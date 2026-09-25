@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Restrict Tenstorrent device nodes from world-rw (the kmd default 0666) to
+# group `ttdev`, mode 0660. The broker runs each job with `ttdev` as a
+# supplementary group so admitted jobs can open the device; interactive shells
+# (whose users are NOT in ttdev) are denied by plain unix permissions. This is
+# what blocks bare-metal device use.
+#
+# Install to /etc/udev/rules.d/ and reload (the install script does this).
+# Verify the match with: udevadm info -a -p $(udevadm info -q path -n /dev/tenstorrent/0)
+SUBSYSTEM=="tenstorrent", GROUP="ttdev", MODE="0660"
+KERNEL=="tenstorrent!*", GROUP="ttdev", MODE="0660"

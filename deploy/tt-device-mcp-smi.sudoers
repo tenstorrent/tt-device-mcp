@@ -1,0 +1,6 @@
+# Installed to /etc/sudoers.d/tt-device-mcp-smi (mode 0440) on a LOCKED host.
+# Lets any user run read-only tt-smi as root so they can watch telemetry/power
+# while jobs run, without bare-metal device access. The target is the fixed
+# read-only wrapper (no args allowed through it that could reset/reconfigure),
+# so this grant cannot be used to reset the device.
+ALL ALL=(root) NOPASSWD: /usr/local/bin/tt-device-mcp-smi-ro

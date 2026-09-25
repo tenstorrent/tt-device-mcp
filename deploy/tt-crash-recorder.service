@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Captures the firmware's record of the last crash, once per boot, on hosts that have no
+# broker. The broker does this itself; this unit exists so a host we do NOT manage can be
+# instrumented without changing anything about how it behaves — a control group is only
+# worth having if observing it does not disturb it.
+[Unit]
+Description=Record what the firmware says killed this machine last boot
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tt-crash-recorder
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

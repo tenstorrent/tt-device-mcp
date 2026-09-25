@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Counts CPU bus locks for the life of the boot, to disk.
+#
+# This exists to settle one question. These hosts reboot ungracefully ~1-2x/day with a
+# fatal EX-unit watchdog timeout (a core stopped retiring instructions). AMD erratum 1431
+# — "CPU Core May Hang If SMT Is Enabled and Bus Lock Occurs" — matches this silicon
+# (Genoa-B1) and this configuration (SMT on, no bus-lock mitigation), and its symptom is
+# exactly a core hang plus a reset. But erratum 1431 REQUIRES A BUS LOCK. So:
+#
+#   next reboot + this log shows bus locks  -> erratum 1431 stays alive
+#   next reboot + this log shows ZERO       -> erratum 1431 is REFUTED for that crash,
+#                                              and the cause is elsewhere (most likely a
+#                                              core stalled on an MMIO access to a hung
+#                                              accelerator, which produces an identical
+#                                              watchdog record)
+#
+# A perf session dies with the reboot, which is why the count goes to disk every minute
+# rather than being summed at the end. The file is read after the next boot, alongside the
+# firmware's BERT record, and together they say what killed the machine.
+[Unit]
+Description=Count CPU bus locks (AMD erratum 1431 discriminator)
+After=multi-user.target
+
+[Service]
+Type=simple
+# -a: all CPUs (a bus lock on any core can hang that core)
+# -I 60000: emit a count every 60s, so the record survives an ungraceful power loss
+ExecStart=/bin/sh -c 'exec perf stat -a -e ls_locks.bus_lock -I 60000 \
+    --log-fd 1 >> /var/lib/tt-device-broker/health/buslock.log 2>&1'
+Restart=always
+RestartSec=10
+Nice=19
+
+[Install]
+WantedBy=multi-user.target
