@@ -1,0 +1,8 @@
+# Ignore patterns for the org-wide SPDX checker (tt-github-actions/spdx-checker);
+# the license rules themselves are built into the action and not overridable.
+ignore:
+  perform_check: no
+  include:
+    - .github/
+    - __pycache__
+    - build/

@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Builds the fabric validator from the pinned tt-metal commit, out of band.
+#
+# Deliberately NOT wired into the health gate or the auto-updater: a tt-metal build
+# takes tens of minutes, and neither a per-job health check nor an update window can
+# afford to block on one. Until this lands, the fabric check honestly reports that it
+# cannot check, and the broker does not act on it.
+[Unit]
+Description=Build the pinned tt-metal fabric validator for tt-device-broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The build is long and CPU-hungry; it must never contend with a device job.
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=7200
+ExecStart=/opt/tt-device-broker/install-fabric-validator.sh /opt/tt-device-broker/fabric-validator.pin
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

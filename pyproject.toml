@@ -1,0 +1,64 @@
+[project]
+name = "tt-device-mcp"
+version = "0.7.2"
+description = "MCP server for managing shared Tenstorrent device access across multiple agents"
+authors = [
+    {name = "Pavle Petrovic", email = "ppetrovic@tenstorrent.com"},
+]
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=2.0.0",
+    "httpx2>=2.5.0",
+    "uvicorn>=0.30.0",
+    "starlette>=0.27.0",
+    "pyyaml>=6.0",
+    "prometheus_client>=0.20",
+    # The recovery stages import tt_smi.reset.{IoctlResetFlags,reset_device_ioctl}
+    # and tt_smi.constants.GLX_BOARD_TYPES; 6.2.1 exposes all three.
+    "tt-smi>=6.2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.scripts]
+tt-device-mcp = "tt_device_mcp.cli:main"
+
+[build-system]
+# packaging>=24.2 ships packaging.licenses, which hatchling needs to validate the
+# SPDX `license` string (PEP 639 / Metadata 2.4); older build envs crash without it.
+requires = ["hatchling", "packaging>=24.2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tt_device_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/tt_device_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 120
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# conftest seals the environment (spawn tripwire, path redirects) before anything imports the
+# server; server.py and metrics.py stage module state their own imports depend on.
+"tests/conftest.py" = ["E402"]
+"src/tt_device_mcp/server.py" = ["E402"]
+"src/tt_device_mcp/metrics.py" = ["E402"]

@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The tt-metal commit the fabric validator is built from. Pinned, and source
+# controlled here, so every host validates its fabric with the SAME code.
+#
+# Before this pin existed the check built run_cluster_validation on demand out of
+# whichever tt-metal tree happened to be on the box — in practice one developer's
+# working tree, on a feature branch, with uncommitted changes, and only on the one
+# host where that tree existed. A fabric verdict that depends on whose checkout the
+# host happens to have is not a verdict.
+#
+# To bump: change TTDEV_VALIDATOR_SHA, push. Hosts rebuild into a new SHA-keyed
+# prefix on the next reconcile and switch over atomically; the old build stays until
+# it is pruned, so a bad pin is a one-line revert.
+
+TTDEV_VALIDATOR_REPO=https://github.com/tenstorrent/tt-metal.git
+# Full 40-char SHA, not an abbreviation: `git fetch --depth 1 origin <sha>` resolves
+# its argument as a remote ref, and an abbreviated hash is not one ("couldn't find
+# remote ref").
+TTDEV_VALIDATOR_SHA=09a878e5419b4c2c8d1465381f04ff6b91300dfc
+
+# tt-metal rejects anything below GCC-12, and the distro default on these hosts is
+# GCC-11 — an unconfigured cmake picks it and the build dies at configure time. Use
+# the toolchain tt-metal ships, and the same one the working dev trees on this
+# hardware build with, so the validator is compiled the way everything else here is.
+TTDEV_VALIDATOR_TOOLCHAIN=cmake/x86_64-linux-clang-20-libstdcpp-toolchain.cmake
+
+# Build target and the paths it produces, relative to the checkout.
+TTDEV_VALIDATOR_TARGET=run_cluster_validation
+TTDEV_VALIDATOR_BIN_REL=build/tools/scaleout/run_cluster_validation
+
+# The dispatch probe, built from the same pinned commit for the same reason: the fabric check's
+# second stage has to be identical everywhere too. This is tt-metal's own distributed example, kept
+# because it opens the entire mesh in one process — a per-chip probe costs ~14s per chip and is too
+# slow to distinguish a wedge from itself. Needs BUILD_PROGRAMMING_EXAMPLES at configure time.
+TTDEV_DISPATCH_TARGET=distributed_program_dispatch
+TTDEV_DISPATCH_BIN_REL=build/programming_examples/distributed/distributed_program_dispatch
+
+# The pre-job gate's dispatch probe — a separate, cheaper binary. The whole-mesh probe above is
+# too slow for a tenant's critical path (~14s), so the gate proves dispatch with the minimal
+# single-kernel program instead. Built from the same pin so the gate is identical everywhere; a
+# host missing it cannot claim a green dispatch gate.
+TTDEV_PREJOB_DISPATCH_TARGET=metal_example_add_2_integers_in_compute
+TTDEV_PREJOB_DISPATCH_BIN_REL=build/programming_examples/metal_example_add_2_integers_in_compute
+
+TTDEV_VALIDATOR_DESCRIPTOR_REL=tools/tests/scaleout/cabling_descriptors/bh_galaxy_xy_torus.textproto
