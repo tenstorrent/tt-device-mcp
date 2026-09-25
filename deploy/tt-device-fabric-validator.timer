@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Retries the pinned validator build until it lands.
+#
+# Without this, a build that fails for any reason — a missing compiler, a transient
+# network error, a full disk — stays failed until someone pushes a new version, since
+# apply-host-config only runs on a version bump. A host would then sit with no fabric
+# coverage indefinitely and nothing would say so. The build script is idempotent and
+# exits immediately once the pin is built, so polling costs nothing.
+[Unit]
+Description=Retry the pinned tt-metal fabric validator build until it lands
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=1h
+Unit=tt-device-fabric-validator.service
+
+[Install]
+WantedBy=timers.target
