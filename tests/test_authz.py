@@ -3,8 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for owner authz: peer-uid authority vs legacy HTTP self-report."""
 
+import json
+
 import pwd
 
+import pytest
+
+import tt_device_mcp.server as srv
 from tt_device_mcp.server import authz_owner, owner_matches
 from tt_device_mcp.socket_transport import current_peer_uid
 
@@ -74,3 +79,77 @@ def test_without_a_peer_identity_there_is_no_agent_tag():
     finally:
         current_via_mcp.reset(mcp_tok)
         current_peer_uid.reset(uid_tok)
+
+
+class TestJobLogsAuthz:
+    """`_get_job_logs` must gate the same way `_kill_job` does: unlike queue-status metadata
+    (owner/command, already shared for coordination — see `_get_queue_status`/`_recent_jobs`),
+    log content carries cleartext resolved env vars and full stdout/stderr, so only the job's
+    owner may read it."""
+
+    def _client(self):
+        from starlette.testclient import TestClient
+
+        return TestClient(srv.build_asgi_app(srv.create_mcp_server()))
+
+    def test_the_owner_can_read_their_own_logs(self, tmp_path, monkeypatch):
+        log_file = tmp_path / "job.log"
+        log_file.write_text("ENVIRONMENT VARIABLES:\n  SECRET=xyz\n")
+        job = srv.Job(
+            id="900-2", owner="bjones", workspace="/w", command="pytest", queued_at="",
+            status=srv.JobStatus.COMPLETED, log_file=str(log_file),
+        )
+        monkeypatch.setattr(srv, "jobs", {"900-2": job})
+
+        d = self._client().post(
+            "/api/tt_device_job_logs", json={"job_id": "900-2", "owner": "bjones"}
+        ).json()
+
+        assert "error" not in d
+        assert "SECRET=xyz" in d["content"]
+
+    def test_a_different_caller_is_refused_the_content(self, tmp_path, monkeypatch):
+        log_file = tmp_path / "job.log"
+        log_file.write_text("ENVIRONMENT VARIABLES:\n  SECRET=xyz\n")
+        job = srv.Job(
+            id="900-3", owner="bjones", workspace="/w", command="pytest", queued_at="",
+            status=srv.JobStatus.COMPLETED, log_file=str(log_file),
+        )
+        monkeypatch.setattr(srv, "jobs", {"900-3": job})
+
+        d = self._client().post(
+            "/api/tt_device_job_logs", json={"job_id": "900-3", "owner": "jdoe"}
+        ).json()
+
+        assert d.get("error", "").startswith("Permission denied")
+        assert "content" not in d
+        assert "SECRET" not in str(d)
+
+    def test_job_status_omits_output_for_a_different_caller(self, monkeypatch):
+        """The MCP tool layer (`job_status`) attaches stdout/stderr for finished jobs; that
+        attachment must be owner-gated even though the REST route's bare metadata
+        (owner/command/status) stays visible to any caller, matching
+        `_get_queue_status`/`_recent_jobs`'s existing shared visibility."""
+        job = srv.Job(
+            id="900-4", owner="bjones", workspace="/w", command="pytest", queued_at="",
+            status=srv.JobStatus.COMPLETED,
+        )
+        job.output = "secret stdout"
+        job.error = "secret stderr"
+        monkeypatch.setattr(srv, "jobs", {"900-4": job})
+
+        mcp = srv.create_mcp_server()
+
+        async def _status_as(owner):
+            monkeypatch.setattr(srv, "authz_owner", lambda reported=None: (owner, True))
+            out = await mcp.call_tool("tt_device_job_status", {"params": {"job_id": "900-4"}})
+            return json.loads(out.content[0].text)
+
+        import asyncio
+
+        mine = asyncio.run(_status_as("bjones"))
+        assert mine["output"] == "secret stdout" and mine["error"] == "secret stderr"
+
+        theirs = asyncio.run(_status_as("jdoe"))
+        assert "output" not in theirs and "error" not in theirs
+        assert theirs["owner"] == "bjones"  # metadata itself stays visible

@@ -1258,11 +1258,14 @@ _SMI_SAFE_FLAGS = {
     "--version",
     "-l",
     "--local",
-    "-f",
-    "--filename",
     "-h",
     "--help",
 }
+# `-f`/`--filename` is deliberately excluded: paired with `-s`/`--snapshot` it makes
+# tt-smi WRITE the snapshot JSON to a caller-supplied path, which is not read-only —
+# and every enforcement point (here, the server-side allowlist, and the root-owned
+# sudoers wrapper below) must agree, or one path re-opens the write primitive the
+# others block.
 _SMI_RO_WRAPPER = "/usr/local/bin/tt-device-mcp-smi-ro"
 
 
@@ -1393,7 +1396,7 @@ for arg in "$@"; do
     case "$arg" in
     -*)
         case "$arg" in
-        -ls|--list|-s|--snapshot|--snapshot_no_tty|-v|--version|-l|--local|-f|--filename|-h|--help) ;;
+        -ls|--list|-s|--snapshot|--snapshot_no_tty|-v|--version|-l|--local|-h|--help) ;;
         *) echo "tt-device-mcp-smi-ro: refusing non-read-only flag: $arg" >&2; exit 2 ;;
         esac ;;
     esac
