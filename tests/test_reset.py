@@ -31,11 +31,15 @@ def _is_galaxy(deps):
 
 
 def test_smi_args_ok_allows_readonly_rejects_reset():
-    # bare = interactive dashboard; read-only flags + positional values allowed
+    # bare = interactive dashboard; read-only flags allowed
     assert srv.smi_args_ok([])
     assert srv.smi_args_ok(["-ls"])
     assert srv.smi_args_ok(["-s"])
-    assert srv.smi_args_ok(["-f", "/tmp/snap.json"])  # filename positional is fine
+    # -f/--filename is NOT read-only: paired with -s it makes tt-smi WRITE the
+    # snapshot to a caller-chosen path (as root, via the sudoers wrapper) — it must
+    # stay rejected even though it isn't a device reset/reconfigure flag.
+    assert not srv.smi_args_ok(["-f", "/tmp/snap.json"])
+    assert not srv.smi_args_ok(["--filename", "/etc/shadow"])
     # anything that could reset/reconfigure the device is rejected
     assert not srv.smi_args_ok(["-r"])
     assert not srv.smi_args_ok(["-r", "0,1"])

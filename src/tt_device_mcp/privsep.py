@@ -22,6 +22,7 @@ import logging
 import os
 import pwd
 import shutil
+import stat
 from typing import List, Optional
 
 logger = logging.getLogger("tt-device-mcp")
@@ -156,3 +157,67 @@ def privsep_refusal(peer_uid: Optional[int], *, env=None) -> Optional[str]:
             f"refusing rather than running it as the broker (root)"
         )
     return None
+
+
+def _groups_for_uid(uid: int, gid: int) -> set:
+    try:
+        username = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return {gid}
+    try:
+        return set(os.getgrouplist(username, gid))
+    except (KeyError, OSError):
+        return {gid}
+
+
+def path_readable_by_uid(path: str, uid: int) -> bool:
+    """Whether ``uid`` could read ``path`` under normal (non-root) DAC permissions.
+
+    The broker only runs privileged (root) while ``should_privsep`` is True — exactly
+    when it must read a caller-supplied path (e.g. a job's ``env`` file) itself, before
+    the job's own systemd-run scope exists to read it as the submitter. Root's open()
+    bypasses the permission bits, so without this check any submitter could point at a
+    file only root can read (e.g. another service's secrets) and have its parsed
+    contents surface back to them in their own job log. Checking every path component's
+    execute/traverse bit plus the leaf's read bit reproduces what the kernel would have
+    allowed uid to do directly.
+
+    A uid of 0 (or root's own request) is trivially readable — nothing to drop to. This
+    does not close every race (a symlink swapped between this check and the later
+    ``open()`` could still redirect the read — TOCTOU); it removes the common case of an
+    unprivileged caller naming an unreadable-to-them path outright.
+    """
+    if uid == 0:
+        return True
+    gid = _gid_for_uid(uid)
+    if gid is None:
+        return False
+    groups = _groups_for_uid(uid, gid)
+
+    def _mode_allows(path_stat: os.stat_result, read_bit: int, exec_bit: int, want_exec: bool) -> bool:
+        bit = exec_bit if want_exec else read_bit
+        if path_stat.st_uid == uid:
+            owner_bit = stat.S_IXUSR if want_exec else stat.S_IRUSR
+            if path_stat.st_mode & owner_bit:
+                return True
+        if path_stat.st_gid in groups:
+            group_bit = stat.S_IXGRP if want_exec else stat.S_IRGRP
+            if path_stat.st_mode & group_bit:
+                return True
+        other_bit = stat.S_IXOTH if want_exec else stat.S_IROTH
+        return bool(path_stat.st_mode & other_bit)
+
+    try:
+        # Every parent directory must be traversable (execute bit) by uid, then the
+        # leaf itself must be readable.
+        parts = os.path.abspath(path).split(os.sep)
+        current = os.sep
+        for part in parts[1:-1]:
+            current = os.path.join(current, part)
+            st = os.stat(current)
+            if not _mode_allows(st, stat.S_IRUSR, stat.S_IXUSR, want_exec=True):
+                return False
+        leaf_stat = os.stat(os.path.abspath(path))
+        return _mode_allows(leaf_stat, stat.S_IRUSR, stat.S_IXUSR, want_exec=False)
+    except OSError:
+        return False

@@ -123,3 +123,76 @@ def test_privsep_refusal_allows_resolvable_uid(monkeypatch):
     env = {"TT_DEVICE_MCP_PRIVSEP": "1"}
     _enable(monkeypatch)
     assert privsep.privsep_refusal(1234, env=env) is None
+
+
+class TestPathReadableByUid:
+    """While privsep is active the daemon runs as root and reads a caller-named path (e.g. a
+    job's env file) itself, before the job's own systemd-run scope exists to read it as the
+    submitter. Root's open() bypasses DAC, so this reproduces what the kernel would have let
+    the submitting uid do directly — closing the arbitrary-root-read a caller-chosen path
+    would otherwise open.
+
+    The filesystem is mocked (a fake path -> os.stat_result map) rather than exercised for
+    real: chmod/chown on a shared CI/sandbox tmp dir can't reliably produce every DAC
+    combination (e.g. a genuinely unsearchable ancestor) without root, and the real ancestors
+    above any tmp_path (e.g. a 0700 per-user TMPDIR) would make an other-uid traversal fail
+    for reasons unrelated to what this test means to check.
+    """
+
+    CALLER_UID = 1234
+    OWNER_UID = 1000
+
+    def _mock_fs(self, monkeypatch, modes: dict[str, tuple[int, int, int]]):
+        """modes: path -> (mode, uid, gid), root-relative components only ('/a/b/c')."""
+        import os as _os
+        import stat as _stat
+
+        def fake_stat(path, *a, **k):
+            path = _os.path.normpath(path)
+            if path not in modes:
+                raise FileNotFoundError(path)
+            mode, uid, gid = modes[path]
+            return _os.stat_result((_stat.S_IFREG | mode, 0, 0, 1, uid, gid, 0, 0, 0, 0))
+
+        monkeypatch.setattr(privsep.os, "stat", fake_stat)
+        monkeypatch.setattr(privsep, "_gid_for_uid", lambda uid: uid)
+        monkeypatch.setattr(privsep, "_groups_for_uid", lambda uid, gid: {gid})
+
+    def test_root_can_read_anything(self):
+        assert privsep.path_readable_by_uid("/does/not/matter", 0) is True
+
+    def test_world_readable_file_in_world_traversable_dirs_is_readable(self, monkeypatch):
+        self._mock_fs(
+            monkeypatch,
+            {"/w": (0o755, self.OWNER_UID, self.OWNER_UID), "/w/env.yaml": (0o644, self.OWNER_UID, self.OWNER_UID)},
+        )
+        assert privsep.path_readable_by_uid("/w/env.yaml", self.CALLER_UID) is True
+
+    def test_owner_only_file_is_not_readable_by_another_uid(self, monkeypatch):
+        self._mock_fs(
+            monkeypatch,
+            {"/w": (0o755, self.OWNER_UID, self.OWNER_UID), "/w/secret.yaml": (0o600, self.OWNER_UID, self.OWNER_UID)},
+        )
+        assert privsep.path_readable_by_uid("/w/secret.yaml", self.CALLER_UID) is False
+
+    def test_owner_only_file_is_readable_by_its_owner(self, monkeypatch):
+        self._mock_fs(
+            monkeypatch,
+            {"/w": (0o755, self.OWNER_UID, self.OWNER_UID), "/w/secret.yaml": (0o600, self.OWNER_UID, self.OWNER_UID)},
+        )
+        assert privsep.path_readable_by_uid("/w/secret.yaml", self.OWNER_UID) is True
+
+    def test_an_unsearchable_parent_directory_blocks_the_read(self, monkeypatch):
+        self._mock_fs(
+            monkeypatch,
+            {
+                "/w": (0o755, self.OWNER_UID, self.OWNER_UID),
+                "/w/locked_dir": (0o700, self.OWNER_UID, self.OWNER_UID),  # not traversable by others
+                "/w/locked_dir/env.yaml": (0o644, self.OWNER_UID, self.OWNER_UID),
+            },
+        )
+        assert privsep.path_readable_by_uid("/w/locked_dir/env.yaml", self.CALLER_UID) is False
+
+    def test_a_missing_path_is_not_readable(self, monkeypatch):
+        self._mock_fs(monkeypatch, {})
+        assert privsep.path_readable_by_uid("/w/nope.yaml", self.CALLER_UID) is False

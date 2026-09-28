@@ -129,7 +129,13 @@ from tt_device_mcp.health import (
     version_floor_warnings,
 )
 from tt_device_mcp.peercred import username_for_uid
-from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
+from tt_device_mcp.privsep import (
+    path_readable_by_uid,
+    privsep_enabled,
+    privsep_prefix_for,
+    privsep_refusal,
+    should_privsep,
+)
 from tt_device_mcp.socket_transport import (
     PeerCredMiddleware,
     current_peer_uid,
@@ -4763,11 +4769,13 @@ SMI_SAFE_FLAGS = {
     "--version",
     "-l",
     "--local",
-    "-f",
-    "--filename",
     "-h",
     "--help",
 }
+# `-f`/`--filename` is deliberately excluded: paired with `-s`/`--snapshot` it makes
+# tt-smi WRITE the snapshot JSON to a caller-supplied path, which is not read-only.
+# All three enforcement points (this allowlist, cli.py's client-side gate, and the
+# root-owned sudoers wrapper it installs) must agree on this.
 
 
 def smi_args_ok(args) -> bool:
@@ -6567,7 +6575,11 @@ def create_mcp_server() -> MCPServer:
     async def api_job_logs(request: Request) -> JSONResponse:
         """REST API: Get job logs."""
         data = await request.json()
-        return JSONResponse(_get_job_logs(data.get("job_id"), data.get("tail", 100)))
+        # authz_owner, not the body: see api_job_kill for why the reported owner is
+        # only trusted as an HTTP legacy fallback (spec 05).
+        return JSONResponse(
+            _get_job_logs(data.get("job_id"), data.get("tail", 100), data.get("owner"))
+        )
 
     @mcp.custom_route("/api/tt_device_job_kill", methods=["POST"])
     async def api_job_kill(request: Request) -> JSONResponse:
@@ -6849,12 +6861,24 @@ def create_mcp_server() -> MCPServer:
 
         return result
 
-    def _get_job_logs(job_id: str, tail: int = 100) -> dict:
-        """Get job logs (shared by REST API and MCP tool)."""
+    def _get_job_logs(job_id: str, tail: int = 100, reported_owner: str | None = None) -> dict:
+        """Get job logs (shared by REST API and MCP tool).
+
+        Log content carries the job's resolved environment variables in cleartext
+        (written at submission for debuggability) plus full stdout/stderr, so —
+        unlike the metadata `_get_job_status` exposes to every caller for queue
+        coordination — only the job's owner (or an equivalent identity, matching
+        `_kill_job`) may read it.
+        """
         if job_id not in jobs:
             return {"error": "Job not found"}
 
         job = jobs[job_id]
+
+        caller_owner, _ = authz_owner(reported_owner)
+        if not owner_matches(job.owner, caller_owner):
+            return {"error": f"Permission denied: job belongs to {job.owner}"}
+
         content = ""
         if job.log_file and os.path.exists(job.log_file):
             with open(job.log_file, "r") as f:
@@ -6989,6 +7013,17 @@ def create_mcp_server() -> MCPServer:
             owner_submit_times[owner] = kept + [now_monotonic]
 
         workspace = os.path.expanduser(workspace)
+
+        # Root only reads a caller-named path itself while privsep is active (the job's
+        # own systemd-run scope, which would read it as the submitter, doesn't exist yet).
+        # Refuse rather than let root's open() bypass DAC on a path this submitter
+        # couldn't otherwise read (see privsep.path_readable_by_uid).
+        if env is not None and should_privsep():
+            peer_uid = current_peer_uid.get()
+            if peer_uid is not None:
+                env_check_path = env if os.path.isabs(env) else os.path.join(workspace, env)
+                if not path_readable_by_uid(env_check_path, peer_uid):
+                    return {"error": f"env file not readable by {owner}: {env}"}
 
         # Resolve and validate env vars (priority: env_file > inherited_env > defaults).
         # Every documented load_env_file failure is client input (missing file, unparseable
@@ -7222,10 +7257,16 @@ def create_mcp_server() -> MCPServer:
 
         result = _get_job_status(params.job_id)
 
-        # MCP tool adds output/error fields for finished jobs
+        # MCP tool adds output/error fields for finished jobs, but only for the
+        # owner: captured stdout/stderr can carry secrets the metadata above
+        # doesn't (unlike owner/command/status, which are already shared queue
+        # visibility — see _get_queue_status/_recent_jobs).
         if "error" not in result and params.job_id in jobs:
             job = jobs[params.job_id]
-            if job.status not in (JobStatus.QUEUED, JobStatus.RUNNING):
+            caller_owner, _ = authz_owner(None)
+            if job.status not in (JobStatus.QUEUED, JobStatus.RUNNING) and owner_matches(
+                job.owner, caller_owner
+            ):
                 result["output"] = job.output
                 result["error"] = job.error
 
