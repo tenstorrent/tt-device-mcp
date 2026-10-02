@@ -2290,6 +2290,33 @@ def _reset_busy_detail(blocker: dict) -> str:
     return f"{job} is {blocker['job_status']} and still being torn down; retry shortly"
 
 
+async def _reset_recheck_in_op(force: bool, log) -> Optional[dict]:
+    """Repeat the busy check once the operator reset holds the device-op lock.
+
+    The first check releases `get_lock()` before the reset enters `_device_op("reset")`, and the
+    runner can dispatch a queued job in that gap (#3). Returns the blocker when not forced, so the
+    caller refuses; when forced, stops the job as the first check would have, and returns None."""
+    global current_process
+    async with get_lock():
+        blocker = _reset_blocking_job()
+        if blocker is None or not force:
+            return blocker
+        pid_to_stop = current_process.pid if current_process else None
+        job_id_to_stop = current_job_id
+    log(f"force: resetting over {_reset_busy_detail(blocker)}")
+    if pid_to_stop:
+        _note_reset_killed_job()
+        if job_id_to_stop:
+            await _terminate_job(job_id_to_stop, pid_to_stop)
+        else:
+            await _terminate_process_group(pid_to_stop)
+        async with get_lock():
+            if current_process:
+                await current_process.wait()
+                current_process = None
+    return None
+
+
 RESET_BUSY_HINT = (
     "Wait for the job to finish (tt_device_job_wait), have its owner kill it (tt_device_job_kill), "
     "or pass {force} to reset over it."
@@ -6731,6 +6758,9 @@ def create_mcp_server() -> MCPServer:
 
         async def run_reset():
             async with _device_op("reset", owner=reset_owner):
+                late = await _reset_recheck_in_op(force, lambda m: output_queue.put_nowait(m + "\n"))
+                if late:
+                    return None, late
                 health_event("reset_begin", argv=argv, expected_chips=len(indices))
                 return await recovery_mechanism.reset_with_quiesce(
                     argv,
@@ -6752,6 +6782,13 @@ def create_mcp_server() -> MCPServer:
         while not output_queue.empty():
             streamed = True
             yield output_queue.get_nowait()
+        if rc is None:
+            if logger:
+                logger.warning(f"reset_stream: busy REFUSED: {_reset_busy_detail(output)}")
+            yield f"busy REFUSED: {_reset_busy_detail(output)}\n"
+            yield f"hint: {RESET_BUSY_HINT.format(force='--force')}\n"
+            yield "::status::refused\n"
+            return
         if output and not streamed:
             yield output if output.endswith("\n") else output + "\n"
         yield f"exit code: {rc}\n"
@@ -8148,6 +8185,20 @@ def create_mcp_server() -> MCPServer:
         health_detail = "not checked (reset did not succeed)"
         reset_owner = _reset_action_owner()
         async with _device_op("reset", owner=reset_owner):
+            # A queued job may have been dispatched since the check above released get_lock().
+            late = await _reset_recheck_in_op(force, lambda m: step(m, "warning"))
+            if late:
+                step(f"busy REFUSED: {_reset_busy_detail(late)}", "warning")
+                return {
+                    "status": "refused",
+                    "reason": "busy",
+                    "detail": _reset_busy_detail(late),
+                    "job_id": late["job_id"],
+                    "owner": late["owner"],
+                    "job_status": late["job_status"],
+                    "steps": steps,
+                    "hint": RESET_BUSY_HINT.format(force="force=true"),
+                }
             rc, reset_out = await recovery_mechanism.reset_with_quiesce(argv, lambda m: step(m), reset_owner)
             status = "reset_complete" if rc == 0 else "reset_failed"
             step(f"{command} exited {rc} -> {status}", "info" if rc == 0 else "error")

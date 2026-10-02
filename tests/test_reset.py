@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 
 import pytest
 from starlette.testclient import TestClient
@@ -1134,6 +1135,64 @@ def test_streaming_reset_refuses_while_a_job_is_running(monkeypatch, tmp_path):
     assert "--force" in resp.text
     assert not resets and not scope_kills and not pgroup_kills
     assert job.status == srv.JobStatus.RUNNING and "903-1" not in srv.reset_killed_job_ids
+
+
+def _dispatch_in_the_gap(monkeypatch, *, live=True):
+    """Start a job after the first busy check but before the reset takes the device-op lock."""
+    real = srv._device_op
+
+    @asynccontextmanager
+    async def op(name, owner="[broker]"):
+        if name == "reset":
+            _running_job(monkeypatch, job_id="904-1", owner="bob", live=live)
+        async with real(name, owner) as v:
+            yield v
+
+    monkeypatch.setattr(srv, "_device_op", op)
+
+
+def test_reset_refuses_a_job_dispatched_after_the_first_check(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+    _dispatch_in_the_gap(monkeypatch)
+
+    d, resets, (scope_kills, pgroup_kills) = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "refused" and d["reason"] == "busy" and d["job_id"] == "904-1"
+    assert not resets and not scope_kills and not pgroup_kills
+    assert srv.jobs["904-1"].status == srv.JobStatus.RUNNING and not srv.reset_killed_job_ids
+
+
+def test_forced_reset_stops_a_job_dispatched_after_the_first_check(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+    _dispatch_in_the_gap(monkeypatch)
+
+    d, resets, (scope_kills, _) = _post_reset(monkeypatch, tmp_path, force=True)
+
+    assert d["status"] == "reset_complete" and resets
+    assert scope_kills == [srv.job_scope_unit("904-1")]
+    assert "904-1" in srv.reset_killed_job_ids
+
+
+def test_streaming_reset_refuses_a_job_dispatched_after_the_first_check(monkeypatch, tmp_path):
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+    _dispatch_in_the_gap(monkeypatch)
+    scope_kills, pgroup_kills = _record_terminators(monkeypatch)
+    resets = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
+
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": False})
+
+    assert "::status::refused" in resp.text
+    assert "busy REFUSED: broker job 904-1 (bob) is running" in resp.text
+    assert not resets and not scope_kills and not pgroup_kills
 
 
 @pytest.mark.asyncio
