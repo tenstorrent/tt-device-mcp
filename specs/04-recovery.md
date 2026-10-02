@@ -245,8 +245,9 @@ each rung fires only when the gentler one failed or cannot apply.
   `reason: busy` and the job's id, owner and status while a broker job owns the device: the job in
   the runner's ownership window (`current_job_id`, which also covers a job gone `HUNG` and still
   being torn down) or a re-adopted job still `RUNNING`. Queued jobs do not block. The job is left
-  untouched. `force=true` keeps the old behaviour — the running job is interrupted (scope-routed,
-  marked reset-killed) and the reset proceeds — but the job it runs over is logged first. The check
+  untouched. `force=true` keeps the old behaviour — the runner's current job is interrupted
+  (scope-routed, marked reset-killed; a re-adopted job is not stopped, as before) and the reset
+  proceeds — but the job it runs over is logged first. The check
   is read under the job lock together with the pid a forced reset would stop. The broker's own
   resets (the health gate's ladder, idle relift, forced escalation) call `reset_with_quiesce`
   directly, never through the tool, and are not subject to it.

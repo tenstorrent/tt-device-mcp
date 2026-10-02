@@ -1019,6 +1019,7 @@ def test_reset_stream_quiesce_scope_routes_a_live_privsep_job(monkeypatch, tmp_p
 
     assert scope_kills == [srv.job_scope_unit("902-1")]
     assert not pgroup_kills, "the streaming reset quiesce must scope-route a privsep job"
+    assert "force: resetting over broker job 902-1" in resp.text, "a forced reset must log the job it stops"
 
 
 # --- issue #3: a reset is not queued, so it must not kill a running job unasked (04 I18) ---
@@ -1034,6 +1035,7 @@ def _running_job(monkeypatch, status=srv.JobStatus.RUNNING, *, job_id="903-1", o
     monkeypatch.setattr(srv, "jobs", {job_id: job})
     monkeypatch.setattr(srv, "current_process", _FakeWrapperProc() if live else None)
     monkeypatch.setattr(srv, "current_job_id", job_id if live else None)
+    monkeypatch.setattr(srv, "reset_killed_job_ids", set())
     return job
 
 
@@ -1057,7 +1059,8 @@ def test_reset_refuses_while_a_job_is_running_and_leaves_it_alone(monkeypatch, t
     assert "force=true" in d["hint"]
     assert not resets, "a busy refusal must not reset the device"
     assert not scope_kills and not pgroup_kills, "a busy refusal must not signal the job"
-    assert job.status == srv.JobStatus.RUNNING, "the job must not be marked reset-killed"
+    assert job.status == srv.JobStatus.RUNNING
+    assert "903-1" not in srv.reset_killed_job_ids, "the job must not be marked reset-killed"
     assert srv.current_process is proc and srv.current_job_id == "903-1"
 
 
@@ -1068,6 +1071,7 @@ def test_reset_refuses_while_a_hung_job_is_still_held(monkeypatch, tmp_path):
     d, resets, _ = _post_reset(monkeypatch, tmp_path, force=False)
 
     assert d["status"] == "refused" and d["reason"] == "busy" and d["job_status"] == "hung"
+    assert "still being torn down" in d["detail"]
     assert not resets
 
 
@@ -1097,6 +1101,7 @@ def test_forced_reset_stops_the_running_job_and_logs_it(monkeypatch, tmp_path):
 
     assert d["status"] == "reset_complete"
     assert scope_kills == [srv.job_scope_unit("903-1")], "force keeps the old behaviour: stop the job"
+    assert "903-1" in srv.reset_killed_job_ids
     assert resets
     assert any(s.startswith("force: resetting over broker job 903-1 (alice) is running") for s in d["steps"])
 
@@ -1128,7 +1133,7 @@ def test_streaming_reset_refuses_while_a_job_is_running(monkeypatch, tmp_path):
     assert "busy REFUSED: broker job 903-1 (alice) is running" in resp.text
     assert "--force" in resp.text
     assert not resets and not scope_kills and not pgroup_kills
-    assert job.status == srv.JobStatus.RUNNING
+    assert job.status == srv.JobStatus.RUNNING and "903-1" not in srv.reset_killed_job_ids
 
 
 @pytest.mark.asyncio

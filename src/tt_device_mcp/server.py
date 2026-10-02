@@ -2268,7 +2268,8 @@ def _reset_blocking_job() -> Optional[dict]:
     process is reaped, so it also covers a job that went HUNG and is still being torn down (held,
     no longer RUNNING). A job re-adopted after a broker restart runs in its scope with no
     `current_job_id`, so RUNNING jobs are read from `jobs` too. QUEUED jobs do not block: a reset
-    does not touch them. Read under `get_lock()` so the answer matches what a forced reset stops.
+    does not touch them. The caller holds `get_lock()`, so the answer matches what a forced reset
+    stops.
     """
     if current_job_id is not None:
         job = jobs.get(current_job_id)
@@ -2282,7 +2283,11 @@ def _reset_blocking_job() -> Optional[dict]:
 
 
 def _reset_busy_detail(blocker: dict) -> str:
-    return f"broker job {blocker['job_id']} ({blocker['owner']}) is {blocker['job_status']}; a reset would kill it"
+    job = f"broker job {blocker['job_id']} ({blocker['owner']})"
+    if blocker["job_status"] == JobStatus.RUNNING.value:
+        return f"{job} is running; a reset would kill it"
+    # Killed, timed out or hung: the runner still owns the device until it reaps the process.
+    return f"{job} is {blocker['job_status']} and still being torn down; retry shortly"
 
 
 RESET_BUSY_HINT = (
