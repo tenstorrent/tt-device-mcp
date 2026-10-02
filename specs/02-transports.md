@@ -52,7 +52,7 @@ transport. The HTTP/TCP listener predates it, attaches no identity, and is to be
   (explicit/env, broker, user daemon — `constants.resolve_socket`) and speaks HTTP over it; its
   `port`/`host` parameters are ignored. No reachable server means a refusal, not a TCP attempt.
 - **I9 — Streaming endpoints are not a side door.** `/api/tt_device_reset_stream` runs the same
-  reset gate, poller quiesce, systemd scope, and audit row as the `tt_device_reset` tool; only the
+  reset gate, busy check, poller quiesce, systemd scope, and audit row as the `tt_device_reset` tool; only the
   delivery (progress lines as they happen) differs.
 - **I10 — Socket-only serving is self-consistent.** `--no-http` requires a socket
   (`--socket` or `TT_DEVICE_MCP_SOCKET`); with HTTP disabled and no socket configured the broker
@@ -80,7 +80,7 @@ an MCP `Context` and stream logs via progress updates. Job semantics are spec 01
 | `tt_device_queue_status` | Running/queued jobs, device busy | yes | no | yes | — (no args) |
 | `tt_device_recent_jobs` | Recent job history, all users | yes | no | yes | bare `limit` |
 | `tt_device_exec` | Direct diagnostic outside the queue (gated) | no | yes | no | `DeviceExecInput` |
-| `tt_device_reset` | Reset TT devices (reset gate, spec 04) | no | yes | yes | `DeviceResetInput` |
+| `tt_device_reset` | Reset TT devices (reset gate, busy check, spec 04) | no | yes | yes | `DeviceResetInput` |
 
 ### REST route inventory
 

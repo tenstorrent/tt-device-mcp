@@ -372,10 +372,11 @@ class DeviceResetInput(BaseModel):
     force: bool = Field(
         False,
         description=(
-            "Override the reset gate even if another user's process is holding "
-            "the device. DANGEROUS: a board-level reset will abort their run and "
-            "can wedge the mesh. The foreign holders are logged before reset. "
-            "Default: false (refuse if any foreign-uid holder is on the device)."
+            "Reset even if a broker job is running or another user's process is "
+            "holding the device. DANGEROUS: a board-level reset kills the running "
+            "job, aborts their run and can wedge the mesh. The job and foreign "
+            "holders are logged before reset. Default: false (refuse while a broker "
+            "job is running or held, or any foreign-uid holder is on the device)."
         ),
     )
 
@@ -2258,6 +2259,36 @@ def _note_reset_killed_job() -> None:
     victim = next((j.id for j in jobs.values() if j.status == JobStatus.RUNNING), None)
     if victim:
         _mark_job_device_fault_failed(victim, "killed to make room for a device reset after a wedge")
+
+
+def _reset_blocking_job() -> Optional[dict]:
+    """The broker job an operator reset would run over, or None while no job owns the device.
+
+    `current_job_id` is the runner's ownership window: set at spawn, cleared only after the
+    process is reaped, so it also covers a job that went HUNG and is still being torn down (held,
+    no longer RUNNING). A job re-adopted after a broker restart runs in its scope with no
+    `current_job_id`, so RUNNING jobs are read from `jobs` too. QUEUED jobs do not block: a reset
+    does not touch them. Read under `get_lock()` so the answer matches what a forced reset stops.
+    """
+    if current_job_id is not None:
+        job = jobs.get(current_job_id)
+        if job is None:
+            return {"job_id": current_job_id, "owner": "unknown", "job_status": "running", "pid": None}
+    else:
+        job = next((j for j in jobs.values() if j.status == JobStatus.RUNNING), None)
+        if job is None:
+            return None
+    return {"job_id": job.id, "owner": job.owner, "job_status": job.status.value, "pid": job.pid}
+
+
+def _reset_busy_detail(blocker: dict) -> str:
+    return f"broker job {blocker['job_id']} ({blocker['owner']}) is {blocker['job_status']}; a reset would kill it"
+
+
+RESET_BUSY_HINT = (
+    "Wait for the job to finish (tt_device_job_wait), have its owner kill it (tt_device_job_kill), "
+    "or pass {force} to reset over it."
+)
 
 
 def _clear_device_reported_fault(why: str) -> None:
@@ -6642,9 +6673,23 @@ def create_mcp_server() -> MCPServer:
         pid_to_stop = None
         job_id_to_stop = None
         async with get_lock():
-            if current_process:
+            # A reset is not queued: refuse rather than kill a job that owns the device (#3).
+            blocker = _reset_blocking_job()
+            busy = blocker is not None and not force
+            if not busy and current_process:
                 pid_to_stop = current_process.pid
                 job_id_to_stop = current_job_id
+        if busy:
+            if logger:
+                logger.warning(f"reset_stream: busy REFUSED: {_reset_busy_detail(blocker)}")
+            yield f"busy REFUSED: {_reset_busy_detail(blocker)}\n"
+            yield f"hint: {RESET_BUSY_HINT.format(force='--force')}\n"
+            yield "::status::refused\n"
+            return
+        if blocker:
+            if logger:
+                logger.warning(f"reset_stream: force: {_reset_busy_detail(blocker)}")
+            yield f"force: resetting over {_reset_busy_detail(blocker)}\n"
         if pid_to_stop:
             # A holder that is SIGKILLed never releases the chip, which guarantees
             # the reset we are about to perform. Interrupting it can release the
@@ -8038,9 +8083,26 @@ def create_mcp_server() -> MCPServer:
         pid_to_stop = None
         job_id_to_stop = None
         async with get_lock():
-            if current_process:
+            # A reset is not queued: refuse rather than kill a job that owns the device (#3).
+            blocker = _reset_blocking_job()
+            busy = blocker is not None and not force
+            if not busy and current_process:
                 pid_to_stop = current_process.pid
                 job_id_to_stop = current_job_id
+        if busy:
+            step(f"busy REFUSED: {_reset_busy_detail(blocker)}", "warning")
+            return {
+                "status": "refused",
+                "reason": "busy",
+                "detail": _reset_busy_detail(blocker),
+                "job_id": blocker["job_id"],
+                "owner": blocker["owner"],
+                "job_status": blocker["job_status"],
+                "steps": steps,
+                "hint": RESET_BUSY_HINT.format(force="force=true"),
+            }
+        if blocker:
+            step(f"force: resetting over {_reset_busy_detail(blocker)}", "warning")
         if pid_to_stop:
             # A holder that is SIGKILLed never releases the chip, which guarantees
             # the reset we are about to perform. Interrupting it can release the
@@ -8131,26 +8193,31 @@ def create_mcp_server() -> MCPServer:
 
         Use this when the device becomes unresponsive. This will:
         1. Refuse if another user's process is holding the device (reset gate)
-        2. Kill any currently running process
+        2. Refuse while a broker job is running or held (reason 'busy')
         3. Reset all detected Tenstorrent devices via tt-smi
 
-        A reset is a board-level reset of ALL chips, so resetting while another
-        tenant holds the device aborts their run mid-op and can wedge the mesh.
-        The gate refuses unless every current device holder is the caller's own
-        uid. Pass force=true to override (the foreign holders are logged first).
+        A reset is a board-level reset of ALL chips and is not queued, so
+        resetting while a job runs or another tenant holds the device aborts
+        their run mid-op and can wedge the mesh. The gate refuses unless every
+        current device holder is the caller's own uid, and the reset refuses
+        while any broker job owns the device (wait for it, or kill your own job
+        first). Pass force=true to override both: the running job is stopped
+        and it and the foreign holders are logged first.
 
         Over the unix socket the caller's real uid (SO_PEERCRED) is used for the
         gate; over HTTP there is no peer identity so the gate degrades to a
         best-effort holder scan with no caller scoping.
 
-        WARNING: This is destructive - any running job will be terminated.
+        WARNING: This is destructive. With force=true any running job is terminated.
 
         Returns:
             dict: Reset result:
-                - status (str): 'reset_complete', 'reset_failed', 'no_devices',
-                  or 'refused' (foreign holder + not forced)
+                - status (str): 'reset_complete', 'reset_unhealthy', 'reset_failed',
+                  'no_devices', or 'refused' (foreign holder or busy, not forced)
                 - devices (list[str]): Device indices that were reset
-                - foreign_holders (list): On refusal, [{pid, uid, user}, ...]
+                - reason (str): On refusal, the gate's reason, or 'busy'
+                - job_id, owner, job_status: On a 'busy' refusal, the job in the way
+                - foreign_holders (list): On a gate refusal, [{pid, uid, user}, ...]
         """
         return await _reset_device(params.force)
 

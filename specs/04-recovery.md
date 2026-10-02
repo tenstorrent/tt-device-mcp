@@ -240,6 +240,16 @@ each rung fires only when the gentler one failed or cannot apply.
   an unprivileged caller, and that rc would arm the cooldown against a reset that never ran.
   Reading a scope is a separate question from starting one — `scope_active` keys on systemd alone,
   so an unprivileged daemon still adopts a root broker's reset rather than racing it (I5).
+- **I18 — An operator reset never kills a running job unasked.** A reset is not queued, so
+  `tt_device_reset` (and its REST and streaming routes) refuses with `status: refused`,
+  `reason: busy` and the job's id, owner and status while a broker job owns the device: the job in
+  the runner's ownership window (`current_job_id`, which also covers a job gone `HUNG` and still
+  being torn down) or a re-adopted job still `RUNNING`. Queued jobs do not block. The job is left
+  untouched. `force=true` keeps the old behaviour — the running job is interrupted (scope-routed,
+  marked reset-killed) and the reset proceeds — but the job it runs over is logged first. The check
+  is read under the job lock together with the pid a forced reset would stop. The broker's own
+  resets (the health gate's ladder, idle relift, forced escalation) call `reset_with_quiesce`
+  directly, never through the tool, and are not subject to it.
 
 ## Interfaces
 
@@ -301,7 +311,8 @@ Class structure: see the diagram in 03-health.md.
   anonymous caller (HTTP, no SO_PEERCRED): it owns no holder, so every tenant is foreign.
 - **`tt_device_reset` tool / `POST /api/tt_device_reset` / CLI `reset`** (contract only; schema in
   spec 02, CLI in 07): scan holders → apply the reset gate (caller-scoped over the socket;
-  anonymous fail-closed over HTTP on a privsep host; legacy skip over HTTP off privsep) → interrupt
+  anonymous fail-closed over HTTP on a privsep host; legacy skip over HTTP off privsep) → refuse
+  `reason: busy` while a broker job owns the device unless forced (I18) → with force, interrupt
   the running job gracefully (scope-routed for privsep jobs; marked reset-killed first so its exit
   does not re-flag the device) → `select_recovery().reset_argv(present chips)` →
   `reset_with_quiesce` under the device-op lock, its one jobs-list row owned by
@@ -417,6 +428,12 @@ count. `force` overrides foreign holders and the blind spot but the foreign list
 for logging. Anonymous HTTP callers on a privsep host get the same fail-closed rules with every
 tenant foreign; off privsep, HTTP keeps the legacy single-tenant skip.
 
+**The busy check.** After the gate, the reset tool MUST refuse (`reason: busy`) while a broker job
+owns the device, whoever owns that job — including the caller: a caller resetting over their own
+run kills it with `tt_device_job_kill` first or passes `force`. This is independent of the holder
+scan; on a non-privsep host the broker's own job runs at the broker's uid and the gate alone would
+never see it (I18).
+
 **Reset verification scope.** Per I13: the operator tool's verify is chip enumeration + ARC
 heartbeat via one `fsm.observe(run_fabric=False)` pass — `reset_complete` with `health_ok: true`
 says the chips are back and ticking, not that the fabric is proven. Over-enumeration against a
@@ -513,6 +530,7 @@ NOT be conflated when reading results.
 | I4 restart-safe scope/local child; overrun waited out; timeout leaves reset | `tests/test_device_safety.py::test_reset_runs_in_its_own_systemd_scope`, `tests/test_reset.py::test_a_reset_scope_argv_is_scoped_and_outlives_us`, `tests/test_reset.py::test_a_reset_without_systemd_runs_detached_and_returns_its_output`, `tests/test_reset.py::test_a_daemon_without_systemd_resets_through_the_local_backend`, `tests/test_reset.py::test_cancelling_the_waiter_does_not_kill_a_local_reset`, `tests/test_reset.py::test_a_reset_that_overruns_is_waited_out_not_failed`, `tests/test_reset.py::test_a_reset_that_never_ends_is_still_a_failure`, `tests/test_device_safety.py::test_reset_timeout_leaves_the_scope_running`, `tests/test_device_safety.py::test_the_reset_without_systemd_runs_bare_never_through_systemd_run` |
 | I5 adopt, never race, a live scope or local lock | `tests/test_reset.py::test_a_restarted_daemon_adopts_the_local_reset_lock`, `tests/test_device_safety.py::test_bridge_reset_is_skipped_while_a_reset_scope_is_in_flight`, `tests/test_device_safety.py::test_stuck_hold_climb_defers_when_a_reset_is_still_cycling`, `tests/test_device_safety.py::test_stuck_offbus_hold_skips_the_surgical_reset_when_a_scope_opened` |
 | I6 reset gate: foreign deny, incomplete fail-closed, force, carve-outs | `tests/test_reset_gate.py::TestResetGateDeny::test_denies_on_foreign_holder`, `tests/test_reset_gate.py::TestResetGateIncompleteScan::test_incomplete_scan_fails_closed_when_no_visible_foreign`, `tests/test_reset_gate.py::TestResetGateForce::test_force_overrides_foreign`, `tests/test_reset_gate.py::TestResetGateSystemHolders::test_allows_over_system_holder`, `tests/test_reset_gate.py::TestForeignHolders::test_ignores_system_holders`, `tests/test_reset_gate.py::TestResetGateAllow::test_allows_when_only_own_holders` |
+| I18 reset refuses (busy) over a running or held job; force stops it; idle proceeds | `tests/test_reset.py::test_reset_refuses_while_a_job_is_running_and_leaves_it_alone`, `tests/test_reset.py::test_reset_refuses_while_a_hung_job_is_still_held`, `tests/test_reset.py::test_reset_refuses_over_a_readopted_running_job`, `tests/test_reset.py::test_queued_jobs_do_not_block_a_reset`, `tests/test_reset.py::test_forced_reset_stops_the_running_job_and_logs_it`, `tests/test_reset.py::test_idle_reset_proceeds_without_a_busy_refusal`, `tests/test_reset.py::test_streaming_reset_refuses_while_a_job_is_running`, `tests/test_reset.py::test_the_health_gate_reset_is_not_blocked_by_the_busy_check` |
 | Anonymous (HTTP/privsep) gate fail-closed | `tests/test_reset_gate.py::TestResetGateAnonymous::test_anonymous_denied_over_a_tenant_holder`, `tests/test_reset_gate.py::TestResetGateAnonymous::test_anonymous_denied_when_scan_incomplete`, `tests/test_reset.py::test_privsep_http_reset_refuses_over_a_foreign_holder`, `tests/test_reset.py::test_non_privsep_http_reset_keeps_the_legacy_skip` |
 | Holder scan mechanics (deleted fd, permission gap) | `tests/test_device_holders.py::TestEnumerateDeviceHolders::test_detects_self_holding_a_device_node`, `tests/test_device_holders.py::TestEnumerateDeviceHolders::test_deleted_node_fd_is_not_a_holder`, `tests/test_device_holders.py::TestEnumerateDeviceHolders::test_permission_denied_marks_scan_incomplete` |
 | I6 driver record: a free device scans complete without privilege | `tests/test_device_holders.py::TestDriverHolderRecord::test_a_free_device_scans_complete_without_privilege` |
