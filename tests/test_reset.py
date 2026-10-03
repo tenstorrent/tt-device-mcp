@@ -1195,6 +1195,151 @@ def test_streaming_reset_refuses_a_job_dispatched_after_the_first_check(monkeypa
     assert not resets and not scope_kills and not pgroup_kills
 
 
+# --- issue #5: a forced reset must stop a job re-adopted after a broker restart (04 I18) ---
+#
+# A re-adopted job runs in its own scope with no current_process, so the forced path, which only
+# stopped current_process, reset the device under the live job.
+
+
+def _readopted_job(monkeypatch, *, job_id="905-1", owner="carol"):
+    """A job re-adopted after a broker restart: RUNNING in `jobs` and `readopted_scopes`, no process."""
+    job = _running_job(monkeypatch, job_id=job_id, owner=owner, live=False)
+    job.pid = None
+    monkeypatch.setattr(srv, "readopted_scopes", {job_id: srv.job_scope_unit(job_id)})
+    monkeypatch.setattr(srv, "READOPTED_FINALIZE_WAIT_SEC", 0)  # no monitor runs here to finalize it
+    return job
+
+
+def test_forced_reset_stops_a_readopted_job(monkeypatch, tmp_path):
+    job = _readopted_job(monkeypatch)
+
+    d, resets, (scope_kills, pgroup_kills) = _post_reset(monkeypatch, tmp_path, force=True)
+
+    assert d["status"] == "reset_complete" and resets
+    assert scope_kills == [srv.job_scope_unit("905-1")], "a forced reset must stop the re-adopted job's scope"
+    assert not pgroup_kills
+    assert job.status == srv.JobStatus.KILLED and "forced device reset" in job.error
+    assert "905-1" in srv.reset_killed_job_ids, "its end must not flag the device for another reset"
+    assert not srv._device_fault_failed_reason("905-1"), "a restart before its scope ends must re-adopt it"
+    assert any(s.startswith("stopping re-adopted job 905-1") for s in d["steps"])
+    assert not any(s.startswith("no broker job running") for s in d["steps"])
+
+
+def test_streaming_forced_reset_stops_a_readopted_job(monkeypatch, tmp_path):
+    (tmp_path / "0").write_text("")
+    job = _readopted_job(monkeypatch)
+    scope_kills, pgroup_kills = _record_terminators(monkeypatch)
+    resets = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
+
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": True})
+
+    assert "::status::refused" not in resp.text and resets
+    assert scope_kills == [srv.job_scope_unit("905-1")] and not pgroup_kills
+    assert "stopping re-adopted job 905-1" in resp.text
+    assert job.status == srv.JobStatus.KILLED and "905-1" in srv.reset_killed_job_ids
+
+
+def test_reset_refuses_while_a_stopped_readopted_job_is_still_being_torn_down(monkeypatch, tmp_path):
+    # A forced reset marked it KILLED and is stopping its scope; it owns the device until the scope ends.
+    job = _readopted_job(monkeypatch)
+    job.status = srv.JobStatus.KILLED
+
+    d, resets, (scope_kills, _) = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "refused" and d["reason"] == "busy" and d["job_id"] == "905-1"
+    assert d["job_status"] == "killed" and "still being torn down" in d["detail"]
+    assert not resets and not scope_kills
+
+
+def test_forced_reset_waits_for_the_readopted_job_to_be_finalized(monkeypatch, tmp_path):
+    """Its end is classified (log scanned for a fault) before the reset, as on the live path."""
+    (tmp_path / "0").write_text("")
+    _readopted_job(monkeypatch)
+    monkeypatch.setattr(srv, "READOPTED_FINALIZE_WAIT_SEC", 5)
+    monkeypatch.setattr(srv.subprocess, "run", _fake_tt_smi(0, snapshot_chips=1))
+    events = []
+
+    async def finalize_later():
+        await asyncio.sleep(0.3)
+        events.append("finalized")
+        srv.readopted_scopes.pop("905-1", None)
+
+    async def fake_scope(scope, grace_sec=0.0):
+        events.append("stop")
+        asyncio.get_event_loop().create_task(finalize_later())
+
+    async def run(argv, log, owner="[broker]health-gate", on_output=None):
+        events.append("reset")
+        return 0, ""
+
+    async def pollers(active, log):
+        return []
+
+    monkeypatch.setattr(srv, "_terminate_scope", fake_scope)
+    monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", run)
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+
+    d = _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": True}).json()
+
+    assert d["status"] == "reset_complete"
+    assert events == ["stop", "finalized", "reset"]
+
+
+def test_forced_reset_stops_a_readopted_job_seen_only_by_the_recheck(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+    real = srv._device_op
+
+    @asynccontextmanager
+    async def op(name, owner="[broker]"):
+        if name == "reset":
+            _readopted_job(monkeypatch, job_id="906-1")
+        async with real(name, owner) as v:
+            yield v
+
+    monkeypatch.setattr(srv, "_device_op", op)
+
+    d, resets, (scope_kills, _) = _post_reset(monkeypatch, tmp_path, force=True)
+
+    assert d["status"] == "reset_complete" and resets
+    assert scope_kills == [srv.job_scope_unit("906-1")]
+    assert srv.jobs["906-1"].status == srv.JobStatus.KILLED
+
+
+@pytest.mark.asyncio
+async def test_a_readopted_job_killed_by_a_forced_reset_does_not_flag_the_device(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The monitor finalizes the job once its scope ends. KILLED is a wedge-risk end, but this kill
+    was the reset's own: flagging the device for it would make the reset its own justification."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "reset_killed_job_ids", set())
+    log = tmp_path / "run_907.log"
+    log.write_text("... running ...\n")
+    job = srv.Job(
+        id="907-1", owner="carol", workspace="/w", command="pytest", queued_at="", status=srv.JobStatus.RUNNING
+    )
+    job.log_file = str(log)
+    srv.jobs["907-1"] = job
+    scope = srv.job_scope_unit("907-1")
+    monkeypatch.setattr(srv, "readopted_scopes", {"907-1": scope})
+    async with srv.get_lock():
+        assert srv._claim_readopted_job_for_reset(srv._reset_blocking_job()) == scope
+
+    await srv._monitor_readopted_scope("907-1", scope)
+
+    assert job.status == srv.JobStatus.KILLED and "forced device reset" in job.error
+    assert not srv._device_unavailable_for_tenant(), "a reset-killed job must not flag the device"
+    assert "907-1" not in srv.reset_killed_job_ids and "907-1" not in srv.readopted_scopes
+    assert "[KILLED by device reset]" in log.read_text()
+
+
 @pytest.mark.asyncio
 async def test_the_health_gate_reset_is_not_blocked_by_the_busy_check(monkeypatch):
     """The busy check belongs to the operator tool only. The gate's ladder resets through the
