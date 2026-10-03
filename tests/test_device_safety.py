@@ -3185,8 +3185,65 @@ async def test_an_interrupted_scope_is_reaped_without_a_second_sigint(monkeypatc
         return srv.subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(srv.subprocess, "run", _run)
+    marks = []
+    monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marks.append(reason))
     await srv._stop_job_scope("925", None, interrupted=True)
     assert systemctl == [["systemctl", "stop", srv.job_scope_unit("925")]]
+    assert len(marks) == 1, "the reaped leftover was not flagged"
+
+
+@pytest.mark.asyncio
+async def test_a_scope_reaped_after_a_clean_exit_marks_the_device_dirty(monkeypatch, clear_job_state):
+    """An exit-0 job raises no wedge-risk flag of its own. When its leftover outlives SIGINT and the
+    stop kills it without unwinding, the device is flagged so the next gate resets and verifies it."""
+    marks = []
+    monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marks.append((reason, job)))
+    job, systemctl, _, _ = await _run_one_job(monkeypatch, "926", privsep=True, scope_active=True)
+    scope = srv.job_scope_unit("926")
+    assert job.status is srv.JobStatus.COMPLETED and job.exit_code == 0
+    assert systemctl[-1] == ["systemctl", "stop", scope]
+    assert len(marks) == 1, "a leftover was stopped without unwinding and the device was left clean"
+    reason, marked_job = marks[0]
+    assert scope in reason and marked_job is job
+
+
+@pytest.mark.asyncio
+async def test_a_scope_that_ends_on_sigint_leaves_the_device_clean(monkeypatch):
+    """A leftover that unwinds on SIGINT released the device itself: no reap, no dirty flag."""
+    monkeypatch.setattr(srv, "GRACEFUL_KILL_GRACE_SEC", 0.05)
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_SEC", 0.02)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_POLL_SEC", 0.01)
+    systemctl = []
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: not systemctl)
+
+    def _run(argv, *a, **kw):
+        systemctl.append(list(argv))
+        return srv.subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(srv.subprocess, "run", _run)
+    marks = []
+    monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marks.append(reason))
+    await srv._stop_job_scope("927", None)
+    assert systemctl == [["systemctl", "kill", "--signal=SIGINT", srv.job_scope_unit("927")]]
+    assert not marks
+
+
+@pytest.mark.asyncio
+async def test_a_reaped_scope_of_a_recovery_killed_job_is_not_flagged(monkeypatch):
+    """Our own recovery killed the job to reset the device; its reap is not evidence for another
+    reset (I14)."""
+    monkeypatch.setattr(srv, "GRACEFUL_KILL_GRACE_SEC", 0.05)
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_SEC", 0.02)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: True)
+    monkeypatch.setattr(srv.subprocess, "run", lambda argv, *a, **kw: srv.subprocess.CompletedProcess(argv, 0, "", ""))
+    monkeypatch.setattr(srv, "reset_killed_job_ids", {"928"})
+    marks = []
+    monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marks.append(reason))
+    await srv._stop_job_scope("928", None, interrupted=True)
+    assert not marks
 
 
 @pytest.mark.asyncio
