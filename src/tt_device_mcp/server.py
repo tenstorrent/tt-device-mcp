@@ -4559,6 +4559,9 @@ async def _refuse_job_on_degraded_device(job: "Job", job_log_file: Optional[Path
         job.error = f"device degraded — job not dispatched: {reason}"
         if stats:
             stats.record_job_completion(job.status, job.wait_sec, job.runtime_sec)
+    # Refused is terminal: drop the queued spec, or a restart re-queues and runs a job the
+    # submitter was told had FAILED.
+    _forget_queued_job(job.id)
     # Make the refusal legible where the submitter looks — the job's own log, which recent
     # history reads back — so a job that never ran does not read as one that vanished.
     if job_log_file:
@@ -4593,6 +4596,7 @@ async def _refuse_job_privsep_identity(job: "Job", job_log_file: Optional[Path],
         job.error = f"privsep: job not dispatched: {reason}"
         if stats:
             stats.record_job_completion(job.status, job.wait_sec, job.runtime_sec)
+    _forget_queued_job(job.id)  # refused is terminal: a restart must not revive it
     if job_log_file:
         try:
             with open(job_log_file, "a") as f:
@@ -5690,6 +5694,7 @@ async def job_runner():
                     job.status = JobStatus.FAILED
                     job.finished_at = datetime.now().isoformat()
                     job.error = f"device degraded — job not dispatched: {blocked_reason}"
+                _forget_queued_job(job_id)
             # A degraded device refuses EVERY arriving job, so this is the high-volume path
             # during an outage — the one that must still sweep finished jobs, or the retained
             # set grows without bound exactly while an operator is reading it.
@@ -5712,6 +5717,7 @@ async def job_runner():
                     job.status = JobStatus.FAILED
                     job.finished_at = datetime.now().isoformat()
                     job.error = f"privsep: job not dispatched: {privsep_refusal_reason}"
+                _forget_queued_job(job_id)
             await cleanup_finished_jobs()
             get_job_queue().task_done()
             continue
