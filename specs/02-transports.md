@@ -146,11 +146,11 @@ socket server's serve task.
   backoff — sized to cover a systemd restart — so a broker bounce blips one call's connect, never
   the client's session. After the budget: a raised error on that call, session intact. A
   `tools/call` is retried only while it provably never reached a tool: the connect and `initialize`,
-  a refused connect, or `INVALID_REQUEST` (a restarted broker's answer to the old session id). Past
+  a refused connect, or a restarted broker's 404 for the old session id (`Session not found`). Past
   that the broker may already be running it (a job submit, a reset), so a stream cut (a broker
   restart) comes back as an `is_error` result saying the call was not re-sent, never as a second
-  send. Any other JSON-RPC error is the broker's answer and is passed on unretried. `tools/list` is
-  read-only and is retried whole.
+  send. Any other JSON-RPC error on a `tools/call`, including one the SDK makes from an HTTP error
+  status, is passed on unretried. `tools/list` is read-only and is retried whole on any failure.
 - **Transparency**: upstream results are returned unaltered (preserving `is_error`, structured
   content, pagination cursors); `_meta` is forwarded on calls so progress tokens reach the broker.
 

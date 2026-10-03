@@ -215,12 +215,20 @@ def _scripted_session(monkeypatch, replies: list) -> list:
 
 
 @pytest.mark.asyncio
-async def test_an_error_reply_from_the_broker_is_passed_on_not_retried(monkeypatch):
+@pytest.mark.parametrize(
+    "code, message",
+    [
+        (types.INVALID_PARAMS, "bad arguments"),
+        # Same code as an unknown session, but the SDK also uses it after the broker took the request.
+        (types.INVALID_REQUEST, "Unexpected content type: text/html"),
+    ],
+)
+async def test_an_error_reply_from_the_broker_is_passed_on_not_retried(monkeypatch, code, message):
     """A JSON-RPC error is the broker's answer, so the shim hands it on rather than asking again."""
-    seen = _scripted_session(monkeypatch, [MCPError(code=types.INVALID_PARAMS, message="bad arguments")])
+    seen = _scripted_session(monkeypatch, [MCPError(code=code, message=message)])
     handlers = await _shim_handlers(monkeypatch, stdio_shim._UDS_URL, contextlib.nullcontext)
 
-    with pytest.raises(MCPError, match="bad arguments"):
+    with pytest.raises(MCPError, match=message):
         await handlers["call_tool"](None, _call_params("tt_device_submit_job"))
     assert seen == ["tt_device_submit_job"]
 
