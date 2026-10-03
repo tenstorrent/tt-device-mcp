@@ -881,7 +881,8 @@ def cmd_logs(args) -> int:
 
 
 # Per read, not per reset: the broker sends a keepalive line on every quiet stretch
-# (RESET_STREAM_KEEPALIVE_SEC), so only a broker that has gone away trips this.
+# (RESET_STREAM_KEEPALIVE_SEC), so against a broker that sends keepalives only one that
+# has gone away trips this. An older broker sends none, and a reset quiet this long trips it.
 RESET_TIMEOUT = 300
 
 

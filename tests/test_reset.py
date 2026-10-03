@@ -6,6 +6,8 @@ never resets real hardware; it exercises the gate→exec→result flow and the
 verbose step/command/returncode payload the CLI prints."""
 
 import asyncio
+import gc
+import json
 import os
 import subprocess
 import sys
@@ -13,6 +15,7 @@ import threading
 import time
 
 import pytest
+from starlette.requests import ClientDisconnect
 from starlette.testclient import TestClient
 
 import tt_device_mcp.server as srv
@@ -211,6 +214,110 @@ def test_a_silent_reset_stream_sends_keepalives_when_asked(monkeypatch, tmp_path
         assert "exit code: 0" in lines, "the keepalive wrapper dropped a progress line"
     else:
         assert kept == 0, "a client that did not ask was sent keepalives"
+
+
+@pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
+def test_a_client_that_leaves_a_silent_reset_does_not_stop_it(monkeypatch, tmp_path, spec_version):
+    """The CLI can go away (Ctrl-C, a dropped socket) while the keepalive wrapper waits on
+    a reset step. The reset must still run to the end, the step must be closed, not left
+    pending, and cleanup must not race it ("already running") or drop it ("destroyed").
+    Starlette has two disconnect paths: under ASGI 2.3 (uvicorn) a cancel scope cancels the
+    stream; under 2.4 the send fails and the wrapper is left for the loop to finalize."""
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "RESET_STREAM_KEEPALIVE_SEC", 0.02)
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    reset_end = []
+
+    async def silent_reset(argv, log, owner="[broker]health-gate", on_output=None):
+        try:
+            await asyncio.sleep(0.3)  # many keepalive intervals with no output
+        except asyncio.CancelledError:
+            reset_end.append("cancelled")
+            raise
+        reset_end.append("finished")
+        return 0, ""
+
+    async def pollers(active, log):
+        return []
+
+    async def healthy(*_a, **_k):
+        return True, {"snapshot": {"detail": "ok"}}
+
+    monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", silent_reset)
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    monkeypatch.setattr(srv.fsm, "observe", healthy)
+    app = srv.build_asgi_app(srv.create_mcp_server())
+    keepalive = srv.RESET_STREAM_KEEPALIVE_LINE.encode()
+
+    async def drive():
+        loop = asyncio.get_running_loop()
+        errors = []
+        loop.set_exception_handler(lambda _loop, ctx: errors.append(ctx))
+        inner = []
+        hooks = sys.get_asyncgen_hooks()
+
+        def firstiter(gen):
+            if gen.__qualname__.endswith("_reset_stream"):
+                inner.append(gen)
+            hooks.firstiter(gen)
+
+        sys.set_asyncgen_hooks(firstiter=firstiter, finalizer=hooks.finalizer)
+        left = asyncio.Event()
+        request = [{"type": "http.request", "body": json.dumps({"force": False, "keepalive": True}).encode()}]
+
+        async def receive():
+            if request:
+                return request.pop()
+            await left.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(msg):
+            if keepalive in msg.get("body", b""):
+                if left.is_set():
+                    raise OSError("client went away")  # ASGI 2.4: the send fails
+                left.set()  # ASGI 2.3: the next receive reports the disconnect
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": spec_version},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/tt_device_reset_stream",
+            "raw_path": b"/api/tt_device_reset_stream",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"host", b"localhost"), (b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 1),
+            "server": ("127.0.0.1", 80),
+        }
+        try:
+            try:
+                await app(scope, receive, send)
+            except ClientDisconnect:
+                assert spec_version == "2.4"  # the server swallows it
+            assert left.is_set(), "the client left before any keepalive was sent"
+            assert not reset_end, "the stream ended with the reset, not with the client"
+            for _ in range(200):
+                if reset_end:
+                    break
+                await asyncio.sleep(0.01)
+            gc.collect()  # a dropped wrapper is finalized by the loop
+            await asyncio.sleep(0.05)
+            # Checked before asyncio.run returns: its shutdown closes any generator left open.
+            open_steps = [g for g in inner if g.ag_frame is not None]
+        finally:
+            sys.set_asyncgen_hooks(*hooks)
+        return inner, open_steps, errors
+
+    inner, open_steps, errors = asyncio.run(drive())
+    gc.collect()
+
+    assert reset_end == ["finished"], f"the client leaving stopped the reset: {reset_end}"
+    assert len(inner) == 1, inner
+    assert not open_steps, "the reset stream was left open after its client went away"
+    assert not errors, [c.get("message") or repr(c.get("exception")) for c in errors]
 
 
 def test_reset_success_reports_steps_and_command(monkeypatch, tmp_path):

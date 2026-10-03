@@ -6745,8 +6745,13 @@ def create_mcp_server() -> MCPServer:
                 yield line
         finally:
             if nxt is not None and not nxt.done():
+                # Cancelling the pending step ends ``lines`` (the CancelledError leaves it through
+                # __anext__); waiting for that keeps aclose() from racing it ("already running").
+                # Under ASGI 2.3 anyio delivers the client's cancel again here, so the gather
+                # raises and aclose() is skipped: harmless, as the cancelled step has already
+                # closed the generator. reset_task is not awaited by the step, so it runs on.
                 nxt.cancel()
-                await asyncio.gather(nxt, return_exceptions=True)  # the step must stop before aclose
+                await asyncio.gather(nxt, return_exceptions=True)
             await lines.aclose()
 
     @mcp.custom_route("/api/tt_device_reset_stream", methods=["POST"])
