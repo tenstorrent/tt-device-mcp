@@ -11,6 +11,7 @@ is a real failure this broker caused in production, so each gets a test.
 import asyncio
 import json
 import os
+import sys
 import time
 from datetime import datetime, timedelta
 
@@ -6526,6 +6527,21 @@ async def test_eth_heartbeat_could_not_check_journals_the_lost_verdict(monkeypat
     assert ok is None
     events = health.read_health_events(kinds={"eth_heartbeat_unavailable"})
     assert [e["reason"] for e in events] == ["could_not_check"], events
+
+
+@pytest.mark.parametrize("rc,forgets", [(FABRIC_CHECK_CANNOT_CHECK_RC, True), (1, True), (0, False), (3, False)])
+@pytest.mark.asyncio
+async def test_a_builtin_eth_read_with_no_verdict_drops_the_cached_python(monkeypatch, rc, forgets):
+    """eth.resolve_python() is cached per process, so a python that lost ttexalens in place would
+    keep being handed out. A built-in read that reaches no verdict drops the cache so the next
+    gate re-runs the import checks; a read with a verdict keeps it."""
+    monkeypatch.setattr(eth, "build", lambda: ([sys.executable, "-c", f"raise SystemExit({rc})"], dict(os.environ)))
+    forgot = []
+    monkeypatch.setattr(eth, "forget_python", lambda: forgot.append(1))
+
+    await srv.health_monitor.verify_eth_heartbeat(timeout_sec=10)
+
+    assert bool(forgot) is forgets
 
 
 # --- a frozen-eth verdict must route the GATE to HOLD, never to a reset ---------

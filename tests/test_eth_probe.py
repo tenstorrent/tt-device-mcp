@@ -225,6 +225,151 @@ def test_falls_through_a_broken_pin_to_the_validator_env(tmp_path, monkeypatch):
     assert tree == str(current)
 
 
+# --- resolve_python's per-process cache: the import checks run once, not every gate ----------
+#
+# On an armed host build() runs on every clean post-job gate, and the import checks it would
+# spawn there (up to 3 x 10s) sit outside the read's own bound. A counting stub python records
+# each `-c import ttexalens` it answers, so these tests count spawns, not just results.
+
+
+def _counting_python(path: Path, log: Path, *, import_ok: bool = True) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [ "$1" = "-c" ]; then echo x >> "{log}"; exit {0 if import_ok else 1}; fi\n'
+        "exit 0\n"
+    )
+    path.chmod(0o755)
+    return path
+
+
+def _spawns(log: Path) -> int:
+    return len(log.read_text().splitlines()) if log.exists() else 0
+
+
+def _validator_release(vroot: Path, name: str, log: Path) -> Path:
+    """A release dir with its own python_env, as the validator pipeline stages one."""
+    release = vroot / name
+    _counting_python(release / "python_env" / "bin" / "python", log)
+    return release
+
+
+def test_resolved_python_is_cached_across_calls(tmp_path, monkeypatch):
+    vroot = tmp_path / "validator"
+    log = tmp_path / "spawns"
+    release = _validator_release(vroot, "r1", log)
+    (vroot / "current").symlink_to(release)
+    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(vroot))
+
+    first = resolve_python()
+    assert first is not None
+    assert _spawns(log) == 1
+    for _ in range(5):
+        assert resolve_python() == first
+    assert _spawns(log) == 1, "a cached python re-ran its import check"
+
+
+def test_build_on_every_gate_spawns_the_import_check_once(tmp_path, monkeypatch):
+    # The gate's actual call: build() on an armed host, once per clean post-job pass.
+    vroot = tmp_path / "validator"
+    log = tmp_path / "spawns"
+    release = _validator_release(vroot, "r1", log)
+    (vroot / "current").symlink_to(release)
+    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(vroot))
+    monkeypatch.setenv("TTDEV_ETH_CHECK_ARMED", "1")
+    monkeypatch.setenv("TTDEV_ETH_CHECK_PROBE", str(_fake_probe(tmp_path)))
+    monkeypatch.setenv("TTDEV_ETH_CHECK_CACHE", str(tmp_path / "cache"))
+
+    for _ in range(4):
+        assert build() is not None
+    assert _spawns(log) == 1
+
+
+def test_repointing_current_re_resolves(tmp_path, monkeypatch):
+    # The validator pipeline flips `current` to a new release; the cached python belongs to the
+    # old one and must not outlive the flip.
+    vroot = tmp_path / "validator"
+    log = tmp_path / "spawns"
+    r1 = _validator_release(vroot, "r1", log)
+    r2 = _validator_release(vroot, "r2", log)
+    current = vroot / "current"
+    current.symlink_to(r1)
+    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(vroot))
+
+    assert resolve_python() is not None
+    assert _spawns(log) == 1
+    current.unlink()
+    current.symlink_to(r2)
+    assert resolve_python() is not None
+    assert _spawns(log) == 2, "a re-pointed current/ kept the old release's cached answer"
+    assert resolve_python() is not None
+    assert _spawns(log) == 2
+
+
+def test_a_changed_pin_re_resolves(tmp_path, monkeypatch):
+    vroot = tmp_path / "validator"
+    (vroot / "current").mkdir(parents=True)
+    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(vroot))
+    log = tmp_path / "spawns"
+    a = _counting_python(tmp_path / "a" / "python", log)
+    b = _counting_python(tmp_path / "b" / "python", log)
+
+    monkeypatch.setenv("TTDEV_ETH_CHECK_PYTHON", str(a))
+    assert resolve_python()[0] == str(a)
+    monkeypatch.setenv("TTDEV_ETH_CHECK_PYTHON", str(b))
+    assert resolve_python()[0] == str(b)
+    assert _spawns(log) == 2
+
+
+def test_a_cached_python_that_disappears_re_resolves(tmp_path, monkeypatch):
+    vroot = tmp_path / "validator"
+    (vroot / "current").mkdir(parents=True)
+    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(vroot))
+    log = tmp_path / "spawns"
+    pin = _counting_python(tmp_path / "pin" / "python", log)
+    monkeypatch.setenv("TTDEV_ETH_CHECK_PYTHON", str(pin))
+
+    assert resolve_python()[0] == str(pin)
+    pin.unlink()
+    assert resolve_python() is None
+
+
+def test_no_python_is_cached_only_for_the_negative_ttl(tmp_path, monkeypatch):
+    vroot = tmp_path / "validator"
+    (vroot / "current").mkdir(parents=True)
+    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(vroot))
+    log = tmp_path / "spawns"
+    pin = _counting_python(tmp_path / "pin" / "python", log, import_ok=False)
+    monkeypatch.setenv("TTDEV_ETH_CHECK_PYTHON", str(pin))
+    now = [1000.0]
+    monkeypatch.setattr(eth.time, "monotonic", lambda: now[0])
+
+    assert resolve_python() is None
+    assert resolve_python() is None
+    assert _spawns(log) == 1
+    # ttexalens gets installed into the pinned python; the miss expires and it is picked up.
+    _counting_python(pin, log, import_ok=True)
+    now[0] += eth.NEGATIVE_TTL_SEC + 1
+    assert resolve_python()[0] == str(pin)
+    assert _spawns(log) == 2
+
+
+def test_forget_python_forces_a_fresh_import_check(tmp_path, monkeypatch):
+    vroot = tmp_path / "validator"
+    (vroot / "current").mkdir(parents=True)
+    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(vroot))
+    log = tmp_path / "spawns"
+    pin = _counting_python(tmp_path / "pin" / "python", log)
+    monkeypatch.setenv("TTDEV_ETH_CHECK_PYTHON", str(pin))
+
+    assert resolve_python() is not None
+    eth.forget_python()
+    # ttexalens vanished from the venv in place: same path, same current/.
+    _counting_python(pin, log, import_ok=False)
+    assert resolve_python() is None
+    assert _spawns(log) == 2
+
+
 # --- probe_timeout_sec: TTDEV_ETH_CHECK_TIMEOUT, kept below the caller's own bound -----------
 
 

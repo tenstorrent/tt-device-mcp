@@ -623,7 +623,7 @@ class HealthMonitor:
     async def _verify_eth_heartbeat_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
         override = self._eth_heartbeat_cmd()
         # build() can shell out up to three candidate pythons (health.monitors.eth.resolve_python)
-        # once armed — off the event loop, or a health gate stalls the job queue, MCP requests,
+        # on a cache miss once armed — off the event loop, or a health gate stalls the job queue, MCP requests,
         # and the sd_notify watchdog ping for as long as those subprocess.run calls take.
         built = await asyncio.to_thread(eth.build)
         if built is None:
@@ -708,6 +708,9 @@ class HealthMonitor:
             # through to the traffic pass is correct, but a configured rung that got no verdict
             # deserves a loud record, mirroring the fabric check's own rc-77 path.
             self._journal_skip_once("eth_heartbeat_unavailable", "could_not_check", detail=last[:400])
+            if not override:
+                # A python that lost ttexalens in place reads like this too: re-resolve next time.
+                eth.forget_python()
             return None, f"skipped (eth-heartbeat read could not check): {reason}"
         if ok is False:
             return False, f"a frozen active-eth core ({dt:.0f}s): {reason}"

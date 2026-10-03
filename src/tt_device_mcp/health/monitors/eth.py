@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -53,6 +55,17 @@ DEFAULT_ETH_VENV_PYTHON = "/opt/tt-device-broker/eth-venv/bin/python"
 # editable install (this repo's own test suite) genuinely has `deploy/` alongside this file, so
 # an unsandboxed test would resolve to the real probe script instead of a scripted stand-in.
 _REPO_ROOT = Path(__file__).resolve().parents[4]
+
+# resolve_python() spawns up to three `python -c "import ttexalens"` checks (10s each), and on an
+# armed host build() calls it on every clean post-job gate — outside the read's own bound. So the
+# answer is cached per process, keyed on the candidate list and where the validator's `current`
+# symlink points: re-pointing `current`, or changing any candidate env var, re-resolves. A hit is
+# re-checked with cheap stat calls only (the python still executable, its tree still there). A
+# miss (None) is cached for NEGATIVE_TTL_SEC only, so a venv provisioned later is picked up
+# without a restart. forget_python() drops the entry when a read reaches no verdict.
+NEGATIVE_TTL_SEC = 60.0
+_python_cache: dict[tuple, tuple[Optional[tuple[str, str]], float]] = {}
+_python_cache_lock = threading.Lock()
 
 
 def _tree_for(python: str, current: str) -> str:
@@ -82,6 +95,10 @@ def resolve_python(*, import_timeout_sec: float = 10.0) -> Optional[tuple[str, s
          in-package move) or the default install path.
     ``None`` if no candidate both exists and can import it — a check that cannot read must
     never guess.
+
+    Cached per process (see ``_python_cache``): only the first call, or the first after
+    ``current`` is re-pointed, a candidate env var changes, a cached python or tree disappears,
+    a ``None`` ages past ``NEGATIVE_TTL_SEC`` or ``forget_python()`` runs, spawns anything.
     """
     vroot = os.environ.get("TTDEV_VALIDATOR_ROOT", "/opt/tt-device-broker/validator").strip()
     current = f"{vroot}/current"
@@ -96,6 +113,33 @@ def resolve_python(*, import_timeout_sec: float = 10.0) -> Optional[tuple[str, s
         if c
     ]
 
+    key = (tuple(candidates), os.path.realpath(current))
+    with _python_cache_lock:
+        hit = _python_cache.get(key)
+        if hit is not None:
+            resolved, at = hit
+            if resolved is None:
+                if time.monotonic() - at < NEGATIVE_TTL_SEC:
+                    return None
+            elif os.access(resolved[0], os.X_OK) and os.path.isdir(resolved[1]):
+                return resolved
+        resolved = _resolve_python_uncached(candidates, current, import_timeout_sec)
+        _python_cache.clear()
+        _python_cache[key] = (resolved, time.monotonic())
+        return resolved
+
+
+def forget_python() -> None:
+    """Drop the cached ``resolve_python()`` answer, so the next ``build()`` re-runs the import
+    checks — called when a read reaches no verdict, which a python that lost ttexalens in place
+    (``current`` unchanged) would cause."""
+    with _python_cache_lock:
+        _python_cache.clear()
+
+
+def _resolve_python_uncached(
+    candidates: list[str], current: str, import_timeout_sec: float
+) -> Optional[tuple[str, str]]:
     for python in candidates:
         if not os.access(python, os.X_OK):
             continue
@@ -190,8 +234,9 @@ def build() -> Optional[tuple[list[str], dict[str, str]]]:
     ``TTDEV_ETH_CHECK_ALLOW_KNOWN_BROKEN=1`` (below) to run the probe itself, laundered.
 
     Spawns nothing and does no I/O beyond ``os.access`` checks EXCEPT ``resolve_python()``,
-    which can shell out up to three candidate pythons — callers on an event loop should run
-    this off it (e.g. ``asyncio.to_thread``), see ``monitor.verify_eth_heartbeat``.
+    which can shell out up to three candidate pythons on a cache miss — callers on an event
+    loop should run this off it (e.g. ``asyncio.to_thread``), see
+    ``monitor.verify_eth_heartbeat``.
 
     The built-in path is ``None`` — unavailable, same as no override and no validator
     installed for fabric — until ALL of: the rung is armed on this host (the broker's startup
