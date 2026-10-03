@@ -178,6 +178,10 @@ class TelemetrySampler:
         # empty sample the all-ones blackout above never sees. Debounced like that blackout: a
         # lone empty sample from a rescan or a driver re-init settling must not trip it.
         self.all_chips_gone_strikes: int = 0
+        # Consecutive samples with FEWER chip nodes than the host's baseline but not none — part of
+        # the mesh off the bus. chip_sample() omits a gone node, so 24 of 32 reads as 24 healthy
+        # chips; without this count the drop sets no flag until the next gate (spec 03 I30).
+        self.short_count_strikes: int = 0
         # Liveness of this loop. Its per-iteration `except Exception` cannot catch a hung
         # `to_thread` device read on a wedged chip, so the loop can stall indefinitely while
         # the event loop keeps serving — see is_stalled() and the watchdog gate in server.py.
@@ -247,14 +251,27 @@ class TelemetrySampler:
         A genuinely dead chip stays dead; a transient does not. Twenty seconds is a rounding
         error against the ~130s a host survives after a chip drops, and it buys immunity to a
         whole class of false positives — the kind that just took a working box offline.
+
+        FEWER CHIPS THAN THE BASELINE. A chip whose node left sysfs is simply absent from the
+        sample, so 24 answering chips on a 32-chip host look healthy chip by chip. The count is
+        held to the same baseline heartbeat_verdict uses, on the same two-sample proof; a host
+        with no baseline yet is never short.
         """
         log = self._deps.logger()
         dead = sorted((i for i, v in sample.items() if v and v[0] == ALL_ONES), key=int)
         if sample and not dead:
-            # Every chip is present and answering — genuinely healthy. Re-arm both debouncers.
             self.dead_chip_strikes = {}
             self.all_chips_gone_strikes = 0
+            # expected(0) reads the baseline without ratcheting it down to a short sample.
+            # Health checks off (TT_DEVICE_MCP_HEALTH_CHECK=0) means no count check either (I25).
+            expected = self._monitor.expected(0) if self._monitor._health_check_enabled() else 0
+            if expected <= 0 or len(sample) >= expected:
+                # Every chip is present and answering — genuinely healthy. Re-arm every debouncer.
+                self.short_count_strikes = 0
+                return
+            await self._check_short_count(len(sample), expected, log)
             return
+        self.short_count_strikes = 0
 
         if self._mechanism.reset_in_flight:
             return  # a reset is supposed to do this
@@ -347,6 +364,28 @@ class TelemetrySampler:
 
         if confirmed:
             await self.isolate_dead_chips(confirmed)
+
+    async def _check_short_count(self, present: int, expected: int, log) -> None:
+        """Fewer chip nodes than the baseline on two consecutive samples -> dirty (spec 03 I30).
+
+        A reset in flight takes chips off the bus by design and is excused, as for all-ones. Flagged
+        only on a HEALTHY box, unlike the all-gone drop: under an open episode (an off-bus hold the
+        gate placed dirty=False, an isolated chip) the short count is that same fault, and
+        re-dirtying it would turn the gate's hold back into a reset owed on every admission poll."""
+        if self._mechanism.reset_in_flight or await asyncio.to_thread(self._mechanism.scope_active):
+            return
+        self.short_count_strikes += 1
+        if self.short_count_strikes < 2 or self._deps.episode_open():
+            return
+        self._deps.health_event("chips_missing", present=present, expected=expected)
+        self._deps.mark_device_dirty(
+            f"{present} of {expected} chips in sysfs — chips dropped off the PCIe bus", why="heartbeat"
+        )
+        if log:
+            log.error(
+                f"{present} of {expected} chips present in sysfs on two consecutive samples — "
+                f"{expected - present} chip(s) dropped off the PCIe bus. Holding the device."
+            )
 
     async def isolate_dead_chips(self, dead: list) -> None:
         """Cut chips that have left the PCIe bus out of the kernel, immediately.
