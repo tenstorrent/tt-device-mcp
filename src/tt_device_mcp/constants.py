@@ -59,6 +59,12 @@ DEVICE_RESET_TIMEOUT_SEC = 600
 # generous margin here is not caution, it is the wedge's dwell time.
 FABRIC_CHECK_TIMEOUT_SEC = 180
 
+# The bound on the passive eth-heartbeat read a CLEAN post-job gate runs (spec 03 I30). The
+# startup self-test only arms the rung on a read that answers inside 10s, so an armed read that
+# needs longer here is not a slow host; it is a read that did not finish, and the gate runs the
+# full pass instead. Matches the self-test budget (server.ETH_CHECK_SELFTEST_BUDGET_SEC).
+ETH_POST_JOB_TIMEOUT_SEC = 10.0
+
 # The fabric check exits with this when it could not run at all (validator or
 # descriptor absent). It means "nothing was learned about the fabric" and must stay
 # distinct from exit 0: a check that reports a mesh it never looked at as healthy is
