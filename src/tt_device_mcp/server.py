@@ -71,6 +71,7 @@ TT_DEV_DIR = "/dev/tenstorrent"
 from tt_device_mcp.device_holders import (
     MIN_TENANT_UID,
     ReclaimResult,
+    descends_from,
     enumerate_device_holders,
     evaluate_reset_gate,
     reclaim_foreign_holders,
@@ -4544,14 +4545,17 @@ def _tenant_holder_reason() -> str:
     The post-job gate skips every probe while such a holder is present (03 I13), so a job
     dispatched behind it would run beside that process on a device nobody checked. Only a
     holder SEEN is counted: system accounts below MIN_TENANT_UID hold the device permanently
-    and are not tenants, the broker itself is not foreign, and an incomplete scan does not
+    and are not tenants, the broker itself and its children are not foreign (a per-user
+    broker runs its own probes — startup fabric verify, idle relift, operator reset, post-step
+    gate — as subprocesses under the tenant's uid; a leftover reparented away from the broker
+    still counts), and an incomplete scan does not
     block — a per-user broker can never see other users' processes, and a dispatch, unlike a
     reset, harms no one it cannot see. A host with no device nodes has no holder to find.
     """
     if not _present_chip_indices():
         return ""
     me = os.getpid()
-    held = [h for h in enumerate_device_holders().holders if h.uid >= MIN_TENANT_UID and h.pid != me]
+    held = [h for h in enumerate_device_holders().holders if h.uid >= MIN_TENANT_UID and not descends_from(h.pid, me)]
     if not held:
         return ""
     who = ", ".join(f"{h.username}(pid {h.pid})" for h in held)

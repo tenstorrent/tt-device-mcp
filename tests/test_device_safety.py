@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event, patch_recovery
-from tt_device_mcp import privileges
+from tt_device_mcp import device_holders, privileges
 from tt_device_mcp import server as srv
 from tt_device_mcp.constants import FABRIC_CHECK_CANNOT_CHECK_RC
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -3060,9 +3060,12 @@ async def test_no_job_starts_on_a_device_flagged_dirty(monkeypatch, clear_job_st
 # every probe, so the next job was dispatched beside the leftover onto an unchecked device.
 
 
-def _patch_device_holders(monkeypatch, scan):
+def _patch_device_holders(monkeypatch, scan, ppids=None):
+    """``ppids`` maps pid -> parent pid for the parent-chain walk; a pid not in it reads as gone,
+    so no test depends on the real /proc."""
     monkeypatch.setattr(srv, "_present_chip_indices", lambda: ["0"])
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scan)
+    monkeypatch.setattr(device_holders, "_read_proc_ppid", (ppids or {}).get)
 
 
 async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=lambda: ""):
@@ -3256,6 +3259,37 @@ async def test_a_tenant_holder_holds_the_job_until_it_exits(monkeypatch, clear_j
 def test_broker_owned_holders_do_not_block_dispatch(monkeypatch, holder):
     _patch_device_holders(monkeypatch, HolderScan(holders=[holder]))
     assert srv._tenant_holder_reason() == ""
+
+
+def test_the_brokers_own_child_probe_does_not_block_dispatch(monkeypatch):
+    """A per-user broker runs its probes (startup fabric verify, relift, reset, post-step gate)
+    as subprocesses under the tenant's uid; one holding the device is not an outside holder."""
+    probe, shell = 5001, 5000  # broker -> shell -> probe
+    _patch_device_holders(
+        monkeypatch,
+        HolderScan(holders=[DeviceHolder(pid=probe, uid=1234)]),
+        ppids={probe: shell, shell: os.getpid()},
+    )
+    assert srv._tenant_holder_reason() == ""
+
+
+def test_a_leftover_reparented_away_from_the_broker_still_blocks_dispatch(monkeypatch):
+    """A daemonized leftover reparented to init is no longer the broker's child: it still counts."""
+    _patch_device_holders(monkeypatch, HolderScan(holders=[DeviceHolder(pid=5001, uid=1234)]), ppids={5001: 1})
+    assert "pid 5001" in srv._tenant_holder_reason()
+
+
+def test_a_holder_that_exits_mid_walk_does_not_break_the_scan(monkeypatch):
+    """The holder's parent is gone before its stat is read: no crash, and it is not exempted."""
+    _patch_device_holders(monkeypatch, HolderScan(holders=[DeviceHolder(pid=5001, uid=1234)]), ppids={5001: 5000})
+    assert "pid 5001" in srv._tenant_holder_reason()
+
+
+def test_a_parent_cycle_ends_the_walk(monkeypatch):
+    _patch_device_holders(
+        monkeypatch, HolderScan(holders=[DeviceHolder(pid=5001, uid=1234)]), ppids={5001: 5000, 5000: 5001}
+    )
+    assert "pid 5001" in srv._tenant_holder_reason()
 
 
 def test_an_incomplete_holder_scan_does_not_block_dispatch(monkeypatch):

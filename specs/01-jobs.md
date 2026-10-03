@@ -89,7 +89,8 @@ the queue and a running job outlive the broker process.
   with `TT_DEVICE_MCP_TENANT_HOLD=0` it is refused at the door as FAILED with the reason in
   its log. Gate internals are spec 03. Before the gate, a job waits while a process
   outside the broker holds the device (`_wait_out_foreign_holder`): a holder with uid ≥
-  `MIN_TENANT_UID` that is not the broker itself. The wait re-scans every
+  `MIN_TENANT_UID` that is not the broker itself or its children (a holder whose parent
+  chain reaches the broker's pid; one reparented away from it still counts). The wait re-scans every
   `_HOLDER_WAIT_POLL_SEC` and ends when the holder exits, so the gate then checks the
   device the holder left. A busy device is not a degraded one: the wait opens no
   `device_held` episode and the hold deadline does not count it. With
