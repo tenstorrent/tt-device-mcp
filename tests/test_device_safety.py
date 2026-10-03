@@ -866,6 +866,7 @@ async def test_a_setup_error_after_running_fails_the_job_not_the_runner(monkeypa
 
     assert bad.status is srv.JobStatus.FAILED, f"job 906 is {bad.status.value}, expected FAILED"
     assert bad.finished_at, "the failed job was never finished"
+    assert "[EXCEPTION:" in bad.error, f"the failed job does not say why: {bad.error!r}"
     assert good.status is srv.JobStatus.COMPLETED, f"the job queued behind it is {good.status.value}"
     assert srv.current_job_id is None
 

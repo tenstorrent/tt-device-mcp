@@ -202,8 +202,8 @@ flowchart LR
   script + the command. Under privsep it runs inside a transient systemd scope named
   `job_scope_unit(job_id)` (`ttdev-job-<id>.scope`) as the submitting uid; otherwise
   directly. Both paths use `preexec_fn=os.setsid` (I4).
-- Every step after the job turns RUNNING — the `[Started at]` log line, the activation
-  script, the privsep prefix, the spawn — runs inside the runner's `try`. If one raises
+- Every step from the `[Started at]` log line on — the activation script, the privsep
+  prefix, the spawn — runs inside the runner's `try`. If one raises
   (a full disk is enough), the job ends FAILED with an `[EXCEPTION: ...]` note, its queued
   spec is forgotten, and the runner goes on to the next job; it never dies with the job
   left RUNNING. A footer write that fails is logged, not raised.
