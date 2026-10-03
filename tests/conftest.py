@@ -285,7 +285,7 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(heartbeat, "_heartbeat_absent_journaled", False, raising=False)
     # eth.resolve_python() caches its answer per process; every test starts with it empty, so
     # one test's resolved stub python never answers for the next one's.
-    monkeypatch.setattr(eth, "_python_cache", {}, raising=False)
+    monkeypatch.setattr(eth, "_python_cache", None, raising=False)
     # Prometheus's textfile dir defaults to the REAL /var/lib/prometheus/node-exporter and is read
     # fresh on every write_textfile() call (never cached), so any path through the stats
     # persistence loop that reaches it in a test would mkdir a real host path.

@@ -6529,12 +6529,16 @@ async def test_eth_heartbeat_could_not_check_journals_the_lost_verdict(monkeypat
     assert [e["reason"] for e in events] == ["could_not_check"], events
 
 
-@pytest.mark.parametrize("rc,forgets", [(FABRIC_CHECK_CANNOT_CHECK_RC, True), (1, True), (0, False), (3, False)])
+@pytest.mark.parametrize(
+    "rc,forgets", [(1, True), (FABRIC_CHECK_CANNOT_CHECK_RC, False), (137, False), (0, False), (3, False)]
+)
 @pytest.mark.asyncio
-async def test_a_builtin_eth_read_with_no_verdict_drops_the_cached_python(monkeypatch, rc, forgets):
+async def test_a_crashed_builtin_eth_read_drops_the_cached_python(monkeypatch, rc, forgets):
     """eth.resolve_python() is cached per process, so a python that lost ttexalens in place would
-    keep being handed out. A built-in read that reaches no verdict drops the cache so the next
-    gate re-runs the import checks; a read with a verdict keeps it."""
+    keep being handed out. A built-in read that crashes (exit 1, an unhandled exception such as
+    that ImportError) drops the cache so the next gate re-runs the import checks. Any other exit
+    keeps it: that python imported and ran the probe, and re-resolving would put the import
+    checks back on every gate."""
     monkeypatch.setattr(eth, "build", lambda: ([sys.executable, "-c", f"raise SystemExit({rc})"], dict(os.environ)))
     forgot = []
     monkeypatch.setattr(eth, "forget_python", lambda: forgot.append(1))
@@ -6542,6 +6546,32 @@ async def test_a_builtin_eth_read_with_no_verdict_drops_the_cached_python(monkey
     await srv.health_monitor.verify_eth_heartbeat(timeout_sec=10)
 
     assert bool(forgot) is forgets
+
+
+@pytest.mark.asyncio
+async def test_a_builtin_eth_read_that_cannot_spawn_drops_the_cached_python(monkeypatch):
+    monkeypatch.setattr(eth, "build", lambda: (["/nonexistent/python", "probe.py"], dict(os.environ)))
+    forgot = []
+    monkeypatch.setattr(eth, "forget_python", lambda: forgot.append(1))
+
+    ok, _ = await srv.health_monitor.verify_eth_heartbeat(timeout_sec=10)
+
+    assert ok is None
+    assert forgot
+
+
+@pytest.mark.asyncio
+async def test_an_override_eth_read_with_no_verdict_keeps_the_cached_python(monkeypatch):
+    # An operator's override never uses resolve_python(), so its failures say nothing about it.
+    monkeypatch.setenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", f"exit {FABRIC_CHECK_CANNOT_CHECK_RC}")
+    monkeypatch.setenv("TTDEV_ETH_CHECK_ARMED", "1")
+    forgot = []
+    monkeypatch.setattr(eth, "forget_python", lambda: forgot.append(1))
+
+    ok, _ = await srv.health_monitor.verify_eth_heartbeat(timeout_sec=10)
+
+    assert ok is None
+    assert not forgot
 
 
 # --- a frozen-eth verdict must route the GATE to HOLD, never to a reset ---------

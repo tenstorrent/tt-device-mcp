@@ -61,10 +61,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 # answer is cached per process, keyed on the candidate list and where the validator's `current`
 # symlink points: re-pointing `current`, or changing any candidate env var, re-resolves. A hit is
 # re-checked with cheap stat calls only (the python still executable, its tree still there). A
-# miss (None) is cached for NEGATIVE_TTL_SEC only, so a venv provisioned later is picked up
-# without a restart. forget_python() drops the entry when a read reaches no verdict.
+# miss (None) is cached for NEGATIVE_TTL_SEC only, and not at all when an import check timed out,
+# so a venv provisioned later is picked up without a restart. forget_python() drops the entry
+# when a read crashes. One slot: (key, answer, monotonic time it was stored), or None.
 NEGATIVE_TTL_SEC = 60.0
-_python_cache: dict[tuple, tuple[Optional[tuple[str, str]], float]] = {}
+_python_cache: Optional[tuple[tuple, Optional[tuple[str, str]], float]] = None
 _python_cache_lock = threading.Lock()
 
 
@@ -98,7 +99,9 @@ def resolve_python(*, import_timeout_sec: float = 10.0) -> Optional[tuple[str, s
 
     Cached per process (see ``_python_cache``): only the first call, or the first after
     ``current`` is re-pointed, a candidate env var changes, a cached python or tree disappears,
-    a ``None`` ages past ``NEGATIVE_TTL_SEC`` or ``forget_python()`` runs, spawns anything.
+    a ``None`` ages past ``NEGATIVE_TTL_SEC`` or ``forget_python()`` runs, spawns anything. A
+    candidate that starts importing ttexalens in place, ahead of the cached one, is picked up only
+    after one of those (or a broker restart).
     """
     vroot = os.environ.get("TTDEV_VALIDATOR_ROOT", "/opt/tt-device-broker/validator").strip()
     current = f"{vroot}/current"
@@ -115,31 +118,39 @@ def resolve_python(*, import_timeout_sec: float = 10.0) -> Optional[tuple[str, s
 
     key = (tuple(candidates), os.path.realpath(current))
     with _python_cache_lock:
-        hit = _python_cache.get(key)
-        if hit is not None:
-            resolved, at = hit
-            if resolved is None:
-                if time.monotonic() - at < NEGATIVE_TTL_SEC:
-                    return None
-            elif os.access(resolved[0], os.X_OK) and os.path.isdir(resolved[1]):
-                return resolved
-        resolved = _resolve_python_uncached(candidates, current, import_timeout_sec)
-        _python_cache.clear()
-        _python_cache[key] = (resolved, time.monotonic())
-        return resolved
+        cached = _python_cache
+    if cached is not None and cached[0] == key:
+        _, resolved, at = cached
+        if resolved is None:
+            if time.monotonic() - at < NEGATIVE_TTL_SEC:
+                return None
+        elif os.access(resolved[0], os.X_OK) and os.path.isdir(resolved[1]):
+            return resolved
+    # Spawned outside the lock, so forget_python() (called on the event loop) never waits on it.
+    resolved, timed_out = _resolve_python_uncached(candidates, current, import_timeout_sec)
+    with _python_cache_lock:
+        _set_python_cache(None if resolved is None and timed_out else (key, resolved, time.monotonic()))
+    return resolved
+
+
+def _set_python_cache(value: Optional[tuple[tuple, Optional[tuple[str, str]], float]]) -> None:
+    global _python_cache
+    _python_cache = value
 
 
 def forget_python() -> None:
     """Drop the cached ``resolve_python()`` answer, so the next ``build()`` re-runs the import
-    checks — called when a read reaches no verdict, which a python that lost ttexalens in place
-    (``current`` unchanged) would cause."""
+    checks — called when the built-in read crashes or cannot spawn, which a python that lost
+    ttexalens in place (``current`` unchanged) would cause."""
     with _python_cache_lock:
-        _python_cache.clear()
+        _set_python_cache(None)
 
 
 def _resolve_python_uncached(
     candidates: list[str], current: str, import_timeout_sec: float
-) -> Optional[tuple[str, str]]:
+) -> tuple[Optional[tuple[str, str]], bool]:
+    """``(answer, whether any import check timed out)`` — a timeout is not proof of absence."""
+    timed_out = False
     for python in candidates:
         if not os.access(python, os.X_OK):
             continue
@@ -152,14 +163,17 @@ def _resolve_python_uncached(
                 ).returncode
                 == 0
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            continue
+        except OSError:
             continue
         if not imported:
             continue
         tree = _tree_for(python, current)
         if os.path.isdir(tree):
-            return python, tree
-    return None
+            return (python, tree), timed_out
+    return None, timed_out
 
 
 def _probe_path() -> Optional[str]:

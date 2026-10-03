@@ -341,16 +341,32 @@ def test_no_python_is_cached_only_for_the_negative_ttl(tmp_path, monkeypatch):
     log = tmp_path / "spawns"
     pin = _counting_python(tmp_path / "pin" / "python", log, import_ok=False)
     monkeypatch.setenv("TTDEV_ETH_CHECK_PYTHON", str(pin))
-    now = [1000.0]
-    monkeypatch.setattr(eth.time, "monotonic", lambda: now[0])
 
     assert resolve_python() is None
     assert resolve_python() is None
     assert _spawns(log) == 1
     # ttexalens gets installed into the pinned python; the miss expires and it is picked up.
     _counting_python(pin, log, import_ok=True)
-    now[0] += eth.NEGATIVE_TTL_SEC + 1
+    key, answer, at = eth._python_cache
+    monkeypatch.setattr(eth, "_python_cache", (key, answer, at - eth.NEGATIVE_TTL_SEC - 1))
     assert resolve_python()[0] == str(pin)
+    assert _spawns(log) == 2
+
+
+def test_an_import_check_timeout_is_not_cached_as_no_python(tmp_path, monkeypatch):
+    # A slow import (cold page cache, slow NFS) is not proof there is no python: the next gate
+    # must try again rather than skip the read as not_configured for NEGATIVE_TTL_SEC.
+    vroot = tmp_path / "validator"
+    (vroot / "current").mkdir(parents=True)
+    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(vroot))
+    log = tmp_path / "spawns"
+    pin = _counting_python(tmp_path / "pin" / "python", log)
+    monkeypatch.setenv("TTDEV_ETH_CHECK_PYTHON", str(pin))
+    pin.write_text(f'#!/usr/bin/env bash\necho x >> "{log}"\nsleep 5\n')
+
+    assert resolve_python(import_timeout_sec=0.2) is None
+    _counting_python(pin, log)
+    assert resolve_python() is not None
     assert _spawns(log) == 2
 
 
