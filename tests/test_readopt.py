@@ -591,8 +591,8 @@ async def test_a_per_user_daemon_start_runs_a_light_probe_and_a_pass_reads_healt
 @pytest.mark.asyncio
 async def test_a_per_user_daemon_start_on_a_bad_device_stays_recovering(monkeypatch, clear_job_state, tmp_path):
     """The hole: a per-user daemon restarted onto a device whose ARC stopped ticking read HEALTHY and
-    admitted its first job onto it. A failing start pass must leave it RECOVERING, dirty — so the
-    first tenant's gate resets and verifies — journal the verdict, and never climb the ladder itself.
+    admitted its first job onto it. A failing start pass must hold the door — a self-heal hold, not a
+    dirty mark, see the next test — journal the verdict, and never climb the ladder itself.
     Fails on base: BOOT went straight to HEALTHY."""
     events = _per_user_start(monkeypatch, tmp_path)
     _probe(monkeypatch, healthy=False)
@@ -601,13 +601,57 @@ async def test_a_per_user_daemon_start_on_a_bad_device_stays_recovering(monkeypa
     await srv.run_startup_tasks()
 
     assert srv.fsm.state is ServerState.RECOVERING, "a failing start probe left the per-user daemon open"
-    assert srv.fsm.record.why == "probe_unhealthy"
-    assert srv.fsm.record.dirty, "the first tenant's gate must owe this device a reset + verify"
+    assert srv.fsm.record.why in srv.SELFHEAL_WHYS, "the start hold must be one the idle relift can lift"
+    assert not srv.fsm.record.dirty, "dirty here routes a later healthy read to a hold nothing lifts"
     assert srv._device_unavailable_for_tenant(), "a tenant must not be admitted onto the failed device"
     assert any(
         kind == "gate" and f.get("phase") == "startup" and f.get("healthy") is False for kind, f in events
     ), f"the failing start pass was not journaled: {[k for k, _ in events]}"
     assert ladder == [], "a start probe reports; it must never enter the recovery ladder"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_per_user_start_reopens_once_the_device_reads_healthy(monkeypatch, clear_job_state, tmp_path):
+    """A dirty mark would strand this: a dirty per-user device that later reads healthy routes to
+    HOLD_FABRIC_UNVERIFIED (no validator to give a verdict), which nothing lifts by default. The start
+    hold must instead be lifted by the idle relift's read-only re-read."""
+    _per_user_start(monkeypatch, tmp_path)
+    _probe(monkeypatch, healthy=False)
+    _no_ladder(monkeypatch)
+    await srv.run_startup_tasks()
+    assert srv.fsm.state is ServerState.RECOVERING
+
+    passes = _probe(monkeypatch, healthy=True)
+
+    async def eth_unconfigured(timeout_sec=60.0):
+        return None, "skipped (no eth reader)"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_unconfigured)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setenv("TT_DEVICE_MCP_SELFHEAL_RELIFT", "1")
+    srv.device_op_active = ""
+    srv.last_relift_monotonic = 0.0
+
+    await srv._attempt_idle_relift()
+
+    assert srv.fsm.state is ServerState.HEALTHY, "a device that recovered after a failed start stayed held"
+    assert passes == [False], "the relift must re-read without the fabric pass"
+
+
+@pytest.mark.asyncio
+async def test_a_per_user_restart_keeps_a_loaded_open_episode(monkeypatch, clear_job_state, tmp_path):
+    """A same-boot restart loads the last episode from fsm.json. The start must not wipe it to
+    HEALTHY (or probe over it): its own gate or relift settles it."""
+    _per_user_start(monkeypatch, tmp_path)
+    srv.fsm.on_fault("job_killed", detail="killed mid-run")
+    passes = _probe(monkeypatch, healthy=True)
+
+    await srv.run_startup_tasks()
+
+    assert passes == [], "probed over a loaded open episode"
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert srv.fsm.record.why == "job_killed" and srv.fsm.record.dirty
 
 
 @pytest.mark.asyncio
@@ -625,8 +669,8 @@ async def test_a_per_user_daemon_start_beside_a_holder_stays_healthy(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_a_per_user_start_probe_that_raises_marks_the_device_dirty(monkeypatch, clear_job_state, tmp_path):
-    """A start probe that could not run verified nothing: the device is dirty, not trusted, and the
+async def test_a_per_user_start_probe_that_raises_holds_the_device(monkeypatch, clear_job_state, tmp_path):
+    """A start probe that could not run verified nothing: the device is held, not trusted, and the
     daemon still comes up."""
     _per_user_start(monkeypatch, tmp_path)
 
@@ -638,7 +682,7 @@ async def test_a_per_user_start_probe_that_raises_marks_the_device_dirty(monkeyp
     await srv.run_startup_tasks()
 
     assert srv.fsm.state is ServerState.RECOVERING
-    assert srv.fsm.record.why == "gate_error"
+    assert srv.fsm.record.why in srv.SELFHEAL_WHYS and not srv.fsm.record.dirty
 
 
 @pytest.mark.asyncio
