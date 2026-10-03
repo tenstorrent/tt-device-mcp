@@ -4498,11 +4498,11 @@ async def _await_device_free_for_tenant(job_log_file: Optional[Path]) -> str:
     with a non-empty reason (the job runner refuses to dispatch; see job_runner).
 
     The invariant, in one place: no tenant job starts while a broker device op holds the
-    device, while the device is dirty and unverified, while a chip has fallen off the
-    PCIe bus, or while a process outside the broker holds it. The job runner satisfied the
-    first half only by accident — it is single-threaded and awaits its gates inline, so a
-    job physically could not overlap one — which is not an invariant, it is a coincidence
-    of the call graph that the next refactor silently spends.
+    device, while the device is dirty and unverified, or while a chip has fallen off the
+    PCIe bus. The job runner satisfied the first half only by accident — it is
+    single-threaded and awaits its gates inline, so a job physically could not overlap
+    one — which is not an invariant, it is a coincidence of the call graph that the next
+    refactor silently spends.
     """
     for _ in range(TENANT_GATE_MAX_VERIFY):
         # A broker op owns the device. Taking its lock IS the wait: the tenant does not get
@@ -4535,11 +4535,11 @@ async def _await_device_free_for_tenant(job_log_file: Optional[Path]) -> str:
     # `break`, not a bare `return ""` — such a chip leaves fsm HEALTHY, and a read of the
     # 0xFFFFFFFF it now returns can stall the host CPU that issues it, so the job must
     # never be dispatched.
-    return _device_degraded_for_tenant() or await asyncio.to_thread(_tenant_holder_reason)
+    return _device_degraded_for_tenant()
 
 
 def _tenant_holder_reason() -> str:
-    """Why a process outside the broker makes the device unfit for the next job — '' if none.
+    """Why a process outside the broker keeps the next job off the device — '' if none.
 
     The post-job gate skips every probe while such a holder is present (03 I13), so a job
     dispatched behind it would run beside that process on a device nobody checked. Only a
@@ -4558,7 +4558,64 @@ def _tenant_holder_reason() -> str:
     return f"device held outside the broker by {who}; not dispatching beside it"
 
 
-async def _refuse_job_on_degraded_device(job: "Job", job_log_file: Optional[Path], reason: str) -> None:
+# How often a job waiting on a process outside the broker re-scans the device's holders.
+_HOLDER_WAIT_POLL_SEC = 5.0
+
+
+async def _wait_out_foreign_holder(job: "Job", job_log_file: Optional[Path]) -> str:
+    """Keep a tenant job at the door while a process outside the broker holds the device.
+
+    Returns '' once no such holder is seen. With the tenant hold off (TT_DEVICE_MCP_TENANT_HOLD=0)
+    it does not wait: it returns the reason and the caller refuses the job. A kill while waiting
+    also returns the reason; the caller sees the job KILLED.
+
+    A holder makes the device busy, not degraded: this opens no device_held episode, the hold
+    deadline never counts it, and the wait ends when the holder exits. The runner calls it BEFORE
+    the tenant gate, so the gate's checks see the device the holder left behind. Never raises."""
+
+    async def scan() -> str:
+        try:
+            return await asyncio.to_thread(_tenant_holder_reason)
+        except Exception as e:  # a scan bug must not keep a job off a free device
+            if logger:
+                logger.error(f"JOB_RUNNER holder scan error for job_id={job.id}: {e}")
+            return ""
+
+    reason = await scan()
+    if not reason or not _tenant_hold_enabled():
+        return reason
+    if logger:
+        logger.warning(f"JOB_RUNNER job_id={job.id} waiting: {reason}")
+    health_event("job_waiting_on_holder", job_id=job.id, reason=reason)
+    if job_log_file:
+        try:
+            append_job_log(
+                job_log_file,
+                "broker",
+                f"[WAITING] {reason}\nThe broker dispatches this job once the device is free. "
+                f"Kill it to give up the wait.\n",
+            )
+        except OSError:
+            pass
+    while reason:
+        if job.status == JobStatus.KILLED:
+            return reason
+        await asyncio.sleep(_HOLDER_WAIT_POLL_SEC)
+        await cleanup_finished_jobs()  # keep sweeping through a long wait
+        reason = await scan()
+    if logger:
+        logger.info(f"JOB_RUNNER job_id={job.id} device free of outside holders; continuing to the gate")
+    return ""
+
+
+async def _refuse_job_on_degraded_device(
+    job: "Job",
+    job_log_file: Optional[Path],
+    reason: str,
+    *,
+    label: str = "device degraded",
+    advice: str = "running it onto the device in this state risks hanging the host. Resubmit once recovered.",
+) -> None:
     """Fail a tenant job AT THE DOOR instead of running its command onto a degraded
     device. The gate already gave a dirty device up to TENANT_GATE_MAX_VERIFY reset+verify
     attempts; a reason survives that only when the device is genuinely not fit to run on —
@@ -4576,7 +4633,7 @@ async def _refuse_job_on_degraded_device(job: "Job", job_log_file: Optional[Path
     async with get_lock():
         job.status = JobStatus.FAILED
         job.finished_at = datetime.now().isoformat()
-        job.error = f"device degraded — job not dispatched: {reason}"
+        job.error = f"{label} — job not dispatched: {reason}"
         if stats:
             stats.record_job_completion(job.status, job.wait_sec, job.runtime_sec)
     # Make the refusal legible where the submitter looks — the job's own log, which recent
@@ -4585,9 +4642,8 @@ async def _refuse_job_on_degraded_device(job: "Job", job_log_file: Optional[Path
         try:
             with open(job_log_file, "a") as f:
                 f.write(
-                    f"\n[REFUSED at {job.finished_at}] device degraded — {reason}\n"
-                    f"The broker did not dispatch this job: running it onto the device "
-                    f"in this state risks hanging the host. Resubmit once recovered.\n"
+                    f"\n[REFUSED at {job.finished_at}] {label} — {reason}\n"
+                    f"The broker did not dispatch this job: {advice}\n"
                 )
             write_job_log_footer(job_log_file, job)
         except OSError as e:
@@ -5416,18 +5472,21 @@ def _job_from_log(job_id: str) -> Optional["Job"]:
     return job
 
 
-async def _terminate_scope(scope: str, grace_sec: float = GRACEFUL_KILL_GRACE_SEC) -> None:
+async def _terminate_scope(scope: str, grace_sec: float = GRACEFUL_KILL_GRACE_SEC, interrupt: bool = True) -> None:
     """Stop a re-adopted job's systemd scope so it RELEASES THE DEVICE.
 
     Same ladder and same reason as _terminate_process_group: `systemctl stop` sends
     SIGTERM, and Python installs no SIGTERM handler -- the interpreter dies without
     unwinding, ttnn never closes the mesh, and the eth cores are left mid-transaction.
-    SIGINT is the signal that unwinds it, so it goes first; `stop` is the reap."""
+    SIGINT is the signal that unwinds it, so it goes first; `stop` is the reap. ``interrupt=False``
+    is for a scope a killer already interrupted: a second SIGINT can abort the teardown the first
+    one started, so it only waits out the grace before the reap."""
 
     async def _run(*argv: str) -> None:
         await asyncio.to_thread(subprocess.run, list(argv), capture_output=True)
 
-    await _run("systemctl", "kill", "--signal=SIGINT", scope)
+    if interrupt:
+        await _run("systemctl", "kill", "--signal=SIGINT", scope)
     loop = asyncio.get_event_loop()
     deadline = loop.time() + grace_sec
     while loop.time() < deadline:
@@ -5439,18 +5498,35 @@ async def _terminate_scope(scope: str, grace_sec: float = GRACEFUL_KILL_GRACE_SE
     await _run("systemctl", "stop", scope)
 
 
-async def _stop_job_scope(job_id: str, job_log_file: Optional[Path]) -> None:
+# systemd notices a scope's cgroup went empty asynchronously, so a scope whose job just exited can
+# read active for a moment. A live one is re-checked this often, for up to this long, before it
+# counts as leftover.
+_SCOPE_SETTLE_POLL_SEC = 0.1
+_SCOPE_SETTLE_SEC = 1.0
+
+
+async def _stop_job_scope(job_id: str, job_log_file: Optional[Path], *, interrupted: bool = False) -> None:
     """End a finished privsep job's scope so nothing it started outlives it on the device.
 
     The job's own exit does not end its scope: a child that left the job's process group (a
     daemonized helper, a worker in its own session) survives the killpg on the wrapper pid and
     keeps the device open. The next gate then sees a tenant holder and skips every probe (03
-    I13). A scope that ended with its job costs one is-active query; one still live gets the
-    same SIGINT-first ladder as a kill (I5), because the leftover may be mid-device-op."""
+    I13). A scope that ended with its job costs one is-active query; one still live after a
+    short settle gets the same SIGINT-first ladder as a kill (I5), because the leftover may be
+    mid-device-op. ``interrupted``: a kill or the hung reaper already sent SIGINT, and its ladder
+    may have been cut short when the job's streams closed; the reap still happens, the SIGINT is
+    not repeated."""
     scope = job_scope_unit(job_id)
-    if not await asyncio.to_thread(_scope_active, scope):
+    loop = asyncio.get_event_loop()
+    settle_until = loop.time() + _SCOPE_SETTLE_SEC
+    while await asyncio.to_thread(_scope_active, scope):
+        if loop.time() >= settle_until:
+            break
+        await asyncio.sleep(_SCOPE_SETTLE_POLL_SEC)
+    else:
         return
-    msg = f"job exited but its scope {scope} is still active; stopping it (SIGINT first)"
+    first = "waiting out the SIGINT already sent" if interrupted else "stopping it (SIGINT first)"
+    msg = f"job exited but its scope {scope} is still active; {first}"
     if logger:
         logger.warning(f"JOB_RUNNER job_id={job_id} {msg}")
     health_event("job_scope_leftover", job_id=job_id, scope=scope)
@@ -5459,7 +5535,7 @@ async def _stop_job_scope(job_id: str, job_log_file: Optional[Path]) -> None:
             append_job_log(job_log_file, "broker", f"{msg}\n")
         except OSError:
             pass
-    await _terminate_scope(scope, grace_sec=GRACEFUL_KILL_GRACE_SEC)
+    await _terminate_scope(scope, grace_sec=GRACEFUL_KILL_GRACE_SEC, interrupt=not interrupted)
 
 
 async def _monitor_readopted_scope(job_id: str, scope: str):
@@ -5685,6 +5761,33 @@ async def job_runner():
                     f"({external_step_active or 'unknown'}); dispatch resumes once it releases"
                 )
             await _external_step_wait.wait()
+
+        # A process outside the broker on the device: wait it out (refuse, with the hold off)
+        # BEFORE the gate, so the gate's checks see the device it leaves behind (01 I15).
+        holder_reason = await _wait_out_foreign_holder(job, job_log_file)
+        if job.status == JobStatus.KILLED:
+            await cleanup_finished_jobs()
+            get_job_queue().task_done()
+            continue
+        if holder_reason:
+            try:
+                await _refuse_job_on_degraded_device(
+                    job,
+                    job_log_file,
+                    holder_reason,
+                    label="device busy",
+                    advice="another process holds the device. Resubmit once it exits.",
+                )
+            except Exception as e:  # the refusal must terminalize the job, never wedge the runner
+                if logger:
+                    logger.error(f"JOB_RUNNER holder refusal error for job_id={job_id}: {e}")
+                async with get_lock():
+                    job.status = JobStatus.FAILED
+                    job.finished_at = datetime.now().isoformat()
+                    job.error = f"device busy — job not dispatched: {holder_reason}"
+            await cleanup_finished_jobs()
+            get_job_queue().task_done()
+            continue
 
         # The gate. No job starts while a broker device op holds the device, or while the
         # device is dirty and unverified: a job that ends abnormally can leave the mesh
@@ -6015,7 +6118,9 @@ async def job_runner():
                 # scope first so they get the graceful SIGINT before anything is SIGKILLed.
                 if privsep_prefix:
                     try:
-                        await _stop_job_scope(job_id, job_log_file)
+                        await _stop_job_scope(
+                            job_id, job_log_file, interrupted=job.status in (JobStatus.KILLED, JobStatus.HUNG)
+                        )
                     except Exception as e:
                         if logger:
                             logger.warning(f"JOB_RUNNER failed to stop the scope for job_id={job_id}: {e}")

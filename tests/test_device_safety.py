@@ -3065,8 +3065,11 @@ def _patch_device_holders(monkeypatch, scan):
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scan)
 
 
-async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active):
-    """Run one exit-0 job through the real runner; return (job, systemctl calls, is-active calls, killpgs)."""
+async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=lambda: ""):
+    """Run one exit-0 job through the real runner; return (job, systemctl calls, is-active calls, killpgs).
+
+    ``scope_active`` answers every is-active query, or is a list answered in order (the last
+    answer then repeats). ``holders`` stands in for the holder scan before dispatch."""
     _free_device_lock(monkeypatch)
     _quiet_post_job_gate(monkeypatch)
 
@@ -3074,16 +3077,21 @@ async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active):
         return ""
 
     monkeypatch.setattr(srv, "_await_device_free_for_tenant", _free_gate)
+    monkeypatch.setattr(srv, "_tenant_holder_reason", holders)
+    monkeypatch.setattr(srv, "_HOLDER_WAIT_POLL_SEC", 0.01)
     monkeypatch.setattr(srv, "get_activation_script", lambda *a, **kw: ("", None))  # no venv to source here
     monkeypatch.setattr(srv, "privsep_prefix_for", lambda uid, unit=None: ["env"] if privsep else None)
     monkeypatch.setattr(srv, "GRACEFUL_KILL_GRACE_SEC", 0.05)
     monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_SEC", 0.05)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_POLL_SEC", 0.01)
 
     active_checks = []
+    answers = list(scope_active) if isinstance(scope_active, list) else [scope_active]
 
     def _active(scope):
         active_checks.append(scope)
-        return scope_active
+        return answers.pop(0) if len(answers) > 1 else answers[0]
 
     monkeypatch.setattr(srv, "_scope_active", _active)
 
@@ -3147,6 +3155,38 @@ async def test_a_scope_that_ended_with_its_job_is_not_signalled(monkeypatch, cle
 
 
 @pytest.mark.asyncio
+async def test_a_scope_that_settles_after_its_job_is_not_signalled(monkeypatch, clear_job_state):
+    """systemd sees an emptied scope asynchronously: a scope still active for a moment after a clean
+    exit is not a leftover, and is not logged or signalled as one."""
+    job, systemctl, active_checks, _ = await _run_one_job(
+        monkeypatch, "924", privsep=True, scope_active=[True, True, False]
+    )
+    assert job.status is srv.JobStatus.COMPLETED
+    assert len(active_checks) == 3
+    assert not systemctl
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_scope_is_reaped_without_a_second_sigint(monkeypatch):
+    """A kill or the hung reaper already sent SIGINT; a second one can abort the teardown it
+    started. The leftover is still reaped once the grace runs out."""
+    monkeypatch.setattr(srv, "GRACEFUL_KILL_GRACE_SEC", 0.05)
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_SEC", 0.02)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: True)
+    systemctl = []
+
+    def _run(argv, *a, **kw):
+        systemctl.append(list(argv))
+        return srv.subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(srv.subprocess, "run", _run)
+    await srv._stop_job_scope("925", None, interrupted=True)
+    assert systemctl == [["systemctl", "stop", srv.job_scope_unit("925")]]
+
+
+@pytest.mark.asyncio
 async def test_a_completed_non_privsep_job_only_killpgs_its_group(monkeypatch, clear_job_state):
     """No scope, so nothing to query or stop: the process-group kill is all there is."""
     job, systemctl, active_checks, killpgs = await _run_one_job(monkeypatch, "922", privsep=False, scope_active=True)
@@ -3157,15 +3197,19 @@ async def test_a_completed_non_privsep_job_only_killpgs_its_group(monkeypatch, c
 
 @pytest.mark.asyncio
 async def test_a_tenant_holder_blocks_dispatch(monkeypatch, clear_job_state):
-    """A process outside the broker holds the device: the job is not run beside it, and the
-    refusal names who holds it."""
+    """A process outside the broker holds the device and the hold is off: the job is refused
+    without running, before the gate, and the refusal names who holds it."""
     _free_device_lock(monkeypatch)
     _quiet_post_job_gate(monkeypatch)
     monkeypatch.setenv("TT_DEVICE_MCP_TENANT_HOLD", "0")
     _patch_device_holders(monkeypatch, HolderScan(holders=[DeviceHolder(pid=4242, uid=1234)]))
+    gate_calls = []
 
-    reason = await srv._await_device_free_for_tenant(None)
-    assert "pid 4242" in reason
+    async def _gate(job_log_file):
+        gate_calls.append(job_log_file)
+        return ""
+
+    monkeypatch.setattr(srv, "_await_device_free_for_tenant", _gate)
 
     job = srv.Job(id="923", owner="tenant", workspace="/tmp", command="echo ran", queued_at="t")
     srv.jobs["923"] = job
@@ -3180,7 +3224,24 @@ async def test_a_tenant_holder_blocks_dispatch(monkeypatch, clear_job_state):
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
     assert job.status is srv.JobStatus.FAILED and job.started_at is None, "the job ran beside a foreign holder"
-    assert "pid 4242" in job.error
+    assert "device busy" in job.error and "pid 4242" in job.error
+    assert not gate_calls
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_holder_holds_the_job_until_it_exits(monkeypatch, clear_job_state):
+    """With the hold on (the default) the job waits while the holder stays and runs once it is
+    gone. A busy device is not a degraded one: no device_held episode opens for it."""
+    monkeypatch.delenv("TT_DEVICE_MCP_TENANT_HOLD", raising=False)
+    held = []
+    monkeypatch.setattr(srv, "_note_tenant_gate_verdict", lambda reason: reason and held.append(reason))
+    scans = ["device held outside the broker by u(pid 4242)"] * 3 + [""]
+    job, _, _, _ = await _run_one_job(
+        monkeypatch, "926", privsep=False, scope_active=False, holders=lambda: scans.pop(0) if scans else ""
+    )
+    assert job.status is srv.JobStatus.COMPLETED
+    assert not scans, "the job was dispatched while the holder was still there"
+    assert not held, "a busy device was recorded as a degraded hold"
 
 
 @pytest.mark.parametrize(

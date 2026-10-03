@@ -105,7 +105,8 @@ job boundary.
   1000) skips the gate untouched: verification is deferred, an existing hold outlives the skip
   (`why=foreign_holder`), and `fsm.note` names the holder. The host rungs re-scan at fire time,
   and an incomplete scan counts as a tenant. The skipped probes are not waved through: the next
-  job is not dispatched while the holder stays (spec 01 I15).
+  job waits while a holder it can SEE stays (spec 01 I15). An incomplete scan does not hold
+  dispatch.
 - **I14 — Absence is never health.** An empty `/dev/tenstorrent` on a host whose baseline expects
   chips is every chip off the bus: mark dirty (`why=heartbeat`), hold, never release. A host that
   has never shown a chip skips with no hold — nothing there will ever verify.
