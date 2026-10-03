@@ -173,6 +173,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_SAMPLE_RING` | 120 | Sampler ring size | 03 |
 | `TT_DEVICE_MCP_SAMPLER_STALL_SEC` | 120 | Sampler-stall watchdog threshold | 03 |
 | `TT_DEVICE_MCP_BOOT_PROBE_TIMEOUT_SEC` | 20 | Boot platform-probe timeout | 03 |
+| `TT_DEVICE_MCP_DISPATCH_RECHECK_SEC` | 300 | Re-check a HEALTHY device before dispatch when its last verdict is older than this (0 off) | 03 |
 | `TT_DEVICE_MCP_PREJOB_DISPATCH` | 0 | Opt-in pre-job single-kernel dispatch proof | 03 |
 | `TT_DEVICE_MCP_DISPATCH_BIN` | validator's `metal_example_add_2_integers_in_compute` | Pre-job dispatch probe binary | 03 |
 | `TT_DEVICE_MCP_DISPATCH_TIMEOUT_SEC` | 90 | Pre-job dispatch probe timeout | 03 |
