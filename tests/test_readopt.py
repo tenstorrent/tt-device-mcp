@@ -8,9 +8,9 @@ import asyncio
 import pytest
 
 import tt_device_mcp.server as srv
-from tests.conftest import fsm_dirty, fsm_healthy
+from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event, patch_recovery
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
-from tt_device_mcp.fsm import ServerState
+from tt_device_mcp.fsm import ServerFsm, ServerState
 
 
 def test_scope_unit_roundtrip():
@@ -522,6 +522,152 @@ async def test_a_fabric_check_that_cannot_run_does_not_break_startup(monkeypatch
 
     monkeypatch.setattr(srv, "_device_health_gate", boom)
     await srv._verify_fabric_on_start()  # must not raise
+
+
+# --- per-user daemon probe on start (spec 03 I4) --------------------------------
+
+
+def _per_user_start(monkeypatch, tmp_path, *, holders=()):
+    """A per-user daemon at BOOT with one present chip, the given device holders, and the gate's side
+    channels stripped. Returns the list each journaled health event lands in."""
+    monkeypatch.setattr(srv, "_startup_tasks_done", False)
+    monkeypatch.setattr(srv, "should_privsep", lambda: False)
+    monkeypatch.setattr(srv, "fsm", ServerFsm(tmp_path / "fsm.json"))
+    assert srv.fsm.state is ServerState.BOOT
+    dev = tmp_path / "tenstorrent"
+    (dev / "0").mkdir(parents=True)
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(dev))
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=list(holders), complete=True))
+    srv.isolated_chips = set()
+    srv.device_fault_reported = ""
+    srv.device_op_lock = None
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    return events
+
+
+def _probe(monkeypatch, healthy: bool) -> list:
+    """Replace the probe pass with a verdict; returns the run_fabric value of each pass it ran."""
+    passes = []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        passes.append(run_fabric)
+        if healthy:
+            return True, {"snapshot": {"ok": True}}
+        return False, {"snapshot": {"ok": False, "detail": "ARC heartbeat stalled on chip 0"}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    return passes
+
+
+def _no_ladder(monkeypatch) -> list:
+    calls = []
+
+    async def escalate(*a, **k):
+        calls.append(a)
+        return srv.OUTCOME_WAITING
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_a_per_user_daemon_start_runs_a_light_probe_and_a_pass_reads_healthy(
+    monkeypatch, clear_job_state, tmp_path
+):
+    """A per-user daemon used to go BOOT -> HEALTHY on trust. It now probes first — the light pass
+    only, no fabric — and a healthy pass leaves it HEALTHY. Fails on base: no probe ran."""
+    _per_user_start(monkeypatch, tmp_path)
+    passes = _probe(monkeypatch, healthy=True)
+
+    await srv.run_startup_tasks()
+
+    assert passes == [False], "the per-user start must run exactly one light pass, with no fabric"
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_per_user_daemon_start_on_a_bad_device_stays_recovering(monkeypatch, clear_job_state, tmp_path):
+    """The hole: a per-user daemon restarted onto a device whose ARC stopped ticking read HEALTHY and
+    admitted its first job onto it. A failing start pass must leave it RECOVERING, dirty — so the
+    first tenant's gate resets and verifies — journal the verdict, and never climb the ladder itself.
+    Fails on base: BOOT went straight to HEALTHY."""
+    events = _per_user_start(monkeypatch, tmp_path)
+    _probe(monkeypatch, healthy=False)
+    ladder = _no_ladder(monkeypatch)
+
+    await srv.run_startup_tasks()
+
+    assert srv.fsm.state is ServerState.RECOVERING, "a failing start probe left the per-user daemon open"
+    assert srv.fsm.record.why == "probe_unhealthy"
+    assert srv.fsm.record.dirty, "the first tenant's gate must owe this device a reset + verify"
+    assert srv._device_unavailable_for_tenant(), "a tenant must not be admitted onto the failed device"
+    assert any(
+        kind == "gate" and f.get("phase") == "startup" and f.get("healthy") is False for kind, f in events
+    ), f"the failing start pass was not journaled: {[k for k, _ in events]}"
+    assert ladder == [], "a start probe reports; it must never enter the recovery ladder"
+
+
+@pytest.mark.asyncio
+async def test_a_per_user_daemon_start_beside_a_holder_stays_healthy(monkeypatch, clear_job_state, tmp_path):
+    """The gate never probes beside a foreign holder. At a per-user start that is often the user's own
+    process; holding on it would leave a foreign_holder hold nothing lifts short of the stuck-hold
+    escalation. Skip and stay as before."""
+    _per_user_start(monkeypatch, tmp_path, holders=[DeviceHolder(pid=4242, uid=2000)])
+    passes = _probe(monkeypatch, healthy=False)
+
+    await srv.run_startup_tasks()
+
+    assert passes == [], "probed the device beside a foreign holder"
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_per_user_start_probe_that_raises_marks_the_device_dirty(monkeypatch, clear_job_state, tmp_path):
+    """A start probe that could not run verified nothing: the device is dirty, not trusted, and the
+    daemon still comes up."""
+    _per_user_start(monkeypatch, tmp_path)
+
+    async def boom(*a, **k):
+        raise RuntimeError("gate exploded")
+
+    monkeypatch.setattr(srv, "_device_health_gate", boom)
+
+    await srv.run_startup_tasks()
+
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert srv.fsm.record.why == "gate_error"
+
+
+@pytest.mark.asyncio
+async def test_the_privsep_broker_start_does_not_run_the_per_user_probe(monkeypatch, clear_job_state):
+    """The system broker keeps its own start: boot_merge's startup_unverified hold and the forced
+    fabric verify. The per-user light pass must not run there, or lift that hold."""
+    monkeypatch.setattr(srv, "_startup_tasks_done", False)
+    monkeypatch.setattr(srv, "should_privsep", lambda: True)
+    ran = []
+
+    async def noop():
+        pass
+
+    async def per_user_probe():
+        ran.append(True)
+
+    for name in (
+        "reconcile_running_scopes",
+        "_restore_queued_jobs",
+        "_record_startup_health",
+        "_verify_fabric_on_start",
+    ):
+        monkeypatch.setattr(srv, name, noop)
+    monkeypatch.setattr(srv, "_probe_on_per_user_start", per_user_probe)
+
+    await srv.run_startup_tasks()
+
+    assert ran == []
+    assert srv.fsm.record.why == "startup_unverified"
 
 
 def test_the_job_exit_dir_is_redirectable(monkeypatch, tmp_path):

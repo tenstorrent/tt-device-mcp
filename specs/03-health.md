@@ -38,7 +38,11 @@ job boundary.
 - **I4 — A restart is never trusted healthy.** `ServerFsm.boot_merge` always closes the door:
   RECOVERING(`startup_unverified`) absent an open episode; an episode still open on disk
   (RECOVERING or DOWN) is adopted unconditionally. There is no "clean boot, skip the verify"
-  branch. Only the forced startup gate pass may open the door.
+  branch. Only the forced startup gate pass may open the door. A per-user daemon has no
+  `boot_merge` and no fabric validator, but its start is not trusted either: it runs one light,
+  read-only gate pass (`phase="startup"`, `with_recover=False`: host PCI, ARC heartbeat, tt-smi
+  snapshot; no fabric, no ladder) before it serves, and a pass that finds the device unhealthy
+  leaves it RECOVERING(`probe_unhealthy`), dirty, with the `gate` row journaled.
 - **I5 — `why` is a closed vocabulary** (`fsm.FAULTS`). An unknown value asserts at the write
   site and clamps to `gate_error`; an unknown value read from disk clamps silently. The idle
   relift and the escalation routing branch on exact membership, so a value outside the set is a
@@ -475,17 +479,23 @@ into `detail` — followed by an async startup-health report (sysfs heartbeat on
 came back after a reboot and marks dirty if degraded) and the forced startup gate
 (`phase="startup"`, `force_fabric=True`), which queues behind re-adopted jobs and is the only
 thing that may lift the `startup_unverified` hold. A per-user daemon (`should_privsep()` false)
-skips all of this and resolves BOOT straight to HEALTHY: it has no re-adopted privsep jobs to
-protect and no staged fabric validator to prove the mesh with.
+skips all of this: it has no re-adopted privsep jobs to protect and no staged fabric validator to
+prove the mesh with. It resolves BOOT to HEALTHY and then, still before the job runner exists,
+runs one light read-only gate pass (I4) — host PCI, ARC heartbeat and the tt-smi snapshot, about
+a second. An unhealthy pass marks the device dirty (`probe_unhealthy`), so the first tenant's
+gate resets and verifies before it runs. A foreign holder makes the pass skip and the daemon
+stays HEALTHY, as before: holding on it would leave a `foreign_holder` hold that nothing lifts
+short of the stuck-hold escalation, over a device the user may simply have open themselves. A
+pass that raises marks the device dirty (`gate_error`).
 
 ```mermaid
 stateDiagram-v2
   [*] --> BOOT
   BOOT --> RECOVERING : boot_merge — a restart is never trusted healthy
   BOOT --> DOWN : boot_merge adopts an episode already DOWN
-  BOOT --> HEALTHY : per-user daemon only — no startup-verify shape
+  BOOT --> HEALTHY : per-user daemon only — then one light read-only pass
+  HEALTHY --> RECOVERING : fault — job exit, sampler, gate hold, per-user start pass
   RECOVERING --> HEALTHY : gate verified healthy / a rung recovered
-  HEALTHY --> RECOVERING : fault — job exit, sampler, gate hold
   RECOVERING --> DOWN : escalation ran and could not help (OUTCOME_TERMINAL)
   DOWN --> HEALTHY : verified healthy
 ```
@@ -643,8 +653,9 @@ model, not the reset procedure, is this spec's contract; the reset path is spec 
 
 ## Per-user health
 
-The per-user daemon runs the gate. The snapshot, heartbeat and PCI presence probes all work
-unprivileged wherever the device nodes are granted.
+The per-user daemon runs the gate, including one light read-only pass at start (I4). The
+snapshot, heartbeat and PCI presence probes all work unprivileged wherever the device nodes are
+granted.
 
 The eth-heartbeat pre-read and the fabric validator are staged by the system installer only, so a
 per-user daemon has neither: preflight warns and the gate runs without them. A reset leaves the
@@ -693,7 +704,7 @@ refuses.
 |---|---|
 | I2 | `tests/test_boot_platform.py::test_importing_the_server_never_touches_the_device` |
 | I3 | `tests/test_fsm.py::test_survives_restart`, `tests/test_fsm.py::test_dirty_survives_restart`, `tests/test_state_paths.py::test_fsm_survives_restart_at_the_per_user_default_health_dir` |
-| I4 | `tests/test_fsm.py::test_boot_with_no_open_episode_starts_closed`, `tests/test_fsm.py::test_boot_open_episode_is_adopted`, `tests/test_fsm.py::test_terminal_episode_survives_boot_merge`, `tests/test_fsm.py::test_boot_sentinel_is_not_an_open_episode` |
+| I4 | `tests/test_fsm.py::test_boot_with_no_open_episode_starts_closed`, `tests/test_fsm.py::test_boot_open_episode_is_adopted`, `tests/test_fsm.py::test_terminal_episode_survives_boot_merge`, `tests/test_fsm.py::test_boot_sentinel_is_not_an_open_episode`, `tests/test_readopt.py::test_a_per_user_daemon_start_runs_a_light_probe_and_a_pass_reads_healthy`, `tests/test_readopt.py::test_a_per_user_daemon_start_on_a_bad_device_stays_recovering`, `tests/test_readopt.py::test_a_per_user_daemon_start_beside_a_holder_stays_healthy`, `tests/test_readopt.py::test_a_per_user_start_probe_that_raises_marks_the_device_dirty`, `tests/test_readopt.py::test_the_privsep_broker_start_does_not_run_the_per_user_probe` |
 | I5 | `tests/test_fsm.py::test_an_unknown_why_on_disk_clamps_on_load` |
 | I6 | `tests/test_fsm.py::test_cross_boot_load_voids_job_but_keeps_device_facts`, `tests/test_fsm.py::test_a_dirty_mark_survives_a_cross_boot_load`, `tests/test_fsm.py::test_a_file_with_no_boot_id_is_treated_as_cross_boot`, `tests/test_fsm.py::test_same_boot_restart_keeps_job_and_dirty` |
 | I3/I5 robustness | `tests/test_fsm.py::test_a_wrong_shape_file_degrades_to_boot_not_a_crash`, `tests/test_fsm.py::test_malformed_field_types_degrade_to_boot_not_a_crash`, `tests/test_device_safety.py::test_a_non_dict_job_on_disk_never_poisons_the_gate` |

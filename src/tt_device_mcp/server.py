@@ -6403,6 +6403,33 @@ async def _verify_fabric_on_start() -> None:
         _mark_device_dirty(f"startup fabric verify errored before it could verify: {e}", why="gate_error")
 
 
+async def _probe_on_per_user_start() -> None:
+    """One light, read-only gate pass when a per-user daemon starts (spec 03 I4).
+
+    Trusting a start blind is how a daemon restarted onto a chip that fell off the bus, or an ARC
+    that stopped ticking, admits its first job onto it. The pass is the cheap one — host PCI, ARC
+    heartbeat, tt-smi snapshot, about a second — with no fabric (this shape has no validator) and
+    no ladder: a start finds faults, it does not fix them. An unhealthy verdict marks the device
+    dirty, so the first tenant's own gate resets and verifies before it runs.
+
+    Called with the FSM already HEALTHY, which is what makes a foreign holder harmless here: the
+    gate skips the pass and its unverified clear invents no hold over a healthy device. Holding
+    instead would leave a foreign_holder hold nothing lifts short of the stuck-hold escalation —
+    over a device the user may simply have open themselves.
+
+    Awaited before the job runner exists, so no queued job can race in ahead of the verdict.
+    """
+    try:
+        await _device_health_gate(None, phase="startup", run_fabric=False, with_recover=False)
+    except Exception as e:  # noqa: BLE001 - startup must survive a check that cannot run
+        # The gate is normally self-contained; if it raised, nothing verified this start. Mark it
+        # dirty so the first tenant's gate resets + verifies, as the post-job gate does on error.
+        if logger:
+            logger.error(f"STARTUP probe failed: {e}")
+        health_event("startup_probe_errored", detail=str(e))
+        _mark_device_dirty(f"startup probe errored before it could verify: {e}", why="gate_error")
+
+
 async def run_startup_tasks() -> None:
     """Everything that must happen once, before this broker serves its queue.
 
@@ -6423,16 +6450,17 @@ async def run_startup_tasks() -> None:
     _startup_tasks_done = True
     if not should_privsep():
         # No re-adoption sequence for a per-user daemon or a test harness, and — matching that
-        # same narrower scope — no startup-verify gate either: resolve BOOT straight to HEALTHY
-        # so fsm.state is never left at BOOT, which no caller outside this function may observe.
-        # The ordinary verified-healthy path, not boot_merge — there is no reboot/re-adoption
-        # concern for this deployment shape for boot_merge to reconcile.
+        # same narrower scope — no forced fabric verify either: this shape has no validator to run
+        # it with. Resolve BOOT to HEALTHY so fsm.state is never left at BOOT, which no caller
+        # outside this function may observe. The ordinary healthy path, not boot_merge — there is
+        # no reboot/re-adoption concern for this deployment shape for boot_merge to reconcile.
         #
         # The rung inventory still prints. It describes what THIS process can execute (spec 04
         # I17), which has nothing to do with re-adoption, and this is the shape most likely to be
         # missing rungs — so it is the shape that most needs them named.
         log_rung_inventory()
         fsm.on_readings(_healthy_reading())
+        await _probe_on_per_user_start()
         return
     try:
         await reconcile_running_scopes()
