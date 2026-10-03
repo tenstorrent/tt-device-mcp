@@ -2738,13 +2738,14 @@ async def test_a_clean_job_on_an_armed_host_reads_eth_but_pays_no_fabric_pass(mo
 
 
 @pytest.mark.asyncio
-async def test_a_frozen_eth_read_after_a_clean_job_holds_without_a_reset(monkeypatch, tmp_path):
+@pytest.mark.parametrize("phase", ["post-job", "post-step"])
+async def test_a_frozen_eth_read_after_a_clean_job_holds_without_a_reset(monkeypatch, tmp_path, phase):
     """Spec 03 I30 + I16. A frozen core found after an exit-0 job takes the existing eth-frozen
     hold: the door closes, nothing resets, and the traffic pass that would shove the frozen chip
     off the bus never runs."""
     calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=(False, "a frozen active-eth core: 0-25"), chips=4)
 
-    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+    await srv._device_health_gate(None, phase=phase, run_fabric=False)
 
     assert calls["eth"] == 1
     assert calls["fabric"] == 0, "ran the traffic pass on a frozen core"
@@ -2755,13 +2756,16 @@ async def test_a_frozen_eth_read_after_a_clean_job_holds_without_a_reset(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_a_clean_exit_eth_read_with_no_verdict_runs_the_fabric_pass_in_the_same_gate(monkeypatch, tmp_path):
+@pytest.mark.parametrize("phase", ["post-job", "post-step"])
+async def test_a_clean_exit_eth_read_with_no_verdict_runs_the_fabric_pass_in_the_same_gate(
+    monkeypatch, tmp_path, phase
+):
     """Spec 03 I30. On an armed host the read has answered before; one that now times out inside
     its own probe or crashes is the stuck-read shape a fabric failure follows. The gate runs the
     full traffic pass in this same pass, as for a failed job, and a passing one releases."""
     calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=(None, "eth probe timed out after 9s"), chips=4)
 
-    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+    await srv._device_health_gate(None, phase=phase, run_fabric=False)
 
     assert calls["eth"] == 1
     assert calls["fabric"] == 1, "a stuck eth read on a clean exit let the mesh through unchecked"
