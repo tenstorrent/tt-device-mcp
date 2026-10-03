@@ -4548,10 +4548,14 @@ async def _admission_verdict(job: "Job", job_log_file: Optional[Path]) -> str:
     """_await_device_free_for_tenant, failing CLOSED on an error. A raise there is a gate that
     never reached a verdict, and dispatching on it lands the job on exactly the device nobody
     verified. So the job waits at the door and the check is retried after a short pause; a one-off
-    error costs a second or two. After ADMISSION_GATE_MAX_ERRORS errors in a row the device is held
-    as gate_error (a GENERIC_ESCALATE_WHYS hold, so the idle escalation recovers it rather than a
-    broker restart) and the returned reason sends the job down the degraded path. Never raises."""
+    error costs a second or two. After ADMISSION_GATE_MAX_ERRORS errors in a row the returned reason
+    sends the job down the degraded path, and a device with no episode open is held as gate_error
+    (a GENERIC_ESCALATE_WHYS hold, so the idle escalation recovers it rather than a broker restart).
+    An episode already open is left alone: its door is already shut, and overwriting it would drop
+    a reset it is owed or a self-heal lift its why arms. Never raises."""
     for attempt in range(1, ADMISSION_GATE_MAX_ERRORS + 1):
+        if job.status == JobStatus.KILLED:
+            return f"job {job.id} cancelled while its admission check was retried"
         try:
             return await _await_device_free_for_tenant(job_log_file)
         except Exception as e:
@@ -4566,9 +4570,9 @@ async def _admission_verdict(job: "Job", job_log_file: Optional[Path]) -> str:
             await asyncio.sleep(ADMISSION_GATE_RETRY_SEC[attempt - 1])
     reason = f"admission check errored {ADMISSION_GATE_MAX_ERRORS} times in a row: {error}"
     try:
-        _journal_fsm_transition(reason, verified=False)
-        fsm.on_fault("gate_error", detail=reason, dirty=False)
-    except Exception as e:  # the job is still refused below; only the device hold is lost
+        if fsm.state in (ServerState.HEALTHY, ServerState.BOOT):
+            fsm.on_fault("gate_error", detail=reason, dirty=False)
+    except Exception as e:  # the job is still not dispatched; only the device hold is lost
         if logger:
             logger.error(f"JOB_RUNNER could not place the gate_error hold: {e}")
     return reason
@@ -4717,8 +4721,8 @@ async def _hold_job_until_device_fit(job: "Job", job_log_file: Optional[Path], r
         await cleanup_finished_jobs()  # keep sweeping through a long hold
         # Re-run the gate, not just the passive predicate: it resets+verifies a dirty device,
         # so a recovered one lifts here instead of freezing on a flag the parked runner can
-        # never clear on its own.
-        reason = await _await_device_free_for_tenant(job_log_file)
+        # never clear on its own. A gate that errors keeps the job held (see _admission_verdict).
+        reason = await _admission_verdict(job, job_log_file)
     _note_tenant_gate_verdict("")  # fit again -> device_released, then dispatch
     return ""
 
@@ -5687,6 +5691,11 @@ async def job_runner():
         # A gate that ERRORS is no verdict either: the job waits while it is retried, and a gate
         # that keeps erroring holds the device (see _admission_verdict) — never an ungated dispatch.
         blocked_reason = await _admission_verdict(job, job_log_file)
+        if job.status == JobStatus.KILLED:
+            # Cancelled while the gate ran or was retried: already terminal, so it never dispatches.
+            await cleanup_finished_jobs()
+            get_job_queue().task_done()
+            continue
 
         # One durable timeline entry when this device opens or lifts a tenant-refused hold,
         # keyed off the same verdict the dispatch decision uses so the two can never
