@@ -199,10 +199,10 @@ flowchart LR
   and forgets its spec.
 - Before dispatch the runner, in order: waits out any re-adopted job; sleeps out the
   optional mesh-rest cooldown (`TT_DEVICE_MCP_JOB_COOLDOWN_SEC`, default 0; only the
-  unspent remainder since the last job's device work ended); awaits an external
-  scheduler's step reservation if one is held (`get_external_step_free_event` — a Slurm
-  pre-step/post-step gate call in progress; spec 03 I29 owns the mechanism); waits out a
-  process outside the broker holding the device (I15); runs the admission gate (I15). Two failure shapes there are distinct and both deliberate: a gate pass that runs
+  unspent remainder since the last job's device work ended); waits out a process outside
+  the broker holding the device (I15); awaits an external scheduler's step reservation if
+  one is held (`get_external_step_free_event` — a Slurm pre-step/post-step gate call in
+  progress; spec 03 I29 owns the mechanism); runs the admission gate (I15). Two failure shapes there are distinct and both deliberate: a gate pass that runs
   but cannot verify records the device unverified — "tried and could not tell" is an
   affirmative hold; an exception *escaping* the admission predicate (a gate bug) MUST NOT
   block dispatch — only an affirmative degraded verdict blocks, so a gate bug never turns

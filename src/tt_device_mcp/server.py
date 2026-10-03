@@ -5741,29 +5741,10 @@ async def job_runner():
                 )
             await asyncio.sleep(cooldown)
 
-        # An external scheduler's pre-step/post-step may hold the device reserved right now,
-        # partway through its own gate (see _reserve_external_step / _run_step_gate): its
-        # in-flight check is only a snapshot, taken before the reservation, and its own device
-        # work happens in threads a deadline cannot cancel out from under it. Waiting HERE, before
-        # this job ever calls _ensure_device_clean_for_next_job or spawns, is what keeps this
-        # dispatch from landing underneath that gate's holder scan or its device-op lock. One
-        # direction only — the step never waits on the runner — so there is no cycle to deadlock.
-        # This can hold for as long as the step's own gate takes — for `post-step` that includes a
-        # possible recovery-ladder climb, unbounded by the step's deadline (03 I29) — so it is
-        # logged like the cooldown wait above: a queue that dispatches nothing during an incident
-        # must have a line somewhere naming the holder, not just a flag nothing surfaces.
-        _external_step_wait = get_external_step_free_event()
-        if not _external_step_wait.is_set():
-            health_event("job_deferred_for_external_step", job=job_id, owner=job.owner, holder=external_step_active)
-            if logger:
-                logger.info(
-                    f"JOB_RUNNER job_id={job_id} deferred — external step reservation held "
-                    f"({external_step_active or 'unknown'}); dispatch resumes once it releases"
-                )
-            await _external_step_wait.wait()
-
         # A process outside the broker on the device: wait it out (refuse, with the hold off)
-        # BEFORE the gate, so the gate's checks see the device it leaves behind (01 I15).
+        # BEFORE the gate, so the gate's checks see the device it leaves behind (01 I15). Ahead of
+        # the external-step wait below: the holder is often a scheduler's own job, whose post-step
+        # reserves the device as it exits, and that reservation must still be waited out after.
         holder_reason = await _wait_out_foreign_holder(job, job_log_file)
         if job.status == JobStatus.KILLED:
             await cleanup_finished_jobs()
@@ -5788,6 +5769,27 @@ async def job_runner():
             await cleanup_finished_jobs()
             get_job_queue().task_done()
             continue
+
+        # An external scheduler's pre-step/post-step may hold the device reserved right now,
+        # partway through its own gate (see _reserve_external_step / _run_step_gate): its
+        # in-flight check is only a snapshot, taken before the reservation, and its own device
+        # work happens in threads a deadline cannot cancel out from under it. Waiting HERE, before
+        # this job ever calls _ensure_device_clean_for_next_job or spawns, is what keeps this
+        # dispatch from landing underneath that gate's holder scan or its device-op lock. One
+        # direction only — the step never waits on the runner — so there is no cycle to deadlock.
+        # This can hold for as long as the step's own gate takes — for `post-step` that includes a
+        # possible recovery-ladder climb, unbounded by the step's deadline (03 I29) — so it is
+        # logged like the cooldown wait above: a queue that dispatches nothing during an incident
+        # must have a line somewhere naming the holder, not just a flag nothing surfaces.
+        _external_step_wait = get_external_step_free_event()
+        if not _external_step_wait.is_set():
+            health_event("job_deferred_for_external_step", job=job_id, owner=job.owner, holder=external_step_active)
+            if logger:
+                logger.info(
+                    f"JOB_RUNNER job_id={job_id} deferred — external step reservation held "
+                    f"({external_step_active or 'unknown'}); dispatch resumes once it releases"
+                )
+            await _external_step_wait.wait()
 
         # The gate. No job starts while a broker device op holds the device, or while the
         # device is dirty and unverified: a job that ends abnormally can leave the mesh
