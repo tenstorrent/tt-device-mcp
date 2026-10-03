@@ -137,7 +137,9 @@ class HealthMonitor:
         ``ETH_POST_JOB_TIMEOUT_SEC`` there. A frozen verdict stops the pass as usual; a read that
         reached no verdict (its own timeout, a crash, a could-not-check) runs the fabric traffic
         pass in this same pass, because on an armed host that read has answered before and a
-        read that now cannot is the stuck-read shape a fabric failure follows.
+        read that now cannot is the stuck-read shape a fabric failure follows. Pass it only when
+        the rung is armed: a disarmed reader always skips, so ``run_eth`` there would buy the
+        traffic pass on every call.
 
         Mirrors ``Recovery._verify_device``'s gentlest-first short-circuiting (a frozen heartbeat
         or a failed snapshot skips every heavier, more perturbing check below it — the traffic
@@ -225,7 +227,7 @@ class HealthMonitor:
                 log(f"eth-heartbeat: {'SKIPPED' if eok is None else ('OK' if eok else 'FROZEN')} — {edetail}")
             _record("eth_heartbeat", eok, edetail)
             if not fabric_asked and eok is None and log:
-                log("eth-heartbeat reached no verdict on an armed host — running the fabric traffic pass")
+                log("eth-heartbeat reached no verdict after a clean exit — running the fabric traffic pass")
             if eok is not False and (fabric_asked or eok is None):
                 self._deps.set_device_op_detail("health check: fabric traffic pass across all links (~45s)")
                 fok, fdetail = await self.verify_fabric_health()

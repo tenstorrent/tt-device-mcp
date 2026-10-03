@@ -2750,6 +2750,7 @@ async def test_a_frozen_eth_read_after_a_clean_job_holds_without_a_reset(monkeyp
     assert calls["fabric"] == 0, "ran the traffic pass on a frozen core"
     assert calls["resets"] == 0, "reset a frozen single-chip wedge — the measured all-chip drop"
     assert srv.fsm.state is not ServerState.HEALTHY, "released a mesh with a frozen eth core"
+    assert srv.fsm.record.why == "eth_frozen", "not the eth-frozen hold, which needs an advancing read to lift"
     assert srv._device_unavailable_for_tenant(), "the next tenant would be dispatched onto it"
 
 

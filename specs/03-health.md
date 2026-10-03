@@ -309,11 +309,14 @@ job boundary.
 - **I30 — A clean post-job exit reads the eth heartbeat when the rung is armed.** Enumeration,
   ARC and the snapshot cannot see a wedged eth core, so on an armed host (I28) the post-job gate
   on an exit-0 job also runs the passive eth read, bounded by `ETH_POST_JOB_TIMEOUT_SEC` (10s,
-  the self-test's arming budget; a healthy read is ~1s). A frozen verdict — including that bound
-  expiring (I16) — holds the door through the existing eth-frozen hold, with no reset. A read
-  that reaches no verdict (the probe's own timeout, a crash, exit 77) runs the full fabric pass
-  inside the same gate, exactly as a failed job's does, so its exit 77 holds fabric-unverified
-  on a multi-chip mesh (I17). A disarmed host keeps the old clean-exit gate: snapshot only.
+  the self-test's arming budget; a healthy read is ~1s, plus the reader's python import check
+  that precedes it). A frozen verdict — including that bound expiring (I16), and an operator
+  override's own timeout — holds the door through the existing eth-frozen hold, with no reset.
+  A read that reaches no verdict (the built-in probe's own timeout, a crash, exit 77, no runnable
+  reader) runs the full fabric pass inside the same gate, exactly as a failed job's does, so its
+  exit 77 holds fabric-unverified on a multi-chip mesh (I17). Only the startup self-test's arming
+  (I28) turns this on; a disarmed host keeps the old clean-exit gate: snapshot only. The Slurm
+  `post-step` gate is out of scope: it runs under its own step deadline and keeps the old rule.
   Rationale: on the field data behind this rule, 76–87% of post-job passes were this light
   path, and a stuck eth read was followed by a fabric failure 23 times out of 23.
 
@@ -603,9 +606,9 @@ Normative points the diagram compresses:
   re-derives it mid-pass.
 - `full` (run the fabric pass) is `with_recover and (not pre-job) and (dirty or force_fabric or
   (run_fabric and stale))` — I12, I29. A clean post-job exit pays no fabric pass; when the eth
-  rung is armed it pays the passive eth read instead (~1s, at most 10s), and the fabric pass
-  only if that read reached no verdict (I30). A read-only pass never pays regardless of phase,
-  dirty, or force_fabric.
+  rung is armed it pays the passive eth read instead (~1s, the read bounded at 10s), and the
+  fabric pass only if that read reached no verdict (I30). A read-only pass never pays regardless
+  of phase, dirty, or force_fabric.
 - Every pass journals a durable `gate` event with the full evidence dict; an unhealthy-or-dirty
   pass freezes an incident bundle (trace ring, last reset/fabric output, kernel evidence) while
   it still exists.
