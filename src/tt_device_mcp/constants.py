@@ -52,6 +52,13 @@ DEVICE_RESET_OVERRUN_SEC = 180
 # reset that had worked.
 DEVICE_RESET_TIMEOUT_SEC = 600
 
+# The CLI reads the streaming reset with a per-read socket timeout, and a reset can sit
+# silent far longer than that (quiesce, an overrun tt-smi, the post-reset check): the
+# overrun warning goes to the broker log, not the stream. A client that asks for it gets
+# this sentinel line after every quiet interval, so silence never reads as a dead broker.
+RESET_STREAM_KEEPALIVE_SEC = 15
+RESET_STREAM_KEEPALIVE_LINE = "::keepalive::"
+
 # Upper bound on the post-job fabric traffic check (TT_DEVICE_MCP_FABRIC_CHECK_CMD).
 # The check runs a pinned, prebuilt validator — it never compiles — so a healthy pass is
 # 45-75s, and anything far past that is a wedged fabric, not a slow one. This bound is what

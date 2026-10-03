@@ -666,6 +666,26 @@ def test_cmd_reset_opens_the_stream_with_the_arguments_it_was_given(monkeypatch,
     assert seen["port"] == 8333, seen
     # No owner: the broker derives it from the peer uid (spec 05 I6), and a field it ignores
     # would read as though the caller still names the reset's owner.
-    assert seen["payload"] == {"force": True}, seen
+    assert seen["payload"] == {"force": True, "keepalive": True}, seen
     assert seen["closed"] is True, "the connection was not closed"
     assert "Reset complete." in capsys.readouterr().out
+
+
+def test_reset_stream_hides_keepalives_and_still_reads_the_status(monkeypatch, capsys):
+    """The broker's keepalive lines only keep the per-read timeout from firing on a quiet
+    reset; printing them would bury the progress the operator is watching."""
+    sys.path.insert(0, SRC_PATH)
+    from tt_device_mcp import cli
+
+    resp = [
+        b"$ tt-smi -r 0\n",
+        b"::keepalive::\n",
+        b"::keepalive::\n",
+        b"exit code: 0\n",
+        b"::status::reset_complete\n",
+    ]
+
+    assert cli._print_stream_with_dots(resp) == "reset_complete"
+    out = capsys.readouterr().out
+    assert "keepalive" not in out, out
+    assert "$ tt-smi -r 0" in out and "exit code: 0" in out
