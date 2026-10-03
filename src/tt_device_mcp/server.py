@@ -2331,6 +2331,11 @@ async def _stop_readopted_job_for_reset(job_id: str, scope: str) -> None:
     deadline = loop.time() + READOPTED_FINALIZE_WAIT_SEC
     while job_id in readopted_scopes and loop.time() < deadline:
         await asyncio.sleep(0.2)
+    if job_id in readopted_scopes and logger:
+        logger.warning(
+            f"reset: re-adopted job {job_id} not finalized {READOPTED_FINALIZE_WAIT_SEC}s after "
+            f"stopping {scope}; resetting anyway"
+        )
 
 
 def _reset_busy_detail(blocker: dict) -> str:
