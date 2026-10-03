@@ -5,9 +5,10 @@
 
 The probe reads only links that are up. A link that went down is one core fewer, and every
 remaining core still reads advancing, so the read passed a mesh with a dead link. The broker now
-keeps a high-water mark of the measured count and treats a drop as "could not vouch", which sends
-the pass on to the traffic pass. Separately, a startup self-test that missed its budget left the
-rung off until the next restart; an idle broker now retries it.
+keeps a high-water mark of the measured count and treats a drop as "could not vouch": recorded as a
+skip in the gate's pass, and enough to keep an eth_frozen hold from lifting in the idle relift.
+Separately, a startup self-test that missed its budget left the rung off until the next restart; an
+idle broker now retries it.
 """
 
 import time
@@ -184,6 +185,7 @@ async def test_a_host_with_no_eth_reader_is_never_retried(monkeypatch):
     await srv.selftest_eth_heartbeat()
     assert srv.eth_rearm_retryable is False
     fsm_healthy(srv)
+    srv._last_eth_rearm_monotonic = time.monotonic() - 2 * srv.ETH_CHECK_REARM_INTERVAL_SEC
     srv._maybe_spawn_eth_rearm()
     assert srv._eth_rearm_task is None
 

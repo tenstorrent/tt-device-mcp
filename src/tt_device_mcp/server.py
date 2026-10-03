@@ -2407,7 +2407,7 @@ async def selftest_eth_heartbeat() -> None:
         eth_check_disarm_reason = "no runnable eth read on this host (no python that imports ttexalens)"
     else:
         # A reader exists, so a failure below (could not check, over budget, not runnable) may pass
-        # on a later, quieter try. Cleared again if this one arms.
+        # on a later, quieter try. Harmless once armed: the retry checks eth_check_armed first.
         eth_rearm_retryable = True
         argv, env = built
         t0 = datetime.now()
