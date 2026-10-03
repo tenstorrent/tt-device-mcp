@@ -619,6 +619,45 @@ def test_an_operator_reset_whose_fabric_fails_is_not_released(monkeypatch, tmp_p
     assert d["status"] == "reset_unhealthy" and d["health_ok"] is False
     assert srv.fsm.state is not srv.ServerState.HEALTHY, "a failed fabric pass reopened the door"
     assert srv.fsm.record.dirty, "the next gate must owe this mesh a real recovery"
+    assert srv.fsm.record.why == "operator_reset_unhealthy", (
+        f"got why={srv.fsm.record.why!r}: a failed operator-reset verify must say so, not pass as a "
+        "read-only probe's finding"
+    )
+
+
+def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
+    """The tool's docstring states the worst case an operator reset on a mesh can take. Recompute it
+    from the timeouts the code actually uses, so a changed timeout cannot leave the doc stale."""
+    import inspect
+    import math
+    import re
+
+    from tt_device_mcp import constants
+    from tt_device_mcp.health import monitor as monitor_mod
+    from tt_device_mcp.health.monitors import heartbeat
+
+    def default(fn, name):
+        return inspect.signature(fn).parameters[name].default
+
+    one_pass = math.ceil(
+        heartbeat.HEARTBEAT_SETTLE_SEC
+        + default(monitor_mod.HealthMonitor.verify_device_health, "timeout_sec")
+        + default(monitor_mod.HealthMonitor.verify_eth_heartbeat, "timeout_sec")
+        + constants.FABRIC_CHECK_TIMEOUT_SEC
+    )
+    # The shipped defaults, read from the source: conftest zeroes the live retry sleep.
+    src = inspect.getsource(recovery_pkg)
+    retries = int(re.search(r'"TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES", "(\d+)"', src).group(1))
+    sleep = float(re.search(r'"TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC", "([\d.]+)"', src).group(1))
+    rescan = 3  # reset_with_quiesce's settle after the PCI rescan
+    worst = constants.DEVICE_RESET_TIMEOUT_SEC + rescan + (1 + retries) * one_pass + retries * sleep
+
+    tools = asyncio.run(srv.create_mcp_server().list_tools())
+    doc = next(t.description for t in tools if t.name == "tt_device_reset")
+    assert f"about {round(worst / 60)} minutes" in doc, (worst, doc)
+    assert f"reset {constants.DEVICE_RESET_TIMEOUT_SEC}s" in doc
+    assert f"up to {one_pass}s each" in doc
+    assert f"the {sleep:.0f}s wait" in doc
 
 
 def test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified(monkeypatch, tmp_path):
@@ -701,6 +740,8 @@ def test_the_stream_settles_an_operator_reset_like_the_tool(monkeypatch, tmp_pat
     assert f"::status::{status}" in text
     assert (srv.fsm.state is srv.ServerState.HEALTHY) is fabric_ok
     assert (srv.device_fault_reported == "") is fabric_ok
+    if not fabric_ok:
+        assert srv.fsm.record.why == "operator_reset_unhealthy"
 
 
 # --- the streaming reset is a reset like any other ----------------------------

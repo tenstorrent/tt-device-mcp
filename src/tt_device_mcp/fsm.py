@@ -92,6 +92,7 @@ FAULTS = (
     "gate_error",  # the gate itself raised before it could reach a verdict
     "foreign_holder",  # a non-broker process holds the device; verification deferred
     "probe_unhealthy",  # a read-only pass (with_recover=False) found the mesh unhealthy, no rung attempted
+    "operator_reset_unhealthy",  # an operator reset (tool or stream) exited 0 but its verify failed
 )
 
 

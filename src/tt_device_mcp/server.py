@@ -2396,7 +2396,9 @@ async def _verify_operator_reset(present: int, recovery, log, source: str) -> tu
     elif verdict is None:
         _hold_device_fabric_unverified(f"{source}: enum+ARC healthy, fabric unverified after the post-reset retries")
     else:
-        _mark_device_dirty(f"{source}: the mesh did not verify after the reset: {detail}", why="probe_unhealthy")
+        _mark_device_dirty(
+            f"{source}: the mesh did not verify after the reset: {detail}", why="operator_reset_unhealthy"
+        )
     return verdict, detail
 
 
@@ -8178,10 +8180,19 @@ def create_mcp_server() -> MCPServer:
         2. Kill any currently running process
         3. Reset all detected Tenstorrent devices via tt-smi
         4. Verify: on a multi-chip mesh with a fabric check installed this runs
-           the fabric traffic pass (about 1-2 minutes, longer on a retry), so the
-           call returns only once the mesh has moved data. status
-           reset_unverified means the fabric could not be checked; the device
-           stays held until a gate proves it.
+           the fabric traffic pass, so the call returns only once the mesh has
+           moved data. status reset_unverified means the fabric could not be
+           checked; the device stays held until a gate proves it.
+
+        Duration: about 2 minutes on a healthy Galaxy (reset ~60s + fabric pass
+        45-75s), about 4 minutes when the first fabric pass finds no trained link
+        and is re-checked after a 60s wait. Worst case, with every step running
+        to its timeout: about 22 minutes (reset 600s + PCI rescan 3s + two
+        verify passes of up to 331s each + the 60s wait), plus any wait for a
+        broker operation already holding the device. The call sends nothing
+        until it ends; the connection stays open on keepalives, so it is not
+        cut by the stdio shim's 300s read timeout, but a client with its own
+        tool-call timeout below that may give up first while the reset goes on.
 
         A reset is a board-level reset of ALL chips, so resetting while another
         tenant holds the device aborts their run mid-op and can wedge the mesh.
@@ -8196,8 +8207,11 @@ def create_mcp_server() -> MCPServer:
 
         Returns:
             dict: Reset result:
-                - status (str): 'reset_complete', 'reset_failed', 'no_devices',
-                  or 'refused' (foreign holder + not forced)
+                - status (str): 'reset_complete', 'reset_unhealthy' (the reset
+                  ran but the mesh did not verify; marked dirty),
+                  'reset_unverified', 'reset_failed', 'no_devices', or
+                  'refused' (foreign holder + not forced)
+                - health_ok (bool): True only when the verify passed
                 - devices (list[str]): Device indices that were reset
                 - foreign_holders (list): On refusal, [{pid, uid, user}, ...]
         """
