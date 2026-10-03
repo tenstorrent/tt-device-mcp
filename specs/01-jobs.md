@@ -42,8 +42,8 @@ the queue and a running job outlive the broker process.
 - **I6** — A broker restart loses no job. RUNNING jobs are re-adopted from their
   `ttdev-job-<id>.scope` units; QUEUED jobs are restored from persisted specs in queue
   order; an unreadable spec is set aside (`.invalid`), never guessed at; a job whose
-  process is already live, or whose spawn failed, is never revived from its spec (the
-  scope, not the spec, owns it from dispatch on).
+  process is already live is never revived from its spec (the scope, not the spec, owns
+  it from dispatch on), nor is one whose spawn failed (it is terminal: FAILED).
 - **I7** — A re-adopted job keeps its original `timeout_sec` reservation, with time already
   served counted against it (`_readopted_deadline`); re-adoption never grants a fresh
   clock, and the deadline is enforced by `_monitor_readopted_scope`.
@@ -178,7 +178,8 @@ flowchart LR
 - The queue is FIFO (`asyncio.Queue` of job ids). Each queued job's spec is persisted as
   `<log_dir>/queued/<id>.json` (I6) and forgotten only after its process is live — a
   broker dying between dispatch and spawn must not lose the job; one dying after spawn
-  must not run it twice. A spawn that raises is terminal (FAILED) and forgets the spec too.
+  must not run it twice. A spawn that fails with an error is terminal (FAILED) and
+  forgets the spec too; a shutdown (cancellation) mid-spawn keeps it.
 - A job cancelled while queued becomes KILLED (terminal); the runner skips it at dequeue
   and forgets its spec.
 - Before dispatch the runner, in order: waits out any re-adopted job; sleeps out the
