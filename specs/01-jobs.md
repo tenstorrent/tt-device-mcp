@@ -33,7 +33,14 @@ the queue and a running job outlive the broker process.
   a bounded tail, `JOB_CAPTURE_MAX_LINES`).
 - **I4** — Every job starts in its own session (`os.setsid`), so pid == pgid, and the
   runner's `finally` block unconditionally `killpg`s the group (idempotent) so no orphaned
-  child can hold the device after the job is finalized.
+  child can hold the device after the job is finalized. A privsep job's scope is stopped
+  first, on every end (`_stop_job_scope`): a child that left the job's process group
+  survives `killpg` but not its scope. The stop follows I5's ladder (SIGINT, then
+  `systemctl stop` after `GRACEFUL_KILL_GRACE_SEC`) and costs one `systemctl is-active`
+  when the scope already ended with its job. A scope still active is re-checked for up to
+  `_SCOPE_SETTLE_SEC` (systemd sees an emptied cgroup asynchronously) before it counts as a
+  leftover. After a kill or a hung reap the SIGINT was already sent, so it is not repeated:
+  the stop waits out the grace and then reaps.
 - **I5** — A job is never killed with bare SIGKILL first. Termination is the ladder SIGINT
   (`GRACEFUL_KILL_GRACE_SEC` = 60 s) → SIGTERM (`SIGTERM_GRACE_SEC` = 15 s) → SIGKILL,
   because only SIGINT unwinds a Python/ttnn job into the teardown that releases the device.
@@ -80,7 +87,17 @@ the queue and a running job outlive the broker process.
   admission gate reports degraded. By default the job is HELD at the door and re-gated on
   `TENANT_HOLD_POLL_SEC` (60 s) until fit, with no clock bound (a kill releases the hold);
   with `TT_DEVICE_MCP_TENANT_HOLD=0` it is refused at the door as FAILED with the reason in
-  its log. Gate internals are spec 03.
+  its log. Gate internals are spec 03. Before the gate, a job waits while a process
+  outside the broker holds the device (`_wait_out_foreign_holder`): a holder with uid ≥
+  `MIN_TENANT_UID` that is not the broker itself or its children (a holder whose parent
+  chain reaches the broker's pid; one reparented away from it still counts). The wait re-scans every
+  `_HOLDER_WAIT_POLL_SEC` and ends when the holder exits, so the gate then checks the
+  device the holder left. A busy device is not a degraded one: the wait opens no
+  `device_held` episode and the hold deadline does not count it. With
+  `TT_DEVICE_MCP_TENANT_HOLD=0` the job is refused instead ("device busy"), naming the
+  holder. Holders below `MIN_TENANT_UID` (root, service daemons) are ignored, and an
+  incomplete scan does not block — a per-user broker cannot see other users' processes,
+  and a dispatch, unlike a reset, harms no one it cannot see.
 
 ## Interfaces
 
@@ -132,7 +149,7 @@ flowchart LR
   K --> P
   KD --> P
   DM --> P
-  P["finally: killpg leftovers, exit file cleared,<br>footer written; classify device evidence:<br>fault-signature scan / recovery-kill exemption /<br>wedge-risk exit → device marked dirty"] --> PJ["post-job gate:<br>snapshot always,<br>fabric pass on failure"]
+  P["finally: stop privsep scope, killpg leftovers,<br>exit file cleared,<br>footer written; classify device evidence:<br>fault-signature scan / recovery-kill exemption /<br>wedge-risk exit → device marked dirty"] --> PJ["post-job gate:<br>snapshot always,<br>fabric pass on failure"]
   PJ --> D
 ```
 
@@ -183,17 +200,17 @@ flowchart LR
   and forgets its spec.
 - Before dispatch the runner, in order: waits out any re-adopted job; sleeps out the
   optional mesh-rest cooldown (`TT_DEVICE_MCP_JOB_COOLDOWN_SEC`, default 0; only the
-  unspent remainder since the last job's device work ended); awaits an external
-  scheduler's step reservation if one is held (`get_external_step_free_event` — a Slurm
-  pre-step/post-step gate call in progress; spec 03 I29 owns the mechanism); runs the
-  admission gate (I15). Two failure shapes there are distinct and both deliberate: a gate pass that runs
+  unspent remainder since the last job's device work ended); waits out a process outside
+  the broker holding the device (I15); awaits an external scheduler's step reservation if
+  one is held (`get_external_step_free_event` — a Slurm pre-step/post-step gate call in
+  progress; spec 03 I29 owns the mechanism); runs the admission gate (I15). Two failure shapes there are distinct and both deliberate: a gate pass that runs
   but cannot verify records the device unverified — "tried and could not tell" is an
   affirmative hold; an exception *escaping* the admission predicate (a gate bug) MUST NOT
   block dispatch — only an affirmative degraded verdict blocks, so a gate bug never turns
   into a stuck queue (its cost is one ungated dispatch instead). Finally the runner
   refuses the job if privsep is active but the submitter identity cannot
   be honored (running it as root instead is forbidden — spec 05).
-- Refusals at the door (degraded device, privsep) terminalize the job as FAILED, append a
+- Refusals at the door (degraded device, device busy, privsep) terminalize the job as FAILED, append a
   `[REFUSED ...]` note and footer to its log, and record completion stats.
 
 ### Execution
@@ -223,8 +240,8 @@ flowchart LR
 - Exit code semantics: preserved verdicts (KILLED, HUNG) win; otherwise exit 0 →
   COMPLETED, anything else → FAILED. The bounded capture is materialized into
   `job.output` / `job.error` and the deques dropped.
-- The `finally` block: `killpg` the group (I4), clear the job's exit file (this broker
-  saw the exit itself), stamp `finished_at`, record stats, classify device evidence
+- The `finally` block: stop a privsep job's scope and `killpg` the group (I4), clear the
+  job's exit file (this broker saw the exit itself), stamp `finished_at`, record stats, classify device evidence
   (I14), write the log footer, run the post-job health gate
   (`_verify_device_after_job` — snapshot always, fabric traffic pass forced on any
   non-success; internals spec 03), mark the mesh-rest clock, and sweep retention (I13).
@@ -302,6 +319,7 @@ flowchart LR
 | I1 | `tests/test_readopt.py::test_reconcile_readopts_running_scope`, `tests/test_readopt.py::test_startup_waits_for_a_readopted_job_before_touching_the_fabric` |
 | I2 | `tests/test_device_safety.py::test_rest_submit_clamps_timeout_to_the_hard_ceiling`, `tests/test_device_safety.py::test_max_timeout_is_25_minutes_and_is_a_hard_ceiling`, `tests/test_device_safety.py::test_hitting_the_ceiling_does_not_offer_a_bigger_number`, `tests/test_server.py::test_timeout_hint_is_actionable` |
 | I3 (bounded capture) | `tests/test_server.py::test_job_output_capture_is_bounded` |
+| I4 | `tests/test_device_safety.py::test_a_completed_privsep_job_stops_its_scope`, `tests/test_device_safety.py::test_a_scope_that_ended_with_its_job_is_not_signalled`, `tests/test_device_safety.py::test_a_scope_that_settles_after_its_job_is_not_signalled`, `tests/test_device_safety.py::test_an_interrupted_scope_is_reaped_without_a_second_sigint`, `tests/test_device_safety.py::test_a_completed_non_privsep_job_only_killpgs_its_group` |
 | I5 | `tests/test_server.py::TestCleanDeviceGate::test_graceful_terminate_on_sigterm`, `tests/test_server.py::TestCleanDeviceGate::test_graceful_escalates_to_sigkill`, `tests/test_server.py::TestCleanDeviceGate::test_graceful_terminate_already_dead`, `tests/test_reset.py::test_terminate_job_signals_the_scope_for_a_privsep_job`, `tests/test_reset.py::test_terminate_job_falls_back_to_killpg_without_a_scope`, `tests/test_reset.py::test_a_live_privsep_kill_signals_the_scope_not_the_pgroup` |
 | I6 | `tests/test_device_safety.py::test_a_queued_job_survives_the_broker_restarting_under_it`, `tests/test_device_safety.py::test_an_unreadable_queued_spec_is_set_aside_not_guessed_at`, `tests/test_device_safety.py::test_a_started_job_is_not_revived_by_a_restart`, `tests/test_readopt.py::test_reconcile_readopts_running_scope`, `tests/test_readopt.py::test_reconcile_skips_already_tracked`, `tests/test_readopt.py::test_a_restored_queue_survives_when_main_already_started_the_runner` |
 | I7 | `tests/test_readopt.py::test_readopted_deadline_counts_time_already_served`, `tests/test_readopt.py::test_readopted_job_past_its_deadline_is_terminated`, `tests/test_readopt.py::test_readopted_job_inside_its_deadline_is_left_alone`, `tests/test_readopt.py::test_job_from_log_recovers_the_deadline`, `tests/test_readopt.py::test_job_from_log_without_a_timeout_header_still_gets_a_deadline` |
@@ -311,7 +329,7 @@ flowchart LR
 | I11 | `tests/test_server.py::TestActivationScript::test_activation_script_default`, `tests/test_server.py::TestActivationScript::test_activation_script_with_env_file`, `tests/test_server.py::TestActivationScript::test_activation_script_inherited_env`, `tests/test_server.py::TestActivationScript::test_activation_script_python_env_dir_over_virtual_env`, `tests/test_server.py::TestActivationScript::test_activation_script_virtual_env_fallback`, `tests/test_server.py::TestEnvFile::test_load_env_file_converts_to_strings` |
 | I12 | `tests/test_device_safety.py::test_rest_submit_bad_env_file_is_a_refusal_not_a_500`, `tests/test_server.py::TestEnvFile::test_load_env_file_not_found`, `tests/test_server.py::TestEnvFile::test_load_env_file_invalid_format`, `tests/test_server.py::TestActivationScript::test_activation_script_validate_missing_env` |
 | I14 | `tests/test_server.py::TestCleanDeviceGate::test_wedge_risk_truth_table`, `tests/test_device_safety.py::test_a_hung_job_is_treated_as_a_wedge_risk`, `tests/test_server.py::test_scan_output_detects_eth_core_fault`, `tests/test_server.py::test_scan_output_finds_signature_in_tail_of_large_log`, `tests/test_readopt.py::test_a_readopted_job_that_wedged_the_mesh_flags_the_device` |
-| I15 | `tests/test_device_safety.py::test_hold_mode_holds_a_degraded_device_then_dispatches_when_fit`, `tests/test_device_safety.py::test_hold_mode_self_heals_a_dirty_device_by_re_running_the_gate`, `tests/test_device_safety.py::test_exhausting_the_verify_budget_does_not_dispatch`, `tests/test_device_safety.py::test_tenant_gate_writes_one_held_and_one_released_per_episode` |
+| I15 | `tests/test_device_safety.py::test_hold_mode_holds_a_degraded_device_then_dispatches_when_fit`, `tests/test_device_safety.py::test_hold_mode_self_heals_a_dirty_device_by_re_running_the_gate`, `tests/test_device_safety.py::test_exhausting_the_verify_budget_does_not_dispatch`, `tests/test_device_safety.py::test_tenant_gate_writes_one_held_and_one_released_per_episode`, `tests/test_device_safety.py::test_a_tenant_holder_blocks_dispatch`, `tests/test_device_safety.py::test_a_tenant_holder_holds_the_job_until_it_exits`, `tests/test_device_safety.py::test_broker_owned_holders_do_not_block_dispatch`, `tests/test_device_safety.py::test_an_incomplete_holder_scan_does_not_block_dispatch` |
 | B-Submission (burst cap) | `tests/test_device_safety.py::test_an_armed_burst_cap_refuses_one_owners_flood_but_not_another`, `tests/test_device_safety.py::test_the_default_off_burst_cap_admits_every_submit`, `tests/test_device_safety.py::test_job_burst_decision_prunes_the_window_and_gates_on_the_cap[2-60.0-recent2-110.0-False-50.0-expect_kept2]` |
 | B-Submission (owner derived from the peer uid and the surface) | `tests/test_device_safety.py::test_the_owner_comes_from_the_peer_uid_and_the_surface` |
 | B-Submission (blocking run) | `tests/test_server.py::test_a_blocking_job_run_reports_progress_through_the_mcp_layer` |
