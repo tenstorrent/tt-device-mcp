@@ -640,6 +640,27 @@ async def test_a_failed_per_user_start_reopens_once_the_device_reads_healthy(mon
 
 
 @pytest.mark.asyncio
+async def test_a_per_user_restart_from_a_saved_healthy_state_probes_again(monkeypatch, clear_job_state, tmp_path):
+    """fsm.json saves HEALTHY, so every restart after the first loads it, not BOOT. A restart onto a
+    device that went bad since must still be probed and held, not trusted on the saved state."""
+    _per_user_start(monkeypatch, tmp_path)
+    _probe(monkeypatch, healthy=True)
+    await srv.run_startup_tasks()
+    assert srv.fsm.state is ServerState.HEALTHY
+
+    monkeypatch.setattr(srv, "_startup_tasks_done", False)
+    monkeypatch.setattr(srv, "fsm", ServerFsm(tmp_path / "fsm.json"))
+    assert srv.fsm.state is ServerState.HEALTHY, "precondition: the restart loads the saved state"
+    passes = _probe(monkeypatch, healthy=False)
+    _no_ladder(monkeypatch)
+
+    await srv.run_startup_tasks()
+
+    assert passes == [False], "a restart from a saved HEALTHY state was trusted without a probe"
+    assert srv.fsm.state is ServerState.RECOVERING and srv.fsm.record.why in srv.SELFHEAL_WHYS
+
+
+@pytest.mark.asyncio
 async def test_a_per_user_restart_keeps_a_loaded_open_episode(monkeypatch, clear_job_state, tmp_path):
     """A same-boot restart loads the last episode from fsm.json. The start must not wipe it to
     HEALTHY (or probe over it): its own gate or relift settles it."""

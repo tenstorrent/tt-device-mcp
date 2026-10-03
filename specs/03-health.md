@@ -43,7 +43,8 @@ job boundary.
   read-only gate pass (`phase="startup"`, `with_recover=False`: host PCI, ARC heartbeat, tt-smi
   snapshot; no fabric, no ladder) before it serves, and a pass that finds the device unhealthy
   (or raises) leaves it RECOVERING under a self-heal hold (`off_bus`, not dirty), with the `gate`
-  row journaled. A same-boot restart that loads an open episode keeps it and skips the pass.
+  row journaled. A restart that loads HEALTHY from `fsm.json` runs the pass too; one that loads an
+  open episode keeps it and skips the pass.
 - **I5 — `why` is a closed vocabulary** (`fsm.FAULTS`). An unknown value asserts at the write
   site and clamps to `gate_error`; an unknown value read from disk clamps silently. The idle
   relift and the escalation routing branch on exact membership, so a value outside the set is a
@@ -490,11 +491,12 @@ and the socket opens that much later. An unhealthy pass, or one that raises, con
 dirty mark into a self-heal hold (`off_bus`, not dirty): a dirty per-user device that later reads
 healthy routes to `HOLD_FABRIC_UNVERIFIED`, since this shape has no validator to give a fabric
 verdict, and that hold is not lifted by default. The self-heal hold is lifted by the idle relift's
-read-only re-read once the device reads healthy; a device that stays bad stays held until an
-operator resets it. A foreign holder makes the pass skip and the daemon stays HEALTHY, as before:
+read-only re-read once the device reads healthy; a device that stays bad stays held, and past the
+stuck-hold ceiling the forced escalation ladder applies (spec 04). A foreign holder makes the pass skip and the daemon stays HEALTHY, as before:
 holding on it would leave a `foreign_holder` hold that nothing lifts short of the stuck-hold
 escalation, over a device the user may simply have open themselves. If `fsm.json` loaded an open
-episode (a same-boot restart), the daemon keeps it as it is and runs no pass.
+episode, the daemon keeps it as it is and runs no pass; a loaded HEALTHY state is probed like a
+first start.
 
 ```mermaid
 stateDiagram-v2
@@ -712,7 +714,7 @@ refuses.
 |---|---|
 | I2 | `tests/test_boot_platform.py::test_importing_the_server_never_touches_the_device` |
 | I3 | `tests/test_fsm.py::test_survives_restart`, `tests/test_fsm.py::test_dirty_survives_restart`, `tests/test_state_paths.py::test_fsm_survives_restart_at_the_per_user_default_health_dir` |
-| I4 | `tests/test_fsm.py::test_boot_with_no_open_episode_starts_closed`, `tests/test_fsm.py::test_boot_open_episode_is_adopted`, `tests/test_fsm.py::test_terminal_episode_survives_boot_merge`, `tests/test_fsm.py::test_boot_sentinel_is_not_an_open_episode`, `tests/test_readopt.py::test_a_per_user_daemon_start_runs_a_light_probe_and_a_pass_reads_healthy`, `tests/test_readopt.py::test_a_per_user_daemon_start_on_a_bad_device_stays_recovering`, `tests/test_readopt.py::test_a_per_user_daemon_start_beside_a_holder_stays_healthy`, `tests/test_readopt.py::test_a_failed_per_user_start_reopens_once_the_device_reads_healthy`, `tests/test_readopt.py::test_a_per_user_restart_keeps_a_loaded_open_episode`, `tests/test_readopt.py::test_a_per_user_start_probe_that_raises_holds_the_device`, `tests/test_readopt.py::test_the_privsep_broker_start_does_not_run_the_per_user_probe` |
+| I4 | `tests/test_fsm.py::test_boot_with_no_open_episode_starts_closed`, `tests/test_fsm.py::test_boot_open_episode_is_adopted`, `tests/test_fsm.py::test_terminal_episode_survives_boot_merge`, `tests/test_fsm.py::test_boot_sentinel_is_not_an_open_episode`, `tests/test_readopt.py::test_a_per_user_daemon_start_runs_a_light_probe_and_a_pass_reads_healthy`, `tests/test_readopt.py::test_a_per_user_daemon_start_on_a_bad_device_stays_recovering`, `tests/test_readopt.py::test_a_per_user_daemon_start_beside_a_holder_stays_healthy`, `tests/test_readopt.py::test_a_failed_per_user_start_reopens_once_the_device_reads_healthy`, `tests/test_readopt.py::test_a_per_user_restart_keeps_a_loaded_open_episode`, `tests/test_readopt.py::test_a_per_user_restart_from_a_saved_healthy_state_probes_again`, `tests/test_readopt.py::test_a_per_user_start_probe_that_raises_holds_the_device`, `tests/test_readopt.py::test_the_privsep_broker_start_does_not_run_the_per_user_probe` |
 | I5 | `tests/test_fsm.py::test_an_unknown_why_on_disk_clamps_on_load` |
 | I6 | `tests/test_fsm.py::test_cross_boot_load_voids_job_but_keeps_device_facts`, `tests/test_fsm.py::test_a_dirty_mark_survives_a_cross_boot_load`, `tests/test_fsm.py::test_a_file_with_no_boot_id_is_treated_as_cross_boot`, `tests/test_fsm.py::test_same_boot_restart_keeps_job_and_dirty` |
 | I3/I5 robustness | `tests/test_fsm.py::test_a_wrong_shape_file_degrades_to_boot_not_a_crash`, `tests/test_fsm.py::test_malformed_field_types_degrade_to_boot_not_a_crash`, `tests/test_device_safety.py::test_a_non_dict_job_on_disk_never_poisons_the_gate` |

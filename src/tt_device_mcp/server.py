@@ -6466,10 +6466,11 @@ async def run_startup_tasks() -> None:
         # I17), which has nothing to do with re-adoption, and this is the shape most likely to be
         # missing rungs — so it is the shape that most needs them named.
         log_rung_inventory()
+        # fsm.json persists, so a restart can load HEALTHY (probe it again: a restart is never
+        # trusted) or an open episode (keep it as it was; its own gate or relift settles it).
         if fsm.state is ServerState.BOOT:
-            # A same-boot restart can load an open episode from fsm.json; keep it as it was (its
-            # own gate or relift settles it) rather than wipe it with a fresh pass.
             fsm.on_readings(_healthy_reading())
+        if fsm.state is ServerState.HEALTHY:
             await _probe_on_per_user_start()
         return
     try:
