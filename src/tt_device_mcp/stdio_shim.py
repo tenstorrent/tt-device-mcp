@@ -26,7 +26,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import MCPError
-from mcp.types import CONNECTION_CLOSED
+from mcp.types import CONNECTION_CLOSED, INVALID_REQUEST
 
 from tt_device_mcp.constants import resolve_socket, user_socket_path
 
@@ -117,9 +117,10 @@ async def _call_upstream(url: str, client_factory, op, resend_safe: bool = True)
     """Run ``op(session)`` against a fresh upstream session, retrying transient
     connection failures (broker mid-restart / socket briefly absent).
 
-    Only the connect and initialize phase is retried unless ``resend_safe``. Once a
-    tools/call is on the wire the broker may already be running it (a job submit, a
-    reset), so a stream cut after that point is reported to the caller, never re-sent.
+    Unless ``resend_safe``, a request is retried only while it provably never reached a
+    tool: the connect and initialize phase, a refused connect, a session the broker does
+    not know. Past that the broker may already be running it (a job submit, a reset), so
+    a stream cut is reported to the caller, never re-sent.
     """
     last_exc = None
     for attempt in range(_RECONNECT_TRIES):
@@ -135,12 +136,12 @@ async def _call_upstream(url: str, client_factory, op, resend_safe: bool = True)
                         try:
                             answer = (await op(upstream), None)
                         except MCPError as exc:
-                            if exc.code == CONNECTION_CLOSED:
+                            if resend_safe or exc.code == CONNECTION_CLOSED or _never_delivered(exc):
                                 raise
                             answer = (None, exc)  # the broker's own error reply is final
         except Exception as exc:  # noqa: BLE001 - transport errors are retryable; re-raised below
             if answer is None:
-                if sent and not resend_safe:
+                if sent and not resend_safe and not _never_delivered(_root_cause(exc)):
                     cause = type(_root_cause(exc)).__name__
                     _log(f"broker connection lost after the call was sent ({cause}); not re-sending")
                     return _lost_call_result(exc)
@@ -163,12 +164,21 @@ def _root_cause(exc: BaseException) -> BaseException:
     return exc
 
 
+def _never_delivered(exc: BaseException) -> bool:
+    """The request cannot have reached a tool: the connect failed, so no byte was sent, or
+    the broker refused the request itself (after a restart it answers the old session id
+    with INVALID_REQUEST "Session not found")."""
+    if isinstance(exc, (httpx2.ConnectError, httpx2.ConnectTimeout)):
+        return True
+    return isinstance(exc, MCPError) and exc.code == INVALID_REQUEST
+
+
 def _lost_call_result(exc: BaseException) -> types.CallToolResult:
-    """The tool call was sent but its answer never came back. Re-sending could run a job or a reset
-    twice, so the caller gets an error and decides after checking state."""
+    """The tool call was sent but no answer came back. Re-sending could run a job or a reset twice,
+    so the caller gets an error and decides after checking state."""
     exc = _root_cause(exc)
     msg = (
-        f"lost the connection to the device broker after this tool call was sent ({type(exc).__name__}: {exc}). "
+        f"no answer from the device broker after this tool call was sent ({type(exc).__name__}: {exc}). "
         "The broker may have run it, or may still be running it. It was not re-sent. "
         "Check tt_device_queue_status or tt_device_recent_jobs before calling it again."
     )
@@ -196,7 +206,9 @@ async def run_shim(url: str, client_factory) -> None:
         return await _call_upstream(
             url,
             client_factory,
-            lambda s: s.call_tool(params.name, params.arguments, meta=params.meta),
+            # send_request, not call_tool: call_tool follows a result with a tools/list to
+            # validate it, a second round trip that could fail after the answer arrived.
+            lambda s: s.send_request(types.CallToolRequest(params=params), types.CallToolResult),
             resend_safe=False,
         )
 

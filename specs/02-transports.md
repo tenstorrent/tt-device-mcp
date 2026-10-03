@@ -144,12 +144,13 @@ socket server's serve task.
 - **Reconnect**: the stdio session (the client's view) lives for the whole session; each
   `tools/list` / `tools/call` opens a fresh upstream session, retrying up to 12 times at 1 s
   backoff — sized to cover a systemd restart — so a broker bounce blips one call's connect, never
-  the client's session. After the budget: a raised error on that call, session intact. Only the
-  connect and `initialize` are retried for a `tools/call`: once it is sent the broker may already
-  be running it (a job submit, a reset), so a stream cut after that point (a broker restart) comes
-  back as an `is_error` result saying the call was not re-sent, never as a second send. A JSON-RPC
-  error reply from the broker is its answer and is passed on unretried. `tools/list` is read-only
-  and is retried whole.
+  the client's session. After the budget: a raised error on that call, session intact. A
+  `tools/call` is retried only while it provably never reached a tool: the connect and `initialize`,
+  a refused connect, or `INVALID_REQUEST` (a restarted broker's answer to the old session id). Past
+  that the broker may already be running it (a job submit, a reset), so a stream cut (a broker
+  restart) comes back as an `is_error` result saying the call was not re-sent, never as a second
+  send. Any other JSON-RPC error is the broker's answer and is passed on unretried. `tools/list` is
+  read-only and is retried whole.
 - **Transparency**: upstream results are returned unaltered (preserving `is_error`, structured
   content, pagination cursors); `_meta` is forwarded on calls so progress tokens reach the broker.
 
@@ -248,7 +249,7 @@ CONTRIBUTING's workflow) — spec diff first, then the removal, in its own PR.
 | I3 (uid stamped on socket, none on TCP) | `tests/test_socket_transport.py::TestPeerUidScope::test_peer_uid_from_unix_scope`, `tests/test_socket_transport.py::TestPeerUidScope::test_tcp_scope_has_no_peer_uid`, `tests/test_socket_transport.py::TestPeerUidScope::test_missing_client_is_none`, `tests/test_socket_transport.py::TestPeerUidScope::test_middleware_publishes_and_clears_contextvar`, `tests/test_socket_transport.py::TestPeerUidScope::test_the_middleware_derives_the_surface_from_the_request_path` |
 | I3 (identity is authoritative vs self-report — spec 05 owns mechanics) | `tests/test_authz.py::TestAuthzOwner::test_socket_overrides_reported_owner`, `tests/test_authz.py::TestAuthzOwner::test_http_uses_reported_owner`, `tests/test_authz.py::TestAuthzOwner::test_http_unknown_when_no_owner` |
 | I4 (resolution order, lazy daemon, no TCP) | `tests/test_stdio_shim.py::test_resolve_prefers_explicit_socket`, `tests/test_stdio_shim.py::test_resolve_auto_discovers_broker_socket`, `tests/test_stdio_shim.py::test_resolve_lazy_starts_user_daemon_when_none` |
-| Shim retries the connect, never a sent `tools/call` | `tests/test_stdio_shim.py::test_a_broker_restart_mid_call_does_not_re_send_the_call`, `tests/test_stdio_shim.py::test_a_call_made_while_the_broker_is_down_is_sent_once_it_is_back`, `tests/test_stdio_shim.py::test_an_error_reply_from_the_broker_is_passed_on_not_retried` |
+| Shim retries the connect, never a sent `tools/call` | `tests/test_stdio_shim.py::test_a_broker_restart_mid_call_does_not_re_send_the_call`, `tests/test_stdio_shim.py::test_a_call_made_while_the_broker_is_down_is_sent_once_it_is_back`, `tests/test_stdio_shim.py::test_an_error_reply_from_the_broker_is_passed_on_not_retried`, `tests/test_stdio_shim.py::test_a_call_that_never_reached_a_tool_is_retried` |
 | I5 | `tests/test_cli.py::test_main_bare_piped_stdin_runs_stdio_adapter`, `tests/test_cli.py::test_main_bare_tty_shows_help_not_adapter` |
 | I6 (tool names present over the wire) | `tests/test_socket_transport.py::test_socket_jsonrpc_round_trip` |
 | I8 (server-side socket resolution) | `tests/test_socket_transport.py::TestResolveSocketPath::test_cli_value_wins`, `tests/test_socket_transport.py::TestResolveSocketPath::test_env_fallback`, `tests/test_socket_transport.py::TestResolveSocketPath::test_disabled_when_unset` |

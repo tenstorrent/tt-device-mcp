@@ -7,8 +7,10 @@ explicit/env, host broker, then a lazy-started per-user daemon."""
 import asyncio
 import contextlib
 
+import httpx2
 import mcp.types as types
 import pytest
+from mcp.shared.exceptions import MCPError
 
 import tt_device_mcp.constants as constants
 from tt_device_mcp import stdio_shim
@@ -178,14 +180,12 @@ async def test_a_call_made_while_the_broker_is_down_is_sent_once_it_is_back(tmp_
     assert not result.is_error, result
 
 
-@pytest.mark.asyncio
-async def test_an_error_reply_from_the_broker_is_passed_on_not_retried(monkeypatch):
-    """A JSON-RPC error is the broker's answer, so the shim hands it on rather than asking again."""
-    from mcp.shared.exceptions import MCPError
+def _scripted_session(monkeypatch, replies: list) -> list:
+    """Stand in for the upstream session: each attempt's tools/call takes the next reply (raised if
+    it is an exception). Returns the list of calls the fake broker saw."""
+    seen = []
 
-    calls = []
-
-    class _RefusingSession:
+    class _Session:
         def __init__(self, read, write):
             pass
 
@@ -198,18 +198,48 @@ async def test_an_error_reply_from_the_broker_is_passed_on_not_retried(monkeypat
         async def initialize(self):
             return None
 
-        async def call_tool(self, name, arguments, meta=None):
-            calls.append(name)
-            raise MCPError(code=types.INVALID_PARAMS, message="bad arguments")
+        async def send_request(self, request, result_type):
+            seen.append(request.params.name)
+            reply = replies.pop(0)
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
 
     @contextlib.asynccontextmanager
     async def _no_transport(url, http_client):
         yield None, None
 
-    monkeypatch.setattr(stdio_shim, "ClientSession", _RefusingSession)
+    monkeypatch.setattr(stdio_shim, "ClientSession", _Session)
     monkeypatch.setattr(stdio_shim, "streamable_http_client", _no_transport)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_an_error_reply_from_the_broker_is_passed_on_not_retried(monkeypatch):
+    """A JSON-RPC error is the broker's answer, so the shim hands it on rather than asking again."""
+    seen = _scripted_session(monkeypatch, [MCPError(code=types.INVALID_PARAMS, message="bad arguments")])
     handlers = await _shim_handlers(monkeypatch, stdio_shim._UDS_URL, contextlib.nullcontext)
 
     with pytest.raises(MCPError, match="bad arguments"):
         await handlers["call_tool"](None, _call_params("tt_device_submit_job"))
-    assert calls == ["tt_device_submit_job"]
+    assert seen == ["tt_device_submit_job"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        # The broker's socket went away between initialize and the call: no byte of it was sent.
+        lambda: httpx2.ConnectError("[Errno 2] No such file or directory"),
+        # A restarted broker does not know the session, so it refuses the call without running it.
+        lambda: MCPError(code=types.INVALID_REQUEST, message="Session not found"),
+    ],
+    ids=["connect_refused", "unknown_session"],
+)
+async def test_a_call_that_never_reached_a_tool_is_retried(monkeypatch, refusal):
+    done = types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
+    seen = _scripted_session(monkeypatch, [refusal(), done])
+    handlers = await _shim_handlers(monkeypatch, stdio_shim._UDS_URL, contextlib.nullcontext)
+
+    assert await handlers["call_tool"](None, _call_params("tt_device_reset")) is done
+    assert seen == ["tt_device_reset", "tt_device_reset"]
