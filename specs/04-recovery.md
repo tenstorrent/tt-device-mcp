@@ -438,8 +438,9 @@ pass but the last one finished: up to 361 s (heartbeat settle 0.5 s + snapshot 9
 probe 3 × 10 s + eth read 60 s + fabric `FABRIC_CHECK_TIMEOUT_SEC` 180 s). The last pass can time
 out and adds the 75 s kill sequence (`GRACEFUL_KILL_GRACE_SEC` + `SIGTERM_GRACE_SEC`): up to
 436 s. With `POST_RESET_FABRIC_RETRIES` (1) re-checks, each after `POST_RESET_FABRIC_RETRY_SLEEP_SEC`
-(60 s): 1579 s, about 26 minutes, at the defaults. Not counted: stopping a running job first (up
-to 75 s) and waiting for a broker operation already holding the lock. Typical on a healthy Galaxy:
+(60 s): 1579 s, about 26 minutes, at the defaults. Not counted: stopping a running job first (60 s
+grace, then the kill), waiting for a broker operation already holding the lock, and the PCI-rescan
+write itself; the bound also assumes a killed process exits. Typical on a healthy Galaxy:
 about 2 minutes, about 4 with a 77 retry. The tool's docstring states this bound and a test
 recomputes it from the timeouts. The MCP tool sends nothing until it returns, which is safe through
 the stdio shim: its 300 s read timeout bounds the gap between reads, and the SSE keepalives fill

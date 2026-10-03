@@ -142,8 +142,8 @@ socket server's serve task.
   Timeouts: 30 s connect/write/pool, 300 s SSE read (a blocking tool call holds the channel for a
   job's runtime; sse-starlette's 15 s keepalives fill the gap between reads). The read timeout is
   a gap budget, never a cap on a call: the broker's SSE keepalives fill the gap, so a tool that
-  sends nothing for longer (a blocking job, a mesh `tt_device_reset` of up to about 26 minutes,
-  spec 04 I13) still returns its result. A stream cut for another reason (a broker restart) is
+  sends nothing for longer (a blocking job, a mesh `tt_device_reset`, about 26 minutes worst case
+  once it holds the device, spec 04 I13) still returns its result. A stream cut for another reason (a broker restart) is
   retried like a failed connect, which re-sends the call.
 - **Reconnect**: the stdio session (the client's view) lives for the whole session; each
   `tools/list` / `tools/call` opens a fresh upstream session, retrying up to 12 times at 1 s

@@ -643,10 +643,15 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
         return float(re.search(pattern, inspect.getsource(fn)).group(1))
 
     # Stop, then restart, each poller service; each systemctl call is bounded on its own.
-    pollers = 2 * len(srv.DEVICE_POLLER_SERVICES) * literal(srv._set_device_pollers, r"timeout=(\d+)")
+    # The shipped default services, read from the source like the retry defaults below.
+    services = re.search(r'"TT_DEVICE_MCP_POLLER_SERVICES", "([^"]*)"', inspect.getsource(srv)).group(1)
+    n_services = len([x for x in services.split(",") if x.strip()])
+    pollers = 2 * n_services * literal(srv._set_device_pollers, r"timeout=(\d+)")
     rescan = literal(recovery_base.RecoveryMechanism.reset_with_quiesce, r"asyncio\.sleep\((\d+)\)")
     kill = constants.GRACEFUL_KILL_GRACE_SEC + constants.SIGTERM_GRACE_SEC
-    eth_setup = 3 * default(eth.resolve_python, "import_timeout_sec")  # up to 3 candidate pythons
+    candidates = re.search(r"for c in \((.*?)\n\s*\)\n", inspect.getsource(eth.resolve_python), re.S).group(1)
+    n_candidates = len([line for line in candidates.splitlines() if line.strip()])
+    eth_setup = n_candidates * default(eth.resolve_python, "import_timeout_sec")
     finished_pass = (
         heartbeat.HEARTBEAT_SETTLE_SEC
         + default(monitor_mod.HealthMonitor.verify_device_health, "timeout_sec")
@@ -666,7 +671,7 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
     tools = asyncio.run(srv.create_mcp_server().list_tools())
     doc = " ".join(next(t.description for t in tools if t.name == "tt_device_reset").split())
     assert f"about {round(worst / 60)} minutes" in doc, (worst, doc)
-    assert f"up to {pollers:.0f}s" in doc
+    assert f"poller stop and restart up to {pollers:.0f}s" in doc
     assert f"reset {constants.DEVICE_RESET_TIMEOUT_SEC}s" in doc
     assert f"PCI rescan {rescan:.0f}s" in doc
     assert f"first verify pass of up to {math.ceil(finished_pass)}s" in doc

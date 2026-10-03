@@ -8191,12 +8191,15 @@ def create_mcp_server() -> MCPServer:
         + a first verify pass of up to 361s + the 60s wait + a last verify pass
         of up to 436s, which adds the 75s kill of a timed-out check). Only the
         last pass can time out: a re-check follows a pass that finished. Each
-        extra TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES adds a wait and a pass.
-        Not counted: stopping a running job (up to 75s) and waiting for a broker
-        operation already holding the device. The call sends nothing until it
-        ends; the connection stays open on keepalives, so the stdio shim's 300s
-        read timeout does not cut it, but a client with its own tool-call
-        timeout below this may give up while the reset goes on.
+        extra TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES adds a wait and a pass;
+        TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC lengthens each wait and each
+        service in TT_DEVICE_MCP_POLLER_SERVICES adds up to 60s. Not counted:
+        stopping a running job first (60s grace, then the kill) and waiting for
+        a broker operation already holding the device; the bound also assumes
+        a killed process exits. The call sends nothing until it ends; the
+        connection stays open on keepalives, so the stdio shim's 300s read
+        timeout does not cut it, but a client with its own tool-call timeout
+        below this may give up while the reset goes on.
 
         A reset is a board-level reset of ALL chips, so resetting while another
         tenant holds the device aborts their run mid-op and can wedge the mesh.
@@ -8215,14 +8218,18 @@ def create_mcp_server() -> MCPServer:
                   ran but the mesh did not verify; marked dirty),
                   'reset_unverified', 'reset_failed', 'no_devices', or
                   'refused' (foreign holder + not forced)
-                - health_ok (bool): True only when the verify passed
+                - health_ok (bool | None): True only when the verify passed;
+                  None when the reset itself failed and nothing was verified
                 - health_detail (str): What the verify found
                 - devices (list[str]): Device indices that were reset
                 - command (str), returncode (int | None): The reset run;
-                  None when it did not finish in time
+                  None when it did not launch or did not finish in time
                 - stdout (str): The last 4000 characters of the reset's output
+                  (stderr is merged into it; the stderr field is always "")
                 - steps (list): The step-by-step log of the call
-                - foreign_holders (list): On refusal, [{pid, uid, user}, ...]
+                - foreign_holders (list): On refusal, [{pid, uid, user}, ...],
+                  with the refusal's reason and hint
+                no_devices returns only status and steps.
         """
         return await _reset_device(params.force)
 
