@@ -140,12 +140,20 @@ each rung fires only when the gentler one failed or cannot apply.
   endpoint is the MMIO stall that reboots the host, and the sampler would isolate mid-reset
   all-ones chips as dead), and restores them only when no reset scope is still cycling. A PCI
   rescan runs before restore so isolated endpoints re-enumerate.
-- **I13 — The reset tool's verify is heartbeat + snapshot, not the fabric pass.** After
-  `tt_device_reset`'s command exits 0, the tool verifies via `fsm.observe(..., run_fabric=False)`:
-  chip enumeration/count and ARC state only. `health_ok: true` from the tool is not proof against
-  an eth/fabric wedge — that pair scores a wedged mesh as fine; the next gate's fabric pass or a
-  real job is the authority. (The *ladder's* internal post-reset verify does include the fabric
-  pass — see Behavior.)
+- **I13 — An operator reset on a mesh proves the fabric before it releases.** After
+  `tt_device_reset`'s command exits 0 (tool and stream alike), a mesh (expected > 1 chip) on a host
+  with a fabric check installed is verified exactly like the ladder's own resets:
+  `_verify_device_after_reset` — eth read and fabric pass, a 77 re-checked
+  `POST_RESET_FABRIC_RETRIES` times. Fabric pass → released (`health_ok: true`, the runtime-reported
+  fault retired). A failed probe → `reset_unhealthy`, marked dirty (`why=probe_unhealthy`), never
+  HEALTHY. Still 77 after the retries → `reset_unverified`, held `fabric_unverified` (not dirty),
+  the reported fault kept. A single chip, or a mesh with no fabric check installed (which could never
+  produce that verdict), keeps the light verify — `fsm.observe(..., run_fabric=False)` against the
+  host's expected chip count (never the survivors), chip enumeration/count and ARC state only — and
+  the mesh case says so in its output; there `health_ok: true` is not proof against an eth/fabric
+  wedge. A light pass still settles like the full one (released and the reported fault retired,
+  or dirty): it is the strongest verify that host has, and holding for one it cannot run would
+  strand it after every reset.
 - **I14 — Host rungs are armed by default, opt-out, and fireable-or-off.** `_auto_reboot_enabled`
   and `_auto_power_cycle_enabled` default ON (`TT_DEVICE_MCP_AUTO_REBOOT=0` /
   `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` opt out); each additionally reads as OFF where the process
@@ -307,8 +315,9 @@ Class structure: see the diagram in 03-health.md.
   `reset_with_quiesce` under the device-op lock, its one jobs-list row owned by
   `[broker]reset-tool` — the broker performs the reset, so it owns the action row; the requesting
   caller keeps their identity on their own job rows, never on this broker action → on rc 0, verify
-  heartbeat+snapshot (I13) → status `reset_complete` /
-  `reset_unhealthy` / `reset_failed` / `refused` / `no_devices`, with `health_ok`, `steps`, and the
+  under the same lock (I13: fabric on a mesh, heartbeat+snapshot otherwise) → status
+  `reset_complete` / `reset_unhealthy` / `reset_unverified` / `reset_failed` / `refused` /
+  `no_devices`, with `health_ok`, `steps`, and the
   reset transcript. The streaming route (`/api/tt_device_reset_stream`) is the same reset — same
   gate, same lock, same restart-safe runner, same quiesce — plus live output. The backend follows
   I4.
@@ -417,12 +426,17 @@ count. `force` overrides foreign holders and the blind spot but the foreign list
 for logging. Anonymous HTTP callers on a privsep host get the same fail-closed rules with every
 tenant foreign; off privsep, HTTP keeps the legacy single-tenant skip.
 
-**Reset verification scope.** Per I13: the operator tool's verify is chip enumeration + ARC
-heartbeat via one `fsm.observe(run_fabric=False)` pass — `reset_complete` with `health_ok: true`
-says the chips are back and ticking, not that the fabric is proven. Over-enumeration against a
-stale degraded baseline is a recovery, not a failure. The gate ladder's own post-reset verify is
-strictly stronger (fabric included, 77-retried) — the two scopes are different by design and MUST
-NOT be conflated when reading results.
+**Reset verification scope.** Per I13: on a mesh with a fabric check installed, the operator
+reset's verify is the ladder's own post-reset verify (eth read + fabric pass, 77-retried), so
+`reset_complete` there means the fabric moved traffic. This costs nothing per job; it lengthens the
+operator's reset by one fabric pass (about 45-75 s on a healthy mesh), plus the retry sleep and a second pass on a 77.
+Before this, the tool released a mesh on heartbeat + snapshot — the pair that scores an eth/fabric
+wedge as fine — and the stream also retired the runtime's fault report on that blind verdict. On a
+single chip, or a mesh with no fabric check, the verify stays one `fsm.observe(run_fabric=False)`
+pass: `reset_complete` there says the chips are back and ticking, not that the fabric is proven.
+Over-enumeration against a stale degraded baseline is a recovery, not a failure. The stream's verify
+runs under the device-op lock and streams its progress lines, so the CLI's per-read timeout never
+sees a silent fabric pass.
 
 ## Design decisions
 
@@ -533,7 +547,8 @@ NOT be conflated when reading results.
 | I10 per-severity interval | `tests/test_device_safety.py::test_power_cycle_escalates_past_a_recent_reboot`, `tests/test_device_safety.py::test_power_cycle_does_not_escalate_past_a_recent_power_cycle`, `tests/test_device_safety.py::test_reboot_does_not_de_escalate_past_a_recent_power_cycle` |
 | I11 host rung only after exhausted reset (two strikes); once-per-episode latch | `tests/test_device_safety.py::test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted`, `tests/test_device_safety.py::test_stuck_hold_escalation_retries_on_the_grace_cadence`, `tests/test_device_safety.py::test_ubb_tray_reset_fires_at_most_once_per_hold_episode`, `tests/test_device_safety.py::test_escalate_forced_suffix_bypasses_the_retry_pacing` |
 | I12 quiesce + in-flight flag + restore rules | `tests/test_reset.py::test_streaming_reset_quiesces_pollers_and_flags_in_flight`, `tests/test_reset.py::test_reset_quiesce_restores_pollers_even_if_the_rescan_is_cancelled`, `tests/test_reset.py::test_reset_quiesce_leaves_pollers_off_when_the_reset_times_out`, `tests/test_reset.py::test_reset_quiesce_restores_pollers_when_a_failed_launch_leaves_no_scope`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_defers_the_dead_chip_sampler_during_the_transient_drop` |
-| I13 tool verify = heartbeat+snapshot; unhealthy downgrade | `tests/test_reset.py::test_reset_tool_reports_health`, `tests/test_reset.py::test_verify_health_fails_on_short_chip_count`, `tests/test_reset.py::test_verify_health_fails_on_wedged_arc`, `tests/test_reset.py::test_verify_health_passes_on_over_count_from_stale_expected` |
+| I13 mesh reset verify = fabric pass (pass/fail/77), single chip and no-fabric-check light | `tests/test_reset.py::test_an_operator_reset_on_a_mesh_releases_only_on_a_fabric_pass`, `tests/test_reset.py::test_an_operator_reset_whose_fabric_fails_is_not_released`, `tests/test_reset.py::test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified`, `tests/test_reset.py::test_a_single_chip_operator_reset_keeps_the_light_verify`, `tests/test_reset.py::test_a_mesh_with_no_fabric_check_keeps_the_light_verify`, `tests/test_reset.py::test_the_light_verify_checks_the_hosts_chip_count_not_the_survivors`, `tests/test_reset.py::test_a_blind_stream_verify_does_not_clear_the_reported_fault`, `tests/test_reset.py::test_the_stream_settles_an_operator_reset_like_the_tool` |
+| I13 light verify; unhealthy downgrade | `tests/test_reset.py::test_reset_tool_reports_health`, `tests/test_reset.py::test_verify_health_fails_on_short_chip_count`, `tests/test_reset.py::test_verify_health_fails_on_wedged_arc`, `tests/test_reset.py::test_verify_health_passes_on_over_count_from_stale_expected` |
 | I14 warm reboot never fired where futile; blocked climbs are loud | `tests/test_device_safety.py::test_host_escalation_for_drop_sends_all_off_bus_to_the_cold_rung`, `tests/test_device_safety.py::test_host_escalation_for_drop_routes_a_futile_reboot_to_the_cold_rung`, `tests/test_device_safety.py::test_gate_all_off_bus_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_reset_regression_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_all_off_bus_power_cycles_when_opted_in` |
 | Cold rung fireable-or-off (ipmitool) | `tests/test_device_safety.py::test_a_host_without_ipmitool_serves_with_the_cold_rung_off`, `tests/test_device_safety.py::test_ipmitool_present_leaves_the_cold_rung_armed` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
