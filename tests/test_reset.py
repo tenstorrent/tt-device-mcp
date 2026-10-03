@@ -16,7 +16,7 @@ import pytest
 from starlette.testclient import TestClient
 
 import tt_device_mcp.server as srv
-from tests.conftest import patch_health_event, patch_recovery
+from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.recovery import _declared_reset_mode, reset_mode_known, select_recovery
@@ -546,6 +546,161 @@ def test_reset_tool_reports_health(monkeypatch, tmp_path):
     monkeypatch.setattr(srv.subprocess, "run", dispatch(healthy=False))
     d = _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": False}).json()
     assert d["status"] == "reset_unhealthy" and d["health_ok"] is False
+
+
+# --- an operator reset proves the fabric before it reopens the door (spec 04 I13) -------------
+#
+# Heartbeat + snapshot score a wedged eth core as fine, so on a mesh the operator's reset is
+# verified the way the broker verifies its own: eth read and fabric pass, re-checked on a 77.
+
+
+def _mesh_with_fabric_check(monkeypatch, tmp_path, chips=2):
+    for i in range(chips):
+        (tmp_path / str(i)).write_text("")
+    monkeypatch.setattr(srv.fabric, "build_command", lambda: (["fabric-check"], {}))
+    _fake_scoped_reset(monkeypatch, 0, "Re-initialized boards\n")
+
+
+class _Calls(list):
+    def __init__(self):
+        super().__init__()
+        self.expected = []
+
+
+def _verify_seam(monkeypatch, fabric_ok):
+    """Fake the probe pass: heartbeat + snapshot pass, the fabric (when asked for) returns
+    ``fabric_ok``. Records the ``run_fabric`` each pass asked for, and on ``.expected`` the chip
+    count it verified against."""
+    calls = _Calls()
+
+    async def verify(expected, log, *, run_fabric=True, phase="verify_device"):
+        calls.append(run_fabric)
+        calls.expected.append(expected)
+        ev = {"snapshot": {"ok": True, "detail": f"all {expected} chips"}}
+        if not run_fabric:
+            return True, ev
+        ev["fabric"] = {"ok": fabric_ok, "detail": f"fabric rc={ {True: 0, False: 1, None: 77}[fabric_ok]}"}
+        return fabric_ok is not False, ev
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    return calls
+
+
+def _reset_tool(monkeypatch, tmp_path):
+    return _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": False}).json()
+
+
+def _reset_stream(monkeypatch, tmp_path):
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": False})
+    assert resp.status_code == 200
+    return resp.text
+
+
+def test_an_operator_reset_on_a_mesh_releases_only_on_a_fabric_pass(monkeypatch, tmp_path):
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    calls = _verify_seam(monkeypatch, fabric_ok=True)
+    fsm_dirty(srv, "job 7 wedged")
+    monkeypatch.setattr(srv, "device_fault_reported", "job 7 waiting for active ethernet core")
+
+    d = _reset_tool(monkeypatch, tmp_path)
+
+    assert calls == [True], "the operator reset on a mesh did not run the fabric pass"
+    assert d["status"] == "reset_complete" and d["health_ok"] is True
+    assert srv.fsm.state is srv.ServerState.HEALTHY
+    assert srv.device_fault_reported == "", "a reset proven by the fabric pass retires the reported fault"
+
+
+def test_an_operator_reset_whose_fabric_fails_is_not_released(monkeypatch, tmp_path):
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    _verify_seam(monkeypatch, fabric_ok=False)
+
+    d = _reset_tool(monkeypatch, tmp_path)
+
+    assert d["status"] == "reset_unhealthy" and d["health_ok"] is False
+    assert srv.fsm.state is not srv.ServerState.HEALTHY, "a failed fabric pass reopened the door"
+    assert srv.fsm.record.dirty, "the next gate must owe this mesh a real recovery"
+
+
+def test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified(monkeypatch, tmp_path):
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    calls = _verify_seam(monkeypatch, fabric_ok=None)
+    monkeypatch.setattr(srv, "device_fault_reported", "job 7 waiting for active ethernet core")
+
+    d = _reset_tool(monkeypatch, tmp_path)
+
+    assert calls == [True] * (1 + recovery_pkg.POST_RESET_FABRIC_RETRIES), "a 77 was not re-checked"
+    assert d["status"] == "reset_unverified" and d["health_ok"] is False
+    assert srv.fsm.state is not srv.ServerState.HEALTHY
+    assert srv.fsm.record.why == "fabric_unverified" and not srv.fsm.record.dirty
+    assert srv.device_fault_reported, "a reset no pass proved retired the runtime's own fault report"
+
+
+def test_a_single_chip_operator_reset_keeps_the_light_verify(monkeypatch, tmp_path):
+    _mesh_with_fabric_check(monkeypatch, tmp_path, chips=1)
+    calls = _verify_seam(monkeypatch, fabric_ok=False)
+    fsm_dirty(srv, "job 7 wedged")
+
+    monkeypatch.setattr(srv, "device_fault_reported", "job 7 hit a device timeout")
+
+    d = _reset_tool(monkeypatch, tmp_path)
+
+    assert calls == [False], "a single chip has no fabric to pass"
+    assert d["status"] == "reset_complete" and d["health_ok"] is True
+    assert srv.fsm.state is srv.ServerState.HEALTHY
+    assert srv.device_fault_reported == "", "on a single chip the light verify is the whole proof"
+
+
+def test_a_mesh_with_no_fabric_check_keeps_the_light_verify(monkeypatch, tmp_path):
+    """Holding for a fabric verdict a host can never produce would strand it after every reset."""
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.fabric, "build_command", lambda: None)
+    calls = _verify_seam(monkeypatch, fabric_ok=None)
+
+    d = _reset_tool(monkeypatch, tmp_path)
+
+    assert calls == [False]
+    assert d["status"] == "reset_complete"
+    assert any("no fabric check installed" in s for s in d["steps"])
+
+
+def test_the_light_verify_checks_the_hosts_chip_count_not_the_survivors(monkeypatch, tmp_path):
+    """A mesh back two chips short must not verify 2-of-2 (spec 03 I11)."""
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.fabric, "build_command", lambda: None)
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "4")
+    calls = _verify_seam(monkeypatch, fabric_ok=None)
+
+    _reset_tool(monkeypatch, tmp_path)
+
+    assert calls.expected == [4]
+
+
+def test_a_blind_stream_verify_does_not_clear_the_reported_fault(monkeypatch, tmp_path):
+    """The stream used to retire the runtime's fault report on heartbeat + snapshot alone."""
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    _verify_seam(monkeypatch, fabric_ok=None)
+    monkeypatch.setattr(srv, "device_fault_reported", "job 7 waiting for active ethernet core")
+
+    text = _reset_stream(monkeypatch, tmp_path)
+
+    assert "::status::reset_unverified" in text
+    assert "fabric rc=77" in text, "the verify's progress must stream"
+    assert srv.device_fault_reported, "a blind verify retired the runtime's own fault report"
+    assert srv.fsm.record.why == "fabric_unverified"
+
+
+@pytest.mark.parametrize("fabric_ok,status", [(True, "reset_complete"), (False, "reset_unhealthy")])
+def test_the_stream_settles_an_operator_reset_like_the_tool(monkeypatch, tmp_path, fabric_ok, status):
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    calls = _verify_seam(monkeypatch, fabric_ok=fabric_ok)
+    monkeypatch.setattr(srv, "device_fault_reported", "job 7 waiting for active ethernet core")
+
+    text = _reset_stream(monkeypatch, tmp_path)
+
+    assert calls == [True]
+    assert f"::status::{status}" in text
+    assert (srv.fsm.state is srv.ServerState.HEALTHY) is fabric_ok
+    assert (srv.device_fault_reported == "") is fabric_ok
 
 
 # --- the streaming reset is a reset like any other ----------------------------

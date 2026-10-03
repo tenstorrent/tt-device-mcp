@@ -154,7 +154,7 @@ socket server's serve task.
   `{"error": ..., "hint": ...}` bodies, not 5xx tracebacks — a bad env file on submit is a
   refusal shaped like every other refusal.
 - Streaming routes return chunked bodies: `reset_stream` emits human-readable progress lines
-  (`text/plain`) with a trailing `::status::<reset_complete|reset_failed|refused|no_devices>`
+  (`text/plain`) with a trailing `::status::<reset_complete|reset_unhealthy|reset_unverified|reset_failed|refused|no_devices>`
   sentinel the CLI parses for its exit code; `smi_stream` streams raw pty bytes
   (`application/octet-stream`), read-only-allowlisted, deliberately parallel to running jobs.
 - Client-side error shape (`utils.api_call`): HTTP ≥ 400 becomes `{"error": "HTTP <status>: ..."}`;
