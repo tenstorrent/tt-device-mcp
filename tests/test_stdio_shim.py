@@ -5,7 +5,9 @@
 explicit/env, host broker, then a lazy-started per-user daemon."""
 
 import asyncio
+import builtins
 import contextlib
+import importlib
 
 import httpx2
 import mcp.types as types
@@ -241,8 +243,10 @@ async def test_an_error_reply_from_the_broker_is_passed_on_not_retried(monkeypat
         lambda: httpx2.ConnectError("[Errno 2] No such file or directory"),
         # A restarted broker does not know the session, so it refuses the call without running it.
         lambda: MCPError(code=types.INVALID_REQUEST, message="Session not found"),
+        # The SDK's spelling of the same 404.
+        lambda: MCPError(code=types.INVALID_REQUEST, message="Session terminated"),
     ],
-    ids=["connect_refused", "unknown_session"],
+    ids=["connect_refused", "unknown_session", "session_terminated"],
 )
 async def test_a_call_that_never_reached_a_tool_is_retried(monkeypatch, refusal):
     done = types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
@@ -251,3 +255,17 @@ async def test_a_call_that_never_reached_a_tool_is_retried(monkeypatch, refusal)
 
     assert await handlers["call_tool"](None, _call_params("tt_device_reset")) is done
     assert seen == ["tt_device_reset", "tt_device_reset"]
+
+
+@pytest.mark.asyncio
+async def test_a_wrapped_failure_is_retried_only_if_every_part_says_never_delivered(monkeypatch):
+    """The SDK's task groups can wrap several errors. One refused connect beside a cut read does not
+    prove the call stayed home, so it is reported, not re-sent."""
+    group = getattr(builtins, "ExceptionGroup", None) or importlib.import_module("exceptiongroup").ExceptionGroup
+    mixed = group("tg", [httpx2.ConnectError("refused"), httpx2.ReadError("cut")])
+    seen = _scripted_session(monkeypatch, [mixed])
+    handlers = await _shim_handlers(monkeypatch, stdio_shim._UDS_URL, contextlib.nullcontext)
+
+    result = await handlers["call_tool"](None, _call_params("tt_device_submit_job"))
+    assert seen == ["tt_device_submit_job"]
+    assert result.is_error and "not re-sent" in result.content[0].text
