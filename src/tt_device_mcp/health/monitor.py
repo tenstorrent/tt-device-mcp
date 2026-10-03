@@ -269,7 +269,8 @@ class HealthMonitor:
         the reason the read cannot vouch for the fabric. Like the chip baseline, the mark only
         rises: links go down from a wedge, not from the design. An operator re-baselines a host
         whose links really changed by deleting the file. An unreadable file fails closed for this
-        read and is rewritten with the current count.
+        read and is rewritten with the current count, so a file lost that way loses its mark.
+        Writes go through a temp file and ``os.replace``, so a crash mid-write cannot tear it.
         """
         path = health_dir() / self.ETH_LINK_BASELINE_FILE
         try:
@@ -280,8 +281,10 @@ class HealthMonitor:
         except (OSError, ValueError, TypeError, AttributeError):
             baseline, corrupt = 0, True
         if measured > baseline or corrupt:
+            tmp = path.with_name(path.name + ".tmp")
             try:
-                path.write_text(json.dumps({"links": measured}))
+                tmp.write_text(json.dumps({"links": measured}))
+                os.replace(tmp, path)
             except OSError:
                 pass  # a mark we cannot persist must not break the gate
         if corrupt:

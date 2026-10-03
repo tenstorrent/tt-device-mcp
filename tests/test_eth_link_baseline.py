@@ -10,6 +10,8 @@ the pass on to the traffic pass. Separately, a startup self-test that missed its
 rung off until the next restart; an idle broker now retries it.
 """
 
+import time
+
 import pytest
 
 import tt_device_mcp.server as srv
@@ -98,9 +100,13 @@ async def test_an_override_is_judged_on_its_exit_code_alone(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_link_drop_sends_the_pass_on_to_the_traffic_pass(monkeypatch):
+@pytest.mark.parametrize("measured, verdict", [(11, Verdict.SKIPPED), (12, Verdict.HEALTHY)])
+async def test_a_link_drop_is_recorded_as_skipped_and_the_traffic_pass_still_runs(monkeypatch, measured, verdict):
+    """In the gate's own pass eth runs only beside the traffic pass, which runs on a skip as on a
+    pass. What the drop changes there is the record: SKIPPED, not a HEALTHY eth reading. The
+    verdict that a drop does change is the idle relift's eth_frozen check (test_device_safety)."""
     srv.health_monitor.eth_link_drop(12)
-    _stub_probe(monkeypatch, 0, f"{_count(11)}\nall 11 active-eth core heartbeat(s) advancing")
+    _stub_probe(monkeypatch, 0, f"{_count(measured)}\nall {measured} active-eth core heartbeat(s) advancing")
     mon = srv.health_monitor
 
     async def _snapshot_ok(expected):
@@ -116,7 +122,7 @@ async def test_a_link_drop_sends_the_pass_on_to_the_traffic_pass(monkeypatch):
     monkeypatch.setattr(mon, "verify_fabric_health", _fabric)
     state = await mon.update(phase="post_job", run_fabric=True, indices=[0, 1], expected=2)
     eth_obs = [o for o in state.observations if o.monitor == "eth_heartbeat"]
-    assert eth_obs and eth_obs[0].verdict is Verdict.SKIPPED
+    assert eth_obs and eth_obs[0].verdict is verdict
     assert fabric_calls == [1], "an unverified link count must not stop the traffic pass"
 
 
@@ -127,8 +133,8 @@ async def test_a_link_drop_sends_the_pass_on_to_the_traffic_pass(monkeypatch):
 def rearm_state(monkeypatch, clear_job_state):
     monkeypatch.setattr(srv, "eth_check_armed", False)
     monkeypatch.setattr(srv, "eth_check_disarm_reason", "read hung past the 10s self-test budget")
-    monkeypatch.setattr(srv, "eth_selftest_ran", True)
-    monkeypatch.setattr(srv, "_last_eth_rearm_monotonic", 0.0)
+    monkeypatch.setattr(srv, "eth_rearm_retryable", True)
+    monkeypatch.setattr(srv, "_last_eth_rearm_monotonic", time.monotonic() - 2 * srv.ETH_CHECK_REARM_INTERVAL_SEC)
     monkeypatch.setattr(srv, "_eth_rearm_task", None)
     monkeypatch.setattr(srv, "device_op_active", "")
     monkeypatch.setattr(srv, "current_process", None)
@@ -156,6 +162,30 @@ async def test_the_selftest_seeds_the_link_baseline(monkeypatch):
     await srv.selftest_eth_heartbeat()
     assert srv.eth_check_armed is True
     assert "15 of 16" in srv.health_monitor.eth_link_drop(15)
+
+
+@pytest.mark.asyncio
+async def test_a_selftest_that_could_not_check_is_retryable(monkeypatch):
+    monkeypatch.setattr(srv, "eth_check_armed", False)
+    monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
+    monkeypatch.setattr(eth, "build", lambda: (["/bin/sh", "-c", "echo 'no devices attached'; exit 77"], {}))
+    await srv.selftest_eth_heartbeat()
+    assert srv.eth_check_armed is False
+    assert srv.eth_rearm_retryable is True
+
+
+@pytest.mark.asyncio
+async def test_a_host_with_no_eth_reader_is_never_retried(monkeypatch):
+    # Nothing a retry can change: re-running it every interval would only take the device-op lock
+    # and log RUNG OFF again on every idle host without ttexalens.
+    monkeypatch.setattr(srv, "eth_check_armed", False)
+    monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
+    monkeypatch.setattr(eth, "build", lambda: None)
+    await srv.selftest_eth_heartbeat()
+    assert srv.eth_rearm_retryable is False
+    fsm_healthy(srv)
+    srv._maybe_spawn_eth_rearm()
+    assert srv._eth_rearm_task is None
 
 
 @pytest.mark.asyncio
@@ -190,10 +220,12 @@ async def test_the_rearm_is_rate_limited(rearm_state, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("why", ["never_ran", "armed", "not_healthy", "queued_job", "device_op", "running"])
+@pytest.mark.parametrize(
+    "why", ["not_retryable", "armed", "not_healthy", "queued_job", "device_op", "running", "post_job_gate", "too_soon"]
+)
 async def test_the_rearm_waits_for_an_idle_device(rearm_state, monkeypatch, why):
-    if why == "never_ran":
-        monkeypatch.setattr(srv, "eth_selftest_ran", False)  # startup has not tried yet, or a per-user daemon
+    if why == "not_retryable":
+        monkeypatch.setattr(srv, "eth_rearm_retryable", False)  # no reader, or a per-user daemon
     elif why == "armed":
         monkeypatch.setattr(srv, "eth_check_armed", True)
     elif why == "not_healthy":
@@ -206,6 +238,10 @@ async def test_the_rearm_waits_for_an_idle_device(rearm_state, monkeypatch, why)
         monkeypatch.setattr(srv, "device_op_active", "health-gate/post_job")
     elif why == "running":
         monkeypatch.setattr(srv, "current_process", object())
+    elif why == "post_job_gate":
+        monkeypatch.setattr(srv, "post_job_gate_pending", True)  # job exited, its gate not yet run
+    elif why == "too_soon":
+        monkeypatch.setattr(srv, "_last_eth_rearm_monotonic", time.monotonic())  # the startup attempt
     srv._maybe_spawn_eth_rearm()
     if srv._eth_rearm_task is not None:
         await srv._eth_rearm_task

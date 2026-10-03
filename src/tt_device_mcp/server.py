@@ -719,6 +719,9 @@ job_queue: asyncio.Queue[str] | None = None  # Lazy init - created at runtime
 job_counter: int = 0  # Monotonic counter for job IDs; wraps at JOB_ID_MODULUS
 current_process: asyncio.subprocess.Process | None = None
 current_job_id: str | None = None  # job_id of current_process, so a kill can scope-route it
+# True from a job's exit until its post-job gate returns. current_process is already None in that
+# window, so idle-only device work (the eth self-test retry) checks this too.
+post_job_gate_pending: bool = False
 lock: asyncio.Lock | None = None  # Lazy init - created at runtime
 
 
@@ -2365,10 +2368,12 @@ def _hold_device_fabric_unverified(why: str) -> None:
 ETH_CHECK_SELFTEST_BUDGET_SEC = 10.0
 eth_check_armed: bool = False
 eth_check_disarm_reason: str = "startup self-test has not run yet"
-eth_selftest_ran: bool = False
 # A self-test that missed its budget once (a read that hung on a busy box, no device detected at
 # that moment) used to leave the rung off until the next broker restart. An idle broker retries it
-# at this pace instead (see _maybe_spawn_eth_rearm).
+# at this pace instead (see _maybe_spawn_eth_rearm). Only a failure a retry can fix counts: a host
+# with no eth reader at all (eth.build() returned None) is not retried, and neither is a per-user
+# daemon, which never runs the self-test.
+eth_rearm_retryable: bool = False
 ETH_CHECK_REARM_INTERVAL_SEC = 600.0
 _last_eth_rearm_monotonic: float = 0.0
 _eth_rearm_task: Optional[asyncio.Task] = None
@@ -2387,8 +2392,10 @@ async def selftest_eth_heartbeat() -> None:
     from outside. So the box proves the detector on itself, here, once, and says at WARNING which
     rung is off and why when it cannot.
     """
-    global eth_check_armed, eth_check_disarm_reason, eth_selftest_ran
-    eth_selftest_ran = True
+    global eth_check_armed, eth_check_disarm_reason, eth_rearm_retryable, _last_eth_rearm_monotonic
+    # Stamped here, so the first idle retry comes a full interval after this attempt.
+    _last_eth_rearm_monotonic = time.monotonic()
+    eth_rearm_retryable = False
     # Arm provisionally: eth.build() refuses to hand back a runnable probe on an unarmed host, and
     # this self-test IS the arming. Rolled back below unless the attach answers inside budget.
     prior = os.environ.get("TTDEV_ETH_CHECK_ARMED")
@@ -2399,6 +2406,9 @@ async def selftest_eth_heartbeat() -> None:
     if built is None:
         eth_check_disarm_reason = "no runnable eth read on this host (no python that imports ttexalens)"
     else:
+        # A reader exists, so a failure below (could not check, over budget, not runnable) may pass
+        # on a later, quieter try. Cleared again if this one arms.
+        eth_rearm_retryable = True
         argv, env = built
         t0 = datetime.now()
         proc = None
@@ -2837,11 +2847,13 @@ async def _attempt_idle_relift() -> None:
 
 def _eth_rearm_idle() -> bool:
     """Whether the device is idle enough for the eth self-test's one read: HEALTHY, no tenant job
-    queued, running or re-adopted, and no external step reservation. Device ops are checked by
-    the caller (the retry takes the device-op lock itself)."""
+    queued, running or re-adopted, no finished job still owed its post-job gate, and no external
+    step reservation. Device ops are checked by the caller (the retry takes the device-op lock
+    itself)."""
     return (
         fsm.state is ServerState.HEALTHY
         and current_process is None
+        and not post_job_gate_pending
         and not readopted_scopes
         and get_external_step_free_event().is_set()
         and not any(j.status in (JobStatus.QUEUED, JobStatus.RUNNING) for j in jobs.values())
@@ -2863,16 +2875,16 @@ async def _attempt_eth_rearm() -> None:
 
 
 def _maybe_spawn_eth_rearm() -> None:
-    """Retry a failed startup eth self-test from the idle sampler, rate-limited. Never before the
-    startup self-test has run (a per-user daemon, which has no eth reader, never runs it), never
-    while armed, and only on an idle device."""
+    """Retry a failed startup eth self-test from the idle sampler, rate-limited. Only after a
+    self-test failed in a way a retry can fix (see eth_rearm_retryable), never while armed, and
+    only on an idle device."""
     global _eth_rearm_task, _last_eth_rearm_monotonic
-    if eth_check_armed or not eth_selftest_ran or device_op_active:
+    if eth_check_armed or not eth_rearm_retryable or device_op_active:
         return
     if _eth_rearm_task is not None and not _eth_rearm_task.done():
         return
     now = time.monotonic()
-    if _last_eth_rearm_monotonic and now - _last_eth_rearm_monotonic < ETH_CHECK_REARM_INTERVAL_SEC:
+    if now - _last_eth_rearm_monotonic < ETH_CHECK_REARM_INTERVAL_SEC:
         return
     if not _eth_rearm_idle():
         return
@@ -5634,7 +5646,7 @@ def _job_burst_decision(recent_times: list[float], now_monotonic: float) -> tupl
 
 async def job_runner():
     """Main loop processing jobs from the queue."""
-    global current_process, current_job_id, last_job_end_monotonic
+    global current_process, current_job_id, last_job_end_monotonic, post_job_gate_pending
 
     if logger:
         logger.info("JOB_RUNNER started, waiting for jobs...")
@@ -6054,6 +6066,7 @@ async def job_runner():
                     job.finished_at = datetime.now().isoformat()
                     current_process = None
                     current_job_id = None
+                    post_job_gate_pending = True
                     # Track device became idle and record job stats
                     if stats:
                         stats.update_device_state(now_busy=False)
@@ -6133,6 +6146,8 @@ async def job_runner():
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:
                         logger.error(f"JOB_RUNNER post-job health gate error for job_id={job_id}: {e}")
+                finally:
+                    post_job_gate_pending = False
 
                 # The mesh's rest window starts now — after this job's device work AND the
                 # post-job fabric pass, the last traffic the silicon saw. The next job's

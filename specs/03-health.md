@@ -164,16 +164,21 @@ job boundary.
 - **I28 — The eth-heartbeat rung arms itself per host, and vouches only for the links it has
   seen.** The startup self-test times the read; a fast answer arms (a frozen verdict still counts
   as armed — the read worked), a read that never measured leaves the rung off, loudly, and a
-  disarmed reader skips — it never delivers a HOLD. A self-test that failed is retried from the
-  idle sampler tick at most every `ETH_CHECK_REARM_INTERVAL_SEC` (600 s), only on a HEALTHY
-  device with no job queued, running or re-adopted, under the device-op lock, so a missed
-  startup budget no longer leaves the rung off until the next restart. The built-in probe
-  reports how many up links it measured; the broker keeps a high-water mark of that count
-  (`eth_link_baseline.json` in the health dir, seeded by the self-test). An all-advancing read
-  that measured fewer links than the mark is a skip, not a pass: the probe skips a link that is
-  down, so the count is the only place the loss shows, and the skip sends the pass on to the
-  traffic pass, which tests every link. A frozen verdict stays frozen. An operator override is
-  still judged on its exit code alone.
+  disarmed reader skips — it never delivers a HOLD. A self-test that failed with a reader present
+  (could not check, over budget, not runnable) is retried from the idle sampler tick, a full
+  `ETH_CHECK_REARM_INTERVAL_SEC` (600 s) after the previous attempt, only on a HEALTHY device
+  with no job queued, running or re-adopted and no post-job gate pending, under the device-op
+  lock, so a missed startup budget no longer leaves the rung off until the next restart. A host
+  with no eth reader at all is not retried. The built-in probe reports how many up links it
+  measured; the broker keeps a high-water mark of that count (`eth_link_baseline.json` in the
+  health dir, seeded by the self-test, written atomically; an unreadable file skips one read and
+  is rewritten with the current count). An all-advancing read that measured fewer links than the
+  mark is a skip, not a pass: the probe does not read a link that is down, so the count is the
+  only place the loss shows. In the gate's own pass that changes the record (SKIPPED, not a
+  HEALTHY eth reading) and not the route, since the traffic pass runs on a skip as on a pass. It
+  does change the idle relift: an `eth_frozen` hold whose frozen core's link went down stays held
+  instead of lifting on the cores that are left. A frozen verdict stays frozen. An operator
+  override is still judged on its exit code alone.
 - **I29 — An externally-driven read-only pass records but never acts.** `with_recover=False`
   journals its verdict, holds an unhealthy device, and freezes an incident bundle, but enters no
   rung of the ladder and never runs the fabric traffic pass regardless of `run_fabric`,
@@ -740,8 +745,8 @@ refuses.
 | I27 | `tests/test_boot_platform.py::test_a_declared_mode_commits_without_touching_the_device`, `tests/test_boot_platform.py::test_a_probe_that_reads_galaxy_boards_commits_the_galaxy_ladder`, `tests/test_boot_platform.py::test_a_probe_that_reads_non_galaxy_boards_commits_per_target`, `tests/test_boot_platform.py::test_an_unreadable_mesh_commits_nothing_and_keeps_the_per_pass_fallback`, `tests/test_boot_platform.py::test_a_probe_that_raises_never_stops_the_broker_booting`, `tests/test_boot_platform.py::test_a_committed_platform_short_circuits_per_pass_selection` |
 | I28 | `tests/test_rung_arming.py::test_a_fast_clean_read_arms_the_rung`, `tests/test_rung_arming.py::test_a_frozen_verdict_still_counts_as_armed`, `tests/test_rung_arming.py::test_a_slow_read_never_arms`, `tests/test_rung_arming.py::test_a_cannot_check_read_leaves_the_rung_off_with_a_reason`, `tests/test_rung_arming.py::test_a_disarmed_rung_skips_instead_of_delivering_a_verdict`, `tests/test_rung_arming.py::test_the_armed_flag_is_not_inherited_from_a_stale_environment` |
 | I28 (the probe reports its link count; exit codes unchanged) | `tests/test_eth_heartbeat_probe.py::test_main_counts_a_down_link_and_still_reads_ok`, `tests/test_eth_heartbeat_probe.py::test_main_frozen_keeps_its_exit_code_with_the_count_line`, `tests/test_eth_heartbeat_probe.py::test_main_all_links_down_is_still_cannot_check`, `tests/test_eth_heartbeat_probe.py::test_main_counts_an_off_bus_core_as_unreadable` |
-| I28 (link high-water mark; a drop is unverified, not a pass) | `tests/test_eth_link_baseline.py::test_the_link_count_is_parsed_from_the_probe_output`, `tests/test_eth_link_baseline.py::test_the_link_baseline_keeps_its_high_water_mark`, `tests/test_eth_link_baseline.py::test_an_unreadable_link_baseline_fails_closed_once_then_rebaselines`, `tests/test_eth_link_baseline.py::test_an_advancing_read_that_lost_a_link_is_not_a_pass`, `tests/test_eth_link_baseline.py::test_an_advancing_read_at_the_mark_passes_and_ratchets`, `tests/test_eth_link_baseline.py::test_a_frozen_read_stays_frozen_whatever_the_count`, `tests/test_eth_link_baseline.py::test_an_override_is_judged_on_its_exit_code_alone`, `tests/test_eth_link_baseline.py::test_a_link_drop_sends_the_pass_on_to_the_traffic_pass`, `tests/test_eth_link_baseline.py::test_the_selftest_seeds_the_link_baseline` |
-| I28 (a failed self-test is retried while idle) | `tests/test_eth_link_baseline.py::test_a_failed_selftest_rearms_from_the_idle_tick`, `tests/test_eth_link_baseline.py::test_the_idle_relift_tick_drives_the_rearm`, `tests/test_eth_link_baseline.py::test_the_rearm_is_rate_limited`, `tests/test_eth_link_baseline.py::test_the_rearm_waits_for_an_idle_device`, `tests/test_eth_link_baseline.py::test_a_job_queued_before_the_lock_is_taken_cancels_the_rearm` |
+| I28 (link high-water mark; a drop is unverified, not a pass) | `tests/test_eth_link_baseline.py::test_the_link_count_is_parsed_from_the_probe_output`, `tests/test_eth_link_baseline.py::test_the_link_baseline_keeps_its_high_water_mark`, `tests/test_eth_link_baseline.py::test_an_unreadable_link_baseline_fails_closed_once_then_rebaselines`, `tests/test_eth_link_baseline.py::test_an_advancing_read_that_lost_a_link_is_not_a_pass`, `tests/test_eth_link_baseline.py::test_an_advancing_read_at_the_mark_passes_and_ratchets`, `tests/test_eth_link_baseline.py::test_a_frozen_read_stays_frozen_whatever_the_count`, `tests/test_eth_link_baseline.py::test_an_override_is_judged_on_its_exit_code_alone`, `tests/test_eth_link_baseline.py::test_a_link_drop_is_recorded_as_skipped_and_the_traffic_pass_still_runs`, `tests/test_device_safety.py::test_idle_relift_holds_a_frozen_core_whose_link_went_down`, `tests/test_eth_link_baseline.py::test_the_selftest_seeds_the_link_baseline` |
+| I28 (a failed self-test is retried while idle) | `tests/test_eth_link_baseline.py::test_a_failed_selftest_rearms_from_the_idle_tick`, `tests/test_eth_link_baseline.py::test_the_idle_relift_tick_drives_the_rearm`, `tests/test_eth_link_baseline.py::test_the_rearm_is_rate_limited`, `tests/test_eth_link_baseline.py::test_the_rearm_waits_for_an_idle_device`, `tests/test_eth_link_baseline.py::test_a_job_queued_before_the_lock_is_taken_cancels_the_rearm`, `tests/test_eth_link_baseline.py::test_a_selftest_that_could_not_check_is_retryable`, `tests/test_eth_link_baseline.py::test_a_host_with_no_eth_reader_is_never_retried` |
 | I29 (read-only never enters the ladder) | `tests/test_slurm_steps.py::test_a_read_only_pass_never_enters_the_recovery_ladder` |
 | I29 (read-only still holds an unhealthy device) | `tests/test_slurm_steps.py::test_a_read_only_pass_still_holds_an_unhealthy_device` |
 | I29 (read-only never runs fabric) | `tests/test_slurm_steps.py::test_a_read_only_pass_never_runs_the_fabric_traffic_pass` |
