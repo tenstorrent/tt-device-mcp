@@ -180,6 +180,39 @@ def _client(monkeypatch, dev_dir, holders=None):
     return TestClient(srv.build_asgi_app(srv.create_mcp_server()))
 
 
+@pytest.mark.parametrize("keepalive", [True, False])
+def test_a_silent_reset_stream_sends_keepalives_when_asked(monkeypatch, tmp_path, keepalive):
+    """The CLI reads the stream with a per-read socket timeout. A reset that prints nothing
+    for longer than that must still put bytes on the wire, or the CLI calls a live reset dead.
+    Older CLIs print every line, so only a client that asks gets the sentinel."""
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "RESET_STREAM_KEEPALIVE_SEC", 0.02)
+
+    async def silent_reset(argv, log, owner="[broker]health-gate", on_output=None):
+        await asyncio.sleep(0.3)  # many keepalive intervals with no output
+        return 0, ""
+
+    async def pollers(active, log):
+        return []
+
+    async def healthy(*_a, **_k):
+        return True, {"snapshot": {"detail": "ok"}}
+
+    monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", silent_reset)
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    monkeypatch.setattr(srv.fsm, "observe", healthy)
+    body = {"force": False, "keepalive": True} if keepalive else {"force": False}
+    lines = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json=body).text.splitlines()
+
+    assert lines[-1] == "::status::reset_complete", lines
+    kept = lines.count(srv.RESET_STREAM_KEEPALIVE_LINE)
+    if keepalive:
+        assert kept >= 3, f"a silent reset went out with {kept} keepalive(s): {lines}"
+        assert "exit code: 0" in lines, "the keepalive wrapper dropped a progress line"
+    else:
+        assert kept == 0, "a client that did not ask was sent keepalives"
+
+
 def test_reset_success_reports_steps_and_command(monkeypatch, tmp_path):
     (tmp_path / "0").write_text("")
     (tmp_path / "1").write_text("")
