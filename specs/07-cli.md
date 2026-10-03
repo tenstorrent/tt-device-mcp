@@ -69,7 +69,8 @@ start` is the only supported way to bring one up.
   overrun, unreachable broker — is 1. A scheduler reads that bit to drain a node and requeue a
   job, so folding transport failure in with device failure is deliberate: neither is a device
   anyone should dispatch onto. `post-step`'s `--exit-code` carries the finished step's status
-  inward (it forces the fabric pass); nothing carries outward but the bit and the printed reason.
+  inward (nonzero forces the fabric pass; zero, on a host whose eth rung is armed, buys the
+  passive eth read, spec 03 I30); nothing carries outward but the bit and the printed reason.
 
   `--exit-code` accepts every shape a scheduler actually reports one in, because only its
   zero/nonzero bit is consumed. Slurm's are not the plain small integers their names suggest:
