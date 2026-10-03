@@ -492,11 +492,11 @@ dirty mark into a self-heal hold (`off_bus`, not dirty): a dirty per-user device
 healthy routes to `HOLD_FABRIC_UNVERIFIED`, since this shape has no validator to give a fabric
 verdict, and that hold is not lifted by default. The self-heal hold is lifted by the idle relift's
 read-only re-read once the device reads healthy; a device that stays bad stays held, and past the
-stuck-hold ceiling the forced escalation ladder applies (spec 04). A foreign holder makes the pass skip and the daemon stays HEALTHY, as before:
-holding on it would leave a `foreign_holder` hold that nothing lifts short of the stuck-hold
-escalation, over a device the user may simply have open themselves. If `fsm.json` loaded an open
-episode, the daemon keeps it as it is and runs no pass; a loaded HEALTHY state is probed like a
-first start.
+stuck-hold ceiling the forced escalation ladder applies (spec 04). A foreign holder makes the
+pass skip and the daemon stays HEALTHY, as before: holding on it would leave a `foreign_holder`
+hold that nothing lifts short of the stuck-hold escalation, over a device the user may simply have
+open themselves. If `fsm.json` loaded an open episode, the daemon keeps it as it is and runs no
+pass; a loaded HEALTHY state is probed like a first start.
 
 ```mermaid
 stateDiagram-v2
