@@ -141,7 +141,8 @@ async def _call_upstream(url: str, client_factory, op, resend_safe: bool = True)
         except Exception as exc:  # noqa: BLE001 - transport errors are retryable; re-raised below
             if answer is None:
                 if sent and not resend_safe:
-                    _log(f"broker connection lost after the call was sent ({type(exc).__name__}); not re-sending")
+                    cause = type(_root_cause(exc)).__name__
+                    _log(f"broker connection lost after the call was sent ({cause}); not re-sending")
                     return _lost_call_result(exc)
                 last_exc = exc
                 _log(f"broker unavailable ({type(exc).__name__}); retry {attempt + 1}/{_RECONNECT_TRIES}")
@@ -155,9 +156,17 @@ async def _call_upstream(url: str, client_factory, op, resend_safe: bool = True)
     raise RuntimeError(f"broker unreachable after {_RECONNECT_TRIES} retries: {last_exc!r}")
 
 
+def _root_cause(exc: BaseException) -> BaseException:
+    # The SDK's task groups wrap the transport error; name the error, not the group.
+    while getattr(exc, "exceptions", None):
+        exc = exc.exceptions[0]
+    return exc
+
+
 def _lost_call_result(exc: BaseException) -> types.CallToolResult:
-    """The tool call reached the broker but its answer did not come back. Re-sending could run a
-    job or a reset twice, so the caller gets an error and decides after checking state."""
+    """The tool call was sent but its answer never came back. Re-sending could run a job or a reset
+    twice, so the caller gets an error and decides after checking state."""
+    exc = _root_cause(exc)
     msg = (
         f"lost the connection to the device broker after this tool call was sent ({type(exc).__name__}: {exc}). "
         "The broker may have run it, or may still be running it. It was not re-sent. "
