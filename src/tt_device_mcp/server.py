@@ -2365,6 +2365,13 @@ def _hold_device_fabric_unverified(why: str) -> None:
 ETH_CHECK_SELFTEST_BUDGET_SEC = 10.0
 eth_check_armed: bool = False
 eth_check_disarm_reason: str = "startup self-test has not run yet"
+eth_selftest_ran: bool = False
+# A self-test that missed its budget once (a read that hung on a busy box, no device detected at
+# that moment) used to leave the rung off until the next broker restart. An idle broker retries it
+# at this pace instead (see _maybe_spawn_eth_rearm).
+ETH_CHECK_REARM_INTERVAL_SEC = 600.0
+_last_eth_rearm_monotonic: float = 0.0
+_eth_rearm_task: Optional[asyncio.Task] = None
 
 
 async def selftest_eth_heartbeat() -> None:
@@ -2380,12 +2387,15 @@ async def selftest_eth_heartbeat() -> None:
     from outside. So the box proves the detector on itself, here, once, and says at WARNING which
     rung is off and why when it cannot.
     """
-    global eth_check_armed, eth_check_disarm_reason
+    global eth_check_armed, eth_check_disarm_reason, eth_selftest_ran
+    eth_selftest_ran = True
     # Arm provisionally: eth.build() refuses to hand back a runnable probe on an unarmed host, and
     # this self-test IS the arming. Rolled back below unless the attach answers inside budget.
     prior = os.environ.get("TTDEV_ETH_CHECK_ARMED")
     os.environ["TTDEV_ETH_CHECK_ARMED"] = "1"
-    built = eth.build()
+    # Off the event loop: build() can shell out to three candidate pythons, and the idle retry
+    # (see _maybe_spawn_eth_rearm) must not stall the sampler or the watchdog ping on them.
+    built = await asyncio.to_thread(eth.build)
     if built is None:
         eth_check_disarm_reason = "no runnable eth read on this host (no python that imports ttexalens)"
     else:
@@ -2412,6 +2422,11 @@ async def selftest_eth_heartbeat() -> None:
                 verdict = True if rc == 0 else None if rc == FABRIC_CHECK_CANNOT_CHECK_RC else False
             else:
                 verdict, _detail = eth.classify_exit(rc)
+                # Seed the link-count high-water mark from the first read, so the first gate
+                # already has a baseline to judge a down link against.
+                links = eth.parse_link_count("\n".join(tail))
+                if links:
+                    health_monitor.eth_link_drop(links)
             if verdict is None:
                 eth_check_disarm_reason = f"read could not check in {dt:.1f}s: {last}"
             else:
@@ -2820,12 +2835,60 @@ async def _attempt_idle_relift() -> None:
         _log("pass aborted on an unexpected error — holding; the sampler retries next window")
 
 
+def _eth_rearm_idle() -> bool:
+    """Whether the device is idle enough for the eth self-test's one read: HEALTHY, no tenant job
+    queued, running or re-adopted, and no external step reservation. Device ops are checked by
+    the caller (the retry takes the device-op lock itself)."""
+    return (
+        fsm.state is ServerState.HEALTHY
+        and current_process is None
+        and not readopted_scopes
+        and get_external_step_free_event().is_set()
+        and not any(j.status in (JobStatus.QUEUED, JobStatus.RUNNING) for j in jobs.values())
+    )
+
+
+async def _attempt_eth_rearm() -> None:
+    """Re-run the eth self-test once, under the device-op lock, if the rung is still off and the
+    device is still idle. A queued job's dispatch waits on the same lock, so it cannot land on the
+    read; the read is bounded by ETH_CHECK_SELFTEST_BUDGET_SEC."""
+    try:
+        async with _device_op("eth-rearm"):
+            if eth_check_armed or not _eth_rearm_idle():
+                return
+            await selftest_eth_heartbeat()
+    except Exception as e:  # noqa: BLE001 - a detached retry must never raise unretrieved
+        if logger:
+            logger.error(f"RUNG SELFTEST eth-heartbeat retry failed: {e}")
+
+
+def _maybe_spawn_eth_rearm() -> None:
+    """Retry a failed startup eth self-test from the idle sampler, rate-limited. Never before the
+    startup self-test has run (a per-user daemon, which has no eth reader, never runs it), never
+    while armed, and only on an idle device."""
+    global _eth_rearm_task, _last_eth_rearm_monotonic
+    if eth_check_armed or not eth_selftest_ran or device_op_active:
+        return
+    if _eth_rearm_task is not None and not _eth_rearm_task.done():
+        return
+    now = time.monotonic()
+    if _last_eth_rearm_monotonic and now - _last_eth_rearm_monotonic < ETH_CHECK_REARM_INTERVAL_SEC:
+        return
+    if not _eth_rearm_idle():
+        return
+    _last_eth_rearm_monotonic = now
+    _eth_rearm_task = asyncio.create_task(_attempt_eth_rearm())
+
+
 def _maybe_spawn_idle_relift() -> None:
     """Start one idle relift as its own task when a re-verifiable hold is up and none is in flight.
     Detached from the sampler by design (see _relift_task): awaiting a possibly-60s eth read or a
     ~45s traffic pass inline would blind the sampler's dead-chip tripwire and leave the probe's
-    dead-BAR read with nothing to kill it. The spawned task re-checks every guard itself."""
+    dead-BAR read with nothing to kill it. The spawned task re-checks every guard itself.
+
+    The same idle tick also retries a failed eth self-test (see _maybe_spawn_eth_rearm)."""
     global _relift_task
+    _maybe_spawn_eth_rearm()
     if _relift_task is not None and not _relift_task.done():
         return
     selfheal, fabric, generic = _idle_relift_armed()
