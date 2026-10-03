@@ -62,6 +62,7 @@ class HealthMonitor:
     """
 
     CHIP_BASELINE_FILE = "chip_baseline.json"
+    ETH_LINK_BASELINE_FILE = "eth_link_baseline.json"
 
     def __init__(self, deps) -> None:
         self._deps = deps
@@ -258,6 +259,39 @@ class HealthMonitor:
                 pass  # a baseline we cannot persist must not break the gate; present is the floor
             return present
         return baseline or present
+
+    def eth_link_drop(self, measured: int) -> str:
+        """Judge the built-in eth probe's measured link count against this host's high-water mark.
+
+        The probe reads only links that are up, so a link that went down is simply one core fewer
+        and every remaining core still reads advancing. The count is the only place that loss
+        shows. Returns "" when ``measured`` is at least the mark (and ratchets the mark up), else
+        the reason the read cannot vouch for the fabric. Like the chip baseline, the mark only
+        rises: links go down from a wedge, not from the design. An operator re-baselines a host
+        whose links really changed by deleting the file. An unreadable file fails closed for this
+        read and is rewritten with the current count, so a file lost that way loses its mark.
+        Writes go through a temp file and ``os.replace``, so a crash mid-write cannot tear it.
+        """
+        path = health_dir() / self.ETH_LINK_BASELINE_FILE
+        try:
+            baseline = int(json.loads(path.read_text()).get("links", 0))
+            corrupt = False
+        except FileNotFoundError:
+            baseline, corrupt = 0, False
+        except (OSError, ValueError, TypeError, AttributeError):
+            baseline, corrupt = 0, True
+        if measured > baseline or corrupt:
+            tmp = path.with_name(path.name + ".tmp")
+            try:
+                tmp.write_text(json.dumps({"links": measured}))
+                os.replace(tmp, path)
+            except OSError:
+                pass  # a mark we cannot persist must not break the gate
+        if corrupt:
+            return f"eth link baseline unreadable; re-baselined at {measured} up link(s)"
+        if measured < baseline:
+            return f"{measured} of {baseline} eth link(s) up — a link went down since the high-water mark"
+        return ""
 
     def _health_check_enabled(self) -> bool:
         """Whether the tt-smi snapshot health check runs around jobs. On by default;
@@ -682,6 +716,14 @@ class HealthMonitor:
             reason = last
         else:
             ok, reason = eth.classify_exit(rc)
+            links = eth.parse_link_count(text)
+            # A down link is invisible to the verdict above (the probe skips it), so a drop in the
+            # measured count turns an all-advancing read into "could not vouch": the caller then
+            # runs the traffic pass, which is what tests every link. A frozen verdict stays frozen.
+            drop = self.eth_link_drop(links) if links else ""
+            if ok is True and drop:
+                self._journal_skip_once("eth_heartbeat_unavailable", "link_count_drop", detail=drop[:400])
+                return None, f"skipped (eth links unverified): {drop}"
 
         if ok is None:
             # The check could not run — it learned nothing about the eth cores, so falling

@@ -77,7 +77,7 @@ and job exit statuses never hit disk.
 | Runtime state base | n/a (system paths below) | `<install>/state` | `TT_DEVICE_MCP_STATE_DIR` (independent of the install base), `--log-dir` |
 | Socket | `/run/tt-device-broker/broker.sock` (`RuntimeDirectory=`, chmod 0666) | `<state>/daemon.sock` | `--socket` / `TT_DEVICE_MCP_SOCKET` |
 | FSM state file | `/var/lib/tt-device-broker/health/fsm.json` | `<state>/health/fsm.json` | follows the health dir |
-| Health journal (events, telemetry trace, buslock, chip baseline, incidents/) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
+| Health journal (events, telemetry trace, buslock, chip and eth-link baselines, incidents/) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
 | Server log + job logs | `/var/log/tt-device-broker/` (the unit passes `--log-dir`; the bare server defaults to CWD) | `<state>/` | `--log-dir` |
 | Stats | `<log-dir>/stats/` → `/var/log/tt-device-broker/stats/` | `<state>/stats/` | follows `--log-dir` |
 | Metrics textfile | `/var/lib/prometheus/node-exporter/tt_device_mcp.prom` | `<state>/metrics/tt_device_mcp.prom` | `TT_DEVICE_MCP_TEXTFILE_DIR` |
