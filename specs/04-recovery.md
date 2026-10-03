@@ -430,15 +430,20 @@ tenant foreign; off privsep, HTTP keeps the legacy single-tenant skip.
 reset's verify is the ladder's own post-reset verify (eth read + fabric pass, 77-retried), so
 `reset_complete` there means the fabric moved traffic. This costs nothing per job; it lengthens the
 operator's reset by one fabric pass (about 45-75 s on a healthy mesh), plus the retry sleep and a second pass on a 77.
-**Duration bound.** From the moment the reset holds the device-op lock, the call takes at most the
+**Duration bound.** From the moment the reset holds the device-op lock, the call takes at most:
+the poller stop and restart (30 s per `systemctl` call, 120 s with the two default services), the
 reset (`DEVICE_RESET_TIMEOUT_SEC`, 600 s; a reset still running then is `reset_failed` with no
-verify), the 3 s PCI-rescan settle, and `1 + POST_RESET_FABRIC_RETRIES` verify passes of up to
-331 s each (heartbeat settle 0.5 s + snapshot 90 s + eth read 60 s + fabric
-`FABRIC_CHECK_TIMEOUT_SEC` 180 s) with `POST_RESET_FABRIC_RETRY_SLEEP_SEC` (60 s) between them:
-1325 s, about 22 minutes, at the defaults. Typical on a healthy Galaxy: about 2 minutes, about 4
-with a 77 retry. The tool's docstring states this bound and a test recomputes it from the
-timeouts. The MCP tool sends nothing until it returns, which is safe through the stdio shim: its
-300 s read timeout bounds the gap between reads, and the SSE keepalives fill it (spec 02).
+verify), the 3 s PCI-rescan settle, and the verify passes. A re-check follows only a 77, so every
+pass but the last one finished: up to 361 s (heartbeat settle 0.5 s + snapshot 90 s + eth python
+probe 3 × 10 s + eth read 60 s + fabric `FABRIC_CHECK_TIMEOUT_SEC` 180 s). The last pass can time
+out and adds the 75 s kill sequence (`GRACEFUL_KILL_GRACE_SEC` + `SIGTERM_GRACE_SEC`): up to
+436 s. With `POST_RESET_FABRIC_RETRIES` (1) re-checks, each after `POST_RESET_FABRIC_RETRY_SLEEP_SEC`
+(60 s): 1579 s, about 26 minutes, at the defaults. Not counted: stopping a running job first (up
+to 75 s) and waiting for a broker operation already holding the lock. Typical on a healthy Galaxy:
+about 2 minutes, about 4 with a 77 retry. The tool's docstring states this bound and a test
+recomputes it from the timeouts. The MCP tool sends nothing until it returns, which is safe through
+the stdio shim: its 300 s read timeout bounds the gap between reads, and the SSE keepalives fill
+it (spec 02).
 Before this, the tool released a mesh on heartbeat + snapshot — the pair that scores an eth/fabric
 wedge as fine — and the stream also retired the runtime's fault report on that blind verdict. On a
 single chip, or a mesh with no fabric check, the verify stays one `fsm.observe(run_fabric=False)`

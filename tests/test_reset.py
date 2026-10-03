@@ -634,30 +634,45 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
 
     from tt_device_mcp import constants
     from tt_device_mcp.health import monitor as monitor_mod
-    from tt_device_mcp.health.monitors import heartbeat
+    from tt_device_mcp.health.monitors import eth, heartbeat
 
     def default(fn, name):
         return inspect.signature(fn).parameters[name].default
 
-    one_pass = math.ceil(
+    def literal(fn, pattern):
+        return float(re.search(pattern, inspect.getsource(fn)).group(1))
+
+    # Stop, then restart, each poller service; each systemctl call is bounded on its own.
+    pollers = 2 * len(srv.DEVICE_POLLER_SERVICES) * literal(srv._set_device_pollers, r"timeout=(\d+)")
+    rescan = literal(recovery_base.RecoveryMechanism.reset_with_quiesce, r"asyncio\.sleep\((\d+)\)")
+    kill = constants.GRACEFUL_KILL_GRACE_SEC + constants.SIGTERM_GRACE_SEC
+    eth_setup = 3 * default(eth.resolve_python, "import_timeout_sec")  # up to 3 candidate pythons
+    finished_pass = (
         heartbeat.HEARTBEAT_SETTLE_SEC
         + default(monitor_mod.HealthMonitor.verify_device_health, "timeout_sec")
+        + eth_setup
         + default(monitor_mod.HealthMonitor.verify_eth_heartbeat, "timeout_sec")
         + constants.FABRIC_CHECK_TIMEOUT_SEC
     )
+    # A re-check follows only a 77, a pass that finished; only the last pass can hit a timeout and
+    # pay the kill sequence.
+    last_pass = finished_pass + kill
     # The shipped defaults, read from the source: conftest zeroes the live retry sleep.
     src = inspect.getsource(recovery_pkg)
     retries = int(re.search(r'"TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES", "(\d+)"', src).group(1))
     sleep = float(re.search(r'"TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC", "([\d.]+)"', src).group(1))
-    rescan = 3  # reset_with_quiesce's settle after the PCI rescan
-    worst = constants.DEVICE_RESET_TIMEOUT_SEC + rescan + (1 + retries) * one_pass + retries * sleep
+    worst = pollers + constants.DEVICE_RESET_TIMEOUT_SEC + rescan + retries * (finished_pass + sleep) + last_pass
 
     tools = asyncio.run(srv.create_mcp_server().list_tools())
-    doc = next(t.description for t in tools if t.name == "tt_device_reset")
+    doc = " ".join(next(t.description for t in tools if t.name == "tt_device_reset").split())
     assert f"about {round(worst / 60)} minutes" in doc, (worst, doc)
+    assert f"up to {pollers:.0f}s" in doc
     assert f"reset {constants.DEVICE_RESET_TIMEOUT_SEC}s" in doc
-    assert f"up to {one_pass}s each" in doc
+    assert f"PCI rescan {rescan:.0f}s" in doc
+    assert f"first verify pass of up to {math.ceil(finished_pass)}s" in doc
     assert f"the {sleep:.0f}s wait" in doc
+    assert f"last verify pass of up to {math.ceil(last_pass)}s" in doc
+    assert f"the {kill}s kill" in doc
 
 
 def test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified(monkeypatch, tmp_path):
