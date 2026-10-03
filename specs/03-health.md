@@ -314,8 +314,10 @@ job boundary.
   override's own timeout — holds the door through the existing eth-frozen hold, with no reset.
   A read that reaches no verdict (the built-in probe's own timeout, a crash, exit 77, no runnable
   reader) runs the full fabric pass inside the same gate, exactly as a failed job's does, so its
-  exit 77 holds fabric-unverified on a multi-chip mesh (I17). Only the startup self-test's arming
-  (I28) turns this on; a disarmed host keeps the old clean-exit gate: snapshot only. The Slurm
+  exit 77 holds fabric-unverified on a multi-chip mesh (I17). Accepted trade-off: a built-in read
+  that armed in 9–10s outlasts its own 9s bound here, so that host pays the fabric pass after
+  every clean job — fail-closed, and journaled. Only the startup self-test's arming (I28) turns
+  this on; a disarmed host keeps the old clean-exit gate: snapshot only. The Slurm
   `post-step` gate is out of scope: it runs under its own step deadline and keeps the old rule.
   Rationale: on the field data behind this rule, 76–87% of post-job passes were this light
   path, and a stuck eth read was followed by a fabric failure 23 times out of 23.
