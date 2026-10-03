@@ -619,6 +619,65 @@ def test_an_operator_reset_whose_fabric_fails_is_not_released(monkeypatch, tmp_p
     assert d["status"] == "reset_unhealthy" and d["health_ok"] is False
     assert srv.fsm.state is not srv.ServerState.HEALTHY, "a failed fabric pass reopened the door"
     assert srv.fsm.record.dirty, "the next gate must owe this mesh a real recovery"
+    assert srv.fsm.record.why == "operator_reset_unhealthy", (
+        f"got why={srv.fsm.record.why!r}: a failed operator-reset verify must say so, not pass as a "
+        "read-only probe's finding"
+    )
+
+
+def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
+    """The tool's docstring states the worst case an operator reset on a mesh can take. Recompute it
+    from the timeouts the code actually uses, so a changed timeout cannot leave the doc stale."""
+    import inspect
+    import math
+    import re
+
+    from tt_device_mcp import constants
+    from tt_device_mcp.health import monitor as monitor_mod
+    from tt_device_mcp.health.monitors import eth, heartbeat
+
+    def default(fn, name):
+        return inspect.signature(fn).parameters[name].default
+
+    def literal(fn, pattern):
+        return float(re.search(pattern, inspect.getsource(fn)).group(1))
+
+    # Stop, then restart, each poller service; each systemctl call is bounded on its own.
+    # The shipped default services, read from the source like the retry defaults below.
+    services = re.search(r'"TT_DEVICE_MCP_POLLER_SERVICES", "([^"]*)"', inspect.getsource(srv)).group(1)
+    n_services = len([x for x in services.split(",") if x.strip()])
+    pollers = 2 * n_services * literal(srv._set_device_pollers, r"timeout=(\d+)")
+    rescan = literal(recovery_base.RecoveryMechanism.reset_with_quiesce, r"asyncio\.sleep\((\d+)\)")
+    kill = constants.GRACEFUL_KILL_GRACE_SEC + constants.SIGTERM_GRACE_SEC
+    candidates = re.search(r"for c in \((.*?)\n\s*\)\n", inspect.getsource(eth.resolve_python), re.S).group(1)
+    n_candidates = len([line for line in candidates.splitlines() if line.strip()])
+    eth_setup = n_candidates * default(eth.resolve_python, "import_timeout_sec")
+    finished_pass = (
+        heartbeat.HEARTBEAT_SETTLE_SEC
+        + default(monitor_mod.HealthMonitor.verify_device_health, "timeout_sec")
+        + eth_setup
+        + default(monitor_mod.HealthMonitor.verify_eth_heartbeat, "timeout_sec")
+        + constants.FABRIC_CHECK_TIMEOUT_SEC
+    )
+    # A re-check follows only a 77, a pass that finished; only the last pass can hit a timeout and
+    # pay the kill sequence.
+    last_pass = finished_pass + kill
+    # The shipped defaults, read from the source: conftest zeroes the live retry sleep.
+    src = inspect.getsource(recovery_pkg)
+    retries = int(re.search(r'"TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES", "(\d+)"', src).group(1))
+    sleep = float(re.search(r'"TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC", "([\d.]+)"', src).group(1))
+    worst = pollers + constants.DEVICE_RESET_TIMEOUT_SEC + rescan + retries * (finished_pass + sleep) + last_pass
+
+    tools = asyncio.run(srv.create_mcp_server().list_tools())
+    doc = " ".join(next(t.description for t in tools if t.name == "tt_device_reset").split())
+    assert f"about {round(worst / 60)} minutes" in doc, (worst, doc)
+    assert f"poller stop and restart up to {pollers:.0f}s" in doc
+    assert f"reset {constants.DEVICE_RESET_TIMEOUT_SEC}s" in doc
+    assert f"PCI rescan {rescan:.0f}s" in doc
+    assert f"first verify pass of up to {math.ceil(finished_pass)}s" in doc
+    assert f"the {sleep:.0f}s wait" in doc
+    assert f"last verify pass of up to {math.ceil(last_pass)}s" in doc
+    assert f"the {kill}s kill" in doc
 
 
 def test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified(monkeypatch, tmp_path):
@@ -701,6 +760,8 @@ def test_the_stream_settles_an_operator_reset_like_the_tool(monkeypatch, tmp_pat
     assert f"::status::{status}" in text
     assert (srv.fsm.state is srv.ServerState.HEALTHY) is fabric_ok
     assert (srv.device_fault_reported == "") is fabric_ok
+    if not fabric_ok:
+        assert srv.fsm.record.why == "operator_reset_unhealthy"
 
 
 # --- the streaming reset is a reset like any other ----------------------------

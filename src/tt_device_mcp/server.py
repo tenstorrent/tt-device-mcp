@@ -2396,7 +2396,9 @@ async def _verify_operator_reset(present: int, recovery, log, source: str) -> tu
     elif verdict is None:
         _hold_device_fabric_unverified(f"{source}: enum+ARC healthy, fabric unverified after the post-reset retries")
     else:
-        _mark_device_dirty(f"{source}: the mesh did not verify after the reset: {detail}", why="probe_unhealthy")
+        _mark_device_dirty(
+            f"{source}: the mesh did not verify after the reset: {detail}", why="operator_reset_unhealthy"
+        )
     return verdict, detail
 
 
@@ -8178,10 +8180,26 @@ def create_mcp_server() -> MCPServer:
         2. Kill any currently running process
         3. Reset all detected Tenstorrent devices via tt-smi
         4. Verify: on a multi-chip mesh with a fabric check installed this runs
-           the fabric traffic pass (about 1-2 minutes, longer on a retry), so the
-           call returns only once the mesh has moved data. status
-           reset_unverified means the fabric could not be checked; the device
-           stays held until a gate proves it.
+           the fabric traffic pass, so the call returns only once the mesh has
+           moved data. status reset_unverified means the fabric could not be
+           checked; the device stays held until a gate proves it.
+
+        Duration: about 2 minutes on a healthy Galaxy (reset ~60s + fabric pass
+        45-75s), about 4 minutes when the first fabric pass finds no trained link
+        and is re-checked after a 60s wait. Worst case at the defaults: about 26
+        minutes (poller stop and restart up to 120s + reset 600s + PCI rescan 3s
+        + a first verify pass of up to 361s + the 60s wait + a last verify pass
+        of up to 436s, which adds the 75s kill of a timed-out check). Only the
+        last pass can time out: a re-check follows a pass that finished. Each
+        extra TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES adds a wait and a pass;
+        TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC lengthens each wait and each
+        service in TT_DEVICE_MCP_POLLER_SERVICES adds up to 60s. Not counted:
+        stopping a running job first (60s grace, then the kill) and waiting for
+        a broker operation already holding the device; the bound also assumes
+        a killed process exits. The call sends nothing until it ends; the
+        connection stays open on keepalives, so the stdio shim's 300s read
+        timeout does not cut it, but a client with its own tool-call timeout
+        below this may give up while the reset goes on.
 
         A reset is a board-level reset of ALL chips, so resetting while another
         tenant holds the device aborts their run mid-op and can wedge the mesh.
@@ -8196,10 +8214,22 @@ def create_mcp_server() -> MCPServer:
 
         Returns:
             dict: Reset result:
-                - status (str): 'reset_complete', 'reset_failed', 'no_devices',
-                  or 'refused' (foreign holder + not forced)
+                - status (str): 'reset_complete', 'reset_unhealthy' (the reset
+                  ran but the mesh did not verify; marked dirty),
+                  'reset_unverified', 'reset_failed', 'no_devices', or
+                  'refused' (foreign holder + not forced)
+                - health_ok (bool | None): True only when the verify passed;
+                  None when the reset itself failed and nothing was verified
+                - health_detail (str): What the verify found
                 - devices (list[str]): Device indices that were reset
-                - foreign_holders (list): On refusal, [{pid, uid, user}, ...]
+                - command (str), returncode (int | None): The reset run;
+                  None when it did not launch or did not finish in time
+                - stdout (str): The last 4000 characters of the reset's output
+                  (stderr is merged into it; the stderr field is always "")
+                - steps (list): The step-by-step log of the call
+                - foreign_holders (list): On refusal, [{pid, uid, user}, ...],
+                  with the refusal's reason and hint
+                no_devices returns only status and steps.
         """
         return await _reset_device(params.force)
 

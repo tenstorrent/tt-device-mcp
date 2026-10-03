@@ -639,7 +639,8 @@ The broker holds at `fsm_why=eth_frozen` (or `fabric_unverified`) and will not r
 0 chips are off the bus — below the mass-drop floor — and the self-heal relift cannot lift it,
 because the read that would clear the hold is the read that is wedged. An operator reset of the
 mesh is therefore verified with the eth read and the fabric pass (spec 04 I13): it releases only on
-a real `fabric: OK`, a failing pass leaves the mesh dirty (`reset_unhealthy`), and a pass that still
+a real `fabric: OK`, a failing pass leaves the mesh dirty (`reset_unhealthy`,
+`why=operator_reset_unhealthy`), and a pass that still
 cannot reach a verdict holds `fabric_unverified` (`reset_unverified`) with the reported fault kept.
 Where no fabric check is installed the reset can only verify heartbeat + snapshot, the pair blind to
 this fault, so there `reset_complete`/`health_ok: true` is not proof of recovery; only a later
