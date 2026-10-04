@@ -5826,6 +5826,7 @@ async def job_runner():
                     job.status = JobStatus.FAILED
                     job.finished_at = datetime.now().isoformat()
                     job.error = f"device busy — job not dispatched: {holder_reason}"
+                _forget_queued_job(job_id)
             await cleanup_finished_jobs()
             get_job_queue().task_done()
             continue
