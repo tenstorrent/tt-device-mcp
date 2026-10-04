@@ -157,6 +157,13 @@ socket server's serve task.
   (`text/plain`) with a trailing `::status::<reset_complete|reset_failed|refused|no_devices>`
   sentinel the CLI parses for its exit code; `smi_stream` streams raw pty bytes
   (`application/octet-stream`), read-only-allowlisted, deliberately parallel to running jobs.
+- `reset_stream` keepalives are opt-in. A body with `"keepalive": true` gets a `::keepalive::`
+  line after every quiet `RESET_STREAM_KEEPALIVE_SEC` (15 s), so a reset that is silent for
+  minutes (quiesce, an overrun `tt-smi`, the post-reset check) still puts bytes on the wire for
+  a client reading with a per-read timeout. The broker waits on the same pending step again; a
+  quiet interval never cancels it. A client that does not ask gets no keepalives (an older CLI
+  would print the sentinel). A client that leaves mid-reset closes the stream, not the reset:
+  the reset runs to the end and the post-reset check is skipped, with or without keepalives.
 - Client-side error shape (`utils.api_call`): HTTP ≥ 400 becomes `{"error": "HTTP <status>: ..."}`;
   a connect failure becomes `{"error": "Connection failed: ..."}`; no reachable socket becomes an
   `{"error": ...}` naming both remedies (broker vs `daemon start`).
@@ -247,6 +254,8 @@ CONTRIBUTING's workflow) — spec diff first, then the removal, in its own PR.
 | I8 (CLI refuses without a reachable server) | `tests/test_cli.py::test_cli_run_requires_daemon` |
 | I9 | `tests/test_reset.py::test_streaming_reset_quiesces_pollers_and_flags_in_flight`, `tests/test_reset.py::test_reset_stream_quiesce_scope_routes_a_live_privsep_job`, `tests/test_reset.py::test_the_sampler_recognises_a_streaming_resets_scope` |
 | MCP layer injects Context / progress streaming works end-to-end | `tests/test_server.py::test_a_blocking_job_run_reports_progress_through_the_mcp_layer` |
+| `reset_stream` keepalives: opt-in, sent on a quiet reset, progress and status kept | `tests/test_reset.py::test_a_silent_reset_stream_sends_keepalives_when_asked` |
+| `reset_stream`: a client leaving mid-reset leaves the reset running and the stream closed, under both ASGI disconnect paths | `tests/test_reset.py::test_a_client_that_leaves_a_silent_reset_does_not_stop_it` |
 | REST errors are refusals, not 500s | `tests/test_device_safety.py::test_rest_submit_bad_env_file_is_a_refusal_not_a_500` |
 | /health payload (spec 03) reachable and hold-aware | `tests/test_device_safety.py::test_health_payload_reports_a_held_device_as_degraded`, `tests/test_device_safety.py::test_health_payload_reads_ok_on_a_fit_device` |
 | exec gating identical via shared helper | `tests/test_device_safety.py::test_exec_refuses_the_device_the_broker_is_working_on`, `tests/test_device_safety.py::test_exec_force_runs_a_diagnostic_alongside_a_foreign_job` |
