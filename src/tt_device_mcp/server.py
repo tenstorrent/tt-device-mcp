@@ -2270,8 +2270,9 @@ def _reset_blocking_job() -> Optional[dict]:
     `current_job_id` is the runner's ownership window: set at spawn, cleared only after the
     process is reaped, so it also covers a job that went HUNG and is still being torn down (held,
     no longer RUNNING). A job re-adopted after a broker restart runs in its scope with no
-    `current_job_id`, so RUNNING jobs are read from `jobs` too. QUEUED jobs do not block: a reset
-    does not touch them. The caller holds `get_lock()`, so the answer matches what a forced reset
+    `current_job_id`, so RUNNING jobs are read from `jobs` too, and a re-adopted job keeps blocking
+    until its scope ends and `readopted_scopes` drops it — a forced reset marks it KILLED before its
+    scope is stopped (#5). QUEUED jobs do not block: a reset does not touch them. The caller holds `get_lock()`, so the answer matches what a forced reset
     stops.
     """
     if current_job_id is not None:
@@ -2281,8 +2282,63 @@ def _reset_blocking_job() -> Optional[dict]:
     else:
         job = next((j for j in jobs.values() if j.status == JobStatus.RUNNING), None)
         if job is None:
+            job = next((jobs[jid] for jid in readopted_scopes if jid in jobs), None)
+        if job is None:
             return None
     return {"job_id": job.id, "owner": job.owner, "job_status": job.status.value, "pid": job.pid}
+
+
+# The monitor polls a scope every _SCOPE_POLL_SEC; two polls and its log scan fit well inside this.
+READOPTED_FINALIZE_WAIT_SEC = 15
+
+READOPTED_RESET_KILLED_ERROR = (
+    "killed by a forced device reset: this job was re-adopted after a broker restart, and an operator "
+    "reset with force stopped it to reset the device. It did not crash on its own — resubmit once the "
+    "device is healthy."
+)
+
+
+def _claim_readopted_job_for_reset(blocker: Optional[dict]) -> Optional[str]:
+    """Take a re-adopted blocker off the device for a forced reset; return the scope to stop.
+
+    A job re-adopted after a broker restart has no `current_process`, so stopping that process
+    stops nothing and the reset runs under the live job (#5). Mark it KILLED and reset-killed now,
+    under `get_lock()` like tt_device_job_kill, so `_monitor_readopted_scope` finalizes it as the
+    reset's kill rather than a failure that flags the device for another reset. Its
+    `readopted_scopes` entry stays until the scope ends, so the runner dispatches nothing and
+    other resets refuse meanwhile. The reset-killed marker is in memory only: a broker restart
+    before the scope ends must re-adopt it, not skip it. None when the blocker is not a re-adopted
+    running job."""
+    if blocker is None or current_process is not None:
+        return None
+    job_id = blocker["job_id"]
+    scope = readopted_scopes.get(job_id)
+    job = jobs.get(job_id)
+    if scope is None or job is None or job.status != JobStatus.RUNNING:
+        return None
+    reset_killed_job_ids.add(job_id)
+    job.status = JobStatus.KILLED
+    job.finished_at = datetime.now().isoformat()
+    if not job.error:
+        job.error = READOPTED_RESET_KILLED_ERROR
+    return scope
+
+
+async def _stop_readopted_job_for_reset(job_id: str, scope: str) -> None:
+    """Stop a claimed re-adopted job's scope, then let `_monitor_readopted_scope` finalize it.
+
+    Waiting for the monitor keeps the order the live path has: the job's end is classified (its
+    log scanned for a fault the reset should answer) before the reset, never after its verify."""
+    await _terminate_scope(scope)
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + READOPTED_FINALIZE_WAIT_SEC
+    while job_id in readopted_scopes and loop.time() < deadline:
+        await asyncio.sleep(0.2)
+    if job_id in readopted_scopes and logger:
+        logger.warning(
+            f"reset: re-adopted job {job_id} not finalized {READOPTED_FINALIZE_WAIT_SEC}s after "
+            f"stopping {scope}; resetting anyway"
+        )
 
 
 def _reset_busy_detail(blocker: dict) -> str:
@@ -2306,7 +2362,11 @@ async def _reset_recheck_in_op(force: bool, log) -> Optional[dict]:
             return blocker
         pid_to_stop = current_process.pid if current_process else None
         job_id_to_stop = current_job_id
+        scope_to_stop = _claim_readopted_job_for_reset(blocker)
     log(f"force: resetting over {_reset_busy_detail(blocker)}")
+    if scope_to_stop:
+        log(f"stopping re-adopted job {blocker['job_id']} (scope {scope_to_stop}) before reset")
+        await _stop_readopted_job_for_reset(blocker["job_id"], scope_to_stop)
     if pid_to_stop:
         _note_reset_killed_job()
         if job_id_to_stop:
@@ -5727,8 +5787,18 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
             # rides out on exit 0), so scan the log first, then fall back to a wedge-risk exit.
             job_log = Path(job.log_file) if job.log_file else None
             fault = _scan_output_for_device_fault(job_log)
+            reset_killed = job_id in reset_killed_job_ids
+            reset_killed_job_ids.discard(job_id)
             if fault:
                 _mark_device_reported_fault(f"re-adopted job {job_id} {fault}", job=job)
+            elif reset_killed:
+                # A forced reset stopped it (#5): the kill is the reset's own, not evidence for another.
+                if job_log:
+                    try:
+                        with open(job_log, "a") as f:
+                            f.write(f"\n[KILLED by device reset] {job.error}\n")
+                    except OSError:
+                        pass
             elif _is_wedge_risk_exit(job.status, job.exit_code):
                 _mark_device_dirty(
                     f"re-adopted job {job_id} ended {job.status.value}"
@@ -6977,6 +7047,7 @@ def create_mcp_server() -> MCPServer:
 
         pid_to_stop = None
         job_id_to_stop = None
+        scope_to_stop = None
         async with get_lock():
             # A reset is not queued: refuse rather than kill a job that owns the device (#3).
             blocker = _reset_blocking_job()
@@ -6984,6 +7055,9 @@ def create_mcp_server() -> MCPServer:
             if not busy and current_process:
                 pid_to_stop = current_process.pid
                 job_id_to_stop = current_job_id
+            elif not busy:
+                # A re-adopted job has no current_process; stop its scope instead (#5).
+                scope_to_stop = _claim_readopted_job_for_reset(blocker)
         if busy:
             if logger:
                 logger.warning(f"reset_stream: busy REFUSED: {_reset_busy_detail(blocker)}")
@@ -7009,11 +7083,14 @@ def create_mcp_server() -> MCPServer:
                 await _terminate_job(job_id_to_stop, pid_to_stop)
             else:
                 await _terminate_process_group(pid_to_stop)
+        elif scope_to_stop:
+            yield f"stopping re-adopted job {blocker['job_id']} (scope {scope_to_stop}) before reset\n"
+            await _stop_readopted_job_for_reset(blocker["job_id"], scope_to_stop)
         async with get_lock():
             if current_process:
                 await current_process.wait()
                 current_process = None
-            else:
+            elif not scope_to_stop:
                 yield "no broker job running; nothing to kill\n"
 
         indices = _present_chip_indices()
@@ -8431,6 +8508,7 @@ def create_mcp_server() -> MCPServer:
 
         pid_to_stop = None
         job_id_to_stop = None
+        scope_to_stop = None
         async with get_lock():
             # A reset is not queued: refuse rather than kill a job that owns the device (#3).
             blocker = _reset_blocking_job()
@@ -8438,6 +8516,9 @@ def create_mcp_server() -> MCPServer:
             if not busy and current_process:
                 pid_to_stop = current_process.pid
                 job_id_to_stop = current_job_id
+            elif not busy:
+                # A re-adopted job has no current_process; stop its scope instead (#5).
+                scope_to_stop = _claim_readopted_job_for_reset(blocker)
         if busy:
             step(f"busy REFUSED: {_reset_busy_detail(blocker)}", "warning")
             return {
@@ -8466,11 +8547,14 @@ def create_mcp_server() -> MCPServer:
                 await _terminate_job(job_id_to_stop, pid_to_stop)
             else:
                 await _terminate_process_group(pid_to_stop)
+        elif scope_to_stop:
+            step(f"stopping re-adopted job {blocker['job_id']} (scope {scope_to_stop}) before reset")
+            await _stop_readopted_job_for_reset(blocker["job_id"], scope_to_stop)
         async with get_lock():
             if current_process:
                 await current_process.wait()
                 current_process = None
-            else:
+            elif not scope_to_stop:
                 step("no broker job running; nothing to kill")
 
         indices = _present_chip_indices()
