@@ -5899,33 +5899,35 @@ async def job_runner():
         # job, so an incident's trace is the run-up to THIS job and not the hour before it.
         sampler.mark_job_window()
 
-        # Write "started" marker to log
-        if job_log_file:
-            with open(job_log_file, "a") as f:
-                f.write(f"[Started at {job.started_at}]\n\n")
+        cancelled = False  # set if the broker is shutting down (don't kill the job)
+        terminal_note = ""  # timeout/exception marker, appended to error at the end
+        # Everything from here on is inside the try: the job is RUNNING, so an error in any
+        # setup step (a full disk is enough) must end it FAILED, never kill the runner.
+        try:
+            # Write "started" marker to log
+            if job_log_file:
+                with open(job_log_file, "a") as f:
+                    f.write(f"[Started at {job.started_at}]\n\n")
 
-        if logger:
-            logger.info(f"JOB_RUNNER starting job_id={job_id}, log={job_log_file}")
+            if logger:
+                logger.info(f"JOB_RUNNER starting job_id={job_id}, log={job_log_file}")
 
-        # Get activation script using env_vars resolved at queue time (not re-reading env_file)
-        activation_script, _ = get_activation_script(job.workspace, env_file=None, inherited_env=job.env_vars)
+            # Get activation script using env_vars resolved at queue time (not re-reading env_file)
+            activation_script, _ = get_activation_script(job.workspace, env_file=None, inherited_env=job.env_vars)
 
-        exit_file = job_exit_file(job_id)
-        full_command = f"""
+            exit_file = job_exit_file(job_id)
+            full_command = f"""
 {_exit_trap_preamble(str(exit_file))}set -e
 {activation_script}
 {job.command}
 """
 
-        # Create process in new session (os.setsid) so all child processes share the same
-        # process group ID. This enables reliable cleanup of nested processes via killpg()
-        # in the finally block, preventing orphaned child processes from holding device locks.
-        # Under privsep (root + opt-in) the command runs as the submitting user inside a
-        # device-admitted systemd scope; otherwise it runs directly as today.
-        privsep_prefix = privsep_prefix_for(job.peer_uid, unit=job_scope_unit(job_id))
-        cancelled = False  # set if the broker is shutting down (don't kill the job)
-        terminal_note = ""  # timeout/exception marker, appended to error at the end
-        try:
+            # Create process in new session (os.setsid) so all child processes share the same
+            # process group ID. This enables reliable cleanup of nested processes via killpg()
+            # in the finally block, preventing orphaned child processes from holding device locks.
+            # Under privsep (root + opt-in) the command runs as the submitting user inside a
+            # device-admitted systemd scope; otherwise it runs directly as today.
+            privsep_prefix = privsep_prefix_for(job.peer_uid, unit=job_scope_unit(job_id))
             if privsep_prefix:
                 if logger:
                     logger.info(f"  privsep: running job {job_id} as uid={job.peer_uid} via systemd-run")
@@ -6229,9 +6231,14 @@ async def job_runner():
                         job=job,
                     )
 
-                # Write job log footer (outside lock - file I/O)
+                # Write job log footer (outside lock - file I/O). The disk that failed the job
+                # can fail this too, and the runner must outlive it.
                 if job_log_file:
-                    write_job_log_footer(job_log_file, job)
+                    try:
+                        write_job_log_footer(job_log_file, job)
+                    except OSError as e:
+                        if logger:
+                            logger.error(f"JOB_RUNNER could not write the log footer for job_id={job_id}: {e}")
 
                 # Post-job health check — snapshot + fabric traffic — after EVERY
                 # run, queue empty or not. A fabric wedge need not trip a wedge-risk

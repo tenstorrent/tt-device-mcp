@@ -920,6 +920,73 @@ async def test_an_unreadable_queued_spec_is_set_aside_not_guessed_at(monkeypatch
     assert (tmp_path / srv.QUEUED_SPEC_DIR / "004.invalid").exists(), "bad spec vanished silently"
 
 
+@pytest.mark.parametrize("step", ["started-log", "activation", "privsep-prefix"])
+@pytest.mark.asyncio
+async def test_a_setup_error_after_running_fails_the_job_not_the_runner(monkeypatch, tmp_path, clear_job_state, step):
+    """Between flipping a job to RUNNING and spawning it, the runner writes the job's
+    '[Started at]' line, builds its activation script and its privsep prefix. Any of those can
+    raise (a full disk is enough). Done outside the try, that killed the runner task: the job sat
+    RUNNING forever, nothing behind it ever dispatched, and its queued spec stayed on disk for a
+    restart to run again. The job must end FAILED with its spec gone, and the queue keep moving."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+
+    async def _free_gate(job_log_file):
+        return ""
+
+    monkeypatch.setattr(srv, "_await_device_free_for_tenant", _free_gate)
+    monkeypatch.setattr(srv, "privsep_refusal", lambda uid: "")
+
+    disk_full = OSError(28, "No space left on device")
+
+    def activation(workspace, *a, **k):
+        if step == "activation" and workspace == "/fails":
+            raise disk_full
+        return "", {}  # no workspace python env to source here
+
+    def prefix(uid, unit=None):
+        if step == "privsep-prefix" and unit == srv.job_scope_unit("906"):
+            raise disk_full
+        return None  # no privsep: the job runs as a plain shell
+
+    monkeypatch.setattr(srv, "get_activation_script", activation)
+    monkeypatch.setattr(srv, "privsep_prefix_for", prefix)
+
+    bad = srv.Job(id="906", owner="tenant", workspace="/fails", command="echo ran", queued_at="t")
+    if step == "started-log":
+        bad.log_file = str(tmp_path / "no-such-dir" / "906.log")  # every write to it raises
+    good = srv.Job(id="907", owner="tenant", workspace="/tmp", command="true", queued_at="t")
+    for job in (bad, good):
+        srv.jobs[job.id] = job
+        srv._persist_queued_job(job)
+        await srv.get_job_queue().put(job.id)
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        for _ in range(250):
+            if good.finished_at or runner.done():
+                break
+            await asyncio.sleep(0.02)
+        assert not runner.done(), f"the runner died: {runner.exception() if runner.done() else ''}"
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+    assert bad.status is srv.JobStatus.FAILED, f"job 906 is {bad.status.value}, expected FAILED"
+    assert bad.finished_at, "the failed job was never finished"
+    assert "[EXCEPTION:" in bad.error, f"the failed job does not say why: {bad.error!r}"
+    assert good.status is srv.JobStatus.COMPLETED, f"the job queued behind it is {good.status.value}"
+    assert srv.current_job_id is None
+
+    # the broker restarts: only what is on disk remains, and the failed job is not on it
+    srv.jobs.clear()
+    srv.job_queue = None
+    srv._ensure_async_primitives()
+    await srv._restore_queued_jobs()
+    assert srv.jobs == {}, "a job whose setup raised was re-queued by the restart"
+
+
 @pytest.mark.asyncio
 async def test_startup_records_what_came_back_after_a_reboot(monkeypatch, tmp_path):
     """A reboot row says the box went away and returned; it never said WHAT returned. A host

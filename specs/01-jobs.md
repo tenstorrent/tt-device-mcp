@@ -227,6 +227,11 @@ flowchart LR
   script + the command. Under privsep it runs inside a transient systemd scope named
   `job_scope_unit(job_id)` (`ttdev-job-<id>.scope`) as the submitting uid; otherwise
   directly. Both paths use `preexec_fn=os.setsid` (I4).
+- Every step from the `[Started at]` log line on — the activation script, the privsep
+  prefix, the spawn — runs inside the runner's `try`. If one raises
+  (a full disk is enough), the job ends FAILED with an `[EXCEPTION: ...]` note, its queued
+  spec is forgotten, and the runner goes on to the next job; it never dies with the job
+  left RUNNING. A footer write that fails is logged, not raised.
 - stdout/stderr are streamed line-by-line to the log file (timestamped, `[stdout]` /
   `[stderr]` prefixed) through a single line-buffered handle, and into bounded in-memory
   deques. Broker-side annotations use a `[broker]` prefix. Every line resets the silence
@@ -344,6 +349,7 @@ flowchart LR
 | B-Queueing (cooldown) | `tests/test_device_safety.py::test_an_armed_cooldown_rests_the_mesh_before_the_next_job`, `tests/test_device_safety.py::test_the_default_off_cooldown_never_delays_a_job`, `tests/test_device_safety.py::test_job_cooldown_remaining_is_only_the_unspent_rest[30.0-100.0-110.0-20.0]` |
 | B-Queueing (gate errored → device held) | `tests/test_device_safety.py::test_a_gate_that_errored_holds` |
 | B-Queueing (gate bug ≠ stuck queue) | `tests/test_device_safety.py::test_a_non_dict_job_on_disk_never_poisons_the_gate`, `tests/test_device_safety.py::test_a_non_str_since_on_disk_never_poisons_the_gate` |
+| B-Execution (setup error fails the job, not the runner) | `tests/test_device_safety.py::test_a_setup_error_after_running_fails_the_job_not_the_runner` |
 | B-Log format | `tests/test_recent_jobs.py::test_recent_jobs_parses_and_limits`, `tests/test_recent_jobs.py::test_the_footer_survives_a_reset_worth_of_gate_output`, `tests/test_recent_jobs.py::test_a_job_printing_status_of_its_own_is_still_unfinished` |
 | B-Ids/`Job` basics | `tests/test_server.py::TestJob::test_job_status_values`, `tests/test_server.py::TestJob::test_runtime_sec_property`, `tests/test_server.py::TestJob::test_wait_sec_property` |
 | Re-adoption scope naming | `tests/test_readopt.py::test_scope_unit_roundtrip`, `tests/test_readopt.py::test_list_active_job_scopes_parses` |
