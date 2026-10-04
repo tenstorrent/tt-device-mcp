@@ -23,7 +23,8 @@ the queue and a running job outlive the broker process.
 - **I1** — At most one job is RUNNING at any time. The runner is a single task that
   dispatches, awaits, and finalizes one job before dequeuing the next, and it MUST wait out
   any job re-adopted from a previous broker instance before dispatching
-  (`readopted_scopes`).
+  (`readopted_scopes`). Killing a re-adopted job does not end that wait: its entry stays
+  until its scope has stopped (`_monitor_readopted_scope`).
 - **I2** — `MAX_TIMEOUT_SEC` (1500 s / 25 min) is a hard ceiling on `timeout_sec`, clamped
   in `_queue_job` — the single funnel shared by the MCP tools and the REST route — never
   only at a tool schema. At the ceiling, the timeout message MUST NOT offer a way to raise
@@ -341,7 +342,7 @@ flowchart LR
 
 | Claim | Test(s) |
 |---|---|
-| I1 | `tests/test_readopt.py::test_reconcile_readopts_running_scope`, `tests/test_readopt.py::test_startup_waits_for_a_readopted_job_before_touching_the_fabric` |
+| I1 | `tests/test_readopt.py::test_reconcile_readopts_running_scope`, `tests/test_readopt.py::test_startup_waits_for_a_readopted_job_before_touching_the_fabric`, `tests/test_reset.py::test_killing_a_readopted_job_holds_the_device_until_its_scope_ends`, `tests/test_reset.py::test_a_killed_readopted_job_frees_the_device_once_its_scope_ends` |
 | I2 | `tests/test_device_safety.py::test_rest_submit_clamps_timeout_to_the_hard_ceiling`, `tests/test_device_safety.py::test_max_timeout_is_25_minutes_and_is_a_hard_ceiling`, `tests/test_device_safety.py::test_hitting_the_ceiling_does_not_offer_a_bigger_number`, `tests/test_server.py::test_timeout_hint_is_actionable` |
 | I3 (bounded capture) | `tests/test_server.py::test_job_output_capture_is_bounded` |
 | I4 | `tests/test_device_safety.py::test_a_completed_privsep_job_stops_its_scope`, `tests/test_device_safety.py::test_a_scope_that_ended_with_its_job_is_not_signalled`, `tests/test_device_safety.py::test_a_scope_that_settles_after_its_job_is_not_signalled`, `tests/test_device_safety.py::test_an_interrupted_scope_is_reaped_without_a_second_sigint`, `tests/test_device_safety.py::test_a_scope_reaped_after_a_clean_exit_marks_the_device_dirty`, `tests/test_device_safety.py::test_a_scope_that_ends_on_sigint_leaves_the_device_clean`, `tests/test_device_safety.py::test_a_reaped_scope_of_a_recovery_killed_job_is_not_flagged`, `tests/test_device_safety.py::test_a_completed_non_privsep_job_only_killpgs_its_group` |

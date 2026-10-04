@@ -2271,8 +2271,8 @@ def _reset_blocking_job() -> Optional[dict]:
     process is reaped, so it also covers a job that went HUNG and is still being torn down (held,
     no longer RUNNING). A job re-adopted after a broker restart runs in its scope with no
     `current_job_id`, so RUNNING jobs are read from `jobs` too, and a re-adopted job keeps blocking
-    until its scope ends and `readopted_scopes` drops it — a forced reset marks it KILLED before its
-    scope is stopped (#5). QUEUED jobs do not block: a reset does not touch them. The caller holds `get_lock()`, so the answer matches what a forced reset
+    until its scope ends and `readopted_scopes` drops it — a forced reset (#5) or a kill (#7) marks
+    it KILLED before its scope is stopped. QUEUED jobs do not block: a reset does not touch them. The caller holds `get_lock()`, so the answer matches what a forced reset
     stops.
     """
     if current_job_id is not None:
@@ -7363,8 +7363,10 @@ def create_mcp_server() -> MCPServer:
                 # and killpg on the broker-held pid hits the systemd-run wrapper, not the
                 # reparented payload -- it wedges the eth mid-CCL. _terminate_job signals
                 # the scope when one is live (SIGINT first, so ttnn closes the mesh) and
-                # falls back to the process group only for an unscoped job.
-                readopted_scopes.pop(job_id, None)
+                # falls back to the process group only for an unscoped job. A re-adopted job keeps
+                # its `readopted_scopes` entry: the scope may take GRACEFUL_KILL_GRACE_SEC to exit,
+                # and the runner and resets read that entry as "device busy". Its monitor drops it
+                # once the scope has really ended (#7).
                 terminate = (job_id, job.pid)
                 job.status = JobStatus.KILLED
                 job.finished_at = datetime.now().isoformat()
