@@ -40,12 +40,19 @@ the queue and a running job outlive the broker process.
   when the scope already ended with its job. A scope still active is re-checked for up to
   `_SCOPE_SETTLE_SEC` (systemd sees an emptied cgroup asynchronously) before it counts as a
   leftover. After a kill or a hung reap the SIGINT was already sent, so it is not repeated:
-  the stop waits out the grace and then reaps.
+  the stop waits out the grace and then reaps. A leftover that is still active after the
+  grace, so it needs the `systemctl stop` reap, marks the device dirty whatever the job's
+  exit (an exit-0 job included): the reap kills it without the SIGINT unwind, possibly
+  mid-device-op, so the post-job gate runs the full check, fabric pass included, and the
+  device is not handed to the next job until it verifies (I5; gate internals spec 03). A
+  job the broker's own recovery killed is exempt (I14).
 - **I5** — A job is never killed with bare SIGKILL first. Termination is the ladder SIGINT
   (`GRACEFUL_KILL_GRACE_SEC` = 60 s) → SIGTERM (`SIGTERM_GRACE_SEC` = 15 s) → SIGKILL,
   because only SIGINT unwinds a Python/ttnn job into the teardown that releases the device.
   A job running in a systemd scope (privsep, or re-adopted) MUST be signalled via the
-  scope, never by `killpg` on the wrapper pid (`_terminate_job`).
+  scope, never by `killpg` on the wrapper pid (`_terminate_job`). A finished job's
+  leftover that outlives SIGINT and needs the `systemctl stop` reap leaves the device
+  dirty (I4); `_terminate_scope` reports whether it escalated.
 - **I6** — A broker restart loses no job. RUNNING jobs are re-adopted from their
   `ttdev-job-<id>.scope` units; QUEUED jobs are restored from persisted specs in queue
   order; an unreadable spec is set aside (`.invalid`), never guessed at; a job whose
@@ -320,7 +327,7 @@ flowchart LR
 | I1 | `tests/test_readopt.py::test_reconcile_readopts_running_scope`, `tests/test_readopt.py::test_startup_waits_for_a_readopted_job_before_touching_the_fabric` |
 | I2 | `tests/test_device_safety.py::test_rest_submit_clamps_timeout_to_the_hard_ceiling`, `tests/test_device_safety.py::test_max_timeout_is_25_minutes_and_is_a_hard_ceiling`, `tests/test_device_safety.py::test_hitting_the_ceiling_does_not_offer_a_bigger_number`, `tests/test_server.py::test_timeout_hint_is_actionable` |
 | I3 (bounded capture) | `tests/test_server.py::test_job_output_capture_is_bounded` |
-| I4 | `tests/test_device_safety.py::test_a_completed_privsep_job_stops_its_scope`, `tests/test_device_safety.py::test_a_scope_that_ended_with_its_job_is_not_signalled`, `tests/test_device_safety.py::test_a_scope_that_settles_after_its_job_is_not_signalled`, `tests/test_device_safety.py::test_an_interrupted_scope_is_reaped_without_a_second_sigint`, `tests/test_device_safety.py::test_a_completed_non_privsep_job_only_killpgs_its_group` |
+| I4 | `tests/test_device_safety.py::test_a_completed_privsep_job_stops_its_scope`, `tests/test_device_safety.py::test_a_scope_that_ended_with_its_job_is_not_signalled`, `tests/test_device_safety.py::test_a_scope_that_settles_after_its_job_is_not_signalled`, `tests/test_device_safety.py::test_an_interrupted_scope_is_reaped_without_a_second_sigint`, `tests/test_device_safety.py::test_a_scope_reaped_after_a_clean_exit_marks_the_device_dirty`, `tests/test_device_safety.py::test_a_scope_that_ends_on_sigint_leaves_the_device_clean`, `tests/test_device_safety.py::test_a_reaped_scope_of_a_recovery_killed_job_is_not_flagged`, `tests/test_device_safety.py::test_a_completed_non_privsep_job_only_killpgs_its_group` |
 | I5 | `tests/test_server.py::TestCleanDeviceGate::test_graceful_terminate_on_sigterm`, `tests/test_server.py::TestCleanDeviceGate::test_graceful_escalates_to_sigkill`, `tests/test_server.py::TestCleanDeviceGate::test_graceful_terminate_already_dead`, `tests/test_reset.py::test_terminate_job_signals_the_scope_for_a_privsep_job`, `tests/test_reset.py::test_terminate_job_falls_back_to_killpg_without_a_scope`, `tests/test_reset.py::test_a_live_privsep_kill_signals_the_scope_not_the_pgroup` |
 | I6 | `tests/test_device_safety.py::test_a_queued_job_survives_the_broker_restarting_under_it`, `tests/test_device_safety.py::test_an_unreadable_queued_spec_is_set_aside_not_guessed_at`, `tests/test_device_safety.py::test_a_started_job_is_not_revived_by_a_restart`, `tests/test_device_safety.py::test_a_job_whose_spawn_raised_is_not_revived_by_a_restart`, `tests/test_readopt.py::test_reconcile_readopts_running_scope`, `tests/test_readopt.py::test_reconcile_skips_already_tracked`, `tests/test_readopt.py::test_a_restored_queue_survives_when_main_already_started_the_runner` |
 | I7 | `tests/test_readopt.py::test_readopted_deadline_counts_time_already_served`, `tests/test_readopt.py::test_readopted_job_past_its_deadline_is_terminated`, `tests/test_readopt.py::test_readopted_job_inside_its_deadline_is_left_alone`, `tests/test_readopt.py::test_job_from_log_recovers_the_deadline`, `tests/test_readopt.py::test_job_from_log_without_a_timeout_header_still_gets_a_deadline` |
