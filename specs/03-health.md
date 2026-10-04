@@ -316,6 +316,30 @@ job boundary.
   not mention. The earlier code discarded the eventual `ReclaimResult` on the timed-out path, so
   root SIGKILLing another user's pids appeared in neither the journal nor the action log.
 
+- **I30 — A short chip count is a drop, between gates too.** The live liveness read
+  (`_device_liveness_reason`, behind every admission and status query) and the sampler's
+  `check_for_dead_chips` compare the sysfs node count with `HealthMonitor.expected()` — the same
+  count the gate's heartbeat verdict uses, so the units cannot drift. Fewer nodes than expected
+  is a degraded reason at once in the liveness read (one sample, no sleep), and a dirty mark
+  (`why=heartbeat`, `chips_missing` event) after two consecutive short samples in the sampler.
+  The sampler flags it only on a HEALTHY box: under an open episode (an off-bus hold the gate
+  placed `dirty=False`) the short count is that same fault, and re-dirtying it would undo the
+  hold. A reset in flight is excused as for all-ones. More nodes than expected is healthy; a host
+  with no baseline (expected 0), or with health checks off (I25), is unchanged.
+- **I31 — A stale verdict is re-checked before dispatch.** When the device is HEALTHY but the
+  last probe pass (`HealthMonitor.status().at`, or the last re-check) is older than
+  `TT_DEVICE_MCP_DISPATCH_RECHECK_SEC` (default 300; 0 disables), `_ensure_device_clean_for_next_job`
+  runs a light re-check before admitting the job: the chip count against `expected()`, the
+  two-sample ARC heartbeat (where the driver exposes it), and the passive eth heartbeat read only
+  when that rung is armed (I28) and no foreign tenant holds the device. It NEVER runs the fabric
+  traffic pass (I12) or the tt-smi snapshot. A short count or failed heartbeat marks the device
+  dirty (`why=heartbeat`), so the admission loop's next pass runs the pre-job gate and the job
+  stays at the door until a verify releases it; a frozen eth read holds as I16. It runs as a
+  device op and re-reads the state under it: a hold placed, or a reset scope still active, while
+  it waited ends it without a read. A re-check that raises is logged and is not a verdict: the
+  device is not marked. A fresh verdict costs nothing, and the re-check never runs inside `_device_liveness_reason`, which answers
+  status queries and must not sleep.
+
 ## Interfaces
 
 **What the main loop consumes.** `server.py` owns the job runner and the gate; it drives the
@@ -773,6 +797,8 @@ refuses.
 | I29 (a deferred dispatch is diagnosable: health_event + log line, holder named in queue/status) | `tests/test_slurm_steps.py::test_a_deferred_dispatch_is_visible_in_the_health_log_and_the_queue_status` |
 | I29 (straggler reclaim is audited: health_event + action-log row, quiet on a no-op) | `tests/test_slurm_steps.py::test_post_step_records_a_reclaim_that_signalled_something`, `tests/test_slurm_steps.py::test_a_no_op_reclaim_writes_nothing` |
 | I29 (the audit covers every pid signalled across escalation rounds, not just the last round's residue) | `tests/test_device_holders.py::test_reclaim_reports_a_pid_that_died_to_an_earlier_round_as_signalled`, `tests/test_slurm_steps.py::test_post_step_audits_a_reclaim_with_mixed_outcomes` |
+| I30 | `tests/test_device_safety.py::test_a_short_chip_count_is_a_degraded_reason_at_dispatch`, `tests/test_device_safety.py::test_the_sampler_dirties_a_short_count_after_two_samples`, `tests/test_device_safety.py::test_a_host_with_no_baseline_is_unchanged_by_the_count_check`, `tests/test_device_safety.py::test_a_short_count_under_an_off_bus_hold_stays_held`, `tests/test_device_safety.py::test_health_checks_off_skip_the_count_check` |
+| I31 | `tests/test_device_safety.py::test_a_stale_verdict_runs_the_heartbeat_once_before_dispatch`, `tests/test_device_safety.py::test_a_fresh_verdict_runs_no_recheck`, `tests/test_device_safety.py::test_a_failing_recheck_holds_the_job_at_the_door`, `tests/test_device_safety.py::test_the_dispatch_recheck_never_runs_the_fabric_pass`, `tests/test_device_safety.py::test_a_frozen_eth_read_at_the_recheck_holds_not_resets`, `tests/test_device_safety.py::test_the_dispatch_recheck_off_switch_tenant_and_errors` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |

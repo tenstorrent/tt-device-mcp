@@ -988,6 +988,7 @@ _recovery_deps = RecoveryDeps(
     refresh_idle_hold_ledger=lambda: _refresh_idle_hold_ledger(),
     spawn_idle_relift=lambda: _maybe_spawn_idle_relift(),
     episode_dirty=lambda: fsm.record.dirty,
+    episode_open=lambda: fsm.state is not ServerState.HEALTHY,
     episode_job=lambda: dict(fsm.record.job),
 )
 
@@ -4203,8 +4204,11 @@ def _slurm_step_verdict(*, require_free: bool) -> dict:
 def _device_liveness_reason() -> str:
     """A chip off the PCIe bus RIGHT NOW, read live from one root-free sysfs sample — ''
     if none. Catches the two degraded states no in-memory flag records: a chip gone to
-    0xFFFFFFFF (off the bus — the reads that stall a CPU core and take the host down) and
-    an empty sysfs on a host whose driver DID expose chips at startup (driver wedged). A
+    0xFFFFFFFF (off the bus — the reads that stall a CPU core and take the host down), an
+    empty sysfs on a host whose driver DID expose chips at startup (driver wedged), and fewer
+    chips than the host's baseline (chips that left the bus and took their sysfs node with
+    them — 24 of 32 is not a healthy mesh, spec 03 I30). The count is the same one
+    heartbeat_verdict holds the gate to; a host with no baseline yet skips it. A
     present-but-frozen ARC is NOT caught here: that needs the two-sample heartbeat_verdict
     the between-job gate runs, and a single sample must not sleep on a caller's path."""
     if not heartbeat_supported():
@@ -4215,6 +4219,11 @@ def _device_liveness_reason() -> str:
     dead = dead_chips(beats)
     if dead:
         return f"chip(s) [{','.join(dead)}] fell off the PCIe bus (reads return 0xFFFFFFFF)"
+    # expected(0) reads the baseline without ratcheting it: a short sample must never lower it.
+    # Off with the health checks (TT_DEVICE_MCP_HEALTH_CHECK=0, I25), like the recheck and the gate.
+    expected = health_monitor.expected(0) if health_monitor and health_monitor._health_check_enabled() else 0
+    if expected > 0 and len(beats) < expected:
+        return f"{len(beats)} of {expected} chips in sysfs (chips dropped off the PCIe bus)"
     return ""
 
 
@@ -4936,6 +4945,127 @@ async def _hold_job_until_device_fit(job: "Job", job_log_file: Optional[Path], r
     return ""
 
 
+DISPATCH_RECHECK_DEFAULT_SEC = 300.0
+# When the dispatch recheck last ran, so an idle box re-reads at most once per window even when no
+# gate pass has refreshed health_monitor.status() in between.
+_last_dispatch_recheck_at: Optional[datetime] = None
+
+
+def _dispatch_recheck_sec() -> float:
+    """TT_DEVICE_MCP_DISPATCH_RECHECK_SEC: how old a HEALTHY verdict may be before dispatch
+    re-reads the device (spec 03 I31). 0 or less turns the recheck off; garbage keeps the default."""
+    raw = os.environ.get("TT_DEVICE_MCP_DISPATCH_RECHECK_SEC", "").strip()
+    if not raw:
+        return DISPATCH_RECHECK_DEFAULT_SEC
+    try:
+        value = float(raw)
+    except ValueError:
+        return DISPATCH_RECHECK_DEFAULT_SEC
+    return value if math.isfinite(value) else DISPATCH_RECHECK_DEFAULT_SEC
+
+
+def _last_verdict_age_sec() -> Optional[float]:
+    """Seconds since the newest of the last health pass and the last dispatch recheck; None if neither
+    has run in this process (a verdict nobody can date is treated as stale)."""
+    stamps = [_last_dispatch_recheck_at]
+    state = health_monitor.status() if health_monitor else None
+    if state is not None:
+        stamps.append(state.at)
+    stamps = [t for t in stamps if t is not None]
+    if not stamps:
+        return None
+    return max(0.0, (datetime.now() - max(stamps)).total_seconds())
+
+
+async def _dispatch_recheck_if_stale(job_log_file: Optional[Path]) -> None:
+    """Re-read a HEALTHY device whose last verdict is older than TT_DEVICE_MCP_DISPATCH_RECHECK_SEC
+    before a tenant is dispatched onto it (spec 03 I31).
+
+    The gate's verdict is taken at the END of the previous job; on an idle box the next tenant can be
+    dispatched an hour later onto chips that left the bus or froze in between, and nothing reads them
+    on the way in. This runs the cheap rungs only: the chip count against the baseline, the two-sample
+    ARC heartbeat (~0.5 s), and the passive eth read when the rung is armed and no foreign tenant
+    holds the device. Never the fabric traffic pass (I12) and never the tt-smi snapshot.
+
+    A short count or a failed heartbeat marks the device dirty, so the admission loop runs the
+    pre-job gate (and its ladder) before anyone is let through. A frozen eth core holds, never
+    resets (I16). A fresh verdict returns before touching anything. Never raises."""
+    global _last_dispatch_recheck_at
+    window = _dispatch_recheck_sec()
+    if window <= 0 or health_monitor is None or not health_monitor._health_check_enabled():
+        return
+    age = _last_verdict_age_sec()
+    if age is not None and age < window:
+        return
+    try:
+        indices = await asyncio.to_thread(_present_chip_indices)
+        expected = health_monitor.expected(len(indices))
+        if expected <= 0:
+            return  # no chips and no baseline: a device-less host has nothing to re-read
+        async with _device_op("health-gate/dispatch-recheck"):
+            # A gate or reset may have held the op while we waited: re-read what it left. A hold it
+            # placed is its own verdict, and a detached reset scope still cycling the bus must not
+            # be read (the eth read maps every chip).
+            if fsm.state is not ServerState.HEALTHY or await asyncio.to_thread(recovery_mechanism.scope_active):
+                return
+            indices = await asyncio.to_thread(_present_chip_indices)
+            _last_dispatch_recheck_at = datetime.now()
+            failure = ""
+            if len(indices) < expected:
+                failure = f"{len(indices)} of {expected} chips enumerated (chips dropped off the bus)"
+            elif heartbeat_supported():
+                verdict, detail, _ev = await asyncio.to_thread(heartbeat_verdict, expected)
+                if verdict is not Verdict.HEALTHY:
+                    failure = detail
+            eth_frozen = ""
+            if not failure and eth_check_armed:
+                scan = await asyncio.to_thread(enumerate_device_holders)
+                # The eth read maps every chip; beside a tenant (or a scan too blind to rule one
+                # out) it is skipped, as the gate skips it.
+                if scan.complete and not any(h.uid >= MIN_TENANT_UID for h in scan.holders):
+                    eok, edetail = await health_monitor.verify_eth_heartbeat()
+                    if eok is False:
+                        eth_frozen = edetail
+    except Exception as e:  # noqa: BLE001 - must never block the queue
+        # A recheck that could not run is not evidence about the device (a holder scan that raised,
+        # say): log it and let the window restart, rather than send a fine device through the ladder.
+        _last_dispatch_recheck_at = datetime.now()
+        if logger:
+            logger.error(f"dispatch recheck error (device not re-read): {e}")
+        return
+    ok = not failure and not eth_frozen
+    age_txt = "never" if age is None else f"{age:.0f}s"
+    line = (
+        f"HEALTH-GATE[dispatch-recheck] last verdict {age_txt} old: "
+        f"{'OK' if ok else 'UNHEALTHY'} — {failure or eth_frozen or f'{len(indices)} chip(s), heartbeat ok'}"
+    )
+    if logger:
+        (logger.info if ok else logger.error)(line)
+    if job_log_file:
+        try:
+            append_job_log(job_log_file, "broker", f"{line}\n")
+        except OSError:
+            pass
+    health_event(
+        "dispatch_recheck",
+        ok=ok,
+        age_sec=None if age is None else round(age, 1),
+        present=len(indices),
+        expected=expected,
+        detail=failure or eth_frozen,
+    )
+    if failure:
+        _mark_device_dirty(f"dispatch recheck: {failure}", why="heartbeat")
+    elif eth_frozen:
+        if _eth_freeze_holds():
+            _hold_device_unverified(
+                f"dispatch recheck: eth-core heartbeat frozen ({eth_frozen}) — held, not reset",
+                needs_eth_advancing=True,
+            )
+        else:
+            _mark_device_dirty(f"dispatch recheck: eth-core heartbeat frozen ({eth_frozen})", why="probe_unhealthy")
+
+
 async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> None:
     """Pre-job gate — a cheap safety net only. The authoritative snapshot+fabric
     check runs at the END of every run (see the post-job gate), so a submitter never
@@ -4954,6 +5084,9 @@ async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> Non
     # server.log — the per-job log is the tenant-visible proof the gate actually ran.
     await _dispatch_probe_ok(job_log_file)
     if fsm.state is ServerState.HEALTHY:
+        # A HEALTHY verdict hours old says nothing about the mesh now: re-read it cheaply first
+        # (spec 03 I31). A fresh verdict returns here at once, so back-to-back jobs pay nothing.
+        await _dispatch_recheck_if_stale(job_log_file)
         return  # clean device -> zero cost before a run
     if (fsm.record and fsm.record.why == "fabric_unverified") or not fsm.record.dirty:
         return
