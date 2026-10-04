@@ -180,7 +180,7 @@ class TelemetrySampler:
         self.all_chips_gone_strikes: int = 0
         # Consecutive samples with FEWER chip nodes than the host's baseline but not none — part of
         # the mesh off the bus. chip_sample() omits a gone node, so 24 of 32 reads as 24 healthy
-        # chips; without this count the drop sets no flag until the next gate (spec 03 I30).
+        # chips; without this count the drop sets no flag until the next gate (spec 03 I31).
         self.short_count_strikes: int = 0
         # Liveness of this loop. Its per-iteration `except Exception` cannot catch a hung
         # `to_thread` device read on a wedged chip, so the loop can stall indefinitely while
@@ -366,7 +366,7 @@ class TelemetrySampler:
             await self.isolate_dead_chips(confirmed)
 
     async def _check_short_count(self, present: int, expected: int, log) -> None:
-        """Fewer chip nodes than the baseline on two consecutive samples -> dirty (spec 03 I30).
+        """Fewer chip nodes than the baseline on two consecutive samples -> dirty (spec 03 I31).
 
         A reset in flight takes chips off the bus by design and is excused, as for all-ones. Flagged
         only on a HEALTHY box, unlike the all-gone drop: under an open episode (an off-bus hold the

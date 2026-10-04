@@ -19,7 +19,7 @@ import pytest
 from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event, patch_recovery
 from tt_device_mcp import device_holders, privileges
 from tt_device_mcp import server as srv
-from tt_device_mcp.constants import FABRIC_CHECK_CANNOT_CHECK_RC
+from tt_device_mcp.constants import ETH_POST_JOB_TIMEOUT_SEC, FABRIC_CHECK_CANNOT_CHECK_RC
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.fsm import ServerFsm, ServerState
 from tt_device_mcp.health import evidence as health
@@ -2825,17 +2825,160 @@ async def test_a_clean_job_does_not_pay_for_a_fabric_pass(monkeypatch, tmp_path)
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
     fsm_healthy(srv)
     srv.last_fabric_check_monotonic = srv.time.monotonic()  # a pass ran recently
+    monkeypatch.setattr(srv, "eth_check_armed", False)
 
     seen = {}
 
-    async def verify(expected, log, run_fabric=True, **_):
+    async def verify(expected, log, run_fabric=True, run_eth=False, **_):
         seen["run_fabric"] = run_fabric
+        seen["run_eth"] = run_eth
         return True, {}
 
     patch_recovery(monkeypatch, "_verify_device", verify)
     await srv._device_health_gate(None, phase="post-job", run_fabric=True)
 
     assert seen["run_fabric"] is False, "a clean job was charged for a fabric pass"
+    # Spec 03 I30: the eth rung is disarmed here, so not even the eth read is asked.
+    assert seen["run_eth"] is False, "a disarmed host was asked for the eth read"
+
+    monkeypatch.setattr(srv, "eth_check_armed", True)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+
+    assert seen["run_fabric"] is False, "an armed host's clean job was charged for a fabric pass"
+    assert seen["run_eth"] is True, "an armed host's clean exit skipped the eth read"
+
+
+def _clean_post_job_gate(monkeypatch, tmp_path, *, eth, fabric=(True, "links healthy"), chips=1, armed=True):
+    """Drive a CLEAN post-job gate through the real probe pass (HealthMonitor.update) with every
+    probe stubbed: host PCI skips, the sysfs heartbeat is absent, the snapshot passes, and the eth
+    read and fabric pass return `eth`/`fabric`. Returns a dict of call counts, the eth read's
+    timeout, and the reset count. Spec 03 I30."""
+    for i in range(chips):
+        (tmp_path / str(i)).write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", str(chips))
+    _no_holders(monkeypatch)
+    srv.device_op_lock = None
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    monkeypatch.setattr(srv, "device_op_active", "")
+    monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})
+    monkeypatch.setattr(srv, "eth_check_armed", armed)
+    srv.recovery_mechanism.last_reset_monotonic = 0.0
+    srv.recovery_mechanism.last_reset_failed = False
+    fsm_healthy(srv)
+    srv.last_fabric_check_monotonic = srv.time.monotonic()  # a pass ran recently: no stale pass owed
+
+    from tt_device_mcp.health import monitor as monitor_mod
+
+    calls = {"eth": 0, "eth_timeout": None, "fabric": 0, "resets": 0}
+    monkeypatch.setattr(monitor_mod.hostpci, "host_pci_verdict", lambda: (None, "skipped", {}))
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda *a: False)
+
+    async def snapshot(expected):
+        return True, f"{expected} chip(s)"
+
+    async def eth_read(timeout_sec=60.0):
+        calls["eth"] += 1
+        calls["eth_timeout"] = timeout_sec
+        return eth
+
+    async def fabric_pass(*a, **k):
+        calls["fabric"] += 1
+        return fabric
+
+    async def reset(indices, log):
+        calls["resets"] += 1
+        return True
+
+    monkeypatch.setattr(srv.health_monitor, "_verify_device", snapshot)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_read)
+    monkeypatch.setattr(srv.health_monitor, "verify_fabric_health", fabric_pass)
+    patch_recovery(monkeypatch, "_reset_and_verify_device", reset)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_a_clean_job_on_an_armed_host_reads_eth_but_pays_no_fabric_pass(monkeypatch, tmp_path):
+    """Spec 03 I30. Enum+ARC+snapshot cannot see a wedged eth core, so a clean exit used to hand a
+    mesh nobody had looked at to the next tenant. On an armed host the gate now runs the ~1s
+    passive eth read, bounded to ETH_POST_JOB_TIMEOUT_SEC, and still never the ~45s traffic pass."""
+    calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=(True, "all active eth cores advancing"))
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+
+    assert calls["eth"] == 1, "a clean exit on an armed host skipped the eth read"
+    assert calls["eth_timeout"] == ETH_POST_JOB_TIMEOUT_SEC
+    assert calls["fabric"] == 0, "a clean job with ticking eth cores was charged for a fabric pass"
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_frozen_eth_read_after_a_clean_job_holds_without_a_reset(monkeypatch, tmp_path):
+    """Spec 03 I30 + I16. A frozen core found after an exit-0 job takes the existing eth-frozen
+    hold: the door closes, nothing resets, and the traffic pass that would shove the frozen chip
+    off the bus never runs."""
+    calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=(False, "a frozen active-eth core: 0-25"), chips=4)
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+
+    assert calls["eth"] == 1
+    assert calls["fabric"] == 0, "ran the traffic pass on a frozen core"
+    assert calls["resets"] == 0, "reset a frozen single-chip wedge — the measured all-chip drop"
+    assert srv.fsm.state is not ServerState.HEALTHY, "released a mesh with a frozen eth core"
+    assert srv.fsm.record.why == "eth_frozen", "not the eth-frozen hold, which needs an advancing read to lift"
+    assert srv._device_unavailable_for_tenant(), "the next tenant would be dispatched onto it"
+
+
+@pytest.mark.asyncio
+async def test_a_clean_exit_eth_read_with_no_verdict_runs_the_fabric_pass_in_the_same_gate(monkeypatch, tmp_path):
+    """Spec 03 I30. On an armed host the read has answered before; one that now times out inside
+    its own probe or crashes is the stuck-read shape a fabric failure follows. The gate runs the
+    full traffic pass in this same pass, as for a failed job, and a passing one releases."""
+    calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=(None, "eth probe timed out after 9s"), chips=4)
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+
+    assert calls["eth"] == 1
+    assert calls["fabric"] == 1, "a stuck eth read on a clean exit let the mesh through unchecked"
+    assert calls["resets"] == 0
+    assert srv.fsm.state is ServerState.HEALTHY, "a fabric pass that proved the mesh must release it"
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_fabric_pass_that_cannot_check_holds_fabric_unverified(monkeypatch, tmp_path):
+    """Spec 03 I30 + I17. The traffic pass a stuck clean-exit eth read runs is forced as surely as
+    a failed job's, so its exit 77 on a multi-chip mesh holds fabric-unverified. Read as an unforced
+    pass, the 77 would release a mesh two checks in a row failed to look at."""
+    calls = _clean_post_job_gate(
+        monkeypatch,
+        tmp_path,
+        eth=(None, "eth probe crashed"),
+        fabric=(None, f"fabric check could not run (exit {FABRIC_CHECK_CANNOT_CHECK_RC})"),
+        chips=4,
+    )
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+
+    assert calls["fabric"] == 1
+    assert calls["resets"] == 0, "a 77 is not a fault a reset fixes"
+    assert srv.fsm.state is not ServerState.HEALTHY, "released a mesh neither the eth read nor the traffic pass saw"
+    assert srv.fsm.record.why == "fabric_unverified"
+
+
+@pytest.mark.asyncio
+async def test_a_disarmed_host_keeps_the_clean_exit_gate_unchanged(monkeypatch, tmp_path):
+    """Spec 03 I30. A host whose startup self-test left the eth rung off keeps the old clean exit:
+    snapshot only. Asking a reader that never measured would buy a fabric pass on every job."""
+    calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=(None, "disarmed"), chips=4, armed=False)
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+
+    assert calls["eth"] == 0, "a disarmed host ran the eth read on a clean exit"
+    assert calls["fabric"] == 0
+    assert srv.fsm.state is ServerState.HEALTHY
 
 
 @pytest.mark.asyncio
@@ -11041,7 +11184,7 @@ async def _unreachable_gate(*a, **k):
     raise AssertionError("the health gate must not run for a clean, non-dirty device")
 
 
-# --- a short chip count and a stale verdict at dispatch (spec 03 I30/I31) -----------------------
+# --- a short chip count and a stale verdict at dispatch (spec 03 I31/I32) -----------------------
 
 
 def _beats(n: int) -> dict:

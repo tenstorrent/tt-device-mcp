@@ -346,7 +346,7 @@ class Recovery(ABC):
     # to be.
 
     async def _verify_device(
-        self, expected: int, log, *, run_fabric: bool = True, phase: str = "verify_device"
+        self, expected: int, log, *, run_fabric: bool = True, phase: str = "verify_device", run_eth: bool = False
     ) -> tuple[bool, dict]:
         """Is the mesh usable? A thin adapter over :meth:`HealthMonitor.update` — the ONE probe
         pass implementation (see monitor.py); this method exists only as the seam
@@ -362,7 +362,7 @@ class Recovery(ABC):
         ``self.monitor.status()`` labels itself meaningfully instead of always reading the same
         placeholder string.
         """
-        state = await self.monitor.update(phase, run_fabric=run_fabric, expected=expected, log=log)
+        state = await self.monitor.update(phase, run_fabric=run_fabric, run_eth=run_eth, expected=expected, log=log)
         return state.healthy, state.as_evidence()
 
     async def _recover_isolated_chips(self, log) -> bool:

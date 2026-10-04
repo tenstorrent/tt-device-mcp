@@ -3705,10 +3705,9 @@ async def device_health_gate(
         # The traffic pass costs ~45s, so it is gated: a dirty device or a failed job
         # (force_fabric) always pays; otherwise it runs only when a caller asks
         # (run_fabric) and no recent pass is fresh. The post-job gate does NOT ask on a
-        # clean exit — a mesh whose chips all tick has nothing the pass would find that a
-        # later job failure would not surface, and charging every clean job 45s is how a
-        # device ends up being checked instead of used. Only startup asks; the stale
-        # window bounds any run_fabric caller to one pass per interval.
+        # clean exit — charging every clean job 45s is how a device ends up being checked
+        # instead of used. Only startup asks; the stale window bounds any run_fabric caller
+        # to one pass per interval.
         global last_fabric_check_monotonic
         # 0.0 is the sentinel for "no pass this process" — the startup check after a boot.
         # It must count as stale outright: subtracting it treats the monotonic clock's own
@@ -3728,7 +3727,14 @@ async def device_health_gate(
         # with_recover=False never pays for the traffic pass: it is the one thing in this
         # function that costs real time, and a read-only pass has no rung to spend it on.
         full = with_recover and (not prejob) and (dirty or force_fabric or (run_fabric and stale))
-        healthy, evidence = await fsm.observe(expected, _log, run_fabric=full, phase=phase, recovery=recovery)
+        # A clean post-job exit still gets the passive eth read when the rung is armed (I30): chips
+        # that all tick say nothing about a wedged eth core, and the next tenant is the one who
+        # finds it. The read costs ~1s and pushes no traffic. A frozen verdict holds below; a read
+        # that reaches no verdict runs the full pass inside this same probe pass.
+        run_eth = with_recover and phase == "post-job" and not full and eth_check_armed
+        healthy, evidence = await fsm.observe(
+            expected, _log, run_fabric=full, run_eth=run_eth, phase=phase, recovery=recovery
+        )
         state = HealthState.from_evidence(evidence, phase=phase, expected=expected)
         fabric_ok = state.fabric_ok
         if fabric_ok is not None:
@@ -3854,7 +3860,9 @@ async def device_health_gate(
             fabric_ok=fabric_ok,
             fabric_ran=state.fabric_ran,
             dirty=dirty,
-            fabric_forced=full,
+            # The traffic pass a stuck clean-exit eth read ran (I30) was forced as surely as a
+            # failed job's: its 77 is the same doubt, and must hold rather than release.
+            fabric_forced=full or state.fabric_ran,
             last_action=None,
             last_action_recovered=None,
             off_bus_before=None,
@@ -4331,7 +4339,7 @@ def _device_liveness_reason() -> str:
     0xFFFFFFFF (off the bus — the reads that stall a CPU core and take the host down), an
     empty sysfs on a host whose driver DID expose chips at startup (driver wedged), and fewer
     chips than the host's baseline (chips that left the bus and took their sysfs node with
-    them — 24 of 32 is not a healthy mesh, spec 03 I30). The count is the same one
+    them — 24 of 32 is not a healthy mesh, spec 03 I31). The count is the same one
     heartbeat_verdict holds the gate to; a host with no baseline yet skips it. A
     present-but-frozen ARC is NOT caught here: that needs the two-sample heartbeat_verdict
     the between-job gate runs, and a single sample must not sleep on a caller's path."""
@@ -5077,7 +5085,7 @@ _last_dispatch_recheck_at: Optional[datetime] = None
 
 def _dispatch_recheck_sec() -> float:
     """TT_DEVICE_MCP_DISPATCH_RECHECK_SEC: how old a HEALTHY verdict may be before dispatch
-    re-reads the device (spec 03 I31). 0 or less turns the recheck off; garbage keeps the default."""
+    re-reads the device (spec 03 I32). 0 or less turns the recheck off; garbage keeps the default."""
     raw = os.environ.get("TT_DEVICE_MCP_DISPATCH_RECHECK_SEC", "").strip()
     if not raw:
         return DISPATCH_RECHECK_DEFAULT_SEC
@@ -5103,7 +5111,7 @@ def _last_verdict_age_sec() -> Optional[float]:
 
 async def _dispatch_recheck_if_stale(job_log_file: Optional[Path]) -> None:
     """Re-read a HEALTHY device whose last verdict is older than TT_DEVICE_MCP_DISPATCH_RECHECK_SEC
-    before a tenant is dispatched onto it (spec 03 I31).
+    before a tenant is dispatched onto it (spec 03 I32).
 
     The gate's verdict is taken at the END of the previous job; on an idle box the next tenant can be
     dispatched an hour later onto chips that left the bus or froze in between, and nothing reads them
@@ -5191,9 +5199,10 @@ async def _dispatch_recheck_if_stale(job_log_file: Optional[Path]) -> None:
 
 
 async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> None:
-    """Pre-job gate — a cheap safety net only. The authoritative snapshot+fabric
-    check runs at the END of every run (see the post-job gate), so a submitter never
-    pays for it on their critical path. This gate covers the residual case: the
+    """Pre-job gate — a cheap safety net only. The post-job gate checks the device at
+    the END of every run (the snapshot always, the passive eth read when that rung is
+    armed, the fabric pass after a failed job or on a dirty device), so a submitter
+    never pays for it on their critical path. This gate covers the residual case: the
     device is still flagged dirty at start time — the post-job check errored, or a
     broker restart dropped the in-memory flag before it ran — so reset + verify here
     before the inheriting job starts. A clean device returns IMMEDIATELY, costing a
@@ -5209,7 +5218,7 @@ async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> Non
     await _dispatch_probe_ok(job_log_file)
     if fsm.state is ServerState.HEALTHY:
         # A HEALTHY verdict hours old says nothing about the mesh now: re-read it cheaply first
-        # (spec 03 I31). A fresh verdict returns here at once, so back-to-back jobs pay nothing.
+        # (spec 03 I32). A fresh verdict returns here at once, so back-to-back jobs pay nothing.
         await _dispatch_recheck_if_stale(job_log_file)
         return  # clean device -> zero cost before a run
     if (fsm.record and fsm.record.why == "fabric_unverified") or not fsm.record.dirty:
@@ -5232,10 +5241,12 @@ async def _verify_device_after_job(job_log_file: Optional[Path], job_failed: boo
     job (``job_failed``) or an already-dirty device. A fabric wedge — chips present, eth
     links down — does not show in the enum snapshot, but a job running across it fails,
     so a failure is exactly when the pass is worth its cost; ``job_failed`` forces it
-    regardless of how recently one ran. A clean exit is not worth it: a mesh whose chips
-    all enumerate and whose last job exited 0 has nothing the traffic pass would find
-    that a later failure would not surface. It forces a CHECK, not a reset — an exit 1
-    from a pytest assertion is not evidence of broken silicon.
+    regardless of how recently one ran. A clean exit does not pay 45s for it; it gets the
+    passive eth-core heartbeat read instead when that rung is armed (~1s, capped at
+    ``ETH_POST_JOB_TIMEOUT_SEC``), because enum+ARC cannot see a wedged eth core: a frozen
+    core holds the door, and a read that reaches no verdict runs the traffic pass in the
+    same gate. ``job_failed`` forces a CHECK, not a reset — an exit 1 from a pytest
+    assertion is not evidence of broken silicon.
 
     Never raises."""
     try:

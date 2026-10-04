@@ -287,6 +287,7 @@ class ServerFsm:
         *,
         phase: str = "verify_device",
         run_fabric: bool = True,
+        run_eth: bool = False,
         recovery: "Optional[Recovery]" = None,
     ) -> tuple[bool, dict]:
         """Trigger one probe pass of the system — the root's read of the mesh, routed through the
@@ -297,8 +298,12 @@ class ServerFsm:
         fault, a foreign holder) no probe pass carries.
 
         ``recovery`` lets a caller that already chose its pass-scoped platform keep every read of
-        that pass on the same choice; omitted, the platform is selected fresh."""
+        that pass on the same choice; omitted, the platform is selected fresh. ``run_eth`` asks for
+        the passive eth read without the traffic pass (spec 03 I30); it is passed on only when set,
+        so a ``_verify_device`` test fake that predates it keeps its signature."""
         r = recovery if recovery is not None else self.select_recovery()
+        if run_eth:
+            return await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase, run_eth=True)
         return await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase)
 
     # ---- durable load/persist -----------------------------------------------------------------
