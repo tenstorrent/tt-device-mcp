@@ -5962,6 +5962,9 @@ async def job_runner():
             if cancelled:
                 pass
             else:
+                # The job is terminal. If the spawn itself raised, the forget after it never ran,
+                # and a surviving spec would make a restart run a job its owner was told failed.
+                _forget_queued_job(job_id)
                 # Materialize the bounded capture into the result fields (the log
                 # file holds the complete output; these are a tail), then drop the
                 # per-line buffers so a retained finished job doesn't hold them.

@@ -845,6 +845,58 @@ async def test_a_job_refused_at_the_door_is_not_revived_by_a_restart(
     assert srv.get_job_queue().empty()
 
 
+@pytest.mark.parametrize("spawn", ["shell", "privsep-exec"])
+@pytest.mark.asyncio
+async def test_a_job_whose_spawn_raised_is_not_revived_by_a_restart(monkeypatch, tmp_path, clear_job_state, spawn):
+    """A job whose process could not be spawned (fork failed, systemd-run missing) is FAILED and
+    the submitter is told so. Its queued spec must go with it: if it stays on disk, the next
+    broker re-queues it and runs a command its owner was told had failed."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+
+    async def _free_gate(job_log_file):
+        return ""
+
+    monkeypatch.setattr(srv, "_await_device_free_for_tenant", _free_gate)
+
+    async def boom(*a, **k):
+        raise OSError("fork failed")
+
+    if spawn == "shell":
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_shell", boom)
+    else:
+        monkeypatch.setattr(srv, "privsep_refusal", lambda uid: "")
+        monkeypatch.setattr(srv, "privsep_prefix_for", lambda uid, unit=None: ["systemd-run", "--scope"])
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", boom)
+
+    job = srv.Job(id="905", owner="tenant", workspace="/tmp", command="echo ran", queued_at="t")
+    srv.jobs["905"] = job
+    srv._persist_queued_job(job)
+    await srv.get_job_queue().put("905")
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        for _ in range(100):
+            if job.finished_at:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+    assert job.status is srv.JobStatus.FAILED, f"job 905 reached {job.status.value}, expected a failed spawn"
+    assert "fork failed" in job.error
+
+    # the broker restarts: in-memory state is gone, only what is on disk remains
+    srv.jobs.clear()
+    srv.job_queue = None
+    srv._ensure_async_primitives()
+    await srv._restore_queued_jobs()
+
+    assert srv.jobs == {}, "a job whose spawn raised was re-queued by the restart"
+    assert srv.get_job_queue().empty()
+
+
 @pytest.mark.asyncio
 async def test_an_unreadable_queued_spec_is_set_aside_not_guessed_at(monkeypatch, tmp_path, clear_job_state):
     """A spec we cannot parse is the one case a job may be dropped — but it is moved aside and
