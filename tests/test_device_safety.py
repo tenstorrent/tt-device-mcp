@@ -7490,6 +7490,33 @@ async def test_idle_relift_holds_a_still_frozen_eth_core(monkeypatch, tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_idle_relift_holds_a_frozen_core_whose_link_went_down(monkeypatch, tmp_path, clear_job_state):
+    """The frozen core's link dropped, so the probe stops reading it: one core fewer, and every core
+    it still reads is advancing. Judged on the exit code alone that lifts the hold onto the same
+    wedge. The link count below the high-water mark keeps it held (spec 03 I28)."""
+    from tt_device_mcp.health.monitors import eth as eth_monitor
+
+    _setup_selfheal_hold(monkeypatch, tmp_path)
+    srv.health_monitor.eth_link_drop(12)
+
+    async def healthy(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}}
+
+    async def probe(argv, env, *, timeout_sec, track, cwd=None):
+        return 0, "eth-links: measured=11 down=1 unreadable=0\nall 11 active-eth core heartbeat(s) advancing"
+
+    patch_recovery(monkeypatch, "_verify_device", healthy)
+    monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
+    monkeypatch.setattr(eth_monitor, "build", lambda: (["probe"], {}))
+    monkeypatch.setattr(eth_monitor, "check", probe)
+
+    await srv._attempt_idle_relift()
+
+    assert srv.fsm.state is not ServerState.HEALTHY, "a frozen core that left the count is not a healed one"
+    assert srv.fsm.record.why == "eth_frozen"
+
+
+@pytest.mark.asyncio
 async def test_idle_relift_holds_a_still_off_bus_chip_without_resetting(monkeypatch, tmp_path, clear_job_state):
     """Still off the bus: leave it held and wait for self-heal. The relift NEVER resets — a reset
     at a still-wedged endpoint is the mesh-inverting drop the hold exists to avoid."""
