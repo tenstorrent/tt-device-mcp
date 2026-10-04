@@ -239,7 +239,7 @@ def _counting_python(path: Path, log: Path, *, import_ok: bool = True) -> Path:
         f'if [ "$1" = "-c" ]; then echo x >> "{log}"; exit {0 if import_ok else 1}; fi\n'
         "exit 0\n"
     )
-    path.chmod(0o755)
+    path.chmod(0o700)
     return path
 
 
