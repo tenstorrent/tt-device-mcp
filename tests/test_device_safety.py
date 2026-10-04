@@ -811,7 +811,9 @@ async def test_a_job_refused_at_the_door_is_not_revived_by_a_restart(
 
     monkeypatch.setattr(srv, "_await_device_free_for_tenant", gate)
     monkeypatch.setattr(srv, "privsep_refusal", lambda uid: "no passwd entry" if door == "privsep" else "")
-    monkeypatch.setattr(srv, "_tenant_holder_reason", lambda: "device held outside the broker" if door == "busy" else "")
+    monkeypatch.setattr(
+        srv, "_tenant_holder_reason", lambda: "device held outside the broker" if door == "busy" else ""
+    )
     if refusal_raises:
 
         async def boom(*a, **k):
