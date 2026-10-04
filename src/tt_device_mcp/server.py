@@ -6403,6 +6403,40 @@ async def _verify_fabric_on_start() -> None:
         _mark_device_dirty(f"startup fabric verify errored before it could verify: {e}", why="gate_error")
 
 
+async def _probe_on_per_user_start() -> None:
+    """One light, read-only gate pass when a per-user daemon starts (spec 03 I4).
+
+    Trusting a start blind is how a daemon restarted onto a chip that fell off the bus, or an ARC
+    that stopped ticking, admits its first job onto it. The pass is the cheap one — host PCI, ARC
+    heartbeat, tt-smi snapshot — with no fabric (this shape has no validator) and no ladder: a start
+    finds faults, it does not fix them. About a second on a healthy device; a stalled ARC can
+    stretch the snapshot to its own timeout, which delays the socket by that much.
+
+    An unhealthy verdict (or a pass that raised) becomes a SELF-HEAL hold (``off_bus``), not a dirty
+    mark. A dirty per-user device that later reads healthy routes to HOLD_FABRIC_UNVERIFIED (no
+    validator here to give a verdict), a hold nothing lifts by default — so the first tenant would
+    wait forever on a device that recovered. The self-heal hold is lifted by the idle relift's
+    read-only re-read once the device reads healthy; a device that stays bad stays held.
+
+    Called with the FSM at HEALTHY, which is what makes a foreign holder harmless here: the gate
+    skips the pass and its unverified clear invents no hold over a healthy device. Holding instead
+    would leave a foreign_holder hold nothing lifts short of the stuck-hold escalation — over a
+    device the user may simply have open themselves.
+
+    Awaited before the job runner exists, so no queued job can race in ahead of the verdict.
+    """
+    try:
+        await _device_health_gate(None, phase="startup", run_fabric=False, with_recover=False)
+    except Exception as e:  # noqa: BLE001 - startup must survive a check that cannot run
+        if logger:
+            logger.error(f"STARTUP probe failed: {e}")
+        health_event("startup_probe_errored", detail=str(e))
+        _hold_device_unverified(f"startup: probe errored before it could verify ({e}) — held")
+        return
+    if fsm.state is ServerState.RECOVERING and fsm.record.dirty:
+        _hold_device_unverified(f"startup: {fsm.record.detail or 'probe unhealthy'} — held until it reads healthy")
+
+
 async def run_startup_tasks() -> None:
     """Everything that must happen once, before this broker serves its queue.
 
@@ -6423,16 +6457,21 @@ async def run_startup_tasks() -> None:
     _startup_tasks_done = True
     if not should_privsep():
         # No re-adoption sequence for a per-user daemon or a test harness, and — matching that
-        # same narrower scope — no startup-verify gate either: resolve BOOT straight to HEALTHY
-        # so fsm.state is never left at BOOT, which no caller outside this function may observe.
-        # The ordinary verified-healthy path, not boot_merge — there is no reboot/re-adoption
-        # concern for this deployment shape for boot_merge to reconcile.
+        # same narrower scope — no forced fabric verify either: this shape has no validator to run
+        # it with. Resolve BOOT to HEALTHY so fsm.state is never left at BOOT, which no caller
+        # outside this function may observe. The ordinary healthy path, not boot_merge — there is
+        # no reboot/re-adoption concern for this deployment shape for boot_merge to reconcile.
         #
         # The rung inventory still prints. It describes what THIS process can execute (spec 04
         # I17), which has nothing to do with re-adoption, and this is the shape most likely to be
         # missing rungs — so it is the shape that most needs them named.
         log_rung_inventory()
-        fsm.on_readings(_healthy_reading())
+        # fsm.json persists, so a restart can load HEALTHY (probe it again: a restart is never
+        # trusted) or an open episode (keep it as it was; its own gate or relift settles it).
+        if fsm.state is ServerState.BOOT:
+            fsm.on_readings(_healthy_reading())
+        if fsm.state is ServerState.HEALTHY:
+            await _probe_on_per_user_start()
         return
     try:
         await reconcile_running_scopes()
