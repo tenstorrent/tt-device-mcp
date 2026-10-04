@@ -40,6 +40,12 @@ def _verdict_label(ok: Optional[bool]) -> str:
     return "healthy" if ok is True else "skipped" if ok is None else "unhealthy"
 
 
+# The detail prefix of an eth read whose cores all advanced but whose measured link count fell
+# below this host's high-water mark (see HealthMonitor.eth_link_drop). update() tells this skip
+# apart from a read that reached no verdict: the drop persists until an operator re-baselines.
+ETH_LINK_DROP_SKIP = "skipped (eth links unverified)"
+
+
 # Every board type tt-smi cannot identify, including the literal it emits when an ARC read fails.
 # Reading these as "not a Galaxy" is how a degraded Galaxy gets the reset that cannot recover it.
 _UNIDENTIFIED_BOARDS = ("", "n/a")
@@ -126,6 +132,7 @@ class HealthMonitor:
         run_fabric: bool,
         force_fabric: bool = False,
         run_eth: bool = False,
+        fabric_stale: bool = True,
         indices: Optional[list] = None,
         expected: Optional[int] = None,
         log: Optional[Callable[[str], None]] = None,
@@ -140,7 +147,10 @@ class HealthMonitor:
         pass in this same pass, because on an armed host that read has answered before and a
         read that now cannot is the stuck-read shape a fabric failure follows. Pass it only when
         the rung is armed: a disarmed reader always skips, so ``run_eth`` there would buy the
-        traffic pass on every call.
+        traffic pass on every call. A ``run_eth`` read skipped for a link-count drop (``eth_link_drop``)
+        runs that traffic pass only when ``fabric_stale`` (no pass fresher than the caller's
+        interval): the drop persists until an operator re-baselines, so running the pass on it
+        would charge every clean job ~45-100s. Otherwise the skip is recorded and the pass ends.
 
         Mirrors ``Recovery._verify_device``'s gentlest-first short-circuiting (a frozen heartbeat
         or a failed snapshot skips every heavier, more perturbing check below it — the traffic
@@ -227,9 +237,15 @@ class HealthMonitor:
             if log:
                 log(f"eth-heartbeat: {'SKIPPED' if eok is None else ('OK' if eok else 'FROZEN')} — {edetail}")
             _record("eth_heartbeat", eok, edetail)
-            if not fabric_asked and eok is None and log:
+            # A link-drop skip is a standing condition, not a stuck read: rate-limit its pass.
+            link_drop_held = (
+                not fabric_asked and eok is None and edetail.startswith(ETH_LINK_DROP_SKIP) and not fabric_stale
+            )
+            if link_drop_held and log:
+                log("eth links unverified after a clean exit — a recent fabric pass covers it, not repeating it")
+            elif not fabric_asked and eok is None and log:
                 log("eth-heartbeat reached no verdict after a clean exit — running the fabric traffic pass")
-            if eok is not False and (fabric_asked or eok is None):
+            if eok is not False and (fabric_asked or eok is None) and not link_drop_held:
                 self._deps.set_device_op_detail("health check: fabric traffic pass across all links (~45s)")
                 fok, fdetail = await self.verify_fabric_health()
                 if log:
@@ -746,7 +762,7 @@ class HealthMonitor:
             drop = self.eth_link_drop(links) if links else ""
             if ok is True and drop:
                 self._journal_skip_once("eth_heartbeat_unavailable", "link_count_drop", detail=drop[:400])
-                return None, f"skipped (eth links unverified): {drop}"
+                return None, f"{ETH_LINK_DROP_SKIP}: {drop}"
 
         if ok is None:
             # The check could not run — it learned nothing about the eth cores, so falling

@@ -2955,6 +2955,45 @@ async def test_a_clean_exit_eth_read_with_no_verdict_runs_the_fabric_pass_in_the
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fresh, passes", [(False, 1), (True, 0)])
+async def test_a_link_drop_after_clean_jobs_pays_at_most_one_fabric_pass_per_interval(
+    monkeypatch, tmp_path, fresh, passes
+):
+    """Spec 03 I30 + I28. The real eth read on an armed host whose measured link count sits below
+    the high-water mark skips (links unverified). That drop stays until an operator re-baselines,
+    so it buys the traffic pass only when no pass is fresher than FABRIC_CHECK_MIN_INTERVAL_SEC:
+    two clean jobs in a row pay one pass at most, and none when a pass is already fresh."""
+    from tt_device_mcp.health.monitors import eth as eth_mod
+
+    real_eth_read = srv.health_monitor.verify_eth_heartbeat
+    calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=None, chips=4)
+
+    async def eth_read(timeout_sec=60.0):
+        calls["eth"] += 1
+        return await real_eth_read(timeout_sec=timeout_sec)
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_read)
+    monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
+    monkeypatch.setattr(eth_mod, "build", lambda: (["probe"], {}))
+
+    async def probe(argv, env, *, timeout_sec, track, cwd=None):
+        return 0, "eth-links: measured=11 down=0 unreadable=0\nall 11 active-eth core heartbeat(s) advancing"
+
+    monkeypatch.setattr(eth_mod, "check", probe)
+    srv.health_monitor.eth_link_drop(12)
+    if not fresh:
+        srv.last_fabric_check_monotonic = 0.0
+
+    for _ in range(2):
+        await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+        assert srv.fsm.state is ServerState.HEALTHY, "a link-drop skip with a fresh fabric pass held the door"
+
+    assert calls["eth"] == 2
+    assert calls["fabric"] == passes, "a standing link drop charged clean jobs a fabric pass each"
+    assert calls["resets"] == 0
+
+
+@pytest.mark.asyncio
 async def test_a_fallback_fabric_pass_that_cannot_check_holds_fabric_unverified(monkeypatch, tmp_path):
     """Spec 03 I30 + I17. The traffic pass a stuck clean-exit eth read runs is forced as surely as
     a failed job's, so its exit 77 on a multi-chip mesh holds fabric-unverified. Read as an unforced
