@@ -347,8 +347,11 @@ job boundary.
   exit 77 holds fabric-unverified on a multi-chip mesh (I17). Accepted trade-off: a built-in read
   that armed in 9–10s outlasts its own 9s bound here, so that host pays the fabric pass after
   every clean job — fail-closed, and journaled. Only the startup self-test's arming (I28) turns
-  this on; a disarmed host keeps the old clean-exit gate: snapshot only. The Slurm
-  `post-step` gate is out of scope: it runs under its own step deadline and keeps the old rule.
+  this on; a disarmed host keeps the old clean-exit gate: snapshot only. The Slurm `post-step`
+  gate on an exit-0 step gets the same read with the same fallback: its worst case (the 10s read,
+  then a traffic pass bounded by `FABRIC_CHECK_TIMEOUT_SEC`) is no more than a failed step's
+  forced pass already costs inside the same step deadline (spec 07 I9), and an overrun answers
+  `inconclusive` while the gate runs on (I29). The read-only `pre-step` pass never runs it.
   Rationale: on the field data behind this rule, 76–87% of post-job passes were this light
   path, and a stuck eth read was followed by a fabric failure 23 times out of 23.
 - **I31 — A short chip count is a drop, between gates too.** The live liveness read
@@ -675,10 +678,10 @@ Normative points the diagram compresses:
 - The gate reads the FSM's coming-in state once per pass (`dirty`, reason, job) and never
   re-derives it mid-pass.
 - `full` (run the fabric pass) is `with_recover and (not pre-job) and (dirty or force_fabric or
-  (run_fabric and stale))` — I12, I29. A clean post-job exit pays no fabric pass; when the eth
-  rung is armed it pays the passive eth read instead (~1s, the read bounded at 10s), and the
-  fabric pass only if that read reached no verdict (I30). A read-only pass never pays regardless
-  of phase, dirty, or force_fabric.
+  (run_fabric and stale))` — I12, I29. A clean post-job or post-step exit pays no fabric pass;
+  when the eth rung is armed it pays the passive eth read instead (~1s, the read bounded at 10s),
+  and the fabric pass only if that read reached no verdict (I30). A read-only pass never pays
+  regardless of phase, dirty, or force_fabric.
 - Every pass journals a durable `gate` event with the full evidence dict; an unhealthy-or-dirty
   pass freezes an incident bundle (trace ring, last reset/fabric output, kernel evidence) while
   it still exists.
@@ -852,6 +855,7 @@ refuses.
 | I30 (a read with no verdict runs the fabric pass in the same gate; its 77 holds) | `tests/test_device_safety.py::test_a_clean_exit_eth_read_with_no_verdict_runs_the_fabric_pass_in_the_same_gate`, `tests/test_device_safety.py::test_a_fallback_fabric_pass_that_cannot_check_holds_fabric_unverified`, `tests/test_monitor.py::test_update_run_eth_runs_fabric_when_eth_reaches_no_verdict` |
 | I30 (the reader's python is resolved once per process, re-resolved on change or a crashed read) | `tests/test_eth_probe.py::test_resolved_python_is_cached_across_calls`, `tests/test_eth_probe.py::test_build_on_every_gate_spawns_the_import_check_once`, `tests/test_eth_probe.py::test_repointing_current_re_resolves`, `tests/test_eth_probe.py::test_a_changed_pin_re_resolves`, `tests/test_eth_probe.py::test_a_cached_python_that_disappears_re_resolves`, `tests/test_eth_probe.py::test_no_python_is_cached_only_for_the_negative_ttl`, `tests/test_eth_probe.py::test_an_import_check_timeout_is_not_cached_as_no_python`, `tests/test_eth_probe.py::test_forget_python_forces_a_fresh_import_check`, `tests/test_device_safety.py::test_a_crashed_builtin_eth_read_drops_the_cached_python`, `tests/test_device_safety.py::test_a_builtin_eth_read_that_cannot_spawn_drops_the_cached_python`, `tests/test_device_safety.py::test_an_override_eth_read_with_no_verdict_keeps_the_cached_python` |
 | I30 (a disarmed host keeps the snapshot-only clean exit) | `tests/test_device_safety.py::test_a_clean_job_does_not_pay_for_a_fabric_pass`, `tests/test_device_safety.py::test_a_disarmed_host_keeps_the_clean_exit_gate_unchanged`, `tests/test_monitor.py::test_update_without_run_eth_or_fabric_reads_no_eth` |
+| I30 (a clean Slurm post-step reads eth on an armed host, with the same hold and fallback; a failed step and the read-only pre-step do not) | `tests/test_slurm_steps.py::test_a_clean_post_step_on_an_armed_host_asks_for_the_eth_read`, `tests/test_device_safety.py::test_a_frozen_eth_read_after_a_clean_job_holds_without_a_reset`, `tests/test_device_safety.py::test_a_clean_exit_eth_read_with_no_verdict_runs_the_fabric_pass_in_the_same_gate` (both parametrized over post-job/post-step) |
 | I31 | `tests/test_device_safety.py::test_a_short_chip_count_is_a_degraded_reason_at_dispatch`, `tests/test_device_safety.py::test_the_sampler_dirties_a_short_count_after_two_samples`, `tests/test_device_safety.py::test_a_host_with_no_baseline_is_unchanged_by_the_count_check`, `tests/test_device_safety.py::test_a_short_count_under_an_off_bus_hold_stays_held`, `tests/test_device_safety.py::test_health_checks_off_skip_the_count_check` |
 | I32 | `tests/test_device_safety.py::test_a_stale_verdict_runs_the_heartbeat_once_before_dispatch`, `tests/test_device_safety.py::test_a_fresh_verdict_runs_no_recheck`, `tests/test_device_safety.py::test_a_failing_recheck_holds_the_job_at_the_door`, `tests/test_device_safety.py::test_the_dispatch_recheck_never_runs_the_fabric_pass`, `tests/test_device_safety.py::test_a_frozen_eth_read_at_the_recheck_holds_not_resets`, `tests/test_device_safety.py::test_the_dispatch_recheck_off_switch_tenant_and_errors` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
