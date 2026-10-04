@@ -140,7 +140,11 @@ socket server's serve task.
   launches `tt-device-mcp daemon start` detached and waits up to ~15 s for the socket. The
   connection is httpx-over-UDS with the synthetic base URL `http://tt-device-broker/mcp` (I7).
   Timeouts: 30 s connect/write/pool, 300 s SSE read (a blocking tool call holds the channel for a
-  job's runtime; sse-starlette's 15 s keepalives fill the gap between reads).
+  job's runtime; sse-starlette's 15 s keepalives fill the gap between reads). The read timeout is
+  a gap budget, never a cap on a call: the broker's SSE keepalives fill the gap, so a tool that
+  sends nothing for longer (a blocking job, a mesh `tt_device_reset`, about 26 minutes worst case
+  once it holds the device, spec 04 I13) still returns its result. A stream cut for another reason (a broker restart) is
+  retried like a failed connect, which re-sends the call.
 - **Reconnect**: the stdio session (the client's view) lives for the whole session; each
   `tools/list` / `tools/call` opens a fresh upstream session, retrying up to 12 times at 1 s
   backoff — sized to cover a systemd restart — so a broker bounce blips one call's connect, never
@@ -257,6 +261,7 @@ CONTRIBUTING's workflow) — spec diff first, then the removal, in its own PR.
 | I3 (identity is authoritative vs self-report — spec 05 owns mechanics) | `tests/test_authz.py::TestAuthzOwner::test_socket_overrides_reported_owner`, `tests/test_authz.py::TestAuthzOwner::test_http_uses_reported_owner`, `tests/test_authz.py::TestAuthzOwner::test_http_unknown_when_no_owner` |
 | I4 (resolution order, lazy daemon, no TCP) | `tests/test_stdio_shim.py::test_resolve_prefers_explicit_socket`, `tests/test_stdio_shim.py::test_resolve_auto_discovers_broker_socket`, `tests/test_stdio_shim.py::test_resolve_lazy_starts_user_daemon_when_none` |
 | Shim retries the connect, never a sent `tools/call` | `tests/test_stdio_shim.py::test_a_broker_restart_mid_call_does_not_re_send_the_call`, `tests/test_stdio_shim.py::test_a_call_made_while_the_broker_is_down_is_sent_once_it_is_back`, `tests/test_stdio_shim.py::test_an_error_reply_from_the_broker_is_passed_on_not_retried`, `tests/test_stdio_shim.py::test_a_call_that_never_reached_a_tool_is_retried`, `tests/test_stdio_shim.py::test_a_wrapped_failure_is_retried_only_if_every_part_says_never_delivered` |
+| Shim read timeout is a gap budget, not a call cap | `tests/test_stdio_shim.py::test_a_tool_call_longer_than_the_read_timeout_completes_on_keepalives` |
 | I5 | `tests/test_cli.py::test_main_bare_piped_stdin_runs_stdio_adapter`, `tests/test_cli.py::test_main_bare_tty_shows_help_not_adapter` |
 | I6 (tool names present over the wire) | `tests/test_socket_transport.py::test_socket_jsonrpc_round_trip` |
 | I8 (server-side socket resolution) | `tests/test_socket_transport.py::TestResolveSocketPath::test_cli_value_wins`, `tests/test_socket_transport.py::TestResolveSocketPath::test_env_fallback`, `tests/test_socket_transport.py::TestResolveSocketPath::test_disabled_when_unset` |
