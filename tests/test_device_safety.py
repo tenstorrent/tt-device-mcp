@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event, patch_recovery
-from tt_device_mcp import privileges
+from tt_device_mcp import device_holders, privileges
 from tt_device_mcp import server as srv
 from tt_device_mcp.constants import FABRIC_CHECK_CANNOT_CHECK_RC
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -3160,6 +3160,251 @@ async def test_no_job_starts_on_a_device_flagged_dirty(monkeypatch, clear_job_st
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
+
+
+# --- nothing of a finished job outlives it; nothing outside the broker shares it ------
+#
+# A finished privsep job's scope can outlive the job: killpg on the wrapper pid misses a child
+# that left the job's process group. The post-job gate then sees a uid >= 1000 holder and skips
+# every probe, so the next job was dispatched beside the leftover onto an unchecked device.
+
+
+def _patch_device_holders(monkeypatch, scan, ppids=None):
+    """``ppids`` maps pid -> parent pid for the parent-chain walk; a pid not in it reads as gone,
+    so no test depends on the real /proc."""
+    monkeypatch.setattr(srv, "_present_chip_indices", lambda: ["0"])
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scan)
+    monkeypatch.setattr(device_holders, "_read_proc_ppid", (ppids or {}).get)
+
+
+async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=lambda: ""):
+    """Run one exit-0 job through the real runner; return (job, systemctl calls, is-active calls, killpgs).
+
+    ``scope_active`` answers every is-active query, or is a list answered in order (the last
+    answer then repeats). ``holders`` stands in for the holder scan before dispatch."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+
+    async def _free_gate(job_log_file):
+        return ""
+
+    monkeypatch.setattr(srv, "_await_device_free_for_tenant", _free_gate)
+    monkeypatch.setattr(srv, "_tenant_holder_reason", holders)
+    monkeypatch.setattr(srv, "_HOLDER_WAIT_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "get_activation_script", lambda *a, **kw: ("", None))  # no venv to source here
+    monkeypatch.setattr(srv, "privsep_prefix_for", lambda uid, unit=None: ["env"] if privsep else None)
+    monkeypatch.setattr(srv, "GRACEFUL_KILL_GRACE_SEC", 0.05)
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_SEC", 0.05)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_POLL_SEC", 0.01)
+
+    active_checks = []
+    answers = list(scope_active) if isinstance(scope_active, list) else [scope_active]
+
+    def _active(scope):
+        active_checks.append(scope)
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    monkeypatch.setattr(srv, "_scope_active", _active)
+
+    systemctl = []
+    real_run = srv.subprocess.run
+
+    def _run(argv, *a, **kw):
+        if argv and argv[0] == "systemctl":
+            systemctl.append(list(argv))
+            return srv.subprocess.CompletedProcess(argv, 0, "", "")
+        return real_run(argv, *a, **kw)
+
+    monkeypatch.setattr(srv.subprocess, "run", _run)
+
+    killpgs = []
+    real_killpg = srv.os.killpg
+
+    def _killpg(pgid, sig):
+        killpgs.append((pgid, len(systemctl)))
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(srv.os, "killpg", _killpg)
+
+    job = srv.Job(id=job_id, owner="tenant", workspace="/tmp", command="true", queued_at="t")
+    srv.jobs[job_id] = job
+    await srv.get_job_queue().put(job_id)
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        for _ in range(300):
+            if job.finished_at:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+    assert job.finished_at, "the job never finished"
+    return job, systemctl, active_checks, killpgs
+
+
+@pytest.mark.asyncio
+async def test_a_completed_privsep_job_stops_its_scope(monkeypatch, clear_job_state):
+    """A leftover keeps the scope alive after an exit-0 job: it gets SIGINT, then the stop,
+    before the job is finalized and before any killpg SIGKILLs it."""
+    job, systemctl, _, killpgs = await _run_one_job(monkeypatch, "920", privsep=True, scope_active=True)
+    scope = srv.job_scope_unit("920")
+    assert job.status is srv.JobStatus.COMPLETED
+    assert systemctl == [
+        ["systemctl", "kill", "--signal=SIGINT", scope],
+        ["systemctl", "stop", scope],
+    ], "a finished privsep job left its scope, and whatever is still in it, holding the device"
+    assert killpgs and killpgs[0][1] == 2, "the leftover was SIGKILLed before it was offered SIGINT"
+
+
+@pytest.mark.asyncio
+async def test_a_scope_that_ended_with_its_job_is_not_signalled(monkeypatch, clear_job_state):
+    """The common case costs one is-active query and nothing else."""
+    job, systemctl, active_checks, _ = await _run_one_job(monkeypatch, "921", privsep=True, scope_active=False)
+    assert job.status is srv.JobStatus.COMPLETED
+    assert active_checks == [srv.job_scope_unit("921")]
+    assert not systemctl
+
+
+@pytest.mark.asyncio
+async def test_a_scope_that_settles_after_its_job_is_not_signalled(monkeypatch, clear_job_state):
+    """systemd sees an emptied scope asynchronously: a scope still active for a moment after a clean
+    exit is not a leftover, and is not logged or signalled as one."""
+    job, systemctl, active_checks, _ = await _run_one_job(
+        monkeypatch, "924", privsep=True, scope_active=[True, True, False]
+    )
+    assert job.status is srv.JobStatus.COMPLETED
+    assert len(active_checks) == 3
+    assert not systemctl
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_scope_is_reaped_without_a_second_sigint(monkeypatch):
+    """A kill or the hung reaper already sent SIGINT; a second one can abort the teardown it
+    started. The leftover is still reaped once the grace runs out."""
+    monkeypatch.setattr(srv, "GRACEFUL_KILL_GRACE_SEC", 0.05)
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_SEC", 0.02)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: True)
+    systemctl = []
+
+    def _run(argv, *a, **kw):
+        systemctl.append(list(argv))
+        return srv.subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(srv.subprocess, "run", _run)
+    await srv._stop_job_scope("925", None, interrupted=True)
+    assert systemctl == [["systemctl", "stop", srv.job_scope_unit("925")]]
+
+
+@pytest.mark.asyncio
+async def test_a_completed_non_privsep_job_only_killpgs_its_group(monkeypatch, clear_job_state):
+    """No scope, so nothing to query or stop: the process-group kill is all there is."""
+    job, systemctl, active_checks, killpgs = await _run_one_job(monkeypatch, "922", privsep=False, scope_active=True)
+    assert job.status is srv.JobStatus.COMPLETED
+    assert not active_checks and not systemctl
+    assert [pgid for pgid, _ in killpgs] == [job.pid]
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_holder_blocks_dispatch(monkeypatch, clear_job_state):
+    """A process outside the broker holds the device and the hold is off: the job is refused
+    without running, before the gate, and the refusal names who holds it."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_TENANT_HOLD", "0")
+    _patch_device_holders(monkeypatch, HolderScan(holders=[DeviceHolder(pid=4242, uid=1234)]))
+    gate_calls = []
+
+    async def _gate(job_log_file):
+        gate_calls.append(job_log_file)
+        return ""
+
+    monkeypatch.setattr(srv, "_await_device_free_for_tenant", _gate)
+
+    job = srv.Job(id="923", owner="tenant", workspace="/tmp", command="echo ran", queued_at="t")
+    srv.jobs["923"] = job
+    await srv.get_job_queue().put("923")
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        for _ in range(200):
+            if job.status is not srv.JobStatus.QUEUED:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+    assert job.status is srv.JobStatus.FAILED and job.started_at is None, "the job ran beside a foreign holder"
+    assert "device busy" in job.error and "pid 4242" in job.error
+    assert not gate_calls
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_holder_holds_the_job_until_it_exits(monkeypatch, clear_job_state):
+    """With the hold on (the default) the job waits while the holder stays and runs once it is
+    gone. A busy device is not a degraded one: no device_held episode opens for it."""
+    monkeypatch.delenv("TT_DEVICE_MCP_TENANT_HOLD", raising=False)
+    held = []
+    monkeypatch.setattr(srv, "_note_tenant_gate_verdict", lambda reason: reason and held.append(reason))
+    scans = ["device held outside the broker by u(pid 4242)"] * 3 + [""]
+    job, _, _, _ = await _run_one_job(
+        monkeypatch, "926", privsep=False, scope_active=False, holders=lambda: scans.pop(0) if scans else ""
+    )
+    assert job.status is srv.JobStatus.COMPLETED
+    assert not scans, "the job was dispatched while the holder was still there"
+    assert not held, "a busy device was recorded as a degraded hold"
+
+
+@pytest.mark.parametrize(
+    "holder",
+    [
+        DeviceHolder(pid=4242, uid=0),  # root: the broker's own probes, a system daemon
+        DeviceHolder(pid=4242, uid=999),  # a service account below MIN_TENANT_UID
+        DeviceHolder(pid=os.getpid(), uid=1234),  # a per-user broker holding the device itself
+    ],
+    ids=["root", "service-account", "broker-pid"],
+)
+def test_broker_owned_holders_do_not_block_dispatch(monkeypatch, holder):
+    _patch_device_holders(monkeypatch, HolderScan(holders=[holder]))
+    assert srv._tenant_holder_reason() == ""
+
+
+def test_the_brokers_own_child_probe_does_not_block_dispatch(monkeypatch):
+    """A per-user broker runs its probes (startup fabric verify, relift, reset, post-step gate)
+    as subprocesses under the tenant's uid; one holding the device is not an outside holder."""
+    probe, shell = 5001, 5000  # broker -> shell -> probe
+    _patch_device_holders(
+        monkeypatch,
+        HolderScan(holders=[DeviceHolder(pid=probe, uid=1234)]),
+        ppids={probe: shell, shell: os.getpid()},
+    )
+    assert srv._tenant_holder_reason() == ""
+
+
+def test_a_leftover_reparented_away_from_the_broker_still_blocks_dispatch(monkeypatch):
+    """A daemonized leftover reparented to init is no longer the broker's child: it still counts."""
+    _patch_device_holders(monkeypatch, HolderScan(holders=[DeviceHolder(pid=5001, uid=1234)]), ppids={5001: 1})
+    assert "pid 5001" in srv._tenant_holder_reason()
+
+
+def test_a_holder_that_exits_mid_walk_does_not_break_the_scan(monkeypatch):
+    """The holder's parent is gone before its stat is read: no crash, and it is not exempted."""
+    _patch_device_holders(monkeypatch, HolderScan(holders=[DeviceHolder(pid=5001, uid=1234)]), ppids={5001: 5000})
+    assert "pid 5001" in srv._tenant_holder_reason()
+
+
+def test_a_parent_cycle_ends_the_walk(monkeypatch):
+    _patch_device_holders(
+        monkeypatch, HolderScan(holders=[DeviceHolder(pid=5001, uid=1234)]), ppids={5001: 5000, 5000: 5001}
+    )
+    assert "pid 5001" in srv._tenant_holder_reason()
+
+
+def test_an_incomplete_holder_scan_does_not_block_dispatch(monkeypatch):
+    """A per-user broker cannot read other users' fds; that blind spot must not stop its queue."""
+    _patch_device_holders(monkeypatch, HolderScan(holders=[], complete=False))
+    assert srv._tenant_holder_reason() == ""
 
 
 # --- inter-job cooldown ------------------------------------------------------

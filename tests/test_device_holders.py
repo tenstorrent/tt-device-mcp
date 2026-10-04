@@ -595,3 +595,9 @@ class TestDriverHolderRecord:
 
         assert scan.source == "proc"
         assert any(h.pid == os.getpid() for h in scan.holders)
+
+
+def test_read_proc_ppid_reads_this_process_parent():
+    """The real /proc parse (no device involved): our own ppid, and None for a pid that is gone."""
+    assert dh._read_proc_ppid(os.getpid()) == os.getppid()
+    assert dh._read_proc_ppid(2**22 + 1) is None  # above pid_max
