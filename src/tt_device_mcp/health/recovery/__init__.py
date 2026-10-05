@@ -239,9 +239,9 @@ class RecoveryDeps:
     # deps fixture — may supply its own bindings, which boot leaves untouched).
     board_types_provider: Optional[Callable[[], Optional[list]]] = None
     glx_board_types_provider: Optional[Callable[[], tuple]] = None
-    # The per-chip bus ids the tray rung derives its trays from (spec 04 I16). Same injection
-    # reason as the two above: the cache lives on the HealthMonitor singleton.
-    bus_ids_provider: Optional[Callable[[], Optional[list]]] = None
+    # {chip index: PCI address}, the map the tray rung derives its trays from (spec 04 I16). Same
+    # injection reason as the two above: the cache lives on the HealthMonitor singleton.
+    chip_buses_provider: Optional[Callable[[], Optional[dict]]] = None
     journal_skip_once: Optional[Callable[[str, str], None]] = None
     # The telemetry sampler's server-side callbacks (see tt_device_mcp.telemetry). Same lambda
     # discipline as every field above — each re-resolves a server.py name per call so a

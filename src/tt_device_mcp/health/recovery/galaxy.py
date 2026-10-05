@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -21,7 +22,7 @@ from tt_device_mcp.device_holders import MIN_TENANT_UID
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import dead_chips
-from tt_device_mcp.health.monitors.pci import chip_node_present
+from tt_device_mcp.health.monitors.pci import chip_node_present, pci_bus_number
 from tt_device_mcp.health.recovery import (
     BLOCKED,
     DEFER,
@@ -649,19 +650,28 @@ def _ubb_bus_id_tables() -> Optional[dict]:
     return tables or None
 
 
-def _tray_map(bus_ids, board_type) -> Optional[dict]:
+def _tray_map(chip_buses, board_type) -> Optional[dict]:
     """``{tray number: [chip ids]}`` for a Galaxy, or None when the trays cannot be known.
 
-    ``bus_ids`` is the cached per-chip ``board_info.bus_id`` from a snapshot that identified every
-    board, indexed by chip id. The tray is the bus masked to its group (``& 0xf0``) looked up in
-    tt-smi's table for this board type — the same derivation ``tt-smi -glx_list_tray_to_device``
-    prints, so the trays the broker names are the trays an operator reads there.
+    ``chip_buses`` is ``{chip id: PCI address}``, the kernel's chip index (the one /dev, sysfs and
+    the heartbeat read use) mapped to that chip's own address, banked from sysfs while every chip
+    was on the bus. The tray is the bus masked to its group (``& 0xf0``) looked up in tt-smi's
+    table for this board type — the same derivation ``tt-smi -glx_list_tray_to_device`` prints, so
+    the trays the broker names are the trays an operator reads there.
 
-    All-or-nothing on purpose (I16). A chip with no bus id, a bus outside the four known groups, or
-    a board type with no table leaves a map that is missing silicon, and a tray reset driven from a
-    partial map would leave exactly the chips it could not place unrecovered. The rung declines on
-    None; it never falls back to arithmetic.
+    Never a list read by position (I16): tt-smi lists chips in PCI order, the kernel numbers them in
+    its own, and on a Blackhole Galaxy the two disagree for chips 16-31 — reading one as the other
+    swaps trays 3 and 4. A list is therefore refused outright, and a chip missing from the map
+    shifts no other chip's tray.
+
+    All-or-nothing on what it is given. A chip with no readable bus, a bus outside the four known
+    groups, or a board type with no table leaves a map that misplaces silicon, and the rung declines
+    on None; it never falls back to arithmetic. That every chip is present is the bank's guarantee
+    (``HealthMonitor._bank_chip_buses_once``), and a drop on a chip the map does not place declines
+    in :func:`_offbus_ids_on_trays`.
     """
+    if not isinstance(chip_buses, Mapping) or not chip_buses:
+        return None
     tables = _ubb_bus_id_tables()
     if not tables:
         return None
@@ -672,16 +682,31 @@ def _tray_map(bus_ids, board_type) -> Optional[dict]:
         return None
     tray_of_group = {group: tray for tray, group in table.items()}
     trays: dict = {}
-    for chip_id, bus_id in enumerate(bus_ids):
-        try:
-            bus = int(str(bus_id).split(":")[1], 16)
-        except (IndexError, ValueError):
+    try:
+        chips = sorted((int(c), addr) for c, addr in chip_buses.items())
+    except (TypeError, ValueError):
+        return None
+    for chip_id, address in chips:
+        bus = pci_bus_number(address)
+        if bus is None:
             return None
         tray = tray_of_group.get(bus & 0xF0)
         if tray is None:
             return None
         trays.setdefault(tray, []).append(chip_id)
     return trays or None
+
+
+def _tray_label(tray: int, tray_map: dict) -> str:
+    """``tray 4 (BMC mask 0x08, chips 24-31)``: the tray number as tt-smi prints it, with the BMC bit
+    the reset pulses and the chip ids it holds, so a log line can be checked against both without
+    knowing the numbering convention."""
+    chips = sorted(tray_map.get(tray) or [])
+    if chips and chips == list(range(chips[0], chips[-1] + 1)):
+        span = f"{chips[0]}-{chips[-1]}" if len(chips) > 1 else str(chips[0])
+    else:
+        span = ",".join(str(c) for c in chips)
+    return f"tray {tray} (BMC mask 0x{1 << (tray - 1):02x}, chips {span})"
 
 
 def _offbus_chip_ids(beats: dict, expected: int) -> set:
@@ -818,9 +843,9 @@ def _maybe_emit_ubb_reset_required(beats: dict, off_bus: int, expected: int, log
         present=max(0, expected - off_bus),
         host_at_risk=True,
     )
-    tray_list = ", ".join(str(t) for t in trays)
+    tray_list = ", ".join(_tray_label(t, tray_map) for t in trays)
     log(
-        f"UBB tray(s) {tray_list} hold the {off_bus}/{expected} off-bus chip(s) — a below-floor drop "
+        f"UBB {tray_list} hold the {off_bus}/{expected} off-bus chip(s) — a below-floor drop "
         f"the mesh-wide reset inverts and a warm reboot cannot re-enumerate. The lightest sufficient "
         f"recovery is a per-tray BMC reset of the affected tray(s): `{command}`. The broker walks them "
         f"one at a time when TT_DEVICE_MCP_AUTO_UBB_RESET is set; here it stays HELD."
@@ -840,7 +865,7 @@ class GalaxyRecovery(Recovery):
         the board-type derivation is: the caches live on the one HealthMonitor the FSM builds, and
         a test aims its own bag at its own monitor.
         """
-        if self.deps.bus_ids_provider is None:
+        if self.deps.chip_buses_provider is None:
             return None
         # Normalized so a WH snapshot's " L"/" R" pair reads as one board type — the same rule
         # _is_galaxy applies for its unanimity check, and the reason the tests seed suffixed values.
@@ -849,7 +874,7 @@ class GalaxyRecovery(Recovery):
             # Unanimous or nothing, as everywhere the board type decides a reset: a mesh reporting
             # two board types is not a topology either UBB table describes.
             return None
-        return _tray_map(self.deps.bus_ids_provider() or [], board_types.pop())
+        return _tray_map(self.deps.chip_buses_provider() or {}, board_types.pop())
 
     def next_stage(self, ev: Evidence) -> str:
         # host_escalation/reboot_blocked are folded here, not carried on Evidence (see its own
@@ -2040,7 +2065,10 @@ class GalaxyRecovery(Recovery):
                     expected=expected,
                     host_at_risk=True,
                 )
-                log(f"per-tray BMC reset {step + 1}/{len(walk)} ({role}): re-powering tray {tray}: `{command}`")
+                log(
+                    f"per-tray BMC reset {step + 1}/{len(walk)} ({role}): re-powering "
+                    f"{_tray_label(tray, tray_map)}: `{command}`"
+                )
                 try:
                     await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
                 except Exception as exc:  # noqa: BLE001 - a fire that did not launch falls through, never raises
