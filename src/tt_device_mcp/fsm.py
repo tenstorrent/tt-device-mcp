@@ -210,7 +210,7 @@ class ServerFsm:
         cooldown/ledger state.
 
         ``deps``' four monitor-bound fields (``board_types_provider``, ``glx_board_types_provider``,
-        ``bus_ids_provider``, ``journal_skip_once``) read state that lives on the monitor
+        ``chip_buses_provider``, ``journal_skip_once``) read state that lives on the monitor
         being built here, so they are wired here rather than demanded of the caller — the
         chicken-and-egg this method exists to resolve. Bindings the caller supplied itself (a
         test's own deps bag, aimed at its own monitor) are left untouched.
@@ -233,8 +233,8 @@ class ServerFsm:
             deps.board_types_provider = lambda: monitor._board_types
         if deps.glx_board_types_provider is None:
             deps.glx_board_types_provider = lambda: monitor._glx_board_types()
-        if deps.bus_ids_provider is None:
-            deps.bus_ids_provider = lambda: monitor._bus_ids
+        if deps.chip_buses_provider is None:
+            deps.chip_buses_provider = lambda: monitor._chip_buses
         if deps.journal_skip_once is None:
             deps.journal_skip_once = lambda kind, reason, **f: monitor._journal_skip_once(kind, reason, **f)
         self.monitor = monitor
