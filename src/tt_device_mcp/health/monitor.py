@@ -89,6 +89,7 @@ class HealthMonitor:
         # {chip index: PCI address} read from sysfs while every chip was on the bus — the map the
         # tray rung actually keys on (spec 04 I16). tt-smi lists chips in PCI order and the kernel
         # numbers them in its own order, so ``_bus_ids`` read by position names the wrong chip.
+        # Re-banked by any later trusted full read that differs: the kernel can re-number chips.
         self._chip_buses: Optional[dict] = None
         self._glx_cache: Optional[tuple] = None
 
@@ -342,17 +343,22 @@ class HealthMonitor:
             return
         self._bus_ids = list(bus_ids)
 
-    def _bank_chip_buses_once(self, bus_ids: list, expected_count: int) -> None:
-        """Record every chip index's PCI address from sysfs, first complete and agreeing read standing.
+    def _bank_chip_buses(self, bus_ids: list, expected_count: int) -> None:
+        """Keep every chip index's PCI address, read from sysfs, as of the latest trusted full read.
 
         The index is the kernel's (/dev, sysfs, heartbeat), so the tray of an off-bus chip comes from
-        its own address, not from where tt-smi happened to list it (spec 04 I16). Banked under the
-        same "complete or not at all" rule as ``_bus_ids``, read in the same pass, and only when the
-        two agree on the set of buses: a disagreement means the bus moved under one of the reads, so
-        both are journaled and the next full pass tries again rather than freeze either.
+        its own address, not from where tt-smi happened to list it (spec 04 I16). Trusted and full
+        means the same "complete or not at all" rule as ``_bus_ids``, read in the same pass, and the
+        two agreeing on the set of buses: a disagreement means the bus moved under one of the reads,
+        so both are journaled and the next full pass tries again.
+
+        Unlike ``_bus_ids`` the map is not first-read-stands. tt-kmd can give a chip another index
+        after a drop, a rescan or a tray reset (it falls back to a free index when the chip's own is
+        still taken), and a map naming the old index re-powers the wrong tray. So a trusted full read
+        that differs re-banks it here, in the gate's pass before any rung reads it, and journals the
+        old and the new map. A short or disagreeing read never touches a banked map: a chip off the
+        bus has no node, so that read cannot place it.
         """
-        if self._chip_buses is not None:
-            return
         if expected_count <= 0 or len(bus_ids) < expected_count or not all(bus_ids):
             return
         chips = pci.chip_pci_bdfs()
@@ -361,12 +367,25 @@ class HealthMonitor:
             self._journal_skip_once(
                 "chip_bus_map_mismatch",
                 f"sysfs and tt-smi disagree on the chips' PCI buses ({len(chips)} vs {len(bus_ids)} chips) — "
-                f"no tray map until they agree (I16)",
+                + ("the banked tray map stands" if self._chip_buses is not None else "no tray map")
+                + " until they agree (I16)",
                 sysfs={str(k): v for k, v in sorted(chips.items())},
                 tt_smi=list(bus_ids),
             )
             return
-        self._chip_buses = dict(chips)
+        if self._chip_buses is None:
+            self._chip_buses = dict(chips)
+            return
+        if chips == self._chip_buses:
+            return
+        old, self._chip_buses = self._chip_buses, dict(chips)
+        # Every change, not once per process: each one moves the tray a rung would re-power.
+        health_event(
+            "chip_bus_map_drift",
+            reason="the kernel re-numbered chips since the map was banked (I16); re-banked from this read",
+            old={str(k): v for k, v in sorted(old.items())},
+            new={str(k): v for k, v in sorted(chips.items())},
+        )
 
     def _bus_id_cache_expected_count(self, expected_count: int) -> int:
         """The smallest snapshot size that is allowed to freeze ``_bus_ids``.
@@ -476,12 +495,11 @@ class HealthMonitor:
         fresh_bus_ids = [(d.get("board_info") or {}).get("bus_id") or "" for d in devs]
         bus_id_expected_count = self._bus_id_cache_expected_count(expected_count)
         self._bank_bus_ids_once(fresh_bus_ids, bus_id_expected_count)
-        self._bank_chip_buses_once(fresh_bus_ids, bus_id_expected_count)
-        # Topology-drift observability: the cache is one-shot for the process, but the very rung
-        # I16 enables re-powers trays, and the driver's bus enumeration after a warm reset is not
-        # guaranteed to match boot. Journal a mismatch so a drift is visible; the cached map
-        # stands, since accepting a fresh one would open a race where a bad snapshot replaces a
-        # known-good one. Only compares full-count reads — anything shorter is an already-degraded
+        self._bank_chip_buses(fresh_bus_ids, bus_id_expected_count)
+        # Topology-drift observability for tt-smi's own list: it is banked once for the process, and
+        # the driver's bus enumeration after a warm reset is not guaranteed to match boot. Journal a
+        # mismatch so a drift is visible. The list stands: no tray is read from it (the chip map just
+        # re-banked is). Only compares full-count reads — anything shorter is an already-degraded
         # mesh whose absent chips look like drift.
         if (
             self._bus_ids is not None
@@ -492,19 +510,9 @@ class HealthMonitor:
         ):
             self._journal_skip_once(
                 "bus_map_drift",
-                "cached per-chip bus map differs from the current snapshot — a warm reset may "
-                "have re-enumerated chips (I16); the cached map stands",
+                "cached tt-smi bus list differs from the current snapshot — a warm reset may have "
+                "re-enumerated chips (I16); no tray is read from this list, so it stands",
             )
-        # The same drift check for the map the trays are actually read from: a re-enumeration can
-        # hand a chip index to a different bus without tt-smi's PCI-ordered list changing at all.
-        if self._chip_buses is not None and bus_id_expected_count > 0 and len(fresh_bus_ids) >= bus_id_expected_count:
-            fresh_chip_buses = pci.chip_pci_bdfs()
-            if len(fresh_chip_buses) >= bus_id_expected_count and fresh_chip_buses != self._chip_buses:
-                self._journal_skip_once(
-                    "chip_bus_map_drift",
-                    "cached chip-index -> PCI map differs from sysfs now — a warm reset may have "
-                    "re-numbered chips (I16); the cached map stands",
-                )
         silent = []
         for i, d in enumerate(devs):
             binfo = d.get("board_info") or {}

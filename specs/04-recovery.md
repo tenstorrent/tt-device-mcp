@@ -203,22 +203,32 @@ each rung fires only when the gentler one failed or cannot apply.
 
   **The map is cached, and no map means no fire.** A chip that has left the bus is absent from the
   tt-smi snapshot and has no sysfs node, so its bus cannot be read at the moment the rung wants
-  it — which is every moment this rung fires. The chip→bus map is therefore taken on the first
-  full-count snapshot (every chip present, every `bus_id` non-empty) and held for the life of the
-  process (PCI topology does not move under a running broker), exactly as the board types are.
-  It is banked only when the sysfs map and the snapshot name the same set of buses; when they
+  it — which is every moment this rung fires. The chip→bus map is therefore banked from a trusted
+  full read and held until the next one: a full-count snapshot (every chip present, every `bus_id`
+  non-empty) and, in the same pass, a sysfs map that names the same set of buses. When the two
   disagree (one read raced the bus) nothing is banked, `chip_bus_map_mismatch` journals both once,
   and a later full pass that agrees banks the map. A broker that restarted after the drop and
   never saw a full-mesh snapshot has no map, and then the tray rung DECLINES rather than fall back
   to arithmetic: the same rule as I15's mesh reset, which never fires on a guessed mode. A decline
   here is `not_applicable`, not `blocked` — it is a missing fact, not an operator's kill switch.
 
+  **A trusted full read re-banks the map; no other read touches it.** A chip's bus does not move,
+  but the index the kernel gives it can: tt-kmd derives a Galaxy chip's index from its PCI address
+  but takes a free one when that index is still in use, and older drivers always take a free one,
+  so a chip can come back from a drop, a rescan or a tray reset under another index — the cycles
+  this rung exists for. A map that names the old index re-powers the wrong tray. So every trusted
+  full read is compared with the banked map, and one that differs replaces it in the gate's own
+  pass, before any rung computes a BMC mask from it, and journals `chip_bus_map_drift` with the
+  old and the new map — on every change, not once per process, since each one moves a tray. A
+  read that is short, has a chip without a readable bus, or disagrees with the snapshot never
+  overwrites a banked map: a chip off the bus has no node to read, so that read cannot place it,
+  and the last trusted map stands.
+
   Boot probes (`expected_count=0`) and short reads never fill the map. A chip missing from the map
   leaves every other chip's tray where it was, and a decision that needs the missing chip
   declines. Board types are normalized (`_normalized_board` strips wormhole ` L`/` R`) before the
-  table lookup. A later full snapshot whose bus list differs journals `bus_map_drift` once, and a
-  later full sysfs read whose chip→bus map differs journals `chip_bus_map_drift` once; the cached
-  map stands either way.
+  table lookup. tt-smi's own bus list is banked once beside the map and no tray is read from it:
+  a later full snapshot whose list differs journals `bus_map_drift` once, and the list stands.
 - **I17 — A rung needs both its platform and its privilege.** `privileges.latch()` measures once
   in `ServerFsm.boot()` and every later read returns that record, so the `BOOT privilege:` line
   and the rung a wedge reaches hours later are the same measurement. The probes: `root` (euid 0),
@@ -361,7 +371,7 @@ holds live silicon. The tray rung walks affected trays first then the rest, one 
 re-verifying (fabric included) between trays, holding `reset_in_flight` across the walk, and never
 applies to a fully-off-bus mesh (that is the cold rung's case). Every tray it names — the affected
 set, the walk order, the bitmap, and the chip ids the ioctl handshake quiesces — comes from the
-cached bus map of I16, so the trays in the `ubb_reset_required` event are the ones an operator
+banked chip→bus map of I16, so the trays in the `ubb_reset_required` event are the ones an operator
 would read off `tt-smi -glx_list_tray_to_device`.
 
 **The tray rung's two branches.** The below-floor tray rung splits on the hold's *class*, chosen
@@ -559,7 +569,9 @@ NOT be conflated when reading results.
 | I16 sysfs and tt-smi disagreeing banks nothing and journals `chip_bus_map_mismatch` | `tests/test_ubb_tray_map.py::test_sysfs_and_tt_smi_disagreeing_banks_no_map_and_logs_both` |
 | I16 a boot platform probe (`expected_count=0`), a degraded first pass, or any short snapshot never freezes the map | `tests/test_ubb_tray_map.py::test_a_partial_boot_snapshot_never_freezes_the_map`, `::test_a_degraded_first_normal_snapshot_cannot_freeze_the_map`, `tests/test_reset.py::test_bank_bus_ids_once_rejects_a_snapshot_shorter_than_the_mesh`, `::test_bank_bus_ids_once_rejects_a_boot_probe_that_did_not_ask_the_question`, `::test_bank_bus_ids_once_rejects_a_chip_enumerated_without_a_bus_id`, `::test_bank_bus_ids_once_rejects_an_empty_list`, `::test_bank_bus_ids_once_first_full_read_stands`, `::test_bank_bus_ids_once_stays_open_after_a_rejected_snapshot` |
 | I16 the board type is normalized before selecting the table (WH ` L`/` R` suffix) | `tests/test_ubb_tray_map.py::test_a_wormhole_snapshot_with_l_r_suffixes_still_produces_a_tray_map`, `::test_a_wormhole_lookup_survives_the_snapshot_suffix_inside_tray_map` |
-| I16 a warm-reset topology drift journals `bus_map_drift` / `chip_bus_map_drift`; the cached map stands | `tests/test_ubb_tray_map.py::test_a_drifted_snapshot_journals_but_leaves_the_cached_map_standing`, `::test_a_renumbered_sysfs_journals_chip_bus_map_drift_and_the_map_stands` |
+| I16 a trusted full read whose chip→bus map differs re-banks it, journals `chip_bus_map_drift` with the old and the new map, and the next mask follows the chip's new bus | `tests/test_ubb_tray_map.py::test_a_renumbered_full_read_re_banks_the_map_and_journals_old_and_new`, `::test_after_a_renumbering_the_walk_re_powers_the_tray_of_the_chips_new_bus` |
+| I16 a short read, an unreadable chip, or a read tt-smi disagrees with never overwrites a banked map; a matching full read changes nothing | `tests/test_ubb_tray_map.py::test_a_short_or_disagreeing_read_never_overwrites_the_banked_map`, `::test_a_full_read_that_matches_the_banked_map_changes_nothing` |
+| I16 tt-smi's bus list drifting journals `bus_map_drift`; the list stands | `tests/test_ubb_tray_map.py::test_a_drifted_snapshot_journals_but_leaves_the_cached_map_standing` |
 | I16 a new GLX board type this build cannot map surfaces as `ubb_tray_table_missing` | `tests/test_ubb_tray_map.py::test_a_glx_board_type_with_no_matching_arch_suffix_journals_once` |
 | Tray rung: plan/walk semantics, fabric-gated clear, decline cases | `tests/test_device_safety.py::test_ubb_reset_plan_maps_a_clean_whole_tray_drop_to_its_bitmap`, `tests/test_device_safety.py::test_ubb_tray_walk_plan_orders_affected_trays_first_then_the_rest`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_stops_as_soon_as_the_mesh_is_healthy`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_does_not_clear_a_hold_on_an_unverified_fabric`, `tests/test_device_safety.py::test_ubb_tray_reset_declines_a_fully_off_bus_mesh_it_is_the_cold_rung`, `tests/test_device_safety.py::test_maybe_emit_ubb_reset_required_names_the_exact_bmc_command_on_a_tray_down`, `tests/test_device_safety.py::test_the_tray_reset_rung_is_armed_by_default` |
 | Tray fire argv/handshake (tt-smi compat, off-bus chip skipped) | `tests/test_ubb_reset_launch.py::test_fire_ubb_reset_imports_a_symbol_the_installed_tt_smi_defines`, `tests/test_ubb_reset_launch.py::test_fire_ubb_reset_pulses_the_tray_when_a_chip_is_already_off_the_bus`, `tests/test_ubb_reset_launch.py::test_fire_ubb_reset_falls_back_to_the_chip_reset_class_on_older_tt_smi` |

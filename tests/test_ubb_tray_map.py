@@ -35,6 +35,11 @@ BH_CHIP_BUSES = {
     for n, chip in enumerate(range(base, base + 8), start=1)
 }
 
+# The same Galaxy after tt-kmd handed chips 16 and 24 each other's index (it falls back to a free
+# index when a chip's own is still taken, e.g. across a drop/rescan): chip 16 is now on 0x81 (tray 4)
+# and chip 24 on 0xC1 (tray 3). Every bus is where it was; only the indexes moved.
+RENUMBERED_CHIP_BUSES = {**BH_CHIP_BUSES, 16: BH_CHIP_BUSES[24], 24: BH_CHIP_BUSES[16]}
+
 
 def test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index():
     """tt-smi's Blackhole table numbers bus group 0xc0 tray 3 and 0x80 tray 4. The kernel puts
@@ -333,26 +338,112 @@ def test_sysfs_and_tt_smi_disagreeing_banks_no_map_and_logs_both(monkeypatch, tm
     assert srv.health_monitor._chip_buses == BH_CHIP_BUSES
 
 
-def test_a_renumbered_sysfs_journals_chip_bus_map_drift_and_the_map_stands(monkeypatch, tmp_path, galaxy_seen):
-    """A re-enumeration can hand chip ids to other buses without tt-smi's PCI-ordered list changing
-    at all, so the drift check has to look at the map the trays come from."""
+def _event_map(chip_buses):
+    return {str(c): b for c, b in sorted(chip_buses.items())}
+
+
+def test_a_renumbered_full_read_re_banks_the_map_and_journals_old_and_new(monkeypatch, tmp_path, galaxy_seen):
+    """tt-kmd can give a chip another index after a drop, a rescan or a tray reset, without tt-smi's
+    PCI-ordered list changing at all. A full read that sysfs and tt-smi agree on is the kernel's
+    numbering now, so it replaces the banked map in the same pass and the journal carries both maps.
+    Fails on 2bb8128: the drift was journaled and the stale map kept."""
     events = _recording_events(monkeypatch)
-    renumbered = dict(BH_CHIP_BUSES)
-    renumbered[16], renumbered[24] = renumbered[24], renumbered[16]
-    _seed_sysfs(tmp_path, renumbered)
+    _seed_sysfs(tmp_path, RENUMBERED_CHIP_BUSES)
 
     srv.health_monitor.verify_device_health(32, timeout_sec=5)
     srv.health_monitor.verify_device_health(32, timeout_sec=5)
 
-    assert srv.health_monitor._chip_buses == BH_CHIP_BUSES, "the cached map must not move on drift"
-    assert len([e for e in events if e[0] == "chip_bus_map_drift"]) == 1
+    assert srv.health_monitor._chip_buses == RENUMBERED_CHIP_BUSES
+    drift = [f for k, f in events if k == "chip_bus_map_drift"]
+    assert len(drift) == 1, "one change, one event: the second pass matches the re-banked map"
+    assert drift[0]["old"] == _event_map(BH_CHIP_BUSES)
+    assert drift[0]["new"] == _event_map(RENUMBERED_CHIP_BUSES)
+    trays = srv.galaxy_recovery._tray_map_now()
+    assert trays[3] == list(range(17, 25))
+    assert trays[4] == [16, *range(25, 32)]
+
+
+@pytest.mark.asyncio
+async def test_after_a_renumbering_the_walk_re_powers_the_tray_of_the_chips_new_bus(
+    monkeypatch, tmp_path, galaxy_seen, clear_job_state
+):
+    """What the re-bank is for: chip 24 now sits on 0xC1, so its drop is a tray-3 drop. The first
+    mask is 0x04 and the handshake quiesces tray 3's chips as the kernel numbers them now. Fails on
+    2bb8128: the stale map still put chip 24 on 0x81 and fired 0x08 at tray 4's healthy chips."""
+    _recording_events(monkeypatch)
+    _seed_sysfs(tmp_path, RENUMBERED_CHIP_BUSES)
+    srv.health_monitor.verify_device_health(32, timeout_sec=5)
+    fired, lines = [], []
+    srv.fsm.set_latch("ubb_reset_fired", False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+
+    async def healthy(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}}
+
+    patch_recovery(monkeypatch, "_verify_device", healthy)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append((bitmap, ids)), raising=False)
+
+    beats = {str(i): 100 for i in range(32) if i != 24}
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 1, 32, lines.append)
+
+    assert out is True
+    assert fired[0] == (0x04, list(range(17, 25)))
+    assert any("re-powering tray 3 (BMC mask 0x04, chips 17-24)" in line for line in lines), lines
+
+
+@pytest.mark.parametrize(
+    "smi_off_bus, sysfs, mismatch",
+    [
+        # tt-smi saw the whole mesh, but one chip's node was gone by the time sysfs was read.
+        (None, {c: b for c, b in RENUMBERED_CHIP_BUSES.items() if c != 20}, True),
+        # chip 24 off the bus: tt-smi's snapshot is short and sysfs has no node for it either.
+        (RENUMBERED_CHIP_BUSES[24], {c: b for c, b in RENUMBERED_CHIP_BUSES.items() if c != 24}, False),
+        # every node there, one on a bus tt-smi did not report: one of the two reads raced the bus.
+        (None, {**RENUMBERED_CHIP_BUSES, 20: "0000:21:00.0"}, True),
+    ],
+    ids=["sysfs-short", "chip-off-the-bus", "sysfs-other-bus"],
+)
+def test_a_short_or_disagreeing_read_never_overwrites_the_banked_map(
+    monkeypatch, tmp_path, galaxy_seen, smi_off_bus, sysfs, mismatch
+):
+    """Only a trusted full read moves the map. A chip off the bus has no node, so a short read
+    cannot place it, and a read tt-smi disagrees with raced the bus: the last trusted map stands
+    even when the chips that are readable look renumbered."""
+    events = _recording_events(monkeypatch)
+    snapshot = _galaxy_snapshot()
+    snapshot["device_info"] = [d for d in snapshot["device_info"] if d["board_info"]["bus_id"] != smi_off_bus]
+    monkeypatch.setattr(srv.subprocess, "run", _fake_smi(snapshot))
+    _seed_sysfs(tmp_path, sysfs)
+
+    srv.health_monitor.verify_device_health(32, timeout_sec=5)
+
+    assert srv.health_monitor._chip_buses == BH_CHIP_BUSES
+    assert srv.galaxy_recovery._tray_map_now()[4] == list(range(24, 32))
+    kinds = [k for k, _ in events]
+    assert "chip_bus_map_drift" not in kinds
+    assert ("chip_bus_map_mismatch" in kinds) is mismatch
+
+
+def test_a_full_read_that_matches_the_banked_map_changes_nothing(monkeypatch, galaxy_seen):
+    """The steady state: every full gate pass re-reads sysfs, and a map that has not moved stays
+    the banked one and journals nothing."""
+    events = _recording_events(monkeypatch)
+    banked = srv.health_monitor._chip_buses
+
+    ok, _detail = srv.health_monitor.verify_device_health(32, timeout_sec=5)
+
+    assert ok
+    assert srv.health_monitor._chip_buses is banked
+    assert [k for k, _ in events if k.startswith("chip_bus_map")] == []
 
 
 def test_a_drifted_snapshot_journals_but_leaves_the_cached_map_standing(monkeypatch):
     """A warm reset (this rung's own, the per-chip bridge, or a power cycle) can re-order PCI
-    enumeration. The cache is one-shot, but a later full snapshot that disagrees is worth naming
-    so a wrong tray decision is not silent (spec 04 I16). Overwriting on drift would open a race
-    where a bad snapshot replaces a known-good one, so the cache stands."""
+    enumeration. tt-smi's bus list is banked once beside the chip map, and a later full snapshot
+    that disagrees is worth naming (spec 04 I16). No tray is read from this list (the chip map,
+    which re-banks, is what the trays come from), so the list stands."""
     from tt_device_mcp.health import monitor as monitor_mod
 
     monkeypatch.setattr(srv.health_monitor, "_board_types", None)

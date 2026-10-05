@@ -667,7 +667,7 @@ def _tray_map(chip_buses, board_type) -> Optional[dict]:
     All-or-nothing on what it is given. A chip with no readable bus, a bus outside the four known
     groups, or a board type with no table leaves a map that misplaces silicon, and the rung declines
     on None; it never falls back to arithmetic. That every chip is present is the bank's guarantee
-    (``HealthMonitor._bank_chip_buses_once``), and a drop on a chip the map does not place declines
+    (``HealthMonitor._bank_chip_buses``), and a drop on a chip the map does not place declines
     in :func:`_offbus_ids_on_trays`.
     """
     if not isinstance(chip_buses, Mapping) or not chip_buses:
