@@ -14,10 +14,11 @@ import subprocess
 
 import pytest
 
-from tests.conftest import patch_health_event, patch_recovery
+from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health import bmc_capture
+from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.recovery import galaxy
 
 # The kernel's chip index -> PCI address on a Blackhole Galaxy (as tests/test_ubb_tray_map.py).
@@ -262,6 +263,70 @@ async def test_the_latch_does_not_change_after_a_reset_and_is_fresh_after_the_ep
 
 
 @pytest.mark.asyncio
+async def test_a_restarted_broker_latches_a_tray_still_missing_afresh(rig, monkeypatch):
+    """The latch is not persisted: a restarted broker (a new GalaxyRecovery) has none, takes it again
+    at its first sighting and captures again, but the power cycle still asks the same guard, so a
+    restart buys no extra cycle and no reset."""
+    g = rig["g"]
+    rig["beats"] = _beats_without(_off(rig["map"], {3: 8}))
+    rig["allowed"] = (False, "interval not elapsed")
+    await g.escalate("offbus", [], 32, lambda m: None)
+    assert (rig["captures"], rig["cycles"]) == (1, 0) and g._td["path"] == "FAST"
+
+    restarted = galaxy.GalaxyRecovery(g.monitor, g.mechanism, g.deps)
+    assert restarted._td is None, "a restart starts with no latch"
+    monkeypatch.setattr(restarted, "_tray_down_capture", g._tray_down_capture)
+    for rung in (
+        "_attempt_ubb_tray_reset",
+        "_fire_tray_down_no_window",
+        "_fire_gate_rung",
+        "_escalate_offbus_stuck_hold",
+    ):
+        monkeypatch.setattr(restarted, rung, getattr(g, rung))
+    await restarted.escalate("offbus", [], 32, lambda m: None)
+    assert restarted._td["path"] == "FAST" and rig["captures"] == 2, "latched and captured afresh"
+    assert rig["cycles"] == 0 and rig["rescans"] == 2, "the guard still holds the cycle; no reset fired"
+    rig["allowed"] = (True, "")
+    await restarted.escalate("offbus", [], 32, lambda m: None)
+    assert rig["cycles"] == 1 and rig["captures"] == 2
+
+
+@pytest.mark.asyncio
+async def test_the_gate_takes_the_fast_path_for_a_tray_down_onset(rig, monkeypatch, tmp_path, clear_job_state):
+    """End to end through server.device_health_gate: tray 3 off the bus after a job, the default
+    action, no tenant. The gate's hook latches FAST, captures, rescans once and power-cycles; no reset
+    rung runs (the rig's tripwires, plus the mesh-wide reset here)."""
+    for i in range(24):
+        (tmp_path / str(i)).write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    srv.device_op_lock = None
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: 32)
+    monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})
+    monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    srv.isolated_chips = set()
+    srv.device_pci_map = {}
+    srv.device_fault_reported = ""
+    fsm_dirty(srv, "", why="gate_error")
+
+    async def unhealthy(expected, log, run_fabric=True, **_):
+        return False, {"snapshot": {"ok": False, "detail": "chips 24-31 off the bus"}}
+
+    async def no_mesh_reset(indices, log):
+        raise AssertionError("a FAST episode reached the mesh-wide reset")
+
+    patch_recovery(monkeypatch, "_verify_device", unhealthy)
+    patch_recovery(monkeypatch, "_reset_and_verify_device", no_mesh_reset)
+    rig["beats"] = _beats_without(_off(rig["map"], {3: 8}))
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+
+    assert (rig["captures"], rig["rescans"], rig["cycles"]) == (1, 1, 1)
+    assert rig["g"]._td["path"] == "FAST"
+    assert ("tray_down_latched", {"path": "FAST", "off_per_tray": {3: 8}, "expected": 32}) in rig["events"]
+
+
+@pytest.mark.asyncio
 async def test_a_tray_missing_at_the_first_idle_sighting_is_an_onset(rig):
     """Startup and the idle relift count as a first sighting: the bus is read when no beats are passed."""
     rig["beats"] = _beats_without(_off(rig["map"], {2: 8}))
@@ -357,7 +422,7 @@ def test_the_capture_meets_its_deadline_survives_a_missing_tool_and_fsyncs_the_b
     onset = {"off_per_tray": {3: 8}, "off": list(range(24, 32)), "expected": 32, "epoch": 1000.0}
     try:
         summary = bmc_capture.capture_tray_down(
-            tmp_path, onset, trays=[3], bridges=["0000:c1:00.0"], deadline_sec=0.3, run=run
+            tmp_path, onset, trays=[3], pci_targets=["0000:c1:00.0"], deadline_sec=0.3, run=run
         )
     finally:
         release.set()
@@ -367,3 +432,48 @@ def test_the_capture_meets_its_deadline_survives_a_missing_tool_and_fsyncs_the_b
     assert "not installed" in text and "deadline" in text and "ok" in text
     assert json.loads((tmp_path / "onset.json").read_text())["off_per_tray"] == {"3": 8}
     assert len(synced) >= 3, "bmc.txt, onset.json and the directory are fsync'd before the cycle"
+
+
+def _sysfs_tree(tmp_path):
+    """A /sys/bus/pci/devices look-alike: links into a device tree where each chip sits under its
+    own bridge. Chip 01 is still enumerated; chip 02 has left the bus (its bridge stays, pointing
+    at the empty bus 2); bus 03 has no bridge at all."""
+    tree = tmp_path / "tree" / "pci0000:00"
+    devices = tmp_path / "devices"
+    devices.mkdir()
+    for bridge_addr, sec in (("0000:00:01.1", 1), ("0000:00:01.2", 2)):
+        (tree / bridge_addr).mkdir(parents=True)
+        (tree / bridge_addr / "secondary_bus_number").write_text(f"{sec}\n")
+        (devices / bridge_addr).symlink_to(tree / bridge_addr)
+    (tree / "0000:00:01.1" / "0000:01:00.0").mkdir()
+    (devices / "0000:01:00.0").symlink_to(tree / "0000:00:01.1" / "0000:01:00.0")
+    return devices
+
+
+def test_lspci_targets_the_bridge_above_each_off_chip(tmp_path, monkeypatch):
+    """The bridge keeps the link status when the endpoint drops: it is found by the sysfs parent
+    while the endpoint is listed, and by its secondary bus once it is gone. The endpoint is added
+    only while present; an address with no bridge or a malformed one adds nothing."""
+    monkeypatch.setattr(pci, "PCI_DEVICES_DIR", _sysfs_tree(tmp_path))
+    assert bmc_capture.upstream_bridge("0000:01:00.0") == "0000:00:01.1"
+    assert bmc_capture.upstream_bridge("0000:02:00.0") == "0000:00:01.2", "found with the endpoint gone"
+    assert bmc_capture.upstream_bridge("0000:03:00.0") is None
+    targets = bmc_capture.lspci_targets(["0000:01:00.0", "0000:02:00.0", "0000:03:00.0", "x; reboot", "0000:01:00.0"])
+    assert targets == ["0000:00:01.1", "0000:01:00.0", "0000:00:01.2"]
+    argvs, _ = bmc_capture.capture_argvs([1], targets, 1000.0)
+    assert [a[2] for a in argvs if a[0] == "lspci"] == targets
+
+
+def test_the_capture_reads_the_bridge_of_every_off_chip(galaxy_trays, monkeypatch):
+    """GalaxyRecovery hands every off chip's banked PCI address (I16) to lspci_targets, not only the
+    first chip of each tray, and passes its targets to the capture."""
+    g = srv.galaxy_recovery
+    off = sorted(galaxy_trays[3])
+    seen = {}
+    monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    monkeypatch.setattr(bmc_capture, "lspci_targets", lambda addrs: seen.setdefault("addrs", list(addrs)) and ["b"])
+    monkeypatch.setattr(bmc_capture, "capture_tray_down", lambda bundle, onset, **k: seen.update(k) or {})
+    g._tray_down_capture({"off_per_tray": {3: len(off)}, "off": off, "expected": 32, "epoch": 1000.0}, 32)
+    buses = srv.health_monitor._chip_buses
+    assert seen["addrs"] == [buses[c] for c in off]
+    assert seen["pci_targets"] == ["b"] and seen["trays"] == [3]

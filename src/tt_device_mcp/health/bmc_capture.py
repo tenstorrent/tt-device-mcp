@@ -28,6 +28,8 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Optional
 
+from tt_device_mcp.health.monitors import pci
+
 CAPTURE_DEADLINE_SEC = 10.0
 CALL_TIMEOUT_SEC = 2.0
 JOURNAL_TIMEOUT_SEC = 3.0
@@ -80,7 +82,41 @@ def argv_allowed(argv: list) -> bool:
     return False
 
 
-def capture_argvs(trays: list, bridges: list, onset_epoch: float) -> tuple[list, bool]:
+def upstream_bridge(bdf: str) -> Optional[str]:
+    """The bridge or root port above ``bdf``: the parent of its sysfs node while the endpoint is
+    still enumerated, else the bridge whose secondary bus is the endpoint's bus. The bridge stays
+    on the bus when the endpoint drops, so its LnkSta/LnkCap still say what the link did. A sysfs
+    read only; None when neither finds one."""
+    from tt_device_mcp.health.recovery.stages.bridge_reset import find_bridge_by_secondary_bus
+
+    if not _PCI_ADDR.match(bdf or ""):
+        return None
+    node = pci.PCI_DEVICES_DIR / bdf
+    if node.exists():
+        try:
+            parent = node.resolve().parent.name
+        except OSError:
+            parent = ""
+        if _PCI_ADDR.match(parent):
+            return parent
+    return find_bridge_by_secondary_bus(bdf.lower())
+
+
+def lspci_targets(addrs: list) -> list:
+    """The lspci targets for the off chips' recorded PCI addresses: each one's upstream bridge, and
+    the endpoint too while it is still enumerated. Deduplicated, in order."""
+    out: list = []
+    for addr in addrs:
+        if not _PCI_ADDR.match(addr or ""):
+            continue
+        endpoint = addr if (pci.PCI_DEVICES_DIR / addr).exists() else None
+        for target in (upstream_bridge(addr), endpoint):
+            if target and target not in out:
+                out.append(target)
+    return out
+
+
+def capture_argvs(trays: list, pci_targets: list, onset_epoch: float) -> tuple[list, bool]:
     """Every argv the capture runs, and whether the CPLD reads were included (config present)."""
     argvs: list = [["ipmitool", "sel", "elist", "last", "40"]]
     cfg = cpld_config()
@@ -92,8 +128,8 @@ def capture_argvs(trays: list, bridges: list, onset_epoch: float) -> tuple[list,
                 continue
             for reg in regs:
                 argvs.append(["ipmitool", "raw", "0x06", "0x52", bus, addr, "0x01", reg])
-    for bridge in bridges:
-        argvs.append(["lspci", "-s", bridge, "-vv"])
+    for target in pci_targets:
+        argvs.append(["lspci", "-s", target, "-vv"])
     argvs.append(["journalctl", "-k", f"--since=@{max(0, int(onset_epoch) - 60)}", "--no-pager", "-q"])
     return [a for a in argvs if argv_allowed(a)], cfg is not None
 
@@ -128,7 +164,7 @@ def capture_tray_down(
     onset: dict,
     *,
     trays: list,
-    bridges: list,
+    pci_targets: list,
     deadline_sec: float = CAPTURE_DEADLINE_SEC,
     run: Callable = subprocess.run,
 ) -> dict:
@@ -137,7 +173,7 @@ def capture_tray_down(
     A read still running at the deadline is recorded as such and abandoned (its own per-call timeout
     reaps it shortly after)."""
     t0 = time.monotonic()
-    argvs, cpld = capture_argvs(trays, bridges, onset.get("epoch", time.time()))
+    argvs, cpld = capture_argvs(trays, pci_targets, onset.get("epoch", time.time()))
     results: dict = {}
     pool = ThreadPoolExecutor(max_workers=max(1, len(argvs)))
     try:

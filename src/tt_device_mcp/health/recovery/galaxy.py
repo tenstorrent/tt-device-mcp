@@ -1216,8 +1216,8 @@ class GalaxyRecovery(Recovery):
     # The episode latch lives on this instance: set at the first off-bus sighting of an episode,
     # before any reset, and never re-derived while the episode is open, because a ladder reset can
     # itself turn a 1-chip drop into a whole tray off. tray_down_episode_end() clears it when the
-    # mesh is released; a broker restart or a reboot starts with none (a tray still missing then is
-    # a fresh onset).
+    # mesh is released. Deliberately not persisted: a broker restart or a reboot starts with none
+    # and latches again at its first sighting; the power-cycle guard's own ledger is on disk.
     _td: Optional[dict] = None
     _td_reset_seen: bool = False
 
@@ -1269,16 +1269,14 @@ class GalaxyRecovery(Recovery):
         buses = (self.deps.chip_buses_provider() if self.deps.chip_buses_provider else None) or {}
         tray_map = self._tray_map_now() or {}
         trays = sorted(int(t) for t in onset.get("off_per_tray", {}))
-        # The endpoint of the first chip off on each tray: lspci then shows whether the kernel still
-        # sees the device behind the link, which the power cycle is about to erase.
-        bridges = []
-        for t in trays:
-            chip = next((c for c in tray_map.get(t, []) if c in onset.get("off", [])), None)
-            addr = (buses.get(chip) or buses.get(str(chip))) if chip is not None else None
-            if addr:
-                bridges.append(addr)
+        # lspci on the bridge above every off chip, found from the chip's banked PCI address: the
+        # bridge stays enumerated when the endpoint drops, so its link status survives, and the
+        # power cycle is about to erase it. The endpoint too while the kernel still lists it.
+        off = set(onset.get("off") or [])
+        addrs = [buses.get(c) or buses.get(str(c)) for t in trays for c in sorted(tray_map.get(t, [])) if c in off]
+        targets = bmc_capture.lspci_targets([a for a in addrs if a])
         return bmc_capture.capture_tray_down(
-            bundle if isinstance(bundle, Path) else None, onset, trays=trays, bridges=bridges
+            bundle if isinstance(bundle, Path) else None, onset, trays=trays, pci_targets=targets
         )
 
     async def tray_down_fast_path(self, expected: int, log, *, phase: str) -> str:
