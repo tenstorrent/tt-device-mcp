@@ -3790,18 +3790,6 @@ async def device_health_gate(
             fsm.on_outcome(outcome)
             return outcome == OUTCOME_RECOVERED
 
-        # A tray-down onset (spec 04 I18) takes none of the rungs below, whatever the router named:
-        # escalate() diverts it to the fast path (capture, one rescan, the power cycle through its
-        # guard, or a hold with no reset). The latch is read here so a stage the router would only
-        # hold on (a DEFER, a WAIT) still reaches the fast path on its first sighting.
-        if ev.off_bus and not ev.scope_active and await galaxy_recovery._tray_down_path(expected, beats) == "FAST":
-            if await _fire(STAGE_POWER_CYCLE):
-                return
-            _log(
-                "device did NOT verify healthy this pass: a tray is down; it stays flagged and no tenant job runs on it"
-            )
-            return
-
         if stage == DEFER and gone_queued:
             # A foreign reset scope opened between queueing these gone chips and here (the
             # two-sample settle is the window), so the surgical rung is skipped and the reset below

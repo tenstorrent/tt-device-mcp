@@ -263,33 +263,46 @@ each rung fires only when the gentler one failed or cannot apply.
   Reading a scope is a separate question from starting one — `scope_active` keys on systemd alone,
   so an unprivileged daemon still adopts a root broker's reset rather than racing it (I5).
 
-- **I18 — A tray that is down at its first sighting is power-cycled, never swept.** On a Galaxy
-  (`expected` at least two trays' worth of chips), the first off-bus sighting of an episode is
-  latched before any reset fires: if the I16 tray map places every off chip and puts 4 or more
-  (`TRAY_DOWN_MIN_CHIPS`) on one tray, the episode is a tray-down onset and takes the fast path —
-  capture the onset evidence, one PCI rescan, re-check, then the power cycle through its usual
-  guard (opt-in, tenant guard, cooldown, boot loop). It never takes a bridge SBR, a tray re-power,
-  `tt-smi -glx_reset` or the last-chance sweep. If the guard denies the power cycle, the broker
-  holds with zero resets, and the gate, the idle relift and the hold-deadline watchdog only
-  re-read the bus and re-ask the guard; none of them starts the ladder. If the re-check finds every
-  chip back and the full verify (fabric included) passes, the mesh is released with no power
-  cycle; every chip back but not verifying, or no tray left at 4+, hands the episode to the ladder.
-  Everything else keeps the ladder: the whole bus off (it has its own route straight to the cold
-  rung), no banked map, a chip the map does not place, fewer than 4 off on every tray, or an off
-  set first seen after a reset already fired this episode (a ladder reset can itself turn a 1-chip
-  drop into a whole tray off). The latch is held in memory until the gate releases the mesh and is
+- **I18 — A tray that is down at its first sighting gets one rescan and a read-only capture, then
+  the full ladder.** On a Galaxy (`expected` at least two trays' worth of chips), the first off-bus
+  sighting of an episode is latched before any reset fires: if the I16 tray map places every off
+  chip and puts 4 or more (`TRAY_DOWN_MIN_CHIPS`) on one tray, the episode is a tray-down onset.
+  Before the ladder's first rung, an onset gets, in this order: (1) one PCI rescan; (2) a read-only
+  capture of the BMC, CPLD and PCIe state, under one deadline (`CAPTURE_DEADLINE_SEC`, 10 s); then
+  (3) the full reset ladder, exactly as it runs without the prelude — the same stage from the
+  router, the same evidence, the same rungs, the same last-chance sweep; and (4) the power cycle
+  only from the ladder's own host rung, when the ladder has failed, under the same guard (opt-in,
+  tenant guard, cooldown, boot loop). The prelude never picks, skips or adds a rung and never
+  power-cycles. The one exception is a rescan that brings every chip back onto a mesh that passes
+  the full verify (fabric included): the mesh is released and the ladder is not needed. Every chip
+  back but not verifying, or any chip still off, runs the ladder. The rescan writes to the PCI
+  subsystem, so it waits while a tenant holds the device (or the holder scan is incomplete); the
+  capture only reads and never waits. Each runs once per episode, before that pass's ladder.
+  Everything else gets no prelude and keeps the ladder: the whole bus off (it has its own route
+  straight to the cold rung), no banked map, a chip the map does not place, fewer than 4 off on
+  every tray, or an off set first seen after a reset — one fired by the ladder this episode, any
+  `reset_with_quiesce` since the mesh was last released (the reset tool and the HTTP reset
+  included), one still in flight, or a live reset scope (a reset can itself turn a 1-chip drop
+  into a whole tray off). The latch is held in memory until the gate releases the mesh and is
   deliberately not persisted: a restarted broker starts with none and takes the latch again the
-  first time it sees the episode, so a tray still missing then is classified afresh (a second
-  capture, into a new bundle). That buys no extra power cycle: the guard's interval and per-boot
-  cap live in the on-disk auto-recovery ledger, not in the latch. The capture is
-  read-only by construction (a fixed allow-list of argv shapes), runs under one deadline
-  (`CAPTURE_DEADLINE_SEC`, 10 s) and is fsync'd into the incident bundle before the power cycle.
-  CPLD bus, address and register numbers come only from the broker's config
-  (`TT_DEVICE_MCP_TRAY_CPLD_*`, spec 06); without them the CPLD reads are skipped and journalled,
-  and the SEL, lspci and kernel-log reads still run. A CPLD read is one register, never an
+  first time it sees the episode, so a tray still missing then gets a second rescan and capture
+  (into a new bundle) before its ladder. That buys no extra power cycle: the ladder and its guard
+  are the same, and the guard's interval and per-boot cap live in the on-disk auto-recovery
+  ledger. The capture is read-only by construction (a fixed allow-list of argv shapes) and is
+  fsync'd to disk before the first rung: into the `tray_down` incident bundle, or, when none was
+  written, a `<stamp>_tray_down_bmc` directory of its own under the incidents root. It reads the
+  BMC SEL, sensors (`sdr elist`) and controller state (`mc info`), `lspci -vv` of the upstream
+  bridge of every off chip, the kernel log since the onset, and, when configured, the CPLD of
+  every configured tray (the trays that stayed up are the baseline) and of the power-distribution
+  board. CPLD bus, address and register numbers come only from the broker's config
+  (`TT_DEVICE_MCP_TRAY_CPLD_*`, `TT_DEVICE_MCP_PDB_CPLD_*`, spec 06); without them those reads are
+  skipped and journalled while the rest still run. A CPLD read is one register, never an
   index/data pair: that needs an index write to a tray that has just dropped, and costs time
-  against the deadline. `TT_DEVICE_MCP_TRAY_DOWN_ACTION=legacy_sweep`
-  is the opt-out: every drop takes the ladder as before.
+  against the deadline. The last tt-smi telemetry is not read again: the gate's `unhealthy` bundle,
+  written just before, holds the sampler's telemetry ring, and the `tray_down` bundle's
+  `incident.json` holds the live per-chip PCI snapshot. Because the prelude changes no ladder
+  decision, it is safe on any Galaxy the tray map covers. `TT_DEVICE_MCP_TRAY_DOWN_CAPTURE=0`
+  turns the prelude off: every drop takes the ladder alone.
 
 ## Interfaces
 
@@ -422,24 +435,22 @@ power-cycle cooldown/boot-loop denials as the generic path; the classification i
 `bridge_reset_failed` reads as *unknown*, never `no_bridge`, so the aggressive sweep can never fire
 on an unproven window.
 
-**The tray-down fast path (I18).** Every caller of the ladder (`escalate()`: the gate, the idle
-relift, the hold-deadline watchdog) asks `_tray_down_path` first, and the gate asks it before
-routing too, so a stage the router would only hold on (a `DEFER`, a `WAIT`) still reaches the fast
-path at the first sighting. A `FAST` episode goes to `tray_down_fast_path`: while a reset scope is
-live or a tenant holds the device it holds; otherwise its first pass captures (`bmc_capture`: SEL,
-`lspci -vv` of the upstream bridge above every off chip, so its link status (LnkSta/LnkCap) is kept
-even when the endpoint is gone, plus the endpoint while it is still enumerated, the kernel log
-since the onset and, when configured, the tray CPLD registers, concurrently under one deadline,
-each call under its own timeout). The bridge is the parent of the chip's sysfs node, found from
-the banked PCI address (I16), or, once the node is gone, the bridge whose secondary bus is the
-chip's bus. Then it writes `1` to
-`/sys/bus/pci/rescan`, waits `TRAY_DOWN_RESCAN_SETTLE_SEC`, and re-reads the heartbeats. Later
-passes skip the capture and the rescan. A tray still at 4+ (or the whole bus off) goes to the
-power-cycle guard: allowed fires `auto_power_cycle_host`; denied journals `tray_down_held` once
-and holds. One `TRAY-DOWN:` error line names the trays, the chips off, the rescan result and the
-action. `tray_down_latched` journals the class when the latch is set. So with the fast path on (the
-default), the `TRAY_DOWN_NO_WINDOW` branch above is reached only by a drop that was not a tray-down
-onset at its first sighting, or under `legacy_sweep`.
+**The tray-down prelude (I18).** Every caller of the ladder (`escalate()`: the gate, the idle
+relift, the hold-deadline watchdog) passes through `_tray_down_latch` first, which latches
+`TRAY_DOWN` or `PARTIAL` at the first sighting (journalled as `tray_down_latched`, with whether a
+reset came first). A `TRAY_DOWN` episode whose prelude has not run goes to `_tray_down_prelude`:
+with no tenant it writes `1` to `/sys/bus/pci/rescan`; it then captures (`bmc_capture`, all reads
+concurrent, each under its own timeout — 8 s for the BMC, which answers slowly while a tray browns
+out — and the whole under the 10 s deadline); it waits what is left of
+`TRAY_DOWN_RESCAN_SETTLE_SEC` and re-reads the heartbeats. The lspci target is the parent of the
+chip's sysfs node, found from the banked PCI address (I16), or, once the node is gone, the bridge
+whose secondary bus is the chip's bus, so the link status (LnkSta/LnkCap) is kept even when the
+endpoint is gone; the endpoint is read too while it is still enumerated. One `TRAY-DOWN:` error
+line names the trays, the chips off, the rescan result and the capture, and says the full ladder
+follows; `tray_down_prelude` journals the same. Then `escalate()` dispatches the caller's own
+ladder with the caller's own stage, indices, evidence and beats, so the `TRAY_DOWN_NO_WINDOW`
+branch above, the generic walk, the mesh-wide reset, the last-chance sweep and the host rungs run
+as they would have.
 
 **The last-chance reset sweep gates EVERY host rung.** A reboot or a power cycle takes the whole box
 down and costs minutes, so before paying that the ladder re-issues every reset type once more,
@@ -620,17 +631,18 @@ NOT be conflated when reading results.
 | I16 a short read, an unreadable chip, or a read tt-smi disagrees with never overwrites a banked map; a matching full read changes nothing | `tests/test_ubb_tray_map.py::test_a_short_or_disagreeing_read_never_overwrites_the_banked_map`, `::test_a_full_read_that_matches_the_banked_map_changes_nothing` |
 | I16 tt-smi's bus list drifting journals `bus_map_drift`; the list stands | `tests/test_ubb_tray_map.py::test_a_drifted_snapshot_journals_but_leaves_the_cached_map_standing` |
 | I16 a new GLX board type this build cannot map surfaces as `ubb_tray_table_missing` | `tests/test_ubb_tray_map.py::test_a_glx_board_type_with_no_matching_arch_suffix_journals_once` |
-| I18 a tray with 4+ chips off at first sighting is an onset; no map, an unplaced chip, or fewer off keeps the ladder | `tests/test_tray_down_fast_path.py::test_a_tray_with_four_or_more_chips_off_is_a_tray_down_onset`, `::test_no_map_or_an_unplaced_chip_never_classifies_fast` |
-| I18 replay: no recorded episode that recovered without a power cycle takes the fast path | `tests/test_tray_down_fast_path.py::test_replay_every_recoverable_episode_keeps_the_ladder` (fixture `tests/fixtures/tray_down_replay.tsv`) |
-| I18 an onset captures, rescans once and power-cycles with no reset | `tests/test_tray_down_fast_path.py::test_a_tray_down_onset_captures_rescans_and_power_cycles_with_no_reset`, `::test_a_tray_missing_at_the_first_idle_sighting_is_an_onset` |
-| I18 a denied power cycle holds with zero resets; the watchdog does not start the ladder | `tests/test_tray_down_fast_path.py::test_a_denied_power_cycle_holds_with_zero_resets_and_the_watchdog_does_not_start_the_ladder` |
-| I18 after the rescan: every chip back runs the full verify; no tray left at 4+ hands over to the ladder | `tests/test_tray_down_fast_path.py::test_every_chip_back_after_the_rescan_runs_the_full_verify`, `::test_every_tray_below_four_after_the_rescan_hands_the_episode_to_the_ladder` |
-| I18 the latch holds through a reset and is fresh after the episode | `tests/test_tray_down_fast_path.py::test_the_latch_does_not_change_after_a_reset_and_is_fresh_after_the_episode` |
-| I18 the latch is not persisted: a restarted broker latches a tray still missing afresh, and the power cycle still goes through its guard | `tests/test_tray_down_fast_path.py::test_a_restarted_broker_latches_a_tray_still_missing_afresh` |
-| I18 the gate (`device_health_gate`) diverts a tray-down onset to the fast path with no reset | `tests/test_tray_down_fast_path.py::test_the_gate_takes_the_fast_path_for_a_tray_down_onset` |
-| I18 `legacy_sweep` and the whole bus off keep their routes | `tests/test_tray_down_fast_path.py::test_legacy_sweep_keeps_todays_ladder`, `::test_the_whole_bus_off_keeps_its_own_route` |
-| I18 the capture is read-only, CPLD reads come only from config, and it meets its deadline and fsyncs | `tests/test_tray_down_fast_path.py::test_the_allow_list_refuses_anything_but_the_read_shapes`, `::test_cpld_reads_come_only_from_config`, `::test_the_capture_meets_its_deadline_survives_a_missing_tool_and_fsyncs_the_bundle` |
-| I18 lspci targets the upstream bridge of every off chip, by sysfs parent or secondary bus, plus the endpoint while present | `tests/test_tray_down_fast_path.py::test_lspci_targets_the_bridge_above_each_off_chip`, `::test_the_capture_reads_the_bridge_of_every_off_chip` |
+| I18 a tray with 4+ chips off at first sighting is an onset; no map, an unplaced chip, or fewer off gets no prelude | `tests/test_tray_down_prelude.py::test_a_tray_with_four_or_more_chips_off_is_a_tray_down_onset`, `::test_no_map_or_an_unplaced_chip_never_classifies_as_tray_down`, `::test_one_to_three_chips_off_get_no_prelude` |
+| I18 replay: no recorded episode that recovered without a power cycle gets the prelude | `tests/test_tray_down_prelude.py::test_replay_the_prelude_runs_only_on_onsets_that_never_recovered_without_a_power_cycle` (fixture `tests/fixtures/tray_down_replay.tsv`) |
+| I18 order: rescan, capture, the full ladder, the power cycle only when the ladder fails | `tests/test_tray_down_prelude.py::test_a_tray_down_onset_rescans_captures_then_runs_the_full_ladder_and_power_cycles_only_when_it_fails`, `::test_a_ladder_that_recovers_the_tray_fires_no_power_cycle`, `::test_the_last_chance_sweep_still_gates_the_power_cycle_of_a_tray_down` |
+| I18 the prelude changes no ladder input (same stage, indices, evidence, beats and rungs as with it off) | `tests/test_tray_down_prelude.py::test_the_prelude_changes_no_ladder_input`, `::test_capture_off_runs_the_ladder_alone` |
+| I18 once per episode from any caller; a tenant defers the rescan, never the capture | `tests/test_tray_down_prelude.py::test_the_prelude_runs_once_per_episode_from_any_caller`, `::test_a_tenant_defers_the_rescan_but_not_the_capture` |
+| I18 after the rescan: every chip back runs the full verify and stops only if it passes | `tests/test_tray_down_prelude.py::test_every_chip_back_after_the_rescan_runs_the_full_verify_and_stops`, `::test_chips_back_on_a_mesh_that_fails_verify_still_get_the_full_ladder` |
+| I18 an off set first seen after a reset (the ladder's, a manual `reset_with_quiesce`, one in flight, a live scope) is not an onset; the latch is fresh after the episode | `tests/test_tray_down_prelude.py::test_the_latch_does_not_change_after_a_reset_and_is_fresh_after_the_episode`, `::test_a_manual_reset_before_the_first_sighting_is_not_an_onset`, `::test_a_reset_in_flight_or_a_live_scope_is_not_an_onset` |
+| I18 the latch is not persisted: a restarted broker latches a tray still missing afresh, and buys no power cycle | `tests/test_tray_down_prelude.py::test_a_restarted_broker_latches_a_tray_still_missing_afresh` |
+| I18 the gate (`device_health_gate`) runs the prelude, then its own rung | `tests/test_tray_down_prelude.py::test_the_gate_runs_the_prelude_then_its_ladder_end_to_end` |
+| I18 the whole bus off keeps its own route | `tests/test_tray_down_prelude.py::test_the_whole_bus_off_keeps_its_own_route` |
+| I18 the capture is read-only, CPLD reads (every configured tray, the PDB) come only from config, BMC reads get the long timeout, it meets its deadline, fsyncs, and is written even with no incident bundle | `tests/test_tray_down_prelude.py::test_the_allow_list_refuses_anything_but_the_read_shapes`, `::test_cpld_reads_come_only_from_config_and_cover_every_configured_tray`, `::test_bmc_reads_get_the_long_timeout_inside_the_deadline`, `::test_the_capture_meets_its_deadline_survives_a_missing_tool_and_fsyncs_the_bundle`, `::test_a_missing_incident_bundle_still_gets_the_bmc_reads_written` |
+| I18 lspci targets the upstream bridge of every off chip, by sysfs parent or secondary bus, plus the endpoint while present | `tests/test_tray_down_prelude.py::test_lspci_targets_the_bridge_above_each_off_chip`, `::test_the_capture_reads_the_bridge_of_every_off_chip` |
 | Tray rung: plan/walk semantics, fabric-gated clear, decline cases | `tests/test_device_safety.py::test_ubb_reset_plan_maps_a_clean_whole_tray_drop_to_its_bitmap`, `tests/test_device_safety.py::test_ubb_tray_walk_plan_orders_affected_trays_first_then_the_rest`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_stops_as_soon_as_the_mesh_is_healthy`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_does_not_clear_a_hold_on_an_unverified_fabric`, `tests/test_device_safety.py::test_ubb_tray_reset_declines_a_fully_off_bus_mesh_it_is_the_cold_rung`, `tests/test_device_safety.py::test_maybe_emit_ubb_reset_required_names_the_exact_bmc_command_on_a_tray_down`, `tests/test_device_safety.py::test_the_tray_reset_rung_is_armed_by_default` |
 | Tray fire argv/handshake (tt-smi compat, off-bus chip skipped) | `tests/test_ubb_reset_launch.py::test_fire_ubb_reset_imports_a_symbol_the_installed_tt_smi_defines`, `tests/test_ubb_reset_launch.py::test_fire_ubb_reset_pulses_the_tray_when_a_chip_is_already_off_the_bus`, `tests/test_ubb_reset_launch.py::test_fire_ubb_reset_falls_back_to_the_chip_reset_class_on_older_tt_smi` |
 | Tray rung's two branches: no-window sweep vs generic walk, classified once from threaded evidence, opt-out honoured | `tests/test_ladder_v2.py::test_classify_hold_names_the_two_branches`, `tests/test_ladder_v2.py::test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep`, `tests/test_ladder_v2.py::test_gate_partial_tray_or_a_bridge_window_takes_the_generic_walk`, `tests/test_ladder_v2.py::test_gate_tray_down_no_window_names_the_command_and_holds_when_not_opted_in`, `tests/test_ladder_v2.py::test_bridge_rung_records_no_bridge_and_it_survives_the_server_replace` |

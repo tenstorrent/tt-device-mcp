@@ -134,6 +134,9 @@ class RecoveryMechanism:
         # nothing else: during a fabric check or a health probe, chips going all-ones IS a failure and
         # must still be acted on — that is precisely how a host was lost.
         self.reset_in_flight = False
+        # Any reset_with_quiesce (the ladder's or a manual one) since the mesh was last released:
+        # an off-bus set first seen after it is the reset's doing, never a tray-down onset (04 I18).
+        self.reset_since_release = False
 
         # The full transcript of the last reset, not the 3-line tail the journal carries: when a
         # mesh is left half-alive, the interesting line is usually somewhere in the middle.
@@ -524,6 +527,7 @@ class RecoveryMechanism:
         # mid-reset and tears the endpoints out of the kernel, which is how a healthy host ended
         # up with no devices at all.
         self.reset_in_flight = True
+        self.reset_since_release = True
         cancelled_mid = False
         rc = None
         try:

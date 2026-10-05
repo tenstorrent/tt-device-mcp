@@ -3,18 +3,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """Read-only BMC/CPLD/PCIe evidence at a tray-down onset (spec 04 I18, issue #26).
 
-A tray that leaves the bus is power-cycled within seconds of the first sighting, and the power
-cycle erases the one state that explains it: the tray CPLD's power-good and fault latches, the
-BMC's SEL, the bridge's link status, the kernel's account of the drop. So the fast path copies
-them first, concurrently, under one deadline, and fsyncs them into the incident bundle before
-anything is power-cycled.
+The reset ladder that follows a tray-down onset (and the power cycle, when the ladder fails)
+erases the state that explains the drop: the tray and PDB CPLDs' power-good and fault latches,
+the BMC's SEL and sensors, the bridge's link status, the kernel's account of the drop. So the
+prelude copies them first, concurrently, under one deadline, and fsyncs them to disk before the
+ladder's first rung.
 
 Read-only by construction: every argv is checked against a fixed shape allow-list before it is
-spawned, and a CPLD read is ``ipmitool raw 0x06 0x52 <bus> <addr> 0x01 <reg>`` (master
-write-read, one register byte selected, one byte read). Nothing else of ``ipmitool raw`` passes.
-The bus, address and register numbers are site data, never shipped in code: they come from
-``TT_DEVICE_MCP_TRAY_CPLD_BUSES``/``_ADDR``/``_REGS``, and without all three the CPLD reads are
-skipped (journalled) while the SEL, lspci and kernel-log reads still run.
+spawned. A CPLD read is ``ipmitool raw 0x06 0x52 <bus> <addr> 0x01 <reg>`` (master write-read,
+one register byte selected, one byte read): a direct register read, never an index/data pair,
+so nothing is ever written to a CPLD. Nothing else of ``ipmitool raw`` passes. The bus, address
+and register numbers are site data, never shipped in code: the tray CPLDs come from
+``TT_DEVICE_MCP_TRAY_CPLD_BUSES``/``_ADDR``/``_REGS`` and the PDB CPLD from
+``TT_DEVICE_MCP_PDB_CPLD_BUS``/``_ADDR``/``_REGS``. Each set is all-or-nothing; without it those
+reads are skipped (journalled) while the SEL, sensor, BMC, lspci and kernel-log reads still run.
+Every configured tray's CPLD is read, not only the dropped one's, so the healthy trays give the
+baseline to compare against.
+
+The last tt-smi telemetry is deliberately not read again here: the gate's own ``unhealthy``
+incident bundle, written just before, holds the sampler's telemetry ring, and the ``tray_down``
+bundle's ``incident.json`` holds the live per-chip PCI snapshot.
 """
 
 from __future__ import annotations
@@ -31,8 +39,19 @@ from typing import Callable, Optional
 from tt_device_mcp.health.monitors import pci
 
 CAPTURE_DEADLINE_SEC = 10.0
+# A BMC answers IPMI slowly while a tray is browning out; each read gets most of the deadline,
+# and all of them run at once, so the capture still ends within CAPTURE_DEADLINE_SEC.
+BMC_CALL_TIMEOUT_SEC = 8.0
 CALL_TIMEOUT_SEC = 2.0
 JOURNAL_TIMEOUT_SEC = 3.0
+_IPMI_FIXED = (
+    ["ipmitool", "sel", "elist", "last", "40"],
+    ["ipmitool", "sdr", "elist"],
+    ["ipmitool", "mc", "info"],
+)
+
+# The spawner, one name the test suite's isolation can replace (spec 09 I1: no real subprocess).
+_RUN: Callable = subprocess.run
 
 _HEX_BYTE = re.compile(r"^0x[0-9a-fA-F]{1,2}$")
 _PCI_ADDR = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
@@ -62,13 +81,34 @@ def cpld_config() -> Optional[tuple[dict, str, list]]:
     return buses, addr, regs
 
 
+def pdb_cpld_config() -> Optional[tuple[str, str, list]]:
+    """``(i2c bus, cpld address, [registers])`` of the power-distribution board's CPLD, from
+    ``TT_DEVICE_MCP_PDB_CPLD_BUS``/``_ADDR``/``_REGS``, or None when any is unset or malformed
+    (all-or-nothing, like :func:`cpld_config`)."""
+    bus = os.environ.get("TT_DEVICE_MCP_PDB_CPLD_BUS", "").strip()
+    addr = os.environ.get("TT_DEVICE_MCP_PDB_CPLD_ADDR", "").strip()
+    regs = [r.strip() for r in os.environ.get("TT_DEVICE_MCP_PDB_CPLD_REGS", "").split(",") if r.strip()]
+    if not (bus and addr and regs) or not all(_HEX_BYTE.match(x) for x in (bus, addr, *regs)):
+        return None
+    return bus, addr, regs
+
+
+def fallback_bundle() -> Path:
+    """A bundle directory of its own for the capture when no incident bundle was written (incident
+    capture switched off, or it failed), so the BMC/CPLD reads are never dropped for want of one."""
+    from tt_device_mcp.health import evidence
+
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return evidence.HEALTH_DIR / evidence.INCIDENTS_DIR / f"{stamp}_tray_down_bmc"
+
+
 def argv_allowed(argv: list) -> bool:
     """Whether ``argv`` is one of the read-only shapes this module may spawn. The only gate between
     a config value and a BMC command, so it is shape-exact rather than a prefix match."""
     if not argv:
         return False
     a = list(argv)
-    if a == ["ipmitool", "sel", "elist", "last", "40"]:
+    if any(a == fixed for fixed in _IPMI_FIXED):
         return True
     if len(a) == 8 and a[:2] == ["ipmitool", "raw"]:
         netfn, cmd, bus, addr, count, reg = a[2:]
@@ -116,26 +156,30 @@ def lspci_targets(addrs: list) -> list:
     return out
 
 
-def capture_argvs(trays: list, pci_targets: list, onset_epoch: float) -> tuple[list, bool]:
-    """Every argv the capture runs, and whether the CPLD reads were included (config present)."""
-    argvs: list = [["ipmitool", "sel", "elist", "last", "40"]]
+def capture_argvs(pci_targets: list, onset_epoch: float) -> tuple[list, dict]:
+    """Every argv the capture runs, and which CPLD sets were included (config present). Every
+    configured tray's CPLD is read: the trays that stayed up are the baseline for the one that
+    dropped."""
+    argvs: list = [list(a) for a in _IPMI_FIXED]
     cfg = cpld_config()
     if cfg is not None:
         buses, addr, regs = cfg
-        for tray in trays:
-            bus = buses.get(tray)
-            if bus is None:
-                continue
+        for tray in sorted(buses):
             for reg in regs:
-                argvs.append(["ipmitool", "raw", "0x06", "0x52", bus, addr, "0x01", reg])
+                argvs.append(["ipmitool", "raw", "0x06", "0x52", buses[tray], addr, "0x01", reg])
+    pdb = pdb_cpld_config()
+    if pdb is not None:
+        bus, addr, regs = pdb
+        for reg in regs:
+            argvs.append(["ipmitool", "raw", "0x06", "0x52", bus, addr, "0x01", reg])
     for target in pci_targets:
         argvs.append(["lspci", "-s", target, "-vv"])
     argvs.append(["journalctl", "-k", f"--since=@{max(0, int(onset_epoch) - 60)}", "--no-pager", "-q"])
-    return [a for a in argvs if argv_allowed(a)], cfg is not None
+    return [a for a in argvs if argv_allowed(a)], {"tray": cfg is not None, "pdb": pdb is not None}
 
 
 def _run_one(argv: list, run: Callable) -> str:
-    timeout = JOURNAL_TIMEOUT_SEC if argv[0] == "journalctl" else CALL_TIMEOUT_SEC
+    timeout = {"journalctl": JOURNAL_TIMEOUT_SEC, "ipmitool": BMC_CALL_TIMEOUT_SEC}.get(argv[0], CALL_TIMEOUT_SEC)
     try:
         p = run(argv, capture_output=True, text=True, timeout=timeout)
         return f"exit {p.returncode}\n{p.stdout or ''}{p.stderr or ''}"
@@ -165,15 +209,17 @@ def capture_tray_down(
     *,
     trays: list,
     pci_targets: list,
+    all_trays: Optional[list] = None,
     deadline_sec: float = CAPTURE_DEADLINE_SEC,
-    run: Callable = subprocess.run,
+    run: Optional[Callable] = None,
 ) -> dict:
     """Run every allowed read concurrently, stop waiting at ``deadline_sec``, and write ``bmc.txt``
     and ``onset.json`` into ``bundle`` (fsync'd). Never raises; returns a summary for the journal.
     A read still running at the deadline is recorded as such and abandoned (its own per-call timeout
     reaps it shortly after)."""
+    run = run or _RUN
     t0 = time.monotonic()
-    argvs, cpld = capture_argvs(trays, pci_targets, onset.get("epoch", time.time()))
+    argvs, cpld = capture_argvs(pci_targets, onset.get("epoch", time.time()))
     results: dict = {}
     pool = ThreadPoolExecutor(max_workers=max(1, len(argvs)))
     try:
@@ -186,7 +232,10 @@ def capture_tray_down(
     summary = {
         "reads": len(argvs),
         "finished": sum(1 for v in results.values() if "deadline" not in v),
-        "cpld": "read" if cpld else "skipped (no TT_DEVICE_MCP_TRAY_CPLD_* config)",
+        "trays": list(trays),
+        "all_trays": list(all_trays or []),
+        "cpld": "read" if cpld["tray"] else "skipped (no TT_DEVICE_MCP_TRAY_CPLD_* config)",
+        "pdb_cpld": "read" if cpld["pdb"] else "skipped (no TT_DEVICE_MCP_PDB_CPLD_* config)",
         "elapsed_sec": round(time.monotonic() - t0, 2),
         "bundle": str(bundle) if bundle else None,
     }

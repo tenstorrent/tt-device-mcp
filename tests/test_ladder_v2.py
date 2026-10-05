@@ -24,13 +24,6 @@ from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.recovery import Evidence, galaxy
 
 
-@pytest.fixture(autouse=True)
-def _legacy_tray_down_action(monkeypatch):
-    """These tests pin the ladder's tray-down rungs, which a whole-tray onset now bypasses by
-    default (spec 04 I18); ``legacy_sweep`` is the config that keeps them, so they run under it."""
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_DOWN_ACTION", "legacy_sweep")
-
-
 async def _async_true(*a, **k):
     return True
 
