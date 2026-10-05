@@ -30,6 +30,8 @@ BH_CHIP_BUSES = {
     for n, chip in enumerate(range(base, base + 8), start=1)
 }
 REPLAY = pathlib.Path(__file__).parent / "fixtures" / "tray_down_replay.tsv"
+# The real one, taken before the rig fixture stubs it out.
+_REAL_CLEAR_FAULT = srv._clear_device_reported_fault
 
 
 def _off(tray_map, spec: dict) -> set:
@@ -287,6 +289,29 @@ async def test_every_chip_back_after_the_rescan_runs_the_full_verify_and_stops(r
     assert out == galaxy.OUTCOME_RECOVERED and verified["n"] == 1
     assert rig["order"] == ["rescan", "capture"], "no rung, no power cycle"
     assert rig["g"]._td is None, "a recovered episode closes the latch"
+
+
+@pytest.mark.asyncio
+async def test_a_rescan_recovery_keeps_the_runtime_fault_and_un_isolates_the_chips(rig, monkeypatch):
+    """As for the bridge rung: a rescan re-inits no eth core and the verify cannot see a stuck one,
+    so a runtime-reported fault stays set for the next gate's galaxy reset. The chips that came back
+    leave isolated_chips, so that gate fires no bridge reset on them."""
+    off = _off(rig["map"], {1: 8})
+    rig["beats"] = _beats_without(off)
+    rig["after_rescan"] = _beats_without(set())
+    monkeypatch.setattr(srv, "_clear_device_reported_fault", _REAL_CLEAR_FAULT)
+    monkeypatch.setattr(srv, "device_fault_reported", "job 7 fabric timeout")
+    monkeypatch.setattr(srv, "isolated_chips", {str(c) for c in off})
+
+    async def verify(expected, log, run_fabric=True, **k):
+        return True, {}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    out = await rig["g"].escalate("gate/post-job", [], 32, lambda m: None, stage=galaxy.STAGE_SMI_RESET)
+    assert out == galaxy.OUTCOME_RECOVERED
+    assert srv.device_fault_reported == "job 7 fabric timeout", "the runtime fault is kept"
+    assert "device_fault_cleared" not in _kinds(rig)
+    assert srv.isolated_chips == set(), "the recovered chips are no longer isolated"
 
 
 @pytest.mark.asyncio

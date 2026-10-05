@@ -1300,9 +1300,9 @@ class GalaxyRecovery(Recovery):
     async def _tray_down_prelude(self, expected: int, log, *, phase: str) -> bool:
         """A tray-down onset, before the ladder's first rung: one PCI rescan, then the read-only
         capture, then a re-read of the bus. True only when every chip came back and the full verify
-        (fabric included) passed — the mesh is released and the ladder is not needed. Otherwise
-        False and the caller runs the ladder exactly as it would have; this never resets and never
-        power-cycles.
+        (fabric included) passed — the ladder is not needed; a runtime-reported fault is kept, as by
+        the bridge rung. Otherwise False and the caller runs the ladder exactly as it would have;
+        this never resets and never power-cycles.
 
         The rescan writes to the PCI subsystem, so it waits while a tenant holds the device (or the
         holder scan is unreadable); the capture is read-only and never waits. A rescan that waited
@@ -1343,7 +1343,12 @@ class GalaxyRecovery(Recovery):
                 health_event("tray_down_prelude", rescan=rescan, off=0, healthy=healthy, capture=capture)
                 if healthy:
                     log("tray-down: every chip came back on the PCI rescan and the mesh verified — no reset needed")
-                    self.deps.clear_device_reported_fault(f"{phase}: tray-down chips back after a PCI rescan")
+                    # Back on the bus, so no longer isolated: the next gate must not bridge-reset them.
+                    isolated = self.deps.isolated_chips()
+                    for c in td["off"]:
+                        isolated.discard(str(c))
+                    # Keep a runtime-reported fault, as the bridge rung does: a rescan re-inits no eth
+                    # core and the verify cannot see a stuck one, so only a galaxy reset earns the retire.
                     self.deps.clear_device_dirty(verified=True, why=f"{phase}: tray-down chips back after a PCI rescan")
                     self.tray_down_episode_end()
                     return True

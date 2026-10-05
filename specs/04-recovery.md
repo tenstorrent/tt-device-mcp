@@ -274,8 +274,10 @@ each rung fires only when the gentler one failed or cannot apply.
   only from the ladder's own host rung, when the ladder has failed, under the same guard (opt-in,
   tenant guard, cooldown, boot loop). The prelude never picks, skips or adds a rung and never
   power-cycles. The one exception is a rescan that brings every chip back onto a mesh that passes
-  the full verify (fabric included): the mesh is released and the ladder is not needed. Every chip
-  back but not verifying, or any chip still off, runs the ladder. The rescan writes to the PCI
+  the full verify (fabric included): the ladder is not needed and the chips leave the isolated set.
+  As after the bridge rung, a runtime-reported fault is kept: a rescan re-inits no eth core and the
+  verify cannot see a stuck one, so the fault escalates to the galaxy reset at the next gate. Every
+  chip back but not verifying, or any chip still off, runs the ladder. The rescan writes to the PCI
   subsystem, so it waits while a tenant holds the device (or the holder scan is incomplete); the
   capture only reads and never waits. Each runs once per episode, before that pass's ladder.
   Everything else gets no prelude and keeps the ladder: the whole bus off (it has its own route
@@ -636,7 +638,7 @@ NOT be conflated when reading results.
 | I18 order: rescan, capture, the full ladder, the power cycle only when the ladder fails | `tests/test_tray_down_prelude.py::test_a_tray_down_onset_rescans_captures_then_runs_the_full_ladder_and_power_cycles_only_when_it_fails`, `::test_a_ladder_that_recovers_the_tray_fires_no_power_cycle`, `::test_the_last_chance_sweep_still_gates_the_power_cycle_of_a_tray_down` |
 | I18 the prelude changes no ladder input (same stage, indices, evidence, beats and rungs as with it off) | `tests/test_tray_down_prelude.py::test_the_prelude_changes_no_ladder_input`, `::test_capture_off_runs_the_ladder_alone` |
 | I18 once per episode from any caller; a tenant defers the rescan, never the capture | `tests/test_tray_down_prelude.py::test_the_prelude_runs_once_per_episode_from_any_caller`, `::test_a_tenant_defers_the_rescan_but_not_the_capture` |
-| I18 after the rescan: every chip back runs the full verify and stops only if it passes | `tests/test_tray_down_prelude.py::test_every_chip_back_after_the_rescan_runs_the_full_verify_and_stops`, `::test_chips_back_on_a_mesh_that_fails_verify_still_get_the_full_ladder` |
+| I18 after the rescan: every chip back runs the full verify and stops only if it passes; the runtime fault is kept and the chips leave the isolated set | `tests/test_tray_down_prelude.py::test_every_chip_back_after_the_rescan_runs_the_full_verify_and_stops`, `::test_a_rescan_recovery_keeps_the_runtime_fault_and_un_isolates_the_chips`, `::test_chips_back_on_a_mesh_that_fails_verify_still_get_the_full_ladder` |
 | I18 an off set first seen after a reset (the ladder's, a manual `reset_with_quiesce`, one in flight, a live scope) is not an onset; the latch is fresh after the episode | `tests/test_tray_down_prelude.py::test_the_latch_does_not_change_after_a_reset_and_is_fresh_after_the_episode`, `::test_a_manual_reset_before_the_first_sighting_is_not_an_onset`, `::test_a_reset_in_flight_or_a_live_scope_is_not_an_onset` |
 | I18 the latch is not persisted: a restarted broker latches a tray still missing afresh, and buys no power cycle | `tests/test_tray_down_prelude.py::test_a_restarted_broker_latches_a_tray_still_missing_afresh` |
 | I18 the gate (`device_health_gate`) runs the prelude, then its own rung | `tests/test_tray_down_prelude.py::test_the_gate_runs_the_prelude_then_its_ladder_end_to_end` |
