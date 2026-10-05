@@ -3797,7 +3797,9 @@ async def device_health_gate(
         if ev.off_bus and not ev.scope_active and await galaxy_recovery._tray_down_path(expected, beats) == "FAST":
             if await _fire(STAGE_POWER_CYCLE):
                 return
-            _log("device did NOT verify healthy this pass: a tray is down; it stays flagged and no tenant job runs on it")
+            _log(
+                "device did NOT verify healthy this pass: a tray is down; it stays flagged and no tenant job runs on it"
+            )
             return
 
         if stage == DEFER and gone_queued:

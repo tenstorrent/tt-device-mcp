@@ -1303,7 +1303,12 @@ class GalaxyRecovery(Recovery):
                 log("tray-down fast path: a tenant holds the device or the scan is unreadable — holding")
                 return OUTCOME_WAITING
             td["acted"] = True
-            onset = {"off_per_tray": td.get("onset"), "off": td.get("off"), "expected": expected, "epoch": td.get("epoch")}
+            onset = {
+                "off_per_tray": td.get("onset"),
+                "off": td.get("off"),
+                "expected": expected,
+                "epoch": td.get("epoch"),
+            }
             capture = await asyncio.to_thread(self._tray_down_capture, onset, expected)
             if capture.get("cpld", "").startswith("skipped"):
                 log("tray-down capture: no TT_DEVICE_MCP_TRAY_CPLD_* config — CPLD registers not read")
@@ -1334,7 +1339,9 @@ class GalaxyRecovery(Recovery):
         if still is None and len(off) < expected:
             td["path"] = "LADDER"
             health_event("tray_down_fast_path", action="ladder", off=len(off), rescan=rescan, capture=capture)
-            log(f"tray-down fast path: after the rescan no tray has {TRAY_DOWN_MIN_CHIPS}+ chips off — the ladder takes over")
+            log(
+                f"tray-down fast path: after the rescan no tray has {TRAY_DOWN_MIN_CHIPS}+ chips off — the ladder takes over"
+            )
             return OUTCOME_WAITING
         escalation, reboot_blocked = _host_escalation_for_drop(
             len(off), expected, warm_reboot_futile=True, **self.deps.host_escalation_kwargs()
@@ -1357,13 +1364,21 @@ class GalaxyRecovery(Recovery):
         if not allowed:
             if not td.get("held"):
                 td["held"] = True
-                health_event("tray_down_held", reason=why, trays=trays, off=len(off), expected=expected, capture=capture)
+                health_event(
+                    "tray_down_held", reason=why, trays=trays, off=len(off), expected=expected, capture=capture
+                )
                 self.mechanism._journal_auto_recovery_denied(CASCADE_POWER_CYCLE, why)
             log(f"tray-down fast path: power cycle held off ({why}) — holding with no resets")
             metrics.stage_fired("power_cycle", "blocked")
             return OUTCOME_WAITING
         health_event(
-            "tray_down_fast_path", action="power_cycle", trays=trays, off=len(off), expected=expected, rescan=rescan, capture=capture
+            "tray_down_fast_path",
+            action="power_cycle",
+            trays=trays,
+            off=len(off),
+            expected=expected,
+            rescan=rescan,
+            capture=capture,
         )
         await self.deps.auto_power_cycle_host(
             log, f"tray-down: trays {trays} off the bus ({len(off)}/{expected}) after a PCI rescan"
