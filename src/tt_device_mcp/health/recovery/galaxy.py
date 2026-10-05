@@ -15,6 +15,7 @@ import os
 import time
 from collections.abc import Mapping
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import metrics, privileges
@@ -44,6 +45,8 @@ from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.ubb_tray import _fire_ubb_reset, _ubb_reset_argv
+
+_logger = logging.getLogger("tt-device-mcp")
 
 
 def _is_galaxy(board_types: Optional[list], glx_board_types: tuple) -> Optional[bool]:
@@ -797,6 +800,61 @@ def _all_trays(expected: int, tray_map: Optional[dict]) -> Optional[list]:
     return sorted(tray_map)
 
 
+# Issue #26 (spec 04 I18): a tray with this many chips off the bus at the FIRST sighting is a tray that
+# has lost power, not a chip that dropped. Replayed over every recorded onset: no recoverable episode
+# had 4 or more chips off one tray, and none with 4 or more ever came back without a power cycle.
+TRAY_DOWN_MIN_CHIPS = 4
+TRAY_DOWN_ACTIONS = ("capture_then_powercycle", "legacy_sweep")
+TRAY_DOWN_RESCAN_SETTLE_SEC = 3
+
+
+def _pci_rescan() -> None:
+    """One bare PCI rescan — the same write the bridge rung's rescan makes. Its own function so the
+    suite replaces it (conftest) and no test writes to the host's sysfs."""
+    Path("/sys/bus/pci/rescan").write_text("1")
+
+
+def tray_down_action() -> str:
+    """``TT_DEVICE_MCP_TRAY_DOWN_ACTION``: ``capture_then_powercycle`` (default) takes the fast path
+    for a tray-down onset; ``legacy_sweep`` keeps the ladder for every drop. Anything else reads as
+    the default."""
+    raw = os.environ.get("TT_DEVICE_MCP_TRAY_DOWN_ACTION", "").strip().lower()
+    return raw if raw in TRAY_DOWN_ACTIONS else "capture_then_powercycle"
+
+
+def _off_per_tray(off_ids, tray_map: Optional[dict]) -> Optional[dict]:
+    """``{tray: chips off}`` for every tray with a chip off, or None when the map is missing or does
+    not place every off chip — no tray decision rests on a partial picture (I16)."""
+    if not tray_map or not off_ids:
+        return None
+    try:
+        ids = {int(c) for c in off_ids}
+    except (TypeError, ValueError):
+        return None
+    tray_of = {c: t for t, chips in tray_map.items() for c in chips}
+    if not ids <= set(tray_of):
+        return None
+    per: dict = {}
+    for i in ids:
+        per[tray_of[i]] = per.get(tray_of[i], 0) + 1
+    return dict(sorted(per.items()))
+
+
+def _tray_down_counts(off_ids, tray_map: Optional[dict]) -> Optional[dict]:
+    """The per-tray off counts when some tray has at least TRAY_DOWN_MIN_CHIPS off, else None."""
+    per = _off_per_tray(off_ids, tray_map)
+    if per is None or not any(n >= TRAY_DOWN_MIN_CHIPS for n in per.values()):
+        return None
+    return per
+
+
+def tray_down_onset(off_ids, chip_buses, board_type) -> Optional[dict]:
+    """``{tray: chips off}`` when the off-bus set puts TRAY_DOWN_MIN_CHIPS or more chips off ONE
+    physical tray (by the bus-derived map, I16), else None — also None for no ids, no map, or a chip
+    the map does not place. Pure: the classification the fast path latches at the first sighting."""
+    return _tray_down_counts(off_ids, _tray_map(chip_buses, board_type))
+
+
 def _ubb_tray_walk_plan(offbus_chips: set, expected: int, tray_map: Optional[dict]) -> Optional[list]:
     """Order the trays for a one-at-a-time per-tray reset walk: every AFFECTED tray first (those that
     hold an off-bus chip, sorted), then THE REST (sorted). Reset one tray at a time, re-verifying
@@ -982,8 +1040,17 @@ class GalaxyRecovery(Recovery):
         surgical bridge reset, a per-tray UBB reset) can recover the mesh without ever calling
         ``_reset_and_verify_device``, so that flag can still carry an unrelated FAILED verdict from
         an earlier, different reset. The gate rung reports its own action's verdict instead and
-        never TERMINAL — see :meth:`_fire_gate_rung`."""
+        never TERMINAL — see :meth:`_fire_gate_rung`.
+
+        Every caller passes here first, so this is where a tray-down onset (spec 04 I18) is latched
+        and diverted: a FAST episode never enters either ladder, from the gate, the idle relift or
+        the hold-deadline watchdog alike."""
         rung, _, gate_phase = phase.partition("/")
+        if await self._tray_down_path(expected, beats) == "FAST":
+            return await self.tray_down_fast_path(expected, log, phase=gate_phase or rung)
+        # Anything that reaches a ladder from here may reset: an onset first sighted after this is
+        # not an onset any more (the ladder can turn a 1-chip drop into a whole tray off).
+        self._td_reset_seen = True
         if rung == "gate":
             return await self._fire_gate_rung(gate_phase, stage, indices, expected, log, ev=ev, beats=beats)
         was_degraded = self.deps.device_degraded()
@@ -1143,6 +1210,165 @@ class GalaxyRecovery(Recovery):
                 await self._auto_reboot_host(log, "reset failed twice; device unrecoverable by reset")
             return OUTCOME_WAITING
         raise ValueError(f"escalate(): {stage!r} is not a gate action rung")
+
+    # ---- the tray-down fast path (spec 04 I18, issue #26) ---------------------------------------
+    #
+    # The episode latch lives on this instance: set at the first off-bus sighting of an episode,
+    # before any reset, and never re-derived while the episode is open, because a ladder reset can
+    # itself turn a 1-chip drop into a whole tray off. tray_down_episode_end() clears it when the
+    # mesh is released; a broker restart or a reboot starts with none (a tray still missing then is
+    # a fresh onset).
+    _td: Optional[dict] = None
+    _td_reset_seen: bool = False
+
+    def tray_down_episode_end(self) -> None:
+        """The episode closed (the gate released the mesh, or a rung recovered it): the next off-bus
+        sighting is a fresh onset."""
+        self._td = None
+        self._td_reset_seen = False
+
+    async def _tray_down_path(self, expected: int, beats: Optional[dict]) -> Optional[str]:
+        """``"FAST"``/``"LADDER"`` for the open episode, latching it at the first off-bus sighting;
+        None when nothing is off the bus yet, or when the action is ``legacy_sweep``."""
+        if tray_down_action() == "legacy_sweep" or expected < 2 * UBB_CHIP_COUNT:
+            return None
+        if self._td is not None:
+            return self._td["path"]
+        if beats is None:
+            beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        off = _offbus_chip_ids(beats or {}, expected)
+        if not off:
+            return None
+        counts = None
+        # The whole bus off keeps its own route: _host_escalation_for_drop already goes straight to
+        # the power cycle for it. A reset already fired means this is not a first sighting.
+        if len(off) < expected and not self._td_reset_seen and not self.mechanism.reset_in_flight:
+            counts = _tray_down_counts(off, self._tray_map_now())
+        path = "FAST" if counts else "LADDER"
+        self._td = {
+            "path": path,
+            "onset": counts or _off_per_tray(off, self._tray_map_now()) or {"count": len(off)},
+            "off": sorted(int(c) for c in off),
+            "epoch": time.time(),
+            "acted": False,
+            "held": False,
+        }
+        health_event("tray_down_latched", path=path, off_per_tray=self._td["onset"], expected=expected)
+        return path
+
+    def _tray_down_capture(self, onset: dict, expected: int) -> dict:
+        """The onset evidence, read-only, under its deadline, fsync'd into an incident bundle."""
+        from tt_device_mcp.health import bmc_capture
+
+        bundle = None
+        if self.deps.capture_incident is not None:
+            try:
+                bundle = self.deps.capture_incident("tray_down", evidence={"onset": onset, "expected": expected})
+            except Exception:  # noqa: BLE001 - a failed bundle must not stop the capture or the cycle
+                bundle = None
+        buses = (self.deps.chip_buses_provider() if self.deps.chip_buses_provider else None) or {}
+        tray_map = self._tray_map_now() or {}
+        trays = sorted(int(t) for t in onset.get("off_per_tray", {}))
+        # The endpoint of the first chip off on each tray: lspci then shows whether the kernel still
+        # sees the device behind the link, which the power cycle is about to erase.
+        bridges = []
+        for t in trays:
+            chip = next((c for c in tray_map.get(t, []) if c in onset.get("off", [])), None)
+            addr = (buses.get(chip) or buses.get(str(chip))) if chip is not None else None
+            if addr:
+                bridges.append(addr)
+        return bmc_capture.capture_tray_down(
+            bundle if isinstance(bundle, Path) else None, onset, trays=trays, bridges=bridges
+        )
+
+    async def tray_down_fast_path(self, expected: int, log, *, phase: str) -> str:
+        """A tray-down onset: capture, one PCI rescan, re-check, then the power cycle through its
+        usual guard — no SBR, tray re-power, mesh reset or last-chance sweep, which never brought a
+        tray back (0/142 in the replay) and only delayed the cycle by 15-35 min.
+
+        The first pass of the episode captures and rescans; every later pass (the gate, the idle
+        relift, the hold-deadline watchdog) only re-reads the bus and re-asks the guard. Returns
+        OUTCOME_RECOVERED when every chip came back and the full verify passed, else OUTCOME_WAITING
+        (power cycle requested, held, or the episode handed to the ladder)."""
+        td = self._td or {}
+        if await asyncio.to_thread(self.mechanism.scope_active):
+            log("tray-down fast path: a reset is cycling in its own scope — holding; the gate adopts it")
+            return OUTCOME_WAITING
+        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
+        tenant_active = self._tenant_active(scan)
+        rescan = "not run"
+        capture: dict = {}
+        if not td.get("acted"):
+            if tenant_active:
+                log("tray-down fast path: a tenant holds the device or the scan is unreadable — holding")
+                return OUTCOME_WAITING
+            td["acted"] = True
+            onset = {"off_per_tray": td.get("onset"), "off": td.get("off"), "expected": expected, "epoch": td.get("epoch")}
+            capture = await asyncio.to_thread(self._tray_down_capture, onset, expected)
+            if capture.get("cpld", "").startswith("skipped"):
+                log("tray-down capture: no TT_DEVICE_MCP_TRAY_CPLD_* config — CPLD registers not read")
+            try:
+                await asyncio.to_thread(_pci_rescan)
+                await asyncio.sleep(TRAY_DOWN_RESCAN_SETTLE_SEC)
+                rescan = "ran"
+            except OSError as e:
+                rescan = f"failed ({e})"
+        beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        off = _offbus_chip_ids(beats or {}, expected)
+        trays = sorted((td.get("onset") or {}).keys()) if isinstance(td.get("onset"), dict) else []
+        if not off:
+            healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=phase)
+            health_event("tray_down_fast_path", action="verify", healthy=healthy, rescan=rescan, capture=capture)
+            if healthy:
+                log("tray-down fast path: every chip came back and the mesh verified — no power cycle")
+                self.deps.clear_device_reported_fault(f"{phase}: tray-down chips back after a PCI rescan")
+                self.deps.clear_device_dirty(verified=True, why=f"{phase}: tray-down chips back after a PCI rescan")
+                self.tray_down_episode_end()
+                return OUTCOME_RECOVERED
+            # Every chip present but the mesh does not verify: no tray is down any more, so the
+            # present-mesh ladder owns it.
+            td["path"] = "LADDER"
+            log("tray-down fast path: every chip came back but the mesh did not verify — the ladder takes over")
+            return OUTCOME_WAITING
+        still = _tray_down_counts(off, self._tray_map_now())
+        if still is None and len(off) < expected:
+            td["path"] = "LADDER"
+            health_event("tray_down_fast_path", action="ladder", off=len(off), rescan=rescan, capture=capture)
+            log(f"tray-down fast path: after the rescan no tray has {TRAY_DOWN_MIN_CHIPS}+ chips off — the ladder takes over")
+            return OUTCOME_WAITING
+        escalation, reboot_blocked = _host_escalation_for_drop(
+            len(off), expected, warm_reboot_futile=True, **self.deps.host_escalation_kwargs()
+        )
+        if reboot_blocked or escalation != CASCADE_POWER_CYCLE:
+            allowed, why = False, "the power cycle is not opted in"
+        else:
+            allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=tenant_active)
+        action = "power_cycle" if allowed else "hold"
+        _logger.error(
+            "TRAY-DOWN: trays %s, chips off %s (%d/%d), rescan %s, action %s%s",
+            trays,
+            sorted(int(c) for c in off),
+            len(off),
+            expected,
+            rescan,
+            action,
+            "" if allowed else f" ({why})",
+        )
+        if not allowed:
+            if not td.get("held"):
+                td["held"] = True
+                health_event("tray_down_held", reason=why, trays=trays, off=len(off), expected=expected, capture=capture)
+                self.mechanism._journal_auto_recovery_denied(CASCADE_POWER_CYCLE, why)
+            log(f"tray-down fast path: power cycle held off ({why}) — holding with no resets")
+            metrics.stage_fired("power_cycle", "blocked")
+            return OUTCOME_WAITING
+        health_event(
+            "tray_down_fast_path", action="power_cycle", trays=trays, off=len(off), expected=expected, rescan=rescan, capture=capture
+        )
+        await self.deps.auto_power_cycle_host(
+            log, f"tray-down: trays {trays} off the bus ({len(off)}/{expected}) after a PCI rescan"
+        )
+        return OUTCOME_WAITING
 
     def _tenant_active(self, scan, *, force: bool = False) -> bool:
         """Is anyone using the device? TWO independent sources, because either one alone lies:

@@ -5944,6 +5944,7 @@ async def test_a_recovered_ubb_tray_reset_releases_without_the_mesh_wide_reset(
     """A clean below-floor whole-tray drop, opted in, fires the per-tray BMC reset instead of
     holding, and a walk that verifies healthy reopens the door — the mesh-wide reset (which inverts
     a below-floor drop) never runs."""
+    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_DOWN_ACTION", "legacy_sweep")  # pins the ladder's tray rung (spec 04 I18)
     _reach_reboot_rung(monkeypatch, tmp_path, n_present=24)
     srv.isolated_chips = set()
     srv.device_pci_map = {}
@@ -7891,6 +7892,7 @@ async def test_escalate_recovers_via_a_ubb_tray_reset(monkeypatch, clear_job_sta
     """Closes the UBB-tray-recovered branch's escalate()-level coverage gap: the per-tray BMC
     reset (neither the surgical bridge reset nor the mesh-wide reset) is what clears the hold, and
     escalate() must report RECOVERED for it exactly as for the other two recovering rungs."""
+    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_DOWN_ACTION", "legacy_sweep")  # pins the ladder's tray rung (spec 04 I18)
     counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=8, isolated=set())  # chips 24-31 = tray 3
     _make_clear_fns_real(monkeypatch, counters)
     fsm_dirty(srv, "test")
@@ -8552,6 +8554,7 @@ async def test_gate_below_floor_hold_names_the_ubb_tray_rung_on_a_clean_tray_dro
     goes idle. It must name the per-tray BMC reset while still holding (no reset, no release). With the
     rung forced off (=0; the default is now ON) this is the name-and-hold path. Fails on base, which
     emits no ubb_reset_required at the gate's below-floor hold."""
+    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_DOWN_ACTION", "legacy_sweep")  # pins the ladder's tray rung (spec 04 I18)
     events = []
     _reach_reboot_rung(monkeypatch, tmp_path, n_present=24)  # 24 /dev nodes: past the empty-dir check
     srv.isolated_chips = set()
@@ -8845,6 +8848,7 @@ async def test_gate_fires_the_ubb_tray_reset_on_a_clean_tray_down_when_opted_in(
     """The gate side of the fire: a clean below-floor tray-down at a job boundary, opted in, fires the
     per-tray BMC reset instead of holding, and a reset that verifies healthy clears the tenant door.
     The mesh-wide galaxy reset never runs. Fails on base, which holds and issues no fire."""
+    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_DOWN_ACTION", "legacy_sweep")  # pins the ladder's tray rung (spec 04 I18)
     fired = {"n": 0}
     cleared = {"n": 0}
     _reach_reboot_rung(monkeypatch, tmp_path, n_present=24)

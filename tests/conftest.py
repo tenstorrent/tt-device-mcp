@@ -401,6 +401,15 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
 
     monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
 
+    # The tray-down fast path (spec 04 I18) rescans the bus: never the real sysfs from the suite.
+    # Its onset latch lives on the module-global GalaxyRecovery, so every test starts with none.
+    def _no_rescan_in_tests():
+        raise OSError("a test reached the real PCI rescan; _pci_rescan must be mocked")
+
+    monkeypatch.setattr(recovery_galaxy, "_pci_rescan", _no_rescan_in_tests)
+    if getattr(srv, "galaxy_recovery", None) is not None:
+        srv.galaxy_recovery.tray_down_episode_end()
+
     _install_spawn_tripwire(monkeypatch, allow_device_spawns=device_marked)
 
 

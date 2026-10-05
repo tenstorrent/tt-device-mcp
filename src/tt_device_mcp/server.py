@@ -3613,6 +3613,7 @@ async def device_health_gate(
         stage = galaxy_recovery.next_stage(ev)
 
         if stage == RELEASE:
+            galaxy_recovery.tray_down_episode_end()  # spec 04 I18: a released mesh closes the onset latch
             # Every check the host can run says the mesh is fine. Resetting anyway —
             # because a job happened to time out — is a 60s reset of 32 healthy ASICs,
             # and doing that on every abnormal exit is how the device spends its day
@@ -3788,6 +3789,16 @@ async def device_health_gate(
             )
             fsm.on_outcome(outcome)
             return outcome == OUTCOME_RECOVERED
+
+        # A tray-down onset (spec 04 I18) takes none of the rungs below, whatever the router named:
+        # escalate() diverts it to the fast path (capture, one rescan, the power cycle through its
+        # guard, or a hold with no reset). The latch is read here so a stage the router would only
+        # hold on (a DEFER, a WAIT) still reaches the fast path on its first sighting.
+        if ev.off_bus and not ev.scope_active and await galaxy_recovery._tray_down_path(expected, beats) == "FAST":
+            if await _fire(STAGE_POWER_CYCLE):
+                return
+            _log("device did NOT verify healthy this pass: a tray is down; it stays flagged and no tenant job runs on it")
+            return
 
         if stage == DEFER and gone_queued:
             # A foreign reset scope opened between queueing these gone chips and here (the
@@ -4229,6 +4240,8 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         )
         _hold_row = None
         device_hold_episode_since = ""
+        if galaxy_recovery is not None:
+            galaxy_recovery.tray_down_episode_end()  # spec 04 I18: the next drop is a fresh onset
         _persist_hold_episode("")  # the device came back fit: the episode is over, on disk too
         device_hold_episode_reason = ""
         device_hold_escalated_monotonic = 0.0
