@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
-from tt_device_mcp import __version__, metrics, privileges, telemetry
+from tt_device_mcp import __version__, aio, metrics, privileges, telemetry
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
     FABRIC_CHECK_CANNOT_CHECK_RC,
@@ -3114,7 +3114,7 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(proc.wait(), timeout=30)
+            await aio.wait_for(proc.wait(), timeout=30)
             if proc.returncode == 0:
                 touched.append(svc)
         except (asyncio.TimeoutError, OSError, ValueError):
@@ -3328,7 +3328,7 @@ async def _dispatch_probe() -> tuple[Optional[bool], str]:
             env=env,
         )
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), DISPATCH_PROBE_TIMEOUT_SEC)
+            out, _ = await aio.wait_for(proc.communicate(), DISPATCH_PROBE_TIMEOUT_SEC)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
@@ -5893,7 +5893,9 @@ async def job_runner():
 
             watchdog = asyncio.create_task(hung_watchdog())
             try:
-                await asyncio.wait_for(
+                # aio.wait_for, not asyncio's: on Python 3.10 a shutdown cancel that lands as the
+                # job ends is dropped, and this loop then waits on the queue forever.
+                await aio.wait_for(
                     asyncio.gather(
                         read_stream(proc.stdout, "stdout", job.out_buf),
                         read_stream(proc.stderr, "stderr", job.err_buf),

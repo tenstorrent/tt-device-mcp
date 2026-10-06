@@ -26,6 +26,8 @@ jobs:
           verbose: "true"
   test:
     runs-on: ubuntu-latest
+    # A hang must not hold the runner for GitHub's 6 h default.
+    timeout-minutes: 20
     strategy:
       matrix:
         python-version: ["3.10"]
