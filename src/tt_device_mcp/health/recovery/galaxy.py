@@ -1573,10 +1573,21 @@ class GalaxyRecovery(Recovery):
         # guards as any host rung. A whole tray off the bus with no window is warm-reboot-futile (a
         # 6U-Galaxy reboot does not power-cycle the UBBs), so it goes straight to the cold rung.
         off_bus = len(offbus_chips)
+        # Log-only: more chips may be off by now than at onset. Every decision below uses off_bus.
+        try:
+            beats_now = await asyncio.to_thread(self.deps.read_heartbeats)
+            off_bus_after = len(_offbus_chip_ids(beats_now or {}, expected))
+        except Exception as e:  # noqa: BLE001 - a failed re-read must never block the power cycle
+            log(f"tray-down-no-window: could not re-read the heartbeats after the verify: {e!r}")
+            off_bus_after = None
         escalation, reboot_blocked = _host_escalation_for_drop(
             off_bus, expected, warm_reboot_futile=True, **self.deps.host_escalation_kwargs()
         )
         if reboot_blocked or escalation != "power-cycle":
+            log(
+                f"tray-down-no-window sweep did not recover the mesh; power cycle not auto-fired "
+                f"(off the bus: {off_bus}/{expected} at onset, {off_bus_after} after the verify)"
+            )
             if off_bus >= expected:
                 self.deps.emit_all_off_bus_power_cycle_required(log, off_bus, expected, f"gate/{gate_phase}")
             else:
@@ -1588,11 +1599,14 @@ class GalaxyRecovery(Recovery):
         tenant_active = self._tenant_active(scan)
         allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=tenant_active)
         if not allowed:
-            log(f"tray-down-no-window sweep did not recover the mesh and a power cycle is opted in but held off: {why}")
+            log(
+                f"tray-down-no-window sweep did not recover the mesh and a power cycle is opted in but held off: {why} "
+                f"(off the bus: {off_bus}/{expected} at onset, {off_bus_after} after the verify)"
+            )
             self.mechanism._journal_auto_recovery_denied(escalation, why)
             metrics.stage_fired("power_cycle", "blocked")
             return OUTCOME_WAITING
-        health_event("tray_down_no_window_power_cycle", off_bus=off_bus, expected=expected)
+        health_event("tray_down_no_window_power_cycle", off_bus=off_bus, off_bus_after=off_bus_after, expected=expected)
         await self.deps.auto_power_cycle_host(
             log, "tray-down-no-window: every reset type ran back-to-back and the mesh did not verify"
         )
