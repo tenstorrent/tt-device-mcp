@@ -13,6 +13,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -786,6 +787,112 @@ async def test_a_started_job_is_not_revived_by_a_restart(monkeypatch, tmp_path, 
 
     await srv._restore_queued_jobs()
     assert srv.jobs == {}, "a job that already started was re-queued by the restart"
+
+
+def _queued_job_with_log(tmp_path, job_id, footer_lines=None):
+    """A queued job whose spec is on disk, with a log holding its header and, when
+    ``footer_lines`` is not None, the footer a finished job gets plus ``footer_lines`` lines of
+    post-job gate output after it."""
+    log = tmp_path / f"{job_id}.log"
+    log.write_text(f"JOB ID:      {job_id}\nOWNER:       tenant\nCOMMAND:     echo hi\n")
+    job = srv.Job(id=job_id, owner="tenant", workspace="/w", command="echo hi", queued_at="t", log_file=str(log))
+    srv._persist_queued_job(job)
+    if footer_lines is not None:
+        job.status = srv.JobStatus.FAILED
+        job.finished_at = "2026-01-01T00:00:00"
+        srv.write_job_log_footer(log, job)
+        with open(log, "a") as f:
+            f.writelines(f"[post-job gate] line {i}\n" for i in range(footer_lines))
+    return job
+
+
+async def _restart_and_restore():
+    """The broker restarts: in-memory state is gone, only what is on disk remains."""
+    srv.jobs.clear()
+    srv.job_queue = None
+    srv._ensure_async_primitives()
+    await srv._restore_queued_jobs()
+
+
+@pytest.mark.parametrize("gate_lines", [0, 40], ids=["footer-last", "footer-then-gate-output"])
+@pytest.mark.asyncio
+async def test_a_spec_whose_job_already_finished_is_set_aside_not_requeued(
+    monkeypatch, tmp_path, clear_job_state, gate_lines
+):
+    """Safety net for specs an earlier broker leaked: a job whose log already carries the FINISHED
+    footer is over, so its spec must not run it again. It is moved aside (``.finished``), not
+    deleted and not requeued. The post-job gate writes after the footer, so the footer is found
+    even when it is not the last line."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    _queued_job_with_log(tmp_path, "001", footer_lines=gate_lines)
+    spec_dir = tmp_path / srv.QUEUED_SPEC_DIR
+
+    await _restart_and_restore()
+
+    assert srv.jobs == {}, "a job that had already finished was re-queued by the restart"
+    assert srv.get_job_queue().empty()
+    assert not (spec_dir / "001.json").exists()
+    assert (spec_dir / "001.finished").exists(), "the finished job's spec vanished instead of being set aside"
+
+
+@pytest.mark.asyncio
+async def test_a_still_waiting_job_is_restored_beside_a_finished_one(monkeypatch, tmp_path, clear_job_state):
+    """The footer check must not eat live work: a job whose log has no footer yet, and one with
+    no log at all, are restored in order while the finished one is set aside."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    _queued_job_with_log(tmp_path, "001", footer_lines=0)
+    _queued_job_with_log(tmp_path, "002")
+    srv._persist_queued_job(srv.Job(id="003", owner="tenant", workspace="/w", command="echo hi", queued_at="t"))
+
+    await _restart_and_restore()
+
+    assert sorted(srv.jobs) == ["002", "003"]
+    assert srv.get_job_queue().get_nowait() == "002"
+    assert srv.get_job_queue().get_nowait() == "003"
+    assert srv.get_job_queue().empty()
+
+
+@pytest.mark.parametrize("door", ["degraded", "privsep"])
+@pytest.mark.asyncio
+async def test_a_refused_job_whose_spec_survived_is_not_revived_by_a_restart(
+    monkeypatch, tmp_path, clear_job_state, door
+):
+    """A job refused at the door is FAILED and its log gets the footer. If its spec is still on
+    disk (a broker that did not forget it on refusal), the restart must not run the command its
+    owner was told never ran. The spec is re-persisted after the refusal so this tests the restore
+    net alone, whatever the refusal path itself does with the spec."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    job = _queued_job_with_log(tmp_path, "001")
+    srv.jobs["001"] = job
+    if door == "degraded":
+        await srv._refuse_job_on_degraded_device(job, Path(job.log_file), "chip 1 off the bus")
+    else:
+        await srv._refuse_job_privsep_identity(job, Path(job.log_file), "no passwd entry")
+    assert job.status is srv.JobStatus.FAILED
+    srv._persist_queued_job(job)  # the spec an older broker left behind
+    assert srv._queued_spec_path("001").exists(), "precondition: the spec is on disk"
+
+    await _restart_and_restore()
+
+    assert srv.jobs == {}, "a job refused at the door was re-queued by the restart"
+    assert srv.get_job_queue().empty()
+
+
+@pytest.mark.asyncio
+async def test_a_spec_colliding_with_a_live_job_id_is_not_revived(monkeypatch, tmp_path, clear_job_state):
+    """Job ids are three digits and wrap, so a stale spec can carry the id of a job that is live
+    now (re-adopted from its scope). The live job owns the id: the spec must not replace it or
+    put a second copy on the queue."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    _queued_job_with_log(tmp_path, "001")  # no footer: only the id collision can keep it off the queue
+    live = srv.Job(id="001", owner="other", workspace="/w", command="sleep 1", queued_at="t")
+    live.status = srv.JobStatus.RUNNING
+    srv.jobs["001"] = live
+
+    await srv._restore_queued_jobs()
+
+    assert srv.jobs["001"] is live, "a stale spec replaced the live job that holds its id"
+    assert srv.get_job_queue().empty()
 
 
 @pytest.mark.asyncio
