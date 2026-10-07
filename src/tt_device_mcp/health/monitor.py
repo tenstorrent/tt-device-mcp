@@ -24,7 +24,11 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from tt_device_mcp import metrics
-from tt_device_mcp.constants import FABRIC_CHECK_CANNOT_CHECK_RC, FABRIC_CHECK_TIMEOUT_SEC
+from tt_device_mcp.constants import (
+    ETH_POST_JOB_TIMEOUT_SEC,
+    FABRIC_CHECK_CANNOT_CHECK_RC,
+    FABRIC_CHECK_TIMEOUT_SEC,
+)
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors import eth, fabric, hostpci
@@ -120,12 +124,22 @@ class HealthMonitor:
         *,
         run_fabric: bool,
         force_fabric: bool = False,
+        run_eth: bool = False,
         indices: Optional[list] = None,
         expected: Optional[int] = None,
         log: Optional[Callable[[str], None]] = None,
     ) -> HealthState:
         """Run one probe pass — heartbeat+pci always, then eth, then the fabric traffic pass
         when ``run_fabric``/``force_fabric`` — and store it as the new ``readings`` blackboard.
+
+        ``run_eth`` asks for the passive eth read WITHOUT the traffic pass: the clean post-job gate
+        on a host whose eth rung is armed (spec 03 I30). The read is bounded to
+        ``ETH_POST_JOB_TIMEOUT_SEC`` there. A frozen verdict stops the pass as usual; a read that
+        reached no verdict (its own timeout, a crash, a could-not-check) runs the fabric traffic
+        pass in this same pass, because on an armed host that read has answered before and a
+        read that now cannot is the stuck-read shape a fabric failure follows. Pass it only when
+        the rung is armed: a disarmed reader always skips, so ``run_eth`` there would buy the
+        traffic pass on every call.
 
         Mirrors ``Recovery._verify_device``'s gentlest-first short-circuiting (a frozen heartbeat
         or a failed snapshot skips every heavier, more perturbing check below it — the traffic
@@ -202,13 +216,19 @@ class HealthMonitor:
         if log:
             log(f"snapshot: {'OK' if ok else 'UNHEALTHY'} — {detail}")
         _record("pci", ok, detail)
-        if ok and (run_fabric or force_fabric):
+        fabric_asked = run_fabric or force_fabric
+        if ok and (fabric_asked or run_eth):
             self._deps.set_device_op_detail("health check: eth-core heartbeat (passive)")
-            eok, edetail = await self.verify_eth_heartbeat()
+            if fabric_asked:
+                eok, edetail = await self.verify_eth_heartbeat()
+            else:
+                eok, edetail = await self.verify_eth_heartbeat(timeout_sec=ETH_POST_JOB_TIMEOUT_SEC)
             if log:
                 log(f"eth-heartbeat: {'SKIPPED' if eok is None else ('OK' if eok else 'FROZEN')} — {edetail}")
             _record("eth_heartbeat", eok, edetail)
-            if eok is not False:
+            if not fabric_asked and eok is None and log:
+                log("eth-heartbeat reached no verdict after a clean exit — running the fabric traffic pass")
+            if eok is not False and (fabric_asked or eok is None):
                 self._deps.set_device_op_detail("health check: fabric traffic pass across all links (~45s)")
                 fok, fdetail = await self.verify_fabric_health()
                 if log:
