@@ -10485,6 +10485,251 @@ async def _unreachable_gate(*a, **k):
     raise AssertionError("the health gate must not run for a clean, non-dirty device")
 
 
+# --- a short chip count and a stale verdict at dispatch (spec 03 I30/I31) -----------------------
+
+
+def _beats(n: int) -> dict:
+    return {str(i): 0x1000 + i for i in range(n)}
+
+
+def _no_heartbeat_verdict(*a, **k):
+    raise AssertionError("the two-sample heartbeat must not run here")
+
+
+def test_a_short_chip_count_is_a_degraded_reason_at_dispatch(monkeypatch):
+    """24 chips answering on a 32-chip host read as healthy chip by chip: the liveness read only
+    looked for all-ones and an empty sysfs, so a mesh short a tray was dispatched onto. The count is
+    now held to the same baseline heartbeat_verdict uses, from one sample and without sleeping."""
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda: True)
+    monkeypatch.setattr(srv, "heartbeat_verdict", _no_heartbeat_verdict)  # one sample, no settle sleep
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: _beats(24))
+
+    reason = srv._device_liveness_reason()
+    assert "24 of 32" in reason, reason
+    assert srv._device_degraded_for_tenant(), "a short mesh must hold the tenant at the door"
+
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: _beats(32))
+    assert srv._device_liveness_reason() == "", "a full mesh is not degraded"
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: _beats(33))
+    assert srv._device_liveness_reason() == "", "an over-count is not a drop"
+
+
+@pytest.mark.asyncio
+async def test_the_sampler_dirties_a_short_count_after_two_samples(monkeypatch):
+    """The sampler omits a chip whose node left sysfs, so a partial drop read as every remaining chip
+    healthy and set no flag until the next gate. Two consecutive short samples now dirty the device;
+    one is a blip, and a full sample re-arms the debouncer."""
+    monkeypatch.setattr(srv.sampler, "short_count_strikes", 0)
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", True)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    short = {str(i): [0x1000 + i] for i in range(24)}
+    full = {str(i): [0x1000 + i] for i in range(32)}
+
+    for _ in range(3):  # a reset takes chips off the bus by design: excused, no strike
+        await srv.sampler.check_for_dead_chips(short)
+    assert srv.sampler.short_count_strikes == 0 and srv.fsm.state is ServerState.HEALTHY
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", False)
+
+    await srv.sampler.check_for_dead_chips(short)
+    await srv.sampler.check_for_dead_chips(full)  # recovered: the strike is forgiven
+    await srv.sampler.check_for_dead_chips(short)
+    assert srv.fsm.state is ServerState.HEALTHY, "one short sample at a time is a blip"
+    assert not [k for k, _ in events if k == "chips_missing"]
+
+    await srv.sampler.check_for_dead_chips(short)
+    missing = [f for k, f in events if k == "chips_missing"]
+    assert missing == [{"present": 24, "expected": 32}], events
+    assert srv.fsm.record.dirty is True and srv.fsm.record.why == "heartbeat"
+
+    await srv.sampler.check_for_dead_chips(short)
+    assert len([k for k, _ in events if k == "chips_missing"]) == 1, "no re-journal once dirty"
+
+
+@pytest.mark.asyncio
+async def test_a_host_with_no_baseline_is_unchanged_by_the_count_check(monkeypatch):
+    """No baseline (no override, no chip_baseline.json) means expected 0: neither the liveness read,
+    the sampler nor the dispatch recheck may read any count as short, or re-read anything."""
+    monkeypatch.delenv("TT_DEVICE_MCP_EXPECTED_CHIPS", raising=False)
+    monkeypatch.setattr(srv.sampler, "short_count_strikes", 0)
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", False)
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda: True)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: _beats(24))
+    monkeypatch.setattr(srv, "heartbeat_verdict", _no_heartbeat_verdict)
+    monkeypatch.setattr(srv, "_device_health_gate", _unreachable_gate)
+    monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None)
+    monkeypatch.setattr(srv.health_monitor, "_readings", None)  # never dated: stale
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+
+    assert srv._device_liveness_reason() == ""
+    for _ in range(3):
+        await srv.sampler.check_for_dead_chips({str(i): [0x1000 + i] for i in range(24)})
+    await srv._ensure_device_clean_for_next_job(None)
+
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert not events, events
+
+
+def _stale_healthy_device(monkeypatch, *, age_sec: float, present: int = 32):
+    """A HEALTHY 32-chip host whose last gate verdict is ``age_sec`` old."""
+    fsm_healthy(srv)
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    monkeypatch.delenv("TT_DEVICE_MCP_DISPATCH_RECHECK_SEC", raising=False)
+    monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None)
+    monkeypatch.setattr(
+        srv.health_monitor,
+        "_readings",
+        HealthState(phase="post-job", at=datetime.now() - timedelta(seconds=age_sec), expected=32),
+    )
+    monkeypatch.setattr(srv, "_present_chip_indices", lambda: [str(i) for i in range(present)])
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda: True)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: _beats(present))
+    monkeypatch.setattr(srv, "eth_check_armed", False)
+    monkeypatch.setattr(srv, "device_op_active", "")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+
+    async def _no_fabric(*a, **k):
+        raise AssertionError("the dispatch recheck must never run the fabric traffic pass")
+
+    async def _no_snapshot(*a, **k):
+        raise AssertionError("the dispatch recheck must never run the full gate pass")
+
+    monkeypatch.setattr(srv.health_monitor, "verify_fabric_health", _no_fabric)
+    monkeypatch.setattr(srv.health_monitor, "update", _no_snapshot)
+
+
+@pytest.mark.asyncio
+async def test_a_stale_verdict_runs_the_heartbeat_once_before_dispatch(monkeypatch, tmp_path):
+    """The last verdict is taken at the end of the previous job; on an idle box the next tenant
+    arrives long after. Past the window the two-sample heartbeat runs once before dispatch, the
+    verdict lands in the job log, and the next job inside the window pays nothing."""
+    _stale_healthy_device(monkeypatch, age_sec=3600)
+    monkeypatch.setattr(srv, "_device_health_gate", _unreachable_gate)
+    calls = []
+
+    def _healthy(expected):
+        calls.append(expected)
+        return Verdict.HEALTHY, f"{expected} chips, heartbeat advancing", {}
+
+    monkeypatch.setattr(srv, "heartbeat_verdict", _healthy)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    job_log = tmp_path / "job.log"
+    job_log.write_text("")
+
+    await srv._ensure_device_clean_for_next_job(job_log)
+    await srv._ensure_device_clean_for_next_job(None)  # back-to-back: inside the window
+
+    assert calls == [32], calls
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert "HEALTH-GATE[dispatch-recheck]" in job_log.read_text()
+    assert [f["ok"] for k, f in events if k == "dispatch_recheck"] == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_verdict_runs_no_recheck(monkeypatch):
+    """A verdict inside the window is trusted as-is: nothing is listed, sampled or read."""
+    _stale_healthy_device(monkeypatch, age_sec=10)
+    monkeypatch.setattr(srv, "eth_check_armed", True)
+    monkeypatch.setattr(srv, "_device_health_gate", _unreachable_gate)
+    monkeypatch.setattr(srv, "heartbeat_verdict", _no_heartbeat_verdict)
+
+    def _no_listing():
+        raise AssertionError("a fresh verdict must not list the device")
+
+    async def _no_eth(*a, **k):
+        raise AssertionError("a fresh verdict must not read the eth cores")
+
+    monkeypatch.setattr(srv, "_present_chip_indices", _no_listing)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", _no_eth)
+
+    await srv._ensure_device_clean_for_next_job(None)
+
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_failing_recheck_holds_the_job_at_the_door(monkeypatch):
+    """A stale HEALTHY verdict over a frozen ARC or a short mesh must not dispatch: the recheck marks
+    the device dirty, the admission loop runs the pre-job gate, and a gate that cannot clear it leaves
+    a reason that keeps the job out."""
+    for present, verdict in ((32, Verdict.UNHEALTHY), (24, Verdict.HEALTHY)):
+        _stale_healthy_device(monkeypatch, age_sec=3600, present=present)
+        heartbeats = []
+
+        def _verdict(expected, _v=verdict):
+            heartbeats.append(expected)
+            return _v, "chip 3 heartbeat not advancing", {}
+
+        monkeypatch.setattr(srv, "heartbeat_verdict", _verdict)
+        gates = []
+
+        async def _gate_cannot_clear(*a, **k):
+            gates.append(k.get("phase"))
+
+        monkeypatch.setattr(srv, "_device_health_gate", _gate_cannot_clear)
+        patch_health_event(monkeypatch, lambda *a, **k: None)
+
+        reason = await srv._await_device_free_for_tenant(None)
+
+        assert reason, f"present={present}: a failed recheck dispatched the job"
+        assert srv.fsm.record.dirty is True and srv.fsm.record.why == "heartbeat"
+        assert gates and set(gates) == {"pre-job"}, gates
+        if present < 32:
+            assert heartbeats == [], "a short count fails before the heartbeat sample"
+
+
+@pytest.mark.asyncio
+async def test_the_dispatch_recheck_never_runs_the_fabric_pass(monkeypatch):
+    """With the eth rung armed and no tenant on the device, the recheck reads the eth cores once —
+    passive — and never reaches the fabric traffic pass or the full gate snapshot (I12)."""
+    _stale_healthy_device(monkeypatch, age_sec=3600)
+    monkeypatch.setattr(srv, "eth_check_armed", True)
+    monkeypatch.setattr(srv, "_device_health_gate", _unreachable_gate)
+    monkeypatch.setattr(srv, "heartbeat_verdict", lambda expected: (Verdict.HEALTHY, "ok", {}))
+    eth_reads = []
+
+    async def _eth_ok(*a, **k):
+        eth_reads.append(1)
+        return True, "all active eth heartbeats advancing"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", _eth_ok)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+
+    await srv._ensure_device_clean_for_next_job(None)
+
+    assert eth_reads == [1]
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_frozen_eth_read_at_the_recheck_holds_not_resets(monkeypatch):
+    """A frozen eth core found at the door is held for self-heal like any other (I16): the job is
+    kept out, the device is not marked for a reset, and no gate pass runs."""
+    _stale_healthy_device(monkeypatch, age_sec=3600)
+    monkeypatch.setenv("TT_DEVICE_MCP_ETH_FREEZE_HOLD", "1")
+    monkeypatch.setattr(srv, "eth_check_armed", True)
+    monkeypatch.setattr(srv, "_device_health_gate", _unreachable_gate)
+    monkeypatch.setattr(srv, "heartbeat_verdict", lambda expected: (Verdict.HEALTHY, "ok", {}))
+
+    async def _eth_frozen(*a, **k):
+        return False, "eth core 5 heartbeat frozen"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", _eth_frozen)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+
+    reason = await srv._await_device_free_for_tenant(None)
+
+    assert reason, "a frozen eth core at the door dispatched the job"
+    assert srv.fsm.record.why == "eth_frozen"
+    assert srv.fsm.record.dirty is False, "a frozen core is held for self-heal, never queued for a reset"
+
+
 @pytest.mark.asyncio
 async def test_prejob_probe_runs_on_the_clean_device_admission_path(monkeypatch):
     """The probe only protects a tenant if it runs on the path a tenant job actually takes:
@@ -10848,3 +11093,89 @@ def test_forced_escalation_names_the_watchdog_clock_that_fired(monkeypatch):
 
     assert held_for(122) == "the 120s off-bus one-shot"
     assert held_for(603) == "the 600s ceiling (window 1)"
+
+
+@pytest.mark.asyncio
+async def test_a_short_count_under_an_off_bus_hold_stays_held(monkeypatch):
+    """The gate holds a sub-floor drop with dirty=False and relifts it when the chips return. The
+    sampler still sees the short count, but it is that same fault: re-dirtying it would disable the
+    idle relift and send every admission poll back through the ladder the gate chose not to run."""
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", False)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    srv.fsm.on_fault("off_bus", detail="8 chips off the bus — held for self-heal", dirty=False)
+
+    for _ in range(3):
+        await srv.sampler.check_for_dead_chips({str(i): [0x1000 + i] for i in range(24)})
+
+    assert srv.fsm.record.why == "off_bus" and srv.fsm.record.dirty is False
+    assert not [k for k, _ in events if k == "chips_missing"]
+
+
+@pytest.mark.asyncio
+async def test_health_checks_off_skip_the_count_check(monkeypatch):
+    """TT_DEVICE_MCP_HEALTH_CHECK=0 switches the checks off (I25). A baseline above the real count
+    (a board pulled) must not then block every admission or have the sampler re-dirty the device."""
+    monkeypatch.setenv("TT_DEVICE_MCP_HEALTH_CHECK", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", False)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda: True)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: _beats(24))
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+
+    assert srv._device_liveness_reason() == ""
+    for _ in range(3):
+        await srv.sampler.check_for_dead_chips({str(i): [0x1000 + i] for i in range(24)})
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert not [k for k, _ in events if k == "chips_missing"]
+
+
+@pytest.mark.asyncio
+async def test_the_dispatch_recheck_off_switch_tenant_and_errors(monkeypatch):
+    """Three edges of the recheck: 0 turns it off; a foreign tenant on the device (or a scan too
+    blind to rule one out) skips the eth read, which maps every chip; and a recheck that raises is
+    not a verdict — it is logged, and the device is not marked."""
+    _stale_healthy_device(monkeypatch, age_sec=3600)
+    monkeypatch.setattr(srv, "_device_health_gate", _unreachable_gate)
+    monkeypatch.setattr(srv, "eth_check_armed", True)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    marked = []
+    monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marked.append(reason))
+    beats = []
+
+    def _healthy(expected):
+        beats.append(expected)
+        return Verdict.HEALTHY, "ok", {}
+
+    async def _no_eth(*a, **k):
+        raise AssertionError("the eth read must not run beside a tenant")
+
+    monkeypatch.setattr(srv, "heartbeat_verdict", _healthy)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", _no_eth)
+
+    monkeypatch.setenv("TT_DEVICE_MCP_DISPATCH_RECHECK_SEC", "0")
+    await srv._ensure_device_clean_for_next_job(None)
+    assert beats == [], "a window of 0 turns the recheck off"
+
+    monkeypatch.delenv("TT_DEVICE_MCP_DISPATCH_RECHECK_SEC")
+    for scan in (
+        HolderScan(holders=[DeviceHolder(pid=4242, uid=1000)], complete=True),
+        HolderScan(holders=[], complete=False),
+    ):
+        monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None)
+        monkeypatch.setattr(srv, "enumerate_device_holders", lambda _s=scan: _s)
+        await srv._ensure_device_clean_for_next_job(None)
+    assert beats == [32, 32] and not marked
+
+    def _raises(expected):
+        raise RuntimeError("sysfs read failed")
+
+    monkeypatch.setattr(srv, "heartbeat_verdict", _raises)
+    monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None)
+    await srv._ensure_device_clean_for_next_job(None)
+    assert not marked, "a recheck that could not run must not send the device through the ladder"
+    assert srv.fsm.state is ServerState.HEALTHY
