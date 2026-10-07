@@ -42,6 +42,7 @@ from tt_device_mcp.constants import (
     POST_STEP_DEADLINE_ENV,
     PRE_STEP_DEADLINE_DEFAULT_SEC,
     PRE_STEP_DEADLINE_ENV,
+    RESET_STREAM_KEEPALIVE_LINE,
     resolve_socket,
     step_client_timeout_sec,
     user_state_dir,
@@ -879,7 +880,10 @@ def cmd_logs(args) -> int:
         return 0
 
 
-RESET_TIMEOUT = 300  # `tt-smi -r` on a 32-chip Galaxy takes ~45-60s; well under this.
+# Per read, not per reset: the broker sends a keepalive line on every quiet stretch
+# (RESET_STREAM_KEEPALIVE_SEC), so against a broker that sends keepalives only one that
+# has gone away trips this. An older broker sends none, and a reset quiet this long trips it.
+RESET_TIMEOUT = 300
 
 
 def _open_reset_stream(
@@ -935,6 +939,8 @@ def _print_stream_with_dots(resp, interval: float = 2.0):
         if item is DONE:
             break
         for line in item.splitlines():
+            if line == RESET_STREAM_KEEPALIVE_LINE:
+                continue  # the broker is alive; the dots already say we are waiting
             if line.startswith("::status::"):
                 status = line[len("::status::") :].strip()
                 continue
@@ -955,7 +961,7 @@ def cmd_reset(args) -> int:
         return 1
 
     try:
-        conn, resp = _open_reset_stream(args.port, {"force": args.force})
+        conn, resp = _open_reset_stream(args.port, {"force": args.force, "keepalive": True})
     except OSError as exc:
         print(f"Error talking to broker: {exc}")
         return 1

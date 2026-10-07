@@ -186,8 +186,12 @@ server's peercred check (spec 05 I5), so nothing the CLI sends can grant a forei
 socket. A server refusal prints the error
 and exits 1.
 
-**`reset`.** Opens the streaming route with a 300 s connection timeout, prints each progress line
-as it arrives, and prints a `.` every 2 s while waiting so a long `tt-smi -r` is visibly alive.
+**`reset`.** Opens the streaming route asking for keepalives (`{"force", "keepalive": true}`, spec
+02 REST semantics), prints each progress line as it arrives, and prints a `.` every 2 s while
+waiting so a long `tt-smi -r` is visibly alive. Keepalive lines are not printed. `RESET_TIMEOUT`
+(300 s) is the longest allowed gap between reads, not a cap on the reset: a broker that sends
+keepalives never leaves a gap that long, so only a broker that has gone away trips it. An older
+broker sends none, and a reset that is silent for 300 s still reads as a stream error there.
 The trailing `::status::<x>` sentinel (spec 02 REST semantics) decides the exit code; no sentinel
 is a failure. Gate, quiesce, and audit are the server's (spec 04).
 
@@ -301,6 +305,8 @@ non-zero keeps that bit honest; `exec` propagates the real exit code because a d
 | I9 (a deferred dispatch is diagnosable: health_event + log line, holder named in queue/status) | `tests/test_slurm_steps.py::test_a_deferred_dispatch_is_visible_in_the_health_log_and_the_queue_status` |
 | I9 (a non-finite deadline env var falls back to the default, in both the deadline and the derived client timeout) | `tests/test_cli.py::test_a_non_finite_step_deadline_falls_back_to_the_default`, `tests/test_cli.py::test_a_non_finite_step_deadline_env_var_does_not_disable_the_cli_socket_timeout` |
 | `post-step` carries the step's exit code and the reclaim switch | `tests/test_cli.py::test_post_step_sends_the_exit_code_and_reclaim_flag` |
+| `reset` asks for keepalives | `tests/test_cli.py::test_cmd_reset_opens_the_stream_with_the_arguments_it_was_given` |
+| `reset` hides keepalives and still reads the status | `tests/test_cli.py::test_reset_stream_hides_keepalives_and_still_reads_the_status` |
 | step verbs exist under the names a site scripts | `tests/test_cli.py::test_cli_step_commands_exist` |
 
 Unanchored (verified against `cli.py` directly, no test exercises them): I4's exit-code mapping

@@ -56,6 +56,8 @@ from tt_device_mcp.constants import (
     POST_STEP_DEADLINE_ENV,
     PRE_STEP_DEADLINE_DEFAULT_SEC,
     PRE_STEP_DEADLINE_ENV,
+    RESET_STREAM_KEEPALIVE_LINE,
+    RESET_STREAM_KEEPALIVE_SEC,
     SIGTERM_GRACE_SEC,
     STAGE_BRIDGE_RESET,
     STAGE_HOST_REBOOT,
@@ -6743,11 +6745,45 @@ def create_mcp_server() -> MCPServer:
                 status = "reset_unhealthy"  # the reset ran; the mesh is not back
         yield f"::status::{status}\n"
 
+    async def _with_keepalive(lines):
+        """Pass ``lines`` through, adding a keepalive line after every quiet
+        RESET_STREAM_KEEPALIVE_SEC. The pending step is never cancelled on a quiet
+        interval: we wait on the same task again, so the reset is not disturbed."""
+        nxt = None
+        try:
+            while True:
+                if nxt is None:
+                    nxt = asyncio.ensure_future(lines.__anext__())
+                done, _ = await asyncio.wait({nxt}, timeout=RESET_STREAM_KEEPALIVE_SEC)
+                if not done:
+                    yield RESET_STREAM_KEEPALIVE_LINE + "\n"
+                    continue
+                try:
+                    line = nxt.result()
+                except StopAsyncIteration:
+                    return
+                nxt = None
+                yield line
+        finally:
+            if nxt is not None and not nxt.done():
+                # Cancelling the pending step ends ``lines`` (the CancelledError leaves it through
+                # __anext__); waiting for that keeps aclose() from racing it ("already running").
+                # Under ASGI 2.3 anyio delivers the client's cancel again here, so the gather
+                # raises and aclose() is skipped: harmless, as the cancelled step has already
+                # closed the generator. reset_task is not awaited by the step, so it runs on.
+                nxt.cancel()
+                await asyncio.gather(nxt, return_exceptions=True)
+            await lines.aclose()
+
     @mcp.custom_route("/api/tt_device_reset_stream", methods=["POST"])
     async def api_reset_stream(request: Request) -> StreamingResponse:
-        """REST API: streaming reset — emits progress lines as they happen."""
+        """REST API: streaming reset — emits progress lines as they happen. Keepalive
+        lines are opt-in: an older CLI would print the sentinel verbatim."""
         data = await request.json()
-        return StreamingResponse(_reset_stream(bool(data.get("force", False))), media_type="text/plain")
+        lines = _reset_stream(bool(data.get("force", False)))
+        if data.get("keepalive"):
+            lines = _with_keepalive(lines)
+        return StreamingResponse(lines, media_type="text/plain")
 
     async def _smi_stream(args, cols, rows):
         """Run tt-smi live (read-only) over a pty and stream its bytes. Unlike a
