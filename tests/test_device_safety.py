@@ -3020,6 +3020,44 @@ async def test_rest_submit_bad_env_file_is_a_refusal_not_a_500(monkeypatch, clea
 
 
 @pytest.mark.asyncio
+async def test_submit_refuses_an_env_file_the_peer_uid_could_not_read(monkeypatch, clear_job_state, tmp_path):
+    """Under active privsep the daemon runs as root and would otherwise open() a caller-named
+    env file itself, bypassing DAC — an arbitrary-root-read that surfaces back to the caller
+    via their own job log (spec 05). _queue_job must refuse before ever reading the file when
+    the peer uid could not have read it themselves."""
+    from tt_device_mcp.socket_transport import current_peer_uid
+
+    srv.device_op_lock = None
+    monkeypatch.setattr(srv, "job_log_dir", None)
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    monkeypatch.setattr(srv, "should_privsep", lambda: True)
+    monkeypatch.setattr(srv, "path_readable_by_uid", lambda path, uid: False)
+    load_calls = []
+    monkeypatch.setattr(
+        srv,
+        "get_activation_script",
+        lambda *a, **k: load_calls.append(1) or ("", {}),
+    )
+
+    env_file = tmp_path / "root_only.yaml"
+    env_file.write_text("SECRET: shh\n")
+
+    mcp = srv.create_mcp_server()
+    token = current_peer_uid.set(4321)
+    try:
+        out = await mcp.call_tool(
+            "tt_device_job_run_bg",
+            {"params": {"workspace": str(tmp_path), "command": "echo hi", "env": str(env_file)}},
+        )
+    finally:
+        current_peer_uid.reset(token)
+
+    body = json.loads(out.content[0].text)
+    assert "error" in body and "job_id" not in body, f"expected a refusal, got {body}"
+    assert not load_calls, "the env file was read despite failing the peer-uid readability check"
+
+
+@pytest.mark.asyncio
 async def test_broker_row_times_the_stage_it_names(monkeypatch):
     """The row's clock and the row's label have to measure the same thing.
 

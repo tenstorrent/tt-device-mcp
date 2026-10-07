@@ -6,7 +6,7 @@ and never dispatch onto a mesh the broker cannot prove fit.
 
 ## How to work in this repo — spec-driven
 
-The specs under `specs/` are normative; the ~970-test suite enforces them. Before touching
+The specs under `specs/` are normative; the 1100+-test suite enforces them. Before touching
 a subsystem, **read its spec** (index below). To change behavior:
 
 1. Edit the owning spec first — the Invariants/Behavior text states the new intent.

@@ -16,8 +16,10 @@ TTSMI="${TTDEV_VENV:-/opt/tt-device-broker/venv}/bin/tt-smi"
 [ -n "$TTSMI" ] && [ -x "$TTSMI" ] || { echo "tt-smi-ro: tt-smi not found" >&2; exit 1; }
 
 # Allowlist of read-only flags; bare (no args) = the interactive dashboard.
-# Any other flag (reset/config/blinky) is refused.
-SAFE=" -ls --list -s --snapshot --snapshot_no_tty -v --version -l --local -f --filename -h --help "
+# Any other flag (reset/config/blinky) is refused. `-f`/`--filename` is
+# deliberately excluded: paired with `-s`/`--snapshot` it makes tt-smi WRITE the
+# snapshot JSON to a caller-supplied path as root, which is not read-only.
+SAFE=" -ls --list -s --snapshot --snapshot_no_tty -v --version -l --local -h --help "
 for a in "$@"; do
     case "$a" in
         -*) case "$SAFE" in *" $a "*) ;; *) echo "tt-smi-ro: '$a' is not allowed (read-only)" >&2; exit 2;; esac ;;

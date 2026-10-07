@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
 # Installed to /etc/sudoers.d/tt-device-mcp-smi (mode 0440) on a LOCKED host.
 # Lets any user run read-only tt-smi as root so they can watch telemetry/power
 # while jobs run, without bare-metal device access. The target is the fixed

@@ -90,13 +90,32 @@ that did not come through the broker at all.
   the root-owned NOPASSWD wrapper installed by `lock` re-enforces the same read-only allowlist
   itself (any user may exec it, so it cannot trust its caller). The streaming server-side smi
   applies the same allowlist (`smi_args_ok`) before running as the broker. A sudoers drop-in that
-  fails `visudo -c` is not installed.
+  fails `visudo -c` is not installed. `-f`/`--filename` is excluded from every copy of the
+  allowlist: paired with `-s`/`--snapshot` it makes tt-smi *write* the snapshot to a
+  caller-supplied path — as root, through the wrapper — which is not read-only.
 - **I11 — An anonymous caller owns no holder.** Where an action is gated on device holders
   (the reset gate, spec 04), the caller's identity is the socket peer uid. Over HTTP on a privsep
   host there is no identity to scope the gate to, so every tenant holder counts as foreign and the
   gate fails closed; off privsep, HTTP keeps the legacy single-tenant skip. `MIN_TENANT_UID`
   (1000) divides tenants from infrastructure: holders below it (root, telemetry daemons) never
   count as foreign.
+- **I12 — Only a job's owner reads its logs or captured output.** `_get_job_logs` and the
+  `job_status` MCP tool's `output`/`error` fields are gated the same way `_kill_job` is
+  (`authz_owner` + `owner_matches`): log content carries the job's resolved environment
+  variables in cleartext (written at submission for debuggability) plus full stdout/stderr, so a
+  non-owner is refused rather than handed another tenant's secrets. This is narrower than the
+  shared visibility every caller already gets: `_get_queue_status`/`_recent_jobs` (and the bare
+  `_get_job_status` metadata — owner/command/status/exit_code) are intentionally visible to any
+  caller for queue coordination, and stay that way.
+- **I13 — Under privsep, root never reads a caller-named path further than the caller could.**
+  Before `_queue_job` opens a submitted `env` file, it runs as root (privsep implies euid 0);
+  the job's own systemd-run scope — which would read it as the real submitter — does not exist
+  yet. `path_readable_by_uid` reproduces the kernel's DAC decision for the peer uid (every
+  ancestor directory's execute bit, then the leaf's read bit) and `_queue_job` refuses the
+  submission rather than let root's `open()` bypass it; the file is never read as the daemon on
+  a path the submitter themselves could not read. This closes an arbitrary-root-read whose
+  output would otherwise surface straight back to the caller through their own job log (I12
+  covers who may read the log; this covers what the daemon may read to produce it).
 
 ## Interfaces
 
@@ -286,5 +305,9 @@ job-side record to the one case with no alternative.
 | I10 (streaming smi allowlist) | `tests/test_reset.py::test_smi_args_ok_allows_readonly_rejects_reset` |
 | I11 (anonymous fails closed) | `tests/test_reset.py::test_privsep_http_reset_refuses_over_a_foreign_holder`, `tests/test_reset.py::test_privsep_http_reset_allows_a_provably_idle_device`, `tests/test_reset.py::test_non_privsep_http_reset_keeps_the_legacy_skip`, `tests/test_reset.py::test_privsep_streaming_reset_refuses_over_a_foreign_holder` |
 | I11 (tenant boundary) | `tests/test_reset_gate.py::TestForeignHolders::test_ignores_system_holders`, `tests/test_reset_gate.py::TestForeignHolders::test_foreign_holders_filters_caller` |
+| I12 (logs owner-gated) | `tests/test_authz.py::TestJobLogsAuthz::test_the_owner_can_read_their_own_logs`, `tests/test_authz.py::TestJobLogsAuthz::test_a_different_caller_is_refused_the_content` |
+| I12 (captured output owner-gated, metadata stays shared) | `tests/test_authz.py::TestJobLogsAuthz::test_job_status_omits_output_for_a_different_caller` |
+| I13 (DAC reproduction) | `tests/test_privsep.py::TestPathReadableByUid::test_root_can_read_anything`, `tests/test_privsep.py::TestPathReadableByUid::test_world_readable_file_in_world_traversable_dirs_is_readable`, `tests/test_privsep.py::TestPathReadableByUid::test_owner_only_file_is_not_readable_by_another_uid`, `tests/test_privsep.py::TestPathReadableByUid::test_owner_only_file_is_readable_by_its_owner`, `tests/test_privsep.py::TestPathReadableByUid::test_an_unsearchable_parent_directory_blocks_the_read`, `tests/test_privsep.py::TestPathReadableByUid::test_a_missing_path_is_not_readable` |
+| I13 (submission refused before the file is read) | `tests/test_device_safety.py::test_submit_refuses_an_env_file_the_peer_uid_could_not_read` |
 | B-Privsep launch (gid modes) | `tests/test_privsep.py::test_systemd_run_prefix_cooperative_keeps_user_gid`, `tests/test_privsep.py::test_systemd_run_prefix_lockdown_uses_device_gid`, `tests/test_privsep.py::test_cooperative_mode_keeps_user_gid`, `tests/test_privsep.py::test_lockdown_uses_device_gid_via_env` |
 | B-Kill (scope-aware terminate) | `tests/test_reset.py::test_a_live_privsep_kill_signals_the_scope_not_the_pgroup`, `tests/test_reset.py::test_terminate_job_falls_back_to_killpg_without_a_scope` |
