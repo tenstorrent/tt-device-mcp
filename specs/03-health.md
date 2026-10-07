@@ -99,7 +99,8 @@ job boundary.
   proves the host has shown chips).
 - **I12 — The fabric traffic pass never runs on a submitter's clock.** Pre-job the gate never
   runs it, dirty or not — the flag is already the answer. It runs post-job on a failed job
-  (forced), at startup (forced), inside the recovery ladder, and on a `run_fabric` caller only
+  (forced), at startup (forced), inside the recovery ladder, after an operator's reset of a mesh
+  (spec 04 I13 — the operator's clock, not a submitter's), and on a `run_fabric` caller only
   when no pass is fresher than `FABRIC_CHECK_MIN_INTERVAL_SEC` (default 1200s).
 - **I13 — The gate never resets over a tenant.** A foreign holder (uid ≥ `MIN_TENANT_UID`,
   1000) skips the gate untouched: verification is deferred, an existing hold outlives the skip
@@ -636,10 +637,14 @@ traffic pass both time out. The first two readings contradict the second pair, a
 contradiction IS the eth/fabric wedge — heartbeat and snapshot both score a wedged mesh as fine.
 The broker holds at `fsm_why=eth_frozen` (or `fabric_unverified`) and will not reset itself while
 0 chips are off the bus — below the mass-drop floor — and the self-heal relift cannot lift it,
-because the read that would clear the hold is the read that is wedged. The reset's own verify is
-heartbeat + snapshot, the pair blind to this fault, so `reset_complete`/`health_ok: true` is not
-proof of recovery here; only a later gate's real `fabric: OK` (or a passing job) is. The hold
-model, not the reset procedure, is this spec's contract; the reset path is spec 04.
+because the read that would clear the hold is the read that is wedged. An operator reset of the
+mesh is therefore verified with the eth read and the fabric pass (spec 04 I13): it releases only on
+a real `fabric: OK`, a failing pass leaves the mesh dirty (`reset_unhealthy`), and a pass that still
+cannot reach a verdict holds `fabric_unverified` (`reset_unverified`) with the reported fault kept.
+Where no fabric check is installed the reset can only verify heartbeat + snapshot, the pair blind to
+this fault, so there `reset_complete`/`health_ok: true` is not proof of recovery; only a later
+gate's real `fabric: OK` (or a passing job) is. The hold model, not the reset procedure, is this
+spec's contract; the reset path is spec 04.
 
 ## Per-user health
 
@@ -710,7 +715,7 @@ refuses.
 | I9 AER totals do not double-count the kernel's own TOTAL_ERR line | `tests/test_device_safety.py::test_sum_aer_does_not_double_count_the_kernels_own_total` |
 | I10 | `tests/test_monitor.py::test_status_never_blocks_before_the_first_update`, `tests/test_monitor.py::test_update_overwrites_readings` |
 | I11 | `tests/test_device_safety.py::test_a_mesh_that_lost_chips_does_not_lower_its_own_bar`, `tests/test_device_safety.py::test_expected_chip_count_survives_an_unreadable_baseline`, `tests/test_device_safety.py::test_an_unreadable_baseline_with_no_chips_present_is_not_read_as_device_less`, `tests/test_device_safety.py::test_a_host_with_no_baseline_and_no_chips_stays_device_less` |
-| I12 | `tests/test_device_safety.py::test_the_pre_job_gate_never_runs_the_slow_fabric_pass`, `tests/test_device_safety.py::test_a_clean_job_does_not_pay_for_a_fabric_pass`, `tests/test_device_safety.py::test_a_failed_job_forces_a_fabric_pass_even_inside_the_quiet_window`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[540-False]`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[660-True]`, `tests/test_device_safety.py::test_fabric_interval_defaults_to_twenty_minutes` |
+| I12 | `tests/test_device_safety.py::test_the_pre_job_gate_never_runs_the_slow_fabric_pass`, `tests/test_device_safety.py::test_a_clean_job_does_not_pay_for_a_fabric_pass`, `tests/test_device_safety.py::test_a_failed_job_forces_a_fabric_pass_even_inside_the_quiet_window`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[540-False]`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[660-True]`, `tests/test_device_safety.py::test_fabric_interval_defaults_to_twenty_minutes`, `tests/test_reset.py::test_an_operator_reset_on_a_mesh_releases_only_on_a_fabric_pass` |
 | I13 | `tests/test_readopt.py::test_startup_hold_names_the_foreign_holder_blocking_the_verify`, `tests/test_device_safety.py::test_governor_never_reboots_over_a_tenant`, `tests/test_device_safety.py::test_a_tenant_arriving_before_the_reboot_decision_blocks_it`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_under_a_foreign_tenant` |
 | I14 | `tests/test_device_safety.py::test_an_empty_dev_dir_on_a_host_that_expects_chips_holds_not_releases`, `tests/test_device_safety.py::test_a_device_less_host_never_reads_an_empty_sysfs_as_a_drop` |
 | I15 | `tests/test_device_safety.py::test_an_unverified_clear_holds_the_device`, `tests/test_device_safety.py::test_a_gate_that_errored_holds`, `tests/test_device_safety.py::test_a_clean_device_is_not_held_by_an_unverified_clear`, `tests/test_device_safety.py::test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace`, `tests/test_device_safety.py::test_a_verified_clear_names_itself_and_records_it_was_verified` |

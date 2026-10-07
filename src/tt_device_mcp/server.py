@@ -2357,6 +2357,53 @@ def _hold_device_fabric_unverified(why: str) -> None:
     fsm.on_fault("fabric_unverified", detail=why, dirty=False)
 
 
+async def _verify_operator_reset(present: int, recovery, log, source: str) -> tuple[Optional[bool], str]:
+    """Verify an operator reset (the tool or the stream) whose command exited 0, and settle the
+    device on the verdict. Caller holds the device-op lock: a multi-chip verify runs the fabric pass.
+
+    A single chip has no fabric, so heartbeat + snapshot is the whole proof; so is it on a mesh with
+    no fabric check installed, which says so in its log. Any other multi-chip mesh is
+    verified the way the broker verifies its own resets (``_verify_device_after_reset``: eth read and
+    fabric pass, re-checked while the links train), because heartbeat + snapshot score a wedged eth
+    core as fine — releasing on them reopened the door onto the very wedge the operator reset for.
+
+    Returns ``(verdict, detail)``: True verified, the device released and a runtime-reported fault
+    retired (on the light path too: it is the strongest verify that host has, and the reset is the
+    remedy the fault was pending); False unhealthy, the device marked dirty so the next gate owes it a real recovery; None
+    the fabric could not be verified, held ``fabric_unverified`` with the reported fault kept."""
+    expected = recovery.monitor.expected(present)
+    if expected > 1 and fabric.build_command() is not None:
+        ok, ev, _retries = await recovery._verify_device_after_reset(expected, log)
+        verdict = True if ok else None if recovery._fabric_ran_but_unverified(ev) else False
+    else:
+        if expected > 1:
+            # Holding for a verdict this host can never produce would strand it after every reset.
+            log("no fabric check installed on this host: heartbeat + snapshot only, which does not prove the fabric")
+        # The host's own chip count, never the survivors: a mesh back short must not verify N-of-N.
+        ok, ev = await fsm.observe(expected, log, run_fabric=False, recovery=recovery)
+        verdict = ok
+    detail = next(
+        (
+            ev[k].get("detail")
+            for k in ("fabric", "eth_heartbeat", "snapshot", "heartbeat", "hostpci")
+            if (ev.get(k) or {}).get("detail")
+        ),
+        "",
+    )
+    if verdict:
+        _clear_device_reported_fault(f"{source}: verified healthy")
+        _clear_device_dirty(verified=True, why=f"{source}: verified healthy")
+    elif verdict is None:
+        _hold_device_fabric_unverified(f"{source}: enum+ARC healthy, fabric unverified after the post-reset retries")
+    else:
+        _mark_device_dirty(f"{source}: the mesh did not verify after the reset: {detail}", why="probe_unhealthy")
+    return verdict, detail
+
+
+def _reset_health_label(verdict: Optional[bool]) -> str:
+    return "OK" if verdict else "UNVERIFIED (fabric could not be checked)" if verdict is None else "UNHEALTHY"
+
+
 # A detector whose cost is a property of the box proves itself here, once per broker start, rather
 # than waiting on an operator to arm it. The eth read sat inert for weeks — 25 SKIPPED, 0 verdicts —
 # because "nobody armed it" and "it is broken" look identical from outside. An opt-in nobody exercises
@@ -6632,7 +6679,7 @@ def create_mcp_server() -> MCPServer:
     async def _reset_stream(force: bool):
         """Yield reset progress line-by-line as it happens, including tt-smi output
         live, so the CLI can print each step as it arrives. Final line is
-        '::status::<reset_complete|reset_failed|refused|no_devices>'."""
+        '::status::<reset_complete|reset_unhealthy|reset_unverified|reset_failed|refused|no_devices>'."""
         global current_process
 
         caller_uid = current_peer_uid.get()
@@ -6699,47 +6746,47 @@ def create_mcp_server() -> MCPServer:
         reset_owner = _reset_action_owner()
         _plog = (lambda m: logger.info(m)) if logger else (lambda m: None)
         output_queue: asyncio.Queue[str] = asyncio.Queue()
+        reset_streamed = False
+
+        def on_reset_output(chunk: str) -> None:
+            nonlocal reset_streamed
+            reset_streamed = True
+            output_queue.put_nowait(chunk)
 
         async def run_reset():
             async with _device_op("reset", owner=reset_owner):
                 health_event("reset_begin", argv=argv, expected_chips=len(indices))
-                return await recovery_mechanism.reset_with_quiesce(
-                    argv,
-                    _plog,
-                    reset_owner,
-                    output_queue.put_nowait,
+                rc, output = await recovery_mechanism.reset_with_quiesce(argv, _plog, reset_owner, on_reset_output)
+                if output and not reset_streamed:
+                    output_queue.put_nowait(output if output.endswith("\n") else output + "\n")
+                output_queue.put_nowait(f"exit code: {rc}\n")
+                if rc != 0:
+                    return rc, False, ""
+                # Exit 0 says tt-smi ran, not that the mesh came back, so verify before the door
+                # reopens — still under the device-op lock, because on a mesh the verify is a fabric
+                # pass and no gate or job may share the fabric with it. Its progress streams too:
+                # the pass and its retry are minutes of otherwise silent stream.
+                verdict, detail = await _verify_operator_reset(
+                    len(indices), recovery, lambda m: output_queue.put_nowait(f"{m}\n"), "operator reset stream"
                 )
+                return rc, verdict, detail
 
         reset_task = asyncio.create_task(run_reset())
-        streamed = False
         while not reset_task.done():
             try:
                 chunk = await asyncio.wait_for(output_queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
                 continue
-            streamed = True
             yield chunk
-        rc, output = await reset_task
+        rc, verdict, detail = await reset_task
         while not output_queue.empty():
-            streamed = True
             yield output_queue.get_nowait()
-        if output and not streamed:
-            yield output if output.endswith("\n") else output + "\n"
-        yield f"exit code: {rc}\n"
         status = "reset_complete" if rc == 0 else "reset_failed"
         if rc == 0:
-            # Exit 0 says tt-smi ran, not that the mesh came back, and an unverified clear
-            # does not release the device — nothing proved it fit. Leaving that for someone
-            # else to answer parked the operator's freshly-reset box behind a hold until the
-            # next gate happened along. The chips are back or they are not, and it takes a
-            # second to find out, so find out.
-            ok, _ev = await fsm.observe(len(indices), lambda m: None, run_fabric=False, recovery=recovery)
-            detail = (_ev.get("snapshot") or {}).get("detail") or (_ev.get("heartbeat") or {}).get("detail", "")
-            yield f"health: {'OK' if ok else 'UNHEALTHY'} — {detail}\n"
-            if ok:
-                _clear_device_reported_fault("reset stream: verified healthy")
-                _clear_device_dirty(verified=True, why="operator reset stream: verified healthy")
-            else:
+            yield f"health: {_reset_health_label(verdict)} — {detail}\n"
+            if verdict is None:
+                status = "reset_unverified"  # the reset ran; no pass proved the fabric moves data
+            elif not verdict:
                 status = "reset_unhealthy"  # the reset ran; the mesh is not back
         yield f"::status::{status}\n"
 
@@ -8110,17 +8157,14 @@ def create_mcp_server() -> MCPServer:
             # came back so the caller learns the mesh is usable, not just that tt-smi
             # returned 0.
             if rc == 0:
-                health_ok, _ev = await fsm.observe(len(indices), lambda m: step(m), run_fabric=False, recovery=recovery)
-                health_detail = (_ev.get("snapshot") or {}).get("detail") or (_ev.get("heartbeat") or {}).get(
-                    "detail", ""
+                verdict, health_detail = await _verify_operator_reset(
+                    len(indices), recovery, lambda m: step(m), "reset tool"
                 )
-                step(
-                    f"health: {'OK' if health_ok else 'UNHEALTHY'} — {health_detail}",
-                    "info" if health_ok else "warning",
-                )
-                if health_ok:
-                    _clear_device_dirty(verified=True, why="reset tool: verified healthy")
-                else:
+                health_ok = verdict is True
+                step(f"health: {_reset_health_label(verdict)} — {health_detail}", "info" if health_ok else "warning")
+                if verdict is None:
+                    status = "reset_unverified"  # the reset ran; no pass proved the fabric moves data
+                elif not health_ok:
                     status = "reset_unhealthy"  # reset ran but the mesh is not back
 
         return {
@@ -8154,6 +8198,11 @@ def create_mcp_server() -> MCPServer:
         1. Refuse if another user's process is holding the device (reset gate)
         2. Kill any currently running process
         3. Reset all detected Tenstorrent devices via tt-smi
+        4. Verify: on a multi-chip mesh with a fabric check installed this runs
+           the fabric traffic pass (about 1-2 minutes, longer on a retry), so the
+           call returns only once the mesh has moved data. status
+           reset_unverified means the fabric could not be checked; the device
+           stays held until a gate proves it.
 
         A reset is a board-level reset of ALL chips, so resetting while another
         tenant holds the device aborts their run mid-op and can wedge the mesh.
