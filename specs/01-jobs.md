@@ -79,7 +79,8 @@ the queue and a running job outlive the broker process.
   applies equally to re-adopted jobs. A job the broker's own recovery killed is exempt —
   a reset must not justify the next reset.
 - **I15** — Job admission is blocking, not advisory: no job is dispatched onto a device the
-  admission gate reports degraded. By default the job is HELD at the door and re-gated on
+  admission gate reports degraded, nor while the gate errors instead of reaching a verdict
+  (see Queueing and dispatch). By default the job is HELD at the door and re-gated on
   `TENANT_HOLD_POLL_SEC` (60 s) until fit, with no clock bound (a kill releases the hold);
   with `TT_DEVICE_MCP_TENANT_HOLD=0` it is refused at the door as FAILED with the reason in
   its log. Gate internals are spec 03.
@@ -189,11 +190,17 @@ flowchart LR
   unspent remainder since the last job's device work ended); awaits an external
   scheduler's step reservation if one is held (`get_external_step_free_event` — a Slurm
   pre-step/post-step gate call in progress; spec 03 I29 owns the mechanism); runs the
-  admission gate (I15). Two failure shapes there are distinct and both deliberate: a gate pass that runs
-  but cannot verify records the device unverified — "tried and could not tell" is an
+  admission gate (I15). Two failure shapes there are distinct and both fail closed: a gate pass
+  that runs but cannot verify records the device unverified — "tried and could not tell" is an
   affirmative hold; an exception *escaping* the admission predicate (a gate bug) MUST NOT
-  block dispatch — only an affirmative degraded verdict blocks, so a gate bug never turns
-  into a stuck queue (its cost is one ungated dispatch instead). Finally the runner
+  dispatch the job either. The job stays queued at the door and the predicate is retried after
+  a short backoff (`ADMISSION_GATE_RETRY_SEC`: 1 s, then 2 s). After
+  `ADMISSION_GATE_MAX_ERRORS` (3) errors in a row the job takes I15's degraded path (held by
+  default, its hold polls retried the same way; refused with `TT_DEVICE_MCP_TENANT_HOLD=0`), and
+  a device with no episode open gets a `gate_error` hold (an open episode keeps its own `why`).
+  Spec 03's generic escalation lifts that hold, so a gate bug costs a held queue that recovery
+  bounds, never an ungated dispatch. A job cancelled while the gate runs or retries is never
+  dispatched. Finally the runner
   refuses the job if privsep is active but the submitter identity cannot
   be honored (running it as root instead is forbidden — spec 05).
 - Refusals at the door (degraded device, privsep) terminalize the job as FAILED, append a
@@ -293,6 +300,10 @@ flowchart LR
 - **Log file as source of truth from queue time.** Tailable immediately, survives the
   broker, and is the substrate for re-adoption (`_job_from_log`) and history
   (`_recent_jobs`).
+- **Admission errors fail closed.** A gate bug used to dispatch the job ungated, on the theory
+  that a stuck queue was the worse outcome. But the ungated job lands on exactly the device
+  nobody could verify, and the hold is now bounded by the recovery ladder, so a stuck queue is
+  no longer unbounded. A short retry absorbs a one-off error; a persistent one holds the device.
 - **Hold-by-default admission.** A queue should hold jobs while the device recovers, not
   bounce them; the hold became the default once the recovery ladder bounded it. The
   fail-fast refusal remains as opt-out. The hold re-runs the full gate each pass because
@@ -320,7 +331,8 @@ flowchart LR
 | B-Submission (blocking run) | `tests/test_server.py::test_a_blocking_job_run_reports_progress_through_the_mcp_layer` |
 | B-Queueing (cooldown) | `tests/test_device_safety.py::test_an_armed_cooldown_rests_the_mesh_before_the_next_job`, `tests/test_device_safety.py::test_the_default_off_cooldown_never_delays_a_job`, `tests/test_device_safety.py::test_job_cooldown_remaining_is_only_the_unspent_rest[30.0-100.0-110.0-20.0]` |
 | B-Queueing (gate errored → device held) | `tests/test_device_safety.py::test_a_gate_that_errored_holds` |
-| B-Queueing (gate bug ≠ stuck queue) | `tests/test_device_safety.py::test_a_non_dict_job_on_disk_never_poisons_the_gate`, `tests/test_device_safety.py::test_a_non_str_since_on_disk_never_poisons_the_gate` |
+| B-Queueing (admission error fails closed) | `tests/test_device_safety.py::test_an_admission_check_error_retries_instead_of_dispatching`, `tests/test_device_safety.py::test_three_admission_check_errors_in_a_row_hold_the_device`, `tests/test_device_safety.py::test_a_held_job_stays_held_while_the_admission_check_keeps_erroring`, `tests/test_device_safety.py::test_admission_check_errors_leave_an_open_episode_alone[off_bus]`, `tests/test_device_safety.py::test_admission_check_errors_leave_an_open_episode_alone[job_killed]`, `tests/test_device_safety.py::test_a_job_cancelled_during_admission_retries_never_dispatches` |
+| B-Queueing (malformed fsm.json never poisons the gate) | `tests/test_device_safety.py::test_a_non_dict_job_on_disk_never_poisons_the_gate`, `tests/test_device_safety.py::test_a_non_str_since_on_disk_never_poisons_the_gate` |
 | B-Log format | `tests/test_recent_jobs.py::test_recent_jobs_parses_and_limits`, `tests/test_recent_jobs.py::test_the_footer_survives_a_reset_worth_of_gate_output`, `tests/test_recent_jobs.py::test_a_job_printing_status_of_its_own_is_still_unfinished` |
 | B-Ids/`Job` basics | `tests/test_server.py::TestJob::test_job_status_values`, `tests/test_server.py::TestJob::test_runtime_sec_property`, `tests/test_server.py::TestJob::test_wait_sec_property` |
 | Re-adoption scope naming | `tests/test_readopt.py::test_scope_unit_roundtrip`, `tests/test_readopt.py::test_list_active_job_scopes_parses` |
