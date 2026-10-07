@@ -6210,19 +6210,30 @@ def _device_fault_failed_reason(job_id: str) -> Optional[str]:
     return rec.get("reason") or "killed by device recovery"
 
 
+def _job_log_records_finish(log_file: Optional[str]) -> bool:
+    """True if a job's log already carries its FINISHED footer: the job ran, or was refused, and
+    reached a terminal state under an earlier broker. A queued job's log holds only its header (and
+    any hold note), so a footer there means the job's spec outlived the job."""
+    if not log_file:
+        return False
+    return bool(_parse_job_log_footer(_tail_lines(log_file, FOOTER_TAIL_LINES)))
+
+
 async def _restore_queued_jobs() -> None:
     """Put jobs that were still waiting when the last broker died back on the queue.
 
     Only specs we can actually read are restored: a spec that will not parse is moved aside,
-    never guessed at and never silently dropped. Ordered by queue time so a restart preserves
-    the order tenants queued in.
+    never guessed at and never silently dropped. A spec whose job log already carries the
+    FINISHED footer is moved aside too (``.finished``): the job is over, and a spec that outlived
+    it must not run it again. Ordered by queue time so a restart preserves the order tenants
+    queued in.
     """
     if not job_log_dir:
         return
     d = Path(job_log_dir) / QUEUED_SPEC_DIR
     if not d.is_dir():
         return
-    restored, broken, dropped = 0, 0, 0
+    restored, broken, dropped, finished = 0, 0, 0, 0
     for p in sorted(d.glob("*.json")):
         try:
             spec = json.loads(p.read_text())
@@ -6249,6 +6260,15 @@ async def _restore_queued_jobs() -> None:
             continue
         if job.id in jobs:
             continue  # already known (a re-adopted run) — the scope owns it, not the spec
+        if _job_log_records_finish(job.log_file):
+            finished += 1
+            if logger:
+                logger.warning(f"QUEUE-RESTORE job_id={job.id} already finished per its log, not requeued")
+            try:
+                p.rename(p.with_suffix(".finished"))
+            except OSError:
+                pass
+            continue
         fault_reason = _device_fault_failed_reason(job.id)
         if fault_reason:
             # This job was SIGKILLed by device recovery (a wedge it caused). Re-running the exact
@@ -6265,14 +6285,15 @@ async def _restore_queued_jobs() -> None:
         await get_job_queue().put(job.id)
         _update_queue_depth_metric()
         restored += 1
-    if (restored or broken or dropped) and logger:
+    if (restored or broken or dropped or finished) and logger:
         logger.info(
             f"QUEUE-RESTORE requeued {restored} job(s) that outlived the last broker"
             + (f"; {broken} spec(s) unreadable and set aside" if broken else "")
             + (f"; {dropped} job(s) dropped (killed by device recovery)" if dropped else "")
+            + (f"; {finished} spec(s) of already-finished jobs set aside" if finished else "")
         )
-    if restored or broken or dropped:
-        health_event("queue_restored", restored=restored, unreadable=broken, dropped=dropped)
+    if restored or broken or dropped or finished:
+        health_event("queue_restored", restored=restored, unreadable=broken, dropped=dropped, finished=finished)
 
 
 async def _record_startup_health() -> None:
