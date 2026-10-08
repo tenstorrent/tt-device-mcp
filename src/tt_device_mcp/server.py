@@ -2147,6 +2147,65 @@ def _is_wedge_risk_exit(status: "JobStatus", exit_code: Optional[int]) -> bool:
     return False
 
 
+# The highest AI clock a chip may read once nothing holds it open. The runtime raises the clock
+# on open (Blackhole 1350 MHz, Wormhole 1000) and drops it on a clean close (Blackhole 800,
+# Wormhole 500); only that close does it, so a job that dies without closing leaves its chips at
+# the busy clock until something else opens and closes them.
+IDLE_AICLK_MAX_MHZ = int(os.environ.get("TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ", "800"))
+
+
+def _aiclk_left_busy(ceiling_mhz: int = IDLE_AICLK_MAX_MHZ) -> dict[str, int]:
+    """Chips whose AI clock still reads above ``ceiling_mhz``, as {chip index: MHz}.
+
+    A sysfs read the KMD answers from its own copy: nothing reaches the chip, and a 32-chip read
+    costs milliseconds. An unreadable or non-numeric clock is left out, not counted as busy.
+    Never raises."""
+    busy: dict[str, int] = {}
+    try:
+        chips = chip_snapshot()
+    except Exception:  # noqa: BLE001 - a read for the record must never fail the runner
+        return busy
+    for idx, rec in chips.items():
+        mhz = rec.get("tt_aiclk")
+        if isinstance(mhz, int) and mhz > ceiling_mhz:
+            busy[idx] = mhz
+    return busy
+
+
+def _note_aiclk_after_job(job: "Job", job_log_file: Optional[Path]) -> None:
+    """Record a job end that left chips at the busy clock (03 B-post-job clock check).
+
+    Runs after the post-job gate, and only after a job that did not complete: a clean close is
+    what drops the clock, and a completed job closed cleanly. The gate's forced fabric pass opens
+    and closes the mesh, which should already have settled the clock; a chip still busy here
+    means it did not run (the gate was skipped, e.g. over a holder) or did not close. Only a
+    record: the next open sets the clock anyway, so this never delays or holds a tenant."""
+    busy = _aiclk_left_busy()
+    if not busy:
+        return
+    top = max(busy.values())
+    health_event(
+        "aiclk_busy_after_job",
+        job=job.id,
+        status=job.status.value,
+        chips=len(busy),
+        max_mhz=top,
+        ceiling_mhz=IDLE_AICLK_MAX_MHZ,
+    )
+    line = (
+        f"{len(busy)} chip(s) still at the busy AI clock after job {job.id} ended "
+        f"{job.status.value} (max {top} MHz, idle ceiling {IDLE_AICLK_MAX_MHZ} MHz): "
+        f"the job did not close the device"
+    )
+    if logger:
+        logger.warning(f"CLEAN-GATE {line}")
+    if job_log_file:
+        try:
+            append_job_log(job_log_file, "broker", f"{line}\n")
+        except OSError:
+            pass
+
+
 # Runtime fault text that means the eth/fabric link layer was left wedged — the
 # mesh is unusable for the next runner regardless of how this process exited.
 # Exit code alone misses these: the fault surfaces at mesh-open as a C++ exception
@@ -5729,10 +5788,15 @@ async def job_runner():
         # job, so an incident's trace is the run-up to THIS job and not the hour before it.
         sampler.mark_job_window()
 
-        # Write "started" marker to log
+        # Write "started" marker to log. A full log disk must not end the runner: everything
+        # from here to the end of the job's finally is what frees the device for the next one.
         if job_log_file:
-            with open(job_log_file, "a") as f:
-                f.write(f"[Started at {job.started_at}]\n\n")
+            try:
+                with open(job_log_file, "a") as f:
+                    f.write(f"[Started at {job.started_at}]\n\n")
+            except OSError as e:
+                if logger:
+                    logger.warning(f"JOB_RUNNER job_id={job_id} could not write its start marker: {e}")
 
         if logger:
             logger.info(f"JOB_RUNNER starting job_id={job_id}, log={job_log_file}")
@@ -5755,6 +5819,7 @@ async def job_runner():
         privsep_prefix = privsep_prefix_for(job.peer_uid, unit=job_scope_unit(job_id))
         cancelled = False  # set if the broker is shutting down (don't kill the job)
         terminal_note = ""  # timeout/exception marker, appended to error at the end
+        proc = None
         try:
             if privsep_prefix:
                 if logger:
@@ -5792,7 +5857,31 @@ async def job_runner():
             # One open handle for the job's lifetime (line-buffered so streaming
             # readers see each line) — opening per line is a syscall storm under a
             # chatty job. In-memory capture is bounded (out_buf/err_buf deques).
-            log_fh = open(job_log_file, "a", buffering=1) if job_log_file else None
+            #
+            # The log is the broker's record, not the job: a log write that fails (a full disk)
+            # stops the file copy and keeps the job running, with its output still kept
+            # in the bounded in-memory tail. Raising here killed the job mid-run.
+            log_fh = None
+            if job_log_file:
+                try:
+                    log_fh = open(job_log_file, "a", buffering=1)
+                except OSError as e:
+                    if logger:
+                        logger.warning(f"JOB_RUNNER job_id={job_id} cannot open its log, output kept in memory: {e}")
+
+            def drop_log(e):
+                nonlocal log_fh
+                if log_fh is None:
+                    return
+                if logger:
+                    logger.warning(
+                        f"JOB_RUNNER job_id={job_id} log write failed, output kept in memory only from here: {e}"
+                    )
+                try:
+                    log_fh.close()
+                except (OSError, ValueError):
+                    pass
+                log_fh = None
 
             async def read_stream(stream, name, sink):
                 while True:
@@ -5809,7 +5898,10 @@ async def job_runner():
                         )
                     sink.append(text)
                     if log_fh:
-                        log_fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] [{name}] {text}")
+                        try:
+                            log_fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] [{name}] {text}")
+                        except (OSError, ValueError) as e:
+                            drop_log(e)
 
             def note(text):
                 """Say something in the job's own log, in the job's own voice."""
@@ -5903,7 +5995,10 @@ async def job_runner():
             finally:
                 watchdog.cancel()
                 if log_fh:
-                    log_fh.close()
+                    try:
+                        log_fh.close()
+                    except OSError:
+                        pass
             await proc.wait()
 
             async with get_lock():
@@ -5947,6 +6042,25 @@ async def job_runner():
 
             if logger:
                 logger.error(f"JOB_RUNNER job_id={job_id} EXCEPTION: {e}")
+
+            # The job may still be running: the error was the broker's (a full log disk), not
+            # the job's. Walk it down the same SIGINT -> SIGTERM -> SIGKILL ladder as
+            # a timeout. The bare SIGKILL in the finally below is only a sweep for what is left:
+            # as the first signal it gives the runtime no chance to close the device, and its
+            # chips stay at the busy clock until something opens and closes them again.
+            if job.pid:
+                try:
+                    await _terminate_job(job_id, job.pid)
+                except asyncio.CancelledError:
+                    # Shutdown mid-ladder: leave whatever is left for the next broker to re-adopt.
+                    cancelled = True
+                    raise
+                except Exception as term_err:  # noqa: BLE001 - the sweep below still runs
+                    if logger:
+                        logger.warning(f"JOB_RUNNER job_id={job_id} terminate after exception failed: {term_err}")
+                # A ladder that had to end in SIGKILL is a signal death, so the wedge check sees it.
+                if proc is not None and proc.returncode is not None:
+                    job.exit_code = proc.returncode
 
         finally:
             # On shutdown leave the running job alive (it survives in its scope for
@@ -6045,9 +6159,15 @@ async def job_runner():
                         job=job,
                     )
 
-                # Write job log footer (outside lock - file I/O)
+                # Write job log footer (outside lock - file I/O). Best effort: a full disk once
+                # raised here and ended the runner, so the post-job gate below never ran and the
+                # next job was dispatched onto an unchecked device.
                 if job_log_file:
-                    write_job_log_footer(job_log_file, job)
+                    try:
+                        write_job_log_footer(job_log_file, job)
+                    except OSError as e:
+                        if logger:
+                            logger.warning(f"JOB_RUNNER job_id={job_id} could not write its log footer: {e}")
 
                 # Post-job health check — snapshot + fabric traffic — after EVERY
                 # run, queue empty or not. A fabric wedge need not trip a wedge-risk
@@ -6070,6 +6190,15 @@ async def job_runner():
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:
                         logger.error(f"JOB_RUNNER post-job health gate error for job_id={job_id}: {e}")
+
+                # A job that did not finish cleanly may not have closed the device, which leaves
+                # its chips at the busy clock. Record it so the timeline shows it (03 B-post-job).
+                if job.status != JobStatus.COMPLETED or job.exit_code != 0:
+                    try:
+                        _note_aiclk_after_job(job, job_log_file)
+                    except Exception as e:  # noqa: BLE001 - a record, never a reason to stop
+                        if logger:
+                            logger.warning(f"JOB_RUNNER job_id={job_id} clock check failed: {e}")
 
                 # The mesh's rest window starts now — after this job's device work AND the
                 # post-job fabric pass, the last traffic the silicon saw. The next job's

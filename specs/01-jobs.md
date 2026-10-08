@@ -33,12 +33,17 @@ the queue and a running job outlive the broker process.
   a bounded tail, `JOB_CAPTURE_MAX_LINES`).
 - **I4** — Every job starts in its own session (`os.setsid`), so pid == pgid, and the
   runner's `finally` block unconditionally `killpg`s the group (idempotent) so no orphaned
-  child can hold the device after the job is finalized.
+  child can hold the device after the job is finalized. That SIGKILL is a sweep of what is
+  left once the job has exited or been through the I5 ladder, never the first signal a job
+  that may still hold the device receives.
 - **I5** — A job is never killed with bare SIGKILL first. Termination is the ladder SIGINT
   (`GRACEFUL_KILL_GRACE_SEC` = 60 s) → SIGTERM (`SIGTERM_GRACE_SEC` = 15 s) → SIGKILL,
   because only SIGINT unwinds a Python/ttnn job into the teardown that releases the device.
   A job running in a systemd scope (privsep, or re-adopted) MUST be signalled via the
-  scope, never by `killpg` on the wrapper pid (`_terminate_job`).
+  scope, never by `killpg` on the wrapper pid (`_terminate_job`). This holds on every path
+  that ends a running job: timeout, the hung reaper, a user kill, and an error raised in
+  the broker itself while the job runs (the runner's exception path). A SIGKILL as the
+  first signal skips the runtime's device close, which leaves its chips at the busy clock.
 - **I6** — A broker restart loses no job. RUNNING jobs are re-adopted from their
   `ttdev-job-<id>.scope` units; QUEUED jobs are restored from persisted specs in queue
   order; an unreadable spec is set aside (`.invalid`), never guessed at; a job whose
@@ -226,11 +231,15 @@ flowchart LR
 - Exit code semantics: preserved verdicts (KILLED, HUNG) win; otherwise exit 0 →
   COMPLETED, anything else → FAILED. The bounded capture is materialized into
   `job.output` / `job.error` and the deques dropped.
+- The job log is best effort. A log write that fails (for example a full disk) stops the
+  file copy for that job, keeps the bounded in-memory capture, and never ends the job or
+  the runner. The start marker and the footer are written the same way.
 - The `finally` block: `killpg` the group (I4), clear the job's exit file (this broker
   saw the exit itself), stamp `finished_at`, record stats, classify device evidence
   (I14), write the log footer, run the post-job health gate
   (`_verify_device_after_job` — snapshot always, fabric traffic pass forced on any
-  non-success; internals spec 03), mark the mesh-rest clock, and sweep retention (I13).
+  non-success; internals spec 03), on a non-success record any chip still at the busy
+  clock (spec 03, B-post-job clock check), mark the mesh-rest clock, and sweep retention (I13).
   The finished job's caller is released before the post-job gate, so the gate never
   bills the finished job.
 - A job killed by the broker's own recovery gets the real cause written into its error
@@ -305,7 +314,7 @@ flowchart LR
 | I1 | `tests/test_readopt.py::test_reconcile_readopts_running_scope`, `tests/test_readopt.py::test_startup_waits_for_a_readopted_job_before_touching_the_fabric` |
 | I2 | `tests/test_device_safety.py::test_rest_submit_clamps_timeout_to_the_hard_ceiling`, `tests/test_device_safety.py::test_max_timeout_is_25_minutes_and_is_a_hard_ceiling`, `tests/test_device_safety.py::test_hitting_the_ceiling_does_not_offer_a_bigger_number`, `tests/test_server.py::test_timeout_hint_is_actionable` |
 | I3 (bounded capture) | `tests/test_server.py::test_job_output_capture_is_bounded` |
-| I5 | `tests/test_server.py::TestCleanDeviceGate::test_graceful_terminate_on_sigterm`, `tests/test_server.py::TestCleanDeviceGate::test_graceful_escalates_to_sigkill`, `tests/test_server.py::TestCleanDeviceGate::test_graceful_terminate_already_dead`, `tests/test_reset.py::test_terminate_job_signals_the_scope_for_a_privsep_job`, `tests/test_reset.py::test_terminate_job_falls_back_to_killpg_without_a_scope`, `tests/test_reset.py::test_a_live_privsep_kill_signals_the_scope_not_the_pgroup` |
+| I5 | `tests/test_server.py::TestCleanDeviceGate::test_graceful_terminate_on_sigterm`, `tests/test_server.py::TestCleanDeviceGate::test_graceful_escalates_to_sigkill`, `tests/test_server.py::TestCleanDeviceGate::test_graceful_terminate_already_dead`, `tests/test_reset.py::test_terminate_job_signals_the_scope_for_a_privsep_job`, `tests/test_reset.py::test_terminate_job_falls_back_to_killpg_without_a_scope`, `tests/test_reset.py::test_a_live_privsep_kill_signals_the_scope_not_the_pgroup`, `tests/test_device_safety.py::test_a_broker_error_mid_job_walks_the_kill_ladder` |
 | I6 | `tests/test_device_safety.py::test_a_queued_job_survives_the_broker_restarting_under_it`, `tests/test_device_safety.py::test_an_unreadable_queued_spec_is_set_aside_not_guessed_at`, `tests/test_device_safety.py::test_a_started_job_is_not_revived_by_a_restart`, `tests/test_device_safety.py::test_a_spec_whose_job_already_finished_is_set_aside_not_requeued`, `tests/test_device_safety.py::test_a_still_waiting_job_is_restored_beside_a_finished_one`, `tests/test_device_safety.py::test_a_refused_job_whose_spec_survived_is_not_revived_by_a_restart`, `tests/test_device_safety.py::test_a_spec_colliding_with_a_live_job_id_is_not_revived`, `tests/test_readopt.py::test_reconcile_readopts_running_scope`, `tests/test_readopt.py::test_reconcile_skips_already_tracked`, `tests/test_readopt.py::test_a_restored_queue_survives_when_main_already_started_the_runner` |
 | I7 | `tests/test_readopt.py::test_readopted_deadline_counts_time_already_served`, `tests/test_readopt.py::test_readopted_job_past_its_deadline_is_terminated`, `tests/test_readopt.py::test_readopted_job_inside_its_deadline_is_left_alone`, `tests/test_readopt.py::test_job_from_log_recovers_the_deadline`, `tests/test_readopt.py::test_job_from_log_without_a_timeout_header_still_gets_a_deadline` |
 | I8 | `tests/test_readopt.py::test_readopted_job_recovers_its_real_exit_code`, `tests/test_readopt.py::test_readopted_job_that_passed_is_reported_as_passed`, `tests/test_readopt.py::test_readopted_job_with_no_exit_status_is_not_called_completed`, `tests/test_readopt.py::test_a_signalled_job_records_a_real_exit_status`, `tests/test_readopt.py::test_the_job_exit_dir_is_redirectable` |
@@ -322,5 +331,6 @@ flowchart LR
 | B-Queueing (gate errored → device held) | `tests/test_device_safety.py::test_a_gate_that_errored_holds` |
 | B-Queueing (gate bug ≠ stuck queue) | `tests/test_device_safety.py::test_a_non_dict_job_on_disk_never_poisons_the_gate`, `tests/test_device_safety.py::test_a_non_str_since_on_disk_never_poisons_the_gate` |
 | B-Log format | `tests/test_recent_jobs.py::test_recent_jobs_parses_and_limits`, `tests/test_recent_jobs.py::test_the_footer_survives_a_reset_worth_of_gate_output`, `tests/test_recent_jobs.py::test_a_job_printing_status_of_its_own_is_still_unfinished` |
+| B-Completion (job log is best effort) | `tests/test_device_safety.py::test_a_full_log_disk_ends_neither_the_job_nor_the_runner` |
 | B-Ids/`Job` basics | `tests/test_server.py::TestJob::test_job_status_values`, `tests/test_server.py::TestJob::test_runtime_sec_property`, `tests/test_server.py::TestJob::test_wait_sec_property` |
 | Re-adoption scope naming | `tests/test_readopt.py::test_scope_unit_roundtrip`, `tests/test_readopt.py::test_list_active_job_scopes_parses` |
