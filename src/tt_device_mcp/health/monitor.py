@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -28,6 +29,29 @@ from tt_device_mcp.constants import FABRIC_CHECK_CANNOT_CHECK_RC, FABRIC_CHECK_T
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors import eth, fabric, hostpci
+
+# How much of a fabric run's output the action-log row keeps for a run that got no healthy verdict:
+# the tail, where a wrapper prints its verdict, bounded so a chatty validator cannot fill the disk.
+ACTION_LOG_OUTPUT_CHARS = 8000
+
+# The lines that name WHY a C++ validator stopped: an uncaught exception's what(), a std::filesystem
+# error, or the bare terminate banner. Matched anywhere in a wrapper's output, first hit wins.
+_REASON_RE = re.compile(r"(what\(\):.*|filesystem error:.*|terminate called.*)")
+
+
+def _override_reason(text: str) -> str:
+    """The reason an operator's fabric wrapper gives for its exit code, as one line.
+
+    The first line naming a C++ failure (what(), a filesystem error, 'terminate called') wins:
+    the wrapper prints its verdict AFTER the validator's own output, and a multi-line verdict
+    put the cause on a line above the last, so the last line alone said "no link was tested"
+    and dropped why. With no such line, the last line is the wrapper's own verdict."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    for line in lines:
+        m = _REASON_RE.search(line)
+        if m:
+            return m.group(1).strip()
+    return lines[-1].strip() if lines else "(no output)"
 
 
 def _verdict_label(ok: Optional[bool]) -> str:
@@ -543,7 +567,7 @@ class HealthMonitor:
             # purely through its exit code — its stdout is never run through classify(), which
             # means something only for the built-in validator's own output signatures.
             ok = True if rc == 0 else None if rc == FABRIC_CHECK_CANNOT_CHECK_RC else False
-            reason = last
+            reason = _override_reason(text)
         else:
             ok, reason = fabric.classify(rc, text)
         # Derived from ok, not rc: on the built-in path a measured-bad verdict can exit 77 (the
@@ -552,7 +576,12 @@ class HealthMonitor:
         # with the raw exit code that verdict may have been remapped away from. A broker-side
         # timeout (rc is None) is its own thing: a live run that ran out of time, not a skip.
         status = "timeout" if rc is None else "completed" if ok is True else "skipped" if ok is None else "failed"
-        self._write_action_log("[broker]fabric-check", cmd, dt, status, rc)
+        if ok is True:
+            self._write_action_log("[broker]fabric-check", cmd, dt, status, rc)
+        else:
+            # A run that got no healthy verdict is the one an operator opens the row for, and the
+            # broker journal keeps only a line of it — so the row carries the output itself.
+            self._write_action_log("[broker]fabric-check", cmd, dt, status, rc, output=text[-ACTION_LOG_OUTPUT_CHARS:])
 
         if ok is True:
             self.last_fabric_ok = True
@@ -563,13 +592,13 @@ class HealthMonitor:
             # in this state has no fabric coverage at all and that must not pass silently.
             log = self._logger()
             if log:
-                log.warning(f"FABRIC-CHECK not runnable on this host — no fabric coverage: {reason[:200]}")
+                log.warning(f"FABRIC-CHECK not runnable on this host — no fabric coverage: {reason[:400]}")
             health_event("fabric_check_unavailable", detail=reason[:400], cmd=cmd)
-            return None, f"fabric check COULD NOT RUN ({dt:.0f}s): {reason[:200]}"
+            return None, f"fabric check COULD NOT RUN ({dt:.0f}s): {reason[:400]}"
         self.last_fabric_ok = False
         if rc is None:
             return False, f"fabric check timed out after {timeout_sec:.0f}s; last line: {last}"
-        return False, f"fabric check exited {rc} ({dt:.0f}s): {reason[:200]}"
+        return False, f"fabric check exited {rc} ({dt:.0f}s): {reason[:400]}"
 
     async def verify_eth_heartbeat(self, timeout_sec: float = 60.0) -> tuple[Optional[bool], str]:
         """Read the active-ethernet-core firmware heartbeats — a passive check that never pushes
