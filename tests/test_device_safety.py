@@ -3200,8 +3200,12 @@ async def test_an_eth_read_with_no_verdict_after_a_skipped_forced_pass_runs_the_
     [
         ("FAILED", 1, 0.0, True),  # blx01 job 091: `cd` into a missing directory, 0s
         ("FAILED", 1, 1.9, True),
-        ("FAILED", 127, 40.0, True),  # command not found
-        ("FAILED", 126, 40.0, True),  # not executable
+        ("FAILED", 127, 0.1, True),  # command not found at once
+        ("FAILED", 126, 0.1, True),  # not executable at once
+        ("FAILED", 127, 40.0, False),  # set -e script that used the device, then hit a missing command
+        ("FAILED", 126, 40.0, False),
+        ("FAILED", 127, 2.0, False),
+        ("FAILED", 127, None, False),
         ("FAILED", 1, 2.0, False),  # long enough to have opened the device
         ("FAILED", 1, None, False),  # no runtime known: assume it did
         ("FAILED", 139, 0.0, False),  # signal death: wedge-risk, never a no-op
@@ -12630,12 +12634,21 @@ async def test_the_dispatch_recheck_off_switch_tenant_and_errors(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("max_runtime, expected", [(2.0, True), (0.0, False)])
+@pytest.mark.parametrize(
+    "command, exit_code, max_runtime, expected",
+    [
+        ("cd /nonexistent-t161", 1, 2.0, True),
+        ("cd /nonexistent-t161", 1, 0.0, False),
+        ("tt-device-mcp-no-such-command-t175", 127, 2.0, True),
+        ("tt-device-mcp-no-such-command-t175", 127, 0.0, False),
+    ],
+)
 async def test_the_runner_tells_the_post_job_gate_when_a_failed_job_never_reached_the_device(
-    monkeypatch, clear_job_state, max_runtime, expected
+    monkeypatch, clear_job_state, command, exit_code, max_runtime, expected
 ):
     """Spec 03 I33. The runner hands the gate its no-op verdict for a failed job: blx01's job 091
-    (`cd` into a missing directory, 0s) is one, and the same exit past the runtime bound is not."""
+    (`cd` into a missing directory, 0s) is one, and the same exit past the runtime bound is not.
+    A 127 is held to the same bound: a `set -e` script can exit 127 after device work."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     monkeypatch.setattr(srv, "NOOP_FAILURE_MAX_RUNTIME_SEC", max_runtime)
@@ -12645,14 +12658,14 @@ async def test_the_runner_tells_the_post_job_gate_when_a_failed_job_never_reache
         gates.append((job_failed, noop_failure))
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
-    job = srv.Job(id="091", owner="tenant", workspace="/tmp", command="cd /nonexistent-t161", queued_at="t")
+    job = srv.Job(id="091", owner="tenant", workspace="/tmp", command=command, queued_at="t")
     srv.jobs[job.id] = job
     await srv.get_job_queue().put(job.id)
 
     runner = asyncio.create_task(srv.job_runner())
     try:
         await _wait_for(lambda: len(gates) == 1)
-        assert job.status is srv.JobStatus.FAILED and job.exit_code == 1
+        assert job.status is srv.JobStatus.FAILED and job.exit_code == exit_code
         assert gates == [(True, expected)]
     finally:
         runner.cancel()

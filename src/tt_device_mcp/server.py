@@ -1158,12 +1158,13 @@ GONE_CHIP_CONFIRM_SETTLE_SEC = 2.0
 FABRIC_CHECK_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_INTERVAL_SEC", "1200"))
 last_fabric_check_monotonic: float = 0.0
 # A failed job that never reached the device (spec 03 I33) does not force the traffic pass when
-# one finished green this recently: it ran in under NOOP_FAILURE_MAX_RUNTIME_SEC or exited 126/127
-# (not executable / not found), so it says nothing about the mesh. blx01 lost its host ~9s into
-# a pass forced 2s after a green one by a job that failed in 0s on a missing directory.
+# one finished green this recently: it ran in under NOOP_FAILURE_MAX_RUNTIME_SEC, so it says
+# nothing about the mesh. blx01 lost its host ~9s into a pass forced 2s after a green one by a
+# job that failed in 0s on a missing directory. The exit code alone never qualifies: jobs run
+# under `bash -c` with `set -e`, so a script that used the device and then hit a missing or
+# non-executable command also exits 127/126.
 NOOP_FAILURE_FABRIC_FRESH_SEC = float(os.environ.get("TT_DEVICE_MCP_NOOP_FAILURE_FABRIC_FRESH_SEC", "300"))
 NOOP_FAILURE_MAX_RUNTIME_SEC = 2.0
-NOOP_FAILURE_EXIT_CODES = (126, 127)
 # The last REAL fabric verdict lives on health_monitor.last_fabric_ok now (see health_monitor
 # above): True healthy / False unhealthy / None until one runs. Kept across checks so the
 # read-only relift can refuse to lift a recovered-on-ARC hold back onto a fabric whose last
@@ -5384,12 +5385,10 @@ async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> Non
 
 def _job_never_reached_device(job: "Job") -> bool:
     """True when a failed job ended before it could have opened the device: a normal FAILED exit
-    (never a signal death, timeout, kill or hang) that ran under ``NOOP_FAILURE_MAX_RUNTIME_SEC``
-    or exited 126/127, the shell's "cannot execute" and "not found". Spec 03 I33."""
+    (never a signal death, timeout, kill or hang) that ran under ``NOOP_FAILURE_MAX_RUNTIME_SEC``,
+    whatever its exit code: a 126/127 can come after device work. Spec 03 I33."""
     if job.status != JobStatus.FAILED or _is_wedge_risk_exit(job.status, job.exit_code):
         return False
-    if job.exit_code in NOOP_FAILURE_EXIT_CODES:
-        return True
     runtime = job.runtime_sec
     return runtime is not None and 0 <= runtime < NOOP_FAILURE_MAX_RUNTIME_SEC
 

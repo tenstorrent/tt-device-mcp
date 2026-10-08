@@ -388,8 +388,9 @@ job boundary.
   status queries and must not sleep.
 - **I33 — A failed job that never reached the device does not force a second pass.** A FAILED
   job with a normal exit (not a signal death, timeout, kill or hang) that ran under
-  `NOOP_FAILURE_MAX_RUNTIME_SEC` (2s) or exited 126/127 (`_job_never_reached_device`) could not
-  have opened the device. Its post-job gate drops the forced fabric pass when all of these hold:
+  `NOOP_FAILURE_MAX_RUNTIME_SEC` (2s) (`_job_never_reached_device`) could not have opened the
+  device. The exit code alone never qualifies a job: under `bash -c` with `set -e`, a script that
+  used the device and then hit a missing or non-executable command also exits 127/126. Its post-job gate drops the forced fabric pass when all of these hold:
   the device is HEALTHY and not dirty, the eth rung is armed (I28), the last fabric verdict
   (`HealthMonitor.last_fabric_ok`) is OK, and the gate's last pass with a verdict is younger than
   `TT_DEVICE_MCP_NOOP_FAILURE_FABRIC_FRESH_SEC` (default 300s). The gate then runs the passive eth
