@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event, patch_recovery
-from tt_device_mcp import privileges
+from tt_device_mcp import device_holders, privileges
 from tt_device_mcp import server as srv
 from tt_device_mcp.constants import FABRIC_CHECK_CANNOT_CHECK_RC
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -7282,6 +7282,157 @@ async def test_maybe_spawn_idle_relift_gates_and_single_flights(monkeypatch, tmp
     await first
 
 
+# --- the foreign-holder hold: re-scanned on the idle clock, lifted once the holder is gone ------
+#
+# The gate defers its verify while a foreign process holds the device and leaves a hold behind
+# (why=foreign_holder, dirty dropped). Nothing re-ran the scan on an idle box: the pre-job gate and
+# the tenant hold-poll only re-verify a DIRTY device, and the generic relift never lifts on a read.
+# So a holder that exited left the door shut until a reset — refusing every tenant for half an hour
+# on a box whose holder pid was long gone. The relift now re-scans and, once nobody holds the
+# device, runs the read-only pass the gate deferred. Never a reset, never the traffic pass.
+
+FOREIGN_NOTE = "held: ansible(pid 19032) holds the device; verify deferred until it releases"
+
+
+def _setup_foreign_hold(monkeypatch, tmp_path, *, holders=()):
+    """A foreign_holder hold on a present 32-chip mesh, the holder scan returning ``holders``, and
+    every reset or escalation counted (any one is a failure of the read-only contract)."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    fsm_dirty(srv, FOREIGN_NOTE, why="foreign_holder")
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    calls = {"resets": 0, "escalations": 0, "run_fabric": []}
+
+    async def no_reset(*a, **k):
+        calls["resets"] += 1
+        return False
+
+    async def no_escalate(*a, **k):
+        calls["escalations"] += 1
+        return OUTCOME_WAITING
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", no_reset)
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", no_escalate)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=list(holders), source="driver"))
+    return calls
+
+
+def _verify_returning(calls, healthy, evidence):
+    async def verify(expected, log, run_fabric=True, **_):
+        calls["run_fabric"].append(run_fabric)
+        return healthy, dict(evidence)
+
+    return verify
+
+
+@pytest.mark.asyncio
+async def test_idle_relift_lifts_a_foreign_holder_hold_once_the_holder_is_gone(monkeypatch, tmp_path, clear_job_state):
+    """The holder exited: the scan is empty, the read-only pass reads healthy, the door reopens."""
+    calls = _setup_foreign_hold(monkeypatch, tmp_path)
+    patch_recovery(monkeypatch, "_verify_device", _verify_returning(calls, True, {"snapshot": {"ok": True}}))
+
+    await srv._attempt_idle_relift()
+
+    assert srv.fsm.state is ServerState.HEALTHY, "a hold whose foreign holder left must lift on its own"
+    assert calls["run_fabric"] == [False], "the lift must never run the fabric traffic pass"
+    assert calls["resets"] == 0 and calls["escalations"] == 0, "the lift must never reset"
+
+
+@pytest.mark.asyncio
+async def test_idle_relift_lifts_a_foreign_holder_hold_when_its_pid_was_reused(monkeypatch, tmp_path, clear_job_state):
+    """The recorded pid is alive again as an unrelated process with no device fd. The scan, not the
+    pid in the note, decides: the real fd walk runs over that pid, finds no device fd, and lifts."""
+    calls = _setup_foreign_hold(monkeypatch, tmp_path)
+    reused = os.getpid()  # alive, owned by a uid >= 1000 here, holds no /dev/tenstorrent fd
+    fsm_dirty(srv, f"held: ansible(pid {reused}) holds the device; verify deferred", why="foreign_holder")
+    monkeypatch.setattr(device_holders, "_driver_holder_pids", lambda: None)
+    monkeypatch.setattr(device_holders, "_iter_pids", lambda: [reused])
+    monkeypatch.setattr(srv, "enumerate_device_holders", device_holders.enumerate_device_holders)
+    patch_recovery(monkeypatch, "_verify_device", _verify_returning(calls, True, {"snapshot": {"ok": True}}))
+
+    await srv._attempt_idle_relift()
+
+    assert srv.fsm.state is ServerState.HEALTHY, "a reused pid that holds no device must not keep the hold"
+    assert calls["resets"] == 0
+
+
+@pytest.mark.asyncio
+async def test_idle_relift_keeps_a_foreign_holder_hold_while_a_holder_remains(monkeypatch, tmp_path, clear_job_state):
+    """A reused pid that DOES hold the device (or any other tenant) keeps the hold, unprobed, and
+    the note names whoever holds it now — not the pid the gate first saw."""
+    holder = DeviceHolder(pid=4242, uid=os.getuid() if os.getuid() >= 1000 else 1000)
+    calls = _setup_foreign_hold(monkeypatch, tmp_path, holders=[holder])
+    patch_recovery(monkeypatch, "_verify_device", _verify_returning(calls, True, {}))
+
+    await srv._attempt_idle_relift()
+
+    assert srv.fsm.state is ServerState.RECOVERING and srv.fsm.record.why == "foreign_holder"
+    assert calls["run_fabric"] == [], "nothing may probe the device beside a tenant"
+    assert "pid 4242" in srv.fsm.record.detail and "19032" not in srv.fsm.record.detail
+    assert calls["resets"] == 0
+
+
+@pytest.mark.asyncio
+async def test_idle_relift_rescans_a_foreign_holder_hold_with_generic_escalation_off(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Noticing the holder left is not an escalation: the kill switch for generic escalation must
+    not strand the hold. Spawn and lift both run with it off."""
+    calls = _setup_foreign_hold(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE", "0")
+    patch_recovery(monkeypatch, "_verify_device", _verify_returning(calls, True, {}))
+    srv._relift_task = None
+
+    srv._maybe_spawn_idle_relift()
+    assert srv._relift_task is not None, "a foreign_holder hold must arm the idle relift on its own"
+    await srv._relift_task
+
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert calls["escalations"] == 0
+
+
+@pytest.mark.asyncio
+async def test_foreign_holder_relift_never_resets_an_unhealthy_mesh(monkeypatch, tmp_path, clear_job_state):
+    """Holder gone but the read finds the mesh unhealthy: record it as the read-only gate pass does
+    (dirty, probe_unhealthy) for the gate's ladder; reset nothing here, lift nothing."""
+    calls = _setup_foreign_hold(monkeypatch, tmp_path)
+    patch_recovery(monkeypatch, "_verify_device", _verify_returning(calls, False, {}))
+
+    await srv._attempt_idle_relift()
+
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert srv.fsm.record.why == "probe_unhealthy" and srv.fsm.record.dirty
+    assert calls["resets"] == 0 and calls["escalations"] == 0
+
+
+@pytest.mark.asyncio
+async def test_foreign_holder_relift_turns_a_frozen_eth_core_into_the_eth_hold(monkeypatch, tmp_path, clear_job_state):
+    """Holder gone, enum+ARC healthy, eth heartbeat frozen: the gate would hold eth_frozen, so does
+    this — the self-heal relift then owns it."""
+    calls = _setup_foreign_hold(monkeypatch, tmp_path)
+    frozen = {"eth_heartbeat": {"ok": False, "detail": "chip 3 core 7 frozen"}}
+    patch_recovery(monkeypatch, "_verify_device", _verify_returning(calls, True, frozen))
+
+    await srv._attempt_idle_relift()
+
+    assert srv.fsm.state is ServerState.RECOVERING and srv.fsm.record.why == "eth_frozen"
+    assert not srv.fsm.record.dirty and calls["resets"] == 0
+
+
+@pytest.mark.asyncio
+async def test_foreign_holder_relift_keeps_a_runtime_reported_fault_held(monkeypatch, tmp_path, clear_job_state):
+    """A fault the runtime named stands until a reset; a clean read never retires it."""
+    calls = _setup_foreign_hold(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "device_fault_reported", "job 9 waiting for active ethernet core")
+    patch_recovery(monkeypatch, "_verify_device", _verify_returning(calls, True, {}))
+
+    await srv._attempt_idle_relift()
+
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert srv.device_fault_reported, "the runtime-reported fault must survive a read-only lift attempt"
+    assert not srv.fsm.record.detail.startswith("held: "), "the status must stop naming a holder that left"
+    assert calls["resets"] == 0
+
+
 # --- Part B: the idle escalation resets a present-mesh hold no read-only relift can clear --------
 #
 # A present-mesh eth/fault hold (device_hold_needs_eth, off_bus == 0 — the blx04 8h strand) is one
@@ -9070,7 +9221,7 @@ async def test_idle_relift_still_strands_a_stuck_off_bus_hold_when_kill_switched
 
 # --- A2: the escalation must reach a hold no read-only relift can lift --------------------------
 #
-# A foreign holder that blocked verification, or a gate that errored out, sets device_unverified_why
+# A gate that errored out (or a foreign holder that is still there, I13) sets device_unverified_why
 # but arms neither the self-heal nor the fabric relift — enum+ARC proves nothing those were placed
 # for. Read-only nothing re-checks it, so it strands until a broker restart: the one indefinite hold
 # Part B did not reach. TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE (default off) closes it by escalating a
@@ -9078,8 +9229,9 @@ async def test_idle_relift_still_strands_a_stuck_off_bus_hold_when_kill_switched
 
 
 def _setup_generic_hold(monkeypatch, tmp_path, *, n_present=32):
-    """Put the device into an arms-neither HOLD (a foreign holder blocked verification), with the
-    generic-hold escalation armed, ready for _attempt_idle_relift."""
+    """Put the device into an arms-neither HOLD (the gate errored before a verdict), with the
+    generic-hold escalation armed, ready for _attempt_idle_relift. Not a foreign-holder hold: the
+    relift re-scans that one and lifts it on a read once its holder is gone (I13)."""
     for i in range(n_present):
         (tmp_path / str(i)).write_text("")
     monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
@@ -9089,14 +9241,14 @@ def _setup_generic_hold(monkeypatch, tmp_path, *, n_present=32):
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     srv.device_op_lock = None
     srv.device_op_active = ""
-    fsm_dirty(srv, "foreign holder present: [agent]someone", why="foreign_holder")
+    fsm_dirty(srv, "gate error: boom", why="gate_error")
     srv.last_relift_monotonic = 0.0
     monkeypatch.setenv("TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE", "1")
 
 
 @pytest.mark.asyncio
 async def test_idle_relift_escalates_a_generic_arms_neither_hold(monkeypatch, tmp_path, clear_job_state):
-    """The remaining indefinite hold, end-to-end: a foreign-holder hold arms neither relift, so base
+    """The remaining indefinite hold, end-to-end: a gate-error hold arms neither relift, so base
     leaves it standing forever. Armed and past the ceiling on an idle present mesh with no tenant, the
     relift now escalates it to the gate's galaxy reset — WITHOUT a read-only verify, which cannot prove
     this class fit. Fails on base, where a generic hold arms nothing and never reaches a reset."""
@@ -9167,7 +9319,7 @@ async def test_idle_relift_escalates_a_fabric_unverified_hold_when_relift_is_off
 
 @pytest.mark.asyncio
 async def test_idle_relift_leaves_a_generic_hold_untouched_when_kill_switched(monkeypatch, tmp_path, clear_job_state):
-    """The kill-switch: with TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE=0 a foreign-holder hold arms neither
+    """The kill-switch: with TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE=0 a gate-error hold arms neither
     relift and is left standing — no reset, no read-only verify — the read-only base behavior."""
     _setup_generic_hold(monkeypatch, tmp_path)
     counters = _arm_stuck_hold(monkeypatch)
