@@ -3124,9 +3124,13 @@ async def test_a_failed_job_that_never_reached_the_device_skips_the_forced_pass_
     pass 2s after a green one, and the host died ~9s into it. That job proved nothing about the
     mesh: the gate reads the eth heartbeat as for a clean exit and runs no traffic pass."""
     calls = _noop_failure_gate(monkeypatch, tmp_path)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
 
     await srv._verify_device_after_job(None, job_failed=True, noop_failure=True)
 
+    skipped = [f for kind, f in events if kind == "forced_fabric_skipped"]
+    assert skipped and skipped[0]["phase"] == "post-job", f"the skip was not journaled: {events}"
     assert calls["eth"] == 1, "the skipped pass was not replaced by the eth read"
     assert calls["eth_timeout"] == ETH_POST_JOB_TIMEOUT_SEC
     assert calls["fabric"] == 0, "a job that never opened the device forced a second traffic pass"
@@ -3208,6 +3212,7 @@ async def test_an_eth_read_with_no_verdict_after_a_skipped_forced_pass_runs_the_
         ("FAILED", 127, None, False),
         ("FAILED", 1, 2.0, False),  # long enough to have opened the device
         ("FAILED", 1, None, False),  # no runtime known: assume it did
+        ("FAILED", None, 0.0, False),  # no exit code of its own: a runner error ended it
         ("FAILED", 139, 0.0, False),  # signal death: wedge-risk, never a no-op
         ("FAILED", -9, 0.0, False),
         ("TIMEOUT", None, 0.5, False),
@@ -12667,6 +12672,54 @@ async def test_the_runner_tells_the_post_job_gate_when_a_failed_job_never_reache
         await _wait_for(lambda: len(gates) == 1)
         assert job.status is srv.JobStatus.FAILED and job.exit_code == exit_code
         assert gates == [(True, expected)]
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("where", ["before-spawn", "after-spawn"])
+async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch, clear_job_state, tmp_path, where):
+    """Spec 03 I36. A job the runner itself ended on an error is never a no-op failure, however fast:
+    before the spawn it has no exit code of its own, and after the spawn the broker ended a job that
+    may hold the device. Either way the gate gets no no-op verdict and forces the pass."""
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    monkeypatch.setattr(srv, "NOOP_FAILURE_MAX_RUNTIME_SEC", 60.0)
+    command = "echo one"
+    if where == "before-spawn":
+
+        def _boom(*a, **k):
+            raise RuntimeError("activation exploded")
+
+        monkeypatch.setattr(srv, "get_activation_script", _boom)
+    else:
+        monkeypatch.setattr(srv, "DOOMED_PATTERNS", _BrokerFault())
+
+        async def _ladder(job_id, pid, grace_sec=srv.GRACEFUL_KILL_GRACE_SEC):
+            await srv._terminate_process_group(pid, grace_sec=2)  # no scope off privsep
+
+        monkeypatch.setattr(srv, "_terminate_job", _ladder)
+        command = "trap 'exit 7' INT; echo hi; sleep 30 & wait"
+    gates = []
+
+    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+        gates.append((job_failed, noop_failure))
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
+    job = srv.Job(id="092", owner="tenant", workspace="/tmp", command=command, queued_at=datetime.now().isoformat())
+    job.log_file = str(tmp_path / "092.log")
+    srv.jobs[job.id] = job
+    await srv.get_job_queue().put(job.id)
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _wait_for(lambda: len(gates) == 1)
+        assert job.status is srv.JobStatus.FAILED and "EXCEPTION" in (job.error or "")
+        if where == "after-spawn":
+            assert job.exit_code == 7, "precondition: the job exited on its own code inside the bound"
+        assert "broker cleanup" not in (job.error or ""), "the runner's own completion path did not run"
+        assert gates == [(True, False)], "a runner error was handed to the gate as a no-op failure"
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
