@@ -98,8 +98,8 @@ VERDICTS = ("healthy", "unhealthy", "skipped")
 # writes into HealthState, and probe_observed() is wired into the same methods update() calls
 # (verify_device_health/verify_fabric_health/verify_eth_heartbeat/heartbeat_verdict) so every
 # caller of those — the gate, Recovery._verify_device, and update() itself — is covered from one
-# instrumentation point per probe.
-PROBES = ("hostpci", "heartbeat", "pci", "eth_heartbeat", "fabric")
+# instrumentation point per probe. "aiclk_ceiling" is the opt-in clock-cap step (health/aiclk_ceiling.py).
+PROBES = ("hostpci", "heartbeat", "pci", "aiclk_ceiling", "eth_heartbeat", "fabric")
 
 # The JobStatus values server.Stats.record_job_completion counts. There is no separate
 # "cancelled" outcome in the real code: _kill_job() cancels a QUEUED job by setting the same

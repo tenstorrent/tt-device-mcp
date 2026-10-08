@@ -82,6 +82,7 @@ from tt_device_mcp.fsm import ServerFsm, ServerState
 from tt_device_mcp.health import (
     _HOST_ESCALATION_ACTION,
     BLOCKED,
+    CEILING,
     DEFER,
     HOLD_ESCALATION_REARM_SEC,
     HOLD_FABRIC_UNVERIFIED,
@@ -3268,7 +3269,14 @@ async def _kill_device_holders(reason: str) -> list:
             survivors.append({"pid": h.pid, "user": h.username, "error": str(e)})
     # The broker's own device work. A fabric check mid-traffic-pass is the likeliest holder of
     # all — it maps every chip — and it is the one that killed a host, twice.
-    for proc, who in ((health_monitor.fabric_check_proc, "[broker]fabric-check"), (current_process, "[broker]job")):
+    for proc, who in (
+        (health_monitor.fabric_check_proc, "[broker]fabric-check"),
+        (
+            CEILING.proc if CEILING.proc is not None and CEILING.proc.returncode is None else None,
+            "[broker]aiclk-ceiling",
+        ),
+        (current_process, "[broker]job"),
+    ):
         if proc is None:
             continue
         try:
@@ -5375,6 +5383,37 @@ async def _dispatch_recheck_if_stale(job_log_file: Optional[Path]) -> None:
             _mark_device_dirty(f"dispatch recheck: eth-core heartbeat frozen ({eth_frozen})", why="probe_unhealthy")
 
 
+async def _ensure_aiclk_ceiling(job_log_file: Optional[Path]) -> None:
+    """Door step for an operator's AICLK ceiling: when something since the last verified apply
+    may have cleared it (a job exit, a reset whose verify never reached the ceiling step), re-apply
+    and prove it before the next tenant runs. A no-op when unconfigured or already verified, so a
+    clean queue pays nothing. One retry; still unverified, the device is flagged dirty and the
+    pre-job gate's reset + verify owns it — the ladder is bounded, so this never wedges the queue.
+    Never raises."""
+    if not (CEILING.armed() and CEILING.owed):
+        return
+
+    def _log(line: str) -> None:
+        if logger:
+            logger.info(f"HEALTH-GATE[pre-job] {line}")
+        if job_log_file:
+            try:
+                append_job_log(job_log_file, "broker", f"HEALTH-GATE[pre-job] {line}\n")
+            except OSError:
+                pass
+
+    try:
+        async with get_device_op_lock():
+            ok, detail, _ = await CEILING.apply("pre-job", log=_log)
+            if ok is False:
+                await asyncio.sleep(2)
+                ok, detail, _ = await CEILING.apply("pre-job retry", log=_log)
+    except Exception as e:  # noqa: BLE001 - the door must never block the queue
+        ok, detail = False, f"apply raised {type(e).__name__}: {e}"
+    if ok is False:
+        _mark_device_dirty(f"aiclk ceiling unverified: {detail}", why="probe_unhealthy")
+
+
 async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> None:
     """Pre-job gate — a cheap safety net only. The post-job gate checks the device at
     the END of every run (the snapshot always, the passive eth read when that rung is
@@ -5392,6 +5431,7 @@ async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> Non
     # kernel can run. Opt-in per host until the probe is timed there (see _prejob_dispatch_enabled).
     # Pass the job log so the verdict is recorded where the run's history reads back, not only in
     # server.log — the per-job log is the tenant-visible proof the gate actually ran.
+    await _ensure_aiclk_ceiling(job_log_file)
     await _dispatch_probe_ok(job_log_file)
     if fsm.state is ServerState.HEALTHY:
         # A HEALTHY verdict hours old says nothing about the mesh now: re-read it cheaply first
@@ -5426,6 +5466,10 @@ async def _verify_device_after_job(job_log_file: Optional[Path], job_failed: boo
     assertion is not evidence of broken silicon.
 
     Never raises."""
+    # A job may set its own clock limits or leave the firmware default behind when it exits; the
+    # gate's probe pass below re-proves the ceiling, and the door re-applies it if this gate never
+    # got that far.
+    CEILING.mark_owed("job end")
     try:
         await _device_health_gate(job_log_file, phase="post-job", run_fabric=False, force_fabric=job_failed)
     except Exception as e:  # noqa: BLE001 - must never crash the runner
@@ -7468,6 +7512,14 @@ async def _verify_fabric_on_start() -> None:
     try:
         while readopted_scopes:
             await asyncio.sleep(_SCOPE_POLL_SEC)
+        # A boot or power cycle cleared any firmware clock cap. Put the operator's ceiling back
+        # first, so the startup traffic pass below never runs above it. The gate's probe pass
+        # re-proves it and owns the verdict, so a failure here is only logged.
+        if CEILING.armed() and CEILING.owed:
+            async with get_device_op_lock():
+                await CEILING.apply(
+                    "startup", log=(lambda line: logger.info(f"HEALTH-GATE[startup] {line}")) if logger else None
+                )
         if not await _await_startup_hugepages():
             return
         await _device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)

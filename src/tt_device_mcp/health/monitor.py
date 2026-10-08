@@ -30,6 +30,7 @@ from tt_device_mcp.constants import (
     FABRIC_CHECK_CANNOT_CHECK_RC,
     FABRIC_CHECK_TIMEOUT_SEC,
 )
+from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
@@ -256,6 +257,17 @@ class HealthMonitor:
         if log:
             log(f"snapshot: {'OK' if ok else 'UNHEALTHY'} — {detail}")
         _record("pci", ok, detail)
+        # The operator's AICLK ceiling, re-proven (and re-applied where a chip lost it) on every
+        # pass once the snapshot showed the chips present — a reset, power cycle, boot or job exit
+        # may have cleared it — and before the eth read and the traffic pass, so no load the broker
+        # drives runs above it. ~2 ms per chip. Off (no step, no observation) when unconfigured.
+        if ok and CEILING.armed():
+            self._deps.set_device_op_detail("health check: AICLK ceiling")
+            cok, cdetail, cevidence = await CEILING.apply(phase, log=log, terminate=self._terminate_process_group)
+            if cok is not None:
+                _record("aiclk_ceiling", cok, cdetail, cevidence)
+            if cok is False:
+                return _store()
         fabric_asked = run_fabric or force_fabric
         if ok and (fabric_asked or run_eth):
             self._deps.set_device_op_detail("health check: eth-core heartbeat (passive)")

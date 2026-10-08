@@ -19,6 +19,7 @@ from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import aio, metrics, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
+from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_dir, health_event
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
@@ -521,6 +522,8 @@ class RecoveryMechanism:
         # Name the command we are actually running. This was hardcoded to the galaxy's -glx_reset, so on
         # every other machine the queue told operators a command that was not the one executing.
         self._set_device_op_detail(f"device reset: {' '.join(argv)} (~60s)")
+        # Any reset clears a firmware clock cap; owed until a verified re-apply (see aiclk_ceiling).
+        CEILING.mark_owed("reset")
         quiesced = await self._set_device_pollers(False, log)
         # A reset takes the chips off the bus — that is what it does — so for its duration they
         # read all-ones exactly like a dead chip. Without this flag the sampler isolates them
@@ -564,6 +567,8 @@ class RecoveryMechanism:
                     # device comes back short and nobody knows why.
                     await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
                     await asyncio.sleep(3)
+                    if rc == 0:
+                        await self._reapply_aiclk_ceiling(log)
                 except OSError:
                     pass
                 finally:
@@ -572,6 +577,19 @@ class RecoveryMechanism:
                     # rather than leaving a telemetry gap.
                     if quiesced:
                         await asyncio.shield(self._set_device_pollers(True, log))
+
+    async def _reapply_aiclk_ceiling(self, log) -> None:
+        """Put an operator's AICLK ceiling back on the freshly reset chips, before the pollers
+        return and before the caller's verify runs its traffic pass. Only after a completed reset
+        (the chips are back on the bus); a no-op when unconfigured. Never raises: a failure here
+        leaves the ceiling owed, and the verify's probe pass retries it and fails closed."""
+        if not CEILING.armed():
+            return
+        self._set_device_op_detail("device reset: re-applying the AICLK ceiling")
+        try:
+            await CEILING.apply("post-reset", log=log)
+        except Exception as e:  # noqa: BLE001 - the verify that follows owns the verdict
+            log(f"aiclk-ceiling: post-reset apply raised {type(e).__name__}: {e}")
 
     def read_auto_recovery_ledger(self) -> Optional[list[dict]]:
         """Every auto-recovery escalation this host has taken, oldest first — the rate limiter's
