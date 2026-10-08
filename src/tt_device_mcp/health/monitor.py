@@ -38,6 +38,7 @@ from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
 # the tail, where a wrapper prints its verdict, bounded so a chatty validator cannot fill the disk.
 ACTION_LOG_OUTPUT_CHARS = 8000
 
+
 def _override_reason(text: str) -> str:
     """The reason an operator's fabric wrapper gives for its exit code, as one line.
 
