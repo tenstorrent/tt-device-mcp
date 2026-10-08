@@ -264,6 +264,10 @@ class RecoveryDeps:
     # then loses every sysfs node must still journal the loss and escalate the episode to dirty —
     # only an already-dirty one has nothing left to re-flag.
     episode_dirty: Optional[Callable[[], bool]] = None
+    # Whether any episode is open (state not HEALTHY). A short chip count is flagged only on a
+    # HEALTHY box: under a hold the gate already placed (an off-bus drop held dirty=False) the
+    # short count IS that fault, and re-dirtying it would disable the hold's idle relift.
+    episode_open: Optional[Callable[[], bool]] = None
     episode_job: Optional[Callable[[], dict]] = None
 
 
