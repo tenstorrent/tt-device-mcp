@@ -800,7 +800,7 @@ def _all_trays(expected: int, tray_map: Optional[dict]) -> Optional[list]:
     return sorted(tray_map)
 
 
-# Issue #26 (spec 04 I18): a tray with this many chips off the bus at the FIRST sighting is a tray that
+# Issue #26 (spec 04 I19): a tray with this many chips off the bus at the FIRST sighting is a tray that
 # has lost power, not a chip that dropped. Such an onset gets one PCI rescan and a read-only capture of
 # the BMC/CPLD/PCIe state in front of the ladder; the ladder itself, and the power cycle only when the
 # ladder fails, are unchanged.
@@ -1041,7 +1041,7 @@ class GalaxyRecovery(Recovery):
         an earlier, different reset. The gate rung reports its own action's verdict instead and
         never TERMINAL — see :meth:`_fire_gate_rung`.
 
-        Every caller passes here first, so this is where a tray-down onset (spec 04 I18) is latched
+        Every caller passes here first, so this is where a tray-down onset (spec 04 I19) is latched
         and, before its first rung, given one PCI rescan and the read-only capture. Then the ladder
         runs exactly as it would have, with the caller's own evidence and stage: the prelude never
         picks a rung, skips one or fires a power cycle. Only a rescan that brought every chip back
@@ -1213,7 +1213,7 @@ class GalaxyRecovery(Recovery):
             return OUTCOME_WAITING
         raise ValueError(f"escalate(): {stage!r} is not a gate action rung")
 
-    # ---- the tray-down prelude (spec 04 I18, issue #26) -----------------------------------------
+    # ---- the tray-down prelude (spec 04 I19, issue #26) -----------------------------------------
     #
     # The episode latch lives on this instance: set at the first off-bus sighting of an episode,
     # before any reset, and never re-derived while the episode is open, because a reset can itself

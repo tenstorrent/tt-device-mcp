@@ -3613,7 +3613,7 @@ async def device_health_gate(
         stage = galaxy_recovery.next_stage(ev)
 
         if stage == RELEASE:
-            galaxy_recovery.tray_down_episode_end()  # spec 04 I18: a released mesh closes the onset latch
+            galaxy_recovery.tray_down_episode_end()  # spec 04 I19: a released mesh closes the onset latch
             # Every check the host can run says the mesh is fine. Resetting anyway —
             # because a job happened to time out — is a 60s reset of 32 healthy ASICs,
             # and doing that on every abnormal exit is how the device spends its day
@@ -4231,7 +4231,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         _hold_row = None
         device_hold_episode_since = ""
         if galaxy_recovery is not None:
-            galaxy_recovery.tray_down_episode_end()  # spec 04 I18: the next drop is a fresh onset
+            galaxy_recovery.tray_down_episode_end()  # spec 04 I19: the next drop is a fresh onset
         _persist_hold_episode("")  # the device came back fit: the episode is over, on disk too
         device_hold_episode_reason = ""
         device_hold_escalated_monotonic = 0.0

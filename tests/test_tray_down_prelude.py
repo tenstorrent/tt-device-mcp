@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""The tray-down prelude (spec 04 I18, issue #26).
+"""The tray-down prelude (spec 04 I19, issue #26).
 
 Four or more chips off ONE physical tray at the first sighting of an episode is a tray that lost
 power. Before the ladder's first rung it gets one PCI rescan and a read-only capture of the

@@ -402,7 +402,7 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
 
     monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
 
-    # The tray-down prelude (spec 04 I18) rescans the bus and reads the BMC: never the real sysfs
+    # The tray-down prelude (spec 04 I19) rescans the bus and reads the BMC: never the real sysfs
     # or ipmitool from the suite. Its reads answer "not run in tests", so every gate/ladder test
     # still passes through the prelude unchanged. Its onset latch lives on the module-global
     # GalaxyRecovery, so every test starts with none.

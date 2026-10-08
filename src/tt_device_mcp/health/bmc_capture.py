@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Read-only BMC/CPLD/PCIe evidence at a tray-down onset (spec 04 I18, issue #26).
+"""Read-only BMC/CPLD/PCIe evidence at a tray-down onset (spec 04 I19, issue #26).
 
 The reset ladder that follows a tray-down onset (and the power cycle, when the ladder fails)
 erases the state that explains the drop: the tray and PDB CPLDs' power-good and fault latches,
