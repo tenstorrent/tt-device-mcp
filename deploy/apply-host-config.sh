@@ -106,6 +106,14 @@ RELIFT="${TTDEV_SELFHEAL_RELIFT:-}"
 # renders no line, so the hwm fallback is unchanged until a host opts in.
 EXPECTED_CHIPS="${TTDEV_EXPECTED_CHIPS:-}"
 [ -z "$EXPECTED_CHIPS" ] && [ -r "$UNIT" ] && EXPECTED_CHIPS="$(sed -n 's/^Environment=TT_DEVICE_MCP_EXPECTED_CHIPS=//p' "$UNIT" 2>/dev/null | head -1)"
+# Opt-in per-host AICLK ceiling (MHz): the broker re-applies the firmware clock cap after every reset,
+# at start and at the job door, and proves it before any traffic pass or job (health/aiclk_ceiling.py).
+# Unset renders no line and the feature is off. An external ceiling daemon, if any, should use the same
+# value: the broker only sends to a chip that reads above it. _CMD overrides the built-in helper.
+AICLK_CEILING="${TTDEV_AICLK_CEILING_MHZ:-}"
+[ -z "$AICLK_CEILING" ] && [ -r "$UNIT" ] && AICLK_CEILING="$(sed -n 's/^Environment=TT_DEVICE_MCP_AICLK_CEILING_MHZ=//p' "$UNIT" 2>/dev/null | head -1)"
+AICLK_CEILING_CMD="${TTDEV_AICLK_CEILING_CMD:-}"
+[ -z "$AICLK_CEILING_CMD" ] && [ -r "$UNIT" ] && AICLK_CEILING_CMD="$(sed -n 's/^Environment=TT_DEVICE_MCP_AICLK_CEILING_CMD=//p' "$UNIT" 2>/dev/null | head -1)"
 # The cold rungs — the TOP of the recovery cascade. server.py reads TT_DEVICE_MCP_AUTO_REBOOT (warm
 # reboot) and TT_DEVICE_MCP_AUTO_POWER_CYCLE (BMC power cycle), each default OFF, each armed with "1".
 # Without this wiring neither key can be set (nothing else sources /etc/default into the broker process),
@@ -153,6 +161,8 @@ autopc_env=""; [ -n "$AUTO_POWER_CYCLE" ] && autopc_env="Environment=TT_DEVICE_M
 autoubb_env=""; [ -n "$AUTO_UBB_RESET" ] && autoubb_env="Environment=TT_DEVICE_MCP_AUTO_UBB_RESET=$AUTO_UBB_RESET"
 prejobdispatch_env=""; [ -n "$PREJOB_DISPATCH" ] && prejobdispatch_env="Environment=TT_DEVICE_MCP_PREJOB_DISPATCH=$PREJOB_DISPATCH"
 ethpython_env=""; [ -n "$ETH_PYTHON" ] && ethpython_env="Environment=TTDEV_ETH_CHECK_PYTHON=$ETH_PYTHON"
+aiclk_env=""; [ -n "$AICLK_CEILING" ] && aiclk_env="Environment=TT_DEVICE_MCP_AICLK_CEILING_MHZ=$AICLK_CEILING"
+aiclkcmd_env=""; [ -n "$AICLK_CEILING_CMD" ] && aiclkcmd_env="Environment=TT_DEVICE_MCP_AICLK_CEILING_CMD=$AICLK_CEILING_CMD"
 
 # Backfill keys the running version expects into /etc/default — a host installed
 # before a key existed won't have it (auto-update never rewrites this file), so the
@@ -184,6 +194,8 @@ if [ -z "$RENDER_ONLY" ]; then
     ensure_default TTDEV_AUTO_UBB_RESET "$AUTO_UBB_RESET"
     ensure_default TTDEV_PREJOB_DISPATCH "$PREJOB_DISPATCH"
     ensure_default TTDEV_ETH_CHECK_PYTHON "$ETH_PYTHON"
+    ensure_default TTDEV_AICLK_CEILING_MHZ "$AICLK_CEILING"
+    ensure_default TTDEV_AICLK_CEILING_CMD "$AICLK_CEILING_CMD"
 fi
 # Preserve the lock: `tt-device-mcp lock` adds DEVICE_GROUP to the unit; keep it
 # across a re-render so an update doesn't silently unlock a shared host.
@@ -225,6 +237,8 @@ $autopc_env
 $autoubb_env
 $prejobdispatch_env
 $ethpython_env
+$aiclk_env
+$aiclkcmd_env
 $group_env
 ExecStart=$VENV/bin/python -m tt_device_mcp.server --socket $SOCK --no-http --log-dir /var/log/tt-device-broker
 ExecStartPost=/bin/sh -c 'for i in \$(seq 1 50); do [ -S $SOCK ] && { chmod 0666 $SOCK; exit 0; }; sleep 0.1; done'
