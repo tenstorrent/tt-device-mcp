@@ -300,6 +300,15 @@ class _PeerUidShim:
         await self._app(scope, receive, send)
 
 
+@pytest.fixture(autouse=True)
+def _startup_already_ran(monkeypatch):
+    """The first TestClient lifespan in a process runs run_startup_tasks(), whose startup gate
+    pass calls the same patched _verify_device the step tests count. Run alone, a test would then
+    see that startup call as its own step's gate pass. Mark startup done, as it already is for
+    every test after the first in a full run, so only the step route's own calls are recorded."""
+    monkeypatch.setattr(srv, "_startup_tasks_done", True)
+
+
 def _client():
     return TestClient(_PeerUidShim(srv.build_asgi_app(srv.create_mcp_server())), raise_server_exceptions=False)
 
