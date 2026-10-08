@@ -2152,14 +2152,25 @@ def _is_wedge_risk_exit(status: "JobStatus", exit_code: Optional[int]) -> bool:
 # on open (Blackhole 1350 MHz, Wormhole 1000) and drops it on a clean close (Blackhole 800,
 # Wormhole 500); only that close does it, so a job that dies without closing leaves its chips at
 # the busy clock until something else opens and closes them.
-IDLE_AICLK_MAX_MHZ = int(os.environ.get("TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ", "800"))
+def _idle_aiclk_max_mhz() -> int:
+    """TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ, or 800 if unset or not a positive integer. A typo in a
+    unit file must not stop the broker from importing."""
+    raw = os.environ.get("TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ", "")
+    try:
+        mhz = int(raw)
+    except ValueError:
+        return 800
+    return mhz if mhz > 0 else 800
+
+
+IDLE_AICLK_MAX_MHZ = _idle_aiclk_max_mhz()
 
 
 def _aiclk_left_busy(ceiling_mhz: int = IDLE_AICLK_MAX_MHZ) -> dict[str, int]:
     """Chips whose AI clock still reads above ``ceiling_mhz``, as {chip index: MHz}.
 
-    A sysfs read the KMD answers from its own copy: nothing reaches the chip, and a 32-chip read
-    costs milliseconds. An unreadable or non-numeric clock is left out, not counted as busy.
+    A sysfs read of the KMD's telemetry: it opens no device and takes no chip lock, and a 32-chip
+    read costs milliseconds. An unreadable or non-numeric clock is left out, not counted as busy.
     Never raises."""
     busy: dict[str, int] = {}
     try:
@@ -5649,14 +5660,25 @@ async def job_runner():
             job_id = runner_job_id
             if logger:
                 logger.error(f"JOB_RUNNER error escaped job_id={job_id}, failing closed: {e!r}")
+            failed_job = None
             async with get_lock():
                 job = jobs.get(job_id) if job_id else None
                 if job is not None and job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
                     job.status = JobStatus.FAILED
                     job.finished_at = job.finished_at or datetime.now().isoformat()
                     job.error = (job.error or "") + f"\n[EXCEPTION in broker cleanup: {e}]"
+                    failed_job = job
                 current_process = None
                 current_job_id = None
+            if failed_job is not None:
+                # FAILED is terminal: a restart must not restore the spec and run the job again.
+                _forget_queued_job(failed_job.id)
+                if failed_job.log_file:
+                    try:
+                        write_job_log_footer(Path(failed_job.log_file), failed_job)
+                    except Exception as footer_err:  # noqa: BLE001 - this path must not raise itself
+                        if logger:
+                            logger.warning(f"JOB_RUNNER job_id={job_id} could not write its log footer: {footer_err}")
             try:
                 _mark_device_dirty(f"job runner error after job {job_id}: {e}", why="gate_error")
             except Exception as mark_err:  # noqa: BLE001 - the gate below still runs
