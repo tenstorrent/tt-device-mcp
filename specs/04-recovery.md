@@ -337,6 +337,14 @@ each rung fires only when the gentler one failed or cannot apply.
   leaves it owed; an apply that fails or raises never breaks the rung, and the verify's probe pass
   retries it and fails closed. Unset, no step runs.
 
+- **I21 — No reset runs over a reaped job's leftover.** While a process a finished job left
+  holding the device stands (spec 01 I16), every reset is refused: the reset tool and the
+  streaming reset refuse with `force` too (`status: refused`, the holders named, and a hint
+  that only a host reboot clears a process stuck in the kernel), and `reset_with_quiesce`
+  checks the broker's `reset_fence` first and returns without a rung (`reset_fenced` event), so
+  no caller (the gate, the ladder, a tool) can reset over one. A reset cannot free such a
+  process and only hits the chips under it. The fence lifts once the holder is gone.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -691,6 +699,7 @@ sees a silent fabric pass.
 | I13 failed operator-reset verify is `operator_reset_unhealthy`; duration bound documented | `tests/test_reset.py::test_an_operator_reset_whose_fabric_fails_is_not_released`, `tests/test_reset.py::test_the_stream_settles_an_operator_reset_like_the_tool`, `tests/test_reset.py::test_the_reset_tools_documented_duration_matches_its_timeouts` |
 | I13 light verify; unhealthy downgrade | `tests/test_reset.py::test_reset_tool_reports_health`, `tests/test_reset.py::test_verify_health_fails_on_short_chip_count`, `tests/test_reset.py::test_verify_health_fails_on_wedged_arc`, `tests/test_reset.py::test_verify_health_passes_on_over_count_from_stale_expected` |
 | I20 the AICLK ceiling is re-applied after the rescan, before the pollers return | `tests/test_aiclk_ceiling.py::test_reset_reapplies_after_the_rescan_before_the_pollers_return`, `tests/test_aiclk_ceiling.py::test_reset_failed_rung_leaves_the_ceiling_owed`, `tests/test_aiclk_ceiling.py::test_reset_apply_error_never_breaks_the_rung`, `tests/test_aiclk_ceiling.py::test_reset_unconfigured_runs_no_ceiling` |
+| I21 every reset is refused over a reaped job's leftover, forced or not, through `reset_with_quiesce` too; it lifts once the holder is gone | `tests/test_reaped_leftover.py::test_the_reset_tool_is_refused_even_with_force`, `tests/test_reaped_leftover.py::test_the_streaming_reset_is_refused_even_with_force`, `tests/test_reaped_leftover.py::test_reset_with_quiesce_is_refused_through_the_fence`, `tests/test_reaped_leftover.py::test_the_broker_wires_the_fence_into_the_recovery_mechanism` |
 | I14 warm reboot never fired where futile; blocked climbs are loud | `tests/test_device_safety.py::test_host_escalation_for_drop_sends_all_off_bus_to_the_cold_rung`, `tests/test_device_safety.py::test_host_escalation_for_drop_routes_a_futile_reboot_to_the_cold_rung`, `tests/test_device_safety.py::test_gate_all_off_bus_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_reset_regression_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_all_off_bus_power_cycles_when_opted_in` |
 | Cold rung fireable-or-off (ipmitool) | `tests/test_device_safety.py::test_a_host_without_ipmitool_serves_with_the_cold_rung_off`, `tests/test_device_safety.py::test_ipmitool_present_leaves_the_cold_rung_armed` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |

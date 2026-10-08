@@ -122,6 +122,10 @@ class RecoveryMechanism:
         self._write_action_log = write_action_log
         self._device_hold_episode_since = device_hold_episode_since
         self._local_reset_dir = local_reset_dir or health_dir
+        # Why no reset may run now — '' when one may. The broker sets it to its leftover fence (spec
+        # 01 I16): a reaped job's process still holding the device, which a reset cannot free.
+        # Checked here, where every reset passes, so no caller can reset over one.
+        self.reset_fence: Optional[Callable[[], str]] = None
 
         # Two callers (the auto-recovery reset launcher and the operator-run reset tool) need this
         # sequence and they must build it identically, because the scope name is what every other
@@ -519,6 +523,11 @@ class RecoveryMechanism:
 
         Returns (exit code, combined output); the code is None on timeout/launch failure.
         """
+        fenced = self.reset_fence() if self.reset_fence else ""
+        if fenced:
+            log(f"reset refused: {fenced}")
+            health_event("reset_fenced", argv=argv, owner=owner, reason=fenced)
+            return None, f"reset refused: {fenced}"
         # Name the command we are actually running. This was hardcoded to the galaxy's -glx_reset, so on
         # every other machine the queue told operators a command that was not the one executing.
         self._set_device_op_detail(f"device reset: {' '.join(argv)} (~60s)")

@@ -124,6 +124,21 @@ the queue and a running job outlive the broker process.
   holder. Holders below `MIN_TENANT_UID` (root, service daemons) are ignored, and an
   incomplete scan does not block — a per-user broker cannot see other users' processes,
   and a dispatch, unlike a reset, harms no one it cannot see.
+- **I16** — A process a finished job left holding `/dev/tenstorrent` (a *reaped job's
+  leftover*) fences the device: no job is dispatched and no reset runs (spec 04 I21) until it
+  closes its fds. A holder is a leftover when it sits in a `ttdev-job-<id>.scope` cgroup of a
+  job that is not running, being torn down or re-adopted, or when the job's survivor sweep
+  named it (same pid and starttime, so a reused pid is not mistaken for it). The check runs
+  before the tenant filter of I15 and ignores uid and parentage: a process stuck in the kernel
+  is never reaped, so it can still be the broker's child. The fence names each holder (job,
+  pid, state, wchan, SIGKILL pending) and says that one stuck in the kernel with SIGKILL
+  pending cannot be killed and only a host reboot clears it. One
+  `reaped_leftover_holds_device` event opens the episode and one `reaped_leftover_released`
+  closes it; repeated scans emit nothing. The health gate skips its probes over a leftover and
+  keeps the device dirty (`foreign_holder`), so the verify runs once it is gone. A scan error
+  reads as no leftover. Motivating incident: a reaped job's process stuck in state D with
+  SIGKILL pending kept 192 device fds open for about an hour until a host reboot; in that time
+  a reset ran over it and a new job was dispatched beside it.
 
 ## Interfaces
 
@@ -391,6 +406,7 @@ flowchart LR
 | I12 | `tests/test_device_safety.py::test_rest_submit_bad_env_file_is_a_refusal_not_a_500`, `tests/test_server.py::TestEnvFile::test_load_env_file_not_found`, `tests/test_server.py::TestEnvFile::test_load_env_file_invalid_format`, `tests/test_server.py::TestActivationScript::test_activation_script_validate_missing_env` |
 | I14 | `tests/test_server.py::TestCleanDeviceGate::test_wedge_risk_truth_table`, `tests/test_device_safety.py::test_a_hung_job_is_treated_as_a_wedge_risk`, `tests/test_server.py::test_scan_output_detects_eth_core_fault`, `tests/test_server.py::test_scan_output_finds_signature_in_tail_of_large_log`, `tests/test_readopt.py::test_a_readopted_job_that_wedged_the_mesh_flags_the_device` |
 | I15 | `tests/test_device_safety.py::test_hold_mode_holds_a_degraded_device_then_dispatches_when_fit`, `tests/test_device_safety.py::test_hold_mode_self_heals_a_dirty_device_by_re_running_the_gate`, `tests/test_device_safety.py::test_exhausting_the_verify_budget_does_not_dispatch`, `tests/test_device_safety.py::test_tenant_gate_writes_one_held_and_one_released_per_episode`, `tests/test_device_safety.py::test_a_tenant_holder_blocks_dispatch`, `tests/test_device_safety.py::test_a_tenant_holder_holds_the_job_until_it_exits`, `tests/test_device_safety.py::test_broker_owned_holders_do_not_block_dispatch`, `tests/test_device_safety.py::test_an_incomplete_holder_scan_does_not_block_dispatch` |
+| I16 | `tests/test_reaped_leftover.py::test_the_leftover_is_named_and_the_event_fires_once_per_episode`, `tests/test_reaped_leftover.py::test_the_fence_lifts_and_the_release_event_fires_once_the_holder_is_gone`, `tests/test_reaped_leftover.py::test_dispatch_is_refused_even_when_the_leftover_descends_from_the_broker`, `tests/test_reaped_leftover.py::test_a_running_jobs_own_scope_is_not_a_leftover`, `tests/test_reaped_leftover.py::test_an_ordinary_holder_behaves_as_before`, `tests/test_reaped_leftover.py::test_a_swept_survivor_outside_a_scope_is_a_leftover_only_with_the_same_starttime`, `tests/test_reaped_leftover.py::test_a_survivor_record_is_dropped_once_a_complete_scan_no_longer_sees_it`, `tests/test_reaped_leftover.py::test_a_scan_error_never_fences_a_free_device`, `tests/test_reaped_leftover.py::test_a_leftover_without_pending_sigkill_is_named_but_not_called_unkillable`, `tests/test_reaped_leftover.py::test_the_health_gate_runs_no_probe_and_keeps_the_device_dirty` |
 | B-Submission (burst cap) | `tests/test_device_safety.py::test_an_armed_burst_cap_refuses_one_owners_flood_but_not_another`, `tests/test_device_safety.py::test_the_default_off_burst_cap_admits_every_submit`, `tests/test_device_safety.py::test_job_burst_decision_prunes_the_window_and_gates_on_the_cap[2-60.0-recent2-110.0-False-50.0-expect_kept2]` |
 | B-Submission (owner derived from the peer uid and the surface) | `tests/test_device_safety.py::test_the_owner_comes_from_the_peer_uid_and_the_surface` |
 | B-Submission (blocking run) | `tests/test_server.py::test_a_blocking_job_run_reports_progress_through_the_mcp_layer` |
