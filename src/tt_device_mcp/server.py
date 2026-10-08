@@ -72,6 +72,7 @@ from tt_device_mcp.constants import step_deadline_sec as _shared_step_deadline_s
 TT_DEV_DIR = "/dev/tenstorrent"
 from tt_device_mcp.device_holders import (
     MIN_TENANT_UID,
+    HolderScan,
     ReclaimResult,
     descends_from,
     enumerate_device_holders,
@@ -135,7 +136,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
-from tt_device_mcp.job_reap import JOB_TAG_ENV, reap_job_survivors
+from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.peercred import username_for_uid
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
 from tt_device_mcp.socket_transport import (
@@ -1049,6 +1050,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         fsm.boot(_recovery_deps)
         health_monitor = fsm.monitor
         recovery_mechanism = fsm.mechanism
+        recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
         galaxy_recovery = fsm.galaxy
         per_target_recovery = fsm.per_target
         select_recovery = fsm.select_recovery
@@ -1305,6 +1307,12 @@ job_runner_task: asyncio.Task | None = None  # Singleton job runner
 runner_job_id: str | None = None  # the job the runner last dequeued, for its error handler
 _startup_tasks_done = False  # run_startup_tasks() is once-per-process, whoever gets there first
 readopted_scopes: dict[str, str] = {}  # job_id -> scope unit, for jobs re-adopted after a restart
+# pid -> (job id, starttime) of each process a job's sweep left alive holding the device. The
+# leftover fence (01 I16) names these; a privsep leftover is also found by its job's scope cgroup.
+reaped_survivors: dict[int, tuple[str, str]] = {}
+# The leftovers the current fence episode names ('' when no fence stands): the operator hint is
+# emitted once per episode, not on every scan.
+_leftover_fence_detail: str = ""
 stats: Stats | None = None  # Session statistics
 stats_dir: Path | None = None  # Directory for stats files
 stats_file: Path | None = None  # Current stats file
@@ -3849,6 +3857,15 @@ async def device_health_gate(
     # Safety: never auto-reset over a real tenant who somehow holds the device
     # (e.g. a non-broker process). A board reset would abort their run.
     scan = await asyncio.to_thread(enumerate_device_holders)
+    # A reaped job's leftover still holding the device (01 I16): no probe and no reset runs over it,
+    # whatever its uid, and the hold names it. It stays dirty, so the verify runs once it is gone.
+    leftover = await asyncio.to_thread(_reaped_leftover_reason, scan)
+    if leftover:
+        _log(f"skip: {leftover}")
+        if not fsm.record.dirty:
+            _mark_device_dirty(leftover, why="foreign_holder")
+        fsm.note(f"{FOREIGN_HOLDER_NOTE}{leftover}")
+        return
     foreign = [h for h in scan.holders if h.uid >= MIN_TENANT_UID]
     if foreign:
         who = ", ".join(f"{h.username}(pid {h.pid})" for h in foreign)
@@ -5053,6 +5070,92 @@ async def _await_device_free_for_tenant(job_log_file: Optional[Path]) -> str:
     return _device_degraded_for_tenant()
 
 
+LEFTOVER_REBOOT_HINT = (
+    "a process stuck in the kernel with SIGKILL pending cannot be killed and keeps its "
+    "/dev/tenstorrent fds open; a device reset run over it does not recover the mesh, and only a "
+    "host reboot clears it"
+)
+
+
+def _live_job_ids() -> set[str]:
+    """The jobs that own the device by right: running, being torn down, or re-adopted."""
+    live = {j.id for j in jobs.values() if j.status == JobStatus.RUNNING}
+    live.update(readopted_scopes)
+    if current_job_id:
+        live.add(current_job_id)
+    return live
+
+
+def _reaped_leftovers(scan: Optional[HolderScan] = None) -> list[ReapedLeftover]:
+    """The /dev/tenstorrent holders left behind by jobs that already ended (01 I16).
+
+    Opens a fence episode the first time one is seen (one error log and one operator-hint event
+    naming each holder) and closes it once none remain. Never raises: a scan bug must not fence a
+    free device, so it reads as no leftover."""
+    global _leftover_fence_detail
+    try:
+        if scan is None:
+            scan = enumerate_device_holders()
+        found = find_reaped_leftovers(scan.holders, _live_job_ids(), reaped_survivors)
+        if scan.complete:
+            held = {h.pid for h in scan.holders}
+            for pid in [p for p in reaped_survivors if p not in held]:
+                reaped_survivors.pop(pid, None)
+    except Exception as e:
+        if logger:
+            logger.error(f"LEFTOVER scan error: {e}")
+        return []
+    detail = "; ".join(f.describe() for f in found)
+    if found and not _leftover_fence_detail:
+        if logger:
+            logger.error(
+                f"LEFTOVER device held by a reaped job: {detail}. No reset runs and no job is "
+                f"dispatched until it closes its /dev/tenstorrent fds; {LEFTOVER_REBOOT_HINT}."
+            )
+        health_event(
+            "reaped_leftover_holds_device",
+            leftovers=[
+                {
+                    "job_id": f.job_id,
+                    "pid": f.pid,
+                    "uid": f.uid,
+                    "state": f.state,
+                    "wchan": f.wchan,
+                    "sigkill_pending": f.sigkill_pending,
+                }
+                for f in found
+            ],
+            unkillable=any(f.unkillable for f in found),
+            operator_hint=LEFTOVER_REBOOT_HINT,
+        )
+    elif not found and _leftover_fence_detail:
+        if logger:
+            logger.info(f"LEFTOVER released the device: {_leftover_fence_detail}")
+        health_event("reaped_leftover_released", leftovers=_leftover_fence_detail)
+    _leftover_fence_detail = detail
+    return found
+
+
+def _reaped_leftover_reason(scan: Optional[HolderScan] = None) -> str:
+    """Why no reset and no dispatch may run while a reaped job's leftover holds the device — '' if
+    none. Names each holder (job, pid, state, wchan, SIGKILL pending) and says only a host reboot
+    clears an unkillable one. Never raises."""
+    found = _reaped_leftovers(scan)
+    if not found:
+        return ""
+    reboot = (
+        "; it is stuck in the kernel and cannot be killed: only a host reboot clears it"
+        if any(f.unkillable for f in found)
+        else ""
+    )
+    return (
+        f"device held by {len(found)} leftover process(es) of reaped job(s): "
+        + "; ".join(f.describe() for f in found)
+        + reboot
+        + "; no reset runs and no job is dispatched until it closes its /dev/tenstorrent fds"
+    )
+
+
 def _tenant_holder_reason() -> str:
     """Why a process outside the broker keeps the next job off the device — '' if none.
 
@@ -5065,11 +5168,18 @@ def _tenant_holder_reason() -> str:
     still counts), and an incomplete scan does not
     block — a per-user broker can never see other users' processes, and a dispatch, unlike a
     reset, harms no one it cannot see. A host with no device nodes has no holder to find.
+    A reaped job's leftover (01 I16) blocks whatever its uid and parentage.
     """
     if not _present_chip_indices():
         return ""
+    scan = enumerate_device_holders()
+    # A reaped job's leftover is checked first and whatever its uid or parent: it can still be the
+    # broker's child (a process stuck in the kernel is never reaped), which the filter below skips.
+    leftover = _reaped_leftover_reason(scan)
+    if leftover:
+        return leftover
     me = os.getpid()
-    held = [h for h in enumerate_device_holders().holders if h.uid >= MIN_TENANT_UID and not descends_from(h.pid, me)]
+    held = [h for h in scan.holders if h.uid >= MIN_TENANT_UID and not descends_from(h.pid, me)]
     if not held:
         return ""
     who = ", ".join(f"{h.username}(pid {h.pid})" for h in held)
@@ -7113,10 +7223,17 @@ export {JOB_TAG_ENV}={job_tag}
                             f"SIGKILL that may hold the device: "
                             + "; ".join(s.describe() for s in held_by)
                             + ". The next job waits until they are gone; state D means stuck in the "
-                            "kernel, which only a device reset or reboot clears."
+                            "kernel, which only a host reboot clears."
                         )
+                    for survivor in held_by:
+                        if survivor.starttime:
+                            reaped_survivors[survivor.pid] = (job_id, survivor.starttime)
+                    # The holder scan names each one (state, wchan, SIGKILL pending) and opens the
+                    # leftover fence (01 I16); the sweep's own words stand if the scan sees none.
+                    leftover = await asyncio.to_thread(_reaped_leftover_reason)
                     _mark_device_dirty(
-                        f"job {job_id} left pid "
+                        leftover
+                        or f"job {job_id} left pid "
                         + ", ".join(f"{s.pid} (state {s.state})" for s in held_by)
                         + " alive after SIGKILL, holding the device",
                         job=job,
@@ -7849,6 +7966,16 @@ def create_mcp_server() -> MCPServer:
             + ("" if scan.complete else " (scan incomplete)")
             + "\n"
         )
+        # A reaped job's leftover still holding the device (01 I16): no reset runs over it, forced or
+        # not. A reset cannot free a process stuck in the kernel and only hits the chips under it.
+        leftover = await asyncio.to_thread(_reaped_leftover_reason, scan)
+        if leftover:
+            if logger:
+                logger.warning(f"reset_stream: leftover REFUSED: {leftover}")
+            yield f"leftover REFUSED: {leftover}\n"
+            yield f"hint: {LEFTOVER_REBOOT_HINT}\n"
+            yield "::status::refused\n"
+            return
 
         # Over the socket the caller's real uid scopes the gate. Over HTTP there is no peer
         # identity: on a privsep host an anonymous caller owns no holder, so every tenant is
@@ -9312,6 +9439,18 @@ def create_mcp_server() -> MCPServer:
             f"scanned device holders: {len(scan.holders)} process(es) holding /dev/tenstorrent"
             + ("" if scan.complete else " (scan incomplete — limited visibility)")
         )
+        # A reaped job's leftover still holding the device (01 I16): no reset runs over it, forced or
+        # not. A reset cannot free a process stuck in the kernel and only hits the chips under it.
+        leftover = await asyncio.to_thread(_reaped_leftover_reason, scan)
+        if leftover:
+            step(f"leftover REFUSED: {leftover}", "warning")
+            return {
+                "status": "refused",
+                "reason": leftover,
+                "foreign_holders": [],
+                "steps": steps,
+                "hint": LEFTOVER_REBOOT_HINT,
+            }
         # Over the socket the caller's real uid scopes the gate. Over HTTP there is no peer
         # identity: on a privsep host an anonymous caller owns no holder, so every tenant is
         # foreign and we fail closed rather than reset over another tenant's run. Off privsep,
