@@ -3730,12 +3730,14 @@ async def device_health_gate(
         # A clean post-job exit still gets the passive eth read when the rung is armed (I30): chips
         # that all tick say nothing about a wedged eth core, and the next tenant is the one who
         # finds it. The read costs ~1s and pushes no traffic. A frozen verdict holds below; a read
-        # that reaches no verdict runs the full pass inside this same probe pass. A clean Slurm
+        # that reaches no verdict runs the full pass inside this same probe pass. A read skipped for
+        # a link-count drop runs it only when no pass is fresh (`stale`): the drop stays until an
+        # operator re-baselines, and an unlimited pass on it charges every clean job. A clean Slurm
         # post-step is the same exit seen from outside the broker, and its worst case (the read, then
         # the bounded pass) is what a failed step already pays inside the same step deadline.
         run_eth = with_recover and phase in ("post-job", "post-step") and not full and eth_check_armed
         healthy, evidence = await fsm.observe(
-            expected, _log, run_fabric=full, run_eth=run_eth, phase=phase, recovery=recovery
+            expected, _log, run_fabric=full, run_eth=run_eth, fabric_stale=stale, phase=phase, recovery=recovery
         )
         state = HealthState.from_evidence(evidence, phase=phase, expected=expected)
         fabric_ok = state.fabric_ok

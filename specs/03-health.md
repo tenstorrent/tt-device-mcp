@@ -108,7 +108,8 @@ job boundary.
   (forced), at startup (forced), inside the recovery ladder, after an operator's reset of a mesh
   (spec 04 I13 — the operator's clock, not a submitter's), on a `run_fabric` caller only when
   no pass is fresher than `FABRIC_CHECK_MIN_INTERVAL_SEC` (default 1200s), and post-job on a
-  clean exit only when that exit's eth read reached no verdict (I30).
+  clean exit only when that exit's eth read reached no verdict (I30; a link-count-drop skip only
+  when no pass is fresher than that interval).
 - **I13 — The gate never resets over a tenant.** A foreign holder (uid ≥ `MIN_TENANT_UID`,
   1000) skips the gate untouched: verification is deferred, an existing hold outlives the skip
   (`why=foreign_holder`), and `fsm.note` names the holder. The host rungs re-scan at fire time,
@@ -344,7 +345,12 @@ job boundary.
   existing eth-frozen hold, with no reset.
   A read that reaches no verdict (the built-in probe's own timeout, a crash, exit 77, no runnable
   reader) runs the full fabric pass inside the same gate, exactly as a failed job's does, so its
-  exit 77 holds fabric-unverified on a multi-chip mesh (I17). Accepted trade-off: a built-in read
+  exit 77 holds fabric-unverified on a multi-chip mesh (I17). A read whose cores all advanced
+  but whose measured link count is below the host's high-water mark (I28) is a skip of another
+  kind: the drop stays until an operator deletes `eth_link_baseline.json`, so it runs the fabric
+  pass only when no pass is fresher than `FABRIC_CHECK_MIN_INTERVAL_SEC`. Otherwise the gate
+  records the eth read SKIPPED and releases, as on a disarmed host. Without that limit every
+  clean job on such a host paid a 45–100s pass. Accepted trade-off: a built-in read
   that armed in 9–10s outlasts its own 9s bound here, so that host pays the fabric pass after
   every clean job — fail-closed, and journaled. Only the startup self-test's arming (I28) turns
   this on; a disarmed host keeps the old clean-exit gate: snapshot only. The Slurm `post-step`
@@ -854,6 +860,7 @@ refuses.
 | I30 (a frozen clean-exit read holds, never resets) | `tests/test_device_safety.py::test_a_frozen_eth_read_after_a_clean_job_holds_without_a_reset`, `tests/test_monitor.py::test_update_run_eth_never_runs_fabric_after_a_frozen_eth_core` |
 | I30 (a read with no verdict runs the fabric pass in the same gate; its 77 holds) | `tests/test_device_safety.py::test_a_clean_exit_eth_read_with_no_verdict_runs_the_fabric_pass_in_the_same_gate`, `tests/test_device_safety.py::test_a_fallback_fabric_pass_that_cannot_check_holds_fabric_unverified`, `tests/test_monitor.py::test_update_run_eth_runs_fabric_when_eth_reaches_no_verdict` |
 | I30 (the reader's python is resolved once per process, re-resolved on change or a crashed read) | `tests/test_eth_probe.py::test_resolved_python_is_cached_across_calls`, `tests/test_eth_probe.py::test_build_on_every_gate_spawns_the_import_check_once`, `tests/test_eth_probe.py::test_repointing_current_re_resolves`, `tests/test_eth_probe.py::test_a_changed_pin_re_resolves`, `tests/test_eth_probe.py::test_a_cached_python_that_disappears_re_resolves`, `tests/test_eth_probe.py::test_no_python_is_cached_only_for_the_negative_ttl`, `tests/test_eth_probe.py::test_an_import_check_timeout_is_not_cached_as_no_python`, `tests/test_eth_probe.py::test_forget_python_forces_a_fresh_import_check`, `tests/test_device_safety.py::test_a_crashed_builtin_eth_read_drops_the_cached_python`, `tests/test_device_safety.py::test_a_builtin_eth_read_that_cannot_spawn_drops_the_cached_python`, `tests/test_device_safety.py::test_an_override_eth_read_with_no_verdict_keeps_the_cached_python` |
+| I30 (a link-count-drop skip runs the fabric pass at most once per interval) | `tests/test_device_safety.py::test_a_link_drop_after_clean_jobs_pays_at_most_one_fabric_pass_per_interval` |
 | I30 (a disarmed host keeps the snapshot-only clean exit) | `tests/test_device_safety.py::test_a_clean_job_does_not_pay_for_a_fabric_pass`, `tests/test_device_safety.py::test_a_disarmed_host_keeps_the_clean_exit_gate_unchanged`, `tests/test_monitor.py::test_update_without_run_eth_or_fabric_reads_no_eth` |
 | I30 (a clean Slurm post-step reads eth on an armed host, with the same hold and fallback; a failed step and the read-only pre-step do not) | `tests/test_slurm_steps.py::test_a_clean_post_step_on_an_armed_host_asks_for_the_eth_read`, `tests/test_device_safety.py::test_a_frozen_eth_read_after_a_clean_job_holds_without_a_reset`, `tests/test_device_safety.py::test_a_clean_exit_eth_read_with_no_verdict_runs_the_fabric_pass_in_the_same_gate` (both parametrized over post-job/post-step) |
 | I31 | `tests/test_device_safety.py::test_a_short_chip_count_is_a_degraded_reason_at_dispatch`, `tests/test_device_safety.py::test_the_sampler_dirties_a_short_count_after_two_samples`, `tests/test_device_safety.py::test_a_host_with_no_baseline_is_unchanged_by_the_count_check`, `tests/test_device_safety.py::test_a_short_count_under_an_off_bus_hold_stays_held`, `tests/test_device_safety.py::test_health_checks_off_skip_the_count_check` |
