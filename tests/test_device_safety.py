@@ -789,16 +789,17 @@ async def test_a_started_job_is_not_revived_by_a_restart(monkeypatch, tmp_path, 
     assert srv.jobs == {}, "a job that already started was re-queued by the restart"
 
 
-@pytest.mark.parametrize("door", ["degraded", "privsep"])
+@pytest.mark.parametrize("door", ["degraded", "busy", "privsep"])
 @pytest.mark.parametrize("refusal_raises", [False, True], ids=["refused", "refusal-raised"])
 @pytest.mark.asyncio
 async def test_a_job_refused_at_the_door_is_not_revived_by_a_restart(
     monkeypatch, tmp_path, clear_job_state, door, refusal_raises
 ):
-    """A job refused at the door (degraded device, or a privsep identity we cannot honour) is
-    FAILED and the submitter is told so. Its queued spec must go with it: if it stays on disk,
-    the next broker re-queues it and runs a command its owner was told never ran. That holds
-    for the runner's fallback too, when the refusal helper itself raises."""
+    """A job refused at the door (degraded device, a process outside the broker holding the
+    device, or a privsep identity we cannot honour) is FAILED and the submitter is told so.
+    Its queued spec must go with it: if it stays on disk, the next broker re-queues it and
+    runs a command its owner was told never ran. That holds for the runner's fallback too,
+    when the refusal helper itself raises."""
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     _free_device_lock(monkeypatch)
     _quiet_post_job_gate(monkeypatch)
@@ -810,6 +811,9 @@ async def test_a_job_refused_at_the_door_is_not_revived_by_a_restart(
 
     monkeypatch.setattr(srv, "_await_device_free_for_tenant", gate)
     monkeypatch.setattr(srv, "privsep_refusal", lambda uid: "no passwd entry" if door == "privsep" else "")
+    monkeypatch.setattr(
+        srv, "_tenant_holder_reason", lambda: "device held outside the broker" if door == "busy" else ""
+    )
     if refusal_raises:
 
         async def boom(*a, **k):
