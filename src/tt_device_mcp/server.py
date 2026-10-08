@@ -131,6 +131,9 @@ from tt_device_mcp.health import (
     read_heartbeats,
     version_floor_warnings,
 )
+from tt_device_mcp.health import (
+    hugepages_shortfall as health_hugepages_shortfall,
+)
 from tt_device_mcp.job_reap import JOB_TAG_ENV, reap_job_survivors
 from tt_device_mcp.peercred import username_for_uid
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
@@ -1985,7 +1988,14 @@ def next_job_id(extra_in_use=frozenset()) -> str:
 
 
 def _write_action_log_file(
-    aid: str, owner: str, command: str, started: datetime, status: str, exit_code, runtime_sec: float
+    aid: str,
+    owner: str,
+    command: str,
+    started: datetime,
+    status: str,
+    exit_code,
+    runtime_sec: float,
+    output: str = "",
 ) -> None:
     """Write one non-queued action's header+footer log under a KNOWN id and start — the shared body
     behind both write_action_log (op sub-actions) and the hold release. Naming the file by the START
@@ -2002,6 +2012,9 @@ def _write_action_log_file(
             # length of whatever queue happened to exist when it ran.
             f.write(f"QUEUED:      {started.isoformat()}\n" + "=" * 70 + "\n")
             f.write(f"[Started at {started.isoformat()}]\n")
+            # Between the start and the footer, where a queued job's own output sits.
+            if output:
+                f.write(output.rstrip("\n") + "\n")
             f.write(f"FINISHED:    {now.isoformat()}\nSTATUS:      {status}\n")
             f.write(f"EXIT CODE:   {exit_code}\nRUNTIME:     {runtime_sec:.1f}s\n")
             f.flush()
@@ -2037,7 +2050,7 @@ def _begin_action_row(owner: str, command: str) -> None:
         pass
 
 
-def write_action_log(owner: str, command: str, runtime_sec: float, status: str, exit_code) -> None:
+def write_action_log(owner: str, command: str, runtime_sec: float, status: str, exit_code, output: str = "") -> None:
     """Record a non-queued device action (a reset, a fabric check) in the same
     header/footer log format jobs use, so it shows up in recent history. It shares the
     jobs' id space — what ran is told by COMMAND.
@@ -2049,6 +2062,7 @@ def write_action_log(owner: str, command: str, runtime_sec: float, status: str, 
     A one-shot event that reserved nothing (a hold, a startup probe) has no running phase to
     match, so its start is reconstructed from the runtime — the finish time would put a 60s reset
     ahead of the job it interrupted and a 45s fabric check ahead of the job that triggered it.
+    ``output`` (a skipped or failed fabric run's output) goes in the body, as a job's would.
     """
     global _action_row
     if not job_log_dir:
@@ -2062,7 +2076,7 @@ def write_action_log(owner: str, command: str, runtime_sec: float, status: str, 
     else:
         started = now - timedelta(seconds=max(runtime_sec, 0.0))
         aid = next_job_id()
-    _write_action_log_file(aid, owner, command, started, status, exit_code, runtime_sec)
+    _write_action_log_file(aid, owner, command, started, status, exit_code, runtime_sec, output)
 
 
 def _span_str(start_iso: Optional[str], end_iso) -> Optional[str]:
@@ -2866,6 +2880,34 @@ def _fabric_relift_enabled() -> bool:
     return os.environ.get("TT_DEVICE_MCP_FABRIC_RELIFT", "0").strip() not in ("", "0")
 
 
+def _fabric_77_only_hold() -> bool:
+    """Whether the open hold's ONLY cause is a fabric pass that could not run (a 77).
+
+    enum+ARC passed, nothing is dirty or off the bus, the runtime named no fault, and no pass has
+    measured the fabric BAD — the broker simply has no verdict. A reset cannot produce one (a 77
+    is a missing prerequisite, such as hugepages not yet allocated at boot, not a device fault),
+    and a galaxy reset on unverifiable fabric is the measured all-chip drop. So this hold is
+    never escalated to a reset by the idle relift, the deadline escalation or the watchdog; the
+    idle relift re-runs the fabric pass instead, and a real verdict decides."""
+    return (
+        fsm.state is ServerState.RECOVERING
+        and fsm.record.why == FABRIC_RELIFT_WHY
+        and not fsm.record.dirty
+        and not device_fault_reported
+        and not isolated_chips
+        and health_monitor.last_fabric_ok is not False
+    )
+
+
+def _fabric_77_relift_enabled() -> bool:
+    """Whether a 77-only fabric hold (see _fabric_77_only_hold) re-runs the fabric pass while idle.
+    ON by default, unlike the broader TT_DEVICE_MCP_FABRIC_RELIFT opt-in: a pass that 77s again
+    costs about a second and moves no traffic, and one that runs either lifts the hold or measures
+    a fault the ordinary escalation then owns. TT_DEVICE_MCP_FABRIC_RELIFT=0 turns it off, and
+    the hold then stands until a job's gate or an operator clears it — still never a reset."""
+    return os.environ.get("TT_DEVICE_MCP_FABRIC_RELIFT", "").strip() != "0"
+
+
 def _generic_hold_escalate_enabled() -> bool:
     """Whether a hold no read-only relift can lift escalates to the idle galaxy reset once past the
     ceiling, instead of standing until a broker restart. These holds arm neither the self-heal nor
@@ -2888,16 +2930,20 @@ def _idle_relift_armed() -> tuple[bool, bool, bool]:
     ``not fabric``): the perturbing traffic-pass retry is what needs the opt-in, not escalation
     itself, and a hold that arms neither would stand idle for the full forced-watchdog ceiling and
     then fire with force=True — bypassing the due and retry-pacing guards the guarded idle path
-    honors — where the old code escalated guarded once past the grace."""
+    honors — where the old code escalated guarded once past the grace.
+
+    The exception is a 77-only fabric hold (see _fabric_77_only_hold): it re-runs the fabric pass
+    by default and is never generic, so no idle path resets a mesh for a pass that could not run."""
     if fsm.state is not ServerState.RECOVERING:
         return False, False, False
     why = fsm.record.why
-    fabric = _fabric_relift_enabled() and why == FABRIC_RELIFT_WHY
+    only_77 = why == FABRIC_RELIFT_WHY and _fabric_77_only_hold()
+    fabric = why == FABRIC_RELIFT_WHY and (_fabric_relift_enabled() or (only_77 and _fabric_77_relift_enabled()))
     return (
         _selfheal_relift_enabled() and why in SELFHEAL_WHYS,
         fabric,
         _generic_hold_escalate_enabled()
-        and (why in GENERIC_ESCALATE_WHYS or (why == FABRIC_RELIFT_WHY and not fabric)),
+        and (why in GENERIC_ESCALATE_WHYS or (why == FABRIC_RELIFT_WHY and not fabric and not only_77)),
     )
 
 
@@ -2919,8 +2965,10 @@ async def _attempt_idle_relift() -> None:
     77) is the one path that RE-RUNS THE TRAFFIC PASS, because a fabric that could only not-run is
     proven fit only by a pass that gets a real verdict. It lifts ONLY on an explicit healthy fabric
     verdict — a 77 again on retry (_verify_device returns healthy=True on a skipped fabric) and a
-    failure both hold, so the door never reopens onto fabric no pass cleared. OFF by default (see
-    _fabric_relift_enabled): it perturbs, so it is opt-in. The two categories are mutually exclusive.
+    failure both hold, so the door never reopens onto fabric no pass cleared. It perturbs, so for a
+    hold with any other trace of a fault it is opt-in (see _fabric_relift_enabled); a hold whose ONLY
+    cause is the 77 (_fabric_77_only_hold) relifts by default instead of escalating to a reset, and
+    waits for the 1G hugepage pool first. The two categories are mutually exclusive.
     A why in GENERIC_ESCALATE_WHYS (a foreign holder that blocked verification, a gate error, or a
     startup boot still awaiting its first fabric pass) arms neither — an enum+ARC pass proves
     nothing those were placed for — so it is never lifted here; when TT_DEVICE_MCP_GENERIC_HOLD_
@@ -2995,6 +3043,15 @@ async def _attempt_idle_relift() -> None:
             # already passed and the fabric merely 77'd, so a retry that gets a real verdict is the
             # only thing that proves the mesh. The self-heal hold must never run it — a frozen core
             # is exactly what a traffic pass shoves off the bus.
+            if fabric:
+                # A pass run before the 1G hugepages exist can only 77 again; wait for the count.
+                short = await asyncio.to_thread(_hugepages_shortfall)
+                if short is not None:
+                    _log(
+                        f"fabric pass waits: hugepages not yet allocated: {short[0]}/{short[1]} — "
+                        "holding; it re-runs once the count is met"
+                    )
+                    return
             healthy, evidence = await fsm.observe(expected, _log, run_fabric=fabric, recovery=galaxy_recovery)
             if not healthy:
                 # A chip is still off the bus: read-only there is nothing left to re-verify, and an
@@ -4645,6 +4702,8 @@ async def _force_escalate_stuck_hold() -> None:
             return
         if not _recovery_degraded():
             return  # the hold cleared between the sampler spawning us and the lock
+        if _fabric_77_only_hold():
+            return  # a pass that could not run is never reset for; the idle relift re-runs it
         indices = _present_chip_indices()
         # No device nodes at all is the sysfs-blackout / all-off-bus case — the catastrophic drop that
         # most needs the cold rung, never a reason to bail. Bailing let the deadline watchdog keep
@@ -4753,7 +4812,12 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # last. Marking the window spent on a decline burns it: the general clock then waits a whole
     # further ceiling, and the off-bus one-shot never fires again at all, which is how a hold
     # outlives its ceiling with no rung ever attempted.
-    if isolated_chips and not device_hold_offbus_escalated and age >= _offbus_hold_ceiling_sec():
+    # A hold whose only cause is a fabric pass that could not run (a 77) is never forced: a reset
+    # cannot give a pass its missing prerequisite, and the idle relift re-runs the pass instead.
+    only_77 = _fabric_77_only_hold()
+    if only_77:
+        pass
+    elif isolated_chips and not device_hold_offbus_escalated and age >= _offbus_hold_ceiling_sec():
         device_hold_escalation_trigger = f"the {int(_offbus_hold_ceiling_sec())}s off-bus one-shot"
         if _maybe_spawn_forced_escalation():
             device_hold_offbus_escalated = True
@@ -4779,7 +4843,14 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         escalated=fsm.latch("escalated"),
         host_at_risk=True,
     )
-    if logger:
+    if logger and only_77:
+        logger.error(
+            f"HOLD-WATCHDOG device HELD {int(age)}s — past the {deadline}s deadline — and still "
+            f"refused to tenants: {device_hold_episode_reason!r}. The fabric check could not run "
+            f"(77), so no reset is forced; the idle relift re-runs the fabric pass. Check why it "
+            f"cannot run (hugepages, validator install) in the fabric-check action log."
+        )
+    elif logger:
         logger.error(
             f"HOLD-WATCHDOG device HELD {int(age)}s — past the {deadline}s deadline — and still "
             f"refused to tenants: {device_hold_episode_reason!r}. The idle escalation has not "
@@ -7321,6 +7392,65 @@ def _close_orphaned_hold() -> None:
         logger.info(f"STARTUP closed an orphaned hold of {int(held_for)}s: {reason}")
 
 
+# How long the startup fabric pass waits for the 1G hugepages before it records cannot-check, and
+# how often it re-reads the count meanwhile. Boot allocates them 15-20 s after the broker starts.
+STARTUP_HUGEPAGES_WAIT_SEC = 120.0
+HUGEPAGES_POLL_SEC = 2.0
+
+
+def _hugepages_shortfall() -> Optional[tuple[int, int]]:
+    """``(have, need)`` while this host's chips still lack their 1G hugepages, else None. Keyed on
+    the operator's declared TT_DEVICE_MCP_EXPECTED_CHIPS (one hugepage per chip): a host that
+    declares no count is never held for hugepages."""
+    raw = os.environ.get("TT_DEVICE_MCP_EXPECTED_CHIPS", "").strip()
+    if not raw.isdigit():
+        return None
+    return health_hugepages_shortfall(int(raw))
+
+
+async def _await_startup_hugepages() -> bool:
+    """Wait (up to STARTUP_HUGEPAGES_WAIT_SEC) for the 1G hugepages before the startup fabric pass.
+
+    A pass run before they exist cannot open the device and exits 77, which holds the box fabric-
+    unverified for nothing. True: run the startup gate now. False: the count is still short, so
+    this recorded cannot-check and held the device fabric-unverified, and the idle relift re-runs
+    the pass once the count is met. A dirty episode carried over a restart still goes to the gate:
+    the reset it owes is not this wait's to drop. Waits under the device lock, so no idle relift
+    or forced escalation acts on the startup hold meanwhile."""
+    short = await asyncio.to_thread(_hugepages_shortfall)
+    if short is None:
+        return True
+    t0 = time.monotonic()
+    async with _device_op("startup-hugepages-wait"):
+        if logger:
+            logger.info(
+                f"STARTUP FABRIC waits for hugepages: {short[0]}/{short[1]} allocated "
+                f"(up to {int(STARTUP_HUGEPAGES_WAIT_SEC)}s) — a pass run now could only exit 77"
+            )
+        while short is not None and time.monotonic() - t0 < STARTUP_HUGEPAGES_WAIT_SEC:
+            await asyncio.sleep(HUGEPAGES_POLL_SEC)
+            short = await asyncio.to_thread(_hugepages_shortfall)
+    if short is None:
+        if logger:
+            logger.info(f"STARTUP FABRIC hugepages allocated after {time.monotonic() - t0:.0f}s")
+        return True
+    if fsm.record.dirty:
+        return True
+    reason = f"hugepages not yet allocated: {short[0]}/{short[1]}"
+    if logger:
+        logger.warning(
+            f"FABRIC-CHECK cannot check at startup — {reason} after {int(STARTUP_HUGEPAGES_WAIT_SEC)}s; "
+            "holding fabric-unverified, and the pass re-runs once the count is met. NOT resetting."
+        )
+    health_event("fabric_check_unavailable", detail=reason, cmd="startup")
+    write_action_log(
+        "[broker]fabric-check", "startup fabric pass", 0.0, "skipped", FABRIC_CHECK_CANNOT_CHECK_RC, output=reason
+    )
+    _hold_device_fabric_unverified(f"gate/startup: {reason}")
+    _note_tenant_gate_verdict(f"device unverified: gate/startup: fabric unverified ({reason})")
+    return False
+
+
 async def _verify_fabric_on_start() -> None:
     """Prove the mesh moves data, not merely that every chip answers.
 
@@ -7338,6 +7468,8 @@ async def _verify_fabric_on_start() -> None:
     try:
         while readopted_scopes:
             await asyncio.sleep(_SCOPE_POLL_SEC)
+        if not await _await_startup_hugepages():
+            return
         await _device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
     except Exception as e:  # noqa: BLE001 - startup must survive a check that cannot run
         # The gate is normally self-contained; if it raised, the startup fabric verdict is unknown and

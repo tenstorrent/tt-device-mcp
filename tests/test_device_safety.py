@@ -4147,7 +4147,7 @@ async def test_exec_timeout_kills_the_command_it_gave_up_on(monkeypatch, tmp_pat
     srv.jobs.clear()
     marker = tmp_path / "exec_orphan"
     logged = []
-    monkeypatch.setattr(srv, "write_action_log", lambda owner, cmd, rt, status, ec: logged.append(status))
+    monkeypatch.setattr(srv, "write_action_log", lambda owner, cmd, rt, status, ec, **k: logged.append(status))
     mcp = srv.create_mcp_server()
 
     out = await mcp.call_tool(
@@ -8475,9 +8475,11 @@ async def test_idle_relift_is_inert_when_kill_switched(monkeypatch, tmp_path, cl
 @pytest.mark.asyncio
 async def test_idle_relift_ignores_a_non_self_heal_hold(monkeypatch, tmp_path, clear_job_state):
     """A fabric-uncheckable host holds on device_unverified_why with device_selfheal_hold False.
-    An enum+ARC re-verify proves nothing that hold was placed for, so the relift must leave it —
-    else it would falsely reopen the door on a mesh whose fabric was never checked."""
+    An enum+ARC re-verify proves nothing that hold was placed for, so with the fabric relift turned
+    off (TT_DEVICE_MCP_FABRIC_RELIFT=0) the relift must leave it — else it would falsely reopen the
+    door on a mesh whose fabric was never checked."""
     _setup_selfheal_hold(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_RELIFT", "0")
     fsm_dirty(srv, "gate/post-job: enum+ARC healthy, fabric unverified", why="fabric_unverified")
     verify_called = {"n": 0}
 
@@ -8499,8 +8501,9 @@ async def test_idle_relift_ignores_a_non_self_heal_hold(monkeypatch, tmp_path, c
 # pass but the fabric traffic check exits 77 (could-not-run — NOT fabric-wedged), holds the door on
 # device_unverified_why WITHOUT device_selfheal_hold. The self-heal relift is scoped past that hold,
 # and nothing else re-checks a held-but-undirty mesh, so it strands until a broker restart or a human
-# reset. The opt-in fabric relift (TT_DEVICE_MCP_FABRIC_RELIFT, OFF by default because it re-runs the
-# traffic pass) closes the gap: it re-runs the health check and lifts ONLY on a real fabric verdict.
+# reset. The fabric relift closes the gap: it re-runs the health check and lifts ONLY on a real
+# fabric verdict. It re-runs the traffic pass, so it is opt-in (TT_DEVICE_MCP_FABRIC_RELIFT=1) for a
+# hold with any other trace of a fault, and on by default for a hold whose only cause is the 77.
 
 
 def _setup_fabric_unverified_hold(monkeypatch, tmp_path, *, n_present=31):
@@ -8589,25 +8592,17 @@ async def test_idle_relift_holds_a_fabric_unverified_hold_when_fabric_now_fails(
     assert resets["n"] == 0, "the relift must never reset — that is the next gate's job"
 
 
-@pytest.mark.asyncio
-async def test_fabric_relift_is_off_by_default(monkeypatch, tmp_path, clear_job_state):
+def test_fabric_relift_is_off_by_default(monkeypatch, tmp_path, clear_job_state):
     """Default-safe: the fabric relift re-runs the TRAFFIC PASS, which can push a marginal chip off
-    the bus, so it is opt-in. Unset, the relift must not touch a fabric-unverified hold — the
-    behavior deployed today is unchanged (this is the guard the existing non-self-heal test relies on)."""
+    the bus, so it is opt-in for a fabric-unverified hold with a measured fault behind it. Unset, the
+    relift must not arm on one. A hold whose ONLY cause is a 77 is the exception (spec 03 I34)."""
     _setup_fabric_unverified_hold(monkeypatch, tmp_path)
     monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_RELIFT", raising=False)
-    verify_called = {"n": 0}
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)
 
-    async def verify(expected, log, run_fabric=True, **_):
-        verify_called["n"] += 1
-        return True, {"fabric": {"ok": True}}
-
-    patch_recovery(monkeypatch, "_verify_device", verify)
-
-    await srv._attempt_idle_relift()
-
-    assert verify_called["n"] == 0, "off by default: the fabric relift must not probe the device"
-    assert srv.fsm.state is not ServerState.HEALTHY, "and the fabric-unverified hold must stand"
+    assert not srv._fabric_relift_enabled()
+    selfheal, fabric, _generic = srv._idle_relift_armed()
+    assert not fabric, "off by default: the fabric relift must not arm on a measured fabric fault"
 
 
 def test_hold_device_fabric_unverified_shuts_the_door_even_when_undirty(monkeypatch):
@@ -10583,9 +10578,11 @@ async def test_idle_relift_escalates_a_fabric_unverified_hold_when_relift_is_off
     """A present-mesh fabric-unverified hold with the fabric relift OFF (the default) is a hold no read
     can clear and nothing re-verifies — the exact 20-min strand this grace exists to end. It now falls
     through to the generic galaxy reset instead of waiting for the ceiling. Fails on base, where the
-    generic branch excludes every fabric-unverified hold outright."""
+    generic branch excludes every fabric-unverified hold outright. Only a hold with a measured fault
+    behind it: one whose only cause is a 77 is re-checked, never reset (spec 03 I34)."""
     _setup_generic_hold(monkeypatch, tmp_path)
-    srv.device_hold_needs_fabric = True
+    fsm_dirty(srv, "gate/post-job: fabric check exited 1", why="fabric_unverified")
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)  # a pass measured the fabric bad
     monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_RELIFT", raising=False)  # OFF: nothing re-verifies the fabric
     counters = _arm_stuck_hold(monkeypatch)
 

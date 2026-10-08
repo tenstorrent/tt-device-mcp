@@ -795,7 +795,7 @@ class TestCleanDeviceGate:
         import tt_device_mcp.server as srv
 
         logged = []
-        monkeypatch.setattr(srv, "write_action_log", lambda owner, cmd, rt, status, ec: logged.append(status))
+        monkeypatch.setattr(srv, "write_action_log", lambda owner, cmd, rt, status, ec, **k: logged.append(status))
         monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", f"exit {FABRIC_CHECK_CANNOT_CHECK_RC}")
         ok, _ = await srv.health_monitor.verify_fabric_health(timeout_sec=10)
         assert ok is None  # skipped => never a reset trigger

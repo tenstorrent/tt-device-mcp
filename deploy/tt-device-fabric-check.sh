@@ -49,7 +49,14 @@ set -u
 
 EXIT_CANNOT_CHECK=77
 
-log() { echo "fabric-check: $*" >&2; }
+# Once $OUT exists, every log line also goes to $LAST: a small file, overwritten each run, that keeps
+# the last run's verdict and output tail where an operator can read it after the journal rotated.
+LAST=""
+log() {
+    echo "fabric-check: $*" >&2
+    [ -n "$LAST" ] && echo "fabric-check: $*" >>"$LAST"
+    return 0
+}
 cannot_check() { log "$* -> CANNOT CHECK (exit $EXIT_CANNOT_CHECK; broker will not reset on this)"; exit "$EXIT_CANNOT_CHECK"; }
 
 VROOT="${TTDEV_VALIDATOR_ROOT:-/opt/tt-device-broker/validator}"
@@ -97,6 +104,12 @@ fi
 
 OUT="${TTDEV_FABRIC_OUTPUT:-$TT_METAL_CACHE/cluster_validation_logs}"
 mkdir -p "$OUT" 2>/dev/null || true
+# Bounded tails only (see tail_to_last): a chatty validator must not grow this file.
+if : >"$OUT/last-run.log" 2>/dev/null; then
+    LAST="$OUT/last-run.log"
+    echo "fabric-check: run started $(date -Is)" >>"$LAST"
+fi
+tail_to_last() { [ -n "$LAST" ] && tail -n 200 "$1" | cut -c1-400 >>"$LAST"; return 0; }
 
 log "running run_cluster_validation --send-traffic --num-iterations $ITERS"
 cd "$RUNTIME_ROOT" || cannot_check "cannot cd to '$RUNTIME_ROOT'"
@@ -106,6 +119,7 @@ trap 'rm -f "$RUNLOG"' EXIT
     >"$RUNLOG" 2>&1
 rc=$?
 cat "$RUNLOG" >&2
+tail_to_last "$RUNLOG"
 
 
 # UNHEALTHY is a VERDICT, and only the validator can return one. It reaches that verdict in exactly
@@ -144,8 +158,11 @@ elif grep -qE "Workload execution timed out after [0-9]+ seconds" "$RUNLOG"; the
     [ "$rc" -eq "$EXIT_CANNOT_CHECK" ] && rc=1
 else
     reason="$(grep -m1 -oE 'what\(\):.*|filesystem error:.*|terminate called.*' "$RUNLOG" | head -1)"
-    cannot_check "validator did not complete a measurement (rc=$rc)${reason:+: $reason}
-    no link was tested, so this says nothing about the fabric -- see $OUT and the log above"
+    [ -n "$reason" ] || reason="last output: $(grep -vE '^\s*$' "$RUNLOG" | sed -n '$p' | cut -c1-200)"
+    # The reason goes on the FINAL line: an operator's wrapper is summarized by its last line, and
+    # a cause printed above it was dropped from every log that quoted the check.
+    log "no link was tested, so this says nothing about the fabric -- see $OUT/last-run.log"
+    cannot_check "validator did not complete a measurement (rc=$rc): $reason"
 fi
 [ "$rc" -eq 0 ] || exit "$rc"
 
@@ -190,11 +207,13 @@ case "$drc" in
     # exact verdict that reset this host in a loop when the probe itself was the slow thing. A real
     # dispatch hang comes back through the operation timeout as a non-zero exit above, so nothing
     # is lost by refusing to guess here.
-    137) cannot_check "dispatch probe hit its ${DTMO}s cap without a verdict (typical is 14s)
-    last: $(grep -vE '^\s*$' "$DOUT" | sed -n '$p' | cut -c1-160)" ;;
+    137) tail_to_last "$DOUT"
+         log "dispatch probe last output: $(grep -vE '^\s*$' "$DOUT" | sed -n '$p' | cut -c1-160)"
+         cannot_check "dispatch probe hit its ${DTMO}s cap without a verdict (typical is 14s)" ;;
     *)   reason="$(grep -m1 -oE 'Timed out.*|TT_THROW.*|what\(\):.*|terminate called.*' "$DOUT")"
          grep -vE '^\s*$' "$DOUT" | sed -n '1,40p' | sed 's/^/fabric-check|  /' >&2
-         log "dispatch FAILED on a green fabric (rc=$drc)${reason:+: $reason}"
+         tail_to_last "$DOUT"
          log "the bus and the links are fine and the mesh still cannot run a program -> UNHEALTHY, the broker will reset"
+         log "dispatch FAILED on a green fabric (rc=$drc)${reason:+: $reason}"
          exit 1 ;;
 esac

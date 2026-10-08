@@ -151,9 +151,9 @@ job boundary.
   guard under the device-op lock, and bails when the hold was re-dirtied or a chip drops
   mid-verify — a dirty device belongs to the pre-job gate.
 - **I22 — The fabric relift is the only relift path that runs the traffic pass, and it is off by
-  default** (`TT_DEVICE_MCP_FABRIC_RELIFT`). It lifts only on an explicit healthy verdict; a 77
-  on retry or a failure holds. With it off, a fabric-unverified hold falls into the generic
-  escalate category rather than standing forever.
+  default** (`TT_DEVICE_MCP_FABRIC_RELIFT`) except for a 77-only hold (I34). It lifts only on an
+  explicit healthy verdict; a 77 on retry or a failure holds. With it off, a fabric-unverified hold
+  with any trace of a fault falls into the generic escalate category rather than standing forever.
 - **I23 — Every hold terminates.** The hold-deadline watchdog puts a stuck hold on the durable
   timeline once per window; past the ceiling (`_stuck_hold_ceiling_sec`, default 1200s; off-bus
   holds get one early attempt at `_offbus_hold_ceiling_sec`, default 120s) a tenant-free hold is
@@ -386,6 +386,21 @@ job boundary.
   it waited ends it without a read. A re-check that raises is logged and is not a verdict: the
   device is not marked. A fresh verdict costs nothing, and the re-check never runs inside `_device_liveness_reason`, which answers
   status queries and must not sleep.
+- **I33 — The startup fabric pass waits for the 1G hugepage pool.** With
+  `TT_DEVICE_MCP_EXPECTED_CHIPS` set, and a Tenstorrent function behind an identity IOMMU domain or
+  none, the broker polls `nr_hugepages` (1G pool) for up to `STARTUP_HUGEPAGES_WAIT_SEC` (120 s)
+  under the device-op lock before the pass. Still short, it runs no pass (one would only exit 77):
+  it records could-not-check with the reason `hugepages not yet allocated: N/M` (a
+  `fabric_check_unavailable` event and a `skipped` action row) and holds `fabric_unverified`; the
+  idle relift re-runs the pass once the count is met. Sysfs reads only. A dirty carried episode
+  still runs the gate; an unreadable pool or a translating IOMMU waits for nothing.
+- **I34 — A hold whose only cause is a fabric 77 is re-checked, never reset.** `fabric_unverified`,
+  not dirty, no reported fault, no isolated chip, and no pass measured the fabric bad
+  (`last_fabric_ok` is not False): a 77 is a missing prerequisite, and a reset cannot produce a
+  fabric verdict. Neither the idle relift's generic escalation, the hold-deadline forced
+  escalation nor the watchdog resets it; the idle relift re-runs the read-only fabric pass instead
+  (on by default; `TT_DEVICE_MCP_FABRIC_RELIFT=0` leaves the hold standing), after the hugepage
+  pool is full. Once a pass measures the fabric bad, the hold is no longer 77-only and I23 applies.
 
 ## Interfaces
 
@@ -727,7 +742,8 @@ lift it:
 
 - `SELFHEAL_WHYS = {eth_frozen, off_bus}` — the idle relift re-verifies read-only (I21).
 - `fabric_unverified` — only a real healthy fabric verdict lifts; the perturbing retry is the
-  opt-in fabric relift (I22).
+  opt-in fabric relift (I22), on by default when the hold's only cause is a 77 (I34), which is
+  never escalated to a reset.
 - `GENERIC_ESCALATE_WHYS = {gate_error, foreign_holder, startup_unverified}` — no read-only
   story: enum+ARC prove nothing these were placed for, so they never lift on a read; past the
   ceiling they escalate to the gate's own ladder (`TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE`, on by
@@ -883,6 +899,8 @@ refuses.
 | I30 (a clean Slurm post-step reads eth on an armed host, with the same hold and fallback; a failed step and the read-only pre-step do not) | `tests/test_slurm_steps.py::test_a_clean_post_step_on_an_armed_host_asks_for_the_eth_read`, `tests/test_device_safety.py::test_a_frozen_eth_read_after_a_clean_job_holds_without_a_reset`, `tests/test_device_safety.py::test_a_clean_exit_eth_read_with_no_verdict_runs_the_fabric_pass_in_the_same_gate` (both parametrized over post-job/post-step) |
 | I31 | `tests/test_device_safety.py::test_a_short_chip_count_is_a_degraded_reason_at_dispatch`, `tests/test_device_safety.py::test_the_sampler_dirties_a_short_count_after_two_samples`, `tests/test_device_safety.py::test_a_host_with_no_baseline_is_unchanged_by_the_count_check`, `tests/test_device_safety.py::test_a_short_count_under_an_off_bus_hold_stays_held`, `tests/test_device_safety.py::test_health_checks_off_skip_the_count_check` |
 | I32 | `tests/test_device_safety.py::test_a_stale_verdict_runs_the_heartbeat_once_before_dispatch`, `tests/test_device_safety.py::test_a_fresh_verdict_runs_no_recheck`, `tests/test_device_safety.py::test_a_failing_recheck_holds_the_job_at_the_door`, `tests/test_device_safety.py::test_the_dispatch_recheck_never_runs_the_fabric_pass`, `tests/test_device_safety.py::test_a_frozen_eth_read_at_the_recheck_holds_not_resets`, `tests/test_device_safety.py::test_the_dispatch_recheck_off_switch_tenant_and_errors` |
+| I33 | `tests/test_startup_fabric_hugepages.py::test_hugepages_shortfall_reports_a_short_pool_behind_identity_or_no_iommu`, `tests/test_startup_fabric_hugepages.py::test_hugepages_shortfall_is_none_behind_a_translating_iommu`, `tests/test_startup_fabric_hugepages.py::test_hugepages_shortfall_is_none_without_a_readable_pool`, `tests/test_startup_fabric_hugepages.py::test_the_broker_waits_only_when_the_expected_chip_count_is_set`, `tests/test_startup_fabric_hugepages.py::test_startup_fabric_pass_waits_for_hugepages_then_runs`, `tests/test_startup_fabric_hugepages.py::test_startup_records_cannot_check_when_hugepages_stay_short`, `tests/test_startup_fabric_hugepages.py::test_a_dirty_carried_episode_still_runs_the_startup_gate` |
+| I34 | `tests/test_startup_fabric_hugepages.py::test_a_77_only_hold_arms_the_fabric_relift_not_the_generic_escalation`, `tests/test_startup_fabric_hugepages.py::test_the_77_only_relift_has_an_off_switch`, `tests/test_startup_fabric_hugepages.py::test_a_fabric_hold_after_a_measured_fail_is_not_77_only`, `tests/test_startup_fabric_hugepages.py::test_the_77_only_relift_reruns_the_fabric_pass_and_never_resets`, `tests/test_startup_fabric_hugepages.py::test_the_77_only_relift_waits_for_hugepages`, `tests/test_startup_fabric_hugepages.py::test_the_hold_deadline_never_forces_a_reset_on_a_77_only_hold`, `tests/test_startup_fabric_hugepages.py::test_the_hold_deadline_still_escalates_a_measured_fabric_fault`, `tests/test_startup_fabric_hugepages.py::test_the_forced_escalation_bails_on_a_77_only_hold` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |
