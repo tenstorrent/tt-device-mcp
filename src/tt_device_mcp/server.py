@@ -5901,6 +5901,7 @@ async def job_runner():
 
         cancelled = False  # set if the broker is shutting down (don't kill the job)
         terminal_note = ""  # timeout/exception marker, appended to error at the end
+        privsep_prefix = None  # set below; read by the finally even when setup raised first
         # Everything from here on is inside the try: the job is RUNNING, so an error in any
         # setup step (a full disk is enough) must end it FAILED, never kill the runner.
         try:
