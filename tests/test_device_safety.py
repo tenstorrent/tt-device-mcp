@@ -4665,46 +4665,6 @@ async def test_an_error_escaping_job_cleanup_fails_closed(monkeypatch, clear_job
         await asyncio.gather(runner, return_exceptions=True)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("healthy", [False, True])
-async def test_a_dispatch_gate_error_fails_closed_on_an_unverified_device(
-    monkeypatch, clear_job_state, tmp_path, healthy
-):
-    """03 tenant gate. A dispatch gate that errors on a device owed a check refuses the job:
-    the check did not run. On a healthy device nothing is owed, so the job still runs."""
-    _free_device_lock(monkeypatch)
-    _quiet_post_job_gate(monkeypatch)
-    _no_workspace_activation(monkeypatch)
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: None)
-    monkeypatch.setenv("TT_DEVICE_MCP_TENANT_HOLD", "0")  # refuse at the door rather than hold
-    if not healthy:
-        srv.fsm.on_fault("job_killed", detail="job 909 ended failed")
-
-    async def _broken_gate(job_log_file):
-        raise OSError(28, "No space left on device")
-
-    monkeypatch.setattr(srv, "_await_device_free_for_tenant", _broken_gate)
-    ran = tmp_path / "ran"
-    job = srv.Job(id="910", owner="tenant", workspace="/tmp", command=f"touch {ran}", queued_at="t")
-    srv.jobs["910"] = job
-    await srv.get_job_queue().put("910")
-
-    runner = asyncio.create_task(srv.job_runner())
-    try:
-        await _wait_for(lambda: job.finished_at is not None)
-        if healthy:
-            assert job.status is srv.JobStatus.COMPLETED and ran.exists()
-        else:
-            assert not ran.exists(), "the job was dispatched onto a device the failed gate never checked"
-            assert job.status is srv.JobStatus.FAILED
-            assert "gate error" in (job.error or ""), job.error
-        assert not runner.done()
-    finally:
-        runner.cancel()
-        await asyncio.gather(runner, return_exceptions=True)
-
-
 def test_aiclk_left_busy_names_only_chips_above_the_idle_clock(monkeypatch):
     """03 B-post-job clock check. A chip still at the busy clock once nothing holds it was not
     closed. Values it cannot read are not evidence either way."""

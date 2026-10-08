@@ -5746,13 +5746,10 @@ async def _job_runner_loop():
         # wedge and none starts on hardware being reset out from under it.
         try:
             blocked_reason = await _await_device_free_for_tenant(job_log_file)
-        except Exception as e:
+        except Exception as e:  # a gate ERROR must never itself block a job
             if logger:
                 logger.error(f"JOB_RUNNER clean-device gate error for job_id={job_id}: {e}")
-            # A gate error on a healthy device does not block: nothing is owed a check. On any
-            # other device it fails closed: the check it owed did not run, and dispatching anyway
-            # puts this job on a device nothing verified.
-            blocked_reason = "" if fsm.state is ServerState.HEALTHY else f"clean-device gate error: {e}"
+            blocked_reason = ""  # only an affirmative degraded verdict blocks; a bug does not
 
         # One durable timeline entry when this device opens or lifts a tenant-refused hold,
         # keyed off the same verdict the dispatch decision uses so the two can never

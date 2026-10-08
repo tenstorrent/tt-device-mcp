@@ -196,11 +196,9 @@ flowchart LR
   pre-step/post-step gate call in progress; spec 03 I29 owns the mechanism); runs the
   admission gate (I15). Two failure shapes there are distinct and both deliberate: a gate pass that runs
   but cannot verify records the device unverified — "tried and could not tell" is an
-  affirmative hold; an exception *escaping* the admission predicate (a gate bug) blocks
-  dispatch only when the device is not HEALTHY. On a HEALTHY device nothing was owed a
-  check, so a gate bug never turns into a stuck queue. On any other device the check it
-  owed did not run, so the job is refused (or held) as on a degraded verdict: no job is
-  dispatched onto a device nothing verified. Finally the runner
+  affirmative hold; an exception *escaping* the admission predicate (a gate bug) MUST NOT
+  block dispatch — only an affirmative degraded verdict blocks, so a gate bug never turns
+  into a stuck queue (its cost is one ungated dispatch instead). Finally the runner
   refuses the job if privsep is active but the submitter identity cannot
   be honored (running it as root instead is forbidden — spec 05).
 - Refusals at the door (degraded device, privsep) terminalize the job as FAILED, append a
@@ -339,6 +337,5 @@ flowchart LR
 | B-Log format | `tests/test_recent_jobs.py::test_recent_jobs_parses_and_limits`, `tests/test_recent_jobs.py::test_the_footer_survives_a_reset_worth_of_gate_output`, `tests/test_recent_jobs.py::test_a_job_printing_status_of_its_own_is_still_unfinished` |
 | B-Completion (job log is best effort) | `tests/test_device_safety.py::test_a_full_log_disk_ends_neither_the_job_nor_the_runner`, `tests/test_device_safety.py::test_a_full_log_disk_still_gates_a_failed_job_before_the_next` |
 | B-Completion (runner fails closed) | `tests/test_device_safety.py::test_an_error_escaping_job_cleanup_fails_closed` |
-| B-Queueing (gate bug on an unverified device refuses) | `tests/test_device_safety.py::test_a_dispatch_gate_error_fails_closed_on_an_unverified_device` |
 | B-Ids/`Job` basics | `tests/test_server.py::TestJob::test_job_status_values`, `tests/test_server.py::TestJob::test_runtime_sec_property`, `tests/test_server.py::TestJob::test_wait_sec_property` |
 | Re-adoption scope naming | `tests/test_readopt.py::test_scope_unit_roundtrip`, `tests/test_readopt.py::test_list_active_job_scopes_parses` |
