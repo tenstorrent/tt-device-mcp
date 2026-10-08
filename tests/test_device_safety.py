@@ -3342,6 +3342,13 @@ async def test_rest_submit_clamps_timeout_to_the_hard_ceiling(monkeypatch, clear
                 "timeout_sec": 3600,
             },
         ).json()
+        # Let the job end before the client shuts the app down. Leaving at once lands the
+        # shutdown cancel on the job's last step, a race this test is not about.
+        deadline = time.monotonic() + 10
+        while "job_id" in res and time.monotonic() < deadline:
+            if srv.jobs[res["job_id"]].status not in (srv.JobStatus.QUEUED, srv.JobStatus.RUNNING):
+                break
+            time.sleep(0.05)
 
     assert "job_id" in res, res
     job = srv.jobs[res["job_id"]]

@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from typing import Callable, Optional
 
-from tt_device_mcp import metrics
+from tt_device_mcp import aio, metrics
 from tt_device_mcp.constants import (
     ETH_POST_JOB_TIMEOUT_SEC,
     FABRIC_CHECK_CANNOT_CHECK_RC,
@@ -769,7 +769,7 @@ class HealthMonitor:
 
         _t0 = datetime.now()
         try:
-            rc, text = await asyncio.wait_for(
+            rc, text = await aio.wait_for(
                 eth.check(argv, env, timeout_sec=probe_timeout, track=_track, cwd=cwd),
                 timeout=timeout_sec,
             )
