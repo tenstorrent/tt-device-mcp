@@ -992,7 +992,7 @@ def _noop_post_job_gate(monkeypatch):
     runner off the device once its dispatched job finishes so nothing here depends on the real
     post-job gate's own timing."""
 
-    async def _noop(job_log_file, job_failed=False):
+    async def _noop(job_log_file, job_failed=False, noop_failure=False):
         return None
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _noop)
