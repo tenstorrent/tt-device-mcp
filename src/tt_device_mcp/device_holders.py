@@ -350,6 +350,47 @@ def _read_proc_starttime(pid: int) -> str | None:
         return None
 
 
+def _read_proc_ppid(pid: int) -> int | None:
+    """Read field 4 (ppid) from /proc/<pid>/stat; None if the process is gone or unreadable.
+
+    Same parsing rule as `_read_proc_starttime`: comm may contain ')' or spaces, so split on
+    the last ')'. Field 4 is index 1 of the remainder.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    try:
+        return int(raw.rsplit(")", 1)[1].split()[1])
+    except (IndexError, ValueError):
+        return None
+
+
+# Bound on the parent-chain walk: real process trees are a few levels deep, and the bound
+# keeps a pathological or racing /proc from looping.
+_MAX_PARENT_DEPTH = 64
+
+
+def descends_from(pid: int, ancestor: int) -> bool:
+    """True if ``pid`` is ``ancestor`` or its parent chain reaches ``ancestor``.
+
+    Walks /proc/<pid>/stat ppid links up to pid 1, bounded by _MAX_PARENT_DEPTH. A process
+    that exits mid-walk (or a chain that cannot be read) is not a descendant: a leftover
+    that daemonized and was reparented away from ``ancestor`` does not count as its child.
+    """
+    for _ in range(_MAX_PARENT_DEPTH):
+        if pid == ancestor:
+            return True
+        if pid <= 1:
+            return False
+        ppid = _read_proc_ppid(pid)
+        if ppid is None or ppid == pid:
+            return False
+        pid = ppid
+    return False
+
+
 @dataclass
 class ReclaimResult:
     """What a reclaim signalled, and what refused to let go."""

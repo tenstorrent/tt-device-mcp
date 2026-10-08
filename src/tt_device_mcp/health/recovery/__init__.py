@@ -239,9 +239,9 @@ class RecoveryDeps:
     # deps fixture — may supply its own bindings, which boot leaves untouched).
     board_types_provider: Optional[Callable[[], Optional[list]]] = None
     glx_board_types_provider: Optional[Callable[[], tuple]] = None
-    # The per-chip bus ids the tray rung derives its trays from (spec 04 I16). Same injection
-    # reason as the two above: the cache lives on the HealthMonitor singleton.
-    bus_ids_provider: Optional[Callable[[], Optional[list]]] = None
+    # {chip index: PCI address}, the map the tray rung derives its trays from (spec 04 I16). Same
+    # injection reason as the two above: the cache lives on the HealthMonitor singleton.
+    chip_buses_provider: Optional[Callable[[], Optional[dict]]] = None
     journal_skip_once: Optional[Callable[[str, str], None]] = None
     # The telemetry sampler's server-side callbacks (see tt_device_mcp.telemetry). Same lambda
     # discipline as every field above — each re-resolves a server.py name per call so a
@@ -264,6 +264,10 @@ class RecoveryDeps:
     # then loses every sysfs node must still journal the loss and escalate the episode to dirty —
     # only an already-dirty one has nothing left to re-flag.
     episode_dirty: Optional[Callable[[], bool]] = None
+    # Whether any episode is open (state not HEALTHY). A short chip count is flagged only on a
+    # HEALTHY box: under a hold the gate already placed (an off-bus drop held dirty=False) the
+    # short count IS that fault, and re-dirtying it would disable the hold's idle relift.
+    episode_open: Optional[Callable[[], bool]] = None
     episode_job: Optional[Callable[[], dict]] = None
 
 
@@ -285,6 +289,9 @@ class Recovery(ABC):
         # after selection later resolves to the other.
         self.mechanism = mechanism
         self.deps = deps
+        # Set fresh by every _recover_isolated_chips call; defined here so the gate can read it
+        # even when no bridge rung has run on this instance yet.
+        self.last_bridge_reset_reasons: dict = {}
 
     @abstractmethod
     def next_stage(self, ev: Evidence) -> str:
@@ -339,7 +346,14 @@ class Recovery(ABC):
     # to be.
 
     async def _verify_device(
-        self, expected: int, log, *, run_fabric: bool = True, phase: str = "verify_device"
+        self,
+        expected: int,
+        log,
+        *,
+        run_fabric: bool = True,
+        phase: str = "verify_device",
+        run_eth: bool = False,
+        fabric_stale: bool = True,
     ) -> tuple[bool, dict]:
         """Is the mesh usable? A thin adapter over :meth:`HealthMonitor.update` — the ONE probe
         pass implementation (see monitor.py); this method exists only as the seam
@@ -355,7 +369,9 @@ class Recovery(ABC):
         ``self.monitor.status()`` labels itself meaningfully instead of always reading the same
         placeholder string.
         """
-        state = await self.monitor.update(phase, run_fabric=run_fabric, expected=expected, log=log)
+        state = await self.monitor.update(
+            phase, run_fabric=run_fabric, run_eth=run_eth, fabric_stale=fabric_stale, expected=expected, log=log
+        )
         return state.healthy, state.as_evidence()
 
     async def _recover_isolated_chips(self, log) -> bool:

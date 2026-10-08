@@ -419,7 +419,12 @@ One workflow: `.github/workflows/test.yml`. On `pull_request`, `push` to `main`,
 `workflow_dispatch`, it runs on `ubuntu-latest` (Python 3.10 matrix): create a venv — the
 deployment shape, one venv owning the package — `pip install -e ".[dev]"`, then
 `.venv/bin/pytest -v`. The `dev` extra (pyproject) is `pytest>=7.0.0`,
-`pytest-asyncio>=0.21.0`.
+`pytest-asyncio>=0.21.0`, `pytest-timeout>=2.1.0`.
+
+A hang fails fast instead of holding a runner for GitHub's 6 h default: pytest's `timeout =
+120` (pyproject) fails any single test after 120 s and prints every thread's stack, and the
+test job has `timeout-minutes: 20`. The whole device-free suite runs in a few minutes, so
+both limits leave wide margin.
 
 That is the whole pipeline: no device stage, no lint stage, no matrix beyond 3.10. CI
 therefore proves exactly I4 — the suite passes device-free on a systemd-bearing VM — and the
