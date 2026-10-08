@@ -334,9 +334,14 @@ job boundary.
 - **I30 — A clean post-job exit reads the eth heartbeat when the rung is armed.** Enumeration,
   ARC and the snapshot cannot see a wedged eth core, so on an armed host (I28) the post-job gate
   on an exit-0 job also runs the passive eth read, bounded by `ETH_POST_JOB_TIMEOUT_SEC` (10s,
-  the self-test's arming budget; a healthy read is ~1s, plus the reader's python import check
-  that precedes it). A frozen verdict — including that bound expiring (I16), and an operator
-  override's own timeout — holds the door through the existing eth-frozen hold, with no reset.
+  the self-test's arming budget; a healthy read is ~1s). The reader's python import check
+  (`eth.resolve_python`, up to three 10s spawns outside that bound) runs once per process, not
+  per gate: its answer is cached and re-resolved only when the validator's `current` symlink is
+  re-pointed, a candidate env var changes, the cached python or tree disappears, a built-in read
+  crashes (exit 1) or cannot spawn, or a "no python" answer is older than 60s (one caused by an
+  import check timing out is not cached). A frozen verdict — including
+  that bound expiring (I16), and an operator override's own timeout — holds the door through the
+  existing eth-frozen hold, with no reset.
   A read that reaches no verdict (the built-in probe's own timeout, a crash, exit 77, no runnable
   reader) runs the full fabric pass inside the same gate, exactly as a failed job's does, so its
   exit 77 holds fabric-unverified on a multi-chip mesh (I17). Accepted trade-off: a built-in read
@@ -845,6 +850,7 @@ refuses.
 | I30 (clean exit on an armed host reads eth, pays no fabric pass) | `tests/test_device_safety.py::test_a_clean_job_on_an_armed_host_reads_eth_but_pays_no_fabric_pass`, `tests/test_monitor.py::test_update_run_eth_reads_eth_with_the_post_job_bound_and_skips_fabric` |
 | I30 (a frozen clean-exit read holds, never resets) | `tests/test_device_safety.py::test_a_frozen_eth_read_after_a_clean_job_holds_without_a_reset`, `tests/test_monitor.py::test_update_run_eth_never_runs_fabric_after_a_frozen_eth_core` |
 | I30 (a read with no verdict runs the fabric pass in the same gate; its 77 holds) | `tests/test_device_safety.py::test_a_clean_exit_eth_read_with_no_verdict_runs_the_fabric_pass_in_the_same_gate`, `tests/test_device_safety.py::test_a_fallback_fabric_pass_that_cannot_check_holds_fabric_unverified`, `tests/test_monitor.py::test_update_run_eth_runs_fabric_when_eth_reaches_no_verdict` |
+| I30 (the reader's python is resolved once per process, re-resolved on change or a crashed read) | `tests/test_eth_probe.py::test_resolved_python_is_cached_across_calls`, `tests/test_eth_probe.py::test_build_on_every_gate_spawns_the_import_check_once`, `tests/test_eth_probe.py::test_repointing_current_re_resolves`, `tests/test_eth_probe.py::test_a_changed_pin_re_resolves`, `tests/test_eth_probe.py::test_a_cached_python_that_disappears_re_resolves`, `tests/test_eth_probe.py::test_no_python_is_cached_only_for_the_negative_ttl`, `tests/test_eth_probe.py::test_an_import_check_timeout_is_not_cached_as_no_python`, `tests/test_eth_probe.py::test_forget_python_forces_a_fresh_import_check`, `tests/test_device_safety.py::test_a_crashed_builtin_eth_read_drops_the_cached_python`, `tests/test_device_safety.py::test_a_builtin_eth_read_that_cannot_spawn_drops_the_cached_python`, `tests/test_device_safety.py::test_an_override_eth_read_with_no_verdict_keeps_the_cached_python` |
 | I30 (a disarmed host keeps the snapshot-only clean exit) | `tests/test_device_safety.py::test_a_clean_job_does_not_pay_for_a_fabric_pass`, `tests/test_device_safety.py::test_a_disarmed_host_keeps_the_clean_exit_gate_unchanged`, `tests/test_monitor.py::test_update_without_run_eth_or_fabric_reads_no_eth` |
 | I31 | `tests/test_device_safety.py::test_a_short_chip_count_is_a_degraded_reason_at_dispatch`, `tests/test_device_safety.py::test_the_sampler_dirties_a_short_count_after_two_samples`, `tests/test_device_safety.py::test_a_host_with_no_baseline_is_unchanged_by_the_count_check`, `tests/test_device_safety.py::test_a_short_count_under_an_off_bus_hold_stays_held`, `tests/test_device_safety.py::test_health_checks_off_skip_the_count_check` |
 | I32 | `tests/test_device_safety.py::test_a_stale_verdict_runs_the_heartbeat_once_before_dispatch`, `tests/test_device_safety.py::test_a_fresh_verdict_runs_no_recheck`, `tests/test_device_safety.py::test_a_failing_recheck_holds_the_job_at_the_door`, `tests/test_device_safety.py::test_the_dispatch_recheck_never_runs_the_fabric_pass`, `tests/test_device_safety.py::test_a_frozen_eth_read_at_the_recheck_holds_not_resets`, `tests/test_device_safety.py::test_the_dispatch_recheck_off_switch_tenant_and_errors` |
