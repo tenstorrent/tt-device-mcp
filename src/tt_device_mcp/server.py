@@ -6262,7 +6262,7 @@ async def job_runner():
     which dispatched the next job onto a device the post-job gate never checked. Here such an
     error fails closed instead: the device is marked dirty, so the post-job gate below resets and
     verifies it, and if that does not prove it fit the dispatch gate refuses the next job."""
-    global current_process, current_job_id
+    global current_process, current_job_id, post_job_gate_pending
 
     while True:
         try:
@@ -6284,6 +6284,7 @@ async def job_runner():
                     failed_job = job
                 current_process = None
                 current_job_id = None
+                post_job_gate_pending = True
             if failed_job is not None:
                 # FAILED is terminal: a restart must not restore the spec and run the job again.
                 _forget_queued_job(failed_job.id)
@@ -6298,7 +6299,10 @@ async def job_runner():
             except Exception as mark_err:  # noqa: BLE001 - the gate below still runs
                 if logger:
                     logger.error(f"JOB_RUNNER could not mark the device dirty: {mark_err}")
-            await _verify_device_after_job(None, job_failed=True)
+            try:
+                await _verify_device_after_job(None, job_failed=True)
+            finally:
+                post_job_gate_pending = False
 
 
 async def _job_runner_loop():
