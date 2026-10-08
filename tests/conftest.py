@@ -19,6 +19,7 @@ if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 
 import tt_device_mcp.device_holders as device_holders
+import tt_device_mcp.job_reap as job_reap
 import tt_device_mcp.server as srv
 from tt_device_mcp import privileges
 from tt_device_mcp.fsm import ServerFsm
@@ -206,6 +207,13 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     # and every unmarked test exercise the walk, exactly as before this route existed. A test about
     # the driver route stages its own directory and points this at it.
     monkeypatch.setattr(device_holders, "DRIVER_PROC_DIR", str(tmp_path_factory.mktemp("no-tt-driver-proc") / "absent"))
+    # The leftover fence (01 I16) reads the REAL /proc/<pid>/cgroup of whatever holder a scan names
+    # — on a broker host a live job's pid sits in a real ttdev-job-<id>.scope this suite never
+    # started, and would read as a reaped job's leftover that refuses the test's reset. Pointed at
+    # an empty dir; a test about the fence stages its own. Its per-process state starts empty.
+    monkeypatch.setattr(job_reap, "LEFTOVER_PROC_DIR", str(tmp_path_factory.mktemp("no-leftover-proc")))
+    monkeypatch.setattr(srv, "reaped_survivors", {})
+    monkeypatch.setattr(srv, "_leftover_fence_detail", "")
     # The reset argv/mode env vars are read live (never cached), so an operator's own shell/CI
     # environment leaks straight into whatever argv a test builds — cleared here for a
     # deterministic floor; a test exercising a declared mode/override sets it itself afterward.
