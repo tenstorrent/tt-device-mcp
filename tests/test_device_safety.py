@@ -4585,6 +4585,43 @@ async def test_a_survivor_known_not_to_hold_the_device_does_not_mark_it_dirty(mo
 
 
 @pytest.mark.asyncio
+async def test_a_shutdown_during_the_sweep_still_finishes_the_job(monkeypatch, clear_job_state):
+    """The sweep is the runner's first wait after a job ends. A shutdown landing there skipped
+    the job's bookkeeping, so the finished job stayed the current one and step routes refused."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    sweeping = asyncio.Event()
+    may_finish = asyncio.Event()
+
+    async def slow_sweep(job_id, pid, scope=None, tag=None, **kw):
+        sweeping.set()
+        await may_finish.wait()
+        return []
+
+    monkeypatch.setattr(srv, "reap_job_survivors", slow_sweep)
+    job = srv.Job(id="914", owner="tenant", workspace="/tmp", command="echo hi", queued_at="t")
+    srv.jobs[job.id] = job
+    await srv.get_job_queue().put(job.id)
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await asyncio.wait_for(sweeping.wait(), timeout=10)
+        runner.cancel()
+        await asyncio.sleep(0.05)
+        assert not runner.done(), "the runner abandoned the sweep on shutdown"
+        may_finish.set()
+        results = await asyncio.wait_for(asyncio.gather(runner, return_exceptions=True), timeout=5)
+    finally:
+        may_finish.set()
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+    assert isinstance(results[0], asyncio.CancelledError), "the shutdown was swallowed"
+    assert job.finished_at is not None
+    assert srv.current_job_id is None, "the finished job stayed the current one"
+
+
+@pytest.mark.asyncio
 async def test_a_hung_reap_runs_its_ladder_to_the_end(monkeypatch, clear_job_state):
     """The job's streams close as soon as its shell dies, often long before a child that is
     still unwinding. The runner cancelled the reaper right then, cutting the ladder short."""

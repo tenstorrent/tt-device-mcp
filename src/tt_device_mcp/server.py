@@ -5998,14 +5998,24 @@ export {JOB_TAG_ENV}={job_tag}
                 # the ladder's reach, and one stuck in the kernel outlives SIGKILL; either keeps
                 # the device open: a hung-reaped job's pytest once held it for two hours this way.
                 survivors = []
+                stop_after_sweep = False
                 if job.pid or privsep_prefix:
-                    survivors = await reap_job_survivors(
-                        job_id,
-                        job.pid,
-                        job_scope_unit(job_id) if privsep_prefix else None,
-                        job_tag,
-                        log=logger.warning if logger else (lambda _msg: None),
+                    sweep = asyncio.ensure_future(
+                        reap_job_survivors(
+                            job_id,
+                            job.pid,
+                            job_scope_unit(job_id) if privsep_prefix else None,
+                            job_tag,
+                            log=logger.warning if logger else (lambda _msg: None),
+                        )
                     )
+                    try:
+                        survivors = await asyncio.shield(sweep)
+                    except asyncio.CancelledError:
+                        # Shutdown landed mid-sweep. Finish it (a few seconds at most) and the
+                        # job's bookkeeping below, or the finished job stays the current one.
+                        survivors = await sweep
+                        stop_after_sweep = True
                 if survivors and job_log_file:
                     try:
                         with open(job_log_file, "a") as f:
@@ -6098,6 +6108,9 @@ export {JOB_TAG_ENV}={job_tag}
                 # Write job log footer (outside lock - file I/O)
                 if job_log_file:
                     write_job_log_footer(job_log_file, job)
+
+                if stop_after_sweep:
+                    raise asyncio.CancelledError()
 
                 # Post-job health check — snapshot + fabric traffic — after EVERY
                 # run, queue empty or not. A fabric wedge need not trip a wedge-risk
