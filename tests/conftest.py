@@ -329,7 +329,7 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # confirm a sysfs blackout on its FIRST empty sample instead of its second. raising=False so
     # a base tree without the counter (a fails-on-base stash) still sets up cleanly.
     monkeypatch.setattr(srv.sampler, "all_chips_gone_strikes", 0)
-    # The short-count debouncer and the dispatch recheck's clock (spec 03 I30/I31), for the same
+    # The short-count debouncer and the dispatch recheck's clock (spec 03 I31/I32), for the same
     # reason. raising=False so a base tree without them (a fails-on-base stash) still sets up.
     monkeypatch.setattr(srv.sampler, "short_count_strikes", 0, raising=False)
     monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None, raising=False)

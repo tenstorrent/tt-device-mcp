@@ -11123,7 +11123,7 @@ async def _unreachable_gate(*a, **k):
     raise AssertionError("the health gate must not run for a clean, non-dirty device")
 
 
-# --- a short chip count and a stale verdict at dispatch (spec 03 I30/I31) -----------------------
+# --- a short chip count and a stale verdict at dispatch (spec 03 I31/I32) -----------------------
 
 
 def _beats(n: int) -> dict:

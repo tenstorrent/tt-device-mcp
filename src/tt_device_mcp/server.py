@@ -4207,7 +4207,7 @@ def _device_liveness_reason() -> str:
     0xFFFFFFFF (off the bus — the reads that stall a CPU core and take the host down), an
     empty sysfs on a host whose driver DID expose chips at startup (driver wedged), and fewer
     chips than the host's baseline (chips that left the bus and took their sysfs node with
-    them — 24 of 32 is not a healthy mesh, spec 03 I30). The count is the same one
+    them — 24 of 32 is not a healthy mesh, spec 03 I31). The count is the same one
     heartbeat_verdict holds the gate to; a host with no baseline yet skips it. A
     present-but-frozen ARC is NOT caught here: that needs the two-sample heartbeat_verdict
     the between-job gate runs, and a single sample must not sleep on a caller's path."""
@@ -4953,7 +4953,7 @@ _last_dispatch_recheck_at: Optional[datetime] = None
 
 def _dispatch_recheck_sec() -> float:
     """TT_DEVICE_MCP_DISPATCH_RECHECK_SEC: how old a HEALTHY verdict may be before dispatch
-    re-reads the device (spec 03 I31). 0 or less turns the recheck off; garbage keeps the default."""
+    re-reads the device (spec 03 I32). 0 or less turns the recheck off; garbage keeps the default."""
     raw = os.environ.get("TT_DEVICE_MCP_DISPATCH_RECHECK_SEC", "").strip()
     if not raw:
         return DISPATCH_RECHECK_DEFAULT_SEC
@@ -4979,7 +4979,7 @@ def _last_verdict_age_sec() -> Optional[float]:
 
 async def _dispatch_recheck_if_stale(job_log_file: Optional[Path]) -> None:
     """Re-read a HEALTHY device whose last verdict is older than TT_DEVICE_MCP_DISPATCH_RECHECK_SEC
-    before a tenant is dispatched onto it (spec 03 I31).
+    before a tenant is dispatched onto it (spec 03 I32).
 
     The gate's verdict is taken at the END of the previous job; on an idle box the next tenant can be
     dispatched an hour later onto chips that left the bus or froze in between, and nothing reads them
@@ -5085,7 +5085,7 @@ async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> Non
     await _dispatch_probe_ok(job_log_file)
     if fsm.state is ServerState.HEALTHY:
         # A HEALTHY verdict hours old says nothing about the mesh now: re-read it cheaply first
-        # (spec 03 I31). A fresh verdict returns here at once, so back-to-back jobs pay nothing.
+        # (spec 03 I32). A fresh verdict returns here at once, so back-to-back jobs pay nothing.
         await _dispatch_recheck_if_stale(job_log_file)
         return  # clean device -> zero cost before a run
     if (fsm.record and fsm.record.why == "fabric_unverified") or not fsm.record.dirty:
