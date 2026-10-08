@@ -11703,6 +11703,71 @@ def test_restoring_a_hold_clock_is_safe_when_none_was_recorded(monkeypatch, tmp_
     assert srv._restore_hold_episode() == ""
 
 
+def _stale_hold_clock(monkeypatch, tmp_path, clear_job_state):
+    """A box whose last broker died held: the clock file outlived it, the episode did not."""
+    monkeypatch.setattr(health, "HEALTH_DIR", tmp_path)
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "health_event", lambda *a, **k: None)
+    stale = (datetime.now() - timedelta(hours=3)).isoformat()
+    (tmp_path / srv.HOLD_EPISODE_FILE).write_text(stale)
+    return stale
+
+
+def _hold_age_sec() -> float:
+    return (datetime.now() - datetime.fromisoformat(srv.device_hold_episode_since)).total_seconds()
+
+
+def test_a_healthy_startup_gate_clears_a_dead_brokers_hold_clock(monkeypatch, tmp_path, clear_job_state):
+    """A power cycle mid-hold leaves the clock file behind: only an in-process release cleared it.
+    The startup gate then verified the box healthy, and the next drop restored the dead episode's
+    start, so the new hold was born past its escalation windows and forced the ladder at once. The
+    verified-healthy clear is where that episode provably ended. Fails on base: the file survived."""
+    _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
+
+    srv._clear_device_dirty(verified=True, why="gate/startup: verified healthy")
+
+    assert srv._restore_hold_episode() == "", "a verified-healthy device kept a dead episode's clock on disk"
+    srv._note_tenant_gate_verdict("device is dirty and unverified: chip(s) 8 fell off the bus")
+    assert _hold_age_sec() < 60, f"a fresh drop was born {_hold_age_sec():.0f}s old"
+
+
+def test_a_hold_after_the_device_was_seen_fit_never_inherits_the_clock(monkeypatch, tmp_path, clear_job_state):
+    """Clearing the file can fail (a read-only or full disk), and the bookkeeping swallows that. Once
+    this process has seen the device fit, the next hold is a new episode whatever the file says.
+    Fails on base: the hold restored the file regardless."""
+    _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
+    monkeypatch.setattr(srv, "_persist_hold_episode", lambda *a, **k: None)  # the unlink fails
+
+    srv._note_tenant_gate_verdict("")  # a tenant gate passed: fit, no hold open
+
+    srv._note_tenant_gate_verdict("device is dirty and unverified: chip(s) 8 fell off the bus")
+    assert _hold_age_sec() < 60, f"a hold after a fit verdict was born {_hold_age_sec():.0f}s old"
+
+
+def test_a_device_held_at_broker_start_keeps_counting_from_the_original_drop(monkeypatch, tmp_path, clear_job_state):
+    """The case the file exists for, from a real file: no fit verdict since start, so the first hold
+    inherits the clock. Guards the fix above from rewinding a restart-split hold."""
+    stale = _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
+
+    srv._note_tenant_gate_verdict("device unverified: gate/startup: unhealthy")
+
+    assert srv.device_hold_episode_since == stale, "a restart while held rewound the escalation clock"
+
+
+def test_closing_an_orphaned_hold_leaves_the_clock_for_the_startup_verdict(monkeypatch, tmp_path, clear_job_state):
+    """The orphan close runs before any probe, so it cannot know whether the device is still held: it
+    ends the ledger row only. Clearing the clock there would rewind a box that restarts while still
+    wedged; the startup gate's verdict decides instead."""
+    stale = _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
+    (tmp_path / health.EVENTS_FILE).write_text(
+        json.dumps({"ts": time.time() - 600, "kind": "device_held", "reason": "chip off the bus"}) + "\n"
+    )
+
+    srv._close_orphaned_hold()
+
+    assert srv._restore_hold_episode() == stale
+
+
 @pytest.mark.asyncio
 async def test_dispatch_probe_runs_with_the_runtime_env_its_binary_needs(monkeypatch, tmp_path):
     """These binaries JIT their kernels from the runtime root — the fabric check exports
