@@ -1480,6 +1480,48 @@ async def test_a_readopted_job_killed_by_a_forced_reset_does_not_flag_the_device
     assert "[KILLED by device reset]" in log.read_text()
 
 
+def test_killing_a_readopted_job_holds_the_device_until_its_scope_ends(monkeypatch, tmp_path):
+    """A kill marks the job KILLED at once, but its scope gets up to GRACEFUL_KILL_GRACE_SEC to exit.
+    Its `readopted_scopes` entry is what keeps the runner from dispatching and a reset from running
+    over it meanwhile, so the kill must leave it for the monitor to drop when the scope ends (#7)."""
+    job = _readopted_job(monkeypatch)
+    during_stop = []
+
+    async def slow_scope(scope, grace_sec=0.0):
+        # The scope is still shutting down: the device is not free yet.
+        during_stop.append(("905-1" in srv.readopted_scopes, srv._reset_blocking_job()))
+
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: True)
+    monkeypatch.setattr(srv, "_terminate_scope", slow_scope)
+    client = _client(monkeypatch, tmp_path)
+
+    d = client.post("/api/tt_device_job_kill", json={"job_id": "905-1", "owner": "carol"}).json()
+
+    assert d["status"] == "killed" and job.status == srv.JobStatus.KILLED
+    assert during_stop and during_stop[0][0], "the kill freed the device before the scope stopped"
+    assert during_stop[0][1] and during_stop[0][1]["job_id"] == "905-1"
+    assert srv.readopted_scopes == {"905-1": srv.job_scope_unit("905-1")}, "only the monitor may drop it"
+    d, resets, _ = _post_reset(monkeypatch, tmp_path, force=False)
+    assert d["status"] == "refused" and d["job_id"] == "905-1" and not resets
+
+
+@pytest.mark.asyncio
+async def test_a_killed_readopted_job_frees_the_device_once_its_scope_ends(monkeypatch, tmp_path, clear_job_state):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    job = srv.Job(
+        id="908-1", owner="carol", workspace="/w", command="pytest", queued_at="", status=srv.JobStatus.KILLED
+    )
+    srv.jobs["908-1"] = job
+    scope = srv.job_scope_unit("908-1")
+    monkeypatch.setattr(srv, "readopted_scopes", {"908-1": scope})
+
+    await srv._monitor_readopted_scope("908-1", scope)
+
+    assert not srv.readopted_scopes and job.status == srv.JobStatus.KILLED and job.finished_at
+
+
 @pytest.mark.asyncio
 async def test_the_health_gate_reset_is_not_blocked_by_the_busy_check(monkeypatch):
     """The busy check belongs to the operator tool only. The gate's ladder resets through the
