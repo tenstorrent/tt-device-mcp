@@ -1075,6 +1075,11 @@ owner_submit_times: dict[str, list[float]] = {}
 # Measured: three consecutive laps held at 5/8 chips, the relift declining each time because the
 # episode looked seconds old, while the queue sat empty so no gate ever ran either.
 HOLD_EPISODE_FILE = "hold_episode_since"
+# What the bare start above cannot say: the kernel boot id it was recorded in. A sidecar rather
+# than a new format for the old file, because a broker rolled back to before it reads that file as
+# a bare timestamp: given anything else, the restored start would not parse and the hold watchdog
+# would go silent for the whole episode. The sidecar only qualifies the start it names.
+HOLD_EPISODE_RECORD_FILE = "hold_episode.json"
 # How the holder scan rewords a held door that a foreign process is keeping (fsm.note).
 FOREIGN_HOLDER_NOTE = "held: "
 
@@ -1082,13 +1087,20 @@ FOREIGN_HOLDER_NOTE = "held: "
 def _persist_hold_episode(since: str, *, tenant: bool = False) -> None:
     """Record (or clear) the episode start so a restart cannot rewind the escalation clock.
     ``tenant``: the hold opened because a foreign process held the device, not on a device
-    fault — see _restore_hold_episode."""
+    fault. Such a hold never carries (see _restore_hold_episode), so it leaves nothing on disk —
+    not even for an older broker, which would carry it."""
+    global _hold_episode_tenant
+    _hold_episode_tenant = bool(since) and tenant
+    record, path = health_dir() / HOLD_EPISODE_RECORD_FILE, health_dir() / HOLD_EPISODE_FILE
     try:
-        path = health_dir() / HOLD_EPISODE_FILE
-        if since:
-            path.write_text(json.dumps({"since": since, "boot_id": _current_boot_id(), "tenant": tenant}))
-        elif path.exists():
-            path.unlink()
+        if since and not tenant:
+            # Sidecar first: one without its start restores nothing, a start without one falls
+            # back to the btime rule — a crash between the writes is safe either way.
+            record.write_text(json.dumps({"since": since, "boot_id": _current_boot_id()}))
+            path.write_text(since)
+        else:
+            path.unlink(missing_ok=True)
+            record.unlink(missing_ok=True)
     except OSError:
         pass  # never let bookkeeping break the gate
 
@@ -1108,24 +1120,25 @@ def _restore_hold_episode() -> str:
 
     Only a broker restart within one boot carries the clock. A reboot is itself the biggest reset
     the ladder has, so an episode from an earlier boot is over; restoring it made the first hold
-    after boot past every window, and the forced ladder reset the box seconds after start. A hold
-    opened on a foreign holder is not a device fault and never carries either. A file from before
-    the boot id was recorded (a bare timestamp) carries only if it is newer than this boot."""
+    after boot past every window, and the forced ladder reset the box seconds after start. The boot
+    is told by the sidecar's kernel boot id when it names this very start; otherwise (a start an
+    older broker wrote, either boot id unreadable) only a start newer than this boot's btime
+    carries. A start that does not parse is not a clock: restoring it would leave the hold with no
+    deadline at all."""
     try:
-        text = (health_dir() / HOLD_EPISODE_FILE).read_text().strip()
-    except OSError:
+        since = (health_dir() / HOLD_EPISODE_FILE).read_text().strip()
+        datetime.fromisoformat(since)
+    except (OSError, ValueError):
         return ""
     try:
-        rec = json.loads(text) if text.startswith("{") else {"since": text}
-    except ValueError:
-        return ""
-    if not isinstance(rec, dict) or rec.get("tenant"):
-        return ""
-    since = str(rec.get("since") or "")
-    file_boot, this_boot = str(rec.get("boot_id") or ""), _current_boot_id()
+        rec = json.loads((health_dir() / HOLD_EPISODE_RECORD_FILE).read_text())
+    except (OSError, ValueError):
+        rec = None
+    file_boot = str(rec.get("boot_id") or "") if isinstance(rec, dict) and rec.get("since") == since else ""
+    this_boot = _current_boot_id()
     if file_boot and this_boot:
         return since if file_boot == this_boot else ""
-    return since if since and _since_this_boot(since) else ""
+    return since if _since_this_boot(since) else ""
 
 
 def _hold_is_tenant_held() -> bool:
@@ -1142,6 +1155,10 @@ def _hold_is_tenant_held() -> bool:
 # hold would be born past every escalation window. A device held at broker start is the one case
 # the file exists for.
 _hold_episode_restorable = True
+# Whether the open hold was recorded as a tenant hold (nothing on disk). Once it turns out to be a
+# device fault the clock is written after all, so a restart stops rewinding it — one way only: a
+# fault hold that a foreign holder later joins is still a fault.
+_hold_episode_tenant = False
 
 
 def _forget_stale_hold_episode() -> None:
@@ -1757,7 +1774,7 @@ def _reset_for_testing():
     Only used by test fixtures - not part of the public API.
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
-    global _hold_episode_restorable
+    global _hold_episode_restorable, _hold_episode_tenant
     job_queue = None
     lock = None
     _action_row = None
@@ -1766,6 +1783,7 @@ def _reset_for_testing():
     device_hold_episode_since = ""
     device_hold_episode_reason = ""
     _hold_episode_restorable = True
+    _hold_episode_tenant = False
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
@@ -4423,6 +4441,8 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     global device_hold_risky_escalated, device_hold_escalation_trigger
     if not device_hold_episode_since:
         return
+    if _hold_episode_tenant and not _hold_is_tenant_held():
+        _persist_hold_episode(device_hold_episode_since)  # the holder left a real fault behind
     try:
         started = datetime.fromisoformat(device_hold_episode_since)
     except ValueError:

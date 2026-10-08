@@ -10649,7 +10649,8 @@ def test_a_tenant_holds_clock_is_not_restored_after_a_restart(monkeypatch, tmp_p
     srv.fsm.note(f"{srv.FOREIGN_HOLDER_NOTE}smarton(pid 1145108) holds the device; verify deferred")
     monkeypatch.setattr(srv, "_hold_episode_restorable", False)  # this process opens its own hold, as the last boot did
     srv._note_tenant_gate_verdict("device unverified: held: smarton(pid 1145108) holds the device")
-    assert json.loads((tmp_path / srv.HOLD_EPISODE_FILE).read_text())["tenant"] is True
+    assert not (tmp_path / srv.HOLD_EPISODE_FILE).exists(), "a tenant hold left a clock an older broker would carry"
+    assert not (tmp_path / srv.HOLD_EPISODE_RECORD_FILE).exists()
 
     # The next process, same boot.
     monkeypatch.setattr(srv, "device_hold_logged", False)
@@ -10683,6 +10684,127 @@ def test_a_bare_timestamp_clock_carries_only_within_this_boot(
 
     monkeypatch.setattr(srv, "_boot_btime_id", lambda: "")
     assert srv._restore_hold_episode() == ""
+
+
+def test_the_hold_clock_file_stays_a_bare_timestamp_for_an_older_broker(monkeypatch, tmp_path):
+    """A broker rolled back to before the boot id was recorded reads the clock file as a bare start.
+    Writing the record into that file made the restored start unparseable, and the hold watchdog
+    returns on that: the episode got no deadline alert and no forced escalation. The boot id goes to
+    a sidecar instead."""
+    monkeypatch.setattr(srv, "health_dir", lambda: tmp_path)
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-a")
+    since = "2026-08-14T18:00:00"
+
+    srv._persist_hold_episode(since)
+
+    legacy = (tmp_path / srv.HOLD_EPISODE_FILE).read_text().strip()
+    assert datetime.fromisoformat(legacy) == datetime.fromisoformat(since), "an older broker cannot read the clock"
+    assert json.loads((tmp_path / srv.HOLD_EPISODE_RECORD_FILE).read_text()) == {"since": since, "boot_id": "boot-a"}
+
+    srv._persist_hold_episode("")
+    assert not (tmp_path / srv.HOLD_EPISODE_FILE).exists()
+    assert not (tmp_path / srv.HOLD_EPISODE_RECORD_FILE).exists()
+
+
+@pytest.mark.parametrize(
+    "file_boot, this_boot, btime_before_since, restored",
+    [
+        ("", "boot-a", True, True),  # sidecar without a boot id: btime decides
+        ("", "boot-a", False, False),
+        ("boot-a", "", True, True),  # this boot id unreadable: btime decides
+        ("boot-a", "", False, False),
+        ("", "", None, False),  # neither boot id nor btime readable: never carries
+        ("boot-a", "boot-a", None, True),  # same boot id needs no btime
+        ("boot-a", "boot-b", True, False),  # a new boot id wins over btime
+    ],
+)
+def test_an_unreadable_boot_id_falls_back_to_btime(
+    monkeypatch, tmp_path, file_boot, this_boot, btime_before_since, restored
+):
+    monkeypatch.setattr(srv, "health_dir", lambda: tmp_path)
+    since = datetime.now() - timedelta(hours=3)
+    (tmp_path / srv.HOLD_EPISODE_FILE).write_text(since.isoformat())
+    (tmp_path / srv.HOLD_EPISODE_RECORD_FILE).write_text(json.dumps({"since": since.isoformat(), "boot_id": file_boot}))
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: this_boot)
+    btime = "" if btime_before_since is None else since + timedelta(hours=-1 if btime_before_since else 1)
+    monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int(btime.timestamp())) if btime else "")
+
+    assert srv._restore_hold_episode() == (since.isoformat() if restored else "")
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    ["", "2026-08-1", "garbage", '{"since": "2026-08-14T18:00:00", "boot_id": "boot-a", "tenant": false}'],
+)
+def test_an_unparseable_hold_clock_is_never_restored(monkeypatch, tmp_path, legacy):
+    """A restored start that does not parse leaves the hold with no deadline: the watchdog returns on
+    it, so the episode would sit silent. Truncated, empty, or a record format this file never holds:
+    count from now instead."""
+    monkeypatch.setattr(srv, "health_dir", lambda: tmp_path)
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-a")
+    (tmp_path / srv.HOLD_EPISODE_FILE).write_text(legacy)
+    (tmp_path / srv.HOLD_EPISODE_RECORD_FILE).write_text(json.dumps({"since": legacy, "boot_id": "boot-a"}))
+
+    assert srv._restore_hold_episode() == ""
+
+
+@pytest.mark.parametrize("record", ['{"since": "2026-08-1', "", "{}", "[]", '{"since": "2026-01-01T00:00:00", "boot_id": "boot-a"}'])
+def test_a_corrupt_or_foreign_sidecar_falls_back_to_btime(monkeypatch, tmp_path, record):
+    """The sidecar only qualifies the start it names. A truncated one, or one naming another start
+    (an older broker rewrote the clock after it), says nothing about this start's boot."""
+    monkeypatch.setattr(srv, "health_dir", lambda: tmp_path)
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-a")
+    since = datetime.now() - timedelta(hours=3)
+    (tmp_path / srv.HOLD_EPISODE_FILE).write_text(since.isoformat())
+    (tmp_path / srv.HOLD_EPISODE_RECORD_FILE).write_text(record)
+
+    monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int((since - timedelta(hours=1)).timestamp())))
+    assert srv._restore_hold_episode() == since.isoformat()
+    monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int((since + timedelta(hours=1)).timestamp())))
+    assert srv._restore_hold_episode() == ""
+
+
+def test_a_sidecar_left_after_an_older_broker_cleared_the_clock_restores_nothing(monkeypatch, tmp_path):
+    """Rolled back, the older broker saw the device fit and removed only the file it knows. The
+    sidecar it left must not bring that dead start back when the newer broker returns."""
+    monkeypatch.setattr(srv, "health_dir", lambda: tmp_path)
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-a")
+    srv._persist_hold_episode("2026-08-14T18:00:00")
+
+    (tmp_path / srv.HOLD_EPISODE_FILE).unlink()
+
+    assert srv._restore_hold_episode() == ""
+
+
+def test_a_fault_hold_a_foreign_holder_later_joins_still_carries(monkeypatch, tmp_path, clear_job_state):
+    """The tenant mark is set when the hold opens. A device fault that a foreign process then sits
+    on is still a fault: its clock carries within the boot."""
+    stale = _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
+    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: False)
+    srv.fsm.on_fault("startup_unverified", detail="gate/startup: unhealthy", dirty=False)
+    srv._note_tenant_gate_verdict("device unverified: gate/startup: unhealthy")
+    assert srv.device_hold_episode_since == stale
+
+    srv.fsm.note(f"{srv.FOREIGN_HOLDER_NOTE}smarton(pid 7) holds the device; verify deferred")
+    srv._check_hold_deadline()
+
+    assert srv._restore_hold_episode() == stale, "a fault hold lost its clock when a foreign holder joined"
+
+
+def test_a_tenant_hold_that_turns_into_a_fault_starts_carrying_its_clock(monkeypatch, tmp_path, clear_job_state):
+    """Opened on a foreign holder, the hold left nothing on disk. Once the holder is gone and the
+    device is still held, it is a device fault: a restart from then on must not rewind it."""
+    _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
+    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: False)
+    monkeypatch.setattr(srv, "_hold_episode_restorable", False)
+    srv.fsm.on_fault("foreign_holder", detail="foreign holder present: smarton(pid 7)", dirty=False)
+    srv._note_tenant_gate_verdict("device unverified: foreign holder present: smarton(pid 7)")
+    assert srv._restore_hold_episode() == ""
+
+    srv.fsm.on_fault("startup_unverified", detail="gate/startup: unhealthy", dirty=False)
+    srv._check_hold_deadline()
+
+    assert srv._restore_hold_episode() == srv.device_hold_episode_since
 
 
 @pytest.mark.asyncio
