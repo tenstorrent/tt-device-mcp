@@ -5129,6 +5129,318 @@ async def test_a_talking_job_is_never_reaped(monkeypatch, clear_job_state):
         await asyncio.gather(runner, return_exceptions=True)
 
 
+class _BrokerFault:
+    """An iterable that raises: stands in for any broker-side error while a job's output is read."""
+
+    def __iter__(self):
+        raise RuntimeError("broker fault while reading job output")
+
+
+@pytest.mark.asyncio
+async def test_a_broker_error_mid_job_walks_the_kill_ladder(monkeypatch, clear_job_state, tmp_path):
+    """01 I5. An error in the broker, not the job, still ends a job that may hold the device: it
+    gets SIGINT first, the one signal the runtime unwinds on to close the device. A bare SIGKILL
+    (the old exception path) left a whole Galaxy at the busy clock for 85 minutes."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    monkeypatch.setattr(srv, "DOOMED_PATTERNS", _BrokerFault())
+    calls = []
+
+    async def _ladder(job_id, pid, grace_sec=srv.GRACEFUL_KILL_GRACE_SEC):
+        calls.append(job_id)
+        await srv._terminate_process_group(pid, grace_sec=2)  # no scope off privsep
+
+    monkeypatch.setattr(srv, "_terminate_job", _ladder)
+    mark = tmp_path / "sigint"
+    job = srv.Job(
+        id="903",
+        owner="tenant",
+        workspace="/tmp",
+        command=f"trap 'touch {mark}; exit 7' INT; echo hi; sleep 30 & wait",
+        queued_at="t",
+    )
+    srv.jobs["903"] = job
+    await srv.get_job_queue().put("903")
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        for _ in range(200):
+            if job.finished_at is not None:
+                break
+            await asyncio.sleep(0.05)
+        assert job.status is srv.JobStatus.FAILED
+        assert calls == ["903"], "the exception path skipped the SIGINT -> SIGTERM -> SIGKILL ladder"
+        assert mark.exists(), "the job never saw SIGINT, so it had no chance to close the device"
+        assert "EXCEPTION" in (job.error or "")
+        assert not runner.done(), "a broker error in one job ended the runner"
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+class _FullDiskFile:
+    """A log file on a full disk: opens, then every write fails with ENOSPC."""
+
+    def write(self, _text):
+        raise OSError(28, "No space left on device")
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_a_full_log_disk_ends_neither_the_job_nor_the_runner(monkeypatch, clear_job_state, tmp_path):
+    """01 Completion. The job log is best effort. On a full disk a log write failed, which killed
+    the running job, then the footer write failed and ended the runner itself, so the post-job
+    gate never ran and the next job was dispatched onto an unchecked device."""
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    gates = []
+
+    async def _gate(job_log_file, job_failed=False):
+        gates.append(job_failed)
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
+    log = tmp_path / "904.log"
+    log.write_text("")
+    real_open = open
+
+    def _open(path, mode="r", *args, **kwargs):
+        if str(path) == str(log) and "a" in mode:
+            return _FullDiskFile()
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(srv, "open", _open, raising=False)
+    job = srv.Job(id="904", owner="tenant", workspace="/tmp", command="echo one; echo two", queued_at="t")
+    job.log_file = str(log)
+    srv.jobs["904"] = job
+    await srv.get_job_queue().put("904")
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        for _ in range(200):
+            if job.finished_at is not None and gates:
+                break
+            await asyncio.sleep(0.05)
+        assert job.status is srv.JobStatus.COMPLETED, f"a full log disk turned a clean run into {job.status.value}"
+        assert "one" in job.output and "two" in job.output, "output is still kept in memory"
+        assert gates == [False], "the post-job gate did not run"
+        assert not runner.done(), "a full log disk ended the runner"
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+async def _wait_for(cond, tries=200):
+    for _ in range(tries):
+        if cond():
+            return
+        await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_a_full_log_disk_still_gates_a_failed_job_before_the_next(monkeypatch, clear_job_state, tmp_path):
+    """01 Completion. A failed job whose log sits on a full disk still gets the forced post-job
+    gate, and the next job waits for it. On a full disk the runner once died in this cleanup and
+    the next job was dispatched with no gate at all."""
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    gates = []
+
+    async def _gate(job_log_file, job_failed=False):
+        gates.append((job_failed, second.status))
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
+    real_open = open
+
+    def _open(path, mode="r", *args, **kwargs):
+        if str(path).startswith(str(tmp_path)) and "a" in mode:
+            return _FullDiskFile()
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(srv, "open", _open, raising=False)
+    monkeypatch.setattr(srv, "write_job_log_footer", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "full")))
+    first = srv.Job(id="905", owner="tenant", workspace="/tmp", command="echo one; exit 3", queued_at="t")
+    second = srv.Job(id="906", owner="tenant", workspace="/tmp", command="echo two", queued_at="t")
+    for job in (first, second):
+        job.log_file = str(tmp_path / f"{job.id}.log")
+        srv.jobs[job.id] = job
+        await srv.get_job_queue().put(job.id)
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _wait_for(lambda: second.finished_at is not None and len(gates) == 2)
+        assert first.status is srv.JobStatus.FAILED and first.exit_code == 3
+        assert gates, "the post-job gate never ran after a job whose log hit a full disk"
+        assert gates[0] == (True, srv.JobStatus.QUEUED), f"the next job did not wait for the gate: {gates}"
+        assert second.status is srv.JobStatus.COMPLETED
+        assert not runner.done(), "a full log disk ended the runner"
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+class _FullDiskStats:
+    """Session stats whose first completion record fails on a full disk; the rest succeed."""
+
+    def __init__(self):
+        self.failed = False
+
+    def update_device_state(self, now_busy):
+        pass
+
+    def record_job_completion(self, *a, **k):
+        if not self.failed:
+            self.failed = True
+            raise OSError(28, "No space left on device")
+
+
+@pytest.mark.asyncio
+async def test_an_error_escaping_job_cleanup_fails_closed(monkeypatch, clear_job_state):
+    """01 Completion. Any error that escapes a job's cleanup (here ENOSPC from a step the cleanup
+    does not guard) must not end the runner. The device is marked dirty and gated before the
+    next job runs. It used to end the runner task; a later submit started a fresh one, which
+    dispatched onto a device nothing had checked."""
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    monkeypatch.setattr(srv, "stats", _FullDiskStats())
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: None)
+    gates = []
+
+    async def _gate(job_log_file, job_failed=False):
+        gates.append((job_failed, srv.fsm.record.dirty, second.status))
+        srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
+    first = srv.Job(id="907", owner="tenant", workspace="/tmp", command="echo one", queued_at="t")
+    second = srv.Job(id="908", owner="tenant", workspace="/tmp", command="echo two", queued_at="t")
+    for job in (first, second):
+        srv.jobs[job.id] = job
+        await srv.get_job_queue().put(job.id)
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _wait_for(lambda: second.finished_at is not None and len(gates) == 2)
+        assert not runner.done(), "an error in one job's cleanup ended the runner"
+        assert gates, "no gate ran after the error"
+        job_failed, dirty, next_status = gates[0]
+        assert job_failed and dirty, "the error did not fail closed: the device was not flagged for the gate"
+        assert next_status is srv.JobStatus.QUEUED, "the next job was dispatched before the gate ran"
+        assert second.status is srv.JobStatus.COMPLETED, "a gate that verified the device must let the next job run"
+        assert srv.current_job_id is None
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_an_error_escaping_before_spawn_forgets_the_queued_spec(monkeypatch, clear_job_state, tmp_path):
+    """01 Completion. An error escaping before the job spawns leaves it FAILED with its spec still
+    under queued/ (only a live scope drops it). A restart would restore that spec and run a job the
+    tenant was already told FAILED. The fail-closed path must drop the spec and write the footer."""
+    _free_device_lock(monkeypatch)
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: None)
+
+    def _boom(*a, **k):
+        raise RuntimeError("activation exploded")
+
+    monkeypatch.setattr(srv, "get_activation_script", _boom)
+    gates = []
+
+    async def _gate(job_log_file, job_failed=False):
+        gates.append(job_failed)
+        srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
+    log = tmp_path / "909.log"
+    job = srv.Job(
+        id="909",
+        owner="tenant",
+        workspace="/tmp",
+        command="echo one",
+        queued_at=datetime.now().isoformat(),
+        log_file=str(log),
+    )
+    srv.jobs[job.id] = job
+    srv._persist_queued_job(job)
+    assert srv._queued_spec_path("909").exists(), "precondition: the spec was persisted"
+    await srv.get_job_queue().put(job.id)
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _wait_for(lambda: bool(gates))
+        assert job.status is srv.JobStatus.FAILED
+        assert not srv._queued_spec_path(
+            "909"
+        ).exists(), "a job reported FAILED kept its queued spec: a restart would run it again"
+        assert srv._parse_job_log_footer(log.read_text().splitlines()), "the failed job's log has no footer"
+        assert not runner.done(), "the error ended the runner"
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.parametrize("raw, want", [("", 800), ("950", 950), ("fast", 800), ("0", 800), ("-5", 800)])
+def test_idle_aiclk_ceiling_falls_back_on_a_bad_value(monkeypatch, raw, want):
+    """A bad TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ must not stop the broker from importing."""
+    monkeypatch.setenv("TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ", raw)
+    assert srv._idle_aiclk_max_mhz() == want
+
+
+def test_aiclk_left_busy_names_only_chips_above_the_idle_clock(monkeypatch):
+    """03 B-post-job clock check. A chip still at the busy clock once nothing holds it was not
+    closed. Values it cannot read are not evidence either way."""
+    snap = {
+        "0": {"tt_aiclk": 1350},
+        "1": {"tt_aiclk": 800},
+        "2": {"tt_aiclk": None},
+        "3": {},
+        "4": {"tt_aiclk": 500},
+    }
+    monkeypatch.setattr(srv, "chip_snapshot", lambda: snap)
+    assert srv._aiclk_left_busy(800) == {"0": 1350}
+
+    def _boom():
+        raise OSError("sysfs gone")
+
+    monkeypatch.setattr(srv, "chip_snapshot", _boom)
+    assert srv._aiclk_left_busy(800) == {}
+
+
+def test_a_job_that_left_chips_busy_is_recorded(monkeypatch, tmp_path):
+    """03 B-post-job clock check: one event and one job-log line, naming the job and the clock."""
+    monkeypatch.setattr(srv, "chip_snapshot", lambda: {"0": {"tt_aiclk": 1350}, "1": {"tt_aiclk": 1350}})
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    log = tmp_path / "905.log"
+    log.write_text("")
+    job = srv.Job(id="905", owner="tenant", workspace="/tmp", command="true", queued_at="t")
+    job.status = srv.JobStatus.FAILED
+    srv._note_aiclk_after_job(job, log)
+    assert events == [
+        (
+            "aiclk_busy_after_job",
+            {"job": "905", "status": "failed", "chips": 2, "max_mhz": 1350, "ceiling_mhz": srv.IDLE_AICLK_MAX_MHZ},
+        )
+    ]
+    assert "still at the busy AI clock" in log.read_text()
+
+    events.clear()
+    monkeypatch.setattr(srv, "chip_snapshot", lambda: {"0": {"tt_aiclk": 800}})
+    srv._note_aiclk_after_job(job, log)
+    assert events == [], "an idle clock is not news"
+
+
 @pytest.mark.asyncio
 async def test_hung_silence_of_zero_disables_the_reaper(monkeypatch, clear_job_state):
     """Every host must be able to turn this off: silence is a proxy, not proof."""
