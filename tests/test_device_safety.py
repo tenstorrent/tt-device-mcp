@@ -5302,13 +5302,169 @@ def test_a_clean_device_is_not_held_by_an_unverified_clear(monkeypatch):
     assert srv._device_unavailable_for_tenant() == ""
 
 
+# --- an admission check that errors fails closed ------------------------------
+#
+# A raise out of _await_device_free_for_tenant used to be swallowed as "fit", so the job was
+# dispatched onto exactly the device nobody could verify. Now the job waits at the door while the
+# check is retried; a check that keeps raising holds the device instead.
+
+
+async def _run_one_job_through_the_gate(job, *, until):
+    """Queue ``job``, run the real job_runner, and stop once ``until()`` holds (or ~6 s pass)."""
+    srv.jobs[job.id] = job
+    await srv.get_job_queue().put(job.id)
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        for _ in range(300):
+            if until():
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_an_admission_check_error_retries_instead_of_dispatching(monkeypatch, clear_job_state):
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "ADMISSION_GATE_RETRY_SEC", (0.01, 0.01))
+
+    job = srv.Job(id="912", owner="tenant", workspace="/tmp", command="echo ran", queued_at="t")
+    status_at_call = []
+
+    async def _flaky_gate(job_log_file):
+        status_at_call.append(job.status)
+        if len(status_at_call) == 1:
+            raise RuntimeError("boom")
+        return ""
+
+    monkeypatch.setattr(srv, "_await_device_free_for_tenant", _flaky_gate)
+
+    await _run_one_job_through_the_gate(job, until=lambda: job.status is not srv.JobStatus.QUEUED)
+
+    assert len(status_at_call) == 2, "the errored admission check was not retried"
+    assert status_at_call[1] is srv.JobStatus.QUEUED, "the job was dispatched before the check answered"
+    assert job.status is not srv.JobStatus.QUEUED, "a check that recovered on retry never dispatched the job"
+    assert srv.fsm.state is ServerState.HEALTHY, "a single transient error held the device"
+
+
+@pytest.mark.asyncio
+async def test_three_admission_check_errors_in_a_row_hold_the_device(monkeypatch, clear_job_state):
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "ADMISSION_GATE_RETRY_SEC", (0.01, 0.01))
+    monkeypatch.setenv("TT_DEVICE_MCP_TENANT_HOLD", "0")  # refuse at the door: the job ends, fast
+
+    calls = []
+
+    async def _broken_gate(job_log_file):
+        calls.append(1)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(srv, "_await_device_free_for_tenant", _broken_gate)
+    job = srv.Job(id="913", owner="tenant", workspace="/tmp", command="echo ran", queued_at="t")
+
+    await _run_one_job_through_the_gate(job, until=lambda: job.finished_at is not None)
+
+    assert len(calls) == srv.ADMISSION_GATE_MAX_ERRORS == 3
+    assert job.started_at is None, "a job was dispatched past an admission check that never answered"
+    assert job.status is srv.JobStatus.FAILED
+    assert "boom" in (job.error or "")
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert srv.fsm.record.why == "gate_error"
+    assert srv.fsm.record.why in srv.GENERIC_ESCALATE_WHYS
+    assert not srv.fsm.record.dirty, "a hold, not a dirty mark: the failing gate is not asked to reset"
+    assert srv._device_degraded_for_tenant(), "the next job would be admitted onto the unverified device"
+
+
+@pytest.mark.asyncio
+async def test_a_held_job_stays_held_while_the_admission_check_keeps_erroring(monkeypatch, clear_job_state):
+    """Default hold mode: the hold's own re-check errors too, and the job stays queued rather than
+    being refused or dispatched."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "ADMISSION_GATE_RETRY_SEC", (0.01, 0.01))
+    monkeypatch.setattr(srv, "TENANT_HOLD_POLL_SEC", 0.01)
+
+    calls = []
+
+    async def _broken_gate(job_log_file):
+        calls.append(1)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(srv, "_await_device_free_for_tenant", _broken_gate)
+    job = srv.Job(id="914", owner="tenant", workspace="/tmp", command="echo ran", queued_at="t")
+
+    await _run_one_job_through_the_gate(job, until=lambda: len(calls) >= 3 * srv.ADMISSION_GATE_MAX_ERRORS)
+
+    assert len(calls) >= 3 * srv.ADMISSION_GATE_MAX_ERRORS, "the hold stopped re-checking the device"
+    assert job.status is srv.JobStatus.QUEUED, "a held job was refused or dispatched on a gate error"
+    assert job.started_at is None
+    assert srv.fsm.record.why == "gate_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("why", ["off_bus", "job_killed"])
+async def test_admission_check_errors_leave_an_open_episode_alone(monkeypatch, clear_job_state, why):
+    """An open episode already shuts the door. Overwriting it with gate_error would drop the reset
+    a dirty device is owed, or the self-heal lift an off-bus hold arms."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "ADMISSION_GATE_RETRY_SEC", (0.01, 0.01))
+    monkeypatch.setenv("TT_DEVICE_MCP_TENANT_HOLD", "0")
+    fsm_dirty(srv, "an earlier finding", why=why)
+    dirty_before = srv.fsm.record.dirty
+
+    async def _broken_gate(job_log_file):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(srv, "_await_device_free_for_tenant", _broken_gate)
+    job = srv.Job(id="915", owner="tenant", workspace="/tmp", command="echo ran", queued_at="t")
+
+    await _run_one_job_through_the_gate(job, until=lambda: job.finished_at is not None)
+
+    assert job.started_at is None and job.status is srv.JobStatus.FAILED
+    assert srv.fsm.record.why == why
+    assert srv.fsm.record.dirty == dirty_before
+
+
+@pytest.mark.asyncio
+async def test_a_job_cancelled_during_admission_retries_never_dispatches(monkeypatch, clear_job_state):
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "ADMISSION_GATE_RETRY_SEC", (0.01, 0.01))
+
+    job = srv.Job(id="916", owner="tenant", workspace="/tmp", command="echo ran", queued_at="t")
+    calls = []
+
+    async def _gate_errors_then_the_job_is_killed(job_log_file):
+        calls.append(1)
+        if len(calls) == 1:
+            job.status = srv.JobStatus.KILLED  # a cancel landing during the retry pause
+            raise RuntimeError("boom")
+        return ""
+
+    monkeypatch.setattr(srv, "_await_device_free_for_tenant", _gate_errors_then_the_job_is_killed)
+
+    await _run_one_job_through_the_gate(job, until=lambda: srv.get_job_queue()._unfinished_tasks == 0)
+
+    assert job.status is srv.JobStatus.KILLED
+    assert job.started_at is None, "a job cancelled at the door was dispatched anyway"
+
+
 # --- a malformed fsm.json must degrade, never poison the admission path --------
 #
 # ServerFsm._load coerces job/since/detail to their expected shapes: a hand-edited or truncated
 # file that leaves the wrong type in one of them must never reach dict()/strptime()/f-string
 # formatting downstream still holding that type, or the tenant predicate and the health payload
-# raise instead of answering — and job_runner's "a gate bug must not block the queue" handler
-# turns that raise into an ungated dispatch onto a device nobody verified.
+# raise instead of answering — and every job would then wait out job_runner's admission retries
+# and end on a gate_error hold.
 
 
 def test_a_non_dict_job_on_disk_never_poisons_the_gate(monkeypatch, tmp_path):
