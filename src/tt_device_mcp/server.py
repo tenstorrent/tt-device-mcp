@@ -131,6 +131,7 @@ from tt_device_mcp.health import (
     read_heartbeats,
     version_floor_warnings,
 )
+from tt_device_mcp.job_reap import JOB_TAG_ENV, reap_job_survivors
 from tt_device_mcp.peercred import username_for_uid
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
 from tt_device_mcp.socket_transport import (
@@ -6503,6 +6504,11 @@ async def _job_runner_loop():
         terminal_note = ""  # timeout/exception marker, appended to error at the end
         privsep_prefix = None  # set below; read by the finally even when setup raised first
         proc = None
+        watchdog = None
+        reaping = False  # the watchdog has started the termination ladder
+        # Unique to this run (ids recycle): what still finds a child that left the job's
+        # session after its parent exited, for the survivor sweep in the finally below.
+        job_tag = f"{job_id}-{os.urandom(6).hex()}"
         # Everything from here on is inside the try: the job is RUNNING, so an error in any
         # setup step (a full disk is enough) must end it FAILED, never kill the runner.
         try:
@@ -6526,6 +6532,7 @@ async def _job_runner_loop():
             full_command = f"""
 {_exit_trap_preamble(str(exit_file))}set -e
 {activation_script}
+export {JOB_TAG_ENV}={job_tag}
 {job.command}
 """
 
@@ -6626,6 +6633,7 @@ async def _job_runner_loop():
                         pass
 
             async def hung_watchdog():
+                nonlocal reaping
                 # Says the silence out loud, and only then reaps it.
                 #
                 # A wedged job prints NOTHING, and the runtime has no always-on heartbeat of its
@@ -6667,6 +6675,7 @@ async def _job_runner_loop():
                                 f"JOB_RUNNER job_id={job_id} DOOMED: device reported unrecoverable "
                                 f"(grace {DOOMED_GRACE_SEC}s) -> terminating"
                             )
+                        reaping = True
                         await _terminate_job(job_id, job.pid)
                         return
 
@@ -6692,6 +6701,7 @@ async def _job_runner_loop():
                             )
                         # Kill the whole scope for a privsep job — killpg on the wrapper pid leaves the
                         # scoped payload running and wedges the eth. See _terminate_job.
+                        reaping = True
                         await _terminate_job(job_id, job.pid)
                         return
 
@@ -6708,14 +6718,24 @@ async def _job_runner_loop():
                     ),
                     timeout=job.timeout_sec,
                 )
-            finally:
+            except asyncio.CancelledError:
                 watchdog.cancel()
+                raise
+            finally:
+                # A reap already under way runs its ladder to the end. The job's streams can
+                # close long before its last process does (the shell dies on SIGINT while a
+                # child is still unwinding), and cancelling here would skip the rest of the
+                # ladder and leave that child to the final sweep's much shorter grace.
+                if not reaping:
+                    watchdog.cancel()
                 if log_fh:
                     try:
                         log_fh.close()
                     except OSError:
                         pass
             await proc.wait()
+            if reaping:
+                await asyncio.gather(watchdog, return_exceptions=True)
 
             async with get_lock():
                 job.exit_code = proc.returncode
@@ -6742,7 +6762,11 @@ async def _job_runner_loop():
             # Graceful SIGTERM -> grace -> SIGKILL so the job can release the device cleanly
             # (a hard SIGKILL mid-CCL is the classic mesh wedge). For a privsep job this MUST
             # signal the systemd scope, not killpg the wrapper pid — see _terminate_job.
-            await _terminate_job(job_id, job.pid)
+            if reaping:
+                # The hung reaper is already running the ladder.
+                await asyncio.gather(watchdog, return_exceptions=True)
+            else:
+                await _terminate_job(job_id, job.pid)
 
             async with get_lock():
                 job.status = JobStatus.TIMEOUT
@@ -6801,7 +6825,7 @@ async def _job_runner_loop():
                 job.out_buf.clear()
                 job.err_buf.clear()
 
-                # A privsep job's leftovers live in its scope, beyond the killpg below: stop the
+                # A privsep job's leftovers live in its scope, beyond its process group: stop the
                 # scope first so they get the graceful SIGINT before anything is SIGKILLed.
                 if privsep_prefix:
                     try:
@@ -6812,20 +6836,37 @@ async def _job_runner_loop():
                         if logger:
                             logger.warning(f"JOB_RUNNER failed to stop the scope for job_id={job_id}: {e}")
 
-                # Ensure process group is killed (idempotent - safe even if already dead)
-                if job.pid:
+                # Sweep whatever the job left behind before the device goes to anyone else:
+                # its process group, its session, its scope's cgroup and their descendants get
+                # SIGTERM, then SIGKILL. A child that started its own process group is out of
+                # the ladder's reach, and one stuck in the kernel outlives SIGKILL; either keeps
+                # the device open: a hung-reaped job's pytest once held it for two hours this way.
+                survivors = []
+                stop_after_sweep = False
+                if job.pid or privsep_prefix:
+                    sweep = asyncio.ensure_future(
+                        reap_job_survivors(
+                            job_id,
+                            job.pid,
+                            job_scope_unit(job_id) if privsep_prefix else None,
+                            job_tag,
+                            log=logger.warning if logger else (lambda _msg: None),
+                        )
+                    )
                     try:
-                        # Use PID directly as PGID (os.setsid makes them equal)
-                        os.killpg(job.pid, signal.SIGKILL)
-                        if logger:
-                            logger.debug(f"JOB_RUNNER killed process group for job_id={job_id}, pid={job.pid}")
-                    except (ProcessLookupError, OSError):
-                        # Process already dead - expected for normal completion due to async timing
-                        # between process exit and finally block execution
+                        survivors = await asyncio.shield(sweep)
+                    except asyncio.CancelledError:
+                        # Shutdown landed mid-sweep. Finish it (a few seconds at most) and the
+                        # job's bookkeeping below, or the finished job stays the current one.
+                        survivors = await sweep
+                        stop_after_sweep = True
+                if survivors and job_log_file:
+                    try:
+                        with open(job_log_file, "a") as f:
+                            for survivor in survivors:
+                                f.write(f"[broker] process outlived the job and SIGKILL: {survivor.describe()}\n")
+                    except OSError:
                         pass
-                    except Exception as e:
-                        if logger:
-                            logger.warning(f"JOB_RUNNER failed to kill process group for job_id={job_id}: {e}")
 
                 # This broker saw the job exit itself, so its own returncode is authoritative
                 # and the job's file has served no purpose. Only a re-adopted job reads it.
@@ -6889,6 +6930,25 @@ async def _job_runner_loop():
                         + (f" (exit {job.exit_code})" if job.exit_code is not None else ""),
                         job=job,
                     )
+                # Last, so its detail is the one the hold shows: the next job waits until this
+                # process is gone and the device verifies, and the operator learns which job
+                # left it and that no signal will move it.
+                held_by = [s for s in survivors if s.holds_device is not False]
+                if held_by:
+                    if logger:
+                        logger.error(
+                            f"JOB_RUNNER job_id={job_id} left {len(held_by)} process(es) alive after "
+                            f"SIGKILL that may hold the device: "
+                            + "; ".join(s.describe() for s in held_by)
+                            + ". The next job waits until they are gone; state D means stuck in the "
+                            "kernel, which only a device reset or reboot clears."
+                        )
+                    _mark_device_dirty(
+                        f"job {job_id} left pid "
+                        + ", ".join(f"{s.pid} (state {s.state})" for s in held_by)
+                        + " alive after SIGKILL, holding the device",
+                        job=job,
+                    )
 
                 # Write job log footer (outside lock - file I/O). Best effort: a full disk once
                 # raised here and ended the runner, so the post-job gate below never ran and the
@@ -6899,6 +6959,9 @@ async def _job_runner_loop():
                     except OSError as e:
                         if logger:
                             logger.warning(f"JOB_RUNNER job_id={job_id} could not write its log footer: {e}")
+
+                if stop_after_sweep:
+                    raise asyncio.CancelledError()
 
                 # Post-job health check — snapshot + fabric traffic — after EVERY
                 # run, queue empty or not. A fabric wedge need not trip a wedge-risk
