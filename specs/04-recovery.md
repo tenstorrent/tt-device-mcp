@@ -145,7 +145,7 @@ each rung fires only when the gentler one failed or cannot apply.
   with a fabric check installed is verified exactly like the ladder's own resets:
   `_verify_device_after_reset` — eth read and fabric pass, a 77 re-checked
   `POST_RESET_FABRIC_RETRIES` times. Fabric pass → released (`health_ok: true`, the runtime-reported
-  fault retired). A failed probe → `reset_unhealthy`, marked dirty (`why=probe_unhealthy`), never
+  fault retired). A failed probe → `reset_unhealthy`, marked dirty (`why=operator_reset_unhealthy`), never
   HEALTHY. Still 77 after the retries → `reset_unverified`, held `fabric_unverified` (not dirty),
   the reported fault kept. A single chip, or a mesh with no fabric check installed (which could never
   produce that verdict), keeps the light verify — `fsm.observe(..., run_fabric=False)` against the
@@ -453,6 +453,21 @@ never see it (I18).
 reset's verify is the ladder's own post-reset verify (eth read + fabric pass, 77-retried), so
 `reset_complete` there means the fabric moved traffic. This costs nothing per job; it lengthens the
 operator's reset by one fabric pass (about 45-75 s on a healthy mesh), plus the retry sleep and a second pass on a 77.
+**Duration bound.** From the moment the reset holds the device-op lock, the call takes at most:
+the poller stop and restart (30 s per `systemctl` call, 120 s with the two default services), the
+reset (`DEVICE_RESET_TIMEOUT_SEC`, 600 s; a reset still running then is `reset_failed` with no
+verify), the 3 s PCI-rescan settle, and the verify passes. A re-check follows only a 77, so every
+pass but the last one finished: up to 361 s (heartbeat settle 0.5 s + snapshot 90 s + eth python
+probe 3 × 10 s + eth read 60 s + fabric `FABRIC_CHECK_TIMEOUT_SEC` 180 s). The last pass can time
+out and adds the 75 s kill sequence (`GRACEFUL_KILL_GRACE_SEC` + `SIGTERM_GRACE_SEC`): up to
+436 s. With `POST_RESET_FABRIC_RETRIES` (1) re-checks, each after `POST_RESET_FABRIC_RETRY_SLEEP_SEC`
+(60 s): 1579 s, about 26 minutes, at the defaults. Not counted: stopping a running job first (60 s
+grace, then the kill), waiting for a broker operation already holding the lock, and the PCI-rescan
+write itself; the bound also assumes a killed process exits. Typical on a healthy Galaxy:
+about 2 minutes, about 4 with a 77 retry. The tool's docstring states this bound and a test
+recomputes it from the timeouts. The MCP tool sends nothing until it returns, which is safe through
+the stdio shim: its 300 s read timeout bounds the gap between reads, and the SSE keepalives fill
+it (spec 02).
 Before this, the tool released a mesh on heartbeat + snapshot — the pair that scores an eth/fabric
 wedge as fine — and the stream also retired the runtime's fault report on that blind verdict. On a
 single chip, or a mesh with no fabric check, the verify stays one `fsm.observe(run_fabric=False)`
@@ -572,6 +587,7 @@ sees a silent fabric pass.
 | I11 host rung only after exhausted reset (two strikes); once-per-episode latch | `tests/test_device_safety.py::test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted`, `tests/test_device_safety.py::test_stuck_hold_escalation_retries_on_the_grace_cadence`, `tests/test_device_safety.py::test_ubb_tray_reset_fires_at_most_once_per_hold_episode`, `tests/test_device_safety.py::test_escalate_forced_suffix_bypasses_the_retry_pacing` |
 | I12 quiesce + in-flight flag + restore rules | `tests/test_reset.py::test_streaming_reset_quiesces_pollers_and_flags_in_flight`, `tests/test_reset.py::test_reset_quiesce_restores_pollers_even_if_the_rescan_is_cancelled`, `tests/test_reset.py::test_reset_quiesce_leaves_pollers_off_when_the_reset_times_out`, `tests/test_reset.py::test_reset_quiesce_restores_pollers_when_a_failed_launch_leaves_no_scope`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_defers_the_dead_chip_sampler_during_the_transient_drop` |
 | I13 mesh reset verify = fabric pass (pass/fail/77), single chip and no-fabric-check light | `tests/test_reset.py::test_an_operator_reset_on_a_mesh_releases_only_on_a_fabric_pass`, `tests/test_reset.py::test_an_operator_reset_whose_fabric_fails_is_not_released`, `tests/test_reset.py::test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified`, `tests/test_reset.py::test_a_single_chip_operator_reset_keeps_the_light_verify`, `tests/test_reset.py::test_a_mesh_with_no_fabric_check_keeps_the_light_verify`, `tests/test_reset.py::test_the_light_verify_checks_the_hosts_chip_count_not_the_survivors`, `tests/test_reset.py::test_a_blind_stream_verify_does_not_clear_the_reported_fault`, `tests/test_reset.py::test_the_stream_settles_an_operator_reset_like_the_tool` |
+| I13 failed operator-reset verify is `operator_reset_unhealthy`; duration bound documented | `tests/test_reset.py::test_an_operator_reset_whose_fabric_fails_is_not_released`, `tests/test_reset.py::test_the_stream_settles_an_operator_reset_like_the_tool`, `tests/test_reset.py::test_the_reset_tools_documented_duration_matches_its_timeouts` |
 | I13 light verify; unhealthy downgrade | `tests/test_reset.py::test_reset_tool_reports_health`, `tests/test_reset.py::test_verify_health_fails_on_short_chip_count`, `tests/test_reset.py::test_verify_health_fails_on_wedged_arc`, `tests/test_reset.py::test_verify_health_passes_on_over_count_from_stale_expected` |
 | I14 warm reboot never fired where futile; blocked climbs are loud | `tests/test_device_safety.py::test_host_escalation_for_drop_sends_all_off_bus_to_the_cold_rung`, `tests/test_device_safety.py::test_host_escalation_for_drop_routes_a_futile_reboot_to_the_cold_rung`, `tests/test_device_safety.py::test_gate_all_off_bus_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_reset_regression_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_all_off_bus_power_cycles_when_opted_in` |
 | Cold rung fireable-or-off (ipmitool) | `tests/test_device_safety.py::test_a_host_without_ipmitool_serves_with_the_cold_rung_off`, `tests/test_device_safety.py::test_ipmitool_present_leaves_the_cold_rung_armed` |

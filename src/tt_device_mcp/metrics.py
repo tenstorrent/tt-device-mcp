@@ -75,6 +75,7 @@ FAULTS = (
     "gate_error",
     "foreign_holder",
     "probe_unhealthy",
+    "operator_reset_unhealthy",
 )
 
 # constants.STAGE_NAMES, in severity order (0..4) — imported, not copied. It lives in
