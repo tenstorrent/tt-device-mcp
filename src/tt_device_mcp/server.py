@@ -2606,6 +2606,63 @@ def _idle_relift_armed() -> tuple[bool, bool, bool]:
     )
 
 
+def _foreign_hold_armed() -> bool:
+    """Whether the open episode is a hold the gate placed only because a foreign process held the
+    device (why ``foreign_holder``). The idle relift re-scans the holders for it whatever the
+    generic-escalate switch says: noticing that the holder left is not an escalation, and nothing
+    else re-runs the scan on an idle box (the hold drops the dirty flag, so neither the pre-job gate
+    nor the tenant hold-poll looks again)."""
+    return fsm.state is ServerState.RECOVERING and fsm.record.why == "foreign_holder"
+
+
+async def _relift_foreign_hold(expected: int, log: Callable[[str], None]) -> bool:
+    """Re-scan the device holders for a ``foreign_holder`` hold and, once none is left, lift it on
+    the same read-only pass the pre-job gate would run. Never a reset, never the traffic pass.
+
+    The scan, not the pid in the hold's note, is the authority: a holder that exited, or whose pid
+    now names an unrelated process with no device fd, is not in it. Same filter as the gate that
+    placed the hold (uid >= MIN_TENANT_UID), so the lift needs exactly what that gate would have.
+
+    Returns True when this pass decided the hold (lifted it, or handed it to the hold or dirty mark
+    the read names); False while a foreign holder remains, so the caller keeps its generic path.
+    Called under the device-op lock."""
+    scan = await asyncio.to_thread(enumerate_device_holders)
+    foreign = [h for h in scan.holders if h.uid >= MIN_TENANT_UID]
+    if foreign:
+        who = ", ".join(f"{h.username}(pid {h.pid})" for h in foreign)
+        # The holder may have changed since the gate looked; name the one there now.
+        fsm.note(f"held: {who} holds the device; verify deferred until it releases")
+        return False
+    gone = fsm.record.detail
+    log(f"foreign holder gone ({gone}) — running the deferred read-only verify")
+    healthy, evidence = await fsm.observe(expected, log, run_fabric=False, recovery=galaxy_recovery)
+    state = HealthState.from_evidence(evidence, phase="idle-relift", expected=expected)
+    # Re-checked after the awaits: a lock-free dead-chip mark or a new hold can have landed meanwhile.
+    if not _foreign_hold_armed() or fsm.record.dirty:
+        log("state changed mid-verify — holding; the pre-job gate owns it now")
+        return True
+    if not healthy:
+        # What a read-only gate pass records on the same read: the normal gate ladder owns it now.
+        reason = "idle relift: foreign holder gone, read-only pass found the device unhealthy"
+        # Reclassify first: a dirty mark landing on a hold keeps the hold's why (on_fault).
+        fsm.on_fault("probe_unhealthy", detail=reason, dirty=False)
+        _mark_device_dirty(reason, why="probe_unhealthy")
+        return True
+    if state.eth_frozen and _eth_freeze_holds():
+        _hold_device_unverified(
+            "idle relift: foreign holder gone, eth-core heartbeat frozen — held, not reset", needs_eth_advancing=True
+        )
+        return True
+    if device_fault_reported:
+        # A fault the runtime named stands until a reset; that is the gate's call, never a read's.
+        fsm.note(f"foreign holder gone; runtime-reported fault stands until a gate resets: {device_fault_reported}")
+        return False
+    log("foreign holder gone and the mesh reads healthy — hold lifted")
+    health_event("device_relift", evidence=evidence, cause="foreign_holder_gone")
+    _clear_device_dirty(verified=True, why=f"idle relift: foreign holder gone ({gone}); verified healthy")
+    return True
+
+
 async def _attempt_idle_relift() -> None:
     """Re-verify a device HELD while idle and lift the hold once the mesh proves fit — never a reset.
 
@@ -2630,9 +2687,11 @@ async def _attempt_idle_relift() -> None:
     startup boot still awaiting its first fabric pass) arms neither — an enum+ARC pass proves
     nothing those were placed for — so it is never lifted here; when TT_DEVICE_MCP_GENERIC_HOLD_
     ESCALATE is set it instead escalates to the idle galaxy reset once past the ceiling (see
-    _generic_hold_escalate_enabled), rather than standing until a broker restart."""
+    _generic_hold_escalate_enabled), rather than standing until a broker restart. The one exception
+    is the foreign holder's own hold: each pass re-scans the holders, and once none is left it lifts
+    on the read-only pass the pre-job gate would have run (see _relift_foreign_hold)."""
     selfheal, fabric, generic = _idle_relift_armed()
-    if not ((selfheal or fabric or generic) and not device_op_active):
+    if not ((selfheal or fabric or generic or _foreign_hold_armed()) and not device_op_active):
         return
     global last_relift_monotonic
     if last_relift_monotonic and (time.monotonic() - last_relift_monotonic) < SELFHEAL_RELIFT_INTERVAL_SEC:
@@ -2664,7 +2723,8 @@ async def _attempt_idle_relift() -> None:
             # concurrent-reset hazard this module exists to prevent), so bail on it exactly as the
             # gate does.
             selfheal, fabric, generic = _idle_relift_armed()
-            if not (selfheal or fabric or generic) or fsm.record.dirty:
+            foreign_hold = _foreign_hold_armed()
+            if not (selfheal or fabric or generic or foreign_hold) or fsm.record.dirty:
                 return
             if await asyncio.to_thread(recovery_mechanism.scope_active):
                 return
@@ -2683,6 +2743,8 @@ async def _attempt_idle_relift() -> None:
                 fsm.on_outcome(outcome)
                 return outcome != OUTCOME_WAITING
 
+            if foreign_hold and await _relift_foreign_hold(expected, _log):
+                return
             if generic:
                 # A hold no read-only check can lift — the foreign holder that blocked verification,
                 # or a gate that errored out. enum+ARC reads clean across a wedged eth link, so a read
@@ -2696,6 +2758,8 @@ async def _attempt_idle_relift() -> None:
                     "escalates to the gate's galaxy reset once idle past the ceiling"
                 )
                 return
+            if foreign_hold:
+                return  # still held by a foreign process, and generic escalation is switched off
             # The fabric-unverified hold is the ONLY case that re-runs the traffic pass: enum+ARC
             # already passed and the fabric merely 77'd, so a retry that gets a real verdict is the
             # only thing that proves the mesh. The self-heal hold must never run it — a frozen core
@@ -2829,7 +2893,7 @@ def _maybe_spawn_idle_relift() -> None:
     if _relift_task is not None and not _relift_task.done():
         return
     selfheal, fabric, generic = _idle_relift_armed()
-    if not ((selfheal or fabric or generic) and not device_op_active):
+    if not ((selfheal or fabric or generic or _foreign_hold_armed()) and not device_op_active):
         return
     _relift_task = asyncio.create_task(_attempt_idle_relift())
 

@@ -104,7 +104,13 @@ job boundary.
 - **I13 — The gate never resets over a tenant.** A foreign holder (uid ≥ `MIN_TENANT_UID`,
   1000) skips the gate untouched: verification is deferred, an existing hold outlives the skip
   (`why=foreign_holder`), and `fsm.note` names the holder. The host rungs re-scan at fire time,
-  and an incomplete scan counts as a tenant.
+  and an incomplete scan counts as a tenant. The idle relift re-scans the holders for that hold on
+  its own clock, whatever `TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE` says: while one remains it re-names
+  it; once none is left (the holder exited, or its pid now names an unrelated process with no
+  device fd — the scan, not the recorded pid, decides) it runs the read-only pass the pre-job gate
+  would have (enum+ARC and the passive eth read, no traffic pass, no reset). Healthy lifts the hold;
+  unhealthy marks dirty (`probe_unhealthy`) for the gate's ladder; a frozen eth core becomes the
+  `eth_frozen` hold; a runtime-reported fault keeps it held for a gate's reset.
 - **I14 — Absence is never health.** An empty `/dev/tenstorrent` on a host whose baseline expects
   chips is every chip off the bus: mark dirty (`why=heartbeat`), hold, never release. A host that
   has never shown a chip skips with no hold — nothing there will ever verify.
@@ -616,7 +622,8 @@ lift it:
 - `fabric_unverified` — only a real healthy fabric verdict lifts; the perturbing retry is the
   opt-in fabric relift (I22).
 - `GENERIC_ESCALATE_WHYS = {gate_error, foreign_holder, startup_unverified}` — no read-only
-  story: enum+ARC prove nothing these were placed for, so they never lift on a read; past the
+  story: enum+ARC prove nothing these were placed for, so they never lift on a read (except a
+  `foreign_holder` hold whose holder is gone, I13: that read is the one the gate deferred); past the
   ceiling they escalate to the gate's own ladder (`TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE`, on by
   default) instead of standing until a broker restart.
 
@@ -711,7 +718,7 @@ refuses.
 | I10 | `tests/test_monitor.py::test_status_never_blocks_before_the_first_update`, `tests/test_monitor.py::test_update_overwrites_readings` |
 | I11 | `tests/test_device_safety.py::test_a_mesh_that_lost_chips_does_not_lower_its_own_bar`, `tests/test_device_safety.py::test_expected_chip_count_survives_an_unreadable_baseline`, `tests/test_device_safety.py::test_an_unreadable_baseline_with_no_chips_present_is_not_read_as_device_less`, `tests/test_device_safety.py::test_a_host_with_no_baseline_and_no_chips_stays_device_less` |
 | I12 | `tests/test_device_safety.py::test_the_pre_job_gate_never_runs_the_slow_fabric_pass`, `tests/test_device_safety.py::test_a_clean_job_does_not_pay_for_a_fabric_pass`, `tests/test_device_safety.py::test_a_failed_job_forces_a_fabric_pass_even_inside_the_quiet_window`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[540-False]`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[660-True]`, `tests/test_device_safety.py::test_fabric_interval_defaults_to_twenty_minutes` |
-| I13 | `tests/test_readopt.py::test_startup_hold_names_the_foreign_holder_blocking_the_verify`, `tests/test_device_safety.py::test_governor_never_reboots_over_a_tenant`, `tests/test_device_safety.py::test_a_tenant_arriving_before_the_reboot_decision_blocks_it`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_under_a_foreign_tenant` |
+| I13 | `tests/test_readopt.py::test_startup_hold_names_the_foreign_holder_blocking_the_verify`, `tests/test_device_safety.py::test_idle_relift_lifts_a_foreign_holder_hold_once_the_holder_is_gone`, `tests/test_device_safety.py::test_idle_relift_lifts_a_foreign_holder_hold_when_its_pid_was_reused`, `tests/test_device_safety.py::test_idle_relift_keeps_a_foreign_holder_hold_while_a_holder_remains`, `tests/test_device_safety.py::test_idle_relift_rescans_a_foreign_holder_hold_with_generic_escalation_off`, `tests/test_device_safety.py::test_foreign_holder_relift_never_resets_an_unhealthy_mesh`, `tests/test_device_safety.py::test_foreign_holder_relift_turns_a_frozen_eth_core_into_the_eth_hold`, `tests/test_device_safety.py::test_foreign_holder_relift_keeps_a_runtime_reported_fault_held`, `tests/test_device_safety.py::test_governor_never_reboots_over_a_tenant`, `tests/test_device_safety.py::test_a_tenant_arriving_before_the_reboot_decision_blocks_it`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_under_a_foreign_tenant` |
 | I14 | `tests/test_device_safety.py::test_an_empty_dev_dir_on_a_host_that_expects_chips_holds_not_releases`, `tests/test_device_safety.py::test_a_device_less_host_never_reads_an_empty_sysfs_as_a_drop` |
 | I15 | `tests/test_device_safety.py::test_an_unverified_clear_holds_the_device`, `tests/test_device_safety.py::test_a_gate_that_errored_holds`, `tests/test_device_safety.py::test_a_clean_device_is_not_held_by_an_unverified_clear`, `tests/test_device_safety.py::test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace`, `tests/test_device_safety.py::test_a_verified_clear_names_itself_and_records_it_was_verified` |
 | I16 | `tests/test_device_safety.py::test_a_frozen_eth_verdict_is_held_not_reset`, `tests/test_device_safety.py::test_a_frozen_eth_verdict_holds_the_door_even_when_not_pre_dirty`, `tests/test_device_safety.py::test_frozen_eth_reset_needs_both_kill_switches`, `tests/test_device_safety.py::test_eth_heartbeat_hang_reads_as_frozen_not_skipped` |
