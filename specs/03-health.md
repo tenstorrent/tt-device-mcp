@@ -605,6 +605,20 @@ Normative points the diagram compresses:
   is spec 04; the gate's obligations at the seam are: build honest Evidence, fire only the rung
   the router named, fold every outcome into `fsm.on_outcome()`, and journal every suppression.
 
+### Post-job clock check
+
+The runtime raises a chip's AI clock when it opens the device (Blackhole 1350 MHz, Wormhole
+1000) and lowers it only on a clean close (Blackhole 800, Wormhole 500). A job that dies
+without closing leaves its chips at the busy clock until something opens and closes them again.
+
+- After a job that did not complete with exit 0, once the post-job gate has run, the runner
+  reads each chip's `tt_aiclk` from sysfs (no device access) and, if any chip reads above
+  `IDLE_AICLK_MAX_MHZ` (default 800, `TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ`), journals one
+  `aiclk_busy_after_job` event and writes one line to the job's log.
+- It is a record only: it adds no device work and no time between jobs, and it never makes a
+  device dirty. Lowering the clock needs a device open and close, which is the fabric pass's
+  job (forced post-job on any non-success) or an operator's.
+
 ### Degraded hold & relift
 
 A held device is refused to tenants, surfaced on `/health` (`status: degraded` exactly while
@@ -762,6 +776,7 @@ refuses.
 | Startup health report | `tests/test_device_safety.py::test_startup_records_what_came_back_after_a_reboot`, `tests/test_device_safety.py::test_a_failing_startup_probe_never_blocks_the_broker_coming_up` |
 | Sampler idle coverage | `tests/test_device_safety.py::test_an_idle_all_gone_drop_is_confirmed_by_the_sampler_and_put_on_the_timeline`, `tests/test_device_safety.py::test_an_all_gone_drop_on_a_held_not_dirty_box_still_journals_and_goes_dirty`, `tests/test_device_safety.py::test_an_all_chips_blackout_needs_two_samples_before_it_dirties_the_device`, `tests/test_device_safety.py::test_sampler_drives_the_idle_hold_ledger` |
 | Eth/fabric exit-code contract | `tests/test_eth_probe.py::test_exit_laundering[0-True]`, `tests/test_eth_probe.py::test_exit_laundering[3-False]`, `tests/test_eth_probe.py::test_exit_laundering[77-None]`, `tests/test_eth_probe.py::test_hung_read_is_skipped_not_frozen`, `tests/test_fabric_probe.py::test_fabric_classification[0-all links healthy-True]`, `tests/test_fabric_probe.py::test_fabric_classification[None-partial output before hang-False]` |
+| B-Post-job clock check | `tests/test_device_safety.py::test_aiclk_left_busy_names_only_chips_above_the_idle_clock`, `tests/test_device_safety.py::test_a_job_that_left_chips_busy_is_recorded` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
