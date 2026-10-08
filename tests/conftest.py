@@ -22,6 +22,7 @@ import tt_device_mcp.device_holders as device_holders
 import tt_device_mcp.server as srv
 from tt_device_mcp import privileges
 from tt_device_mcp.fsm import ServerFsm
+from tt_device_mcp.health import bmc_capture
 from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState
@@ -414,6 +415,21 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
         raise AssertionError("a test reached the real per-tray BMC reset; _fire_ubb_reset must be mocked")
 
     monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
+
+    # The tray-down prelude (spec 04 I19) rescans the bus and reads the BMC: never the real sysfs
+    # or ipmitool from the suite. Its reads answer "not run in tests", so every gate/ladder test
+    # still passes through the prelude unchanged. Its onset latch lives on the module-global
+    # GalaxyRecovery, so every test starts with none.
+    def _no_rescan_in_tests():
+        raise OSError("a test reached the real PCI rescan; _pci_rescan must be mocked")
+
+    def _no_bmc_reads_in_tests(argv, **k):
+        return subprocess.CompletedProcess(argv, 0, stdout="not run in tests\n", stderr="")
+
+    monkeypatch.setattr(recovery_galaxy, "_pci_rescan", _no_rescan_in_tests)
+    monkeypatch.setattr(bmc_capture, "_RUN", _no_bmc_reads_in_tests)
+    if getattr(srv, "galaxy_recovery", None) is not None:
+        srv.galaxy_recovery.tray_down_episode_end()
 
     _install_spawn_tripwire(monkeypatch, allow_device_spawns=device_marked)
 
