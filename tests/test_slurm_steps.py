@@ -821,6 +821,48 @@ def test_post_step_malformed_exit_code_does_not_500(monkeypatch, clear_job_state
         current_peer_uid.reset(tok)
 
 
+@pytest.mark.parametrize(
+    "armed, exit_code, want_eth, want_fabric",
+    [
+        (True, 0, True, False),  # clean step, armed: the passive read, no traffic pass
+        (False, 0, False, False),  # disarmed: the old snapshot-only clean exit
+        (True, 1, False, True),  # failed step: the forced traffic pass, which reads eth itself
+    ],
+)
+def test_a_clean_post_step_on_an_armed_host_asks_for_the_eth_read(
+    monkeypatch, clear_job_state, tmp_path, armed, exit_code, want_eth, want_fabric
+):
+    """Spec 03 I30. A Slurm step that exits 0 hands the next job a mesh only enum+ARC looked at,
+    the same hole the in-broker post-job gate closed. Through the real route, a clean step on an
+    armed host asks the probe pass for the eth read and no traffic pass."""
+    _present_chips(monkeypatch, tmp_path)
+    _quiet_gate(monkeypatch)
+    _no_holders(monkeypatch)
+    fsm_healthy(srv)
+    srv.last_fabric_check_monotonic = srv.time.monotonic()  # a pass ran recently: none is owed
+    monkeypatch.setattr(srv, "eth_check_armed", armed)
+    monkeypatch.setattr(srv, "_device_liveness_reason", lambda: "")
+    monkeypatch.setattr(
+        srv, "reclaim_foreign_holders", lambda **_: srv.ReclaimResult(signalled=[], survivors=[], scan_complete=True)
+    )
+    seen = []
+
+    async def verify(expected, log, run_fabric=True, run_eth=False, phase=None, **_):
+        seen.append((phase, run_eth, run_fabric))
+        return True, {"snapshot": {"ok": True}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+    tok = current_peer_uid.set(0)
+    try:
+        with _client() as c:
+            body = c.post("/api/tt_device_post_step", json={"exit_code": exit_code}).json()
+        assert seen == [("post-step", want_eth, want_fabric)], f"post-step asked the probe pass for {seen}"
+        assert body["status"] == "ok", body
+    finally:
+        current_peer_uid.reset(tok)
+
+
 def test_post_step_non_boolean_reclaim_is_refused_not_silently_run(monkeypatch, clear_job_state):
     """Python's `bool("false")` is True: a naive coercion would read the JSON string "false" as
     "run the reclaim" and SIGTERM/SIGKILL another user's processes they explicitly asked to

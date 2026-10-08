@@ -20,10 +20,13 @@ import sys
 
 import anyio
 import httpx2
+from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
+from mcp.shared.exceptions import MCPError
+from mcp.types import CONNECTION_CLOSED, INVALID_REQUEST
 
 from tt_device_mcp.constants import resolve_socket, user_socket_path
 
@@ -110,6 +113,84 @@ _RECONNECT_TRIES = 12
 _RECONNECT_BACKOFF = 1.0  # seconds; ~12s covers a service restart window
 
 
+async def _call_upstream(url: str, client_factory, op, resend_safe: bool = True):
+    """Run ``op(session)`` against a fresh upstream session, retrying transient
+    connection failures (broker mid-restart / socket briefly absent).
+
+    Unless ``resend_safe``, a request is retried only while it provably never reached a
+    tool: the connect and initialize phase, a refused connect, a session the broker does
+    not know. Past that the broker may already be running it (a job submit, a reset), so
+    a stream cut is reported to the caller, never re-sent.
+    """
+    last_exc = None
+    for attempt in range(_RECONNECT_TRIES):
+        sent = False
+        answer = failure = None
+        try:
+            # Ours to close: the SDK only closes a client it created itself.
+            async with client_factory() as http_client:
+                async with streamable_http_client(url, http_client=http_client) as (read, write):
+                    async with ClientSession(read, write) as upstream:
+                        await upstream.initialize()
+                        sent = True
+                        try:
+                            answer = await op(upstream)
+                        except MCPError as exc:
+                            failure = exc  # caught here, before the SDK's task groups wrap it
+        except Exception as exc:  # noqa: BLE001 - transport errors are retryable; re-raised below
+            failure = failure or exc
+        if answer is not None:
+            return answer  # a teardown failure after the answer changes nothing
+        if sent and not resend_safe and not _never_delivered(failure):
+            if isinstance(failure, MCPError) and failure.code != CONNECTION_CLOSED:
+                raise failure  # the broker's own error reply is final
+            _log(f"broker connection lost after the call was sent ({_describe(failure)}); not re-sending")
+            return _lost_call_result(failure)
+        last_exc = failure
+        _log(f"broker unavailable ({type(failure).__name__}); retry {attempt + 1}/{_RECONNECT_TRIES}")
+        await anyio.sleep(_RECONNECT_BACKOFF)
+    raise RuntimeError(f"broker unreachable after {_RECONNECT_TRIES} retries: {last_exc!r}")
+
+
+def _leaves(exc: BaseException) -> list:
+    # The SDK's task groups wrap the transport errors, sometimes more than one.
+    if getattr(exc, "exceptions", None):
+        return [leaf for sub in exc.exceptions for leaf in _leaves(sub)]
+    return [exc]
+
+
+def _describe(exc: BaseException) -> str:
+    return "; ".join(f"{type(leaf).__name__}: {leaf}" for leaf in _leaves(exc))
+
+
+# A broker restarted mid-session answers the old session id with a 404: the server says
+# "Session not found", and the SDK spells a bare 404 "Session terminated".
+_UNKNOWN_SESSION = ("Session not found", "Session terminated")
+
+
+def _never_delivered(exc: BaseException) -> bool:
+    """The request cannot have reached a tool: the connect failed, so no byte was sent,
+    or the broker did not know the session. Every wrapped error must say so."""
+
+    def refused(leaf):
+        if isinstance(leaf, (httpx2.ConnectError, httpx2.ConnectTimeout)):
+            return True
+        return isinstance(leaf, MCPError) and leaf.code == INVALID_REQUEST and leaf.message in _UNKNOWN_SESSION
+
+    return all(refused(leaf) for leaf in _leaves(exc))
+
+
+def _lost_call_result(exc: BaseException) -> types.CallToolResult:
+    """The tool call was sent but no answer came back. Re-sending could run a job or a reset twice,
+    so the caller gets an error and decides after checking state."""
+    msg = (
+        f"no answer from the device broker after this tool call was sent ({_describe(exc)}). "
+        "The broker may have run it, or may still be running it. It was not re-sent. "
+        "Check tt_device_queue_status or tt_device_recent_jobs before calling it again."
+    )
+    return types.CallToolResult(content=[types.TextContent(type="text", text=msg)], is_error=True)
+
+
 async def run_shim(url: str, client_factory) -> None:
     """Serve a transparent stdio proxy that reconnects to ``url`` per call.
 
@@ -119,34 +200,23 @@ async def run_shim(url: str, client_factory) -> None:
     """
     asyncio.get_running_loop().set_exception_handler(_quiet_teardown_handler)
 
-    async def _call_upstream(op):
-        """Run ``op(session)`` against a fresh upstream session, retrying transient
-        connection failures (broker mid-restart / socket briefly absent)."""
-        last_exc = None
-        for attempt in range(_RECONNECT_TRIES):
-            try:
-                # Ours to close: the SDK only closes a client it created itself.
-                async with client_factory() as http_client:
-                    async with streamable_http_client(url, http_client=http_client) as (read, write):
-                        async with ClientSession(read, write) as upstream:
-                            await upstream.initialize()
-                            return await op(upstream)
-            except Exception as exc:  # noqa: BLE001 - transport errors are retryable; re-raised below
-                last_exc = exc
-                _log(f"broker unavailable ({type(exc).__name__}); retry {attempt + 1}/{_RECONNECT_TRIES}")
-                await anyio.sleep(_RECONNECT_BACKOFF)
-        raise RuntimeError(f"broker unreachable after {_RECONNECT_TRIES} retries: {last_exc!r}")
-
     # Upstream results are already the wire types the client expects, so returning them
     # unaltered preserves is_error, structured content and the pagination cursor.
     async def _on_list_tools(_ctx, params):
-        return await _call_upstream(lambda s: s.list_tools(params=params))
+        return await _call_upstream(url, client_factory, lambda s: s.list_tools(params=params))
 
     async def _on_call_tool(_ctx, params):
         # `_meta` carries the progress token, and from protocol 2026-07-28 the log level.
         # Without it report_progress and ctx.info are no-ops broker-side. What they emit
         # lands on this upstream session; nothing forwards it to the stdio client.
-        return await _call_upstream(lambda s: s.call_tool(params.name, params.arguments, meta=params.meta))
+        return await _call_upstream(
+            url,
+            client_factory,
+            # send_request, not call_tool: call_tool follows a result with a tools/list to
+            # validate it, a second round trip that could fail after the answer arrived.
+            lambda s: s.send_request(types.CallToolRequest(params=params), types.CallToolResult),
+            resend_safe=False,
+        )
 
     proxy = Server("tt-device-mcp", on_list_tools=_on_list_tools, on_call_tool=_on_call_tool)
 
