@@ -321,6 +321,13 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # Left set, a prior test's value would make the next runner test wait (or not) unexpectedly.
     # raising=False so a base tree without the cooldown (a fails-on-base stash) still sets up.
     monkeypatch.setattr(srv, "last_job_end_monotonic", 0.0, raising=False)
+    # The eth self-test retry's latches. Left set by a test that ran the self-test, any later test
+    # that ticks the idle sampler on a HEALTHY device would start a real retry task. raising=False
+    # so a base tree without the retry (a fails-on-base stash) still sets up cleanly.
+    monkeypatch.setattr(srv, "eth_rearm_retryable", False, raising=False)
+    monkeypatch.setattr(srv, "_last_eth_rearm_monotonic", 0.0, raising=False)
+    monkeypatch.setattr(srv, "_eth_rearm_task", None, raising=False)
+    monkeypatch.setattr(srv, "post_job_gate_pending", False, raising=False)
     # The per-owner burst-cap ledger. Left populated, one test's submissions would count against
     # the next test's cap. Fresh dict so state never bleeds; raising=False so a base tree without
     # the cap (a fails-on-base stash) still sets up cleanly.

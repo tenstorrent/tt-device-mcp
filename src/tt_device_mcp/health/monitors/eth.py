@@ -32,6 +32,7 @@ mesh or, worse, hides a wedge:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -310,6 +311,17 @@ def classify_exit(rc: Optional[int]) -> tuple[Optional[bool], str]:
     if rc is None:
         return None, "eth-heartbeat read timed out without reaching a verdict"
     return None, f"probe exited {rc} (not a frozen verdict)"
+
+
+_LINK_COUNT = re.compile(r"^eth-links: measured=(\d+)\b", re.MULTILINE)
+
+
+def parse_link_count(text: str) -> Optional[int]:
+    """How many up-link cores the built-in probe measured, from its ``eth-links: measured=<n>``
+    line, or ``None`` when the output has no such line (an older probe, an attach failure, or an
+    operator override, whose output is never parsed)."""
+    m = _LINK_COUNT.search(text or "")
+    return int(m.group(1)) if m else None
 
 
 async def check(
