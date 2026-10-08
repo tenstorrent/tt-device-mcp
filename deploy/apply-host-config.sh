@@ -197,6 +197,10 @@ cat > "$unit_dest" <<UNIT
 [Unit]
 Description=Tenstorrent device MCP broker (multi-tenant arbiter)
 After=network.target
+# The startup fabric pass needs the 1G hugepage pool; start after its mount where the host has one
+# (a Wants= on a unit the host lacks is a no-op). The broker still waits for the page count itself.
+Wants=dev-hugepages\x2d1G.mount
+After=dev-hugepages\x2d1G.mount
 [Service]
 User=root
 # Type=notify + WatchdogSec: the broker pings the watchdog from its event loop;
