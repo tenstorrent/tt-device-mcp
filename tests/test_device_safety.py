@@ -10748,7 +10748,9 @@ def test_an_unparseable_hold_clock_is_never_restored(monkeypatch, tmp_path, lega
     assert srv._restore_hold_episode() == ""
 
 
-@pytest.mark.parametrize("record", ['{"since": "2026-08-1', "", "{}", "[]", '{"since": "2026-01-01T00:00:00", "boot_id": "boot-a"}'])
+@pytest.mark.parametrize(
+    "record", ['{"since": "2026-08-1', "", "{}", "[]", '{"since": "2026-01-01T00:00:00", "boot_id": "boot-a"}']
+)
 def test_a_corrupt_or_foreign_sidecar_falls_back_to_btime(monkeypatch, tmp_path, record):
     """The sidecar only qualifies the start it names. A truncated one, or one naming another start
     (an older broker rewrote the clock after it), says nothing about this start's boot."""
