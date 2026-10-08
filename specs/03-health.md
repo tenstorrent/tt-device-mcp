@@ -422,11 +422,12 @@ job boundary.
   77/126/127: wrong architecture, no telemetry support) disarms the feature for the process, loudly
   (`aiclk_ceiling_disarmed`), rather than holding healthy silicon on a configuration error.
 - **I36 — A failed job that never reached the device does not force a second pass.** A FAILED
-  job with a normal exit (not a signal death, timeout, kill or hang) that ran under
-  `NOOP_FAILURE_MAX_RUNTIME_SEC` (2s) (`_job_never_reached_device`) could not have opened the
-  device. The exit code alone never qualifies a job: under `bash -c` with `set -e`, a script that
-  used the device and then hit a missing or non-executable command also exits 127/126. Its
-  post-job gate drops the forced fabric pass when all of these hold:
+  job with a normal exit code of its own (not a signal death, timeout, kill or hang, and never a
+  missing exit code) that ran under `NOOP_FAILURE_MAX_RUNTIME_SEC` (2s)
+  (`_job_never_reached_device`) could not have opened the device. The exit code alone never
+  qualifies a job: under `bash -c` with `set -e`, a script that used the device and then hit a
+  missing or non-executable command also exits 127/126. Its post-job gate drops the forced
+  fabric pass when all of these hold:
   the device is HEALTHY and not dirty, the eth rung is armed (I28), the last fabric verdict
   (`HealthMonitor.last_fabric_ok`) is OK, and the gate's last pass with a verdict is younger than
   `TT_DEVICE_MCP_NOOP_FAILURE_FABRIC_FRESH_SEC` (default 300s). The gate then runs the passive eth
@@ -434,7 +435,8 @@ job boundary.
   read with no verdict runs the full pass in the same gate, a link-count-drop skip included (the
   interval that rate-limits that skip after a clean exit does not apply here). Any condition
   missing, the failed job pays the full pass as before. Only the in-broker job runner says a job
-  never reached the device: a Slurm `post-step` and a runner error still force the pass.
+  never reached the device: a Slurm `post-step` still forces the pass, and so does a job the runner
+  ended on its own error, before or after the spawn, however fast and whatever its exit code.
   Rationale: blx01 lost its host ~9s into a pass forced 2s after a green one by a job that had
   failed in 0s on a missing directory; the pass is the heaviest load the broker puts on the mesh,
   and that job told it nothing.
@@ -946,7 +948,7 @@ refuses.
 | I32 | `tests/test_device_safety.py::test_a_stale_verdict_runs_the_heartbeat_once_before_dispatch`, `tests/test_device_safety.py::test_a_fresh_verdict_runs_no_recheck`, `tests/test_device_safety.py::test_a_failing_recheck_holds_the_job_at_the_door`, `tests/test_device_safety.py::test_the_dispatch_recheck_never_runs_the_fabric_pass`, `tests/test_device_safety.py::test_a_frozen_eth_read_at_the_recheck_holds_not_resets`, `tests/test_device_safety.py::test_the_dispatch_recheck_off_switch_tenant_and_errors` |
 | I33 | `tests/test_startup_fabric_hugepages.py::test_hugepages_shortfall_reports_a_short_pool_behind_identity_or_no_iommu`, `tests/test_startup_fabric_hugepages.py::test_hugepages_shortfall_is_none_behind_a_translating_iommu`, `tests/test_startup_fabric_hugepages.py::test_hugepages_shortfall_is_none_without_a_readable_pool`, `tests/test_startup_fabric_hugepages.py::test_the_broker_waits_only_when_the_expected_chip_count_is_set`, `tests/test_startup_fabric_hugepages.py::test_startup_fabric_pass_waits_for_hugepages_then_runs`, `tests/test_startup_fabric_hugepages.py::test_startup_records_cannot_check_when_hugepages_stay_short`, `tests/test_startup_fabric_hugepages.py::test_a_dirty_carried_episode_still_runs_the_startup_gate` |
 | I34 | `tests/test_startup_fabric_hugepages.py::test_a_77_only_hold_arms_the_fabric_relift_not_the_generic_escalation`, `tests/test_startup_fabric_hugepages.py::test_the_77_only_relift_has_an_off_switch`, `tests/test_startup_fabric_hugepages.py::test_a_fabric_hold_after_a_measured_fail_is_not_77_only`, `tests/test_startup_fabric_hugepages.py::test_the_77_only_relift_reruns_the_fabric_pass_and_never_resets`, `tests/test_startup_fabric_hugepages.py::test_the_77_only_relift_waits_for_hugepages`, `tests/test_startup_fabric_hugepages.py::test_the_hold_deadline_never_forces_a_reset_on_a_77_only_hold`, `tests/test_startup_fabric_hugepages.py::test_the_hold_deadline_still_escalates_a_measured_fabric_fault`, `tests/test_startup_fabric_hugepages.py::test_the_forced_escalation_bails_on_a_77_only_hold`, `tests/test_device_safety.py::test_a_startup_gate_77_leaves_a_77_only_hold_that_no_path_resets` |
-| I36 | `tests/test_device_safety.py::test_a_failed_job_that_never_reached_the_device_skips_the_forced_pass_after_a_fresh_green_one`, `tests/test_device_safety.py::test_a_failed_job_still_forces_the_fabric_pass_unless_every_skip_condition_holds`, `tests/test_device_safety.py::test_a_frozen_eth_read_after_a_skipped_forced_pass_holds_without_a_reset`, `tests/test_device_safety.py::test_an_eth_read_with_no_verdict_after_a_skipped_forced_pass_runs_the_pass`, `tests/test_device_safety.py::test_job_never_reached_device`, `tests/test_device_safety.py::test_the_runner_tells_the_post_job_gate_when_a_failed_job_never_reached_the_device` |
+| I36 | `tests/test_device_safety.py::test_a_failed_job_that_never_reached_the_device_skips_the_forced_pass_after_a_fresh_green_one`, `tests/test_device_safety.py::test_a_failed_job_still_forces_the_fabric_pass_unless_every_skip_condition_holds`, `tests/test_device_safety.py::test_a_frozen_eth_read_after_a_skipped_forced_pass_holds_without_a_reset`, `tests/test_device_safety.py::test_an_eth_read_with_no_verdict_after_a_skipped_forced_pass_runs_the_pass`, `tests/test_device_safety.py::test_job_never_reached_device`, `tests/test_device_safety.py::test_the_runner_tells_the_post_job_gate_when_a_failed_job_never_reached_the_device`, `tests/test_device_safety.py::test_a_runner_error_still_forces_the_post_job_fabric_pass` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |

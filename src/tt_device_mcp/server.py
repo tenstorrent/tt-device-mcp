@@ -5665,8 +5665,11 @@ async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> Non
 def _job_never_reached_device(job: "Job") -> bool:
     """True when a failed job ended before it could have opened the device: a normal FAILED exit
     (never a signal death, timeout, kill or hang) that ran under ``NOOP_FAILURE_MAX_RUNTIME_SEC``,
-    whatever its exit code: a 126/127 can come after device work. Spec 03 I36."""
-    if job.status != JobStatus.FAILED or _is_wedge_risk_exit(job.status, job.exit_code):
+    whatever its exit code: a 126/127 can come after device work. A job with no exit code of its
+    own did not end by itself (a runner error ended it), so it never qualifies. Spec 03 I36."""
+    if job.status != JobStatus.FAILED or not isinstance(job.exit_code, int):
+        return False
+    if _is_wedge_risk_exit(job.status, job.exit_code):
         return False
     runtime = job.runtime_sec
     return runtime is not None and 0 <= runtime < NOOP_FAILURE_MAX_RUNTIME_SEC
@@ -6846,6 +6849,7 @@ async def _job_runner_loop():
 
         cancelled = False  # set if the broker is shutting down (don't kill the job)
         terminal_note = ""  # timeout/exception marker, appended to error at the end
+        runner_error = False  # the broker, not the job, ended it: never a no-op failure (03 I36)
         privsep_prefix = None  # set below; read by the finally even when setup raised first
         proc = None
         watchdog = None
@@ -7120,6 +7124,7 @@ export {JOB_TAG_ENV}={job_tag}
                 logger.warning(f"JOB_RUNNER job_id={job_id} TIMEOUT after {job.timeout_sec}s")
 
         except Exception as e:
+            runner_error = True
             async with get_lock():
                 job.status = JobStatus.FAILED
             terminal_note = f"\n[EXCEPTION: {e}]"
@@ -7332,7 +7337,7 @@ export {JOB_TAG_ENV}={job_tag}
                     await _verify_device_after_job(
                         job_log_file,
                         job_failed=job_failed,
-                        noop_failure=job_failed and _job_never_reached_device(job),
+                        noop_failure=job_failed and not runner_error and _job_never_reached_device(job),
                     )
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:
