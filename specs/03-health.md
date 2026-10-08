@@ -105,7 +105,7 @@ job boundary.
   proves the host has shown chips).
 - **I12 — The fabric traffic pass never runs on a submitter's clock.** Pre-job the gate never
   runs it, dirty or not — the flag is already the answer. It runs post-job on a failed job
-  (forced, unless I33 lets a fresh green pass stand in), at startup (forced), inside the recovery ladder, after an operator's reset of a mesh
+  (forced, unless I36 lets a fresh green pass stand in), at startup (forced), inside the recovery ladder, after an operator's reset of a mesh
   (spec 04 I13 — the operator's clock, not a submitter's), on a `run_fabric` caller only when
   no pass is fresher than `FABRIC_CHECK_MIN_INTERVAL_SEC` (default 1200s), and post-job on a
   clean exit only when that exit's eth read reached no verdict (I30; a link-count-drop skip only
@@ -386,7 +386,7 @@ job boundary.
   it waited ends it without a read. A re-check that raises is logged and is not a verdict: the
   device is not marked. A fresh verdict costs nothing, and the re-check never runs inside `_device_liveness_reason`, which answers
   status queries and must not sleep.
-- **I33 — A failed job that never reached the device does not force a second pass.** A FAILED
+- **I36 — A failed job that never reached the device does not force a second pass.** A FAILED
   job with a normal exit (not a signal death, timeout, kill or hang) that ran under
   `NOOP_FAILURE_MAX_RUNTIME_SEC` (2s) (`_job_never_reached_device`) could not have opened the
   device. The exit code alone never qualifies a job: under `bash -c` with `set -e`, a script that
@@ -705,7 +705,7 @@ Normative points the diagram compresses:
   re-derives it mid-pass.
 - `full` (run the fabric pass) is `with_recover and (not pre-job) and (dirty or force_fabric or
   (run_fabric and stale))` — I12, I29; a failed job that never reached the device clears
-  `force_fabric` first when a fresh green pass stands in (I33). A clean post-job or post-step exit pays no fabric pass;
+  `force_fabric` first when a fresh green pass stands in (I36). A clean post-job or post-step exit pays no fabric pass;
   when the eth rung is armed it pays the passive eth read instead (~1s, the read bounded at 10s),
   and the fabric pass only if that read reached no verdict (I30). A read-only pass never pays
   regardless of phase, dirty, or force_fabric.
@@ -816,7 +816,7 @@ refuses.
 - **The fabric pass is billed to nobody.** It is both the authoritative check and the heaviest
   perturbation the broker aims at the mesh (a host was lost with one in flight), so it runs where
   it costs no submitter and no healthy silicon: post-job on failure (not after a fresh green
-  pass when the job never reached the device, I33), post-job on a clean exit
+  pass when the job never reached the device, I36), post-job on a clean exit
   whose eth read reached no verdict (I30), startup, ladder, stale-window — never pre-job (I12),
   never on a frozen core (I9), never as a relift default (I22).
 - **Asymmetric error costs** (`health.core.Verdict`): a needless reset of an idle device costs
@@ -902,7 +902,7 @@ refuses.
 | I30 (a clean Slurm post-step reads eth on an armed host, with the same hold and fallback; a failed step and the read-only pre-step do not) | `tests/test_slurm_steps.py::test_a_clean_post_step_on_an_armed_host_asks_for_the_eth_read`, `tests/test_device_safety.py::test_a_frozen_eth_read_after_a_clean_job_holds_without_a_reset`, `tests/test_device_safety.py::test_a_clean_exit_eth_read_with_no_verdict_runs_the_fabric_pass_in_the_same_gate` (both parametrized over post-job/post-step) |
 | I31 | `tests/test_device_safety.py::test_a_short_chip_count_is_a_degraded_reason_at_dispatch`, `tests/test_device_safety.py::test_the_sampler_dirties_a_short_count_after_two_samples`, `tests/test_device_safety.py::test_a_host_with_no_baseline_is_unchanged_by_the_count_check`, `tests/test_device_safety.py::test_a_short_count_under_an_off_bus_hold_stays_held`, `tests/test_device_safety.py::test_health_checks_off_skip_the_count_check` |
 | I32 | `tests/test_device_safety.py::test_a_stale_verdict_runs_the_heartbeat_once_before_dispatch`, `tests/test_device_safety.py::test_a_fresh_verdict_runs_no_recheck`, `tests/test_device_safety.py::test_a_failing_recheck_holds_the_job_at_the_door`, `tests/test_device_safety.py::test_the_dispatch_recheck_never_runs_the_fabric_pass`, `tests/test_device_safety.py::test_a_frozen_eth_read_at_the_recheck_holds_not_resets`, `tests/test_device_safety.py::test_the_dispatch_recheck_off_switch_tenant_and_errors` |
-| I33 | `tests/test_device_safety.py::test_a_failed_job_that_never_reached_the_device_skips_the_forced_pass_after_a_fresh_green_one`, `tests/test_device_safety.py::test_a_failed_job_still_forces_the_fabric_pass_unless_every_skip_condition_holds`, `tests/test_device_safety.py::test_a_frozen_eth_read_after_a_skipped_forced_pass_holds_without_a_reset`, `tests/test_device_safety.py::test_an_eth_read_with_no_verdict_after_a_skipped_forced_pass_runs_the_pass`, `tests/test_device_safety.py::test_job_never_reached_device`, `tests/test_device_safety.py::test_the_runner_tells_the_post_job_gate_when_a_failed_job_never_reached_the_device` |
+| I36 | `tests/test_device_safety.py::test_a_failed_job_that_never_reached_the_device_skips_the_forced_pass_after_a_fresh_green_one`, `tests/test_device_safety.py::test_a_failed_job_still_forces_the_fabric_pass_unless_every_skip_condition_holds`, `tests/test_device_safety.py::test_a_frozen_eth_read_after_a_skipped_forced_pass_holds_without_a_reset`, `tests/test_device_safety.py::test_an_eth_read_with_no_verdict_after_a_skipped_forced_pass_runs_the_pass`, `tests/test_device_safety.py::test_job_never_reached_device`, `tests/test_device_safety.py::test_the_runner_tells_the_post_job_gate_when_a_failed_job_never_reached_the_device` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |

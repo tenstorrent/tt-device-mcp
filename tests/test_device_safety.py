@@ -3109,7 +3109,7 @@ async def test_a_link_drop_after_clean_jobs_pays_at_most_one_fabric_pass_per_int
 
 
 def _noop_failure_gate(monkeypatch, tmp_path, *, eth=(True, "all active eth cores advancing"), chips=4, armed=True):
-    """A post-job gate after a failed job, with a green fabric pass 2s ago. Spec 03 I33."""
+    """A post-job gate after a failed job, with a green fabric pass 2s ago. Spec 03 I36."""
     calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=eth, chips=chips, armed=armed)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", True)
     srv.last_fabric_check_monotonic = srv.time.monotonic() - 2.0
@@ -3120,7 +3120,7 @@ def _noop_failure_gate(monkeypatch, tmp_path, *, eth=(True, "all active eth core
 async def test_a_failed_job_that_never_reached_the_device_skips_the_forced_pass_after_a_fresh_green_one(
     monkeypatch, tmp_path
 ):
-    """Spec 03 I33. blx01: a job failed in 0s on a missing directory, the gate forced a full traffic
+    """Spec 03 I36. blx01: a job failed in 0s on a missing directory, the gate forced a full traffic
     pass 2s after a green one, and the host died ~9s into it. That job proved nothing about the
     mesh: the gate reads the eth heartbeat as for a clean exit and runs no traffic pass."""
     calls = _noop_failure_gate(monkeypatch, tmp_path)
@@ -3140,7 +3140,7 @@ async def test_a_failed_job_that_never_reached_the_device_skips_the_forced_pass_
     ["job-touched-device", "stale-pass", "no-pass-yet", "last-pass-failed", "no-verdict-yet", "disarmed", "dirty"],
 )
 async def test_a_failed_job_still_forces_the_fabric_pass_unless_every_skip_condition_holds(monkeypatch, tmp_path, case):
-    """Spec 03 I33. The skip needs all of: a job that never reached the device, a green verdict
+    """Spec 03 I36. The skip needs all of: a job that never reached the device, a green verdict
     under NOOP_FAILURE_FABRIC_FRESH_SEC old, an armed eth rung and a clean HEALTHY device. Missing
     any one, a failed job pays the full pass as before."""
     calls = _noop_failure_gate(monkeypatch, tmp_path, armed=case != "disarmed")
@@ -3163,7 +3163,7 @@ async def test_a_failed_job_still_forces_the_fabric_pass_unless_every_skip_condi
 
 @pytest.mark.asyncio
 async def test_a_frozen_eth_read_after_a_skipped_forced_pass_holds_without_a_reset(monkeypatch, tmp_path):
-    """Spec 03 I33 + I16. The eth read that replaces the forced pass keeps its verdict: a frozen core
+    """Spec 03 I36 + I16. The eth read that replaces the forced pass keeps its verdict: a frozen core
     holds the door with no reset and no traffic pass."""
     calls = _noop_failure_gate(monkeypatch, tmp_path, eth=(False, "a frozen active-eth core: 0-25"))
 
@@ -3180,7 +3180,7 @@ async def test_a_frozen_eth_read_after_a_skipped_forced_pass_holds_without_a_res
     "detail", ["eth probe timed out after 9s", "skipped (eth links unverified): measured 11 of 12 links"]
 )
 async def test_an_eth_read_with_no_verdict_after_a_skipped_forced_pass_runs_the_pass(monkeypatch, tmp_path, detail):
-    """Spec 03 I33. The skip rests on the eth read being OK. A read with no verdict runs the full pass
+    """Spec 03 I36. The skip rests on the eth read being OK. A read with no verdict runs the full pass
     in the same gate, a link-count-drop skip included: the fresh pass that rate-limits that skip after
     a clean exit does not stand in for it after a failed job."""
     from tt_device_mcp.health.monitor import ETH_LINK_DROP_SKIP
@@ -3217,7 +3217,7 @@ async def test_an_eth_read_with_no_verdict_after_a_skipped_forced_pass_runs_the_
     ],
 )
 def test_job_never_reached_device(status, exit_code, runtime, expected):
-    """Spec 03 I33: which failed jobs count as never having reached the device."""
+    """Spec 03 I36: which failed jobs count as never having reached the device."""
     start = datetime(2026, 10, 8, 12, 0, 0)
     job = srv.Job(id="091", owner="tenant", workspace="/tmp", command="cd missing && run", queued_at="t")
     job.status = srv.JobStatus[status]
@@ -12646,7 +12646,7 @@ async def test_the_dispatch_recheck_off_switch_tenant_and_errors(monkeypatch):
 async def test_the_runner_tells_the_post_job_gate_when_a_failed_job_never_reached_the_device(
     monkeypatch, clear_job_state, command, exit_code, max_runtime, expected
 ):
-    """Spec 03 I33. The runner hands the gate its no-op verdict for a failed job: blx01's job 091
+    """Spec 03 I36. The runner hands the gate its no-op verdict for a failed job: blx01's job 091
     (`cd` into a missing directory, 0s) is one, and the same exit past the runtime bound is not.
     A 127 is held to the same bound: a `set -e` script can exit 127 after device work."""
     _free_device_lock(monkeypatch)

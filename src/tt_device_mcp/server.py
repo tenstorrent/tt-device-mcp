@@ -1157,7 +1157,7 @@ GONE_CHIP_CONFIRM_SETTLE_SEC = 2.0
 # actually requires. On a clean exit, nothing is owed.
 FABRIC_CHECK_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_INTERVAL_SEC", "1200"))
 last_fabric_check_monotonic: float = 0.0
-# A failed job that never reached the device (spec 03 I33) does not force the traffic pass when
+# A failed job that never reached the device (spec 03 I36) does not force the traffic pass when
 # one finished green this recently: it ran in under NOOP_FAILURE_MAX_RUNTIME_SEC, so it says
 # nothing about the mesh. blx01 lost its host ~9s into a pass forced 2s after a green one by a
 # job that failed in 0s on a missing directory. The exit code alone never qualifies: jobs run
@@ -3728,7 +3728,7 @@ async def device_health_gate(
     ``noop_failure`` says the failed job behind ``force_fabric`` never reached the device (see
     ``_job_never_reached_device``). On a HEALTHY, clean device whose last fabric verdict was OK
     less than ``NOOP_FAILURE_FABRIC_FRESH_SEC`` ago, and with the eth rung armed, the forced pass
-    becomes the passive eth read of a clean exit (spec 03 I33)."""
+    becomes the passive eth read of a clean exit (spec 03 I36)."""
 
     def _log(msg: str) -> None:
         if logger:
@@ -3823,7 +3823,7 @@ async def device_health_gate(
         # it most needs to run — freshly-booted silicon — is the one it would skip.
         never_run = last_fabric_check_monotonic == 0.0
         stale = never_run or (time.monotonic() - last_fabric_check_monotonic) > FABRIC_CHECK_MIN_INTERVAL_SEC
-        # A failed job that never reached the device (I33) owes no forced pass on a mesh a green
+        # A failed job that never reached the device (I36) owes no forced pass on a mesh a green
         # pass proved moments ago: the pass is the heaviest thing the broker does to the mesh, and
         # blx01 lost its host ~9s into one forced 2s after a green pass. Only a clean HEALTHY
         # device skips it, and only on an armed host: the eth read still runs below (run_eth), a
@@ -5386,7 +5386,7 @@ async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> Non
 def _job_never_reached_device(job: "Job") -> bool:
     """True when a failed job ended before it could have opened the device: a normal FAILED exit
     (never a signal death, timeout, kill or hang) that ran under ``NOOP_FAILURE_MAX_RUNTIME_SEC``,
-    whatever its exit code: a 126/127 can come after device work. Spec 03 I33."""
+    whatever its exit code: a 126/127 can come after device work. Spec 03 I36."""
     if job.status != JobStatus.FAILED or _is_wedge_risk_exit(job.status, job.exit_code):
         return False
     runtime = job.runtime_sec
@@ -5411,7 +5411,7 @@ async def _verify_device_after_job(
     core holds the door, and a read that reaches no verdict runs the traffic pass in the
     same gate. ``job_failed`` forces a CHECK, not a reset — an exit 1 from a pytest
     assertion is not evidence of broken silicon. ``noop_failure`` (the job never reached the
-    device) lets a fresh green pass stand in for the forced one (spec 03 I33).
+    device) lets a fresh green pass stand in for the forced one (spec 03 I36).
 
     Never raises."""
     try:
