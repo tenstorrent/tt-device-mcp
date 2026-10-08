@@ -1075,27 +1075,64 @@ owner_submit_times: dict[str, list[float]] = {}
 # Measured: three consecutive laps held at 5/8 chips, the relift declining each time because the
 # episode looked seconds old, while the queue sat empty so no gate ever ran either.
 HOLD_EPISODE_FILE = "hold_episode_since"
+# How the holder scan rewords a held door that a foreign process is keeping (fsm.note).
+FOREIGN_HOLDER_NOTE = "held: "
 
 
-def _persist_hold_episode(since: str) -> None:
-    """Record (or clear) the episode start so a restart cannot rewind the escalation clock."""
+def _persist_hold_episode(since: str, *, tenant: bool = False) -> None:
+    """Record (or clear) the episode start so a restart cannot rewind the escalation clock.
+    ``tenant``: the hold opened because a foreign process held the device, not on a device
+    fault — see _restore_hold_episode."""
     try:
         path = health_dir() / HOLD_EPISODE_FILE
         if since:
-            path.write_text(since)
+            path.write_text(json.dumps({"since": since, "boot_id": _current_boot_id(), "tenant": tenant}))
         elif path.exists():
             path.unlink()
     except OSError:
         pass  # never let bookkeeping break the gate
 
 
+def _since_this_boot(since: str) -> bool:
+    """Whether ``since`` falls inside the current boot, by /proc/stat btime. False if unreadable."""
+    btime = _boot_btime_id()
+    try:
+        return bool(btime) and datetime.fromisoformat(since).timestamp() >= float(btime)
+    except ValueError:
+        return False
+
+
 def _restore_hold_episode() -> str:
     """The episode start from a previous process, or '' if none. The caller decides whether the
-    device is still degraded — a stale file on a recovered box must not resurrect a dead hold."""
+    device is still degraded — a stale file on a recovered box must not resurrect a dead hold.
+
+    Only a broker restart within one boot carries the clock. A reboot is itself the biggest reset
+    the ladder has, so an episode from an earlier boot is over; restoring it made the first hold
+    after boot past every window, and the forced ladder reset the box seconds after start. A hold
+    opened on a foreign holder is not a device fault and never carries either. A file from before
+    the boot id was recorded (a bare timestamp) carries only if it is newer than this boot."""
     try:
-        return (health_dir() / HOLD_EPISODE_FILE).read_text().strip()
+        text = (health_dir() / HOLD_EPISODE_FILE).read_text().strip()
     except OSError:
         return ""
+    try:
+        rec = json.loads(text) if text.startswith("{") else {"since": text}
+    except ValueError:
+        return ""
+    if not isinstance(rec, dict) or rec.get("tenant"):
+        return ""
+    since = str(rec.get("since") or "")
+    file_boot, this_boot = str(rec.get("boot_id") or ""), _current_boot_id()
+    if file_boot and this_boot:
+        return since if file_boot == this_boot else ""
+    return since if since and _since_this_boot(since) else ""
+
+
+def _hold_is_tenant_held() -> bool:
+    """The open episode is a foreign process holding the device (its own why, or a held door the
+    holder scan reworded), not a device fault."""
+    record = fsm.record
+    return record.why == "foreign_holder" or record.detail.startswith(FOREIGN_HOLDER_NOTE)
 
 
 # Whether this process's next hold may inherit the clock on disk: only while the device has not
@@ -3416,7 +3453,7 @@ async def device_health_gate(
         # queued behind it as a bare "device unverified", a device fault, when the blocker is
         # another user's process. Name them so the status says who to wait on. Reword only: a
         # foreign holder on an unheld device is ordinary contention, not a hold to invent.
-        fsm.note(f"held: {who} holds the device; verify deferred until it releases")
+        fsm.note(f"{FOREIGN_HOLDER_NOTE}{who} holds the device; verify deferred until it releases")
         return
 
     indices = _present_chip_indices()
@@ -4202,7 +4239,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         restored = _restore_hold_episode() if _hold_episode_restorable else ""
         _hold_episode_restorable = False
         device_hold_episode_since = restored or row_since
-        _persist_hold_episode(device_hold_episode_since)
+        _persist_hold_episode(device_hold_episode_since, tenant=_hold_is_tenant_held())
         device_hold_episode_reason = reason
         # Reserve the ledger row now, so the live row and the durable one share id, start, and name.
         # Its start is THIS process's segment (row_since), NOT the restored escalation clock: a hold
