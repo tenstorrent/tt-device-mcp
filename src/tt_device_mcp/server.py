@@ -1106,6 +1106,25 @@ def _restore_hold_episode() -> str:
         return ""
 
 
+# Whether this process's next hold may inherit the clock on disk: only while the device has not
+# been seen fit since the broker started. The file is cleared only by an in-process release, so a
+# broker that dies held (a power cycle, a reboot, a crash) leaves it behind; a box that then comes
+# back healthy and drops again hours later would restore that dead episode's start, and the new
+# hold would be born past every escalation window. A device held at broker start is the one case
+# the file exists for.
+_hold_episode_restorable = True
+
+
+def _forget_stale_hold_episode() -> None:
+    """The device was seen fit with no hold open: any clock on disk is a dead episode's. Once per
+    process — after this, the in-process release keeps the file honest."""
+    global _hold_episode_restorable
+    if device_hold_logged or not _hold_episode_restorable:
+        return
+    _hold_episode_restorable = False
+    _persist_hold_episode("")
+
+
 # A surgical bridge reset fired seconds after a chip leaves the bus can lose the race
 # with the endpoint's link retrain and report failure, yet the same chip re-binds in ~2s
 # once the link settles. Retry the bridge reset a few times before escalating to a much
@@ -1709,6 +1728,7 @@ def _reset_for_testing():
     Only used by test fixtures - not part of the public API.
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
+    global _hold_episode_restorable
     job_queue = None
     lock = None
     _action_row = None
@@ -1716,6 +1736,7 @@ def _reset_for_testing():
     device_hold_logged = False
     device_hold_episode_since = ""
     device_hold_episode_reason = ""
+    _hold_episode_restorable = True
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
@@ -2429,6 +2450,7 @@ def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> N
     if verified:
         # Only proof retires it, whatever the device was flagged for — dirty or held.
         fsm.on_readings(_healthy_reading())
+        _forget_stale_hold_episode()  # e.g. the startup gate: a clock left by a dead broker is over
     elif was_degraded:
         # Not proven fit, and nothing here names a new fault class — keep the open episode's own
         # why, just reword the detail and drop the dirty bit: dropping the flag ends the RESETTING
@@ -4442,13 +4464,16 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global device_hold_deadline_bucket, device_hold_escalate_bucket
     global device_hold_offbus_escalated
-    global device_hold_escalated_monotonic, _hold_row
+    global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
     if reason and not device_hold_logged:
         device_hold_logged = True
         # Prefer a start this box already recorded: if the device was still held across a restart,
-        # the ceiling must keep counting from the ORIGINAL drop, not from the new process.
+        # the ceiling must keep counting from the ORIGINAL drop, not from the new process. Only then:
+        # once this process has seen the device fit, a file on disk is a dead episode's.
         row_since = datetime.now().isoformat()
-        device_hold_episode_since = _restore_hold_episode() or row_since
+        restored = _restore_hold_episode() if _hold_episode_restorable else ""
+        _hold_episode_restorable = False
+        device_hold_episode_since = restored or row_since
         _persist_hold_episode(device_hold_episode_since)
         device_hold_episode_reason = reason
         # Reserve the ledger row now, so the live row and the durable one share id, start, and name.
@@ -4472,6 +4497,8 @@ def _note_tenant_gate_verdict(reason: str) -> None:
             0.0,
         )
         health_event("device_held", reason=reason)
+    elif not reason and not device_hold_logged:
+        _forget_stale_hold_episode()
     elif not reason and device_hold_logged:
         device_hold_logged = False
         health_event("device_released")
@@ -7009,7 +7036,9 @@ def _close_orphaned_hold() -> None:
     the row exists rather than re-reporting the same hold on every start.
 
     If the device is still degraded, the startup probe opens a fresh episode; this only
-    settles the one that outlived its broker.
+    settles the one that outlived its broker. It leaves the escalation clock on disk: nothing
+    has probed the device yet, and a box still wedged must keep counting from the original drop.
+    The startup gate's verdict decides (see _forget_stale_hold_episode).
     """
     try:
         events = read_health_events(kinds={"device_held", "device_released"})
