@@ -240,6 +240,12 @@ each rung fires only when the gentler one failed or cannot apply.
   an unprivileged caller, and that rc would arm the cooldown against a reset that never ran.
   Reading a scope is a separate question from starting one — `scope_active` keys on systemd alone,
   so an unprivileged daemon still adopts a root broker's reset rather than racing it (I5).
+- **I20 — A reset puts an operator's AICLK ceiling back before anything else touches the chips.**
+  Any reset clears the firmware clock cap (spec 03 I33), so `reset_with_quiesce` marks it owed
+  before the rung runs and, after a reset that exited 0, re-applies it right after the PCI rescan —
+  before the pollers return and before the caller's verify runs its traffic pass. A failed rung
+  leaves it owed; an apply that fails or raises never breaks the rung, and the verify's probe pass
+  retries it and fails closed. Unset, no step runs.
 
 ## Interfaces
 
@@ -533,6 +539,7 @@ NOT be conflated when reading results.
 | I10 per-severity interval | `tests/test_device_safety.py::test_power_cycle_escalates_past_a_recent_reboot`, `tests/test_device_safety.py::test_power_cycle_does_not_escalate_past_a_recent_power_cycle`, `tests/test_device_safety.py::test_reboot_does_not_de_escalate_past_a_recent_power_cycle` |
 | I11 host rung only after exhausted reset (two strikes); once-per-episode latch | `tests/test_device_safety.py::test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted`, `tests/test_device_safety.py::test_stuck_hold_escalation_retries_on_the_grace_cadence`, `tests/test_device_safety.py::test_ubb_tray_reset_fires_at_most_once_per_hold_episode`, `tests/test_device_safety.py::test_escalate_forced_suffix_bypasses_the_retry_pacing` |
 | I12 quiesce + in-flight flag + restore rules | `tests/test_reset.py::test_streaming_reset_quiesces_pollers_and_flags_in_flight`, `tests/test_reset.py::test_reset_quiesce_restores_pollers_even_if_the_rescan_is_cancelled`, `tests/test_reset.py::test_reset_quiesce_leaves_pollers_off_when_the_reset_times_out`, `tests/test_reset.py::test_reset_quiesce_restores_pollers_when_a_failed_launch_leaves_no_scope`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_defers_the_dead_chip_sampler_during_the_transient_drop` |
+| I20 the AICLK ceiling is re-applied after the rescan, before the pollers return | `tests/test_aiclk_ceiling.py::test_reset_reapplies_after_the_rescan_before_the_pollers_return`, `tests/test_aiclk_ceiling.py::test_reset_failed_rung_leaves_the_ceiling_owed`, `tests/test_aiclk_ceiling.py::test_reset_apply_error_never_breaks_the_rung`, `tests/test_aiclk_ceiling.py::test_reset_unconfigured_runs_no_ceiling` |
 | I13 tool verify = heartbeat+snapshot; unhealthy downgrade | `tests/test_reset.py::test_reset_tool_reports_health`, `tests/test_reset.py::test_verify_health_fails_on_short_chip_count`, `tests/test_reset.py::test_verify_health_fails_on_wedged_arc`, `tests/test_reset.py::test_verify_health_passes_on_over_count_from_stale_expected` |
 | I14 warm reboot never fired where futile; blocked climbs are loud | `tests/test_device_safety.py::test_host_escalation_for_drop_sends_all_off_bus_to_the_cold_rung`, `tests/test_device_safety.py::test_host_escalation_for_drop_routes_a_futile_reboot_to_the_cold_rung`, `tests/test_device_safety.py::test_gate_all_off_bus_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_reset_regression_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_all_off_bus_power_cycles_when_opted_in` |
 | Cold rung fireable-or-off (ipmitool) | `tests/test_device_safety.py::test_a_host_without_ipmitool_serves_with_the_cold_rung_off`, `tests/test_device_safety.py::test_ipmitool_present_leaves_the_cold_rung_armed` |

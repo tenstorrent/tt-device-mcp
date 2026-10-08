@@ -172,6 +172,18 @@ job boundary.
   `why="probe_unhealthy"` (`fsm.FAULTS`) — never `job_killed`, since no job is in play — leaving
   the device dirty for the next gate: the prologue that drives it is on the critical path of every
   node in an allocation; the recovery it declines is the epilogue's work (spec 07 `post-step`).
+- **I33 — An operator's AICLK ceiling is proven before any load the broker drives, fail-closed.**
+  Opt-in per host (`TT_DEVICE_MCP_AICLK_CEILING_MHZ`; unset, no step runs and no time is added).
+  Every probe pass whose snapshot proved the chips present re-applies the firmware clock cap
+  (`SET_ASIC_HOST_FMAX`) and reads it back, after the snapshot and before the eth read and the
+  fabric pass; a chip it cannot bring to or below the ceiling is an UNHEALTHY pass that runs no
+  traffic. The same apply runs at broker start before the startup fabric verify and at the job door
+  whenever a job exit or reset may have cleared the cap since the last verified apply (one retry,
+  then the device is marked dirty `probe_unhealthy` and the bounded ladder owns it — the door never
+  wedges the queue). The helper sends only to a chip reading above the ceiling, so it never fights
+  another holder of the same or a lower cap. A helper that cannot run on this host at all (exit
+  77/126/127: wrong architecture, no telemetry support) disarms the feature for the process, loudly
+  (`aiclk_ceiling_disarmed`), rather than holding healthy silicon on a configuration error.
 
   `post-step`'s recovering pass (`with_recover` defaulted True) is bound by
   `TT_DEVICE_MCP_POST_STEP_DEADLINE_SEC` (default 600s), as ONE absolute deadline for the WHOLE
@@ -522,6 +534,12 @@ short-circuit per I9. Each probe returns a tri-state that maps onto an `Observat
   verdict (never a reset trigger, I17), non-zero unhealthy; a broker-side timeout is unhealthy.
   Operator override: `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, exit code only. The real verdict latches
   on `last_fabric_ok`; a skip never overwrites it.
+- **aiclk ceiling** (`health/aiclk_ceiling.py`, I33): opt-in; runs
+  `deploy/tt-device-aiclk-ceiling.py` (staged as `aiclk-ceiling.py`), which reads each chip's
+  AICLK limit, sends the cap only where it reads above the ceiling, and re-reads. Exit 0 verified,
+  1 a chip still above or unreadable, 77 cannot run here (disarm). Bounded by
+  `TT_DEVICE_MCP_AICLK_CEILING_TIMEOUT_SEC` (8 s) with a 2 s per-chip bound inside; ~2 ms per chip
+  on a healthy 32-chip host. Operator override: `TT_DEVICE_MCP_AICLK_CEILING_CMD`, exit code only.
 - **subproc** (`health/monitors/subproc.py`): every traffic/firmware probe runs in its own
   session, tracked for the life of the call so the dead-chip path can kill it — it maps chip
   BARs, and `pci remove` does not revoke a mapping.
@@ -762,8 +780,10 @@ refuses.
 | Startup health report | `tests/test_device_safety.py::test_startup_records_what_came_back_after_a_reboot`, `tests/test_device_safety.py::test_a_failing_startup_probe_never_blocks_the_broker_coming_up` |
 | Sampler idle coverage | `tests/test_device_safety.py::test_an_idle_all_gone_drop_is_confirmed_by_the_sampler_and_put_on_the_timeline`, `tests/test_device_safety.py::test_an_all_gone_drop_on_a_held_not_dirty_box_still_journals_and_goes_dirty`, `tests/test_device_safety.py::test_an_all_chips_blackout_needs_two_samples_before_it_dirties_the_device`, `tests/test_device_safety.py::test_sampler_drives_the_idle_hold_ledger` |
 | Eth/fabric exit-code contract | `tests/test_eth_probe.py::test_exit_laundering[0-True]`, `tests/test_eth_probe.py::test_exit_laundering[3-False]`, `tests/test_eth_probe.py::test_exit_laundering[77-None]`, `tests/test_eth_probe.py::test_hung_read_is_skipped_not_frozen`, `tests/test_fabric_probe.py::test_fabric_classification[0-all links healthy-True]`, `tests/test_fabric_probe.py::test_fabric_classification[None-partial output before hang-False]` |
+| I33 (AICLK ceiling: off unset, proven before traffic, fail-closed, door bounded, disarms on a host it cannot run on) | `tests/test_aiclk_ceiling.py::test_unset_or_invalid_ceiling_is_off`, `tests/test_aiclk_ceiling.py::test_update_unconfigured_has_no_ceiling_step`, `tests/test_aiclk_ceiling.py::test_update_applies_after_the_snapshot_and_before_any_traffic`, `tests/test_aiclk_ceiling.py::test_update_failed_ceiling_is_unhealthy_and_runs_no_traffic`, `tests/test_aiclk_ceiling.py::test_update_skips_the_ceiling_when_the_snapshot_failed`, `tests/test_aiclk_ceiling.py::test_startup_applies_before_the_startup_fabric_gate`, `tests/test_aiclk_ceiling.py::test_door_reapplies_an_owed_ceiling_before_admitting`, `tests/test_aiclk_ceiling.py::test_door_verified_ceiling_costs_nothing`, `tests/test_aiclk_ceiling.py::test_door_unverified_ceiling_flags_dirty_and_returns`, `tests/test_aiclk_ceiling.py::test_door_apply_error_flags_dirty_never_raises`, `tests/test_aiclk_ceiling.py::test_job_end_marks_the_ceiling_owed`, `tests/test_aiclk_ceiling.py::test_apply_cannot_run_here_disarms_once`, `tests/test_aiclk_ceiling.py::test_helper_sends_only_to_chips_above_the_ceiling`, `tests/test_aiclk_ceiling.py::test_helper_chip_that_keeps_its_clock_fails`, `tests/test_aiclk_ceiling.py::test_helper_no_chips_is_a_failure_not_a_pass` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
+`TT_DEVICE_MCP_AICLK_CEILING_*`,
 relift/escalation switches) are behavioral toggles owned by this subsystem; the state-path and
 override matrix is spec 06. Transports serving `/health` are spec 02.

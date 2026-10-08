@@ -154,7 +154,13 @@ class AiclkCeiling:
         chips, at_or_below, sent = s.get("chips"), s.get("ok"), s.get("sent", 0)
         evidence = {"mhz": mhz, "rc": rc, "seconds": round(dt, 3), "where": where}
         # The helper's "ok" count is renamed: an evidence dict's "ok" is the probe's own verdict.
-        for k, ek in (("chips", "chips"), ("ok", "chips_ok"), ("sent", "sent"), ("over", "over"), ("unreadable", "unreadable")):
+        for k, ek in (
+            ("chips", "chips"),
+            ("ok", "chips_ok"),
+            ("sent", "sent"),
+            ("over", "over"),
+            ("unreadable", "unreadable"),
+        ):
             if k in s:
                 evidence[ek] = s[k]
         last_line = text.strip().splitlines()[-1][:200] if text.strip() else "(no output)"

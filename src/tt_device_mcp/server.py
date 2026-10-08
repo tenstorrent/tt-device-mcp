@@ -76,7 +76,6 @@ from tt_device_mcp.device_holders import (
     reclaim_foreign_holders,
 )
 from tt_device_mcp.fsm import ServerFsm, ServerState
-from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health import (
     _HOST_ESCALATION_ACTION,
     BLOCKED,
@@ -129,6 +128,7 @@ from tt_device_mcp.health import (
     read_heartbeats,
     version_floor_warnings,
 )
+from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.peercred import username_for_uid
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
 from tt_device_mcp.socket_transport import (
@@ -2869,7 +2869,10 @@ async def _kill_device_holders(reason: str) -> list:
     # all — it maps every chip — and it is the one that killed a host, twice.
     for proc, who in (
         (health_monitor.fabric_check_proc, "[broker]fabric-check"),
-        (CEILING.proc if CEILING.proc is not None and CEILING.proc.returncode is None else None, "[broker]aiclk-ceiling"),
+        (
+            CEILING.proc if CEILING.proc is not None and CEILING.proc.returncode is None else None,
+            "[broker]aiclk-ceiling",
+        ),
         (current_process, "[broker]job"),
     ):
         if proc is None:
@@ -6457,7 +6460,9 @@ async def _verify_fabric_on_start() -> None:
         # re-proves it and owns the verdict, so a failure here is only logged.
         if CEILING.armed() and CEILING.owed:
             async with get_device_op_lock():
-                await CEILING.apply("startup", log=(lambda line: logger.info(f"HEALTH-GATE[startup] {line}")) if logger else None)
+                await CEILING.apply(
+                    "startup", log=(lambda line: logger.info(f"HEALTH-GATE[startup] {line}")) if logger else None
+                )
         await _device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
     except Exception as e:  # noqa: BLE001 - startup must survive a check that cannot run
         # The gate is normally self-contained; if it raised, the startup fabric verdict is unknown and

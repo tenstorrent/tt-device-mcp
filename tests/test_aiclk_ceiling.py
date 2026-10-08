@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""The opt-in per-host AICLK ceiling (health/aiclk_ceiling.py, spec 03 I34 / 04 I33): off without
+"""The opt-in per-host AICLK ceiling (health/aiclk_ceiling.py, spec 03 I33 / 04 I20): off without
 config, re-applied after every reset rung and at start before any traffic pass, proven at the job
 door, and a failure that holds the box through the bounded ladder rather than wedging the queue."""
 
