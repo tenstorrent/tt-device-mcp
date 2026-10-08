@@ -1216,6 +1216,14 @@ GONE_CHIP_CONFIRM_SETTLE_SEC = 2.0
 # actually requires. On a clean exit, nothing is owed.
 FABRIC_CHECK_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_INTERVAL_SEC", "1200"))
 last_fabric_check_monotonic: float = 0.0
+# A failed job that never reached the device (spec 03 I36) does not force the traffic pass when
+# one finished green this recently: it ran in under NOOP_FAILURE_MAX_RUNTIME_SEC, so it says
+# nothing about the mesh. blx01 lost its host ~9s into a pass forced 2s after a green one by a
+# job that failed in 0s on a missing directory. The exit code alone never qualifies: jobs run
+# under `bash -c` with `set -e`, so a script that used the device and then hit a missing or
+# non-executable command also exits 127/126.
+NOOP_FAILURE_FABRIC_FRESH_SEC = float(os.environ.get("TT_DEVICE_MCP_NOOP_FAILURE_FABRIC_FRESH_SEC", "300"))
+NOOP_FAILURE_MAX_RUNTIME_SEC = 2.0
 # The last REAL fabric verdict lives on health_monitor.last_fabric_ok now (see health_monitor
 # above): True healthy / False unhealthy / None until one runs. Kept across checks so the
 # read-only relift can refuse to lift a recovered-on-ARC hold back onto a fabric whose last
@@ -3819,6 +3827,7 @@ async def device_health_gate(
     run_fabric: bool,
     force_fabric: bool = False,
     with_recover: bool = True,
+    noop_failure: bool = False,
 ) -> None:
     """Unified health gate run while the device is IDLE around a job.
 
@@ -3835,7 +3844,12 @@ async def device_health_gate(
     ladder — the read-only shape an external scheduler drives before a job, where the ladder's
     minutes would be paid on the critical path of every node in an allocation. The FSM is still
     written: the pass's finding is the one truth about the mesh, and a pass that saw a fault and
-    recorded nothing would admit the next job onto it."""
+    recorded nothing would admit the next job onto it.
+
+    ``noop_failure`` says the failed job behind ``force_fabric`` never reached the device (see
+    ``_job_never_reached_device``). On a HEALTHY, clean device whose last fabric verdict was OK
+    less than ``NOOP_FAILURE_FABRIC_FRESH_SEC`` ago, and with the eth rung armed, the forced pass
+    becomes the passive eth read of a clean exit (spec 03 I36)."""
 
     def _log(msg: str) -> None:
         if logger:
@@ -3930,6 +3944,33 @@ async def device_health_gate(
         # it most needs to run — freshly-booted silicon — is the one it would skip.
         never_run = last_fabric_check_monotonic == 0.0
         stale = never_run or (time.monotonic() - last_fabric_check_monotonic) > FABRIC_CHECK_MIN_INTERVAL_SEC
+        # A failed job that never reached the device (I36) owes no forced pass on a mesh a green
+        # pass proved moments ago: the pass is the heaviest thing the broker does to the mesh, and
+        # blx01 lost its host ~9s into one forced 2s after a green pass. Only a clean HEALTHY
+        # device skips it, and only on an armed host: the eth read still runs below (run_eth), a
+        # frozen core still holds, and a read with no verdict, a link-drop skip included, still
+        # runs the full pass (fabric_stale is forced for it). last_fabric_check_monotonic is set
+        # only when the gate's own pass reached a verdict, so its age never understates the OK's.
+        fabric_age = None if never_run else time.monotonic() - last_fabric_check_monotonic
+        skip_forced = (
+            force_fabric
+            and noop_failure
+            and phase == "post-job"
+            and with_recover
+            and not dirty
+            and fsm.state is ServerState.HEALTHY
+            and eth_check_armed
+            and health_monitor.last_fabric_ok is True
+            and fabric_age is not None
+            and fabric_age < NOOP_FAILURE_FABRIC_FRESH_SEC
+        )
+        if skip_forced:
+            _log(
+                f"the failed job never reached the device and a fabric pass {fabric_age:.0f}s ago was "
+                f"green: reading the eth heartbeat instead of forcing another pass"
+            )
+            health_event("forced_fabric_skipped", phase=phase, fabric_age_sec=round(fabric_age, 1))
+            force_fabric = False
         # NOTHING SLOW RUNS BEFORE A JOB. The traffic pass takes ~45-100s, and pre-job is the one
         # phase where that lands on a submitter who is only waiting to start: a dirty flag alone
         # used to force it, so an ordinary submit paid 102s and was held anyway. A device that is
@@ -3951,7 +3992,13 @@ async def device_health_gate(
         # the bounded pass) is what a failed step already pays inside the same step deadline.
         run_eth = with_recover and phase in ("post-job", "post-step") and not full and eth_check_armed
         healthy, evidence = await fsm.observe(
-            expected, _log, run_fabric=full, run_eth=run_eth, fabric_stale=stale, phase=phase, recovery=recovery
+            expected,
+            _log,
+            run_fabric=full,
+            run_eth=run_eth,
+            fabric_stale=stale or skip_forced,
+            phase=phase,
+            recovery=recovery,
         )
         state = HealthState.from_evidence(evidence, phase=phase, expected=expected)
         fabric_ok = state.fabric_ok
@@ -5505,7 +5552,19 @@ async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> Non
         _clear_device_dirty_unverified(f"pre-job gate error: {e}")
 
 
-async def _verify_device_after_job(job_log_file: Optional[Path], job_failed: bool = False) -> None:
+def _job_never_reached_device(job: "Job") -> bool:
+    """True when a failed job ended before it could have opened the device: a normal FAILED exit
+    (never a signal death, timeout, kill or hang) that ran under ``NOOP_FAILURE_MAX_RUNTIME_SEC``,
+    whatever its exit code: a 126/127 can come after device work. Spec 03 I36."""
+    if job.status != JobStatus.FAILED or _is_wedge_risk_exit(job.status, job.exit_code):
+        return False
+    runtime = job.runtime_sec
+    return runtime is not None and 0 <= runtime < NOOP_FAILURE_MAX_RUNTIME_SEC
+
+
+async def _verify_device_after_job(
+    job_log_file: Optional[Path], job_failed: bool = False, noop_failure: bool = False
+) -> None:
     """Post-job gate — runs at the END of every run (the finished job's caller has
     already been released, so this never delays their terminal/result): the enum/ARC
     snapshot always runs, so a chip that left the bus is flagged here — as the sampler
@@ -5520,7 +5579,8 @@ async def _verify_device_after_job(job_log_file: Optional[Path], job_failed: boo
     ``ETH_POST_JOB_TIMEOUT_SEC``), because enum+ARC cannot see a wedged eth core: a frozen
     core holds the door, and a read that reaches no verdict runs the traffic pass in the
     same gate. ``job_failed`` forces a CHECK, not a reset — an exit 1 from a pytest
-    assertion is not evidence of broken silicon.
+    assertion is not evidence of broken silicon. ``noop_failure`` (the job never reached the
+    device) lets a fresh green pass stand in for the forced one (spec 03 I36).
 
     Never raises."""
     # A job may set its own clock limits or leave the firmware default behind when it exits; the
@@ -5528,7 +5588,9 @@ async def _verify_device_after_job(job_log_file: Optional[Path], job_failed: boo
     # got that far.
     CEILING.mark_owed("job end")
     try:
-        await _device_health_gate(job_log_file, phase="post-job", run_fabric=False, force_fabric=job_failed)
+        await _device_health_gate(
+            job_log_file, phase="post-job", run_fabric=False, force_fabric=job_failed, noop_failure=noop_failure
+        )
     except Exception as e:  # noqa: BLE001 - must never crash the runner
         # The gate threw before it could clear the device, so its state is unknown. Leaving it
         # unflagged lets the next tenant run on a device nothing verified; mark it dirty so the
@@ -7149,9 +7211,11 @@ export {JOB_TAG_ENV}={job_tag}
                     # mesh, so the fabric is proved before the next tenant sees it — the
                     # periodic interval does not get a vote on whether a failure is
                     # investigated.
+                    job_failed = job.status != JobStatus.COMPLETED or job.exit_code != 0
                     await _verify_device_after_job(
                         job_log_file,
-                        job_failed=(job.status != JobStatus.COMPLETED or job.exit_code != 0),
+                        job_failed=job_failed,
+                        noop_failure=job_failed and _job_never_reached_device(job),
                     )
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:
