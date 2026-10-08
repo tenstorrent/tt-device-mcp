@@ -1039,7 +1039,9 @@ async def test_a_setup_error_after_running_fails_the_job_not_the_runner(monkeypa
     '[Started at]' line, builds its activation script and its privsep prefix. Any of those can
     raise (a full disk is enough). Done outside the try, that killed the runner task: the job sat
     RUNNING forever, nothing behind it ever dispatched, and its queued spec stayed on disk for a
-    restart to run again. The job must end FAILED with its spec gone, and the queue keep moving."""
+    restart to run again. The job must end FAILED with its spec gone, and the queue keep moving.
+    A start marker that cannot be written is the exception: the log is best effort, so that job
+    runs to completion."""
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     _free_device_lock(monkeypatch)
     _quiet_post_job_gate(monkeypatch)
@@ -1085,9 +1087,15 @@ async def test_a_setup_error_after_running_fails_the_job_not_the_runner(monkeypa
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
 
-    assert bad.status is srv.JobStatus.FAILED, f"job 906 is {bad.status.value}, expected FAILED"
-    assert bad.finished_at, "the failed job was never finished"
-    assert "[EXCEPTION:" in bad.error, f"the failed job does not say why: {bad.error!r}"
+    if step == "started-log":
+        # The job log is best effort (spec 01): a start marker that cannot be written leaves
+        # the job running on its in-memory capture.
+        assert bad.status is srv.JobStatus.COMPLETED, f"job 906 is {bad.status.value}, expected COMPLETED"
+        assert bad.finished_at, "the job was never finished"
+    else:
+        assert bad.status is srv.JobStatus.FAILED, f"job 906 is {bad.status.value}, expected FAILED"
+        assert bad.finished_at, "the failed job was never finished"
+        assert "[EXCEPTION:" in bad.error, f"the failed job does not say why: {bad.error!r}"
     assert good.status is srv.JobStatus.COMPLETED, f"the job queued behind it is {good.status.value}"
     assert srv.current_job_id is None
 
