@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """The leftover fence (spec 01 I16, spec 04 I21).
 
 A reaped job's process stuck in the kernel (state D, SIGKILL pending) can keep its
