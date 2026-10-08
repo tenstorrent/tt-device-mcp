@@ -5482,7 +5482,7 @@ def _job_from_log(job_id: str) -> Optional["Job"]:
     return job
 
 
-async def _terminate_scope(scope: str, grace_sec: float = GRACEFUL_KILL_GRACE_SEC, interrupt: bool = True) -> None:
+async def _terminate_scope(scope: str, grace_sec: float = GRACEFUL_KILL_GRACE_SEC, interrupt: bool = True) -> bool:
     """Stop a re-adopted job's systemd scope so it RELEASES THE DEVICE.
 
     Same ladder and same reason as _terminate_process_group: `systemctl stop` sends
@@ -5490,7 +5490,8 @@ async def _terminate_scope(scope: str, grace_sec: float = GRACEFUL_KILL_GRACE_SE
     unwinding, ttnn never closes the mesh, and the eth cores are left mid-transaction.
     SIGINT is the signal that unwinds it, so it goes first; `stop` is the reap. ``interrupt=False``
     is for a scope a killer already interrupted: a second SIGINT can abort the teardown the first
-    one started, so it only waits out the grace before the reap."""
+    one started, so it only waits out the grace before the reap. Returns True when the scope
+    outlived the grace and had to be reaped."""
 
     async def _run(*argv: str) -> None:
         await asyncio.to_thread(subprocess.run, list(argv), capture_output=True)
@@ -5501,11 +5502,12 @@ async def _terminate_scope(scope: str, grace_sec: float = GRACEFUL_KILL_GRACE_SE
     deadline = loop.time() + grace_sec
     while loop.time() < deadline:
         if not await asyncio.to_thread(_scope_active, scope):
-            return
+            return False
         await asyncio.sleep(_SCOPE_POLL_SEC)
     if logger:
         logger.info(f"TERMINATE scope={scope} survived SIGINT for {grace_sec}s; escalating")
     await _run("systemctl", "stop", scope)
+    return True
 
 
 # systemd notices a scope's cgroup went empty asynchronously, so a scope whose job just exited can
@@ -5525,7 +5527,10 @@ async def _stop_job_scope(job_id: str, job_log_file: Optional[Path], *, interrup
     short settle gets the same SIGINT-first ladder as a kill (I5), because the leftover may be
     mid-device-op. ``interrupted``: a kill or the hung reaper already sent SIGINT, and its ladder
     may have been cut short when the job's streams closed; the reap still happens, the SIGINT is
-    not repeated."""
+    not repeated. A leftover that has to be reaped is killed without unwinding, possibly mid-op,
+    so the device is marked dirty whatever the job's exit: an exit-0 job raises no other flag,
+    and the post-job gate would otherwise skip the fabric pass and hand the device on unverified.
+    A job our own recovery killed is exempt."""
     scope = job_scope_unit(job_id)
     loop = asyncio.get_event_loop()
     settle_until = loop.time() + _SCOPE_SETTLE_SEC
@@ -5545,7 +5550,12 @@ async def _stop_job_scope(job_id: str, job_log_file: Optional[Path], *, interrup
             append_job_log(job_log_file, "broker", f"{msg}\n")
         except OSError:
             pass
-    await _terminate_scope(scope, grace_sec=GRACEFUL_KILL_GRACE_SEC, interrupt=not interrupted)
+    reaped = await _terminate_scope(scope, grace_sec=GRACEFUL_KILL_GRACE_SEC, interrupt=not interrupted)
+    if reaped and job_id not in reset_killed_job_ids:
+        _mark_device_dirty(
+            f"job {job_id} left {scope} active past SIGINT; it was stopped without unwinding",
+            job=jobs.get(job_id),
+        )
 
 
 async def _monitor_readopted_scope(job_id: str, scope: str):
