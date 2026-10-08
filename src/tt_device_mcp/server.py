@@ -79,6 +79,7 @@ from tt_device_mcp.fsm import ServerFsm, ServerState
 from tt_device_mcp.health import (
     _HOST_ESCALATION_ACTION,
     BLOCKED,
+    CEILING,
     DEFER,
     HOLD_ESCALATION_REARM_SEC,
     HOLD_FABRIC_UNVERIFIED,
@@ -128,7 +129,6 @@ from tt_device_mcp.health import (
     read_heartbeats,
     version_floor_warnings,
 )
-from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.peercred import username_for_uid
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
 from tt_device_mcp.socket_transport import (
