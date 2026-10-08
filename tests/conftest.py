@@ -567,7 +567,7 @@ def health_deps():
         auto_power_cycle_enabled=lambda: srv._auto_power_cycle_enabled(),
         board_types_provider=lambda: srv.health_monitor._board_types,
         glx_board_types_provider=lambda: srv.health_monitor._glx_board_types(),
-        bus_ids_provider=lambda: srv.health_monitor._bus_ids,
+        chip_buses_provider=lambda: srv.health_monitor._chip_buses,
         journal_skip_once=lambda kind, reason, **f: srv.health_monitor._journal_skip_once(kind, reason, **f),
         terminate_process_group=lambda pid: srv._terminate_process_group(pid),
         logger=lambda: srv.logger,
@@ -639,6 +639,9 @@ def galaxy_trays(monkeypatch):
     and a broker that has never seen a healthy snapshot declines the rung outright rather than
     derive a tray from the chip index."""
     monkeypatch.setattr(srv.health_monitor, "_bus_ids", list(GALAXY_BUS_IDS), raising=False)
+    # The tray map keys on {chip id: bus} (I16). This fixture's host numbers its chips in PCI order;
+    # tests/test_ubb_tray_map.py pins the real Blackhole kernel order, where 0xCX comes before 0x8X.
+    monkeypatch.setattr(srv.health_monitor, "_chip_buses", dict(enumerate(GALAXY_BUS_IDS)), raising=False)
     monkeypatch.setattr(srv.health_monitor, "_board_types", ["tt-galaxy-bh"] * len(GALAXY_BUS_IDS))
     return srv.galaxy_recovery._tray_map_now()
 
