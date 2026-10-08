@@ -66,6 +66,15 @@ RESET_STREAM_KEEPALIVE_LINE = "::keepalive::"
 # generous margin here is not caution, it is the wedge's dwell time.
 FABRIC_CHECK_TIMEOUT_SEC = 180
 
+# The caller's bound on the passive eth-heartbeat read a CLEAN post-job gate runs (spec 03 I30);
+# a healthy read answers in ~1s. Matches the self-test's arming budget
+# (server.ETH_CHECK_SELFTEST_BUDGET_SEC): a read this slow could not have armed the rung. The
+# built-in probe's own bound sits at most at 90% of this, and its expiry is "no verdict", so the
+# gate runs the full pass; this bound expiring is frozen evidence (I16) and holds. An operator
+# override's inner bound is this same bound, so its timeout is frozen evidence here as on every
+# other path.
+ETH_POST_JOB_TIMEOUT_SEC = 10.0
+
 # The fabric check exits with this when it could not run at all (validator or
 # descriptor absent). It means "nothing was learned about the fabric" and must stay
 # distinct from exit 0: a check that reports a mesh it never looked at as healthy is
