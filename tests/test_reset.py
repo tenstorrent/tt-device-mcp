@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 
 import pytest
 from starlette.requests import ClientDisconnect
@@ -1159,6 +1160,206 @@ def test_reset_stream_quiesce_scope_routes_a_live_privsep_job(monkeypatch, tmp_p
 
     assert scope_kills == [srv.job_scope_unit("902-1")]
     assert not pgroup_kills, "the streaming reset quiesce must scope-route a privsep job"
+    assert "force: resetting over broker job 902-1" in resp.text, "a forced reset must log the job it stops"
+
+
+# --- issue #3: a reset is not queued, so it must not kill a running job unasked (04 I18) ---
+#
+# The reset used to stop whatever job was running and reset over it. Another agent's job died
+# mid-run because someone else asked for a reset. Now it refuses (reason "busy") unless forced.
+
+
+def _running_job(monkeypatch, status=srv.JobStatus.RUNNING, *, job_id="903-1", owner="alice", live=True):
+    """A job the runner owns: in `jobs`, and (if live) the runner's current process and job id."""
+    job = srv.Job(id=job_id, owner=owner, workspace="/w", command="pytest", queued_at="", status=status)
+    job.pid = 4242
+    monkeypatch.setattr(srv, "jobs", {job_id: job})
+    monkeypatch.setattr(srv, "current_process", _FakeWrapperProc() if live else None)
+    monkeypatch.setattr(srv, "current_job_id", job_id if live else None)
+    monkeypatch.setattr(srv, "reset_killed_job_ids", set())
+    return job
+
+
+def _post_reset(monkeypatch, tmp_path, *, force):
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv.subprocess, "run", _fake_tt_smi(0, snapshot_chips=1))
+    resets = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    kills = _record_terminators(monkeypatch)
+    d = _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": force}).json()
+    return d, resets, kills
+
+
+def test_reset_refuses_while_a_job_is_running_and_leaves_it_alone(monkeypatch, tmp_path):
+    job = _running_job(monkeypatch)
+    proc = srv.current_process
+
+    d, resets, (scope_kills, pgroup_kills) = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "refused" and d["reason"] == "busy"
+    assert d["job_id"] == "903-1" and d["owner"] == "alice" and d["job_status"] == "running"
+    assert "force=true" in d["hint"]
+    assert not resets, "a busy refusal must not reset the device"
+    assert not scope_kills and not pgroup_kills, "a busy refusal must not signal the job"
+    assert job.status == srv.JobStatus.RUNNING
+    assert "903-1" not in srv.reset_killed_job_ids, "the job must not be marked reset-killed"
+    assert srv.current_process is proc and srv.current_job_id == "903-1"
+
+
+def test_reset_refuses_while_a_hung_job_is_still_held(monkeypatch, tmp_path):
+    # HUNG is set before the runner reaps the process: the job still owns the device until then.
+    _running_job(monkeypatch, srv.JobStatus.HUNG)
+
+    d, resets, _ = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "refused" and d["reason"] == "busy" and d["job_status"] == "hung"
+    assert "still being torn down" in d["detail"]
+    assert not resets
+
+
+def test_reset_refuses_over_a_readopted_running_job(monkeypatch, tmp_path):
+    # A job re-adopted after a broker restart runs in its scope with no current_process.
+    _running_job(monkeypatch, live=False)
+
+    d, resets, _ = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "refused" and d["reason"] == "busy" and d["job_id"] == "903-1"
+    assert not resets
+
+
+def test_queued_jobs_do_not_block_a_reset(monkeypatch, tmp_path):
+    _running_job(monkeypatch, srv.JobStatus.QUEUED, live=False)
+
+    d, resets, _ = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "reset_complete"
+    assert resets
+
+
+def test_forced_reset_stops_the_running_job_and_logs_it(monkeypatch, tmp_path):
+    _running_job(monkeypatch)
+
+    d, resets, (scope_kills, _) = _post_reset(monkeypatch, tmp_path, force=True)
+
+    assert d["status"] == "reset_complete"
+    assert scope_kills == [srv.job_scope_unit("903-1")], "force keeps the old behaviour: stop the job"
+    assert "903-1" in srv.reset_killed_job_ids
+    assert resets
+    assert any(s.startswith("force: resetting over broker job 903-1 (alice) is running") for s in d["steps"])
+
+
+def test_idle_reset_proceeds_without_a_busy_refusal(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+
+    d, resets, (scope_kills, pgroup_kills) = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "reset_complete"
+    assert resets and not scope_kills and not pgroup_kills
+    assert not any("busy" in s or s.startswith("force:") for s in d["steps"])
+
+
+def test_streaming_reset_refuses_while_a_job_is_running(monkeypatch, tmp_path):
+    (tmp_path / "0").write_text("")
+    job = _running_job(monkeypatch)
+    scope_kills, pgroup_kills = _record_terminators(monkeypatch)
+    resets = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
+
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": False})
+
+    assert resp.status_code == 200
+    assert "::status::refused" in resp.text
+    assert "busy REFUSED: broker job 903-1 (alice) is running" in resp.text
+    assert "--force" in resp.text
+    assert not resets and not scope_kills and not pgroup_kills
+    assert job.status == srv.JobStatus.RUNNING and "903-1" not in srv.reset_killed_job_ids
+
+
+def _dispatch_in_the_gap(monkeypatch, *, live=True):
+    """Start a job after the first busy check but before the reset takes the device-op lock."""
+    real = srv._device_op
+
+    @asynccontextmanager
+    async def op(name, owner="[broker]"):
+        if name == "reset":
+            _running_job(monkeypatch, job_id="904-1", owner="bob", live=live)
+        async with real(name, owner) as v:
+            yield v
+
+    monkeypatch.setattr(srv, "_device_op", op)
+
+
+def test_reset_refuses_a_job_dispatched_after_the_first_check(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+    _dispatch_in_the_gap(monkeypatch)
+
+    d, resets, (scope_kills, pgroup_kills) = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "refused" and d["reason"] == "busy" and d["job_id"] == "904-1"
+    assert not resets and not scope_kills and not pgroup_kills
+    assert srv.jobs["904-1"].status == srv.JobStatus.RUNNING and not srv.reset_killed_job_ids
+
+
+def test_forced_reset_stops_a_job_dispatched_after_the_first_check(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+    _dispatch_in_the_gap(monkeypatch)
+
+    d, resets, (scope_kills, _) = _post_reset(monkeypatch, tmp_path, force=True)
+
+    assert d["status"] == "reset_complete" and resets
+    assert scope_kills == [srv.job_scope_unit("904-1")]
+    assert "904-1" in srv.reset_killed_job_ids
+
+
+def test_streaming_reset_refuses_a_job_dispatched_after_the_first_check(monkeypatch, tmp_path):
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+    _dispatch_in_the_gap(monkeypatch)
+    scope_kills, pgroup_kills = _record_terminators(monkeypatch)
+    resets = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
+
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": False})
+
+    assert "::status::refused" in resp.text
+    assert "busy REFUSED: broker job 904-1 (bob) is running" in resp.text
+    assert not resets and not scope_kills and not pgroup_kills
+
+
+@pytest.mark.asyncio
+async def test_the_health_gate_reset_is_not_blocked_by_the_busy_check(monkeypatch):
+    """The busy check belongs to the operator tool only. The gate's ladder resets through the
+    shared mechanism, and it runs while the runner still owns the job it is cleaning up after."""
+    _running_job(monkeypatch, srv.JobStatus.HUNG)
+    fired = []
+
+    async def no_foreign(log):
+        return False
+
+    async def quiesced_reset(argv, log):
+        fired.append(list(argv))
+        return 0, ""
+
+    async def ok_verify(exp, log, **k):
+        return True, {"snapshot": {"detail": "ok"}}
+
+    monkeypatch.setattr(srv.recovery_mechanism, "await_foreign_scope", no_foreign)
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_with_quiesce", quiesced_reset)
+    patch_recovery(monkeypatch, "_verify_device", ok_verify)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "1")
+
+    assert await srv.galaxy_recovery._reset_and_verify_device(["0"], lambda m: None) is True
+    assert fired, "the gate's own reset must not be refused because a job is held"
 
 
 @pytest.mark.asyncio

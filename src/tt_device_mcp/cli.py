@@ -1762,13 +1762,13 @@ Examples:
     smi_parser.add_argument("smi_args", nargs=argparse.REMAINDER, help="tt-smi args (read-only; reset/config rejected)")
 
     reset_parser = subparsers.add_parser(
-        "reset", help="[--force]  — reset devices (refused if a foreign tenant holds them)"
+        "reset", help="[--force]  — reset devices (refused if a foreign tenant holds them or a job runs)"
     )
     reset_parser.add_argument(
         "-f",
         "--force",
         action="store_true",
-        help="Override the reset gate even if another user's process holds the device",
+        help="Reset even if a broker job is running or another user's process holds the device",
     )
 
     subparsers.add_parser("pre-step", help="health pass before a job step (Slurm Prolog); exit 0 iff fit and free")
