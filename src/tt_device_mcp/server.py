@@ -1359,8 +1359,10 @@ def device_op_inhibit() -> Path:
 # tool that writes to the device can stay out of a reset's way: it takes LOCK_EX|LOCK_NB on this file
 # just before one short write and skips the write when the lock is busy. A sibling file, not the
 # inhibit file above: that one is unlinked at the end of every op (and removed by the auto-updater
-# when stale), and a flock on an unlinked inode excludes nobody who opened the new one. This file is
-# created once and never removed. Spec 06 I8.
+# when stale), and a flock on an unlinked inode excludes nobody who opened the new one. The broker
+# never removes this file, but systemd removes its RuntimeDirectory, file included, whenever the
+# broker stops; the next op creates it again on a new inode. So an external tool opens the path fresh
+# for every write attempt rather than keeping an fd. Spec 06 I8.
 DEVICE_OP_FLOCK_NAME = "device-op.flock"
 # External holds are one short write, milliseconds. A hold longer than this is a tool breaking the
 # contract, and it must not stall a reset: the op goes ahead, loudly (spec 06 I8).

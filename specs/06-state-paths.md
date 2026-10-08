@@ -70,23 +70,34 @@ and job exit statuses never hit disk.
   `/run/tt-device-broker/device-op.flock`, a sibling of the inhibit file) after it gets the
   in-process device lock and holds it until the op ends: on return, on an exception and on
   cancellation. The fd is opened `O_CLOEXEC` (and `O_NOFOLLOW`, mode 0600 on create), so no reset
-  tool, fabric probe or job the op starts inherits the lock. The file is created once and never
-  unlinked. The broker waits for the lock without blocking the event loop (non-blocking retries
+  tool, fabric probe or job the op starts inherits the lock. The broker never unlinks the file,
+  but the system broker's `/run/tt-device-broker` is the unit's `RuntimeDirectory=`, which systemd
+  removes, file included, every time the broker stops (an auto-update, a watchdog restart). The
+  next device op creates the file again, on a new inode. The broker waits for the lock without blocking the event loop (non-blocking retries
   every 50 ms) for at most `TT_DEVICE_MCP_DEVICE_OP_FLOCK_TIMEOUT_SEC` (10 s). While it waits it
   logs the holder's pid, read from `/proc/locks`. If the hold outlasts the timeout, the op goes
   ahead without the flock, with a WARNING naming the holder and a `device_op_flock_timeout`
-  journal event; it is never refused or failed for it (see Design decisions). A file that cannot
-  be opened (a per-user daemon without the directory) means the op runs as before. With no
+  journal event; it is never refused or failed for it (see Design decisions). The
+  `device_op_begin` journal event is written before the flock is taken, so its `waited_sec` counts
+  only the wait for the in-process device lock; a wait for the flock shows in the server log. A
+  file that cannot be opened (a per-user daemon without the directory) means the op runs as before. With no
   external user the lock is always free at once, so nothing about an op's timing, rungs or order
   changes.
 
-  **External-tool contract.** A tool that writes to the device outside the broker opens the file
-  (read-only is enough; never create, truncate or unlink it), takes
-  `flock(fd, LOCK_EX | LOCK_NB)` immediately before ONE short write, does the write, and releases
-  at once. On `EWOULDBLOCK` it skips that write and tries again later. It never blocks on the lock
-  and never holds it across a sleep, a loop or a subprocess. A missing file means this broker does
-  not offer the lock: keep whatever checks the tool used before. The lock is advisory and only
-  covers the broker's own device ops, not tenant jobs, which run outside `_device_op()`.
+  **External-tool contract.** A tool that writes to the device outside the broker opens the path
+  fresh for each write attempt: open (read-only is enough; never create, truncate or unlink it),
+  `flock(fd, LOCK_EX | LOCK_NB)` immediately before ONE short write, the write, then close, which
+  releases the lock. It must not keep one fd open across attempts: after a broker restart that fd
+  points at the removed file, and locking it excludes nothing. (A tool that must keep its fd checks
+  before each attempt that `fstat(fd).st_ino == stat(path).st_ino`, and reopens when they differ.)
+  On `EWOULDBLOCK` it skips that write and tries again later. It never blocks on the lock and never
+  holds it across a sleep, a loop or a subprocess. `ENOENT` means no lock is on offer right now (an
+  older broker, or one that has not run a device op since it started): keep whatever checks the
+  tool used before. On the system broker the file is root's, mode 0600, so that tenants cannot
+  hold resets back; a tool that is not root gets `EACCES` and cannot take part. It must run as
+  root, or else report the error and fall back to its old checks, never treat `EACCES` as a free
+  lock. The lock is advisory and only covers the broker's own device ops, not tenant jobs, which
+  run outside `_device_op()`.
 
 ## Path matrix
 

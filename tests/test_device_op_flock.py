@@ -59,11 +59,50 @@ async def test_the_flock_is_held_for_the_op_and_released_after(flock_path):
         assert flock_path.exists()
         assert _try_lock(flock_path) in (errno.EWOULDBLOCK, errno.EAGAIN)
     assert _try_lock(flock_path) == 0
-    # Never removed: an external tool's open fd must stay on the file the broker locks next time.
+    # The broker itself never removes it (systemd removing the runtime directory at a broker stop is
+    # the only thing that does; see the restart test below).
     assert flock_path.exists()
     async with srv._device_op("health-gate/post-job"):
         assert _try_lock(flock_path) in (errno.EWOULDBLOCK, errno.EAGAIN)
     assert _try_lock(flock_path) == 0
+
+
+@pytest.mark.asyncio
+async def test_after_the_file_is_removed_only_a_fresh_open_sees_the_lock(flock_path):
+    # systemd removes the broker's RuntimeDirectory, flock file included, every time the broker
+    # stops. The next op creates the file on a new inode, so a tool that kept its fd from before
+    # locks the removed file and excludes nothing: the contract is to open the path for each write.
+    async with srv._device_op("reset"):
+        pass
+    stale = os.open(flock_path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        old_ino = os.fstat(stale).st_ino
+        flock_path.unlink()
+        async with srv._device_op("reset"):
+            assert flock_path.exists()
+            assert os.stat(flock_path).st_ino != old_ino
+            # The documented check for a tool that keeps its fd: the inodes differ, so reopen.
+            assert _try_lock(flock_path) in (errno.EWOULDBLOCK, errno.EAGAIN)
+            fcntl.flock(stale, fcntl.LOCK_EX | fcntl.LOCK_NB)  # the stale fd "gets" a lock nobody holds
+            fcntl.flock(stale, fcntl.LOCK_UN)
+    finally:
+        os.close(stale)
+    assert _try_lock(flock_path) == 0
+
+
+@pytest.mark.asyncio
+async def test_the_whole_directory_is_recreated_after_a_restart(monkeypatch, tmp_path):
+    # The default path lives in the runtime directory itself, which systemd removes as a whole.
+    rundir = tmp_path / "tt-device-broker"
+    monkeypatch.delenv("TT_DEVICE_MCP_DEVICE_OP_FLOCK", raising=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", str(rundir / "device-op.lock"))
+    async with srv._device_op("reset"):
+        assert _try_lock(rundir / "device-op.flock") in (errno.EWOULDBLOCK, errno.EAGAIN)
+    (rundir / "device-op.flock").unlink()
+    rundir.rmdir()
+    async with srv._device_op("reset"):
+        assert _try_lock(rundir / "device-op.flock") in (errno.EWOULDBLOCK, errno.EAGAIN)
+    assert _try_lock(rundir / "device-op.flock") == 0
 
 
 @pytest.mark.asyncio
@@ -91,6 +130,35 @@ async def test_the_flock_is_released_when_the_op_is_cancelled(flock_path):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert _try_lock(flock_path) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_flock_wait_leaks_nothing(flock_path):
+    # An op cancelled while it still waits for an external holder must close its fd, free the
+    # in-process device lock and remove the inhibit file, like any other op that ends.
+    flock_path.touch()
+    holder = os.open(flock_path, os.O_RDONLY | os.O_CLOEXEC)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        task = asyncio.create_task(srv._device_op("reset").__aenter__())
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if srv.device_op_active == "reset":
+                break
+        await asyncio.sleep(2 * srv.DEVICE_OP_FLOCK_POLL_SEC)
+        assert srv.device_op_active == "reset" and not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+    assert not [n for n in os.listdir("/proc/self/fd") if _readlink(f"/proc/self/fd/{n}") == str(flock_path)]
+    assert srv.device_op_active == ""
+    assert not srv.device_op_inhibit().exists()
+    assert not srv.get_device_op_lock().locked()
+    async with srv._device_op("reset"):
+        assert _try_lock(flock_path) in (errno.EWOULDBLOCK, errno.EAGAIN)
 
 
 @pytest.mark.asyncio
