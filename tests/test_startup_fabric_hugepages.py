@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """The startup fabric pass waits for the 1G hugepage pool, and a hold whose only cause is a fabric
 77 (could not check) is re-checked read-only, never escalated to a galaxy reset (spec 03 I33, I34).
 
