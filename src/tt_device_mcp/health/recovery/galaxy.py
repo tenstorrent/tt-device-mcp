@@ -13,7 +13,9 @@ import logging
 import math
 import os
 import time
+from collections.abc import Mapping
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import metrics, privileges
@@ -21,7 +23,7 @@ from tt_device_mcp.device_holders import MIN_TENANT_UID
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import dead_chips
-from tt_device_mcp.health.monitors.pci import chip_node_present
+from tt_device_mcp.health.monitors.pci import chip_node_present, pci_bus_number
 from tt_device_mcp.health.recovery import (
     BLOCKED,
     DEFER,
@@ -43,6 +45,8 @@ from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.ubb_tray import _fire_ubb_reset, _ubb_reset_argv
+
+_logger = logging.getLogger("tt-device-mcp")
 
 
 def _is_galaxy(board_types: Optional[list], glx_board_types: tuple) -> Optional[bool]:
@@ -649,19 +653,28 @@ def _ubb_bus_id_tables() -> Optional[dict]:
     return tables or None
 
 
-def _tray_map(bus_ids, board_type) -> Optional[dict]:
+def _tray_map(chip_buses, board_type) -> Optional[dict]:
     """``{tray number: [chip ids]}`` for a Galaxy, or None when the trays cannot be known.
 
-    ``bus_ids`` is the cached per-chip ``board_info.bus_id`` from a snapshot that identified every
-    board, indexed by chip id. The tray is the bus masked to its group (``& 0xf0``) looked up in
-    tt-smi's table for this board type — the same derivation ``tt-smi -glx_list_tray_to_device``
-    prints, so the trays the broker names are the trays an operator reads there.
+    ``chip_buses`` is ``{chip id: PCI address}``, the kernel's chip index (the one /dev, sysfs and
+    the heartbeat read use) mapped to that chip's own address, banked from sysfs while every chip
+    was on the bus. The tray is the bus masked to its group (``& 0xf0``) looked up in tt-smi's
+    table for this board type — the same derivation ``tt-smi -glx_list_tray_to_device`` prints, so
+    the trays the broker names are the trays an operator reads there.
 
-    All-or-nothing on purpose (I16). A chip with no bus id, a bus outside the four known groups, or
-    a board type with no table leaves a map that is missing silicon, and a tray reset driven from a
-    partial map would leave exactly the chips it could not place unrecovered. The rung declines on
-    None; it never falls back to arithmetic.
+    Never a list read by position (I16): tt-smi lists chips in PCI order, the kernel numbers them in
+    its own, and on a Blackhole Galaxy the two disagree for chips 16-31 — reading one as the other
+    swaps trays 3 and 4. A list is therefore refused outright, and a chip missing from the map
+    shifts no other chip's tray.
+
+    All-or-nothing on what it is given. A chip with no readable bus, a bus outside the four known
+    groups, or a board type with no table leaves a map that misplaces silicon, and the rung declines
+    on None; it never falls back to arithmetic. That every chip is present is the bank's guarantee
+    (``HealthMonitor._bank_chip_buses``), and a drop on a chip the map does not place declines
+    in :func:`_offbus_ids_on_trays`.
     """
+    if not isinstance(chip_buses, Mapping) or not chip_buses:
+        return None
     tables = _ubb_bus_id_tables()
     if not tables:
         return None
@@ -672,16 +685,31 @@ def _tray_map(bus_ids, board_type) -> Optional[dict]:
         return None
     tray_of_group = {group: tray for tray, group in table.items()}
     trays: dict = {}
-    for chip_id, bus_id in enumerate(bus_ids):
-        try:
-            bus = int(str(bus_id).split(":")[1], 16)
-        except (IndexError, ValueError):
+    try:
+        chips = sorted((int(c), addr) for c, addr in chip_buses.items())
+    except (TypeError, ValueError):
+        return None
+    for chip_id, address in chips:
+        bus = pci_bus_number(address)
+        if bus is None:
             return None
         tray = tray_of_group.get(bus & 0xF0)
         if tray is None:
             return None
         trays.setdefault(tray, []).append(chip_id)
     return trays or None
+
+
+def _tray_label(tray: int, tray_map: dict) -> str:
+    """``tray 4 (BMC mask 0x08, chips 24-31)``: the tray number as tt-smi prints it, with the BMC bit
+    the reset pulses and the chip ids it holds, so a log line can be checked against both without
+    knowing the numbering convention."""
+    chips = sorted(tray_map.get(tray) or [])
+    if chips and chips == list(range(chips[0], chips[-1] + 1)):
+        span = f"{chips[0]}-{chips[-1]}" if len(chips) > 1 else str(chips[0])
+    else:
+        span = ",".join(str(c) for c in chips)
+    return f"tray {tray} (BMC mask 0x{1 << (tray - 1):02x}, chips {span})"
 
 
 def _offbus_chip_ids(beats: dict, expected: int) -> set:
@@ -772,6 +800,77 @@ def _all_trays(expected: int, tray_map: Optional[dict]) -> Optional[list]:
     return sorted(tray_map)
 
 
+# Issue #26 (spec 04 I19): a tray with this many chips off the bus at the FIRST sighting is a tray that
+# has lost power, not a chip that dropped. Such an onset gets one PCI rescan and a read-only capture of
+# the BMC/CPLD/PCIe state in front of the ladder; the ladder itself, and the power cycle only when the
+# ladder fails, are unchanged.
+TRAY_DOWN_MIN_CHIPS = 4
+TRAY_DOWN_RESCAN_SETTLE_SEC = 3
+TRAY_DOWN_ONSET = "TRAY_DOWN"
+
+
+def _pci_rescan() -> None:
+    """One bare PCI rescan — the same write the bridge rung's rescan makes. Its own function so the
+    suite replaces it (conftest) and no test writes to the host's sysfs."""
+    Path("/sys/bus/pci/rescan").write_text("1")
+
+
+# The per-tray walk's settle after the PCI rescan that follows each tray re-power, before the verify.
+UBB_WALK_RESCAN_SETTLE_SEC = 3
+
+
+async def _rescan_after_tray_step(tray: int, log) -> None:
+    """One PCI rescan after a tray re-power, then a short settle. A re-power does not undo the
+    dead-chip sampler's ``remove``, so without it an isolated chip could never verify back (the
+    rescan :meth:`ResetMechanism.reset_with_quiesce` makes after every reset). A failed write is
+    logged and the verify runs anyway."""
+    try:
+        await asyncio.to_thread(_pci_rescan)
+    except OSError as e:
+        log(f"PCI rescan after the tray {tray} re-power failed ({e}); verifying anyway")
+        return
+    await asyncio.sleep(UBB_WALK_RESCAN_SETTLE_SEC)
+
+
+def tray_down_capture_enabled() -> bool:
+    """``TT_DEVICE_MCP_TRAY_DOWN_CAPTURE``: the rescan and capture in front of the ladder for a
+    tray-down onset. ON by default; ``0`` turns it off and every drop goes straight to the ladder."""
+    return os.environ.get("TT_DEVICE_MCP_TRAY_DOWN_CAPTURE", "1").strip() != "0"
+
+
+def _off_per_tray(off_ids, tray_map: Optional[dict]) -> Optional[dict]:
+    """``{tray: chips off}`` for every tray with a chip off, or None when the map is missing or does
+    not place every off chip — no tray decision rests on a partial picture (I16)."""
+    if not tray_map or not off_ids:
+        return None
+    try:
+        ids = {int(c) for c in off_ids}
+    except (TypeError, ValueError):
+        return None
+    tray_of = {c: t for t, chips in tray_map.items() for c in chips}
+    if not ids <= set(tray_of):
+        return None
+    per: dict = {}
+    for i in ids:
+        per[tray_of[i]] = per.get(tray_of[i], 0) + 1
+    return dict(sorted(per.items()))
+
+
+def _tray_down_counts(off_ids, tray_map: Optional[dict]) -> Optional[dict]:
+    """The per-tray off counts when some tray has at least TRAY_DOWN_MIN_CHIPS off, else None."""
+    per = _off_per_tray(off_ids, tray_map)
+    if per is None or not any(n >= TRAY_DOWN_MIN_CHIPS for n in per.values()):
+        return None
+    return per
+
+
+def tray_down_onset(off_ids, chip_buses, board_type) -> Optional[dict]:
+    """``{tray: chips off}`` when the off-bus set puts TRAY_DOWN_MIN_CHIPS or more chips off ONE
+    physical tray (by the bus-derived map, I16), else None — also None for no ids, no map, or a chip
+    the map does not place. Pure: the classification the tray-down latch takes at the first sighting."""
+    return _tray_down_counts(off_ids, _tray_map(chip_buses, board_type))
+
+
 def _ubb_tray_walk_plan(offbus_chips: set, expected: int, tray_map: Optional[dict]) -> Optional[list]:
     """Order the trays for a one-at-a-time per-tray reset walk: every AFFECTED tray first (those that
     hold an off-bus chip, sorted), then THE REST (sorted). Reset one tray at a time, re-verifying
@@ -818,9 +917,9 @@ def _maybe_emit_ubb_reset_required(beats: dict, off_bus: int, expected: int, log
         present=max(0, expected - off_bus),
         host_at_risk=True,
     )
-    tray_list = ", ".join(str(t) for t in trays)
+    tray_list = ", ".join(_tray_label(t, tray_map) for t in trays)
     log(
-        f"UBB tray(s) {tray_list} hold the {off_bus}/{expected} off-bus chip(s) — a below-floor drop "
+        f"UBB {tray_list} hold the {off_bus}/{expected} off-bus chip(s) — a below-floor drop "
         f"the mesh-wide reset inverts and a warm reboot cannot re-enumerate. The lightest sufficient "
         f"recovery is a per-tray BMC reset of the affected tray(s): `{command}`. The broker walks them "
         f"one at a time when TT_DEVICE_MCP_AUTO_UBB_RESET is set; here it stays HELD."
@@ -840,7 +939,7 @@ class GalaxyRecovery(Recovery):
         the board-type derivation is: the caches live on the one HealthMonitor the FSM builds, and
         a test aims its own bag at its own monitor.
         """
-        if self.deps.bus_ids_provider is None:
+        if self.deps.chip_buses_provider is None:
             return None
         # Normalized so a WH snapshot's " L"/" R" pair reads as one board type — the same rule
         # _is_galaxy applies for its unanimity check, and the reason the tests seed suffixed values.
@@ -849,7 +948,7 @@ class GalaxyRecovery(Recovery):
             # Unanimous or nothing, as everywhere the board type decides a reset: a mesh reporting
             # two board types is not a topology either UBB table describes.
             return None
-        return _tray_map(self.deps.bus_ids_provider() or [], board_types.pop())
+        return _tray_map(self.deps.chip_buses_provider() or {}, board_types.pop())
 
     def next_stage(self, ev: Evidence) -> str:
         # host_escalation/reboot_blocked are folded here, not carried on Evidence (see its own
@@ -957,8 +1056,20 @@ class GalaxyRecovery(Recovery):
         surgical bridge reset, a per-tray UBB reset) can recover the mesh without ever calling
         ``_reset_and_verify_device``, so that flag can still carry an unrelated FAILED verdict from
         an earlier, different reset. The gate rung reports its own action's verdict instead and
-        never TERMINAL — see :meth:`_fire_gate_rung`."""
+        never TERMINAL — see :meth:`_fire_gate_rung`.
+
+        Every caller passes here first, so this is where a tray-down onset (spec 04 I19) is latched
+        and, before its first rung, given one PCI rescan and the read-only capture. Then the ladder
+        runs exactly as it would have, with the caller's own evidence and stage: the prelude never
+        picks a rung, skips one or fires a power cycle. Only a rescan that brought every chip back
+        onto a mesh that passes the full verify ends the episode before the ladder."""
         rung, _, gate_phase = phase.partition("/")
+        if await self._tray_down_latch(expected, beats) == TRAY_DOWN_ONSET and not self._td["prelude_done"]:
+            if await self._tray_down_prelude(expected, log, phase=gate_phase or rung):
+                return OUTCOME_RECOVERED
+        # Anything that reaches a ladder from here may reset: an onset first sighted after this is
+        # not an onset any more (the ladder can turn a 1-chip drop into a whole tray off).
+        self._td_reset_seen = True
         if rung == "gate":
             return await self._fire_gate_rung(gate_phase, stage, indices, expected, log, ev=ev, beats=beats)
         was_degraded = self.deps.device_degraded()
@@ -1119,6 +1230,157 @@ class GalaxyRecovery(Recovery):
             return OUTCOME_WAITING
         raise ValueError(f"escalate(): {stage!r} is not a gate action rung")
 
+    # ---- the tray-down prelude (spec 04 I19, issue #26) -----------------------------------------
+    #
+    # The episode latch lives on this instance: set at the first off-bus sighting of an episode,
+    # before any reset, and never re-derived while the episode is open, because a reset can itself
+    # turn a 1-chip drop into a whole tray off. tray_down_episode_end() clears it when the mesh is
+    # released. Deliberately not persisted: a broker restart or a reboot starts with none and latches
+    # again at its first sighting.
+    _td: Optional[dict] = None
+    _td_reset_seen: bool = False
+
+    def tray_down_episode_end(self) -> None:
+        """The episode closed (the gate released the mesh, or the prelude's rescan recovered it): the
+        next off-bus sighting is a fresh onset, and a reset before this point no longer counts."""
+        self._td = None
+        self._td_reset_seen = False
+        self.mechanism.reset_since_release = False
+
+    async def _tray_down_latch(self, expected: int, beats: Optional[dict]) -> Optional[str]:
+        """``TRAY_DOWN_ONSET``/``"PARTIAL"`` for the open episode, latching it at the first off-bus
+        sighting; None when nothing is off the bus yet, the prelude is switched off, or this is not
+        a Galaxy-sized mesh. An off set first seen after any reset (the ladder's own, or a manual
+        ``reset_with_quiesce`` since the last release) or while one is cycling is never an onset."""
+        if not tray_down_capture_enabled() or expected < 2 * UBB_CHIP_COUNT:
+            return None
+        if self._td is not None:
+            return self._td["path"]
+        if beats is None:
+            beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        off = _offbus_chip_ids(beats or {}, expected)
+        if not off:
+            return None
+        after_reset = (
+            self._td_reset_seen
+            or self.mechanism.reset_since_release
+            or self.mechanism.reset_in_flight
+            or bool(await asyncio.to_thread(self.mechanism.scope_active))
+        )
+        counts = None
+        # The whole bus off keeps its own route (_host_escalation_for_drop) with nothing to capture
+        # per tray; a reset already fired means this is not a first sighting.
+        if len(off) < expected and not after_reset:
+            counts = _tray_down_counts(off, self._tray_map_now())
+        path = TRAY_DOWN_ONSET if counts else "PARTIAL"
+        self._td = {
+            "path": path,
+            "onset": counts or _off_per_tray(off, self._tray_map_now()) or {"count": len(off)},
+            "off": sorted(int(c) for c in off),
+            "epoch": time.time(),
+            "rescanned": False,
+            "captured": False,
+            "prelude_done": path != TRAY_DOWN_ONSET,
+        }
+        health_event(
+            "tray_down_latched", path=path, off_per_tray=self._td["onset"], expected=expected, after_reset=after_reset
+        )
+        return path
+
+    def _tray_down_capture(self, onset: dict, expected: int) -> dict:
+        """The onset evidence, read-only, under its deadline, fsync'd into an incident bundle."""
+        from tt_device_mcp.health import bmc_capture
+
+        bundle = None
+        if self.deps.capture_incident is not None:
+            try:
+                bundle = self.deps.capture_incident("tray_down", evidence={"onset": onset, "expected": expected})
+            except Exception:  # noqa: BLE001 - a failed bundle must not stop the capture or the ladder
+                bundle = None
+        if not isinstance(bundle, Path):
+            # No incident bundle (capture off, or it failed): the BMC reads still get a directory
+            # of their own, so the capture is never lost for want of one.
+            bundle = bmc_capture.fallback_bundle()
+        buses = (self.deps.chip_buses_provider() if self.deps.chip_buses_provider else None) or {}
+        tray_map = self._tray_map_now() or {}
+        trays = sorted(int(t) for t in onset.get("off_per_tray", {}))
+        # lspci on the bridge above every off chip, found from the chip's banked PCI address: the
+        # bridge stays enumerated when the endpoint drops, so its link status survives, and the
+        # first reset is about to erase it. The endpoint too while the kernel still lists it.
+        off = set(onset.get("off") or [])
+        addrs = [buses.get(c) or buses.get(str(c)) for t in trays for c in sorted(tray_map.get(t, [])) if c in off]
+        targets = bmc_capture.lspci_targets([a for a in addrs if a])
+        return bmc_capture.capture_tray_down(
+            bundle, onset, trays=trays, all_trays=sorted(tray_map), pci_targets=targets
+        )
+
+    async def _tray_down_prelude(self, expected: int, log, *, phase: str) -> bool:
+        """A tray-down onset, before the ladder's first rung: one PCI rescan, then the read-only
+        capture, then a re-read of the bus. True only when every chip came back and the full verify
+        (fabric included) passed — the ladder is not needed; a runtime-reported fault is kept, as by
+        the bridge rung. Otherwise False and the caller runs the ladder exactly as it would have;
+        this never resets and never power-cycles.
+
+        The rescan writes to the PCI subsystem, so it waits while a tenant holds the device (or the
+        holder scan is unreadable); the capture is read-only and never waits. A rescan that waited
+        runs at the first later ladder entry with no tenant, still before any rung."""
+        td = self._td
+        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
+        tenant_active = self._tenant_active(scan)
+        rescan = "not run"
+        t0 = time.monotonic()
+        if not td["rescanned"]:
+            if tenant_active:
+                rescan = "waiting (a tenant holds the device)"
+            else:
+                td["rescanned"] = True
+                try:
+                    await asyncio.to_thread(_pci_rescan)
+                    rescan = "ran"
+                except OSError as e:
+                    rescan = f"failed ({e})"
+        capture: dict = {}
+        if not td["captured"]:
+            td["captured"] = True
+            onset = {"off_per_tray": td["onset"], "off": td["off"], "expected": expected, "epoch": td["epoch"]}
+            capture = await asyncio.to_thread(self._tray_down_capture, onset, expected)
+            if str(capture.get("cpld", "")).startswith("skipped"):
+                log("tray-down capture: no TT_DEVICE_MCP_TRAY_CPLD_* config — CPLD registers not read")
+        td["prelude_done"] = td["rescanned"] and td["captured"]
+        trays = sorted(k for k in td["onset"] if isinstance(k, int))
+        if rescan != "ran":
+            off = td["off"]
+        else:
+            # The capture usually outlasts the settle; wait only for what is left of it.
+            await asyncio.sleep(max(0.0, TRAY_DOWN_RESCAN_SETTLE_SEC - (time.monotonic() - t0)))
+            beats = await asyncio.to_thread(self.deps.read_heartbeats)
+            off = sorted(int(c) for c in _offbus_chip_ids(beats or {}, expected))
+            if not off:
+                healthy, _ = await self._verify_device(expected, log, run_fabric=True, phase=phase)
+                health_event("tray_down_prelude", rescan=rescan, off=0, healthy=healthy, capture=capture)
+                if healthy:
+                    log("tray-down: every chip came back on the PCI rescan and the mesh verified — no reset needed")
+                    # Back on the bus, so no longer isolated: the next gate must not bridge-reset them.
+                    isolated = self.deps.isolated_chips()
+                    for c in td["off"]:
+                        isolated.discard(str(c))
+                    # Keep a runtime-reported fault, as the bridge rung does: a rescan re-inits no eth
+                    # core and the verify cannot see a stuck one, so only a galaxy reset earns the retire.
+                    self.deps.clear_device_dirty(verified=True, why=f"{phase}: tray-down chips back after a PCI rescan")
+                    self.tray_down_episode_end()
+                    return True
+        _logger.error(
+            "TRAY-DOWN: trays %s, chips off %s (%d/%d), rescan %s, capture %s — the full reset ladder follows",
+            trays,
+            off,
+            len(off),
+            expected,
+            rescan,
+            "done" if capture else ("done earlier" if td["captured"] else "not run"),
+        )
+        health_event("tray_down_prelude", rescan=rescan, off=len(off), trays=trays, capture=capture)
+        return False
+
     def _tenant_active(self, scan, *, force: bool = False) -> bool:
         """Is anyone using the device? TWO independent sources, because either one alone lies:
 
@@ -1154,6 +1416,7 @@ class GalaxyRecovery(Recovery):
         # Hold reset_in_flight across the whole sweep so the dead-chip sampler defers instead of
         # isolating a tray mid-reset. Cleared on every exit.
         self.mechanism.reset_in_flight = True
+        self.mechanism.reset_since_release = True
         try:
             # 1) SBR — only when the caller has something surgical to fire at. The tray branch always
             # does (the dead tray's own chips); the last-chance sweep passes do_sbr only when a chip is
@@ -1327,10 +1590,21 @@ class GalaxyRecovery(Recovery):
         # guards as any host rung. A whole tray off the bus with no window is warm-reboot-futile (a
         # 6U-Galaxy reboot does not power-cycle the UBBs), so it goes straight to the cold rung.
         off_bus = len(offbus_chips)
+        # Log-only: more chips may be off by now than at onset. Every decision below uses off_bus.
+        try:
+            beats_now = await asyncio.to_thread(self.deps.read_heartbeats)
+            off_bus_after = len(_offbus_chip_ids(beats_now or {}, expected))
+        except Exception as e:  # noqa: BLE001 - a failed re-read must never block the power cycle
+            log(f"tray-down-no-window: could not re-read the heartbeats after the verify: {e!r}")
+            off_bus_after = None
         escalation, reboot_blocked = _host_escalation_for_drop(
             off_bus, expected, warm_reboot_futile=True, **self.deps.host_escalation_kwargs()
         )
         if reboot_blocked or escalation != "power-cycle":
+            log(
+                f"tray-down-no-window sweep did not recover the mesh; power cycle not auto-fired "
+                f"(off the bus: {off_bus}/{expected} at onset, {off_bus_after} after the verify)"
+            )
             if off_bus >= expected:
                 self.deps.emit_all_off_bus_power_cycle_required(log, off_bus, expected, f"gate/{gate_phase}")
             else:
@@ -1342,11 +1616,14 @@ class GalaxyRecovery(Recovery):
         tenant_active = self._tenant_active(scan)
         allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=tenant_active)
         if not allowed:
-            log(f"tray-down-no-window sweep did not recover the mesh and a power cycle is opted in but held off: {why}")
+            log(
+                f"tray-down-no-window sweep did not recover the mesh and a power cycle is opted in but held off: {why} "
+                f"(off the bus: {off_bus}/{expected} at onset, {off_bus_after} after the verify)"
+            )
             self.mechanism._journal_auto_recovery_denied(escalation, why)
             metrics.stage_fired("power_cycle", "blocked")
             return OUTCOME_WAITING
-        health_event("tray_down_no_window_power_cycle", off_bus=off_bus, expected=expected)
+        health_event("tray_down_no_window_power_cycle", off_bus=off_bus, off_bus_after=off_bus_after, expected=expected)
         await self.deps.auto_power_cycle_host(
             log, "tray-down-no-window: every reset type ran back-to-back and the mesh did not verify"
         )
@@ -1954,6 +2231,14 @@ class GalaxyRecovery(Recovery):
         sweep re-powers every tray WITHOUT taking the mesh off the bus all at once — unlike the mesh-wide
         reset, which inverted an 8-chip drop to 32 off the bus and can hard-exit.
 
+        Each re-power is followed by a PCI rescan, so a chip the sampler removed from the kernel can come
+        back. The walk stops early, returning False, in two cases: a step took a chip off the bus that was
+        on it before the walk (``ubb_reset_regressed_offbus``), or a chip that was off at the start is still
+        off once every affected tray was re-powered (``ubb_reset_sweep_skipped``): re-powering a healthy
+        tray cannot bring back a chip on another tray. The sweep of the rest is for the case it was written
+        for: every chip back on the bus and the fabric still failing. The device pollers are stopped
+        across the walk, as for every other reset.
+
         Returns True when a tray reset recovered the mesh (the caller clears the hold), False when the walk
         ran and did not (the caller holds; a warm reboot cannot revive a still-off-bus tray, so the next rung
         is the cold power cycle, and the deadline watchdog keeps the hold visible), and None when nothing
@@ -2022,7 +2307,13 @@ class GalaxyRecovery(Recovery):
         # chip. Hold self.mechanism.reset_in_flight across the whole walk so the dead-chip sampler defers instead
         # of isolating a tray mid-reset and tearing it out of the kernel. Cleared on every exit.
         self.mechanism.reset_in_flight = True
+        self.mechanism.reset_since_release = True
+        start_off = set(offbus_ids)
+        quiesced: list = []
+        cancelled_mid_fire = False
         try:
+            # A tray pulse takes chips off the bus: stop the pollers' MMIO across the walk, as for every reset.
+            quiesced = await self.mechanism._set_device_pollers(False, log)
             for step, tray in enumerate(walk):
                 bitmap = 1 << (tray - 1)
                 tray_chip_ids = list(tray_map[tray])
@@ -2040,9 +2331,17 @@ class GalaxyRecovery(Recovery):
                     expected=expected,
                     host_at_risk=True,
                 )
-                log(f"per-tray BMC reset {step + 1}/{len(walk)} ({role}): re-powering tray {tray}: `{command}`")
+                log(
+                    f"per-tray BMC reset {step + 1}/{len(walk)} ({role}): re-powering "
+                    f"{_tray_label(tray, tray_map)}: `{command}`"
+                )
                 try:
                     await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
+                except asyncio.CancelledError:
+                    # Abandoned while the BMC pulse runs on in its thread: the tray may still be off the
+                    # bus, so the pollers stay stopped, as reset_with_quiesce leaves them on a mid-reset cancel.
+                    cancelled_mid_fire = True
+                    raise
                 except Exception as exc:  # noqa: BLE001 - a fire that did not launch falls through, never raises
                     log(f"per-tray BMC reset of tray {tray} failed to launch: {exc!r}; falling to the next rung")
                     health_event("ubb_reset_failed", tray=tray, error=repr(exc))
@@ -2057,11 +2356,53 @@ class GalaxyRecovery(Recovery):
                 # is given time to resolve, and a fabric that never verifies stays NOT healthy — so the
                 # walk never STOPS-and-CLEARS the hold onto a fabric no pass ever proved; a still-degraded
                 # verify just moves the walk to the next tray, exactly like an off-bus one that did not
-                # come back.
+                # come back. The rescan first: a chip removed from the kernel only returns on one.
+                await _rescan_after_tray_step(tray, log)
                 healthy, _evidence, _retries = await self._verify_device_after_reset(expected, log)
                 if healthy:
                     health_event("ubb_reset_recovered", tray=tray, walked=step + 1)
+                    # Back on the bus (the rescan re-added any removed node), so no longer isolated: the
+                    # next gate must not bridge-reset them.
+                    isolated = self.deps.isolated_chips()
+                    for c in start_off:
+                        isolated.discard(c)
                     return True
+                off_now = _offbus_chip_ids(await asyncio.to_thread(self.deps.read_heartbeats) or {}, expected)
+                new_off = off_now - start_off
+                if new_off:
+                    log(
+                        f"per-tray BMC reset {step + 1}/{len(walk)} took chip(s) {sorted(new_off, key=int)} off the "
+                        f"bus that were on it before the walk ({len(start_off)} -> {len(off_now)} of {expected} "
+                        f"off) — stopping the walk; the next rung owns it"
+                    )
+                    health_event(
+                        "ubb_reset_regressed_offbus",
+                        tray=tray,
+                        step=step + 1,
+                        of=len(walk),
+                        new_off=sorted(new_off, key=int),
+                        off_bus_before=len(start_off),
+                        off_bus_after=len(off_now),
+                        expected=expected,
+                        host_at_risk=True,
+                    )
+                    return False
+                # The walk lists the affected trays first, so step len(affected) is the last of them.
+                still_off = off_now & start_off
+                if step + 1 == len(affected) and still_off and step + 1 < len(walk):
+                    log(
+                        f"the affected tray(s) {sorted(affected)} were re-powered and chip(s) "
+                        f"{sorted(still_off, key=int)} are still off the bus — skipping the sweep of the "
+                        f"healthy trays {walk[step + 1:]}, which cannot bring them back; the next rung owns it"
+                    )
+                    health_event(
+                        "ubb_reset_sweep_skipped",
+                        still_off=sorted(still_off, key=int),
+                        walked=step + 1,
+                        skipped=walk[step + 1 :],
+                        expected=expected,
+                    )
+                    return False
             log(
                 "the per-tray reset walk re-powered the affected trays and then the rest, one at a time, and "
                 "the mesh still did not verify — holding; a warm reboot cannot re-enumerate a still-off-bus "
@@ -2071,3 +2412,5 @@ class GalaxyRecovery(Recovery):
             return False
         finally:
             self.mechanism.reset_in_flight = False
+            if quiesced and not cancelled_mid_fire:
+                await asyncio.shield(self.mechanism._set_device_pollers(True, log))

@@ -174,6 +174,10 @@ if [ -d "$clone/deploy" ]; then
     # apply-host-config.sh below.
     install -m 0755 "$clone/deploy/tt-device-eth-heartbeat-probe.py" "$ROOT/eth-heartbeat-probe.py" \
         || { echo "autoupdate: staging eth-heartbeat-probe.py failed (required); not marking current" >&2; exit 1; }
+    # The AICLK ceiling helper (health.aiclk_ceiling; off unless TTDEV_AICLK_CEILING_MHZ is set).
+    # Staged on every update all the same, so a host that opts in later never runs a stale copy.
+    install -m 0755 "$clone/deploy/tt-device-aiclk-ceiling.py" "$ROOT/aiclk-ceiling.py" \
+        || { echo "autoupdate: staging aiclk-ceiling.py failed (required); not marking current" >&2; exit 1; }
     # The reader's interpreter, broker-owned. Pinning a developer's tt-metal python_env makes a
     # health rung die the moment that user rebuilds or moves their tree; tt-exalens ships manylinux
     # wheels on PyPI, so the box owns its own copy at a pinned version. Idempotent, and fail-OPEN:
