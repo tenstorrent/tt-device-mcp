@@ -285,6 +285,9 @@ class Recovery(ABC):
         # after selection later resolves to the other.
         self.mechanism = mechanism
         self.deps = deps
+        # Set fresh by every _recover_isolated_chips call; defined here so the gate can read it
+        # even when no bridge rung has run on this instance yet.
+        self.last_bridge_reset_reasons: dict = {}
 
     @abstractmethod
     def next_stage(self, ev: Evidence) -> str:
