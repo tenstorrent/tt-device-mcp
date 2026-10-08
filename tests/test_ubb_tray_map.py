@@ -17,7 +17,7 @@ import subprocess
 
 import pytest
 
-from tests.conftest import patch_health_event, patch_recovery
+from tests.conftest import patch_health_event, patch_recovery, stub_device_pollers
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.monitors import pci
@@ -271,6 +271,7 @@ def galaxy_seen(monkeypatch, tmp_path):
     monkeypatch.setattr(srv.subprocess, "run", _fake_smi(_galaxy_snapshot()))
     ok, _detail = srv.health_monitor.verify_device_health(32, timeout_sec=5)
     assert ok
+    stub_device_pollers(monkeypatch)
 
 
 def test_the_snapshot_caches_every_chips_bus_id(galaxy_seen):

@@ -659,7 +659,23 @@ def galaxy_trays(monkeypatch):
     # tests/test_ubb_tray_map.py pins the real Blackhole kernel order, where 0xCX comes before 0x8X.
     monkeypatch.setattr(srv.health_monitor, "_chip_buses", dict(enumerate(GALAXY_BUS_IDS)), raising=False)
     monkeypatch.setattr(srv.health_monitor, "_board_types", ["tt-galaxy-bh"] * len(GALAXY_BUS_IDS))
+    stub_device_pollers(monkeypatch)
     return srv.galaxy_recovery._tray_map_now()
+
+
+def stub_device_pollers(monkeypatch, stopped=()) -> list:
+    """Replace the poller stop/start (a real `systemctl stop`, which the spawn tripwire refuses) with
+    a recorder: the per-tray walk quiesces the pollers across its re-powers. ``stopped`` is what the
+    stop reports it touched (empty: nothing to restore). Returns the list of `active` flags it was
+    called with."""
+    calls: list = []
+
+    async def pollers(active, log):
+        calls.append(active)
+        return list(stopped)
+
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    return calls
 
 
 def patch_health_event(monkeypatch, fn) -> None:

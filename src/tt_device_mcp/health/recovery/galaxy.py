@@ -815,6 +815,23 @@ def _pci_rescan() -> None:
     Path("/sys/bus/pci/rescan").write_text("1")
 
 
+# The per-tray walk's settle after the PCI rescan that follows each tray re-power, before the verify.
+UBB_WALK_RESCAN_SETTLE_SEC = 3
+
+
+async def _rescan_after_tray_step(tray: int, log) -> None:
+    """One PCI rescan after a tray re-power, then a short settle. A re-power does not undo the
+    dead-chip sampler's ``remove``, so without it an isolated chip could never verify back (the
+    rescan :meth:`ResetMechanism.reset_with_quiesce` makes after every reset). A failed write is
+    logged and the verify runs anyway."""
+    try:
+        await asyncio.to_thread(_pci_rescan)
+    except OSError as e:
+        log(f"PCI rescan after the tray {tray} re-power failed ({e}); verifying anyway")
+        return
+    await asyncio.sleep(UBB_WALK_RESCAN_SETTLE_SEC)
+
+
 def tray_down_capture_enabled() -> bool:
     """``TT_DEVICE_MCP_TRAY_DOWN_CAPTURE``: the rescan and capture in front of the ladder for a
     tray-down onset. ON by default; ``0`` turns it off and every drop goes straight to the ladder."""
@@ -2214,6 +2231,14 @@ class GalaxyRecovery(Recovery):
         sweep re-powers every tray WITHOUT taking the mesh off the bus all at once — unlike the mesh-wide
         reset, which inverted an 8-chip drop to 32 off the bus and can hard-exit.
 
+        Each re-power is followed by a PCI rescan, so a chip the sampler removed from the kernel can come
+        back. The walk stops early, returning False, in two cases: a step took a chip off the bus that was
+        on it before the walk (``ubb_reset_regressed_offbus``), or a chip that was off at the start is still
+        off once every affected tray was re-powered (``ubb_reset_sweep_skipped``): re-powering a healthy
+        tray cannot bring back a chip on another tray. The sweep of the rest is for the case it was written
+        for: every chip back on the bus and the fabric still failing. The device pollers are stopped
+        across the walk, as for every other reset.
+
         Returns True when a tray reset recovered the mesh (the caller clears the hold), False when the walk
         ran and did not (the caller holds; a warm reboot cannot revive a still-off-bus tray, so the next rung
         is the cold power cycle, and the deadline watchdog keeps the hold visible), and None when nothing
@@ -2283,7 +2308,12 @@ class GalaxyRecovery(Recovery):
         # of isolating a tray mid-reset and tearing it out of the kernel. Cleared on every exit.
         self.mechanism.reset_in_flight = True
         self.mechanism.reset_since_release = True
+        start_off = set(offbus_ids)
+        quiesced: list = []
+        cancelled_mid_fire = False
         try:
+            # A tray pulse takes chips off the bus: stop the pollers' MMIO across the walk, as for every reset.
+            quiesced = await self.mechanism._set_device_pollers(False, log)
             for step, tray in enumerate(walk):
                 bitmap = 1 << (tray - 1)
                 tray_chip_ids = list(tray_map[tray])
@@ -2307,6 +2337,11 @@ class GalaxyRecovery(Recovery):
                 )
                 try:
                     await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
+                except asyncio.CancelledError:
+                    # Abandoned while the BMC pulse runs on in its thread: the tray may still be off the
+                    # bus, so the pollers stay stopped, as reset_with_quiesce leaves them on a mid-reset cancel.
+                    cancelled_mid_fire = True
+                    raise
                 except Exception as exc:  # noqa: BLE001 - a fire that did not launch falls through, never raises
                     log(f"per-tray BMC reset of tray {tray} failed to launch: {exc!r}; falling to the next rung")
                     health_event("ubb_reset_failed", tray=tray, error=repr(exc))
@@ -2321,11 +2356,53 @@ class GalaxyRecovery(Recovery):
                 # is given time to resolve, and a fabric that never verifies stays NOT healthy — so the
                 # walk never STOPS-and-CLEARS the hold onto a fabric no pass ever proved; a still-degraded
                 # verify just moves the walk to the next tray, exactly like an off-bus one that did not
-                # come back.
+                # come back. The rescan first: a chip removed from the kernel only returns on one.
+                await _rescan_after_tray_step(tray, log)
                 healthy, _evidence, _retries = await self._verify_device_after_reset(expected, log)
                 if healthy:
                     health_event("ubb_reset_recovered", tray=tray, walked=step + 1)
+                    # Back on the bus (the rescan re-added any removed node), so no longer isolated: the
+                    # next gate must not bridge-reset them.
+                    isolated = self.deps.isolated_chips()
+                    for c in start_off:
+                        isolated.discard(c)
                     return True
+                off_now = _offbus_chip_ids(await asyncio.to_thread(self.deps.read_heartbeats) or {}, expected)
+                new_off = off_now - start_off
+                if new_off:
+                    log(
+                        f"per-tray BMC reset {step + 1}/{len(walk)} took chip(s) {sorted(new_off, key=int)} off the "
+                        f"bus that were on it before the walk ({len(start_off)} -> {len(off_now)} of {expected} "
+                        f"off) — stopping the walk; the next rung owns it"
+                    )
+                    health_event(
+                        "ubb_reset_regressed_offbus",
+                        tray=tray,
+                        step=step + 1,
+                        of=len(walk),
+                        new_off=sorted(new_off, key=int),
+                        off_bus_before=len(start_off),
+                        off_bus_after=len(off_now),
+                        expected=expected,
+                        host_at_risk=True,
+                    )
+                    return False
+                # The walk lists the affected trays first, so step len(affected) is the last of them.
+                still_off = off_now & start_off
+                if step + 1 == len(affected) and still_off and step + 1 < len(walk):
+                    log(
+                        f"the affected tray(s) {sorted(affected)} were re-powered and chip(s) "
+                        f"{sorted(still_off, key=int)} are still off the bus — skipping the sweep of the "
+                        f"healthy trays {walk[step + 1:]}, which cannot bring them back; the next rung owns it"
+                    )
+                    health_event(
+                        "ubb_reset_sweep_skipped",
+                        still_off=sorted(still_off, key=int),
+                        walked=step + 1,
+                        skipped=walk[step + 1 :],
+                        expected=expected,
+                    )
+                    return False
             log(
                 "the per-tray reset walk re-powered the affected trays and then the rest, one at a time, and "
                 "the mesh still did not verify — holding; a warm reboot cannot re-enumerate a still-off-bus "
@@ -2335,3 +2412,5 @@ class GalaxyRecovery(Recovery):
             return False
         finally:
             self.mechanism.reset_in_flight = False
+            if quiesced and not cancelled_mid_fire:
+                await asyncio.shield(self.mechanism._set_device_pollers(True, log))
