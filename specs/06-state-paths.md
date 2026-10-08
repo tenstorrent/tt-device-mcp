@@ -65,6 +65,39 @@ and job exit statuses never hit disk.
   broker down); but the setup paths are loud: `per_user_daemon_env` warns when it cannot create a
   redirect target, and preflight *fails* on an unwritable health dir when health checks are on
   (warns when off).
+- **I8 — Every device op holds an advisory flock that external device writers can test.**
+  `_device_op()` takes `fcntl.flock(LOCK_EX)` on `device_op_flock()` (default
+  `/run/tt-device-broker/device-op.flock`, a sibling of the inhibit file) after it gets the
+  in-process device lock and holds it until the op ends: on return, on an exception and on
+  cancellation. The fd is opened `O_CLOEXEC` (and `O_NOFOLLOW`, mode 0600 on create), so no reset
+  tool, fabric probe or job the op starts inherits the lock. The broker never unlinks the file,
+  but the system broker's `/run/tt-device-broker` is the unit's `RuntimeDirectory=`, which systemd
+  removes, file included, every time the broker stops (an auto-update, a watchdog restart). The
+  next device op creates the file again, on a new inode. The broker waits for the lock without blocking the event loop (non-blocking retries
+  every 50 ms) for at most `TT_DEVICE_MCP_DEVICE_OP_FLOCK_TIMEOUT_SEC` (10 s). While it waits it
+  logs the holder's pid, read from `/proc/locks`. If the hold outlasts the timeout, the op goes
+  ahead without the flock, with a WARNING naming the holder and a `device_op_flock_timeout`
+  journal event; it is never refused or failed for it (see Design decisions). The
+  `device_op_begin` journal event is written before the flock is taken, so its `waited_sec` counts
+  only the wait for the in-process device lock; a wait for the flock shows in the server log. A
+  file that cannot be opened (a per-user daemon without the directory) means the op runs as before. With no
+  external user the lock is always free at once, so nothing about an op's timing, rungs or order
+  changes.
+
+  **External-tool contract.** A tool that writes to the device outside the broker opens the path
+  fresh for each write attempt: open (read-only is enough; never create, truncate or unlink it),
+  `flock(fd, LOCK_EX | LOCK_NB)` immediately before ONE short write, the write, then close, which
+  releases the lock. It must not keep one fd open across attempts: after a broker restart that fd
+  points at the removed file, and locking it excludes nothing. (A tool that must keep its fd checks
+  before each attempt that `fstat(fd).st_ino == stat(path).st_ino`, and reopens when they differ.)
+  On `EWOULDBLOCK` it skips that write and tries again later. It never blocks on the lock and never
+  holds it across a sleep, a loop or a subprocess. `ENOENT` means no lock is on offer right now (an
+  older broker, or one that has not run a device op since it started): keep whatever checks the
+  tool used before. On the system broker the file is root's, mode 0600, so that tenants cannot
+  hold resets back; a tool that is not root gets `EACCES` and cannot take part. It must run as
+  root, or else report the error and fall back to its old checks, never treat `EACCES` as a free
+  lock. The lock is advisory and only covers the broker's own device ops, not tenant jobs, which
+  run outside `_device_op()`.
 
 ## Path matrix
 
@@ -83,6 +116,7 @@ and job exit statuses never hit disk.
 | Metrics textfile | `/var/lib/prometheus/node-exporter/tt_device_mcp.prom` | `<state>/metrics/tt_device_mcp.prom` | `TT_DEVICE_MCP_TEXTFILE_DIR` |
 | Job exit records | `/run/tt-device-broker/jobexit/` (sticky 1777) | `<state>/jobexit/` (exported by the CLI, 0700 base) | `TT_DEVICE_MCP_JOB_EXIT_DIR` |
 | Device-op inhibit lock | `/run/tt-device-broker/device-op.lock` | `<state>/device-op.lock` (exported by the CLI) | `TT_DEVICE_MCP_DEVICE_OP_LOCK` |
+| Device-op advisory flock (I8) | `/run/tt-device-broker/device-op.flock` | `<state>/device-op.flock` (sibling of the inhibit lock) | `TT_DEVICE_MCP_DEVICE_OP_FLOCK` |
 | Daemon pid / daemon stdout | n/a (systemd / journald) | `<state>/daemon.pid`, `<state>/daemon.log` | follows the state base |
 | Host config | `/etc/default/tt-device-broker` (written by installer, sourced by apply-host-config, autoupdate, and the Slurm hooks) | n/a | `TTDEV_ETC_DEFAULT` (apply-host-config's render/test seam; also a real runtime override for the Slurm hooks, which source it unconditionally on every invocation) |
 | Per-user client prefs (CLI-side, any shape) | `~/.config/tt-device-mcp/timezone` (`XDG_CONFIG_HOME` honored) | same | `TT_DEVICE_MCP_TZ` beats the saved timezone |
@@ -152,6 +186,8 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_TEXTFILE_DIR` | euid-split (matrix) | Prometheus textfile directory | 06 |
 | `TT_DEVICE_MCP_JOB_EXIT_DIR` | `/run/tt-device-broker/jobexit` | Where jobs record their own exit status | 06 |
 | `TT_DEVICE_MCP_DEVICE_OP_LOCK` | `/run/tt-device-broker/device-op.lock` | Restart-inhibit file for in-flight device ops | 06 |
+| `TT_DEVICE_MCP_DEVICE_OP_FLOCK` | sibling `device-op.flock` of the inhibit file | Advisory flock held for every device op, for external device writers (I8) | 06 |
+| `TT_DEVICE_MCP_DEVICE_OP_FLOCK_TIMEOUT_SEC` | `10` | Longest the broker waits on an external holder before going ahead without the flock (I8) | 06 |
 | `TT_DEVICE_MCP_INSTALL_DIR` | `/tmp/tt-device-mcp-<uid>` | Per-user base: venv, CLI symlink, and `state/` (deploy-defined, install-user.sh) | 06/08 |
 | `TT_DEVICE_MCP_PRIVSEP` | unset (off) | Run each job as its submitter via systemd-run | 05 |
 | `TT_DEVICE_MCP_DEVICE_GROUP` | unset (off) | Group-membership admission gate for jobs (device lock) | 05 |
@@ -312,6 +348,21 @@ the misconfiguration produced no error, only absent state discovered after the r
 to survive. Resolution by euid makes the safe path the default in both shapes; the env var remains
 for tests and unusual layouts, never as the mechanism that makes a stock deployment correct.
 
+**A separate flock file, not the inhibit file.** `device-op.lock` means "an op is in flight" by
+existing: the broker writes it at the start of each op and unlinks it at the end, and the
+auto-updater removes it when its pid is gone. A flock on that file would be taken on a fresh inode
+each op, and a tool that opened the path earlier would lock the old, unlinked inode and exclude
+nobody. Keeping the inhibit file unchanged also keeps the auto-updater, which reads it by
+presence and pid, working as before.
+
+**On timeout the op goes ahead.** External holds are milliseconds; a hold of 10 s is a tool
+breaking the contract, or one that is stuck. Refusing or failing the op would hand that tool a way
+to stall recovery: a failed gate leaves the device dirty, and the next reset attempt would meet
+the same lock and climb the ladder toward a power cycle because of a lock, not a fault. Going
+ahead loses only what the lock adds (a cooperating tool skipping its write), which is the
+behaviour without the lock. The WARNING and the journal event make it visible. A holder that dies
+releases the lock with its last fd, as every flock does.
+
 ## Test anchors
 
 | Claim | Anchors (pytest node ids) |
@@ -329,3 +380,7 @@ for tests and unusual layouts, never as the mechanism that makes a stock deploym
 | Jobexit perms (1777 only at the shared default) | `tests/test_readopt.py::test_a_redirected_job_exit_dir_is_not_made_world_writable` |
 | Textfile write behavior (atomic, creates dir, never raises, logs once, recovers) | `tests/test_metrics.py::test_write_textfile_is_atomic_and_leaves_no_tmp`, `tests/test_metrics.py::test_write_textfile_creates_the_directory`, `tests/test_metrics.py::test_write_textfile_never_raises_when_directory_is_unwritable`, `tests/test_metrics.py::test_write_textfile_logs_the_failure_once_per_process`, `tests/test_metrics.py::test_write_textfile_recovers_once_the_directory_is_writable_again`, `tests/test_state_paths.py::test_non_root_textfile_writer_writes_and_leaves_no_tmp` |
 | Per-user daemon health gating on by default, overridable off | `tests/test_install_modes.py::test_the_per_user_daemon_health_gates_like_any_other`, `tests/test_install_modes.py::test_an_operator_can_still_turn_the_gate_off` |
+| I8 (flock held for the op, released on return, exception and cancel) | `tests/test_device_op_flock.py::test_the_flock_is_held_for_the_op_and_released_after`, `tests/test_device_op_flock.py::test_the_flock_is_released_when_the_op_raises`, `tests/test_device_op_flock.py::test_the_flock_is_released_when_the_op_is_cancelled` |
+| I8 (children never inherit it) | `tests/test_device_op_flock.py::test_children_never_inherit_the_flock` |
+| I8 (path: sibling of the inhibit file, own override) | `tests/test_device_op_flock.py::test_the_flock_defaults_to_a_sibling_of_the_inhibit_file` |
+| I8 (a short hold delays; one past the timeout is logged and does not stall the op; unopenable path is inert) | `tests/test_device_op_flock.py::test_a_short_external_hold_only_delays_the_op`, `tests/test_device_op_flock.py::test_a_holder_that_outlasts_the_timeout_does_not_stall_the_op`, `tests/test_device_op_flock.py::test_an_unopenable_flock_path_changes_nothing` |

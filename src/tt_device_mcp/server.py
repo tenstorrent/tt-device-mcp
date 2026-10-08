@@ -20,6 +20,8 @@ Claude Configuration:
 
 import argparse
 import asyncio
+import errno
+import fcntl
 import json
 import logging
 import math
@@ -1456,6 +1458,106 @@ def device_op_inhibit() -> Path:
     return Path(os.environ.get("TT_DEVICE_MCP_DEVICE_OP_LOCK", "").strip() or DEVICE_OP_INHIBIT_DEFAULT)
 
 
+# An advisory flock (LOCK_EX) the broker holds for the whole of every device op, so that an external
+# tool that writes to the device can stay out of a reset's way: it takes LOCK_EX|LOCK_NB on this file
+# just before one short write and skips the write when the lock is busy. A sibling file, not the
+# inhibit file above: that one is unlinked at the end of every op (and removed by the auto-updater
+# when stale), and a flock on an unlinked inode excludes nobody who opened the new one. The broker
+# never removes this file, but systemd removes its RuntimeDirectory, file included, whenever the
+# broker stops; the next op creates it again on a new inode. So an external tool opens the path fresh
+# for every write attempt rather than keeping an fd. Spec 06 I8.
+DEVICE_OP_FLOCK_NAME = "device-op.flock"
+# External holds are one short write, milliseconds. A hold longer than this is a tool breaking the
+# contract, and it must not stall a reset: the op goes ahead, loudly (spec 06 I8).
+DEVICE_OP_FLOCK_TIMEOUT_SEC = float(os.environ.get("TT_DEVICE_MCP_DEVICE_OP_FLOCK_TIMEOUT_SEC", "10"))
+DEVICE_OP_FLOCK_POLL_SEC = 0.05
+
+
+def device_op_flock() -> Path:
+    """The advisory device-op flock file. Late-bound (spec 06 I5); defaults to a sibling of the
+    inhibit file, so the per-user daemon's redirect of that file moves this one too."""
+    explicit = os.environ.get("TT_DEVICE_MCP_DEVICE_OP_FLOCK", "").strip()
+    return Path(explicit) if explicit else device_op_inhibit().with_name(DEVICE_OP_FLOCK_NAME)
+
+
+def _flock_holder_pids(fd: int) -> list[int]:
+    """Pids /proc/locks names as holding a flock on the same file as ``fd``, other than us. Matched
+    on the inode alone: /proc/locks prints the superblock's device, which on some filesystems is
+    not the st_dev that fstat reports. Only ever used to name a holder in a log line."""
+    try:
+        want = f":{os.fstat(fd).st_ino}"
+        pids = []
+        with open("/proc/locks") as f:
+            for line in f:
+                parts = line.split()
+                if "->" in parts or len(parts) < 6 or parts[1] != "FLOCK":
+                    continue
+                if parts[5].endswith(want) and int(parts[4]) != os.getpid():
+                    pids.append(int(parts[4]))
+        return pids
+    except (OSError, ValueError):
+        return []
+
+
+async def _acquire_device_op_flock(name: str) -> Optional[int]:
+    """Take the device-op flock, waiting at most DEVICE_OP_FLOCK_TIMEOUT_SEC. Returns the fd to
+    release, or None when the op goes ahead without it: the file cannot be opened (a per-user
+    daemon without the directory, an unwritable path) or an external holder outlasted the timeout.
+    The fd is O_CLOEXEC so no reset tool or job ever inherits the lock."""
+    path = device_op_flock()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return None
+    started = time.monotonic()
+    holders: list[int] = []
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                    raise
+            if not holders:
+                holders = _flock_holder_pids(fd)
+                if logger:
+                    logger.info(
+                        f"DEVICE-OP {name}: waiting for {path} "
+                        f"(held by pid {','.join(map(str, holders)) or 'unknown'})"
+                    )
+            if time.monotonic() - started >= DEVICE_OP_FLOCK_TIMEOUT_SEC:
+                holders = _flock_holder_pids(fd) or holders
+                if logger:
+                    logger.warning(
+                        f"DEVICE-OP {name}: {path} still held by pid "
+                        f"{','.join(map(str, holders)) or 'unknown'} after "
+                        f"{DEVICE_OP_FLOCK_TIMEOUT_SEC:.0f}s; going ahead without it"
+                    )
+                health_event("device_op_flock_timeout", op=name, holders=holders)
+                os.close(fd)
+                return None
+            await asyncio.sleep(DEVICE_OP_FLOCK_POLL_SEC)
+    except BaseException:
+        os.close(fd)
+        raise
+    waited = time.monotonic() - started
+    if holders and logger:
+        logger.info(f"DEVICE-OP {name}: waited {waited:.2f}s for {path}")
+    return fd
+
+
+def _release_device_op_flock(fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+
+
 @asynccontextmanager
 async def _device_op(name: str, owner: str = "[broker]"):
     """Serialize one device-touching operation and shield it from restarts.
@@ -1466,6 +1568,9 @@ async def _device_op(name: str, owner: str = "[broker]"):
       * inhibition — while this is held, the auto-updater defers, so nothing
         restarts the broker (and, via KillMode=control-group, kills the device
         command) partway through.
+      * advisory host-wide exclusion — the device-op flock (device_op_flock()) is held
+        for the same span, so a cooperating external tool can skip its device write
+        instead of landing it in the middle of a reset.
 
     ``owner`` is who asked for it. The running row used to say "[broker]" for every op,
     so an operator watching their own reset saw the broker doing something to the device
@@ -1497,9 +1602,12 @@ async def _device_op(name: str, owner: str = "[broker]"):
             pass
         health_event("device_op_begin", op=name, waited_sec=round(held, 1))
         t0 = time.monotonic()
+        flock_fd = None
         try:
+            flock_fd = await _acquire_device_op_flock(name)
             yield
         finally:
+            _release_device_op_flock(flock_fd)
             health_event("device_op_end", op=name, seconds=round(time.monotonic() - t0, 1))
             device_op_active = ""
             device_op_owner = "[broker]"
