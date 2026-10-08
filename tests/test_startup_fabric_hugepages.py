@@ -87,14 +87,14 @@ def test_the_broker_waits_only_when_the_expected_chip_count_is_set(monkeypatch):
 # --- the fabric wrapper's reason and the action-log output -------------------------------------
 
 
-def test_override_reason_prefers_the_first_cpp_failure_line():
+def test_override_reason_prefers_the_cause_over_the_terminate_banner():
     text = (
         "fabric-check: validating 32 chips\n"
         "terminate called after throwing an instance of 'std::runtime_error'\n"
         "  what():  Failed to allocate 32 hugepages\n"
         "fabric-check: no link was tested\n"
     )
-    assert health_monitor_mod._override_reason(text).startswith("terminate called after throwing")
+    assert health_monitor_mod._override_reason(text) == "what():  Failed to allocate 32 hugepages"
 
 
 def test_override_reason_finds_a_filesystem_error():
@@ -172,6 +172,8 @@ def _startup(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv, "device_op_lock", None)
     monkeypatch.setattr(srv, "device_op_active", "")
     monkeypatch.setattr(srv, "readopted_scopes", {})
+    # Other suites leave chips isolated; a startup 77-only hold needs none.
+    monkeypatch.setattr(srv, "isolated_chips", set())
     events = []
     patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
     rows = []

@@ -211,6 +211,10 @@ Description=Tenstorrent device MCP broker (multi-tenant arbiter)
 After=network.target
 # The startup fabric pass needs the 1G hugepage pool; start after its mount where the host has one
 # (a Wants= on a unit the host lacks is a no-op). The broker still waits for the page count itself.
+# Never After=tenstorrent-hugepages.service: that unit is After=multi-user.target, and this one
+# (and ltx-host, After= it) are ordered before multi-user.target, so it closes an ordering cycle
+# and systemd breaks it at boot by deleting the broker's or ltx-host's start job. A drop-in cannot
+# remove the vendor's After=; the in-process wait covers the 16-22 s it takes to fill the pool.
 Wants=dev-hugepages\x2d1G.mount
 After=dev-hugepages\x2d1G.mount
 [Service]

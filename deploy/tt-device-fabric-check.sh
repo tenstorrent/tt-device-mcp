@@ -157,7 +157,16 @@ elif grep -qE "Workload execution timed out after [0-9]+ seconds" "$RUNLOG"; the
     log "fabric UNHEALTHY (rc=$rc): traffic stalled until the validator's watchdog fired; no link reported back -> resettable"
     [ "$rc" -eq "$EXIT_CANNOT_CHECK" ] && rc=1
 else
-    reason="$(grep -m1 -oE 'what\(\):.*|filesystem error:.*|terminate called.*' "$RUNLOG" | head -1)"
+    # The validator's FIRST error line, most specific first (same order as fabric.first_reason):
+    # "terminate called after throwing ..." sits on the line ABOVE "  what():  <cause>", so a single
+    # first-match grep kept the exception type and dropped the cause — a missing hugepage pool read
+    # as a bare UmdException.
+    reason=""
+    for pat in 'what\(\):.*' 'filesystem error:.*' \
+        '(\|\s*(critical|fatal|error)\s*\||\[(critical|error)\]|TT_THROW|TT_FATAL).*' 'terminate called.*'; do
+        reason="$(grep -m1 -oiE "$pat" "$RUNLOG" | head -1 | cut -c1-300)"
+        [ -n "$reason" ] && break
+    done
     [ -n "$reason" ] || reason="last output: $(grep -vE '^\s*$' "$RUNLOG" | sed -n '$p' | cut -c1-200)"
     # The reason goes on the FINAL line: an operator's wrapper is summarized by its last line, and
     # a cause printed above it was dropped from every log that quoted the check.

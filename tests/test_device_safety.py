@@ -13149,3 +13149,29 @@ async def test_the_runner_tells_the_post_job_gate_when_a_failed_job_never_reache
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_startup_gate_77_leaves_a_77_only_hold_that_no_path_resets(monkeypatch, tmp_path):
+    """Spec 03 I34. A broker start whose forced fabric pass exits 77 (hugepages not yet allocated,
+    seen on two galaxies on 2026-10-08) holds fabric-unverified, runs no reset, and leaves a hold
+    that neither the idle generic escalation nor the forced escalation may reset."""
+    resets = _gate_with_verdict(
+        monkeypatch,
+        tmp_path,
+        (True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": "could not run (77)"}}),
+    )
+    for i in range(1, 4):
+        (tmp_path / str(i)).write_text("")
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: 4)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_RELIFT", raising=False)
+    srv.fsm.on_fault("startup_unverified", detail="broker start", dirty=False)
+
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+
+    assert resets["n"] == 0, "a startup 77 must never reset"
+    assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY and not srv.fsm.record.dirty
+    assert srv._fabric_77_only_hold()
+    assert srv._idle_relift_armed()[2] is False, "the generic idle escalation must not own a 77-only hold"
