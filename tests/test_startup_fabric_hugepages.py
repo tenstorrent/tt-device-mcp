@@ -172,6 +172,8 @@ def _startup(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv, "device_op_lock", None)
     monkeypatch.setattr(srv, "device_op_active", "")
     monkeypatch.setattr(srv, "readopted_scopes", {})
+    # Other suites leave chips isolated; a startup 77-only hold needs none.
+    monkeypatch.setattr(srv, "isolated_chips", set())
     events = []
     patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
     rows = []
