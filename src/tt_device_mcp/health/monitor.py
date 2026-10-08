@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import signal
 import subprocess
 import time
@@ -39,23 +38,19 @@ from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
 # the tail, where a wrapper prints its verdict, bounded so a chatty validator cannot fill the disk.
 ACTION_LOG_OUTPUT_CHARS = 8000
 
-# The lines that name WHY a C++ validator stopped: an uncaught exception's what(), a std::filesystem
-# error, or the bare terminate banner. Matched anywhere in a wrapper's output, first hit wins.
-_REASON_RE = re.compile(r"(what\(\):.*|filesystem error:.*|terminate called.*)")
-
 
 def _override_reason(text: str) -> str:
     """The reason an operator's fabric wrapper gives for its exit code, as one line.
 
-    The first line naming a C++ failure (what(), a filesystem error, 'terminate called') wins:
-    the wrapper prints its verdict AFTER the validator's own output, and a multi-line verdict
-    put the cause on a line above the last, so the last line alone said "no link was tested"
-    and dropped why. With no such line, the last line is the wrapper's own verdict."""
+    The validator's first error line wins (see :func:`fabric.first_reason`: what() before the
+    'terminate called' banner above it): the wrapper prints its verdict AFTER the validator's own
+    output, and a multi-line verdict put the cause on a line above the last, so the last line alone
+    said "no link was tested" and dropped why. With no such line, the last line is the wrapper's
+    own verdict."""
+    reason = fabric.first_reason(text)
+    if reason:
+        return reason
     lines = [line for line in text.splitlines() if line.strip()]
-    for line in lines:
-        m = _REASON_RE.search(line)
-        if m:
-            return m.group(1).strip()
     return lines[-1].strip() if lines else "(no output)"
 
 

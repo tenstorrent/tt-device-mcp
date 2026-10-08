@@ -231,3 +231,13 @@ def test_aiclk_ceiling_set_reaches_the_unit(tmp_path):
     assert line in unit
     assert unit.index(line) < unit.index("ExecStart=")
     assert "TT_DEVICE_MCP_AICLK_CEILING_CMD" not in unit
+
+
+def test_the_unit_never_orders_after_the_vendor_hugepages_service(tmp_path):
+    # tenstorrent-hugepages.service is After=multi-user.target and the broker is ordered before it
+    # (WantedBy=), so an After= on it is a boot ordering cycle: systemd deletes the broker's (or
+    # ltx-host's) start job to break it. The broker waits for the pool in-process instead.
+    unit = _render(tmp_path, _GALAXY)
+    deps = [ln for ln in unit.splitlines() if ln.split("=", 1)[0] in ("After", "Wants", "Requires", "BindsTo")]
+    assert not [ln for ln in deps if "tenstorrent-hugepages" in ln]
+    assert "Wants=dev-hugepages\\x2d1G.mount" in deps
