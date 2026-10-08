@@ -280,6 +280,12 @@ flowchart LR
 
 - On broker shutdown (CancelledError in the runner) a RUNNING job is left alive in its
   scope — no kill, no footer — for the next broker to re-adopt.
+- That cancel always ends the runner, even when it lands as a job ends. Before Python 3.12,
+  `asyncio.wait_for` returns the inner result and drops a cancel that arrives in the same loop
+  step (bpo-42130); the runner then went back to the queue and waited forever, so shutdown
+  never finished. The timed waits the runner makes (the job's output readers and, between
+  jobs, the dispatch probe, eth read, subprocess probes, reset wait and poller stop/start) use
+  `aio.wait_for`, which has `asyncio.wait_for`'s contract but is built on `asyncio.wait`.
 - At startup, `reconcile_running_scopes` re-adopts every active `ttdev-job-*.scope`:
   the job is reconstructed from its log header (`_job_from_log` — owner, command,
   queued/started, TIMEOUT), registered RUNNING, and `_monitor_readopted_scope` polls the
@@ -371,3 +377,4 @@ flowchart LR
 | B-Log format | `tests/test_recent_jobs.py::test_recent_jobs_parses_and_limits`, `tests/test_recent_jobs.py::test_the_footer_survives_a_reset_worth_of_gate_output`, `tests/test_recent_jobs.py::test_a_job_printing_status_of_its_own_is_still_unfinished` |
 | B-Ids/`Job` basics | `tests/test_server.py::TestJob::test_job_status_values`, `tests/test_server.py::TestJob::test_runtime_sec_property`, `tests/test_server.py::TestJob::test_wait_sec_property` |
 | Re-adoption scope naming | `tests/test_readopt.py::test_scope_unit_roundtrip`, `tests/test_readopt.py::test_list_active_job_scopes_parses` |
+| B-Shutdown (a cancel that lands as a job ends still ends the runner) | `tests/test_aio.py::test_a_cancel_that_lands_as_the_inner_work_ends_is_not_dropped`, `tests/test_aio.py::test_cancel_also_cancels_the_inner_work`, `tests/test_aio.py::test_timeout_cancels_the_inner_work_and_raises_timeout` |
