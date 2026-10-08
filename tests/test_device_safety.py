@@ -5349,6 +5349,104 @@ async def test_an_error_escaping_job_cleanup_fails_closed(monkeypatch, clear_job
         await asyncio.gather(runner, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_an_error_escaping_before_spawn_forgets_the_queued_spec(monkeypatch, clear_job_state, tmp_path):
+    """01 Completion. An error escaping before the job spawns leaves it FAILED with its spec still
+    under queued/ (only a live scope drops it). A restart would restore that spec and run a job the
+    tenant was already told FAILED. The fail-closed path must drop the spec and write the footer."""
+    _free_device_lock(monkeypatch)
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: None)
+
+    def _boom(*a, **k):
+        raise RuntimeError("activation exploded")
+
+    monkeypatch.setattr(srv, "get_activation_script", _boom)
+    gates = []
+
+    async def _gate(job_log_file, job_failed=False):
+        gates.append(job_failed)
+        srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
+    log = tmp_path / "909.log"
+    job = srv.Job(
+        id="909",
+        owner="tenant",
+        workspace="/tmp",
+        command="echo one",
+        queued_at=datetime.now().isoformat(),
+        log_file=str(log),
+    )
+    srv.jobs[job.id] = job
+    srv._persist_queued_job(job)
+    assert srv._queued_spec_path("909").exists(), "precondition: the spec was persisted"
+    await srv.get_job_queue().put(job.id)
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _wait_for(lambda: bool(gates))
+        assert job.status is srv.JobStatus.FAILED
+        assert not srv._queued_spec_path(
+            "909"
+        ).exists(), "a job reported FAILED kept its queued spec: a restart would run it again"
+        assert srv._parse_job_log_footer(log.read_text().splitlines()), "the failed job's log has no footer"
+        assert not runner.done(), "the error ended the runner"
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.parametrize("where", ["cleanup", "before-spawn"])
+@pytest.mark.asyncio
+async def test_a_fail_closed_gate_holds_the_idle_self_test_off_until_it_ends(monkeypatch, clear_job_state, where):
+    """01 Completion x 03 I28. The fail-closed path runs a post-job gate like any other: the idle
+    eth self-test retry must wait it out (post_job_gate_pending), and the flag must drop once the
+    gate ends. Before, an error escaping cleanup left the flag set after its gate, so the idle
+    retry stayed off until another job ran."""
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: None)
+    if where == "cleanup":
+        monkeypatch.setattr(srv, "stats", _FullDiskStats())
+    else:
+
+        def _boom(*a, **k):
+            raise RuntimeError("activation exploded")
+
+        monkeypatch.setattr(srv, "get_activation_script", _boom)
+    seen = []
+
+    async def _gate(job_log_file, job_failed=False):
+        seen.append(srv.post_job_gate_pending)
+        srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
+    job = srv.Job(id="910", owner="tenant", workspace="/tmp", command="echo one", queued_at="t")
+    srv.jobs[job.id] = job
+    await srv.get_job_queue().put(job.id)
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _wait_for(lambda: bool(seen) and srv.get_job_queue().empty())
+        await asyncio.sleep(0.05)
+        assert all(seen), f"a gate ran with the idle self-test free to start beside it: {seen}"
+        assert not srv.post_job_gate_pending, "the flag outlived the fail-closed gate"
+        assert not runner.done(), "the error ended the runner"
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.parametrize("raw, want", [("", 800), ("950", 950), ("fast", 800), ("0", 800), ("-5", 800)])
+def test_idle_aiclk_ceiling_falls_back_on_a_bad_value(monkeypatch, raw, want):
+    """A bad TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ must not stop the broker from importing."""
+    monkeypatch.setenv("TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ", raw)
+    assert srv._idle_aiclk_max_mhz() == want
+
+
 def test_aiclk_left_busy_names_only_chips_above_the_idle_clock(monkeypatch):
     """03 B-post-job clock check. A chip still at the busy clock once nothing holds it was not
     closed. Values it cannot read are not evidence either way."""
