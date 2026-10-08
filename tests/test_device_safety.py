@@ -52,6 +52,7 @@ from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery.galaxy import GalaxyRecovery
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
 from tt_device_mcp.health.recovery.stages import bridge_reset as bridge
+from tt_device_mcp.job_reap import Survivor
 
 
 def _no_holders(monkeypatch):
@@ -4146,7 +4147,7 @@ async def test_exec_timeout_kills_the_command_it_gave_up_on(monkeypatch, tmp_pat
     srv.jobs.clear()
     marker = tmp_path / "exec_orphan"
     logged = []
-    monkeypatch.setattr(srv, "write_action_log", lambda owner, cmd, rt, status, ec: logged.append(status))
+    monkeypatch.setattr(srv, "write_action_log", lambda owner, cmd, rt, status, ec, **k: logged.append(status))
     mcp = srv.create_mcp_server()
 
     out = await mcp.call_tool(
@@ -5514,6 +5515,173 @@ async def test_hung_silence_of_zero_disables_the_reaper(monkeypatch, clear_job_s
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
+
+
+# --- the survivor sweep ------------------------------------------------------
+#
+# The ladder signals the job's process group (or its scope). A child that started its own
+# session is out of that group's reach, and one stuck in the kernel outlives SIGKILL; either
+# keeps the device open while the next job is released onto it. After every job the runner
+# sweeps what is left, SIGTERM then SIGKILL, and a survivor that may hold the device marks it
+# dirty so the next job waits.
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+async def _run_one(job, limit_sec: float = 15.0):
+    srv.jobs[job.id] = job
+    await srv.get_job_queue().put(job.id)
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        deadline = time.monotonic() + limit_sec
+        while job.finished_at is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_child_that_left_the_session_does_not_outlive_its_job(monkeypatch, clear_job_state):
+    """`setsid cmd &` puts the child in a new session and process group: the final killpg
+    misses it, and it kept running (and kept the device) after its job was reported done."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+
+    job = srv.Job(
+        id="911",
+        owner="tenant",
+        workspace="/tmp",
+        # The pause lets the child leave the group before its parent exits, as a real one does.
+        command="setsid sleep 60 >/dev/null 2>&1 </dev/null & echo child=$!; sleep 0.5",
+        queued_at="t",
+    )
+    await _run_one(job)
+    child = int((job.output or "").split("child=")[1].split()[0])
+    try:
+        assert job.status is srv.JobStatus.COMPLETED
+        for _ in range(40):
+            if not _pid_alive(child):
+                break
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(child), "a child that left the job's session outlived the job"
+    finally:
+        try:
+            os.kill(child, 9)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_a_survivor_holding_the_device_is_logged_and_marks_it_dirty(monkeypatch, clear_job_state, tmp_path):
+    """No signal moves a process stuck in the kernel. The runner must say which job left it
+    and hold the device until it is gone, not hand it to the next job as if it were free."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    stuck = Survivor(pid=4242, state="D", cmdline="python -m pytest test_model.py", holds_device=True)
+
+    async def fake_sweep(job_id, pid, scope=None, tag=None, **kw):
+        return [stuck]
+
+    marked = []
+    monkeypatch.setattr(srv, "reap_job_survivors", fake_sweep)
+    monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marked.append(reason))
+    log = tmp_path / "912.log"
+    job = srv.Job(id="912", owner="tenant", workspace="/tmp", command="echo hi", queued_at="t", log_file=str(log))
+    await _run_one(job)
+
+    assert job.status is srv.JobStatus.COMPLETED
+    assert any("job 912 left pid 4242 (state D)" in r for r in marked), marked
+    assert "pid 4242 state D (holds the device)" in log.read_text()
+
+
+@pytest.mark.asyncio
+async def test_a_survivor_known_not_to_hold_the_device_does_not_mark_it_dirty(monkeypatch, clear_job_state):
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+
+    async def fake_sweep(job_id, pid, scope=None, tag=None, **kw):
+        return [Survivor(pid=4243, state="D", cmdline="cat", holds_device=False)]
+
+    marked = []
+    monkeypatch.setattr(srv, "reap_job_survivors", fake_sweep)
+    monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marked.append(reason))
+    job = srv.Job(id="913", owner="tenant", workspace="/tmp", command="echo hi", queued_at="t")
+    await _run_one(job)
+
+    assert job.status is srv.JobStatus.COMPLETED
+    assert marked == []
+
+
+@pytest.mark.asyncio
+async def test_a_shutdown_during_the_sweep_still_finishes_the_job(monkeypatch, clear_job_state):
+    """The sweep is the runner's first wait after a job ends. A shutdown landing there skipped
+    the job's bookkeeping, so the finished job stayed the current one and step routes refused."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    sweeping = asyncio.Event()
+    may_finish = asyncio.Event()
+
+    async def slow_sweep(job_id, pid, scope=None, tag=None, **kw):
+        sweeping.set()
+        await may_finish.wait()
+        return []
+
+    monkeypatch.setattr(srv, "reap_job_survivors", slow_sweep)
+    job = srv.Job(id="914", owner="tenant", workspace="/tmp", command="echo hi", queued_at="t")
+    srv.jobs[job.id] = job
+    await srv.get_job_queue().put(job.id)
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await asyncio.wait_for(sweeping.wait(), timeout=10)
+        runner.cancel()
+        await asyncio.sleep(0.05)
+        assert not runner.done(), "the runner abandoned the sweep on shutdown"
+        may_finish.set()
+        results = await asyncio.wait_for(asyncio.gather(runner, return_exceptions=True), timeout=5)
+    finally:
+        may_finish.set()
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+    assert isinstance(results[0], asyncio.CancelledError), "the shutdown was swallowed"
+    assert job.finished_at is not None
+    assert srv.current_job_id is None, "the finished job stayed the current one"
+
+
+@pytest.mark.asyncio
+async def test_a_hung_reap_runs_its_ladder_to_the_end(monkeypatch, clear_job_state):
+    """The job's streams close as soon as its shell dies, often long before a child that is
+    still unwinding. The runner cancelled the reaper right then, cutting the ladder short."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 1)
+    monkeypatch.setattr(srv, "HUNG_POLL_SEC", 0.05)
+    ladder = []
+
+    async def fake_terminate(job_id, pid, grace_sec=None):
+        ladder.append("SIGINT")
+        os.killpg(pid, 9)  # the shell and its streams go at once
+        await asyncio.sleep(0.5)  # ...while the ladder waits out a child
+        ladder.append("SIGKILL")
+
+    monkeypatch.setattr(srv, "_terminate_job", fake_terminate)
+    job = srv.Job(id="914", owner="tenant", workspace="/tmp", command="echo working; sleep 60", queued_at="t")
+    await _run_one(job)
+
+    assert job.status is srv.JobStatus.HUNG
+    assert ladder == ["SIGINT", "SIGKILL"], f"the reap ladder was cut short: {ladder}"
 
 
 # --- the doomed reaper ------------------------------------------------------
@@ -8307,9 +8475,11 @@ async def test_idle_relift_is_inert_when_kill_switched(monkeypatch, tmp_path, cl
 @pytest.mark.asyncio
 async def test_idle_relift_ignores_a_non_self_heal_hold(monkeypatch, tmp_path, clear_job_state):
     """A fabric-uncheckable host holds on device_unverified_why with device_selfheal_hold False.
-    An enum+ARC re-verify proves nothing that hold was placed for, so the relift must leave it —
-    else it would falsely reopen the door on a mesh whose fabric was never checked."""
+    An enum+ARC re-verify proves nothing that hold was placed for, so with the fabric relift turned
+    off (TT_DEVICE_MCP_FABRIC_RELIFT=0) the relift must leave it — else it would falsely reopen the
+    door on a mesh whose fabric was never checked."""
     _setup_selfheal_hold(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_RELIFT", "0")
     fsm_dirty(srv, "gate/post-job: enum+ARC healthy, fabric unverified", why="fabric_unverified")
     verify_called = {"n": 0}
 
@@ -8331,8 +8501,9 @@ async def test_idle_relift_ignores_a_non_self_heal_hold(monkeypatch, tmp_path, c
 # pass but the fabric traffic check exits 77 (could-not-run — NOT fabric-wedged), holds the door on
 # device_unverified_why WITHOUT device_selfheal_hold. The self-heal relift is scoped past that hold,
 # and nothing else re-checks a held-but-undirty mesh, so it strands until a broker restart or a human
-# reset. The opt-in fabric relift (TT_DEVICE_MCP_FABRIC_RELIFT, OFF by default because it re-runs the
-# traffic pass) closes the gap: it re-runs the health check and lifts ONLY on a real fabric verdict.
+# reset. The fabric relift closes the gap: it re-runs the health check and lifts ONLY on a real
+# fabric verdict. It re-runs the traffic pass, so it is opt-in (TT_DEVICE_MCP_FABRIC_RELIFT=1) for a
+# hold with any other trace of a fault, and on by default for a hold whose only cause is the 77.
 
 
 def _setup_fabric_unverified_hold(monkeypatch, tmp_path, *, n_present=31):
@@ -8421,25 +8592,17 @@ async def test_idle_relift_holds_a_fabric_unverified_hold_when_fabric_now_fails(
     assert resets["n"] == 0, "the relift must never reset — that is the next gate's job"
 
 
-@pytest.mark.asyncio
-async def test_fabric_relift_is_off_by_default(monkeypatch, tmp_path, clear_job_state):
+def test_fabric_relift_is_off_by_default(monkeypatch, tmp_path, clear_job_state):
     """Default-safe: the fabric relift re-runs the TRAFFIC PASS, which can push a marginal chip off
-    the bus, so it is opt-in. Unset, the relift must not touch a fabric-unverified hold — the
-    behavior deployed today is unchanged (this is the guard the existing non-self-heal test relies on)."""
+    the bus, so it is opt-in for a fabric-unverified hold with a measured fault behind it. Unset, the
+    relift must not arm on one. A hold whose ONLY cause is a 77 is the exception (spec 03 I34)."""
     _setup_fabric_unverified_hold(monkeypatch, tmp_path)
     monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_RELIFT", raising=False)
-    verify_called = {"n": 0}
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)
 
-    async def verify(expected, log, run_fabric=True, **_):
-        verify_called["n"] += 1
-        return True, {"fabric": {"ok": True}}
-
-    patch_recovery(monkeypatch, "_verify_device", verify)
-
-    await srv._attempt_idle_relift()
-
-    assert verify_called["n"] == 0, "off by default: the fabric relift must not probe the device"
-    assert srv.fsm.state is not ServerState.HEALTHY, "and the fabric-unverified hold must stand"
+    assert not srv._fabric_relift_enabled()
+    selfheal, fabric, _generic = srv._idle_relift_armed()
+    assert not fabric, "off by default: the fabric relift must not arm on a measured fabric fault"
 
 
 def test_hold_device_fabric_unverified_shuts_the_door_even_when_undirty(monkeypatch):
@@ -10415,9 +10578,11 @@ async def test_idle_relift_escalates_a_fabric_unverified_hold_when_relift_is_off
     """A present-mesh fabric-unverified hold with the fabric relift OFF (the default) is a hold no read
     can clear and nothing re-verifies — the exact 20-min strand this grace exists to end. It now falls
     through to the generic galaxy reset instead of waiting for the ceiling. Fails on base, where the
-    generic branch excludes every fabric-unverified hold outright."""
+    generic branch excludes every fabric-unverified hold outright. Only a hold with a measured fault
+    behind it: one whose only cause is a 77 is re-checked, never reset (spec 03 I34)."""
     _setup_generic_hold(monkeypatch, tmp_path)
-    srv.device_hold_needs_fabric = True
+    fsm_dirty(srv, "gate/post-job: fabric check exited 1", why="fabric_unverified")
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)  # a pass measured the fabric bad
     monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_RELIFT", raising=False)  # OFF: nothing re-verifies the fabric
     counters = _arm_stuck_hold(monkeypatch)
 

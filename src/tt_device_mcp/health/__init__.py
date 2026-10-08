@@ -19,6 +19,10 @@ both files) — every name either of them needs from here is either:
 
 from __future__ import annotations
 
+# The operator's AICLK ceiling state: server.py re-applies it at broker start and at the job door,
+# marks it owed when a job ends, and must be able to kill its helper on the dead-chip path.
+from tt_device_mcp.health.aiclk_ceiling import CEILING
+
 # The shared health vocabulary: HealthMonitor.status() returns a HealthState, and server.py both
 # builds one of its own (_healthy_reading()) and compares a probe's Verdict directly.
 from tt_device_mcp.health.core import HealthState, Verdict
@@ -55,7 +59,7 @@ from tt_device_mcp.health.monitors.heartbeat import (
 
 # The host-software version floors the startup preflight reports. Sysfs reads only, so the
 # preflight can assert them without spawning anything or touching a device.
-from tt_device_mcp.health.monitors.hostpci import version_floor_warnings
+from tt_device_mcp.health.monitors.hostpci import hugepages_shortfall, version_floor_warnings
 
 # The tt-smi/sysfs telemetry-sampler primitives server.py's own polling loop runs directly.
 from tt_device_mcp.health.monitors.pci import (
@@ -121,6 +125,8 @@ from tt_device_mcp.health.recovery.stages.bridge_reset import (
 from tt_device_mcp.health.recovery.stages.power_cycle import _fire_power_cycle
 
 __all__ = [
+    # AICLK ceiling state (start, door, job end, dead-chip kill)
+    "CEILING",
     # construction pieces ServerFsm.boot assembles into the process singletons
     "HealthMonitor",
     "RecoveryMechanism",
@@ -149,6 +155,7 @@ __all__ = [
     "heartbeat_supported",
     "heartbeat_verdict",
     "read_heartbeats",
+    "hugepages_shortfall",
     "version_floor_warnings",
     "SAMPLE_INTERVAL_SEC",
     "SAMPLE_RING_SIZE",

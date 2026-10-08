@@ -38,6 +38,17 @@ GRACEFUL_KILL_GRACE_SEC = 60
 # to the reap, and reaching SIGKILL means the device was NOT released.
 SIGTERM_GRACE_SEC = 15
 
+# After a job is finalized, any of its processes still alive (a child that left the process
+# group, or one the ladder never reached) gets SIGTERM, then SIGKILL after this window. The
+# job itself is already gone, so this is a sweep of leftovers, not a teardown: it is kept
+# short because the next job waits on it.
+SURVIVOR_TERM_GRACE_SEC = 5
+
+# How long to wait after the survivors' SIGKILL before naming whoever is still alive. A
+# process that outlives SIGKILL is stuck in the kernel (state D, most often inside the
+# driver), and no signal will move it.
+SURVIVOR_KILL_WAIT_SEC = 2
+
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
 # is deliberately never killed, because one stopped partway through 32 ASICs is far worse
