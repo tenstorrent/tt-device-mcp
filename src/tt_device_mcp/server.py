@@ -1216,6 +1216,7 @@ DEVICE_POLLER_SERVICES = tuple(
 logger: logging.Logger | None = None
 job_log_dir: Path | None = None
 job_runner_task: asyncio.Task | None = None  # Singleton job runner
+runner_job_id: str | None = None  # the job the runner last dequeued, for its error handler
 _startup_tasks_done = False  # run_startup_tasks() is once-per-process, whoever gets there first
 readopted_scopes: dict[str, str] = {}  # job_id -> scope unit, for jobs re-adopted after a restart
 stats: Stats | None = None  # Session statistics
@@ -5629,14 +5630,50 @@ def _job_burst_decision(recent_times: list[float], now_monotonic: float) -> tupl
 
 
 async def job_runner():
-    """Main loop processing jobs from the queue."""
-    global current_process, current_job_id, last_job_end_monotonic
+    """Main loop processing jobs from the queue. Never ends on an error, only on a cancel.
+
+    An error that escapes one job's run (seen: a full disk raising from a log write in the
+    cleanup) used to end this task. Nothing noticed until a later submit started a new runner,
+    which dispatched the next job onto a device the post-job gate never checked. Here such an
+    error fails closed instead: the device is marked dirty, so the post-job gate below resets and
+    verifies it, and if that does not prove it fit the dispatch gate refuses the next job."""
+    global current_process, current_job_id
+
+    while True:
+        try:
+            await _job_runner_loop()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - the runner must outlive any one job's error
+            job_id = runner_job_id
+            if logger:
+                logger.error(f"JOB_RUNNER error escaped job_id={job_id}, failing closed: {e!r}")
+            async with get_lock():
+                job = jobs.get(job_id) if job_id else None
+                if job is not None and job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
+                    job.status = JobStatus.FAILED
+                    job.finished_at = job.finished_at or datetime.now().isoformat()
+                    job.error = (job.error or "") + f"\n[EXCEPTION in broker cleanup: {e}]"
+                current_process = None
+                current_job_id = None
+            try:
+                _mark_device_dirty(f"job runner error after job {job_id}: {e}", why="gate_error")
+            except Exception as mark_err:  # noqa: BLE001 - the gate below still runs
+                if logger:
+                    logger.error(f"JOB_RUNNER could not mark the device dirty: {mark_err}")
+            await _verify_device_after_job(None, job_failed=True)
+
+
+async def _job_runner_loop():
+    global current_process, current_job_id, last_job_end_monotonic, runner_job_id
 
     if logger:
         logger.info("JOB_RUNNER started, waiting for jobs...")
 
     while True:
         job_id = await get_job_queue().get()
+        runner_job_id = job_id
 
         # Handle case where job was cleaned up while still in queue
         job = jobs.get(job_id)
@@ -5709,10 +5746,13 @@ async def job_runner():
         # wedge and none starts on hardware being reset out from under it.
         try:
             blocked_reason = await _await_device_free_for_tenant(job_log_file)
-        except Exception as e:  # a gate ERROR must never itself block a job
+        except Exception as e:
             if logger:
                 logger.error(f"JOB_RUNNER clean-device gate error for job_id={job_id}: {e}")
-            blocked_reason = ""  # only an affirmative degraded verdict blocks; a bug does not
+            # A gate error on a healthy device does not block: nothing is owed a check. On any
+            # other device it fails closed: the check it owed did not run, and dispatching anyway
+            # puts this job on a device nothing verified.
+            blocked_reason = "" if fsm.state is ServerState.HEALTHY else f"clean-device gate error: {e}"
 
         # One durable timeline entry when this device opens or lifts a tenant-refused hold,
         # keyed off the same verdict the dispatch decision uses so the two can never
