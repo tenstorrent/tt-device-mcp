@@ -789,6 +789,63 @@ async def test_a_started_job_is_not_revived_by_a_restart(monkeypatch, tmp_path, 
     assert srv.jobs == {}, "a job that already started was re-queued by the restart"
 
 
+@pytest.mark.parametrize("door", ["degraded", "privsep"])
+@pytest.mark.parametrize("refusal_raises", [False, True], ids=["refused", "refusal-raised"])
+@pytest.mark.asyncio
+async def test_a_job_refused_at_the_door_is_not_revived_by_a_restart(
+    monkeypatch, tmp_path, clear_job_state, door, refusal_raises
+):
+    """A job refused at the door (degraded device, or a privsep identity we cannot honour) is
+    FAILED and the submitter is told so. Its queued spec must go with it: if it stays on disk,
+    the next broker re-queues it and runs a command its owner was told never ran. That holds
+    for the runner's fallback too, when the refusal helper itself raises."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    monkeypatch.setattr(srv, "_tenant_hold_enabled", lambda: False)
+    monkeypatch.setattr(srv, "_note_tenant_gate_verdict", lambda reason: None)
+
+    async def gate(job_log_file):
+        return "chip 1 off the bus" if door == "degraded" else ""
+
+    monkeypatch.setattr(srv, "_await_device_free_for_tenant", gate)
+    monkeypatch.setattr(srv, "privsep_refusal", lambda uid: "no passwd entry" if door == "privsep" else "")
+    if refusal_raises:
+
+        async def boom(*a, **k):
+            raise RuntimeError("refusal helper bug")
+
+        monkeypatch.setattr(srv, "_refuse_job_on_degraded_device", boom)
+        monkeypatch.setattr(srv, "_refuse_job_privsep_identity", boom)
+
+    marker = tmp_path / "the_command_ran"
+    job = srv.Job(id="904", owner="tenant", workspace="/tmp", command=f"touch {marker}", queued_at="t")
+    srv.jobs["904"] = job
+    srv._persist_queued_job(job)
+    await srv.get_job_queue().put("904")
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        for _ in range(100):
+            if job.status is not srv.JobStatus.QUEUED:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+    assert job.status is srv.JobStatus.FAILED, f"job 904 reached {job.status.value}, expected a door refusal"
+    assert not marker.exists(), "the refused job's command ran"
+
+    # the broker restarts: in-memory state is gone, only what is on disk remains
+    srv.jobs.clear()
+    srv.job_queue = None
+    srv._ensure_async_primitives()
+    await srv._restore_queued_jobs()
+
+    assert srv.jobs == {}, "a job refused at the door was re-queued by the restart"
+    assert srv.get_job_queue().empty()
+
+
 def _queued_job_with_log(tmp_path, job_id, footer_lines=None):
     """A queued job whose spec is on disk, with a log holding its header and, when
     ``footer_lines`` is not None, the footer a finished job gets plus ``footer_lines`` lines of
