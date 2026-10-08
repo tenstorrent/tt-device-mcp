@@ -52,12 +52,28 @@ DEVICE_RESET_OVERRUN_SEC = 180
 # reset that had worked.
 DEVICE_RESET_TIMEOUT_SEC = 600
 
+# The CLI reads the streaming reset with a per-read socket timeout, and a reset can sit
+# silent far longer than that (quiesce, an overrun tt-smi, the post-reset check): the
+# overrun warning goes to the broker log, not the stream. A client that asks for it gets
+# this sentinel line after every quiet interval, so silence never reads as a dead broker.
+RESET_STREAM_KEEPALIVE_SEC = 15
+RESET_STREAM_KEEPALIVE_LINE = "::keepalive::"
+
 # Upper bound on the post-job fabric traffic check (TT_DEVICE_MCP_FABRIC_CHECK_CMD).
 # The check runs a pinned, prebuilt validator — it never compiles — so a healthy pass is
 # 45-75s, and anything far past that is a wedged fabric, not a slow one. This bound is what
 # a wedge COSTS: the queue is dead until it expires, and only then does recovery start. A
 # generous margin here is not caution, it is the wedge's dwell time.
 FABRIC_CHECK_TIMEOUT_SEC = 180
+
+# The caller's bound on the passive eth-heartbeat read a CLEAN post-job gate runs (spec 03 I30);
+# a healthy read answers in ~1s. Matches the self-test's arming budget
+# (server.ETH_CHECK_SELFTEST_BUDGET_SEC): a read this slow could not have armed the rung. The
+# built-in probe's own bound sits at most at 90% of this, and its expiry is "no verdict", so the
+# gate runs the full pass; this bound expiring is frozen evidence (I16) and holds. An operator
+# override's inner bound is this same bound, so its timeout is frozen evidence here as on every
+# other path.
+ETH_POST_JOB_TIMEOUT_SEC = 10.0
 
 # The fabric check exits with this when it could not run at all (validator or
 # descriptor absent). It means "nothing was learned about the fabric" and must stay

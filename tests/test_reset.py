@@ -6,17 +6,22 @@ never resets real hardware; it exercises the gate→exec→result flow and the
 verbose step/command/returncode payload the CLI prints."""
 
 import asyncio
+import gc
+import json
 import os
 import subprocess
 import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 
 import pytest
+from starlette.requests import ClientDisconnect
 from starlette.testclient import TestClient
 
 import tt_device_mcp.server as srv
-from tests.conftest import patch_health_event, patch_recovery
+from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
+from tt_device_mcp import privileges
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.recovery import _declared_reset_mode, reset_mode_known, select_recovery
@@ -178,6 +183,143 @@ def _client(monkeypatch, dev_dir, holders=None):
     monkeypatch.setattr(srv, "TT_DEV_DIR", str(dev_dir))
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=holders or [], complete=True))
     return TestClient(srv.build_asgi_app(srv.create_mcp_server()))
+
+
+@pytest.mark.parametrize("keepalive", [True, False])
+def test_a_silent_reset_stream_sends_keepalives_when_asked(monkeypatch, tmp_path, keepalive):
+    """The CLI reads the stream with a per-read socket timeout. A reset that prints nothing
+    for longer than that must still put bytes on the wire, or the CLI calls a live reset dead.
+    Older CLIs print every line, so only a client that asks gets the sentinel."""
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "RESET_STREAM_KEEPALIVE_SEC", 0.02)
+
+    async def silent_reset(argv, log, owner="[broker]health-gate", on_output=None):
+        await asyncio.sleep(0.3)  # many keepalive intervals with no output
+        return 0, ""
+
+    async def pollers(active, log):
+        return []
+
+    async def healthy(*_a, **_k):
+        return True, {"snapshot": {"detail": "ok"}}
+
+    monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", silent_reset)
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    monkeypatch.setattr(srv.fsm, "observe", healthy)
+    body = {"force": False, "keepalive": True} if keepalive else {"force": False}
+    lines = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json=body).text.splitlines()
+
+    assert lines[-1] == "::status::reset_complete", lines
+    kept = lines.count(srv.RESET_STREAM_KEEPALIVE_LINE)
+    if keepalive:
+        assert kept >= 3, f"a silent reset went out with {kept} keepalive(s): {lines}"
+        assert "exit code: 0" in lines, "the keepalive wrapper dropped a progress line"
+    else:
+        assert kept == 0, "a client that did not ask was sent keepalives"
+
+
+@pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
+def test_a_client_that_leaves_a_silent_reset_does_not_stop_it(monkeypatch, tmp_path, spec_version):
+    """The CLI can go away (Ctrl-C, a dropped socket) while the keepalive wrapper waits on
+    a reset step. The reset must still run to the end, the step must be closed, not left
+    pending, and cleanup must not race it ("already running") or drop it ("destroyed").
+    Starlette has two disconnect paths: under ASGI 2.3 (uvicorn) a cancel scope cancels the
+    stream; under 2.4 the send fails and the wrapper is left for the loop to finalize."""
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "RESET_STREAM_KEEPALIVE_SEC", 0.02)
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    reset_end = []
+
+    async def silent_reset(argv, log, owner="[broker]health-gate", on_output=None):
+        try:
+            await asyncio.sleep(0.3)  # many keepalive intervals with no output
+        except asyncio.CancelledError:
+            reset_end.append("cancelled")
+            raise
+        reset_end.append("finished")
+        return 0, ""
+
+    async def pollers(active, log):
+        return []
+
+    async def healthy(*_a, **_k):
+        return True, {"snapshot": {"detail": "ok"}}
+
+    monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", silent_reset)
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    monkeypatch.setattr(srv.fsm, "observe", healthy)
+    app = srv.build_asgi_app(srv.create_mcp_server())
+    keepalive = srv.RESET_STREAM_KEEPALIVE_LINE.encode()
+
+    async def drive():
+        loop = asyncio.get_running_loop()
+        errors = []
+        loop.set_exception_handler(lambda _loop, ctx: errors.append(ctx))
+        inner = []
+        hooks = sys.get_asyncgen_hooks()
+
+        def firstiter(gen):
+            if gen.__qualname__.endswith("_reset_stream"):
+                inner.append(gen)
+            hooks.firstiter(gen)
+
+        sys.set_asyncgen_hooks(firstiter=firstiter, finalizer=hooks.finalizer)
+        left = asyncio.Event()
+        request = [{"type": "http.request", "body": json.dumps({"force": False, "keepalive": True}).encode()}]
+
+        async def receive():
+            if request:
+                return request.pop()
+            await left.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(msg):
+            if keepalive in msg.get("body", b""):
+                if left.is_set():
+                    raise OSError("client went away")  # ASGI 2.4: the send fails
+                left.set()  # ASGI 2.3: the next receive reports the disconnect
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": spec_version},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/tt_device_reset_stream",
+            "raw_path": b"/api/tt_device_reset_stream",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"host", b"localhost"), (b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 1),
+            "server": ("127.0.0.1", 80),
+        }
+        try:
+            try:
+                await app(scope, receive, send)
+            except ClientDisconnect:
+                assert spec_version == "2.4"  # the server swallows it
+            assert left.is_set(), "the client left before any keepalive was sent"
+            assert not reset_end, "the stream ended with the reset, not with the client"
+            for _ in range(200):
+                if reset_end:
+                    break
+                await asyncio.sleep(0.01)
+            gc.collect()  # a dropped wrapper is finalized by the loop
+            await asyncio.sleep(0.05)
+            # Checked before asyncio.run returns: its shutdown closes any generator left open.
+            open_steps = [g for g in inner if g.ag_frame is not None]
+        finally:
+            sys.set_asyncgen_hooks(*hooks)
+        return inner, open_steps, errors
+
+    inner, open_steps, errors = asyncio.run(drive())
+    gc.collect()
+
+    assert reset_end == ["finished"], f"the client leaving stopped the reset: {reset_end}"
+    assert len(inner) == 1, inner
+    assert not open_steps, "the reset stream was left open after its client went away"
+    assert not errors, [c.get("message") or repr(c.get("exception")) for c in errors]
 
 
 def test_reset_success_reports_steps_and_command(monkeypatch, tmp_path):
@@ -548,6 +690,222 @@ def test_reset_tool_reports_health(monkeypatch, tmp_path):
     assert d["status"] == "reset_unhealthy" and d["health_ok"] is False
 
 
+# --- an operator reset proves the fabric before it reopens the door (spec 04 I13) -------------
+#
+# Heartbeat + snapshot score a wedged eth core as fine, so on a mesh the operator's reset is
+# verified the way the broker verifies its own: eth read and fabric pass, re-checked on a 77.
+
+
+def _mesh_with_fabric_check(monkeypatch, tmp_path, chips=2):
+    for i in range(chips):
+        (tmp_path / str(i)).write_text("")
+    monkeypatch.setattr(srv.fabric, "build_command", lambda: (["fabric-check"], {}))
+    _fake_scoped_reset(monkeypatch, 0, "Re-initialized boards\n")
+
+
+class _Calls(list):
+    def __init__(self):
+        super().__init__()
+        self.expected = []
+
+
+def _verify_seam(monkeypatch, fabric_ok):
+    """Fake the probe pass: heartbeat + snapshot pass, the fabric (when asked for) returns
+    ``fabric_ok``. Records the ``run_fabric`` each pass asked for, and on ``.expected`` the chip
+    count it verified against."""
+    calls = _Calls()
+
+    async def verify(expected, log, *, run_fabric=True, phase="verify_device"):
+        calls.append(run_fabric)
+        calls.expected.append(expected)
+        ev = {"snapshot": {"ok": True, "detail": f"all {expected} chips"}}
+        if not run_fabric:
+            return True, ev
+        ev["fabric"] = {"ok": fabric_ok, "detail": f"fabric rc={ {True: 0, False: 1, None: 77}[fabric_ok]}"}
+        return fabric_ok is not False, ev
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    return calls
+
+
+def _reset_tool(monkeypatch, tmp_path):
+    return _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": False}).json()
+
+
+def _reset_stream(monkeypatch, tmp_path):
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": False})
+    assert resp.status_code == 200
+    return resp.text
+
+
+def test_an_operator_reset_on_a_mesh_releases_only_on_a_fabric_pass(monkeypatch, tmp_path):
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    calls = _verify_seam(monkeypatch, fabric_ok=True)
+    fsm_dirty(srv, "job 7 wedged")
+    monkeypatch.setattr(srv, "device_fault_reported", "job 7 waiting for active ethernet core")
+
+    d = _reset_tool(monkeypatch, tmp_path)
+
+    assert calls == [True], "the operator reset on a mesh did not run the fabric pass"
+    assert d["status"] == "reset_complete" and d["health_ok"] is True
+    assert srv.fsm.state is srv.ServerState.HEALTHY
+    assert srv.device_fault_reported == "", "a reset proven by the fabric pass retires the reported fault"
+
+
+def test_an_operator_reset_whose_fabric_fails_is_not_released(monkeypatch, tmp_path):
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    _verify_seam(monkeypatch, fabric_ok=False)
+
+    d = _reset_tool(monkeypatch, tmp_path)
+
+    assert d["status"] == "reset_unhealthy" and d["health_ok"] is False
+    assert srv.fsm.state is not srv.ServerState.HEALTHY, "a failed fabric pass reopened the door"
+    assert srv.fsm.record.dirty, "the next gate must owe this mesh a real recovery"
+    assert srv.fsm.record.why == "operator_reset_unhealthy", (
+        f"got why={srv.fsm.record.why!r}: a failed operator-reset verify must say so, not pass as a "
+        "read-only probe's finding"
+    )
+
+
+def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
+    """The tool's docstring states the worst case an operator reset on a mesh can take. Recompute it
+    from the timeouts the code actually uses, so a changed timeout cannot leave the doc stale."""
+    import inspect
+    import math
+    import re
+
+    from tt_device_mcp import constants
+    from tt_device_mcp.health import monitor as monitor_mod
+    from tt_device_mcp.health.monitors import eth, heartbeat
+
+    def default(fn, name):
+        return inspect.signature(fn).parameters[name].default
+
+    def literal(fn, pattern):
+        return float(re.search(pattern, inspect.getsource(fn)).group(1))
+
+    # Stop, then restart, each poller service; each systemctl call is bounded on its own.
+    # The shipped default services, read from the source like the retry defaults below.
+    services = re.search(r'"TT_DEVICE_MCP_POLLER_SERVICES", "([^"]*)"', inspect.getsource(srv)).group(1)
+    n_services = len([x for x in services.split(",") if x.strip()])
+    pollers = 2 * n_services * literal(srv._set_device_pollers, r"timeout=(\d+)")
+    rescan = literal(recovery_base.RecoveryMechanism.reset_with_quiesce, r"asyncio\.sleep\((\d+)\)")
+    kill = constants.GRACEFUL_KILL_GRACE_SEC + constants.SIGTERM_GRACE_SEC
+    candidates = re.search(r"for c in \((.*?)\n\s*\)\n", inspect.getsource(eth.resolve_python), re.S).group(1)
+    n_candidates = len([line for line in candidates.splitlines() if line.strip()])
+    eth_setup = n_candidates * default(eth.resolve_python, "import_timeout_sec")
+    finished_pass = (
+        heartbeat.HEARTBEAT_SETTLE_SEC
+        + default(monitor_mod.HealthMonitor.verify_device_health, "timeout_sec")
+        + eth_setup
+        + default(monitor_mod.HealthMonitor.verify_eth_heartbeat, "timeout_sec")
+        + constants.FABRIC_CHECK_TIMEOUT_SEC
+    )
+    # A re-check follows only a 77, a pass that finished; only the last pass can hit a timeout and
+    # pay the kill sequence.
+    last_pass = finished_pass + kill
+    # The shipped defaults, read from the source: conftest zeroes the live retry sleep.
+    src = inspect.getsource(recovery_pkg)
+    retries = int(re.search(r'"TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES", "(\d+)"', src).group(1))
+    sleep = float(re.search(r'"TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC", "([\d.]+)"', src).group(1))
+    worst = pollers + constants.DEVICE_RESET_TIMEOUT_SEC + rescan + retries * (finished_pass + sleep) + last_pass
+
+    tools = asyncio.run(srv.create_mcp_server().list_tools())
+    doc = " ".join(next(t.description for t in tools if t.name == "tt_device_reset").split())
+    assert f"about {round(worst / 60)} minutes" in doc, (worst, doc)
+    assert f"poller stop and restart up to {pollers:.0f}s" in doc
+    assert f"reset {constants.DEVICE_RESET_TIMEOUT_SEC}s" in doc
+    assert f"PCI rescan {rescan:.0f}s" in doc
+    assert f"first verify pass of up to {math.ceil(finished_pass)}s" in doc
+    assert f"the {sleep:.0f}s wait" in doc
+    assert f"last verify pass of up to {math.ceil(last_pass)}s" in doc
+    assert f"the {kill}s kill" in doc
+
+
+def test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified(monkeypatch, tmp_path):
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    calls = _verify_seam(monkeypatch, fabric_ok=None)
+    monkeypatch.setattr(srv, "device_fault_reported", "job 7 waiting for active ethernet core")
+
+    d = _reset_tool(monkeypatch, tmp_path)
+
+    assert calls == [True] * (1 + recovery_pkg.POST_RESET_FABRIC_RETRIES), "a 77 was not re-checked"
+    assert d["status"] == "reset_unverified" and d["health_ok"] is False
+    assert srv.fsm.state is not srv.ServerState.HEALTHY
+    assert srv.fsm.record.why == "fabric_unverified" and not srv.fsm.record.dirty
+    assert srv.device_fault_reported, "a reset no pass proved retired the runtime's own fault report"
+
+
+def test_a_single_chip_operator_reset_keeps_the_light_verify(monkeypatch, tmp_path):
+    _mesh_with_fabric_check(monkeypatch, tmp_path, chips=1)
+    calls = _verify_seam(monkeypatch, fabric_ok=False)
+    fsm_dirty(srv, "job 7 wedged")
+
+    monkeypatch.setattr(srv, "device_fault_reported", "job 7 hit a device timeout")
+
+    d = _reset_tool(monkeypatch, tmp_path)
+
+    assert calls == [False], "a single chip has no fabric to pass"
+    assert d["status"] == "reset_complete" and d["health_ok"] is True
+    assert srv.fsm.state is srv.ServerState.HEALTHY
+    assert srv.device_fault_reported == "", "on a single chip the light verify is the whole proof"
+
+
+def test_a_mesh_with_no_fabric_check_keeps_the_light_verify(monkeypatch, tmp_path):
+    """Holding for a fabric verdict a host can never produce would strand it after every reset."""
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.fabric, "build_command", lambda: None)
+    calls = _verify_seam(monkeypatch, fabric_ok=None)
+
+    d = _reset_tool(monkeypatch, tmp_path)
+
+    assert calls == [False]
+    assert d["status"] == "reset_complete"
+    assert any("no fabric check installed" in s for s in d["steps"])
+
+
+def test_the_light_verify_checks_the_hosts_chip_count_not_the_survivors(monkeypatch, tmp_path):
+    """A mesh back two chips short must not verify 2-of-2 (spec 03 I11)."""
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.fabric, "build_command", lambda: None)
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "4")
+    calls = _verify_seam(monkeypatch, fabric_ok=None)
+
+    _reset_tool(monkeypatch, tmp_path)
+
+    assert calls.expected == [4]
+
+
+def test_a_blind_stream_verify_does_not_clear_the_reported_fault(monkeypatch, tmp_path):
+    """The stream used to retire the runtime's fault report on heartbeat + snapshot alone."""
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    _verify_seam(monkeypatch, fabric_ok=None)
+    monkeypatch.setattr(srv, "device_fault_reported", "job 7 waiting for active ethernet core")
+
+    text = _reset_stream(monkeypatch, tmp_path)
+
+    assert "::status::reset_unverified" in text
+    assert "fabric rc=77" in text, "the verify's progress must stream"
+    assert srv.device_fault_reported, "a blind verify retired the runtime's own fault report"
+    assert srv.fsm.record.why == "fabric_unverified"
+
+
+@pytest.mark.parametrize("fabric_ok,status", [(True, "reset_complete"), (False, "reset_unhealthy")])
+def test_the_stream_settles_an_operator_reset_like_the_tool(monkeypatch, tmp_path, fabric_ok, status):
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    calls = _verify_seam(monkeypatch, fabric_ok=fabric_ok)
+    monkeypatch.setattr(srv, "device_fault_reported", "job 7 waiting for active ethernet core")
+
+    text = _reset_stream(monkeypatch, tmp_path)
+
+    assert calls == [True]
+    assert f"::status::{status}" in text
+    assert (srv.fsm.state is srv.ServerState.HEALTHY) is fabric_ok
+    assert (srv.device_fault_reported == "") is fabric_ok
+    if not fabric_ok:
+        assert srv.fsm.record.why == "operator_reset_unhealthy"
+
+
 # --- the streaming reset is a reset like any other ----------------------------
 #
 # It ran as a bare child of the broker: outside the op lock, outside a scope. The dead-chip
@@ -593,7 +951,11 @@ def test_the_sampler_recognises_a_streaming_resets_scope(monkeypatch):
     assert seen["pattern"].startswith(recovery_base.RESET_SCOPE_PREFIX)
 
 
-def _local_reset_mechanism(tmp_path):
+def _local_reset_mechanism(tmp_path, monkeypatch):
+    # The conftest latch says systemd is present, which makes scope_active() list the host's real
+    # reset scopes; a reset running on the machine under test would then look like this one's.
+    monkeypatch.setitem(privileges._LATCHED, "systemd", False)
+
     async def pollers(_active, _log):
         return []
 
@@ -611,10 +973,10 @@ def _local_reset_mechanism(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_reset_without_systemd_runs_detached_and_returns_its_output(tmp_path):
+async def test_a_reset_without_systemd_runs_detached_and_returns_its_output(monkeypatch, tmp_path):
     """Removing the systemd-only gate must execute the reset, not turn a missing scope into a
     successful no-op."""
-    mechanism = _local_reset_mechanism(tmp_path)
+    mechanism = _local_reset_mechanism(tmp_path, monkeypatch)
     rc, output = await mechanism.run_scoped(
         [sys.executable, "-c", "print('local reset complete')"],
         lambda _message: None,
@@ -625,7 +987,7 @@ async def test_a_reset_without_systemd_runs_detached_and_returns_its_output(tmp_
 
 
 @pytest.mark.asyncio
-async def test_a_restarted_daemon_adopts_the_local_reset_lock(tmp_path):
+async def test_a_restarted_daemon_adopts_the_local_reset_lock(monkeypatch, tmp_path):
     """A second daemon must see the kernel-owned lock from the first daemon's child, or its startup
     probe can race the reset and launch another one."""
     release = tmp_path / "release"
@@ -634,8 +996,8 @@ async def test_a_restarted_daemon_adopts_the_local_reset_lock(tmp_path):
         "-c",
         f"import pathlib,time; p=pathlib.Path({str(release)!r});\nwhile not p.exists(): time.sleep(.01)",
     ]
-    first = _local_reset_mechanism(tmp_path)
-    restarted = _local_reset_mechanism(tmp_path)
+    first = _local_reset_mechanism(tmp_path, monkeypatch)
+    restarted = _local_reset_mechanism(tmp_path, monkeypatch)
     task = asyncio.create_task(first.run_scoped(command, lambda _message: None))
     try:
         for _ in range(100):
@@ -650,7 +1012,7 @@ async def test_a_restarted_daemon_adopts_the_local_reset_lock(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cancelling_the_waiter_does_not_kill_a_local_reset(tmp_path):
+async def test_cancelling_the_waiter_does_not_kill_a_local_reset(monkeypatch, tmp_path):
     """The reset child, not the daemon task, owns the lock; cancelling the waiter must not expose
     the device to a concurrent reset while the first reset still runs."""
     release = tmp_path / "release"
@@ -659,8 +1021,8 @@ async def test_cancelling_the_waiter_does_not_kill_a_local_reset(tmp_path):
         "-c",
         f"import pathlib,time; p=pathlib.Path({str(release)!r});\nwhile not p.exists(): time.sleep(.01)",
     ]
-    mechanism = _local_reset_mechanism(tmp_path)
-    observer = _local_reset_mechanism(tmp_path)
+    mechanism = _local_reset_mechanism(tmp_path, monkeypatch)
+    observer = _local_reset_mechanism(tmp_path, monkeypatch)
     task = asyncio.create_task(mechanism.run_scoped(command, lambda _message: None))
     try:
         for _ in range(100):
@@ -681,11 +1043,11 @@ async def test_cancelling_the_waiter_does_not_kill_a_local_reset(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_daemon_without_systemd_resets_through_the_local_backend(tmp_path):
+async def test_a_daemon_without_systemd_resets_through_the_local_backend(monkeypatch, tmp_path):
     """A container needs no declared authority to reset: `tt-smi -r` is an ioctl on a device node
     its submitter already holds (spec 04 I17), so lacking a PID-1 scope picks the other backend
     rather than cancelling the reset. The tenant rules (I6/I7) still gate it."""
-    mechanism = _local_reset_mechanism(tmp_path)
+    mechanism = _local_reset_mechanism(tmp_path, monkeypatch)
     rc, _output = await mechanism.run_scoped(
         [sys.executable, "-c", "raise SystemExit(0)"],
         lambda _message: None,
@@ -727,7 +1089,7 @@ def test_a_streaming_local_reset_is_visible_to_a_restarted_daemon(monkeypatch, t
         target=lambda: response.setdefault("value", client.post("/api/tt_device_reset_stream", json={"force": False}))
     )
     request.start()
-    observer = _local_reset_mechanism(tmp_path)
+    observer = _local_reset_mechanism(tmp_path, monkeypatch)
     try:
         for _ in range(200):
             if observer.scope_active() == recovery_base.LOCAL_RESET_NAME:
@@ -1019,6 +1381,393 @@ def test_reset_stream_quiesce_scope_routes_a_live_privsep_job(monkeypatch, tmp_p
 
     assert scope_kills == [srv.job_scope_unit("902-1")]
     assert not pgroup_kills, "the streaming reset quiesce must scope-route a privsep job"
+    assert "force: resetting over broker job 902-1" in resp.text, "a forced reset must log the job it stops"
+
+
+# --- issue #3: a reset is not queued, so it must not kill a running job unasked (04 I18) ---
+#
+# The reset used to stop whatever job was running and reset over it. Another agent's job died
+# mid-run because someone else asked for a reset. Now it refuses (reason "busy") unless forced.
+
+
+def _running_job(monkeypatch, status=srv.JobStatus.RUNNING, *, job_id="903-1", owner="alice", live=True):
+    """A job the runner owns: in `jobs`, and (if live) the runner's current process and job id."""
+    job = srv.Job(id=job_id, owner=owner, workspace="/w", command="pytest", queued_at="", status=status)
+    job.pid = 4242
+    monkeypatch.setattr(srv, "jobs", {job_id: job})
+    monkeypatch.setattr(srv, "current_process", _FakeWrapperProc() if live else None)
+    monkeypatch.setattr(srv, "current_job_id", job_id if live else None)
+    monkeypatch.setattr(srv, "reset_killed_job_ids", set())
+    return job
+
+
+def _post_reset(monkeypatch, tmp_path, *, force):
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv.subprocess, "run", _fake_tt_smi(0, snapshot_chips=1))
+    resets = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    kills = _record_terminators(monkeypatch)
+    d = _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": force}).json()
+    return d, resets, kills
+
+
+def test_reset_refuses_while_a_job_is_running_and_leaves_it_alone(monkeypatch, tmp_path):
+    job = _running_job(monkeypatch)
+    proc = srv.current_process
+
+    d, resets, (scope_kills, pgroup_kills) = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "refused" and d["reason"] == "busy"
+    assert d["job_id"] == "903-1" and d["owner"] == "alice" and d["job_status"] == "running"
+    assert "force=true" in d["hint"]
+    assert not resets, "a busy refusal must not reset the device"
+    assert not scope_kills and not pgroup_kills, "a busy refusal must not signal the job"
+    assert job.status == srv.JobStatus.RUNNING
+    assert "903-1" not in srv.reset_killed_job_ids, "the job must not be marked reset-killed"
+    assert srv.current_process is proc and srv.current_job_id == "903-1"
+
+
+def test_reset_refuses_while_a_hung_job_is_still_held(monkeypatch, tmp_path):
+    # HUNG is set before the runner reaps the process: the job still owns the device until then.
+    _running_job(monkeypatch, srv.JobStatus.HUNG)
+
+    d, resets, _ = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "refused" and d["reason"] == "busy" and d["job_status"] == "hung"
+    assert "still being torn down" in d["detail"]
+    assert not resets
+
+
+def test_reset_refuses_over_a_readopted_running_job(monkeypatch, tmp_path):
+    # A job re-adopted after a broker restart runs in its scope with no current_process.
+    _running_job(monkeypatch, live=False)
+
+    d, resets, _ = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "refused" and d["reason"] == "busy" and d["job_id"] == "903-1"
+    assert not resets
+
+
+def test_queued_jobs_do_not_block_a_reset(monkeypatch, tmp_path):
+    _running_job(monkeypatch, srv.JobStatus.QUEUED, live=False)
+
+    d, resets, _ = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "reset_complete"
+    assert resets
+
+
+def test_forced_reset_stops_the_running_job_and_logs_it(monkeypatch, tmp_path):
+    _running_job(monkeypatch)
+
+    d, resets, (scope_kills, _) = _post_reset(monkeypatch, tmp_path, force=True)
+
+    assert d["status"] == "reset_complete"
+    assert scope_kills == [srv.job_scope_unit("903-1")], "force keeps the old behaviour: stop the job"
+    assert "903-1" in srv.reset_killed_job_ids
+    assert resets
+    assert any(s.startswith("force: resetting over broker job 903-1 (alice) is running") for s in d["steps"])
+
+
+def test_idle_reset_proceeds_without_a_busy_refusal(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+
+    d, resets, (scope_kills, pgroup_kills) = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "reset_complete"
+    assert resets and not scope_kills and not pgroup_kills
+    assert not any("busy" in s or s.startswith("force:") for s in d["steps"])
+
+
+def test_streaming_reset_refuses_while_a_job_is_running(monkeypatch, tmp_path):
+    (tmp_path / "0").write_text("")
+    job = _running_job(monkeypatch)
+    scope_kills, pgroup_kills = _record_terminators(monkeypatch)
+    resets = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
+
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": False})
+
+    assert resp.status_code == 200
+    assert "::status::refused" in resp.text
+    assert "busy REFUSED: broker job 903-1 (alice) is running" in resp.text
+    assert "--force" in resp.text
+    assert not resets and not scope_kills and not pgroup_kills
+    assert job.status == srv.JobStatus.RUNNING and "903-1" not in srv.reset_killed_job_ids
+
+
+def _dispatch_in_the_gap(monkeypatch, *, live=True):
+    """Start a job after the first busy check but before the reset takes the device-op lock."""
+    real = srv._device_op
+
+    @asynccontextmanager
+    async def op(name, owner="[broker]"):
+        if name == "reset":
+            _running_job(monkeypatch, job_id="904-1", owner="bob", live=live)
+        async with real(name, owner) as v:
+            yield v
+
+    monkeypatch.setattr(srv, "_device_op", op)
+
+
+def test_reset_refuses_a_job_dispatched_after_the_first_check(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+    _dispatch_in_the_gap(monkeypatch)
+
+    d, resets, (scope_kills, pgroup_kills) = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "refused" and d["reason"] == "busy" and d["job_id"] == "904-1"
+    assert not resets and not scope_kills and not pgroup_kills
+    assert srv.jobs["904-1"].status == srv.JobStatus.RUNNING and not srv.reset_killed_job_ids
+
+
+def test_forced_reset_stops_a_job_dispatched_after_the_first_check(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+    _dispatch_in_the_gap(monkeypatch)
+
+    d, resets, (scope_kills, _) = _post_reset(monkeypatch, tmp_path, force=True)
+
+    assert d["status"] == "reset_complete" and resets
+    assert scope_kills == [srv.job_scope_unit("904-1")]
+    assert "904-1" in srv.reset_killed_job_ids
+
+
+def test_streaming_reset_refuses_a_job_dispatched_after_the_first_check(monkeypatch, tmp_path):
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+    _dispatch_in_the_gap(monkeypatch)
+    scope_kills, pgroup_kills = _record_terminators(monkeypatch)
+    resets = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
+
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": False})
+
+    assert "::status::refused" in resp.text
+    assert "busy REFUSED: broker job 904-1 (bob) is running" in resp.text
+    assert not resets and not scope_kills and not pgroup_kills
+
+
+# --- issue #5: a forced reset must stop a job re-adopted after a broker restart (04 I18) ---
+#
+# A re-adopted job runs in its own scope with no current_process, so the forced path, which only
+# stopped current_process, reset the device under the live job.
+
+
+def _readopted_job(monkeypatch, *, job_id="905-1", owner="carol"):
+    """A job re-adopted after a broker restart: RUNNING in `jobs` and `readopted_scopes`, no process."""
+    job = _running_job(monkeypatch, job_id=job_id, owner=owner, live=False)
+    job.pid = None
+    monkeypatch.setattr(srv, "readopted_scopes", {job_id: srv.job_scope_unit(job_id)})
+    monkeypatch.setattr(srv, "READOPTED_FINALIZE_WAIT_SEC", 0)  # no monitor runs here to finalize it
+    return job
+
+
+def test_forced_reset_stops_a_readopted_job(monkeypatch, tmp_path):
+    job = _readopted_job(monkeypatch)
+
+    d, resets, (scope_kills, pgroup_kills) = _post_reset(monkeypatch, tmp_path, force=True)
+
+    assert d["status"] == "reset_complete" and resets
+    assert scope_kills == [srv.job_scope_unit("905-1")], "a forced reset must stop the re-adopted job's scope"
+    assert not pgroup_kills
+    assert job.status == srv.JobStatus.KILLED and "forced device reset" in job.error
+    assert "905-1" in srv.reset_killed_job_ids, "its end must not flag the device for another reset"
+    assert not srv._device_fault_failed_reason("905-1"), "a restart before its scope ends must re-adopt it"
+    assert any(s.startswith("stopping re-adopted job 905-1") for s in d["steps"])
+    assert not any(s.startswith("no broker job running") for s in d["steps"])
+
+
+def test_streaming_forced_reset_stops_a_readopted_job(monkeypatch, tmp_path):
+    (tmp_path / "0").write_text("")
+    job = _readopted_job(monkeypatch)
+    scope_kills, pgroup_kills = _record_terminators(monkeypatch)
+    resets = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
+
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": True})
+
+    assert "::status::refused" not in resp.text and resets
+    assert scope_kills == [srv.job_scope_unit("905-1")] and not pgroup_kills
+    assert "stopping re-adopted job 905-1" in resp.text
+    assert job.status == srv.JobStatus.KILLED and "905-1" in srv.reset_killed_job_ids
+
+
+def test_reset_refuses_while_a_stopped_readopted_job_is_still_being_torn_down(monkeypatch, tmp_path):
+    # A forced reset marked it KILLED and is stopping its scope; it owns the device until the scope ends.
+    job = _readopted_job(monkeypatch)
+    job.status = srv.JobStatus.KILLED
+
+    d, resets, (scope_kills, _) = _post_reset(monkeypatch, tmp_path, force=False)
+
+    assert d["status"] == "refused" and d["reason"] == "busy" and d["job_id"] == "905-1"
+    assert d["job_status"] == "killed" and "still being torn down" in d["detail"]
+    assert not resets and not scope_kills
+
+
+def test_forced_reset_waits_for_the_readopted_job_to_be_finalized(monkeypatch, tmp_path):
+    """Its end is classified (log scanned for a fault) before the reset, as on the live path."""
+    (tmp_path / "0").write_text("")
+    _readopted_job(monkeypatch)
+    monkeypatch.setattr(srv, "READOPTED_FINALIZE_WAIT_SEC", 5)
+    monkeypatch.setattr(srv.subprocess, "run", _fake_tt_smi(0, snapshot_chips=1))
+    events = []
+
+    async def finalize_later():
+        await asyncio.sleep(0.3)
+        events.append("finalized")
+        srv.readopted_scopes.pop("905-1", None)
+
+    async def fake_scope(scope, grace_sec=0.0):
+        events.append("stop")
+        asyncio.get_event_loop().create_task(finalize_later())
+
+    async def run(argv, log, owner="[broker]health-gate", on_output=None):
+        events.append("reset")
+        return 0, ""
+
+    async def pollers(active, log):
+        return []
+
+    monkeypatch.setattr(srv, "_terminate_scope", fake_scope)
+    monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", run)
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+
+    d = _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": True}).json()
+
+    assert d["status"] == "reset_complete"
+    assert events == ["stop", "finalized", "reset"]
+
+
+def test_forced_reset_stops_a_readopted_job_seen_only_by_the_recheck(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+    real = srv._device_op
+
+    @asynccontextmanager
+    async def op(name, owner="[broker]"):
+        if name == "reset":
+            _readopted_job(monkeypatch, job_id="906-1")
+        async with real(name, owner) as v:
+            yield v
+
+    monkeypatch.setattr(srv, "_device_op", op)
+
+    d, resets, (scope_kills, _) = _post_reset(monkeypatch, tmp_path, force=True)
+
+    assert d["status"] == "reset_complete" and resets
+    assert scope_kills == [srv.job_scope_unit("906-1")]
+    assert srv.jobs["906-1"].status == srv.JobStatus.KILLED
+
+
+@pytest.mark.asyncio
+async def test_a_readopted_job_killed_by_a_forced_reset_does_not_flag_the_device(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The monitor finalizes the job once its scope ends. KILLED is a wedge-risk end, but this kill
+    was the reset's own: flagging the device for it would make the reset its own justification."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "reset_killed_job_ids", set())
+    log = tmp_path / "run_907.log"
+    log.write_text("... running ...\n")
+    job = srv.Job(
+        id="907-1", owner="carol", workspace="/w", command="pytest", queued_at="", status=srv.JobStatus.RUNNING
+    )
+    job.log_file = str(log)
+    srv.jobs["907-1"] = job
+    scope = srv.job_scope_unit("907-1")
+    monkeypatch.setattr(srv, "readopted_scopes", {"907-1": scope})
+    async with srv.get_lock():
+        assert srv._claim_readopted_job_for_reset(srv._reset_blocking_job()) == scope
+
+    await srv._monitor_readopted_scope("907-1", scope)
+
+    assert job.status == srv.JobStatus.KILLED and "forced device reset" in job.error
+    assert not srv._device_unavailable_for_tenant(), "a reset-killed job must not flag the device"
+    assert "907-1" not in srv.reset_killed_job_ids and "907-1" not in srv.readopted_scopes
+    assert "[KILLED by device reset]" in log.read_text()
+
+
+def test_killing_a_readopted_job_holds_the_device_until_its_scope_ends(monkeypatch, tmp_path):
+    """A kill marks the job KILLED at once, but its scope gets up to GRACEFUL_KILL_GRACE_SEC to exit.
+    Its `readopted_scopes` entry is what keeps the runner from dispatching and a reset from running
+    over it meanwhile, so the kill must leave it for the monitor to drop when the scope ends (#7)."""
+    job = _readopted_job(monkeypatch)
+    during_stop = []
+
+    async def slow_scope(scope, grace_sec=0.0):
+        # The scope is still shutting down: the device is not free yet.
+        during_stop.append(("905-1" in srv.readopted_scopes, srv._reset_blocking_job()))
+
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: True)
+    monkeypatch.setattr(srv, "_terminate_scope", slow_scope)
+    client = _client(monkeypatch, tmp_path)
+
+    d = client.post("/api/tt_device_job_kill", json={"job_id": "905-1", "owner": "carol"}).json()
+
+    assert d["status"] == "killed" and job.status == srv.JobStatus.KILLED
+    assert during_stop and during_stop[0][0], "the kill freed the device before the scope stopped"
+    assert during_stop[0][1] and during_stop[0][1]["job_id"] == "905-1"
+    assert srv.readopted_scopes == {"905-1": srv.job_scope_unit("905-1")}, "only the monitor may drop it"
+    d, resets, _ = _post_reset(monkeypatch, tmp_path, force=False)
+    assert d["status"] == "refused" and d["job_id"] == "905-1" and not resets
+
+
+@pytest.mark.asyncio
+async def test_a_killed_readopted_job_frees_the_device_once_its_scope_ends(monkeypatch, tmp_path, clear_job_state):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    job = srv.Job(
+        id="908-1", owner="carol", workspace="/w", command="pytest", queued_at="", status=srv.JobStatus.KILLED
+    )
+    srv.jobs["908-1"] = job
+    scope = srv.job_scope_unit("908-1")
+    monkeypatch.setattr(srv, "readopted_scopes", {"908-1": scope})
+
+    await srv._monitor_readopted_scope("908-1", scope)
+
+    assert not srv.readopted_scopes and job.status == srv.JobStatus.KILLED and job.finished_at
+
+
+@pytest.mark.asyncio
+async def test_the_health_gate_reset_is_not_blocked_by_the_busy_check(monkeypatch):
+    """The busy check belongs to the operator tool only. The gate's ladder resets through the
+    shared mechanism, and it runs while the runner still owns the job it is cleaning up after."""
+    _running_job(monkeypatch, srv.JobStatus.HUNG)
+    fired = []
+
+    async def no_foreign(log):
+        return False
+
+    async def quiesced_reset(argv, log):
+        fired.append(list(argv))
+        return 0, ""
+
+    async def ok_verify(exp, log, **k):
+        return True, {"snapshot": {"detail": "ok"}}
+
+    monkeypatch.setattr(srv.recovery_mechanism, "await_foreign_scope", no_foreign)
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_with_quiesce", quiesced_reset)
+    patch_recovery(monkeypatch, "_verify_device", ok_verify)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "1")
+
+    assert await srv.galaxy_recovery._reset_and_verify_device(["0"], lambda m: None) is True
+    assert fired, "the gate's own reset must not be refused because a job is held"
 
 
 @pytest.mark.asyncio
@@ -1456,7 +2205,7 @@ class TestCpldTooOldBanner:
         The loud reset_mode_unknown warning exists for a host nothing could identify. Repeating it
         after the host itself answered would be reporting an open question that is closed.
         """
-        mech = _local_reset_mechanism(tmp_path)
+        mech = _local_reset_mechanism(tmp_path, monkeypatch)
         monkeypatch.delenv("TT_DEVICE_MCP_RESET_MODE", raising=False)
         monkeypatch.delenv("TT_DEVICE_MCP_RESET_ARGS", raising=False)
         monkeypatch.setattr(health_deps, "board_types_provider", lambda: None)
@@ -1472,7 +2221,7 @@ class TestCpldTooOldBanner:
         from tt_device_mcp.health.recovery.galaxy import GalaxyRecovery
         from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
 
-        mech = _local_reset_mechanism(tmp_path)
+        mech = _local_reset_mechanism(tmp_path, monkeypatch)
         monkeypatch.delenv("TT_DEVICE_MCP_RESET_MODE", raising=False)
         monkeypatch.setattr(health_deps, "board_types_provider", lambda: None)
         monitor = object()
@@ -1489,7 +2238,7 @@ class TestCpldTooOldBanner:
         """
         from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
 
-        mech = _local_reset_mechanism(tmp_path)
+        mech = _local_reset_mechanism(tmp_path, monkeypatch)
         mech.cpld_forces_galaxy = True
         monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "per-target")
 

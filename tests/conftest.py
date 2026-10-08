@@ -22,6 +22,7 @@ import tt_device_mcp.device_holders as device_holders
 import tt_device_mcp.server as srv
 from tt_device_mcp import privileges
 from tt_device_mcp.fsm import ServerFsm
+from tt_device_mcp.health import bmc_capture
 from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState
@@ -283,6 +284,9 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(heartbeat, "_heartbeat_supported", None)
     # raising=False so a base tree without the re-arm latch (a fails-on-base stash) still sets up.
     monkeypatch.setattr(heartbeat, "_heartbeat_absent_journaled", False, raising=False)
+    # eth.resolve_python() caches its answer per process; every test starts with it empty, so
+    # one test's resolved stub python never answers for the next one's.
+    monkeypatch.setattr(eth, "_python_cache", None, raising=False)
     # Prometheus's textfile dir defaults to the REAL /var/lib/prometheus/node-exporter and is read
     # fresh on every write_textfile() call (never cached), so any path through the stats
     # persistence loop that reaches it in a test would mkdir a real host path.
@@ -321,6 +325,13 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # Left set, a prior test's value would make the next runner test wait (or not) unexpectedly.
     # raising=False so a base tree without the cooldown (a fails-on-base stash) still sets up.
     monkeypatch.setattr(srv, "last_job_end_monotonic", 0.0, raising=False)
+    # The eth self-test retry's latches. Left set by a test that ran the self-test, any later test
+    # that ticks the idle sampler on a HEALTHY device would start a real retry task. raising=False
+    # so a base tree without the retry (a fails-on-base stash) still sets up cleanly.
+    monkeypatch.setattr(srv, "eth_rearm_retryable", False, raising=False)
+    monkeypatch.setattr(srv, "_last_eth_rearm_monotonic", 0.0, raising=False)
+    monkeypatch.setattr(srv, "_eth_rearm_task", None, raising=False)
+    monkeypatch.setattr(srv, "post_job_gate_pending", False, raising=False)
     # The per-owner burst-cap ledger. Left populated, one test's submissions would count against
     # the next test's cap. Fresh dict so state never bleeds; raising=False so a base tree without
     # the cap (a fails-on-base stash) still sets up cleanly.
@@ -329,6 +340,10 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # confirm a sysfs blackout on its FIRST empty sample instead of its second. raising=False so
     # a base tree without the counter (a fails-on-base stash) still sets up cleanly.
     monkeypatch.setattr(srv.sampler, "all_chips_gone_strikes", 0)
+    # The short-count debouncer and the dispatch recheck's clock (spec 03 I31/I32), for the same
+    # reason. raising=False so a base tree without them (a fails-on-base stash) still sets up.
+    monkeypatch.setattr(srv.sampler, "short_count_strikes", 0, raising=False)
+    monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None, raising=False)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
     monkeypatch.setattr(srv, "_fabric_ok_retire_monotonic", 0.0)
     monkeypatch.setattr(srv, "_fabric_ok_retire_streak", 0)
@@ -400,6 +415,21 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
         raise AssertionError("a test reached the real per-tray BMC reset; _fire_ubb_reset must be mocked")
 
     monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
+
+    # The tray-down prelude (spec 04 I19) rescans the bus and reads the BMC: never the real sysfs
+    # or ipmitool from the suite. Its reads answer "not run in tests", so every gate/ladder test
+    # still passes through the prelude unchanged. Its onset latch lives on the module-global
+    # GalaxyRecovery, so every test starts with none.
+    def _no_rescan_in_tests():
+        raise OSError("a test reached the real PCI rescan; _pci_rescan must be mocked")
+
+    def _no_bmc_reads_in_tests(argv, **k):
+        return subprocess.CompletedProcess(argv, 0, stdout="not run in tests\n", stderr="")
+
+    monkeypatch.setattr(recovery_galaxy, "_pci_rescan", _no_rescan_in_tests)
+    monkeypatch.setattr(bmc_capture, "_RUN", _no_bmc_reads_in_tests)
+    if getattr(srv, "galaxy_recovery", None) is not None:
+        srv.galaxy_recovery.tray_down_episode_end()
 
     _install_spawn_tripwire(monkeypatch, allow_device_spawns=device_marked)
 
@@ -553,7 +583,7 @@ def health_deps():
         auto_power_cycle_enabled=lambda: srv._auto_power_cycle_enabled(),
         board_types_provider=lambda: srv.health_monitor._board_types,
         glx_board_types_provider=lambda: srv.health_monitor._glx_board_types(),
-        bus_ids_provider=lambda: srv.health_monitor._bus_ids,
+        chip_buses_provider=lambda: srv.health_monitor._chip_buses,
         journal_skip_once=lambda kind, reason, **f: srv.health_monitor._journal_skip_once(kind, reason, **f),
         terminate_process_group=lambda pid: srv._terminate_process_group(pid),
         logger=lambda: srv.logger,
@@ -625,6 +655,9 @@ def galaxy_trays(monkeypatch):
     and a broker that has never seen a healthy snapshot declines the rung outright rather than
     derive a tray from the chip index."""
     monkeypatch.setattr(srv.health_monitor, "_bus_ids", list(GALAXY_BUS_IDS), raising=False)
+    # The tray map keys on {chip id: bus} (I16). This fixture's host numbers its chips in PCI order;
+    # tests/test_ubb_tray_map.py pins the real Blackhole kernel order, where 0xCX comes before 0x8X.
+    monkeypatch.setattr(srv.health_monitor, "_chip_buses", dict(enumerate(GALAXY_BUS_IDS)), raising=False)
     monkeypatch.setattr(srv.health_monitor, "_board_types", ["tt-galaxy-bh"] * len(GALAXY_BUS_IDS))
     return srv.galaxy_recovery._tray_map_now()
 

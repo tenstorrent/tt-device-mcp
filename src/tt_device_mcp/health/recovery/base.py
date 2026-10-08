@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from tt_device_mcp import metrics, privileges
+from tt_device_mcp import aio, metrics, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
 from tt_device_mcp.health.evidence import health_dir, health_event
 
@@ -134,6 +134,9 @@ class RecoveryMechanism:
         # nothing else: during a fabric check or a health probe, chips going all-ones IS a failure and
         # must still be acted on — that is precisely how a host was lost.
         self.reset_in_flight = False
+        # Any reset_with_quiesce (the ladder's or a manual one) since the mesh was last released:
+        # an off-bus set first seen after it is the reset's doing, never a tray-down onset (04 I19).
+        self.reset_since_release = False
 
         # The full transcript of the last reset, not the 3-line tail the journal carries: when a
         # mesh is left half-alive, the interesting line is usually somewhere in the middle.
@@ -346,7 +349,7 @@ class RecoveryMechanism:
 
             wait_task = asyncio.create_task(wait_and_stream())
             try:
-                await asyncio.wait_for(asyncio.shield(wait_task), timeout=DEVICE_RESET_OVERRUN_SEC)
+                await aio.wait_for(asyncio.shield(wait_task), timeout=DEVICE_RESET_OVERRUN_SEC)
             except asyncio.TimeoutError:
                 over = (datetime.now() - started).total_seconds()
                 log(
@@ -354,7 +357,7 @@ class RecoveryMechanism:
                     f"killed, and only a reset that never ends is a failure"
                 )
                 health_event("reset_overran", unit=unit, seconds=over, argv=argv)
-                await asyncio.wait_for(
+                await aio.wait_for(
                     asyncio.shield(wait_task), timeout=max(1, DEVICE_RESET_TIMEOUT_SEC - DEVICE_RESET_OVERRUN_SEC)
                 )
         except asyncio.CancelledError:
@@ -451,7 +454,7 @@ class RecoveryMechanism:
                 return await proc.communicate()
 
             try:
-                out, _ = await asyncio.wait_for(communicate(), timeout=DEVICE_RESET_OVERRUN_SEC)
+                out, _ = await aio.wait_for(communicate(), timeout=DEVICE_RESET_OVERRUN_SEC)
             except asyncio.TimeoutError:
                 # Our timer is not the reset's deadline. The scope is deliberately never killed —
                 # a reset stopped partway through 32 ASICs is far worse than one that overran —
@@ -466,7 +469,7 @@ class RecoveryMechanism:
                     f"killed, and only a scope that never ends is a failure"
                 )
                 health_event("reset_overran", unit=unit, seconds=over, argv=argv)
-                out, _ = await asyncio.wait_for(
+                out, _ = await aio.wait_for(
                     communicate(), timeout=max(1, DEVICE_RESET_TIMEOUT_SEC - DEVICE_RESET_OVERRUN_SEC)
                 )
             rc = proc.returncode
@@ -524,6 +527,7 @@ class RecoveryMechanism:
         # mid-reset and tears the endpoints out of the kernel, which is how a healthy host ended
         # up with no devices at all.
         self.reset_in_flight = True
+        self.reset_since_release = True
         cancelled_mid = False
         rc = None
         try:
