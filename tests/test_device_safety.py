@@ -51,6 +51,7 @@ from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery.galaxy import GalaxyRecovery
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
 from tt_device_mcp.health.recovery.stages import bridge_reset as bridge
+from tt_device_mcp.job_reap import Survivor
 
 
 def _no_holders(monkeypatch):
@@ -4476,6 +4477,173 @@ async def test_hung_silence_of_zero_disables_the_reaper(monkeypatch, clear_job_s
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
+
+
+# --- the survivor sweep ------------------------------------------------------
+#
+# The ladder signals the job's process group (or its scope). A child that started its own
+# session is out of that group's reach, and one stuck in the kernel outlives SIGKILL; either
+# keeps the device open while the next job is released onto it. After every job the runner
+# sweeps what is left, SIGTERM then SIGKILL, and a survivor that may hold the device marks it
+# dirty so the next job waits.
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+async def _run_one(job, limit_sec: float = 15.0):
+    srv.jobs[job.id] = job
+    await srv.get_job_queue().put(job.id)
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        deadline = time.monotonic() + limit_sec
+        while job.finished_at is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_child_that_left_the_session_does_not_outlive_its_job(monkeypatch, clear_job_state):
+    """`setsid cmd &` puts the child in a new session and process group: the final killpg
+    misses it, and it kept running (and kept the device) after its job was reported done."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+
+    job = srv.Job(
+        id="911",
+        owner="tenant",
+        workspace="/tmp",
+        # The pause lets the child leave the group before its parent exits, as a real one does.
+        command="setsid sleep 60 >/dev/null 2>&1 </dev/null & echo child=$!; sleep 0.5",
+        queued_at="t",
+    )
+    await _run_one(job)
+    child = int((job.output or "").split("child=")[1].split()[0])
+    try:
+        assert job.status is srv.JobStatus.COMPLETED
+        for _ in range(40):
+            if not _pid_alive(child):
+                break
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(child), "a child that left the job's session outlived the job"
+    finally:
+        try:
+            os.kill(child, 9)
+        except OSError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_a_survivor_holding_the_device_is_logged_and_marks_it_dirty(monkeypatch, clear_job_state, tmp_path):
+    """No signal moves a process stuck in the kernel. The runner must say which job left it
+    and hold the device until it is gone, not hand it to the next job as if it were free."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    stuck = Survivor(pid=4242, state="D", cmdline="python -m pytest test_model.py", holds_device=True)
+
+    async def fake_sweep(job_id, pid, scope=None, tag=None, **kw):
+        return [stuck]
+
+    marked = []
+    monkeypatch.setattr(srv, "reap_job_survivors", fake_sweep)
+    monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marked.append(reason))
+    log = tmp_path / "912.log"
+    job = srv.Job(id="912", owner="tenant", workspace="/tmp", command="echo hi", queued_at="t", log_file=str(log))
+    await _run_one(job)
+
+    assert job.status is srv.JobStatus.COMPLETED
+    assert any("job 912 left pid 4242 (state D)" in r for r in marked), marked
+    assert "pid 4242 state D (holds the device)" in log.read_text()
+
+
+@pytest.mark.asyncio
+async def test_a_survivor_known_not_to_hold_the_device_does_not_mark_it_dirty(monkeypatch, clear_job_state):
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+
+    async def fake_sweep(job_id, pid, scope=None, tag=None, **kw):
+        return [Survivor(pid=4243, state="D", cmdline="cat", holds_device=False)]
+
+    marked = []
+    monkeypatch.setattr(srv, "reap_job_survivors", fake_sweep)
+    monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marked.append(reason))
+    job = srv.Job(id="913", owner="tenant", workspace="/tmp", command="echo hi", queued_at="t")
+    await _run_one(job)
+
+    assert job.status is srv.JobStatus.COMPLETED
+    assert marked == []
+
+
+@pytest.mark.asyncio
+async def test_a_shutdown_during_the_sweep_still_finishes_the_job(monkeypatch, clear_job_state):
+    """The sweep is the runner's first wait after a job ends. A shutdown landing there skipped
+    the job's bookkeeping, so the finished job stayed the current one and step routes refused."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    sweeping = asyncio.Event()
+    may_finish = asyncio.Event()
+
+    async def slow_sweep(job_id, pid, scope=None, tag=None, **kw):
+        sweeping.set()
+        await may_finish.wait()
+        return []
+
+    monkeypatch.setattr(srv, "reap_job_survivors", slow_sweep)
+    job = srv.Job(id="914", owner="tenant", workspace="/tmp", command="echo hi", queued_at="t")
+    srv.jobs[job.id] = job
+    await srv.get_job_queue().put(job.id)
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await asyncio.wait_for(sweeping.wait(), timeout=10)
+        runner.cancel()
+        await asyncio.sleep(0.05)
+        assert not runner.done(), "the runner abandoned the sweep on shutdown"
+        may_finish.set()
+        results = await asyncio.wait_for(asyncio.gather(runner, return_exceptions=True), timeout=5)
+    finally:
+        may_finish.set()
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+    assert isinstance(results[0], asyncio.CancelledError), "the shutdown was swallowed"
+    assert job.finished_at is not None
+    assert srv.current_job_id is None, "the finished job stayed the current one"
+
+
+@pytest.mark.asyncio
+async def test_a_hung_reap_runs_its_ladder_to_the_end(monkeypatch, clear_job_state):
+    """The job's streams close as soon as its shell dies, often long before a child that is
+    still unwinding. The runner cancelled the reaper right then, cutting the ladder short."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 1)
+    monkeypatch.setattr(srv, "HUNG_POLL_SEC", 0.05)
+    ladder = []
+
+    async def fake_terminate(job_id, pid, grace_sec=None):
+        ladder.append("SIGINT")
+        os.killpg(pid, 9)  # the shell and its streams go at once
+        await asyncio.sleep(0.5)  # ...while the ladder waits out a child
+        ladder.append("SIGKILL")
+
+    monkeypatch.setattr(srv, "_terminate_job", fake_terminate)
+    job = srv.Job(id="914", owner="tenant", workspace="/tmp", command="echo working; sleep 60", queued_at="t")
+    await _run_one(job)
+
+    assert job.status is srv.JobStatus.HUNG
+    assert ladder == ["SIGINT", "SIGKILL"], f"the reap ladder was cut short: {ladder}"
 
 
 # --- the doomed reaper ------------------------------------------------------
