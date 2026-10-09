@@ -595,6 +595,99 @@ async def test_a_lone_off_bus_chip_24_re_powers_tray_4_first(monkeypatch, galaxy
     assert any("re-powering tray 4 (BMC mask 0x08, chips 24-31)" in line for line in lines), lines
 
 
+# --- the back-to-back sweep journals the mask it fired -----------------------------------------
+
+
+def _sweep_stubs(monkeypatch, fire):
+    """Stub every device-touching step of the back-to-back sweep and record its events and lines."""
+    g = srv.galaxy_recovery
+    events, lines = [], []
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    patch_health_event(monkeypatch, lambda kind, **fields: events.append((kind, fields)))
+
+    async def sbr(log):
+        return False
+
+    async def mesh(argv, log, *a, **k):
+        return 0, ""
+
+    async def healthy(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}}
+
+    patch_recovery(monkeypatch, "_recover_isolated_chips", sbr)
+    patch_recovery(monkeypatch, "_verify_device", healthy)
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", fire)
+    return g, events, lines
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_journals_the_tray_4_mask_it_fired_for_chips_24_to_31(monkeypatch, galaxy_seen):
+    """Chips 24-31 off a Blackhole Galaxy: the sweep's BMC re-power must leave exactly one
+    ubb_reset_fired naming mask 0x08 and chips 24-31, and a log line naming tray 4 beside the exact
+    ipmitool command. Fails on base: a successful fire emitted no event and no line, so nobody could
+    prove afterwards which mask went out."""
+    fired = []
+    g, events, lines = _sweep_stubs(monkeypatch, lambda bitmap, ids: fired.append((bitmap, ids)))
+
+    offbus = {str(i) for i in range(24, 32)}
+    out = await g._fire_tray_down_no_window(offbus, 32, lines.append, gate_phase="post-job", ev=None)
+
+    assert out == galaxy.OUTCOME_RECOVERED
+    assert fired == [(0x08, list(range(24, 32)))]
+    done = [f for k, f in events if k == "ubb_reset_fired"]
+    assert len(done) == 1, events
+    assert done[0]["ubb_bitmap"] == 0x08
+    assert done[0]["chips"] == list(range(24, 32))
+    assert done[0]["trays"] == [4]
+    assert done[0]["rc"] == 0
+    command = " ".join(galaxy._ubb_reset_argv(0x08))
+    assert done[0]["command"] == command
+    assert any(f"tray 4 (BMC mask 0x08, chips 24-31): `{command}`" in line for line in lines), lines
+
+
+@pytest.mark.asyncio
+async def test_a_failed_sweep_fire_journals_its_rc_and_no_fired_event(monkeypatch, galaxy_seen):
+    """A BMC command that exits non-zero is journalled as ubb_reset_failed with its exit code and
+    mask, never as ubb_reset_fired, and the sweep still goes on to the mesh reset."""
+    from tt_device_mcp.health.recovery.stages.ubb_tray import UbbResetError
+
+    def fail(bitmap, ids):
+        raise UbbResetError(1, "Unable to send RAW command\n")
+
+    g, events, lines = _sweep_stubs(monkeypatch, fail)
+
+    offbus = {str(i) for i in range(24, 32)}
+    await g._fire_tray_down_no_window(offbus, 32, lines.append, gate_phase="post-job", ev=None)
+
+    kinds = [k for k, _ in events]
+    assert "ubb_reset_fired" not in kinds
+    failed = [f for k, f in events if k == "ubb_reset_failed"]
+    assert len(failed) == 1
+    assert failed[0]["rc"] == 1
+    assert failed[0]["ubb_bitmap"] == 0x08
+    assert failed[0]["chips"] == list(range(24, 32))
+    assert any("failed to launch (rc 1)" in line for line in lines), lines
+
+
+@pytest.mark.asyncio
+async def test_the_last_chance_sweep_labels_each_tray_from_the_map(monkeypatch, galaxy_seen):
+    """The other caller of the sweep (the last-chance gate before a host rung) also hands the map
+    down, so its per-tray line names the tray's chips and not an empty list."""
+    g, events, lines = _sweep_stubs(monkeypatch, lambda bitmap, ids: None)
+
+    ok = await g._settle_and_verify_before_host_rung(
+        32, lines.append, "post-job", offbus_chips={str(i) for i in range(24, 32)}
+    )
+
+    assert ok is True
+    assert any("tray 4 (BMC mask 0x08, chips 24-31)" in line for line in lines), lines
+    assert [f["ubb_bitmap"] for k, f in events if k == "ubb_reset_fired"] == [0x08]
+
+
 # --- the Wormhole snapshot suffix must not disable the rung ------------------------------------
 
 

@@ -19,6 +19,14 @@ from tt_device_mcp.health.recovery.stages.smi_reset import (
 UBB_RESET_SETTLE_SEC = float(os.environ.get("TT_DEVICE_MCP_UBB_RESET_SETTLE_SEC", "28"))
 
 
+class UbbResetError(RuntimeError):
+    """The BMC command ran and exited non-zero; ``returncode`` is its exit code, for the journal."""
+
+    def __init__(self, returncode: int, stderr: str):
+        super().__init__(f"ubb tray reset exited {returncode}: {stderr.strip()[:200]}")
+        self.returncode = returncode
+
+
 def _ubb_reset_argv(bitmap: int) -> list:
     """The BMC command that re-powers the trays in ``bitmap``, as an argv list. Bit i is tray i+1:
     tt-smi's tray tables are 1-based and the BMC's bits are not, so the caller shifts (spec 04 I16). The
@@ -51,7 +59,7 @@ def _fire_ubb_reset(bitmap: int, tray_chip_ids: list) -> None:
         _reset_ioctl_if_on_bus(reset_device_ioctl, iid, IoctlResetFlags.USER_RESET)
     r = subprocess.run(_ubb_reset_argv(bitmap), timeout=60, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"ubb tray reset exited {r.returncode}: {r.stderr.strip()[:200]}")
+        raise UbbResetError(r.returncode, r.stderr)
     time.sleep(UBB_RESET_SETTLE_SEC)
     for iid in tray_chip_ids:
         _reset_ioctl_if_on_bus(reset_device_ioctl, iid, IoctlResetFlags.POST_RESET)

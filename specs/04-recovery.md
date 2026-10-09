@@ -398,7 +398,11 @@ on an unproven window.
 down and costs minutes, so before paying that the ladder re-issues every reset type once more,
 back-to-back, then takes ONE settle and ONE verify — and fires the host rung only if the mesh is
 still bad (`_settle_and_verify_before_host_rung` → `_issue_all_resets_back_to_back`, the same
-implementation the `TRAY_DOWN_NO_WINDOW` branch uses, so the two can never drift). This holds on
+implementation the `TRAY_DOWN_NO_WINDOW` branch uses, so the two can never drift). The sweep's
+per-tray BMC re-power is auditable from the journal alone: before the fire it logs one line per tray
+naming the tray, its BMC bit and its chips (from the I16 map) beside the exact `ipmitool` command;
+after it, a `ubb_reset_fired` event (`trays`, `ubb_bitmap`, `chips`, `rc`, `command`) on success or a
+`ubb_reset_failed` event carrying the same fields, the BMC exit code as `rc` and the error on failure. This holds on
 every road to a host rung, not just the tray branch: the gate ladder's own rung, the idle/stuck-hold
 escalation (`_climb_to_host_recovery_after_failed_reset` — the road most measured power cycles
 actually took), and the post-reboot cold climb (`_verify_post_reboot_recovery`, where the warm reboot
@@ -572,6 +576,7 @@ NOT be conflated when reading results.
 | I16 a trusted full read whose chip→bus map differs re-banks it, journals `chip_bus_map_drift` with the old and the new map, and the next mask follows the chip's new bus | `tests/test_ubb_tray_map.py::test_a_renumbered_full_read_re_banks_the_map_and_journals_old_and_new`, `::test_after_a_renumbering_the_walk_re_powers_the_tray_of_the_chips_new_bus` |
 | I16 a short read, an unreadable chip, or a read tt-smi disagrees with never overwrites a banked map; a matching full read changes nothing | `tests/test_ubb_tray_map.py::test_a_short_or_disagreeing_read_never_overwrites_the_banked_map`, `::test_a_full_read_that_matches_the_banked_map_changes_nothing` |
 | I16 tt-smi's bus list drifting journals `bus_map_drift`; the list stands | `tests/test_ubb_tray_map.py::test_a_drifted_snapshot_journals_but_leaves_the_cached_map_standing` |
+| I16 the back-to-back sweep journals each BMC re-power: a per-tray log line with the exact command, `ubb_reset_fired` with mask and chips on success, `ubb_reset_failed` with `rc` on failure, from both callers | `tests/test_ubb_tray_map.py::test_the_sweep_journals_the_tray_4_mask_it_fired_for_chips_24_to_31`, `::test_a_failed_sweep_fire_journals_its_rc_and_no_fired_event`, `::test_the_last_chance_sweep_labels_each_tray_from_the_map`, `tests/test_ubb_reset_launch.py::test_a_non_zero_bmc_exit_raises_with_its_exit_code` |
 | I16 a new GLX board type this build cannot map surfaces as `ubb_tray_table_missing` | `tests/test_ubb_tray_map.py::test_a_glx_board_type_with_no_matching_arch_suffix_journals_once` |
 | Tray rung: plan/walk semantics, fabric-gated clear, decline cases | `tests/test_device_safety.py::test_ubb_reset_plan_maps_a_clean_whole_tray_drop_to_its_bitmap`, `tests/test_device_safety.py::test_ubb_tray_walk_plan_orders_affected_trays_first_then_the_rest`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_stops_as_soon_as_the_mesh_is_healthy`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_does_not_clear_a_hold_on_an_unverified_fabric`, `tests/test_device_safety.py::test_ubb_tray_reset_declines_a_fully_off_bus_mesh_it_is_the_cold_rung`, `tests/test_device_safety.py::test_maybe_emit_ubb_reset_required_names_the_exact_bmc_command_on_a_tray_down`, `tests/test_device_safety.py::test_the_tray_reset_rung_is_armed_by_default` |
 | Tray fire argv/handshake (tt-smi compat, off-bus chip skipped) | `tests/test_ubb_reset_launch.py::test_fire_ubb_reset_imports_a_symbol_the_installed_tt_smi_defines`, `tests/test_ubb_reset_launch.py::test_fire_ubb_reset_pulses_the_tray_when_a_chip_is_already_off_the_bus`, `tests/test_ubb_reset_launch.py::test_fire_ubb_reset_falls_back_to_the_chip_reset_class_on_older_tt_smi` |
