@@ -14,7 +14,6 @@ own processes' fds. We degrade gracefully and report whether the scan was
 complete so the gate can decide how much to trust it.
 """
 
-import functools
 import logging
 import os
 import pwd
@@ -80,22 +79,56 @@ def in_broker_scope(pid: int) -> bool:
     return False
 
 
-@functools.lru_cache(maxsize=8)
+# Fully resolved TENANT_UIDS_ENV values, keyed by the raw string. A value with a name that did not
+# resolve is never stored, so the lookup is retried on the next scan.
+_tenant_uid_cache: dict[str, frozenset] = {}
+_tenant_uid_warned: set[str] = set()
+
+
+def _warn_tenant_uids_once(message: str) -> None:
+    if message not in _tenant_uid_warned:
+        _tenant_uid_warned.add(message)
+        logger.warning("%s: %s", TENANT_UIDS_ENV, message)
+
+
 def _parse_tenant_uids(raw: str) -> frozenset:
-    """Resolve TENANT_UIDS_ENV once per distinct value: a name lookup can go to a directory
-    service, and the gate runs on every scan. An unknown name is logged and skipped."""
+    """Resolve TENANT_UIDS_ENV, cached per distinct value: a name lookup can go to a directory
+    service, and the gate runs on every scan. Only a value whose names all resolved is cached: a
+    lookup that failed (an unknown name, or the directory service down at the first scan) is
+    retried on the next scan rather than leaving a configured tenant unprotected until a restart.
+    Root is ignored: its daemons hold the device permanently, so as a tenant it would block every
+    gate, reset and reclaim for good."""
+    cached = _tenant_uid_cache.get(raw)
+    if cached is not None:
+        return cached
     uids = set()
+    resolved = True
     for item in (part.strip() for part in raw.split(",")):
         if not item:
             continue
         if item.isdigit():
-            uids.add(int(item))
+            uid = int(item)
+        else:
+            try:
+                uid = pwd.getpwnam(item).pw_uid
+            except (KeyError, OSError):
+                resolved = False
+                _warn_tenant_uids_once(f"user {item!r} not found; retried on the next scan")
+                continue
+        if uid == 0:
+            _warn_tenant_uids_once(f"{item!r} is root, which is never a tenant; ignored")
             continue
-        try:
-            uids.add(pwd.getpwnam(item).pw_uid)
-        except KeyError:
-            logger.warning("%s: unknown user %r ignored", TENANT_UIDS_ENV, item)
-    return frozenset(uids)
+        uids.add(uid)
+    result = frozenset(uids)
+    if resolved:
+        _tenant_uid_cache[raw] = result
+    return result
+
+
+def _clear_tenant_uid_cache() -> None:
+    """Forget resolved values and warnings (tests)."""
+    _tenant_uid_cache.clear()
+    _tenant_uid_warned.clear()
 
 
 def configured_tenant_uids() -> frozenset:

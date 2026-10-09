@@ -37,9 +37,9 @@ def scope_proc(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fresh_tenant_uid_cache():
-    dh._parse_tenant_uids.cache_clear()
+    dh._clear_tenant_uid_cache()
     yield
-    dh._parse_tenant_uids.cache_clear()
+    dh._clear_tenant_uid_cache()
 
 
 # ------------------------------------------------------------------ scope detection
@@ -126,12 +126,51 @@ def test_a_scoped_holder_is_a_tenant_whatever_its_uid():
 
 
 def test_tenant_uids_env_names_extra_tenants_by_uid_or_name(monkeypatch):
-    root_name = pwd.getpwuid(0).pw_name
-    monkeypatch.setenv(dh.TENANT_UIDS_ENV, f" {SERVICE_UID} , {root_name},no-such-user-xyz,")
-    assert dh.configured_tenant_uids() == frozenset({SERVICE_UID, 0})
+    name, uid = "svc-runner", 113
+    monkeypatch.setattr(dh.pwd, "getpwnam", lambda n: pwd.struct_passwd((n, "x", uid, uid, "", "/", "/bin/sh")))
+    monkeypatch.setenv(dh.TENANT_UIDS_ENV, f" {SERVICE_UID} , {name},")
+    assert dh.configured_tenant_uids() == frozenset({SERVICE_UID, uid})
     assert dh.is_tenant(DeviceHolder(pid=1, uid=SERVICE_UID)) is True
-    assert dh.is_tenant(DeviceHolder(pid=1, uid=0)) is True
-    assert dh.is_tenant(DeviceHolder(pid=1, uid=113)) is False
+    assert dh.is_tenant(DeviceHolder(pid=1, uid=uid)) is True
+    assert dh.is_tenant(DeviceHolder(pid=1, uid=114)) is False
+
+
+@pytest.mark.parametrize("entry", ["0", pwd.getpwuid(0).pw_name])
+def test_tenant_uids_env_never_makes_root_a_tenant(monkeypatch, caplog, entry):
+    """Root's daemons hold the device permanently: as a tenant, every gate, reset and reclaim
+    would stay blocked for good. Root is ignored, with a warning, by uid or by name."""
+    monkeypatch.setenv(dh.TENANT_UIDS_ENV, f"{entry},{SERVICE_UID}")
+    with caplog.at_level("WARNING", logger="tt-device-mcp"):
+        assert dh.configured_tenant_uids() == frozenset({SERVICE_UID})
+    assert dh.is_tenant(DeviceHolder(pid=1, uid=0)) is False
+    assert "root" in caplog.text
+
+
+def test_an_unresolved_tenant_name_is_retried_not_cached(monkeypatch, caplog):
+    """A lookup that fails at the first scan (the directory service is down) must not leave the
+    account unprotected until a restart: the next scan asks again, and only a fully resolved
+    value is cached. The warning is logged once, not on every scan."""
+    directory = {}
+    lookups = []
+
+    def getpwnam(name):
+        lookups.append(name)
+        if name not in directory:
+            raise KeyError(name)
+        return pwd.struct_passwd((name, "x", directory[name], directory[name], "", "/", "/bin/sh"))
+
+    monkeypatch.setattr(dh.pwd, "getpwnam", getpwnam)
+    monkeypatch.setenv(dh.TENANT_UIDS_ENV, "svc-runner")
+    with caplog.at_level("WARNING", logger="tt-device-mcp"):
+        assert dh.configured_tenant_uids() == frozenset()
+        assert dh.configured_tenant_uids() == frozenset()
+    assert caplog.text.count("svc-runner") == 1, caplog.text
+
+    directory["svc-runner"] = 113  # the directory service is back
+    assert dh.is_tenant(DeviceHolder(pid=1, uid=113)) is True
+    n = len(lookups)
+    assert dh.configured_tenant_uids() == frozenset({113})
+    assert len(lookups) == n, "a fully resolved value is cached"
 
 
 def test_tenant_uids_env_unset_adds_nothing(monkeypatch):

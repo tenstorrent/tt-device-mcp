@@ -254,7 +254,8 @@ uids ≥ 1000 as tenants is the conservative default: a human's process is never
 submitted by a service account is still a tenant's job: its processes sit in the broker's
 `ttdev-job-*.scope`, which they cannot leave, so a straggler that outlives the job's KILLED or
 finished status (seconds while the scope winds down) still blocks. A service account that also
-runs device work outside the broker is named in `TT_DEVICE_MCP_TENANT_UIDS`. Spec 04
+runs device work outside the broker is named in `TT_DEVICE_MCP_TENANT_UIDS`. Root is never one,
+even if named: its daemons hold the device permanently and would block every gate for good. Spec 04
 (I6, I7) defines how the reset gate and the automatic ladder consume the boundary.
 
 **Why the exit file defers to the broker's own reaping.** A record written by the job is the only

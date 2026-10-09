@@ -5318,11 +5318,11 @@ def _tenant_holder_reason() -> str:
     The post-job gate skips every probe while such a holder is present (03 I13), so a job
     dispatched behind it would run beside that process on a device nobody checked. Only a
     holder SEEN is counted: system accounts below MIN_TENANT_UID (outside a broker scope and
-    TT_DEVICE_MCP_TENANT_UIDS) hold the device permanently and are not tenants, the broker itself and its children are not foreign (a per-user
-    broker runs its own probes — startup fabric verify, idle relift, operator reset, post-step
-    gate — as subprocesses under the tenant's uid; a leftover reparented away from the broker
-    still counts), and an incomplete scan does not
-    block — a per-user broker can never see other users' processes, and a dispatch, unlike a
+    TT_DEVICE_MCP_TENANT_UIDS) hold the device permanently and are not tenants, the broker
+    itself and its children are not foreign (a per-user broker runs its own probes — startup
+    fabric verify, idle relift, operator reset, post-step gate — as subprocesses under the
+    tenant's uid; a leftover reparented away from the broker still counts), and an incomplete
+    scan does not block — a per-user broker can never see other users' processes, and a dispatch, unlike a
     reset, harms no one it cannot see. A host with no device nodes has no holder to find.
     A reaped job's leftover (01 I16) blocks whatever its uid and parentage.
     """
