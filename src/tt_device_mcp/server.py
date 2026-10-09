@@ -9333,7 +9333,7 @@ def create_mcp_server() -> MCPServer:
         """'' if the device is idle of broker work. The gate runs while the device is IDLE around
         a job; an external pass with a queue job live would probe underneath it.
 
-        Three sources of broker ownership, none of them optional:
+        Four sources of broker ownership, none of them optional:
           * `device_op_active` — the broker itself is mid-reset or mid-fabric-pass (`_device_op`),
             outside of any job.
           * `current_job_id` — the runner's own ownership window for the currently dispatched
@@ -9345,6 +9345,10 @@ def create_mcp_server() -> MCPServer:
             that window.
           * the QUEUED scan — a job not yet dispatched has no `current_job_id` to catch, so it is
             still read from `jobs` directly.
+          * `readopted_scopes` — a job re-adopted after a broker restart has no `current_job_id`,
+            and a kill or a forced reset marks it KILLED before its scope has wound down. Its entry
+            stays until the scope ends; until then its processes may still be on the device, and
+            post-step's reclaim would SIGTERM them mid-teardown.
 
         This is still a snapshot: nothing stops a job from being queued and dispatched the
         instant after this returns clean. The caller re-checks it after any await (the reclaim's
@@ -9360,6 +9364,10 @@ def create_mcp_server() -> MCPServer:
         for j in jobs.values():
             if j.status in (JobStatus.RUNNING, JobStatus.QUEUED):
                 return f"broker job {j.id} is {j.status.value} ({j.owner}); the device is not idle"
+        for jid, scope in readopted_scopes.items():
+            j = jobs.get(jid)
+            state = f"{j.status.value} ({j.owner})" if j is not None else "re-adopted"
+            return f"broker job {jid} is {state}, its scope {scope} has not ended; the device is not idle"
         return ""
 
     def _parse_post_step_reclaim(data: dict) -> tuple[bool, str]:
