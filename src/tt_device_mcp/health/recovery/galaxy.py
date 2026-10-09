@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import metrics, privileges
-from tt_device_mcp.device_holders import MIN_TENANT_UID
+from tt_device_mcp.device_holders import is_tenant
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import dead_chips
@@ -1399,7 +1399,7 @@ class GalaxyRecovery(Recovery):
         queue-known: resetting out from under a live job is the thing the guard is for."""
         if self.deps.job_running():
             return True
-        if any(h.uid >= MIN_TENANT_UID for h in scan.holders):
+        if any(is_tenant(h) for h in scan.holders):
             return True
         return not force and not scan.complete
 
