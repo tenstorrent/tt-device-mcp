@@ -190,11 +190,14 @@ lifecycle can assert that a remaining holder is a straggler rather than a tenant
 pids present in its own first scan — a pid that appears only in a later rescan is a holder that
 opened the device after the reclaim began, not a straggler of the allocation that just ended, and
 is reported as a survivor rather than escalated onto. Two exclusions are structural: it never
-signals uids below `MIN_TENANT_UID` (infrastructure that survives a board reset), and it never
+signals a holder `is_tenant` does not count (infrastructure below `MIN_TENANT_UID` that survives a
+board reset), and it never
 signals itself or its own process group. It has no way to recognize "a broker-owned job" as such
 — under privsep that job runs as its submitter's uid and looks like any other tenant holder — so
 protecting a live broker job from the reclaim is the in-flight guard's job (`_broker_work_in_flight`,
-re-checked after the reclaim returns), not a property of this function. A job the broker itself
+re-checked after the reclaim returns), not a property of this function. The guard also refuses
+while a re-adopted job's scope has not ended, even once the job reads KILLED: its processes may
+still be winding down, and a SIGTERM there skips the scope's own graceful stop. A job the broker itself
 means to end still terminates through `_kill_job`.
 
 **Job-step routes are root-only.** `/api/tt_device_pre_step` and `/api/tt_device_post_step`

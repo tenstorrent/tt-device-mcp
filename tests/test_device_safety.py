@@ -2870,6 +2870,31 @@ async def test_dirty_device_is_not_reset_when_the_fabric_cannot_be_checked(monke
 
 
 @pytest.mark.asyncio
+async def test_the_gate_skips_over_a_scoped_service_account_holder(monkeypatch, tmp_path):
+    """03 I13: a holder in a broker job scope is a tenant whatever its uid. The straggler of a
+    service account's killed job, still winding down, must make the gate skip untouched rather
+    than probe or reset under it."""
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    straggler = DeviceHolder(pid=4242, uid=996, scoped=True)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[straggler], complete=True))
+    srv.device_op_lock = None
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+
+    async def _no_verify(*a, **k):
+        raise AssertionError("the gate probed the device under a scoped tenant")
+
+    patch_recovery(monkeypatch, "_verify_device", _no_verify)
+
+    srv._mark_device_dirty("job 511 ended killed (exit -9)")
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+
+    assert srv.fsm.record.why == "foreign_holder", srv.fsm.record
+    assert "pid 4242" in srv.fsm.record.detail, srv.fsm.record
+
+
+@pytest.mark.asyncio
 async def test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace(monkeypatch, tmp_path):
     """The gate meets a device a foreign tenant is using: it will not touch it, and it
     drops the dirty flag. That is a real "the last job left this unverified" state going
@@ -6749,7 +6774,12 @@ async def test_gate_hard_failed_reset_holds_loudly_never_reboots(monkeypatch, tm
 
 
 @pytest.mark.asyncio
-async def test_a_tenant_arriving_before_the_reboot_decision_blocks_it(monkeypatch, tmp_path, clear_job_state):
+@pytest.mark.parametrize(
+    "tenant",
+    [DeviceHolder(pid=4242, uid=1000), DeviceHolder(pid=4242, uid=996, scoped=True)],
+    ids=["uid-floor", "scoped-service-account"],
+)
+async def test_a_tenant_arriving_before_the_reboot_decision_blocks_it(monkeypatch, tmp_path, clear_job_state, tenant):
     """The gate scans for foreign holders TWICE: once before it touches anything, and again right
     before the host rung — and the window between them is a whole galaxy reset wide. A tenant that
     arrived inside it must reach the governor as active and block the reboot: the highest-risk
@@ -6765,8 +6795,8 @@ async def test_a_tenant_arriving_before_the_reboot_decision_blocks_it(monkeypatc
         scans["n"] += 1
         if scans["n"] == 1:
             return HolderScan(holders=[], complete=True)  # nobody, at the top of the gate
-        # A tenant opened the device while the reset ran.
-        return HolderScan(holders=[DeviceHolder(pid=4242, uid=1000)], complete=True)
+        # A tenant opened the device while the reset ran (a scoped service-account job is one too).
+        return HolderScan(holders=[tenant], complete=True)
 
     monkeypatch.setattr(srv, "enumerate_device_holders", holders)
     # The REAL governor, so the re-scan's tenant verdict is what decides — _reach_reboot_rung's
@@ -12393,6 +12423,35 @@ async def test_the_dispatch_recheck_never_runs_the_fabric_pass(monkeypatch):
 
     assert eth_reads == [1]
     assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "holder, reads",
+    [(DeviceHolder(pid=4242, uid=996, scoped=True), []), (DeviceHolder(pid=4242, uid=996), [1])],
+    ids=["scoped-service-account-skips", "unscoped-infrastructure-reads"],
+)
+async def test_the_dispatch_recheck_skips_the_eth_read_beside_a_scoped_holder(monkeypatch, holder, reads):
+    """The eth read maps every chip, so beside a tenant it is skipped, as the gate skips it. A
+    service account's process in a broker job scope is a tenant; one outside any scope is
+    infrastructure and does not stop the read."""
+    _stale_healthy_device(monkeypatch, age_sec=3600)
+    monkeypatch.setattr(srv, "eth_check_armed", True)
+    monkeypatch.setattr(srv, "_device_health_gate", _unreachable_gate)
+    monkeypatch.setattr(srv, "heartbeat_verdict", lambda expected: (Verdict.HEALTHY, "ok", {}))
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[holder], complete=True))
+    eth_reads = []
+
+    async def _eth_ok(*a, **k):
+        eth_reads.append(1)
+        return True, "all active eth heartbeats advancing"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", _eth_ok)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+
+    await srv._dispatch_recheck_if_stale(None)
+
+    assert eth_reads == reads
 
 
 @pytest.mark.asyncio
