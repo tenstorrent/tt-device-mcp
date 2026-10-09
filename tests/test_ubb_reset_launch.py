@@ -157,8 +157,6 @@ def test_fire_ubb_reset_falls_back_to_the_chip_reset_class_on_older_tt_smi(monke
 def test_a_non_zero_bmc_exit_raises_with_its_exit_code(monkeypatch):
     """A BMC command that exits non-zero raises before the settle and the POST_RESET half, and the
     error carries the exit code so the sweep can journal it as ``rc``."""
-    import pytest
-
     from tt_device_mcp.health.recovery.stages.ubb_tray import UbbResetError
 
     calls = []
