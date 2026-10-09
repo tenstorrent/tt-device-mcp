@@ -403,6 +403,46 @@ def test_the_in_flight_guard_catches_a_hung_jobs_teardown_window(monkeypatch, cl
         current_peer_uid.reset(tok)
 
 
+@pytest.mark.parametrize("status", ["KILLED", "RUNNING", None])
+def test_the_in_flight_guard_catches_a_readopted_jobs_scope_until_it_ends(monkeypatch, clear_job_state, status):
+    """A job re-adopted after a broker restart has no `current_job_id`. A kill or a forced reset
+    marks it KILLED before its scope has wound down; its `readopted_scopes` entry stays until the
+    scope ends. A step in that window would read the device as idle, and post-step's reclaim would
+    SIGTERM the scope's processes mid-teardown."""
+    _no_holders(monkeypatch)
+    _quiet_gate(monkeypatch)
+    fsm_healthy(srv)
+    if status is not None:
+        job = srv.Job(id="007", owner="svc", workspace="/tmp", command="echo hi", queued_at="2026-09-03T00:00:00")
+        job.status = srv.JobStatus[status]
+        srv.jobs["007"] = job
+    monkeypatch.setitem(srv.readopted_scopes, "007", "ttdev-job-007.scope")
+    reclaimed = []
+    monkeypatch.setattr(srv, "reclaim_foreign_holders", lambda **_: reclaimed.append(True))
+
+    tok = current_peer_uid.set(0)
+    try:
+        with _client() as c:
+            for route in ("/api/tt_device_pre_step", "/api/tt_device_post_step"):
+                body = c.post(route, json={}).json()
+                assert body["status"] == "refused", f"{route} ran under a re-adopted job's scope: {body}"
+                assert "007" in body["reason"], body["reason"]
+        assert reclaimed == [], "post-step reclaimed under a re-adopted job's scope"
+    finally:
+        current_peer_uid.reset(tok)
+
+    if status == "RUNNING":
+        return  # a running job blocks on its own; the scope check is what covers the others
+    srv.readopted_scopes.pop("007")
+    with _client() as c:
+        tok = current_peer_uid.set(0)
+        try:
+            body = c.post("/api/tt_device_pre_step", json={}).json()
+        finally:
+            current_peer_uid.reset(tok)
+    assert body["status"] != "refused", f"the guard outlived the scope: {body}"
+
+
 def test_post_step_re_checks_the_guard_after_the_reclaim_before_the_gate(monkeypatch, clear_job_state, tmp_path):
     """The reclaim's `to_thread` call yields the event loop — the one window in this route where a
     submission can be queued and dispatched. A guard checked only at entry would miss a job that

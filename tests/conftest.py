@@ -212,6 +212,10 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     # started, and would read as a reaped job's leftover that refuses the test's reset. Pointed at
     # an empty dir; a test about the fence stages its own. Its per-process state starts empty.
     monkeypatch.setattr(job_reap, "LEFTOVER_PROC_DIR", str(tmp_path_factory.mktemp("no-leftover-proc")))
+    # The tenant rule reads a holder's REAL /proc/<pid>/cgroup at scan time for the same reason: on a
+    # broker host a live job's pid would read as scoped. Empty dir; a test about scopes stages its own.
+    monkeypatch.setattr(device_holders, "SCOPE_PROC_DIR", str(tmp_path_factory.mktemp("no-scope-proc")))
+    monkeypatch.delenv(device_holders.TENANT_UIDS_ENV, raising=False)
     monkeypatch.setattr(srv, "reaped_survivors", {})
     monkeypatch.setattr(srv, "_leftover_fence_detail", "")
     # The reset argv/mode env vars are read live (never cached), so an operator's own shell/CI
