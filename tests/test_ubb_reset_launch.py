@@ -14,6 +14,8 @@ import sys
 import time
 import types
 
+import pytest
+
 from tt_device_mcp.health.recovery.stages.ubb_tray import _fire_ubb_reset as _REAL_FIRE_UBB_RESET
 
 
@@ -150,3 +152,35 @@ def test_fire_ubb_reset_falls_back_to_the_chip_reset_class_on_older_tt_smi(monke
         ("ioctl", 17, "POST_RESET"),
         ("ioctl", 18, "POST_RESET"),
     ], "the fire must USER_RESET every chip, pulse the tray once over IPMI, then POST_RESET every chip"
+
+
+def test_a_non_zero_bmc_exit_raises_with_its_exit_code(monkeypatch):
+    """A BMC command that exits non-zero raises before the settle and the POST_RESET half, and the
+    error carries the exit code so the sweep can journal it as ``rc``."""
+    from tt_device_mcp.health.recovery.stages.ubb_tray import UbbResetError
+
+    calls = []
+
+    class _Flags:
+        USER_RESET = "USER_RESET"
+        POST_RESET = "POST_RESET"
+
+    fake_reset = types.ModuleType("tt_smi.reset")
+    fake_reset.IoctlResetFlags = _Flags
+    fake_reset.reset_device_ioctl = lambda iid, flag: calls.append(("ioctl", iid, flag))
+    fake_pkg = types.ModuleType("tt_smi")
+    fake_pkg.reset = fake_reset
+    monkeypatch.setitem(sys.modules, "tt_smi", fake_pkg)
+    monkeypatch.setitem(sys.modules, "tt_smi.reset", fake_reset)
+    monkeypatch.setattr(
+        subprocess, "run", lambda argv, **_kw: types.SimpleNamespace(returncode=1, stdout="", stderr="no BMC\n")
+    )
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: calls.append(("sleep",)))
+
+    with pytest.raises(UbbResetError) as err:
+        _REAL_FIRE_UBB_RESET(0x08, [24])
+
+    assert err.value.returncode == 1
+    assert isinstance(err.value, RuntimeError)
+    assert "exited 1: no BMC" in str(err.value)
+    assert calls == [("ioctl", 24, "USER_RESET")], "no settle and no POST_RESET after a failed pulse"
