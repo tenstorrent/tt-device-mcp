@@ -17,8 +17,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from tt_device_mcp import metrics, privileges
+from tt_device_mcp import aio, metrics, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
+from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_dir, health_event
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
@@ -121,6 +122,10 @@ class RecoveryMechanism:
         self._write_action_log = write_action_log
         self._device_hold_episode_since = device_hold_episode_since
         self._local_reset_dir = local_reset_dir or health_dir
+        # Why no reset may run now — '' when one may. The broker sets it to its leftover fence (spec
+        # 01 I16): a reaped job's process still holding the device, which a reset cannot free.
+        # Checked here, where every reset passes, so no caller can reset over one.
+        self.reset_fence: Optional[Callable[[], str]] = None
 
         # Two callers (the auto-recovery reset launcher and the operator-run reset tool) need this
         # sequence and they must build it identically, because the scope name is what every other
@@ -134,6 +139,9 @@ class RecoveryMechanism:
         # nothing else: during a fabric check or a health probe, chips going all-ones IS a failure and
         # must still be acted on — that is precisely how a host was lost.
         self.reset_in_flight = False
+        # Any reset_with_quiesce (the ladder's or a manual one) since the mesh was last released:
+        # an off-bus set first seen after it is the reset's doing, never a tray-down onset (04 I19).
+        self.reset_since_release = False
 
         # The full transcript of the last reset, not the 3-line tail the journal carries: when a
         # mesh is left half-alive, the interesting line is usually somewhere in the middle.
@@ -346,7 +354,7 @@ class RecoveryMechanism:
 
             wait_task = asyncio.create_task(wait_and_stream())
             try:
-                await asyncio.wait_for(asyncio.shield(wait_task), timeout=DEVICE_RESET_OVERRUN_SEC)
+                await aio.wait_for(asyncio.shield(wait_task), timeout=DEVICE_RESET_OVERRUN_SEC)
             except asyncio.TimeoutError:
                 over = (datetime.now() - started).total_seconds()
                 log(
@@ -354,7 +362,7 @@ class RecoveryMechanism:
                     f"killed, and only a reset that never ends is a failure"
                 )
                 health_event("reset_overran", unit=unit, seconds=over, argv=argv)
-                await asyncio.wait_for(
+                await aio.wait_for(
                     asyncio.shield(wait_task), timeout=max(1, DEVICE_RESET_TIMEOUT_SEC - DEVICE_RESET_OVERRUN_SEC)
                 )
         except asyncio.CancelledError:
@@ -451,7 +459,7 @@ class RecoveryMechanism:
                 return await proc.communicate()
 
             try:
-                out, _ = await asyncio.wait_for(communicate(), timeout=DEVICE_RESET_OVERRUN_SEC)
+                out, _ = await aio.wait_for(communicate(), timeout=DEVICE_RESET_OVERRUN_SEC)
             except asyncio.TimeoutError:
                 # Our timer is not the reset's deadline. The scope is deliberately never killed —
                 # a reset stopped partway through 32 ASICs is far worse than one that overran —
@@ -466,7 +474,7 @@ class RecoveryMechanism:
                     f"killed, and only a scope that never ends is a failure"
                 )
                 health_event("reset_overran", unit=unit, seconds=over, argv=argv)
-                out, _ = await asyncio.wait_for(
+                out, _ = await aio.wait_for(
                     communicate(), timeout=max(1, DEVICE_RESET_TIMEOUT_SEC - DEVICE_RESET_OVERRUN_SEC)
                 )
             rc = proc.returncode
@@ -515,15 +523,23 @@ class RecoveryMechanism:
 
         Returns (exit code, combined output); the code is None on timeout/launch failure.
         """
+        fenced = self.reset_fence() if self.reset_fence else ""
+        if fenced:
+            log(f"reset refused: {fenced}")
+            health_event("reset_fenced", argv=argv, owner=owner, reason=fenced)
+            return None, f"reset refused: {fenced}"
         # Name the command we are actually running. This was hardcoded to the galaxy's -glx_reset, so on
         # every other machine the queue told operators a command that was not the one executing.
         self._set_device_op_detail(f"device reset: {' '.join(argv)} (~60s)")
+        # Any reset clears a firmware clock cap; owed until a verified re-apply (see aiclk_ceiling).
+        CEILING.mark_owed("reset")
         quiesced = await self._set_device_pollers(False, log)
         # A reset takes the chips off the bus — that is what it does — so for its duration they
         # read all-ones exactly like a dead chip. Without this flag the sampler isolates them
         # mid-reset and tears the endpoints out of the kernel, which is how a healthy host ended
         # up with no devices at all.
         self.reset_in_flight = True
+        self.reset_since_release = True
         cancelled_mid = False
         rc = None
         try:
@@ -560,6 +576,8 @@ class RecoveryMechanism:
                     # device comes back short and nobody knows why.
                     await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
                     await asyncio.sleep(3)
+                    if rc == 0:
+                        await self._reapply_aiclk_ceiling(log)
                 except OSError:
                     pass
                 finally:
@@ -568,6 +586,19 @@ class RecoveryMechanism:
                     # rather than leaving a telemetry gap.
                     if quiesced:
                         await asyncio.shield(self._set_device_pollers(True, log))
+
+    async def _reapply_aiclk_ceiling(self, log) -> None:
+        """Put an operator's AICLK ceiling back on the freshly reset chips, before the pollers
+        return and before the caller's verify runs its traffic pass. Only after a completed reset
+        (the chips are back on the bus); a no-op when unconfigured. Never raises: a failure here
+        leaves the ceiling owed, and the verify's probe pass retries it and fails closed."""
+        if not CEILING.armed():
+            return
+        self._set_device_op_detail("device reset: re-applying the AICLK ceiling")
+        try:
+            await CEILING.apply("post-reset", log=log)
+        except Exception as e:  # noqa: BLE001 - the verify that follows owns the verdict
+            log(f"aiclk-ceiling: post-reset apply raised {type(e).__name__}: {e}")
 
     def read_auto_recovery_ledger(self) -> Optional[list[dict]]:
         """Every auto-recovery escalation this host has taken, oldest first — the rate limiter's

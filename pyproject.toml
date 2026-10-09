@@ -24,6 +24,7 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "pytest-timeout>=2.1.0",
 ]
 
 [project.scripts]
@@ -44,6 +45,8 @@ include = ["src/tt_device_mcp"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# A hung test fails in minutes with its stacks printed, instead of holding CI for hours.
+timeout = 120
 
 [tool.black]
 line-length = 120

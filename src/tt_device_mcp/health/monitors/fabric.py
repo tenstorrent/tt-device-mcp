@@ -47,9 +47,27 @@ _WEDGED_ETH_INIT = re.compile(r"waiting for active ethernet core|Try resetting t
 # — and it is the dominant reason a host learns nothing about its fabric.
 _WATCHDOG_TIMEOUT = re.compile(r"Workload execution timed out after \d+ seconds")
 
-# The first line naming why the validator never reached a verdict, for a SKIPPED detail that
-# says more than a bare exit code.
-_SKIP_REASON = re.compile(r"what\(\):.*|filesystem error:.*|terminate called.*")
+# The lines naming why the validator never reached a verdict, most specific first, for a SKIPPED
+# detail that says more than a bare exit code. Order matters: an uncaught exception prints
+# "terminate called after throwing an instance of '<type>'" on the line ABOVE "  what():  <cause>",
+# so a first-match-in-line-order search kept the exception type and dropped the cause (a missing
+# 1G hugepage pool read as a bare UmdException). A logged error/TT_THROW line is next: some aborts
+# print their cause only there.
+_REASON_PATTERNS = (
+    re.compile(r"what\(\):.*"),
+    re.compile(r"filesystem error:.*"),
+    re.compile(r"(?:\|\s*(?:critical|fatal|error)\s*\||\[(?:critical|error)\]|TT_THROW|TT_FATAL).*", re.IGNORECASE),
+    re.compile(r"terminate called.*"),
+)
+
+
+def first_reason(output: str) -> Optional[str]:
+    """The validator's first error line, by :data:`_REASON_PATTERNS` priority, or ``None``."""
+    for pat in _REASON_PATTERNS:
+        m = pat.search(output)
+        if m:
+            return m.group(0).strip()[:300]
+    return None
 
 
 def classify(rc: Optional[int], output: str) -> tuple[Optional[bool], str]:
@@ -75,10 +93,10 @@ def classify(rc: Optional[int], output: str) -> tuple[Optional[bool], str]:
         )
     if _WATCHDOG_TIMEOUT.search(output):
         return False, "traffic stalled until the validator's own watchdog fired; no link reported back"
-    reason = _SKIP_REASON.search(output)
+    reason = first_reason(output)
     detail = f"validator did not complete a measurement (rc={rc})"
     if reason:
-        detail += f": {reason.group(0)}"
+        detail += f": {reason}"
     return None, detail
 
 
