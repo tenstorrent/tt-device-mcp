@@ -7795,13 +7795,14 @@ HUGEPAGES_POLL_SEC = 2.0
 
 
 def _hugepages_shortfall() -> Optional[tuple[int, int]]:
-    """``(have, need)`` while this host's chips still lack their 1G hugepages, else None. Keyed on
-    the operator's declared TT_DEVICE_MCP_EXPECTED_CHIPS (one hugepage per chip): a host that
-    declares no count is never held for hugepages."""
+    """``(have, need)`` while this host's chips still lack their 1G hugepages, else None. Opt-in:
+    only a host that declares TT_DEVICE_MCP_EXPECTED_CHIPS is ever held for hugepages. The count
+    needed is one page per Tenstorrent PCI function that needs one, never the chip count: a card
+    with two chips behind one function would otherwise wait for pages nothing ever allocates."""
     raw = os.environ.get("TT_DEVICE_MCP_EXPECTED_CHIPS", "").strip()
-    if not raw.isdigit():
+    if not raw.isdigit() or int(raw) <= 0:
         return None
-    return health_hugepages_shortfall(int(raw))
+    return health_hugepages_shortfall()
 
 
 async def _await_startup_hugepages() -> bool:

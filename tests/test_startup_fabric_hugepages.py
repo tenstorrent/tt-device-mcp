@@ -48,40 +48,69 @@ def _fake_bus(tmp_path, monkeypatch, *, iommu_type, nr="4", n_chips=4):
 
 @pytest.mark.parametrize("iommu_type", ["identity", None])
 def test_hugepages_shortfall_reports_a_short_pool_behind_identity_or_no_iommu(tmp_path, monkeypatch, iommu_type):
-    _fake_bus(tmp_path, monkeypatch, iommu_type=iommu_type, nr="3")
-    assert hostpci.hugepages_shortfall(32) == (3, 32)
+    _fake_bus(tmp_path, monkeypatch, iommu_type=iommu_type, nr="3", n_chips=32)
+    assert hostpci.hugepages_shortfall() == (3, 32)
 
 
 def test_hugepages_shortfall_is_none_once_the_count_is_met(tmp_path, monkeypatch):
-    _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="32")
-    assert hostpci.hugepages_shortfall(32) is None
+    _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="32", n_chips=32)
+    assert hostpci.hugepages_shortfall() is None
 
 
 def test_hugepages_shortfall_is_none_behind_a_translating_iommu(tmp_path, monkeypatch):
     """A DMA domain maps buffers through the IOMMU and needs no hugepages: nothing to wait for."""
     _fake_bus(tmp_path, monkeypatch, iommu_type="DMA-FQ", nr="0")
-    assert hostpci.hugepages_shortfall(32) is None
+    assert hostpci.hugepages_shortfall() is None
 
 
 def test_hugepages_shortfall_is_none_without_a_readable_pool(tmp_path, monkeypatch):
     """No 1G pool to read is not evidence of a short one; waiting on it would hold a box that may
     not use hugepages at all."""
     _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr=None)
-    assert hostpci.hugepages_shortfall(32) is None
+    assert hostpci.hugepages_shortfall() is None
 
 
-def test_hugepages_shortfall_needs_an_expected_count(tmp_path, monkeypatch):
-    _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="0")
-    assert hostpci.hugepages_shortfall(0) is None
+def test_hugepages_shortfall_is_none_with_no_function_on_the_bus(tmp_path, monkeypatch):
+    _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="0", n_chips=0)
+    assert hostpci.hugepages_shortfall() is None
+
+
+def test_hugepages_shortfall_counts_pci_functions_not_chips(tmp_path, monkeypatch):
+    """UMD pins one 1G page per PCI function, and the vendor setup allocates per function. A card
+    with two chips behind one function (n300, T3K) needs one page, not two: keyed on the chip
+    count, a pool sized per function never reads full, and the startup pass and the relift wait
+    on it forever."""
+    _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="4", n_chips=4)
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "8")
+    assert hostpci.hugepages_shortfall() is None
+    assert srv._hugepages_shortfall() is None, "8 chips on 4 functions need 4 pages, and 4 are there"
+
+
+def test_hugepages_shortfall_needs_a_page_only_per_identity_mapped_function(tmp_path, monkeypatch):
+    """A function behind a translating domain needs no page; only the identity-mapped ones count."""
+    _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="1", n_chips=2)
+    dma = tmp_path / "iommu_groups" / "8"
+    dma.mkdir()
+    (dma / "type").write_text("DMA\n")
+    for i in (3, 4):
+        dev = pci.PCI_DEVICES_DIR / f"0000:{i:02x}:00.0"
+        dev.mkdir()
+        (dev / "vendor").write_text(hostpci.TT_VENDOR_ID + "\n")
+        (dev / "iommu_group").symlink_to(dma)
+    assert hostpci.hugepages_shortfall() == (1, 2)
+    (tmp_path / "nr_hugepages").write_text("2\n")
+    assert hostpci.hugepages_shortfall() is None
 
 
 def test_the_broker_waits_only_when_the_expected_chip_count_is_set(monkeypatch):
     seen = []
-    monkeypatch.setattr(srv, "health_hugepages_shortfall", lambda need: seen.append(need) or (1, need))
+    monkeypatch.setattr(srv, "health_hugepages_shortfall", lambda: seen.append(1) or (1, 32))
     assert srv._hugepages_shortfall() is None, "no TT_DEVICE_MCP_EXPECTED_CHIPS: unchanged behaviour"
     assert seen == []
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
     assert srv._hugepages_shortfall() == (1, 32)
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "0")
+    assert srv._hugepages_shortfall() is None, "a declared count of 0 declares nothing"
 
 
 # --- the fabric wrapper's reason and the action-log output -------------------------------------
