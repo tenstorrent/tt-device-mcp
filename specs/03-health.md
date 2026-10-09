@@ -111,7 +111,7 @@ job boundary.
   clean exit only when that exit's eth read reached no verdict (I30; a link-count-drop skip only
   when no pass is fresher than that interval).
 - **I13 — The gate never resets over a tenant.** A foreign holder (uid ≥ `MIN_TENANT_UID`,
-  1000) skips the gate untouched: verification is deferred, an existing hold outlives the skip
+  1000, or below it in a broker job/exec scope or named in `TT_DEVICE_MCP_TENANT_UIDS`; 04 I6) skips the gate untouched: verification is deferred, an existing hold outlives the skip
   (`why=foreign_holder`), and `fsm.note` names the holder. The host rungs re-scan at fire time,
   and an incomplete scan counts as a tenant. The skipped probes are not waved through: the next
   job waits while a holder it can SEE stays (spec 01 I15). An incomplete scan does not hold

@@ -14,8 +14,10 @@ own processes' fds. We degrade gracefully and report whether the scan was
 complete so the gate can decide how much to trust it.
 """
 
+import functools
 import logging
 import os
+import pwd
 import signal
 import time
 from dataclasses import dataclass, field
@@ -35,6 +37,18 @@ DRIVER_PROC_DIR = "/proc/driver/tenstorrent"
 # Only real logged-in users (uid >= this) count as foreign holders to protect.
 MIN_TENANT_UID = 1000
 
+# The uid floor alone misses tenant work run under a service account. Work the broker itself
+# launched runs (under privsep) in one of these transient scopes: a queued job in
+# ttdev-job-<id>.scope, a direct exec in ttdev-exec-<pid>-<n>.scope. A process cannot leave its
+# scope, so one still holding the device after its job was marked killed or finished is that job's
+# straggler, and a reset under it is a reset under the job, whatever its uid.
+BROKER_SCOPE_PREFIXES = ("ttdev-job-", "ttdev-exec-")
+# Where a holder's cgroup is read from. A module attribute so tests point it at a staged tree.
+SCOPE_PROC_DIR = "/proc"
+# Comma-separated uids or user names that count as tenants even below MIN_TENANT_UID: a service
+# account that runs device work outside the broker too.
+TENANT_UIDS_ENV = "TT_DEVICE_MCP_TENANT_UIDS"
+
 
 @dataclass(frozen=True)
 class DeviceHolder:
@@ -42,10 +56,58 @@ class DeviceHolder:
 
     pid: int
     uid: int
+    # Sits in a broker job or exec scope (BROKER_SCOPE_PREFIXES). Read once, at scan time; not part
+    # of the holder's identity, so holders from two scans still compare by (pid, uid).
+    scoped: bool = field(default=False, compare=False)
 
     @property
     def username(self) -> str:
         return username_for_uid(self.uid)
+
+
+def in_broker_scope(pid: int) -> bool:
+    """True when ``pid`` sits in a broker job or exec scope. Unreadable reads as False: the uid
+    rule still applies, and /proc/<pid>/cgroup is world-readable, so only an exited pid gets here."""
+    try:
+        with open(f"{SCOPE_PROC_DIR}/{pid}/cgroup") as f:
+            raw = f.read()
+    except OSError:
+        return False
+    for line in raw.splitlines():
+        for part in line.rsplit(":", 1)[-1].split("/"):
+            if part.endswith(".scope") and part.startswith(BROKER_SCOPE_PREFIXES):
+                return True
+    return False
+
+
+@functools.lru_cache(maxsize=8)
+def _parse_tenant_uids(raw: str) -> frozenset:
+    """Resolve TENANT_UIDS_ENV once per distinct value: a name lookup can go to a directory
+    service, and the gate runs on every scan. An unknown name is logged and skipped."""
+    uids = set()
+    for item in (part.strip() for part in raw.split(",")):
+        if not item:
+            continue
+        if item.isdigit():
+            uids.add(int(item))
+            continue
+        try:
+            uids.add(pwd.getpwnam(item).pw_uid)
+        except KeyError:
+            logger.warning("%s: unknown user %r ignored", TENANT_UIDS_ENV, item)
+    return frozenset(uids)
+
+
+def configured_tenant_uids() -> frozenset:
+    """The extra tenant uids named by TENANT_UIDS_ENV (empty when unset)."""
+    return _parse_tenant_uids(os.environ.get(TENANT_UIDS_ENV, ""))
+
+
+def is_tenant(holder: DeviceHolder) -> bool:
+    """Whether a holder is a tenant the gates must not act under: a real user (uid at or above
+    MIN_TENANT_UID), a process in a broker job or exec scope, or a uid named in TENANT_UIDS_ENV.
+    Everything else below the floor is infrastructure (root, telemetry daemons)."""
+    return holder.uid >= MIN_TENANT_UID or holder.scoped or holder.uid in configured_tenant_uids()
 
 
 @dataclass
@@ -69,7 +131,7 @@ class HolderScan:
         ``caller_uid=None`` is a caller with no peer identity (an HTTP reset): no
         holder can be claimed as its own, so every real tenant counts as foreign.
         """
-        return [h for h in self.holders if h.uid != caller_uid and h.uid >= MIN_TENANT_UID]
+        return [h for h in self.holders if h.uid != caller_uid and is_tenant(h)]
 
 
 def _proc_uid(pid: int) -> int | None:
@@ -185,7 +247,7 @@ def _scan_from_driver_pids(pids: "set[int]", complete: bool) -> HolderScan:
         if not confirmed:
             scan.complete = False
             continue
-        scan.holders.append(DeviceHolder(pid=pid, uid=uid))
+        scan.holders.append(DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid)))
     return scan
 
 
@@ -239,7 +301,7 @@ def _scan_by_walking_proc() -> HolderScan:
             if uid is None:
                 scan.complete = False
                 continue
-            scan.holders.append(DeviceHolder(pid=pid, uid=uid))
+            scan.holders.append(DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid)))
 
     if blocked:
         logger.warning(
@@ -418,8 +480,8 @@ def reclaim_foreign_holders(
     Only a caller with the authority to declare the allocation over may run it (spec 05).
 
     Two exclusions are structural, enforced here regardless of what the scan reports:
-    infrastructure below MIN_TENANT_UID (it survives a board reset and is not a competing
-    tenant), and this process itself along with its own process group (a defensive belt in
+    infrastructure (a holder `is_tenant` does not count: it survives a board reset and is not a
+    competing tenant), and this process itself along with its own process group (a defensive belt in
     case a scan or a uid check upstream ever miscounted the broker as a holder — the caller
     already runs as this process, so signalling it would be self-inflicted). Neither the uid
     floor nor self-exclusion has any notion of "a job the broker submitted" — a broker-owned
@@ -452,7 +514,7 @@ def reclaim_foreign_holders(
             return False  # pid already gone; not the broker's group either way
 
     scan = rescan()
-    targets = [h for h in scan.holders if h.uid >= MIN_TENANT_UID and not _is_self(h)]
+    targets = [h for h in scan.holders if is_tenant(h) and not _is_self(h)]
     if not targets:
         return ReclaimResult(signalled=[], survivors=[], scan_complete=scan.complete)
 
@@ -508,7 +570,7 @@ def reclaim_foreign_holders(
         if grace_sec:
             sleep(grace_sec)
         after = rescan()
-        still = [h for h in after.holders if h.uid >= MIN_TENANT_UID]
+        still = [h for h in after.holders if is_tenant(h)]
         if not still:
             return ReclaimResult(signalled=list(signalled_by_pid.values()), survivors=[], scan_complete=after.complete)
         # No `or still` fallback: a pid that shows up here but was never a target is a NEW
@@ -531,6 +593,6 @@ def reclaim_foreign_holders(
         logger.debug("device-holder reclaim: %d signal(s) targeted an already-gone process", vanished)
     return ReclaimResult(
         signalled=list(signalled_by_pid.values()),
-        survivors=[h for h in final.holders if h.uid >= MIN_TENANT_UID],
+        survivors=[h for h in final.holders if is_tenant(h)],
         scan_complete=final.complete,
     )

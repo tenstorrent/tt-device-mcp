@@ -73,12 +73,13 @@ from tt_device_mcp.constants import step_deadline_sec as _shared_step_deadline_s
 # Device node directory; module-level so tests can point it at a fixture dir.
 TT_DEV_DIR = "/dev/tenstorrent"
 from tt_device_mcp.device_holders import (
-    MIN_TENANT_UID,
+    MIN_TENANT_UID,  # noqa: F401 - re-exported: tests read srv.MIN_TENANT_UID
     HolderScan,
     ReclaimResult,
     descends_from,
     enumerate_device_holders,
     evaluate_reset_gate,
+    is_tenant,
     reclaim_foreign_holders,
 )
 from tt_device_mcp.fsm import ServerFsm, ServerState
@@ -3988,7 +3989,7 @@ async def device_health_gate(
             _mark_device_dirty(leftover, why="foreign_holder")
         fsm.note(f"{FOREIGN_HOLDER_NOTE}{leftover}")
         return
-    foreign = [h for h in scan.holders if h.uid >= MIN_TENANT_UID]
+    foreign = [h for h in scan.holders if is_tenant(h)]
     if foreign:
         who = ", ".join(f"{h.username}(pid {h.pid})" for h in foreign)
         _log(f"skip: device held by {who}; not touching it")
@@ -4611,7 +4612,7 @@ async def device_health_gate(
             # A scan that could not read every holder (no CAP_DAC_READ_SEARCH on a tenant's
             # /proc) must count as "a tenant is here": the highest-risk action does not get to
             # take the box down over a tenant it merely could not see.
-            tenant_active = not scan2.complete or any(h.uid >= MIN_TENANT_UID for h in scan2.holders)
+            tenant_active = not scan2.complete or any(is_tenant(h) for h in scan2.holders)
             allowed, why = recovery_mechanism.auto_recovery_allowed(action, tenant_active=tenant_active)
             if allowed:
                 await _fire(stage)
@@ -4700,12 +4701,12 @@ def _slurm_step_verdict(*, require_free: bool) -> dict:
 
     Fit is the FSM's own verdict plus one live sysfs sample, reusing the two predicates the
     queue's own admission reads — an external driver and a queued job must never get different
-    answers about the same device. Free is the reset gate's tenant rule: a holder at or above
-    MIN_TENANT_UID, or a scan too blind to rule one out (04 I7 fails closed).
+    answers about the same device. Free is the reset gate's tenant rule: a holder `is_tenant`
+    counts, or a scan too blind to rule one out (04 I7 fails closed).
     """
     reason = _device_degraded_for_tenant()
     scan = enumerate_device_holders()
-    foreign = [h for h in scan.holders if h.uid >= MIN_TENANT_UID]
+    foreign = [h for h in scan.holders if is_tenant(h)]
     holders = [{"pid": h.pid, "uid": h.uid, "username": h.username} for h in foreign]
 
     if require_free and not reason:
@@ -5316,8 +5317,8 @@ def _tenant_holder_reason() -> str:
 
     The post-job gate skips every probe while such a holder is present (03 I13), so a job
     dispatched behind it would run beside that process on a device nobody checked. Only a
-    holder SEEN is counted: system accounts below MIN_TENANT_UID hold the device permanently
-    and are not tenants, the broker itself and its children are not foreign (a per-user
+    holder SEEN is counted: system accounts below MIN_TENANT_UID (outside a broker scope and
+    TT_DEVICE_MCP_TENANT_UIDS) hold the device permanently and are not tenants, the broker itself and its children are not foreign (a per-user
     broker runs its own probes — startup fabric verify, idle relift, operator reset, post-step
     gate — as subprocesses under the tenant's uid; a leftover reparented away from the broker
     still counts), and an incomplete scan does not
@@ -5334,7 +5335,7 @@ def _tenant_holder_reason() -> str:
     if leftover:
         return leftover
     me = os.getpid()
-    held = [h for h in scan.holders if h.uid >= MIN_TENANT_UID and not descends_from(h.pid, me)]
+    held = [h for h in scan.holders if is_tenant(h) and not descends_from(h.pid, me)]
     if not held:
         return ""
     who = ", ".join(f"{h.username}(pid {h.pid})" for h in held)
@@ -5661,7 +5662,7 @@ async def _dispatch_recheck_if_stale(job_log_file: Optional[Path]) -> None:
                 scan = await asyncio.to_thread(enumerate_device_holders)
                 # The eth read maps every chip; beside a tenant (or a scan too blind to rule one
                 # out) it is skipped, as the gate skips it.
-                if scan.complete and not any(h.uid >= MIN_TENANT_UID for h in scan.holders):
+                if scan.complete and not any(is_tenant(h) for h in scan.holders):
                     eok, edetail = await health_monitor.verify_eth_heartbeat()
                     if eok is False:
                         eth_frozen = edetail

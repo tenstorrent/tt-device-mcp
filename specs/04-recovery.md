@@ -56,8 +56,11 @@ each rung fires only when the gentler one failed or cannot apply.
   holds `/dev/tenstorrent`, and an incomplete holder scan fails closed (an unreadable holder may be
   a tenant). `force=true` overrides both, but the decision still carries the foreign holders so the
   override is logged against what it ran over. Holders below `MIN_TENANT_UID` (root, telemetry
-  daemons) are infrastructure, not tenants, and never block. A stale fd to a deleted device node is
-  not a holder.
+  daemons) are infrastructure, not tenants, and never block, with two exceptions that count as
+  tenants whatever their uid (`device_holders.is_tenant`): a process in a broker job or exec scope
+  (`ttdev-job-*.scope`, `ttdev-exec-*.scope` — a killed or finished job's straggler still winding
+  down is still that job), and a uid named in `TT_DEVICE_MCP_TENANT_UIDS`. A stale fd to a deleted
+  device node is not a holder.
 
   **The scan asks tt-kmd before it infers.** `/proc/driver/tenstorrent/<n>/pids` is the driver's
   own record of who holds each device — one pid per line, empty while free, and world-readable.
@@ -546,7 +549,8 @@ Absence is never health: every blocked/exhausted path emits a loud actionable ev
 `reset_unrecoverable_power_cycle_required`) rather than a silent hold.
 
 **The reset gate.** `evaluate_reset_gate` MUST allow only when no foreign-uid holder exists AND the
-scan is complete (I6). Carve-outs: holders with uid < `MIN_TENANT_UID` are ignored; the caller's
+scan is complete (I6). Carve-outs: holders with uid < `MIN_TENANT_UID` are ignored unless
+`is_tenant` counts them (broker scope, `TT_DEVICE_MCP_TENANT_UIDS`); the caller's
 own holders are not foreign (resetting your own wedged run is the point); deleted-node fds do not
 count. `force` overrides foreign holders and the blind spot but the foreign list is still returned
 for logging. Anonymous HTTP callers on a privsep host get the same fail-closed rules with every
@@ -683,6 +687,7 @@ sees a silent fabric pass.
 | I6 driver record absent or wholly unreadable falls back to the walk | `tests/test_device_holders.py::TestDriverHolderRecord::test_an_absent_driver_dir_falls_back_to_the_walk`, `::test_a_driver_dir_with_no_devices_falls_back_to_the_walk`, `::test_wholly_unreadable_records_fall_back_rather_than_report_blind` |
 | I6 driver record against real hardware, unprivileged | `tests/test_device_hardware.py::test_the_driver_holder_record_answers_completely_without_root`, `::test_a_free_device_passes_the_reset_gate_without_root` |
 | I7 tenant blocks automatic action | `tests/test_device_safety.py::test_governor_never_reboots_over_a_tenant`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_under_a_foreign_tenant`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_when_the_holder_scan_is_incomplete`, `tests/test_device_safety.py::test_a_tenant_arriving_before_the_reboot_decision_blocks_it` |
+| I6 a broker-scoped holder or a `TT_DEVICE_MCP_TENANT_UIDS` uid is a tenant below the uid floor, in the gate, reclaim, the ladder and dispatch | `tests/test_tenant_scope.py::test_the_driver_record_marks_a_scoped_holder`, `::test_the_reset_gate_refuses_over_a_scoped_service_account_holder`, `::test_the_reset_gate_refuses_over_a_configured_tenant_uid`, `::test_reclaim_signals_a_scoped_service_account_holder`, `::test_the_ladder_counts_a_scoped_straggler_of_a_killed_job_as_a_tenant`, `::test_dispatch_waits_for_a_scoped_service_account_holder` |
 | Reclaim removes the tenant without relaxing I6/I7 | `tests/test_device_holders.py::test_reclaim_signals_only_tenant_holders`, `tests/test_device_holders.py::test_reclaim_escalates_term_to_kill`, `tests/test_device_holders.py::test_reclaim_reports_a_survivor_rather_than_claiming_success`, `tests/test_device_holders.py::test_reclaim_carries_the_rescan_completeness` |
 | Reclaim never retargets onto a holder that appears after it began | `tests/test_device_holders.py::test_reclaim_never_retargets_onto_a_new_holder_that_appears_after_it_began` |
 | Reclaim self-exclusion (never signals itself or its own process group) | `tests/test_device_holders.py::test_reclaim_never_signals_itself_or_its_own_process_group` |
