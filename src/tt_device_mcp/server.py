@@ -1313,6 +1313,13 @@ DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service,tt-f
 DEVICE_POLLER_SERVICES = tuple(
     s for s in os.environ.get("TT_DEVICE_MCP_POLLER_SERVICES", DEFAULT_POLLER_SERVICES).split(",") if s.strip()
 )
+# The pollers a quiesce found running and stopped, so the restore starts only those: a unit an operator
+# stopped on purpose stays stopped. Kept until the restore, across nested stops (the dead-chip path
+# stops the pollers and the reset that follows finds them already down).
+_pollers_to_restore: set[str] = set()
+# `systemctl is-active` states of a unit that is running or on its way up: a crash-looping poller
+# reads "activating" between restarts, and it was running all the same.
+_POLLER_RUNNING_STATES = ("active", "activating", "reloading", "refreshing")
 logger: logging.Logger | None = None
 job_log_dir: Path | None = None
 job_runner_task: asyncio.Task | None = None  # Singleton job runner
@@ -3692,34 +3699,67 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
     point firmware-first RAS resets the whole host. Quiescing them is the
     difference between a 60s device reset and an ungraceful reboot.
 
+    The restore starts only the pollers the stop found running: a poller an operator
+    stopped on purpose, or one this host does not have, is left as it was.
+
     Best-effort by design: a poller we cannot stop must not block the recovery.
     """
     verb = "start" if active else "stop"
+    # The stop asks every configured unit; the restore only the ones a stop took down.
+    services = [s for s in DEVICE_POLLER_SERVICES if s in _pollers_to_restore] if active else DEVICE_POLLER_SERVICES
+
+    async def _apply(svc: str) -> tuple[int | None, bool]:
+        running = False
+        if not active:
+            # Already ours to restore, or running now: one the stop below takes down.
+            running = svc in _pollers_to_restore
+            if not running:
+                probe = await asyncio.create_subprocess_exec(
+                    "systemctl",
+                    "is-active",
+                    svc,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                out, _ = await probe.communicate()
+                running = out.decode(errors="replace").strip() in _POLLER_RUNNING_STATES
+        else:
+            _pollers_to_restore.discard(svc)
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl",
+            verb,
+            svc,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        return proc.returncode, running
+
     touched = []
-    for svc in DEVICE_POLLER_SERVICES:
+    for svc in services:
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "systemctl",
-                verb,
-                svc,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await aio.wait_for(proc.wait(), timeout=30)
-            if proc.returncode == 0:
+            # One bound for the state probe and the verb together, so the documented worst case holds.
+            rc, running = await aio.wait_for(_apply(svc), timeout=30)
+            if rc == 0:
                 touched.append(svc)
+                if running:
+                    _pollers_to_restore.add(svc)
         except (asyncio.TimeoutError, OSError, ValueError):
             continue
     if touched:
         log(f"{'restarted' if active else 'stopped'} device pollers: {', '.join(touched)}")
-    elif DEVICE_POLLER_SERVICES:
+    if active:
+        left = [s for s in DEVICE_POLLER_SERVICES if s not in services]
+        if left:
+            log(f"left device pollers stopped (not running before the stop): {', '.join(left)}")
+    if not touched and services:
         # Pollers were configured, yet the verb reached none of them: on this host they resolve
         # to no active unit. Quiescing was a no-op, so a reset about to run cannot assume it lands
         # on a quiet bus — the real pollers may still be hammering MMIO under a name we were never
         # told. On the stop path that is the host-reboot hazard the quiesce exists to prevent, so
         # flag it host_at_risk; either way, do not let the absence read as a clean quiesce.
-        log(f"WARNING: no configured device poller answered '{verb}': " f"{', '.join(DEVICE_POLLER_SERVICES)}")
-        health_event("pollers_none_active", verb=verb, configured=list(DEVICE_POLLER_SERVICES), host_at_risk=not active)
+        log(f"WARNING: no configured device poller answered '{verb}': " f"{', '.join(services)}")
+        health_event("pollers_none_active", verb=verb, configured=list(services), host_at_risk=not active)
     health_event("pollers_" + ("restarted" if active else "quiesced"), services=touched)
     return touched
 
