@@ -172,12 +172,6 @@ job boundary.
   `why="probe_unhealthy"` (`fsm.FAULTS`) — never `job_killed`, since no job is in play — leaving
   the device dirty for the next gate: the prologue that drives it is on the critical path of every
   node in an allocation; the recovery it declines is the epilogue's work (spec 07 `post-step`).
-- **I30 — The stuck-hold alert hook is opt-in, backs off, and never blocks.** With
-  `TT_DEVICE_MCP_ALERT_CMD` set, the first `hold_stuck_past_deadline` of an episode also runs that
-  command (argv split like shell words, no shell) with the event as JSON on stdin. Repeats wait 2,
-  4, 8 … deadline windows, the gap capped at 24 h, and re-arm with the episode. The command runs on
-  its own thread under `TT_DEVICE_MCP_ALERT_TIMEOUT_SEC` (its process group is killed past it), one
-  at a time; a failure is only logged. Unset, nothing runs and the timeline is unchanged.
 
   `post-step`'s recovering pass (`with_recover` defaulted True) is bound by
   `TT_DEVICE_MCP_POST_STEP_DEADLINE_SEC` (default 600s), as ONE absolute deadline for the WHOLE
@@ -311,6 +305,17 @@ job boundary.
   is identical either way; a `late` field marks the ones the reply that already went out could
   not mention. The earlier code discarded the eventual `ReclaimResult` on the timed-out path, so
   root SIGKILLing another user's pids appeared in neither the journal nor the action log.
+
+- **I30 — The stuck-hold alert hook is opt-in, backs off, and never blocks.** With
+  `TT_DEVICE_MCP_ALERT_CMD` set, the first `hold_stuck_past_deadline` of an episode also runs that
+  command (argv split like shell words, no shell) with the event as JSON on stdin. Repeats wait 2,
+  4, 8 … deadline windows, the gap capped at 24 h, and re-arm with the episode; the backoff is kept
+  on disk with the episode (`hold_alert_backoff.json`), so a broker restart mid-episode does not
+  page again. The command runs on its own thread under `TT_DEVICE_MCP_ALERT_TIMEOUT_SEC` (its
+  process group is killed past it), one at a time; its output is read in chunks and only the last
+  4 KB kept, and its own exit ends the run even if a child it left behind holds the pipe. A failure
+  is only logged, as is a command that does not parse (which leaves the hook off). Unset, nothing
+  runs and the timeline is unchanged.
 
 ## Interfaces
 
@@ -756,7 +761,7 @@ refuses.
 | I29 (a deferred dispatch is diagnosable: health_event + log line, holder named in queue/status) | `tests/test_slurm_steps.py::test_a_deferred_dispatch_is_visible_in_the_health_log_and_the_queue_status` |
 | I29 (straggler reclaim is audited: health_event + action-log row, quiet on a no-op) | `tests/test_slurm_steps.py::test_post_step_records_a_reclaim_that_signalled_something`, `tests/test_slurm_steps.py::test_a_no_op_reclaim_writes_nothing` |
 | I29 (the audit covers every pid signalled across escalation rounds, not just the last round's residue) | `tests/test_device_holders.py::test_reclaim_reports_a_pid_that_died_to_an_earlier_round_as_signalled`, `tests/test_slurm_steps.py::test_post_step_audits_a_reclaim_with_mixed_outcomes` |
-| I30 | `tests/test_alert_hook.py::test_unset_hook_runs_nothing`, `tests/test_alert_hook.py::test_alert_fires_once_on_the_first_stuck_window_then_backs_off`, `tests/test_alert_hook.py::test_alert_backoff_is_capped_at_a_day`, `tests/test_alert_hook.py::test_alert_re_arms_when_the_episode_closes`, `tests/test_alert_hook.py::test_a_hung_hook_never_blocks_and_is_killed_on_timeout`, `tests/test_alert_hook.py::test_hook_gets_the_event_as_json_on_stdin` |
+| I30 | `tests/test_alert_hook.py::test_unset_hook_runs_nothing`, `tests/test_alert_hook.py::test_alert_fires_once_on_the_first_stuck_window_then_backs_off`, `tests/test_alert_hook.py::test_alert_backoff_is_capped_at_a_day`, `tests/test_alert_hook.py::test_alert_re_arms_when_the_episode_closes`, `tests/test_alert_hook.py::test_a_hung_hook_never_blocks_and_is_killed_on_timeout`, `tests/test_alert_hook.py::test_hook_gets_the_event_as_json_on_stdin`, `tests/test_alert_hook.py::test_a_restart_mid_episode_keeps_the_backoff`, `tests/test_alert_hook.py::test_a_backoff_from_another_episode_is_ignored`, `tests/test_alert_hook.py::test_the_episode_closing_clears_the_stored_backoff`, `tests/test_alert_hook.py::test_a_chatty_hook_cannot_grow_the_broker_memory`, `tests/test_alert_hook.py::test_a_hook_that_exits_frees_the_slot_even_if_its_child_holds_the_pipe`, `tests/test_alert_hook.py::test_a_hook_killed_on_timeout_is_reaped_even_if_an_escaped_child_holds_the_pipe`, `tests/test_alert_hook.py::test_an_unparseable_hook_is_logged_once` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |

@@ -1103,6 +1103,36 @@ def _restore_hold_episode() -> str:
         return ""
 
 
+# The alert hook's backoff for that episode, on disk beside it. In memory alone a restart during a
+# stuck hold (a self-update, a crash loop) re-arms it, and every restart pages again on its first
+# sample. Kept only for the episode it was written in.
+HOLD_ALERT_BACKOFF_FILE = "hold_alert_backoff.json"
+
+
+def _persist_hold_alert_backoff(since: str, next_bucket: int, gap: int) -> None:
+    """Record (or, with no episode, clear) the alert backoff for the episode that started at since."""
+    try:
+        path = health_dir() / HOLD_ALERT_BACKOFF_FILE
+        if since:
+            path.write_text(json.dumps({"since": since, "next_bucket": next_bucket, "gap": gap}))
+        elif path.exists():
+            path.unlink()
+    except OSError:
+        pass  # never let bookkeeping break the gate
+
+
+def _restore_hold_alert_backoff(since: str) -> tuple[int, int]:
+    """The (next_bucket, gap) a previous process recorded for the episode that started at since,
+    or (0, 0) when there is none, it is unreadable, or it belongs to another episode."""
+    try:
+        rec = json.loads((health_dir() / HOLD_ALERT_BACKOFF_FILE).read_text())
+        if rec.get("since") == since:
+            return max(0, int(rec["next_bucket"])), max(0, int(rec["gap"]))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    return 0, 0
+
+
 # A surgical bridge reset fired seconds after a chip leaves the bus can lose the race
 # with the endpoint's link retrain and report failure, yet the same chip re-binds in ~2s
 # once the link settles. Retry the bridge reset a few times before escalating to a much
@@ -4183,6 +4213,10 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         row_since = datetime.now().isoformat()
         device_hold_episode_since = _restore_hold_episode() or row_since
         _persist_hold_episode(device_hold_episode_since)
+        # ...and the alert hook's backoff for that same episode, so a restart does not page again.
+        device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(
+            device_hold_episode_since
+        )
         device_hold_episode_reason = reason
         # Reserve the ledger row now, so the live row and the durable one share id, start, and name.
         # Its start is THIS process's segment (row_since), NOT the restored escalation clock: a hold
@@ -4242,6 +4276,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # ...and its alert hook's backoff.
         device_hold_alert_next_bucket = 0
         device_hold_alert_gap = 0
+        _persist_hold_alert_backoff("", 0, 0)
         # ...and its own forced-escalation windows.
         device_hold_escalate_bucket = 0
         # ...and its own early off-bus attempt.
@@ -4429,7 +4464,8 @@ def _maybe_alert_stuck_hold(bucket: int, deadline: int, age: float) -> None:
 
     The timeline event above repeats every deadline window so a recency monitor keeps alarming; a
     page must not. This fires on the episode's first stuck window, then waits 2, 4, 8 ... windows
-    (capped at 24 h) before the next. Unset, it does nothing. A run still in flight leaves the
+    (capped at 24 h) before the next. The backoff is kept on disk with the episode, so a restart
+    mid-episode does not page again. Unset, it does nothing. A run still in flight leaves the
     backoff untouched, so the next window tries again."""
     global device_hold_alert_next_bucket, device_hold_alert_gap
     if bucket < device_hold_alert_next_bucket or alert.alert_argv() is None:
@@ -4449,6 +4485,7 @@ def _maybe_alert_stuck_hold(bucket: int, deadline: int, age: float) -> None:
         return
     device_hold_alert_next_bucket = bucket + gap
     device_hold_alert_gap = gap
+    _persist_hold_alert_backoff(device_hold_episode_since, device_hold_alert_next_bucket, gap)
     if logger:
         logger.info(f"ALERT-HOOK stuck hold sent ({int(age)}s held); next in {gap * deadline}s if still held")
 
