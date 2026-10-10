@@ -10,6 +10,8 @@ round, issue #27). Nothing here reaches a real device or a real config space.
 
 import json
 import os
+import pathlib
+import shutil
 import sys
 import types
 
@@ -841,3 +843,126 @@ def test_an_unchanged_topology_is_not_rewritten(sysfs, monkeypatch):
     for _ in range(3):
         pcie_guard.record_topology()
     assert len(writes) == 1
+
+
+# ---------------------------------------------------------------- unreadable sysfs fails closed
+
+
+def _deny(monkeypatch, method, target):
+    """``Path.<method>`` on ``target`` fails as for a non-root reader (chmod does not stop root)."""
+    real = getattr(pathlib.Path, method)
+
+    def guarded(self, *a, **k):
+        if self == target:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(pathlib.Path, method, guarded)
+
+
+def _break_sysfs(root, monkeypatch, how):
+    devs = root / "sys/bus/pci/devices"
+    if how == "devices dir missing":
+        shutil.rmtree(devs)
+    elif how == "devices dir unlistable":
+        _deny(monkeypatch, "iterdir", devs)
+    elif how == "vendor unreadable":
+        _deny(monkeypatch, "read_text", devs / "0000:01:00.0" / "vendor")
+    elif how == "vendor unparseable":
+        (devs / "0000:01:00.0" / "vendor").write_text("garbage\n")
+    elif how == "entry name unparseable":
+        (devs / "bogus").symlink_to(root / "sys/devices")
+    elif how == "chip class dir unlistable":
+        _deny(monkeypatch, "iterdir", root / "sys/class/tenstorrent")
+    elif how == "device id unreadable":
+        _deny(monkeypatch, "read_text", devs / "0000:01:00.0" / "device")
+    else:
+        raise AssertionError(how)
+
+
+UNREADABLE = [
+    "devices dir missing",
+    "devices dir unlistable",
+    "vendor unreadable",
+    "vendor unparseable",
+    "entry name unparseable",
+    "chip class dir unlistable",
+    "device id unreadable",
+]
+
+
+@pytest.mark.parametrize("all_off", [False, True])
+@pytest.mark.parametrize("how", UNREADABLE)
+def test_a_tray_re_power_refuses_when_sysfs_cannot_be_read(sysfs, monkeypatch, how, all_off):
+    """Sysfs that cannot be read is not "every chip off the bus": the #27 cross-check cannot run, so
+    the envelope refuses before it touches anything and says why (spec 04 I19)."""
+    pcie_guard.record_topology()  # a healthy look first: the remembered ports must not make it safe
+    if all_off:
+        for chip in range(1, len(CHIPS)):
+            _take_off_bus(sysfs, chip)
+    _break_sysfs(sysfs, monkeypatch, how)
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    plan = pcie_guard.plan_tray_repower(0b1, [0])
+    assert plan.mismatch, f"{how}: an unreadable sysfs must refuse the re-power"
+    fired, logs = [], []
+    with pytest.raises(pcie_guard.TrayRepowerRefused) as exc:
+        pcie_guard.safe_tray_repower(0b1, [0], lambda: fired.append(1), logs.append, sleep=lambda s: None)
+    assert fired == []
+    assert not any(_masked(sysfs, p) for p in PORTS if (sysfs / "sys/bus/pci/devices" / p).exists())
+    refused = [k for n, k in events if n == "tray_repower_refused"]
+    assert refused and refused[0]["reason"] == str(exc.value)
+    if how != "device id unreadable":  # that one refuses on the missing tray table, as before
+        assert "cannot read" in str(exc.value)
+
+
+def test_an_all_off_mesh_behind_an_unreadable_sysfs_is_not_re_powered(sysfs, monkeypatch):
+    """The reported case: no function listed because /sys/bus/pci/devices cannot be read."""
+    pcie_guard.record_topology()
+    _break_sysfs(sysfs, monkeypatch, "devices dir unlistable")
+    assert pcie_guard.tt_endpoints() is None
+    assert "cannot read" in pcie_guard.plan_tray_repower(0b1111, [0, 1, 2, 3]).mismatch
+    assert pcie_guard.main(["0b1111", "0", "1", "2", "3"]) == 1
+
+
+@pytest.mark.parametrize("how", UNREADABLE[:-1])
+def test_an_unreadable_sysfs_counts_every_chip_off_so_a_hold_gate_holds(sysfs, monkeypatch, how):
+    _break_sysfs(sysfs, monkeypatch, how)
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
+    off_bus = pcie_guard.chips_off_bus(len(CHIPS))
+    if how == "devices dir missing":
+        assert off_bus == 0, "no PCI sysfs at all: nothing to count, the AER evidence decides"
+    else:
+        assert off_bus == len(CHIPS)
+        assert pcie_guard.host_reset_gate(off_bus)[0] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", UNREADABLE[:-1])
+async def test_an_unreadable_look_keeps_the_recorded_topology(sysfs, monkeypatch, health_deps, how):
+    """Broker start and the between-jobs check look at sysfs (#292): a look that cannot read it
+    never raises, never shrinks the recorded topology and leaves a health event naming why."""
+    from tt_device_mcp.health.monitor import HealthMonitor
+    from tt_device_mcp.health.monitors import hostpci
+
+    _no_topology(monkeypatch)
+    pcie_guard.record_topology()
+    path = pcie_guard.health_dir() / pcie_guard.TOPOLOGY_FILE
+    before = path.read_text()
+    _break_sysfs(sysfs, monkeypatch, how)
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    srv.pcie_guard_at_start(lambda m: None)
+    monkeypatch.setattr(hostpci, "host_pci_verdict", lambda: (True, "ok", {}))
+    m = HealthMonitor(health_deps)
+
+    async def healthy(*a, **k):
+        return True, "ok"
+
+    monkeypatch.setattr(m, "_verify_device", healthy)
+    await m.update("post-job", run_fabric=False, expected=len(CHIPS))
+    assert path.read_text() == before
+    unreadable = [k for n, k in events if n == "pci_topology_unreadable"]
+    assert len(unreadable) == 2 and all("cannot read" in k["reason"] for k in unreadable)
+    _forget_in_process(monkeypatch)
+    assert "cannot read" in pcie_guard.plan_tray_repower(0b1, [0]).mismatch

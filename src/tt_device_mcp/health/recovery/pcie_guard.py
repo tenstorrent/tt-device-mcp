@@ -121,33 +121,46 @@ def _remember(eps: dict) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def tt_endpoints() -> dict:
-    """``{bdf: Endpoint}`` for every Tenstorrent function the kernel lists. The root port is the
-    first PCI function on the device's sysfs path; the chip id comes from the tenstorrent class
-    device that links to it. Each look is remembered (root ports, architectures) for when the chips
-    are off the bus."""
+class SysfsUnreadable(OSError):
+    """The Tenstorrent functions could not be listed from sysfs: no answer, not "none on the bus"."""
+
+
+def _scan_endpoints() -> dict:
+    """``{bdf: Endpoint}`` read from sysfs. Raises :class:`SysfsUnreadable` when the PCI device list,
+    an entry's vendor or name, or the tenstorrent class list cannot be read or parsed: a function it
+    could not judge might be a Tenstorrent chip. An entry that vanished mid-scan is simply gone."""
     chips: dict = {}
     cls = SYS_ROOT / "sys/class/tenstorrent"
     try:
-        for entry in cls.iterdir():
-            m = re.search(r"(\d+)$", entry.name)
-            if m:
-                try:
-                    chips[os.path.basename(os.path.realpath(entry / "device"))] = int(m.group(1))
-                except OSError:
-                    continue
-    except OSError:
-        pass
+        entries = list(cls.iterdir())
+    except FileNotFoundError:
+        entries = []  # no driver loaded: no chip has a /dev node
+    except OSError as exc:
+        raise SysfsUnreadable(f"cannot read {cls}: {exc}") from exc
+    for entry in entries:
+        m = re.search(r"(\d+)$", entry.name)
+        if m:
+            try:
+                chips[os.path.basename(os.path.realpath(entry / "device"))] = int(m.group(1))
+            except OSError:
+                continue
     out: dict = {}
     try:
         entries = sorted(_pci_dir().iterdir())
-    except OSError:
-        return out
+    except OSError as exc:
+        raise SysfsUnreadable(f"cannot read {_pci_dir()}: {exc}") from exc
     for dev in entries:
+        if not _BDF.match(dev.name):
+            raise SysfsUnreadable(f"cannot read {dev}: not a PCI address")
         try:
-            if int((dev / "vendor").read_text().strip(), 16) != TT_VENDOR:
-                continue
-        except (OSError, ValueError):
+            vendor = int((dev / "vendor").read_text().strip(), 16)
+        except OSError as exc:
+            if not os.path.lexists(dev):
+                continue  # removed while we looked
+            raise SysfsUnreadable(f"cannot read {dev / 'vendor'}: {exc}") from exc
+        except ValueError as exc:
+            raise SysfsUnreadable(f"cannot read {dev / 'vendor'}: {exc}") from exc
+        if vendor != TT_VENDOR:
             continue
         bdf = dev.name
         parts = [p for p in Path(os.path.realpath(dev)).parts if _BDF.match(p)]
@@ -155,10 +168,23 @@ def tt_endpoints() -> dict:
         try:
             device: Optional[int] = int((dev / "device").read_text().strip(), 16)
         except (OSError, ValueError):
-            device = None
+            device = None  # no architecture: tray_bus_groups finds no table and the plan refuses
         out[bdf] = Endpoint(
             bdf=bdf, bus=int(bdf.split(":")[1], 16), root_port=root_port, chip=chips.get(bdf), device=device
         )
+    return out
+
+
+def tt_endpoints() -> Optional[dict]:
+    """``{bdf: Endpoint}`` for every Tenstorrent function the kernel lists, or None when sysfs cannot
+    be read (never ``{}``, which means every chip is off the bus). The root port is the first PCI
+    function on the device's sysfs path; the chip id comes from the tenstorrent class device that
+    links to it. Each look is remembered (root ports, architectures) for when the chips are off the
+    bus."""
+    try:
+        out = _scan_endpoints()
+    except SysfsUnreadable:
+        return None
     _remember(out)
     return out
 
@@ -166,9 +192,13 @@ def tt_endpoints() -> dict:
 def record_topology() -> None:
     """Look at the Tenstorrent functions now, so each chip's root port is known once it leaves the
     bus (spec 04 I19). Run at broker start and in every between-jobs check: a sysfs read, and the
-    topology file is rewritten only when the look adds a port or an architecture. Never raises."""
+    topology file is rewritten only when the look adds a port or an architecture. A look that cannot
+    read sysfs keeps what was recorded and leaves a ``pci_topology_unreadable`` event. Never raises."""
     try:
-        tt_endpoints()
+        try:
+            _remember(_scan_endpoints())
+        except SysfsUnreadable as exc:
+            health_event("pci_topology_unreadable", reason=str(exc))
     except Exception:  # noqa: BLE001 - a failed look must not fail the start or the check
         pass
 
@@ -178,7 +208,7 @@ def tt_root_ports(endpoints: Optional[dict] = None) -> list:
     saw it (an off-bus chip's port is the one its re-power floods) — the ports a reset can flood.
     A remembered port that is no longer in sysfs is left out."""
     eps = tt_endpoints() if endpoints is None else endpoints
-    present = {e.root_port for e in eps.values() if e.root_port}
+    present = {e.root_port for e in (eps or {}).values() if e.root_port}
     remembered = {p for p in _seen()["root_ports"] if (_pci_dir() / p).exists()}
     return sorted(present | remembered)
 
@@ -421,11 +451,13 @@ def gate_mode() -> str:
 
 
 def chips_off_bus(expected: int) -> int:
-    """How many of ``expected`` chips have no PCI function in sysfs right now; 0 when sysfs cannot
-    be read (the gate then decides on the AER evidence alone)."""
-    if not _pci_dir().is_dir():
-        return 0
-    return max(0, expected - len(tt_endpoints()))
+    """How many of ``expected`` chips have no PCI function in sysfs right now. Sysfs that is there
+    but cannot be read counts every chip as off, so a ``hold`` gate holds; with no PCI sysfs at all
+    it is 0 (the gate then decides on the AER evidence alone)."""
+    eps = tt_endpoints()
+    if eps is None:
+        return expected if _pci_dir().is_dir() else 0
+    return max(0, expected - len(eps))
 
 
 def host_reset_gate(off_bus: int) -> tuple:
@@ -615,9 +647,21 @@ class TrayPlan:
 def plan_tray_repower(bitmap: int, tray_chip_ids: list) -> TrayPlan:
     """What re-powering ``bitmap`` touches, from sysfs. ``mismatch`` is set when the caller's chip ids
     and the trays' buses disagree (a mis-mapped tray, issue #27): firing then would re-power a
-    healthy tray. Chips with no /dev node are off the bus and cannot be checked."""
+    healthy tray. It is also set when sysfs cannot be read: that is no answer, not every chip off the
+    bus, and the cross-check cannot run. Chips with no /dev node are off the bus and cannot be checked."""
     trays = [i + 1 for i in range(8) if bitmap >> i & 1]
-    eps = tt_endpoints()
+    try:
+        eps = _scan_endpoints()
+    except SysfsUnreadable as exc:
+        return TrayPlan(
+            bitmap=bitmap,
+            trays=trays,
+            functions=[],
+            chips=[],
+            root_ports=[],
+            mismatch=f"{exc}; refusing the re-power of trays {trays}: the tray map cannot be checked",
+        )
+    _remember(eps)
     groups = tray_bus_groups(eps)
     plan = TrayPlan(bitmap=bitmap, trays=trays, functions=[], chips=[], root_ports=tt_root_ports(eps))
     if not eps:
@@ -673,8 +717,9 @@ def safe_tray_repower(
 ) -> TrayPlan:
     """Re-power the trays in ``bitmap`` without letting the host see the fallout:
 
-    1. refuse if the tray map disagrees with sysfs (a wrong tray would be cut); with every chip off
-       the bus there is no healthy tray to cut and nothing to cross-check, so it goes ahead;
+    1. refuse if the tray map disagrees with sysfs (a wrong tray would be cut) or sysfs cannot be
+       read; with every chip off the bus there is no healthy tray to cut and nothing to
+       cross-check, so it goes ahead;
     2. wait up to ``TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC`` (default 10) for every process to
        let go of the tray's chips, else refuse;
     3. mask AER and DPC on EVERY Tenstorrent root port, the sibling trays' and the off-bus chips'
