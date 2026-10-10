@@ -77,7 +77,7 @@ and job exit statuses never hit disk.
 | Runtime state base | n/a (system paths below) | `<install>/state` | `TT_DEVICE_MCP_STATE_DIR` (independent of the install base), `--log-dir` |
 | Socket | `/run/tt-device-broker/broker.sock` (`RuntimeDirectory=`, chmod 0666) | `<state>/daemon.sock` | `--socket` / `TT_DEVICE_MCP_SOCKET` |
 | FSM state file | `/var/lib/tt-device-broker/health/fsm.json` | `<state>/health/fsm.json` | follows the health dir |
-| Health journal (events, telemetry trace, buslock, chip baseline, incidents/) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
+| Health journal (events, telemetry trace, buslock, chip baseline, incidents/, the idle-time probe's `health_probe_state.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
 | Server log + job logs | `/var/log/tt-device-broker/` (the unit passes `--log-dir`; the bare server defaults to CWD) | `<state>/` | `--log-dir` |
 | Stats | `<log-dir>/stats/` → `/var/log/tt-device-broker/stats/` | `<state>/stats/` | follows `--log-dir` |
 | Metrics textfile | `/var/lib/prometheus/node-exporter/tt_device_mcp.prom` | `<state>/metrics/tt_device_mcp.prom` | `TT_DEVICE_MCP_TEXTFILE_DIR` |
@@ -243,6 +243,7 @@ Behavior).
 | `TTDEV_AUTOUPDATE` | `1` | Autoupdate master switch. Read at install to seed the config file, and by every lap; `sudo TTDEV_AUTOUPDATE=0 ./install.sh` turns a host off outright (after `sudo`, which resets the environment) |
 | `TTDEV_MAX_DEFER_SEC` | 0 (off — apply immediately; jobs re-adopt) | Opt-in busy/idle gate: seconds autoupdate waits for an idle window. The in-flight device-op bar is separate and unconditional (spec 08) |
 | `TTDEV_LOCK` | 0 | Apply the udev device lock at install (shared host) |
+| `TTDEV_HEALTH_PROBE` | 1 | Read by `apply-host-config.sh` from the config file: `0` disables `tt-device-health-probe.timer` (spec 08 I17), anything else enables it |
 | `TTDEV_NO_LOCK` | unset | Back-compat: force cooperative (no lock) |
 | `TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`, `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_REBOOT`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_AUTO_UBB_RESET`, `TTDEV_PREJOB_DISPATCH` | unset | Per-host config keys; each renders the same-named `TT_DEVICE_MCP_*` unit env line (values already in the unit survive an update) |
 | `TTDEV_FABRIC_DESCRIPTOR` | galaxy: shipped descriptor; else unset | Cabling descriptor for the fabric check (src, fabric.py) |

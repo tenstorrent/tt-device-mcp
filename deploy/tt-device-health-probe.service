@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Idle-time Tenstorrent device-health probe (PCI rescan, telemetry re-arm, alerts)
+After=tt-device-broker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/tt-device-broker/venv/bin/python -m tt_device_mcp.health_probe
+# Settle waits plus one alert-hook run; the probe joins the hook before it exits.
+TimeoutStartSec=300

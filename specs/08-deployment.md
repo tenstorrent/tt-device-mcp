@@ -13,7 +13,8 @@ the per-user installer (`deploy/install-user.sh`), autoupdate/reconcile
 pipeline (`deploy/install-fabric-validator.sh`, `deploy/tt-device-fabric-check.sh`,
 `deploy/fabric-validator.pin`), the crash recorder (`deploy/install-crash-recorder.sh`,
 `deploy/tt-crash-recorder.py`), the eth-heartbeat probe artifact
-(`deploy/tt-device-eth-heartbeat-probe.py`), client wiring (`deploy/tt-device-client-setup.sh`),
+(`deploy/tt-device-eth-heartbeat-probe.py`), the idle-time health probe
+(`deploy/tt-device-health-probe.{service,timer}`, `tt_device_mcp.health_probe`), client wiring (`deploy/tt-device-client-setup.sh`),
 login-heal (`deploy/tt-device-mcp-login-heal.sh`), and the Slurm hooks (`deploy/slurm/prolog.sh`,
 `deploy/slurm/epilog.sh`). Paths and variables are spec 06's; what the broker does once running is
 specs 01–05. This spec owns the pipeline.
@@ -123,6 +124,24 @@ job log, so every "installed" claim below is verified, not assumed.
   minutes, and a branch that moved in that window must not be installed unannounced under a sha
   `installed.sha` would then misname.
 
+- **I17 — The idle-time health probe acts only on an idle broker, and pages once per episode.**
+  `tt-device-health-probe.timer` (every 2 min) runs `python -m tt_device_mcp.health_probe` as root.
+  It reads the broker's `/health` first and stands back, touching nothing, unless the broker
+  answers with no hold, `fsm_state` `healthy`, no degraded flag, and no job running or queued; it
+  asks again right before each action, so a broker that turns busy mid-lap stops it. The broker
+  stops the pollers around a reset, and a probe that restarted them would fight it. Its actions are
+  non-destructive only: a PCI bus rescan when fewer chips are present than expected (at most one
+  per 30 min while short), and `reset-failed` + `start` of a stopped `tt-telemetry.service` (a
+  host without that unit is skipped). The expected count is the broker's own (spec 03 I11:
+  `TT_DEVICE_MCP_EXPECTED_CHIPS`, else the high-water `chip_baseline.json`, read and never
+  written), so no chip count is hardcoded. The alert hook, chip count and health dir come from the
+  running broker's environment unless the probe's unit sets them. What it cannot fix (chips still
+  missing after a rescan, telemetry still down after a restart, AER fatal/non-fatal counters
+  rising) goes to the alert hook (spec 03 I30) on the first lap of an episode, AER at most once an
+  hour; episodes and counters live in `health_probe_state.json` in the health dir and reset on
+  reboot. Apply installs and arms it on every host (`TTDEV_HEALTH_PROBE=0` disarms it), warns but
+  does not abort if it will not arm, and retires the unmanaged `tt-health-probe.timer` it replaces.
+
 ## Interfaces
 
 **`/etc/default/tt-device-broker`** — written by the installer, sourced by `apply-host-config.sh`,
@@ -152,6 +171,7 @@ so a knob without a render line is unreachable.
 | `tt-device-fabric-validator.timer` → `.service` | apply-host-config (enabled there) | `OnBootSec=10min`, `OnUnitInactiveSec=1h` — retries the pinned build (oneshot, `TimeoutStartSec=7200`) |
 | `tt-device-buslock.service` | apply-host-config / install-crash-recorder | continuous `perf stat -e ls_locks.bus_lock -I 60000` to `buslock.log`; enabled only where the PMU event counts |
 | `tt-crash-recorder.service` | install-crash-recorder | oneshot at boot (`After=multi-user.target`) |
+| `tt-device-health-probe.timer` → `.service` | apply-host-config (enabled there unless `TTDEV_HEALTH_PROBE=0`) | `OnBootSec=90s`, `OnUnitActiveSec=2min` — oneshot `python -m tt_device_mcp.health_probe` (I17) |
 
 Also installed by apply-host-config: `/usr/local/bin/tt-device-mcp-smi-ro` +
 `/etc/sudoers.d/tt-device-mcp-smi` (spec 05), `/etc/logrotate.d/tt-device-broker`, a journald
@@ -436,6 +456,7 @@ script exists, the claim stands on the script (listed below).
 | Epilog prefers a non-zero `SLURM_JOB_DERIVED_EC` over `SLURM_JOB_EXIT_CODE`, and still falls back to it when DERIVED_EC is zero | `tests/test_slurm_steps.py::test_the_epilog_prefers_slurm_job_derived_ec_when_nonzero`, `tests/test_slurm_steps.py::test_the_epilog_falls_back_to_slurm_job_exit_code_when_derived_ec_is_zero` |
 | The installer stages both hooks at the path `deploy/README.md` documents, and auto-update (via `apply-host-config.sh`) keeps them current on an already-installed host | `tests/test_slurm_steps.py::test_the_installer_stages_the_slurm_hooks_at_the_documented_path`, `tests/test_slurm_steps.py::test_apply_host_config_also_stages_the_slurm_hooks` |
 | Each hook exports its own step-deadline var from `/etc/default/tt-device-broker` to the CLI child, and the export is harmless when the var was never set | `tests/test_slurm_steps.py::test_the_hooks_export_their_deadline_var_from_etc_default`, `tests/test_slurm_steps.py::test_the_hooks_do_not_require_the_deadline_var_to_be_set` |
+| I17 (idle-time probe: stands back unless idle, re-checks before acting; broker's chip count; one page per episode; apply arms it, optional, retires the old timer) | `tests/test_health_probe.py::test_idle_verdict_requires_an_idle_healthy_broker`, `tests/test_health_probe.py::test_a_busy_broker_is_left_alone`, `tests/test_health_probe.py::test_a_broker_turning_busy_stops_the_rescan`, `tests/test_health_probe.py::test_expected_chips_reads_the_broker_count`, `tests/test_health_probe.py::test_missing_chips_rescan_then_alert_once`, `tests/test_health_probe.py::test_rescan_recovers_without_alert`, `tests/test_health_probe.py::test_telemetry_restart_and_alert`, `tests/test_health_probe.py::test_aer_growth_alerts_once_an_hour`, `tests/test_health_probe.py::test_hook_and_chip_count_come_from_the_broker_env`, `tests/test_health_probe.py::test_apply_installs_and_arms_the_probe_optionally` |
 
 **Unanchored (the claim stands on the script):** I2 (wheel/venv from this tree —
 `install-tt-device-broker.sh`); the installer's flow ordering and lock opt-in; Galaxy detection
