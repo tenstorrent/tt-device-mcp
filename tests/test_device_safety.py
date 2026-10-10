@@ -9959,6 +9959,97 @@ async def test_a_cross_boot_down_episode_is_cleared_by_a_healthy_startup_gate(mo
     assert srv.fsm.record.why == ""
 
 
+async def _start_broker_holding(monkeypatch, events):
+    """run_startup_tasks as a privsep broker, up to the startup hold, with the fabric pass held off
+    so the test drives the startup gate itself. ``events`` collects every journal row."""
+    monkeypatch.setattr(srv, "_startup_tasks_done", False)
+    monkeypatch.setattr(srv, "should_privsep", lambda: True)
+
+    async def noop():
+        pass
+
+    monkeypatch.setattr(srv, "reconcile_running_scopes", noop)
+    monkeypatch.setattr(srv, "_restore_queued_jobs", noop)
+    monkeypatch.setattr(srv, "_record_startup_health", noop)
+    monkeypatch.setattr(srv, "_verify_fabric_on_start", noop)
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    await srv.run_startup_tasks()
+    assert [k for k, _ in events if k.startswith("startup_fabric")] == ["startup_fabric_hold"]
+
+
+@pytest.mark.asyncio
+async def test_a_passing_startup_gate_journals_the_release_of_the_startup_hold(monkeypatch, tmp_path):
+    """The broker journals startup_fabric_hold on every fresh start; a watcher that saw it waits for
+    the release. When the startup gate then passed before any tenant was refused, nothing was
+    written: device_released follows only a device_held, so the hold read as open forever. Fails on
+    base, which writes no release row at all."""
+    _gate_with_verdict(monkeypatch, tmp_path, _HEALTHY_VERDICT)
+    events = []
+    await _start_broker_holding(monkeypatch, events)
+
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+
+    assert srv.fsm.state is ServerState.HEALTHY
+    released = [f for k, f in events if k == "startup_fabric_released"]
+    assert len(released) == 1, "the startup hold lifted with no release row for a watcher to see"
+    assert released[0]["prior_why"] == "startup_unverified"
+    kinds = [k for k, _ in events]
+    assert kinds.index("startup_fabric_released") > kinds.index("startup_fabric_hold")
+
+    # Exactly once: a later episode on the same broker closes with no second startup release.
+    srv._mark_device_dirty("job ended timeout")
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert len([k for k, _ in events if k == "startup_fabric_released"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_startup_release_is_written_when_a_held_start_recovers_later(monkeypatch, tmp_path):
+    """The startup hold does not always lift on the startup gate's first pass: a foreign holder can
+    block the verify, and the door then opens on some later path (here a recovered rung). The
+    release row must follow wherever it opens, naming the fault the hold ended on."""
+    _gate_with_verdict(monkeypatch, tmp_path, _HEALTHY_VERDICT)
+    events = []
+    await _start_broker_holding(monkeypatch, events)
+
+    srv._clear_device_dirty_unverified("gate/startup: foreign holder pid 4242", fault="foreign_holder")
+    assert srv.fsm.state is not ServerState.HEALTHY
+    assert "startup_fabric_released" not in [k for k, _ in events], "released while still held"
+
+    srv.fsm.on_outcome(OUTCOME_RECOVERED)
+    released = [f for k, f in events if k == "startup_fabric_released"]
+    assert len(released) == 1
+    assert released[0]["prior_why"] == "foreign_holder"
+
+
+@pytest.mark.asyncio
+async def test_a_carried_over_episode_writes_no_startup_release(monkeypatch, tmp_path):
+    """Only the fresh startup hold gets the startup_fabric_hold row, so only it gets the release: an
+    episode carried across the restart keeps its own device_held/device_released rows."""
+    after = _cross_boot_carry(tmp_path, ServerState.RECOVERING, "eth_frozen")
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    monkeypatch.setattr(srv, "fsm", after)
+    monkeypatch.setattr(srv, "_startup_tasks_done", False)
+    monkeypatch.setattr(srv, "should_privsep", lambda: True)
+
+    async def noop():
+        pass
+
+    for name in (
+        "reconcile_running_scopes",
+        "_restore_queued_jobs",
+        "_record_startup_health",
+        "_verify_fabric_on_start",
+    ):
+        monkeypatch.setattr(srv, name, noop)
+    await srv.run_startup_tasks()
+    assert srv.fsm.record.why == "eth_frozen"
+
+    srv.fsm.on_outcome(OUTCOME_RECOVERED)
+    assert not [k for k, _ in events if k.startswith("startup_fabric")]
+
+
 @pytest.mark.asyncio
 async def test_post_reboot_climb_keeps_the_escalated_marker_and_the_reset_retries(monkeypatch, tmp_path):
     """The exact loop the durable record exists to prevent: the idle escalation already spent this

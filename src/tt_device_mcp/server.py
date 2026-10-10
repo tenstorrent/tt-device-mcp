@@ -75,7 +75,7 @@ from tt_device_mcp.device_holders import (
     evaluate_reset_gate,
     reclaim_foreign_holders,
 )
-from tt_device_mcp.fsm import ServerFsm, ServerState
+from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec
 from tt_device_mcp.health import (
     _HOST_ESCALATION_ACTION,
     BLOCKED,
@@ -6394,6 +6394,16 @@ def _close_orphaned_hold() -> None:
         logger.info(f"STARTUP closed an orphaned hold of {int(held_for)}s: {reason}")
 
 
+def _journal_startup_hold_released(closed: FsmRecord) -> None:
+    """Close the ``startup_fabric_hold`` row: the door this broker start held is open again.
+    ``prior_why`` is the last fault the episode carried — ``startup_unverified`` when the startup
+    verify itself passed, something else when the hold turned into a real fault first."""
+    held_s = _episode_elapsed_sec(closed.since)
+    health_event("startup_fabric_released", prior_why=closed.why, detail=closed.detail, held_s=round(held_s, 1))
+    if logger:
+        logger.info(f"STARTUP hold released after {int(held_s)}s (last why: {closed.why})")
+
+
 async def _verify_fabric_on_start() -> None:
     """Prove the mesh moves data, not merely that every chip answers.
 
@@ -6498,6 +6508,11 @@ async def run_startup_tasks() -> None:
     # already has its own rows and keeps its own why, so only the fresh startup hold gets one.
     if fsm.state is ServerState.RECOVERING and fsm.record.why == "startup_unverified":
         health_event("startup_fabric_hold", why="broker start: awaiting the startup fabric verify")
+        # ...and its closing row. A watcher that saw the hold waits for a release, and the
+        # device_held/device_released pair does not cover this one: device_held is written only
+        # when a tenant is refused, so a gate that passed before any job asked left the hold open
+        # in the journal forever. Armed on the FSM, it fires once on whichever path reopens the door.
+        fsm.on_next_close(_journal_startup_hold_released)
     # Answers "did it come back?" next to the reboot row that says it went away.
     # Fire-and-forget: a health REPORT must never gate the queue coming up.
     asyncio.create_task(_record_startup_health())

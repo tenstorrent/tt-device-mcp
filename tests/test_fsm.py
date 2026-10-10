@@ -3,7 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """The server FSM: BOOT/HEALTHY/RECOVERING/DOWN, and the durable record behind it."""
 
+from datetime import datetime
+
 from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState
+from tt_device_mcp.health import OUTCOME_RECOVERED
+from tt_device_mcp.health.core import HealthState
 
 
 def _fsm(tmp_path):
@@ -294,3 +298,34 @@ def test_boot_merge_reattributes_only_the_current_boot(tmp_path):
     d = f.record.detail
     assert d.count("boot attributed") == 1, "no stale-plus-new duplicate"
     assert "recorded at NEW" in d and "recorded at OLD" not in d
+
+
+def test_on_next_close_fires_once_on_whichever_path_reaches_healthy(tmp_path):
+    """A caller pairing an opening event with its close (the startup hold's release row) registers
+    once and must hear about the close exactly once — not on a refreshed fault mid-episode, not
+    again on a later episode — whether a healthy read or a recovered rung closes it."""
+    f = _fsm(tmp_path)
+    f.boot_merge(open_episode=None, attributed_boot=None)
+    closed = []
+    f.on_next_close(closed.append)
+
+    f.on_fault("foreign_holder", detail="pid 42 holds it", dirty=False)  # same episode, new why
+    assert closed == []
+    f.on_outcome(OUTCOME_RECOVERED)
+    assert [(r.state, r.why) for r in closed] == [(ServerState.RECOVERING, "foreign_holder")]
+
+    f.on_fault("job_killed")
+    f.on_readings(HealthState(phase="test", at=datetime.now(), expected=0))
+    assert len(closed) == 1, "a one-shot close hook fired again on a later episode"
+
+
+def test_a_failing_close_hook_does_not_break_the_transition(tmp_path):
+    f = _fsm(tmp_path)
+    f.on_fault("job_killed")
+
+    def boom(_record):
+        raise RuntimeError("journal unwritable")
+
+    f.on_next_close(boom)
+    f.on_readings(HealthState(phase="test", at=datetime.now(), expected=0))
+    assert f.state is ServerState.HEALTHY

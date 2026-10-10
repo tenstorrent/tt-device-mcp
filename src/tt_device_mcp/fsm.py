@@ -179,6 +179,8 @@ class ServerFsm:
         # on a read-only or full state dir would otherwise downgrade to in-memory-only silently,
         # every single mutation, which is the exact durability this file exists to provide.
         self._persist_failed_logged = False
+        # One-shot callbacks run when the current episode closes to HEALTHY — see on_next_close.
+        self._on_close: list[Callable[[FsmRecord], None]] = []
         # The health subsystem this FSM roots — None until boot() constructs it. A bare unit
         # test of the durable record never needs them; anything that probes or escalates does.
         self.monitor: Optional[HealthMonitor] = None
@@ -461,11 +463,27 @@ class ServerFsm:
             state=state, why=_validate_why(why), since=since or _now_iso(), detail=detail, job=job or {}, dirty=dirty
         )
         self._latches = {}
+        closing = state is ServerState.HEALTHY and prev.state is not ServerState.HEALTHY
         # Opening a fresh fault episode (from HEALTHY/BOOT, or boot_merge's own fresh RECOVERING).
         if state is ServerState.RECOVERING and self._record.why:
             metrics.recovery_episode_opened(self._record.why)
         metrics.state_entered(state.value)
         self._persist()
+        if closing:
+            callbacks, self._on_close = self._on_close, []
+            for cb in callbacks:
+                try:
+                    cb(prev)
+                except Exception:  # noqa: BLE001 - a journal hook must never break a transition
+                    _logger.exception("fsm on-close callback failed")
+
+    def on_next_close(self, callback: "Callable[[FsmRecord], None]") -> None:
+        """Run ``callback(closed_record)`` once, the next time the device reaches HEALTHY from any
+        other state — whichever path lifts it (the startup gate, a reset, the idle relift, a forced
+        escalation). Every route to HEALTHY goes through :meth:`_open_episode`, so a caller that
+        must pair an opening event with its close registers here rather than at each lift site.
+        In memory only: a restart re-arms whatever it journals afresh."""
+        self._on_close.append(callback)
 
     def on_readings(self, state: "HealthState") -> None:
         """Fold one HEALTHY probe pass into the FSM, closing whatever episode was open. Named for
