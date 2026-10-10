@@ -135,11 +135,11 @@ AUTO_UBB_RESET="${TTDEV_AUTO_UBB_RESET:-}"
 # never drops an opt-in an operator already made.
 PREJOB_DISPATCH="${TTDEV_PREJOB_DISPATCH:-}"
 [ -z "$PREJOB_DISPATCH" ] && [ -r "$UNIT" ] && PREJOB_DISPATCH="$(sed -n 's/^Environment=TT_DEVICE_MCP_PREJOB_DISPATCH=//p' "$UNIT" 2>/dev/null | head -1)"
-# Extra device pollers to quiesce around a reset. server.py reads TT_DEVICE_MCP_POLLER_SERVICES (a
-# comma list; its default covers tt-telemetry and tt-metrics-exporter). A host running another unit
-# that reads the device (e.g. a clock-cap keeper) opts in with the full list here, so a reset does not
-# race it. Unset renders no line and the code default rules; the unit-read fallback keeps an opt-in
-# across updates.
+# Device pollers to quiesce around a reset. server.py reads TT_DEVICE_MCP_POLLER_SERVICES (a comma
+# list; its default covers tt-telemetry, tt-metrics-exporter and tt-fmax-cap, and a unit a host lacks
+# is skipped). A host running yet another unit that reads the device overrides it with the full list
+# here, so a reset does not race it. Unset renders no line and the code default rules; the unit-read
+# fallback keeps an override across updates.
 POLLER_SERVICES="${TTDEV_POLLER_SERVICES:-}"
 [ -z "$POLLER_SERVICES" ] && [ -r "$UNIT" ] && POLLER_SERVICES="$(sed -n 's/^Environment=TT_DEVICE_MCP_POLLER_SERVICES=//p' "$UNIT" 2>/dev/null | head -1)"
 # The python the eth reader resolves ttexalens from. Its own docs call this the per-box mechanism,

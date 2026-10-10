@@ -201,15 +201,15 @@ def test_prejob_dispatch_set_reaches_the_unit(tmp_path):
 
 
 def test_poller_services_unset_renders_no_line(tmp_path):
-    # Default: no line, so server.py's built-in poller list rules.
+    # Default: no line, so server.py's built-in poller list (which includes tt-fmax-cap) rules.
     unit = _render(tmp_path, _GALAXY)
     assert "TT_DEVICE_MCP_POLLER_SERVICES" not in unit
 
 
 def test_poller_services_set_reaches_the_unit(tmp_path):
-    # A host with an extra device poller opts in via /etc/default; the list must reach the unit
-    # verbatim, before ExecStart, or a reset races that poller.
-    pollers = "tt-telemetry.service,tt-metrics-exporter.service,tt-fmax-cap.service"
+    # A host with yet another device poller overrides the default list via /etc/default; the list
+    # must reach the unit verbatim, before ExecStart, or a reset races that poller.
+    pollers = "tt-telemetry.service,tt-metrics-exporter.service,tt-fmax-cap.service,site-poller.service"
     unit = _render(tmp_path, dict(_GALAXY, TTDEV_POLLER_SERVICES=pollers))
     line = f"Environment=TT_DEVICE_MCP_POLLER_SERVICES={pollers}"
     assert line in unit
