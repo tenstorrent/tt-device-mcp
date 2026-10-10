@@ -482,7 +482,8 @@ class ServerFsm:
         other state — whichever path lifts it (the startup gate, a reset, the idle relift, a forced
         escalation). Every route to HEALTHY goes through :meth:`_open_episode`, so a caller that
         must pair an opening event with its close registers here rather than at each lift site.
-        In memory only: a restart re-arms whatever it journals afresh."""
+        In memory only: a caller that needs the pairing to survive a restart re-arms it from its own
+        durable rows (``run_startup_tasks`` does, from the health journal)."""
         self._on_close.append(callback)
 
     def on_readings(self, state: "HealthState") -> None:

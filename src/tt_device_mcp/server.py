@@ -6394,6 +6394,40 @@ def _close_orphaned_hold() -> None:
         logger.info(f"STARTUP closed an orphaned hold of {int(held_for)}s: {reason}")
 
 
+def _open_startup_hold() -> Optional[dict]:
+    """The ``startup_fabric_hold`` row no ``startup_fabric_released`` has closed yet, if any.
+
+    The release hook lives in memory, so a broker that restarts while its startup hold is still
+    open forgets it — but the hold row is durable, and the journal still says it is open. Read
+    here, before ``boot_merge``, so a restart pairs that hold instead of stacking a second one.
+    Never raises: a missing journal reads as no open hold."""
+    try:
+        events = read_health_events(kinds={"startup_fabric_hold", "startup_fabric_released"})
+    except Exception:  # noqa: BLE001 - a missing journal must not block startup
+        return None
+    if not events or events[-1].get("kind") != "startup_fabric_hold":
+        return None
+    return events[-1]
+
+
+def _close_stale_startup_hold(hold: dict) -> None:
+    """Release a startup hold whose episode did not survive the restart: this start opens a fresh
+    one (with its own hold row), so the old row is closed first, the way ``_close_orphaned_hold``
+    closes a ``device_held``."""
+    try:
+        held_s = max(0.0, time.time() - float(hold.get("ts") or 0))
+    except (TypeError, ValueError):
+        held_s = 0.0
+    health_event(
+        "startup_fabric_released",
+        prior_why="closed on broker start",
+        detail="episode ended by a broker restart",
+        held_s=round(held_s, 1),
+    )
+    if logger:
+        logger.info(f"STARTUP closed a startup hold of {int(held_s)}s left open by the last broker")
+
+
 def _journal_startup_hold_released(closed: FsmRecord) -> None:
     """Close the ``startup_fabric_hold`` row: the door this broker start held is open again.
     ``prior_why`` is the last fault the episode carried — ``startup_unverified`` when the startup
@@ -6500,19 +6534,37 @@ async def run_startup_tasks() -> None:
     # door — a live sysfs check on its own is never enough (it reads perfectly healthy across a
     # wedged ethernet link).
     open_episode = fsm.record if fsm.record.state in (ServerState.RECOVERING, ServerState.DOWN) else None
+    try:
+        open_hold = await asyncio.to_thread(_open_startup_hold)
+    except Exception:  # noqa: BLE001 - bookkeeping must never block startup
+        open_hold = None
     fsm.boot_merge(
         open_episode=open_episode, attributed_boot=recovery_mechanism.boot_from_broker_escalation(_current_boot_id())
     )
     # The per-boot "door held pending the startup verify" row, durable in the health journal —
-    # fsm.json records the episode but is not the timeline operators read. A carried-over episode
-    # already has its own rows and keeps its own why, so only the fresh startup hold gets one.
-    if fsm.state is ServerState.RECOVERING and fsm.record.why == "startup_unverified":
-        health_event("startup_fabric_hold", why="broker start: awaiting the startup fabric verify")
-        # ...and its closing row. A watcher that saw the hold waits for a release, and the
-        # device_held/device_released pair does not cover this one: device_held is written only
-        # when a tenant is refused, so a gate that passed before any job asked left the hold open
-        # in the journal forever. Armed on the FSM, it fires once on whichever path reopens the door.
-        fsm.on_next_close(_journal_startup_hold_released)
+    # fsm.json records the episode but is not the timeline operators read — and its closing row.
+    # A watcher that saw the hold waits for a release, and the device_held/device_released pair
+    # does not cover this one: device_held is written only when a tenant is refused, so a gate that
+    # passed before any job asked left the hold open in the journal forever. The release is armed
+    # on the FSM and fires once on whichever path reopens the door. The hook is in memory and the
+    # hold row is durable, so the journal decides across a restart:
+    #   - a hold still open and its episode carried over: re-arm the release, no second hold row
+    #     (the hold may since have turned into another fault, so the why is not checked);
+    #   - a hold still open but a fresh episode: close the old hold, then hold afresh;
+    #   - no hold open: only a startup_unverified episode gets one — a carried-over fault episode
+    #     already has its own rows and keeps its own why.
+    try:
+        if open_hold is not None and open_episode is not None:
+            fsm.on_next_close(_journal_startup_hold_released)
+        else:
+            if open_hold is not None:
+                _close_stale_startup_hold(open_hold)
+            if fsm.state is ServerState.RECOVERING and fsm.record.why == "startup_unverified":
+                health_event("startup_fabric_hold", why="broker start: awaiting the startup fabric verify")
+                fsm.on_next_close(_journal_startup_hold_released)
+    except Exception as e:  # noqa: BLE001 - bookkeeping must never block startup
+        if logger:
+            logger.error(f"STARTUP startup-hold journal failed: {e}")
     # Answers "did it come back?" next to the reboot row that says it went away.
     # Fire-and-forget: a health REPORT must never gate the queue coming up.
     asyncio.create_task(_record_startup_health())

@@ -10050,6 +10050,86 @@ async def test_a_carried_over_episode_writes_no_startup_release(monkeypatch, tmp
     assert not [k for k, _ in events if k.startswith("startup_fabric")]
 
 
+async def _restart_broker(monkeypatch, fsm_path):
+    """One privsep broker start against the durable fsm.json at ``fsm_path`` and the real (test-dir)
+    health journal: a fresh ServerFsm loads the file the last broker left, exactly as a restart
+    within one boot does, with the fabric pass held off."""
+    monkeypatch.setattr(srv, "fsm", ServerFsm(fsm_path, current_boot_id="boot-same"))
+    monkeypatch.setattr(srv, "_startup_tasks_done", False)
+    monkeypatch.setattr(srv, "should_privsep", lambda: True)
+
+    async def noop():
+        pass
+
+    for name in (
+        "reconcile_running_scopes",
+        "_restore_queued_jobs",
+        "_record_startup_health",
+        "_verify_fabric_on_start",
+    ):
+        monkeypatch.setattr(srv, name, noop)
+    await srv.run_startup_tasks()
+
+
+def _startup_rows():
+    return [
+        (r["kind"], r.get("prior_why"))
+        for r in srv.read_health_events(kinds={"startup_fabric_hold", "startup_fabric_released"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_restart_during_the_startup_hold_pairs_one_hold_with_one_release(monkeypatch, tmp_path):
+    """The release hook is in memory, the hold row durable. A broker restarted (twice) before its
+    startup gate passed carries the startup_unverified episode over; it must re-arm the release, not
+    stack a second hold. Fails on base: hold, hold, hold, released."""
+    fsm_path = tmp_path / "fsmdir" / "fsm.json"
+    fsm_path.parent.mkdir()
+    await _restart_broker(monkeypatch, fsm_path)
+    await _restart_broker(monkeypatch, fsm_path)
+    await _restart_broker(monkeypatch, fsm_path)
+    assert srv.fsm.record.why == "startup_unverified"
+
+    srv.fsm.on_outcome(OUTCOME_RECOVERED)
+    assert _startup_rows() == [("startup_fabric_hold", None), ("startup_fabric_released", "startup_unverified")]
+
+
+@pytest.mark.asyncio
+async def test_a_restart_after_the_startup_hold_turned_into_a_fault_still_releases_it(monkeypatch, tmp_path):
+    """The hold can turn into another fault (a foreign holder blocked the verify) before a restart.
+    The carried episode's why is then not startup_unverified, but the hold row is still open: the
+    restart must arm its release all the same. Fails on base: a hold that is never released."""
+    fsm_path = tmp_path / "fsmdir" / "fsm.json"
+    fsm_path.parent.mkdir()
+    await _restart_broker(monkeypatch, fsm_path)
+    srv.fsm.on_fault("foreign_holder", detail="pid 4242 holds it", dirty=False)
+    await _restart_broker(monkeypatch, fsm_path)
+    assert srv.fsm.record.why == "foreign_holder"
+
+    srv.fsm.on_outcome(OUTCOME_RECOVERED)
+    assert _startup_rows() == [("startup_fabric_hold", None), ("startup_fabric_released", "foreign_holder")]
+
+
+@pytest.mark.asyncio
+async def test_a_startup_hold_whose_episode_was_lost_is_closed_before_the_next_hold(monkeypatch, tmp_path):
+    """A hold still open in the journal with no episode carried over (fsm.json lost, or the broker
+    died between persisting HEALTHY and writing the release) is closed on start, then the fresh
+    hold opens: the journal never shows two holds in a row. Fails on base: hold, hold, released."""
+    fsm_path = tmp_path / "fsmdir" / "fsm.json"
+    fsm_path.parent.mkdir()
+    await _restart_broker(monkeypatch, fsm_path)
+    fsm_path.unlink()
+    await _restart_broker(monkeypatch, fsm_path)
+
+    srv.fsm.on_outcome(OUTCOME_RECOVERED)
+    assert _startup_rows() == [
+        ("startup_fabric_hold", None),
+        ("startup_fabric_released", "closed on broker start"),
+        ("startup_fabric_hold", None),
+        ("startup_fabric_released", "startup_unverified"),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_post_reboot_climb_keeps_the_escalated_marker_and_the_reset_retries(monkeypatch, tmp_path):
     """The exact loop the durable record exists to prevent: the idle escalation already spent this
