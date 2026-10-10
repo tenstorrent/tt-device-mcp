@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
-from tt_device_mcp import __version__, metrics, privileges, telemetry
+from tt_device_mcp import __version__, alert, metrics, privileges, telemetry
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
     FABRIC_CHECK_CANNOT_CHECK_RC,
@@ -909,6 +909,11 @@ def _set_hold_escalated(value: bool) -> None:
 # so the watchdog writes one durable event per window rather than one per sample. Re-arms (0) with
 # the episode clock the moment the device comes back fit — the next episode gets its own deadline.
 device_hold_deadline_bucket: int = 0
+# The opt-in alert hook (TT_DEVICE_MCP_ALERT_CMD) fires on the first of those windows, then backs
+# off: the deadline window it may fire again at, and the last gap in windows (doubles, capped at
+# 24 h). Both re-arm (0) with the episode, like the bucket above.
+device_hold_alert_next_bucket: int = 0
+device_hold_alert_gap: int = 0
 # Which ceiling window this episode has already FORCE-ESCALATED for. The relift and the class
 # escalators fail closed to "keep holding" on their guards (an unconfigured eth reader, a last-fabric
 # verdict that never re-runs on an idle box, an unreadable tenant scan, the one-reset latch), which is
@@ -1096,6 +1101,36 @@ def _restore_hold_episode() -> str:
         return (health_dir() / HOLD_EPISODE_FILE).read_text().strip()
     except OSError:
         return ""
+
+
+# The alert hook's backoff for that episode, on disk beside it. In memory alone a restart during a
+# stuck hold (a self-update, a crash loop) re-arms it, and every restart pages again on its first
+# sample. Kept only for the episode it was written in.
+HOLD_ALERT_BACKOFF_FILE = "hold_alert_backoff.json"
+
+
+def _persist_hold_alert_backoff(since: str, next_bucket: int, gap: int) -> None:
+    """Record (or, with no episode, clear) the alert backoff for the episode that started at since."""
+    try:
+        path = health_dir() / HOLD_ALERT_BACKOFF_FILE
+        if since:
+            path.write_text(json.dumps({"since": since, "next_bucket": next_bucket, "gap": gap}))
+        elif path.exists():
+            path.unlink()
+    except OSError:
+        pass  # never let bookkeeping break the gate
+
+
+def _restore_hold_alert_backoff(since: str) -> tuple[int, int]:
+    """The (next_bucket, gap) a previous process recorded for the episode that started at since,
+    or (0, 0) when there is none, it is unreadable, or it belongs to another episode."""
+    try:
+        rec = json.loads((health_dir() / HOLD_ALERT_BACKOFF_FILE).read_text())
+        if rec.get("since") == since:
+            return max(0, int(rec["next_bucket"])), max(0, int(rec["gap"]))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    return 0, 0
 
 
 # A surgical bridge reset fired seconds after a chip leaves the bus can lose the race
@@ -4169,7 +4204,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     onto one degraded device writes a single ``device_held`` event, not one per job."""
     global device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global device_hold_deadline_bucket, device_hold_escalate_bucket
-    global device_hold_offbus_escalated
+    global device_hold_offbus_escalated, device_hold_alert_next_bucket, device_hold_alert_gap
     global device_hold_escalated_monotonic, _hold_row
     if reason and not device_hold_logged:
         device_hold_logged = True
@@ -4178,6 +4213,8 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         row_since = datetime.now().isoformat()
         device_hold_episode_since = _restore_hold_episode() or row_since
         _persist_hold_episode(device_hold_episode_since)
+        # ...and the alert hook's backoff for that same episode, so a restart does not page again.
+        device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
         device_hold_episode_reason = reason
         # Reserve the ledger row now, so the live row and the durable one share id, start, and name.
         # Its start is THIS process's segment (row_since), NOT the restored escalation clock: a hold
@@ -4234,6 +4271,10 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_escalated_monotonic = 0.0
         # ...and its own deadline watchdog: re-arm the stuck-hold alert for the next episode.
         device_hold_deadline_bucket = 0
+        # ...and its alert hook's backoff.
+        device_hold_alert_next_bucket = 0
+        device_hold_alert_gap = 0
+        _persist_hold_alert_backoff("", 0, 0)
         # ...and its own forced-escalation windows.
         device_hold_escalate_bucket = 0
         # ...and its own early off-bus attempt.
@@ -4413,6 +4454,38 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             f"cleared it (opted out, a stuck tenant/unreadable holder scan, its one reset spent, or "
             f"a killed relift). Manual recovery is likely required — a hold must terminate."
         )
+    _maybe_alert_stuck_hold(bucket, deadline, age)
+
+
+def _maybe_alert_stuck_hold(bucket: int, deadline: int, age: float) -> None:
+    """Hand a stuck hold to the operator's opt-in alert hook (TT_DEVICE_MCP_ALERT_CMD, spec 03 I30).
+
+    The timeline event above repeats every deadline window so a recency monitor keeps alarming; a
+    page must not. This fires on the episode's first stuck window, then waits 2, 4, 8 ... windows
+    (capped at 24 h) before the next. The backoff is kept on disk with the episode, so a restart
+    mid-episode does not page again. Unset, it does nothing. A run still in flight leaves the
+    backoff untouched, so the next window tries again."""
+    global device_hold_alert_next_bucket, device_hold_alert_gap
+    if bucket < device_hold_alert_next_bucket or alert.alert_argv() is None:
+        return
+    gap = alert.next_gap_windows(device_hold_alert_gap, deadline)
+    event = {
+        "kind": "hold_stuck_past_deadline",
+        "host": socket.gethostname(),
+        "held_since": device_hold_episode_since,
+        "reason": device_hold_episode_reason,
+        "held_age_sec": int(age),
+        "deadline_sec": deadline,
+        "escalated": fsm.latch("escalated"),
+        "next_alert_after_sec": gap * deadline,
+    }
+    if alert.send_alert(event, logger) is None:
+        return
+    device_hold_alert_next_bucket = bucket + gap
+    device_hold_alert_gap = gap
+    _persist_hold_alert_backoff(device_hold_episode_since, device_hold_alert_next_bucket, gap)
+    if logger:
+        logger.info(f"ALERT-HOOK stuck hold sent ({int(age)}s held); next in {gap * deadline}s if still held")
 
 
 def _refresh_idle_hold_ledger() -> None:
