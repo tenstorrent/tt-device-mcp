@@ -38,7 +38,8 @@ from tt_device_mcp.health.evidence import health_dir, health_event
 
 SYS_ROOT = Path("/")
 TT_VENDOR = 0x1E52
-_BDF = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+# A PCI domain has 4 hex digits, or more above 0xffff (an Intel VMD domain reads 10000:...).
+_BDF = re.compile(r"^[0-9a-f]{4,}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 
 # Config-space layout (PCIe base spec). Only what the mask touches.
 _CAP_PTR = 0x34
@@ -125,10 +126,21 @@ class SysfsUnreadable(OSError):
     """The Tenstorrent functions could not be listed from sysfs: no answer, not "none on the bus"."""
 
 
+def _maybe_tt(dev: Path, chips: dict, upstream: set) -> bool:
+    """Whether an entry whose vendor could not be read may be one the guard needs: a function the
+    tenstorrent driver owns, a port above a Tenstorrent function seen in this scan, or anything at or
+    below a recorded Tenstorrent root port. Any other entry cannot change what the guard does."""
+    if dev.name in chips or os.path.basename(os.path.realpath(dev / "driver")) == "tenstorrent":
+        return True
+    real = Path(os.path.realpath(dev))
+    return real.name in upstream or any(p in _seen()["root_ports"] for p in real.parts)
+
+
 def _scan_endpoints() -> dict:
-    """``{bdf: Endpoint}`` read from sysfs. Raises :class:`SysfsUnreadable` when the PCI device list,
-    an entry's vendor or name, or the tenstorrent class list cannot be read or parsed: a function it
-    could not judge might be a Tenstorrent chip. An entry that vanished mid-scan is simply gone."""
+    """``{bdf: Endpoint}`` read from sysfs. Raises :class:`SysfsUnreadable` when the PCI device list or
+    the tenstorrent class list cannot be read, or a Tenstorrent function (or a port above one) cannot
+    be judged: its vendor is unreadable, or it has no PCI address. Any other entry the scan cannot
+    read is not a Tenstorrent function and is skipped. An entry that vanished mid-scan is simply gone."""
     chips: dict = {}
     cls = SYS_ROOT / "sys/class/tenstorrent"
     try:
@@ -145,33 +157,45 @@ def _scan_endpoints() -> dict:
             except OSError:
                 continue
     out: dict = {}
+    unjudged: list = []
+    upstream: set = set()  # every PCI function on the sysfs path of a Tenstorrent function
     try:
         entries = sorted(_pci_dir().iterdir())
     except OSError as exc:
         raise SysfsUnreadable(f"cannot read {_pci_dir()}: {exc}") from exc
     for dev in entries:
-        if not _BDF.match(dev.name):
-            raise SysfsUnreadable(f"cannot read {dev}: not a PCI address")
         try:
             vendor = int((dev / "vendor").read_text().strip(), 16)
         except OSError as exc:
             if not os.path.lexists(dev):
                 continue  # removed while we looked
-            raise SysfsUnreadable(f"cannot read {dev / 'vendor'}: {exc}") from exc
+            unjudged.append((dev, exc))
+            continue
         except ValueError as exc:
-            raise SysfsUnreadable(f"cannot read {dev / 'vendor'}: {exc}") from exc
+            unjudged.append((dev, exc))
+            continue
         if vendor != TT_VENDOR:
             continue
+        if not _BDF.match(dev.name):
+            raise SysfsUnreadable(f"cannot read {dev}: a Tenstorrent function with no PCI address")
         bdf = dev.name
         parts = [p for p in Path(os.path.realpath(dev)).parts if _BDF.match(p)]
-        root_port = parts[0] if len(parts) > 1 else None
+        upstream.update(parts)
+        # The root port is the first function above it in its own domain (under Intel VMD the VMD
+        # controller, in domain 0000, comes first on the path).
+        domain = bdf.rsplit(":", 2)[0]
+        above = [p for p in parts[:-1] if p.rsplit(":", 2)[0] == domain]
+        root_port = above[0] if above else None
         try:
             device: Optional[int] = int((dev / "device").read_text().strip(), 16)
         except (OSError, ValueError):
             device = None  # no architecture: tray_bus_groups finds no table and the plan refuses
         out[bdf] = Endpoint(
-            bdf=bdf, bus=int(bdf.split(":")[1], 16), root_port=root_port, chip=chips.get(bdf), device=device
+            bdf=bdf, bus=int(bdf.split(":")[-2], 16), root_port=root_port, chip=chips.get(bdf), device=device
         )
+    for dev, exc in unjudged:
+        if _maybe_tt(dev, chips, upstream):
+            raise SysfsUnreadable(f"cannot read {dev / 'vendor'}: {exc}") from exc
     return out
 
 
@@ -611,11 +635,19 @@ def clear_offbus_reset_latch(dirs: Optional[list] = None) -> list:
 
 def mask_for_mesh_reset(log) -> Optional[AerMask]:
     """Mask every Tenstorrent root port before a mesh reset when the gate is on, else None. A port
-    that cannot be masked is logged and the reset goes ahead unmasked, as before the gate."""
+    that cannot be masked is logged and the reset goes ahead unmasked, as before the gate. Sysfs that
+    cannot be read is logged the same way, and only the recorded root ports are masked."""
     if gate_mode() == GATE_OFF:
         return None
     try:
-        return AerMask(tt_root_ports()).apply()
+        eps = _scan_endpoints()
+        _remember(eps)
+    except SysfsUnreadable as exc:
+        log(f"could not list the Tenstorrent root ports before the reset ({exc}); masking only the recorded ones")
+        health_event("aer_mask_failed", error=str(exc), host_at_risk=True)
+        eps = {}
+    try:
+        return AerMask(tt_root_ports(eps)).apply()
     except OSError as exc:
         log(f"could not mask AER on the Tenstorrent root ports before the reset: {exc!r}")
         health_event("aer_mask_failed", error=repr(exc), host_at_risk=True)

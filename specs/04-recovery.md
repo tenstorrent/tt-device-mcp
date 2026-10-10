@@ -265,11 +265,14 @@ each rung fires only when the gentler one failed or cannot apply.
   Known limit: a root port never seen with its chip present on this host (the broker's first start
   here already found that chip off the bus) is not known and is not masked; every other port is.
   With every chip off the bus there is no healthy tray to cut and nothing to cross-check, so the
-  fire goes ahead without a tray table. Sysfs that cannot be read (the PCI device list, an entry's
-  vendor or address, or the tenstorrent class list) is no answer, never "every chip off the bus":
-  the plan refuses the fire and names what it could not read, and a look at start or between jobs
-  keeps the recorded topology and leaves a `pci_topology_unreadable` event; the I20 gate counts
-  every chip off the bus then, so `hold` holds. A quiet port gets its
+  fire goes ahead without a tray table. Sysfs that cannot be read (the PCI device list, the
+  tenstorrent class list, or the vendor or address of a Tenstorrent function or of a port above
+  one) is no answer, never "every chip off the bus": the plan refuses the fire and names what it
+  could not read, and a look at start or between jobs keeps the recorded topology and leaves a
+  `pci_topology_unreadable` event; the I20 gate counts every chip off the bus then, so `hold`
+  holds, and a `guard` mesh-reset mask logs `aer_mask_failed` and masks the recorded ports. Any
+  other entry it cannot read is skipped. PCI domains of 5+ hex digits (Intel VMD) are addresses,
+  and a chip's root port is the first port above it in its own domain. A quiet port gets its
   exact saved settings back; one that errors again stays masked, starts the AER flood window and stops the tray
   walk. A refused fire re-powers nothing. `TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1` logs the planned
   sequence and refuses; `python -m tt_device_mcp.health.recovery.pcie_guard <bitmap> [chip ...]`
@@ -570,6 +573,7 @@ NOT be conflated when reading results.
 | I19 an off-bus chip's remembered root port is masked (tray fire and mesh reset); a port gone from sysfs is not | `tests/test_pcie_guard.py::test_an_off_bus_chips_root_port_is_masked_for_its_trays_re_power`, `::test_guard_masks_an_off_bus_chips_port_around_a_mesh_reset`, `::test_a_remembered_port_gone_from_sysfs_is_not_masked` |
 | I19 the topology is recorded at broker start and in each between-jobs check, rewritten only on change; a port never seen is not known | `tests/test_pcie_guard.py::test_broker_start_records_the_topology_for_the_first_tray_drop`, `::test_the_between_jobs_check_records_the_topology_for_the_first_tray_drop`, `::test_an_unchanged_topology_is_not_rewritten`, `::test_without_a_healthy_look_an_off_bus_chips_port_is_not_known` |
 | I19 unreadable sysfs refuses the tray fire (all-off included) and a look keeps the recorded topology | `tests/test_pcie_guard.py::test_a_tray_re_power_refuses_when_sysfs_cannot_be_read`, `::test_an_all_off_mesh_behind_an_unreadable_sysfs_is_not_re_powered`, `::test_an_unreadable_look_keeps_the_recorded_topology`, `::test_an_unreadable_sysfs_counts_every_chip_off_so_a_hold_gate_holds` |
+| I19 a 5+ digit PCI domain parses; an unrelated entry sysfs cannot read is skipped; a `guard` mask over unreadable sysfs logs `aer_mask_failed` | `tests/test_pcie_guard.py::test_a_5_digit_domain_beside_the_mesh_does_not_make_sysfs_unreadable`, `::test_a_chip_in_a_5_digit_domain_is_parsed_and_counted`, `::test_an_unrelated_entry_the_scan_cannot_read_is_skipped`, `::test_an_unreadable_sysfs_under_guard_logs_a_mask_failure` |
 | I19 an all-off mesh is re-powered and its sweep is complete | `tests/test_pcie_guard.py::test_an_all_off_bus_mesh_still_gets_its_trays_re_powered`, `::test_an_all_off_bus_last_chance_sweep_is_complete` |
 | I19 mask before quiesce; a mask failure refuses; a failed quiesce still re-inits and restores | `tests/test_pcie_guard.py::test_the_envelope_masks_before_it_quiesces_and_refuses_when_it_cannot_mask`, `::test_a_quiesce_that_raises_still_re_inits_and_restores` |
 | I20 the flood is a rate; the flood window refuses even under `off`; a refused reset is not recorded | `tests/test_pcie_guard.py::test_a_steady_trickle_between_distant_looks_is_not_a_flood`, `::test_a_trickle_since_an_old_boot_is_not_a_flood`, `::test_the_flood_window_holds_automatic_resets_even_with_the_gate_off`, `::test_after_a_kept_masked_port_the_stuck_hold_mesh_reset_does_not_fire`, `::test_a_gated_mesh_reset_records_no_reset_and_arms_no_cooldown` |

@@ -870,8 +870,10 @@ def _break_sysfs(root, monkeypatch, how):
         _deny(monkeypatch, "read_text", devs / "0000:01:00.0" / "vendor")
     elif how == "vendor unparseable":
         (devs / "0000:01:00.0" / "vendor").write_text("garbage\n")
-    elif how == "entry name unparseable":
-        (devs / "bogus").symlink_to(root / "sys/devices")
+    elif how == "root port vendor unreadable":
+        _deny(monkeypatch, "read_text", devs / "0000:00:01.1" / "vendor")
+    elif how == "chip with no PCI address":
+        (devs / "bogus").symlink_to(devs / "0000:01:00.0")
     elif how == "chip class dir unlistable":
         _deny(monkeypatch, "iterdir", root / "sys/class/tenstorrent")
     elif how == "device id unreadable":
@@ -885,7 +887,8 @@ UNREADABLE = [
     "devices dir unlistable",
     "vendor unreadable",
     "vendor unparseable",
-    "entry name unparseable",
+    "root port vendor unreadable",
+    "chip with no PCI address",
     "chip class dir unlistable",
     "device id unreadable",
 ]
@@ -966,3 +969,88 @@ async def test_an_unreadable_look_keeps_the_recorded_topology(sysfs, monkeypatch
     assert len(unreadable) == 2 and all("cannot read" in k["reason"] for k in unreadable)
     _forget_in_process(monkeypatch)
     assert "cannot read" in pcie_guard.plan_tray_repower(0b1, [0]).mismatch
+
+
+# ---------------------------------------------------------------- entries the guard does not need
+
+
+def _vmd_entry(root, bdf="10000:e0:01.0", vendor="0x8086\n"):
+    """A function in a 5-digit PCI domain behind an Intel VMD controller, which is not a chip."""
+    d = root / f"sys/devices/pci0000:00/0000:00:0e.0/pci{bdf.split(':')[0]}:{bdf.split(':')[1]}/{bdf}"
+    d.mkdir(parents=True)
+    if vendor is not None:
+        (d / "vendor").write_text(vendor)
+    (root / "sys/bus/pci/devices" / bdf).symlink_to(d)
+    return d
+
+
+def test_a_5_digit_domain_beside_the_mesh_does_not_make_sysfs_unreadable(sysfs, monkeypatch):
+    """A VMD host lists domains >= 0x10000 with 5+ digits. Such an entry is a PCI address, and an
+    entry that is no Tenstorrent function never makes the whole of sysfs unreadable."""
+    _vmd_entry(sysfs)
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    pcie_guard.record_topology()
+    assert events == []
+    rec = json.loads((pcie_guard.health_dir() / pcie_guard.TOPOLOGY_FILE).read_text())
+    assert rec["root_ports"] == sorted(PORTS)
+    plan = pcie_guard.plan_tray_repower(0b1, [0])
+    assert not plan.mismatch and plan.functions == ["0000:01:00.0"] and plan.root_ports == sorted(PORTS)
+    assert pcie_guard.chips_off_bus(len(CHIPS)) == 0
+
+
+def test_a_chip_in_a_5_digit_domain_is_parsed_and_counted(sysfs):
+    """Tray 1's chip behind a VMD controller: its own domain's port is its root port, not the VMD
+    controller in domain 0000 above it."""
+    _take_off_bus(sysfs, 0)
+    rp = _vmd_entry(sysfs, "10000:00:01.1")
+    (rp / "config").write_bytes(bytes(_port_config()))
+    ep = rp / "10000:01:00.0"
+    ep.mkdir()
+    (ep / "vendor").write_text("0x1e52\n")
+    (ep / "device").write_text("0xb140\n")
+    (sysfs / "sys/bus/pci/devices/10000:01:00.0").symlink_to(ep)
+    cls = sysfs / "sys/class/tenstorrent/tenstorrent!0"
+    cls.mkdir()
+    (cls / "device").symlink_to(ep)
+    eps = pcie_guard.tt_endpoints()
+    assert eps["10000:01:00.0"] == pcie_guard.Endpoint("10000:01:00.0", 0x01, "10000:00:01.1", 0, 0xB140)
+    assert pcie_guard.chips_off_bus(len(CHIPS)) == 0
+    plan = pcie_guard.plan_tray_repower(0b1, [0])
+    assert not plan.mismatch and plan.functions == ["10000:01:00.0"] and plan.chips == [0]
+    assert "10000:00:01.1" in plan.root_ports and "0000:00:0e.0" not in plan.root_ports
+
+
+@pytest.mark.parametrize("how", ["entry name unparseable", "vendor unreadable", "vendor unparseable"])
+def test_an_unrelated_entry_the_scan_cannot_read_is_skipped(sysfs, monkeypatch, how):
+    devs = sysfs / "sys/bus/pci/devices"
+    if how == "entry name unparseable":
+        (devs / "bogus").symlink_to(sysfs / "sys/devices")
+    else:
+        d = _vmd_entry(sysfs, "0000:20:00.0", vendor="garbage\n")
+        if how == "vendor unreadable":
+            _deny(monkeypatch, "read_text", devs / "0000:20:00.0" / "vendor")
+        assert d.is_dir()
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    assert sorted(pcie_guard.tt_endpoints()) == sorted(f"0000:{b:02x}:00.0" for _c, b, _r in CHIPS)
+    pcie_guard.record_topology()
+    assert not pcie_guard.plan_tray_repower(0b1, [0]).mismatch
+    assert pcie_guard.chips_off_bus(len(CHIPS)) == 0
+    assert events == []
+
+
+def test_an_unreadable_sysfs_under_guard_logs_a_mask_failure(sysfs, monkeypatch):
+    """The mesh-reset mask cannot list the ports when sysfs is unreadable: it says so in the journal
+    and masks the ports an earlier look recorded."""
+    pcie_guard.record_topology()
+    _break_sysfs(sysfs, monkeypatch, "devices dir unlistable")
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "guard")
+    events, logs = [], []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    mask = pcie_guard.mask_for_mesh_reset(logs.append)
+    failed = [k for n, k in events if n == "aer_mask_failed"]
+    assert len(failed) == 1 and "cannot read" in failed[0]["error"] and failed[0]["host_at_risk"]
+    assert logs and "cannot read" in logs[0]
+    assert sorted(mask.ports) == sorted(PORTS) and all(_masked(sysfs, p) for p in PORTS)
+    mask.restore(quiet_sec=0)
