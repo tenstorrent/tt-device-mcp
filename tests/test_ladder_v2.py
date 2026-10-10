@@ -518,10 +518,28 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
         return False, {"snapshot": {"ok": False}}
 
     patch_recovery(monkeypatch, "_verify_device", bad)
+    # The sweep did not run (no holder scan stubbed, so it reads as a tenant): the full ladder has not
+    # been tried, so the host rung holds (spec 04 I22).
+    out_held = await g._fire_gate_rung(
+        "post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={}
+    )
+    assert (
+        out_held == galaxy.OUTCOME_WAITING and cycles["n"] == 0
+    ), "a host rung never fires when the last-chance sweep was skipped"
+
+    # The full sweep ran and the mesh is still bad: the host rung fires.
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: None)
+
+    async def fake_reset(argv, log, *a, **k):
+        return 0, ""
+
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", fake_reset)
     out2 = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={})
     assert (
         out2 == galaxy.OUTCOME_WAITING and cycles["n"] == 1
-    ), "a mesh still bad after the settle+verify proceeds to the host rung"
+    ), "a mesh still bad after the full sweep, settle and verify proceeds to the host rung"
 
 
 # ---------------------------------------------------------------- (d) power-cycle cooldown (1800s)
