@@ -779,3 +779,65 @@ def test_a_quiesce_that_raises_still_re_inits_and_restores(sysfs):
         )
     assert steps == [("reinit", [3])]
     assert all(_restored(sysfs, p) for p in PORTS)
+
+
+# ---------------------------------------------------------------- re-review #52 fixes
+
+
+def _no_topology(monkeypatch):
+    """A first start on this host: no look yet, in this process or persisted."""
+    _forget_in_process(monkeypatch)
+    (pcie_guard.health_dir() / pcie_guard.TOPOLOGY_FILE).unlink(missing_ok=True)
+
+
+def _tray_1_plan(sysfs, monkeypatch):
+    """Tray 1's chip leaves the bus and a new broker process plans its re-power."""
+    _take_off_bus(sysfs, 0)
+    _forget_in_process(monkeypatch)
+    return pcie_guard.plan_tray_repower(0b1, [0])
+
+
+def test_without_a_healthy_look_an_off_bus_chips_port_is_not_known(sysfs, monkeypatch):
+    """The documented limit (spec 04 I19): a port never seen with its chip present is not masked."""
+    _no_topology(monkeypatch)
+    plan = _tray_1_plan(sysfs, monkeypatch)
+    assert "0000:00:01.1" not in plan.root_ports
+
+
+def test_broker_start_records_the_topology_for_the_first_tray_drop(sysfs, monkeypatch):
+    _no_topology(monkeypatch)
+    srv.pcie_guard_at_start(lambda m: None)  # what the broker runs at start
+    assert (pcie_guard.health_dir() / pcie_guard.TOPOLOGY_FILE).exists()
+    assert not [f for f in os.listdir(pcie_guard.health_dir()) if f.endswith(".tmp")], "no temp file left"
+    plan = _tray_1_plan(sysfs, monkeypatch)
+    assert not plan.mismatch
+    assert plan.root_ports == sorted(PORTS), "tray 1's own port 0000:00:01.1 is masked"
+
+
+@pytest.mark.asyncio
+async def test_the_between_jobs_check_records_the_topology_for_the_first_tray_drop(sysfs, monkeypatch, health_deps):
+    from tt_device_mcp.health.monitor import HealthMonitor
+    from tt_device_mcp.health.monitors import hostpci
+
+    _no_topology(monkeypatch)
+    monkeypatch.setattr(hostpci, "host_pci_verdict", lambda: (True, "ok", {}))
+    m = HealthMonitor(health_deps)
+
+    async def healthy(*a, **k):
+        return True, "ok"
+
+    monkeypatch.setattr(m, "_verify_device", healthy)
+    await m.update("post-job", run_fabric=False, expected=len(CHIPS))
+    plan = _tray_1_plan(sysfs, monkeypatch)
+    assert not plan.mismatch
+    assert plan.root_ports == sorted(PORTS), "tray 1's own port 0000:00:01.1 is masked"
+
+
+def test_an_unchanged_topology_is_not_rewritten(sysfs, monkeypatch):
+    _no_topology(monkeypatch)
+    writes = []
+    real_replace = os.replace
+    monkeypatch.setattr(pcie_guard.os, "replace", lambda a, b: (writes.append(b), real_replace(a, b)))
+    for _ in range(3):
+        pcie_guard.record_topology()
+    assert len(writes) == 1

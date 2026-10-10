@@ -107,7 +107,6 @@ from tt_device_mcp.health import (
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
     capture_incident,
-    check_offbus_reset_latch,
     chip_node_present,
     chip_pci_bdf,
     chip_sample,
@@ -123,6 +122,7 @@ from tt_device_mcp.health import (
     heartbeat_verdict,
     isolate_chip,
     mark_boot,
+    pcie_guard_at_start,
     previous_boot_bus_locks,
     previous_boot_error,
     read_health_events,
@@ -8331,8 +8331,9 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
     # taken every start, that becomes a distribution of real causes instead of a theory.
     await asyncio.to_thread(_record_previous_boot_error)
     # An automatic reset over off-bus chips that the last boot never finished hung the host: latch the
-    # off-bus reset gate to hold until an operator clears it (spec 04 I21).
-    await asyncio.to_thread(check_offbus_reset_latch, lambda m: logger.warning(f"STARTUP {m}") if logger else None)
+    # off-bus reset gate to hold until an operator clears it (spec 04 I21). Record which root ports
+    # carry the chips too, so the first tray drop after this start masks its own port (I19).
+    await asyncio.to_thread(pcie_guard_at_start, lambda m: logger.warning(f"STARTUP {m}") if logger else None)
 
     # A reset started by the broker we are replacing may still be going in its
     # restart-safe backend. Wait it out before anything else touches the device.

@@ -259,9 +259,13 @@ each rung fires only when the gentler one failed or cannot apply.
   port's error status cleared and watched for `TT_DEVICE_MCP_AER_QUIET_CHECK_SEC`. "Every root
   port" includes the ports of chips already off the bus: the broker remembers each root port and
   chip arch it has seen (`tt_pci_topology.json` in the health dir) and masks a remembered port
-  that still exists in sysfs. With every chip off the bus there is no healthy tray to cut and
-  nothing to cross-check, so the fire goes ahead (the tray table then comes from the remembered
-  archs). A quiet port gets its exact saved
+  that still exists in sysfs. It looks at broker start and in every between-jobs check (sysfs
+  reads; the file is rewritten, through a temp file and a rename, only when a look adds a port or
+  an arch), so one healthy start covers the first tray drop after it and every later restart.
+  Known limit: a root port never seen with its chip present on this host (the broker's first start
+  here already found that chip off the bus) is not known and is not masked; every other port is.
+  With every chip off the bus there is no healthy tray to cut and nothing to cross-check, so the
+  fire goes ahead without a tray table. A quiet port gets its exact saved
   settings back; one that errors again stays masked, starts the AER flood window and stops the tray
   walk. A refused fire re-powers nothing. `TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1` logs the planned
   sequence and refuses; `python -m tt_device_mcp.health.recovery.pcie_guard <bitmap> [chip ...]`
@@ -275,7 +279,12 @@ each rung fires only when the gentler one failed or cannot apply.
   flood), or within `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC` of one (the first look after a recent boot
   counts from zero at boot). `hold` also refuses while any chip has no PCI function, so a reset
   that dropped a chip is not re-issued over it. Under every mode, `off` included, an automatic reset is refused while
-  the flood window an I19 port that stayed masked opened is still open. The gate is checked before
+  the flood window an I19 port that stayed masked opened is still open: with the gate `off` that
+  holds every automatic mesh reset, tray walk and last-chance sweep (and so the host rung above
+  them, I18) for `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC`. The one exception is inside a last-chance
+  sweep that already started: its mesh reset still follows its tray fire, even one that left a port
+  masked, because no host rung fires without the full ladder (I18); the erroring port stays masked
+  across that reset. The gate is checked before
   the reset is recorded (`reset_begin`, the cooldown clock): a refused reset did not happen. A
   refusal is a hold for an operator, never a climb (I18). Operator and tool resets are not gated.
   The per-chip bridge SBR is gated the same way, counting its target chips as off the bus: under
@@ -555,6 +564,7 @@ NOT be conflated when reading results.
 | I21 the host-hang latch: intent, latch on a new boot, not on the same boot, clear, opt-out | `tests/test_pcie_guard.py::test_an_off_bus_reset_writes_an_intent_and_removes_it_when_done`, `::test_an_intent_from_a_boot_that_died_latches_hold_until_cleared`, `::test_an_intent_from_this_boot_does_not_latch`, `::test_the_latch_can_be_switched_off`, `::test_a_tray_re_power_carries_an_intent_and_ends_it` |
 | I20 gate modes: off by default, hold on an off-bus chip, guard on a flood | `tests/test_pcie_guard.py::test_gate_is_off_by_default`, `::test_hold_refuses_a_reset_over_chips_already_off_the_bus`, `::test_guard_refuses_during_an_aer_flood`, `::test_first_look_after_a_recent_boot_counts_errors_since_boot`, `::test_hold_gate_stops_an_automatic_mesh_reset_over_an_off_bus_chip`, `::test_guard_masks_the_root_ports_around_an_automatic_mesh_reset` |
 | I19 an off-bus chip's remembered root port is masked (tray fire and mesh reset); a port gone from sysfs is not | `tests/test_pcie_guard.py::test_an_off_bus_chips_root_port_is_masked_for_its_trays_re_power`, `::test_guard_masks_an_off_bus_chips_port_around_a_mesh_reset`, `::test_a_remembered_port_gone_from_sysfs_is_not_masked` |
+| I19 the topology is recorded at broker start and in each between-jobs check, rewritten only on change; a port never seen is not known | `tests/test_pcie_guard.py::test_broker_start_records_the_topology_for_the_first_tray_drop`, `::test_the_between_jobs_check_records_the_topology_for_the_first_tray_drop`, `::test_an_unchanged_topology_is_not_rewritten`, `::test_without_a_healthy_look_an_off_bus_chips_port_is_not_known` |
 | I19 an all-off mesh is re-powered and its sweep is complete | `tests/test_pcie_guard.py::test_an_all_off_bus_mesh_still_gets_its_trays_re_powered`, `::test_an_all_off_bus_last_chance_sweep_is_complete` |
 | I19 mask before quiesce; a mask failure refuses; a failed quiesce still re-inits and restores | `tests/test_pcie_guard.py::test_the_envelope_masks_before_it_quiesces_and_refuses_when_it_cannot_mask`, `::test_a_quiesce_that_raises_still_re_inits_and_restores` |
 | I20 the flood is a rate; the flood window refuses even under `off`; a refused reset is not recorded | `tests/test_pcie_guard.py::test_a_steady_trickle_between_distant_looks_is_not_a_flood`, `::test_a_trickle_since_an_old_boot_is_not_a_flood`, `::test_the_flood_window_holds_automatic_resets_even_with_the_gate_off`, `::test_after_a_kept_masked_port_the_stuck_hold_mesh_reset_does_not_fire`, `::test_a_gated_mesh_reset_records_no_reset_and_arms_no_cooldown` |

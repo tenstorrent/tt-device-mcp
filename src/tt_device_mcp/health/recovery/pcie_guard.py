@@ -111,12 +111,14 @@ def _remember(eps: dict) -> None:
         return
     seen["root_ports"] |= ports
     seen["devices"] |= devices
+    path = health_dir() / TOPOLOGY_FILE
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        path = health_dir() / TOPOLOGY_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"root_ports": sorted(seen["root_ports"]), "devices": sorted(seen["devices"])}))
+        tmp.write_text(json.dumps({"root_ports": sorted(seen["root_ports"]), "devices": sorted(seen["devices"])}))
+        os.replace(tmp, path)  # a torn write would read back as nothing seen
     except OSError:
-        pass
+        tmp.unlink(missing_ok=True)
 
 
 def tt_endpoints() -> dict:
@@ -159,6 +161,16 @@ def tt_endpoints() -> dict:
         )
     _remember(out)
     return out
+
+
+def record_topology() -> None:
+    """Look at the Tenstorrent functions now, so each chip's root port is known once it leaves the
+    bus (spec 04 I19). Run at broker start and in every between-jobs check: a sysfs read, and the
+    topology file is rewritten only when the look adds a port or an architecture. Never raises."""
+    try:
+        tt_endpoints()
+    except Exception:  # noqa: BLE001 - a failed look must not fail the start or the check
+        pass
 
 
 def tt_root_ports(endpoints: Optional[dict] = None) -> list:
@@ -528,6 +540,15 @@ def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
         f"`{clear_latch_cmd()}`"
     )
     health_event("offbus_reset_hold_latched", intent=intent, clear=clear_latch_cmd(), host_at_risk=True)
+    return rec
+
+
+def pcie_guard_at_start(log: Callable[[str], None]) -> Optional[dict]:
+    """Broker start: latch the off-bus reset gate when the last boot died inside an off-bus reset
+    (:func:`check_offbus_reset_latch`, returned), and record the PCI topology while the mesh is
+    still as the host left it."""
+    rec = check_offbus_reset_latch(log)
+    record_topology()
     return rec
 
 

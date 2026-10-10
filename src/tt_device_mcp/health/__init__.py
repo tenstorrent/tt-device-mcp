@@ -108,7 +108,7 @@ from tt_device_mcp.health.recovery.galaxy import (
     _stuck_hold_ceiling_sec,
     _ubb_reset_enabled,
 )
-from tt_device_mcp.health.recovery.pcie_guard import check_offbus_reset_latch
+from tt_device_mcp.health.recovery.pcie_guard import pcie_guard_at_start
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
     bridge_reset_enabled,
@@ -139,8 +139,9 @@ __all__ = [
     "previous_boot_bus_locks",
     "previous_boot_error",
     "read_health_events",
-    # boot: latch the off-bus reset gate when the last boot died inside one (spec 04 I21)
-    "check_offbus_reset_latch",
+    # boot: latch the off-bus reset gate when the last boot died inside one (spec 04 I21), and
+    # record the PCI topology (I19)
+    "pcie_guard_at_start",
     # vocabulary
     "HealthState",
     "Verdict",
