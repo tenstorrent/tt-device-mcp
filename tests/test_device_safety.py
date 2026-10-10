@@ -8575,7 +8575,7 @@ def test_affected_trays_rejects_a_non_tray_topology_or_bad_drop(galaxy_trays):
 
 
 def test_ubb_tray_walk_plan_walks_only_the_affected_trays(galaxy_trays):
-    """F18 / spec 04 I21: the walk re-powers only the trays holding an off-bus chip, one tray at a time,
+    """F18 / spec 04 I25: the walk re-powers only the trays holding an off-bus chip, one tray at a time,
     ascending by real tray number. A tray whose chips are all on the bus is never in the plan."""
     assert galaxy._ubb_tray_walk_plan({str(i) for i in range(8)}, 32, galaxy_trays) == [1]
     assert galaxy._ubb_tray_walk_plan({str(i) for i in range(24, 32)}, 32, galaxy_trays) == [3]
@@ -8739,7 +8739,7 @@ async def test_ubb_tray_reset_fires_on_a_partial_tray_below_floor_drop(monkeypat
 async def test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_whole_sweep_fails(
     monkeypatch, clear_job_state, galaxy_trays
 ):
-    """A per-tray reset walk that re-powered the affected tray (spec 04 I21: only trays holding an
+    """A per-tray reset walk that re-powered the affected tray (spec 04 I25: only trays holding an
     off-bus chip) and still did not recover must not sit: past the grace it climbs straight to the host rung (a warm
     reboot cannot re-enumerate a still-off-bus tray, so the cold power cycle is the only rung left),
     loudly when none is opted in. The mesh-wide galaxy reset still never runs, and the episode's one
@@ -8850,7 +8850,7 @@ async def test_ubb_tray_reset_declines_a_fully_off_bus_mesh_it_is_the_cold_rung(
 async def test_ubb_tray_reset_walk_never_sweeps_healthy_trays_when_the_affected_tray_does_not_recover(
     monkeypatch, clear_job_state, galaxy_trays
 ):
-    """Spec 04 I21: when re-powering the affected tray does not clear the drop, the walk does NOT go on
+    """Spec 04 I25: when re-powering the affected tray does not clear the drop, the walk does NOT go on
     to re-power the trays whose chips are all on the bus (fleet: sweeping healthy trays took 16+ chips
     off in a third of single-chip walks). It returns False and the next rung (the mesh reset) owns the
     rest, so no rung before the power cycle is skipped."""
@@ -8877,7 +8877,7 @@ async def test_ubb_tray_reset_walk_never_sweeps_healthy_trays_when_the_affected_
 async def test_ubb_tray_reset_walk_recovers_chips_off_on_any_tray_by_re_powering_that_tray_alone(
     monkeypatch, clear_job_state, galaxy_trays, tray
 ):
-    """Recovery equivalence (spec 04 I21): for chips off on tray X, re-powering tray X alone recovers
+    """Recovery equivalence (spec 04 I25): for chips off on tray X, re-powering tray X alone recovers
     them, exactly as the old walk did when it fired X first. No other tray is touched."""
     fired = []
     srv.fsm.set_latch("ubb_reset_fired", False)

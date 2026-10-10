@@ -139,8 +139,8 @@ __all__ = [
     "previous_boot_bus_locks",
     "previous_boot_error",
     "read_health_events",
-    # boot: latch the off-bus reset gate when the last boot died inside one (spec 04 I21), and
-    # record the PCI topology (I19)
+    # boot: latch the off-bus reset gate when the last boot died inside one (spec 04 I25), and
+    # record the PCI topology (I23)
     "pcie_guard_at_start",
     # vocabulary
     "HealthState",

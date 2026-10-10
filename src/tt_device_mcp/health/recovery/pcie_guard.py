@@ -84,7 +84,7 @@ class Endpoint:
 
 
 # What sysfs showed while the chips were on the bus, kept so an off-bus chip's root port and the
-# host's architecture are still known once its function is gone (spec 04 I19). Persisted in the
+# host's architecture are still known once its function is gone (spec 04 I23). Persisted in the
 # health dir so a broker that starts with a tray already off the bus knows them too.
 TOPOLOGY_FILE = "tt_pci_topology.json"
 _SEEN: Optional[dict] = None
@@ -215,7 +215,7 @@ def tt_endpoints() -> Optional[dict]:
 
 def record_topology() -> None:
     """Look at the Tenstorrent functions now, so each chip's root port is known once it leaves the
-    bus (spec 04 I19). Run at broker start and in every between-jobs check: a sysfs read, and the
+    bus (spec 04 I23). Run at broker start and in every between-jobs check: a sysfs read, and the
     topology file is rewritten only when the look adds a port or an architecture. A look that cannot
     read sysfs keeps what was recorded and leaves a ``pci_topology_unreadable`` event. Never raises."""
     try:

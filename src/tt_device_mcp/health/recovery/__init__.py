@@ -393,7 +393,7 @@ class Recovery(ABC):
         sbr = bridge_reset_enabled()
         if not sbr:
             log(f"per-chip bridge reset unavailable ({bridge_reset_unavailable_reason()}) — trying a PCI rescan")
-        # An SBR takes its chip off the bus like any reset, so the per-host gate (spec 04 I20) holds it
+        # An SBR takes its chip off the bus like any reset, so the per-host gate (spec 04 I24) holds it
         # too: the isolated chips are off the bus by definition.
         gated, why = False, ""
         if sbr:
@@ -611,7 +611,7 @@ class Recovery(ABC):
                 "`-r`, which does NOT recover a Galaxy; set TT_DEVICE_MCP_RESET_MODE"
             )
 
-        # The per-host gate (spec 04 I20): on a host whose resets have flooded AER into a crash, an
+        # The per-host gate (spec 04 I24): on a host whose resets have flooded AER into a crash, an
         # automatic reset never fires over chips already off the bus or during a flood, and the
         # Tenstorrent root ports are masked for the reset window. Off by default. Checked before
         # reset_begin and the cooldown clock: a refused reset did not happen.

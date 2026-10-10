@@ -70,6 +70,6 @@ def _fire_ubb_reset(bitmap: int, tray_chip_ids: list, log=None):
         for iid in tray_chip_ids:
             _reset_ioctl_if_on_bus(reset_device_ioctl, iid, IoctlResetFlags.POST_RESET)
 
-    # The envelope (spec 04 I19) refuses a mis-mapped tray or a held chip, and masks AER on every
+    # The envelope (spec 04 I23) refuses a mis-mapped tray or a held chip, and masks AER on every
     # Tenstorrent root port while the tray is unpowered, so the fallout cannot flood the host.
     return pcie_guard.safe_tray_repower(bitmap, tray_chip_ids, pulse, log or _LOG.info, quiesce=quiesce, reinit=reinit)

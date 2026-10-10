@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""The host-safety envelope around a per-tray re-power and the per-host reset gate (spec 04 I18-I20).
+"""The host-safety envelope around a per-tray re-power and the per-host reset gate (spec 04 I22-I24).
 
 Every test runs against a fake sysfs tree: four Blackhole trays, one chip each, the kernel's /dev
 order 0x0X, 0x4X, 0xCX, 0x8X (so trays 3 and 4 are where list position puts them the wrong way
@@ -388,7 +388,7 @@ async def _false():
     return False
 
 
-# ---------------------------------------------------------------- host-hang latch (spec 04 I21)
+# ---------------------------------------------------------------- host-hang latch (spec 04 I25)
 
 
 def _boot(root, boot_id):
@@ -501,7 +501,7 @@ async def test_the_per_chip_bridge_reset_obeys_the_hold_gate_and_the_latch(sysfs
 async def test_the_last_chance_sweep_re_powers_only_the_affected_trays(
     monkeypatch, clear_job_state, galaxy_trays, off, trays
 ):
-    """Spec 04 I21: a caller that names no off-bus chips gets them read from the heartbeats; only trays
+    """Spec 04 I25: a caller that names no off-bus chips gets them read from the heartbeats; only trays
     holding one are re-powered. A present mesh gets SBR and the mesh reset but no tray re-power."""
     g = srv.galaxy_recovery
     swept = []
@@ -603,7 +603,7 @@ def test_an_all_off_bus_mesh_still_gets_its_trays_re_powered(sysfs, monkeypatch,
 @pytest.mark.asyncio
 async def test_an_all_off_bus_last_chance_sweep_is_complete(sysfs, monkeypatch):
     """With the gate off, an all-off mesh's sweep re-powers every tray and is COMPLETE, so the power
-    cycle above it is not held (I18) — the old path's recovery."""
+    cycle above it is not held (I22) — the old path's recovery."""
     pcie_guard.tt_endpoints()
     for chip in range(len(CHIPS)):
         _take_off_bus(sysfs, chip)
@@ -800,7 +800,7 @@ def _tray_1_plan(sysfs, monkeypatch):
 
 
 def test_without_a_healthy_look_an_off_bus_chips_port_is_not_known(sysfs, monkeypatch):
-    """The documented limit (spec 04 I19): a port never seen with its chip present is not masked."""
+    """The documented limit (spec 04 I23): a port never seen with its chip present is not masked."""
     _no_topology(monkeypatch)
     plan = _tray_1_plan(sysfs, monkeypatch)
     assert "0000:00:01.1" not in plan.root_ports
@@ -898,7 +898,7 @@ UNREADABLE = [
 @pytest.mark.parametrize("how", UNREADABLE)
 def test_a_tray_re_power_refuses_when_sysfs_cannot_be_read(sysfs, monkeypatch, how, all_off):
     """Sysfs that cannot be read is not "every chip off the bus": the #27 cross-check cannot run, so
-    the envelope refuses before it touches anything and says why (spec 04 I19)."""
+    the envelope refuses before it touches anything and says why (spec 04 I23)."""
     pcie_guard.record_topology()  # a healthy look first: the remembered ports must not make it safe
     if all_off:
         for chip in range(1, len(CHIPS)):

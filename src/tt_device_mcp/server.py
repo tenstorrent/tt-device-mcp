@@ -8331,8 +8331,8 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
     # taken every start, that becomes a distribution of real causes instead of a theory.
     await asyncio.to_thread(_record_previous_boot_error)
     # An automatic reset over off-bus chips that the last boot never finished hung the host: latch the
-    # off-bus reset gate to hold until an operator clears it (spec 04 I21). Record which root ports
-    # carry the chips too, so the first tray drop after this start masks its own port (I19).
+    # off-bus reset gate to hold until an operator clears it (spec 04 I25). Record which root ports
+    # carry the chips too, so the first tray drop after this start masks its own port (I23).
     await asyncio.to_thread(pcie_guard_at_start, lambda m: logger.warning(f"STARTUP {m}") if logger else None)
 
     # A reset started by the broker we are replacing may still be going in its
