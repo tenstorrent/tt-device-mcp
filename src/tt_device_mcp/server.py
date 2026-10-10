@@ -1304,13 +1304,13 @@ device_pci_map: dict = {}
 
 # Daemons that continuously poll every chip. They are stopped for the duration of
 # a reset: MMIO aimed at a chip that is mid-reset (or already dead) is what pushes
-# the root complex into the fatal error path that reboots the host.
+# the root complex into the fatal error path that reboots the host. tt-fmax-cap.service writes the
+# clock cap to every chip, so a reset or fabric op racing it is the same hazard; it is in the default
+# list on every host. A unit a host does not have answers `systemctl` non-zero and is skipped, so
+# naming it costs nothing there.
+DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service,tt-fmax-cap.service"
 DEVICE_POLLER_SERVICES = tuple(
-    s
-    for s in os.environ.get("TT_DEVICE_MCP_POLLER_SERVICES", "tt-telemetry.service,tt-metrics-exporter.service").split(
-        ","
-    )
-    if s.strip()
+    s for s in os.environ.get("TT_DEVICE_MCP_POLLER_SERVICES", DEFAULT_POLLER_SERVICES).split(",") if s.strip()
 )
 logger: logging.Logger | None = None
 job_log_dir: Path | None = None
