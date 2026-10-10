@@ -4214,9 +4214,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_episode_since = _restore_hold_episode() or row_since
         _persist_hold_episode(device_hold_episode_since)
         # ...and the alert hook's backoff for that same episode, so a restart does not page again.
-        device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(
-            device_hold_episode_since
-        )
+        device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
         device_hold_episode_reason = reason
         # Reserve the ledger row now, so the live row and the durable one share id, start, and name.
         # Its start is THIS process's segment (row_since), NOT the restored escalation clock: a hold
