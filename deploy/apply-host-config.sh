@@ -312,15 +312,41 @@ CLIENT
 chmod 0644 /etc/profile.d/tt-device-mcp-client.sh
 
 # Idle-time health probe (spec 08 I17): PCI rescan and telemetry re-arm while the broker is idle.
-install -m 0644 "$DEPLOY/tt-device-health-probe.service" /etc/systemd/system/tt-device-health-probe.service
-install -m 0644 "$DEPLOY/tt-device-health-probe.timer"   /etc/systemd/system/tt-device-health-probe.timer
-# Its unmanaged predecessor (tt-health-probe.timer) rescanned for a fixed chip count with no broker
-# check. Two probes must not race, so it is retired; its files outside systemd are left alone.
-if [ -e /etc/systemd/system/tt-health-probe.timer ]; then
-    echo "apply-host-config: retiring the unmanaged tt-health-probe.timer (replaced by tt-device-health-probe.timer)" >&2
+# The service runs the broker's own venv, rendered like the broker unit's ExecStart.
+install_health_probe_units() {
+    local unitdir="$1"
+    sed "s|@VENV@|$VENV|g" "$DEPLOY/tt-device-health-probe.service" > "$unitdir/tt-device-health-probe.service"
+    chmod 0644 "$unitdir/tt-device-health-probe.service"
+    install -m 0644 "$DEPLOY/tt-device-health-probe.timer" "$unitdir/tt-device-health-probe.timer"
+}
+# On by default; TTDEV_HEALTH_PROBE=0 in /etc/default turns it off. Optional, so a timer that will
+# not arm is loud but does not abort the apply the broker's own updates depend on. Its unmanaged
+# predecessor (tt-health-probe.timer) rescanned for a fixed chip count with no broker check; two
+# probes must not race, so it is retired, but only once the new timer is armed, and its units are
+# moved aside, not deleted. An opted-out host, or one where the new timer will not arm, keeps the
+# old probe's coverage. Undo a retirement: move the *.retired-by-tt-device-mcp files back.
+arm_health_probe() {
+    local unitdir="$1" f
+    if [ "${TTDEV_HEALTH_PROBE:-1}" = 0 ]; then
+        systemctl disable --now tt-device-health-probe.timer >/dev/null 2>&1 || true
+        return 0
+    fi
+    if ! systemctl enable --now tt-device-health-probe.timer >/dev/null 2>&1 \
+            || ! systemctl is-active --quiet tt-device-health-probe.timer; then
+        echo "apply-host-config: warn: tt-device-health-probe.timer did not arm; idle-time PCI rescan and telemetry re-arm are off (an unmanaged tt-health-probe.timer, if any, is left running)" >&2
+        return 0
+    fi
+    [ -e "$unitdir/tt-health-probe.timer" ] || return 0
+    echo "apply-host-config: retiring the unmanaged tt-health-probe.timer (replaced by tt-device-health-probe.timer; kept as *.retired-by-tt-device-mcp)" >&2
     systemctl disable --now tt-health-probe.timer >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/tt-health-probe.timer /etc/systemd/system/tt-health-probe.service
-fi
+    for f in tt-health-probe.timer tt-health-probe.service; do
+        if [ -e "$unitdir/$f" ]; then
+            mv -f "$unitdir/$f" "$unitdir/$f.retired-by-tt-device-mcp"
+        fi
+    done
+    systemctl daemon-reload
+}
+install_health_probe_units /etc/systemd/system
 
 systemctl daemon-reload
 
@@ -334,14 +360,7 @@ systemctl enable --now tt-device-fabric-validator.timer >/dev/null 2>&1 \
 # runs with no fabric validation, so confirm the timer is actually armed before continuing.
 systemctl is-active --quiet tt-device-fabric-validator.timer \
     || { echo "apply-host-config: tt-device-fabric-validator.timer enabled but not active — host loses its authoritative fabric validator" >&2; exit 1; }
-# On by default; TTDEV_HEALTH_PROBE=0 in /etc/default turns it off. Optional, so a timer that will
-# not arm is loud but does not abort the apply the broker's own updates depend on.
-if [ "${TTDEV_HEALTH_PROBE:-1}" = 0 ]; then
-    systemctl disable --now tt-device-health-probe.timer >/dev/null 2>&1 || true
-elif ! systemctl enable --now tt-device-health-probe.timer >/dev/null 2>&1 \
-        || ! systemctl is-active --quiet tt-device-health-probe.timer; then
-    echo "apply-host-config: warn: tt-device-health-probe.timer did not arm; idle-time PCI rescan and telemetry re-arm are off" >&2
-fi
+arm_health_probe /etc/systemd/system
 # Only where perf can actually count it; a missing PMU event must not leave a failed unit.
 if perf stat -a -e ls_locks.bus_lock -- true >/dev/null 2>&1; then
     systemctl enable --now tt-device-buslock.service >/dev/null 2>&1 || true
