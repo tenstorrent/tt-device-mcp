@@ -218,6 +218,8 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     monkeypatch.delenv(device_holders.TENANT_UIDS_ENV, raising=False)
     monkeypatch.setattr(srv, "reaped_survivors", {})
     monkeypatch.setattr(srv, "_leftover_fence_detail", "")
+    # The pollers a quiesce stopped and owes a restore: per process, so per test.
+    monkeypatch.setattr(srv, "_pollers_to_restore", set())
     # The reset argv/mode env vars are read live (never cached), so an operator's own shell/CI
     # environment leaks straight into whatever argv a test builds — cleared here for a
     # deterministic floor; a test exercising a declared mode/override sets it itself afterward.
