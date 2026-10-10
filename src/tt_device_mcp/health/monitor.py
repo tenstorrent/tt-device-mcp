@@ -171,6 +171,12 @@ class HealthMonitor:
         # because both faults it judges make the device unusable AND are the kind the gentlest
         # rung actually repairs: a PCI rescan re-binds a driver that failed to attach, and an
         # unassigned BAR after hotplug is exactly what a rescan places.
+        # Record which root ports carry the chips while they are on the bus, so a tray that drops
+        # later still gets its own port masked for its re-power (spec 04 I19). Sysfs reads only.
+        from tt_device_mcp.health.recovery import pcie_guard  # recovery imports this module
+
+        await asyncio.to_thread(pcie_guard.record_topology)
+
         self._deps.set_device_op_detail("health check: host PCI (driver binding, BARs)")
         _t0 = time.monotonic()
         hp_ok, hp_detail, hp_evidence = await asyncio.to_thread(hostpci.host_pci_verdict)

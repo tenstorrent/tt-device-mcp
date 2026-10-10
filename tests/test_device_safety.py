@@ -8574,14 +8574,13 @@ def test_affected_trays_rejects_a_non_tray_topology_or_bad_drop(galaxy_trays):
     assert galaxy._affected_trays({"x"}, 32, galaxy_trays) is None  # malformed id
 
 
-def test_ubb_tray_walk_plan_orders_affected_trays_first_then_the_rest(galaxy_trays):
-    """F18: the walk re-powers the trays holding a fault first, then sweeps the rest — one tray at a
-    time, so a full pass never takes the whole mesh off the bus at once (the mesh reset's failure mode).
-    The order is affected then the remaining trays, each ascending by real tray number."""
-    assert galaxy._ubb_tray_walk_plan({str(i) for i in range(8)}, 32, galaxy_trays) == [1, 2, 3, 4]
-    assert galaxy._ubb_tray_walk_plan({str(i) for i in range(24, 32)}, 32, galaxy_trays) == [3, 1, 2, 4]
-    assert galaxy._ubb_tray_walk_plan({"20"}, 32, galaxy_trays) == [4, 1, 2, 3]  # a lone chip -> its tray leads
-    assert galaxy._ubb_tray_walk_plan({"0", "31"}, 32, galaxy_trays) == [1, 3, 2, 4]  # two affected trays lead
+def test_ubb_tray_walk_plan_walks_only_the_affected_trays(galaxy_trays):
+    """F18 / spec 04 I21: the walk re-powers only the trays holding an off-bus chip, one tray at a time,
+    ascending by real tray number. A tray whose chips are all on the bus is never in the plan."""
+    assert galaxy._ubb_tray_walk_plan({str(i) for i in range(8)}, 32, galaxy_trays) == [1]
+    assert galaxy._ubb_tray_walk_plan({str(i) for i in range(24, 32)}, 32, galaxy_trays) == [3]
+    assert galaxy._ubb_tray_walk_plan({"20"}, 32, galaxy_trays) == [4]  # a lone chip -> its tray only
+    assert galaxy._ubb_tray_walk_plan({"0", "31"}, 32, galaxy_trays) == [1, 3]  # never a healthy tray
     assert galaxy._ubb_tray_walk_plan(set(), 32, galaxy_trays) is None  # no tray to re-power
     assert galaxy._ubb_tray_walk_plan({str(i) for i in range(8)}, 8, galaxy_trays) is None  # single-tray host
 
@@ -8740,8 +8739,8 @@ async def test_ubb_tray_reset_fires_on_a_partial_tray_below_floor_drop(monkeypat
 async def test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_whole_sweep_fails(
     monkeypatch, clear_job_state, galaxy_trays
 ):
-    """A per-tray reset walk that re-powered every tray (affected first, then the rest, one at a time)
-    and still did not recover must not sit: past the grace it climbs straight to the host rung (a warm
+    """A per-tray reset walk that re-powered the affected tray (spec 04 I21: only trays holding an
+    off-bus chip) and still did not recover must not sit: past the grace it climbs straight to the host rung (a warm
     reboot cannot re-enumerate a still-off-bus tray, so the cold power cycle is the only rung left),
     loudly when none is opted in. The mesh-wide galaxy reset still never runs, and the episode's one
     walk is spent so it does not loop. Fails on base, which falls to a silent below-floor hold."""
@@ -8759,7 +8758,7 @@ async def test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_whole_swee
     )
     ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
     assert ran is True, "a walk that did not recover must climb, never sit"
-    assert fired["n"] == 4, "the walk swept all four trays (affected first, then the rest) one at a time"
+    assert fired["n"] == 1, "the walk re-powered the affected tray only, never a healthy one"
     assert counters["resets"] == 1, "a failed walk falls to the mesh reset's below-floor attempt"
     assert counters["dirty_cleared"] == 0, "a walk that did not verify healthy must not clear the hold"
     assert "ubb_reset_did_not_recover" in events
@@ -8848,14 +8847,13 @@ async def test_ubb_tray_reset_declines_a_fully_off_bus_mesh_it_is_the_cold_rung(
 
 
 @pytest.mark.asyncio
-async def test_ubb_tray_reset_walk_sweeps_the_rest_when_the_affected_tray_does_not_recover(
+async def test_ubb_tray_reset_walk_never_sweeps_healthy_trays_when_the_affected_tray_does_not_recover(
     monkeypatch, clear_job_state, galaxy_trays
 ):
-    """F18: when re-powering the affected tray does not clear the drop (a fabric wedge spanning trays),
-    the walk continues through the remaining trays ONE AT A TIME — a full sweep that never takes the
-    whole mesh off the bus at once, unlike the mesh reset. Verify never healthy -> every tray re-powered,
-    affected first, then the rest, then False. Fails on base, whose single-fire rung bounces only the
-    one clean tray."""
+    """Spec 04 I21: when re-powering the affected tray does not clear the drop, the walk does NOT go on
+    to re-power the trays whose chips are all on the bus (fleet: sweeping healthy trays took 16+ chips
+    off in a third of single-chip walks). It returns False and the next rung (the mesh reset) owns the
+    rest, so no rung before the power cycle is skipped."""
     fired = []
     srv.fsm.set_latch("ubb_reset_fired", False)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
@@ -8870,13 +8868,34 @@ async def test_ubb_tray_reset_walk_sweeps_the_rest_when_the_affected_tray_does_n
     monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap), raising=False)
     beats = {str(i): 100 for i in range(24)}  # tray 3 off; 0-23 up
     out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None)
-    assert out is False
-    assert fired == [
-        0x04,
-        0x01,
-        0x02,
-        0x08,
-    ], "affected tray 3 first, then the rest one at a time — never all four trays off the bus at once"
+    assert out is False, "not recovered -> the caller climbs to the next rung"
+    assert fired == [0x04], "affected tray 3 only — a tray whose chips are all present is never re-powered"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tray", [1, 2, 3, 4])
+async def test_ubb_tray_reset_walk_recovers_chips_off_on_any_tray_by_re_powering_that_tray_alone(
+    monkeypatch, clear_job_state, galaxy_trays, tray
+):
+    """Recovery equivalence (spec 04 I21): for chips off on tray X, re-powering tray X alone recovers
+    them, exactly as the old walk did when it fired X first. No other tray is touched."""
+    fired = []
+    srv.fsm.set_latch("ubb_reset_fired", False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+
+    async def healthy_after_x(expected, log, run_fabric=True, **_):
+        return (len(fired) == 1, {"snapshot": {"ok": len(fired) == 1}})
+
+    patch_recovery(monkeypatch, "_verify_device", healthy_after_x)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap), raising=False)
+    off = set(galaxy_trays[tray])
+    beats = {str(i): 100 for i in range(32) if i not in off}
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, len(off), 32, lambda m: None)
+    assert out is True, f"re-powering tray {tray} alone recovers its chips"
+    assert fired == [1 << (tray - 1)], f"only tray {tray} was re-powered"
 
 
 @pytest.mark.asyncio
@@ -8887,8 +8906,7 @@ async def test_ubb_tray_reset_walk_does_not_clear_a_hold_on_an_unverified_fabric
     trained link, a training-window verdict, not proof the mesh moves data) is NOT a recovery. The walk
     must not STOP and clear the hold onto an unproven fabric — the blx04 shape, where enum+ARC read OK
     while every full-mesh job died on a down eth link. It gives the 77 training time, then, still
-    unverified, treats that tray as not-recovered and sweeps on; a full sweep that never verifies returns
-    False and holds. Fails on base, where a 77 reads healthy=True so the first tray's reset stops the
+    unverified, treats that tray as not-recovered; a walk that never verifies returns False and holds. Fails on base, where a 77 reads healthy=True so the first tray's reset stops the
     walk and clears the hold."""
     fired = []
     srv.fsm.set_latch("ubb_reset_fired", False)
@@ -8907,12 +8925,7 @@ async def test_ubb_tray_reset_walk_does_not_clear_a_hold_on_an_unverified_fabric
     beats = {str(i): 100 for i in range(24)}  # chips 24-31 = tray 3 off the bus
     out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None)
     assert out is False, "a persistent post-reset 77 is NOT a verified recovery — the walk must not clear the hold"
-    assert fired == [
-        0x04,
-        0x01,
-        0x02,
-        0x08,
-    ], "an unverified fabric keeps the walk sweeping every tray, never stops-and-clears on the 77"
+    assert fired == [0x04], "an unverified fabric never stops-and-clears on the 77, and no healthy tray is swept"
 
 
 @pytest.mark.asyncio

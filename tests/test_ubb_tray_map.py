@@ -129,11 +129,11 @@ def test_affected_trays_names_the_tray_an_operator_would_read_from_tt_smi(bh_tra
     assert galaxy._affected_trays({"0", "31"}, 32, bh_trays) == [1, 3]
 
 
-def test_the_walk_leads_with_the_affected_tray_then_sweeps_the_rest(bh_trays):
-    """Walk order is affected-first, then the remaining trays ascending — over real tray numbers,
-    which are 1-based, not the 0-based ordinals the index arithmetic produced."""
-    assert galaxy._ubb_tray_walk_plan({"20"}, 32, bh_trays) == [4, 1, 2, 3]
-    assert galaxy._ubb_tray_walk_plan({"0", "31"}, 32, bh_trays) == [1, 3, 2, 4]
+def test_the_walk_covers_only_the_affected_trays(bh_trays):
+    """The walk is the affected trays only, ascending — over real tray numbers, which are 1-based, not
+    the 0-based ordinals the index arithmetic produced (spec 04 I21: never a healthy tray)."""
+    assert galaxy._ubb_tray_walk_plan({"20"}, 32, bh_trays) == [4]
+    assert galaxy._ubb_tray_walk_plan({"0", "31"}, 32, bh_trays) == [1, 3]
 
 
 def test_without_a_map_every_tray_decision_declines(bh_trays):
