@@ -251,11 +251,17 @@ each rung fires only when the gentler one failed or cannot apply.
   In order: the tray map is cross-checked against sysfs (each chip's bus against tt-smi's tray
   table) and a disagreement refuses the fire, so a mis-mapped tray is never cut (issue #27); it
   waits up to `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` for every process to let go of the
-  tray's chips, else refuses; the device pollers are stopped as for a mesh reset; the chips are
-  quiesced (USER_RESET); AER and DPC are masked on EVERY Tenstorrent root port, the sibling trays'
-  included; the tray's PCI functions are removed; the BMC pulse fires; then, even if the pulse
-  failed, the bus is rescanned, the chips re-inited (POST_RESET) and each port's error status
-  cleared and watched for `TT_DEVICE_MCP_AER_QUIET_CHECK_SEC`. A quiet port gets its exact saved
+  tray's chips, else refuses; the device pollers are stopped as for a mesh reset; AER and DPC are
+  masked on EVERY Tenstorrent root port, the sibling trays' included (a mask that cannot be applied
+  is put back and refuses the fire, before any chip is touched); the chips are quiesced
+  (USER_RESET); the tray's PCI functions are removed; the BMC pulse fires; then, even if the
+  quiesce or the pulse failed, the bus is rescanned, the chips re-inited (POST_RESET) and each
+  port's error status cleared and watched for `TT_DEVICE_MCP_AER_QUIET_CHECK_SEC`. "Every root
+  port" includes the ports of chips already off the bus: the broker remembers each root port and
+  chip arch it has seen (`tt_pci_topology.json` in the health dir) and masks a remembered port
+  that still exists in sysfs. With every chip off the bus there is no healthy tray to cut and
+  nothing to cross-check, so the fire goes ahead (the tray table then comes from the remembered
+  archs). A quiet port gets its exact saved
   settings back; one that errors again stays masked, starts the AER flood window and stops the tray
   walk. A refused fire re-powers nothing. `TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1` logs the planned
   sequence and refuses; `python -m tt_device_mcp.health.recovery.pcie_guard <bitmap> [chip ...]`
@@ -264,11 +270,14 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I20 — A per-host gate on automatic host-affecting resets** (`TT_DEVICE_MCP_HOST_RESET_GATE`).
   `off` (default) keeps the behaviour above. `guard` masks AER on every Tenstorrent root port around
   each automatic mesh reset and refuses an automatic mesh reset, tray walk or last-chance sweep
-  while the root ports' AER counters rise by `TT_DEVICE_MCP_AER_FLOOD_THRESHOLD` between looks, or
-  within `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC` of one (the first look after a recent boot counts
-  from zero). `hold` also refuses while any chip has no PCI function, so a reset that dropped a chip
-  is not re-issued over it. A refusal is a hold for an operator, never a climb (I18). Operator and
-  tool resets are not gated.
+  while the root ports' AER counters rise at `TT_DEVICE_MCP_AER_FLOOD_THRESHOLD` or more errors per
+  `TT_DEVICE_MCP_AER_FLOOD_PERIOD_SEC` (a rate, so a trickle between looks hours apart is not a
+  flood), or within `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC` of one (the first look after a recent boot
+  counts from zero at boot). `hold` also refuses while any chip has no PCI function, so a reset
+  that dropped a chip is not re-issued over it. Under every mode, `off` included, an automatic reset is refused while
+  the flood window an I19 port that stayed masked opened is still open. The gate is checked before
+  the reset is recorded (`reset_begin`, the cooldown clock): a refused reset did not happen. A
+  refusal is a hold for an operator, never a climb (I18). Operator and tool resets are not gated.
   The per-chip bridge SBR is gated the same way, counting its target chips as off the bus: under
   `hold` (or the I21 latch) it does not fire, and the PCI rescan still runs.
 
@@ -283,7 +292,11 @@ each rung fires only when the gentler one failed or cannot apply.
   verify. A broker that starts on another boot id and finds that intent writes
   `offbus_reset_hold.json`, emits `offbus_reset_hold_latched` (host at risk), and from then on runs
   the I20 gate as `hold`, whatever it is configured to. The latch survives restarts until an
-  operator runs `python -m tt_device_mcp.health.recovery.pcie_guard --clear-hang-latch`.
+  operator runs `sudo <broker python> -m tt_device_mcp.health.recovery.pcie_guard
+  --clear-hang-latch [--health-dir DIR]` (the logged hint names the broker's own python and health
+  dir). Without `--health-dir` it clears the caller's health dir and the system broker's
+  (`/var/lib/tt-device-broker/health`); a latch it cannot remove exits 1 and is never reported as
+  absent.
   `TT_DEVICE_MCP_OFFBUS_HANG_LATCH=0` turns the intent and the latch off.
 
 ## Interfaces
@@ -533,7 +546,7 @@ NOT be conflated when reading results.
 |---|---|
 | I18 a host rung holds when the last-chance sweep was skipped or gated; it fires after a full sweep | `tests/test_ladder_v2.py::test_settle_and_verify_gates_the_power_cycle_host_rung`, `tests/test_pcie_guard.py::test_a_gated_sweep_never_reaches_the_power_cycle`, `::test_a_refused_tray_fire_makes_the_sweep_incomplete` |
 | I19 the tray map is cross-checked against sysfs; a mismatch or missing table refuses | `tests/test_pcie_guard.py::test_plan_refuses_a_tray_map_that_points_at_another_tray`, `::test_plan_refuses_without_a_tray_table`, `::test_envelope_refuses_a_mismatched_tray_map` |
-| I19 the envelope's order: quiesce, mask every port, remove, fire, rescan, re-init, restore | `tests/test_pcie_guard.py::test_envelope_masks_every_port_removes_the_tray_fires_rescans_and_restores`, `::test_envelope_restores_and_rescans_even_when_the_pulse_fails`, `::test_pollers_are_stopped_across_the_tray_fire` |
+| I19 the envelope's order: mask every port, quiesce, remove, fire, rescan, re-init, restore | `tests/test_pcie_guard.py::test_envelope_masks_every_port_removes_the_tray_fires_rescans_and_restores`, `::test_envelope_restores_and_rescans_even_when_the_pulse_fails`, `::test_pollers_are_stopped_across_the_tray_fire` |
 | I19 holders: wait, then refuse | `tests/test_pcie_guard.py::test_envelope_waits_for_holders_then_refuses_without_touching_anything`, `::test_envelope_proceeds_once_the_holder_lets_go` |
 | I19 an erroring port stays masked and starts the flood window | `tests/test_pcie_guard.py::test_a_port_that_keeps_erroring_stays_masked_and_marks_a_flood` |
 | I19 dry run and plan CLI touch nothing | `tests/test_pcie_guard.py::test_dry_run_logs_the_plan_and_touches_nothing`, `::test_cli_prints_the_plan` |
@@ -541,6 +554,11 @@ NOT be conflated when reading results.
 | I21 the walk and the sweep re-power only affected trays; X alone recovers chips off on X; a failed walk climbs to the mesh reset | `tests/test_ubb_tray_map.py::test_the_walk_covers_only_the_affected_trays`, `tests/test_device_safety.py::test_ubb_tray_walk_plan_walks_only_the_affected_trays`, `::test_ubb_tray_reset_walk_recovers_chips_off_on_any_tray_by_re_powering_that_tray_alone`, `::test_ubb_tray_reset_walk_never_sweeps_healthy_trays_when_the_affected_tray_does_not_recover`, `::test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_whole_sweep_fails`, `tests/test_pcie_guard.py::test_the_last_chance_sweep_re_powers_only_the_affected_trays` |
 | I21 the host-hang latch: intent, latch on a new boot, not on the same boot, clear, opt-out | `tests/test_pcie_guard.py::test_an_off_bus_reset_writes_an_intent_and_removes_it_when_done`, `::test_an_intent_from_a_boot_that_died_latches_hold_until_cleared`, `::test_an_intent_from_this_boot_does_not_latch`, `::test_the_latch_can_be_switched_off`, `::test_a_tray_re_power_carries_an_intent_and_ends_it` |
 | I20 gate modes: off by default, hold on an off-bus chip, guard on a flood | `tests/test_pcie_guard.py::test_gate_is_off_by_default`, `::test_hold_refuses_a_reset_over_chips_already_off_the_bus`, `::test_guard_refuses_during_an_aer_flood`, `::test_first_look_after_a_recent_boot_counts_errors_since_boot`, `::test_hold_gate_stops_an_automatic_mesh_reset_over_an_off_bus_chip`, `::test_guard_masks_the_root_ports_around_an_automatic_mesh_reset` |
+| I19 an off-bus chip's remembered root port is masked (tray fire and mesh reset); a port gone from sysfs is not | `tests/test_pcie_guard.py::test_an_off_bus_chips_root_port_is_masked_for_its_trays_re_power`, `::test_guard_masks_an_off_bus_chips_port_around_a_mesh_reset`, `::test_a_remembered_port_gone_from_sysfs_is_not_masked` |
+| I19 an all-off mesh is re-powered and its sweep is complete | `tests/test_pcie_guard.py::test_an_all_off_bus_mesh_still_gets_its_trays_re_powered`, `::test_an_all_off_bus_last_chance_sweep_is_complete` |
+| I19 mask before quiesce; a mask failure refuses; a failed quiesce still re-inits and restores | `tests/test_pcie_guard.py::test_the_envelope_masks_before_it_quiesces_and_refuses_when_it_cannot_mask`, `::test_a_quiesce_that_raises_still_re_inits_and_restores` |
+| I20 the flood is a rate; the flood window refuses even under `off`; a refused reset is not recorded | `tests/test_pcie_guard.py::test_a_steady_trickle_between_distant_looks_is_not_a_flood`, `::test_a_trickle_since_an_old_boot_is_not_a_flood`, `::test_the_flood_window_holds_automatic_resets_even_with_the_gate_off`, `::test_after_a_kept_masked_port_the_stuck_hold_mesh_reset_does_not_fire`, `::test_a_gated_mesh_reset_records_no_reset_and_arms_no_cooldown` |
+| I21 the clear command finds the system broker's latch; one it cannot remove is reported | `tests/test_pcie_guard.py::test_the_clear_command_finds_the_system_brokers_latch`, `::test_a_latch_that_cannot_be_removed_is_reported_not_called_absent` |
 | I17 a rung the process cannot execute reads OFF (reboot, power cycle, tray, bridge) | `tests/test_rung_privilege.py::test_a_non_root_daemon_has_no_reboot_rung`, `::test_a_host_without_systemd_has_no_reboot_rung`, `::test_an_unreachable_bmc_has_no_power_cycle_rung`, `::test_an_unreachable_bmc_has_no_tray_rung`, `::test_a_non_root_daemon_has_no_bridge_rung` |
 | I17 the inventory reads the tray rung OFF on a committed per-target host, naming the platform; unresolved or Galaxy keeps it | `tests/test_rung_privilege.py::test_a_per_target_host_has_no_tray_rung`, `::test_an_unresolved_platform_keeps_the_tray_rung`, `::test_a_galaxy_keeps_the_tray_rung` |
 | I17 privilege is a second conjunct, never a replacement for the opt-out | `tests/test_rung_privilege.py::test_the_opt_out_still_wins_where_the_privilege_exists` |

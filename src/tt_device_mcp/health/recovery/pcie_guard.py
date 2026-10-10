@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,12 +79,51 @@ class Endpoint:
     bus: int
     root_port: Optional[str]
     chip: Optional[int]  # /dev/tenstorrent/<chip>, None when the driver has no node for it
+    device: Optional[int] = None  # PCI device id (the architecture), None when unreadable
+
+
+# What sysfs showed while the chips were on the bus, kept so an off-bus chip's root port and the
+# host's architecture are still known once its function is gone (spec 04 I19). Persisted in the
+# health dir so a broker that starts with a tray already off the bus knows them too.
+TOPOLOGY_FILE = "tt_pci_topology.json"
+_SEEN: Optional[dict] = None
+
+
+def _seen() -> dict:
+    global _SEEN
+    key = (str(SYS_ROOT), str(health_dir()))
+    if _SEEN is None or _SEEN["key"] != key:
+        _SEEN = {"key": key, "root_ports": set(), "devices": set()}
+        try:
+            rec = json.loads((health_dir() / TOPOLOGY_FILE).read_text())
+            _SEEN["root_ports"].update(p for p in rec.get("root_ports", []) if isinstance(p, str) and _BDF.match(p))
+            _SEEN["devices"].update(d for d in rec.get("devices", []) if isinstance(d, int))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    return _SEEN
+
+
+def _remember(eps: dict) -> None:
+    seen = _seen()
+    ports = {e.root_port for e in eps.values() if e.root_port}
+    devices = {e.device for e in eps.values() if e.device is not None}
+    if ports <= seen["root_ports"] and devices <= seen["devices"]:
+        return
+    seen["root_ports"] |= ports
+    seen["devices"] |= devices
+    try:
+        path = health_dir() / TOPOLOGY_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"root_ports": sorted(seen["root_ports"]), "devices": sorted(seen["devices"])}))
+    except OSError:
+        pass
 
 
 def tt_endpoints() -> dict:
     """``{bdf: Endpoint}`` for every Tenstorrent function the kernel lists. The root port is the
     first PCI function on the device's sysfs path; the chip id comes from the tenstorrent class
-    device that links to it."""
+    device that links to it. Each look is remembered (root ports, architectures) for when the chips
+    are off the bus."""
     chips: dict = {}
     cls = SYS_ROOT / "sys/class/tenstorrent"
     try:
@@ -110,30 +150,38 @@ def tt_endpoints() -> dict:
         bdf = dev.name
         parts = [p for p in Path(os.path.realpath(dev)).parts if _BDF.match(p)]
         root_port = parts[0] if len(parts) > 1 else None
-        out[bdf] = Endpoint(bdf=bdf, bus=int(bdf.split(":")[1], 16), root_port=root_port, chip=chips.get(bdf))
+        try:
+            device: Optional[int] = int((dev / "device").read_text().strip(), 16)
+        except (OSError, ValueError):
+            device = None
+        out[bdf] = Endpoint(
+            bdf=bdf, bus=int(bdf.split(":")[1], 16), root_port=root_port, chip=chips.get(bdf), device=device
+        )
+    _remember(out)
     return out
 
 
 def tt_root_ports(endpoints: Optional[dict] = None) -> list:
-    """Every root port with a Tenstorrent function below it — the ports a reset can flood."""
+    """Every root port with a Tenstorrent function below it now, or below one when an earlier look
+    saw it (an off-bus chip's port is the one its re-power floods) — the ports a reset can flood.
+    A remembered port that is no longer in sysfs is left out."""
     eps = tt_endpoints() if endpoints is None else endpoints
-    return sorted({e.root_port for e in eps.values() if e.root_port})
+    present = {e.root_port for e in eps.values() if e.root_port}
+    remembered = {p for p in _seen()["root_ports"] if (_pci_dir() / p).exists()}
+    return sorted(present | remembered)
 
 
-def tray_bus_groups() -> Optional[dict]:
+def tray_bus_groups(endpoints: Optional[dict] = None) -> Optional[dict]:
     """tt-smi's ``{tray: bus group}`` table for this host's architecture, or None when it cannot be
-    known (tt-smi missing, no Tenstorrent function, or a mix of architectures). Imported, never
-    copied: the numbering is tt-smi's to define."""
+    known (tt-smi missing, an unreadable or mixed architecture, or no Tenstorrent function now or
+    ever seen). With every chip off the bus the architecture an earlier look saw stands. Imported,
+    never copied: the numbering is tt-smi's to define."""
     try:
         from tt_smi.constants import BH_UBB_BUS_IDS, WH_UBB_BUS_IDS
     except Exception:  # noqa: BLE001 - a native extension failing here must not raise into recovery
         return None
-    archs = set()
-    for ep in tt_endpoints():
-        try:
-            archs.add(int((_pci_dir() / ep / "device").read_text().strip(), 16))
-        except (OSError, ValueError):
-            return None
+    eps = tt_endpoints() if endpoints is None else endpoints
+    archs = {e.device for e in eps.values()} if eps else set(_seen()["devices"])
     if archs == {0xB140}:
         return dict(BH_UBB_BUS_IDS)
     if archs == {0x401E}:
@@ -296,6 +344,12 @@ def _note_flood() -> None:
     _FLOOD_UNTIL = time.monotonic() + _env_float("TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC", 1800)
 
 
+def flood_window_open() -> bool:
+    """A flood was seen within ``TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC``: by :func:`aer_flooding`, or
+    by a re-power or reset whose root port kept erroring and stayed masked."""
+    return time.monotonic() < _FLOOD_UNTIL
+
+
 def _aer_total(ports: list) -> int:
     total = 0
     for bdf in ports:
@@ -316,10 +370,11 @@ def _uptime_sec() -> Optional[float]:
 
 def aer_flooding(ports: Optional[list] = None) -> bool:
     """True while the Tenstorrent root ports are flooding AER errors, or within the flood window
-    (``TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC``, default 1800) after one was seen. A flood is
-    ``TT_DEVICE_MCP_AER_FLOOD_THRESHOLD`` (default 50) new errors since the previous look. The first
-    look after a boot inside the window counts from zero, so errors that carried on through a reboot
-    are seen."""
+    (``TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC``, default 1800) after one was seen. A flood is a rate:
+    ``TT_DEVICE_MCP_AER_FLOOD_THRESHOLD`` (default 50) new errors per
+    ``TT_DEVICE_MCP_AER_FLOOD_PERIOD_SEC`` (default 60) since the previous look, so a steady trickle
+    between looks hours apart is not one. The first look after a boot inside the window counts from
+    zero over the uptime, so errors that carried on through a reboot are seen."""
     global _LAST_AER_SAMPLE
     ports = tt_root_ports() if ports is None else ports
     now = time.monotonic()
@@ -328,18 +383,22 @@ def aer_flooding(ports: Optional[list] = None) -> bool:
     if prev is None:
         up = _uptime_sec()
         if up is not None and up < _env_float("TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC", 1800):
-            prev = (now, 0)
+            prev = (now - up, 0)
     _LAST_AER_SAMPLE = (now, total)
-    if prev is not None and total - prev[1] >= _env_float("TT_DEVICE_MCP_AER_FLOOD_THRESHOLD", 50):
-        _note_flood()
-    return now < _FLOOD_UNTIL
+    if prev is not None:
+        period = max(_env_float("TT_DEVICE_MCP_AER_FLOOD_PERIOD_SEC", 60), 1.0)
+        per_period = (total - prev[1]) * period / max(now - prev[0], period)
+        if per_period >= _env_float("TT_DEVICE_MCP_AER_FLOOD_THRESHOLD", 50):
+            _note_flood()
+    return flood_window_open()
 
 
 GATE_OFF, GATE_GUARD, GATE_HOLD = "off", "guard", "hold"
 
 
 def gate_mode() -> str:
-    """``TT_DEVICE_MCP_HOST_RESET_GATE``: ``off`` (default) keeps the old reset behaviour; ``guard``
+    """``TT_DEVICE_MCP_HOST_RESET_GATE``: ``off`` (default) keeps the old reset behaviour, except
+    while a port that kept erroring after a re-power or reset holds the flood window open; ``guard``
     masks AER on every Tenstorrent root port around each automatic mesh reset and refuses one while
     AER errors flood; ``hold`` also refuses one while any chip is off the bus. Set per host. A latched
     host-hang hold (:func:`check_offbus_reset_latch`) reads as ``hold`` whatever the setting."""
@@ -363,13 +422,17 @@ def host_reset_gate(off_bus: int) -> tuple:
     above it holds rather than climbing to a reboot or power cycle."""
     mode = gate_mode()
     if mode == GATE_OFF:
+        if flood_window_open():
+            # Set by a port the envelope had to leave masked: the next reset is the one that, in the
+            # incident, followed a tray re-power into a dead host. Holds whatever the gate's mode.
+            return False, "a root port kept erroring AER after the last re-power or reset (flood window open)"
         return True, ""
     if mode == GATE_HOLD and off_bus > 0:
         latch = offbus_reset_latched()
         if latch is not None:
             return False, (
                 f"{off_bus} chip(s) off the bus and the off-bus reset before boot {latch.get('boot_id', '?')} "
-                f"hung the host; held until an operator runs `{CLEAR_LATCH_CMD}`"
+                f"hung the host; held until an operator runs `{clear_latch_cmd()}`"
             )
         return False, f"{off_bus} chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold"
     if aer_flooding():
@@ -383,6 +446,16 @@ INTENT_FILE = "offbus_reset_intent.json"
 LATCH_FILE = "offbus_reset_hold.json"
 CLEAR_LATCH_CMD = "python -m tt_device_mcp.health.recovery.pcie_guard --clear-hang-latch"
 _INTENT_OPEN = False
+
+
+def clear_latch_cmd() -> str:
+    """The exact clear command for THIS broker: its interpreter and its health dir, as root. Run
+    from another user or venv, the bare module resolves another health dir and clears nothing."""
+    return f"sudo {sys.executable} -m tt_device_mcp.health.recovery.pcie_guard --clear-hang-latch --health-dir {health_dir()}"
+
+
+def _system_health_dir() -> Path:
+    return SYS_ROOT / "var/lib/tt-device-broker/health"
 
 
 def _boot_id() -> str:
@@ -452,20 +525,35 @@ def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
     log(
         f"the {intent.get('kind')} that ran with {intent.get('off_bus')} chip(s) off the bus did not finish "
         f"before the host went down: automatic resets over off-bus chips are HELD until an operator runs "
-        f"`{CLEAR_LATCH_CMD}`"
+        f"`{clear_latch_cmd()}`"
     )
-    health_event("offbus_reset_hold_latched", intent=intent, clear=CLEAR_LATCH_CMD, host_at_risk=True)
+    health_event("offbus_reset_hold_latched", intent=intent, clear=clear_latch_cmd(), host_at_risk=True)
     return rec
 
 
-def clear_offbus_reset_latch() -> bool:
-    """Operator step: lift the host-hang hold. True when one was latched."""
-    path = health_dir() / LATCH_FILE
-    if not path.exists():
-        return False
-    path.unlink()
-    health_event("offbus_reset_hold_cleared")
-    return True
+def latch_dirs(health_dir_arg: Optional[str] = None) -> list:
+    """Where a broker's latch can be: ``--health-dir`` when given, else this process's health dir
+    and the system broker's (``/var/lib/tt-device-broker/health``), which a non-root shell does not
+    resolve to on its own."""
+    if health_dir_arg:
+        return [Path(health_dir_arg)]
+    out = [health_dir()]
+    if _system_health_dir() not in out:
+        out.append(_system_health_dir())
+    return out
+
+
+def clear_offbus_reset_latch(dirs: Optional[list] = None) -> list:
+    """Operator step: lift the host-hang hold in each of ``dirs`` (default :func:`latch_dirs`).
+    Returns the latch files removed. Raises OSError when one exists but cannot be removed (not root)."""
+    cleared = []
+    for d in latch_dirs() if dirs is None else dirs:
+        path = Path(d) / LATCH_FILE
+        if path.exists():
+            path.unlink()
+            cleared.append(path)
+            health_event("offbus_reset_hold_cleared", path=str(path))
+    return cleared
 
 
 def mask_for_mesh_reset(log) -> Optional[AerMask]:
@@ -508,9 +596,13 @@ def plan_tray_repower(bitmap: int, tray_chip_ids: list) -> TrayPlan:
     and the trays' buses disagree (a mis-mapped tray, issue #27): firing then would re-power a
     healthy tray. Chips with no /dev node are off the bus and cannot be checked."""
     trays = [i + 1 for i in range(8) if bitmap >> i & 1]
-    groups = tray_bus_groups()
     eps = tt_endpoints()
+    groups = tray_bus_groups(eps)
     plan = TrayPlan(bitmap=bitmap, trays=trays, functions=[], chips=[], root_ports=tt_root_ports(eps))
+    if not eps:
+        # Every chip is off the bus: no healthy tray can be cut, and there is nothing to cross-check.
+        # Refusing here would leave an all-off mesh with no tray re-power before the power cycle.
+        return plan
     if not groups or any(t not in groups for t in trays):
         plan.mismatch = f"no tt-smi tray table covers trays {trays} on this host"
         return plan
@@ -560,17 +652,19 @@ def safe_tray_repower(
 ) -> TrayPlan:
     """Re-power the trays in ``bitmap`` without letting the host see the fallout:
 
-    1. refuse if the tray map disagrees with sysfs (a wrong tray would be cut);
+    1. refuse if the tray map disagrees with sysfs (a wrong tray would be cut); with every chip off
+       the bus there is no healthy tray to cut and nothing to cross-check, so it goes ahead;
     2. wait up to ``TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC`` (default 10) for every process to
        let go of the tray's chips, else refuse;
-    3. ``quiesce`` the chips (tt-smi's USER_RESET ioctl);
-    4. mask AER and DPC on EVERY Tenstorrent root port, the sibling trays' included;
+    3. mask AER and DPC on EVERY Tenstorrent root port, the sibling trays' and the off-bus chips'
+       included; a port that cannot be masked refuses the fire before any chip is touched;
+    4. ``quiesce`` the chips (tt-smi's USER_RESET ioctl);
     5. remove the tray's PCI functions so nothing in the kernel touches them while unpowered;
     6. ``fire`` the BMC pulse (it also waits out the settle);
     7. rescan the bus, ``reinit`` the chips (POST_RESET ioctl);
     8. restore AER on every port that stayed quiet; one that keeps erroring stays masked.
 
-    Steps 7-8 run even when the pulse raised. ``TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1`` logs the plan
+    Steps 7-8 run even when the quiesce or the pulse raised. ``TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1`` logs the plan
     and raises :class:`TrayRepowerDryRun` before step 2."""
     plan = plan_tray_repower(bitmap, tray_chip_ids)
     log(
@@ -580,8 +674,8 @@ def safe_tray_repower(
     if os.environ.get("TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN", "").strip() == "1":
         steps = [
             "wait for holders",
-            f"quiesce chips {plan.chips}",
             f"mask AER/DPC on {plan.root_ports}",
+            f"quiesce chips {plan.chips}",
             f"remove {plan.functions}",
             f"fire BMC re-power {bitmap:#04x}",
             "rescan",
@@ -604,9 +698,14 @@ def safe_tray_repower(
         why = f"chip(s) still held open after {wait:.0f}s: {holders}"
         health_event("tray_repower_refused", trays=plan.trays, reason=why, holders=holders)
         raise TrayRepowerRefused(why)
-    quiesce(plan.chips)
-    mask = AerMask(plan.root_ports).apply()
     try:
+        mask = AerMask(plan.root_ports).apply()
+    except OSError as exc:
+        why = f"could not mask AER on the Tenstorrent root ports: {exc!r}"
+        health_event("tray_repower_refused", trays=plan.trays, reason=why, host_at_risk=True)
+        raise TrayRepowerRefused(why) from exc
+    try:
+        quiesce(plan.chips)
         for bdf in plan.functions:
             try:
                 _write(_pci_dir() / bdf / "remove", "1")
@@ -637,14 +736,25 @@ def safe_tray_repower(
 def main(argv: Optional[list] = None) -> int:
     """``python -m tt_device_mcp.health.recovery.pcie_guard <bitmap> [chip ...]``: print the plan a
     per-tray re-power would follow. Reads sysfs only; never touches a device."""
-    import sys
-
     args = sys.argv[1:] if argv is None else argv
-    if args == ["--clear-hang-latch"]:
-        print("host-hang hold cleared" if clear_offbus_reset_latch() else "no host-hang hold was latched")
+    if args[:1] == ["--clear-hang-latch"]:
+        rest = args[1:]
+        if rest and (len(rest) != 2 or rest[0] != "--health-dir"):
+            print("usage: pcie_guard --clear-hang-latch [--health-dir DIR]")
+            return 2
+        dirs = latch_dirs(rest[1] if rest else None)
+        try:
+            cleared = clear_offbus_reset_latch(dirs)
+        except OSError as exc:
+            print(f"a host-hang hold is latched but could not be cleared ({exc}); run it as root (sudo)")
+            return 1
+        if cleared:
+            print("host-hang hold cleared: " + ", ".join(str(p) for p in cleared))
+        else:
+            print("no host-hang hold was latched in " + ", ".join(str(d) for d in dirs))
         return 0
     if not args:
-        print("usage: pcie_guard <bitmap> [chip ...] | --clear-hang-latch")
+        print("usage: pcie_guard <bitmap> [chip ...] | --clear-hang-latch [--health-dir DIR]")
         return 2
     plan = plan_tray_repower(int(args[0], 0), [int(a) for a in args[1:]])
     print(f"trays {plan.trays}\nfunctions {plan.functions}\nchips {plan.chips}\nroot ports {plan.root_ports}")
@@ -652,7 +762,7 @@ def main(argv: Optional[list] = None) -> int:
     print(f"gate: {gate_mode()}")
     latch = offbus_reset_latched()
     if latch is not None:
-        print(f"host-hang hold LATCHED: {latch}; clear with `{CLEAR_LATCH_CMD}`")
+        print(f"host-hang hold LATCHED: {latch}; clear with `{clear_latch_cmd()}`")
     return 1 if plan.mismatch else 0
 
 

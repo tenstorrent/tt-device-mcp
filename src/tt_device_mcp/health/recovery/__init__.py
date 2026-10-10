@@ -611,19 +611,20 @@ class Recovery(ABC):
                 "`-r`, which does NOT recover a Galaxy; set TT_DEVICE_MCP_RESET_MODE"
             )
 
-        log(f"resetting device: {' '.join(argv)}  ({expected} device(s); ~30-60s, restart-safe)")
-        health_event("reset_begin", argv=argv, expected_chips=expected)
-        self.mechanism.last_reset_monotonic = time.monotonic()
-
         # The per-host gate (spec 04 I20): on a host whose resets have flooded AER into a crash, an
         # automatic reset never fires over chips already off the bus or during a flood, and the
-        # Tenstorrent root ports are masked for the reset window. Off by default.
+        # Tenstorrent root ports are masked for the reset window. Off by default. Checked before
+        # reset_begin and the cooldown clock: a refused reset did not happen.
         off_bus = pcie_guard.chips_off_bus(expected)
         allowed, why = pcie_guard.host_reset_gate(off_bus)
         if not allowed:
             log(f"automatic reset NOT fired: {why}; holding for an operator")
             health_event("host_reset_gated", argv=argv, reason=why, host_at_risk=True)
             return False
+
+        log(f"resetting device: {' '.join(argv)}  ({expected} device(s); ~30-60s, restart-safe)")
+        health_event("reset_begin", argv=argv, expected_chips=expected)
+        self.mechanism.last_reset_monotonic = time.monotonic()
         pcie_guard.begin_offbus_reset("mesh reset", off_bus)
         aer_mask = pcie_guard.mask_for_mesh_reset(log)
         try:
