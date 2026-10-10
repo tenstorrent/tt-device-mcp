@@ -76,11 +76,11 @@ def test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit(chip, bus, tray, 
 
 def test_the_issue_27_walk_leads_with_the_tray_the_chip_is_on():
     """The reported walk for an off-bus chip 25 (0000:82:00.0) was [3, 1, 2, 4]: tray 3 first, a
-    healthy tray. It must lead with tray 4."""
+    healthy tray. It must be tray 4 alone (spec 04 I25: never a healthy tray)."""
     trays = galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-bh")
 
-    assert galaxy._ubb_tray_walk_plan({"25"}, 32, trays) == [4, 1, 2, 3]
-    assert galaxy._ubb_tray_walk_plan({"24", "30"}, 32, trays) == [4, 1, 2, 3]
+    assert galaxy._ubb_tray_walk_plan({"25"}, 32, trays) == [4]
+    assert galaxy._ubb_tray_walk_plan({"24", "30"}, 32, trays) == [4]
 
 
 def test_a_positional_bus_list_is_refused_not_read_by_position():
@@ -195,11 +195,11 @@ def test_affected_trays_names_the_tray_an_operator_would_read_from_tt_smi(bh_tra
     assert galaxy._affected_trays({"0", "31"}, 32, bh_trays) == [1, 4]
 
 
-def test_the_walk_leads_with_the_affected_tray_then_sweeps_the_rest(bh_trays):
-    """Walk order is affected-first, then the remaining trays ascending — over real tray numbers,
-    which are 1-based, not the 0-based ordinals the index arithmetic produced."""
-    assert galaxy._ubb_tray_walk_plan({"20"}, 32, bh_trays) == [3, 1, 2, 4]
-    assert galaxy._ubb_tray_walk_plan({"0", "31"}, 32, bh_trays) == [1, 4, 2, 3]
+def test_the_walk_covers_only_the_affected_trays(bh_trays):
+    """The walk is the affected trays only, ascending — over real tray numbers, which are 1-based, not
+    the 0-based ordinals the index arithmetic produced (spec 04 I25: never a healthy tray)."""
+    assert galaxy._ubb_tray_walk_plan({"20"}, 32, bh_trays) == [3]
+    assert galaxy._ubb_tray_walk_plan({"0", "31"}, 32, bh_trays) == [1, 4]
 
 
 def test_without_a_map_every_tray_decision_declines(bh_trays):
