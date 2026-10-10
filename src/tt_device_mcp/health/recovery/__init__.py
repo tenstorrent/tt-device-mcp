@@ -28,6 +28,7 @@ from typing import Awaitable, Callable, Optional
 from tt_device_mcp import constants, metrics
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.evidence import health_event
+from tt_device_mcp.health.recovery import pcie_guard
 from tt_device_mcp.health.recovery.base import RESET_COOLDOWN_SEC, RecoveryMechanism
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
     bridge_reset_enabled,
@@ -593,7 +594,20 @@ class Recovery(ABC):
         health_event("reset_begin", argv=argv, expected_chips=expected)
         self.mechanism.last_reset_monotonic = time.monotonic()
 
-        rc, out = await self.mechanism.reset_with_quiesce(argv, log)
+        # The per-host gate (spec 04 I20): on a host whose resets have flooded AER into a crash, an
+        # automatic reset never fires over chips already off the bus or during a flood, and the
+        # Tenstorrent root ports are masked for the reset window. Off by default.
+        allowed, why = pcie_guard.host_reset_gate(pcie_guard.chips_off_bus(expected))
+        if not allowed:
+            log(f"automatic reset NOT fired: {why}; holding for an operator")
+            health_event("host_reset_gated", argv=argv, reason=why, host_at_risk=True)
+            return False
+        aer_mask = pcie_guard.mask_for_mesh_reset(log)
+        try:
+            rc, out = await self.mechanism.reset_with_quiesce(argv, log)
+        finally:
+            if aer_mask is not None:
+                await asyncio.to_thread(aer_mask.restore)
         if _journal_cpld_too_old(argv, out, log):
             # Latched on the mechanism both platforms share, so the NEXT rung and every later pass
             # resolve to the galaxy ladder rather than repeating the `-r` tt-smi just disowned.

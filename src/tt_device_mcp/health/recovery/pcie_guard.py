@@ -1,0 +1,550 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Keep a host alive across the resets that re-power Tenstorrent silicon.
+
+A per-tray BMC re-power or a mesh-wide reset takes chips off the bus. Each root port above them then
+reports Surprise Down, completion timeouts and Advisory Non-Fatal errors. On a 6U Galaxy that error
+stream has turned into an AER interrupt flood, on the re-powered tray's ports and on a SIBLING tray's
+port, followed by NMI/RCU stalls and a dead host. This module holds the pieces that keep a reset from
+getting there:
+
+* :func:`tt_endpoints` — every Tenstorrent PCI function, its bus, its root port and its /dev id, read
+  from sysfs (never from list position, issue #27).
+* :class:`AerMask` — mask AER and DPC on root ports for the reset window, then clear their status,
+  watch them for a moment and restore only the quiet ones. A port that keeps erroring stays masked
+  and is reported, so a flood cannot take the host down.
+* :func:`host_reset_gate` — the per-host switch (``TT_DEVICE_MCP_HOST_RESET_GATE``) that refuses an
+  automatic reset while chips are off the bus or AER errors are flooding.
+* :func:`safe_tray_repower` — the full envelope around one per-tray BMC re-power, with a dry run.
+
+Everything reads and writes through :data:`SYS_ROOT` so tests run against a fake tree.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+from tt_device_mcp.health.evidence import health_event
+
+SYS_ROOT = Path("/")
+TT_VENDOR = 0x1E52
+_BDF = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+
+# Config-space layout (PCIe base spec). Only what the mask touches.
+_CAP_PTR = 0x34
+_CAP_ID_PCIE = 0x10
+_PCIE_DEVCTL = 0x08  # Device Control: bits 0-3 enable correctable/non-fatal/fatal/UR reporting
+_PCIE_DEVSTA = 0x0A  # Device Status: bits 0-3 are RW1C error-detected flags
+_EXT_CAP_AER = 0x0001
+_EXT_CAP_DPC = 0x001D
+_AER_UE_STATUS = 0x04
+_AER_UE_MASK = 0x08
+_AER_CE_STATUS = 0x10
+_AER_CE_MASK = 0x14
+_AER_ROOT_CMD = 0x2C  # Root Error Command: bits 0-2 raise the AER interrupt
+_AER_ROOT_STATUS = 0x30
+_DPC_CTL = 0x06  # DPC Control: bits 0-1 trigger enable, bit 3 interrupt enable
+# Every defined uncorrectable (bits 4-5, 12-26) and correctable (0, 6-8, 12-15) error bit.
+_UE_ALL = 0x07FFF030
+_CE_ALL = 0xF1C1
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _pci_dir() -> Path:
+    return SYS_ROOT / "sys/bus/pci/devices"
+
+
+# ---- topology ---------------------------------------------------------------------------------------
+
+
+@dataclass
+class Endpoint:
+    bdf: str
+    bus: int
+    root_port: Optional[str]
+    chip: Optional[int]  # /dev/tenstorrent/<chip>, None when the driver has no node for it
+
+
+def tt_endpoints() -> dict:
+    """``{bdf: Endpoint}`` for every Tenstorrent function the kernel lists. The root port is the
+    first PCI function on the device's sysfs path; the chip id comes from the tenstorrent class
+    device that links to it."""
+    chips: dict = {}
+    cls = SYS_ROOT / "sys/class/tenstorrent"
+    try:
+        for entry in cls.iterdir():
+            m = re.search(r"(\d+)$", entry.name)
+            if m:
+                try:
+                    chips[os.path.basename(os.path.realpath(entry / "device"))] = int(m.group(1))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    out: dict = {}
+    try:
+        entries = sorted(_pci_dir().iterdir())
+    except OSError:
+        return out
+    for dev in entries:
+        try:
+            if int((dev / "vendor").read_text().strip(), 16) != TT_VENDOR:
+                continue
+        except (OSError, ValueError):
+            continue
+        bdf = dev.name
+        parts = [p for p in Path(os.path.realpath(dev)).parts if _BDF.match(p)]
+        root_port = parts[0] if len(parts) > 1 else None
+        out[bdf] = Endpoint(bdf=bdf, bus=int(bdf.split(":")[1], 16), root_port=root_port, chip=chips.get(bdf))
+    return out
+
+
+def tt_root_ports(endpoints: Optional[dict] = None) -> list:
+    """Every root port with a Tenstorrent function below it — the ports a reset can flood."""
+    eps = tt_endpoints() if endpoints is None else endpoints
+    return sorted({e.root_port for e in eps.values() if e.root_port})
+
+
+def tray_bus_groups() -> Optional[dict]:
+    """tt-smi's ``{tray: bus group}`` table for this host's architecture, or None when it cannot be
+    known (tt-smi missing, no Tenstorrent function, or a mix of architectures). Imported, never
+    copied: the numbering is tt-smi's to define."""
+    try:
+        from tt_smi.constants import BH_UBB_BUS_IDS, WH_UBB_BUS_IDS
+    except Exception:  # noqa: BLE001 - a native extension failing here must not raise into recovery
+        return None
+    archs = set()
+    for ep in tt_endpoints():
+        try:
+            archs.add(int((_pci_dir() / ep / "device").read_text().strip(), 16))
+        except (OSError, ValueError):
+            return None
+    if archs == {0xB140}:
+        return dict(BH_UBB_BUS_IDS)
+    if archs == {0x401E}:
+        return dict(WH_UBB_BUS_IDS)
+    return None
+
+
+# ---- config space -----------------------------------------------------------------------------------
+
+
+class _Config:
+    """Read and write one function's config space through sysfs (root reads all 4 KiB)."""
+
+    def __init__(self, bdf: str):
+        self.bdf = bdf
+        self.path = _pci_dir() / bdf / "config"
+
+    def read(self, off: int, size: int) -> int:
+        with open(self.path, "rb") as f:
+            f.seek(off)
+            data = f.read(size)
+        if len(data) != size:
+            raise OSError(f"{self.bdf}: config read at {off:#x} returned {len(data)} bytes")
+        return int.from_bytes(data, "little")
+
+    def write(self, off: int, size: int, value: int) -> None:
+        with open(self.path, "r+b", buffering=0) as f:
+            f.seek(off)
+            f.write(value.to_bytes(size, "little"))
+
+    def cap(self, cap_id: int) -> Optional[int]:
+        if not self.read(0x06, 2) & 0x10:
+            return None
+        ptr, seen = self.read(_CAP_PTR, 1) & 0xFC, 0
+        while ptr and seen < 48:
+            if self.read(ptr, 1) == cap_id:
+                return ptr
+            ptr, seen = self.read(ptr + 1, 1) & 0xFC, seen + 1
+        return None
+
+    def ext_cap(self, cap_id: int) -> Optional[int]:
+        ptr, seen = 0x100, 0
+        while ptr and seen < 64:
+            hdr = self.read(ptr, 4)
+            if hdr in (0, 0xFFFFFFFF):
+                return None
+            if hdr & 0xFFFF == cap_id:
+                return ptr
+            ptr, seen = (hdr >> 20) & 0xFFC, seen + 1
+        return None
+
+
+@dataclass
+class _PortSave:
+    pcie: Optional[int] = None
+    aer: Optional[int] = None
+    dpc: Optional[int] = None
+    devctl: int = 0
+    ue_mask: int = 0
+    ce_mask: int = 0
+    root_cmd: int = 0
+    dpc_ctl: int = 0
+
+
+def _error_status(cfg: _Config, save: _PortSave) -> int:
+    """The port's sticky error flags, or 0 when it has no AER: what a quiet port leaves clear."""
+    if save.aer is None:
+        return 0
+    return cfg.read(save.aer + _AER_UE_STATUS, 4) | cfg.read(save.aer + _AER_CE_STATUS, 4)
+
+
+def _clear_error_status(cfg: _Config, save: _PortSave) -> None:
+    if save.aer is not None:
+        for off in (_AER_UE_STATUS, _AER_CE_STATUS, _AER_ROOT_STATUS):
+            cfg.write(save.aer + off, 4, cfg.read(save.aer + off, 4))
+    if save.pcie is not None:
+        cfg.write(save.pcie + _PCIE_DEVSTA, 2, cfg.read(save.pcie + _PCIE_DEVSTA, 2) & 0xF)
+
+
+@dataclass
+class AerMask:
+    """AER and DPC masked on ``ports`` until :meth:`restore`. ``kept_masked`` names the ports that
+    were still erroring at restore time; they stay masked so their flood cannot reach the CPU."""
+
+    ports: list
+    saved: dict = field(default_factory=dict)
+    kept_masked: list = field(default_factory=list)
+
+    def apply(self) -> "AerMask":
+        """Save and mask every port. Raises OSError if any port cannot be masked, after putting
+        back the ones already masked: a half-masked host is not one a reset may run on."""
+        try:
+            for bdf in self.ports:
+                cfg = _Config(bdf)
+                s = _PortSave(pcie=cfg.cap(_CAP_ID_PCIE), aer=cfg.ext_cap(_EXT_CAP_AER), dpc=cfg.ext_cap(_EXT_CAP_DPC))
+                if s.pcie is not None:
+                    s.devctl = cfg.read(s.pcie + _PCIE_DEVCTL, 2)
+                if s.aer is not None:
+                    s.ue_mask = cfg.read(s.aer + _AER_UE_MASK, 4)
+                    s.ce_mask = cfg.read(s.aer + _AER_CE_MASK, 4)
+                    s.root_cmd = cfg.read(s.aer + _AER_ROOT_CMD, 4)
+                if s.dpc is not None:
+                    s.dpc_ctl = cfg.read(s.dpc + _DPC_CTL, 2)
+                self.saved[bdf] = s
+                if s.aer is not None:
+                    cfg.write(s.aer + _AER_ROOT_CMD, 4, s.root_cmd & ~0x7)
+                    cfg.write(s.aer + _AER_UE_MASK, 4, s.ue_mask | _UE_ALL)
+                    cfg.write(s.aer + _AER_CE_MASK, 4, s.ce_mask | _CE_ALL)
+                if s.pcie is not None:
+                    cfg.write(s.pcie + _PCIE_DEVCTL, 2, s.devctl & ~0xF)
+                if s.dpc is not None:
+                    cfg.write(s.dpc + _DPC_CTL, 2, s.dpc_ctl & ~0xB)
+        except OSError:
+            self.restore(quiet_sec=0)
+            raise
+        return self
+
+    def restore(self, quiet_sec: Optional[float] = None, sleep: Callable[[float], None] = time.sleep) -> list:
+        """Clear each port's error flags, wait ``quiet_sec`` and restore the ports that stayed quiet.
+        Returns (and records in ``kept_masked``) the ports that errored again."""
+        quiet = _env_float("TT_DEVICE_MCP_AER_QUIET_CHECK_SEC", 2.0) if quiet_sec is None else quiet_sec
+        for bdf, s in self.saved.items():
+            try:
+                _clear_error_status(_Config(bdf), s)
+            except OSError:
+                pass
+        if quiet > 0 and self.saved:
+            sleep(quiet)
+        for bdf, s in list(self.saved.items()):
+            cfg = _Config(bdf)
+            try:
+                if quiet > 0 and _error_status(cfg, s):
+                    self.kept_masked.append(bdf)
+                    continue
+                if s.dpc is not None:
+                    cfg.write(s.dpc + _DPC_CTL, 2, s.dpc_ctl)
+                if s.pcie is not None:
+                    cfg.write(s.pcie + _PCIE_DEVCTL, 2, s.devctl)
+                if s.aer is not None:
+                    cfg.write(s.aer + _AER_CE_MASK, 4, s.ce_mask)
+                    cfg.write(s.aer + _AER_UE_MASK, 4, s.ue_mask)
+                    cfg.write(s.aer + _AER_ROOT_CMD, 4, s.root_cmd)
+            except OSError:
+                self.kept_masked.append(bdf)
+        self.saved.clear()
+        if self.kept_masked:
+            _note_flood()
+            health_event("aer_ports_kept_masked", ports=self.kept_masked, host_at_risk=True)
+        return self.kept_masked
+
+
+# ---- the per-host gate ------------------------------------------------------------------------------
+
+_FLOOD_UNTIL = 0.0
+_LAST_AER_SAMPLE: Optional[tuple] = None
+
+
+def _note_flood() -> None:
+    global _FLOOD_UNTIL
+    _FLOOD_UNTIL = time.monotonic() + _env_float("TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC", 1800)
+
+
+def _aer_total(ports: list) -> int:
+    total = 0
+    for bdf in ports:
+        for name in ("aer_rootport_total_err_cor", "aer_rootport_total_err_nonfatal", "aer_rootport_total_err_fatal"):
+            try:
+                total += int((_pci_dir() / bdf / name).read_text().split()[0])
+            except (OSError, ValueError, IndexError):
+                continue
+    return total
+
+
+def _uptime_sec() -> Optional[float]:
+    try:
+        return float((SYS_ROOT / "proc/uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def aer_flooding(ports: Optional[list] = None) -> bool:
+    """True while the Tenstorrent root ports are flooding AER errors, or within the flood window
+    (``TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC``, default 1800) after one was seen. A flood is
+    ``TT_DEVICE_MCP_AER_FLOOD_THRESHOLD`` (default 50) new errors since the previous look. The first
+    look after a boot inside the window counts from zero, so errors that carried on through a reboot
+    are seen."""
+    global _LAST_AER_SAMPLE
+    ports = tt_root_ports() if ports is None else ports
+    now = time.monotonic()
+    total = _aer_total(ports)
+    prev = _LAST_AER_SAMPLE
+    if prev is None:
+        up = _uptime_sec()
+        if up is not None and up < _env_float("TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC", 1800):
+            prev = (now, 0)
+    _LAST_AER_SAMPLE = (now, total)
+    if prev is not None and total - prev[1] >= _env_float("TT_DEVICE_MCP_AER_FLOOD_THRESHOLD", 50):
+        _note_flood()
+    return now < _FLOOD_UNTIL
+
+
+GATE_OFF, GATE_GUARD, GATE_HOLD = "off", "guard", "hold"
+
+
+def gate_mode() -> str:
+    """``TT_DEVICE_MCP_HOST_RESET_GATE``: ``off`` (default) keeps the old reset behaviour; ``guard``
+    masks AER on every Tenstorrent root port around each automatic mesh reset and refuses one while
+    AER errors flood; ``hold`` also refuses one while any chip is off the bus. Set per host."""
+    mode = os.environ.get("TT_DEVICE_MCP_HOST_RESET_GATE", GATE_OFF).strip().lower()
+    return mode if mode in (GATE_GUARD, GATE_HOLD) else GATE_OFF
+
+
+def chips_off_bus(expected: int) -> int:
+    """How many of ``expected`` chips have no PCI function in sysfs right now; 0 when sysfs cannot
+    be read (the gate then decides on the AER evidence alone)."""
+    if not _pci_dir().is_dir():
+        return 0
+    return max(0, expected - len(tt_endpoints()))
+
+
+def host_reset_gate(off_bus: int) -> tuple:
+    """``(allowed, why)`` for an automatic host-affecting reset (mesh reset, per-tray re-power) with
+    ``off_bus`` chips already off the bus. A refused reset is a rung that did not fire, so the ladder
+    above it holds rather than climbing to a reboot or power cycle."""
+    mode = gate_mode()
+    if mode == GATE_OFF:
+        return True, ""
+    if mode == GATE_HOLD and off_bus > 0:
+        return False, f"{off_bus} chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold"
+    if aer_flooding():
+        return False, f"AER errors are flooding the Tenstorrent root ports (TT_DEVICE_MCP_HOST_RESET_GATE={mode})"
+    return True, ""
+
+
+def mask_for_mesh_reset(log) -> Optional[AerMask]:
+    """Mask every Tenstorrent root port before a mesh reset when the gate is on, else None. A port
+    that cannot be masked is logged and the reset goes ahead unmasked, as before the gate."""
+    if gate_mode() == GATE_OFF:
+        return None
+    try:
+        return AerMask(tt_root_ports()).apply()
+    except OSError as exc:
+        log(f"could not mask AER on the Tenstorrent root ports before the reset: {exc!r}")
+        health_event("aer_mask_failed", error=repr(exc), host_at_risk=True)
+        return None
+
+
+# ---- the per-tray re-power envelope -----------------------------------------------------------------
+
+
+class TrayRepowerRefused(RuntimeError):
+    """The envelope refused to cut tray power; nothing was re-powered."""
+
+
+class TrayRepowerDryRun(TrayRepowerRefused):
+    """``TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1``: the plan was logged, nothing was touched."""
+
+
+@dataclass
+class TrayPlan:
+    bitmap: int
+    trays: list
+    functions: list  # Tenstorrent functions on the re-powered trays, removed before the pulse
+    chips: list  # their /dev ids
+    root_ports: list  # every Tenstorrent root port, masked for the window (siblings too)
+    mismatch: str = ""
+    kept_masked: list = field(default_factory=list)  # ports still erroring after the re-power
+
+
+def plan_tray_repower(bitmap: int, tray_chip_ids: list) -> TrayPlan:
+    """What re-powering ``bitmap`` touches, from sysfs. ``mismatch`` is set when the caller's chip ids
+    and the trays' buses disagree (a mis-mapped tray, issue #27): firing then would re-power a
+    healthy tray. Chips with no /dev node are off the bus and cannot be checked."""
+    trays = [i + 1 for i in range(8) if bitmap >> i & 1]
+    groups = tray_bus_groups()
+    eps = tt_endpoints()
+    plan = TrayPlan(bitmap=bitmap, trays=trays, functions=[], chips=[], root_ports=tt_root_ports(eps))
+    if not groups or any(t not in groups for t in trays):
+        plan.mismatch = f"no tt-smi tray table covers trays {trays} on this host"
+        return plan
+    wanted = {groups[t] for t in trays}
+    on_trays = [e for e in eps.values() if e.bus & 0xF0 in wanted]
+    plan.functions = sorted(e.bdf for e in on_trays)
+    plan.chips = sorted(e.chip for e in on_trays if e.chip is not None)
+    given = {int(c) for c in tray_chip_ids}
+    elsewhere = sorted(e.chip for e in eps.values() if e.chip in given and e.bus & 0xF0 not in wanted)
+    missing = sorted(set(plan.chips) - given)
+    if elsewhere or missing:
+        plan.mismatch = (
+            f"tray map disagrees with sysfs for trays {trays}: chip(s) {elsewhere} sit on other trays, "
+            f"chip(s) {missing} on these trays were not named"
+        )
+    return plan
+
+
+def _tray_holders(chips: list) -> dict:
+    """``{chip: [pid, ...]}`` for the tray's chips that a process still holds open (tt-kmd's own
+    record). A chip the driver does not publish has no entry."""
+    out = {}
+    for c in chips:
+        try:
+            pids = [int(p) for p in (SYS_ROOT / f"proc/driver/tenstorrent/{c}/pids").read_text().split()]
+        except (OSError, ValueError):
+            continue
+        pids = [p for p in pids if p != os.getpid()]
+        if pids:
+            out[c] = pids
+    return out
+
+
+def _write(path: Path, text: str) -> None:
+    path.write_text(text)
+
+
+def safe_tray_repower(
+    bitmap: int,
+    tray_chip_ids: list,
+    fire: Callable[[], None],
+    log: Callable[[str], None],
+    *,
+    quiesce: Callable[[list], None] = lambda chips: None,
+    reinit: Callable[[list], None] = lambda chips: None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> TrayPlan:
+    """Re-power the trays in ``bitmap`` without letting the host see the fallout:
+
+    1. refuse if the tray map disagrees with sysfs (a wrong tray would be cut);
+    2. wait up to ``TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC`` (default 10) for every process to
+       let go of the tray's chips, else refuse;
+    3. ``quiesce`` the chips (tt-smi's USER_RESET ioctl);
+    4. mask AER and DPC on EVERY Tenstorrent root port, the sibling trays' included;
+    5. remove the tray's PCI functions so nothing in the kernel touches them while unpowered;
+    6. ``fire`` the BMC pulse (it also waits out the settle);
+    7. rescan the bus, ``reinit`` the chips (POST_RESET ioctl);
+    8. restore AER on every port that stayed quiet; one that keeps erroring stays masked.
+
+    Steps 7-8 run even when the pulse raised. ``TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1`` logs the plan
+    and raises :class:`TrayRepowerDryRun` before step 2."""
+    plan = plan_tray_repower(bitmap, tray_chip_ids)
+    log(
+        f"tray re-power plan: trays {plan.trays} (bitmap {bitmap:#04x}); functions {plan.functions}; "
+        f"chips {plan.chips}; AER/DPC masked on {plan.root_ports}"
+    )
+    if os.environ.get("TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN", "").strip() == "1":
+        steps = [
+            "wait for holders",
+            f"quiesce chips {plan.chips}",
+            f"mask AER/DPC on {plan.root_ports}",
+            f"remove {plan.functions}",
+            f"fire BMC re-power {bitmap:#04x}",
+            "rescan",
+            f"re-init chips {plan.chips}",
+            "restore AER on quiet ports",
+        ]
+        log("tray re-power DRY RUN, nothing touched: " + " -> ".join(steps))
+        health_event("tray_repower_dry_run", trays=plan.trays, functions=plan.functions, mismatch=plan.mismatch)
+        raise TrayRepowerDryRun(plan.mismatch or "dry run")
+    if plan.mismatch:
+        health_event("tray_repower_refused", trays=plan.trays, reason=plan.mismatch, host_at_risk=True)
+        raise TrayRepowerRefused(plan.mismatch)
+    wait = _env_float("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", 10)
+    deadline = time.monotonic() + wait
+    holders = _tray_holders(plan.chips)
+    while holders and time.monotonic() < deadline:
+        sleep(0.5)
+        holders = _tray_holders(plan.chips)
+    if holders:
+        why = f"chip(s) still held open after {wait:.0f}s: {holders}"
+        health_event("tray_repower_refused", trays=plan.trays, reason=why, holders=holders)
+        raise TrayRepowerRefused(why)
+    quiesce(plan.chips)
+    mask = AerMask(plan.root_ports).apply()
+    try:
+        for bdf in plan.functions:
+            try:
+                _write(_pci_dir() / bdf / "remove", "1")
+            except OSError as exc:
+                log(f"could not remove {bdf} before the re-power: {exc!r}")
+        fire()
+    finally:
+        try:
+            _write(SYS_ROOT / "sys/bus/pci/rescan", "1")
+            sleep(3)
+        except OSError as exc:
+            log(f"PCI rescan after the re-power failed: {exc!r}")
+        try:
+            reinit(plan.chips)
+        finally:
+            kept = plan.kept_masked = mask.restore(sleep=sleep)
+            back = sorted(b for b in plan.functions if (_pci_dir() / b).exists())
+            log(
+                f"tray re-power done: {len(back)}/{len(plan.functions)} function(s) back"
+                + (f"; AER kept masked on erroring port(s) {kept}" if kept else "; AER restored")
+            )
+            health_event(
+                "tray_repower_envelope", trays=plan.trays, back=len(back), of=len(plan.functions), kept_masked=kept
+            )
+    return plan
+
+
+def main(argv: Optional[list] = None) -> int:
+    """``python -m tt_device_mcp.health.recovery.pcie_guard <bitmap> [chip ...]``: print the plan a
+    per-tray re-power would follow. Reads sysfs only; never touches a device."""
+    import sys
+
+    args = sys.argv[1:] if argv is None else argv
+    if not args:
+        print("usage: pcie_guard <bitmap> [chip ...]")
+        return 2
+    plan = plan_tray_repower(int(args[0], 0), [int(a) for a in args[1:]])
+    print(f"trays {plan.trays}\nfunctions {plan.functions}\nchips {plan.chips}\nroot ports {plan.root_ports}")
+    print(f"mismatch: {plan.mismatch or 'none'}")
+    print(f"gate: {gate_mode()}")
+    return 1 if plan.mismatch else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
