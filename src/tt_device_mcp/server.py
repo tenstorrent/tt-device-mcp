@@ -100,6 +100,7 @@ from tt_device_mcp.health import (
     _galaxy_reset_min_dead_chips,
     _offbus_hold_ceiling_sec,
     _reboot_min_dead_chips,
+    _run_pre_power_cycle_hook,
     _stuck_hold_ceiling_sec,
     _ubb_reset_enabled,
     aer_totals,
@@ -3232,6 +3233,7 @@ async def _auto_power_cycle_host(log, reason: str) -> None:
         fire=_fire_power_cycle,
         log=log,
         reason=reason,
+        pre_fire=_run_pre_power_cycle_hook,
     )
 
 

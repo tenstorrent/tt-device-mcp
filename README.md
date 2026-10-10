@@ -122,6 +122,22 @@ Start with [00-overview](specs/00-overview.md).
 Environment variables set paths, timeouts, and health thresholds. The full index
 is in [06-state-paths](specs/06-state-paths.md).
 
+If other workloads share the host, an automatic power cycle cuts them too. Set
+`TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` to a command that drains them; the broker
+runs it just before it power-cycles the host and waits for it to exit, up to
+`TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC` (default 300 s). The command is
+split like shell words and run without a shell; the reason for the cycle is in
+`TT_DEVICE_MCP_POWER_CYCLE_REASON`. Its exit code and output go to the log. The
+cycle goes ahead whatever the hook does, so a failing or hung hook never blocks
+recovery. The full reset ladder still runs first. For example, in a systemd
+drop-in for the broker:
+
+```
+[Service]
+Environment="TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK=/usr/local/bin/drain-jobs --reason power-cycle"
+Environment=TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC=300
+```
+
 ## Slurm
 
 The health gate is also reachable from outside the queue, as two root-only REST

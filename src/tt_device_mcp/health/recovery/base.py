@@ -792,7 +792,7 @@ class RecoveryMechanism:
                 return
 
     async def _fire_recovery_escalation(
-        self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: str
+        self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: str, pre_fire=None
     ) -> None:
         """Shared body of the two host-level recovery rungs (reboot, BMC power cycle). Records the
         escalation durably — the rate limiter — and leaves a visible jobs-list row BEFORE the action
@@ -806,7 +806,12 @@ class RecoveryMechanism:
         ``health.recovery.stages.host_reboot``/``power_cycle``): "blocked" when the ledger write
         itself fails (nothing fired), "failed" when ``fire`` raised (attempted, did not launch),
         "ok" when it returned normally (the action was issued — a SUCCESSFUL reboot/power-cycle
-        takes the box down from inside ``fire`` and never reaches here at all)."""
+        takes the box down from inside ``fire`` and never reaches here at all).
+
+        ``pre_fire(log, reason)``, when given, runs after the record and row and just before
+        ``fire`` (spec 04 I22): a bounded, blocking call that never raises and whose outcome never
+        stops the fire. Running it after the record means it only runs for an action that is
+        really about to happen, never for one the ledger then aborts."""
         ev = action.replace("-", "_")
         stage = _ACTION_TO_STAGE[action]
         if not self.record_auto_recovery(action, reason):
@@ -820,6 +825,26 @@ class RecoveryMechanism:
         self._write_action_log(row_owner, f"{label} — {reason}", 0.0, action, None)
         health_event(f"auto_{ev}_request", reason=reason)
         log(f"{label.upper()}: {detail} ({reason}); opted in + within limits — requesting it now")
+        if pre_fire is not None:
+            try:
+                hook = await asyncio.to_thread(pre_fire, log, reason)
+            except asyncio.CancelledError:
+                # Stopped while waiting on the hook (broker shutdown): the action never fired, so
+                # its ledger entry must not spend the retry the still-wedged box needs.
+                self.retract_last_auto_recovery(action)
+                raise
+            except Exception as exc:  # noqa: BLE001 - the hook never gates recovery
+                hook = {"ran": False, "detail": f"failed: {exc!r}"}
+                log(f"{label.upper()}: pre-{action} hook failed ({exc!r}); going ahead")
+            if hook and (hook.get("ran") or hook.get("detail")):
+                health_event(
+                    f"pre_{ev}_hook",
+                    reason=reason,
+                    rc=hook.get("rc"),
+                    timed_out=hook.get("timed_out", False),
+                    seconds=hook.get("seconds"),
+                    detail=str(hook.get("detail", ""))[-500:],
+                )
         try:
             await asyncio.to_thread(fire)
         except Exception as exc:  # noqa: BLE001 - a fire that did not launch must not leave a poisoned limiter

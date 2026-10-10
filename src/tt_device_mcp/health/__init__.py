@@ -119,6 +119,7 @@ from tt_device_mcp.health.recovery.stages.bridge_reset import (
 # the BMC (see the stage's own docstring); server.py's host-escalation ladder passes it straight
 # through as the `fire` callback, so it needs the name itself, not a wrapper around it.
 from tt_device_mcp.health.recovery.stages.power_cycle import _fire_power_cycle
+from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook as _run_pre_power_cycle_hook
 
 __all__ = [
     # construction pieces ServerFsm.boot assembles into the process singletons
@@ -190,4 +191,5 @@ __all__ = [
     "bridge_reset_unavailable_reason",
     "gone_chip_bridge_reset_enabled",
     "_fire_power_cycle",
+    "_run_pre_power_cycle_hook",
 ]
