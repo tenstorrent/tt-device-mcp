@@ -348,6 +348,20 @@ each rung fires only when the gentler one failed or cannot apply.
   no caller (the gate, the ladder, a tool) can reset over one. A reset cannot free such a
   process and only hits the chips under it. The fence lifts once the holder is gone.
 
+- **I22 — The pre-power-cycle hook is opt-in, bounded, and never gates the cycle.** With
+  `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` set, `_fire_recovery_escalation` runs that command (argv
+  split like shell words, no shell, its own session, the cycle's reason in
+  `TT_DEVICE_MCP_POWER_CYCLE_REASON`) after the ledger record and jobs-list row and just before the
+  BMC power cycle, and waits for it — so other workloads on the host can be drained first. The wait
+  is bounded by `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC` (default 300 s; a non-positive or
+  malformed value reads as the default, anything above 3600 s is capped); past it the hook's process
+  group is killed. A hook that is unset, unparseable, not startable, exits non-zero or times out is
+  logged (`pre_power_cycle_hook` health event: rc, timed_out, seconds, output tail) and the cycle
+  fires anyway. A cycle the ledger aborts never runs the hook; a broker stopped while waiting on
+  it retracts the ledger entry (nothing fired). The hook changes nothing about which rung fires or
+  when: the full ladder below the power cycle still runs first (I11), and the warm reboot does not
+  run it. Unset, nothing runs and the timeline is unchanged.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -707,6 +721,7 @@ sees a silent fabric pass.
 | I21 every reset is refused over a reaped job's leftover, forced or not, through `reset_with_quiesce` too; it lifts once the holder is gone | `tests/test_reaped_leftover.py::test_the_reset_tool_is_refused_even_with_force`, `tests/test_reaped_leftover.py::test_the_streaming_reset_is_refused_even_with_force`, `tests/test_reaped_leftover.py::test_reset_with_quiesce_is_refused_through_the_fence`, `tests/test_reaped_leftover.py::test_the_broker_wires_the_fence_into_the_recovery_mechanism` |
 | I14 warm reboot never fired where futile; blocked climbs are loud | `tests/test_device_safety.py::test_host_escalation_for_drop_sends_all_off_bus_to_the_cold_rung`, `tests/test_device_safety.py::test_host_escalation_for_drop_routes_a_futile_reboot_to_the_cold_rung`, `tests/test_device_safety.py::test_gate_all_off_bus_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_reset_regression_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_all_off_bus_power_cycles_when_opted_in` |
 | Cold rung fireable-or-off (ipmitool) | `tests/test_device_safety.py::test_a_host_without_ipmitool_serves_with_the_cold_rung_off`, `tests/test_device_safety.py::test_ipmitool_present_leaves_the_cold_rung_armed` |
+| I22 pre-power-cycle hook: opt-in, runs between record and fire, bounded, never gates the cycle | `tests/test_pre_power_cycle_hook.py::test_unset_hook_runs_nothing_and_the_cycle_is_unchanged`, `tests/test_pre_power_cycle_hook.py::test_the_hook_runs_after_the_record_and_before_the_fire`, `tests/test_pre_power_cycle_hook.py::test_a_failing_hook_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_a_hook_that_cannot_run_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_a_hung_hook_is_killed_with_its_children_and_the_cycle_goes_ahead`, `tests/test_pre_power_cycle_hook.py::test_a_background_child_holding_output_does_not_stretch_the_wait`, `tests/test_pre_power_cycle_hook.py::test_the_hook_never_runs_when_the_ledger_aborts_the_cycle`, `tests/test_pre_power_cycle_hook.py::test_a_hook_that_raises_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_cancelled_while_waiting_on_the_hook_retracts_the_ledger_entry`, `tests/test_pre_power_cycle_hook.py::test_the_warm_reboot_does_not_run_the_power_cycle_hook`, `tests/test_pre_power_cycle_hook.py::test_the_timeout_is_always_finite_and_positive` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |
