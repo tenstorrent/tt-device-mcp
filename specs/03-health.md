@@ -870,7 +870,16 @@ refuses.
   wedged ethernet link: nothing available at `boot_merge` time is proof the mesh is fit, so a
   restart closes the door and only the forced startup gate — the one caller of the fabric pass on
   broker start — opens it. `/health` reports `fsm_state: recovering, fsm_why: startup_unverified`
-  until then, by contract.
+  until then, by contract. In the health journal the fresh hold is a `startup_fabric_hold` row,
+  closed by exactly one `startup_fabric_released` row (`prior_why`, `detail`, `held_s`) on
+  whichever path next reaches HEALTHY — normally the startup gate itself, with
+  `prior_why: startup_unverified`; another value means the hold turned into that fault before it
+  lifted. This pair is separate from `device_held`/`device_released`, which is written only once a
+  tenant is refused. The release hook is in memory, so a restart settles the pair from the journal:
+  a hold still open whose episode `boot_merge` carried over gets its release re-armed and no second
+  hold row (whatever fault it has turned into); a hold still open under a fresh episode is closed
+  first (`prior_why: closed on broker start`), then the fresh hold is written. A carried-over
+  fault episode with no open hold gets neither row.
 - **The fabric pass is billed to nobody.** It is both the authoritative check and the heaviest
   perturbation the broker aims at the mesh (a host was lost with one in flight), so it runs where
   it costs no submitter and no healthy silicon: post-job on failure (not after a fresh green
