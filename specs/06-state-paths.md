@@ -243,6 +243,8 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_REBOOT_MIN_DEAD_FRAC` | 0.5 | Dead fraction gating the host-reboot rung | 04 |
 | `TT_DEVICE_MCP_AUTO_REBOOT` | 1 | Arm the warm host-reboot rung | 04 |
 | `TT_DEVICE_MCP_AUTO_POWER_CYCLE` | 1 | Arm the BMC power-cycle rung | 04 |
+| `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` | unset (off) | Opt-in command the broker runs and waits for before an auto power cycle (drain other workloads) | 04 |
+| `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC` | 300 (max 3600) | Pre-power-cycle hook timeout; its process group is killed past it and the cycle goes ahead | 04 |
 | `TT_DEVICE_MCP_AUTO_UBB_RESET` | 1 | Arm the per-tray UBB reset rung | 04 |
 | `TT_DEVICE_MCP_UBB_RESET_SETTLE_SEC` | 28 | Settle time after a UBB tray reset | 04 |
 | `TT_DEVICE_MCP_TRAY_DOWN_CAPTURE` | `1` | `0` turns off the tray-down prelude (one PCI rescan and the read-only BMC/CPLD/PCIe capture before the ladder at a tray-down onset); the ladder is the same either way | 04 |
