@@ -1486,13 +1486,24 @@ device_pci_map: dict = {}
 # a reset: MMIO aimed at a chip that is mid-reset (or already dead) is what pushes
 # the root complex into the fatal error path that reboots the host. A host
 # running another unit that reads or writes the chips (a clock-cap keeper, say) names it in
-# TT_DEVICE_MCP_POLLER_SERVICES. The default lists no clock-cap keeper: a reset restarts every unit
-# it lists, which would bring back a keeper the host masked. A unit a host does not have answers
+# TT_DEVICE_MCP_POLLER_SERVICES. The default lists no clock-cap keeper, which every reset would
+# otherwise stop and restart on every host. A unit a host does not have answers
 # `systemctl` non-zero and is skipped.
 DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service"
 DEVICE_POLLER_SERVICES = tuple(
     s for s in os.environ.get("TT_DEVICE_MCP_POLLER_SERVICES", DEFAULT_POLLER_SERVICES).split(",") if s.strip()
 )
+# The pollers a quiesce found running, so the restore starts only those: a unit an operator stopped
+# on purpose stays stopped. A unit is recorded before its stop is sent and leaves the record only
+# when a start returns 0, so a stop that fails or outlasts its bound, or a start that fails, never
+# loses it. Kept across nested stops (the dead-chip path stops the pollers and the reset that
+# follows finds them already down) and on disk, so a broker restart in between loses nothing.
+# None until read from disk in this process (_pollers_restore_record).
+POLLERS_TO_RESTORE_FILE = "pollers_to_restore.json"
+_pollers_to_restore: Optional[set[str]] = None
+# `systemctl is-active` states of a unit that is running or on its way up: a crash-looping poller
+# reads "activating" between restarts, and it was running all the same.
+_POLLER_RUNNING_STATES = ("active", "activating", "reloading", "refreshing")
 logger: logging.Logger | None = None
 job_log_dir: Path | None = None
 job_runner_task: asyncio.Task | None = None  # Singleton job runner
@@ -5305,6 +5316,34 @@ def _pollers_unfit_reason() -> Optional[str]:
     return f"fabric unverified since {debt}" if debt else None
 
 
+def _pollers_restore_record() -> set[str]:
+    """The pollers owed a restore (see _pollers_to_restore), read from disk once per process. An
+    unreadable record reads as empty: the restore then starts only what the next stop finds running."""
+    global _pollers_to_restore
+    if _pollers_to_restore is None:
+        try:
+            names = json.loads((health_dir() / POLLERS_TO_RESTORE_FILE).read_text())
+            _pollers_to_restore = {n for n in names if isinstance(n, str)}
+        except (OSError, ValueError, TypeError):
+            _pollers_to_restore = set()
+    return _pollers_to_restore
+
+
+def _note_poller_to_restore(svc: str, owed: bool) -> None:
+    """Add (or, after a start that returned 0, drop) one poller in the restore record, on disk too."""
+    record = _pollers_restore_record()
+    if (svc in record) == owed:
+        return
+    (record.add if owed else record.discard)(svc)
+    path = health_dir() / POLLERS_TO_RESTORE_FILE
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sorted(record)))
+        os.replace(tmp, path)
+    except OSError:
+        pass  # never let bookkeeping break a reset; the record in memory still holds
+
+
 async def _set_device_pollers(active: bool, log) -> list[str]:
     """Stop (or restart) the daemons that continuously poll every chip.
 
@@ -5313,6 +5352,9 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
     endpoint are what drive the root complex past its error threshold — at which
     point firmware-first RAS resets the whole host. Quiescing them is the
     difference between a 60s device reset and an ungraceful reboot.
+
+    The restore starts only the pollers the stop found running: a poller an operator
+    stopped on purpose, or one this host does not have, is left as it was.
 
     Best-effort by design: a poller we cannot stop must not block the recovery.
     """
@@ -5333,31 +5375,69 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
             return []
         _pollers_owed = None
     verb = "start" if active else "stop"
-    touched = []
-    for svc in DEVICE_POLLER_SERVICES:
-        try:
-            proc = await asyncio.create_subprocess_exec(
+    record = _pollers_restore_record()
+    # The stop asks every configured unit; the restore only the ones a stop found running.
+    services = [s for s in DEVICE_POLLER_SERVICES if s in record] if active else DEVICE_POLLER_SERVICES
+
+    async def _apply(svc: str, stage: list) -> Optional[int]:
+        if not active and svc not in record:
+            stage[0] = "probe"
+            probe = await asyncio.create_subprocess_exec(
                 "systemctl",
-                verb,
+                "is-active",
                 svc,
-                stdout=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await aio.wait_for(proc.wait(), timeout=30)
-            if proc.returncode == 0:
-                touched.append(svc)
+            out, _ = await probe.communicate()
+            state = out.decode(errors="replace").strip()
+            # Recorded before the stop is sent: a stop that hangs on a wedged chip still owes a start.
+            # No state read at all counts as running, as every unit did before this record existed.
+            if state in _POLLER_RUNNING_STATES or not state:
+                _note_poller_to_restore(svc, True)
+        stage[0] = verb
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl",
+            verb,
+            svc,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        return proc.returncode
+
+    touched = []
+    for svc in services:
+        stage = [""]
+        try:
+            # One bound for the state probe and the verb together, so the documented worst case holds.
+            rc = await aio.wait_for(_apply(svc, stage), timeout=30)
         except (asyncio.TimeoutError, OSError, ValueError):
-            continue
+            rc = None
+            if stage[0] == "probe":
+                _note_poller_to_restore(svc, True)  # state unknown: restore it, as before
+        if rc == 0:
+            touched.append(svc)
+            if active:
+                _note_poller_to_restore(svc, False)
+        elif not active and svc in record:
+            # Running, and its stop failed or is still running (systemd finishes it): the inline
+            # restore may be skipped when no stop returned 0, so the next close to HEALTHY starts it.
+            _owe_device_pollers(f"{svc} stop did not complete")
     if touched:
         log(f"{'restarted' if active else 'stopped'} device pollers: {', '.join(touched)}")
-    elif DEVICE_POLLER_SERVICES:
+    if active:
+        left = [s for s in DEVICE_POLLER_SERVICES if s not in services]
+        if left:
+            log(f"left device pollers stopped (not running before the stop): {', '.join(left)}")
+    if not touched and services:
         # Pollers were configured, yet the verb reached none of them: on this host they resolve
         # to no active unit. Quiescing was a no-op, so a reset about to run cannot assume it lands
         # on a quiet bus — the real pollers may still be hammering MMIO under a name we were never
         # told. On the stop path that is the host-reboot hazard the quiesce exists to prevent, so
         # flag it host_at_risk; either way, do not let the absence read as a clean quiesce.
-        log(f"WARNING: no configured device poller answered '{verb}': " f"{', '.join(DEVICE_POLLER_SERVICES)}")
-        health_event("pollers_none_active", verb=verb, configured=list(DEVICE_POLLER_SERVICES), host_at_risk=not active)
+        log(f"WARNING: no configured device poller answered '{verb}': " f"{', '.join(services)}")
+        health_event("pollers_none_active", verb=verb, configured=list(services), host_at_risk=not active)
     health_event("pollers_" + ("restarted" if active else "quiesced"), services=touched)
     return touched
 

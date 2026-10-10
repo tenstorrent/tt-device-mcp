@@ -277,8 +277,8 @@ def _shortfalls(monkeypatch, seq):
 
 @pytest.fixture
 def _systemctl(monkeypatch):
-    """The real poller quiesce over a fake ``systemctl``: every call's verb lands in the returned list,
-    and no reset scope is cycling unless a test says so."""
+    """The real poller quiesce over a fake ``systemctl`` on a running poller: every stop and start
+    lands in the returned list, and no reset scope is cycling unless a test says so."""
     calls = []
 
     class _Proc:
@@ -287,9 +287,13 @@ def _systemctl(monkeypatch):
         async def wait(self):
             return 0
 
+        async def communicate(self):
+            return b"active\n", b""
+
     async def fake_exec(program, *args, **kwargs):
         assert program == "systemctl", f"unexpected spawn {program} {args}"
-        calls.append(args[0])
+        if args[0] != "is-active":  # the running-state probe before a stop
+            calls.append(args[0])
         return _Proc()
 
     monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))

@@ -278,6 +278,8 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(srv, "_leftover_rung_stage", "")
     monkeypatch.setattr(srv, "_leftover_rung_detail", "")
     monkeypatch.setattr(srv, "_leftover_rung_task", None)
+    # The pollers a quiesce stopped and owes a restore. None: read again from the per-test health dir.
+    monkeypatch.setattr(srv, "_pollers_to_restore", None)
     # The reset argv/mode env vars are read live (never cached), so an operator's own shell/CI
     # environment leaks straight into whatever argv a test builds — cleared here for a
     # deterministic floor; a test exercising a declared mode/override sets it itself afterward.
