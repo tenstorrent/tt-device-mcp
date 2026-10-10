@@ -367,6 +367,7 @@ async def test_tray_down_no_window_power_cycles_when_the_sweep_does_not_recover(
 
     monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_pc)
     monkeypatch.setattr(g, "_auto_reboot_host", fake_reboot)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 1 for i in range(24)})
 
     offbus = {str(i) for i in range(24, 32)}
     out = await g._fire_tray_down_no_window(offbus, 32, lambda m: None, gate_phase="post-job", ev=None)
@@ -374,6 +375,102 @@ async def test_tray_down_no_window_power_cycles_when_the_sweep_does_not_recover(
     assert out == galaxy.OUTCOME_WAITING
     assert cycles["n"] == 1, "a sweep that did not recover the mesh climbs straight to the power cycle"
     assert reboots["n"] == 0, "a whole tray off the bus is warm-reboot-futile — never the warm reboot"
+
+
+def _wire_failed_tray_down_sweep(monkeypatch, read_heartbeats, *, allowed=True):
+    """Wire _fire_tray_down_no_window so the one verify fails and the power cycle is opted in.
+    Returns the recorded health events and the power-cycle counter."""
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
+    events = []
+    patch_health_event(monkeypatch, lambda name, **k: events.append((name, k)))
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    patch_recovery(monkeypatch, "_recover_isolated_chips", _async_true)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: None)
+
+    async def mesh(argv, log, *a, **k):
+        return 0, ""
+
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh)
+
+    async def verify(expected, log, run_fabric=True, **k):
+        return False, {"snapshot": {"ok": False}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
+    monkeypatch.setattr(
+        g.mechanism,
+        "auto_recovery_allowed",
+        lambda action, tenant_active=False, **k: (allowed, "" if allowed else "cooldown"),
+    )
+    monkeypatch.setattr(g.mechanism, "_journal_auto_recovery_denied", lambda *a, **k: None)
+    cycles = {"n": 0}
+
+    async def fake_pc(log, reason):
+        cycles["n"] += 1
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_pc)
+    monkeypatch.setattr(srv, "read_heartbeats", read_heartbeats)
+    return events, cycles
+
+
+def _raise_oserror():
+    raise OSError("sysfs read failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "read_heartbeats, want_after",
+    [
+        (lambda: {}, 32),  # every chip off the bus by the time the verify fails
+        (lambda: {str(i): 1 for i in range(24)}, 8),  # still the one tray
+        (_raise_oserror, None),  # a failed re-read is logged and never blocks the power cycle
+    ],
+    ids=["32-off-after", "8-off-after", "re-read-raises"],
+)
+async def test_tray_down_no_window_power_cycle_logs_the_off_bus_count_after_the_verify(
+    monkeypatch, read_heartbeats, want_after
+):
+    """The power-cycle event keeps the onset count in off_bus and adds the count re-read after the
+    failed verify as off_bus_after (log-only). Exactly one power cycle fires either way."""
+    g = srv.galaxy_recovery
+    events, cycles = _wire_failed_tray_down_sweep(monkeypatch, read_heartbeats)
+    lines = []
+    offbus = {str(i) for i in range(24, 32)}
+    out = await g._fire_tray_down_no_window(offbus, 32, lines.append, gate_phase="post-job", ev=None)
+
+    assert out == galaxy.OUTCOME_WAITING
+    assert cycles["n"] == 1, "the extra count never changes the decision: exactly one power cycle"
+    pc = [k for name, k in events if name == "tray_down_no_window_power_cycle"]
+    assert pc == [{"off_bus": 8, "off_bus_after": want_after, "expected": 32}]
+    if want_after is None:
+        assert any("could not re-read the heartbeats" in m for m in lines)
+
+
+@pytest.mark.asyncio
+async def test_tray_down_no_window_escalation_uses_the_onset_count_not_the_count_after(monkeypatch):
+    """The host-rung choice rests on the onset count (8), never on the re-read (32): the re-read is
+    log-only. A denied power cycle names both counts in its log line."""
+    g = srv.galaxy_recovery
+    events, cycles = _wire_failed_tray_down_sweep(monkeypatch, lambda: {}, allowed=False)
+    seen = []
+    real = galaxy._host_escalation_for_drop
+
+    def spy(off_bus, expected, **k):
+        seen.append(off_bus)
+        return real(off_bus, expected, **k)
+
+    monkeypatch.setattr(galaxy, "_host_escalation_for_drop", spy)
+    lines = []
+    offbus = {str(i) for i in range(24, 32)}
+    out = await g._fire_tray_down_no_window(offbus, 32, lines.append, gate_phase="post-job", ev=None)
+
+    assert out == galaxy.OUTCOME_WAITING
+    assert seen == [8], "_host_escalation_for_drop gets the onset count only"
+    assert cycles["n"] == 0, "a denied power cycle stays denied"
+    assert any("8/32 at onset, 32 after the verify" in m for m in lines)
 
 
 @pytest.mark.asyncio
@@ -421,10 +518,28 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
         return False, {"snapshot": {"ok": False}}
 
     patch_recovery(monkeypatch, "_verify_device", bad)
+    # The sweep did not run (no holder scan stubbed, so it reads as a tenant): the full ladder has not
+    # been tried, so the host rung holds (spec 04 I22).
+    out_held = await g._fire_gate_rung(
+        "post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={}
+    )
+    assert (
+        out_held == galaxy.OUTCOME_WAITING and cycles["n"] == 0
+    ), "a host rung never fires when the last-chance sweep was skipped"
+
+    # The full sweep ran and the mesh is still bad: the host rung fires.
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: None)
+
+    async def fake_reset(argv, log, *a, **k):
+        return 0, ""
+
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", fake_reset)
     out2 = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={})
     assert (
         out2 == galaxy.OUTCOME_WAITING and cycles["n"] == 1
-    ), "a mesh still bad after the settle+verify proceeds to the host rung"
+    ), "a mesh still bad after the full sweep, settle and verify proceeds to the host rung"
 
 
 # ---------------------------------------------------------------- (d) power-cycle cooldown (1800s)

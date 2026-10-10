@@ -28,6 +28,7 @@ from typing import Awaitable, Callable, Optional
 from tt_device_mcp import constants, metrics
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.evidence import health_event
+from tt_device_mcp.health.recovery import pcie_guard
 from tt_device_mcp.health.recovery.base import RESET_COOLDOWN_SEC, RecoveryMechanism
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
     bridge_reset_enabled,
@@ -239,9 +240,9 @@ class RecoveryDeps:
     # deps fixture — may supply its own bindings, which boot leaves untouched).
     board_types_provider: Optional[Callable[[], Optional[list]]] = None
     glx_board_types_provider: Optional[Callable[[], tuple]] = None
-    # The per-chip bus ids the tray rung derives its trays from (spec 04 I16). Same injection
-    # reason as the two above: the cache lives on the HealthMonitor singleton.
-    bus_ids_provider: Optional[Callable[[], Optional[list]]] = None
+    # {chip index: PCI address}, the map the tray rung derives its trays from (spec 04 I16). Same
+    # injection reason as the two above: the cache lives on the HealthMonitor singleton.
+    chip_buses_provider: Optional[Callable[[], Optional[dict]]] = None
     journal_skip_once: Optional[Callable[[str, str], None]] = None
     # The telemetry sampler's server-side callbacks (see tt_device_mcp.telemetry). Same lambda
     # discipline as every field above — each re-resolves a server.py name per call so a
@@ -264,6 +265,10 @@ class RecoveryDeps:
     # then loses every sysfs node must still journal the loss and escalate the episode to dirty —
     # only an already-dirty one has nothing left to re-flag.
     episode_dirty: Optional[Callable[[], bool]] = None
+    # Whether any episode is open (state not HEALTHY). A short chip count is flagged only on a
+    # HEALTHY box: under a hold the gate already placed (an off-bus drop held dirty=False) the
+    # short count IS that fault, and re-dirtying it would disable the hold's idle relift.
+    episode_open: Optional[Callable[[], bool]] = None
     episode_job: Optional[Callable[[], dict]] = None
 
 
@@ -285,6 +290,9 @@ class Recovery(ABC):
         # after selection later resolves to the other.
         self.mechanism = mechanism
         self.deps = deps
+        # Set fresh by every _recover_isolated_chips call; defined here so the gate can read it
+        # even when no bridge rung has run on this instance yet.
+        self.last_bridge_reset_reasons: dict = {}
 
     @abstractmethod
     def next_stage(self, ev: Evidence) -> str:
@@ -339,7 +347,14 @@ class Recovery(ABC):
     # to be.
 
     async def _verify_device(
-        self, expected: int, log, *, run_fabric: bool = True, phase: str = "verify_device"
+        self,
+        expected: int,
+        log,
+        *,
+        run_fabric: bool = True,
+        phase: str = "verify_device",
+        run_eth: bool = False,
+        fabric_stale: bool = True,
     ) -> tuple[bool, dict]:
         """Is the mesh usable? A thin adapter over :meth:`HealthMonitor.update` — the ONE probe
         pass implementation (see monitor.py); this method exists only as the seam
@@ -355,7 +370,9 @@ class Recovery(ABC):
         ``self.monitor.status()`` labels itself meaningfully instead of always reading the same
         placeholder string.
         """
-        state = await self.monitor.update(phase, run_fabric=run_fabric, expected=expected, log=log)
+        state = await self.monitor.update(
+            phase, run_fabric=run_fabric, run_eth=run_eth, fabric_stale=fabric_stale, expected=expected, log=log
+        )
         return state.healthy, state.as_evidence()
 
     async def _recover_isolated_chips(self, log) -> bool:
@@ -392,7 +409,21 @@ class Recovery(ABC):
         sbr = bridge_reset_enabled()
         if not sbr:
             log(f"per-chip bridge reset unavailable ({bridge_reset_unavailable_reason()}) — trying a PCI rescan")
+        # An SBR takes its chip off the bus like any reset, so the per-host gate (spec 04 I24) holds it
+        # too: the isolated chips are off the bus by definition.
+        gated, why = False, ""
+        if sbr:
+            allowed, why = pcie_guard.host_reset_gate(len(targets))
+            gated = not allowed
+        if gated:
+            log(f"per-chip bridge reset NOT fired: {why} — trying a PCI rescan")
+            health_event("host_reset_gated", context="bridge_reset", chips=targets, reason=why, host_at_risk=True)
         for idx in targets:
+            if gated:
+                inapplicable.append(idx)
+                self.last_bridge_reset_reasons[idx] = {"reason": "gated"}
+                metrics.stage_fired("bridge_reset", "blocked")
+                continue
             if not sbr:
                 inapplicable.append(idx)
                 # NOT no_bridge: that means the endpoint left the bus, which is the drop measured
@@ -561,6 +592,13 @@ class Recovery(ABC):
         fatal and takes the host down with it. One attempt, then back off and let the
         caller report honestly. Returns True if the device verified healthy.
         """
+        try:
+            return await self._reset_and_verify_device_once(indices, log)
+        finally:
+            # The reset and its verify are over and the host is still up: an off-bus intent is spent.
+            pcie_guard.end_offbus_reset()
+
+    async def _reset_and_verify_device_once(self, indices: list, log) -> bool:
         # Reset per call: only a reset that actually EXITS non-zero this pass sets it below. An adopted
         # foreign scope or a clean-exit-but-unverified reset must not leave a stale hard-fail flag that
         # steers the next gate's escalation to the cold rung over a reset that never hard-failed.
@@ -589,11 +627,27 @@ class Recovery(ABC):
                 "`-r`, which does NOT recover a Galaxy; set TT_DEVICE_MCP_RESET_MODE"
             )
 
+        # The per-host gate (spec 04 I24): on a host whose resets have flooded AER into a crash, an
+        # automatic reset never fires over chips already off the bus or during a flood, and the
+        # Tenstorrent root ports are masked for the reset window. Off by default. Checked before
+        # reset_begin and the cooldown clock: a refused reset did not happen.
+        off_bus = pcie_guard.chips_off_bus(expected)
+        allowed, why = pcie_guard.host_reset_gate(off_bus)
+        if not allowed:
+            log(f"automatic reset NOT fired: {why}; holding for an operator")
+            health_event("host_reset_gated", argv=argv, reason=why, host_at_risk=True)
+            return False
+
         log(f"resetting device: {' '.join(argv)}  ({expected} device(s); ~30-60s, restart-safe)")
         health_event("reset_begin", argv=argv, expected_chips=expected)
         self.mechanism.last_reset_monotonic = time.monotonic()
-
-        rc, out = await self.mechanism.reset_with_quiesce(argv, log)
+        pcie_guard.begin_offbus_reset("mesh reset", off_bus)
+        aer_mask = pcie_guard.mask_for_mesh_reset(log)
+        try:
+            rc, out = await self.mechanism.reset_with_quiesce(argv, log)
+        finally:
+            if aer_mask is not None:
+                await asyncio.to_thread(aer_mask.restore)
         if _journal_cpld_too_old(argv, out, log):
             # Latched on the mechanism both platforms share, so the NEXT rung and every later pass
             # resolve to the galaxy ladder rather than repeating the `-r` tt-smi just disowned.

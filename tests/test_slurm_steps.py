@@ -300,6 +300,15 @@ class _PeerUidShim:
         await self._app(scope, receive, send)
 
 
+@pytest.fixture(autouse=True)
+def _startup_already_ran(monkeypatch):
+    """The first TestClient lifespan in a process runs run_startup_tasks(), whose startup gate
+    pass calls the same patched _verify_device the step tests count. Run alone, a test would then
+    see that startup call as its own step's gate pass. Mark startup done, as it already is for
+    every test after the first in a full run, so only the step route's own calls are recorded."""
+    monkeypatch.setattr(srv, "_startup_tasks_done", True)
+
+
 def _client():
     return TestClient(_PeerUidShim(srv.build_asgi_app(srv.create_mcp_server())), raise_server_exceptions=False)
 
@@ -392,6 +401,46 @@ def test_the_in_flight_guard_catches_a_hung_jobs_teardown_window(monkeypatch, cl
         assert body["status"] == "refused", f"pre-step ran during a hung job's teardown window: {body}"
     finally:
         current_peer_uid.reset(tok)
+
+
+@pytest.mark.parametrize("status", ["KILLED", "RUNNING", None])
+def test_the_in_flight_guard_catches_a_readopted_jobs_scope_until_it_ends(monkeypatch, clear_job_state, status):
+    """A job re-adopted after a broker restart has no `current_job_id`. A kill or a forced reset
+    marks it KILLED before its scope has wound down; its `readopted_scopes` entry stays until the
+    scope ends. A step in that window would read the device as idle, and post-step's reclaim would
+    SIGTERM the scope's processes mid-teardown."""
+    _no_holders(monkeypatch)
+    _quiet_gate(monkeypatch)
+    fsm_healthy(srv)
+    if status is not None:
+        job = srv.Job(id="007", owner="svc", workspace="/tmp", command="echo hi", queued_at="2026-09-03T00:00:00")
+        job.status = srv.JobStatus[status]
+        srv.jobs["007"] = job
+    monkeypatch.setitem(srv.readopted_scopes, "007", "ttdev-job-007.scope")
+    reclaimed = []
+    monkeypatch.setattr(srv, "reclaim_foreign_holders", lambda **_: reclaimed.append(True))
+
+    tok = current_peer_uid.set(0)
+    try:
+        with _client() as c:
+            for route in ("/api/tt_device_pre_step", "/api/tt_device_post_step"):
+                body = c.post(route, json={}).json()
+                assert body["status"] == "refused", f"{route} ran under a re-adopted job's scope: {body}"
+                assert "007" in body["reason"], body["reason"]
+        assert reclaimed == [], "post-step reclaimed under a re-adopted job's scope"
+    finally:
+        current_peer_uid.reset(tok)
+
+    if status == "RUNNING":
+        return  # a running job blocks on its own; the scope check is what covers the others
+    srv.readopted_scopes.pop("007")
+    with _client() as c:
+        tok = current_peer_uid.set(0)
+        try:
+            body = c.post("/api/tt_device_pre_step", json={}).json()
+        finally:
+            current_peer_uid.reset(tok)
+    assert body["status"] != "refused", f"the guard outlived the scope: {body}"
 
 
 def test_post_step_re_checks_the_guard_after_the_reclaim_before_the_gate(monkeypatch, clear_job_state, tmp_path):
@@ -821,6 +870,48 @@ def test_post_step_malformed_exit_code_does_not_500(monkeypatch, clear_job_state
         current_peer_uid.reset(tok)
 
 
+@pytest.mark.parametrize(
+    "armed, exit_code, want_eth, want_fabric",
+    [
+        (True, 0, True, False),  # clean step, armed: the passive read, no traffic pass
+        (False, 0, False, False),  # disarmed: the old snapshot-only clean exit
+        (True, 1, False, True),  # failed step: the forced traffic pass, which reads eth itself
+    ],
+)
+def test_a_clean_post_step_on_an_armed_host_asks_for_the_eth_read(
+    monkeypatch, clear_job_state, tmp_path, armed, exit_code, want_eth, want_fabric
+):
+    """Spec 03 I30. A Slurm step that exits 0 hands the next job a mesh only enum+ARC looked at,
+    the same hole the in-broker post-job gate closed. Through the real route, a clean step on an
+    armed host asks the probe pass for the eth read and no traffic pass."""
+    _present_chips(monkeypatch, tmp_path)
+    _quiet_gate(monkeypatch)
+    _no_holders(monkeypatch)
+    fsm_healthy(srv)
+    srv.last_fabric_check_monotonic = srv.time.monotonic()  # a pass ran recently: none is owed
+    monkeypatch.setattr(srv, "eth_check_armed", armed)
+    monkeypatch.setattr(srv, "_device_liveness_reason", lambda: "")
+    monkeypatch.setattr(
+        srv, "reclaim_foreign_holders", lambda **_: srv.ReclaimResult(signalled=[], survivors=[], scan_complete=True)
+    )
+    seen = []
+
+    async def verify(expected, log, run_fabric=True, run_eth=False, phase=None, **_):
+        seen.append((phase, run_eth, run_fabric))
+        return True, {"snapshot": {"ok": True}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+    tok = current_peer_uid.set(0)
+    try:
+        with _client() as c:
+            body = c.post("/api/tt_device_post_step", json={"exit_code": exit_code}).json()
+        assert seen == [("post-step", want_eth, want_fabric)], f"post-step asked the probe pass for {seen}"
+        assert body["status"] == "ok", body
+    finally:
+        current_peer_uid.reset(tok)
+
+
 def test_post_step_non_boolean_reclaim_is_refused_not_silently_run(monkeypatch, clear_job_state):
     """Python's `bool("false")` is True: a naive coercion would read the JSON string "false" as
     "run the reclaim" and SIGTERM/SIGKILL another user's processes they explicitly asked to
@@ -950,7 +1041,7 @@ def _noop_post_job_gate(monkeypatch):
     runner off the device once its dispatched job finishes so nothing here depends on the real
     post-job gate's own timing."""
 
-    async def _noop(job_log_file, job_failed=False):
+    async def _noop(job_log_file, job_failed=False, noop_failure=False):
         return None
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _noop)

@@ -65,6 +65,39 @@ and job exit statuses never hit disk.
   broker down); but the setup paths are loud: `per_user_daemon_env` warns when it cannot create a
   redirect target, and preflight *fails* on an unwritable health dir when health checks are on
   (warns when off).
+- **I8 — Every device op holds an advisory flock that external device writers can test.**
+  `_device_op()` takes `fcntl.flock(LOCK_EX)` on `device_op_flock()` (default
+  `/run/tt-device-broker/device-op.flock`, a sibling of the inhibit file) after it gets the
+  in-process device lock and holds it until the op ends: on return, on an exception and on
+  cancellation. The fd is opened `O_CLOEXEC` (and `O_NOFOLLOW`, mode 0600 on create), so no reset
+  tool, fabric probe or job the op starts inherits the lock. The broker never unlinks the file,
+  but the system broker's `/run/tt-device-broker` is the unit's `RuntimeDirectory=`, which systemd
+  removes, file included, every time the broker stops (an auto-update, a watchdog restart). The
+  next device op creates the file again, on a new inode. The broker waits for the lock without blocking the event loop (non-blocking retries
+  every 50 ms) for at most `TT_DEVICE_MCP_DEVICE_OP_FLOCK_TIMEOUT_SEC` (10 s). While it waits it
+  logs the holder's pid, read from `/proc/locks`. If the hold outlasts the timeout, the op goes
+  ahead without the flock, with a WARNING naming the holder and a `device_op_flock_timeout`
+  journal event; it is never refused or failed for it (see Design decisions). The
+  `device_op_begin` journal event is written before the flock is taken, so its `waited_sec` counts
+  only the wait for the in-process device lock; a wait for the flock shows in the server log. A
+  file that cannot be opened (a per-user daemon without the directory) means the op runs as before. With no
+  external user the lock is always free at once, so nothing about an op's timing, rungs or order
+  changes.
+
+  **External-tool contract.** A tool that writes to the device outside the broker opens the path
+  fresh for each write attempt: open (read-only is enough; never create, truncate or unlink it),
+  `flock(fd, LOCK_EX | LOCK_NB)` immediately before ONE short write, the write, then close, which
+  releases the lock. It must not keep one fd open across attempts: after a broker restart that fd
+  points at the removed file, and locking it excludes nothing. (A tool that must keep its fd checks
+  before each attempt that `fstat(fd).st_ino == stat(path).st_ino`, and reopens when they differ.)
+  On `EWOULDBLOCK` it skips that write and tries again later. It never blocks on the lock and never
+  holds it across a sleep, a loop or a subprocess. `ENOENT` means no lock is on offer right now (an
+  older broker, or one that has not run a device op since it started): keep whatever checks the
+  tool used before. On the system broker the file is root's, mode 0600, so that tenants cannot
+  hold resets back; a tool that is not root gets `EACCES` and cannot take part. It must run as
+  root, or else report the error and fall back to its old checks, never treat `EACCES` as a free
+  lock. The lock is advisory and only covers the broker's own device ops, not tenant jobs, which
+  run outside `_device_op()`.
 
 ## Path matrix
 
@@ -77,12 +110,15 @@ and job exit statuses never hit disk.
 | Runtime state base | n/a (system paths below) | `<install>/state` | `TT_DEVICE_MCP_STATE_DIR` (independent of the install base), `--log-dir` |
 | Socket | `/run/tt-device-broker/broker.sock` (`RuntimeDirectory=`, chmod 0666) | `<state>/daemon.sock` | `--socket` / `TT_DEVICE_MCP_SOCKET` |
 | FSM state file | `/var/lib/tt-device-broker/health/fsm.json` | `<state>/health/fsm.json` | follows the health dir |
-| Health journal (events, telemetry trace, buslock, chip baseline, incidents/) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
+| Health journal (events, telemetry trace, buslock, chip and eth-link baselines, incidents/) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
+| Off-bus reset intent and host-hang latch (`offbus_reset_intent.json`, `offbus_reset_hold.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
+| Remembered Tenstorrent root ports and chip archs (`tt_pci_topology.json`, spec 04 I23) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Server log + job logs | `/var/log/tt-device-broker/` (the unit passes `--log-dir`; the bare server defaults to CWD) | `<state>/` | `--log-dir` |
 | Stats | `<log-dir>/stats/` → `/var/log/tt-device-broker/stats/` | `<state>/stats/` | follows `--log-dir` |
 | Metrics textfile | `/var/lib/prometheus/node-exporter/tt_device_mcp.prom` | `<state>/metrics/tt_device_mcp.prom` | `TT_DEVICE_MCP_TEXTFILE_DIR` |
 | Job exit records | `/run/tt-device-broker/jobexit/` (sticky 1777) | `<state>/jobexit/` (exported by the CLI, 0700 base) | `TT_DEVICE_MCP_JOB_EXIT_DIR` |
 | Device-op inhibit lock | `/run/tt-device-broker/device-op.lock` | `<state>/device-op.lock` (exported by the CLI) | `TT_DEVICE_MCP_DEVICE_OP_LOCK` |
+| Device-op advisory flock (I8) | `/run/tt-device-broker/device-op.flock` | `<state>/device-op.flock` (sibling of the inhibit lock) | `TT_DEVICE_MCP_DEVICE_OP_FLOCK` |
 | Daemon pid / daemon stdout | n/a (systemd / journald) | `<state>/daemon.pid`, `<state>/daemon.log` | follows the state base |
 | Host config | `/etc/default/tt-device-broker` (written by installer, sourced by apply-host-config, autoupdate, and the Slurm hooks) | n/a | `TTDEV_ETC_DEFAULT` (apply-host-config's render/test seam; also a real runtime override for the Slurm hooks, which source it unconditionally on every invocation) |
 | Per-user client prefs (CLI-side, any shape) | `~/.config/tt-device-mcp/timezone` (`XDG_CONFIG_HOME` honored) | same | `TT_DEVICE_MCP_TZ` beats the saved timezone |
@@ -140,7 +176,7 @@ path unless the operator points node_exporter's own `--collector.textfile.direct
 ## Environment variable reference
 
 The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defined ones —
-61 total. One line each; behavioral detail lives in the owning spec
+65 total. One line each; behavioral detail lives in the owning spec
 (01 jobs, 02 tools/transports, 03 health, 04 recovery, 05 identity/privsep, 06 this spec,
 07 CLI, 08 install/deploy). "1"/"0" defaults are the effective on/off state when unset.
 
@@ -152,6 +188,8 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_TEXTFILE_DIR` | euid-split (matrix) | Prometheus textfile directory | 06 |
 | `TT_DEVICE_MCP_JOB_EXIT_DIR` | `/run/tt-device-broker/jobexit` | Where jobs record their own exit status | 06 |
 | `TT_DEVICE_MCP_DEVICE_OP_LOCK` | `/run/tt-device-broker/device-op.lock` | Restart-inhibit file for in-flight device ops | 06 |
+| `TT_DEVICE_MCP_DEVICE_OP_FLOCK` | sibling `device-op.flock` of the inhibit file | Advisory flock held for every device op, for external device writers (I8) | 06 |
+| `TT_DEVICE_MCP_DEVICE_OP_FLOCK_TIMEOUT_SEC` | `10` | Longest the broker waits on an external holder before going ahead without the flock (I8) | 06 |
 | `TT_DEVICE_MCP_INSTALL_DIR` | `/tmp/tt-device-mcp-<uid>` | Per-user base: venv, CLI symlink, and `state/` (deploy-defined, install-user.sh) | 06/08 |
 | `TT_DEVICE_MCP_PRIVSEP` | unset (off) | Run each job as its submitter via systemd-run | 05 |
 | `TT_DEVICE_MCP_DEVICE_GROUP` | unset (off) | Group-membership admission gate for jobs (device lock) | 05 |
@@ -165,14 +203,20 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_HEALTH_CHECK` | 1 | Master switch for health checks. On in both shapes; preflight forces 0 for a non-root daemon with no tt-smi | 03 |
 | `TT_DEVICE_MCP_FABRIC_CHECK_CMD` | unset (built-in validator) | Operator override for the fabric traffic check | 03 |
 | `TT_DEVICE_MCP_FABRIC_CHECK_INTERVAL_SEC` | 1200 | Staleness window before the gate re-runs the fabric pass | 03 |
+| `TT_DEVICE_MCP_NOOP_FAILURE_FABRIC_FRESH_SEC` | 300 | A failed job that never reached the device skips the forced fabric pass when a green pass is younger than this (I36) | 03 |
 | `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD` | unset (built-in probe) | Operator override for the passive eth-heartbeat read | 03 |
 | `TT_DEVICE_MCP_EXPECTED_CHIPS` | unset (baseline/hwm-derived) | Authoritative chip count for this host | 03 |
+| `TT_DEVICE_MCP_AICLK_CEILING_MHZ` | unset (off) | Per-host AICLK ceiling the broker re-applies and proves before any load; a positive integer arms it | 03 |
+| `TT_DEVICE_MCP_AICLK_CEILING_CMD` | unset (built-in helper) | Operator override for the ceiling apply, judged on exit code alone | 03 |
+| `TT_DEVICE_MCP_AICLK_CEILING_TIMEOUT_SEC` | 8 | Bound on one ceiling apply (min 1) | 03 |
+| `TT_DEVICE_MCP_AICLK_CEILING_PYTHON` | broker's interpreter | Interpreter for the built-in ceiling helper (needs tt-umd) | 03 |
 | `TT_DEVICE_MCP_SYSFS_DIR` | `/sys/class/tenstorrent` | Sysfs class dir (test seam) | 03 |
 | `TT_DEVICE_MCP_PCI_DIR` | `/sys/bus/pci/devices` | PCI devices dir (test seam) | 03 |
 | `TT_DEVICE_MCP_SAMPLE_INTERVAL_SEC` | 10 | Telemetry sampler cadence | 03 |
 | `TT_DEVICE_MCP_SAMPLE_RING` | 120 | Sampler ring size | 03 |
 | `TT_DEVICE_MCP_SAMPLER_STALL_SEC` | 120 | Sampler-stall watchdog threshold | 03 |
 | `TT_DEVICE_MCP_BOOT_PROBE_TIMEOUT_SEC` | 20 | Boot platform-probe timeout | 03 |
+| `TT_DEVICE_MCP_DISPATCH_RECHECK_SEC` | 300 | Re-check a HEALTHY device before dispatch when its last verdict is older than this (0 off) | 03 |
 | `TT_DEVICE_MCP_PREJOB_DISPATCH` | 0 | Opt-in pre-job single-kernel dispatch proof | 03 |
 | `TT_DEVICE_MCP_DISPATCH_BIN` | validator's `metal_example_add_2_integers_in_compute` | Pre-job dispatch probe binary | 03 |
 | `TT_DEVICE_MCP_DISPATCH_TIMEOUT_SEC` | 90 | Pre-job dispatch probe timeout | 03 |
@@ -181,6 +225,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_FABRIC_RELIFT` | 0 | Opt-in relift of fabric-unverified holds | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD` | 1 | Hold tenant jobs at the door while degraded (vs fail-fast) | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD_POLL_SEC` | 60 | Held-job re-check cadence | 03 |
+| `TT_DEVICE_MCP_TENANT_UIDS` | unset | Comma-separated uids or user names below 1000 whose device holders count as tenants. Root is ignored; a name that does not resolve is retried on the next scan | 04 |
 | `TT_DEVICE_MCP_HOLD_DEADLINE_SEC` | 2× stuck ceiling (2400) | Hold age flagged STUCK to the durable timeline | 03 |
 | `TT_DEVICE_MCP_STUCK_HOLD_SEC` | 1200 | General hold ceiling before forced escalation | 03 |
 | `TT_DEVICE_MCP_STUCK_HOLD_RESET` | 1 | Kill switch: idle escalation may reset a stuck hold | 03 |
@@ -191,6 +236,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_FORCE_ESCALATE` | 1 | Kill switch: past-ceiling forced escalation | 03 |
 | `TT_DEVICE_MCP_ETH_FREEZE_HOLD` | 1 | Frozen-eth verdict holds instead of resetting | 03 |
 | `TT_DEVICE_MCP_HOLD_REARM_SEC` | 1800 | Re-arm window for hold-escalation alerts | 03 |
+| `TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ` | 800 | Highest AI clock a chip may read once a job has ended; above it the job is recorded as not having closed the device (a bad value falls back to 800) | 03 |
 | `TT_DEVICE_MCP_RESET_MODE` | unset (derived from boards) | Declared platform: `galaxy`/`per-target`/`loudbox` | 04 |
 | `TT_DEVICE_MCP_RESET_ARGS` | unset | Full reset-command override (argv) | 04 |
 | `TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC` | unset → 0.5 floor | Off-bus fraction below which the gate holds instead of resetting; 0 disables the floor | 04 |
@@ -199,13 +245,28 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_AUTO_POWER_CYCLE` | 1 | Arm the BMC power-cycle rung | 04 |
 | `TT_DEVICE_MCP_AUTO_UBB_RESET` | 1 | Arm the per-tray UBB reset rung | 04 |
 | `TT_DEVICE_MCP_UBB_RESET_SETTLE_SEC` | 28 | Settle time after a UBB tray reset | 04 |
+| `TT_DEVICE_MCP_TRAY_DOWN_CAPTURE` | `1` | `0` turns off the tray-down prelude (one PCI rescan and the read-only BMC/CPLD/PCIe capture before the ladder at a tray-down onset); the ladder is the same either way | 04 |
+| `TT_DEVICE_MCP_TRAY_CPLD_BUSES` | unset | Site data for the tray-down capture: each tray's CPLD BMC I2C bus, `tray:0xNN,...`. All three CPLD vars must be set and well formed; otherwise the CPLD reads are skipped | 04 |
+| `TT_DEVICE_MCP_TRAY_CPLD_ADDR` | unset | Site data: the tray CPLD's I2C address, `0xNN`; unset = CPLD reads skipped | 04 |
+| `TT_DEVICE_MCP_TRAY_CPLD_REGS` | unset | Site data: the CPLD registers to read on every configured tray, `0xNN,...`; unset = CPLD reads skipped | 04 |
+| `TT_DEVICE_MCP_PDB_CPLD_BUS` | unset | Site data for the tray-down capture: the power-distribution board CPLD's BMC I2C bus, `0xNN`. All three PDB vars must be set and well formed; otherwise the PDB reads are skipped | 04 |
+| `TT_DEVICE_MCP_PDB_CPLD_ADDR` | unset | Site data: the PDB CPLD's I2C address, `0xNN`; unset = PDB reads skipped | 04 |
+| `TT_DEVICE_MCP_PDB_CPLD_REGS` | unset | Site data: the PDB CPLD registers to read, `0xNN,...` (single-register reads); unset = PDB reads skipped | 04 |
+| `TT_DEVICE_MCP_HOST_RESET_GATE` | off | `off`, `guard` (mask AER around automatic resets, refuse during an AER flood) or `hold` (also refuse while a chip is off the bus) | 04 |
+| `TT_DEVICE_MCP_OFFBUS_HANG_LATCH` | 1 | `0` turns off the off-bus reset intent and the host-hang latch (spec 04 I25) | 04 |
+| `TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN` | unset | `1`: log the per-tray re-power plan and refuse it | 04 |
+| `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` | 10 | How long a tray re-power waits for holders of the tray's chips | 04 |
+| `TT_DEVICE_MCP_AER_QUIET_CHECK_SEC` | 2 | How long a root port must stay error-free before its AER settings are restored | 04 |
+| `TT_DEVICE_MCP_AER_FLOOD_THRESHOLD` | 50 | New AER errors on the Tenstorrent root ports per flood period that count as a flood | 04 |
+| `TT_DEVICE_MCP_AER_FLOOD_PERIOD_SEC` | 60 | The period the flood threshold is a rate over | 04 |
+| `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC` | 1800 | How long after a flood the gate keeps refusing | 04 |
 | `TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET` | 0 | Opt-in bridge reset for a gone chip | 04 |
 | `TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES` | 1 | Fabric re-check retries after a reset | 04 |
 | `TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC` | 60 | Sleep between post-reset fabric retries | 04 |
 | `TT_DEVICE_MCP_POST_REBOOT_VERIFY` | 1 | Verify the mesh actually came back after a reboot | 04 |
 | `TT_DEVICE_MCP_AUTO_RECOVERY_INTERVAL_SEC` | 3600 | Durable rate limit between auto reboot/power-cycle rungs | 04 |
 | `TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC` | 900 | Window to attribute a boot to our own reboot rung | 04 |
-| `TT_DEVICE_MCP_POLLER_SERVICES` | `tt-telemetry.service,tt-metrics-exporter.service` | Pollers quiesced around a reset | 04 |
+| `TT_DEVICE_MCP_POLLER_SERVICES` | `tt-telemetry.service,tt-metrics-exporter.service,tt-fmax-cap.service` | Pollers quiesced around a reset; a unit the host lacks is skipped | 04 |
 | `TT_DEVICE_MCP_PRE_STEP_DEADLINE_SEC` | `120` | Wall-clock cap on the reply to an external read-only health pass, **and** the base the CLI derives its pre-step client timeout from (+60 s margin) | 03/07 |
 | `TT_DEVICE_MCP_POST_STEP_DEADLINE_SEC` | `600` | Wall-clock cap on the reply to the whole post-step route — the straggler reclaim and the recovering health pass together, not the pass alone — **and** the base the CLI derives its post-step client timeout from (+60 s margin) | 03/07 |
 
@@ -242,7 +303,7 @@ Behavior).
 | `TTDEV_MAX_DEFER_SEC` | 0 (off — apply immediately; jobs re-adopt) | Opt-in busy/idle gate: seconds autoupdate waits for an idle window. The in-flight device-op bar is separate and unconditional (spec 08) |
 | `TTDEV_LOCK` | 0 | Apply the udev device lock at install (shared host) |
 | `TTDEV_NO_LOCK` | unset | Back-compat: force cooperative (no lock) |
-| `TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`, `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_REBOOT`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_AUTO_UBB_RESET`, `TTDEV_PREJOB_DISPATCH` | unset | Per-host config keys; each renders the same-named `TT_DEVICE_MCP_*` unit env line (values already in the unit survive an update) |
+| `TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`, `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_REBOOT`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_AUTO_UBB_RESET`, `TTDEV_PREJOB_DISPATCH`, `TTDEV_AICLK_CEILING_MHZ`, `TTDEV_AICLK_CEILING_CMD`, `TTDEV_POLLER_SERVICES` | unset | Per-host config keys; each renders the same-named `TT_DEVICE_MCP_*` unit env line (values already in the unit survive an update) |
 | `TTDEV_FABRIC_DESCRIPTOR` | galaxy: shipped descriptor; else unset | Cabling descriptor for the fabric check (src, fabric.py) |
 | `TTDEV_FABRIC_BIN` | validator `run_cluster_validation` | Fabric validator binary override (src) |
 | `TTDEV_FABRIC_RUNTIME_ROOT` | validator `current/` | `TT_METAL_HOME` for the fabric check (src) |
@@ -298,6 +359,21 @@ the misconfiguration produced no error, only absent state discovered after the r
 to survive. Resolution by euid makes the safe path the default in both shapes; the env var remains
 for tests and unusual layouts, never as the mechanism that makes a stock deployment correct.
 
+**A separate flock file, not the inhibit file.** `device-op.lock` means "an op is in flight" by
+existing: the broker writes it at the start of each op and unlinks it at the end, and the
+auto-updater removes it when its pid is gone. A flock on that file would be taken on a fresh inode
+each op, and a tool that opened the path earlier would lock the old, unlinked inode and exclude
+nobody. Keeping the inhibit file unchanged also keeps the auto-updater, which reads it by
+presence and pid, working as before.
+
+**On timeout the op goes ahead.** External holds are milliseconds; a hold of 10 s is a tool
+breaking the contract, or one that is stuck. Refusing or failing the op would hand that tool a way
+to stall recovery: a failed gate leaves the device dirty, and the next reset attempt would meet
+the same lock and climb the ladder toward a power cycle because of a lock, not a fault. Going
+ahead loses only what the lock adds (a cooperating tool skipping its write), which is the
+behaviour without the lock. The WARNING and the journal event make it visible. A holder that dies
+releases the lock with its last fd, as every flock does.
+
 ## Test anchors
 
 | Claim | Anchors (pytest node ids) |
@@ -315,3 +391,7 @@ for tests and unusual layouts, never as the mechanism that makes a stock deploym
 | Jobexit perms (1777 only at the shared default) | `tests/test_readopt.py::test_a_redirected_job_exit_dir_is_not_made_world_writable` |
 | Textfile write behavior (atomic, creates dir, never raises, logs once, recovers) | `tests/test_metrics.py::test_write_textfile_is_atomic_and_leaves_no_tmp`, `tests/test_metrics.py::test_write_textfile_creates_the_directory`, `tests/test_metrics.py::test_write_textfile_never_raises_when_directory_is_unwritable`, `tests/test_metrics.py::test_write_textfile_logs_the_failure_once_per_process`, `tests/test_metrics.py::test_write_textfile_recovers_once_the_directory_is_writable_again`, `tests/test_state_paths.py::test_non_root_textfile_writer_writes_and_leaves_no_tmp` |
 | Per-user daemon health gating on by default, overridable off | `tests/test_install_modes.py::test_the_per_user_daemon_health_gates_like_any_other`, `tests/test_install_modes.py::test_an_operator_can_still_turn_the_gate_off` |
+| I8 (flock held for the op, released on return, exception and cancel) | `tests/test_device_op_flock.py::test_the_flock_is_held_for_the_op_and_released_after`, `tests/test_device_op_flock.py::test_the_flock_is_released_when_the_op_raises`, `tests/test_device_op_flock.py::test_the_flock_is_released_when_the_op_is_cancelled` |
+| I8 (children never inherit it) | `tests/test_device_op_flock.py::test_children_never_inherit_the_flock` |
+| I8 (path: sibling of the inhibit file, own override) | `tests/test_device_op_flock.py::test_the_flock_defaults_to_a_sibling_of_the_inhibit_file` |
+| I8 (a short hold delays; one past the timeout is logged and does not stall the op; unopenable path is inert) | `tests/test_device_op_flock.py::test_a_short_external_hold_only_delays_the_op`, `tests/test_device_op_flock.py::test_a_holder_that_outlasts_the_timeout_does_not_stall_the_op`, `tests/test_device_op_flock.py::test_an_unopenable_flock_path_changes_nothing` |

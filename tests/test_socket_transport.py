@@ -151,7 +151,14 @@ async def test_socket_jsonrpc_round_trip(tmp_path):
                 # report no devices (test host has none) -- never opens a device.
                 reset = await session.call_tool("tt_device_reset", {"params": {"force": False}})
                 status = _tool_payload(reset)["status"]
-                assert status in ("no_devices", "reset_complete", "reset_unhealthy", "reset_failed", "refused")
+                assert status in (
+                    "no_devices",
+                    "reset_complete",
+                    "reset_unhealthy",
+                    "reset_unverified",
+                    "reset_failed",
+                    "refused",
+                )
     finally:
         uv_server.should_exit = True
         task = getattr(uv_server, "_tt_serve_task", None)

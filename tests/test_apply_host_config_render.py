@@ -200,6 +200,22 @@ def test_prejob_dispatch_set_reaches_the_unit(tmp_path):
     assert unit.index(line) < unit.index("ExecStart=")
 
 
+def test_poller_services_unset_renders_no_line(tmp_path):
+    # Default: no line, so server.py's built-in poller list (which includes tt-fmax-cap) rules.
+    unit = _render(tmp_path, _GALAXY)
+    assert "TT_DEVICE_MCP_POLLER_SERVICES" not in unit
+
+
+def test_poller_services_set_reaches_the_unit(tmp_path):
+    # A host with yet another device poller overrides the default list via /etc/default; the list
+    # must reach the unit verbatim, before ExecStart, or a reset races that poller.
+    pollers = "tt-telemetry.service,tt-metrics-exporter.service,tt-fmax-cap.service,site-poller.service"
+    unit = _render(tmp_path, dict(_GALAXY, TTDEV_POLLER_SERVICES=pollers))
+    line = f"Environment=TT_DEVICE_MCP_POLLER_SERVICES={pollers}"
+    assert line in unit
+    assert unit.index(line) < unit.index("ExecStart=")
+
+
 def test_eth_check_python_reaches_the_unit(tmp_path):
     # The reader resolves ttexalens from this and calls it the per-box mechanism, but nothing rendered
     # it — so no host could satisfy it and the rung self-tested to OFF everywhere. Documented and
@@ -214,3 +230,30 @@ def test_eth_check_python_reaches_the_unit(tmp_path):
 def test_eth_check_python_unset_renders_no_line(tmp_path):
     unit = _render(tmp_path, _GALAXY)
     assert "TTDEV_ETH_CHECK_PYTHON" not in unit
+
+
+def test_aiclk_ceiling_unset_renders_no_line(tmp_path):
+    # Default: no ceiling. ceiling_mhz() reads None, so no helper runs and no time is added to a pass.
+    unit = _render(tmp_path, _GALAXY)
+    assert "TT_DEVICE_MCP_AICLK_CEILING" not in unit
+
+
+def test_aiclk_ceiling_set_reaches_the_unit(tmp_path):
+    # A host that caps its clock: the /etc/default value must reach the unit under the name
+    # ceiling_mhz() reads, before ExecStart, or the broker never re-applies it after a reset.
+    opted = dict(_GALAXY, TTDEV_AICLK_CEILING_MHZ="900")
+    unit = _render(tmp_path, opted)
+    line = "Environment=TT_DEVICE_MCP_AICLK_CEILING_MHZ=900"
+    assert line in unit
+    assert unit.index(line) < unit.index("ExecStart=")
+    assert "TT_DEVICE_MCP_AICLK_CEILING_CMD" not in unit
+
+
+def test_the_unit_never_orders_after_the_vendor_hugepages_service(tmp_path):
+    # tenstorrent-hugepages.service is After=multi-user.target and the broker is ordered before it
+    # (WantedBy=), so an After= on it is a boot ordering cycle: systemd deletes the broker's (or
+    # ltx-host's) start job to break it. The broker waits for the pool in-process instead.
+    unit = _render(tmp_path, _GALAXY)
+    deps = [ln for ln in unit.splitlines() if ln.split("=", 1)[0] in ("After", "Wants", "Requires", "BindsTo")]
+    assert not [ln for ln in deps if "tenstorrent-hugepages" in ln]
+    assert "Wants=dev-hugepages\\x2d1G.mount" in deps
