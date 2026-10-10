@@ -760,33 +760,15 @@ def _affected_trays(offbus_chips: set, expected: int, tray_map: Optional[dict]) 
     return sorted({tray for tray, chips in tray_map.items() if ids & set(chips)})
 
 
-def _all_trays(expected: int, tray_map: Optional[dict]) -> Optional[list]:
-    """EVERY UBB tray on the host, for the last-chance sweep that precedes a host rung: about to take the
-    box down, a drop with no tray to blame (a present-mesh eth/fabric wedge) still gets every tray
-    re-powered, because a tray re-power is strictly lighter than the reboot or power cycle it is
-    delaying. None for a host without multi-tray topology or without a cached bus map (I16): tray
-    identity is bus-derived, so no map means no tray to name."""
-    if expected < 2 * UBB_CHIP_COUNT or expected % UBB_CHIP_COUNT != 0:
-        return None
-    if not tray_map:
-        return None
-    return sorted(tray_map)
-
-
 def _ubb_tray_walk_plan(offbus_chips: set, expected: int, tray_map: Optional[dict]) -> Optional[list]:
-    """Order the trays for a one-at-a-time per-tray reset walk: every AFFECTED tray first (those that
-    hold an off-bus chip, sorted), then THE REST (sorted). Reset one tray at a time, re-verifying
-    between each, and a full sweep re-powers every tray without ever taking the whole mesh off the bus
-    at once — which is the mesh-wide reset's failure mode. The affected trays lead because they hold the
-    fault; the rest follow only if re-powering the affected ones did not clear it (a fabric wedge that
-    spans trays). None whenever :func:`_affected_trays` is None — no tray to re-power. Pure and
-    side-effect-free; the caller walks the list and decides when the mesh has verified healthy."""
-    affected = _affected_trays(offbus_chips, expected, tray_map)
-    if affected is None:
-        return None
-    lead = set(affected)
-    rest = sorted(t for t in tray_map if t not in lead)
-    return affected + rest
+    """Order the trays for a one-at-a-time per-tray reset walk: the AFFECTED trays only (those that
+    hold an off-bus chip, sorted), re-verifying between each. A tray whose chips are all on the bus is
+    never re-powered: re-powering tray Y cannot bring back a chip on tray X, and sweeping healthy trays
+    took 16+ chips off the bus in about a third of one-chip walks (spec 04 I21). If the affected trays
+    do not clear it, the ladder's next rung (the mesh reset) owns it. None whenever
+    :func:`_affected_trays` is None — no tray to re-power. Pure and side-effect-free; the caller walks
+    the list and decides when the mesh has verified healthy."""
+    return _affected_trays(offbus_chips, expected, tray_map)
 
 
 def _maybe_emit_ubb_reset_required(beats: dict, off_bus: int, expected: int, log, tray_map: Optional[dict]):
@@ -1177,11 +1159,14 @@ class GalaxyRecovery(Recovery):
         Returns whether the sweep was COMPLETE: False when the per-host gate refused it (spec 04 I20)
         or the tray envelope refused to cut power (I19). An incomplete sweep is not the full ladder,
         so the caller must not climb to a power cycle or reboot on it (I18)."""
-        allowed, why = pcie_guard.host_reset_gate(pcie_guard.chips_off_bus(expected))
+        off_bus = pcie_guard.chips_off_bus(expected)
+        allowed, why = pcie_guard.host_reset_gate(off_bus)
         if not allowed:
             log(f"back-to-back reset sweep NOT fired: {why}; holding — no host rung without the full ladder")
             health_event("host_reset_gated", context="reset_sweep", reason=why, trays=trays, host_at_risk=True)
             return False
+        # The caller ends it after its settle and verify (the host-hang latch, I21).
+        pcie_guard.begin_offbus_reset("reset sweep", off_bus)
         complete = True
         # Hold reset_in_flight across the whole sweep so the dead-chip sampler defers instead of
         # isolating a tray mid-reset. Cleared on every exit.
@@ -1254,8 +1239,9 @@ class GalaxyRecovery(Recovery):
         post-reboot cold climb — settled and verified but never re-tried the rungs, so a present-mesh
         eth wedge could be power-cycled having only ever seen mesh resets.
 
-        ``offbus_chips`` names the trays to re-power; with none known (a present-mesh wedge) EVERY tray
-        is re-powered, which is still lighter than the rung it is delaying. The sweep is SKIPPED — the
+        ``offbus_chips`` names the trays to re-power (read from the heartbeats when not given); only those
+        trays are re-powered, never one whose chips are all on the bus (I21), so a present-mesh wedge gets
+        SBR and the mesh reset but no tray re-power. The sweep is SKIPPED — the
         settle and verify still run — when a tenant holds the mesh or a reset is already cycling in its
         own scope: those are the two guards a destructive rung never crosses.
 
@@ -1264,7 +1250,14 @@ class GalaxyRecovery(Recovery):
         full ladder has not run, so the caller holds and fires no host rung this pass (I18)."""
         where = f" ({context})" if context else ""
         tray_map = self._tray_map_now()
-        trays = _affected_trays(offbus_chips or set(), expected, tray_map) or _all_trays(expected, tray_map) or []
+        if offbus_chips is None:
+            try:
+                beats = await asyncio.to_thread(self.deps.read_heartbeats)
+            except Exception as exc:  # noqa: BLE001 - an unreadable heartbeat counts every chip off, as the gate does
+                log(f"could not read the heartbeats for the last-chance sweep: {exc!r}")
+                beats = {}
+            offbus_chips = _offbus_chip_ids(beats or {}, expected)
+        trays = _affected_trays(offbus_chips, expected, tray_map) or []
         bitmap = 0
         for t in trays:
             bitmap |= 1 << (t - 1)
@@ -1299,8 +1292,11 @@ class GalaxyRecovery(Recovery):
                 )
         settle = _settle_before_host_rung_sec()
         log(f"settling {settle}s for re-enumeration, then one verify before the host rung")
-        await asyncio.sleep(settle)
-        healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+        try:
+            await asyncio.sleep(settle)
+            healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+        finally:
+            pcie_guard.end_offbus_reset()
         if not healthy:
             if not swept:
                 log(f"the full reset ladder did not run{where} — holding; no reboot or power cycle this pass")
@@ -1365,8 +1361,11 @@ class GalaxyRecovery(Recovery):
         # ONE settle, ONE verify.
         settle = _settle_before_host_rung_sec()
         log(f"back-to-back reset sweep issued — settling {settle}s, then one verify")
-        await asyncio.sleep(settle)
-        healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+        try:
+            await asyncio.sleep(settle)
+            healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+        finally:
+            pcie_guard.end_offbus_reset()
         if healthy:
             log("tray-down-no-window sweep recovered the mesh — no power cycle needed")
             health_event("tray_down_no_window_recovered", trays=trays, evidence=evidence)
@@ -2011,10 +2010,11 @@ class GalaxyRecovery(Recovery):
     async def _attempt_ubb_tray_reset(self, beats: dict, off_bus: int, expected: int, log) -> Optional[bool]:
         """The per-tray BMC reset rung, between the per-chip bridge reset and the mesh-wide reset. It walks
         the AFFECTED trays — those holding an off-bus chip — one at a time, re-verifying (chips back, ARC
-        advancing, FABRIC re-checked) after each and stopping as soon as the whole mesh verifies healthy; if
-        re-powering the affected trays does not clear the drop it walks the REST, still one at a time. A full
-        sweep re-powers every tray WITHOUT taking the mesh off the bus all at once — unlike the mesh-wide
-        reset, which inverted an 8-chip drop to 32 off the bus and can hard-exit.
+        advancing, FABRIC re-checked) after each and stopping as soon as the whole mesh verifies healthy. It
+        never re-powers a tray whose chips are all on the bus (spec 04 I21): if the affected trays do not
+        clear the drop, the ladder's next rung owns it. A tray re-power never takes the mesh off the bus all
+        at once — unlike the mesh-wide reset, which inverted an 8-chip drop to 32 off the bus and can
+        hard-exit.
 
         Returns True when a tray reset recovered the mesh (the caller clears the hold), False when the walk
         ran and did not (the caller holds; a warm reboot cannot revive a still-off-bus tray, so the next rung
@@ -2080,13 +2080,13 @@ class GalaxyRecovery(Recovery):
             health_event("host_reset_gated", context="ubb_tray_walk", reason=why, host_at_risk=True)
             metrics.stage_fired("ubb_tray", "blocked")
             return None
-        affected = set(_affected_trays(offbus_ids, expected, tray_map))
         # Latch before firing, not after: a walk that throws or does not recover must not re-fire next pass.
         self.deps.set_device_hold_episode_ubb_reset_fired(True)
         log(
             f"UBB tray-down ({off_bus}/{expected} off the bus) — walking the per-tray BMC reset (opted in): "
-            f"affected trays {sorted(affected)} first, then the rest, one at a time: {walk}"
+            f"the affected trays only, one at a time: {walk}"
         )
+        pcie_guard.begin_offbus_reset("tray re-power", off_bus)
         # A tray reset takes its 8 chips transiently off the bus, reading all-ones exactly like a dead
         # chip. Hold self.mechanism.reset_in_flight across the whole walk so the dead-chip sampler defers instead
         # of isolating a tray mid-reset and tearing it out of the kernel. Cleared on every exit.
@@ -2096,7 +2096,7 @@ class GalaxyRecovery(Recovery):
                 bitmap = 1 << (tray - 1)
                 tray_chip_ids = list(tray_map[tray])
                 command = " ".join(_ubb_reset_argv(bitmap))
-                role = "affected" if tray in affected else "sweep"
+                role = "affected"
                 health_event(
                     "ubb_reset_begin",
                     tray=tray,
@@ -2145,11 +2145,12 @@ class GalaxyRecovery(Recovery):
                     health_event("ubb_reset_recovered", tray=tray, walked=step + 1)
                     return True
             log(
-                "the per-tray reset walk re-powered the affected trays and then the rest, one at a time, and "
-                "the mesh still did not verify — holding; a warm reboot cannot re-enumerate a still-off-bus "
-                "tray, so the next rung is the cold power cycle, not a reboot"
+                "the per-tray reset walk re-powered the affected trays, one at a time, and the mesh still did "
+                "not verify — the ladder's next rung owns it; a warm reboot cannot re-enumerate a still-off-bus "
+                "tray, so the host rung above it is the cold power cycle, not a reboot"
             )
             health_event("ubb_reset_did_not_recover", trays=walk)
             return False
         finally:
             self.mechanism.reset_in_flight = False
+            pcie_guard.end_offbus_reset()

@@ -16,12 +16,16 @@ getting there:
 * :func:`host_reset_gate` — the per-host switch (``TT_DEVICE_MCP_HOST_RESET_GATE``) that refuses an
   automatic reset while chips are off the bus or AER errors are flooding.
 * :func:`safe_tray_repower` — the full envelope around one per-tray BMC re-power, with a dry run.
+* The host-hang latch — :func:`begin_offbus_reset` writes an intent before an automatic reset with
+  chips off the bus, and :func:`check_offbus_reset_latch` reads one left by an earlier boot as a
+  reset that hung the host, and holds every later off-bus reset until an operator clears it.
 
 Everything reads and writes through :data:`SYS_ROOT` so tests run against a fake tree.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -29,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from tt_device_mcp.health.evidence import health_event
+from tt_device_mcp.health.evidence import health_dir, health_event
 
 SYS_ROOT = Path("/")
 TT_VENDOR = 0x1E52
@@ -337,7 +341,10 @@ GATE_OFF, GATE_GUARD, GATE_HOLD = "off", "guard", "hold"
 def gate_mode() -> str:
     """``TT_DEVICE_MCP_HOST_RESET_GATE``: ``off`` (default) keeps the old reset behaviour; ``guard``
     masks AER on every Tenstorrent root port around each automatic mesh reset and refuses one while
-    AER errors flood; ``hold`` also refuses one while any chip is off the bus. Set per host."""
+    AER errors flood; ``hold`` also refuses one while any chip is off the bus. Set per host. A latched
+    host-hang hold (:func:`check_offbus_reset_latch`) reads as ``hold`` whatever the setting."""
+    if offbus_reset_latched() is not None:
+        return GATE_HOLD  # the last off-bus reset hung this host: hold until an operator clears it
     mode = os.environ.get("TT_DEVICE_MCP_HOST_RESET_GATE", GATE_OFF).strip().lower()
     return mode if mode in (GATE_GUARD, GATE_HOLD) else GATE_OFF
 
@@ -358,10 +365,107 @@ def host_reset_gate(off_bus: int) -> tuple:
     if mode == GATE_OFF:
         return True, ""
     if mode == GATE_HOLD and off_bus > 0:
+        latch = offbus_reset_latched()
+        if latch is not None:
+            return False, (
+                f"{off_bus} chip(s) off the bus and the off-bus reset before boot {latch.get('boot_id', '?')} "
+                f"hung the host; held until an operator runs `{CLEAR_LATCH_CMD}`"
+            )
         return False, f"{off_bus} chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold"
     if aer_flooding():
         return False, f"AER errors are flooding the Tenstorrent root ports (TT_DEVICE_MCP_HOST_RESET_GATE={mode})"
     return True, ""
+
+
+# ---- the host-hang latch ----------------------------------------------------------------------------
+
+INTENT_FILE = "offbus_reset_intent.json"
+LATCH_FILE = "offbus_reset_hold.json"
+CLEAR_LATCH_CMD = "python -m tt_device_mcp.health.recovery.pcie_guard --clear-hang-latch"
+_INTENT_OPEN = False
+
+
+def _boot_id() -> str:
+    try:
+        return (SYS_ROOT / "proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _latch_enabled() -> bool:
+    return os.environ.get("TT_DEVICE_MCP_OFFBUS_HANG_LATCH", "1").strip() != "0"
+
+
+def begin_offbus_reset(kind: str, off_bus: int) -> None:
+    """Before an automatic reset or re-power fires with ``off_bus`` chips off the bus: write down,
+    with this boot's id, that it is about to run. :func:`end_offbus_reset` removes the note once the
+    reset and its verify are over. A note a later boot finds means the host died in between."""
+    global _INTENT_OPEN
+    if off_bus <= 0 or not _latch_enabled():
+        return
+    path = health_dir() / INTENT_FILE
+    rec = {"kind": kind, "off_bus": off_bus, "boot_id": _boot_id(), "at_epoch": time.time()}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec))
+            f.flush()
+            os.fsync(f.fileno())
+        _INTENT_OPEN = True
+    except OSError as exc:
+        health_event("offbus_reset_intent_unwritable", error=repr(exc), host_at_risk=True)
+
+
+def end_offbus_reset() -> None:
+    """The reset begun by :func:`begin_offbus_reset` is over and the host is still up."""
+    global _INTENT_OPEN
+    if _INTENT_OPEN:
+        _INTENT_OPEN = False
+        (health_dir() / INTENT_FILE).unlink(missing_ok=True)
+
+
+def offbus_reset_latched() -> Optional[dict]:
+    """The latched host-hang record, or None when no hold is latched."""
+    try:
+        return json.loads((health_dir() / LATCH_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
+    """At broker start: an intent left by another boot is an off-bus reset the host did not survive.
+    Latch the gate to ``hold`` for off-bus resets, report it, and return the record. An intent from
+    this same boot (the broker restarted, the host did not) is dropped."""
+    path = health_dir() / INTENT_FILE
+    try:
+        intent = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return offbus_reset_latched()
+    path.unlink(missing_ok=True)
+    if intent.get("boot_id") == _boot_id() or not _latch_enabled():
+        return offbus_reset_latched()
+    rec = dict(intent, latched_on_boot=_boot_id(), latched_at_epoch=time.time())
+    try:
+        (health_dir() / LATCH_FILE).write_text(json.dumps(rec))
+    except OSError as exc:
+        log(f"could not persist the host-hang hold: {exc!r}; holding for this boot only")
+    log(
+        f"the {intent.get('kind')} that ran with {intent.get('off_bus')} chip(s) off the bus did not finish "
+        f"before the host went down: automatic resets over off-bus chips are HELD until an operator runs "
+        f"`{CLEAR_LATCH_CMD}`"
+    )
+    health_event("offbus_reset_hold_latched", intent=intent, clear=CLEAR_LATCH_CMD, host_at_risk=True)
+    return rec
+
+
+def clear_offbus_reset_latch() -> bool:
+    """Operator step: lift the host-hang hold. True when one was latched."""
+    path = health_dir() / LATCH_FILE
+    if not path.exists():
+        return False
+    path.unlink()
+    health_event("offbus_reset_hold_cleared")
+    return True
 
 
 def mask_for_mesh_reset(log) -> Optional[AerMask]:
@@ -536,13 +640,19 @@ def main(argv: Optional[list] = None) -> int:
     import sys
 
     args = sys.argv[1:] if argv is None else argv
+    if args == ["--clear-hang-latch"]:
+        print("host-hang hold cleared" if clear_offbus_reset_latch() else "no host-hang hold was latched")
+        return 0
     if not args:
-        print("usage: pcie_guard <bitmap> [chip ...]")
+        print("usage: pcie_guard <bitmap> [chip ...] | --clear-hang-latch")
         return 2
     plan = plan_tray_repower(int(args[0], 0), [int(a) for a in args[1:]])
     print(f"trays {plan.trays}\nfunctions {plan.functions}\nchips {plan.chips}\nroot ports {plan.root_ports}")
     print(f"mismatch: {plan.mismatch or 'none'}")
     print(f"gate: {gate_mode()}")
+    latch = offbus_reset_latched()
+    if latch is not None:
+        print(f"host-hang hold LATCHED: {latch}; clear with `{CLEAR_LATCH_CMD}`")
     return 1 if plan.mismatch else 0
 
 

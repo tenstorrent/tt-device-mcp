@@ -78,6 +78,7 @@ and job exit statuses never hit disk.
 | Socket | `/run/tt-device-broker/broker.sock` (`RuntimeDirectory=`, chmod 0666) | `<state>/daemon.sock` | `--socket` / `TT_DEVICE_MCP_SOCKET` |
 | FSM state file | `/var/lib/tt-device-broker/health/fsm.json` | `<state>/health/fsm.json` | follows the health dir |
 | Health journal (events, telemetry trace, buslock, chip baseline, incidents/) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
+| Off-bus reset intent and host-hang latch (`offbus_reset_intent.json`, `offbus_reset_hold.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Server log + job logs | `/var/log/tt-device-broker/` (the unit passes `--log-dir`; the bare server defaults to CWD) | `<state>/` | `--log-dir` |
 | Stats | `<log-dir>/stats/` → `/var/log/tt-device-broker/stats/` | `<state>/stats/` | follows `--log-dir` |
 | Metrics textfile | `/var/lib/prometheus/node-exporter/tt_device_mcp.prom` | `<state>/metrics/tt_device_mcp.prom` | `TT_DEVICE_MCP_TEXTFILE_DIR` |
@@ -200,6 +201,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_AUTO_UBB_RESET` | 1 | Arm the per-tray UBB reset rung | 04 |
 | `TT_DEVICE_MCP_UBB_RESET_SETTLE_SEC` | 28 | Settle time after a UBB tray reset | 04 |
 | `TT_DEVICE_MCP_HOST_RESET_GATE` | off | `off`, `guard` (mask AER around automatic resets, refuse during an AER flood) or `hold` (also refuse while a chip is off the bus) | 04 |
+| `TT_DEVICE_MCP_OFFBUS_HANG_LATCH` | 1 | `0` turns off the off-bus reset intent and the host-hang latch (spec 04 I21) | 04 |
 | `TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN` | unset | `1`: log the per-tray re-power plan and refuse it | 04 |
 | `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` | 10 | How long a tray re-power waits for holders of the tray's chips | 04 |
 | `TT_DEVICE_MCP_AER_QUIET_CHECK_SEC` | 2 | How long a root port must stay error-free before its AER settings are restored | 04 |

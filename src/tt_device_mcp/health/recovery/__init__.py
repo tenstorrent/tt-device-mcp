@@ -393,7 +393,21 @@ class Recovery(ABC):
         sbr = bridge_reset_enabled()
         if not sbr:
             log(f"per-chip bridge reset unavailable ({bridge_reset_unavailable_reason()}) — trying a PCI rescan")
+        # An SBR takes its chip off the bus like any reset, so the per-host gate (spec 04 I20) holds it
+        # too: the isolated chips are off the bus by definition.
+        gated, why = False, ""
+        if sbr:
+            allowed, why = pcie_guard.host_reset_gate(len(targets))
+            gated = not allowed
+        if gated:
+            log(f"per-chip bridge reset NOT fired: {why} — trying a PCI rescan")
+            health_event("host_reset_gated", context="bridge_reset", chips=targets, reason=why, host_at_risk=True)
         for idx in targets:
+            if gated:
+                inapplicable.append(idx)
+                self.last_bridge_reset_reasons[idx] = {"reason": "gated"}
+                metrics.stage_fired("bridge_reset", "blocked")
+                continue
             if not sbr:
                 inapplicable.append(idx)
                 # NOT no_bridge: that means the endpoint left the bus, which is the drop measured
@@ -562,6 +576,13 @@ class Recovery(ABC):
         fatal and takes the host down with it. One attempt, then back off and let the
         caller report honestly. Returns True if the device verified healthy.
         """
+        try:
+            return await self._reset_and_verify_device_once(indices, log)
+        finally:
+            # The reset and its verify are over and the host is still up: an off-bus intent is spent.
+            pcie_guard.end_offbus_reset()
+
+    async def _reset_and_verify_device_once(self, indices: list, log) -> bool:
         # Reset per call: only a reset that actually EXITS non-zero this pass sets it below. An adopted
         # foreign scope or a clean-exit-but-unverified reset must not leave a stale hard-fail flag that
         # steers the next gate's escalation to the cold rung over a reset that never hard-failed.
@@ -597,11 +618,13 @@ class Recovery(ABC):
         # The per-host gate (spec 04 I20): on a host whose resets have flooded AER into a crash, an
         # automatic reset never fires over chips already off the bus or during a flood, and the
         # Tenstorrent root ports are masked for the reset window. Off by default.
-        allowed, why = pcie_guard.host_reset_gate(pcie_guard.chips_off_bus(expected))
+        off_bus = pcie_guard.chips_off_bus(expected)
+        allowed, why = pcie_guard.host_reset_gate(off_bus)
         if not allowed:
             log(f"automatic reset NOT fired: {why}; holding for an operator")
             health_event("host_reset_gated", argv=argv, reason=why, host_at_risk=True)
             return False
+        pcie_guard.begin_offbus_reset("mesh reset", off_bus)
         aer_mask = pcie_guard.mask_for_mesh_reset(log)
         try:
             rc, out = await self.mechanism.reset_with_quiesce(argv, log)

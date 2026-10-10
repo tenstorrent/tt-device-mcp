@@ -8,6 +8,7 @@ order 0x0X, 0x4X, 0xCX, 0x8X (so trays 3 and 4 are where list position puts them
 round, issue #27). Nothing here reaches a real device or a real config space.
 """
 
+import json
 import os
 import sys
 import types
@@ -383,3 +384,139 @@ async def test_guard_masks_the_root_ports_around_an_automatic_mesh_reset(sysfs, 
 
 async def _false():
     return False
+
+
+# ---------------------------------------------------------------- host-hang latch (spec 04 I21)
+
+
+def _boot(root, boot_id):
+    p = root / "proc/sys/kernel/random/boot_id"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(boot_id + "\n")
+
+
+def test_an_off_bus_reset_writes_an_intent_and_removes_it_when_done(sysfs):
+    _boot(sysfs, "boot-a")
+    intent = pcie_guard.health_dir() / pcie_guard.INTENT_FILE
+    pcie_guard.begin_offbus_reset("tray re-power", 0)
+    assert not intent.exists(), "no chip off the bus -> no intent"
+    pcie_guard.begin_offbus_reset("tray re-power", 2)
+    assert json.loads(intent.read_text())["boot_id"] == "boot-a"
+    pcie_guard.end_offbus_reset()
+    assert not intent.exists()
+
+
+def test_an_intent_from_a_boot_that_died_latches_hold_until_cleared(sysfs, monkeypatch):
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
+    _boot(sysfs, "boot-a")
+    pcie_guard.begin_offbus_reset("mesh reset", 1)  # the host dies before end_offbus_reset
+    monkeypatch.setattr(pcie_guard, "_INTENT_OPEN", False)
+    _boot(sysfs, "boot-b")
+    latch = pcie_guard.check_offbus_reset_latch(lambda m: None)
+    assert latch["boot_id"] == "boot-a" and latch["kind"] == "mesh reset"
+    assert events[0][0] == "offbus_reset_hold_latched" and events[0][1]["host_at_risk"] is True
+    assert not (pcie_guard.health_dir() / pcie_guard.INTENT_FILE).exists()
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_HOLD, "the latch overrides a configured gate of off"
+    allowed, why = pcie_guard.host_reset_gate(1)
+    assert not allowed and "--clear-hang-latch" in why
+    assert pcie_guard.host_reset_gate(0)[0] is True, "a reset with every chip present still runs"
+    assert pcie_guard.check_offbus_reset_latch(lambda m: None) is not None, "the latch survives a restart"
+    assert pcie_guard.main(["--clear-hang-latch"]) == 0
+    assert pcie_guard.offbus_reset_latched() is None
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_OFF
+
+
+def test_an_intent_from_this_boot_does_not_latch(sysfs):
+    _boot(sysfs, "boot-a")
+    pcie_guard.begin_offbus_reset("tray re-power", 1)
+    pcie_guard.check_offbus_reset_latch(lambda m: None)  # broker restarted, host did not
+    assert pcie_guard.offbus_reset_latched() is None
+
+
+def test_the_latch_can_be_switched_off(sysfs, monkeypatch):
+    _boot(sysfs, "boot-a")
+    pcie_guard.begin_offbus_reset("tray re-power", 1)
+    _boot(sysfs, "boot-b")
+    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HANG_LATCH", "0")
+    assert pcie_guard.check_offbus_reset_latch(lambda m: None) is None
+    assert pcie_guard.offbus_reset_latched() is None
+
+
+@pytest.mark.asyncio
+async def test_a_tray_re_power_carries_an_intent_and_ends_it(monkeypatch, clear_job_state, galaxy_trays):
+    """The walk writes the intent before it fires and removes it once its verify is over."""
+    monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-a")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    intent = pcie_guard.health_dir() / pcie_guard.INTENT_FILE
+    seen = []
+    srv.fsm.set_latch("ubb_reset_fired", False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+
+    async def healthy(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}}
+
+    patch_recovery(monkeypatch, "_verify_device", healthy)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: seen.append(intent.exists()), raising=False)
+    beats = {str(i): 100 for i in range(31)}  # chip 31 off
+    assert await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 1, 32, lambda m: None) is True
+    assert seen == [True], "the intent is on disk while the re-power runs"
+    assert not intent.exists()
+
+
+# ---------------------------------------------------------------- per-chip bridge SBR under the gate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("latched", [False, True])
+async def test_the_per_chip_bridge_reset_obeys_the_hold_gate_and_the_latch(sysfs, monkeypatch, latched):
+    from tt_device_mcp.health import recovery as recovery_pkg
+
+    if latched:
+        monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
+        (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).write_text('{"boot_id": "boot-a"}')
+    else:
+        monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
+    srv.isolated_chips = {"1"}
+    srv.device_pci_map = {"1": "0000:41:00.0"}
+    monkeypatch.setattr(recovery_pkg, "bridge_reset_enabled", lambda: True)
+    monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", lambda *a: pytest.fail("gated SBR fired"))
+    monkeypatch.setattr(srv, "_set_device_op_detail", lambda d: None)
+    g = srv.galaxy_recovery
+    await g._recover_isolated_chips(lambda m: None)
+    assert g.last_bridge_reset_reasons == {"1": {"reason": "gated"}}
+    srv.isolated_chips = set()
+
+
+# ---------------------------------------------------------------- last-chance sweep: affected trays only
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("off, trays", [(set(range(24, 32)), [3]), (set(), [])])
+async def test_the_last_chance_sweep_re_powers_only_the_affected_trays(
+    monkeypatch, clear_job_state, galaxy_trays, off, trays
+):
+    """Spec 04 I21: a caller that names no off-bus chips gets them read from the heartbeats; only trays
+    holding one are re-powered. A present mesh gets SBR and the mesh reset but no tray re-power."""
+    g = srv.galaxy_recovery
+    swept = []
+
+    async def sweep(bitmap, ids, trays_, expected, log, do_sbr):
+        swept.append(trays_)
+        return True
+
+    async def bad(expected, log, run_fabric=True, **k):
+        return False, {}
+
+    monkeypatch.setattr(g, "_issue_all_resets_back_to_back", sweep)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(g.deps, "read_heartbeats", lambda: {str(i): 100 for i in range(32) if i not in off})
+    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    patch_recovery(monkeypatch, "_verify_device", bad)
+    assert await g._settle_and_verify_before_host_rung(32, lambda m: None, "x") is False
+    assert swept == [trays]

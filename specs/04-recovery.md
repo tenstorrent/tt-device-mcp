@@ -269,6 +269,22 @@ each rung fires only when the gentler one failed or cannot apply.
   from zero). `hold` also refuses while any chip has no PCI function, so a reset that dropped a chip
   is not re-issued over it. A refusal is a hold for an operator, never a climb (I18). Operator and
   tool resets are not gated.
+  The per-chip bridge SBR is gated the same way, counting its target chips as off the bus: under
+  `hold` (or the I21 latch) it does not fire, and the PCI rescan still runs.
+
+- **I21 — Re-power only affected trays; latch hold after an off-bus reset hung the host.** The
+  automatic tray walk and the last-chance sweep re-power only trays that hold an off-bus chip (read
+  from the heartbeats when the caller names none), each through the I19 envelope and its sysfs
+  cross-check. A tray whose chips are all on the bus is never re-powered automatically; if chips are
+  still off after their trays, the next rung runs as the I20 gate allows (no rung is skipped before
+  a power cycle, I18). Re-powering tray X alone recovers chips off on tray X, as the old walk did.
+  Before an automatic mesh reset, tray re-power or sweep with a chip off the bus, the broker writes
+  `offbus_reset_intent.json` (with the boot id) to the health dir and removes it after the reset's
+  verify. A broker that starts on another boot id and finds that intent writes
+  `offbus_reset_hold.json`, emits `offbus_reset_hold_latched` (host at risk), and from then on runs
+  the I20 gate as `hold`, whatever it is configured to. The latch survives restarts until an
+  operator runs `python -m tt_device_mcp.health.recovery.pcie_guard --clear-hang-latch`.
+  `TT_DEVICE_MCP_OFFBUS_HANG_LATCH=0` turns the intent and the latch off.
 
 ## Interfaces
 
@@ -521,6 +537,9 @@ NOT be conflated when reading results.
 | I19 holders: wait, then refuse | `tests/test_pcie_guard.py::test_envelope_waits_for_holders_then_refuses_without_touching_anything`, `::test_envelope_proceeds_once_the_holder_lets_go` |
 | I19 an erroring port stays masked and starts the flood window | `tests/test_pcie_guard.py::test_a_port_that_keeps_erroring_stays_masked_and_marks_a_flood` |
 | I19 dry run and plan CLI touch nothing | `tests/test_pcie_guard.py::test_dry_run_logs_the_plan_and_touches_nothing`, `::test_cli_prints_the_plan` |
+| I20 the per-chip bridge SBR obeys the hold gate and the latch | `tests/test_pcie_guard.py::test_the_per_chip_bridge_reset_obeys_the_hold_gate_and_the_latch` |
+| I21 the walk and the sweep re-power only affected trays; X alone recovers chips off on X; a failed walk climbs to the mesh reset | `tests/test_ubb_tray_map.py::test_the_walk_covers_only_the_affected_trays`, `tests/test_device_safety.py::test_ubb_tray_walk_plan_walks_only_the_affected_trays`, `::test_ubb_tray_reset_walk_recovers_chips_off_on_any_tray_by_re_powering_that_tray_alone`, `::test_ubb_tray_reset_walk_never_sweeps_healthy_trays_when_the_affected_tray_does_not_recover`, `::test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_whole_sweep_fails`, `tests/test_pcie_guard.py::test_the_last_chance_sweep_re_powers_only_the_affected_trays` |
+| I21 the host-hang latch: intent, latch on a new boot, not on the same boot, clear, opt-out | `tests/test_pcie_guard.py::test_an_off_bus_reset_writes_an_intent_and_removes_it_when_done`, `::test_an_intent_from_a_boot_that_died_latches_hold_until_cleared`, `::test_an_intent_from_this_boot_does_not_latch`, `::test_the_latch_can_be_switched_off`, `::test_a_tray_re_power_carries_an_intent_and_ends_it` |
 | I20 gate modes: off by default, hold on an off-bus chip, guard on a flood | `tests/test_pcie_guard.py::test_gate_is_off_by_default`, `::test_hold_refuses_a_reset_over_chips_already_off_the_bus`, `::test_guard_refuses_during_an_aer_flood`, `::test_first_look_after_a_recent_boot_counts_errors_since_boot`, `::test_hold_gate_stops_an_automatic_mesh_reset_over_an_off_bus_chip`, `::test_guard_masks_the_root_ports_around_an_automatic_mesh_reset` |
 | I17 a rung the process cannot execute reads OFF (reboot, power cycle, tray, bridge) | `tests/test_rung_privilege.py::test_a_non_root_daemon_has_no_reboot_rung`, `::test_a_host_without_systemd_has_no_reboot_rung`, `::test_an_unreachable_bmc_has_no_power_cycle_rung`, `::test_an_unreachable_bmc_has_no_tray_rung`, `::test_a_non_root_daemon_has_no_bridge_rung` |
 | I17 the inventory reads the tray rung OFF on a committed per-target host, naming the platform; unresolved or Galaxy keeps it | `tests/test_rung_privilege.py::test_a_per_target_host_has_no_tray_rung`, `::test_an_unresolved_platform_keeps_the_tray_rung`, `::test_a_galaxy_keeps_the_tray_rung` |

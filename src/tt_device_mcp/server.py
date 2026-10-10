@@ -8329,6 +8329,13 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
     # not taken here is a crash nobody will ever explain. These hosts reboot most days;
     # taken every start, that becomes a distribution of real causes instead of a theory.
     await asyncio.to_thread(_record_previous_boot_error)
+    # An automatic reset over off-bus chips that the last boot never finished hung the host: latch the
+    # off-bus reset gate to hold until an operator clears it (spec 04 I21).
+    from tt_device_mcp.health.recovery import pcie_guard
+
+    await asyncio.to_thread(
+        pcie_guard.check_offbus_reset_latch, lambda m: logger.warning(f"STARTUP {m}") if logger else None
+    )
 
     # A reset started by the broker we are replacing may still be going in its
     # restart-safe backend. Wait it out before anything else touches the device.
