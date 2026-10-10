@@ -9799,8 +9799,8 @@ def create_mcp_server() -> MCPServer:
 
         Duration: about 2 minutes on a healthy Galaxy (reset ~60s + fabric pass
         45-75s), about 4 minutes when the first fabric pass finds no trained link
-        and is re-checked after a 60s wait. Worst case at the defaults: about 26
-        minutes (poller stop and restart up to 120s + reset 600s + PCI rescan 3s
+        and is re-checked after a 60s wait. Worst case at the defaults: about 27
+        minutes (poller stop and restart up to 180s + reset 600s + PCI rescan 3s
         + a first verify pass of up to 361s + the 60s wait + a last verify pass
         of up to 436s, which adds the 75s kill of a timed-out check). Only the
         last pass can time out: a re-check follows a pass that finished. Each

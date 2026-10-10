@@ -785,8 +785,8 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
         return float(re.search(pattern, inspect.getsource(fn)).group(1))
 
     # Stop, then restart, each poller service; each systemctl call is bounded on its own.
-    # The shipped default services, read from the source like the retry defaults below.
-    services = re.search(r'"TT_DEVICE_MCP_POLLER_SERVICES", "([^"]*)"', inspect.getsource(srv)).group(1)
+    # The shipped default services, not the live list a test environment may override.
+    services = srv.DEFAULT_POLLER_SERVICES
     n_services = len([x for x in services.split(",") if x.strip()])
     pollers = 2 * n_services * literal(srv._set_device_pollers, r"timeout=(\d+)")
     rescan = literal(recovery_base.RecoveryMechanism.reset_with_quiesce, r"asyncio\.sleep\((\d+)\)")
