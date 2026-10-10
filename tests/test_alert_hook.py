@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""The opt-in alert hook for stuck holds (spec 03 I30)."""
+"""The opt-in alert hook for stuck holds (spec 03 I37)."""
 
 import json
 import os
@@ -113,6 +113,7 @@ def _restart_broker(monkeypatch):
     monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
     monkeypatch.setattr(srv, "device_hold_alert_next_bucket", 0)
     monkeypatch.setattr(srv, "device_hold_alert_gap", 0)
+    monkeypatch.setattr(srv, "_hold_episode_restorable", True)  # a new process may inherit the clock
     srv._note_tenant_gate_verdict("eth/fabric fault on a present mesh")
     assert srv.device_hold_episode_since == SINCE.isoformat()
 

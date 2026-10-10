@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in operator alert hook (spec 03 I30).
+"""Opt-in operator alert hook (spec 03 I37).
 
 ``TT_DEVICE_MCP_ALERT_CMD`` names a command (split like a shell word list, run without a shell) that
 the broker runs with one event as JSON on stdin. Unset or blank, nothing runs. The command runs on

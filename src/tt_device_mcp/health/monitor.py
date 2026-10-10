@@ -23,17 +23,47 @@ import time
 from datetime import datetime
 from typing import Callable, Optional
 
-from tt_device_mcp import metrics
-from tt_device_mcp.constants import FABRIC_CHECK_CANNOT_CHECK_RC, FABRIC_CHECK_TIMEOUT_SEC
+from tt_device_mcp import aio, metrics
+from tt_device_mcp.constants import (
+    ETH_POST_JOB_TIMEOUT_SEC,
+    FABRIC_CHECK_CANNOT_CHECK_RC,
+    FABRIC_CHECK_TIMEOUT_SEC,
+)
+from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import health_dir, health_event
-from tt_device_mcp.health.monitors import eth, fabric, hostpci
+from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
+
+# How much of a fabric run's output the action-log row keeps for a run that got no healthy verdict:
+# the tail, where a wrapper prints its verdict, bounded so a chatty validator cannot fill the disk.
+ACTION_LOG_OUTPUT_CHARS = 8000
+
+
+def _override_reason(text: str) -> str:
+    """The reason an operator's fabric wrapper gives for its exit code, as one line.
+
+    The validator's first error line wins (see :func:`fabric.first_reason`: what() before the
+    'terminate called' banner above it): the wrapper prints its verdict AFTER the validator's own
+    output, and a multi-line verdict put the cause on a line above the last, so the last line alone
+    said "no link was tested" and dropped why. With no such line, the last line is the wrapper's
+    own verdict."""
+    reason = fabric.first_reason(text)
+    if reason:
+        return reason
+    lines = [line for line in text.splitlines() if line.strip()]
+    return lines[-1].strip() if lines else "(no output)"
 
 
 def _verdict_label(ok: Optional[bool]) -> str:
     """The tri-state ``(ok, unhealthy, could-not-check)`` every probe here returns, in
     :data:`metrics.VERDICTS` terms."""
     return "healthy" if ok is True else "skipped" if ok is None else "unhealthy"
+
+
+# The detail prefix of an eth read whose cores all advanced but whose measured link count fell
+# below this host's high-water mark (see HealthMonitor.eth_link_drop). update() tells this skip
+# apart from a read that reached no verdict: the drop persists until an operator re-baselines.
+ETH_LINK_DROP_SKIP = "skipped (eth links unverified)"
 
 
 # Every board type tt-smi cannot identify, including the literal it emits when an ARC read fails.
@@ -62,6 +92,7 @@ class HealthMonitor:
     """
 
     CHIP_BASELINE_FILE = "chip_baseline.json"
+    ETH_LINK_BASELINE_FILE = "eth_link_baseline.json"
 
     def __init__(self, deps) -> None:
         self._deps = deps
@@ -86,6 +117,11 @@ class HealthMonitor:
         # that has left the bus is absent from every later snapshot AND from sysfs, so the tray
         # rung that needs its bus (spec 04 I16) can only ever read one taken before the drop.
         self._bus_ids: Optional[list] = None
+        # {chip index: PCI address} read from sysfs while every chip was on the bus — the map the
+        # tray rung actually keys on (spec 04 I16). tt-smi lists chips in PCI order and the kernel
+        # numbers them in its own order, so ``_bus_ids`` read by position names the wrong chip.
+        # Re-banked by any later trusted full read that differs: the kernel can re-number chips.
+        self._chip_buses: Optional[dict] = None
         self._glx_cache: Optional[tuple] = None
 
         # The once-per-process dedup for no-verdict skip journaling: the fabric and eth-heartbeat
@@ -120,12 +156,26 @@ class HealthMonitor:
         *,
         run_fabric: bool,
         force_fabric: bool = False,
+        run_eth: bool = False,
+        fabric_stale: bool = True,
         indices: Optional[list] = None,
         expected: Optional[int] = None,
         log: Optional[Callable[[str], None]] = None,
     ) -> HealthState:
         """Run one probe pass — heartbeat+pci always, then eth, then the fabric traffic pass
         when ``run_fabric``/``force_fabric`` — and store it as the new ``readings`` blackboard.
+
+        ``run_eth`` asks for the passive eth read WITHOUT the traffic pass: the clean post-job gate
+        on a host whose eth rung is armed (spec 03 I30). The read is bounded to
+        ``ETH_POST_JOB_TIMEOUT_SEC`` there. A frozen verdict stops the pass as usual; a read that
+        reached no verdict (its own timeout, a crash, a could-not-check) runs the fabric traffic
+        pass in this same pass, because on an armed host that read has answered before and a
+        read that now cannot is the stuck-read shape a fabric failure follows. Pass it only when
+        the rung is armed: a disarmed reader always skips, so ``run_eth`` there would buy the
+        traffic pass on every call. A ``run_eth`` read skipped for a link-count drop (``eth_link_drop``)
+        runs that traffic pass only when ``fabric_stale`` (no pass fresher than the caller's
+        interval): the drop persists until an operator re-baselines, so running the pass on it
+        would charge every clean job ~45-100s. Otherwise the skip is recorded and the pass ends.
 
         Mirrors ``Recovery._verify_device``'s gentlest-first short-circuiting (a frozen heartbeat
         or a failed snapshot skips every heavier, more perturbing check below it — the traffic
@@ -202,13 +252,36 @@ class HealthMonitor:
         if log:
             log(f"snapshot: {'OK' if ok else 'UNHEALTHY'} — {detail}")
         _record("pci", ok, detail)
-        if ok and (run_fabric or force_fabric):
+        # The operator's AICLK ceiling, re-proven (and re-applied where a chip lost it) on every
+        # pass once the snapshot showed the chips present — a reset, power cycle, boot or job exit
+        # may have cleared it — and before the eth read and the traffic pass, so no load the broker
+        # drives runs above it. ~2 ms per chip. Off (no step, no observation) when unconfigured.
+        if ok and CEILING.armed():
+            self._deps.set_device_op_detail("health check: AICLK ceiling")
+            cok, cdetail, cevidence = await CEILING.apply(phase, log=log, terminate=self._terminate_process_group)
+            if cok is not None:
+                _record("aiclk_ceiling", cok, cdetail, cevidence)
+            if cok is False:
+                return _store()
+        fabric_asked = run_fabric or force_fabric
+        if ok and (fabric_asked or run_eth):
             self._deps.set_device_op_detail("health check: eth-core heartbeat (passive)")
-            eok, edetail = await self.verify_eth_heartbeat()
+            if fabric_asked:
+                eok, edetail = await self.verify_eth_heartbeat()
+            else:
+                eok, edetail = await self.verify_eth_heartbeat(timeout_sec=ETH_POST_JOB_TIMEOUT_SEC)
             if log:
                 log(f"eth-heartbeat: {'SKIPPED' if eok is None else ('OK' if eok else 'FROZEN')} — {edetail}")
             _record("eth_heartbeat", eok, edetail)
-            if eok is not False:
+            # A link-drop skip is a standing condition, not a stuck read: rate-limit its pass.
+            link_drop_held = (
+                not fabric_asked and eok is None and edetail.startswith(ETH_LINK_DROP_SKIP) and not fabric_stale
+            )
+            if link_drop_held and log:
+                log("eth links unverified after a clean exit — a recent fabric pass covers it, not repeating it")
+            elif not fabric_asked and eok is None and log:
+                log("eth-heartbeat reached no verdict after a clean exit — running the fabric traffic pass")
+            if eok is not False and (fabric_asked or eok is None) and not link_drop_held:
                 self._deps.set_device_op_detail("health check: fabric traffic pass across all links (~45s)")
                 fok, fdetail = await self.verify_fabric_health()
                 if log:
@@ -258,6 +331,39 @@ class HealthMonitor:
                 pass  # a baseline we cannot persist must not break the gate; present is the floor
             return present
         return baseline or present
+
+    def eth_link_drop(self, measured: int) -> str:
+        """Judge the built-in eth probe's measured link count against this host's high-water mark.
+
+        The probe reads only links that are up, so a link that went down is simply one core fewer
+        and every remaining core still reads advancing. The count is the only place that loss
+        shows. Returns "" when ``measured`` is at least the mark (and ratchets the mark up), else
+        the reason the read cannot vouch for the fabric. Like the chip baseline, the mark only
+        rises: links go down from a wedge, not from the design. An operator re-baselines a host
+        whose links really changed by deleting the file. An unreadable file fails closed for this
+        read and is rewritten with the current count, so a file lost that way loses its mark.
+        Writes go through a temp file and ``os.replace``, so a crash mid-write cannot tear it.
+        """
+        path = health_dir() / self.ETH_LINK_BASELINE_FILE
+        try:
+            baseline = int(json.loads(path.read_text()).get("links", 0))
+            corrupt = False
+        except FileNotFoundError:
+            baseline, corrupt = 0, False
+        except (OSError, ValueError, TypeError, AttributeError):
+            baseline, corrupt = 0, True
+        if measured > baseline or corrupt:
+            tmp = path.with_name(path.name + ".tmp")
+            try:
+                tmp.write_text(json.dumps({"links": measured}))
+                os.replace(tmp, path)
+            except OSError:
+                pass  # a mark we cannot persist must not break the gate
+        if corrupt:
+            return f"eth link baseline unreadable; re-baselined at {measured} up link(s)"
+        if measured < baseline:
+            return f"{measured} of {baseline} eth link(s) up — a link went down since the high-water mark"
+        return ""
 
     def _health_check_enabled(self) -> bool:
         """Whether the tt-smi snapshot health check runs around jobs. On by default;
@@ -337,6 +443,50 @@ class HealthMonitor:
         if not bus_ids or not all(bus_ids):
             return
         self._bus_ids = list(bus_ids)
+
+    def _bank_chip_buses(self, bus_ids: list, expected_count: int) -> None:
+        """Keep every chip index's PCI address, read from sysfs, as of the latest trusted full read.
+
+        The index is the kernel's (/dev, sysfs, heartbeat), so the tray of an off-bus chip comes from
+        its own address, not from where tt-smi happened to list it (spec 04 I16). Trusted and full
+        means the same "complete or not at all" rule as ``_bus_ids``, read in the same pass, and the
+        two agreeing on the set of buses: a disagreement means the bus moved under one of the reads,
+        so both are journaled and the next full pass tries again.
+
+        Unlike ``_bus_ids`` the map is not first-read-stands. tt-kmd can give a chip another index
+        after a drop, a rescan or a tray reset (it falls back to a free index when the chip's own is
+        still taken), and a map naming the old index re-powers the wrong tray. So a trusted full read
+        that differs re-banks it here, in the gate's pass before any rung reads it, and journals the
+        old and the new map. A short or disagreeing read never touches a banked map: a chip off the
+        bus has no node, so that read cannot place it.
+        """
+        if expected_count <= 0 or len(bus_ids) < expected_count or not all(bus_ids):
+            return
+        chips = pci.chip_pci_bdfs()
+        smi_buses = [pci.pci_bus_number(b) for b in bus_ids]
+        if None in smi_buses or sorted(smi_buses) != sorted(pci.pci_bus_number(a) for a in chips.values()):
+            self._journal_skip_once(
+                "chip_bus_map_mismatch",
+                f"sysfs and tt-smi disagree on the chips' PCI buses ({len(chips)} vs {len(bus_ids)} chips) — "
+                + ("the banked tray map stands" if self._chip_buses is not None else "no tray map")
+                + " until they agree (I16)",
+                sysfs={str(k): v for k, v in sorted(chips.items())},
+                tt_smi=list(bus_ids),
+            )
+            return
+        if self._chip_buses is None:
+            self._chip_buses = dict(chips)
+            return
+        if chips == self._chip_buses:
+            return
+        old, self._chip_buses = self._chip_buses, dict(chips)
+        # Every change, not once per process: each one moves the tray a rung would re-power.
+        health_event(
+            "chip_bus_map_drift",
+            reason="the kernel re-numbered chips since the map was banked (I16); re-banked from this read",
+            old={str(k): v for k, v in sorted(old.items())},
+            new={str(k): v for k, v in sorted(chips.items())},
+        )
 
     def _bus_id_cache_expected_count(self, expected_count: int) -> int:
         """The smallest snapshot size that is allowed to freeze ``_bus_ids``.
@@ -446,11 +596,11 @@ class HealthMonitor:
         fresh_bus_ids = [(d.get("board_info") or {}).get("bus_id") or "" for d in devs]
         bus_id_expected_count = self._bus_id_cache_expected_count(expected_count)
         self._bank_bus_ids_once(fresh_bus_ids, bus_id_expected_count)
-        # Topology-drift observability: the cache is one-shot for the process, but the very rung
-        # I16 enables re-powers trays, and the driver's bus enumeration after a warm reset is not
-        # guaranteed to match boot. Journal a mismatch so a drift is visible; the cached map
-        # stands, since accepting a fresh one would open a race where a bad snapshot replaces a
-        # known-good one. Only compares full-count reads — anything shorter is an already-degraded
+        self._bank_chip_buses(fresh_bus_ids, bus_id_expected_count)
+        # Topology-drift observability for tt-smi's own list: it is banked once for the process, and
+        # the driver's bus enumeration after a warm reset is not guaranteed to match boot. Journal a
+        # mismatch so a drift is visible. The list stands: no tray is read from it (the chip map just
+        # re-banked is). Only compares full-count reads — anything shorter is an already-degraded
         # mesh whose absent chips look like drift.
         if (
             self._bus_ids is not None
@@ -461,8 +611,8 @@ class HealthMonitor:
         ):
             self._journal_skip_once(
                 "bus_map_drift",
-                "cached per-chip bus map differs from the current snapshot — a warm reset may "
-                "have re-enumerated chips (I16); the cached map stands",
+                "cached tt-smi bus list differs from the current snapshot — a warm reset may have "
+                "re-enumerated chips (I16); no tray is read from this list, so it stands",
             )
         silent = []
         for i, d in enumerate(devs):
@@ -543,7 +693,7 @@ class HealthMonitor:
             # purely through its exit code — its stdout is never run through classify(), which
             # means something only for the built-in validator's own output signatures.
             ok = True if rc == 0 else None if rc == FABRIC_CHECK_CANNOT_CHECK_RC else False
-            reason = last
+            reason = _override_reason(text)
         else:
             ok, reason = fabric.classify(rc, text)
         # Derived from ok, not rc: on the built-in path a measured-bad verdict can exit 77 (the
@@ -552,7 +702,12 @@ class HealthMonitor:
         # with the raw exit code that verdict may have been remapped away from. A broker-side
         # timeout (rc is None) is its own thing: a live run that ran out of time, not a skip.
         status = "timeout" if rc is None else "completed" if ok is True else "skipped" if ok is None else "failed"
-        self._write_action_log("[broker]fabric-check", cmd, dt, status, rc)
+        if ok is True:
+            self._write_action_log("[broker]fabric-check", cmd, dt, status, rc)
+        else:
+            # A run that got no healthy verdict is the one an operator opens the row for, and the
+            # broker journal keeps only a line of it — so the row carries the output itself.
+            self._write_action_log("[broker]fabric-check", cmd, dt, status, rc, output=text[-ACTION_LOG_OUTPUT_CHARS:])
 
         if ok is True:
             self.last_fabric_ok = True
@@ -563,13 +718,13 @@ class HealthMonitor:
             # in this state has no fabric coverage at all and that must not pass silently.
             log = self._logger()
             if log:
-                log.warning(f"FABRIC-CHECK not runnable on this host — no fabric coverage: {reason[:200]}")
+                log.warning(f"FABRIC-CHECK not runnable on this host — no fabric coverage: {reason[:400]}")
             health_event("fabric_check_unavailable", detail=reason[:400], cmd=cmd)
-            return None, f"fabric check COULD NOT RUN ({dt:.0f}s): {reason[:200]}"
+            return None, f"fabric check COULD NOT RUN ({dt:.0f}s): {reason[:400]}"
         self.last_fabric_ok = False
         if rc is None:
             return False, f"fabric check timed out after {timeout_sec:.0f}s; last line: {last}"
-        return False, f"fabric check exited {rc} ({dt:.0f}s): {reason[:200]}"
+        return False, f"fabric check exited {rc} ({dt:.0f}s): {reason[:400]}"
 
     async def verify_eth_heartbeat(self, timeout_sec: float = 60.0) -> tuple[Optional[bool], str]:
         """Read the active-ethernet-core firmware heartbeats — a passive check that never pushes
@@ -603,8 +758,9 @@ class HealthMonitor:
     async def _verify_eth_heartbeat_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
         override = self._eth_heartbeat_cmd()
         # build() can shell out up to three candidate pythons (health.monitors.eth.resolve_python)
-        # once armed — off the event loop, or a health gate stalls the job queue, MCP requests,
-        # and the sd_notify watchdog ping for as long as those subprocess.run calls take.
+        # on a cache miss once armed — off the event loop, or a health gate stalls the job queue,
+        # MCP requests, and the sd_notify watchdog ping for as long as those subprocess.run calls
+        # take.
         built = await asyncio.to_thread(eth.build)
         if built is None:
             # Nothing to check with: the rung is disarmed (override or built-in alike — the
@@ -649,7 +805,7 @@ class HealthMonitor:
 
         _t0 = datetime.now()
         try:
-            rc, text = await asyncio.wait_for(
+            rc, text = await aio.wait_for(
                 eth.check(argv, env, timeout_sec=probe_timeout, track=_track, cwd=cwd),
                 timeout=timeout_sec,
             )
@@ -670,6 +826,8 @@ class HealthMonitor:
             # Wired but could not spawn — a configured rung silently producing no verdict is the
             # degrade worth a loud record, unlike the sanctioned unavailable default above.
             self._journal_skip_once("eth_heartbeat_unavailable", "not_runnable", detail=str(e)[:400])
+            if not override:
+                eth.forget_python()  # the cached python may be what cannot spawn
             return None, f"skipped (eth-heartbeat read not runnable: {e})"
 
         dt = (datetime.now() - _t0).total_seconds()
@@ -682,12 +840,24 @@ class HealthMonitor:
             reason = last
         else:
             ok, reason = eth.classify_exit(rc)
+            links = eth.parse_link_count(text)
+            # A down link is invisible to the verdict above (the probe skips it), so a drop in the
+            # measured count turns an all-advancing read into "could not vouch": the caller then
+            # runs the traffic pass, which is what tests every link. A frozen verdict stays frozen.
+            drop = self.eth_link_drop(links) if links else ""
+            if ok is True and drop:
+                self._journal_skip_once("eth_heartbeat_unavailable", "link_count_drop", detail=drop[:400])
+                return None, f"{ETH_LINK_DROP_SKIP}: {drop}"
 
         if ok is None:
             # The check could not run — it learned nothing about the eth cores, so falling
             # through to the traffic pass is correct, but a configured rung that got no verdict
             # deserves a loud record, mirroring the fabric check's own rc-77 path.
             self._journal_skip_once("eth_heartbeat_unavailable", "could_not_check", detail=last[:400])
+            if not override and rc == 1:
+                # A crash, which a python that lost ttexalens in place causes: re-resolve next time.
+                # Not on a timeout or the probe's own 77: that python imported and ran the probe.
+                eth.forget_python()
             return None, f"skipped (eth-heartbeat read could not check): {reason}"
         if ok is False:
             return False, f"a frozen active-eth core ({dt:.0f}s): {reason}"

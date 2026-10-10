@@ -209,6 +209,43 @@ def _iommu_mode() -> str:
     return f"{','.join(types)}{' passthrough' if passthrough else ''}"
 
 
+# The host's 1G hugepage pool. A PCI function behind an identity-mapped (passthrough) IOMMU, or no
+# IOMMU at all, cannot be opened until its 1G hugepage exists: UMD pins the host-side buffers there,
+# one page per function (not per chip: an n300 or T3K card carries two chips behind one function).
+# Boot allocates them in tenstorrent-hugepages.service, late (after multi-user.target), so a broker
+# that starts first sees too few, and any fabric pass it runs before then exits 77.
+HUGEPAGES_1G_NR = Path("/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages")
+
+
+def _functions_needing_hugepages() -> int:
+    """How many Tenstorrent functions sit behind an identity IOMMU domain or none at all.
+
+    A translated domain (DMA, DMA-FQ) maps the device's buffers through the IOMMU and needs no
+    hugepage; a host with no Tenstorrent function on the bus has nothing to wait for."""
+    n = 0
+    for bdf in tt_functions():
+        group = pci.PCI_DEVICES_DIR / bdf / "iommu_group"
+        if not group.exists() or (_read(group / "type") or "") == "identity":
+            n += 1
+    return n
+
+
+def hugepages_shortfall() -> Optional[tuple[int, int]]:
+    """``(have, need)`` when fewer 1G hugepages are allocated than the functions that need one.
+
+    None when there is nothing to wait for: every function behind a translating IOMMU, none on the
+    bus, or a kernel with no 1G hugepage pool to read (an unreadable pool is not evidence of a short
+    one, and waiting on it would hold a box that may not use hugepages at all). Sysfs reads only."""
+    need = _functions_needing_hugepages()
+    if need <= 0:
+        return None
+    raw = _read(HUGEPAGES_1G_NR)
+    if raw is None or not raw.isdigit():
+        return None
+    have = int(raw)
+    return (have, need) if have < need else None
+
+
 # Minimum host software the broker's own reset and probe semantics were matched against. Read
 # from sysfs only, so the check costs nothing and cannot touch a device. Overridable per site:
 # a floor that cannot be lowered is a floor that gets deleted the first time it is inconvenient.
