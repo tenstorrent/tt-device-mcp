@@ -100,6 +100,33 @@ def classify(rc: Optional[int], output: str) -> tuple[Optional[bool], str]:
     return None, detail
 
 
+def _validator_paths() -> tuple[str, str, str]:
+    """``(binary, runtime root, descriptor or "")`` of the pinned validator, from the same env the
+    wrapper script reads."""
+    vroot = os.environ.get("TTDEV_VALIDATOR_ROOT", "/opt/tt-device-broker/validator").strip()
+    current = f"{vroot}/current"
+    binpath = os.environ.get("TTDEV_FABRIC_BIN", "").strip() or f"{current}/build/tools/scaleout/run_cluster_validation"
+    runtime_root = os.environ.get("TTDEV_FABRIC_RUNTIME_ROOT", "").strip() or current
+    return binpath, runtime_root, os.environ.get("TTDEV_FABRIC_DESCRIPTOR", "").strip()
+
+
+def validator_missing() -> Optional[str]:
+    """What of the pinned validator is not on disk yet, or ``None`` once all of it is.
+
+    The same three things the wrapper script exits 77 on: the binary, its runtime root and, when one
+    is configured, the cabling descriptor. ``install-fabric-validator.sh`` publishes them together by
+    flipping the ``current`` link, which on a fresh boot can land minutes after the broker's startup
+    pass ran. Stat calls only, so a caller may poll it."""
+    binpath, runtime_root, desc = _validator_paths()
+    if not os.access(binpath, os.X_OK):
+        return f"pinned validator not installed yet ('{binpath}')"
+    if not os.path.isdir(runtime_root):
+        return f"validator runtime root '{runtime_root}' missing"
+    if desc and not os.path.isfile(desc):
+        return f"cabling descriptor '{desc}' missing"
+    return None
+
+
 def build_command() -> Optional[tuple[list[str], dict[str, str]]]:
     """The argv + env to run the fabric check with, or ``None`` when nothing is
     configured/available to run at all.
@@ -121,21 +148,10 @@ def build_command() -> Optional[tuple[list[str], dict[str, str]]]:
     if override:
         return ["/bin/bash", "-c", override], {**os.environ, "PYTHONUNBUFFERED": "1"}
 
-    vroot = os.environ.get("TTDEV_VALIDATOR_ROOT", "/opt/tt-device-broker/validator").strip()
-    current = f"{vroot}/current"
-    binpath = os.environ.get("TTDEV_FABRIC_BIN", "").strip() or f"{current}/build/tools/scaleout/run_cluster_validation"
-    if not os.access(binpath, os.X_OK):
+    if validator_missing() is not None:
         return None
-    runtime_root = os.environ.get("TTDEV_FABRIC_RUNTIME_ROOT", "").strip() or current
-    if not os.path.isdir(runtime_root):
-        return None
-
-    desc = os.environ.get("TTDEV_FABRIC_DESCRIPTOR", "").strip()
-    desc_argv: list[str] = []
-    if desc:
-        if not os.path.isfile(desc):
-            return None
-        desc_argv = ["--cabling-descriptor-path", desc]
+    binpath, runtime_root, desc = _validator_paths()
+    desc_argv = ["--cabling-descriptor-path", desc] if desc else []
 
     # Dedicated so the (root-run) check never depends on $HOME and never pollutes a
     # user's own firmware/kernel cache.

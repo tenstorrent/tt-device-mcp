@@ -349,6 +349,10 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv, "eth_rearm_retryable", False, raising=False)
     monkeypatch.setattr(srv, "_last_eth_rearm_monotonic", 0.0, raising=False)
     monkeypatch.setattr(srv, "_eth_rearm_task", None, raising=False)
+    # The owed startup fabric pass (spec 03 I39): left set, a later test's 77-only hold that
+    # happened to share its `since` would arm a relift it never asked for.
+    monkeypatch.setattr(srv, "_startup_fabric_owed_since", None, raising=False)
+    monkeypatch.setattr(srv, "_startup_prereq_task", None, raising=False)
     monkeypatch.setattr(srv, "post_job_gate_pending", False, raising=False)
     # The per-owner burst-cap ledger. Left populated, one test's submissions would count against
     # the next test's cap. Fresh dict so state never bleeds; raising=False so a base tree without

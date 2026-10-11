@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The startup fabric pass waits for the 1G hugepage pool, and a hold whose only cause is a fabric
 77 (could not check) is re-checked read-only, never escalated to a galaxy reset (spec 03 I33, I34).
+A startup pass that 77'd for want of the validator or the pool is owed again once they land, even
+with the fabric relift switched off (I39).
 
 blx01, 2026-10-08: the broker started before tenstorrent-hugepages.service had allocated the pool,
 the startup fabric pass exited 77 with its reason cut to "no link was tested", and the idle relift
@@ -213,6 +215,13 @@ def _startup(monkeypatch, tmp_path, clear_job_state):
         gate_calls.append(phase)
 
     monkeypatch.setattr(srv, "_device_health_gate", fake_gate)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    watchers = []
+
+    async def fake_watch(missing):
+        watchers.append(missing)
+
+    monkeypatch.setattr(srv, "_await_startup_prerequisites", fake_watch)
     return events, rows, gate_calls
 
 
@@ -385,3 +394,258 @@ async def test_the_forced_escalation_bails_on_a_77_only_hold(monkeypatch, tmp_pa
 
     assert climbed == []
     await asyncio.sleep(0)
+
+
+# --- a startup pass the validator missed is owed again once it lands (I39) ----------------------
+#
+# g15blx02, 2026-10-11: the broker started 2 min after boot, the validator timer published the
+# pinned build's `current` link 8 min later, and the startup pass exited 77 in between. With the
+# fabric relift switched off by a hold drop-in, nothing re-ran it and a healthy mesh stayed held
+# until someone restarted the broker.
+
+
+def _validator(tmp_path, monkeypatch, *, binary=True, descriptor=None):
+    root = tmp_path / "validator"
+    current = root / "current"
+    if binary:
+        b = current / "build" / "tools" / "scaleout" / "run_cluster_validation"
+        b.parent.mkdir(parents=True)
+        b.write_text("#!/bin/sh\n")
+        b.chmod(0o755)
+    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(root))
+    monkeypatch.setenv("TTDEV_FABRIC_CACHE", str(tmp_path / "cache"))
+    for k in ("TTDEV_FABRIC_BIN", "TTDEV_FABRIC_RUNTIME_ROOT", "TT_DEVICE_MCP_FABRIC_CHECK_CMD"):
+        monkeypatch.delenv(k, raising=False)
+    if descriptor is None:
+        monkeypatch.delenv("TTDEV_FABRIC_DESCRIPTOR", raising=False)
+    else:
+        monkeypatch.setenv("TTDEV_FABRIC_DESCRIPTOR", str(current / descriptor))
+    return current
+
+
+def test_validator_missing_names_what_is_not_installed(tmp_path, monkeypatch):
+    _validator(tmp_path, monkeypatch, binary=False)
+    assert "pinned validator not installed yet" in srv.fabric.validator_missing()
+    assert srv.fabric.build_command() is None
+
+
+def test_validator_missing_is_none_once_the_install_lands(tmp_path, monkeypatch):
+    current = _validator(tmp_path, monkeypatch)
+    assert srv.fabric.validator_missing() is None
+    argv, env = srv.fabric.build_command()
+    assert argv[0] == str(current / "build/tools/scaleout/run_cluster_validation")
+    assert "--cabling-descriptor-path" not in argv
+    assert env["TT_METAL_RUNTIME_ROOT"] == str(current)
+
+
+def test_validator_missing_waits_for_a_configured_descriptor(tmp_path, monkeypatch):
+    """The descriptor can live under the same `current` link, so it lands with it."""
+    current = _validator(tmp_path, monkeypatch, descriptor="galaxy.textproto")
+    assert "cabling descriptor" in srv.fabric.validator_missing()
+    assert srv.fabric.build_command() is None
+    (current / "galaxy.textproto").write_text("")
+    assert srv.fabric.validator_missing() is None
+    argv, _ = srv.fabric.build_command()
+    assert argv[1:3] == ["--cabling-descriptor-path", str(current / "galaxy.textproto")]
+
+
+def _startup_77_gate(monkeypatch, gate_calls):
+    async def gate(job_log_file, *, phase, run_fabric, force_fabric=False):
+        gate_calls.append(phase)
+        srv.fsm.on_fault(srv.FABRIC_RELIFT_WHY, detail="gate/startup: fabric unverified", dirty=False)
+
+    monkeypatch.setattr(srv, "_device_health_gate", gate)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+
+
+@pytest.mark.asyncio
+async def test_a_startup_77_without_the_validator_starts_the_watch(monkeypatch, _startup):
+    events, rows, gate_calls = _startup
+    _shortfalls(monkeypatch, [None])
+    _startup_77_gate(monkeypatch, gate_calls)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: "pinned validator not installed yet ('x')")
+    watchers = []
+
+    async def watch(missing):
+        watchers.append(missing)
+
+    monkeypatch.setattr(srv, "_await_startup_prerequisites", watch)
+
+    await srv._verify_fabric_on_start()
+    await srv._startup_prereq_task
+
+    assert gate_calls == ["startup"], "the pass still runs at once"
+    assert watchers == ["pinned validator not installed yet ('x')"]
+
+
+@pytest.mark.asyncio
+async def test_a_startup_77_with_the_validator_present_starts_no_watch(monkeypatch, _startup):
+    """With the validator there the only added cost is the stat calls; a 77 for any other reason is
+    the idle relift's, as before."""
+    events, rows, gate_calls = _startup
+    _shortfalls(monkeypatch, [None])
+    _startup_77_gate(monkeypatch, gate_calls)
+    monkeypatch.setattr(srv, "_startup_prereq_task", None)
+    watchers = []
+
+    async def watch(missing):
+        watchers.append(missing)
+
+    monkeypatch.setattr(srv, "_await_startup_prerequisites", watch)
+
+    await srv._verify_fabric_on_start()
+
+    assert gate_calls == ["startup"]
+    assert srv._startup_prereq_task is None and watchers == []
+
+
+@pytest.mark.asyncio
+async def test_a_startup_hugepages_timeout_starts_the_watch(monkeypatch, _startup):
+    events, rows, gate_calls = _startup
+    _shortfalls(monkeypatch, [(5, 32)])
+    monkeypatch.setattr(srv, "STARTUP_HUGEPAGES_WAIT_SEC", 0.05)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+    watchers = []
+
+    async def watch(missing):
+        watchers.append(missing)
+
+    monkeypatch.setattr(srv, "_await_startup_prerequisites", watch)
+
+    await srv._verify_fabric_on_start()
+    await srv._startup_prereq_task
+
+    assert gate_calls == []
+    assert watchers == ["hugepages not yet allocated"]
+
+
+def _sleeps(monkeypatch):
+    """Record the watcher's sleeps instead of taking them; ``on_sleep`` runs after each one."""
+    slept = []
+    hooks = []
+
+    async def fake_sleep(sec):
+        slept.append(sec)
+        for h in hooks:
+            h(len(slept))
+
+    monkeypatch.setattr(srv.asyncio, "sleep", fake_sleep)
+    return slept, hooks
+
+
+@pytest.mark.asyncio
+async def test_the_watch_owes_the_pass_once_the_validator_lands(monkeypatch, tmp_path, clear_job_state):
+    _hold_77(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_RELIFT", "0")
+    monkeypatch.setattr(srv, "_startup_fabric_owed_since", None)
+    landed = {"v": False}
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None if landed["v"] else "not installed")
+    slept, hooks = _sleeps(monkeypatch)
+    hooks.append(lambda n: landed.update(v=n >= 6))
+
+    assert srv._idle_relift_armed() == (False, False, False), "relift off: the hold would just stand"
+    await srv._await_startup_prerequisites("not installed")
+
+    assert slept == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0], "backs off to a 60 s look"
+    assert srv._startup_fabric_owed()
+    assert srv._idle_relift_armed() == (False, True, False), "the relift now owes the one pass"
+
+
+@pytest.mark.asyncio
+async def test_the_watch_also_waits_for_the_hugepages(monkeypatch, tmp_path, clear_job_state):
+    _hold_77(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "_startup_fabric_owed_since", None)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    _shortfalls(monkeypatch, [(0, 32), (0, 32), None])
+    slept, _ = _sleeps(monkeypatch)
+
+    await srv._await_startup_prerequisites("hugepages not yet allocated")
+
+    assert len(slept) == 2
+    assert srv._startup_fabric_owed()
+
+
+@pytest.mark.asyncio
+async def test_the_watch_stops_once_the_hold_is_settled_elsewhere(monkeypatch, tmp_path, clear_job_state):
+    _hold_77(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "_startup_fabric_owed_since", None)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: "not installed")
+    slept, hooks = _sleeps(monkeypatch)
+    hooks.append(lambda n: n == 2 and srv._clear_device_dirty(verified=True, why="a job's gate verified it"))
+
+    await srv._await_startup_prerequisites("not installed")
+
+    assert len(slept) == 2
+    assert not srv._startup_fabric_owed()
+
+
+@pytest.mark.asyncio
+async def test_the_watch_gives_up_after_its_bound(monkeypatch, tmp_path, clear_job_state):
+    _hold_77(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_RELIFT", "0")
+    monkeypatch.setattr(srv, "_startup_fabric_owed_since", None)
+    monkeypatch.setattr(srv, "STARTUP_PREREQ_WAIT_SEC", 0.0)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: "not installed")
+    slept, _ = _sleeps(monkeypatch)
+
+    await srv._await_startup_prerequisites("not installed")
+
+    assert slept == []
+    assert not srv._startup_fabric_owed()
+    assert srv._idle_relift_armed() == (False, False, False)
+
+
+@pytest.mark.asyncio
+async def test_the_owed_pass_runs_once_with_the_relift_off_and_lifts_on_healthy(monkeypatch, tmp_path, clear_job_state):
+    _hold_77(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_RELIFT", "0")
+    monkeypatch.setattr(srv, "_startup_fabric_owed_since", srv.fsm.record.since)
+    seen = []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        seen.append(run_fabric)
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": True, "detail": "fabric healthy"}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    rungs = []
+
+    async def escalate(rung, *a, **k):
+        rungs.append(rung)
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+
+    await srv._attempt_idle_relift()
+
+    assert seen == [True], "the owed startup pass runs the fabric check"
+    assert rungs == [], "and never resets"
+    assert srv.fsm.state is ServerState.HEALTHY, "a healthy verdict lifts the hold"
+    assert not srv._startup_fabric_owed()
+
+
+@pytest.mark.asyncio
+async def test_the_owed_pass_is_owed_once(monkeypatch, tmp_path, clear_job_state):
+    """Another 77 on the owed pass leaves the hold standing, and with the relift off nothing re-runs it."""
+    _hold_77(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_RELIFT", "0")
+    monkeypatch.setattr(srv, "_startup_fabric_owed_since", srv.fsm.record.since)
+    seen = []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        seen.append(run_fabric)
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": "could not run (77)"}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+    await srv._attempt_idle_relift()
+
+    assert seen == [True]
+    assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY
+    assert srv._idle_relift_armed() == (False, False, False)
+
+
+def test_an_owed_pass_does_not_carry_to_another_episode(monkeypatch, tmp_path, clear_job_state):
+    _hold_77(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_RELIFT", "0")
+    monkeypatch.setattr(srv, "_startup_fabric_owed_since", "an earlier episode")
+    assert not srv._startup_fabric_owed()
+    assert srv._idle_relift_armed() == (False, False, False)

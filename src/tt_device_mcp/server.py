@@ -3175,6 +3175,19 @@ def _fabric_77_only_hold() -> bool:
     )
 
 
+# The episode (its ``since``) of a 77-only hold that owes the startup fabric pass it never got: the
+# pass exited 77 because the pinned validator or the 1G hugepages were not there yet, and they have
+# since landed (see _await_startup_prerequisites). The idle relift runs that one pass whatever
+# TT_DEVICE_MCP_FABRIC_RELIFT says: the switch keeps the relift from re-running passes on a held box,
+# not the broker from running the startup pass a restart would run. Cleared once the pass starts.
+_startup_fabric_owed_since: Optional[str] = None
+
+
+def _startup_fabric_owed() -> bool:
+    """Whether the open hold is the 77-only hold a deferred startup pass is owed to."""
+    return _startup_fabric_owed_since is not None and _startup_fabric_owed_since == fsm.record.since
+
+
 def _fabric_77_relift_enabled() -> bool:
     """Whether a 77-only fabric hold (see _fabric_77_only_hold) re-runs the fabric pass while idle.
     ON by default, unlike the broader TT_DEVICE_MCP_FABRIC_RELIFT opt-in: a pass that 77s again
@@ -3214,7 +3227,9 @@ def _idle_relift_armed() -> tuple[bool, bool, bool]:
         return False, False, False
     why = fsm.record.why
     only_77 = why == FABRIC_RELIFT_WHY and _fabric_77_only_hold()
-    fabric = why == FABRIC_RELIFT_WHY and (_fabric_relift_enabled() or (only_77 and _fabric_77_relift_enabled()))
+    fabric = why == FABRIC_RELIFT_WHY and (
+        _fabric_relift_enabled() or (only_77 and (_fabric_77_relift_enabled() or _startup_fabric_owed()))
+    )
     return (
         _selfheal_relift_enabled() and why in SELFHEAL_WHYS,
         fabric,
@@ -3253,7 +3268,7 @@ async def _attempt_idle_relift() -> None:
     selfheal, fabric, generic = _idle_relift_armed()
     if not ((selfheal or fabric or generic) and not device_op_active):
         return
-    global last_relift_monotonic
+    global last_relift_monotonic, _startup_fabric_owed_since
     if last_relift_monotonic and (time.monotonic() - last_relift_monotonic) < SELFHEAL_RELIFT_INTERVAL_SEC:
         return
     last_relift_monotonic = time.monotonic()
@@ -3329,6 +3344,9 @@ async def _attempt_idle_relift() -> None:
                         "holding; it re-runs once the count is met"
                     )
                     return
+                if _startup_fabric_owed():
+                    _startup_fabric_owed_since = None
+                    _log("running the startup fabric pass a missing prerequisite deferred")
             healthy, evidence = await fsm.observe(expected, _log, run_fabric=fabric, recovery=galaxy_recovery)
             if not healthy:
                 # A chip is still off the bus: read-only there is nothing left to re-verify, and an
@@ -8051,6 +8069,62 @@ async def _await_startup_hugepages() -> bool:
     return False
 
 
+# How long a startup pass that exited 77 for want of the pinned validator (or the hugepages) keeps
+# watching for it, and the backoff between looks. The validator timer first fires 10 min after boot
+# and its build may run 2 h (tt-device-fabric-validator.timer/.service), so the bound covers both.
+# Each look is a few stat calls.
+STARTUP_PREREQ_WAIT_SEC = 2.5 * 3600
+STARTUP_PREREQ_POLL_MIN_SEC = 5.0
+STARTUP_PREREQ_POLL_MAX_SEC = 60.0
+_startup_prereq_task: Optional[asyncio.Task] = None
+
+
+async def _await_startup_prerequisites(missing: str) -> None:
+    """Owe the startup fabric pass again once what it lacked has landed (spec 03 I39).
+
+    The startup pass exited 77 because ``missing`` (the validator install, or the hugepages) was not
+    there yet, and left a 77-only hold. Only the idle relift re-runs a pass on that hold, and an
+    operator can switch it off (TT_DEVICE_MCP_FABRIC_RELIFT=0), so the hold then stood on a healthy
+    mesh until a broker restart. This polls, with backoff, for the validator and the hugepage count,
+    and once both are there marks the episode owed one pass, which the idle relift runs under the
+    device lock with all its guards. It lifts only on a healthy verdict and never resets. Stops early
+    when anything else settles or replaces the hold, and gives up after STARTUP_PREREQ_WAIT_SEC."""
+    global _startup_fabric_owed_since
+    t0 = time.monotonic()
+    delay = STARTUP_PREREQ_POLL_MIN_SEC
+    if logger:
+        logger.warning(
+            f"STARTUP FABRIC could not check: {missing} — holding fabric-unverified; the pass re-runs "
+            f"once it is there (watching up to {int(STARTUP_PREREQ_WAIT_SEC)}s)"
+        )
+    while True:
+        if not _fabric_77_only_hold():
+            if logger:
+                logger.info("STARTUP FABRIC stops watching for its prerequisites: the hold was settled elsewhere")
+            return
+        missing = await asyncio.to_thread(fabric.validator_missing)
+        if missing is None:
+            short = await asyncio.to_thread(_hugepages_shortfall)
+            missing = None if short is None else f"hugepages not yet allocated: {short[0]}/{short[1]}"
+        if missing is None:
+            break
+        if time.monotonic() - t0 >= STARTUP_PREREQ_WAIT_SEC:
+            if logger:
+                logger.warning(
+                    f"STARTUP FABRIC gave up after {int(STARTUP_PREREQ_WAIT_SEC)}s: {missing} — the hold "
+                    "stands until a pass runs (a job's gate, the idle relift or a broker restart)"
+                )
+            return
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, STARTUP_PREREQ_POLL_MAX_SEC)
+    _startup_fabric_owed_since = fsm.record.since
+    if logger:
+        logger.info(
+            f"STARTUP FABRIC prerequisites in place after {time.monotonic() - t0:.0f}s — the idle relift "
+            "re-runs the startup pass"
+        )
+
+
 def _open_startup_hold() -> Optional[dict]:
     """The ``startup_fabric_hold`` row no ``startup_fabric_released`` has closed yet, if any.
 
@@ -8108,7 +8182,11 @@ async def _verify_fabric_on_start() -> None:
     Queued behind any job re-adopted from the previous broker. The pass pushes traffic
     across every inter-chip link, so running it beside a tenant job corrupts their
     measurements and ours both — and the device is theirs until they are done.
+
+    A pass that exited 77 because the validator or the hugepages were not there yet is owed again
+    once they are (see _await_startup_prerequisites).
     """
+    global _startup_prereq_task
     try:
         while readopted_scopes:
             await asyncio.sleep(_SCOPE_POLL_SEC)
@@ -8120,9 +8198,14 @@ async def _verify_fabric_on_start() -> None:
                 await CEILING.apply(
                     "startup", log=(lambda line: logger.info(f"HEALTH-GATE[startup] {line}")) if logger else None
                 )
+        # Read before the pass: a validator that lands while it runs must still be waited for.
+        missing = await asyncio.to_thread(fabric.validator_missing)
         if not await _await_startup_hugepages():
-            return
-        await _device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+            missing = missing or "hugepages not yet allocated"
+        else:
+            await _device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+        if missing and _fabric_77_only_hold():
+            _startup_prereq_task = asyncio.create_task(_await_startup_prerequisites(missing))
     except Exception as e:  # noqa: BLE001 - startup must survive a check that cannot run
         # The gate is normally self-contained; if it raised, the startup fabric verdict is unknown and
         # the tenant door is still held pending it (see run_startup_tasks). Leaving it held on a checker
