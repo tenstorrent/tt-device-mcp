@@ -12,7 +12,7 @@ import tempfile
 import time
 from typing import Callable
 
-# Spec 04 I22. The pre-power-cycle hook gets this long by default to drain whatever else on the host
+# Spec 04 I26. The pre-power-cycle hook gets this long by default to drain whatever else on the host
 # would be cut by the cycle; past it the hook's process group is killed and the cycle goes ahead.
 PRE_POWER_CYCLE_HOOK_TIMEOUT_DEFAULT_SEC = 300.0
 # Ceiling on a configured timeout: the hook delays recovery of a box that is already down, so a
@@ -46,7 +46,7 @@ def pre_power_cycle_hook_timeout_sec() -> float:
 
 
 def run_pre_power_cycle_hook(log: Callable[[str], None], reason: str) -> dict:
-    """Run ``TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK`` (spec 04 I22) and wait for it, bounded.
+    """Run ``TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK`` (spec 04 I26) and wait for it, bounded.
 
     The command is split like shell words and run without a shell, in its own session, with the
     cycle's reason in ``TT_DEVICE_MCP_POWER_CYCLE_REASON``. Its output goes to a temp file, not a

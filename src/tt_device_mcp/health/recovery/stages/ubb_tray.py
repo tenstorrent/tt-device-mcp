@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import time
@@ -12,6 +13,8 @@ from tt_device_mcp.health.recovery.stages.smi_reset import (
     _reset_ioctl_if_on_bus,
     _tt_smi_reset_device_ioctl,
 )
+
+_LOG = logging.getLogger(__name__)
 
 # The tray's chips leave and re-join the bus across the BMC power pulse; wait this long between the
 # pulse and the POST_RESET ioctl that re-inits them, so they have re-enumerated first. Measured at
@@ -27,7 +30,7 @@ def _ubb_reset_argv(bitmap: int) -> list:
     return ["ipmitool", "raw", "0x30", "0x8b", f"0x{bitmap:02x}", "0xff", "0x00", "0x0f"]
 
 
-def _fire_ubb_reset(bitmap: int, tray_chip_ids: list) -> None:
+def _fire_ubb_reset(bitmap: int, tray_chip_ids: list, log=None):
     """Re-power exactly the trays in ``bitmap`` over the BMC, wrapped in the tt-smi ioctl handshake
     that quiesces the tray's chips before the power pulse and re-inits them after. Isolated so every
     test replaces it and no test path can reset real trays. Raises on a non-zero BMC exit so a fire
@@ -43,15 +46,30 @@ def _fire_ubb_reset(bitmap: int, tray_chip_ids: list) -> None:
     chips — the ipmitool bitmap alone decides which silicon is re-powered, so a mis-mapped id can only
     fail to quiesce/re-init, never re-power a healthy tray. A chip already off the bus (the very chip a
     tray-down reset exists to recover) has no /dev node to ioctl, so its quiesce/re-init is skipped
-    rather than aborting the walk before the power pulse that would re-enumerate it."""
+    rather than aborting the walk before the power pulse that would re-enumerate it.
+
+    Raises ``pcie_guard.TrayRepowerRefused`` when the envelope refused to cut power (nothing fired).
+    Returns the envelope's ``TrayPlan``."""
     from tt_smi.reset import IoctlResetFlags
 
+    from tt_device_mcp.health.recovery import pcie_guard
+
     reset_device_ioctl = _tt_smi_reset_device_ioctl()
-    for iid in tray_chip_ids:
-        _reset_ioctl_if_on_bus(reset_device_ioctl, iid, IoctlResetFlags.USER_RESET)
-    r = subprocess.run(_ubb_reset_argv(bitmap), timeout=60, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"ubb tray reset exited {r.returncode}: {r.stderr.strip()[:200]}")
-    time.sleep(UBB_RESET_SETTLE_SEC)
-    for iid in tray_chip_ids:
-        _reset_ioctl_if_on_bus(reset_device_ioctl, iid, IoctlResetFlags.POST_RESET)
+
+    def quiesce(_on_tray: list) -> None:
+        for iid in tray_chip_ids:
+            _reset_ioctl_if_on_bus(reset_device_ioctl, iid, IoctlResetFlags.USER_RESET)
+
+    def pulse() -> None:
+        r = subprocess.run(_ubb_reset_argv(bitmap), timeout=60, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"ubb tray reset exited {r.returncode}: {r.stderr.strip()[:200]}")
+        time.sleep(UBB_RESET_SETTLE_SEC)
+
+    def reinit(_on_tray: list) -> None:
+        for iid in tray_chip_ids:
+            _reset_ioctl_if_on_bus(reset_device_ioctl, iid, IoctlResetFlags.POST_RESET)
+
+    # The envelope (spec 04 I23) refuses a mis-mapped tray or a held chip, and masks AER on every
+    # Tenstorrent root port while the tray is unpowered, so the fallout cannot flood the host.
+    return pcie_guard.safe_tray_repower(bitmap, tray_chip_ids, pulse, log or _LOG.info, quiesce=quiesce, reinit=reinit)

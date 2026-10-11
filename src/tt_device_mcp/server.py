@@ -131,6 +131,7 @@ from tt_device_mcp.health import (
     heartbeat_verdict,
     isolate_chip,
     mark_boot,
+    pcie_guard_at_start,
     previous_boot_bus_locks,
     previous_boot_error,
     read_health_events,
@@ -1340,13 +1341,13 @@ device_pci_map: dict = {}
 
 # Daemons that continuously poll every chip. They are stopped for the duration of
 # a reset: MMIO aimed at a chip that is mid-reset (or already dead) is what pushes
-# the root complex into the fatal error path that reboots the host.
+# the root complex into the fatal error path that reboots the host. tt-fmax-cap.service writes the
+# clock cap to every chip, so a reset or fabric op racing it is the same hazard; it is in the default
+# list on every host. A unit a host does not have answers `systemctl` non-zero and is skipped, so
+# naming it costs nothing there.
+DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service,tt-fmax-cap.service"
 DEVICE_POLLER_SERVICES = tuple(
-    s
-    for s in os.environ.get("TT_DEVICE_MCP_POLLER_SERVICES", "tt-telemetry.service,tt-metrics-exporter.service").split(
-        ","
-    )
-    if s.strip()
+    s for s in os.environ.get("TT_DEVICE_MCP_POLLER_SERVICES", DEFAULT_POLLER_SERVICES).split(",") if s.strip()
 )
 logger: logging.Logger | None = None
 job_log_dir: Path | None = None
@@ -9941,8 +9942,8 @@ def create_mcp_server() -> MCPServer:
 
         Duration: about 2 minutes on a healthy Galaxy (reset ~60s + fabric pass
         45-75s), about 4 minutes when the first fabric pass finds no trained link
-        and is re-checked after a 60s wait. Worst case at the defaults: about 26
-        minutes (poller stop and restart up to 120s + reset 600s + PCI rescan 3s
+        and is re-checked after a 60s wait. Worst case at the defaults: about 27
+        minutes (poller stop and restart up to 180s + reset 600s + PCI rescan 3s
         + a first verify pass of up to 361s + the 60s wait + a last verify pass
         of up to 436s, which adds the 75s kill of a timed-out check). Only the
         last pass can time out: a re-check follows a pass that finished. Each
@@ -10147,6 +10148,10 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
     # not taken here is a crash nobody will ever explain. These hosts reboot most days;
     # taken every start, that becomes a distribution of real causes instead of a theory.
     await asyncio.to_thread(_record_previous_boot_error)
+    # An automatic reset over off-bus chips that the last boot never finished hung the host: latch the
+    # off-bus reset gate to hold until an operator clears it (spec 04 I25). Record which root ports
+    # carry the chips too, so the first tray drop after this start masks its own port (I23).
+    await asyncio.to_thread(pcie_guard_at_start, lambda m: logger.warning(f"STARTUP {m}") if logger else None)
 
     # A reset started by the broker we are replacing may still be going in its
     # restart-safe backend. Wait it out before anything else touches the device.

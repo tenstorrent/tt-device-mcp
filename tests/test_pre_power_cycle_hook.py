@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""The opt-in pre-power-cycle hook (spec 04 I22).
+"""The opt-in pre-power-cycle hook (spec 04 I26).
 
 A BMC power cycle cuts everything else on the host. TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK lets the
 operator drain it first. The hook is a courtesy, never a gate: whatever it does (fail, hang, not

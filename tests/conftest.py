@@ -28,7 +28,7 @@ from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState
 from tt_device_mcp.health.monitors import eth, heartbeat, pci
-from tt_device_mcp.health.recovery import RecoveryDeps
+from tt_device_mcp.health.recovery import RecoveryDeps, pcie_guard
 from tt_device_mcp.health.recovery import galaxy as recovery_galaxy
 from tt_device_mcp.server import (
     _ensure_async_primitives,
@@ -180,6 +180,9 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     # does not disturb the ~14 tests that already patch it to their own scenario-specific dir:
     # their own monkeypatch.setattr runs later, in the test body, and simply overrides this one.
     monkeypatch.setattr(pci, "PCI_DEVICES_DIR", tmp_path_factory.mktemp("no-pci-devices"))
+    # pcie_guard reads sysfs under SYS_ROOT (the between-jobs check records the PCI topology):
+    # an empty root, for the same reason.
+    monkeypatch.setattr(pcie_guard, "SYS_ROOT", tmp_path_factory.mktemp("no-sys-root"))
     # TT_DEV_DIR defaults to the REAL /dev/tenstorrent and is read fresh by _present_chip_indices()
     # on every call — on a build host with actual hardware (unlike CI, which has none) a test that
     # never sets this itself silently probes the real device count instead of the scenario it

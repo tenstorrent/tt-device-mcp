@@ -840,7 +840,7 @@ class RecoveryMechanism:
         takes the box down from inside ``fire`` and never reaches here at all).
 
         ``pre_fire(log, reason)``, when given, runs after the record and row and just before
-        ``fire`` (spec 04 I22): a bounded, blocking call that never raises and whose outcome never
+        ``fire`` (spec 04 I26): a bounded, blocking call that never raises and whose outcome never
         stops the fire. Running it after the record means it only runs for an action that is
         really about to happen, never for one the ledger then aborts."""
         ev = action.replace("-", "_")

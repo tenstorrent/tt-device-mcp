@@ -14,7 +14,25 @@ import sys
 import time
 import types
 
+import pytest
+
+from tt_device_mcp.health.recovery import pcie_guard
 from tt_device_mcp.health.recovery.stages.ubb_tray import _fire_ubb_reset as _REAL_FIRE_UBB_RESET
+
+
+@pytest.fixture(autouse=True)
+def _bare_envelope(monkeypatch):
+    """These tests pin the ioctl/IPMI handshake; the sysfs envelope around it has its own tests
+    (test_pcie_guard.py). Run the handshake's three steps in order, as the envelope does."""
+
+    def _run(bitmap, ids, fire, log, *, quiesce, reinit, **_kw):
+        quiesce(ids)
+        try:
+            fire()
+        finally:
+            reinit(ids)
+
+    monkeypatch.setattr(pcie_guard, "safe_tray_repower", _run)
 
 
 def test_fire_ubb_reset_imports_a_symbol_the_installed_tt_smi_defines(monkeypatch):
