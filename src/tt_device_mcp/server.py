@@ -1266,6 +1266,26 @@ last_fabric_check_monotonic: float = 0.0
 # non-executable command also exits 127/126.
 NOOP_FAILURE_FABRIC_FRESH_SEC = float(os.environ.get("TT_DEVICE_MCP_NOOP_FAILURE_FABRIC_FRESH_SEC", "300"))
 NOOP_FAILURE_MAX_RUNTIME_SEC = 2.0
+# A job that failed with a plain exit 1 and left nothing in its log tail that points at the device
+# (no eth/fabric fault text, no hang or timeout text) is almost always a host-side error: a failed
+# assertion, a permission or build error, an OOM. Its post-job gate drops the forced fabric pass when
+# a green pass is at most this old and no reset has run since, and every cheap read comes back clean
+# (spec 03 I38). The pass itself sometimes takes a marginal chip off the bus, and in a month of logs
+# from two hosts it never caught a fault after such a job. 0 (the default) forces it as before.
+EXIT1_FABRIC_WINDOW_SEC = float(os.environ.get("TT_DEVICE_MCP_EXIT1_FABRIC_WINDOW_SEC", "0"))
+# When the gate's own fabric pass last returned OK. 0.0 = none since the last reset or recovery
+# attempt: every rung voids it (_void_fabric_ok), an UNHEALTHY verdict voids it, and a pass with no
+# verdict (exit 77) leaves it alone. Only EXIT1_FABRIC_WINDOW_SEC reads it.
+last_fabric_ok_monotonic: float = 0.0
+# Log-tail text that says a job hung or timed out rather than failed on its own: a pytest-timeout
+# abort and the runtime's dispatch/operation timeouts. Matched lowercase, like
+# _DEVICE_FAULT_SIGNATURES. Any of these keeps the forced pass.
+_EXIT1_HANG_SIGNATURES = (
+    "timeout (>",  # pytest-timeout: "+++ Timeout (>300.0s) from pytest-timeout +++"
+    "pytest-timeout",
+    "timeout: device timeout",
+    "timed out",
+)
 # The last REAL fabric verdict lives on health_monitor.last_fabric_ok now (see health_monitor
 # above): True healthy / False unhealthy / None until one runs. Kept across checks so the
 # read-only relift can refuse to lift a recovered-on-ARC hold back onto a fabric whose last
@@ -2248,6 +2268,10 @@ def _begin_action_row(owner: str, command: str) -> None:
     from a runtime at the end) — the two mismatches that made a running op re-sort and rename when
     it finished. Caller holds the device op lock, so the id allocation is safe and single-flight."""
     global _action_row
+    if owner != "[broker]fabric-check":
+        # Every device action but the traffic pass itself opens its row here: a reset, a bridge
+        # reset, a host-rung request. Whatever it does to the mesh, the last OK pass predates it.
+        _void_fabric_ok(f"{owner}: {command}")
     if not job_log_dir:
         return
     if _action_row is not None:
@@ -2494,12 +2518,9 @@ _DEVICE_FAULT_SIGNATURES = (
 )
 
 
-def _scan_output_for_device_fault(job_log_file: Optional[Path], *, tail_bytes: int = 262144) -> Optional[str]:
-    """Scan the tail of a finished job's log for a wedged-eth/fabric signature
-    (see ``_DEVICE_FAULT_SIGNATURES``). Returns a short reason if found, else None.
-    Only the tail is read because the signature, if present, is at the failure
-    point near the end. Read-only, bounded, never raises — health bookkeeping must
-    not crash the runner."""
+def _read_job_log_tail(job_log_file: Optional[Path], tail_bytes: int = 262144) -> Optional[str]:
+    """The last ``tail_bytes`` of a job's log, lowercased; None when there is no log or it cannot be
+    read. Never raises."""
     if not job_log_file:
         return None
     try:
@@ -2508,13 +2529,44 @@ def _scan_output_for_device_fault(job_log_file: Optional[Path], *, tail_bytes: i
                 f.seek(-tail_bytes, os.SEEK_END)
             except OSError:
                 f.seek(0)
-            blob = f.read().decode("utf-8", "replace").lower()
+            return f.read().decode("utf-8", "replace").lower()
     except OSError:
+        return None
+
+
+def _scan_output_for_device_fault(job_log_file: Optional[Path], *, tail_bytes: int = 262144) -> Optional[str]:
+    """Scan the tail of a finished job's log for a wedged-eth/fabric signature
+    (see ``_DEVICE_FAULT_SIGNATURES``). Returns a short reason if found, else None.
+    Only the tail is read because the signature, if present, is at the failure
+    point near the end. Read-only, bounded, never raises — health bookkeeping must
+    not crash the runner."""
+    blob = _read_job_log_tail(job_log_file, tail_bytes)
+    if blob is None:
         return None
     for sig in _DEVICE_FAULT_SIGNATURES:
         if sig in blob:
             return f"eth/fabric fault in output: '{sig}'"
     return None
+
+
+def _void_fabric_ok(why: str) -> None:
+    """A reset or recovery attempt is starting: the last OK fabric pass no longer describes the
+    mesh, so it stands in for no forced pass until another one passes (spec 03 I38)."""
+    global last_fabric_ok_monotonic
+    if last_fabric_ok_monotonic and logger:
+        logger.info(f"fabric OK stamp cleared: {why}")
+    last_fabric_ok_monotonic = 0.0
+
+
+def _fabric_ok_age() -> Optional[float]:
+    """Seconds since the gate's last OK fabric pass, or None when there is none to rely on: never
+    run, voided, or older than the last reset the mechanism ran (a backstop for a rung that did not
+    void it)."""
+    if not last_fabric_ok_monotonic:
+        return None
+    if recovery_mechanism.last_reset_monotonic >= last_fabric_ok_monotonic:
+        return None
+    return time.monotonic() - last_fabric_ok_monotonic
 
 
 def _healthy_reading() -> HealthState:
@@ -3052,7 +3104,13 @@ def log_rung_inventory() -> None:
         "BOOT privilege: euid={euid} root={root} systemd={systemd} setpci_bin={setpci_bin} "
         "ipmitool={ipmitool} ipmi_node={ipmi_node}".format(**priv)
     )
-    logger.info("RUNG INVENTORY: " + ", ".join(f"{name}={'on' if on else 'OFF'}" for name, on, _ in rungs))
+    # Not a rung: the window in which a clean exit-1 failure may skip the forced fabric pass (03 I38),
+    # printed here so the one line an operator reads at boot says how much checking this host gave up.
+    logger.info(
+        "RUNG INVENTORY: "
+        + ", ".join(f"{name}={'on' if on else 'OFF'}" for name, on, _ in rungs)
+        + f", exit1-fabric-window={EXIT1_FABRIC_WINDOW_SEC:.0f}s"
+    )
     for name, on, why in rungs:
         # eth states its own reason in the self-test — but that only runs on the privsep path, so
         # elsewhere the inventory is the only place its OFF is ever explained.
@@ -3240,6 +3298,7 @@ async def _attempt_idle_relift() -> None:
                 is re-derived per platform inside _reset_and_verify_device), while a per-target
                 host's own escalate() has no ladder and reports WAITING forever — an idle hold
                 there would outlive every ceiling with no rung ever attempted."""
+                _void_fabric_ok(f"idle relift: {rung}")
                 outcome = await galaxy_recovery.escalate(rung, indices, expected, _log)
                 fsm.on_outcome(outcome)
                 return outcome != OUTCOME_WAITING
@@ -3851,6 +3910,7 @@ async def _auto_power_cycle_host(log, reason: str) -> None:
     """Fire the final recovery rung: a BMC chassis power cycle, above the warm reboot because it
     recovers a whole-bus wedge the reboot cannot. The caller has already confirmed both the env
     opt-in AND ``RecoveryMechanism.auto_recovery_allowed``."""
+    _void_fabric_ok("auto power cycle")
     await recovery_mechanism._fire_recovery_escalation(
         "power-cycle",
         row_owner="[broker]power-cycle-request",
@@ -3983,6 +4043,7 @@ async def device_health_gate(
     force_fabric: bool = False,
     with_recover: bool = True,
     noop_failure: bool = False,
+    exit1_failure: bool = False,
 ) -> None:
     """Unified health gate run while the device is IDLE around a job.
 
@@ -4004,7 +4065,12 @@ async def device_health_gate(
     ``noop_failure`` says the failed job behind ``force_fabric`` never reached the device (see
     ``_job_never_reached_device``). On a HEALTHY, clean device whose last fabric verdict was OK
     less than ``NOOP_FAILURE_FABRIC_FRESH_SEC`` ago, and with the eth rung armed, the forced pass
-    becomes the passive eth read of a clean exit (spec 03 I36)."""
+    becomes the passive eth read of a clean exit (spec 03 I36).
+
+    ``exit1_failure`` says the failed job exited 1 with nothing in its log tail about the device
+    (see ``_job_failed_exit1_clean``). With ``EXIT1_FABRIC_WINDOW_SEC`` set, a HEALTHY, clean device,
+    an armed eth rung and an OK pass at most that old with no reset since, the forced pass becomes
+    the same eth read; every cheap read must come back clean or the pass runs (spec 03 I38)."""
 
     def _log(msg: str) -> None:
         if logger:
@@ -4100,7 +4166,7 @@ async def device_health_gate(
         # clean exit — charging every clean job 45s is how a device ends up being checked
         # instead of used. Only startup asks; the stale window bounds any run_fabric caller
         # to one pass per interval.
-        global last_fabric_check_monotonic
+        global last_fabric_check_monotonic, last_fabric_ok_monotonic
         # 0.0 is the sentinel for "no pass this process" — the startup check after a boot.
         # It must count as stale outright: subtracting it treats the monotonic clock's own
         # value as an elapsed time, so on a host whose uptime is still below the interval
@@ -4135,6 +4201,28 @@ async def device_health_gate(
             )
             health_event("forced_fabric_skipped", phase=phase, fabric_age_sec=round(fabric_age, 1))
             force_fabric = False
+        # A plain exit-1 failure with a clean log tail (I38) owes no forced pass while an OK one is
+        # fresh and no reset has run since. Same shape as the I36 skip: the cheap reads still run
+        # below, a frozen eth core still holds, an unhealthy read still takes the ladder (whose verify
+        # runs the pass), and a read with no verdict still runs the full pass in this same probe.
+        ok_age = _fabric_ok_age()
+        relax_exit1 = (
+            force_fabric
+            and exit1_failure
+            and EXIT1_FABRIC_WINDOW_SEC > 0
+            and phase == "post-job"
+            and with_recover
+            and not dirty
+            and not fsm.record.dirty
+            and not device_fault_reported
+            and fsm.state is ServerState.HEALTHY
+            and eth_check_armed
+            and health_monitor.last_fabric_ok is True
+            and ok_age is not None
+            and ok_age <= EXIT1_FABRIC_WINDOW_SEC
+        )
+        if relax_exit1:
+            force_fabric = False
         # NOTHING SLOW RUNS BEFORE A JOB. The traffic pass takes ~45-100s, and pre-job is the one
         # phase where that lands on a submitter who is only waiting to start: a dirty flag alone
         # used to force it, so an ordinary submit paid 102s and was held anyway. A device that is
@@ -4160,7 +4248,7 @@ async def device_health_gate(
             _log,
             run_fabric=full,
             run_eth=run_eth,
-            fabric_stale=stale or skip_forced,
+            fabric_stale=stale or skip_forced or relax_exit1,
             phase=phase,
             recovery=recovery,
         )
@@ -4168,6 +4256,23 @@ async def device_health_gate(
         fabric_ok = state.fabric_ok
         if fabric_ok is not None:
             last_fabric_check_monotonic = time.monotonic()
+        if fabric_ok is True:
+            last_fabric_ok_monotonic = time.monotonic()
+        elif fabric_ok is False:
+            last_fabric_ok_monotonic = 0.0
+        if relax_exit1 and healthy and fabric_ok is None:
+            # Worded so nothing reads it as a fabric verdict: no pass ran, so it is neither an OK nor
+            # an exit-77 skip.
+            _log(
+                f"fabric: not run - exit 1 with clean reads, last OK pass {ok_age:.0f}s ago "
+                f"(window {EXIT1_FABRIC_WINDOW_SEC:.0f}s)"
+            )
+            health_event(
+                "exit1_fabric_not_run",
+                phase=phase,
+                fabric_ok_age_sec=round(ok_age, 1),
+                window_sec=EXIT1_FABRIC_WINDOW_SEC,
+            )
 
         # The full chip state behind every decision, and the bus-error totals inline so a
         # rising trend is visible without opening the chip journal. If the theory that a
@@ -4472,6 +4577,7 @@ async def device_health_gate(
             caller is done. Reads ``ev``/``beats`` as they stand at the call, which is the evidence
             the decision being fired was made from."""
             _note_tenant_gate_verdict(f"device unverified: gate/{phase}: {dirty_reason or 'unhealthy'}")
+            _void_fabric_ok(f"gate/{phase} ladder: {rung}")
             outcome = await galaxy_recovery.escalate(
                 f"gate/{phase}", indices, expected, _log, stage=rung, ev=ev, beats=beats
             )
@@ -5026,6 +5132,7 @@ async def _force_escalate_stuck_hold() -> None:
         # `tt-smi -r`, never -glx_reset. Routing through select_recovery hands a per-target host the
         # base escalate() that always reports WAITING — these teeth silently bite nothing, and the
         # hold outlives every ceiling with no rung ever attempted.
+        _void_fabric_ok("hold escalation")
         outcome = await galaxy_recovery.escalate(
             "offbus-forced" if off_bus > 0 else "present-forced", indices, expected, log
         )
@@ -5860,8 +5967,21 @@ def _job_never_reached_device(job: "Job") -> bool:
     return runtime is not None and 0 <= runtime < NOOP_FAILURE_MAX_RUNTIME_SEC
 
 
+def _job_failed_exit1_clean(job: "Job", job_log_file: Optional[Path]) -> bool:
+    """True when a failed job ended on its own with exit 1 and its log tail names nothing about the
+    device: none of ``_DEVICE_FAULT_SIGNATURES`` and none of ``_EXIT1_HANG_SIGNATURES``. A signal
+    death, a timeout, kill or hang, exit 124 or any other code never qualifies. Spec 03 I38."""
+    if job.status != JobStatus.FAILED or type(job.exit_code) is not int or job.exit_code != 1:
+        return False
+    blob = _read_job_log_tail(job_log_file)
+    if blob is None:
+        # No log to read is no evidence the job stayed clear of the device.
+        return False
+    return not any(sig in blob for sig in _DEVICE_FAULT_SIGNATURES + _EXIT1_HANG_SIGNATURES)
+
+
 async def _verify_device_after_job(
-    job_log_file: Optional[Path], job_failed: bool = False, noop_failure: bool = False
+    job_log_file: Optional[Path], job_failed: bool = False, noop_failure: bool = False, exit1_failure: bool = False
 ) -> None:
     """Post-job gate — runs at the END of every run (the finished job's caller has
     already been released, so this never delays their terminal/result): the enum/ARC
@@ -5878,7 +5998,8 @@ async def _verify_device_after_job(
     core holds the door, and a read that reaches no verdict runs the traffic pass in the
     same gate. ``job_failed`` forces a CHECK, not a reset — an exit 1 from a pytest
     assertion is not evidence of broken silicon. ``noop_failure`` (the job never reached the
-    device) lets a fresh green pass stand in for the forced one (spec 03 I36).
+    device) lets a fresh green pass stand in for the forced one (spec 03 I36), and so does
+    ``exit1_failure`` (a clean exit-1 failure) within ``EXIT1_FABRIC_WINDOW_SEC`` (spec 03 I38).
 
     Never raises."""
     # A job may set its own clock limits or leave the firmware default behind when it exits; the
@@ -5887,7 +6008,12 @@ async def _verify_device_after_job(
     CEILING.mark_owed("job end")
     try:
         await _device_health_gate(
-            job_log_file, phase="post-job", run_fabric=False, force_fabric=job_failed, noop_failure=noop_failure
+            job_log_file,
+            phase="post-job",
+            run_fabric=False,
+            force_fabric=job_failed,
+            noop_failure=noop_failure,
+            exit1_failure=exit1_failure,
         )
     except Exception as e:  # noqa: BLE001 - must never crash the runner
         # The gate threw before it could clear the device, so its state is unknown. Leaving it
@@ -7523,6 +7649,7 @@ export {JOB_TAG_ENV}={job_tag}
                         job_log_file,
                         job_failed=job_failed,
                         noop_failure=job_failed and not runner_error and _job_never_reached_device(job),
+                        exit1_failure=job_failed and not runner_error and _job_failed_exit1_clean(job, job_log_file),
                     )
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:
@@ -8391,6 +8518,7 @@ def create_mcp_server() -> MCPServer:
                 if late_blocker:
                     return None, None, ""
                 health_event("reset_begin", argv=argv, expected_chips=len(indices))
+                _void_fabric_ok("operator reset")
                 rc, output = await recovery_mechanism.reset_with_quiesce(argv, _plog, reset_owner, on_reset_output)
                 if output and not reset_streamed:
                     output_queue.put_nowait(output if output.endswith("\n") else output + "\n")
@@ -9886,6 +10014,7 @@ def create_mcp_server() -> MCPServer:
                     "steps": steps,
                     "hint": RESET_BUSY_HINT.format(force="force=true"),
                 }
+            _void_fabric_ok("operator reset")
             rc, reset_out = await recovery_mechanism.reset_with_quiesce(argv, lambda m: step(m), reset_owner)
             status = "reset_complete" if rc == 0 else "reset_failed"
             step(f"{command} exited {rc} -> {status}", "info" if rc == 0 else "error")

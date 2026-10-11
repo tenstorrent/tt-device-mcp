@@ -204,6 +204,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_FABRIC_CHECK_CMD` | unset (built-in validator) | Operator override for the fabric traffic check | 03 |
 | `TT_DEVICE_MCP_FABRIC_CHECK_INTERVAL_SEC` | 1200 | Staleness window before the gate re-runs the fabric pass | 03 |
 | `TT_DEVICE_MCP_NOOP_FAILURE_FABRIC_FRESH_SEC` | 300 | A failed job that never reached the device skips the forced fabric pass when a green pass is younger than this (I36) | 03 |
+| `TT_DEVICE_MCP_EXIT1_FABRIC_WINDOW_SEC` | 0 (off) | A failed job that exited 1 with no device fault or hang text in its log tail skips the forced fabric pass when the cheap reads are clean and an OK pass is at most this old with no reset since (I38) | 03 |
 | `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD` | unset (built-in probe) | Operator override for the passive eth-heartbeat read | 03 |
 | `TT_DEVICE_MCP_EXPECTED_CHIPS` | unset (baseline/hwm-derived) | Authoritative chip count for this host | 03 |
 | `TT_DEVICE_MCP_AICLK_CEILING_MHZ` | unset (off) | Per-host AICLK ceiling the broker re-applies and proves before any load; a positive integer arms it | 03 |

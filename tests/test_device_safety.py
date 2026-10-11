@@ -3663,7 +3663,7 @@ async def test_broker_row_times_the_stage_it_names(monkeypatch):
 def _quiet_post_job_gate(monkeypatch):
     """The post-job gate is not what these tests are about; keep the runner off the device."""
 
-    async def _noop(job_log_file, job_failed=False, noop_failure=False):
+    async def _noop(job_log_file, job_failed=False, noop_failure=False, exit1_failure=False):
         return None
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _noop)
@@ -5425,7 +5425,7 @@ async def test_a_full_log_disk_ends_neither_the_job_nor_the_runner(monkeypatch, 
     _no_workspace_activation(monkeypatch)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, noop_failure=False, exit1_failure=False):
         gates.append(job_failed)
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
@@ -5475,7 +5475,7 @@ async def test_a_full_log_disk_still_gates_a_failed_job_before_the_next(monkeypa
     _no_workspace_activation(monkeypatch)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, noop_failure=False, exit1_failure=False):
         gates.append((job_failed, second.status))
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
@@ -5536,7 +5536,7 @@ async def test_an_error_escaping_job_cleanup_fails_closed(monkeypatch, clear_job
     monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: None)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, noop_failure=False, exit1_failure=False):
         gates.append((job_failed, srv.fsm.record.dirty, second.status))
         srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
 
@@ -5578,7 +5578,7 @@ async def test_an_error_escaping_before_spawn_forgets_the_queued_spec(monkeypatc
     monkeypatch.setattr(srv, "get_activation_script", _boom)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, noop_failure=False, exit1_failure=False):
         gates.append(job_failed)
         srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
 
@@ -5632,7 +5632,7 @@ async def test_a_fail_closed_gate_holds_the_idle_self_test_off_until_it_ends(mon
         monkeypatch.setattr(srv, "get_activation_script", _boom)
     seen = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, noop_failure=False, exit1_failure=False):
         seen.append(srv.post_job_gate_pending)
         srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
 
@@ -13421,7 +13421,7 @@ async def test_the_runner_tells_the_post_job_gate_when_a_failed_job_never_reache
     monkeypatch.setattr(srv, "NOOP_FAILURE_MAX_RUNTIME_SEC", max_runtime)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, noop_failure=False, exit1_failure=False):
         gates.append((job_failed, noop_failure))
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
@@ -13491,7 +13491,7 @@ async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch,
         command = "trap 'exit 7' INT; echo hi; sleep 30 & wait"
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, noop_failure=False, exit1_failure=False):
         gates.append((job_failed, noop_failure))
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
