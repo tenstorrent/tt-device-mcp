@@ -105,7 +105,7 @@ job boundary.
   proves the host has shown chips).
 - **I12 — The fabric traffic pass never runs on a submitter's clock.** Pre-job the gate never
   runs it, dirty or not — the flag is already the answer. It runs post-job on a failed job
-  (forced, unless I36 lets a fresh green pass stand in), at startup (forced), inside the recovery ladder, after an operator's reset of a mesh
+  (forced, unless I36 or I37 lets a fresh green pass stand in), at startup (forced), inside the recovery ladder, after an operator's reset of a mesh
   (spec 04 I13 — the operator's clock, not a submitter's), on a `run_fabric` caller only when
   no pass is fresher than `FABRIC_CHECK_MIN_INTERVAL_SEC` (default 1200s), and post-job on a
   clean exit only when that exit's eth read reached no verdict (I30; a link-count-drop skip only
@@ -444,6 +444,29 @@ job boundary.
   Rationale: blx01 lost its host ~9s into a pass forced 2s after a green one by a job that had
   failed in 0s on a missing directory; the pass is the heaviest load the broker puts on the mesh,
   and that job told it nothing.
+- **I37 — A clean exit-1 failure may skip the forced pass while an OK pass is fresh.** Off by
+  default: `TT_DEVICE_MCP_EXIT1_FABRIC_WINDOW_SEC` = 0 keeps the forced pass. Set above 0, a FAILED
+  job that exited 1 on its own (`_job_failed_exit1_clean`) and whose log tail (the same bounded
+  tail `_scan_output_for_device_fault` reads) holds none of `_DEVICE_FAULT_SIGNATURES` and no hang or
+  timeout text (`_EXIT1_HANG_SIGNATURES`: a pytest-timeout abort, `TIMEOUT: device timeout`,
+  `Timed out`) drops the post-job forced pass when all of these hold: the device is HEALTHY, not
+  dirty and has no reported fault, the eth rung is armed (I28), `HealthMonitor.last_fabric_ok` is
+  OK, and the gate's own last OK pass (`last_fabric_ok_monotonic`) is at most the window old with
+  no reset since. Only an OK verdict sets that stamp; an UNHEALTHY verdict clears it, a pass with no
+  verdict (exit 77) leaves it, and every reset or recovery attempt clears it: the gate ladder, an idle
+  relift, a hold escalation, a host power cycle and an operator reset clear it as they start (a
+  bridge reset or tray re-power runs inside one of these), every device action row but the pass
+  itself clears it, and the mechanism's last reset time is a backstop. A missing
+  log, a signal death, exit 124 or any code but 1, and a KILLED, TIMEOUT or HUNG job never qualify.
+  The cheap reads still run (host PCI, ARC heartbeat, snapshot, the passive eth read of I30): any
+  that is not clean takes today's path (a frozen read holds, I16; an unhealthy read takes the
+  ladder; a read with no verdict runs the full pass in the same gate). All clean, the gate logs
+  `fabric: not run - exit 1 with clean reads, last OK pass Ns ago (window Ws)`, worded so it never
+  reads as a fabric verdict, and journals `exit1_fabric_not_run`. The RUNG INVENTORY line at boot
+  reports the window. Only `post-job` qualifies: startup and Slurm `post-step` are unchanged.
+  Rationale: the pass is the heaviest load the broker puts on the mesh and sometimes takes a
+  marginal chip off the bus; after an exit-1 failure with a clean tail and a recent OK pass it
+  rarely finds anything the cheap reads miss.
 
 ## Interfaces
 
@@ -752,7 +775,8 @@ Normative points the diagram compresses:
   re-derives it mid-pass.
 - `full` (run the fabric pass) is `with_recover and (not pre-job) and (dirty or force_fabric or
   (run_fabric and stale))` — I12, I29; a failed job that never reached the device clears
-  `force_fabric` first when a fresh green pass stands in (I36). A clean post-job or post-step exit pays no fabric pass;
+  `force_fabric` first when a fresh green pass stands in (I36), and so does a clean exit-1 failure
+  inside `EXIT1_FABRIC_WINDOW_SEC` (I37). A clean post-job or post-step exit pays no fabric pass;
   when the eth rung is armed it pays the passive eth read instead (~1s, the read bounded at 10s),
   and the fabric pass only if that read reached no verdict (I30). A read-only pass never pays
   regardless of phase, dirty, or force_fabric.
@@ -864,7 +888,7 @@ refuses.
 - **The fabric pass is billed to nobody.** It is both the authoritative check and the heaviest
   perturbation the broker aims at the mesh (a host was lost with one in flight), so it runs where
   it costs no submitter and no healthy silicon: post-job on failure (not after a fresh green
-  pass when the job never reached the device, I36), post-job on a clean exit
+  pass when the job never reached the device, I36, nor inside the exit-1 window, I37), post-job on a clean exit
   whose eth read reached no verdict (I30), startup, ladder, stale-window — never pre-job (I12),
   never on a frozen core (I9), never as a relift default (I22).
 - **Asymmetric error costs** (`health.core.Verdict`): a needless reset of an idle device costs
@@ -953,6 +977,7 @@ refuses.
 | I33 | `tests/test_startup_fabric_hugepages.py::test_hugepages_shortfall_reports_a_short_pool_behind_identity_or_no_iommu`, `tests/test_startup_fabric_hugepages.py::test_hugepages_shortfall_is_none_behind_a_translating_iommu`, `tests/test_startup_fabric_hugepages.py::test_hugepages_shortfall_is_none_without_a_readable_pool`, `tests/test_startup_fabric_hugepages.py::test_hugepages_shortfall_is_none_with_no_function_on_the_bus`, `tests/test_startup_fabric_hugepages.py::test_hugepages_shortfall_counts_pci_functions_not_chips`, `tests/test_startup_fabric_hugepages.py::test_hugepages_shortfall_needs_a_page_only_per_identity_mapped_function`, `tests/test_startup_fabric_hugepages.py::test_the_broker_waits_only_when_the_expected_chip_count_is_set`, `tests/test_startup_fabric_hugepages.py::test_startup_fabric_pass_waits_for_hugepages_then_runs`, `tests/test_startup_fabric_hugepages.py::test_startup_records_cannot_check_when_hugepages_stay_short`, `tests/test_startup_fabric_hugepages.py::test_a_dirty_carried_episode_still_runs_the_startup_gate` |
 | I34 | `tests/test_startup_fabric_hugepages.py::test_a_77_only_hold_arms_the_fabric_relift_not_the_generic_escalation`, `tests/test_startup_fabric_hugepages.py::test_the_77_only_relift_has_an_off_switch`, `tests/test_startup_fabric_hugepages.py::test_a_fabric_hold_after_a_measured_fail_is_not_77_only`, `tests/test_startup_fabric_hugepages.py::test_the_77_only_relift_reruns_the_fabric_pass_and_never_resets`, `tests/test_startup_fabric_hugepages.py::test_the_77_only_relift_waits_for_hugepages`, `tests/test_startup_fabric_hugepages.py::test_the_hold_deadline_never_forces_a_reset_on_a_77_only_hold`, `tests/test_startup_fabric_hugepages.py::test_the_hold_deadline_still_escalates_a_measured_fabric_fault`, `tests/test_startup_fabric_hugepages.py::test_the_forced_escalation_bails_on_a_77_only_hold`, `tests/test_device_safety.py::test_a_startup_gate_77_leaves_a_77_only_hold_that_no_path_resets` |
 | I36 | `tests/test_device_safety.py::test_a_failed_job_that_never_reached_the_device_skips_the_forced_pass_after_a_fresh_green_one`, `tests/test_device_safety.py::test_a_failed_job_still_forces_the_fabric_pass_unless_every_skip_condition_holds`, `tests/test_device_safety.py::test_a_frozen_eth_read_after_a_skipped_forced_pass_holds_without_a_reset`, `tests/test_device_safety.py::test_an_eth_read_with_no_verdict_after_a_skipped_forced_pass_runs_the_pass`, `tests/test_device_safety.py::test_job_never_reached_device`, `tests/test_device_safety.py::test_the_runner_tells_the_post_job_gate_when_a_failed_job_never_reached_the_device`, `tests/test_device_safety.py::test_a_runner_error_still_forces_the_post_job_fabric_pass` |
+| I37 | `tests/test_postjob_fabric_relax.py::test_window_zero_forces_the_pass`, `tests/test_postjob_fabric_relax.py::test_fresh_ok_pass_and_clean_reads_skip_the_pass_and_say_so`, `tests/test_postjob_fabric_relax.py::test_without_a_fresh_ok_pass_the_pass_runs`, `tests/test_postjob_fabric_relax.py::test_an_unhealthy_verdict_clears_the_stamp_and_an_ok_one_sets_it`, `tests/test_postjob_fabric_relax.py::test_a_pass_with_no_verdict_does_not_refresh_the_stamp`, `tests/test_postjob_fabric_relax.py::test_a_dirty_or_unreadable_device_still_pays_the_pass`, `tests/test_postjob_fabric_relax.py::test_a_frozen_eth_read_holds_without_a_pass_or_reset`, `tests/test_postjob_fabric_relax.py::test_an_eth_read_with_no_verdict_runs_the_pass`, `tests/test_postjob_fabric_relax.py::test_a_failed_snapshot_goes_to_recovery`, `tests/test_postjob_fabric_relax.py::test_the_startup_gate_is_unchanged`, `tests/test_postjob_fabric_relax.py::test_job_failed_exit1_clean`, `tests/test_postjob_fabric_relax.py::test_only_the_log_tail_is_read`, `tests/test_postjob_fabric_relax.py::test_every_device_action_but_the_pass_clears_the_stamp`, `tests/test_postjob_fabric_relax.py::test_a_reset_after_the_ok_pass_makes_it_stale`, `tests/test_postjob_fabric_relax.py::test_rung_inventory_reports_the_window`, `tests/test_postjob_fabric_relax.py::test_the_runner_passes_a_clean_exit1_to_the_gate` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |
