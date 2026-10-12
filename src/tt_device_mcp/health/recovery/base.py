@@ -20,6 +20,7 @@ from typing import Awaitable, Callable, Optional
 from tt_device_mcp import aio, metrics, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
 from tt_device_mcp.health.aiclk_ceiling import CEILING
+from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
 from tt_device_mcp.health.evidence import health_dir, health_event
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
@@ -591,12 +592,14 @@ class RecoveryMechanism:
         """Put an operator's AICLK ceiling back on the freshly reset chips, before the pollers
         return and before the caller's verify runs its traffic pass. Only after a completed reset
         (the chips are back on the bus); a no-op when unconfigured. Never raises: a failure here
-        leaves the ceiling owed, and the verify's probe pass retries it and fails closed."""
+        leaves the ceiling owed, and the verify's probe pass retries it and fails closed. Freshly
+        reset firmware may read its old limit for a few seconds after the cap is sent, so the
+        apply re-reads within the settle window before it calls the ceiling unverified."""
         if not CEILING.armed():
             return
         self._set_device_op_detail("device reset: re-applying the AICLK ceiling")
         try:
-            await CEILING.apply("post-reset", log=log)
+            await CEILING.apply("post-reset", log=log, settle=aiclk_settle_sec())
         except Exception as e:  # noqa: BLE001 - the verify that follows owns the verdict
             log(f"aiclk-ceiling: post-reset apply raised {type(e).__name__}: {e}")
 

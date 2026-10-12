@@ -728,7 +728,9 @@ short-circuit per I9. Each probe returns a tri-state that maps onto an `Observat
   AICLK limit, sends the cap only where it reads above the ceiling, and re-reads. Exit 0 verified,
   1 a chip still above or unreadable, 77 cannot run here (disarm). Bounded by
   `TT_DEVICE_MCP_AICLK_CEILING_TIMEOUT_SEC` (8 s) with a 2 s per-chip bound inside; ~2 ms per chip
-  on a healthy 32-chip host. Operator override: `TT_DEVICE_MCP_AICLK_CEILING_CMD`, exit code only.
+  on a healthy 32-chip host. Only the post-reset apply re-runs an exit-1 helper within a settle
+  window (`TT_DEVICE_MCP_AICLK_CEILING_SETTLE_SEC`, 3 s; spec 04 I20); every other apply reports
+  its first readback. Operator override: `TT_DEVICE_MCP_AICLK_CEILING_CMD`, exit code only.
 - **subproc** (`health/monitors/subproc.py`): every traffic/firmware probe runs in its own
   session, tracked for the life of the call so the dead-chip path can kill it — it maps chip
   BARs, and `pci remove` does not revoke a mapping.

@@ -27,7 +27,7 @@ _HELPER = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-aiclk-c
 @pytest.fixture(autouse=True)
 def _fresh_ceiling(monkeypatch):
     """Each test starts with the process-wide state of a fresh broker and no config."""
-    for k in (ac.ENV_MHZ, ac.ENV_CMD, ac.ENV_TIMEOUT, ac.ENV_PYTHON):
+    for k in (ac.ENV_MHZ, ac.ENV_CMD, ac.ENV_TIMEOUT, ac.ENV_PYTHON, ac.ENV_SETTLE):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(CEILING, "owed", True)
     monkeypatch.setattr(CEILING, "disarmed", "")
@@ -50,7 +50,7 @@ def _fake_apply(calls, results):
     """A stand-in for CEILING.apply that records where it ran and replays canned verdicts."""
     results = list(results)
 
-    async def apply(where, *, log=None, terminate=None):
+    async def apply(where, *, log=None, terminate=None, settle=0.0):
         calls.append(where)
         ok = results.pop(0) if results else True
         if ok:
@@ -140,6 +140,89 @@ async def test_apply_cannot_run_here_disarms_once(monkeypatch, _fresh_ceiling, r
     assert [k for k, _ in _fresh_ceiling] == ["aiclk_ceiling_disarmed"]
     # Disarmed: never runs again in this process.
     assert (await CEILING.apply("pre-job"))[0] is None
+
+
+# --- post-reset settle window ----------------------------------------------------------------
+
+_OVER = b'{"summary": true, "mhz": 900, "chips": 32, "ok": 0, "sent": 32, "over": [0, 1]}\n'
+_AT = b'{"summary": true, "mhz": 900, "chips": 32, "ok": 32, "sent": 0}\n'
+
+
+def _scripted_helper(monkeypatch, results, run_sec=0.0):
+    """Fake clock and helper: each run takes ``run_sec`` and replays the next (rc, output); the
+    last one repeats. Returns the list of clock readings at each run's start."""
+    clock = [100.0]
+    starts = []
+    results = list(results)
+
+    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate):
+        starts.append(clock[0])
+        clock[0] += run_sec
+        return results.pop(0) if len(results) > 1 else results[0]
+
+    async def sleep(d):
+        clock[0] += d
+
+    monkeypatch.setenv(ac.ENV_MHZ, "900")
+    monkeypatch.setattr(ac, "run_probe", run_probe)
+    monkeypatch.setattr(ac, "_now", lambda: clock[0])
+    monkeypatch.setattr(ac, "_sleep", sleep)
+    return starts, clock
+
+
+@pytest.mark.asyncio
+async def test_post_reset_readback_that_settles_in_the_window_is_verified(monkeypatch, _fresh_ceiling):
+    starts, _ = _scripted_helper(monkeypatch, [(1, _OVER), (1, _OVER), (0, _AT)], run_sec=0.4)
+    lines = []
+    ok, detail, ev = await CEILING.apply("post-reset", log=lines.append, settle=3.0)
+    assert ok is True and CEILING.owed is False
+    assert len(starts) == 3 and ev["attempts"] == 3 and ev["rc"] == 0
+    assert [k for k, _ in _fresh_ceiling] == ["aiclk_ceiling_applied"], "a transient readback logged unverified"
+    assert "re-reading" in lines[0] and lines[-1].startswith("aiclk-ceiling: OK")
+
+
+@pytest.mark.asyncio
+async def test_post_reset_readback_high_for_the_whole_window_is_unverified_once(monkeypatch, _fresh_ceiling):
+    starts, _ = _scripted_helper(monkeypatch, [(1, _OVER)], run_sec=0.4)
+    ok, detail, ev = await CEILING.apply("post-reset", settle=3.0)
+    assert ok is False and CEILING.owed is True
+    assert len(starts) > 1 and ev["attempts"] == len(starts) and ev["over"] == [0, 1]
+    assert [k for k, _ in _fresh_ceiling] == ["aiclk_ceiling_unverified"]
+    assert "NOT verified" in detail and f"after {len(starts)} reads" in detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_sec", [0.0, 0.4, 2.9])
+async def test_post_reset_settle_wait_is_bounded(monkeypatch, run_sec):
+    starts, clock = _scripted_helper(monkeypatch, [(1, _OVER)], run_sec=run_sec)
+    t0 = clock[0]
+    await CEILING.apply("post-reset", settle=3.0)
+    # No run starts past the window, so the total is the window plus at most one helper run.
+    assert all(s - t0 <= 3.0 for s in starts)
+    assert clock[0] - t0 <= 3.0 + run_sec
+    assert len(starts) <= 1 + int(3.0 / ac.SETTLE_POLL_SEC)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rc", [0, None, 77])
+async def test_settle_never_reruns_a_verified_timed_out_or_unsupported_helper(monkeypatch, rc):
+    starts, _ = _scripted_helper(monkeypatch, [(rc, _AT if rc == 0 else b"x")])
+    await CEILING.apply("post-reset", settle=3.0)
+    assert len(starts) == 1
+
+
+@pytest.mark.asyncio
+async def test_without_settle_a_high_readback_is_reported_at_once(monkeypatch, _fresh_ceiling):
+    starts, _ = _scripted_helper(monkeypatch, [(1, _OVER), (0, _AT)])
+    ok, _, ev = await CEILING.apply("pre-job")
+    assert ok is False and len(starts) == 1 and "attempts" not in ev
+    assert [k for k, _ in _fresh_ceiling] == ["aiclk_ceiling_unverified"]
+
+
+@pytest.mark.parametrize(("raw", "want"), [("", 3.0), ("0", 0.0), ("1.5", 1.5), ("-2", 0.0), ("99", 10.0), ("x", 3.0)])
+def test_settle_window_config(monkeypatch, raw, want):
+    monkeypatch.setenv(ac.ENV_SETTLE, raw)
+    assert ac.settle_sec() == want
 
 
 def test_mark_owed_journals_only_the_transition(monkeypatch, _fresh_ceiling):
@@ -260,6 +343,21 @@ async def test_reset_reapplies_after_the_rescan_before_the_pollers_return(monkey
     await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
     assert order == ["pollers:False", "reset", "rescan", "post-reset", "pollers:True"]
     assert CEILING.owed is False
+
+
+@pytest.mark.asyncio
+async def test_reset_reapply_reads_back_within_the_settle_window(monkeypatch):
+    monkeypatch.setenv(ac.ENV_MHZ, "900")
+    _reset_seams(monkeypatch, [])
+    seen = []
+
+    async def apply(where, *, log=None, terminate=None, settle=0.0):
+        seen.append((where, settle))
+        return True, "ok", {}
+
+    monkeypatch.setattr(CEILING, "apply", apply)
+    await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
+    assert seen == [("post-reset", ac.DEFAULT_SETTLE_SEC)]
 
 
 @pytest.mark.asyncio

@@ -210,6 +210,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_AICLK_CEILING_MHZ` | unset (off) | Per-host AICLK ceiling the broker re-applies and proves before any load; a positive integer arms it | 03 |
 | `TT_DEVICE_MCP_AICLK_CEILING_CMD` | unset (built-in helper) | Operator override for the ceiling apply, judged on exit code alone | 03 |
 | `TT_DEVICE_MCP_AICLK_CEILING_TIMEOUT_SEC` | 8 | Bound on one ceiling apply (min 1) | 03 |
+| `TT_DEVICE_MCP_AICLK_CEILING_SETTLE_SEC` | 3 | Post-reset window in which a ceiling readback still above the cap is re-read every 0.5 s before it is reported unverified (0 off, max 10) | 04 |
 | `TT_DEVICE_MCP_AICLK_CEILING_PYTHON` | broker's interpreter | Interpreter for the built-in ceiling helper (needs tt-umd) | 03 |
 | `TT_DEVICE_MCP_SYSFS_DIR` | `/sys/class/tenstorrent` | Sysfs class dir (test seam) | 03 |
 | `TT_DEVICE_MCP_PCI_DIR` | `/sys/bus/pci/devices` | PCI devices dir (test seam) | 03 |

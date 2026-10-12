@@ -11,7 +11,9 @@ fabric traffic pass included. So the broker owns re-applying it at the points wh
 been lost:
 
   - right after a reset's PCI rescan, before the pollers come back and before the verify's
-    traffic pass (``RecoveryMechanism.reset_with_quiesce``);
+    traffic pass (``RecoveryMechanism.reset_with_quiesce``). Freshly reset firmware can still read
+    the old limit for a few seconds after the cap was sent, so this apply re-runs the helper within
+    a short settle window before it calls the ceiling unverified;
   - in every probe pass, after the snapshot proved the chips present and before the eth read and
     the fabric pass (``HealthMonitor.update``);
   - at broker start (a boot or power cycle cleared it), before the startup fabric verify;
@@ -27,6 +29,7 @@ healthy box on a configuration error.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -42,7 +45,15 @@ ENV_MHZ = "TT_DEVICE_MCP_AICLK_CEILING_MHZ"
 ENV_CMD = "TT_DEVICE_MCP_AICLK_CEILING_CMD"
 ENV_TIMEOUT = "TT_DEVICE_MCP_AICLK_CEILING_TIMEOUT_SEC"
 ENV_PYTHON = "TT_DEVICE_MCP_AICLK_CEILING_PYTHON"
+ENV_SETTLE = "TT_DEVICE_MCP_AICLK_CEILING_SETTLE_SEC"
 DEFAULT_TIMEOUT_SEC = 8.0
+# Post-reset settle window: a chip reset seconds ago may still read its old limit right after the
+# cap was sent (seen ~4 s after a Galaxy reset, all 32 chips, then verified 7 s later). The helper
+# is re-run every SETTLE_POLL_SEC while the window lasts; only a chip still above the ceiling at
+# its end is unverified. Bounds the added time to the window plus one helper run.
+DEFAULT_SETTLE_SEC = 3.0
+MAX_SETTLE_SEC = 10.0
+SETTLE_POLL_SEC = 0.5
 # Per-chip bound inside the helper. Measured at ~2 ms per chip on a healthy 32-chip Blackhole
 # host; a chip that takes a second to open is not healthy.
 CHIP_TIMEOUT_SEC = 2.0
@@ -51,6 +62,10 @@ CHIP_TIMEOUT_SEC = 2.0
 UNSUPPORTED_RC = 77
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# Clock and sleep seams for the settle window (tests drive them without real waiting).
+_now = time.monotonic
+_sleep = asyncio.sleep
 
 
 def ceiling_mhz() -> Optional[int]:
@@ -67,6 +82,15 @@ def timeout_sec() -> float:
         return max(1.0, float(os.environ.get(ENV_TIMEOUT, "") or DEFAULT_TIMEOUT_SEC))
     except ValueError:
         return DEFAULT_TIMEOUT_SEC
+
+
+def settle_sec() -> float:
+    """The post-reset settle window in seconds, 0 to report the first readback as is."""
+    try:
+        v = float(os.environ.get(ENV_SETTLE, "") or DEFAULT_SETTLE_SEC)
+    except ValueError:
+        return DEFAULT_SETTLE_SEC
+    return min(max(0.0, v), MAX_SETTLE_SEC)
 
 
 def helper_path() -> Path:
@@ -125,34 +149,55 @@ class AiclkCeiling:
     def _track(self, proc) -> None:
         self.proc = proc
 
-    async def apply(
-        self,
-        where: str,
-        *,
-        log: Optional[Callable[[str], None]] = None,
-        terminate: Terminate = _killpg,
-    ) -> tuple[Optional[bool], str, dict]:
-        """Run the helper once. Returns ``(ok, detail, evidence)``: True verified (clears
-        ``owed``), False not verified (``owed`` stays set), None not armed or disarmed now.
-        Bounded by ``timeout_sec()``; the helper's process group is killed on timeout. Never
-        raises."""
-        mhz = ceiling_mhz()
-        if mhz is None or self.disarmed:
-            return None, "not armed", {}
-        argv = build_argv(mhz)
-        env = {**os.environ, ENV_MHZ: str(mhz)}
-        t0 = time.monotonic()
+    async def _run_helper(self, argv: list[str], env: dict, terminate: Terminate) -> tuple[Optional[int], str]:
         try:
             rc, out = await run_probe(
                 argv, timeout_sec=timeout_sec(), track=self._track, stream=True, env=env, terminate=terminate
             )
         except Exception as e:  # noqa: BLE001 - a helper that cannot start is a host config fault
             rc, out = UNSUPPORTED_RC, f"could not start the helper: {e}".encode()
-        dt = time.monotonic() - t0
-        text = out.decode(errors="replace") if isinstance(out, (bytes, bytearray)) else str(out)
+        return rc, out.decode(errors="replace") if isinstance(out, (bytes, bytearray)) else str(out)
+
+    async def apply(
+        self,
+        where: str,
+        *,
+        log: Optional[Callable[[str], None]] = None,
+        terminate: Terminate = _killpg,
+        settle: float = 0.0,
+    ) -> tuple[Optional[bool], str, dict]:
+        """Run the helper (once unless ``settle``). Returns ``(ok, detail, evidence)``: True verified (clears
+        ``owed``), False not verified (``owed`` stays set), None not armed or disarmed now.
+        Bounded by ``timeout_sec()``; the helper's process group is killed on timeout. Never
+        raises.
+
+        ``settle`` > 0 (the post-reset apply) re-runs a helper that reported a chip above the
+        ceiling or unreadable every ``SETTLE_POLL_SEC`` until ``settle`` seconds after the first
+        run started, and reports only the last result: no retry starts past the window, so the
+        added time is at most ``settle`` plus one helper run. A timeout or a cannot-run exit is
+        never retried."""
+        mhz = ceiling_mhz()
+        if mhz is None or self.disarmed:
+            return None, "not armed", {}
+        argv = build_argv(mhz)
+        env = {**os.environ, ENV_MHZ: str(mhz)}
+        t0 = _now()
+        rc, text = await self._run_helper(argv, env, terminate)
+        attempts = 1
+        # Verified, timed out (already spent the full bound) or cannot run here: never re-run.
+        final = (0, None, UNSUPPORTED_RC, 126, 127)
+        while rc not in final and _now() + SETTLE_POLL_SEC <= t0 + settle:
+            if log and attempts == 1:
+                log(f"aiclk-ceiling: readback not yet at {mhz} MHz (rc={rc}); re-reading for up to {settle:g}s")
+            await _sleep(SETTLE_POLL_SEC)
+            rc, text = await self._run_helper(argv, env, terminate)
+            attempts += 1
+        dt = _now() - t0
         s = _summary(text)
         chips, at_or_below, sent = s.get("chips"), s.get("ok"), s.get("sent", 0)
         evidence = {"mhz": mhz, "rc": rc, "seconds": round(dt, 3), "where": where}
+        if attempts > 1:
+            evidence["attempts"] = attempts
         # The helper's "ok" count is renamed: an evidence dict's "ok" is the probe's own verdict.
         for k, ek in (
             ("chips", "chips"),
@@ -181,13 +226,16 @@ class AiclkCeiling:
         if rc == 0:
             self.owed = False
             self.last = {**evidence, "verified_at": time.time()}
-            detail = f"ceiling {mhz} MHz applied to {count} (sent {sent}, {dt:.2f}s)"
+            tries = f", {attempts} reads" if attempts > 1 else ""
+            detail = f"ceiling {mhz} MHz applied to {count} (sent {sent}, {dt:.2f}s{tries})"
             health_event("aiclk_ceiling_applied", **evidence)
             metrics.probe_observed("aiclk_ceiling", "healthy", dt)
             ok: Optional[bool] = True
         else:
             self.owed = True
             why = f"timed out after {timeout_sec():.0f}s" if rc is None else f"rc={rc}"
+            if attempts > 1:
+                why += f" after {attempts} reads in {dt:.1f}s"
             detail = f"ceiling {mhz} MHz NOT verified ({why}; {count} at or below): {last_line}"
             health_event("aiclk_ceiling_unverified", **evidence, detail=last_line)
             metrics.probe_observed("aiclk_ceiling", "unhealthy", dt)
