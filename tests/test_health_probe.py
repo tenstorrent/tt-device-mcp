@@ -345,11 +345,23 @@ def test_a_poller_that_stays_up_between_rare_falls_is_restarted_quietly(tmp_path
     assert p.calls.count(("start", "tt-telemetry.service")) == 3 and sent == []
 
 
+def test_the_probe_default_is_the_broker_default():
+    from tt_device_mcp import server as srv
+
+    assert hp.DEFAULT_POLLER_SERVICES == srv.DEFAULT_POLLER_SERVICES
+
+
 def test_the_pollers_are_the_broker_list(tmp_path, hdir, sent, monkeypatch):
+    monkeypatch.delenv("TT_DEVICE_MCP_POLLER_SERVICES", raising=False)
     p = FakeProbe(tmp_path, chips=8)
-    p.units = {"tt-telemetry.service": "active", "tt-metrics-exporter.service": "failed"}
-    p.run()  # the broker's default list has both
+    p.units = {
+        "tt-telemetry.service": "active",
+        "tt-metrics-exporter.service": "failed",
+        "tt-fmax-cap.service": "inactive",
+    }
+    p.run()  # the broker's default list has all three
     assert ("start", "tt-metrics-exporter.service") in p.calls
+    assert ("start", "tt-fmax-cap.service") in p.calls
     monkeypatch.setenv("TT_DEVICE_MCP_POLLER_SERVICES", "my-poller.service")
     p.units = {"my-poller.service": "inactive", "tt-telemetry.service": "failed"}
     p.calls.clear()
