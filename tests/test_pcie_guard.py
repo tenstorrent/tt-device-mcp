@@ -263,20 +263,20 @@ def test_a_sibling_chip_already_all_ones_or_on_the_tray_is_not_touched(sysfs, mo
     assert _rescanned(sysfs) == ["0000:80:01.1"]
 
 
-def test_a_disabled_tray_rung_refuses_the_envelope(sysfs, monkeypatch):
-    """Once disabled (a walk regressed), the envelope refuses before touching anything, and the
+def test_a_disabled_tray_walk_leaves_the_envelope_armed(sysfs, monkeypatch):
+    """Disabling (a walk regressed) declines only the verify-between walk: the envelope still fires for
+    the back-to-back sweep, whose refused tray fire would hold the host rung forever (I22). The
     ubb_tray_rung_disabled event is left once, however often it is disabled."""
-    events = []
+    events, fired = [], []
     monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
     assert pcie_guard.tray_rung_disabled() is None
     pcie_guard.disable_tray_rung(tray=3, new_off=["5"])
     pcie_guard.disable_tray_rung(tray=1, new_off=["13"])
     assert [n for n, _ in events] == ["ubb_tray_rung_disabled"]
     assert pcie_guard.tray_rung_disabled() == {"tray": 3, "new_off": ["5"]}
-    with pytest.raises(pcie_guard.TrayRepowerRefused, match="disabled"):
-        pcie_guard.safe_tray_repower(0b1000, [3], lambda: pytest.fail("fired"), lambda m: None, sleep=lambda s: None)
-    assert all(_restored(sysfs, p) for p in PORTS), "nothing was masked"
-    assert not (sysfs / "sys/bus/pci/devices/0000:81:00.0/remove").exists()
+    pcie_guard.safe_tray_repower(0b1000, [3], lambda: fired.append(1), lambda m: None, sleep=lambda s: None)
+    assert fired == [1]
+    assert "tray_repower_refused" not in dict(events)
 
 
 def test_a_port_that_keeps_erroring_stays_masked_and_marks_a_flood(sysfs, monkeypatch):

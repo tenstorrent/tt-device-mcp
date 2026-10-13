@@ -210,12 +210,11 @@ def _ubb_reset_enabled() -> bool:
     Armed also means fireable (I14, I17): the re-power goes out as `ipmitool raw` to the local
     BMC, so a host with no reachable BMC reports the rung OFF rather than choosing it and raising.
 
-    Also OFF for the rest of the process once a tray re-power took chips on other trays off the bus
-    (``ubb_reset_regressed_offbus``, see :func:`pcie_guard.disable_tray_rung`).
+    A walk that took chips on other trays off the bus (``ubb_reset_regressed_offbus``) declines only
+    the verify-between walk for the rest of the process (:func:`pcie_guard.disable_tray_rung`); it
+    leaves this switch, and so the back-to-back sweep's tray re-power, as it is.
     """
     if os.environ.get("TT_DEVICE_MCP_AUTO_UBB_RESET", "1").strip() == "0":
-        return False
-    if pcie_guard.tray_rung_disabled() is not None:
         return False
     return privileges.can_ipmi()
 
@@ -2349,6 +2348,16 @@ class GalaxyRecovery(Recovery):
             return None  # no tray to re-power — the caller's existing hold owns it
         if not _ubb_reset_enabled():
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)  # name it + hold (the default)
+            metrics.stage_fired("ubb_tray", "blocked")
+            return None
+        if pcie_guard.tray_rung_disabled() is not None:
+            # An earlier walk took chips on other trays off the bus: decline the walk for the rest of
+            # the process. The back-to-back sweep still re-powers the tray, with a mesh reset after it.
+            _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)
+            log(
+                f"tray-down but the per-tray walk is disabled for this process "
+                f"({pcie_guard.tray_rung_disabled()}) — holding"
+            )
             metrics.stage_fired("ubb_tray", "blocked")
             return None
         if self.deps.device_hold_episode_ubb_reset_fired():

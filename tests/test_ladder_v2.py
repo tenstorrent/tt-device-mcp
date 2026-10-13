@@ -21,7 +21,7 @@ from tests.conftest import patch_health_event, patch_recovery
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health import recovery as recovery_pkg
-from tt_device_mcp.health.recovery import Evidence, galaxy
+from tt_device_mcp.health.recovery import Evidence, galaxy, pcie_guard
 
 
 async def _async_true(*a, **k):
@@ -95,14 +95,18 @@ def test_classify_hold_names_the_two_branches(galaxy_trays):
 
 
 @pytest.mark.asyncio
-async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(monkeypatch, galaxy_trays):
+@pytest.mark.parametrize("walk_disabled", [False, True])
+async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(monkeypatch, galaxy_trays, walk_disabled):
     """Through escalate()'s gate path (the live STAGE_UBB_TRAY rung, not the helper directly): a whole
     tray off the bus whose every off-bus chip reported no_bridge — threaded onto
     Evidence.bridge_reset_failed by the server — is classified TRAY_DOWN_NO_WINDOW and dispatched to
     _fire_tray_down_no_window: every reset type back-to-back (SBR -> per-tray re-power -> mesh reset),
     NO verify between, exactly ONE settle + ONE verify, then the power cycle. The generic
-    verify-between walk must NOT run."""
+    verify-between walk must NOT run. The same after an earlier walk regressed and disabled the walk
+    (spec 04 I25): only the walk is declined, never this sweep's tray re-power."""
     g = srv.galaxy_recovery
+    if walk_disabled:
+        pcie_guard.disable_tray_rung(tray=1, new_off=["13"])
     monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
     patch_health_event(monkeypatch, lambda *a, **k: None)
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
@@ -703,6 +707,18 @@ async def test_gate_ladder_sweeps_every_reset_before_the_power_cycle(monkeypatch
     steps = [o if isinstance(o, str) else o[0] for o in order]
     assert steps == ["sbr", "tray", "mesh"], f"every reset type once, in order, before the power cycle; got {steps}"
     assert out == galaxy.OUTCOME_WAITING and cycles["n"] == 1, "still bad after the sweep -> the power cycle fires"
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_tray_walk_still_re_powers_in_the_last_chance_sweep(monkeypatch, galaxy_trays):
+    """Spec 04 I25/I22: a regressed walk disables only the verify-between walk. The last-chance sweep
+    before a host rung still re-powers the off-bus tray, so the full ladder ran and the caller climbs
+    (False), never the hold (None) a skipped or refused tray fire would leave."""
+    g, order, cycles = _arm_sweep(monkeypatch)
+    pcie_guard.disable_tray_rung(tray=1, new_off=["13"])
+    off = {str(i) for i in range(24, 32)}  # UBB3
+    assert await g._settle_and_verify_before_host_rung(32, lambda m: None, "post-job", offbus_chips=off) is False
+    assert order == ["sbr", ("tray", 1 << 2), "mesh"], f"the tray re-power still fires in the sweep; got {order}"
 
 
 @pytest.mark.asyncio

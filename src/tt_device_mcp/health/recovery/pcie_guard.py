@@ -839,13 +839,15 @@ def _recover_siblings(plan: TrayPlan, live: dict, log: Callable[[str], None], sl
 
 
 # Set by :func:`disable_tray_rung` once a per-tray re-power took chips on other trays off the bus
-# (``ubb_reset_regressed_offbus``): the rung is declined for the rest of the process. Kept in memory
-# only, so a broker restart re-arms it.
+# (``ubb_reset_regressed_offbus``): the verify-between walk is declined for the rest of the process.
+# The back-to-back sweep still fires the re-power (a mesh reset follows it). Kept in memory only, so
+# a broker restart re-arms it.
 _TRAY_RUNG_DISABLED: Optional[dict] = None
 
 
 def disable_tray_rung(**why) -> None:
-    """Decline the per-tray re-power for the rest of the process (``ubb_tray_rung_disabled``, once)."""
+    """Decline the per-tray verify-between walk for the rest of the process (``ubb_tray_rung_disabled``,
+    once)."""
     global _TRAY_RUNG_DISABLED
     if _TRAY_RUNG_DISABLED is not None:
         return
@@ -906,7 +908,7 @@ def safe_tray_repower(
     9. restore AER on every port that stayed quiet; one that keeps erroring stays masked.
 
     Steps 7-9 run even when the quiesce or the pulse raised. ``TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1`` logs the plan
-    and raises :class:`TrayRepowerDryRun` before step 2. Refuses once :func:`disable_tray_rung` ran."""
+    and raises :class:`TrayRepowerDryRun` before step 2."""
     plan = plan_tray_repower(bitmap, tray_chip_ids)
     log(
         f"tray re-power plan: trays {plan.trays} (bitmap {bitmap:#04x}); functions {plan.functions}; "
@@ -930,10 +932,6 @@ def safe_tray_repower(
     if plan.mismatch:
         health_event("tray_repower_refused", trays=plan.trays, reason=plan.mismatch, host_at_risk=True)
         raise TrayRepowerRefused(plan.mismatch)
-    if tray_rung_disabled() is not None:
-        why = f"the per-tray re-power is disabled for this process: {tray_rung_disabled()}"
-        health_event("tray_repower_refused", trays=plan.trays, reason=why)
-        raise TrayRepowerRefused(why)
     wait = _env_float("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", 10)
     deadline = time.monotonic() + wait
     holders = _tray_holders(plan.chips)

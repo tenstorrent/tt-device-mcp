@@ -10705,14 +10705,15 @@ async def test_the_walk_rescans_only_the_re_powered_trays_root_ports(monkeypatch
 async def test_a_regressed_walk_disables_the_tray_rung_for_the_process(monkeypatch, clear_job_state, galaxy_trays):
     """After one walk that took a chip on another tray off the bus, the rung is declined for the rest of
     the process (ubb_tray_rung_disabled, once): the next drop is named and held as when opted out, and
-    nothing is re-powered. Only a broker restart arms it again."""
+    nothing is re-powered. Only the walk is declined: the opt-in the back-to-back sweep reads stays on.
+    Only a broker restart arms the walk again."""
     start = set(range(24, 32))
     fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(start | {5})])
     assert await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 8, 32, lambda m: None) is False
     assert fired == [0x04]
     assert pcie_guard.tray_rung_disabled() == {"tray": 3, "new_off": ["5"]}
     assert [n for n, _ in events].count("ubb_tray_rung_disabled") == 1
-    assert galaxy._ubb_reset_enabled() is False
+    assert galaxy._ubb_reset_enabled() is True, "the sweep's tray re-power stays armed"
 
     srv.fsm.set_latch("ubb_reset_fired", False)  # a new hold episode
     fired.clear()
