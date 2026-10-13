@@ -28,9 +28,8 @@ from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState
 from tt_device_mcp.health.monitors import eth, heartbeat, pci
-from tt_device_mcp.health.recovery import RecoveryDeps, pcie_guard
+from tt_device_mcp.health.recovery import RecoveryDeps, offbus_power_cycle, pcie_guard
 from tt_device_mcp.health.recovery import galaxy as recovery_galaxy
-from tt_device_mcp.health.recovery import offbus_power_cycle
 from tt_device_mcp.server import (
     _ensure_async_primitives,
     _reset_for_testing,

@@ -8,7 +8,9 @@ rungs ran, idle and with nothing objecting, the broker runs the host's power-cyc
 interval — and otherwise holds or pages, never loops. ``fire_command`` is always a fake here; no test
 may run a real power-cycle command (conftest makes the real one a tripwire)."""
 
+import subprocess
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -16,9 +18,8 @@ from tests.test_device_safety import _arm_offbus_stuck_hold
 from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
-from tt_device_mcp.health.recovery import galaxy
+from tt_device_mcp.health.recovery import galaxy, pcie_guard
 from tt_device_mcp.health.recovery import offbus_power_cycle as opc
-from tt_device_mcp.health.recovery import pcie_guard
 
 GATE_WHY = "3 chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold"
 OFF_BUS, EXPECTED = 3, 32
@@ -368,3 +369,39 @@ def test_a_corrupt_state_file_reads_empty_and_a_bad_stamp_counts_as_now(monkeypa
     now = 1_000_000.0
     assert opc.last_attempt_within({"attempts": [{"at_epoch": "?"}]}, now, 600) == now
     assert opc.last_attempt_within({"attempts": [{"at_epoch": now - 700}]}, now, 600) is None
+
+
+# --- the manual-recovery check template -----------------------------------------------------------
+
+_CHECK = str(Path(__file__).resolve().parent.parent / "deploy" / "tt-manual-recovery-check.sh")
+
+
+def _journal(tmp_path, lines, rc=0):
+    """A stand-in journalctl printing ``lines`` (and recording its argv), never the real journal."""
+    body = "\n".join(f"echo '{line}'" for line in lines)
+    return _script(tmp_path, "journalctl", f'echo "$@" > {tmp_path / "argv"}\n{body}\nexit {rc}')
+
+
+@pytest.mark.parametrize(
+    "lines, rc",
+    [
+        (["... sudo[1]: ops : TTY=pts/0 ; PWD=/ ; USER=root ; COMMAND=/usr/sbin/reboot"], 0),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/systemctl reboot"], 0),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool -H bmc chassis power cycle"], 0),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool sensor list"], 1),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/apt-get install halt-utils"], 1),
+        ([], 1),
+    ],
+    ids=["reboot", "systemctl-reboot", "ipmitool-power", "ipmitool-read", "unrelated", "nothing"],
+)
+def test_the_manual_recovery_check_template(tmp_path, monkeypatch, lines, rc):
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, lines))
+    p = subprocess.run(["bash", _CHECK, "45"], capture_output=True, text=True)
+    assert p.returncode == rc, p.stderr
+    assert "_COMM=sudo" in (tmp_path / "argv").read_text() and "-45min" in (tmp_path / "argv").read_text()
+
+
+def test_the_manual_recovery_check_cannot_answer_on_an_unreadable_journal(tmp_path, monkeypatch):
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, ["Failed to open journal"], rc=1))
+    assert subprocess.run(["bash", _CHECK], capture_output=True).returncode == 2
+    assert subprocess.run(["bash", _CHECK, "soon"], capture_output=True).returncode == 2
