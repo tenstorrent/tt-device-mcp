@@ -300,6 +300,42 @@ def test_boot_merge_reattributes_only_the_current_boot(tmp_path):
     assert "recorded at NEW" in d and "recorded at OLD" not in d
 
 
+def test_boot_merge_skips_attribution_on_a_plain_broker_restart(tmp_path):
+    """A broker restart within one boot is not a new boot: the escalation that brought this boot up
+    was already attributed by the broker that ran first in it. Re-attributing it on every later
+    restart names weeks-old power cycles as this start's cause and holds the door on them."""
+    path = tmp_path / "fsm.json"
+    escalation = {"action": "power-cycle", "at": "2026-09-16T05:21:11"}
+
+    first = ServerFsm(path, current_boot_id="boot-B")  # the first broker start of boot B
+    first.boot_merge(open_episode=None, attributed_boot=escalation)
+    assert "boot attributed to a broker-fired power-cycle" in first.record.detail
+
+    restart = ServerFsm(path, current_boot_id="boot-B")  # same boot id: a plain broker restart
+    restart.boot_merge(open_episode=None, attributed_boot=escalation)
+    assert "boot attributed" not in restart.record.detail
+
+    rebooted = ServerFsm(path, current_boot_id="boot-C")  # a real reboot since: attribute again
+    rebooted.boot_merge(open_episode=None, attributed_boot={"action": "reboot", "at": "NEW"})
+    assert "broker-fired reboot recorded at NEW" in rebooted.record.detail
+
+
+def test_boot_merge_attributes_when_the_previous_boot_is_unknown(tmp_path):
+    """No prior record, or one without a boot id, or an unknown current boot id: nothing proves
+    this is a restart within one boot, so the guarded attribution still applies."""
+    escalation = {"action": "power-cycle", "at": "AT"}
+    (tmp_path / "legacy.json").write_text('{"state": "healthy"}')
+    for path, boot in ((tmp_path / "none.json", "boot-B"), (tmp_path / "legacy.json", "boot-B")):
+        f = ServerFsm(path, current_boot_id=boot)
+        f.boot_merge(open_episode=None, attributed_boot=escalation)
+        assert "recorded at AT" in f.record.detail, path.name
+    path = tmp_path / "unknown.json"
+    ServerFsm(path, current_boot_id="").boot_merge(open_episode=None)
+    f = ServerFsm(path, current_boot_id="")
+    f.boot_merge(open_episode=None, attributed_boot=escalation)
+    assert "recorded at AT" in f.record.detail
+
+
 def test_on_next_close_fires_once_on_whichever_path_reaches_healthy(tmp_path):
     """A caller pairing an opening event with its close (the startup hold's release row) registers
     once and must hear about the close exactly once — not on a refreshed fault mid-episode, not

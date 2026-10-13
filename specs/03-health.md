@@ -52,6 +52,9 @@ job boundary.
 - **I6 — A cross-boot load voids the job context but keeps the device facts.**
   state/why/since/detail/latches/dirty all survive a reboot; only `job` is cleared (it cannot have
   survived), and `dirty` is deliberately NOT cleared — fail closed toward the owed reset attempt.
+  The converse: a same-boot load (the file's `boot_id` equals this boot's, both known) is a plain
+  broker restart, so `boot_merge` does not attribute the boot to a ledger escalation again — the
+  first broker start of that boot already did, and the escalation did not cause this restart.
 - **I7 — `OUTCOME_WAITING` never transitions the FSM.** Only `recovered` closes an episode
   (→ HEALTHY) and only `terminal` reaches DOWN; a platform with no ladder (per-target) reports
   waiting forever and must never be read as DOWN.
@@ -656,7 +659,7 @@ resolves per pass until a later snapshot succeeds.
 `run_startup_tasks()` then runs once, before the job runner: re-adopt running scopes, restore the
 queued backlog, self-test and arm the eth-heartbeat rung (I28), close any orphaned hold, then
 `fsm.boot_merge()` — always closed (I4), with this boot's auto-recovery ledger attribution folded
-into `detail` — followed by an async startup-health report (sysfs heartbeat only, records what
+into `detail` on the boot's first broker start only (I6) — followed by an async startup-health report (sysfs heartbeat only, records what
 came back after a reboot and marks dirty if degraded) and the forced startup gate
 (`phase="startup"`, `force_fabric=True`), which queues behind re-adopted jobs and is the only
 thing that may lift the `startup_unverified` hold. A per-user daemon (`should_privsep()` false)
@@ -940,7 +943,7 @@ refuses.
 | I3 | `tests/test_fsm.py::test_survives_restart`, `tests/test_fsm.py::test_dirty_survives_restart`, `tests/test_state_paths.py::test_fsm_survives_restart_at_the_per_user_default_health_dir` |
 | I4 | `tests/test_fsm.py::test_boot_with_no_open_episode_starts_closed`, `tests/test_fsm.py::test_boot_open_episode_is_adopted`, `tests/test_fsm.py::test_terminal_episode_survives_boot_merge`, `tests/test_fsm.py::test_boot_sentinel_is_not_an_open_episode`, `tests/test_readopt.py::test_a_per_user_daemon_start_runs_a_light_probe_and_a_pass_reads_healthy`, `tests/test_readopt.py::test_a_per_user_daemon_start_on_a_bad_device_stays_recovering`, `tests/test_readopt.py::test_a_per_user_daemon_start_beside_a_holder_stays_healthy`, `tests/test_readopt.py::test_a_failed_per_user_start_reopens_once_the_device_reads_healthy`, `tests/test_readopt.py::test_a_per_user_restart_keeps_a_loaded_open_episode`, `tests/test_readopt.py::test_a_per_user_restart_from_a_saved_healthy_state_probes_again`, `tests/test_readopt.py::test_a_per_user_start_probe_that_raises_holds_the_device`, `tests/test_readopt.py::test_the_privsep_broker_start_does_not_run_the_per_user_probe` |
 | I5 | `tests/test_fsm.py::test_an_unknown_why_on_disk_clamps_on_load` |
-| I6 | `tests/test_fsm.py::test_cross_boot_load_voids_job_but_keeps_device_facts`, `tests/test_fsm.py::test_a_dirty_mark_survives_a_cross_boot_load`, `tests/test_fsm.py::test_a_file_with_no_boot_id_is_treated_as_cross_boot`, `tests/test_fsm.py::test_same_boot_restart_keeps_job_and_dirty` |
+| I6 | `tests/test_fsm.py::test_cross_boot_load_voids_job_but_keeps_device_facts`, `tests/test_fsm.py::test_a_dirty_mark_survives_a_cross_boot_load`, `tests/test_fsm.py::test_a_file_with_no_boot_id_is_treated_as_cross_boot`, `tests/test_fsm.py::test_same_boot_restart_keeps_job_and_dirty`, `tests/test_fsm.py::test_boot_merge_skips_attribution_on_a_plain_broker_restart`, `tests/test_fsm.py::test_boot_merge_attributes_when_the_previous_boot_is_unknown` |
 | I3/I5 robustness | `tests/test_fsm.py::test_a_wrong_shape_file_degrades_to_boot_not_a_crash`, `tests/test_fsm.py::test_malformed_field_types_degrade_to_boot_not_a_crash`, `tests/test_device_safety.py::test_a_non_dict_job_on_disk_never_poisons_the_gate` |
 | I7 | `tests/test_fsm.py::test_waiting_outcome_never_transitions`, `tests/test_device_safety.py::test_a_per_target_gate_pass_never_reaches_down` |
 | I8 | `tests/test_health_core.py::test_healthstate_any_unhealthy_is_unhealthy`, `tests/test_health_core.py::test_healthstate_skipped_never_heals` |

@@ -172,6 +172,9 @@ class ServerFsm:
         # see _load. "" (unreadable, or a caller that does not care) never matches itself: an
         # unknown boot id must never be trusted to mean "the same boot" on either side.
         self._boot_id = current_boot_id
+        # The boot id the file on disk was last written under ("" when absent or unreadable): equal
+        # to this boot's means a broker already ran in this boot, so this start is a plain restart.
+        self._loaded_boot_id = ""
         self._record = FsmRecord(ServerState.BOOT)
         # Per-episode latches: reset every time a new episode opens (see _open_episode), so a
         # once-per-episode rung re-arms once the device has actually recovered and gone bad again.
@@ -324,6 +327,7 @@ class ServerFsm:
             # wrote. Degrade to BOOT rather than let a .get()/.items() below raise into the
             # constructor of a module-scope singleton and take the whole broker down with it.
             return
+        self._loaded_boot_id = str(raw.get("boot_id") or "")
         try:
             raw_job = raw.get("job")
             record = FsmRecord(
@@ -567,6 +571,11 @@ class ServerFsm:
             self._persist()
         # OUTCOME_WAITING: hold exactly where we are — see the docstring above.
 
+    def _restart_within_boot(self) -> bool:
+        """Whether this broker start is a restart within a boot a broker already ran in: the record
+        on disk was written under this same boot id. An unknown id on either side is never "same"."""
+        return bool(self._boot_id) and self._loaded_boot_id == self._boot_id
+
     def boot_merge(self, open_episode: Optional[FsmRecord], attributed_boot: Optional[dict] = None) -> ServerState:
         """Reconcile BOOT into a real state, once, at startup. Always closed: a restart loses the
         in-memory verification state, and sysfs reads perfectly healthy across a wedged ethernet
@@ -584,7 +593,8 @@ class ServerFsm:
         ``attributed_boot`` — this boot's own auto-recovery ledger entry, if a broker-fired reboot
         or power cycle brought it up — is not part of the state decision (only the startup gate
         proves whether that escalation actually worked); it is folded into ``detail`` purely so the
-        FSM's own record names the boot's cause for anyone reading it later."""
+        FSM's own record names the boot's cause for anyone reading it later. Only on the first broker
+        start of a boot: a restart within the same boot id drops it (see _restart_within_boot)."""
         if open_episode is not None and open_episode.state in (ServerState.RECOVERING, ServerState.DOWN):
             self._record = FsmRecord(
                 state=open_episode.state,
@@ -597,6 +607,17 @@ class ServerFsm:
             metrics.state_entered(open_episode.state.value)
         else:
             self._open_episode(ServerState.RECOVERING, "startup_unverified")
+        if attributed_boot and self._restart_within_boot():
+            # The broker that ran first in this boot already attributed it. Re-applying it on every
+            # later restart names a weeks-old escalation as this start's cause (a broker restart
+            # attributed to a power cycle 27 days earlier) — this start's cause is the restart.
+            _logger.info(
+                "fsm: boot %s already ran a broker; not re-attributing it to the %s recorded at %s",
+                self._boot_id,
+                attributed_boot.get("action", "?"),
+                attributed_boot.get("at", "?"),
+            )
+            attributed_boot = None
         if attributed_boot:
             action = attributed_boot.get("action", "?")
             at = attributed_boot.get("at", "?")
