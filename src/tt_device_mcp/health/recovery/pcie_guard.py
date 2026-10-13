@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp.health.evidence import health_dir, health_event
+from tt_device_mcp.health.monitors.heartbeat import ALL_ONES
 
 SYS_ROOT = Path("/")
 TT_VENDOR = 0x1E52
@@ -674,6 +675,9 @@ class TrayPlan:
     root_ports: list  # every Tenstorrent root port, masked for the window (siblings too)
     mismatch: str = ""
     kept_masked: list = field(default_factory=list)  # ports still erroring after the re-power
+    tray_ports: list = field(default_factory=list)  # the re-powered trays' root ports, the only ones rescanned
+    siblings_dropped: list = field(default_factory=list)  # chips on other trays that read all-ones after it
+    siblings_still_off: list = field(default_factory=list)  # ... and still did after their remove + rescan
 
 
 def plan_tray_repower(bitmap: int, tray_chip_ids: list) -> TrayPlan:
@@ -696,6 +700,7 @@ def plan_tray_repower(bitmap: int, tray_chip_ids: list) -> TrayPlan:
     _remember(eps)
     groups = tray_bus_groups(eps)
     plan = TrayPlan(bitmap=bitmap, trays=trays, functions=[], chips=[], root_ports=tt_root_ports(eps))
+    plan.tray_ports = tray_root_ports(trays, eps, groups)
     if not eps:
         # Every chip is off the bus: no healthy tray can be cut, and there is nothing to cross-check.
         # Refusing here would leave an all-off mesh with no tray re-power before the power cycle.
@@ -716,6 +721,141 @@ def plan_tray_repower(bitmap: int, tray_chip_ids: list) -> TrayPlan:
             f"chip(s) {missing} on these trays were not named"
         )
     return plan
+
+
+def _secondary_buses(port: str) -> list:
+    """The buses below a root port, from its ``pci_bus`` children (there with or without a chip on them)."""
+    try:
+        return sorted(int(b.name.split(":")[-1], 16) for b in (_pci_dir() / port / "pci_bus").iterdir())
+    except (OSError, ValueError):
+        return []
+
+
+def tray_root_ports(trays: list, endpoints: Optional[dict] = None, groups: Optional[dict] = None) -> list:
+    """The root ports of ``trays``: those above a Tenstorrent function on them now, and every Tenstorrent
+    root port (present or remembered) whose bus below falls in their tt-smi bus group, which still finds
+    the port of a chip that is off the bus. ``[]`` when no tray table is known."""
+    eps = (tt_endpoints() or {}) if endpoints is None else endpoints
+    groups = tray_bus_groups(eps) if groups is None else groups
+    if not groups:
+        return []
+    wanted = {groups[t] for t in trays if t in groups}
+    ports = {e.root_port for e in eps.values() if e.root_port and e.bus & 0xF0 in wanted}
+    ports |= {p for p in tt_root_ports(eps) if any(b & 0xF0 in wanted for b in _secondary_buses(p))}
+    return sorted(ports)
+
+
+def rescan_root_ports(ports: list, log: Callable[[str], None]) -> list:
+    """Rescan only the bus below each of ``ports`` (the kernel's ``pci_bus/<bus>/rescan``), never the
+    whole host: a global rescan also walks every other tray's ports, and after each per-tray re-power
+    on a 6U Galaxy the slot-6 chip of every other tray was left reading all-ones. Returns the ports
+    rescanned; one that cannot be is logged and skipped."""
+    done = []
+    for port in ports:
+        try:
+            buses = sorted((_pci_dir() / port / "pci_bus").iterdir())
+        except OSError as exc:
+            log(f"no scoped rescan for root port {port}: {exc!r}")
+            continue
+        for bus in buses:
+            try:
+                _write(bus / "rescan", "1")
+            except OSError as exc:
+                log(f"rescan of bus {bus.name} below {port} failed: {exc!r}")
+                continue
+            if port not in done:
+                done.append(port)
+    return done
+
+
+def rescan_trays(trays: list, log: Callable[[str], None]) -> list:
+    """:func:`rescan_root_ports` for the root ports of ``trays``. ``[]`` when none could be rescanned."""
+    return rescan_root_ports(tray_root_ports(trays), log)
+
+
+def _heartbeats() -> dict:
+    """``{chip: ARC heartbeat}`` from the tenstorrent class: a sysfs read, the driver answers it. A chip
+    whose value cannot be read is left out."""
+    out: dict = {}
+    try:
+        entries = list((SYS_ROOT / "sys/class/tenstorrent").iterdir())
+    except OSError:
+        return out
+    for entry in entries:
+        m = re.search(r"(\d+)$", entry.name)
+        if not m:
+            continue
+        try:
+            out[int(m.group(1))] = int((entry / "tt_heartbeat").read_text().strip())
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def _live_siblings(plan: TrayPlan) -> dict:
+    """``{chip: Endpoint}`` for the chips NOT on the re-powered trays whose heartbeat reads live now: the
+    ones a re-power must not take off the bus. Empty when sysfs cannot be read."""
+    eps = tt_endpoints() or {}
+    beats = _heartbeats()
+    return {
+        e.chip: e
+        for e in eps.values()
+        if e.chip is not None and e.bdf not in plan.functions and beats.get(e.chip, ALL_ONES) != ALL_ONES
+    }
+
+
+def _recover_siblings(plan: TrayPlan, live: dict, log: Callable[[str], None], sleep: Callable[[float], None]) -> None:
+    """After the pulse: a chip on another tray that read live before it and all-ones now gets ONE remove
+    and a rescan of its own root port. One still all-ones after that is left to the caller (the walk's
+    regression check hands it to the mesh reset)."""
+    if not live:
+        return
+    beats = _heartbeats()
+    dropped = sorted(c for c in live if beats.get(c) == ALL_ONES)
+    if not dropped:
+        return
+    plan.siblings_dropped = dropped
+    log(f"tray re-power of trays {plan.trays} left chip(s) {dropped} on other trays reading all-ones; remove + rescan")
+    for c in dropped:
+        try:
+            _write(_pci_dir() / live[c].bdf / "remove", "1")
+        except OSError as exc:
+            log(f"could not remove {live[c].bdf} (chip {c}): {exc!r}")
+    rescan_root_ports(sorted({live[c].root_port for c in dropped if live[c].root_port}), log)
+    sleep(3)
+    beats = _heartbeats()
+    by_bdf = {e.bdf: e.chip for e in (tt_endpoints() or {}).values()}
+    plan.siblings_still_off = [
+        c for c in dropped if beats.get(by_bdf.get(live[c].bdf), ALL_ONES) == ALL_ONES  # type: ignore[arg-type]
+    ]
+    health_event(
+        "tray_repower_sibling_offbus",
+        trays=plan.trays,
+        chips=dropped,
+        functions=[live[c].bdf for c in dropped],
+        still_off=plan.siblings_still_off,
+        host_at_risk=True,
+    )
+
+
+# Set by :func:`disable_tray_rung` once a per-tray re-power took chips on other trays off the bus
+# (``ubb_reset_regressed_offbus``): the rung is declined for the rest of the process. Kept in memory
+# only, so a broker restart re-arms it.
+_TRAY_RUNG_DISABLED: Optional[dict] = None
+
+
+def disable_tray_rung(**why) -> None:
+    """Decline the per-tray re-power for the rest of the process (``ubb_tray_rung_disabled``, once)."""
+    global _TRAY_RUNG_DISABLED
+    if _TRAY_RUNG_DISABLED is not None:
+        return
+    _TRAY_RUNG_DISABLED = dict(why)
+    health_event("ubb_tray_rung_disabled", **why, host_at_risk=True)
+
+
+def tray_rung_disabled() -> Optional[dict]:
+    """Why the per-tray rung was disabled in this process, or None while it is armed."""
+    return _TRAY_RUNG_DISABLED
 
 
 def _tray_holders(chips: list) -> dict:
@@ -759,11 +899,14 @@ def safe_tray_repower(
     4. ``quiesce`` the chips (tt-smi's USER_RESET ioctl);
     5. remove the tray's PCI functions so nothing in the kernel touches them while unpowered;
     6. ``fire`` the BMC pulse (it also waits out the settle);
-    7. rescan the bus, ``reinit`` the chips (POST_RESET ioctl);
-    8. restore AER on every port that stayed quiet; one that keeps erroring stays masked.
+    7. rescan only the tray's root ports (a global rescan only when none is known), ``reinit`` the
+       chips (POST_RESET ioctl);
+    8. heartbeat-check the other trays' chips: one that read live before the pulse and all-ones now
+       gets one remove and a rescan of its own root port;
+    9. restore AER on every port that stayed quiet; one that keeps erroring stays masked.
 
-    Steps 7-8 run even when the quiesce or the pulse raised. ``TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1`` logs the plan
-    and raises :class:`TrayRepowerDryRun` before step 2."""
+    Steps 7-9 run even when the quiesce or the pulse raised. ``TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1`` logs the plan
+    and raises :class:`TrayRepowerDryRun` before step 2. Refuses once :func:`disable_tray_rung` ran."""
     plan = plan_tray_repower(bitmap, tray_chip_ids)
     log(
         f"tray re-power plan: trays {plan.trays} (bitmap {bitmap:#04x}); functions {plan.functions}; "
@@ -776,8 +919,9 @@ def safe_tray_repower(
             f"quiesce chips {plan.chips}",
             f"remove {plan.functions}",
             f"fire BMC re-power {bitmap:#04x}",
-            "rescan",
+            f"rescan {plan.tray_ports or 'the bus'}",
             f"re-init chips {plan.chips}",
+            "heartbeat-check the other trays",
             "restore AER on quiet ports",
         ]
         log("tray re-power DRY RUN, nothing touched: " + " -> ".join(steps))
@@ -786,6 +930,10 @@ def safe_tray_repower(
     if plan.mismatch:
         health_event("tray_repower_refused", trays=plan.trays, reason=plan.mismatch, host_at_risk=True)
         raise TrayRepowerRefused(plan.mismatch)
+    if tray_rung_disabled() is not None:
+        why = f"the per-tray re-power is disabled for this process: {tray_rung_disabled()}"
+        health_event("tray_repower_refused", trays=plan.trays, reason=why)
+        raise TrayRepowerRefused(why)
     wait = _env_float("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", 10)
     deadline = time.monotonic() + wait
     holders = _tray_holders(plan.chips)
@@ -796,6 +944,7 @@ def safe_tray_repower(
         why = f"chip(s) still held open after {wait:.0f}s: {holders}"
         health_event("tray_repower_refused", trays=plan.trays, reason=why, holders=holders)
         raise TrayRepowerRefused(why)
+    live = _live_siblings(plan)
     try:
         mask = AerMask(plan.root_ports).apply()
     except OSError as exc:
@@ -812,21 +961,34 @@ def safe_tray_repower(
         fire()
     finally:
         try:
-            _write(SYS_ROOT / "sys/bus/pci/rescan", "1")
+            if not rescan_root_ports(plan.tray_ports, log):
+                log(f"no root port of trays {plan.trays} could be rescanned on its own; rescanning the whole bus")
+                _write(SYS_ROOT / "sys/bus/pci/rescan", "1")
             sleep(3)
         except OSError as exc:
             log(f"PCI rescan after the re-power failed: {exc!r}")
         try:
             reinit(plan.chips)
         finally:
+            try:
+                _recover_siblings(plan, live, log, sleep)
+            except Exception as exc:  # noqa: BLE001 - the AER restore below must still run
+                log(f"checking the other trays after the re-power failed: {exc!r}")
             kept = plan.kept_masked = mask.restore(sleep=sleep)
             back = sorted(b for b in plan.functions if (_pci_dir() / b).exists())
             log(
                 f"tray re-power done: {len(back)}/{len(plan.functions)} function(s) back"
                 + (f"; AER kept masked on erroring port(s) {kept}" if kept else "; AER restored")
+                + (f"; other trays' chip(s) {plan.siblings_dropped} dropped" if plan.siblings_dropped else "")
             )
             health_event(
-                "tray_repower_envelope", trays=plan.trays, back=len(back), of=len(plan.functions), kept_masked=kept
+                "tray_repower_envelope",
+                trays=plan.trays,
+                back=len(back),
+                of=len(plan.functions),
+                kept_masked=kept,
+                siblings_dropped=plan.siblings_dropped,
+                siblings_still_off=plan.siblings_still_off,
             )
     return plan
 

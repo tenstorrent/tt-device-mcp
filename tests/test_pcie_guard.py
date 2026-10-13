@@ -56,6 +56,7 @@ def sysfs(tmp_path, monkeypatch):
         (rp_dir / "vendor").write_text("0x1022\n")
         (rp_dir / "config").write_bytes(bytes(_port_config()))
         (rp_dir / "aer_rootport_total_err_cor").write_text("0\n")
+        (rp_dir / f"pci_bus/0000:{bus:02x}").mkdir(parents=True)  # the bus below the port
         (ep_dir / "vendor").write_text("0x1e52\n")
         (ep_dir / "device").write_text("0xb140\n")
         (devs / rp).symlink_to(rp_dir)
@@ -63,6 +64,7 @@ def sysfs(tmp_path, monkeypatch):
         cls = tmp_path / f"sys/class/tenstorrent/tenstorrent!{chip}"
         cls.mkdir()
         (cls / "device").symlink_to(ep_dir)
+        (cls / "tt_heartbeat").write_text("100\n")
     constants = types.ModuleType("tt_smi.constants")
     constants.BH_UBB_BUS_IDS = {1: 0x00, 2: 0x40, 3: 0xC0, 4: 0x80}
     constants.WH_UBB_BUS_IDS = {}
@@ -109,6 +111,11 @@ def _restored(root, bdf) -> bool:
         and _cfg(root, bdf, AER + 0x14, 4) == 0x2000
         and _cfg(root, bdf, DPC + 6, 2) == 0xB
     )
+
+
+def _rescanned(root) -> list:
+    """The root ports whose bus below was rescanned on its own."""
+    return sorted(rp for rp in PORTS if any((root / "sys/bus/pci/devices" / rp / "pci_bus").glob("*/rescan")))
 
 
 # ---------------------------------------------------------------- tray map cross-check (issue #27)
@@ -159,7 +166,7 @@ def test_envelope_masks_every_port_removes_the_tray_fires_rescans_and_restores(s
         sleep=lambda s: None,
     )
     assert steps == [("quiesce", [3]), "fire", ("reinit", [3])]
-    assert (sysfs / "sys/bus/pci/rescan").read_text() == "1"
+    assert _rescanned(sysfs) == ["0000:80:01.1"]
     assert all(_restored(sysfs, p) for p in PORTS), "a quiet port gets its exact old settings back"
     assert plan.kept_masked == []
 
@@ -170,8 +177,106 @@ def test_envelope_restores_and_rescans_even_when_the_pulse_fails(sysfs):
 
     with pytest.raises(RuntimeError):
         pcie_guard.safe_tray_repower(0b1000, [3], fire, lambda m: None, sleep=lambda s: None)
-    assert (sysfs / "sys/bus/pci/rescan").read_text() == "1"
+    assert _rescanned(sysfs) == ["0000:80:01.1"]
     assert all(_restored(sysfs, p) for p in PORTS)
+
+
+ALL_ONES = "4294967295\n"
+
+
+def _beat(root, chip, value):
+    (root / f"sys/class/tenstorrent/tenstorrent!{chip}/tt_heartbeat").write_text(value)
+
+
+def test_the_envelope_rescans_only_the_re_powered_trays_root_ports(sysfs):
+    """A global rescan walks every other tray's ports too; after each per-tray re-power on a Galaxy the
+    slot-6 chip of every other tray then read all-ones. Only the re-powered tray's port is rescanned,
+    the bare global rescan never, and a tray whose chip is off the bus still has its port found."""
+    plan = pcie_guard.safe_tray_repower(0b0010, [1], lambda: None, lambda m: None, sleep=lambda s: None)
+    assert plan.tray_ports == ["0000:40:01.1"]
+    assert _rescanned(sysfs) == ["0000:40:01.1"]
+    assert not (sysfs / "sys/bus/pci/rescan").exists(), "never the whole bus"
+    # Chip 1 off the bus (its function gone): its port, remembered and still in sysfs, is the tray's.
+    (sysfs / "sys/bus/pci/devices/0000:41:00.0").unlink()
+    assert pcie_guard.tray_root_ports([2]) == ["0000:40:01.1"]
+    assert pcie_guard.tray_root_ports([1, 3]) == ["0000:00:01.1", "0000:c0:01.1"]
+
+
+def test_the_envelope_falls_back_to_the_global_rescan_when_no_tray_port_is_known(sysfs):
+    """With no port of the tray rescannable on its own, a removed chip could never come back: then,
+    and only then, the whole bus is rescanned."""
+    for rp in PORTS:
+        shutil.rmtree(sysfs / "sys/bus/pci/devices" / rp / "pci_bus")
+    lines = []
+    pcie_guard.safe_tray_repower(0b1000, [3], lambda: None, lines.append, sleep=lambda s: None)
+    assert (sysfs / "sys/bus/pci/rescan").read_text() == "1"
+    assert any("rescanning the whole bus" in m for m in lines)
+
+
+def test_a_sibling_chip_newly_all_ones_gets_one_remove_and_scoped_rescan(sysfs, monkeypatch):
+    """Tray 4's re-power leaves chip 0 (tray 1) reading all-ones: it gets one remove and a rescan of its
+    own port, with AER still masked, and is reported. Back after that: still_off is empty; still
+    all-ones: it is reported still off and left to the walk (the mesh reset)."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    real_write = pcie_guard._write
+    writes = []
+
+    def write(path, text):
+        writes.append((str(path.relative_to(sysfs)), _masked(sysfs, "0000:00:01.1")))
+        real_write(path, text)
+        if path.name == "rescan" and "0000:00:01.1" in str(path) and recovers:
+            _beat(sysfs, 0, "100\n")
+
+    monkeypatch.setattr(pcie_guard, "_write", write)
+    for recovers, still_off in ((True, []), (False, [0])):
+        events.clear()
+        writes.clear()
+        _beat(sysfs, 0, "100\n")
+        plan = pcie_guard.safe_tray_repower(
+            0b1000, [3], lambda: _beat(sysfs, 0, ALL_ONES), lambda m: None, sleep=lambda s: None
+        )
+        assert plan.siblings_dropped == [0] and plan.siblings_still_off == still_off
+        sib = [w for w in writes if "0000:01:00.0" in w[0] or "0000:00:01.1" in w[0]]
+        assert [w[0].rsplit("/", 1)[-1] for w in sib] == ["remove", "rescan"], "one remove, one scoped rescan"
+        assert all(masked for _p, masked in sib), "done while AER is still masked"
+        assert dict(events)["tray_repower_sibling_offbus"]["chips"] == [0]
+        assert dict(events)["tray_repower_sibling_offbus"]["still_off"] == still_off
+        assert dict(events)["tray_repower_envelope"]["siblings_still_off"] == still_off
+        assert all(_restored(sysfs, p) for p in PORTS)
+
+
+def test_a_sibling_chip_already_all_ones_or_on_the_tray_is_not_touched(sysfs, monkeypatch):
+    """Only a chip on ANOTHER tray that read live before the pulse counts: one already all-ones before
+    it (chip 1) or one on the re-powered tray (chip 3) is never removed by the check."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    _beat(sysfs, 1, ALL_ONES)
+
+    def fire():
+        _beat(sysfs, 3, ALL_ONES)
+
+    plan = pcie_guard.safe_tray_repower(0b1000, [3], fire, lambda m: None, sleep=lambda s: None)
+    assert plan.siblings_dropped == []
+    assert not (sysfs / "sys/bus/pci/devices/0000:41:00.0/remove").exists()
+    assert "tray_repower_sibling_offbus" not in dict(events)
+    assert _rescanned(sysfs) == ["0000:80:01.1"]
+
+
+def test_a_disabled_tray_rung_refuses_the_envelope(sysfs, monkeypatch):
+    """Once disabled (a walk regressed), the envelope refuses before touching anything, and the
+    ubb_tray_rung_disabled event is left once, however often it is disabled."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    assert pcie_guard.tray_rung_disabled() is None
+    pcie_guard.disable_tray_rung(tray=3, new_off=["5"])
+    pcie_guard.disable_tray_rung(tray=1, new_off=["13"])
+    assert [n for n, _ in events] == ["ubb_tray_rung_disabled"]
+    assert pcie_guard.tray_rung_disabled() == {"tray": 3, "new_off": ["5"]}
+    with pytest.raises(pcie_guard.TrayRepowerRefused, match="disabled"):
+        pcie_guard.safe_tray_repower(0b1000, [3], lambda: pytest.fail("fired"), lambda m: None, sleep=lambda s: None)
+    assert all(_restored(sysfs, p) for p in PORTS), "nothing was masked"
+    assert not (sysfs / "sys/bus/pci/devices/0000:81:00.0/remove").exists()
 
 
 def test_a_port_that_keeps_erroring_stays_masked_and_marks_a_flood(sysfs, monkeypatch):
@@ -532,8 +637,7 @@ def _take_off_bus(root, chip):
     port (a host bridge) stays."""
     _c, bus, _rp = CHIPS[chip]
     os.unlink(root / f"sys/bus/pci/devices/0000:{bus:02x}:00.0")
-    (root / f"sys/class/tenstorrent/tenstorrent!{chip}/device").unlink()
-    (root / f"sys/class/tenstorrent/tenstorrent!{chip}").rmdir()
+    shutil.rmtree(root / f"sys/class/tenstorrent/tenstorrent!{chip}")
 
 
 def _forget_in_process(monkeypatch):

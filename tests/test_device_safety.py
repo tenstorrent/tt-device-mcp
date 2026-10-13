@@ -47,6 +47,7 @@ from tt_device_mcp.health.recovery import (
     WAIT,
     Evidence,
     galaxy,
+    pcie_guard,
 )
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery.galaxy import GalaxyRecovery
@@ -10583,6 +10584,7 @@ def _arm_ubb_walk(monkeypatch, heartbeat_reads, verify_healthy=None):
     fired, events = [], []
     srv.fsm.set_latch("ubb_reset_fired", False)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append((name, k)))
@@ -10682,6 +10684,40 @@ async def test_ubb_tray_reset_walk_rescans_after_each_tray_before_the_verify(
     assert out is True
     assert any("PCI rescan after the tray 3 re-power failed" in m for m in lines)
     assert srv.isolated_chips == {"3"}, "the walk's chips are back on the bus, so no longer isolated"
+
+
+@pytest.mark.asyncio
+async def test_the_walk_rescans_only_the_re_powered_trays_root_ports(monkeypatch, clear_job_state, galaxy_trays):
+    """A global rescan after a tray's re-power also walks the other trays' ports; on a Galaxy each
+    per-tray re-power then left the slot-6 chip of every other tray reading all-ones. Each step rescans
+    only its own tray's root ports, and the whole bus never while one is known."""
+    order = []
+    _arm_ubb_walk(monkeypatch, [_beats_without(set())])
+    monkeypatch.setattr(galaxy, "UBB_WALK_RESCAN_SETTLE_SEC", 0)
+    monkeypatch.setattr(pcie_guard, "rescan_trays", lambda trays, log: order.append(("tray", trays)) or ["rp"])
+    monkeypatch.setattr(galaxy, "_pci_rescan", lambda: order.append(("global",)))
+    off = set(range(24, 32)) | {3}  # trays 1 and 3
+    await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(off), 9, 32, lambda m: None)
+    assert order == [("tray", [1]), ("tray", [3])], "each tray's own ports, never the whole bus"
+
+
+@pytest.mark.asyncio
+async def test_a_regressed_walk_disables_the_tray_rung_for_the_process(monkeypatch, clear_job_state, galaxy_trays):
+    """After one walk that took a chip on another tray off the bus, the rung is declined for the rest of
+    the process (ubb_tray_rung_disabled, once): the next drop is named and held as when opted out, and
+    nothing is re-powered. Only a broker restart arms it again."""
+    start = set(range(24, 32))
+    fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(start | {5})])
+    assert await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 8, 32, lambda m: None) is False
+    assert fired == [0x04]
+    assert pcie_guard.tray_rung_disabled() == {"tray": 3, "new_off": ["5"]}
+    assert [n for n, _ in events].count("ubb_tray_rung_disabled") == 1
+    assert galaxy._ubb_reset_enabled() is False
+
+    srv.fsm.set_latch("ubb_reset_fired", False)  # a new hold episode
+    fired.clear()
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 8, 32, lambda m: None)
+    assert out is None and fired == [], "declined, as when opted out"
 
 
 @pytest.mark.asyncio
