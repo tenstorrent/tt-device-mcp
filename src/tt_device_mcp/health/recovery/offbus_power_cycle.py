@@ -104,7 +104,7 @@ def _run(argv: list, timeout: float, env: Optional[dict] = None) -> tuple:
     return p.returncode, out.decode(errors="replace").strip()[-300:]
 
 
-def standback_reason(timeout: float = CHECK_TIMEOUT_DEFAULT_SEC) -> str:
+def standback_reason(timeout: Optional[float] = None) -> str:
     """Why the broker must stand back from the power cycle now, or "" when nothing objects.
 
     * ``TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE``: paths separated by ``os.pathsep``; any that
@@ -128,7 +128,7 @@ def standback_reason(timeout: float = CHECK_TIMEOUT_DEFAULT_SEC) -> str:
         argv = _argv(name)
         if argv is None:
             return f"{name} does not parse"
-        rc, out = _run(argv, timeout)
+        rc, out = _run(argv, CHECK_TIMEOUT_DEFAULT_SEC if timeout is None else timeout)
         if rc == 1:
             continue
         if rc == 0:

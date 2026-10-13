@@ -30,6 +30,7 @@ from tt_device_mcp.health.core import HealthState
 from tt_device_mcp.health.monitors import eth, heartbeat, pci
 from tt_device_mcp.health.recovery import RecoveryDeps, pcie_guard
 from tt_device_mcp.health.recovery import galaxy as recovery_galaxy
+from tt_device_mcp.health.recovery import offbus_power_cycle
 from tt_device_mcp.server import (
     _ensure_async_primitives,
     _reset_for_testing,
@@ -437,6 +438,16 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
         raise AssertionError("a test reached the real per-tray BMC reset; _fire_ubb_reset must be mocked")
 
     monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
+
+    # The bounded off-bus hold (spec 04 I27) runs a host-supplied power-cycle command: unset here, a
+    # loud tripwire if reached anyway, and its per-process episode tracking starts empty per test.
+    monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
+
+    def _no_offbus_power_cycle_in_tests(*a, **k):
+        raise AssertionError("a test reached the real off-bus power cycle; fire_command must be mocked")
+
+    monkeypatch.setattr(offbus_power_cycle, "fire_command", _no_offbus_power_cycle_in_tests)
+    monkeypatch.setattr(offbus_power_cycle, "_pending", {})
 
     # The tray-down prelude (spec 04 I19) rescans the bus and reads the BMC: never the real sysfs
     # or ipmitool from the suite. Its reads answer "not run in tests", so every gate/ladder test
