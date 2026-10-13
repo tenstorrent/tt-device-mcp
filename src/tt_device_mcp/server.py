@@ -141,6 +141,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.health.recovery import offbus_power_cycle
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.peercred import username_for_uid
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
@@ -5222,6 +5223,12 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # A hold whose only cause is a fabric pass that could not run (a 77) is never forced: a reset
     # cannot give a pass its missing prerequisite, and the idle relift re-runs the pass instead.
     only_77 = _fabric_77_only_hold()
+    # A gated off-bus hold (spec 04 I27) gets one forced pass the moment its grace runs out, so the
+    # bounded power cycle fires at the grace and not at the next ceiling window.
+    if not only_77 and offbus_power_cycle.due_for_watchdog(device_hold_episode_since, now):
+        device_hold_escalation_trigger = f"the {offbus_power_cycle.grace_sec()}s gated off-bus grace"
+        if _maybe_spawn_forced_escalation():
+            offbus_power_cycle.mark_spawned(device_hold_episode_since)
     if only_77:
         pass
     elif isolated_chips and not device_hold_offbus_escalated and age >= _offbus_hold_ceiling_sec():
