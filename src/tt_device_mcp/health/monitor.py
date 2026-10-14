@@ -174,6 +174,14 @@ def _override_reason(text: str) -> str:
     return lines[-1].strip() if lines else "(no output)"
 
 
+def _env_int(name: str, default: int, floor: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return max(floor, int(raw)) if raw else default
+    except ValueError:
+        return default
+
+
 def _verdict_label(ok: Optional[bool]) -> str:
     """The tri-state ``(ok, unhealthy, could-not-check)`` every probe here returns, in
     :data:`metrics.VERDICTS` terms."""
@@ -268,6 +276,13 @@ class HealthMonitor:
         # until an operator restarts the broker.
         self.topology_hw_fault: str = ""
         self._topology_alerted: set[str] = set()
+        # Whether the last fabric pass that ran reached no verdict (a 77). A job that then dies on the
+        # fabric's routing ran on a mesh no pass cleared; consecutive ones are a known fabric fault
+        # that no reset ends (see note_job_fabric_route_fault, spec 03 I46).
+        self.last_fabric_skipped: bool = False
+        self.fabric_known_fault: str = ""
+        self._fabric_known_fault_at: float = 0.0
+        self._fabric_route_fault_streak: int = 0
         # The in-flight fabric traffic pass. It maps every chip's BARs, so when a chip leaves the
         # bus it is the likeliest thing still reading a dead address — and `pci remove` does not
         # revoke its mapping. Tracked so a dead chip can kill it (see server._kill_device_holders).
@@ -925,8 +940,12 @@ class HealthMonitor:
             # broker journal keeps only a line of it — so the row carries the output itself.
             self._write_action_log("[broker]fabric-check", cmd, dt, status, rc, output=_action_log_output(text))
 
+        self.last_fabric_skipped = ok is None
         if ok is True:
             self.last_fabric_ok = True
+            if self.fabric_known_fault:
+                health_event("fabric_known_fault_cleared", detail=self.fabric_known_fault)
+            self.fabric_known_fault, self._fabric_route_fault_streak = "", 0
             marker = fabric.find_topology_marker(text)
             if marker:
                 self._on_topology_mismatch(marker)
@@ -1062,6 +1081,46 @@ class HealthMonitor:
             log.error(f"FABRIC {self.topology_hw_fault}")
         alert.send_alert({"kind": "fabric_topology_hw_fault", "detail": self.topology_hw_fault}, log)
         return self.topology_hw_fault
+
+    def note_job_fabric_route_fault(self, failed: bool, log_tail: Optional[str]) -> Optional[str]:
+        """Called once per finished job (spec 03 I46). A job that dies on the fabric's routing right
+        after a fabric pass that could not run (a 77) ran on a mesh no pass cleared. After
+        ``TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS`` (default 2) such jobs in a row, resetting is shown
+        futile (each reset ends in another 77 and the next job dies the same way), so this declares a
+        known fabric fault: journal it, page once, and return the hold reason. Any other job
+        outcome, or a fabric pass that measured, breaks the streak. Returns the reason, or None."""
+        sig = fabric.job_fabric_error(log_tail or "") if failed else None
+        if not sig or not self.last_fabric_skipped:
+            self._fabric_route_fault_streak = 0
+            return None
+        self._fabric_route_fault_streak += 1
+        limit = _env_int("TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS", 2, 1)
+        if self._fabric_route_fault_streak < limit:
+            return None
+        self.fabric_known_fault = (
+            f"known fabric fault: {self._fabric_route_fault_streak} jobs in a row failed on the fabric ({sig}) "
+            "after fabric checks that could not run (77); held without a reset, needs an operator"
+        )
+        self._fabric_known_fault_at = time.monotonic()
+        health_event("fabric_known_fault", detail=self.fabric_known_fault)
+        log = self._logger()
+        if log:
+            log.error(f"FABRIC {self.fabric_known_fault}")
+        alert.send_alert({"kind": "fabric_known_fault", "detail": self.fabric_known_fault}, log)
+        return self.fabric_known_fault
+
+    def known_fabric_fault(self) -> str:
+        """The open known fabric fault, or "". Bounded: past ``TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC``
+        (default 21600 s) it expires and the usual 77 path (03 I40) gets one more try; the streak is
+        left one short, so the next job that dies the same way declares it again at once."""
+        if self.fabric_known_fault and (
+            time.monotonic() - self._fabric_known_fault_at
+            >= _env_int("TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC", 21600, 60)
+        ):
+            health_event("fabric_known_fault_expired", detail=self.fabric_known_fault)
+            self.fabric_known_fault = ""
+            self._fabric_route_fault_streak = _env_int("TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS", 2, 1) - 1
+        return self.fabric_known_fault
 
     async def verify_eth_heartbeat(self, timeout_sec: float = 60.0) -> tuple[Optional[bool], str]:
         """Read the active-ethernet-core firmware heartbeats — a passive check that never pushes
