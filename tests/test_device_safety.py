@@ -12377,6 +12377,109 @@ async def test_a_startup_hold_whose_episode_was_lost_is_closed_before_the_next_h
     ]
 
 
+def _journal_rows(*rows):
+    """Append synthetic rows to the (test-dir) health journal, as an earlier broker left them."""
+    with open(health.HEALTH_DIR / health.EVENTS_FILE, "a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def _startup_releases():
+    return [r for r in srv.read_health_events(kinds={"startup_fabric_released"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lift",
+    [
+        {"kind": "device_dirty_cleared", "verified": True, "why": "gate/post-job: verified healthy"},
+        {"kind": "device_dirty_cleared", "verified": True, "why": "idle escalation: galaxy reset recovered the mesh"},
+        {"kind": "device_released", "why": "startup_unverified", "held_s": 60},
+    ],
+    ids=["post-job-gate", "idle-relift", "device-released"],
+)
+async def test_a_stale_startup_hold_is_closed_with_the_time_it_was_really_held(monkeypatch, tmp_path, lift):
+    """An earlier broker lifted its startup hold a minute in but wrote no release row (a build
+    without the release hook, or a death between HEALTHY and the row). The next start closes that
+    hold: held_s must run to the lift the journal shows, not to this restart ~10 h later.
+    Fails on base: held_s ~37478."""
+    t0 = time.time() - 37478
+    _journal_rows(
+        {"ts": t0, "kind": "startup_fabric_hold", "why": "broker start: awaiting the startup fabric verify"},
+        {"ts": t0 + 1, "kind": "device_dirty_cleared", "verified": False, "why": "unverified clear"},
+        {"ts": t0 + 2, "kind": "device_released", "why": "closed on broker start"},
+        dict(lift, ts=t0 + 60, iso="2026-10-13T10:07:49Z"),
+    )
+    fsm_path = tmp_path / "fsmdir" / "fsm.json"
+    fsm_path.parent.mkdir()
+    await _restart_broker(monkeypatch, fsm_path)
+
+    closed = _startup_releases()[0]
+    assert closed["prior_why"] == "closed on broker start"
+    assert closed["held_s"] == pytest.approx(60, abs=1)
+    assert "2026-10-13T10:07:49Z" in closed["detail"]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_startup_hold_with_no_lift_in_the_journal_runs_to_the_restart(monkeypatch, tmp_path):
+    """No verified clear and only _close_orphaned_hold's bookkeeping release: the door never
+    reopened, so the hold really lasted until this restart."""
+    t0 = time.time() - 3600
+    _journal_rows(
+        {"ts": t0, "kind": "startup_fabric_hold", "why": "broker start: awaiting the startup fabric verify"},
+        {"ts": t0 + 2, "kind": "device_released", "why": "closed on broker start"},
+    )
+    fsm_path = tmp_path / "fsmdir" / "fsm.json"
+    fsm_path.parent.mkdir()
+    await _restart_broker(monkeypatch, fsm_path)
+
+    closed = _startup_releases()[0]
+    assert closed["held_s"] == pytest.approx(3600, abs=30)
+    assert closed["detail"] == "episode ended by a broker restart"
+
+
+@pytest.mark.asyncio
+async def test_the_startup_release_measures_held_s_from_the_hold_row(monkeypatch, tmp_path):
+    """Whichever path closes a carried startup hold (startup gate, post-job gate, idle relift),
+    held_s is the hold's own length, from its journal row, not the carried episode's since."""
+    fsm_path = tmp_path / "fsmdir" / "fsm.json"
+    fsm_path.parent.mkdir()
+    await _restart_broker(monkeypatch, fsm_path)
+    # Age the hold row to 10 min and the episode's since to 10 h: the two must not be confused.
+    events = health.HEALTH_DIR / health.EVENTS_FILE
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    for row in rows:
+        if row["kind"] == "startup_fabric_hold":
+            row["ts"] = time.time() - 600
+    events.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    record = json.loads(fsm_path.read_text())
+    record["since"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 36000))
+    fsm_path.write_text(json.dumps(record))
+
+    await _restart_broker(monkeypatch, fsm_path)
+    srv.fsm.on_outcome(OUTCOME_RECOVERED)
+    assert _startup_rows() == [("startup_fabric_hold", None), ("startup_fabric_released", "startup_unverified")]
+    assert _startup_releases()[0]["held_s"] == pytest.approx(600, abs=30)
+
+
+@pytest.mark.asyncio
+async def test_a_restart_later_in_the_boot_does_not_blame_the_boots_power_cycle(monkeypatch, tmp_path):
+    """The ledger's power cycle brought this boot up and stays adjacent to it all boot. Only the
+    boot's first broker start may name it; a broker restarted weeks later in the same boot must not
+    hold the device as 'boot attributed to a broker-fired power-cycle'. Fails on base."""
+    escalation = {"action": "power-cycle", "at": "2026-09-16T05:21:11", "boot_id": "boot-before"}
+    monkeypatch.setattr(srv.recovery_mechanism, "boot_from_broker_escalation", lambda boot_id: escalation)
+    fsm_path = tmp_path / "fsmdir" / "fsm.json"
+    fsm_path.parent.mkdir()
+    await _restart_broker(monkeypatch, fsm_path)
+    assert "boot attributed to a broker-fired power-cycle" in srv.fsm.record.detail
+
+    srv.fsm.on_outcome(OUTCOME_RECOVERED)  # the first start's gate passed
+    await _restart_broker(monkeypatch, fsm_path)
+    assert srv.fsm.record.why == "startup_unverified"
+    assert "boot attributed" not in (srv.fsm.record.detail or "")
+
+
 @pytest.mark.asyncio
 async def test_post_reboot_climb_keeps_the_escalated_marker_and_the_reset_retries(monkeypatch, tmp_path):
     """The exact loop the durable record exists to prevent: the idle escalation already spent this
