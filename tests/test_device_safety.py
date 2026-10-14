@@ -5747,7 +5747,8 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-async def _run_one(job, limit_sec: float = 15.0):
+async def _run_one(job, limit_sec: float = 15.0, until=None):
+    """Run one job; `until` also waits for work the runner does after `finished_at` is set."""
     srv.jobs[job.id] = job
     await srv.get_job_queue().put(job.id)
     runner = asyncio.create_task(srv.job_runner())
@@ -5755,7 +5756,7 @@ async def _run_one(job, limit_sec: float = 15.0):
         deadline = time.monotonic() + limit_sec
         # finished_at is set before the survivor bookkeeping and the post-job gate; cancelling
         # then (a slow holder scan on a busy host) cut the runner off before it marked anything.
-        while (job.finished_at is None or srv.post_job_gate_pending) and time.monotonic() < deadline:
+        while (job.finished_at is None or srv.post_job_gate_pending or (until and not until())) and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
     finally:
         runner.cancel()
@@ -5809,9 +5810,12 @@ async def test_a_survivor_holding_the_device_is_logged_and_marks_it_dirty(monkey
     marked = []
     monkeypatch.setattr(srv, "reap_job_survivors", fake_sweep)
     monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marked.append(reason))
+    # Not this host's real holders: the sweep's own words are the ones under test.
+    monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda: "")
     log = tmp_path / "912.log"
     job = srv.Job(id="912", owner="tenant", workspace="/tmp", command="echo hi", queued_at="t", log_file=str(log))
-    await _run_one(job)
+    # The runner marks the device after it sets finished_at; stopping it at finished_at raced that.
+    await _run_one(job, until=lambda: marked)
 
     assert job.status is srv.JobStatus.COMPLETED
     assert any("job 912 left pid 4242 (state D)" in r for r in marked), marked
