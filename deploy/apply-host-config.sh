@@ -287,6 +287,11 @@ install -m 0644 "$DEPLOY/fabric-validator.pin"          "$ROOT/fabric-validator.
 install -m 0644 "$DEPLOY/tt-device-fabric-validator.service" /etc/systemd/system/tt-device-fabric-validator.service
 install -m 0644 "$DEPLOY/tt-device-fabric-validator.timer"   /etc/systemd/system/tt-device-fabric-validator.timer
 
+# Manual-recovery check (spec 04 I27): the broker's off-bus power cycle stands back while it says an
+# operator is recovering the host. It is the default when TT_DEVICE_MCP_MANUAL_RECOVERY_CMD is unset,
+# and with neither the cycle never fires, so this stage is required (fatal under set -e).
+install -m 0755 "$DEPLOY/tt-manual-recovery-check.sh" "$ROOT/manual-recovery-check.sh"
+
 # Slurm hooks: staged here too, not just by install-tt-device-broker.sh — auto-update never
 # re-runs the installer, only this script (this file's own header comment), so an autoupdating
 # host would otherwise never receive deploy/slurm/*.sh at all, and deploy/README.md's
