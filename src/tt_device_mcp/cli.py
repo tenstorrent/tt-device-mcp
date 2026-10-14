@@ -167,7 +167,11 @@ def per_user_daemon_env(log_dir=None) -> dict:
     env = dict(os.environ)
     base = _daemon_state_dir(log_dir)
     env.setdefault("TT_DEVICE_MCP_DEVICE_OP_LOCK", str(base / "device-op.lock"))
-    for var, name in (("TT_DEVICE_MCP_HEALTH_DIR", "health"), ("TT_DEVICE_MCP_JOB_EXIT_DIR", "jobexit")):
+    for var, name in (
+        ("TT_DEVICE_MCP_HEALTH_DIR", "health"),
+        ("TT_DEVICE_MCP_JOB_EXIT_DIR", "jobexit"),
+        ("TT_DEVICE_MCP_JOB_SPOOL_DIR", "jobspool"),
+    ):
         if var in env:
             continue
         try:

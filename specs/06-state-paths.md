@@ -121,6 +121,8 @@ and job exit statuses never hit disk.
 | Metrics textfile | `/var/lib/prometheus/node-exporter/tt_device_mcp.prom` | `<state>/metrics/tt_device_mcp.prom` | `TT_DEVICE_MCP_TEXTFILE_DIR` |
 | Job exit records | `/run/tt-device-broker/jobexit/` (sticky 1777) | `<state>/jobexit/` (exported by the CLI, 0700 base) | `TT_DEVICE_MCP_JOB_EXIT_DIR` |
 | Device-op inhibit lock | `/run/tt-device-broker/device-op.lock` | `<state>/device-op.lock` (exported by the CLI) | `TT_DEVICE_MCP_DEVICE_OP_LOCK` |
+| Job output spool | `/run/tt-device-broker-spool/` (0700; outside the unit's RuntimeDirectory, so it survives a broker restart) | `<state>/jobspool/` (exported by the CLI) | `TT_DEVICE_MCP_JOB_SPOOL_DIR` |
+| Dispatch hold (autoupdate) | `/run/tt-device-broker/dispatch-hold` | `<state>/dispatch-hold` (sibling of the inhibit lock) | `TT_DEVICE_MCP_DISPATCH_HOLD` |
 | Device-op advisory flock (I8) | `/run/tt-device-broker/device-op.flock` | `<state>/device-op.flock` (sibling of the inhibit lock) | `TT_DEVICE_MCP_DEVICE_OP_FLOCK` |
 | Daemon pid / daemon stdout | n/a (systemd / journald) | `<state>/daemon.pid`, `<state>/daemon.log` | follows the state base |
 | Host config | `/etc/default/tt-device-broker` (written by installer, sourced by apply-host-config, autoupdate, and the Slurm hooks) | n/a | `TTDEV_ETC_DEFAULT` (apply-host-config's render/test seam; also a real runtime override for the Slurm hooks, which source it unconditionally on every invocation) |
@@ -144,7 +146,8 @@ secured or refused with the owning user named (I6). Subdirectories (`health/`, `
 
 **Daemon environment assembly** (`cli.per_user_daemon_env`, shared by `start` and `start-fg` so
 they cannot diverge): `setdefault` `TT_DEVICE_MCP_DEVICE_OP_LOCK=<state>/device-op.lock`, and export
-`TT_DEVICE_MCP_HEALTH_DIR=<state>/health` and `TT_DEVICE_MCP_JOB_EXIT_DIR=<state>/jobexit` unless
+`TT_DEVICE_MCP_HEALTH_DIR=<state>/health`, `TT_DEVICE_MCP_JOB_EXIT_DIR=<state>/jobexit` and
+`TT_DEVICE_MCP_JOB_SPOOL_DIR=<state>/jobspool` unless
 already set (preset values are left alone, I2). A redirect target it cannot create is warned about
 and left unset — fail-soft, never silent (I7).
 
@@ -191,6 +194,8 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_TEXTFILE_DIR` | euid-split (matrix) | Prometheus textfile directory | 06 |
 | `TT_DEVICE_MCP_JOB_EXIT_DIR` | `/run/tt-device-broker/jobexit` | Where jobs record their own exit status | 06 |
 | `TT_DEVICE_MCP_DEVICE_OP_LOCK` | `/run/tt-device-broker/device-op.lock` | Restart-inhibit file for in-flight device ops | 06 |
+| `TT_DEVICE_MCP_JOB_SPOOL_DIR` | `/run/tt-device-broker-spool` | Where a job's stdout/stderr are spooled so they outlive a broker restart (01 I17); unusable → pipes | 06 |
+| `TT_DEVICE_MCP_DISPATCH_HOLD` | sibling `dispatch-hold` of the inhibit file | Autoupdate's hold on dispatch across its busy check and restart (01 I18, 08 I18) | 06 |
 | `TT_DEVICE_MCP_DEVICE_OP_FLOCK` | sibling `device-op.flock` of the inhibit file | Advisory flock held for every device op, for external device writers (I8) | 06 |
 | `TT_DEVICE_MCP_DEVICE_OP_FLOCK_TIMEOUT_SEC` | `10` | Longest the broker waits on an external holder before going ahead without the flock (I8) | 06 |
 | `TT_DEVICE_MCP_INSTALL_DIR` | `/tmp/tt-device-mcp-<uid>` | Per-user base: venv, CLI symlink, and `state/` (deploy-defined, install-user.sh) | 06/08 |
@@ -258,6 +263,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC` | 300 (max 3600) | Pre-power-cycle hook timeout; its process group is killed past it and the cycle goes ahead | 04 |
 | `TT_DEVICE_MCP_AUTO_UBB_RESET` | 1 | Arm the per-tray UBB reset rung | 04 |
 | `TT_DEVICE_MCP_AUTO_MESH_RESET` | unset | `0` holds every automatic mesh reset, `1` arms it; unset, an outage hold (reboot, power cycle and tray reset all `0`) holds it | 04 |
+| `TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC` | 3600 | While a held mesh reset stands, page again after this long; `0` pages once per hold | 04 |
 | `TT_DEVICE_MCP_UBB_RESET_SETTLE_SEC` | 28 | Settle time after a UBB tray reset | 04 |
 | `TT_DEVICE_MCP_TRAY_DOWN_CAPTURE` | `1` | `0` turns off the tray-down prelude (one PCI rescan and the read-only BMC/CPLD/PCIe capture before the ladder at a tray-down onset); the ladder is the same either way | 04 |
 | `TT_DEVICE_MCP_TRAY_CPLD_BUSES` | unset | Site data for the tray-down capture: each tray's CPLD BMC I2C bus, `tray:0xNN,...`. All three CPLD vars must be set and well formed; otherwise the CPLD reads are skipped | 04 |
