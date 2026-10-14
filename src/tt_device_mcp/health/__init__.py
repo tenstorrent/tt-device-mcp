@@ -39,7 +39,7 @@ from tt_device_mcp.health.evidence import (
     previous_boot_error,
     read_health_events,
 )
-from tt_device_mcp.health.monitor import HealthMonitor
+from tt_device_mcp.health.monitor import HealthMonitor, journal_interrupted_fabric_check
 
 # The fabric probe module itself, not a wrapping function: server.py's own preflight check reads
 # fabric.build_command() directly to warn when no fabric check is configured OR installed, and a
@@ -133,6 +133,7 @@ __all__ = [
     "CEILING",
     # construction pieces ServerFsm.boot assembles into the process singletons
     "HealthMonitor",
+    "journal_interrupted_fabric_check",
     "RecoveryMechanism",
     "RecoveryDeps",
     "GalaxyRecovery",

@@ -132,6 +132,7 @@ from tt_device_mcp.health import (
     heartbeat_supported,
     heartbeat_verdict,
     isolate_chip,
+    journal_interrupted_fabric_check,
     mark_boot,
     mesh_hold_repage_sec,
     offbus_power_cycle,
@@ -145,7 +146,6 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
-from tt_device_mcp.health.monitor import journal_interrupted_fabric_check
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
