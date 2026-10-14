@@ -575,6 +575,23 @@ each rung fires only when the gentler one failed or cannot apply.
   most one more reset. Bounds the loop one Galaxy host ran: three mesh resets, one per forced
   window, took a 4-chip drop to 31 and then 32 off the bus.
 
+- **I32 — No reset releases the device until a fabric pass has passed since.** Every reset action
+  records a post-reset fabric debt (`post_reset_fabric_owed`): a `tt-smi -r` or `-glx_reset` through
+  `reset_with_quiesce` (operator reset, ladder rungs, the last-chance sweep), a reset this broker
+  adopted from a foreign scope, a bridge chip reset, a UBB tray reset or re-power, a PCI rescan (the
+  tray-down prelude, I19), and every broker start (after a boot or a restart). Only a fabric pass
+  that returns a healthy verdict settles it (`post_reset_fabric_settled`); a 77, a measured failure,
+  or a verify that ran no fabric pass (enum+ARC only, the foreign-holder fast verify) leaves it
+  owed. Every verified release goes through one funnel; while the debt is owed that funnel refuses
+  (`post_reset_release_refused`) and holds the device fabric-unverified instead, so the fabric
+  relift, the I40 bound and the deadline escalation settle it — bounded, never an open-ended hold.
+  The I40 startup-checks release does not apply while a reset owes a pass: that pass climbs the
+  present-mesh rung instead (spec 03 I40). The post-job gate runs the full pass while the debt is
+  owed and settles it in place; a job boundary that followed no reset adds no time, and the pre-job
+  gate never runs the pass (03 I12). The startup pass runs only once the hugepage pool is ready
+  (03 I48). Exempt only where no fabric pass can run at all: a single chip, or no fabric check
+  configured on the host. There is no switch that turns it off.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -979,6 +996,9 @@ sees a silent fabric pass.
 | I29 one unverified reset per 77-only episode; next escalation sweeps once, strict on 77, climbs only on a measured failure, a sweep still reading 77 holds and pages once | `tests/test_device_safety.py::test_a_reset_that_leaves_the_fabric_unverified_counts_toward_the_relift_bound`, `tests/test_device_safety.py::test_a_second_escalation_after_an_unverified_reset_sweeps_instead_of_resetting`, `tests/test_device_safety.py::test_an_incomplete_sweep_after_an_unverified_reset_does_not_climb`, `tests/test_device_safety.py::test_a_sweep_verify_that_reads_77_is_not_a_release`, `tests/test_device_safety.py::test_a_sweep_that_still_reads_77_holds_and_pages_once_instead_of_climbing` |
 | I30 deadline escalation holds a fabric-only present mesh without a reset; real faults keep the ladder | `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_fabric_only_present_mesh_without_a_reset`, `tests/test_device_safety.py::test_the_deadline_escalation_keeps_the_ladder_for_real_faults`, `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset` |
 | I31 a regressed galaxy reset is not repeated in its hold episode; climb or page instead | `tests/test_device_safety.py::test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset`, `tests/test_device_safety.py::test_forced_offbus_ladder_after_a_regression_sweeps_then_power_cycles_when_opted_in`, `tests/test_device_safety.py::test_an_early_regression_is_latched_before_the_ceiling_deferral`, `tests/test_device_safety.py::test_a_new_hold_episode_resets_again_after_a_regression`, `tests/test_device_safety.py::test_gate_skips_a_repeat_galaxy_reset_after_a_regression`, `tests/test_device_safety.py::test_gate_latches_a_regression_seen_before_any_hold` |
+| I32 every reset path releases only after a passing fabric pass: the debt settles only on a healthy verdict, the funnel holds fabric-unverified, exemptions | `tests/test_post_reset_gate.py::test_the_debt_settles_only_on_a_healthy_fabric_verdict`, `::test_a_single_chip_or_a_host_with_no_fabric_check_is_exempt`, `::test_a_verified_release_after_a_reset_holds_fabric_unverified`, `::test_no_debt_releases_as_before` |
+| I32 per path: operator reset, bridge rung, no-window sweep, idle off-bus bridge, adopted foreign scope, foreign-holder fast verify, broker start, tray-down prelude rescan | `tests/test_post_reset_gate.py::test_an_operator_reset_without_a_passing_fabric_pass_holds`, `::test_an_operator_reset_with_a_passing_fabric_pass_releases`, `::test_the_bridge_rung`, `::test_the_tray_down_no_window_sweep`, `::test_the_idle_off_bus_bridge_reset`, `::test_a_reset_adopted_from_a_foreign_scope`, `::test_the_foreign_holder_fast_verify_after_a_reset_holds`, `::test_a_broker_start_owes_a_fabric_pass_before_any_release`, `tests/test_tray_down_prelude.py::test_a_rescan_recovery_releases_only_on_a_passing_fabric_pass` |
+| I32 the post-job gate runs the pass only while a reset owes one, never pre-job; the I40 fallback climbs instead of releasing an owed reset | `tests/test_post_reset_gate.py::test_a_clean_post_job_gate_with_no_debt_runs_no_fabric_pass`, `::test_a_post_job_gate_owed_a_fabric_pass_runs_it_and_settles`, `::test_a_pre_job_gate_never_runs_the_owed_pass`, `::test_the_77_fallback_never_releases_a_reset_with_no_passing_fabric_pass` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |
