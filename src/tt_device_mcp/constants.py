@@ -93,6 +93,12 @@ ETH_POST_JOB_TIMEOUT_SEC = 10.0
 # reason. The broker skips on this code and warns.
 FABRIC_CHECK_CANNOT_CHECK_RC = 77
 
+# The fabric check exits with this when the validator listed cabling-descriptor links that are
+# missing and no extra link that could explain them (a moved tray shows both): a cable that is
+# absent or dead. A hardware verdict, not a skip and not a reset: no reset or rung can fix a
+# cable, so the broker holds as a known fabric fault and pages once (spec 03 I47).
+FABRIC_CHECK_HARDWARE_FAULT_RC = 78
+
 # The recovery ladder's five named rungs, in severity order (0..4) — the one place that names
 # them. Lives here, not in health/recovery/stages/ (the package these actually name), so
 # metrics.py can import it directly: importing a package submodule always runs that package's

@@ -15,6 +15,9 @@
 #   exit 77  => the check could not run at all (binary/descriptor absent, or the
 #               descriptor does not describe this host). The broker records this and
 #               SKIPS — it does not reset, because nothing about the device was learned.
+#   exit 78  => HARDWARE FAULT: the cabling descriptor's links are missing with none extra (a cable
+#               absent or dead) and the traffic-only rerun gave no verdict. The broker holds it as a
+#               known fabric fault and pages once; it never resets or climbs the ladder for it.
 #   exit *   => fabric UNHEALTHY -> the broker resets the device.
 #
 # The distinction between 0 and 77 is the whole contract. This script used to
@@ -48,6 +51,7 @@
 set -u
 
 EXIT_CANNOT_CHECK=77
+EXIT_HARDWARE_FAULT=78
 
 # Once $OUT exists, every log line also goes to $LAST: a small file, overwritten each run, that keeps
 # the last run's verdict and output tail where an operator can read it after the journal rotated.
@@ -129,6 +133,7 @@ run_validator "${desc_argv[@]}"
 # rerun once without the descriptor so traffic still crosses every discovered link, and classify
 # that run with the chain below. A pass carries the marker as the last line before exit 0.
 TOPO=""
+n_missing=0 n_extra=0
 if [ "$rc" -ne 0 ] && [ -n "$DESC" ] && grep -q "Connection mismatch detected" "$RUNLOG"; then
     read -r n_missing n_extra < <(awk '
         /found [0-9]+ missing port\/cable connections/ { s = "m"; next }
@@ -213,8 +218,17 @@ else
     # a cause printed above it was dropped from every log that quoted the check.
     log "no link was tested, so this says nothing about the fabric -- see $OUT/last-run.log"
     [ -z "$TOPO" ] || reason="topology mismatch, traffic-only rerun: $reason"
+    if [ -n "$TOPO" ] && [ "$n_missing" -gt 0 ] && [ "$n_extra" -eq 0 ]; then
+        # Links the descriptor names are missing and nothing extra was found, so no tray moved: a
+        # cable is absent or dead. That is a hardware verdict, not "cannot check": a reset, a tray
+        # re-power or a power cycle cannot bring it back, and a 77 sends the broker round its ladder.
+        log "HARDWARE FAULT: $n_missing port/cable connection(s) of $DESC missing and none extra (a cable is absent or dead; no reset can fix it, needs an operator); $reason (exit $EXIT_HARDWARE_FAULT; broker holds without a reset)"
+        exit "$EXIT_HARDWARE_FAULT"
+    fi
     cannot_check "validator did not complete a measurement (rc=$rc): $reason"
 fi
+# A measured-bad verdict must never collide with the cannot-check or hardware-fault sentinels.
+case "$rc" in "$EXIT_CANNOT_CHECK" | "$EXIT_HARDWARE_FAULT") rc=1 ;; esac
 [ "$rc" -eq 0 ] || exit "$rc"
 
 # ---- dispatch ----------------------------------------------------------------------------------
