@@ -201,7 +201,7 @@ def test_prejob_dispatch_set_reaches_the_unit(tmp_path):
 
 
 def test_poller_services_unset_renders_no_line(tmp_path):
-    # Default: no line, so server.py's built-in poller list (which includes tt-fmax-cap) rules.
+    # Default: no line, so server.py's built-in poller list (no clock-cap keeper) rules.
     unit = _render(tmp_path, _GALAXY)
     assert "TT_DEVICE_MCP_POLLER_SERVICES" not in unit
 
