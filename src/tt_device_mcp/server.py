@@ -5408,6 +5408,9 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         # The FSM's own record, straight from the source every field above is now derived from.
         "fsm_state": fsm.state.value,
         "fsm_why": fsm.record.why,
+        # A tray re-power holds the device pollers stopped until its verify (spec 04 I23): the idle
+        # health probe reads this and does not restart one meanwhile (spec 08 I17).
+        "pollers_held": bool(recovery_mechanism is not None and getattr(recovery_mechanism, "pollers_held", 0)),
     }
     if hold:
         reason, since = hold

@@ -322,6 +322,22 @@ def test_envelope_proceeds_once_the_holder_lets_go(sysfs, monkeypatch):
     assert fired == [1]
 
 
+def test_envelope_waits_for_holders_on_every_tray_not_just_the_re_powered_one(sysfs, monkeypatch):
+    """One tray's pulse has dropped the other trays within seconds, so a holder on ANY chip of the box
+    refuses the re-power, as for a whole-box cycle (spec 04 I23)."""
+    pids = sysfs / "proc/driver/tenstorrent/0"  # chip 0 is on tray 1; the fire is tray 4
+    pids.mkdir(parents=True)
+    (pids / "pids").write_text("4343\n")
+    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", "1")
+    assert 0 in pcie_guard.plan_tray_repower(0b1000, [3]).box_chips
+    with pytest.raises(pcie_guard.TrayRepowerRefused, match="4343"):
+        pcie_guard.safe_tray_repower(
+            0b1000, [3], lambda: pytest.fail("fired over another tray's holder"), lambda m: None, sleep=lambda s: None
+        )
+    assert all(_restored(sysfs, p) for p in PORTS)
+    assert not (sysfs / "sys/bus/pci/devices/0000:81:00.0/remove").exists()
+
+
 def test_envelope_refuses_a_mismatched_tray_map(sysfs):
     with pytest.raises(pcie_guard.TrayRepowerRefused):
         pcie_guard.safe_tray_repower(0b1000, [2], lambda: pytest.fail("fired the wrong tray"), lambda m: None)
@@ -453,6 +469,54 @@ async def test_pollers_are_stopped_across_the_tray_fire(sysfs, monkeypatch):
     monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: seen.append("fire"))
     await g._fire_tray_repower(0b1000, [3], lambda m: None)
     assert seen == ["stop", "fire", "start"]
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_keeps_pollers_stopped_from_the_tray_pulse_through_the_mesh_reset(sysfs, monkeypatch):
+    """A tray pulse can drop every tray: nothing between it and the end of the sweep restarts a poller,
+    the mesh reset after it included, and each pulse stops them afresh (spec 04 I23)."""
+    g = srv.galaxy_recovery
+    seen = []
+
+    async def pollers(active, log):
+        seen.append("start" if active else "stop")
+        return ["tt-telemetry.service"]
+
+    async def mesh_reset(*a, **k):
+        assert g.mechanism.pollers_held, "the mesh reset runs inside the hold"
+        seen.append("mesh")
+        return 0, ""
+
+    monkeypatch.setattr(g.mechanism, "_set_device_pollers", pollers)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: seen.append("fire"))
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh_reset)
+    monkeypatch.setattr(galaxy, "_ubb_reset_enabled", lambda: True)
+    assert await g._issue_all_resets_back_to_back(0b1000, [3], [4], 4, lambda m: None, do_sbr=False) is True
+    assert seen == ["stop", "stop", "fire", "mesh", "start"]
+    assert g.mechanism.pollers_held == 0
+
+
+@pytest.mark.asyncio
+async def test_a_mesh_reset_inside_a_tray_hold_leaves_the_pollers_stopped(monkeypatch):
+    """reset_with_quiesce restarts the pollers after its rescan, except inside a tray re-power's hold:
+    then the hold's release decides, after the verify (spec 04 I23)."""
+    mech = srv.galaxy_recovery.mechanism
+    seen = []
+
+    async def pollers(active, log):
+        seen.append("start" if active else "stop")
+        return ["tt-telemetry.service"]
+
+    monkeypatch.setattr(mech, "_set_device_pollers", pollers)
+    stopped = await mech.hold_pollers(lambda m: None)
+    inner = await mech.hold_pollers(lambda m: None)
+    await mech.release_pollers(inner, lambda m: None, restore=True)
+    assert seen == ["stop", "stop"], "a nested release never restarts"
+    await mech.release_pollers(stopped, lambda m: None, restore=False)
+    assert seen == ["stop", "stop"], "an unverified outermost release leaves them stopped"
+    assert mech.pollers_held == 0
+    await mech.release_pollers(await mech.hold_pollers(lambda m: None), lambda m: None, restore=True)
+    assert seen[-1] == "start"
 
 
 @pytest.mark.asyncio
@@ -1184,3 +1248,51 @@ def test_an_unreadable_sysfs_under_guard_logs_a_mask_failure(sysfs, monkeypatch)
     assert logs and "cannot read" in logs[0]
     assert sorted(mask.ports) == sorted(PORTS) and all(_masked(sysfs, p) for p in PORTS)
     mask.restore(quiet_sec=0)
+
+
+def _walk_setup(monkeypatch, verified):
+    """An opted-in idle Galaxy whose tray 3 is off the bus; the verify after a pulse answers ``verified``."""
+    srv.fsm.set_latch("ubb_reset_fired", False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(24)})
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+
+    async def verify(expected, log, run_fabric=True, **_):
+        return verified, {"snapshot": {"ok": verified}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    seen = []
+
+    async def pollers(active, log):
+        seen.append("start" if active else "stop")
+        return ["tt-telemetry.service"]
+
+    monkeypatch.setattr(srv.galaxy_recovery.mechanism, "_set_device_pollers", pollers)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: seen.append("fire"), raising=False)
+    return seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verified", [True, False])
+async def test_the_tray_walk_restarts_pollers_only_on_a_verified_mesh(
+    monkeypatch, clear_job_state, galaxy_trays, verified
+):
+    """Spec 04 I23: the walk stops the pollers before its first pulse, stops them afresh before each
+    pulse, and restarts them only once a verify proves the mesh; a walk that left the mesh unproven
+    leaves them stopped for the next rung."""
+    seen = _walk_setup(monkeypatch, verified)
+    beats = {str(i): 100 for i in range(24)}  # tray 3 off
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None)
+    assert out is verified
+    assert seen == (["stop", "stop", "fire", "start"] if verified else ["stop", "stop", "fire"])
+    assert srv.galaxy_recovery.mechanism.pollers_held == 0
+
+
+def test_health_reports_the_poller_hold(monkeypatch):
+    """/health carries pollers_held so the idle probe stands back while a tray re-power runs (spec 08 I17)."""
+    monkeypatch.setattr(srv.recovery_mechanism, "pollers_held", 1)
+    assert srv._health_payload()["pollers_held"] is True
+    monkeypatch.setattr(srv.recovery_mechanism, "pollers_held", 0)
+    assert srv._health_payload()["pollers_held"] is False

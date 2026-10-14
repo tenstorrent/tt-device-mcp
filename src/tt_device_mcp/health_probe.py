@@ -96,6 +96,8 @@ def device_verdict(health: Optional[dict]) -> Optional[str]:
         return f"broker FSM is {health.get('fsm_state')!r} ({health.get('fsm_why') or '?'})"
     if health.get("device_degraded"):
         return f"broker recovery in flight ({health.get('device_degraded')})"
+    if health.get("pollers_held"):
+        return "broker holds the device pollers stopped across a tray re-power"
     return None
 
 

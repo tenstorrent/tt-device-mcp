@@ -200,13 +200,14 @@ def _ubb_reset_enabled() -> bool:
     """Whether the broker may FIRE the per-tray BMC reset itself on a below-floor tray-down, rather than
     only NAMING the command and holding. ON by default, with a knob to force it off.
 
-    A tray reset re-powers one 8-chip tray and leaves the other 24 running, so it is the lightest rung
+    A tray reset aims at one 8-chip tray, so it is the lightest rung
     that fits the failure that took the incident box down: a whole tray off the bus, below the
     galaxy-reset floor, which the mesh-wide reset inverts to an all-off-bus mesh and a warm reboot cannot
     re-enumerate. Without it that drop HOLDS forever — the mesh reset is suppressed below the floor — and
-    that indefinite hold is the failure this rung exists to end. Only the target tray's ARC restarts, so
-    it never risks the mesh reset's off-bus inversion, and the bit order and re-enumeration handshake are
-    hardware-confirmed. An operator whose BMC the broker has not confirmed forces the rung off with
+    that indefinite hold is the failure this rung exists to end. It is NOT isolated: one tray's pulse has
+    dropped every other tray within seconds, so the rung requires the whole box idle, holds the device
+    pollers stopped until its verify, and re-checks every chip after each pulse (spec 04 I23, I25). The
+    bit order and re-enumeration handshake are hardware-confirmed. An operator whose BMC the broker has not confirmed forces the rung off with
     TT_DEVICE_MCP_AUTO_UBB_RESET=0, back to naming the command and holding.
 
     Armed also means fireable (I14, I17): the re-power goes out as `ipmitool raw` to the local
@@ -1407,18 +1408,17 @@ class GalaxyRecovery(Recovery):
         across it, as every mesh reset already has them: a poller that keeps reading a tray's chips
         while they lose power is MMIO at a dead endpoint (spec 04 I23). Raises what the fire raises,
         including ``pcie_guard.TrayRepowerRefused``; returns the envelope's plan (or what a test's
-        stand-in returns)."""
-        set_pollers = getattr(self.mechanism, "_set_device_pollers", None)
-        quiesced = []
-        try:
-            quiesced = await set_pollers(False, log) if set_pollers else []
-        except Exception as exc:  # noqa: BLE001 - best-effort, as for a mesh reset: never blocks recovery
-            log(f"could not stop the device pollers before the tray re-power: {exc!r}")
+        stand-in returns). Inside a sweep that holds the pollers, it stops them afresh right before the
+        pulse and leaves the restart to that sweep's verify (spec 04 I23)."""
+        stopped = await self.mechanism.hold_pollers(log)
+        cancelled_mid_fire = False
         try:
             return await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
+        except asyncio.CancelledError:
+            cancelled_mid_fire = True  # the pulse runs on in its thread: the tray may still be off the bus
+            raise
         finally:
-            if quiesced:
-                await asyncio.shield(set_pollers(True, log))
+            await self.mechanism.release_pollers(stopped, log, restore=not cancelled_mid_fire)
 
     async def _issue_all_resets_back_to_back(
         self, bitmap: int, tray_chip_ids: list, trays: list, expected: int, log, *, do_sbr: bool = True
@@ -1446,6 +1446,10 @@ class GalaxyRecovery(Recovery):
         # The caller ends it after its settle and verify (the host-hang latch, I25).
         pcie_guard.begin_offbus_reset("reset sweep", off_bus)
         complete = True
+        # The pollers stay stopped from before the first rung to after the last: a tray pulse can drop
+        # every tray, so the mesh reset after it must not restart them (a caller's hold keeps them
+        # stopped through its settle and verify too).
+        pollers = await self.mechanism.hold_pollers(log)
         # Hold reset_in_flight across the whole sweep so the dead-chip sampler defers instead of
         # isolating a tray mid-reset. Cleared on every exit.
         self.mechanism.reset_in_flight = True
@@ -1500,6 +1504,7 @@ class GalaxyRecovery(Recovery):
             health_event("last_chance_reset_sweep_error", error=repr(exc))
         finally:
             self.mechanism.reset_in_flight = False
+            await self.mechanism.release_pollers(pollers, log, restore=True)
         return complete
 
     async def _settle_and_verify_before_host_rung(
@@ -1551,6 +1556,7 @@ class GalaxyRecovery(Recovery):
         # and index arithmetic would target the wrong silicon.
         tray_chip_ids = [c for t in trays for c in (tray_map or {}).get(t, [])]
         swept = False
+        pollers: Optional[list] = None
         if await asyncio.to_thread(self.mechanism.scope_active):
             log(f"last chance before the host rung{where}: a reset is already cycling in its own scope — adopting it")
         else:
@@ -1573,16 +1579,21 @@ class GalaxyRecovery(Recovery):
                     f"(SBR -> per-tray re-power of trays {trays} -> mesh reset) — nothing to lose before a "
                     f"reboot or power cycle"
                 )
+                # Held through the settle and the verify below: restarted only on a verified mesh.
+                pollers = await self.mechanism.hold_pollers(log)
                 swept = await self._issue_all_resets_back_to_back(
                     bitmap, tray_chip_ids, trays, expected, log, do_sbr=bool(self.deps.isolated_chips())
                 )
         settle = _settle_before_host_rung_sec()
         log(f"settling {settle}s for re-enumeration, then one verify before the host rung")
+        healthy = False
         try:
             await asyncio.sleep(settle)
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
         finally:
             pcie_guard.end_offbus_reset()
+            if pollers is not None:
+                await self.mechanism.release_pollers(pollers, log, restore=bool(healthy))
         if healthy and fabric_77_unverified and expected > 1 and self._fabric_ran_but_unverified(evidence):
             # The caller is past an UNKNOWN reset whose I40 fallback refused (spec 04 I29): a 77 here is
             # the same no-verdict the reset already got, never a recovered fabric.
@@ -1649,15 +1660,21 @@ class GalaxyRecovery(Recovery):
             f"reset type back-to-back (SBR -> per-tray re-power -> mesh reset), then one {_settle_before_host_rung_sec()}s "
             f"settle and one verify before a power cycle"
         )
-        complete = await self._issue_all_resets_back_to_back(bitmap, tray_chip_ids, trays, expected, log)
-        # ONE settle, ONE verify.
-        settle = _settle_before_host_rung_sec()
-        log(f"back-to-back reset sweep issued — settling {settle}s, then one verify")
+        # The pollers stay stopped through the sweep, the settle and the verify: restarted only on a verified mesh.
+        pollers = await self.mechanism.hold_pollers(log)
+        healthy = False
         try:
-            await asyncio.sleep(settle)
-            healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+            complete = await self._issue_all_resets_back_to_back(bitmap, tray_chip_ids, trays, expected, log)
+            # ONE settle, ONE verify.
+            settle = _settle_before_host_rung_sec()
+            log(f"back-to-back reset sweep issued — settling {settle}s, then one verify")
+            try:
+                await asyncio.sleep(settle)
+                healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+            finally:
+                pcie_guard.end_offbus_reset()
         finally:
-            pcie_guard.end_offbus_reset()
+            await self.mechanism.release_pollers(pollers, log, restore=bool(healthy))
         if healthy:
             log("tray-down-no-window sweep recovered the mesh — no power cycle needed")
             health_event("tray_down_no_window_recovered", trays=trays, evidence=evidence)
@@ -2591,11 +2608,14 @@ class GalaxyRecovery(Recovery):
         self.mechanism.reset_in_flight = True
         self.mechanism.reset_since_release = True
         start_off = set(offbus_ids)
-        quiesced: list = []
         cancelled_mid_fire = False
+        pulsed = 0
+        recovered = False
+        # A tray pulse can drop every tray on the box, not just its own: stop the pollers before the
+        # first pulse and keep them stopped across the walk. Restarted only once a verify proves the
+        # mesh, or when nothing was re-powered (spec 04 I23).
+        pollers = await self.mechanism.hold_pollers(log)
         try:
-            # A tray pulse takes chips off the bus: stop the pollers' MMIO across the walk, as for every reset.
-            quiesced = await self.mechanism._set_device_pollers(False, log)
             for step, tray in enumerate(walk):
                 bitmap = 1 << (tray - 1)
                 tray_chip_ids = list(tray_map[tray])
@@ -2618,10 +2638,10 @@ class GalaxyRecovery(Recovery):
                     f"{_tray_label(tray, tray_map)}: `{command}`"
                 )
                 try:
-                    # The envelope (spec 04 I23) runs inside _fire_ubb_reset. The pollers are already
-                    # stopped across the whole walk, so not _fire_tray_repower, which would restart them
-                    # between trays.
-                    plan = await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
+                    # The envelope (spec 04 I23) runs inside _fire_ubb_reset. _fire_tray_repower nests in
+                    # the walk's hold: it stops the pollers afresh right before each pulse (one an outside
+                    # actor started since is stopped again) and leaves the restart to the walk.
+                    plan = await self._fire_tray_repower(bitmap, tray_chip_ids, log)
                 except asyncio.CancelledError:
                     # Abandoned while the BMC pulse runs on in its thread: the tray may still be off the
                     # bus, so the pollers stay stopped, as reset_with_quiesce leaves them on a mid-reset cancel.
@@ -2644,6 +2664,7 @@ class GalaxyRecovery(Recovery):
                 # the mesh recovered yet (a partial walk's earlier trays firing cleanly is real signal,
                 # same rc==0-always-fires contract as the mesh-wide reset's own "ok" report).
                 metrics.stage_fired("ubb_tray", "ok")
+                pulsed += 1
                 if getattr(plan, "kept_masked", None):
                     # A root port kept erroring after the re-power: re-powering another tray now is how
                     # a flood on one port turned into a dead host. Stop the walk here.
@@ -2664,6 +2685,7 @@ class GalaxyRecovery(Recovery):
                     isolated = self.deps.isolated_chips()
                     for c in start_off:
                         isolated.discard(c)
+                    recovered = True
                     return True
                 off_now = _offbus_chip_ids(await asyncio.to_thread(self.deps.read_heartbeats) or {}, expected)
                 new_off = off_now - start_off
@@ -2698,5 +2720,8 @@ class GalaxyRecovery(Recovery):
         finally:
             self.mechanism.reset_in_flight = False
             pcie_guard.end_offbus_reset()
-            if quiesced and not cancelled_mid_fire:
-                await asyncio.shield(self.mechanism._set_device_pollers(True, log))
+            # Not on a mid-fire cancel (the pulse runs on), and not after a pulse that left the mesh
+            # unproven: the next rung, or the idle probe once the broker is healthy, restarts them.
+            await self.mechanism.release_pollers(
+                pollers, log, restore=not cancelled_mid_fire and (recovered or pulsed == 0)
+            )

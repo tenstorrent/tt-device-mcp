@@ -192,6 +192,10 @@ class RecoveryMechanism:
         # 01 I16): a reaped job's process still holding the device, which a reset cannot free.
         # Checked here, where every reset passes, so no caller can reset over one.
         self.reset_fence: Optional[Callable[[], str]] = None
+        # Open recoveries that re-power a tray (hold_pollers): while above 0 no rung restarts a
+        # device poller, and /health reports it so the idle probe stands back (spec 04 I23).
+        self.pollers_held = 0
+        self._held_stopped: set[str] = set()
 
         # Two callers (the auto-recovery reset launcher and the operator-run reset tool) need this
         # sequence and they must build it identically, because the scope name is what every other
@@ -656,8 +660,48 @@ class RecoveryMechanism:
                     # The reset is done and the chips are back, so restoring is safe; put it in the
                     # rescan's finally under shield so a cancellation during the rescan still restores
                     # rather than leaving a telemetry gap.
-                    if quiesced:
+                    if quiesced and self.pollers_held:
+                        self._held_stopped.update(quiesced)
+                        log("device pollers left stopped: a tray re-power holds them until its verify")
+                    elif quiesced:
                         await asyncio.shield(self._set_device_pollers(True, log))
+
+    async def hold_pollers(self, log) -> list[str]:
+        """Stop every device poller for a recovery that re-powers a tray, and keep it stopped until
+        :meth:`release_pollers`. A per-tray BMC pulse can drop every other tray on the box too (a
+        Galaxy lost its three other trays within 5 s of one tray's pulse), so no rung inside the
+        recovery, the mesh reset after a tray fire included, may restart a poller onto chips that
+        may be off the bus. Holds nest; each one stops the pollers afresh, so one an outside actor
+        started since the last stop is stopped again right before the next pulse. Never raises
+        (best-effort, as for a mesh reset); returns the units stopped."""
+        stopped: list[str] = []
+        if self._set_device_pollers is not None:
+            try:
+                stopped = await self._set_device_pollers(False, log)
+            except Exception as exc:  # noqa: BLE001 - best-effort: never blocks recovery
+                log(f"could not stop the device pollers before the tray re-power: {exc!r}")
+        self.pollers_held += 1
+        self._held_stopped.update(stopped or [])
+        return stopped
+
+    async def release_pollers(self, stopped: list[str], log, *, restore: bool) -> None:
+        """End one :meth:`hold_pollers`. The outermost release restarts what any stop inside the hold
+        stopped only when
+        ``restore`` (the recovery verified the mesh, or re-powered nothing); otherwise they stay
+        stopped (``pollers_left_stopped``) and the next completed reset, or the idle probe once the
+        broker reports the device healthy, brings them back."""
+        self.pollers_held = max(0, self.pollers_held - 1)
+        if self.pollers_held:
+            return
+        stopped = sorted(self._held_stopped.union(stopped or []))
+        self._held_stopped.clear()
+        if not stopped:
+            return
+        if restore:
+            await asyncio.shield(self._set_device_pollers(True, log))
+            return
+        log(f"device pollers left stopped after the tray re-power: {', '.join(stopped)} (chips may be off the bus)")
+        health_event("pollers_left_stopped", services=list(stopped))
 
     async def _reapply_aiclk_ceiling(self, log) -> None:
         """Put an operator's AICLK ceiling back on the freshly reset chips, before the pollers

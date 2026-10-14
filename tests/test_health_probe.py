@@ -126,6 +126,7 @@ def _baseline(hdir: Path, chips: int) -> None:
         ({**IDLE, "fsm_state": "recovering", "fsm_why": "reset"}, "'recovering'"),
         ({**IDLE, "fsm_state": "boot"}, "'boot'"),
         ({**IDLE, "device_degraded": "pcie_reset"}, "recovery in flight"),
+        ({**IDLE, "pollers_held": True}, "pollers stopped across a tray re-power"),
         ({**IDLE, "running": 1}, "1 running"),
         ({**IDLE, "queued": 2}, "2 queued"),
         ({k: v for k, v in IDLE.items() if k != "running"}, "no job counts"),
