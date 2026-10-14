@@ -324,6 +324,9 @@ class HealthMonitor:
         # A skip (None) never overwrites it: not knowing is not the same as knowing it is fit.
         self.last_fabric_ok: Optional[bool] = None
         self.last_fabric_output: str = ""
+        # When the run that produced last_fabric_output started (local naive datetime), None until
+        # one runs. An incident bundle keeps that output only when this pass produced it (spec 03 I56).
+        self.last_fabric_output_at: Optional[datetime] = None
         # (reason, monotonic, bundle path) of the last no-verdict fabric run kept in an incident bundle.
         self._fabric_skip_incident: Optional[tuple[str, float, str]] = None
         # A topology mismatch (the discovered links are not the descriptor's) passed on a
@@ -997,6 +1000,7 @@ class HealthMonitor:
         # Keep the whole thing: the validator names the failing links, and the 400-char detail
         # the journal carries truncates exactly the part naming them.
         self.last_fabric_output = text
+        self.last_fabric_output_at = _t0
         last = text.splitlines()[-1][:200] if text else "(no output)"
         if override:
             # An operator's own wrapper has already done its own interpretation and reports it
@@ -1015,6 +1019,7 @@ class HealthMonitor:
                     desc, text, timeout_sec=timeout_sec, track=_track, cwd=cwd
                 )
                 self.last_fabric_output = text
+                self.last_fabric_output_at = _t0
         # Derived from ok, not rc: on the built-in path a measured-bad verdict can exit 77 (the
         # collision guard classify() applies), and a did-not-measure run can exit some other
         # code entirely — status must agree with the verdict actually being returned below, not
@@ -1219,7 +1224,7 @@ class HealthMonitor:
         return self.fabric_known_fault
 
     def _declare_cable_fault(self, detail: str) -> None:
-        """A fabric pass found cables missing (spec 03 I47): open the known fabric fault (I46) at once,
+        """A fabric pass found cables missing (spec 03 I50): open the known fabric fault (I46) at once,
         journal it, page once per distinct fault. A fault already open is left as it is, so its
         bound still runs from the first declaration."""
         if self.fabric_known_fault == detail:

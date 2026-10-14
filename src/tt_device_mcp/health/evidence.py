@@ -18,6 +18,7 @@ import platform
 import re
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -357,6 +358,11 @@ def _prune_incidents() -> None:
             pass
 
 
+def _utc_iso(at: datetime) -> str:
+    """A datetime as UTC ISO 8601 with a Z; a naive one is read as local time."""
+    return at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def capture_incident(
     label: str,
     *,
@@ -367,6 +373,8 @@ def capture_incident(
     fabric_output: str = "",
     evidence: dict | None = None,
     job_log_bytes: int = 256 * 1024,
+    fabric_output_at: Optional[datetime] = None,
+    fabric_since: Optional[datetime] = None,
 ) -> Optional[Path]:
     """Freeze everything a root-cause investigation will want, at the moment it exists.
 
@@ -376,6 +384,12 @@ def capture_incident(
     all lived somewhere volatile — a rotating log, a kernel ring buffer an ungraceful
     reboot erases, a truncated string in a JSON field. Each one is copied here, once,
     while it still exists.
+
+    ``fabric_since`` is when the calling gate pass began, ``fabric_output_at`` when the run that
+    produced ``fabric_output`` began. With ``fabric_since`` set, output from an earlier pass is
+    stale: it is left out of the bundle, and incident.json says so, so no bundle presents another
+    pass's transcript as this one's; fresh output goes to fabric.log under a header naming its run
+    time (spec 03 I56). Without ``fabric_since`` the output is kept as given.
 
     Never raises. Returns the bundle directory.
     """
@@ -400,6 +414,15 @@ def capture_incident(
             "chips": chips,
             "chips_present_at_capture": len(chips),
         }
+        fabric_header = ""
+        if fabric_output and fabric_since is not None:
+            at_iso = _utc_iso(fabric_output_at) if fabric_output_at is not None else None
+            if fabric_output_at is None or fabric_output_at < fabric_since:
+                meta["fabric_output"] = {"at": at_iso, "stale": True, "omitted": True}
+                fabric_output = ""
+            else:
+                meta["fabric_output"] = {"at": at_iso, "stale": False}
+                fabric_header = f"# fabric check run started {at_iso}\n"
         (root / "incident.json").write_text(json.dumps(meta, indent=2, default=str))
 
         # The kernel's view — the piece that a reboot destroys and that nobody has had.
@@ -417,7 +440,7 @@ def capture_incident(
         if reset_output:
             (root / "reset.log").write_text(reset_output)
         if fabric_output:
-            (root / "fabric.log").write_text(fabric_output)
+            (root / "fabric.log").write_text(fabric_header + fabric_output)
 
         for f in root.iterdir():
             try:
