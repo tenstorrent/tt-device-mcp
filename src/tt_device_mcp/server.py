@@ -92,6 +92,7 @@ from tt_device_mcp.health import (
     HOLD_ESCALATION_REARM_SEC,
     HOLD_FABRIC_UNVERIFIED,
     OUTCOME_RECOVERED,
+    OUTCOME_TERMINAL,
     OUTCOME_WAITING,
     RELEASE,
     RESET_COOLDOWN_SEC,
@@ -2076,6 +2077,7 @@ def _reset_for_testing():
     global _hold_episode_restorable, _hold_episode_tenant
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
     global _topology_hw_fault_paged
+    global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
     job_queue = None
     lock = None
     _action_row = None
@@ -2090,6 +2092,9 @@ def _reset_for_testing():
     _fabric_77_fallback_release_monotonic = 0.0
     _fabric_77_paged_since = None
     _topology_hw_fault_paged = None
+    _fabric_77_recheck_since = None
+    _fabric_77_rechecks = 0
+    _fabric_77_recheck_monotonic = 0.0
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
@@ -3464,6 +3469,50 @@ def _fabric_77_bound_reached() -> bool:
     return age >= _env_int("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", 600, 60)
 
 
+# I48 — the re-check backoff of a 77-only hold. The idle relift re-runs the fabric pass at most once
+# per step of TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC (120, 300, 600, 1200 s; the last step repeats), so
+# the I40 bound's third retry lands about 17 min into the episode and never past 60 min, and a hold the
+# ladder could not end keeps getting a fresh pass every 20 min instead of every relift tick.
+_fabric_77_recheck_since: Optional[str] = None
+_fabric_77_rechecks: int = 0
+_fabric_77_recheck_monotonic: float = 0.0
+FABRIC_77_BACKOFF_MAX_SEC = 1200
+
+
+def _fabric_77_backoff_sec() -> list[int]:
+    """The backoff steps, each clamped to 60..1200 s; a malformed value reads as the default."""
+    default = [120, 300, 600, 1200]
+    raw = os.environ.get("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", "").strip()
+    try:
+        steps = [int(x) for x in raw.split(",") if x.strip()] if raw else default
+    except ValueError:
+        steps = default
+    return [min(FABRIC_77_BACKOFF_MAX_SEC, max(60, x)) for x in steps] or default
+
+
+def _fabric_77_recheck_due() -> bool:
+    """Whether the open 77-only hold is due its next fabric re-check (I48): the first step after the
+    hold opened, then each further step after the last re-check that 77'd again."""
+    steps = _fabric_77_backoff_sec()
+    if _fabric_77_recheck_since != fsm.record.since or not _fabric_77_rechecks:
+        try:
+            opened = datetime.strptime(str(fsm.record.since), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return True  # a stamp this FSM did not write: re-check rather than stall the hold
+        return (datetime.now(timezone.utc) - opened).total_seconds() >= steps[0]
+    wait = steps[min(_fabric_77_rechecks, len(steps) - 1)]
+    return time.monotonic() - _fabric_77_recheck_monotonic >= wait
+
+
+def _note_fabric_77_recheck() -> None:
+    """Record an idle re-check that 77'd again on the open hold, so the next one backs off (I48)."""
+    global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
+    if _fabric_77_recheck_since != fsm.record.since:
+        _fabric_77_recheck_since, _fabric_77_rechecks = fsm.record.since, 0
+    _fabric_77_rechecks += 1
+    _fabric_77_recheck_monotonic = time.monotonic()
+
+
 def _note_fabric_77_reset_passes(passes: int) -> None:
     """Count a reset's post-reset 77 passes toward the open episode's I40 bound: they ran on freshly
     retrained links, so the next relift's 77 falls back at once rather than re-running them."""
@@ -3566,6 +3615,8 @@ async def _attempt_idle_relift() -> None:
     global last_relift_monotonic, _startup_fabric_owed_since
     if last_relift_monotonic and (time.monotonic() - last_relift_monotonic) < SELFHEAL_RELIFT_INTERVAL_SEC:
         return
+    if fabric and _fabric_77_only_hold() and not _startup_fabric_owed() and not _fabric_77_recheck_due():
+        return  # I48: a 77-only hold re-runs the pass on its backoff, not every relift tick
     last_relift_monotonic = time.monotonic()
 
     def _log(msg: str) -> None:
@@ -3610,7 +3661,13 @@ async def _attempt_idle_relift() -> None:
                 there would outlive every ceiling with no rung ever attempted."""
                 _void_fabric_ok(f"idle relift: {rung}")
                 outcome = await galaxy_recovery.escalate(rung, indices, expected, _log)
-                fsm.on_outcome(outcome)
+                if outcome == OUTCOME_TERMINAL and _fabric_77_only_hold():
+                    # The rung ran and the fabric still only 77s: no fault was measured, so the episode
+                    # is not the terminal DOWN no idle path re-checks. It stays held and RECOVERING, and
+                    # the relift keeps re-running the pass on its backoff (I48).
+                    _log("the rung left the fabric unverified (77), not failed — holding; re-checks continue")
+                else:
+                    fsm.on_outcome(outcome)
                 return outcome != OUTCOME_WAITING
 
             if generic:
@@ -3681,6 +3738,8 @@ async def _attempt_idle_relift() -> None:
                 # so gate the lift on an explicit True. An unverifiable or failed fabric on retry is
                 # not proof, and reopening on it hands the next tenant a mesh no pass cleared.
                 fabric_ok = (evidence.get("fabric") or {}).get("ok")
+                if fabric_ok is None:
+                    _note_fabric_77_recheck()
                 if (
                     fabric_ok is None
                     and _fabric_77_only_hold()

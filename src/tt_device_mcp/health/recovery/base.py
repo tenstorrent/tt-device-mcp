@@ -221,6 +221,9 @@ class RecoveryMechanism:
         self.unverified_reset_since: Optional[str] = None
         # The episode whose last-chance sweep that path already ran; the next escalation climbs.
         self.unverified_sweep_since: Optional[str] = None
+        # The episode whose sweep verify still read a fabric 77: no rung measured a fault, so it never
+        # climbs to a host rung; it holds, pages once and the idle relift keeps re-checking.
+        self.unverified_sweep_77_since: Optional[str] = None
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a
