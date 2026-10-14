@@ -1770,6 +1770,10 @@ class GalaxyRecovery(Recovery):
         beats_before = await asyncio.to_thread(self.deps.read_heartbeats)
         off_bus_before = len(dead_chips(beats_before)) + max(0, expected - len(beats_before))
         recovered = await self._reset_and_verify_device(indices, log)
+        if recovered is None:
+            # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, which the
+            # idle relift re-checks within its bound (spec 03 I40). Nothing measured a failure to climb on.
+            return True
         if recovered:
             self.deps.clear_device_reported_fault("idle escalation: galaxy reset recovered the mesh")
             self.deps.clear_device_dirty(verified=True, why="idle escalation: galaxy reset recovered the mesh")
@@ -2102,6 +2106,10 @@ class GalaxyRecovery(Recovery):
             beats_before = await asyncio.to_thread(self.deps.read_heartbeats)
             off_bus_before = len(dead_chips(beats_before)) + max(0, expected - len(beats_before))
         recovered = await self._reset_and_verify_device(indices, log)
+        if recovered is None:
+            # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, which the
+            # idle relift re-checks within its bound (spec 03 I40). Nothing measured a failure to climb on.
+            return True
         if recovered:
             self.deps.clear_device_reported_fault("idle off-bus escalation: galaxy reset recovered the mesh")
             self.deps.clear_device_dirty(verified=True, why="idle off-bus escalation: galaxy reset recovered the mesh")
