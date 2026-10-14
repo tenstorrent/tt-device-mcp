@@ -5807,6 +5807,9 @@ async def test_a_survivor_holding_the_device_is_logged_and_marks_it_dirty(monkey
     marked = []
     monkeypatch.setattr(srv, "reap_job_survivors", fake_sweep)
     monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marked.append(reason))
+    # The real holder scan walks the host's /proc after finished_at is set; on a loaded host
+    # _run_one cancelled the runner before the mark landed.
+    monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda scan=None: "")
     log = tmp_path / "912.log"
     job = srv.Job(id="912", owner="tenant", workspace="/tmp", command="echo hi", queued_at="t", log_file=str(log))
     await _run_one(job)
