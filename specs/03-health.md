@@ -442,7 +442,7 @@ job boundary.
   missing, the failed job pays the full pass as before. Only the in-broker job runner says a job
   never reached the device: a Slurm `post-step` still forces the pass, and so does a job the runner
   ended on its own error, before or after the spawn, however fast and whatever its exit code.
-  Rationale: blx01 lost its host ~9s into a pass forced 2s after a green one by a job that had
+  Rationale: box A lost its host ~9s into a pass forced 2s after a green one by a job that had
   failed in 0s on a missing directory; the pass is the heaviest load the broker puts on the mesh,
   and that job told it nothing.
 - **I37 — The stuck-hold alert hook is opt-in, backs off, and never blocks.** With

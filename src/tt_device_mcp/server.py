@@ -1264,7 +1264,7 @@ FABRIC_CHECK_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_I
 last_fabric_check_monotonic: float = 0.0
 # A failed job that never reached the device (spec 03 I36) does not force the traffic pass when
 # one finished green this recently: it ran in under NOOP_FAILURE_MAX_RUNTIME_SEC, so it says
-# nothing about the mesh. blx01 lost its host ~9s into a pass forced 2s after a green one by a
+# nothing about the mesh. box A lost its host ~9s into a pass forced 2s after a green one by a
 # job that failed in 0s on a missing directory. The exit code alone never qualifies: jobs run
 # under `bash -c` with `set -e`, so a script that used the device and then hit a missing or
 # non-executable command also exits 127/126.
@@ -3474,7 +3474,7 @@ async def _attempt_idle_relift() -> None:
                 # A present mesh (nothing off the bus) can still verify UNHEALTHY on a MASS ARC
                 # wedge — every chip present but its heartbeat frozen. The off-bus escalator above
                 # cannot see it (off_bus==0) and the frozen-eth branch below is unreachable (that
-                # needs enum+ARC HEALTHY), so read-only this held forever (blx04, 37h). It is the one
+                # needs enum+ARC HEALTHY), so read-only this held forever (box D, 37h). It is the one
                 # present-mesh fault a galaxy reset both cures and cannot invert — every chip is
                 # present — so route a confirmed mass wedge (frozen chips >= the same mass-drop floor
                 # the gate keys on) to the present-mesh reset the eth strand runs. A sub-floor frozen
@@ -4184,7 +4184,7 @@ def _frozen_chip_count(evidence: dict) -> int:
     records. A galaxy reset re-inits them and, unlike an off-bus drop, cannot invert the mesh doing
     so: every frozen chip is already present, so there is nothing for the reset to take down with it.
     The mass-reset floor counts these alongside the off-bus chips so an all-frozen present mesh does
-    not read as 0-off-bus and hold below the floor forever (the blx04 present-mesh deadlock)."""
+    not read as 0-off-bus and hold below the floor forever (the box D present-mesh deadlock)."""
     return len((evidence.get("heartbeat") or {}).get("stalled") or [])
 
 
@@ -4479,7 +4479,7 @@ async def device_health_gate(
         stale = never_run or (time.monotonic() - last_fabric_check_monotonic) > FABRIC_CHECK_MIN_INTERVAL_SEC
         # A failed job that never reached the device (I36) owes no forced pass on a mesh a green
         # pass proved moments ago: the pass is the heaviest thing the broker does to the mesh, and
-        # blx01 lost its host ~9s into one forced 2s after a green pass. Only a clean HEALTHY
+        # box A lost its host ~9s into one forced 2s after a green pass. Only a clean HEALTHY
         # device skips it, and only on an armed host: the eth read still runs below (run_eth), a
         # frozen core still holds, and a read with no verdict, a link-drop skip included, still
         # runs the full pass (fabric_stale is forced for it). last_fabric_check_monotonic is set
@@ -4734,7 +4734,7 @@ async def device_health_gate(
             # The fabric pass RAN but returned no verdict (77 — the validator tested no link, e.g.
             # eth links that never trained). On a multi-chip host that is NOT "the mesh is fine":
             # enum+ARC are blind to a wedged eth core, so reading it healthy admits tenants onto a
-            # possibly-dead fabric — measured on blx04, a box whose chip 4/14 eth links were down
+            # possibly-dead fabric — measured on box D, a box whose chip 4/14 eth links were down
             # read `ok` on enum+ARC and every full-mesh job died. Fail CLOSED: hold it fabric-
             # unverified whether or not it was flagged dirty, so no tenant runs until a pass
             # returns a real healthy verdict. Do NOT reset — a 77 is not resettable, and a galaxy
@@ -8249,7 +8249,7 @@ async def _record_startup_health() -> None:
                 _mark_device_dirty(f"broker start: {detail}", why="heartbeat")
                 # If this boot is a warm reboot the broker fired and the mesh did not come back, the
                 # reboot is spent (it cannot re-enumerate a whole-bus wedge) — climb to the cold rung
-                # now rather than re-holding it dead, the failure that lost blx02 for ~18h.
+                # now rather than re-holding it dead, the failure that lost box B for ~18h.
                 off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
 
                 def _log(msg: str) -> None:

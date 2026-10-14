@@ -43,7 +43,7 @@ from tt_device_mcp.health.recovery import (
     offbus_power_cycle,
     pcie_guard,
 )
-from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC
+from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC, refuse_mesh_reset
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
@@ -1388,7 +1388,7 @@ class GalaxyRecovery(Recovery):
         * the broker's own queue — a job in RUNNING state. Authoritative about work the broker
           itself dispatched, and it does not care whether that job currently holds an fd.
 
-        Measured failure this exists to stop (g15blx02, 2026-09-17 10:07:09Z): the stuck-hold
+        Measured failure this exists to stop (box B, 2026-09-17 10:07:09Z): the stuck-hold
         escalation read an empty holder scan 106 s into a running job, fired a mesh reset, and the
         job died of SIGPIPE at 10:09:18Z the moment the reset released the device. The broker knew
         the job was RUNNING the whole time; nothing asked it.
@@ -1439,6 +1439,9 @@ class GalaxyRecovery(Recovery):
         if not allowed:
             log(f"back-to-back reset sweep NOT fired: {why}; holding — no host rung without the full ladder")
             health_event("host_reset_gated", context="reset_sweep", reason=why, trays=trays, host_at_risk=True)
+            return False
+        # The operator's outage hold (spec 04 I28) refuses the whole sweep: its last step is the mesh reset.
+        if refuse_mesh_reset("reset_sweep", self.reset_argv([str(i) for i in range(expected)]), log):
             return False
         # The caller ends it after its settle and verify (the host-hang latch, I25).
         pcie_guard.begin_offbus_reset("reset sweep", off_bus)
@@ -2239,7 +2242,7 @@ class GalaxyRecovery(Recovery):
             # A PRESENT mesh (every chip on the bus, ARC-healthy) whose galaxy reset STILL did not verify
             # is an eth/fabric wedge the reset could not clear — and self-heal will not either, since it
             # already survived the deepest reset. The old code held it here (below the mass floor), which
-            # is an INDEFINITE hold: measured on blx04, hours of ceiling -> galaxy-reset -> hold with the
+            # is an INDEFINITE hold: measured on box D, hours of ceiling -> galaxy-reset -> hold with the
             # eth core wedged the whole time, the ledger never firing a rung above the reset. "Survived a
             # galaxy reset" is the proof this is a reboot/power-cycle-class wedge, not a self-healing one —
             # so climb, do not sit. (A transient post-reset training window reports 77/skip, which reads as

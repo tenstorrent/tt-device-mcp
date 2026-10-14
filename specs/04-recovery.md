@@ -487,6 +487,18 @@ each rung fires only when the gentler one failed or cannot apply.
   manual-recovery command: exit 0 when the sudo journal or auth.log shows a sudo-run reboot,
   poweroff, shutdown, halt, kexec or ipmitool power/reset in the last 30 min, 1 when not, 2 when it
   cannot read the journal.
+- **I28 — An operator's outage hold holds every automatic mesh reset.** With
+  `TT_DEVICE_MCP_AUTO_MESH_RESET=0`, or with it unset and `TT_DEVICE_MCP_AUTO_REBOOT`,
+  `TT_DEVICE_MCP_AUTO_POWER_CYCLE` and `TT_DEVICE_MCP_AUTO_UBB_RESET` all `0` (an outage hold), no
+  automatic mesh reset fires: not the between-jobs gate's, the idle relift's or the hold
+  watchdog's, and no last-chance sweep. `TT_DEVICE_MCP_AUTO_MESH_RESET=1` arms it whatever the
+  others say. Any one of the three alone is a per-host choice and still climbs through the mesh
+  reset (the tray rung off only names its command). A held reset did not happen, as for I24: it is
+  checked before `reset_begin` and the cooldown clock, sets no failed-reset flag, and the episode
+  holds. It is logged, journaled (`mesh_reset_held`, host at risk) and paged once through the alert
+  hook, again after a pass that found no hold; a page the hook drops is sent again on the next
+  pass. An already-running reset in its own scope is still adopted, and the operator's reset tool
+  is never held.
 
 ## Interfaces
 
@@ -679,7 +691,7 @@ cycling in its own scope. A sweep that brings the mesh back cancels the host run
 device?" goes through one helper (`_tenant_active`), and it consults TWO independent sources: the holder scan (open
 `/dev/tenstorrent` fds) and the broker's own queue (`deps.job_running`). The scan alone is not evidence of idleness —
 a running job spends minutes off the device compiling, loading weights and between opens, and during that window the
-scan is empty. Measured on g15blx02 2026-09-17: the stuck-hold escalation read an empty scan 106 s into a running
+scan is empty. Measured on box B 2026-09-17: the stuck-hold escalation read an empty scan 106 s into a running
 job, fired a mesh reset, and the job died of SIGPIPE the instant the reset released the device. `force` (the
 hold-deadline backstop) still waives an UNREADABLE scan, because that guard protects against blindness, but it never
 waives a known tenant — fd-held or queue-known.
@@ -881,6 +893,7 @@ sees a silent fabric pass.
 | I27 the gated off-bus hold: safe rungs first, grace, idle and nothing standing back, then one power cycle per interval with the attempt on disk first; otherwise hold or page once | `tests/test_offbus_power_cycle.py::test_a_gate_that_allows_resets_hands_back_to_the_ladder`, `tests/test_offbus_power_cycle.py::test_no_power_cycle_before_the_safe_rungs_ran`, `tests/test_offbus_power_cycle.py::test_an_unset_command_pages_once_and_the_hold_stands`, `tests/test_offbus_power_cycle.py::test_within_the_grace_it_holds`, `tests/test_offbus_power_cycle.py::test_past_the_grace_and_idle_it_fires_once_with_the_attempt_on_disk_first`, `tests/test_offbus_power_cycle.py::test_the_ladder_then_the_power_cycle_through_the_escalation`, `tests/test_offbus_power_cycle.py::test_a_tenant_or_an_unreadable_scan_holds`, `tests/test_offbus_power_cycle.py::test_a_reset_in_its_own_scope_holds`, `tests/test_offbus_power_cycle.py::test_anything_objecting_stands_back`, `tests/test_offbus_power_cycle.py::test_checks_that_say_no_let_it_fire`, `tests/test_offbus_power_cycle.py::test_an_attempt_within_the_interval_pages_instead`, `tests/test_offbus_power_cycle.py::test_an_attempt_older_than_the_interval_does_not_limit`, `tests/test_offbus_power_cycle.py::test_the_mechanism_limits_still_apply`, `tests/test_offbus_power_cycle.py::test_an_unwritable_attempt_record_never_fires`, `tests/test_offbus_power_cycle.py::test_a_failed_fire_keeps_its_error_for_the_next_page`, `tests/test_offbus_power_cycle.py::test_fire_command_raises_on_a_non_zero_exit_and_passes_the_reason`, `tests/test_offbus_power_cycle.py::test_due_for_the_watchdog_once_per_episode`, `tests/test_offbus_power_cycle.py::test_the_hold_watchdog_forces_one_pass_at_the_grace`, `tests/test_offbus_power_cycle.py::test_the_knobs_default_and_reject_nonsense`, `tests/test_offbus_power_cycle.py::test_a_corrupt_state_file_reads_empty_and_a_bad_stamp_counts_as_now` |
 | I27 bounded: a blocked cycle pages once (high severity) past grace + the bound; a page the hook drops is retried | `tests/test_offbus_power_cycle.py::test_a_blocked_power_cycle_pages_once_past_its_bound`, `tests/test_offbus_power_cycle.py::test_a_page_the_alert_hook_drops_is_sent_again`, `tests/test_offbus_power_cycle.py::test_the_blocked_page_bound_defaults_and_rejects_nonsense` |
 | I27 the manual-recovery check template: operator power actions count, read-only BMC queries do not, an unreadable journal cannot answer | `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_template`, `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_cannot_answer_on_an_unreadable_journal`, `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_reads_auth_log_within_the_window` |
+| I28 an outage hold or `TT_DEVICE_MCP_AUTO_MESH_RESET=0` holds the gate, relift, watchdog and sweep mesh reset, pages once; one rung off alone, or `=1`, still resets | `tests/test_mesh_reset_hold.py::test_the_hold_reason_follows_the_flags`, `::test_the_gate_holds_the_mesh_reset_under_an_outage_hold_and_pages_once`, `::test_the_gate_holds_with_the_explicit_knob_alone`, `::test_the_gate_still_resets_with_only_the_tray_rung_off`, `::test_an_explicit_opt_in_re_arms_the_mesh_reset_under_an_outage_hold`, `::test_the_last_chance_sweep_is_refused_under_an_outage_hold`, `::test_a_dropped_page_is_sent_again_and_a_lifted_hold_re_arms_it` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |
