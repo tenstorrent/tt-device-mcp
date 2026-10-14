@@ -818,7 +818,9 @@ queued backlog, self-test and arm the eth-heartbeat rung (I28), close any orphan
 `fsm.boot_merge()` — always closed (I4), with this boot's auto-recovery ledger attribution folded
 into `detail` on the boot's first broker start only (a later restart in the same boot was not
 caused by that escalation and carries no attribution) — followed by an async startup-health report (sysfs heartbeat only, records what
-came back after a reboot and marks dirty if degraded) and the forced startup gate
+came back after a reboot and marks dirty if degraded; on the boot's first broker start only, a
+degraded mesh after a broker-fired warm reboot goes on to the post-reboot verify, spec 04) and the
+forced startup gate on every start
 (`phase="startup"`, `force_fabric=True`), which queues behind re-adopted jobs and is the only
 thing that may lift the `startup_unverified` hold. A per-user daemon (`should_privsep()` false)
 skips all of this: it has no re-adopted privsep jobs to protect and no staged fabric validator to
