@@ -4662,9 +4662,9 @@ async def test_held_job_fails_past_the_hold_bound_and_escalates(monkeypatch, tmp
             if first.status is not srv.JobStatus.QUEUED:
                 break
             await asyncio.sleep(0.02)
-        assert first.status is srv.JobStatus.FAILED, (
-            f"job 971 is {first.status.value} past its 0.3s hold bound — the hold is still open-ended"
-        )
+        assert (
+            first.status is srv.JobStatus.FAILED
+        ), f"job 971 is {first.status.value} past its 0.3s hold bound — the hold is still open-ended"
         assert "hold bound" in first.error and "TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC" in first.error, first.error
         assert "bus" in first.error.lower(), f"the refusal lost the degraded reason: {first.error!r}"
         assert not marker.exists(), "a job past its hold bound ran its command onto the degraded device"
