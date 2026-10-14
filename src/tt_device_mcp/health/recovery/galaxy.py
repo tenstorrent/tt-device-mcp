@@ -43,7 +43,7 @@ from tt_device_mcp.health.recovery import (
     offbus_power_cycle,
     pcie_guard,
 )
-from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC
+from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC, refuse_mesh_reset
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
@@ -1439,6 +1439,9 @@ class GalaxyRecovery(Recovery):
         if not allowed:
             log(f"back-to-back reset sweep NOT fired: {why}; holding — no host rung without the full ladder")
             health_event("host_reset_gated", context="reset_sweep", reason=why, trays=trays, host_at_risk=True)
+            return False
+        # The operator's outage hold (spec 04 I28) refuses the whole sweep: its last step is the mesh reset.
+        if refuse_mesh_reset("reset_sweep", self.reset_argv([str(i) for i in range(expected)]), log):
             return False
         # The caller ends it after its settle and verify (the host-hang latch, I25).
         pcie_guard.begin_offbus_reset("reset sweep", off_bus)

@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from tt_device_mcp import aio, metrics, privileges
+from tt_device_mcp import aio, alert, metrics, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
@@ -86,6 +86,52 @@ _ACTION_TO_STAGE = {"reboot": "host_reboot", "power-cycle": "power_cycle"}
 BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC = int(
     os.environ.get("TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC", "900").strip() or "900"
 )
+
+# An outage hold turns every hardware rung off at once. Each alone is a normal per-host choice (an
+# unconfirmed BMC turns the tray rung off and the ladder still climbs through the mesh reset), but
+# all three off together say "touch nothing": the mesh reset is held too.
+OUTAGE_HOLD_VARS = ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE", "TT_DEVICE_MCP_AUTO_UBB_RESET")
+_mesh_hold_paged: set = set()
+
+
+def mesh_reset_hold_reason() -> str:
+    """Why the operator forbids an AUTOMATIC mesh-wide reset (the gate's, the idle relift's, the
+    watchdog's or the last-chance sweep's ``tt-smi -glx_reset``), or "" when it may fire.
+
+    ``TT_DEVICE_MCP_AUTO_MESH_RESET=0`` holds it explicitly and ``=1`` arms it whatever else is set.
+    Unset, an outage hold (every :data:`OUTAGE_HOLD_VARS` set to 0) holds it: a mesh reset on a mesh
+    that is already off the bus is what starts an off-bus power-cycle loop. The operator's own reset
+    tool is never held."""
+    mesh = os.environ.get("TT_DEVICE_MCP_AUTO_MESH_RESET", "").strip()
+    if mesh == "0":
+        return "TT_DEVICE_MCP_AUTO_MESH_RESET=0"
+    if mesh == "1":
+        return ""
+    if all(os.environ.get(v, "").strip() == "0" for v in OUTAGE_HOLD_VARS):
+        return "outage hold (" + ", ".join(f"{v}=0" for v in OUTAGE_HOLD_VARS) + ")"
+    return ""
+
+
+def refuse_mesh_reset(context: str, argv: list, log) -> bool:
+    """True when :func:`mesh_reset_hold_reason` holds the mesh reset: logged, journaled and paged
+    once per hold (again after a pass that found no hold). A refused reset did not happen, so the
+    caller holds exactly as for a gated one and arms no cooldown or failed-reset flag."""
+    why = mesh_reset_hold_reason()
+    if not why:
+        _mesh_hold_paged.clear()
+        return False
+    message = (
+        f"automatic mesh reset NOT fired ({context}): {why}; holding for an operator — "
+        f"lift the hold or set TT_DEVICE_MCP_AUTO_MESH_RESET=1 to re-arm it"
+    )
+    log(message)
+    health_event("mesh_reset_held", context=context, argv=argv, reason=why, host_at_risk=True)
+    metrics.stage_fired("smi_reset", "blocked")
+    if why not in _mesh_hold_paged:
+        event = {"kind": "mesh_reset_held", "context": context, "reason": why, "message": message}
+        if alert.send_alert(event) is not None or alert.alert_argv() is None:
+            _mesh_hold_paged.add(why)
+    return True
 
 
 class RecoveryMechanism:
