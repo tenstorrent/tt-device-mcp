@@ -6,7 +6,7 @@
 A startup pass that 77'd for want of the validator or the pool is owed again once they land, even
 with the fabric relift switched off (I39).
 
-blx01, 2026-10-08: the broker started before tenstorrent-hugepages.service had allocated the pool,
+box A, 2026-10-08: the broker started before tenstorrent-hugepages.service had allocated the pool,
 the startup fabric pass exited 77 with its reason cut to "no link was tested", and the idle relift
 then escalated that hold to a glx_reset 120 s later — a reset that cannot produce a fabric verdict.
 """
@@ -428,7 +428,7 @@ async def test_the_forced_escalation_bails_on_a_77_only_hold(monkeypatch, tmp_pa
 
 # --- a startup pass the validator missed is owed again once it lands (I39) ----------------------
 #
-# g15blx02, 2026-10-11: the broker started 2 min after boot, the validator timer published the
+# box B, 2026-10-11: the broker started 2 min after boot, the validator timer published the
 # pinned build's `current` link 8 min later, and the startup pass exited 77 in between. With the
 # fabric relift switched off by a hold drop-in, nothing re-ran it and a healthy mesh stayed held
 # until someone restarted the broker.
@@ -736,21 +736,28 @@ async def test_a_second_77_only_hold_inside_the_window_climbs_the_ladder(monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "hold_detail,fabric_detail",
+    "hold_detail,fabric_detail,flagged",
     [
-        ("gate/startup: fabric unverified (could not run)", "topology mismatch; traffic-only rerun unavailable"),
-        ("topology mismatch; traffic-only rerun not runnable: boom", "could not run (77)"),
         (
             "job 7: hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)",
             "could not run (77)",
+            "",
         ),
+        (
+            "gate/startup: fabric unverified (could not run)",
+            "fabric check withheld: hardware fault: the first job after a topology-mismatch lift failed",
+            "",
+        ),
+        ("gate/startup: fabric unverified (could not run)", "could not run (77)", "hardware fault: x"),
     ],
 )
-async def test_a_topology_mismatch_hold_is_outside_the_77_bound(
-    monkeypatch, tmp_path, clear_job_state, hold_detail, fabric_detail
+async def test_the_first_job_hardware_fault_is_outside_the_77_bound(
+    monkeypatch, tmp_path, clear_job_state, hold_detail, fabric_detail, flagged
 ):
-    """No reset or fallback release can fix cabling: past the bound it neither lifts nor climbs."""
+    """The first job after a topology lift proved the skipped links are needed: no release or rung
+    can fix cabling, so past the bound it neither lifts nor climbs."""
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", flagged)
     fsm_dirty(srv, hold_detail, why="fabric_unverified")
 
     async def verify(expected, log, run_fabric=True, **_):
@@ -760,6 +767,36 @@ async def test_a_topology_mismatch_hold_is_outside_the_77_bound(
     await srv._attempt_idle_relift()
     assert rungs == []
     assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "eth,released",
+    [((True, "all active-eth cores advancing"), True), ((None, "252 of 256 eth link(s) up"), False)],
+)
+async def test_a_topology_mismatch_whose_rerun_77s_takes_the_bounded_fallback(
+    monkeypatch, tmp_path, clear_job_state, eth, released
+):
+    """I45: a topology-mismatch 77 is no longer an open-ended hold. Past the bound the eth read
+    decides (against the re-baselined mark); a release is watched like a lift."""
+    rungs = _bound(monkeypatch, tmp_path, eth)
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", "")
+    monkeypatch.setattr(srv.health_monitor, "topology_lift_pending", False)
+    fsm_dirty(srv, "gate/startup: fabric unverified (could not run)", why="fabric_unverified")
+
+    async def verify(expected, log, run_fabric=True, **_):
+        detail = "fabric check COULD NOT RUN (19s): topology mismatch; traffic-only rerun: hugepages"
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": detail}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    await srv._attempt_idle_relift()
+    if released:
+        assert rungs == []
+        assert srv.fsm.state is ServerState.HEALTHY
+        assert srv.health_monitor.topology_lift_pending is True
+    else:
+        assert rungs == ["present"]
+        assert srv.fsm.state is ServerState.RECOVERING
 
 
 @pytest.mark.asyncio

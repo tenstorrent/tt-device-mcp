@@ -33,6 +33,14 @@ tt-device-mcp    # piped stdin -> stdio MCP adapter; tty -> CLI help
 
 **Never add interactive users to `ttdev`** — that re-opens bare-metal access.
 
+**Off-bus power cycle (spec 04 I27).** Setting `TT_DEVICE_MCP_POWER_CYCLE_CMD` lets the broker
+power-cycle the host when chips stay off the bus and every reset is refused. It stands back while
+an operator is recovering the host, which it asks `TT_DEVICE_MCP_MANUAL_RECOVERY_CMD`; unset, it
+uses `/opt/tt-device-broker/manual-recovery-check.sh` (staged from
+`deploy/tt-manual-recovery-check.sh` by `apply-host-config.sh`: it reads the sudo journal and
+auth.log). With neither, or a check that cannot read its sources, the cycle never fires and the
+broker pages instead. The broker runs as root, so it can read both.
+
 ## What is verified vs. what needs on-box validation
 
 Unit-tested (no hardware): the privsep gating + `systemd-run` argv construction
