@@ -9,7 +9,8 @@ the hold is bounded: once the episode has stood ``TT_DEVICE_MCP_OFFBUS_GATED_GRA
 ``TT_DEVICE_MCP_POWER_CYCLE_CMD`` — but only on a tenant-free box, with no operator recovery in
 progress and no stand-back marker or command active, and at most once per
 ``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC`` (default 6 h). Past that, or with the command
-unset, it pages instead and the hold stands as before.
+unset, it pages instead and the hold stands as before; a cycle blocked
+``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC`` (default 1800 s) past the grace pages too.
 
 Every phase goes to the fsync'd health journal, and each attempt is written to a small state file in
 the health dir before the command runs, so a broker killed mid-cycle (the cycle itself) still counts
@@ -36,6 +37,7 @@ GRACE_DEFAULT_SEC = 300
 MIN_INTERVAL_DEFAULT_SEC = 6 * 3600
 CHECK_TIMEOUT_DEFAULT_SEC = 10.0
 FIRE_TIMEOUT_DEFAULT_SEC = 120.0
+BLOCKED_PAGE_DEFAULT_SEC = 1800
 # Attempts kept in the state file: enough to read the rate limit, never a growing log.
 MAX_ATTEMPTS_KEPT = 8
 
@@ -191,7 +193,7 @@ def arm(episode: str) -> None:
     """The gate refused to reset this episode's off-bus hold: start tracking it (idempotent)."""
     if _pending.get("episode") != episode:
         _pending.clear()
-        _pending.update(episode=episode, ladder_ran=False, paged=set(), spawned=False)
+        _pending.update(episode=episode, ladder_ran=False, paged=set(), journaled=set(), spawned=False)
         health_event("offbus_gated_hold", phase="grace", held_since=episode, grace_sec=grace_sec())
 
 
@@ -221,16 +223,42 @@ def mark_spawned(episode: str) -> None:
         _pending["spawned"] = True
 
 
+def blocked_page_sec() -> int:
+    """Seconds past the grace a power cycle may stand blocked (a tenant, a reset in its own scope, a
+    stand-back) before the broker pages that the hold is not ending (default 1800)."""
+    return _int_env("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC", BLOCKED_PAGE_DEFAULT_SEC)
+
+
 def page_once(kind: str, log, message: str, **fields) -> None:
-    """Journal, log and alert ``kind`` once per episode (the journal line is the kill-safe record)."""
+    """Journal, log and alert ``kind`` once per episode (the journal line is the kill-safe record).
+    A page the alert hook drops (a previous run still in flight) is sent again on the next pass."""
+    journaled = _pending.setdefault("journaled", set())
     paged = _pending.setdefault("paged", set())
     if kind in paged:
         return
-    paged.add(kind)
-    log(message)
-    event = {"kind": kind, "message": message, "host_at_risk": True, **fields}
-    health_event(kind, message=message, host_at_risk=True, **fields)
-    alert.send_alert(event)
+    if kind not in journaled:
+        journaled.add(kind)
+        log(message)
+        health_event(kind, message=message, host_at_risk=True, severity="high", **fields)
+    event = {"kind": kind, "message": message, "host_at_risk": True, "severity": "high", **fields}
+    if alert.send_alert(event) is not None or alert.alert_argv() is None:
+        paged.add(kind)
+
+
+def page_if_blocked(episode: str, age: float, log, why: str, **fields) -> None:
+    """Hold for ``why`` past the grace; once it has blocked the power cycle for
+    :func:`blocked_page_sec` more, page once: the hold ends in a cycle or a page, never silence."""
+    limit = grace_sec() + blocked_page_sec()
+    if age >= limit:
+        page_once(
+            "offbus_power_cycle_blocked",
+            log,
+            f"off-bus hold {int(age)}s old: the power cycle has been blocked past {limit}s — {why}; "
+            f"the hold stands until that clears or an operator recovers the host",
+            held_since=episode,
+            why=why,
+            **fields,
+        )
 
 
 def fire_command(argv: list, reason: str, timeout: float = FIRE_TIMEOUT_DEFAULT_SEC) -> None:

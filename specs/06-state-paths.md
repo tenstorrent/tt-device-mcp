@@ -265,6 +265,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC` | 120 | Timeout for that command; past it its process group is killed and the attempt counts as failed | 04 |
 | `TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC` | 300 | How long a gated off-bus hold stands, from the episode start, before the I27 power cycle may run | 04 |
 | `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` | 21600 | At most one I27 attempt per this many seconds per host; within it the broker pages instead | 04 |
+| `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC` | 1800 | How long past the grace a tenant, a reset scope or a stand-back may block the I27 power cycle before the broker pages once | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE` | unset | `:`-separated marker paths; any that exists holds the I27 power cycle | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD` | unset | Command; exit 0 holds the I27 power cycle, 1 clears, anything else holds | 04 |
 | `TT_DEVICE_MCP_MANUAL_RECOVERY_CMD` | unset | Command; exit 0 means an operator is recovering the host, so the I27 power cycle holds; 1 clears, anything else holds | 04 |

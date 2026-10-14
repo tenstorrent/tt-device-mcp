@@ -8,6 +8,7 @@ rungs ran, idle and with nothing objecting, the broker runs the host's power-cyc
 interval — and otherwise holds or pages, never loops. ``fire_command`` is always a fake here; no test
 may run a real power-cycle command (conftest makes the real one a tripwire)."""
 
+import json
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -25,6 +26,7 @@ GATE_WHY = "3 chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold"
 OFF_BUS, EXPECTED = 3, 32
 # Taken at import, before conftest swaps in its tripwire; only ever called on stand-in scripts.
 _REAL_FIRE = opc.fire_command
+_REAL_GATE = pcie_guard.host_reset_gate
 
 
 def _gated(monkeypatch, tmp_path, *, held_sec=600, cmd="/usr/local/sbin/host-power-cycle --now"):
@@ -216,6 +218,81 @@ async def test_anything_objecting_stands_back(monkeypatch, tmp_path, clear_job_s
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", ["tenant", "scope", "standback"])
+async def test_a_blocked_power_cycle_pages_once_past_its_bound(monkeypatch, tmp_path, clear_job_state, blocker):
+    """Whatever keeps the cycle from firing, the hold does not stand silent: past the grace plus
+    the blocked-page bound it pages once, high severity, naming the blocker, and still never fires."""
+    hold_since, rec = _gated(monkeypatch, tmp_path, held_sec=300 + 1800 - 10)
+    if blocker == "tenant":
+        monkeypatch.setattr(
+            srv, "enumerate_device_holders", lambda: HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True)
+        )
+    elif blocker == "scope":
+        monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "tt-reset@1.scope")
+    else:
+        marker = tmp_path / "hold-off"
+        marker.touch()
+        monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE", str(marker))
+    _ladder_ran(hold_since)
+    assert await _pass(hold_since) is False
+    assert rec["alerts"] == [], "inside the bound it only holds"
+    later = (datetime.fromisoformat(hold_since) - timedelta(seconds=20)).isoformat()
+    srv.device_hold_episode_since = later
+    _ladder_ran(later)
+    for _ in range(3):
+        assert await _pass(later) is False
+    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_blocked"], "one page per episode"
+    page = rec["alerts"][0]
+    assert page["severity"] == "high" and page["host_at_risk"] is True and page["held_since"] == later
+    assert rec["fires"] == []
+
+
+def test_a_page_the_alert_hook_drops_is_sent_again(monkeypatch):
+    """A page dropped because the hook is busy is retried on the next pass; journaled only once."""
+    sent, events = [], []
+    monkeypatch.setattr(opc, "health_event", lambda kind, **f: events.append(kind))
+    monkeypatch.setattr(alert, "alert_argv", lambda: ["/bin/true"])
+    results = iter([None, object()])
+    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: sent.append(event) or next(results))
+    opc.arm("2026-10-13T19:29:00")
+    for _ in range(3):
+        opc.page_once("offbus_gated_hold_page", lambda m: None, "held")
+    assert len(sent) == 2 and events.count("offbus_gated_hold_page") == 1
+
+
+def test_the_blocked_page_bound_defaults_and_rejects_nonsense(monkeypatch):
+    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC", raising=False)
+    assert opc.blocked_page_sec() == 1800
+    for bad in ("0", "-1", "later"):
+        monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC", bad)
+        assert opc.blocked_page_sec() == 1800
+    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC", "600")
+    assert opc.blocked_page_sec() == 600
+
+
+@pytest.mark.asyncio
+async def test_a_latch_never_blocks_a_rung_after_its_boot_nor_the_power_cycle_on_it(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The I25 latch is scoped to its boot. After a later boot the real gate allows resets again and
+    the drop goes back to the ladder (no hold, no cycle); on the latched boot the gate refuses every
+    reset, and that refusal is exactly what the bounded power cycle answers."""
+    hold_since, rec = _gated(monkeypatch, tmp_path)
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", _REAL_GATE)
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
+    (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).write_text(
+        json.dumps({"boot_id": "boot-a", "latched_on_boot": "boot-b"})
+    )
+    _ladder_ran(hold_since)
+    monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-c")
+    assert await _pass(hold_since) is None
+    assert rec["fires"] == [] and rec["alerts"] == []
+    monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-b")
+    assert await _pass(hold_since) is True
+    assert len(rec["fires"]) == 1 and "--clear-hang-latch" in rec["fires"][0]["reason"]
+
+
+@pytest.mark.asyncio
 async def test_checks_that_say_no_let_it_fire(monkeypatch, tmp_path, clear_job_state):
     hold_since, rec = _gated(monkeypatch, tmp_path)
     monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE", str(tmp_path / "absent"))
@@ -396,9 +473,35 @@ def _journal(tmp_path, lines, rc=0):
 )
 def test_the_manual_recovery_check_template(tmp_path, monkeypatch, lines, rc):
     monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, lines))
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_AUTHLOG", str(tmp_path / "no-auth.log"))
     p = subprocess.run(["bash", _CHECK, "45"], capture_output=True, text=True)
     assert p.returncode == rc, p.stderr
     assert "_COMM=sudo" in (tmp_path / "argv").read_text() and "-45min" in (tmp_path / "argv").read_text()
+
+
+def _stamp(ago_min, iso=True):
+    t = datetime.now().astimezone() - timedelta(minutes=ago_min)
+    return t.isoformat() if iso else t.strftime("%b %d %H:%M:%S")
+
+
+@pytest.mark.parametrize(
+    "ago_min, iso, rc",
+    [(5, True, 0), (5, False, 0), (90, True, 1), (90, False, 1)],
+    ids=["rfc3339-recent", "syslog-recent", "rfc3339-old", "syslog-old"],
+)
+def test_the_manual_recovery_check_reads_auth_log_within_the_window(tmp_path, monkeypatch, ago_min, iso, rc):
+    """A sudo reboot only auth.log shows counts inside the window and not before it, in both of
+    auth.log's stamp styles; an unrelated sudo line never counts."""
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, []))
+    log = tmp_path / "auth.log"
+    log.write_text(
+        f"{_stamp(1, iso)} host sudo:   ops : TTY=pts/0 ; PWD=/ ; USER=root ; COMMAND=/usr/bin/ls\n"
+        f"{_stamp(ago_min, iso)} host sudo:   ops : TTY=pts/0 ; PWD=/ ; USER=root ; COMMAND=/usr/sbin/reboot\n"
+    )
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_AUTHLOG", str(log))
+    p = subprocess.run(["bash", _CHECK, "30"], capture_output=True, text=True)
+    assert p.returncode == rc, p.stderr
+    assert ("COMMAND=/usr/sbin/reboot" in p.stdout) == (rc == 0)
 
 
 def test_the_manual_recovery_check_cannot_answer_on_an_unreadable_journal(tmp_path, monkeypatch):

@@ -1774,7 +1774,8 @@ class GalaxyRecovery(Recovery):
         Returns None when it does not apply or hands back to the plain hold (the gate allows resets,
         the ladder's safe rungs have not run yet this episode, or the command is unset or
         rate-limited — those two page first), False while it holds (grace, a tenant, a reset in its
-        own scope, a stand-back), True once the power cycle was requested. Only the idle relift and
+        own scope, a stand-back; past the grace plus the blocked-page bound those page once), True
+        once the power cycle was requested. Only the idle relift and
         the hold watchdog reach it, never the between-jobs gate, so it adds no time between jobs."""
         if off_bus <= 0 or not hold_since:
             return None
@@ -1804,15 +1805,18 @@ class GalaxyRecovery(Recovery):
             return False
         if await asyncio.to_thread(self.mechanism.scope_active):
             log("off-bus hold past its grace but a reset is cycling in its own scope — holding")
+            offbus_power_cycle.page_if_blocked(hold_since, age, log, "a reset is cycling in its own scope", off_bus=off_bus)
             return False
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
         if self._tenant_active(scan):
             log("off-bus hold past its grace but a tenant holds the device or the scan is unreadable — holding")
+            offbus_power_cycle.page_if_blocked(hold_since, age, log, "a tenant holds the device or the holder scan is unreadable", off_bus=off_bus)
             return False
         standback = await asyncio.to_thread(offbus_power_cycle.standback_reason)
         if standback:
             log(f"off-bus hold past its grace: standing back from the power cycle — {standback}")
             offbus_power_cycle.note_standback(hold_since, standback)
+            offbus_power_cycle.page_if_blocked(hold_since, age, log, standback, off_bus=off_bus)
             return False
         state = offbus_power_cycle.load_state()
         now = offbus_power_cycle.now_epoch()
