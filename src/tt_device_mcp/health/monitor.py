@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from typing import Callable, Optional
 
-from tt_device_mcp import aio, metrics
+from tt_device_mcp import aio, alert, metrics
 from tt_device_mcp.constants import (
     ETH_POST_JOB_TIMEOUT_SEC,
     FABRIC_CHECK_CANNOT_CHECK_RC,
@@ -46,6 +46,59 @@ def _action_log_output(text: str) -> str:
         return text
     half = ACTION_LOG_OUTPUT_CHARS // 2
     return f"{text[:half]}\n[... {len(text) - 2 * half} chars cut ...]\n{text[-half:]}"
+
+
+ASIC_BUS_FILE = "fabric_ok_asic_bus.json"
+# The validator's tray id is the PCI bus's top two bits (its UBB_TRAY_BUS_IDS).
+_TRAY_BY_BUS_GROUP = {0x00: 1, 0x40: 2, 0xC0: 3, 0x80: 4}
+
+
+def _asic_bus_map() -> dict[str, int]:
+    """``{tt_asic_id: PCI bus}`` for every chip sysfs names both for. A file read per chip."""
+    out: dict[str, int] = {}
+    for rec in pci.chip_snapshot().values():
+        bus = pci.pci_bus_number(rec.get("pci", ""))
+        if rec.get("tt_asic_id") is not None and bus is not None:
+            out[str(rec["tt_asic_id"])] = bus
+    return out
+
+
+def _save_asic_bus_map() -> None:
+    """Remember which bus each chip sat on at the last clean fabric pass; kept across reboots so a
+    later mismatch can name the trays that moved."""
+    m = _asic_bus_map()
+    if not m:
+        return
+    try:
+        p = health_dir() / ASIC_BUS_FILE
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(m))
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def _load_asic_bus_map() -> dict[str, int]:
+    try:
+        data = json.loads((health_dir() / ASIC_BUS_FILE).read_text())
+        return {str(k): int(v) for k, v in data.items()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _tray_name(bus: int) -> str:
+    tray = _TRAY_BY_BUS_GROUP.get(bus & 0xC0)
+    return f"tray {tray}" if tray else f"bus 0x{bus:02x}"
+
+
+def moved_trays(before: dict[str, int], now: dict[str, int]) -> list[str]:
+    """``['tray 1 -> tray 3 (8 chips)', ...]``: the chips whose tray changed since ``before``."""
+    moves: dict[tuple[str, str], int] = {}
+    for asic, bus in now.items():
+        if asic in before and _tray_name(before[asic]) != _tray_name(bus):
+            k = (_tray_name(before[asic]), _tray_name(bus))
+            moves[k] = moves.get(k, 0) + 1
+    return [f"{a} -> {b} ({n} chips)" for (a, b), n in sorted(moves.items())]
 
 
 def _override_reason(text: str) -> str:
@@ -146,6 +199,15 @@ class HealthMonitor:
         # A skip (None) never overwrites it: not knowing is not the same as knowing it is fit.
         self.last_fabric_ok: Optional[bool] = None
         self.last_fabric_output: str = ""
+        # A topology mismatch (the discovered links are not the descriptor's) passed on a
+        # traffic-only rerun: the first job after it is watched, because the links that pass
+        # skipped are the ones a mesh-wide workload routes over (see note_job_after_topology_lift).
+        self.topology_lift_pending: bool = False
+        # Set once that first job failed on the fabric: a hardware fault no reset can fix. Every
+        # later fabric check is withheld (a 77-only hold: never reset, never escalated, no loop)
+        # until an operator restarts the broker.
+        self.topology_hw_fault: str = ""
+        self._topology_alerted: set[str] = set()
         # The in-flight fabric traffic pass. It maps every chip's BARs, so when a chip leaves the
         # bus it is the likeliest thing still reading a dead address — and `pci remove` does not
         # revoke its mapping. Tracked so a dead chip can kill it (see server._kill_device_holders).
@@ -662,6 +724,8 @@ class HealthMonitor:
         return ok, detail
 
     async def _verify_fabric_health_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
+        if self.topology_hw_fault:
+            return None, f"fabric check withheld: {self.topology_hw_fault}"
         override = self._fabric_check_cmd()
         built = fabric.build_command()
         if built is None:
@@ -711,6 +775,12 @@ class HealthMonitor:
             reason = _override_reason(text)
         else:
             ok, reason = fabric.classify(rc, text)
+            desc = fabric._validator_paths()[2]
+            if ok is None and desc and fabric.is_topology_mismatch(text):
+                rc, text, ok, reason = await self._fabric_traffic_only_rerun(
+                    desc, text, timeout_sec=timeout_sec, track=_track, cwd=cwd
+                )
+                self.last_fabric_output = text
         # Derived from ok, not rc: on the built-in path a measured-bad verdict can exit 77 (the
         # collision guard classify() applies), and a did-not-measure run can exit some other
         # code entirely — status must agree with the verdict actually being returned below, not
@@ -726,6 +796,12 @@ class HealthMonitor:
 
         if ok is True:
             self.last_fabric_ok = True
+            marker = fabric.find_topology_marker(text)
+            if marker:
+                self._on_topology_mismatch(marker)
+                return True, f"fabric links healthy on discovered links ({dt:.0f}s); {marker}"
+            self.topology_lift_pending = False
+            _save_asic_bus_map()
             return True, f"fabric links healthy ({dt:.0f}s)"
         if ok is None:
             # The check could not run — it learned nothing about the fabric, so resetting
@@ -740,6 +816,79 @@ class HealthMonitor:
         if rc is None:
             return False, f"fabric check timed out after {timeout_sec:.0f}s; last line: {last}"
         return False, f"fabric check exited {rc} ({dt:.0f}s): {reason[:400]}"
+
+    async def _fabric_traffic_only_rerun(
+        self, desc: str, first: str, *, timeout_sec: float, track, cwd: Optional[str]
+    ) -> tuple[Optional[int], str, Optional[bool], str]:
+        """The validator stopped on its descriptor comparison: rerun it once without the descriptor
+        so traffic still crosses every link it discovered. Same verdict table as the first run; a
+        pass carries the mismatch marker onto its OK, anything not measured stays a topology skip."""
+        missing, extra = fabric.topology_counts(first)
+        marker = fabric.topology_marker(desc, missing, extra)
+        log = self._logger()
+        if log:
+            log.warning(f"fabric-check: {marker}; rerunning without the descriptor")
+        rebuilt = fabric.build_command(descriptor=False)
+        if rebuilt is None:
+            return None, first, None, f"{fabric.TOPOLOGY_MISMATCH}; traffic-only rerun unavailable"
+        try:
+            rc, text = await fabric.check(
+                rebuilt[0],
+                rebuilt[1],
+                timeout_sec=timeout_sec,
+                track=track,
+                terminate=self._terminate_process_group,
+                cwd=cwd,
+            )
+        except Exception as e:  # noqa: BLE001 - never raise into the gate
+            return None, first, None, f"{fabric.TOPOLOGY_MISMATCH}; traffic-only rerun not runnable: {e}"
+        ok, reason = fabric.classify(rc, text)
+        combined = f"{first}\n{marker}\n{text}"
+        if ok is True:
+            return rc, f"{combined}\n{marker}", True, "fabric healthy on discovered links; " + marker
+        if ok is None:
+            reason = f"{fabric.TOPOLOGY_MISMATCH}; traffic-only rerun: {reason}"
+        return rc, combined, ok, reason
+
+    def _on_topology_mismatch(self, marker: str) -> None:
+        """An OK verdict that carries a topology mismatch: journal it, name the trays that moved
+        since the last clean pass, page the operator once per distinct mismatch, and watch the
+        next job (the lift is bounded by that one job, see note_job_after_topology_lift)."""
+        moved = moved_trays(_load_asic_bus_map(), _asic_bus_map())
+        health_event("fabric_topology_mismatch", marker=marker, moved_trays=moved)
+        self.topology_lift_pending = True
+        log = self._logger()
+        if log:
+            log.warning(f"FABRIC TOPOLOGY MISMATCH: {marker}" + (f"; moved: {', '.join(moved)}" if moved else ""))
+        key = marker + "|" + ",".join(moved)
+        if key not in self._topology_alerted:
+            self._topology_alerted.add(key)
+            alert.send_alert(
+                {"kind": "fabric_topology_mismatch", "detail": marker, "moved_trays": moved},
+                log,
+            )
+
+    def note_job_after_topology_lift(self, failed: bool, log_tail: Optional[str]) -> Optional[str]:
+        """Called once per finished job. Only the first job after a topology-mismatch lift
+        counts: if it failed on the fabric, the skipped links are a hardware fault, so the
+        fabric check is withheld from now on (the hold this makes is 77-only: never a reset, a
+        reboot or a power cycle) and the operator is paged. Returns the hold reason, or None."""
+        if not self.topology_lift_pending:
+            return None
+        self.topology_lift_pending = False
+        sig = fabric.job_fabric_error(log_tail or "") if failed else None
+        if not sig:
+            return None
+        self.topology_hw_fault = (
+            f"hardware fault: the first job after a topology-mismatch lift failed on the fabric ({sig}); "
+            "needs an operator (cabling) and a broker restart"
+        )
+        health_event("fabric_topology_hw_fault", detail=self.topology_hw_fault)
+        log = self._logger()
+        if log:
+            log.error(f"FABRIC {self.topology_hw_fault}")
+        alert.send_alert({"kind": "fabric_topology_hw_fault", "detail": self.topology_hw_fault}, log)
+        return self.topology_hw_fault
 
     async def verify_eth_heartbeat(self, timeout_sec: float = 60.0) -> tuple[Optional[bool], str]:
         """Read the active-ethernet-core firmware heartbeats — a passive check that never pushes

@@ -40,11 +40,13 @@ from tt_device_mcp.health.recovery import (
     WAIT,
     Evidence,
     Recovery,
+    offbus_power_cycle,
     pcie_guard,
 )
 from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
+from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
 from tt_device_mcp.health.recovery.stages.ubb_tray import _fire_ubb_reset, _ubb_reset_argv
 
 _logger = logging.getLogger("tt-device-mcp")
@@ -1579,7 +1581,7 @@ class GalaxyRecovery(Recovery):
         finally:
             pcie_guard.end_offbus_reset()
         if healthy and fabric_77_unverified and expected > 1 and self._fabric_ran_but_unverified(evidence):
-            # The caller is past an UNKNOWN reset whose I41 fallback refused (spec 04 I27): a 77 here is
+            # The caller is past an UNKNOWN reset whose I40 fallback refused (spec 04 I28): a 77 here is
             # the same no-verdict the reset already got, never a recovered fabric.
             log("the sweep's verify is still a fabric 77 — the fabric stays unverified, not recovered")
             health_event("host_rung_sweep_unverified", context=context or gate_phase, evidence=evidence)
@@ -1779,17 +1781,17 @@ class GalaxyRecovery(Recovery):
         off_bus_before = len(dead_chips(beats_before)) + max(0, expected - len(beats_before))
         if hold_since and self.mechanism.unverified_reset_since == hold_since:
             # This episode's reset already came back UNKNOWN (enum+ARC healthy, the fabric a persistent
-            # 77) and the I41 fallback still refused, so it escalated again. Another identical reset
+            # 77) and the I40 fallback still refused, so it escalated again. Another identical reset
             # measures nothing new — one Galaxy host ran eight of them, ten minutes apart, before the sweep
-            # finally ran. Go straight to the last-chance sweep, then the host climb (spec 04 I27).
+            # finally ran. Go straight to the last-chance sweep, then the host climb (spec 04 I28).
             await self._sweep_after_unverified_reset(expected, off_bus_before, hold_since, log)
             return True
         recovered = await self._reset_and_verify_device(indices, log)
         if recovered is None:
             # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, and its
-            # passes already count toward the relift's bound (spec 03 I41), so the next relift gates on
+            # passes already count toward the relift's bound (spec 03 I40), so the next relift gates on
             # the startup checks at once. A refused fallback that escalates again on this episode goes to
-            # the sweep, not another reset (spec 04 I27). Nothing measured a failure to climb on.
+            # the sweep, not another reset (spec 04 I28). Nothing measured a failure to climb on.
             return True
         if recovered:
             self.deps.clear_device_reported_fault("idle escalation: galaxy reset recovered the mesh")
@@ -1801,6 +1803,109 @@ class GalaxyRecovery(Recovery):
         # the host rungs (journaled) and the grace cadence retries the reset; at the ceiling the
         # climb hands the mesh to the gate's host rung.
         await self._climb_to_host_recovery_after_failed_reset(expected, off_bus_before, log)
+        return True
+
+    async def _offbus_gated_power_cycle(self, off_bus: int, expected: int, hold_since: str, log) -> Optional[bool]:
+        """The bounded end of an off-bus hold the host reset gate refuses to reset (spec 04 I27).
+
+        Returns None when it does not apply or hands back to the plain hold (the gate allows resets,
+        the ladder's safe rungs have not run yet this episode, or the command is unset or
+        rate-limited — those two page first), False while it holds (grace, a tenant, a reset in its
+        own scope, a stand-back; past the grace plus the blocked-page bound those page once), True
+        once the power cycle was requested. Only the idle relift and
+        the hold watchdog reach it, never the between-jobs gate, so it adds no time between jobs."""
+        if off_bus <= 0 or not hold_since:
+            return None
+        allowed, why = pcie_guard.host_reset_gate(off_bus)
+        if allowed:
+            return None
+        offbus_power_cycle.arm(hold_since)
+        if not offbus_power_cycle.ladder_ran(hold_since):
+            return None  # the safe rungs run once first; none is skipped before a power cycle
+        argv = offbus_power_cycle.power_cycle_argv()
+        if argv is None:
+            offbus_power_cycle.page_once(
+                "offbus_gated_hold_page",
+                log,
+                f"{off_bus}/{expected} chip(s) off the bus and every reset is refused ({why}); "
+                f"TT_DEVICE_MCP_POWER_CYCLE_CMD is not set, so the hold stands until an operator "
+                f"power-cycles the host",
+                held_since=hold_since,
+                off_bus=off_bus,
+                expected=expected,
+            )
+            return None
+        age = offbus_power_cycle.episode_age_sec(hold_since) or 0.0
+        grace = offbus_power_cycle.grace_sec()
+        if age < grace:
+            log(f"off-bus hold with every reset refused ({why}): {int(age)}/{grace}s of grace before the power cycle")
+            return False
+        if await asyncio.to_thread(self.mechanism.scope_active):
+            log("off-bus hold past its grace but a reset is cycling in its own scope — holding")
+            offbus_power_cycle.page_if_blocked(
+                hold_since, age, log, "a reset is cycling in its own scope", off_bus=off_bus
+            )
+            return False
+        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
+        if self._tenant_active(scan):
+            log("off-bus hold past its grace but a tenant holds the device or the scan is unreadable — holding")
+            offbus_power_cycle.page_if_blocked(
+                hold_since, age, log, "a tenant holds the device or the holder scan is unreadable", off_bus=off_bus
+            )
+            return False
+        standback = await asyncio.to_thread(offbus_power_cycle.standback_reason)
+        if standback:
+            log(f"off-bus hold past its grace: standing back from the power cycle — {standback}")
+            offbus_power_cycle.note_standback(hold_since, standback)
+            offbus_power_cycle.page_if_blocked(hold_since, age, log, standback, off_bus=off_bus)
+            return False
+        state = offbus_power_cycle.load_state()
+        now = offbus_power_cycle.now_epoch()
+        interval = offbus_power_cycle.min_interval_sec()
+        last = offbus_power_cycle.last_attempt_within(state, now, interval)
+        if last is not None:
+            offbus_power_cycle.page_once(
+                "offbus_power_cycle_rate_limited",
+                log,
+                f"{off_bus}/{expected} chip(s) still off the bus {int(age)}s into the hold; this host's "
+                f"power cycle already ran {int(now - last)}s ago (limit one per {interval}s) — paging "
+                f"instead; the hold stands",
+                held_since=hold_since,
+                off_bus=off_bus,
+                last_attempt_epoch=last,
+                last_error=state.get("last_error", ""),
+            )
+            return None
+        allowed, deny = self.mechanism.auto_recovery_allowed("power-cycle", tenant_active=False)
+        if not allowed:
+            offbus_power_cycle.page_once(
+                "offbus_power_cycle_denied",
+                log,
+                f"off-bus hold past its grace but the power cycle is denied: {deny} — paging instead",
+                held_since=hold_since,
+                off_bus=off_bus,
+            )
+            return None
+        reason = f"{off_bus}/{expected} chip(s) off the bus for {int(age)}s with every reset refused ({why})"
+        # On disk before anything runs: a cycle that takes the broker down with it still counts
+        # against the rate limit on the boot that comes back.
+        try:
+            offbus_power_cycle.record_attempt(state, now, hold_since, reason)
+        except OSError as exc:
+            log(f"off-bus power cycle NOT fired: could not record the attempt ({exc!r}); holding")
+            health_event("offbus_gated_hold", phase="record_failed", held_since=hold_since, error=repr(exc))
+            return False
+        health_event("offbus_gated_hold", phase="firing", held_since=hold_since, off_bus=off_bus, reason=reason)
+        await self.mechanism._fire_recovery_escalation(
+            "power-cycle",
+            row_owner="[broker]power-cycle-request",
+            label="off-bus power cycle",
+            detail="chips off the bus and every reset refused past the grace",
+            fire=lambda: offbus_power_cycle.fire_and_record(argv, reason, state),
+            log=log,
+            reason=reason,
+            pre_fire=run_pre_power_cycle_hook,
+        )
         return True
 
     async def _escalate_offbus_stuck_hold(self, indices: list, expected: int, log, *, force: bool = False) -> bool:
@@ -1850,6 +1955,11 @@ class GalaxyRecovery(Recovery):
         hold_since = self.deps.device_hold_episode_since()
         if not force and not _offbus_stuck_hold_due(hold_since, off_bus=off_bus):
             return False
+        # Before the once-per-episode latch: a gated hold must reach its bounded end (I27) on the
+        # first pass past its grace, not wait out the latch's re-arm.
+        gated = await self._offbus_gated_power_cycle(off_bus, expected, hold_since, log)
+        if gated is not None:
+            return gated
         if not force and self.deps.hold_escalation_latched():
             log(
                 f"off-bus hold past the ceiling but this episode already climbed once — holding for up to "
@@ -1892,6 +2002,7 @@ class GalaxyRecovery(Recovery):
         # window. This episode's one attempt is spent; the latch clears only when the device comes back
         # fit (the release transition clears the episode clock and this latch together).
         self.deps.set_device_hold_episode_escalated(True)
+        offbus_power_cycle.note_ladder_ran(hold_since)
         isolated_chips = self.deps.isolated_chips()
         device_pci_map = self.deps.device_pci_map()
         # A chip GONE from the bus entirely — absent from sysfs, not reading all-ones — never entered
@@ -2016,7 +2127,7 @@ class GalaxyRecovery(Recovery):
         recovered = await self._reset_and_verify_device(indices, log)
         if recovered is None:
             # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, which the
-            # idle relift re-checks within its bound (spec 03 I41). Nothing measured a failure to climb on.
+            # idle relift re-checks within its bound (spec 03 I40). Nothing measured a failure to climb on.
             return True
         if recovered:
             self.deps.clear_device_reported_fault("idle off-bus escalation: galaxy reset recovered the mesh")
@@ -2030,8 +2141,8 @@ class GalaxyRecovery(Recovery):
         return True
 
     async def _sweep_after_unverified_reset(self, expected: int, off_bus_before: int, hold_since: str, log) -> None:
-        """The next rung for a present-mesh episode whose reset came back UNKNOWN and whose I41 fallback
-        refused: the last-chance sweep once per episode, then the host climb (spec 04 I27).
+        """The next rung for a present-mesh episode whose reset came back UNKNOWN and whose I40 fallback
+        refused: the last-chance sweep once per episode, then the host climb (spec 04 I28).
 
         The sweep runs here, not behind the host-rung permission: the climb asks the reboot ledger
         first, and on one Galaxy host its boot-loop guard kept the sweep waiting an hour. A sweep whose verify

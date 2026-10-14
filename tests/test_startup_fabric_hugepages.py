@@ -681,7 +681,7 @@ def test_an_owed_pass_does_not_carry_to_another_episode(monkeypatch, tmp_path, c
     assert srv._idle_relift_armed() == (False, False, False)
 
 
-# --- I41: a 77-only hold is bounded, then the startup checks are the gate -----------------------
+# --- I40: a 77-only hold is bounded, then the startup checks are the gate -----------------------
 
 
 def _bound(monkeypatch, tmp_path, eth):
@@ -744,7 +744,7 @@ async def test_a_second_77_only_hold_inside_the_window_climbs_the_ladder(monkeyp
             "job 7: hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)",
             "could not run (77)",
         ),
-        # The validator's own line, still reaching the broker as a plain 77 (spec 04 I28).
+        # The validator's own line, still reaching the broker as a plain 77 (spec 04 I29).
         ("gate/startup: fabric unverified (could not run)", "COULD NOT RUN: what():  Connection mismatch detected."),
     ],
 )
@@ -769,8 +769,8 @@ async def test_a_topology_mismatch_hold_is_outside_the_77_bound(
 async def test_after_an_unknown_reset_the_next_relift_77_reaches_the_bound(
     monkeypatch, tmp_path, clear_job_state, reset_passes, lifted
 ):
-    """Spec 04 I27: a reset whose post-reset fabric stayed a 77 (one pass and one retry) counts those
-    passes toward the episode's I41 bound, so the next relift's 77 falls back at once and releases on a
+    """Spec 04 I28: a reset whose post-reset fabric stayed a 77 (one pass and one retry) counts those
+    passes toward the episode's I40 bound, so the next relift's 77 falls back at once and releases on a
     healthy eth read. Without them, the same relift is still under the default bound and just holds."""
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
     monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)

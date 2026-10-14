@@ -131,6 +131,7 @@ from tt_device_mcp.health import (
     heartbeat_verdict,
     isolate_chip,
     mark_boot,
+    offbus_power_cycle,
     pcie_guard_at_start,
     previous_boot_bus_locks,
     previous_boot_error,
@@ -1973,6 +1974,7 @@ def _reset_for_testing():
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant
+    global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic
     job_queue = None
     lock = None
     _action_row = None
@@ -1982,6 +1984,9 @@ def _reset_for_testing():
     device_hold_episode_reason = ""
     _hold_episode_restorable = True
     _hold_episode_tenant = False
+    _fabric_77_streak_since = None
+    _fabric_77_streak = 0
+    _fabric_77_fallback_release_monotonic = 0.0
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
@@ -3240,7 +3245,7 @@ def _idle_relift_armed() -> tuple[bool, bool, bool]:
     )
 
 
-# I41 — the bound on a 77-only hold. Each idle-relift pass that 77s again on the same episode adds
+# I40 — the bound on a 77-only hold. Each idle-relift pass that 77s again on the same episode adds
 # one to the streak; once it reaches FABRIC_77_MAX_RETRIES, or the episode is FABRIC_77_BOUND_SEC old
 # with at least one retry behind it, the fabric pass stops being the gate (see _fabric_77_fallback).
 _fabric_77_streak_since: Optional[str] = None
@@ -3260,7 +3265,7 @@ def _env_int(name: str, default: int, floor: int) -> int:
 
 # A topology-mismatch skip, and the hardware fault the first job after its lift names, are holds no
 # fallback release may lift: the cabling is not what the descriptor says, and enum+ARC and the eth
-# read cannot see that. They stay outside the I41 budget and release.
+# read cannot see that. They stay outside the I40 budget and release.
 _TOPOLOGY_HOLD_PREFIX = "topology mismatch"
 _TOPOLOGY_HW_FAULT = "hardware fault: the first job after a topology-mismatch lift"
 # The validator's own line for it, which reaches the broker as a 77 ("COULD NOT RUN") wherever the
@@ -3278,7 +3283,7 @@ def _topology_mismatch_hold(evidence: dict) -> bool:
 
 
 def _fabric_no_reset_hold() -> str:
-    """Why the open hold is one no reset can end, or "" (spec 04 I28).
+    """Why the open hold is one no reset can end, or "" (spec 04 I29).
 
     A topology mismatch (the hold, its reason, or a fabric-unverified hold whose last pass printed the
     validator's mismatch line) is cabling that differs from the descriptor; a fabric pass that could
@@ -3300,7 +3305,7 @@ _fabric_no_reset_paged_since: Optional[str] = None
 
 
 def _fabric_77_bound_reached() -> bool:
-    """Count this 77 against the open episode and say whether the I41 bound is reached."""
+    """Count this 77 against the open episode and say whether the I40 bound is reached."""
     global _fabric_77_streak_since, _fabric_77_streak
     if _fabric_77_streak_since != fsm.record.since:
         _fabric_77_streak_since, _fabric_77_streak = fsm.record.since, 0
@@ -3315,7 +3320,7 @@ def _fabric_77_bound_reached() -> bool:
 
 
 def _note_fabric_77_reset_passes(passes: int) -> None:
-    """Count a reset's post-reset 77 passes toward the open episode's I41 bound: they ran on freshly
+    """Count a reset's post-reset 77 passes toward the open episode's I40 bound: they ran on freshly
     retrained links, so the next relift's 77 falls back at once rather than re-running them."""
     global _fabric_77_streak_since, _fabric_77_streak
     if _fabric_77_streak_since != fsm.record.since:
@@ -3360,7 +3365,9 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
             "WITH A WARNING: the fabric is unverified, the next gate re-runs the pass"
         )
         health_event("device_relift_fabric_unverified", evidence=evidence, retries=_fabric_77_streak)
-        _clear_device_dirty(verified=True, why="idle relift: fabric check unrunnable past its bound; startup checks pass")
+        _clear_device_dirty(
+            verified=True, why="idle relift: fabric check unrunnable past its bound; startup checks pass"
+        )
         return True
     log(
         "startup checks do not clear it ("
@@ -3521,7 +3528,7 @@ async def _attempt_idle_relift() -> None:
                     and not _topology_mismatch_hold(evidence)
                     and _fabric_77_bound_reached()
                 ):
-                    # I41: a pass that cannot run is retried a bounded number of times, never
+                    # I40: a pass that cannot run is retried a bounded number of times, never
                     # forever. Past the bound the startup checks become the gate.
                     if await _fabric_77_fallback(evidence, _log, _escalate):
                         return
@@ -5270,7 +5277,7 @@ async def _force_escalate_stuck_hold() -> None:
         if no_reset:
             # Every chip enumerates with a live ARC heartbeat and the hold names only the fabric: a 77
             # or a cabling mismatch. A galaxy reset cannot fix either, and on one Galaxy host it took a
-            # chip off the bus and the ladder then re-powered its tray. Hold, page once (spec 04 I28).
+            # chip off the bus and the ladder then re-powered its tray. Hold, page once (spec 04 I29).
             _hold_without_reset(no_reset, expected, log)
             return
         health_event(
@@ -5398,6 +5405,12 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # A hold whose only cause is a fabric pass that could not run (a 77) is never forced: a reset
     # cannot give a pass its missing prerequisite, and the idle relift re-runs the pass instead.
     only_77 = _fabric_77_only_hold()
+    # A gated off-bus hold (spec 04 I27) gets one forced pass the moment its grace runs out, so the
+    # bounded power cycle fires at the grace and not at the next ceiling window.
+    if not only_77 and offbus_power_cycle.due_for_watchdog(device_hold_episode_since, now):
+        device_hold_escalation_trigger = f"the {offbus_power_cycle.grace_sec()}s gated off-bus grace"
+        if _maybe_spawn_forced_escalation():
+            offbus_power_cycle.mark_spawned(device_hold_episode_since)
     if only_77:
         pass
     elif isolated_chips and not device_hold_offbus_escalated and age >= _offbus_hold_ceiling_sec():
@@ -7746,6 +7759,14 @@ export {JOB_TAG_ENV}={job_tag}
                 # Scanning only the benign exits threw the specific evidence away on exactly
                 # the jobs that died of it, leaving a generic "ended failed" the gate then
                 # cleared on the word of checks that cannot see this fault at all.
+                # The first job after a topology-mismatch lift is the bound on that lift: one that
+                # dies on the fabric makes it a hardware fault, held without a reset (03 I42).
+                if health_monitor is not None:
+                    topo = health_monitor.note_job_after_topology_lift(
+                        job.status != JobStatus.COMPLETED, _read_job_log_tail(job_log_file)
+                    )
+                    if topo:
+                        _hold_device_fabric_unverified(f"job {job_id}: {topo}")
                 fault = _scan_output_for_device_fault(job_log_file)
                 if fault:
                     _mark_device_reported_fault(f"job {job_id} {fault}", job=job)

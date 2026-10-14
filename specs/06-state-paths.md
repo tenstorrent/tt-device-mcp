@@ -112,7 +112,9 @@ and job exit statuses never hit disk.
 | FSM state file | `/var/lib/tt-device-broker/health/fsm.json` | `<state>/health/fsm.json` | follows the health dir |
 | Health journal (events, telemetry trace, buslock, chip and eth-link baselines, incidents/, the idle-time probe's `health_probe_state.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
 | Off-bus reset intent and host-hang latch (`offbus_reset_intent.json`, `offbus_reset_hold.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
+| Gated off-bus power-cycle attempts (`offbus_power_cycle.json`, spec 04 I27) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Remembered Tenstorrent root ports and chip archs (`tt_pci_topology.json`, spec 04 I23) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
+| Chip-to-PCI-bus map at the last clean fabric pass (`fabric_ok_asic_bus.json`, spec 03 I42) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Server log + job logs | `/var/log/tt-device-broker/` (the unit passes `--log-dir`; the bare server defaults to CWD) | `<state>/` | `--log-dir` |
 | Stats | `<log-dir>/stats/` → `/var/log/tt-device-broker/stats/` | `<state>/stats/` | follows `--log-dir` |
 | Metrics textfile | `/var/lib/prometheus/node-exporter/tt_device_mcp.prom` | `<state>/metrics/tt_device_mcp.prom` | `TT_DEVICE_MCP_TEXTFILE_DIR` |
@@ -225,9 +227,9 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_SELFHEAL_RELIFT` | 1 | Idle relift of a self-healed hold | 03 |
 | `TT_DEVICE_MCP_SELFHEAL_RELIFT_SEC` | 120 | Idle relift cadence | 03 |
 | `TT_DEVICE_MCP_FABRIC_RELIFT` | 0 | Opt-in relift of fabric-unverified holds | 03 |
-| `TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES` | 3 | Idle-relift 77 retries on one 77-only hold before the startup checks gate it (I41) | 03 |
-| `TT_DEVICE_MCP_FABRIC_77_BOUND_SEC` | 600 | Age of a 77-only hold (at least one retry behind it) past which the startup checks gate it (I41) | 03 |
-| `TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC` | 21600 | At most one I41 fallback release per window; a second 77-only hold inside it climbs the ladder | 03 |
+| `TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES` | 3 | Idle-relift 77 retries on one 77-only hold before the startup checks gate it (I40) | 03 |
+| `TT_DEVICE_MCP_FABRIC_77_BOUND_SEC` | 600 | Age of a 77-only hold (at least one retry behind it) past which the startup checks gate it (I40) | 03 |
+| `TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC` | 21600 | At most one I40 fallback release per window; a second 77-only hold inside it climbs the ladder | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD` | 1 | Hold tenant jobs at the door while degraded (vs fail-fast) | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD_POLL_SEC` | 60 | Held-job re-check cadence | 03 |
 | `TT_DEVICE_MCP_TENANT_UIDS` | unset | Comma-separated uids or user names below 1000 whose device holders count as tenants. Root is ignored; a name that does not resolve is retried on the next scan | 04 |
@@ -263,6 +265,14 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_PDB_CPLD_REGS` | unset | Site data: the PDB CPLD registers to read, `0xNN,...` (single-register reads); unset = PDB reads skipped | 04 |
 | `TT_DEVICE_MCP_HOST_RESET_GATE` | off | `off`, `guard` (mask AER around automatic resets, refuse during an AER flood) or `hold` (also refuse while a chip is off the bus) | 04 |
 | `TT_DEVICE_MCP_OFFBUS_HANG_LATCH` | 1 | `0` turns off the off-bus reset intent and the host-hang latch (spec 04 I25) | 04 |
+| `TT_DEVICE_MCP_POWER_CYCLE_CMD` | unset (off) | The host's own power-cycle command, run to end an off-bus hold the reset gate refuses (spec 04 I27); unset = page and hold | 04 |
+| `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC` | 120 | Timeout for that command; past it its process group is killed and the attempt counts as failed | 04 |
+| `TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC` | 300 | How long a gated off-bus hold stands, from the episode start, before the I27 power cycle may run | 04 |
+| `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` | 21600 | At most one I27 attempt per this many seconds per host; within it the broker pages instead | 04 |
+| `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC` | 1800 | How long past the grace a tenant, a reset scope or a stand-back may block the I27 power cycle before the broker pages once | 04 |
+| `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE` | unset | `:`-separated marker paths; any that exists holds the I27 power cycle | 04 |
+| `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD` | unset | Command; exit 0 holds the I27 power cycle, 1 clears, anything else holds | 04 |
+| `TT_DEVICE_MCP_MANUAL_RECOVERY_CMD` | unset | Command; exit 0 means an operator is recovering the host, so the I27 power cycle holds; 1 clears, anything else holds | 04 |
 | `TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN` | unset | `1`: log the per-tray re-power plan and refuse it | 04 |
 | `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` | 10 | How long a tray re-power waits for holders of the tray's chips | 04 |
 | `TT_DEVICE_MCP_AER_QUIET_CHECK_SEC` | 2 | How long a root port must stay error-free before its AER settings are restored | 04 |

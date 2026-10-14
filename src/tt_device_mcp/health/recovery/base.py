@@ -152,7 +152,7 @@ class RecoveryMechanism:
         self.last_reset_failed: bool = False
         # The hold episode (its ``since``) whose reset already came back UNKNOWN — enum+ARC healthy, the
         # fabric a persistent 77. A second identical reset on that episode measures nothing new, so the
-        # idle escalation goes to the last-chance sweep instead (spec 04 I27).
+        # idle escalation goes to the last-chance sweep instead (spec 04 I28).
         self.unverified_reset_since: Optional[str] = None
         # The episode whose last-chance sweep that path already ran; the next escalation climbs.
         self.unverified_sweep_since: Optional[str] = None
