@@ -45,7 +45,7 @@ BROKER_UNIT = "tt-device-broker.service"
 # The broker's own poller list and default (server.DEVICE_POLLER_SERVICES): the units it quiesces
 # around a reset are the ones this probe re-arms. Kept equal to server.DEFAULT_POLLER_SERVICES (a test
 # checks it) rather than imported, so the probe does not load the broker module every lap.
-DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service,tt-fmax-cap.service"
+DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service"
 # The broker's restart-inhibit file (server.device_op_inhibit): present while a device op runs.
 DEFAULT_DEVICE_OP_LOCK = "/run/tt-device-broker/device-op.lock"
 # The broker's advisory flock (spec 06 I8, server.device_op_flock), held for every device op; a

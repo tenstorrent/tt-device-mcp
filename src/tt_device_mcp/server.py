@@ -1365,11 +1365,12 @@ device_pci_map: dict = {}
 
 # Daemons that continuously poll every chip. They are stopped for the duration of
 # a reset: MMIO aimed at a chip that is mid-reset (or already dead) is what pushes
-# the root complex into the fatal error path that reboots the host. tt-fmax-cap.service writes the
-# clock cap to every chip, so a reset or fabric op racing it is the same hazard; it is in the default
-# list on every host. A unit a host does not have answers `systemctl` non-zero and is skipped, so
-# naming it costs nothing there.
-DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service,tt-fmax-cap.service"
+# the root complex into the fatal error path that reboots the host. A host
+# running another unit that reads or writes the chips (a clock-cap keeper, say) names it in
+# TT_DEVICE_MCP_POLLER_SERVICES. The default lists no clock-cap keeper: a reset restarts every unit
+# it lists, which would bring back a keeper the host masked. A unit a host does not have answers
+# `systemctl` non-zero and is skipped.
+DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service"
 DEVICE_POLLER_SERVICES = tuple(
     s for s in os.environ.get("TT_DEVICE_MCP_POLLER_SERVICES", DEFAULT_POLLER_SERVICES).split(",") if s.strip()
 )
@@ -10460,8 +10461,8 @@ def create_mcp_server() -> MCPServer:
 
         Duration: about 2 minutes on a healthy Galaxy (reset ~60s + fabric pass
         45-75s), about 4 minutes when the first fabric pass finds no trained link
-        and is re-checked after a 60s wait. Worst case at the defaults: about 27
-        minutes (poller stop and restart up to 180s + reset 600s + PCI rescan 3s
+        and is re-checked after a 60s wait. Worst case at the defaults: about 26
+        minutes (poller stop and restart up to 120s + reset 600s + PCI rescan 3s
         + a first verify pass of up to 361s + the 60s wait + a last verify pass
         of up to 436s, which adds the 75s kill of a timed-out check). Only the
         last pass can time out: a re-check follows a pass that finished. Each
