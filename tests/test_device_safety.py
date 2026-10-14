@@ -14101,3 +14101,72 @@ async def test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_rese
     await srv._force_escalate_stuck_hold()
     assert escalations == []
     assert [a["cause"] for a in alerts] == ["known fabric fault"]
+
+
+def _boot_split_hold(monkeypatch, tmp_path, clear_job_state, *, sidecar):
+    """A box cold-cycled mid-hold: the last boot's broker died holding (an unmatched device_held and
+    a 3h-old clock on disk, with or without the boot-id sidecar), and this boot's broker started.
+    Returns the forced escalations _check_hold_deadline spawns."""
+    stale = _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
+    if not sidecar:  # the bare-timestamp file an older broker leaves: older than this boot's btime
+        (tmp_path / srv.HOLD_EPISODE_RECORD_FILE).unlink()
+        btime = datetime.now() - timedelta(minutes=1)
+        monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int(btime.timestamp())))
+    (tmp_path / health.EVENTS_FILE).write_text(
+        json.dumps({"ts": time.time() - 3 * 3600, "kind": "device_held", "reason": "eth/fabric fault"}) + "\n"
+    )
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-b")
+    monkeypatch.setattr(srv, "_hold_episode_restorable", True)
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
+    monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: False)  # a hold the ladder may force
+    fired = []
+    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: fired.append(True) or True)
+    return stale, fired
+
+
+@pytest.mark.parametrize("sidecar", [True, False])
+def test_an_orphaned_pre_boot_hold_does_not_drive_the_deadline_escalation(
+    monkeypatch, tmp_path, clear_job_state, sidecar
+):
+    """Measured: a box cold-cycled mid-hold; STARTUP closed the pre-boot hold as orphaned, the
+    startup pass opened a new hold, and 10s later HOLD-DEADLINE-ESCALATE counted the pre-boot
+    hold's 2550s and ran a galaxy reset on the freshly cycled box. The closed hold's age must not
+    count toward the new boot's deadline."""
+    stale, fired = _boot_split_hold(monkeypatch, tmp_path, clear_job_state, sidecar=sidecar)
+
+    srv._close_orphaned_hold()
+    srv._note_tenant_gate_verdict("device unverified: gate/startup: eth/fabric fault")
+
+    assert srv.device_hold_episode_since != stale, "the new boot's hold inherited the pre-boot clock"
+    srv._check_hold_deadline(now=datetime.now() + timedelta(seconds=10))
+    assert fired == [], "the deadline forced the ladder on a pre-boot hold's age"
+
+
+def test_a_hold_clock_with_an_earlier_boot_id_is_ignored_by_the_deadline(monkeypatch, tmp_path, clear_job_state):
+    """No orphan close at all (no journal row): the clock's sidecar names the last boot, so the
+    deadline still counts this boot's hold from its own start."""
+    _stale, fired = _boot_split_hold(monkeypatch, tmp_path, clear_job_state, sidecar=True)
+    (tmp_path / health.EVENTS_FILE).unlink()
+
+    srv._note_tenant_gate_verdict("device unverified: gate/startup: eth/fabric fault")
+
+    srv._check_hold_deadline(now=datetime.now() + timedelta(seconds=10))
+    assert fired == [], "a clock from an earlier boot drove the deadline escalation"
+    assert srv.device_hold_deadline_bucket == 0 and srv.device_hold_escalate_bucket == 0
+
+
+def test_a_fresh_post_boot_hold_still_escalates_at_its_deadline(monkeypatch, tmp_path, clear_job_state):
+    """The pre-boot clock is dropped, not the deadline: a hold this boot opened is forced once its
+    own age passes the ceiling."""
+    _stale, fired = _boot_split_hold(monkeypatch, tmp_path, clear_job_state, sidecar=True)
+    srv._close_orphaned_hold()
+    srv._note_tenant_gate_verdict("device unverified: gate/startup: eth/fabric fault")
+    since = datetime.fromisoformat(srv.device_hold_episode_since)
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling - 1))
+    assert fired == [], "escalated before the new hold's own ceiling"
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 1))
+    assert len(fired) == 1, "a post-boot hold past its ceiling must still force the ladder"
