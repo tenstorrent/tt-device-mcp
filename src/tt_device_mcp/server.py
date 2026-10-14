@@ -3262,16 +3262,21 @@ def _env_int(name: str, default: int, floor: int) -> int:
         return default
 
 
-# A topology-mismatch skip, and the hardware fault the first job after its lift names, are holds no
-# fallback release may lift: the cabling is not what the descriptor says, and enum+ARC and the eth
-# read cannot see that. They stay outside the I40 budget and release.
-_TOPOLOGY_HOLD_PREFIX = "topology mismatch"
+# The hardware fault the first job after a topology-mismatch lift names is a hold no fallback release
+# may lift: that job proved the links the traffic-only pass skipped are needed, and enum+ARC and the
+# eth read cannot see them. It stays outside the I40 budget and release. A topology mismatch whose
+# traffic-only rerun could not run is inside the bound (I43): its eth read is judged against the
+# link mark re-baselined for this chip-to-bus map, and a release is watched like a lift.
+_TOPOLOGY_HOLD = "topology mismatch"
 _TOPOLOGY_HW_FAULT = "hardware fault: the first job after a topology-mismatch lift"
 
 
-def _topology_mismatch_hold(evidence: dict) -> bool:
-    details = (str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or ""))
-    return any(d.startswith(_TOPOLOGY_HOLD_PREFIX) or _TOPOLOGY_HW_FAULT in d for d in details)
+def _hold_details(evidence: dict) -> tuple[str, str]:
+    return str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or "")
+
+
+def _topology_hw_fault_hold(evidence: dict) -> bool:
+    return bool(health_monitor.topology_hw_fault) or any(_TOPOLOGY_HW_FAULT in d for d in _hold_details(evidence))
 
 
 def _fabric_77_bound_reached() -> bool:
@@ -3326,6 +3331,9 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
             "WITH A WARNING: the fabric is unverified, the next gate re-runs the pass"
         )
         health_event("device_relift_fabric_unverified", evidence=evidence, retries=_fabric_77_streak)
+        if any(_TOPOLOGY_HOLD in d for d in _hold_details(evidence)):
+            # The release is a lift onto links no traffic crossed: the first job bounds it (I42).
+            health_monitor.topology_lift_pending = True
         _clear_device_dirty(
             verified=True, why="idle relift: fabric check unrunnable past its bound; startup checks pass"
         )
@@ -3486,7 +3494,7 @@ async def _attempt_idle_relift() -> None:
                 if (
                     fabric_ok is None
                     and _fabric_77_only_hold()
-                    and not _topology_mismatch_hold(evidence)
+                    and not _topology_hw_fault_hold(evidence)
                     and _fabric_77_bound_reached()
                 ):
                     # I40: a pass that cannot run is retried a bounded number of times, never

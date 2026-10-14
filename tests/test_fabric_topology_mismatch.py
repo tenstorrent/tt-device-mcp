@@ -202,3 +202,16 @@ async def test_a_cached_mismatch_skips_the_descriptor_run_on_the_same_bus_map_on
     monkeypatch.setattr(fabric, "_validator_paths", lambda: ("bin", "root", "/x/other.textproto"))
     await m._verify_fabric_health_body(60)
     assert "--cabling-descriptor-path" in state["calls"][5]
+
+
+@pytest.mark.asyncio
+async def test_a_rerun_that_cannot_measure_arms_the_rebaseline_for_the_bounded_fallback(topo, tmp_path):
+    m, state = topo
+    m.eth_link_drop(256)
+    state["rerun"] = (134, "  what():  Hugepages are not allocated for channel: 0\n")
+    ok, _ = await m._verify_fabric_health_body(60)
+    assert ok is None and m.topology_lift_pending is False
+    # The fallback's eth read is judged against this mesh's links, not the descriptor's.
+    assert m.eth_link_drop(252) == ""
+    assert _baseline(tmp_path)["links"] == 252
+    assert "250 of 252" in m.eth_link_drop(250)

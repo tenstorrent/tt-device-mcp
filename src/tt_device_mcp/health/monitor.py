@@ -924,6 +924,10 @@ class HealthMonitor:
             if log:
                 log.warning(f"FABRIC-CHECK not runnable on this host — no fabric coverage: {reason[:400]}")
             health_event("fabric_check_unavailable", detail=reason[:400], cmd=cmd)
+            if reason.startswith(fabric.TOPOLOGY_MISMATCH):
+                # The rerun could not measure: the bounded fallback (I40) judges the eth read, so it
+                # needs the mark for this mesh, not the descriptor's (I43).
+                self._arm_eth_rebaseline()
             return None, f"fabric check COULD NOT RUN ({dt:.0f}s): {reason[:400]}"
         self.last_fabric_ok = False
         if rc is None:
