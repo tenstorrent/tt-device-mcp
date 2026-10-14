@@ -368,8 +368,11 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I23 — A per-tray re-power runs inside a host-safety envelope** (`pcie_guard.safe_tray_repower`).
   In order: the tray map is cross-checked against sysfs (each chip's bus against tt-smi's tray
   table) and a disagreement refuses the fire, so a mis-mapped tray is never cut (issue #27); it
-  waits up to `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` for every process to let go of the
-  tray's chips, else refuses; the device pollers are stopped as for a mesh reset; AER and DPC are
+  waits up to `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` for every process to let go of EVERY
+  chip on the box (`TrayPlan.box_chips`: each chip sysfs or tt-kmd's `/proc` list names, on the bus
+  or not), not only the tray's, else refuses: one tray's pulse has dropped every other tray of a
+  Galaxy within seconds, so the box must be as idle as for a whole-box cycle; the device pollers
+  are stopped afresh before each pulse; AER and DPC are
   masked on EVERY Tenstorrent root port, the sibling trays' included (a mask that cannot be applied
   is put back and refuses the fire, before any chip is touched); the chips are quiesced
   (USER_RESET); the tray's PCI functions are removed; the BMC pulse fires; then, even if the
@@ -401,6 +404,12 @@ each rung fires only when the gentler one failed or cannot apply.
   walk. A refused fire re-powers nothing. `TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1` logs the planned
   sequence and refuses; `python -m tt_device_mcp.health.recovery.pcie_guard <bitmap> [chip ...]`
   prints the plan from sysfs and touches nothing.
+  The tray rungs (the tray walk and the last-chance sweep) hold the pollers stopped from before the
+  first pulse until the rung's verify (`RecoveryMechanism.hold_pollers`/`release_pollers`; holds
+  nest): a mesh reset inside the hold (`reset_with_quiesce`) does not restart them, `/health`
+  reports `pollers_held`, and the idle health probe stands back on it (spec 08 I17). The outermost
+  release restarts them only when the verify proved the mesh; a rung that leaves the mesh unproven
+  leaves them stopped for the next rung.
 
 - **I24 — A per-host gate on automatic host-affecting resets** (`TT_DEVICE_MCP_HOST_RESET_GATE`).
   `off` (default) keeps the behaviour above. `guard` masks AER on every Tenstorrent root port around
@@ -427,6 +436,8 @@ each rung fires only when the gentler one failed or cannot apply.
   cross-check. A tray whose chips are all on the bus is never re-powered automatically; if chips are
   still off after their trays, the next rung runs as the I24 gate allows (no rung is skipped before
   a power cycle, I22). Re-powering tray X alone recovers chips off on tray X, as the old walk did.
+  Re-powering one tray is still treated as disrupting the whole box: I23's holder wait covers every
+  chip on it and the pollers stay held across the rung.
   Before an automatic mesh reset, tray re-power or sweep with a chip off the bus, the broker writes
   `offbus_reset_intent.json` (with the boot id) to the health dir and removes it after the reset's
   verify. A broker that starts on another boot id and finds that intent writes
@@ -857,7 +868,8 @@ sees a silent fabric pass.
 | I23 only the re-powered tray's root ports are rescanned; the global rescan only when none is known | `tests/test_pcie_guard.py::test_the_envelope_rescans_only_the_re_powered_trays_root_ports`, `::test_the_envelope_falls_back_to_the_global_rescan_when_no_tray_port_is_known`, `tests/test_device_safety.py::test_the_walk_rescans_only_the_re_powered_trays_root_ports` |
 | I23 a chip on another tray newly all-ones gets one remove + scoped rescan | `tests/test_pcie_guard.py::test_a_sibling_chip_newly_all_ones_gets_one_remove_and_scoped_rescan`, `::test_a_sibling_chip_already_all_ones_or_on_the_tray_is_not_touched` |
 | I25 a regressed walk disables the tray walk for the process; the back-to-back sweep still re-powers | `tests/test_device_safety.py::test_a_regressed_walk_disables_the_tray_rung_for_the_process`, `tests/test_pcie_guard.py::test_a_disabled_tray_walk_leaves_the_envelope_armed`, `tests/test_ladder_v2.py::test_a_disabled_tray_walk_still_re_powers_in_the_last_chance_sweep`, `::test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep` |
-| I23 holders: wait, then refuse | `tests/test_pcie_guard.py::test_envelope_waits_for_holders_then_refuses_without_touching_anything`, `::test_envelope_proceeds_once_the_holder_lets_go` |
+| I23 holders: wait, then refuse; a holder on any chip of the box refuses | `tests/test_pcie_guard.py::test_envelope_waits_for_holders_then_refuses_without_touching_anything`, `::test_envelope_proceeds_once_the_holder_lets_go`, `::test_envelope_waits_for_holders_on_every_tray_not_just_the_re_powered_one` |
+| I23 tray rungs hold the pollers stopped until verify; a mesh reset inside the hold does not restart them; an unproven mesh leaves them stopped; `/health` reports the hold | `tests/test_pcie_guard.py::test_the_sweep_keeps_pollers_stopped_from_the_tray_pulse_through_the_mesh_reset`, `::test_a_mesh_reset_inside_a_tray_hold_leaves_the_pollers_stopped`, `::test_the_tray_walk_restarts_pollers_only_on_a_verified_mesh`, `::test_health_reports_the_poller_hold` |
 | I23 an erroring port stays masked and starts the flood window | `tests/test_pcie_guard.py::test_a_port_that_keeps_erroring_stays_masked_and_marks_a_flood` |
 | I23 dry run and plan CLI touch nothing | `tests/test_pcie_guard.py::test_dry_run_logs_the_plan_and_touches_nothing`, `::test_cli_prints_the_plan` |
 | I24 the per-chip bridge SBR obeys the hold gate and the latch | `tests/test_pcie_guard.py::test_the_per_chip_bridge_reset_obeys_the_hold_gate_and_the_latch` |
