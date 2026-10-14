@@ -9,6 +9,8 @@ interval — and otherwise holds or pages, never loops. ``fire_command`` is alwa
 may run a real power-cycle command (conftest makes the real one a tripwire)."""
 
 import json
+import os
+import socket
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,10 +31,12 @@ _REAL_FIRE = opc.fire_command
 _REAL_GATE = pcie_guard.host_reset_gate
 
 
-def _gated(monkeypatch, tmp_path, *, held_sec=600, cmd="/usr/local/sbin/host-power-cycle --now"):
+def _gated(monkeypatch, tmp_path, *, held_sec=600, cmd="/usr/local/sbin/host-power-cycle --now", manual="exit 1"):
     """An idle off-bus hold the gate refuses to reset, held ``held_sec``, with the power-cycle command
-    set (``cmd=None`` leaves it unset). Returns (hold_since, rec) where rec collects the fake fires
-    (each with the state file as it stood when the command ran), alerts and journal events."""
+    set (``cmd=None`` leaves it unset) and a manual-recovery check running ``manual`` (default: a
+    clean "none seen"; ``None`` leaves it unset, and conftest's TTDEV_ROOT has none installed).
+    Returns (hold_since, rec) where rec collects the fake fires (each with the state file as it stood
+    when the command ran), alerts and journal events."""
     _arm_offbus_stuck_hold(monkeypatch, off_bus=OFF_BUS, isolated=set(), reset_result=False)
     for name in (
         "TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC",
@@ -47,6 +51,8 @@ def _gated(monkeypatch, tmp_path, *, held_sec=600, cmd="/usr/local/sbin/host-pow
         monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
     else:
         monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", cmd)
+    if manual is not None:
+        monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", _script(tmp_path, "mr-default", manual))
     monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (False, GATE_WHY))
     hold_since = (datetime.now() - timedelta(seconds=held_sec)).isoformat()
     srv.device_hold_episode_since = hold_since
@@ -306,6 +312,117 @@ async def test_checks_that_say_no_let_it_fire(monkeypatch, tmp_path, clear_job_s
 
 
 @pytest.mark.asyncio
+async def test_no_manual_recovery_check_never_fires_and_pages_once(monkeypatch, tmp_path, clear_job_state):
+    """A power-cycle command with no manual-recovery check (unset, none installed) is unguarded: it
+    never fires, past the grace or not, and pages once, high severity. Fail closed, not open."""
+    hold_since, rec = _gated(monkeypatch, tmp_path, held_sec=300 + 1800 + 60, manual=None)
+    _ladder_ran(hold_since)
+    for _ in range(3):
+        assert await _pass(hold_since) is None
+    assert rec["fires"] == [] and opc.load_state() == {}
+    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_unguarded"]
+    assert rec["alerts"][0]["severity"] == "high" and rec["alerts"][0]["host_at_risk"] is True
+    assert "no manual-recovery check" in opc.standback_reason(), "standback_reason fails closed on its own too"
+    monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", "'unbalanced")
+    assert opc.manual_recovery_argv() is None and await _pass(hold_since) is None
+    assert rec["fires"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body, fires", [("exit 1", True), ("echo sudo reboot; exit 0", False)])
+async def test_the_installed_check_is_the_default(monkeypatch, tmp_path, clear_job_state, body, fires):
+    """Unset, the check is the template the installer stages under TTDEV_ROOT."""
+    hold_since, rec = _gated(monkeypatch, tmp_path, manual=None)
+    root = tmp_path / "root"
+    root.mkdir()
+    _script(root, opc.MANUAL_RECOVERY_CHECK, body)
+    monkeypatch.setenv("TTDEV_ROOT", str(root))
+    assert opc.manual_recovery_argv() == [str(root / opc.MANUAL_RECOVERY_CHECK)]
+    _ladder_ran(hold_since)
+    assert await _pass(hold_since) is (True if fires else False)
+    assert len(rec["fires"]) == (1 if fires else 0)
+    assert "offbus_power_cycle_unguarded" not in [a["kind"] for a in rec["alerts"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["unreadable", "raises", "times_out"])
+async def test_a_manual_recovery_check_that_cannot_answer_holds_until_the_bound(
+    monkeypatch, tmp_path, clear_job_state, source
+):
+    """Evidence the check cannot read, a check that raises and one that times out are all a possible
+    operator recovery: the cycle holds, the reason is journaled, every pass asks again, and past
+    grace + the blocked-page bound it pages once — the same bounded end as any other blocker."""
+    hold_since, rec = _gated(monkeypatch, tmp_path, held_sec=300 + 1800 - 10)
+    if source == "unreadable":
+        monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, ["Failed to open journal"], rc=1))
+        monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", f"bash {_CHECK}")
+        why = "could not answer (exit 2)"
+    elif source == "raises":
+
+        def boom(argv, timeout, env=None):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(opc, "_run", boom)
+        why = "RuntimeError('boom')"
+    else:
+        monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", _script(tmp_path, "mr", "sleep 30"))
+        monkeypatch.setattr(opc, "CHECK_TIMEOUT_DEFAULT_SEC", 0.3)
+        why = "timed out"
+    _ladder_ran(hold_since)
+    assert await _pass(hold_since) is False
+    assert rec["alerts"] == []
+    later = (datetime.fromisoformat(hold_since) - timedelta(seconds=20)).isoformat()
+    srv.device_hold_episode_since = later
+    _ladder_ran(later)
+    for _ in range(2):
+        assert await _pass(later) is False
+    assert rec["fires"] == [] and opc.load_state() == {}
+    standing = [f["why"] for k, f in rec["events"] if f.get("phase") == "standing_back"]
+    assert standing and all(why in w for w in standing)
+    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_blocked"]
+    assert why in rec["alerts"][0]["why"]
+
+
+@pytest.mark.asyncio
+async def test_a_clean_manual_recovery_template_lets_it_fire(monkeypatch, tmp_path, clear_job_state):
+    """The shipped template reading a readable journal with no recovery and no auth.log says none,
+    and the cycle runs."""
+    hold_since, rec = _gated(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, ["-- No entries --"]))
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_AUTHLOG", str(tmp_path / "no-auth.log"))
+    monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", f"bash {_CHECK}")
+    _ladder_ran(hold_since)
+    assert await _pass(hold_since) is True
+    assert len(rec["fires"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_arriving_during_the_checks_holds(monkeypatch, tmp_path, clear_job_state):
+    """The stand-back checks can take seconds: the holder scan is read again after them."""
+    hold_since, rec = _gated(monkeypatch, tmp_path)
+    scans = iter(
+        [
+            HolderScan(holders=[], complete=True),
+            HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True),
+        ]
+    )
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: next(scans))
+    _ladder_ran(hold_since)
+    assert await _pass(hold_since) is False
+    assert rec["fires"] == [] and opc.load_state() == {}
+
+
+def test_the_pages_name_the_host(monkeypatch):
+    sent = []
+    monkeypatch.setattr(opc, "health_event", lambda kind, **f: None)
+    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: sent.append(event))
+    opc.arm("2026-10-13T19:29:00")
+    opc.page_once("offbus_power_cycle_unguarded", lambda m: None, "held")
+    opc.page_if_blocked("2026-10-13T19:29:00", 10**6, lambda m: None, "a marker")
+    assert [e["host"] for e in sent] == [socket.gethostname()] * 2
+
+
+@pytest.mark.asyncio
 async def test_an_attempt_within_the_interval_pages_instead(monkeypatch, tmp_path, clear_job_state):
     hold_since, rec = _gated(monkeypatch, tmp_path)
     opc.save_state({"attempts": [{"at_epoch": opc.now_epoch() - 3600, "episode": "earlier"}], "last_error": "boom"})
@@ -467,11 +584,36 @@ def _journal(tmp_path, lines, rc=0):
         (["... sudo[1]: ops : TTY=pts/0 ; PWD=/ ; USER=root ; COMMAND=/usr/sbin/reboot"], 0),
         (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/systemctl reboot"], 0),
         (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool -H bmc chassis power cycle"], 0),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool chassis power off"], 0),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool power soft"], 0),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool -I lanplus mc reset cold"], 0),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool raw 0x06 0x02"], 0),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool raw 0x00 0x02 0x02"], 0),
         (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool sensor list"], 1),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool chassis power status"], 1),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool dcmi power reading"], 1),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool raw 0x06 0x01"], 1),
+        (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/ipmitool chassis status"], 1),
         (["... sudo[1]: ops : USER=root ; COMMAND=/usr/bin/apt-get install halt-utils"], 1),
         ([], 1),
     ],
-    ids=["reboot", "systemctl-reboot", "ipmitool-power", "ipmitool-read", "unrelated", "nothing"],
+    ids=[
+        "reboot",
+        "systemctl-reboot",
+        "ipmitool-power",
+        "ipmitool-power-off",
+        "ipmitool-power-soft",
+        "ipmitool-mc-reset",
+        "ipmitool-raw-bmc-reset",
+        "ipmitool-raw-chassis-control",
+        "ipmitool-read",
+        "ipmitool-power-status",
+        "ipmitool-dcmi-power-reading",
+        "ipmitool-raw-get-device-id",
+        "ipmitool-chassis-status",
+        "unrelated",
+        "nothing",
+    ],
 )
 def test_the_manual_recovery_check_template(tmp_path, monkeypatch, lines, rc):
     monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, lines))
@@ -510,3 +652,20 @@ def test_the_manual_recovery_check_cannot_answer_on_an_unreadable_journal(tmp_pa
     monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, ["Failed to open journal"], rc=1))
     assert subprocess.run(["bash", _CHECK], capture_output=True).returncode == 2
     assert subprocess.run(["bash", _CHECK, "soon"], capture_output=True).returncode == 2
+    hint = "Hint: You are currently not seeing messages from other users and the system."
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, [hint]))
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_AUTHLOG", str(tmp_path / "no-auth.log"))
+    assert subprocess.run(["bash", _CHECK], capture_output=True).returncode == 2, "a partial journal is unreadable"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_the_manual_recovery_check_cannot_answer_on_an_unreadable_auth_log(tmp_path, monkeypatch):
+    """An auth.log that exists but cannot be read is unknown, not empty; only an absent one is skipped."""
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, []))
+    log = tmp_path / "auth.log"
+    log.write_text("")
+    log.chmod(0)
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_AUTHLOG", str(log))
+    assert subprocess.run(["bash", _CHECK], capture_output=True).returncode == 2
+    log.unlink()
+    assert subprocess.run(["bash", _CHECK], capture_output=True).returncode == 1

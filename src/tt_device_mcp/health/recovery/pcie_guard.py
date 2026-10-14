@@ -625,7 +625,7 @@ def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
     log(
         f"the {intent.get('kind')} that ran with {intent.get('off_bus')} chip(s) off the bus did not finish "
         f"before the host went down: automatic resets over off-bus chips are HELD until an operator runs "
-        f"`{clear_latch_cmd()}`"
+        f"`{clear_latch_cmd()}` or the host boots again"
     )
     health_event("offbus_reset_hold_latched", intent=intent, clear=clear_latch_cmd(), host_at_risk=True)
     return rec

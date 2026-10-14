@@ -272,7 +272,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC` | 1800 | How long past the grace a tenant, a reset scope or a stand-back may block the I27 power cycle before the broker pages once | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE` | unset | `:`-separated marker paths; any that exists holds the I27 power cycle | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD` | unset | Command; exit 0 holds the I27 power cycle, 1 clears, anything else holds | 04 |
-| `TT_DEVICE_MCP_MANUAL_RECOVERY_CMD` | unset | Command; exit 0 means an operator is recovering the host, so the I27 power cycle holds; 1 clears, anything else holds | 04 |
+| `TT_DEVICE_MCP_MANUAL_RECOVERY_CMD` | `$TTDEV_ROOT/manual-recovery-check.sh` if installed | Command; exit 0 means an operator is recovering the host, so the I27 power cycle holds; 1 clears, anything else holds. Neither set nor installed: the power cycle never fires and the broker pages | 04 |
 | `TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN` | unset | `1`: log the per-tray re-power plan and refuse it | 04 |
 | `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` | 10 | How long a tray re-power waits for holders of the tray's chips | 04 |
 | `TT_DEVICE_MCP_AER_QUIET_CHECK_SEC` | 2 | How long a root port must stay error-free before its AER settings are restored | 04 |
