@@ -586,6 +586,17 @@ job boundary.
   try, with the streak left one short so the next job that dies the same way declares it again.
   Bounds the loop one Galaxy host ran: a 77, a reset, a release on another 77, and the next job
   dead on routing, 24 resets in 2.5 h.
+- **I47 — A missing cable is a hardware verdict, not a pass that could not run.** When the
+  descriptor run reports a connection mismatch whose cabling-descriptor links are missing with
+  none extra (a moved tray shows both and stays on the I42 path) and the traffic-only rerun
+  reaches no verdict, the pass is a HARDWARE FAULT: the broker declares the I46 known fabric fault
+  at once (`fabric_known_fault`, `cause=missing_cable`, the missing count and the descriptor in
+  its reason), pages once per distinct reason and holds without a reset as I46 does, with the same
+  expiry. The wrapper reports it as exit 78 (`FABRIC_CHECK_HARDWARE_FAULT_RC`), and a configured
+  check that exits 78 is read the same way; a validator that measured bad links never leaves on
+  77 or 78. A rerun that passes still lifts per I42 and one that measures bad links stays
+  UNHEALTHY. No reset, re-power or ladder rung reconnects a cable: without this the pass was a 77
+  and the broker reset and climbed until the 77 bound ran out.
 
 ## Interfaces
 
@@ -1118,6 +1129,7 @@ refuses.
 | I44 | `tests/test_idle_holder.py::test_a_flat_holder_past_the_threshold_is_named_once_and_never_signalled`, `tests/test_idle_holder.py::test_cpu_time_moving_restarts_the_clock`, `tests/test_idle_holder.py::test_broker_jobs_and_system_holders_are_never_counted`, `tests/test_idle_holder.py::test_a_child_of_the_broker_is_never_counted`, `tests/test_idle_holder.py::test_a_reused_pid_is_a_new_process`, `tests/test_idle_holder.py::test_a_busy_alert_hook_is_retried_without_a_second_event`, `tests/test_idle_holder.py::test_a_gone_holder_is_forgotten`, `tests/test_idle_holder.py::test_threshold_is_configurable`, `tests/test_idle_holder.py::test_threshold_zero_turns_the_detector_off`, `tests/test_idle_holder.py::test_read_proc_cpu_reads_this_process_and_none_for_a_gone_pid`, `tests/test_idle_holder.py::test_the_sampler_spawn_is_rate_limited` |
 | I45 | `tests/test_fabric_topology_mismatch.py::test_a_lift_rebaselines_the_eth_mark_at_the_discovered_links`, `tests/test_fabric_topology_mismatch.py::test_trays_moving_again_drop_the_rebaseline_back_to_the_high_water_mark`, `tests/test_fabric_topology_mismatch.py::test_a_clean_pass_without_the_marker_restores_the_high_water_rule`, `tests/test_fabric_topology_mismatch.py::test_a_cached_mismatch_skips_the_descriptor_run_on_the_same_bus_map_only`, `tests/test_fabric_topology_mismatch.py::test_a_rerun_that_cannot_measure_arms_the_rebaseline_for_the_bounded_fallback`, `tests/test_startup_fabric_hugepages.py::test_a_topology_mismatch_whose_rerun_77s_takes_the_bounded_fallback` |
 | I46 | `tests/test_fabric_known_fault.py::test_two_jobs_dying_on_routing_after_77_passes_are_a_known_fault`, `tests/test_fabric_known_fault.py::test_anything_else_breaks_the_streak`, `tests/test_fabric_known_fault.py::test_a_healthy_fabric_verdict_ends_the_known_fault`, `tests/test_fabric_known_fault.py::test_the_known_fault_is_bounded_and_rearms_one_short`, `tests/test_fabric_known_fault.py::test_the_runner_holds_a_known_fabric_fault_without_the_dirty_reset`, `tests/test_startup_fabric_hugepages.py::test_a_known_fabric_fault_hold_is_outside_the_77_bound`, `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset` |
+| I47 | `tests/test_fabric_cable_fault.py::test_a_missing_cable_is_a_hardware_verdict_held_and_paged_once`, `tests/test_fabric_cable_fault.py::test_a_missing_cable_whose_rerun_passes_still_lifts_on_the_discovered_links`, `tests/test_fabric_cable_fault.py::test_a_moved_tray_with_no_rerun_verdict_stays_a_topology_skip`, `tests/test_fabric_cable_fault.py::test_an_override_wrapper_exit_78_is_the_hardware_verdict`, `tests/test_fabric_cable_fault.py::test_the_broker_holds_a_missing_cable_outside_the_77_bound_without_a_reset`, `tests/test_fabric_cable_fault.py::test_wrapper_exits_78_on_a_missing_cable_whose_rerun_cannot_measure`, `tests/test_fabric_cable_fault.py::test_wrapper_measured_bad_links_never_exit_on_a_sentinel` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |
