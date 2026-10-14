@@ -649,3 +649,65 @@ def test_an_owed_pass_does_not_carry_to_another_episode(monkeypatch, tmp_path, c
     monkeypatch.setattr(srv, "_startup_fabric_owed_since", "an earlier episode")
     assert not srv._startup_fabric_owed()
     assert srv._idle_relift_armed() == (False, False, False)
+
+
+# --- I40: a 77-only hold is bounded, then the startup checks are the gate -----------------------
+
+
+def _bound(monkeypatch, tmp_path, eth):
+    _hold_77(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "1")
+    monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", 0.0)
+    monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
+
+    async def verify(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": "could not run (77)"}}
+
+    async def eth_read(*a, **k):
+        return eth
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_read)
+    rungs = []
+
+    async def escalate(rung, *a, **k):
+        rungs.append(rung)
+        return srv.OUTCOME_WAITING
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    return rungs
+
+
+@pytest.mark.asyncio
+async def test_a_77_only_hold_past_its_bound_lifts_on_a_healthy_eth_read(monkeypatch, tmp_path, clear_job_state):
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    await srv._attempt_idle_relift()
+    assert rungs == []
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_77_only_hold_with_a_link_drop_climbs_the_ladder_not_released(monkeypatch, tmp_path, clear_job_state):
+    """A 77 is never a healthy fabric: a link-count drop reads no-verdict and goes to the ladder."""
+    rungs = _bound(monkeypatch, tmp_path, (None, "eth links below baseline"))
+    await srv._attempt_idle_relift()
+    assert rungs == ["present"]
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+async def test_a_second_77_only_hold_inside_the_window_climbs_the_ladder(monkeypatch, tmp_path, clear_job_state):
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", srv.time.monotonic())
+    await srv._attempt_idle_relift()
+    assert rungs == ["present"]
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+async def test_a_77_only_hold_under_its_bound_still_just_holds(monkeypatch, tmp_path, clear_job_state):
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "5")
+    await srv._attempt_idle_relift()
+    assert rungs == []
+    assert srv.fsm.state is ServerState.RECOVERING

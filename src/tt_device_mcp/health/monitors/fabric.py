@@ -47,6 +47,21 @@ _WEDGED_ETH_INIT = re.compile(r"waiting for active ethernet core|Try resetting t
 # — and it is the dominant reason a host learns nothing about its fabric.
 _WATCHDOG_TIMEOUT = re.compile(r"Workload execution timed out after \d+ seconds")
 
+# Links the cabling descriptor expects are still missing after the validator's own five link
+# retrains. Reachable only with a descriptor set (no descriptor = no connectivity comparison), and a
+# descriptor is set only on a host it describes, so this is a measured fault, not a could-not-check:
+# a galaxy reset retrains the links. Left as a skip it held a galaxy fabric-unverified with no
+# release path after a reset left links down (jobs then failed "no forwarding direction").
+_LINKS_MISSING_AFTER_RETRAIN = re.compile(r"Encountered unrecoverable state")
+
+# The discovered links differ from the cabling descriptor, thrown before any traffic (in seconds,
+# where a pass takes about a minute). Its own result, not a could-not-check: a link toward one chip
+# went down while every chip still enumerates, and jobs then fail to route across the mesh. Reported
+# with the TOPOLOGY_MISMATCH prefix so a caller can tell it from a traffic failure. Measured-bad, so
+# the ladder (a galaxy reset retrains links) owns it, and the ladder's own bounds end it.
+_TOPOLOGY_MISMATCH = re.compile(r"Connection mismatch detected")
+TOPOLOGY_MISMATCH = "topology mismatch"
+
 # The lines naming why the validator never reached a verdict, most specific first, for a SKIPPED
 # detail that says more than a bare exit code. Order matters: an uncaught exception prints
 # "terminate called after throwing an instance of '<type>'" on the line ABOVE "  what():  <cause>",
@@ -93,6 +108,10 @@ def classify(rc: Optional[int], output: str) -> tuple[Optional[bool], str]:
         )
     if _WATCHDOG_TIMEOUT.search(output):
         return False, "traffic stalled until the validator's own watchdog fired; no link reported back"
+    if _TOPOLOGY_MISMATCH.search(output):
+        return False, f"{TOPOLOGY_MISMATCH}: the discovered links differ from the cabling descriptor"
+    if _LINKS_MISSING_AFTER_RETRAIN.search(output):
+        return False, "links the cabling descriptor expects are still missing after the validator's retrains"
     reason = first_reason(output)
     detail = f"validator did not complete a measurement (rc={rc})"
     if reason:
