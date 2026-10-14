@@ -71,7 +71,8 @@ canonize an accident by writing it into a spec as if it were intent.
 
 1. **Formatting and lint are mechanical**: black at 120 columns, ruff (`E4,E7,E9,F` + import
    sort) — configured in `pyproject.toml`, run by pre-commit, enforced in CI. SPDX headers are
-   checked in CI by the org-wide `spdx-checker` action.
+   checked in CI by the org-wide `spdx-checker` action; `tests/test_spdx_headers.py` catches a
+   missing one locally first.
 2. **No dead code** — delete, don't comment out.
 3. **Imports at top** — no inline imports. (One documented consequence: `health.HEALTH_DIR`
    binds at import — see spec 06 I5 before touching path accessors; new accessors are

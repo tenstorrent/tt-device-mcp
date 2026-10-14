@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
 """Idle foreign holder detector (spec 03 I44): a tenant process outside every broker scope that holds a
 device fd with its CPU time flat past the threshold is named once — a health event and an alert with
 its user and pid — and never killed or signalled."""
