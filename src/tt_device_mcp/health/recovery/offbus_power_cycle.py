@@ -23,6 +23,7 @@ import json
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import time
 from datetime import datetime
@@ -38,6 +39,9 @@ MIN_INTERVAL_DEFAULT_SEC = 6 * 3600
 CHECK_TIMEOUT_DEFAULT_SEC = 10.0
 FIRE_TIMEOUT_DEFAULT_SEC = 120.0
 BLOCKED_PAGE_DEFAULT_SEC = 1800
+# Where the installer stages deploy/tt-manual-recovery-check.sh; the manual-recovery check when
+# TT_DEVICE_MCP_MANUAL_RECOVERY_CMD is unset.
+MANUAL_RECOVERY_CHECK = "manual-recovery-check.sh"
 # Attempts kept in the state file: enough to read the rate limit, never a growing log.
 MAX_ATTEMPTS_KEPT = 8
 
@@ -106,37 +110,61 @@ def _run(argv: list, timeout: float, env: Optional[dict] = None) -> tuple:
     return p.returncode, out.decode(errors="replace").strip()[-300:]
 
 
+def manual_recovery_argv() -> Optional[list]:
+    """The manual-recovery check: ``TT_DEVICE_MCP_MANUAL_RECOVERY_CMD``, else the installed
+    template under ``TTDEV_ROOT`` (default /opt/tt-device-broker), else None — no check at all,
+    which never reads as "no operator" (the power cycle stays held)."""
+    if os.environ.get("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", "").strip():
+        return _argv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD")
+    installed = Path(os.environ.get("TTDEV_ROOT", "/opt/tt-device-broker")) / MANUAL_RECOVERY_CHECK
+    return [str(installed)] if installed.is_file() else None
+
+
 def standback_reason(timeout: Optional[float] = None) -> str:
     """Why the broker must stand back from the power cycle now, or "" when nothing objects.
 
     * ``TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE``: paths separated by ``os.pathsep``; any that
       exists is a stand-back marker.
-    * ``TT_DEVICE_MCP_MANUAL_RECOVERY_CMD``: exit 0 means an operator is recovering the host.
+    * the manual-recovery check (:func:`manual_recovery_argv`): exit 0 means an operator is
+      recovering the host. No check configured or installed stands back.
     * ``TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD``: exit 0 means stand back (e.g. a workload is
       starting that the device-holder scan cannot see yet).
 
-    Exit 1 clears a check. Any other exit, a timeout or a command that cannot start stands back:
-    a check that cannot answer is not a yes."""
+    Exit 1 clears a check. Any other exit, a timeout, a command that cannot start or a check that
+    raises stands back: a check that cannot answer is not a yes."""
+    try:
+        return _standback_reason(CHECK_TIMEOUT_DEFAULT_SEC if timeout is None else timeout)
+    except Exception as exc:
+        return f"the stand-back checks could not answer ({exc!r}) — standing back"
+
+
+def _standback_reason(timeout: float) -> str:
     for path in filter(None, os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE", "").split(os.pathsep)):
         if Path(path).exists():
             return f"stand-back marker {path} is present"
-    for name, what in (
-        ("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", "an operator recovery is in progress"),
-        ("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD", "the stand-back check says stand back"),
-    ):
-        raw = os.environ.get(name, "").strip()
-        if not raw:
-            continue
-        argv = _argv(name)
-        if argv is None:
-            return f"{name} does not parse"
-        rc, out = _run(argv, CHECK_TIMEOUT_DEFAULT_SEC if timeout is None else timeout)
-        if rc == 1:
-            continue
-        if rc == 0:
-            return f"{what} ({name}: {out[-120:] or 'exit 0'})"
-        return f"{name} could not answer ({'exit ' + str(rc) if rc is not None else out}) — standing back"
-    return ""
+    name = "TT_DEVICE_MCP_MANUAL_RECOVERY_CMD"
+    argv = manual_recovery_argv()
+    if argv is None:
+        return f"no manual-recovery check ({name} unset or unparseable, none installed) — standing back"
+    why = _check(name, argv, "an operator recovery is in progress", timeout)
+    if why:
+        return why
+    name = "TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD"
+    if not os.environ.get(name, "").strip():
+        return ""
+    argv = _argv(name)
+    if argv is None:
+        return f"{name} does not parse"
+    return _check(name, argv, "the stand-back check says stand back", timeout)
+
+
+def _check(name: str, argv: list, what: str, timeout: float) -> str:
+    rc, out = _run(argv, timeout)
+    if rc == 1:
+        return ""
+    if rc == 0:
+        return f"{what} ({name}: {out[-120:] or 'exit 0'})"
+    return f"{name} could not answer ({'exit ' + str(rc) if rc is not None else out}) — standing back"
 
 
 def _state_path() -> Path:
@@ -240,7 +268,14 @@ def page_once(kind: str, log, message: str, **fields) -> None:
         journaled.add(kind)
         log(message)
         health_event(kind, message=message, host_at_risk=True, severity="high", **fields)
-    event = {"kind": kind, "message": message, "host_at_risk": True, "severity": "high", **fields}
+    event = {
+        "kind": kind,
+        "message": message,
+        "host": socket.gethostname(),
+        "host_at_risk": True,
+        "severity": "high",
+        **fields,
+    }
     if alert.send_alert(event) is not None or alert.alert_argv() is None:
         paged.add(kind)
 

@@ -734,7 +734,7 @@ async def test_a_sweep_that_recovers_the_mesh_cancels_the_power_cycle(monkeypatc
 @pytest.mark.parametrize("path", ["idle-escalation", "post-reboot"])
 async def test_the_other_two_roads_to_a_power_cycle_go_through_the_sweep(path):
     """Wiring test for the two host-rung roads the gate ladder does not own: the idle/stuck-hold
-    escalation (`stuck_hold_host_escalation` — the road MOST real power cycles took on blx01/02/03)
+    escalation (`stuck_hold_host_escalation` — the road MOST real power cycles took on boxes A/B/C)
     and the post-reboot cold climb. Both must pass through the last-chance sweep; before ladder-v2
     they climbed to the host rung having only ever re-tried the mesh reset."""
     src = pathlib.Path(galaxy.__file__).read_text()
@@ -760,7 +760,7 @@ async def test_the_last_chance_sweep_never_resets_over_a_tenant(monkeypatch):
 
 
 # --------------------------------- (c3) a RUNNING broker job is a tenant, fd scan or not
-# g15blx02, 2026-09-17 10:07:09Z: the stuck-hold escalation read an empty holder scan 106 s into a
+# box B, 2026-09-17 10:07:09Z: the stuck-hold escalation read an empty holder scan 106 s into a
 # running job (which was compiling, so it held no /dev/tenstorrent fd), fired a mesh reset, and the
 # job died of SIGPIPE at 10:09:18Z the instant the reset released the device. The broker knew the job
 # was RUNNING the whole time — nothing asked it.

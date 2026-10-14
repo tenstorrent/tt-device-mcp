@@ -29,6 +29,7 @@ from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState
 from tt_device_mcp.health.monitors import eth, heartbeat, pci
 from tt_device_mcp.health.recovery import RecoveryDeps, offbus_power_cycle, pcie_guard
+from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as recovery_galaxy
 from tt_device_mcp.server import (
     _ensure_async_primitives,
@@ -429,6 +430,9 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # make the real fire a loud tripwire so a test that DOES reach it fails rather than issuing real
     # reset ioctls / ipmitool. A test exercising the tray-reset path re-patches _fire_ubb_reset itself.
     monkeypatch.delenv("TT_DEVICE_MCP_AUTO_UBB_RESET", raising=False)
+    # The two pins above plus a test's own AUTO_UBB_RESET=0 would read as an operator outage hold and
+    # hold every mesh reset (spec 04 I28); arm it explicitly. A test of the hold deletes this.
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")
 
     def _no_reboot_in_tests():
         raise AssertionError("a test reached the real host reboot; _fire_host_reboot must be mocked")
@@ -722,11 +726,12 @@ def patch_health_event(monkeypatch, fn) -> None:
     ``from health.evidence import health_event`` binding — an import copies the reference, so
     patching one module's copy never touches another's. A test that wants to see (or silence) an
     event any of these bodies emits has to patch all three, and ``pcie_guard`` (the tray re-power
-    envelope and the tray rung's disable, which the walk reaches)."""
+    envelope and the tray rung's disable, which the walk reaches), and ``base`` (the outage hold)."""
     monkeypatch.setattr(srv, "health_event", fn)
     monkeypatch.setattr(recovery_pkg, "health_event", fn)
     monkeypatch.setattr(recovery_galaxy, "health_event", fn)
     monkeypatch.setattr(pcie_guard, "health_event", fn)
+    monkeypatch.setattr(recovery_base, "health_event", fn)
 
 
 def patch_recovery(monkeypatch, name: str, fn) -> None:
