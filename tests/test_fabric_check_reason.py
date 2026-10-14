@@ -179,6 +179,19 @@ def test_wrapper_last_run_log_keeps_both_ends_past_its_cap(tmp_path):
     assert len(log) < 6000
 
 
+@pytest.mark.parametrize("raw", ["4M", "0", "-1", "12", "1e6", "99999999999999999999"])
+@pytest.mark.parametrize("rc", [0, 134])
+def test_a_malformed_last_run_cap_falls_back_to_the_default(tmp_path, raw, rc):
+    """A cap that is not a byte count must not turn the run into a fault (rc 1 reads as a measured
+    fabric fail): the wrapper says so and keeps its verdict, with the default cap."""
+    body = "HEAD-CAUSE\n" + "y" * 20000 + "\nTAIL-VERDICT\n"
+    r = _run_wrapper(tmp_path, body, rc, TTDEV_FABRIC_LAST_RUN_MAX_BYTES=raw)
+    assert r.returncode == (0 if rc == 0 else FABRIC_CHECK_CANNOT_CHECK_RC), r.stderr
+    assert "TTDEV_FABRIC_LAST_RUN_MAX_BYTES" in r.stderr and "4194304" in r.stderr
+    log = (tmp_path / "cache" / "cluster_validation_logs" / "last-run.log").read_text()
+    assert body in log and "bytes cut" not in log
+
+
 @pytest.mark.parametrize(
     "validator_output,cause",
     [
