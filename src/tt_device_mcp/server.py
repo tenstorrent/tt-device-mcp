@@ -145,6 +145,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.health.monitor import journal_interrupted_fabric_check
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
@@ -9172,6 +9173,10 @@ async def run_startup_tasks() -> None:
     if _startup_tasks_done:
         return
     _startup_tasks_done = True
+    # A fabric check the last broker had in flight was cut off by its stop: journal it, once.
+    interrupted = journal_interrupted_fabric_check()
+    if interrupted and logger:
+        logger.warning(f"STARTUP the previous broker stopped mid fabric check: {interrupted}")
     if not should_privsep():
         # No re-adoption sequence for a per-user daemon or a test harness, and — matching that
         # same narrower scope — no forced fabric verify either: this shape has no validator to run
@@ -11132,12 +11137,34 @@ def build_asgi_app(mcp: MCPServer):
 # every WATCHDOG=1 ping, so an unbounded log would flood at the ping interval.
 _sd_notify_errors_logged: set = set()
 
+# The unit says NotifyAccess=main: systemd drops (and logs) a notification from any other pid.
+# The broker's own pid is fixed when it claims the socket at startup; _sd_notify_claim also takes
+# NOTIFY_SOCKET out of the environment so no job, fabric check or tool it spawns inherits it.
+_sd_notify_main_pid: int = os.getpid()
+_sd_notify_addr: str = ""
+
+
+def _sd_notify_claim() -> None:
+    """Called once by the broker process before it spawns anything: remember $NOTIFY_SOCKET and
+    this pid, then drop the variable so children cannot notify as if they were the broker."""
+    global _sd_notify_main_pid, _sd_notify_addr
+    _sd_notify_main_pid = os.getpid()
+    _sd_notify_addr = os.environ.pop("NOTIFY_SOCKET", "") or _sd_notify_addr
+
 
 def _sd_notify(state: str) -> None:
     """Send a notification to systemd via $NOTIFY_SOCKET. No-op when not run under
-    systemd Type=notify. Used for readiness and the watchdog heartbeat."""
-    addr = os.environ.get("NOTIFY_SOCKET")
+    systemd Type=notify. Used for readiness and the watchdog heartbeat. Only the broker's
+    main pid sends: a forked child is refused here, not by systemd's NotifyAccess=main."""
+    addr = os.environ.get("NOTIFY_SOCKET") or _sd_notify_addr
     if not addr:
+        return
+    if os.getpid() != _sd_notify_main_pid:
+        kind = state.split("=", 1)[0]
+        if f"pid:{kind}" not in _sd_notify_errors_logged:
+            _sd_notify_errors_logged.add(f"pid:{kind}")
+            if logger:
+                logger.warning(f"systemd notify {kind} refused from pid {os.getpid()}: only the main pid notifies")
         return
     if addr.startswith("@"):  # abstract namespace
         addr = "\0" + addr[1:]
@@ -11560,6 +11587,9 @@ def main():
 
     if args.no_http and not socket_path:
         parser.error("--no-http requires --socket (or TT_DEVICE_MCP_SOCKET)")
+
+    # Before the first spawn (the platform probe below): only this pid may notify systemd.
+    _sd_notify_claim()
 
     # The boot flow, before anything that reads the subsystem it builds: construct, then resolve
     # which platform this host IS. Preflight below reports capabilities per rung, and the rungs a
