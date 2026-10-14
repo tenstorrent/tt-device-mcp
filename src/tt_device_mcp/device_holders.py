@@ -462,6 +462,26 @@ def _read_proc_ppid(pid: int) -> int | None:
         return None
 
 
+def read_proc_cpu(pid: int) -> tuple[int, str] | None:
+    """Read ``(cpu_ticks, starttime)`` from one /proc/<pid>/stat read; None if gone or unreadable.
+
+    cpu_ticks is utime+stime+cutime+cstime (fields 14-17): the process's own CPU plus that of the
+    children it has reaped, so a parent that farms work out to short-lived children still reads as
+    busy. starttime (field 22) comes from the same read, so the pair names one process even if the
+    pid is reused between reads. Same parsing rule as `_read_proc_starttime`.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    try:
+        rest = raw.rsplit(")", 1)[1].split()
+        return sum(int(v) for v in rest[11:15]), rest[19]
+    except (IndexError, ValueError):
+        return None
+
+
 # Bound on the parent-chain walk: real process trees are a few levels deep, and the bound
 # keeps a pathological or racing /proc from looping.
 _MAX_PARENT_DEPTH = 64

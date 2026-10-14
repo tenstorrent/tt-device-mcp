@@ -135,7 +135,8 @@ job boundary.
   Its message keeps the validator's first error line, on the built-in path and in the wrapper
   script alike: a `what():` line, else a filesystem error, else a logged critical/error/`TT_THROW`
   line, else the `terminate called` banner (which sits ABOVE `what():` and names only the
-  exception type), else the last line.
+  exception type), else the last line. A `TT_FATAL @`/`TT_THROW @` header names only the source
+  line and the failed condition, so it carries the message from the line under its `info:`.
 - **I18 — A healthy device is not reset because a job ended badly.** A timeout or kill is a
   reason to look hard (the full check, fabric included, post-job), then believe the answer. The
   one exception is a runtime-reported device fault, which outranks checks that are blind to it.
@@ -525,6 +526,26 @@ job boundary.
   and every later fabric check is withheld (a 77-only hold, never a reset, reboot or power cycle)
   until an operator restarts the broker. Any later job is outside the bound. A clean pass without the
   marker ends the lift.
+- **I43 — A foreign-holder hold whose holder is gone is verified at once, not reset at the ceiling.**
+  A hold placed only because a tenant held the device when the gate wanted to verify
+  (`why == "foreign_holder"`) carries no measured fault. When the idle relift reaches it (the generic
+  branch, so `TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE` must be on) and a fresh holder scan shows no
+  tenant, no RUNNING job, no reaped job's leftover and a complete scan, it runs the pre-job verify
+  (enum+ARC, no traffic pass) under the device-op lock. It lifts on a healthy read only when no
+  runtime-named fault is pending and the last fabric verdict did not read UNHEALTHY, and only if the
+  hold is still the same undirtied foreign-holder hold after the verify. Any other outcome falls
+  through to the existing ceiling escalation (I23 generic), which is unchanged. A tenant still there
+  means no probe at all. It emits `foreign_holder_verify` with `lifted` either way.
+- **I44 — An idle foreign holder is named, never signalled.** A tenant process (`is_tenant`) that
+  holds a device fd outside every broker job/exec scope and is not a descendant of the broker is
+  tracked by its `/proc/<pid>/stat` CPU time (utime+stime+cutime+cstime), keyed on (pid, starttime)
+  so a reused pid is a new process. Once that CPU time has not changed for
+  `TT_DEVICE_MCP_IDLE_HOLDER_SEC` (default 900 s; 0 or less turns the detector off) the broker emits
+  one `idle_foreign_holder` health event and sends one alert through the I37 hook naming the user
+  and pid; an alert the busy hook dropped is retried on the next scan, the event is not repeated.
+  The sampler drives one detached scan every 60 s. The broker never kills, signals or otherwise
+  touches the holder: this only tells a person who to ask, because nothing bounds a hold beside a
+  live tenant (I13).
 
 ## Interfaces
 
@@ -1052,6 +1073,8 @@ refuses.
 | I40 | `tests/test_startup_fabric_hugepages.py::test_a_77_only_hold_past_its_bound_lifts_on_a_healthy_eth_read`, `tests/test_startup_fabric_hugepages.py::test_a_77_only_hold_with_a_link_drop_climbs_the_ladder_not_released`, `tests/test_startup_fabric_hugepages.py::test_a_second_77_only_hold_inside_the_window_climbs_the_ladder`, `tests/test_startup_fabric_hugepages.py::test_a_77_only_hold_under_its_bound_still_just_holds`, `tests/test_startup_fabric_hugepages.py::test_a_topology_mismatch_hold_is_outside_the_77_bound`, `tests/test_device_safety.py::test_a_reset_that_leaves_the_fabric_unverified_is_unknown`, `tests/test_device_safety.py::test_an_idle_reset_whose_fabric_stays_77_does_not_climb_to_a_host_rung`, `tests/test_fabric_probe.py::test_fabric_classification`, `tests/test_fabric_check_reason.py::test_wrapper_reports_links_missing_after_retrains_as_resettable_not_77` |
 | Fabric action-log row keeps the whole output (head and tail past its ceiling) | `tests/test_startup_fabric_hugepages.py::test_a_skipped_fabric_run_keeps_its_output_in_the_action_log`, `tests/test_startup_fabric_hugepages.py::test_a_failed_fabric_run_keeps_its_full_output_in_the_action_log`, `tests/test_startup_fabric_hugepages.py::test_only_output_past_the_ceiling_is_cut_and_both_ends_kept` |
 | I42 | `tests/test_fabric_check_reason.py::test_a_topology_mismatch_is_a_skip_not_a_measurement`, `tests/test_fabric_check_reason.py::test_an_ok_carrying_the_topology_marker_stays_ok_and_names_the_mismatch`, `tests/test_fabric_check_reason.py::test_wrapper_reruns_a_topology_mismatch_without_the_descriptor_and_ends_on_the_marker`, `tests/test_fabric_check_reason.py::test_wrapper_topology_rerun_that_measures_bad_links_is_unhealthy`, `tests/test_fabric_check_reason.py::test_wrapper_topology_rerun_that_cannot_measure_is_77_and_says_so`, `tests/test_fabric_topology_mismatch.py::test_moved_trays_names_only_chips_whose_tray_changed`, `tests/test_fabric_topology_mismatch.py::test_a_mismatch_reruns_traffic_only_and_an_ok_names_it_and_pages_once`, `tests/test_fabric_topology_mismatch.py::test_a_mismatch_whose_rerun_measures_bad_links_is_unhealthy`, `tests/test_fabric_topology_mismatch.py::test_a_mismatch_whose_rerun_cannot_measure_stays_a_topology_skip`, `tests/test_fabric_topology_mismatch.py::test_the_lift_is_bounded_by_the_first_job_only`, `tests/test_fabric_topology_mismatch.py::test_a_fabric_failure_on_the_first_job_holds_the_check_without_a_reset`, `tests/test_fabric_topology_mismatch.py::test_a_first_job_that_fails_off_the_fabric_is_not_a_topology_fault` |
+| I43 | `tests/test_device_safety.py::test_a_gone_foreign_holder_hold_lifts_on_the_pre_job_verify_without_a_reset`, `tests/test_device_safety.py::test_a_failed_fast_verify_falls_back_to_the_ceiling_reset`, `tests/test_device_safety.py::test_a_failed_fast_verify_inside_the_ceiling_holds`, `tests/test_device_safety.py::test_a_healthy_read_does_not_lift_over_a_named_fault_or_a_bad_fabric_verdict`, `tests/test_device_safety.py::test_the_fast_verify_never_probes_beside_a_tenant`, `tests/test_device_safety.py::test_the_fast_verify_does_not_lift_a_hold_re_dirtied_mid_verify`, `tests/test_device_safety.py::test_idle_relift_escalates_a_generic_arms_neither_hold` |
+| I44 | `tests/test_idle_holder.py::test_a_flat_holder_past_the_threshold_is_named_once_and_never_signalled`, `tests/test_idle_holder.py::test_cpu_time_moving_restarts_the_clock`, `tests/test_idle_holder.py::test_broker_jobs_and_system_holders_are_never_counted`, `tests/test_idle_holder.py::test_a_child_of_the_broker_is_never_counted`, `tests/test_idle_holder.py::test_a_reused_pid_is_a_new_process`, `tests/test_idle_holder.py::test_a_busy_alert_hook_is_retried_without_a_second_event`, `tests/test_idle_holder.py::test_a_gone_holder_is_forgotten`, `tests/test_idle_holder.py::test_threshold_is_configurable`, `tests/test_idle_holder.py::test_threshold_zero_turns_the_detector_off`, `tests/test_idle_holder.py::test_read_proc_cpu_reads_this_process_and_none_for_a_gone_pid`, `tests/test_idle_holder.py::test_the_sampler_spawn_is_rate_limited` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |

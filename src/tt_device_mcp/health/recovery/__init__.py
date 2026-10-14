@@ -262,6 +262,7 @@ class RecoveryDeps:
     hold_device_fabric_unverified: Optional[Callable[[str], None]] = None
     refresh_idle_hold_ledger: Optional[Callable[[], None]] = None
     spawn_idle_relift: Optional[Callable[[], None]] = None
+    watch_idle_holders: Optional[Callable[[], None]] = None
     # The sampler's two FSM reads. Late-bound like everything else here — NOT the fsm reference
     # itself: srv.fsm is the one singleton the test fixtures rebind wholesale (a fresh durable
     # record per test), and a captured reference would keep judging a previous test's episode.

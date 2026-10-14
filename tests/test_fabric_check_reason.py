@@ -34,6 +34,22 @@ _LOGGED = (
     " --- /opt/x/libtt_metal.so(+0x1234)\n"
 )
 _NO_ERROR_LINE = "banner\nsomething odd\nlast words\n"
+# metal's TT_FATAL: the what() header names only the source line and the failed condition; the
+# message itself comes two lines down, under "info:" (as run_cluster_validation printed it when a
+# route was missing on a galaxy).
+_TT_FATAL = (
+    "2026-10-14 08:55:40.1 | info     | Device | Opening 32 chips\n"
+    "terminate called after throwing an instance of 'std::runtime_error'\n"
+    "  what():  TT_FATAL @ /opt/v/tt_metal/fabric/fabric.cpp:173: forwarding_direction.has_value()\n"
+    "info:\n"
+    "Could not find any forwarding direction from src (M0, D0) to dst (M0, D28)\n"
+    "backtrace:\n"
+    " --- /opt/v/build/lib/libtt_metal.so(+0x18ebee8)\n"
+)
+_TT_FATAL_REASON = (
+    "what():  TT_FATAL @ /opt/v/tt_metal/fabric/fabric.cpp:173: forwarding_direction.has_value()"
+    " -- Could not find any forwarding direction from src (M0, D0) to dst (M0, D28)"
+)
 
 
 @pytest.mark.parametrize(
@@ -47,6 +63,9 @@ _NO_ERROR_LINE = "banner\nsomething odd\nlast words\n"
             "filesystem error: cannot create directory: Permission denied",
         ),
         (_NO_ERROR_LINE, None),
+        (_TT_FATAL, _TT_FATAL_REASON),
+        # An "info:" line that does not follow the matched line is not its message.
+        ("  what():  TT_FATAL @ a.cpp:1: x\nbacktrace:\ninfo:\nunrelated\n", "what():  TT_FATAL @ a.cpp:1: x"),
     ],
 )
 def test_first_reason_prefers_the_cause_over_the_terminate_banner(output, expected):
@@ -88,6 +107,7 @@ def _run_wrapper(tmp_path, validator_output: str, rc: int):
         (_UNCAUGHT, "what():  Hugepages are not allocated for channel: 0"),
         (_LOGGED, "TT_THROW @ sysmem.cpp:362: IOMMU is required"),
         (_NO_ERROR_LINE, "last output: last words"),
+        (_TT_FATAL, _TT_FATAL_REASON),
     ],
 )
 def test_wrapper_77_final_line_keeps_the_validators_first_error_line(tmp_path, validator_output, cause):
