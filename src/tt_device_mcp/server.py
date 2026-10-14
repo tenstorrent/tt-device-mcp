@@ -1005,6 +1005,7 @@ _recovery_deps = RecoveryDeps(
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
     hold_device_fabric_unverified=lambda why: _hold_device_fabric_unverified(why),
+    note_fabric_77_reset_passes=lambda n: _note_fabric_77_reset_passes(n),
     refresh_idle_hold_ledger=lambda: _refresh_idle_hold_ledger(),
     spawn_idle_relift=lambda: _maybe_spawn_idle_relift(),
     episode_dirty=lambda: fsm.record.dirty,
@@ -3282,6 +3283,15 @@ def _fabric_77_bound_reached() -> bool:
     except (TypeError, ValueError):
         return False
     return age >= _env_int("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", 600, 60)
+
+
+def _note_fabric_77_reset_passes(passes: int) -> None:
+    """Count a reset's post-reset 77 passes toward the open episode's I41 bound: they ran on freshly
+    retrained links, so the next relift's 77 falls back at once rather than re-running them."""
+    global _fabric_77_streak_since, _fabric_77_streak
+    if _fabric_77_streak_since != fsm.record.since:
+        _fabric_77_streak_since, _fabric_77_streak = fsm.record.since, 0
+    _fabric_77_streak = max(_fabric_77_streak + passes, _env_int("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", 3, 1) - 1)
 
 
 async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
