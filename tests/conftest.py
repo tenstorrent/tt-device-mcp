@@ -332,6 +332,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv.health_monitor, "_glx_cache", None)
 
     monkeypatch.setattr(srv, "device_fault_reported", "", raising=False)
+    # Many tests assign srv.isolated_chips directly; a leaked chip makes a later hold not 77-only.
+    monkeypatch.setattr(srv, "isolated_chips", set())
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
     # Whether the last reset EXITED non-zero. Left set it would steer the NEXT test's gate
