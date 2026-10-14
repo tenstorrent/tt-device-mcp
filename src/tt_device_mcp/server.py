@@ -1365,11 +1365,12 @@ device_pci_map: dict = {}
 
 # Daemons that continuously poll every chip. They are stopped for the duration of
 # a reset: MMIO aimed at a chip that is mid-reset (or already dead) is what pushes
-# the root complex into the fatal error path that reboots the host. tt-fmax-cap.service writes the
-# clock cap to every chip, so a reset or fabric op racing it is the same hazard; it is in the default
-# list on every host. A unit a host does not have answers `systemctl` non-zero and is skipped, so
-# naming it costs nothing there.
-DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service,tt-fmax-cap.service"
+# the root complex into the fatal error path that reboots the host. A host
+# running another unit that reads or writes the chips (a clock-cap keeper, say) names it in
+# TT_DEVICE_MCP_POLLER_SERVICES. The default lists no clock-cap keeper: a reset restarts every unit
+# it lists, which would bring back a keeper the host masked. A unit a host does not have answers
+# `systemctl` non-zero and is skipped.
+DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service"
 DEVICE_POLLER_SERVICES = tuple(
     s for s in os.environ.get("TT_DEVICE_MCP_POLLER_SERVICES", DEFAULT_POLLER_SERVICES).split(",") if s.strip()
 )
@@ -3264,16 +3265,21 @@ def _env_int(name: str, default: int, floor: int) -> int:
         return default
 
 
-# A topology-mismatch skip, and the hardware fault the first job after its lift names, are holds no
-# fallback release may lift: the cabling is not what the descriptor says, and enum+ARC and the eth
-# read cannot see that. They stay outside the I40 budget and release.
-_TOPOLOGY_HOLD_PREFIX = "topology mismatch"
+# The hardware fault the first job after a topology-mismatch lift names is a hold no fallback release
+# may lift: that job proved the links the traffic-only pass skipped are needed, and enum+ARC and the
+# eth read cannot see them. It stays outside the I40 budget and release. A topology mismatch whose
+# traffic-only rerun could not run is inside the bound (I45): its eth read is judged against the
+# link mark re-baselined for this chip-to-bus map, and a release is watched like a lift.
+_TOPOLOGY_HOLD = "topology mismatch"
 _TOPOLOGY_HW_FAULT = "hardware fault: the first job after a topology-mismatch lift"
 
 
-def _topology_mismatch_hold(evidence: dict) -> bool:
-    details = (str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or ""))
-    return any(d.startswith(_TOPOLOGY_HOLD_PREFIX) or _TOPOLOGY_HW_FAULT in d for d in details)
+def _hold_details(evidence: dict) -> tuple[str, str]:
+    return str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or "")
+
+
+def _topology_hw_fault_hold(evidence: dict) -> bool:
+    return bool(health_monitor.topology_hw_fault) or any(_TOPOLOGY_HW_FAULT in d for d in _hold_details(evidence))
 
 
 def _fabric_77_bound_reached() -> bool:
@@ -3328,6 +3334,9 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
             "WITH A WARNING: the fabric is unverified, the next gate re-runs the pass"
         )
         health_event("device_relift_fabric_unverified", evidence=evidence, retries=_fabric_77_streak)
+        if any(_TOPOLOGY_HOLD in d for d in _hold_details(evidence)):
+            # The release is a lift onto links no traffic crossed: the first job bounds it (I42).
+            health_monitor.topology_lift_pending = True
         _clear_device_dirty(
             verified=True, why="idle relift: fabric check unrunnable past its bound; startup checks pass"
         )
@@ -3495,7 +3504,7 @@ async def _attempt_idle_relift() -> None:
                 if (
                     fabric_ok is None
                     and _fabric_77_only_hold()
-                    and not _topology_mismatch_hold(evidence)
+                    and not _topology_hw_fault_hold(evidence)
                     and _fabric_77_bound_reached()
                 ):
                     # I40: a pass that cannot run is retried a bounded number of times, never
@@ -10452,8 +10461,8 @@ def create_mcp_server() -> MCPServer:
 
         Duration: about 2 minutes on a healthy Galaxy (reset ~60s + fabric pass
         45-75s), about 4 minutes when the first fabric pass finds no trained link
-        and is re-checked after a 60s wait. Worst case at the defaults: about 27
-        minutes (poller stop and restart up to 180s + reset 600s + PCI rescan 3s
+        and is re-checked after a 60s wait. Worst case at the defaults: about 26
+        minutes (poller stop and restart up to 120s + reset 600s + PCI rescan 3s
         + a first verify pass of up to 361s + the 60s wait + a last verify pass
         of up to 436s, which adds the 75s kill of a timed-out check). Only the
         last pass can time out: a re-check follows a pass that finished. Each
