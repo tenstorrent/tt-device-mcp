@@ -3881,9 +3881,12 @@ async def _attempt_idle_relift() -> None:
                     # failure: none of that is the gate. A chip that left the bus came back through a
                     # reset of some kind (its own, a tray's, the driver's), so the lift waits for the
                     # full health gate, fabric included, exactly as after any reset (spec 03 I50).
-                    gate_ok, evidence = await _offbus_return_full_gate(expected, _log)
-                    if not gate_ok:
-                        return
+                    # A per-user daemon has no staged fabric validator, so no pass of its could ever
+                    # read True; its start-probe hold (also off_bus) lifts on the enum+ARC re-read.
+                    if should_privsep():
+                        gate_ok, evidence = await _offbus_return_full_gate(expected, _log)
+                        if not gate_ok:
+                            return
             # Re-assert under the lock AFTER the long awaits above: the sampler's dead-chip path is
             # lock-free (_isolate_dead_chips marks the device dirty without _device_op), so a chip can
             # have dropped during _verify_device or the eth read, re-raising dirty after the guard at
@@ -3940,6 +3943,8 @@ def _down_offbus_recheck_armed() -> bool:
     operator, a driver rescan) leave nothing for it to wait on: the full gate decides (spec 03 I50)."""
     if fsm.state is not ServerState.DOWN or fsm.record.why not in OFFBUS_RECHECK_WHYS:
         return False
+    if not should_privsep():
+        return False  # a per-user daemon has no fabric validator: its full gate could never pass
     indices = _present_chip_indices()
     return bool(indices) and len(indices) >= health_monitor.expected(len(indices))
 

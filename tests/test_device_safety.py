@@ -8551,6 +8551,7 @@ def _setup_selfheal_hold(monkeypatch, tmp_path, *, n_present=31):
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
     patch_health_event(monkeypatch, lambda *a, **k: None)
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)  # no detached reset cycling
+    monkeypatch.setattr(srv, "should_privsep", lambda: True)  # the system broker, with a fabric validator
     srv.device_op_lock = None
     srv.device_op_active = ""
     fsm_dirty(srv, "gate/post-job: eth-core heartbeat frozen — held, not reset", why="eth_frozen")
@@ -8756,6 +8757,35 @@ async def test_a_down_offbus_recheck_is_paced(monkeypatch, tmp_path, clear_job_s
     await srv._attempt_down_offbus_recheck()
 
     assert calls == [True], "the second tick inside the interval runs nothing"
+
+
+@pytest.mark.asyncio
+async def test_a_per_user_daemon_neither_arms_the_down_offbus_recheck_nor_gates_on_fabric(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """A per-user daemon has no staged fabric validator, so its full gate could never read True: the
+    DOWN re-check is not armed there, and its off_bus start-probe hold lifts on the enum+ARC re-read
+    (spec 03 I4) instead of standing forever on a fabric pass that cannot run."""
+    _setup_down_offbus(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "should_privsep", lambda: False)
+    assert not srv._down_offbus_recheck_armed()
+
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    monkeypatch.setattr(srv, "should_privsep", lambda: False)
+    fsm_healthy(srv)
+    fsm_dirty(srv, "startup: probe unhealthy — held until it reads healthy", why="off_bus")
+    calls = _recording_verify(monkeypatch, None)
+
+    async def eth_unconfigured(timeout_sec=60.0):
+        return None, "skipped"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_unconfigured)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+
+    await srv._attempt_idle_relift()
+
+    assert srv.fsm.state is ServerState.HEALTHY, "a per-user start hold must lift once the device reads healthy"
+    assert True not in calls, "a per-user daemon has no fabric pass to run"
 
 
 @pytest.mark.asyncio
