@@ -7663,6 +7663,14 @@ export {JOB_TAG_ENV}={job_tag}
                 # Scanning only the benign exits threw the specific evidence away on exactly
                 # the jobs that died of it, leaving a generic "ended failed" the gate then
                 # cleared on the word of checks that cannot see this fault at all.
+                # The first job after a topology-mismatch lift is the bound on that lift: one that
+                # dies on the fabric makes it a hardware fault, held without a reset (03 I42).
+                if health_monitor is not None:
+                    topo = health_monitor.note_job_after_topology_lift(
+                        job.status != JobStatus.COMPLETED, _read_job_log_tail(job_log_file)
+                    )
+                    if topo:
+                        _hold_device_fabric_unverified(f"job {job_id}: {topo}")
                 fault = _scan_output_for_device_fault(job_log_file)
                 if fault:
                     _mark_device_reported_fault(f"job {job_id} {fault}", job=job)
