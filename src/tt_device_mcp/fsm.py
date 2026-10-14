@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from tt_device_mcp import metrics, privileges
 from tt_device_mcp.health import (
+    FABRIC_DEBT,
     OUTCOME_RECOVERED,
     OUTCOME_TERMINAL,
     RESET_MODE_GALAXY,
@@ -52,7 +53,6 @@ from tt_device_mcp.health import (
     _persistent_recovery,
     _select_recovery,
 )
-from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.telemetry import TelemetrySampler
 
 if TYPE_CHECKING:

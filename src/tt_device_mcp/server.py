@@ -90,6 +90,7 @@ from tt_device_mcp.health import (
     BLOCKED,
     CEILING,
     DEFER,
+    FABRIC_DEBT,
     HOLD_ESCALATION_REARM_SEC,
     HOLD_FABRIC_UNVERIFIED,
     OUTCOME_RECOVERED,
@@ -146,7 +147,6 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
-from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
