@@ -6296,7 +6296,9 @@ async def test_a_talking_job_is_never_announced_silent(monkeypatch, clear_job_st
     _quiet_post_job_gate(monkeypatch)
     _no_workspace_activation(monkeypatch)
     monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 0)
-    monkeypatch.setattr(srv, "HUNG_NOTICE_SEC", 1)
+    # Each gap is 0.3 s, ten times inside the notice, so a loaded host's scheduler delay
+    # cannot stretch one past it; the run as a whole still outlasts the notice.
+    monkeypatch.setattr(srv, "HUNG_NOTICE_SEC", 3)
     monkeypatch.setattr(srv, "HUNG_POLL_SEC", 0.05)
 
     log = tmp_path / "job3.log"
@@ -6304,7 +6306,7 @@ async def test_a_talking_job_is_never_announced_silent(monkeypatch, clear_job_st
         id="907",
         owner="tenant",
         workspace="/tmp",
-        command="for i in 1 2 3 4 5 6; do echo tick $i; sleep 0.3; done",
+        command="for i in $(seq 1 16); do echo tick $i; sleep 0.3; done",
         queued_at="t",
     )
     job.log_file = str(log)
@@ -6317,7 +6319,10 @@ async def test_a_talking_job_is_never_announced_silent(monkeypatch, clear_job_st
             if job.finished_at is not None:
                 break
             await asyncio.sleep(0.05)
-        assert "no output for" not in log.read_text(), "called a job that never stopped talking silent"
+        assert job.finished_at is not None, "job did not finish"
+        text = log.read_text()
+        assert "tick 16" in text, "job did not run long enough to outlast the notice"
+        assert "no output for" not in text, "called a job that never stopped talking silent"
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)

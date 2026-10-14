@@ -12,6 +12,7 @@ then escalated that hold to a glx_reset 120 s later — a reset that cannot prod
 """
 
 import asyncio
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -20,6 +21,7 @@ from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
 from tt_device_mcp import server as srv
 from tt_device_mcp.constants import FABRIC_CHECK_CANNOT_CHECK_RC
 from tt_device_mcp.fsm import ServerState
+from tt_device_mcp.health import evidence
 from tt_device_mcp.health import monitor as health_monitor_mod
 from tt_device_mcp.health.monitors import hostpci, pci
 
@@ -188,6 +190,51 @@ async def test_a_failed_fabric_run_keeps_its_full_output_in_the_action_log(monke
     row = [t for t in logs if "first error: link 3 down" in t]
     assert row, "the head of a long failed run, where the validator names the cause, must be in its action log"
     assert "fabric-check: verdict at the tail" in row[0] and "progress line 1000 " in row[0]
+
+
+@pytest.mark.asyncio
+async def test_a_77_run_keeps_its_stderr_tail_and_exit_code_in_an_incident_bundle(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """A 77 that aborted before any link test named its cause only on stderr, and nothing kept it:
+    the cause took a rerun to read. Its tail and exit code now go to an incident bundle the detail
+    names; a rerun with the same reason reuses that bundle instead of rotating others out. Fails on
+    base, which wrote no bundle."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path / "jobs")
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "_action_row", None, raising=False)
+    monkeypatch.setattr(srv.health_monitor, "_fabric_skip_incident", None, raising=False)
+    monkeypatch.setattr(evidence, "_kernel_evidence", lambda: "(kernel log stubbed)")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    pad_line = "p" * 99 + "\n"
+    pad = health_monitor_mod.FABRIC_SKIP_OUTPUT_TAIL_BYTES // len(pad_line) + 10
+    monkeypatch.setenv(
+        "TT_DEVICE_MCP_FABRIC_CHECK_CMD",
+        f"echo 'fabric-check: head line'; for i in $(seq {pad}); do echo {'p' * 99}; done; "
+        "echo '  what():  Hugepages are not allocated for channel: 0' >&2; "
+        f"echo 'fabric-check: no link was tested -> CANNOT CHECK' >&2; exit {FABRIC_CHECK_CANNOT_CHECK_RC}",
+    )
+
+    ok, detail = await srv.health_monitor.verify_fabric_health(timeout_sec=30)
+
+    assert ok is None
+    bundles = sorted((evidence.health_dir() / evidence.INCIDENTS_DIR).glob("*_fabric_cannot_check_*"))
+    assert len(bundles) == 1, "a 77 run must leave an incident bundle"
+    assert f"exit {FABRIC_CHECK_CANNOT_CHECK_RC}, output in {bundles[0]}/fabric.log" in detail
+    log = (bundles[0] / "fabric.log").read_text()
+    assert "what():  Hugepages are not allocated for channel: 0" in log, "the stderr tail names the cause"
+    assert log.rstrip().endswith("CANNOT CHECK")
+    assert "fabric-check: head line" not in log and "bytes cut" in log, "only the tail is kept"
+    assert len(log.encode()) <= health_monitor_mod.FABRIC_SKIP_OUTPUT_TAIL_BYTES + 64
+    meta = json.loads((bundles[0] / "incident.json").read_text())
+    assert meta["evidence"]["rc"] == FABRIC_CHECK_CANNOT_CHECK_RC
+    assert "Hugepages are not allocated" in meta["evidence"]["reason"]
+
+    ok, again = await srv.health_monitor.verify_fabric_health(timeout_sec=30)
+
+    assert ok is None
+    assert sorted((evidence.health_dir() / evidence.INCIDENTS_DIR).glob("*_fabric_cannot_check_*")) == bundles
+    assert str(bundles[0]) in again
 
 
 def test_only_output_past_the_ceiling_is_cut_and_both_ends_kept():
