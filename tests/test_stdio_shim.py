@@ -277,7 +277,9 @@ async def test_a_wrapped_failure_is_retried_only_if_every_part_says_never_delive
 async def test_a_tool_call_longer_than_the_read_timeout_completes_on_keepalives(tmp_path, monkeypatch, clear_job_state):
     """The shim's SSE read timeout bounds the gap between reads, not the call: a reset on a mesh can
     run for minutes with nothing to send, and the broker's SSE keepalives are what hold the line open.
-    Scaled down: the reset tool takes 3x the shim's read timeout and must still return its result."""
+    Scaled down: the reset tool takes 3x the shim's read timeout and must still return its result.
+    The read timeout is 20 ping intervals: a loaded test host stalls the shared event loop for
+    over half a second (seen at load 128), and a tighter margin read that stall as a lost line."""
     import sse_starlette
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
@@ -286,7 +288,7 @@ async def test_a_tool_call_longer_than_the_read_timeout_completes_on_keepalives(
     from tt_device_mcp.device_holders import HolderScan
     from tt_device_mcp.socket_transport import serve_unix_socket
 
-    read_timeout = 0.5
+    read_timeout = 2.0
     monkeypatch.setattr(stdio_shim, "_SSE_READ_TIMEOUT_SEC", read_timeout)
     monkeypatch.setattr(sse_starlette.EventSourceResponse, "DEFAULT_PING_INTERVAL", 0.1)
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
@@ -302,7 +304,7 @@ async def test_a_tool_call_longer_than_the_read_timeout_completes_on_keepalives(
 
     socket_path = str(tmp_path / "broker.sock")
     uv_server = await serve_unix_socket(server.build_asgi_app(server.create_mcp_server()), socket_path)
-    for _ in range(50):
+    for _ in range(400):  # up to 20 s: a loaded host starts uvicorn slowly
         if uv_server.started:
             break
         await asyncio.sleep(0.05)
@@ -316,7 +318,7 @@ async def test_a_tool_call_longer_than_the_read_timeout_completes_on_keepalives(
                     await session.initialize()
                     t0 = time.monotonic()
                     result = await asyncio.wait_for(
-                        session.call_tool("tt_device_reset", {"params": {"force": False}}), timeout=10
+                        session.call_tool("tt_device_reset", {"params": {"force": False}}), timeout=30
                     )
                     elapsed = time.monotonic() - t0
     finally:
@@ -328,8 +330,8 @@ async def test_a_tool_call_longer_than_the_read_timeout_completes_on_keepalives(
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 task.cancel()
 
-    assert elapsed > 2 * read_timeout, "the call must outlast the read timeout to prove anything"
     assert not result.is_error, result
     payload = result.structured_content or json.loads(result.content[0].text)
     payload = payload.get("result", payload)
     assert payload["status"] == "reset_failed" and payload["returncode"] == 1, payload
+    assert elapsed > 2 * read_timeout, "the call must outlast the read timeout to prove anything"
