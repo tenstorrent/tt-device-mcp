@@ -168,6 +168,36 @@ async def test_a_skipped_fabric_run_keeps_its_output_in_the_action_log(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_a_failed_fabric_run_keeps_its_full_output_in_the_action_log(monkeypatch, tmp_path, clear_job_state):
+    """The validator names the cause near the head of a long run and the verdict at its tail: the row
+    keeps both. Fails on base, which kept only the last 8000 chars and lost the first error line."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "_action_row", None, raising=False)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setenv(
+        "TT_DEVICE_MCP_FABRIC_CHECK_CMD",
+        "echo 'first error: link 3 down'; for i in $(seq 2000); do echo \"progress line $i padding padding\"; done; "
+        "echo 'fabric-check: verdict at the tail'; exit 1",
+    )
+
+    ok, _detail = await srv.health_monitor.verify_fabric_health(timeout_sec=30)
+
+    assert ok is False
+    logs = [p.read_text() for p in tmp_path.rglob("*") if p.is_file()]
+    row = [t for t in logs if "first error: link 3 down" in t]
+    assert row, "the head of a long failed run, where the validator names the cause, must be in its action log"
+    assert "fabric-check: verdict at the tail" in row[0] and "progress line 1000 " in row[0]
+
+
+def test_only_output_past_the_ceiling_is_cut_and_both_ends_kept():
+    big = "H" * health_monitor_mod.ACTION_LOG_OUTPUT_CHARS + "T" * 10
+    out = health_monitor_mod._action_log_output(big)
+    assert out.startswith("H") and out.endswith("T" * 10) and "chars cut" in out
+    assert health_monitor_mod._action_log_output("short") == "short"
+
+
+@pytest.mark.asyncio
 async def test_a_healthy_fabric_run_keeps_its_action_log_short(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     monkeypatch.setattr(srv, "jobs", {})

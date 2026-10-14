@@ -35,8 +35,17 @@ from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
 
 # How much of a fabric run's output the action-log row keeps for a run that got no healthy verdict:
-# the tail, where a wrapper prints its verdict, bounded so a chatty validator cannot fill the disk.
-ACTION_LOG_OUTPUT_CHARS = 8000
+# all of it, since the validator's first error line (the cause) sits near the head and a wrapper's
+# verdict at the tail. Only past this ceiling, so a chatty validator cannot fill the disk, is the
+# middle cut, keeping both ends.
+ACTION_LOG_OUTPUT_CHARS = 256 * 1024
+
+
+def _action_log_output(text: str) -> str:
+    if len(text) <= ACTION_LOG_OUTPUT_CHARS:
+        return text
+    half = ACTION_LOG_OUTPUT_CHARS // 2
+    return f"{text[:half]}\n[... {len(text) - 2 * half} chars cut ...]\n{text[-half:]}"
 
 
 def _override_reason(text: str) -> str:
@@ -713,7 +722,7 @@ class HealthMonitor:
         else:
             # A run that got no healthy verdict is the one an operator opens the row for, and the
             # broker journal keeps only a line of it — so the row carries the output itself.
-            self._write_action_log("[broker]fabric-check", cmd, dt, status, rc, output=text[-ACTION_LOG_OUTPUT_CHARS:])
+            self._write_action_log("[broker]fabric-check", cmd, dt, status, rc, output=_action_log_output(text))
 
         if ok is True:
             self.last_fabric_ok = True
