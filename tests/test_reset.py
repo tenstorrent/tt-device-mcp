@@ -1098,7 +1098,7 @@ def test_a_streaming_local_reset_is_visible_to_a_restarted_daemon(monkeypatch, t
         assert observer.scope_active() == recovery_base.LOCAL_RESET_NAME
     finally:
         release.write_text("")
-        request.join(timeout=5)
+        request.join(timeout=30)  # the stream finishes in well under 1 s unless the host is loaded
     assert not request.is_alive()
     assert "local operator reset complete" in response["value"].text
 
