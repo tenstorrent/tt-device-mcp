@@ -120,13 +120,24 @@ _REASON_PATTERNS = (
     re.compile(r"terminate called.*"),
 )
 
+# metal's TT_FATAL/TT_THROW header names only the source line and the failed condition
+# ("TT_FATAL @ fabric.cpp:173: forwarding_direction.has_value()"); the message itself is on the
+# line after a bare "info:" right below it, so the header alone said where it failed and not why.
+_ASSERT_HEADER = re.compile(r"TT_(?:FATAL|THROW) @ ")
+_ASSERT_INFO = re.compile(r"[^\n]*\n[ \t]*info:[ \t]*\n[ \t]*(\S[^\n]*)")
+
 
 def first_reason(output: str) -> Optional[str]:
-    """The validator's first error line, by :data:`_REASON_PATTERNS` priority, or ``None``."""
+    """The validator's first error line, by :data:`_REASON_PATTERNS` priority, or ``None``.
+    A TT_FATAL/TT_THROW header line gets its "info:" message appended."""
     for pat in _REASON_PATTERNS:
         m = pat.search(output)
         if m:
-            return m.group(0).strip()[:300]
+            reason = m.group(0).strip()
+            info = _ASSERT_INFO.match(output, m.end()) if _ASSERT_HEADER.search(reason) else None
+            if info:
+                return f"{reason[:200]} -- {info.group(1).strip()[:200]}"
+            return reason[:300]
     return None
 
 
