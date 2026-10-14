@@ -2732,13 +2732,14 @@ async def test_pollers_quiesce_stays_quiet_when_no_pollers_are_configured(monkey
     assert health.read_health_events(kinds={"pollers_none_active"}) == []
 
 
-DEFAULT_POLLERS = ("tt-telemetry.service", "tt-metrics-exporter.service", "tt-fmax-cap.service")
+DEFAULT_POLLERS = ("tt-telemetry.service", "tt-metrics-exporter.service")
 
 
-def test_fmax_cap_is_a_default_poller_on_every_host():
-    """tt-fmax-cap writes the clock cap to every chip, so a reset racing it is the MMIO hazard the
-    quiesce exists for. It is in the code default, not a per-host opt-in."""
+def test_no_clock_cap_keeper_in_the_default_pollers():
+    """A reset restarts every listed poller, so a clock-cap keeper in the default would come back on
+    a host that masked it. The default names none; a host that runs one opts in by env."""
     assert srv.DEFAULT_POLLER_SERVICES.split(",") == list(DEFAULT_POLLERS)
+    assert "fmax" not in srv.DEFAULT_POLLER_SERVICES
 
 
 def _systemctl_with_units(installed, calls):
@@ -2761,9 +2762,9 @@ def _systemctl_with_units(installed, calls):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("active", [False, True])
 async def test_pollers_quiesce_skips_a_default_poller_the_host_does_not_have(monkeypatch, active):
-    """A host without tt-fmax-cap behaves as before it joined the default: the other pollers are
-    stopped and restarted, the missing unit is skipped, and no none-active alarm fires."""
-    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    """A host without a listed poller: the others are stopped and restarted, the missing unit is
+    skipped, and no none-active alarm fires."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS + ("tt-fmax-cap.service",))
     calls = []
     monkeypatch.setattr(
         srv.asyncio,
@@ -2780,15 +2781,16 @@ async def test_pollers_quiesce_skips_a_default_poller_the_host_does_not_have(mon
 
 
 @pytest.mark.asyncio
-async def test_pollers_quiesce_stops_and_restarts_fmax_cap_where_installed(monkeypatch):
-    """Where tt-fmax-cap is installed, the reset quiesce stops it with the other pollers and the
-    restore starts it again."""
-    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+async def test_pollers_quiesce_stops_and_restarts_an_opted_in_fmax_cap(monkeypatch):
+    """A host that opts tt-fmax-cap in via the env list gets it stopped with the other pollers and
+    started again by the restore."""
+    listed = DEFAULT_POLLERS + ("tt-fmax-cap.service",)
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", listed)
     calls = []
-    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(listed), calls))
 
-    assert await srv._set_device_pollers(False, lambda m: None) == list(DEFAULT_POLLERS)
-    assert await srv._set_device_pollers(True, lambda m: None) == list(DEFAULT_POLLERS)
+    assert await srv._set_device_pollers(False, lambda m: None) == list(listed)
+    assert await srv._set_device_pollers(True, lambda m: None) == list(listed)
     assert ("stop", "tt-fmax-cap.service") in calls
     assert ("start", "tt-fmax-cap.service") in calls
 
