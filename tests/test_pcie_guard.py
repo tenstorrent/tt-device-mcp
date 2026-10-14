@@ -782,6 +782,7 @@ async def test_the_between_jobs_check_lifts_the_latch_once_the_mesh_is_back(sysf
 @pytest.mark.asyncio
 async def test_a_tray_re_power_carries_an_intent_and_ends_it(monkeypatch, clear_job_state, galaxy_trays):
     """The walk writes the intent before it fires and removes it once its verify is over."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-a")
     patch_health_event(monkeypatch, lambda *a, **k: None)
     intent = pcie_guard.health_dir() / pcie_guard.INTENT_FILE

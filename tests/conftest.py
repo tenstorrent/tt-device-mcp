@@ -432,6 +432,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # make the real fire a loud tripwire so a test that DOES reach it fails rather than issuing real
     # reset ioctls / ipmitool. A test exercising the tray-reset path re-patches _fire_ubb_reset itself.
     monkeypatch.delenv("TT_DEVICE_MCP_AUTO_UBB_RESET", raising=False)
+    # A developer shell that opted the single-tray walk back in must not change what the suite tests.
+    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
     # The two pins above plus a test's own AUTO_UBB_RESET=0 would read as an operator outage hold and
     # hold every mesh reset (spec 04 I28); arm it explicitly. A test of the hold deletes this.
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")

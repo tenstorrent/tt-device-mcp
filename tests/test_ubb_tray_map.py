@@ -371,6 +371,7 @@ async def test_after_a_renumbering_the_walk_re_powers_the_tray_of_the_chips_new_
     """What the re-bank is for: chip 24 now sits on 0xC1, so its drop is a tray-3 drop. The first
     mask is 0x04 and the handshake quiesces tray 3's chips as the kernel numbers them now. Fails on
     2bb8128: the stale map still put chip 24 on 0x81 and fired 0x08 at tray 4's healthy chips."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     _recording_events(monkeypatch)
     _seed_sysfs(tmp_path, RENUMBERED_CHIP_BUSES)
     srv.health_monitor.verify_device_health(32, timeout_sec=5)
@@ -551,6 +552,7 @@ async def test_the_walk_re_powers_the_tray_the_dropped_chips_actually_sit_on(mon
     and the ioctl handshake must quiesce chips 24-31. Read by position from tt-smi's PCI-ordered
     list this was 0x04 — bit 2 — which re-powers tray 3's eight healthy chips and leaves the
     dropped tray down."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired = []
     srv.fsm.set_latch("ubb_reset_fired", False)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
@@ -575,6 +577,7 @@ async def test_the_walk_re_powers_the_tray_the_dropped_chips_actually_sit_on(mon
 async def test_a_lone_off_bus_chip_24_re_powers_tray_4_first(monkeypatch, galaxy_seen, clear_job_state):
     """Issue #27's case: chip 24 (0000:81:00.0) off the bus. The first mask must be 0x08 (tray 4),
     not 0x04, and the log line names the tray, its BMC mask and its chips."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired, lines = [], []
     srv.fsm.set_latch("ubb_reset_fired", False)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")

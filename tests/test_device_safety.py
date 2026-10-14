@@ -7801,6 +7801,7 @@ async def test_a_recovered_ubb_tray_reset_releases_without_the_mesh_wide_reset(
     """A clean below-floor whole-tray drop, opted in, fires the per-tray BMC reset instead of
     holding, and a walk that verifies healthy reopens the door — the mesh-wide reset (which inverts
     a below-floor drop) never runs."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     _reach_reboot_rung(monkeypatch, tmp_path, n_present=24)
     srv.isolated_chips = set()
     srv.device_pci_map = {}
@@ -9816,6 +9817,7 @@ async def test_escalate_recovers_via_a_ubb_tray_reset(monkeypatch, clear_job_sta
     """Closes the UBB-tray-recovered branch's escalate()-level coverage gap: the per-tray BMC
     reset (neither the surgical bridge reset nor the mesh-wide reset) is what clears the hold, and
     escalate() must report RECOVERED for it exactly as for the other two recovering rungs."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=8, isolated=set())  # chips 24-31 = tray 3
     _make_clear_fns_real(monkeypatch, counters)
     fsm_dirty(srv, "test")
@@ -10653,6 +10655,7 @@ async def test_ubb_tray_reset_fires_and_recovers_a_clean_tray_down_when_opted_in
     recovery — instead of holding. A reset that verifies healthy retires the fault and clears the hold,
     and the mesh-wide galaxy reset (which would invert the below-floor drop) never runs. Fails on base,
     which has no tray-reset rung: the tray-down holds and no fire is issued."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired = {"n": 0}
     counters = _arm_offbus_stuck_hold(
         monkeypatch, off_bus=8, isolated=set(), sbr_verify_healthy=True  # chips 24-31 = tray 3
@@ -10679,6 +10682,7 @@ async def test_ubb_tray_reset_fires_on_a_partial_tray_below_floor_drop(monkeypat
     holding. Re-powering the tray bounces its live chips too, but that is strictly lighter than the
     32-chip mesh reset (which inverts a partial drop off the bus). chips 28-31 off is half of tray 3.
     Fails on base, whose clean-tray-down-only rung returns None here and holds silently."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired = {"n": 0}
     counters = _arm_offbus_stuck_hold(
         monkeypatch, off_bus=4, isolated=set(), sbr_verify_healthy=True  # 28-31 off = half tray 3
@@ -10705,6 +10709,7 @@ async def test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_affected_t
     and then the host rung (a warm reboot cannot re-enumerate a still-off-bus tray, so the cold power
     cycle is the only rung left), loudly when none is opted in, and the episode's one walk is spent so
     it does not loop. Fails on base, which falls to a silent below-floor hold."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired = {"n": 0}
     counters = _arm_offbus_stuck_hold(
         monkeypatch, off_bus=8, isolated=set(), sbr_verify_healthy=False, reset_result=False
@@ -10735,6 +10740,7 @@ async def test_ubb_tray_reset_fires_at_most_once_per_hold_episode(monkeypatch, c
     """The per-tray reset carries its own once-per-episode latch — the gate, unlike the idle
     escalation, never sets the general one — so a second attempt in the same episode names the command
     and holds rather than re-powering the tray again."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired = {"n": 0}
     srv.fsm.set_latch("ubb_reset_fired", False)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
@@ -10763,6 +10769,7 @@ async def test_ubb_tray_reset_walk_stops_as_soon_as_the_mesh_is_healthy(monkeypa
     """F18: the affected tray leads and the walk STOPS the moment the mesh verifies healthy — it does
     not go on to bounce the healthy trays. One affected tray (tray 3), verify healthy after its reset ->
     exactly one fire, of that tray's bitmap."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired = []
     srv.fsm.set_latch("ubb_reset_fired", False)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
@@ -10815,6 +10822,7 @@ async def test_ubb_tray_reset_walk_never_sweeps_healthy_trays_when_the_affected_
     to re-power the trays whose chips are all on the bus (fleet: sweeping healthy trays took 16+ chips
     off in a third of single-chip walks). It returns False and the next rung (the mesh reset) owns the
     rest, so no rung before the power cycle is skipped."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired = []
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})
     srv.fsm.set_latch("ubb_reset_fired", False)
@@ -10841,6 +10849,7 @@ async def test_ubb_tray_reset_walk_recovers_chips_off_on_any_tray_by_re_powering
 ):
     """Recovery equivalence (spec 04 I25): for chips off on tray X, re-powering tray X alone recovers
     them, exactly as the old walk did when it fired X first. No other tray is touched."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired = []
     srv.fsm.set_latch("ubb_reset_fired", False)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
@@ -10870,6 +10879,7 @@ async def test_ubb_tray_reset_walk_does_not_clear_a_hold_on_an_unverified_fabric
     while every full-mesh job died on a down eth link. It gives the 77 training time, then, still
     unverified, treats that tray as not-recovered; a walk that never verifies returns False and holds. Fails on base, where a 77 reads healthy=True so the first tray's reset stops the
     walk and clears the hold."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired = []
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})  # all back on the bus
     srv.fsm.set_latch("ubb_reset_fired", False)
@@ -10931,6 +10941,134 @@ async def test_ubb_tray_reset_walk_re_powers_every_affected_tray(monkeypatch, cl
     assert "ubb_reset_did_not_recover" in [n for n, _ in events]
 
 
+def _tray_of(tray_map, chip):
+    return next(t for t, chips in tray_map.items() if chip in {int(c) for c in chips})
+
+
+@pytest.mark.asyncio
+async def test_a_one_chip_drop_on_a_full_galaxy_never_re_powers_its_tray(monkeypatch, clear_job_state, galaxy_trays):
+    """The 1 -> 24 case: chip 18 off the bus on a 32/32 Galaxy, below the reset floor and on one tray.
+    Re-powering that tray took the other trays off the bus with it (24 chips off 40 s later), so by
+    default the walk declines: no fire, no once-per-episode latch spent, the hold stands. Opted back in
+    (TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1) the same drop fires the tray and the walk sees the 1 -> 24
+    regression. Fails on base, which fires the tray re-power by default."""
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
+    tray = _tray_of(galaxy_trays, 18)
+    others = {c for t, chips in galaxy_trays.items() if t != tray for c in map(int, chips)}
+    after_fire = _beats_without(others)  # what the box read after the tray re-power: 24 off
+    lines = []
+    fired, events = _arm_ubb_walk(monkeypatch, [after_fire])
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without({18}), 1, 32, lines.append)
+    names = [n for n, _ in events]
+    assert out is None and fired == [], "a one-chip drop on one tray must not re-power the tray"
+    assert "ubb_reset_begin" not in names
+    declined = dict(events)["ubb_reset_declined_single_tray"]
+    assert declined["tray"] == tray and declined["off_bus"] == ["18"] and declined["floor"] == 16
+    assert srv.fsm.latch("ubb_reset_fired") is False, "a declined walk must not spend the episode's one walk"
+    assert any("holding" in m for m in lines)
+
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
+    fired, events = _arm_ubb_walk(monkeypatch, [after_fire])
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without({18}), 1, 32, lambda m: None)
+    assert out is False and fired == [1 << (tray - 1)]
+    regressed = dict(events)["ubb_reset_regressed_offbus"]
+    assert regressed["off_bus_before"] == 1 and regressed["off_bus_after"] == 24
+
+
+@pytest.mark.asyncio
+async def test_a_whole_tray_below_the_floor_is_not_re_powered_alone_but_two_trays_still_walk(
+    monkeypatch, clear_job_state, galaxy_trays
+):
+    """The guard is keyed on one affected tray below the floor, whatever the count on it: a whole tray
+    (8 off) is declined too. A below-floor drop across two trays still walks both (spec 04 I25)."""
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
+    tray3 = set(range(24, 32))
+    fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(tray3)])
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(tray3), 8, 32, lambda m: None)
+    assert out is None and fired == []
+    assert "ubb_reset_declined_single_tray" in [n for n, _ in events]
+
+    fired, events = _arm_ubb_walk(monkeypatch, [_beats_without({3, 24})])
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without({3, 24}), 2, 32, lambda m: None)
+    assert out is False and fired == [0x01, 0x04]
+    assert "ubb_reset_declined_single_tray" not in [n for n, _ in events]
+
+
+@pytest.mark.asyncio
+async def test_gate_holds_a_one_chip_drop_without_a_tray_re_power(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
+    """At a job boundary a one-chip drop (chip 18) on a 32/32 Galaxy reaches the below-floor tray rung.
+    With the rung armed (the default) the gate must still not fire the tray, must not run the mesh
+    reset, and must keep the device held: nothing was reset, so nothing was verified, so nothing is
+    released. Fails on base, which fires the tray re-power at the gate."""
+    events = []
+    fired = {"n": 0}
+    cleared = {"n": 0}
+    _reach_reboot_rung(monkeypatch, tmp_path, n_present=31)
+    srv.isolated_chips = set()
+    srv.device_pci_map = {}
+    srv.device_fault_reported = ""
+    fsm_dirty(srv, "", why="gate_error")
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(32) if i != 18})
+    resets = _count_galaxy_resets(monkeypatch)
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
+    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
+    monkeypatch.setattr(srv, "_clear_device_dirty", lambda **kw: cleared.__setitem__("n", cleared["n"] + 1))
+    monkeypatch.setattr(
+        galaxy, "_fire_ubb_reset", lambda *a, **k: fired.__setitem__("n", fired["n"] + 1), raising=False
+    )
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+
+    assert fired["n"] == 0, "the gate must not re-power a tray for a one-chip drop"
+    assert resets["n"] == 0, "nor run the mesh reset below the floor"
+    assert "ubb_reset_declined_single_tray" in events
+    assert cleared["n"] == 0 and srv.fsm.state is not ServerState.HEALTHY, "the device stays held"
+
+
+@pytest.mark.asyncio
+async def test_a_declined_tray_walk_hands_the_stuck_hold_to_the_next_rung(monkeypatch, clear_job_state, galaxy_trays):
+    """On the stuck-hold ladder the declined walk is not a dead end: the climb goes on to the next rung
+    (the mesh reset, then the host rungs), and a reset that does not verify never clears the hold."""
+    fired = {"n": 0}
+    counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=1, isolated=set(), reset_result=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
+    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
+    monkeypatch.setattr(
+        galaxy, "_fire_ubb_reset", lambda *a, **k: fired.__setitem__("n", fired["n"] + 1), raising=False
+    )
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert fired["n"] == 0, "no single-tray re-power on the stuck-hold ladder either"
+    assert counters["resets"] == 1, "the climb goes on to the next rung"
+    assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_opted_in_single_tray_walk_releases_only_after_the_full_check(
+    monkeypatch, clear_job_state, galaxy_trays
+):
+    """Goal: health check after every reset. Opted back in, a single-tray re-power is a reset like any
+    other: the walk recovers only on the full post-reset check (fabric included), and a check that fails
+    leaves the device held."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
+    calls = []
+
+    for healthy in (False, True):
+        calls.clear()
+        fired, _events = _arm_ubb_walk(monkeypatch, [_beats_without({18})])
+
+        async def verify(expected, log, run_fabric=True, healthy=healthy, **_):
+            calls.append(run_fabric)
+            return healthy, {"snapshot": {"ok": healthy}}
+
+        patch_recovery(monkeypatch, "_verify_device", verify)
+        out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without({18}), 1, 32, lambda m: None)
+        assert len(fired) == 1 and calls and all(calls), "the post-reset check ran, fabric included"
+        assert out is healthy, "the walk recovers only when that check passed"
+
+
 @pytest.mark.asyncio
 async def test_ubb_tray_reset_walk_stops_when_a_step_takes_a_healthy_chip_off_the_bus(
     monkeypatch, clear_job_state, galaxy_trays
@@ -10939,6 +11077,7 @@ async def test_ubb_tray_reset_walk_stops_when_a_step_takes_a_healthy_chip_off_th
     walk stops at once with ubb_reset_regressed_offbus and returns False, rather than re-power more
     trays. Covered on a one-tray walk and on the first of two affected trays. Fails on base, which
     walked on and took 17 chips off the bus on a real host."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     start = set(range(24, 32))
     # Affected step: tray 3 stays off and chip 5 (tray 1) dropped with it.
     fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(start | {5})])
@@ -10965,6 +11104,7 @@ async def test_ubb_tray_reset_walk_rescans_after_each_tray_before_the_verify(
     (and settles) before its verify, and the pollers stay stopped across the walk and come back at the
     end. A failed rescan still verifies. A walk that recovers takes its chips out of isolated_chips,
     so the next gate does not bridge-reset them. Fails on base, which never rescanned."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     order = []
     fired, _events = _arm_ubb_walk(monkeypatch, [_beats_without(set())])
     monkeypatch.setattr(galaxy, "UBB_WALK_RESCAN_SETTLE_SEC", 0)
@@ -11021,6 +11161,7 @@ async def test_a_regressed_walk_disables_the_tray_rung_for_the_process(monkeypat
     the process (ubb_tray_rung_disabled, once): the next drop is named and held as when opted out, and
     nothing is re-powered. Only the walk is declined: the opt-in the back-to-back sweep reads stays on.
     Only a broker restart arms the walk again."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     start = set(range(24, 32))
     fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(start | {5})])
     assert await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 8, 32, lambda m: None) is False
@@ -11043,6 +11184,7 @@ async def test_ubb_tray_reset_walk_defers_the_dead_chip_sampler_during_the_trans
     held across the walk the dead-chip sampler would isolate a tray mid-reset and tear it out of the
     kernel (mistaking the expected transient drop for a new fault). The flag must be set while
     _fire_ubb_reset runs, and cleared once the walk returns. Fails on base, whose rung never sets it."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     srv.fsm.set_latch("ubb_reset_fired", False)
     srv.recovery_mechanism.reset_in_flight = False
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
@@ -11072,6 +11214,7 @@ async def test_gate_fires_the_ubb_tray_reset_on_a_clean_tray_down_when_opted_in(
     """The gate side of the fire: a clean below-floor tray-down at a job boundary, opted in, fires the
     per-tray BMC reset instead of holding, and a reset that verifies healthy clears the tenant door.
     The mesh-wide galaxy reset never runs. Fails on base, which holds and issues no fire."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired = {"n": 0}
     cleared = {"n": 0}
     _reach_reboot_rung(monkeypatch, tmp_path, n_present=24)
@@ -11129,6 +11272,7 @@ async def test_ubb_tray_reset_fires_by_default_on_a_clean_tray_down(monkeypatch,
     tray-down FIRES the per-tray reset instead of naming it and holding — no opt-in required. Mirrors
     the opted-in fire test but leaves the env at its default. Fails on base, whose default-OFF rung only
     named the command and held here."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired = {"n": 0}
     counters = _arm_offbus_stuck_hold(
         monkeypatch, off_bus=8, isolated=set(), sbr_verify_healthy=True  # chips 24-31 = tray 3

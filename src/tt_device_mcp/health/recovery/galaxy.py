@@ -221,6 +221,18 @@ def _ubb_reset_enabled() -> bool:
     return privileges.can_ipmi()
 
 
+def _ubb_single_tray_walk_enabled() -> bool:
+    """Whether the verify-between walk may re-power a tray when the whole below-floor drop sits on that
+    one tray. OFF by default; ``TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1`` turns it back on.
+
+    A single-tray re-power is not isolated on a Galaxy: the BMC pulse has taken the other trays off the
+    bus with it (measured: one chip off tray 3 on a 32/32 box, tray 3 re-powered, 24 chips off the bus
+    40 s later). A drop that small self-heals or is cleared by the whole-box host rung, so the walk
+    holds for those instead of re-powering. The tray-down-no-window sweep, which ends in the power cycle
+    anyway, is not affected."""
+    return os.environ.get("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "0").strip() == "1"
+
+
 def _stuck_hold_ceiling_sec() -> int:
     """Seconds a GENERIC hold may stand — and the window its mesh-reset retries run inside — before
     the ladder climbs through it to a power cycle. The hard ceiling on any hold. Default 600 (10
@@ -2631,6 +2643,24 @@ class GalaxyRecovery(Recovery):
             return None  # no tray to re-power — the caller's existing hold owns it
         if not _ubb_reset_enabled():
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)  # name it + hold (the default)
+            metrics.stage_fired("ubb_tray", "blocked")
+            return None
+        reset_floor = _galaxy_reset_min_dead_chips(expected)
+        if len(walk) == 1 and (reset_floor is None or off_bus < reset_floor) and not _ubb_single_tray_walk_enabled():
+            # A below-floor drop on one tray: re-powering that tray has dropped the other trays too
+            # (1 chip off -> 24 off), so hold for self-heal; the stuck-hold ladder's next rungs own it.
+            log(
+                f"{off_bus}/{expected} chip(s) off the bus, all on tray {walk[0]} and below the reset floor "
+                f"({reset_floor}) — not re-powering one tray (it can take the other trays off the bus); "
+                f"holding for self-heal or the host rung"
+            )
+            health_event(
+                "ubb_reset_declined_single_tray",
+                tray=walk[0],
+                off_bus=sorted(offbus_ids, key=int),
+                expected=expected,
+                floor=reset_floor,
+            )
             metrics.stage_fired("ubb_tray", "blocked")
             return None
         if pcie_guard.tray_rung_disabled() is not None:

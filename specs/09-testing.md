@@ -66,7 +66,7 @@ gets through anyway.
     reset per test so one test's outcome never steers the next test's gate.
   - **Host rungs**: `TT_DEVICE_MCP_AUTO_REBOOT=0`, `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`
     (both default ON, so they are pinned off, never merely deleted),
-    `TT_DEVICE_MCP_AUTO_UBB_RESET` cleared; `_fire_host_reboot` and `_fire_ubb_reset` are
+    `TT_DEVICE_MCP_AUTO_UBB_RESET` and `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK` cleared; `_fire_host_reboot` and `_fire_ubb_reset` are
     replaced with functions that raise `AssertionError` — loud tripwires, so a test that
     reaches a real fire fails instead of taking the box down. `shutil.which("tt-smi")` answers
     None: it is a device tool, so an unmarked test must not find one, and preflight verdicts keyed
