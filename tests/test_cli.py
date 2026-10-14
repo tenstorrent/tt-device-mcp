@@ -112,6 +112,93 @@ def test_is_daemon_running_treats_a_degraded_broker_as_reachable(monkeypatch):
     assert cli.is_daemon_running(1234) is True
 
 
+def _restart_rig(
+    monkeypatch, tmp_path, cli, *, answers, unit_state="active", sock_exists=False, env_sock=None, err=None
+):
+    """Drive is_daemon_running on a fake clock against a scripted /health sequence. `answers` is
+    the elapsed second at which /health starts answering ok (None = never); until then it fails
+    with `err` (default: refused if the socket exists, else no server)."""
+    unit = tmp_path / "tt-device-broker.service"
+    unit.write_text("[Service]\n")
+    monkeypatch.setattr(cli, "_BROKER_UNIT", str(unit))
+    monkeypatch.setattr(cli, "_broker_unit_state", lambda: unit_state)
+    if env_sock is None:
+        monkeypatch.delenv("TT_DEVICE_MCP_SOCKET", raising=False)
+    else:
+        monkeypatch.setenv("TT_DEVICE_MCP_SOCKET", env_sock)
+    real_exists = os.path.exists
+    monkeypatch.setattr(cli.os.path, "exists", lambda p: sock_exists if p == cli.DEFAULT_SOCKET else real_exists(p))
+    clock = {"t": 0.0, "calls": 0}
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(cli.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+
+    def fake_api(*a, **k):
+        clock["calls"] += 1
+        if answers is not None and clock["t"] >= answers:
+            return {"status": "ok"}
+        return {"error": err or ("Connection failed: [Errno 111] Connection refused" if sock_exists else "no server")}
+
+    monkeypatch.setattr(cli, "api_call", fake_api)
+    return clock
+
+
+def test_is_daemon_running_rides_out_a_broker_restart(monkeypatch, tmp_path):
+    """A broker restart removes its socket for ~3-5 s. A status poll in that gap must wait for
+    the broker to come back rather than report it down — a caller reads 'down' as 'job gone'."""
+    cli = _load_cli()
+    clock = _restart_rig(monkeypatch, tmp_path, cli, answers=5.0)
+    assert cli.is_daemon_running(1234) is True
+    assert clock["t"] == pytest.approx(5.0)
+
+
+def test_is_daemon_running_rides_out_a_refusing_socket(monkeypatch, tmp_path):
+    """A socket file that refuses connections (broker just stopped or not listening yet) is the
+    same restart gap and gets the same grace."""
+    cli = _load_cli()
+    _restart_rig(monkeypatch, tmp_path, cli, answers=4.0, sock_exists=True)
+    assert cli.is_daemon_running(1234) is True
+
+
+def test_is_daemon_running_gives_up_on_a_broker_that_stays_down(monkeypatch, tmp_path):
+    """A broker that is really down is reported down after the grace, not waited on forever."""
+    cli = _load_cli()
+    clock = _restart_rig(monkeypatch, tmp_path, cli, answers=None)
+    assert cli.is_daemon_running(1234) is False
+    assert cli._RESTART_GRACE_SEC <= clock["t"] <= cli._RESTART_GRACE_SEC + 1
+
+
+def test_is_daemon_running_waits_longer_while_the_unit_is_activating(monkeypatch, tmp_path):
+    """While systemd still reports the unit activating, keep waiting past the grace, up to the cap."""
+    cli = _load_cli()
+    _restart_rig(monkeypatch, tmp_path, cli, answers=15.0, unit_state="activating")
+    assert cli.is_daemon_running(1234) is True
+    clock = _restart_rig(monkeypatch, tmp_path, cli, answers=None, unit_state="activating")
+    assert cli.is_daemon_running(1234) is False
+    assert cli._RESTART_CAP_SEC <= clock["t"] <= cli._RESTART_CAP_SEC + 1
+
+
+def test_is_daemon_running_fails_fast_without_a_broker(monkeypatch, tmp_path):
+    """No broker unit (a reserved box), or the CLI aimed at a per-user socket: the old quick
+    3-try check stands, with no restart grace."""
+    cli = _load_cli()
+    clock = _restart_rig(monkeypatch, tmp_path, cli, answers=None)
+    monkeypatch.setattr(cli, "_BROKER_UNIT", str(tmp_path / "absent.service"))
+    assert cli.is_daemon_running(1234) is False
+    assert (clock["calls"], clock["t"]) == (3, 1.0)
+    clock = _restart_rig(monkeypatch, tmp_path, cli, answers=None, env_sock=str(tmp_path / "daemon.sock"))
+    assert cli.is_daemon_running(1234) is False
+    assert (clock["calls"], clock["t"]) == (3, 1.0)
+
+
+def test_is_daemon_running_does_not_wait_on_a_wedged_broker(monkeypatch, tmp_path):
+    """A socket that exists but doesn't answer (timeout, not refused) is a wedged broker, not a
+    restart: the usual retries apply and nothing more."""
+    cli = _load_cli()
+    clock = _restart_rig(monkeypatch, tmp_path, cli, answers=None, sock_exists=True, err="Connection failed: timed out")
+    assert cli.is_daemon_running(1234) is False
+    assert clock["calls"] == 3
+
+
 def test_install_smi_ro_wrapper_creates_wrapper_and_sudoers(tmp_path, monkeypatch):
     """`_install_smi_ro_wrapper` writes the root-only (0700) wrapper and a visudo-checked
     owner-only (0400) sudoers entry. chown/visudo are stubbed so the test needs no root."""

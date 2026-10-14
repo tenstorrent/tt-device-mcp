@@ -77,17 +77,55 @@ def is_daemon_running(port: int, host: str = "localhost", *, retries: int = 3, t
     a too-tight probe would falsely report 'not running' while it's just loaded. A
     genuinely-absent server fails fast (no socket / connection refused), so the
     retries only cost time when the server is up-but-slow — exactly when patience
-    is warranted.
+    is warranted. The one exception is a broker host whose socket is missing or
+    refusing: that is what a broker restart looks like, so it is ridden out
+    (see _broker_restarting) before reporting the server down.
     """
-    for attempt in range(retries):
+    start = time.monotonic()
+    attempt = 0
+    while True:
         result = api_call(port, "/health", method="GET", timeout=timeout)
         # 'degraded' means the device is held, not that the broker is down — it is up and
         # serving, so a held box stays reachable (a tenant job queues and waits behind the hold).
         if isinstance(result, dict) and result.get("status") in ("ok", "degraded"):
             return True
-        if attempt < retries - 1:
-            time.sleep(0.5)
-    return False
+        attempt += 1
+        if attempt >= retries and not _broker_restarting(result, time.monotonic() - start):
+            return False
+        time.sleep(0.5)
+
+
+# A `systemctl restart tt-device-broker` removes the socket (RuntimeDirectory=) for a few
+# seconds. Polling through that gap keeps a status check from reporting 'server down' — which a
+# caller may read as 'my job is gone' — while the broker is only restarting.
+_RESTART_GRACE_SEC = 8.0
+_RESTART_CAP_SEC = 30.0  # bound on riding out a unit systemd still reports as (de)activating
+
+
+def _broker_restarting(result, elapsed: float) -> bool:
+    """True while a failed /health looks like a broker restart worth waiting out: this is a
+    broker host, the CLI targets the broker's socket, and that socket is missing or refuses
+    connections — for up to _RESTART_GRACE_SEC, or longer (capped) while systemd reports the
+    unit (de)activating. A wedged broker (socket up, no answer) is not waited on here."""
+    if elapsed >= _RESTART_CAP_SEC or not os.path.exists(_BROKER_UNIT):
+        return False
+    if os.environ.get("TT_DEVICE_MCP_SOCKET", DEFAULT_SOCKET) != DEFAULT_SOCKET:
+        return False
+    err = result.get("error", "") if isinstance(result, dict) else ""
+    if os.path.exists(DEFAULT_SOCKET) and "refused" not in err:
+        return False
+    return elapsed < _RESTART_GRACE_SEC or _broker_unit_state() in ("activating", "deactivating", "reloading")
+
+
+def _broker_unit_state() -> str:
+    """`systemctl is-active` for the broker unit, or '' if it can't be asked."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "is-active", "tt-device-broker.service"], capture_output=True, text=True, timeout=2
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip()
 
 
 def _server_down_message() -> str:
