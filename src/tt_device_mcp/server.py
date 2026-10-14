@@ -3090,12 +3090,17 @@ def _reopen_boot_carried_fabric_hold() -> bool:
     escalation holds a fabric-only hold without a reset, so it paged once and held forever. When the
     startup pass found every chip present and named no fault, reopen it RECOVERING on a fresh clock
     and owe it one startup pass (whatever TT_DEVICE_MCP_FABRIC_RELIFT says, as I39), so the relift,
-    the I48 backoff and the I40 bound verify it or fall back. Anything else keeps the hold as is."""
+    the I48 backoff and the I40 bound verify it or fall back. A runtime-named fault, an isolated chip
+    or a pass that measured the fabric bad keeps the hold as is.
+
+    The record is read after the gate's own hold, which set ``why`` to fabric_unverified and cleared
+    ``dirty``: whatever cause or dirty mark the carried DOWN had, a clean startup 77 reopens it, as it
+    would open a fresh 77 hold on a fresh record. The ``why`` check only refuses a caller that did not
+    place that hold first."""
     global device_hold_escalated_monotonic, _startup_fabric_owed_since
     record = fsm.record
     if (
         record.why != FABRIC_RELIFT_WHY
-        or record.dirty
         or device_fault_reported
         or isolated_chips
         or health_monitor.last_fabric_ok is False
