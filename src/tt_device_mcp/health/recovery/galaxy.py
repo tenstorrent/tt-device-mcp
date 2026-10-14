@@ -1816,12 +1816,16 @@ class GalaxyRecovery(Recovery):
             return False
         if await asyncio.to_thread(self.mechanism.scope_active):
             log("off-bus hold past its grace but a reset is cycling in its own scope — holding")
-            offbus_power_cycle.page_if_blocked(hold_since, age, log, "a reset is cycling in its own scope", off_bus=off_bus)
+            offbus_power_cycle.page_if_blocked(
+                hold_since, age, log, "a reset is cycling in its own scope", off_bus=off_bus
+            )
             return False
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
         if self._tenant_active(scan):
             log("off-bus hold past its grace but a tenant holds the device or the scan is unreadable — holding")
-            offbus_power_cycle.page_if_blocked(hold_since, age, log, "a tenant holds the device or the holder scan is unreadable", off_bus=off_bus)
+            offbus_power_cycle.page_if_blocked(
+                hold_since, age, log, "a tenant holds the device or the holder scan is unreadable", off_bus=off_bus
+            )
             return False
         standback = await asyncio.to_thread(offbus_power_cycle.standback_reason)
         if standback:

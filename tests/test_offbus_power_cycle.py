@@ -225,7 +225,9 @@ async def test_a_blocked_power_cycle_pages_once_past_its_bound(monkeypatch, tmp_
     hold_since, rec = _gated(monkeypatch, tmp_path, held_sec=300 + 1800 - 10)
     if blocker == "tenant":
         monkeypatch.setattr(
-            srv, "enumerate_device_holders", lambda: HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True)
+            srv,
+            "enumerate_device_holders",
+            lambda: HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True),
         )
     elif blocker == "scope":
         monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "tt-reset@1.scope")
