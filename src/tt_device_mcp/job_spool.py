@@ -33,6 +33,9 @@ SPOOL_POLL_SEC = 0.1
 SPOOL_MAX_LINE_BYTES = 1 << 20
 # Punch the consumed prefix once this much more has been read: one syscall per MiB, not per line.
 SPOOL_PUNCH_MIN_BYTES = 1 << 20
+# How much of a stream's uncopied tail the startup sweep keeps for the job log: the last bytes, which
+# say most about how the job ended. More than this only grows while no broker runs.
+SPOOL_SALVAGE_MAX_BYTES = 8 << 20
 _PUNCH_ALIGN = 4096
 _STREAMS = ("stdout", "stderr")
 _FALLOC_FL_KEEP_SIZE = 0x01
@@ -246,8 +249,44 @@ def remove_job_spool(job_id: str) -> None:
             pass
 
 
-def sweep_job_spools(keep: Callable[[str], bool]) -> list:
-    """Remove the spools of every job ``keep`` does not claim. Returns the job ids removed."""
+def read_unread_tail(job_id: str, max_bytes: Optional[int] = None) -> dict:
+    """What each stream holds past the recorded offsets: output no broker copied into the job log.
+    Returns {name: (skipped, data)} for each stream with any; past ``max_bytes`` (default
+    SPOOL_SALVAGE_MAX_BYTES) only the last ``max_bytes`` are read and ``skipped`` counts the rest.
+    A stream that cannot be read is left out."""
+    limit = SPOOL_SALVAGE_MAX_BYTES if max_bytes is None else max_bytes
+    paths = spool_paths(job_id)
+    start = read_offsets(job_id)
+    out: dict = {}
+    for name in _STREAMS:
+        try:
+            fd = os.open(paths[name], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            size = os.fstat(fd).st_size
+            begin = max(start[name], size - limit)
+            chunks = []
+            pos = begin
+            while pos < size:
+                chunk = os.pread(fd, size - pos, pos)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                pos += len(chunk)
+            if chunks:
+                out[name] = (begin - start[name], b"".join(chunks))
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    return out
+
+
+def sweep_job_spools(keep: Callable[[str], bool], salvage: Optional[Callable[[str], None]] = None) -> list:
+    """Remove the spools of every job ``keep`` does not claim. ``salvage(job_id)`` runs first, once per
+    such job, while its spool is still there (an exception in it never stops the removal). Returns the
+    job ids removed."""
     d = job_spool_dir()
     if not _private_dir(d):
         return []
@@ -256,13 +295,21 @@ def sweep_job_spools(keep: Callable[[str], bool]) -> list:
         entries = list(d.iterdir())
     except OSError:
         return []
+    by_job: dict = {}
     for p in entries:
-        job_id = p.name.split(".", 1)[0]
+        by_job.setdefault(p.name.split(".", 1)[0], []).append(p)
+    for job_id, files in by_job.items():
         if keep(job_id):
             continue
-        try:
-            p.unlink()
-            removed.add(job_id)
-        except OSError:
-            pass
+        if salvage is not None:
+            try:
+                salvage(job_id)
+            except Exception:
+                pass
+        for p in files:
+            try:
+                p.unlink()
+                removed.add(job_id)
+            except OSError:
+                pass
     return sorted(removed)

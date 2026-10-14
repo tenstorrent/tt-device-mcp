@@ -150,6 +150,7 @@ from tt_device_mcp.job_spool import (
     SpoolTail,
     open_job_spool,
     read_offsets,
+    read_unread_tail,
     remove_job_spool,
     spool_paths,
     sweep_job_spools,
@@ -7521,6 +7522,27 @@ async def _follow_job_spool(job: "Job", done: Callable[[], bool]) -> None:
                 pass
 
 
+def _salvage_job_spool(job_id: str) -> None:
+    """Append what a job that ended while no broker ran wrote past the copied offsets to its log, so
+    the startup sweep does not drop its last lines (spec 01 I17). No log, nothing to do."""
+    tail = read_unread_tail(job_id)
+    if not tail or not job_log_dir:
+        return
+    matches = sorted(Path(job_log_dir).glob(f"*_{job_id}.log"))
+    if not matches:
+        return
+    stamp = datetime.now().strftime("%H:%M:%S")
+    try:
+        with open(matches[-1], "a") as fh:
+            for name, (skipped, data) in tail.items():
+                dropped = f"; its first {skipped} uncopied bytes were dropped" if skipped else ""
+                fh.write(f"[{stamp}] [broker] {name} the job wrote while no broker ran, copied at startup{dropped}\n")
+                for line in data.decode("utf-8", errors="replace").splitlines(keepends=True):
+                    fh.write(f"[{stamp}] [{name}] {line}" + ("" if line.endswith("\n") else "\n"))
+    except OSError:
+        pass
+
+
 async def reconcile_running_scopes():
     """Re-adopt jobs still running in named scopes after a broker restart so a
     restart never orphans a running job: it stays visible as RUNNING and the
@@ -7547,9 +7569,9 @@ async def reconcile_running_scopes():
         if logger:
             logger.info(f"RE-ADOPT job_id={job_id} from {scope} (owner={job.owner})")
         asyncio.create_task(_monitor_readopted_scope(job_id, scope))
-    # A spool no job claims is the output of a job that ended while no broker ran: the log has
-    # what was copied, the rest has no reader left (spec 01 I17).
-    swept = sweep_job_spools(lambda jid: jid in jobs or jid in readopted_scopes)
+    # A spool no job claims is the output of a job that ended while no broker ran: the log has what
+    # was copied, and the uncopied tail is appended to it before the spool goes (spec 01 I17).
+    swept = sweep_job_spools(lambda jid: jid in jobs or jid in readopted_scopes, _salvage_job_spool)
     if swept and logger:
         logger.info(f"RE-ADOPT removed the output spools of jobs not re-adopted: {', '.join(swept)}")
 
