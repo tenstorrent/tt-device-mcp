@@ -669,3 +669,23 @@ def test_the_manual_recovery_check_cannot_answer_on_an_unreadable_auth_log(tmp_p
     assert subprocess.run(["bash", _CHECK], capture_output=True).returncode == 2
     log.unlink()
     assert subprocess.run(["bash", _CHECK], capture_output=True).returncode == 1
+
+
+def test_the_manual_recovery_check_cannot_answer_when_auth_log_fails_to_read(tmp_path, monkeypatch):
+    """A read that fails past the permission check (here a directory) is unknown, never 'no recovery'."""
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, []))
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_AUTHLOG", str(tmp_path))
+    p = subprocess.run(["bash", _CHECK], capture_output=True, text=True)
+    assert p.returncode == 2, p.stderr
+
+
+def test_the_manual_recovery_check_never_globs_an_auth_log_line(tmp_path, monkeypatch):
+    """A '*' leading a line stays a '*': it never expands to a file name that reads as a recent stamp."""
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, []))
+    log = tmp_path / "auth.log"
+    log.write_text("* host sudo:   ops : TTY=pts/0 ; PWD=/ ; USER=root ; COMMAND=/usr/sbin/reboot\n")
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_AUTHLOG", str(log))
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / _stamp(5)).touch()
+    assert subprocess.run(["bash", _CHECK, "30"], capture_output=True, cwd=cwd).returncode == 1

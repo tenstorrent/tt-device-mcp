@@ -27,6 +27,7 @@ from tt_device_mcp import aio, alert, metrics
 from tt_device_mcp.constants import (
     ETH_POST_JOB_TIMEOUT_SEC,
     FABRIC_CHECK_CANNOT_CHECK_RC,
+    FABRIC_CHECK_HARDWARE_FAULT_RC,
     FABRIC_CHECK_TIMEOUT_SEC,
 )
 from tt_device_mcp.health.aiclk_ceiling import CEILING
@@ -282,6 +283,7 @@ class HealthMonitor:
         self.last_fabric_skipped: bool = False
         self.fabric_known_fault: str = ""
         self._fabric_known_fault_at: float = 0.0
+        self._cable_fault_alerted: set[str] = set()
         self._fabric_route_fault_streak: int = 0
         # The in-flight fabric traffic pass. It maps every chip's BARs, so when a chip leaves the
         # bus it is the likeliest thing still reading a dead address — and `pci remove` does not
@@ -921,8 +923,12 @@ class HealthMonitor:
             # An operator's own wrapper has already done its own interpretation and reports it
             # purely through its exit code — its stdout is never run through classify(), which
             # means something only for the built-in validator's own output signatures.
-            ok = True if rc == 0 else None if rc == FABRIC_CHECK_CANNOT_CHECK_RC else False
+            ok = None if rc in (FABRIC_CHECK_CANNOT_CHECK_RC, FABRIC_CHECK_HARDWARE_FAULT_RC) else rc == 0
             reason = _override_reason(text)
+            if rc == FABRIC_CHECK_HARDWARE_FAULT_RC:
+                # The wrapper's own verdict line names the missing cable; the validator's what() does not.
+                lines = [line.strip() for line in text.splitlines() if line.strip()]
+                reason = f"{fabric.CABLE_FAULT} (fabric check exit {rc}): {lines[-1] if lines else '(no output)'}"
         elif not cached:
             ok, reason = fabric.classify(rc, text)
             if ok is None and desc and fabric.is_topology_mismatch(text):
@@ -935,7 +941,10 @@ class HealthMonitor:
         # code entirely — status must agree with the verdict actually being returned below, not
         # with the raw exit code that verdict may have been remapped away from. A broker-side
         # timeout (rc is None) is its own thing: a live run that ran out of time, not a skip.
+        cable = ok is None and reason.startswith(fabric.CABLE_FAULT)
         status = "timeout" if rc is None else "completed" if ok is True else "skipped" if ok is None else "failed"
+        if cable:
+            status = "hardware_fault"
         if ok is True:
             self._write_action_log("[broker]fabric-check", cmd, dt, status, rc)
         else:
@@ -957,6 +966,15 @@ class HealthMonitor:
             _save_asic_bus_map()
             self._restore_eth_high_water()
             return True, f"fabric links healthy ({dt:.0f}s)"
+        if cable:
+            # A missing cable is a hardware verdict, not a skip (I47): held as a known fabric fault,
+            # outside the 77 bound and never reset or climbed for (I40, 04 I30), paged once.
+            self._declare_cable_fault(reason)
+            if not override:
+                self._arm_eth_rebaseline()  # as a topology skip does: the mark is this mesh's (I45)
+            bundle = await self._keep_skip_output(rc, text, reason, cmd) if rc is not None else None
+            kept = f"; exit {rc}, output in {bundle}/fabric.log" if bundle else ""
+            return None, f"fabric HARDWARE FAULT ({dt:.0f}s{kept}): {reason[:400]}"
         if ok is None:
             # The check could not run — it learned nothing about the fabric, so resetting
             # on it would be resetting on our own missing install. Loud, because a host
@@ -1022,9 +1040,15 @@ class HealthMonitor:
                 log.warning(f"fabric-check: {marker}; rerunning without the descriptor")
         elif log:
             log.warning(f"fabric-check: {marker} (cached for this chip-to-bus map); descriptor run skipped")
+        cables = fabric.missing_cables(marker)
+
+        def no_verdict(why: str) -> str:
+            # Missing cables with none extra are a hardware verdict whatever the rerun came to (I47).
+            return fabric.cable_fault(cables, desc, why) if cables else f"{fabric.TOPOLOGY_MISMATCH}; {why}"
+
         rebuilt = fabric.build_command(descriptor=False)
         if rebuilt is None:
-            return None, first, None, f"{fabric.TOPOLOGY_MISMATCH}; traffic-only rerun unavailable"
+            return None, first, None, no_verdict("traffic-only rerun unavailable")
         try:
             rc, text = await fabric.check(
                 rebuilt[0],
@@ -1035,13 +1059,13 @@ class HealthMonitor:
                 cwd=cwd,
             )
         except Exception as e:  # noqa: BLE001 - never raise into the gate
-            return None, first, None, f"{fabric.TOPOLOGY_MISMATCH}; traffic-only rerun not runnable: {e}"
+            return None, first, None, no_verdict(f"traffic-only rerun not runnable: {e}")
         ok, reason = fabric.classify(rc, text)
         combined = f"{first}\n{marker}\n{text}"
         if ok is True:
             return rc, f"{combined}\n{marker}", True, "fabric healthy on discovered links; " + marker
         if ok is None:
-            reason = f"{fabric.TOPOLOGY_MISMATCH}; traffic-only rerun: {reason}"
+            reason = no_verdict(f"traffic-only rerun: {reason}")
         return rc, combined, ok, reason
 
     def _on_topology_mismatch(self, marker: str) -> None:
@@ -1111,6 +1135,22 @@ class HealthMonitor:
             log.error(f"FABRIC {self.fabric_known_fault}")
         alert.send_alert({"kind": "fabric_known_fault", "detail": self.fabric_known_fault}, log)
         return self.fabric_known_fault
+
+    def _declare_cable_fault(self, detail: str) -> None:
+        """A fabric pass found cables missing (spec 03 I47): open the known fabric fault (I46) at once,
+        journal it, page once per distinct fault. A fault already open is left as it is, so its
+        bound still runs from the first declaration."""
+        if self.fabric_known_fault == detail:
+            return
+        self.fabric_known_fault = detail
+        self._fabric_known_fault_at = time.monotonic()
+        health_event("fabric_known_fault", detail=detail, cause="missing_cable")
+        log = self._logger()
+        if log:
+            log.error(f"FABRIC HARDWARE FAULT: {detail}")
+        if detail not in self._cable_fault_alerted:
+            self._cable_fault_alerted.add(detail)
+            alert.send_alert({"kind": "fabric_known_fault", "cause": "missing_cable", "detail": detail}, log)
 
     def known_fabric_fault(self) -> str:
         """The open known fabric fault, or "". Bounded: past ``TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC``
