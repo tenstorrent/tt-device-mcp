@@ -137,6 +137,10 @@ job boundary.
   line, else the `terminate called` banner (which sits ABOVE `what():` and names only the
   exception type), else the last line. A `TT_FATAL @`/`TT_THROW @` header names only the source
   line and the failed condition, so it carries the message from the line under its `info:`.
+  A run that reached no verdict keeps its exit code and the last 64 KiB of its output (stderr
+  included) in a `<stamp>_fabric_cannot_check_none` incident bundle (`fabric.log`, `incident.json`
+  evidence `rc`/`reason`), rotated with the other incidents, and its detail names the bundle, so
+  the cause reads without a rerun. A rerun with the same reason within an hour reuses that bundle.
 - **I18 — A healthy device is not reset because a job ended badly.** A timeout or kill is a
   reason to look hard (the full check, fabric included, post-job), then believe the answer. The
   one exception is a runtime-reported device fault, which outranks checks that are blind to it.
@@ -812,7 +816,8 @@ short-circuit per I9. Each probe returns a tri-state that maps onto an `Observat
   `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, judged on exit code alone.
 - **fabric** (`health/monitors/fabric.py`): the traffic pass — pushes packets across every
   inter-chip link; the only check that proves the fabric moves data. Exit 0 healthy, 77 no
-  verdict (never a reset trigger, I17), non-zero unhealthy; a broker-side timeout is unhealthy.
+  verdict (never a reset trigger, I17; its output tail is kept in an incident bundle), non-zero
+  unhealthy; a broker-side timeout is unhealthy.
   Operator override: `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, exit code only. The real verdict latches
   on `last_fabric_ok`; a skip never overwrites it.
 - **aiclk ceiling** (`health/aiclk_ceiling.py`, I35): opt-in; runs
@@ -1052,7 +1057,7 @@ refuses.
 | I14 | `tests/test_device_safety.py::test_an_empty_dev_dir_on_a_host_that_expects_chips_holds_not_releases`, `tests/test_device_safety.py::test_a_device_less_host_never_reads_an_empty_sysfs_as_a_drop` |
 | I15 | `tests/test_device_safety.py::test_an_unverified_clear_holds_the_device`, `tests/test_device_safety.py::test_a_gate_that_errored_holds`, `tests/test_device_safety.py::test_a_clean_device_is_not_held_by_an_unverified_clear`, `tests/test_device_safety.py::test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace`, `tests/test_device_safety.py::test_a_verified_clear_names_itself_and_records_it_was_verified` |
 | I16 | `tests/test_device_safety.py::test_a_frozen_eth_verdict_is_held_not_reset`, `tests/test_device_safety.py::test_a_frozen_eth_verdict_holds_the_door_even_when_not_pre_dirty`, `tests/test_device_safety.py::test_frozen_eth_reset_needs_both_kill_switches`, `tests/test_device_safety.py::test_eth_heartbeat_hang_reads_as_frozen_not_skipped` |
-| I17 | `tests/test_device_safety.py::test_dirty_device_is_not_reset_when_the_fabric_cannot_be_checked`, `tests/test_device_safety.py::test_an_unverified_fabric_is_never_recorded_as_verified_healthy`, `tests/test_fabric_probe.py::test_fabric_classification[77-cannot check-None]`, `tests/test_fabric_check_reason.py::test_first_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_fabric_check_reason.py::test_builtin_path_skip_detail_names_the_cause`, `tests/test_fabric_check_reason.py::test_override_path_reason_names_the_cause`, `tests/test_fabric_check_reason.py::test_wrapper_77_final_line_keeps_the_validators_first_error_line`, `tests/test_startup_fabric_hugepages.py::test_override_reason_prefers_the_cause_over_the_terminate_banner` |
+| I17 | `tests/test_device_safety.py::test_dirty_device_is_not_reset_when_the_fabric_cannot_be_checked`, `tests/test_device_safety.py::test_an_unverified_fabric_is_never_recorded_as_verified_healthy`, `tests/test_fabric_probe.py::test_fabric_classification[77-cannot check-None]`, `tests/test_fabric_check_reason.py::test_first_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_fabric_check_reason.py::test_builtin_path_skip_detail_names_the_cause`, `tests/test_fabric_check_reason.py::test_override_path_reason_names_the_cause`, `tests/test_fabric_check_reason.py::test_wrapper_77_final_line_keeps_the_validators_first_error_line`, `tests/test_startup_fabric_hugepages.py::test_override_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_startup_fabric_hugepages.py::test_a_77_run_keeps_its_stderr_tail_and_exit_code_in_an_incident_bundle` |
 | I18 | `tests/test_device_safety.py::test_a_healthy_device_is_not_reset_just_because_a_job_timed_out`, `tests/test_device_safety.py::test_a_runtime_reported_fault_holds_the_device` |
 | I19 | `tests/test_device_safety.py::test_a_dead_chip_is_isolated_without_waiting_for_the_device_lock`, `tests/test_device_safety.py::test_a_chip_dead_on_two_consecutive_samples_is_isolated`, `tests/test_device_safety.py::test_a_transient_all_ones_does_not_amputate_a_chip`, `tests/test_device_safety.py::test_a_reset_in_flight_must_not_look_like_dead_chips`, `tests/test_device_safety.py::test_a_reset_that_outlives_our_wait_still_shields_its_chips`, `tests/test_device_safety.py::test_every_chip_at_once_is_a_global_event_not_32_dead_chips`, `tests/test_device_safety.py::test_a_dead_chip_kills_the_processes_that_still_map_it` |
 | I20 | `tests/test_device_safety.py::test_watchdog_ping_gates_on_sampler_liveness` |
