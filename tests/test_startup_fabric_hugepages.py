@@ -562,6 +562,67 @@ async def test_a_hugepage_77_rechecks_every_30s_and_spends_no_retry(monkeypatch,
     assert len(seen) == 5
 
 
+@pytest.mark.parametrize("hugepages", [True, False], ids=["hugepage-77", "other-77"])
+@pytest.mark.parametrize("age,reached", [(100, False), (700, True), (7200, True)])
+def test_the_77_age_bound_counts_from_the_fsm_stamp(monkeypatch, tmp_path, clear_job_state, hugepages, age, reached):
+    """I40's age bound ends a hold the retries do not: a hugepage 77 spends none, so only the age
+    ends it. The bound reads the FSM's own ``...Z`` stamp."""
+    _hold_77(monkeypatch, tmp_path)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", raising=False)
+    monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
+    monkeypatch.setattr(srv, "_fabric_77_streak", 0)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
+    monkeypatch.setattr(
+        srv.health_monitor,
+        "last_fabric_output",
+        _HUGEPAGE_77S[0] if hugepages else "fabric-check: validator did not complete",
+    )
+    _opened_ago(monkeypatch, age)
+    assert srv._fabric_77_bound_reached() is reached
+    assert srv._fabric_77_streak == (0 if hugepages else 1), "one 77, under the retry bound"
+
+
+def test_an_unparseable_stamp_falls_back_to_the_retry_count(monkeypatch, tmp_path, clear_job_state):
+    """A ``since`` the bound cannot read must not hold forever: each 77, a hugepage one too, then
+    counts as a retry, so the retry bound still ends the hold."""
+    _hold_77(monkeypatch, tmp_path)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
+    monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
+    monkeypatch.setattr(srv, "_fabric_77_streak", 0)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_output", _HUGEPAGE_77S[0])
+    monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, since="not a stamp"))
+    assert [srv._fabric_77_bound_reached() for _ in range(3)] == [False, False, True]
+
+
+@pytest.mark.asyncio
+async def test_a_hugepage_77_hold_past_its_age_bound_takes_the_fallback(monkeypatch, tmp_path, clear_job_state):
+    """A pool that never fills does not hold forever: past the age bound the relift's hugepage 77
+    hands over to the I40 fallback."""
+    _hold_77(monkeypatch, tmp_path)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", raising=False)
+    monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
+    monkeypatch.setattr(srv, "_fabric_77_streak", 0)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_output", _HUGEPAGE_77S[0])
+    fallbacks = []
+
+    async def fallback(*a, **k):
+        fallbacks.append(True)
+        return True
+
+    async def verify(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": _HUGEPAGE_77S[0]}}
+
+    monkeypatch.setattr(srv, "_fabric_77_fallback", fallback)
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    _opened_ago(monkeypatch, 2 * 3600)
+    await srv._attempt_idle_relift()
+    assert fallbacks == [True]
+
+
 @pytest.mark.asyncio
 async def test_the_77_only_relift_waits_for_hugepages(monkeypatch, tmp_path, clear_job_state):
     _hold_77(monkeypatch, tmp_path)

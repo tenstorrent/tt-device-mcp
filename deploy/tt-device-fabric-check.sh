@@ -114,9 +114,15 @@ if : >"$OUT/last-run.log" 2>/dev/null; then
     LAST="$OUT/last-run.log"
     echo "fabric-check: run started $(date -Is)" >>"$LAST"
 fi
+# A cap that is not a plain byte count (e.g. "4M") would break the arithmetic below after the
+# validator ran and turn its verdict into a fault: say so and use the default.
 LAST_MAX="${TTDEV_FABRIC_LAST_RUN_MAX_BYTES:-4194304}"
+if ! [[ "$LAST_MAX" =~ ^[0-9]{1,15}$ ]] || [ "$LAST_MAX" -lt 1024 ]; then
+    log "TTDEV_FABRIC_LAST_RUN_MAX_BYTES='$LAST_MAX' is not a byte count >= 1024; using 4194304"
+    LAST_MAX=4194304
+fi
 save_to_last() {
-    [ -n "$LAST" ] || return 0
+    [ -n "$LAST" ] && [ -r "$1" ] || return 0
     local size
     size="$(wc -c <"$1")"
     if [ "$size" -le "$LAST_MAX" ]; then

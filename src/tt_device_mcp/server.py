@@ -3497,14 +3497,19 @@ def _fabric_77_bound_reached() -> bool:
     # A pool still filling is a prerequisite on its way, not a check that cannot run: its 30 s
     # re-checks would spend the retries in 90 s and release a box no job can open yet. The age bound
     # below still ends it.
-    if not _last_77_was_hugepages():
+    # The FSM's own "...Z" stamp, read as _fabric_77_recheck_due reads it. One it did not write has no
+    # age: every 77 then counts as a retry, a hugepage one too, so the retry bound still ends the hold.
+    try:
+        opened = datetime.strptime(str(fsm.record.since), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        opened = None
+    if opened is None or not _last_77_was_hugepages():
         _fabric_77_streak += 1
     if _fabric_77_streak >= _env_int("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", 3, 1):
         return True
-    try:
-        age = (datetime.now() - datetime.fromisoformat(str(fsm.record.since))).total_seconds()
-    except (TypeError, ValueError):
+    if opened is None:
         return False
+    age = (datetime.now(timezone.utc) - opened).total_seconds()
     return age >= _env_int("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", 600, 60)
 
 
