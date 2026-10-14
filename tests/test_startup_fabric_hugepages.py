@@ -770,6 +770,25 @@ async def test_the_first_job_hardware_fault_is_outside_the_77_bound(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reset_passes, lifted", [(2, True), (0, False)])
+async def test_after_an_unknown_reset_the_next_relift_77_reaches_the_bound(
+    monkeypatch, tmp_path, clear_job_state, reset_passes, lifted
+):
+    """Spec 04 I29: a reset whose post-reset fabric stayed a 77 (one pass and one retry) counts those
+    passes toward the episode's I40 bound, so the next relift's 77 falls back at once and releases on a
+    healthy eth read. Without them, the same relift is still under the default bound and just holds."""
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
+    monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
+    monkeypatch.setattr(srv, "_fabric_77_streak", 0)
+    if reset_passes:
+        srv._note_fabric_77_reset_passes(reset_passes)
+    await srv._attempt_idle_relift()
+    assert rungs == []
+    assert (srv.fsm.state is ServerState.HEALTHY) is lifted
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "eth,released",
     [((True, "all active-eth cores advancing"), True), ((None, "252 of 256 eth link(s) up"), False)],
@@ -803,6 +822,17 @@ async def test_a_topology_mismatch_whose_rerun_77s_takes_the_bounded_fallback(
 async def test_a_77_only_hold_under_its_bound_still_just_holds(monkeypatch, tmp_path, clear_job_state):
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "5")
+    await srv._attempt_idle_relift()
+    assert rungs == []
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+async def test_a_known_fabric_fault_hold_is_outside_the_77_bound(monkeypatch, tmp_path, clear_job_state):
+    """03 I46: the fallback release is what kept handing jobs a fabric that killed them, so a known
+    fabric fault neither lifts on a healthy eth read nor climbs the ladder past the bound."""
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "known fabric fault: 2 jobs in a row")
     await srv._attempt_idle_relift()
     assert rungs == []
     assert srv.fsm.state is ServerState.RECOVERING

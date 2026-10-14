@@ -215,6 +215,12 @@ class RecoveryMechanism:
 
         self.last_reset_monotonic: float = 0.0
         self.last_reset_failed: bool = False
+        # The hold episode (its ``since``) whose reset already came back UNKNOWN — enum+ARC healthy, the
+        # fabric a persistent 77. A second identical reset on that episode measures nothing new, so the
+        # idle escalation goes to the last-chance sweep instead (spec 04 I29).
+        self.unverified_reset_since: Optional[str] = None
+        # The episode whose last-chance sweep that path already ran; the next escalation climbs.
+        self.unverified_sweep_since: Optional[str] = None
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a

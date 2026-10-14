@@ -1503,7 +1503,14 @@ class GalaxyRecovery(Recovery):
         return complete
 
     async def _settle_and_verify_before_host_rung(
-        self, expected: int, log, gate_phase: str, *, offbus_chips: Optional[set] = None, context: str = ""
+        self,
+        expected: int,
+        log,
+        gate_phase: str,
+        *,
+        offbus_chips: Optional[set] = None,
+        context: str = "",
+        fabric_77_unverified: bool = False,
     ) -> Optional[bool]:
         """The LAST-CHANCE gate every host rung passes through: fire every reset type once more,
         back-to-back, then ONE settle and ONE verify — and only if the mesh is still bad does the
@@ -1576,6 +1583,12 @@ class GalaxyRecovery(Recovery):
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
         finally:
             pcie_guard.end_offbus_reset()
+        if healthy and fabric_77_unverified and expected > 1 and self._fabric_ran_but_unverified(evidence):
+            # The caller is past an UNKNOWN reset whose I40 fallback refused (spec 04 I29): a 77 here is
+            # the same no-verdict the reset already got, never a recovered fabric.
+            log("the sweep's verify is still a fabric 77 — the fabric stays unverified, not recovered")
+            health_event("host_rung_sweep_unverified", context=context or gate_phase, evidence=evidence)
+            healthy = False
         if not healthy:
             if not swept:
                 log(f"the full reset ladder did not run{where} — holding; no reboot or power cycle this pass")
@@ -1769,10 +1782,19 @@ class GalaxyRecovery(Recovery):
         # the cold rung, not a warm reboot that cannot re-enumerate the dropped ASICs.
         beats_before = await asyncio.to_thread(self.deps.read_heartbeats)
         off_bus_before = len(dead_chips(beats_before)) + max(0, expected - len(beats_before))
+        if hold_since and self.mechanism.unverified_reset_since == hold_since:
+            # This episode's reset already came back UNKNOWN (enum+ARC healthy, the fabric a persistent
+            # 77) and the I40 fallback still refused, so it escalated again. Another identical reset
+            # measures nothing new — one Galaxy host ran eight of them, ten minutes apart, before the sweep
+            # finally ran. Go straight to the last-chance sweep, then the host climb (spec 04 I29).
+            await self._sweep_after_unverified_reset(expected, off_bus_before, hold_since, log)
+            return True
         recovered = await self._reset_and_verify_device(indices, log)
         if recovered is None:
-            # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, which the
-            # idle relift re-checks within its bound (spec 03 I40). Nothing measured a failure to climb on.
+            # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, and its
+            # passes already count toward the relift's bound (spec 03 I40), so the next relift gates on
+            # the startup checks at once. A refused fallback that escalates again on this episode goes to
+            # the sweep, not another reset (spec 04 I29). Nothing measured a failure to climb on.
             return True
         if recovered:
             self.deps.clear_device_reported_fault("idle escalation: galaxy reset recovered the mesh")
@@ -2142,8 +2164,37 @@ class GalaxyRecovery(Recovery):
         await self._climb_to_host_recovery_after_failed_reset(expected, off_bus_before, log)
         return True
 
+    async def _sweep_after_unverified_reset(self, expected: int, off_bus_before: int, hold_since: str, log) -> None:
+        """The next rung for a present-mesh episode whose reset came back UNKNOWN and whose I40 fallback
+        refused: the last-chance sweep once per episode, then the host climb (spec 04 I29).
+
+        The sweep runs here, not behind the host-rung permission: the climb asks the reboot ledger
+        first, and on one Galaxy host its boot-loop guard kept the sweep waiting an hour. A sweep whose verify
+        is still a 77 is not a recovery (the fallback that refused it measured more than a 77 can)."""
+        if self.mechanism.unverified_sweep_since != hold_since:
+            self.mechanism.unverified_sweep_since = hold_since
+            health_event("unverified_reset_sweep", held_since=hold_since)
+            log(
+                "this hold's reset already left the fabric unverified and the startup checks refused it — "
+                "running the last-chance sweep now instead of another identical reset"
+            )
+            swept = await self._settle_and_verify_before_host_rung(
+                expected,
+                log,
+                "idle-escalation",
+                context="idle escalation after an unverified reset",
+                fabric_77_unverified=True,
+            )
+            if swept is not False:
+                # True: recovered and released. None: the sweep could not run in full — the next
+                # escalation of this episode climbs; the climb's own sweep covers what this one missed.
+                if swept is None:
+                    self.mechanism.unverified_sweep_since = None
+                return
+        await self._climb_to_host_recovery_after_failed_reset(expected, off_bus_before, log, swept=True)
+
     async def _climb_to_host_recovery_after_failed_reset(
-        self, expected: int, off_bus_before: Optional[int], log
+        self, expected: int, off_bus_before: Optional[int], log, *, swept: bool = False
     ) -> None:
         """Climb an idle escalation whose galaxy reset failed to revive the mesh to the host rung — a
         warm reboot, then a BMC power cycle above it — so a reset that did not recover does not sit.
@@ -2293,8 +2344,9 @@ class GalaxyRecovery(Recovery):
         )
         # Last chance: every reset type once more, back-to-back, then one settle and one verify. This
         # is the road MOST real power cycles took (the idle/stuck-hold escalation), and before ladder-v2
-        # it climbed to the host rung without ever re-trying the cheaper rungs.
-        if (
+        # it climbed to the host rung without ever re-trying the cheaper rungs. Skipped when the caller
+        # already swept this episode (_sweep_after_unverified_reset).
+        if not swept and (
             await self._settle_and_verify_before_host_rung(
                 expected, log, "idle-escalation", context=f"idle escalation, {off_bus}/{expected} off the bus"
             )

@@ -514,6 +514,31 @@ each rung fires only when the gentler one failed or cannot apply.
   pass. An already-running reset in its own scope is still adopted, and the operator's reset tool
   is never held.
 
+- **I29 — One unverified reset per 77-only episode; the next escalation sweeps once, then climbs.**
+  A galaxy reset whose post-reset fabric is still a 77 after the eth-training retries (UNKNOWN,
+  spec 03 I40) records its hold episode and counts its passes toward that episode's I40 bound.
+  When the I40 fallback then refuses and the idle escalation runs again on the same episode, it
+  fires no second identical reset: it runs the last-chance sweep (I22) once for that episode,
+  strict on a 77 (a sweep whose verify still reads a 77 is no recovery and clears nothing), then
+  the host climb with the sweep marked spent. A later escalation of the episode climbs without
+  sweeping again. A sweep that could not run in full holds that pass and fires no host rung (I22);
+  the episode's next escalation tries it again. Bounds the loop of identical ten-minute resets one
+  Galaxy host ran (eight, about 65 min) before it ever swept.
+
+- **I30 — The deadline escalation never resets a fabric-only present mesh.** Past the escalation
+  ceiling, when the fresh heartbeat read shows every expected chip present with a live ARC
+  heartbeat, no chip is isolated, and the hold names only the fabric — a topology mismatch (the
+  hold's detail or reason starts `topology mismatch`, names the hardware fault of the first job
+  after a topology-mismatch lift, or a fabric-unverified hold's last pass printed the validator's
+  `Connection mismatch detected`), or a fabric pass that could not run (a 77) with no runtime fault
+  reported and no pass that measured the fabric bad — the forced escalation runs no galaxy reset
+  and no ladder rung. It holds, journals `hold_deadline_no_reset` and sends the alert hook once per
+  episode; later ceiling windows stay quiet. A reset cannot fix cabling or a missing verdict, and
+  on one Galaxy host a galaxy reset on a cabling mismatch took a chip off the bus and the ladder
+  then re-powered its tray. An off-bus or dead-ARC chip, a runtime-reported fault, or a measured-bad
+  fabric keeps the ladder. A known fabric fault (spec 03 I46) on a fabric-unverified hold is held the
+  same way (`known fabric fault`), even when an older pass measured the fabric bad.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -909,6 +934,8 @@ sees a silent fabric pass.
 | I27 the manual-recovery guard fails closed: no check configured never fires (pages once), the installed template is the default, a check that is unreadable, raises or times out stands back, a clean check lets it fire, and the tenant is re-read after the checks | `tests/test_offbus_power_cycle.py::test_no_manual_recovery_check_never_fires_and_pages_once`, `tests/test_offbus_power_cycle.py::test_the_installed_check_is_the_default`, `tests/test_offbus_power_cycle.py::test_a_manual_recovery_check_that_cannot_answer_holds_until_the_bound`, `tests/test_offbus_power_cycle.py::test_checks_that_say_no_let_it_fire`, `tests/test_offbus_power_cycle.py::test_a_tenant_arriving_during_the_checks_holds`, `tests/test_offbus_power_cycle.py::test_the_pages_name_the_host` |
 | I27 the manual-recovery check template: operator power actions count, read-only BMC queries do not, an unreadable journal or auth.log cannot answer | `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_template`, `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_cannot_answer_on_an_unreadable_journal`, `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_cannot_answer_on_an_unreadable_auth_log`, `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_reads_auth_log_within_the_window` |
 | I28 an outage hold or `TT_DEVICE_MCP_AUTO_MESH_RESET=0` holds the gate, relift, watchdog and sweep mesh reset, also with a chip off the bus in the startup and pre-job gates, and pages again while it stands; one rung off alone, or `=1`, still resets | `tests/test_mesh_reset_hold.py::test_the_hold_reason_follows_the_flags`, `::test_the_gate_holds_the_mesh_reset_under_an_outage_hold_and_pages_once`, `::test_the_gate_holds_with_the_explicit_knob_alone`, `::test_the_gate_still_resets_with_only_the_tray_rung_off`, `::test_an_explicit_opt_in_re_arms_the_mesh_reset_under_an_outage_hold`, `::test_the_last_chance_sweep_is_refused_under_an_outage_hold`, `::test_a_dropped_page_is_sent_again_and_a_lifted_hold_re_arms_it`, `::test_the_gate_holds_with_a_chip_off_the_bus_under_an_outage_hold`, `::test_without_the_hold_a_chip_off_the_bus_still_gets_the_mesh_reset`, `::test_a_standing_hold_pages_again_after_the_repage_interval`, `::test_the_repage_knob_defaults_and_rejects_nonsense` |
+| I29 one unverified reset per 77-only episode; next escalation sweeps once, strict on 77, then climbs | `tests/test_device_safety.py::test_a_reset_that_leaves_the_fabric_unverified_counts_toward_the_relift_bound`, `tests/test_device_safety.py::test_a_second_escalation_after_an_unverified_reset_sweeps_instead_of_resetting`, `tests/test_device_safety.py::test_an_incomplete_sweep_after_an_unverified_reset_does_not_climb`, `tests/test_device_safety.py::test_a_sweep_verify_that_reads_77_is_not_a_release` |
+| I30 deadline escalation holds a fabric-only present mesh without a reset; real faults keep the ladder | `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_fabric_only_present_mesh_without_a_reset`, `tests/test_device_safety.py::test_the_deadline_escalation_keeps_the_ladder_for_real_faults`, `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |
