@@ -1886,8 +1886,10 @@ async def test_a_dead_chip_is_isolated_without_waiting_for_the_device_lock(monke
     monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
 
     # Hold the device lock, as a hung fabric check would. Isolation must proceed anyway.
+    # The lock is held for the whole block, so any finite bound proves isolation skips it;
+    # 15 s leaves room for a loaded host's busy thread pool behind the to_thread calls.
     async with srv._device_op("health-gate/post-job"):
-        await asyncio.wait_for(srv.sampler.isolate_dead_chips(["13"]), timeout=2.0)
+        await asyncio.wait_for(srv.sampler.isolate_dead_chips(["13"]), timeout=15.0)
 
     assert removed == ["13"], "the dead chip was not removed from the kernel"
     assert quiesced == [False], "tt-telemetry was not stopped before/while isolating"
