@@ -86,6 +86,47 @@ def _load_asic_bus_map() -> dict[str, int]:
         return {}
 
 
+# A topology mismatch remembered per chip-to-bus map: while the map is unchanged, the descriptor
+# run that would only throw the same mismatch again (~19 s) is skipped and the gate goes straight
+# to the traffic-only rerun. Spec 03 I45.
+TOPOLOGY_CACHE_FILE = "fabric_topology_mismatch.json"
+
+
+def _write_json(name: str, data: dict) -> None:
+    try:
+        p = health_dir() / name
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, p)
+    except OSError:
+        pass  # state we cannot persist must not break the gate
+
+
+def _remember_topology_mismatch(desc: str, marker: str) -> None:
+    m = _asic_bus_map()
+    if m:
+        _write_json(TOPOLOGY_CACHE_FILE, {"desc": desc, "asic_bus": m, "marker": marker})
+
+
+def _forget_topology_mismatch() -> None:
+    try:
+        (health_dir() / TOPOLOGY_CACHE_FILE).unlink()
+    except OSError:
+        pass
+
+
+def _cached_topology_mismatch(desc: str) -> Optional[str]:
+    """The cached mismatch marker when it was seen with this descriptor on this chip-to-bus map."""
+    try:
+        data = json.loads((health_dir() / TOPOLOGY_CACHE_FILE).read_text())
+        cached = {str(k): int(v) for k, v in data["asic_bus"].items()}
+        marker = str(data["marker"])
+        same_desc = data.get("desc") == desc
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    return marker if same_desc and cached and cached == _asic_bus_map() else None
+
+
 def _tray_name(bus: int) -> str:
     tray = _TRAY_BY_BUS_GROUP.get(bus & 0xC0)
     return f"tray {tray}" if tray else f"bus 0x{bus:02x}"
@@ -423,24 +464,87 @@ class HealthMonitor:
         """
         path = health_dir() / self.ETH_LINK_BASELINE_FILE
         try:
-            baseline = int(json.loads(path.read_text()).get("links", 0))
+            data = json.loads(path.read_text())
+            baseline = int(data.get("links", 0))
             corrupt = False
         except FileNotFoundError:
-            baseline, corrupt = 0, False
+            data, baseline, corrupt = {}, 0, False
         except (OSError, ValueError, TypeError, AttributeError):
-            baseline, corrupt = 0, True
+            data, baseline, corrupt = {}, 0, True
+        topo = self._topology_baseline(data)
+        if topo is not None:
+            # A topology-mismatch lift re-baselined this host (I45): the mark belongs to the
+            # chip-to-bus map it was taken on, and the pre-lift mark is kept as ``high_water``.
+            high, keyed, pending = topo
+            if keyed != _asic_bus_map():
+                # Trays moved again since: the re-baseline no longer describes this mesh.
+                data, baseline = {"links": high}, high
+                _write_json(self.ETH_LINK_BASELINE_FILE, data)
+            elif pending:
+                # The first read after the lift sets the mark at the links it discovered.
+                _write_json(
+                    self.ETH_LINK_BASELINE_FILE,
+                    {"links": measured, "high_water": max(high, measured), "asic_bus": keyed},
+                )
+                health_event("eth_link_rebaselined", links=measured, high_water=high)
+                return ""
+            elif measured != baseline:
+                # The cabling changed under the re-baseline: the next pass runs the descriptor again.
+                _forget_topology_mismatch()
         if measured > baseline or corrupt:
-            tmp = path.with_name(path.name + ".tmp")
-            try:
-                tmp.write_text(json.dumps({"links": measured}))
-                os.replace(tmp, path)
-            except OSError:
-                pass  # a mark we cannot persist must not break the gate
+            data = {"links": measured} if corrupt else {**data, "links": measured}
+            if "high_water" in data:
+                data["high_water"] = max(int(data["high_water"]), measured)
+            _write_json(self.ETH_LINK_BASELINE_FILE, data)
         if corrupt:
             return f"eth link baseline unreadable; re-baselined at {measured} up link(s)"
         if measured < baseline:
             return f"{measured} of {baseline} eth link(s) up — a link went down since the high-water mark"
         return ""
+
+    @staticmethod
+    def _topology_baseline(data: dict) -> Optional[tuple[int, dict[str, int], bool]]:
+        """``(high_water, asic_bus, pending)`` of a topology re-baseline, or None for a plain mark."""
+        try:
+            keyed = {str(k): int(v) for k, v in data["asic_bus"].items()}
+            high = max(int(data.get("high_water", 0)), 0)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        return high, keyed, bool(data.get("rebaseline"))
+
+    def _arm_eth_rebaseline(self) -> None:
+        """A topology-mismatch lift: key the link mark to this chip-to-bus map and let the next read
+        set it at the links the traffic-only pass found. A map already re-baselined keeps its mark,
+        so a link lost since then still reads as a drop."""
+        now = _asic_bus_map()
+        if not now:
+            return
+        try:
+            data = json.loads((health_dir() / self.ETH_LINK_BASELINE_FILE).read_text())
+            topo = self._topology_baseline(data)
+            links = int(data.get("links", 0))
+        except (OSError, ValueError, TypeError, AttributeError):
+            data, topo, links = {}, None, 0
+        if topo is not None and topo[1] == now:
+            return
+        high = max(links, topo[0] if topo else 0)
+        _write_json(
+            self.ETH_LINK_BASELINE_FILE, {"links": high, "high_water": high, "asic_bus": now, "rebaseline": True}
+        )
+
+    def _restore_eth_high_water(self) -> None:
+        """A clean pass without the mismatch marker: the descriptor's links are all there again, so
+        the pre-lift high-water mark is the bar again, and the cached mismatch is gone."""
+        _forget_topology_mismatch()
+        try:
+            data = json.loads((health_dir() / self.ETH_LINK_BASELINE_FILE).read_text())
+            topo = self._topology_baseline(data)
+            links = int(data.get("links", 0))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return
+        if topo is not None:
+            _write_json(self.ETH_LINK_BASELINE_FILE, {"links": max(links, topo[0])})
+            health_event("eth_link_baseline_restored", links=max(links, topo[0]))
 
     def _health_check_enabled(self) -> bool:
         """Whether the tt-smi snapshot health check runs around jobs. On by default;
@@ -754,13 +858,22 @@ class HealthMonitor:
             # has killed a host twice.
             self.fabric_check_proc = proc
 
-        try:
-            rc, text = await fabric.check(
-                argv, env, timeout_sec=timeout_sec, track=_track, terminate=self._terminate_process_group, cwd=cwd
+        desc = "" if override else fabric._validator_paths()[2]
+        cached = _cached_topology_mismatch(desc) if desc else None
+        if cached:
+            # This chip-to-bus map already mismatched the descriptor: that run would only throw the
+            # same mismatch again, so go straight to the traffic-only rerun (I45).
+            rc, text, ok, reason = await self._fabric_traffic_only_rerun(
+                desc, "", timeout_sec=timeout_sec, track=_track, cwd=cwd, marker=cached
             )
-        except Exception as e:  # noqa: BLE001 - configured but could not spawn; never raise into the gate
-            self._journal_skip_once("fabric_check_unavailable", "not_runnable", detail=str(e)[:400])
-            return None, f"skipped (fabric check not runnable: {e})"
+        else:
+            try:
+                rc, text = await fabric.check(
+                    argv, env, timeout_sec=timeout_sec, track=_track, terminate=self._terminate_process_group, cwd=cwd
+                )
+            except Exception as e:  # noqa: BLE001 - configured but could not spawn; never raise into the gate
+                self._journal_skip_once("fabric_check_unavailable", "not_runnable", detail=str(e)[:400])
+                return None, f"skipped (fabric check not runnable: {e})"
 
         dt = (datetime.now() - _t0).total_seconds()
         # Keep the whole thing: the validator names the failing links, and the 400-char detail
@@ -773,9 +886,8 @@ class HealthMonitor:
             # means something only for the built-in validator's own output signatures.
             ok = True if rc == 0 else None if rc == FABRIC_CHECK_CANNOT_CHECK_RC else False
             reason = _override_reason(text)
-        else:
+        elif not cached:
             ok, reason = fabric.classify(rc, text)
-            desc = fabric._validator_paths()[2]
             if ok is None and desc and fabric.is_topology_mismatch(text):
                 rc, text, ok, reason = await self._fabric_traffic_only_rerun(
                     desc, text, timeout_sec=timeout_sec, track=_track, cwd=cwd
@@ -802,6 +914,7 @@ class HealthMonitor:
                 return True, f"fabric links healthy on discovered links ({dt:.0f}s); {marker}"
             self.topology_lift_pending = False
             _save_asic_bus_map()
+            self._restore_eth_high_water()
             return True, f"fabric links healthy ({dt:.0f}s)"
         if ok is None:
             # The check could not run — it learned nothing about the fabric, so resetting
@@ -811,6 +924,10 @@ class HealthMonitor:
             if log:
                 log.warning(f"FABRIC-CHECK not runnable on this host — no fabric coverage: {reason[:400]}")
             health_event("fabric_check_unavailable", detail=reason[:400], cmd=cmd)
+            if reason.startswith(fabric.TOPOLOGY_MISMATCH):
+                # The rerun could not measure: the bounded fallback (I40) judges the eth read, so it
+                # needs the mark for this mesh, not the descriptor's (I45).
+                self._arm_eth_rebaseline()
             return None, f"fabric check COULD NOT RUN ({dt:.0f}s): {reason[:400]}"
         self.last_fabric_ok = False
         if rc is None:
@@ -818,16 +935,28 @@ class HealthMonitor:
         return False, f"fabric check exited {rc} ({dt:.0f}s): {reason[:400]}"
 
     async def _fabric_traffic_only_rerun(
-        self, desc: str, first: str, *, timeout_sec: float, track, cwd: Optional[str]
+        self,
+        desc: str,
+        first: str,
+        *,
+        timeout_sec: float,
+        track,
+        cwd: Optional[str],
+        marker: Optional[str] = None,
     ) -> tuple[Optional[int], str, Optional[bool], str]:
         """The validator stopped on its descriptor comparison: rerun it once without the descriptor
         so traffic still crosses every link it discovered. Same verdict table as the first run; a
-        pass carries the mismatch marker onto its OK, anything not measured stays a topology skip."""
-        missing, extra = fabric.topology_counts(first)
-        marker = fabric.topology_marker(desc, missing, extra)
+        pass carries the mismatch marker onto its OK, anything not measured stays a topology skip.
+        ``marker`` set is a mismatch cached for this chip-to-bus map: no descriptor run preceded."""
         log = self._logger()
-        if log:
-            log.warning(f"fabric-check: {marker}; rerunning without the descriptor")
+        if marker is None:
+            missing, extra = fabric.topology_counts(first)
+            marker = fabric.topology_marker(desc, missing, extra)
+            _remember_topology_mismatch(desc, marker)
+            if log:
+                log.warning(f"fabric-check: {marker}; rerunning without the descriptor")
+        elif log:
+            log.warning(f"fabric-check: {marker} (cached for this chip-to-bus map); descriptor run skipped")
         rebuilt = fabric.build_command(descriptor=False)
         if rebuilt is None:
             return None, first, None, f"{fabric.TOPOLOGY_MISMATCH}; traffic-only rerun unavailable"
@@ -857,6 +986,7 @@ class HealthMonitor:
         moved = moved_trays(_load_asic_bus_map(), _asic_bus_map())
         health_event("fabric_topology_mismatch", marker=marker, moved_trays=moved)
         self.topology_lift_pending = True
+        self._arm_eth_rebaseline()
         log = self._logger()
         if log:
             log.warning(f"FABRIC TOPOLOGY MISMATCH: {marker}" + (f"; moved: {', '.join(moved)}" if moved else ""))
