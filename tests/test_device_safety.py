@@ -5758,7 +5758,9 @@ async def _run_one(job, limit_sec: float = 15.0, until=None):
         deadline = time.monotonic() + limit_sec
         # finished_at is set before the survivor bookkeeping and the post-job gate; cancelling
         # then (a slow holder scan on a busy host) cut the runner off before it marked anything.
-        while (job.finished_at is None or srv.post_job_gate_pending or (until and not until())) and time.monotonic() < deadline:
+        while (
+            job.finished_at is None or srv.post_job_gate_pending or (until and not until())
+        ) and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
     finally:
         runner.cancel()
