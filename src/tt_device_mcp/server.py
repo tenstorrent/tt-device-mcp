@@ -144,6 +144,15 @@ from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
+from tt_device_mcp.job_spool import (
+    SpoolOffsets,
+    SpoolTail,
+    open_job_spool,
+    read_offsets,
+    remove_job_spool,
+    spool_paths,
+    sweep_job_spools,
+)
 from tt_device_mcp.peercred import username_for_uid
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
 from tt_device_mcp.socket_transport import (
@@ -1544,6 +1553,87 @@ def device_op_flock() -> Path:
     inhibit file, so the per-user daemon's redirect of that file moves this one too."""
     explicit = os.environ.get("TT_DEVICE_MCP_DEVICE_OP_FLOCK", "").strip()
     return Path(explicit) if explicit else device_op_inhibit().with_name(DEVICE_OP_FLOCK_NAME)
+
+
+# The auto-updater's hold on dispatch (spec 01 I18, 08 I18). The updater writes "<pid> <epoch>" here
+# before it decides the box is idle and removes it once the broker restart has returned, so no job
+# starts in the window between its idle check and the restart that would cut the job off. A hold
+# whose writer is gone, or that has stood longer than DISPATCH_HOLD_MAX_SEC, is an updater that died
+# or hung: it is ignored and removed, so a broken updater can delay dispatch but never stop it.
+DISPATCH_HOLD_NAME = "dispatch-hold"
+DISPATCH_HOLD_MAX_SEC = float(os.environ.get("TT_DEVICE_MCP_DISPATCH_HOLD_MAX_SEC", "900"))
+DISPATCH_HOLD_POLL_SEC = 0.5
+
+
+def dispatch_hold() -> Path:
+    """The dispatch-hold file. Late-bound (spec 06 I5); a sibling of the inhibit file by default."""
+    explicit = os.environ.get("TT_DEVICE_MCP_DISPATCH_HOLD", "").strip()
+    return Path(explicit) if explicit else device_op_inhibit().with_name(DISPATCH_HOLD_NAME)
+
+
+def _dispatch_hold_holder() -> str:
+    """Who holds dispatch, or '' when nobody does. A dead, malformed or overdue hold is removed."""
+    path = dispatch_hold()
+    try:
+        text = path.read_text()
+    except OSError:
+        return ""
+    try:
+        pid_s, epoch_s = text.split()[:2]
+        pid, epoch = int(pid_s), float(epoch_s)
+        if pid <= 0:
+            raise ValueError(pid)
+    except ValueError:
+        pid, epoch = 0, 0.0
+    alive = False
+    if pid:
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except PermissionError:
+            alive = True
+        except OSError:
+            alive = False
+    age = time.time() - epoch
+    if alive and 0 <= age <= DISPATCH_HOLD_MAX_SEC:
+        return f"pid {pid}, held {int(age)}s"
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    if logger:
+        logger.warning(
+            f"DISPATCH_HOLD ignoring stale hold {text.strip()!r} "
+            f"({'overdue' if alive else 'holder gone or unreadable'}); removed"
+        )
+    return ""
+
+
+async def _wait_out_dispatch_hold(job: "Job", job_log_file: Optional[Path]) -> None:
+    """Keep the job QUEUED while the auto-updater holds dispatch. Returns at once when nobody does,
+    and when the job is killed while it waits. Never raises."""
+    try:
+        holder = _dispatch_hold_holder()
+    except Exception:  # noqa: BLE001 - a bug here must not keep a job off a free device
+        return
+    if not holder:
+        return
+    if logger:
+        logger.info(f"JOB_RUNNER job_id={job.id} waiting: the auto-updater holds dispatch ({holder})")
+    health_event("dispatch_hold_wait", job_id=job.id, holder=holder)
+    if job_log_file:
+        try:
+            with open(job_log_file, "a") as f:
+                f.write("[waiting: the broker is about to update and restart; this job starts after it]\n")
+        except OSError:
+            pass
+    while job.status != JobStatus.KILLED:
+        await asyncio.sleep(DISPATCH_HOLD_POLL_SEC)
+        try:
+            if not _dispatch_hold_holder():
+                return
+        except Exception:  # noqa: BLE001
+            return
 
 
 def _flock_holder_pids(fd: int) -> list[int]:
@@ -7170,9 +7260,14 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
     # held a shared galaxy for 1044s). The scope is stopped gracefully so it can still
     # release the chip on the way out.
     timed_out = False
+    scope_ended = False
+    # Carry on copying the job's output where the broker that spawned it stopped (spec 01 I17).
+    follow = None
+    job0 = jobs.get(job_id)
+    if job0 is not None and spool_paths(job_id)["stdout"].exists():
+        follow = asyncio.create_task(_follow_job_spool(job0, lambda: scope_ended))
     try:
         deadline = None
-        job0 = jobs.get(job_id)
         if job0 is not None and job0.started_at and job0.timeout_sec:
             try:
                 started = datetime.fromisoformat(job0.started_at)
@@ -7190,7 +7285,14 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                 await _terminate_scope(scope)
                 break
             await asyncio.sleep(_SCOPE_POLL_SEC)
+        scope_ended = True
     finally:
+        if follow is not None:
+            if not scope_ended:
+                follow.cancel()
+            await asyncio.gather(follow, return_exceptions=True)
+        if scope_ended:
+            remove_job_spool(job_id)
         job = jobs.get(job_id)
         if job is not None:
             rc = await asyncio.to_thread(read_job_exit_code, job_id)
@@ -7253,6 +7355,55 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
             )
 
 
+async def _follow_job_spool(job: "Job", done: Callable[[], bool]) -> None:
+    """Tail a re-adopted job's spool into its log from the offsets its spawning broker recorded,
+    until ``done()`` and nothing is left. Never raises but CancelledError."""
+    paths = spool_paths(job.id)
+    start = read_offsets(job.id)
+    offsets = SpoolOffsets(job.id, start)
+    tails = []
+    log_fh = None
+    try:
+        for name in ("stdout", "stderr"):
+            tails.append((name, SpoolTail(paths[name], done, start[name])))
+        if job.log_file:
+            try:
+                log_fh = open(job.log_file, "a", buffering=1)
+            except OSError:
+                log_fh = None
+
+        async def pump(name, tail, sink):
+            nonlocal log_fh
+            while True:
+                line = await tail.readline()
+                if not line:
+                    return
+                text = line.decode("utf-8", errors="replace")
+                job.last_output_monotonic = time.monotonic()
+                sink.append(text)
+                if log_fh:
+                    try:
+                        log_fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] [{name}] {text}")
+                    except (OSError, ValueError):
+                        log_fh = None
+                offsets.set(name, tail.emitted)
+                tail.release()
+
+        await asyncio.gather(*(pump(n, t, job.out_buf if n == "stdout" else job.err_buf) for n, t in tails))
+    except OSError as e:
+        if logger:
+            logger.warning(f"RE-ADOPT job_id={job.id} cannot follow its output spool: {e}")
+    finally:
+        for _, tail in tails:
+            tail.close()
+        offsets.close()
+        if log_fh:
+            try:
+                log_fh.close()
+            except (OSError, ValueError):
+                pass
+
+
 async def reconcile_running_scopes():
     """Re-adopt jobs still running in named scopes after a broker restart so a
     restart never orphans a running job: it stays visible as RUNNING and the
@@ -7279,6 +7430,11 @@ async def reconcile_running_scopes():
         if logger:
             logger.info(f"RE-ADOPT job_id={job_id} from {scope} (owner={job.owner})")
         asyncio.create_task(_monitor_readopted_scope(job_id, scope))
+    # A spool no job claims is the output of a job that ended while no broker ran: the log has
+    # what was copied, the rest has no reader left (spec 01 I17).
+    swept = sweep_job_spools(lambda jid: jid in jobs or jid in readopted_scopes)
+    if swept and logger:
+        logger.info(f"RE-ADOPT removed the output spools of jobs not re-adopted: {', '.join(swept)}")
 
 
 def _job_cooldown_remaining_sec(last_end_monotonic: float, now_monotonic: float) -> float:
@@ -7548,6 +7704,16 @@ async def _job_runner_loop():
             get_job_queue().task_done()
             continue
 
+        # Last step before RUNNING (spec 01 I18): an auto-update that judged the box idle is about
+        # to restart the broker, and a job started now would lose its output to that restart. On
+        # restart the job is still QUEUED, its spec still on disk, and the next broker runs it.
+        await _wait_out_dispatch_hold(job, job_log_file)
+        if job.status == JobStatus.KILLED:
+            _forget_queued_job(job_id)
+            await cleanup_finished_jobs()
+            get_job_queue().task_done()
+            continue
+
         # Update job state under lock
         async with get_lock():
             job.status = JobStatus.RUNNING
@@ -7567,6 +7733,8 @@ async def _job_runner_loop():
         privsep_prefix = None  # set below; read by the finally even when setup raised first
         proc = None
         watchdog = None
+        spool_tails: list = []  # the job's output files, when it writes to a spool (spec 01 I17)
+        spool_offsets = None
         reaping = False  # the watchdog has started the termination ladder
         # Unique to this run (ids recycle): what still finds a child that left the job's
         # session after its parent exited, for the survivor sweep in the finally below.
@@ -7604,26 +7772,46 @@ export {JOB_TAG_ENV}={job_tag}
             # Under privsep (root + opt-in) the command runs as the submitting user inside a
             # device-admitted systemd scope; otherwise it runs directly as today.
             privsep_prefix = privsep_prefix_for(job.peer_uid, unit=job_scope_unit(job_id))
-            if privsep_prefix:
-                if logger:
-                    logger.info(f"  privsep: running job {job_id} as uid={job.peer_uid} via systemd-run")
-                proc = await asyncio.create_subprocess_exec(
-                    *privsep_prefix,
-                    "/bin/bash",
-                    "-c",
-                    full_command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    preexec_fn=os.setsid,
-                )
-            else:
-                proc = await asyncio.create_subprocess_shell(
-                    full_command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    preexec_fn=os.setsid,
-                    executable="/bin/bash",
-                )
+            # The job writes into spool files, not pipes (spec 01 I17): a pipe dies with this
+            # broker, and a job re-adopted across a restart then fails on its next print. No spool
+            # to be had: pipes, as before.
+            spool = await asyncio.to_thread(open_job_spool, job_id)
+            out_target = spool["stdout"] if spool else asyncio.subprocess.PIPE
+            err_target = spool["stderr"] if spool else asyncio.subprocess.PIPE
+            try:
+                if privsep_prefix:
+                    if logger:
+                        logger.info(f"  privsep: running job {job_id} as uid={job.peer_uid} via systemd-run")
+                    proc = await asyncio.create_subprocess_exec(
+                        *privsep_prefix,
+                        "/bin/bash",
+                        "-c",
+                        full_command,
+                        stdout=out_target,
+                        stderr=err_target,
+                        preexec_fn=os.setsid,
+                    )
+                else:
+                    proc = await asyncio.create_subprocess_shell(
+                        full_command,
+                        stdout=out_target,
+                        stderr=err_target,
+                        preexec_fn=os.setsid,
+                        executable="/bin/bash",
+                    )
+            finally:
+                for fd in (spool or {}).values():
+                    os.close(fd)
+            if spool:
+                spawned = proc
+
+                def job_done() -> bool:
+                    return spawned.returncode is not None
+
+                paths = spool_paths(job_id)
+                exited = asyncio.ensure_future(spawned.wait())
+                spool_tails = [SpoolTail(paths[name], job_done, exited=exited) for name in ("stdout", "stderr")]
+                spool_offsets = SpoolOffsets(job_id)
 
             async with get_lock():
                 current_process = proc
@@ -7685,6 +7873,10 @@ export {JOB_TAG_ENV}={job_tag}
                             log_fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] [{name}] {text}")
                         except (OSError, ValueError) as e:
                             drop_log(e)
+                    if spool_offsets is not None:
+                        # The line is in the log: a successor broker resumes after it (I17).
+                        spool_offsets.set(name, stream.emitted)
+                        stream.release()
 
             def note(text):
                 """Say something in the job's own log, in the job's own voice."""
@@ -7775,8 +7967,8 @@ export {JOB_TAG_ENV}={job_tag}
                 # job ends is dropped, and this loop then waits on the queue forever.
                 await aio.wait_for(
                     asyncio.gather(
-                        read_stream(proc.stdout, "stdout", job.out_buf),
-                        read_stream(proc.stderr, "stderr", job.err_buf),
+                        read_stream(spool_tails[0] if spool_tails else proc.stdout, "stdout", job.out_buf),
+                        read_stream(spool_tails[1] if spool_tails else proc.stderr, "stderr", job.err_buf),
                     ),
                     timeout=job.timeout_sec,
                 )
@@ -7795,6 +7987,12 @@ export {JOB_TAG_ENV}={job_tag}
                         log_fh.close()
                     except OSError:
                         pass
+                for tail in spool_tails:
+                    tail.close()
+                    if tail.exited is not None:
+                        tail.exited.cancel()
+                if spool_offsets is not None:
+                    spool_offsets.close()
             await proc.wait()
             if reaping:
                 await asyncio.gather(watchdog, return_exceptions=True)
@@ -7874,6 +8072,13 @@ export {JOB_TAG_ENV}={job_tag}
                 # The job is terminal. If the spawn itself raised, the forget after it never ran,
                 # and a surviving spec would make a restart run a job its owner was told failed.
                 _forget_queued_job(job_id)
+                for tail in spool_tails:
+                    tail.close()
+                    if tail.exited is not None:
+                        tail.exited.cancel()
+                if spool_offsets is not None:
+                    spool_offsets.close()
+                remove_job_spool(job_id)
                 # Materialize the bounded capture into the result fields (the log
                 # file holds the complete output; these are a tail), then drop the
                 # per-line buffers so a retained finished job doesn't hold them.
