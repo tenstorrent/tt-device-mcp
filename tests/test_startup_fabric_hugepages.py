@@ -168,6 +168,36 @@ async def test_a_skipped_fabric_run_keeps_its_output_in_the_action_log(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_a_failed_fabric_run_keeps_its_full_output_in_the_action_log(monkeypatch, tmp_path, clear_job_state):
+    """The validator names the cause near the head of a long run and the verdict at its tail: the row
+    keeps both. Fails on base, which kept only the last 8000 chars and lost the first error line."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "_action_row", None, raising=False)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setenv(
+        "TT_DEVICE_MCP_FABRIC_CHECK_CMD",
+        "echo 'first error: link 3 down'; for i in $(seq 2000); do echo \"progress line $i padding padding\"; done; "
+        "echo 'fabric-check: verdict at the tail'; exit 1",
+    )
+
+    ok, _detail = await srv.health_monitor.verify_fabric_health(timeout_sec=30)
+
+    assert ok is False
+    logs = [p.read_text() for p in tmp_path.rglob("*") if p.is_file()]
+    row = [t for t in logs if "first error: link 3 down" in t]
+    assert row, "the head of a long failed run, where the validator names the cause, must be in its action log"
+    assert "fabric-check: verdict at the tail" in row[0] and "progress line 1000 " in row[0]
+
+
+def test_only_output_past_the_ceiling_is_cut_and_both_ends_kept():
+    big = "H" * health_monitor_mod.ACTION_LOG_OUTPUT_CHARS + "T" * 10
+    out = health_monitor_mod._action_log_output(big)
+    assert out.startswith("H") and out.endswith("T" * 10) and "chars cut" in out
+    assert health_monitor_mod._action_log_output("short") == "short"
+
+
+@pytest.mark.asyncio
 async def test_a_healthy_fabric_run_keeps_its_action_log_short(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     monkeypatch.setattr(srv, "jobs", {})
@@ -649,3 +679,93 @@ def test_an_owed_pass_does_not_carry_to_another_episode(monkeypatch, tmp_path, c
     monkeypatch.setattr(srv, "_startup_fabric_owed_since", "an earlier episode")
     assert not srv._startup_fabric_owed()
     assert srv._idle_relift_armed() == (False, False, False)
+
+
+# --- I40: a 77-only hold is bounded, then the startup checks are the gate -----------------------
+
+
+def _bound(monkeypatch, tmp_path, eth):
+    _hold_77(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "1")
+    monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", 0.0)
+    monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
+
+    async def verify(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": "could not run (77)"}}
+
+    async def eth_read(*a, **k):
+        return eth
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_read)
+    rungs = []
+
+    async def escalate(rung, *a, **k):
+        rungs.append(rung)
+        return srv.OUTCOME_WAITING
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    return rungs
+
+
+@pytest.mark.asyncio
+async def test_a_77_only_hold_past_its_bound_lifts_on_a_healthy_eth_read(monkeypatch, tmp_path, clear_job_state):
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    await srv._attempt_idle_relift()
+    assert rungs == []
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_77_only_hold_with_a_link_drop_climbs_the_ladder_not_released(monkeypatch, tmp_path, clear_job_state):
+    """A 77 is never a healthy fabric: a link-count drop reads no-verdict and goes to the ladder."""
+    rungs = _bound(monkeypatch, tmp_path, (None, "eth links below baseline"))
+    await srv._attempt_idle_relift()
+    assert rungs == ["present"]
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+async def test_a_second_77_only_hold_inside_the_window_climbs_the_ladder(monkeypatch, tmp_path, clear_job_state):
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", srv.time.monotonic())
+    await srv._attempt_idle_relift()
+    assert rungs == ["present"]
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hold_detail,fabric_detail",
+    [
+        ("gate/startup: fabric unverified (could not run)", "topology mismatch; traffic-only rerun unavailable"),
+        ("topology mismatch; traffic-only rerun not runnable: boom", "could not run (77)"),
+        (
+            "job 7: hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)",
+            "could not run (77)",
+        ),
+    ],
+)
+async def test_a_topology_mismatch_hold_is_outside_the_77_bound(
+    monkeypatch, tmp_path, clear_job_state, hold_detail, fabric_detail
+):
+    """No reset or fallback release can fix cabling: past the bound it neither lifts nor climbs."""
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    fsm_dirty(srv, hold_detail, why="fabric_unverified")
+
+    async def verify(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": fabric_detail}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    await srv._attempt_idle_relift()
+    assert rungs == []
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+async def test_a_77_only_hold_under_its_bound_still_just_holds(monkeypatch, tmp_path, clear_job_state):
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "5")
+    await srv._attempt_idle_relift()
+    assert rungs == []
+    assert srv.fsm.state is ServerState.RECOVERING
