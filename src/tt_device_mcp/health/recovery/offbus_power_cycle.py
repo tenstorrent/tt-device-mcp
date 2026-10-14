@@ -276,8 +276,12 @@ def ipmi_detail(episode: str) -> str:
 
 
 def note_ladder_ran(episode: str) -> None:
-    if _pending.get("episode") == episode:
-        _pending["ladder_ran"] = True
+    """The safe rungs ran for this episode. Tracks it even when nothing armed it yet: the ladder's own
+    tray rung may start the IPMI clock only after this (tracking alone forces no pass)."""
+    if not episode:
+        return
+    _track(episode)
+    _pending["ladder_ran"] = True
 
 
 def ladder_ran(episode: str) -> bool:
