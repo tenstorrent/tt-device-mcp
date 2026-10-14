@@ -73,6 +73,10 @@ from tt_device_mcp.health.monitors.pci import (
     chip_snapshot_event,
     isolate_chip,
 )
+
+# The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and
+# server.py's release funnel and the gate read it to hold fabric-unverified until a pass settles it.
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
     BLOCKED,
     DEFER,
@@ -210,4 +214,6 @@ __all__ = [
     # the bounded off-bus hold (spec 04 I27): the gate's hold-deadline check asks it when the
     # grace has run out and records the forced pass it spawned for that episode
     "offbus_power_cycle",
+    # the post-reset fabric debt (spec 04 I32): no reset releases until a fabric pass settles it
+    "FABRIC_DEBT",
 ]
