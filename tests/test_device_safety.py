@@ -1884,6 +1884,8 @@ async def test_a_dead_chip_is_isolated_without_waiting_for_the_device_lock(monke
 
     monkeypatch.setattr(srv, "_set_device_pollers", pollers)
     monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    # The real holder scan walks the host's /proc; on a loaded host it outran the 2 s timeout.
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
 
     # Hold the device lock, as a hung fabric check would. Isolation must proceed anyway.
     async with srv._device_op("health-gate/post-job"):
