@@ -39,7 +39,7 @@ from typing import Callable, Optional
 
 from tt_device_mcp import alert
 from tt_device_mcp.health.evidence import health_dir, health_event
-from tt_device_mcp.health.monitors.heartbeat import ALL_ONES
+from tt_device_mcp.health.monitors.heartbeat import ALL_ONES, dead_chips, read_heartbeats
 
 _logger = logging.getLogger("tt-device-mcp")
 
@@ -484,11 +484,13 @@ def gate_mode() -> str:
 def chips_off_bus(expected: int) -> int:
     """How many of ``expected`` chips have no PCI function in sysfs right now. Sysfs that is there
     but cannot be read counts every chip as off, so a ``hold`` gate holds; with no PCI sysfs at all
-    it is 0 (the gate then decides on the AER evidence alone)."""
+    it is 0 (the gate then decides on the AER evidence alone). A chip still in sysfs whose ARC
+    heartbeat reads all-ones has left the bus too (its BAR reads return nothing), so it counts: a
+    ``hold`` box never fires a mesh reset or a sweep over it (spec 04 I24)."""
     eps = tt_endpoints()
     if eps is None:
         return expected if _pci_dir().is_dir() else 0
-    return max(0, expected - len(eps))
+    return max(0, expected - len(eps)) + len(dead_chips(read_heartbeats()))
 
 
 def host_reset_gate(off_bus: int) -> tuple:
