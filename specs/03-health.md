@@ -135,7 +135,8 @@ job boundary.
   Its message keeps the validator's first error line, on the built-in path and in the wrapper
   script alike: a `what():` line, else a filesystem error, else a logged critical/error/`TT_THROW`
   line, else the `terminate called` banner (which sits ABOVE `what():` and names only the
-  exception type), else the last line.
+  exception type), else the last line. A `TT_FATAL @`/`TT_THROW @` header names only the source
+  line and the failed condition, so it carries the message from the line under its `info:`.
 - **I18 — A healthy device is not reset because a job ended badly.** A timeout or kill is a
   reason to look hard (the full check, fabric included, post-job), then believe the answer. The
   one exception is a runtime-reported device fault, which outranks checks that are blind to it.
@@ -441,7 +442,7 @@ job boundary.
   missing, the failed job pays the full pass as before. Only the in-broker job runner says a job
   never reached the device: a Slurm `post-step` still forces the pass, and so does a job the runner
   ended on its own error, before or after the spawn, however fast and whatever its exit code.
-  Rationale: blx01 lost its host ~9s into a pass forced 2s after a green one by a job that had
+  Rationale: box A lost its host ~9s into a pass forced 2s after a green one by a job that had
   failed in 0s on a missing directory; the pass is the heaviest load the broker puts on the mesh,
   and that job told it nothing.
 - **I37 — The stuck-hold alert hook is opt-in, backs off, and never blocks.** With
