@@ -164,8 +164,22 @@ else
     reason=""
     for pat in 'what\(\):.*' 'filesystem error:.*' \
         '(\|\s*(critical|fatal|error)\s*\||\[(critical|error)\]|TT_THROW|TT_FATAL).*' 'terminate called.*'; do
-        reason="$(grep -m1 -oiE "$pat" "$RUNLOG" | head -1 | cut -c1-300)"
-        [ -n "$reason" ] && break
+        hit="$(grep -m1 -noiE "$pat" "$RUNLOG" | head -1)"
+        [ -n "$hit" ] || continue
+        reason="${hit#*:}"
+        # A TT_FATAL/TT_THROW header names only the source line and the failed condition; metal
+        # prints the message itself on the line after a bare "info:" right below it.
+        info=""
+        if printf '%s' "$reason" | grep -qE 'TT_(FATAL|THROW) @ '; then
+            info="$(awk -v n="${hit%%:*}" 'NR == n + 1 && !/^[ \t]*info:[ \t]*$/ { exit }
+                NR == n + 2 { sub(/^[ \t]+/, ""); print; exit }' "$RUNLOG")"
+        fi
+        if [ -n "$info" ]; then
+            reason="$(printf '%s' "$reason" | cut -c1-200) -- $(printf '%s' "$info" | cut -c1-200)"
+        else
+            reason="$(printf '%s' "$reason" | cut -c1-300)"
+        fi
+        break
     done
     [ -n "$reason" ] || reason="last output: $(grep -vE '^\s*$' "$RUNLOG" | sed -n '$p' | cut -c1-200)"
     # The reason goes on the FINAL line: an operator's wrapper is summarized by its last line, and
