@@ -968,7 +968,7 @@ class GalaxyRecovery(Recovery):
                 ev.expected > 1
                 and ev.off_bus > 0
                 and not ev.scope_active
-                and (reset_regressed or ev.reset_exit_nonzero)
+                and (reset_regressed or ev.reset_exit_nonzero or ev.episode_reset_regressed)
             )
             host_escalation, reboot_blocked = _host_escalation_for_drop(
                 ev.off_bus,
@@ -2033,6 +2033,20 @@ class GalaxyRecovery(Recovery):
         # fit (the release transition clears the episode clock and this latch together).
         self.deps.set_device_hold_episode_escalated(True)
         offbus_power_cycle.note_ladder_ran(hold_since)
+        if off_bus > 0 and self.mechanism.reset_regressed_in(hold_since):
+            # This episode's galaxy reset already made the drop WORSE. Re-running the ladder would fire
+            # that same mesh reset again (one Galaxy host went 4 -> 31 -> 32 off-bus across three, one
+            # per forced window), and the tray rung re-powers trays the whole box shares. Go straight to
+            # the host climb: it routes the drop to the cold rung, whose last-chance sweep still runs the
+            # full reset ladder once before any power cycle (I22), or pages and holds when no power
+            # cycle is opted in (spec 04 I31).
+            log(
+                f"{off_bus}/{expected} off-bus and this hold's galaxy reset already regressed the mesh — "
+                f"not repeating it; climbing to the host rung"
+            )
+            health_event("galaxy_reset_skipped_regressed", held_since=hold_since, off_bus=off_bus, phase="idle")
+            await self._climb_to_host_recovery_after_failed_reset(expected, off_bus, log)
+            return True
         isolated_chips = self.deps.isolated_chips()
         device_pci_map = self.deps.device_pci_map()
         # A chip GONE from the bus entirely — absent from sysfs, not reading all-ones — never entered
@@ -2274,6 +2288,32 @@ class GalaxyRecovery(Recovery):
         # defer — the watchdog keys on that same clock, so deferring without one would strand the
         # hold with nothing left to re-attempt it.
         hold_since = self.deps.device_hold_episode_since()
+        beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+        # A reset that made the mesh WORSE off the bus (the incident's 8->32), or that hard-exited
+        # leaving chips off it, cannot be undone by a warm reboot — a 6U-Galaxy reboot does not
+        # power-cycle the UBBs, so a dropped ASIC stays off across it. Route such a reset to the cold
+        # rung, never the reboot, and flag a regression loudly. No reset is cycling here (the top guard
+        # already returned on a live scope), so the count is a confirmed post-reset state. This mirrors
+        # the gate's own escalation so a regression climbs the same on the idle path as at a job boundary.
+        # Detected BEFORE the ceiling deferral below so an early regression is latched for the episode:
+        # no later pass of it fires the mesh reset again (spec 04 I31).
+        reset_regressed = expected > 1 and off_bus_before is not None and off_bus > off_bus_before
+        if reset_regressed:
+            self.mechanism.note_reset_regressed(hold_since)
+            health_event(
+                "reset_regressed_offbus",
+                off_bus_before=off_bus_before,
+                off_bus_after=off_bus,
+                expected=expected,
+                host_at_risk=True,
+            )
+            log(
+                f"the idle escalation's reset REGRESSED the mesh — {off_bus_before} -> {off_bus} of "
+                f"{expected} chip(s) off the bus. A warm reboot cannot re-enumerate a dropped Galaxy "
+                f"ASIC, so climbing to the cold rung, never the reboot; no further mesh reset this hold."
+            )
+        episode_regressed = self.mechanism.reset_regressed_in(hold_since)
         hold_age = _hold_age_sec(hold_since)
         if hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
             log(
@@ -2288,8 +2328,6 @@ class GalaxyRecovery(Recovery):
                 ceiling_sec=_stuck_hold_ceiling_sec(),
             )
             return
-        beats = await asyncio.to_thread(self.deps.read_heartbeats)
-        off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
         reboot_floor = _reboot_min_dead_chips(expected)
         # A below-floor off-bus drop reaching this climb is NOT self-healing: it survived the 20-min grace
         # and a reset that could not recover it. A dropped ASIC does not re-enumerate on a warm reboot (a
@@ -2297,31 +2335,11 @@ class GalaxyRecovery(Recovery):
         # recover it — never hold below the floor. Mark it warm-reboot-futile so the chooser routes it
         # straight to the cold rung; the reboot floor only ever gated the mesh reset, not the power cycle.
         below_floor_offbus = 0 < off_bus < reboot_floor
-        # A reset that made the mesh WORSE off the bus (the incident's 8->32), or that hard-exited
-        # leaving chips off it, cannot be undone by a warm reboot — a 6U-Galaxy reboot does not
-        # power-cycle the UBBs, so a dropped ASIC stays off across it. Route such a reset to the cold
-        # rung, never the reboot, and flag a regression loudly. No reset is cycling here (the top guard
-        # already returned on a live scope), so the count is a confirmed post-reset state. This mirrors
-        # the gate's own escalation so a regression climbs the same on the idle path as at a job boundary.
-        reset_regressed = expected > 1 and off_bus_before is not None and off_bus > off_bus_before
         warm_reboot_futile = (
             expected > 1
             and off_bus > 0
-            and (reset_regressed or self.mechanism.last_reset_exit_nonzero or below_floor_offbus)
+            and (reset_regressed or episode_regressed or self.mechanism.last_reset_exit_nonzero or below_floor_offbus)
         )
-        if reset_regressed:
-            health_event(
-                "reset_regressed_offbus",
-                off_bus_before=off_bus_before,
-                off_bus_after=off_bus,
-                expected=expected,
-                host_at_risk=True,
-            )
-            log(
-                f"the idle escalation's reset REGRESSED the mesh — {off_bus_before} -> {off_bus} of "
-                f"{expected} chip(s) off the bus. A warm reboot cannot re-enumerate a dropped Galaxy "
-                f"ASIC, so climbing to the cold rung, never the reboot."
-            )
         escalation, reboot_blocked = _host_escalation_for_drop(
             off_bus, expected, warm_reboot_futile=warm_reboot_futile, **self.deps.host_escalation_kwargs()
         )
@@ -2334,7 +2352,7 @@ class GalaxyRecovery(Recovery):
                 self.deps.emit_all_off_bus_power_cycle_required(log, off_bus, expected, "idle escalation")
             else:
                 self._emit_reset_unrecoverable_power_cycle_required(
-                    log, off_bus, expected, regressed=reset_regressed, context="idle escalation"
+                    log, off_bus, expected, regressed=reset_regressed or episode_regressed, context="idle escalation"
                 )
             # reboot_blocked means specifically: this drop needs the cold rung and power-cycle is
             # not opted in — a power_cycle kill-switch decline, not a "no rung exists at all" case.
