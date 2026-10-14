@@ -129,6 +129,9 @@ class Evidence:
     # never reads it — the router stays pure; only the tray rung's fire does. None when no bridge
     # rung ran this pass, which reads as "window unknown" -> the generic branch.
     bridge_reset_failed: Optional[dict] = None
+    # This hold episode's galaxy reset already REGRESSED the off-bus count (spec 04 I31): a failed
+    # reset on it is warm-reboot-futile even when this pass's own count did not grow.
+    episode_reset_regressed: bool = False
 
 
 @dataclass
