@@ -12139,6 +12139,75 @@ async def test_startup_health_climbs_after_a_reboot_that_did_not_bring_the_mesh_
     assert srv.fsm.state is not ServerState.HEALTHY, "the box must stay HELD across the verify — it never releases"
 
 
+def _arm_degraded_startup_after_reboot(monkeypatch, tmp_path):
+    """A broker start on a boot the ledger attributes to the broker's own warm reboot, with the sysfs
+    probe reading 0/32 and the cold rung opted in: the post-reboot verify, if it runs, climbs to the
+    power cycle. Returns the power-cycle counter and the verify-call counter."""
+    _ledger_dir(monkeypatch, tmp_path)
+    _seed_reboot_ledger(tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-now")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    _no_holders(monkeypatch)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {})
+    monkeypatch.setattr(srv, "heartbeat_verdict", lambda expected, **k: (Verdict.UNHEALTHY, "0 chip(s) in sysfs", {}))
+    counts = {"cycles": 0, "verifies": 0}
+
+    async def fake_power_cycle(log, reason):
+        counts["cycles"] += 1
+
+    real_verify = srv.galaxy_recovery._verify_post_reboot_recovery
+
+    async def counting_verify(*a, **k):
+        counts["verifies"] += 1
+        return await real_verify(*a, **k)
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
+    monkeypatch.setattr(srv.galaxy_recovery, "_verify_post_reboot_recovery", counting_verify)
+    return counts
+
+
+@pytest.mark.asyncio
+async def test_post_reboot_verify_runs_on_the_boots_first_broker_start(monkeypatch, tmp_path, clear_job_state):
+    """The boot's first broker start is the reboot's only verification point: fsm.json was last
+    written by the boot before (or not at all), so the verify runs and climbs a still-dead mesh to
+    the power cycle. The pair to the same-boot restart test below."""
+    counts = _arm_degraded_startup_after_reboot(monkeypatch, tmp_path)
+    fsm_path = tmp_path / "fsmdir" / "fsm.json"
+    fsm_path.parent.mkdir()
+    ServerFsm(fsm_path, current_boot_id="prev-boot").on_fault("off_bus", dirty=False)  # the boot that rebooted
+    first = ServerFsm(fsm_path, current_boot_id="boot-now")
+    assert first.restarted_this_boot is False
+    monkeypatch.setattr(srv, "fsm", first)
+    await srv._record_startup_health()
+    assert counts == {"cycles": 1, "verifies": 1}
+    assert first.state is not ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_restart_later_in_the_boot_does_not_rerun_the_post_reboot_verify(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The ledger's warm reboot stays adjacent to the boot for its whole life, so without a gate a
+    broker restarted days later in the same boot (an autoupdate, a crash) that finds a fresh
+    degradation would read it as the reboot's failure and climb straight to the chassis power
+    cycle. Only the first start verifies the reboot; the restart marks the device dirty and leaves
+    it held for the forced startup gate. Fails on base, where every start of the boot re-verifies."""
+    counts = _arm_degraded_startup_after_reboot(monkeypatch, tmp_path)
+    fsm_path = tmp_path / "fsmdir" / "fsm.json"
+    fsm_path.parent.mkdir()
+    ServerFsm(fsm_path, current_boot_id="boot-now").boot_merge(open_episode=None, attributed_boot=None)
+    restarted = ServerFsm(fsm_path, current_boot_id="boot-now")  # an earlier broker of this boot wrote it
+    assert restarted.restarted_this_boot is True
+    monkeypatch.setattr(srv, "fsm", restarted)
+    await srv._record_startup_health()
+    assert counts == {"cycles": 0, "verifies": 0}, "a same-boot restart must not re-verify the boot's reboot"
+    assert restarted.state is not ServerState.HEALTHY, "the degraded device stays HELD for the startup gate"
+
+
 # --- a carried episode is still an ordinary episode to the gate that clears it ----------------
 #
 # boot_merge (and the cross-boot load underneath it) never itself reopens the door — that is by
