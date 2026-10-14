@@ -10818,9 +10818,10 @@ async def test_ubb_tray_reset_walk_rescans_after_each_tray_before_the_verify(
     monkeypatch, clear_job_state, galaxy_trays
 ):
     """A tray re-power does not undo the dead-chip sampler's `remove`, so each step rescans the PCI bus
-    (and settles) before its verify, and the pollers stay stopped across the walk and come back at the
-    end. A failed rescan still verifies. A walk that recovers takes its chips out of isolated_chips,
-    so the next gate does not bridge-reset them. Fails on base, which never rescanned."""
+    (and settles) before its verify. The pollers are stopped before the walk and again before each
+    pulse; a walk that never proves the mesh leaves them stopped (a pulse can drop the whole box), one
+    that recovers restarts them. A failed rescan still verifies. A walk that recovers takes its chips out
+    of isolated_chips, so the next gate does not bridge-reset them. Fails on base, which never rescanned."""
     order = []
     fired, _events = _arm_ubb_walk(monkeypatch, [_beats_without(set())])
     monkeypatch.setattr(galaxy, "UBB_WALK_RESCAN_SETTLE_SEC", 0)
@@ -10839,7 +10840,7 @@ async def test_ubb_tray_reset_walk_rescans_after_each_tray_before_the_verify(
     assert order == [
         step for bitmap in (0x01, 0x04) for step in (("fire", bitmap), ("rescan",), ("verify",))
     ], "fire, rescan, verify for every tray"
-    assert pollers == [False, True], "pollers stopped once across the walk, restarted at the end"
+    assert pollers == [False, False, False], "stopped before the walk and each pulse, left stopped: mesh unproven"
 
     # A failed rescan is logged and the verify still runs; a recovered walk un-isolates its chips.
     _arm_ubb_walk(monkeypatch, [_beats_without(set())], verify_healthy=[True])
@@ -10854,6 +10855,7 @@ async def test_ubb_tray_reset_walk_rescans_after_each_tray_before_the_verify(
     assert out is True
     assert any("PCI rescan after the tray 3 re-power failed" in m for m in lines)
     assert srv.isolated_chips == {"3"}, "the walk's chips are back on the bus, so no longer isolated"
+    assert pollers[-1] is True, "a walk that recovers restarts the pollers"
 
 
 @pytest.mark.asyncio
