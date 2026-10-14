@@ -631,7 +631,8 @@ class Recovery(ABC):
             # untouched and the next gate fires another back-to-back galaxy reset — the repeat MMIO at
             # a dead endpoint the cooldown exists to prevent.
             self.mechanism.last_reset_monotonic = time.monotonic()
-            healthy = (await self._verify_device(expected, log))[0]
+            healthy, evidence = await self._verify_device(expected, log)
+            FABRIC_DEBT.note_evidence(evidence)
             self.mechanism.last_reset_failed = not healthy
             return healthy
 
