@@ -436,6 +436,14 @@ class ServerFsm:
         return self._record.state
 
     @property
+    def restarted_this_boot(self) -> bool:
+        """Whether an earlier broker of this same boot already wrote the record: this start is a
+        restart (an autoupdate, a crash), not what the boot came up to. Anything that belongs to
+        the boot's arrival — the ledger escalation that caused it — is judged on the first start
+        only; see boot_merge and the startup probe's post-reboot verify."""
+        return self._loaded_same_boot
+
+    @property
     def healthy(self) -> bool:
         """Whether the device is fit for a tenant right now — the one predicate consumers with
         no business importing :class:`ServerState` (the sampler) branch on."""
@@ -636,7 +644,7 @@ class ServerFsm:
             metrics.state_entered(open_episode.state.value)
         else:
             self._open_episode(ServerState.RECOVERING, "startup_unverified")
-        if attributed_boot and not self._loaded_same_boot:
+        if attributed_boot and not self.restarted_this_boot:
             action = attributed_boot.get("action", "?")
             at = attributed_boot.get("at", "?")
             self._record.detail = (f"{self._record.detail} " if self._record.detail else "") + (
