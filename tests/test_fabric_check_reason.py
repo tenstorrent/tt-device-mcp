@@ -83,7 +83,7 @@ def test_override_path_reason_names_the_cause():
     assert health_monitor_mod._override_reason(text) == "what():  Hugepages are not allocated for channel: 0"
 
 
-def _run_wrapper(tmp_path, validator_output: str, rc: int):
+def _run_wrapper(tmp_path, validator_output: str, rc: int, **extra_env):
     root = tmp_path / "root"
     root.mkdir()
     out = tmp_path / "validator-output.txt"
@@ -97,8 +97,86 @@ def _run_wrapper(tmp_path, validator_output: str, rc: int):
         "TTDEV_FABRIC_RUNTIME_ROOT": str(root),
         "TTDEV_FABRIC_CACHE": str(tmp_path / "cache"),
         "TTDEV_DISPATCH_BIN": str(tmp_path / "absent"),
+        "TTDEV_PCI_DEVICES_DIR": str(tmp_path / "no-pci"),
+        **extra_env,
     }
     return subprocess.run(["bash", str(_SCRIPT)], env=env, capture_output=True, text=True, timeout=30)
+
+
+def _pci_with_pool(tmp_path, iommu_types, pages):
+    """A stand-in PCI bus of Tenstorrent functions (an IOMMU group type each, None for no group), one
+    foreign function, and a 1G pool holding ``pages``; the env that points the wrapper at them."""
+    pci = tmp_path / "pci"
+    for i, kind in enumerate(iommu_types):
+        fn = pci / f"0000:{i + 1:02x}:00.0"
+        fn.mkdir(parents=True)
+        (fn / "vendor").write_text("0x1e52\n")
+        if kind is not None:
+            (fn / "iommu_group").mkdir()
+            (fn / "iommu_group" / "type").write_text(kind + "\n")
+    other = pci / "0000:ff:00.0"
+    other.mkdir(parents=True)
+    (other / "vendor").write_text("0x8086\n")
+    nr = tmp_path / "nr_hugepages"
+    nr.write_text(f"{pages}\n")
+    return {"TTDEV_PCI_DEVICES_DIR": str(pci), "TTDEV_HUGEPAGES_1G_NR": str(nr)}
+
+
+def test_wrapper_77s_on_a_short_hugepage_pool_without_running_the_validator(tmp_path):
+    """Boot fills the 1G pool after the hugetlbfs mount is up with 0 pages; a pass run first dies on
+    'Failed to pin pages for hugepage'. The wrapper names the cause and does not open the device."""
+    env = _pci_with_pool(tmp_path, ["identity", None, "DMA-FQ"], 1)
+    r = _run_wrapper(tmp_path, "ran\n", 0, **env)
+    assert r.returncode == FABRIC_CHECK_CANNOT_CHECK_RC, r.stderr
+    last = [ln for ln in r.stderr.splitlines() if ln.strip()][-1]
+    assert "hugepage pool not ready: 1/2 1G pages allocated" in last
+    assert "ran" not in r.stderr, "the validator must not run on a short pool"
+    log = (tmp_path / "cache" / "cluster_validation_logs" / "last-run.log").read_text()
+    assert "hugepage pool not ready: 1/2" in log
+    assert "hugepage pool not ready" in health_monitor_mod._override_reason(r.stderr)
+
+
+@pytest.mark.parametrize(
+    "iommu_types,pages",
+    [(["identity", None], 2), (["DMA-FQ", "DMA"], 0), (["identity"], "")],
+    ids=["pool-full", "translating-iommu", "unreadable-pool"],
+)
+def test_wrapper_runs_the_validator_when_no_hugepage_is_owed(tmp_path, iommu_types, pages):
+    r = _run_wrapper(tmp_path, "ran\n", 0, **_pci_with_pool(tmp_path, iommu_types, pages))
+    assert r.returncode == 0, r.stderr
+    assert "ran" in r.stderr
+
+
+def test_wrapper_names_a_failed_hugepage_pin_as_the_pool_not_ready(tmp_path):
+    out = (
+        "terminate called after throwing an instance of 'std::runtime_error'\n"
+        "  what():  Failed to pin pages for hugepage\n"
+        "Aborted (core dumped)\n"
+    )
+    r = _run_wrapper(tmp_path, out, 134)
+    assert r.returncode == FABRIC_CHECK_CANNOT_CHECK_RC, r.stderr
+    last = [ln for ln in r.stderr.splitlines() if ln.strip()][-1]
+    assert "hugepage pool not ready: what():  Failed to pin pages for hugepage" in last
+
+
+def test_wrapper_saves_the_whole_validator_output_in_last_run_log(tmp_path):
+    """A 77's cause can sit anywhere in the output: last-run.log keeps all of it, not a tail."""
+    lines = ["  what():  the first cause"] + [f"line {i} " + "x" * 500 for i in range(400)]
+    r = _run_wrapper(tmp_path, "\n".join(lines) + "\n", 134)
+    assert r.returncode == FABRIC_CHECK_CANNOT_CHECK_RC, r.stderr
+    log = (tmp_path / "cache" / "cluster_validation_logs" / "last-run.log").read_text()
+    for line in lines:
+        assert line in log
+    assert "validator did not complete a measurement (rc=134): what():  the first cause" in log
+
+
+def test_wrapper_last_run_log_keeps_both_ends_past_its_cap(tmp_path):
+    body = "HEAD-CAUSE\n" + "y" * 20000 + "\nTAIL-VERDICT\n"
+    r = _run_wrapper(tmp_path, body, 134, TTDEV_FABRIC_LAST_RUN_MAX_BYTES="4000")
+    assert r.returncode == FABRIC_CHECK_CANNOT_CHECK_RC, r.stderr
+    log = (tmp_path / "cache" / "cluster_validation_logs" / "last-run.log").read_text()
+    assert "HEAD-CAUSE" in log and "TAIL-VERDICT" in log and "bytes cut" in log
+    assert len(log) < 6000
 
 
 @pytest.mark.parametrize(
@@ -185,6 +263,7 @@ def _run_wrapper_topology(tmp_path, rerun_output: str, rerun_rc: int):
         "TTDEV_FABRIC_CACHE": str(tmp_path / "cache"),
         "TTDEV_FABRIC_DESCRIPTOR": str(desc),
         "TTDEV_DISPATCH_BIN": str(tmp_path / "absent"),
+        "TTDEV_PCI_DEVICES_DIR": str(tmp_path / "no-pci"),
     }
     r = subprocess.run(["bash", str(_SCRIPT)], env=env, capture_output=True, text=True, timeout=30)
     return r, calls.read_text().splitlines(), desc
