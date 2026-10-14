@@ -12,8 +12,9 @@ then escalated that hold to a glx_reset 120 s later — a reset that cannot prod
 """
 
 import asyncio
+import dataclasses
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -348,7 +349,7 @@ async def test_a_dirty_carried_episode_still_runs_the_startup_gate(monkeypatch, 
 # --- a 77-only hold: re-checked, never reset ---------------------------------------------------
 
 
-def _hold_77(monkeypatch, tmp_path, *, last_fabric_ok=None):
+def _hold_77(monkeypatch, tmp_path, *, last_fabric_ok=None, due=True):
     for i in range(32):
         (tmp_path / str(i)).write_text("")
     monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
@@ -362,6 +363,11 @@ def _hold_77(monkeypatch, tmp_path, *, last_fabric_ok=None):
     monkeypatch.setattr(srv, "isolated_chips", set())
     monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
     monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+    monkeypatch.setattr(srv, "_fabric_77_recheck_since", None)
+    monkeypatch.setattr(srv, "_fabric_77_rechecks", 0)
+    monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", 0.0)
+    if due:  # the I48 backoff has its own tests below; the rest exercise a re-check that is due
+        monkeypatch.setattr(srv, "_fabric_77_recheck_due", lambda: True)
     fsm_dirty(srv, "gate/startup: fabric unverified (could not run)", why="fabric_unverified")
 
 
@@ -408,6 +414,87 @@ async def test_the_77_only_relift_reruns_the_fabric_pass_and_never_resets(monkey
     assert seen == [True], "the relift re-runs the read-only fabric pass"
     assert rungs == [], "a 77 is no fault: never a reset"
     assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY, "another 77 leaves the hold standing"
+
+
+# --- I48: a 77-only hold re-checks on a backoff ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,steps",
+    [
+        (None, [120, 300, 600, 1200]),
+        ("90,240", [90, 240]),
+        ("5,5000", [60, 1200]),
+        ("2m,5m", [120, 300, 600, 1200]),
+        (" , ", [120, 300, 600, 1200]),
+    ],
+)
+def test_the_77_backoff_parses_and_clamps(monkeypatch, raw, steps):
+    """Each step clamps to 60..1200 s; a malformed or empty value reads as the default."""
+    if raw is None:
+        monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
+    else:
+        monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raw)
+    assert srv._fabric_77_backoff_sec() == steps
+
+
+def _opened_ago(monkeypatch, seconds):
+    since = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, since=since))
+
+
+@pytest.mark.asyncio
+async def test_the_77_only_relift_reruns_the_pass_only_once_its_step_is_due(monkeypatch, tmp_path, clear_job_state):
+    """I48: before the first step the relift skips the pass; once due it runs it once, and the 77 it
+    reads again moves the next re-check to the second step."""
+    _hold_77(monkeypatch, tmp_path, due=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "99")
+    seen = []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        seen.append(run_fabric)
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": "could not run (77)"}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+    async def relift():
+        monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
+        await srv._attempt_idle_relift()
+
+    _opened_ago(monkeypatch, 30)
+    await relift()
+    assert seen == [], "the first re-check waits for the first step"
+    _opened_ago(monkeypatch, 130)
+    await relift()
+    assert seen == [True], "due: the pass runs once"
+    await relift()
+    assert seen == [True], "the next re-check waits for the second step"
+    monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", srv.time.monotonic() - 301)
+    await relift()
+    assert seen == [True, True]
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+def test_a_77_recheck_advances_the_backoff_step(monkeypatch, tmp_path, clear_job_state):
+    """Each re-check that 77s again moves to the next step; the last step repeats; a new episode starts over."""
+    _hold_77(monkeypatch, tmp_path, due=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
+
+    def due_after(seconds):
+        monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", srv.time.monotonic() - seconds)
+        return srv._fabric_77_recheck_due()
+
+    srv._note_fabric_77_recheck()
+    srv._note_fabric_77_recheck()
+    assert srv._fabric_77_rechecks == 2
+    assert not due_after(590) and due_after(610), "the third re-check waits the third step"
+    for _ in range(5):
+        srv._note_fabric_77_recheck()
+    assert not due_after(1190) and due_after(1210), "the last step repeats"
+    _opened_ago(monkeypatch, 30)
+    srv._note_fabric_77_recheck()
+    assert srv._fabric_77_rechecks == 1, "a new episode starts its backoff over"
 
 
 @pytest.mark.asyncio
@@ -909,3 +996,23 @@ async def test_a_known_fabric_fault_hold_is_outside_the_77_bound(monkeypatch, tm
     await srv._attempt_idle_relift()
     assert rungs == []
     assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_fabric_ok, state", [(None, ServerState.RECOVERING), (False, ServerState.DOWN)])
+async def test_a_terminal_rung_on_a_77_only_hold_keeps_it_recovering(
+    monkeypatch, tmp_path, clear_job_state, last_fabric_ok, state
+):
+    """I48: a rung that ran and left the fabric only 77ing measured no fault, so the hold stays
+    RECOVERING for the relift to re-check, never the terminal DOWN. A measured fault still goes DOWN."""
+    rungs = _bound(monkeypatch, tmp_path, (None, "eth links below baseline"))
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", last_fabric_ok)
+
+    async def escalate(rung, *a, **k):
+        rungs.append(rung)
+        return srv.OUTCOME_TERMINAL
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    await srv._attempt_idle_relift()
+    assert rungs == ["present"]
+    assert srv.fsm.state is state

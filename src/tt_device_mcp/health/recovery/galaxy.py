@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from tt_device_mcp import metrics, privileges
+from tt_device_mcp import alert, metrics, privileges
 from tt_device_mcp.device_holders import is_tenant
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
@@ -928,6 +928,11 @@ class GalaxyRecovery(Recovery):
     per-chip bridge reset when a chip is surgically isolable), and the host reboot/power-cycle
     escalation once a reset has already run and failed to revive the mesh."""
 
+    # Whether the last sweep after an UNKNOWN reset read a fabric 77 (no verdict), and the episode whose
+    # no-host-rung hold already paged (spec 04 I29).
+    _sweep_read_77: bool = False
+    _host_rung_77_paged_since: Optional[str] = None
+
     def _tray_map_now(self) -> Optional[dict]:
         """This host's tray -> chip-ids map, or None when it cannot be known (spec 04 I16).
 
@@ -1588,6 +1593,7 @@ class GalaxyRecovery(Recovery):
             # the same no-verdict the reset already got, never a recovered fabric.
             log("the sweep's verify is still a fabric 77 — the fabric stays unverified, not recovered")
             health_event("host_rung_sweep_unverified", context=context or gate_phase, evidence=evidence)
+            self._sweep_read_77 = True
             healthy = False
         if not healthy:
             if not swept:
@@ -2170,9 +2176,13 @@ class GalaxyRecovery(Recovery):
 
         The sweep runs here, not behind the host-rung permission: the climb asks the reboot ledger
         first, and on one Galaxy host its boot-loop guard kept the sweep waiting an hour. A sweep whose verify
-        is still a 77 is not a recovery (the fallback that refused it measured more than a 77 can)."""
+        is still a 77 is not a recovery (the fallback that refused it measured more than a 77 can), and
+        not a fault either: no rung measured one, so it never climbs to a host rung (a reboot or power
+        cycle). The episode holds, pages once, and the idle relift keeps re-running the fabric pass on
+        its backoff (spec 03 I48)."""
         if self.mechanism.unverified_sweep_since != hold_since:
             self.mechanism.unverified_sweep_since = hold_since
+            self._sweep_read_77 = False
             health_event("unverified_reset_sweep", held_since=hold_since)
             log(
                 "this hold's reset already left the fabric unverified and the startup checks refused it — "
@@ -2191,7 +2201,32 @@ class GalaxyRecovery(Recovery):
                 if swept is None:
                     self.mechanism.unverified_sweep_since = None
                 return
+            if self._sweep_read_77:
+                self.mechanism.unverified_sweep_77_since = hold_since
+        if self.mechanism.unverified_sweep_77_since == hold_since:
+            self._hold_77_without_host_rung(hold_since, expected, log)
+            return
         await self._climb_to_host_recovery_after_failed_reset(expected, off_bus_before, log, swept=True)
+
+    def _hold_77_without_host_rung(self, hold_since: str, expected: int, log) -> None:
+        """Every lower rung ran on a 77-only episode (one reset, the sweep) and the fabric pass still could
+        not run: hold without a reboot or power cycle and page once per episode (spec 04 I29)."""
+        if self._host_rung_77_paged_since == hold_since:
+            log("fabric still unverified (77) after the reset and the sweep — holding; no host rung on a 77")
+            return
+        self._host_rung_77_paged_since = hold_since
+        event = {
+            "kind": "fabric_unverified_no_host_rung",
+            "held_since": hold_since,
+            "reason": self.deps.device_hold_episode_reason(),
+            "expected": expected,
+        }
+        health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
+        log(
+            "the reset and the last-chance sweep both left the fabric unverified (77) — no rung measured a "
+            "fault, so no reboot or power cycle; holding, paging once, the idle relift keeps re-checking"
+        )
+        alert.send_alert(event, _logger)
 
     async def _climb_to_host_recovery_after_failed_reset(
         self, expected: int, off_bus_before: Optional[int], log, *, swept: bool = False
