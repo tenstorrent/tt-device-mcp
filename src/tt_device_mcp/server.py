@@ -3494,7 +3494,11 @@ def _fabric_77_bound_reached() -> bool:
     global _fabric_77_streak_since, _fabric_77_streak
     if _fabric_77_streak_since != fsm.record.since:
         _fabric_77_streak_since, _fabric_77_streak = fsm.record.since, 0
-    _fabric_77_streak += 1
+    # A pool still filling is a prerequisite on its way, not a check that cannot run: its 30 s
+    # re-checks would spend the retries in 90 s and release a box no job can open yet. The age bound
+    # below still ends it.
+    if not _last_77_was_hugepages():
+        _fabric_77_streak += 1
     if _fabric_77_streak >= _env_int("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", 3, 1):
         return True
     try:
@@ -3512,6 +3516,18 @@ _fabric_77_recheck_since: Optional[str] = None
 _fabric_77_rechecks: int = 0
 _fabric_77_recheck_monotonic: float = 0.0
 FABRIC_77_BACKOFF_MAX_SEC = 1200
+# A 77 whose cause is the 1G hugepage pool not being filled yet (the wrapper's "hugepage pool not
+# ready", or UMD's own "Failed to pin pages for hugepage") re-checks every 30 s instead: boot fills the
+# pool seconds to a minute after the broker starts, and nothing about the device is in doubt meanwhile.
+FABRIC_77_HUGEPAGES_RECHECK_SEC = 30
+_HUGEPAGES_77_RE = re.compile(r"hugepage pool not ready|Failed to pin pages for hugepage")
+
+
+def _last_77_was_hugepages() -> bool:
+    """Whether the last fabric pass got no verdict because the 1G hugepage pool was not ready."""
+    return bool(health_monitor.last_fabric_skipped) and bool(
+        _HUGEPAGES_77_RE.search(health_monitor.last_fabric_output or "")
+    )
 
 
 def _fabric_77_backoff_sec() -> list[int]:
@@ -3527,8 +3543,9 @@ def _fabric_77_backoff_sec() -> list[int]:
 
 def _fabric_77_recheck_due() -> bool:
     """Whether the open 77-only hold is due its next fabric re-check (I48): the first step after the
-    hold opened, then each further step after the last re-check that 77'd again."""
-    steps = _fabric_77_backoff_sec()
+    hold opened, then each further step after the last re-check that 77'd again. A hugepage 77 re-checks
+    every FABRIC_77_HUGEPAGES_RECHECK_SEC."""
+    steps = [FABRIC_77_HUGEPAGES_RECHECK_SEC] if _last_77_was_hugepages() else _fabric_77_backoff_sec()
     if _fabric_77_recheck_since != fsm.record.since or not _fabric_77_rechecks:
         try:
             opened = datetime.strptime(str(fsm.record.since), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -3648,7 +3665,10 @@ async def _attempt_idle_relift() -> None:
     if not ((selfheal or fabric or generic) and not device_op_active):
         return
     global last_relift_monotonic, _startup_fabric_owed_since
-    if last_relift_monotonic and (time.monotonic() - last_relift_monotonic) < SELFHEAL_RELIFT_INTERVAL_SEC:
+    interval = SELFHEAL_RELIFT_INTERVAL_SEC
+    if fabric and _fabric_77_only_hold() and _last_77_was_hugepages():
+        interval = min(interval, FABRIC_77_HUGEPAGES_RECHECK_SEC)
+    if last_relift_monotonic and (time.monotonic() - last_relift_monotonic) < interval:
         return
     if fabric and _fabric_77_only_hold() and not _startup_fabric_owed() and not _fabric_77_recheck_due():
         return  # I48: a 77-only hold re-runs the pass on its backoff, not every relift tick

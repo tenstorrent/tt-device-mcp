@@ -345,6 +345,8 @@ Behavior).
 | `TTDEV_FABRIC_CACHE` | `/var/cache/tt-device-broker/fabric-tt-metal-cache` | `TT_METAL_CACHE` for the fabric check (src) |
 | `TTDEV_FABRIC_OUTPUT` | `<cache>/cluster_validation_logs` | Validator output dir (src) |
 | `TTDEV_FABRIC_ITERS` | 1 | Traffic iterations (src) |
+| `TTDEV_FABRIC_LAST_RUN_MAX_BYTES` | 4194304 | Fabric-check wrapper: size past which `last-run.log` keeps only the head and tail of a run's output |
+| `TTDEV_HUGEPAGES_1G_NR`, `TTDEV_PCI_DEVICES_DIR` | `/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages`, `/sys/bus/pci/devices` | Fabric-check wrapper: where its hugepage-pool check reads (tests point them at stand-ins) |
 | `TTDEV_VALIDATOR_ROOT` | `/opt/tt-device-broker/validator` | Pinned-validator install root (src + installer) |
 | `TTDEV_VALIDATOR_REPO`, `TTDEV_VALIDATOR_SHA`, `TTDEV_VALIDATOR_TOOLCHAIN`, `TTDEV_VALIDATOR_TARGET`, `TTDEV_VALIDATOR_BIN_REL`, `TTDEV_VALIDATOR_DESCRIPTOR_REL` | `deploy/fabric-validator.pin` | Validator build pin (repo, SHA, toolchain, target, artifact paths) |
 | `TTDEV_DISPATCH_TARGET`, `TTDEV_DISPATCH_BIN_REL`, `TTDEV_PREJOB_DISPATCH_TARGET`, `TTDEV_PREJOB_DISPATCH_BIN_REL` | pin file | Dispatch-probe build targets/artifacts |

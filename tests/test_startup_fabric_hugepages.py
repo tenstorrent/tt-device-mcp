@@ -366,6 +366,8 @@ def _hold_77(monkeypatch, tmp_path, *, last_fabric_ok=None, due=True):
     monkeypatch.setattr(srv, "_fabric_77_recheck_since", None)
     monkeypatch.setattr(srv, "_fabric_77_rechecks", 0)
     monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", 0.0)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", False)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_output", "")
     if due:  # the I48 backoff has its own tests below; the rest exercise a re-check that is due
         monkeypatch.setattr(srv, "_fabric_77_recheck_due", lambda: True)
     fsm_dirty(srv, "gate/startup: fabric unverified (could not run)", why="fabric_unverified")
@@ -495,6 +497,69 @@ def test_a_77_recheck_advances_the_backoff_step(monkeypatch, tmp_path, clear_job
     _opened_ago(monkeypatch, 30)
     srv._note_fabric_77_recheck()
     assert srv._fabric_77_rechecks == 1, "a new episode starts its backoff over"
+
+
+_HUGEPAGE_77S = [
+    "fabric-check: hugepage pool not ready: 0/32 1G pages allocated -> CANNOT CHECK (exit 77)",
+    "  what():  Failed to pin pages for hugepage\nfabric-check: validator did not complete a measurement",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", _HUGEPAGE_77S, ids=["wrapper-precheck", "umd-pin-failure"])
+async def test_a_hugepage_77_rechecks_every_30s_and_spends_no_retry(monkeypatch, tmp_path, clear_job_state, output):
+    """Boot fills the 1G pool after the broker's startup pass ran: a 77 for that re-checks after 30 s,
+    not on the 120 s relift interval or the I48 backoff, and its re-checks do not spend the I40 retries
+    that would release a box no job can open yet."""
+    _hold_77(monkeypatch, tmp_path, due=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
+    monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
+    monkeypatch.setattr(srv, "_fabric_77_streak", 0)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_output", output)
+    fallbacks = []
+
+    async def fallback(*a, **k):
+        fallbacks.append(True)
+        return True
+
+    monkeypatch.setattr(srv, "_fabric_77_fallback", fallback)
+    seen = []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        seen.append(run_fabric)
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": output}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+    def ago(seconds):
+        return srv.time.monotonic() - seconds
+
+    _opened_ago(monkeypatch, 20)
+    await srv._attempt_idle_relift()
+    assert seen == [], "not yet 30 s since the hold opened"
+    _opened_ago(monkeypatch, 35)
+    await srv._attempt_idle_relift()
+    assert seen == [True], "30 s after the hold opened the pass runs, not 120 s"
+    for n in range(2, 6):
+        monkeypatch.setattr(srv, "last_relift_monotonic", ago(20))
+        monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", ago(20))
+        await srv._attempt_idle_relift()
+        assert len(seen) == n - 1, "under 30 s since the last re-check: no pass"
+        monkeypatch.setattr(srv, "last_relift_monotonic", ago(31))
+        monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", ago(31))
+        await srv._attempt_idle_relift()
+        assert len(seen) == n, "each later re-check comes 30 s after the last, below the relift interval"
+    assert srv._fabric_77_streak == 0 and fallbacks == [], "a pool still filling spends no I40 retry"
+    assert srv.fsm.state is ServerState.RECOVERING
+
+    # Any other 77 keeps the I48 backoff and the relift interval.
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_output", "fabric-check: validator did not complete")
+    monkeypatch.setattr(srv, "last_relift_monotonic", ago(31))
+    monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", ago(31))
+    await srv._attempt_idle_relift()
+    assert len(seen) == 5
 
 
 @pytest.mark.asyncio

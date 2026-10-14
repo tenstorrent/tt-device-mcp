@@ -216,6 +216,7 @@ def _run_wrapper(tmp_path, first: str, rerun_output: str, rerun_rc: int):
         "TTDEV_FABRIC_CACHE": str(tmp_path / "cache"),
         "TTDEV_FABRIC_DESCRIPTOR": str(desc),
         "TTDEV_DISPATCH_BIN": str(tmp_path / "absent"),
+        "TTDEV_PCI_DEVICES_DIR": str(tmp_path / "no-pci"),
     }
     r = subprocess.run(["bash", str(_SCRIPT)], env=env, capture_output=True, text=True, timeout=30)
     return r, desc
