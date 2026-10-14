@@ -3656,9 +3656,11 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
         + (
             f"a reset ({owed}) has had no passing fabric pass since"
             if eok is True and owed
-            else "a fallback release already ran inside the window"
-            if eok is True
-            else f"eth heartbeat {'frozen' if eok is False else 'gave no verdict'}: {edetail}"
+            else (
+                "a fallback release already ran inside the window"
+                if eok is True
+                else f"eth heartbeat {'frozen' if eok is False else 'gave no verdict'}: {edetail}"
+            )
         )
         + ") — climbing the recovery ladder"
     )

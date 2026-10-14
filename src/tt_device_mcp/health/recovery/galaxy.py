@@ -21,10 +21,10 @@ from typing import Callable, Optional
 from tt_device_mcp import alert, metrics, privileges
 from tt_device_mcp.device_holders import is_tenant
 from tt_device_mcp.health.evidence import health_event
-from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import dead_chips
 from tt_device_mcp.health.monitors.pci import chip_node_present, pci_bus_number
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
     BLOCKED,
     DEFER,

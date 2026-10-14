@@ -33,8 +33,8 @@ from tt_device_mcp.constants import (
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
-from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
 # How much of a fabric run's output the action-log row keeps for a run that got no healthy verdict:
 # all of it, since the validator's first error line (the cause) sits near the head and a wrapper's
