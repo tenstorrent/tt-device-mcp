@@ -1972,6 +1972,7 @@ def _reset_for_testing():
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant
+    global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic
     job_queue = None
     lock = None
     _action_row = None
@@ -1981,6 +1982,9 @@ def _reset_for_testing():
     device_hold_episode_reason = ""
     _hold_episode_restorable = True
     _hold_episode_tenant = False
+    _fabric_77_streak_since = None
+    _fabric_77_streak = 0
+    _fabric_77_fallback_release_monotonic = 0.0
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
