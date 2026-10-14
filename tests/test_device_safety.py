@@ -4644,7 +4644,7 @@ def _bounded_hold_state(monkeypatch, bound: str):
 
 @pytest.mark.asyncio
 async def test_held_job_fails_past_the_hold_bound_and_escalates(monkeypatch, tmp_path, clear_job_state):
-    """Spec 01 I17: the CLEAN-GATE hold is bounded. A job held past TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC
+    """Spec 01 I19: the CLEAN-GATE hold is bounded. A job held past TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC
     FAILS at the door with a reason naming the bound — never dispatched onto the degraded device —
     and the hold behind it escalates through the forced recovery ladder, not just dropped. A second
     job arriving into the same episode gets no fresh bound and fires no second escalation."""

@@ -6142,7 +6142,7 @@ def _tenant_hold_max_sec() -> float:
     """TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC: how long a degraded device may hold a tenant job at the
     door, counted from the start of the device's hold episode (or the job's own hold, if later
     known). Past it the job is refused FAILED with the reason, and the hold escalates through the
-    forced recovery ladder (spec 01 I17). Default is the hold deadline (2x the escalation ceiling,
+    forced recovery ladder (spec 01 I19). Default is the hold deadline (2x the escalation ceiling,
     1200 s at the 600 s default): by then the forced ladder has fired (off-bus at 120 s, the
     ceiling at 600 s) and had a full further window to climb, so a device still unfit is not
     coming back on the submitter's clock, and the broker itself declares the hold stuck at the
@@ -6214,7 +6214,7 @@ async def _hold_job_until_device_fit(job: "Job", job_log_file: Optional[Path], r
     a healthy enum+ARC mesh) and TENANT_HOLD_POLL_SEC governs the cadence, so a device that
     will not come clean is retried, not stormed. The bound never dispatches: past it the job
     FAILS at the door (dispatching a tenant command onto a wedge is the outcome G2 forbids) and
-    the hold escalates through the forced recovery ladder (spec 01 I17). Never raises."""
+    the hold escalates through the forced recovery ladder (spec 01 I19). Never raises."""
     bound = _tenant_hold_max_sec()
     clock_start = _hold_clock_start(datetime.now())
     if logger:
@@ -7650,7 +7650,7 @@ async def _job_runner_loop():
         # Env-gated (default ON, TT_DEVICE_MCP_TENANT_HOLD): HOLD a degraded device rather than
         # failing the arriving job. A degraded device holds the queue and this job dispatches the
         # instant the device is fit, or fails at the door past TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC
-        # with the hold escalated (spec 01 I17) — never dispatched onto the wedge.
+        # with the hold escalated (spec 01 I19) — never dispatched onto the wedge.
         if blocked_reason and _tenant_hold_enabled():
             try:
                 blocked_reason = await _hold_job_until_device_fit(job, job_log_file, blocked_reason)

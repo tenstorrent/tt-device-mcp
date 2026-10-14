@@ -111,7 +111,7 @@ the queue and a running job outlive the broker process.
 - **I15** — Job admission is blocking, not advisory: no job is dispatched onto a device the
   admission gate reports degraded, nor while the gate errors instead of reaching a verdict
   (see Queueing and dispatch). By default the job is HELD at the door and re-gated on
-  `TENANT_HOLD_POLL_SEC` (60 s) until fit, at most `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` (I17;
+  `TENANT_HOLD_POLL_SEC` (60 s) until fit, at most `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` (I19;
   a kill releases the hold sooner);
   with `TT_DEVICE_MCP_TENANT_HOLD=0` it is refused at the door as FAILED with the reason in
   its log. Gate internals are spec 03. Before the gate, a job waits while a process
@@ -140,21 +140,6 @@ the queue and a running job outlive the broker process.
   reads as no leftover. Motivating incident: a reaped job's process stuck in state D with
   SIGKILL pending kept 192 device fds open for about an hour until a host reboot; in that time
   a reset ran over it and a new job was dispatched beside it.
-- **I17** — The I15 hold is bounded; no job is held open-ended. A job is held at most
-  `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` (default the hold deadline, 2× the escalation ceiling:
-  1200 s at the 600 s default), counted from the device's hold episode start, or from the job's
-  own hold if no older episode is open, so a queue of jobs cannot stretch one outage to a
-  bound per job. Past it the job is refused FAILED at the door, never dispatched onto the
-  degraded device, and its error and log name the bound, what was escalated and the degraded
-  reason. The hold is not just dropped: a `tenant_hold_bound_exceeded` event is written and,
-  if this episode has not yet had a forced run (ceiling window, off-bus one-shot or an earlier
-  bound), the forced recovery ladder of spec 03 I23 is started, once per episode. A run
-  already spent is not repeated on the job's clock, since that would climb the ladder (warm
-  reboot, power cycle) on a short timer. The deadline watchdog keeps escalating per window. No
-  value turns the bound off: garbage, non-finite or non-positive reads as the default. With
-  `TT_DEVICE_MCP_FORCE_ESCALATE=0` the job still fails at the bound and its error says nothing
-  was escalated.
-
 - **I17** — A job's output outlives the broker that spawned it. Its stdout and stderr go to
   spool files in `job_spool_dir()` (outside the unit's RuntimeDirectory, which systemd removes
   on every restart), never to pipes: a pipe's read end dies with the broker, and a job that kept
@@ -174,6 +159,21 @@ the queue and a running job outlive the broker process.
   dispatch into the restart it is about to make (spec 08 I18). A hold whose pid is gone, that
   cannot be read, or that is older than the bound is ignored (and removed), so a dead or stuck
   updater never wedges the queue. A job held there stays QUEUED with its persisted spec (I6).
+- **I19** — The I15 hold is bounded; no job is held open-ended. A job is held at most
+  `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` (default the hold deadline, 2× the escalation ceiling:
+  1200 s at the 600 s default), counted from the device's hold episode start, or from the job's
+  own hold if no older episode is open, so a queue of jobs cannot stretch one outage to a
+  bound per job. Past it the job is refused FAILED at the door, never dispatched onto the
+  degraded device, and its error and log name the bound, what was escalated and the degraded
+  reason. The hold is not just dropped: a `tenant_hold_bound_exceeded` event is written and,
+  if this episode has not yet had a forced run (ceiling window, off-bus one-shot or an earlier
+  bound), the forced recovery ladder of spec 03 I23 is started, once per episode. A run
+  already spent is not repeated on the job's clock, since that would climb the ladder (warm
+  reboot, power cycle) on a short timer. The deadline watchdog keeps escalating per window. No
+  value turns the bound off: garbage, non-finite or non-positive reads as the default. With
+  `TT_DEVICE_MCP_FORCE_ESCALATE=0` the job still fails at the bound and its error says nothing
+  was escalated.
+
 ## Interfaces
 
 Other subsystems and tenants may rely on:
@@ -288,7 +288,7 @@ flowchart LR
   dispatch the job either. The job stays queued at the door and the predicate is retried after
   a short backoff (`ADMISSION_GATE_RETRY_SEC`: 1 s, then 2 s). After
   `ADMISSION_GATE_MAX_ERRORS` (3) errors in a row the job takes I15's degraded path (held by
-  default and bounded by I17, its hold polls retried the same way; refused with
+  default and bounded by I19, its hold polls retried the same way; refused with
   `TT_DEVICE_MCP_TENANT_HOLD=0`), and
   a device with no episode open gets a `gate_error` hold (an open episode keeps its own `why`).
   Spec 03's generic escalation lifts that hold, so a gate bug costs a held queue that recovery
@@ -444,7 +444,7 @@ flowchart LR
 | I14 | `tests/test_server.py::TestCleanDeviceGate::test_wedge_risk_truth_table`, `tests/test_device_safety.py::test_a_hung_job_is_treated_as_a_wedge_risk`, `tests/test_server.py::test_scan_output_detects_eth_core_fault`, `tests/test_server.py::test_scan_output_finds_signature_in_tail_of_large_log`, `tests/test_readopt.py::test_a_readopted_job_that_wedged_the_mesh_flags_the_device` |
 | I15 | `tests/test_device_safety.py::test_hold_mode_holds_a_degraded_device_then_dispatches_when_fit`, `tests/test_device_safety.py::test_hold_mode_self_heals_a_dirty_device_by_re_running_the_gate`, `tests/test_device_safety.py::test_exhausting_the_verify_budget_does_not_dispatch`, `tests/test_device_safety.py::test_tenant_gate_writes_one_held_and_one_released_per_episode`, `tests/test_device_safety.py::test_a_tenant_holder_blocks_dispatch`, `tests/test_device_safety.py::test_a_tenant_holder_holds_the_job_until_it_exits`, `tests/test_device_safety.py::test_broker_owned_holders_do_not_block_dispatch`, `tests/test_device_safety.py::test_an_incomplete_holder_scan_does_not_block_dispatch` |
 | I16 | `tests/test_reaped_leftover.py::test_the_leftover_is_named_and_the_event_fires_once_per_episode`, `tests/test_reaped_leftover.py::test_the_fence_lifts_and_the_release_event_fires_once_the_holder_is_gone`, `tests/test_reaped_leftover.py::test_dispatch_is_refused_even_when_the_leftover_descends_from_the_broker`, `tests/test_reaped_leftover.py::test_a_running_jobs_own_scope_is_not_a_leftover`, `tests/test_reaped_leftover.py::test_an_ordinary_holder_behaves_as_before`, `tests/test_reaped_leftover.py::test_a_swept_survivor_outside_a_scope_is_a_leftover_only_with_the_same_starttime`, `tests/test_reaped_leftover.py::test_a_survivor_record_is_dropped_once_a_complete_scan_no_longer_sees_it`, `tests/test_reaped_leftover.py::test_a_scan_error_never_fences_a_free_device`, `tests/test_reaped_leftover.py::test_a_leftover_without_pending_sigkill_is_named_but_not_called_unkillable`, `tests/test_reaped_leftover.py::test_the_health_gate_runs_no_probe_and_keeps_the_device_dirty` |
-| I17 | `tests/test_device_safety.py::test_held_job_fails_past_the_hold_bound_and_escalates`, `tests/test_device_safety.py::test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation`, `tests/test_device_safety.py::test_tenant_hold_max_sec_has_no_unbounded_value` |
+| I19 | `tests/test_device_safety.py::test_held_job_fails_past_the_hold_bound_and_escalates`, `tests/test_device_safety.py::test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation`, `tests/test_device_safety.py::test_tenant_hold_max_sec_has_no_unbounded_value` |
 | B-Submission (burst cap) | `tests/test_device_safety.py::test_an_armed_burst_cap_refuses_one_owners_flood_but_not_another`, `tests/test_device_safety.py::test_the_default_off_burst_cap_admits_every_submit`, `tests/test_device_safety.py::test_job_burst_decision_prunes_the_window_and_gates_on_the_cap[2-60.0-recent2-110.0-False-50.0-expect_kept2]` |
 | B-Submission (owner derived from the peer uid and the surface) | `tests/test_device_safety.py::test_the_owner_comes_from_the_peer_uid_and_the_surface` |
 | B-Submission (blocking run) | `tests/test_server.py::test_a_blocking_job_run_reports_progress_through_the_mcp_layer` |
