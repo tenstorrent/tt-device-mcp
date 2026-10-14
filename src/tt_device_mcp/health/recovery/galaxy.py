@@ -1388,7 +1388,7 @@ class GalaxyRecovery(Recovery):
         * the broker's own queue — a job in RUNNING state. Authoritative about work the broker
           itself dispatched, and it does not care whether that job currently holds an fd.
 
-        Measured failure this exists to stop (g15blx02, 2026-09-17 10:07:09Z): the stuck-hold
+        Measured failure this exists to stop (box B, 2026-09-17 10:07:09Z): the stuck-hold
         escalation read an empty holder scan 106 s into a running job, fired a mesh reset, and the
         job died of SIGPIPE at 10:09:18Z the moment the reset released the device. The broker knew
         the job was RUNNING the whole time; nothing asked it.
@@ -2290,7 +2290,7 @@ class GalaxyRecovery(Recovery):
             # A PRESENT mesh (every chip on the bus, ARC-healthy) whose galaxy reset STILL did not verify
             # is an eth/fabric wedge the reset could not clear — and self-heal will not either, since it
             # already survived the deepest reset. The old code held it here (below the mass floor), which
-            # is an INDEFINITE hold: measured on blx04, hours of ceiling -> galaxy-reset -> hold with the
+            # is an INDEFINITE hold: measured on box D, hours of ceiling -> galaxy-reset -> hold with the
             # eth core wedged the whole time, the ledger never firing a rung above the reset. "Survived a
             # galaxy reset" is the proof this is a reboot/power-cycle-class wedge, not a self-healing one —
             # so climb, do not sit. (A transient post-reset training window reports 77/skip, which reads as

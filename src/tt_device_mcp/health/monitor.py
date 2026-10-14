@@ -218,7 +218,7 @@ class HealthMonitor:
         self._topology_alerted: set[str] = set()
         # Whether the last fabric pass that ran reached no verdict (a 77). A job that then dies on the
         # fabric's routing ran on a mesh no pass cleared; consecutive ones are a known fabric fault
-        # that no reset ends (see note_job_fabric_route_fault, spec 03 I43).
+        # that no reset ends (see note_job_fabric_route_fault, spec 03 I45).
         self.last_fabric_skipped: bool = False
         self.fabric_known_fault: str = ""
         self._fabric_known_fault_at: float = 0.0
@@ -910,7 +910,7 @@ class HealthMonitor:
         return self.topology_hw_fault
 
     def note_job_fabric_route_fault(self, failed: bool, log_tail: Optional[str]) -> Optional[str]:
-        """Called once per finished job (spec 03 I43). A job that dies on the fabric's routing right
+        """Called once per finished job (spec 03 I45). A job that dies on the fabric's routing right
         after a fabric pass that could not run (a 77) ran on a mesh no pass cleared. After
         ``TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS`` (default 2) such jobs in a row, resetting is shown
         futile (each reset ends in another 77 and the next job dies the same way), so this declares a

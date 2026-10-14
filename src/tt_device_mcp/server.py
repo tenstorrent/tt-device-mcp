@@ -80,6 +80,7 @@ from tt_device_mcp.device_holders import (
     enumerate_device_holders,
     evaluate_reset_gate,
     is_tenant,
+    read_proc_cpu,
     reclaim_foreign_holders,
 )
 from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec
@@ -1009,6 +1010,7 @@ _recovery_deps = RecoveryDeps(
     note_fabric_77_reset_passes=lambda n: _note_fabric_77_reset_passes(n),
     refresh_idle_hold_ledger=lambda: _refresh_idle_hold_ledger(),
     spawn_idle_relift=lambda: _maybe_spawn_idle_relift(),
+    watch_idle_holders=lambda: _maybe_spawn_idle_holder_watch(),
     episode_dirty=lambda: fsm.record.dirty,
     episode_open=lambda: fsm.state is not ServerState.HEALTHY,
     episode_job=lambda: dict(fsm.record.job),
@@ -1263,7 +1265,7 @@ FABRIC_CHECK_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_I
 last_fabric_check_monotonic: float = 0.0
 # A failed job that never reached the device (spec 03 I36) does not force the traffic pass when
 # one finished green this recently: it ran in under NOOP_FAILURE_MAX_RUNTIME_SEC, so it says
-# nothing about the mesh. blx01 lost its host ~9s into a pass forced 2s after a green one by a
+# nothing about the mesh. box A lost its host ~9s into a pass forced 2s after a green one by a
 # job that failed in 0s on a missing directory. The exit code alone never qualifies: jobs run
 # under `bash -c` with `set -e`, so a script that used the device and then hit a missing or
 # non-executable command also exits 127/126.
@@ -3278,7 +3280,7 @@ def _names_topology_mismatch(text: str) -> bool:
 
 
 def _topology_mismatch_hold(evidence: dict) -> bool:
-    # A known fabric fault (03 I43) is outside the I40 bound too: its release is what failed.
+    # A known fabric fault (03 I45) is outside the I40 bound too: its release is what failed.
     if health_monitor is not None and health_monitor.known_fabric_fault():
         return True
     details = (str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or ""))
@@ -3472,6 +3474,13 @@ async def _attempt_idle_relift() -> None:
                 # never proves such a mesh fit; this branch never lifts on one. Past the ceiling on an
                 # idle, tenant-free present mesh it escalates to the gate's galaxy reset (the one
                 # authoritative proof), and holds otherwise — every guard lives in _escalate_stuck_hold.
+                #
+                # The one exception is a pure foreign-holder hold: no fault was measured, the verify
+                # was only deferred because a tenant held the device. Once the tenant is gone, run the
+                # pre-job verify the next job's gate would run, now, rather than wait out the ceiling
+                # and pay a reset (spec 03 I43). Only a verify that fails falls through to the ceiling.
+                if fsm.record.why == "foreign_holder" and await _foreign_holder_fast_verify(expected, _log):
+                    return
                 if await _escalate("present"):
                     return
                 _log(
@@ -3508,7 +3517,7 @@ async def _attempt_idle_relift() -> None:
                 # A present mesh (nothing off the bus) can still verify UNHEALTHY on a MASS ARC
                 # wedge — every chip present but its heartbeat frozen. The off-bus escalator above
                 # cannot see it (off_bus==0) and the frozen-eth branch below is unreachable (that
-                # needs enum+ARC HEALTHY), so read-only this held forever (blx04, 37h). It is the one
+                # needs enum+ARC HEALTHY), so read-only this held forever (box D, 37h). It is the one
                 # present-mesh fault a galaxy reset both cures and cannot invert — every chip is
                 # present — so route a confirmed mass wedge (frozen chips >= the same mass-drop floor
                 # the gate keys on) to the present-mesh reset the eth strand runs. A sub-floor frozen
@@ -3625,6 +3634,49 @@ async def _attempt_idle_relift() -> None:
         _log("pass aborted on an unexpected error — holding; the sampler retries next window")
 
 
+async def _foreign_holder_fast_verify(expected: int, log: Callable[[str], None]) -> bool:
+    """Run the pre-job verify on a foreign-holder hold whose holder is gone (spec 03 I43). Called by
+    the idle relift under the device-op lock. Returns True when the relift is done with this pass
+    (the hold lifted, a tenant is still there, or the state changed under it); False hands the hold
+    to the ceiling escalation, which is what a failed verify needs.
+
+    The hold was placed because the gate could not verify beside a tenant, not on a measured fault,
+    so the verify the next job's gate would run is all it owes: enum+ARC, no traffic pass, released
+    on a healthy read with no runtime-named fault. Stricter than the gate in one way: a last fabric
+    verdict that read UNHEALTHY is not lifted here, it goes to the ceiling reset. The tenant check
+    is the escalation's own (an fd holder, a RUNNING job, or a scan it cannot fully read), plus a
+    reaped job's leftover, so nothing is probed beside anyone."""
+    scan = await asyncio.to_thread(enumerate_device_holders)
+    if galaxy_recovery._tenant_active(scan) or await asyncio.to_thread(_reaped_leftover_reason, scan):
+        log("foreign-holder hold: a tenant or a running job still holds the device — holding")
+        return True
+    log("foreign-holder hold: the holder is gone and no job runs — running the pre-job verify now")
+    healthy, evidence = await fsm.observe(expected, log, run_fabric=False, phase="pre-job", recovery=select_recovery())
+    if not healthy or device_fault_reported or health_monitor.last_fabric_ok is False:
+        why = (
+            "the mesh reads unhealthy"
+            if not healthy
+            else (
+                f"the runtime reported '{device_fault_reported}'"
+                if device_fault_reported
+                else "the last fabric verdict was UNHEALTHY"
+            )
+        )
+        log(f"foreign-holder hold: pre-job verify did not clear it ({why}) — the ceiling escalation owns it")
+        health_event("foreign_holder_verify", lifted=False, healthy=healthy, reason=why)
+        return False
+    # Same re-assert as the relift's own lift: the sampler's dead-chip path is lock-free and can
+    # re-dirty the device during the awaits above.
+    if fsm.state is not ServerState.RECOVERING or fsm.record.dirty or fsm.record.why != "foreign_holder":
+        log("state changed mid-verify (a chip dropped, or a gate took over) — holding; the pre-job gate owns it now")
+        return True
+    log("foreign-holder hold: pre-job verify healthy — hold lifted without a reset")
+    health_event("foreign_holder_verify", lifted=True, healthy=True, reason="holder gone")
+    health_event("device_relift", evidence=evidence)
+    _clear_device_dirty(verified=True, why="idle relift: foreign holder gone, pre-job verify healthy")
+    return True
+
+
 def _eth_rearm_idle() -> bool:
     """Whether the device is idle enough for the eth self-test's one read: HEALTHY, no tenant job
     queued, running or re-adopted, no finished job still owed its post-job gate, and no external
@@ -3687,6 +3739,124 @@ def _maybe_spawn_idle_relift() -> None:
     if not ((selfheal or fabric or generic) and not device_op_active):
         return
     _relift_task = asyncio.create_task(_attempt_idle_relift())
+
+
+# Idle foreign holder (spec 03 I44). A tenant process outside every broker scope that keeps a device
+# fd open but does no work blocks the queue (_wait_out_foreign_holder) and any foreign-holder hold
+# with no bound: the gate never acts under a live tenant. The broker never kills or signals it; past
+# TT_DEVICE_MCP_IDLE_HOLDER_SEC with its CPU time flat it names the holder once, as an event and an
+# alert, so a person can. Keyed on (pid, starttime) so a reused pid is a new process.
+IDLE_HOLDER_DEFAULT_SEC = 900
+IDLE_HOLDER_SCAN_SEC = 60
+_idle_holders: dict = {}
+_idle_holder_task: Optional[asyncio.Task] = None
+_idle_holder_last_scan: float = 0.0
+
+
+def _idle_holder_sec() -> float:
+    """Seconds a foreign holder's CPU time must stay flat before it is named. 0 or less turns the
+    detector off; unset or malformed reads as the default."""
+    raw = os.environ.get("TT_DEVICE_MCP_IDLE_HOLDER_SEC", "").strip()
+    try:
+        return float(raw) if raw else float(IDLE_HOLDER_DEFAULT_SEC)
+    except ValueError:
+        return float(IDLE_HOLDER_DEFAULT_SEC)
+
+
+def _watch_idle_foreign_holders(scan: HolderScan, now: float) -> list:
+    """Track each foreign holder's CPU time across scans and name the ones idle past the threshold.
+    Returns the holders named in this call (for tests and the log). Read-only towards the holder:
+    it reads /proc and never signals anything.
+
+    Counted: a tenant (``is_tenant``) outside the broker's job/exec scopes and not a descendant of
+    the broker itself, so the broker's own jobs (scoped under privsep, children otherwise) never
+    count. Each holder gets one ``idle_foreign_holder`` event and one alert for its lifetime; an
+    alert dropped because the hook is still busy is retried on the next scan."""
+    threshold = _idle_holder_sec()
+    if threshold <= 0:
+        _idle_holders.clear()
+        return []
+    me = os.getpid()
+    seen = set()
+    named = []
+    for h in scan.holders:
+        if not is_tenant(h) or h.scoped or descends_from(h.pid, me):
+            continue
+        cpu = read_proc_cpu(h.pid)
+        if cpu is None:
+            continue  # exited between the scan and this read
+        ticks, start = cpu
+        key = (h.pid, start)
+        seen.add(key)
+        entry = _idle_holders.get(key)
+        if entry is None:
+            _idle_holders[key] = {"ticks": ticks, "since": now, "evented": False, "alerted": False}
+            continue
+        if entry["ticks"] != ticks:
+            entry["ticks"], entry["since"] = ticks, now
+            continue
+        idle = now - entry["since"]
+        if idle < threshold or entry["alerted"]:
+            continue
+        user = h.username
+        if not entry["evented"]:
+            entry["evented"] = True
+            named.append({"pid": h.pid, "user": user, "idle_sec": int(idle)})
+            if logger:
+                logger.warning(
+                    f"IDLE-HOLDER {user} (pid {h.pid}) holds the device with no CPU time for "
+                    f"{int(idle)}s — named, never signalled"
+                )
+            health_event(
+                "idle_foreign_holder",
+                pid=h.pid,
+                uid=h.uid,
+                user=user,
+                idle_sec=int(idle),
+                threshold_sec=int(threshold),
+            )
+        if alert.alert_argv() is None:
+            entry["alerted"] = True
+            continue
+        event = {
+            "kind": "idle_foreign_holder",
+            "host": socket.gethostname(),
+            "pid": h.pid,
+            "uid": h.uid,
+            "user": user,
+            "idle_sec": int(idle),
+            "threshold_sec": int(threshold),
+        }
+        if alert.send_alert(event, logger) is not None:
+            entry["alerted"] = True
+    for key in list(_idle_holders):
+        if key not in seen:
+            del _idle_holders[key]
+    return named
+
+
+async def _idle_holder_watch_pass() -> None:
+    """One scan for the idle-holder detector, off the event loop. Never raises: a detached task."""
+    try:
+        scan = await asyncio.to_thread(enumerate_device_holders)
+        await asyncio.to_thread(_watch_idle_foreign_holders, scan, time.monotonic())
+    except Exception:  # noqa: BLE001 - a detached watch task must never raise unretrieved
+        if logger:
+            logger.exception("IDLE-HOLDER scan failed — retrying next window")
+
+
+def _maybe_spawn_idle_holder_watch() -> None:
+    """Driven by the sampler: one detached scan per IDLE_HOLDER_SCAN_SEC, never two at once."""
+    global _idle_holder_task, _idle_holder_last_scan
+    if _idle_holder_sec() <= 0:
+        return
+    if _idle_holder_task is not None and not _idle_holder_task.done():
+        return
+    now = time.monotonic()
+    if _idle_holder_last_scan and now - _idle_holder_last_scan < IDLE_HOLDER_SCAN_SEC:
+        return
+    _idle_holder_last_scan = now
+    _idle_holder_task = asyncio.create_task(_idle_holder_watch_pass())
 
 
 async def _kill_device_holders(reason: str) -> list:
@@ -4057,7 +4227,7 @@ def _frozen_chip_count(evidence: dict) -> int:
     records. A galaxy reset re-inits them and, unlike an off-bus drop, cannot invert the mesh doing
     so: every frozen chip is already present, so there is nothing for the reset to take down with it.
     The mass-reset floor counts these alongside the off-bus chips so an all-frozen present mesh does
-    not read as 0-off-bus and hold below the floor forever (the blx04 present-mesh deadlock)."""
+    not read as 0-off-bus and hold below the floor forever (the box D present-mesh deadlock)."""
     return len((evidence.get("heartbeat") or {}).get("stalled") or [])
 
 
@@ -4352,7 +4522,7 @@ async def device_health_gate(
         stale = never_run or (time.monotonic() - last_fabric_check_monotonic) > FABRIC_CHECK_MIN_INTERVAL_SEC
         # A failed job that never reached the device (I36) owes no forced pass on a mesh a green
         # pass proved moments ago: the pass is the heaviest thing the broker does to the mesh, and
-        # blx01 lost its host ~9s into one forced 2s after a green pass. Only a clean HEALTHY
+        # box A lost its host ~9s into one forced 2s after a green pass. Only a clean HEALTHY
         # device skips it, and only on an armed host: the eth read still runs below (run_eth), a
         # frozen core still holds, and a read with no verdict, a link-drop skip included, still
         # runs the full pass (fabric_stale is forced for it). last_fabric_check_monotonic is set
@@ -4607,7 +4777,7 @@ async def device_health_gate(
             # The fabric pass RAN but returned no verdict (77 — the validator tested no link, e.g.
             # eth links that never trained). On a multi-chip host that is NOT "the mesh is fine":
             # enum+ARC are blind to a wedged eth core, so reading it healthy admits tenants onto a
-            # possibly-dead fabric — measured on blx04, a box whose chip 4/14 eth links were down
+            # possibly-dead fabric — measured on box D, a box whose chip 4/14 eth links were down
             # read `ok` on enum+ARC and every full-mesh job died. Fail CLOSED: hold it fabric-
             # unverified whether or not it was flagged dirty, so no tenant runs until a pass
             # returns a real healthy verdict. Do NOT reset — a 77 is not resettable, and a galaxy
@@ -7767,7 +7937,7 @@ export {JOB_TAG_ENV}={job_tag}
                 # The first job after a topology-mismatch lift is the bound on that lift: one that
                 # dies on the fabric makes it a hardware fault, held without a reset (03 I42).
                 # Jobs that keep dying on the fabric's routing after passes that could not run are a
-                # known fabric fault: held, never the dirty-flag reset that only ends in another 77 (03 I43).
+                # known fabric fault: held, never the dirty-flag reset that only ends in another 77 (03 I45).
                 known = None
                 if health_monitor is not None:
                     tail = _read_job_log_tail(job_log_file)
@@ -8157,7 +8327,7 @@ async def _record_startup_health() -> None:
                 _mark_device_dirty(f"broker start: {detail}", why="heartbeat")
                 # If this boot is a warm reboot the broker fired and the mesh did not come back, the
                 # reboot is spent (it cannot re-enumerate a whole-bus wedge) — climb to the cold rung
-                # now rather than re-holding it dead, the failure that lost blx02 for ~18h.
+                # now rather than re-holding it dead, the failure that lost box B for ~18h.
                 off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
 
                 def _log(msg: str) -> None:

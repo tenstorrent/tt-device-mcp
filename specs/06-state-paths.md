@@ -230,8 +230,8 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES` | 3 | Idle-relift 77 retries on one 77-only hold before the startup checks gate it (I40) | 03 |
 | `TT_DEVICE_MCP_FABRIC_77_BOUND_SEC` | 600 | Age of a 77-only hold (at least one retry behind it) past which the startup checks gate it (I40) | 03 |
 | `TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC` | 21600 | At most one I40 fallback release per window; a second 77-only hold inside it climbs the ladder | 03 |
-| `TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS` | 2 | Jobs in a row that die on the fabric's routing after a 77 pass before a known fabric fault holds without a reset (I43) | 03 |
-| `TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC` | 21600 | Age past which a known fabric fault expires and the usual 77 path gets one more try (I43) | 03 |
+| `TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS` | 2 | Jobs in a row that die on the fabric's routing after a 77 pass before a known fabric fault holds without a reset (I45) | 03 |
+| `TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC` | 21600 | Age past which a known fabric fault expires and the usual 77 path gets one more try (I45) | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD` | 1 | Hold tenant jobs at the door while degraded (vs fail-fast) | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD_POLL_SEC` | 60 | Held-job re-check cadence | 03 |
 | `TT_DEVICE_MCP_TENANT_UIDS` | unset | Comma-separated uids or user names below 1000 whose device holders count as tenants. Root is ignored; a name that does not resolve is retried on the next scan | 04 |
@@ -242,6 +242,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE` | 1 | Kill switch: off-bus holds escalate early | 03 |
 | `TT_DEVICE_MCP_PRESENT_MESH_RESET_GRACE_SEC` | 300 | Present-mesh eth/fabric hold grace before reset | 03 |
 | `TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE` | 1 | Kill switch: generic holds join the idle escalation | 03 |
+| `TT_DEVICE_MCP_IDLE_HOLDER_SEC` | 900 | Seconds a foreign holder's CPU time stays flat before it is named (event + alert, never signalled); 0 turns it off | 03 |
 | `TT_DEVICE_MCP_FORCE_ESCALATE` | 1 | Kill switch: past-ceiling forced escalation | 03 |
 | `TT_DEVICE_MCP_ETH_FREEZE_HOLD` | 1 | Frozen-eth verdict holds instead of resetting | 03 |
 | `TT_DEVICE_MCP_HOLD_REARM_SEC` | 1800 | Re-arm window for hold-escalation alerts | 03 |

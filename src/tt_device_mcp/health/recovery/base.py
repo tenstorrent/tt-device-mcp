@@ -65,7 +65,7 @@ AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
 POWER_CYCLE_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC", "1800"))
 
 # The host-level recovery rungs, ordered by severity. A warm reboot recovers most wedges; a
-# whole-bus wedge survives it and only the chassis power cycle clears it (measured on blx04).
+# whole-bus wedge survives it and only the chassis power cycle clears it (measured on box D).
 # The min-interval loop guard is therefore PER SEVERITY: a stronger rung may escalate past a
 # weaker one that just fired — a reboot that did not fix the mesh must not force an hour's wait
 # before the power cycle that will — but no rung may re-fire itself inside the interval (its own
