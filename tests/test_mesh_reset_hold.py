@@ -76,7 +76,7 @@ def test_the_hold_reason_follows_the_flags(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_the_gate_holds_the_mesh_reset_under_an_outage_hold_and_pages_once(held, rec):
-    """The blx03 case: the hold drop-in turned every hardware rung off and the gate still fired
+    """The observed case: an outage-hold drop-in turned every hardware rung off and the gate still fired
     `tt-smi -glx_reset`. Held now: nothing fires, nothing is recorded as a reset, one page."""
     g = srv.galaxy_recovery
     logs = []
