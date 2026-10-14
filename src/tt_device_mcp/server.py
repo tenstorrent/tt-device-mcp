@@ -3325,7 +3325,9 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
             "WITH A WARNING: the fabric is unverified, the next gate re-runs the pass"
         )
         health_event("device_relift_fabric_unverified", evidence=evidence, retries=_fabric_77_streak)
-        _clear_device_dirty(verified=True, why="idle relift: fabric check unrunnable past its bound; startup checks pass")
+        _clear_device_dirty(
+            verified=True, why="idle relift: fabric check unrunnable past its bound; startup checks pass"
+        )
         return True
     log(
         "startup checks do not clear it ("
