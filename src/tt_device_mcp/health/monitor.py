@@ -34,6 +34,7 @@ from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
 # How much of a fabric run's output the action-log row keeps for a run that got no healthy verdict:
 # all of it, since the validator's first error line (the cause) sits near the head and a wrapper's
@@ -957,6 +958,7 @@ class HealthMonitor:
         self.last_fabric_skipped = ok is None
         if ok is True:
             self.last_fabric_ok = True
+            FABRIC_DEBT.note_fabric(True)  # the one verdict that settles a post-reset debt (04 I32)
             if self.fabric_known_fault:
                 health_event("fabric_known_fault_cleared", detail=self.fabric_known_fault)
             self.fabric_known_fault, self._fabric_route_fault_streak = "", 0
