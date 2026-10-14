@@ -211,6 +211,10 @@ def _ubb_reset_enabled() -> bool:
 
     Armed also means fireable (I14, I17): the re-power goes out as `ipmitool raw` to the local
     BMC, so a host with no reachable BMC reports the rung OFF rather than choosing it and raising.
+
+    A walk that took chips on other trays off the bus (``ubb_reset_regressed_offbus``) declines only
+    the verify-between walk for the rest of the process (:func:`pcie_guard.disable_tray_rung`); it
+    leaves this switch, and so the back-to-back sweep's tray re-power, as it is.
     """
     if os.environ.get("TT_DEVICE_MCP_AUTO_UBB_RESET", "1").strip() == "0":
         return False
@@ -809,13 +813,20 @@ def _pci_rescan() -> None:
 UBB_WALK_RESCAN_SETTLE_SEC = 3
 
 
+def _pci_rescan_tray(tray: int, log) -> None:
+    """Rescan only the re-powered tray's root ports; the bare global rescan only when none is known.
+    A global rescan also walks the other trays' ports (see :func:`pcie_guard.rescan_root_ports`)."""
+    if not pcie_guard.rescan_trays([tray], log):
+        _pci_rescan()
+
+
 async def _rescan_after_tray_step(tray: int, log) -> None:
-    """One PCI rescan after a tray re-power, then a short settle. A re-power does not undo the
-    dead-chip sampler's ``remove``, so without it an isolated chip could never verify back (the
-    rescan :meth:`ResetMechanism.reset_with_quiesce` makes after every reset). A failed write is
+    """One PCI rescan of the tray's root ports after its re-power, then a short settle. A re-power does
+    not undo the dead-chip sampler's ``remove``, so without it an isolated chip could never verify back
+    (the rescan :meth:`ResetMechanism.reset_with_quiesce` makes after every reset). A failed write is
     logged and the verify runs anyway."""
     try:
-        await asyncio.to_thread(_pci_rescan)
+        await asyncio.to_thread(_pci_rescan_tray, tray, log)
     except OSError as e:
         log(f"PCI rescan after the tray {tray} re-power failed ({e}); verifying anyway")
         return
@@ -2446,6 +2457,16 @@ class GalaxyRecovery(Recovery):
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)  # name it + hold (the default)
             metrics.stage_fired("ubb_tray", "blocked")
             return None
+        if pcie_guard.tray_rung_disabled() is not None:
+            # An earlier walk took chips on other trays off the bus: decline the walk for the rest of
+            # the process. The back-to-back sweep still re-powers the tray, with a mesh reset after it.
+            _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)
+            log(
+                f"tray-down but the per-tray walk is disabled for this process "
+                f"({pcie_guard.tray_rung_disabled()}) — holding"
+            )
+            metrics.stage_fired("ubb_tray", "blocked")
+            return None
         if self.deps.device_hold_episode_ubb_reset_fired():
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)
             log("tray-down but this episode's one per-tray reset walk already ran — holding; the next rung owns it")
@@ -2575,6 +2596,9 @@ class GalaxyRecovery(Recovery):
                         expected=expected,
                         host_at_risk=True,
                     )
+                    # Every such re-power so far cost the other trays a chip: decline the rung for the
+                    # rest of the process, so the next drop goes to the mesh reset, as when opted out.
+                    pcie_guard.disable_tray_rung(tray=tray, new_off=sorted(new_off, key=int))
                     return False
             log(
                 "the per-tray reset walk re-powered the affected trays, one at a time, and the mesh still did "

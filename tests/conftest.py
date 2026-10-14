@@ -437,6 +437,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
         raise AssertionError("a test reached the real per-tray BMC reset; _fire_ubb_reset must be mocked")
 
     monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
+    # A regressed tray walk disables the rung for the rest of the process: every test starts armed.
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
 
     # The bounded off-bus hold (spec 04 I27) runs a host-supplied power-cycle command: unset here, a
     # loud tripwire if reached anyway, and its per-process episode tracking starts empty per test.
@@ -717,10 +719,12 @@ def patch_health_event(monkeypatch, fn) -> None:
     ``health.recovery.galaxy`` (the escalation ladder) each hold their OWN
     ``from health.evidence import health_event`` binding — an import copies the reference, so
     patching one module's copy never touches another's. A test that wants to see (or silence) an
-    event any of these bodies emits has to patch all three."""
+    event any of these bodies emits has to patch all three, and ``pcie_guard`` (the tray re-power
+    envelope and the tray rung's disable, which the walk reaches)."""
     monkeypatch.setattr(srv, "health_event", fn)
     monkeypatch.setattr(recovery_pkg, "health_event", fn)
     monkeypatch.setattr(recovery_galaxy, "health_event", fn)
+    monkeypatch.setattr(pcie_guard, "health_event", fn)
 
 
 def patch_recovery(monkeypatch, name: str, fn) -> None:

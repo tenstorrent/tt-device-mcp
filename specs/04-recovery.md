@@ -372,8 +372,14 @@ each rung fires only when the gentler one failed or cannot apply.
   masked on EVERY Tenstorrent root port, the sibling trays' included (a mask that cannot be applied
   is put back and refuses the fire, before any chip is touched); the chips are quiesced
   (USER_RESET); the tray's PCI functions are removed; the BMC pulse fires; then, even if the
-  quiesce or the pulse failed, the bus is rescanned, the chips re-inited (POST_RESET) and each
-  port's error status cleared and watched for `TT_DEVICE_MCP_AER_QUIET_CHECK_SEC`. "Every root
+  quiesce or the pulse failed, only the re-powered tray's root ports are rescanned (each port's
+  `pci_bus/<bus>/rescan`; the global `/sys/bus/pci/rescan` only when no port of the tray is known),
+  the chips re-inited (POST_RESET), and every chip on another tray that read a live heartbeat
+  before the pulse and all-ones after it gets one `remove` and a rescan of its own root port
+  (`tray_repower_sibling_offbus`; one still all-ones is left to the walk's regression check), then
+  each port's error status is cleared and watched for `TT_DEVICE_MCP_AER_QUIET_CHECK_SEC`. On a
+  Galaxy every per-tray re-power with a global rescan left the slot-6 chip of each other tray
+  reading all-ones. "Every root
   port" includes the ports of chips already off the bus: the broker remembers each root port and
   chip arch it has seen (`tt_pci_topology.json` in the health dir) and masks a remembered port
   that still exists in sysfs. It looks at broker start and in every between-jobs check (sysfs
@@ -591,10 +597,17 @@ bare PCI rescan before anything heavier, and refuses a stale cached address whos
 holds live silicon. The tray rung walks only the affected trays (I25), one at a time,
 holding `reset_in_flight` and the device pollers stopped across the walk (restored after it, as in
 I12), and never applies to a fully-off-bus mesh (that is the cold rung's case). After each tray's
-re-power it rescans the PCI bus and settles (`UBB_WALK_RESCAN_SETTLE_SEC`) before re-verifying,
+re-power it rescans that tray's root ports (the whole bus only when none is known) and settles
+(`UBB_WALK_RESCAN_SETTLE_SEC`) before re-verifying,
 fabric included: a re-power does not undo a chip's sysfs `remove`. After a failed verify it re-reads
 the bus. If a chip that was on the bus before the walk is now off, the walk stops at once
-(`ubb_reset_regressed_offbus`) rather than re-power more trays. A healthy tray is never swept (I25):
+(`ubb_reset_regressed_offbus`) rather than re-power more trays, and the verify-between walk is
+declined for the rest of the broker process (`ubb_tray_rung_disabled`; the next generic drop names
+the command and holds, and the hold's ceiling climbs to the mesh reset; a broker restart re-arms
+it). Only the walk is declined: the back-to-back sweep (TRAY_DOWN_NO_WINDOW and the last-chance
+sweep before a host rung) still fires the tray re-power, since a mesh reset and, if needed, the
+power cycle follow it, and skipping it would climb to the host rung without the full ladder (I22).
+A healthy tray is never swept (I25):
 re-powering it cannot bring back a chip on another tray and can knock its own chips off, so a mesh
 that still fails once every affected tray was re-powered (an off-bus chip or a fabric fault) goes to
 the next rung. Either way the walk returns False, so the ladder climbs to the same next rungs as an
@@ -787,6 +800,9 @@ sees a silent fabric pass.
 | I22 a host rung holds when the last-chance sweep was skipped or gated; it fires after a full sweep | `tests/test_ladder_v2.py::test_settle_and_verify_gates_the_power_cycle_host_rung`, `tests/test_pcie_guard.py::test_a_gated_sweep_never_reaches_the_power_cycle`, `::test_a_refused_tray_fire_makes_the_sweep_incomplete` |
 | I23 the tray map is cross-checked against sysfs; a mismatch or missing table refuses | `tests/test_pcie_guard.py::test_plan_refuses_a_tray_map_that_points_at_another_tray`, `::test_plan_refuses_without_a_tray_table`, `::test_envelope_refuses_a_mismatched_tray_map` |
 | I23 the envelope's order: mask every port, quiesce, remove, fire, rescan, re-init, restore | `tests/test_pcie_guard.py::test_envelope_masks_every_port_removes_the_tray_fires_rescans_and_restores`, `::test_envelope_restores_and_rescans_even_when_the_pulse_fails`, `::test_pollers_are_stopped_across_the_tray_fire` |
+| I23 only the re-powered tray's root ports are rescanned; the global rescan only when none is known | `tests/test_pcie_guard.py::test_the_envelope_rescans_only_the_re_powered_trays_root_ports`, `::test_the_envelope_falls_back_to_the_global_rescan_when_no_tray_port_is_known`, `tests/test_device_safety.py::test_the_walk_rescans_only_the_re_powered_trays_root_ports` |
+| I23 a chip on another tray newly all-ones gets one remove + scoped rescan | `tests/test_pcie_guard.py::test_a_sibling_chip_newly_all_ones_gets_one_remove_and_scoped_rescan`, `::test_a_sibling_chip_already_all_ones_or_on_the_tray_is_not_touched` |
+| I25 a regressed walk disables the tray walk for the process; the back-to-back sweep still re-powers | `tests/test_device_safety.py::test_a_regressed_walk_disables_the_tray_rung_for_the_process`, `tests/test_pcie_guard.py::test_a_disabled_tray_walk_leaves_the_envelope_armed`, `tests/test_ladder_v2.py::test_a_disabled_tray_walk_still_re_powers_in_the_last_chance_sweep`, `::test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep` |
 | I23 holders: wait, then refuse | `tests/test_pcie_guard.py::test_envelope_waits_for_holders_then_refuses_without_touching_anything`, `::test_envelope_proceeds_once_the_holder_lets_go` |
 | I23 an erroring port stays masked and starts the flood window | `tests/test_pcie_guard.py::test_a_port_that_keeps_erroring_stays_masked_and_marks_a_flood` |
 | I23 dry run and plan CLI touch nothing | `tests/test_pcie_guard.py::test_dry_run_logs_the_plan_and_touches_nothing`, `::test_cli_prints_the_plan` |
