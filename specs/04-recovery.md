@@ -691,7 +691,7 @@ cycling in its own scope. A sweep that brings the mesh back cancels the host run
 device?" goes through one helper (`_tenant_active`), and it consults TWO independent sources: the holder scan (open
 `/dev/tenstorrent` fds) and the broker's own queue (`deps.job_running`). The scan alone is not evidence of idleness —
 a running job spends minutes off the device compiling, loading weights and between opens, and during that window the
-scan is empty. Measured on g15blx02 2026-09-17: the stuck-hold escalation read an empty scan 106 s into a running
+scan is empty. Measured on box B 2026-09-17: the stuck-hold escalation read an empty scan 106 s into a running
 job, fired a mesh reset, and the job died of SIGPIPE the instant the reset released the device. `force` (the
 hold-deadline backstop) still waives an UNREADABLE scan, because that guard protects against blindness, but it never
 waives a known tenant — fd-held or queue-known.

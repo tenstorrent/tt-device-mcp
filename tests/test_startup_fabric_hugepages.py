@@ -6,7 +6,7 @@
 A startup pass that 77'd for want of the validator or the pool is owed again once they land, even
 with the fabric relift switched off (I39).
 
-blx01, 2026-10-08: the broker started before tenstorrent-hugepages.service had allocated the pool,
+box A, 2026-10-08: the broker started before tenstorrent-hugepages.service had allocated the pool,
 the startup fabric pass exited 77 with its reason cut to "no link was tested", and the idle relift
 then escalated that hold to a glx_reset 120 s later — a reset that cannot produce a fabric verdict.
 """
@@ -428,7 +428,7 @@ async def test_the_forced_escalation_bails_on_a_77_only_hold(monkeypatch, tmp_pa
 
 # --- a startup pass the validator missed is owed again once it lands (I39) ----------------------
 #
-# g15blx02, 2026-10-11: the broker started 2 min after boot, the validator timer published the
+# box B, 2026-10-11: the broker started 2 min after boot, the validator timer published the
 # pinned build's `current` link 8 min later, and the startup pass exited 77 in between. With the
 # fabric relift switched off by a hold drop-in, nothing re-ran it and a healthy mesh stayed held
 # until someone restarted the broker.
