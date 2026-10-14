@@ -2067,7 +2067,7 @@ def _reset_for_testing():
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant
-    global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic
+    global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
     job_queue = None
     lock = None
     _action_row = None
@@ -2080,6 +2080,7 @@ def _reset_for_testing():
     _fabric_77_streak_since = None
     _fabric_77_streak = 0
     _fabric_77_fallback_release_monotonic = 0.0
+    _fabric_77_paged_since = None
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
@@ -3346,6 +3347,9 @@ _fabric_77_streak: int = 0
 # Monotonic time of the last release the fallback granted on a still-unverified fabric. A second
 # 77-only hold within FABRIC_77_RELEASE_WINDOW_SEC of it goes to the ladder, not another release.
 _fabric_77_fallback_release_monotonic: float = 0.0
+# The hold episode (its ``since``) whose bound the alert hook has already paged. Every relift pass past
+# the bound runs the fallback again; only the first on an episode pages.
+_fabric_77_paged_since: Optional[str] = None
 
 
 def _env_int(name: str, default: int, floor: int) -> int:
@@ -3438,9 +3442,10 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
     that went down reads as no-verdict rather than healthy. A 77 is never a healthy fabric: only a
     positively healthy read, and no fallback release in the window, lifts the hold, with a warning.
     Frozen, unreadable, a link-count drop, or a second 77-only hold inside the window climbs the
-    ladder (the present-mesh rung, with every guard of _escalate_stuck_hold). Returns True when it
-    settled the hold."""
-    global _fabric_77_fallback_release_monotonic
+    ladder (the present-mesh rung, with every guard of _escalate_stuck_hold). Pages once per hold
+    episode: a later pass on the same episode journals but does not page again, and a page the hook
+    dropped is tried again on the next pass. Returns True when it settled the hold."""
+    global _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
     window = _env_int("TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC", 21600, 0)
     recent = bool(_fabric_77_fallback_release_monotonic) and (
         time.monotonic() - _fabric_77_fallback_release_monotonic < window
@@ -3459,7 +3464,10 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
             f"FABRIC-77-BOUND the fabric check could not run on {_fabric_77_streak} retries of this hold "
             "— falling back to the startup checks as the gate"
         )
-    alert.send_alert(event, logger)
+    if _fabric_77_paged_since != fsm.record.since and (
+        alert.send_alert(event, logger) is not None or alert.alert_argv() is None
+    ):
+        _fabric_77_paged_since = fsm.record.since
     eok, edetail = await health_monitor.verify_eth_heartbeat()
     if eok is True and not recent:
         _fabric_77_fallback_release_monotonic = time.monotonic()
