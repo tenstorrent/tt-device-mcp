@@ -1769,7 +1769,7 @@ class GalaxyRecovery(Recovery):
         recovered = await self._reset_and_verify_device(indices, log)
         if recovered is None:
             # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, which the
-            # idle relift re-checks within its bound (spec 03 I41). Nothing measured a failure to climb on.
+            # idle relift re-checks within its bound (spec 03 I40). Nothing measured a failure to climb on.
             return True
         if recovered:
             self.deps.clear_device_reported_fault("idle escalation: galaxy reset recovered the mesh")
@@ -2105,7 +2105,7 @@ class GalaxyRecovery(Recovery):
         recovered = await self._reset_and_verify_device(indices, log)
         if recovered is None:
             # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, which the
-            # idle relift re-checks within its bound (spec 03 I41). Nothing measured a failure to climb on.
+            # idle relift re-checks within its bound (spec 03 I40). Nothing measured a failure to climb on.
             return True
         if recovered:
             self.deps.clear_device_reported_fault("idle off-bus escalation: galaxy reset recovered the mesh")

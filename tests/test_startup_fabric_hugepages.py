@@ -681,7 +681,7 @@ def test_an_owed_pass_does_not_carry_to_another_episode(monkeypatch, tmp_path, c
     assert srv._idle_relift_armed() == (False, False, False)
 
 
-# --- I41: a 77-only hold is bounded, then the startup checks are the gate -----------------------
+# --- I40: a 77-only hold is bounded, then the startup checks are the gate -----------------------
 
 
 def _bound(monkeypatch, tmp_path, eth):

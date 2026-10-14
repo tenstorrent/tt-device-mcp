@@ -3244,7 +3244,7 @@ def _idle_relift_armed() -> tuple[bool, bool, bool]:
     )
 
 
-# I41 — the bound on a 77-only hold. Each idle-relift pass that 77s again on the same episode adds
+# I40 — the bound on a 77-only hold. Each idle-relift pass that 77s again on the same episode adds
 # one to the streak; once it reaches FABRIC_77_MAX_RETRIES, or the episode is FABRIC_77_BOUND_SEC old
 # with at least one retry behind it, the fabric pass stops being the gate (see _fabric_77_fallback).
 _fabric_77_streak_since: Optional[str] = None
@@ -3264,7 +3264,7 @@ def _env_int(name: str, default: int, floor: int) -> int:
 
 # A topology-mismatch skip, and the hardware fault the first job after its lift names, are holds no
 # fallback release may lift: the cabling is not what the descriptor says, and enum+ARC and the eth
-# read cannot see that. They stay outside the I41 budget and release.
+# read cannot see that. They stay outside the I40 budget and release.
 _TOPOLOGY_HOLD_PREFIX = "topology mismatch"
 _TOPOLOGY_HW_FAULT = "hardware fault: the first job after a topology-mismatch lift"
 
@@ -3275,7 +3275,7 @@ def _topology_mismatch_hold(evidence: dict) -> bool:
 
 
 def _fabric_77_bound_reached() -> bool:
-    """Count this 77 against the open episode and say whether the I41 bound is reached."""
+    """Count this 77 against the open episode and say whether the I40 bound is reached."""
     global _fabric_77_streak_since, _fabric_77_streak
     if _fabric_77_streak_since != fsm.record.since:
         _fabric_77_streak_since, _fabric_77_streak = fsm.record.since, 0
@@ -3489,7 +3489,7 @@ async def _attempt_idle_relift() -> None:
                     and not _topology_mismatch_hold(evidence)
                     and _fabric_77_bound_reached()
                 ):
-                    # I41: a pass that cannot run is retried a bounded number of times, never
+                    # I40: a pass that cannot run is retried a bounded number of times, never
                     # forever. Past the bound the startup checks become the gate.
                     if await _fabric_77_fallback(evidence, _log, _escalate):
                         return

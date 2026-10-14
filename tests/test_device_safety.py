@@ -12001,7 +12001,7 @@ async def test_a_reset_that_leaves_the_fabric_unverified_is_unknown(monkeypatch,
     retries (persistent 77) is NOT a recovery — enum+ARC came back but the fabric proved nothing — and
     NOT a failed reset either: a 77 measured nothing. _reset_and_verify_device returns None, the hold is
     neither cleared onto an unverified fabric nor counted a failed reset (cooldown, two strikes, host
-    rungs): it becomes a not-dirty 77-only fabric-unverified hold the idle relift re-checks (spec 03 I41)."""
+    rungs): it becomes a not-dirty 77-only fabric-unverified hold the idle relift re-checks (spec 03 I40)."""
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
     srv._mark_device_dirty("job 007 ended: eth link down")
     monkeypatch.setattr(srv, "device_fault_reported", "ethernet link timeout")
@@ -12031,7 +12031,7 @@ async def test_a_reset_that_leaves_the_fabric_unverified_is_unknown(monkeypatch,
     assert srv.recovery_mechanism.last_reset_failed is False, "a 77 must not arm the cooldown or the two strikes"
     assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY and not srv.fsm.record.dirty
     assert srv.fsm.state is ServerState.RECOVERING, "the door stays shut: no hold cleared onto an unverified fabric"
-    assert srv._fabric_77_only_hold(), "the hold must be 77-only, so the relift's I41 bound owns it"
+    assert srv._fabric_77_only_hold(), "the hold must be 77-only, so the relift's I40 bound owns it"
 
 
 @pytest.mark.asyncio

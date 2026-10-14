@@ -71,7 +71,7 @@ BRIDGE_RESET_SETTLE_SEC = 4
 # no trained link (77). Retry (see Recovery._verify_device_after_reset), giving the links time to
 # train, so the reset resolves to a REAL verdict rather than a transient 77 that reads as
 # "recovered" onto an unverified fabric. A 77 that persists past the retries is UNKNOWN: the reset is
-# neither a recovery nor a failure, and the mesh is held fabric-unverified (spec 03 I34/I41 bound it).
+# neither a recovery nor a failure, and the mesh is held fabric-unverified (spec 03 I34/I40 bound it).
 POST_RESET_FABRIC_RETRIES = int(os.environ.get("TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES", "1"))
 POST_RESET_FABRIC_RETRY_SLEEP_SEC = float(os.environ.get("TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC", "60"))
 
@@ -686,7 +686,7 @@ class Recovery(ABC):
             # fabric pass measured nothing. Counting it failed armed the cooldown and the gate's two
             # strikes, and drove the idle ladder toward a host rung on no evidence. Hold fabric-unverified
             # (not dirty) instead: the reset was the remedy a reported fault was pending, so retire that,
-            # and the hold is 77-only — the idle relift re-runs the pass, bounded by spec 03 I41.
+            # and the hold is 77-only — the idle relift re-runs the pass, bounded by spec 03 I40.
             health_event("reset_unverified", rc=rc, evidence=evidence, fabric_retries=retries)
             self.mechanism.last_reset_failed = False
             self.deps.clear_device_reported_fault("reset ran and enum+ARC verify; the fabric is unknown")
