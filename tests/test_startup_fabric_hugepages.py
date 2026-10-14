@@ -744,6 +744,8 @@ async def test_a_second_77_only_hold_inside_the_window_climbs_the_ladder(monkeyp
             "job 7: hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)",
             "could not run (77)",
         ),
+        # The validator's own line, still reaching the broker as a plain 77 (spec 04 I28).
+        ("gate/startup: fabric unverified (could not run)", "COULD NOT RUN: what():  Connection mismatch detected."),
     ],
 )
 async def test_a_topology_mismatch_hold_is_outside_the_77_bound(
@@ -760,6 +762,25 @@ async def test_a_topology_mismatch_hold_is_outside_the_77_bound(
     await srv._attempt_idle_relift()
     assert rungs == []
     assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reset_passes, lifted", [(2, True), (0, False)])
+async def test_after_an_unknown_reset_the_next_relift_77_reaches_the_bound(
+    monkeypatch, tmp_path, clear_job_state, reset_passes, lifted
+):
+    """Spec 04 I27: a reset whose post-reset fabric stayed a 77 (one pass and one retry) counts those
+    passes toward the episode's I41 bound, so the next relift's 77 falls back at once and releases on a
+    healthy eth read. Without them, the same relift is still under the default bound and just holds."""
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
+    monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
+    monkeypatch.setattr(srv, "_fabric_77_streak", 0)
+    if reset_passes:
+        srv._note_fabric_77_reset_passes(reset_passes)
+    await srv._attempt_idle_relift()
+    assert rungs == []
+    assert (srv.fsm.state is ServerState.HEALTHY) is lifted
 
 
 @pytest.mark.asyncio

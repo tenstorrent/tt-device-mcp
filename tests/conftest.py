@@ -624,6 +624,7 @@ def health_deps():
         set_device_hold_episode_ubb_reset_fired=lambda v: srv.fsm.set_latch("ubb_reset_fired", v),
         clear_device_reported_fault=lambda why: srv._clear_device_reported_fault(why),
         clear_device_dirty=lambda **kw: srv._clear_device_dirty(**kw),
+        note_fabric_77_reset_passes=lambda n: srv._note_fabric_77_reset_passes(n),
         device_degraded=lambda: srv._recovery_degraded(),
         auto_power_cycle_host=lambda log, reason: srv._auto_power_cycle_host(log, reason),
         emit_all_off_bus_power_cycle_required=lambda log, off_bus, expected, context: (
