@@ -684,7 +684,7 @@ def test_a_missing_journal_never_breaks_the_job_list(monkeypatch, tmp_path, clea
 #
 # The live HOLD row is synthetic: it exists only while the device is held, so the moment the
 # device came back the window it sat refused vanished from the one place anyone looks. Seen
-# on blx02: chip 2 fell off the bus, the reset "timed out", the device was held 4m39s, and
+# on box B: chip 2 fell off the bus, the reset "timed out", the device was held 4m39s, and
 # the list jumped from the failed reset straight to the next broker start.
 
 
@@ -1007,7 +1007,7 @@ def test_in_flight_hold_row_appears_in_recent_jobs(monkeypatch, tmp_path, clear_
 
 
 def test_a_queued_job_that_never_started_is_abandoned_not_interrupted(monkeypatch, tmp_path, clear_job_state):
-    """Job 901 (cs04, 2026-09-16): queued into a hold, its owner gave up before it ever ran. It
+    """Job 901 (box E, 2026-09-16): queued into a hold, its owner gave up before it ever ran. It
     showed as "interrupted" — the word for a job the broker killed mid-run. Nothing ran."""
     logs = tmp_path / "logs"
     logs.mkdir()
