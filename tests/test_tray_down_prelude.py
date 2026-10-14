@@ -19,8 +19,10 @@ import pytest
 from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import bmc_capture
 from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import galaxy
 
 # The kernel's chip index -> PCI address on a Blackhole Galaxy (as tests/test_ubb_tray_map.py).
@@ -32,6 +34,7 @@ BH_CHIP_BUSES = {
 REPLAY = pathlib.Path(__file__).parent / "fixtures" / "tray_down_replay.tsv"
 # The real one, taken before the rig fixture stubs it out.
 _REAL_CLEAR_FAULT = srv._clear_device_reported_fault
+_REAL_CLEAR_DIRTY = srv._clear_device_dirty
 
 
 def _off(tray_map, spec: dict) -> set:
@@ -289,6 +292,41 @@ async def test_every_chip_back_after_the_rescan_runs_the_full_verify_and_stops(r
     assert out == galaxy.OUTCOME_RECOVERED and verified["n"] == 1
     assert rig["order"] == ["rescan", "capture"], "no rung, no power cycle"
     assert rig["g"]._td is None, "a recovered episode closes the latch"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fabric, released",
+    [({"ok": None, "detail": "could not run (77)"}, False), (None, False), ({"ok": True}, True)],
+    ids=["fabric-77", "no-fabric-verdict", "fabric-ok"],
+)
+async def test_a_rescan_recovery_releases_only_on_a_passing_fabric_pass(rig, monkeypatch, tmp_path, fabric, released):
+    """A PCI rescan is a reset (spec 04 I32): chips back on the bus release only once a fabric pass
+    has passed, else the device is held fabric-unverified for the bounded relift."""
+    for i in range(32):
+        (tmp_path / str(i)).write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: 32)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "true")
+    monkeypatch.setattr(srv, "_clear_device_dirty", _REAL_CLEAR_DIRTY)
+
+    def rescan():  # the prelude itself records the rescan as a reset
+        rig["beats"] = _beats_without(set())
+
+    monkeypatch.setattr(galaxy, "_pci_rescan", rescan)
+    fsm_dirty(srv, "gate/post-job: tray 1 off the bus", why="job_killed")
+    rig["beats"] = _beats_without(_off(rig["map"], {1: 8}))
+
+    async def verify(expected, log, run_fabric=True, **k):
+        return True, {"snapshot": {"ok": True}, **({"fabric": fabric} if fabric else {})}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    out = await rig["g"].escalate("gate/post-job", [], 32, lambda m: None, stage=galaxy.STAGE_SMI_RESET)
+    assert out == galaxy.OUTCOME_RECOVERED
+    if released:
+        assert srv.fsm.state is ServerState.HEALTHY and FABRIC_DEBT.owed == ""
+    else:
+        assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY and FABRIC_DEBT.owed == "PCI rescan"
 
 
 @pytest.mark.asyncio
