@@ -635,6 +635,20 @@ def test_the_hold_message_names_both_boots(sysfs, monkeypatch, capsys):
     assert "the mesh reset on boot boot-a did not finish before the host went down; held on boot boot-b" in out
 
 
+def test_a_latch_from_an_ended_boot_never_gates_even_if_the_broker_never_restarted(sysfs, monkeypatch):
+    """Field record: the reset sweep ran on boot A, the hold latched on boot B, the host is now on
+    boot C and the broker has not dropped the file. Its boot has ended, so no rung is gated by it."""
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
+    rec = {"kind": "reset sweep", "off_bus": 8, "boot_id": "boot-a", "at_epoch": time.time() - 90000}
+    rec.update(latched_on_boot="boot-b", latched_at_epoch=time.time() - 89500)
+    pcie_guard.health_dir().mkdir(parents=True, exist_ok=True)
+    (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).write_text(json.dumps(rec))
+    _boot(sysfs, "boot-c")
+    _take_off_bus(sysfs, 0)
+    assert pcie_guard.offbus_reset_latched() is None
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_OFF and pcie_guard.host_reset_gate(1) == (True, "")
+
+
 def test_the_latch_can_be_switched_off(sysfs, monkeypatch):
     _boot(sysfs, "boot-a")
     pcie_guard.begin_offbus_reset("tray re-power", 1)
