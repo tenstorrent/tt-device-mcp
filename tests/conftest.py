@@ -309,6 +309,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # The device-op flock defaults to /run/tt-device-broker/device-op.flock, the file the host's own
     # broker holds during its resets. A test that took it there would stall that broker's device op.
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_FLOCK", str(tmp_path_factory.mktemp("flock") / "device-op.flock"))
+    monkeypatch.setenv("TT_DEVICE_MCP_DISPATCH_HOLD", str(tmp_path_factory.mktemp("hold") / "dispatch-hold"))
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_SPOOL_DIR", str(tmp_path_factory.mktemp("spool") / "spool"))
     # The gate's history lives in module globals — whether a reset just failed, when the
     # fabric was last proved. A test that leaves those set silently changes what the NEXT
     # test's gate decides to do, which is a debugging session nobody wants.
