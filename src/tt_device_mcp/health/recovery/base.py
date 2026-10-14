@@ -22,6 +22,7 @@ from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEO
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
 from tt_device_mcp.health.evidence import health_dir, health_event
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
 # A daemon without systemd uses the local lock below for the same restart-adoption contract.
@@ -350,6 +351,7 @@ class RecoveryMechanism:
             return False
         log(f"a reset is already in flight ({unit}); waiting for it rather than starting another")
         health_event("reset_scope_adopted", unit=unit)
+        FABRIC_DEBT.note_reset(f"adopted {unit}")
         deadline = time.monotonic() + DEVICE_RESET_TIMEOUT_SEC
         while time.monotonic() < deadline:
             await asyncio.sleep(2)
@@ -625,6 +627,8 @@ class RecoveryMechanism:
         self._set_device_op_detail(f"device reset: {' '.join(argv)} (~60s)")
         # Any reset clears a firmware clock cap; owed until a verified re-apply (see aiclk_ceiling).
         CEILING.mark_owed("reset")
+        # And it leaves the fabric unproven: no release until a fabric pass passes (post_reset).
+        FABRIC_DEBT.note_reset(" ".join(argv))
         quiesced = await self._set_device_pollers(False, log)
         # A reset takes the chips off the bus — that is what it does — so for its duration they
         # read all-ones exactly like a dead chip. Without this flag the sampler isolates them

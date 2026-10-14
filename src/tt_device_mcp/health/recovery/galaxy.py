@@ -21,6 +21,7 @@ from typing import Callable, Optional
 from tt_device_mcp import alert, metrics, privileges
 from tt_device_mcp.device_holders import is_tenant
 from tt_device_mcp.health.evidence import health_event
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import dead_chips
 from tt_device_mcp.health.monitors.pci import chip_node_present, pci_bus_number
@@ -825,6 +826,7 @@ async def _rescan_after_tray_step(tray: int, log) -> None:
     not undo the dead-chip sampler's ``remove``, so without it an isolated chip could never verify back
     (the rescan :meth:`ResetMechanism.reset_with_quiesce` makes after every reset). A failed write is
     logged and the verify runs anyway."""
+    FABRIC_DEBT.note_reset(f"PCI rescan of tray {tray}")
     try:
         await asyncio.to_thread(_pci_rescan_tray, tray, log)
     except OSError as e:
@@ -1339,6 +1341,7 @@ class GalaxyRecovery(Recovery):
             else:
                 td["rescanned"] = True
                 try:
+                    FABRIC_DEBT.note_reset("PCI rescan")
                     await asyncio.to_thread(_pci_rescan)
                     rescan = "ran"
                 except OSError as e:
@@ -1425,6 +1428,7 @@ class GalaxyRecovery(Recovery):
             quiesced = await set_pollers(False, log) if set_pollers else []
         except Exception as exc:  # noqa: BLE001 - best-effort, as for a mesh reset: never blocks recovery
             log(f"could not stop the device pollers before the tray re-power: {exc!r}")
+        FABRIC_DEBT.note_reset(f"tray re-power 0x{bitmap:02x}")
         try:
             return await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
         finally:
@@ -2709,6 +2713,7 @@ class GalaxyRecovery(Recovery):
                     # The envelope (spec 04 I23) runs inside _fire_ubb_reset. The pollers are already
                     # stopped across the whole walk, so not _fire_tray_repower, which would restart them
                     # between trays.
+                    FABRIC_DEBT.note_reset(f"tray re-power 0x{bitmap:02x}")
                     plan = await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
                 except asyncio.CancelledError:
                     # Abandoned while the BMC pulse runs on in its thread: the tray may still be off the

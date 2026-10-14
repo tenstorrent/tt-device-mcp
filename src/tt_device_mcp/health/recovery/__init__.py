@@ -28,6 +28,7 @@ from typing import Awaitable, Callable, Optional
 from tt_device_mcp import constants, metrics
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.evidence import health_event
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import pcie_guard
 from tt_device_mcp.health.recovery.base import RESET_COOLDOWN_SEC, RecoveryMechanism, refuse_mesh_reset
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
@@ -467,6 +468,7 @@ class Recovery(ABC):
             # record the chip inapplicable and fall through now (the incident burnt ~64s spinning
             # a no_bridge reset 3x per gone chip, then again on the stuck-hold escalation).
             for attempt in range(BRIDGE_RESET_MAX_TRIES):
+                FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
                 result = await asyncio.to_thread(reset_chip_via_bridge, idx, bdf)
                 if result:
                     recovered.append(idx)
