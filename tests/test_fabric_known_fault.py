@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 """Jobs that keep dying on the fabric's routing after fabric passes that could not run are a known
-fabric fault: held without a reset, paged once, bounded (03 I45). No device is opened: the
+fabric fault: held without a reset, paged once, bounded (03 I46). No device is opened: the
 validator, the alert hook and the job's command are stand-ins."""
 
 import asyncio

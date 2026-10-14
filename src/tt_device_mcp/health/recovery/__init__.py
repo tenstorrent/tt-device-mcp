@@ -29,7 +29,7 @@ from tt_device_mcp import constants, metrics
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.recovery import pcie_guard
-from tt_device_mcp.health.recovery.base import RESET_COOLDOWN_SEC, RecoveryMechanism
+from tt_device_mcp.health.recovery.base import RESET_COOLDOWN_SEC, RecoveryMechanism, refuse_mesh_reset
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
@@ -648,6 +648,9 @@ class Recovery(ABC):
         if not allowed:
             log(f"automatic reset NOT fired: {why}; holding for an operator")
             health_event("host_reset_gated", argv=argv, reason=why, host_at_risk=True)
+            return False
+        # The operator's outage hold (spec 04 I28): held like the gate above, and paged.
+        if refuse_mesh_reset("gate/relift", argv, log):
             return False
 
         log(f"resetting device: {' '.join(argv)}  ({expected} device(s); ~30-60s, restart-safe)")

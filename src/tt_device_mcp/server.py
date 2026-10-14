@@ -3265,10 +3265,12 @@ def _env_int(name: str, default: int, floor: int) -> int:
         return default
 
 
-# A topology-mismatch skip, and the hardware fault the first job after its lift names, are holds no
-# fallback release may lift: the cabling is not what the descriptor says, and enum+ARC and the eth
-# read cannot see that. They stay outside the I40 budget and release.
-_TOPOLOGY_HOLD_PREFIX = "topology mismatch"
+# The hardware fault the first job after a topology-mismatch lift names is a hold no fallback release
+# may lift: that job proved the links the traffic-only pass skipped are needed, and enum+ARC and the
+# eth read cannot see them. It stays outside the I40 budget and release. A topology mismatch whose
+# traffic-only rerun could not run is inside the bound (I45): its eth read is judged against the
+# link mark re-baselined for this chip-to-bus map, and a release is watched like a lift.
+_TOPOLOGY_HOLD = "topology mismatch"
 _TOPOLOGY_HW_FAULT = "hardware fault: the first job after a topology-mismatch lift"
 # The validator's own line for it, which reaches the broker as a 77 ("COULD NOT RUN") wherever the
 # topology-mismatch path has not relabelled it yet.
@@ -3276,19 +3278,22 @@ _TOPOLOGY_VALIDATOR_LINE = "Connection mismatch detected"
 
 
 def _names_topology_mismatch(text: str) -> bool:
-    return text.startswith(_TOPOLOGY_HOLD_PREFIX) or _TOPOLOGY_HW_FAULT in text or _TOPOLOGY_VALIDATOR_LINE in text
+    return text.startswith(_TOPOLOGY_HOLD) or _TOPOLOGY_HW_FAULT in text or _TOPOLOGY_VALIDATOR_LINE in text
 
 
-def _topology_mismatch_hold(evidence: dict) -> bool:
-    # A known fabric fault (03 I45) is outside the I40 bound too: its release is what failed.
+def _hold_details(evidence: dict) -> tuple[str, str]:
+    return str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or "")
+
+
+def _topology_hw_fault_hold(evidence: dict) -> bool:
+    # A known fabric fault (03 I46) is outside the I40 bound too: its release is what failed.
     if health_monitor is not None and health_monitor.known_fabric_fault():
         return True
-    details = (str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or ""))
-    return any(_names_topology_mismatch(d) for d in details)
+    return bool(health_monitor.topology_hw_fault) or any(_TOPOLOGY_HW_FAULT in d for d in _hold_details(evidence))
 
 
 def _fabric_no_reset_hold() -> str:
-    """Why the open hold is one no reset can end, or "" (spec 04 I29).
+    """Why the open hold is one no reset can end, or "" (spec 04 I30).
 
     A topology mismatch (the hold, its reason, or a fabric-unverified hold whose last pass printed the
     validator's mismatch line) is cabling that differs from the descriptor; a fabric pass that could
@@ -3372,6 +3377,9 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
             "WITH A WARNING: the fabric is unverified, the next gate re-runs the pass"
         )
         health_event("device_relift_fabric_unverified", evidence=evidence, retries=_fabric_77_streak)
+        if any(_TOPOLOGY_HOLD in d for d in _hold_details(evidence)):
+            # The release is a lift onto links no traffic crossed: the first job bounds it (I42).
+            health_monitor.topology_lift_pending = True
         _clear_device_dirty(
             verified=True, why="idle relift: fabric check unrunnable past its bound; startup checks pass"
         )
@@ -3539,7 +3547,7 @@ async def _attempt_idle_relift() -> None:
                 if (
                     fabric_ok is None
                     and _fabric_77_only_hold()
-                    and not _topology_mismatch_hold(evidence)
+                    and not _topology_hw_fault_hold(evidence)
                     and _fabric_77_bound_reached()
                 ):
                     # I40: a pass that cannot run is retried a bounded number of times, never
@@ -5452,7 +5460,7 @@ async def _force_escalate_stuck_hold() -> None:
         if no_reset:
             # Every chip enumerates with a live ARC heartbeat and the hold names only the fabric: a 77
             # or a cabling mismatch. A galaxy reset cannot fix either, and on one Galaxy host it took a
-            # chip off the bus and the ladder then re-powered its tray. Hold, page once (spec 04 I29).
+            # chip off the bus and the ladder then re-powered its tray. Hold, page once (spec 04 I30).
             _hold_without_reset(no_reset, expected, log)
             return
         health_event(
@@ -7937,7 +7945,7 @@ export {JOB_TAG_ENV}={job_tag}
                 # The first job after a topology-mismatch lift is the bound on that lift: one that
                 # dies on the fabric makes it a hardware fault, held without a reset (03 I42).
                 # Jobs that keep dying on the fabric's routing after passes that could not run are a
-                # known fabric fault: held, never the dirty-flag reset that only ends in another 77 (03 I45).
+                # known fabric fault: held, never the dirty-flag reset that only ends in another 77 (03 I46).
                 known = None
                 if health_monitor is not None:
                     tail = _read_job_log_tail(job_log_file)

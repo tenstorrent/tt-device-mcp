@@ -43,7 +43,7 @@ from tt_device_mcp.health.recovery import (
     offbus_power_cycle,
     pcie_guard,
 )
-from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC
+from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC, refuse_mesh_reset
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
@@ -1440,6 +1440,9 @@ class GalaxyRecovery(Recovery):
             log(f"back-to-back reset sweep NOT fired: {why}; holding — no host rung without the full ladder")
             health_event("host_reset_gated", context="reset_sweep", reason=why, trays=trays, host_at_risk=True)
             return False
+        # The operator's outage hold (spec 04 I28) refuses the whole sweep: its last step is the mesh reset.
+        if refuse_mesh_reset("reset_sweep", self.reset_argv([str(i) for i in range(expected)]), log):
+            return False
         # The caller ends it after its settle and verify (the host-hang latch, I25).
         pcie_guard.begin_offbus_reset("reset sweep", off_bus)
         complete = True
@@ -1581,7 +1584,7 @@ class GalaxyRecovery(Recovery):
         finally:
             pcie_guard.end_offbus_reset()
         if healthy and fabric_77_unverified and expected > 1 and self._fabric_ran_but_unverified(evidence):
-            # The caller is past an UNKNOWN reset whose I40 fallback refused (spec 04 I28): a 77 here is
+            # The caller is past an UNKNOWN reset whose I40 fallback refused (spec 04 I29): a 77 here is
             # the same no-verdict the reset already got, never a recovered fabric.
             log("the sweep's verify is still a fabric 77 — the fabric stays unverified, not recovered")
             health_event("host_rung_sweep_unverified", context=context or gate_phase, evidence=evidence)
@@ -1783,7 +1786,7 @@ class GalaxyRecovery(Recovery):
             # This episode's reset already came back UNKNOWN (enum+ARC healthy, the fabric a persistent
             # 77) and the I40 fallback still refused, so it escalated again. Another identical reset
             # measures nothing new — one Galaxy host ran eight of them, ten minutes apart, before the sweep
-            # finally ran. Go straight to the last-chance sweep, then the host climb (spec 04 I28).
+            # finally ran. Go straight to the last-chance sweep, then the host climb (spec 04 I29).
             await self._sweep_after_unverified_reset(expected, off_bus_before, hold_since, log)
             return True
         recovered = await self._reset_and_verify_device(indices, log)
@@ -1791,7 +1794,7 @@ class GalaxyRecovery(Recovery):
             # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, and its
             # passes already count toward the relift's bound (spec 03 I40), so the next relift gates on
             # the startup checks at once. A refused fallback that escalates again on this episode goes to
-            # the sweep, not another reset (spec 04 I28). Nothing measured a failure to climb on.
+            # the sweep, not another reset (spec 04 I29). Nothing measured a failure to climb on.
             return True
         if recovered:
             self.deps.clear_device_reported_fault("idle escalation: galaxy reset recovered the mesh")
@@ -1809,11 +1812,11 @@ class GalaxyRecovery(Recovery):
         """The bounded end of an off-bus hold the host reset gate refuses to reset (spec 04 I27).
 
         Returns None when it does not apply or hands back to the plain hold (the gate allows resets,
-        the ladder's safe rungs have not run yet this episode, or the command is unset or
-        rate-limited — those two page first), False while it holds (grace, a tenant, a reset in its
-        own scope, a stand-back; past the grace plus the blocked-page bound those page once), True
-        once the power cycle was requested. Only the idle relift and
-        the hold watchdog reach it, never the between-jobs gate, so it adds no time between jobs."""
+        the ladder's safe rungs have not run yet this episode, the command is unset, no
+        manual-recovery check is configured, or it is rate-limited — those page first), False while
+        it holds (grace, a tenant, a reset in its own scope, a stand-back; past the grace plus the
+        blocked-page bound those page once), True once the power cycle was requested. Only the idle
+        relift and the hold watchdog reach it, never the between-jobs gate, so it adds no time between jobs."""
         if off_bus <= 0 or not hold_since:
             return None
         allowed, why = pcie_guard.host_reset_gate(off_bus)
@@ -1830,6 +1833,20 @@ class GalaxyRecovery(Recovery):
                 f"{off_bus}/{expected} chip(s) off the bus and every reset is refused ({why}); "
                 f"TT_DEVICE_MCP_POWER_CYCLE_CMD is not set, so the hold stands until an operator "
                 f"power-cycles the host",
+                held_since=hold_since,
+                off_bus=off_bus,
+                expected=expected,
+            )
+            return None
+        if offbus_power_cycle.manual_recovery_argv() is None:
+            # No way to tell whether an operator is recovering the host: never read that as "no".
+            offbus_power_cycle.page_once(
+                "offbus_power_cycle_unguarded",
+                log,
+                f"{off_bus}/{expected} chip(s) off the bus and every reset is refused ({why}); "
+                f"TT_DEVICE_MCP_POWER_CYCLE_CMD is set but no manual-recovery check is "
+                f"(TT_DEVICE_MCP_MANUAL_RECOVERY_CMD unset or unparseable and none installed), so the "
+                f"power cycle never fires and the hold stands until an operator power-cycles the host",
                 held_since=hold_since,
                 off_bus=off_bus,
                 expected=expected,
@@ -1858,6 +1875,13 @@ class GalaxyRecovery(Recovery):
             log(f"off-bus hold past its grace: standing back from the power cycle — {standback}")
             offbus_power_cycle.note_standback(hold_since, standback)
             offbus_power_cycle.page_if_blocked(hold_since, age, log, standback, off_bus=off_bus)
+            return False
+        # The stand-back checks can take seconds each: a tenant or a reset that arrived meanwhile
+        # still holds the cycle.
+        if await asyncio.to_thread(self.mechanism.scope_active) or self._tenant_active(
+            await asyncio.to_thread(self.deps.enumerate_device_holders)
+        ):
+            log("off-bus hold: a tenant or a reset arrived during the stand-back checks — holding")
             return False
         state = offbus_power_cycle.load_state()
         now = offbus_power_cycle.now_epoch()
@@ -2142,7 +2166,7 @@ class GalaxyRecovery(Recovery):
 
     async def _sweep_after_unverified_reset(self, expected: int, off_bus_before: int, hold_since: str, log) -> None:
         """The next rung for a present-mesh episode whose reset came back UNKNOWN and whose I40 fallback
-        refused: the last-chance sweep once per episode, then the host climb (spec 04 I28).
+        refused: the last-chance sweep once per episode, then the host climb (spec 04 I29).
 
         The sweep runs here, not behind the host-rung permission: the climb asks the reboot ledger
         first, and on one Galaxy host its boot-loop guard kept the sweep waiting an hour. A sweep whose verify

@@ -12193,7 +12193,7 @@ async def test_an_idle_reset_whose_fabric_stays_77_does_not_climb_to_a_host_rung
 async def test_a_reset_that_leaves_the_fabric_unverified_counts_toward_the_relift_bound(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """Spec 04 I28: the UNKNOWN reset records its episode and counts its post-reset 77 passes toward the
+    """Spec 04 I29: the UNKNOWN reset records its episode and counts its post-reset 77 passes toward the
     I40 bound, so the next relift's 77 falls back to the startup checks at once."""
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
     srv._mark_device_dirty("job 007 ended: eth link down")
@@ -12223,7 +12223,7 @@ async def test_a_reset_that_leaves_the_fabric_unverified_counts_toward_the_relif
 
 
 def _arm_unverified_reset_episode(monkeypatch):
-    """A stuck present-mesh hold whose reset already came back UNKNOWN on this episode (spec 04 I28).
+    """A stuck present-mesh hold whose reset already came back UNKNOWN on this episode (spec 04 I29).
     Returns (counters, sweeps, climbs)."""
     counters = _arm_stuck_hold(monkeypatch, reset_result=None)
     monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", srv.device_hold_episode_since)
@@ -12244,7 +12244,7 @@ def _arm_unverified_reset_episode(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_second_escalation_after_an_unverified_reset_sweeps_instead_of_resetting(monkeypatch, clear_job_state):
-    """Spec 04 I28: the escalation after an UNKNOWN reset on the same episode fires no second identical
+    """Spec 04 I29: the escalation after an UNKNOWN reset on the same episode fires no second identical
     reset. It runs the last-chance sweep once, strict on a 77, then climbs with the sweep spent. Fails on
     base, which re-ran the galaxy reset every grace window (eight on one host) before ever sweeping."""
     counters, sweeps, climbs = _arm_unverified_reset_episode(monkeypatch)
@@ -12262,7 +12262,7 @@ async def test_a_second_escalation_after_an_unverified_reset_sweeps_instead_of_r
 
 @pytest.mark.asyncio
 async def test_an_incomplete_sweep_after_an_unverified_reset_does_not_climb(monkeypatch, clear_job_state):
-    """Spec 04 I28 with I22: a sweep that could not run in full (None) holds this pass and fires no host
+    """Spec 04 I29 with I22: a sweep that could not run in full (None) holds this pass and fires no host
     rung; the episode's next escalation tries the sweep again rather than climbing past it."""
     counters, sweeps, climbs = _arm_unverified_reset_episode(monkeypatch)
 
@@ -12281,7 +12281,7 @@ async def test_an_incomplete_sweep_after_an_unverified_reset_does_not_climb(monk
 async def test_a_sweep_verify_that_reads_77_is_not_a_release(
     monkeypatch, clear_job_state, fabric_77_unverified, expect
 ):
-    """Spec 04 I28: on the path after an UNKNOWN reset, the sweep's verify reading a 77 (enum+ARC fine,
+    """Spec 04 I29: on the path after an UNKNOWN reset, the sweep's verify reading a 77 (enum+ARC fine,
     fabric no verdict) is the same no-verdict, never a recovery, so the hold is not cleared. Other callers
     keep their verdict."""
     g = srv.galaxy_recovery
@@ -12363,7 +12363,7 @@ def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output=""
 async def test_the_deadline_escalation_holds_a_fabric_only_present_mesh_without_a_reset(
     monkeypatch, clear_job_state, why, detail, fabric_output, cause
 ):
-    """Spec 04 I29: past the ceiling, every chip present with a live ARC heartbeat and a hold that names
+    """Spec 04 I30: past the ceiling, every chip present with a live ARC heartbeat and a hold that names
     only the fabric (a 77 or a cabling mismatch) gets no galaxy reset and no ladder: it holds and pages
     once per episode. Fails on base, where the forced escalation ran tt-smi -glx_reset on a cabling
     mismatch, which took a chip off the bus and the ladder then re-powered its tray."""
@@ -12391,7 +12391,7 @@ async def test_the_deadline_escalation_holds_a_fabric_only_present_mesh_without_
 async def test_the_deadline_escalation_keeps_the_ladder_for_real_faults(
     monkeypatch, clear_job_state, beats, fault, fabric_ok, expect
 ):
-    """Spec 04 I29 does not switch recovery off: an off-bus chip, a dead ARC, a runtime-reported fault or
+    """Spec 04 I30 does not switch recovery off: an off-bus chip, a dead ARC, a runtime-reported fault or
     a measured-bad fabric still climbs the ladder on a fabric-unverified 77 hold."""
     escalations, alerts, _events = _arm_fabric_only_deadline_hold(
         monkeypatch,
@@ -13933,7 +13933,7 @@ async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch,
 
 @pytest.mark.asyncio
 async def test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset(monkeypatch, clear_job_state):
-    """03 I45 with 04 I29: a known fabric fault holds and pages at the ceiling even when an old pass
+    """03 I46 with 04 I30: a known fabric fault holds and pages at the ceiling even when an old pass
     measured the fabric bad, since every reset on it has ended in another 77 and another dead job."""
     escalations, alerts, events = _arm_fabric_only_deadline_hold(
         monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail="job 9: known fabric fault: 2 jobs in a row"
