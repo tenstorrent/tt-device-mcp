@@ -953,6 +953,9 @@ device_hold_escalate_bucket: int = 0
 # One early forced escalation per off-bus episode, tracked apart from the ceiling windows so it adds
 # an attempt rather than consuming one (see _offbus_hold_ceiling_sec).
 device_hold_offbus_escalated: bool = False
+# Whether a tenant job held past TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC already forced the recovery ladder
+# this episode (see _escalate_held_job_past_bound): once per episode, like the off-bus one-shot.
+device_hold_job_bound_escalated: bool = False
 # Which watchdog window spawned the forced escalation now in flight, in the words its log line
 # names: the off-bus one-shot or a ceiling window. Set by _check_hold_deadline right before each
 # spawn so the escalation reports the clock that actually fired rather than the general ceiling.
@@ -5429,6 +5432,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_deadline_bucket, device_hold_escalate_bucket
     global device_hold_offbus_escalated, device_hold_alert_next_bucket, device_hold_alert_gap
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
+    global device_hold_job_bound_escalated
     if reason and not device_hold_logged:
         device_hold_logged = True
         # Prefer a start this box already recorded: if the device was still held across a restart,
@@ -5509,6 +5513,8 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_escalate_bucket = 0
         # ...and its own early off-bus attempt.
         device_hold_offbus_escalated = False
+        # ...and its held-job bound's attempt.
+        device_hold_job_bound_escalated = False
         # A new episode gets its own single escalation and its own single per-tray BMC reset — the
         # spent latches reset with this ledger's own clock. Not derived from fsm opening a fresh
         # episode: this release can land before or after fsm's own clear, and a latch left set
@@ -6183,8 +6189,9 @@ async def _refuse_job_privsep_identity(job: "Job", job_log_file: Optional[Path],
 def _tenant_hold_enabled() -> bool:
     """Whether a degraded device HOLDS a tenant job (default) or FAILS it fast. Default ON:
     a queue must hold jobs while the device recovers, not bounce them back to the submitter.
-    The indefinite hold that requires is now bounded by the recovery ladder (forced escalation
-    past the hold ceiling), so the earlier default-OFF caveat no longer applies. Opt OUT with
+    The hold is bounded twice: the recovery ladder (forced escalation past the hold ceiling)
+    works the device, and TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC fails a job held past it, so the
+    earlier default-OFF caveat no longer applies. Opt OUT with
     TT_DEVICE_MCP_TENANT_HOLD=0 on a host that deliberately wants fail-fast instead."""
     return os.environ.get("TT_DEVICE_MCP_TENANT_HOLD", "1").strip() != "0"
 
@@ -6215,24 +6222,90 @@ def _hold_poll_sec_from_env(raw: Optional[str]) -> float:
 TENANT_HOLD_POLL_SEC = _hold_poll_sec_from_env(os.environ.get("TT_DEVICE_MCP_TENANT_HOLD_POLL_SEC"))
 
 
+def _tenant_hold_max_sec() -> float:
+    """TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC: how long a degraded device may hold a tenant job at the
+    door, counted from the start of the device's hold episode (or the job's own hold, if later
+    known). Past it the job is refused FAILED with the reason, and the hold escalates through the
+    forced recovery ladder (spec 01 I19). Default is the hold deadline (2x the escalation ceiling,
+    1200 s at the 600 s default): by then the forced ladder has fired (off-bus at 120 s, the
+    ceiling at 600 s) and had a full further window to climb, so a device still unfit is not
+    coming back on the submitter's clock, and the broker itself declares the hold stuck at the
+    same moment. Read per call. There is no "unbounded"
+    value: garbage, non-finite or non-positive reads as the default."""
+    raw = os.environ.get("TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC", "").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return float(_hold_deadline_sec())
+    return v if math.isfinite(v) and v > 0 else float(_hold_deadline_sec())
+
+
+def _escalate_held_job_past_bound(job: "Job", held_sec: float, bound: float, reason: str) -> str:
+    """A job held past its bound is not just dropped: the hold behind it escalates through the
+    existing forced recovery ladder (_maybe_spawn_forced_escalation, the same teeth the deadline
+    watchdog drives), once per episode and only if no forced run has happened in it yet — a further
+    forced run on top of one already spent would climb the ladder (warm reboot, BMC cycle) on a
+    short clock. Returns what was done, for the job's error and log. Never raises."""
+    global device_hold_job_bound_escalated, device_hold_escalation_trigger
+    try:
+        health_event(
+            "tenant_hold_bound_exceeded",
+            job_id=job.id,
+            owner=job.owner,
+            held_sec=int(held_sec),
+            bound_sec=int(bound),
+            reason=reason,
+        )
+        if device_hold_job_bound_escalated or device_hold_escalate_bucket >= 1 or device_hold_offbus_escalated:
+            return "recovery already escalated this episode; the hold watchdog keeps escalating"
+        if _forced_escalation_task is not None and not _forced_escalation_task.done():
+            return "a forced recovery escalation is already running"
+        if not _force_escalate_enabled():
+            return "forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0); the device stays held"
+        device_hold_escalation_trigger = f"the {int(bound)}s tenant-hold bound (job {job.id})"
+        if _maybe_spawn_forced_escalation():
+            device_hold_job_bound_escalated = True
+            return "forced recovery escalation started"
+        return "forced escalation deferred (a device op is in flight); the hold watchdog retries it"
+    except Exception as e:  # escalation bookkeeping must never keep the job held
+        if logger:
+            logger.error(f"CLEAN-GATE could not escalate the hold behind job {job.id}: {e}")
+        return "forced escalation could not start; the hold watchdog retries it"
+
+
+def _hold_clock_start(job_hold_started: datetime) -> datetime:
+    """Where a held job's bound counts from: the device's hold episode when it is older (a job
+    arriving into a long hold is not given a fresh bound), else the job's own hold start."""
+    if device_hold_episode_since:
+        try:
+            return min(job_hold_started, datetime.fromisoformat(device_hold_episode_since))
+        except ValueError:
+            pass
+    return job_hold_started
+
+
 async def _hold_job_until_device_fit(job: "Job", job_log_file: Optional[Path], reason: str) -> str:
     """Hold a tenant job at the door while the device is degraded, then let it dispatch the
     instant the device is fit. Returns '' when fit — the caller dispatches — or the still-
-    degraded reason when the hold was released by a cancel instead of by recovery (the caller
-    sees the job is now KILLED and terminalizes it).
+    degraded reason when the hold ended otherwise: released by a cancel (the caller sees the job
+    is now KILLED and terminalizes it) or past TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC (the reason
+    names the bound and the caller refuses the job FAILED).
 
     Each pass re-runs the tenant gate, so a device dirtied and then recovered self-heals here
     exactly as the next job's gate would. A passive predicate cannot: only the gate clears the
     dirty flag, and the parked runner never reaches its own gate, so the queue would freeze on
     hardware that is fine. The gate resets only a genuinely dirty device (8bab0a2 keeps it off
     a healthy enum+ARC mesh) and TENANT_HOLD_POLL_SEC governs the cadence, so a device that
-    will not come clean is retried, not stormed. No timeout by design — the bound is the device
-    becoming fit (or a human / the recovery ladder), never a clock, because dispatching a
-    tenant command onto a wedge is the outcome G2 forbids. Never raises."""
+    will not come clean is retried, not stormed. The bound never dispatches: past it the job
+    FAILS at the door (dispatching a tenant command onto a wedge is the outcome G2 forbids) and
+    the hold escalates through the forced recovery ladder (spec 01 I19). Never raises."""
+    bound = _tenant_hold_max_sec()
+    clock_start = _hold_clock_start(datetime.now())
     if logger:
         logger.warning(
             f"CLEAN-GATE holding job {job.id} — device degraded: {reason}. Queue "
-            f"HELD until the device is fit (no timeout); kill the job to release it."
+            f"HELD until the device is fit, at most {int(bound)}s into the hold "
+            f"(TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC); kill the job to release it."
         )
     if job_log_file:
         try:
@@ -6240,7 +6313,8 @@ async def _hold_job_until_device_fit(job: "Job", job_log_file: Optional[Path], r
                 f.write(
                     f"[HELD] device degraded — {reason}\n"
                     f"The broker is holding this job until the device is fit; it dispatches "
-                    f"automatically then. Kill it to give up the hold.\n"
+                    f"automatically then. Past {int(bound)}s of hold it fails instead. Kill it to "
+                    f"give up the hold.\n"
                 )
         except OSError as e:
             if logger:
@@ -6249,7 +6323,19 @@ async def _hold_job_until_device_fit(job: "Job", job_log_file: Optional[Path], r
         if job.status == JobStatus.KILLED:
             return reason  # released by a cancel, not by recovery — the device stays held
         _note_tenant_gate_verdict(reason)  # durable device_held (latched, idempotent)
-        await asyncio.sleep(TENANT_HOLD_POLL_SEC)
+        held = (datetime.now() - clock_start).total_seconds()
+        if held >= bound:
+            escalation = _escalate_held_job_past_bound(job, held, bound, reason)
+            if logger:
+                logger.error(
+                    f"CLEAN-GATE job {job.id} held {int(held)}s, past the {int(bound)}s tenant-hold "
+                    f"bound — refusing it, not dispatching onto the degraded device; {escalation}"
+                )
+            return (
+                f"held {int(held)}s, past the {int(bound)}s hold bound (TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC); "
+                f"{escalation} — {reason}"
+            )
+        await asyncio.sleep(min(TENANT_HOLD_POLL_SEC, max(0.0, bound - held)))
         await cleanup_finished_jobs()  # keep sweeping through a long hold
         # Re-run the gate, not just the passive predicate: it resets+verifies a dirty device,
         # so a recovered one lifts here instead of freezing on a flag the parked runner can
@@ -7650,10 +7736,10 @@ async def _job_runner_loop():
         # one held event and its recovery is one released event.
         _note_tenant_gate_verdict(blocked_reason)
 
-        # Env-gated (default OFF): HOLD a degraded device rather than failing the arriving
-        # job. Default OFF keeps fail-fast until a recovery ladder can bound the hold and the
-        # change is proven on live silicon. When on, a degraded device holds the queue and
-        # this job dispatches the instant the device is fit — the G2 hold, not a bounded retry.
+        # Env-gated (default ON, TT_DEVICE_MCP_TENANT_HOLD): HOLD a degraded device rather than
+        # failing the arriving job. A degraded device holds the queue and this job dispatches the
+        # instant the device is fit, or fails at the door past TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC
+        # with the hold escalated (spec 01 I19) — never dispatched onto the wedge.
         if blocked_reason and _tenant_hold_enabled():
             try:
                 blocked_reason = await _hold_job_until_device_fit(job, job_log_file, blocked_reason)

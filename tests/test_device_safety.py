@@ -4629,6 +4629,143 @@ async def test_hold_mode_holds_a_degraded_device_then_dispatches_when_fit(monkey
         await asyncio.gather(runner, return_exceptions=True)
 
 
+def _bounded_hold_state(monkeypatch, bound: str):
+    """A runner-level hold with a short TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC, a fresh episode, and the
+    forced escalation replaced by a recorder (no ladder runs in a unit test)."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    monkeypatch.setattr(srv, "get_activation_script", lambda *a, **k: ("", {}))
+    monkeypatch.setenv("TT_DEVICE_MCP_TENANT_HOLD", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC", bound)
+    monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "1")
+    monkeypatch.setattr(srv, "TENANT_HOLD_POLL_SEC", 0.02, raising=False)
+    monkeypatch.setattr(srv, "device_hold_logged", False)
+    monkeypatch.setattr(srv, "device_hold_episode_since", "")
+    monkeypatch.setattr(srv, "_hold_episode_restorable", False)
+    monkeypatch.setattr(srv, "device_hold_job_bound_escalated", False)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
+    monkeypatch.setattr(srv, "_forced_escalation_task", None)
+    spawns = []
+
+    def spawn():
+        spawns.append(srv.device_hold_escalation_trigger)
+        return True
+
+    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", spawn)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    return spawns, events
+
+
+@pytest.mark.asyncio
+async def test_held_job_fails_past_the_hold_bound_and_escalates(monkeypatch, tmp_path, clear_job_state):
+    """Spec 01 I19: the CLEAN-GATE hold is bounded. A job held past TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC
+    FAILS at the door with a reason naming the bound — never dispatched onto the degraded device —
+    and the hold behind it escalates through the forced recovery ladder, not just dropped. A second
+    job arriving into the same episode gets no fresh bound and fires no second escalation."""
+    spawns, events = _bounded_hold_state(monkeypatch, "0.3")
+    _chip(pci.SYSFS_CLASS_DIR, 0, 100)
+    _chip(pci.SYSFS_CLASS_DIR, 1, heartbeat.ALL_ONES)  # chip 1 off the bus -> degraded, never recovers
+
+    marker = tmp_path / "held_command_ran"
+    first = srv.Job(id="971", owner="tenant", workspace="/tmp", command=f"touch {marker}", queued_at="t")
+    second = srv.Job(id="972", owner="tenant", workspace="/tmp", command=f"touch {marker}", queued_at="t")
+    srv.jobs["971"], srv.jobs["972"] = first, second
+    await srv.get_job_queue().put("971")
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await asyncio.sleep(0.15)
+        assert first.status is srv.JobStatus.QUEUED, f"job failed before its bound: {first.status.value}"
+        for _ in range(200):
+            if first.status is not srv.JobStatus.QUEUED:
+                break
+            await asyncio.sleep(0.02)
+        assert (
+            first.status is srv.JobStatus.FAILED
+        ), f"job 971 is {first.status.value} past its 0.3s hold bound — the hold is still open-ended"
+        assert "hold bound" in first.error and "TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC" in first.error, first.error
+        assert "bus" in first.error.lower(), f"the refusal lost the degraded reason: {first.error!r}"
+        assert not marker.exists(), "a job past its hold bound ran its command onto the degraded device"
+        assert len(spawns) == 1 and "tenant-hold bound" in spawns[0], spawns
+        assert srv.device_hold_job_bound_escalated is True
+        exceeded = [f for k, f in events if k == "tenant_hold_bound_exceeded"]
+        assert exceeded and exceeded[0]["job_id"] == "971", events
+
+        # The same episode, already past the bound: the next job fails after its one gate pass.
+        await srv.get_job_queue().put("972")
+        for _ in range(100):
+            if second.status is not srv.JobStatus.QUEUED:
+                break
+            await asyncio.sleep(0.02)
+        assert second.status is srv.JobStatus.FAILED, second.status
+        assert "already escalated" in second.error, second.error
+        assert len(spawns) == 1, f"a second job re-forced the ladder in one episode: {spawns}"
+        assert not marker.exists()
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation(monkeypatch):
+    """The bound counts from the device's hold episode, not from each job's arrival, so a queue of
+    N jobs cannot stretch one outage to N bounds. A forced run this episode already spent (the
+    ceiling window or the off-bus one-shot) is not repeated on the job's clock — that would walk a
+    shared box up the ladder on a short timer — and a device that recovers in time dispatches."""
+    spawns, _events = _bounded_hold_state(monkeypatch, "600")
+    job = srv.Job(id="973", owner="tenant", workspace="/tmp", command="true", queued_at="t")
+
+    async def still_degraded(_job, _log):
+        return "chip 1 off the bus"
+
+    monkeypatch.setattr(srv, "_admission_verdict", still_degraded)
+    monkeypatch.setattr(srv, "_note_tenant_gate_verdict", lambda reason: None)
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(seconds=900)).isoformat())
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)  # a ceiling window already forced a run
+
+    out = await asyncio.wait_for(srv._hold_job_until_device_fit(job, None, "chip 1 off the bus"), 2)
+    assert "past the 600s hold bound" in out and "off the bus" in out, out
+    assert spawns == [], f"a spent forced run was repeated on the job's clock: {spawns}"
+    assert srv.device_hold_job_bound_escalated is False
+
+    # Kill switch off: the job still fails at the bound, and says why nothing escalated.
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
+    out = await asyncio.wait_for(srv._hold_job_until_device_fit(job, None, "chip 1 off the bus"), 2)
+    assert "FORCE_ESCALATE=0" in out and spawns == [], (out, spawns)
+
+    # Within the bound and recovered: no refusal, the job dispatches.
+    monkeypatch.setattr(srv, "device_hold_episode_since", datetime.now().isoformat())
+    verdicts = iter(["chip 1 off the bus", ""])
+
+    async def recovers(_job, _log):
+        return next(verdicts)
+
+    monkeypatch.setattr(srv, "_admission_verdict", recovers)
+    out = await asyncio.wait_for(srv._hold_job_until_device_fit(job, None, "chip 1 off the bus"), 2)
+    assert out == "", out
+
+
+def test_tenant_hold_max_sec_has_no_unbounded_value(monkeypatch):
+    """TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC defaults to the hold deadline (2x the escalation ceiling)
+    and tracks its override; no value — garbage, inf, nan, 0, negative — turns the bound off."""
+    monkeypatch.delenv("TT_DEVICE_MCP_HOLD_DEADLINE_SEC", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_STUCK_HOLD_SEC", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC", raising=False)
+    default = float(2 * srv._stuck_hold_ceiling_sec())
+    assert srv._tenant_hold_max_sec() == default == 1200.0
+    for raw in ("", "soon", "inf", "nan", "0", "-5"):
+        monkeypatch.setenv("TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC", raw)
+        assert srv._tenant_hold_max_sec() == default, raw
+    monkeypatch.setenv("TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC", "90")
+    assert srv._tenant_hold_max_sec() == 90.0
+    monkeypatch.delenv("TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC")
+    monkeypatch.setenv("TT_DEVICE_MCP_HOLD_DEADLINE_SEC", "3000")
+    assert srv._tenant_hold_max_sec() == 3000.0
+
+
 def test_hold_poll_sec_floors_values_that_would_defeat_the_governor():
     """TENANT_HOLD_POLL_SEC doubles as the reset governor, so a malformed env value must floor
     to a safe cadence, never disable it. inf/nan sleep forever and would hold a recovered

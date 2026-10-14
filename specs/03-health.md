@@ -165,7 +165,7 @@ job boundary.
   explicit healthy verdict; a 77 on retry or a failure holds. With it off, a fabric-unverified hold
   with any trace of a fault falls into the generic escalate category rather than standing forever.
 - **I23 — Every hold terminates.** The hold-deadline watchdog puts a stuck hold on the durable
-  timeline once per window; past the ceiling (`_stuck_hold_ceiling_sec`, default 1200s; off-bus
+  timeline once per window; past the ceiling (`_stuck_hold_ceiling_sec`, default 600s; off-bus
   holds get one early attempt at `_offbus_hold_ceiling_sec`, default 120s) a tenant-free hold is
   force-escalated through the gate's own gentlest-first ladder (spec 04). Both re-arm per episode.
   The windows count from the episode start, kept on disk so a restart while held cannot rewind
