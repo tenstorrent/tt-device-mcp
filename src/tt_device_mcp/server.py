@@ -5812,9 +5812,14 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # cannot give a pass its missing prerequisite, and the idle relift re-runs the pass instead.
     only_77 = _fabric_77_only_hold()
     # A gated off-bus hold (spec 04 I27) gets one forced pass the moment its grace runs out, so the
-    # bounded power cycle fires at the grace and not at the next ceiling window.
+    # bounded power cycle fires at the grace and not at the next ceiling window; so does a hold whose
+    # tray re-power the BMC's IPMI failed, at its hand-off bound.
     if not only_77 and offbus_power_cycle.due_for_watchdog(device_hold_episode_since, now):
-        device_hold_escalation_trigger = f"the {offbus_power_cycle.grace_sec()}s gated off-bus grace"
+        device_hold_escalation_trigger = (
+            f"the {offbus_power_cycle.ipmi_handoff_sec()}s BMC IPMI hand-off bound"
+            if offbus_power_cycle.ipmi_unavailable_age_sec(device_hold_episode_since, now) is not None
+            else f"the {offbus_power_cycle.grace_sec()}s gated off-bus grace"
+        )
         if _maybe_spawn_forced_escalation():
             offbus_power_cycle.mark_spawned(device_hold_episode_since)
     if only_77:

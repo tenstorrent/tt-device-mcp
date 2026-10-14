@@ -12,6 +12,13 @@ progress and no stand-back marker or command active, and at most once per
 unset, it pages instead and the hold stands as before; a cycle blocked
 ``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC`` (default 1800 s) past the grace pages too.
 
+The same bounded end applies when the gate allows resets but the BMC's IPMI failed a tray re-power
+(:class:`~tt_device_mcp.health.recovery.stages.ubb_tray.BmcIpmiError`): the tray rung, the mesh reset
+that re-powers trays through the same BMC and the cold rung's own ``ipmitool`` cannot work, so the
+hold would otherwise re-run them and stand. Once the ladder has run once in the episode, the command
+fires ``TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC`` (default 300 s) after the IPMI failure, with the
+same checks, stand-backs and rate limit.
+
 Every phase goes to the fsync'd health journal, and each attempt is written to a small state file in
 the health dir before the command runs, so a broker killed mid-cycle (the cycle itself) still counts
 the attempt against the rate limit.
@@ -39,15 +46,17 @@ MIN_INTERVAL_DEFAULT_SEC = 6 * 3600
 CHECK_TIMEOUT_DEFAULT_SEC = 10.0
 FIRE_TIMEOUT_DEFAULT_SEC = 120.0
 BLOCKED_PAGE_DEFAULT_SEC = 1800
+IPMI_HANDOFF_DEFAULT_SEC = 300
 # Where the installer stages deploy/tt-manual-recovery-check.sh; the manual-recovery check when
 # TT_DEVICE_MCP_MANUAL_RECOVERY_CMD is unset.
 MANUAL_RECOVERY_CHECK = "manual-recovery-check.sh"
 # Attempts kept in the state file: enough to read the rate limit, never a growing log.
 MAX_ATTEMPTS_KEPT = 8
 
-# In-memory, per broker process: the episode whose off-bus hold the gate is refusing, when its grace
-# ends, and whether the ladder's safe rungs have run in it. A restart starts empty: the next idle
-# pass re-arms it and the ladder runs its safe rungs once more, both harmless.
+# In-memory, per broker process: the episode whose off-bus hold the gate is refusing (or whose tray
+# re-power the BMC's IPMI failed, and when), and whether the ladder's safe rungs have run in it. A
+# restart starts empty: the next idle pass re-arms it and the ladder runs its safe rungs once more,
+# both harmless.
 _pending: dict = {}
 
 
@@ -63,6 +72,12 @@ def grace_sec() -> int:
     """Seconds an off-bus hold the gate refuses to reset stands before the power cycle may fire,
     counted from the start of the hold episode. A non-positive or malformed value reads as 300."""
     return _int_env("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", GRACE_DEFAULT_SEC)
+
+
+def ipmi_handoff_sec() -> int:
+    """Seconds after the BMC's IPMI failed a tray re-power before the hold may hand off to the power-cycle
+    command (the ladder must also have run once). A non-positive or malformed value reads as 300."""
+    return _int_env("TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC", IPMI_HANDOFF_DEFAULT_SEC)
 
 
 def min_interval_sec() -> int:
@@ -217,12 +232,47 @@ def episode_age_sec(episode: str, now: Optional[datetime] = None) -> Optional[fl
         return None
 
 
-def arm(episode: str) -> None:
-    """The gate refused to reset this episode's off-bus hold: start tracking it (idempotent)."""
+def _track(episode: str) -> None:
     if _pending.get("episode") != episode:
         _pending.clear()
         _pending.update(episode=episode, ladder_ran=False, paged=set(), journaled=set(), spawned=False)
+
+
+def arm(episode: str) -> None:
+    """The gate refused to reset this episode's off-bus hold: start tracking it (idempotent)."""
+    _track(episode)
+    if not _pending.get("gated"):
+        _pending["gated"] = True
         health_event("offbus_gated_hold", phase="grace", held_since=episode, grace_sec=grace_sec())
+
+
+def note_ipmi_unavailable(episode: str, detail: str, now: Optional[datetime] = None) -> None:
+    """The BMC's IPMI failed a tray re-power in this episode: start its hand-off clock (the first
+    failure counts; idempotent)."""
+    if not episode:
+        return
+    _track(episode)
+    if _pending.get("ipmi_at") is None:
+        _pending["ipmi_at"] = now or datetime.now()
+        _pending["ipmi_detail"] = detail[-200:]
+        health_event(
+            "offbus_gated_hold",
+            phase="ipmi_unavailable",
+            held_since=episode,
+            detail=_pending["ipmi_detail"],
+            handoff_sec=ipmi_handoff_sec(),
+        )
+
+
+def ipmi_unavailable_age_sec(episode: str, now: Optional[datetime] = None) -> Optional[float]:
+    """Seconds since the BMC's IPMI failed this episode's tray re-power, or None when it has not."""
+    if not episode or _pending.get("episode") != episode or _pending.get("ipmi_at") is None:
+        return None
+    return ((now or datetime.now()) - _pending["ipmi_at"]).total_seconds()
+
+
+def ipmi_detail(episode: str) -> str:
+    return _pending.get("ipmi_detail", "") if _pending.get("episode") == episode else ""
 
 
 def note_ladder_ran(episode: str) -> None:
@@ -235,15 +285,18 @@ def ladder_ran(episode: str) -> bool:
 
 
 def due_for_watchdog(episode: str, now: Optional[datetime] = None) -> bool:
-    """True once per episode, when an armed gated hold's grace has run out and the command is set:
-    the hold watchdog then forces one escalation pass so the cycle fires at the grace, not at the
-    next ceiling window."""
+    """True once per episode, when an armed gated hold's grace (or the IPMI hand-off bound) has run out
+    and the command is set: the hold watchdog then forces one escalation pass so the cycle fires at
+    the bound, not at the next ceiling window."""
     if not episode or _pending.get("episode") != episode or _pending.get("spawned"):
         return False
     if not _pending.get("ladder_ran") or power_cycle_argv() is None:
         return False
+    ipmi_age = ipmi_unavailable_age_sec(episode, now)
+    if ipmi_age is not None and ipmi_age >= ipmi_handoff_sec():
+        return True
     age = episode_age_sec(episode, now)
-    return age is not None and age >= grace_sec()
+    return bool(_pending.get("gated")) and age is not None and age >= grace_sec()
 
 
 def mark_spawned(episode: str) -> None:
@@ -280,10 +333,11 @@ def page_once(kind: str, log, message: str, **fields) -> None:
         paged.add(kind)
 
 
-def page_if_blocked(episode: str, age: float, log, why: str, **fields) -> None:
-    """Hold for ``why`` past the grace; once it has blocked the power cycle for
-    :func:`blocked_page_sec` more, page once: the hold ends in a cycle or a page, never silence."""
-    limit = grace_sec() + blocked_page_sec()
+def page_if_blocked(episode: str, age: float, log, why: str, *, bound: Optional[int] = None, **fields) -> None:
+    """Hold for ``why`` past the grace (or ``bound``, the clock ``age`` counts against); once it has
+    blocked the power cycle for :func:`blocked_page_sec` more, page once: the hold ends in a cycle or a
+    page, never silence."""
+    limit = (grace_sec() if bound is None else bound) + blocked_page_sec()
     if age >= limit:
         page_once(
             "offbus_power_cycle_blocked",
