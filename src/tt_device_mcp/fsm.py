@@ -178,6 +178,9 @@ class ServerFsm:
         self._latches: dict[str, bool] = {}
         # Whether _load restored an episode a previous boot wrote — see reopen_after_boot. One-shot.
         self._crossed_boot = False
+        # Whether _load read a file this same boot wrote: an earlier broker of this boot already
+        # started, so this start is a restart, not what the boot came up to — see boot_merge.
+        self._loaded_same_boot = False
         # Whether a persist failure has already been logged this process — see _persist. A broker
         # on a read-only or full state dir would otherwise downgrade to in-memory-only silently,
         # every single mutation, which is the exact durability this file exists to provide.
@@ -378,6 +381,7 @@ class ServerFsm:
             )
         # Known to be another boot: both ids read and differ. An unreadable id is not proof of a reboot.
         self._crossed_boot = bool(file_boot_id) and bool(self._boot_id) and not same_boot
+        self._loaded_same_boot = same_boot
         self._record = record
         self._latches = latches
 
@@ -613,7 +617,10 @@ class ServerFsm:
         ``attributed_boot`` — this boot's own auto-recovery ledger entry, if a broker-fired reboot
         or power cycle brought it up — is not part of the state decision (only the startup gate
         proves whether that escalation actually worked); it is folded into ``detail`` purely so the
-        FSM's own record names the boot's cause for anyone reading it later."""
+        FSM's own record names the boot's cause for anyone reading it later. Only on the boot's
+        first broker start: once a broker of this same boot has written the record, this start is a
+        restart (an autoupdate, a crash) the escalation did not cause, and naming it there stamps a
+        weeks-old power cycle onto every later restart's hold."""
         if open_episode is not None and open_episode.state in (ServerState.RECOVERING, ServerState.DOWN):
             self._record = FsmRecord(
                 state=open_episode.state,
@@ -626,7 +633,7 @@ class ServerFsm:
             metrics.state_entered(open_episode.state.value)
         else:
             self._open_episode(ServerState.RECOVERING, "startup_unverified")
-        if attributed_boot:
+        if attributed_boot and not self._loaded_same_boot:
             action = attributed_boot.get("action", "?")
             at = attributed_boot.get("at", "?")
             self._record.detail = (f"{self._record.detail} " if self._record.detail else "") + (

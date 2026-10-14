@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import errno
 import fcntl
+import functools
 import json
 import logging
 import math
@@ -9139,29 +9140,63 @@ def _open_startup_hold() -> Optional[dict]:
     return events[-1]
 
 
+def _startup_hold_lifted_at(hold_ts: float) -> Optional[dict]:
+    """The first journal row after ``hold_ts`` that proves the door reopened: a verified clear (the
+    FSM reached HEALTHY on a gate, relift or reset that passed the full check) or a tenant release.
+    A broker that lifted its startup hold this way but wrote no release row (it predates the release
+    hook, or died before writing it) left the hold open in the journal; this is when it really ended.
+    None when no such row exists — the hold may then have stood until the broker stopped."""
+    try:
+        rows = read_health_events(since_ts=hold_ts, kinds={"device_dirty_cleared", "device_released"})
+    except Exception:  # noqa: BLE001 - a missing journal reads as no release
+        return None
+    for row in rows:
+        if float(row.get("ts") or 0) <= hold_ts:
+            continue
+        if row.get("kind") == "device_dirty_cleared" and row.get("verified") is True:
+            return row
+        # "closed on broker start" is _close_orphaned_hold's bookkeeping, not a door that opened.
+        if row.get("kind") == "device_released" and row.get("why") != "closed on broker start":
+            return row
+    return None
+
+
 def _close_stale_startup_hold(hold: dict) -> None:
     """Release a startup hold whose episode did not survive the restart: this start opens a fresh
     one (with its own hold row), so the old row is closed first, the way ``_close_orphaned_hold``
-    closes a ``device_held``."""
+    closes a ``device_held``. ``held_s`` runs to the release the journal already shows when there is
+    one, not to this restart: a hold a gate lifted within a minute must not read as hours."""
     try:
-        held_s = max(0.0, time.time() - float(hold.get("ts") or 0))
+        hold_ts = float(hold.get("ts") or 0)
     except (TypeError, ValueError):
-        held_s = 0.0
+        hold_ts = 0.0
+    lifted = _startup_hold_lifted_at(hold_ts) if hold_ts else None
+    end = float(lifted["ts"]) if lifted else time.time()
+    held_s = max(0.0, end - hold_ts) if hold_ts else 0.0
+    if lifted:
+        detail = f"lifted at {lifted.get('iso', '?')} ({lifted.get('why') or lifted.get('kind')}); no release row was written"
+    else:
+        detail = "episode ended by a broker restart"
     health_event(
         "startup_fabric_released",
         prior_why="closed on broker start",
-        detail="episode ended by a broker restart",
+        detail=detail,
         held_s=round(held_s, 1),
     )
     if logger:
         logger.info(f"STARTUP closed a startup hold of {int(held_s)}s left open by the last broker")
 
 
-def _journal_startup_hold_released(closed: FsmRecord) -> None:
+def _journal_startup_hold_released(closed: FsmRecord, held_since: Optional[float] = None) -> None:
     """Close the ``startup_fabric_hold`` row: the door this broker start held is open again.
     ``prior_why`` is the last fault the episode carried — ``startup_unverified`` when the startup
-    verify itself passed, something else when the hold turned into a real fault first."""
-    held_s = _episode_elapsed_sec(closed.since)
+    verify itself passed, something else when the hold turned into a real fault first.
+    ``held_since`` is the hold row's own timestamp, so ``held_s`` is the hold's length whichever
+    path closed it, independent of the episode's ``since``."""
+    try:
+        held_s = max(0.0, time.time() - float(held_since)) if held_since else _episode_elapsed_sec(closed.since)
+    except (TypeError, ValueError):
+        held_s = _episode_elapsed_sec(closed.since)
     health_event("startup_fabric_released", prior_why=closed.why, detail=closed.detail, held_s=round(held_s, 1))
     if logger:
         logger.info(f"STARTUP hold released after {int(held_s)}s (last why: {closed.why})")
@@ -9342,13 +9377,14 @@ async def run_startup_tasks() -> None:
     #     already has its own rows and keeps its own why.
     try:
         if open_hold is not None and open_episode is not None:
-            fsm.on_next_close(_journal_startup_hold_released)
+            fsm.on_next_close(functools.partial(_journal_startup_hold_released, held_since=open_hold.get("ts")))
         else:
             if open_hold is not None:
                 _close_stale_startup_hold(open_hold)
             if fsm.state is ServerState.RECOVERING and fsm.record.why == "startup_unverified":
+                held_since = time.time()
                 health_event("startup_fabric_hold", why="broker start: awaiting the startup fabric verify")
-                fsm.on_next_close(_journal_startup_hold_released)
+                fsm.on_next_close(functools.partial(_journal_startup_hold_released, held_since=held_since))
     except Exception as e:  # noqa: BLE001 - bookkeeping must never block startup
         if logger:
             logger.error(f"STARTUP startup-hold journal failed: {e}")
