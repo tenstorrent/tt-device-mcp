@@ -790,3 +790,14 @@ async def test_a_77_only_hold_under_its_bound_still_just_holds(monkeypatch, tmp_
     await srv._attempt_idle_relift()
     assert rungs == []
     assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+async def test_a_known_fabric_fault_hold_is_outside_the_77_bound(monkeypatch, tmp_path, clear_job_state):
+    """03 I43: the fallback release is what kept handing jobs a fabric that killed them, so a known
+    fabric fault neither lifts on a healthy eth read nor climbs the ladder past the bound."""
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "known fabric fault: 2 jobs in a row")
+    await srv._attempt_idle_relift()
+    assert rungs == []
+    assert srv.fsm.state is ServerState.RECOVERING

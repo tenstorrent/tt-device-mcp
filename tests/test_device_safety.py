@@ -12110,9 +12110,7 @@ def _arm_unverified_reset_episode(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_second_escalation_after_an_unverified_reset_sweeps_instead_of_resetting(
-    monkeypatch, clear_job_state
-):
+async def test_a_second_escalation_after_an_unverified_reset_sweeps_instead_of_resetting(monkeypatch, clear_job_state):
     """Spec 04 I28: the escalation after an UNKNOWN reset on the same episode fires no second identical
     reset. It runs the last-chance sweep once, strict on a 77, then climbs with the sweep spent. Fails on
     base, which re-ran the galaxy reset every grace window (eight on one host) before ever sweeping."""
@@ -12189,7 +12187,9 @@ def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output=""
     monkeypatch.setattr(srv.health_monitor, "expected", lambda n: 32)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_output", fabric_output)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: beats if beats is not None else {str(i): 100 for i in range(32)})
+    monkeypatch.setattr(
+        srv, "read_heartbeats", lambda: beats if beats is not None else {str(i): 100 for i in range(32)}
+    )
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
     srv.device_hold_episode_since = (datetime.now() - timedelta(minutes=11)).isoformat()
@@ -12217,7 +12217,12 @@ def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output=""
             "",
             "topology mismatch",
         ),
-        (srv.FABRIC_RELIFT_WHY, "post-job: fabric unverified", "what(): Connection mismatch detected", "topology mismatch"),
+        (
+            srv.FABRIC_RELIFT_WHY,
+            "post-job: fabric unverified",
+            "what(): Connection mismatch detected",
+            "topology mismatch",
+        ),
         (srv.FABRIC_RELIFT_WHY, "post-job: fabric check COULD NOT RUN (77)", "", "fabric check could not run (77)"),
         ("gate_error", "topology mismatch: links differ from the cabling descriptor", "", "topology mismatch"),
     ],
@@ -13791,3 +13796,17 @@ async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch,
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset(monkeypatch, clear_job_state):
+    """03 I43 with 04 I29: a known fabric fault holds and pages at the ceiling even when an old pass
+    measured the fabric bad, since every reset on it has ended in another 77 and another dead job."""
+    escalations, alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail="job 9: known fabric fault: 2 jobs in a row"
+    )
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "known fabric fault: 2 jobs in a row")
+    await srv._force_escalate_stuck_hold()
+    assert escalations == []
+    assert [a["cause"] for a in alerts] == ["known fabric fault"]

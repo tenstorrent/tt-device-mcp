@@ -3278,6 +3278,9 @@ def _names_topology_mismatch(text: str) -> bool:
 
 
 def _topology_mismatch_hold(evidence: dict) -> bool:
+    # A known fabric fault (03 I43) is outside the I40 bound too: its release is what failed.
+    if health_monitor is not None and health_monitor.known_fabric_fault():
+        return True
     details = (str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or ""))
     return any(_names_topology_mismatch(d) for d in details)
 
@@ -3291,6 +3294,8 @@ def _fabric_no_reset_hold() -> str:
     read every chip present with a live ARC heartbeat, so a reset has nothing to fix in either case.
     A measured-bad fabric or a runtime-reported fault is not this: those keep the ladder."""
     fabric_hold = fsm.record.why == FABRIC_RELIFT_WHY
+    if fabric_hold and not device_fault_reported and health_monitor.known_fabric_fault():
+        return "known fabric fault"
     if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
         return "topology mismatch"
     if fabric_hold and _TOPOLOGY_VALIDATOR_LINE in (health_monitor.last_fabric_output or ""):
@@ -7761,12 +7766,17 @@ export {JOB_TAG_ENV}={job_tag}
                 # cleared on the word of checks that cannot see this fault at all.
                 # The first job after a topology-mismatch lift is the bound on that lift: one that
                 # dies on the fabric makes it a hardware fault, held without a reset (03 I42).
+                # Jobs that keep dying on the fabric's routing after passes that could not run are a
+                # known fabric fault: held, never the dirty-flag reset that only ends in another 77 (03 I43).
+                known = None
                 if health_monitor is not None:
-                    topo = health_monitor.note_job_after_topology_lift(
-                        job.status != JobStatus.COMPLETED, _read_job_log_tail(job_log_file)
-                    )
+                    tail = _read_job_log_tail(job_log_file)
+                    topo = health_monitor.note_job_after_topology_lift(job.status != JobStatus.COMPLETED, tail)
                     if topo:
                         _hold_device_fabric_unverified(f"job {job_id}: {topo}")
+                    known = health_monitor.note_job_fabric_route_fault(job.status != JobStatus.COMPLETED, tail)
+                    if known:
+                        _hold_device_fabric_unverified(f"job {job_id}: {known}")
                 fault = _scan_output_for_device_fault(job_log_file)
                 if fault:
                     _mark_device_reported_fault(f"job {job_id} {fault}", job=job)
@@ -7799,7 +7809,7 @@ export {JOB_TAG_ENV}={job_tag}
                             f"CLEAN-GATE job {job_id} was killed by device recovery; not "
                             f"flagging the device over a death we caused"
                         )
-                elif _is_wedge_risk_exit(job.status, job.exit_code):
+                elif not known and _is_wedge_risk_exit(job.status, job.exit_code):
                     _mark_device_dirty(
                         f"job {job_id} ended {job.status.value}"
                         + (f" (exit {job.exit_code})" if job.exit_code is not None else ""),
