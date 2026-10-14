@@ -556,7 +556,7 @@ pass, where a post-reset "no trained link" (77) is retried after an eth-training
 (`POST_RESET_FABRIC_RETRIES` / `_SLEEP_SEC`) and a 77 that persists is UNKNOWN — never a
 recovery (no hold is cleared onto a fabric no pass ever proved) and never a failed reset (no
 cooldown, no two strikes, no host-rung climb): it settles as a 77-only fabric-unverified hold that
-spec 03 I40 bounds. The bridge-reset rung
+spec 03 I41 bounds. The bridge-reset rung
 retries up to `BRIDGE_RESET_MAX_TRIES` with a settle (the first shot races link retrain), treats a
 structurally inapplicable chip (no bridge, no setpci) as fall-through rather than spin, tries a
 bare PCI rescan before anything heavier, and refuses a stale cached address whose target bus now

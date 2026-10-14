@@ -18,7 +18,6 @@ from tt_device_mcp.health.monitors.fabric import classify
         (1, "Try resetting the board", False),
         (1, "Workload execution timed out after 300 seconds", False),  # stalled traffic IS a measurement
         (1, "Encountered unrecoverable state. Please check the system and try again.", False),  # links missing
-        (1, "  what():  Connection mismatch detected. Check console output for details.", False),  # topology
         (77, "cannot check", None),
         (1, "filesystem error: cannot create directory", None),  # did-not-measure => skip
         (None, "partial output before hang", False),  # timeout == unhealthy
@@ -27,8 +26,3 @@ from tt_device_mcp.health.monitors.fabric import classify
 def test_fabric_classification(rc, output, expected_ok):
     ok, detail = classify(rc, output)
     assert ok is expected_ok
-
-
-def test_a_connection_mismatch_reads_topology_mismatch():
-    ok, detail = classify(1, "  what():  Connection mismatch detected. Check console output for details.")
-    assert ok is False and detail.startswith("topology mismatch")

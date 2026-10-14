@@ -681,7 +681,7 @@ def test_an_owed_pass_does_not_carry_to_another_episode(monkeypatch, tmp_path, c
     assert srv._idle_relift_armed() == (False, False, False)
 
 
-# --- I40: a 77-only hold is bounded, then the startup checks are the gate -----------------------
+# --- I41: a 77-only hold is bounded, then the startup checks are the gate -----------------------
 
 
 def _bound(monkeypatch, tmp_path, eth):
@@ -731,6 +731,34 @@ async def test_a_second_77_only_hold_inside_the_window_climbs_the_ladder(monkeyp
     monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", srv.time.monotonic())
     await srv._attempt_idle_relift()
     assert rungs == ["present"]
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hold_detail,fabric_detail",
+    [
+        ("gate/startup: fabric unverified (could not run)", "topology mismatch; traffic-only rerun unavailable"),
+        ("topology mismatch; traffic-only rerun not runnable: boom", "could not run (77)"),
+        (
+            "job 7: hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)",
+            "could not run (77)",
+        ),
+    ],
+)
+async def test_a_topology_mismatch_hold_is_outside_the_77_bound(
+    monkeypatch, tmp_path, clear_job_state, hold_detail, fabric_detail
+):
+    """No reset or fallback release can fix cabling: past the bound it neither lifts nor climbs."""
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    fsm_dirty(srv, hold_detail, why="fabric_unverified")
+
+    async def verify(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": fabric_detail}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    await srv._attempt_idle_relift()
+    assert rungs == []
     assert srv.fsm.state is ServerState.RECOVERING
 
 

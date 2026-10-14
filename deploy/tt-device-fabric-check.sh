@@ -156,12 +156,6 @@ elif grep -qE "Workload execution timed out after [0-9]+ seconds" "$RUNLOG"; the
     # about its fabric. Skipping it leaves the wedge riding on, exactly like the eth-core case.
     log "fabric UNHEALTHY (rc=$rc): traffic stalled until the validator's watchdog fired; no link reported back -> resettable"
     [ "$rc" -eq "$EXIT_CANNOT_CHECK" ] && rc=1
-elif grep -q "Connection mismatch detected" "$RUNLOG"; then
-    # The discovered links differ from the cabling descriptor (thrown before any traffic). A link went
-    # down while every chip still enumerates: measured, not could-not-check. Its own wording so the
-    # broker's journal tells it from a traffic failure.
-    log "fabric TOPOLOGY MISMATCH (rc=$rc): the discovered links differ from the cabling descriptor -> resettable"
-    [ "$rc" -eq "$EXIT_CANNOT_CHECK" ] && rc=1
 elif grep -q "Encountered unrecoverable state" "$RUNLOG"; then
     # Links the descriptor expects are still missing after the validator's own link retrains. Only
     # reachable with a descriptor set, and one is set only on a host it describes: a measured fault.
