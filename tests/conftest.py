@@ -47,6 +47,17 @@ srv.boot_broker()
 
 
 @pytest.fixture(autouse=True)
+def reset_post_reset_fabric_debt():
+    """Clear the process-wide post-reset fabric debt (spec 04 I32) around every test: a reset one
+    test drove must not hold a release in the next."""
+    from tt_device_mcp.health.post_reset import FABRIC_DEBT
+
+    FABRIC_DEBT.owed = ""
+    yield
+    FABRIC_DEBT.owed = ""
+
+
+@pytest.fixture(autouse=True)
 def isolate_process_globals():
     """Restore os.environ and sys.argv around every test.
 

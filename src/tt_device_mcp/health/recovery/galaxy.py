@@ -1138,6 +1138,7 @@ class GalaxyRecovery(Recovery):
             # Re-verify with the traffic pass: a chip back on the bus is not yet a mesh that moves
             # data across it.
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+            FABRIC_DEBT.note_evidence(evidence)
             if not healthy:
                 return OUTCOME_WAITING
             log("chip(s) recovered and the mesh verified — no galaxy reset needed")
@@ -1363,7 +1364,8 @@ class GalaxyRecovery(Recovery):
             beats = await asyncio.to_thread(self.deps.read_heartbeats)
             off = sorted(int(c) for c in _offbus_chip_ids(beats or {}, expected))
             if not off:
-                healthy, _ = await self._verify_device(expected, log, run_fabric=True, phase=phase)
+                healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=phase)
+                FABRIC_DEBT.note_evidence(evidence)
                 health_event("tray_down_prelude", rescan=rescan, off=0, healthy=healthy, capture=capture)
                 if healthy:
                     log("tray-down: every chip came back on the PCI rescan and the mesh verified — no reset needed")
@@ -1597,6 +1599,7 @@ class GalaxyRecovery(Recovery):
         try:
             await asyncio.sleep(settle)
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+            FABRIC_DEBT.note_evidence(evidence)
         finally:
             pcie_guard.end_offbus_reset()
         if healthy and fabric_77_unverified and expected > 1 and self._fabric_ran_but_unverified(evidence):
@@ -1673,6 +1676,7 @@ class GalaxyRecovery(Recovery):
         try:
             await asyncio.sleep(settle)
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+            FABRIC_DEBT.note_evidence(evidence)
         finally:
             pcie_guard.end_offbus_reset()
         if healthy:
@@ -2145,6 +2149,7 @@ class GalaxyRecovery(Recovery):
             and await self._recover_isolated_chips(log)
         ):
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True)
+            FABRIC_DEBT.note_evidence(evidence)
             if healthy:
                 self.deps.clear_device_reported_fault("idle off-bus escalation: bridge reset recovered the mesh")
                 self.deps.clear_device_dirty(

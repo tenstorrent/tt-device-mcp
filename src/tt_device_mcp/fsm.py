@@ -52,6 +52,7 @@ from tt_device_mcp.health import (
     _persistent_recovery,
     _select_recovery,
 )
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.telemetry import TelemetrySampler
 
 if TYPE_CHECKING:
@@ -309,10 +310,13 @@ class ServerFsm:
         set, so a ``_verify_device`` test fake that predates them keeps its signature."""
         r = recovery if recovery is not None else self.select_recovery()
         if run_eth:
-            return await r._verify_device(
+            healthy, evidence = await r._verify_device(
                 expected, log, run_fabric=run_fabric, phase=phase, run_eth=True, fabric_stale=fabric_stale
             )
-        return await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase)
+        else:
+            healthy, evidence = await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase)
+        FABRIC_DEBT.note_evidence(evidence)
+        return healthy, evidence
 
     # ---- durable load/persist -----------------------------------------------------------------
 

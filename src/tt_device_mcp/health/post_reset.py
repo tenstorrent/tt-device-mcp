@@ -21,6 +21,7 @@ followed no reset.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from tt_device_mcp.health.evidence import health_event
@@ -54,9 +55,15 @@ class FabricDebt:
 
     def blocks_release(self, expected: int) -> str:
         """The reset that still owes a fabric pass, or "" when a release may proceed."""
-        if not self.owed or expected <= 1 or fabric.build_command() is None:
+        if not self.owed or expected <= 1 or not _fabric_check_configured():
             return ""
         return self.owed
+
+
+def _fabric_check_configured() -> bool:
+    """Whether a fabric pass can run here at all: ``fabric.build_command`` is not None, read without
+    the cache directories that builds as a side effect."""
+    return bool(os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "").strip()) or fabric.validator_missing() is None
 
 
 FABRIC_DEBT = FabricDebt()

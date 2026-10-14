@@ -590,6 +590,7 @@ class Recovery(ABC):
                 "(enum+ARC healthy, no pass got a verdict): not recovered, and not a failed reset"
             )
             healthy = None
+        FABRIC_DEBT.note_evidence(evidence)
         return healthy, evidence, retries
 
     async def _reset_and_verify_device(self, indices: list, log) -> Optional[bool]:
