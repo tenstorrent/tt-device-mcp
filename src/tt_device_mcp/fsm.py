@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from tt_device_mcp import metrics, privileges
 from tt_device_mcp.health import (
+    FABRIC_DEBT,
     OUTCOME_RECOVERED,
     OUTCOME_TERMINAL,
     RESET_MODE_GALAXY,
@@ -312,10 +313,13 @@ class ServerFsm:
         set, so a ``_verify_device`` test fake that predates them keeps its signature."""
         r = recovery if recovery is not None else self.select_recovery()
         if run_eth:
-            return await r._verify_device(
+            healthy, evidence = await r._verify_device(
                 expected, log, run_fabric=run_fabric, phase=phase, run_eth=True, fabric_stale=fabric_stale
             )
-        return await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase)
+        else:
+            healthy, evidence = await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase)
+        FABRIC_DEBT.note_evidence(evidence)
+        return healthy, evidence
 
     # ---- durable load/persist -----------------------------------------------------------------
 
@@ -430,6 +434,14 @@ class ServerFsm:
     @property
     def state(self) -> ServerState:
         return self._record.state
+
+    @property
+    def restarted_this_boot(self) -> bool:
+        """Whether an earlier broker of this same boot already wrote the record: this start is a
+        restart (an autoupdate, a crash), not what the boot came up to. Anything that belongs to
+        the boot's arrival — the ledger escalation that caused it — is judged on the first start
+        only; see boot_merge and the startup probe's post-reboot verify."""
+        return self._loaded_same_boot
 
     @property
     def healthy(self) -> bool:
@@ -632,7 +644,7 @@ class ServerFsm:
             metrics.state_entered(open_episode.state.value)
         else:
             self._open_episode(ServerState.RECOVERING, "startup_unverified")
-        if attributed_boot and not self._loaded_same_boot:
+        if attributed_boot and not self.restarted_this_boot:
             action = attributed_boot.get("action", "?")
             at = attributed_boot.get("at", "?")
             self._record.detail = (f"{self._record.detail} " if self._record.detail else "") + (

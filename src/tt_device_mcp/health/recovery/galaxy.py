@@ -24,6 +24,7 @@ from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import dead_chips
 from tt_device_mcp.health.monitors.pci import chip_node_present, pci_bus_number
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
     BLOCKED,
     DEFER,
@@ -837,6 +838,7 @@ async def _rescan_after_tray_step(tray: int, log) -> None:
     not undo the dead-chip sampler's ``remove``, so without it an isolated chip could never verify back
     (the rescan :meth:`ResetMechanism.reset_with_quiesce` makes after every reset). A failed write is
     logged and the verify runs anyway."""
+    FABRIC_DEBT.note_reset(f"PCI rescan of tray {tray}")
     try:
         await asyncio.to_thread(_pci_rescan_tray, tray, log)
     except OSError as e:
@@ -1148,6 +1150,7 @@ class GalaxyRecovery(Recovery):
             # Re-verify with the traffic pass: a chip back on the bus is not yet a mesh that moves
             # data across it.
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+            FABRIC_DEBT.note_evidence(evidence)
             if not healthy:
                 return OUTCOME_WAITING
             log("chip(s) recovered and the mesh verified — no galaxy reset needed")
@@ -1351,6 +1354,7 @@ class GalaxyRecovery(Recovery):
             else:
                 td["rescanned"] = True
                 try:
+                    FABRIC_DEBT.note_reset("PCI rescan")
                     await asyncio.to_thread(_pci_rescan)
                     rescan = "ran"
                 except OSError as e:
@@ -1372,7 +1376,8 @@ class GalaxyRecovery(Recovery):
             beats = await asyncio.to_thread(self.deps.read_heartbeats)
             off = sorted(int(c) for c in _offbus_chip_ids(beats or {}, expected))
             if not off:
-                healthy, _ = await self._verify_device(expected, log, run_fabric=True, phase=phase)
+                healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=phase)
+                FABRIC_DEBT.note_evidence(evidence)
                 health_event("tray_down_prelude", rescan=rescan, off=0, healthy=healthy, capture=capture)
                 if healthy:
                     log("tray-down: every chip came back on the PCI rescan and the mesh verified — no reset needed")
@@ -1437,6 +1442,7 @@ class GalaxyRecovery(Recovery):
             quiesced = await set_pollers(False, log) if set_pollers else []
         except Exception as exc:  # noqa: BLE001 - best-effort, as for a mesh reset: never blocks recovery
             log(f"could not stop the device pollers before the tray re-power: {exc!r}")
+        FABRIC_DEBT.note_reset(f"tray re-power 0x{bitmap:02x}")
         try:
             return await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
         finally:
@@ -1605,6 +1611,7 @@ class GalaxyRecovery(Recovery):
         try:
             await asyncio.sleep(settle)
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+            FABRIC_DEBT.note_evidence(evidence)
         finally:
             pcie_guard.end_offbus_reset()
         if healthy and fabric_77_unverified and expected > 1 and self._fabric_ran_but_unverified(evidence):
@@ -1681,6 +1688,7 @@ class GalaxyRecovery(Recovery):
         try:
             await asyncio.sleep(settle)
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+            FABRIC_DEBT.note_evidence(evidence)
         finally:
             pcie_guard.end_offbus_reset()
         if healthy:
@@ -2153,6 +2161,7 @@ class GalaxyRecovery(Recovery):
             and await self._recover_isolated_chips(log)
         ):
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True)
+            FABRIC_DEBT.note_evidence(evidence)
             if healthy:
                 self.deps.clear_device_reported_fault("idle off-bus escalation: bridge reset recovered the mesh")
                 self.deps.clear_device_dirty(
@@ -2739,6 +2748,7 @@ class GalaxyRecovery(Recovery):
                     # The envelope (spec 04 I23) runs inside _fire_ubb_reset. The pollers are already
                     # stopped across the whole walk, so not _fire_tray_repower, which would restart them
                     # between trays.
+                    FABRIC_DEBT.note_reset(f"tray re-power 0x{bitmap:02x}")
                     plan = await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
                 except asyncio.CancelledError:
                     # Abandoned while the BMC pulse runs on in its thread: the tray may still be off the
