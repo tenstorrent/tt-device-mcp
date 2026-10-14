@@ -808,8 +808,11 @@ resolves per pass until a later snapshot succeeds.
 `run_startup_tasks()` then runs once, before the job runner: re-adopt running scopes, restore the
 queued backlog, self-test and arm the eth-heartbeat rung (I28), close any orphaned hold, then
 `fsm.boot_merge()` — always closed (I4), with this boot's auto-recovery ledger attribution folded
-into `detail` on the boot's first broker start only (I6) — followed by an async startup-health report (sysfs heartbeat only, records what
-came back after a reboot and marks dirty if degraded) and the forced startup gate
+into `detail` on the boot's first broker start only (I6; a later restart in the same boot was not
+caused by that escalation and carries no attribution) — followed by an async startup-health report (sysfs heartbeat only, records what
+came back after a reboot and marks dirty if degraded; on the boot's first broker start only, a
+degraded mesh after a broker-fired warm reboot goes on to the post-reboot verify, spec 04) and the
+forced startup gate on every start
 (`phase="startup"`, `force_fabric=True`), which queues behind re-adopted jobs and is the only
 thing that may lift the `startup_unverified` hold. A per-user daemon (`should_privsep()` false)
 skips all of this: it has no re-adopted privsep jobs to protect and no staged fabric validator to
@@ -1071,7 +1074,11 @@ refuses.
   a hold still open whose episode `boot_merge` carried over gets its release re-armed and no second
   hold row (whatever fault it has turned into); a hold still open under a fresh episode is closed
   first (`prior_why: closed on broker start`), then the fresh hold is written. A carried-over
-  fault episode with no open hold gets neither row.
+  fault episode with no open hold gets neither row. `held_s` is the hold's own length, measured
+  from its `startup_fabric_hold` row on every path that closes it. A stale hold closed on broker
+  start runs to the first row after it that shows the door reopened (a verified
+  `device_dirty_cleared`, or a `device_released` that is not this bookkeeping), and to the restart
+  only when the journal shows none.
 - **The fabric pass is billed to nobody.** It is both the authoritative check and the heaviest
   perturbation the broker aims at the mesh (a host was lost with one in flight), so it runs where
   it costs no submitter and no healthy silicon: post-job on failure (not after a fresh green
@@ -1091,7 +1098,7 @@ refuses.
 |---|---|
 | I2 | `tests/test_boot_platform.py::test_importing_the_server_never_touches_the_device` |
 | I3 | `tests/test_fsm.py::test_survives_restart`, `tests/test_fsm.py::test_dirty_survives_restart`, `tests/test_state_paths.py::test_fsm_survives_restart_at_the_per_user_default_health_dir` |
-| I4 | `tests/test_fsm.py::test_boot_with_no_open_episode_starts_closed`, `tests/test_fsm.py::test_boot_open_episode_is_adopted`, `tests/test_fsm.py::test_terminal_episode_survives_boot_merge`, `tests/test_fsm.py::test_boot_sentinel_is_not_an_open_episode`, `tests/test_readopt.py::test_a_per_user_daemon_start_runs_a_light_probe_and_a_pass_reads_healthy`, `tests/test_readopt.py::test_a_per_user_daemon_start_on_a_bad_device_stays_recovering`, `tests/test_readopt.py::test_a_per_user_daemon_start_beside_a_holder_stays_healthy`, `tests/test_readopt.py::test_a_failed_per_user_start_reopens_once_the_device_reads_healthy`, `tests/test_readopt.py::test_a_per_user_restart_keeps_a_loaded_open_episode`, `tests/test_readopt.py::test_a_per_user_restart_from_a_saved_healthy_state_probes_again`, `tests/test_readopt.py::test_a_per_user_start_probe_that_raises_holds_the_device`, `tests/test_readopt.py::test_the_privsep_broker_start_does_not_run_the_per_user_probe` |
+| I4 | `tests/test_fsm.py::test_boot_with_no_open_episode_starts_closed`, `tests/test_fsm.py::test_boot_open_episode_is_adopted`, `tests/test_fsm.py::test_terminal_episode_survives_boot_merge`, `tests/test_fsm.py::test_boot_sentinel_is_not_an_open_episode`, `tests/test_readopt.py::test_a_per_user_daemon_start_runs_a_light_probe_and_a_pass_reads_healthy`, `tests/test_readopt.py::test_a_per_user_daemon_start_on_a_bad_device_stays_recovering`, `tests/test_readopt.py::test_a_per_user_daemon_start_beside_a_holder_stays_healthy`, `tests/test_readopt.py::test_a_failed_per_user_start_reopens_once_the_device_reads_healthy`, `tests/test_readopt.py::test_a_per_user_restart_keeps_a_loaded_open_episode`, `tests/test_readopt.py::test_a_per_user_restart_from_a_saved_healthy_state_probes_again`, `tests/test_readopt.py::test_a_per_user_start_probe_that_raises_holds_the_device`, `tests/test_readopt.py::test_the_privsep_broker_start_does_not_run_the_per_user_probe`, `tests/test_fsm.py::test_boot_merge_attributes_the_escalation_only_on_the_boots_first_broker_start`, `tests/test_device_safety.py::test_a_restart_later_in_the_boot_does_not_blame_the_boots_power_cycle`, `tests/test_device_safety.py::test_a_stale_startup_hold_is_closed_with_the_time_it_was_really_held`, `tests/test_device_safety.py::test_a_stale_startup_hold_with_no_lift_in_the_journal_runs_to_the_restart`, `tests/test_device_safety.py::test_the_startup_release_measures_held_s_from_the_hold_row` |
 | I5 | `tests/test_fsm.py::test_an_unknown_why_on_disk_clamps_on_load` |
 | I6 | `tests/test_fsm.py::test_cross_boot_load_voids_job_but_keeps_device_facts`, `tests/test_fsm.py::test_a_dirty_mark_survives_a_cross_boot_load`, `tests/test_fsm.py::test_a_file_with_no_boot_id_is_treated_as_cross_boot`, `tests/test_fsm.py::test_same_boot_restart_keeps_job_and_dirty`, `tests/test_fsm.py::test_boot_merge_skips_attribution_on_a_plain_broker_restart`, `tests/test_fsm.py::test_boot_merge_attributes_when_the_previous_boot_is_unknown` |
 | I3/I5 robustness | `tests/test_fsm.py::test_a_wrong_shape_file_degrades_to_boot_not_a_crash`, `tests/test_fsm.py::test_malformed_field_types_degrade_to_boot_not_a_crash`, `tests/test_device_safety.py::test_a_non_dict_job_on_disk_never_poisons_the_gate` |

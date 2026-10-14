@@ -336,6 +336,33 @@ def test_boot_merge_attributes_when_the_previous_boot_is_unknown(tmp_path):
     assert "recorded at AT" in f.record.detail
 
 
+def test_boot_merge_attributes_the_escalation_only_on_the_boots_first_broker_start(tmp_path):
+    """The ledger names the escalation that brought THIS boot up, and stays adjacent to it for the
+    whole boot. A broker restarted later in that boot (an autoupdate, a crash) was not caused by
+    it: stamping it there labels every later hold with a weeks-old power cycle. Fails on base,
+    where every start of the boot re-attributes."""
+    path = tmp_path / "fsm.json"
+    escalation = {"action": "power-cycle", "at": "2026-09-16T05:21:11"}
+    first = ServerFsm(path, current_boot_id="boot-A")
+    first.boot_merge(open_episode=None, attributed_boot=escalation)
+    assert "boot attributed to a broker-fired power-cycle" in first.record.detail
+
+    again = ServerFsm(path, current_boot_id="boot-A")  # restart within the same boot
+    again.boot_merge(open_episode=None, attributed_boot=escalation)
+    assert "boot attributed" not in (again.record.detail or "")
+
+    carried = ServerFsm(path, current_boot_id="boot-A")  # a carried episode loses the stale clause too
+    carried.boot_merge(
+        open_episode=FsmRecord(state=ServerState.RECOVERING, why="eth_frozen", detail=first.record.detail),
+        attributed_boot=escalation,
+    )
+    assert "boot attributed" not in (carried.record.detail or "")
+
+    next_boot = ServerFsm(path, current_boot_id="boot-B")  # a new boot it brought up attributes again
+    next_boot.boot_merge(open_episode=None, attributed_boot={"action": "reboot", "at": "2026-10-13T20:30:00"})
+    assert "boot attributed to a broker-fired reboot" in next_boot.record.detail
+
+
 def test_on_next_close_fires_once_on_whichever_path_reaches_healthy(tmp_path):
     """A caller pairing an opening event with its close (the startup hold's release row) registers
     once and must hear about the close exactly once — not on a refreshed fault mid-episode, not

@@ -436,9 +436,13 @@ each rung fires only when the gentler one failed or cannot apply.
   lifts on its own (`offbus_reset_hold_expired`, naming why) once a health pass sees every expected
   chip on the bus and host-pci OK, or once every chip is on the bus and the latch is older than
   `TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC` (default 21600 s, one I27 interval; the gate checks that
-  ceiling whenever it is asked with no chip off the bus). It never lifts itself while a chip is off
-  the bus or sysfs cannot be read: that hold is the I27 power cycle's to end, and the boot after it
-  drops the latch. One it cannot remove keeps holding (`offbus_reset_hold_unremovable`, host at
+  ceiling whenever it is asked with no chip off the bus). While a chip is off the bus or sysfs cannot
+  be read it lifts only where `TT_DEVICE_MCP_POWER_CYCLE_CMD` is unset, at the same ceiling: there no
+  I27 power cycle would ever end the hold. That expiry pages once (`offbus_reset_hold_expired_off_bus`,
+  host at risk), and the gate, which then checks the ceiling on every ask, falls back to its configured
+  `TT_DEVICE_MCP_HOST_RESET_GATE` mode. Where a power cycle is configured the hold is the I27 power
+  cycle's to end, and the boot after it drops the latch. A held gate names both boots: the one the
+  reset ran in and the one the hold is on; so does the CLI's status line. One it cannot remove keeps holding (`offbus_reset_hold_unremovable`, host at
   risk). An operator may lift it sooner with `sudo <broker python> -m tt_device_mcp.health.recovery.pcie_guard
   --clear-hang-latch [--health-dir DIR]` (the logged hint names the broker's own python and health
   dir). Without `--health-dir` it clears the caller's health dir and the system broker's
@@ -773,7 +777,10 @@ and per-boot cap (I7, I9, I10); a denied opted-in rung journals `auto_recovery_d
 hold episode. `boot_from_broker_escalation` back-fills the boot that results; on coming back up
 from a broker-fired warm reboot, `_verify_post_reboot_recovery` compares what returned to what
 left and climbs a still-off-bus mesh to the power cycle (never a second warm reboot — the rung
-that just failed), or holds loudly naming the BMC command when the cold rung is not armed.
+that just failed), or holds loudly naming the BMC command when the cold rung is not armed. It runs
+on the boot's first broker start only (`fsm.restarted_this_boot` false): the ledger entry stays
+adjacent to the boot for its whole life, and a restart later in the same boot that finds a fresh
+degradation is not that reboot's verdict — it stays held for the forced startup gate and its ladder.
 Absence is never health: every blocked/exhausted path emits a loud actionable event
 (`ubb_reset_required`, `all-off-bus power-cycle required`,
 `reset_unrecoverable_power_cycle_required`) rather than a silent hold.
@@ -902,8 +909,8 @@ sees a silent fabric pass.
 | I23 mask before quiesce; a mask failure refuses; a failed quiesce still re-inits and restores | `tests/test_pcie_guard.py::test_the_envelope_masks_before_it_quiesces_and_refuses_when_it_cannot_mask`, `::test_a_quiesce_that_raises_still_re_inits_and_restores` |
 | I24 the flood is a rate; the flood window refuses even under `off`; a refused reset is not recorded | `tests/test_pcie_guard.py::test_a_steady_trickle_between_distant_looks_is_not_a_flood`, `::test_a_trickle_since_an_old_boot_is_not_a_flood`, `::test_the_flood_window_holds_automatic_resets_even_with_the_gate_off`, `::test_after_a_kept_masked_port_the_stuck_hold_mesh_reset_does_not_fire`, `::test_a_gated_mesh_reset_records_no_reset_and_arms_no_cooldown` |
 | I25 the clear command finds the system broker's latch; one it cannot remove is reported | `tests/test_pcie_guard.py::test_the_clear_command_finds_the_system_brokers_latch`, `::test_a_latch_that_cannot_be_removed_is_reported_not_called_absent` |
-| I25 the latch is scoped to its boot: a later boot ignores and drops it, and it never holds the I27 power cycle | `tests/test_pcie_guard.py::test_a_latch_holds_only_on_the_boot_it_was_written_in`, `tests/test_offbus_power_cycle.py::test_a_latch_never_blocks_a_rung_after_its_boot_nor_the_power_cycle_on_it` |
-| I25 the latch is bounded: it lifts with every chip on the bus and host-pci OK, or at its ceiling with every chip on the bus; never with a chip off or sysfs unreadable; one it cannot remove keeps holding | `tests/test_pcie_guard.py::test_the_latch_lifts_once_every_chip_is_back_and_host_pci_is_ok`, `::test_the_latch_never_lifts_while_a_chip_is_off_the_bus`, `::test_the_latch_lifts_at_its_ceiling_with_every_chip_on_the_bus`, `::test_the_latch_ceiling_defaults_and_rejects_nonsense`, `::test_a_latch_that_cannot_be_removed_keeps_holding`, `::test_the_between_jobs_check_lifts_the_latch_once_the_mesh_is_back` |
+| I25 the latch is scoped to its boot: a later boot ignores and drops it, and it never holds the I27 power cycle | `tests/test_pcie_guard.py::test_a_latch_holds_only_on_the_boot_it_was_written_in`, `::test_a_latch_from_an_ended_boot_never_gates_even_if_the_broker_never_restarted`, `tests/test_offbus_power_cycle.py::test_a_latch_never_blocks_a_rung_after_its_boot_nor_the_power_cycle_on_it` |
+| I25 the latch is bounded: it lifts with every chip on the bus and host-pci OK, or at its ceiling with every chip on the bus; with a chip off or sysfs unreadable only at its ceiling with no power cycle configured (paged once, the gate falls back to its mode); one it cannot remove keeps holding; the hold names both boots | `tests/test_pcie_guard.py::test_the_latch_lifts_once_every_chip_is_back_and_host_pci_is_ok`, `::test_the_latch_never_lifts_while_a_chip_is_off_the_bus`, `::test_with_no_power_cycle_a_latch_with_a_chip_off_lifts_at_its_ceiling`, `::test_with_no_power_cycle_the_gate_itself_lifts_a_latch_past_its_ceiling`, `::test_with_a_power_cycle_a_latch_with_a_chip_off_still_holds_past_its_ceiling`, `::test_the_hold_message_names_both_boots`, `::test_the_latch_lifts_at_its_ceiling_with_every_chip_on_the_bus`, `::test_the_latch_ceiling_defaults_and_rejects_nonsense`, `::test_a_latch_that_cannot_be_removed_keeps_holding`, `::test_the_between_jobs_check_lifts_the_latch_once_the_mesh_is_back` |
 | I17 a rung the process cannot execute reads OFF (reboot, power cycle, tray, bridge) | `tests/test_rung_privilege.py::test_a_non_root_daemon_has_no_reboot_rung`, `::test_a_host_without_systemd_has_no_reboot_rung`, `::test_an_unreachable_bmc_has_no_power_cycle_rung`, `::test_an_unreachable_bmc_has_no_tray_rung`, `::test_a_non_root_daemon_has_no_bridge_rung` |
 | I17 the inventory reads the tray rung OFF on a committed per-target host, naming the platform; unresolved or Galaxy keeps it | `tests/test_rung_privilege.py::test_a_per_target_host_has_no_tray_rung`, `::test_an_unresolved_platform_keeps_the_tray_rung`, `::test_a_galaxy_keeps_the_tray_rung` |
 | I17 privilege is a second conjunct, never a replacement for the opt-out | `tests/test_rung_privilege.py::test_the_opt_out_still_wins_where_the_privilege_exists` |
@@ -1008,6 +1015,7 @@ sees a silent fabric pass.
 | escalate() outcome mapping; unknown phase rejected | `tests/test_device_safety.py::test_escalate_waits_when_nothing_ran`, `tests/test_device_safety.py::test_escalate_recovers_on_a_present_mesh_reset`, `tests/test_device_safety.py::test_escalate_reports_terminal_when_a_present_mesh_reset_fails_and_climbs`, `tests/test_device_safety.py::test_escalate_does_not_report_recovered_when_the_mesh_was_never_degraded`, `tests/test_device_safety.py::test_escalate_rejects_an_unknown_phase` |
 | Forced ladder has teeth on every platform | `tests/test_device_safety.py::test_force_escalate_has_teeth_on_a_per_target_host`, `tests/test_device_safety.py::test_hold_past_ceiling_triggers_forced_escalation` |
 | Post-reboot verify: climbs to cold rung, never a second warm reboot | `tests/test_device_safety.py::test_post_reboot_all_off_bus_climbs_to_the_power_cycle`, `tests/test_device_safety.py::test_post_reboot_verify_never_repeats_the_warm_reboot`, `tests/test_device_safety.py::test_post_reboot_all_off_bus_holds_loudly_with_no_cold_rung_opted_in`, `tests/test_device_safety.py::test_boot_attribution_rejects_a_stale_escalation`, `tests/test_device_safety.py::test_an_escalation_fired_on_this_same_boot_is_not_attributed_to_it` |
+| Post-reboot verify runs on the boot's first broker start only, never on a same-boot restart | `tests/test_device_safety.py::test_post_reboot_verify_runs_on_the_boots_first_broker_start`, `tests/test_device_safety.py::test_a_restart_later_in_the_boot_does_not_rerun_the_post_reboot_verify` |
 | Reset tool contract: steps/attribution/no-devices/job stop | `tests/test_reset.py::test_reset_success_reports_steps_and_command`, `tests/test_reset.py::test_reset_failure_surfaces_returncode_and_output`, `tests/test_reset.py::test_explicit_reset_leaves_one_row_attributed_to_the_caller`, `tests/test_reset.py::test_reset_no_devices_does_not_call_tt_smi`, `tests/test_reset.py::test_a_reset_stops_the_running_job_gracefully`, `tests/test_reset.py::test_reset_device_quiesce_scope_routes_a_live_privsep_job` |
 | Rung inventory stated loudly at boot | `tests/test_rung_arming.py::test_a_rung_that_is_off_is_stated_loudly` |
 | Stage metrics: structural inapplicability is not "blocked" | `tests/test_metrics.py::test_ubb_tray_no_tray_on_this_platform_is_not_applicable_not_blocked`, `tests/test_metrics.py::test_bridge_reset_missing_pci_address_is_not_applicable_not_blocked` |
