@@ -2087,6 +2087,8 @@ def _reset_for_testing():
     device_hold_episode_reason = ""
     _hold_episode_restorable = True
     _hold_episode_tenant = False
+    if recovery_mechanism is not None:
+        recovery_mechanism.regressed_reset_since = None
     _fabric_77_streak_since = None
     _fabric_77_streak = 0
     _fabric_77_fallback_release_monotonic = 0.0
@@ -5229,7 +5231,24 @@ async def device_health_gate(
             return
 
         _log("device needs reset — " + "; ".join(reasons))
-        if await _fire(stage):
+        # This hold's galaxy reset already made the drop WORSE (spec 04 I31): firing it again repeats
+        # the action that regressed it (one Galaxy host went 4 -> 31 -> 32 off-bus across three). Skip
+        # it and go to the post-reset verdict below as if it had failed — the cold rung (whose sweep
+        # still runs the full ladder once, I22) or a loud page when none is opted in.
+        episode_regressed = (
+            stage == STAGE_SMI_RESET
+            and expected > 1
+            and ev.off_bus > 0
+            and recovery_mechanism.reset_regressed_in(device_hold_episode_since)
+        )
+        if episode_regressed:
+            _log(
+                f"{ev.off_bus}/{expected} chip(s) off the bus and this hold's galaxy reset already "
+                f"regressed the mesh — not repeating it; deciding the host rung instead"
+            )
+            health_event("galaxy_reset_skipped_regressed", phase=phase, off_bus=ev.off_bus)
+            metrics.stage_fired("smi_reset", "blocked")
+        elif await _fire(stage):
             return
 
         # Last rungs: the reset did not bring the mesh back. The host-level escalations — a warm
@@ -5259,6 +5278,7 @@ async def device_health_gate(
             reset_exit_nonzero=recovery_mechanism.last_reset_exit_nonzero,
             last_action=STAGE_SMI_RESET,
             last_action_recovered=False,
+            episode_reset_regressed=episode_regressed,
         )
         stage = galaxy_recovery.next_stage(ev)
         # A reset that made the mesh WORSE off the bus (the incident's 8->32 inversion), or that
@@ -5268,6 +5288,7 @@ async def device_health_gate(
         # that verdict, and it names the drop in the fail-closed event below.
         reset_regressed = expected > 1 and off_bus > off_bus_before and not reset_cycling
         if reset_regressed:
+            recovery_mechanism.note_reset_regressed(device_hold_episode_since)
             health_event(
                 "reset_regressed_offbus",
                 phase=phase,
@@ -5298,7 +5319,7 @@ async def device_health_gate(
                 _emit_all_off_bus_power_cycle_required(_log, off_bus, expected, context=f"gate/{phase}")
             else:
                 galaxy_recovery._emit_reset_unrecoverable_power_cycle_required(
-                    _log, off_bus, expected, regressed=reset_regressed, context=f"gate/{phase}"
+                    _log, off_bus, expected, regressed=reset_regressed or episode_regressed, context=f"gate/{phase}"
                 )
             metrics.stage_fired("power_cycle", "blocked")
         elif stage in (STAGE_HOST_REBOOT, STAGE_POWER_CYCLE):
@@ -5591,6 +5612,8 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         )
         _hold_row = None
         device_hold_episode_since = ""
+        if recovery_mechanism is not None:
+            recovery_mechanism.regressed_reset_since = None  # spec 04 I31: the next episode may reset again
         if galaxy_recovery is not None:
             galaxy_recovery.tray_down_episode_end()  # spec 04 I19: the next drop is a fresh onset
         _persist_hold_episode("")  # the device came back fit: the episode is over, on disk too

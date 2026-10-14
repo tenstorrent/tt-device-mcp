@@ -10340,6 +10340,149 @@ async def test_stuck_offbus_hold_hard_failed_reset_holds_loudly_never_reboots(mo
     assert "reset_regressed_offbus" not in events, "an unchanged off-bus count is not a regression"
 
 
+# --- spec 04 I31: a galaxy reset that regressed an off-bus mesh is not repeated in its hold episode -
+#
+# The incident: a Galaxy host's broker fired the mesh reset at three forced windows of one hold. Each
+# made the drop worse: 4 off-bus, then 31, then 32. The forced ladder bypasses the once-per-episode latch
+# and the cooldown, and nothing remembered the regression, so every window re-ran the same reset.
+
+
+def _arm_regressed_offbus_hold(monkeypatch, *, held_minutes_ago=21):
+    """An off-bus hold of 16/32 whose galaxy reset regresses it to 28/32 (floors 16), with the tray rung
+    and the last-chance sweep stubbed to count. Returns (counters, events)."""
+    events = []
+    counters = _arm_offbus_stuck_hold(
+        monkeypatch, off_bus=16, isolated=set(), reset_result=False, beats_after_reset={str(i): 100 for i in range(4)}
+    )  # 28 off-bus after the reset
+    srv.device_hold_episode_since = (datetime.now() - timedelta(minutes=held_minutes_ago)).isoformat()
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # galaxy + reboot floor = 16
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
+    counters["trays"] = counters["sweeps"] = 0
+
+    async def tray(*a, **k):
+        counters["trays"] += 1
+        return None
+
+    async def sweep(*a, **k):
+        counters["sweeps"] += 1
+        return False
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_attempt_ubb_tray_reset", tray)
+    monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", sweep)
+    return counters, events
+
+
+@pytest.mark.asyncio
+async def test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset(monkeypatch, clear_job_state):
+    """The next forced window after a regressing reset fires no reset rung: it pages for the cold rung and
+    holds. Fails on base, which fires the same galaxy reset again (resets == 2)."""
+    counters, events = _arm_regressed_offbus_hold(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    first = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert first is True and counters["resets"] == 1 and "reset_regressed_offbus" in events
+    events.clear()
+    second = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert second is True
+    assert counters["resets"] == 1, "a reset that regressed the mesh must not be repeated in its hold episode"
+    assert counters["sbr"] == 0 and counters["trays"] == 0, "no gentler reset rung re-runs either"
+    assert "galaxy_reset_skipped_regressed" in events
+    assert "reset_unrecoverable_power_cycle_required" in events, "with no power cycle opted in it pages"
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0 and counters["sweeps"] == 0
+
+
+@pytest.mark.asyncio
+async def test_forced_offbus_ladder_after_a_regression_sweeps_then_power_cycles_when_opted_in(
+    monkeypatch, clear_job_state
+):
+    """With the power cycle opted in, a latched episode skips the ladder's own reset and climbs to the
+    cold rung, still behind one last-chance sweep (the full ladder before any power cycle, I22)."""
+    counters, events = _arm_regressed_offbus_hold(monkeypatch)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(4)})  # 28 off-bus
+    srv.recovery_mechanism.note_reset_regressed(srv.device_hold_episode_since)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert ran is True and "galaxy_reset_skipped_regressed" in events
+    assert counters["resets"] == 0 and counters["sbr"] == 0 and counters["trays"] == 0
+    assert counters["sweeps"] == 1, "the last-chance sweep still runs once before the power cycle"
+    assert counters["power_cycles"] == 1 and counters["reboots"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_early_regression_is_latched_before_the_ceiling_deferral(monkeypatch, clear_job_state):
+    """A regression on an early forced pass (hold younger than the ceiling, so the host rung defers) is
+    still latched: the next pass does not reset again. Fails on base, which only looked for a
+    regression after the deferral returned."""
+    counters, events = _arm_regressed_offbus_hold(monkeypatch, held_minutes_ago=3)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["resets"] == 1
+    assert "reset_regressed_offbus" in events and "host_rung_deferred_until_ladder_end" in events
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["resets"] == 1, "an early regression must latch the episode too"
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_new_hold_episode_resets_again_after_a_regression(monkeypatch, clear_job_state):
+    """The latch is per hold episode: a regression recorded for an earlier episode does not stop this
+    one's galaxy reset, and releasing the device clears it."""
+    counters, events = _arm_regressed_offbus_hold(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    srv.recovery_mechanism.note_reset_regressed("2026-10-14T09:47:12")  # an older episode
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["resets"] == 1 and "galaxy_reset_skipped_regressed" not in events
+    # The release transition ends the episode and the latch with it.
+    srv.device_hold_logged = True
+    srv._note_tenant_gate_verdict("")
+    assert srv.recovery_mechanism.regressed_reset_since is None
+
+
+async def _gate_twice_after_a_regressing_reset(monkeypatch, tmp_path):
+    reboots = _reach_reboot_rung_with_regressing_reset(monkeypatch, tmp_path, off_before=20, off_after=28)
+    events, resets = [], {"n": 0}
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    reset = srv.galaxy_recovery._reset_and_verify_device
+
+    async def counting_reset(indices, log):
+        resets["n"] += 1
+        return await reset(indices, log)
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", counting_reset)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    assert resets["n"] == 1 and "reset_regressed_offbus" in events
+    latched = srv.recovery_mechanism.regressed_reset_since
+    events.clear()
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    assert resets["n"] == 1, "the gate must not repeat a galaxy reset that regressed the mesh"
+    assert "galaxy_reset_skipped_regressed" in events
+    assert "reset_unrecoverable_power_cycle_required" in events, "it pages for the cold rung instead"
+    assert reboots["n"] == 0
+    return latched
+
+
+@pytest.mark.asyncio
+async def test_gate_skips_a_repeat_galaxy_reset_after_a_regression(monkeypatch, tmp_path, clear_job_state):
+    """Inside an open hold episode the gate latches that episode and skips the next galaxy reset."""
+    monkeypatch.setattr(srv, "device_hold_episode_since", "2026-10-14T09:47:12")
+    srv.device_hold_logged = True
+    assert await _gate_twice_after_a_regressing_reset(monkeypatch, tmp_path) == "2026-10-14T09:47:12"
+
+
+@pytest.mark.asyncio
+async def test_gate_latches_a_regression_seen_before_any_hold(monkeypatch, tmp_path, clear_job_state):
+    """A gate's first reset regresses with no hold open yet: the latch covers the episode that pass
+    opens, so the following gate pass does not reset again either. A regression latched with no
+    episode at all covers whichever episode comes next."""
+    assert srv.device_hold_episode_since == ""
+    latched = await _gate_twice_after_a_regressing_reset(monkeypatch, tmp_path)
+    assert latched in ("*", srv.device_hold_episode_since) and srv.device_hold_episode_since
+    monkeypatch.setattr(srv.recovery_mechanism, "regressed_reset_since", None)
+    srv.recovery_mechanism.note_reset_regressed("")
+    assert srv.recovery_mechanism.reset_regressed_in("2026-10-14T09:47:12")
+
+
 # --- F13: the per-UBB tray rung (a tray-down named as the lightest sufficient recovery) ---
 
 
