@@ -89,6 +89,7 @@ from tt_device_mcp.health.recovery import (
     RecoveryDeps,
     _declared_reset_mode,
     _persistent_recovery,
+    offbus_power_cycle,
 )
 from tt_device_mcp.health.recovery import select_recovery as _select_recovery  # noqa: F401
 from tt_device_mcp.health.recovery.base import (
@@ -203,4 +204,7 @@ __all__ = [
     "gone_chip_bridge_reset_enabled",
     "_fire_power_cycle",
     "_run_pre_power_cycle_hook",
+    # the bounded off-bus hold (spec 04 I27): the gate's hold-deadline check asks it when the
+    # grace has run out and records the forced pass it spawned for that episode
+    "offbus_power_cycle",
 ]

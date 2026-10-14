@@ -542,6 +542,32 @@ def test_an_intent_from_this_boot_does_not_latch(sysfs):
     assert pcie_guard.offbus_reset_latched() is None
 
 
+def test_a_latch_holds_only_on_the_boot_it_was_written_in(sysfs, monkeypatch):
+    """The host-hang record is scoped to its boot: once the host boots again it never holds a rung,
+    and the broker drops it at start with an event; a latch that names no boot is no exception."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
+    _boot(sysfs, "boot-a")
+    pcie_guard.begin_offbus_reset("mesh reset", 1)
+    monkeypatch.setattr(pcie_guard, "_INTENT_OPEN", False)
+    _boot(sysfs, "boot-b")
+    assert pcie_guard.check_offbus_reset_latch(lambda m: None)["latched_on_boot"] == "boot-b"
+    assert pcie_guard.host_reset_gate(1)[0] is False, "held on the boot it was latched on"
+    _boot(sysfs, "boot-c")  # e.g. the bounded power cycle (I27) or an operator's
+    assert pcie_guard.offbus_reset_latched() is None
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_OFF and pcie_guard.host_reset_gate(1) == (True, "")
+    logs = []
+    assert pcie_guard.check_offbus_reset_latch(logs.append) is None
+    assert not (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).exists()
+    assert events[-1][0] == "offbus_reset_hold_expired" and events[-1][1]["latch"]["latched_on_boot"] == "boot-b"
+    assert any("expired" in m for m in logs)
+    (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).write_text('{"boot_id": "boot-a"}')
+    assert pcie_guard.offbus_reset_latched() is None, "a latch that names no boot is not this boot's"
+    _boot(sysfs, "")
+    assert pcie_guard.offbus_reset_latched() is not None, "with the boot id unreadable it cannot be shown stale"
+
+
 def test_the_latch_can_be_switched_off(sysfs, monkeypatch):
     _boot(sysfs, "boot-a")
     pcie_guard.begin_offbus_reset("tray re-power", 1)

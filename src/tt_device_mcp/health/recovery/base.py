@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from tt_device_mcp import aio, metrics, privileges
+from tt_device_mcp import aio, alert, metrics, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
@@ -65,7 +65,7 @@ AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
 POWER_CYCLE_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC", "1800"))
 
 # The host-level recovery rungs, ordered by severity. A warm reboot recovers most wedges; a
-# whole-bus wedge survives it and only the chassis power cycle clears it (measured on blx04).
+# whole-bus wedge survives it and only the chassis power cycle clears it (measured on box D).
 # The min-interval loop guard is therefore PER SEVERITY: a stronger rung may escalate past a
 # weaker one that just fired — a reboot that did not fix the mesh must not force an hour's wait
 # before the power cycle that will — but no rung may re-fire itself inside the interval (its own
@@ -86,6 +86,71 @@ _ACTION_TO_STAGE = {"reboot": "host_reboot", "power-cycle": "power_cycle"}
 BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC = int(
     os.environ.get("TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC", "900").strip() or "900"
 )
+
+# An outage hold turns every hardware rung off at once. Each alone is a normal per-host choice (an
+# unconfirmed BMC turns the tray rung off and the ladder still climbs through the mesh reset), but
+# all three off together say "touch nothing": the mesh reset is held too.
+OUTAGE_HOLD_VARS = ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE", "TT_DEVICE_MCP_AUTO_UBB_RESET")
+# The hold reason -> when its page went out (monotonic). A held mesh reset stays HELD until an operator
+# acts, so the page is the hold's only bound: while the hold stands it is sent again every
+# mesh_hold_repage_sec(), so a page that was missed or forgotten never leaves the device held in silence.
+_mesh_hold_paged: dict = {}
+MESH_HOLD_REPAGE_DEFAULT_SEC = 3600
+
+
+def mesh_hold_repage_sec() -> int:
+    """``TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC``: how long a standing mesh-reset hold waits before it pages
+    again (default 3600). ``0`` pages once per hold; nonsense reads as the default."""
+    try:
+        value = int(os.environ.get("TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC", "").strip())
+    except ValueError:
+        return MESH_HOLD_REPAGE_DEFAULT_SEC
+    return value if value >= 0 else MESH_HOLD_REPAGE_DEFAULT_SEC
+
+
+def mesh_reset_hold_reason() -> str:
+    """Why the operator forbids an AUTOMATIC mesh-wide reset (the gate's, the idle relift's, the
+    watchdog's or the last-chance sweep's ``tt-smi -glx_reset``), or "" when it may fire.
+
+    ``TT_DEVICE_MCP_AUTO_MESH_RESET=0`` holds it explicitly and ``=1`` arms it whatever else is set.
+    Unset, an outage hold (every :data:`OUTAGE_HOLD_VARS` set to 0) holds it: a mesh reset on a mesh
+    that is already off the bus is what starts an off-bus power-cycle loop. The operator's own reset
+    tool is never held."""
+    mesh = os.environ.get("TT_DEVICE_MCP_AUTO_MESH_RESET", "").strip()
+    if mesh == "0":
+        return "TT_DEVICE_MCP_AUTO_MESH_RESET=0"
+    if mesh == "1":
+        return ""
+    if all(os.environ.get(v, "").strip() == "0" for v in OUTAGE_HOLD_VARS):
+        return "outage hold (" + ", ".join(f"{v}=0" for v in OUTAGE_HOLD_VARS) + ")"
+    return ""
+
+
+def refuse_mesh_reset(context: str, argv: list, log, off_bus: int = 0) -> bool:
+    """True when :func:`mesh_reset_hold_reason` holds the mesh reset: logged, journaled and paged
+    once per hold, again every :func:`mesh_hold_repage_sec` while it stands and after a pass that
+    found no hold. A refused reset did not happen, so the caller holds exactly as for a gated one and
+    arms no cooldown or failed-reset flag. ``off_bus`` (chips off the bus this pass) is named in
+    the page: the case a mesh reset turns into an off-bus power-cycle loop."""
+    why = mesh_reset_hold_reason()
+    if not why:
+        _mesh_hold_paged.clear()
+        return False
+    held = f"{off_bus} chip(s) off the bus, " if off_bus > 0 else ""
+    message = (
+        f"automatic mesh reset NOT fired ({context}): {held}{why}; device HELD for an operator — "
+        f"lift the hold or set TT_DEVICE_MCP_AUTO_MESH_RESET=1 to re-arm it"
+    )
+    log(message)
+    health_event("mesh_reset_held", context=context, argv=argv, reason=why, off_bus=off_bus, host_at_risk=True)
+    metrics.stage_fired("smi_reset", "blocked")
+    paged_at = _mesh_hold_paged.get(why)
+    repage = mesh_hold_repage_sec()
+    if paged_at is None or (repage > 0 and time.monotonic() - paged_at >= repage):
+        event = {"kind": "mesh_reset_held", "context": context, "reason": why, "off_bus": off_bus, "message": message}
+        if alert.send_alert(event) is not None or alert.alert_argv() is None:
+            _mesh_hold_paged[why] = time.monotonic()
+    return True
 
 
 class RecoveryMechanism:
@@ -150,6 +215,12 @@ class RecoveryMechanism:
 
         self.last_reset_monotonic: float = 0.0
         self.last_reset_failed: bool = False
+        # The hold episode (its ``since``) whose reset already came back UNKNOWN — enum+ARC healthy, the
+        # fabric a persistent 77. A second identical reset on that episode measures nothing new, so the
+        # idle escalation goes to the last-chance sweep instead (spec 04 I29).
+        self.unverified_reset_since: Optional[str] = None
+        # The episode whose last-chance sweep that path already ran; the next escalation climbs.
+        self.unverified_sweep_since: Optional[str] = None
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a

@@ -18,7 +18,8 @@ getting there:
 * :func:`safe_tray_repower` — the full envelope around one per-tray BMC re-power, with a dry run.
 * The host-hang latch — :func:`begin_offbus_reset` writes an intent before an automatic reset with
   chips off the bus, and :func:`check_offbus_reset_latch` reads one left by an earlier boot as a
-  reset that hung the host, and holds every later off-bus reset until an operator clears it.
+  reset that hung the host, and holds every later off-bus reset on this boot until an operator
+  clears it or the host boots again.
 
 Everything reads and writes through :data:`SYS_ROOT` so tests run against a fake tree.
 """
@@ -566,18 +567,48 @@ def end_offbus_reset() -> None:
         (health_dir() / INTENT_FILE).unlink(missing_ok=True)
 
 
-def offbus_reset_latched() -> Optional[dict]:
-    """The latched host-hang record, or None when no hold is latched."""
+def _read_latch() -> Optional[dict]:
     try:
-        return json.loads((health_dir() / LATCH_FILE).read_text())
+        rec = json.loads((health_dir() / LATCH_FILE).read_text())
     except (OSError, ValueError):
         return None
+    return rec if isinstance(rec, dict) else {}
+
+
+def _latch_is_this_boots(rec: dict) -> bool:
+    """A latch holds only on the boot it was written in (``latched_on_boot``). One from an earlier
+    boot, or one that does not say, never holds a rung; with this boot's id unreadable it cannot be
+    shown stale, so it holds."""
+    current = _boot_id()
+    return not current or rec.get("latched_on_boot") == current
+
+
+def offbus_reset_latched() -> Optional[dict]:
+    """The latched host-hang record of this boot, or None when no hold is latched."""
+    rec = _read_latch()
+    return rec if rec is not None and _latch_is_this_boots(rec) else None
+
+
+def _expire_stale_latch(log: Callable[[str], None]) -> None:
+    """Broker start: drop a latch an earlier boot wrote. The host has booted since, so it no longer
+    describes this host, and left in place it would read as a hold an operator must clear."""
+    rec = _read_latch()
+    if rec is None or _latch_is_this_boots(rec):
+        return
+    try:
+        (health_dir() / LATCH_FILE).unlink(missing_ok=True)
+    except OSError as exc:
+        log(f"could not remove the host-hang hold of an earlier boot: {exc!r}; it is ignored")
+    log(f"the host-hang hold latched on boot {rec.get('latched_on_boot') or '(unknown)'} expired with that boot")
+    health_event("offbus_reset_hold_expired", latch=rec, boot_id=_boot_id())
 
 
 def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
     """At broker start: an intent left by another boot is an off-bus reset the host did not survive.
     Latch the gate to ``hold`` for off-bus resets, report it, and return the record. An intent from
-    this same boot (the broker restarted, the host did not) is dropped."""
+    this same boot (the broker restarted, the host did not) is dropped. A latch an earlier boot
+    wrote is dropped first: it is scoped to its own boot."""
+    _expire_stale_latch(log)
     path = health_dir() / INTENT_FILE
     try:
         intent = json.loads(path.read_text())
@@ -594,7 +625,7 @@ def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
     log(
         f"the {intent.get('kind')} that ran with {intent.get('off_bus')} chip(s) off the bus did not finish "
         f"before the host went down: automatic resets over off-bus chips are HELD until an operator runs "
-        f"`{clear_latch_cmd()}`"
+        f"`{clear_latch_cmd()}` or the host boots again"
     )
     health_event("offbus_reset_hold_latched", intent=intent, clear=clear_latch_cmd(), host_at_risk=True)
     return rec

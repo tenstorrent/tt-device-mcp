@@ -28,7 +28,8 @@ from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState
 from tt_device_mcp.health.monitors import eth, heartbeat, pci
-from tt_device_mcp.health.recovery import RecoveryDeps, pcie_guard
+from tt_device_mcp.health.recovery import RecoveryDeps, offbus_power_cycle, pcie_guard
+from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as recovery_galaxy
 from tt_device_mcp.server import (
     _ensure_async_primitives,
@@ -309,6 +310,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # The device-op flock defaults to /run/tt-device-broker/device-op.flock, the file the host's own
     # broker holds during its resets. A test that took it there would stall that broker's device op.
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_FLOCK", str(tmp_path_factory.mktemp("flock") / "device-op.flock"))
+    monkeypatch.setenv("TT_DEVICE_MCP_DISPATCH_HOLD", str(tmp_path_factory.mktemp("hold") / "dispatch-hold"))
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_SPOOL_DIR", str(tmp_path_factory.mktemp("spool") / "spool"))
     # The gate's history lives in module globals — whether a reset just failed, when the
     # fabric was last proved. A test that leaves those set silently changes what the NEXT
     # test's gate decides to do, which is a debugging session nobody wants.
@@ -332,6 +335,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv.health_monitor, "_glx_cache", None)
 
     monkeypatch.setattr(srv, "device_fault_reported", "", raising=False)
+    # Many tests assign srv.isolated_chips directly; a leaked chip makes a later hold not 77-only.
+    monkeypatch.setattr(srv, "isolated_chips", set())
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
     # Whether the last reset EXITED non-zero. Left set it would steer the NEXT test's gate
@@ -427,6 +432,9 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # make the real fire a loud tripwire so a test that DOES reach it fails rather than issuing real
     # reset ioctls / ipmitool. A test exercising the tray-reset path re-patches _fire_ubb_reset itself.
     monkeypatch.delenv("TT_DEVICE_MCP_AUTO_UBB_RESET", raising=False)
+    # The two pins above plus a test's own AUTO_UBB_RESET=0 would read as an operator outage hold and
+    # hold every mesh reset (spec 04 I28); arm it explicitly. A test of the hold deletes this.
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")
 
     def _no_reboot_in_tests():
         raise AssertionError("a test reached the real host reboot; _fire_host_reboot must be mocked")
@@ -439,6 +447,16 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
     # A regressed tray walk disables the rung for the rest of the process: every test starts armed.
     monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+
+    # The bounded off-bus hold (spec 04 I27) runs a host-supplied power-cycle command: unset here, a
+    # loud tripwire if reached anyway, and its per-process episode tracking starts empty per test.
+    monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
+
+    def _no_offbus_power_cycle_in_tests(*a, **k):
+        raise AssertionError("a test reached the real off-bus power cycle; fire_command must be mocked")
+
+    monkeypatch.setattr(offbus_power_cycle, "fire_command", _no_offbus_power_cycle_in_tests)
+    monkeypatch.setattr(offbus_power_cycle, "_pending", {})
 
     # The tray-down prelude (spec 04 I19) rescans the bus and reads the BMC: never the real sysfs
     # or ipmitool from the suite. Its reads answer "not run in tests", so every gate/ladder test
@@ -624,6 +642,7 @@ def health_deps():
         set_device_hold_episode_ubb_reset_fired=lambda v: srv.fsm.set_latch("ubb_reset_fired", v),
         clear_device_reported_fault=lambda why: srv._clear_device_reported_fault(why),
         clear_device_dirty=lambda **kw: srv._clear_device_dirty(**kw),
+        note_fabric_77_reset_passes=lambda n: srv._note_fabric_77_reset_passes(n),
         device_degraded=lambda: srv._recovery_degraded(),
         auto_power_cycle_host=lambda log, reason: srv._auto_power_cycle_host(log, reason),
         emit_all_off_bus_power_cycle_required=lambda log, off_bus, expected, context: (
@@ -710,11 +729,12 @@ def patch_health_event(monkeypatch, fn) -> None:
     ``from health.evidence import health_event`` binding — an import copies the reference, so
     patching one module's copy never touches another's. A test that wants to see (or silence) an
     event any of these bodies emits has to patch all three, and ``pcie_guard`` (the tray re-power
-    envelope and the tray rung's disable, which the walk reaches)."""
+    envelope and the tray rung's disable, which the walk reaches), and ``base`` (the outage hold)."""
     monkeypatch.setattr(srv, "health_event", fn)
     monkeypatch.setattr(recovery_pkg, "health_event", fn)
     monkeypatch.setattr(recovery_galaxy, "health_event", fn)
     monkeypatch.setattr(pcie_guard, "health_event", fn)
+    monkeypatch.setattr(recovery_base, "health_event", fn)
 
 
 def patch_recovery(monkeypatch, name: str, fn) -> None:

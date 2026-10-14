@@ -111,7 +111,8 @@ the queue and a running job outlive the broker process.
 - **I15** — Job admission is blocking, not advisory: no job is dispatched onto a device the
   admission gate reports degraded, nor while the gate errors instead of reaching a verdict
   (see Queueing and dispatch). By default the job is HELD at the door and re-gated on
-  `TENANT_HOLD_POLL_SEC` (60 s) until fit, with no clock bound (a kill releases the hold);
+  `TENANT_HOLD_POLL_SEC` (60 s) until fit, at most `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` (I19;
+  a kill releases the hold sooner);
   with `TT_DEVICE_MCP_TENANT_HOLD=0` it is refused at the door as FAILED with the reason in
   its log. Gate internals are spec 03. Before the gate, a job waits while a process
   outside the broker holds the device (`_wait_out_foreign_holder`): a holder with uid ≥
@@ -139,6 +140,39 @@ the queue and a running job outlive the broker process.
   reads as no leftover. Motivating incident: a reaped job's process stuck in state D with
   SIGKILL pending kept 192 device fds open for about an hour until a host reboot; in that time
   a reset ran over it and a new job was dispatched beside it.
+- **I17** — A job's output outlives the broker that spawned it. Its stdout and stderr go to
+  spool files in `job_spool_dir()` (outside the unit's RuntimeDirectory, which systemd removes
+  on every restart), never to pipes: a pipe's read end dies with the broker, and a job that kept
+  printing then failed (Python exits 120 when its last stdout flush hits the broken pipe). The
+  broker tails the spool into the job log and its bounded capture, records in a sidecar how far
+  it has copied, and frees what it has read (hole punch), so the spool stays near empty while a
+  broker runs. A re-adopted job's monitor resumes the copy from that offset, so its log carries
+  everything the job printed across the restart, once. A job's spool is removed when the job is
+  finalized; at startup, spools of jobs not re-adopted are removed. A spool that cannot be
+  created falls back to pipes (the old behaviour), never to a refused job. The streams end when
+  the job's process exits, not when every descendant has closed them; the survivor sweep (I4)
+  deals with descendants. The reader wakes on that exit, not on its next poll, so a short job
+  ends as promptly as it did on pipes.
+- **I18** — The runner starts no job while the autoupdate dispatch hold is held
+  (`dispatch_hold()`: a file naming a live pid, younger than `DISPATCH_HOLD_MAX_SEC`). The check
+  is the last step before the job flips RUNNING, so the updater's busy check cannot race a
+  dispatch into the restart it is about to make (spec 08 I18). A hold whose pid is gone, that
+  cannot be read, or that is older than the bound is ignored (and removed), so a dead or stuck
+  updater never wedges the queue. A job held there stays QUEUED with its persisted spec (I6).
+- **I19** — The I15 hold is bounded; no job is held open-ended. A job is held at most
+  `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` (default the hold deadline, 2× the escalation ceiling:
+  1200 s at the 600 s default), counted from the device's hold episode start, or from the job's
+  own hold if no older episode is open, so a queue of jobs cannot stretch one outage to a
+  bound per job. Past it the job is refused FAILED at the door, never dispatched onto the
+  degraded device, and its error and log name the bound, what was escalated and the degraded
+  reason. The hold is not just dropped: a `tenant_hold_bound_exceeded` event is written and,
+  if this episode has not yet had a forced run (ceiling window, off-bus one-shot or an earlier
+  bound), the forced recovery ladder of spec 03 I23 is started, once per episode. A run
+  already spent is not repeated on the job's clock, since that would climb the ladder (warm
+  reboot, power cycle) on a short timer. The deadline watchdog keeps escalating per window. No
+  value turns the bound off: garbage, non-finite or non-positive reads as the default. With
+  `TT_DEVICE_MCP_FORCE_ESCALATE=0` the job still fails at the bound and its error says nothing
+  was escalated.
 
 ## Interfaces
 
@@ -254,7 +288,8 @@ flowchart LR
   dispatch the job either. The job stays queued at the door and the predicate is retried after
   a short backoff (`ADMISSION_GATE_RETRY_SEC`: 1 s, then 2 s). After
   `ADMISSION_GATE_MAX_ERRORS` (3) errors in a row the job takes I15's degraded path (held by
-  default, its hold polls retried the same way; refused with `TT_DEVICE_MCP_TENANT_HOLD=0`), and
+  default and bounded by I19, its hold polls retried the same way; refused with
+  `TT_DEVICE_MCP_TENANT_HOLD=0`), and
   a device with no episode open gets a `gate_error` hold (an open episode keeps its own `why`).
   Spec 03's generic escalation lifts that hold, so a gate bug costs a held queue that recovery
   bounds, never an ungated dispatch. A job cancelled while the gate runs or retries is never
@@ -398,6 +433,8 @@ flowchart LR
 | I4 (survivor sweep) | `tests/test_job_reap.py`, `tests/test_device_safety.py::test_a_child_that_left_the_session_does_not_outlive_its_job`, `tests/test_device_safety.py::test_a_survivor_holding_the_device_is_logged_and_marks_it_dirty`, `tests/test_device_safety.py::test_a_survivor_known_not_to_hold_the_device_does_not_mark_it_dirty`, `tests/test_device_safety.py::test_a_shutdown_during_the_sweep_still_finishes_the_job` |
 | I5 | `tests/test_server.py::TestCleanDeviceGate::test_graceful_terminate_on_sigterm`, `tests/test_server.py::TestCleanDeviceGate::test_graceful_escalates_to_sigkill`, `tests/test_server.py::TestCleanDeviceGate::test_graceful_terminate_already_dead`, `tests/test_reset.py::test_terminate_job_signals_the_scope_for_a_privsep_job`, `tests/test_reset.py::test_terminate_job_falls_back_to_killpg_without_a_scope`, `tests/test_reset.py::test_a_live_privsep_kill_signals_the_scope_not_the_pgroup`, `tests/test_device_safety.py::test_a_broker_error_mid_job_walks_the_kill_ladder`, `tests/test_device_safety.py::test_a_hung_reap_runs_its_ladder_to_the_end` |
 | I6 | `tests/test_device_safety.py::test_a_queued_job_survives_the_broker_restarting_under_it`, `tests/test_device_safety.py::test_an_unreadable_queued_spec_is_set_aside_not_guessed_at`, `tests/test_device_safety.py::test_a_started_job_is_not_revived_by_a_restart`, `tests/test_device_safety.py::test_a_job_whose_spawn_raised_is_not_revived_by_a_restart`, `tests/test_device_safety.py::test_a_spec_whose_job_already_finished_is_set_aside_not_requeued`, `tests/test_device_safety.py::test_a_still_waiting_job_is_restored_beside_a_finished_one`, `tests/test_device_safety.py::test_a_refused_job_whose_spec_survived_is_not_revived_by_a_restart`, `tests/test_device_safety.py::test_a_spec_colliding_with_a_live_job_id_is_not_revived`, `tests/test_readopt.py::test_reconcile_readopts_running_scope`, `tests/test_readopt.py::test_reconcile_skips_already_tracked`, `tests/test_readopt.py::test_a_restored_queue_survives_when_main_already_started_the_runner` |
+| I17 | `tests/test_restart_drain.py::test_a_job_writes_its_output_to_a_spool_not_a_pipe`, `tests/test_restart_drain.py::test_a_readopted_job_keeps_printing_and_its_log_gets_every_line_once`, `tests/test_restart_drain.py::test_the_spool_frees_what_the_broker_has_copied`, `tests/test_restart_drain.py::test_an_unusable_spool_dir_falls_back_to_pipes`, `tests/test_restart_drain.py::test_startup_sweeps_spools_of_jobs_not_readopted`, `tests/test_restart_drain.py::test_a_spool_line_with_no_newline_is_still_bounded`, `tests/test_restart_drain.py::test_a_spool_reader_ends_as_the_job_exits_not_a_poll_later` |
+| I18 | `tests/test_restart_drain.py::test_no_job_dispatches_while_the_update_holds_dispatch`, `tests/test_restart_drain.py::test_a_dead_or_overdue_hold_is_ignored` |
 | I7 | `tests/test_readopt.py::test_readopted_deadline_counts_time_already_served`, `tests/test_readopt.py::test_readopted_job_past_its_deadline_is_terminated`, `tests/test_readopt.py::test_readopted_job_inside_its_deadline_is_left_alone`, `tests/test_readopt.py::test_job_from_log_recovers_the_deadline`, `tests/test_readopt.py::test_job_from_log_without_a_timeout_header_still_gets_a_deadline` |
 | I8 | `tests/test_readopt.py::test_readopted_job_recovers_its_real_exit_code`, `tests/test_readopt.py::test_readopted_job_that_passed_is_reported_as_passed`, `tests/test_readopt.py::test_readopted_job_with_no_exit_status_is_not_called_completed`, `tests/test_readopt.py::test_a_signalled_job_records_a_real_exit_status`, `tests/test_readopt.py::test_the_job_exit_dir_is_redirectable` |
 | I9 | `tests/test_server.py::test_next_job_id_is_3_digit_and_wraps`, `tests/test_server.py::test_next_job_id_skips_live_ids`, `tests/test_server.py::test_seed_job_counter_resumes_across_restart`, `tests/test_server.py::test_seed_job_counter_wraps_at_999`, `tests/test_server.py::test_a_restart_does_not_reissue_an_id_a_log_still_holds`, `tests/test_server.py::test_no_id_in_the_recent_window_is_ever_reissued`, `tests/test_recent_jobs.py::test_a_reserved_action_id_is_not_handed_to_another_job` |
@@ -407,6 +444,7 @@ flowchart LR
 | I14 | `tests/test_server.py::TestCleanDeviceGate::test_wedge_risk_truth_table`, `tests/test_device_safety.py::test_a_hung_job_is_treated_as_a_wedge_risk`, `tests/test_server.py::test_scan_output_detects_eth_core_fault`, `tests/test_server.py::test_scan_output_finds_signature_in_tail_of_large_log`, `tests/test_readopt.py::test_a_readopted_job_that_wedged_the_mesh_flags_the_device` |
 | I15 | `tests/test_device_safety.py::test_hold_mode_holds_a_degraded_device_then_dispatches_when_fit`, `tests/test_device_safety.py::test_hold_mode_self_heals_a_dirty_device_by_re_running_the_gate`, `tests/test_device_safety.py::test_exhausting_the_verify_budget_does_not_dispatch`, `tests/test_device_safety.py::test_tenant_gate_writes_one_held_and_one_released_per_episode`, `tests/test_device_safety.py::test_a_tenant_holder_blocks_dispatch`, `tests/test_device_safety.py::test_a_tenant_holder_holds_the_job_until_it_exits`, `tests/test_device_safety.py::test_broker_owned_holders_do_not_block_dispatch`, `tests/test_device_safety.py::test_an_incomplete_holder_scan_does_not_block_dispatch` |
 | I16 | `tests/test_reaped_leftover.py::test_the_leftover_is_named_and_the_event_fires_once_per_episode`, `tests/test_reaped_leftover.py::test_the_fence_lifts_and_the_release_event_fires_once_the_holder_is_gone`, `tests/test_reaped_leftover.py::test_dispatch_is_refused_even_when_the_leftover_descends_from_the_broker`, `tests/test_reaped_leftover.py::test_a_running_jobs_own_scope_is_not_a_leftover`, `tests/test_reaped_leftover.py::test_an_ordinary_holder_behaves_as_before`, `tests/test_reaped_leftover.py::test_a_swept_survivor_outside_a_scope_is_a_leftover_only_with_the_same_starttime`, `tests/test_reaped_leftover.py::test_a_survivor_record_is_dropped_once_a_complete_scan_no_longer_sees_it`, `tests/test_reaped_leftover.py::test_a_scan_error_never_fences_a_free_device`, `tests/test_reaped_leftover.py::test_a_leftover_without_pending_sigkill_is_named_but_not_called_unkillable`, `tests/test_reaped_leftover.py::test_the_health_gate_runs_no_probe_and_keeps_the_device_dirty` |
+| I19 | `tests/test_device_safety.py::test_held_job_fails_past_the_hold_bound_and_escalates`, `tests/test_device_safety.py::test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation`, `tests/test_device_safety.py::test_tenant_hold_max_sec_has_no_unbounded_value` |
 | B-Submission (burst cap) | `tests/test_device_safety.py::test_an_armed_burst_cap_refuses_one_owners_flood_but_not_another`, `tests/test_device_safety.py::test_the_default_off_burst_cap_admits_every_submit`, `tests/test_device_safety.py::test_job_burst_decision_prunes_the_window_and_gates_on_the_cap[2-60.0-recent2-110.0-False-50.0-expect_kept2]` |
 | B-Submission (owner derived from the peer uid and the surface) | `tests/test_device_safety.py::test_the_owner_comes_from_the_peer_uid_and_the_surface` |
 | B-Submission (blocking run) | `tests/test_server.py::test_a_blocking_job_run_reports_progress_through_the_mcp_layer` |

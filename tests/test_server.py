@@ -753,19 +753,19 @@ class TestCleanDeviceGate:
         assert "probing-link-27-25" in detail, "the last line must reach the gate's verdict"
 
     @pytest.mark.asyncio
-    async def test_a_timed_out_fabric_check_leaves_no_process_mapping_the_chips(self, monkeypatch):
+    async def test_a_timed_out_fabric_check_leaves_no_process_mapping_the_chips(self, monkeypatch, tmp_path):
         """The validator maps every chip's BARs. Orphaning it across a reset is how a host dies.
 
         The check is spawned via `bash -c` under setsid, so killing only the process leaves the
         validator itself alive, still holding the mesh we are about to reset.
         """
-        import os
+        import time
 
         import tt_device_mcp.server as srv
 
-        marker = "/tmp/blxfix_fabric_orphan_probe"
-        if os.path.exists(marker):
-            os.remove(marker)  # a prior run's marker would make this always-fail
+        # Per test, never a fixed /tmp path: suite runs in parallel worktrees shared one, and an
+        # orphan of a killed run touched it inside this test's window.
+        marker = tmp_path / "fabric_orphan_probe"
         # `&&`, not `;`: the timeout now stops the check with SIGINT (so a real validator unwinds and
         # releases the mesh), which would leave a `; touch` to still run. `&&` short-circuits on the
         # interrupted sleep's non-zero exit, so the marker appears only if the grandchild ran to
@@ -774,10 +774,25 @@ class TestCleanDeviceGate:
         ok, _ = await srv.health_monitor.verify_fabric_health(timeout_sec=2)
         assert ok is False
 
-        # The grandchild must be gone: _terminate_process_group signals the whole session.
-        await asyncio.sleep(0.3)
+        # The grandchild must be gone: _terminate_process_group signals the whole session. The
+        # marker alone would only show that 30 s from now, so check the echoed pid itself. Once
+        # orphaned it may linger as a zombie until init reaps it; that holds no device.
         assert srv.health_monitor.fabric_check_proc is None, "a stale handle survives the timeout"
-        assert not os.path.exists(marker)
+        pids = [int(w) for w in srv.health_monitor.last_fabric_output.split() if w.isdigit()]
+        assert pids, f"the check never started its grandchild: {srv.health_monitor.last_fabric_output!r}"
+
+        def running(pid):
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+            except OSError:
+                return False
+
+        deadline = time.monotonic() + 10
+        while running(pids[0]) and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert not running(pids[0]), "the validator's grandchild outlived the timeout"
+        assert not marker.exists()
 
     @pytest.mark.asyncio
     async def test_verify_fabric_health_fails_on_nonzero(self, monkeypatch):

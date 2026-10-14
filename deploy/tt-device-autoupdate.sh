@@ -20,8 +20,11 @@
 # So root fetches the public repo itself, into a root-owned clone: code that is about to be
 # installed as root has no business sitting anywhere else on the way in.
 #
-# Idle-gated: an update never interrupts an in-flight exec (re-adoption already
-# covers jobs across the restart).
+# Idle-gated: an update never interrupts an in-flight device op, and re-adoption covers a
+# running job across the restart. From its busy check through the restart the updater holds
+# dispatch (spec 08 I18): the broker starts no queued job while the hold names a live pid, so
+# a job queued behind one that just ended waits, persisted, for the new broker instead of being
+# dispatched into the restart.
 set -u
 
 [ -r /etc/default/tt-device-broker ] && . /etc/default/tt-device-broker
@@ -103,6 +106,17 @@ if systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttd
     exit 0
 fi
 
+# Dispatch hold (spec 08 I18, spec 01 I18). Taken before anything is counted, then a short
+# settle so a dispatch already past the broker's check shows up as a child. A deferring lap
+# drops it at once; an applying lap keeps it until `systemctl restart` returns (the trap drops
+# it on every exit, and systemd removes it with the RuntimeDirectory anyway).
+HOLD=/run/tt-device-broker/dispatch-hold
+if [ -d "${HOLD%/*}" ]; then
+    trap 'rm -f "$HOLD" 2>/dev/null || true' EXIT
+    echo "$$ $(date +%s)" > "$HOLD" 2>/dev/null || true
+    sleep "${TTDEV_HOLD_SETTLE_SEC:-2}"
+fi
+
 # Idle gate, OFF by default. A job runs in its own scope and is re-adopted across a restart
 # (tests/test_readopt.py), so a busy box is not a reason to hold an update back: waiting buys
 # no safety, only a host left stale on the fix it is waiting for. A host that does want an idle
@@ -118,7 +132,16 @@ for p in /proc/[0-9]*; do
         uu=$(stat -c %u "$p" 2>/dev/null); [ "${uu:-0}" -ge 1000 ] && holders=$((holders+1))
     fi
 done
-if { [ "$kids" -ne 0 ] || [ "$holders" -ne 0 ]; } && [ "$MAX_DEFER" -gt 0 ]; then
+# A re-adopted job is no child of this broker, and a queued job is about to be one: a job
+# scope still running and a persisted queued spec both count as busy.
+scopes="$(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-job-*' 2>/dev/null \
+    | grep -c 'ttdev-job-')"
+queued=0
+for q in "${TTDEV_LOG_DIR:-/var/log/tt-device-broker}"/queued/*.json; do
+    [ -e "$q" ] && queued=$((queued+1))
+done
+busy=$(( kids + holders + ${scopes:-0} + queued ))
+if [ "$busy" -ne 0 ] && [ "$MAX_DEFER" -gt 0 ]; then
     now="$(date +%s)"
     p_sha=""; p_since=""
     [ -f "$PENDING" ] && read -r p_sha p_since < "$PENDING" 2>/dev/null
@@ -128,12 +151,13 @@ if { [ "$kids" -ne 0 ] || [ "$holders" -ne 0 ]; } && [ "$MAX_DEFER" -gt 0 ]; the
     echo "$remote_sha $p_since" > "$PENDING"
     waited=$(( now - p_since ))
     if [ "$waited" -lt "$MAX_DEFER" ]; then
-        echo "autoupdate: deferring (busy: children=$kids holders=$holders; waited ${waited}s/${MAX_DEFER}s)" >&2
+        echo "autoupdate: deferring (busy: children=$kids holders=$holders scopes=${scopes:-0} queued=$queued; waited ${waited}s/${MAX_DEFER}s)" >&2
+        rm -f "$HOLD" 2>/dev/null || true
         exit 0
     fi
     echo "autoupdate: busy for ${waited}s (>= ${MAX_DEFER}s) -> applying anyway; re-adoption preserves the running job" >&2
-elif [ "$kids" -ne 0 ] || [ "$holders" -ne 0 ]; then
-    echo "autoupdate: busy (children=$kids holders=$holders); idle gate off -> applying, the running job is re-adopted" >&2
+elif [ "$busy" -ne 0 ]; then
+    echo "autoupdate: busy (children=$kids holders=$holders scopes=${scopes:-0} queued=$queued); idle gate off -> applying, the running job is re-adopted" >&2
 fi
 rm -f "$PENDING" 2>/dev/null || true
 
