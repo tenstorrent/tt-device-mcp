@@ -31,7 +31,7 @@ from tt_device_mcp.constants import (
 )
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
-from tt_device_mcp.health.evidence import health_dir, health_event
+from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
 
 # How much of a fabric run's output the action-log row keeps for a run that got no healthy verdict:
@@ -46,6 +46,23 @@ def _action_log_output(text: str) -> str:
         return text
     half = ACTION_LOG_OUTPUT_CHARS // 2
     return f"{text[:half]}\n[... {len(text) - 2 * half} chars cut ...]\n{text[-half:]}"
+
+
+# How much of a fabric run that reached no verdict (a 77) its incident bundle keeps: the tail, where
+# the validator's abort and the wrapper's verdict sit. The action-log row rotates with the jobs list;
+# the bundle rotates with the incidents (MAX_INCIDENTS), so the cause outlives the row.
+FABRIC_SKIP_OUTPUT_TAIL_BYTES = 64 * 1024
+# A no-verdict run with the same reason as the last one bundled this recently reuses that bundle:
+# the idle relift reruns a 77-only hold, and a bundle per rerun would rotate the bundles that explain
+# a reboot out of the bounded set.
+FABRIC_SKIP_INCIDENT_REUSE_SEC = 3600.0
+
+
+def _output_tail(text: str, max_bytes: int) -> str:
+    raw = text.encode("utf-8", "replace")
+    if len(raw) <= max_bytes:
+        return text
+    return f"[... {len(raw) - max_bytes} bytes cut ...]\n" + raw[-max_bytes:].decode("utf-8", "replace")
 
 
 ASIC_BUS_FILE = "fabric_ok_asic_bus.json"
@@ -240,6 +257,8 @@ class HealthMonitor:
         # A skip (None) never overwrites it: not knowing is not the same as knowing it is fit.
         self.last_fabric_ok: Optional[bool] = None
         self.last_fabric_output: str = ""
+        # (reason, monotonic, bundle path) of the last no-verdict fabric run kept in an incident bundle.
+        self._fabric_skip_incident: Optional[tuple[str, float, str]] = None
         # A topology mismatch (the discovered links are not the descriptor's) passed on a
         # traffic-only rerun: the first job after it is watched, because the links that pass
         # skipped are the ones a mesh-wide workload routes over (see note_job_after_topology_lift).
@@ -928,11 +947,35 @@ class HealthMonitor:
                 # The rerun could not measure: the bounded fallback (I40) judges the eth read, so it
                 # needs the mark for this mesh, not the descriptor's (I45).
                 self._arm_eth_rebaseline()
-            return None, f"fabric check COULD NOT RUN ({dt:.0f}s): {reason[:400]}"
+            # The run's output is the only record of why it could not check: keep its tail and exit
+            # code where a rerun is not needed to read them, and name the bundle in the detail.
+            bundle = await self._keep_skip_output(rc, text, reason, cmd) if rc is not None else None
+            kept = f"; exit {rc}, output in {bundle}/fabric.log" if bundle else ""
+            return None, f"fabric check COULD NOT RUN ({dt:.0f}s{kept}): {reason[:400]}"
         self.last_fabric_ok = False
         if rc is None:
             return False, f"fabric check timed out after {timeout_sec:.0f}s; last line: {last}"
         return False, f"fabric check exited {rc} ({dt:.0f}s): {reason[:400]}"
+
+    async def _keep_skip_output(self, rc: int, text: str, reason: str, cmd: str) -> Optional[str]:
+        """Freeze a no-verdict fabric run's exit code and output tail (``FABRIC_SKIP_OUTPUT_TAIL_BYTES``)
+        in an incident bundle; return its path, or ``None`` when it could not be written. A run with
+        the reason of the last bundle written within ``FABRIC_SKIP_INCIDENT_REUSE_SEC`` reuses it."""
+        now = time.monotonic()
+        last = self._fabric_skip_incident
+        if last and last[0] == reason and now - last[1] < FABRIC_SKIP_INCIDENT_REUSE_SEC and os.path.isdir(last[2]):
+            return last[2]
+        nbytes = len(text.encode("utf-8", "replace"))
+        bundle = await asyncio.to_thread(
+            capture_incident,
+            "fabric_cannot_check",
+            fabric_output=_output_tail(text, FABRIC_SKIP_OUTPUT_TAIL_BYTES) or "(no output)",
+            evidence={"rc": rc, "reason": reason[:400], "cmd": cmd[:400], "output_bytes": nbytes},
+        )
+        if bundle is None:
+            return None
+        self._fabric_skip_incident = (reason, now, str(bundle))
+        return str(bundle)
 
     async def _fabric_traffic_only_rerun(
         self,
