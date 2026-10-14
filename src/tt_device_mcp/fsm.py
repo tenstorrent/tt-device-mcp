@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from tt_device_mcp import metrics, privileges
 from tt_device_mcp.health import (
+    FABRIC_DEBT,
     OUTCOME_RECOVERED,
     OUTCOME_TERMINAL,
     RESET_MODE_GALAXY,
@@ -312,10 +313,13 @@ class ServerFsm:
         set, so a ``_verify_device`` test fake that predates them keeps its signature."""
         r = recovery if recovery is not None else self.select_recovery()
         if run_eth:
-            return await r._verify_device(
+            healthy, evidence = await r._verify_device(
                 expected, log, run_fabric=run_fabric, phase=phase, run_eth=True, fabric_stale=fabric_stale
             )
-        return await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase)
+        else:
+            healthy, evidence = await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase)
+        FABRIC_DEBT.note_evidence(evidence)
+        return healthy, evidence
 
     # ---- durable load/persist -----------------------------------------------------------------
 

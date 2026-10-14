@@ -90,6 +90,7 @@ from tt_device_mcp.health import (
     BLOCKED,
     CEILING,
     DEFER,
+    FABRIC_DEBT,
     HOLD_ESCALATION_REARM_SEC,
     HOLD_FABRIC_UNVERIFIED,
     OUTCOME_RECOVERED,
@@ -2911,14 +2912,33 @@ def _journal_fsm_transition(why: str, *, verified: bool) -> None:
         )
 
 
-def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> None:
+def _post_reset_debt() -> str:
+    """The reset that has had no passing fabric pass since (spec 04 I32), or "" when none blocks a
+    release: nothing owed, a single chip, or no fabric check on this host."""
+    if not FABRIC_DEBT.owed or health_monitor is None:
+        return ""
+    return FABRIC_DEBT.blocks_release(health_monitor.expected(len(_present_chip_indices())))
+
+
+def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> bool:
     """Mark the device clean, and record the transition on the durable health timeline.
 
     Dropping the flag ends the RESETTING, not the doubt. Where there was something to
     doubt and nothing proved it wrong, the device stays unfit for a tenant: the two are
     separate states, and collapsing them is what let a job onto a mesh whose fabric no
     pass had ever cleared. The doubt lifts when a later gate verifies, not by elapsed time.
+
+    Every verified release funnels through here, so this is where no reset may release a mesh no
+    fabric pass has passed on since (spec 04 I32): with that debt open, the device is held
+    fabric-unverified instead, and the fabric relift or the bounded escalation settles it. Returns
+    whether the device was released (always True for an unverified clear).
     """
+    if verified:
+        owed = _post_reset_debt()
+        if owed:
+            health_event("post_reset_release_refused", why=why, reset=owed)
+            _hold_device_fabric_unverified(f"{why}; reset ({owed}) has had no passing fabric pass since")
+            return False
     was_degraded = fsm.state is not ServerState.HEALTHY
     _journal_fsm_transition(why, verified=verified)
     if verified:
@@ -2932,6 +2952,7 @@ def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> N
         # know a new fault class calls _hold_device_unverified/_hold_device_fabric_unverified
         # instead, which set it directly.
         fsm.on_fault(fsm.record.why, detail=why, dirty=False)
+    return True
 
 
 def _clear_device_dirty_unverified(why: str, *, holds: bool = True, fault: str = "gate_error") -> None:
@@ -3614,7 +3635,9 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
     ):
         _fabric_77_paged_since = fsm.record.since
     eok, edetail = await health_monitor.verify_eth_heartbeat()
-    if eok is True and not recent:
+    # A reset with no passing fabric pass since may not be released on the startup checks (04 I32).
+    owed = _post_reset_debt()
+    if eok is True and not recent and not owed:
         _fabric_77_fallback_release_monotonic = time.monotonic()
         log(
             f"startup checks pass (enum+ARC healthy, eth heartbeat {edetail or eok!r}) — hold lifted "
@@ -3631,9 +3654,13 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
     log(
         "startup checks do not clear it ("
         + (
-            "a fallback release already ran inside the window"
-            if eok is True
-            else f"eth heartbeat {'frozen' if eok is False else 'gave no verdict'}: {edetail}"
+            f"a reset ({owed}) has had no passing fabric pass since"
+            if eok is True and owed
+            else (
+                "a fallback release already ran inside the window"
+                if eok is True
+                else f"eth heartbeat {'frozen' if eok is False else 'gave no verdict'}: {edetail}"
+            )
         )
         + ") — climbing the recovery ladder"
     )
@@ -4845,7 +4872,13 @@ async def device_health_gate(
         prejob = phase == "pre-job"
         # with_recover=False never pays for the traffic pass: it is the one thing in this
         # function that costs real time, and a read-only pass has no rung to spend it on.
-        full = with_recover and (not prejob) and (dirty or force_fabric or (run_fabric and stale))
+        # A reset with no passing fabric pass since (04 I32) runs the pass here too, so the gate
+        # settles it in place; a job boundary that followed no reset adds no time.
+        full = (
+            with_recover
+            and (not prejob)
+            and (dirty or force_fabric or (run_fabric and stale) or bool(_post_reset_debt()))
+        )
         # A clean post-job exit still gets the passive eth read when the rung is armed (I30): chips
         # that all tick say nothing about a wedged eth core, and the next tenant is the one who
         # finds it. The read costs ~1s and pushes no traffic. A frozen verdict holds below; a read
@@ -5034,8 +5067,7 @@ async def device_health_gate(
                 _log(f"device verified healthy (incl. fabric) despite: {dirty_reason}" f" — no reset needed")
             else:
                 _log("device healthy; no reset needed")
-            _clear_device_dirty(verified=True, why=f"gate/{phase}: verified healthy")
-            if device_hold_logged:
+            if _clear_device_dirty(verified=True, why=f"gate/{phase}: verified healthy") and device_hold_logged:
                 _note_tenant_gate_verdict("")
             return
 
@@ -9252,6 +9284,9 @@ async def run_startup_tasks() -> None:
         if logger:
             logger.error(f"RUNG SELFTEST eth-heartbeat failed: {e}")
     log_rung_inventory()
+    # A broker start is never trusted, whatever the last broker saw: the startup gate's own fabric
+    # pass (after hugepages) settles this before anything is released (04 I32).
+    FABRIC_DEBT.note_reset("broker start")
     # A hold the last broker died holding has no row yet; give it one before anything opens
     # a new episode over the top of it.
     try:
