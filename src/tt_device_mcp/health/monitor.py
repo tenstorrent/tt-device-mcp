@@ -380,6 +380,9 @@ class HealthMonitor:
         if log:
             log(f"host-pci: {'SKIPPED' if hp_ok is None else ('OK' if hp_ok else 'UNHEALTHY')} — {hp_detail}")
         _record("hostpci", hp_ok, hp_detail, hp_evidence)
+        # A host-hang hold (spec 04 I25) lifts itself once every chip is back on the bus and host-pci
+        # is OK, or past its ceiling with every chip back: one file read while no hold is latched.
+        await asyncio.to_thread(pcie_guard.expire_offbus_reset_latch, expected, hp_ok, log or (lambda m: None))
         if hp_ok is False:
             return _store()
 
