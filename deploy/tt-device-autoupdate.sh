@@ -109,11 +109,13 @@ fi
 # Dispatch hold (spec 08 I18, spec 01 I18). Taken before anything is counted, then a short
 # settle so a dispatch already past the broker's check shows up as a child. A deferring lap
 # drops it at once; an applying lap keeps it until `systemctl restart` returns (the trap drops
-# it on every exit, and systemd removes it with the RuntimeDirectory anyway).
+# it on every exit, and systemd removes it with the RuntimeDirectory anyway). Written whole under
+# a temporary name and renamed into place: the broker removes a hold it cannot parse, so it must
+# never see this one empty or half-written.
 HOLD=/run/tt-device-broker/dispatch-hold
 if [ -d "${HOLD%/*}" ]; then
-    trap 'rm -f "$HOLD" 2>/dev/null || true' EXIT
-    echo "$$ $(date +%s)" > "$HOLD" 2>/dev/null || true
+    trap 'rm -f "$HOLD" "$HOLD.$$" 2>/dev/null || true' EXIT
+    { echo "$$ $(date +%s)" > "$HOLD.$$" && mv -f "$HOLD.$$" "$HOLD"; } 2>/dev/null || true
     sleep "${TTDEV_HOLD_SETTLE_SEC:-2}"
 fi
 

@@ -42,7 +42,7 @@ def test_an_in_flight_device_op_still_bars_the_update():
 # restart that ends an applying lap and records whether the hold was still there.
 
 
-def _gate(tmp_path, *, scopes="", queued=0, max_defer=600):
+def _gate(tmp_path, *, scopes="", queued=0, max_defer=600, stand_ins=""):
     text = _SCRIPT.read_text()
     start = text.index("# Dispatch hold (spec 08 I18")
     end = text.index('echo "autoupdate: applying', start)
@@ -71,6 +71,7 @@ systemctl() {{
         restart*) seen restart ;;
     esac
 }}
+{stand_ins}
 """
     script = prelude + gate + 'echo "autoupdate: applying"\nsystemctl restart tt-device-broker\n'
     env = {
@@ -93,6 +94,16 @@ def test_the_hold_is_taken_before_anything_is_counted(tmp_path):
     counted = [t for t in trace if t.split()[0] in ("pgrep", "scopes")]
     assert counted and all(" held " in t for t in counted), f"something was counted without the hold: {trace}"
     assert not hold.exists(), "the hold outlived the lap"
+
+
+def test_the_hold_appears_whole(tmp_path):
+    """The broker removes a hold it cannot parse, so the hold is never seen empty or half-written:
+    it is written under another name and renamed into place."""
+    done, trace, hold = _gate(tmp_path, max_defer=0, stand_ins='mv() { seen "mv $*"; command mv "$@"; }')
+    assert done.returncode == 0, done.stderr
+    assert trace[0].startswith(f"mv -f {hold}.") and trace[0].endswith(f" {hold} free"), trace
+    assert trace[1].startswith("sleep 7 held "), f"the rename did not put the hold in place: {trace}"
+    assert not hold.exists() and list(hold.parent.iterdir()) == [], "the lap left a hold file behind"
 
 
 def test_a_queued_job_defers_an_opted_in_update_and_drops_the_hold(tmp_path):

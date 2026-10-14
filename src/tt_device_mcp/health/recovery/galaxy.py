@@ -1403,7 +1403,7 @@ class GalaxyRecovery(Recovery):
         return not force and not scan.complete
 
     async def _fire_tray_repower(self, bitmap: int, tray_chip_ids: list, log):
-        """One per-tray BMC re-power with the device pollers (tt-telemetry, tt-fmax-cap, ...) stopped
+        """One per-tray BMC re-power with the device pollers (tt-telemetry, tt-metrics-exporter, ...) stopped
         across it, as every mesh reset already has them: a poller that keeps reading a tray's chips
         while they lose power is MMIO at a dead endpoint (spec 04 I23). Raises what the fire raises,
         including ``pcie_guard.TrayRepowerRefused``; returns the envelope's plan (or what a test's

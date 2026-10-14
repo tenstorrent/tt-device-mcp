@@ -782,6 +782,32 @@ async def test_a_second_77_only_hold_inside_the_window_climbs_the_ladder(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_the_77_bound_pages_once_per_hold_episode(monkeypatch, tmp_path, clear_job_state):
+    """Every relift pass past the bound runs the fallback again (here each climbs a ladder that leaves
+    the hold standing). Only the first on an episode pages. A page the hook dropped (a run still in
+    flight) goes out on the next pass, and a page sent for an earlier episode does not quiet this one."""
+    rungs = _bound(monkeypatch, tmp_path, (None, "eth links below baseline"))
+    monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["hook"])
+    monkeypatch.setattr(srv, "_fabric_77_paged_since", "an earlier episode", raising=False)
+    sent = []
+    outcomes = iter([None])  # the first send is dropped; every later one starts
+
+    def send_alert(event, log=None):
+        if event["kind"] == "fabric_check_unrunnable_bound":
+            sent.append(event["held_since"])
+            return next(outcomes, object())
+        return object()
+
+    monkeypatch.setattr(srv.alert, "send_alert", send_alert)
+    for _ in range(4):
+        monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
+        await srv._attempt_idle_relift()
+
+    assert rungs == ["present"] * 4, "every pass past the bound still runs the fallback"
+    assert sent == [srv.fsm.record.since] * 2, "one dropped page, then one page for the episode"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "hold_detail,fabric_detail,flagged",
     [

@@ -1610,15 +1610,16 @@ def _dispatch_hold_holder() -> str:
     return ""
 
 
-async def _wait_out_dispatch_hold(job: "Job", job_log_file: Optional[Path]) -> None:
+async def _wait_out_dispatch_hold(job: "Job", job_log_file: Optional[Path]) -> bool:
     """Keep the job QUEUED while the auto-updater holds dispatch. Returns at once when nobody does,
-    and when the job is killed while it waits. Never raises."""
+    and when the job is killed while it waits. True when it held the job: the caller's admission
+    checks are then stale and must run again (spec 01 I18). Never raises."""
     try:
         holder = _dispatch_hold_holder()
     except Exception:  # noqa: BLE001 - a bug here must not keep a job off a free device
-        return
+        return False
     if not holder:
-        return
+        return False
     if logger:
         logger.info(f"JOB_RUNNER job_id={job.id} waiting: the auto-updater holds dispatch ({holder})")
     health_event("dispatch_hold_wait", job_id=job.id, holder=holder)
@@ -1632,9 +1633,10 @@ async def _wait_out_dispatch_hold(job: "Job", job_log_file: Optional[Path]) -> N
         await asyncio.sleep(DISPATCH_HOLD_POLL_SEC)
         try:
             if not _dispatch_hold_holder():
-                return
+                return True
         except Exception:  # noqa: BLE001
-            return
+            return True
+    return True
 
 
 def _flock_holder_pids(fd: int) -> list[int]:
@@ -2070,7 +2072,7 @@ def _reset_for_testing():
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant
-    global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic
+    global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
     job_queue = None
     lock = None
     _action_row = None
@@ -2083,6 +2085,7 @@ def _reset_for_testing():
     _fabric_77_streak_since = None
     _fabric_77_streak = 0
     _fabric_77_fallback_release_monotonic = 0.0
+    _fabric_77_paged_since = None
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
@@ -3349,6 +3352,9 @@ _fabric_77_streak: int = 0
 # Monotonic time of the last release the fallback granted on a still-unverified fabric. A second
 # 77-only hold within FABRIC_77_RELEASE_WINDOW_SEC of it goes to the ladder, not another release.
 _fabric_77_fallback_release_monotonic: float = 0.0
+# The hold episode (its ``since``) whose bound the alert hook has already paged. Every relift pass past
+# the bound runs the fallback again; only the first on an episode pages.
+_fabric_77_paged_since: Optional[str] = None
 
 
 def _env_int(name: str, default: int, floor: int) -> int:
@@ -3441,9 +3447,10 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
     that went down reads as no-verdict rather than healthy. A 77 is never a healthy fabric: only a
     positively healthy read, and no fallback release in the window, lifts the hold, with a warning.
     Frozen, unreadable, a link-count drop, or a second 77-only hold inside the window climbs the
-    ladder (the present-mesh rung, with every guard of _escalate_stuck_hold). Returns True when it
-    settled the hold."""
-    global _fabric_77_fallback_release_monotonic
+    ladder (the present-mesh rung, with every guard of _escalate_stuck_hold). Pages once per hold
+    episode: a later pass on the same episode journals but does not page again, and a page the hook
+    dropped is tried again on the next pass. Returns True when it settled the hold."""
+    global _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
     window = _env_int("TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC", 21600, 0)
     recent = bool(_fabric_77_fallback_release_monotonic) and (
         time.monotonic() - _fabric_77_fallback_release_monotonic < window
@@ -3462,7 +3469,10 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
             f"FABRIC-77-BOUND the fabric check could not run on {_fabric_77_streak} retries of this hold "
             "— falling back to the startup checks as the gate"
         )
-    alert.send_alert(event, logger)
+    if _fabric_77_paged_since != fsm.record.since and (
+        alert.send_alert(event, logger) is not None or alert.alert_argv() is None
+    ):
+        _fabric_77_paged_since = fsm.record.since
     eok, edetail = await health_monitor.verify_eth_heartbeat()
     if eok is True and not recent:
         _fabric_77_fallback_release_monotonic = time.monotonic()
@@ -7603,8 +7613,13 @@ async def _job_runner_loop():
     if logger:
         logger.info("JOB_RUNNER started, waiting for jobs...")
 
+    # A job the dispatch hold kept waiting, to be admitted again before anything else is dequeued.
+    readmit: Optional[str] = None
     while True:
-        job_id = await get_job_queue().get()
+        if readmit:
+            job_id, readmit = readmit, None
+        else:
+            job_id = await get_job_queue().get()
         runner_job_id = job_id
 
         # Handle case where job was cleaned up while still in queue
@@ -7781,11 +7796,19 @@ async def _job_runner_loop():
         # Last step before RUNNING (spec 01 I18): an auto-update that judged the box idle is about
         # to restart the broker, and a job started now would lose its output to that restart. On
         # restart the job is still QUEUED, its spec still on disk, and the next broker runs it.
-        await _wait_out_dispatch_hold(job, job_log_file)
+        held = await _wait_out_dispatch_hold(job, job_log_file)
         if job.status == JobStatus.KILLED:
             _forget_queued_job(job_id)
             await cleanup_finished_jobs()
             get_job_queue().task_done()
+            continue
+        if held:
+            # The hold can stand for minutes, and the device, its holders and the gate's verdict may
+            # all have changed under it: run this job's admission again from the top, as if it had
+            # just been dequeued. It dispatches only from a pass that ends with no hold.
+            if logger:
+                logger.info(f"JOB_RUNNER job_id={job_id} the dispatch hold ended; admitting it again")
+            readmit = job_id
             continue
 
         # Update job state under lock
