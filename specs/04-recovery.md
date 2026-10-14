@@ -553,8 +553,10 @@ it stale ones.
 cooldown clock; `reset_with_quiesce` (I4, I12); exactly one attempt (I3, I11). On rc 0 the ladder
 verifies with `_verify_device_after_reset`: the full probe pass *including* the fabric traffic
 pass, where a post-reset "no trained link" (77) is retried after an eth-training sleep
-(`POST_RESET_FABRIC_RETRIES` / `_SLEEP_SEC`) and a 77 that persists reads as NOT recovered — the
-ladder climbs rather than clear a hold onto a fabric no pass ever proved. The bridge-reset rung
+(`POST_RESET_FABRIC_RETRIES` / `_SLEEP_SEC`) and a 77 that persists is UNKNOWN — never a
+recovery (no hold is cleared onto a fabric no pass ever proved) and never a failed reset (no
+cooldown, no two strikes, no host-rung climb): it settles as a 77-only fabric-unverified hold that
+spec 03 I40 bounds. The bridge-reset rung
 retries up to `BRIDGE_RESET_MAX_TRIES` with a settle (the first shot races link retrain), treats a
 structurally inapplicable chip (no bridge, no setpci) as fall-through rather than spin, tries a
 bare PCI rescan before anything heavier, and refuses a stale cached address whose target bus now
