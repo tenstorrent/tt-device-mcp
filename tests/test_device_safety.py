@@ -8909,6 +8909,7 @@ def _setup_fabric_unverified_hold(monkeypatch, tmp_path, *, n_present=31):
     srv.last_relift_monotonic = 0.0
     monkeypatch.setenv("TT_DEVICE_MCP_SELFHEAL_RELIFT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_RELIFT", "1")
+    monkeypatch.setattr(srv, "_fabric_77_recheck_due", lambda: True)  # the I48 backoff: re-check due
 
 
 @pytest.mark.asyncio
@@ -12435,6 +12436,40 @@ async def test_an_incomplete_sweep_after_an_unverified_reset_does_not_climb(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("read_77", [True, False])
+async def test_a_sweep_that_still_reads_77_holds_and_pages_once_instead_of_climbing(
+    monkeypatch, clear_job_state, read_77
+):
+    """Spec 04 I29: after an UNKNOWN reset, a sweep whose verify still reads a 77 measured no fault, so
+    no escalation of the episode climbs to a reboot or power cycle: it holds and pages once. A sweep that
+    measured a failure still climbs."""
+    counters, sweeps, climbs = _arm_unverified_reset_episode(monkeypatch)
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(srv.recovery_mechanism, "unverified_sweep_77_since", None)
+    monkeypatch.setattr(g, "_sweep_read_77", False)
+    monkeypatch.setattr(g, "_host_rung_77_paged_since", None)
+    alerts = []
+    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event["kind"]))
+
+    async def sweep(expected, log, gate_phase, **k):
+        sweeps.append(k)
+        g._sweep_read_77 = read_77
+        return False
+
+    monkeypatch.setattr(g, "_settle_and_verify_before_host_rung", sweep)
+    for _ in range(2):
+        assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    assert len(sweeps) == 1 and counters["resets"] == 0
+    if read_77:
+        assert climbs == [], "a 77 is no measured fault: never a host rung"
+        assert alerts == ["fabric_unverified_no_host_rung"], "one page per episode"
+    else:
+        assert climbs == [{"swept": True}] * 2
+        assert alerts == []
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fabric_77_unverified, expect", [(True, False), (False, True)])
 async def test_a_sweep_verify_that_reads_77_is_not_a_release(
     monkeypatch, clear_job_state, fabric_77_unverified, expect
@@ -12456,6 +12491,7 @@ async def test_a_sweep_verify_that_reads_77_is_not_a_release(
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     monkeypatch.setattr(g.deps, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})
     monkeypatch.setattr(galaxy_mod, "_settle_before_host_rung_sec", lambda: 0)
+    monkeypatch.setattr(g, "_sweep_read_77", False)
     monkeypatch.setattr(srv, "_clear_device_dirty", lambda **kw: cleared.append(kw))
     patch_health_event(monkeypatch, lambda *a, **k: None)
     patch_recovery(monkeypatch, "_verify_device", verify_77)
@@ -12464,6 +12500,7 @@ async def test_a_sweep_verify_that_reads_77_is_not_a_release(
     )
     assert got is expect
     assert bool(cleared) is expect, "a 77 after an UNKNOWN reset must never clear the hold"
+    assert g._sweep_read_77 is fabric_77_unverified, "the 77 is noted so the escalation holds, not climbs"
 
 
 def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output="", beats=None, fault=""):
