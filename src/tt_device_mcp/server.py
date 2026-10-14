@@ -132,6 +132,7 @@ from tt_device_mcp.health import (
     heartbeat_verdict,
     isolate_chip,
     mark_boot,
+    mesh_hold_repage_sec,
     offbus_power_cycle,
     pcie_guard_at_start,
     previous_boot_bus_locks,
@@ -143,7 +144,6 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
-from tt_device_mcp.health.recovery.base import mesh_hold_repage_sec
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
