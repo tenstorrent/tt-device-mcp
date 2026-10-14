@@ -115,11 +115,33 @@ log "running run_cluster_validation --send-traffic --num-iterations $ITERS"
 cd "$RUNTIME_ROOT" || cannot_check "cannot cd to '$RUNTIME_ROOT'"
 RUNLOG="$(mktemp)" || cannot_check "cannot create a temp file for the validator output"
 trap 'rm -f "$RUNLOG"' EXIT
-"$BIN" "${desc_argv[@]}" --output-path "$OUT" --hard-fail --send-traffic --num-iterations "$ITERS" \
-    >"$RUNLOG" 2>&1
-rc=$?
-cat "$RUNLOG" >&2
-tail_to_last "$RUNLOG"
+run_validator() {
+    "$BIN" "$@" --output-path "$OUT" --hard-fail --send-traffic --num-iterations "$ITERS" >"$RUNLOG" 2>&1
+    rc=$?
+    cat "$RUNLOG" >&2
+    tail_to_last "$RUNLOG"
+}
+run_validator "${desc_argv[@]}"
+
+# TOPOLOGY MISMATCH: the links the validator discovered are not the ones the descriptor names. Its
+# tray ids come from PCI bus numbers, so a tray whose uplink lands on another bus, or a cable that is
+# not there, mismatches on every run, and a board reset cannot change either. Not a measurement:
+# rerun once without the descriptor so traffic still crosses every discovered link, and classify
+# that run with the chain below. A pass carries the marker as the last line before exit 0.
+TOPO=""
+if [ "$rc" -ne 0 ] && [ -n "$DESC" ] && grep -q "Connection mismatch detected" "$RUNLOG"; then
+    read -r n_missing n_extra < <(awk '
+        /found [0-9]+ missing port\/cable connections/ { s = "m"; next }
+        /found [0-9]+ extra port\/cable connections/   { s = "e"; next }
+        /Physical Discovery found|connections:/        { s = ""; next }
+        s != "" && /PhysicalPortEndpoint/              { c[s]++ }
+        END { printf "%d %d\n", c["m"], c["e"] }' "$RUNLOG")
+    TOPO="TOPOLOGY MISMATCH vs $DESC: $n_missing missing, $n_extra extra port connections (tray ids come from PCI bus numbers; a board reset cannot change this)"
+    log "$TOPO"
+    log "rerunning once without the descriptor: traffic over every discovered link"
+    run_validator
+fi
+topo_ok() { [ -z "$TOPO" ] || log "$TOPO"; }
 
 
 # UNHEALTHY is a VERDICT, and only the validator can return one. It reaches that verdict in exactly
@@ -185,6 +207,7 @@ else
     # The reason goes on the FINAL line: an operator's wrapper is summarized by its last line, and
     # a cause printed above it was dropped from every log that quoted the check.
     log "no link was tested, so this says nothing about the fabric -- see $OUT/last-run.log"
+    [ -z "$TOPO" ] || reason="topology mismatch, traffic-only rerun: $reason"
     cannot_check "validator did not complete a measurement (rc=$rc): $reason"
 fi
 [ "$rc" -eq 0 ] || exit "$rc"
@@ -210,6 +233,7 @@ fi
 DBIN="${TTDEV_DISPATCH_BIN:-$CURRENT/build/programming_examples/distributed/distributed_program_dispatch}"
 [ -x "$DBIN" ] || {
     log "pinned dispatch probe not built ('$DBIN'); fabric verdict stands on its own"
+    topo_ok
     exit 0
 }
 DTMO="${TTDEV_DISPATCH_TIMEOUT:-90}"
@@ -225,7 +249,7 @@ TT_METAL_OPERATION_TIMEOUT_SECONDS="${TTDEV_DISPATCH_OP_TIMEOUT:-25}" \
 drc=$?
 
 case "$drc" in
-    0)   log "dispatch OK: every chip ran a program"; exit 0 ;;
+    0)   log "dispatch OK: every chip ran a program"; topo_ok; exit 0 ;;
     # Killed at the cap. We did NOT measure a wedge — we failed to measure at all, and this is the
     # exact verdict that reset this host in a loop when the probe itself was the slow thing. A real
     # dispatch hang comes back through the operation timeout as a non-zero exit above, so nothing
