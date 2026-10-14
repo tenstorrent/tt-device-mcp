@@ -2744,6 +2744,20 @@ def test_no_clock_cap_keeper_in_the_default_pollers():
     assert "fmax" not in srv.DEFAULT_POLLER_SERVICES
 
 
+def test_the_specs_name_the_default_pollers():
+    """Spec 06's env-var index and spec 04 I12 state the code's default poller list, and neither
+    names a clock-cap keeper as a default (both did after the code dropped it)."""
+    specs = Path(__file__).resolve().parent.parent / "specs"
+    row = next(
+        line
+        for line in (specs / "06-state-paths.md").read_text().splitlines()
+        if line.startswith("| `TT_DEVICE_MCP_POLLER_SERVICES` |")
+    )
+    assert row.split("|")[2].strip() == f"`{srv.DEFAULT_POLLER_SERVICES}`", row
+    i12 = (specs / "04-recovery.md").read_text().split("- **I12 —", 1)[1].split("\n- **I13 —", 1)[0]
+    assert "fmax" not in i12, i12
+
+
 def _systemctl_with_units(installed, calls):
     """A `systemctl` stand-in: 0 for a unit the host has, 5 (not loaded) for one it lacks."""
 
