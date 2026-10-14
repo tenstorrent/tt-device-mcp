@@ -113,6 +113,7 @@ and job exit statuses never hit disk.
 | Health journal (events, telemetry trace, buslock, chip and eth-link baselines, incidents/, the idle-time probe's `health_probe_state.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
 | Off-bus reset intent and host-hang latch (`offbus_reset_intent.json`, `offbus_reset_hold.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Remembered Tenstorrent root ports and chip archs (`tt_pci_topology.json`, spec 04 I23) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
+| Chip-to-PCI-bus map at the last clean fabric pass (`fabric_ok_asic_bus.json`, spec 03 I40) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Server log + job logs | `/var/log/tt-device-broker/` (the unit passes `--log-dir`; the bare server defaults to CWD) | `<state>/` | `--log-dir` |
 | Stats | `<log-dir>/stats/` → `/var/log/tt-device-broker/stats/` | `<state>/stats/` | follows `--log-dir` |
 | Metrics textfile | `/var/lib/prometheus/node-exporter/tt_device_mcp.prom` | `<state>/metrics/tt_device_mcp.prom` | `TT_DEVICE_MCP_TEXTFILE_DIR` |

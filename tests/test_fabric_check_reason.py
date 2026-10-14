@@ -16,6 +16,7 @@ import pytest
 
 from tt_device_mcp.constants import FABRIC_CHECK_CANNOT_CHECK_RC
 from tt_device_mcp.health import monitor as health_monitor_mod
+from tt_device_mcp.health.monitors import fabric as fabric_mod
 from tt_device_mcp.health.monitors.fabric import classify, first_reason
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-fabric-check.sh"
@@ -100,3 +101,88 @@ def test_wrapper_77_final_line_keeps_the_validators_first_error_line(tmp_path, v
         assert health_monitor_mod._override_reason(r.stderr) == last.strip()
     else:
         assert cause in health_monitor_mod._override_reason(r.stderr)
+
+
+# The validator's own throw when the links it discovered are not the descriptor's: tray ids come
+# from PCI bus numbers, so a moved uplink or an absent cable mismatches on every run.
+_MISMATCH = (
+    "2026-10-13 10:00:00.1 | info | Distributed | Opening 32 chips\n"
+    "Physical Discovery found 2 missing port/cable connections:\n"
+    "  PhysicalPortEndpoint{hostname=host0, tray_id=1, asic_location=3, port_type=QSFP_DD, port_id=1}\n"
+    "  PhysicalPortEndpoint{hostname=host0, tray_id=2, asic_location=4, port_type=QSFP_DD, port_id=2}\n"
+    "Physical Discovery found 1 extra port/cable connections:\n"
+    "  PhysicalPortEndpoint{hostname=host0, tray_id=3, asic_location=3, port_type=QSFP_DD, port_id=1}\n"
+    "terminate called after throwing an instance of 'std::runtime_error'\n"
+    "  what():  Connection mismatch detected. Check the log above for details.\n"
+    "Aborted (core dumped)\n"
+)
+_UNHEALTHY = "| critical | Always | TT_THROW: Encountered unhealthy ethernet connections, listed above\n"
+
+
+def test_a_topology_mismatch_is_a_skip_not_a_measurement():
+    ok, detail = classify(134, _MISMATCH)
+    assert ok is None
+    assert detail.startswith("topology mismatch: 2 missing, 1 extra port connections")
+
+
+def test_an_ok_carrying_the_topology_marker_stays_ok_and_names_the_mismatch():
+    marker = fabric_mod.topology_marker("/x/desc.textproto", 2, 1)
+    ok, detail = classify(0, "fabric healthy\n" + marker + "\n")
+    assert ok is True
+    assert marker in detail
+
+
+def _run_wrapper_topology(tmp_path, rerun_output: str, rerun_rc: int):
+    """The wrapper with a descriptor set: the stand-in validator mismatches whenever it is handed the
+    descriptor, and prints ``rerun_output`` (exit ``rerun_rc``) on the run without it."""
+    root = tmp_path / "root"
+    root.mkdir()
+    desc = tmp_path / "desc.textproto"
+    desc.write_text("# cabling\n")
+    (tmp_path / "mismatch.txt").write_text(_MISMATCH)
+    (tmp_path / "rerun.txt").write_text(rerun_output)
+    calls = tmp_path / "calls"
+    fake = tmp_path / "run_cluster_validation"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f"echo \"$*\" >> '{calls}'\n"
+        f'case "$*" in *cabling*) cat \'{tmp_path / "mismatch.txt"}\'; exit 134 ;; esac\n'
+        f"cat '{tmp_path / 'rerun.txt'}'\nexit {rerun_rc}\n"
+    )
+    fake.chmod(0o755)
+    env = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "TTDEV_FABRIC_BIN": str(fake),
+        "TTDEV_FABRIC_RUNTIME_ROOT": str(root),
+        "TTDEV_FABRIC_CACHE": str(tmp_path / "cache"),
+        "TTDEV_FABRIC_DESCRIPTOR": str(desc),
+        "TTDEV_DISPATCH_BIN": str(tmp_path / "absent"),
+    }
+    r = subprocess.run(["bash", str(_SCRIPT)], env=env, capture_output=True, text=True, timeout=30)
+    return r, calls.read_text().splitlines(), desc
+
+
+def test_wrapper_reruns_a_topology_mismatch_without_the_descriptor_and_ends_on_the_marker(tmp_path):
+    r, calls, desc = _run_wrapper_topology(tmp_path, "all links ok\n", 0)
+    assert r.returncode == 0, r.stderr
+    assert len(calls) == 2
+    assert "--cabling-descriptor-path" in calls[0]
+    assert "cabling" not in calls[1]
+    last = [ln for ln in r.stderr.splitlines() if ln.strip()][-1]
+    assert f"TOPOLOGY MISMATCH vs {desc}: 2 missing, 1 extra port connections" in last
+    # The broker reads the same marker off the wrapper's output.
+    ok, detail = classify(0, r.stderr)
+    assert ok is True and "TOPOLOGY MISMATCH" in detail
+
+
+def test_wrapper_topology_rerun_that_measures_bad_links_is_unhealthy(tmp_path):
+    r, calls, _ = _run_wrapper_topology(tmp_path, _UNHEALTHY, 1)
+    assert r.returncode == 1, r.stderr
+    assert len(calls) == 2
+
+
+def test_wrapper_topology_rerun_that_cannot_measure_is_77_and_says_so(tmp_path):
+    r, calls, _ = _run_wrapper_topology(tmp_path, _UNCAUGHT, 134)
+    assert r.returncode == FABRIC_CHECK_CANNOT_CHECK_RC, r.stderr
+    last = [ln for ln in r.stderr.splitlines() if ln.strip()][-1]
+    assert "topology mismatch, traffic-only rerun: what():  Hugepages are not allocated" in last
