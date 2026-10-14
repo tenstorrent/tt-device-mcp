@@ -650,7 +650,7 @@ class Recovery(ABC):
             health_event("host_reset_gated", argv=argv, reason=why, host_at_risk=True)
             return False
         # The operator's outage hold (spec 04 I28): held like the gate above, and paged.
-        if refuse_mesh_reset("gate/relift", argv, log):
+        if refuse_mesh_reset("gate/relift", argv, log, off_bus):
             return False
 
         log(f"resetting device: {' '.join(argv)}  ({expected} device(s); ~30-60s, restart-safe)")

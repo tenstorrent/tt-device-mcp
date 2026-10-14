@@ -91,7 +91,21 @@ BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC = int(
 # unconfirmed BMC turns the tray rung off and the ladder still climbs through the mesh reset), but
 # all three off together say "touch nothing": the mesh reset is held too.
 OUTAGE_HOLD_VARS = ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE", "TT_DEVICE_MCP_AUTO_UBB_RESET")
-_mesh_hold_paged: set = set()
+# The hold reason -> when its page went out (monotonic). A held mesh reset stays HELD until an operator
+# acts, so the page is the hold's only bound: while the hold stands it is sent again every
+# mesh_hold_repage_sec(), so a page that was missed or forgotten never leaves the device held in silence.
+_mesh_hold_paged: dict = {}
+MESH_HOLD_REPAGE_DEFAULT_SEC = 3600
+
+
+def mesh_hold_repage_sec() -> int:
+    """``TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC``: how long a standing mesh-reset hold waits before it pages
+    again (default 3600). ``0`` pages once per hold; nonsense reads as the default."""
+    try:
+        value = int(os.environ.get("TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC", "").strip())
+    except ValueError:
+        return MESH_HOLD_REPAGE_DEFAULT_SEC
+    return value if value >= 0 else MESH_HOLD_REPAGE_DEFAULT_SEC
 
 
 def mesh_reset_hold_reason() -> str:
@@ -112,25 +126,30 @@ def mesh_reset_hold_reason() -> str:
     return ""
 
 
-def refuse_mesh_reset(context: str, argv: list, log) -> bool:
+def refuse_mesh_reset(context: str, argv: list, log, off_bus: int = 0) -> bool:
     """True when :func:`mesh_reset_hold_reason` holds the mesh reset: logged, journaled and paged
-    once per hold (again after a pass that found no hold). A refused reset did not happen, so the
-    caller holds exactly as for a gated one and arms no cooldown or failed-reset flag."""
+    once per hold, again every :func:`mesh_hold_repage_sec` while it stands and after a pass that
+    found no hold. A refused reset did not happen, so the caller holds exactly as for a gated one and
+    arms no cooldown or failed-reset flag. ``off_bus`` (chips off the bus this pass) is named in
+    the page: the case a mesh reset turns into an off-bus power-cycle loop."""
     why = mesh_reset_hold_reason()
     if not why:
         _mesh_hold_paged.clear()
         return False
+    held = f"{off_bus} chip(s) off the bus, " if off_bus > 0 else ""
     message = (
-        f"automatic mesh reset NOT fired ({context}): {why}; holding for an operator — "
+        f"automatic mesh reset NOT fired ({context}): {held}{why}; device HELD for an operator — "
         f"lift the hold or set TT_DEVICE_MCP_AUTO_MESH_RESET=1 to re-arm it"
     )
     log(message)
-    health_event("mesh_reset_held", context=context, argv=argv, reason=why, host_at_risk=True)
+    health_event("mesh_reset_held", context=context, argv=argv, reason=why, off_bus=off_bus, host_at_risk=True)
     metrics.stage_fired("smi_reset", "blocked")
-    if why not in _mesh_hold_paged:
-        event = {"kind": "mesh_reset_held", "context": context, "reason": why, "message": message}
+    paged_at = _mesh_hold_paged.get(why)
+    repage = mesh_hold_repage_sec()
+    if paged_at is None or (repage > 0 and time.monotonic() - paged_at >= repage):
+        event = {"kind": "mesh_reset_held", "context": context, "reason": why, "off_bus": off_bus, "message": message}
         if alert.send_alert(event) is not None or alert.alert_argv() is None:
-            _mesh_hold_paged.add(why)
+            _mesh_hold_paged[why] = time.monotonic()
     return True
 
 

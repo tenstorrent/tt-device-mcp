@@ -1441,7 +1441,7 @@ class GalaxyRecovery(Recovery):
             health_event("host_reset_gated", context="reset_sweep", reason=why, trays=trays, host_at_risk=True)
             return False
         # The operator's outage hold (spec 04 I28) refuses the whole sweep: its last step is the mesh reset.
-        if refuse_mesh_reset("reset_sweep", self.reset_argv([str(i) for i in range(expected)]), log):
+        if refuse_mesh_reset("reset_sweep", self.reset_argv([str(i) for i in range(expected)]), log, off_bus):
             return False
         # The caller ends it after its settle and verify (the host-hang latch, I25).
         pcie_guard.begin_offbus_reset("reset sweep", off_bus)
