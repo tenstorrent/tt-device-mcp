@@ -1019,6 +1019,7 @@ _recovery_deps = RecoveryDeps(
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
     hold_device_fabric_unverified=lambda why: _hold_device_fabric_unverified(why),
+    note_fabric_77_reset_passes=lambda n: _note_fabric_77_reset_passes(n),
     refresh_idle_hold_ledger=lambda: _refresh_idle_hold_ledger(),
     spawn_idle_relift=lambda: _maybe_spawn_idle_relift(),
     watch_idle_holders=lambda: _maybe_spawn_idle_holder_watch(),
@@ -3365,6 +3366,13 @@ def _env_int(name: str, default: int, floor: int) -> int:
 # link mark re-baselined for this chip-to-bus map, and a release is watched like a lift.
 _TOPOLOGY_HOLD = "topology mismatch"
 _TOPOLOGY_HW_FAULT = "hardware fault: the first job after a topology-mismatch lift"
+# The validator's own line for it, which reaches the broker as a 77 ("COULD NOT RUN") wherever the
+# topology-mismatch path has not relabelled it yet.
+_TOPOLOGY_VALIDATOR_LINE = "Connection mismatch detected"
+
+
+def _names_topology_mismatch(text: str) -> bool:
+    return text.startswith(_TOPOLOGY_HOLD) or _TOPOLOGY_HW_FAULT in text or _TOPOLOGY_VALIDATOR_LINE in text
 
 
 def _hold_details(evidence: dict) -> tuple[str, str]:
@@ -3372,7 +3380,34 @@ def _hold_details(evidence: dict) -> tuple[str, str]:
 
 
 def _topology_hw_fault_hold(evidence: dict) -> bool:
+    # A known fabric fault (03 I46) is outside the I40 bound too: its release is what failed.
+    if health_monitor is not None and health_monitor.known_fabric_fault():
+        return True
     return bool(health_monitor.topology_hw_fault) or any(_TOPOLOGY_HW_FAULT in d for d in _hold_details(evidence))
+
+
+def _fabric_no_reset_hold() -> str:
+    """Why the open hold is one no reset can end, or "" (spec 04 I30).
+
+    A topology mismatch (the hold, its reason, or a fabric-unverified hold whose last pass printed the
+    validator's mismatch line) is cabling that differs from the descriptor; a fabric pass that could
+    not run (a 77) with no fault measured or reported is a missing verdict. The caller has already
+    read every chip present with a live ARC heartbeat, so a reset has nothing to fix in either case.
+    A measured-bad fabric or a runtime-reported fault is not this: those keep the ladder."""
+    fabric_hold = fsm.record.why == FABRIC_RELIFT_WHY
+    if fabric_hold and not device_fault_reported and health_monitor.known_fabric_fault():
+        return "known fabric fault"
+    if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
+        return "topology mismatch"
+    if fabric_hold and _TOPOLOGY_VALIDATOR_LINE in (health_monitor.last_fabric_output or ""):
+        return "topology mismatch"
+    if fabric_hold and not device_fault_reported and health_monitor.last_fabric_ok is not False:
+        return "fabric check could not run (77)"
+    return ""
+
+
+# The hold episode (its ``since``) whose no-reset deadline hold has already logged and paged.
+_fabric_no_reset_paged_since: Optional[str] = None
 
 
 def _fabric_77_bound_reached() -> bool:
@@ -3388,6 +3423,15 @@ def _fabric_77_bound_reached() -> bool:
     except (TypeError, ValueError):
         return False
     return age >= _env_int("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", 600, 60)
+
+
+def _note_fabric_77_reset_passes(passes: int) -> None:
+    """Count a reset's post-reset 77 passes toward the open episode's I40 bound: they ran on freshly
+    retrained links, so the next relift's 77 falls back at once rather than re-running them."""
+    global _fabric_77_streak_since, _fabric_77_streak
+    if _fabric_77_streak_since != fsm.record.since:
+        _fabric_77_streak_since, _fabric_77_streak = fsm.record.since, 0
+    _fabric_77_streak = max(_fabric_77_streak + passes, _env_int("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", 3, 1) - 1)
 
 
 async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
@@ -5509,6 +5553,13 @@ async def _force_escalate_stuck_hold() -> None:
             return
         beats = await asyncio.to_thread(read_heartbeats)
         off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+        no_reset = "" if off_bus or isolated_chips else _fabric_no_reset_hold()
+        if no_reset:
+            # Every chip enumerates with a live ARC heartbeat and the hold names only the fabric: a 77
+            # or a cabling mismatch. A galaxy reset cannot fix either, and on one Galaxy host it took a
+            # chip off the bus and the ladder then re-powered its tray. Hold, page once (spec 04 I30).
+            _hold_without_reset(no_reset, expected, log)
+            return
         health_event(
             "hold_deadline_forced_escalation",
             off_bus=off_bus,
@@ -5544,6 +5595,29 @@ async def _force_escalate_stuck_hold() -> None:
             "offbus-forced" if off_bus > 0 else "present-forced", indices, expected, log
         )
         fsm.on_outcome(outcome)
+
+
+def _hold_without_reset(cause: str, expected: int, log) -> None:
+    """Keep a present-mesh fabric-only hold past the ceiling without a reset: log, record and page once
+    per episode. Later windows re-read the chips and stay quiet while nothing changed."""
+    global _fabric_no_reset_paged_since
+    if _fabric_no_reset_paged_since == device_hold_episode_since:
+        return
+    _fabric_no_reset_paged_since = device_hold_episode_since
+    event = {
+        "kind": "hold_deadline_no_reset",
+        "host": socket.gethostname(),
+        "held_since": device_hold_episode_since,
+        "reason": device_hold_episode_reason,
+        "cause": cause,
+        "expected": expected,
+    }
+    health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
+    log(
+        f"all {expected} chips present with live ARC and the hold names only the fabric ({cause}) — "
+        "no reset or power cycle can fix that; holding and paging once"
+    )
+    alert.send_alert(event, logger)
 
 
 def _maybe_spawn_forced_escalation() -> bool:
@@ -8162,12 +8236,17 @@ export {JOB_TAG_ENV}={job_tag}
                 # cleared on the word of checks that cannot see this fault at all.
                 # The first job after a topology-mismatch lift is the bound on that lift: one that
                 # dies on the fabric makes it a hardware fault, held without a reset (03 I42).
+                # Jobs that keep dying on the fabric's routing after passes that could not run are a
+                # known fabric fault: held, never the dirty-flag reset that only ends in another 77 (03 I46).
+                known = None
                 if health_monitor is not None:
-                    topo = health_monitor.note_job_after_topology_lift(
-                        job.status != JobStatus.COMPLETED, _read_job_log_tail(job_log_file)
-                    )
+                    tail = _read_job_log_tail(job_log_file)
+                    topo = health_monitor.note_job_after_topology_lift(job.status != JobStatus.COMPLETED, tail)
                     if topo:
                         _hold_device_fabric_unverified(f"job {job_id}: {topo}")
+                    known = health_monitor.note_job_fabric_route_fault(job.status != JobStatus.COMPLETED, tail)
+                    if known:
+                        _hold_device_fabric_unverified(f"job {job_id}: {known}")
                 fault = _scan_output_for_device_fault(job_log_file)
                 if fault:
                     _mark_device_reported_fault(f"job {job_id} {fault}", job=job)
@@ -8200,7 +8279,7 @@ export {JOB_TAG_ENV}={job_tag}
                             f"CLEAN-GATE job {job_id} was killed by device recovery; not "
                             f"flagging the device over a death we caused"
                         )
-                elif _is_wedge_risk_exit(job.status, job.exit_code):
+                elif not known and _is_wedge_risk_exit(job.status, job.exit_code):
                     _mark_device_dirty(
                         f"job {job_id} ended {job.status.value}"
                         + (f" (exit {job.exit_code})" if job.exit_code is not None else ""),

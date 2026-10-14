@@ -335,6 +335,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv.health_monitor, "_glx_cache", None)
 
     monkeypatch.setattr(srv, "device_fault_reported", "", raising=False)
+    # Many tests assign srv.isolated_chips directly; a leaked chip makes a later hold not 77-only.
+    monkeypatch.setattr(srv, "isolated_chips", set())
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
     # Whether the last reset EXITED non-zero. Left set it would steer the NEXT test's gate
@@ -640,6 +642,7 @@ def health_deps():
         set_device_hold_episode_ubb_reset_fired=lambda v: srv.fsm.set_latch("ubb_reset_fired", v),
         clear_device_reported_fault=lambda why: srv._clear_device_reported_fault(why),
         clear_device_dirty=lambda **kw: srv._clear_device_dirty(**kw),
+        note_fabric_77_reset_passes=lambda n: srv._note_fabric_77_reset_passes(n),
         device_degraded=lambda: srv._recovery_degraded(),
         auto_power_cycle_host=lambda log, reason: srv._auto_power_cycle_host(log, reason),
         emit_all_off_bus_power_cycle_required=lambda log, off_bus, expected, context: (

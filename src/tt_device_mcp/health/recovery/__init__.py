@@ -260,6 +260,10 @@ class RecoveryDeps:
     # Places a not-dirty fabric-unverified hold (server._hold_device_fabric_unverified): a reset whose
     # fabric stayed a 77 settles there, never as a failed reset.
     hold_device_fabric_unverified: Optional[Callable[[str], None]] = None
+    # Counts a reset's post-reset 77 passes toward the open episode's I40 bound
+    # (server._note_fabric_77_reset_passes), so the next relift falls back at once instead of
+    # re-running the passes the reset just spent.
+    note_fabric_77_reset_passes: Optional[Callable[[int], None]] = None
     refresh_idle_hold_ledger: Optional[Callable[[], None]] = None
     spawn_idle_relift: Optional[Callable[[], None]] = None
     watch_idle_holders: Optional[Callable[[], None]] = None
@@ -698,6 +702,9 @@ class Recovery(ABC):
                 self.deps.hold_device_fabric_unverified(
                     "reset ran: enum+ARC healthy, fabric unverified after the post-reset retries"
                 )
+            if self.deps.note_fabric_77_reset_passes is not None:
+                self.deps.note_fabric_77_reset_passes(1 + retries)
+            self.mechanism.unverified_reset_since = self.deps.device_hold_episode_since() or None
             log("reset complete; enum+ARC healthy but the fabric is UNKNOWN — held fabric-unverified, not climbing")
             return None
         health_event(
