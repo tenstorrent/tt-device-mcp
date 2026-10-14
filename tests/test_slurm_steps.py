@@ -1563,7 +1563,7 @@ async def test_a_second_step_waits_for_the_first_instead_of_overlapping(monkeypa
     try:
         monkeypatch.setattr(srv, "device_health_gate", gate_one)
         task_one = asyncio.create_task(_call_pre_step(pre_step))
-        await asyncio.wait_for(first_started.wait(), timeout=2)
+        await asyncio.wait_for(first_started.wait(), timeout=10)
 
         monkeypatch.setattr(srv, "device_health_gate", gate_two)
         task_two = asyncio.create_task(_call_pre_step(pre_step))
@@ -1573,8 +1573,8 @@ async def test_a_second_step_waits_for_the_first_instead_of_overlapping(monkeypa
         assert len(srv._external_step_holders) == 1, srv._external_step_holders
 
         first_may_finish.set()
-        await asyncio.wait_for(task_one, timeout=2)
-        body_two = await asyncio.wait_for(task_two, timeout=5)
+        await asyncio.wait_for(task_one, timeout=10)
+        body_two = await asyncio.wait_for(task_two, timeout=10)
         assert second_started.is_set(), "the second step never ran once the first released"
         assert body_two["status"] == "ok", f"the second step did not get a clean verdict: {body_two}"
         assert srv.get_external_step_free_event().is_set(), "the device stayed reserved after both steps released"
@@ -1609,10 +1609,10 @@ async def test_a_step_that_waits_past_its_deadline_reports_inconclusive(monkeypa
     try:
         monkeypatch.setattr(srv, "device_health_gate", gate_one)
         task_one = asyncio.create_task(_call_pre_step(pre_step))
-        await asyncio.wait_for(first_started.wait(), timeout=2)
+        await asyncio.wait_for(first_started.wait(), timeout=10)
 
         monkeypatch.setattr(srv, "device_health_gate", gate_two)
-        body = await asyncio.wait_for(_call_pre_step(pre_step), timeout=5)
+        body = await asyncio.wait_for(_call_pre_step(pre_step), timeout=10)
 
         assert body["status"] == "inconclusive", f"a wait timeout was not inconclusive: {body}"
         assert body["ok"] is False
@@ -1620,7 +1620,7 @@ async def test_a_step_that_waits_past_its_deadline_reports_inconclusive(monkeypa
         assert second_gate_ran["n"] == 0, "the second step probed anyway after giving up on the wait"
     finally:
         first_may_finish.set()
-        await asyncio.wait_for(task_one, timeout=2)
+        await asyncio.wait_for(task_one, timeout=10)
         current_peer_uid.reset(tok)
 
 

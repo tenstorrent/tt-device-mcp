@@ -359,9 +359,9 @@ def test_the_pollers_are_the_broker_list(tmp_path, hdir, sent, monkeypatch):
         "tt-metrics-exporter.service": "failed",
         "tt-fmax-cap.service": "inactive",
     }
-    p.run()  # the broker's default list has all three
+    p.run()  # the broker's default list has the first two, not the clock-cap keeper
     assert ("start", "tt-metrics-exporter.service") in p.calls
-    assert ("start", "tt-fmax-cap.service") in p.calls
+    assert ("start", "tt-fmax-cap.service") not in p.calls
     monkeypatch.setenv("TT_DEVICE_MCP_POLLER_SERVICES", "my-poller.service")
     p.units = {"my-poller.service": "inactive", "tt-telemetry.service": "failed"}
     p.calls.clear()

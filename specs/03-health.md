@@ -135,7 +135,12 @@ job boundary.
   Its message keeps the validator's first error line, on the built-in path and in the wrapper
   script alike: a `what():` line, else a filesystem error, else a logged critical/error/`TT_THROW`
   line, else the `terminate called` banner (which sits ABOVE `what():` and names only the
-  exception type), else the last line.
+  exception type), else the last line. A `TT_FATAL @`/`TT_THROW @` header names only the source
+  line and the failed condition, so it carries the message from the line under its `info:`.
+  A run that reached no verdict keeps its exit code and the last 64 KiB of its output (stderr
+  included) in a `<stamp>_fabric_cannot_check_none` incident bundle (`fabric.log`, `incident.json`
+  evidence `rc`/`reason`), rotated with the other incidents, and its detail names the bundle, so
+  the cause reads without a rerun. A rerun with the same reason within an hour reuses that bundle.
 - **I18 — A healthy device is not reset because a job ended badly.** A timeout or kill is a
   reason to look hard (the full check, fabric included, post-job), then believe the answer. The
   one exception is a runtime-reported device fault, which outranks checks that are blind to it.
@@ -160,7 +165,7 @@ job boundary.
   explicit healthy verdict; a 77 on retry or a failure holds. With it off, a fabric-unverified hold
   with any trace of a fault falls into the generic escalate category rather than standing forever.
 - **I23 — Every hold terminates.** The hold-deadline watchdog puts a stuck hold on the durable
-  timeline once per window; past the ceiling (`_stuck_hold_ceiling_sec`, default 1200s; off-bus
+  timeline once per window; past the ceiling (`_stuck_hold_ceiling_sec`, default 600s; off-bus
   holds get one early attempt at `_offbus_hold_ceiling_sec`, default 120s) a tenant-free hold is
   force-escalated through the gate's own gentlest-first ladder (spec 04). Both re-arm per episode.
   The windows count from the episode start, kept on disk so a restart while held cannot rewind
@@ -359,7 +364,8 @@ job boundary.
   reader) runs the full fabric pass inside the same gate, exactly as a failed job's does, so its
   exit 77 holds fabric-unverified on a multi-chip mesh (I17). A read whose cores all advanced
   but whose measured link count is below the host's high-water mark (I28) is a skip of another
-  kind: the drop stays until an operator deletes `eth_link_baseline.json`, so it runs the fabric
+  kind: the drop stays until an operator deletes `eth_link_baseline.json` or a topology-mismatch
+  lift re-baselines it (I45), so it runs the fabric
   pass only when no pass is fresher than `FABRIC_CHECK_MIN_INTERVAL_SEC`. Otherwise the gate
   records the eth read SKIPPED and releases, as on a disarmed host. Without that limit every
   clean job on such a host paid a 45–100s pass. Accepted trade-off: a built-in read
@@ -441,7 +447,7 @@ job boundary.
   missing, the failed job pays the full pass as before. Only the in-broker job runner says a job
   never reached the device: a Slurm `post-step` still forces the pass, and so does a job the runner
   ended on its own error, before or after the spawn, however fast and whatever its exit code.
-  Rationale: blx01 lost its host ~9s into a pass forced 2s after a green one by a job that had
+  Rationale: box A lost its host ~9s into a pass forced 2s after a green one by a job that had
   failed in 0s on a missing directory; the pass is the heaviest load the broker puts on the mesh,
   and that job told it nothing.
 - **I37 — The stuck-hold alert hook is opt-in, backs off, and never blocks.** With
@@ -490,6 +496,96 @@ job boundary.
   leaves the hold standing, and the debt never carries to a later episode. The watch stops as soon
   as the hold is lifted or replaced by any other path, and it never runs the pass itself. With the
   validator present at startup, the only added cost is up to three stat calls.
+- **I40 — A 77-only hold is bounded; past the bound the startup checks gate it, never forever.**
+  Each idle-relift pass that 77s again on the same 77-only hold episode (I34) counts one retry.
+  After `TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES` (3) retries, or once the episode is
+  `TT_DEVICE_MCP_FABRIC_77_BOUND_SEC` (600 s) old with at least one retry behind it, the broker
+  journals `fabric_check_unrunnable_bound`, sends the alert hook (I37) and gates on the startup
+  checks instead of the fabric pass: enum+ARC (already passed on that relift) plus a positively
+  healthy eth-heartbeat read, which also compares the up-link count with the host's baseline, so a
+  link that went down never reads healthy. Only that releases the hold, with a warning
+  (`device_relift_fabric_unverified`; the fabric stays unverified and the next gate re-runs the
+  pass), and at most once per `TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC` (6 h). A frozen or
+  unreadable eth read, a link-count drop, or a second 77-only hold inside the window climbs the
+  present-mesh rung of the ladder with every guard of the stuck-hold escalation. A post-reset
+  fabric that is still a 77 after the eth-training retries (spec 04) is UNKNOWN, not a failed
+  reset: it never clears the hold, never arms the reset cooldown or the gate's two strikes, and
+  drives the idle ladder's host-rung climb only through a refused fallback, by way of spec 04 I29.
+  The reset settles as this 77-only hold (not dirty, the reported fault it was the remedy for
+  retired), its post-reset passes count toward this bound (so the next relift that 77s gates on
+  the startup checks at once), and this bound ends it. Idle path only: no added time between
+  jobs. The hardware fault of the first job after a
+  topology-mismatch lift (I42) is outside this bound: no release or rung can fix cabling. A
+  topology mismatch whose traffic-only rerun could not run is inside it (I45). The deadline
+  escalation resets neither (spec 04 I30). The validator's `Encountered
+  unrecoverable state` (links still missing after its retrains) is a measured fault, never a 77.
+- **I42 — A cabling-descriptor topology mismatch is never a reset; its lift is bounded by one job.**
+  When the validator stops on `Connection mismatch detected` (the links it discovered are not the
+  descriptor's; tray ids come from PCI bus numbers, so a moved uplink or an absent cable mismatches
+  on every run), `classify()` returns a skip whose detail starts with `topology mismatch`, never a
+  measured-bad verdict. The built-in path and `deploy/tt-device-fabric-check.sh` rerun once without
+  the descriptor, so traffic still crosses every discovered link, and classify that run with the
+  usual table: bad links are still a fault, a run that did not measure stays a topology skip (77).
+  A pass is OK and carries the `TOPOLOGY MISMATCH vs <descriptor>: N missing, M extra` marker (the
+  wrapper's last line before exit 0). The broker journals `fabric_topology_mismatch` with the trays
+  whose chips moved since the last clean pass (`fabric_ok_asic_bus.json` in the health dir) and
+  pages the operator once per distinct mismatch. The first job after that lift is watched: if it
+  fails on the fabric, the skipped links are a hardware fault, the device is held fabric-unverified
+  and every later fabric check is withheld (a 77-only hold, never a reset, reboot or power cycle)
+  until an operator restarts the broker. Any later job is outside the bound. A clean pass without the
+  marker ends the lift.
+- **I43 — A foreign-holder hold whose holder is gone is verified at once, not reset at the ceiling.**
+  A hold placed only because a tenant held the device when the gate wanted to verify
+  (`why == "foreign_holder"`) carries no measured fault. When the idle relift reaches it (the generic
+  branch, so `TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE` must be on) and a fresh holder scan shows no
+  tenant, no RUNNING job, no reaped job's leftover and a complete scan, it runs the pre-job verify
+  (enum+ARC, no traffic pass) under the device-op lock. It lifts on a healthy read only when no
+  runtime-named fault is pending and the last fabric verdict did not read UNHEALTHY, and only if the
+  hold is still the same undirtied foreign-holder hold after the verify. Any other outcome falls
+  through to the existing ceiling escalation (I23 generic), which is unchanged. A tenant still there
+  means no probe at all. It emits `foreign_holder_verify` with `lifted` either way.
+- **I44 — An idle foreign holder is named, never signalled.** A tenant process (`is_tenant`) that
+  holds a device fd outside every broker job/exec scope and is not a descendant of the broker is
+  tracked by its `/proc/<pid>/stat` CPU time (utime+stime+cutime+cstime), keyed on (pid, starttime)
+  so a reused pid is a new process. Once that CPU time has not changed for
+  `TT_DEVICE_MCP_IDLE_HOLDER_SEC` (default 900 s; 0 or less turns the detector off) the broker emits
+  one `idle_foreign_holder` health event and sends one alert through the I37 hook naming the user
+  and pid; an alert the busy hook dropped is retried on the next scan, the event is not repeated.
+  The sampler drives one detached scan every 60 s. The broker never kills, signals or otherwise
+  touches the holder: this only tells a person who to ask, because nothing bounds a hold beside a
+  live tenant (I13).
+- **I45 — A topology-mismatch lift re-baselines the eth link mark for its chip-to-bus map.** A
+  lift (I42) keys `eth_link_baseline.json` to the current chip-to-PCI-bus map and keeps the pre-lift
+  mark as `high_water`; the next eth read sets the mark at the links it measured (the ones the
+  traffic-only pass just crossed) and journals `eth_link_rebaselined`, so the heartbeat vouches for
+  the reduced mesh instead of skipping on every read. From then on the mark is a high-water rule
+  again: a link lost after the re-baseline is a drop (I28), and a later lift on the same map keeps
+  that mark. A read on another map (trays moved again) falls back to `high_water`. A clean pass
+  without the marker restores `high_water` as the mark. The built-in path caches the mismatch per
+  chip-to-bus map and descriptor (`fabric_topology_mismatch.json` in the health dir), including
+  one whose rerun could not measure: while both match, a gate skips the descriptor run that can
+  only throw the same mismatch (~19 s) and goes straight to the traffic-only rerun. The cache is
+  dropped by a clean pass without the marker, and by an eth read on the keyed map whose count
+  differs from the re-baselined mark (the cabling changed), so the next pass runs the descriptor
+  again. Deleting either file re-baselines by hand. A traffic-only rerun that could not run arms
+  the same re-baseline, so the hold it leaves takes the bounded fallback (I40) judged against the
+  mesh's own links, never the descriptor's; a release on a topology-mismatch hold is a lift, bounded
+  by its first job (I42).
+- **I46 — Jobs that keep dying on the fabric after passes that could not run are a known fault,
+  held without a reset.** A finished job that failed on the fabric's routing (`could not find any
+  forwarding direction`, `fabric router sync: timeout`, `waiting for active ethernet core`) right
+  after a fabric pass that reached no verdict (a 77) ran on a mesh no pass cleared. After
+  `TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS` (default 2) such jobs in a row, the broker declares a
+  known fabric fault: it journals `fabric_known_fault`, pages once through the alert hook, holds
+  the device fabric-unverified with that reason and does not mark the job's failure dirty (the
+  dirty flag's post-job reset only ends in another 77). The hold is outside the I40 bound (no
+  fallback release, no climb) and the deadline escalation holds it without a reset (spec 04 I30)
+  unless a runtime fault is reported. Any other job outcome, or a fabric pass that measured, breaks
+  the streak. A healthy fabric verdict ends the fault; otherwise it expires after
+  `TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC` (default 21600 s) and the usual 77 path gets one more
+  try, with the streak left one short so the next job that dies the same way declares it again.
+  Bounds the loop one Galaxy host ran: a 77, a reset, a release on another 77, and the next job
+  dead on routing, 24 resets in 2.5 h.
 
 ## Interfaces
 
@@ -720,7 +816,8 @@ short-circuit per I9. Each probe returns a tri-state that maps onto an `Observat
   `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, judged on exit code alone.
 - **fabric** (`health/monitors/fabric.py`): the traffic pass — pushes packets across every
   inter-chip link; the only check that proves the fabric moves data. Exit 0 healthy, 77 no
-  verdict (never a reset trigger, I17), non-zero unhealthy; a broker-side timeout is unhealthy.
+  verdict (never a reset trigger, I17; its output tail is kept in an incident bundle), non-zero
+  unhealthy; a broker-side timeout is unhealthy.
   Operator override: `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, exit code only. The real verdict latches
   on `last_fabric_ok`; a skip never overwrites it.
 - **aiclk ceiling** (`health/aiclk_ceiling.py`, I35): opt-in; runs
@@ -960,7 +1057,7 @@ refuses.
 | I14 | `tests/test_device_safety.py::test_an_empty_dev_dir_on_a_host_that_expects_chips_holds_not_releases`, `tests/test_device_safety.py::test_a_device_less_host_never_reads_an_empty_sysfs_as_a_drop` |
 | I15 | `tests/test_device_safety.py::test_an_unverified_clear_holds_the_device`, `tests/test_device_safety.py::test_a_gate_that_errored_holds`, `tests/test_device_safety.py::test_a_clean_device_is_not_held_by_an_unverified_clear`, `tests/test_device_safety.py::test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace`, `tests/test_device_safety.py::test_a_verified_clear_names_itself_and_records_it_was_verified` |
 | I16 | `tests/test_device_safety.py::test_a_frozen_eth_verdict_is_held_not_reset`, `tests/test_device_safety.py::test_a_frozen_eth_verdict_holds_the_door_even_when_not_pre_dirty`, `tests/test_device_safety.py::test_frozen_eth_reset_needs_both_kill_switches`, `tests/test_device_safety.py::test_eth_heartbeat_hang_reads_as_frozen_not_skipped` |
-| I17 | `tests/test_device_safety.py::test_dirty_device_is_not_reset_when_the_fabric_cannot_be_checked`, `tests/test_device_safety.py::test_an_unverified_fabric_is_never_recorded_as_verified_healthy`, `tests/test_fabric_probe.py::test_fabric_classification[77-cannot check-None]`, `tests/test_fabric_check_reason.py::test_first_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_fabric_check_reason.py::test_builtin_path_skip_detail_names_the_cause`, `tests/test_fabric_check_reason.py::test_override_path_reason_names_the_cause`, `tests/test_fabric_check_reason.py::test_wrapper_77_final_line_keeps_the_validators_first_error_line`, `tests/test_startup_fabric_hugepages.py::test_override_reason_prefers_the_cause_over_the_terminate_banner` |
+| I17 | `tests/test_device_safety.py::test_dirty_device_is_not_reset_when_the_fabric_cannot_be_checked`, `tests/test_device_safety.py::test_an_unverified_fabric_is_never_recorded_as_verified_healthy`, `tests/test_fabric_probe.py::test_fabric_classification[77-cannot check-None]`, `tests/test_fabric_check_reason.py::test_first_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_fabric_check_reason.py::test_builtin_path_skip_detail_names_the_cause`, `tests/test_fabric_check_reason.py::test_override_path_reason_names_the_cause`, `tests/test_fabric_check_reason.py::test_wrapper_77_final_line_keeps_the_validators_first_error_line`, `tests/test_startup_fabric_hugepages.py::test_override_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_startup_fabric_hugepages.py::test_a_77_run_keeps_its_stderr_tail_and_exit_code_in_an_incident_bundle` |
 | I18 | `tests/test_device_safety.py::test_a_healthy_device_is_not_reset_just_because_a_job_timed_out`, `tests/test_device_safety.py::test_a_runtime_reported_fault_holds_the_device` |
 | I19 | `tests/test_device_safety.py::test_a_dead_chip_is_isolated_without_waiting_for_the_device_lock`, `tests/test_device_safety.py::test_a_chip_dead_on_two_consecutive_samples_is_isolated`, `tests/test_device_safety.py::test_a_transient_all_ones_does_not_amputate_a_chip`, `tests/test_device_safety.py::test_a_reset_in_flight_must_not_look_like_dead_chips`, `tests/test_device_safety.py::test_a_reset_that_outlives_our_wait_still_shields_its_chips`, `tests/test_device_safety.py::test_every_chip_at_once_is_a_global_event_not_32_dead_chips`, `tests/test_device_safety.py::test_a_dead_chip_kills_the_processes_that_still_map_it` |
 | I20 | `tests/test_device_safety.py::test_watchdog_ping_gates_on_sampler_liveness` |
@@ -1014,6 +1111,13 @@ refuses.
 | I37 | `tests/test_alert_hook.py::test_unset_hook_runs_nothing`, `tests/test_alert_hook.py::test_alert_fires_once_on_the_first_stuck_window_then_backs_off`, `tests/test_alert_hook.py::test_alert_backoff_is_capped_at_a_day`, `tests/test_alert_hook.py::test_alert_re_arms_when_the_episode_closes`, `tests/test_alert_hook.py::test_a_hung_hook_never_blocks_and_is_killed_on_timeout`, `tests/test_alert_hook.py::test_hook_gets_the_event_as_json_on_stdin`, `tests/test_alert_hook.py::test_a_restart_mid_episode_keeps_the_backoff`, `tests/test_alert_hook.py::test_a_backoff_from_another_episode_is_ignored`, `tests/test_alert_hook.py::test_the_episode_closing_clears_the_stored_backoff`, `tests/test_alert_hook.py::test_a_chatty_hook_cannot_grow_the_broker_memory`, `tests/test_alert_hook.py::test_a_hook_that_exits_frees_the_slot_even_if_its_child_holds_the_pipe`, `tests/test_alert_hook.py::test_a_hook_killed_on_timeout_is_reaped_even_if_an_escaped_child_holds_the_pipe`, `tests/test_alert_hook.py::test_an_unparseable_hook_is_logged_once` |
 | I38 | `tests/test_postjob_fabric_relax.py::test_window_zero_forces_the_pass`, `tests/test_postjob_fabric_relax.py::test_fresh_ok_pass_and_clean_reads_skip_the_pass_and_say_so`, `tests/test_postjob_fabric_relax.py::test_without_a_fresh_ok_pass_the_pass_runs`, `tests/test_postjob_fabric_relax.py::test_an_unhealthy_verdict_clears_the_stamp_and_an_ok_one_sets_it`, `tests/test_postjob_fabric_relax.py::test_a_pass_with_no_verdict_does_not_refresh_the_stamp`, `tests/test_postjob_fabric_relax.py::test_a_dirty_or_unreadable_device_still_pays_the_pass`, `tests/test_postjob_fabric_relax.py::test_a_frozen_eth_read_holds_without_a_pass_or_reset`, `tests/test_postjob_fabric_relax.py::test_an_eth_read_with_no_verdict_runs_the_pass`, `tests/test_postjob_fabric_relax.py::test_a_failed_snapshot_goes_to_recovery`, `tests/test_postjob_fabric_relax.py::test_the_startup_gate_is_unchanged`, `tests/test_postjob_fabric_relax.py::test_job_failed_exit1_clean`, `tests/test_postjob_fabric_relax.py::test_only_the_log_tail_is_read`, `tests/test_postjob_fabric_relax.py::test_every_device_action_but_the_pass_clears_the_stamp`, `tests/test_postjob_fabric_relax.py::test_a_reset_after_the_ok_pass_makes_it_stale`, `tests/test_postjob_fabric_relax.py::test_rung_inventory_reports_the_window`, `tests/test_postjob_fabric_relax.py::test_the_runner_passes_a_clean_exit1_to_the_gate` |
 | I39 | `tests/test_startup_fabric_hugepages.py::test_validator_missing_names_what_is_not_installed`, `tests/test_startup_fabric_hugepages.py::test_validator_missing_is_none_once_the_install_lands`, `tests/test_startup_fabric_hugepages.py::test_validator_missing_waits_for_a_configured_descriptor`, `tests/test_startup_fabric_hugepages.py::test_a_startup_77_without_the_validator_starts_the_watch`, `tests/test_startup_fabric_hugepages.py::test_a_startup_77_with_the_validator_present_starts_no_watch`, `tests/test_startup_fabric_hugepages.py::test_a_startup_hugepages_timeout_starts_the_watch`, `tests/test_startup_fabric_hugepages.py::test_the_watch_owes_the_pass_once_the_validator_lands`, `tests/test_startup_fabric_hugepages.py::test_the_watch_also_waits_for_the_hugepages`, `tests/test_startup_fabric_hugepages.py::test_the_watch_stops_once_the_hold_is_settled_elsewhere`, `tests/test_startup_fabric_hugepages.py::test_the_watch_gives_up_after_its_bound`, `tests/test_startup_fabric_hugepages.py::test_the_owed_pass_runs_once_with_the_relift_off_and_lifts_on_healthy`, `tests/test_startup_fabric_hugepages.py::test_the_owed_pass_is_owed_once`, `tests/test_startup_fabric_hugepages.py::test_an_owed_pass_does_not_carry_to_another_episode` |
+| I40 | `tests/test_startup_fabric_hugepages.py::test_after_an_unknown_reset_the_next_relift_77_reaches_the_bound`, `tests/test_startup_fabric_hugepages.py::test_a_77_only_hold_past_its_bound_lifts_on_a_healthy_eth_read`, `tests/test_startup_fabric_hugepages.py::test_a_77_only_hold_with_a_link_drop_climbs_the_ladder_not_released`, `tests/test_startup_fabric_hugepages.py::test_a_second_77_only_hold_inside_the_window_climbs_the_ladder`, `tests/test_startup_fabric_hugepages.py::test_a_77_only_hold_under_its_bound_still_just_holds`, `tests/test_startup_fabric_hugepages.py::test_the_first_job_hardware_fault_is_outside_the_77_bound`, `tests/test_device_safety.py::test_a_reset_that_leaves_the_fabric_unverified_is_unknown`, `tests/test_device_safety.py::test_an_idle_reset_whose_fabric_stays_77_does_not_climb_to_a_host_rung`, `tests/test_fabric_probe.py::test_fabric_classification`, `tests/test_fabric_check_reason.py::test_wrapper_reports_links_missing_after_retrains_as_resettable_not_77` |
+| Fabric action-log row keeps the whole output (head and tail past its ceiling) | `tests/test_startup_fabric_hugepages.py::test_a_skipped_fabric_run_keeps_its_output_in_the_action_log`, `tests/test_startup_fabric_hugepages.py::test_a_failed_fabric_run_keeps_its_full_output_in_the_action_log`, `tests/test_startup_fabric_hugepages.py::test_only_output_past_the_ceiling_is_cut_and_both_ends_kept` |
+| I42 | `tests/test_fabric_check_reason.py::test_a_topology_mismatch_is_a_skip_not_a_measurement`, `tests/test_fabric_check_reason.py::test_an_ok_carrying_the_topology_marker_stays_ok_and_names_the_mismatch`, `tests/test_fabric_check_reason.py::test_wrapper_reruns_a_topology_mismatch_without_the_descriptor_and_ends_on_the_marker`, `tests/test_fabric_check_reason.py::test_wrapper_topology_rerun_that_measures_bad_links_is_unhealthy`, `tests/test_fabric_check_reason.py::test_wrapper_topology_rerun_that_cannot_measure_is_77_and_says_so`, `tests/test_fabric_topology_mismatch.py::test_moved_trays_names_only_chips_whose_tray_changed`, `tests/test_fabric_topology_mismatch.py::test_a_mismatch_reruns_traffic_only_and_an_ok_names_it_and_pages_once`, `tests/test_fabric_topology_mismatch.py::test_a_mismatch_whose_rerun_measures_bad_links_is_unhealthy`, `tests/test_fabric_topology_mismatch.py::test_a_mismatch_whose_rerun_cannot_measure_stays_a_topology_skip`, `tests/test_fabric_topology_mismatch.py::test_the_lift_is_bounded_by_the_first_job_only`, `tests/test_fabric_topology_mismatch.py::test_a_fabric_failure_on_the_first_job_holds_the_check_without_a_reset`, `tests/test_fabric_topology_mismatch.py::test_a_first_job_that_fails_off_the_fabric_is_not_a_topology_fault` |
+| I43 | `tests/test_device_safety.py::test_a_gone_foreign_holder_hold_lifts_on_the_pre_job_verify_without_a_reset`, `tests/test_device_safety.py::test_a_failed_fast_verify_falls_back_to_the_ceiling_reset`, `tests/test_device_safety.py::test_a_failed_fast_verify_inside_the_ceiling_holds`, `tests/test_device_safety.py::test_a_healthy_read_does_not_lift_over_a_named_fault_or_a_bad_fabric_verdict`, `tests/test_device_safety.py::test_the_fast_verify_never_probes_beside_a_tenant`, `tests/test_device_safety.py::test_the_fast_verify_does_not_lift_a_hold_re_dirtied_mid_verify`, `tests/test_device_safety.py::test_idle_relift_escalates_a_generic_arms_neither_hold` |
+| I44 | `tests/test_idle_holder.py::test_a_flat_holder_past_the_threshold_is_named_once_and_never_signalled`, `tests/test_idle_holder.py::test_cpu_time_moving_restarts_the_clock`, `tests/test_idle_holder.py::test_broker_jobs_and_system_holders_are_never_counted`, `tests/test_idle_holder.py::test_a_child_of_the_broker_is_never_counted`, `tests/test_idle_holder.py::test_a_reused_pid_is_a_new_process`, `tests/test_idle_holder.py::test_a_busy_alert_hook_is_retried_without_a_second_event`, `tests/test_idle_holder.py::test_a_gone_holder_is_forgotten`, `tests/test_idle_holder.py::test_threshold_is_configurable`, `tests/test_idle_holder.py::test_threshold_zero_turns_the_detector_off`, `tests/test_idle_holder.py::test_read_proc_cpu_reads_this_process_and_none_for_a_gone_pid`, `tests/test_idle_holder.py::test_the_sampler_spawn_is_rate_limited` |
+| I45 | `tests/test_fabric_topology_mismatch.py::test_a_lift_rebaselines_the_eth_mark_at_the_discovered_links`, `tests/test_fabric_topology_mismatch.py::test_trays_moving_again_drop_the_rebaseline_back_to_the_high_water_mark`, `tests/test_fabric_topology_mismatch.py::test_a_clean_pass_without_the_marker_restores_the_high_water_rule`, `tests/test_fabric_topology_mismatch.py::test_a_cached_mismatch_skips_the_descriptor_run_on_the_same_bus_map_only`, `tests/test_fabric_topology_mismatch.py::test_a_rerun_that_cannot_measure_arms_the_rebaseline_for_the_bounded_fallback`, `tests/test_startup_fabric_hugepages.py::test_a_topology_mismatch_whose_rerun_77s_takes_the_bounded_fallback` |
+| I46 | `tests/test_fabric_known_fault.py::test_two_jobs_dying_on_routing_after_77_passes_are_a_known_fault`, `tests/test_fabric_known_fault.py::test_anything_else_breaks_the_streak`, `tests/test_fabric_known_fault.py::test_a_healthy_fabric_verdict_ends_the_known_fault`, `tests/test_fabric_known_fault.py::test_the_known_fault_is_bounded_and_rearms_one_short`, `tests/test_fabric_known_fault.py::test_the_runner_holds_a_known_fabric_fault_without_the_dirty_reset`, `tests/test_startup_fabric_hugepages.py::test_a_known_fabric_fault_hold_is_outside_the_77_bound`, `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |
