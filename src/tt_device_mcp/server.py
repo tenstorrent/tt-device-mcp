@@ -1008,6 +1008,7 @@ _recovery_deps = RecoveryDeps(
     health_event=lambda kind, **f: health_event(kind, **f),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
+    hold_device_fabric_unverified=lambda why: _hold_device_fabric_unverified(why),
     refresh_idle_hold_ledger=lambda: _refresh_idle_hold_ledger(),
     spawn_idle_relift=lambda: _maybe_spawn_idle_relift(),
     episode_dirty=lambda: fsm.record.dirty,
@@ -1975,6 +1976,7 @@ def _reset_for_testing():
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant
+    global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic
     job_queue = None
     lock = None
     _action_row = None
@@ -1984,6 +1986,9 @@ def _reset_for_testing():
     device_hold_episode_reason = ""
     _hold_episode_restorable = True
     _hold_episode_tenant = False
+    _fabric_77_streak_since = None
+    _fabric_77_streak = 0
+    _fabric_77_fallback_release_monotonic = 0.0
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
@@ -3242,6 +3247,104 @@ def _idle_relift_armed() -> tuple[bool, bool, bool]:
     )
 
 
+# I40 — the bound on a 77-only hold. Each idle-relift pass that 77s again on the same episode adds
+# one to the streak; once it reaches FABRIC_77_MAX_RETRIES, or the episode is FABRIC_77_BOUND_SEC old
+# with at least one retry behind it, the fabric pass stops being the gate (see _fabric_77_fallback).
+_fabric_77_streak_since: Optional[str] = None
+_fabric_77_streak: int = 0
+# Monotonic time of the last release the fallback granted on a still-unverified fabric. A second
+# 77-only hold within FABRIC_77_RELEASE_WINDOW_SEC of it goes to the ladder, not another release.
+_fabric_77_fallback_release_monotonic: float = 0.0
+
+
+def _env_int(name: str, default: int, floor: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return max(floor, int(raw)) if raw else default
+    except ValueError:
+        return default
+
+
+# A topology-mismatch skip, and the hardware fault the first job after its lift names, are holds no
+# fallback release may lift: the cabling is not what the descriptor says, and enum+ARC and the eth
+# read cannot see that. They stay outside the I40 budget and release.
+_TOPOLOGY_HOLD_PREFIX = "topology mismatch"
+_TOPOLOGY_HW_FAULT = "hardware fault: the first job after a topology-mismatch lift"
+
+
+def _topology_mismatch_hold(evidence: dict) -> bool:
+    details = (str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or ""))
+    return any(d.startswith(_TOPOLOGY_HOLD_PREFIX) or _TOPOLOGY_HW_FAULT in d for d in details)
+
+
+def _fabric_77_bound_reached() -> bool:
+    """Count this 77 against the open episode and say whether the I40 bound is reached."""
+    global _fabric_77_streak_since, _fabric_77_streak
+    if _fabric_77_streak_since != fsm.record.since:
+        _fabric_77_streak_since, _fabric_77_streak = fsm.record.since, 0
+    _fabric_77_streak += 1
+    if _fabric_77_streak >= _env_int("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", 3, 1):
+        return True
+    try:
+        age = (datetime.now() - datetime.fromisoformat(str(fsm.record.since))).total_seconds()
+    except (TypeError, ValueError):
+        return False
+    return age >= _env_int("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", 600, 60)
+
+
+async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
+    """The fabric check could not run on a bounded number of retries: alert, then gate on the startup
+    checks instead. enum+ARC already passed (the caller's observe returned healthy); add the eth
+    heartbeat, which also compares the measured up-link count with the host's baseline, so a link
+    that went down reads as no-verdict rather than healthy. A 77 is never a healthy fabric: only a
+    positively healthy read, and no fallback release in the window, lifts the hold, with a warning.
+    Frozen, unreadable, a link-count drop, or a second 77-only hold inside the window climbs the
+    ladder (the present-mesh rung, with every guard of _escalate_stuck_hold). Returns True when it
+    settled the hold."""
+    global _fabric_77_fallback_release_monotonic
+    window = _env_int("TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC", 21600, 0)
+    recent = bool(_fabric_77_fallback_release_monotonic) and (
+        time.monotonic() - _fabric_77_fallback_release_monotonic < window
+    )
+    event = {
+        "kind": "fabric_check_unrunnable_bound",
+        "host": socket.gethostname(),
+        "held_since": fsm.record.since,
+        "retries": _fabric_77_streak,
+        "detail": str((evidence.get("fabric") or {}).get("detail", ""))[:300],
+        "repeat_within_window": recent,
+    }
+    health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
+    if logger:
+        logger.warning(
+            f"FABRIC-77-BOUND the fabric check could not run on {_fabric_77_streak} retries of this hold "
+            "— falling back to the startup checks as the gate"
+        )
+    alert.send_alert(event, logger)
+    eok, edetail = await health_monitor.verify_eth_heartbeat()
+    if eok is True and not recent:
+        _fabric_77_fallback_release_monotonic = time.monotonic()
+        log(
+            f"startup checks pass (enum+ARC healthy, eth heartbeat {edetail or eok!r}) — hold lifted "
+            "WITH A WARNING: the fabric is unverified, the next gate re-runs the pass"
+        )
+        health_event("device_relift_fabric_unverified", evidence=evidence, retries=_fabric_77_streak)
+        _clear_device_dirty(
+            verified=True, why="idle relift: fabric check unrunnable past its bound; startup checks pass"
+        )
+        return True
+    log(
+        "startup checks do not clear it ("
+        + (
+            "a fallback release already ran inside the window"
+            if eok is True
+            else f"eth heartbeat {'frozen' if eok is False else 'gave no verdict'}: {edetail}"
+        )
+        + ") — climbing the recovery ladder"
+    )
+    return await escalate("present")
+
+
 async def _attempt_idle_relift() -> None:
     """Re-verify a device HELD while idle and lift the hold once the mesh proves fit — never a reset.
 
@@ -3383,6 +3486,16 @@ async def _attempt_idle_relift() -> None:
                 # so gate the lift on an explicit True. An unverifiable or failed fabric on retry is
                 # not proof, and reopening on it hands the next tenant a mesh no pass cleared.
                 fabric_ok = (evidence.get("fabric") or {}).get("ok")
+                if (
+                    fabric_ok is None
+                    and _fabric_77_only_hold()
+                    and not _topology_mismatch_hold(evidence)
+                    and _fabric_77_bound_reached()
+                ):
+                    # I40: a pass that cannot run is retried a bounded number of times, never
+                    # forever. Past the bound the startup checks become the gate.
+                    if await _fabric_77_fallback(evidence, _log, _escalate):
+                        return
                 if fabric_ok is not True:
                     _log(
                         f"fabric still could not verify on retry ({fabric_ok!r}) — holding; "

@@ -227,6 +227,9 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_SELFHEAL_RELIFT` | 1 | Idle relift of a self-healed hold | 03 |
 | `TT_DEVICE_MCP_SELFHEAL_RELIFT_SEC` | 120 | Idle relift cadence | 03 |
 | `TT_DEVICE_MCP_FABRIC_RELIFT` | 0 | Opt-in relift of fabric-unverified holds | 03 |
+| `TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES` | 3 | Idle-relift 77 retries on one 77-only hold before the startup checks gate it (I40) | 03 |
+| `TT_DEVICE_MCP_FABRIC_77_BOUND_SEC` | 600 | Age of a 77-only hold (at least one retry behind it) past which the startup checks gate it (I40) | 03 |
+| `TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC` | 21600 | At most one I40 fallback release per window; a second 77-only hold inside it climbs the ladder | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD` | 1 | Hold tenant jobs at the door while degraded (vs fail-fast) | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD_POLL_SEC` | 60 | Held-job re-check cadence | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` | hold deadline (1200) | Longest a held job waits before it fails and the hold escalates; no value disables it | 01 |

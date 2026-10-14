@@ -12135,12 +12135,16 @@ async def test_post_reboot_climb_keeps_the_escalated_marker_and_the_reset_retrie
 
 
 @pytest.mark.asyncio
-async def test_a_reset_that_leaves_the_fabric_unverified_is_not_recovered(monkeypatch, tmp_path):
+async def test_a_reset_that_leaves_the_fabric_unverified_is_unknown(monkeypatch, tmp_path, clear_job_state):
     """H2: on a multi-chip host, a galaxy reset whose fabric still cannot verify after eth-training
-    retries (persistent 77) is NOT a recovery — enum+ARC came back but the fabric proved nothing, so
-    _reset_and_verify_device returns False and the caller climbs (E0) instead of clearing the hold onto
-    an unverified fabric (which loops). Fails on base, where a 77 reads as recovered (healthy=True)."""
+    retries (persistent 77) is NOT a recovery — enum+ARC came back but the fabric proved nothing — and
+    NOT a failed reset either: a 77 measured nothing. _reset_and_verify_device returns None, the hold is
+    neither cleared onto an unverified fabric nor counted a failed reset (cooldown, two strikes, host
+    rungs): it becomes a not-dirty 77-only fabric-unverified hold the idle relift re-checks (spec 03 I40)."""
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    srv._mark_device_dirty("job 007 ended: eth link down")
+    monkeypatch.setattr(srv, "device_fault_reported", "ethernet link timeout")
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", True)
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRIES", 1)
 
     async def no_foreign(log):
@@ -12161,8 +12165,30 @@ async def test_a_reset_that_leaves_the_fabric_unverified_is_not_recovered(monkey
     patch_health_event(monkeypatch, lambda *a, **k: None)
 
     recovered = await srv.galaxy_recovery._reset_and_verify_device(["0", "1"], lambda _m: None)
-    assert recovered is False, "a persistent post-reset 77 must count NOT recovered so the caller climbs"
+    assert recovered is None, "a persistent post-reset 77 is UNKNOWN: neither recovered nor a failed reset"
     assert calls["n"] >= 2, "the post-reset fabric must be retried at least once for eth training"
+    assert srv.recovery_mechanism.last_reset_failed is False, "a 77 must not arm the cooldown or the two strikes"
+    assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY and not srv.fsm.record.dirty
+    assert srv.fsm.state is ServerState.RECOVERING, "the door stays shut: no hold cleared onto an unverified fabric"
+    assert srv._fabric_77_only_hold(), "the hold must be 77-only, so the relift's I40 bound owns it"
+
+
+@pytest.mark.asyncio
+async def test_an_idle_reset_whose_fabric_stays_77_does_not_climb_to_a_host_rung(monkeypatch, clear_job_state):
+    """The idle escalation's galaxy reset comes back with enum+ARC healthy and a persistent fabric 77
+    (UNKNOWN). It must not climb toward a reboot or power cycle as if the reset failed: nothing
+    measured a failure. Fails on base, where the 77 read as a failed reset and the climb ran."""
+    counters = _arm_stuck_hold(monkeypatch, reset_result=None, beats_after_reset={})
+    climbs = []
+
+    async def climb(*a, **k):
+        climbs.append(a)
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_climb_to_host_recovery_after_failed_reset", climb)
+    ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert ran is True and counters["resets"] == 1
+    assert climbs == [], "an UNKNOWN post-reset fabric must not drive the host-rung climb"
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0
 
 
 # --- G-tier safe U-fixes: fail-closed / loudness on the silent-degrade paths -------------

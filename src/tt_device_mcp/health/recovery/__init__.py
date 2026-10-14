@@ -70,7 +70,8 @@ BRIDGE_RESET_SETTLE_SEC = 4
 # A reset returns before the eth links re-train, so the immediate post-reset fabric pass can find
 # no trained link (77). Retry (see Recovery._verify_device_after_reset), giving the links time to
 # train, so the reset resolves to a REAL verdict rather than a transient 77 that reads as
-# "recovered" onto an unverified fabric. A 77 that persists past the retries is a genuine wedge.
+# "recovered" onto an unverified fabric. A 77 that persists past the retries is UNKNOWN: the reset is
+# neither a recovery nor a failure, and the mesh is held fabric-unverified (spec 03 I34/I40 bound it).
 POST_RESET_FABRIC_RETRIES = int(os.environ.get("TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES", "1"))
 POST_RESET_FABRIC_RETRY_SLEEP_SEC = float(os.environ.get("TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC", "60"))
 
@@ -256,6 +257,9 @@ class RecoveryDeps:
     health_event: Optional[Callable[..., None]] = None
     kill_device_holders: Optional[Callable[[str], Awaitable[list]]] = None
     mark_device_dirty: Optional[Callable[..., None]] = None
+    # Places a not-dirty fabric-unverified hold (server._hold_device_fabric_unverified): a reset whose
+    # fabric stayed a 77 settles there, never as a failed reset.
+    hold_device_fabric_unverified: Optional[Callable[[str], None]] = None
     refresh_idle_hold_ledger: Optional[Callable[[], None]] = None
     spawn_idle_relift: Optional[Callable[[], None]] = None
     # The sampler's two FSM reads. Late-bound like everything else here — NOT the fsm reference
@@ -544,16 +548,17 @@ class Recovery(ABC):
         f = evidence.get("fabric")
         return f is not None and f.get("ok") is None
 
-    async def _verify_device_after_reset(self, expected: int, log) -> tuple[bool, dict, int]:
+    async def _verify_device_after_reset(self, expected: int, log) -> tuple[Optional[bool], dict, int]:
         """Verify a mesh after a reset, giving a post-reset fabric 77 time to settle before it is believed.
 
         A reset returns before the eth links re-train, so the first fabric pass can find no trained link
         (a 77 — a training-window verdict, not a cleared or a broken fabric). Re-check up to
         ``POST_RESET_FABRIC_RETRIES`` times so it resolves to a REAL verdict; multi-chip only, while
-        enum+ARC pass. A fabric that STILL cannot verify after training (a persistent 77) is an eth/fabric
-        wedge the reset did not clear — report it NOT healthy so the caller climbs to the next rung instead
-        of clearing a hold onto a fabric no pass ever proved (the blx04 shape: enum+ARC read OK while every
-        full-mesh job died on a down link). Returns ``(healthy, evidence, fabric_retries)``."""
+        enum+ARC pass. A fabric that STILL cannot verify after training (a persistent 77) is UNKNOWN —
+        ``healthy`` is None: never a recovery (no hold is cleared onto a fabric no pass proved, the blx04
+        shape: enum+ARC read OK while every full-mesh job died on a down link), and never a failed reset
+        either (a 77 measured nothing, so it must not arm the host rungs). Falsy, so a caller that only
+        asks "recovered?" still reads no. Returns ``(healthy, evidence, fabric_retries)``."""
         healthy, evidence = await self._verify_device(expected, log)
         retries = 0
         while (
@@ -571,13 +576,13 @@ class Recovery(ABC):
             healthy, evidence = await self._verify_device(expected, log)
         if healthy and expected > 1 and self._fabric_ran_but_unverified(evidence):
             log(
-                "post-reset fabric still could not verify after eth-training retries — treating the reset as "
-                "NOT recovered (the eth/fabric wedge survived; the caller climbs, it does not clear)"
+                "post-reset fabric still could not verify after eth-training retries — the fabric is UNKNOWN "
+                "(enum+ARC healthy, no pass got a verdict): not recovered, and not a failed reset"
             )
-            healthy = False
+            healthy = None
         return healthy, evidence, retries
 
-    async def _reset_and_verify_device(self, indices: list, log) -> bool:
+    async def _reset_and_verify_device(self, indices: list, log) -> Optional[bool]:
         """Recover the device with ONE reset, performed safely, then prove it worked.
 
         Safety here is structural, not statistical — the reset is exclusive (the caller
@@ -590,7 +595,9 @@ class Recovery(ABC):
         will not revive it on an immediate retry, and every extra reset is another pass
         of MMIO at a dead endpoint — the exact traffic that promotes a PCIe error to
         fatal and takes the host down with it. One attempt, then back off and let the
-        caller report honestly. Returns True if the device verified healthy.
+        caller report honestly. Returns True if the device verified healthy, None when the reset ran,
+        enum+ARC verify and only the fabric stayed unverifiable (a persistent 77: held fabric-unverified,
+        the caller must not climb on it), False otherwise.
         """
         try:
             return await self._reset_and_verify_device_once(indices, log)
@@ -598,7 +605,7 @@ class Recovery(ABC):
             # The reset and its verify are over and the host is still up: an off-bus intent is spent.
             pcie_guard.end_offbus_reset()
 
-    async def _reset_and_verify_device_once(self, indices: list, log) -> bool:
+    async def _reset_and_verify_device_once(self, indices: list, log) -> Optional[bool]:
         # Reset per call: only a reset that actually EXITS non-zero this pass sets it below. An adopted
         # foreign scope or a clean-exit-but-unverified reset must not leave a stale hard-fail flag that
         # steers the next gate's escalation to the cold rung over a reset that never hard-failed.
@@ -674,6 +681,21 @@ class Recovery(ABC):
         # clear, so this always reports "ok" whether or not the device comes back healthy.
         metrics.stage_fired("smi_reset", "ok")
         healthy, evidence, retries = await self._verify_device_after_reset(expected, log)
+        if healthy is None:
+            # A persistent post-reset 77 is UNKNOWN, not a failed recovery: the chips came back, and the
+            # fabric pass measured nothing. Counting it failed armed the cooldown and the gate's two
+            # strikes, and drove the idle ladder toward a host rung on no evidence. Hold fabric-unverified
+            # (not dirty) instead: the reset was the remedy a reported fault was pending, so retire that,
+            # and the hold is 77-only — the idle relift re-runs the pass, bounded by spec 03 I40.
+            health_event("reset_unverified", rc=rc, evidence=evidence, fabric_retries=retries)
+            self.mechanism.last_reset_failed = False
+            self.deps.clear_device_reported_fault("reset ran and enum+ARC verify; the fabric is unknown")
+            if self.deps.hold_device_fabric_unverified is not None:
+                self.deps.hold_device_fabric_unverified(
+                    "reset ran: enum+ARC healthy, fabric unverified after the post-reset retries"
+                )
+            log("reset complete; enum+ARC healthy but the fabric is UNKNOWN — held fabric-unverified, not climbing")
+            return None
         health_event(
             "reset_verified" if healthy else "reset_ineffective",
             rc=rc,
