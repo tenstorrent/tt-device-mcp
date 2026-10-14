@@ -146,7 +146,7 @@ def _run_wrapper_topology(tmp_path, rerun_output: str, rerun_rc: int):
     fake.write_text(
         "#!/bin/sh\n"
         f"echo \"$*\" >> '{calls}'\n"
-        f'case "$*" in *cabling*) cat \'{tmp_path / "mismatch.txt"}\'; exit 134 ;; esac\n'
+        f"case \"$*\" in *cabling*) cat '{tmp_path / 'mismatch.txt'}'; exit 134 ;; esac\n"
         f"cat '{tmp_path / 'rerun.txt'}'\nexit {rerun_rc}\n"
     )
     fake.chmod(0o755)

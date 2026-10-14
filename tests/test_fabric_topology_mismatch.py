@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 """A cabling-descriptor topology mismatch is never a reset: the built-in path reruns traffic-only,
-an OK names the mismatch, and the lift is bounded by the next job (03 I40). No device is opened:
+an OK names the mismatch, and the lift is bounded by the next job (03 I42). No device is opened:
 the validator, the chip snapshot and the alert hook are stand-ins."""
 
 import pytest

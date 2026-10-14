@@ -7571,7 +7571,7 @@ export {JOB_TAG_ENV}={job_tag}
                 # the jobs that died of it, leaving a generic "ended failed" the gate then
                 # cleared on the word of checks that cannot see this fault at all.
                 # The first job after a topology-mismatch lift is the bound on that lift: one that
-                # dies on the fabric makes it a hardware fault, held without a reset (03 I40).
+                # dies on the fabric makes it a hardware fault, held without a reset (03 I42).
                 if health_monitor is not None:
                     topo = health_monitor.note_job_after_topology_lift(
                         job.status != JobStatus.COMPLETED, _read_job_log_tail(job_log_file)
