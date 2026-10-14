@@ -180,7 +180,7 @@ class RecoveryDeps:
     # True while the broker has a job in RUNNING state. The holder scan alone is NOT enough evidence
     # that the device is idle: it reads open /dev/tenstorrent fds, and a running job spends minutes
     # off the device (compiling, loading weights, between opens), during which the scan is empty and
-    # the ladder read the box as idle. Measured on g15blx02 2026-09-17: the stuck-hold escalation
+    # the ladder read the box as idle. Measured on box B 2026-09-17: the stuck-hold escalation
     # fired a mesh reset 106 s into a running job, and the job died of SIGPIPE the second the reset
     # released the device. The broker knows its own queue — ask it, never infer idleness from fds.
     job_running: Callable[[], bool]
@@ -262,6 +262,7 @@ class RecoveryDeps:
     hold_device_fabric_unverified: Optional[Callable[[str], None]] = None
     refresh_idle_hold_ledger: Optional[Callable[[], None]] = None
     spawn_idle_relift: Optional[Callable[[], None]] = None
+    watch_idle_holders: Optional[Callable[[], None]] = None
     # The sampler's two FSM reads. Late-bound like everything else here — NOT the fsm reference
     # itself: srv.fsm is the one singleton the test fixtures rebind wholesale (a fresh durable
     # record per test), and a captured reference would keep judging a previous test's episode.
@@ -555,7 +556,7 @@ class Recovery(ABC):
         (a 77 — a training-window verdict, not a cleared or a broken fabric). Re-check up to
         ``POST_RESET_FABRIC_RETRIES`` times so it resolves to a REAL verdict; multi-chip only, while
         enum+ARC pass. A fabric that STILL cannot verify after training (a persistent 77) is UNKNOWN —
-        ``healthy`` is None: never a recovery (no hold is cleared onto a fabric no pass proved, the blx04
+        ``healthy`` is None: never a recovery (no hold is cleared onto a fabric no pass proved, the box D
         shape: enum+ARC read OK while every full-mesh job died on a down link), and never a failed reset
         either (a 77 measured nothing, so it must not arm the host rungs). Falsy, so a caller that only
         asks "recovered?" still reads no. Returns ``(healthy, evidence, fabric_retries)``."""

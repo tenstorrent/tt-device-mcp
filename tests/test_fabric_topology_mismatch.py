@@ -124,7 +124,7 @@ async def test_a_first_job_that_fails_off_the_fabric_is_not_a_topology_fault(top
     assert m.topology_hw_fault == ""
 
 
-# ---- I43: a lift re-baselines the eth link mark per chip-to-bus map; the mismatch is cached ----
+# ---- I45: a lift re-baselines the eth link mark per chip-to-bus map; the mismatch is cached ----
 
 
 def _baseline(tmp_path) -> dict:

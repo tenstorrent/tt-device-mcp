@@ -88,7 +88,7 @@ def _load_asic_bus_map() -> dict[str, int]:
 
 # A topology mismatch remembered per chip-to-bus map: while the map is unchanged, the descriptor
 # run that would only throw the same mismatch again (~19 s) is skipped and the gate goes straight
-# to the traffic-only rerun. Spec 03 I43.
+# to the traffic-only rerun. Spec 03 I45.
 TOPOLOGY_CACHE_FILE = "fabric_topology_mismatch.json"
 
 
@@ -473,7 +473,7 @@ class HealthMonitor:
             data, baseline, corrupt = {}, 0, True
         topo = self._topology_baseline(data)
         if topo is not None:
-            # A topology-mismatch lift re-baselined this host (I43): the mark belongs to the
+            # A topology-mismatch lift re-baselined this host (I45): the mark belongs to the
             # chip-to-bus map it was taken on, and the pre-lift mark is kept as ``high_water``.
             high, keyed, pending = topo
             if keyed != _asic_bus_map():
@@ -862,7 +862,7 @@ class HealthMonitor:
         cached = _cached_topology_mismatch(desc) if desc else None
         if cached:
             # This chip-to-bus map already mismatched the descriptor: that run would only throw the
-            # same mismatch again, so go straight to the traffic-only rerun (I43).
+            # same mismatch again, so go straight to the traffic-only rerun (I45).
             rc, text, ok, reason = await self._fabric_traffic_only_rerun(
                 desc, "", timeout_sec=timeout_sec, track=_track, cwd=cwd, marker=cached
             )
@@ -926,7 +926,7 @@ class HealthMonitor:
             health_event("fabric_check_unavailable", detail=reason[:400], cmd=cmd)
             if reason.startswith(fabric.TOPOLOGY_MISMATCH):
                 # The rerun could not measure: the bounded fallback (I40) judges the eth read, so it
-                # needs the mark for this mesh, not the descriptor's (I43).
+                # needs the mark for this mesh, not the descriptor's (I45).
                 self._arm_eth_rebaseline()
             return None, f"fabric check COULD NOT RUN ({dt:.0f}s): {reason[:400]}"
         self.last_fabric_ok = False
