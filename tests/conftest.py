@@ -23,7 +23,7 @@ import tt_device_mcp.job_reap as job_reap
 import tt_device_mcp.server as srv
 from tt_device_mcp import privileges
 from tt_device_mcp.fsm import ServerFsm
-from tt_device_mcp.health import bmc_capture
+from tt_device_mcp.health import bmc_capture, post_reset
 from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState
@@ -746,6 +746,7 @@ def patch_health_event(monkeypatch, fn) -> None:
     monkeypatch.setattr(recovery_galaxy, "health_event", fn)
     monkeypatch.setattr(pcie_guard, "health_event", fn)
     monkeypatch.setattr(recovery_base, "health_event", fn)
+    monkeypatch.setattr(post_reset, "health_event", fn)
 
 
 def patch_recovery(monkeypatch, name: str, fn) -> None:
