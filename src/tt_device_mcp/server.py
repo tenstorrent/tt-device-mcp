@@ -2982,6 +2982,39 @@ def _hold_device_fabric_unverified(why: str) -> None:
     fsm.on_fault("fabric_unverified", detail=why, dirty=False)
 
 
+def _reopen_boot_carried_fabric_hold() -> bool:
+    """Hand a DOWN fabric-unverified episode an earlier boot left behind back to this boot's bounded
+    77 path (spec 03 I49). Called by the startup gate right after it placed the 77 hold.
+
+    The record carries state/why/since/latches across a reboot, so the startup 77 lands on a DOWN
+    episode: no idle relift re-checks DOWN, the prerequisite watch wants RECOVERING, and the deadline
+    escalation holds a fabric-only hold without a reset, so it paged once and held forever. When the
+    startup pass found every chip present and named no fault, reopen it RECOVERING on a fresh clock
+    and owe it one startup pass (whatever TT_DEVICE_MCP_FABRIC_RELIFT says, as I39), so the relift,
+    the I48 backoff and the I40 bound verify it or fall back. Anything else keeps the hold as is."""
+    global device_hold_escalated_monotonic, _startup_fabric_owed_since
+    record = fsm.record
+    if (
+        record.why != FABRIC_RELIFT_WHY
+        or record.dirty
+        or device_fault_reported
+        or isolated_chips
+        or health_monitor.last_fabric_ok is False
+    ):
+        return False
+    if not fsm.reopen_after_boot():
+        return False
+    device_hold_escalated_monotonic = 0.0
+    _startup_fabric_owed_since = fsm.record.since
+    health_event("boot_fabric_reverify", prior_since=record.since, since=fsm.record.since)
+    if logger:
+        logger.warning(
+            f"STARTUP FABRIC: the fabric-unverified hold carried from an earlier boot (DOWN since "
+            f"{record.since}) reopens on this boot's clock; the idle relift re-runs the pass"
+        )
+    return True
+
+
 async def _verify_operator_reset(present: int, recovery, log, source: str) -> tuple[Optional[bool], str]:
     """Verify an operator reset (the tool or the stream) whose command exited 0, and settle the
     device on the verdict. Caller holds the device-op lock: a multi-chip verify runs the fabric pass.
@@ -5002,6 +5035,8 @@ async def device_health_gate(
             # Mark it fabric-unverified so the opt-in fabric relift can re-run the pass while
             # idle — a transient 77 otherwise strands the mesh here until a broker restart.
             _hold_device_fabric_unverified(f"gate/{phase}: enum+ARC healthy, fabric unverified")
+            if phase == "startup":
+                _reopen_boot_carried_fabric_hold()
             _note_tenant_gate_verdict(f"device unverified: gate/{phase}: enum+ARC healthy, fabric unverified (rc 77)")
             return
 
