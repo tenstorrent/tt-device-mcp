@@ -12182,7 +12182,7 @@ def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output=""
     monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, why=why))
     monkeypatch.setattr(srv, "device_fault_reported", fault)
     monkeypatch.setattr(srv, "isolated_chips", set())
-    monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: False)  # the dirty case blx01 hit
+    monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: False)  # the dirty case a field host hit
     monkeypatch.setattr(srv, "_present_chip_indices", lambda: [str(i) for i in range(32)])
     monkeypatch.setattr(srv.health_monitor, "expected", lambda n: 32)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_output", fabric_output)
