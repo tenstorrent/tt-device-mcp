@@ -778,7 +778,10 @@ and per-boot cap (I7, I9, I10); a denied opted-in rung journals `auto_recovery_d
 hold episode. `boot_from_broker_escalation` back-fills the boot that results; on coming back up
 from a broker-fired warm reboot, `_verify_post_reboot_recovery` compares what returned to what
 left and climbs a still-off-bus mesh to the power cycle (never a second warm reboot — the rung
-that just failed), or holds loudly naming the BMC command when the cold rung is not armed.
+that just failed), or holds loudly naming the BMC command when the cold rung is not armed. It runs
+on the boot's first broker start only (`fsm.restarted_this_boot` false): the ledger entry stays
+adjacent to the boot for its whole life, and a restart later in the same boot that finds a fresh
+degradation is not that reboot's verdict — it stays held for the forced startup gate and its ladder.
 Absence is never health: every blocked/exhausted path emits a loud actionable event
 (`ubb_reset_required`, `all-off-bus power-cycle required`,
 `reset_unrecoverable_power_cycle_required`) rather than a silent hold.
@@ -1014,6 +1017,7 @@ sees a silent fabric pass.
 | escalate() outcome mapping; unknown phase rejected | `tests/test_device_safety.py::test_escalate_waits_when_nothing_ran`, `tests/test_device_safety.py::test_escalate_recovers_on_a_present_mesh_reset`, `tests/test_device_safety.py::test_escalate_reports_terminal_when_a_present_mesh_reset_fails_and_climbs`, `tests/test_device_safety.py::test_escalate_does_not_report_recovered_when_the_mesh_was_never_degraded`, `tests/test_device_safety.py::test_escalate_rejects_an_unknown_phase` |
 | Forced ladder has teeth on every platform | `tests/test_device_safety.py::test_force_escalate_has_teeth_on_a_per_target_host`, `tests/test_device_safety.py::test_hold_past_ceiling_triggers_forced_escalation` |
 | Post-reboot verify: climbs to cold rung, never a second warm reboot | `tests/test_device_safety.py::test_post_reboot_all_off_bus_climbs_to_the_power_cycle`, `tests/test_device_safety.py::test_post_reboot_verify_never_repeats_the_warm_reboot`, `tests/test_device_safety.py::test_post_reboot_all_off_bus_holds_loudly_with_no_cold_rung_opted_in`, `tests/test_device_safety.py::test_boot_attribution_rejects_a_stale_escalation`, `tests/test_device_safety.py::test_an_escalation_fired_on_this_same_boot_is_not_attributed_to_it` |
+| Post-reboot verify runs on the boot's first broker start only, never on a same-boot restart | `tests/test_device_safety.py::test_post_reboot_verify_runs_on_the_boots_first_broker_start`, `tests/test_device_safety.py::test_a_restart_later_in_the_boot_does_not_rerun_the_post_reboot_verify` |
 | Reset tool contract: steps/attribution/no-devices/job stop | `tests/test_reset.py::test_reset_success_reports_steps_and_command`, `tests/test_reset.py::test_reset_failure_surfaces_returncode_and_output`, `tests/test_reset.py::test_explicit_reset_leaves_one_row_attributed_to_the_caller`, `tests/test_reset.py::test_reset_no_devices_does_not_call_tt_smi`, `tests/test_reset.py::test_a_reset_stops_the_running_job_gracefully`, `tests/test_reset.py::test_reset_device_quiesce_scope_routes_a_live_privsep_job` |
 | Rung inventory stated loudly at boot | `tests/test_rung_arming.py::test_a_rung_that_is_off_is_stated_loudly` |
 | Stage metrics: structural inapplicability is not "blocked" | `tests/test_metrics.py::test_ubb_tray_no_tray_on_this_platform_is_not_applicable_not_blocked`, `tests/test_metrics.py::test_bridge_reset_missing_pci_address_is_not_applicable_not_blocked` |

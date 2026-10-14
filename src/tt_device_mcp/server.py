@@ -8954,14 +8954,20 @@ async def _record_startup_health() -> None:
                 _mark_device_dirty(f"broker start: {detail}", why="heartbeat")
                 # If this boot is a warm reboot the broker fired and the mesh did not come back, the
                 # reboot is spent (it cannot re-enumerate a whole-bus wedge) — climb to the cold rung
-                # now rather than re-holding it dead, the failure that lost box B for ~18h.
+                # now rather than re-holding it dead, the failure that lost box B for ~18h. Only on
+                # the boot's first broker start: the ledger's reboot stays adjacent to the boot for
+                # its whole life, and a restart days later that finds a fresh degradation is not that
+                # reboot's verdict. It stays held for the forced startup gate and its ladder.
                 off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
 
                 def _log(msg: str) -> None:
                     if logger:
                         logger.warning(f"POST-REBOOT {msg}")
 
-                await galaxy_recovery._verify_post_reboot_recovery(off_bus, expected, _log)
+                if fsm.restarted_this_boot:
+                    _log("skipped: a restart within this boot is not the reboot's result")
+                else:
+                    await galaxy_recovery._verify_post_reboot_recovery(off_bus, expected, _log)
             if logger:
                 (logger.info if ok else logger.error)(f"STARTUP HEALTH: {'OK' if ok else 'DEGRADED'} — {detail}")
     except Exception as e:  # noqa: BLE001 - a report must never block the broker coming up
