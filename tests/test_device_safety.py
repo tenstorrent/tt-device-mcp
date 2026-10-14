@@ -10904,11 +10904,13 @@ def _setup_generic_hold(monkeypatch, tmp_path, *, n_present=32):
 
 @pytest.mark.asyncio
 async def test_idle_relift_escalates_a_generic_arms_neither_hold(monkeypatch, tmp_path, clear_job_state):
-    """The remaining indefinite hold, end-to-end: a foreign-holder hold arms neither relift, so base
+    """The remaining indefinite hold, end-to-end: a gate-error hold arms neither relift, so base
     leaves it standing forever. Armed and past the ceiling on an idle present mesh with no tenant, the
     relift now escalates it to the gate's galaxy reset — WITHOUT a read-only verify, which cannot prove
-    this class fit. Fails on base, where a generic hold arms nothing and never reaches a reset."""
+    this class fit. Fails on base, where a generic hold arms nothing and never reaches a reset. (A pure
+    foreign-holder hold is the one generic class that does verify first: spec 03 I43, below.)"""
     _setup_generic_hold(monkeypatch, tmp_path)
+    fsm_dirty(srv, "gate/pre-job: health gate errored", why="gate_error")
     counters = _arm_stuck_hold(monkeypatch)
     verify_called = {"n": 0}
 
@@ -10947,7 +10949,7 @@ async def test_idle_relift_bails_on_a_re_dirtied_hold(monkeypatch, tmp_path, cle
 
     assert counters["resets"] == 0, "a re-dirtied hold is the gate's to reset, never the idle path's"
     assert verify_called["n"] == 0, "and it must not probe a device that owes the gate a reset"
-    assert srv.fsm.state is not ServerState.HEALTHY, "the hold stands"
+    assert counters["dirty_cleared"] == 0, "the hold stands"
 
 
 @pytest.mark.asyncio
@@ -10994,7 +10996,7 @@ async def test_idle_relift_leaves_a_generic_hold_untouched_when_kill_switched(mo
 
     assert counters["resets"] == 0, "kill-switched: a generic hold must not escalate"
     assert verify_called["n"] == 0, "and it must not even re-verify"
-    assert srv.fsm.state is not ServerState.HEALTHY, "the hold stands"
+    assert counters["dirty_cleared"] == 0, "the hold stands"
 
 
 @pytest.mark.asyncio
@@ -11047,6 +11049,129 @@ async def test_maybe_spawn_idle_relift_arms_for_a_generic_hold_unless_kill_switc
 
     gate.set()
     await first
+
+
+# --- I43: a foreign-holder hold whose holder is gone runs the pre-job verify at once ----------------
+
+
+def _fast_verify_setup(monkeypatch, tmp_path, *, healthy=True, held_minutes_ago=1, scan=None):
+    """A foreign-holder hold, the holder gone (empty scan unless given), an OK last fabric verdict
+    and no runtime fault. Returns (counters, verify calls, event kinds)."""
+    _setup_generic_hold(monkeypatch, tmp_path)
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=held_minutes_ago, scan=scan)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", True)
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    calls = []
+
+    async def verify(expected, log, run_fabric=True, **kw):
+        calls.append({"run_fabric": run_fabric, "phase": kw.get("phase")})
+        return healthy, {"snapshot": {"ok": healthy}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    return counters, calls, events
+
+
+@pytest.mark.asyncio
+async def test_a_gone_foreign_holder_hold_lifts_on_the_pre_job_verify_without_a_reset(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Measured (task audit, 2026-10-13): a 'tenant holds the device' hold whose holder had exited sat
+    to the ceiling and then paid a full galaxy reset. No fault was ever measured — the verify was only
+    deferred. Well inside the ceiling, the relift now runs the pre-job verify (enum+ARC, no traffic
+    pass) and lifts on a healthy read. Fails on base, which never verifies this class."""
+    counters, calls, events = _fast_verify_setup(monkeypatch, tmp_path)
+
+    await srv._attempt_idle_relift()
+
+    assert calls == [{"run_fabric": False, "phase": "pre-job"}], "exactly the pre-job verify, no traffic pass"
+    assert counters["resets"] == 0, "a healthy verify lifts without a reset"
+    assert counters["dirty_cleared"] == 1, "the hold is lifted (a verified clear)"
+    assert ("foreign_holder_verify", {"lifted": True, "healthy": True, "reason": "holder gone"}) in events
+
+
+@pytest.mark.asyncio
+async def test_a_failed_fast_verify_falls_back_to_the_ceiling_reset(monkeypatch, tmp_path, clear_job_state):
+    """Only a verify that fails goes on to the existing escalation: past the ceiling it resets."""
+    counters, calls, _ = _fast_verify_setup(monkeypatch, tmp_path, healthy=False, held_minutes_ago=21)
+
+    await srv._attempt_idle_relift()
+
+    assert len(calls) == 1, "the verify runs first"
+    assert counters["resets"] == 1, "a failed verify past the ceiling escalates to the reset"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_fast_verify_inside_the_ceiling_holds(monkeypatch, tmp_path, clear_job_state):
+    """A failed verify never lifts and never resets early: inside the ceiling the hold stands."""
+    counters, calls, _ = _fast_verify_setup(monkeypatch, tmp_path, healthy=False, held_minutes_ago=1)
+
+    await srv._attempt_idle_relift()
+
+    assert len(calls) == 1
+    assert counters["resets"] == 0, "the ceiling still bounds the reset"
+    assert counters["dirty_cleared"] == 0, "the hold stands"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("doubt", ["fault_reported", "fabric_bad"])
+async def test_a_healthy_read_does_not_lift_over_a_named_fault_or_a_bad_fabric_verdict(
+    monkeypatch, tmp_path, clear_job_state, doubt
+):
+    """enum+ARC is blind to a wedged eth core: a runtime-named fault (the gate's own release refuses
+    it) or a last fabric verdict that read UNHEALTHY keeps the hold for the ceiling escalation."""
+    counters, calls, _ = _fast_verify_setup(monkeypatch, tmp_path)
+    if doubt == "fault_reported":
+        monkeypatch.setattr(srv, "device_fault_reported", "ethernet core timeout")
+    else:
+        monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)
+
+    await srv._attempt_idle_relift()
+
+    assert len(calls) == 1
+    assert counters["resets"] == 0, "inside the ceiling: no reset either"
+    assert counters["dirty_cleared"] == 0, "the hold stands"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tenant", ["fd_holder", "running_job", "blind_scan"])
+async def test_the_fast_verify_never_probes_beside_a_tenant(monkeypatch, tmp_path, clear_job_state, tenant):
+    """A holder still there, a RUNNING broker job (blind to the fd scan between opens), or a scan that
+    could not read every holder: no verify runs and nothing lifts."""
+    scan = {
+        "fd_holder": HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True),
+        "running_job": HolderScan(holders=[], complete=True),
+        "blind_scan": HolderScan(holders=[], complete=False),
+    }[tenant]
+    counters, calls, _ = _fast_verify_setup(monkeypatch, tmp_path, scan=scan)
+    if tenant == "running_job":
+        monkeypatch.setattr(srv.galaxy_recovery.deps, "job_running", lambda: True)
+
+    await srv._attempt_idle_relift()
+
+    assert calls == [], "nothing is probed beside a tenant"
+    assert counters["resets"] == 0
+    assert counters["dirty_cleared"] == 0, "the hold stands"
+
+
+@pytest.mark.asyncio
+async def test_the_fast_verify_does_not_lift_a_hold_re_dirtied_mid_verify(monkeypatch, tmp_path, clear_job_state):
+    """The sampler's dead-chip path is lock-free: a chip that drops during the verify re-dirties the
+    device, and a healthy read taken before it must not wipe that."""
+    counters, _, _ = _fast_verify_setup(monkeypatch, tmp_path)
+
+    async def verify(expected, log, run_fabric=True, **_):
+        fsm_dirty(srv, "chip 3 left the bus", why="foreign_holder", dirty=True)
+        return True, {"snapshot": {"ok": True}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+    await srv._attempt_idle_relift()
+
+    assert counters["dirty_cleared"] == 0, "the re-dirtied device stays held"
+    assert srv.fsm.record.dirty, "and still owes the gate its reset"
+    assert counters["resets"] == 0
 
 
 def test_preflight_requires_fabric_check_but_only_warns_on_eth_heartbeat(monkeypatch, tmp_path):

@@ -225,6 +225,11 @@ class TelemetrySampler:
                 # do it. Spawned as its own task, never awaited here, so this loop keeps
                 # sampling; read-only, rate-limited, inert unless the operator opts in.
                 self._deps.spawn_idle_relift()
+                # ...and the idle-holder detector: names a foreign process that holds the device
+                # without working (spec 03 I44). Its own detached, rate-limited scan.
+                watch = getattr(self._deps, "watch_idle_holders", None)
+                if watch is not None:
+                    watch()
             except Exception:  # noqa: BLE001 - a sampler must never take the runner down
                 pass
             await asyncio.sleep(SAMPLE_INTERVAL_SEC)
