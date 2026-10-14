@@ -123,6 +123,14 @@ def test_wrapper_77_final_line_keeps_the_validators_first_error_line(tmp_path, v
         assert cause in health_monitor_mod._override_reason(r.stderr)
 
 
+def test_wrapper_reports_links_missing_after_retrains_as_resettable_not_77(tmp_path):
+    """Links still missing against the cabling descriptor after the validator's own retrains are a
+    measured fault, never the could-not-check 77. Fails on base, which reported it as 77."""
+    r = _run_wrapper(tmp_path, "Encountered unrecoverable state. Please check the system and try again.\n", 134)
+    assert r.returncode not in (0, FABRIC_CHECK_CANNOT_CHECK_RC), r.stderr
+    assert "fabric UNHEALTHY" in r.stderr and "-> resettable" in r.stderr
+
+
 # The validator's own throw when the links it discovered are not the descriptor's: tray ids come
 # from PCI bus numbers, so a moved uplink or an absent cable mismatches on every run.
 _MISMATCH = (

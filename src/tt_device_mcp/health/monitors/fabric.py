@@ -47,6 +47,13 @@ _WEDGED_ETH_INIT = re.compile(r"waiting for active ethernet core|Try resetting t
 # — and it is the dominant reason a host learns nothing about its fabric.
 _WATCHDOG_TIMEOUT = re.compile(r"Workload execution timed out after \d+ seconds")
 
+# Links the cabling descriptor expects are still missing after the validator's own five link
+# retrains. Reachable only with a descriptor set (no descriptor = no connectivity comparison), and a
+# descriptor is set only on a host it describes, so this is a measured fault, not a could-not-check:
+# a galaxy reset retrains the links. Left as a skip it held a galaxy fabric-unverified with no
+# release path after a reset left links down (jobs then failed "no forwarding direction").
+_LINKS_MISSING_AFTER_RETRAIN = re.compile(r"Encountered unrecoverable state")
+
 # The validator's own throw when the links it discovered do not match the cabling descriptor. Its
 # tray ids come from PCI bus numbers, so a tray whose uplink lands on another bus, or a cable that
 # is simply not there, mismatches on every run: a board reset cannot change either. Never
@@ -166,6 +173,8 @@ def classify(rc: Optional[int], output: str) -> tuple[Optional[bool], str]:
             f"{TOPOLOGY_MISMATCH}: {missing} missing, {extra} extra port connections vs the cabling "
             "descriptor (tray ids come from PCI bus numbers; a board reset cannot change this)"
         )
+    if _LINKS_MISSING_AFTER_RETRAIN.search(output):
+        return False, "links the cabling descriptor expects are still missing after the validator's retrains"
     reason = first_reason(output)
     detail = f"validator did not complete a measurement (rc={rc})"
     if reason:

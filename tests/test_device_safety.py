@@ -1886,8 +1886,10 @@ async def test_a_dead_chip_is_isolated_without_waiting_for_the_device_lock(monke
     monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
 
     # Hold the device lock, as a hung fabric check would. Isolation must proceed anyway.
+    # The lock is held for the whole block, so any finite bound proves isolation skips it;
+    # 15 s leaves room for a loaded host's busy thread pool behind the to_thread calls.
     async with srv._device_op("health-gate/post-job"):
-        await asyncio.wait_for(srv.sampler.isolate_dead_chips(["13"]), timeout=2.0)
+        await asyncio.wait_for(srv.sampler.isolate_dead_chips(["13"]), timeout=15.0)
 
     assert removed == ["13"], "the dead chip was not removed from the kernel"
     assert quiesced == [False], "tt-telemetry was not stopped before/while isolating"
@@ -5747,7 +5749,8 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-async def _run_one(job, limit_sec: float = 15.0):
+async def _run_one(job, limit_sec: float = 15.0, until=None):
+    """Run one job; `until` also waits for work the runner does after `finished_at` is set."""
     srv.jobs[job.id] = job
     await srv.get_job_queue().put(job.id)
     runner = asyncio.create_task(srv.job_runner())
@@ -5755,7 +5758,9 @@ async def _run_one(job, limit_sec: float = 15.0):
         deadline = time.monotonic() + limit_sec
         # finished_at is set before the survivor bookkeeping and the post-job gate; cancelling
         # then (a slow holder scan on a busy host) cut the runner off before it marked anything.
-        while (job.finished_at is None or srv.post_job_gate_pending) and time.monotonic() < deadline:
+        while (
+            job.finished_at is None or srv.post_job_gate_pending or (until and not until())
+        ) and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
     finally:
         runner.cancel()
@@ -5809,9 +5814,12 @@ async def test_a_survivor_holding_the_device_is_logged_and_marks_it_dirty(monkey
     marked = []
     monkeypatch.setattr(srv, "reap_job_survivors", fake_sweep)
     monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marked.append(reason))
+    # Not this host's real holders: the sweep's own words are the ones under test.
+    monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda: "")
     log = tmp_path / "912.log"
     job = srv.Job(id="912", owner="tenant", workspace="/tmp", command="echo hi", queued_at="t", log_file=str(log))
-    await _run_one(job)
+    # The runner marks the device after it sets finished_at; stopping it at finished_at raced that.
+    await _run_one(job, until=lambda: marked)
 
     assert job.status is srv.JobStatus.COMPLETED
     assert any("job 912 left pid 4242 (state D)" in r for r in marked), marked
@@ -10904,11 +10912,13 @@ def _setup_generic_hold(monkeypatch, tmp_path, *, n_present=32):
 
 @pytest.mark.asyncio
 async def test_idle_relift_escalates_a_generic_arms_neither_hold(monkeypatch, tmp_path, clear_job_state):
-    """The remaining indefinite hold, end-to-end: a foreign-holder hold arms neither relift, so base
+    """The remaining indefinite hold, end-to-end: a gate-error hold arms neither relift, so base
     leaves it standing forever. Armed and past the ceiling on an idle present mesh with no tenant, the
     relift now escalates it to the gate's galaxy reset — WITHOUT a read-only verify, which cannot prove
-    this class fit. Fails on base, where a generic hold arms nothing and never reaches a reset."""
+    this class fit. Fails on base, where a generic hold arms nothing and never reaches a reset. (A pure
+    foreign-holder hold is the one generic class that does verify first: spec 03 I43, below.)"""
     _setup_generic_hold(monkeypatch, tmp_path)
+    fsm_dirty(srv, "gate/pre-job: health gate errored", why="gate_error")
     counters = _arm_stuck_hold(monkeypatch)
     verify_called = {"n": 0}
 
@@ -10947,7 +10957,7 @@ async def test_idle_relift_bails_on_a_re_dirtied_hold(monkeypatch, tmp_path, cle
 
     assert counters["resets"] == 0, "a re-dirtied hold is the gate's to reset, never the idle path's"
     assert verify_called["n"] == 0, "and it must not probe a device that owes the gate a reset"
-    assert srv.fsm.state is not ServerState.HEALTHY, "the hold stands"
+    assert counters["dirty_cleared"] == 0, "the hold stands"
 
 
 @pytest.mark.asyncio
@@ -10994,7 +11004,7 @@ async def test_idle_relift_leaves_a_generic_hold_untouched_when_kill_switched(mo
 
     assert counters["resets"] == 0, "kill-switched: a generic hold must not escalate"
     assert verify_called["n"] == 0, "and it must not even re-verify"
-    assert srv.fsm.state is not ServerState.HEALTHY, "the hold stands"
+    assert counters["dirty_cleared"] == 0, "the hold stands"
 
 
 @pytest.mark.asyncio
@@ -11047,6 +11057,129 @@ async def test_maybe_spawn_idle_relift_arms_for_a_generic_hold_unless_kill_switc
 
     gate.set()
     await first
+
+
+# --- I43: a foreign-holder hold whose holder is gone runs the pre-job verify at once ----------------
+
+
+def _fast_verify_setup(monkeypatch, tmp_path, *, healthy=True, held_minutes_ago=1, scan=None):
+    """A foreign-holder hold, the holder gone (empty scan unless given), an OK last fabric verdict
+    and no runtime fault. Returns (counters, verify calls, event kinds)."""
+    _setup_generic_hold(monkeypatch, tmp_path)
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=held_minutes_ago, scan=scan)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", True)
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    calls = []
+
+    async def verify(expected, log, run_fabric=True, **kw):
+        calls.append({"run_fabric": run_fabric, "phase": kw.get("phase")})
+        return healthy, {"snapshot": {"ok": healthy}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    return counters, calls, events
+
+
+@pytest.mark.asyncio
+async def test_a_gone_foreign_holder_hold_lifts_on_the_pre_job_verify_without_a_reset(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Measured (task audit, 2026-10-13): a 'tenant holds the device' hold whose holder had exited sat
+    to the ceiling and then paid a full galaxy reset. No fault was ever measured — the verify was only
+    deferred. Well inside the ceiling, the relift now runs the pre-job verify (enum+ARC, no traffic
+    pass) and lifts on a healthy read. Fails on base, which never verifies this class."""
+    counters, calls, events = _fast_verify_setup(monkeypatch, tmp_path)
+
+    await srv._attempt_idle_relift()
+
+    assert calls == [{"run_fabric": False, "phase": "pre-job"}], "exactly the pre-job verify, no traffic pass"
+    assert counters["resets"] == 0, "a healthy verify lifts without a reset"
+    assert counters["dirty_cleared"] == 1, "the hold is lifted (a verified clear)"
+    assert ("foreign_holder_verify", {"lifted": True, "healthy": True, "reason": "holder gone"}) in events
+
+
+@pytest.mark.asyncio
+async def test_a_failed_fast_verify_falls_back_to_the_ceiling_reset(monkeypatch, tmp_path, clear_job_state):
+    """Only a verify that fails goes on to the existing escalation: past the ceiling it resets."""
+    counters, calls, _ = _fast_verify_setup(monkeypatch, tmp_path, healthy=False, held_minutes_ago=21)
+
+    await srv._attempt_idle_relift()
+
+    assert len(calls) == 1, "the verify runs first"
+    assert counters["resets"] == 1, "a failed verify past the ceiling escalates to the reset"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_fast_verify_inside_the_ceiling_holds(monkeypatch, tmp_path, clear_job_state):
+    """A failed verify never lifts and never resets early: inside the ceiling the hold stands."""
+    counters, calls, _ = _fast_verify_setup(monkeypatch, tmp_path, healthy=False, held_minutes_ago=1)
+
+    await srv._attempt_idle_relift()
+
+    assert len(calls) == 1
+    assert counters["resets"] == 0, "the ceiling still bounds the reset"
+    assert counters["dirty_cleared"] == 0, "the hold stands"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("doubt", ["fault_reported", "fabric_bad"])
+async def test_a_healthy_read_does_not_lift_over_a_named_fault_or_a_bad_fabric_verdict(
+    monkeypatch, tmp_path, clear_job_state, doubt
+):
+    """enum+ARC is blind to a wedged eth core: a runtime-named fault (the gate's own release refuses
+    it) or a last fabric verdict that read UNHEALTHY keeps the hold for the ceiling escalation."""
+    counters, calls, _ = _fast_verify_setup(monkeypatch, tmp_path)
+    if doubt == "fault_reported":
+        monkeypatch.setattr(srv, "device_fault_reported", "ethernet core timeout")
+    else:
+        monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)
+
+    await srv._attempt_idle_relift()
+
+    assert len(calls) == 1
+    assert counters["resets"] == 0, "inside the ceiling: no reset either"
+    assert counters["dirty_cleared"] == 0, "the hold stands"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tenant", ["fd_holder", "running_job", "blind_scan"])
+async def test_the_fast_verify_never_probes_beside_a_tenant(monkeypatch, tmp_path, clear_job_state, tenant):
+    """A holder still there, a RUNNING broker job (blind to the fd scan between opens), or a scan that
+    could not read every holder: no verify runs and nothing lifts."""
+    scan = {
+        "fd_holder": HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True),
+        "running_job": HolderScan(holders=[], complete=True),
+        "blind_scan": HolderScan(holders=[], complete=False),
+    }[tenant]
+    counters, calls, _ = _fast_verify_setup(monkeypatch, tmp_path, scan=scan)
+    if tenant == "running_job":
+        monkeypatch.setattr(srv.galaxy_recovery.deps, "job_running", lambda: True)
+
+    await srv._attempt_idle_relift()
+
+    assert calls == [], "nothing is probed beside a tenant"
+    assert counters["resets"] == 0
+    assert counters["dirty_cleared"] == 0, "the hold stands"
+
+
+@pytest.mark.asyncio
+async def test_the_fast_verify_does_not_lift_a_hold_re_dirtied_mid_verify(monkeypatch, tmp_path, clear_job_state):
+    """The sampler's dead-chip path is lock-free: a chip that drops during the verify re-dirties the
+    device, and a healthy read taken before it must not wipe that."""
+    counters, _, _ = _fast_verify_setup(monkeypatch, tmp_path)
+
+    async def verify(expected, log, run_fabric=True, **_):
+        fsm_dirty(srv, "chip 3 left the bus", why="foreign_holder", dirty=True)
+        return True, {"snapshot": {"ok": True}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+    await srv._attempt_idle_relift()
+
+    assert counters["dirty_cleared"] == 0, "the re-dirtied device stays held"
+    assert srv.fsm.record.dirty, "and still owes the gate its reset"
+    assert counters["resets"] == 0
 
 
 def test_preflight_requires_fabric_check_but_only_warns_on_eth_heartbeat(monkeypatch, tmp_path):
@@ -11998,12 +12131,16 @@ async def test_post_reboot_climb_keeps_the_escalated_marker_and_the_reset_retrie
 
 
 @pytest.mark.asyncio
-async def test_a_reset_that_leaves_the_fabric_unverified_is_not_recovered(monkeypatch, tmp_path):
+async def test_a_reset_that_leaves_the_fabric_unverified_is_unknown(monkeypatch, tmp_path, clear_job_state):
     """H2: on a multi-chip host, a galaxy reset whose fabric still cannot verify after eth-training
-    retries (persistent 77) is NOT a recovery — enum+ARC came back but the fabric proved nothing, so
-    _reset_and_verify_device returns False and the caller climbs (E0) instead of clearing the hold onto
-    an unverified fabric (which loops). Fails on base, where a 77 reads as recovered (healthy=True)."""
+    retries (persistent 77) is NOT a recovery — enum+ARC came back but the fabric proved nothing — and
+    NOT a failed reset either: a 77 measured nothing. _reset_and_verify_device returns None, the hold is
+    neither cleared onto an unverified fabric nor counted a failed reset (cooldown, two strikes, host
+    rungs): it becomes a not-dirty 77-only fabric-unverified hold the idle relift re-checks (spec 03 I40)."""
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    srv._mark_device_dirty("job 007 ended: eth link down")
+    monkeypatch.setattr(srv, "device_fault_reported", "ethernet link timeout")
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", True)
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRIES", 1)
 
     async def no_foreign(log):
@@ -12024,8 +12161,30 @@ async def test_a_reset_that_leaves_the_fabric_unverified_is_not_recovered(monkey
     patch_health_event(monkeypatch, lambda *a, **k: None)
 
     recovered = await srv.galaxy_recovery._reset_and_verify_device(["0", "1"], lambda _m: None)
-    assert recovered is False, "a persistent post-reset 77 must count NOT recovered so the caller climbs"
+    assert recovered is None, "a persistent post-reset 77 is UNKNOWN: neither recovered nor a failed reset"
     assert calls["n"] >= 2, "the post-reset fabric must be retried at least once for eth training"
+    assert srv.recovery_mechanism.last_reset_failed is False, "a 77 must not arm the cooldown or the two strikes"
+    assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY and not srv.fsm.record.dirty
+    assert srv.fsm.state is ServerState.RECOVERING, "the door stays shut: no hold cleared onto an unverified fabric"
+    assert srv._fabric_77_only_hold(), "the hold must be 77-only, so the relift's I40 bound owns it"
+
+
+@pytest.mark.asyncio
+async def test_an_idle_reset_whose_fabric_stays_77_does_not_climb_to_a_host_rung(monkeypatch, clear_job_state):
+    """The idle escalation's galaxy reset comes back with enum+ARC healthy and a persistent fabric 77
+    (UNKNOWN). It must not climb toward a reboot or power cycle as if the reset failed: nothing
+    measured a failure. Fails on base, where the 77 read as a failed reset and the climb ran."""
+    counters = _arm_stuck_hold(monkeypatch, reset_result=None, beats_after_reset={})
+    climbs = []
+
+    async def climb(*a, **k):
+        climbs.append(a)
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_climb_to_host_recovery_after_failed_reset", climb)
+    ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert ran is True and counters["resets"] == 1
+    assert climbs == [], "an UNKNOWN post-reset fabric must not drive the host-rung climb"
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0
 
 
 # --- G-tier safe U-fixes: fail-closed / loudness on the silent-degrade paths -------------

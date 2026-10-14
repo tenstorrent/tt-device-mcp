@@ -80,6 +80,7 @@ from tt_device_mcp.device_holders import (
     enumerate_device_holders,
     evaluate_reset_gate,
     is_tenant,
+    read_proc_cpu,
     reclaim_foreign_holders,
 )
 from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec
@@ -1005,8 +1006,10 @@ _recovery_deps = RecoveryDeps(
     health_event=lambda kind, **f: health_event(kind, **f),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
+    hold_device_fabric_unverified=lambda why: _hold_device_fabric_unverified(why),
     refresh_idle_hold_ledger=lambda: _refresh_idle_hold_ledger(),
     spawn_idle_relift=lambda: _maybe_spawn_idle_relift(),
+    watch_idle_holders=lambda: _maybe_spawn_idle_holder_watch(),
     episode_dirty=lambda: fsm.record.dirty,
     episode_open=lambda: fsm.state is not ServerState.HEALTHY,
     episode_job=lambda: dict(fsm.record.job),
@@ -1972,6 +1975,7 @@ def _reset_for_testing():
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant
+    global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic
     job_queue = None
     lock = None
     _action_row = None
@@ -1981,6 +1985,9 @@ def _reset_for_testing():
     device_hold_episode_reason = ""
     _hold_episode_restorable = True
     _hold_episode_tenant = False
+    _fabric_77_streak_since = None
+    _fabric_77_streak = 0
+    _fabric_77_fallback_release_monotonic = 0.0
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
@@ -3239,6 +3246,104 @@ def _idle_relift_armed() -> tuple[bool, bool, bool]:
     )
 
 
+# I40 — the bound on a 77-only hold. Each idle-relift pass that 77s again on the same episode adds
+# one to the streak; once it reaches FABRIC_77_MAX_RETRIES, or the episode is FABRIC_77_BOUND_SEC old
+# with at least one retry behind it, the fabric pass stops being the gate (see _fabric_77_fallback).
+_fabric_77_streak_since: Optional[str] = None
+_fabric_77_streak: int = 0
+# Monotonic time of the last release the fallback granted on a still-unverified fabric. A second
+# 77-only hold within FABRIC_77_RELEASE_WINDOW_SEC of it goes to the ladder, not another release.
+_fabric_77_fallback_release_monotonic: float = 0.0
+
+
+def _env_int(name: str, default: int, floor: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return max(floor, int(raw)) if raw else default
+    except ValueError:
+        return default
+
+
+# A topology-mismatch skip, and the hardware fault the first job after its lift names, are holds no
+# fallback release may lift: the cabling is not what the descriptor says, and enum+ARC and the eth
+# read cannot see that. They stay outside the I40 budget and release.
+_TOPOLOGY_HOLD_PREFIX = "topology mismatch"
+_TOPOLOGY_HW_FAULT = "hardware fault: the first job after a topology-mismatch lift"
+
+
+def _topology_mismatch_hold(evidence: dict) -> bool:
+    details = (str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or ""))
+    return any(d.startswith(_TOPOLOGY_HOLD_PREFIX) or _TOPOLOGY_HW_FAULT in d for d in details)
+
+
+def _fabric_77_bound_reached() -> bool:
+    """Count this 77 against the open episode and say whether the I40 bound is reached."""
+    global _fabric_77_streak_since, _fabric_77_streak
+    if _fabric_77_streak_since != fsm.record.since:
+        _fabric_77_streak_since, _fabric_77_streak = fsm.record.since, 0
+    _fabric_77_streak += 1
+    if _fabric_77_streak >= _env_int("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", 3, 1):
+        return True
+    try:
+        age = (datetime.now() - datetime.fromisoformat(str(fsm.record.since))).total_seconds()
+    except (TypeError, ValueError):
+        return False
+    return age >= _env_int("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", 600, 60)
+
+
+async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
+    """The fabric check could not run on a bounded number of retries: alert, then gate on the startup
+    checks instead. enum+ARC already passed (the caller's observe returned healthy); add the eth
+    heartbeat, which also compares the measured up-link count with the host's baseline, so a link
+    that went down reads as no-verdict rather than healthy. A 77 is never a healthy fabric: only a
+    positively healthy read, and no fallback release in the window, lifts the hold, with a warning.
+    Frozen, unreadable, a link-count drop, or a second 77-only hold inside the window climbs the
+    ladder (the present-mesh rung, with every guard of _escalate_stuck_hold). Returns True when it
+    settled the hold."""
+    global _fabric_77_fallback_release_monotonic
+    window = _env_int("TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC", 21600, 0)
+    recent = bool(_fabric_77_fallback_release_monotonic) and (
+        time.monotonic() - _fabric_77_fallback_release_monotonic < window
+    )
+    event = {
+        "kind": "fabric_check_unrunnable_bound",
+        "host": socket.gethostname(),
+        "held_since": fsm.record.since,
+        "retries": _fabric_77_streak,
+        "detail": str((evidence.get("fabric") or {}).get("detail", ""))[:300],
+        "repeat_within_window": recent,
+    }
+    health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
+    if logger:
+        logger.warning(
+            f"FABRIC-77-BOUND the fabric check could not run on {_fabric_77_streak} retries of this hold "
+            "— falling back to the startup checks as the gate"
+        )
+    alert.send_alert(event, logger)
+    eok, edetail = await health_monitor.verify_eth_heartbeat()
+    if eok is True and not recent:
+        _fabric_77_fallback_release_monotonic = time.monotonic()
+        log(
+            f"startup checks pass (enum+ARC healthy, eth heartbeat {edetail or eok!r}) — hold lifted "
+            "WITH A WARNING: the fabric is unverified, the next gate re-runs the pass"
+        )
+        health_event("device_relift_fabric_unverified", evidence=evidence, retries=_fabric_77_streak)
+        _clear_device_dirty(
+            verified=True, why="idle relift: fabric check unrunnable past its bound; startup checks pass"
+        )
+        return True
+    log(
+        "startup checks do not clear it ("
+        + (
+            "a fallback release already ran inside the window"
+            if eok is True
+            else f"eth heartbeat {'frozen' if eok is False else 'gave no verdict'}: {edetail}"
+        )
+        + ") — climbing the recovery ladder"
+    )
+    return await escalate("present")
+
+
 async def _attempt_idle_relift() -> None:
     """Re-verify a device HELD while idle and lift the hold once the mesh proves fit — never a reset.
 
@@ -3325,6 +3430,13 @@ async def _attempt_idle_relift() -> None:
                 # never proves such a mesh fit; this branch never lifts on one. Past the ceiling on an
                 # idle, tenant-free present mesh it escalates to the gate's galaxy reset (the one
                 # authoritative proof), and holds otherwise — every guard lives in _escalate_stuck_hold.
+                #
+                # The one exception is a pure foreign-holder hold: no fault was measured, the verify
+                # was only deferred because a tenant held the device. Once the tenant is gone, run the
+                # pre-job verify the next job's gate would run, now, rather than wait out the ceiling
+                # and pay a reset (spec 03 I43). Only a verify that fails falls through to the ceiling.
+                if fsm.record.why == "foreign_holder" and await _foreign_holder_fast_verify(expected, _log):
+                    return
                 if await _escalate("present"):
                     return
                 _log(
@@ -3380,6 +3492,16 @@ async def _attempt_idle_relift() -> None:
                 # so gate the lift on an explicit True. An unverifiable or failed fabric on retry is
                 # not proof, and reopening on it hands the next tenant a mesh no pass cleared.
                 fabric_ok = (evidence.get("fabric") or {}).get("ok")
+                if (
+                    fabric_ok is None
+                    and _fabric_77_only_hold()
+                    and not _topology_mismatch_hold(evidence)
+                    and _fabric_77_bound_reached()
+                ):
+                    # I40: a pass that cannot run is retried a bounded number of times, never
+                    # forever. Past the bound the startup checks become the gate.
+                    if await _fabric_77_fallback(evidence, _log, _escalate):
+                        return
                 if fabric_ok is not True:
                     _log(
                         f"fabric still could not verify on retry ({fabric_ok!r}) — holding; "
@@ -3468,6 +3590,49 @@ async def _attempt_idle_relift() -> None:
         _log("pass aborted on an unexpected error — holding; the sampler retries next window")
 
 
+async def _foreign_holder_fast_verify(expected: int, log: Callable[[str], None]) -> bool:
+    """Run the pre-job verify on a foreign-holder hold whose holder is gone (spec 03 I43). Called by
+    the idle relift under the device-op lock. Returns True when the relift is done with this pass
+    (the hold lifted, a tenant is still there, or the state changed under it); False hands the hold
+    to the ceiling escalation, which is what a failed verify needs.
+
+    The hold was placed because the gate could not verify beside a tenant, not on a measured fault,
+    so the verify the next job's gate would run is all it owes: enum+ARC, no traffic pass, released
+    on a healthy read with no runtime-named fault. Stricter than the gate in one way: a last fabric
+    verdict that read UNHEALTHY is not lifted here, it goes to the ceiling reset. The tenant check
+    is the escalation's own (an fd holder, a RUNNING job, or a scan it cannot fully read), plus a
+    reaped job's leftover, so nothing is probed beside anyone."""
+    scan = await asyncio.to_thread(enumerate_device_holders)
+    if galaxy_recovery._tenant_active(scan) or await asyncio.to_thread(_reaped_leftover_reason, scan):
+        log("foreign-holder hold: a tenant or a running job still holds the device — holding")
+        return True
+    log("foreign-holder hold: the holder is gone and no job runs — running the pre-job verify now")
+    healthy, evidence = await fsm.observe(expected, log, run_fabric=False, phase="pre-job", recovery=select_recovery())
+    if not healthy or device_fault_reported or health_monitor.last_fabric_ok is False:
+        why = (
+            "the mesh reads unhealthy"
+            if not healthy
+            else (
+                f"the runtime reported '{device_fault_reported}'"
+                if device_fault_reported
+                else "the last fabric verdict was UNHEALTHY"
+            )
+        )
+        log(f"foreign-holder hold: pre-job verify did not clear it ({why}) — the ceiling escalation owns it")
+        health_event("foreign_holder_verify", lifted=False, healthy=healthy, reason=why)
+        return False
+    # Same re-assert as the relift's own lift: the sampler's dead-chip path is lock-free and can
+    # re-dirty the device during the awaits above.
+    if fsm.state is not ServerState.RECOVERING or fsm.record.dirty or fsm.record.why != "foreign_holder":
+        log("state changed mid-verify (a chip dropped, or a gate took over) — holding; the pre-job gate owns it now")
+        return True
+    log("foreign-holder hold: pre-job verify healthy — hold lifted without a reset")
+    health_event("foreign_holder_verify", lifted=True, healthy=True, reason="holder gone")
+    health_event("device_relift", evidence=evidence)
+    _clear_device_dirty(verified=True, why="idle relift: foreign holder gone, pre-job verify healthy")
+    return True
+
+
 def _eth_rearm_idle() -> bool:
     """Whether the device is idle enough for the eth self-test's one read: HEALTHY, no tenant job
     queued, running or re-adopted, no finished job still owed its post-job gate, and no external
@@ -3530,6 +3695,124 @@ def _maybe_spawn_idle_relift() -> None:
     if not ((selfheal or fabric or generic) and not device_op_active):
         return
     _relift_task = asyncio.create_task(_attempt_idle_relift())
+
+
+# Idle foreign holder (spec 03 I44). A tenant process outside every broker scope that keeps a device
+# fd open but does no work blocks the queue (_wait_out_foreign_holder) and any foreign-holder hold
+# with no bound: the gate never acts under a live tenant. The broker never kills or signals it; past
+# TT_DEVICE_MCP_IDLE_HOLDER_SEC with its CPU time flat it names the holder once, as an event and an
+# alert, so a person can. Keyed on (pid, starttime) so a reused pid is a new process.
+IDLE_HOLDER_DEFAULT_SEC = 900
+IDLE_HOLDER_SCAN_SEC = 60
+_idle_holders: dict = {}
+_idle_holder_task: Optional[asyncio.Task] = None
+_idle_holder_last_scan: float = 0.0
+
+
+def _idle_holder_sec() -> float:
+    """Seconds a foreign holder's CPU time must stay flat before it is named. 0 or less turns the
+    detector off; unset or malformed reads as the default."""
+    raw = os.environ.get("TT_DEVICE_MCP_IDLE_HOLDER_SEC", "").strip()
+    try:
+        return float(raw) if raw else float(IDLE_HOLDER_DEFAULT_SEC)
+    except ValueError:
+        return float(IDLE_HOLDER_DEFAULT_SEC)
+
+
+def _watch_idle_foreign_holders(scan: HolderScan, now: float) -> list:
+    """Track each foreign holder's CPU time across scans and name the ones idle past the threshold.
+    Returns the holders named in this call (for tests and the log). Read-only towards the holder:
+    it reads /proc and never signals anything.
+
+    Counted: a tenant (``is_tenant``) outside the broker's job/exec scopes and not a descendant of
+    the broker itself, so the broker's own jobs (scoped under privsep, children otherwise) never
+    count. Each holder gets one ``idle_foreign_holder`` event and one alert for its lifetime; an
+    alert dropped because the hook is still busy is retried on the next scan."""
+    threshold = _idle_holder_sec()
+    if threshold <= 0:
+        _idle_holders.clear()
+        return []
+    me = os.getpid()
+    seen = set()
+    named = []
+    for h in scan.holders:
+        if not is_tenant(h) or h.scoped or descends_from(h.pid, me):
+            continue
+        cpu = read_proc_cpu(h.pid)
+        if cpu is None:
+            continue  # exited between the scan and this read
+        ticks, start = cpu
+        key = (h.pid, start)
+        seen.add(key)
+        entry = _idle_holders.get(key)
+        if entry is None:
+            _idle_holders[key] = {"ticks": ticks, "since": now, "evented": False, "alerted": False}
+            continue
+        if entry["ticks"] != ticks:
+            entry["ticks"], entry["since"] = ticks, now
+            continue
+        idle = now - entry["since"]
+        if idle < threshold or entry["alerted"]:
+            continue
+        user = h.username
+        if not entry["evented"]:
+            entry["evented"] = True
+            named.append({"pid": h.pid, "user": user, "idle_sec": int(idle)})
+            if logger:
+                logger.warning(
+                    f"IDLE-HOLDER {user} (pid {h.pid}) holds the device with no CPU time for "
+                    f"{int(idle)}s — named, never signalled"
+                )
+            health_event(
+                "idle_foreign_holder",
+                pid=h.pid,
+                uid=h.uid,
+                user=user,
+                idle_sec=int(idle),
+                threshold_sec=int(threshold),
+            )
+        if alert.alert_argv() is None:
+            entry["alerted"] = True
+            continue
+        event = {
+            "kind": "idle_foreign_holder",
+            "host": socket.gethostname(),
+            "pid": h.pid,
+            "uid": h.uid,
+            "user": user,
+            "idle_sec": int(idle),
+            "threshold_sec": int(threshold),
+        }
+        if alert.send_alert(event, logger) is not None:
+            entry["alerted"] = True
+    for key in list(_idle_holders):
+        if key not in seen:
+            del _idle_holders[key]
+    return named
+
+
+async def _idle_holder_watch_pass() -> None:
+    """One scan for the idle-holder detector, off the event loop. Never raises: a detached task."""
+    try:
+        scan = await asyncio.to_thread(enumerate_device_holders)
+        await asyncio.to_thread(_watch_idle_foreign_holders, scan, time.monotonic())
+    except Exception:  # noqa: BLE001 - a detached watch task must never raise unretrieved
+        if logger:
+            logger.exception("IDLE-HOLDER scan failed — retrying next window")
+
+
+def _maybe_spawn_idle_holder_watch() -> None:
+    """Driven by the sampler: one detached scan per IDLE_HOLDER_SCAN_SEC, never two at once."""
+    global _idle_holder_task, _idle_holder_last_scan
+    if _idle_holder_sec() <= 0:
+        return
+    if _idle_holder_task is not None and not _idle_holder_task.done():
+        return
+    now = time.monotonic()
+    if _idle_holder_last_scan and now - _idle_holder_last_scan < IDLE_HOLDER_SCAN_SEC:
+        return
+    _idle_holder_last_scan = now
+    _idle_holder_task = asyncio.create_task(_idle_holder_watch_pass())
 
 
 async def _kill_device_holders(reason: str) -> list:

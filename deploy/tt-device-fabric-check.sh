@@ -178,6 +178,11 @@ elif grep -qE "Workload execution timed out after [0-9]+ seconds" "$RUNLOG"; the
     # about its fabric. Skipping it leaves the wedge riding on, exactly like the eth-core case.
     log "fabric UNHEALTHY (rc=$rc): traffic stalled until the validator's watchdog fired; no link reported back -> resettable"
     [ "$rc" -eq "$EXIT_CANNOT_CHECK" ] && rc=1
+elif grep -q "Encountered unrecoverable state" "$RUNLOG"; then
+    # Links the descriptor expects are still missing after the validator's own link retrains. Only
+    # reachable with a descriptor set, and one is set only on a host it describes: a measured fault.
+    log "fabric UNHEALTHY (rc=$rc): links the cabling descriptor expects are still missing after the validator's retrains -> resettable"
+    [ "$rc" -eq "$EXIT_CANNOT_CHECK" ] && rc=1
 else
     # The validator's FIRST error line, most specific first (same order as fabric.first_reason):
     # "terminate called after throwing ..." sits on the line ABOVE "  what():  <cause>", so a single
