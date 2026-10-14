@@ -22,6 +22,13 @@ _LOG = logging.getLogger(__name__)
 UBB_RESET_SETTLE_SEC = float(os.environ.get("TT_DEVICE_MCP_UBB_RESET_SETTLE_SEC", "28"))
 
 
+class BmcIpmiError(RuntimeError):
+    """The BMC did not take the tray re-power over IPMI: ``ipmitool`` exited non-zero (e.g. "No data
+    available" from a BMC whose IPMI is wedged while Redfish still answers), timed out or could not
+    start. Nothing was re-powered, and the BMC's other IPMI rungs will not work either, so the off-bus
+    hold hands off to the host's power-cycle command on its own clock (spec 04 I27)."""
+
+
 def _ubb_reset_argv(bitmap: int) -> list:
     """The BMC command that re-powers the trays in ``bitmap``, as an argv list. Bit i is tray i+1:
     tt-smi's tray tables are 1-based and the BMC's bits are not, so the caller shifts (spec 04 I16). The
@@ -48,7 +55,8 @@ def _fire_ubb_reset(bitmap: int, tray_chip_ids: list, log=None):
     tray-down reset exists to recover) has no /dev node to ioctl, so its quiesce/re-init is skipped
     rather than aborting the walk before the power pulse that would re-enumerate it.
 
-    Raises ``pcie_guard.TrayRepowerRefused`` when the envelope refused to cut power (nothing fired).
+    Raises ``pcie_guard.TrayRepowerRefused`` when the envelope refused to cut power (nothing fired), and
+    :class:`BmcIpmiError` when the BMC did not take the pulse.
     Returns the envelope's ``TrayPlan``."""
     from tt_smi.reset import IoctlResetFlags
 
@@ -61,9 +69,12 @@ def _fire_ubb_reset(bitmap: int, tray_chip_ids: list, log=None):
             _reset_ioctl_if_on_bus(reset_device_ioctl, iid, IoctlResetFlags.USER_RESET)
 
     def pulse() -> None:
-        r = subprocess.run(_ubb_reset_argv(bitmap), timeout=60, capture_output=True, text=True)
+        try:
+            r = subprocess.run(_ubb_reset_argv(bitmap), timeout=60, capture_output=True, text=True)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise BmcIpmiError(f"ubb tray reset did not run: {exc!r}"[:300]) from exc
         if r.returncode != 0:
-            raise RuntimeError(f"ubb tray reset exited {r.returncode}: {r.stderr.strip()[:200]}")
+            raise BmcIpmiError(f"ubb tray reset exited {r.returncode}: {r.stderr.strip()[:200]}")
         time.sleep(UBB_RESET_SETTLE_SEC)
 
     def reinit(_on_tray: list) -> None:

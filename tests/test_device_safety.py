@@ -2746,6 +2746,20 @@ def test_no_clock_cap_keeper_in_the_default_pollers():
     assert "fmax" not in srv.DEFAULT_POLLER_SERVICES
 
 
+def test_the_specs_name_the_default_pollers():
+    """Spec 06's env-var index and spec 04 I12 state the code's default poller list, and neither
+    names a clock-cap keeper as a default (both did after the code dropped it)."""
+    specs = Path(__file__).resolve().parent.parent / "specs"
+    row = next(
+        line
+        for line in (specs / "06-state-paths.md").read_text().splitlines()
+        if line.startswith("| `TT_DEVICE_MCP_POLLER_SERVICES` |")
+    )
+    assert row.split("|")[2].strip() == f"`{srv.DEFAULT_POLLER_SERVICES}`", row
+    i12 = (specs / "04-recovery.md").read_text().split("- **I12 —", 1)[1].split("\n- **I13 —", 1)[0]
+    assert "fmax" not in i12, i12
+
+
 def _systemctl_with_units(installed, calls):
     """A `systemctl` stand-in: 0 for a unit the host has, 5 (not loaded) for one it lacks."""
 
@@ -8898,6 +8912,7 @@ def _setup_fabric_unverified_hold(monkeypatch, tmp_path, *, n_present=31):
     srv.last_relift_monotonic = 0.0
     monkeypatch.setenv("TT_DEVICE_MCP_SELFHEAL_RELIFT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_RELIFT", "1")
+    monkeypatch.setattr(srv, "_fabric_77_recheck_due", lambda: True)  # the I48 backoff: re-check due
 
 
 @pytest.mark.asyncio
@@ -10326,6 +10341,149 @@ async def test_stuck_offbus_hold_hard_failed_reset_holds_loudly_never_reboots(mo
     ), "a hard-failed reset leaving chips off the bus must never warm-reboot on the idle path"
     assert "reset_unrecoverable_power_cycle_required" in events, "the cold rung must be named for the held drop"
     assert "reset_regressed_offbus" not in events, "an unchanged off-bus count is not a regression"
+
+
+# --- spec 04 I31: a galaxy reset that regressed an off-bus mesh is not repeated in its hold episode -
+#
+# The incident: a Galaxy host's broker fired the mesh reset at three forced windows of one hold. Each
+# made the drop worse: 4 off-bus, then 31, then 32. The forced ladder bypasses the once-per-episode latch
+# and the cooldown, and nothing remembered the regression, so every window re-ran the same reset.
+
+
+def _arm_regressed_offbus_hold(monkeypatch, *, held_minutes_ago=21):
+    """An off-bus hold of 16/32 whose galaxy reset regresses it to 28/32 (floors 16), with the tray rung
+    and the last-chance sweep stubbed to count. Returns (counters, events)."""
+    events = []
+    counters = _arm_offbus_stuck_hold(
+        monkeypatch, off_bus=16, isolated=set(), reset_result=False, beats_after_reset={str(i): 100 for i in range(4)}
+    )  # 28 off-bus after the reset
+    srv.device_hold_episode_since = (datetime.now() - timedelta(minutes=held_minutes_ago)).isoformat()
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # galaxy + reboot floor = 16
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
+    counters["trays"] = counters["sweeps"] = 0
+
+    async def tray(*a, **k):
+        counters["trays"] += 1
+        return None
+
+    async def sweep(*a, **k):
+        counters["sweeps"] += 1
+        return False
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_attempt_ubb_tray_reset", tray)
+    monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", sweep)
+    return counters, events
+
+
+@pytest.mark.asyncio
+async def test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset(monkeypatch, clear_job_state):
+    """The next forced window after a regressing reset fires no reset rung: it pages for the cold rung and
+    holds. Fails on base, which fires the same galaxy reset again (resets == 2)."""
+    counters, events = _arm_regressed_offbus_hold(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    first = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert first is True and counters["resets"] == 1 and "reset_regressed_offbus" in events
+    events.clear()
+    second = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert second is True
+    assert counters["resets"] == 1, "a reset that regressed the mesh must not be repeated in its hold episode"
+    assert counters["sbr"] == 0 and counters["trays"] == 0, "no gentler reset rung re-runs either"
+    assert "galaxy_reset_skipped_regressed" in events
+    assert "reset_unrecoverable_power_cycle_required" in events, "with no power cycle opted in it pages"
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0 and counters["sweeps"] == 0
+
+
+@pytest.mark.asyncio
+async def test_forced_offbus_ladder_after_a_regression_sweeps_then_power_cycles_when_opted_in(
+    monkeypatch, clear_job_state
+):
+    """With the power cycle opted in, a latched episode skips the ladder's own reset and climbs to the
+    cold rung, still behind one last-chance sweep (the full ladder before any power cycle, I22)."""
+    counters, events = _arm_regressed_offbus_hold(monkeypatch)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(4)})  # 28 off-bus
+    srv.recovery_mechanism.note_reset_regressed(srv.device_hold_episode_since)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert ran is True and "galaxy_reset_skipped_regressed" in events
+    assert counters["resets"] == 0 and counters["sbr"] == 0 and counters["trays"] == 0
+    assert counters["sweeps"] == 1, "the last-chance sweep still runs once before the power cycle"
+    assert counters["power_cycles"] == 1 and counters["reboots"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_early_regression_is_latched_before_the_ceiling_deferral(monkeypatch, clear_job_state):
+    """A regression on an early forced pass (hold younger than the ceiling, so the host rung defers) is
+    still latched: the next pass does not reset again. Fails on base, which only looked for a
+    regression after the deferral returned."""
+    counters, events = _arm_regressed_offbus_hold(monkeypatch, held_minutes_ago=3)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["resets"] == 1
+    assert "reset_regressed_offbus" in events and "host_rung_deferred_until_ladder_end" in events
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["resets"] == 1, "an early regression must latch the episode too"
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_new_hold_episode_resets_again_after_a_regression(monkeypatch, clear_job_state):
+    """The latch is per hold episode: a regression recorded for an earlier episode does not stop this
+    one's galaxy reset, and releasing the device clears it."""
+    counters, events = _arm_regressed_offbus_hold(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    srv.recovery_mechanism.note_reset_regressed("2026-10-14T09:47:12")  # an older episode
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["resets"] == 1 and "galaxy_reset_skipped_regressed" not in events
+    # The release transition ends the episode and the latch with it.
+    srv.device_hold_logged = True
+    srv._note_tenant_gate_verdict("")
+    assert srv.recovery_mechanism.regressed_reset_since is None
+
+
+async def _gate_twice_after_a_regressing_reset(monkeypatch, tmp_path):
+    reboots = _reach_reboot_rung_with_regressing_reset(monkeypatch, tmp_path, off_before=20, off_after=28)
+    events, resets = [], {"n": 0}
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    reset = srv.galaxy_recovery._reset_and_verify_device
+
+    async def counting_reset(indices, log):
+        resets["n"] += 1
+        return await reset(indices, log)
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", counting_reset)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    assert resets["n"] == 1 and "reset_regressed_offbus" in events
+    latched = srv.recovery_mechanism.regressed_reset_since
+    events.clear()
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    assert resets["n"] == 1, "the gate must not repeat a galaxy reset that regressed the mesh"
+    assert "galaxy_reset_skipped_regressed" in events
+    assert "reset_unrecoverable_power_cycle_required" in events, "it pages for the cold rung instead"
+    assert reboots["n"] == 0
+    return latched
+
+
+@pytest.mark.asyncio
+async def test_gate_skips_a_repeat_galaxy_reset_after_a_regression(monkeypatch, tmp_path, clear_job_state):
+    """Inside an open hold episode the gate latches that episode and skips the next galaxy reset."""
+    monkeypatch.setattr(srv, "device_hold_episode_since", "2026-10-14T09:47:12")
+    srv.device_hold_logged = True
+    assert await _gate_twice_after_a_regressing_reset(monkeypatch, tmp_path) == "2026-10-14T09:47:12"
+
+
+@pytest.mark.asyncio
+async def test_gate_latches_a_regression_seen_before_any_hold(monkeypatch, tmp_path, clear_job_state):
+    """A gate's first reset regresses with no hold open yet: the latch covers the episode that pass
+    opens, so the following gate pass does not reset again either. A regression latched with no
+    episode at all covers whichever episode comes next."""
+    assert srv.device_hold_episode_since == ""
+    latched = await _gate_twice_after_a_regressing_reset(monkeypatch, tmp_path)
+    assert latched in ("*", srv.device_hold_episode_since) and srv.device_hold_episode_since
+    monkeypatch.setattr(srv.recovery_mechanism, "regressed_reset_since", None)
+    srv.recovery_mechanism.note_reset_regressed("")
+    assert srv.recovery_mechanism.reset_regressed_in("2026-10-14T09:47:12")
 
 
 # --- F13: the per-UBB tray rung (a tray-down named as the lightest sufficient recovery) ---
@@ -12424,6 +12582,40 @@ async def test_an_incomplete_sweep_after_an_unverified_reset_does_not_climb(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("read_77", [True, False])
+async def test_a_sweep_that_still_reads_77_holds_and_pages_once_instead_of_climbing(
+    monkeypatch, clear_job_state, read_77
+):
+    """Spec 04 I29: after an UNKNOWN reset, a sweep whose verify still reads a 77 measured no fault, so
+    no escalation of the episode climbs to a reboot or power cycle: it holds and pages once. A sweep that
+    measured a failure still climbs."""
+    counters, sweeps, climbs = _arm_unverified_reset_episode(monkeypatch)
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(srv.recovery_mechanism, "unverified_sweep_77_since", None)
+    monkeypatch.setattr(g, "_sweep_read_77", False)
+    monkeypatch.setattr(g, "_host_rung_77_paged_since", None)
+    alerts = []
+    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event["kind"]))
+
+    async def sweep(expected, log, gate_phase, **k):
+        sweeps.append(k)
+        g._sweep_read_77 = read_77
+        return False
+
+    monkeypatch.setattr(g, "_settle_and_verify_before_host_rung", sweep)
+    for _ in range(2):
+        assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    assert len(sweeps) == 1 and counters["resets"] == 0
+    if read_77:
+        assert climbs == [], "a 77 is no measured fault: never a host rung"
+        assert alerts == ["fabric_unverified_no_host_rung"], "one page per episode"
+    else:
+        assert climbs == [{"swept": True}] * 2
+        assert alerts == []
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fabric_77_unverified, expect", [(True, False), (False, True)])
 async def test_a_sweep_verify_that_reads_77_is_not_a_release(
     monkeypatch, clear_job_state, fabric_77_unverified, expect
@@ -12445,6 +12637,7 @@ async def test_a_sweep_verify_that_reads_77_is_not_a_release(
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     monkeypatch.setattr(g.deps, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})
     monkeypatch.setattr(galaxy_mod, "_settle_before_host_rung_sec", lambda: 0)
+    monkeypatch.setattr(g, "_sweep_read_77", False)
     monkeypatch.setattr(srv, "_clear_device_dirty", lambda **kw: cleared.append(kw))
     patch_health_event(monkeypatch, lambda *a, **k: None)
     patch_recovery(monkeypatch, "_verify_device", verify_77)
@@ -12453,6 +12646,7 @@ async def test_a_sweep_verify_that_reads_77_is_not_a_release(
     )
     assert got is expect
     assert bool(cleared) is expect, "a 77 after an UNKNOWN reset must never clear the hold"
+    assert g._sweep_read_77 is fabric_77_unverified, "the 77 is noted so the escalation holds, not climbs"
 
 
 def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output="", beats=None, fault=""):
@@ -14090,3 +14284,72 @@ async def test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_rese
     await srv._force_escalate_stuck_hold()
     assert escalations == []
     assert [a["cause"] for a in alerts] == ["known fabric fault"]
+
+
+def _boot_split_hold(monkeypatch, tmp_path, clear_job_state, *, sidecar):
+    """A box cold-cycled mid-hold: the last boot's broker died holding (an unmatched device_held and
+    a 3h-old clock on disk, with or without the boot-id sidecar), and this boot's broker started.
+    Returns the forced escalations _check_hold_deadline spawns."""
+    stale = _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
+    if not sidecar:  # the bare-timestamp file an older broker leaves: older than this boot's btime
+        (tmp_path / srv.HOLD_EPISODE_RECORD_FILE).unlink()
+        btime = datetime.now() - timedelta(minutes=1)
+        monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int(btime.timestamp())))
+    (tmp_path / health.EVENTS_FILE).write_text(
+        json.dumps({"ts": time.time() - 3 * 3600, "kind": "device_held", "reason": "eth/fabric fault"}) + "\n"
+    )
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-b")
+    monkeypatch.setattr(srv, "_hold_episode_restorable", True)
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
+    monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: False)  # a hold the ladder may force
+    fired = []
+    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: fired.append(True) or True)
+    return stale, fired
+
+
+@pytest.mark.parametrize("sidecar", [True, False])
+def test_an_orphaned_pre_boot_hold_does_not_drive_the_deadline_escalation(
+    monkeypatch, tmp_path, clear_job_state, sidecar
+):
+    """Measured: a box cold-cycled mid-hold; STARTUP closed the pre-boot hold as orphaned, the
+    startup pass opened a new hold, and 10s later HOLD-DEADLINE-ESCALATE counted the pre-boot
+    hold's 2550s and ran a galaxy reset on the freshly cycled box. The closed hold's age must not
+    count toward the new boot's deadline."""
+    stale, fired = _boot_split_hold(monkeypatch, tmp_path, clear_job_state, sidecar=sidecar)
+
+    srv._close_orphaned_hold()
+    srv._note_tenant_gate_verdict("device unverified: gate/startup: eth/fabric fault")
+
+    assert srv.device_hold_episode_since != stale, "the new boot's hold inherited the pre-boot clock"
+    srv._check_hold_deadline(now=datetime.now() + timedelta(seconds=10))
+    assert fired == [], "the deadline forced the ladder on a pre-boot hold's age"
+
+
+def test_a_hold_clock_with_an_earlier_boot_id_is_ignored_by_the_deadline(monkeypatch, tmp_path, clear_job_state):
+    """No orphan close at all (no journal row): the clock's sidecar names the last boot, so the
+    deadline still counts this boot's hold from its own start."""
+    _stale, fired = _boot_split_hold(monkeypatch, tmp_path, clear_job_state, sidecar=True)
+    (tmp_path / health.EVENTS_FILE).unlink()
+
+    srv._note_tenant_gate_verdict("device unverified: gate/startup: eth/fabric fault")
+
+    srv._check_hold_deadline(now=datetime.now() + timedelta(seconds=10))
+    assert fired == [], "a clock from an earlier boot drove the deadline escalation"
+    assert srv.device_hold_deadline_bucket == 0 and srv.device_hold_escalate_bucket == 0
+
+
+def test_a_fresh_post_boot_hold_still_escalates_at_its_deadline(monkeypatch, tmp_path, clear_job_state):
+    """The pre-boot clock is dropped, not the deadline: a hold this boot opened is forced once its
+    own age passes the ceiling."""
+    _stale, fired = _boot_split_hold(monkeypatch, tmp_path, clear_job_state, sidecar=True)
+    srv._close_orphaned_hold()
+    srv._note_tenant_gate_verdict("device unverified: gate/startup: eth/fabric fault")
+    since = datetime.fromisoformat(srv.device_hold_episode_since)
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling - 1))
+    assert fired == [], "escalated before the new hold's own ceiling"
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 1))
+    assert len(fired) == 1, "a post-boot hold past its ceiling must still force the ladder"

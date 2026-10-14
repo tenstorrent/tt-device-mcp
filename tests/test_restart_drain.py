@@ -228,6 +228,37 @@ def test_startup_sweeps_spools_of_jobs_not_readopted(monkeypatch):
     assert {p.name for p in _spool_dir().glob("981.*")} == {"981.stdout", "981.stderr", "981.offsets"}
 
 
+def test_startup_copies_the_uncopied_spool_tail_into_the_log_before_the_sweep(monkeypatch, tmp_path):
+    """A job that ended while no broker ran wrote past the offsets its broker recorded: the sweep
+    appends that tail to the job's log before it removes the spool, never the copied part again,
+    and keeps only the last SPOOL_SALVAGE_MAX_BYTES of a stream that grew past it."""
+    fds = spool.open_job_spool("982")
+    os.write(fds["stdout"], b"copied line\nlast words\nno newline")
+    os.write(fds["stderr"], b"0123456789" * 3 + b"\nTT_FATAL at the end\n")
+    for fd in fds.values():
+        os.close(fd)
+    offsets = spool.SpoolOffsets("982")
+    offsets.set("stdout", len(b"copied line\n"))
+    offsets.close()
+    monkeypatch.setattr(spool, "SPOOL_SALVAGE_MAX_BYTES", 25)
+    log = tmp_path / "20261014_982.log"
+    log.write_text("COMMAND: x\n[12:00:00] [stdout] copied line\n")
+    monkeypatch.setattr(srv, "job_log_dir", str(tmp_path))
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "readopted_scopes", {})
+    monkeypatch.setattr(srv, "list_active_job_scopes", lambda: {})
+
+    asyncio.run(srv.reconcile_running_scopes())
+
+    assert not any(_spool_dir().glob("982.*"))
+    text = log.read_text()
+    assert text.count("copied line") == 1, "the copied part was appended again"
+    assert "] [stdout] last words\n" in text and "] [stdout] no newline\n" in text
+    assert "] [stderr] TT_FATAL at the end\n" in text
+    assert "] [stderr] 0123456789" not in text, "the stderr tail past the cap was not bounded"
+    assert "its first 26 uncopied bytes were dropped" in text
+
+
 def test_a_spool_line_with_no_newline_is_still_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(spool, "SPOOL_MAX_LINE_BYTES", 4096)
     path = tmp_path / "j.stdout"
@@ -307,3 +338,75 @@ async def test_a_dead_or_overdue_hold_is_ignored(monkeypatch, tmp_path, clear_jo
 
     assert job.status is srv.JobStatus.COMPLETED, f"a {hold} hold wedged the queue ({job.status.value})"
     assert not path.exists(), f"the {hold} hold was left in place"
+
+
+@pytest.mark.asyncio
+async def test_a_job_held_by_the_update_is_gated_again_before_it_runs(monkeypatch, tmp_path, clear_job_state):
+    """The hold can stand for minutes and the device can go bad under it, so the verdict the gate
+    gave before the wait is stale: the job is admitted again once the hold ends, and refused here."""
+    ws = _quiet_runner(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_TENANT_HOLD", "0")  # a degraded verdict refuses at once
+    monkeypatch.setattr(srv, "DISPATCH_HOLD_POLL_SEC", 0.02)
+    hold = _hold(f"{os.getpid()} {int(time.time())}\n")
+    held_at_verdict = []
+
+    async def admission(job, job_log_file):
+        held_at_verdict.append(hold.exists())
+        return "" if len(held_at_verdict) == 1 else "device degraded: a fault opened during the hold"
+
+    monkeypatch.setattr(srv, "_admission_verdict", admission)
+    marker = tmp_path / "ran"
+    job = _job(tmp_path, ws, "996", f"touch {marker}")
+    await srv.get_job_queue().put("996")
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await asyncio.sleep(0.3)
+        assert job.status is srv.JobStatus.QUEUED and held_at_verdict == [True]
+        hold.unlink()
+        for _ in range(250):
+            if job.finished_at:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+    assert held_at_verdict == [True, False], "the job was not admitted again once the hold ended"
+    assert job.status is srv.JobStatus.FAILED and "degraded" in (job.error or ""), job.error
+    assert not marker.exists(), "the job ran on the verdict from before the hold"
+
+
+@pytest.mark.asyncio
+async def test_a_step_that_reserves_the_device_during_the_hold_is_waited_out(monkeypatch, tmp_path, clear_job_state):
+    """A scheduler step that reserves the device while the update holds dispatch: once the hold ends
+    the job waits for the step to release it, rather than starting under the step's own gate."""
+    ws = _quiet_runner(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "DISPATCH_HOLD_POLL_SEC", 0.02)
+    hold = _hold(f"{os.getpid()} {int(time.time())}\n")
+    marker = tmp_path / "ran"
+    job = _job(tmp_path, ws, "997", f"touch {marker}")
+    await srv.get_job_queue().put("997")
+
+    runner = asyncio.create_task(srv.job_runner())
+    token = None
+    try:
+        await asyncio.sleep(0.3)
+        assert job.status is srv.JobStatus.QUEUED
+        token = srv._reserve_external_step("pre-step")
+        hold.unlink()
+        await asyncio.sleep(0.4)
+        assert job.status is srv.JobStatus.QUEUED, f"job 997 reached {job.status.value} under a step's reservation"
+        assert not marker.exists()
+        srv._release_external_step(token)
+        token = None
+        for _ in range(250):
+            if job.finished_at:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        if token is not None:
+            srv._release_external_step(token)
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+    assert job.status is srv.JobStatus.COMPLETED, job.error
+    assert marker.exists()

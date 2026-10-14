@@ -235,6 +235,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_FABRIC_RELIFT` | 0 | Opt-in relift of fabric-unverified holds | 03 |
 | `TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES` | 3 | Idle-relift 77 retries on one 77-only hold before the startup checks gate it (I40) | 03 |
 | `TT_DEVICE_MCP_FABRIC_77_BOUND_SEC` | 600 | Age of a 77-only hold (at least one retry behind it) past which the startup checks gate it (I40) | 03 |
+| `TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC` | 120,300,600,1200 | Backoff steps between idle re-checks of a 77-only hold, each clamped to 60..1200 s (I48) | 03 |
 | `TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC` | 21600 | At most one I40 fallback release per window; a second 77-only hold inside it climbs the ladder | 03 |
 | `TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS` | 2 | Jobs in a row that die on the fabric's routing after a 77 pass before a known fabric fault holds without a reset (I46) | 03 |
 | `TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC` | 21600 | Age past which a known fabric fault expires and the usual 77 path gets one more try (I46) | 03 |
@@ -266,7 +267,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC` | 300 (max 3600) | Pre-power-cycle hook timeout; its process group is killed past it and the cycle goes ahead | 04 |
 | `TT_DEVICE_MCP_AUTO_UBB_RESET` | 1 | Arm the per-tray UBB reset rung | 04 |
 | `TT_DEVICE_MCP_AUTO_MESH_RESET` | unset | `0` holds every automatic mesh reset, `1` arms it; unset, an outage hold (reboot, power cycle and tray reset all `0`) holds it | 04 |
-| `TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC` | 3600 | While a held mesh reset stands, page again after this long; `0` pages once per hold | 04 |
+| `TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC` | 3600 | While a held mesh reset or a topology hardware-fault hold stands, page again after this long; `0` pages once per hold | 03, 04 |
 | `TT_DEVICE_MCP_UBB_RESET_SETTLE_SEC` | 28 | Settle time after a UBB tray reset | 04 |
 | `TT_DEVICE_MCP_TRAY_DOWN_CAPTURE` | `1` | `0` turns off the tray-down prelude (one PCI rescan and the read-only BMC/CPLD/PCIe capture before the ladder at a tray-down onset); the ladder is the same either way | 04 |
 | `TT_DEVICE_MCP_TRAY_CPLD_BUSES` | unset | Site data for the tray-down capture: each tray's CPLD BMC I2C bus, `tray:0xNN,...`. All three CPLD vars must be set and well formed; otherwise the CPLD reads are skipped | 04 |
@@ -277,9 +278,11 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_PDB_CPLD_REGS` | unset | Site data: the PDB CPLD registers to read, `0xNN,...` (single-register reads); unset = PDB reads skipped | 04 |
 | `TT_DEVICE_MCP_HOST_RESET_GATE` | off | `off`, `guard` (mask AER around automatic resets, refuse during an AER flood) or `hold` (also refuse while a chip is off the bus) | 04 |
 | `TT_DEVICE_MCP_OFFBUS_HANG_LATCH` | 1 | `0` turns off the off-bus reset intent and the host-hang latch (spec 04 I25) | 04 |
+| `TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC` | 21600 | A host-hang latch older than this lifts once every chip is on the bus, even without a clean host-pci look; never with a chip off (spec 04 I25) | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_CMD` | unset (off) | The host's own power-cycle command, run to end an off-bus hold the reset gate refuses (spec 04 I27); unset = page and hold | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC` | 120 | Timeout for that command; past it its process group is killed and the attempt counts as failed | 04 |
 | `TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC` | 300 | How long a gated off-bus hold stands, from the episode start, before the I27 power cycle may run | 04 |
+| `TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC` | 300 | How long after the BMC's IPMI first fails a tray re-power in an off-bus hold before the I27 power cycle may run (the ladder still runs once first) | 04 |
 | `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` | 21600 | At most one I27 attempt per this many seconds per host; within it the broker pages instead | 04 |
 | `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC` | 1800 | How long past the grace a tenant, a reset scope or a stand-back may block the I27 power cycle before the broker pages once | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE` | unset | `:`-separated marker paths; any that exists holds the I27 power cycle | 04 |
@@ -297,7 +300,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_POST_REBOOT_VERIFY` | 1 | Verify the mesh actually came back after a reboot | 04 |
 | `TT_DEVICE_MCP_AUTO_RECOVERY_INTERVAL_SEC` | 3600 | Durable rate limit between auto reboot/power-cycle rungs | 04 |
 | `TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC` | 900 | Window to attribute a boot to our own reboot rung | 04 |
-| `TT_DEVICE_MCP_POLLER_SERVICES` | `tt-telemetry.service,tt-metrics-exporter.service,tt-fmax-cap.service` | Pollers quiesced around a reset; a unit the host lacks is skipped. The idle-time probe re-arms the same list, with the same default | 04, 08 |
+| `TT_DEVICE_MCP_POLLER_SERVICES` | `tt-telemetry.service,tt-metrics-exporter.service` | Pollers quiesced around a reset; a unit the host lacks is skipped. The idle-time probe re-arms the same list, with the same default | 04, 08 |
 | `TT_DEVICE_MCP_PRE_STEP_DEADLINE_SEC` | `120` | Wall-clock cap on the reply to an external read-only health pass, **and** the base the CLI derives its pre-step client timeout from (+60 s margin) | 03/07 |
 | `TT_DEVICE_MCP_POST_STEP_DEADLINE_SEC` | `600` | Wall-clock cap on the reply to the whole post-step route — the straggler reclaim and the recovering health pass together, not the pass alone — **and** the base the CLI derives its post-step client timeout from (+60 s margin) | 03/07 |
 
@@ -342,6 +345,8 @@ Behavior).
 | `TTDEV_FABRIC_CACHE` | `/var/cache/tt-device-broker/fabric-tt-metal-cache` | `TT_METAL_CACHE` for the fabric check (src) |
 | `TTDEV_FABRIC_OUTPUT` | `<cache>/cluster_validation_logs` | Validator output dir (src) |
 | `TTDEV_FABRIC_ITERS` | 1 | Traffic iterations (src) |
+| `TTDEV_FABRIC_LAST_RUN_MAX_BYTES` | 4194304 | Fabric-check wrapper: size past which `last-run.log` keeps only the head and tail of a run's output |
+| `TTDEV_HUGEPAGES_1G_NR`, `TTDEV_PCI_DEVICES_DIR` | `/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages`, `/sys/bus/pci/devices` | Fabric-check wrapper: where its hugepage-pool check reads (tests point them at stand-ins) |
 | `TTDEV_VALIDATOR_ROOT` | `/opt/tt-device-broker/validator` | Pinned-validator install root (src + installer) |
 | `TTDEV_VALIDATOR_REPO`, `TTDEV_VALIDATOR_SHA`, `TTDEV_VALIDATOR_TOOLCHAIN`, `TTDEV_VALIDATOR_TARGET`, `TTDEV_VALIDATOR_BIN_REL`, `TTDEV_VALIDATOR_DESCRIPTOR_REL` | `deploy/fabric-validator.pin` | Validator build pin (repo, SHA, toolchain, target, artifact paths) |
 | `TTDEV_DISPATCH_TARGET`, `TTDEV_DISPATCH_BIN_REL`, `TTDEV_PREJOB_DISPATCH_TARGET`, `TTDEV_PREJOB_DISPATCH_BIN_REL` | pin file | Dispatch-probe build targets/artifacts |

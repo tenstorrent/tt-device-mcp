@@ -669,3 +669,211 @@ def test_the_manual_recovery_check_cannot_answer_on_an_unreadable_auth_log(tmp_p
     assert subprocess.run(["bash", _CHECK], capture_output=True).returncode == 2
     log.unlink()
     assert subprocess.run(["bash", _CHECK], capture_output=True).returncode == 1
+
+
+def test_the_manual_recovery_check_cannot_answer_when_auth_log_fails_to_read(tmp_path, monkeypatch):
+    """A read that fails past the permission check (here a directory) is unknown, never 'no recovery'."""
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, []))
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_AUTHLOG", str(tmp_path))
+    p = subprocess.run(["bash", _CHECK], capture_output=True, text=True)
+    assert p.returncode == 2, p.stderr
+
+
+def test_the_manual_recovery_check_never_globs_an_auth_log_line(tmp_path, monkeypatch):
+    """A '*' leading a line stays a '*': it never expands to a file name that reads as a recent stamp."""
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, []))
+    log = tmp_path / "auth.log"
+    log.write_text("* host sudo:   ops : TTY=pts/0 ; PWD=/ ; USER=root ; COMMAND=/usr/sbin/reboot\n")
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_AUTHLOG", str(log))
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / _stamp(5)).touch()
+    assert subprocess.run(["bash", _CHECK, "30"], capture_output=True, cwd=cwd).returncode == 1
+
+
+# --- the BMC's IPMI failed the tray re-power ------------------------------------------------------
+
+IPMI_FAIL = "ubb tray reset exited 1: No data available"
+
+
+def _ipmi_failed(monkeypatch, hold_since, ago_sec):
+    """The gate allows resets, but the BMC's IPMI failed this episode's tray re-power ``ago_sec`` ago."""
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
+    monkeypatch.delenv("TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC", raising=False)
+    opc.note_ipmi_unavailable(hold_since, IPMI_FAIL, now=datetime.now() - timedelta(seconds=ago_sec))
+
+
+@pytest.mark.asyncio
+async def test_a_failed_bmc_ipmi_hands_off_past_its_bound(monkeypatch, tmp_path, clear_job_state):
+    """The 10-14 incident: the tray re-power returned no data, the gate still allowed resets, and the
+    hold re-ran the ladder and paged for an hour. Past the bound, once the ladder ran, it fires once."""
+    hold_since, rec = _gated(monkeypatch, tmp_path)
+    _ipmi_failed(monkeypatch, hold_since, 400)
+    assert await _pass(hold_since) is None, "the ladder runs once first"
+    assert rec["fires"] == []
+    opc.note_ladder_ran(hold_since)
+    assert await _pass(hold_since) is True
+    assert len(rec["fires"]) == 1
+    assert "IPMI" in rec["fires"][0]["reason"] and "No data available" in rec["fires"][0]["reason"]
+    assert ("offbus_gated_hold", "ipmi_unavailable") in [(k, f.get("phase")) for k, f in rec["events"]]
+
+
+@pytest.mark.asyncio
+async def test_within_the_ipmi_bound_it_holds_and_the_bound_is_configurable(monkeypatch, tmp_path, clear_job_state):
+    hold_since, rec = _gated(monkeypatch, tmp_path)
+    _ipmi_failed(monkeypatch, hold_since, 120)
+    opc.note_ladder_ran(hold_since)
+    assert await _pass(hold_since) is False, "inside the bound: hold, do not re-run the futile ladder"
+    assert rec["fires"] == []
+    monkeypatch.setenv("TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC", "60")
+    assert await _pass(hold_since) is True and len(rec["fires"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_in_progress_stands_the_ipmi_hand_off_back(monkeypatch, tmp_path, clear_job_state):
+    """A stand-back command that exits 0 (e.g. a host-cycle tool reporting a cycle in progress) holds."""
+    hold_since, rec = _gated(monkeypatch, tmp_path)
+    _ipmi_failed(monkeypatch, hold_since, 400)
+    opc.note_ladder_ran(hold_since)
+    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD", _script(tmp_path, "busy", "echo cycling; exit 0"))
+    assert await _pass(hold_since) is False
+    assert rec["fires"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_whole_box_is_re_read_before_the_cycle(monkeypatch, tmp_path, clear_job_state):
+    """A tray re-power can drop or bring back other trays: the pass re-reads every chip before firing,
+    and a box back on the bus never cycles."""
+    hold_since, rec = _gated(monkeypatch, tmp_path)
+    _ipmi_failed(monkeypatch, hold_since, 400)
+    opc.note_ladder_ran(hold_since)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(EXPECTED)})
+    assert await _pass(hold_since) is None
+    assert rec["fires"] == []
+    assert ("offbus_gated_hold", "back_on_bus") in [(k, f.get("phase")) for k, f in rec["events"]]
+
+
+def test_only_a_bmc_ipmi_failure_starts_the_clock(monkeypatch, clear_job_state):
+    from tt_device_mcp.health.recovery.stages.ubb_tray import BmcIpmiError
+
+    since = datetime.now().isoformat()
+    monkeypatch.setattr(srv, "device_hold_episode_since", since)
+    monkeypatch.setattr(opc, "health_event", lambda *a, **k: None)
+    srv.galaxy_recovery._note_bmc_ipmi_failure(RuntimeError("tray map disagrees"))
+    assert opc.ipmi_unavailable_age_sec(since) is None
+    srv.galaxy_recovery._note_bmc_ipmi_failure(BmcIpmiError(IPMI_FAIL))
+    assert opc.ipmi_unavailable_age_sec(since) is not None and opc.ipmi_detail(since) == IPMI_FAIL
+
+
+@pytest.mark.asyncio
+async def test_a_tray_sweep_the_bmc_failed_starts_the_clock(monkeypatch, clear_job_state):
+    from tt_device_mcp.health.recovery.stages.ubb_tray import BmcIpmiError
+
+    g = srv.galaxy_recovery
+    since = datetime.now().isoformat()
+    monkeypatch.setattr(srv, "device_hold_episode_since", since)
+    monkeypatch.setattr(opc, "health_event", lambda *a, **k: None)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+
+    def no_data(*a, **k):
+        raise BmcIpmiError(IPMI_FAIL)
+
+    async def ok_reset(*a, **k):
+        return 0, ""
+
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", no_data)
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", ok_reset)
+    await g._issue_all_resets_back_to_back(0b1000, [3], [4], 4, lambda m: None, do_sbr=False)
+    assert opc.ipmi_unavailable_age_sec(since) is not None
+
+
+def test_the_watchdog_forces_a_pass_at_the_ipmi_bound(monkeypatch, clear_job_state):
+    fired = []
+    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: fired.append(True) or True)
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", True)
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: False)
+    monkeypatch.setattr(srv, "_stuck_hold_ceiling_sec", lambda: 1200)
+    monkeypatch.setattr(opc, "health_event", lambda *a, **k: None)
+    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "/bin/true")
+    monkeypatch.delenv("TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC", raising=False)
+    since = datetime(2026, 10, 14, 10, 49, 0)
+    ep = since.isoformat()
+    monkeypatch.setattr(srv, "device_hold_episode_since", ep)
+    failed = since + timedelta(seconds=100)
+    opc.note_ipmi_unavailable(ep, IPMI_FAIL, now=failed)
+    opc.note_ladder_ran(ep)
+    assert not opc.due_for_watchdog(ep, failed + timedelta(seconds=299))
+    srv._check_hold_deadline(now=failed + timedelta(seconds=299))
+    assert fired == []
+    srv._check_hold_deadline(now=failed + timedelta(seconds=301))
+    assert fired == [True]
+    assert "BMC IPMI hand-off bound" in srv.device_hold_escalation_trigger
+
+
+def test_the_ipmi_bound_defaults_and_rejects_nonsense(monkeypatch):
+    monkeypatch.delenv("TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC", raising=False)
+    assert opc.ipmi_handoff_sec() == 300
+    for bad in ("0", "-5", "soon", ""):
+        monkeypatch.setenv("TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC", bad)
+        assert opc.ipmi_handoff_sec() == 300
+    monkeypatch.setenv("TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC", "120")
+    assert opc.ipmi_handoff_sec() == 120
+
+
+def test_the_ladder_noted_before_the_ipmi_failure_still_counts(monkeypatch, clear_job_state):
+    """The real order: the escalation notes the ladder before its tray rung fails over IPMI. With the gate
+    allowing resets nothing tracked the episode yet; the ladder must still count, or the watchdog never
+    forces the pass at the bound and the hold waits for the next ceiling window."""
+    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "/bin/true")
+    monkeypatch.delenv("TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC", raising=False)
+    monkeypatch.setattr(opc, "health_event", lambda *a, **k: None)
+    since = datetime(2026, 10, 14, 10, 49, 0)
+    ep = since.isoformat()
+    opc.note_ladder_ran(ep)
+    assert opc.ladder_ran(ep)
+    assert not opc.due_for_watchdog(ep, since + timedelta(hours=1)), "tracking alone forces nothing"
+    failed = since + timedelta(seconds=100)
+    opc.note_ipmi_unavailable(ep, IPMI_FAIL, now=failed)
+    assert opc.ladder_ran(ep), "the IPMI note keeps the ladder it found"
+    assert not opc.due_for_watchdog(ep, failed + timedelta(seconds=299))
+    assert opc.due_for_watchdog(ep, failed + timedelta(seconds=300))
+    opc.note_ladder_ran("")
+    assert opc.ladder_ran(ep), "an empty episode tracks nothing"
+
+
+@pytest.mark.asyncio
+async def test_the_escalations_own_tray_rung_failing_over_ipmi_hands_off_at_the_bound(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """End to end through _escalate_offbus_stuck_hold with the gate allowing resets: the forced pass runs
+    the ladder, whose tray rung the BMC's IPMI fails. Past the bound the watchdog is due and its forced
+    pass fires the power cycle once, without a second ladder run."""
+    from tt_device_mcp.health.recovery.stages.ubb_tray import BmcIpmiError
+
+    hold_since, rec = _gated(monkeypatch, tmp_path)
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
+    monkeypatch.delenv("TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC", raising=False)
+    g = srv.galaxy_recovery
+    tray_rungs = []
+
+    async def tray_rung(beats, off_bus, expected, log):
+        tray_rungs.append(off_bus)
+        g._note_bmc_ipmi_failure(BmcIpmiError(IPMI_FAIL))
+        return False
+
+    monkeypatch.setattr(g, "_attempt_ubb_tray_reset", tray_rung)
+    await g._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
+    assert tray_rungs, "the ladder reached the tray rung"
+    assert opc.ladder_ran(hold_since) and opc.ipmi_unavailable_age_sec(hold_since) is not None
+    assert rec["fires"] == []
+    now = datetime.now()
+    assert not opc.due_for_watchdog(hold_since, now)
+    assert opc.due_for_watchdog(hold_since, now + timedelta(seconds=opc.ipmi_handoff_sec() + 1))
+    opc._pending["ipmi_at"] -= timedelta(seconds=opc.ipmi_handoff_sec() + 1)  # the bound has passed
+    ran = await g._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
+    assert ran is True and len(rec["fires"]) == 1
+    assert len(tray_rungs) == 1, "the ladder ran once, not again before the cycle"

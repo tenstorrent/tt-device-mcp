@@ -49,14 +49,21 @@ if [ -z "$hit" ] && [ -e "$authlog" ] && [ ! -r "$authlog" ]; then
 fi
 if [ -z "$hit" ] && [ -e "$authlog" ]; then
     # auth.log stamps lines either RFC 3339 (2026-10-13T19:34:12.5+00:00) or syslog style
-    # (Oct 13 19:34:12); a line whose stamp does not parse is skipped.
+    # (Oct 13 19:34:12); a line whose stamp does not parse is skipped. grep exits 1 when no line
+    # matches; above that it could not read the file, which leaves the answer unknown.
+    sudo_lines="$(grep -a 'sudo' "$authlog")"
+    if [ "$?" -gt 1 ]; then
+        echo "auth.log unreadable: $authlog" >&2
+        exit 2
+    fi
     cutoff=$(( $(date +%s) - window * 60 ))
     while IFS= read -r line; do
-        set -- $line
-        case "$1" in [0-9]*) ts="$1" ;; *) ts="$1 $2 $3" ;; esac
+        # Split into words without glob expansion: a '*' in a line must not expand to file names.
+        read -ra f <<< "$line"
+        case "${f[0]:-}" in [0-9]*) ts="${f[0]}" ;; *) ts="${f[0]:-} ${f[1]:-} ${f[2]:-}" ;; esac
         t="$(date -d "$ts" +%s 2>/dev/null)" || continue
         [ "$t" -ge "$cutoff" ] && hit="$line"
-    done < <(grep -a 'sudo' "$authlog" | recovery | tail -n 50)
+    done < <(printf '%s\n' "$sudo_lines" | recovery | tail -n 50)
 fi
 if [ -n "$hit" ]; then
     echo "$hit"

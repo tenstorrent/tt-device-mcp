@@ -221,6 +221,14 @@ class RecoveryMechanism:
         self.unverified_reset_since: Optional[str] = None
         # The episode whose last-chance sweep that path already ran; the next escalation climbs.
         self.unverified_sweep_since: Optional[str] = None
+        # The episode whose sweep verify still read a fabric 77: no rung measured a fault, so it never
+        # climbs to a host rung; it holds, pages once and the idle relift keeps re-checking.
+        self.unverified_sweep_77_since: Optional[str] = None
+        # The hold episode (its ``since``) whose galaxy reset REGRESSED an off-bus mesh (more chips off
+        # the bus after it than before). Another mesh reset on that episode repeats the action that just
+        # made the drop worse — one Galaxy host went 4 -> 31 -> 32 off-bus across three — so the episode
+        # goes straight to the host rung, or pages when none is opted in (spec 04 I31).
+        self.regressed_reset_since: Optional[str] = None
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a
@@ -253,6 +261,18 @@ class RecoveryMechanism:
         will not revive it now, and hammering a dead endpoint is precisely what escalates a PCIe
         error to fatal and reboots the host."""
         return self.last_reset_failed and (time.monotonic() - self.last_reset_monotonic) < RESET_COOLDOWN_SEC
+
+    def note_reset_regressed(self, hold_since: str) -> None:
+        """Latch that this hold episode's galaxy reset regressed an off-bus mesh (spec 04 I31). A
+        regression seen before any hold opened (a gate's first reset) latches the episode about to
+        open; the release transition clears the latch either way."""
+        self.regressed_reset_since = hold_since or "*"
+
+    def reset_regressed_in(self, hold_since: str) -> bool:
+        """True when this hold episode's galaxy reset already regressed the mesh: another mesh
+        reset on it is not tried (spec 04 I31)."""
+        latched = self.regressed_reset_since
+        return latched is not None and (latched == "*" or latched == hold_since)
 
     def _local_reset_lock_path(self) -> Path:
         return self._local_reset_dir() / LOCAL_RESET_LOCK

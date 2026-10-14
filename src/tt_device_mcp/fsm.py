@@ -179,6 +179,8 @@ class ServerFsm:
         # Per-episode latches: reset every time a new episode opens (see _open_episode), so a
         # once-per-episode rung re-arms once the device has actually recovered and gone bad again.
         self._latches: dict[str, bool] = {}
+        # Whether _load restored an episode a previous boot wrote — see reopen_after_boot. One-shot.
+        self._crossed_boot = False
         # Whether a persist failure has already been logged this process — see _persist. A broker
         # on a read-only or full state dir would otherwise downgrade to in-memory-only silently,
         # every single mutation, which is the exact durability this file exists to provide.
@@ -378,6 +380,8 @@ class ServerFsm:
                 file_boot_id or "(none)",
                 self._boot_id or "(unknown)",
             )
+        # Known to be another boot: both ids read and differ. An unreadable id is not proof of a reboot.
+        self._crossed_boot = bool(file_boot_id) and bool(self._boot_id) and not same_boot
         self._record = record
         self._latches = latches
 
@@ -575,6 +579,30 @@ class ServerFsm:
         """Whether this broker start is a restart within a boot a broker already ran in: the record
         on disk was written under this same boot id. An unknown id on either side is never "same"."""
         return bool(self._boot_id) and self._loaded_boot_id == self._boot_id
+
+    def reopen_after_boot(self, detail: str = "") -> bool:
+        """Reopen a DOWN episode a previous boot left behind as RECOVERING, once, so this boot's own
+        bounded paths (the idle relift, its backoff and bound) own it again (spec 03 I49).
+
+        DOWN is the terminal rung and no idle path re-checks it. That is right within one boot, where
+        the ladder that took it there ran on this silicon; a reboot since is itself the biggest reset
+        the ladder has, so a carried DOWN is a verdict about a boot that is gone. Only when the record
+        was loaded from another boot and is still DOWN: ``why`` and ``ubb_reset_fired`` stay, ``since``
+        starts over (the bound counts from this boot), ``dirty`` clears (the caller has just placed a
+        no-reset hold) and the ``escalated`` latch drops so this boot's ladder is not pre-spent.
+        Returns whether it reopened."""
+        if self._record.state is not ServerState.DOWN or not self._crossed_boot:
+            return False
+        self._crossed_boot = False
+        self._record.state = ServerState.RECOVERING
+        self._record.since = _now_iso()
+        self._record.dirty = False
+        if detail:
+            self._record.detail = detail
+        self._latches.pop("escalated", None)
+        metrics.state_entered(ServerState.RECOVERING.value)
+        self._persist()
+        return True
 
     def boot_merge(self, open_episode: Optional[FsmRecord], attributed_boot: Optional[dict] = None) -> ServerState:
         """Reconcile BOOT into a real state, once, at startup. Always closed: a restart loses the

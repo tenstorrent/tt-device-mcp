@@ -12,8 +12,9 @@ then escalated that hold to a glx_reset 120 s later — a reset that cannot prod
 """
 
 import asyncio
+import dataclasses
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -348,7 +349,7 @@ async def test_a_dirty_carried_episode_still_runs_the_startup_gate(monkeypatch, 
 # --- a 77-only hold: re-checked, never reset ---------------------------------------------------
 
 
-def _hold_77(monkeypatch, tmp_path, *, last_fabric_ok=None):
+def _hold_77(monkeypatch, tmp_path, *, last_fabric_ok=None, due=True):
     for i in range(32):
         (tmp_path / str(i)).write_text("")
     monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
@@ -362,6 +363,13 @@ def _hold_77(monkeypatch, tmp_path, *, last_fabric_ok=None):
     monkeypatch.setattr(srv, "isolated_chips", set())
     monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
     monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+    monkeypatch.setattr(srv, "_fabric_77_recheck_since", None)
+    monkeypatch.setattr(srv, "_fabric_77_rechecks", 0)
+    monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", 0.0)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", False)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_output", "")
+    if due:  # the I48 backoff has its own tests below; the rest exercise a re-check that is due
+        monkeypatch.setattr(srv, "_fabric_77_recheck_due", lambda: True)
     fsm_dirty(srv, "gate/startup: fabric unverified (could not run)", why="fabric_unverified")
 
 
@@ -408,6 +416,150 @@ async def test_the_77_only_relift_reruns_the_fabric_pass_and_never_resets(monkey
     assert seen == [True], "the relift re-runs the read-only fabric pass"
     assert rungs == [], "a 77 is no fault: never a reset"
     assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY, "another 77 leaves the hold standing"
+
+
+# --- I48: a 77-only hold re-checks on a backoff ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,steps",
+    [
+        (None, [120, 300, 600, 1200]),
+        ("90,240", [90, 240]),
+        ("5,5000", [60, 1200]),
+        ("2m,5m", [120, 300, 600, 1200]),
+        (" , ", [120, 300, 600, 1200]),
+    ],
+)
+def test_the_77_backoff_parses_and_clamps(monkeypatch, raw, steps):
+    """Each step clamps to 60..1200 s; a malformed or empty value reads as the default."""
+    if raw is None:
+        monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
+    else:
+        monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raw)
+    assert srv._fabric_77_backoff_sec() == steps
+
+
+def _opened_ago(monkeypatch, seconds):
+    since = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, since=since))
+
+
+@pytest.mark.asyncio
+async def test_the_77_only_relift_reruns_the_pass_only_once_its_step_is_due(monkeypatch, tmp_path, clear_job_state):
+    """I48: before the first step the relift skips the pass; once due it runs it once, and the 77 it
+    reads again moves the next re-check to the second step."""
+    _hold_77(monkeypatch, tmp_path, due=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "99")
+    seen = []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        seen.append(run_fabric)
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": "could not run (77)"}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+    async def relift():
+        monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
+        await srv._attempt_idle_relift()
+
+    _opened_ago(monkeypatch, 30)
+    await relift()
+    assert seen == [], "the first re-check waits for the first step"
+    _opened_ago(monkeypatch, 130)
+    await relift()
+    assert seen == [True], "due: the pass runs once"
+    await relift()
+    assert seen == [True], "the next re-check waits for the second step"
+    monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", srv.time.monotonic() - 301)
+    await relift()
+    assert seen == [True, True]
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+def test_a_77_recheck_advances_the_backoff_step(monkeypatch, tmp_path, clear_job_state):
+    """Each re-check that 77s again moves to the next step; the last step repeats; a new episode starts over."""
+    _hold_77(monkeypatch, tmp_path, due=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
+
+    def due_after(seconds):
+        monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", srv.time.monotonic() - seconds)
+        return srv._fabric_77_recheck_due()
+
+    srv._note_fabric_77_recheck()
+    srv._note_fabric_77_recheck()
+    assert srv._fabric_77_rechecks == 2
+    assert not due_after(590) and due_after(610), "the third re-check waits the third step"
+    for _ in range(5):
+        srv._note_fabric_77_recheck()
+    assert not due_after(1190) and due_after(1210), "the last step repeats"
+    _opened_ago(monkeypatch, 30)
+    srv._note_fabric_77_recheck()
+    assert srv._fabric_77_rechecks == 1, "a new episode starts its backoff over"
+
+
+_HUGEPAGE_77S = [
+    "fabric-check: hugepage pool not ready: 0/32 1G pages allocated -> CANNOT CHECK (exit 77)",
+    "  what():  Failed to pin pages for hugepage\nfabric-check: validator did not complete a measurement",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", _HUGEPAGE_77S, ids=["wrapper-precheck", "umd-pin-failure"])
+async def test_a_hugepage_77_rechecks_every_30s_and_spends_no_retry(monkeypatch, tmp_path, clear_job_state, output):
+    """Boot fills the 1G pool after the broker's startup pass ran: a 77 for that re-checks after 30 s,
+    not on the 120 s relift interval or the I48 backoff, and its re-checks do not spend the I40 retries
+    that would release a box no job can open yet."""
+    _hold_77(monkeypatch, tmp_path, due=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
+    monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
+    monkeypatch.setattr(srv, "_fabric_77_streak", 0)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_output", output)
+    fallbacks = []
+
+    async def fallback(*a, **k):
+        fallbacks.append(True)
+        return True
+
+    monkeypatch.setattr(srv, "_fabric_77_fallback", fallback)
+    seen = []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        seen.append(run_fabric)
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": output}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+    def ago(seconds):
+        return srv.time.monotonic() - seconds
+
+    _opened_ago(monkeypatch, 20)
+    await srv._attempt_idle_relift()
+    assert seen == [], "not yet 30 s since the hold opened"
+    _opened_ago(monkeypatch, 35)
+    await srv._attempt_idle_relift()
+    assert seen == [True], "30 s after the hold opened the pass runs, not 120 s"
+    for n in range(2, 6):
+        monkeypatch.setattr(srv, "last_relift_monotonic", ago(20))
+        monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", ago(20))
+        await srv._attempt_idle_relift()
+        assert len(seen) == n - 1, "under 30 s since the last re-check: no pass"
+        monkeypatch.setattr(srv, "last_relift_monotonic", ago(31))
+        monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", ago(31))
+        await srv._attempt_idle_relift()
+        assert len(seen) == n, "each later re-check comes 30 s after the last, below the relift interval"
+    assert srv._fabric_77_streak == 0 and fallbacks == [], "a pool still filling spends no I40 retry"
+    assert srv.fsm.state is ServerState.RECOVERING
+
+    # Any other 77 keeps the I48 backoff and the relift interval.
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_output", "fabric-check: validator did not complete")
+    monkeypatch.setattr(srv, "last_relift_monotonic", ago(31))
+    monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", ago(31))
+    await srv._attempt_idle_relift()
+    assert len(seen) == 5
 
 
 @pytest.mark.asyncio
@@ -782,6 +934,79 @@ async def test_a_second_77_only_hold_inside_the_window_climbs_the_ladder(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_the_77_bound_pages_once_per_hold_episode(monkeypatch, tmp_path, clear_job_state):
+    """Every relift pass past the bound runs the fallback again (here each climbs a ladder that leaves
+    the hold standing). Only the first on an episode pages. A page the hook dropped (a run still in
+    flight) goes out on the next pass, and a page sent for an earlier episode does not quiet this one."""
+    rungs = _bound(monkeypatch, tmp_path, (None, "eth links below baseline"))
+    monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["hook"])
+    monkeypatch.setattr(srv, "_fabric_77_paged_since", "an earlier episode", raising=False)
+    sent = []
+    outcomes = iter([None])  # the first send is dropped; every later one starts
+
+    def send_alert(event, log=None):
+        if event["kind"] == "fabric_check_unrunnable_bound":
+            sent.append(event["held_since"])
+            return next(outcomes, object())
+        return object()
+
+    monkeypatch.setattr(srv.alert, "send_alert", send_alert)
+    for _ in range(4):
+        monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
+        await srv._attempt_idle_relift()
+
+    assert rungs == ["present"] * 4, "every pass past the bound still runs the fallback"
+    assert sent == [srv.fsm.record.since] * 2, "one dropped page, then one page for the episode"
+
+
+@pytest.mark.asyncio
+async def test_the_topology_hw_fault_hold_repages_once_per_interval_per_episode(monkeypatch, tmp_path, clear_job_state):
+    """I42: the first-job hardware-fault hold stands until an operator restarts the broker, so the
+    idle relift pages it again every TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC. The fault's own page counts
+    for the episode, a dropped re-page goes out on the next pass, a new episode pages anew, and 0
+    pages once."""
+    _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    fault = "hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)"
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", fault)
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault_paged", srv.time.monotonic())
+    monkeypatch.setattr(srv, "_topology_hw_fault_paged", None)
+    monkeypatch.setenv("TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC", "3600")
+    monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["hook"])
+    sent = []
+    outcomes = iter([None])  # the first re-page is dropped; every later one starts
+
+    def send_alert(event, log=None):
+        if event["kind"] == "fabric_topology_hw_fault":
+            sent.append(event["held_since"])
+            return next(outcomes, object())
+        return object()
+
+    monkeypatch.setattr(srv.alert, "send_alert", send_alert)
+
+    async def relift(n):
+        for _ in range(n):
+            monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
+            await srv._attempt_idle_relift()
+
+    since = srv.fsm.record.since
+    await relift(3)
+    assert sent == [], "the fault's own page covers the episode until the interval runs out"
+    srv._topology_hw_fault_paged = (since, srv.time.monotonic() - 3601)
+    await relift(3)
+    assert sent == [since, since], "one dropped re-page, then one re-page for the interval"
+    assert srv.fsm.state is ServerState.RECOVERING
+
+    srv._topology_hw_fault_paged = ("an earlier episode", srv.time.monotonic())
+    await relift(2)
+    assert sent[2:] == [since], "a page sent for an earlier episode does not quiet this one"
+
+    monkeypatch.setenv("TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC", "0")
+    srv._topology_hw_fault_paged = (since, srv.time.monotonic() - 99999)
+    await relift(2)
+    assert len(sent) == 3, "0 pages once per episode"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "hold_detail,fabric_detail,flagged",
     [
@@ -883,3 +1108,23 @@ async def test_a_known_fabric_fault_hold_is_outside_the_77_bound(monkeypatch, tm
     await srv._attempt_idle_relift()
     assert rungs == []
     assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_fabric_ok, state", [(None, ServerState.RECOVERING), (False, ServerState.DOWN)])
+async def test_a_terminal_rung_on_a_77_only_hold_keeps_it_recovering(
+    monkeypatch, tmp_path, clear_job_state, last_fabric_ok, state
+):
+    """I48: a rung that ran and left the fabric only 77ing measured no fault, so the hold stays
+    RECOVERING for the relift to re-check, never the terminal DOWN. A measured fault still goes DOWN."""
+    rungs = _bound(monkeypatch, tmp_path, (None, "eth links below baseline"))
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", last_fabric_ok)
+
+    async def escalate(rung, *a, **k):
+        rungs.append(rung)
+        return srv.OUTCOME_TERMINAL
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    await srv._attempt_idle_relift()
+    assert rungs == ["present"]
+    assert srv.fsm.state is state

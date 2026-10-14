@@ -67,6 +67,10 @@ _EXTRA_PORTS = re.compile(r"found (\d+) extra port/cable connections")
 
 # The detail prefix of a topology-mismatch skip, so a hold can tell it from any other.
 TOPOLOGY_MISMATCH = "topology mismatch"
+# The detail prefix of a missing-cable verdict (spec 03 I47): the same prefix a known fabric fault
+# (I46) carries, because it is held the same way.
+CABLE_FAULT = "known fabric fault"
+_MARKER_COUNTS = re.compile(r"(\d+) missing, (\d+) extra port connections")
 
 
 def topology_counts(output: str) -> tuple[int, int]:
@@ -81,6 +85,25 @@ def topology_marker(desc: str, missing: int, extra: int) -> str:
     return (
         f"TOPOLOGY MISMATCH vs {desc}: {missing} missing, {extra} extra port connections "
         "(tray ids come from PCI bus numbers; a board reset cannot change this)"
+    )
+
+
+def missing_cables(marker: str) -> int:
+    """How many port/cable connections a topology marker names missing with none extra, else 0.
+
+    A moved tray renames its links, so it shows extra connections beside the missing ones; missing
+    links with nothing extra are cables that are absent or dead, which no reset can bring back."""
+    m = _MARKER_COUNTS.search(marker or "")
+    if not m or int(m.group(2)):
+        return 0
+    return int(m.group(1))
+
+
+def cable_fault(missing: int, desc: str, why: str) -> str:
+    """The detail of a missing-cable verdict; ``why`` is what the traffic-only rerun came to."""
+    return (
+        f"{CABLE_FAULT}: {missing} port/cable connection(s) of {desc} missing and none extra "
+        f"(a cable is absent or dead; no reset can fix it, needs an operator); {why}"
     )
 
 
