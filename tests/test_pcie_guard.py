@@ -569,6 +569,72 @@ def test_a_latch_holds_only_on_the_boot_it_was_written_in(sysfs, monkeypatch):
     assert pcie_guard.offbus_reset_latched() is not None, "with the boot id unreadable it cannot be shown stale"
 
 
+def _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch, gate: str) -> list:
+    """Boot-a began an off-bus reset, boot-b latched it, one chip is still off the bus and the latch
+    is older than its ceiling. Returns the pages sent."""
+    pages = []
+    monkeypatch.setattr(pcie_guard.alert, "send_alert", lambda event, log=None: pages.append(event))
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", gate)
+    _boot(sysfs, "boot-a")
+    pcie_guard.begin_offbus_reset("mesh reset", 1)
+    monkeypatch.setattr(pcie_guard, "_INTENT_OPEN", False)
+    _boot(sysfs, "boot-b")
+    assert pcie_guard.check_offbus_reset_latch(lambda m: None)["latched_on_boot"] == "boot-b"
+    _take_off_bus(sysfs, 0)
+    now = time.time()
+    monkeypatch.setattr(time, "time", lambda: now + pcie_guard.LATCH_MAX_SEC + 1)
+    return pages
+
+
+@pytest.mark.parametrize("gate", ["off", "hold"])
+def test_with_no_power_cycle_a_latch_with_a_chip_off_lifts_at_its_ceiling(sysfs, monkeypatch, gate):
+    """With TT_DEVICE_MCP_POWER_CYCLE_CMD unset no I27 cycle would end an off-bus hold, so the latch
+    lifts at its ceiling even with a chip off, pages once, and the gate follows its configured mode."""
+    pages = _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch, gate)
+    logs = []
+    reason = pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, logs.append)
+    assert reason and "TT_DEVICE_MCP_POWER_CYCLE_CMD" in reason and "ceiling" in reason
+    assert pcie_guard.offbus_reset_latched() is None
+    assert any("lifted" in m for m in logs)
+    assert len(pages) == 1 and pages[0]["kind"] == "offbus_reset_hold_expired_off_bus"
+    assert "boot boot-a" in pages[0]["message"] and "boot boot-b" in pages[0]["message"]
+    assert pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, logs.append) is None
+    assert len(pages) == 1, "paged once"
+    if gate == "off":
+        assert pcie_guard.host_reset_gate(1) == (True, "")
+    else:
+        assert pcie_guard.host_reset_gate(1) == (False, "1 chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold")
+
+
+def test_with_no_power_cycle_the_gate_itself_lifts_a_latch_past_its_ceiling(sysfs, monkeypatch):
+    """No health pass needed: the gate, asked with a chip off, ends the hold at its ceiling."""
+    pages = _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch, "off")
+    assert pcie_guard.host_reset_gate(1) == (True, "")
+    assert pcie_guard.offbus_reset_latched() is None and len(pages) == 1
+
+
+def test_with_a_power_cycle_a_latch_with_a_chip_off_still_holds_past_its_ceiling(sysfs, monkeypatch):
+    pages = _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch, "off")
+    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "/usr/local/bin/cycle-host")
+    assert pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, lambda m: None) is None
+    allowed, why = pcie_guard.host_reset_gate(1)
+    assert not allowed and pcie_guard.offbus_reset_latched() is not None and not pages
+    assert "ceiling" not in why, "the power cycle, not the ceiling, ends this hold"
+
+
+def test_the_hold_message_names_both_boots(sysfs, monkeypatch, capsys):
+    """The reset ran in boot-a; the hold is on boot-b. Both the gate and the CLI say so."""
+    _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch, "off")
+    monkeypatch.setattr(time, "time", lambda: 0.0)  # inside the ceiling: it holds
+    allowed, why = pcie_guard.host_reset_gate(1)
+    assert not allowed
+    assert "the mesh reset on boot boot-a did not finish before the host went down; held on boot boot-b until" in why
+    assert "ceiling" in why, "with no power cycle the ceiling is one of the ends"
+    pcie_guard.main(["0x1"])
+    out = capsys.readouterr().out
+    assert "the mesh reset on boot boot-a did not finish before the host went down; held on boot boot-b" in out
+
+
 def test_the_latch_can_be_switched_off(sysfs, monkeypatch):
     _boot(sysfs, "boot-a")
     pcie_guard.begin_offbus_reset("tray re-power", 1)
@@ -623,6 +689,7 @@ def test_the_latch_never_lifts_while_a_chip_is_off_the_bus(sysfs, monkeypatch, w
     host-pci verdict nor the ceiling lifts it with a chip off, or with sysfs unreadable."""
     events = []
     _latched(monkeypatch, sysfs, events)
+    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "/usr/local/bin/cycle-host")
     if why == "past the ceiling":
         _age_latch(pcie_guard.LATCH_MAX_SEC + 1)
     _take_off_bus(sysfs, 0)
@@ -640,6 +707,7 @@ def test_the_latch_lifts_at_its_ceiling_with_every_chip_on_the_bus(sysfs, monkey
     gate, asked with no chip off the bus, lifts a latch older than its ceiling."""
     events = []
     _latched(monkeypatch, sysfs, events)
+    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "/usr/local/bin/cycle-host")
     _age_latch(pcie_guard.LATCH_MAX_SEC - 60)
     assert pcie_guard.host_reset_gate(0) == (True, "")
     assert pcie_guard.offbus_reset_latched() is not None, "inside the ceiling it holds"
