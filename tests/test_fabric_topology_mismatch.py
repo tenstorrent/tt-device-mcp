@@ -110,6 +110,7 @@ async def test_a_fabric_failure_on_the_first_job_holds_the_check_without_a_reset
     assert why and "hardware fault: the first job after a topology-mismatch lift" in why
     assert m.topology_hw_fault == why
     assert state["alerts"][-1]["kind"] == "fabric_topology_hw_fault"
+    assert m.topology_hw_fault_paged > 0, "the relift re-pages from the time this page went out"
     n = len(state["calls"])
     ok, detail = await m._verify_fabric_health_body(60)
     assert ok is None and why in detail

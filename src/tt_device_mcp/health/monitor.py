@@ -275,6 +275,8 @@ class HealthMonitor:
         # later fabric check is withheld (a 77-only hold: never reset, never escalated, no loop)
         # until an operator restarts the broker.
         self.topology_hw_fault: str = ""
+        # Monotonic time the fault's page went out (0.0: not sent). The idle relift re-pages from it.
+        self.topology_hw_fault_paged: float = 0.0
         self._topology_alerted: set[str] = set()
         # Whether the last fabric pass that ran reached no verdict (a 77). A job that then dies on the
         # fabric's routing ran on a mesh no pass cleared; consecutive ones are a known fabric fault
@@ -1079,7 +1081,9 @@ class HealthMonitor:
         log = self._logger()
         if log:
             log.error(f"FABRIC {self.topology_hw_fault}")
-        alert.send_alert({"kind": "fabric_topology_hw_fault", "detail": self.topology_hw_fault}, log)
+        event = {"kind": "fabric_topology_hw_fault", "detail": self.topology_hw_fault}
+        if alert.send_alert(event, log) is not None or alert.alert_argv() is None:
+            self.topology_hw_fault_paged = time.monotonic()
         return self.topology_hw_fault
 
     def note_job_fabric_route_fault(self, failed: bool, log_tail: Optional[str]) -> Optional[str]:

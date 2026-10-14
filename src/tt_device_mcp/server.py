@@ -143,6 +143,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.health.recovery.base import mesh_hold_repage_sec
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
@@ -2073,6 +2074,7 @@ def _reset_for_testing():
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
+    global _topology_hw_fault_paged
     job_queue = None
     lock = None
     _action_row = None
@@ -2086,6 +2088,7 @@ def _reset_for_testing():
     _fabric_77_streak = 0
     _fabric_77_fallback_release_monotonic = 0.0
     _fabric_77_paged_since = None
+    _topology_hw_fault_paged = None
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
@@ -3385,6 +3388,35 @@ def _hold_details(evidence: dict) -> tuple[str, str]:
     return str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or "")
 
 
+# (hold episode since, monotonic time of its last page) of the I42 first-job hardware-fault hold. That
+# hold stands until an operator restarts the broker, so its page is its only bound: see
+# _repage_topology_hw_fault.
+_topology_hw_fault_paged: Optional[tuple[str, float]] = None
+
+
+def _repage_topology_hw_fault() -> None:
+    """I42: page a standing first-job hardware-fault hold again every mesh_hold_repage_sec() (0: never
+    again). Called on each idle-relift pass that holds. The fault's own page counts for the episode it
+    opened; a page the hook dropped is tried on the next pass, and a new hold episode pages anew."""
+    global _topology_hw_fault_paged
+    fault = health_monitor.topology_hw_fault if health_monitor is not None else ""
+    if not fault:
+        return
+    since = fsm.record.since
+    last: Optional[float] = None
+    if _topology_hw_fault_paged is not None and _topology_hw_fault_paged[0] == since:
+        last = _topology_hw_fault_paged[1]
+    elif _topology_hw_fault_paged is None and health_monitor.topology_hw_fault_paged:
+        last = health_monitor.topology_hw_fault_paged
+        _topology_hw_fault_paged = (since, last)
+    repage = mesh_hold_repage_sec()
+    if last is not None and (repage == 0 or time.monotonic() - last < repage):
+        return
+    event = {"kind": "fabric_topology_hw_fault", "detail": fault, "held_since": since, "repage": last is not None}
+    if alert.send_alert(event, logger) is not None or alert.alert_argv() is None:
+        _topology_hw_fault_paged = (since, time.monotonic())
+
+
 def _topology_hw_fault_hold(evidence: dict) -> bool:
     # A known fabric fault (03 I46) is outside the I40 bound too: its release is what failed.
     if health_monitor is not None and health_monitor.known_fabric_fault():
@@ -3659,6 +3691,7 @@ async def _attempt_idle_relift() -> None:
                     if await _fabric_77_fallback(evidence, _log, _escalate):
                         return
                 if fabric_ok is not True:
+                    _repage_topology_hw_fault()
                     _log(
                         f"fabric still could not verify on retry ({fabric_ok!r}) — holding; "
                         "the door never reopens onto unverified fabric"
