@@ -13,6 +13,7 @@ import os
 import pathlib
 import shutil
 import sys
+import time
 import types
 
 import pytest
@@ -575,6 +576,125 @@ def test_the_latch_can_be_switched_off(sysfs, monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HANG_LATCH", "0")
     assert pcie_guard.check_offbus_reset_latch(lambda m: None) is None
     assert pcie_guard.offbus_reset_latched() is None
+
+
+def _latched(monkeypatch, root, events) -> dict:
+    """A host-hang hold latched on boot-b: an off-bus reset on boot-a never finished."""
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
+    _boot(root, "boot-a")
+    pcie_guard.begin_offbus_reset("mesh reset", 1)
+    monkeypatch.setattr(pcie_guard, "_INTENT_OPEN", False)
+    _boot(root, "boot-b")
+    return pcie_guard.check_offbus_reset_latch(lambda m: None)
+
+
+def _age_latch(seconds: float) -> None:
+    path = pcie_guard.health_dir() / pcie_guard.LATCH_FILE
+    rec = json.loads(path.read_text())
+    rec["latched_at_epoch"] = time.time() - seconds
+    path.write_text(json.dumps(rec))
+
+
+def test_the_latch_lifts_once_every_chip_is_back_and_host_pci_is_ok(sysfs, monkeypatch):
+    """Goal: a bounded hold (I25). Every chip on the bus with host-pci OK lifts it on its own boot,
+    with an event naming why; host-pci not OK, or not judged, keeps it until the ceiling."""
+    events, logs = [], []
+    _latched(monkeypatch, sysfs, events)
+    n = len(CHIPS)
+    assert pcie_guard.expire_offbus_reset_latch(n, False, logs.append) is None
+    assert pcie_guard.expire_offbus_reset_latch(n, None, logs.append) is None
+    assert pcie_guard.expire_offbus_reset_latch(n + 1, True, logs.append) is None, "a chip short of expected"
+    assert pcie_guard.expire_offbus_reset_latch(0, True, logs.append) is None, "no expected count proves nothing"
+    assert pcie_guard.offbus_reset_latched() is not None
+    reason = pcie_guard.expire_offbus_reset_latch(n, True, logs.append)
+    assert reason and "host-pci is OK" in reason
+    assert pcie_guard.offbus_reset_latched() is None
+    assert not (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).exists()
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_OFF
+    assert events[-1][0] == "offbus_reset_hold_expired" and events[-1][1]["reason"] == reason
+    assert any("lifted" in m for m in logs)
+    assert pcie_guard.expire_offbus_reset_latch(n, True, logs.append) is None, "nothing left to lift"
+
+
+@pytest.mark.parametrize("why", ["host-pci OK", "past the ceiling"])
+def test_the_latch_never_lifts_while_a_chip_is_off_the_bus(sysfs, monkeypatch, why):
+    """An off-bus hold is the I27 power cycle's to end, never the latch's own expiry: neither a clean
+    host-pci verdict nor the ceiling lifts it with a chip off, or with sysfs unreadable."""
+    events = []
+    _latched(monkeypatch, sysfs, events)
+    if why == "past the ceiling":
+        _age_latch(pcie_guard.LATCH_MAX_SEC + 1)
+    _take_off_bus(sysfs, 0)
+    assert pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, lambda m: None) is None
+    allowed, why_held = pcie_guard.host_reset_gate(1)
+    assert not allowed and "--clear-hang-latch" in why_held
+    monkeypatch.setattr(pcie_guard, "tt_endpoints", lambda: None)
+    assert pcie_guard.expire_offbus_reset_latch(len(CHIPS) - 1, True, lambda m: None) is None
+    assert pcie_guard.offbus_reset_latched() is not None
+    assert not [n for n, _k in events if n == "offbus_reset_hold_expired"]
+
+
+def test_the_latch_lifts_at_its_ceiling_with_every_chip_on_the_bus(sysfs, monkeypatch):
+    """Without a clean host-pci look (health checks off, or host-pci not OK) the hold still ends: the
+    gate, asked with no chip off the bus, lifts a latch older than its ceiling."""
+    events = []
+    _latched(monkeypatch, sysfs, events)
+    _age_latch(pcie_guard.LATCH_MAX_SEC - 60)
+    assert pcie_guard.host_reset_gate(0) == (True, "")
+    assert pcie_guard.offbus_reset_latched() is not None, "inside the ceiling it holds"
+    _age_latch(pcie_guard.LATCH_MAX_SEC + 1)
+    assert pcie_guard.host_reset_gate(1)[0] is False, "a gate asked with a chip off never lifts it"
+    assert pcie_guard.offbus_reset_latched() is not None
+    assert pcie_guard.host_reset_gate(0) == (True, "")
+    assert pcie_guard.offbus_reset_latched() is None and pcie_guard.gate_mode() == pcie_guard.GATE_OFF
+    assert "ceiling" in events[-1][1]["reason"]
+    # A latch that names no time ages from its file; a ceiling set lower is honoured.
+    _latched(monkeypatch, sysfs, events)
+    path = pcie_guard.health_dir() / pcie_guard.LATCH_FILE
+    path.write_text('{"latched_on_boot": "boot-b"}')
+    old = time.time() - 120
+    os.utime(path, (old, old))
+    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC", "60")
+    assert "ceiling" in pcie_guard.expire_offbus_reset_latch(len(CHIPS), False, lambda m: None)
+
+
+@pytest.mark.parametrize("raw", ["", "0", "-5", "nan", "inf", "six hours"])
+def test_the_latch_ceiling_defaults_and_rejects_nonsense(monkeypatch, raw):
+    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC", raw)
+    assert pcie_guard.latch_max_sec() == pcie_guard.LATCH_MAX_SEC == 21600
+
+
+def test_a_latch_that_cannot_be_removed_keeps_holding(sysfs, monkeypatch):
+    events = []
+    _latched(monkeypatch, sysfs, events)
+    _deny(monkeypatch, "unlink", pcie_guard.health_dir() / pcie_guard.LATCH_FILE)
+    assert pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, lambda m: None) is None
+    assert pcie_guard.offbus_reset_latched() is not None
+    assert events[-1][0] == "offbus_reset_hold_unremovable" and events[-1][1]["host_at_risk"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_between_jobs_check_lifts_the_latch_once_the_mesh_is_back(sysfs, monkeypatch, health_deps):
+    """The between-jobs and idle passes are where a clean bus is seen: the latch lifts there with no
+    operator, and a pass with a chip off leaves it."""
+    from tt_device_mcp.health.monitor import HealthMonitor
+    from tt_device_mcp.health.monitors import hostpci
+
+    _latched(monkeypatch, sysfs, [])
+    monkeypatch.setattr(hostpci, "host_pci_verdict", lambda: (True, "ok", {}))
+    m = HealthMonitor(health_deps)
+
+    async def healthy(*a, **k):
+        return True, "ok"
+
+    monkeypatch.setattr(m, "_verify_device", healthy)
+    await m.update("post-job", run_fabric=False, expected=len(CHIPS) + 1)
+    assert pcie_guard.offbus_reset_latched() is not None, "a chip is still missing"
+    logs = []
+    await m.update("post-job", run_fabric=False, expected=len(CHIPS), log=logs.append)
+    assert pcie_guard.offbus_reset_latched() is None
+    assert any("host-hang hold" in line and "lifted" in line for line in logs)
 
 
 @pytest.mark.asyncio

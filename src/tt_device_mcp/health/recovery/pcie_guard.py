@@ -18,8 +18,8 @@ getting there:
 * :func:`safe_tray_repower` — the full envelope around one per-tray BMC re-power, with a dry run.
 * The host-hang latch — :func:`begin_offbus_reset` writes an intent before an automatic reset with
   chips off the bus, and :func:`check_offbus_reset_latch` reads one left by an earlier boot as a
-  reset that hung the host, and holds every later off-bus reset on this boot until an operator
-  clears it or the host boots again.
+  reset that hung the host, and holds every later off-bus reset on this boot until every chip is
+  back on the bus (:func:`expire_offbus_reset_latch`), an operator clears it or the host boots again.
 
 Everything reads and writes through :data:`SYS_ROOT` so tests run against a fake tree.
 """
@@ -471,7 +471,7 @@ def gate_mode() -> str:
     AER errors flood; ``hold`` also refuses one while any chip is off the bus. Set per host. A latched
     host-hang hold (:func:`check_offbus_reset_latch`) reads as ``hold`` whatever the setting."""
     if offbus_reset_latched() is not None:
-        return GATE_HOLD  # the last off-bus reset hung this host: hold until an operator clears it
+        return GATE_HOLD  # the last off-bus reset hung this host: hold until the chips are back (I25)
     mode = os.environ.get("TT_DEVICE_MCP_HOST_RESET_GATE", GATE_OFF).strip().lower()
     return mode if mode in (GATE_GUARD, GATE_HOLD) else GATE_OFF
 
@@ -490,6 +490,8 @@ def host_reset_gate(off_bus: int) -> tuple:
     """``(allowed, why)`` for an automatic host-affecting reset (mesh reset, per-tray re-power) with
     ``off_bus`` chips already off the bus. A refused reset is a rung that did not fire, so the ladder
     above it holds rather than climbing to a reboot or power cycle."""
+    if off_bus <= 0:
+        expire_offbus_reset_latch(None, None, lambda m: None)  # only the ceiling: no host-pci look here
     mode = gate_mode()
     if mode == GATE_OFF:
         if flood_window_open():
@@ -502,7 +504,8 @@ def host_reset_gate(off_bus: int) -> tuple:
         if latch is not None:
             return False, (
                 f"{off_bus} chip(s) off the bus and the off-bus reset before boot {latch.get('boot_id', '?')} "
-                f"hung the host; held until an operator runs `{clear_latch_cmd()}`"
+                f"hung the host; held until every chip is back on the bus, the host boots again "
+                f"or an operator runs `{clear_latch_cmd()}`"
             )
         return False, f"{off_bus} chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold"
     if aer_flooding():
@@ -537,6 +540,18 @@ def _boot_id() -> str:
 
 def _latch_enabled() -> bool:
     return os.environ.get("TT_DEVICE_MCP_OFFBUS_HANG_LATCH", "1").strip() != "0"
+
+
+LATCH_MAX_SEC = 21600.0
+
+
+def latch_max_sec() -> float:
+    """``TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC`` (default 21600 s, 6 h): the oldest a host-hang
+    hold may grow with every chip on the bus before it lifts without a clean host-pci look. The same
+    6 h as one I27 power-cycle interval, so the latch never outlives the next cycle it would allow.
+    Zero, negative or not a number reads as the default: the hold is always bounded."""
+    v = _env_float("TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC", LATCH_MAX_SEC)
+    return v if 0 < v < float("inf") else LATCH_MAX_SEC
 
 
 def begin_offbus_reset(kind: str, off_bus: int) -> None:
@@ -589,6 +604,51 @@ def offbus_reset_latched() -> Optional[dict]:
     return rec if rec is not None and _latch_is_this_boots(rec) else None
 
 
+def _latch_age(rec: dict) -> float:
+    """Seconds since the latch was written: its ``latched_at_epoch``, else the file's mtime, else
+    unbounded (a latch whose age cannot be read is past any ceiling)."""
+    try:
+        at = float(rec["latched_at_epoch"])
+    except (KeyError, TypeError, ValueError):
+        try:
+            at = (health_dir() / LATCH_FILE).stat().st_mtime
+        except OSError:
+            return float("inf")
+    return time.time() - at if at == at else float("inf")
+
+
+def expire_offbus_reset_latch(
+    expected: Optional[int], host_pci_ok: Optional[bool], log: Callable[[str], None]
+) -> Optional[str]:
+    """Lift this boot's host-hang hold once it guards nothing (spec 04 I25): every one of ``expected``
+    chips is on the bus and host-pci is OK, or every chip is on the bus and the latch is older than
+    :func:`latch_max_sec`. ``expected`` None means the caller already counted no chip off the bus.
+    Never while a chip is off the bus or sysfs cannot be read: that hold is bounded by the I27 power
+    cycle, and the boot after it drops the latch. Returns why it lifted, or None."""
+    rec = offbus_reset_latched()
+    if rec is None:
+        return None
+    if expected is not None:
+        eps = tt_endpoints()
+        if expected <= 0 or eps is None or len(eps) < expected:
+            return None
+    if host_pci_ok is True and expected is not None:
+        reason = f"all {expected} chip(s) are back on the bus and host-pci is OK"
+    elif _latch_age(rec) >= latch_max_sec():
+        reason = f"every chip is on the bus and the hold reached its {latch_max_sec():.0f} s ceiling"
+    else:
+        return None
+    try:
+        (health_dir() / LATCH_FILE).unlink(missing_ok=True)
+    except OSError as exc:
+        log(f"could not remove the host-hang hold that {reason}: {exc!r}; it still holds")
+        health_event("offbus_reset_hold_unremovable", latch=rec, reason=reason, error=repr(exc), host_at_risk=True)
+        return None
+    log(f"the host-hang hold latched on boot {rec.get('latched_on_boot') or '(unknown)'} lifted: {reason}")
+    health_event("offbus_reset_hold_expired", latch=rec, boot_id=_boot_id(), reason=reason)
+    return reason
+
+
 def _expire_stale_latch(log: Callable[[str], None]) -> None:
     """Broker start: drop a latch an earlier boot wrote. The host has booted since, so it no longer
     describes this host, and left in place it would read as a hold an operator must clear."""
@@ -624,8 +684,9 @@ def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
         log(f"could not persist the host-hang hold: {exc!r}; holding for this boot only")
     log(
         f"the {intent.get('kind')} that ran with {intent.get('off_bus')} chip(s) off the bus did not finish "
-        f"before the host went down: automatic resets over off-bus chips are HELD until an operator runs "
-        f"`{clear_latch_cmd()}` or the host boots again"
+        f"before the host went down: automatic resets over off-bus chips are HELD until every chip is back "
+        f"on the bus with host-pci OK (or for {latch_max_sec():.0f} s with every chip back), the host boots "
+        f"again or an operator runs `{clear_latch_cmd()}`"
     )
     health_event("offbus_reset_hold_latched", intent=intent, clear=clear_latch_cmd(), host_at_risk=True)
     return rec
