@@ -343,6 +343,7 @@ Behavior).
 | `TTDEV_MAX_DEFER_SEC` | 0 (off — apply immediately; jobs re-adopt) | Opt-in busy/idle gate: seconds autoupdate waits for an idle window. The in-flight device-op bar is separate and unconditional (spec 08) |
 | `TTDEV_DRAIN_AFTER_SEC` | 300 | With the idle gate on: seconds a pending update waits on a busy box before autoupdate drains it (holds dispatch, lets the running job finish, applies at the job boundary); also the back-off after a drain that timed out (spec 08 I20) |
 | `TTDEV_DRAIN_TIMEOUT_SEC` | 300 | Bound on one drain: a job still running after it is left alone and dispatch is released (spec 08 I20) |
+| `TTDEV_MIN_APPLY_INTERVAL_SEC` | 0 (off) | Minimum seconds between autoupdate applies (each one restarts the broker and runs the startup fabric pass); a newer sha waits, so a burst of pushes is one restart. Last apply kept in `$ROOT/last-apply` (spec 08 I21) |
 | `TTDEV_LOCK` | 0 | Apply the udev device lock at install (shared host) |
 | `TTDEV_HEALTH_PROBE` | 1 | Read by `apply-host-config.sh` from the config file: `0` disables `tt-device-health-probe.timer` (spec 08 I17), anything else enables it |
 | `TTDEV_NO_LOCK` | unset | Back-compat: force cooperative (no lock) |

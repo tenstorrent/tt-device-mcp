@@ -9,6 +9,7 @@
 #   TTDEV_AUTOUPDATE=1                 # master switch
 #   TTDEV_BRANCH=<branch>              # branch to track (main in prod)
 #   TTDEV_VENV=/path/to/broker/venv    # venv we pip-install into
+#   TTDEV_MIN_APPLY_INTERVAL_SEC=3600  # optional: min seconds between applies (0/unset = off)
 #
 # THE SOURCE IS NOT CONFIGURABLE (spec 08 I16). It is the constant below, and the only
 # lever an operator has is which branch of it to track. That is what keeps this path
@@ -85,6 +86,26 @@ installed_sha="$(cat "$STATE" 2>/dev/null || true)"
 [ "$installed_sha" = "$remote_sha" ] && exit 0   # already current
 
 echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >&2
+
+# Apply rate limit (spec 08 I21), OFF by default. Every apply restarts the broker, and every start
+# runs the full startup check, fabric traffic pass included (spec 03 I4) -- a burst of pushes is a
+# burst of fabric passes on a galaxy. With TTDEV_MIN_APPLY_INTERVAL_SEC set, a new sha waits until
+# that long has passed since the last apply, so the burst becomes one restart onto its newest sha.
+# Checked before the device-op bar and the dispatch hold: a lap that will not apply holds nothing.
+# Only the timing of an apply moves; the startup check after it is never skipped or shortened.
+# The stamp is written just before the restart, so a failed apply retries on the next lap.
+LAST_APPLY="$ROOT/last-apply"
+MIN_APPLY="${TTDEV_MIN_APPLY_INTERVAL_SEC:-0}"
+if [ "$MIN_APPLY" -gt 0 ] 2>/dev/null; then
+    last=""; read -r last < "$LAST_APPLY" 2>/dev/null || true
+    now="$(date +%s)"
+    # A stamp that is not a number, or lies in the future (the clock stepped back), bars nothing.
+    case "$last" in ''|*[!0-9]*) last="" ;; esac
+    if [ -n "$last" ] && [ "$last" -le "$now" ] && [ $(( now - last )) -lt "$MIN_APPLY" ]; then
+        echo "autoupdate: rate-limited: last apply $(( now - last ))s ago (min ${MIN_APPLY}s); ${remote_sha:0:9} applies in $(( last + MIN_APPLY - now ))s" >&2
+        exit 0
+    fi
+fi
 
 # An in-flight device operation is an ABSOLUTE bar — not the bounded defer below.
 # Restarting the broker mid-reset lets KillMode=control-group SIGTERM the running
@@ -298,5 +319,6 @@ bash "$clone/deploy/apply-host-config.sh" "$clone" \
 echo "$remote_sha" > "$STATE"
 chmod -R a+rX "$VENV" 2>/dev/null || true
 
+date +%s > "$LAST_APPLY" 2>/dev/null || true   # I21: the rate limit counts from this restart
 systemctl restart tt-device-broker
 echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
