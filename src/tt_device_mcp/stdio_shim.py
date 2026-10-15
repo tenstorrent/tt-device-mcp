@@ -47,7 +47,7 @@ def _log(msg: str) -> None:
 
 def _lazy_start_user_daemon():
     """No broker and no user daemon — start a per-user daemon so the MCP just
-    works (tt-buddy is MCP-by-design). Returns the user socket once it's up."""
+    works (the client is MCP-by-design). Returns the user socket once it's up."""
     import subprocess
     import time
 
