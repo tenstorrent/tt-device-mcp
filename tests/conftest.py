@@ -419,6 +419,10 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # test tripping it does not silence the next test's expected held event. raising=False
     # so a tree without the attribute yet (a fails-on-base stash) still sets up cleanly.
     monkeypatch.setattr(srv, "device_hold_logged", False, raising=False)
+    # A window given back on a tenant deferral keeps the next forced spawn checking for the tenant
+    # first; a leaked flag would make the next test's escalation stand down on its own stub scan.
+    monkeypatch.setattr(srv, "device_hold_tenant_deferred", False, raising=False)
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_deferred", False, raising=False)
     # The idle escalation's and the per-tray BMC reset's once-per-episode latches are per-episode
     # state on the fresh srv.fsm just constructed above, so they are already unarmed here — no
     # separate reset needed.
