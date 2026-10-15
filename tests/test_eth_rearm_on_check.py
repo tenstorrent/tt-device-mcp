@@ -240,3 +240,60 @@ async def test_the_eth_frozen_relift_rearms_then_reads(monkeypatch, tmp_path, cl
     await srv._attempt_idle_relift()
     assert calls[:2] == ["selftest", "read"]
     assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_retry_outside_an_episode_is_paced_to_the_rearm_interval(monkeypatch, unarmed):
+    """Idle full passes share the idle tick's pace; the fixture's last attempt was a moment ago."""
+    fsm_healthy(srv)
+    attempts = []
+
+    async def _selftest():
+        attempts.append(1)
+        return ""
+
+    monkeypatch.setattr(srv, "selftest_eth_heartbeat", _selftest)
+    assert await srv._rearm_eth_before_check() == ""
+    assert attempts == [], "retried inside ETH_CHECK_REARM_INTERVAL_SEC with no fault episode"
+    monkeypatch.setattr(srv, "_last_eth_rearm_monotonic", time.monotonic() - 2 * srv.ETH_CHECK_REARM_INTERVAL_SEC)
+    await srv._rearm_eth_before_check()
+    assert attempts == [1]
+
+
+@pytest.mark.asyncio
+async def test_a_retry_inside_a_fault_episode_is_never_paced(monkeypatch, unarmed):
+    """Goal 8: a reset's post-check re-arms at once, however recent the last attempt."""
+    fsm_dirty(srv, "gate/post-job: fabric unhealthy", why="job_killed")
+    attempts = []
+
+    async def _selftest():
+        attempts.append(1)
+        return ""
+
+    monkeypatch.setattr(srv, "selftest_eth_heartbeat", _selftest)
+    await srv._rearm_eth_before_check()
+    await srv._rearm_eth_before_check()
+    assert attempts == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_the_77_fallback_skips_a_second_retry_after_the_relift_retried(monkeypatch, unarmed):
+    fsm_dirty(srv, "fabric check unrunnable", why="fabric_unverified")
+    rearmed = []
+
+    async def _rearmed():
+        rearmed.append(1)
+        return None, "no verdict"
+
+    async def _verify():
+        return None, "no verdict"
+
+    async def _escalate(kind):
+        return False
+
+    monkeypatch.setattr(srv, "_eth_read_rearmed", _rearmed)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", _verify)
+    await srv._fabric_77_fallback({}, lambda m: None, _escalate, retried=True)
+    assert rearmed == []
+    await srv._fabric_77_fallback({}, lambda m: None, _escalate)
+    assert rearmed == [1]

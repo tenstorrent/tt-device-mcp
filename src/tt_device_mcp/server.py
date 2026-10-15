@@ -3170,6 +3170,8 @@ eth_check_disarm_reason: str = "startup self-test has not run yet"
 eth_rearm_retryable: bool = False
 ETH_CHECK_REARM_INTERVAL_SEC = 600.0
 _last_eth_rearm_monotonic: float = 0.0
+# Counts the self-test retries _rearm_eth_before_check ran; a relift compares it across its own pass.
+_eth_rearm_retries: int = 0
 _eth_rearm_task: Optional[asyncio.Task] = None
 
 
@@ -3307,11 +3309,17 @@ async def selftest_eth_heartbeat() -> str:
 
 async def _rearm_eth_before_check() -> str:
     """Retry a failed eth self-test at the head of a full health pass, before it reads the mesh
-    (spec 03 I28). The caller holds the device-op lock (every full pass does). Unpaced, unlike the
-    idle tick: a reset or a held device's re-check must not run with the rung off just because a
-    broker start found the core frozen. Returns the self-test's FROZEN detail, or ""."""
+    (spec 03 I28). The caller holds the device-op lock (every full pass does). Unpaced inside a
+    fault episode: a reset or a held device's re-check must not run with the rung off just because
+    a broker start found the core frozen. Outside one it keeps the idle tick's ETH_CHECK_REARM_INTERVAL_SEC
+    pace, so a core that stays frozen is not retried at every full pass. Returns the self-test's
+    FROZEN detail, or ""."""
+    global _eth_rearm_retries
     if eth_check_armed or not eth_rearm_retryable:
         return ""
+    if not _fault_episode_open() and time.monotonic() - _last_eth_rearm_monotonic < ETH_CHECK_REARM_INTERVAL_SEC:
+        return ""
+    _eth_rearm_retries += 1
     _set_device_op_detail("health check: eth-heartbeat self-test (re-arming)")
     try:
         return await selftest_eth_heartbeat() or ""
@@ -3751,7 +3759,7 @@ def _note_fabric_77_reset_passes(passes: int) -> None:
     _fabric_77_streak = max(_fabric_77_streak + passes, _env_int("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", 3, 1) - 1)
 
 
-async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
+async def _fabric_77_fallback(evidence: dict, log, escalate, retried: bool = False) -> bool:
     """The fabric check could not run on a bounded number of retries: alert, then gate on the startup
     checks instead. enum+ARC already passed (the caller's observe returned healthy); add the eth
     heartbeat, which also compares the measured up-link count with the host's baseline, so a link
@@ -3784,7 +3792,11 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
         alert.send_alert(event, logger) is not None or alert.alert_argv() is None
     ):
         _fabric_77_paged_since = fsm.record.since
-    eok, edetail = await _eth_read_rearmed()
+    # ``retried``: this relift's own pass already ran the re-arm retry, so a second one is skipped.
+    if retried:
+        eok, edetail = await health_monitor.verify_eth_heartbeat()
+    else:
+        eok, edetail = await _eth_read_rearmed()
     # A reset with no passing fabric pass since may not be released on the startup checks (04 I32).
     owed = _post_reset_debt()
     if eok is True and not recent and not owed:
@@ -3871,6 +3883,7 @@ async def _attempt_idle_relift() -> None:
         expected = health_monitor.expected(len(indices))
 
         async with _device_op("idle-relift"):
+            retries_at_start = _eth_rearm_retries
             # Re-checked under the lock: a job's gate or a reset can have taken over — and lifted or
             # re-dirtied the device — between the sampler's unlocked read and here. Recompute the mode
             # too: the hold class can have changed under the lock. The dirty axis is re-read
@@ -3989,7 +4002,9 @@ async def _attempt_idle_relift() -> None:
                 ):
                     # I40: a pass that cannot run is retried a bounded number of times, never
                     # forever. Past the bound the startup checks become the gate.
-                    if await _fabric_77_fallback(evidence, _log, _escalate):
+                    if await _fabric_77_fallback(
+                        evidence, _log, _escalate, retried=_eth_rearm_retries != retries_at_start
+                    ):
                         return
                 if fabric_ok is not True:
                     _repage_topology_hw_fault()
