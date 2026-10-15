@@ -117,6 +117,7 @@ from tt_device_mcp.health import (
     _ubb_reset_enabled,
     aer_totals,
     append_trace,
+    arc_not_ready_chips,
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
     capture_incident,
@@ -137,6 +138,7 @@ from tt_device_mcp.health import (
     journal_interrupted_fabric_check,
     mark_boot,
     mesh_hold_repage_sec,
+    offbus_count,
     offbus_power_cycle,
     pcie_guard_at_start,
     previous_boot_bus_locks,
@@ -4034,9 +4036,14 @@ async def _attempt_down_offbus_recheck() -> None:
             if heartbeat_supported():
                 # A chip still in sysfs but reading all-ones is still off the bus.
                 beats = await asyncio.to_thread(read_heartbeats)
-                off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+                not_ready = await asyncio.to_thread(arc_not_ready_chips, beats)
+                off_bus = _offbus_count(beats, expected, not_ready)
                 if off_bus > 0:
                     _log(f"DOWN off-bus hold: {off_bus}/{expected} chip(s) still off the bus — holding")
+                    return
+                if not_ready:
+                    # Back on the bus but its ARC is not up yet: the gate would fail on it, so wait.
+                    _log(f"DOWN off-bus hold: chip(s) {sorted(not_ready, key=int)} back but ARC not ready — holding")
                     return
             # ``dirty`` too: a dead-chip mark landing on a hold flips only that bit (fsm.on_fault).
             episode = (fsm.record.since, fsm.record.why, fsm.record.detail, fsm.record.dirty)
@@ -5317,7 +5324,7 @@ async def device_health_gate(
                 # touch. Route only chips whose own PCIe node is actually absent; the rest fall to
                 # the hold below.
                 gone = [c for c in gone if not await asyncio.to_thread(chip_node_present, device_pci_map[c])]
-                off_bus_gone = len(dead_chips(beats_b)) + max(0, expected - len(beats_b))
+                off_bus_gone = _offbus_count(beats_b, expected)
                 floor_gone = _galaxy_reset_min_dead_chips(expected)
                 if gone and floor_gone is not None and off_bus_gone < floor_gone:
                     _log(
@@ -5346,7 +5353,7 @@ async def device_health_gate(
         # into DEFER: skip the surgical rung and the floor, adopt that reset and verify its result.
         ev = replace(
             ev,
-            off_bus=len(dead_chips(beats)) + max(0, expected - len(beats)),
+            off_bus=_offbus_count(beats, expected),
             sbr_candidates=len(isolated_chips),
             scope_active=bool(await asyncio.to_thread(recovery_mechanism.scope_active)),
         )
@@ -5397,7 +5404,7 @@ async def device_health_gate(
             beats = await asyncio.to_thread(read_heartbeats)
             ev = replace(
                 ev,
-                off_bus=len(dead_chips(beats)) + max(0, expected - len(beats)),
+                off_bus=_offbus_count(beats, expected),
                 last_action=STAGE_BRIDGE_RESET,
                 last_action_recovered=False,
                 # Carry the per-chip SBR window this rung just read into the evidence the tray stage
@@ -5490,7 +5497,7 @@ async def device_health_gate(
         # after it, because both are live IO a pure decision must not do. Any of them absent and the
         # device stays flagged exactly as before.
         beats_now = await asyncio.to_thread(read_heartbeats)
-        off_bus = len(dead_chips(beats_now)) + max(0, expected - len(beats_now))
+        off_bus = _offbus_count(beats_now, expected)
         reboot_floor = _reboot_min_dead_chips(expected)
         # A reset that timed out is deliberately left cycling in its own scope for the next gate to
         # adopt and verify, and a reset takes every chip off the bus — so the count above reads
@@ -5692,8 +5699,38 @@ def _device_liveness_reason() -> str:
     # Off with the health checks (TT_DEVICE_MCP_HEALTH_CHECK=0, I25), like the recheck and the gate.
     expected = health_monitor.expected(0) if health_monitor and health_monitor._health_check_enabled() else 0
     if expected > 0 and len(beats) < expected:
+        not_ready = arc_not_ready_chips(beats)
+        if not_ready:
+            return (
+                f"chip(s) [{','.join(sorted(not_ready, key=int))}] on the bus but ARC not ready, "
+                f"{_offbus_count(beats, expected, not_ready)} of {expected} off the PCIe bus"
+            )
         return f"{len(beats)} of {expected} chips in sysfs (chips dropped off the PCIe bus)"
     return ""
+
+
+def _offbus_count(beats: dict, expected: int, not_ready: Optional[set] = None) -> int:
+    """``offbus_count`` with this module's ``dead_chips``: the one off-bus count every rung here uses."""
+    return offbus_count(beats, expected, not_ready, dead=dead_chips(beats))
+
+
+def _live_offbus_state() -> dict:
+    """The live off-bus picture for /health, read fresh from sysfs on every call (no device touch):
+    ``off_bus`` (chips off the PCIe bus now), ``arc_not_ready`` (on the bus, heartbeat ENODATA) and
+    ``isolated_chips``. ``held_reason``/``fsm_why`` keep the reason the hold OPENED with; these say
+    where it stands now. Empty where the heartbeat detector is absent or no baseline is known."""
+    out: dict = {"isolated_chips": sorted(isolated_chips, key=int)}
+    if not heartbeat_supported():
+        return out
+    expected = health_monitor.expected(0) if health_monitor and health_monitor._health_check_enabled() else 0
+    if expected <= 0:
+        return out
+    beats = read_heartbeats()
+    not_ready = arc_not_ready_chips(beats)
+    out["off_bus"] = _offbus_count(beats, expected, not_ready)
+    out["arc_not_ready"] = sorted(not_ready, key=int)
+    out["expected_chips"] = expected
+    return out
 
 
 def _device_degraded_for_tenant() -> str:
@@ -5752,6 +5789,7 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         "fsm_state": fsm.state.value,
         "fsm_why": fsm.record.why,
     }
+    payload.update(_live_offbus_state())
     if hold:
         reason, since = hold
         payload["held_since"] = since
@@ -5907,7 +5945,7 @@ async def _force_escalate_stuck_hold() -> None:
         if expected <= 0:
             return
         beats = await asyncio.to_thread(read_heartbeats)
-        off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+        off_bus = _offbus_count(beats, expected)
         no_reset = "" if off_bus or isolated_chips else _fabric_no_reset_hold()
         if no_reset:
             # Every chip enumerates with a live ARC heartbeat and the hold names only the fabric: a 77
@@ -9042,7 +9080,7 @@ async def _record_startup_health() -> None:
                 # the boot's first broker start: the ledger's reboot stays adjacent to the boot for
                 # its whole life, and a restart days later that finds a fresh degradation is not that
                 # reboot's verdict. It stays held for the forced startup gate and its ladder.
-                off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+                off_bus = _offbus_count(beats, expected)
 
                 def _log(msg: str) -> None:
                     if logger:

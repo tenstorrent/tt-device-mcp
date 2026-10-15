@@ -20,6 +20,7 @@ fabric verdict still requires a traffic workload.
 
 from __future__ import annotations
 
+import errno
 import time
 from typing import Optional
 
@@ -53,10 +54,16 @@ def read_heartbeats() -> dict[str, int]:
         if not idx.isdigit():
             continue
         try:
-            beats[idx] = int((ent / "tt_heartbeat").read_text().strip())
+            beats[idx] = int(_read_beat(ent))
         except (OSError, ValueError):
             continue
     return beats
+
+
+def _read_beat(node) -> str:
+    """One chip's raw ``tt_heartbeat`` text. Its own function so the suite can make the read fail
+    with a chosen errno (ENODATA cannot be produced by a plain file)."""
+    return (node / "tt_heartbeat").read_text().strip()
 
 
 # A PCIe read to an endpoint that is not answering returns all-ones. It is not a value — no
@@ -76,6 +83,76 @@ ALL_ONES = 0xFFFFFFFF
 def dead_chips(beats: dict[str, int]) -> list[str]:
     """Chips that have fallen off the PCIe bus, by index. See ALL_ONES."""
     return sorted((i for i, v in beats.items() if v == ALL_ONES), key=int)
+
+
+def arc_not_ready_chips(beats: dict[str, int]) -> set[str]:
+    """Chips :func:`read_heartbeats` left out of ``beats`` that are still ON the bus: the KMD node is
+    there, its PCI endpoint is bound to the driver, and the heartbeat read fails with ENODATA (the
+    KMD has no ARC telemetry for it yet: ARC not ready, e.g. mid-boot after a reset or re-power).
+    Such a chip is present but not usable. It is unhealthy for the gate, but it is not off the bus,
+    so it never arms an off-bus rung (bridge, tray, gone-chip) nor counts toward a floor (spec 04
+    I24). Only the chips missing from ``beats`` are re-read; any other error, or an endpoint that is
+    gone or unbound, leaves the chip counted off the bus."""
+    try:
+        entries = sorted(pci.SYSFS_CLASS_DIR.iterdir())
+    except OSError:
+        return set()
+    out: set[str] = set()
+    for ent in entries:
+        idx = ent.name.rsplit("!", 1)[-1]
+        if not idx.isdigit() or idx in beats:
+            continue
+        try:
+            _read_beat(ent)
+            continue  # it reads now: whatever made the first read miss, it is not ENODATA
+        except OSError as e:
+            if e.errno != errno.ENODATA:
+                continue
+        except ValueError:
+            continue
+        bdf = chip_pci_bdf(idx)
+        try:
+            bound = bool(bdf) and (pci.PCI_DEVICES_DIR / bdf / "driver").exists()
+        except OSError:
+            bound = False
+        if bound:
+            out.add(idx)
+    return out
+
+
+def offbus_chip_ids(beats: dict[str, int], expected: int, not_ready: Optional[set] = None) -> set[str]:
+    """The chips off the PCIe bus by this heartbeat read: every expected index missing from
+    ``beats``, other than an ARC-not-ready chip (:func:`arc_not_ready_chips`), plus every chip
+    reading all-ones. ``not_ready`` defaults to a fresh look at the missing chips."""
+    nr = arc_not_ready_chips(beats) if not_ready is None else set(not_ready)
+    missing = {str(i) for i in range(expected)} - set(beats) - nr
+    return set(dead_chips(beats)) | missing
+
+
+def offbus_count(
+    beats: dict[str, int], expected: int, not_ready: Optional[set] = None, dead: Optional[list] = None
+) -> int:
+    """How many chips are off the PCIe bus by this heartbeat read: all-ones chips plus the shortfall
+    below ``expected`` that ARC-not-ready chips do not explain. The one count every off-bus rung,
+    floor and the /health ``off_bus`` field use."""
+    nr = arc_not_ready_chips(beats) if not_ready is None else set(not_ready)
+    dead = dead_chips(beats) if dead is None else dead
+    return len(dead) + max(0, expected - len(beats) - len(nr - set(beats)))
+
+
+def returned_chips(ids) -> list[str]:
+    """Of ``ids``, the chips back on the bus by a fresh sysfs read: the KMD node is there and its
+    heartbeat is a counter that is not all-ones, or it is ARC-not-ready on a bound endpoint. Read
+    after every tray re-power, mesh reset and PCI rescan so a chip that came back leaves
+    ``isolated_chips`` at once, whatever the verify that follows says."""
+    want = {str(i) for i in ids}
+    if not want:
+        return []
+    beats = read_heartbeats()
+    back = {i for i in want if i in beats and beats[i] != ALL_ONES}
+    if want - back:
+        back |= want & arc_not_ready_chips(beats)
+    return sorted(back, key=int)
 
 
 def heartbeat_absence_reason() -> Optional[str]:
@@ -193,6 +270,22 @@ def _heartbeat_verdict_body(expected_count: int, settle_sec: float) -> tuple[Ver
     # ``expected_count`` — a stale high-water mark baked while degraded, cleared by a reset
     # that recovered the rest — and that is a healthy mesh, not chips that fell off it.
     if len(first) < expected_count:
+        # A chip whose heartbeat read gives ENODATA on a bound endpoint is on the bus with its ARC not
+        # ready: still unhealthy, but named as such, so nobody reads it as a drop (spec 04 I24).
+        not_ready = sorted(arc_not_ready_chips(first), key=int)
+        off = offbus_count(first, expected_count, set(not_ready))
+        if not_ready:
+            return (
+                Verdict.UNHEALTHY,
+                f"chip(s) [{','.join(not_ready)}] on the bus but ARC not ready (heartbeat read ENODATA), "
+                f"{off} off the bus",
+                {
+                    "present": sorted(first),
+                    "arc_not_ready": not_ready,
+                    "off_bus": off,
+                    "expected_count": expected_count,
+                },
+            )
         return (
             Verdict.UNHEALTHY,
             f"{len(first)} chip(s) in sysfs, expected {expected_count} (chips dropped off the bus)",

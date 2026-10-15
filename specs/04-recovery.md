@@ -410,7 +410,13 @@ each rung fires only when the gentler one failed or cannot apply.
   flood), or within `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC` of one (the first look after a recent boot
   counts from zero at boot). `hold` also refuses while any chip has no PCI function, or keeps its
   function but its ARC heartbeat reads all-ones (its BAR reads return nothing: it has left the bus
-  too), so a reset that dropped a chip is not re-issued over it. Under every mode, `off` included, an automatic reset is refused while
+  too), so a reset that dropped a chip is not re-issued over it. A chip whose heartbeat read fails
+  with ENODATA while its KMD node is there and its PCI endpoint is bound to the driver is on the bus
+  with its ARC not ready (mid-boot after a reset or re-power), not off it: the heartbeat verdict
+  reads it UNHEALTHY and names it `arc_not_ready`, but no off-bus count includes it (this gate, the
+  reset and reboot floors, the tray walk plan, the bridge and gone-chip rungs, the hold-deadline
+  climbs, `/health` `off_bus`). An unbound endpoint, a missing node or any other read error still
+  counts the chip off the bus. Under every mode, `off` included, an automatic reset is refused while
   the flood window an I23 port that stayed masked opened is still open: with the gate `off` that
   holds every automatic mesh reset, tray walk and last-chance sweep (and so the host rung above
   them, I22) for `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC`. The one exception is inside a last-chance
@@ -925,6 +931,7 @@ sees a silent fabric pass.
 | I23 an erroring port stays masked and starts the flood window | `tests/test_pcie_guard.py::test_a_port_that_keeps_erroring_stays_masked_and_marks_a_flood` |
 | I23 dry run and plan CLI touch nothing | `tests/test_pcie_guard.py::test_dry_run_logs_the_plan_and_touches_nothing`, `::test_cli_prints_the_plan` |
 | I24 `hold` counts an all-ones chip still in sysfs as off the bus; the mesh reset and the sweep refuse over it | `tests/test_pcie_guard.py::test_chips_off_bus_counts_an_all_ones_chip_still_in_sysfs`, `::test_a_hold_gate_refuses_the_mesh_reset_and_the_sweep_over_an_all_ones_chip` |
+| I24 ENODATA on a bound endpoint is ARC-not-ready, not off the bus; an unbound endpoint, a missing node or another errno is off | `tests/test_arc_not_ready.py::test_enodata_on_31_bound_chips_is_not_off_the_bus`, `tests/test_arc_not_ready.py::test_an_unbound_or_missing_chip_still_counts_off_the_bus` |
 | I24 the per-chip bridge SBR obeys the hold gate and the latch | `tests/test_pcie_guard.py::test_the_per_chip_bridge_reset_obeys_the_hold_gate_and_the_latch` |
 | I25 the walk and the sweep re-power only affected trays; X alone recovers chips off on X; a failed walk climbs to the mesh reset | `tests/test_ubb_tray_map.py::test_the_walk_covers_only_the_affected_trays`, `tests/test_device_safety.py::test_ubb_tray_walk_plan_walks_only_the_affected_trays`, `::test_ubb_tray_reset_walk_recovers_chips_off_on_any_tray_by_re_powering_that_tray_alone`, `::test_ubb_tray_reset_walk_never_sweeps_healthy_trays_when_the_affected_tray_does_not_recover`, `::test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_affected_tray_stays_off`, `tests/test_pcie_guard.py::test_the_last_chance_sweep_re_powers_only_the_affected_trays` |
 | I25 the host-hang latch: intent, latch on a new boot, not on the same boot, clear, opt-out | `tests/test_pcie_guard.py::test_an_off_bus_reset_writes_an_intent_and_removes_it_when_done`, `::test_an_intent_from_a_boot_that_died_latches_hold_until_cleared`, `::test_an_intent_from_this_boot_does_not_latch`, `::test_the_latch_can_be_switched_off`, `::test_a_tray_re_power_carries_an_intent_and_ends_it` |
