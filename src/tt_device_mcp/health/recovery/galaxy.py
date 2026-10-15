@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import alert, metrics, privileges
-from tt_device_mcp.device_holders import holder_comm, is_tenant
+from tt_device_mcp.device_holders import holder_comm, is_tenant, username_for_uid
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count
@@ -1455,7 +1455,7 @@ class GalaxyRecovery(Recovery):
                 "blocker": "tenant",
                 "pid": h.pid,
                 "uid": h.uid,
-                "user": h.username,
+                "user": username_for_uid(h.uid),
                 "comm": holder_comm(h.pid),
                 "tenants": len(tenants),
             }
