@@ -21,6 +21,7 @@ import pytest
 from tests.conftest import patch_health_event, patch_recovery
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.recovery import galaxy, pcie_guard
 
 # (chip id, endpoint bus, root port) in the kernel's /dev order
@@ -368,6 +369,49 @@ def test_chips_off_bus_counts_missing_functions(sysfs):
     assert pcie_guard.chips_off_bus(4) == 0
     os.unlink(sysfs / "sys/bus/pci/devices/0000:c1:00.0")
     assert pcie_guard.chips_off_bus(4) == 1
+
+
+def _all_ones(root, monkeypatch, chip):
+    """Chip ``chip`` keeps its PCI function and class node, but its ARC heartbeat reads all-ones: the
+    chip has left the bus and its BAR reads return nothing."""
+    monkeypatch.setattr(pci, "SYSFS_CLASS_DIR", root / "sys/class/tenstorrent")
+    _beat(root, chip, ALL_ONES)
+
+
+def test_chips_off_bus_counts_an_all_ones_chip_still_in_sysfs(sysfs, monkeypatch):
+    """Spec 04 I24: a chip still listed in sysfs whose heartbeat reads all-ones is off the bus."""
+    monkeypatch.setattr(pci, "SYSFS_CLASS_DIR", sysfs / "sys/class/tenstorrent")
+    assert pcie_guard.chips_off_bus(4) == 0, "ticking heartbeats are on the bus"
+    _all_ones(sysfs, monkeypatch, 2)
+    assert pcie_guard.chips_off_bus(4) == 1
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
+    assert pcie_guard.host_reset_gate(pcie_guard.chips_off_bus(4))[0] is False
+
+
+@pytest.mark.asyncio
+async def test_a_hold_gate_refuses_the_mesh_reset_and_the_sweep_over_an_all_ones_chip(sysfs, monkeypatch):
+    """Spec 04 I24: in hold mode an all-ones chip with its function still listed refuses the mesh reset
+    and the back-to-back sweep alike. No glx_reset argv is ever issued."""
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
+    _all_ones(sysfs, monkeypatch, 1)
+    events, argvs = [], []
+    patch_health_event(monkeypatch, lambda name, **k: events.append(name))
+    g = srv.galaxy_recovery
+
+    async def reset(argv, log, *a, **k):
+        argvs.append(argv)
+        return 0, ""
+
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    monkeypatch.setattr(g.mechanism, "await_foreign_scope", lambda log: _false())
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(g.monitor, "expected", lambda n: 4)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: pytest.fail("gated sweep fired a tray"))
+    assert await g._reset_and_verify_device_once(["0", "1", "2", "3"], lambda m: None) is False
+    assert await g._issue_all_resets_back_to_back(0b1000, [3], [4], 4, lambda m: None, do_sbr=False) is False
+    assert argvs == [], "no mesh reset over a chip whose heartbeat reads all-ones"
+    assert events.count("host_reset_gated") == 2 and "reset_begin" not in events
 
 
 def test_guard_refuses_during_an_aer_flood(sysfs, monkeypatch):
