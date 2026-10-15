@@ -265,6 +265,10 @@ class RecoveryDeps:
     # only an already-dirty one has nothing left to re-flag.
     episode_dirty: Optional[Callable[[], bool]] = None
     episode_job: Optional[Callable[[], dict]] = None
+    # Who blocks an idle escalation (spec 03 I30): called with the holder scan when a tenant stops
+    # a past-the-ceiling escalation, and with None once one proceeds, so /health and the
+    # hold-deadline watchdog can name the blocker instead of a silent hold.
+    note_hold_blocked: Optional[Callable[[Optional[HolderScan]], None]] = None
 
 
 class Recovery(ABC):

@@ -1119,6 +1119,11 @@ class GalaxyRecovery(Recovery):
             return OUTCOME_WAITING
         raise ValueError(f"escalate(): {stage!r} is not a gate action rung")
 
+    def _note_hold_blocked(self, scan) -> None:
+        """Tell the broker who blocks this escalation (``None``: nothing does any more)."""
+        if self.deps.note_hold_blocked is not None:
+            self.deps.note_hold_blocked(scan)
+
     def _tenant_active(self, scan, *, force: bool = False) -> bool:
         """Is anyone using the device? TWO independent sources, because either one alone lies:
 
@@ -1400,6 +1405,7 @@ class GalaxyRecovery(Recovery):
             return False
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
         tenant_active = self._tenant_active(scan, force=force)
+        self._note_hold_blocked(scan if tenant_active else None)
         if tenant_active:
             log("hold past the ceiling but a tenant holds the device — holding; escalates once idle")
             return False
@@ -1492,6 +1498,7 @@ class GalaxyRecovery(Recovery):
             return False
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
         tenant_active = self._tenant_active(scan, force=force)
+        self._note_hold_blocked(scan if tenant_active else None)
         if tenant_active:
             log("off-bus hold past the ceiling but a tenant holds the device — holding; escalates once idle")
             return False

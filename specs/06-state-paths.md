@@ -189,7 +189,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_PRESENT_MESH_RESET_GRACE_SEC` | 300 | Present-mesh eth/fabric hold grace before reset | 03 |
 | `TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE` | 1 | Kill switch: generic holds join the idle escalation | 03 |
 | `TT_DEVICE_MCP_FOREIGN_HOLDER_POLL_SEC` | 10 | Foreign-holder hold: poll for the holder's exit | 03 |
-| `TT_DEVICE_MCP_FOREIGN_HOLDER_DEADLINE_SEC` | 900 | Foreign-holder hold: age that escalates once, naming the holder | 03 |
+| `TT_DEVICE_MCP_FOREIGN_HOLDER_DEADLINE_SEC` | 900 | Foreign-holder hold, or a hold whose escalation a non-broker process blocks: age that pages once, naming the holder | 03 |
 | `TT_DEVICE_MCP_FORCE_ESCALATE` | 1 | Kill switch: past-ceiling forced escalation | 03 |
 | `TT_DEVICE_MCP_ETH_FREEZE_HOLD` | 1 | Frozen-eth verdict holds instead of resetting | 03 |
 | `TT_DEVICE_MCP_HOLD_REARM_SEC` | 1800 | Re-arm window for hold-escalation alerts | 03 |

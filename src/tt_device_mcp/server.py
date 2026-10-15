@@ -983,6 +983,7 @@ _recovery_deps = RecoveryDeps(
     isolate_chip=lambda idx: isolate_chip(idx),
     chip_pci_bdf=lambda idx: chip_pci_bdf(idx),
     health_event=lambda kind, **f: health_event(kind, **f),
+    note_hold_blocked=lambda scan: _note_hold_blocked(scan),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
     refresh_idle_hold_ledger=lambda: _refresh_idle_hold_ledger(),
@@ -2462,6 +2463,98 @@ async def _foreign_holder_pass() -> None:
     except Exception:  # noqa: BLE001 - runs in the detached relift task, which must never raise
         if logger:
             logger.exception("FOREIGN-HOLDER pass aborted on an unexpected error — holding")
+
+
+# Who blocks an idle escalation of the current hold (spec 03 I30): since (epoch), paged, why,
+# holders [{pid, uid, user, cmd}], jobs (RUNNING broker job ids), scan_complete. Set by the galaxy
+# escalators through RecoveryDeps.note_hold_blocked; empty when nothing blocks one.
+hold_blocked_by: dict = {}
+
+
+def _note_hold_blocked(scan) -> None:
+    """Record who stopped a past-the-ceiling escalation (``None``: one proceeded). A broker job
+    blocks by design (issue #3) and has its own timeout; a process outside the broker has none, so
+    it is named, and paged once past the foreign-holder deadline — never killed or signalled."""
+    if scan is None:
+        hold_blocked_by.clear()
+        return
+    first = not hold_blocked_by
+    if first:
+        hold_blocked_by.update(since=time.time(), paged=False)
+    hold_blocked_by.update(
+        why=fsm.record.why,
+        holders=[_describe_holder(h) for h in scan.holders if h.uid >= MIN_TENANT_UID],
+        jobs=[j.id for j in jobs.values() if j.status == JobStatus.RUNNING],
+        scan_complete=bool(scan.complete),
+    )
+    if first:
+        health_event("hold_blocked_by_tenant", **_hold_blocked_view())
+        if logger:
+            logger.warning(f"HOLD-BLOCKED escalation of the {fsm.record.why!r} hold waits on {_blocked_by_text()}")
+    _check_hold_blocked_deadline()
+
+
+def _pid_alive(pid: int) -> bool:
+    return Path(f"/proc/{pid}").exists()
+
+
+def _hold_blocked_view() -> dict:
+    """The live blocker for /health and the watchdog: holders that have exited and jobs that have
+    finished drop out; {} once nothing recorded still blocks."""
+    if not hold_blocked_by:
+        return {}
+    holders = [h for h in hold_blocked_by.get("holders", []) if _pid_alive(h["pid"])]
+    running = {j.id for j in jobs.values() if j.status == JobStatus.RUNNING}
+    job_ids = [j for j in hold_blocked_by.get("jobs", []) if j in running]
+    if not holders and not job_ids and hold_blocked_by.get("scan_complete", True):
+        return {}
+    return {
+        "why": hold_blocked_by.get("why"),
+        "blocked_sec": round(time.time() - hold_blocked_by.get("since", time.time()), 1),
+        "deadline_sec": _foreign_holder_deadline_sec(),
+        "paged": bool(hold_blocked_by.get("paged")),
+        "holders": holders,
+        "jobs": job_ids,
+        "scan_complete": bool(hold_blocked_by.get("scan_complete", True)),
+    }
+
+
+def _blocked_by_text(view: Optional[dict] = None) -> str:
+    view = _hold_blocked_view() if view is None else view
+    parts = [f"{h['user']}(pid {h['pid']}: {h['cmd'] or '?'})" for h in view.get("holders", [])]
+    parts += [f"broker job {j}" for j in view.get("jobs", [])]
+    if not view.get("scan_complete", True):
+        parts.append("an unreadable holder scan")
+    return ", ".join(parts) or "nothing"
+
+
+def _check_hold_blocked_deadline() -> None:
+    """Page once when a process outside the broker has blocked a held device's escalation past the
+    foreign-holder deadline. Driven every idle sample, so the page does not wait for the next
+    ceiling window. Clears the record once the device is healthy again."""
+    if fsm.state is ServerState.HEALTHY:
+        hold_blocked_by.clear()
+        return
+    view = _hold_blocked_view()
+    if not view or hold_blocked_by.get("paged") or not view["holders"] or view["jobs"]:
+        return
+    if view["blocked_sec"] < view["deadline_sec"]:
+        return
+    hold_blocked_by["paged"] = True
+    view["paged"] = True
+    health_event(
+        "foreign_holder_past_deadline",
+        why=view["why"],
+        holders=view["holders"],
+        held_sec=view["blocked_sec"],
+        deadline_sec=view["deadline_sec"],
+    )
+    if logger:
+        logger.warning(
+            f"FOREIGN-HOLDER the {view['why']!r} hold cannot escalate: {_blocked_by_text(view)} has held the "
+            f"device {int(view['blocked_sec'])}s (deadline {view['deadline_sec']}s); not touching it — stop "
+            f"that process to let the recovery run"
+        )
 
 
 def _hold_device_unverified(why: str, *, needs_eth_advancing: bool = False) -> None:
@@ -4301,6 +4394,12 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         }
     if last_foreign_hold_recovery:
         payload["last_foreign_hold_recovery"] = dict(last_foreign_hold_recovery)
+    # One key box-watch reads to page on a hold nothing automatic will end while the blocker stays.
+    blocked = _hold_blocked_view()
+    if not blocked and foreign_hold.get("holders"):
+        blocked = {"why": FOREIGN_HOLDER_WHY, "holders": foreign_hold["holders"], "jobs": []}
+    if blocked and fsm.state is not ServerState.HEALTHY:
+        payload["blocked_by"] = blocked
     if hold:
         reason, since = hold
         payload["held_since"] = since
@@ -4551,6 +4650,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     if bucket < 1 or bucket <= device_hold_deadline_bucket:
         return
     device_hold_deadline_bucket = bucket
+    blocked = _hold_blocked_view()
     health_event(
         "hold_stuck_past_deadline",
         held_since=device_hold_episode_since,
@@ -4558,13 +4658,19 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         held_age_sec=int(age),
         escalated=fsm.latch("escalated"),
         host_at_risk=True,
+        blocked_by=blocked or None,
     )
     if logger:
+        cause = (
+            f"Blocked by {_blocked_by_text(blocked)} — the escalation waits for it to release the device."
+            if blocked
+            else "Manual recovery is likely required — a hold must terminate."
+        )
         logger.error(
             f"HOLD-WATCHDOG device HELD {int(age)}s — past the {deadline}s deadline — and still "
             f"refused to tenants: {device_hold_episode_reason!r}. The idle escalation has not "
             f"cleared it (opted out, a stuck tenant/unreadable holder scan, its one reset spent, or "
-            f"a killed relift). Manual recovery is likely required — a hold must terminate."
+            f"a killed relift). {cause}"
         )
 
 
@@ -4595,6 +4701,7 @@ def _refresh_idle_hold_ledger() -> None:
         return
     _note_tenant_gate_verdict(_device_unavailable_for_tenant())
     _check_hold_deadline()
+    _check_hold_blocked_deadline()
 
 
 # How many times the gate will reset+verify a device that keeps coming back dirty before it

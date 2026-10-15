@@ -202,3 +202,98 @@ def test_foreign_holder_timings_default_and_parse(monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_FOREIGN_HOLDER_POLL_SEC", "0")
     assert srv._foreign_holder_deadline_sec() == 900
     assert srv._foreign_holder_poll_sec() == 1
+
+
+# --- an off-bus / stuck hold whose escalation a tenant blocks names the blocker (spec 03 I30) ---
+
+
+@pytest.fixture
+def offbus_blocked(monkeypatch, clear_job_state):
+    """An idle off-bus hold past the ceiling with an interactive tt-smi holding the device."""
+    from tests.test_device_safety import _arm_offbus_stuck_hold
+
+    # The helper assigns these module globals directly: register them so monkeypatch restores them.
+    for name in ("isolated_chips", "device_hold_episode_reason", "device_hold_episode_since"):
+        monkeypatch.setattr(srv, name, getattr(srv, name))
+    counters = _arm_offbus_stuck_hold(monkeypatch, isolated={"8"})
+    counters["kills"] = 0
+    counters["events"] = []
+    fsm_dirty(srv, "gate/post-job: 1/32 off-bus below the reset floor", why="off_bus", dirty=False)
+    holder = DeviceHolder(pid=124766, uid=srv.MIN_TENANT_UID)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[holder], complete=True))
+    monkeypatch.setattr(srv, "_holder_cmd", lambda pid: "tt-smi")
+    monkeypatch.setattr(srv, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(srv.os, "kill", lambda *a: counters.__setitem__("kills", counters["kills"] + 1))
+    patch_health_event(monkeypatch, lambda kind, **f: counters["events"].append((kind, f)))
+    srv.hold_blocked_by.clear()
+    yield counters
+    srv.hold_blocked_by.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_offbus_escalation_names_the_holder_in_health(offbus_blocked):
+    """blx01 10-14: an interactive tt-smi held an off-bus hold's escalation for 3 h 27 min, and
+    /health said nothing about who. /health now exposes blocked_by with pid, user and command."""
+    ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
+
+    assert ran is False and offbus_blocked["resets"] == 0 and offbus_blocked["kills"] == 0
+    blocked = srv._health_payload()["blocked_by"]
+    assert blocked["why"] == "off_bus"
+    who = DeviceHolder(pid=124766, uid=srv.MIN_TENANT_UID).username
+    assert blocked["holders"] == [{"pid": 124766, "uid": srv.MIN_TENANT_UID, "user": who, "cmd": "tt-smi"}]
+    assert len(_kinds(offbus_blocked, "hold_blocked_by_tenant")) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_blocker_past_the_deadline_pages_once_and_is_never_killed(offbus_blocked, monkeypatch):
+    """The foreign-holder bound covers off-bus holds too: past the deadline the broker pages once,
+    from the per-sample watchdog (not the next ceiling window), and never signals the holder. The
+    HOLD-WATCHDOG event names the blocker instead of 'manual recovery'."""
+    monkeypatch.setenv("TT_DEVICE_MCP_FOREIGN_HOLDER_DEADLINE_SEC", "60")
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
+    srv.hold_blocked_by["since"] = time.time() - 61
+    monkeypatch.setattr(srv, "device_op_active", "")
+    monkeypatch.setattr(srv, "device_hold_logged", True)
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
+    old = (srv.datetime.now() - srv.timedelta(seconds=srv._hold_deadline_sec() + 60)).isoformat()
+    monkeypatch.setattr(srv, "device_hold_episode_since", old)
+
+    srv._refresh_idle_hold_ledger()
+    srv._refresh_idle_hold_ledger()
+
+    paged = _kinds(offbus_blocked, "foreign_holder_past_deadline")
+    assert len(paged) == 1, "one page per blocked hold, not one per sample"
+    assert paged[0]["why"] == "off_bus" and paged[0]["holders"][0]["pid"] == 124766
+    stuck = _kinds(offbus_blocked, "hold_stuck_past_deadline")
+    assert stuck and stuck[0]["blocked_by"]["holders"][0]["cmd"] == "tt-smi"
+    assert offbus_blocked["kills"] == 0 and offbus_blocked["resets"] == 0
+    assert srv._health_payload()["blocked_by"]["paged"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_running_broker_job_blocks_without_a_page(offbus_blocked, monkeypatch):
+    """A broker job blocks by design (issue #3: never reset under a running job) and carries its own
+    timeout, so it is named in blocked_by but never paged as a foreign holder."""
+    monkeypatch.setenv("TT_DEVICE_MCP_FOREIGN_HOLDER_DEADLINE_SEC", "60")
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    srv.jobs["042"] = srv.Job(
+        id="042", owner="u", workspace="/w", command="pytest", queued_at="2026-01-01T00:00:00",
+        status=srv.JobStatus.RUNNING,
+    )
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
+    srv.hold_blocked_by["since"] = time.time() - 61
+    srv._check_hold_blocked_deadline()
+
+    assert offbus_blocked["resets"] == 0
+    assert srv._health_payload()["blocked_by"]["jobs"] == ["042"]
+    assert _kinds(offbus_blocked, "foreign_holder_past_deadline") == []
+
+
+@pytest.mark.asyncio
+async def test_blocked_by_clears_once_the_escalation_proceeds(offbus_blocked, monkeypatch):
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert srv.hold_blocked_by
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert srv.hold_blocked_by == {}
+    assert "blocked_by" not in srv._health_payload()

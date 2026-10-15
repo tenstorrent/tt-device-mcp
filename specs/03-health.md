@@ -317,7 +317,15 @@ job boundary.
   `TT_DEVICE_MCP_FOREIGN_HOLDER_DEADLINE_SEC` (900 s) it emits one `foreign_holder_past_deadline`
   naming pid, user and command, and keeps polling. Every release emits `foreign_holder_recovered`
   with `time_to_recover_sec`; `/health` shows `foreign_holder` while tracked and
-  `last_foreign_hold_recovery`.
+  `last_foreign_hold_recovery`. The same bound covers any other hold whose idle escalation a tenant
+  blocks (an off-bus or present-mesh hold past its ceiling): the escalator records the blocker
+  (`hold_blocked_by_tenant`, once), `/health` exposes `blocked_by` (why, holders with pid, user and
+  command, RUNNING broker job ids, scan completeness, `blocked_sec`, `paged`) while the device is
+  held, and the hold-deadline watchdog's event and HOLD-WATCHDOG line name it. A process outside
+  the broker that blocks past the deadline is paged once (`foreign_holder_past_deadline` with the
+  hold's `why`), checked every idle sample, never signalled. A RUNNING broker job is named but not
+  paged: it blocks by design (04, issue #3) and has its own timeout. `blocked_by` clears once an
+  escalation proceeds or the device is HEALTHY.
 
 ## Interfaces
 
@@ -771,6 +779,10 @@ refuses.
 | I30 (a stale hold clears on the next short poll) | `tests/test_foreign_holder.py::test_a_stale_holder_record_clears_on_the_next_poll` |
 | I30 (own poll interval) | `tests/test_foreign_holder.py::test_the_poll_runs_on_its_own_short_interval` |
 | I30 (env timings) | `tests/test_foreign_holder.py::test_foreign_holder_timings_default_and_parse` |
+| I30 (a blocked off-bus escalation names its blocker in `/health` `blocked_by`) | `tests/test_foreign_holder.py::test_a_blocked_offbus_escalation_names_the_holder_in_health` |
+| I30 (a foreign blocker past the deadline pages once, named in the watchdog event, never killed) | `tests/test_foreign_holder.py::test_a_foreign_blocker_past_the_deadline_pages_once_and_is_never_killed` |
+| I30 (a RUNNING broker job blocks without a page) | `tests/test_foreign_holder.py::test_a_running_broker_job_blocks_without_a_page` |
+| I30 (`blocked_by` clears once the escalation proceeds) | `tests/test_foreign_holder.py::test_blocked_by_clears_once_the_escalation_proceeds` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |
