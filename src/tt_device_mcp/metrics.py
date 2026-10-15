@@ -146,6 +146,7 @@ def _construct_metrics(registry: CollectorRegistry) -> None:
     global recovery_episode_seconds_total, stages_fired_total, probe_checks_total
     global probe_last_seconds, snapshot_gauges
     global platform_state, fault_state, probe_last_verdict
+    global offbus_operator_deadline_seconds
 
     jobs_total = Counter("tt_device_broker_jobs_total", "Jobs finished, by outcome", ["outcome"], registry=registry)
     # A labeled counter emits nothing until its first increment, so a freshly started broker
@@ -268,6 +269,12 @@ def _construct_metrics(registry: CollectorRegistry) -> None:
             registry=registry,
         ),
     }
+    offbus_operator_deadline_seconds = Gauge(
+        "tt_device_broker_offbus_operator_deadline_seconds",
+        "Unix time an operator must recover a gated off-bus hold by before the broker runs its own "
+        "reset ladder (spec 04 I33); 0 when no hold is handed off",
+        registry=registry,
+    )
     probe_last_seconds = Gauge(
         "tt_device_broker_probe_last_seconds",
         "How long the LAST run of each probe took — the one to alert on as the fabric pass creeps "
@@ -293,6 +300,11 @@ def job_completed(outcome: str) -> None:
     snapshot, busy/free from the occupancy clock — this counts, nothing more."""
     _validate(outcome, OUTCOMES, "job outcome")
     jobs_total.labels(outcome=outcome).inc()
+
+
+def offbus_operator_deadline(epoch: float) -> None:
+    """The gated off-bus hold's operator deadline (spec 04 I33), 0 once no hold is handed off."""
+    offbus_operator_deadline_seconds.set(epoch)
 
 
 def stage_fired(stage: str, outcome: str) -> None:

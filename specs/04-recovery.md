@@ -424,7 +424,8 @@ each rung fires only when the gentler one failed or cannot apply.
   masked, because no host rung fires without the full ladder (I22); the erroring port stays masked
   across that reset. The gate is checked before
   the reset is recorded (`reset_begin`, the cooldown clock): a refused reset did not happen. A
-  refusal is a hold for an operator, never a climb (I22), bounded by I27. Operator and tool resets are not gated.
+  refusal is handed to an operator, never a climb (I22), bounded by I27 and, with no power cycle
+  configured, by the I33 operator hand-off. Operator and tool resets are not gated.
   The per-chip bridge SBR is gated the same way, counting its target chips as off the bus: under
   `hold` (or the I25 latch) it does not fire, and the PCI rescan still runs.
 
@@ -507,7 +508,7 @@ each rung fires only when the gentler one failed or cannot apply.
   episode (`offbus_gated_hold_page`, `offbus_power_cycle_rate_limited`,
   `offbus_power_cycle_denied`, `offbus_power_cycle_unguarded`, naming the host, host at risk,
   `severity: high`, through the alert hook; a page the hook drops while busy is sent again on the
-  next pass) and the hold stands as before. A cycle held
+  next pass) and the hold stands as before; with the command unset, I33 bounds it. A cycle held
   back by a tenant, a reset in its own scope or a stand-back for
   `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC` (default 1800 s) past the grace pages once
   (`offbus_power_cycle_blocked`, naming the blocker), so every gated hold ends in a power-cycle
@@ -535,7 +536,7 @@ each rung fires only when the gentler one failed or cannot apply.
   re-power on this boot took chips on other trays off the bus (the per-tray rung is declined, I25
   and the tray rung's walk below), no IPMI rung will run, so the off-bus hold takes the same grace
   and then the same power cycle, with every check above.
-  Unset, the behaviour is I24's plus one page. `deploy/tt-manual-recovery-check.sh` is a template for the
+  Unset, the behaviour is I24's plus the I33 hand-off. `deploy/tt-manual-recovery-check.sh` is a template for the
   manual-recovery command: exit 0 when the sudo journal or auth.log shows a sudo-run reboot,
   poweroff, shutdown, halt, kexec or ipmitool power/reset in the last 30 min, 1 when not, 2 when it
   cannot read the journal.
@@ -615,6 +616,30 @@ each rung fires only when the gentler one failed or cannot apply.
   gate never runs the pass (03 I12). The startup pass runs only once the hugepage pool is ready
   (03 I48). Exempt only where no fabric pass can run at all: a single chip, or no fabric check
   configured on the host. There is no switch that turns it off.
+
+- **I33 — With no power cycle configured, the gated off-bus hold is handed to an operator with a
+  deadline, then ends in the broker's own ladder.** When the I24 `hold` gate refuses every reset of an
+  idle off-bus hold and `TT_DEVICE_MCP_POWER_CYCLE_CMD` is unset (no I27 cycle can end it), the first
+  escalation of the episode hands the hold to an operator, once per episode: one high-severity page
+  (`offbus_gated_hold_page`) that names the host, says no power cycle is configured, the time the
+  operator must recover the host by, what the broker does then, and that every reset is followed by the
+  full health check, fabric included; the gauge `tt_device_broker_offbus_operator_deadline_seconds`
+  (that time as Unix seconds, 0 once no hold is handed off); and `/health` `operator_handoff` (the
+  reason, who must act, `act_by`/`act_by_epoch`, what happens then, and whether the manual-recovery
+  check saw an operator at work). The deadline is the episode start plus
+  `TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC` (default 1200 s, two 600 s ceiling windows; a non-positive
+  or malformed value reads as the default). Past it the hold watchdog forces one escalation pass, and
+  that pass runs with the gate's off-bus refusal lifted for that pass only (`hold` reads as `guard`:
+  the AER flood checks still refuse): the ladder's own rungs (the bridge reset, then the mesh reset)
+  may fire as I22 allows, and outside the pass the gate holds again. Nothing lifts the gate while an
+  operator owns the hold: `TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC=off` (the operator's latch: the page
+  says the hold stands until an operator recovers the host, and `act_by` is null), the I25 host-hang
+  latch, a stand-back path or command (I27), or a manual-recovery check that exits 0; a stand-back
+  past the deadline pages once (`offbus_power_cycle_blocked`). A missing manual-recovery check does
+  not stand back here: this lifts a mesh reset, not a power cycle. Every reset a lifted pass fires owes
+  the I32 fabric debt, so the device is released only after the full health check, fabric included,
+  passes; a failed check keeps it held for the next bounded rung, and a reset the gate still refuses
+  releases nothing. The hand-off ends (gauge to 0, `operator_handoff` gone) when the hold ends.
 
 ## Interfaces
 
@@ -799,7 +824,14 @@ fails); it is log-only, and `off_bus`, the count at onset, still drives every de
 down and costs minutes, so before paying that the ladder re-issues every reset type once more,
 back-to-back, then takes ONE settle and ONE verify — and fires the host rung only if the mesh is
 still bad (`_settle_and_verify_before_host_rung` → `_issue_all_resets_back_to_back`, the same
-implementation the `TRAY_DOWN_NO_WINDOW` branch uses, so the two can never drift). This holds on
+implementation the `TRAY_DOWN_NO_WINDOW` branch uses, so the two can never drift). The sweep's
+per-tray BMC re-power is auditable from the journal alone: before the fire it logs one line per tray
+naming the tray, its BMC bit and its chips (from the I16 map) beside the exact `ipmitool` command;
+after it, a `ubb_reset_fired` event (`trays`, `ubb_bitmap`, `chips`, `command`) on success, or a
+`ubb_reset_failed` event with the same fields, the BMC's exit code as `rc` (null when ipmitool never
+exited) and the error. The single-tray walk journals each clean pulse the same way (`tray` in place of
+`trays`). This is logging only: it changes no tray fired, no timing and no hold, and the full health
+check still has to pass after the sweep before anything is released. This holds on
 every road to a host rung, not just the tray branch: the gate ladder's own rung, the idle/stuck-hold
 escalation (`_climb_to_host_recovery_after_failed_reset` — the road most measured power cycles
 actually took), and the post-reboot cold climb (`_verify_post_reboot_recovery`, where the warm reboot
@@ -1039,6 +1071,10 @@ sees a silent fabric pass.
 | I32 every reset path releases only after a passing fabric pass: the debt settles only on a healthy verdict, the funnel holds fabric-unverified, exemptions | `tests/test_post_reset_gate.py::test_the_debt_settles_only_on_a_healthy_fabric_verdict`, `::test_a_single_chip_or_a_host_with_no_fabric_check_is_exempt`, `::test_a_verified_release_after_a_reset_holds_fabric_unverified`, `::test_no_debt_releases_as_before` |
 | I32 per path: operator reset, bridge rung, no-window sweep, idle off-bus bridge, adopted foreign scope, foreign-holder fast verify, broker start, tray-down prelude rescan | `tests/test_post_reset_gate.py::test_an_operator_reset_without_a_passing_fabric_pass_holds`, `::test_an_operator_reset_with_a_passing_fabric_pass_releases`, `::test_the_bridge_rung`, `::test_the_tray_down_no_window_sweep`, `::test_the_idle_off_bus_bridge_reset`, `::test_a_reset_adopted_from_a_foreign_scope`, `::test_the_foreign_holder_fast_verify_after_a_reset_holds`, `::test_a_broker_start_owes_a_fabric_pass_before_any_release`, `tests/test_tray_down_prelude.py::test_a_rescan_recovery_releases_only_on_a_passing_fabric_pass` |
 | I32 the post-job gate runs the pass only while a reset owes one, never pre-job; the I40 fallback climbs instead of releasing an owed reset | `tests/test_post_reset_gate.py::test_a_clean_post_job_gate_with_no_debt_runs_no_fabric_pass`, `::test_a_post_job_gate_owed_a_fabric_pass_runs_it_and_settles`, `::test_a_pre_job_gate_never_runs_the_owed_pass`, `::test_the_77_fallback_never_releases_a_reset_with_no_passing_fabric_pass` |
+| I33 no power cycle configured: the gated off-bus hold is handed to an operator once per episode (one page, the deadline gauge, `/health` `operator_handoff`), which end with the hold; the knob's default, `off` and malformed values | `tests/test_gated_hold_handoff.py::test_the_hold_is_handed_to_an_operator_once_with_a_deadline`, `::test_the_handoff_knob` |
+| I33 before the deadline the gate holds; past it the watchdog forces one pass, and only that pass runs the ladder with the gate lifted | `tests/test_gated_hold_handoff.py::test_before_the_deadline_the_gate_holds_and_no_reset_fires`, `::test_the_watchdog_forces_one_pass_at_the_handoff_bound`, `::test_past_the_deadline_the_ladder_runs_with_the_gate_lifted_for_that_pass_only` |
+| I33 an operator latch (`off`, the I25 latch) or an operator at work keeps the hold past the deadline | `tests/test_gated_hold_handoff.py::test_an_operator_latch_keeps_the_hold_past_the_deadline`, `::test_an_operator_at_work_keeps_the_gate_shut` |
+| I33 / I32 a lifted reset releases only after a passing full health check, fabric included; a reset the gate still refuses releases nothing | `tests/test_gated_hold_handoff.py::test_the_lifted_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_a_reset_the_gate_still_refuses_releases_nothing` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |
@@ -1053,6 +1089,7 @@ sees a silent fabric pass.
 | I16 a trusted full read whose chip→bus map differs re-banks it, journals `chip_bus_map_drift` with the old and the new map, and the next mask follows the chip's new bus | `tests/test_ubb_tray_map.py::test_a_renumbered_full_read_re_banks_the_map_and_journals_old_and_new`, `::test_after_a_renumbering_the_walk_re_powers_the_tray_of_the_chips_new_bus` |
 | I16 a short read, an unreadable chip, or a read tt-smi disagrees with never overwrites a banked map; a matching full read changes nothing | `tests/test_ubb_tray_map.py::test_a_short_or_disagreeing_read_never_overwrites_the_banked_map`, `::test_a_full_read_that_matches_the_banked_map_changes_nothing` |
 | I16 tt-smi's bus list drifting journals `bus_map_drift`; the list stands | `tests/test_ubb_tray_map.py::test_a_drifted_snapshot_journals_but_leaves_the_cached_map_standing` |
+| I16 every BMC re-power is journalled: the sweep logs one line per tray with the exact command, then `ubb_reset_fired` with mask and chips on success or `ubb_reset_failed` with `rc` on failure, from both its callers; the walk does the same per tray; a tray not fired journals no `ubb_reset_fired` | `tests/test_ubb_tray_map.py::test_the_sweep_journals_the_tray_4_mask_it_fired_for_chips_24_to_31`, `::test_a_failed_sweep_fire_journals_its_rc_and_no_fired_event`, `::test_a_sweep_that_does_not_fire_the_tray_journals_no_fired_event`, `::test_the_last_chance_sweep_labels_each_tray_from_the_map`, `::test_the_walk_journals_the_tray_4_mask_it_fired`, `::test_a_failed_walk_fire_journals_its_rc_and_no_fired_event`, `tests/test_ubb_reset_launch.py::test_a_pulse_the_bmc_did_not_take_raises_bmc_ipmi_error` |
 | I16 a new GLX board type this build cannot map surfaces as `ubb_tray_table_missing` | `tests/test_ubb_tray_map.py::test_a_glx_board_type_with_no_matching_arch_suffix_journals_once` |
 | I19 a tray with 4+ chips off at first sighting is an onset; no map, an unplaced chip, or fewer off gets no prelude | `tests/test_tray_down_prelude.py::test_a_tray_with_four_or_more_chips_off_is_a_tray_down_onset`, `::test_no_map_or_an_unplaced_chip_never_classifies_as_tray_down`, `::test_one_to_three_chips_off_get_no_prelude` |
 | I19 replay: no recorded episode that recovered without a power cycle gets the prelude | `tests/test_tray_down_prelude.py::test_replay_the_prelude_runs_only_on_onsets_that_never_recovered_without_a_power_cycle` (fixture `tests/fixtures/tray_down_replay.tsv`) |
