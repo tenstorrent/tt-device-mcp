@@ -681,6 +681,17 @@ job boundary.
   read back at the mark clears the drop. Not for a known cable fault (a 78, I46/I47), a topology
   mismatch or fault, or a missing prerequisite (the hugepages, at startup too, or the validator):
   no reset fixes those, so they keep their no-reset hold. With every link up, a 77 keeps I48/I40.
+- **I54 — A held device says where its escalation stands.** While the device is held, `/health`
+  `held_reason` is the reason the hold opened with plus one bracketed line, and `hold_escalation`
+  carries the same as fields: `stage` (the last step of the forced escalation: each rung it logs and
+  its outcome, or "held, no forced escalation yet"), `stage_at`, `next_step` with `next_deadline`
+  and `next_in_sec` (the earliest of the off-bus one-shot, the off-bus power-cycle bound and the
+  next ceiling window; none forced for a 77-only hold or with `TT_DEVICE_MCP_FORCE_ESCALATE=0`; "is
+  running" while a forced pass runs), and `power_cycle_requested` (with `power_cycle_requested_at`),
+  read from this episode's power-cycle attempt record, so it survives the cycle. A hold that is
+  being climbed never reads as unbounded. Reporting only: it releases nothing, and a requested power
+  cycle leaves the device held until the full gate, fabric included, passes. The stage clears with
+  the episode. The jobs-list hold row keeps the name it opened with.
 
 ## Interfaces
 
@@ -713,7 +724,8 @@ subsystem through the root:
 - `/health` (REST, `server._health_payload`) — `status: ok|degraded` (degraded exactly while the
   device is HELD: degraded, refused to tenants, no recovery op running), `fsm_state`, `fsm_why`,
   `held`/`held_since`/`held_reason`/`held_age_sec`, `device_degraded`, queue counts, version.
-  `held_reason` and `fsm_why` keep the reason the hold opened with; the live fields say where it
+  `fsm_why` keeps the reason the hold opened with, and `held_reason` adds where its escalation
+  stands, also given as `hold_escalation` (I54); the live fields say where it
   stands now, read fresh from sysfs on every call with no device touch: `isolated_chips` (always),
   and where the heartbeat detector and a chip baseline exist, `off_bus` (chips off the PCIe bus now,
   the count the rungs use), `arc_not_ready` (on the bus, heartbeat ENODATA on a bound endpoint, 04
@@ -1236,6 +1248,7 @@ refuses.
 | I51 | `tests/test_sd_notify_main_pid.py::test_the_main_pid_notifies`, `tests/test_sd_notify_main_pid.py::test_a_non_main_pid_is_refused_and_said_once`, `tests/test_sd_notify_main_pid.py::test_the_claim_keeps_the_socket_from_children` |
 | I52 | `tests/test_device_safety.py::test_idle_relift_lifts_an_off_bus_floor_hold_without_the_eth_reader`, `tests/test_device_safety.py::test_idle_relift_holds_an_off_bus_hold_until_the_fabric_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_lifts_once_every_chip_is_back_and_the_full_gate_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_stays_down_unless_the_fabric_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_runs_no_gate_until_every_chip_is_back`, `tests/test_device_safety.py::test_a_down_offbus_recheck_holds_when_a_chip_drops_mid_verify`, `tests/test_device_safety.py::test_a_down_offbus_recheck_is_paced`, `tests/test_arc_not_ready.py::test_a_down_offbus_recheck_holds_on_arc_not_ready_chips_without_the_gate`, `tests/test_device_safety.py::test_a_per_user_daemon_neither_arms_the_down_offbus_recheck_nor_gates_on_fabric`, `tests/test_readopt.py::test_a_failed_per_user_start_reopens_once_the_device_reads_healthy` |
 | I53 | `tests/test_startup_fabric_hugepages.py::test_the_eth_read_records_a_measured_link_drop`, `tests/test_startup_fabric_hugepages.py::test_a_77_with_eth_links_down_escalates_on_the_first_relift`, `tests/test_startup_fabric_hugepages.py::test_a_77_with_eth_links_down_is_forced_past_the_hold_deadline`, `tests/test_startup_fabric_hugepages.py::test_a_77_with_eth_links_full_keeps_the_backoff`, `tests/test_startup_fabric_hugepages.py::test_a_78_cable_fault_with_eth_links_down_holds_without_a_reset`, `tests/test_startup_fabric_hugepages.py::test_a_77_eth_drop_reset_releases_only_on_a_passing_full_check`, `tests/test_startup_fabric_hugepages.py::test_a_startup_hugepages_hold_with_links_measured_down_stays_77_only` |
+| I54 | `tests/test_hold_escalation_status.py::test_a_fresh_offbus_hold_names_the_one_shot_deadline`, `tests/test_hold_escalation_status.py::test_each_step_moves_the_stage_and_the_deadline`, `tests/test_hold_escalation_status.py::test_another_episodes_power_cycle_is_not_this_ones`, `tests/test_hold_escalation_status.py::test_a_running_ladder_and_the_kill_switch_and_a_77_hold_say_so`, `tests/test_hold_escalation_status.py::test_the_hold_row_keeps_its_name`, `tests/test_hold_escalation_status.py::test_release_clears_the_stage`, `tests/test_hold_escalation_status.py::test_not_held_reports_no_escalation`, `tests/test_hold_escalation_status.py::test_a_forced_pass_updates_the_reason_and_keeps_the_hold` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |

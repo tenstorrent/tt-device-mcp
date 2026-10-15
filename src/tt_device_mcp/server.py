@@ -985,6 +985,11 @@ device_hold_job_bound_escalated: bool = False
 # spawn so the escalation reports the clock that actually fired rather than the general ceiling.
 device_hold_escalation_trigger: str = ""
 device_hold_escalation_kind: str = ""  # machine-readable twin of the trigger text, for the event
+# Where this episode's forced escalation stands, for /health and the hold row: the hold's opening
+# reason never changes, so without this a hold the ladder is actively climbing reads as unbounded.
+# Set as each forced pass starts, on every rung it logs, and when it ends. Cleared with the episode.
+device_hold_escalation_stage: str = ""
+device_hold_escalation_stage_at: str = ""
 _forced_escalation_task: "Optional[asyncio.Task]" = None
 # Jobs a reset SIGKILLed to take the device. Their deaths are ours, not the mesh's: a reset
 # kills the running job, the job dies mid-CCL, and that death then reads as evidence the
@@ -2100,6 +2105,7 @@ def _reset_for_testing():
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
     global _topology_hw_fault_paged
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
+    _note_escalation_stage("")
     job_queue = None
     lock = None
     _action_row = None
@@ -5819,7 +5825,13 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     if hold:
         reason, since = hold
         payload["held_since"] = since
-        payload["held_reason"] = reason
+        # The reason the hold opened with, plus where its escalation stands now: stage, next step and
+        # deadline, and whether a power cycle was requested — so a hold the ladder is climbing never
+        # reads as unbounded. The same picture, machine-readable, is ``hold_escalation``.
+        escalation = _hold_escalation_status(now)
+        payload["held_reason"] = reason + _hold_escalation_suffix(escalation)
+        if escalation is not None:
+            payload["hold_escalation"] = escalation
         try:
             payload["held_age_sec"] = int(((now or datetime.now()) - datetime.fromisoformat(since)).total_seconds())
         except ValueError:
@@ -5858,6 +5870,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # ...and the alert hook's backoff for that same episode, so a restart does not page again.
         device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
         device_hold_episode_reason = reason
+        _note_escalation_stage("")  # a fresh episode starts with no escalation behind it
         # Reserve the ledger row now, so the live row and the durable one share id, start, and name.
         # Its start is THIS process's segment (row_since), NOT the restored escalation clock: a hold
         # split by a restart then reads as adjacent rows — the orphaned-close for the prior segment,
@@ -5924,8 +5937,9 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_alert_next_bucket = 0
         device_hold_alert_gap = 0
         _persist_hold_alert_backoff("", 0, 0)
-        # ...and its own forced-escalation windows.
+        # ...and its own forced-escalation windows, and where the last one stood.
         device_hold_escalate_bucket = 0
+        _note_escalation_stage("")
         # ...and its own early off-bus attempt.
         device_hold_offbus_escalated = False
         # ...and its held-job bound's attempt.
@@ -5956,6 +5970,7 @@ async def _force_escalate_stuck_hold() -> None:
     and the host rungs' own boot-loop rate limiter. Fired once per ceiling window until recovery."""
 
     def log(msg: str) -> None:
+        _note_escalation_stage(msg)  # each rung's line is also the hold's current stage in /health
         if logger:
             logger.error(f"HOLD-DEADLINE-ESCALATE {msg}")
 
@@ -6027,7 +6042,92 @@ async def _force_escalate_stuck_hold() -> None:
         outcome = await galaxy_recovery.escalate(
             "offbus-forced" if off_bus > 0 else "present-forced", indices, expected, log
         )
+        _note_escalation_stage(f"forced recovery ladder ({trigger}) ended: {outcome}")
         fsm.on_outcome(outcome)
+
+
+def _note_escalation_stage(stage: str, now: Optional[datetime] = None) -> None:
+    """Record where the forced escalation of this hold stands (see device_hold_escalation_stage)."""
+    global device_hold_escalation_stage, device_hold_escalation_stage_at
+    device_hold_escalation_stage = " ".join(stage.split())[:240]
+    device_hold_escalation_stage_at = (now or datetime.now()).isoformat(timespec="seconds") if stage else ""
+
+
+def _hold_escalation_status(now: Optional[datetime] = None) -> Optional[dict]:
+    """Where a held episode's escalation stands, for /health and the hold row: the last step taken,
+    the next step and when it is due, and whether a power cycle was requested. None while not held.
+
+    The hold's reason is the one it OPENED with ("... held for self-heal, not reset"); the watchdog
+    then climbs the 120 s off-bus, power-cycle grace and 600 s ceiling rungs underneath it. Without
+    this the reason stays the same throughout, and a hold being actively escalated reads as unbounded.
+    Reads in-memory clocks and the small power-cycle state file only: no device touch."""
+    episode = device_hold_episode_since
+    if not episode:
+        return None
+    try:
+        started = datetime.fromisoformat(episode)
+    except ValueError:
+        return None
+    now = now or datetime.now()
+    out: dict = {
+        "stage": device_hold_escalation_stage or "held, no forced escalation yet",
+        "stage_at": device_hold_escalation_stage_at or None,
+        "next_step": None,
+        "next_deadline": None,
+        "next_in_sec": None,
+    }
+    running = _forced_escalation_task is not None and not _forced_escalation_task.done()
+    due: list = []
+    if running:
+        out["next_step"] = "the forced recovery ladder is running"
+    elif not _force_escalate_enabled():
+        out["next_step"] = "none: forced escalation is off (TT_DEVICE_MCP_FORCE_ESCALATE=0)"
+    elif _fabric_77_only_hold():
+        out["next_step"] = "none forced: the fabric check could not run (77); the idle relift re-runs it"
+    else:
+        if isolated_chips and not device_hold_offbus_escalated:
+            due.append((started + timedelta(seconds=_offbus_hold_ceiling_sec()), "off-bus forced escalation"))
+        bound = offbus_power_cycle.watchdog_due_at(episode)
+        if bound is not None:
+            due.append(bound)
+        window = device_hold_escalate_bucket + 1
+        due.append(
+            (
+                started + timedelta(seconds=window * _stuck_hold_ceiling_sec()),
+                f"forced recovery ladder (ceiling window {window})",
+            )
+        )
+    if due:
+        when, what = min(due, key=lambda d: d[0])
+        out["next_step"] = what
+        out["next_deadline"] = when.isoformat(timespec="seconds")
+        out["next_in_sec"] = max(0, int((when - now).total_seconds()))
+    req = offbus_power_cycle.power_cycle_requested(episode)
+    out["power_cycle_requested"] = req is not None
+    if req is not None:
+        try:
+            out["power_cycle_requested_at"] = datetime.fromtimestamp(float(req.get("at_epoch"))).isoformat(
+                timespec="seconds"
+            )
+        except (TypeError, ValueError):
+            out["power_cycle_requested_at"] = None
+    return out
+
+
+def _hold_escalation_suffix(status: Optional[dict]) -> str:
+    """One line of :func:`_hold_escalation_status` to append to the hold reason, or '' when none."""
+    if not status:
+        return ""
+    parts = [f"escalation: {status['stage']}"]
+    if status["next_deadline"]:
+        parts.append(f"next: {status['next_step']} at {status['next_deadline']} (in {status['next_in_sec']}s)")
+    elif status["next_step"]:
+        parts.append(f"next: {status['next_step']}")
+    if status.get("power_cycle_requested"):
+        parts.append(f"power cycle requested at {status.get('power_cycle_requested_at') or 'unknown time'}")
+    else:
+        parts.append("no power cycle requested")
+    return " [" + "; ".join(parts) + "]"
 
 
 def _hold_without_reset(cause: str, expected: int, log) -> None:

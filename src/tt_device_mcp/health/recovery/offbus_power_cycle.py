@@ -37,7 +37,7 @@ import signal
 import socket
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -450,6 +450,49 @@ def due_for_watchdog(episode: str, now: Optional[datetime] = None) -> bool:
         return True
     age = episode_age_sec(episode, now)
     return bool(_pending.get("gated")) and age is not None and age >= grace_sec()
+
+
+def watchdog_due_at(episode: str) -> Optional[tuple]:
+    """``(when, what)`` for the next bound at which :func:`due_for_watchdog` turns true for this
+    episode, or None when none is pending. For /health: the hold says when its next step runs."""
+    if not episode or _pending.get("episode") != episode or _pending.get("spawned"):
+        return None
+    if power_cycle_argv() is None:
+        h = _pending.get("handoff")
+        if not h or not h["deadline"]:
+            return None
+        return datetime.fromtimestamp(h["deadline"]), "the broker's reset ladder (operator hand-off bound)"
+    if not _pending.get("ladder_ran"):
+        return None
+    due = []
+    if _pending.get("ipmi_at") is not None:
+        due.append((_pending["ipmi_at"] + timedelta(seconds=ipmi_handoff_sec()), "power cycle (IPMI hand-off bound)"))
+    if _pending.get("tray_walk_at") is not None:
+        due.append(
+            (
+                _pending["tray_walk_at"] + timedelta(seconds=tray_walk_handoff_sec()),
+                "power cycle (tray walk hand-off bound)",
+            )
+        )
+    if _pending.get("gated"):
+        try:
+            due.append(
+                (datetime.fromisoformat(episode) + timedelta(seconds=grace_sec()), "power cycle (off-bus grace)")
+            )
+        except ValueError:
+            pass
+    return min(due, key=lambda d: d[0]) if due else None
+
+
+def power_cycle_requested(episode: str) -> Optional[dict]:
+    """This episode's power-cycle request from the on-disk attempt record (it survives the cycle), or
+    None when none was made."""
+    if not episode:
+        return None
+    for rec in load_state().get("attempts") or []:
+        if isinstance(rec, dict) and rec.get("episode") == episode:
+            return rec
+    return None
 
 
 def mark_spawned(episode: str) -> None:
