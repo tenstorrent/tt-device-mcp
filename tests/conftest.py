@@ -383,6 +383,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv.sampler, "short_count_strikes", 0, raising=False)
     monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None, raising=False)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+    # A link drop an eth test measured on the singleton would turn the next test's 77 hold into a fault.
+    monkeypatch.setattr(srv.health_monitor, "last_eth_link_drop", "", raising=False)
     monkeypatch.setattr(srv, "_fabric_ok_retire_monotonic", 0.0)
     monkeypatch.setattr(srv, "_fabric_ok_retire_streak", 0)
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRY_SLEEP_SEC", 0.0)  # no real eth-training wait in tests
@@ -443,6 +445,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # make the real fire a loud tripwire so a test that DOES reach it fails rather than issuing real
     # reset ioctls / ipmitool. A test exercising the tray-reset path re-patches _fire_ubb_reset itself.
     monkeypatch.delenv("TT_DEVICE_MCP_AUTO_UBB_RESET", raising=False)
+    # A developer shell that opted the single-tray walk back in must not change what the suite tests.
+    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
     # The two pins above plus a test's own AUTO_UBB_RESET=0 would read as an operator outage hold and
     # hold every mesh reset (spec 04 I28); arm it explicitly. A test of the hold deletes this.
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")
@@ -458,6 +462,7 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
     # A regressed tray walk disables the rung for the rest of the process: every test starts armed.
     monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+    monkeypatch.setattr(pcie_guard, "_LAST_TRAY_PULSE", None, raising=False)
 
     # The bounded off-bus hold (spec 04 I27) runs a host-supplied power-cycle command: unset here, a
     # loud tripwire if reached anyway, and its per-process episode tracking starts empty per test.

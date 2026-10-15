@@ -662,7 +662,8 @@ job boundary.
   (a shortfall holds without running anything), enum+ARC read healthy, and the fabric pass returns an
   explicit healthy verdict. A 77 (`ok` None) or a failure holds. This applies to the `off_bus` self-heal
   relift (I21) and to a DOWN episode whose `why` is `off_bus` or `heartbeat`: DOWN is the terminal
-  rung, but once every expected device node is back and no chip's ARC heartbeat reads all-ones, the
+  rung, but once every expected device node is back, no chip's ARC heartbeat reads all-ones and none
+  is ARC-not-ready (04 I24: the gate would only fail on it, so the re-check holds without running it), the
   idle tick re-checks it on the relift pacing (`SELFHEAL_RELIFT_INTERVAL_SEC`) under the device-op
   lock. That re-check never resets. It lifts only on a passing gate, and only if the episode
   (`since`, `why`, `detail`, `dirty`) is unchanged after it, so a chip that drops mid-verify keeps it
@@ -670,6 +671,16 @@ job boundary.
   rule: a per-user daemon (`should_privsep()` false) has no staged fabric validator, so no pass of
   its could read True. There the `off_bus` hold its start pass places (I4) lifts on the enum+ARC
   re-read, and the DOWN re-check is not armed.
+- **I53 — A 77 with eth links measured down is a fault, not a missing verdict.** The validator
+  cannot build a mesh with links missing and exits 77 instead of failing them. So when the last eth
+  read measured fewer up links than the host's high-water mark, the fabric-unverified hold is not a
+  77-only hold (I34) and not a no-reset hold: the idle relift sends it to the present-mesh rung (a
+  galaxy reset, then the full post-reset check, fabric included) on its first pass instead of
+  re-running the pass on the I48 backoff up to the I40 bound, and the hold deadline may escalate it.
+  Only a passing post-reset fabric verdict releases the device; a 77 or a failure keeps it held. A
+  read back at the mark clears the drop. Not for a known cable fault (a 78, I46/I47), a topology
+  mismatch or fault, or a missing prerequisite (the hugepages, at startup too, or the validator):
+  no reset fixes those, so they keep their no-reset hold. With every link up, a 77 keeps I48/I40.
 
 ## Interfaces
 
@@ -702,6 +713,14 @@ subsystem through the root:
 - `/health` (REST, `server._health_payload`) — `status: ok|degraded` (degraded exactly while the
   device is HELD: degraded, refused to tenants, no recovery op running), `fsm_state`, `fsm_why`,
   `held`/`held_since`/`held_reason`/`held_age_sec`, `device_degraded`, queue counts, version.
+  `held_reason` and `fsm_why` keep the reason the hold opened with; the live fields say where it
+  stands now, read fresh from sysfs on every call with no device touch: `isolated_chips` (always),
+  and where the heartbeat detector and a chip baseline exist, `off_bus` (chips off the PCIe bus now,
+  the count the rungs use), `arc_not_ready` (on the bus, heartbeat ENODATA on a bound endpoint, 04
+  I24) and `expected_chips`. A chip that is back on the bus leaves `isolated_chips` right after the
+  reset, tray re-power or PCI rescan that brought it back (the reset mechanism's rescan, each tray
+  walk step, the tray-down prelude rescan, the isolated-chip rescan), whatever the verify after it
+  says. Dropping it never releases the device or clears a hold: only the full gate does (I52).
 
 **Test monkeypatch seams.** The module globals `server.health_monitor`,
 `server.recovery_mechanism`, `server.galaxy_recovery`, `server.per_target_recovery`,
@@ -1215,7 +1234,8 @@ refuses.
 | I49 | `tests/test_boot_fabric_reverify.py::test_a_carried_down_fabric_hold_reopens_on_a_startup_77`, `tests/test_boot_fabric_reverify.py::test_the_reopened_hold_lifts_on_a_healthy_relift`, `tests/test_boot_fabric_reverify.py::test_a_reopened_hold_that_77s_again_is_held_without_a_reset_then_bounded`, `tests/test_boot_fabric_reverify.py::test_a_reopened_known_fabric_fault_is_held_without_a_climb`, `tests/test_boot_fabric_reverify.py::test_a_same_boot_down_is_not_reopened`, `tests/test_boot_fabric_reverify.py::test_a_carried_down_with_a_finding_is_not_reopened`, `tests/test_boot_fabric_reverify.py::test_reopen_after_boot_is_one_shot_and_needs_a_known_other_boot` |
 | I50 | `tests/test_fabric_check_interrupted.py::test_a_check_in_flight_is_marked_and_cleared`, `tests/test_fabric_check_interrupted.py::test_a_mark_left_by_a_stopped_broker_is_journaled_once_at_startup`, `tests/test_fabric_check_interrupted.py::test_an_unreadable_mark_is_still_journaled`, `tests/test_fabric_check_interrupted.py::test_a_cancelled_check_is_journaled_at_once`, `tests/test_fabric_check_interrupted.py::test_startup_journals_the_interruption_before_anything_else` |
 | I51 | `tests/test_sd_notify_main_pid.py::test_the_main_pid_notifies`, `tests/test_sd_notify_main_pid.py::test_a_non_main_pid_is_refused_and_said_once`, `tests/test_sd_notify_main_pid.py::test_the_claim_keeps_the_socket_from_children` |
-| I52 | `tests/test_device_safety.py::test_idle_relift_lifts_an_off_bus_floor_hold_without_the_eth_reader`, `tests/test_device_safety.py::test_idle_relift_holds_an_off_bus_hold_until_the_fabric_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_lifts_once_every_chip_is_back_and_the_full_gate_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_stays_down_unless_the_fabric_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_runs_no_gate_until_every_chip_is_back`, `tests/test_device_safety.py::test_a_down_offbus_recheck_holds_when_a_chip_drops_mid_verify`, `tests/test_device_safety.py::test_a_down_offbus_recheck_is_paced`, `tests/test_device_safety.py::test_a_per_user_daemon_neither_arms_the_down_offbus_recheck_nor_gates_on_fabric`, `tests/test_readopt.py::test_a_failed_per_user_start_reopens_once_the_device_reads_healthy` |
+| I52 | `tests/test_device_safety.py::test_idle_relift_lifts_an_off_bus_floor_hold_without_the_eth_reader`, `tests/test_device_safety.py::test_idle_relift_holds_an_off_bus_hold_until_the_fabric_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_lifts_once_every_chip_is_back_and_the_full_gate_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_stays_down_unless_the_fabric_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_runs_no_gate_until_every_chip_is_back`, `tests/test_device_safety.py::test_a_down_offbus_recheck_holds_when_a_chip_drops_mid_verify`, `tests/test_device_safety.py::test_a_down_offbus_recheck_is_paced`, `tests/test_arc_not_ready.py::test_a_down_offbus_recheck_holds_on_arc_not_ready_chips_without_the_gate`, `tests/test_device_safety.py::test_a_per_user_daemon_neither_arms_the_down_offbus_recheck_nor_gates_on_fabric`, `tests/test_readopt.py::test_a_failed_per_user_start_reopens_once_the_device_reads_healthy` |
+| I53 | `tests/test_startup_fabric_hugepages.py::test_the_eth_read_records_a_measured_link_drop`, `tests/test_startup_fabric_hugepages.py::test_a_77_with_eth_links_down_escalates_on_the_first_relift`, `tests/test_startup_fabric_hugepages.py::test_a_77_with_eth_links_down_is_forced_past_the_hold_deadline`, `tests/test_startup_fabric_hugepages.py::test_a_77_with_eth_links_full_keeps_the_backoff`, `tests/test_startup_fabric_hugepages.py::test_a_78_cable_fault_with_eth_links_down_holds_without_a_reset`, `tests/test_startup_fabric_hugepages.py::test_a_77_eth_drop_reset_releases_only_on_a_passing_full_check`, `tests/test_startup_fabric_hugepages.py::test_a_startup_hugepages_hold_with_links_measured_down_stays_77_only` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |
@@ -1224,7 +1244,7 @@ refuses.
 | Heartbeat probe contract | `tests/test_device_safety.py::test_heartbeat_healthy_when_all_chips_advance`, `tests/test_device_safety.py::test_heartbeat_unhealthy_when_a_chip_arc_is_frozen`, `tests/test_device_safety.py::test_heartbeat_unhealthy_when_chips_drop_off_the_bus`, `tests/test_device_safety.py::test_heartbeat_healthy_when_more_chips_than_a_stale_expected`, `tests/test_device_safety.py::test_heartbeat_probe_touches_no_device`, `tests/test_device_safety.py::test_a_chip_dropping_off_the_bus_mid_probe_is_not_read_as_healthy` |
 | Probe pass carries phase | `tests/test_monitor.py::test_update_logs_and_sets_device_op_detail_per_probe`, `tests/test_device_safety.py::test_verify_device_adapter_forwards_the_callers_real_phase`, `tests/test_health_core.py::test_healthstate_from_evidence_carries_the_callers_real_phase` |
 | Deps seam | `tests/test_monitor.py::test_update_routes_heartbeat_through_the_injected_deps`, `tests/test_monitor.py::test_update_derives_present_from_dev_enumeration_not_heartbeat`, `tests/test_monitor.py::test_update_accepts_caller_supplied_indices_and_expected` |
-| Hold surface (/health, rows) | `tests/test_device_safety.py::test_health_payload_reports_a_held_device_as_degraded`, `tests/test_device_safety.py::test_health_payload_reads_ok_on_a_fit_device`, `tests/test_device_safety.py::test_hold_state_latches_a_held_device_and_clears_when_fit`, `tests/test_device_safety.py::test_hold_state_suppressed_while_a_broker_op_runs`, `tests/test_device_safety.py::test_tenant_gate_writes_one_held_and_one_released_per_episode` |
+| Hold surface (/health, rows) | `tests/test_arc_not_ready.py::test_health_reports_arc_not_ready_chips_as_on_the_bus_and_degraded`, `tests/test_arc_not_ready.py::test_drop_returned_isolated_takes_back_chips_out`, `tests/test_arc_not_ready.py::test_a_tray_re_power_drops_a_returned_chip_even_when_the_verify_fails`, `tests/test_arc_not_ready.py::test_a_reset_drops_a_returned_chip_after_its_rescan`, `tests/test_arc_not_ready.py::test_dropping_a_returned_chip_never_clears_the_hold`, `tests/test_device_safety.py::test_health_payload_reports_a_held_device_as_degraded`, `tests/test_device_safety.py::test_health_payload_reads_ok_on_a_fit_device`, `tests/test_device_safety.py::test_hold_state_latches_a_held_device_and_clears_when_fit`, `tests/test_device_safety.py::test_hold_state_suppressed_while_a_broker_op_runs`, `tests/test_device_safety.py::test_tenant_gate_writes_one_held_and_one_released_per_episode` |
 | Startup health report | `tests/test_device_safety.py::test_startup_records_what_came_back_after_a_reboot`, `tests/test_device_safety.py::test_a_failing_startup_probe_never_blocks_the_broker_coming_up` |
 | Sampler idle coverage | `tests/test_device_safety.py::test_an_idle_all_gone_drop_is_confirmed_by_the_sampler_and_put_on_the_timeline`, `tests/test_device_safety.py::test_an_all_gone_drop_on_a_held_not_dirty_box_still_journals_and_goes_dirty`, `tests/test_device_safety.py::test_an_all_chips_blackout_needs_two_samples_before_it_dirties_the_device`, `tests/test_device_safety.py::test_sampler_drives_the_idle_hold_ledger` |
 | Eth/fabric exit-code contract | `tests/test_eth_probe.py::test_exit_laundering[0-True]`, `tests/test_eth_probe.py::test_exit_laundering[3-False]`, `tests/test_eth_probe.py::test_exit_laundering[77-None]`, `tests/test_eth_probe.py::test_hung_read_is_skipped_not_frozen`, `tests/test_fabric_probe.py::test_fabric_classification[0-all links healthy-True]`, `tests/test_fabric_probe.py::test_fabric_classification[None-partial output before hang-False]` |

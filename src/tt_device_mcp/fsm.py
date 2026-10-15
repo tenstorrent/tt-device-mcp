@@ -235,6 +235,7 @@ class ServerFsm:
             begin_action_row=deps.begin_action_row,
             write_action_log=deps.write_action_log,
             device_hold_episode_since=deps.device_hold_episode_since,
+            isolated_chips=getattr(deps, "isolated_chips", None),
         )
         monitor = HealthMonitor(deps)
         if deps.board_types_provider is None:

@@ -266,8 +266,8 @@ def test_a_sibling_chip_already_all_ones_or_on_the_tray_is_not_touched(sysfs, mo
 
 
 def test_a_disabled_tray_walk_leaves_the_envelope_armed(sysfs, monkeypatch):
-    """Disabling (a walk regressed) declines only the verify-between walk: the envelope still fires for
-    the back-to-back sweep, whose refused tray fire would hold the host rung forever (I22). The
+    """Disabling (a tray re-power regressed) is a ladder decision: the envelope itself never refuses a
+    tray fire on it, since a refused fire inside the sweep would hold the host rung forever (I22). The
     ubb_tray_rung_disabled event is left once, however often it is disabled."""
     events, fired = [], []
     monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
@@ -279,6 +279,47 @@ def test_a_disabled_tray_walk_leaves_the_envelope_armed(sysfs, monkeypatch):
     pcie_guard.safe_tray_repower(0b1000, [3], lambda: fired.append(1), lambda m: None, sleep=lambda s: None)
     assert fired == [1]
     assert "tray_repower_refused" not in dict(events)
+
+
+def test_a_disabled_tray_rung_survives_a_broker_restart_on_the_same_boot(sysfs, monkeypatch):
+    """The record goes to the health dir with the boot id: a new broker process on the same boot
+    (in-memory state gone) still declines the tray rung."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    _boot(sysfs, "boot-a")
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5", "13"], signature="position5")
+    rec = json.loads((pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE).read_text())
+    assert rec["boot_id"] == "boot-a" and rec["why"]["tray"] == [3]
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)  # a broker restart
+    assert pcie_guard.tray_rung_disabled() == {"tray": [3], "new_off": ["5", "13"], "signature": "position5"}
+    assert "ubb_tray_rung_disabled_restored" in [n for n, _ in events]
+    pcie_guard.disable_tray_rung(tray=[1], new_off=["21"])
+    assert [n for n, _ in events].count("ubb_tray_rung_disabled") == 1, "restored: not latched again"
+
+
+def test_a_new_boot_re_arms_the_tray_rung(sysfs, monkeypatch):
+    """A record from another boot never counts: it is removed and the rung is armed again."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    _boot(sysfs, "boot-a")
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
+    path = pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+    _boot(sysfs, "boot-b")
+    assert pcie_guard.tray_rung_disabled() is None
+    assert not path.exists()
+    assert "ubb_tray_rung_rearmed" in [n for n, _ in events]
+
+
+def test_an_unreadable_boot_id_keeps_the_tray_rung_record(sysfs, monkeypatch):
+    """With this boot's id unreadable a record cannot be shown stale, so it counts (as the host-hang
+    latch does); the hold it routes to is the bounded I27 hand-off."""
+    monkeypatch.setattr(pcie_guard, "health_event", lambda *a, **k: None)
+    _boot(sysfs, "boot-a")
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+    (sysfs / "proc/sys/kernel/random/boot_id").unlink()
+    assert pcie_guard.tray_rung_disabled() == {"tray": [3], "new_off": ["5"]}
 
 
 def test_a_port_that_keeps_erroring_stays_masked_and_marks_a_flood(sysfs, monkeypatch):
@@ -826,6 +867,7 @@ async def test_the_between_jobs_check_lifts_the_latch_once_the_mesh_is_back(sysf
 @pytest.mark.asyncio
 async def test_a_tray_re_power_carries_an_intent_and_ends_it(monkeypatch, clear_job_state, galaxy_trays):
     """The walk writes the intent before it fires and removes it once its verify is over."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-a")
     patch_health_event(monkeypatch, lambda *a, **k: None)
     intent = pcie_guard.health_dir() / pcie_guard.INTENT_FILE

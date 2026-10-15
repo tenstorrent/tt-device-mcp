@@ -117,6 +117,7 @@ from tt_device_mcp.health import (
     _ubb_reset_enabled,
     aer_totals,
     append_trace,
+    arc_not_ready_chips,
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
     capture_incident,
@@ -137,6 +138,7 @@ from tt_device_mcp.health import (
     journal_interrupted_fabric_check,
     mark_boot,
     mesh_hold_repage_sec,
+    offbus_count,
     offbus_power_cycle,
     pcie_guard_at_start,
     previous_boot_bus_locks,
@@ -970,6 +972,7 @@ device_hold_job_bound_escalated: bool = False
 # names: the off-bus one-shot or a ceiling window. Set by _check_hold_deadline right before each
 # spawn so the escalation reports the clock that actually fired rather than the general ceiling.
 device_hold_escalation_trigger: str = ""
+device_hold_escalation_kind: str = ""  # machine-readable twin of the trigger text, for the event
 _forced_escalation_task: "Optional[asyncio.Task]" = None
 # Jobs a reset SIGKILLed to take the device. Their deaths are ours, not the mesh's: a reset
 # kills the running job, the job dies mid-CCL, and that death then reads as evidence the
@@ -3374,7 +3377,9 @@ def _fabric_77_only_hold() -> bool:
     is a missing prerequisite, such as hugepages not yet allocated at boot, not a device fault),
     and a galaxy reset on unverifiable fabric is the measured all-chip drop. So this hold is
     never escalated to a reset by the idle relift, the deadline escalation or the watchdog; the
-    idle relift re-runs the fabric pass instead, and a real verdict decides."""
+    idle relift re-runs the fabric pass instead, and a real verdict decides.
+
+    Not when the last eth read measured links down (see _fabric_77_eth_drop): that is a fault."""
     return (
         fsm.state is ServerState.RECOVERING
         and fsm.record.why == FABRIC_RELIFT_WHY
@@ -3382,7 +3387,30 @@ def _fabric_77_only_hold() -> bool:
         and not device_fault_reported
         and not isolated_chips
         and health_monitor.last_fabric_ok is not False
+        and not _fabric_77_eth_drop()
     )
+
+
+def _fabric_77_eth_drop() -> str:
+    """The eth link-count drop that makes a fabric 77 a fault, or "".
+
+    The validator cannot build a mesh with links missing and exits 77 instead of failing them, so a
+    77 on links the eth read measured below the host's high-water mark is a down link, which the
+    present-mesh rung (a galaxy reset, then the full post-reset check) can fix; waiting out the 77
+    bound only delays it. Not for a known cable fault (a 78), a topology mismatch or fault, or a
+    missing prerequisite (hugepages, the validator): no reset fixes those."""
+    drop = health_monitor.last_eth_link_drop if health_monitor is not None else ""
+    if not drop or health_monitor.known_fabric_fault() or health_monitor.topology_hw_fault:
+        return ""
+    if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
+        return ""
+    if _TOPOLOGY_VALIDATOR_LINE in (health_monitor.last_fabric_output or ""):
+        return ""
+    if _last_77_was_hugepages() or fabric.validator_missing() is not None:
+        return ""
+    if "hugepages not yet allocated" in str(fsm.record.detail or ""):  # the startup pass's hugepages hold
+        return ""
+    return drop
 
 
 # The episode (its ``since``) of a 77-only hold that owes the startup fabric pass it never got: the
@@ -3540,7 +3568,12 @@ def _fabric_no_reset_hold() -> str:
         return "topology mismatch"
     if fabric_hold and _TOPOLOGY_VALIDATOR_LINE in (health_monitor.last_fabric_output or ""):
         return "topology mismatch"
-    if fabric_hold and not device_fault_reported and health_monitor.last_fabric_ok is not False:
+    if (
+        fabric_hold
+        and not device_fault_reported
+        and health_monitor.last_fabric_ok is not False
+        and not _fabric_77_eth_drop()
+    ):
         return "fabric check could not run (77)"
     return ""
 
@@ -3809,6 +3842,9 @@ async def _attempt_idle_relift() -> None:
                 # and pay a reset (spec 03 I43). Only a verify that fails falls through to the ceiling.
                 if fsm.record.why == "foreign_holder" and await _foreign_holder_fast_verify(expected, _log):
                     return
+                drop = _fabric_77_eth_drop() if fsm.record.why == FABRIC_RELIFT_WHY else ""
+                if drop:
+                    _log(f"fabric 77 with eth links measured down ({drop}) — a fault: the present-mesh rung")
                 if await _escalate("present"):
                     return
                 _log(
@@ -4037,9 +4073,14 @@ async def _attempt_down_offbus_recheck() -> None:
             if heartbeat_supported():
                 # A chip still in sysfs but reading all-ones is still off the bus.
                 beats = await asyncio.to_thread(read_heartbeats)
-                off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+                not_ready = await asyncio.to_thread(arc_not_ready_chips, beats)
+                off_bus = _offbus_count(beats, expected, not_ready)
                 if off_bus > 0:
                     _log(f"DOWN off-bus hold: {off_bus}/{expected} chip(s) still off the bus — holding")
+                    return
+                if not_ready:
+                    # Back on the bus but its ARC is not up yet: the gate would fail on it, so wait.
+                    _log(f"DOWN off-bus hold: chip(s) {sorted(not_ready, key=int)} back but ARC not ready — holding")
                     return
             # ``dirty`` too: a dead-chip mark landing on a hold flips only that bit (fsm.on_fault).
             episode = (fsm.record.since, fsm.record.why, fsm.record.detail, fsm.record.dirty)
@@ -5320,7 +5361,7 @@ async def device_health_gate(
                 # touch. Route only chips whose own PCIe node is actually absent; the rest fall to
                 # the hold below.
                 gone = [c for c in gone if not await asyncio.to_thread(chip_node_present, device_pci_map[c])]
-                off_bus_gone = len(dead_chips(beats_b)) + max(0, expected - len(beats_b))
+                off_bus_gone = _offbus_count(beats_b, expected)
                 floor_gone = _galaxy_reset_min_dead_chips(expected)
                 if gone and floor_gone is not None and off_bus_gone < floor_gone:
                     _log(
@@ -5349,7 +5390,7 @@ async def device_health_gate(
         # into DEFER: skip the surgical rung and the floor, adopt that reset and verify its result.
         ev = replace(
             ev,
-            off_bus=len(dead_chips(beats)) + max(0, expected - len(beats)),
+            off_bus=_offbus_count(beats, expected),
             sbr_candidates=len(isolated_chips),
             scope_active=bool(await asyncio.to_thread(recovery_mechanism.scope_active)),
         )
@@ -5400,7 +5441,7 @@ async def device_health_gate(
             beats = await asyncio.to_thread(read_heartbeats)
             ev = replace(
                 ev,
-                off_bus=len(dead_chips(beats)) + max(0, expected - len(beats)),
+                off_bus=_offbus_count(beats, expected),
                 last_action=STAGE_BRIDGE_RESET,
                 last_action_recovered=False,
                 # Carry the per-chip SBR window this rung just read into the evidence the tray stage
@@ -5493,7 +5534,7 @@ async def device_health_gate(
         # after it, because both are live IO a pure decision must not do. Any of them absent and the
         # device stays flagged exactly as before.
         beats_now = await asyncio.to_thread(read_heartbeats)
-        off_bus = len(dead_chips(beats_now)) + max(0, expected - len(beats_now))
+        off_bus = _offbus_count(beats_now, expected)
         reboot_floor = _reboot_min_dead_chips(expected)
         # A reset that timed out is deliberately left cycling in its own scope for the next gate to
         # adopt and verify, and a reset takes every chip off the bus — so the count above reads
@@ -5695,8 +5736,38 @@ def _device_liveness_reason() -> str:
     # Off with the health checks (TT_DEVICE_MCP_HEALTH_CHECK=0, I25), like the recheck and the gate.
     expected = health_monitor.expected(0) if health_monitor and health_monitor._health_check_enabled() else 0
     if expected > 0 and len(beats) < expected:
+        not_ready = arc_not_ready_chips(beats)
+        if not_ready:
+            return (
+                f"chip(s) [{','.join(sorted(not_ready, key=int))}] on the bus but ARC not ready, "
+                f"{_offbus_count(beats, expected, not_ready)} of {expected} off the PCIe bus"
+            )
         return f"{len(beats)} of {expected} chips in sysfs (chips dropped off the PCIe bus)"
     return ""
+
+
+def _offbus_count(beats: dict, expected: int, not_ready: Optional[set] = None) -> int:
+    """``offbus_count`` with this module's ``dead_chips``: the one off-bus count every rung here uses."""
+    return offbus_count(beats, expected, not_ready, dead=dead_chips(beats))
+
+
+def _live_offbus_state() -> dict:
+    """The live off-bus picture for /health, read fresh from sysfs on every call (no device touch):
+    ``off_bus`` (chips off the PCIe bus now), ``arc_not_ready`` (on the bus, heartbeat ENODATA) and
+    ``isolated_chips``. ``held_reason``/``fsm_why`` keep the reason the hold OPENED with; these say
+    where it stands now. Empty where the heartbeat detector is absent or no baseline is known."""
+    out: dict = {"isolated_chips": sorted(isolated_chips, key=int)}
+    if not heartbeat_supported():
+        return out
+    expected = health_monitor.expected(0) if health_monitor and health_monitor._health_check_enabled() else 0
+    if expected <= 0:
+        return out
+    beats = read_heartbeats()
+    not_ready = arc_not_ready_chips(beats)
+    out["off_bus"] = _offbus_count(beats, expected, not_ready)
+    out["arc_not_ready"] = sorted(not_ready, key=int)
+    out["expected_chips"] = expected
+    return out
 
 
 def _device_degraded_for_tenant() -> str:
@@ -5755,6 +5826,7 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         "fsm_state": fsm.state.value,
         "fsm_why": fsm.record.why,
     }
+    payload.update(_live_offbus_state())
     # Whether the running job is doing device work (spec 03 I53); absent while no job runs.
     for j in jobs.values():
         view = job_activity_view(j.id) if j.status == JobStatus.RUNNING else None
@@ -5916,7 +5988,7 @@ async def _force_escalate_stuck_hold() -> None:
         if expected <= 0:
             return
         beats = await asyncio.to_thread(read_heartbeats)
-        off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+        off_bus = _offbus_count(beats, expected)
         no_reset = "" if off_bus or isolated_chips else _fabric_no_reset_hold()
         if no_reset:
             # Every chip enumerates with a live ARC heartbeat and the hold names only the fabric: a 77
@@ -5930,6 +6002,14 @@ async def _force_escalate_stuck_hold() -> None:
             expected=expected,
             held_since=device_hold_episode_since,
             host_at_risk=True,
+            trigger=device_hold_escalation_kind or "ceiling_window",
+            window_sec=int(
+                _offbus_hold_ceiling_sec()
+                if device_hold_escalation_kind == "offbus_one_shot"
+                else _stuck_hold_ceiling_sec()
+            ),
+            ceiling_sec=int(_stuck_hold_ceiling_sec()),
+            deadline_sec=int(_hold_deadline_sec()),
         )
         held_age = 0.0
         if device_hold_episode_since:
@@ -6020,7 +6100,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     the episode clock (``device_hold_episode_since``) the escalation and the held/released pair already
     use; a missing or unparseable stamp is not held, so it is not flagged."""
     global device_hold_deadline_bucket, device_hold_escalate_bucket, device_hold_offbus_escalated
-    global device_hold_risky_escalated, device_hold_escalation_trigger
+    global device_hold_risky_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
     if not device_hold_episode_since:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
@@ -6051,18 +6131,25 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     only_77 = _fabric_77_only_hold()
     # A gated off-bus hold (spec 04 I27) gets one forced pass the moment its grace runs out, so the
     # bounded power cycle fires at the grace and not at the next ceiling window; so does a hold whose
-    # tray re-power the BMC's IPMI failed, at its hand-off bound.
+    # tray re-power the BMC's IPMI failed, or whose tray walk did not recover, at its hand-off bound.
     if not only_77 and offbus_power_cycle.due_for_watchdog(device_hold_episode_since, now):
-        device_hold_escalation_trigger = (
-            f"the {offbus_power_cycle.ipmi_handoff_sec()}s BMC IPMI hand-off bound"
-            if offbus_power_cycle.ipmi_unavailable_age_sec(device_hold_episode_since, now) is not None
-            else f"the {offbus_power_cycle.grace_sec()}s gated off-bus grace"
-        )
+        if offbus_power_cycle.ipmi_unavailable_age_sec(device_hold_episode_since, now) is not None:
+            device_hold_escalation_kind = "ipmi_handoff_bound"
+            device_hold_escalation_trigger = f"the {offbus_power_cycle.ipmi_handoff_sec()}s BMC IPMI hand-off bound"
+        elif offbus_power_cycle.tray_walk_failed_age_sec(device_hold_episode_since, now) is not None:
+            device_hold_escalation_kind = "tray_walk_handoff_bound"
+            device_hold_escalation_trigger = (
+                f"the {offbus_power_cycle.tray_walk_handoff_sec()}s failed tray walk hand-off bound"
+            )
+        else:
+            device_hold_escalation_kind = "gated_offbus_grace"
+            device_hold_escalation_trigger = f"the {offbus_power_cycle.grace_sec()}s gated off-bus grace"
         if _maybe_spawn_forced_escalation():
             offbus_power_cycle.mark_spawned(device_hold_episode_since)
     if only_77:
         pass
     elif isolated_chips and not device_hold_offbus_escalated and age >= _offbus_hold_ceiling_sec():
+        device_hold_escalation_kind = "offbus_one_shot"
         device_hold_escalation_trigger = f"the {int(_offbus_hold_ceiling_sec())}s off-bus one-shot"
         if _maybe_spawn_forced_escalation():
             device_hold_offbus_escalated = True
@@ -6072,6 +6159,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         # the one forced run past the early off-bus one-shot.
         ebucket = int(age // ceiling)
         if ebucket >= 1 and ebucket > device_hold_escalate_bucket:
+            device_hold_escalation_kind = "ceiling_window"
             device_hold_escalation_trigger = f"the {int(ceiling)}s ceiling (window {ebucket})"
             if _maybe_spawn_forced_escalation():
                 device_hold_escalate_bucket = ebucket
@@ -6605,7 +6693,7 @@ def _escalate_held_job_past_bound(job: "Job", held_sec: float, bound: float, rea
     watchdog drives), once per episode and only if no forced run has happened in it yet — a further
     forced run on top of one already spent would climb the ladder (warm reboot, BMC cycle) on a
     short clock. Returns what was done, for the job's error and log. Never raises."""
-    global device_hold_job_bound_escalated, device_hold_escalation_trigger
+    global device_hold_job_bound_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
     try:
         health_event(
             "tenant_hold_bound_exceeded",
@@ -6621,6 +6709,7 @@ def _escalate_held_job_past_bound(job: "Job", held_sec: float, bound: float, rea
             return "a forced recovery escalation is already running"
         if not _force_escalate_enabled():
             return "forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0); the device stays held"
+        device_hold_escalation_kind = "tenant_hold_bound"
         device_hold_escalation_trigger = f"the {int(bound)}s tenant-hold bound (job {job.id})"
         if _maybe_spawn_forced_escalation():
             device_hold_job_bound_escalated = True
@@ -9040,7 +9129,7 @@ async def _record_startup_health() -> None:
                 # the boot's first broker start: the ledger's reboot stays adjacent to the boot for
                 # its whole life, and a restart days later that finds a fresh degradation is not that
                 # reboot's verdict. It stays held for the forced startup gate and its ladder.
-                off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+                off_bus = _offbus_count(beats, expected)
 
                 def _log(msg: str) -> None:
                     if logger:
