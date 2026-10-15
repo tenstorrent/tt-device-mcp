@@ -134,6 +134,7 @@ from tt_device_mcp.health import (
     heartbeat_supported,
     heartbeat_verdict,
     isolate_chip,
+    journal_interrupted_fabric_check,
     mark_boot,
     mesh_hold_repage_sec,
     offbus_power_cycle,
@@ -3904,6 +3905,16 @@ async def _attempt_idle_relift() -> None:
                             "UNHEALTHY — holding; the door reopens only on a healthy fabric pass"
                         )
                         return
+                    # The chip is back, the eth reader is not frozen and the last verdict was not a
+                    # failure: none of that is the gate. A chip that left the bus came back through a
+                    # reset of some kind (its own, a tray's, the driver's), so the lift waits for the
+                    # full health gate, fabric included, exactly as after any reset (spec 03 I52).
+                    # A per-user daemon has no staged fabric validator, so no pass of its could ever
+                    # read True; its start-probe hold (also off_bus) lifts on the enum+ARC re-read.
+                    if should_privsep():
+                        gate_ok, evidence = await _offbus_return_full_gate(expected, _log)
+                        if not gate_ok:
+                            return
             # Re-assert under the lock AFTER the long awaits above: the sampler's dead-chip path is
             # lock-free (_isolate_dead_chips marks the device dirty without _device_op), so a chip can
             # have dropped during _verify_device or the eth read, re-raising dirty after the guard at
@@ -3925,6 +3936,93 @@ async def _attempt_idle_relift() -> None:
             _clear_device_dirty(verified=True, why="idle relift: verified healthy")
     except Exception:  # noqa: BLE001 - a detached relift task must never raise unretrieved
         _log("pass aborted on an unexpected error — holding; the sampler retries next window")
+
+
+# Why classes a chip leaving the bus puts on the device: the gate's off-bus hold, and the sampler's
+# dead-chip mark (_isolate_dead_chips). Both are re-checked once every chip is back (spec 03 I52).
+OFFBUS_RECHECK_WHYS = frozenset({"off_bus", "heartbeat"})
+# Monotonic time of the last DOWN off-bus re-check; paced like the relift (SELFHEAL_RELIFT_INTERVAL_SEC).
+_down_offbus_recheck_monotonic: float = 0.0
+
+
+async def _offbus_return_full_gate(expected: int, log: Callable[[str], None]) -> tuple[bool, dict]:
+    """The full health gate, fabric included, for a mesh whose dropped chips are back (spec 03 I52).
+    ``(True, evidence)`` only when enum+ARC pass AND the fabric pass returns an explicit healthy
+    verdict: a 77 (``ok`` None) or a failure holds. A pass before the 1G hugepages exist can only 77,
+    so it waits for the count first and holds without running."""
+    short = await asyncio.to_thread(_hugepages_shortfall)
+    if short is not None:
+        log(f"full gate waits: hugepages not yet allocated: {short[0]}/{short[1]} — holding")
+        return False, {}
+    healthy, evidence = await fsm.observe(expected, log, run_fabric=True, recovery=galaxy_recovery)
+    fabric_ok = (evidence.get("fabric") or {}).get("ok")
+    if not healthy or fabric_ok is not True:
+        log(
+            f"every chip back on the bus but the full gate did not pass (healthy={healthy}, "
+            f"fabric={fabric_ok!r}) — holding; the door never reopens onto unverified fabric"
+        )
+        return False, evidence
+    return True, evidence
+
+
+def _down_offbus_recheck_armed() -> bool:
+    """A DOWN episode placed for a chip off the bus, with every expected device node back. DOWN is
+    the terminal rung and runs no further reset, but chips that came back (a tray re-powered by an
+    operator, a driver rescan) leave nothing for it to wait on: the full gate decides (spec 03 I52)."""
+    if fsm.state is not ServerState.DOWN or fsm.record.why not in OFFBUS_RECHECK_WHYS:
+        return False
+    if not should_privsep():
+        return False  # a per-user daemon has no fabric validator: its full gate could never pass
+    indices = _present_chip_indices()
+    return bool(indices) and len(indices) >= health_monitor.expected(len(indices))
+
+
+async def _attempt_down_offbus_recheck() -> None:
+    """Re-run the full health gate, fabric included, on a DOWN off-bus episode once every chip is back
+    on the bus, and lift it only when that gate passes. It never resets: a failed or unverifiable
+    gate leaves the episode DOWN and held, and the next idle tick re-checks on the relift's pacing."""
+    global _down_offbus_recheck_monotonic
+    now = time.monotonic()
+    if _down_offbus_recheck_monotonic and (now - _down_offbus_recheck_monotonic) < SELFHEAL_RELIFT_INTERVAL_SEC:
+        return
+    _down_offbus_recheck_monotonic = now
+
+    def _log(msg: str) -> None:
+        if logger:
+            logger.info(f"IDLE-RELIFT {msg}")
+
+    try:
+        async with _device_op("idle-relift"):
+            if not _down_offbus_recheck_armed():
+                return
+            indices = _present_chip_indices()
+            expected = health_monitor.expected(len(indices))
+            if heartbeat_supported():
+                # A chip still in sysfs but reading all-ones is still off the bus.
+                beats = await asyncio.to_thread(read_heartbeats)
+                off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+                if off_bus > 0:
+                    _log(f"DOWN off-bus hold: {off_bus}/{expected} chip(s) still off the bus — holding")
+                    return
+            # ``dirty`` too: a dead-chip mark landing on a hold flips only that bit (fsm.on_fault).
+            episode = (fsm.record.since, fsm.record.why, fsm.record.detail, fsm.record.dirty)
+            _log(
+                f"every chip is back on the bus ({len(indices)}/{expected}) on a DOWN off-bus hold — "
+                "running the full health gate, fabric included"
+            )
+            ok, evidence = await _offbus_return_full_gate(expected, _log)
+            if not ok:
+                return
+            # Re-assert after the long awaits: the sampler's dead-chip mark is lock-free.
+            now_episode = (fsm.record.since, fsm.record.why, fsm.record.detail, fsm.record.dirty)
+            if fsm.state is not ServerState.DOWN or now_episode != episode:
+                _log("state changed mid-verify (a chip dropped, or a gate took over) — holding")
+                return
+            _log("mesh verified healthy, fabric included — DOWN off-bus hold lifted")
+            health_event("device_relift", evidence=evidence, from_state="down")
+            _clear_device_dirty(verified=True, why="idle relift: every chip back on the bus, full gate passed")
+    except Exception:  # noqa: BLE001 - a detached task must never raise unretrieved
+        _log("DOWN off-bus re-check aborted on an unexpected error — holding; the next idle tick retries")
 
 
 async def _foreign_holder_fast_verify(expected: int, log: Callable[[str], None]) -> bool:
@@ -4027,6 +4125,10 @@ def _maybe_spawn_idle_relift() -> None:
     global _relift_task
     _maybe_spawn_eth_rearm()
     if _relift_task is not None and not _relift_task.done():
+        return
+    if _down_offbus_recheck_armed():
+        if not device_op_active:
+            _relift_task = asyncio.create_task(_attempt_down_offbus_recheck())
         return
     selfheal, fabric, generic = _idle_relift_armed()
     if not ((selfheal or fabric or generic) and not device_op_active):
@@ -9245,6 +9347,10 @@ async def run_startup_tasks() -> None:
     if _startup_tasks_done:
         return
     _startup_tasks_done = True
+    # A fabric check the last broker had in flight was cut off by its stop: journal it, once.
+    interrupted = journal_interrupted_fabric_check()
+    if interrupted and logger:
+        logger.warning(f"STARTUP the previous broker stopped mid fabric check: {interrupted}")
     if not should_privsep():
         # No re-adoption sequence for a per-user daemon or a test harness, and — matching that
         # same narrower scope — no forced fabric verify either: this shape has no validator to run
@@ -11209,12 +11315,34 @@ def build_asgi_app(mcp: MCPServer):
 # every WATCHDOG=1 ping, so an unbounded log would flood at the ping interval.
 _sd_notify_errors_logged: set = set()
 
+# The unit says NotifyAccess=main: systemd drops (and logs) a notification from any other pid.
+# The broker's own pid is fixed when it claims the socket at startup; _sd_notify_claim also takes
+# NOTIFY_SOCKET out of the environment so no job, fabric check or tool it spawns inherits it.
+_sd_notify_main_pid: int = os.getpid()
+_sd_notify_addr: str = ""
+
+
+def _sd_notify_claim() -> None:
+    """Called once by the broker process before it spawns anything: remember $NOTIFY_SOCKET and
+    this pid, then drop the variable so children cannot notify as if they were the broker."""
+    global _sd_notify_main_pid, _sd_notify_addr
+    _sd_notify_main_pid = os.getpid()
+    _sd_notify_addr = os.environ.pop("NOTIFY_SOCKET", "") or _sd_notify_addr
+
 
 def _sd_notify(state: str) -> None:
     """Send a notification to systemd via $NOTIFY_SOCKET. No-op when not run under
-    systemd Type=notify. Used for readiness and the watchdog heartbeat."""
-    addr = os.environ.get("NOTIFY_SOCKET")
+    systemd Type=notify. Used for readiness and the watchdog heartbeat. Only the broker's
+    main pid sends: a forked child is refused here, not by systemd's NotifyAccess=main."""
+    addr = os.environ.get("NOTIFY_SOCKET") or _sd_notify_addr
     if not addr:
+        return
+    if os.getpid() != _sd_notify_main_pid:
+        kind = state.split("=", 1)[0]
+        if f"pid:{kind}" not in _sd_notify_errors_logged:
+            _sd_notify_errors_logged.add(f"pid:{kind}")
+            if logger:
+                logger.warning(f"systemd notify {kind} refused from pid {os.getpid()}: only the main pid notifies")
         return
     if addr.startswith("@"):  # abstract namespace
         addr = "\0" + addr[1:]
@@ -11637,6 +11765,9 @@ def main():
 
     if args.no_http and not socket_path:
         parser.error("--no-http requires --socket (or TT_DEVICE_MCP_SOCKET)")
+
+    # Before the first spawn (the platform probe below): only this pid may notify systemd.
+    _sd_notify_claim()
 
     # The boot flow, before anything that reads the subsystem it builds: construct, then resolve
     # which platform this host IS. Preflight below reports capabilities per rung, and the rungs a
