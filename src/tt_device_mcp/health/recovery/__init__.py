@@ -26,8 +26,9 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import constants, metrics
-from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.device_holders import HolderScan, is_tenant
 from tt_device_mcp.health.evidence import health_event
+from tt_device_mcp.health.monitors.heartbeat import arc_not_ready_chips, offbus_count
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import pcie_guard
 from tt_device_mcp.health.recovery.base import (
@@ -80,6 +81,11 @@ BRIDGE_RESET_SETTLE_SEC = 4
 # neither a recovery nor a failure, and the mesh is held fabric-unverified (spec 03 I34/I40 bound it).
 POST_RESET_FABRIC_RETRIES = int(os.environ.get("TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES", "1"))
 POST_RESET_FABRIC_RETRY_SLEEP_SEC = float(os.environ.get("TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC", "60"))
+# A mesh reset that exits non-zero with every chip back on the bus but some ARC not ready gets ONE more
+# reset, after this settle, on an idle box (:meth:`Recovery._arc_not_ready_retry_due`). Measured on a
+# 32-chip Galaxy: the first -glx_reset brought an off-bus chip back but left 31 chips ARC-not-ready and
+# exited 1; the hold re-observed that for 10 min, and the next -glx_reset recovered it at once.
+ARC_NOT_READY_RETRY_SETTLE_SEC = float(os.environ.get("TT_DEVICE_MCP_ARC_NOT_READY_RETRY_SETTLE_SEC", "5"))
 
 
 @dataclass(frozen=True)
@@ -613,7 +619,9 @@ class Recovery(ABC):
         will not revive it on an immediate retry, and every extra reset is another pass
         of MMIO at a dead endpoint — the exact traffic that promotes a PCIe error to
         fatal and takes the host down with it. One attempt, then back off and let the
-        caller report honestly. Returns True if the device verified healthy, None when the reset ran,
+        caller report honestly. The one exception is a reset that brought every chip back on the bus
+        but left ARC not ready: that is not a dead endpoint, and one more reset clears it
+        (:meth:`_arc_not_ready_retry_due`). Returns True if the device verified healthy, None when the reset ran,
         enum+ARC verify and only the fabric stayed unverifiable (a persistent 77: held fabric-unverified,
         the caller must not climb on it), False otherwise.
         """
@@ -623,7 +631,41 @@ class Recovery(ABC):
             # The reset and its verify are over and the host is still up: an off-bus intent is spent.
             pcie_guard.end_offbus_reset()
 
-    async def _reset_and_verify_device_once(self, indices: list, log) -> Optional[bool]:
+    async def _arc_not_ready_retry_due(self, argv: list, expected: int, log) -> bool:
+        """After a mesh reset that EXITED non-zero: is this the one shape a second reset clears, on a box
+        it may fire on? All of: a Galaxy ``-glx_reset`` on a multi-chip mesh; every expected chip on the
+        bus (none missing, none reading all-ones); at least one chip ARC-not-ready, still so after
+        ``ARC_NOT_READY_RETRY_SETTLE_SEC``; no running broker job and a complete holder scan with no
+        tenant. A chip still off the bus is the dead-endpoint case the no-repeat rule is for: never."""
+        if expected <= 1 or "-glx_reset" not in argv:
+            return False
+
+        def bus_back_arc_not_ready() -> list:
+            beats = self.deps.read_heartbeats()
+            not_ready = arc_not_ready_chips(beats)
+            if not not_ready or offbus_count(beats, expected, not_ready) or pcie_guard.chips_off_bus(expected):
+                return []
+            return sorted(not_ready, key=int)
+
+        if not await asyncio.to_thread(bus_back_arc_not_ready):
+            return False
+        await asyncio.sleep(ARC_NOT_READY_RETRY_SETTLE_SEC)
+        not_ready = await asyncio.to_thread(bus_back_arc_not_ready)
+        if not not_ready:
+            return False
+        if self.deps.job_running():
+            return False
+        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
+        if not scan.complete or any(is_tenant(h) for h in scan.holders):
+            return False
+        log(
+            f"all {expected} chips back on the bus but chip(s) {not_ready} ARC not ready after the reset — "
+            "one more reset on the idle device (not a dead endpoint)"
+        )
+        health_event("reset_arc_not_ready_retry", argv=argv, arc_not_ready=not_ready, expected_chips=expected)
+        return True
+
+    async def _reset_and_verify_device_once(self, indices: list, log, arc_retry: bool = True) -> Optional[bool]:
         # Reset per call: only a reset that actually EXITS non-zero this pass sets it below. An adopted
         # foreign scope or a clean-exit-but-unverified reset must not leave a stale hard-fail flag that
         # steers the next gate's escalation to the cold rung over a reset that never hard-failed.
@@ -696,6 +738,10 @@ class Recovery(ABC):
                 self.mechanism.last_reset_failed = True
                 self.mechanism.last_reset_exit_nonzero = True
             metrics.stage_fired("smi_reset", "timeout" if rc is None else "failed")
+            if rc is not None and arc_retry and await self._arc_not_ready_retry_due(argv, expected, log):
+                # The retry is this same gated path (host gate, outage hold, cooldown clock, full verify
+                # with the fabric), only once: a second failure returns False and the ladder climbs on.
+                return await self._reset_and_verify_device_once(indices, log, arc_retry=False)
             return False
 
         # rc == 0: the reset command itself completed, independent of whatever the verify below
