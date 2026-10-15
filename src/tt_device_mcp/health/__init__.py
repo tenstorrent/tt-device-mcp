@@ -96,6 +96,7 @@ from tt_device_mcp.health.recovery import (
     RecoveryDeps,
     _declared_reset_mode,
     _persistent_recovery,
+    host_rung_latch,
     offbus_power_cycle,
 )
 from tt_device_mcp.health.recovery import select_recovery as _select_recovery  # noqa: F401
@@ -223,4 +224,7 @@ __all__ = [
     "offbus_power_cycle",
     # the post-reset fabric debt (spec 04 I32): no reset releases until a fabric pass settles it
     "FABRIC_DEBT",
+    # a requested reboot or power cycle is taking the box down (spec 04 I34): the hold-deadline
+    # watchdog refuses to force the ladder while it is in flight
+    "host_rung_latch",
 ]
