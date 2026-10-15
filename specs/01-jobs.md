@@ -319,10 +319,11 @@ flowchart LR
   `[stderr]` prefixed) through a single line-buffered handle, and into bounded in-memory
   deques. Broker-side annotations use a `[broker]` prefix. Every line resets the silence
   clock; the clock starts at spawn so a job that never speaks is still measured.
-- `asyncio.wait_for(..., timeout=job.timeout_sec)` bounds the run. On expiry the job is
+- `aio.wait_for(..., timeout=job.timeout_sec)` bounds the run. On expiry the job is
   terminated via `_terminate_job` (scope-aware, I5) and becomes TIMEOUT, with
   `timeout_hint()` explaining the limit — actionable below the ceiling, non-negotiable at
-  it.
+  it. The runner then serves the next job: the timeout's own cancel of the stream readers'
+  gather is a timeout, never a broker shutdown.
 - The hung watchdog (I10) announces silence every `HUNG_NOTICE_SEC` (60 s) in the job's
   log, then reaps at `HUNG_SILENCE_SEC` as HUNG; the doomed reap fires first if the
   runtime declared the device unrecoverable. Both kill the process so the streams hit EOF
@@ -464,3 +465,4 @@ flowchart LR
 | B-Ids/`Job` basics | `tests/test_server.py::TestJob::test_job_status_values`, `tests/test_server.py::TestJob::test_runtime_sec_property`, `tests/test_server.py::TestJob::test_wait_sec_property` |
 | Re-adoption scope naming | `tests/test_readopt.py::test_scope_unit_roundtrip`, `tests/test_readopt.py::test_list_active_job_scopes_parses` |
 | B-Shutdown (a cancel that lands as a job ends still ends the runner) | `tests/test_aio.py::test_a_cancel_that_lands_as_the_inner_work_ends_is_not_dropped`, `tests/test_aio.py::test_cancel_also_cancels_the_inner_work`, `tests/test_aio.py::test_timeout_cancels_the_inner_work_and_raises_timeout` |
+| B-Timeout (a job past its timeout is killed and the runner goes on) | `tests/test_aio.py::test_a_timed_out_gather_raises_timeout_not_cancel`, `tests/test_device_safety.py::test_a_job_past_its_timeout_is_killed_and_the_runner_serves_the_next` |

@@ -5591,6 +5591,51 @@ async def test_a_broker_error_mid_job_walks_the_kill_ladder(monkeypatch, clear_j
         await asyncio.gather(runner, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_a_job_past_its_timeout_is_killed_and_the_runner_serves_the_next(monkeypatch, clear_job_state, tmp_path):
+    """01 I5. The runner waits on a gather of the job's stream readers. On Python 3.10 a gather
+    cancelled by the timeout ended with CancelledError, which read as a broker shutdown: the job
+    was left running and the runner exited, so the queue stopped until a restart."""
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    calls = []
+
+    async def _ladder(job_id, pid, grace_sec=srv.GRACEFUL_KILL_GRACE_SEC):
+        calls.append(job_id)
+        await srv._terminate_process_group(pid, grace_sec=2)  # no scope off privsep
+
+    monkeypatch.setattr(srv, "_terminate_job", _ladder)
+    mark = tmp_path / "sigint"
+    slow = srv.Job(
+        id="905",
+        owner="tenant",
+        workspace="/tmp",
+        command=f"trap 'touch {mark}; exit 7' INT; echo hi; sleep 30 & wait",
+        queued_at="t",
+        timeout_sec=1,
+    )
+    nxt = srv.Job(id="906", owner="tenant", workspace="/tmp", command="echo next", queued_at="t")
+    srv.jobs["905"], srv.jobs["906"] = slow, nxt
+    await srv.get_job_queue().put("905")
+    await srv.get_job_queue().put("906")
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        for _ in range(200):
+            if nxt.finished_at is not None or runner.done():
+                break
+            await asyncio.sleep(0.05)
+        assert not runner.done(), "a job timeout ended the runner"
+        assert slow.status is srv.JobStatus.TIMEOUT
+        assert calls == ["905"], "the timed-out job was not walked down the kill ladder"
+        assert mark.exists(), "the timed-out job never saw SIGINT"
+        assert nxt.status is srv.JobStatus.COMPLETED, "the runner did not go on to the next job"
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
 class _FullDiskFile:
     """A log file on a full disk: opens, then every write fails with ENOSPC."""
 
