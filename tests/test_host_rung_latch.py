@@ -8,22 +8,45 @@ while the box shuts down. Without a latch the hold watchdog's next tick forced t
 same second and ran a parent-bridge reset plus a PCI rescan during the shutdown.
 """
 
+import time
 from datetime import datetime, timedelta
 
 import pytest
 
-from tests.conftest import fsm_dirty, patch_health_event
+from tests import test_post_reset_gate as prg
+from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
+from tests.test_post_reset_gate import _assert_settled, _verify_returning
 from tt_device_mcp import server as srv
+from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import recovery as recovery_pkg
-from tt_device_mcp.health.recovery import galaxy, host_rung_latch, pcie_guard
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
+from tt_device_mcp.health.recovery import galaxy, host_rung_latch, offbus_power_cycle, pcie_guard
 from tt_device_mcp.health.recovery.stages import bridge_reset, ubb_tray
+
+mesh = prg.mesh  # the post-reset gate's fixtures, shared
+verdict = prg.verdict
 
 
 @pytest.fixture(autouse=True)
-def _no_latch():
+def _no_latch(monkeypatch):
     host_rung_latch.clear()
+    monkeypatch.setattr(host_rung_latch, "_boot_id", lambda: "boot-a", raising=False)
+    monkeypatch.setattr(offbus_power_cycle, "standback_reason", lambda **k: "")
     yield
+    task = getattr(srv.recovery_mechanism, "_host_rung_deadline_task", None)
+    if task is not None and not task.done():
+        try:
+            task.cancel()
+        except RuntimeError:
+            pass  # its loop already closed
+    srv.recovery_mechanism._host_rung_deadline_task = None
     host_rung_latch.clear()
+
+
+def _restart_broker():
+    """A new broker process: the in-memory latch is gone, the file in the health dir is not."""
+    host_rung_latch._LATCH = None
+    host_rung_latch._LOADED = False
 
 
 def _fire_ok(monkeypatch, action="reboot"):
@@ -184,16 +207,144 @@ def test_the_latch_expires_so_a_reboot_that_never_happened_does_not_hold_forever
     patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
     monkeypatch.delenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", raising=False)
     host_rung_latch.latch("reboot", "r", now=1000.0)
-    assert host_rung_latch.refuse("x", now=1000.0 + 1799)
-    assert host_rung_latch.refuse("x", now=1000.0 + 1800) == ""
+    assert host_rung_latch.refuse("x", now=1000.0 + 1199)
+    assert host_rung_latch.refuse("x", now=1000.0 + 1200) == ""
     assert "host_rung_latch_expired" in events
     assert host_rung_latch.in_flight() is None
 
 
-@pytest.mark.parametrize("value,expected", [(None, 1800.0), ("60", 60.0), ("0", 1800.0), ("x", 1800.0)])
+@pytest.mark.parametrize("value,expected", [(None, 1200.0), ("60", 60.0), ("0", 1200.0), ("x", 1200.0)])
 def test_the_latch_knob(monkeypatch, value, expected):
     if value is None:
         monkeypatch.delenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", raising=False)
     else:
         monkeypatch.setenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", value)
     assert host_rung_latch.latch_sec() == expected
+
+
+# ---- spec 04 I35: the latch's deadline when the requested cycle never happens ----
+
+
+async def _past_first_deadline(monkeypatch, action="reboot"):
+    """A first request whose fire returned, then its deadline task run to the end with the host up."""
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", "0.05")
+    go, fired = _fire_ok(monkeypatch, action)
+    await go()
+    task = srv.recovery_mechanism._host_rung_deadline_task
+    assert task is not None and not task.done()
+    await task
+    return fired
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["reboot", "power-cycle"])
+async def test_past_the_deadline_with_no_reboot_the_cycle_is_re_requested_once(monkeypatch, action):
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    fired = await _past_first_deadline(monkeypatch, action)
+
+    assert fired == [action, action], "re-requested exactly once"
+    expired = [f for k, f in events if k == "host_rung_latch_expired"]
+    assert expired == [dict(action=action, reason="mass drop", attempt=1, age_sec=0, next="re-request")]
+    assert ("host_rung_rerequest", {"action": action, "latch_sec": 0}) in events
+    rec = host_rung_latch.in_flight()
+    assert rec["attempt"] == 2 and not rec["rerequest"], "the re-request latches again, with no third request"
+    assert host_rung_latch.refuse("mesh reset"), "no reset while the re-requested cycle may still happen"
+    assert srv.recovery_mechanism._host_rung_deadline_task.done(), "no deadline task follows the re-request"
+
+
+@pytest.mark.asyncio
+async def test_past_the_second_deadline_the_bounded_escalation_goes_on(monkeypatch, tmp_path, clear_job_state):
+    issued = _held_past_ceiling(monkeypatch, tmp_path)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    fired = await _past_first_deadline(monkeypatch)
+    srv._check_hold_deadline()
+    assert issued == [] and srv._forced_escalation_task is None, "still refused under the re-request's latch"
+
+    assert host_rung_latch.refuse("x", now=time.time() + 1) == ""
+    assert ("host_rung_latch_expired", "bounded escalation") in [(k, f.get("next")) for k, f in events]
+    assert not host_rung_latch._state_path().exists()
+    srv._check_hold_deadline()
+    assert srv._forced_escalation_task is not None
+    await srv._forced_escalation_task
+    assert issued == ["ladder"]
+    assert fired == ["reboot", "reboot"], "no third request"
+
+
+@pytest.mark.asyncio
+async def test_an_operator_at_work_skips_the_re_request(monkeypatch):
+    monkeypatch.setattr(offbus_power_cycle, "standback_reason", lambda **k: "an operator recovery is in progress")
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
+    fired = await _past_first_deadline(monkeypatch, "power-cycle")
+    assert fired == ["power-cycle"]
+    assert "host_rung_rerequest_skipped" in events
+    assert host_rung_latch.in_flight() is None
+
+
+@pytest.mark.asyncio
+async def test_a_reboot_before_the_deadline_ends_the_latch_with_no_re_request(monkeypatch):
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
+    go, fired = _fire_ok(monkeypatch)
+    await go()
+    path = host_rung_latch._state_path()
+    assert path.exists()
+
+    _restart_broker()  # same boot: a broker restart keeps refusing
+    rec = host_rung_latch.in_flight()
+    assert rec["action"] == "reboot" and rec["boot_id"] == "boot-a"
+    assert host_rung_latch.refuse("mesh reset")
+
+    _restart_broker()  # the box came back on a new boot: the request was carried out
+    monkeypatch.setattr(host_rung_latch, "_boot_id", lambda: "boot-b")
+    assert host_rung_latch.in_flight() is None
+    assert "host_rung_completed" in events and "host_rung_latch_expired" not in events
+    assert not path.exists()
+    assert host_rung_latch.refuse("mesh reset") == ""
+    assert fired == ["reboot"]
+
+
+@pytest.mark.asyncio
+async def test_the_deadline_task_does_not_re_request_after_a_reboot(monkeypatch):
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", "0.05")
+    go, fired = _fire_ok(monkeypatch)
+    await go()
+    monkeypatch.setattr(host_rung_latch, "_boot_id", lambda: "boot-b")
+    await srv.recovery_mechanism._host_rung_deadline_task
+    assert fired == ["reboot"] and host_rung_latch.in_flight() is None
+
+
+def test_a_latch_whose_deadline_task_never_runs_still_ends(monkeypatch):
+    monkeypatch.delenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", raising=False)
+    host_rung_latch.latch("reboot", "r", now=1000.0, rerequest=True)
+    assert host_rung_latch.refuse("x", now=1000.0 + 1300), "waits for its deadline task past the deadline"
+    assert host_rung_latch.refuse("x", now=1000.0 + 2400) == ""
+
+
+@pytest.mark.asyncio
+async def test_no_release_across_the_deadline_without_a_passing_fabric_check(mesh, monkeypatch, verdict):
+    """The latch, its re-request and its end release nothing; the reset that follows releases only
+    after the full health check, fabric included, has passed."""
+    evidence, released = verdict
+    fsm_dirty(srv, "gate/post-job: chip 8 off the bus", why="job_killed")
+    g = srv.galaxy_recovery
+    resets = []
+
+    async def bridge(log):
+        resets.append("bridge")
+        FABRIC_DEBT.note_reset("bridge reset of chip 8")
+        return True
+
+    patch_recovery(monkeypatch, "_recover_isolated_chips", bridge)
+    _verify_returning(monkeypatch, evidence)
+    await _past_first_deadline(monkeypatch)
+    assert await g.escalate("present-forced", ["8"], 32, lambda m: None) == galaxy.OUTCOME_WAITING
+    assert srv.fsm.state is not ServerState.HEALTHY and resets == []
+
+    assert host_rung_latch.refuse("x", now=time.time() + 1) == ""
+    assert srv.fsm.state is not ServerState.HEALTHY, "the latch's end released the device"
+    out = await g._fire_gate_rung("post-job", galaxy.STAGE_BRIDGE_RESET, ["8"], 32, lambda m: None, ev=None, beats=None)
+    assert out == galaxy.OUTCOME_RECOVERED and resets == ["bridge"]
+    _assert_settled(released)

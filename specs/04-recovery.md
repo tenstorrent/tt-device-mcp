@@ -649,10 +649,24 @@ each rung fires only when the gentler one failed or cannot apply.
   stays unspent), the ladder (`escalate` reports WAITING), `reset_with_quiesce` (operator reset, gate,
   ladder rungs), the bridge reset and its rescan, the tray re-power, and a second reboot or power
   cycle. A fire that raised latches nothing. A reboot that really happens ends the process and the
-  latch with it; one that does not must not hold forever, so the latch expires after
-  `TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC` (default 1800 s; a non-positive or malformed value reads as the
-  default) with `host_rung_latch_expired`. Refusing a reset releases nothing: the device stays held
-  and the I32 health check still gates every release.
+  latch with it; one that does not must not hold forever, so the latch has a deadline (I35). Refusing
+  a reset releases nothing: the device stays held and the I32 health check still gates every release.
+
+- **I35 — A requested host rung that never happens ends in a bounded time.** The I34 latch is kept in
+  `host_rung_latch.json` in the health dir with the boot id it was requested on, so a broker restart
+  in the same boot keeps refusing, and the first look on a new boot ends it (`host_rung_completed`):
+  the request was carried out. Its deadline is `TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC` after the request
+  (default 1200 s; a non-positive or malformed value reads as the default). At the deadline of a first
+  request, still on the same boot (the hand-off was lost, the cycle was declined, the host stayed up),
+  the broker that fired it ends the latch (`host_rung_latch_expired`, `next=re-request`), logs it and
+  re-requests the same action once (`host_rung_rerequest`), past the
+  rate limiter that already counted the first: it did not take the box down. A stand-back (I27: a
+  marker, an operator recovery, the stand-back command) skips the re-request
+  (`host_rung_rerequest_skipped`). The re-request latches again with no re-request of its own; past its
+  deadline the latch ends (`next=bounded escalation`) and the hold watchdog and ladder go on under their
+  own bounds and limiters. Until its deadline task runs, a first request's latch keeps refusing, and it
+  ends at twice the deadline should that task never run. None of this releases the device: it stays
+  held until a reset's full health check, fabric included, passes (I32).
 
 ## Interfaces
 
@@ -1089,6 +1103,7 @@ sees a silent fabric pass.
 | I33 an operator latch (`off`, the I25 latch) or an operator at work keeps the hold past the deadline | `tests/test_gated_hold_handoff.py::test_an_operator_latch_keeps_the_hold_past_the_deadline`, `::test_an_operator_at_work_keeps_the_gate_shut` |
 | I33 / I32 a lifted reset releases only after a passing full health check, fabric included; a reset the gate still refuses releases nothing | `tests/test_gated_hold_handoff.py::test_the_lifted_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_a_reset_the_gate_still_refuses_releases_nothing` |
 | I34 no reset after a requested reboot or power cycle: the next hold tick forces nothing; every reset entry point refuses; a fire that raised latches nothing; the latch expires; the knob | `tests/test_host_rung_latch.py::test_no_reset_on_the_hold_tick_after_a_reboot_was_requested`, `::test_without_a_host_rung_the_same_tick_forces_the_ladder`, `::test_every_reset_entry_point_refuses_while_a_host_rung_is_in_flight`, `::test_a_fire_that_did_not_launch_latches_nothing`, `::test_the_latch_expires_so_a_reboot_that_never_happened_does_not_hold_forever`, `::test_the_latch_knob` |
+| I35 past the deadline on the same boot the request is re-requested once, then the bounded escalation goes on; a stand-back skips the re-request; a reboot (new boot id) ends the latch with no re-request, a same-boot restart keeps it; a latch whose deadline task never runs still ends; nothing releases before a passing fabric check | `tests/test_host_rung_latch.py::test_past_the_deadline_with_no_reboot_the_cycle_is_re_requested_once`, `::test_past_the_second_deadline_the_bounded_escalation_goes_on`, `::test_an_operator_at_work_skips_the_re_request`, `::test_a_reboot_before_the_deadline_ends_the_latch_with_no_re_request`, `::test_the_deadline_task_does_not_re_request_after_a_reboot`, `::test_a_latch_whose_deadline_task_never_runs_still_ends`, `::test_no_release_across_the_deadline_without_a_passing_fabric_check` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |

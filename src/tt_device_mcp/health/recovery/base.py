@@ -24,7 +24,7 @@ from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors.heartbeat import returned_chips
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
-from tt_device_mcp.health.recovery import host_rung_latch
+from tt_device_mcp.health.recovery import host_rung_latch, offbus_power_cycle
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
 # A daemon without systemd uses the local lock below for the same restart-adoption contract.
@@ -216,6 +216,8 @@ class RecoveryMechanism:
         # 01 I16): a reaped job's process still holding the device, which a reset cannot free.
         # Checked here, where every reset passes, so no caller can reset over one.
         self.reset_fence: Optional[Callable[[], str]] = None
+        # The deadline of the host rung requested last (spec 04 I35), kept so the task is not collected.
+        self._host_rung_deadline_task: Optional[asyncio.Task] = None
 
         # Two callers (the auto-recovery reset launcher and the operator-run reset tool) need this
         # sequence and they must build it identically, because the scope name is what every other
@@ -951,7 +953,17 @@ class RecoveryMechanism:
                 return
 
     async def _fire_recovery_escalation(
-        self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: str, pre_fire=None
+        self,
+        action: str,
+        *,
+        row_owner: str,
+        label: str,
+        detail: str,
+        fire,
+        log,
+        reason: str,
+        pre_fire=None,
+        attempt: int = 1,
     ) -> None:
         """Shared body of the two host-level recovery rungs (reboot, BMC power cycle). Records the
         escalation durably — the rate limiter — and leaves a visible jobs-list row BEFORE the action
@@ -966,7 +978,9 @@ class RecoveryMechanism:
         itself fails (nothing fired), "failed" when ``fire`` raised (attempted, did not launch),
         "ok" when it returned normally (the action was issued). ``systemctl reboot`` and a BMC command
         return as soon as the action is queued, so "ok" latches the host rung in flight (spec 04 I34):
-        every reset path refuses until the box goes down, or until the latch expires.
+        every reset path refuses until the box goes down, or until the latch expires. A first request
+        (``attempt`` 1) also starts its deadline task (I35), which re-requests it once as ``attempt`` 2
+        when the deadline passes on the same boot.
 
         ``pre_fire(log, reason)``, when given, runs after the record and row and just before
         ``fire`` (spec 04 I26): a bounded, blocking call that never raises and whose outcome never
@@ -1024,5 +1038,52 @@ class RecoveryMechanism:
             return
         # The fire returned normally: `systemctl reboot` and a BMC command return once the action is
         # queued, and the box goes down over the next seconds. No reset may run in that window (I34).
-        host_rung_latch.latch(action, reason)
+        host_rung_latch.latch(action, reason, attempt=attempt, rerequest=attempt == 1)
         metrics.stage_fired(stage, "ok")
+        if attempt == 1:
+
+            def rerequest(why: str):
+                return self._fire_recovery_escalation(
+                    action,
+                    row_owner=row_owner,
+                    label=label,
+                    detail=detail,
+                    fire=fire,
+                    log=log,
+                    reason=f"{why}; first request: {reason}",
+                    pre_fire=pre_fire,
+                    attempt=2,
+                )
+
+            self._host_rung_deadline_task = asyncio.get_running_loop().create_task(
+                self._host_rung_deadline(action, label, rerequest, log)
+            )
+
+    async def _host_rung_deadline(self, action: str, label: str, rerequest, log) -> None:
+        """The deadline of a first host-rung request (spec 04 I35). A reboot or power cycle that happens
+        ends this process with it. Still running at the deadline, on the same boot, means the request
+        was lost, declined, or did not take the host down: end the latch, re-request the action once
+        (no deadline task follows it), and past that second deadline the bounded escalation goes on.
+        A stand-back (an operator recovering the host) skips the re-request. Nothing here releases the
+        device: it stays held until a reset's full health check, fabric included, passes (I32)."""
+        while True:
+            rec = host_rung_latch.in_flight()
+            if rec is None or not rec.get("rerequest") or rec["action"] != action:
+                return
+            wait = rec["at"] + host_rung_latch.latch_sec() - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+            rec = host_rung_latch.expire()
+            if rec is None:
+                return
+            break
+        sec = int(host_rung_latch.latch_sec())
+        why = await asyncio.to_thread(offbus_power_cycle.standback_reason, require_manual_check=False)
+        if why:
+            log(f"{label.upper()}: the host is still up {sec}s after the request; not re-requesting it ({why})")
+            health_event("host_rung_rerequest_skipped", action=action, why=why)
+            return
+        log(f"{label.upper()}: the host is still up {sec}s after the request (same boot); re-requesting it once")
+        health_event("host_rung_rerequest", action=action, latch_sec=sec)
+        await rerequest(f"re-request: host still up {sec}s after the first request")
