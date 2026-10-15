@@ -90,7 +90,7 @@ def _held_past_ceiling(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_no_reset_on_the_hold_tick_after_a_reboot_was_requested(monkeypatch, tmp_path, clear_job_state):
-    """The blx01 sequence: the reboot fire returns normally, the next hold-deadline tick must not
+    """The reported sequence: the reboot fire returns normally, the next hold-deadline tick must not
     force the ladder (no bridge reset, SBR, tray re-power or mesh reset)."""
     issued = _held_past_ceiling(monkeypatch, tmp_path)
     events = []
