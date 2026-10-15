@@ -232,7 +232,7 @@ def offbus_blocked(monkeypatch, clear_job_state):
 
 @pytest.mark.asyncio
 async def test_a_blocked_offbus_escalation_names_the_holder_in_health(offbus_blocked):
-    """blx01 10-14: an interactive tt-smi held an off-bus hold's escalation for 3 h 27 min, and
+    """An interactive tool held an off-bus hold's escalation for hours, and
     /health said nothing about who. /health now exposes blocked_by with pid, user and command."""
     ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
 
