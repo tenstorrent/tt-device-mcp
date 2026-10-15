@@ -64,9 +64,13 @@ def _fire_ubb_reset(bitmap: int, tray_chip_ids: list, log=None):
     Raises ``pcie_guard.TrayRepowerRefused`` when the envelope refused to cut power (nothing fired), and
     :class:`BmcIpmiError` when the BMC did not take the pulse.
     Returns the envelope's ``TrayPlan``."""
-    from tt_smi.reset import IoctlResetFlags
+    from tt_device_mcp.health.recovery import host_rung_latch, pcie_guard
 
-    from tt_device_mcp.health.recovery import pcie_guard
+    going_down = host_rung_latch.refuse("tray re-power", log)
+    if going_down:
+        raise pcie_guard.TrayRepowerRefused(going_down)  # spec 04 I34: nothing quiesced or re-powered
+
+    from tt_smi.reset import IoctlResetFlags
 
     reset_device_ioctl = _tt_smi_reset_device_ioctl()
 

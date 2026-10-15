@@ -14,6 +14,7 @@ from typing import Optional
 from tt_device_mcp import privileges
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.health.recovery import host_rung_latch
 
 
 def bridge_reset_enabled() -> bool:
@@ -68,6 +69,8 @@ def reset_chip_via_bridge(idx: str, bdf: str) -> Optional[bool]:
     only path, so a node-less endpoint yields no bridge and this returns without firing a reset —
     the prior behavior. Rescans the bus afterwards to bring the endpoint back.
     """
+    if host_rung_latch.refuse("bridge reset"):
+        return None  # a reboot or power cycle is taking the box down (spec 04 I34): issue nothing
     bdf_re = r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]"
     bridge = None
     try:

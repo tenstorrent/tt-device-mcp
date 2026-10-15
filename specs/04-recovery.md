@@ -641,6 +641,19 @@ each rung fires only when the gentler one failed or cannot apply.
   passes; a failed check keeps it held for the next bounded rung, and a reset the gate still refuses
   releases nothing. The hand-off ends (gauge to 0, `operator_handoff` gone) when the hold ends.
 
+- **I34 — No reset runs once a host reboot or power cycle has been requested.** `systemctl reboot`
+  and a BMC power-cycle command return as soon as the action is queued, so the host rung's fire
+  returns while the box shuts down. A fire that returned normally latches the host rung in flight,
+  process-wide (`host_rung_in_flight`). While it is latched every reset path refuses and journals
+  `reset_refused_host_rung_in_flight` once per path: the hold watchdog's forced escalation (its window
+  stays unspent), the ladder (`escalate` reports WAITING), `reset_with_quiesce` (operator reset, gate,
+  ladder rungs), the bridge reset and its rescan, the tray re-power, and a second reboot or power
+  cycle. A fire that raised latches nothing. A reboot that really happens ends the process and the
+  latch with it; one that does not must not hold forever, so the latch expires after
+  `TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC` (default 1800 s; a non-positive or malformed value reads as the
+  default) with `host_rung_latch_expired`. Refusing a reset releases nothing: the device stays held
+  and the I32 health check still gates every release.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -1075,6 +1088,7 @@ sees a silent fabric pass.
 | I33 before the deadline the gate holds; past it the watchdog forces one pass, and only that pass runs the ladder with the gate lifted | `tests/test_gated_hold_handoff.py::test_before_the_deadline_the_gate_holds_and_no_reset_fires`, `::test_the_watchdog_forces_one_pass_at_the_handoff_bound`, `::test_past_the_deadline_the_ladder_runs_with_the_gate_lifted_for_that_pass_only` |
 | I33 an operator latch (`off`, the I25 latch) or an operator at work keeps the hold past the deadline | `tests/test_gated_hold_handoff.py::test_an_operator_latch_keeps_the_hold_past_the_deadline`, `::test_an_operator_at_work_keeps_the_gate_shut` |
 | I33 / I32 a lifted reset releases only after a passing full health check, fabric included; a reset the gate still refuses releases nothing | `tests/test_gated_hold_handoff.py::test_the_lifted_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_a_reset_the_gate_still_refuses_releases_nothing` |
+| I34 no reset after a requested reboot or power cycle: the next hold tick forces nothing; every reset entry point refuses; a fire that raised latches nothing; the latch expires; the knob | `tests/test_host_rung_latch.py::test_no_reset_on_the_hold_tick_after_a_reboot_was_requested`, `::test_without_a_host_rung_the_same_tick_forces_the_ladder`, `::test_every_reset_entry_point_refuses_while_a_host_rung_is_in_flight`, `::test_a_fire_that_did_not_launch_latches_nothing`, `::test_the_latch_expires_so_a_reboot_that_never_happened_does_not_hold_forever`, `::test_the_latch_knob` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |

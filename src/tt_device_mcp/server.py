@@ -150,6 +150,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.health.recovery import host_rung_latch
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
@@ -6038,6 +6039,8 @@ def _maybe_spawn_forced_escalation() -> bool:
         return False
     if device_op_active:
         return False
+    if host_rung_latch.refuse("hold-deadline escalation", logger.error if logger else None):
+        return False  # a reboot or power cycle is taking the box down (spec 04 I34); the window stays unspent
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:

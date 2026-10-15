@@ -24,6 +24,7 @@ from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors.heartbeat import returned_chips
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
+from tt_device_mcp.health.recovery import host_rung_latch
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
 # A daemon without systemd uses the local lock below for the same restart-adoption contract.
@@ -644,6 +645,10 @@ class RecoveryMechanism:
             log(f"reset refused: {fenced}")
             health_event("reset_fenced", argv=argv, owner=owner, reason=fenced)
             return None, f"reset refused: {fenced}"
+        # A reboot or power cycle already requested is taking the box down: no reset races it (I34).
+        going_down = host_rung_latch.refuse(owner, log)
+        if going_down:
+            return None, f"reset refused: {going_down}"
         # Name the command we are actually running. This was hardcoded to the galaxy's -glx_reset, so on
         # every other machine the queue told operators a command that was not the one executing.
         self._set_device_op_detail(f"device reset: {' '.join(argv)} (~60s)")
@@ -959,8 +964,9 @@ class RecoveryMechanism:
         ("reboot" -> "host_reboot", "power-cycle" -> "power_cycle" — see
         ``health.recovery.stages.host_reboot``/``power_cycle``): "blocked" when the ledger write
         itself fails (nothing fired), "failed" when ``fire`` raised (attempted, did not launch),
-        "ok" when it returned normally (the action was issued — a SUCCESSFUL reboot/power-cycle
-        takes the box down from inside ``fire`` and never reaches here at all).
+        "ok" when it returned normally (the action was issued). ``systemctl reboot`` and a BMC command
+        return as soon as the action is queued, so "ok" latches the host rung in flight (spec 04 I34):
+        every reset path refuses until the box goes down, or until the latch expires.
 
         ``pre_fire(log, reason)``, when given, runs after the record and row and just before
         ``fire`` (spec 04 I26): a bounded, blocking call that never raises and whose outcome never
@@ -968,6 +974,9 @@ class RecoveryMechanism:
         really about to happen, never for one the ledger then aborts."""
         ev = action.replace("-", "_")
         stage = _ACTION_TO_STAGE[action]
+        if host_rung_latch.refuse(f"auto {action}", log):
+            metrics.stage_fired(stage, "blocked")
+            return
         if not self.record_auto_recovery(action, reason):
             log(
                 f"{label.upper()} ABORTED: could not persist the escalation record; refusing to act "
@@ -1002,9 +1011,8 @@ class RecoveryMechanism:
         try:
             await asyncio.to_thread(fire)
         except Exception as exc:  # noqa: BLE001 - a fire that did not launch must not leave a poisoned limiter
-            # A SUCCESSFUL fire takes the box down inside asyncio.to_thread, so reaching here means the
-            # action never launched — the binary is missing, exited non-zero, or timed out. The ledger
-            # entry written above to rate-limit it would now count a recovery that never happened and
+            # A fire that raised never launched — the binary is missing, exited non-zero, or timed
+            # out. The ledger entry written above to rate-limit it would now count a recovery that never happened and
             # block the retry the still-wedged box needs, so retract it and surface loudly.
             self.retract_last_auto_recovery(action)
             log(
@@ -1014,4 +1022,7 @@ class RecoveryMechanism:
             health_event(f"auto_{ev}_failed", reason=reason, error=repr(exc))
             metrics.stage_fired(stage, "failed")
             return
+        # The fire returned normally: `systemctl reboot` and a BMC command return once the action is
+        # queued, and the box goes down over the next seconds. No reset may run in that window (I34).
+        host_rung_latch.latch(action, reason)
         metrics.stage_fired(stage, "ok")

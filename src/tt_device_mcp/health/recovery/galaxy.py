@@ -41,6 +41,7 @@ from tt_device_mcp.health.recovery import (
     WAIT,
     Evidence,
     Recovery,
+    host_rung_latch,
     offbus_power_cycle,
     pcie_guard,
 )
@@ -1099,6 +1100,8 @@ class GalaxyRecovery(Recovery):
         picks a rung, skips one or fires a power cycle. Only a rescan that brought every chip back
         onto a mesh that passes the full verify ends the episode before the ladder."""
         rung, _, gate_phase = phase.partition("/")
+        if host_rung_latch.refuse(f"escalate {phase}", log):
+            return OUTCOME_WAITING  # a reboot or power cycle is taking the box down (spec 04 I34)
         if await self._tray_down_latch(expected, beats) == TRAY_DOWN_ONSET and not self._td["prelude_done"]:
             if await self._tray_down_prelude(expected, log, phase=gate_phase or rung):
                 return OUTCOME_RECOVERED

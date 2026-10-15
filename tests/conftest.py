@@ -28,7 +28,7 @@ from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState
 from tt_device_mcp.health.monitors import eth, heartbeat, pci
-from tt_device_mcp.health.recovery import RecoveryDeps, offbus_power_cycle, pcie_guard
+from tt_device_mcp.health.recovery import RecoveryDeps, host_rung_latch, offbus_power_cycle, pcie_guard
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as recovery_galaxy
 from tt_device_mcp.server import (
@@ -462,6 +462,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
     # A regressed tray walk disables the rung for the rest of the process: every test starts armed.
     monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+    # A test whose stubbed host rung fired "successfully" latches it process-wide (spec 04 I34).
+    host_rung_latch.clear()
     monkeypatch.setattr(pcie_guard, "_LAST_TRAY_PULSE", None, raising=False)
 
     # The bounded off-bus hold (spec 04 I27) runs a host-supplied power-cycle command: unset here, a
@@ -752,6 +754,7 @@ def patch_health_event(monkeypatch, fn) -> None:
     monkeypatch.setattr(pcie_guard, "health_event", fn)
     monkeypatch.setattr(recovery_base, "health_event", fn)
     monkeypatch.setattr(post_reset, "health_event", fn)
+    monkeypatch.setattr(host_rung_latch, "health_event", fn)
 
 
 def patch_recovery(monkeypatch, name: str, fn) -> None:
