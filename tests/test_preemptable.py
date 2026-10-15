@@ -377,3 +377,31 @@ async def test_a_readopted_preemptable_job_is_preempted_once_a_job_waits(monkeyp
     await asyncio.wait_for(srv._monitor_readopted_scope("021", "ttdev-job-021.scope"), timeout=5)
     assert stopped == ["021"]
     assert srv.jobs["021"].status is srv.JobStatus.PREEMPTED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rc", ["130", "-2", None])
+async def test_a_preempted_readopted_job_never_releases_the_device_clean(monkeypatch, tmp_path, clear_job_state, rc):
+    """A re-adopted job has no post-job gate: the runner that would have proved the fabric died with
+    the old broker. Its SIGINT exit (130 / -2) is a clean release only where that gate follows, so
+    here the device must be flagged for the reset + full check (fabric included) before the queue
+    moves on, whatever the exit status."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    marks = _recording_dirty(monkeypatch)
+    monkeypatch.setattr(srv, "_mark_device_reported_fault", lambda *a, **k: marks.append("fault"))
+    active = {"v": True}
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: active["v"])
+
+    async def fake_preempt(job_id, pid):
+        if rc is not None:
+            (tmp_path / f"{job_id}.exit").write_text(rc)
+        active["v"] = False
+
+    monkeypatch.setattr(srv, "_preempt_job", fake_preempt)
+    _readopted("022", served_sec=2400, timeout_sec=300)
+    _waiting_job("952")
+
+    await asyncio.wait_for(srv._monitor_readopted_scope("022", "ttdev-job-022.scope"), timeout=5)
+    assert srv.jobs["022"].status is srv.JobStatus.PREEMPTED
+    assert len(marks) == 1 and "022" in marks[0], f"a preempted re-adopted job released the device clean: {marks}"
