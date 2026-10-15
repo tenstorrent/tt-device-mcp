@@ -171,6 +171,13 @@ job log, so every "installed" claim below is verified, not assumed.
   until `systemctl restart` returns (systemd also removes it with the RuntimeDirectory), so
   queued jobs wait, persisted, for the new broker. An exit on any other path drops it too.
 
+- **I19 — reconcile never revives a broker that is already starting or stopping.** Step 1 reads
+  `systemctl is-active`: `activating`, `reloading` and `deactivating` are a job systemd already
+  runs (the broker sits in `activating` through its startup check, minutes after a boot), so
+  reconcile runs neither `reset-failed` nor `start` and logs "in progress" once per episode (the
+  state is kept in `/run/tt-device-broker/reconcile_inprogress`, cleared once the broker is
+  `active` or down). Every other non-`active` state is still reset and started.
+
 ## Interfaces
 
 **`/etc/default/tt-device-broker`** — written by the installer, sourced by `apply-host-config.sh`,
@@ -305,7 +312,8 @@ pulled tree fail-closed (I8); write `installed.sha`; restart the broker.
 
 **Reconcile semantics (`reconcile.sh`, per minute + 30s after boot).** Idempotent, quiet when
 nothing drifts. (0) Run autoupdate (its own gates apply). (1) Broker liveness: the exact
-predicate is `systemctl is-active tt-device-broker != "active"` → `reset-failed` + `start`. This
+predicate is `systemctl is-active tt-device-broker` not `active` and not a start or stop in
+progress (I19) → `reset-failed` + `start`. This
 deliberately covers `failed`/start-limit exhaustion, but the predicate cannot distinguish an
 operator's deliberate `systemctl stop` (`inactive`): a stopped broker is revived within ~60s
 — measured consequence: the revived broker's startup gate reset a device a container daemon was
@@ -493,6 +501,7 @@ script exists, the claim stands on the script (listed below).
 | Each hook exports its own step-deadline var from `/etc/default/tt-device-broker` to the CLI child, and the export is harmless when the var was never set | `tests/test_slurm_steps.py::test_the_hooks_export_their_deadline_var_from_etc_default`, `tests/test_slurm_steps.py::test_the_hooks_do_not_require_the_deadline_var_to_be_set` |
 | I17 (idle-time probe: stands back unless idle, no device op and no tenant; re-checks before and after acting; broker's chip count and poller list; enabled failed/inactive pollers only; one page per episode, flaps included; AER first-lap baseline; apply arms it, optional, retires the old timer only after arming, moved aside) | `tests/test_health_probe.py::test_idle_verdict_requires_an_idle_healthy_broker`, `tests/test_health_probe.py::test_a_busy_broker_is_left_alone`, `tests/test_health_probe.py::test_a_broker_turning_busy_stops_the_rescan`, `tests/test_health_probe.py::test_expected_chips_reads_the_broker_count`, `tests/test_health_probe.py::test_missing_chips_rescan_then_alert_once`, `tests/test_health_probe.py::test_rescan_recovers_without_alert`, `tests/test_health_probe.py::test_telemetry_restart_and_alert`, `tests/test_health_probe.py::test_a_poller_stopped_and_disabled_on_purpose_is_left_off`, `tests/test_health_probe.py::test_an_activating_poller_is_left_to_systemd_then_paged_once`, `tests/test_health_probe.py::test_a_start_that_is_still_activating_does_not_page`, `tests/test_health_probe.py::test_a_flapping_poller_pages_once_per_episode`, `tests/test_health_probe.py::test_a_poller_that_stays_up_between_rare_falls_is_restarted_quietly`, `tests/test_health_probe.py::test_the_pollers_are_the_broker_list`, `tests/test_health_probe.py::test_the_probe_default_is_the_broker_default`, `tests/test_health_probe.py::test_the_poller_list_comes_from_the_broker_env`, `tests/test_health_probe.py::test_a_device_op_in_flight_stops_the_lap`, `tests/test_health_probe.py::test_a_tenant_holding_the_device_outside_the_job_table_stops_the_lap`, `tests/test_health_probe.py::test_a_device_op_that_starts_during_the_settle_stops_the_poller_again`, `tests/test_health_probe.py::test_a_job_starting_during_the_settle_keeps_the_poller`, `tests/test_health_probe.py::test_device_op_lock_reads_the_broker_inhibit_file`, `tests/test_health_probe.py::test_tenant_holders_fail_closed`, `tests/test_health_probe.py::test_the_broker_device_op_flock_is_tested_and_the_rescan_written_under_it`, `tests/test_health_probe.py::test_a_rescan_the_flock_refused_is_retried_next_lap`, `tests/test_health_probe.py::test_aer_growth_alerts_once_an_hour`, `tests/test_health_probe.py::test_aer_already_counted_at_the_first_lap_is_a_baseline_not_a_page`, `tests/test_health_probe.py::test_hook_and_chip_count_come_from_the_broker_env`, `tests/test_health_probe.py::test_apply_installs_and_arms_the_probe_optionally`, `tests/test_health_probe.py::test_an_armed_probe_moves_the_old_timer_aside`, `tests/test_health_probe.py::test_an_opted_out_host_keeps_the_old_timer`, `tests/test_health_probe.py::test_a_probe_that_will_not_arm_keeps_the_old_timer`, `tests/test_health_probe.py::test_a_host_without_the_old_timer_only_arms`, `tests/test_health_probe.py::test_the_probe_unit_runs_the_broker_venv` |
 | I18 (dispatch hold from the busy check through the restart; queued specs and job scopes count as busy) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_hold_is_taken_before_anything_is_counted`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_hold_appears_whole`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_queued_job_defers_an_opted_in_update_and_drops_the_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_idle_box_applies_and_keeps_the_hold_until_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_running_job_scope_counts_as_busy` |
+| I19 (an in-progress broker is not reset or started; logged once) | `tests/test_deploy_reconcile_activating.py::test_an_in_progress_broker_is_not_reset_or_started`, `tests/test_deploy_reconcile_activating.py::test_an_in_progress_broker_logs_once_per_episode`, `tests/test_deploy_reconcile_activating.py::test_a_down_broker_is_still_reset_and_started`, `tests/test_deploy_reconcile_activating.py::test_an_active_broker_is_left_alone` |
 
 **Unanchored (the claim stands on the script):** I2 (wheel/venv from this tree —
 `install-tt-device-broker.sh`); the installer's flow ordering and lock opt-in; Galaxy detection
