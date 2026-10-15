@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """No reset once a host reboot or power cycle has been requested (spec 04 I34).
 
 ``systemctl reboot`` returns as soon as PID 1 has queued it, so the host rung's fire returns normally

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """The gated off-bus hold's bounded end with no power cycle configured (spec 04 I33).
 
 ``TT_DEVICE_MCP_HOST_RESET_GATE=hold`` refuses every reset while a chip is off the bus. With no
