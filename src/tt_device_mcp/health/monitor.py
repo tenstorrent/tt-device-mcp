@@ -484,8 +484,15 @@ class HealthMonitor:
                 return _store()
         fabric_asked = run_fabric or force_fabric
         if ok and (fabric_asked or run_eth):
+            # A full pass re-arms a rung a failed self-test left off before it reads (spec 03 I28). A
+            # self-test that hung during an open fault episode is the frozen core itself: FROZEN.
+            hung = ""
+            if fabric_asked and self._deps.eth_rearm is not None:
+                hung = await self._deps.eth_rearm()
             self._deps.set_device_op_detail("health check: eth-core heartbeat (passive)")
-            if fabric_asked:
+            if hung:
+                eok, edetail = False, hung
+            elif fabric_asked:
                 eok, edetail = await self.verify_eth_heartbeat()
             else:
                 eok, edetail = await self.verify_eth_heartbeat(timeout_sec=ETH_POST_JOB_TIMEOUT_SEC)

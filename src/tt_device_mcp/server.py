@@ -1055,6 +1055,7 @@ _recovery_deps = RecoveryDeps(
     episode_dirty=lambda: fsm.record.dirty,
     episode_open=lambda: fsm.state is not ServerState.HEALTHY,
     episode_job=lambda: dict(fsm.record.job),
+    eth_rearm=lambda: _rearm_eth_before_check(),
 )
 
 # The root constructs the health subsystem, once, while still in its BOOT state — never per gate
@@ -3172,7 +3173,23 @@ _last_eth_rearm_monotonic: float = 0.0
 _eth_rearm_task: Optional[asyncio.Task] = None
 
 
-async def selftest_eth_heartbeat() -> None:
+async def _eth_read_rearmed() -> tuple[Optional[bool], str]:
+    """The idle relift's eth read, after re-arming a rung a failed self-test left off. A self-test
+    that hung during the open episode reads FROZEN (see selftest_eth_heartbeat)."""
+    hung = await _rearm_eth_before_check()
+    if hung:
+        return False, hung
+    return await health_monitor.verify_eth_heartbeat()
+
+
+def _fault_episode_open() -> bool:
+    """Whether the device is held or dirty for a fault. The startup_unverified hold every broker
+    start opens is not one. Read off the record, so before boot_merge it answers for the episode
+    the last broker left open."""
+    return fsm.state in (ServerState.RECOVERING, ServerState.DOWN) and fsm.record.why != "startup_unverified"
+
+
+async def selftest_eth_heartbeat() -> str:
     """Time the passive eth read once per broker start; arm the rung only on a fast answer.
 
     Slow is the dangerous outcome, not failing: past its timeout the gate reads a frozen core and
@@ -3184,6 +3201,11 @@ async def selftest_eth_heartbeat() -> None:
     weeks — 25 SKIPPED, 0 verdicts — because "nobody armed it" and "it is broken" look identical
     from outside. So the box proves the detector on itself, here, once, and says at WARNING which
     rung is off and why when it cannot.
+
+    Returns a FROZEN detail when the read hung past its budget during an open fault episode, else
+    "". There a hung read is the wedge itself, not a slow host: on one box every broker start over
+    a frozen eth core hung the read past the budget, and the read took 0.79s after the reboot. The
+    caller holds the device on it; the rung stays off and retryable either way.
     """
     global eth_check_armed, eth_check_disarm_reason, eth_rearm_retryable, _last_eth_rearm_monotonic
     # Stamped here, so the first idle retry comes a full interval after this attempt.
@@ -3196,6 +3218,7 @@ async def selftest_eth_heartbeat() -> None:
     # Off the event loop: build() can shell out to three candidate pythons, and the idle retry
     # (see _maybe_spawn_eth_rearm) must not stall the sampler or the watchdog ping on them.
     built = await asyncio.to_thread(eth.build)
+    hung = False
     if built is None:
         eth_check_disarm_reason = "no runnable eth read on this host (no python that imports ttexalens)"
     else:
@@ -3252,6 +3275,7 @@ async def selftest_eth_heartbeat() -> None:
                 f"read hung past the {ETH_CHECK_SELFTEST_BUDGET_SEC:.0f}s self-test budget — too slow "
                 "to distinguish from a frozen core"
             )
+            hung = True
         except Exception as e:  # noqa: BLE001 - a self-test must never block startup
             eth_check_disarm_reason = f"read not runnable: {e}"
     if not eth_check_armed:
@@ -3263,9 +3287,38 @@ async def selftest_eth_heartbeat() -> None:
         if logger:
             logger.warning(
                 f"RUNG OFF eth-heartbeat: {eth_check_disarm_reason}. The passive frozen-eth detector "
-                "produces NO verdict this run, so a frozen core is left to the traffic pass, which can "
-                "knock it off the PCIe bus instead of naming it."
+                "produces NO verdict until a retry arms it"
+                + (" (retried at the next full health check or reset)" if eth_rearm_retryable else "")
+                + ", so a frozen core is left to the traffic pass, which can knock it off the PCIe bus "
+                "instead of naming it."
             )
+    if not (hung and _fault_episode_open()):
+        return ""
+    why = fsm.record.why
+    detail = (
+        f"eth self-test read hung past its {ETH_CHECK_SELFTEST_BUDGET_SEC:.0f}s budget during an open "
+        f"fault episode ({why}): counted as a frozen eth core"
+    )
+    health_event("eth_selftest_hung", episode=why, budget_sec=ETH_CHECK_SELFTEST_BUDGET_SEC)
+    if logger:
+        logger.warning(f"RUNG SELFTEST eth-heartbeat: {detail} — the device stays held")
+    return detail
+
+
+async def _rearm_eth_before_check() -> str:
+    """Retry a failed eth self-test at the head of a full health pass, before it reads the mesh
+    (spec 03 I28). The caller holds the device-op lock (every full pass does). Unpaced, unlike the
+    idle tick: a reset or a held device's re-check must not run with the rung off just because a
+    broker start found the core frozen. Returns the self-test's FROZEN detail, or ""."""
+    if eth_check_armed or not eth_rearm_retryable:
+        return ""
+    _set_device_op_detail("health check: eth-heartbeat self-test (re-arming)")
+    try:
+        return await selftest_eth_heartbeat() or ""
+    except Exception as e:  # noqa: BLE001 - a retry must never break the pass it heads
+        if logger:
+            logger.error(f"RUNG SELFTEST eth-heartbeat retry failed: {e}")
+        return ""
 
 
 def _opted_out(var: str) -> str:
@@ -3731,7 +3784,7 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
         alert.send_alert(event, logger) is not None or alert.alert_argv() is None
     ):
         _fabric_77_paged_since = fsm.record.since
-    eok, edetail = await health_monitor.verify_eth_heartbeat()
+    eok, edetail = await _eth_read_rearmed()
     # A reset with no passing fabric pass since may not be released on the startup checks (04 I32).
     owed = _post_reset_debt()
     if eok is True and not recent and not owed:
@@ -3946,7 +3999,7 @@ async def _attempt_idle_relift() -> None:
                     )
                     return
             else:
-                eok, edetail = await health_monitor.verify_eth_heartbeat()
+                eok, edetail = await _eth_read_rearmed()
                 if fsm.record.why == "eth_frozen":
                     # Held for a frozen eth core, which enum+ARC cannot see. Lift ONLY on a positively-
                     # advancing heartbeat. `None` is "could not tell" (reader unconfigured, or a read a

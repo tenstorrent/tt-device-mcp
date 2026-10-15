@@ -288,6 +288,10 @@ class RecoveryDeps:
     # short count IS that fault, and re-dirtying it would disable the hold's idle relift.
     episode_open: Optional[Callable[[], bool]] = None
     episode_job: Optional[Callable[[], dict]] = None
+    # Re-runs a failed eth self-test at the head of a full health pass (server._rearm_eth_before_check,
+    # spec 03 I28). Returns a FROZEN detail when the self-test hung during an open fault episode,
+    # else "". None (the conftest deps fixture) skips the retry.
+    eth_rearm: Optional[Callable[[], Awaitable[str]]] = None
 
 
 class Recovery(ABC):

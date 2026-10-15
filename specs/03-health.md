@@ -198,7 +198,16 @@ job boundary.
   (could not check, over budget, not runnable) is retried from the idle sampler tick, a full
   `ETH_CHECK_REARM_INTERVAL_SEC` (600 s) after the previous attempt, only on a HEALTHY device
   with no job queued, running or re-adopted and no post-job gate pending, under the device-op
-  lock, so a missed startup budget no longer leaves the rung off until the next restart. A host
+  lock, so a missed startup budget no longer leaves the rung off until the next restart. The same
+  retry runs, unpaced, at the head of every full health pass while the rung is off (the startup
+  gate, the gates' full passes, every post-reset verify and the idle relift of an `eth_frozen`
+  hold), under the device-op lock its caller already holds, so a reset or a gate re-arms the rung
+  before it reads the mesh rather than leaving it off for the broker's life. During an open fault
+  episode (the device held or dirty for a fault; the `startup_unverified` hold every broker start
+  opens is not one) a self-test that hung past its budget is evidence of a frozen eth core, the
+  wedge that hangs the read: that pass records the eth read FROZEN, runs no traffic pass, and the
+  device stays held (the gate's `eth_frozen` hold and its bounded escalation; a post-reset verify
+  fails). Outside an episode a hung self-test only leaves the rung off, as before. A host
   with no eth reader at all is not retried. The built-in probe reports how many up links it
   measured; the broker keeps a high-water mark of that count (`eth_link_baseline.json` in the
   health dir, seeded by the self-test, written atomically; an unreadable file skips one read and
@@ -1199,6 +1208,7 @@ refuses.
 | I28 (the probe reports its link count; exit codes unchanged) | `tests/test_eth_heartbeat_probe.py::test_main_counts_a_down_link_and_still_reads_ok`, `tests/test_eth_heartbeat_probe.py::test_main_frozen_keeps_its_exit_code_with_the_count_line`, `tests/test_eth_heartbeat_probe.py::test_main_all_links_down_is_still_cannot_check`, `tests/test_eth_heartbeat_probe.py::test_main_counts_an_off_bus_core_as_unreadable` |
 | I28 (link high-water mark; a drop is unverified, not a pass) | `tests/test_eth_link_baseline.py::test_the_link_count_is_parsed_from_the_probe_output`, `tests/test_eth_link_baseline.py::test_the_link_baseline_keeps_its_high_water_mark`, `tests/test_eth_link_baseline.py::test_an_unreadable_link_baseline_fails_closed_once_then_rebaselines`, `tests/test_eth_link_baseline.py::test_an_advancing_read_that_lost_a_link_is_not_a_pass`, `tests/test_eth_link_baseline.py::test_an_advancing_read_at_the_mark_passes_and_ratchets`, `tests/test_eth_link_baseline.py::test_a_frozen_read_stays_frozen_whatever_the_count`, `tests/test_eth_link_baseline.py::test_an_override_is_judged_on_its_exit_code_alone`, `tests/test_eth_link_baseline.py::test_a_link_drop_is_recorded_as_skipped_and_the_traffic_pass_still_runs`, `tests/test_device_safety.py::test_idle_relift_holds_a_frozen_core_whose_link_went_down`, `tests/test_eth_link_baseline.py::test_the_selftest_seeds_the_link_baseline` |
 | I28 (a failed self-test is retried while idle) | `tests/test_eth_link_baseline.py::test_a_failed_selftest_rearms_from_the_idle_tick`, `tests/test_eth_link_baseline.py::test_the_idle_relift_tick_drives_the_rearm`, `tests/test_eth_link_baseline.py::test_the_rearm_is_rate_limited`, `tests/test_eth_link_baseline.py::test_the_rearm_waits_for_an_idle_device`, `tests/test_eth_link_baseline.py::test_a_job_queued_before_the_lock_is_taken_cancels_the_rearm`, `tests/test_eth_link_baseline.py::test_a_selftest_that_could_not_check_is_retryable`, `tests/test_eth_link_baseline.py::test_a_host_with_no_eth_reader_is_never_retried` |
+| I28 (every full pass and reset verify re-arms first; a hung self-test in a fault episode reads FROZEN) | `tests/test_eth_rearm_on_check.py::test_a_hung_selftest_in_a_fault_episode_is_frozen_evidence`, `tests/test_eth_rearm_on_check.py::test_a_hung_selftest_outside_a_fault_episode_only_leaves_the_rung_off`, `tests/test_eth_rearm_on_check.py::test_a_full_pass_rearms_the_rung_before_it_reads`, `tests/test_eth_rearm_on_check.py::test_a_full_pass_in_a_fault_episode_holds_on_a_hung_selftest`, `tests/test_eth_rearm_on_check.py::test_a_full_pass_outside_an_episode_still_runs_the_traffic_pass_on_a_hung_selftest`, `tests/test_eth_rearm_on_check.py::test_a_full_pass_does_not_retry_an_armed_or_unretryable_rung`, `tests/test_eth_rearm_on_check.py::test_the_post_reset_verify_holds_on_a_hung_selftest`, `tests/test_eth_rearm_on_check.py::test_the_post_reset_verify_reads_eth_once_rearmed`, `tests/test_eth_rearm_on_check.py::test_the_eth_frozen_relift_holds_while_the_selftest_still_hangs`, `tests/test_eth_rearm_on_check.py::test_the_eth_frozen_relift_rearms_then_reads` |
 | I29 (read-only never enters the ladder) | `tests/test_slurm_steps.py::test_a_read_only_pass_never_enters_the_recovery_ladder` |
 | I29 (read-only still holds an unhealthy device) | `tests/test_slurm_steps.py::test_a_read_only_pass_still_holds_an_unhealthy_device` |
 | I29 (read-only never runs fabric) | `tests/test_slurm_steps.py::test_a_read_only_pass_never_runs_the_fabric_traffic_pass` |
