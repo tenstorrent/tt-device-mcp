@@ -20,6 +20,8 @@ import pytest
 import tt_device_mcp.job_spool as spool
 import tt_device_mcp.server as srv
 from tests.test_device_safety import _free_device_lock, _quiet_post_job_gate
+from tests.test_startup_fabric_hugepages import _shortfalls, _startup  # noqa: F401 - a fixture
+from tt_device_mcp.fsm import ServerState
 
 
 def _spool_dir() -> Path:
@@ -410,3 +412,70 @@ async def test_a_step_that_reserves_the_device_during_the_hold_is_waited_out(mon
         await asyncio.gather(runner, return_exceptions=True)
     assert job.status is srv.JobStatus.COMPLETED, job.error
     assert marker.exists()
+
+
+# --- spec 08 I20: the restart an update ends in re-proves the device before the queue opens ------
+
+
+async def _restart_with_a_held_job(monkeypatch, tmp_path, verdict):
+    """A job the drained update kept queued, then the broker restart the apply ends in. The startup
+    gate is stood in by ``verdict``; returns (the restored job, the gate's calls)."""
+    ws = _quiet_runner(monkeypatch, tmp_path)
+    srv._persist_queued_job(_job(tmp_path, ws, "991", "true"))
+    srv.jobs.clear()  # a new process: only the spool remembers the job
+    monkeypatch.setattr(srv, "_startup_tasks_done", False)
+    monkeypatch.setattr(srv, "should_privsep", lambda: True)
+
+    async def noop():
+        pass
+
+    monkeypatch.setattr(srv, "reconcile_running_scopes", noop)
+    monkeypatch.setattr(srv, "_record_startup_health", noop)
+    _shortfalls(monkeypatch, [(0, 32), (16, 32), None])  # the pool fills after the restart
+    calls = []
+
+    async def gate(job_log_file, *, phase, run_fabric, force_fabric=False, **kw):
+        calls.append((phase, run_fabric, force_fabric, srv._hugepages_shortfall()))
+        verdict()
+
+    monkeypatch.setattr(srv, "_device_health_gate", gate)
+
+    await srv.run_startup_tasks()
+
+    job = srv.jobs["991"]
+    assert job.status is srv.JobStatus.QUEUED
+    assert calls == [], "the startup pass runs after startup returns, behind a shut door"
+    assert srv.fsm.record.why == "startup_unverified"
+    assert srv._device_unavailable_for_tenant(), "the held job may not run before the startup pass"
+    for _ in range(200):
+        if calls:
+            break
+        await asyncio.sleep(0.01)
+    return job, calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_startup")
+async def test_a_job_held_across_an_update_waits_for_the_startup_fabric_pass(monkeypatch, tmp_path):
+    job, calls = await _restart_with_a_held_job(
+        monkeypatch, tmp_path, lambda: srv.fsm.on_readings(srv._healthy_reading())
+    )
+
+    assert calls == [("startup", True, True, None)], "one forced fabric pass, after the hugepage pool filled"
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert not srv._device_unavailable_for_tenant(), "a passed startup check opens the queue"
+    assert job.status is srv.JobStatus.QUEUED
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_startup")
+async def test_a_failed_startup_pass_after_an_update_keeps_the_queue_held(monkeypatch, tmp_path):
+    job, calls = await _restart_with_a_held_job(
+        monkeypatch, tmp_path, lambda: srv.fsm.on_fault(srv.FABRIC_RELIFT_WHY, detail="fabric check failed", dirty=True)
+    )
+
+    assert calls == [("startup", True, True, None)]
+    assert srv.fsm.state is ServerState.RECOVERING, "a failed check never releases the device"
+    assert srv._device_unavailable_for_tenant()
+    assert job.status is srv.JobStatus.QUEUED
+    assert (tmp_path / srv.QUEUED_SPEC_DIR / "991.json").exists(), "the held job is kept, not dropped"
