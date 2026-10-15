@@ -60,6 +60,7 @@ def test_autoupdate_required_stages_fail_closed():
         '"$ROOT/autoupdate.sh"',
         '"$ROOT/fabric-check.sh"',
         '"$ROOT/eth-heartbeat-probe.py"',
+        '"$ROOT/aiclk-ceiling.py"',
     ):
         stmt = _install_stmt(_AUTOUPDATE, dest)
         assert "|| true" not in stmt

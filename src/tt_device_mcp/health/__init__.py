@@ -19,6 +19,10 @@ both files) — every name either of them needs from here is either:
 
 from __future__ import annotations
 
+# The operator's AICLK ceiling state: server.py re-applies it at broker start and at the job door,
+# marks it owed when a job ends, and must be able to kill its helper on the dead-chip path.
+from tt_device_mcp.health.aiclk_ceiling import CEILING
+
 # The shared health vocabulary: HealthMonitor.status() returns a HealthState, and server.py both
 # builds one of its own (_healthy_reading()) and compares a probe's Verdict directly.
 from tt_device_mcp.health.core import HealthState, Verdict
@@ -35,7 +39,7 @@ from tt_device_mcp.health.evidence import (
     previous_boot_error,
     read_health_events,
 )
-from tt_device_mcp.health.monitor import HealthMonitor
+from tt_device_mcp.health.monitor import HealthMonitor, journal_interrupted_fabric_check
 
 # The fabric probe module itself, not a wrapping function: server.py's own preflight check reads
 # fabric.build_command() directly to warn when no fabric check is configured OR installed, and a
@@ -47,15 +51,18 @@ from tt_device_mcp.health.monitors import eth, fabric
 # counts, the dead-chip sampler, the startup probe) — not merely bounced into RecoveryDeps.
 from tt_device_mcp.health.monitors.heartbeat import (
     ALL_ONES,
+    arc_not_ready_chips,
     dead_chips,
     heartbeat_supported,
     heartbeat_verdict,
+    offbus_count,
     read_heartbeats,
+    returned_chips,
 )
 
 # The host-software version floors the startup preflight reports. Sysfs reads only, so the
 # preflight can assert them without spawning anything or touching a device.
-from tt_device_mcp.health.monitors.hostpci import version_floor_warnings
+from tt_device_mcp.health.monitors.hostpci import hugepages_shortfall, version_floor_warnings
 
 # The tt-smi/sysfs telemetry-sampler primitives server.py's own polling loop runs directly.
 from tt_device_mcp.health.monitors.pci import (
@@ -69,6 +76,10 @@ from tt_device_mcp.health.monitors.pci import (
     chip_snapshot_event,
     isolate_chip,
 )
+
+# The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and
+# server.py's release funnel and the gate read it to hold fabric-unverified until a pass settles it.
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
     BLOCKED,
     DEFER,
@@ -85,12 +96,14 @@ from tt_device_mcp.health.recovery import (
     RecoveryDeps,
     _declared_reset_mode,
     _persistent_recovery,
+    offbus_power_cycle,
 )
 from tt_device_mcp.health.recovery import select_recovery as _select_recovery  # noqa: F401
 from tt_device_mcp.health.recovery.base import (
     HOLD_ESCALATION_REARM_SEC,
     RESET_COOLDOWN_SEC,
     RecoveryMechanism,
+    mesh_hold_repage_sec,
 )
 
 # The Galaxy escalation ladder's own thresholds and vocabulary. The gate takes its escalation
@@ -108,6 +121,7 @@ from tt_device_mcp.health.recovery.galaxy import (
     _stuck_hold_ceiling_sec,
     _ubb_reset_enabled,
 )
+from tt_device_mcp.health.recovery.pcie_guard import pcie_guard_at_start
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
     bridge_reset_enabled,
@@ -119,10 +133,14 @@ from tt_device_mcp.health.recovery.stages.bridge_reset import (
 # the BMC (see the stage's own docstring); server.py's host-escalation ladder passes it straight
 # through as the `fire` callback, so it needs the name itself, not a wrapper around it.
 from tt_device_mcp.health.recovery.stages.power_cycle import _fire_power_cycle
+from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook as _run_pre_power_cycle_hook
 
 __all__ = [
+    # AICLK ceiling state (start, door, job end, dead-chip kill)
+    "CEILING",
     # construction pieces ServerFsm.boot assembles into the process singletons
     "HealthMonitor",
+    "journal_interrupted_fabric_check",
     "RecoveryMechanism",
     "RecoveryDeps",
     "GalaxyRecovery",
@@ -138,6 +156,9 @@ __all__ = [
     "previous_boot_bus_locks",
     "previous_boot_error",
     "read_health_events",
+    # boot: latch the off-bus reset gate when the last boot died inside one (spec 04 I25), and
+    # record the PCI topology (I23)
+    "pcie_guard_at_start",
     # vocabulary
     "HealthState",
     "Verdict",
@@ -146,9 +167,13 @@ __all__ = [
     "fabric",
     "ALL_ONES",
     "dead_chips",
+    "arc_not_ready_chips",
+    "offbus_count",
+    "returned_chips",
     "heartbeat_supported",
     "heartbeat_verdict",
     "read_heartbeats",
+    "hugepages_shortfall",
     "version_floor_warnings",
     "SAMPLE_INTERVAL_SEC",
     "SAMPLE_RING_SIZE",
@@ -168,6 +193,8 @@ __all__ = [
     "HOLD_ESCALATION_REARM_SEC",
     "RESET_COOLDOWN_SEC",
     "_declared_reset_mode",
+    # how often a standing hardware-fault hold is paged again (spec 03 I42)
+    "mesh_hold_repage_sec",
     # the escalation decision the gate acts on: the evidence it hands next_stage, and every
     # decision value that comes back which is not itself a stage name
     "Evidence",
@@ -190,4 +217,10 @@ __all__ = [
     "bridge_reset_unavailable_reason",
     "gone_chip_bridge_reset_enabled",
     "_fire_power_cycle",
+    "_run_pre_power_cycle_hook",
+    # the bounded off-bus hold (spec 04 I27): the gate's hold-deadline check asks it when the
+    # grace has run out and records the forced pass it spawned for that episode
+    "offbus_power_cycle",
+    # the post-reset fabric debt (spec 04 I32): no reset releases until a fabric pass settles it
+    "FABRIC_DEBT",
 ]

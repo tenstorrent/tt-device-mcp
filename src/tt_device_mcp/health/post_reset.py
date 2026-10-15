@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+"""The post-reset fabric debt: no reset releases the device until a fabric pass has passed since.
+
+Every reset action (a ``tt-smi -r`` or ``glx_reset`` through ``reset_with_quiesce``, a reset this
+broker adopted from a foreign scope, a bridge chip reset, a UBB tray reset or re-power, a PCI
+rescan) and every broker start marks the debt owed. Only a fabric pass that returns a healthy
+verdict settles it; a 77 (the pass could not run) or a failure leaves it owed.
+
+``_clear_device_dirty(verified=True)`` — the one release funnel every path goes through — consults
+``blocks_release`` and holds fabric-unverified instead of releasing while the debt is open, so a
+path that verified only enum+ARC, read a 77 as healthy, or skipped the fabric pass can no longer
+release a reset mesh. There is no switch that turns this off. It does not apply where no fabric
+pass can run on this host at all (a single chip, or no fabric check configured): nothing there
+could ever settle it, and those hosts have no fabric for a reset to leave unproven.
+
+The between-jobs path is unchanged while nothing is owed: no pass is added to a job boundary that
+followed no reset.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+from tt_device_mcp.health.evidence import health_event
+from tt_device_mcp.health.monitors import fabric
+
+
+class FabricDebt:
+    """Process-wide record of the newest reset no healthy fabric pass has followed yet."""
+
+    def __init__(self) -> None:
+        self.owed: str = ""
+
+    def note_reset(self, what: str) -> None:
+        """A reset (or a broker start) happened: the fabric is unproven until a pass clears it.
+        Journaled on the transition only; a newer reset while owed just renames it."""
+        if not self.owed:
+            health_event("post_reset_fabric_owed", reset=what)
+        self.owed = what
+
+    def note_fabric(self, ok: Optional[bool]) -> None:
+        """Fold one fabric verdict in: only a healthy one settles the debt."""
+        if ok is True and self.owed:
+            health_event("post_reset_fabric_settled", reset=self.owed)
+            self.owed = ""
+
+    def note_evidence(self, evidence: Optional[dict]) -> None:
+        """Fold the fabric verdict of a verify pass's evidence in, when that pass ran one."""
+        fab = (evidence or {}).get("fabric")
+        if isinstance(fab, dict):
+            self.note_fabric(fab.get("ok"))
+
+    def blocks_release(self, expected: int) -> str:
+        """The reset that still owes a fabric pass, or "" when a release may proceed."""
+        if not self.owed or expected <= 1 or not _fabric_check_configured():
+            return ""
+        return self.owed
+
+
+def _fabric_check_configured() -> bool:
+    """Whether a fabric pass can run here at all: ``fabric.build_command`` is not None, read without
+    the cache directories that builds as a side effect."""
+    return bool(os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "").strip()) or fabric.validator_missing() is None
+
+
+FABRIC_DEBT = FabricDebt()

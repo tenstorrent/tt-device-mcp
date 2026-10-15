@@ -99,7 +99,7 @@ your project's `AGENTS.md`.
 | `tt_device_job_kill` | Kill or cancel a job |
 | `tt_device_queue_status` | Running and queued jobs |
 | `tt_device_exec` | Run a command directly (`tt-smi`, etc.) |
-| `tt_device_reset` | Reset the device; refuses over another user's job |
+| `tt_device_reset` | Reset the device; refuses while a job runs or another user holds it |
 | `tt_device_recent_jobs` | Recent job history |
 
 ## How it works
@@ -121,6 +121,22 @@ Start with [00-overview](specs/00-overview.md).
 
 Environment variables set paths, timeouts, and health thresholds. The full index
 is in [06-state-paths](specs/06-state-paths.md).
+
+If other workloads share the host, an automatic power cycle cuts them too. Set
+`TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` to a command that drains them; the broker
+runs it just before it power-cycles the host and waits for it to exit, up to
+`TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC` (default 300 s). The command is
+split like shell words and run without a shell; the reason for the cycle is in
+`TT_DEVICE_MCP_POWER_CYCLE_REASON`. Its exit code and output go to the log. The
+cycle goes ahead whatever the hook does, so a failing or hung hook never blocks
+recovery. The full reset ladder still runs first. For example, in a systemd
+drop-in for the broker:
+
+```
+[Service]
+Environment="TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK=/usr/local/bin/drain-jobs --reason power-cycle"
+Environment=TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC=300
+```
 
 ## Slurm
 
@@ -148,7 +164,9 @@ See [deploy/README.md](deploy/README.md) for the timeout arithmetic
 **The device is hung.**
 
 - `tt-device-mcp reset`. It scans for processes holding the device first, and
-  refuses if another user is on it. Ask them to stop, or pass `--force`.
+  refuses if another user is on it. It also refuses while a broker job is
+  running, since a reset would kill it. Wait for the job, kill your own job
+  first, or pass `--force` (the job it stops is logged).
 - Never run `tt-smi -r` by hand while the broker is up.
 
 **`pytest` cannot open the device.**

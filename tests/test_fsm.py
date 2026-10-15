@@ -3,7 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """The server FSM: BOOT/HEALTHY/RECOVERING/DOWN, and the durable record behind it."""
 
+from datetime import datetime
+
 from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState
+from tt_device_mcp.health import OUTCOME_RECOVERED
+from tt_device_mcp.health.core import HealthState
 
 
 def _fsm(tmp_path):
@@ -294,3 +298,61 @@ def test_boot_merge_reattributes_only_the_current_boot(tmp_path):
     d = f.record.detail
     assert d.count("boot attributed") == 1, "no stale-plus-new duplicate"
     assert "recorded at NEW" in d and "recorded at OLD" not in d
+
+
+def test_boot_merge_attributes_the_escalation_only_on_the_boots_first_broker_start(tmp_path):
+    """The ledger names the escalation that brought THIS boot up, and stays adjacent to it for the
+    whole boot. A broker restarted later in that boot (an autoupdate, a crash) was not caused by
+    it: stamping it there labels every later hold with a weeks-old power cycle. Fails on base,
+    where every start of the boot re-attributes."""
+    path = tmp_path / "fsm.json"
+    escalation = {"action": "power-cycle", "at": "2026-09-16T05:21:11"}
+    first = ServerFsm(path, current_boot_id="boot-A")
+    first.boot_merge(open_episode=None, attributed_boot=escalation)
+    assert "boot attributed to a broker-fired power-cycle" in first.record.detail
+
+    again = ServerFsm(path, current_boot_id="boot-A")  # restart within the same boot
+    again.boot_merge(open_episode=None, attributed_boot=escalation)
+    assert "boot attributed" not in (again.record.detail or "")
+
+    carried = ServerFsm(path, current_boot_id="boot-A")  # a carried episode loses the stale clause too
+    carried.boot_merge(
+        open_episode=FsmRecord(state=ServerState.RECOVERING, why="eth_frozen", detail=first.record.detail),
+        attributed_boot=escalation,
+    )
+    assert "boot attributed" not in (carried.record.detail or "")
+
+    next_boot = ServerFsm(path, current_boot_id="boot-B")  # a new boot it brought up attributes again
+    next_boot.boot_merge(open_episode=None, attributed_boot={"action": "reboot", "at": "2026-10-13T20:30:00"})
+    assert "boot attributed to a broker-fired reboot" in next_boot.record.detail
+
+
+def test_on_next_close_fires_once_on_whichever_path_reaches_healthy(tmp_path):
+    """A caller pairing an opening event with its close (the startup hold's release row) registers
+    once and must hear about the close exactly once — not on a refreshed fault mid-episode, not
+    again on a later episode — whether a healthy read or a recovered rung closes it."""
+    f = _fsm(tmp_path)
+    f.boot_merge(open_episode=None, attributed_boot=None)
+    closed = []
+    f.on_next_close(closed.append)
+
+    f.on_fault("foreign_holder", detail="pid 42 holds it", dirty=False)  # same episode, new why
+    assert closed == []
+    f.on_outcome(OUTCOME_RECOVERED)
+    assert [(r.state, r.why) for r in closed] == [(ServerState.RECOVERING, "foreign_holder")]
+
+    f.on_fault("job_killed")
+    f.on_readings(HealthState(phase="test", at=datetime.now(), expected=0))
+    assert len(closed) == 1, "a one-shot close hook fired again on a later episode"
+
+
+def test_a_failing_close_hook_does_not_break_the_transition(tmp_path):
+    f = _fsm(tmp_path)
+    f.on_fault("job_killed")
+
+    def boom(_record):
+        raise RuntimeError("journal unwritable")
+
+    f.on_next_close(boom)
+    f.on_readings(HealthState(phase="test", at=datetime.now(), expected=0))
+    assert f.state is ServerState.HEALTHY

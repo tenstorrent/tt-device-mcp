@@ -83,6 +83,9 @@ FABRIC_DESCRIPTOR=""
 # the artifact is missing.
 install -m 0755 "$REPO/deploy/tt-device-eth-heartbeat-probe.py" "$R/eth-heartbeat-probe.py" \
     || echo "warn: eth-heartbeat probe not staged (optional pre-read unavailable): $R/eth-heartbeat-probe.py" >&2
+# Optional AICLK ceiling helper (off unless TTDEV_AICLK_CEILING_MHZ is set); same best-effort rule.
+install -m 0755 "$REPO/deploy/tt-device-aiclk-ceiling.py" "$R/aiclk-ceiling.py" \
+    || echo "warn: aiclk-ceiling helper not staged (falls back to the checkout's copy): $R/aiclk-ceiling.py" >&2
 # Remove the retired wrapper a host installed before it was retired may still have on disk
 # (apply-host-config.sh, run on every auto-update, also scrubs this and any /etc/default value
 # still pointing at it — this covers the manual re-install path too).

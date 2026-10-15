@@ -226,6 +226,36 @@ def chip_pci_bdf(idx: str) -> Optional[str]:
         return None
 
 
+def chip_pci_bdfs() -> dict:
+    """Every chip index the KMD currently exposes, mapped to its PCI address:
+    ``{0: '0000:01:00.0', ...}``. A chip whose address cannot be read is left out.
+
+    The kernel's chip index is the one /dev, sysfs and the heartbeat read use, and it need not
+    follow PCI order — so this, not a list position in a tt-smi snapshot, is what ties a chip
+    index to its bus."""
+    out: dict = {}
+    try:
+        entries = sorted(SYSFS_CLASS_DIR.iterdir())
+    except OSError:
+        return out
+    for ent in entries:
+        idx = ent.name.rsplit("!", 1)[-1]
+        if not idx.isdigit():
+            continue
+        bdf = chip_pci_bdf(idx)
+        if bdf and pci_bus_number(bdf) is not None:
+            out[int(idx)] = bdf
+    return out
+
+
+def pci_bus_number(address) -> Optional[int]:
+    """The bus number of a PCI address ('0000:81:00.0' -> 0x81), or None when unreadable."""
+    try:
+        return int(str(address).split(":")[1], 16)
+    except (IndexError, ValueError):
+        return None
+
+
 def isolate_chip(idx: str) -> bool:
     """Remove a dead chip from the kernel, so nothing on the box can reach it any more.
 

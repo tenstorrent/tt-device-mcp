@@ -14,7 +14,25 @@ import sys
 import time
 import types
 
+import pytest
+
+from tt_device_mcp.health.recovery import pcie_guard
 from tt_device_mcp.health.recovery.stages.ubb_tray import _fire_ubb_reset as _REAL_FIRE_UBB_RESET
+
+
+@pytest.fixture(autouse=True)
+def _bare_envelope(monkeypatch):
+    """These tests pin the ioctl/IPMI handshake; the sysfs envelope around it has its own tests
+    (test_pcie_guard.py). Run the handshake's three steps in order, as the envelope does."""
+
+    def _run(bitmap, ids, fire, log, *, quiesce, reinit, **_kw):
+        quiesce(ids)
+        try:
+            fire()
+        finally:
+            reinit(ids)
+
+    monkeypatch.setattr(pcie_guard, "safe_tray_repower", _run)
 
 
 def test_fire_ubb_reset_imports_a_symbol_the_installed_tt_smi_defines(monkeypatch):
@@ -150,3 +168,40 @@ def test_fire_ubb_reset_falls_back_to_the_chip_reset_class_on_older_tt_smi(monke
         ("ioctl", 17, "POST_RESET"),
         ("ioctl", 18, "POST_RESET"),
     ], "the fire must USER_RESET every chip, pulse the tray once over IPMI, then POST_RESET every chip"
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        types.SimpleNamespace(returncode=1, stdout="", stderr="Unable to send RAW command: No data available"),
+        OSError(2, "No such file or directory", "ipmitool"),
+        subprocess.TimeoutExpired("ipmitool", 60),
+    ],
+    ids=["no_data", "missing", "timeout"],
+)
+def test_a_pulse_the_bmc_did_not_take_raises_bmc_ipmi_error(monkeypatch, outcome):
+    """A BMC whose IPMI does not answer (non-zero exit, no ipmitool, a hang) raises BmcIpmiError, so the
+    broker can tell an unresponsive BMC from a refused or failed re-power and hand off (spec 04 I27)."""
+    from tt_device_mcp.health.recovery.stages.ubb_tray import BmcIpmiError
+
+    class _Flags:
+        USER_RESET = "USER_RESET"
+        POST_RESET = "POST_RESET"
+
+    fake_reset = types.ModuleType("tt_smi.reset")
+    fake_reset.IoctlResetFlags = _Flags
+    fake_reset.reset_device_ioctl = lambda iid, flag: None
+    fake_pkg = types.ModuleType("tt_smi")
+    fake_pkg.reset = fake_reset
+    monkeypatch.setitem(sys.modules, "tt_smi", fake_pkg)
+    monkeypatch.setitem(sys.modules, "tt_smi.reset", fake_reset)
+
+    def _fake_run(argv, **_kw):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+    with pytest.raises(BmcIpmiError):
+        _REAL_FIRE_UBB_RESET(0b1, [0])

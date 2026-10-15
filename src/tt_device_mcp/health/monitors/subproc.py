@@ -18,6 +18,8 @@ import os
 import signal
 from typing import Awaitable, Callable, Optional
 
+from tt_device_mcp import aio
+
 Track = Callable[[Optional["asyncio.subprocess.Process"]], None]
 Terminate = Callable[[int], Awaitable[None]]
 
@@ -75,10 +77,10 @@ async def run_probe(
                 async for line in proc.stdout:
                     chunks.append(line)
 
-            await asyncio.wait_for(_drain(), timeout=timeout_sec)
+            await aio.wait_for(_drain(), timeout=timeout_sec)
             await proc.wait()
         else:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+            out, _ = await aio.wait_for(proc.communicate(), timeout=timeout_sec)
             if out:
                 chunks.append(out)
         return proc.returncode, b"".join(chunks)

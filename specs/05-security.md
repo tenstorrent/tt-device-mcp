@@ -96,7 +96,8 @@ that did not come through the broker at all.
   host there is no identity to scope the gate to, so every tenant holder counts as foreign and the
   gate fails closed; off privsep, HTTP keeps the legacy single-tenant skip. `MIN_TENANT_UID`
   (1000) divides tenants from infrastructure: holders below it (root, telemetry daemons) never
-  count as foreign.
+  count as foreign, unless they sit in a broker job or exec scope or their uid is named in
+  `TT_DEVICE_MCP_TENANT_UIDS` (`device_holders.is_tenant`, 04 I6).
 
 ## Interfaces
 
@@ -128,7 +129,9 @@ Consumed by other subsystems and by tests:
   time, `None` over HTTP, carried in the durable queued-job spec so a restart preserves the
   privsep target.
 - **`device_holders.MIN_TENANT_UID`** (= 1000): the tenant/infrastructure boundary, used by the
-  reset gate (spec 04) and the health gate's holder checks (spec 03).
+  reset gate (spec 04) and the health gate's holder checks (spec 03) through
+  `device_holders.is_tenant`, which also counts a broker-scoped holder and a
+  `TT_DEVICE_MCP_TENANT_UIDS` uid.
 - **Lock surface** (`cli.py`): `cmd_lock` / `cmd_unlock` (sudo; `tt-device-mcp lock|unlock`);
   artifacts managed by them: the udev rule (`99-tenstorrent-ttdev.rules`), the
   `TT_DEVICE_MCP_DEVICE_GROUP=ttdev` line in the broker unit, the read-only smi wrapper +
@@ -187,11 +190,14 @@ lifecycle can assert that a remaining holder is a straggler rather than a tenant
 pids present in its own first scan — a pid that appears only in a later rescan is a holder that
 opened the device after the reclaim began, not a straggler of the allocation that just ended, and
 is reported as a survivor rather than escalated onto. Two exclusions are structural: it never
-signals uids below `MIN_TENANT_UID` (infrastructure that survives a board reset), and it never
+signals a holder `is_tenant` does not count (infrastructure below `MIN_TENANT_UID` that survives a
+board reset), and it never
 signals itself or its own process group. It has no way to recognize "a broker-owned job" as such
 — under privsep that job runs as its submitter's uid and looks like any other tenant holder — so
 protecting a live broker job from the reclaim is the in-flight guard's job (`_broker_work_in_flight`,
-re-checked after the reclaim returns), not a property of this function. A job the broker itself
+re-checked after the reclaim returns), not a property of this function. The guard also refuses
+while a re-adopted job's scope has not ended, even once the job reads KILLED: its processes may
+still be winding down, and a SIGTERM there skips the scope's own graceful stop. A job the broker itself
 means to end still terminates through `_kill_job`.
 
 **Job-step routes are root-only.** `/api/tt_device_pre_step` and `/api/tt_device_post_step`
@@ -244,7 +250,12 @@ converts "unprotected" into "believed protected".
 **Why `MIN_TENANT_UID`.** System uids (< 1000) belong to infrastructure that legitimately holds
 the device continuously — telemetry exporters, the broker's own tooling. Treating them as tenants
 would make every holder-gated action permanently refusable on any instrumented host. Treating
-uids ≥ 1000 as tenants is the conservative default: a human's process is never reset over. Spec 04
+uids ≥ 1000 as tenants is the conservative default: a human's process is never reset over. A job
+submitted by a service account is still a tenant's job: its processes sit in the broker's
+`ttdev-job-*.scope`, which they cannot leave, so a straggler that outlives the job's KILLED or
+finished status (seconds while the scope winds down) still blocks. A service account that also
+runs device work outside the broker is named in `TT_DEVICE_MCP_TENANT_UIDS`. Root is never one,
+even if named: its daemons hold the device permanently and would block every gate for good. Spec 04
 (I6, I7) defines how the reset gate and the automatic ladder consume the boundary.
 
 **Why the exit file defers to the broker's own reaping.** A record written by the job is the only

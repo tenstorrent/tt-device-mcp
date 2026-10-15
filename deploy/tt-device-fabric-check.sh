@@ -15,6 +15,9 @@
 #   exit 77  => the check could not run at all (binary/descriptor absent, or the
 #               descriptor does not describe this host). The broker records this and
 #               SKIPS — it does not reset, because nothing about the device was learned.
+#   exit 78  => HARDWARE FAULT: the cabling descriptor's links are missing with none extra (a cable
+#               absent or dead) and the traffic-only rerun gave no verdict. The broker holds it as a
+#               known fabric fault and pages once; it never resets or climbs the ladder for it.
 #   exit *   => fabric UNHEALTHY -> the broker resets the device.
 #
 # The distinction between 0 and 77 is the whole contract. This script used to
@@ -48,8 +51,16 @@
 set -u
 
 EXIT_CANNOT_CHECK=77
+EXIT_HARDWARE_FAULT=78
 
-log() { echo "fabric-check: $*" >&2; }
+# Once $OUT exists, every log line also goes to $LAST: a file overwritten each run that keeps the last
+# run's verdict and its whole output where an operator can read it after the journal rotated.
+LAST=""
+log() {
+    echo "fabric-check: $*" >&2
+    [ -n "$LAST" ] && echo "fabric-check: $*" >>"$LAST"
+    return 0
+}
 cannot_check() { log "$* -> CANNOT CHECK (exit $EXIT_CANNOT_CHECK; broker will not reset on this)"; exit "$EXIT_CANNOT_CHECK"; }
 
 VROOT="${TTDEV_VALIDATOR_ROOT:-/opt/tt-device-broker/validator}"
@@ -97,15 +108,84 @@ fi
 
 OUT="${TTDEV_FABRIC_OUTPUT:-$TT_METAL_CACHE/cluster_validation_logs}"
 mkdir -p "$OUT" 2>/dev/null || true
+# The whole output of each run, so a 77 shows its cause and not only its last line. Overwritten each
+# run; a run whose output passes TTDEV_FABRIC_LAST_RUN_MAX_BYTES (default 4 MiB) keeps both ends.
+if : >"$OUT/last-run.log" 2>/dev/null; then
+    LAST="$OUT/last-run.log"
+    echo "fabric-check: run started $(date -Is)" >>"$LAST"
+fi
+# A cap that is not a plain byte count (e.g. "4M") would break the arithmetic below after the
+# validator ran and turn its verdict into a fault: say so and use the default.
+LAST_MAX="${TTDEV_FABRIC_LAST_RUN_MAX_BYTES:-4194304}"
+if ! [[ "$LAST_MAX" =~ ^[0-9]{1,15}$ ]] || [ "$LAST_MAX" -lt 1024 ]; then
+    log "TTDEV_FABRIC_LAST_RUN_MAX_BYTES='$LAST_MAX' is not a byte count >= 1024; using 4194304"
+    LAST_MAX=4194304
+fi
+save_to_last() {
+    [ -n "$LAST" ] && [ -r "$1" ] || return 0
+    local size
+    size="$(wc -c <"$1")"
+    if [ "$size" -le "$LAST_MAX" ]; then
+        cat "$1" >>"$LAST"
+    else
+        head -c "$((LAST_MAX / 2))" "$1" >>"$LAST"
+        printf '\nfabric-check: ... %s bytes cut ...\n' "$((size - LAST_MAX))" >>"$LAST"
+        tail -c "$((LAST_MAX / 2))" "$1" >>"$LAST"
+    fi
+    return 0
+}
+
+# The 1G hugepage pool. A Tenstorrent function behind an identity-mapped IOMMU, or none, cannot be
+# opened until its 1G hugepage exists (one per function), and boot fills the pool late
+# (tenstorrent-hugepages.service), after the hugetlbfs mount is up with 0 pages. A validator run then
+# dies with "Failed to pin pages for hugepage" having tested no link, so say why without running it.
+# An unreadable pool, or no function that needs a page, waits for nothing (as the broker's own check).
+HP_NR="${TTDEV_HUGEPAGES_1G_NR:-/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages}"
+PCI_DEVICES="${TTDEV_PCI_DEVICES_DIR:-/sys/bus/pci/devices}"
+hp_need=0
+for fn in "$PCI_DEVICES"/*; do
+    [ "$(cat "$fn/vendor" 2>/dev/null)" = "0x1e52" ] || continue
+    if [ ! -e "$fn/iommu_group" ] || [ "$(cat "$fn/iommu_group/type" 2>/dev/null)" = "identity" ]; then
+        hp_need=$((hp_need + 1))
+    fi
+done
+hp_have="$(cat "$HP_NR" 2>/dev/null)"
+if [ "$hp_need" -gt 0 ] && [[ "$hp_have" =~ ^[0-9]+$ ]] && [ "$hp_have" -lt "$hp_need" ]; then
+    cannot_check "hugepage pool not ready: $hp_have/$hp_need 1G pages allocated ($HP_NR)"
+fi
 
 log "running run_cluster_validation --send-traffic --num-iterations $ITERS"
 cd "$RUNTIME_ROOT" || cannot_check "cannot cd to '$RUNTIME_ROOT'"
 RUNLOG="$(mktemp)" || cannot_check "cannot create a temp file for the validator output"
 trap 'rm -f "$RUNLOG"' EXIT
-"$BIN" "${desc_argv[@]}" --output-path "$OUT" --hard-fail --send-traffic --num-iterations "$ITERS" \
-    >"$RUNLOG" 2>&1
-rc=$?
-cat "$RUNLOG" >&2
+run_validator() {
+    "$BIN" "$@" --output-path "$OUT" --hard-fail --send-traffic --num-iterations "$ITERS" >"$RUNLOG" 2>&1
+    rc=$?
+    cat "$RUNLOG" >&2
+    save_to_last "$RUNLOG"
+}
+run_validator "${desc_argv[@]}"
+
+# TOPOLOGY MISMATCH: the links the validator discovered are not the ones the descriptor names. Its
+# tray ids come from PCI bus numbers, so a tray whose uplink lands on another bus, or a cable that is
+# not there, mismatches on every run, and a board reset cannot change either. Not a measurement:
+# rerun once without the descriptor so traffic still crosses every discovered link, and classify
+# that run with the chain below. A pass carries the marker as the last line before exit 0.
+TOPO=""
+n_missing=0 n_extra=0
+if [ "$rc" -ne 0 ] && [ -n "$DESC" ] && grep -q "Connection mismatch detected" "$RUNLOG"; then
+    read -r n_missing n_extra < <(awk '
+        /found [0-9]+ missing port\/cable connections/ { s = "m"; next }
+        /found [0-9]+ extra port\/cable connections/   { s = "e"; next }
+        /Physical Discovery found|connections:/        { s = ""; next }
+        s != "" && /PhysicalPortEndpoint/              { c[s]++ }
+        END { printf "%d %d\n", c["m"], c["e"] }' "$RUNLOG")
+    TOPO="TOPOLOGY MISMATCH vs $DESC: $n_missing missing, $n_extra extra port connections (tray ids come from PCI bus numbers; a board reset cannot change this)"
+    log "$TOPO"
+    log "rerunning once without the descriptor: traffic over every discovered link"
+    run_validator
+fi
+topo_ok() { [ -z "$TOPO" ] || log "$TOPO"; }
 
 
 # UNHEALTHY is a VERDICT, and only the validator can return one. It reaches that verdict in exactly
@@ -142,11 +222,54 @@ elif grep -qE "Workload execution timed out after [0-9]+ seconds" "$RUNLOG"; the
     # about its fabric. Skipping it leaves the wedge riding on, exactly like the eth-core case.
     log "fabric UNHEALTHY (rc=$rc): traffic stalled until the validator's watchdog fired; no link reported back -> resettable"
     [ "$rc" -eq "$EXIT_CANNOT_CHECK" ] && rc=1
+elif grep -q "Encountered unrecoverable state" "$RUNLOG"; then
+    # Links the descriptor expects are still missing after the validator's own link retrains. Only
+    # reachable with a descriptor set, and one is set only on a host it describes: a measured fault.
+    log "fabric UNHEALTHY (rc=$rc): links the cabling descriptor expects are still missing after the validator's retrains -> resettable"
+    [ "$rc" -eq "$EXIT_CANNOT_CHECK" ] && rc=1
 else
-    reason="$(grep -m1 -oE 'what\(\):.*|filesystem error:.*|terminate called.*' "$RUNLOG" | head -1)"
-    cannot_check "validator did not complete a measurement (rc=$rc)${reason:+: $reason}
-    no link was tested, so this says nothing about the fabric -- see $OUT and the log above"
+    # The validator's FIRST error line, most specific first (same order as fabric.first_reason):
+    # "terminate called after throwing ..." sits on the line ABOVE "  what():  <cause>", so a single
+    # first-match grep kept the exception type and dropped the cause — a missing hugepage pool read
+    # as a bare UmdException.
+    reason=""
+    for pat in 'what\(\):.*' 'filesystem error:.*' \
+        '(\|\s*(critical|fatal|error)\s*\||\[(critical|error)\]|TT_THROW|TT_FATAL).*' 'terminate called.*'; do
+        hit="$(grep -m1 -noiE "$pat" "$RUNLOG" | head -1)"
+        [ -n "$hit" ] || continue
+        reason="${hit#*:}"
+        # A TT_FATAL/TT_THROW header names only the source line and the failed condition; metal
+        # prints the message itself on the line after a bare "info:" right below it.
+        info=""
+        if printf '%s' "$reason" | grep -qE 'TT_(FATAL|THROW) @ '; then
+            info="$(awk -v n="${hit%%:*}" 'NR == n + 1 && !/^[ \t]*info:[ \t]*$/ { exit }
+                NR == n + 2 { sub(/^[ \t]+/, ""); print; exit }' "$RUNLOG")"
+        fi
+        if [ -n "$info" ]; then
+            reason="$(printf '%s' "$reason" | cut -c1-200) -- $(printf '%s' "$info" | cut -c1-200)"
+        else
+            reason="$(printf '%s' "$reason" | cut -c1-300)"
+        fi
+        break
+    done
+    [ -n "$reason" ] || reason="last output: $(grep -vE '^\s*$' "$RUNLOG" | sed -n '$p' | cut -c1-200)"
+    # The pool emptied or was short of free pages after the check above: the same not-yet-ready, by name.
+    grep -q "Failed to pin pages for hugepage" "$RUNLOG" && reason="hugepage pool not ready: $reason"
+    # The reason goes on the FINAL line: an operator's wrapper is summarized by its last line, and
+    # a cause printed above it was dropped from every log that quoted the check.
+    log "no link was tested, so this says nothing about the fabric -- see $OUT/last-run.log"
+    [ -z "$TOPO" ] || reason="topology mismatch, traffic-only rerun: $reason"
+    if [ -n "$TOPO" ] && [ "$n_missing" -gt 0 ] && [ "$n_extra" -eq 0 ]; then
+        # Links the descriptor names are missing and nothing extra was found, so no tray moved: a
+        # cable is absent or dead. That is a hardware verdict, not "cannot check": a reset, a tray
+        # re-power or a power cycle cannot bring it back, and a 77 sends the broker round its ladder.
+        log "HARDWARE FAULT: $n_missing port/cable connection(s) of $DESC missing and none extra (a cable is absent or dead; no reset can fix it, needs an operator); $reason (exit $EXIT_HARDWARE_FAULT; broker holds without a reset)"
+        exit "$EXIT_HARDWARE_FAULT"
+    fi
+    cannot_check "validator did not complete a measurement (rc=$rc): $reason"
 fi
+# A measured-bad verdict must never collide with the cannot-check or hardware-fault sentinels.
+case "$rc" in "$EXIT_CANNOT_CHECK" | "$EXIT_HARDWARE_FAULT") rc=1 ;; esac
 [ "$rc" -eq 0 ] || exit "$rc"
 
 # ---- dispatch ----------------------------------------------------------------------------------
@@ -170,6 +293,7 @@ fi
 DBIN="${TTDEV_DISPATCH_BIN:-$CURRENT/build/programming_examples/distributed/distributed_program_dispatch}"
 [ -x "$DBIN" ] || {
     log "pinned dispatch probe not built ('$DBIN'); fabric verdict stands on its own"
+    topo_ok
     exit 0
 }
 DTMO="${TTDEV_DISPATCH_TIMEOUT:-90}"
@@ -185,16 +309,18 @@ TT_METAL_OPERATION_TIMEOUT_SECONDS="${TTDEV_DISPATCH_OP_TIMEOUT:-25}" \
 drc=$?
 
 case "$drc" in
-    0)   log "dispatch OK: every chip ran a program"; exit 0 ;;
+    0)   log "dispatch OK: every chip ran a program"; topo_ok; exit 0 ;;
     # Killed at the cap. We did NOT measure a wedge — we failed to measure at all, and this is the
     # exact verdict that reset this host in a loop when the probe itself was the slow thing. A real
     # dispatch hang comes back through the operation timeout as a non-zero exit above, so nothing
     # is lost by refusing to guess here.
-    137) cannot_check "dispatch probe hit its ${DTMO}s cap without a verdict (typical is 14s)
-    last: $(grep -vE '^\s*$' "$DOUT" | sed -n '$p' | cut -c1-160)" ;;
+    137) save_to_last "$DOUT"
+         log "dispatch probe last output: $(grep -vE '^\s*$' "$DOUT" | sed -n '$p' | cut -c1-160)"
+         cannot_check "dispatch probe hit its ${DTMO}s cap without a verdict (typical is 14s)" ;;
     *)   reason="$(grep -m1 -oE 'Timed out.*|TT_THROW.*|what\(\):.*|terminate called.*' "$DOUT")"
          grep -vE '^\s*$' "$DOUT" | sed -n '1,40p' | sed 's/^/fabric-check|  /' >&2
-         log "dispatch FAILED on a green fabric (rc=$drc)${reason:+: $reason}"
+         save_to_last "$DOUT"
          log "the bus and the links are fine and the mesh still cannot run a program -> UNHEALTHY, the broker will reset"
+         log "dispatch FAILED on a green fabric (rc=$drc)${reason:+: $reason}"
          exit 1 ;;
 esac

@@ -18,12 +18,25 @@ GROUP=ttdev
 
 # 1) Broker service: systemd handles normal restarts (Restart=on-failure); only
 #    intervene if it's not active (e.g. failed/exhausted), so we don't fight it.
+#    'activating' (and 'reloading'/'deactivating') is a start or stop already in progress: the
+#    broker sits in it through its startup check, which can take minutes. A start would only block
+#    behind that job, so leave it alone and say so once per episode, not every lap.
 state="$(systemctl is-active tt-device-broker 2>/dev/null || true)"
-if [ "$state" != "active" ]; then
-    echo "reconcile: broker is '$state' -> resetting + starting" >&2
-    systemctl reset-failed tt-device-broker 2>/dev/null || true
-    systemctl start tt-device-broker 2>/dev/null || true
-fi
+inprog=/run/tt-device-broker/reconcile_inprogress
+case "$state" in
+    active)
+        rm -f "$inprog" 2>/dev/null || true ;;
+    activating|reloading|deactivating)
+        if [ "$(cat "$inprog" 2>/dev/null || true)" != "$state" ]; then
+            echo "reconcile: broker is '$state' -> in progress, leaving it to systemd" >&2
+            echo "$state" > "$inprog" 2>/dev/null || true
+        fi ;;
+    *)
+        rm -f "$inprog" 2>/dev/null || true
+        echo "reconcile: broker is '$state' -> resetting + starting" >&2
+        systemctl reset-failed tt-device-broker 2>/dev/null || true
+        systemctl start tt-device-broker 2>/dev/null || true ;;
+esac
 
 # 1b) Stray broker: a SECOND broker the system unit does not manage — a legacy per-user daemon
 #     from before `daemon start` learned to defer to the system broker, or a hand-started one. It
@@ -63,7 +76,7 @@ if [ -S "$SOCK" ] && [ "$(stat -c %a "$SOCK" 2>/dev/null)" != "666" ]; then
 fi
 
 # 3) System CLI symlink points at the broker venv. Must be on PATH so both the
-#    human CLI and the tt-buddy plugin's bare `tt-device-mcp` command resolve.
+#    human CLI and an agent plugin's bare `tt-device-mcp` command resolve.
 t="$R/venv/bin/tt-device-mcp"
 if [ -x "$t" ] && [ "$(readlink -f /usr/local/bin/tt-device-mcp 2>/dev/null)" != "$(readlink -f "$t" 2>/dev/null)" ]; then
     echo "reconcile: repointing /usr/local/bin/tt-device-mcp -> $t" >&2

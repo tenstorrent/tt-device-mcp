@@ -17,9 +17,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from tt_device_mcp import metrics, privileges
+from tt_device_mcp import aio, alert, metrics, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
+from tt_device_mcp.health.aiclk_ceiling import CEILING
+from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
 from tt_device_mcp.health.evidence import health_dir, health_event
+from tt_device_mcp.health.monitors.heartbeat import returned_chips
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
 # A daemon without systemd uses the local lock below for the same restart-adoption contract.
@@ -63,7 +67,7 @@ AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
 POWER_CYCLE_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC", "1800"))
 
 # The host-level recovery rungs, ordered by severity. A warm reboot recovers most wedges; a
-# whole-bus wedge survives it and only the chassis power cycle clears it (measured on blx04).
+# whole-bus wedge survives it and only the chassis power cycle clears it (measured on box D).
 # The min-interval loop guard is therefore PER SEVERITY: a stronger rung may escalate past a
 # weaker one that just fired — a reboot that did not fix the mesh must not force an hour's wait
 # before the power cycle that will — but no rung may re-fire itself inside the interval (its own
@@ -85,6 +89,89 @@ BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC = int(
     os.environ.get("TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC", "900").strip() or "900"
 )
 
+# An outage hold turns every hardware rung off at once. Each alone is a normal per-host choice (an
+# unconfirmed BMC turns the tray rung off and the ladder still climbs through the mesh reset), but
+# all three off together say "touch nothing": the mesh reset is held too.
+OUTAGE_HOLD_VARS = ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE", "TT_DEVICE_MCP_AUTO_UBB_RESET")
+# The hold reason -> when its page went out (monotonic). A held mesh reset stays HELD until an operator
+# acts, so the page is the hold's only bound: while the hold stands it is sent again every
+# mesh_hold_repage_sec(), so a page that was missed or forgotten never leaves the device held in silence.
+_mesh_hold_paged: dict = {}
+MESH_HOLD_REPAGE_DEFAULT_SEC = 3600
+
+
+def mesh_hold_repage_sec() -> int:
+    """``TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC``: how long a standing mesh-reset hold waits before it pages
+    again (default 3600). ``0`` pages once per hold; nonsense reads as the default."""
+    try:
+        value = int(os.environ.get("TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC", "").strip())
+    except ValueError:
+        return MESH_HOLD_REPAGE_DEFAULT_SEC
+    return value if value >= 0 else MESH_HOLD_REPAGE_DEFAULT_SEC
+
+
+def mesh_reset_hold_reason() -> str:
+    """Why the operator forbids an AUTOMATIC mesh-wide reset (the gate's, the idle relift's, the
+    watchdog's or the last-chance sweep's ``tt-smi -glx_reset``), or "" when it may fire.
+
+    ``TT_DEVICE_MCP_AUTO_MESH_RESET=0`` holds it explicitly and ``=1`` arms it whatever else is set.
+    Unset, an outage hold (every :data:`OUTAGE_HOLD_VARS` set to 0) holds it: a mesh reset on a mesh
+    that is already off the bus is what starts an off-bus power-cycle loop. The operator's own reset
+    tool is never held."""
+    mesh = os.environ.get("TT_DEVICE_MCP_AUTO_MESH_RESET", "").strip()
+    if mesh == "0":
+        return "TT_DEVICE_MCP_AUTO_MESH_RESET=0"
+    if mesh == "1":
+        return ""
+    if all(os.environ.get(v, "").strip() == "0" for v in OUTAGE_HOLD_VARS):
+        return "outage hold (" + ", ".join(f"{v}=0" for v in OUTAGE_HOLD_VARS) + ")"
+    return ""
+
+
+def drop_returned_isolated(isolated: set, context: str, log=None) -> list:
+    """Re-read sysfs and take every chip of ``isolated`` that is back on the bus out of it, in place.
+    Run after every tray re-power, mesh reset and PCI rescan, whatever the verify that follows says:
+    a chip left in the set after it returned keeps /health and the gate reading it as isolated and
+    arms a needless bridge reset on the next pass. Never releases anything: only the full health
+    check, fabric included, does that (spec 03 I52)."""
+    if not isolated:
+        return []
+    back = returned_chips(isolated)
+    for c in back:
+        isolated.discard(c)
+    if back:
+        health_event("isolated_chips_returned", chips=back, context=context, still_isolated=sorted(isolated, key=int))
+        if log:
+            log(f"chip(s) {back} back on the bus after the {context}: no longer isolated")
+    return back
+
+
+def refuse_mesh_reset(context: str, argv: list, log, off_bus: int = 0) -> bool:
+    """True when :func:`mesh_reset_hold_reason` holds the mesh reset: logged, journaled and paged
+    once per hold, again every :func:`mesh_hold_repage_sec` while it stands and after a pass that
+    found no hold. A refused reset did not happen, so the caller holds exactly as for a gated one and
+    arms no cooldown or failed-reset flag. ``off_bus`` (chips off the bus this pass) is named in
+    the page: the case a mesh reset turns into an off-bus power-cycle loop."""
+    why = mesh_reset_hold_reason()
+    if not why:
+        _mesh_hold_paged.clear()
+        return False
+    held = f"{off_bus} chip(s) off the bus, " if off_bus > 0 else ""
+    message = (
+        f"automatic mesh reset NOT fired ({context}): {held}{why}; device HELD for an operator — "
+        f"lift the hold or set TT_DEVICE_MCP_AUTO_MESH_RESET=1 to re-arm it"
+    )
+    log(message)
+    health_event("mesh_reset_held", context=context, argv=argv, reason=why, off_bus=off_bus, host_at_risk=True)
+    metrics.stage_fired("smi_reset", "blocked")
+    paged_at = _mesh_hold_paged.get(why)
+    repage = mesh_hold_repage_sec()
+    if paged_at is None or (repage > 0 and time.monotonic() - paged_at >= repage):
+        event = {"kind": "mesh_reset_held", "context": context, "reason": why, "off_bus": off_bus, "message": message}
+        if alert.send_alert(event) is not None or alert.alert_argv() is None:
+            _mesh_hold_paged[why] = time.monotonic()
+    return True
+
 
 class RecoveryMechanism:
     """Shared, platform-invariant machinery. ``Recovery`` (recovery/__init__.py) holds this by
@@ -105,6 +192,7 @@ class RecoveryMechanism:
         write_action_log: Callable[[str, str, float, str, Optional[int]], None],
         device_hold_episode_since: Callable[[], str],
         local_reset_dir: Optional[Callable[[], Path]] = None,
+        isolated_chips: Optional[Callable[[], set]] = None,
     ) -> None:
         # Server-state accessors this mechanism cannot own without importing server (a cycle):
         # the broker's boot-id/boot-time readers, its systemd-availability predicate, the poller
@@ -121,6 +209,12 @@ class RecoveryMechanism:
         self._write_action_log = write_action_log
         self._device_hold_episode_since = device_hold_episode_since
         self._local_reset_dir = local_reset_dir or health_dir
+        # The broker's isolated-chip set, re-read after every reset's rescan (drop_returned_isolated).
+        self._isolated_chips = isolated_chips
+        # Why no reset may run now — '' when one may. The broker sets it to its leftover fence (spec
+        # 01 I16): a reaped job's process still holding the device, which a reset cannot free.
+        # Checked here, where every reset passes, so no caller can reset over one.
+        self.reset_fence: Optional[Callable[[], str]] = None
 
         # Two callers (the auto-recovery reset launcher and the operator-run reset tool) need this
         # sequence and they must build it identically, because the scope name is what every other
@@ -134,6 +228,9 @@ class RecoveryMechanism:
         # nothing else: during a fabric check or a health probe, chips going all-ones IS a failure and
         # must still be acted on — that is precisely how a host was lost.
         self.reset_in_flight = False
+        # Any reset_with_quiesce (the ladder's or a manual one) since the mesh was last released:
+        # an off-bus set first seen after it is the reset's doing, never a tray-down onset (04 I19).
+        self.reset_since_release = False
 
         # The full transcript of the last reset, not the 3-line tail the journal carries: when a
         # mesh is left half-alive, the interesting line is usually somewhere in the middle.
@@ -141,6 +238,20 @@ class RecoveryMechanism:
 
         self.last_reset_monotonic: float = 0.0
         self.last_reset_failed: bool = False
+        # The hold episode (its ``since``) whose reset already came back UNKNOWN — enum+ARC healthy, the
+        # fabric a persistent 77. A second identical reset on that episode measures nothing new, so the
+        # idle escalation goes to the last-chance sweep instead (spec 04 I29).
+        self.unverified_reset_since: Optional[str] = None
+        # The episode whose last-chance sweep that path already ran; the next escalation climbs.
+        self.unverified_sweep_since: Optional[str] = None
+        # The episode whose sweep verify still read a fabric 77: no rung measured a fault, so it never
+        # climbs to a host rung; it holds, pages once and the idle relift keeps re-checking.
+        self.unverified_sweep_77_since: Optional[str] = None
+        # The hold episode (its ``since``) whose galaxy reset REGRESSED an off-bus mesh (more chips off
+        # the bus after it than before). Another mesh reset on that episode repeats the action that just
+        # made the drop worse — one Galaxy host went 4 -> 31 -> 32 off-bus across three — so the episode
+        # goes straight to the host rung, or pages when none is opted in (spec 04 I31).
+        self.regressed_reset_since: Optional[str] = None
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a
@@ -173,6 +284,18 @@ class RecoveryMechanism:
         will not revive it now, and hammering a dead endpoint is precisely what escalates a PCIe
         error to fatal and reboots the host."""
         return self.last_reset_failed and (time.monotonic() - self.last_reset_monotonic) < RESET_COOLDOWN_SEC
+
+    def note_reset_regressed(self, hold_since: str) -> None:
+        """Latch that this hold episode's galaxy reset regressed an off-bus mesh (spec 04 I31). A
+        regression seen before any hold opened (a gate's first reset) latches the episode about to
+        open; the release transition clears the latch either way."""
+        self.regressed_reset_since = hold_since or "*"
+
+    def reset_regressed_in(self, hold_since: str) -> bool:
+        """True when this hold episode's galaxy reset already regressed the mesh: another mesh
+        reset on it is not tried (spec 04 I31)."""
+        latched = self.regressed_reset_since
+        return latched is not None and (latched == "*" or latched == hold_since)
 
     def _local_reset_lock_path(self) -> Path:
         return self._local_reset_dir() / LOCAL_RESET_LOCK
@@ -250,6 +373,7 @@ class RecoveryMechanism:
             return False
         log(f"a reset is already in flight ({unit}); waiting for it rather than starting another")
         health_event("reset_scope_adopted", unit=unit)
+        FABRIC_DEBT.note_reset(f"adopted {unit}")
         deadline = time.monotonic() + DEVICE_RESET_TIMEOUT_SEC
         while time.monotonic() < deadline:
             await asyncio.sleep(2)
@@ -346,7 +470,7 @@ class RecoveryMechanism:
 
             wait_task = asyncio.create_task(wait_and_stream())
             try:
-                await asyncio.wait_for(asyncio.shield(wait_task), timeout=DEVICE_RESET_OVERRUN_SEC)
+                await aio.wait_for(asyncio.shield(wait_task), timeout=DEVICE_RESET_OVERRUN_SEC)
             except asyncio.TimeoutError:
                 over = (datetime.now() - started).total_seconds()
                 log(
@@ -354,7 +478,7 @@ class RecoveryMechanism:
                     f"killed, and only a reset that never ends is a failure"
                 )
                 health_event("reset_overran", unit=unit, seconds=over, argv=argv)
-                await asyncio.wait_for(
+                await aio.wait_for(
                     asyncio.shield(wait_task), timeout=max(1, DEVICE_RESET_TIMEOUT_SEC - DEVICE_RESET_OVERRUN_SEC)
                 )
         except asyncio.CancelledError:
@@ -451,7 +575,7 @@ class RecoveryMechanism:
                 return await proc.communicate()
 
             try:
-                out, _ = await asyncio.wait_for(communicate(), timeout=DEVICE_RESET_OVERRUN_SEC)
+                out, _ = await aio.wait_for(communicate(), timeout=DEVICE_RESET_OVERRUN_SEC)
             except asyncio.TimeoutError:
                 # Our timer is not the reset's deadline. The scope is deliberately never killed —
                 # a reset stopped partway through 32 ASICs is far worse than one that overran —
@@ -466,7 +590,7 @@ class RecoveryMechanism:
                     f"killed, and only a scope that never ends is a failure"
                 )
                 health_event("reset_overran", unit=unit, seconds=over, argv=argv)
-                out, _ = await asyncio.wait_for(
+                out, _ = await aio.wait_for(
                     communicate(), timeout=max(1, DEVICE_RESET_TIMEOUT_SEC - DEVICE_RESET_OVERRUN_SEC)
                 )
             rc = proc.returncode
@@ -515,15 +639,25 @@ class RecoveryMechanism:
 
         Returns (exit code, combined output); the code is None on timeout/launch failure.
         """
+        fenced = self.reset_fence() if self.reset_fence else ""
+        if fenced:
+            log(f"reset refused: {fenced}")
+            health_event("reset_fenced", argv=argv, owner=owner, reason=fenced)
+            return None, f"reset refused: {fenced}"
         # Name the command we are actually running. This was hardcoded to the galaxy's -glx_reset, so on
         # every other machine the queue told operators a command that was not the one executing.
         self._set_device_op_detail(f"device reset: {' '.join(argv)} (~60s)")
+        # Any reset clears a firmware clock cap; owed until a verified re-apply (see aiclk_ceiling).
+        CEILING.mark_owed("reset")
+        # And it leaves the fabric unproven: no release until a fabric pass passes (post_reset).
+        FABRIC_DEBT.note_reset(" ".join(argv))
         quiesced = await self._set_device_pollers(False, log)
         # A reset takes the chips off the bus — that is what it does — so for its duration they
         # read all-ones exactly like a dead chip. Without this flag the sampler isolates them
         # mid-reset and tears the endpoints out of the kernel, which is how a healthy host ended
         # up with no devices at all.
         self.reset_in_flight = True
+        self.reset_since_release = True
         cancelled_mid = False
         rc = None
         try:
@@ -560,6 +694,11 @@ class RecoveryMechanism:
                     # device comes back short and nobody knows why.
                     await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
                     await asyncio.sleep(3)
+                    isolated = self._isolated_chips() if self._isolated_chips is not None else None
+                    if isolated:
+                        await asyncio.to_thread(drop_returned_isolated, isolated, "reset", log)
+                    if rc == 0:
+                        await self._reapply_aiclk_ceiling(log)
                 except OSError:
                     pass
                 finally:
@@ -568,6 +707,21 @@ class RecoveryMechanism:
                     # rather than leaving a telemetry gap.
                     if quiesced:
                         await asyncio.shield(self._set_device_pollers(True, log))
+
+    async def _reapply_aiclk_ceiling(self, log) -> None:
+        """Put an operator's AICLK ceiling back on the freshly reset chips, before the pollers
+        return and before the caller's verify runs its traffic pass. Only after a completed reset
+        (the chips are back on the bus); a no-op when unconfigured. Never raises: a failure here
+        leaves the ceiling owed, and the verify's probe pass retries it and fails closed. Freshly
+        reset firmware may read its old limit for a few seconds after the cap is sent, so the
+        apply re-reads within the settle window before it calls the ceiling unverified."""
+        if not CEILING.armed():
+            return
+        self._set_device_op_detail("device reset: re-applying the AICLK ceiling")
+        try:
+            await CEILING.apply("post-reset", log=log, settle=aiclk_settle_sec())
+        except Exception as e:  # noqa: BLE001 - the verify that follows owns the verdict
+            log(f"aiclk-ceiling: post-reset apply raised {type(e).__name__}: {e}")
 
     def read_auto_recovery_ledger(self) -> Optional[list[dict]]:
         """Every auto-recovery escalation this host has taken, oldest first — the rate limiter's
@@ -792,7 +946,7 @@ class RecoveryMechanism:
                 return
 
     async def _fire_recovery_escalation(
-        self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: str
+        self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: str, pre_fire=None
     ) -> None:
         """Shared body of the two host-level recovery rungs (reboot, BMC power cycle). Records the
         escalation durably — the rate limiter — and leaves a visible jobs-list row BEFORE the action
@@ -806,7 +960,12 @@ class RecoveryMechanism:
         ``health.recovery.stages.host_reboot``/``power_cycle``): "blocked" when the ledger write
         itself fails (nothing fired), "failed" when ``fire`` raised (attempted, did not launch),
         "ok" when it returned normally (the action was issued — a SUCCESSFUL reboot/power-cycle
-        takes the box down from inside ``fire`` and never reaches here at all)."""
+        takes the box down from inside ``fire`` and never reaches here at all).
+
+        ``pre_fire(log, reason)``, when given, runs after the record and row and just before
+        ``fire`` (spec 04 I26): a bounded, blocking call that never raises and whose outcome never
+        stops the fire. Running it after the record means it only runs for an action that is
+        really about to happen, never for one the ledger then aborts."""
         ev = action.replace("-", "_")
         stage = _ACTION_TO_STAGE[action]
         if not self.record_auto_recovery(action, reason):
@@ -820,6 +979,26 @@ class RecoveryMechanism:
         self._write_action_log(row_owner, f"{label} — {reason}", 0.0, action, None)
         health_event(f"auto_{ev}_request", reason=reason)
         log(f"{label.upper()}: {detail} ({reason}); opted in + within limits — requesting it now")
+        if pre_fire is not None:
+            try:
+                hook = await asyncio.to_thread(pre_fire, log, reason)
+            except asyncio.CancelledError:
+                # Stopped while waiting on the hook (broker shutdown): the action never fired, so
+                # its ledger entry must not spend the retry the still-wedged box needs.
+                self.retract_last_auto_recovery(action)
+                raise
+            except Exception as exc:  # noqa: BLE001 - the hook never gates recovery
+                hook = {"ran": False, "detail": f"failed: {exc!r}"}
+                log(f"{label.upper()}: pre-{action} hook failed ({exc!r}); going ahead")
+            if hook and (hook.get("ran") or hook.get("detail")):
+                health_event(
+                    f"pre_{ev}_hook",
+                    reason=reason,
+                    rc=hook.get("rc"),
+                    timed_out=hook.get("timed_out", False),
+                    seconds=hook.get("seconds"),
+                    detail=str(hook.get("detail", ""))[-500:],
+                )
         try:
             await asyncio.to_thread(fire)
         except Exception as exc:  # noqa: BLE001 - a fire that did not launch must not leave a poisoned limiter

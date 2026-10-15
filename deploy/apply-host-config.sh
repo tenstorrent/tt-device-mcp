@@ -106,6 +106,14 @@ RELIFT="${TTDEV_SELFHEAL_RELIFT:-}"
 # renders no line, so the hwm fallback is unchanged until a host opts in.
 EXPECTED_CHIPS="${TTDEV_EXPECTED_CHIPS:-}"
 [ -z "$EXPECTED_CHIPS" ] && [ -r "$UNIT" ] && EXPECTED_CHIPS="$(sed -n 's/^Environment=TT_DEVICE_MCP_EXPECTED_CHIPS=//p' "$UNIT" 2>/dev/null | head -1)"
+# Opt-in per-host AICLK ceiling (MHz): the broker re-applies the firmware clock cap after every reset,
+# at start and at the job door, and proves it before any traffic pass or job (health/aiclk_ceiling.py).
+# Unset renders no line and the feature is off. An external ceiling daemon, if any, should use the same
+# value: the broker only sends to a chip that reads above it. _CMD overrides the built-in helper.
+AICLK_CEILING="${TTDEV_AICLK_CEILING_MHZ:-}"
+[ -z "$AICLK_CEILING" ] && [ -r "$UNIT" ] && AICLK_CEILING="$(sed -n 's/^Environment=TT_DEVICE_MCP_AICLK_CEILING_MHZ=//p' "$UNIT" 2>/dev/null | head -1)"
+AICLK_CEILING_CMD="${TTDEV_AICLK_CEILING_CMD:-}"
+[ -z "$AICLK_CEILING_CMD" ] && [ -r "$UNIT" ] && AICLK_CEILING_CMD="$(sed -n 's/^Environment=TT_DEVICE_MCP_AICLK_CEILING_CMD=//p' "$UNIT" 2>/dev/null | head -1)"
 # The cold rungs — the TOP of the recovery cascade. server.py reads TT_DEVICE_MCP_AUTO_REBOOT (warm
 # reboot) and TT_DEVICE_MCP_AUTO_POWER_CYCLE (BMC power cycle), each default OFF, each armed with "1".
 # Without this wiring neither key can be set (nothing else sources /etc/default into the broker process),
@@ -135,6 +143,13 @@ AUTO_UBB_RESET="${TTDEV_AUTO_UBB_RESET:-}"
 # never drops an opt-in an operator already made.
 PREJOB_DISPATCH="${TTDEV_PREJOB_DISPATCH:-}"
 [ -z "$PREJOB_DISPATCH" ] && [ -r "$UNIT" ] && PREJOB_DISPATCH="$(sed -n 's/^Environment=TT_DEVICE_MCP_PREJOB_DISPATCH=//p' "$UNIT" 2>/dev/null | head -1)"
+# Device pollers to quiesce around a reset. server.py reads TT_DEVICE_MCP_POLLER_SERVICES (a comma
+# list; its default covers tt-telemetry and tt-metrics-exporter, and a unit a host lacks
+# is skipped). A host running yet another unit that reads the device overrides it with the full list
+# here, so a reset does not race it. Unset renders no line and the code default rules; the unit-read
+# fallback keeps an override across updates.
+POLLER_SERVICES="${TTDEV_POLLER_SERVICES:-}"
+[ -z "$POLLER_SERVICES" ] && [ -r "$UNIT" ] && POLLER_SERVICES="$(sed -n 's/^Environment=TT_DEVICE_MCP_POLLER_SERVICES=//p' "$UNIT" 2>/dev/null | head -1)"
 # The python the eth reader resolves ttexalens from. Its own docs call this the per-box mechanism,
 # but nothing rendered it, so the reader could never find one and the rung self-tested to OFF on every
 # host — documented and unreachable is the same bug as unwired.
@@ -152,7 +167,10 @@ autoreboot_env=""; [ -n "$AUTO_REBOOT" ] && autoreboot_env="Environment=TT_DEVIC
 autopc_env=""; [ -n "$AUTO_POWER_CYCLE" ] && autopc_env="Environment=TT_DEVICE_MCP_AUTO_POWER_CYCLE=$AUTO_POWER_CYCLE"
 autoubb_env=""; [ -n "$AUTO_UBB_RESET" ] && autoubb_env="Environment=TT_DEVICE_MCP_AUTO_UBB_RESET=$AUTO_UBB_RESET"
 prejobdispatch_env=""; [ -n "$PREJOB_DISPATCH" ] && prejobdispatch_env="Environment=TT_DEVICE_MCP_PREJOB_DISPATCH=$PREJOB_DISPATCH"
+pollers_env=""; [ -n "$POLLER_SERVICES" ] && pollers_env="Environment=TT_DEVICE_MCP_POLLER_SERVICES=$POLLER_SERVICES"
 ethpython_env=""; [ -n "$ETH_PYTHON" ] && ethpython_env="Environment=TTDEV_ETH_CHECK_PYTHON=$ETH_PYTHON"
+aiclk_env=""; [ -n "$AICLK_CEILING" ] && aiclk_env="Environment=TT_DEVICE_MCP_AICLK_CEILING_MHZ=$AICLK_CEILING"
+aiclkcmd_env=""; [ -n "$AICLK_CEILING_CMD" ] && aiclkcmd_env="Environment=TT_DEVICE_MCP_AICLK_CEILING_CMD=$AICLK_CEILING_CMD"
 
 # Backfill keys the running version expects into /etc/default — a host installed
 # before a key existed won't have it (auto-update never rewrites this file), so the
@@ -184,6 +202,9 @@ if [ -z "$RENDER_ONLY" ]; then
     ensure_default TTDEV_AUTO_UBB_RESET "$AUTO_UBB_RESET"
     ensure_default TTDEV_PREJOB_DISPATCH "$PREJOB_DISPATCH"
     ensure_default TTDEV_ETH_CHECK_PYTHON "$ETH_PYTHON"
+    ensure_default TTDEV_AICLK_CEILING_MHZ "$AICLK_CEILING"
+    ensure_default TTDEV_AICLK_CEILING_CMD "$AICLK_CEILING_CMD"
+    ensure_default TTDEV_POLLER_SERVICES "$POLLER_SERVICES"
 fi
 # Preserve the lock: `tt-device-mcp lock` adds DEVICE_GROUP to the unit; keep it
 # across a re-render so an update doesn't silently unlock a shared host.
@@ -197,6 +218,14 @@ cat > "$unit_dest" <<UNIT
 [Unit]
 Description=Tenstorrent device MCP broker (multi-tenant arbiter)
 After=network.target
+# The startup fabric pass needs the 1G hugepage pool; start after its mount where the host has one
+# (a Wants= on a unit the host lacks is a no-op). The broker still waits for the page count itself.
+# Never After=tenstorrent-hugepages.service: that unit is After=multi-user.target, and this one
+# (and any serving unit ordered After= it) are ordered before multi-user.target, so it closes an ordering cycle
+# and systemd breaks it at boot by deleting the broker's or that unit's start job. A drop-in cannot
+# remove the vendor's After=; the in-process wait covers the 16-22 s it takes to fill the pool.
+Wants=dev-hugepages\x2d1G.mount
+After=dev-hugepages\x2d1G.mount
 [Service]
 User=root
 # Type=notify + WatchdogSec: the broker pings the watchdog from its event loop;
@@ -224,7 +253,10 @@ $autoreboot_env
 $autopc_env
 $autoubb_env
 $prejobdispatch_env
+$pollers_env
 $ethpython_env
+$aiclk_env
+$aiclkcmd_env
 $group_env
 ExecStart=$VENV/bin/python -m tt_device_mcp.server --socket $SOCK --no-http --log-dir /var/log/tt-device-broker
 ExecStartPost=/bin/sh -c 'for i in \$(seq 1 50); do [ -S $SOCK ] && { chmod 0666 $SOCK; exit 0; }; sleep 0.1; done'
@@ -254,6 +286,11 @@ install -m 0755 "$DEPLOY/install-fabric-validator.sh"   "$ROOT/install-fabric-va
 install -m 0644 "$DEPLOY/fabric-validator.pin"          "$ROOT/fabric-validator.pin"
 install -m 0644 "$DEPLOY/tt-device-fabric-validator.service" /etc/systemd/system/tt-device-fabric-validator.service
 install -m 0644 "$DEPLOY/tt-device-fabric-validator.timer"   /etc/systemd/system/tt-device-fabric-validator.timer
+
+# Manual-recovery check (spec 04 I27): the broker's off-bus power cycle stands back while it says an
+# operator is recovering the host. It is the default when TT_DEVICE_MCP_MANUAL_RECOVERY_CMD is unset,
+# and with neither the cycle never fires, so this stage is required (fatal under set -e).
+install -m 0755 "$DEPLOY/tt-manual-recovery-check.sh" "$ROOT/manual-recovery-check.sh"
 
 # Slurm hooks: staged here too, not just by install-tt-device-broker.sh — auto-update never
 # re-runs the installer, only this script (this file's own header comment), so an autoupdating
@@ -289,6 +326,43 @@ cat > /etc/profile.d/tt-device-mcp-client.sh <<CLIENT
 CLIENT
 chmod 0644 /etc/profile.d/tt-device-mcp-client.sh
 
+# Idle-time health probe (spec 08 I17): PCI rescan and telemetry re-arm while the broker is idle.
+# The service runs the broker's own venv, rendered like the broker unit's ExecStart.
+install_health_probe_units() {
+    local unitdir="$1"
+    sed "s|@VENV@|$VENV|g" "$DEPLOY/tt-device-health-probe.service" > "$unitdir/tt-device-health-probe.service"
+    chmod 0644 "$unitdir/tt-device-health-probe.service"
+    install -m 0644 "$DEPLOY/tt-device-health-probe.timer" "$unitdir/tt-device-health-probe.timer"
+}
+# On by default; TTDEV_HEALTH_PROBE=0 in /etc/default turns it off. Optional, so a timer that will
+# not arm is loud but does not abort the apply the broker's own updates depend on. Its unmanaged
+# predecessor (tt-health-probe.timer) rescanned for a fixed chip count with no broker check; two
+# probes must not race, so it is retired, but only once the new timer is armed, and its units are
+# moved aside, not deleted. An opted-out host, or one where the new timer will not arm, keeps the
+# old probe's coverage. Undo a retirement: move the *.retired-by-tt-device-mcp files back.
+arm_health_probe() {
+    local unitdir="$1" f
+    if [ "${TTDEV_HEALTH_PROBE:-1}" = 0 ]; then
+        systemctl disable --now tt-device-health-probe.timer >/dev/null 2>&1 || true
+        return 0
+    fi
+    if ! systemctl enable --now tt-device-health-probe.timer >/dev/null 2>&1 \
+            || ! systemctl is-active --quiet tt-device-health-probe.timer; then
+        echo "apply-host-config: warn: tt-device-health-probe.timer did not arm; idle-time PCI rescan and telemetry re-arm are off (an unmanaged tt-health-probe.timer, if any, is left running)" >&2
+        return 0
+    fi
+    [ -e "$unitdir/tt-health-probe.timer" ] || return 0
+    echo "apply-host-config: retiring the unmanaged tt-health-probe.timer (replaced by tt-device-health-probe.timer; kept as *.retired-by-tt-device-mcp)" >&2
+    systemctl disable --now tt-health-probe.timer >/dev/null 2>&1 || true
+    for f in tt-health-probe.timer tt-health-probe.service; do
+        if [ -e "$unitdir/$f" ]; then
+            mv -f "$unitdir/$f" "$unitdir/$f.retired-by-tt-device-mcp"
+        fi
+    done
+    systemctl daemon-reload
+}
+install_health_probe_units /etc/systemd/system
+
 systemctl daemon-reload
 
 # The timer retries a failed build; this only makes the FIRST attempt immediate rather
@@ -301,6 +375,7 @@ systemctl enable --now tt-device-fabric-validator.timer >/dev/null 2>&1 \
 # runs with no fabric validation, so confirm the timer is actually armed before continuing.
 systemctl is-active --quiet tt-device-fabric-validator.timer \
     || { echo "apply-host-config: tt-device-fabric-validator.timer enabled but not active — host loses its authoritative fabric validator" >&2; exit 1; }
+arm_health_probe /etc/systemd/system
 # Only where perf can actually count it; a missing PMU event must not leave a failed unit.
 if perf stat -a -e ls_locks.bus_lock -- true >/dev/null 2>&1; then
     systemctl enable --now tt-device-buslock.service >/dev/null 2>&1 || true

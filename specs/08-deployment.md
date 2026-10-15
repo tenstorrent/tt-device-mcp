@@ -13,7 +13,8 @@ the per-user installer (`deploy/install-user.sh`), autoupdate/reconcile
 pipeline (`deploy/install-fabric-validator.sh`, `deploy/tt-device-fabric-check.sh`,
 `deploy/fabric-validator.pin`), the crash recorder (`deploy/install-crash-recorder.sh`,
 `deploy/tt-crash-recorder.py`), the eth-heartbeat probe artifact
-(`deploy/tt-device-eth-heartbeat-probe.py`), client wiring (`deploy/tt-device-client-setup.sh`),
+(`deploy/tt-device-eth-heartbeat-probe.py`), the idle-time health probe
+(`deploy/tt-device-health-probe.{service,timer}`, `tt_device_mcp.health_probe`), client wiring (`deploy/tt-device-client-setup.sh`),
 login-heal (`deploy/tt-device-mcp-login-heal.sh`), and the Slurm hooks (`deploy/slurm/prolog.sh`,
 `deploy/slurm/epilog.sh`). Paths and variables are spec 06's; what the broker does once running is
 specs 01–05. This spec owns the pipeline.
@@ -64,7 +65,7 @@ job log, so every "installed" claim below is verified, not assumed.
   bar is separate from the *busy/idle* gate, which is OFF by default: `TTDEV_MAX_DEFER_SEC=0`
   applies immediately even on a busy box (jobs are re-adopted across the restart); a host that
   wants an idle window sets it to a max wait, clocked from the FIRST pending update so a commit
-  burst cannot starve a busy host forever.
+  burst cannot starve a busy host forever; a box that never goes idle is drained (I20).
 - **I8 — Autoupdate marks a sha current only after every required stage lands.** Staging the
   deploy scripts (`reconcile.sh`, `client-setup.sh`, `autoupdate.sh`, `fabric-check.sh`,
   `eth-heartbeat-probe.py`) and the host-config apply are each fail-closed: on failure
@@ -123,6 +124,75 @@ job log, so every "installed" claim below is verified, not assumed.
   minutes, and a branch that moved in that window must not be installed unannounced under a sha
   `installed.sha` would then misname.
 
+- **I17 — The idle-time health probe acts only on an idle broker, and pages once per episode.**
+  `tt-device-health-probe.timer` (every 2 min) runs `python -m tt_device_mcp.health_probe` as root,
+  in the broker's venv (apply renders it from `TTDEV_VENV`). It stands back, touching nothing,
+  unless the broker's `/health` answers with no hold, `fsm_state` `healthy`, no degraded flag and no
+  job running or queued, the restart-inhibit file (spec 06, `TT_DEVICE_MCP_DEVICE_OP_LOCK`) names no
+  live device op, its device-op flock (spec 06 I8) is free, and no tenant holds the device outside
+  the job table (spec 03 I13 holder scan; root and system accounts such as the pollers are not
+  tenants, and an incomplete scan counts as a tenant). It asks again right before each action, so a
+  broker that turns busy mid-lap stops it. The broker stops the pollers around a reset, and a probe
+  that restarted them would fight it. Its actions are non-destructive only: a PCI bus rescan when
+  fewer chips are present than expected (at most one per 30 min while short; the one write is made
+  under the device-op flock, taken non-blocking, and skipped while the broker holds it), and
+  `reset-failed` + `start` of a poller in the broker's own list (`TT_DEVICE_MCP_POLLER_SERVICES`,
+  same default as the broker's) that is `failed` or `inactive` and enabled. A poller that is absent, disabled or masked is off on
+  purpose and left off; one that is `activating` is systemd's to finish and is not restarted. After
+  a start it waits the settle time and re-reads `/health` and the inhibit file; if a hold, a
+  degraded flag, a non-healthy FSM or a device op appeared meanwhile, it stops the poller again. The
+  residual window is that settle time: the I8 contract forbids holding the flock across a subprocess
+  such as `systemctl start`, so a reset that begins inside it can meet the poller the probe just
+  started until the probe stops it. The expected count is the broker's own (spec 03 I11:
+  `TT_DEVICE_MCP_EXPECTED_CHIPS`, else the high-water `chip_baseline.json`, read and never written),
+  so no chip count is hardcoded. The alert hook, chip count, poller list, inhibit and flock files
+  and health dir come from the running broker's environment unless the probe's unit sets them. What
+  it cannot fix goes to the alert hook (spec 03 I37), once per episode: chips still missing after a
+  rescan; a poller still down after a restart, down again within an episode (a flap), or
+  `activating` for 3 laps in a row; AER fatal/non-fatal counters rising, at most once an hour. A
+  poller's episode closes only after 3 laps in a row up, so a crash loop pages once; a first restart
+  that comes up stays quiet. The first lap after a boot takes the AER counters as a baseline and
+  pages nothing. Episodes and counters live in `health_probe_state.json` in the health dir and reset
+  on reboot. Apply installs and arms it on every host (`TTDEV_HEALTH_PROBE=0` disarms it) and warns
+  but does not abort if it will not arm. Only once the new timer is active does it retire the
+  unmanaged `tt-health-probe.timer` it replaces: that timer is disabled and its unit files are moved
+  aside to `*.retired-by-tt-device-mcp`, never deleted. An opted-out host, or one where the new
+  timer did not arm, keeps the old timer running.
+- **I18 — An applying update holds dispatch from its busy check through the restart, and a
+  queued job counts as busy.** Before it counts anything the updater writes the dispatch hold
+  (spec 01 I18: `<pid> <epoch>` in `/run/tt-device-broker/dispatch-hold`, written under a
+  temporary name and renamed into place, so the broker never reads it half-written) and waits
+  `TTDEV_HOLD_SETTLE_SEC` (default 2) for a dispatch already past the broker's check to show up
+  as a child. Busy is then: a broker child, a user process holding `/dev/tenstorrent`, an
+  active `ttdev-job-*.scope` (a re-adopted job is no child of the new broker), or a persisted
+  queued spec (`<log-dir>/queued/*.json`). Counting only children and holders let a job queued
+  behind one that had just ended be dispatched two seconds before the restart, which cut its
+  output pipe and failed it. A deferring lap drops the hold at once; an applying lap keeps it
+  until `systemctl restart` returns (systemd also removes it with the RuntimeDirectory), so
+  queued jobs wait, persisted, for the new broker. An exit on any other path drops it too.
+- **I19 — reconcile never revives a broker that is already starting or stopping.** Step 1 reads
+  `systemctl is-active`: `activating`, `reloading` and `deactivating` are a job systemd already
+  runs (the broker sits in `activating` through its startup check, minutes after a boot), so
+  reconcile runs neither `reset-failed` nor `start` and logs "in progress" once per episode (the
+  state is kept in `/run/tt-device-broker/reconcile_inprogress`, cleared once the broker is
+  `active` or down). Every other non-`active` state is still reset and started.
+- **I20 — A box that is never idle is drained, not waited on forever, and no job is killed for
+  it.** With the idle gate on (`TTDEV_MAX_DEFER_SEC` > 0), a lap that finds the box busy defers
+  only until the pending update has waited `TTDEV_DRAIN_AFTER_SEC` (default 300). From then on the
+  lap drains: it keeps the I18 hold, so the running job finishes and nothing new starts, polls
+  every 5 s until no broker child, device holder or job scope remains and no device op (I7) is in
+  flight, and applies at that job boundary; queued jobs wait, persisted, for the new broker. A
+  queued spec alone is not running work and does not hold a drain up. The drain is bounded by
+  `TTDEV_DRAIN_TIMEOUT_SEC` (default 300): a job that outlives it is left alone, the hold is
+  dropped, the queue runs again, and the next drain starts `TTDEV_DRAIN_AFTER_SEC` later (kept in
+  `pending.defer` as a third field). The hold is rewritten on every poll and once more as the
+  apply starts, so the broker's overdue bound (`DISPATCH_HOLD_MAX_SEC`) counts from the updater's
+  last sign of life, never from the start of a long drain. `TTDEV_MAX_DEFER_SEC` keeps its
+  meaning as the outer bound: past it the lap applies anyway, on re-adoption. A drain blocks its
+  lap, and the reconcile that runs it, for at most `TTDEV_DRAIN_TIMEOUT_SEC`. The restart after an
+  apply is an ordinary broker start, so the queue opens only once the startup check (spec 03 I4:
+  the forced fabric pass, after the 1G hugepage pool is ready) has passed.
+
 ## Interfaces
 
 **`/etc/default/tt-device-broker`** — written by the installer, sourced by `apply-host-config.sh`,
@@ -137,7 +207,7 @@ table. Two key groups: pipeline config (`TTDEV_ROOT`, `TTDEV_VENV`, `TTDEV_AUTOU
 broker knobs (`TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_FABRIC_DESCRIPTOR`,
 `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`,
 `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_REBOOT`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_AUTO_UBB_RESET`,
-`TTDEV_PREJOB_DISPATCH`, `TTDEV_ETH_CHECK_PYTHON`) that `apply-host-config.sh` renders into
+`TTDEV_PREJOB_DISPATCH`, `TTDEV_ETH_CHECK_PYTHON`, `TTDEV_POLLER_SERVICES`) that `apply-host-config.sh` renders into
 same-named `Environment=TT_DEVICE_MCP_*` (or `TTDEV_*`) unit lines. An unset knob renders **no
 line** (the code default rules); a set knob reaches the unit verbatim. This rendering is the ONLY
 route from `/etc/default` into the broker process — nothing else sources the file into the unit,
@@ -152,6 +222,7 @@ so a knob without a render line is unreachable.
 | `tt-device-fabric-validator.timer` → `.service` | apply-host-config (enabled there) | `OnBootSec=10min`, `OnUnitInactiveSec=1h` — retries the pinned build (oneshot, `TimeoutStartSec=7200`) |
 | `tt-device-buslock.service` | apply-host-config / install-crash-recorder | continuous `perf stat -e ls_locks.bus_lock -I 60000` to `buslock.log`; enabled only where the PMU event counts |
 | `tt-crash-recorder.service` | install-crash-recorder | oneshot at boot (`After=multi-user.target`) |
+| `tt-device-health-probe.timer` → `.service` | apply-host-config (enabled there unless `TTDEV_HEALTH_PROBE=0`) | `OnBootSec=90s`, `OnUnitActiveSec=2min` — oneshot `python -m tt_device_mcp.health_probe` (I17) |
 
 Also installed by apply-host-config: `/usr/local/bin/tt-device-mcp-smi-ro` +
 `/etc/sudoers.d/tt-device-mcp-smi` (spec 05), `/etc/logrotate.d/tt-device-broker`, a journald
@@ -229,6 +300,11 @@ if the pinned SHA is not built, and refreshes the login banner from the lock sta
 `--print-unit` is a dry-run seam: render the unit to stdout from a given config, touch no host
 path, need no root — every install step is downstream of the render, so tests drive it on any
 host.
+The unit orders after `dev-hugepages\x2d1G.mount` (`Wants=` + `After=`) and never after
+`tenstorrent-hugepages.service`: that unit is `After=multi-user.target`, while the broker and
+a serving unit (`After=` the broker) come before multi-user.target, so the ordering is a cycle and
+systemd breaks it at boot by deleting the broker's or that unit's start job. A drop-in cannot
+remove the vendor's `After=`; the broker waits for the page count itself (spec 03 I33).
 
 **Autoupdate flow (`autoupdate.sh`).** Invoked every reconcile lap; self-gated
 (`TTDEV_AUTOUPDATE=1` and all config keys present, else silent no-op). Serialized by `flock` on
@@ -239,8 +315,8 @@ leftover first), fetches the tracked branch thereafter, and reads the sha with
 `rev-parse --verify -q refs/remotes/origin/$TTDEV_BRANCH`; an unmakeable clone, an unreachable
 network and a missing branch each name the fault and exit 0. If that sha equals `installed.sha`,
 exit. Otherwise: device-op bar and reset-scope check
-(I7 — the scope check asks systemd, because a reset outlives the broker by design); busy/idle
-gate per I7; then materialize the tree — `reset --hard` to **the sha this lap resolved**, not to
+(I7 — the scope check asks systemd, because a reset outlives the broker by design); dispatch hold and busy/idle
+gate per I7 and I18; then materialize the tree — `reset --hard` to **the sha this lap resolved**, not to
 `origin/<branch>` re-read after the gate, so a branch that moved during a defer is not installed
 under a sha `installed.sha` would misname; pip install into the broker venv (on failure, clear broken
 `dist-info` metadata and retry `--ignore-installed` — recovery from a half-installed venv that
@@ -251,7 +327,8 @@ pulled tree fail-closed (I8); write `installed.sha`; restart the broker.
 
 **Reconcile semantics (`reconcile.sh`, per minute + 30s after boot).** Idempotent, quiet when
 nothing drifts. (0) Run autoupdate (its own gates apply). (1) Broker liveness: the exact
-predicate is `systemctl is-active tt-device-broker != "active"` → `reset-failed` + `start`. This
+predicate is `systemctl is-active tt-device-broker` not `active` and not a start or stop in
+progress (I19) → `reset-failed` + `start`. This
 deliberately covers `failed`/start-limit exhaustion, but the predicate cannot distinguish an
 operator's deliberate `systemctl stop` (`inactive`): a stopped broker is revived within ~60s
 — measured consequence: the revived broker's startup gate reset a device a container daemon was
@@ -424,6 +501,7 @@ script exists, the claim stands on the script (listed below).
 | Cron contract (none installed; no self-update; stale entries removed) | `tests/test_install_modes.py::test_no_cron_entry_is_installed`, `tests/test_install_modes.py::test_the_self_update_command_is_gone_not_merely_unscheduled`, `tests/test_install_modes.py::test_a_stale_self_update_cron_is_removed` |
 | Branch defaults to `main` everywhere; no retired-branch default | `tests/test_deploy_default_branch.py::test_broker_installer_defaults_branch_to_main`, `tests/test_deploy_default_branch.py::test_user_installer_defaults_branch_to_main`, `tests/test_deploy_default_branch.py::test_no_in_repo_default_tracks_anything_but_main` |
 | Unit render: unset knob → no line; set knob reaches the unit; existing render preserved | `tests/test_apply_host_config_render.py::test_seam_preserves_the_existing_render`, `tests/test_apply_host_config_render.py::test_eth_heartbeat_unset_renders_no_line`, `tests/test_apply_host_config_render.py::test_eth_heartbeat_set_reaches_the_unit`, `tests/test_apply_host_config_render.py::test_reset_floor_knobs_unset_render_no_line`, `tests/test_apply_host_config_render.py::test_reset_floor_knobs_set_reach_the_unit`, `tests/test_apply_host_config_render.py::test_expected_chips_unset_renders_no_line`, `tests/test_apply_host_config_render.py::test_expected_chips_set_reaches_the_unit`, `tests/test_apply_host_config_render.py::test_cold_rung_knobs_unset_render_no_line`, `tests/test_apply_host_config_render.py::test_cold_rung_knobs_set_reach_the_unit`, `tests/test_apply_host_config_render.py::test_ubb_reset_force_off_unset_renders_no_line`, `tests/test_apply_host_config_render.py::test_ubb_reset_force_off_reaches_the_unit`, `tests/test_apply_host_config_render.py::test_prejob_dispatch_unset_renders_no_line`, `tests/test_apply_host_config_render.py::test_prejob_dispatch_set_reaches_the_unit`, `tests/test_apply_host_config_render.py::test_eth_check_python_unset_renders_no_line`, `tests/test_apply_host_config_render.py::test_eth_check_python_reaches_the_unit` |
+| Unit never ordered after `tenstorrent-hugepages.service` (boot ordering cycle) | `tests/test_apply_host_config_render.py::test_the_unit_never_orders_after_the_vendor_hugepages_service` |
 | Retired heartbeat wrapper scrubbed on apply | `tests/test_apply_host_config_render.py::test_eth_heartbeat_pointed_at_the_retired_wrapper_is_scrubbed` |
 | I15 (probe exit contract: crash folds to 77, never bare 1; verdict pass-through) | `tests/test_eth_heartbeat_probe.py::test_run_folds_crash_to_cannot_check_never_bare_one`, `tests/test_eth_heartbeat_probe.py::test_run_passes_through_main_return`, `tests/test_eth_heartbeat_probe.py::test_run_propagates_system_exit`, `tests/test_eth_heartbeat_probe.py::test_main_frozen_core_is_frozen`, `tests/test_eth_heartbeat_probe.py::test_main_all_advancing_is_ok`, `tests/test_eth_heartbeat_probe.py::test_main_attach_failure_is_cannot_check`, `tests/test_eth_heartbeat_probe.py::test_main_no_devices_is_cannot_check`, `tests/test_eth_heartbeat_probe.py::test_main_read_error_skips_core_not_frozen`, `tests/test_eth_heartbeat_probe.py::test_main_offbus_heartbeat_not_counted` |
 | I16 (the source is a literal that expands nothing, assigned once; the config's only operator input is the branch) | `tests/test_deploy_update_source.py::test_the_update_source_is_a_literal_with_no_expansion`, `tests/test_deploy_update_source.py::test_nothing_else_assigns_the_source`, `tests/test_deploy_update_source.py::test_the_only_operator_input_in_the_config_is_the_branch` |
@@ -436,6 +514,10 @@ script exists, the claim stands on the script (listed below).
 | Epilog prefers a non-zero `SLURM_JOB_DERIVED_EC` over `SLURM_JOB_EXIT_CODE`, and still falls back to it when DERIVED_EC is zero | `tests/test_slurm_steps.py::test_the_epilog_prefers_slurm_job_derived_ec_when_nonzero`, `tests/test_slurm_steps.py::test_the_epilog_falls_back_to_slurm_job_exit_code_when_derived_ec_is_zero` |
 | The installer stages both hooks at the path `deploy/README.md` documents, and auto-update (via `apply-host-config.sh`) keeps them current on an already-installed host | `tests/test_slurm_steps.py::test_the_installer_stages_the_slurm_hooks_at_the_documented_path`, `tests/test_slurm_steps.py::test_apply_host_config_also_stages_the_slurm_hooks` |
 | Each hook exports its own step-deadline var from `/etc/default/tt-device-broker` to the CLI child, and the export is harmless when the var was never set | `tests/test_slurm_steps.py::test_the_hooks_export_their_deadline_var_from_etc_default`, `tests/test_slurm_steps.py::test_the_hooks_do_not_require_the_deadline_var_to_be_set` |
+| I17 (idle-time probe: stands back unless idle, no device op and no tenant; re-checks before and after acting; broker's chip count and poller list; enabled failed/inactive pollers only; one page per episode, flaps included; AER first-lap baseline; apply arms it, optional, retires the old timer only after arming, moved aside) | `tests/test_health_probe.py::test_idle_verdict_requires_an_idle_healthy_broker`, `tests/test_health_probe.py::test_a_busy_broker_is_left_alone`, `tests/test_health_probe.py::test_a_broker_turning_busy_stops_the_rescan`, `tests/test_health_probe.py::test_expected_chips_reads_the_broker_count`, `tests/test_health_probe.py::test_missing_chips_rescan_then_alert_once`, `tests/test_health_probe.py::test_rescan_recovers_without_alert`, `tests/test_health_probe.py::test_telemetry_restart_and_alert`, `tests/test_health_probe.py::test_a_poller_stopped_and_disabled_on_purpose_is_left_off`, `tests/test_health_probe.py::test_an_activating_poller_is_left_to_systemd_then_paged_once`, `tests/test_health_probe.py::test_a_start_that_is_still_activating_does_not_page`, `tests/test_health_probe.py::test_a_flapping_poller_pages_once_per_episode`, `tests/test_health_probe.py::test_a_poller_that_stays_up_between_rare_falls_is_restarted_quietly`, `tests/test_health_probe.py::test_the_pollers_are_the_broker_list`, `tests/test_health_probe.py::test_the_probe_default_is_the_broker_default`, `tests/test_health_probe.py::test_the_poller_list_comes_from_the_broker_env`, `tests/test_health_probe.py::test_a_device_op_in_flight_stops_the_lap`, `tests/test_health_probe.py::test_a_tenant_holding_the_device_outside_the_job_table_stops_the_lap`, `tests/test_health_probe.py::test_a_device_op_that_starts_during_the_settle_stops_the_poller_again`, `tests/test_health_probe.py::test_a_job_starting_during_the_settle_keeps_the_poller`, `tests/test_health_probe.py::test_device_op_lock_reads_the_broker_inhibit_file`, `tests/test_health_probe.py::test_tenant_holders_fail_closed`, `tests/test_health_probe.py::test_the_broker_device_op_flock_is_tested_and_the_rescan_written_under_it`, `tests/test_health_probe.py::test_a_rescan_the_flock_refused_is_retried_next_lap`, `tests/test_health_probe.py::test_aer_growth_alerts_once_an_hour`, `tests/test_health_probe.py::test_aer_already_counted_at_the_first_lap_is_a_baseline_not_a_page`, `tests/test_health_probe.py::test_hook_and_chip_count_come_from_the_broker_env`, `tests/test_health_probe.py::test_apply_installs_and_arms_the_probe_optionally`, `tests/test_health_probe.py::test_an_armed_probe_moves_the_old_timer_aside`, `tests/test_health_probe.py::test_an_opted_out_host_keeps_the_old_timer`, `tests/test_health_probe.py::test_a_probe_that_will_not_arm_keeps_the_old_timer`, `tests/test_health_probe.py::test_a_host_without_the_old_timer_only_arms`, `tests/test_health_probe.py::test_the_probe_unit_runs_the_broker_venv` |
+| I18 (dispatch hold from the busy check through the restart; queued specs and job scopes count as busy) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_hold_is_taken_before_anything_is_counted`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_hold_appears_whole`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_queued_job_defers_an_opted_in_update_and_drops_the_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_idle_box_applies_and_keeps_the_hold_until_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_running_job_scope_counts_as_busy` |
+| I19 (an in-progress broker is not reset or started; logged once) | `tests/test_deploy_reconcile_activating.py::test_an_in_progress_broker_is_not_reset_or_started`, `tests/test_deploy_reconcile_activating.py::test_an_in_progress_broker_logs_once_per_episode`, `tests/test_deploy_reconcile_activating.py::test_a_down_broker_is_still_reset_and_started`, `tests/test_deploy_reconcile_activating.py::test_an_active_broker_is_left_alone` |
+| I20 (drain: past DRAIN_AFTER the hold is kept until the running job ends, then the update applies with no job running; a back-to-back queue cannot slip a job in; a job past DRAIN_TIMEOUT is left alone and the next drain waits DRAIN_AFTER; a device op holds the apply; the restart opens the queue only after the startup fabric pass, after hugepages) | `tests/test_deploy_autoupdate_idle_gate.py::test_a_busy_box_defers_until_the_drain_is_due`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_due_drain_keeps_the_hold_and_applies_at_the_job_boundary`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_back_to_back_queue_cannot_slip_a_job_into_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_drain_that_outlives_its_bound_lets_the_job_run_and_backs_off`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_backed_off_drain_waits_its_turn`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_holds_a_drained_apply`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_drain_refreshes_the_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_apply_ends_in_a_full_broker_restart`, `tests/test_restart_drain.py::test_a_job_held_across_an_update_waits_for_the_startup_fabric_pass`, `tests/test_restart_drain.py::test_a_failed_startup_pass_after_an_update_keeps_the_queue_held` |
 
 **Unanchored (the claim stands on the script):** I2 (wheel/venv from this tree —
 `install-tt-device-broker.sh`); the installer's flow ordering and lock opt-in; Galaxy detection

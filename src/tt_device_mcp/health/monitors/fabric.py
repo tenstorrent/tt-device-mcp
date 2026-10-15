@@ -47,9 +47,121 @@ _WEDGED_ETH_INIT = re.compile(r"waiting for active ethernet core|Try resetting t
 # — and it is the dominant reason a host learns nothing about its fabric.
 _WATCHDOG_TIMEOUT = re.compile(r"Workload execution timed out after \d+ seconds")
 
-# The first line naming why the validator never reached a verdict, for a SKIPPED detail that
-# says more than a bare exit code.
-_SKIP_REASON = re.compile(r"what\(\):.*|filesystem error:.*|terminate called.*")
+# Links the cabling descriptor expects are still missing after the validator's own five link
+# retrains. Reachable only with a descriptor set (no descriptor = no connectivity comparison), and a
+# descriptor is set only on a host it describes, so this is a measured fault, not a could-not-check:
+# a galaxy reset retrains the links. Left as a skip it held a galaxy fabric-unverified with no
+# release path after a reset left links down (jobs then failed "no forwarding direction").
+_LINKS_MISSING_AFTER_RETRAIN = re.compile(r"Encountered unrecoverable state")
+
+# The validator's own throw when the links it discovered do not match the cabling descriptor. Its
+# tray ids come from PCI bus numbers, so a tray whose uplink lands on another bus, or a cable that
+# is simply not there, mismatches on every run: a board reset cannot change either. Never
+# measured-bad; the caller reruns once without the descriptor (traffic over the discovered links).
+_TOPOLOGY_MISMATCH = re.compile(r"Connection mismatch detected")
+# The wrapper's own line once that traffic-only rerun passed. It carries the mismatch onto an OK
+# verdict, so the operator still hears that the cabling is not what the descriptor says.
+_TOPOLOGY_MARKER = re.compile(r"TOPOLOGY MISMATCH vs \S+: \d+ missing, \d+ extra port connections[^\n]*")
+_MISSING_PORTS = re.compile(r"found (\d+) missing port/cable connections")
+_EXTRA_PORTS = re.compile(r"found (\d+) extra port/cable connections")
+
+# The detail prefix of a topology-mismatch skip, so a hold can tell it from any other.
+TOPOLOGY_MISMATCH = "topology mismatch"
+# The detail prefix of a missing-cable verdict (spec 03 I47): the same prefix a known fabric fault
+# (I46) carries, because it is held the same way.
+CABLE_FAULT = "known fabric fault"
+_MARKER_COUNTS = re.compile(r"(\d+) missing, (\d+) extra port connections")
+
+
+def topology_counts(output: str) -> tuple[int, int]:
+    """``(missing, extra)`` port connections the validator listed against its descriptor."""
+    m = _MISSING_PORTS.search(output)
+    e = _EXTRA_PORTS.search(output)
+    return (int(m.group(1)) if m else 0, int(e.group(1)) if e else 0)
+
+
+def topology_marker(desc: str, missing: int, extra: int) -> str:
+    """The one line the wrapper and the built-in path both log for a mismatch."""
+    return (
+        f"TOPOLOGY MISMATCH vs {desc}: {missing} missing, {extra} extra port connections "
+        "(tray ids come from PCI bus numbers; a board reset cannot change this)"
+    )
+
+
+def missing_cables(marker: str) -> int:
+    """How many port/cable connections a topology marker names missing with none extra, else 0.
+
+    A moved tray renames its links, so it shows extra connections beside the missing ones; missing
+    links with nothing extra are cables that are absent or dead, which no reset can bring back."""
+    m = _MARKER_COUNTS.search(marker or "")
+    if not m or int(m.group(2)):
+        return 0
+    return int(m.group(1))
+
+
+def cable_fault(missing: int, desc: str, why: str) -> str:
+    """The detail of a missing-cable verdict; ``why`` is what the traffic-only rerun came to."""
+    return (
+        f"{CABLE_FAULT}: {missing} port/cable connection(s) of {desc} missing and none extra "
+        f"(a cable is absent or dead; no reset can fix it, needs an operator); {why}"
+    )
+
+
+def find_topology_marker(output: str) -> Optional[str]:
+    m = _TOPOLOGY_MARKER.search(output or "")
+    return m.group(0).strip() if m else None
+
+
+def is_topology_mismatch(output: str) -> bool:
+    """Whether the validator stopped on the descriptor comparison, not on a measurement."""
+    return bool(_TOPOLOGY_MISMATCH.search(output or "")) and not find_topology_marker(output)
+
+
+# A job that fails on the fabric right after a topology-mismatch lift: the links the traffic-only
+# pass skipped are exactly the ones a workload that routes across the whole mesh needs.
+_JOB_FABRIC_ERRORS = re.compile(
+    r"could not find any forwarding direction|fabric router sync: timeout|waiting for active ethernet core",
+    re.IGNORECASE,
+)
+
+
+def job_fabric_error(log_tail: str) -> Optional[str]:
+    m = _JOB_FABRIC_ERRORS.search(log_tail or "")
+    return m.group(0) if m else None
+
+
+# The lines naming why the validator never reached a verdict, most specific first, for a SKIPPED
+# detail that says more than a bare exit code. Order matters: an uncaught exception prints
+# "terminate called after throwing an instance of '<type>'" on the line ABOVE "  what():  <cause>",
+# so a first-match-in-line-order search kept the exception type and dropped the cause (a missing
+# 1G hugepage pool read as a bare UmdException). A logged error/TT_THROW line is next: some aborts
+# print their cause only there.
+_REASON_PATTERNS = (
+    re.compile(r"what\(\):.*"),
+    re.compile(r"filesystem error:.*"),
+    re.compile(r"(?:\|\s*(?:critical|fatal|error)\s*\||\[(?:critical|error)\]|TT_THROW|TT_FATAL).*", re.IGNORECASE),
+    re.compile(r"terminate called.*"),
+)
+
+# metal's TT_FATAL/TT_THROW header names only the source line and the failed condition
+# ("TT_FATAL @ fabric.cpp:173: forwarding_direction.has_value()"); the message itself is on the
+# line after a bare "info:" right below it, so the header alone said where it failed and not why.
+_ASSERT_HEADER = re.compile(r"TT_(?:FATAL|THROW) @ ")
+_ASSERT_INFO = re.compile(r"[^\n]*\n[ \t]*info:[ \t]*\n[ \t]*(\S[^\n]*)")
+
+
+def first_reason(output: str) -> Optional[str]:
+    """The validator's first error line, by :data:`_REASON_PATTERNS` priority, or ``None``.
+    A TT_FATAL/TT_THROW header line gets its "info:" message appended."""
+    for pat in _REASON_PATTERNS:
+        m = pat.search(output)
+        if m:
+            reason = m.group(0).strip()
+            info = _ASSERT_INFO.match(output, m.end()) if _ASSERT_HEADER.search(reason) else None
+            if info:
+                return f"{reason[:200]} -- {info.group(1).strip()[:200]}"
+            return reason[:300]
+    return None
 
 
 def classify(rc: Optional[int], output: str) -> tuple[Optional[bool], str]:
@@ -63,6 +175,9 @@ def classify(rc: Optional[int], output: str) -> tuple[Optional[bool], str]:
     that can cut it off first.
     """
     if rc == 0:
+        marker = find_topology_marker(output)
+        if marker:
+            return True, "fabric healthy on discovered links; " + marker
         return True, "fabric healthy"
     if rc is None:
         return False, "fabric check timed out before reaching a verdict"
@@ -75,14 +190,49 @@ def classify(rc: Optional[int], output: str) -> tuple[Optional[bool], str]:
         )
     if _WATCHDOG_TIMEOUT.search(output):
         return False, "traffic stalled until the validator's own watchdog fired; no link reported back"
-    reason = _SKIP_REASON.search(output)
+    if is_topology_mismatch(output):
+        missing, extra = topology_counts(output)
+        return None, (
+            f"{TOPOLOGY_MISMATCH}: {missing} missing, {extra} extra port connections vs the cabling "
+            "descriptor (tray ids come from PCI bus numbers; a board reset cannot change this)"
+        )
+    if _LINKS_MISSING_AFTER_RETRAIN.search(output):
+        return False, "links the cabling descriptor expects are still missing after the validator's retrains"
+    reason = first_reason(output)
     detail = f"validator did not complete a measurement (rc={rc})"
     if reason:
-        detail += f": {reason.group(0)}"
+        detail += f": {reason}"
     return None, detail
 
 
-def build_command() -> Optional[tuple[list[str], dict[str, str]]]:
+def _validator_paths() -> tuple[str, str, str]:
+    """``(binary, runtime root, descriptor or "")`` of the pinned validator, from the same env the
+    wrapper script reads."""
+    vroot = os.environ.get("TTDEV_VALIDATOR_ROOT", "/opt/tt-device-broker/validator").strip()
+    current = f"{vroot}/current"
+    binpath = os.environ.get("TTDEV_FABRIC_BIN", "").strip() or f"{current}/build/tools/scaleout/run_cluster_validation"
+    runtime_root = os.environ.get("TTDEV_FABRIC_RUNTIME_ROOT", "").strip() or current
+    return binpath, runtime_root, os.environ.get("TTDEV_FABRIC_DESCRIPTOR", "").strip()
+
+
+def validator_missing() -> Optional[str]:
+    """What of the pinned validator is not on disk yet, or ``None`` once all of it is.
+
+    The same three things the wrapper script exits 77 on: the binary, its runtime root and, when one
+    is configured, the cabling descriptor. ``install-fabric-validator.sh`` publishes them together by
+    flipping the ``current`` link, which on a fresh boot can land minutes after the broker's startup
+    pass ran. Stat calls only, so a caller may poll it."""
+    binpath, runtime_root, desc = _validator_paths()
+    if not os.access(binpath, os.X_OK):
+        return f"pinned validator not installed yet ('{binpath}')"
+    if not os.path.isdir(runtime_root):
+        return f"validator runtime root '{runtime_root}' missing"
+    if desc and not os.path.isfile(desc):
+        return f"cabling descriptor '{desc}' missing"
+    return None
+
+
+def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str, str]]]:
     """The argv + env to run the fabric check with, or ``None`` when nothing is
     configured/available to run at all.
 
@@ -98,26 +248,18 @@ def build_command() -> Optional[tuple[list[str], dict[str, str]]]:
     to any one topology makes the check work on only that topology, where every host gets a
     traffic-only check without it. A binary that has not been published yet is exactly as
     unavailable as no override at all, so both collapse to the same ``None``.
+
+    ``descriptor=False`` drops the cabling descriptor: the traffic-only rerun after a topology
+    mismatch.
     """
     override = os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "").strip()
     if override:
         return ["/bin/bash", "-c", override], {**os.environ, "PYTHONUNBUFFERED": "1"}
 
-    vroot = os.environ.get("TTDEV_VALIDATOR_ROOT", "/opt/tt-device-broker/validator").strip()
-    current = f"{vroot}/current"
-    binpath = os.environ.get("TTDEV_FABRIC_BIN", "").strip() or f"{current}/build/tools/scaleout/run_cluster_validation"
-    if not os.access(binpath, os.X_OK):
+    if validator_missing() is not None:
         return None
-    runtime_root = os.environ.get("TTDEV_FABRIC_RUNTIME_ROOT", "").strip() or current
-    if not os.path.isdir(runtime_root):
-        return None
-
-    desc = os.environ.get("TTDEV_FABRIC_DESCRIPTOR", "").strip()
-    desc_argv: list[str] = []
-    if desc:
-        if not os.path.isfile(desc):
-            return None
-        desc_argv = ["--cabling-descriptor-path", desc]
+    binpath, runtime_root, desc = _validator_paths()
+    desc_argv = ["--cabling-descriptor-path", desc] if desc and descriptor else []
 
     # Dedicated so the (root-run) check never depends on $HOME and never pollutes a
     # user's own firmware/kernel cache.
