@@ -7940,7 +7940,10 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                             f.write(f"\n[KILLED by device reset] {job.error}\n")
                     except OSError:
                         pass
-            elif _is_wedge_risk_exit(job.status, job.exit_code):
+            elif _is_wedge_risk_exit(job.status, job.exit_code) or job.status == JobStatus.PREEMPTED:
+                # A SIGINT-preempted job (-2 / 130) counts as a clean release only because the
+                # runner's post-job gate proves the fabric after it. That gate died with the old
+                # broker, so here a preemption always flags the device for reset + full check.
                 _mark_device_dirty(
                     f"re-adopted job {job_id} ended {job.status.value}"
                     + (f" (exit {job.exit_code})" if job.exit_code is not None else ""),
