@@ -19,7 +19,7 @@ import pytest
 
 from tests.conftest import patch_health_event, patch_recovery, stub_device_pollers
 from tt_device_mcp import server as srv
-from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.recovery import galaxy
 
@@ -818,3 +818,109 @@ async def test_a_broker_with_no_cached_bus_map_declines_the_walk(monkeypatch, cl
     assert out is None
     assert fired == []
     assert srv.fsm.latch("ubb_reset_fired") is False
+
+
+# --- the hold-deadline climb's tray rung reads the climb's own forced tenant guard ----------------
+
+
+def _arm_forced_tray_rung(monkeypatch, scan, *, verify_ok=True):
+    """The tray walk opted in on a single-tray below-floor drop, the holder scan fixed to ``scan`` and
+    the post-re-power verify recorded. Returns (fired, verifies)."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    srv.fsm.set_latch("ubb_reset_fired", False)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scan)
+    fired, verifies = [], []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        verifies.append(run_fabric)
+        return verify_ok, {"snapshot": {"ok": True}, "fabric": {"ok": verify_ok}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append((bitmap, ids)), raising=False)
+    return fired, verifies
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("force", [False, True])
+async def test_the_forced_tray_rung_does_not_read_an_unreadable_scan_as_a_tenant(
+    monkeypatch, galaxy_seen, clear_job_state, force
+):
+    """g15blx02, 10-14 17:43:25 PDT: the hold-deadline climb passed its own forced tenant guard (no tenant,
+    no job), then the tray rung re-read the scan WITHOUT force, took an unreadable one for a tenant and
+    skipped, so the climb fell to glx_reset. Forced, the walk fires and verifies with the fabric check;
+    unforced (the gate), an unreadable scan still holds. Fails on 4fc0588..4e08ca4: forced also holds."""
+    fired, verifies = _arm_forced_tray_rung(monkeypatch, HolderScan(holders=[], complete=False))
+    lines = []
+
+    beats = {str(i): 100 for i in range(32) if i != 31}
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 1, 32, lines.append, force=force)
+
+    if force:
+        assert out is True
+        assert fired == [(0x08, list(range(24, 32)))]
+        assert verifies and all(verifies), "the walk's verify runs the fabric check before it reports recovered"
+    else:
+        assert out is None
+        assert fired == []
+        assert any("holder scan is unreadable" in line for line in lines), lines
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tenant", ["holder", "job"])
+async def test_the_forced_tray_rung_still_holds_for_a_real_tenant_or_a_running_job(
+    monkeypatch, galaxy_seen, clear_job_state, tenant
+):
+    """force waives only the blindness guard: a readable tenant fd or a job the broker knows is RUNNING
+    still keeps the walk from re-powering silicon under it."""
+    if tenant == "holder":
+        scan = HolderScan(holders=[DeviceHolder(pid=4242, uid=3014)], complete=True)
+    else:
+        scan = HolderScan(holders=[], complete=False)
+        monkeypatch.setattr(srv.galaxy_recovery.deps, "job_running", lambda: True)
+    fired, verifies = _arm_forced_tray_rung(monkeypatch, scan)
+
+    beats = {str(i): 100 for i in range(32) if i != 31}
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 1, 32, lambda m: None, force=True)
+
+    assert out is None
+    assert fired == [] and verifies == []
+
+
+@pytest.mark.asyncio
+async def test_a_forced_tray_walk_whose_fabric_check_fails_keeps_the_hold(monkeypatch, galaxy_seen, clear_job_state):
+    """Goal of every reset path: no release before the full health check, fabric included, passes. A
+    forced walk whose post-re-power verify fails reports NOT recovered, so no caller clears the hold."""
+    fired, verifies = _arm_forced_tray_rung(monkeypatch, HolderScan(holders=[], complete=False), verify_ok=False)
+
+    beats = {str(i): 100 for i in range(32) if i != 31}
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 1, 32, lambda m: None, force=True)
+
+    assert out is False
+    assert fired and verifies and all(verifies)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verify_ok", [True, False])
+async def test_the_hold_deadline_climb_walks_the_tray_on_an_unreadable_scan_not_glx_reset(
+    monkeypatch, galaxy_seen, clear_job_state, verify_ok
+):
+    """End to end through the forced off-bus climb, the 10-14 shape: one chip off the bus below the floor,
+    no bridge candidate, no tenant, an unreadable holder scan. The tray walk fires instead of being skipped
+    for the mesh-wide reset, and the hold is cleared only when its fabric-inclusive verify passed."""
+    from tests.test_device_safety import _arm_offbus_stuck_hold
+
+    counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=1, isolated=set(), sbr_verify_healthy=verify_ok)
+    fired, verifies = _arm_forced_tray_rung(monkeypatch, HolderScan(holders=[], complete=False), verify_ok=verify_ok)
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
+
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+
+    assert fired and fired[0] == (0x08, list(range(24, 32))), "the forced climb walks the affected tray"
+    assert verifies and all(verifies)
+    assert counters["resets"] == 0, "no mesh-wide reset in place of the tray rung"
+    if verify_ok:
+        assert counters["fault_cleared"] == 1 and counters["dirty_cleared"] == 1
+    else:
+        assert counters["dirty_cleared"] == 0, "a walk whose verify failed never releases the device"
