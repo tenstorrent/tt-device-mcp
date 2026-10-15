@@ -371,3 +371,45 @@ async def test_a_readopted_preemptable_job_is_preempted_once_a_job_waits(monkeyp
     await asyncio.wait_for(srv._monitor_readopted_scope("021", "ttdev-job-021.scope"), timeout=5)
     assert stopped == ["021"]
     assert srv.jobs["021"].status is srv.JobStatus.PREEMPTED
+
+
+class _RecordingLogger:
+    def __init__(self):
+        self.warnings = []
+
+    def warning(self, msg, *a, **k):
+        self.warnings.append(msg)
+
+    def __getattr__(self, name):
+        return lambda *a, **k: None
+
+
+@pytest.mark.asyncio
+async def test_the_stop_window_runs_to_its_end_after_the_shell_exits(monkeypatch, clear_job_state):
+    """The shell exits on the SIGINT while a child that ignores it still holds the device. The
+    streams close at once, but the window is not cut short: the child gets the window's SIGKILL,
+    not just the survivor sweep's much shorter grace."""
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    _recording_post_job_gate(monkeypatch)
+    _recording_dirty(monkeypatch)
+    _fast_preempt(monkeypatch, grace=3)
+    log = _RecordingLogger()
+    monkeypatch.setattr(srv, "logger", log)
+    _waiting_job()
+
+    job = srv.Job(
+        id="945",
+        owner="t",
+        workspace="/tmp",
+        command="(trap '' INT TERM; sleep 30) & trap 'exit 0' INT; while true; do sleep 0.1; done",
+        queued_at="t",
+        timeout_sec=1,
+        preemptable=True,
+    )
+    srv.jobs["945"] = job
+    await srv.get_job_queue().put("945")
+    await _run_until_finished(job, limit_sec=20)
+
+    assert job.status is srv.JobStatus.PREEMPTED
+    assert any("PREEMPT job_id=945 still running" in w for w in log.warnings), log.warnings
