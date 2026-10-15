@@ -102,8 +102,10 @@ job boundary.
   (forced), at startup (forced), inside the recovery ladder, and on a `run_fabric` caller only
   when no pass is fresher than `FABRIC_CHECK_MIN_INTERVAL_SEC` (default 1200s).
 - **I13 — The gate never resets over a tenant.** A foreign holder (uid ≥ `MIN_TENANT_UID`,
-  1000) skips the gate untouched: verification is deferred, an existing hold outlives the skip
-  (`why=foreign_holder`), and `fsm.note` names the holder. The host rungs re-scan at fire time,
+  1000) skips the gate untouched: verification is deferred and the device is HELD
+  (`why=foreign_holder`, not dirty) even when it read HEALTHY — the holder's presence is reset
+  debt, since nobody knows what it did to the mesh — and `fsm.note` names the holder. That hold is
+  bounded by I30. The host rungs re-scan at fire time,
   and an incomplete scan counts as a tenant.
 - **I14 — Absence is never health.** An empty `/dev/tenstorrent` on a host whose baseline expects
   chips is every chip off the bus: mark dirty (`why=heartbeat`), hold, never release. A host that
@@ -305,6 +307,17 @@ job boundary.
   is identical either way; a `late` field marks the ones the reply that already went out could
   not mention. The earlier code discarded the eventual `ReclaimResult` on the timed-out path, so
   root SIGKILLing another user's pids appeared in neither the journal nor the action log.
+- **I30 — A foreign-holder hold is bounded and released only by the full check.** The idle relift
+  polls a `why=foreign_holder` hold every `TT_DEVICE_MCP_FOREIGN_HOLDER_POLL_SEC` (10 s) on its own
+  clock — ahead of the self-heal throttle, independent of `TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE` —
+  and never kills, signals, probes or resets beside the holder; an incomplete scan counts as one.
+  Once the holder is gone and no job runs, it runs the full gate with the fabric pass
+  (`force_fabric`); only a HEALTHY verdict releases, and a failed check keeps the device held for
+  the gate's recovery ladder (`foreign_holder_check_failed`), never released. Past
+  `TT_DEVICE_MCP_FOREIGN_HOLDER_DEADLINE_SEC` (900 s) it emits one `foreign_holder_past_deadline`
+  naming pid, user and command, and keeps polling. Every release emits `foreign_holder_recovered`
+  with `time_to_recover_sec`; `/health` shows `foreign_holder` while tracked and
+  `last_foreign_hold_recovery`.
 
 ## Interfaces
 
@@ -544,7 +557,7 @@ reset (spec 04).
 ```mermaid
 flowchart TB
   G["device_health_gate<br>phase: pre-job / post-job / startup / pre-step / post-step"] --> FH{"foreign holder<br>uid ≥ 1000?"}
-  FH -->|yes| FSKIP["skip untouched — hold unverified,<br>fault=foreign_holder, fsm.note names them"]
+  FH -->|yes| FSKIP["skip untouched — HOLD even if healthy,<br>why=foreign_holder, fsm.note names them;<br>idle relift polls for exit, then full gate + fabric (I30)"]
   FH -->|no| ND{"/dev/tenstorrent empty?"}
   ND -->|"yes, baseline expects chips"| ALLOFF["all chips off bus →<br>mark dirty (heartbeat), HOLD"]
   ND -->|"yes, never had chips"| NSKIP["skip, no hold"]
@@ -615,7 +628,9 @@ lift it:
 - `SELFHEAL_WHYS = {eth_frozen, off_bus}` — the idle relift re-verifies read-only (I21).
 - `fabric_unverified` — only a real healthy fabric verdict lifts; the perturbing retry is the
   opt-in fabric relift (I22).
-- `GENERIC_ESCALATE_WHYS = {gate_error, foreign_holder, startup_unverified}` — no read-only
+- `foreign_holder` — polled for the holder's exit on its own short clock; released only by the
+  full gate with the fabric pass once it is gone, never reset under the holder (I30).
+- `GENERIC_ESCALATE_WHYS = {gate_error, startup_unverified}` — no read-only
   story: enum+ARC prove nothing these were placed for, so they never lift on a read; past the
   ceiling they escalate to the gate's own ladder (`TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE`, on by
   default) instead of standing until a broker restart.
@@ -711,7 +726,7 @@ refuses.
 | I10 | `tests/test_monitor.py::test_status_never_blocks_before_the_first_update`, `tests/test_monitor.py::test_update_overwrites_readings` |
 | I11 | `tests/test_device_safety.py::test_a_mesh_that_lost_chips_does_not_lower_its_own_bar`, `tests/test_device_safety.py::test_expected_chip_count_survives_an_unreadable_baseline`, `tests/test_device_safety.py::test_an_unreadable_baseline_with_no_chips_present_is_not_read_as_device_less`, `tests/test_device_safety.py::test_a_host_with_no_baseline_and_no_chips_stays_device_less` |
 | I12 | `tests/test_device_safety.py::test_the_pre_job_gate_never_runs_the_slow_fabric_pass`, `tests/test_device_safety.py::test_a_clean_job_does_not_pay_for_a_fabric_pass`, `tests/test_device_safety.py::test_a_failed_job_forces_a_fabric_pass_even_inside_the_quiet_window`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[540-False]`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[660-True]`, `tests/test_device_safety.py::test_fabric_interval_defaults_to_twenty_minutes` |
-| I13 | `tests/test_readopt.py::test_startup_hold_names_the_foreign_holder_blocking_the_verify`, `tests/test_device_safety.py::test_governor_never_reboots_over_a_tenant`, `tests/test_device_safety.py::test_a_tenant_arriving_before_the_reboot_decision_blocks_it`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_under_a_foreign_tenant` |
+| I13 | `tests/test_foreign_holder.py::test_a_foreign_holder_on_a_healthy_device_is_reset_debt`, `tests/test_readopt.py::test_startup_hold_names_the_foreign_holder_blocking_the_verify`, `tests/test_device_safety.py::test_governor_never_reboots_over_a_tenant`, `tests/test_device_safety.py::test_a_tenant_arriving_before_the_reboot_decision_blocks_it`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_under_a_foreign_tenant` |
 | I14 | `tests/test_device_safety.py::test_an_empty_dev_dir_on_a_host_that_expects_chips_holds_not_releases`, `tests/test_device_safety.py::test_a_device_less_host_never_reads_an_empty_sysfs_as_a_drop` |
 | I15 | `tests/test_device_safety.py::test_an_unverified_clear_holds_the_device`, `tests/test_device_safety.py::test_a_gate_that_errored_holds`, `tests/test_device_safety.py::test_a_clean_device_is_not_held_by_an_unverified_clear`, `tests/test_device_safety.py::test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace`, `tests/test_device_safety.py::test_a_verified_clear_names_itself_and_records_it_was_verified` |
 | I16 | `tests/test_device_safety.py::test_a_frozen_eth_verdict_is_held_not_reset`, `tests/test_device_safety.py::test_a_frozen_eth_verdict_holds_the_door_even_when_not_pre_dirty`, `tests/test_device_safety.py::test_frozen_eth_reset_needs_both_kill_switches`, `tests/test_device_safety.py::test_eth_heartbeat_hang_reads_as_frozen_not_skipped` |
@@ -750,6 +765,12 @@ refuses.
 | I29 (a deferred dispatch is diagnosable: health_event + log line, holder named in queue/status) | `tests/test_slurm_steps.py::test_a_deferred_dispatch_is_visible_in_the_health_log_and_the_queue_status` |
 | I29 (straggler reclaim is audited: health_event + action-log row, quiet on a no-op) | `tests/test_slurm_steps.py::test_post_step_records_a_reclaim_that_signalled_something`, `tests/test_slurm_steps.py::test_a_no_op_reclaim_writes_nothing` |
 | I29 (the audit covers every pid signalled across escalation rounds, not just the last round's residue) | `tests/test_device_holders.py::test_reclaim_reports_a_pid_that_died_to_an_earlier_round_as_signalled`, `tests/test_slurm_steps.py::test_post_step_audits_a_reclaim_with_mixed_outcomes` |
+| I30 (holder gone: full check with fabric, then release, time recorded) | `tests/test_foreign_holder.py::test_holder_exits_then_the_fabric_check_passes_and_the_device_is_released` |
+| I30 (failed check stays held for the ladder) | `tests/test_foreign_holder.py::test_holder_exits_but_the_check_fails_so_the_device_stays_held_for_the_ladder` |
+| I30 (one deadline escalation, never a kill or reset) | `tests/test_foreign_holder.py::test_past_the_deadline_one_escalation_names_the_holder_and_nothing_is_killed` |
+| I30 (a stale hold clears on the next short poll) | `tests/test_foreign_holder.py::test_a_stale_holder_record_clears_on_the_next_poll` |
+| I30 (own poll interval) | `tests/test_foreign_holder.py::test_the_poll_runs_on_its_own_short_interval` |
+| I30 (env timings) | `tests/test_foreign_holder.py::test_foreign_holder_timings_default_and_parse` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |
