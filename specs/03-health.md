@@ -707,6 +707,13 @@ job boundary.
   being climbed never reads as unbounded. Reporting only: it releases nothing, and a requested power
   cycle leaves the device held until the full gate, fabric included, passes. The stage clears with
   the episode. The jobs-list hold row keeps the name it opened with.
+- **I56 — A hold stays held through its own recovery.** A broker op that runs while a hold episode
+  is open (a forced ladder rung such as a glx_reset, any reset, the check after it) keeps `/health`
+  `held: true` and `status: degraded`, with the hold's own `held_since` and `held_reason` (and I55's
+  escalation), until the full gate, fabric included, passes and closes the episode. Neither the op
+  starting nor the op ending lifts it. The jobs list still shows one row for the device, the op's. A
+  routine op on a device no hold was open for (a between-jobs check, a post-job reset) does not read
+  as held; `device_degraded` names it.
 
 ## Interfaces
 
@@ -737,7 +744,8 @@ subsystem through the root:
   *Free* (`require_free=True`, `pre-step` only) applies the reset gate's tenant rule: a holder at
   or above `MIN_TENANT_UID`, or an incomplete scan, is not free (04 I7).
 - `/health` (REST, `server._health_payload`) — `status: ok|degraded` (degraded exactly while the
-  device is HELD: degraded, refused to tenants, no recovery op running), `fsm_state`, `fsm_why`,
+  device is HELD: degraded, refused to tenants, no recovery op running, or an op running inside an
+  open hold, I56), `fsm_state`, `fsm_why`,
   `held`/`held_since`/`held_reason`/`held_age_sec`, `device_degraded`, queue counts, version.
   `fsm_why` keeps the reason the hold opened with, and `held_reason` adds where its escalation
   stands, also given as `hold_escalation` (I55); the live fields say where it
@@ -1265,6 +1273,7 @@ refuses.
 | I53 | `tests/test_startup_fabric_hugepages.py::test_the_eth_read_records_a_measured_link_drop`, `tests/test_startup_fabric_hugepages.py::test_a_77_with_eth_links_down_escalates_on_the_first_relift`, `tests/test_startup_fabric_hugepages.py::test_a_77_with_eth_links_down_is_forced_past_the_hold_deadline`, `tests/test_startup_fabric_hugepages.py::test_a_77_with_eth_links_full_keeps_the_backoff`, `tests/test_startup_fabric_hugepages.py::test_a_78_cable_fault_with_eth_links_down_holds_without_a_reset`, `tests/test_startup_fabric_hugepages.py::test_a_77_eth_drop_reset_releases_only_on_a_passing_full_check`, `tests/test_startup_fabric_hugepages.py::test_a_startup_hugepages_hold_with_links_measured_down_stays_77_only` |
 | I54 | `tests/test_device_activity.py::test_a_gap_of_one_second_or_less_never_reads_idle`, `tests/test_device_activity.py::test_a_gap_over_one_second_reads_idle_and_counts_up`, `tests/test_device_activity.py::test_idle_clears_on_the_first_sample_with_work_and_the_total_is_kept`, `tests/test_device_activity.py::test_unknown_is_never_idle_and_restarts_the_count`, `tests/test_device_activity.py::test_a_stale_view_reads_unknown_not_the_last_idle`, `tests/test_device_activity.py::test_no_job_process_holding_the_device_is_no_work`, `tests/test_device_activity.py::test_a_holder_whose_cpu_moves_is_work_and_a_flat_one_is_not`, `tests/test_device_activity.py::test_an_unreadable_holder_record_is_unknown`, `tests/test_device_activity.py::test_the_cadence_and_threshold_default_to_one_second`, `tests/test_device_activity.py::test_the_sampler_reads_once_per_interval_and_a_failed_read_is_unknown`, `tests/test_device_activity.py::test_the_sampler_runs_only_while_the_job_runs`, `tests/test_device_activity.py::test_the_sampler_is_stopped_before_the_post_job_gate`, `tests/test_device_activity.py::test_a_sampler_that_cannot_start_leaves_the_job_alone`, `tests/test_device_activity.py::test_queue_status_shows_device_idle_on_the_running_row`, `tests/test_device_activity.py::test_queue_status_without_a_sampler_has_no_activity_fields`, `tests/test_device_activity.py::test_health_carries_the_running_jobs_activity`, `tests/test_device_activity.py::test_job_status_tool_shows_idle_while_running_and_the_total_after`, `tests/test_device_activity.py::test_the_footer_records_the_idle_total_and_still_parses`, `tests/test_device_activity.py::test_the_cli_overview_marks_only_an_idle_job`, `tests/test_device_activity.py::test_cli_status_of_one_job_prints_its_device_line`, `tests/test_device_activity.py::test_watch_redraws_every_second` |
 | I55 | `tests/test_hold_escalation_status.py::test_a_fresh_offbus_hold_names_the_one_shot_deadline`, `tests/test_hold_escalation_status.py::test_each_step_moves_the_stage_and_the_deadline`, `tests/test_hold_escalation_status.py::test_another_episodes_power_cycle_is_not_this_ones`, `tests/test_hold_escalation_status.py::test_a_running_ladder_and_the_kill_switch_and_a_77_hold_say_so`, `tests/test_hold_escalation_status.py::test_the_hold_row_keeps_its_name`, `tests/test_hold_escalation_status.py::test_release_clears_the_stage`, `tests/test_hold_escalation_status.py::test_not_held_reports_no_escalation`, `tests/test_hold_escalation_status.py::test_a_forced_pass_updates_the_reason_and_keeps_the_hold` |
+| I56 | `tests/test_hold_escalation_status.py::test_health_stays_held_while_a_forced_rung_runs`, `tests/test_hold_escalation_status.py::test_health_lifts_the_hold_only_when_the_gate_passes_inside_the_op`, `tests/test_hold_escalation_status.py::test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |

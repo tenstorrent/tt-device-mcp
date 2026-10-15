@@ -181,3 +181,64 @@ async def test_a_forced_pass_updates_the_reason_and_keeps_the_hold(monkeypatch, 
     stage = payload["hold_escalation"]["stage"]
     assert stage.startswith("forced recovery ladder (the 600s ceiling (window 1)) ended:"), stage
     assert payload["held_reason"] != before
+
+
+# --- /health stays held while a broker op runs inside a hold (spec 03 I56) ----------------------
+
+
+def test_health_stays_held_while_a_forced_rung_runs(held, monkeypatch):
+    """g15blx02 10-15: /health read held:false, status ok, fsm recovering while the forced glx_reset of a
+    hold ran, then held:true again once it ended. The op inside an open hold episode is the recovery of
+    THAT hold: the device is still refused, and a probe or watcher that reads ``held`` must not see it
+    lifted until the full gate, fabric included, passes."""
+    srv._note_tenant_gate_verdict(f"device unverified: {REASON}")
+    before = srv._health_payload(now=held + timedelta(seconds=30))
+    assert before["held"] is True
+
+    class Running:
+        def done(self):
+            return False
+
+    monkeypatch.setattr(srv, "_forced_escalation_task", Running())
+    monkeypatch.setattr(srv, "device_op_active", "hold-deadline-escalate")
+    monkeypatch.setattr(srv, "device_op_detail", "galaxy reset")
+    srv._note_escalation_stage("galaxy reset (glx_reset) of the present mesh")
+    during = srv._health_payload(now=held + timedelta(seconds=700))
+    assert during["held"] is True, "a forced rung must not read as a lifted hold"
+    assert during["status"] == "degraded" and during["fsm_state"] != ServerState.HEALTHY.value
+    assert during["held_since"] == before["held_since"], "the hold keeps its clock across the op"
+    assert during["held_age_sec"] >= before["held_age_sec"]
+    assert during["held_reason"].startswith(f"device unverified: {REASON} [")
+    assert "the forced recovery ladder is running" in during["held_reason"]
+    assert during["hold_escalation"]["stage"] == "galaxy reset (glx_reset) of the present mesh"
+    assert "broker device op in flight" in during["device_degraded"]
+    assert not [
+        r for r in srv._recent_jobs(20) if r["job_id"] == "--" and "HELD" in r["command"]
+    ], "the jobs list still shows the op's row, not a second hold row"
+
+    # The rung ended but the post-reset check has not passed: still held.
+    monkeypatch.setattr(srv, "device_op_active", "")
+    monkeypatch.setattr(srv, "_forced_escalation_task", None)
+    assert srv._health_payload(now=held + timedelta(seconds=760))["held"] is True
+
+
+def test_health_lifts_the_hold_only_when_the_gate_passes_inside_the_op(held, monkeypatch):
+    """The post-reset check runs inside the op; held drops the moment that full gate passes (it closes
+    the episode), not when the op ends and not before."""
+    srv._note_tenant_gate_verdict(f"device unverified: {REASON}")
+    monkeypatch.setattr(srv, "device_op_active", "health-gate/post-reset")
+    assert srv._health_payload()["held"] is True
+    srv._note_tenant_gate_verdict("")  # the gate passed, fabric included
+    payload = srv._health_payload()
+    assert payload["held"] is False and "held_reason" not in payload
+
+
+def test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held(monkeypatch, clear_job_state):
+    """A between-jobs check or reset on a device no hold was open for is not a hold: status stays ok and
+    device_degraded names the op, as before."""
+    _isolate_hold(monkeypatch)
+    monkeypatch.setattr(srv, "device_op_active", "health-gate/post-job")
+    fsm_dirty(srv, "job 070 ended killed")
+    payload = srv._health_payload()
+    assert payload["held"] is False and payload["status"] == "ok"
+    assert payload["device_degraded"]
