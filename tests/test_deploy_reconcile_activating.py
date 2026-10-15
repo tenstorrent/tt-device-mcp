@@ -37,7 +37,7 @@ def _run(tmp_path: Path, state: str) -> tuple[list[str], str]:
         f'if [ "$1" = is-active ]; then echo "{state}"; [ "{state}" = active ] && exit 0; exit 3; fi\n'
         "exit 0\n"
     )
-    stub.chmod(0o755)
+    stub.chmod(0o700)
     script = tmp_path / "step1.sh"
     script.write_text("set -u\n" + _step1(tmp_path) + "\n")
     env = {"PATH": f"{bindir}:/usr/bin:/bin"}
