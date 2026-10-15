@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Spec 03 I38: a clean exit-1 failure may skip the forced post-job fabric pass while a recent OK
 pass is fresh. Device-free: every probe is stubbed."""
 
