@@ -32,7 +32,9 @@ async def wait_for(aw: Awaitable[T], timeout: Optional[float]) -> T:
         raise
     if not done:
         await _cancel_and_wait(fut)
-        if fut.cancelled():
+        # A cancelled gather is not in the cancelled state: it ends with CancelledError as its
+        # exception. Our own cancel, either way, is the timeout.
+        if fut.cancelled() or isinstance(fut.exception(), asyncio.CancelledError):
             raise asyncio.TimeoutError
     return fut.result()
 
