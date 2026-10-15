@@ -280,8 +280,8 @@ path, need no root — every install step is downstream of the render, so tests 
 host.
 The unit orders after `dev-hugepages\x2d1G.mount` (`Wants=` + `After=`) and never after
 `tenstorrent-hugepages.service`: that unit is `After=multi-user.target`, while the broker and
-ltx-host (`After=` the broker) come before multi-user.target, so the ordering is a cycle and
-systemd breaks it at boot by deleting the broker's or ltx-host's start job. A drop-in cannot
+a serving unit (`After=` the broker) come before multi-user.target, so the ordering is a cycle and
+systemd breaks it at boot by deleting the broker's or that unit's start job. A drop-in cannot
 remove the vendor's `After=`; the broker waits for the page count itself (spec 03 I33).
 
 **Autoupdate flow (`autoupdate.sh`).** Invoked every reconcile lap; self-gated

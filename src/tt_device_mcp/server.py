@@ -1103,7 +1103,7 @@ JOB_COOLDOWN_SEC = float(os.environ.get("TT_DEVICE_MCP_JOB_COOLDOWN_SEC", "0"))
 # seconds. 0.0 until a job ends this process, so the first job after a boot never waits.
 last_job_end_monotonic: float = 0.0
 
-# Per-owner submission burst cap. The incident's LTX vbench sweep queued ten 32-chip jobs in
+# Per-owner submission burst cap. The incident's benchmark sweep queued ten 32-chip jobs in
 # ~90s — one every ~11s — and draining them back-to-back with no idle is what walked a tray off
 # the bus. This caps how fast a single owner may ADMIT work: a burst is refused at submission,
 # before it fills the queue, rather than throttled at dispatch after the run is committed and the
