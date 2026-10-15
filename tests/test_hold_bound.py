@@ -132,6 +132,8 @@ def test_fsm_json_records_whether_recovery_is_armed(tmp_path):
     path = tmp_path / "fsm.json"
     f = ServerFsm(path)
     f.set_recovery_armed(False, None)
+    assert not path.exists(), "a BOOT record is never written; the first transition carries the fields"
+    f.on_fault("off_bus", detail="1 of 32 chips off the bus")
     on_disk = json.loads(path.read_text())
     assert on_disk["recovery_armed"] is False and on_disk["hold_bound_sec"] is None
     f.set_recovery_armed(True, 600)

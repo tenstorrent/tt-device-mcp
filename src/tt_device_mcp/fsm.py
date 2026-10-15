@@ -480,10 +480,13 @@ class ServerFsm:
         return self._hold_bound_sec
 
     def set_recovery_armed(self, armed: bool, bound_sec: Optional[int]) -> None:
-        """State whether a hold is bounded by an armed rung (and the bound), for fsm.json and /health."""
+        """State whether a hold is bounded by an armed rung (and the bound), for fsm.json and /health.
+        Written now unless the record is still BOOT: a BOOT record is never on disk (a restart would
+        read it as this boot's earlier broker), and the first transition writes these fields anyway."""
         self._recovery_armed = bool(armed)
         self._hold_bound_sec = bound_sec if armed else None
-        self._persist()
+        if self._record.state is not ServerState.BOOT:
+            self._persist()
 
     def set_latch(self, name: str, value: bool) -> None:
         """Set a per-episode latch directly — for a caller (the escalation ladder) that must
