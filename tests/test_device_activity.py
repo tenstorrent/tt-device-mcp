@@ -12,8 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.conftest import fsm_healthy
 from tests import test_device_safety
+from tests.conftest import fsm_healthy
 from tests.test_device_safety import _run_one_job
 from tt_device_mcp import cli, device_activity, device_holders, job_reap
 from tt_device_mcp import server as srv
