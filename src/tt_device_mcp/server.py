@@ -49,7 +49,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
-from tt_device_mcp import __version__, aio, alert, metrics, privileges, telemetry
+from tt_device_mcp import __version__, aio, alert, device_activity, metrics, privileges, telemetry
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
     FABRIC_CHECK_CANNOT_CHECK_RC,
@@ -743,6 +743,7 @@ class Job:
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     log_file: Optional[str] = None
+    idle_total_sec: Optional[float] = None  # DEVICE IDLE time over the run (spec 03 I54)
 
     @property
     def runtime_sec(self) -> Optional[float]:
@@ -769,6 +770,9 @@ job_queue: asyncio.Queue[str] | None = None  # Lazy init - created at runtime
 job_counter: int = 0  # Monotonic counter for job IDs; wraps at JOB_ID_MODULUS
 current_process: asyncio.subprocess.Process | None = None
 current_job_id: str | None = None  # job_id of current_process, so a kill can scope-route it
+# job_id -> the 1 s device-activity sampler of that running job (spec 03 I54). Started at spawn,
+# stopped at the top of the runner's finally; never on the between-jobs path.
+_job_activity: dict[str, device_activity.DeviceActivitySampler] = {}
 # True from a job's exit until its post-job gate returns. current_process is already None in that
 # window, so idle-only device work (the eth self-test retry) checks this too.
 post_job_gate_pending: bool = False
@@ -2291,6 +2295,37 @@ def _parse_job_log_footer(tail: list[str]) -> dict:
     return {}
 
 
+def _start_job_activity(job_id: str, pid: Optional[int], scope: Optional[str], tag: Optional[str]) -> None:
+    """Start the job's 1 s device-activity sampler (spec 03 I54). Best effort: a sampler that
+    cannot start leaves the job's activity unknown and never touches the job itself."""
+    try:
+        sampler = device_activity.DeviceActivitySampler(device_activity.JobActivitySource(pid, scope, tag))
+        sampler.start()
+    except Exception as e:  # noqa: BLE001 - status only; the job runs regardless
+        if logger:
+            logger.warning(f"JOB_RUNNER job_id={job_id} device activity sampler did not start: {e}")
+        return
+    _job_activity[job_id] = sampler
+
+
+def _stop_job_activity(job_id: str, job: Optional["Job"], log=None) -> None:
+    """Stop the job's sampler (cancel, never await) and keep its total idle time on the job."""
+    sampler = _job_activity.pop(job_id, None)
+    if sampler is None:
+        return
+    view = sampler.stop()
+    if job is not None:
+        job.idle_total_sec = view.get("idle_total_sec")
+    if log and view.get("idle_total_sec"):
+        log.info(f"JOB_RUNNER job_id={job_id} device idle {view['idle_total_sec']:.1f}s in total while held")
+
+
+def job_activity_view(job_id: Optional[str]) -> Optional[dict]:
+    """The running job's activity fields for the status surfaces, or None when it has no sampler."""
+    sampler = _job_activity.get(job_id) if job_id else None
+    return sampler.view() if sampler is not None else None
+
+
 def write_job_log_footer(job_log_file: Path, job: Job):
     """Write job completion footer to the job log file."""
     with open(job_log_file, "a") as f:
@@ -2302,6 +2337,8 @@ def write_job_log_footer(job_log_file: Path, job: Job):
             f.write(f"WAIT TIME:   {job.wait_sec:.1f}s\n")
         if job.runtime_sec is not None:
             f.write(f"RUNTIME:     {job.runtime_sec:.1f}s\n")
+        if job.idle_total_sec is not None:
+            f.write(f"DEVICE IDLE: {job.idle_total_sec:.1f}s\n")
         f.write("=" * 70 + "\n")
 
 
@@ -5822,6 +5859,12 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         "fsm_why": fsm.record.why,
     }
     payload.update(_live_offbus_state())
+    # Whether the running job is doing device work (spec 03 I54); absent while no job runs.
+    for j in jobs.values():
+        view = job_activity_view(j.id) if j.status == JobStatus.RUNNING else None
+        if view is not None:
+            payload["device_activity"] = {"job_id": j.id, **view}
+            break
     if hold:
         reason, since = hold
         payload["held_since"] = since
@@ -7310,6 +7353,8 @@ def _get_queue_status() -> dict:
             "command": j.command[:COMMAND_DISPLAY_LENGTH],
             "workspace": Path(j.workspace).name,
             "started_at": j.started_at,
+            # activity / idle_since / idle_seconds / activity_label: DEVICE IDLE (spec 03 I54).
+            **(job_activity_view(j.id) or {}),
             **({"preempt": preempt_label(j)} if j.preemptable else {}),
         }
         for j in running
@@ -8567,6 +8612,7 @@ export {JOB_TAG_ENV}={job_tag}
             # the queued spec only now: forgetting it any earlier would lose the job if the
             # broker died between dispatch and spawn.
             _forget_queued_job(job_id)
+            _start_job_activity(job_id, proc.pid, job_scope_unit(job_id) if privsep_prefix else None, job_tag)
 
             # One open handle for the job's lifetime (line-buffered so streaming
             # readers see each line) — opening per line is a syscall storm under a
@@ -8854,6 +8900,9 @@ export {JOB_TAG_ENV}={job_tag}
                     job.exit_code = proc.returncode
 
         finally:
+            # The process is gone (or the broker is shutting down): the activity sampler ends
+            # here, cancelled rather than awaited, before the sweep and the gate (spec 03 I54).
+            _stop_job_activity(job_id, job, logger)
             # On shutdown leave the running job alive (it survives in its scope for
             # re-adoption) — skip the kill, the footer, and the completion bookkeeping.
             if cancelled:
@@ -10238,6 +10287,10 @@ def create_mcp_server() -> MCPServer:
         }
         if job.error:
             result["cause"] = job.error
+        if job.status == JobStatus.RUNNING:
+            result.update(job_activity_view(job_id) or {})  # DEVICE IDLE (spec 03 I54)
+        elif job.idle_total_sec is not None:
+            result["idle_total_sec"] = job.idle_total_sec
         if job.preemptable:
             result["preemptable"] = True
             result["timeout_sec"] = job.timeout_sec

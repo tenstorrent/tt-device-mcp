@@ -1,4 +1,4 @@
-"""The hold reason and /health say where a held device's escalation stands (spec 03 I54).
+"""The hold reason and /health say where a held device's escalation stands (spec 03 I55).
 
 A below-floor off-bus hold opens with "held for self-heal, not reset", and the hold watchdog then
 climbs the off-bus one-shot, the power-cycle grace and the ceiling windows underneath it. Without
