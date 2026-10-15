@@ -16,6 +16,7 @@ import time
 import pytest
 
 import tt_device_mcp.server as srv
+from tt_device_mcp.constants import ETH_POST_JOB_TIMEOUT_SEC
 from tt_device_mcp.health.core import Verdict
 from tt_device_mcp.health.monitors import eth
 
@@ -98,6 +99,34 @@ async def test_an_override_is_judged_on_its_exit_code_alone(monkeypatch):
     monkeypatch.setattr(eth, "check", _check)
     ok, _ = await srv.health_monitor.verify_eth_heartbeat()
     assert ok is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "timeout_sec, override, reap_sec",
+    [(60.0, False, 2.0), (ETH_POST_JOB_TIMEOUT_SEC, False, 0.5), (60.0, True, 0.0)],
+)
+async def test_the_eth_read_reaps_its_killed_reader_within_the_outer_bound(
+    monkeypatch, timeout_sec, override, reap_sec
+):
+    """The built-in read waits up to ETH_REAP_SEC for a killed reader, capped at half the slack
+    under the caller's bound: 2.0 s at 60 s/probe 45 s, 0.5 s at the 10 s post-job bound. The
+    override runs at the caller's own bound and has no slack, so it does not wait (spec 03 I16)."""
+    seen = {}
+    if override:
+        monkeypatch.setenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", "exit 0")
+    else:
+        monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
+    monkeypatch.delenv("TTDEV_ETH_CHECK_TIMEOUT", raising=False)
+    monkeypatch.setattr(eth, "build", lambda: (["probe"], {}))
+
+    async def _check(argv, env, *, timeout_sec, track, cwd=None, reap_sec=0.0):
+        seen["reap_sec"] = reap_sec
+        return 0, _count(4)
+
+    monkeypatch.setattr(eth, "check", _check)
+    await srv.health_monitor.verify_eth_heartbeat(timeout_sec=timeout_sec)
+    assert seen["reap_sec"] == pytest.approx(reap_sec)
 
 
 @pytest.mark.asyncio

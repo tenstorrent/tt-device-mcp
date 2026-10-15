@@ -9468,9 +9468,7 @@ async def test_stuck_hold_escalation_holds_when_the_holder_scan_is_incomplete(mo
 def _deferral_capture(monkeypatch):
     """Record the escalation's log lines and its stuck_hold_deferred events."""
     lines, events = [], []
-    patch_health_event(
-        monkeypatch, lambda kind, **f: events.append(f) if kind == "stuck_hold_deferred" else None
-    )
+    patch_health_event(monkeypatch, lambda kind, **f: events.append(f) if kind == "stuck_hold_deferred" else None)
     return lines, events
 
 
@@ -9504,7 +9502,9 @@ async def test_stuck_hold_deferral_names_the_tenant_holder(monkeypatch, clear_jo
     """A real tenant is named by pid, uid, user and comm, on the forced pass too (force never waives one)."""
     tenant = DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)
     counters = _arm_stuck_hold(monkeypatch, scan=HolderScan(holders=[tenant], complete=True))
-    monkeypatch.setattr("tt_device_mcp.health.recovery.galaxy.holder_comm", lambda pid: "tt-smi" if pid == 4242 else "?")
+    monkeypatch.setattr(
+        "tt_device_mcp.health.recovery.galaxy.holder_comm", lambda pid: "tt-smi" if pid == 4242 else "?"
+    )
     lines, events = _deferral_capture(monkeypatch)
     ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lines.append, force=True)
     assert ran is False and counters["resets"] == 0
