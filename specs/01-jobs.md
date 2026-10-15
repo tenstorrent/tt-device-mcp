@@ -28,7 +28,7 @@ the queue and a running job outlive the broker process.
 - **I2** — `MAX_TIMEOUT_SEC` (1500 s / 25 min) is a hard ceiling on `timeout_sec`, clamped
   in `_queue_job` — the single funnel shared by the MCP tools and the REST route — never
   only at a tool schema. At the ceiling, the timeout message MUST NOT offer a way to raise
-  it.
+  it. A preemptable job's `timeout_sec` is clamped the same way; it is a soft limit (I20).
 - **I3** — The job log file is created at queue time, before the job is enqueued, so it can
   be tailed immediately; it is the complete, durable record of the run (in-memory capture is
   a bounded tail, `JOB_CAPTURE_MAX_LINES`).
@@ -78,7 +78,9 @@ the queue and a running job outlive the broker process.
   aside (`.finished`), not requeued — nor one whose id a live job holds (ids wrap).
 - **I7** — A re-adopted job keeps its original `timeout_sec` reservation, with time already
   served counted against it (`_readopted_deadline`); re-adoption never grants a fresh
-  clock, and the deadline is enforced by `_monitor_readopted_scope`.
+  clock, and the deadline is enforced by `_monitor_readopted_scope`. A re-adopted
+  preemptable job (header `PREEMPTABLE: yes`) is held to I20 instead: past its deadline it
+  is preempted only once another job waits.
 - **I8** — A job's exit status comes from the job itself: the shell preamble
   (`_exit_trap_preamble`) traps EXIT/TERM/INT and writes the status to
   `job_exit_file(job_id)`. A re-adopted job with no exit file MUST be reported FAILED,
@@ -178,17 +180,32 @@ the queue and a running job outlive the broker process.
   value turns the bound off: garbage, non-finite or non-positive reads as the default. With
   `TT_DEVICE_MCP_FORCE_ESCALATE=0` the job still fails at the bound and its error says nothing
   was escalated.
+- **I20** — A job submitted with `preemptable` has no timeout except on contention:
+  `timeout_sec` is a soft limit. Past it the job runs on for as long as no other job is
+  queued. Once one is (and the limit has passed), the broker starts a stop window of
+  `PREEMPT_GRACE_SEC` (60 s): SIGINT at once, SIGTERM `SIGTERM_GRACE_SEC` before the end,
+  SIGKILL at the end (`_preempt_job`). The job ends `preempted`. A job queued before the
+  limit passes waits for it — the limit stays a guarantee. Status surfaces mark the job
+  `PREEMPTABLE <x>min` (x = the soft limit) and, inside the window, `PREEMPTING <x>s`
+  (seconds to SIGKILL) — queue status, job status, wait progress and the CLI.
+  A preempted job's end is a failed end for the post-job gate (fabric pass forced, I14 rules
+  for dirtiness): the gate, fabric included, passes before the waiting job is dispatched. A
+  SIGINT exit (−2 / 130) is the stop it was asked for, not a wedge; a kill by any other signal,
+  or no exit status, marks the device dirty. Anyone using the option MUST watch the broker
+  (queue status, or the job's own status) and shut down gracefully within the window once a
+  job is queued.
 
 ## Interfaces
 
 Other subsystems and tenants may rely on:
 
 - **Job states** (`JobStatus`): `queued`, `running`, `completed`, `failed`, `timeout`,
-  `hung`, `killed`. Terminal: all but `queued`/`running`. `completed` means exit code 0;
-  a non-zero exit is `failed`.
+  `hung`, `killed`, `preempted`. Terminal: all but `queued`/`running`. `completed` means
+  exit code 0; a non-zero exit is `failed`; `preempted` is a preemptable job stopped on
+  contention (I20).
 - **`Job` fields and properties**: `id`, `owner`, `workspace`, `command`, `queued_at`,
-  `started_at`, `finished_at`, `exit_code`, `timeout_sec`, `log_file`, `env_vars`;
-  computed `runtime_sec`, `wait_sec`.
+  `started_at`, `finished_at`, `exit_code`, `timeout_sec`, `log_file`, `env_vars`,
+  `preemptable`; computed `runtime_sec`, `wait_sec`.
 - **MCP/REST surface** (schemas and routes are spec 02; names only):
   `tt_device_job_run` (queue + block, streams progress), `tt_device_job_run_bg`,
   `tt_device_job_status`, `tt_device_job_wait`, `tt_device_job_logs`,
@@ -322,7 +339,10 @@ flowchart LR
 - `asyncio.wait_for(..., timeout=job.timeout_sec)` bounds the run. On expiry the job is
   terminated via `_terminate_job` (scope-aware, I5) and becomes TIMEOUT, with
   `timeout_hint()` explaining the limit — actionable below the ceiling, non-negotiable at
-  it.
+  it. A preemptable job is not bounded by `wait_for`; a `preempt_watchdog` polls every
+  `PREEMPT_POLL_SEC` and, past the soft limit with a job queued, sets
+  `preempt_deadline_monotonic` and calls `_preempt_job` (I20). The job stays `running`
+  through the window so status shows the countdown; it becomes `preempted` at exit.
 - The hung watchdog (I10) announces silence every `HUNG_NOTICE_SEC` (60 s) in the job's
   log, then reaps at `HUNG_SILENCE_SEC` as HUNG; the doomed reap fires first if the
   runtime declared the device unrecoverable. Both kill the process so the streams hit EOF
@@ -450,6 +470,7 @@ flowchart LR
 | I15 | `tests/test_device_safety.py::test_hold_mode_holds_a_degraded_device_then_dispatches_when_fit`, `tests/test_device_safety.py::test_hold_mode_self_heals_a_dirty_device_by_re_running_the_gate`, `tests/test_device_safety.py::test_exhausting_the_verify_budget_does_not_dispatch`, `tests/test_device_safety.py::test_tenant_gate_writes_one_held_and_one_released_per_episode`, `tests/test_device_safety.py::test_a_tenant_holder_blocks_dispatch`, `tests/test_device_safety.py::test_a_tenant_holder_holds_the_job_until_it_exits`, `tests/test_device_safety.py::test_broker_owned_holders_do_not_block_dispatch`, `tests/test_device_safety.py::test_an_incomplete_holder_scan_does_not_block_dispatch` |
 | I16 | `tests/test_reaped_leftover.py::test_the_leftover_is_named_and_the_event_fires_once_per_episode`, `tests/test_reaped_leftover.py::test_the_fence_lifts_and_the_release_event_fires_once_the_holder_is_gone`, `tests/test_reaped_leftover.py::test_dispatch_is_refused_even_when_the_leftover_descends_from_the_broker`, `tests/test_reaped_leftover.py::test_a_running_jobs_own_scope_is_not_a_leftover`, `tests/test_reaped_leftover.py::test_an_ordinary_holder_behaves_as_before`, `tests/test_reaped_leftover.py::test_a_swept_survivor_outside_a_scope_is_a_leftover_only_with_the_same_starttime`, `tests/test_reaped_leftover.py::test_a_survivor_record_is_dropped_once_a_complete_scan_no_longer_sees_it`, `tests/test_reaped_leftover.py::test_a_scan_error_never_fences_a_free_device`, `tests/test_reaped_leftover.py::test_a_leftover_without_pending_sigkill_is_named_but_not_called_unkillable`, `tests/test_reaped_leftover.py::test_the_health_gate_runs_no_probe_and_keeps_the_device_dirty` |
 | I19 | `tests/test_device_safety.py::test_held_job_fails_past_the_hold_bound_and_escalates`, `tests/test_device_safety.py::test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation`, `tests/test_device_safety.py::test_tenant_hold_max_sec_has_no_unbounded_value` |
+| I20 | `tests/test_preemptable.py::test_a_preemptable_job_runs_past_its_limit_while_nobody_waits`, `tests/test_preemptable.py::test_an_ordinary_job_still_times_out_at_its_limit`, `tests/test_preemptable.py::test_contention_inside_the_limit_does_not_preempt`, `tests/test_preemptable.py::test_contention_past_the_limit_stops_the_job_and_still_runs_the_full_gate`, `tests/test_preemptable.py::test_a_job_that_ignores_the_stop_is_killed_at_the_window_end`, `tests/test_preemptable.py::test_the_stop_window_runs_to_its_end_after_the_shell_exits`, `tests/test_preemptable.py::test_preempt_labels`, `tests/test_preemptable.py::test_queue_status_and_cli_show_the_preempt_label`, `tests/test_preemptable.py::test_preempted_wedge_risk`, `tests/test_preemptable.py::test_rest_submit_carries_the_option_into_the_job_and_its_log`, `tests/test_preemptable.py::test_a_readopted_preemptable_job_past_its_limit_is_left_alone_while_nobody_waits`, `tests/test_preemptable.py::test_a_readopted_preemptable_job_is_preempted_once_a_job_waits` |
 | B-Submission (burst cap) | `tests/test_device_safety.py::test_an_armed_burst_cap_refuses_one_owners_flood_but_not_another`, `tests/test_device_safety.py::test_the_default_off_burst_cap_admits_every_submit`, `tests/test_device_safety.py::test_job_burst_decision_prunes_the_window_and_gates_on_the_cap[2-60.0-recent2-110.0-False-50.0-expect_kept2]` |
 | B-Submission (owner derived from the peer uid and the surface) | `tests/test_device_safety.py::test_the_owner_comes_from_the_peer_uid_and_the_surface` |
 | B-Submission (blocking run) | `tests/test_server.py::test_a_blocking_job_run_reports_progress_through_the_mcp_layer` |
