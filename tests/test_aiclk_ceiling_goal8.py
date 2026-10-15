@@ -281,9 +281,7 @@ async def test_every_reset_path_runs_ceiling_then_full_fabric_pass_then_releases
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", list(PATHS))
-async def test_fabric_fail_after_any_reset_keeps_the_hold_and_enters_bounded_recovery(
-    rig, monkeypatch, tmp_path, path
-):
+async def test_fabric_fail_after_any_reset_keeps_the_hold_and_enters_bounded_recovery(rig, monkeypatch, tmp_path, path):
     """A fabric FAIL after the reset (and its ceiling) never releases: the device stays held with the
     fabric still owed, and the hold-deadline watchdog forces the recovery ladder past its ceiling."""
     rig.fabric = FABRIC_FAIL
