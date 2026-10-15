@@ -7026,8 +7026,6 @@ SMI_SAFE_FLAGS = {
     "--version",
     "-l",
     "--local",
-    "-f",
-    "--filename",
     "-h",
     "--help",
 }
