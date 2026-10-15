@@ -31,7 +31,7 @@ def _stub_probe(monkeypatch, rc: int, text: str) -> None:
     monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
     monkeypatch.setattr(eth, "build", lambda: (["probe"], {}))
 
-    async def _check(argv, env, *, timeout_sec, track, cwd=None):
+    async def _check(argv, env, *, timeout_sec, track, cwd=None, reap_sec=0.0):
         return rc, text
 
     monkeypatch.setattr(eth, "check", _check)
@@ -92,7 +92,7 @@ async def test_an_override_is_judged_on_its_exit_code_alone(monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", "exit 0")
     monkeypatch.setattr(eth, "build", lambda: (["probe"], {}))
 
-    async def _check(argv, env, *, timeout_sec, track, cwd=None):
+    async def _check(argv, env, *, timeout_sec, track, cwd=None, reap_sec=0.0):
         return 0, _count(1)
 
     monkeypatch.setattr(eth, "check", _check)
