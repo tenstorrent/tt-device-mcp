@@ -157,14 +157,16 @@ job boundary.
 - **I20 — A stalled sampler withholds the systemd watchdog ping.** The escalation ladder must
   never sit silently behind a dead sampler; a stall past `STALL_SEC` gets the broker restarted.
 - **I21 — The idle relift lifts a hold only on proof, read-only for self-heal holds.**
-  `eth_frozen` lifts only on a positively-advancing eth heartbeat; `off_bus` lifts on enum+ARC
-  (the chip returns visibly) unless the eth read is affirmatively frozen or the last fabric
-  verdict is UNHEALTHY; a skip (`None`) never overwrites the fabric latch. The relift is
+  `eth_frozen` lifts only on a positively-advancing eth heartbeat; `off_bus` lifts once enum+ARC
+  see the chip back, unless the eth read is affirmatively frozen or the last fabric verdict is
+  UNHEALTHY, and only after the full gate, fabric included, passes (I52); a skip (`None`) never
+  overwrites the fabric latch. The relift is
   rate-limited (`SELFHEAL_RELIFT_INTERVAL_SEC`, default 120s), single-flight, re-checks every
   guard under the device-op lock, and bails when the hold was re-dirtied or a chip drops
   mid-verify — a dirty device belongs to the pre-job gate.
 - **I22 — The fabric relift is the only relift path that runs the traffic pass, and it is off by
-  default** (`TT_DEVICE_MCP_FABRIC_RELIFT`) except for a 77-only hold (I34). It lifts only on an
+  default** (`TT_DEVICE_MCP_FABRIC_RELIFT`) except for a 77-only hold (I34) and an off-bus return
+  (I52). It lifts only on an
   explicit healthy verdict; a 77 on retry or a failure holds. With it off, a fabric-unverified hold
   with any trace of a fault falls into the generic escalate category rather than standing forever.
 - **I23 — Every hold terminates.** The hold-deadline watchdog puts a stuck hold on the durable
@@ -657,6 +659,20 @@ job boundary.
   startup, before its first spawn, the broker records its pid and takes `NOTIFY_SOCKET` out of its
   environment, so no job, check or tool it starts inherits the socket. `_sd_notify` refuses a call
   from any other pid (logged once per kind) instead of sending one systemd would drop.
+- **I52 — An off-bus return is gated by the full health gate, fabric included.** A chip that left
+  the bus came back through a reset of some kind (its own, a tray's, the driver's), so no relift
+  reopens the door on it until the full gate passes after its return: the 1G hugepages are allocated
+  (a shortfall holds without running anything), enum+ARC read healthy, and the fabric pass returns an
+  explicit healthy verdict. A 77 (`ok` None) or a failure holds. This applies to the `off_bus` self-heal
+  relift (I21) and to a DOWN episode whose `why` is `off_bus` or `heartbeat`: DOWN is the terminal
+  rung, but once every expected device node is back and no chip's ARC heartbeat reads all-ones, the
+  idle tick re-checks it on the relift pacing (`SELFHEAL_RELIFT_INTERVAL_SEC`) under the device-op
+  lock. That re-check never resets. It lifts only on a passing gate, and only if the episode
+  (`since`, `why`, `detail`, `dirty`) is unchanged after it, so a chip that drops mid-verify keeps it
+  DOWN. A failed or unverifiable gate leaves it DOWN for the next tick. This is the system broker's
+  rule: a per-user daemon (`should_privsep()` false) has no staged fabric validator, so no pass of
+  its could read True. There the `off_bus` hold its start pass places (I4) lifts on the enum+ARC
+  re-read, and the DOWN re-check is not armed.
 
 ## Interfaces
 
@@ -1010,7 +1026,8 @@ held with no broker op running), given one synthetic HOLD row and one durable
 `device_held`/`device_released` pair per episode. Which `why` a hold carries decides what may
 lift it:
 
-- `SELFHEAL_WHYS = {eth_frozen, off_bus}` — the idle relift re-verifies read-only (I21).
+- `SELFHEAL_WHYS = {eth_frozen, off_bus}` — the idle relift re-verifies read-only (I21); an
+  `off_bus` lift then also passes the full gate, fabric included (I52).
 - `fabric_unverified` — only a real healthy fabric verdict lifts; the perturbing retry is the
   opt-in fabric relift (I22), on by default when the hold's only cause is a 77 (I34), which is
   never escalated to a reset.
@@ -1201,6 +1218,7 @@ refuses.
 | I49 | `tests/test_boot_fabric_reverify.py::test_a_carried_down_fabric_hold_reopens_on_a_startup_77`, `tests/test_boot_fabric_reverify.py::test_the_reopened_hold_lifts_on_a_healthy_relift`, `tests/test_boot_fabric_reverify.py::test_a_reopened_hold_that_77s_again_is_held_without_a_reset_then_bounded`, `tests/test_boot_fabric_reverify.py::test_a_reopened_known_fabric_fault_is_held_without_a_climb`, `tests/test_boot_fabric_reverify.py::test_a_same_boot_down_is_not_reopened`, `tests/test_boot_fabric_reverify.py::test_a_carried_down_with_a_finding_is_not_reopened`, `tests/test_boot_fabric_reverify.py::test_reopen_after_boot_is_one_shot_and_needs_a_known_other_boot` |
 | I50 | `tests/test_fabric_check_interrupted.py::test_a_check_in_flight_is_marked_and_cleared`, `tests/test_fabric_check_interrupted.py::test_a_mark_left_by_a_stopped_broker_is_journaled_once_at_startup`, `tests/test_fabric_check_interrupted.py::test_an_unreadable_mark_is_still_journaled`, `tests/test_fabric_check_interrupted.py::test_a_cancelled_check_is_journaled_at_once`, `tests/test_fabric_check_interrupted.py::test_startup_journals_the_interruption_before_anything_else` |
 | I51 | `tests/test_sd_notify_main_pid.py::test_the_main_pid_notifies`, `tests/test_sd_notify_main_pid.py::test_a_non_main_pid_is_refused_and_said_once`, `tests/test_sd_notify_main_pid.py::test_the_claim_keeps_the_socket_from_children` |
+| I52 | `tests/test_device_safety.py::test_idle_relift_lifts_an_off_bus_floor_hold_without_the_eth_reader`, `tests/test_device_safety.py::test_idle_relift_holds_an_off_bus_hold_until_the_fabric_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_lifts_once_every_chip_is_back_and_the_full_gate_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_stays_down_unless_the_fabric_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_runs_no_gate_until_every_chip_is_back`, `tests/test_device_safety.py::test_a_down_offbus_recheck_holds_when_a_chip_drops_mid_verify`, `tests/test_device_safety.py::test_a_down_offbus_recheck_is_paced`, `tests/test_device_safety.py::test_a_per_user_daemon_neither_arms_the_down_offbus_recheck_nor_gates_on_fabric`, `tests/test_readopt.py::test_a_failed_per_user_start_reopens_once_the_device_reads_healthy` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |
