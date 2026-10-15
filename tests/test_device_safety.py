@@ -9078,8 +9078,9 @@ async def test_idle_relift_still_strands_a_stuck_off_bus_hold_when_kill_switched
 
 
 def _setup_generic_hold(monkeypatch, tmp_path, *, n_present=32):
-    """Put the device into an arms-neither HOLD (a foreign holder blocked verification), with the
-    generic-hold escalation armed, ready for _attempt_idle_relift."""
+    """Put the device into an arms-neither HOLD (a gate that errored out), with the generic-hold
+    escalation armed, ready for _attempt_idle_relift. A foreign-holder hold has its own bounded poll
+    (spec 03 I30, tests/test_foreign_holder.py) and never escalates to a reset."""
     for i in range(n_present):
         (tmp_path / str(i)).write_text("")
     monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
@@ -9089,14 +9090,14 @@ def _setup_generic_hold(monkeypatch, tmp_path, *, n_present=32):
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     srv.device_op_lock = None
     srv.device_op_active = ""
-    fsm_dirty(srv, "foreign holder present: [agent]someone", why="foreign_holder")
+    fsm_dirty(srv, "gate errored out: verify raised", why="gate_error")
     srv.last_relift_monotonic = 0.0
     monkeypatch.setenv("TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE", "1")
 
 
 @pytest.mark.asyncio
 async def test_idle_relift_escalates_a_generic_arms_neither_hold(monkeypatch, tmp_path, clear_job_state):
-    """The remaining indefinite hold, end-to-end: a foreign-holder hold arms neither relift, so base
+    """The remaining indefinite hold, end-to-end: a gate-error hold arms neither relift, so base
     leaves it standing forever. Armed and past the ceiling on an idle present mesh with no tenant, the
     relift now escalates it to the gate's galaxy reset — WITHOUT a read-only verify, which cannot prove
     this class fit. Fails on base, where a generic hold arms nothing and never reaches a reset."""
@@ -9167,7 +9168,7 @@ async def test_idle_relift_escalates_a_fabric_unverified_hold_when_relift_is_off
 
 @pytest.mark.asyncio
 async def test_idle_relift_leaves_a_generic_hold_untouched_when_kill_switched(monkeypatch, tmp_path, clear_job_state):
-    """The kill-switch: with TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE=0 a foreign-holder hold arms neither
+    """The kill-switch: with TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE=0 a gate-error hold arms neither
     relift and is left standing — no reset, no read-only verify — the read-only base behavior."""
     _setup_generic_hold(monkeypatch, tmp_path)
     counters = _arm_stuck_hold(monkeypatch)

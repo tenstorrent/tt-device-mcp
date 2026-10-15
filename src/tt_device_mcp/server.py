@@ -776,11 +776,15 @@ SELFHEAL_WHYS = frozenset({"eth_frozen", "off_bus"})
 # The one why the idle relift re-runs the (perturbing) fabric traffic pass for, because a fabric
 # that could only not-run (a 77) is proven fit only by a pass that gets a real verdict.
 FABRIC_RELIFT_WHY = "fabric_unverified"
-# why values with no read-only story at all — a foreign holder that blocked verification, a gate
+# why values with no read-only story at all — a gate
 # that errored out, or a startup boot still awaiting its first fabric pass. enum+ARC prove nothing
 # these were placed for, so they never lift on a read; past the ceiling they escalate to the gate's
 # own recovery ladder instead of standing until a broker restart.
-GENERIC_ESCALATE_WHYS = frozenset({"gate_error", "foreign_holder", "startup_unverified"})
+GENERIC_ESCALATE_WHYS = frozenset({"gate_error", "startup_unverified"})
+# The why of a hold placed because a process outside the broker holds the device (spec 03 I30). It
+# has its own bounded path in the idle relift: a short poll for the holder's exit, then the full
+# gate with the fabric pass before release. It never escalates to a reset under the holder.
+FOREIGN_HOLDER_WHY = "foreign_holder"
 
 # Set when the RUNTIME named a device fault in a job's output. Outranks our own checks,
 # which are blind to this class of fault, and only a reset retires it. Independent of the FSM:
@@ -2328,6 +2332,138 @@ def _clear_device_dirty_unverified(why: str, *, holds: bool = True, fault: str =
     fsm.on_fault(fault, detail=why, dirty=False)
 
 
+def _foreign_holder_poll_sec() -> int:
+    """How often (seconds) the idle relift re-scans a foreign-holder hold for the holder's exit —
+    TT_DEVICE_MCP_FOREIGN_HOLDER_POLL_SEC, default 10 (the sampler's own interval). Read per call;
+    malformed reads as the default, floored at 1 so it never busy-spins."""
+    raw = os.environ.get("TT_DEVICE_MCP_FOREIGN_HOLDER_POLL_SEC", "").strip()
+    try:
+        return max(1, int(raw)) if raw else 10
+    except ValueError:
+        return 10
+
+
+def _foreign_holder_deadline_sec() -> int:
+    """How long (seconds) a foreign holder may keep the device held before the broker escalates
+    once, naming it — TT_DEVICE_MCP_FOREIGN_HOLDER_DEADLINE_SEC, default 900. Malformed or <= 0
+    reads as the default. The escalation is a report only: the holder is never signalled."""
+    raw = os.environ.get("TT_DEVICE_MCP_FOREIGN_HOLDER_DEADLINE_SEC", "").strip()
+    try:
+        val = int(raw) if raw else 900
+    except ValueError:
+        return 900
+    return val if val > 0 else 900
+
+
+# The foreign-holder hold being tracked (spec 03 I30): since (epoch), escalated, holders. Empty when
+# none is. last_foreign_hold_recovery keeps the last release's time to recover for /health.
+foreign_hold: dict = {}
+last_foreign_hold_recovery: dict = {}
+last_foreign_poll_monotonic: float = 0.0
+
+
+def _holder_cmd(pid: int) -> str:
+    """The holder's command line, truncated, for the operator; '' when it cannot be read."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()[:200]
+
+
+def _describe_holder(h) -> dict:
+    return {"pid": h.pid, "uid": h.uid, "user": h.username, "cmd": _holder_cmd(h.pid)}
+
+
+def _hold_for_foreign_holder(foreign: list, who: str) -> None:
+    """Hold the door because a process outside the broker holds the device — HEALTHY or not.
+
+    Nobody knows what that process did to the mesh, so its presence is reset debt, not ordinary
+    contention: the queue stays closed until the holder is gone and the full gate, fabric included,
+    has passed (spec 03 I30). Nothing here probes, signals or resets beside it; the idle relift
+    polls for its exit on a short clock (_foreign_holder_pass)."""
+    _journal_fsm_transition(f"foreign holder present: {who}", verified=False)
+    fsm.on_fault(FOREIGN_HOLDER_WHY, detail=f"foreign holder present: {who}", dirty=False)
+    # Name them so the status says who to wait on, not a bare "device unverified".
+    fsm.note(f"held: {who} holds the device; verify deferred until it releases")
+    holders = [_describe_holder(h) for h in foreign]
+    if not foreign_hold:
+        foreign_hold.update(since=time.time(), escalated=False)
+        health_event("foreign_holder_hold", holders=holders)
+    foreign_hold["holders"] = holders
+
+
+def _settle_foreign_hold() -> None:
+    """Close a tracked foreign-holder hold once the device is HEALTHY again, recording the time to
+    recover. A no-op while none is tracked or the device is still held."""
+    if not foreign_hold or fsm.state is not ServerState.HEALTHY:
+        return
+    ttr = round(time.time() - foreign_hold.get("since", time.time()), 1)
+    holders = foreign_hold.get("holders", [])
+    health_event("foreign_holder_recovered", time_to_recover_sec=ttr, holders=holders)
+    if logger:
+        logger.info(f"FOREIGN-HOLDER released after {ttr}s: holder gone and the full check passed")
+    last_foreign_hold_recovery.clear()
+    last_foreign_hold_recovery.update(
+        time_to_recover_sec=ttr, at=datetime.now().isoformat(timespec="seconds"), holders=holders
+    )
+    foreign_hold.clear()
+
+
+def _foreign_holder_hold_armed() -> bool:
+    """A foreign-holder hold the idle relift polls — independent of the generic escalate switch.
+    A dirty mark landing on it belongs to the pre-job gate, as for every other hold."""
+    return fsm.state is ServerState.RECOVERING and fsm.record.why == FOREIGN_HOLDER_WHY and not fsm.record.dirty
+
+
+async def _foreign_holder_pass() -> None:
+    """One poll of a foreign-holder hold (spec 03 I30). Holder still there: name it, escalate once
+    past the deadline, and wait — never kill, signal, probe or reset. Holder gone and no job
+    running: the full gate with the fabric pass decides; only its healthy verdict releases, and a
+    failure stays held for the gate's recovery ladder."""
+    try:
+        if not foreign_hold:
+            # A hold carried across a restart, or placed before this tracking: its clock starts now.
+            foreign_hold.update(since=time.time(), escalated=False, holders=[])
+        scan = await asyncio.to_thread(enumerate_device_holders)
+        foreign = [h for h in scan.holders if h.uid >= MIN_TENANT_UID]
+        if foreign or not scan.complete:
+            if foreign:
+                foreign_hold["holders"] = [_describe_holder(h) for h in foreign]
+                who = ", ".join(f"{h.username}(pid {h.pid})" for h in foreign)
+                fsm.note(f"held: {who} holds the device; verify deferred until it releases")
+            held = time.time() - foreign_hold["since"]
+            deadline = _foreign_holder_deadline_sec()
+            if held >= deadline and not foreign_hold.get("escalated"):
+                foreign_hold["escalated"] = True
+                health_event(
+                    "foreign_holder_past_deadline",
+                    holders=foreign_hold.get("holders", []),
+                    held_sec=round(held, 1),
+                    deadline_sec=deadline,
+                )
+                if logger:
+                    logger.warning(
+                        f"FOREIGN-HOLDER device held {int(held)}s by {foreign_hold.get('holders')} "
+                        f"(deadline {deadline}s); not touching it — stop that process to release the device"
+                    )
+            return
+        if any(j.status == JobStatus.RUNNING for j in jobs.values()):
+            return
+        if logger:
+            logger.info("FOREIGN-HOLDER holder gone; running the full health check, fabric included")
+        await _device_health_gate(None, phase="foreign-holder-left", run_fabric=True, force_fabric=True)
+        if fsm.state is ServerState.HEALTHY:
+            _settle_foreign_hold()
+        else:
+            health_event("foreign_holder_check_failed", why=fsm.record.why)
+            if logger:
+                logger.warning(f"FOREIGN-HOLDER check after the holder left failed ({fsm.record.why}); held")
+    except Exception:  # noqa: BLE001 - runs in the detached relift task, which must never raise
+        if logger:
+            logger.exception("FOREIGN-HOLDER pass aborted on an unexpected error — holding")
+
+
 def _hold_device_unverified(why: str, *, needs_eth_advancing: bool = False) -> None:
     """Hold the tenant door on an affirmative fault the broker will NOT reset — a detected
     frozen eth core, which self-heals and drops off the bus if pushed.
@@ -2574,7 +2710,7 @@ def _fabric_relift_enabled() -> bool:
 def _generic_hold_escalate_enabled() -> bool:
     """Whether a hold no read-only relift can lift escalates to the idle galaxy reset once past the
     ceiling, instead of standing until a broker restart. These holds arm neither the self-heal nor
-    the fabric relift — a foreign holder that blocked verification, or a gate that errored out — and
+    the fabric relift — a gate that errored out, or a startup still awaiting its fabric pass — and
     enum+ARC proves nothing they were placed for, so read-only they never reopen. This path never
     lifts on a read: it only escalates a present, tenant-free mesh past the ceiling to the reset the
     next job's gate would run, riding every _escalate_stuck_hold guard. ON by default;
@@ -2626,11 +2762,24 @@ async def _attempt_idle_relift() -> None:
     verdict — a 77 again on retry (_verify_device returns healthy=True on a skipped fabric) and a
     failure both hold, so the door never reopens onto fabric no pass cleared. OFF by default (see
     _fabric_relift_enabled): it perturbs, so it is opt-in. The two categories are mutually exclusive.
-    A why in GENERIC_ESCALATE_WHYS (a foreign holder that blocked verification, a gate error, or a
+    A foreign-holder hold (FOREIGN_HOLDER_WHY) is polled on its own short clock ahead of everything
+    else here (_foreign_holder_pass, spec 03 I30): never a reset under the holder, the full gate with
+    the fabric pass once it is gone.
+    A why in GENERIC_ESCALATE_WHYS (a gate error, or a
     startup boot still awaiting its first fabric pass) arms neither — an enum+ARC pass proves
     nothing those were placed for — so it is never lifted here; when TT_DEVICE_MCP_GENERIC_HOLD_
     ESCALATE is set it instead escalates to the idle galaxy reset once past the ceiling (see
     _generic_hold_escalate_enabled), rather than standing until a broker restart."""
+    if _foreign_holder_hold_armed() and not device_op_active:
+        # Its own short clock, ahead of the self-heal throttle and outside _device_op: the gate it
+        # may run takes the device-op lock itself, and that lock is not re-entrant.
+        global last_foreign_poll_monotonic
+        now = time.monotonic()
+        if last_foreign_poll_monotonic and now - last_foreign_poll_monotonic < _foreign_holder_poll_sec():
+            return
+        last_foreign_poll_monotonic = now
+        await _foreign_holder_pass()
+        return
     selfheal, fabric, generic = _idle_relift_armed()
     if not ((selfheal or fabric or generic) and not device_op_active):
         return
@@ -2684,8 +2833,8 @@ async def _attempt_idle_relift() -> None:
                 return outcome != OUTCOME_WAITING
 
             if generic:
-                # A hold no read-only check can lift — the foreign holder that blocked verification,
-                # or a gate that errored out. enum+ARC reads clean across a wedged eth link, so a read
+                # A hold no read-only check can lift — a gate that errored out, or a startup still
+                # awaiting its first fabric pass. enum+ARC reads clean across a wedged eth link, so a read
                 # never proves such a mesh fit; this branch never lifts on one. Past the ceiling on an
                 # idle, tenant-free present mesh it escalates to the gate's galaxy reset (the one
                 # authoritative proof), and holds otherwise — every guard lives in _escalate_stuck_hold.
@@ -2826,10 +2975,11 @@ def _maybe_spawn_idle_relift() -> None:
     ~45s traffic pass inline would blind the sampler's dead-chip tripwire and leave the probe's
     dead-BAR read with nothing to kill it. The spawned task re-checks every guard itself."""
     global _relift_task
+    _settle_foreign_hold()
     if _relift_task is not None and not _relift_task.done():
         return
     selfheal, fabric, generic = _idle_relift_armed()
-    if not ((selfheal or fabric or generic) and not device_op_active):
+    if not ((selfheal or fabric or generic or _foreign_holder_hold_armed()) and not device_op_active):
         return
     _relift_task = asyncio.create_task(_attempt_idle_relift())
 
@@ -3388,13 +3538,7 @@ async def device_health_gate(
     if foreign:
         who = ", ".join(f"{h.username}(pid {h.pid})" for h in foreign)
         _log(f"skip: device held by {who}; not touching it")
-        _clear_device_dirty_unverified(f"foreign holder present: {who}", fault="foreign_holder")
-        # A door already held (a startup verify, a prior fault) outlives this skip: the verify
-        # cannot run beside a foreign tenant, so the hold waits them out — and reads to the tenant
-        # queued behind it as a bare "device unverified", a device fault, when the blocker is
-        # another user's process. Name them so the status says who to wait on. Reword only: a
-        # foreign holder on an unheld device is ordinary contention, not a hold to invent.
-        fsm.note(f"held: {who} holds the device; verify deferred until it releases")
+        _hold_for_foreign_holder(foreign, who)
         return
 
     indices = _present_chip_indices()
@@ -4148,6 +4292,15 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         "fsm_state": fsm.state.value,
         "fsm_why": fsm.record.why,
     }
+    if foreign_hold:
+        payload["foreign_holder"] = {
+            "held_sec": round(time.time() - foreign_hold.get("since", time.time()), 1),
+            "deadline_sec": _foreign_holder_deadline_sec(),
+            "escalated": bool(foreign_hold.get("escalated")),
+            "holders": foreign_hold.get("holders", []),
+        }
+    if last_foreign_hold_recovery:
+        payload["last_foreign_hold_recovery"] = dict(last_foreign_hold_recovery)
     if hold:
         reason, since = hold
         payload["held_since"] = since
