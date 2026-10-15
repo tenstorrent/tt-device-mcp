@@ -10916,10 +10916,12 @@ async def test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_affected_t
     monkeypatch, clear_job_state, galaxy_trays
 ):
     """A per-tray reset walk that re-powered the affected tray (spec 04 I25: only trays holding an
-    off-bus chip) and still did not recover must not sit: past the grace it climbs to the mesh reset
-    and then the host rung (a warm reboot cannot re-enumerate a still-off-bus tray, so the cold power
-    cycle is the only rung left), loudly when none is opted in, and the episode's one walk is spent so
-    it does not loop. Fails on base, which falls to a silent below-floor hold."""
+    off-bus chip) and still did not recover must not sit: with no bounded power cycle to hand off to
+    (spec 04 I27) it climbs straight to the host rung (a warm reboot cannot re-enumerate a still-off-bus
+    tray, so the cold power cycle is the only rung left), loudly when none is opted in, and the
+    episode's one walk is spent so it does not loop. No below-floor mesh reset follows a failed walk:
+    on one Galaxy it overran its 180 s and failed with 8 chips off. Fails on base, which falls to a
+    silent below-floor hold."""
     fired = {"n": 0}
     counters = _arm_offbus_stuck_hold(
         monkeypatch, off_bus=8, isolated=set(), sbr_verify_healthy=False, reset_result=False
@@ -10935,10 +10937,11 @@ async def test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_affected_t
     ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
     assert ran is True, "a walk that did not recover must climb, never sit"
     assert fired["n"] == 1, "the walk re-powered the affected tray only, never a healthy one"
-    assert counters["resets"] == 1, "a failed walk falls to the mesh reset's below-floor attempt"
+    assert counters["resets"] == 0, "no below-floor mesh reset after a failed walk"
     assert counters["dirty_cleared"] == 0, "a walk that did not verify healthy must not clear the hold"
     assert "ubb_reset_did_not_recover" in events
-    assert "stuck_hold_galaxy_reset_below_floor_attempt" in events
+    assert "galaxy_reset_skipped_after_tray_walk" in events
+    assert "stuck_hold_galaxy_reset_below_floor_attempt" not in events
     assert (
         "reset_unrecoverable_power_cycle_required" in events
     ), "the failed walk climbs loudly to the host rung, never a silent hold"
