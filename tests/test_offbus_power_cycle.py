@@ -720,6 +720,25 @@ async def test_a_failed_bmc_ipmi_hands_off_past_its_bound(monkeypatch, tmp_path,
 
 
 @pytest.mark.asyncio
+async def test_a_regressed_tray_rung_hands_off_past_the_grace(monkeypatch, tmp_path, clear_job_state):
+    """A tray re-power on this boot took chips on other trays off the bus: the gate still allows resets,
+    but the per-tray rung is declined, so the hold takes the same bounded end (ladder once, grace, one
+    power cycle) instead of re-running the ladder."""
+    hold_since, rec = _gated(monkeypatch, tmp_path, held_sec=120)
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
+    assert await _pass(hold_since) is None, "nothing latched: back to the ladder"
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5", "13"], signature="position5")
+    assert await _pass(hold_since) is None, "the ladder runs once first"
+    opc.note_ladder_ran(hold_since)
+    assert await _pass(hold_since) is False, "inside the grace: hold"
+    assert rec["fires"] == []
+    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", "60")
+    assert await _pass(hold_since) is True
+    assert len(rec["fires"]) == 1
+    assert "other trays off the bus" in rec["fires"][0]["reason"]
+
+
+@pytest.mark.asyncio
 async def test_within_the_ipmi_bound_it_holds_and_the_bound_is_configurable(monkeypatch, tmp_path, clear_job_state):
     hold_since, rec = _gated(monkeypatch, tmp_path)
     _ipmi_failed(monkeypatch, hold_since, 120)

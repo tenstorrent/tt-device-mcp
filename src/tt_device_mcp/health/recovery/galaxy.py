@@ -213,9 +213,9 @@ def _ubb_reset_enabled() -> bool:
     Armed also means fireable (I14, I17): the re-power goes out as `ipmitool raw` to the local
     BMC, so a host with no reachable BMC reports the rung OFF rather than choosing it and raising.
 
-    A walk that took chips on other trays off the bus (``ubb_reset_regressed_offbus``) declines only
-    the verify-between walk for the rest of the process (:func:`pcie_guard.disable_tray_rung`); it
-    leaves this switch, and so the back-to-back sweep's tray re-power, as it is.
+    A re-power that took chips on other trays off the bus (``ubb_reset_regressed_offbus``) declines the
+    walk and the back-to-back sweep's tray re-power for the rest of the boot
+    (:func:`pcie_guard.disable_tray_rung`, kept across broker restarts); it leaves this switch as it is.
     """
     if os.environ.get("TT_DEVICE_MCP_AUTO_UBB_RESET", "1").strip() == "0":
         return False
@@ -948,6 +948,14 @@ class GalaxyRecovery(Recovery):
     _sweep_read_77: bool = False
     _host_rung_77_paged_since: Optional[str] = None
 
+    async def _offbus_ids_now(self, expected: int) -> Optional[set]:
+        """The chip ids off the bus now, or None when the heartbeats cannot be read."""
+        try:
+            beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        except Exception:  # noqa: BLE001 - an unreadable read decides nothing here
+            return None
+        return _offbus_chip_ids(beats or {}, expected)
+
     def _tray_map_now(self) -> Optional[dict]:
         """This host's tray -> chip-ids map, or None when it cannot be known (spec 04 I16).
 
@@ -1492,6 +1500,10 @@ class GalaxyRecovery(Recovery):
             # tray fire off (TT_DEVICE_MCP_AUTO_UBB_RESET=0) — the command is named instead — and when
             # the host has no tray topology.
             if bitmap:
+                # A delayed cross-tray drop from an earlier pulse (position 5 on the other trays) latches here.
+                off_now = await self._offbus_ids_now(expected)
+                if off_now is not None:
+                    pcie_guard.latch_tray_pulse_drop(off_now)
                 if not _ubb_reset_enabled():
                     log(
                         f"per-tray BMC re-power of trays {trays} is not opted in "
@@ -1499,8 +1511,18 @@ class GalaxyRecovery(Recovery):
                         f"skipping that rung and continuing to the mesh reset"
                     )
                     health_event("ubb_reset_required", trays=trays, command=" ".join(_ubb_reset_argv(bitmap)))
+                elif pcie_guard.tray_rung_disabled() is not None:
+                    # A tray re-power on this boot already took chips on other trays off the bus: skip it,
+                    # as when opted out, so the mesh reset and the bounded hand-off (I27) follow.
+                    log(
+                        f"per-tray BMC re-power of trays {trays} skipped: an earlier re-power on this boot took "
+                        f"chips on other trays off the bus ({pcie_guard.tray_rung_disabled()}); continuing to "
+                        f"the mesh reset"
+                    )
+                    health_event("ubb_reset_skipped_regressed", trays=trays, why=pcie_guard.tray_rung_disabled())
                 else:
                     try:
+                        pcie_guard.note_tray_pulse(trays, self._tray_map_now(), off_now or ())
                         await self._fire_tray_repower(bitmap, tray_chip_ids, log)
                     except pcie_guard.TrayRepowerRefused as exc:
                         complete = False
@@ -1859,21 +1881,29 @@ class GalaxyRecovery(Recovery):
         counted from the IPMI failure on ``TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC``. The same applies
         when this episode's per-tray reset walk did not recover the mesh (the ladder no longer tries the
         below-floor mesh reset after it), counted from the walk on
-        ``TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC``. It still waits for the ladder to have run once,
-        and it runs no reset itself."""
+        ``TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC``. The same applies, on the plain grace, when a tray
+        re-power on this boot took chips on other trays off the bus (the tray rung is declined for the
+        boot). It still waits for the ladder to have run once, and it runs no reset itself."""
         if off_bus <= 0 or not hold_since:
             return None
         allowed, why = pcie_guard.host_reset_gate(off_bus)
         ipmi_age = offbus_power_cycle.ipmi_unavailable_age_sec(hold_since)
         walk_age = offbus_power_cycle.tray_walk_failed_age_sec(hold_since)
-        if allowed and ipmi_age is None and walk_age is None:
+        tray_regressed = pcie_guard.tray_rung_disabled()
+        if allowed and ipmi_age is None and walk_age is None and tray_regressed is None:
             return None
         if allowed and ipmi_age is not None:
             why = f"the BMC's IPMI failed the tray re-power: {offbus_power_cycle.ipmi_detail(hold_since)}"
             age, grace = ipmi_age, offbus_power_cycle.ipmi_handoff_sec()
-        elif allowed:
+        elif allowed and walk_age is not None:
             why = f"the per-tray reset walk did not recover the mesh: {offbus_power_cycle.tray_walk_detail(hold_since)}"
             age, grace = walk_age, offbus_power_cycle.tray_walk_handoff_sec()
+        elif allowed:
+            # A tray re-power on this boot took chips on other trays off the bus: the per-tray rung is
+            # declined, so the same bounded end as a refused gate applies (grace, then the power cycle).
+            why = f"a tray re-power on this boot took chips on other trays off the bus ({tray_regressed})"
+            offbus_power_cycle.arm(hold_since)
+            age, grace = offbus_power_cycle.episode_age_sec(hold_since) or 0.0, offbus_power_cycle.grace_sec()
         else:
             offbus_power_cycle.arm(hold_since)
             age, grace = offbus_power_cycle.episode_age_sec(hold_since) or 0.0, offbus_power_cycle.grace_sec()
@@ -2692,6 +2722,7 @@ class GalaxyRecovery(Recovery):
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)  # name it + hold (the default)
             metrics.stage_fired("ubb_tray", "blocked")
             return None
+        pcie_guard.latch_tray_pulse_drop(offbus_ids)
         reset_floor = _galaxy_reset_min_dead_chips(expected)
         if len(walk) == 1 and (reset_floor is None or off_bus < reset_floor) and not _ubb_single_tray_walk_enabled():
             # A below-floor drop on one tray: re-powering that tray has dropped the other trays too
@@ -2711,11 +2742,11 @@ class GalaxyRecovery(Recovery):
             metrics.stage_fired("ubb_tray", "blocked")
             return None
         if pcie_guard.tray_rung_disabled() is not None:
-            # An earlier walk took chips on other trays off the bus: decline the walk for the rest of
-            # the process. The back-to-back sweep still re-powers the tray, with a mesh reset after it.
+            # A tray re-power on this boot took chips on other trays off the bus: decline the walk for the
+            # rest of the boot. The hold goes to its bounded hand-off (I27, _offbus_gated_power_cycle).
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)
             log(
-                f"tray-down but the per-tray walk is disabled for this process "
+                f"tray-down but the per-tray walk is disabled on this boot "
                 f"({pcie_guard.tray_rung_disabled()}) — holding"
             )
             metrics.stage_fired("ubb_tray", "blocked")
@@ -2787,6 +2818,7 @@ class GalaxyRecovery(Recovery):
                     # stopped across the whole walk, so not _fire_tray_repower, which would restart them
                     # between trays.
                     FABRIC_DEBT.note_reset(f"tray re-power 0x{bitmap:02x}")
+                    pcie_guard.note_tray_pulse(walk[: step + 1], tray_map, start_off)
                     plan = await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
                 except asyncio.CancelledError:
                     # Abandoned while the BMC pulse runs on in its thread: the tray may still be off the
@@ -2856,7 +2888,7 @@ class GalaxyRecovery(Recovery):
                         host_at_risk=True,
                     )
                     # Every such re-power so far cost the other trays a chip: decline the rung for the
-                    # rest of the process, so the next drop goes to the mesh reset, as when opted out.
+                    # rest of the boot (kept across broker restarts), so the hold goes to its bounded end.
                     pcie_guard.disable_tray_rung(tray=tray, new_off=sorted(new_off, key=int))
                     return False
             log(

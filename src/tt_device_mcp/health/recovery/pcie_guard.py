@@ -978,25 +978,100 @@ def _recover_siblings(plan: TrayPlan, live: dict, log: Callable[[str], None], sl
 
 
 # Set by :func:`disable_tray_rung` once a per-tray re-power took chips on other trays off the bus
-# (``ubb_reset_regressed_offbus``): the verify-between walk is declined for the rest of the process.
-# The back-to-back sweep still fires the re-power (a mesh reset follows it). Kept in memory only, so
-# a broker restart re-arms it.
+# (``ubb_reset_regressed_offbus``): the per-tray rung (the verify-between walk and the sweep's tray
+# re-power) is declined for the rest of this boot. Written to ``TRAY_RUNG_FILE`` in the health dir with
+# the boot id, so a broker restart on the same boot keeps it; a record from another boot is dropped.
+TRAY_RUNG_FILE = "ubb_tray_rung_disabled.json"
 _TRAY_RUNG_DISABLED: Optional[dict] = None
 
 
 def disable_tray_rung(**why) -> None:
-    """Decline the per-tray verify-between walk for the rest of the process (``ubb_tray_rung_disabled``,
-    once)."""
+    """Decline the per-tray rung for the rest of this boot (``ubb_tray_rung_disabled``, once). The record
+    goes to the health dir with the boot id, so it survives a broker restart on this boot."""
     global _TRAY_RUNG_DISABLED
-    if _TRAY_RUNG_DISABLED is not None:
+    if tray_rung_disabled() is not None:
         return
     _TRAY_RUNG_DISABLED = dict(why)
-    health_event("ubb_tray_rung_disabled", **why, host_at_risk=True)
+    rec = {"why": dict(why), "boot_id": _boot_id(), "at_epoch": time.time()}
+    try:
+        path = health_dir() / TRAY_RUNG_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec))
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as exc:
+        health_event("ubb_tray_rung_disabled_unwritable", error=repr(exc), host_at_risk=True)
+    health_event("ubb_tray_rung_disabled", **why, boot_id=rec["boot_id"], host_at_risk=True)
 
 
 def tray_rung_disabled() -> Optional[dict]:
-    """Why the per-tray rung was disabled in this process, or None while it is armed."""
+    """Why the per-tray rung is disabled on this boot, or None while it is armed. Reads the record an
+    earlier broker process of this boot wrote; one from another boot is removed and never counts. With
+    this boot's id unreadable a record cannot be shown stale, so it counts (as for the host-hang latch):
+    the hold it routes to is the bounded I27 hand-off."""
+    global _TRAY_RUNG_DISABLED
+    if _TRAY_RUNG_DISABLED is not None:
+        return _TRAY_RUNG_DISABLED
+    path = health_dir() / TRAY_RUNG_FILE
+    try:
+        rec = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    current = _boot_id()
+    if not isinstance(rec, dict) or (current and rec.get("boot_id") != current):
+        path.unlink(missing_ok=True)
+        health_event("ubb_tray_rung_rearmed", latch=rec, boot_id=current)
+        return None
+    why = rec.get("why")
+    _TRAY_RUNG_DISABLED = dict(why) if isinstance(why, dict) else {}
+    health_event("ubb_tray_rung_disabled_restored", **_TRAY_RUNG_DISABLED, boot_id=current, host_at_risk=True)
     return _TRAY_RUNG_DISABLED
+
+
+# The last per-tray re-power of this process, for :func:`latch_tray_pulse_drop`: chips on the trays it
+# did NOT re-power that leave the bus within ``TRAY_PULSE_WINDOW_SEC`` of it, all at in-tray position 5
+# (chips 5/13/21/29 on a Galaxy), are the cross-tray signature some UBBs show a minute after a pulse.
+TRAY_PULSE_WINDOW_SEC = 900.0
+TRAY_PULSE_POSITION = 5
+_LAST_TRAY_PULSE: Optional[dict] = None
+
+
+def note_tray_pulse(trays, tray_map: Optional[dict], off_before) -> None:
+    """A per-tray re-power of ``trays`` was fired with ``off_before`` (chip ids) off the bus."""
+    global _LAST_TRAY_PULSE
+    if not tray_map:
+        return
+    _LAST_TRAY_PULSE = {
+        "trays": sorted(int(t) for t in trays),
+        "tray_map": {int(t): sorted(int(c) for c in chips) for t, chips in tray_map.items()},
+        "off_before": {str(c) for c in off_before},
+        "at": time.monotonic(),
+    }
+
+
+def latch_tray_pulse_drop(off_now) -> Optional[dict]:
+    """Disable the per-tray rung (:func:`disable_tray_rung`) when chips that were on the bus before the
+    last tray re-power, on trays it did not re-power, are now off and every one of them sits at in-tray
+    position 5. Only that signature counts: a mesh reset fired after the pulse drops other chips too.
+    Returns why it latched, or None."""
+    pulse = _LAST_TRAY_PULSE
+    if pulse is None or time.monotonic() - pulse["at"] > TRAY_PULSE_WINDOW_SEC:
+        return None
+    new_off = {str(c) for c in off_now} - pulse["off_before"]
+    elsewhere = {
+        c: pos
+        for tray, chips in pulse["tray_map"].items()
+        if tray not in pulse["trays"]
+        for pos, c in enumerate(chips)
+        if str(c) in new_off
+    }
+    if not elsewhere or set(elsewhere.values()) != {TRAY_PULSE_POSITION}:
+        return None
+    why = {"tray": pulse["trays"], "new_off": [str(c) for c in sorted(elsewhere)], "signature": "position5"}
+    health_event("ubb_reset_regressed_offbus", **why, host_at_risk=True)
+    disable_tray_rung(**why)
+    return why
 
 
 def _tray_holders(chips: list) -> dict:

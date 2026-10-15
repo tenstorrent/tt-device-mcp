@@ -11127,6 +11127,8 @@ def _arm_ubb_walk(monkeypatch, heartbeat_reads, verify_healthy=None):
     srv.fsm.set_latch("ubb_reset_fired", False)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
     monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+    # A fresh host: no record of an earlier walk's regression on this boot (it survives a restart).
+    (pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE).unlink(missing_ok=True)
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append((name, k)))
@@ -11376,9 +11378,9 @@ async def test_the_walk_rescans_only_the_re_powered_trays_root_ports(monkeypatch
 @pytest.mark.asyncio
 async def test_a_regressed_walk_disables_the_tray_rung_for_the_process(monkeypatch, clear_job_state, galaxy_trays):
     """After one walk that took a chip on another tray off the bus, the rung is declined for the rest of
-    the process (ubb_tray_rung_disabled, once): the next drop is named and held as when opted out, and
-    nothing is re-powered. Only the walk is declined: the opt-in the back-to-back sweep reads stays on.
-    Only a broker restart arms the walk again."""
+    the boot (ubb_tray_rung_disabled, once): the next drop is named and held as when opted out, and
+    nothing is re-powered. The opt-in switch itself stays on (the sweep reads the record instead).
+    A broker restart on the same boot keeps it declined; only a new boot arms the walk again."""
     monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     start = set(range(24, 32))
     fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(start | {5})])
@@ -11392,6 +11394,40 @@ async def test_a_regressed_walk_disables_the_tray_rung_for_the_process(monkeypat
     fired.clear()
     out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 8, 32, lambda m: None)
     assert out is None and fired == [], "declined, as when opted out"
+
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)  # a broker restart on the same boot
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 8, 32, lambda m: None)
+    assert out is None and fired == [], "still declined after a restart: the record is on disk"
+
+
+@pytest.mark.asyncio
+async def test_a_tray_pulse_that_drops_position_5_on_other_trays_disables_the_rung(
+    monkeypatch, clear_job_state, galaxy_trays
+):
+    """The cross-tray signature: a tray re-power, and a minute later chip 5 of every tray it did not
+    re-power reads off (5/13/21 after tray 4). The walk's own verify found no new chip off, so it did not
+    latch; the next pass sees the drop and disables the rung before it re-powers anything. A drop at
+    other positions too (a mesh reset after the pulse) is not the signature."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
+    start = set(range(24, 32))  # tray 3 off the bus
+    fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(start)])
+    assert await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 8, 32, lambda m: None) is False
+    assert fired == [0x04] and pcie_guard.tray_rung_disabled() is None, "no new chip off at the walk's own read"
+
+    srv.fsm.set_latch("ubb_reset_fired", False)  # the next hold episode
+    fired.clear()
+    later = start | {5, 13}  # trays 1 and 2 lost their position-5 chip after the pulse
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(later), 10, 32, lambda m: None)
+    assert out is None and fired == [], "the signature disables the rung before another re-power"
+    assert pcie_guard.tray_rung_disabled() == {"tray": [3], "new_off": ["5", "13"], "signature": "position5"}
+    assert (pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE).exists()
+
+    # Not the signature: chips at other positions dropped too.
+    pcie_guard.note_tray_pulse([3], galaxy_trays, start)
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+    (pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE).unlink()
+    assert pcie_guard.latch_tray_pulse_drop(start | {5, 6}) is None
+    assert pcie_guard.tray_rung_disabled() is None
 
 
 @pytest.mark.asyncio
