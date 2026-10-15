@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
 """A hold placed because a process outside the broker holds the device is bounded (spec 03 I30).
 
 The broker polls for the holder's exit on its own short clock; once it is gone, the full gate
