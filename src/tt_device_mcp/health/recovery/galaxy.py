@@ -1521,20 +1521,40 @@ class GalaxyRecovery(Recovery):
                     )
                     health_event("ubb_reset_skipped_regressed", trays=trays, why=pcie_guard.tray_rung_disabled())
                 else:
+                    tray_map = self._tray_map_now()
+                    command = " ".join(_ubb_reset_argv(bitmap))
+                    # One line per tray, naming its BMC bit and chips beside the exact command, so the
+                    # journal alone shows which silicon a mask re-powered (I16).
+                    for tray in trays:
+                        log(f"per-tray BMC re-power (sweep): {_tray_label(tray, tray_map or {})}: `{command}`")
                     try:
-                        pcie_guard.note_tray_pulse(trays, self._tray_map_now(), off_now or ())
+                        pcie_guard.note_tray_pulse(trays, tray_map, off_now or ())
                         await self._fire_tray_repower(bitmap, tray_chip_ids, log)
                     except pcie_guard.TrayRepowerRefused as exc:
                         complete = False
                         log(f"per-tray BMC re-power of trays {trays} refused: {exc}; continuing to the mesh reset")
                         health_event("ubb_reset_refused", trays=trays, reason=str(exc))
                     except Exception as exc:  # noqa: BLE001 - a fire that did not launch falls through to the reset
+                        rc = getattr(exc, "returncode", None)
                         log(
-                            f"per-tray BMC re-power of trays {trays} failed to launch: {exc!r}; "
+                            f"per-tray BMC re-power of trays {trays} failed to launch (rc {rc}): {exc!r}; "
                             f"continuing to the mesh reset"
                         )
-                        health_event("ubb_reset_failed", trays=trays, error=repr(exc))
+                        health_event(
+                            "ubb_reset_failed",
+                            trays=trays,
+                            ubb_bitmap=bitmap,
+                            chips=tray_chip_ids,
+                            rc=rc,
+                            command=command,
+                            error=repr(exc),
+                        )
                         self._note_bmc_ipmi_failure(exc)
+                    else:
+                        log(f"per-tray BMC re-power of trays {trays} fired: `{command}`")
+                        health_event(
+                            "ubb_reset_fired", trays=trays, ubb_bitmap=bitmap, chips=tray_chip_ids, command=command
+                        )
             # 3) mesh-wide reset, no verify (the ONE verify belongs to the caller). Lazy import:
             # select_recovery lives in the package __init__ that imports THIS module, so a top-level
             # import would be circular; by call time the package is fully loaded.
@@ -2835,7 +2855,15 @@ class GalaxyRecovery(Recovery):
                     return None
                 except Exception as exc:  # noqa: BLE001 - a fire that did not launch falls through, never raises
                     log(f"per-tray BMC reset of tray {tray} failed to launch: {exc!r}; falling to the next rung")
-                    health_event("ubb_reset_failed", tray=tray, error=repr(exc))
+                    health_event(
+                        "ubb_reset_failed",
+                        tray=tray,
+                        ubb_bitmap=bitmap,
+                        chips=tray_chip_ids,
+                        rc=getattr(exc, "returncode", None),
+                        command=command,
+                        error=repr(exc),
+                    )
                     metrics.stage_fired("ubb_tray", "failed")
                     self._note_bmc_ipmi_failure(exc)
                     return False
@@ -2843,6 +2871,7 @@ class GalaxyRecovery(Recovery):
                 # the mesh recovered yet (a partial walk's earlier trays firing cleanly is real signal,
                 # same rc==0-always-fires contract as the mesh-wide reset's own "ok" report).
                 metrics.stage_fired("ubb_tray", "ok")
+                health_event("ubb_reset_fired", tray=tray, ubb_bitmap=bitmap, chips=tray_chip_ids, command=command)
                 if getattr(plan, "kept_masked", None):
                     # A root port kept erroring after the re-power: re-powering another tray now is how
                     # a flood on one port turned into a dead host. Stop the walk here.

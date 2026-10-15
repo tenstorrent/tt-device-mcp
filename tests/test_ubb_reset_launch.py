@@ -181,7 +181,8 @@ def test_fire_ubb_reset_falls_back_to_the_chip_reset_class_on_older_tt_smi(monke
 )
 def test_a_pulse_the_bmc_did_not_take_raises_bmc_ipmi_error(monkeypatch, outcome):
     """A BMC whose IPMI does not answer (non-zero exit, no ipmitool, a hang) raises BmcIpmiError, so the
-    broker can tell an unresponsive BMC from a refused or failed re-power and hand off (spec 04 I27)."""
+    broker can tell an unresponsive BMC from a refused or failed re-power and hand off (spec 04 I27).
+    A non-zero exit carries its exit code as ``returncode``."""
     from tt_device_mcp.health.recovery.stages.ubb_tray import BmcIpmiError
 
     class _Flags:
@@ -203,5 +204,9 @@ def test_a_pulse_the_bmc_did_not_take_raises_bmc_ipmi_error(monkeypatch, outcome
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
     monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
-    with pytest.raises(BmcIpmiError):
+    with pytest.raises(BmcIpmiError) as err:
         _REAL_FIRE_UBB_RESET(0b1, [0])
+    # The BMC's exit code rides on the error so the sweep journals it as ``rc``; a command that never
+    # exited (missing, timed out) has none.
+    expected_rc = None if isinstance(outcome, BaseException) else outcome.returncode
+    assert err.value.returncode == expected_rc

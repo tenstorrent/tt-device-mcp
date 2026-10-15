@@ -799,7 +799,14 @@ fails); it is log-only, and `off_bus`, the count at onset, still drives every de
 down and costs minutes, so before paying that the ladder re-issues every reset type once more,
 back-to-back, then takes ONE settle and ONE verify — and fires the host rung only if the mesh is
 still bad (`_settle_and_verify_before_host_rung` → `_issue_all_resets_back_to_back`, the same
-implementation the `TRAY_DOWN_NO_WINDOW` branch uses, so the two can never drift). This holds on
+implementation the `TRAY_DOWN_NO_WINDOW` branch uses, so the two can never drift). The sweep's
+per-tray BMC re-power is auditable from the journal alone: before the fire it logs one line per tray
+naming the tray, its BMC bit and its chips (from the I16 map) beside the exact `ipmitool` command;
+after it, a `ubb_reset_fired` event (`trays`, `ubb_bitmap`, `chips`, `command`) on success, or a
+`ubb_reset_failed` event with the same fields, the BMC's exit code as `rc` (null when ipmitool never
+exited) and the error. The single-tray walk journals each clean pulse the same way (`tray` in place of
+`trays`). This is logging only: it changes no tray fired, no timing and no hold, and the full health
+check still has to pass after the sweep before anything is released. This holds on
 every road to a host rung, not just the tray branch: the gate ladder's own rung, the idle/stuck-hold
 escalation (`_climb_to_host_recovery_after_failed_reset` — the road most measured power cycles
 actually took), and the post-reboot cold climb (`_verify_post_reboot_recovery`, where the warm reboot
@@ -1053,6 +1060,7 @@ sees a silent fabric pass.
 | I16 a trusted full read whose chip→bus map differs re-banks it, journals `chip_bus_map_drift` with the old and the new map, and the next mask follows the chip's new bus | `tests/test_ubb_tray_map.py::test_a_renumbered_full_read_re_banks_the_map_and_journals_old_and_new`, `::test_after_a_renumbering_the_walk_re_powers_the_tray_of_the_chips_new_bus` |
 | I16 a short read, an unreadable chip, or a read tt-smi disagrees with never overwrites a banked map; a matching full read changes nothing | `tests/test_ubb_tray_map.py::test_a_short_or_disagreeing_read_never_overwrites_the_banked_map`, `::test_a_full_read_that_matches_the_banked_map_changes_nothing` |
 | I16 tt-smi's bus list drifting journals `bus_map_drift`; the list stands | `tests/test_ubb_tray_map.py::test_a_drifted_snapshot_journals_but_leaves_the_cached_map_standing` |
+| I16 every BMC re-power is journalled: the sweep logs one line per tray with the exact command, then `ubb_reset_fired` with mask and chips on success or `ubb_reset_failed` with `rc` on failure, from both its callers; the walk does the same per tray; a tray not fired journals no `ubb_reset_fired` | `tests/test_ubb_tray_map.py::test_the_sweep_journals_the_tray_4_mask_it_fired_for_chips_24_to_31`, `::test_a_failed_sweep_fire_journals_its_rc_and_no_fired_event`, `::test_a_sweep_that_does_not_fire_the_tray_journals_no_fired_event`, `::test_the_last_chance_sweep_labels_each_tray_from_the_map`, `::test_the_walk_journals_the_tray_4_mask_it_fired`, `::test_a_failed_walk_fire_journals_its_rc_and_no_fired_event`, `tests/test_ubb_reset_launch.py::test_a_pulse_the_bmc_did_not_take_raises_bmc_ipmi_error` |
 | I16 a new GLX board type this build cannot map surfaces as `ubb_tray_table_missing` | `tests/test_ubb_tray_map.py::test_a_glx_board_type_with_no_matching_arch_suffix_journals_once` |
 | I19 a tray with 4+ chips off at first sighting is an onset; no map, an unplaced chip, or fewer off gets no prelude | `tests/test_tray_down_prelude.py::test_a_tray_with_four_or_more_chips_off_is_a_tray_down_onset`, `::test_no_map_or_an_unplaced_chip_never_classifies_as_tray_down`, `::test_one_to_three_chips_off_get_no_prelude` |
 | I19 replay: no recorded episode that recovered without a power cycle gets the prelude | `tests/test_tray_down_prelude.py::test_replay_the_prelude_runs_only_on_onsets_that_never_recovered_without_a_power_cycle` (fixture `tests/fixtures/tray_down_replay.tsv`) |
