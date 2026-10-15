@@ -13315,6 +13315,22 @@ async def test_the_deadline_escalation_keeps_the_ladder_for_real_faults(
     assert alerts == []
 
 
+@pytest.mark.asyncio
+async def test_the_deadline_escalation_climbs_a_present_mesh_eth_frozen_self_heal_hold(monkeypatch, clear_job_state):
+    """The gate's below-floor present-mesh hold ('eth/fabric fault on a present mesh ... held for self-heal,
+    not reset', fsm why eth_frozen) is not a fabric-only hold: past the deadline it takes the present-mesh
+    ladder (galaxy reset, then the host rungs), never a page-and-hold. A box that sat in this hold for 1h43m
+    had the forced escalation switched off (TT_DEVICE_MCP_FORCE_ESCALATE=0), not a gap in this path."""
+    escalations, alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch,
+        why="eth_frozen",
+        detail="gate/post-job: eth/fabric fault on a present mesh (all 32 chips on the bus) — held for self-heal, not reset",
+    )
+    await srv._force_escalate_stuck_hold()
+    assert escalations == ["present-forced"]
+    assert alerts == [] and "hold_deadline_no_reset" not in events
+
+
 # --- G-tier safe U-fixes: fail-closed / loudness on the silent-degrade paths -------------
 
 
