@@ -64,7 +64,7 @@ def _broker(monkeypatch, tmp_path, fsm, verdict=_FABRIC_77):
     monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "")
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
-    # g15blx02's shape: the broad relift is off, so only an owed pass re-runs the fabric.
+    # A host with the broad relift off: only an owed pass re-runs the fabric.
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_RELIFT", "0")
     monkeypatch.setattr(srv, "device_op_lock", None)
     monkeypatch.setattr(srv, "device_op_active", "")
