@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import patch_recovery
 from tests.test_device_safety import _arm_offbus_stuck_hold
 from tt_device_mcp import alert
 from tt_device_mcp import server as srv
@@ -877,3 +878,161 @@ async def test_the_escalations_own_tray_rung_failing_over_ipmi_hands_off_at_the_
     ran = await g._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
     assert ran is True and len(rec["fires"]) == 1
     assert len(tray_rungs) == 1, "the ladder ran once, not again before the cycle"
+
+
+# --- a failed or regressed tray walk hands off; no below-floor mesh reset after it ----------------
+
+
+def _tray_walk_episode(monkeypatch, tmp_path, *, cmd="/usr/local/sbin/host-power-cycle --now", drops=()):
+    """The 10-14 replay: chips 0-7 (tray 1) off the bus and isolated, below the 16-chip floor, the gate
+    allowing resets, the per-tray walk opted in and the bridge rung not bringing them back. Re-powering
+    tray 1 leaves 0-7 off and takes ``drops`` off with them. Returns (hold_since, rec, counters, state)."""
+    hold_since, rec = _gated(monkeypatch, tmp_path, cmd=cmd)
+    counters = _arm_offbus_stuck_hold(
+        monkeypatch, off_bus=8, isolated={str(c) for c in range(8)}, sbr_recovers=False, reset_result=False
+    )
+    srv.device_hold_episode_since = hold_since
+    for mod in (opc, galaxy):  # the re-arm patched the journal again; keep recording into rec
+        monkeypatch.setattr(mod, "health_event", lambda kind, **f: rec["events"].append((kind, f)))
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
+    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC", raising=False)
+    srv.fsm.set_latch("ubb_reset_fired", False)
+    state = {"off": set(range(8)), "fired": [], "verifies": []}
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32) if i not in state["off"]})
+
+    def fire(bitmap, ids):
+        state["fired"].append(bitmap)
+        state["off"] |= set(drops)
+
+    async def verify(expected, log, run_fabric=True, **_):
+        state["verifies"].append(run_fabric)
+        return False, {"snapshot": {"ok": False}}
+
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", fire, raising=False)
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    return hold_since, rec, counters, state
+
+
+@pytest.mark.asyncio
+async def test_a_regressed_tray_walk_hands_off_to_the_power_cycle_not_the_mesh_reset(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """10-14, 15:23-15:32: chips 0-7 off, the walk's tray re-power took 16-31 off too, and the below-floor
+    mesh reset that followed overran 180 s and exited 1, after which nothing ran. Now the walk stops at
+    the regression, no mesh reset runs, the hold stands, and the power cycle fires once at the hand-off
+    bound without a second walk. The device is never released: every verify was a full one, fabric
+    included, and none passed. Fails on base, which runs the mesh reset."""
+    hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path, drops=range(16, 32))
+    g = srv.galaxy_recovery
+    ran = await g._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
+    assert ran is True
+    assert state["fired"] == [0x01], "only the affected tray was re-powered"
+    assert counters["resets"] == 0, "no below-floor mesh reset after a walk that regressed the mesh"
+    kinds = [k for k, _ in rec["events"]]
+    assert "ubb_reset_regressed_offbus" in kinds and "galaxy_reset_skipped_after_tray_walk" in kinds
+    assert "stuck_hold_galaxy_reset_below_floor_attempt" not in kinds
+    assert opc.tray_walk_failed_age_sec(hold_since) is not None and rec["fires"] == []
+    assert counters["power_cycles"] == 0 and counters["reboots"] == 0, "no host rung before the bound"
+    now = datetime.now()
+    assert not opc.due_for_watchdog(hold_since, now)
+    assert opc.due_for_watchdog(hold_since, now + timedelta(seconds=opc.tray_walk_handoff_sec() + 1))
+    opc._pending["tray_walk_at"] -= timedelta(seconds=opc.tray_walk_handoff_sec() + 1)  # the bound has passed
+    ran = await g._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
+    assert ran is True and len(rec["fires"]) == 1
+    assert "per-tray reset walk did not recover" in rec["fires"][0]["reason"]
+    assert state["fired"] == [0x01] and counters["resets"] == 0, "no second walk, no mesh reset"
+    # Goal: no release without the full check, fabric included.
+    assert state["verifies"] and all(state["verifies"]), "every verify ran the fabric pass"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
+
+
+@pytest.mark.asyncio
+async def test_by_default_the_one_tray_drop_is_never_walked(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
+    """The same 10-14 drop (chips 0-7, all on tray 1, below the floor) without the single-tray opt-in:
+    the walk declines, so tray 1 is never re-powered and 16-31 cannot follow it off the bus. The device
+    stays held; nothing releases it without the full check, fabric included."""
+    hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path, drops=range(16, 32))
+    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
+    assert state["fired"] == [], "no single-tray re-power for a below-floor drop on one tray"
+    assert state["off"] == set(range(8)), "the other trays stayed on the bus"
+    assert "ubb_reset_declined_single_tray" in [k for k, _ in rec["events"]]
+    assert all(state["verifies"]), "every verify ran the fabric pass"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
+
+
+@pytest.mark.asyncio
+async def test_a_walk_that_did_not_recover_skips_the_mesh_reset_on_every_later_pass(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """The other failure: the walk re-powered tray 1 and its chips stayed off (nothing worse). No mesh
+    reset now, nor on a later pass of the episode, where the walk's latch declines a second walk."""
+    hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path)
+    g = srv.galaxy_recovery
+    await g._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
+    assert state["fired"] == [0x01] and counters["resets"] == 0
+    assert "ubb_reset_did_not_recover" in [k for k, _ in rec["events"]]
+    await g._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
+    assert state["fired"] == [0x01] and counters["resets"] == 0, "the latch holds the walk, still no mesh reset"
+    assert rec["fires"] == [] and counters["dirty_cleared"] == 0
+
+
+@pytest.mark.asyncio
+async def test_with_no_power_cycle_command_a_failed_walk_climbs_without_the_sweep(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """Where the bounded power cycle cannot fire (no command), the failed walk pages and climbs to the
+    host rung, skipping the last-chance sweep: its back-to-back resets include the same mesh reset."""
+    hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path, cmd=None, drops=range(16, 32))
+    sweeps = []
+
+    async def sweep(*a, **k):
+        sweeps.append(True)
+        return False
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", sweep)
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
+    assert counters["resets"] == 0 and sweeps == []
+    assert "offbus_gated_hold_page" in [a.get("kind") for a in rec["alerts"]]
+    assert "reset_unrecoverable_power_cycle_required" in [k for k, _ in rec["events"]], "the climb is loud"
+    assert counters["dirty_cleared"] == 0
+
+
+def test_the_watchdog_forces_a_pass_at_the_tray_walk_bound(monkeypatch, clear_job_state):
+    fired = []
+    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: fired.append(True) or True)
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", True)
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: False)
+    monkeypatch.setattr(srv, "_stuck_hold_ceiling_sec", lambda: 86400)
+    monkeypatch.setattr(opc, "health_event", lambda *a, **k: None)
+    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "/bin/true")
+    monkeypatch.delenv("TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC", raising=False)
+    since = datetime(2026, 10, 14, 15, 23, 41)
+    ep = since.isoformat()
+    monkeypatch.setattr(srv, "device_hold_episode_since", ep)
+    opc.note_ladder_ran(ep)
+    failed = since + timedelta(seconds=240)
+    opc.note_tray_walk_failed(ep, "8/32 chip(s) off the bus after the walk", now=failed)
+    srv._check_hold_deadline(now=failed + timedelta(seconds=299))
+    assert fired == []
+    srv._check_hold_deadline(now=failed + timedelta(seconds=301))
+    assert fired == [True]
+    assert "failed tray walk hand-off bound" in srv.device_hold_escalation_trigger
+
+
+def test_the_tray_walk_bound_defaults_and_rejects_nonsense(monkeypatch):
+    monkeypatch.delenv("TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC", raising=False)
+    assert opc.tray_walk_handoff_sec() == 300
+    for bad in ("0", "-5", "soon", ""):
+        monkeypatch.setenv("TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC", bad)
+        assert opc.tray_walk_handoff_sec() == 300
+    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC", "60")
+    assert opc.tray_walk_handoff_sec() == 60

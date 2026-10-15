@@ -1854,17 +1854,24 @@ class GalaxyRecovery(Recovery):
         A gate that allows resets hands back to the ladder, unless the BMC's IPMI failed a tray re-power
         this episode: then the IPMI rungs (the tray re-power, the mesh reset that re-powers trays through
         the same BMC, the cold rung's ``ipmitool``) cannot end the hold, so the same bounded end applies,
-        counted from the IPMI failure on ``TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC``. It still waits for
-        the ladder to have run once, and it runs no reset itself."""
+        counted from the IPMI failure on ``TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC``. The same applies
+        when this episode's per-tray reset walk did not recover the mesh (the ladder no longer tries the
+        below-floor mesh reset after it), counted from the walk on
+        ``TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC``. It still waits for the ladder to have run once,
+        and it runs no reset itself."""
         if off_bus <= 0 or not hold_since:
             return None
         allowed, why = pcie_guard.host_reset_gate(off_bus)
         ipmi_age = offbus_power_cycle.ipmi_unavailable_age_sec(hold_since)
-        if allowed and ipmi_age is None:
+        walk_age = offbus_power_cycle.tray_walk_failed_age_sec(hold_since)
+        if allowed and ipmi_age is None and walk_age is None:
             return None
-        if allowed:
+        if allowed and ipmi_age is not None:
             why = f"the BMC's IPMI failed the tray re-power: {offbus_power_cycle.ipmi_detail(hold_since)}"
             age, grace = ipmi_age, offbus_power_cycle.ipmi_handoff_sec()
+        elif allowed:
+            why = f"the per-tray reset walk did not recover the mesh: {offbus_power_cycle.tray_walk_detail(hold_since)}"
+            age, grace = walk_age, offbus_power_cycle.tray_walk_handoff_sec()
         else:
             offbus_power_cycle.arm(hold_since)
             age, grace = offbus_power_cycle.episode_age_sec(hold_since) or 0.0, offbus_power_cycle.grace_sec()
@@ -2197,6 +2204,35 @@ class GalaxyRecovery(Recovery):
                     self.deps.clear_device_dirty(
                         verified=True, why="idle off-bus escalation: per-tray BMC reset recovered the mesh"
                     )
+                    return True
+                if outcome is False or self.deps.device_hold_episode_ubb_reset_fired():
+                    # This episode's tray walk fired and did not recover the mesh, or took more chips
+                    # off the bus (a later pass reads its latch). After a failed walk the below-floor
+                    # mesh reset only deepened the drop: 8 chips off went to 24 off across the walk,
+                    # then the reset overran 180 s and exited 1 with nothing after it. Hold, and hand
+                    # the episode to the bounded power cycle (I27) on its own clock. Where that cannot
+                    # fire (no command, rate-limited), climb without the last-chance sweep, whose
+                    # back-to-back resets include the same mesh reset.
+                    hold_since = self.deps.device_hold_episode_since()
+                    offbus_power_cycle.note_tray_walk_failed(
+                        hold_since, f"{off_bus_pre}/{expected} chip(s) off the bus after the walk"
+                    )
+                    log(
+                        f"{off_bus_pre} of {expected} chip(s) off the bus — below the galaxy-reset floor "
+                        f"({reset_floor}) and this hold's per-tray reset walk did not recover it; not "
+                        f"trying the mesh-wide reset, holding for the bounded power cycle"
+                    )
+                    health_event(
+                        "galaxy_reset_skipped_after_tray_walk",
+                        held_since=hold_since,
+                        off_bus=off_bus_pre,
+                        expected=expected,
+                        floor=reset_floor,
+                    )
+                    metrics.stage_fired("smi_reset", "blocked")
+                    gated = await self._offbus_gated_power_cycle(off_bus_pre, expected, hold_since, log)
+                    if gated is None:
+                        await self._climb_to_host_recovery_after_failed_reset(expected, off_bus_pre, log, swept=True)
                     return True
                 # The tray reset did not recover it (or was not opted in). The gate keeps the mesh
                 # reset suppressed below the floor (it can invert a below-floor drop all-off-bus),
