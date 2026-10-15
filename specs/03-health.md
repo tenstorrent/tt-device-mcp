@@ -671,6 +671,16 @@ job boundary.
   rule: a per-user daemon (`should_privsep()` false) has no staged fabric validator, so no pass of
   its could read True. There the `off_bus` hold its start pass places (I4) lifts on the enum+ARC
   re-read, and the DOWN re-check is not armed.
+- **I53 — A 77 with eth links measured down is a fault, not a missing verdict.** The validator
+  cannot build a mesh with links missing and exits 77 instead of failing them. So when the last eth
+  read measured fewer up links than the host's high-water mark, the fabric-unverified hold is not a
+  77-only hold (I34) and not a no-reset hold: the idle relift sends it to the present-mesh rung (a
+  galaxy reset, then the full post-reset check, fabric included) on its first pass instead of
+  re-running the pass on the I48 backoff up to the I40 bound, and the hold deadline may escalate it.
+  Only a passing post-reset fabric verdict releases the device; a 77 or a failure keeps it held. A
+  read back at the mark clears the drop. Not for a known cable fault (a 78, I46/I47), a topology
+  mismatch or fault, or a missing prerequisite (the hugepages, at startup too, or the validator):
+  no reset fixes those, so they keep their no-reset hold. With every link up, a 77 keeps I48/I40.
 
 ## Interfaces
 
@@ -1225,6 +1235,7 @@ refuses.
 | I50 | `tests/test_fabric_check_interrupted.py::test_a_check_in_flight_is_marked_and_cleared`, `tests/test_fabric_check_interrupted.py::test_a_mark_left_by_a_stopped_broker_is_journaled_once_at_startup`, `tests/test_fabric_check_interrupted.py::test_an_unreadable_mark_is_still_journaled`, `tests/test_fabric_check_interrupted.py::test_a_cancelled_check_is_journaled_at_once`, `tests/test_fabric_check_interrupted.py::test_startup_journals_the_interruption_before_anything_else` |
 | I51 | `tests/test_sd_notify_main_pid.py::test_the_main_pid_notifies`, `tests/test_sd_notify_main_pid.py::test_a_non_main_pid_is_refused_and_said_once`, `tests/test_sd_notify_main_pid.py::test_the_claim_keeps_the_socket_from_children` |
 | I52 | `tests/test_device_safety.py::test_idle_relift_lifts_an_off_bus_floor_hold_without_the_eth_reader`, `tests/test_device_safety.py::test_idle_relift_holds_an_off_bus_hold_until_the_fabric_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_lifts_once_every_chip_is_back_and_the_full_gate_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_stays_down_unless_the_fabric_passes`, `tests/test_device_safety.py::test_a_down_offbus_hold_runs_no_gate_until_every_chip_is_back`, `tests/test_device_safety.py::test_a_down_offbus_recheck_holds_when_a_chip_drops_mid_verify`, `tests/test_device_safety.py::test_a_down_offbus_recheck_is_paced`, `tests/test_arc_not_ready.py::test_a_down_offbus_recheck_holds_on_arc_not_ready_chips_without_the_gate`, `tests/test_device_safety.py::test_a_per_user_daemon_neither_arms_the_down_offbus_recheck_nor_gates_on_fabric`, `tests/test_readopt.py::test_a_failed_per_user_start_reopens_once_the_device_reads_healthy` |
+| I53 | `tests/test_startup_fabric_hugepages.py::test_the_eth_read_records_a_measured_link_drop`, `tests/test_startup_fabric_hugepages.py::test_a_77_with_eth_links_down_escalates_on_the_first_relift`, `tests/test_startup_fabric_hugepages.py::test_a_77_with_eth_links_down_is_forced_past_the_hold_deadline`, `tests/test_startup_fabric_hugepages.py::test_a_77_with_eth_links_full_keeps_the_backoff`, `tests/test_startup_fabric_hugepages.py::test_a_78_cable_fault_with_eth_links_down_holds_without_a_reset`, `tests/test_startup_fabric_hugepages.py::test_a_77_eth_drop_reset_releases_only_on_a_passing_full_check`, `tests/test_startup_fabric_hugepages.py::test_a_startup_hugepages_hold_with_links_measured_down_stays_77_only` |
 | `with_recover` default preserves the broker's own gates | `tests/test_slurm_steps.py::test_with_recover_defaults_on_so_existing_callers_are_unchanged`, `tests/test_slurm_steps.py::test_a_recovering_pass_still_enters_the_ladder` |
 | step verdict: fit from the queue's own predicates | `tests/test_slurm_steps.py::test_the_verdict_is_ok_on_a_healthy_free_device`, `tests/test_slurm_steps.py::test_the_verdict_reports_the_fsm_hold_as_the_reason`, `tests/test_slurm_steps.py::test_a_chip_off_the_bus_is_not_fit_even_with_a_healthy_fsm` |
 | step verdict: free applies the tenant rule, fails closed | `tests/test_slurm_steps.py::test_a_foreign_holder_makes_the_device_not_free`, `tests/test_slurm_steps.py::test_infrastructure_holders_do_not_make_the_device_busy`, `tests/test_slurm_steps.py::test_an_incomplete_holder_scan_is_not_free`, `tests/test_slurm_steps.py::test_require_free_false_ignores_occupancy` |
