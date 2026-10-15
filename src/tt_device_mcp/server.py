@@ -968,6 +968,7 @@ device_hold_job_bound_escalated: bool = False
 # names: the off-bus one-shot or a ceiling window. Set by _check_hold_deadline right before each
 # spawn so the escalation reports the clock that actually fired rather than the general ceiling.
 device_hold_escalation_trigger: str = ""
+device_hold_escalation_kind: str = ""  # machine-readable twin of the trigger text, for the event
 _forced_escalation_task: "Optional[asyncio.Task]" = None
 # Jobs a reset SIGKILLed to take the device. Their deaths are ours, not the mesh's: a reset
 # kills the running job, the job dies mid-CCL, and that death then reads as evidence the
@@ -5958,6 +5959,14 @@ async def _force_escalate_stuck_hold() -> None:
             expected=expected,
             held_since=device_hold_episode_since,
             host_at_risk=True,
+            trigger=device_hold_escalation_kind or "ceiling_window",
+            window_sec=int(
+                _offbus_hold_ceiling_sec()
+                if device_hold_escalation_kind == "offbus_one_shot"
+                else _stuck_hold_ceiling_sec()
+            ),
+            ceiling_sec=int(_stuck_hold_ceiling_sec()),
+            deadline_sec=int(_hold_deadline_sec()),
         )
         held_age = 0.0
         if device_hold_episode_since:
@@ -6048,7 +6057,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     the episode clock (``device_hold_episode_since``) the escalation and the held/released pair already
     use; a missing or unparseable stamp is not held, so it is not flagged."""
     global device_hold_deadline_bucket, device_hold_escalate_bucket, device_hold_offbus_escalated
-    global device_hold_risky_escalated, device_hold_escalation_trigger
+    global device_hold_risky_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
     if not device_hold_episode_since:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
@@ -6082,18 +6091,22 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # tray re-power the BMC's IPMI failed, or whose tray walk did not recover, at its hand-off bound.
     if not only_77 and offbus_power_cycle.due_for_watchdog(device_hold_episode_since, now):
         if offbus_power_cycle.ipmi_unavailable_age_sec(device_hold_episode_since, now) is not None:
+            device_hold_escalation_kind = "ipmi_handoff_bound"
             device_hold_escalation_trigger = f"the {offbus_power_cycle.ipmi_handoff_sec()}s BMC IPMI hand-off bound"
         elif offbus_power_cycle.tray_walk_failed_age_sec(device_hold_episode_since, now) is not None:
+            device_hold_escalation_kind = "tray_walk_handoff_bound"
             device_hold_escalation_trigger = (
                 f"the {offbus_power_cycle.tray_walk_handoff_sec()}s failed tray walk hand-off bound"
             )
         else:
+            device_hold_escalation_kind = "gated_offbus_grace"
             device_hold_escalation_trigger = f"the {offbus_power_cycle.grace_sec()}s gated off-bus grace"
         if _maybe_spawn_forced_escalation():
             offbus_power_cycle.mark_spawned(device_hold_episode_since)
     if only_77:
         pass
     elif isolated_chips and not device_hold_offbus_escalated and age >= _offbus_hold_ceiling_sec():
+        device_hold_escalation_kind = "offbus_one_shot"
         device_hold_escalation_trigger = f"the {int(_offbus_hold_ceiling_sec())}s off-bus one-shot"
         if _maybe_spawn_forced_escalation():
             device_hold_offbus_escalated = True
@@ -6103,6 +6116,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         # the one forced run past the early off-bus one-shot.
         ebucket = int(age // ceiling)
         if ebucket >= 1 and ebucket > device_hold_escalate_bucket:
+            device_hold_escalation_kind = "ceiling_window"
             device_hold_escalation_trigger = f"the {int(ceiling)}s ceiling (window {ebucket})"
             if _maybe_spawn_forced_escalation():
                 device_hold_escalate_bucket = ebucket
@@ -6636,7 +6650,7 @@ def _escalate_held_job_past_bound(job: "Job", held_sec: float, bound: float, rea
     watchdog drives), once per episode and only if no forced run has happened in it yet — a further
     forced run on top of one already spent would climb the ladder (warm reboot, BMC cycle) on a
     short clock. Returns what was done, for the job's error and log. Never raises."""
-    global device_hold_job_bound_escalated, device_hold_escalation_trigger
+    global device_hold_job_bound_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
     try:
         health_event(
             "tenant_hold_bound_exceeded",
@@ -6652,6 +6666,7 @@ def _escalate_held_job_past_bound(job: "Job", held_sec: float, bound: float, rea
             return "a forced recovery escalation is already running"
         if not _force_escalate_enabled():
             return "forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0); the device stays held"
+        device_hold_escalation_kind = "tenant_hold_bound"
         device_hold_escalation_trigger = f"the {int(bound)}s tenant-hold bound (job {job.id})"
         if _maybe_spawn_forced_escalation():
             device_hold_job_bound_escalated = True
