@@ -30,7 +30,12 @@ from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import pcie_guard
-from tt_device_mcp.health.recovery.base import RESET_COOLDOWN_SEC, RecoveryMechanism, refuse_mesh_reset
+from tt_device_mcp.health.recovery.base import (
+    RESET_COOLDOWN_SEC,
+    RecoveryMechanism,
+    drop_returned_isolated,
+    refuse_mesh_reset,
+)
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
@@ -524,6 +529,8 @@ class Recovery(ABC):
                 log(f"PCI rescan could not run ({e}); falling through to the heavier rungs")
             else:
                 back = [i for i in still_dead if Path(f"/sys/class/tenstorrent/tenstorrent!{i}").exists()]
+                # The rescan may bring back more than the chips this pass targeted.
+                back = sorted(set(back) | set(drop_returned_isolated(isolated_chips, "PCI rescan", log)), key=int)
                 if back:
                     for idx in back:
                         isolated_chips.discard(idx)

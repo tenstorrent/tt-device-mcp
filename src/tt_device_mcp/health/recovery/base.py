@@ -22,6 +22,7 @@ from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEO
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
 from tt_device_mcp.health.evidence import health_dir, health_event
+from tt_device_mcp.health.monitors.heartbeat import returned_chips
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
@@ -127,6 +128,24 @@ def mesh_reset_hold_reason() -> str:
     return ""
 
 
+def drop_returned_isolated(isolated: set, context: str, log=None) -> list:
+    """Re-read sysfs and take every chip of ``isolated`` that is back on the bus out of it, in place.
+    Run after every tray re-power, mesh reset and PCI rescan, whatever the verify that follows says:
+    a chip left in the set after it returned keeps /health and the gate reading it as isolated and
+    arms a needless bridge reset on the next pass. Never releases anything: only the full health
+    check, fabric included, does that (spec 03 I52)."""
+    if not isolated:
+        return []
+    back = returned_chips(isolated)
+    for c in back:
+        isolated.discard(c)
+    if back:
+        health_event("isolated_chips_returned", chips=back, context=context, still_isolated=sorted(isolated, key=int))
+        if log:
+            log(f"chip(s) {back} back on the bus after the {context}: no longer isolated")
+    return back
+
+
 def refuse_mesh_reset(context: str, argv: list, log, off_bus: int = 0) -> bool:
     """True when :func:`mesh_reset_hold_reason` holds the mesh reset: logged, journaled and paged
     once per hold, again every :func:`mesh_hold_repage_sec` while it stands and after a pass that
@@ -173,6 +192,7 @@ class RecoveryMechanism:
         write_action_log: Callable[[str, str, float, str, Optional[int]], None],
         device_hold_episode_since: Callable[[], str],
         local_reset_dir: Optional[Callable[[], Path]] = None,
+        isolated_chips: Optional[Callable[[], set]] = None,
     ) -> None:
         # Server-state accessors this mechanism cannot own without importing server (a cycle):
         # the broker's boot-id/boot-time readers, its systemd-availability predicate, the poller
@@ -189,6 +209,8 @@ class RecoveryMechanism:
         self._write_action_log = write_action_log
         self._device_hold_episode_since = device_hold_episode_since
         self._local_reset_dir = local_reset_dir or health_dir
+        # The broker's isolated-chip set, re-read after every reset's rescan (drop_returned_isolated).
+        self._isolated_chips = isolated_chips
         # Why no reset may run now — '' when one may. The broker sets it to its leftover fence (spec
         # 01 I16): a reaped job's process still holding the device, which a reset cannot free.
         # Checked here, where every reset passes, so no caller can reset over one.
@@ -672,6 +694,9 @@ class RecoveryMechanism:
                     # device comes back short and nobody knows why.
                     await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
                     await asyncio.sleep(3)
+                    isolated = self._isolated_chips() if self._isolated_chips is not None else None
+                    if isolated:
+                        await asyncio.to_thread(drop_returned_isolated, isolated, "reset", log)
                     if rc == 0:
                         await self._reapply_aiclk_ceiling(log)
                 except OSError:
