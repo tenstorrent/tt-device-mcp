@@ -613,7 +613,7 @@ def _fmt_when(iso) -> str:
 
 # ANSI styling — applied only when the destination is a terminal (see _overview),
 # so piping `status` into grep/files stays plain text.
-_ANSI = {"hdr": "\033[1;36m", "dim": "\033[2m", "off": "\033[0m"}
+_ANSI = {"hdr": "\033[1;36m", "dim": "\033[2m", "idle": "\033[1;33m", "off": "\033[0m"}
 
 
 def _style(text: str, key: str, color: bool) -> str:
@@ -748,6 +748,11 @@ def overview_lines(running, queued, rjobs, color: bool = False) -> list:
                 except Exception:
                     pass
             lines.append(f"  {jid:<10}  {_pad(icon + _ICON_GAP + owner, max_w + 3)}  {runtime:<8} {cmd}")
+            # The job holds the device but has done no device work for over the threshold
+            # (spec 03 I54). Only IDLE gets a line: active is the normal case, and unknown is
+            # never shown as idle.
+            if job.get("activity") == "idle":
+                lines.append(_style(f"  {'':<10}  {job.get('activity_label') or 'DEVICE IDLE'}", "idle", color))
     else:
         lines.append(_style("  (none)", "dim", color))
 
@@ -813,6 +818,10 @@ def cmd_status(args) -> int:
             print(f"Exit:    {result['exit_code']}")
         if result.get("runtime_sec"):
             print(f"Runtime: {result['runtime_sec']:.1f}s")
+        if result.get("activity_label"):
+            print(f"Device:  {result['activity_label']}")
+        elif result.get("idle_total_sec"):
+            print(f"Idle:    {result['idle_total_sec']:.1f}s with the device held and no device work")
         if result.get("log_file"):
             print(f"Log:     {result['log_file']}")
     else:
@@ -1229,8 +1238,12 @@ def _wait_and_stream(
         time.sleep(1)
 
 
+WATCH_INTERVAL_SEC = 1.0
+
+
 def cmd_watch(args) -> int:
-    """Live `status`: the same overview, refreshed in place every 2s. Ctrl-C to exit."""
+    """Live `status`: the same overview, refreshed in place every second, so a DEVICE IDLE
+    marker (spec 03 I54) counts up as it happens. Ctrl-C to exit."""
     if not is_daemon_running(args.port):
         print(_server_down_message())
         return 1
@@ -1255,7 +1268,7 @@ def cmd_watch(args) -> int:
             else:
                 sys.stdout.write(frame + "\n")
             sys.stdout.flush()
-            time.sleep(2.0)
+            time.sleep(WATCH_INTERVAL_SEC)
     except KeyboardInterrupt:
         pass
     finally:
