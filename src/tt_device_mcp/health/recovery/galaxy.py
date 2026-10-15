@@ -1471,7 +1471,15 @@ class GalaxyRecovery(Recovery):
                 await asyncio.shield(set_pollers(True, log))
 
     async def _issue_all_resets_back_to_back(
-        self, bitmap: int, tray_chip_ids: list, trays: list, expected: int, log, *, do_sbr: bool = True
+        self,
+        bitmap: int,
+        tray_chip_ids: list,
+        trays: list,
+        expected: int,
+        log,
+        *,
+        do_sbr: bool = True,
+        mesh_reset: bool = True,
     ) -> bool:
         """Fire EVERY reset type once, back-to-back, with no waiting or verifying between them: SBR on
         any chip still bridged, then a per-tray BMC re-power of ``bitmap``, then the mesh-wide reset —
@@ -1483,7 +1491,9 @@ class GalaxyRecovery(Recovery):
 
         Returns whether the sweep was COMPLETE: False when the per-host gate refused it (spec 04 I24)
         or the tray envelope refused to cut power (I23). An incomplete sweep is not the full ladder,
-        so the caller must not climb to a power cycle or reboot on it (I22)."""
+        so the caller must not climb to a power cycle or reboot on it (I22). ``mesh_reset`` False skips
+        the mesh-wide reset (the episode's mesh reset already regressed the drop, spec 04 I31); the
+        sweep still counts as complete."""
         off_bus = pcie_guard.chips_off_bus(expected)
         allowed, why = pcie_guard.host_reset_gate(off_bus)
         if not allowed:
@@ -1569,17 +1579,18 @@ class GalaxyRecovery(Recovery):
             # 3) mesh-wide reset, no verify (the ONE verify belongs to the caller). Lazy import:
             # select_recovery lives in the package __init__ that imports THIS module, so a top-level
             # import would be circular; by call time the package is fully loaded.
-            from tt_device_mcp.health.recovery import select_recovery
+            if mesh_reset:
+                from tt_device_mcp.health.recovery import select_recovery
 
-            argv = select_recovery(self.monitor, self.mechanism, self.deps).reset_argv(
-                [str(i) for i in range(expected)]
-            )
-            aer_mask = pcie_guard.mask_for_mesh_reset(log)
-            try:
-                await self.mechanism.reset_with_quiesce(argv, log)
-            finally:
-                if aer_mask is not None:
-                    await asyncio.to_thread(aer_mask.restore)
+                argv = select_recovery(self.monitor, self.mechanism, self.deps).reset_argv(
+                    [str(i) for i in range(expected)]
+                )
+                aer_mask = pcie_guard.mask_for_mesh_reset(log)
+                try:
+                    await self.mechanism.reset_with_quiesce(argv, log)
+                finally:
+                    if aer_mask is not None:
+                        await asyncio.to_thread(aer_mask.restore)
         except Exception as exc:  # noqa: BLE001 - the host rung above must fire even if a reset blew up
             log(f"the back-to-back reset sweep raised {exc!r} — continuing to the host rung")
             health_event("last_chance_reset_sweep_error", error=repr(exc))
@@ -1635,6 +1646,40 @@ class GalaxyRecovery(Recovery):
         # Chip ids come from the tray map (I16), not index arithmetic — bus 0x80 is tray 4 on BH
         # and index arithmetic would target the wrong silicon.
         tray_chip_ids = [c for t in trays for c in (tray_map or {}).get(t, [])]
+        off_count = len(offbus_chips or set())
+        # The episode's mesh reset already took more chips off the bus (I31): the sweep fires none of the
+        # bridge, tray or mesh resets again. Measured on a Galaxy: after such a regression the sweep's
+        # one-tray re-power dropped position 5 on the three other trays (1 -> 4 off), its mesh reset
+        # followed, and the host hung in the settle before the host rung could fire.
+        regressed = off_count > 0 and self.mechanism.reset_regressed_in(self.deps.device_hold_episode_since())
+        reset_floor = _galaxy_reset_min_dead_chips(expected)
+        # The walk's I25 rule holds here too: a one-tray re-power for a below-floor drop takes the other
+        # trays off the bus with it, so the sweep does not fire it (TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1
+        # turns it back on). The host rung that follows re-powers the whole box anyway.
+        single_tray = (
+            len(trays) == 1 and (reset_floor is None or off_count < reset_floor) and not _ubb_single_tray_walk_enabled()
+        )
+        do_sbr = bool(self.deps.isolated_chips()) and not regressed
+        if bitmap and (regressed or single_tray):
+            why = (
+                "the episode's mesh reset regressed the drop" if regressed else "a one-tray re-power drops other trays"
+            )
+            log(f"last chance before the host rung{where}: not re-powering trays {trays} ({why})")
+            health_event(
+                "ubb_reset_declined_single_tray" if not regressed else "ubb_reset_skipped_regressed",
+                context="last_chance_reset_sweep",
+                tray=trays[0] if len(trays) == 1 else None,
+                trays=trays,
+                off_bus=off_count,
+                expected=expected,
+                floor=reset_floor,
+            )
+            bitmap, tray_chip_ids = 0, []
+        if regressed:
+            log(f"last chance before the host rung{where}: no mesh reset — this hold's mesh reset regressed the drop")
+            health_event("galaxy_reset_skipped_regressed", context="last_chance_reset_sweep", off_bus=off_count)
+        plan = (["SBR"] if do_sbr else []) + ([f"per-tray re-power of trays {trays}"] if bitmap else [])
+        plan += [] if regressed else ["mesh reset"]
         swept = False
         if await asyncio.to_thread(self.mechanism.scope_active):
             log(f"last chance before the host rung{where}: a reset is already cycling in its own scope — adopting it")
@@ -1654,12 +1699,11 @@ class GalaxyRecovery(Recovery):
                     host_at_risk=True,
                 )
                 log(
-                    f"last chance before the host rung{where}: firing every reset type back-to-back "
-                    f"(SBR -> per-tray re-power of trays {trays} -> mesh reset) — nothing to lose before a "
-                    f"reboot or power cycle"
+                    f"last chance before the host rung{where}: firing the resets back-to-back "
+                    f"({' -> '.join(plan) or 'none left to fire'}) — nothing to lose before a reboot or power cycle"
                 )
                 swept = await self._issue_all_resets_back_to_back(
-                    bitmap, tray_chip_ids, trays, expected, log, do_sbr=bool(self.deps.isolated_chips())
+                    bitmap, tray_chip_ids, trays, expected, log, do_sbr=do_sbr, mesh_reset=not regressed
                 )
         settle = _settle_before_host_rung_sec()
         log(f"settling {settle}s for re-enumeration, then one verify before the host rung")
@@ -1876,6 +1920,27 @@ class GalaxyRecovery(Recovery):
             # measures nothing new — one Galaxy host ran eight of them, ten minutes apart, before the sweep
             # finally ran. Go straight to the last-chance sweep, then the host climb (spec 04 I29).
             await self._sweep_after_unverified_reset(expected, off_bus_before, hold_since, log)
+            return True
+        hold_age = _hold_age_sec(hold_since) if hold_since else None
+        since_reset = time.monotonic() - self.mechanism.last_reset_monotonic
+        if (
+            force
+            and hold_age is not None
+            and hold_age >= _stuck_hold_ceiling_sec()
+            and self.mechanism.last_reset_monotonic
+            and self.mechanism.last_reset_failed
+            and since_reset <= hold_age
+        ):
+            # This episode already ran a mesh reset that did not verify. At the ceiling the climb runs the
+            # last-chance sweep, whose mesh reset is the one retry, so a plain reset here first only doubles
+            # it: on one Galaxy host that second reset took a 32/32 mesh to 1 off and the sweep's tray
+            # re-power then dropped three more chips (spec 04 I31).
+            log(
+                f"this hold's mesh reset {int(since_reset)}s ago did not verify — no identical reset at the "
+                f"ceiling; the last-chance sweep, then the host rung"
+            )
+            health_event("galaxy_reset_skipped_failed", held_since=hold_since, off_bus=off_bus_before)
+            await self._climb_to_host_recovery_after_failed_reset(expected, off_bus_before, log)
             return True
         recovered = await self._reset_and_verify_device(indices, log)
         if recovered is None:

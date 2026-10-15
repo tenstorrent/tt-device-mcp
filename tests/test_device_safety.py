@@ -13193,7 +13193,7 @@ async def test_a_sweep_verify_that_reads_77_is_not_a_release(
     g = srv.galaxy_recovery
     cleared = []
 
-    async def fire_all(bitmap, ids, trays_, expected, log, do_sbr):
+    async def fire_all(bitmap, ids, trays_, expected, log, **k):
         return True
 
     async def verify_77(expected, log, run_fabric=True, **k):
@@ -14920,3 +14920,27 @@ def test_a_fresh_post_boot_hold_still_escalates_at_its_deadline(monkeypatch, tmp
     assert fired == [], "escalated before the new hold's own ceiling"
     srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 1))
     assert len(fired) == 1, "a post-boot hold past its ceiling must still force the ladder"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reset_age_s, force, resets", [(400, True, 0), (2000, True, 1), (400, False, 1)])
+async def test_a_ceiling_escalation_after_a_failed_reset_in_the_episode_sweeps_instead(
+    monkeypatch, clear_job_state, reset_age_s, force, resets
+):
+    """Spec 04 I31: at the ceiling, an episode whose mesh reset already failed its verify fires no second
+    identical reset; it climbs, and the climb's last-chance sweep holds the one retry. On one Galaxy host
+    the second reset took a 32/32 mesh to 1 off. A failed reset from before the episode, or a paced retry
+    below the forced ceiling pass, still resets."""
+    counters = _arm_stuck_hold(monkeypatch, reset_result=False)  # held 21 min: past the ceiling
+    srv.recovery_mechanism.last_reset_failed = True
+    srv.recovery_mechanism.last_reset_monotonic = time.monotonic() - reset_age_s
+    climbs = []
+
+    async def climb(expected, off_bus_before, log, **k):
+        climbs.append(off_bus_before)
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_climb_to_host_recovery_after_failed_reset", climb)
+    ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None, force=force)
+    assert ran is True
+    assert counters["resets"] == resets
+    assert climbs == [0], "a failed or skipped reset climbs, never sits"

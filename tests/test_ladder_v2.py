@@ -747,6 +747,75 @@ async def test_a_skipped_tray_rung_releases_only_after_the_full_health_check(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("opt_in", [False, True])
+async def test_the_last_chance_sweep_never_re_powers_one_tray_for_a_below_floor_drop(monkeypatch, galaxy_trays, opt_in):
+    """Spec 04 I25 in the sweep: a one-tray BMC re-power drops position 5 on the other trays (one Galaxy
+    host: 1 chip off -> 4 off, then the host hung in the settle). A below-floor drop on one tray gets SBR
+    and the mesh reset but no tray re-power, and the sweep still counts as complete (False: the caller
+    climbs). TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1 turns the re-power back on."""
+    if opt_in:
+        monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
+    else:
+        monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
+    g, order, cycles = _arm_sweep(monkeypatch)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **k: events.append(kind))
+    out = await g._settle_and_verify_before_host_rung(32, lambda m: None, "idle-escalation", offbus_chips={"30"})
+    steps = [o if isinstance(o, str) else o[0] for o in order]
+    assert out is False, "the sweep is complete either way, so the caller climbs to the host rung"
+    if opt_in:
+        assert steps == ["sbr", "tray", "mesh"]
+    else:
+        assert steps == ["sbr", "mesh"], f"no one-tray re-power in the sweep; got {steps}"
+        assert "ubb_reset_declined_single_tray" in events
+
+
+def _latch_regressed_episode(monkeypatch, g, since="2026-10-15T03:00:00"):
+    """The hold episode whose mesh reset already regressed the drop (spec 04 I31)."""
+    monkeypatch.setattr(g.deps, "device_hold_episode_since", lambda: since)
+    monkeypatch.setattr(g.mechanism, "regressed_reset_since", since)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("healthy", [False, True])
+async def test_after_a_regressed_mesh_reset_the_sweep_fires_no_reset_and_only_the_full_check_releases(
+    monkeypatch, galaxy_trays, healthy
+):
+    """Spec 04 I31 in the sweep, and goal 8: once the episode's mesh reset regressed the drop, the
+    last-chance sweep fires none of the bridge, tray or mesh resets again (two trays off, so only the
+    regression rule can skip the re-power). The full health check, fabric included, still runs; only its
+    pass counts as recovered and clears the hold. A failed check returns False, so the caller climbs to
+    the host rung (bounded), never None (the open-ended hold)."""
+    g, order, cycles = _arm_sweep(monkeypatch, verify_healthy=healthy)
+    _latch_regressed_episode(monkeypatch, g)
+    checks, cleared = [], []
+
+    async def verify(expected, log, run_fabric=True, **k):
+        checks.append(run_fabric)
+        return healthy, {"snapshot": {"ok": healthy}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(g.deps, "clear_device_dirty", lambda **k: cleared.append(k))
+    monkeypatch.setattr(g.deps, "clear_device_reported_fault", lambda *a, **k: None)
+    off = {str(i) for i in range(16, 32)}
+    out = await g._settle_and_verify_before_host_rung(32, lambda m: None, "idle-escalation", offbus_chips=off)
+    assert order == [], f"no reset after a regressed mesh reset; got {order}"
+    assert checks == [True], "the verify after the sweep runs the fabric check"
+    assert out is healthy
+    assert bool(cleared) is healthy, "the hold clears only on a passing full check"
+
+
+@pytest.mark.asyncio
+async def test_a_regressed_episode_goes_from_the_sweep_straight_to_the_power_cycle(monkeypatch, galaxy_trays):
+    """The road the blx01 episode took: a regressed mesh reset, then the gate ladder's host rung. The
+    sweep fires nothing, its verify fails, and the power cycle fires once."""
+    g, order, cycles = _arm_sweep(monkeypatch)
+    _latch_regressed_episode(monkeypatch, g)
+    out = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={})
+    assert order == [] and out == galaxy.OUTCOME_WAITING and cycles["n"] == 1
+
+
+@pytest.mark.asyncio
 async def test_a_sweep_that_recovers_the_mesh_cancels_the_power_cycle(monkeypatch, galaxy_trays):
     """The point of sweeping: if the last-chance resets bring the mesh back, the box is NOT cycled."""
     g, order, cycles = _arm_sweep(monkeypatch, verify_healthy=True)

@@ -916,17 +916,21 @@ async def test_the_per_chip_bridge_reset_obeys_the_hold_gate_and_the_latch(sysfs
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("off, trays", [(set(range(24, 32)), [3]), (set(), [])])
+@pytest.mark.parametrize(
+    "off, trays, bitmap",
+    [(set(range(16, 32)), [3, 4], 0b1100), (set(range(24, 32)), [3], 0), (set(), [], 0)],
+)
 async def test_the_last_chance_sweep_re_powers_only_the_affected_trays(
-    monkeypatch, clear_job_state, galaxy_trays, off, trays
+    monkeypatch, clear_job_state, galaxy_trays, off, trays, bitmap
 ):
     """Spec 04 I25: a caller that names no off-bus chips gets them read from the heartbeats; only trays
-    holding one are re-powered. A present mesh gets SBR and the mesh reset but no tray re-power."""
+    holding one are re-powered. A present mesh gets SBR and the mesh reset but no tray re-power, and a
+    below-floor drop on one tray is not re-powered alone (it drops the other trays)."""
     g = srv.galaxy_recovery
     swept = []
 
-    async def sweep(bitmap, ids, trays_, expected, log, do_sbr):
-        swept.append(trays_)
+    async def sweep(bitmap_, ids, trays_, expected, log, **k):
+        swept.append((trays_, bitmap_))
         return True
 
     async def bad(expected, log, run_fabric=True, **k):
@@ -940,7 +944,7 @@ async def test_the_last_chance_sweep_re_powers_only_the_affected_trays(
     patch_health_event(monkeypatch, lambda *a, **k: None)
     patch_recovery(monkeypatch, "_verify_device", bad)
     assert await g._settle_and_verify_before_host_rung(32, lambda m: None, "x") is False
-    assert swept == [trays]
+    assert swept == [(trays, bitmap)]
 
 
 # ---------------------------------------------------------------- review #52 fixes

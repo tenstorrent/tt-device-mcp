@@ -756,12 +756,13 @@ async def test_the_last_chance_sweep_labels_each_tray_from_the_map(monkeypatch, 
     g, events = _sweep_stubs(monkeypatch, lambda bitmap, ids: None)
 
     ok = await g._settle_and_verify_before_host_rung(
-        32, lines.append, "post-job", offbus_chips={str(i) for i in range(24, 32)}
+        32, lines.append, "post-job", offbus_chips={str(i) for i in range(16, 32)}
     )
 
     assert ok is True
     assert any("tray 4 (BMC mask 0x08, chips 24-31)" in line for line in lines), lines
-    assert [f["ubb_bitmap"] for k, f in events if k == "ubb_reset_fired"] == [0x08]
+    assert any("tray 3 (BMC mask 0x04, chips 16-23)" in line for line in lines), lines
+    assert [f["ubb_bitmap"] for k, f in events if k == "ubb_reset_fired"] == [0x0C]
 
 
 # --- the Wormhole snapshot suffix must not disable the rung ------------------------------------

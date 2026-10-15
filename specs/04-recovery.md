@@ -435,7 +435,9 @@ each rung fires only when the gentler one failed or cannot apply.
   cross-check. A tray whose chips are all on the bus is never re-powered automatically; if chips are
   still off after their trays, the next rung runs as the I24 gate allows (no rung is skipped before
   a power cycle, I22). Re-powering tray X alone recovers chips off on tray X, as the old walk did.
-  The walk never re-powers a single tray for a below-floor drop that sits on that one tray: a
+  The walk and the last-chance sweep never re-power a single tray for a below-floor drop that sits
+  on that one tray (the sweep then fires SBR and the mesh reset only, and still counts as complete
+  for I22; the tray-down-no-window sweep stays exempt): a
   one-tray BMC re-power has taken the other trays off the bus with it (1 chip off -> 24 off), so it
   emits `ubb_reset_declined_single_tray`, spends no walk latch, holds for self-heal, and the stuck-hold
   ladder's next rung owns it. `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1` turns the single-tray walk back on;
@@ -593,8 +595,11 @@ each rung fires only when the gentler one failed or cannot apply.
   and chips are still off the bus, neither the gate nor the idle off-bus ladder (forced or not)
   fires the bridge, tray or mesh reset rungs again: each journals `galaxy_reset_skipped_regressed`
   and goes straight to the post-reset verdict, with the drop treated as warm-reboot-futile. With a
-  power cycle opted in that is the cold rung, still behind the last-chance sweep (I22), so the full
-  ladder runs once more before any power cycle. Without one it pages
+  power cycle opted in that is the cold rung, still behind the last-chance sweep (I22); under the
+  latch the sweep fires no bridge, tray or mesh reset either (it counts as complete), and only its
+  full verify, fabric included, can release the device. A forced escalation at the stuck-hold
+  ceiling whose episode already ran a mesh reset that failed its verify fires no identical reset:
+  it journals `galaxy_reset_skipped_failed` and climbs, so the sweep's mesh reset is the one retry. Without one it pages
   (`reset_unrecoverable_power_cycle_required` or `all_chips_off_bus_power_cycle_required`) and holds.
   The latch clears when the device is released; it is in memory only, so a broker restart costs at
   most one more reset. Bounds the loop one Galaxy host ran: three mesh resets, one per forced
