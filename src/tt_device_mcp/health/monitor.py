@@ -342,6 +342,9 @@ class HealthMonitor:
         self.last_fabric_skipped: bool = False
         self.fabric_known_fault: str = ""
         self._fabric_known_fault_at: float = 0.0
+        # The last measured eth link count's drop below the high-water mark ("" when it met the mark).
+        # A 77 on a mesh with links measured down is a fault a reset can fix, not a missing verdict.
+        self.last_eth_link_drop: str = ""
         self._cable_fault_alerted: set[str] = set()
         self._fabric_route_fault_streak: int = 0
         # The in-flight fabric traffic pass. It maps every chip's BARs, so when a chip leaves the
@@ -585,6 +588,7 @@ class HealthMonitor:
                     {"links": measured, "high_water": max(high, measured), "asic_bus": keyed},
                 )
                 health_event("eth_link_rebaselined", links=measured, high_water=high)
+                self.last_eth_link_drop = ""
                 return ""
             elif measured != baseline:
                 # The cabling changed under the re-baseline: the next pass runs the descriptor again.
@@ -594,10 +598,14 @@ class HealthMonitor:
             if "high_water" in data:
                 data["high_water"] = max(int(data["high_water"]), measured)
             _write_json(self.ETH_LINK_BASELINE_FILE, data)
+        self.last_eth_link_drop = ""
         if corrupt:
             return f"eth link baseline unreadable; re-baselined at {measured} up link(s)"
         if measured < baseline:
-            return f"{measured} of {baseline} eth link(s) up — a link went down since the high-water mark"
+            self.last_eth_link_drop = (
+                f"{measured} of {baseline} eth link(s) up — a link went down since the high-water mark"
+            )
+            return self.last_eth_link_drop
         return ""
 
     @staticmethod

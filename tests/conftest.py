@@ -383,6 +383,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv.sampler, "short_count_strikes", 0, raising=False)
     monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None, raising=False)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+    # A link drop an eth test measured on the singleton would turn the next test's 77 hold into a fault.
+    monkeypatch.setattr(srv.health_monitor, "last_eth_link_drop", "", raising=False)
     monkeypatch.setattr(srv, "_fabric_ok_retire_monotonic", 0.0)
     monkeypatch.setattr(srv, "_fabric_ok_retire_streak", 0)
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRY_SLEEP_SEC", 0.0)  # no real eth-training wait in tests
