@@ -277,7 +277,11 @@ async def test_a_running_broker_job_blocks_without_a_page(offbus_blocked, monkey
     monkeypatch.setenv("TT_DEVICE_MCP_FOREIGN_HOLDER_DEADLINE_SEC", "60")
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     srv.jobs["042"] = srv.Job(
-        id="042", owner="u", workspace="/w", command="pytest", queued_at="2026-01-01T00:00:00",
+        id="042",
+        owner="u",
+        workspace="/w",
+        command="pytest",
+        queued_at="2026-01-01T00:00:00",
         status=srv.JobStatus.RUNNING,
     )
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
