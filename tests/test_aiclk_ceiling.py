@@ -203,6 +203,93 @@ async def test_post_reset_settle_wait_is_bounded(monkeypatch, run_sec):
     assert len(starts) <= 1 + int(3.0 / ac.SETTLE_POLL_SEC)
 
 
+def _timed_helper(monkeypatch, runs):
+    """Fake clock and helper that honours the timeout: each run replays the next (rc, output,
+    seconds), the last one repeating; a run longer than its timeout ends at the timeout with
+    rc None, as run_probe does. Returns (starts, timeouts, clock)."""
+    clock = [100.0]
+    starts, timeouts = [], []
+    runs = list(runs)
+
+    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate):
+        starts.append(clock[0])
+        timeouts.append(timeout_sec)
+        rc, out, sec = runs.pop(0) if len(runs) > 1 else runs[0]
+        if sec > timeout_sec:
+            clock[0] += timeout_sec
+            return None, b"timed out"
+        clock[0] += sec
+        return rc, out
+
+    async def sleep(d):
+        clock[0] += d
+
+    monkeypatch.setenv(ac.ENV_MHZ, "900")
+    monkeypatch.setattr(ac, "run_probe", run_probe)
+    monkeypatch.setattr(ac, "_now", lambda: clock[0])
+    monkeypatch.setattr(ac, "_sleep", sleep)
+    return starts, timeouts, clock
+
+
+# Goal: a post-reset step adds about 10 s or less between jobs.
+_POST_RESET_BUDGET_SEC = 10.0
+_HUNG = 1000.0
+
+
+@pytest.mark.asyncio
+async def test_post_reset_apply_realistic_run_is_well_inside_the_budget(monkeypatch, _fresh_ceiling):
+    starts, timeouts, clock = _timed_helper(monkeypatch, [(1, _OVER, 0.4), (1, _OVER, 0.4), (0, _AT, 0.4)])
+    t0 = clock[0]
+    ok, _, ev = await CEILING.apply("post-reset", settle=ac.DEFAULT_SETTLE_SEC)
+    assert ok is True and ev["attempts"] == 3
+    assert clock[0] - t0 == pytest.approx(2.2)
+    assert timeouts[0] == ac.DEFAULT_TIMEOUT_SEC and min(timeouts) >= ac.SETTLE_RETRY_MARGIN_SEC
+
+
+@pytest.mark.asyncio
+async def test_post_reset_apply_hung_first_run_stops_at_the_helper_timeout(monkeypatch, _fresh_ceiling):
+    starts, timeouts, clock = _timed_helper(monkeypatch, [(0, _AT, _HUNG)])
+    t0 = clock[0]
+    ok, detail, _ = await CEILING.apply("post-reset", settle=ac.DEFAULT_SETTLE_SEC)
+    assert ok is False and CEILING.owed is True and len(starts) == 1
+    assert clock[0] - t0 == ac.DEFAULT_TIMEOUT_SEC <= _POST_RESET_BUDGET_SEC
+    assert "timed out after 8s" in detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_sec", [round(0.05 * i, 2) for i in range(61)])
+async def test_post_reset_apply_retry_hung_near_the_window_end_stays_in_budget(monkeypatch, _fresh_ceiling, first_sec):
+    # The first readback is still high; the retry that follows hangs. Swept over the whole window:
+    # at first_sec 2.45 the retry starts at 2.95 s, and uncapped it ran to 2.95 + 8 = 10.95 s.
+    starts, timeouts, clock = _timed_helper(monkeypatch, [(1, _OVER, first_sec), (0, _AT, _HUNG)])
+    t0 = clock[0]
+    ok, detail, ev = await CEILING.apply("post-reset", settle=ac.DEFAULT_SETTLE_SEC)
+    dt = clock[0] - t0
+    assert dt <= max(ac.DEFAULT_TIMEOUT_SEC, ac.DEFAULT_SETTLE_SEC + ac.SETTLE_RETRY_MARGIN_SEC) + 1e-9
+    assert dt <= _POST_RESET_BUDGET_SEC
+    assert ok is False and CEILING.owed is True
+    if len(starts) > 1:
+        assert ev["rc"] is None and "timed out after" in detail
+        # The cap is the time left in the window plus the margin, never less than the margin.
+        left = t0 + ac.DEFAULT_SETTLE_SEC - starts[1]
+        assert timeouts[1] == pytest.approx(min(ac.DEFAULT_TIMEOUT_SEC, left + ac.SETTLE_RETRY_MARGIN_SEC))
+        assert timeouts[1] >= ac.SETTLE_RETRY_MARGIN_SEC
+
+
+@pytest.mark.asyncio
+async def test_post_reset_apply_worst_case_is_under_the_budget(monkeypatch, _fresh_ceiling):
+    # Every first-run length on a 10 ms grid, each followed by a hung retry, plus a hung first run.
+    worst = 0.0
+    for i in range(0, 801):
+        CEILING.owed, CEILING.disarmed = True, ""
+        _, _, clock = _timed_helper(monkeypatch, [(1, _OVER, i / 100), (0, _AT, _HUNG)])
+        t0 = clock[0]
+        await CEILING.apply("post-reset", settle=ac.DEFAULT_SETTLE_SEC)
+        worst = max(worst, clock[0] - t0)
+    assert worst == pytest.approx(ac.DEFAULT_TIMEOUT_SEC)
+    assert worst <= _POST_RESET_BUDGET_SEC
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rc", [0, None, 77])
 async def test_settle_never_reruns_a_verified_timed_out_or_unsupported_helper(monkeypatch, rc):

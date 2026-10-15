@@ -50,10 +50,14 @@ DEFAULT_TIMEOUT_SEC = 8.0
 # Post-reset settle window: a chip reset seconds ago may still read its old limit right after the
 # cap was sent (seen ~4 s after a Galaxy reset, all 32 chips, then verified 7 s later). The helper
 # is re-run every SETTLE_POLL_SEC while the window lasts; only a chip still above the ceiling at
-# its end is unverified. Bounds the added time to the window plus one helper run.
+# its end is unverified. A re-run's timeout is capped to the time left in the window plus
+# SETTLE_RETRY_MARGIN_SEC, so the whole apply ends within max(timeout, window + margin): 8 s at the
+# defaults, under the ~10 s a post-reset step may add. The margin is well above a healthy run
+# (~2 ms per chip), so the cap never cuts one short.
 DEFAULT_SETTLE_SEC = 3.0
 MAX_SETTLE_SEC = 10.0
 SETTLE_POLL_SEC = 0.5
+SETTLE_RETRY_MARGIN_SEC = 4.0
 # Per-chip bound inside the helper. Measured at ~2 ms per chip on a healthy 32-chip Blackhole
 # host; a chip that takes a second to open is not healthy.
 CHIP_TIMEOUT_SEC = 2.0
@@ -149,10 +153,12 @@ class AiclkCeiling:
     def _track(self, proc) -> None:
         self.proc = proc
 
-    async def _run_helper(self, argv: list[str], env: dict, terminate: Terminate) -> tuple[Optional[int], str]:
+    async def _run_helper(
+        self, argv: list[str], env: dict, terminate: Terminate, timeout: float
+    ) -> tuple[Optional[int], str]:
         try:
             rc, out = await run_probe(
-                argv, timeout_sec=timeout_sec(), track=self._track, stream=True, env=env, terminate=terminate
+                argv, timeout_sec=timeout, track=self._track, stream=True, env=env, terminate=terminate
             )
         except Exception as e:  # noqa: BLE001 - a helper that cannot start is a host config fault
             rc, out = UNSUPPORTED_RC, f"could not start the helper: {e}".encode()
@@ -173,16 +179,18 @@ class AiclkCeiling:
 
         ``settle`` > 0 (the post-reset apply) re-runs a helper that reported a chip above the
         ceiling or unreadable every ``SETTLE_POLL_SEC`` until ``settle`` seconds after the first
-        run started, and reports only the last result: no retry starts past the window, so the
-        added time is at most ``settle`` plus one helper run. A timeout or a cannot-run exit is
-        never retried."""
+        run started, and reports only the last result: no retry starts past the window, and a
+        retry's timeout is capped to the time left in the window plus ``SETTLE_RETRY_MARGIN_SEC``,
+        so the added time is at most ``max(timeout_sec(), settle + SETTLE_RETRY_MARGIN_SEC)``. A
+        timeout or a cannot-run exit is never retried."""
         mhz = ceiling_mhz()
         if mhz is None or self.disarmed:
             return None, "not armed", {}
         argv = build_argv(mhz)
         env = {**os.environ, ENV_MHZ: str(mhz)}
         t0 = _now()
-        rc, text = await self._run_helper(argv, env, terminate)
+        run_timeout = timeout_sec()
+        rc, text = await self._run_helper(argv, env, terminate, run_timeout)
         attempts = 1
         # Verified, timed out (already spent the full bound) or cannot run here: never re-run.
         final = (0, None, UNSUPPORTED_RC, 126, 127)
@@ -190,7 +198,9 @@ class AiclkCeiling:
             if log and attempts == 1:
                 log(f"aiclk-ceiling: readback not yet at {mhz} MHz (rc={rc}); re-reading for up to {settle:g}s")
             await _sleep(SETTLE_POLL_SEC)
-            rc, text = await self._run_helper(argv, env, terminate)
+            left = max(0.0, t0 + settle - _now())
+            run_timeout = min(timeout_sec(), left + SETTLE_RETRY_MARGIN_SEC)
+            rc, text = await self._run_helper(argv, env, terminate, run_timeout)
             attempts += 1
         dt = _now() - t0
         s = _summary(text)
@@ -233,7 +243,7 @@ class AiclkCeiling:
             ok: Optional[bool] = True
         else:
             self.owed = True
-            why = f"timed out after {timeout_sec():.0f}s" if rc is None else f"rc={rc}"
+            why = f"timed out after {round(run_timeout, 1):g}s" if rc is None else f"rc={rc}"
             if attempts > 1:
                 why += f" after {attempts} reads in {dt:.1f}s"
             detail = f"ceiling {mhz} MHz NOT verified ({why}; {count} at or below): {last_line}"
