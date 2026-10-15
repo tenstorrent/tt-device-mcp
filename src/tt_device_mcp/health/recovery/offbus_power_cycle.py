@@ -19,6 +19,10 @@ hold would otherwise re-run them and stand. Once the ladder has run once in the 
 fires ``TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC`` (default 300 s) after the IPMI failure, with the
 same checks, stand-backs and rate limit.
 
+It applies too when this episode's per-tray reset walk fired and did not recover the mesh, or took
+more chips off the bus: the ladder then holds instead of trying the below-floor mesh reset, and the
+command fires ``TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC`` (default 300 s) after the walk failed.
+
 Every phase goes to the fsync'd health journal, and each attempt is written to a small state file in
 the health dir before the command runs, so a broker killed mid-cycle (the cycle itself) still counts
 the attempt against the rate limit.
@@ -47,6 +51,7 @@ CHECK_TIMEOUT_DEFAULT_SEC = 10.0
 FIRE_TIMEOUT_DEFAULT_SEC = 120.0
 BLOCKED_PAGE_DEFAULT_SEC = 1800
 IPMI_HANDOFF_DEFAULT_SEC = 300
+TRAY_WALK_HANDOFF_DEFAULT_SEC = 300
 # Where the installer stages deploy/tt-manual-recovery-check.sh; the manual-recovery check when
 # TT_DEVICE_MCP_MANUAL_RECOVERY_CMD is unset.
 MANUAL_RECOVERY_CHECK = "manual-recovery-check.sh"
@@ -78,6 +83,13 @@ def ipmi_handoff_sec() -> int:
     """Seconds after the BMC's IPMI failed a tray re-power before the hold may hand off to the power-cycle
     command (the ladder must also have run once). A non-positive or malformed value reads as 300."""
     return _int_env("TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC", IPMI_HANDOFF_DEFAULT_SEC)
+
+
+def tray_walk_handoff_sec() -> int:
+    """Seconds after this episode's per-tray reset walk failed before the hold may hand off to the
+    power-cycle command (the ladder must also have run once). A non-positive or malformed value reads
+    as 300."""
+    return _int_env("TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC", TRAY_WALK_HANDOFF_DEFAULT_SEC)
 
 
 def min_interval_sec() -> int:
@@ -275,6 +287,36 @@ def ipmi_detail(episode: str) -> str:
     return _pending.get("ipmi_detail", "") if _pending.get("episode") == episode else ""
 
 
+def note_tray_walk_failed(episode: str, detail: str, now: Optional[datetime] = None) -> None:
+    """This episode's per-tray reset walk fired and did not recover the mesh (or made it worse): start
+    its hand-off clock (the first failure counts; idempotent). The below-floor mesh reset is not tried
+    after it."""
+    if not episode:
+        return
+    _track(episode)
+    if _pending.get("tray_walk_at") is None:
+        _pending["tray_walk_at"] = now or datetime.now()
+        _pending["tray_walk_detail"] = detail[-200:]
+        health_event(
+            "offbus_gated_hold",
+            phase="tray_walk_failed",
+            held_since=episode,
+            detail=_pending["tray_walk_detail"],
+            handoff_sec=tray_walk_handoff_sec(),
+        )
+
+
+def tray_walk_failed_age_sec(episode: str, now: Optional[datetime] = None) -> Optional[float]:
+    """Seconds since this episode's per-tray reset walk failed, or None when it has not."""
+    if not episode or _pending.get("episode") != episode or _pending.get("tray_walk_at") is None:
+        return None
+    return ((now or datetime.now()) - _pending["tray_walk_at"]).total_seconds()
+
+
+def tray_walk_detail(episode: str) -> str:
+    return _pending.get("tray_walk_detail", "") if _pending.get("episode") == episode else ""
+
+
 def note_ladder_ran(episode: str) -> None:
     """The safe rungs ran for this episode. Tracks it even when nothing armed it yet: the ladder's own
     tray rung may start the IPMI clock only after this (tracking alone forces no pass)."""
@@ -289,15 +331,18 @@ def ladder_ran(episode: str) -> bool:
 
 
 def due_for_watchdog(episode: str, now: Optional[datetime] = None) -> bool:
-    """True once per episode, when an armed gated hold's grace (or the IPMI hand-off bound) has run out
-    and the command is set: the hold watchdog then forces one escalation pass so the cycle fires at
-    the bound, not at the next ceiling window."""
+    """True once per episode, when an armed gated hold's grace (or the IPMI or failed-tray-walk hand-off
+    bound) has run out and the command is set: the hold watchdog then forces one escalation pass so the
+    cycle fires at the bound, not at the next ceiling window."""
     if not episode or _pending.get("episode") != episode or _pending.get("spawned"):
         return False
     if not _pending.get("ladder_ran") or power_cycle_argv() is None:
         return False
     ipmi_age = ipmi_unavailable_age_sec(episode, now)
     if ipmi_age is not None and ipmi_age >= ipmi_handoff_sec():
+        return True
+    walk_age = tray_walk_failed_age_sec(episode, now)
+    if walk_age is not None and walk_age >= tray_walk_handoff_sec():
         return True
     age = episode_age_sec(episode, now)
     return bool(_pending.get("gated")) and age is not None and age >= grace_sec()
