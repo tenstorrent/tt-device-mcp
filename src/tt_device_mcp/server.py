@@ -5841,6 +5841,11 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
             payload["held_age_sec"] = int(((now or datetime.now()) - datetime.fromisoformat(since)).total_seconds())
         except ValueError:
             payload["held_age_sec"] = None  # a since we cannot parse is still a hold; report it without an age
+        # Keyed on the hold EPISODE (survives a broker restart), the clock the hand-off was armed on.
+        episode = device_hold_episode_since or since
+        handoff = offbus_power_cycle.hold_handoff_status(episode, now.timestamp() if now else None)
+        if handoff is not None:
+            payload["operator_handoff"] = handoff  # spec 04 I33: who must act on the hold, and by when
     return payload
 
 
@@ -5926,6 +5931,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
             recovery_mechanism.regressed_reset_since = None  # spec 04 I31: the next episode may reset again
         if galaxy_recovery is not None:
             galaxy_recovery.tray_down_episode_end()  # spec 04 I19: the next drop is a fresh onset
+        offbus_power_cycle.end_hold_handoff()  # spec 04 I33: no hold is handed off any more
         _persist_hold_episode("")  # the device came back fit: the episode is over, on disk too
         device_hold_episode_reason = ""
         device_hold_escalated_monotonic = 0.0
@@ -6140,6 +6146,12 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             device_hold_escalation_kind = "tray_walk_handoff_bound"
             device_hold_escalation_trigger = (
                 f"the {offbus_power_cycle.tray_walk_handoff_sec()}s failed tray walk hand-off bound"
+            )
+        elif offbus_power_cycle.hold_handoff_due(device_hold_episode_since, now.timestamp() if now else None):
+            # spec 04 I33: the operator's hand-off ran out with no power cycle configured.
+            device_hold_escalation_kind = "gated_hold_handoff_bound"
+            device_hold_escalation_trigger = (
+                f"the {offbus_power_cycle.hold_handoff_sec()}s gated off-bus operator hand-off bound"
             )
         else:
             device_hold_escalation_kind = "gated_offbus_grace"
@@ -7069,8 +7081,6 @@ SMI_SAFE_FLAGS = {
     "--version",
     "-l",
     "--local",
-    "-f",
-    "--filename",
     "-h",
     "--help",
 }

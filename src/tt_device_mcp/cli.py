@@ -1281,8 +1281,6 @@ _SMI_SAFE_FLAGS = {
     "--version",
     "-l",
     "--local",
-    "-f",
-    "--filename",
     "-h",
     "--help",
 }
@@ -1416,7 +1414,7 @@ for arg in "$@"; do
     case "$arg" in
     -*)
         case "$arg" in
-        -ls|--list|-s|--snapshot|--snapshot_no_tty|-v|--version|-l|--local|-f|--filename|-h|--help) ;;
+        -ls|--list|-s|--snapshot|--snapshot_no_tty|-v|--version|-l|--local|-h|--help) ;;
         *) echo "tt-device-mcp-smi-ro: refusing non-read-only flag: $arg" >&2; exit 2 ;;
         esac ;;
     esac

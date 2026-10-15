@@ -26,6 +26,8 @@ Everything reads and writes through :data:`SYS_ROOT` so tests run against a fake
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -493,6 +495,21 @@ def chips_off_bus(expected: int) -> int:
     return max(0, expected - len(eps)) + len(dead_chips(read_heartbeats()))
 
 
+_HOLD_LIFTED: contextvars.ContextVar = contextvars.ContextVar("tt_device_mcp_hold_lifted", default="")
+
+
+@contextlib.contextmanager
+def hold_lifted(why: str):
+    """Inside this scope (and the threads it starts) a configured ``hold`` gate reads as ``guard`` for a
+    chip off the bus: the AER flood checks still refuse, the I25 host-hang latch still holds. Scoped to
+    one escalation pass, so nothing outlives it (spec 04 I33)."""
+    token = _HOLD_LIFTED.set(why)
+    try:
+        yield
+    finally:
+        _HOLD_LIFTED.reset(token)
+
+
 def host_reset_gate(off_bus: int) -> tuple:
     """``(allowed, why)`` for an automatic host-affecting reset (mesh reset, per-tray re-power) with
     ``off_bus`` chips already off the bus. A refused reset is a rung that did not fire, so the ladder
@@ -516,7 +533,9 @@ def host_reset_gate(off_bus: int) -> tuple:
                 f"{off_bus} chip(s) off the bus and {_latch_boots(latch)} until every chip is back on the "
                 f"bus, the host boots again{ceiling} or an operator runs `{clear_latch_cmd()}`"
             )
-        return False, f"{off_bus} chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold"
+        if not _HOLD_LIFTED.get():
+            return False, f"{off_bus} chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold"
+        # The off-bus hold's operator hand-off ran out (spec 04 I33): this pass reads `hold` as `guard`.
     if aer_flooding():
         return False, f"AER errors are flooding the Tenstorrent root ports (TT_DEVICE_MCP_HOST_RESET_GATE={mode})"
     return True, ""

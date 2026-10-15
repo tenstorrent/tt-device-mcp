@@ -96,6 +96,17 @@ def _reboot_min_dead_chips(expected: int) -> int:
     return max(2, math.ceil(expected * frac))
 
 
+def _hold_gate_liftable() -> bool:
+    """The gate refuses off-bus resets only because ``TT_DEVICE_MCP_HOST_RESET_GATE=hold`` is configured:
+    no I25 host-hang latch and no ``TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC=off``. Only such a hold's
+    operator hand-off ends in the broker's own ladder (spec 04 I33)."""
+    return (
+        pcie_guard.offbus_reset_latched() is None
+        and pcie_guard.gate_mode() == pcie_guard.GATE_HOLD
+        and offbus_power_cycle.hold_handoff_sec() is not None
+    )
+
+
 def _galaxy_reset_min_dead_chips(expected: int) -> Optional[int]:
     """Fewest off-bus chips that justifies the mesh-wide galaxy reset. Defaults to the mass-drop
     floor; None only when an operator explicitly disables it (frac <= 0), restoring the old
@@ -1927,6 +1938,12 @@ class GalaxyRecovery(Recovery):
         else:
             offbus_power_cycle.arm(hold_since)
             age, grace = offbus_power_cycle.episode_age_sec(hold_since) or 0.0, offbus_power_cycle.grace_sec()
+            if offbus_power_cycle.power_cycle_argv() is None:
+                # No host rung to end it: hand the hold to an operator with a deadline (spec 04 I33).
+                offbus_power_cycle.note_hold_handoff(
+                    hold_since, off_bus, expected, why, log, latched="" if _hold_gate_liftable() else why
+                )
+                return None
         if not offbus_power_cycle.ladder_ran(hold_since):
             return None  # the safe rungs run once first; none is skipped before a power cycle
         argv = offbus_power_cycle.power_cycle_argv()
@@ -2053,6 +2070,53 @@ class GalaxyRecovery(Recovery):
         return True
 
     async def _escalate_offbus_stuck_hold(self, indices: list, expected: int, log, *, force: bool = False) -> bool:
+        """One escalation pass over an idle off-bus hold (:meth:`_climb_offbus_stuck_hold`). Once a hold a
+        configured ``hold`` gate refuses, with no power cycle to end it, has outlived its operator
+        hand-off, the pass runs with the gate lifted (spec 04 I33): the ladder's own rungs (the bridge
+        reset, then the mesh reset) may fire, each followed by the full health check, fabric included,
+        before anything releases the device. An operator latch (the I25 host-hang latch,
+        ``TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC=off``) or a manual-recovery check that says an operator
+        is acting keeps the hold."""
+        lift = await self._offbus_hold_lift(expected, log)
+        if not lift:
+            return await self._climb_offbus_stuck_hold(indices, expected, log, force=force)
+        with pcie_guard.hold_lifted(lift):
+            return await self._climb_offbus_stuck_hold(indices, expected, log, force=force)
+
+    async def _offbus_hold_lift(self, expected: int, log) -> str:
+        """Why this pass may lift the ``hold`` gate (spec 04 I33), or "" to keep it."""
+        hold_since = self.deps.device_hold_episode_since()
+        if not offbus_power_cycle.hold_handoff_due(hold_since) or offbus_power_cycle.power_cycle_argv() is not None:
+            return ""
+        if not _hold_gate_liftable():
+            return ""
+        beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        off_bus = offbus_count(beats, expected)
+        if off_bus <= 0:
+            return ""
+        standback = await asyncio.to_thread(offbus_power_cycle.standback_reason, require_manual_check=False)
+        if standback:
+            log(f"off-bus hold past its operator hand-off, but {standback} — holding; the gate stays shut")
+            offbus_power_cycle.page_if_blocked(
+                hold_since,
+                offbus_power_cycle.episode_age_sec(hold_since) or 0.0,
+                log,
+                standback,
+                bound=offbus_power_cycle.hold_handoff_sec() or 0,
+                off_bus=off_bus,
+            )
+            return ""
+        why = f"the {offbus_power_cycle.hold_handoff_sec()}s operator hand-off of this off-bus hold ran out"
+        log(
+            f"{off_bus}/{expected} chip(s) off the bus and {why} — lifting TT_DEVICE_MCP_HOST_RESET_GATE=hold "
+            f"for this pass: the ladder's own rungs may fire, then the full health check"
+        )
+        health_event(
+            "offbus_gated_hold", phase="gate_lifted", held_since=hold_since, off_bus=off_bus, expected=expected
+        )
+        return why
+
+    async def _climb_offbus_stuck_hold(self, indices: list, expected: int, log, *, force: bool = False) -> bool:
         """Escalate an idle OFF-BUS hold the read-only relift cannot clear through the gate's OWN
         gentlest-first recovery once it has stood past the ceiling. Returns True iff a recovery action
         ran (recovered or not); False leaves the hold standing for the next window.
