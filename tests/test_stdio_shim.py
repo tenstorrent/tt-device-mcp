@@ -40,7 +40,7 @@ def test_resolve_auto_discovers_broker_socket(tmp_path, monkeypatch):
 
 def test_resolve_lazy_starts_user_daemon_when_none(tmp_path, monkeypatch):
     # No broker socket, no user daemon -> the shim lazy-starts a per-user daemon
-    # (that's what makes the MCP "just work" for tt-buddy). No TCP fallback.
+    # (that's what makes the MCP "just work" for agent clients). No TCP fallback.
     monkeypatch.setattr(constants, "DEFAULT_SOCKET", str(tmp_path / "absent.sock"))
     monkeypatch.setattr(constants, "user_socket_path", lambda: str(tmp_path / "absent-user.sock"))
     monkeypatch.delenv("TT_DEVICE_MCP_SOCKET", raising=False)
