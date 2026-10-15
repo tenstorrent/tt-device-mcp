@@ -414,7 +414,7 @@ async def test_a_step_that_reserves_the_device_during_the_hold_is_waited_out(mon
     assert marker.exists()
 
 
-# --- spec 08 I19: the restart an update ends in re-proves the device before the queue opens ------
+# --- spec 08 I20: the restart an update ends in re-proves the device before the queue opens ------
 
 
 async def _restart_with_a_held_job(monkeypatch, tmp_path, verdict):

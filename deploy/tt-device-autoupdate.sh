@@ -24,7 +24,7 @@
 # running job across the restart. From its busy check through the restart the updater holds
 # dispatch (spec 08 I18): the broker starts no queued job while the hold names a live pid, so
 # a job queued behind one that just ended waits, persisted, for the new broker instead of being
-# dispatched into the restart. A box that is never idle is drained instead (spec 08 I19): past
+# dispatched into the restart. A box that is never idle is drained instead (spec 08 I20): past
 # TTDEV_DRAIN_AFTER_SEC the lap keeps the hold, lets the running job finish and applies at that job
 # boundary, and lets go after TTDEV_DRAIN_TIMEOUT_SEC if the job runs on. A drain blocks this lap
 # (and the reconcile after it) for at most that long.
@@ -132,7 +132,7 @@ fi
 # window sets TTDEV_MAX_DEFER_SEC to the seconds it will wait. The in-flight device-op bar above
 # is separate and unconditional — re-adoption covers a job, not a tt-smi killed mid-reset.
 MAX_DEFER="${TTDEV_MAX_DEFER_SEC:-0}"
-# Drain (spec 08 I19). A box whose queue is never empty (jobs back to back, a second apart) has no
+# Drain (spec 08 I20). A box whose queue is never empty (jobs back to back, a second apart) has no
 # idle tick, so an update waiting for one waits forever. Once a pending update has waited
 # DRAIN_AFTER, the lap keeps the dispatch hold instead of dropping it: the running job finishes,
 # nothing new starts, and the update applies at that job boundary while the queued jobs wait,

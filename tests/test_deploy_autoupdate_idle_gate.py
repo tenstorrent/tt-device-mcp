@@ -145,7 +145,7 @@ def test_a_running_job_scope_counts_as_busy(tmp_path):
     assert not hold.exists()
 
 
-# --- spec 08 I19: draining a box that is never idle ------------------------------------------------
+# --- spec 08 I20: draining a box that is never idle ------------------------------------------------
 # A model broker stands behind pgrep: one job runs for `job_ticks` polls, and whenever no job runs
 # and no hold stands it dispatches the next queued one at once, as a queue of back-to-back jobs does.
 # The restart stub asks it once more first: a job dispatched between the last idle count and the
