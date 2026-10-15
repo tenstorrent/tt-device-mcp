@@ -641,6 +641,19 @@ each rung fires only when the gentler one failed or cannot apply.
   passes; a failed check keeps it held for the next bounded rung, and a reset the gate still refuses
   releases nothing. The hand-off ends (gauge to 0, `operator_handoff` gone) when the hold ends.
 
+- **I34 — Once a host reboot or power cycle is requested, the hold watchdog starts no device reset
+  until the host acts or the request expires.** A cycle handed to a `TT_DEVICE_MCP_POWER_CYCLE_CMD`
+  wrapper can run some time after the request returns; a forced escalation (the off-bus one-shot, a
+  ceiling window, any other hold-deadline trigger) that ran a bridge reset, tray re-power or galaxy
+  reset in that gap would race the host going down. The request is marked once its I9 ledger record
+  is written; while it is pending the forced ladder declines without spending its window latch and
+  logs one `hold_escalation_suppressed_host_action` line per request. The device stays held and the
+  I32 fabric debt stands: it is settled by the startup pass after the host returns, behind the
+  hugepage gate (03 I33). Bounded: a request whose ledger write failed or whose fire did not launch
+  never marks; one the host has not acted on within `TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC` (default
+  900 s, capped at 3600 s; malformed or non-positive reads as the default) is journaled as
+  `host_action_request_expired` and the next tick resumes the forced ladder.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -1075,6 +1088,8 @@ sees a silent fabric pass.
 | I33 before the deadline the gate holds; past it the watchdog forces one pass, and only that pass runs the ladder with the gate lifted | `tests/test_gated_hold_handoff.py::test_before_the_deadline_the_gate_holds_and_no_reset_fires`, `::test_the_watchdog_forces_one_pass_at_the_handoff_bound`, `::test_past_the_deadline_the_ladder_runs_with_the_gate_lifted_for_that_pass_only` |
 | I33 an operator latch (`off`, the I25 latch) or an operator at work keeps the hold past the deadline | `tests/test_gated_hold_handoff.py::test_an_operator_latch_keeps_the_hold_past_the_deadline`, `::test_an_operator_at_work_keeps_the_gate_shut` |
 | I33 / I32 a lifted reset releases only after a passing full health check, fabric included; a reset the gate still refuses releases nothing | `tests/test_gated_hold_handoff.py::test_the_lifted_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_a_reset_the_gate_still_refuses_releases_nothing` |
+| I34 a requested power cycle or reboot suppresses every hold-deadline tick and a forced escalation waiting on the lock; the device stays held with the check owed; one line per request | `tests/test_host_action_suppress.py::test_power_cycle_request_suppresses_every_deadline_tick`, `::test_reboot_request_suppresses_the_deadline_tick`, `::test_escalation_waiting_on_the_lock_runs_no_rung` |
+| I34 bounded: a refused or failed request never suppresses; an expired one resumes the ladder; the window is always finite | `tests/test_host_action_suppress.py::test_power_cycle_that_fails_to_launch_does_not_suppress`, `::test_power_cycle_refused_by_the_ledger_does_not_suppress`, `::test_a_request_the_host_never_acted_on_expires_and_the_ladder_resumes`, `::test_pending_window_is_always_finite` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |
