@@ -727,7 +727,7 @@ class Job:
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     log_file: Optional[str] = None
-    idle_total_sec: Optional[float] = None  # DEVICE IDLE time over the run (spec 03 I53)
+    idle_total_sec: Optional[float] = None  # DEVICE IDLE time over the run (spec 03 I54)
 
     @property
     def runtime_sec(self) -> Optional[float]:
@@ -754,7 +754,7 @@ job_queue: asyncio.Queue[str] | None = None  # Lazy init - created at runtime
 job_counter: int = 0  # Monotonic counter for job IDs; wraps at JOB_ID_MODULUS
 current_process: asyncio.subprocess.Process | None = None
 current_job_id: str | None = None  # job_id of current_process, so a kill can scope-route it
-# job_id -> the 1 s device-activity sampler of that running job (spec 03 I53). Started at spawn,
+# job_id -> the 1 s device-activity sampler of that running job (spec 03 I54). Started at spawn,
 # stopped at the top of the runner's finally; never on the between-jobs path.
 _job_activity: dict[str, device_activity.DeviceActivitySampler] = {}
 # True from a job's exit until its post-job gate returns. current_process is already None in that
@@ -2274,7 +2274,7 @@ def _parse_job_log_footer(tail: list[str]) -> dict:
 
 
 def _start_job_activity(job_id: str, pid: Optional[int], scope: Optional[str], tag: Optional[str]) -> None:
-    """Start the job's 1 s device-activity sampler (spec 03 I53). Best effort: a sampler that
+    """Start the job's 1 s device-activity sampler (spec 03 I54). Best effort: a sampler that
     cannot start leaves the job's activity unknown and never touches the job itself."""
     try:
         sampler = device_activity.DeviceActivitySampler(device_activity.JobActivitySource(pid, scope, tag))
@@ -5827,7 +5827,7 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         "fsm_why": fsm.record.why,
     }
     payload.update(_live_offbus_state())
-    # Whether the running job is doing device work (spec 03 I53); absent while no job runs.
+    # Whether the running job is doing device work (spec 03 I54); absent while no job runs.
     for j in jobs.values():
         view = job_activity_view(j.id) if j.status == JobStatus.RUNNING else None
         if view is not None:
@@ -7170,7 +7170,7 @@ def _get_queue_status() -> dict:
             "command": j.command[:COMMAND_DISPLAY_LENGTH],
             "workspace": Path(j.workspace).name,
             "started_at": j.started_at,
-            # activity / idle_since / idle_seconds / activity_label: DEVICE IDLE (spec 03 I53).
+            # activity / idle_since / idle_seconds / activity_label: DEVICE IDLE (spec 03 I54).
             **(job_activity_view(j.id) or {}),
         }
         for j in running
@@ -8634,7 +8634,7 @@ export {JOB_TAG_ENV}={job_tag}
 
         finally:
             # The process is gone (or the broker is shutting down): the activity sampler ends
-            # here, cancelled rather than awaited, before the sweep and the gate (spec 03 I53).
+            # here, cancelled rather than awaited, before the sweep and the gate (spec 03 I54).
             _stop_job_activity(job_id, job, logger)
             # On shutdown leave the running job alive (it survives in its scope for
             # re-adoption) — skip the kill, the footer, and the completion bookkeeping.
@@ -10016,7 +10016,7 @@ def create_mcp_server() -> MCPServer:
         if job.error:
             result["cause"] = job.error
         if job.status == JobStatus.RUNNING:
-            result.update(job_activity_view(job_id) or {})  # DEVICE IDLE (spec 03 I53)
+            result.update(job_activity_view(job_id) or {})  # DEVICE IDLE (spec 03 I54)
         elif job.idle_total_sec is not None:
             result["idle_total_sec"] = job.idle_total_sec
 

@@ -744,7 +744,7 @@ def overview_lines(running, queued, rjobs, color: bool = False) -> list:
                     pass
             lines.append(f"  {jid:<10}  {_pad(icon + _ICON_GAP + owner, max_w + 3)}  {runtime:<8} {cmd}")
             # The job holds the device but has done no device work for over the threshold
-            # (spec 03 I53). Only IDLE gets a line: active is the normal case, and unknown is
+            # (spec 03 I54). Only IDLE gets a line: active is the normal case, and unknown is
             # never shown as idle.
             if job.get("activity") == "idle":
                 lines.append(_style(f"  {'':<10}  {job.get('activity_label') or 'DEVICE IDLE'}", "idle", color))
@@ -1236,7 +1236,7 @@ WATCH_INTERVAL_SEC = 1.0
 
 def cmd_watch(args) -> int:
     """Live `status`: the same overview, refreshed in place every second, so a DEVICE IDLE
-    marker (spec 03 I53) counts up as it happens. Ctrl-C to exit."""
+    marker (spec 03 I54) counts up as it happens. Ctrl-C to exit."""
     if not is_daemon_running(args.port):
         print(_server_down_message())
         return 1

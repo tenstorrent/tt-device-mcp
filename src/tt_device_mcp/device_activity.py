@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Whether a held device is doing any work, sampled once a second while a job runs (spec 03 I53).
+"""Whether a held device is doing any work, sampled once a second while a job runs (spec 03 I54).
 
 A job owns the whole device for as long as it runs, so time it spends building, editing or sleeping
 is time nobody else can use the device. The status surfaces say so: while the job's processes do no
