@@ -107,6 +107,15 @@ def cable_fault(missing: int, desc: str, why: str) -> str:
     )
 
 
+# The wrapper's line when the links passed and the mesh still could not run a program.
+DISPATCH_FAILED = "dispatch FAILED on a green fabric"
+
+
+def names_dispatch_failure(text: str) -> bool:
+    """Whether ``text`` carries the wrapper's green-fabric dispatch failure (spec 03 I55)."""
+    return DISPATCH_FAILED in (text or "")
+
+
 def find_topology_marker(output: str) -> Optional[str]:
     m = _TOPOLOGY_MARKER.search(output or "")
     return m.group(0).strip() if m else None
@@ -137,6 +146,9 @@ def job_fabric_error(log_tail: str) -> Optional[str]:
 # 1G hugepage pool read as a bare UmdException). A logged error/TT_THROW line is next: some aborts
 # print their cause only there.
 _REASON_PATTERNS = (
+    # The wrapper's own final verdict on a mesh whose links passed and whose dispatch did not
+    # (spec 03 I55): it names the failure the exit code is about, ahead of any validator line above.
+    re.compile(r"dispatch FAILED on a green fabric.*"),
     re.compile(r"what\(\):.*"),
     re.compile(r"filesystem error:.*"),
     re.compile(r"(?:\|\s*(?:critical|fatal|error)\s*\||\[(?:critical|error)\]|TT_THROW|TT_FATAL).*", re.IGNORECASE),
@@ -152,7 +164,14 @@ _ASSERT_INFO = re.compile(r"[^\n]*\n[ \t]*info:[ \t]*\n[ \t]*(\S[^\n]*)")
 
 def first_reason(output: str) -> Optional[str]:
     """The validator's first error line, by :data:`_REASON_PATTERNS` priority, or ``None``.
-    A TT_FATAL/TT_THROW header line gets its "info:" message appended."""
+    A TT_FATAL/TT_THROW header line gets its "info:" message appended.
+
+    Past a ``TOPOLOGY MISMATCH`` marker only the output after it is read: the descriptor run's
+    ``Connection mismatch detected`` above it is what the wrapper already downgraded and reran
+    without, so it is never why the run that followed failed (spec 03 I55)."""
+    marker = _TOPOLOGY_MARKER.search(output)
+    if marker:
+        output = output[marker.end() :]
     for pat in _REASON_PATTERNS:
         m = pat.search(output)
         if m:
