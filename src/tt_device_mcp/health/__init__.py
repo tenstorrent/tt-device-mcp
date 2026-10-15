@@ -51,10 +51,13 @@ from tt_device_mcp.health.monitors import eth, fabric
 # counts, the dead-chip sampler, the startup probe) — not merely bounced into RecoveryDeps.
 from tt_device_mcp.health.monitors.heartbeat import (
     ALL_ONES,
+    arc_not_ready_chips,
     dead_chips,
     heartbeat_supported,
     heartbeat_verdict,
+    offbus_count,
     read_heartbeats,
+    returned_chips,
 )
 
 # The host-software version floors the startup preflight reports. Sysfs reads only, so the
@@ -164,6 +167,9 @@ __all__ = [
     "fabric",
     "ALL_ONES",
     "dead_chips",
+    "arc_not_ready_chips",
+    "offbus_count",
+    "returned_chips",
     "heartbeat_supported",
     "heartbeat_verdict",
     "read_heartbeats",

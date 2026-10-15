@@ -22,7 +22,7 @@ from tt_device_mcp import alert, metrics, privileges
 from tt_device_mcp.device_holders import is_tenant
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
-from tt_device_mcp.health.monitors.heartbeat import dead_chips
+from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count
 from tt_device_mcp.health.monitors.pci import chip_node_present, pci_bus_number
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
@@ -44,7 +44,7 @@ from tt_device_mcp.health.recovery import (
     offbus_power_cycle,
     pcie_guard,
 )
-from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC, refuse_mesh_reset
+from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC, drop_returned_isolated, refuse_mesh_reset
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
@@ -734,11 +734,12 @@ def _tray_label(tray: int, tray_map: dict) -> str:
 
 def _offbus_chip_ids(beats: dict, expected: int) -> set:
     """The index set of chips off the PCIe bus: every expected chip id that is missing from the
-    heartbeat read (its node left the bus) or present but reading all-ones. Its cardinality matches
-    the off_bus count the rungs use (``len(dead_chips) + max(0, expected - len(beats))``); the id
-    SET is what a rung needs to map a drop onto physical trays."""
-    missing = {str(i) for i in range(expected)} - set(beats)
-    return set(dead_chips(beats)) | missing
+    heartbeat read (its node left the bus) or present but reading all-ones. A chip missing only
+    because its ARC is not ready (ENODATA on a bound endpoint) is on the bus and not in it, so no
+    tray or bridge rung is planned around it (spec 04 I24). Its cardinality matches the off_bus
+    count the rungs use (:func:`offbus_count`); the id SET is what a rung needs to map a drop onto
+    physical trays."""
+    return offbus_chip_ids(beats, expected)
 
 
 def _offbus_ids_on_trays(offbus_chips: set, expected: int, tray_map: Optional[dict]) -> Optional[set]:
@@ -1375,6 +1376,7 @@ class GalaxyRecovery(Recovery):
             await asyncio.sleep(max(0.0, TRAY_DOWN_RESCAN_SETTLE_SEC - (time.monotonic() - t0)))
             beats = await asyncio.to_thread(self.deps.read_heartbeats)
             off = sorted(int(c) for c in _offbus_chip_ids(beats or {}, expected))
+            await asyncio.to_thread(drop_returned_isolated, self.deps.isolated_chips(), "tray-down PCI rescan", log)
             if not off:
                 healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=phase)
                 FABRIC_DEBT.note_evidence(evidence)
@@ -1774,7 +1776,7 @@ class GalaxyRecovery(Recovery):
         if not _stuck_hold_reset_enabled() and not force:
             return False
         beats = await asyncio.to_thread(self.deps.read_heartbeats)
-        off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+        off_bus = offbus_count(beats, expected)
         hold_since = self.deps.device_hold_episode_since()
         if not force and not _stuck_hold_reset_due(hold_since, off_bus=off_bus):
             return False
@@ -1814,7 +1816,7 @@ class GalaxyRecovery(Recovery):
         # mesh (dropped more chips off the bus) from one that merely did not recover — the former needs
         # the cold rung, not a warm reboot that cannot re-enumerate the dropped ASICs.
         beats_before = await asyncio.to_thread(self.deps.read_heartbeats)
-        off_bus_before = len(dead_chips(beats_before)) + max(0, expected - len(beats_before))
+        off_bus_before = offbus_count(beats_before, expected)
         if hold_since and self.mechanism.unverified_reset_since == hold_since:
             # This episode's reset already came back UNKNOWN (enum+ARC healthy, the fabric a persistent
             # 77) and the I40 fallback still refused, so it escalated again. Another identical reset
@@ -1944,7 +1946,7 @@ class GalaxyRecovery(Recovery):
         # take other trays off the bus (or the box can come back on its own) between the caller's read
         # and here. A box with nothing off the bus any more needs no cycle.
         beats = await asyncio.to_thread(self.deps.read_heartbeats)
-        off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+        off_bus = offbus_count(beats, expected)
         if off_bus <= 0:
             log("off-bus hold: every chip is back on the bus — no power cycle")
             health_event("offbus_gated_hold", phase="back_on_bus", held_since=hold_since)
@@ -2043,7 +2045,7 @@ class GalaxyRecovery(Recovery):
         if not _offbus_hold_escalate_enabled() and not force:
             return False
         beats = await asyncio.to_thread(self.deps.read_heartbeats)
-        off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+        off_bus = offbus_count(beats, expected)
         hold_since = self.deps.device_hold_episode_since()
         if not force and not _offbus_stuck_hold_due(hold_since, off_bus=off_bus):
             return False
@@ -2138,7 +2140,7 @@ class GalaxyRecovery(Recovery):
                         for c in sorted(candidates - set(beats_b), key=int)
                         if not await asyncio.to_thread(chip_node_present, device_pci_map[c])
                     ]
-                    off_bus_gone = len(dead_chips(beats_b)) + max(0, expected - len(beats_b))
+                    off_bus_gone = offbus_count(beats_b, expected)
                     floor_gone = _galaxy_reset_min_dead_chips(expected)
                     if gone and floor_gone is not None and off_bus_gone < floor_gone:
                         log(
@@ -2189,7 +2191,7 @@ class GalaxyRecovery(Recovery):
         off_bus_before = None
         if reset_floor is not None and not await asyncio.to_thread(self.mechanism.scope_active):
             beats_pre = await asyncio.to_thread(self.deps.read_heartbeats)
-            off_bus_pre = len(dead_chips(beats_pre)) + max(0, expected - len(beats_pre))
+            off_bus_pre = offbus_count(beats_pre, expected)
             if off_bus_pre < reset_floor:
                 # A below-floor drop confined to whole UBB trays is a tray-down: the per-tray BMC reset
                 # is the lightest sufficient recovery. Opted in, it fires here — between the per-chip bridge
@@ -2259,7 +2261,7 @@ class GalaxyRecovery(Recovery):
             # The floor read above did not run (floor opted out, or a reset was cycling), so take a
             # pre-reset baseline here — the climb needs it to catch a reset that regresses the mesh.
             beats_before = await asyncio.to_thread(self.deps.read_heartbeats)
-            off_bus_before = len(dead_chips(beats_before)) + max(0, expected - len(beats_before))
+            off_bus_before = offbus_count(beats_before, expected)
         recovered = await self._reset_and_verify_device(indices, log)
         if recovered is None:
             # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, which the
@@ -2381,7 +2383,7 @@ class GalaxyRecovery(Recovery):
         # hold with nothing left to re-attempt it.
         hold_since = self.deps.device_hold_episode_since()
         beats = await asyncio.to_thread(self.deps.read_heartbeats)
-        off_bus = len(dead_chips(beats)) + max(0, expected - len(beats))
+        off_bus = offbus_count(beats, expected)
         # A reset that made the mesh WORSE off the bus (the incident's 8->32), or that hard-exited
         # leaving chips off it, cannot be undone by a warm reboot — a 6U-Galaxy reboot does not
         # power-cycle the UBBs, so a dropped ASIC stays off across it. Route such a reset to the cold
@@ -2821,6 +2823,10 @@ class GalaxyRecovery(Recovery):
                 # verify just moves the walk to the next tray, exactly like an off-bus one that did not
                 # come back. The rescan first: a chip removed from the kernel only returns on one.
                 await _rescan_after_tray_step(tray, log)
+                # Whatever the verify says, a chip this re-power brought back is no longer isolated.
+                await asyncio.to_thread(
+                    drop_returned_isolated, self.deps.isolated_chips(), f"tray {tray} re-power", log
+                )
                 healthy, _evidence, _retries = await self._verify_device_after_reset(expected, log)
                 if healthy:
                     health_event("ubb_reset_recovered", tray=tray, walked=step + 1)
