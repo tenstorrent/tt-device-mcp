@@ -283,6 +283,12 @@ async def test_rest_submit_carries_the_option_into_the_job_and_its_log(monkeypat
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     monkeypatch.setattr(srv, "get_activation_script", lambda *a, **k: ("", {}))
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    # The option is recorded at submit time; nothing here needs the job to run. A real runner
+    # would spawn it on the TestClient's loop and die with that loop, leaving current_process
+    # set for later tests (and the job's process orphaned), so the runner stays idle.
+    monkeypatch.setattr(srv, "job_runner_task", None)
+    monkeypatch.setattr(srv, "job_runner", lambda: asyncio.Event().wait())
     app = srv.build_asgi_app(srv.create_mcp_server())
 
     from starlette.testclient import TestClient
