@@ -8590,7 +8590,7 @@ async def test_idle_relift_lifts_an_off_bus_floor_hold_without_the_eth_reader(mo
     a floor-hold on a box with no eth reader never reopens — the stuck-hold the reset floor depends
     on the relift to avoid. Fails on base, where the relift demands eok is True and None never lifts.
 
-    The lift itself waits for the full health gate, fabric included (spec 03 I50): the chip came back
+    The lift itself waits for the full health gate, fabric included (spec 03 I52): the chip came back
     through a reset of some kind, and no reset path reopens the door before that gate passes."""
     _setup_selfheal_hold(monkeypatch, tmp_path)
     fsm_dirty(srv, "gate/post-job: 3/32 off-bus below the reset floor — held, not reset", why="off_bus")
@@ -8619,7 +8619,7 @@ async def test_idle_relift_lifts_an_off_bus_floor_hold_without_the_eth_reader(mo
 async def test_idle_relift_holds_an_off_bus_hold_until_the_fabric_passes(
     monkeypatch, tmp_path, clear_job_state, fabric_ok
 ):
-    """Spec 03 I50: an off-bus chip back on the bus and ARC-healthy, with no fabric failure on record,
+    """Spec 03 I52: an off-bus chip back on the bus and ARC-healthy, with no fabric failure on record,
     still holds when the full gate's fabric pass could not verify (77) or failed. Fails on base, which
     lifted on enum+ARC without running the fabric pass."""
     _setup_selfheal_hold(monkeypatch, tmp_path)
@@ -8679,7 +8679,7 @@ def _recording_verify(monkeypatch, fabric_ok):
 async def test_a_down_offbus_hold_lifts_once_every_chip_is_back_and_the_full_gate_passes(
     monkeypatch, tmp_path, clear_job_state, why
 ):
-    """Spec 03 I50: DOWN is the terminal rung, but a chip that came back (a tray re-powered by an
+    """Spec 03 I52: DOWN is the terminal rung, but a chip that came back (a tray re-powered by an
     operator, a driver rescan) leaves it nothing to wait on. Once every device node is back the full
     gate runs, fabric included, and the episode lifts only on its pass. Fails on base, where nothing
     re-checks a DOWN episode within a boot."""
@@ -8699,7 +8699,7 @@ async def test_a_down_offbus_hold_lifts_once_every_chip_is_back_and_the_full_gat
 async def test_a_down_offbus_hold_stays_down_unless_the_fabric_passes(
     monkeypatch, tmp_path, clear_job_state, fabric_ok
 ):
-    """Spec 03 I50 and goal of the full gate: a fabric pass that could not run (None) or failed (False)
+    """Spec 03 I52 and goal of the full gate: a fabric pass that could not run (None) or failed (False)
     is no proof, so the DOWN episode stands, with no reset, and the next tick re-checks."""
     _setup_down_offbus(monkeypatch, tmp_path)
     calls = _recording_verify(monkeypatch, fabric_ok)
@@ -8713,7 +8713,7 @@ async def test_a_down_offbus_hold_stays_down_unless_the_fabric_passes(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["chip short", "all-ones heartbeat", "hugepages short"])
 async def test_a_down_offbus_hold_runs_no_gate_until_every_chip_is_back(monkeypatch, tmp_path, clear_job_state, case):
-    """Spec 03 I50: no gate runs while a device node is missing or a chip still in sysfs reads
+    """Spec 03 I52: no gate runs while a device node is missing or a chip still in sysfs reads
     all-ones (it has not come back), nor before the 1G hugepages exist (the pass could only 77)."""
     _setup_down_offbus(monkeypatch, tmp_path, n_present=31 if case == "chip short" else 32)
     if case == "all-ones heartbeat":

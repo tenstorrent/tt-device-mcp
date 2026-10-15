@@ -134,6 +134,62 @@ def _forget_topology_mismatch() -> None:
         pass
 
 
+# Written when a fabric check starts and removed when it returns, so a broker that is stopped or
+# killed mid-check (systemd SIGTERMs the unit's cgroup, the validator with it, and SIGKILLs it at
+# the stop timeout) leaves a mark the next startup journals as `fabric_check_interrupted`.
+FABRIC_INFLIGHT_FILE = "fabric_check_inflight.json"
+
+
+def _read_boot_id() -> str:
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _fabric_inflight_begin(cmd: str) -> None:
+    _write_json(FABRIC_INFLIGHT_FILE, {"ts": time.time(), "pid": os.getpid(), "boot_id": _read_boot_id(), "cmd": cmd})
+
+
+def _fabric_inflight_end() -> None:
+    try:
+        (health_dir() / FABRIC_INFLIGHT_FILE).unlink()
+    except OSError:
+        pass
+
+
+def _journal_fabric_interrupted(rec: dict, how: str) -> dict:
+    started = rec.get("ts")
+    boot = rec.get("boot_id") or ""
+    now_boot = _read_boot_id()
+    event = {
+        "how": how,
+        "started": started,
+        "ran_s": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,
+        "broker_pid": rec.get("pid"),
+        "same_boot": (boot == now_boot) if boot and now_boot else None,
+        "cmd": str(rec.get("cmd", ""))[:400],
+    }
+    health_event("fabric_check_interrupted", **event)
+    return event
+
+
+def journal_interrupted_fabric_check() -> Optional[dict]:
+    """At startup, before any pass: a fabric check the previous broker left in flight was cut off
+    by its stop, kill or the host going down. Journal it once and clear the mark. Nothing is
+    trusted from it: the startup gate runs its own full pass regardless (03 I4)."""
+    p = health_dir() / FABRIC_INFLIGHT_FILE
+    try:
+        rec = json.loads(p.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        rec = {}
+    _fabric_inflight_end()
+    return _journal_fabric_interrupted(rec if isinstance(rec, dict) else {}, "broker_stopped")
+
+
 def _cached_topology_mismatch(desc: str) -> Optional[str]:
     """The cached mismatch marker when it was seen with this descriptor on this chip-to-bus map."""
     try:
@@ -865,7 +921,18 @@ class HealthMonitor:
         Wrapped by a thin timer that reports the "fabric" probe metric — the pass whose duration
         is the one worth alerting on, since it is the closest to its own timeout of the four."""
         _t0 = time.monotonic()
-        ok, detail = await self._verify_fabric_health_body(timeout_sec)
+        _fabric_inflight_begin(self._fabric_check_cmd() or "built-in")
+        try:
+            ok, detail = await self._verify_fabric_health_body(timeout_sec)
+        except asyncio.CancelledError:
+            # Cancelled under us (a shutdown that unwinds the loop): say so now, the mark goes.
+            _journal_fabric_interrupted(
+                {"ts": time.time() - (time.monotonic() - _t0), "pid": os.getpid(), "boot_id": _read_boot_id()},
+                "cancelled",
+            )
+            raise
+        finally:
+            _fabric_inflight_end()
         metrics.probe_observed("fabric", _verdict_label(ok), time.monotonic() - _t0)
         return ok, detail
 

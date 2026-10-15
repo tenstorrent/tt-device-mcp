@@ -134,6 +134,7 @@ from tt_device_mcp.health import (
     heartbeat_supported,
     heartbeat_verdict,
     isolate_chip,
+    journal_interrupted_fabric_check,
     mark_boot,
     mesh_hold_repage_sec,
     offbus_power_cycle,
@@ -3907,7 +3908,7 @@ async def _attempt_idle_relift() -> None:
                     # The chip is back, the eth reader is not frozen and the last verdict was not a
                     # failure: none of that is the gate. A chip that left the bus came back through a
                     # reset of some kind (its own, a tray's, the driver's), so the lift waits for the
-                    # full health gate, fabric included, exactly as after any reset (spec 03 I50).
+                    # full health gate, fabric included, exactly as after any reset (spec 03 I52).
                     # A per-user daemon has no staged fabric validator, so no pass of its could ever
                     # read True; its start-probe hold (also off_bus) lifts on the enum+ARC re-read.
                     if should_privsep():
@@ -3938,14 +3939,14 @@ async def _attempt_idle_relift() -> None:
 
 
 # Why classes a chip leaving the bus puts on the device: the gate's off-bus hold, and the sampler's
-# dead-chip mark (_isolate_dead_chips). Both are re-checked once every chip is back (spec 03 I50).
+# dead-chip mark (_isolate_dead_chips). Both are re-checked once every chip is back (spec 03 I52).
 OFFBUS_RECHECK_WHYS = frozenset({"off_bus", "heartbeat"})
 # Monotonic time of the last DOWN off-bus re-check; paced like the relift (SELFHEAL_RELIFT_INTERVAL_SEC).
 _down_offbus_recheck_monotonic: float = 0.0
 
 
 async def _offbus_return_full_gate(expected: int, log: Callable[[str], None]) -> tuple[bool, dict]:
-    """The full health gate, fabric included, for a mesh whose dropped chips are back (spec 03 I50).
+    """The full health gate, fabric included, for a mesh whose dropped chips are back (spec 03 I52).
     ``(True, evidence)`` only when enum+ARC pass AND the fabric pass returns an explicit healthy
     verdict: a 77 (``ok`` None) or a failure holds. A pass before the 1G hugepages exist can only 77,
     so it waits for the count first and holds without running."""
@@ -3967,7 +3968,7 @@ async def _offbus_return_full_gate(expected: int, log: Callable[[str], None]) ->
 def _down_offbus_recheck_armed() -> bool:
     """A DOWN episode placed for a chip off the bus, with every expected device node back. DOWN is
     the terminal rung and runs no further reset, but chips that came back (a tray re-powered by an
-    operator, a driver rescan) leave nothing for it to wait on: the full gate decides (spec 03 I50)."""
+    operator, a driver rescan) leave nothing for it to wait on: the full gate decides (spec 03 I52)."""
     if fsm.state is not ServerState.DOWN or fsm.record.why not in OFFBUS_RECHECK_WHYS:
         return False
     if not should_privsep():
@@ -9346,6 +9347,10 @@ async def run_startup_tasks() -> None:
     if _startup_tasks_done:
         return
     _startup_tasks_done = True
+    # A fabric check the last broker had in flight was cut off by its stop: journal it, once.
+    interrupted = journal_interrupted_fabric_check()
+    if interrupted and logger:
+        logger.warning(f"STARTUP the previous broker stopped mid fabric check: {interrupted}")
     if not should_privsep():
         # No re-adoption sequence for a per-user daemon or a test harness, and — matching that
         # same narrower scope — no forced fabric verify either: this shape has no validator to run
@@ -11310,12 +11315,34 @@ def build_asgi_app(mcp: MCPServer):
 # every WATCHDOG=1 ping, so an unbounded log would flood at the ping interval.
 _sd_notify_errors_logged: set = set()
 
+# The unit says NotifyAccess=main: systemd drops (and logs) a notification from any other pid.
+# The broker's own pid is fixed when it claims the socket at startup; _sd_notify_claim also takes
+# NOTIFY_SOCKET out of the environment so no job, fabric check or tool it spawns inherits it.
+_sd_notify_main_pid: int = os.getpid()
+_sd_notify_addr: str = ""
+
+
+def _sd_notify_claim() -> None:
+    """Called once by the broker process before it spawns anything: remember $NOTIFY_SOCKET and
+    this pid, then drop the variable so children cannot notify as if they were the broker."""
+    global _sd_notify_main_pid, _sd_notify_addr
+    _sd_notify_main_pid = os.getpid()
+    _sd_notify_addr = os.environ.pop("NOTIFY_SOCKET", "") or _sd_notify_addr
+
 
 def _sd_notify(state: str) -> None:
     """Send a notification to systemd via $NOTIFY_SOCKET. No-op when not run under
-    systemd Type=notify. Used for readiness and the watchdog heartbeat."""
-    addr = os.environ.get("NOTIFY_SOCKET")
+    systemd Type=notify. Used for readiness and the watchdog heartbeat. Only the broker's
+    main pid sends: a forked child is refused here, not by systemd's NotifyAccess=main."""
+    addr = os.environ.get("NOTIFY_SOCKET") or _sd_notify_addr
     if not addr:
+        return
+    if os.getpid() != _sd_notify_main_pid:
+        kind = state.split("=", 1)[0]
+        if f"pid:{kind}" not in _sd_notify_errors_logged:
+            _sd_notify_errors_logged.add(f"pid:{kind}")
+            if logger:
+                logger.warning(f"systemd notify {kind} refused from pid {os.getpid()}: only the main pid notifies")
         return
     if addr.startswith("@"):  # abstract namespace
         addr = "\0" + addr[1:]
@@ -11738,6 +11765,9 @@ def main():
 
     if args.no_http and not socket_path:
         parser.error("--no-http requires --socket (or TT_DEVICE_MCP_SOCKET)")
+
+    # Before the first spawn (the platform probe below): only this pid may notify systemd.
+    _sd_notify_claim()
 
     # The boot flow, before anything that reads the subsystem it builds: construct, then resolve
     # which platform this host IS. Preflight below reports capabilities per rung, and the rungs a
