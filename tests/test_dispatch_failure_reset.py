@@ -250,3 +250,33 @@ async def test_a_uid0_telemetry_holder_does_not_block_the_reset(monkeypatch, mes
     await _gate()
     assert mesh["resets"] == [["tt-smi", "-glx_reset"]]
     assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_frozen_chip_outage_hold_does_not_claim_a_reset_ran(monkeypatch, mesh):
+    """An ARC-frozen chip under the outage hold: no reset ran, so the hold must not say one did."""
+    for var, value in OUTAGE_HOLD.items():
+        monkeypatch.setenv(var, value)
+    tick = {"n": 0}
+
+    def beats():
+        tick["n"] += 1
+        return {str(i): (100 if i == 5 else 100 + tick["n"]) for i in range(CHIPS)}
+
+    monkeypatch.setattr(srv, "read_heartbeats", beats)
+    await _gate()
+    assert mesh["resets"] == [] and srv._dispatch_reset_spent is False
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert "already ran" not in srv.fsm.record.detail
+
+
+@pytest.mark.asyncio
+async def test_gate_refused_reset_leaves_the_latch_unspent(monkeypatch, mesh):
+    """The per-host gate refuses the reset: nothing started, so the episode's reset is not used up
+    and the device stays held (never released without a passing check)."""
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (False, "gate says no"))
+    await _gate()
+    assert mesh["resets"] == []
+    assert srv._dispatch_reset_spent is False, "a gate-refused reset is not spent"
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert "already ran" not in srv.fsm.record.detail

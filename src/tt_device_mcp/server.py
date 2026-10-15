@@ -5593,10 +5593,16 @@ async def device_health_gate(
                     f"{expected} chips on the bus) — its present-mesh reset is HELD "
                     f"({mesh_reset_hold_reason()}); an operator must reset or lift the hold"
                 )
-            elif dispatch_failed and ev.off_bus == 0:
+            elif dispatch_failed and ev.off_bus == 0 and _dispatch_reset_spent:
                 why = (
                     f"gate/{phase}: dispatch failed on a green fabric over a present mesh (all "
                     f"{expected} chips on the bus) — held; this episode's present-mesh reset already ran"
+                )
+            elif dispatch_failed and ev.off_bus == 0:
+                why = (
+                    f"gate/{phase}: dispatch failed on a green fabric over a present mesh (all "
+                    f"{expected} chips on the bus, {ev.frozen_chips} ARC-frozen) — held; no present-mesh "
+                    f"reset has run this episode"
                 )
             elif ev.off_bus == 0:
                 why = (
@@ -5614,7 +5620,6 @@ async def device_health_gate(
 
         _log("device needs reset — " + "; ".join(reasons))
         if ev.dispatch_reset_due and stage == STAGE_SMI_RESET:
-            _dispatch_reset_spent = True
             _log(
                 f"dispatch failed on a green fabric with all {expected} chips present — one "
                 f"present-mesh reset this hold episode, then the full check (fabric included)"
@@ -5637,8 +5642,19 @@ async def device_health_gate(
             )
             health_event("galaxy_reset_skipped_regressed", phase=phase, off_bus=ev.off_bus)
             metrics.stage_fired("smi_reset", "blocked")
-        elif await _fire(stage):
-            return
+        else:
+            reset_clock = recovery_mechanism.last_reset_monotonic
+            recovered = await _fire(stage)
+            # The latch is spent only once a reset actually started (the clock moves at reset begin):
+            # one the per-host gate or the outage hold refused leaves the episode's reset unspent.
+            if (
+                ev.dispatch_reset_due
+                and stage == STAGE_SMI_RESET
+                and recovery_mechanism.last_reset_monotonic != reset_clock
+            ):
+                _dispatch_reset_spent = True
+            if recovered:
+                return
 
         # Last rungs: the reset did not bring the mesh back. The host-level escalations — a warm
         # reboot, then a BMC power cycle above it — are the highest-risk actions here: each takes
