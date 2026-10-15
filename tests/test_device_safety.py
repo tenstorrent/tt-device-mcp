@@ -4174,7 +4174,7 @@ async def test_the_default_off_cooldown_never_delays_a_job(monkeypatch, clear_jo
 
 # --- per-owner submission burst cap ------------------------------------------
 #
-# The incident's LTX vbench sweep queued ten 32-chip jobs in ~90s — one every ~11s — then drained
+# The incident's benchmark sweep queued ten 32-chip jobs in ~90s — one every ~11s — then drained
 # them back-to-back with no idle, which is what walked a tray off the bus. The cap refuses a burst
 # at SUBMISSION, before it fills the queue, keyed per owner so one tenant's sweep cannot flood the
 # shared device. Off by default; an armed host trades a tenant's submission rate for mesh headroom.

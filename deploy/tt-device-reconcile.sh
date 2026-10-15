@@ -76,7 +76,7 @@ if [ -S "$SOCK" ] && [ "$(stat -c %a "$SOCK" 2>/dev/null)" != "666" ]; then
 fi
 
 # 3) System CLI symlink points at the broker venv. Must be on PATH so both the
-#    human CLI and the tt-buddy plugin's bare `tt-device-mcp` command resolve.
+#    human CLI and an agent plugin's bare `tt-device-mcp` command resolve.
 t="$R/venv/bin/tt-device-mcp"
 if [ -x "$t" ] && [ "$(readlink -f /usr/local/bin/tt-device-mcp 2>/dev/null)" != "$(readlink -f "$t" 2>/dev/null)" ]; then
     echo "reconcile: repointing /usr/local/bin/tt-device-mcp -> $t" >&2
