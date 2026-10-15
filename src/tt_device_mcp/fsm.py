@@ -298,6 +298,7 @@ class ServerFsm:
         run_fabric: bool = True,
         run_eth: bool = False,
         fabric_stale: bool = True,
+        eth_timeout_reset: bool = False,
         recovery: "Optional[Recovery]" = None,
     ) -> tuple[bool, dict]:
         """Trigger one probe pass of the system — the root's read of the mesh, routed through the
@@ -311,11 +312,13 @@ class ServerFsm:
         that pass on the same choice; omitted, the platform is selected fresh. ``run_eth`` asks for
         the passive eth read without the traffic pass (spec 03 I30); it and ``fabric_stale`` (may a
         link-drop skip of that read buy the traffic pass) are passed on only when ``run_eth`` is
-        set, so a ``_verify_device`` test fake that predates them keeps its signature."""
+        set, so a ``_verify_device`` test fake that predates them keeps its signature.
+        ``eth_timeout_reset`` (spec 03 I56) is passed on only when set, for the same reason."""
         r = recovery if recovery is not None else self.select_recovery()
         if run_eth:
+            extra = {"eth_timeout_reset": True} if eth_timeout_reset else {}
             healthy, evidence = await r._verify_device(
-                expected, log, run_fabric=run_fabric, phase=phase, run_eth=True, fabric_stale=fabric_stale
+                expected, log, run_fabric=run_fabric, phase=phase, run_eth=True, fabric_stale=fabric_stale, **extra
             )
         else:
             healthy, evidence = await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase)

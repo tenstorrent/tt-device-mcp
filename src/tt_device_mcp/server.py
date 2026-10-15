@@ -136,6 +136,7 @@ from tt_device_mcp.health import (
     heartbeat_supported,
     heartbeat_verdict,
     isolate_chip,
+    eth_read_timed_out,
     journal_interrupted_fabric_check,
     mark_boot,
     mesh_hold_repage_sec,
@@ -3588,6 +3589,19 @@ def _names_topology_mismatch(text: str) -> bool:
     return text.startswith(_TOPOLOGY_HOLD) or _TOPOLOGY_HW_FAULT in text or _TOPOLOGY_VALIDATOR_LINE in text
 
 
+def _eth_timeout_reset_shape(evidence: dict) -> bool:
+    """Whether a probe pass took the spec 03 I56 skip: its eth read timed out with no verdict, host-pci
+    and the snapshot were OK, and no fabric pass ran. Any other shape keeps today's path."""
+    eth_ev = evidence.get("eth_heartbeat") or {}
+    return (
+        eth_ev.get("ok") is None
+        and eth_read_timed_out(str(eth_ev.get("detail") or ""))
+        and (evidence.get("hostpci") or {}).get("ok") is True
+        and (evidence.get("snapshot") or {}).get("ok") is True
+        and "fabric" not in evidence
+    )
+
+
 def _validator_line_names_topology(output: str) -> bool:
     """The validator's mismatch line in the last fabric output, unless the dispatch probe after it
     failed: then the wrapper's verdict is the dispatch failure (spec 04 I30)."""
@@ -5150,12 +5164,27 @@ async def device_health_gate(
         # post-step is the same exit seen from outside the broker, and its worst case (the read, then
         # the bounded pass) is what a failed step already pays inside the same step deadline.
         run_eth = with_recover and phase in ("post-job", "post-step") and not full and eth_check_armed
+        # Spec 03 I56: on a clean post-job exit this episode's one present-mesh reset is still
+        # grantable, so a timed-out eth read may skip the pre-reset fabric pass and reset instead.
+        # Each guard here is one a reset would otherwise trip on; any that fails keeps today's pass.
+        eth_timeout_reset = (
+            run_eth
+            and phase == "post-job"
+            and expected > 1
+            and not dirty
+            and not device_fault_reported
+            and not isolated_chips
+            and not _dispatch_reset_spent
+            and not mesh_reset_hold_reason()
+            and not recovery_mechanism.cooling()
+        )
         healthy, evidence = await fsm.observe(
             expected,
             _log,
             run_fabric=full,
             run_eth=run_eth,
             fabric_stale=stale or skip_forced or relax_exit1,
+            eth_timeout_reset=eth_timeout_reset,
             phase=phase,
             recovery=recovery,
         )
@@ -5167,6 +5196,17 @@ async def device_health_gate(
             last_fabric_ok_monotonic = time.monotonic()
         elif fabric_ok is False:
             last_fabric_ok_monotonic = 0.0
+        # The probe pass took the I56 skip: the read timed out, host-pci and the snapshot (every chip,
+        # ARC healthy) were OK, and no fabric pass ran. The mesh is not proven, so it is not healthy.
+        eth_timeout_due = eth_timeout_reset and healthy and _eth_timeout_reset_shape(evidence)
+        if eth_timeout_due:
+            healthy = False
+            eth_reason = str((evidence.get("eth_heartbeat") or {}).get("detail") or "")
+            _log(
+                f"eth-heartbeat timed out after a clean exit with all {expected} chips present, host-pci OK "
+                f"and ARC healthy ({eth_reason}) — one present-mesh reset, then the full check"
+            )
+            health_event("eth_timeout_mesh_reset", phase=phase, expected=expected, eth=eth_reason[:200])
         if relax_exit1 and healthy and fabric_ok is None:
             # Worded so nothing reads it as a fabric verdict: no pass ran, so it is neither an OK nor
             # an exit-77 skip.
@@ -5202,7 +5242,7 @@ async def device_health_gate(
         if not healthy or dirty:
             bundle = await asyncio.to_thread(
                 capture_incident,
-                "unhealthy" if not healthy else "dirty",
+                "eth_timeout" if eth_timeout_due else "unhealthy" if not healthy else "dirty",
                 job=dirty_job,
                 job_log=job_log_file,
                 trace=list(sampler.ring),
@@ -5411,7 +5451,9 @@ async def device_health_gate(
                 _note_tenant_gate_verdict(f"device unverified: gate/{phase}: reset cooldown active ({int(left)}s left)")
             return
 
-        reasons = ["failed health check"] if not healthy else []
+        reasons = ["failed health check"] if not healthy and not eth_timeout_due else []
+        if eth_timeout_due:
+            reasons.append("eth-heartbeat read timed out after a clean exit")
         if device_fault_reported:
             # Say what actually brought us here. Every check passed; the runtime disagreed.
             reasons.append(f"runtime reported: {device_fault_reported}")
@@ -5481,6 +5523,9 @@ async def device_health_gate(
         dispatch_failed = fabric_ok is False and fabric.names_dispatch_failure(health_monitor.last_fabric_output or "")
         if dispatch_failed and not _dispatch_reset_spent and not mesh_reset_hold_reason():
             ev = replace(ev, dispatch_reset_due=True)
+        # Spec 03 I56: the same one reset, shared latch, for a clean exit's timed-out eth read.
+        if eth_timeout_due and not _dispatch_reset_spent and not mesh_reset_hold_reason():
+            ev = replace(ev, eth_timeout_reset_due=True)
         stage = galaxy_recovery.next_stage(ev)
 
         async def _fire(rung: str) -> bool:
@@ -5648,7 +5693,7 @@ async def device_health_gate(
             # The latch is spent only once a reset actually started (the clock moves at reset begin):
             # one the per-host gate or the outage hold refused leaves the episode's reset unspent.
             if (
-                ev.dispatch_reset_due
+                (ev.dispatch_reset_due or ev.eth_timeout_reset_due)
                 and stage == STAGE_SMI_RESET
                 and recovery_mechanism.last_reset_monotonic != reset_clock
             ):
@@ -6031,6 +6076,9 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         health_event("device_held", reason=reason)
     elif not reason and not device_hold_logged:
         _forget_stale_hold_episode()
+        # No episode is open: a reset spent by a gate that then released without ever holding (the
+        # I56 eth-timeout reset on a clean exit) must not starve the next episode of its own.
+        _dispatch_reset_spent = False
     elif not reason and device_hold_logged:
         device_hold_logged = False
         health_event("device_released")

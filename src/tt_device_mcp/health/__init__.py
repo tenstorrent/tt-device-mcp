@@ -39,7 +39,7 @@ from tt_device_mcp.health.evidence import (
     previous_boot_error,
     read_health_events,
 )
-from tt_device_mcp.health.monitor import HealthMonitor, journal_interrupted_fabric_check
+from tt_device_mcp.health.monitor import HealthMonitor, eth_read_timed_out, journal_interrupted_fabric_check
 
 # The fabric probe module itself, not a wrapping function: server.py's own preflight check reads
 # fabric.build_command() directly to warn when no fabric check is configured OR installed, and a
@@ -143,6 +143,7 @@ __all__ = [
     # construction pieces ServerFsm.boot assembles into the process singletons
     "HealthMonitor",
     "journal_interrupted_fabric_check",
+    "eth_read_timed_out",  # spec 03 I56: the stuck eth read the post-job present-mesh reset answers
     "RecoveryMechanism",
     "RecoveryDeps",
     "GalaxyRecovery",
