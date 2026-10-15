@@ -42,6 +42,7 @@ from tt_device_mcp.constants import (
     POST_STEP_DEADLINE_ENV,
     PRE_STEP_DEADLINE_DEFAULT_SEC,
     PRE_STEP_DEADLINE_ENV,
+    PREEMPT_GRACE_SEC,
     resolve_socket,
     step_client_timeout_sec,
     user_state_dir,
@@ -326,6 +327,7 @@ def cmd_run(args) -> int:
             "env": env_file,
             "inherited_env": inherited_env,
             "timeout_sec": timeout,
+            "preemptable": bool(getattr(args, "preemptable", False)),
         },
     )
 
@@ -411,6 +413,7 @@ def cmd_run_bg(args) -> int:
             "env": env_file,
             "inherited_env": inherited_env,
             "timeout_sec": timeout,
+            "preemptable": bool(getattr(args, "preemptable", False)),
         },
     )
 
@@ -730,6 +733,8 @@ def overview_lines(running, queued, rjobs, color: bool = False) -> list:
             jid = job.get("id", "?")[:10]
             icon, owner = _fmt_owner(job.get("owner", "?"))
             cmd = job.get("command", "?")[:80]
+            if job.get("preempt"):
+                cmd = f"[{job['preempt']}] {cmd}"
             runtime = "..."
             started = job.get("started_at")
             if started:
@@ -795,7 +800,7 @@ def cmd_status(args) -> int:
 
         print(f"Job:     {result['job_id']}")
         print(f"Owner:   {result.get('owner', '?')}")
-        print(f"Status:  {result['status']}")
+        print(f"Status:  {result['status']}" + (f"  [{result['preempt']}]" if result.get("preempt") else ""))
         if result.get("cause"):
             print(f"Cause:   {result['cause']}")
         print(f"Command: {result.get('command', '?')}")
@@ -1200,6 +1205,8 @@ def _wait_and_stream(
                 print(f"Runtime: {result['runtime_sec']:.1f}s")
             if result["status"] == "timeout" and result.get("hint"):
                 print(f"\n!! TIMED OUT after {result.get('timeout_sec')}s !!\n{result['hint']}")
+            if result["status"] == "preempted":
+                print(f"\n!! PREEMPTED: another job was waiting past the {result.get('timeout_sec')}s soft limit !!")
 
             # Show last N lines summary if requested
             if output_lines > 0 and all_output:
@@ -1692,6 +1699,14 @@ Examples:
     run_parser.add_argument("-e", "--env", help="Env file path")
     run_parser.add_argument("-t", "--timeout", type=int, default=600, help="Timeout in seconds")
     run_parser.add_argument(
+        "--preemptable",
+        action="store_true",
+        help=(
+            f"PREEMPTABLE: -t becomes a soft limit; past it the job runs on until another job is "
+            f"queued, then is stopped and SIGKILLed {PREEMPT_GRACE_SEC}s later. Watch the broker."
+        ),
+    )
+    run_parser.add_argument(
         "-o", "--output-lines", type=int, default=0, help="Show last N lines summary at end (default: 0 = no summary)"
     )
 
@@ -1715,6 +1730,14 @@ Examples:
     run_bg_parser.add_argument("-w", "--workspace", help="Workspace path (default: cwd)")
     run_bg_parser.add_argument("-e", "--env", help="Env file path")
     run_bg_parser.add_argument("-t", "--timeout", type=int, default=600, help="Timeout in seconds")
+    run_bg_parser.add_argument(
+        "--preemptable",
+        action="store_true",
+        help=(
+            f"PREEMPTABLE: -t becomes a soft limit; past it the job runs on until another job is "
+            f"queued, then is stopped and SIGKILLed {PREEMPT_GRACE_SEC}s later. Watch the broker."
+        ),
+    )
 
     status_parser = subparsers.add_parser(
         "status", help="[N] [-j ID]  — queue + last N recent (all users, default 15); -j for one job's detail"

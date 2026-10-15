@@ -332,6 +332,7 @@ class TestJob:
         assert JobStatus.TIMEOUT.value == "timeout"
         assert JobStatus.HUNG.value == "hung"
         assert JobStatus.KILLED.value == "killed"
+        assert JobStatus.PREEMPTED.value == "preempted"
 
     def test_runtime_sec_property(self):
         """Test runtime_sec calculation."""

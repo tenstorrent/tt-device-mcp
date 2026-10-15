@@ -108,7 +108,8 @@ PROBES = ("hostpci", "heartbeat", "pci", "eth_heartbeat", "fabric")
 # the LONGEST device occupancy, so omitting them from busy_seconds_total would make this series
 # read systematically lower than Stats.utilization (which DOES count hung time, via
 # update_device_state), and two disagreeing "utilization" numbers is worse than one.
-OUTCOMES = ("completed", "failed", "killed", "timeout", "hung")
+# "preempted" is counted the same way: a preemptable job stopped because another job was waiting.
+OUTCOMES = ("completed", "failed", "killed", "timeout", "hung", "preempted")
 
 # A stage/action's own firing outcome (independent of whether recovery later verified healthy):
 # "ok" the action ran and completed (rc 0, or a reboot/power-cycle that issued and took the box

@@ -297,6 +297,7 @@ def test_outcomes_match_the_job_statuses_stats_actually_counts():
         JobStatus.KILLED.value,
         JobStatus.TIMEOUT.value,
         JobStatus.HUNG.value,
+        JobStatus.PREEMPTED.value,
     }
     # There is no separate "cancelled" JobStatus — _kill_job() cancels a QUEUED job by setting
     # the same JobStatus.KILLED a running job gets when killed.
