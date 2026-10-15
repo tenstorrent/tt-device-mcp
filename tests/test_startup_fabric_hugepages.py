@@ -334,6 +334,24 @@ async def test_startup_records_cannot_check_when_hugepages_stay_short(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_a_startup_hugepages_hold_with_links_measured_down_stays_77_only(monkeypatch, _startup):
+    """A reset before the pool exists could only 77 again: the hugepages hold waits, links down or not."""
+    _shortfalls(monkeypatch, [(5, 32)])
+    monkeypatch.setattr(srv, "STARTUP_HUGEPAGES_WAIT_SEC", 0.05)
+    monkeypatch.setattr(srv.health_monitor, "last_eth_link_drop", "228 of 256 eth link(s) up")
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "")
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", "")
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+
+    await srv._verify_fabric_on_start()
+
+    assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY
+    assert srv._fabric_77_eth_drop() == ""
+    assert srv._fabric_77_only_hold()
+    assert srv._fabric_no_reset_hold() == "fabric check could not run (77)"
+
+
+@pytest.mark.asyncio
 async def test_a_dirty_carried_episode_still_runs_the_startup_gate(monkeypatch, _startup):
     """A carried dirty mark is the gate's to reset+verify; the hugepages wait must not hide it."""
     events, rows, gate_calls = _startup

@@ -3368,6 +3368,8 @@ def _fabric_77_eth_drop() -> str:
         return ""
     if _last_77_was_hugepages() or fabric.validator_missing() is not None:
         return ""
+    if "hugepages not yet allocated" in str(fsm.record.detail or ""):  # the startup pass's hugepages hold
+        return ""
     return drop
 
 
