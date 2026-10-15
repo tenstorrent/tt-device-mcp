@@ -9576,19 +9576,20 @@ async def _verify_fabric_on_start() -> None:
     try:
         while readopted_scopes:
             await asyncio.sleep(_SCOPE_POLL_SEC)
-        # A boot or power cycle cleared any firmware clock cap. Put the operator's ceiling back
-        # first, so the startup traffic pass below never runs above it. The gate's probe pass
-        # re-proves it and owns the verdict, so a failure here is only logged.
-        if CEILING.armed() and CEILING.owed:
-            async with get_device_op_lock():
-                await CEILING.apply(
-                    "startup", log=(lambda line: logger.info(f"HEALTH-GATE[startup] {line}")) if logger else None
-                )
         # Read before the pass: a validator that lands while it runs must still be waited for.
         missing = await asyncio.to_thread(fabric.validator_missing)
         if not await _await_startup_hugepages():
             missing = missing or "hugepages not yet allocated"
         else:
+            # A boot or power cycle cleared any firmware clock cap. Once the hugepage pool is ready,
+            # put the operator's ceiling back before the startup traffic pass, so it never runs above
+            # it. The gate's probe pass re-proves it and owns the verdict; a failure here is only
+            # logged. Short of hugepages there is no pass, and the relift's pass applies it later.
+            if CEILING.armed() and CEILING.owed:
+                async with get_device_op_lock():
+                    await CEILING.apply(
+                        "startup", log=(lambda line: logger.info(f"HEALTH-GATE[startup] {line}")) if logger else None
+                    )
             await _device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
         if missing and _fabric_77_only_hold():
             _startup_prereq_task = asyncio.create_task(_await_startup_prerequisites(missing))
