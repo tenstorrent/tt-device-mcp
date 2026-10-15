@@ -591,7 +591,8 @@ class ServerFsm:
         """Reopen a DOWN episode a previous boot left behind as RECOVERING, once, so this boot's own
         bounded paths (the idle relift, its backoff and bound) own it again (spec 03 I49).
 
-        DOWN is the terminal rung and no idle path re-checks it. That is right within one boot, where
+        DOWN is the terminal rung and no idle path re-checks it (bar an off-bus DOWN once every chip is
+        back, spec 03 I52). That is right within one boot, where
         the ladder that took it there ran on this silicon; a reboot since is itself the biggest reset
         the ladder has, so a carried DOWN is a verdict about a boot that is gone. Only when the record
         was loaded from another boot and is still DOWN: ``why`` and ``ubb_reset_fired`` stay, ``since``
