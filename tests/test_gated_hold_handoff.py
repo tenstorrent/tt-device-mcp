@@ -35,9 +35,10 @@ def _deadline_gauge() -> float:
     return metrics.REGISTRY.get_sample_value("tt_device_broker_offbus_operator_deadline_seconds")
 
 
-def _hold_gate(monkeypatch, tmp_path, *, held_sec, handoff=None, manual="exit 1", off_bus=1):
-    """An off-bus hold refused by a real ``hold`` gate (not a stub), no power cycle configured."""
-    hold_since, rec = _gated(monkeypatch, tmp_path, held_sec=held_sec, cmd=None, manual=manual)
+def _hold_gate(monkeypatch, tmp_path, *, held_sec, handoff=None, manual="exit 1", off_bus=1, cmd=None):
+    """An off-bus hold refused by a real ``hold`` gate (not a stub), no power cycle configured unless
+    ``cmd`` names one."""
+    hold_since, rec = _gated(monkeypatch, tmp_path, held_sec=held_sec, cmd=cmd, manual=manual)
     monkeypatch.setattr(pcie_guard, "host_reset_gate", _REAL_GATE)
     monkeypatch.setattr(pcie_guard, "aer_flooding", lambda ports=None: False)
     monkeypatch.setattr(pcie_guard, "mask_for_mesh_reset", lambda log: None)
@@ -236,4 +237,159 @@ async def test_a_reset_the_gate_still_refuses_releases_nothing(mesh, monkeypatch
     await _escalate()
     await _escalate()
     assert fired == []
+    assert srv.fsm.record is not None and srv.fsm.state is not ServerState.HEALTHY
+
+
+# ---- spec 04 I27: with a power cycle configured, a whole tray down goes straight to it; a partial ----
+# ---- off-bus drop gets the reset ladder (the mesh reset) once first, and the cycle only if that fails ----
+
+CYCLE = "/usr/local/sbin/host-power-cycle --now"
+
+
+def _beats_off(monkeypatch, off):
+    beats = {str(i): 100 for i in range(EXPECTED) if i not in set(off)}
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: beats)
+
+
+@pytest.mark.asyncio
+async def test_a_whole_tray_down_goes_straight_to_the_power_cycle(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
+    """Chips 24-31 are all of one tray: no reset can bring a tray that lost power back, so the gate stays
+    shut past the grace and the power cycle fires with no mesh reset in front of it."""
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=400, cmd=CYCLE, off_bus=8)
+    _beats_off(monkeypatch, range(24, 32))
+    counters = {"resets": 0}
+    seen = _gate_seen_by_reset(monkeypatch, counters)
+    await _escalate()  # the episode's first climb: the gate refuses every rung
+    assert rec["fires"] == []
+    assert await _escalate() is True
+    assert len(rec["fires"]) == 1, "the power cycle fired"
+    assert counters["resets"] == 0 and not any(seen), "no mesh reset before it"
+    assert ("offbus_gated_hold", "gate_lifted") not in [(k, f.get("phase")) for k, f in rec["events"]]
+    assert opc._pending.get("partial_reset") is None, "no lifted pass was spent"
+
+
+@pytest.mark.asyncio
+async def test_a_partial_drop_gets_the_mesh_reset_first_and_the_power_cycle_only_if_it_fails(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """g15blx02, 10-15 01:37-01:48 PDT: one chip off, gate ``hold``, power cycle configured. It went to the
+    power cycle and the mesh reset never ran. Now the pass at the grace lifts the gate once and the
+    mesh reset runs; it fails, the watchdog forces one more pass, and that one fires the power cycle
+    with the gate shut again. Fails on base, which never lifts the gate with a power cycle set."""
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=400, cmd=CYCLE)
+    _beats_off(monkeypatch, [17])
+    counters = {"resets": 0}
+    seen = _gate_seen_by_reset(monkeypatch, counters)  # the reset fails: the chip stays off
+    await _escalate()  # the first climb, gate shut
+    assert counters["resets"] == 0 and rec["fires"] == []
+    assert opc.partial_reset_due(hold_since)
+    assert await _escalate() is True
+    assert counters["resets"] == 1 and seen[-1] is True, "the mesh reset fired with the gate lifted"
+    assert rec["fires"] == [], "no power cycle in the same pass"
+    assert pcie_guard.host_reset_gate(1)[0] is False, "outside the pass the gate holds again"
+    assert not opc.partial_reset_due(hold_since), "one lifted pass per episode"
+    assert opc.due_for_watchdog(hold_since), "the watchdog forces the next pass at once"
+    opc.mark_spawned(hold_since)
+    assert await _escalate() is True
+    assert len(rec["fires"]) == 1 and counters["resets"] == 1, "then the power cycle, no second reset"
+    assert not opc.due_for_watchdog(hold_since), "re-armed once only"
+
+
+@pytest.mark.asyncio
+async def test_a_partial_drop_the_mesh_reset_heals_never_gets_the_power_cycle(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=400, cmd=CYCLE)
+    _beats_off(monkeypatch, [17])
+    counters = {"resets": 0}
+
+    async def reset(indices, log):
+        if not pcie_guard.host_reset_gate(1)[0]:
+            return False
+        counters["resets"] += 1
+        _beats_off(monkeypatch, [])
+        return True
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", reset)
+    await _escalate()
+    await _escalate()
+    assert counters["resets"] == 1
+    await _escalate()
+    assert rec["fires"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_partial_drop_with_no_tray_map_gets_the_mesh_reset_first(monkeypatch, tmp_path, clear_job_state):
+    """No tray map: the broker cannot tell a whole tray from a partial drop, so no rung is skipped."""
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=400, cmd=CYCLE, off_bus=8)
+    _beats_off(monkeypatch, range(24, 32))
+    counters = {"resets": 0}
+    _gate_seen_by_reset(monkeypatch, counters)
+    await _escalate()
+    await _escalate()
+    assert counters["resets"] == 1 and rec["fires"] == []
+
+
+@pytest.mark.asyncio
+async def test_before_the_grace_a_partial_drop_gets_no_lifted_reset(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=60, cmd=CYCLE)
+    _beats_off(monkeypatch, [17])
+    counters = {"resets": 0}
+    seen = _gate_seen_by_reset(monkeypatch, counters)
+    for _ in range(3):
+        await _escalate()
+    assert counters["resets"] == 0 and not any(seen) and rec["fires"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_partial_drops_mesh_reset_releases_only_after_a_passing_fabric_check(
+    mesh, monkeypatch, tmp_path, verdict, galaxy_trays
+):
+    """Goal: the real reset path in the lifted pass releases only on a verify carrying a healthy fabric
+    verdict; on a 77 or no fabric verdict it stays held and the next pass fires the power cycle."""
+    evidence, released = verdict
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=400, cmd=CYCLE)
+    monkeypatch.delattr(srv.galaxy_recovery, "_reset_and_verify_device")
+    monkeypatch.setattr(srv, "_clear_device_dirty", _REAL_CLEAR_DIRTY)
+    monkeypatch.setattr(post_reset, "health_event", lambda kind, **f: None)
+    fsm_dirty(srv, "gate/post-job: 1/32 off-bus below the reset floor", why="job_killed")
+    srv.device_hold_episode_since = hold_since
+    _beats_off(monkeypatch, [17])
+    fired = []
+
+    async def mesh_reset(argv, log, *a, **k):
+        fired.append(argv)
+        FABRIC_DEBT.note_reset(" ".join(argv))
+        return 0, ""
+
+    monkeypatch.setattr(srv.galaxy_recovery.mechanism, "reset_with_quiesce", mesh_reset)
+    _verify_returning(monkeypatch, evidence)
+    await _escalate()
+    assert fired == []
+    assert await _escalate() is True
+    assert len(fired) == 1, "the lifted pass ran the mesh reset"
+    _assert_settled(released)
+    if not released:
+        opc.mark_spawned(hold_since)
+        await _escalate()
+        assert len(rec["fires"]) == 1, "a failed post-reset check goes on to the power cycle"
+        assert srv.fsm.record is not None and srv.fsm.state is not ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_the_power_cycle_releases_nothing(mesh, monkeypatch, tmp_path, galaxy_trays):
+    """The power cycle leaves the device held: only the next boot's startup gate, which waits for the
+    hugepage pool and runs the full check, fabric included, releases it."""
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=400, cmd=CYCLE, off_bus=8)
+    monkeypatch.delattr(srv.galaxy_recovery, "_reset_and_verify_device")
+    monkeypatch.setattr(srv, "_clear_device_dirty", _REAL_CLEAR_DIRTY)
+    fsm_dirty(srv, "gate/post-job: 8/32 off-bus", why="job_killed")
+    srv.device_hold_episode_since = hold_since
+    _beats_off(monkeypatch, range(24, 32))
+    _verify_returning(monkeypatch, {"snapshot": {"ok": True}, "fabric": {"ok": True}})
+    await _escalate()
+    await _escalate()
+    assert len(rec["fires"]) == 1
     assert srv.fsm.record is not None and srv.fsm.state is not ServerState.HEALTHY
