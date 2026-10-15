@@ -407,6 +407,33 @@ def ladder_ran(episode: str) -> bool:
     return _pending.get("episode") == episode and bool(_pending.get("ladder_ran"))
 
 
+def partial_reset_due(episode: str, now: Optional[datetime] = None) -> bool:
+    """True once per episode when, with the power cycle configured, a gated hold has run its ladder and
+    outlived its grace and has not had its one lifted pass yet: a partial off-bus drop then gets the
+    ladder's own rungs (the mesh reset included) with the gate lifted before the power cycle (spec 04
+    I27). A whole tray down never gets it; the caller decides that."""
+    if not episode or _pending.get("episode") != episode or _pending.get("partial_reset"):
+        return False
+    if not (_pending.get("gated") and _pending.get("ladder_ran")):
+        return False
+    age = episode_age_sec(episode, now)
+    return age is not None and age >= grace_sec()
+
+
+def note_partial_reset(episode: str) -> None:
+    """This episode's one lifted pass is starting: it is spent whatever its outcome."""
+    _track(episode)
+    _pending["partial_reset"] = True
+
+
+def rearm_after_partial_reset(episode: str) -> None:
+    """The lifted pass ended with the hold still standing: the watchdog forces one more pass, which
+    fires the power cycle, instead of waiting for the next ceiling window (once per episode)."""
+    if _pending.get("episode") == episode and _pending.get("partial_reset") and not _pending.get("partial_rearmed"):
+        _pending["partial_rearmed"] = True
+        _pending["spawned"] = False
+
+
 def hold_handoff_sec() -> Optional[int]:
     """Seconds, from the episode start, an off-bus hold the gate refuses with no power cycle configured
     stands for an operator before the broker lifts the gate for its own ladder (spec 04 I33). A
