@@ -584,6 +584,39 @@ async def test_forced_escalation_fires_on_a_hold_held_only_by_a_reported_fault(m
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind,window_attr", [("offbus_one_shot", "_offbus_hold_ceiling_sec"), ("ceiling_window", "_stuck_hold_ceiling_sec")]
+)
+async def test_forced_escalation_event_names_trigger_and_thresholds(monkeypatch, tmp_path, kind, window_attr):
+    """The event must explain itself: which trigger fired and the window, ceiling and deadline in force."""
+    fields = {}
+    patch_health_event(monkeypatch, lambda k, **f: fields.update(f) if k == "hold_deadline_forced_escalation" else None)
+    fsm_dirty(srv, "all chips off the bus", why="heartbeat")
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    dev = tmp_path / "tenstorrent"
+    dev.mkdir()
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(dev))
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: 32)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {})
+    monkeypatch.setattr(srv, "dead_chips", lambda beats: [])
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    monkeypatch.setattr(srv, "device_op_lock", None)
+    monkeypatch.setattr(srv, "device_hold_escalation_kind", kind)
+
+    async def _noop(indices, expected, log, *, force=False):
+        pass
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_escalate_offbus_stuck_hold", _noop)
+
+    await srv._force_escalate_stuck_hold()
+
+    assert fields["trigger"] == kind
+    assert fields["window_sec"] == int(getattr(srv, window_attr)())
+    assert fields["ceiling_sec"] == int(srv._stuck_hold_ceiling_sec())
+    assert fields["deadline_sec"] == int(srv._hold_deadline_sec())
+
+
+@pytest.mark.asyncio
 async def test_forced_escalation_power_cycles_when_all_device_nodes_are_gone(monkeypatch, tmp_path):
     """A full sysfs blackout — every /dev/tenstorrent node gone — is the catastrophic all-off-bus drop
     that most needs the cold rung. Base bailed on ``if not indices: return``, so the deadline watchdog
