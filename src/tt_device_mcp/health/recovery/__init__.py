@@ -27,6 +27,7 @@ from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import constants, metrics
 from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import pcie_guard
@@ -474,6 +475,8 @@ class Recovery(ABC):
             # a no_bridge reset 3x per gone chip, then again on the stuck-hold escalation).
             for attempt in range(BRIDGE_RESET_MAX_TRIES):
                 FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
+                # A bridge reset clears the chip's firmware clock cap like any reset (spec 03 I35).
+                CEILING.mark_owed(f"bridge reset of chip {idx}")
                 result = await asyncio.to_thread(reset_chip_via_bridge, idx, bdf)
                 if result:
                     recovered.append(idx)
