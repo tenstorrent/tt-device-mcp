@@ -847,7 +847,7 @@ def _arm_forced_tray_rung(monkeypatch, scan, *, verify_ok=True):
 async def test_the_forced_tray_rung_does_not_read_an_unreadable_scan_as_a_tenant(
     monkeypatch, galaxy_seen, clear_job_state, force
 ):
-    """g15blx02, 10-14 17:43:25 PDT: the hold-deadline climb passed its own forced tenant guard (no tenant,
+    """A past incident: the hold-deadline climb passed its own forced tenant guard (no tenant,
     no job), then the tray rung re-read the scan WITHOUT force, took an unreadable one for a tenant and
     skipped, so the climb fell to glx_reset. Forced, the walk fires and verifies with the fabric check;
     unforced (the gate), an unreadable scan still holds. Fails on 4fc0588..4e08ca4: forced also holds."""
@@ -890,7 +890,7 @@ async def test_the_forced_tray_rung_still_holds_for_a_real_tenant_or_a_running_j
 
 @pytest.mark.asyncio
 async def test_a_forced_tray_walk_whose_fabric_check_fails_keeps_the_hold(monkeypatch, galaxy_seen, clear_job_state):
-    """Goal of every reset path: no release before the full health check, fabric included, passes. A
+    """Invariant of every reset path: no release before the full health check, fabric included, passes. A
     forced walk whose post-re-power verify fails reports NOT recovered, so no caller clears the hold."""
     fired, verifies = _arm_forced_tray_rung(monkeypatch, HolderScan(holders=[], complete=False), verify_ok=False)
 
@@ -906,7 +906,7 @@ async def test_a_forced_tray_walk_whose_fabric_check_fails_keeps_the_hold(monkey
 async def test_the_hold_deadline_climb_walks_the_tray_on_an_unreadable_scan_not_glx_reset(
     monkeypatch, galaxy_seen, clear_job_state, verify_ok
 ):
-    """End to end through the forced off-bus climb, the 10-14 shape: one chip off the bus below the floor,
+    """End to end through the forced off-bus climb, the incident shape: one chip off the bus below the floor,
     no bridge candidate, no tenant, an unreadable holder scan. The tray walk fires instead of being skipped
     for the mesh-wide reset, and the hold is cleared only when its fabric-inclusive verify passed."""
     from tests.test_device_safety import _arm_offbus_stuck_hold
