@@ -202,6 +202,11 @@ class ServerFsm:
         # snapshot caches board types. Committing a guess here instead would pin the wrong ladder
         # for the process lifetime, and a wedged Galaxy is exactly the host that cannot answer.
         self.recovery: Optional[Recovery] = None
+        # Whether an armed rung bounds a hold, and by how many seconds — the server states it once
+        # its config is read (see set_recovery_armed). Config of THIS process, so written but never
+        # read back: None until stated, so a reader can tell "not stated yet" from "no bound".
+        self._recovery_armed: Optional[bool] = None
+        self._hold_bound_sec: Optional[int] = None
         self._load()
         # Baseline the one-hot gauge + dwell clock at whatever state _load() landed on (BOOT for
         # a fresh process, or a restored RECOVERING/DOWN/HEALTHY for a same-boot restart) — every
@@ -404,6 +409,9 @@ class ServerFsm:
             "dirty": self._record.dirty,
             "latches": self._latches,
             "boot_id": self._boot_id,
+            # A RECOVERING record with recovery_armed false is a hold nothing will end on a timer.
+            "recovery_armed": self._recovery_armed,
+            "hold_bound_sec": self._hold_bound_sec,
             # Not read back by anything in this class — purely so an operator staring at the raw
             # file can tell how stale it is without cross-referencing a log timestamp.
             "written_at": _now_iso(),
@@ -461,6 +469,21 @@ class ServerFsm:
         """Peek a per-episode latch without consuming it — for a caller (the health payload, a
         durable event) that only wants to report whether a rung has already fired this episode."""
         return bool(self._latches.get(name))
+
+    @property
+    def recovery_armed(self) -> Optional[bool]:
+        """Whether an armed rung bounds a hold; None until the server has stated it."""
+        return self._recovery_armed
+
+    @property
+    def hold_bound_sec(self) -> Optional[int]:
+        return self._hold_bound_sec
+
+    def set_recovery_armed(self, armed: bool, bound_sec: Optional[int]) -> None:
+        """State whether a hold is bounded by an armed rung (and the bound), for fsm.json and /health."""
+        self._recovery_armed = bool(armed)
+        self._hold_bound_sec = bound_sec if armed else None
+        self._persist()
 
     def set_latch(self, name: str, value: bool) -> None:
         """Set a per-episode latch directly — for a caller (the escalation ladder) that must

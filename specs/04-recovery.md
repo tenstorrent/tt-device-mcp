@@ -720,6 +720,8 @@ Class structure: see the diagram in 03-health.md.
 **Rung inventory at boot.** `log_rung_inventory()` MUST state every optional rung ON or OFF at
 startup (`RUNG INVENTORY:` line, plus a `RUNG OFF <name>:` warning naming the cause for each off
 rung); an off rung is readable in the journal, never inferred from an absence of verdicts. The
+line names the hold bound (`hold-bound=<N>s`, or `hold-bound=NONE` when forced escalation is
+off, spec 03 I23); with none it also logs an error and runs the alert hook once. The
 power-cycle entry distinguishes the operator's `=0` opt-out from an armed rung whose `ipmitool` is
 missing. `resolve_platform()` runs first (a declared mode without touching the device; otherwise
 one tt-smi snapshot), so `BOOT platform:` precedes any preflight or gate line.
@@ -1117,4 +1119,5 @@ sees a silent fabric pass.
 | Post-reboot verify runs on the boot's first broker start only, never on a same-boot restart | `tests/test_device_safety.py::test_post_reboot_verify_runs_on_the_boots_first_broker_start`, `tests/test_device_safety.py::test_a_restart_later_in_the_boot_does_not_rerun_the_post_reboot_verify` |
 | Reset tool contract: steps/attribution/no-devices/job stop | `tests/test_reset.py::test_reset_success_reports_steps_and_command`, `tests/test_reset.py::test_reset_failure_surfaces_returncode_and_output`, `tests/test_reset.py::test_explicit_reset_leaves_one_row_attributed_to_the_caller`, `tests/test_reset.py::test_reset_no_devices_does_not_call_tt_smi`, `tests/test_reset.py::test_a_reset_stops_the_running_job_gracefully`, `tests/test_reset.py::test_reset_device_quiesce_scope_routes_a_live_privsep_job` |
 | Rung inventory stated loudly at boot | `tests/test_rung_arming.py::test_a_rung_that_is_off_is_stated_loudly` |
+| Rung inventory states the hold bound; NONE errors and alerts once | `tests/test_hold_bound.py::test_inventory_names_no_hold_bound_and_alerts_once`, `tests/test_hold_bound.py::test_inventory_states_the_armed_bound_and_does_not_alert` |
 | Stage metrics: structural inapplicability is not "blocked" | `tests/test_metrics.py::test_ubb_tray_no_tray_on_this_platform_is_not_applicable_not_blocked`, `tests/test_metrics.py::test_bridge_reset_missing_pci_address_is_not_applicable_not_blocked` |

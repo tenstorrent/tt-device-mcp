@@ -177,6 +177,11 @@ job boundary.
   bare timestamp that older brokers can read; the boot id lives in a sidecar that only qualifies the
   start it names (otherwise: carries only if newer than btime). An unparseable start is never
   restored. A tenant hold writes nothing until the holder is gone and the device is still held.
+  The forced escalation is the only rung on the hold's own clock, so `TT_DEVICE_MCP_FORCE_ESCALATE=0`
+  leaves a hold unbounded (`_hold_bound_sec` is None) whatever else is armed. Such a broker says so:
+  the boot inventory reads `hold-bound=NONE` (spec 04), the watchdog's stuck line says no rung will
+  end the hold, every hold message states the bound read from the live config (never a fixed
+  "~2 min" / "10-min"), and `fsm.json` and `/health` carry `recovery_armed` / `hold_bound_sec`.
 - **I24 — `server.py`, `fsm.py`, and `telemetry.py` import health only through the
   `tt_device_mcp.health` facade** — enforced by an AST walk over those files.
 - **I25 — `TT_DEVICE_MCP_HEALTH_CHECK=0` skips the gate with no hold.** A host that will never
@@ -468,7 +473,9 @@ job boundary.
   process group is killed past it), one at a time; its output is read in chunks and only the last
   4 KB kept, and its own exit ends the run even if a child it left behind holds the pipe. A failure
   is only logged, as is a command that does not parse (which leaves the hook off). Unset, nothing
-  runs and the timeline is unchanged.
+  runs and the timeline is unchanged. The event carries `recovery_armed` and `hold_bound_sec`, so
+  a page for a hold no rung will end says so. A broker that starts with no hold bound (I23) also
+  runs the hook once at boot with a `hold_unbounded` event naming the rungs that are off.
 - **I38 — A clean exit-1 failure may skip the forced pass while an OK pass is fresh.** Off by
   default: `TT_DEVICE_MCP_EXIT1_FABRIC_WINDOW_SEC` = 0 keeps the forced pass. Set above 0, a FAILED
   job that exited 1 on its own (`_job_failed_exit1_clean`) and whose log tail (the same bounded
@@ -727,7 +734,9 @@ subsystem through the root:
   or above `MIN_TENANT_UID`, or an incomplete scan, is not free (04 I7).
 - `/health` (REST, `server._health_payload`) — `status: ok|degraded` (degraded exactly while the
   device is HELD: degraded, refused to tenants, no recovery op running), `fsm_state`, `fsm_why`,
-  `held`/`held_since`/`held_reason`/`held_age_sec`, `device_degraded`, queue counts, version.
+  `held`/`held_since`/`held_reason`/`held_age_sec`, `device_degraded`, queue counts, version,
+  `recovery_armed`/`hold_bound_sec` (I23), and while held `hold_recovery`: `recovering` only when
+  a rung will end the hold, else `none` (the hold waits on an operator).
   `held_reason` and `fsm_why` keep the reason the hold opened with; the live fields say where it
   stands now, read fresh from sysfs on every call with no device touch: `isolated_chips` (always),
   and where the heartbeat detector and a chip baseline exist, `off_bus` (chips off the PCIe bus now,
@@ -1191,6 +1200,7 @@ refuses.
 | I22 | `tests/test_device_safety.py::test_fabric_relift_is_off_by_default`, `tests/test_device_safety.py::test_idle_relift_lifts_a_fabric_unverified_hold_when_fabric_reverifies`, `tests/test_device_safety.py::test_idle_relift_holds_a_fabric_unverified_hold_when_the_check_still_cannot_run`, `tests/test_device_safety.py::test_idle_relift_holds_a_fabric_unverified_hold_when_fabric_now_fails`, `tests/test_device_safety.py::test_idle_relift_escalates_a_fabric_unverified_hold_when_relift_is_off` |
 | I23 | `tests/test_device_safety.py::test_a_hold_that_outlives_the_deadline_is_flagged_to_the_durable_timeline`, `tests/test_device_safety.py::test_a_hold_within_the_deadline_is_not_flagged_stuck`, `tests/test_device_safety.py::test_the_stuck_hold_watchdog_re_alerts_each_window_and_re_arms_per_episode`, `tests/test_device_safety.py::test_an_offbus_hold_escalates_long_before_the_general_ceiling`, `tests/test_device_safety.py::test_a_present_mesh_hold_still_waits_the_full_ceiling`, `tests/test_device_safety.py::test_a_closed_episode_re_arms_the_forced_escalation_windows`, `tests/test_device_safety.py::test_idle_relift_escalates_a_generic_arms_neither_hold` |
 | I23 (episode clock: restored only while held since broker start, in the same boot, from a device-fault hold; cleared by the first fit verdict) | `tests/test_device_safety.py::test_the_hold_clock_survives_a_broker_restart`, `tests/test_device_safety.py::test_a_healthy_startup_gate_clears_a_dead_brokers_hold_clock`, `tests/test_device_safety.py::test_a_hold_after_the_device_was_seen_fit_never_inherits_the_clock`, `tests/test_device_safety.py::test_a_device_held_at_broker_start_keeps_counting_from_the_original_drop`, `tests/test_device_safety.py::test_closing_an_orphaned_hold_leaves_the_clock_for_the_startup_verdict`, `tests/test_device_safety.py::test_a_hold_clock_from_an_earlier_boot_is_not_restored`, `tests/test_device_safety.py::test_a_tenant_holds_clock_is_not_restored_after_a_restart`, `tests/test_device_safety.py::test_a_foreign_holder_fault_marks_the_clock_as_a_tenant_hold`, `tests/test_device_safety.py::test_a_bare_timestamp_clock_carries_only_within_this_boot`, `tests/test_device_safety.py::test_the_hold_clock_file_stays_a_bare_timestamp_for_an_older_broker`, `tests/test_device_safety.py::test_an_unreadable_boot_id_falls_back_to_btime`, `tests/test_device_safety.py::test_an_unparseable_hold_clock_is_never_restored`, `tests/test_device_safety.py::test_a_corrupt_or_foreign_sidecar_falls_back_to_btime`, `tests/test_device_safety.py::test_a_sidecar_left_after_an_older_broker_cleared_the_clock_restores_nothing`, `tests/test_device_safety.py::test_a_fault_hold_a_foreign_holder_later_joins_still_carries`, `tests/test_device_safety.py::test_a_tenant_hold_that_turns_into_a_fault_starts_carrying_its_clock`, `tests/test_device_safety.py::test_an_orphaned_pre_boot_hold_does_not_drive_the_deadline_escalation`, `tests/test_device_safety.py::test_a_hold_clock_with_an_earlier_boot_id_is_ignored_by_the_deadline`, `tests/test_device_safety.py::test_a_fresh_post_boot_hold_still_escalates_at_its_deadline` |
+| I23 (no armed rung: inventory, watchdog page, hold-message bound, `/health` and `fsm.json` say so) | `tests/test_hold_bound.py::test_inventory_names_no_hold_bound_and_alerts_once`, `tests/test_hold_bound.py::test_watchdog_alerts_when_escalation_is_off`, `tests/test_hold_bound.py::test_hold_messages_state_the_real_bound`, `tests/test_hold_bound.py::test_health_does_not_show_an_unarmed_hold_as_recovering`, `tests/test_hold_bound.py::test_fsm_json_records_whether_recovery_is_armed` |
 | I24 | `tests/test_health_surface.py::test_imports_only_the_facade[src/tt_device_mcp/server.py]`, `tests/test_health_surface.py::test_imports_only_the_facade[src/tt_device_mcp/fsm.py]`, `tests/test_health_surface.py::test_imports_only_the_facade[src/tt_device_mcp/telemetry.py]` |
 | I25 | `tests/test_device_safety.py::test_switched_off_verification_does_not_brick_the_host`, `tests/test_device_safety.py::test_a_non_root_daemon_without_tt_smi_degrades_to_a_serializer`, `tests/test_device_safety.py::test_the_same_host_as_root_still_refuses_to_serve` |
 | I26 | `tests/test_health_core.py::test_healthstate_as_evidence_relabels_pci_to_snapshot`, `tests/test_health_core.py::test_healthstate_from_evidence_round_trips_through_as_evidence`, `tests/test_health_core.py::test_healthstate_as_evidence_matches_the_legacy_verify_device_shape`, `tests/test_health_core.py::test_healthstate_from_evidence_matches_the_gates_old_dict_reads` |

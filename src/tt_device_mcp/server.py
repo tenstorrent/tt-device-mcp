@@ -3336,6 +3336,8 @@ def log_rung_inventory() -> None:
         ("self-heal-relift", _selfheal_relift_enabled(), "TT_DEVICE_MCP_SELFHEAL_RELIFT=0"),
         ("tenant-hold", _tenant_hold_enabled(), "TT_DEVICE_MCP_TENANT_HOLD=0"),
     ]
+    bound = _hold_bound_sec()
+    fsm.set_recovery_armed(bound is not None, bound)
     if not logger:
         return
     priv = privileges.snapshot()
@@ -3348,6 +3350,7 @@ def log_rung_inventory() -> None:
     logger.info(
         "RUNG INVENTORY: "
         + ", ".join(f"{name}={'on' if on else 'OFF'}" for name, on, _ in rungs)
+        + f", hold-bound={f'{bound}s' if bound is not None else 'NONE'}"
         + f", exit1-fabric-window={EXIT1_FABRIC_WINDOW_SEC:.0f}s"
     )
     for name, on, why in rungs:
@@ -3355,6 +3358,21 @@ def log_rung_inventory() -> None:
         # elsewhere the inventory is the only place its OFF is ever explained.
         if not on and not (name == "eth-heartbeat" and should_privsep()):
             logger.warning(f"RUNG OFF {name}: {why}")
+    if bound is None:
+        # A box that admits jobs with no rung able to end a hold must say so where an operator looks
+        # first, and page once: the watchdog's per-window line is the only other trace.
+        logger.error(
+            "RUNG INVENTORY hold bound: NONE — forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0), "
+            "so a hold that does not clear on its own stays held until an operator acts"
+        )
+        alert.send_alert(
+            {
+                "kind": "hold_unbounded",
+                "host": socket.gethostname(),
+                "rungs_off": [name for name, on, _ in rungs if not on],
+            },
+            logger,
+        )
 
 
 # The telemetry trace: what the chips were doing while the job ran. Snapshots at the gate
@@ -5320,9 +5338,8 @@ async def device_health_gate(
                 _log(
                     "active-eth-core heartbeat frozen — a single-chip wedge; NOT resetting (a "
                     "galaxy reset here is the measured all-chip drop). Holding the door: no tenant "
-                    "runs on the frozen mesh until a later gate verifies the core came back. The "
-                    "ladder escalates at the 10-min hold ceiling — do not plan around waiting the "
-                    "wedge out."
+                    "runs on the frozen mesh until a later gate verifies the core came back. "
+                    f"{_hold_bound_text()} — do not plan around waiting the wedge out."
                 )
                 # A runtime-reported fault otherwise stands until a reset — the checks that cleared
                 # it "healthy" are blind to the wedge, but the heartbeat read is not, and every
@@ -5490,9 +5507,8 @@ async def device_health_gate(
             _log(
                 f"{ev.off_bus} of {expected} chip(s) off the bus — below the galaxy-reset "
                 f"floor ({reset_floor}). A galaxy reset here is the measured all-chip drop, so "
-                f"holding the mesh degraded rather than resetting in-flight work away. The off-bus "
-                f"ladder escalates in ~2 min and no hold outlives the 10-min ceiling — do not plan "
-                f"around waiting the wedge out."
+                f"holding the mesh degraded rather than resetting in-flight work away. "
+                f"{_hold_bound_text(offbus=True)} — do not plan around waiting the wedge out."
             )
             health_event(
                 "galaxy_reset_suppressed_below_mass_threshold", off_bus=ev.off_bus, expected=expected, floor=reset_floor
@@ -5649,8 +5665,8 @@ async def device_health_gate(
             _log(
                 f"{off_bus} of {expected} chip(s) dead — below the reboot floor ({reboot_floor}). "
                 f"The holder-kill covers the MCE path, so holding the mesh degraded rather than "
-                f"rebooting in-flight work away. The ladder escalates at the 10-min hold ceiling — "
-                f"do not plan around waiting the wedge out."
+                f"rebooting in-flight work away. {_hold_bound_text()} — do not plan around waiting "
+                f"the wedge out."
             )
             health_event(
                 "reboot_suppressed_below_mass_threshold", off_bus=off_bus, expected=expected, floor=reboot_floor
@@ -5851,6 +5867,9 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         # The FSM's own record, straight from the source every field above is now derived from.
         "fsm_state": fsm.state.value,
         "fsm_why": fsm.record.why,
+        # Whether an armed rung ends a hold, and when: without one a hold is NOT recovering.
+        "recovery_armed": _recovery_armed(),
+        "hold_bound_sec": _hold_bound_sec(),
     }
     payload.update(_live_offbus_state())
     # Whether the running job is doing device work (spec 03 I54); absent while no job runs.
@@ -5867,6 +5886,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
             payload["held_age_sec"] = int(((now or datetime.now()) - datetime.fromisoformat(since)).total_seconds())
         except ValueError:
             payload["held_age_sec"] = None  # a since we cannot parse is still a hold; report it without an age
+        # "recovering" only while a rung will end the hold; "none" is a hold that waits on an operator.
+        payload["hold_recovery"] = "recovering" if payload["recovery_armed"] else "none"
         # Keyed on the hold EPISODE (survives a broker restart), the clock the hand-off was armed on.
         episode = device_hold_episode_since or since
         handoff = offbus_power_cycle.hold_handoff_status(episode, now.timestamp() if now else None)
@@ -5986,6 +6007,41 @@ def _force_escalate_enabled() -> bool:
     operator kill-switch. On by default because a hold that outlived the ceiling with no tenant on the
     device must terminate — the alternative is the 21 h silent hold this exists to end."""
     return os.environ.get("TT_DEVICE_MCP_FORCE_ESCALATE", "1").strip() != "0"
+
+
+def _hold_bound_sec() -> Optional[int]:
+    """Seconds after which an armed rung starts ending ANY hold, or None when none is armed. Only the
+    forced escalation runs on the hold's own clock: the self-heal relift lifts only a hold whose
+    fault cleared by itself, and the host rungs fire only from a gate the held device never runs on
+    its own. So with TT_DEVICE_MCP_FORCE_ESCALATE=0 nothing bounds a hold, whatever else is on."""
+    return _stuck_hold_ceiling_sec() if _force_escalate_enabled() else None
+
+
+def _recovery_armed() -> bool:
+    """Whether a hold is bounded by an armed rung (see _hold_bound_sec)."""
+    return _hold_bound_sec() is not None
+
+
+def _fmt_bound(sec: int) -> str:
+    return f"{sec // 60} min" if sec % 60 == 0 else f"{sec}s"
+
+
+def _hold_bound_text(offbus: bool = False) -> str:
+    """What a hold message may promise: the armed bound read from the live config, or that there is
+    none. A hard-coded "escalates in ~2 min" read as a promise on a box with escalation off."""
+    bound = _hold_bound_sec()
+    if bound is None:
+        relift = " — only the self-heal relift can lift it" if _selfheal_relift_enabled() else ""
+        return (
+            f"Forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0), so no rung ends this hold on "
+            f"a timer{relift}; manual recovery is required if it does not clear"
+        )
+    if offbus:
+        return (
+            f"The off-bus ladder escalates in ~{_fmt_bound(_offbus_hold_ceiling_sec())} and no hold "
+            f"outlives the {_fmt_bound(bound)} ceiling"
+        )
+    return f"The ladder escalates at the {_fmt_bound(bound)} hold ceiling"
 
 
 async def _force_escalate_stuck_hold() -> None:
@@ -6221,6 +6277,13 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             f"(77), so no reset is forced; the idle relift re-runs the fabric pass. Check why it "
             f"cannot run (hugepages, validator install) in the fabric-check action log."
         )
+    elif logger and not _recovery_armed():
+        logger.error(
+            f"HOLD-WATCHDOG device HELD {int(age)}s — past the {deadline}s deadline — and still "
+            f"refused to tenants: {device_hold_episode_reason!r}. Forced escalation is OFF "
+            f"(TT_DEVICE_MCP_FORCE_ESCALATE=0): no rung will end this hold. Manual recovery is "
+            f"required — a hold must terminate."
+        )
     elif logger:
         logger.error(
             f"HOLD-WATCHDOG device HELD {int(age)}s — past the {deadline}s deadline — and still "
@@ -6251,6 +6314,8 @@ def _maybe_alert_stuck_hold(bucket: int, deadline: int, age: float) -> None:
         "held_age_sec": int(age),
         "deadline_sec": deadline,
         "escalated": fsm.latch("escalated"),
+        "recovery_armed": _recovery_armed(),
+        "hold_bound_sec": _hold_bound_sec(),
         "next_alert_after_sec": gap * deadline,
     }
     if alert.send_alert(event, logger) is None:
