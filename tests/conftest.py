@@ -419,6 +419,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # test tripping it does not silence the next test's expected held event. raising=False
     # so a tree without the attribute yet (a fails-on-base stash) still sets up cleanly.
     monkeypatch.setattr(srv, "device_hold_logged", False, raising=False)
+    # A carried-over hold one startup test armed must not tag the next test's device_held.
+    monkeypatch.setattr(srv, "_carried_hold", None, raising=False)
     # The idle escalation's and the per-tray BMC reset's once-per-episode latches are per-episode
     # state on the fresh srv.fsm just constructed above, so they are already unarmed here — no
     # separate reset needed.
