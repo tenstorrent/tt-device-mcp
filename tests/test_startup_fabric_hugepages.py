@@ -686,6 +686,178 @@ async def test_the_forced_escalation_bails_on_a_77_only_hold(monkeypatch, tmp_pa
     await asyncio.sleep(0)
 
 
+# --- a 77 on eth links measured down is a fault, not a missing verdict -------------------------
+#
+# A host, 2026-10-14: chips came back by rescan without a reset, the post-job eth read measured 228
+# of 256 links and the fabric validator exited 77 (it cannot build a mesh with links missing). The
+# hold was read as 77-only, so the relift re-ran the pass on its backoff for about 17 minutes before
+# the I40 bound sent it to the reset that fixed it.
+
+_DROP = "228 of 256 eth link(s) up — a link went down since the high-water mark"
+
+
+def _hold_77_eth(monkeypatch, tmp_path, *, drop=_DROP, due=True):
+    _hold_77(monkeypatch, tmp_path, due=due)
+    monkeypatch.setattr(srv.health_monitor, "last_eth_link_drop", drop)
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "")
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", "")
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_RELIFT", raising=False)
+
+
+def test_the_eth_read_records_a_measured_link_drop(monkeypatch, tmp_path):
+    monkeypatch.setattr(health_monitor_mod, "health_dir", lambda: tmp_path)
+    m = srv.health_monitor
+    monkeypatch.setattr(m, "last_eth_link_drop", "")
+    (tmp_path / m.ETH_LINK_BASELINE_FILE).write_text(json.dumps({"links": 256}))
+    assert m.eth_link_drop(228)
+    assert "228 of 256" in m.last_eth_link_drop
+    assert m.eth_link_drop(256) == ""
+    assert m.last_eth_link_drop == "", "a read back at the mark clears it"
+
+
+@pytest.mark.asyncio
+async def test_a_77_with_eth_links_down_escalates_on_the_first_relift(monkeypatch, tmp_path, clear_job_state):
+    """F7: the first relift pass goes to the present-mesh rung; no fabric retries, no 77 bound."""
+    _hold_77_eth(monkeypatch, tmp_path)
+    assert not srv._fabric_77_only_hold()
+    assert srv._fabric_no_reset_hold() == ""
+    assert srv._idle_relift_armed() == (False, False, True)
+    seen, rungs = [], []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        seen.append(run_fabric)
+        return True, {"fabric": {"ok": None, "detail": "could not run (77)"}}
+
+    async def escalate(rung, *a, **k):
+        rungs.append(rung)
+        return srv.OUTCOME_WAITING
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    await srv._attempt_idle_relift()
+    assert rungs == ["present"]
+    assert seen == [], "no fabric re-run on the backoff first"
+    assert srv.fsm.state is ServerState.RECOVERING, "never released by the escalation call itself"
+
+
+def test_a_77_with_eth_links_down_is_forced_past_the_hold_deadline(monkeypatch, tmp_path, clear_job_state):
+    _hold_77_eth(monkeypatch, tmp_path)
+    fired, since = _deadline(monkeypatch)
+    srv._check_hold_deadline(now=since + timedelta(seconds=2 * srv._stuck_hold_ceiling_sec() + 1))
+    assert fired, "a measured link drop is a fault the deadline escalation owns"
+
+
+@pytest.mark.asyncio
+async def test_a_77_with_eth_links_full_keeps_the_backoff(monkeypatch, tmp_path, clear_job_state):
+    """256 of 256: a 77 is still a missing verdict. The relift waits for its I48 backoff step and
+    never resets."""
+    _hold_77_eth(monkeypatch, tmp_path, drop="", due=False)
+    monkeypatch.setattr(srv, "_fabric_77_recheck_due", lambda: False)
+    assert srv._fabric_77_only_hold()
+    assert srv._fabric_no_reset_hold() == "fabric check could not run (77)"
+    assert srv._idle_relift_armed() == (False, True, False)
+    seen, rungs = [], []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        seen.append(run_fabric)
+        return True, {"fabric": {"ok": None, "detail": "could not run (77)"}}
+
+    async def escalate(rung, *a, **k):
+        rungs.append(rung)
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    await srv._attempt_idle_relift()
+    assert seen == [] and rungs == [], "the backoff step is not due: nothing runs"
+    monkeypatch.setattr(srv, "_fabric_77_recheck_due", lambda: True)
+    await srv._attempt_idle_relift()
+    assert seen == [True] and rungs == [], "once due it re-runs the pass, never a reset"
+
+
+@pytest.mark.asyncio
+async def test_a_78_cable_fault_with_eth_links_down_holds_without_a_reset(monkeypatch, tmp_path, clear_job_state):
+    """A 78 (a missing cable) reads as links down too, and no reset fixes a cable: it keeps its hold."""
+    _hold_77_eth(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "fabric cable fault (fabric check exit 78)")
+    assert srv._fabric_77_eth_drop() == ""
+    assert srv._fabric_no_reset_hold() == "known fabric fault"
+    climbed = []
+
+    async def rung(*a, **k):
+        climbed.append(a)
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_escalate_stuck_hold", rung)
+    monkeypatch.setattr(srv.galaxy_recovery, "_escalate_offbus_stuck_hold", rung)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})
+    monkeypatch.setattr(srv, "dead_chips", lambda beats: [])
+    monkeypatch.setattr(srv, "device_hold_episode_since", "2026-10-14T22:18:18")
+    await srv._force_escalate_stuck_hold()
+    assert climbed == [], "a 78 is held, never reset"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "post_reset, released",
+    [
+        ({"ok": True, "detail": "fabric links healthy"}, True),
+        ({"ok": None, "detail": "77"}, False),
+        ({"ok": False, "detail": "2 links failed"}, False),
+    ],
+)
+async def test_a_77_eth_drop_reset_releases_only_on_a_passing_full_check(
+    monkeypatch, tmp_path, clear_job_state, post_reset, released
+):
+    """Goal 8: the reset this escalation runs is followed by the full health check, fabric included,
+    and only a passing fabric verdict releases the device; a 77 or a failed pass keeps it held."""
+    from tt_device_mcp.health import recovery as recovery_pkg
+    from tt_device_mcp.health.recovery import pcie_guard
+
+    _hold_77_eth(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_STUCK_HOLD_RESET", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: srv.HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(minutes=21)).isoformat())
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
+    monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", None)
+    monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRIES", 0)
+    monkeypatch.setattr(recovery_pkg, "refuse_mesh_reset", lambda *a, **k: False)
+    monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: 0)
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
+    monkeypatch.setattr(pcie_guard, "mask_for_mesh_reset", lambda log: None)
+    monkeypatch.setattr(pcie_guard, "begin_offbus_reset", lambda *a, **k: None)
+    monkeypatch.setattr(pcie_guard, "end_offbus_reset", lambda *a, **k: None)
+    climbs, resets, checks = [], [], []
+
+    async def no_foreign(log):
+        return False
+
+    async def reset(argv, log):
+        resets.append(argv)
+        return 0, ""
+
+    async def verify(expected, log, run_fabric=True, **_):
+        checks.append(run_fabric)
+        return post_reset["ok"] is not False, {"snapshot": {"ok": True}, "fabric": post_reset}
+
+    async def climb(*a, **k):
+        climbs.append(a)
+
+    monkeypatch.setattr(srv.recovery_mechanism, "await_foreign_scope", no_foreign)
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_with_quiesce", reset)
+    monkeypatch.setattr(srv.galaxy_recovery, "_climb_to_host_recovery_after_failed_reset", climb)
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+    await srv._attempt_idle_relift()
+
+    assert len(resets) == 1, "the first relift pass runs the present-mesh reset"
+    assert checks == [True], "the post-reset check runs the fabric pass"
+    assert (srv.fsm.state is ServerState.HEALTHY) is released
+    if not released:
+        assert srv._recovery_degraded(), "a post-reset check that did not pass keeps the device held"
+
+
 # --- a startup pass the validator missed is owed again once it lands (I39) ----------------------
 #
 # box B, 2026-10-11: the broker started 2 min after boot, the validator timer published the

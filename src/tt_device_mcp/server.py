@@ -3337,7 +3337,9 @@ def _fabric_77_only_hold() -> bool:
     is a missing prerequisite, such as hugepages not yet allocated at boot, not a device fault),
     and a galaxy reset on unverifiable fabric is the measured all-chip drop. So this hold is
     never escalated to a reset by the idle relift, the deadline escalation or the watchdog; the
-    idle relift re-runs the fabric pass instead, and a real verdict decides."""
+    idle relift re-runs the fabric pass instead, and a real verdict decides.
+
+    Not when the last eth read measured links down (see _fabric_77_eth_drop): that is a fault."""
     return (
         fsm.state is ServerState.RECOVERING
         and fsm.record.why == FABRIC_RELIFT_WHY
@@ -3345,7 +3347,28 @@ def _fabric_77_only_hold() -> bool:
         and not device_fault_reported
         and not isolated_chips
         and health_monitor.last_fabric_ok is not False
+        and not _fabric_77_eth_drop()
     )
+
+
+def _fabric_77_eth_drop() -> str:
+    """The eth link-count drop that makes a fabric 77 a fault, or "".
+
+    The validator cannot build a mesh with links missing and exits 77 instead of failing them, so a
+    77 on links the eth read measured below the host's high-water mark is a down link, which the
+    present-mesh rung (a galaxy reset, then the full post-reset check) can fix; waiting out the 77
+    bound only delays it. Not for a known cable fault (a 78), a topology mismatch or fault, or a
+    missing prerequisite (hugepages, the validator): no reset fixes those."""
+    drop = health_monitor.last_eth_link_drop if health_monitor is not None else ""
+    if not drop or health_monitor.known_fabric_fault() or health_monitor.topology_hw_fault:
+        return ""
+    if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
+        return ""
+    if _TOPOLOGY_VALIDATOR_LINE in (health_monitor.last_fabric_output or ""):
+        return ""
+    if _last_77_was_hugepages() or fabric.validator_missing() is not None:
+        return ""
+    return drop
 
 
 # The episode (its ``since``) of a 77-only hold that owes the startup fabric pass it never got: the
@@ -3503,7 +3526,12 @@ def _fabric_no_reset_hold() -> str:
         return "topology mismatch"
     if fabric_hold and _TOPOLOGY_VALIDATOR_LINE in (health_monitor.last_fabric_output or ""):
         return "topology mismatch"
-    if fabric_hold and not device_fault_reported and health_monitor.last_fabric_ok is not False:
+    if (
+        fabric_hold
+        and not device_fault_reported
+        and health_monitor.last_fabric_ok is not False
+        and not _fabric_77_eth_drop()
+    ):
         return "fabric check could not run (77)"
     return ""
 
@@ -3772,6 +3800,9 @@ async def _attempt_idle_relift() -> None:
                 # and pay a reset (spec 03 I43). Only a verify that fails falls through to the ceiling.
                 if fsm.record.why == "foreign_holder" and await _foreign_holder_fast_verify(expected, _log):
                     return
+                drop = _fabric_77_eth_drop() if fsm.record.why == FABRIC_RELIFT_WHY else ""
+                if drop:
+                    _log(f"fabric 77 with eth links measured down ({drop}) — a fault: the present-mesh rung")
                 if await _escalate("present"):
                     return
                 _log(
