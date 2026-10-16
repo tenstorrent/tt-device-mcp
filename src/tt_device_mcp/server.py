@@ -3032,6 +3032,13 @@ def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> b
     return True
 
 
+def _stamp_verified_release(evidence: dict, via: str) -> None:
+    """A hold lifted on a pass whose fabric check ran and passed is proof the box heals: stamp it, so
+    a power cycle before it no longer reads as a boot loop (spec 04 I10). Any other lift stamps nothing."""
+    if (evidence.get("fabric") or {}).get("ok") is True:
+        recovery_mechanism.record_verified_release(via)
+
+
 def _clear_device_dirty_unverified(why: str, *, holds: bool = True, fault: str = "gate_error") -> None:
     """Drop the dirty flag on a path that did NOT verify the silicon — a foreign tenant
     holds the device, no device nodes are present, health checks are off, or the gate
@@ -4091,7 +4098,8 @@ async def _attempt_idle_relift() -> None:
                 return
             _log("mesh verified healthy — hold lifted")
             health_event("device_relift", evidence=evidence)
-            _clear_device_dirty(verified=True, why="idle relift: verified healthy")
+            if _clear_device_dirty(verified=True, why="idle relift: verified healthy"):
+                _stamp_verified_release(evidence, "idle relift")
     except Exception:  # noqa: BLE001 - a detached relift task must never raise unretrieved
         _log("pass aborted on an unexpected error — holding; the sampler retries next window")
 
@@ -4183,7 +4191,8 @@ async def _attempt_down_offbus_recheck() -> None:
                 return
             _log("mesh verified healthy, fabric included — DOWN off-bus hold lifted")
             health_event("device_relift", evidence=evidence, from_state="down")
-            _clear_device_dirty(verified=True, why="idle relift: every chip back on the bus, full gate passed")
+            if _clear_device_dirty(verified=True, why="idle relift: every chip back on the bus, full gate passed"):
+                _stamp_verified_release(evidence, "idle relift: off-bus return")
     except Exception:  # noqa: BLE001 - a detached task must never raise unretrieved
         _log("DOWN off-bus re-check aborted on an unexpected error — holding; the next idle tick retries")
 
@@ -5333,7 +5342,11 @@ async def device_health_gate(
                 _log(f"device verified healthy (incl. fabric) despite: {dirty_reason}" f" — no reset needed")
             else:
                 _log("device healthy; no reset needed")
-            if _clear_device_dirty(verified=True, why=f"gate/{phase}: verified healthy") and device_hold_logged:
+            released = _clear_device_dirty(verified=True, why=f"gate/{phase}: verified healthy")
+            if released and state.fabric_ran and fabric_ok is True:
+                # Proof this boot heals: a power cycle before it no longer reads as a boot loop (04 I10).
+                recovery_mechanism.record_verified_release(f"gate/{phase}")
+            if released and device_hold_logged:
                 _note_tenant_gate_verdict("")
             return
 
