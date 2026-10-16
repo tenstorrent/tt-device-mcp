@@ -463,7 +463,7 @@ async def test_the_mechanism_limits_still_apply(monkeypatch, tmp_path, clear_job
 async def test_an_unwritable_attempt_record_never_fires(monkeypatch, tmp_path, clear_job_state):
     hold_since, rec = _gated(monkeypatch, tmp_path)
 
-    def no_disk(state, now, episode, reason):
+    def no_disk(state, now, episode, reason, boot_id=""):
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(opc, "record_attempt", no_disk)

@@ -756,8 +756,8 @@ async def test_the_last_chance_sweep_labels_each_tray_from_the_map(monkeypatch, 
     g, events = _sweep_stubs(monkeypatch, lambda bitmap, ids: None)
 
     ok = await g._settle_and_verify_before_host_rung(
-        32, lines.append, "post-job", offbus_chips={str(i) for i in range(24, 32)}
-    )
+        32, lines.append, "post-job", offbus_chips={str(i) for i in range(24, 30)}
+    )  # part of tray 4: a whole tray skips the sweep (spec 04 I37 class A)
 
     assert ok is True
     assert any("tray 4 (BMC mask 0x08, chips 24-31)" in line for line in lines), lines

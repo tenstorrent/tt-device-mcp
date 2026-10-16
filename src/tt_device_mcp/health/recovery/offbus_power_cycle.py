@@ -226,21 +226,23 @@ def save_state(state: dict) -> None:
     os.replace(tmp, path)
 
 
-def last_attempt_within(state: dict, now: float, interval: int) -> Optional[float]:
-    """Epoch of an attempt younger than ``interval``, or None. An unreadable stamp counts as now."""
+def last_attempt_within(state: dict, now: float, interval: int, healed=None) -> Optional[float]:
+    """Epoch of an attempt younger than ``interval``, or None. An unreadable stamp counts as now. An
+    attempt ``healed(rec)`` says a later boot verified healthy is skipped: the hold after it is a new
+    episode, not a loop (spec 04 I9); the ledger's backstop still caps every cycle."""
     for rec in state.get("attempts") or []:
         try:
             at = float(rec.get("at_epoch"))
         except (AttributeError, TypeError, ValueError):
             return now
-        if now - at < interval:
+        if now - at < interval and not (healed and healed(rec)):
             return at
     return None
 
 
-def record_attempt(state: dict, now: float, episode: str, reason: str) -> None:
+def record_attempt(state: dict, now: float, episode: str, reason: str, boot_id: str = "") -> None:
     attempts = list(state.get("attempts") or [])
-    attempts.insert(0, {"at_epoch": now, "episode": episode, "reason": reason})
+    attempts.insert(0, {"at_epoch": now, "episode": episode, "reason": reason, "boot_id": boot_id})
     state["attempts"] = attempts[:MAX_ATTEMPTS_KEPT]
     save_state(state)
 
