@@ -377,7 +377,7 @@ def _helper_cannot_run_here(monkeypatch, r):
     monkeypatch.delattr(CEILING, "apply")
     clock = [100.0]
 
-    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate):
+    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate, name=""):
         r.order.append("ceiling-helper")
         return ac.UNSUPPORTED_RC, b"cannot run here"
 
@@ -419,7 +419,7 @@ async def test_job_restoring_fmax_is_capped_again_before_post_job_traffic(rig, m
     monkeypatch.delattr(CEILING, "apply")
     fmax = {"mhz": 800}
 
-    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate):
+    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate, name=""):
         rig.order.append("ceiling-helper")
         fmax["mhz"] = int(env[ac.ENV_MHZ])
         return 0, b'{"summary": true, "mhz": 800, "chips": 32, "ok": 32, "sent": 32}\n'
@@ -454,7 +454,7 @@ def _timed_helper(monkeypatch, run):
     ``offset`` seconds into the apply. Returns the clock."""
     clock = [100.0]
 
-    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate):
+    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate, name=""):
         rc, out, sec = run(clock[0] - 100.0)
         clock[0] += sec
         return rc, out
