@@ -20,7 +20,7 @@ import pytest
 import tt_device_mcp.job_spool as spool
 import tt_device_mcp.server as srv
 from tests.test_device_safety import _free_device_lock, _quiet_post_job_gate
-from tests.test_startup_fabric_hugepages import _shortfalls, _startup  # noqa: F401 - a fixture
+from tests.test_startup_fabric_hugepages import _shortfalls, _startup, _systemctl  # noqa: F401 - fixtures
 from tt_device_mcp.fsm import ServerState
 
 

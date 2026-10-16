@@ -880,7 +880,7 @@ async def test_the_escalations_own_tray_rung_failing_over_ipmi_hands_off_at_the_
     g = srv.galaxy_recovery
     tray_rungs = []
 
-    async def tray_rung(beats, off_bus, expected, log):
+    async def tray_rung(beats, off_bus, expected, log, **_):
         tray_rungs.append(off_bus)
         g._note_bmc_ipmi_failure(BmcIpmiError(IPMI_FAIL))
         return False
