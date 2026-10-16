@@ -135,6 +135,7 @@ from tt_device_mcp.health import (
     health_event,
     heartbeat_supported,
     heartbeat_verdict,
+    host_action_pending_sec,
     isolate_chip,
     journal_interrupted_fabric_check,
     mark_boot,
@@ -995,6 +996,9 @@ device_hold_job_bound_escalated: bool = False
 device_hold_escalation_trigger: str = ""
 device_hold_escalation_kind: str = ""  # machine-readable twin of the trigger text, for the event
 _forced_escalation_task: "Optional[asyncio.Task]" = None
+# The host-action request (see RecoveryMechanism.host_action_requested) whose suppression of the
+# forced ladder was already logged: one line per request, not one per sampler tick.
+_host_action_suppressed_logged: "Optional[tuple[str, float]]" = None
 # Jobs a reset SIGKILLed to take the device. Their deaths are ours, not the mesh's: a reset
 # kills the running job, the job dies mid-CCL, and that death then reads as evidence the
 # device needs resetting — by the reset that caused it. The set is drained as each is seen.
@@ -6171,6 +6175,8 @@ async def _force_escalate_stuck_hold() -> None:
             return  # the hold cleared between the sampler spawning us and the lock
         if _fabric_77_only_hold():
             return  # a pass that could not run is never reset for; the idle relift re-runs it
+        if _host_action_blocks_escalation():
+            return  # a host reboot/power cycle was requested while this waited on the lock
         indices = _present_chip_indices()
         # No device nodes at all is the sysfs-blackout / all-off-bus case — the catastrophic drop that
         # most needs the cold rung, never a reason to bail. Bailing let the deadline watchdog keep
@@ -6258,12 +6264,58 @@ def _hold_without_reset(cause: str, expected: int, log) -> None:
     alert.send_alert(event, logger)
 
 
+def _host_action_blocks_escalation() -> bool:
+    """True while a host reboot or power cycle the broker requested is still pending: the forced
+    ladder then starts no device reset (bridge, tray re-power, galaxy reset) — one would only race the
+    host going down. The device stays held, and the full health check, fabric included, still runs
+    after the host comes back (startup, behind the hugepage gate). Bounded: past the pending window
+    the request reads as failed, is logged once, and the ladder resumes. A request that was refused or
+    failed to launch never set the marker, so it never blocks."""
+    global _host_action_suppressed_logged
+    req = recovery_mechanism.host_action_requested
+    pending = recovery_mechanism.host_action_pending()
+    if pending is None:
+        if req is not None:
+            bound = int(host_action_pending_sec())
+            health_event(
+                "host_action_request_expired", action=req[0], bound_sec=bound, held_since=device_hold_episode_since
+            )
+            if logger:
+                logger.error(
+                    f"HOLD-DEADLINE-ESCALATE host {req[0]} was requested over {bound}s ago and the host is "
+                    f"still up — treating the request as failed; the forced recovery ladder resumes"
+                )
+        return False
+    action, age = pending
+    if _host_action_suppressed_logged != req:
+        _host_action_suppressed_logged = req
+        health_event(
+            "hold_escalation_suppressed_host_action",
+            action=action,
+            age_sec=int(age),
+            bound_sec=int(host_action_pending_sec()),
+            trigger=device_hold_escalation_kind or "ceiling_window",
+            held_since=device_hold_episode_since,
+        )
+        if logger:
+            logger.error(
+                f"HOLD-DEADLINE-ESCALATE suppressed ({device_hold_escalation_kind or 'ceiling_window'}): a host "
+                f"{action} was requested {int(age)}s ago — no device reset starts while it is pending (up to "
+                f"{int(host_action_pending_sec())}s). Device stays HELD; the full health check runs after the "
+                f"host comes back"
+            )
+    return True
+
+
 def _maybe_spawn_forced_escalation() -> bool:
     """Start one forced escalation as its own task when a hold has outlived the ceiling and none is in
     flight. Detached from the sampler (like the relift): the reset/climb it runs takes tens of seconds,
-    and awaiting it inline would blind the sampler's dead-chip tripwire."""
+    and awaiting it inline would blind the sampler's dead-chip tripwire. Declines while a requested
+    host reboot or power cycle is pending, so the caller's window latch stays unspent."""
     global _forced_escalation_task
     if not _force_escalate_enabled():
+        return False
+    if _host_action_blocks_escalation():
         return False
     if _forced_escalation_task is not None and not _forced_escalation_task.done():
         return False
