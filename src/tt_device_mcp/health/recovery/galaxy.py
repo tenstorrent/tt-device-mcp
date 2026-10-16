@@ -2646,8 +2646,29 @@ class GalaxyRecovery(Recovery):
                 f"ASIC, so climbing to the cold rung, never the reboot; no further mesh reset this hold."
             )
         episode_regressed = self.mechanism.reset_regressed_in(hold_since)
+        # This episode's mesh reset already ran and failed on exactly the chips off the bus now (I36).
+        # Every rung below the host pair has had its one try and the mesh reset may not run again on
+        # this set, so neither the ceiling wait nor the last-chance sweep (whose last step is that same
+        # mesh reset) has anything left to try: the host rung fires now (spec 04 I38). A second mesh
+        # reset after an rc 1 on the same chips killed one Galaxy host.
+        failed_unchanged = off_bus > 0 and self.mechanism.rung_failed_unchanged(
+            hold_since, "mesh_reset", await self._offbus_ids_now(expected)
+        )
         hold_age = _hold_age_sec(hold_since)
-        if hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
+        if failed_unchanged and hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
+            log(
+                f"{off_bus}/{expected} off-bus and this hold's mesh reset already failed on exactly these "
+                f"chips — every rung below the host pair has run once; not waiting for the "
+                f"{_stuck_hold_ceiling_sec()}s ladder end"
+            )
+            health_event(
+                "host_rung_not_deferred",
+                held_since=hold_since,
+                held_age_sec=int(hold_age),
+                ceiling_sec=_stuck_hold_ceiling_sec(),
+                reason="mesh_reset_failed_unchanged",
+            )
+        elif hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
             log(
                 f"mesh unrecovered after the reset ladder but the hold is only {int(hold_age)}s "
                 f"old — the host rungs (reboot/power-cycle) wait for the "
@@ -2731,7 +2752,12 @@ class GalaxyRecovery(Recovery):
         # is the road MOST real power cycles took (the idle/stuck-hold escalation), and before ladder-v2
         # it climbed to the host rung without ever re-trying the cheaper rungs. Skipped when the caller
         # already swept this episode (_sweep_after_unverified_reset).
-        if not swept and (
+        if failed_unchanged and not swept:
+            log("last-chance sweep skipped: its mesh reset already failed on these chips in this hold")
+            health_event(
+                "reset_rung_skipped_failed_unchanged", rung="last_chance_sweep", held_since=hold_since, off_bus=off_bus
+            )
+        elif not swept and (
             await self._settle_and_verify_before_host_rung(
                 expected, log, "idle-escalation", context=f"idle escalation, {off_bus}/{expected} off the bus"
             )

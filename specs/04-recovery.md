@@ -369,7 +369,8 @@ each rung fires only when the gentler one failed or cannot apply.
 
 - **I22 — No host rung without the full reset ladder.** A reboot or power cycle fires only after
   the last-chance sweep (SBR, per-tray re-power, mesh reset) ran COMPLETE and the one verify after
-  it failed. A sweep that was skipped (a reset already cycling in its own scope, a tenant) or
+  it failed, or once this episode's ladder already ran its mesh reset and it failed on an unchanged
+  off-bus set (I38: the sweep would repeat that reset, which I36 forbids). A sweep that was skipped (a reset already cycling in its own scope, a tenant) or
   incomplete (the I24 gate refused it, or the I23 envelope refused the tray fire) holds the host
   rung for that pass: `_settle_and_verify_before_host_rung` returns None and every caller holds.
 
@@ -681,14 +682,31 @@ each rung fires only when the gentler one failed or cannot apply.
   While the set off the bus is still that recorded set, the idle off-bus ladder (forced or not) fires
   none of its reset rungs again, and a forced present-mesh window does not repeat the reset (the
   grace-cadence retries before the ceiling stay). It journals `reset_rung_skipped_failed_unchanged` and
-  climbs: the host rung behind the last-chance sweep (I22), within one hold-deadline window of the
-  failure, rate limits kept (a denied cycle holds and fires no reset). When no host rung is available
+  climbs to the host rung at once (I38), rate limits kept (a denied cycle holds, fires no reset and is
+  asked again the next window). When no host rung is available
   (power cycle and reboot both off or unfireable) the hold goes to an operator once per episode through
   the I33 hand-off, latched (no deadline, `act_by` null), and no further reset fires on that set. Any
   later reset still owes the I32 fabric pass, so nothing releases the device before the full health
   check, fabric included, passes. The record is keyed by the episode, so a new episode resets again.
   Bounds the loop one Galaxy host ran: six identical mesh resets in one hold, each exiting 1 after a
   263 s overrun, one per forced window.
+- **I38 — Once this hold episode's mesh reset has failed on an unchanged off-bus set, the host rung
+  fires in the same pass: no hold-ceiling deferral and no last-chance sweep.** Every rung below the
+  host pair (the per-chip bridge reset, the tray rung where it applies, the mesh reset) has then had
+  its one try, and I36 forbids the mesh reset again on that set, which is the last step of the I22
+  sweep. So the climb that follows the failed reset (or any later window's I36 skip) journals
+  `host_rung_not_deferred` (reason `mesh_reset_failed_unchanged`) when the hold is younger than the
+  ceiling, and `reset_rung_skipped_failed_unchanged` with `rung=last_chance_sweep` in place of the sweep,
+  then fires the rung the chooser picks (the power cycle for a below-floor or non-zero-exit drop). The
+  rate limits, the tenant scan and the reset-scope check still apply; a denied cycle is asked again
+  the next forced window, never skipped for good. With no host rung the hold goes to an operator
+  (I36, I33). The power cycle releases nothing: the startup pass after the host returns runs the full
+  health check, fabric included, behind the hugepage gate, and a failure keeps the hold. A set that
+  shrank or changed is not covered and keeps the ordinary ladder. Partial off-bus time to power cycle
+  falls from the 600 s ceiling window plus a second reset and a sweep (924 s for one chip with a 132 s
+  reset; 1186 s for four chips with 263 s resets) to the one-shot plus the one failed reset (252 s and
+  383 s). Bounds the idle 5-6 min one Galaxy host sat between a failed mesh reset and the ceiling
+  window; a second mesh reset on the same chips after an exit 1 killed another host.
 
 ## Interfaces
 
@@ -1131,11 +1149,12 @@ sees a silent fabric pass.
 | I34 a requested power cycle or reboot suppresses every hold-deadline tick and a forced escalation waiting on the lock; the device stays held with the check owed; one line per request | `tests/test_host_action_suppress.py::test_power_cycle_request_suppresses_every_deadline_tick`, `::test_reboot_request_suppresses_the_deadline_tick`, `::test_escalation_waiting_on_the_lock_runs_no_rung` |
 | I34 bounded: a refused or failed request never suppresses; an expired one resumes the ladder; the window is always finite | `tests/test_host_action_suppress.py::test_power_cycle_that_fails_to_launch_does_not_suppress`, `::test_power_cycle_refused_by_the_ledger_does_not_suppress`, `::test_a_request_the_host_never_acted_on_expires_and_the_ladder_resumes`, `::test_pending_window_is_always_finite` |
 | I36 a mesh reset that failed on an unchanged off-bus set is not repeated in its hold; with no host rung the hold is handed to an operator once, latched | `tests/test_no_repeat_failed_rung.py::test_a_failed_unchanged_reset_is_not_repeated_and_with_no_host_rung_is_handed_off_once` |
-| I36 the next window climbs: the last-chance sweep, then the power cycle; a rate-limited cycle holds and fires no reset | `tests/test_no_repeat_failed_rung.py::test_with_a_power_cycle_the_next_window_sweeps_then_power_cycles`, `::test_a_rate_limited_power_cycle_fires_no_reset` |
+| I36 / I38 the failed reset climbs at once: no sweep, the power cycle; a rate-limited cycle holds and fires no reset | `tests/test_no_repeat_failed_rung.py::test_with_a_power_cycle_the_failed_reset_climbs_at_once`, `::test_a_rate_limited_power_cycle_fires_no_reset` |
 | I36 a changed off-bus set, a new episode or a refused (never run) reset leaves the reset open | `tests/test_no_repeat_failed_rung.py::test_a_changed_off_bus_set_lets_the_reset_run_again`, `::test_a_new_hold_episode_resets_again`, `::test_a_refused_reset_is_not_recorded` |
 | I36 present mesh: a forced window skips the failed reset; the grace-cadence retry still resets | `tests/test_no_repeat_failed_rung.py::test_a_forced_present_mesh_window_skips_the_failed_reset`, `::test_a_non_forced_grace_retry_still_resets_a_present_mesh` |
 | I36 / I32 every reset on this path is followed by the full verify, fabric included; a failed verify keeps the hold and climbs | `tests/test_no_repeat_failed_rung.py::test_every_reset_is_verified_with_the_fabric_and_a_failed_verify_keeps_the_hold_and_climbs` |
-| I36 time to recover (fake-clock replay): power cycle at 923 s vs 1186 s, one reset vs one per window | `tests/test_no_repeat_failed_rung.py::test_replay_the_power_cycle_fires_one_reset_sooner`, `::test_replay_with_no_host_rung_the_reset_loop_ends_in_one_hand_off` |
+| I36 time to recover (fake-clock replay): power cycle at 263 s vs 1186 s, one reset vs one per window | `tests/test_no_repeat_failed_rung.py::test_replay_the_power_cycle_fires_right_after_the_failed_reset`, `::test_replay_with_no_host_rung_the_reset_loop_ends_in_one_hand_off` |
+| I38 partial off-bus (one chip, four chips): the power cycle fires right after the one failed reset, 252 s vs 924 s and 383 s vs 1186 s from onset; a denied cycle is asked again the next window with no reset between | `tests/test_no_repeat_failed_rung.py::test_partial_offbus_power_cycles_right_after_the_failed_reset`, `::test_a_denied_power_cycle_after_the_failed_reset_is_retried_next_window` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |
