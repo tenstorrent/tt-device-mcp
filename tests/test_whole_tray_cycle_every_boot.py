@@ -30,7 +30,7 @@ CYCLE_2 = T0 + 1800
 RESTART = T0 + 5 * 3600 + 25 * 60
 
 
-def _replay(cool, monkeypatch, *, now, boot_btime=BOOT_B, boot_id="boot-B"):
+def _replay(cool, monkeypatch, *, now, boot_btime=BOOT_B, boot_id="boot-B"):  # noqa: F811
     """The ledger and the off-bus attempt file as that boot left them, tray 2 off, the clock at ``now``."""
     cool["boot"].update(id=boot_id, btime=boot_btime)
     _ledger(
@@ -43,18 +43,18 @@ def _replay(cool, monkeypatch, *, now, boot_btime=BOOT_B, boot_id="boot-B"):
     _tray_off(cool)
 
 
-def _deadline(cool):
+def _deadline(cool):  # noqa: F811
     state = cool["g"].mechanism.power_cycle_cooldown_state
     return None if state is None else state["until"]
 
 
-def _health_cooldown(cool, monkeypatch, at):
+def _health_cooldown(cool, monkeypatch, at):  # noqa: F811
     monkeypatch.setattr(srv, "_device_hold_state", lambda now=None: ("tray off", srv.device_hold_episode_since))
     return srv._health_payload(now=datetime.fromtimestamp(at)).get("power_cycle_cooldown")
 
 
 @pytest.mark.asyncio
-async def test_a_restart_hours_after_a_cycle_that_never_went_down_cycles_at_once(cool, monkeypatch):
+async def test_a_restart_hours_after_a_cycle_that_never_went_down_cycles_at_once(cool, monkeypatch):  # noqa: F811
     """The measured case: restart 5 h after the second request on the same boot, tray still off. Two
     cycles healed nothing, so the cooldown is 1 h from the latest of them; it ended long ago."""
     _replay(cool, monkeypatch, now=RESTART)
@@ -64,7 +64,7 @@ async def test_a_restart_hours_after_a_cycle_that_never_went_down_cycles_at_once
 
 
 @pytest.mark.asyncio
-async def test_inside_the_cooldown_the_hold_shows_its_deadline_and_cycles_when_it_ends(cool, monkeypatch):
+async def test_inside_the_cooldown_the_hold_shows_its_deadline_and_cycles_when_it_ends(cool, monkeypatch):  # noqa: F811
     """Restart 10 min after the second request: held to its stated end, then the watchdog asks once
     and the cycle fires, whatever the per-boot count."""
     _replay(cool, monkeypatch, now=CYCLE_2 + 600)
@@ -83,7 +83,7 @@ async def test_inside_the_cooldown_the_hold_shows_its_deadline_and_cycles_when_i
 
 
 @pytest.mark.asyncio
-async def test_an_external_reboot_counts_toward_the_cooldown_and_the_cycle_follows_it(cool, monkeypatch):
+async def test_an_external_reboot_counts_toward_the_cooldown_and_the_cycle_follows_it(cool, monkeypatch):  # noqa: F811
     """A cycle the broker did not fire (manual, BMC or datacenter) brought a new boot with the tray
     still off: the cooldown runs from that boot, not from the broker's request, and fires at its end."""
     external = RESTART - 600
@@ -101,7 +101,7 @@ async def test_an_external_reboot_counts_toward_the_cooldown_and_the_cycle_follo
 
 
 @pytest.fixture
-def gated(cool, monkeypatch, tmp_path):
+def gated(cool, monkeypatch, tmp_path):  # noqa: F811
     """The idle off-bus hold's bounded end with a whole tray down, the real governor and its ledger:
     the command records a cycle instead of running."""
     hold_since = srv.device_hold_episode_since
@@ -120,14 +120,14 @@ def gated(cool, monkeypatch, tmp_path):
     opc._pending.clear()
 
 
-async def _gated_pass(cool, hold_since):
+async def _gated_pass(cool, hold_since):  # noqa: F811
     return await cool["g"]._offbus_gated_power_cycle(8, EXPECTED, hold_since, lambda m: None)
 
 
 @pytest.mark.asyncio
 async def test_the_off_bus_path_no_longer_holds_six_hours_on_an_attempt_that_never_went_down(
-    cool, monkeypatch, gated
-):
+    cool, monkeypatch, gated  # noqa: F811
+):  # noqa: F811
     """5 h after the second request the off-bus path used to page "limit one per 21600s" and stand,
     with no deadline. The I65 cooldown (1 h after two cycles that healed nothing) is the wait now."""
     _replay(cool, monkeypatch, now=RESTART)
@@ -136,7 +136,9 @@ async def test_the_off_bus_path_no_longer_holds_six_hours_on_an_attempt_that_nev
 
 
 @pytest.mark.asyncio
-async def test_the_off_bus_path_inside_the_cooldown_holds_with_a_deadline_and_no_ladder(cool, monkeypatch, gated):
+async def test_the_off_bus_path_inside_the_cooldown_holds_with_a_deadline_and_no_ladder(
+    cool, monkeypatch, gated  # noqa: F811
+):  # noqa: F811
     """Inside the cooldown the off-bus path holds (False: no fall-through to the reset ladder), with
     the deadline on /health and the watchdog retry set; at the deadline it fires."""
     _replay(cool, monkeypatch, now=CYCLE_2 + 600)
@@ -154,7 +156,9 @@ async def test_the_off_bus_path_inside_the_cooldown_holds_with_a_deadline_and_no
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("env", ["600", "86400"])
-async def test_an_operator_attempt_interval_is_a_stated_wait_capped_at_the_backoff_cap(cool, monkeypatch, gated, env):
+async def test_an_operator_attempt_interval_is_a_stated_wait_capped_at_the_backoff_cap(
+    cool, monkeypatch, gated, env  # noqa: F811
+):  # noqa: F811
     """``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC`` still spaces attempts when set, but as a
     stated wait on /health that the watchdog retries at its end, and never past the I65 cap."""
     monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", env)
@@ -182,7 +186,9 @@ def test_the_attempt_interval_default_adds_no_wait_beyond_the_cooldown(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_a_whole_tray_seen_again_among_partial_reads_still_cycles_at_the_deadline(cool, monkeypatch, gated):
+async def test_a_whole_tray_seen_again_among_partial_reads_still_cycles_at_the_deadline(
+    cool, monkeypatch, gated  # noqa: F811
+):  # noqa: F811
     """A flapping tray: forced passes alternate a whole-tray read (8 off) and a partial one (3 off)
     inside the cooldown. No read clears the episode's whole-tray clock, every pass holds with the
     same stated deadline, and the first pass at the deadline cycles, whichever read it sees."""

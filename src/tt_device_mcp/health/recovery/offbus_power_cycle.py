@@ -105,7 +105,8 @@ def min_interval_sec() -> int:
     from tt_device_mcp.health.recovery.base import POWER_CYCLE_BACKOFF_CAP_SEC
 
     return min(
-        _int_env("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", MIN_INTERVAL_DEFAULT_SEC), POWER_CYCLE_BACKOFF_CAP_SEC
+        _int_env("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", MIN_INTERVAL_DEFAULT_SEC),
+        POWER_CYCLE_BACKOFF_CAP_SEC,
     )
 
 
