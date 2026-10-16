@@ -5386,14 +5386,17 @@ def test_host_escalation_for_drop_sends_all_off_bus_to_the_cold_rung(monkeypatch
     """A whole-bus drop (present==0) is the one wedge a warm reboot cannot clear: it does not
     power-cycle the Galaxy UBBs, so dropped ASICs stay off across it. So an all-off-bus mesh never
     takes the reboot rung — power-cycle when opted in, else no rung + reboot_blocked so the caller
-    holds loudly. A partial drop (a chip still on the bus) keeps the ordinary reboot-first ladder."""
+    holds loudly. Spec 04 I71: the same holds for a partial drop on a multi-chip mesh — a warm
+    reboot does not re-power the trays either, so any chip off the bus never takes it."""
     _ledger_dir(monkeypatch, tmp_path)
     # Reboot opted in, power cycle NOT: an all-off-bus drop BLOCKS the reboot (it cannot re-enumerate).
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
     assert galaxy._host_escalation_for_drop(off_bus=32, expected=32, **srv._host_escalation_kwargs()) == (None, True)
-    # A partial drop keeps the reboot rung — some chips are on the bus, a reboot may re-enumerate them.
-    assert galaxy._host_escalation_for_drop(off_bus=31, expected=32, **srv._host_escalation_kwargs()) == (
+    # I71: a partial drop is blocked the same way — a warm reboot cannot bring an off-bus chip back.
+    assert galaxy._host_escalation_for_drop(off_bus=31, expected=32, **srv._host_escalation_kwargs()) == (None, True)
+    # A present mesh (nothing off the bus) with no power cycle armed keeps the reboot as last rung.
+    assert galaxy._host_escalation_for_drop(off_bus=0, expected=32, **srv._host_escalation_kwargs()) == (
         "reboot",
         False,
     )
@@ -5412,15 +5415,13 @@ def test_host_escalation_for_drop_routes_a_futile_reboot_to_the_cold_rung(monkey
     """A PARTIAL drop the caller has proven a warm reboot cannot recover — a reset that regressed
     the mesh off the bus, or hard-exited leaving chips off it — is routed like a whole-bus drop:
     the reboot is skipped for the cold rung when opted in, else no rung + reboot_blocked to hold
-    loudly. Without the flag the same partial drop keeps the ordinary reboot-first ladder."""
+    loudly. Since spec 04 I71 the flag is implied for any off-bus chip on a multi-chip mesh, so
+    with or without it the partial drop never takes the reboot."""
     _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    # 20/32 off-bus is a partial drop: the ordinary ladder warm-reboots it.
-    assert galaxy._host_escalation_for_drop(off_bus=20, expected=32, **srv._host_escalation_kwargs()) == (
-        "reboot",
-        False,
-    )
+    # 20/32 off-bus is a partial drop: I71 blocks the reboot even without the flag.
+    assert galaxy._host_escalation_for_drop(off_bus=20, expected=32, **srv._host_escalation_kwargs()) == (None, True)
     # warm_reboot_futile blocks that useless reboot; with no cold rung opted in the caller must hold.
     assert galaxy._host_escalation_for_drop(
         off_bus=20, expected=32, warm_reboot_futile=True, **srv._host_escalation_kwargs()
@@ -5454,8 +5455,13 @@ def test_an_unconfigured_host_still_has_a_terminating_ladder(monkeypatch, tmp_pa
 
     assert srv._auto_reboot_enabled(), "the warm-reboot rung must be armed on an unconfigured host"
     assert srv._auto_power_cycle_enabled(), "the cold rung must be armed on an unconfigured host"
-    # Gentlest-first still holds: an ordinary partial drop takes the reboot, not the power cycle.
-    assert galaxy._host_escalation_for_drop(off_bus=1, expected=8, **srv._host_escalation_kwargs()) == ("reboot", False)
+    # I71: on a multi-chip mesh even a one-chip drop takes the cold rung, never a futile reboot.
+    assert galaxy._host_escalation_for_drop(off_bus=1, expected=8, **srv._host_escalation_kwargs()) == (
+        "power-cycle",
+        False,
+    )
+    # A single-chip host keeps gentlest-first: the reboot before the power cycle.
+    assert galaxy._host_escalation_for_drop(off_bus=1, expected=1, **srv._host_escalation_kwargs()) == ("reboot", False)
     # The drop that used to strand the queue: reboot proven futile, so climb — never (None, True).
     assert galaxy._host_escalation_for_drop(
         off_bus=3, expected=8, warm_reboot_futile=True, **srv._host_escalation_kwargs()
@@ -6921,16 +6927,47 @@ def _reach_reboot_rung(monkeypatch, tmp_path, n_present):
     return reboots
 
 
+def _stub_power_cycle(monkeypatch):
+    cycles = {"n": 0}
+
+    async def fake_power_cycle(log, reason):
+        cycles["n"] += 1
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
+    return cycles
+
+
 @pytest.mark.asyncio
-async def test_a_mass_drop_still_reboots(monkeypatch, tmp_path, clear_job_state):
-    """The other half: a mass drop self-heal does NOT clear, so the reboot must still fire."""
+async def test_a_mass_drop_power_cycles_and_never_reboots(monkeypatch, tmp_path, clear_job_state):
+    """The other half: a mass drop self-heal does NOT clear, so the gate must still climb, and
+    since a warm reboot does not re-power the trays (spec 04 I71) the rung it climbs to is the
+    power cycle, with no reboot tried first."""
     reboots = _reach_reboot_rung(monkeypatch, tmp_path, n_present=1)
     # Only 1 of 32 chips answers — the mesh is gone.
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {"0": 100})
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    cycles = _stub_power_cycle(monkeypatch)
 
     await srv._device_health_gate(None, phase="post-job", run_fabric=False)
 
-    assert reboots["n"] == 1, "a mass drop must still escalate to a reboot"
+    assert cycles["n"] == 1, "a mass drop must still escalate to the host rung"
+    assert reboots["n"] == 0, "a mass drop must never take the futile warm reboot first"
+
+
+@pytest.mark.asyncio
+async def test_a_partial_drop_with_only_the_reboot_armed_holds_loudly(monkeypatch, tmp_path, clear_job_state):
+    """Spec 04 I71: with no power cycle armed, a partial drop (some chips still on the bus) holds
+    loudly instead of warm-rebooting the box for nothing (and taking its traffic down with it)."""
+    events = []
+    reboots = _reach_reboot_rung(monkeypatch, tmp_path, n_present=1)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {"0": 100})  # 31 of 32 off the bus
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+
+    assert reboots["n"] == 0, "a partial drop must never warm-reboot — the reboot cannot bring a chip back"
+    assert any(e.endswith("power_cycle_required") for e in events), events
 
 
 @pytest.mark.asyncio
@@ -7133,6 +7170,9 @@ async def test_a_tenant_arriving_before_the_reboot_decision_blocks_it(monkeypatc
     reboots = _reach_reboot_rung(monkeypatch, tmp_path, n_present=1)
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {"0": 100})  # 31 of 32 off the bus
     _ledger_dir(monkeypatch, tmp_path)
+    # A partial drop's host rung is the power cycle (spec 04 I71).
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    cycles = _stub_power_cycle(monkeypatch)
 
     scans = {"n": 0}
 
@@ -7160,6 +7200,7 @@ async def test_a_tenant_arriving_before_the_reboot_decision_blocks_it(monkeypatc
     assert scans["n"] >= 2, "the gate must re-scan for holders before the host rung"
     assert seen == [True], "the tenant that arrived mid-pass must reach the governor as active"
     assert reboots["n"] == 0, "rebooted the box out from under a tenant that arrived mid-pass"
+    assert cycles["n"] == 0, "power-cycled the box out from under a tenant that arrived mid-pass"
 
 
 @pytest.mark.asyncio
@@ -7170,8 +7211,11 @@ async def test_the_gate_aborts_the_host_reboot_when_the_ledger_cannot_be_written
     reboot no record survives is one the next boot repeats, which is a loop across boots. Driven
     through the GATE, because the gate's host rung fires inside escalate() now and nothing pinned
     that this ordering survived the move."""
-    _reach_reboot_rung(monkeypatch, tmp_path, n_present=1)  # reboot opted in, mass drop
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {"0": 100})
+    # Reboot opted in, power cycle off, present mesh that fails its check: the one case the warm
+    # reboot is still the rung (spec 04 I71).
+    _reach_reboot_rung(monkeypatch, tmp_path, n_present=32)
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0")  # let the reset run on a present mesh
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})
     _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     # Drop the harness's counting stub so the real _auto_reboot_host — the ledger-then-fire
@@ -7707,12 +7751,18 @@ def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(
     (last_action is the galaxy reset, last_action_recovered is False), so the router names a host
     rung only in that post-reset phase, and only when a prior cycle failed too (was_failing), the
     drop is at/above the reboot floor, no reset is still cycling, AND that rung is opted in.
-    Anything short holds the mesh degraded."""
-    # Reset just ran and did not recover, a prior cycle failed too, mass drop, opted in: climb to the
-    # chosen host rung, gentlest of the two.
+    Anything short holds the mesh degraded. On a multi-chip mesh a warm reboot is futile with any
+    chip off the bus (spec 04 I71): with no power cycle armed that drop is BLOCKED, never rebooted."""
+    # Reset just ran and did not recover, a prior cycle failed too, opted in: climb to the chosen
+    # host rung. A present-mesh wedge may still take the reboot when no power cycle is armed.
+    assert (
+        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=0, was_failing=True, host_escalation="reboot")
+        == STAGE_HOST_REBOOT
+    )
+    # Spec 04 I71: a mass drop with only the reboot armed is BLOCKED, never a futile warm reboot.
     assert (
         _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=True, host_escalation="reboot")
-        == STAGE_HOST_REBOOT
+        == BLOCKED
     )
     assert (
         _rung(
@@ -7720,21 +7770,30 @@ def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(
         )
         == STAGE_POWER_CYCLE
     )
-    # Post-reset, mass drop, but neither host rung opted in (the default): hold, never reboot.
+    # Post-reset, mass drop, but neither host rung opted in: a loud hold, never reboot.
     assert (
         _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=True, host_escalation=None)
+        == BLOCKED
+    )
+    # A present mesh with neither rung opted in: nothing can climb, an ordinary hold.
+    assert (
+        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=0, was_failing=True, host_escalation=None)
         == WAIT
     )
     # Post-reset but only THIS pass's reset failed (was_failing False — no prior cycle): one failed
     # reset is not "clearly won't recover", so hold, do not reboot.
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=False, host_escalation="reboot")
+        _rung(
+            monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=False, host_escalation="power-cycle"
+        )
         == WAIT
     )
     # Post-reset below the reboot floor: a single/few-chip wedge self-heals and the holder-kill covers
     # the MCE path, so hold rather than reboot in-flight work away.
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=1, was_failing=True, host_escalation="reboot")
+        _rung(
+            monkeypatch, health_deps, reset_recovered=False, off_bus=1, was_failing=True, host_escalation="power-cycle"
+        )
         == WAIT
     )
     # Post-reset but a reset re-opened its scope (a chip dropped mid-reset reads all-ones like a mass
@@ -7746,7 +7805,7 @@ def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(
             reset_recovered=False,
             off_bus=16,
             was_failing=True,
-            host_escalation="reboot",
+            host_escalation="power-cycle",
             scope_active=True,
         )
         == WAIT
