@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
+import math
 import os
 import subprocess
 import time
@@ -100,17 +101,33 @@ def _local_time(epoch: float) -> str:
     return datetime.fromtimestamp(epoch).isoformat(sep=" ", timespec="seconds")
 
 
-def _epoch_after(value, than: float) -> bool:
+def _epoch(value) -> Optional[float]:
+    """``value`` as a finite epoch, or None (missing, garbage, NaN or infinite)."""
     try:
-        return float(value) > than
+        at = float(value)
     except (TypeError, ValueError):
-        return True
+        return None
+    return at if math.isfinite(at) else None
 
 
-def _last_external_power_cycle() -> Optional[tuple[float, str]]:
-    """The latest ``at_epoch`` in the external cycler's history file and its cause, or None when no
-    file is named or it cannot be read (the host's boot time still covers any cycle that took the box
-    down). Malformed lines are skipped."""
+def _past_epoch(value, now: float) -> Optional[float]:
+    """``value`` as a finite epoch no later than ``now``, or None. A stamp later than now (a clock that
+    disagrees) anchors nothing in the I65 cooldown: taken as is it would hold a cycle past the stated
+    gaps, and as the max it would hide every valid record before it."""
+    at = _epoch(value)
+    return at if at is not None and at <= now else None
+
+
+def _epoch_after(value, than: float, now: float) -> bool:
+    """A record stamped after ``than`` and not later than ``now``; an unreadable stamp counts."""
+    at = _epoch(value)
+    return True if at is None else than < at <= now
+
+
+def _last_external_power_cycle(now_epoch: float) -> Optional[tuple[float, str]]:
+    """The latest ``at_epoch`` in the external cycler's history file no later than ``now_epoch``, and
+    its cause, or None when no file is named or it cannot be read (the host's boot time still covers
+    any cycle that took the box down). Malformed, non-finite and future lines are skipped."""
     name = os.environ.get(POWER_CYCLE_HISTORY_FILE_ENV, "").strip()
     if not name:
         return None
@@ -122,10 +139,10 @@ def _last_external_power_cycle() -> Optional[tuple[float, str]]:
     for ln in lines:
         try:
             rec = json.loads(ln)
-            at = float(rec.get("at_epoch"))
+            at = _past_epoch(rec.get("at_epoch"), now_epoch)
         except (ValueError, TypeError, AttributeError):
             continue
-        if best is None or at > best[0]:
+        if at is not None and (best is None or at > best[0]):
             best = (at, str(rec.get("cause") or "external power cycle"))
     return best
 
@@ -1073,6 +1090,7 @@ class RecoveryMechanism:
         # boot of any cause (power_cycle_cooldown); the loop below keeps only its fail-closed read.
         cycle = action == "power-cycle"
         min_interval = AUTO_RECOVERY_MIN_INTERVAL_SEC
+        boot_start = _past_epoch(self._boot_btime_id() or None, now_epoch)
         for rec in ledger:
             # A weaker prior rung does not gate a stronger escalation — that is what lets a failed
             # reboot hand off to the power cycle without waiting out the interval. Equal-or-stronger
@@ -1083,6 +1101,11 @@ class RecoveryMechanism:
                 continue
             # A gating record we cannot read a timestamp from is treated as "just now": the interval
             # is the loop guard, so a missing/garbled stamp must block, never wave the action through.
+            # The power cycle's one exception (spec 04 I65): with the boot's start known, such a
+            # record is bounded without it, by the host-boot anchor (a cycle that went down) or the
+            # per-boot cap below (one this boot), so it never refuses the rung for good.
+            if cycle and boot_start is not None:
+                continue
             try:
                 at = float(rec.get("at_epoch"))
             except (TypeError, ValueError):
@@ -1112,43 +1135,54 @@ class RecoveryMechanism:
             # The per-boot cap counts this boot's requests within the action's interval only: a
             # request recorded this boot never took the box down (else this would be a new boot),
             # and holding on it for the rest of the boot was an open-ended hold (spec 04 I65). Past
-            # the interval it is asked again; an unreadable stamp counts as now (fail closed).
-            interval = self.power_cycle_interval(ledger) if cycle else AUTO_RECOVERY_MIN_INTERVAL_SEC
+            # the interval it is asked again. An unreadable stamp counts as the boot's start, a fixed
+            # end (as now only when that is unknown, fail closed). For the power cycle a stamp later
+            # than now counts as nothing: the cooldown already runs from the host boot (I65).
+            interval = (
+                self.power_cycle_interval(ledger, now_epoch=now_epoch) if cycle else AUTO_RECOVERY_MIN_INTERVAL_SEC
+            )
             stamps = []
             for r in ledger:
                 if r.get("boot_id") != boot_id:
                     continue
-                try:
-                    stamps.append(float(r.get("at_epoch")))
-                except (TypeError, ValueError):
-                    stamps.append(now_epoch)
+                at = _epoch(r.get("at_epoch"))
+                if at is None:
+                    at = boot_start if boot_start is not None else now_epoch
+                elif cycle and at > now_epoch:
+                    continue
+                stamps.append(at)
             recent = [t for t in stamps if now_epoch - t < interval]
             if len(recent) >= AUTO_RECOVERY_MAX_PER_BOOT:
                 until = max(recent) + interval
-                if cycle:
-                    self.power_cycle_retry = (until, self._device_hold_episode_since())
-                return False, (
+                why = (
                     f"already auto-escalated {len(recent)}x this boot "
                     f"(cap {AUTO_RECOVERY_MAX_PER_BOOT}); holding {action} until {_local_time(until)}"
                 )
+                if cycle:
+                    self.power_cycle_retry = (until, self._device_hold_episode_since())
+                    self.power_cycle_cooldown_state = {
+                        "until": until,
+                        "last": max(recent),
+                        "cause": "broker request this boot",
+                        "interval_sec": interval,
+                        "why": why,
+                    }
+                return False, why
         if cycle:
             self.power_cycle_retry = None
         return True, ""
 
-    def power_cycle_interval(self, ledger: Optional[list[dict]] = None) -> int:
+    def power_cycle_interval(self, ledger: Optional[list[dict]] = None, *, now_epoch: Optional[float] = None) -> int:
         """The power-cycle cooldown's length now: :func:`power_cycle_interval_sec` of the broker power
-        cycles recorded since the last verified release (spec 04 I65)."""
+        cycles recorded since the last verified release (spec 04 I65). A record stamped later than now
+        is not counted, so it cannot outlive a verified release."""
+        now_epoch = time.time() if now_epoch is None else now_epoch
         ledger = self.read_auto_recovery_ledger() if ledger is None else ledger
-        healed = self._power_cycle_healed_at()
+        healed = self._power_cycle_healed_at(now_epoch)
         failed = 0
         for rec in ledger or []:
-            if rec.get("action") != "power-cycle":
-                continue
-            try:
-                at = float(rec.get("at_epoch"))
-            except (TypeError, ValueError):
-                at = float("inf")  # unreadable: count it, the longer cooldown is the safe side
-            if at > healed:
+            # An unreadable stamp counts: the longer (still capped) cooldown is the safe side.
+            if rec.get("action") == "power-cycle" and _epoch_after(rec.get("at_epoch"), healed, now_epoch):
                 failed += 1
         return power_cycle_interval_sec(failed)
 
@@ -1160,8 +1194,9 @@ class RecoveryMechanism:
         Counted from the latest of: the broker's own last reboot or power cycle (its ledger); this
         host's current boot, whatever caused it; and the last record of the external cycler's history
         file when one is named and readable. A stamp later than now (a clock that disagrees) anchors
-        nothing. Returns ``until``/``last`` (epochs), ``cause``, ``interval_sec`` and ``why``, the line
-        the journal and /health carry."""
+        nothing, and neither does a non-finite or unreadable one; each source's anchor is its latest valid
+        past record. Returns ``until``/``last`` (epochs), ``cause``, ``interval_sec`` and ``why``, the
+        line the journal and /health carry."""
         now_epoch = time.time() if now_epoch is None else now_epoch
         ledger = self.read_auto_recovery_ledger() if ledger is None else ledger
         anchors: list[tuple[float, str]] = []
@@ -1169,31 +1204,24 @@ class RecoveryMechanism:
         for rec in ledger or []:
             if rec.get("action") not in AUTO_RECOVERY_RANK:
                 continue
-            try:
-                at = float(rec.get("at_epoch"))
-            except (TypeError, ValueError):
-                continue
-            if broker_last is None or at > broker_last[0]:
+            at = _past_epoch(rec.get("at_epoch"), now_epoch)
+            if at is not None and (broker_last is None or at > broker_last[0]):
                 broker_last = (at, str(rec.get("action")))
         if broker_last is not None:
             anchors.append((broker_last[0], f"broker {broker_last[1]}"))
-        try:
-            btime = float(self._boot_btime_id() or "")
-        except ValueError:
-            btime = None
+        btime = _past_epoch(self._boot_btime_id() or None, now_epoch)
         if btime is not None:
             by_broker = (
                 broker_last is not None and 0 <= btime - broker_last[0] <= BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC
             )
             anchors.append((btime, f"host boot after the broker {broker_last[1]}" if by_broker else "host boot"))
-        external = _last_external_power_cycle()
+        external = _last_external_power_cycle(now_epoch)
         if external is not None:
             anchors.append(external)
-        anchors = [a for a in anchors if a[0] <= now_epoch]
         if not anchors:
             return None
         last, cause = max(anchors, key=lambda a: a[0])
-        interval = self.power_cycle_interval(ledger)
+        interval = self.power_cycle_interval(ledger, now_epoch=now_epoch)
         until = last + interval
         if now_epoch >= until:
             return None
@@ -1208,11 +1236,14 @@ class RecoveryMechanism:
             ),
         }
 
-    def _power_cycle_healed_at(self) -> float:
+    def _power_cycle_healed_at(self, now_epoch: float) -> float:
+        """When the last verified release ended the streak; 0.0 (no heal: every cycle counts, the
+        longer capped cooldown) when unknown, unreadable or later than now."""
         try:
-            return float(json.loads((health_dir() / POWER_CYCLE_HEALED_FILE).read_text()).get("at_epoch", 0))
+            at = json.loads((health_dir() / POWER_CYCLE_HEALED_FILE).read_text()).get("at_epoch", 0)
         except (OSError, ValueError, TypeError, AttributeError):
             return 0.0
+        return _past_epoch(at, now_epoch) or 0.0
 
     def note_mesh_verified(self, *, now_epoch: Optional[float] = None) -> None:
         """A verified release (a passing full health check, fabric included) ends any power-cycle
@@ -1220,11 +1251,13 @@ class RecoveryMechanism:
         cycle is recorded after the last heal. Never raises."""
         self.power_cycle_retry = None
         self.power_cycle_cooldown_state = None
-        ledger = self.read_auto_recovery_ledger() or []
-        healed = self._power_cycle_healed_at()
-        if not any(r.get("action") == "power-cycle" and _epoch_after(r.get("at_epoch"), healed) for r in ledger):
-            return
         now_epoch = time.time() if now_epoch is None else now_epoch
+        ledger = self.read_auto_recovery_ledger() or []
+        healed = self._power_cycle_healed_at(now_epoch)
+        if not any(
+            r.get("action") == "power-cycle" and _epoch_after(r.get("at_epoch"), healed, now_epoch) for r in ledger
+        ):
+            return
         try:
             path = health_dir() / POWER_CYCLE_HEALED_FILE
             path.parent.mkdir(parents=True, exist_ok=True)

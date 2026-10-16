@@ -356,12 +356,12 @@ def _power_cycle_direct_class(
 
     ``FAULT_CLASS_ALL_OFF`` when every chip is off the bus and ``mesh_reset_failed``: a mesh reset
     already ran and failed on it, or the broker's own reboot or power cycle for this fault did not
-    bring it back (the callers pass both, spec 04 I37). A whole-bus drop with no failed reset gets its one mesh reset
-    first, at the startup gate as at run time: the startup gate also runs after a broker restart, and
-    one mesh reset has brought a whole bus back there. ``FAULT_CLASS_WHOLE_TRAY`` when the set is
-    exactly one or more whole trays and at least one chip of the mesh is still on the bus. Anything else — a partial-tray drop, a single
-    chip, a host with fewer than two trays, or no tray map to say which chips share a tray — is
-    None. Pure and side-effect-free."""
+    bring it back (the callers pass both, spec 04 I37). A whole-bus drop with no failed reset gets
+    its one mesh reset first, at the startup gate as at run time: the startup gate also runs after a
+    broker restart, and one mesh reset has brought a whole bus back there. ``FAULT_CLASS_WHOLE_TRAY``
+    when the set is exactly one or more whole trays and at least one chip of the mesh is still on the
+    bus. Anything else — a partial-tray drop, a single chip, a host with fewer than two trays, or no
+    tray map to say which chips share a tray — is None. Pure and side-effect-free."""
     if expected < 2 * UBB_CHIP_COUNT or not offbus_chips:
         return None
     if len(offbus_chips) >= expected:

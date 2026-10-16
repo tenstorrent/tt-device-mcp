@@ -691,13 +691,14 @@ each rung fires only when the gentler one failed or cannot apply.
   every chip) and at least one chip is still on the bus. Class C: every chip is off the bus after a
   mesh reset already ran and failed (nonzero exit or unhealthy verify) since the mesh was last
   released (or this boot, I58), or after a host reboot or power cycle the broker started for this
-  fault: the boot it brought up, or one requested this boot since the hold episode began. A whole-bus drop with no failed reset gets its one mesh reset first, at the startup gate
-  as at run time: the startup gate also runs after a broker restart, and one mesh reset has healed an
-  all-off bus there and at run time. When the
-  power cycle is opted in, `escalate()` requests it for these classes before any rung fires (after the
-  I19 rescan and capture, which still run once per episode): no mesh reset, no SBR, no tray re-power
-  and no last-chance sweep, and the host rung's own sweep skips itself for these classes
-  (`last_chance_sweep_skipped`). The request keeps every guard of the host rung: a reset cycling in
+  fault: the boot it brought up, or one requested this boot since the hold episode began. A
+  whole-bus drop with no failed reset gets its one mesh reset first, at the startup gate as at run
+  time: the startup gate also runs after a broker restart, and one mesh reset has healed an all-off
+  bus there and at run time. When the power cycle is opted in, `escalate()` requests it for these
+  classes before any rung fires (after the I19 rescan and capture, which still run once per
+  episode): no mesh reset, no SBR, no tray re-power and no last-chance sweep, and the host rung's
+  own sweep skips itself for these classes (`last_chance_sweep_skipped`). The request keeps every
+  guard of the host rung: a reset cycling in
   its scope, a tenant or an unreadable holder scan, an operator stand-back marker or check, and the
   power-cycle rate limits (journaled as denied) each hold and fire nothing; the next window asks
   again. The hold-deadline climb (`offbus-forced`) waives an unreadable scan, as the tray rung does,
@@ -739,8 +740,12 @@ each rung fires only when the gentler one failed or cannot apply.
   reboot or power cycle (the I9 ledger), the host's current boot (whatever caused it: a manual, BMC,
   datacenter or external cycle shows here), and the last record of an external cycler's history file
   when `TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE` names a readable one (JSON lines with `at_epoch` and
-  an optional `cause`; unreadable or malformed lines are ignored). A stamp later than now anchors
-  nothing. The cooldown is the power cycle's own interval (`POWER_CYCLE_MIN_INTERVAL_SEC`, 1800 s),
+  an optional `cause`; unreadable or malformed lines are ignored). A stamp later than now (a clock
+  that disagrees), non-finite or unreadable anchors nothing and never hides an earlier valid one:
+  each source's anchor is its latest valid past record, so no stamp postpones a cycle past the stated
+  gaps or skips the cooldown. A power-cycle record stamped later than now does not count toward the
+  backoff streak, and a heal stamped later than now reads as no heal (the longer, capped gaps). The
+  cooldown is the power cycle's own interval (`POWER_CYCLE_MIN_INTERVAL_SEC`, 1800 s),
   the governor's one check for this rung, not a second gate. After two consecutive broker power
   cycles with no verified release between them it doubles for each further one, capped at 4 h:
   30 min, 30 min, 1 h, 2 h, then 4 h. A verified release (the full health check, fabric included,
@@ -752,7 +757,10 @@ each rung fires only when the gentler one failed or cannot apply.
   watchdog asks once (a forced escalation in the same hold episode), and the cycle fires then if the
   fault persists, behind I37's stand-back, tenant and scope guards. Every governor denial names its
   end: the per-boot cap counts only records within the interval, so a cycle requested this boot that
-  never took the box down is asked again at the interval's end rather than never. At most one cycle
+  never took the box down is asked again at the interval's end rather than never. There an unreadable
+  stamp counts as the boot's start (a fixed end, not now), a stamp later than now does not count for
+  the power cycle, and with the boot's start known an unreadable power-cycle record never refuses the
+  rung for good. A cap denial of the power cycle shows on `/health` like the cooldown's. At most one cycle
   fires per cooldown, and no hold waits on it without a stated time. Goal of 03 I4 holds after each
   cycle: the startup gate waits for the hugepage pool and passes the full check, fabric included,
   before any release; a failed check keeps the hold and the streak. Time to the power-cycle request
@@ -1225,6 +1233,7 @@ sees a silent fabric pass.
 | I65 every denial ends at a stated time and is asked again then, in its own hold episode; the per-boot cap is bounded | `tests/test_power_cycle_cooldown.py::test_a_cycle_requested_this_boot_that_never_went_down_is_asked_again`, `::test_the_watchdog_retry_is_kept_to_its_own_hold_episode`, `tests/test_device_safety.py::test_governor_per_boot_cap_ends_with_the_interval`, `::test_power_cycle_after_a_recent_reboot_waits_out_the_cooldown` |
 | I65 no recent cycle or boot: the cycle fires at once | `tests/test_power_cycle_cooldown.py::test_with_no_recent_cycle_or_boot_the_cycle_fires_at_once` |
 | I65 only a verified release with no fabric debt ends the streak; a refused one keeps the hold | `tests/test_power_cycle_cooldown.py::test_only_a_verified_release_with_no_fabric_debt_ends_the_streak` |
+| I65 a future, non-finite or unreadable stamp (history file, ledger, heal file) never hides a valid past anchor, never holds the cycle past the stated gap, never keeps the streak past a verified release; every cap denial is on /health | `tests/test_power_cycle_cooldown.py::test_a_nan_or_future_history_line_does_not_hide_the_valid_past_one`, `::test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle`, `::test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health`, `::test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end`, `::test_the_per_boot_cap_denial_shows_on_health`, `::test_a_future_record_does_not_keep_the_streak_past_a_verified_release` |
 | I37/I65 class C at startup: one mesh reset with no failed reset or broker cycle; none after the broker's own cycle, which then waits only for the cooldown | `tests/test_power_cycle_cooldown.py::test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_gets_one_reset`, `::test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_reset`, `::test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not` |
 | I58 all off after a failed reset and a broker restart: the startup or a later gate cycles with no second reset; the sweep skips a failed-unchanged set | `tests/test_classac_power_cycle_direct.py::test_replay_all_off_after_a_restart_cycles_with_no_second_reset`, `::test_a_partial_drop_keeps_the_ladder` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |

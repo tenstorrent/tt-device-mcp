@@ -171,6 +171,83 @@ def test_a_boot_stamp_in_the_future_anchors_nothing(cool):
     assert cool["g"].mechanism.power_cycle_cooldown(now_epoch=T0) is None
 
 
+def _hist(monkeypatch, tmp_path, *lines):
+    hist = tmp_path / "cycles.jsonl"
+    hist.write_text("".join(ln + "\n" for ln in lines))
+    monkeypatch.setenv(recovery_base.POWER_CYCLE_HISTORY_FILE_ENV, str(hist))
+
+
+@pytest.mark.parametrize("bad", ['{"at_epoch": NaN}', '{"at_epoch": Infinity}', "FUTURE"])
+@pytest.mark.parametrize("bad_first", [True, False])
+def test_a_nan_or_future_history_line_does_not_hide_the_valid_past_one(cool, monkeypatch, tmp_path, bad, bad_first):
+    """Review #968: one non-finite or future line (a clock that disagrees) took the max and was then
+    dropped as future, so the real cycle 100 s ago anchored nothing and the cycle fired at once."""
+    bad = bad.replace("FUTURE", json.dumps({"at_epoch": T0 + 6 * 3600, "cause": "clock ahead"}))
+    good = json.dumps({"at_epoch": T0 - 100, "cause": "BMC chassis power cycle"})
+    _hist(monkeypatch, tmp_path, *((bad, good) if bad_first else (good, bad)))
+    cd = cool["g"].mechanism.power_cycle_cooldown(now_epoch=T0)
+    assert cd["last"] == T0 - 100 and cd["cause"] == "BMC chassis power cycle"
+    assert cd["until"] == T0 - 100 + POWER_CYCLE_MIN_INTERVAL_SEC
+
+
+@pytest.mark.parametrize("bad", [T0 + 6 * 3600, "NaN", "garbage"])
+def test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle(cool, bad):
+    _ledger(
+        {"action": "power-cycle", "boot_id": "boot-old", "at_epoch": T0 - 100, "at": "x"},
+        {"action": "reboot", "boot_id": "boot-old", "at_epoch": bad, "at": "x"},
+    )
+    cd = cool["g"].mechanism.power_cycle_cooldown(now_epoch=T0)
+    assert cd["last"] == T0 - 100 and cd["cause"] == "broker power-cycle"
+
+
+def test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health(cool, monkeypatch):
+    """Review #968: a this-boot ledger stamp 6 h ahead (the clock stepped back) held the cycle until
+    stamp + interval, 6.5 h, with nothing on /health. It now anchors nothing: the cooldown runs from
+    the host boot, the denial is on /health, and the cycle is allowed at the boot's cooldown end."""
+    m = cool["g"].mechanism
+    cool["boot"]["btime"] = T0 - 600
+    _ledger({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": T0 + 6 * 3600, "at": "x"})
+    allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=T0)
+    until = T0 - 600 + POWER_CYCLE_MIN_INTERVAL_SEC
+    assert not allowed and m.power_cycle_retry[0] == until
+    monkeypatch.setattr(srv, "_device_hold_state", lambda now=None: ("tray off", srv.device_hold_episode_since))
+    payload = srv._health_payload(now=datetime.fromtimestamp(T0))
+    assert payload["power_cycle_cooldown"]["next_deadline"] == datetime.fromtimestamp(until).isoformat(
+        timespec="seconds"
+    )
+    allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=until)
+    assert allowed, why
+
+
+@pytest.mark.parametrize("action", ["reboot", "power-cycle"])
+@pytest.mark.parametrize("stamp", [None, "garbage", "NaN"])
+def test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end(cool, action, stamp):
+    """Review #968: an unreadable stamp counted as now, so its end moved forward on every ask and the
+    cycle was held for the whole boot. It now ends at the boot's start plus the interval, a fixed
+    time; a power-cycle record no longer refuses the rung for good either."""
+    m = cool["g"].mechanism
+    cool["boot"]["btime"] = T0 - 600
+    _ledger({"action": action, "boot_id": "boot-A", "at_epoch": stamp, "at": "x"})
+    until = T0 - 600 + POWER_CYCLE_MIN_INTERVAL_SEC
+    for now in (T0, until - 1):
+        allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=now)
+        assert not allowed and m.power_cycle_retry[0] == until, why
+        assert m.power_cycle_cooldown_state["until"] == until
+    allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=until)
+    assert allowed, why
+
+
+def test_the_per_boot_cap_denial_shows_on_health(cool, monkeypatch):
+    """Any cap denial of the power cycle fills the /health deadline, not only the cooldown's."""
+    m = cool["g"].mechanism
+    monkeypatch.setattr(m, "power_cycle_cooldown", lambda **k: None)  # isolate the per-boot cap
+    _ledger({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": T0 - 60, "at": "x"})
+    allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=T0)
+    until = T0 - 60 + POWER_CYCLE_MIN_INTERVAL_SEC
+    assert not allowed and m.power_cycle_cooldown_state["until"] == until == m.power_cycle_retry[0]
+    assert m.power_cycle_cooldown_state["last"] == T0 - 60
+
+
 # ---- (c) backoff ---------------------------------------------------------------------------------
 
 
@@ -202,6 +279,25 @@ def test_cycles_that_heal_nothing_back_off_and_a_verified_release_resets_it(cool
     m.note_mesh_verified(now_epoch=at)
     assert m.power_cycle_interval() == POWER_CYCLE_MIN_INTERVAL_SEC
     assert m.power_cycle_retry is None
+
+
+def test_a_future_record_does_not_keep_the_streak_past_a_verified_release(cool):
+    """Review #968: a power-cycle record stamped later than now stayed 'after the heal', so a verified
+    release did not end the backoff streak. A heal file stamped later than now does not hide the
+    cycles after it either (it reads as no heal: the longer, capped cooldown)."""
+    m = cool["g"].mechanism
+    _ledger(
+        {"action": "power-cycle", "boot_id": "b1", "at_epoch": T0 - 7200, "at": "x"},
+        {"action": "power-cycle", "boot_id": "b2", "at_epoch": T0 - 3600, "at": "x"},
+        {"action": "power-cycle", "boot_id": "b3", "at_epoch": T0 + 6 * 3600, "at": "x"},
+    )
+    assert m.power_cycle_interval(now_epoch=T0) == 3600  # two past cycles; the future one is not counted
+    m.note_mesh_verified(now_epoch=T0)
+    assert m.power_cycle_interval(now_epoch=T0 + 1) == POWER_CYCLE_MIN_INTERVAL_SEC
+    (recovery_base.health_dir() / recovery_base.POWER_CYCLE_HEALED_FILE).write_text(
+        json.dumps({"at_epoch": T0 + 9 * 3600})
+    )
+    assert m.power_cycle_interval(now_epoch=T0) == 3600
 
 
 # ---- (d) a denial retries at its stated time -----------------------------------------------------
