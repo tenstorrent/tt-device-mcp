@@ -709,6 +709,7 @@ class Recovery(ABC):
             if rc is not None:
                 self.mechanism.last_reset_failed = True
                 self.mechanism.last_reset_exit_nonzero = True
+                self.mechanism.mesh_reset_failed_since_release = True
             metrics.stage_fired("smi_reset", "timeout" if rc is None else "failed")
             return False
 
@@ -748,6 +749,8 @@ class Recovery(ABC):
             fabric_retries=retries,
         )
         self.mechanism.last_reset_failed = not healthy
+        if not healthy:
+            self.mechanism.mesh_reset_failed_since_release = True
         if healthy:
             log("reset complete + health verified")
             return True

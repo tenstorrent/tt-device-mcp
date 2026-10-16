@@ -318,6 +318,10 @@ class RecoveryMechanism:
         # Any reset_with_quiesce (the ladder's or a manual one) since the mesh was last released:
         # an off-bus set first seen after it is the reset's doing, never a tray-down onset (04 I19).
         self.reset_since_release = False
+        # A mesh reset ran to an exit and left the mesh unhealthy since the mesh was last released.
+        # With every chip still off the bus after it, a second one is futile (spec 04 I37): the
+        # episode goes straight to the power-cycle rung.
+        self.mesh_reset_failed_since_release = False
 
         # The full transcript of the last reset, not the 3-line tail the journal carries: when a
         # mesh is left half-alive, the interesting line is usually somewhere in the middle.
