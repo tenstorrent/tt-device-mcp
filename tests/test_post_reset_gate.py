@@ -358,3 +358,119 @@ async def test_a_pre_job_gate_never_runs_the_owed_pass(monkeypatch, tmp_path):
     FABRIC_DEBT.note_reset("tt-smi -glx_reset")
     await srv._device_health_gate(None, phase="pre-job", run_fabric=False)
     assert calls["fabric"] == 0
+
+
+# ---- the last-chance sweep before a host rung (04 I22/I32): a verify that proves no fabric holds ----
+
+# The fabric check could not run at all (spawn failure): no verdict, and the pass journals
+# fabric_check_unavailable. Like a 77, it must hold, never release.
+FUNAVAIL = {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": "skipped (fabric check not runnable: x)"}}
+
+
+@pytest.fixture(params=["fabric-77", "no-fabric-verdict", "fabric-unavailable", "fabric-ok"])
+def sweep_verdict(request):
+    if request.param == "fabric-ok":
+        return FOK, True
+    return (FUNAVAIL if request.param == "fabric-unavailable" else UNPROVEN[request.param]), False
+
+
+def _arm_last_chance_sweep(monkeypatch, mesh, evidence):
+    """Stub every reset the sweep fires (the mesh reset records the debt, as reset_with_quiesce
+    does) and the host rungs; return the list of host rungs that fired."""
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
+    monkeypatch.setattr(g.deps, "isolated_chips", lambda: set())
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: None)
+    host = []
+
+    async def mesh_reset(argv, log, *a, **k):
+        FABRIC_DEBT.note_reset("tt-smi -glx_reset")
+        return 0, ""
+
+    async def power_cycle(log, reason):
+        host.append("power-cycle")
+
+    async def reboot(log, reason):
+        host.append("reboot")
+
+    async def verify(expected, log, run_fabric=True, **_):
+        if (evidence.get("fabric") or {}).get("detail", "").startswith("skipped"):
+            mesh.append(("fabric_check_unavailable", {"detail": "not_runnable"}))
+        return True, dict(evidence)
+
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh_reset)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    monkeypatch.setattr(g, "_auto_reboot_host", reboot)
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    return g, host
+
+
+def _assert_no_release(mesh):
+    assert _held(), "the sweep released a reset mesh no fabric pass has passed on since"
+    assert FABRIC_DEBT.owed == "tt-smi -glx_reset"
+    kinds = [k for k, _ in mesh]
+    # The funnel's own hold journals the dropped dirty bit as unverified; a verified clear is a release.
+    assert not any(k == "device_dirty_cleared" and f.get("verified") for k, f in mesh), "released as verified"
+    assert not any(k == "gate" and f.get("healthy") for k, f in mesh), "journaled as a healthy gate"
+    assert "post_reset_release_refused" in kinds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", [galaxy.STAGE_HOST_REBOOT, galaxy.STAGE_POWER_CYCLE])
+async def test_the_gate_ladders_last_chance_sweep(mesh, monkeypatch, galaxy_trays, sweep_verdict, stage):
+    """The gate's host rung runs the sweep; its verify passes enum+ARC. Folded into the FSM the way the
+    gate's ``_fire`` does, the device is released only on a passing fabric pass; otherwise it stays
+    held fabric-unverified (the relift owns it), and no host rung fires on a verify that passed."""
+    evidence, released = sweep_verdict
+    fsm_dirty(srv, "gate/post-job: mesh failed the verify after the reset", why="job_killed")
+    g, host = _arm_last_chance_sweep(monkeypatch, mesh, evidence)
+    out = await g._fire_gate_rung("post-job", stage, ["0"], 32, lambda m: None, ev=None, beats={})
+    assert out == galaxy.OUTCOME_RECOVERED, "the gate stops climbing this pass: no further reset or host rung"
+    srv._fold_rung_outcome(out, lambda m: None)
+    assert host == [], "no reboot or power cycle on a mesh whose verify passed enum+ARC"
+    if released:
+        assert srv.fsm.state is ServerState.HEALTHY and FABRIC_DEBT.owed == ""
+        assert any(k == "gate" and f.get("recovered_via") == "last-chance-reset-sweep" for k, f in mesh)
+    else:
+        _assert_no_release(mesh)
+        assert srv._idle_relift_armed()[1], "the fabric relift owns the hold: bounded, never open-ended"
+
+
+@pytest.mark.parametrize(
+    "owed, outcome, expect",
+    [
+        (True, galaxy.OUTCOME_RECOVERED, "held"),  # the funnel refused: never reopened by the fold
+        (False, galaxy.OUTCOME_RECOVERED, "healthy"),
+        (True, galaxy.OUTCOME_TERMINAL, "held"),  # a 77-only hold measured no fault: not DOWN
+        (False, galaxy.OUTCOME_WAITING, "held"),
+    ],
+)
+def test_no_rung_outcome_lifts_a_fabric_unverified_hold(mesh, owed, outcome, expect):
+    """The gate, the idle relift and the hold escalation fold a rung's outcome through one helper, so
+    none of them reopens the door the release funnel held (I32), nor parks a 77-only hold in DOWN."""
+    if owed:
+        FABRIC_DEBT.note_reset("tt-smi -glx_reset")
+    srv._hold_device_fabric_unverified("fabric check exited 77")
+    srv._fold_rung_outcome(outcome, lambda m: None)
+    if expect == "healthy":
+        assert srv.fsm.state is ServerState.HEALTHY
+    else:
+        assert _held()
+
+
+def test_a_terminal_rung_on_a_measured_fault_still_goes_down(mesh):
+    fsm_dirty(srv, "gate/post-job: mesh failed the verify after the reset", why="job_killed")
+    srv._fold_rung_outcome(galaxy.OUTCOME_TERMINAL, lambda m: None)
+    assert srv.fsm.state is ServerState.DOWN
+
+
+def test_every_rung_outcome_folds_through_the_helper():
+    import inspect
+
+    src = inspect.getsource(srv)
+    body = src.replace(inspect.getsource(srv._fold_rung_outcome), "")
+    assert "fsm.on_outcome(" not in body, "a rung outcome folded around the I32 guard"
+    assert src.count("_fold_rung_outcome(outcome, ") == 3, "the gate, the idle relift and the hold escalation"
