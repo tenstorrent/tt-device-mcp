@@ -281,6 +281,12 @@ class RecoveryMechanism:
         # made the drop worse — one Galaxy host went 4 -> 31 -> 32 off-bus across three — so the episode
         # goes straight to the host rung, or pages when none is opted in (spec 04 I31).
         self.regressed_reset_since: Optional[str] = None
+        # The hold episode (its ``since``) whose reset rungs failed, and per rung the off-bus set it
+        # failed with when it left that set unchanged. Firing it again on the same set measures nothing
+        # new (one Galaxy host ran six identical 263 s mesh resets in one hold, one per forced window),
+        # so the next window takes the next stronger rung instead (spec 04 I36).
+        self.failed_rungs_since: str = ""
+        self.failed_rungs: dict = {}
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a
@@ -311,9 +317,6 @@ class RecoveryMechanism:
         self.host_action_requested: Optional[tuple[str, float]] = None
         # The request a device reset was last refused for (one log line per request, spec 04 I34).
         self._host_action_reset_refused: Optional[tuple[str, float]] = None
-        # The hold episode in which a power cycle was found required (spec 04 I35): no further
-        # device reset runs in it — the next recovery step is the host rung, or the hold.
-        self.power_cycle_required_since: Optional[str] = None
 
     def host_action_pending(self, now: Optional[float] = None) -> Optional[tuple[str, float]]:
         """``(action, age_sec)`` while a requested host reboot or power cycle is still inside its
@@ -352,16 +355,6 @@ class RecoveryMechanism:
             )
         return True
 
-    def note_power_cycle_required(self, hold_since: str) -> None:
-        """Latch that this hold episode needs a power cycle (spec 04 I35): no more device resets in
-        it. Before any hold opened it latches the episode about to open; release clears it."""
-        self.power_cycle_required_since = hold_since or "*"
-
-    def power_cycle_required_in(self, hold_since: str) -> bool:
-        """True when this hold episode already found that only a power cycle heals it."""
-        latched = self.power_cycle_required_since
-        return latched is not None and (latched == "*" or latched == hold_since)
-
     def cooling(self) -> bool:
         """True while a reset that already failed is still inside its cooldown window.
 
@@ -382,6 +375,26 @@ class RecoveryMechanism:
         reset on it is not tried (spec 04 I31)."""
         latched = self.regressed_reset_since
         return latched is not None and (latched == "*" or latched == hold_since)
+
+    def note_rung_failed(self, hold_since: str, rung: str, off_before, off_after) -> None:
+        """Record that ``rung`` failed in this hold episode (spec 04 I36). Only a failure that left the
+        off-bus set exactly as it found it is kept: a set that grew is a regression (I31) and one that
+        shrank is progress another try may finish."""
+        if not hold_since:
+            return
+        if self.failed_rungs_since != hold_since:
+            self.failed_rungs_since, self.failed_rungs = hold_since, {}
+        if off_before is not None and off_after is not None and set(off_before) == set(off_after):
+            self.failed_rungs[rung] = frozenset(off_after)
+        else:
+            self.failed_rungs.pop(rung, None)
+
+    def rung_failed_unchanged(self, hold_since: str, rung: str, off_now) -> bool:
+        """True when ``rung`` already failed in this hold episode on exactly the off-bus set seen now:
+        it is not fired again in the episode (spec 04 I36)."""
+        if not hold_since or off_now is None or self.failed_rungs_since != hold_since:
+            return False
+        return self.failed_rungs.get(rung) == frozenset(off_now)
 
     def _local_reset_lock_path(self) -> Path:
         return self._local_reset_dir() / LOCAL_RESET_LOCK

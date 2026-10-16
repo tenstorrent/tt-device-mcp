@@ -59,9 +59,9 @@ def reset_post_reset_fabric_debt():
 
 @pytest.fixture(autouse=True)
 def reset_host_action_state():
-    """Clear the process-wide mechanism's pending host action and power-cycle-required latch
-    (spec 04 I34/I35) around every test: escalate() refuses every rung under either, so one a test
-    left behind would stop the next test's ladder."""
+    """Clear the process-wide mechanism's pending host action (spec 04 I34) around every test:
+    escalate() refuses every rung under it, so one a test left behind would stop the next test's
+    ladder."""
 
     def clear():
         m = srv.recovery_mechanism
@@ -69,7 +69,6 @@ def reset_host_action_state():
             return
         m.host_action_requested = None
         m._host_action_reset_refused = None
-        m.power_cycle_required_since = None
 
     clear()
     yield
@@ -442,6 +441,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # test tripping it does not silence the next test's expected held event. raising=False
     # so a tree without the attribute yet (a fails-on-base stash) still sets up cleanly.
     monkeypatch.setattr(srv, "device_hold_logged", False, raising=False)
+    # A carried-over hold one startup test armed must not tag the next test's device_held.
+    monkeypatch.setattr(srv, "_carried_hold", None, raising=False)
     # The idle escalation's and the per-tray BMC reset's once-per-episode latches are per-episode
     # state on the fresh srv.fsm just constructed above, so they are already unarmed here — no
     # separate reset needed.
