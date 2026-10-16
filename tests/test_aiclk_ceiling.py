@@ -211,7 +211,7 @@ def _timed_helper(monkeypatch, runs):
     starts, timeouts = [], []
     runs = list(runs)
 
-    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate):
+    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate, name=""):
         starts.append(clock[0])
         timeouts.append(timeout_sec)
         rc, out, sec = runs.pop(0) if len(runs) > 1 else runs[0]
