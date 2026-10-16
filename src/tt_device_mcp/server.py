@@ -3894,7 +3894,7 @@ async def _attempt_idle_relift() -> None:
             if await asyncio.to_thread(recovery_mechanism.scope_active):
                 return
 
-            async def _escalate(rung: str) -> bool:
+            async def _escalate(rung: str, *, measured_fault: bool = False) -> bool:
                 """Run one rung and fold its outcome into ``fsm``. Returns True iff something
                 other than WAITING came back — the caller's cue to stop, the same way a direct
                 ``!= OUTCOME_WAITING`` check did before ``fsm`` needed telling too.
@@ -3903,9 +3903,10 @@ async def _attempt_idle_relift() -> None:
                 reason the gate's rungs are: the idle ladders apply on every platform (reset argv
                 is re-derived per platform inside _reset_and_verify_device), while a per-target
                 host's own escalate() has no ladder and reports WAITING forever — an idle hold
-                there would outlive every ceiling with no rung ever attempted."""
+                there would outlive every ceiling with no rung ever attempted. ``measured_fault``
+                lets the present ladder reset without the grace (spec 03 I56)."""
                 _void_fabric_ok(f"idle relift: {rung}")
-                outcome = await galaxy_recovery.escalate(rung, indices, expected, _log)
+                outcome = await galaxy_recovery.escalate(rung, indices, expected, _log, measured_fault=measured_fault)
                 if outcome == OUTCOME_TERMINAL and _fabric_77_only_hold():
                     # The rung ran and the fabric still only 77s: no fault was measured, so the episode
                     # is not the terminal DOWN no idle path re-checks. It stays held and RECOVERING, and
@@ -4008,6 +4009,11 @@ async def _attempt_idle_relift() -> None:
             else:
                 eok, edetail = await health_monitor.verify_eth_heartbeat()
                 if fsm.record.why == "eth_frozen":
+                    # The hold's last fabric pass MEASURED a failure (a post-job gate's rc 1, not a 77
+                    # skip) and no eth read says the cores are frozen: the fault is proven, so the
+                    # present-mesh reset runs on this relift, not after the grace (I56). A positive
+                    # frozen read keeps the grace — that is the eth wedge it was sized for.
+                    measured = health_monitor.last_fabric_ok is False and eok is not False
                     # Held for a frozen eth core, which enum+ARC cannot see. Lift ONLY on a positively-
                     # advancing heartbeat. `None` is "could not tell" (reader unconfigured, or a read a
                     # frozen core can itself hang), `False` is still frozen — both hold. The gate never
@@ -4018,7 +4024,7 @@ async def _attempt_idle_relift() -> None:
                         # unreadable — a present-mesh wedge no read the broker owns can clear. Left here
                         # the hold stands forever on an idle box (the 8h strand). Past the ceiling, with
                         # no tenant, escalate to the gate's galaxy reset, which re-inits every eth core.
-                        if await _escalate("present"):
+                        if await _escalate("present", measured_fault=measured):
                             return
                         _log(
                             f"held for a frozen eth core but the heartbeat is not confirmed advancing "
@@ -4033,8 +4039,9 @@ async def _attempt_idle_relift() -> None:
                         # real traffic verdict was FAIL and that no pass has cleared since. Same
                         # last-verdict guard as the off-bus branch below, but here the mesh is fully
                         # present, so this is exactly the state the present-mesh galaxy reset cures:
-                        # ride its guards (grace, pacing, tenant-free) instead of standing forever.
-                        if await _escalate("present"):
+                        # ride its guards (pacing, tenant-free; no grace on a measured fault, I56)
+                        # instead of standing forever.
+                        if await _escalate("present", measured_fault=measured):
                             return
                         _log(
                             "eth heartbeat advancing but the last fabric verdict was UNHEALTHY — "
@@ -12106,7 +12113,7 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
 
         class _BrokerServer(uvicorn.Server):
             # Note the stop signal first: a health probe the same cgroup-wide SIGTERM kills then
-            # reads as interrupted by shutdown, never as a failure (03 I58).
+            # reads as interrupted by shutdown, never as a failure (03 I63).
             def handle_exit(self, sig, frame):
                 note_broker_stopping(sig)
                 super().handle_exit(sig, frame)

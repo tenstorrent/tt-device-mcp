@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 """A health probe killed by the host going down, or by the broker's own stop, is not a verdict
-(spec 03 I58).
+(spec 03 I63).
 
 systemd stops a unit by signalling its whole cgroup, so a host shutdown or a broker stop
 SIGTERMs a running probe in the same instant it SIGTERMs the broker. The probe then exits -15,

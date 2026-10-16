@@ -68,7 +68,7 @@ async def run_probe(
 
     A probe that ends by SIGTERM/SIGKILL while the host or the broker is shutting down raises
     ``shutdown.CheckInterruptedByShutdown`` (``name`` labels it, else ``argv[0]``): the shutdown
-    killed it, it measured nothing, and no caller may count it (spec 03 I58).
+    killed it, it measured nothing, and no caller may count it (spec 03 I63).
     """
     proc: Optional[asyncio.subprocess.Process] = None
     try:

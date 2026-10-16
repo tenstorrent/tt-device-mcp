@@ -565,7 +565,7 @@ async def test_forced_escalation_fires_on_a_hold_held_only_by_a_reported_fault(m
 
     climbed = []
 
-    async def _fake_present(indices, expected, log, *, force=False):
+    async def _fake_present(indices, expected, log, *, force=False, **_):
         climbed.append(("present", force))
 
     async def _fake_offbus(indices, expected, log, *, force=False):
@@ -9080,6 +9080,58 @@ async def test_idle_relift_escalates_an_eth_hold_with_a_failed_fabric_to_the_pre
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("eth", [None, True])
+async def test_idle_relift_resets_a_measured_fabric_failure_without_the_grace(
+    monkeypatch, tmp_path, clear_job_state, eth
+):
+    """Class J (job failed, post-job gate measured fabric rc 1 on a present mesh): the fault is
+    proven, so the first idle relift resets — seconds into the hold, not after the 120 s grace
+    (spec 03 I56). Replays g15blx02 10-14 (first relift 3 s in, eth read None) and blx01 10-12
+    (eth advancing). Fails on base, where the hold sits out the grace first."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=0.05)
+    srv.health_monitor.last_fabric_ok = False
+
+    async def healthy(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}}
+
+    async def eth_read(timeout_sec=60.0):
+        return eth, "eth read"
+
+    patch_recovery(monkeypatch, "_verify_device", healthy)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_read)
+
+    await srv._attempt_idle_relift()
+
+    assert counters["resets"] == 1, "a measured fabric failure must reset on the first relift, not after the grace"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eth,fabric", [(False, False), (None, None), (None, True)])
+async def test_idle_relift_keeps_the_grace_without_a_measured_fabric_failure(
+    monkeypatch, tmp_path, clear_job_state, eth, fabric
+):
+    """I56 is narrow: a positive frozen eth read, or no measured fabric failure (77 / healthy),
+    keeps the grace before the present-mesh reset."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=0.05)
+    srv.health_monitor.last_fabric_ok = fabric
+
+    async def healthy(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}}
+
+    async def eth_read(timeout_sec=60.0):
+        return eth, "eth read"
+
+    patch_recovery(monkeypatch, "_verify_device", healthy)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_read)
+
+    await srv._attempt_idle_relift()
+
+    assert counters["resets"] == 0, "inside the grace, a hold with no measured fabric failure must not reset"
+
+
+@pytest.mark.asyncio
 async def test_idle_relift_holds_when_eth_read_is_inconclusive(monkeypatch, tmp_path, clear_job_state):
     """`None` from the eth read is "could not tell" — reader unconfigured, a 60s timeout, or an
     exit-77 uncheckable, any of which a frozen core can itself provoke — NOT proof of health.
@@ -13797,6 +13849,22 @@ async def test_the_deadline_escalation_keeps_the_ladder_for_real_faults(
     await srv._force_escalate_stuck_hold()
     assert escalations == [expect]
     assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_the_deadline_escalation_climbs_a_present_mesh_eth_frozen_self_heal_hold(monkeypatch, clear_job_state):
+    """The gate's below-floor present-mesh hold ('eth/fabric fault on a present mesh ... held for self-heal,
+    not reset', fsm why eth_frozen) is not a fabric-only hold: past the deadline it takes the present-mesh
+    ladder (galaxy reset, then the host rungs), never a page-and-hold. A box that sat in this hold for 1h43m
+    had the forced escalation switched off (TT_DEVICE_MCP_FORCE_ESCALATE=0), not a gap in this path."""
+    escalations, alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch,
+        why="eth_frozen",
+        detail="gate/post-job: eth/fabric fault on a present mesh (all 32 chips on the bus) — held for self-heal, not reset",
+    )
+    await srv._force_escalate_stuck_hold()
+    assert escalations == ["present-forced"]
+    assert alerts == [] and "hold_deadline_no_reset" not in events
 
 
 # --- G-tier safe U-fixes: fail-closed / loudness on the silent-degrade paths -------------

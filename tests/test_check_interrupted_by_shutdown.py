@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""A health probe the host shutdown or the broker's own stop killed is not a verdict (03 I58).
+"""A health probe the host shutdown or the broker's own stop killed is not a verdict (03 I63).
 
 The field case: an operator rebooted the host while a hold-deadline escalation ran its post-reset
 verify. systemd SIGTERMed the fabric validator with the broker, the check "exited -15", and the
@@ -148,7 +148,7 @@ def test_tt_smi_killed_during_shutdown_raises_else_fails(monkeypatch, health_dep
 @pytest.mark.asyncio
 async def test_post_reset_verify_killed_by_shutdown_requests_no_reboot_and_releases_nothing(mesh):  # noqa: F811
     """The field sequence: a prior cycle failed, the reset fires, its post-reset verify is killed by
-    the reboot. Without I58 this climbs to the host rung (see test_dispatch_failure_reset's
+    the reboot. Without I63 this climbs to the host rung (see test_dispatch_failure_reset's
     test_a_failed_post_reset_check_stays_held_and_climbs, the same setup, which reboots once)."""
     mesh["reset_heals"] = False
     srv.recovery_mechanism.last_reset_failed = True

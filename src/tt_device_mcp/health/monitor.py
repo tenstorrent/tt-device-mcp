@@ -409,7 +409,7 @@ class HealthMonitor:
 
         A probe the host shutdown or the broker's own stop killed raises
         ``CheckInterruptedByShutdown`` out of here, logged once: no readings are stored, and the
-        caller unwinds as from a cancellation, counting nothing (I58).
+        caller unwinds as from a cancellation, counting nothing (I63).
         """
         try:
             return await self._update(
@@ -893,7 +893,7 @@ class HealthMonitor:
             if proc.returncode != 0:
                 interrupted = interrupted_by_shutdown("tt-smi", proc.returncode)
                 if interrupted is not None:
-                    raise interrupted  # the shutdown killed it, not the chips (I58)
+                    raise interrupted  # the shutdown killed it, not the chips (I63)
                 tail = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")[-200:]
                 return False, f"tt-smi snapshot exited {proc.returncode}: {tail}"
             try:
@@ -975,7 +975,7 @@ class HealthMonitor:
             ok, detail = await self._verify_fabric_health_body(timeout_sec)
         except asyncio.CancelledError as e:
             # Cancelled under us (a shutdown that unwinds the loop), or the validator itself killed
-            # by the shutdown (I58): say so now, the mark goes.
+            # by the shutdown (I63): say so now, the mark goes.
             _journal_fabric_interrupted(
                 {"ts": time.time() - (time.monotonic() - _t0), "pid": os.getpid(), "boot_id": _read_boot_id()},
                 "shutdown" if isinstance(e, CheckInterruptedByShutdown) else "cancelled",
