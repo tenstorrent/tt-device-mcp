@@ -179,3 +179,20 @@ def test_the_attempt_interval_default_adds_no_wait_beyond_the_cooldown(monkeypat
     assert opc.min_interval_sec() == 0
     monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", str(10**6))
     assert opc.min_interval_sec() == recovery_base.POWER_CYCLE_BACKOFF_CAP_SEC
+
+
+@pytest.mark.asyncio
+async def test_a_whole_tray_seen_again_among_partial_reads_still_cycles_at_the_deadline(cool, monkeypatch, gated):
+    """A flapping tray: forced passes alternate a whole-tray read (8 off) and a partial one (3 off)
+    inside the cooldown. No read clears the episode's whole-tray clock, every pass holds with the
+    same stated deadline, and the first pass at the deadline cycles, whichever read it sees."""
+    _replay(cool, monkeypatch, now=CYCLE_2 + 600)
+    until = CYCLE_2 + recovery_base.power_cycle_interval_sec(2)
+    for i, off in enumerate((8, 3, 8, 3, 3, 8)):
+        cool["clk"][0] = CYCLE_2 + 600 + i * 300
+        assert await cool["g"]._offbus_gated_power_cycle(off, EXPECTED, gated, lambda m: None) is False
+        assert opc.whole_tray_down_age_sec(gated) is not None, "a partial read never clears the whole-tray clock"
+        assert _deadline(cool) == until and _cycles(cool) == 0
+    cool["clk"][0] = until
+    assert await cool["g"]._offbus_gated_power_cycle(3, EXPECTED, gated, lambda m: None) is True
+    assert _cycles(cool) == 1 and not LADDER & set(cool["order"])
