@@ -468,6 +468,159 @@ def test_the_reset_gate_does_not_count_a_lost_chip_that_answers_again(sysfs, clo
     assert not chip_state.is_lost("2")
 
 
+def _lost_and_back(sysfs, clock, idx="2"):
+    """Chip ``idx`` marked lost on a real all-ones read, then answering again on the same node,
+    inside the reprobe window: a poll still reports the mark, a decision read must not."""
+    sysfs["node"](int(idx), ALL_ONES)
+    chip_state.mark_lost([idx], "test", chip_state.chip_nodes([idx]))
+    clock.now += chip_state.PROBE_MIN_SEC
+    sysfs["node"](int(idx), 12345)
+    sysfs["reads"].clear()
+
+
+def test_a_decision_read_judges_a_lost_chip_on_a_real_read_and_reads_a_dead_one_once(sysfs, clock):
+    """The broker's other decision reads (the DOWN off-bus recheck, the hold-deadline escalation, the
+    gate's rung counts, the recovery ladder's reads) go through _decision_heartbeats: a lost chip that
+    answers again is read and cleared, not counted off the bus on the mark. A chip still dead is read
+    once however many decisions run back to back, again only PROBE_MIN_SEC later, and polls stay gated."""
+    _lost_and_back(sysfs, clock)
+    assert heartbeat.read_heartbeats()["2"] == ALL_ONES and _reads_of(sysfs, 2) == [], "polls stay gated"
+    beats = srv._decision_heartbeats()
+    assert beats["2"] == 12345 and _reads_of(sysfs, 2) == ["tt_heartbeat"]
+    assert srv._offbus_count(beats, N) == 0 and not chip_state.is_lost("2")
+
+    sysfs["node"](3, ALL_ONES)
+    chip_state.mark_lost(["3"], "test", chip_state.chip_nodes(["3"]))
+    clock.now += chip_state.PROBE_MIN_SEC
+    sysfs["reads"].clear()
+    for _ in range(3):
+        assert srv._offbus_count(srv._decision_heartbeats(), N) == 1
+    assert _reads_of(sysfs, 3) == ["tt_heartbeat"], "back-to-back decisions read a dead chip once"
+    clock.now += chip_state.PROBE_MIN_SEC
+    srv._decision_heartbeats()
+    assert _reads_of(sysfs, 3) == ["tt_heartbeat"] * 2
+    heartbeat.read_heartbeats()
+    assert _reads_of(sysfs, 3) == ["tt_heartbeat"] * 2, "a decision read restarts the poll clock"
+
+
+def test_the_recovery_ladder_reads_lost_chips_for_real(sysfs, clock):
+    """The galaxy ladder's rung selection and verify counts read through the recovery deps."""
+    _lost_and_back(sysfs, clock)
+    assert srv._recovery_deps.read_heartbeats()["2"] == 12345
+    assert not chip_state.is_lost("2")
+
+
+def test_admission_and_exec_probe_a_lost_chip_status_does_not(sysfs, clock, monkeypatch):
+    """Job admission, exec and a Slurm step decide whether a tenant gets the device: a lost chip that
+    answers again is not refused as 'fell off the PCIe bus' on an all-ones nobody read. Status and
+    /health polls keep the gated answer and read nothing."""
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda: True)
+    monkeypatch.setattr(srv, "_device_unavailable_for_tenant", lambda: "")
+    monkeypatch.setattr(srv, "health_monitor", None)
+    _lost_and_back(sysfs, clock)
+    assert "0xFFFFFFFF" in srv._device_degraded_for_tenant() and _reads_of(sysfs, 2) == []
+    assert srv._device_degraded_for_decision() == ""
+    assert _reads_of(sysfs, 2) == ["tt_heartbeat"] and not chip_state.is_lost("2")
+
+
+def _all_ones_unless_probed(monkeypatch, n):
+    """read_heartbeats as the gate gives it for lost chip 5 that is back: all-ones on a poll, its real
+    counter on a read just after chip_state.reprobe_due."""
+    calls: list = []
+    monkeypatch.setattr(chip_state, "reprobe_due", lambda: calls.append("due"))
+
+    def beats():
+        probed = calls[-1:] == ["due"]
+        calls.append("read")
+        return {str(i): ALL_ONES if i == 5 and not probed else 100 + i for i in range(n)}
+
+    monkeypatch.setattr(srv, "read_heartbeats", beats)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_the_down_offbus_recheck_does_not_hold_on_a_lost_chip_that_is_back(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Every chip is back, one of them still marked lost: the recheck runs the full gate at once instead
+    of logging 'still off the bus' and waiting out another relift interval (up to 120 s)."""
+    from tests.test_device_safety import _setup_down_offbus
+
+    _setup_down_offbus(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda *a: True)
+    monkeypatch.setattr(srv, "arc_not_ready_chips", lambda beats: set())
+    calls = _all_ones_unless_probed(monkeypatch, 32)
+    gated: list = []
+
+    async def gate(*a, **k):
+        gated.append(True)
+        return False
+
+    monkeypatch.setattr(srv, "_offbus_return_full_gate", gate)
+    await srv._attempt_down_offbus_recheck()
+    assert calls[:2] == ["due", "read"] and gated == [True]
+
+
+@pytest.mark.asyncio
+async def test_the_hold_deadline_escalation_does_not_count_a_lost_chip_that_is_back(monkeypatch, tmp_path):
+    """A lost chip back on the bus is not off the bus to the hold-deadline escalation: it climbs the
+    present-mesh ladder, not the forced off-bus one (bridge reset, tray re-power, host rungs)."""
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "device_op_active", "")
+    monkeypatch.setattr(srv, "device_fault_reported", "job 1 eth/fabric fault", raising=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    dev = tmp_path / "tenstorrent"
+    dev.mkdir()
+    for i in range(32):
+        (dev / str(i)).mkdir()
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(dev))
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: present)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    monkeypatch.setattr(srv, "device_op_lock", None)
+    calls = _all_ones_unless_probed(monkeypatch, 32)
+    climbed: list = []
+
+    async def present(indices, expected, log, *, force=False, **_):
+        climbed.append("present")
+
+    async def offbus(indices, expected, log, *, force=False):
+        climbed.append("offbus")
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_escalate_stuck_hold", present)
+    monkeypatch.setattr(srv.galaxy_recovery, "_escalate_offbus_stuck_hold", offbus)
+    await srv._force_escalate_stuck_hold()
+    assert "due" in calls and climbed == ["present"], (calls, climbed)
+
+
+@pytest.mark.asyncio
+async def test_each_tenant_decision_takes_the_probing_verdict(monkeypatch):
+    """Admission, exec and the Slurm step verdict call _device_degraded_for_decision, not the polled one."""
+    from tests.test_device_safety import _free_device_lock
+
+    seen: list = []
+    monkeypatch.setattr(srv, "_device_degraded_for_decision", lambda: seen.append("decision") or "")
+    monkeypatch.setattr(srv, "_device_degraded_for_tenant", lambda: seen.append("poll") or "")
+
+    srv._slurm_step_verdict(require_free=False)
+    assert seen == ["decision"]
+
+    async def clean(_log):
+        return None
+
+    monkeypatch.setattr(srv, "_ensure_device_clean_for_next_job", clean)
+    monkeypatch.setattr(srv, "device_op_active", "")
+    seen.clear()
+    assert await srv._await_device_free_for_tenant(None) == ""
+    assert seen == ["decision"]
+
+    _free_device_lock(monkeypatch)
+    srv.jobs.clear()
+    seen.clear()
+    mcp = srv.create_mcp_server()
+    await mcp.call_tool("tt_device_exec", {"params": {"owner": "tenant", "command": "true"}})
+    assert seen[:1] == ["decision"] and "poll" not in seen, seen
+
+
 # --- stale gate state ----------------------------------------------------------------------------
 
 

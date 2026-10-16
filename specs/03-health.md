@@ -771,10 +771,13 @@ job boundary.
   re-created (rescan, tray re-power, hotplug), (b) in the 120 s grace after a broker reset or
   recovery step ends, at most once a second, so the post-reset verify reads the chip for real, or
   (c) as a backstop once per `TT_DEVICE_MCP_LOST_REPROBE_SEC` (default 30 s, floor 5), or (d) by a
-  check's decision read, which is not a poll: the gate's heartbeat verdict (between-jobs gate,
-  dispatch recheck, idle relift, post-reset verify) and the per-host reset gate's off-bus count read
-  each lost chip for real once per check, so no check judges a chip off the bus on a value nobody
-  read. A read that is not all-ones clears *lost*. While a reset step owns the chips (`reset_in_flight`, or a reset
+  decision read, which is not a poll: the gate's heartbeat verdict (between-jobs gate, dispatch
+  recheck, idle relift, post-reset verify), the per-host reset gate's off-bus count, the gate's rung
+  counts and reboot decision, the DOWN off-bus recheck, the hold-deadline escalation, the recovery
+  ladder's reads, and the tenant verdict of job admission, `tt_device_exec` and a Slurm step. A
+  decision read reads a lost chip whose last real read is at least 1 s old, so no hold, rung or
+  refusal rests on a value nobody read, and back-to-back decisions read a dead chip once. Status and
+  `/health` stay gated. A read that is not all-ones clears *lost*. While a reset step owns the chips (`reset_in_flight`, or a reset
   scope still cycling them after the broker stopped waiting) every chip is *recovering*: the
   sampler skips its sample, `/health` serves the last live picture and reads nothing, and only the
   step's own reads run, ungated. The device pollers (telemetry services) stop on the FIRST sample
@@ -788,9 +791,11 @@ job boundary.
   every chip. Time to recover: unchanged for whole-tray drop, partial off-bus, ARC not ready,
   fabric/health-check failure, dispatch failure, hold-deadline expiry and dirty boot (their rungs
   re-create the nodes or run in the op or its grace). A chip that returns on its own on the same
-  node, outside any broker step, is seen by the next check at once (the sampler and `/health` see it
-  within 30 s instead of 10 s), so it never starts a hold or a rung. A check on a chip still lost
-  costs one read of it per check. Pollers left stopped after a failed reset are a telemetry gap
+  node, outside any broker step, is seen by the next decision at once (the sampler and `/health` see
+  it within 30 s instead of 10 s), so it never starts a hold, a rung or a refusal; the DOWN off-bus
+  recheck no longer waits another relift interval (up to 120 s) on it, and the hold-deadline
+  escalation no longer takes the off-bus ladder for it. A decision on a chip still lost costs at most
+  one read of it per second. Pollers left stopped after a failed reset are a telemetry gap
   only. Lost and recovering state lives in process memory: a reset step clears recovering on every
   exit (return, raise, cancel) and opens the grace, and a fresh broker publishes a clean
   `chip-state.json` at boot, over a file a crashed process left.
@@ -1403,6 +1408,7 @@ refuses.
 | I66 (pollers stop on the first hung sample, not on a mesh blip or reset; not restored after a failed reset) | `tests/test_chip_state.py::test_the_first_hung_sample_stops_the_pollers`, `tests/test_chip_state.py::test_a_whole_mesh_blip_or_a_reset_does_not_stop_the_pollers`, `tests/test_chip_state.py::test_a_failed_reset_leaves_the_pollers_stopped` |
 | I66 (post-reset grace reads lost chips for real; the full check, fabric included, still runs) | `tests/test_chip_state.py::test_the_post_reset_grace_reads_lost_chips_for_real`, `tests/test_chip_state.py::test_the_post_reset_health_check_runs_fabric_on_chips_marked_lost` |
 | I66 (a check reads a lost chip for real: one that answers again passes and clears, one still lost fails on one read; the reset gate does not count a returned chip) | `tests/test_chip_state.py::test_a_lost_chip_that_answers_again_passes_the_health_check_inside_the_reprobe_window`, `tests/test_chip_state.py::test_a_check_reads_a_still_lost_chip_once_and_judges_it_on_that_read`, `tests/test_chip_state.py::test_the_reset_gate_does_not_count_a_lost_chip_that_answers_again` |
+| I66 (every decision read reads a lost chip for real, a dead one at most once a second; polls stay gated) | `tests/test_chip_state.py::test_a_decision_read_judges_a_lost_chip_on_a_real_read_and_reads_a_dead_one_once`, `tests/test_chip_state.py::test_the_recovery_ladder_reads_lost_chips_for_real`, `tests/test_chip_state.py::test_admission_and_exec_probe_a_lost_chip_status_does_not`, `tests/test_chip_state.py::test_the_down_offbus_recheck_does_not_hold_on_a_lost_chip_that_is_back`, `tests/test_chip_state.py::test_the_hold_deadline_escalation_does_not_count_a_lost_chip_that_is_back`, `tests/test_chip_state.py::test_each_tenant_decision_takes_the_probing_verdict` |
 | I66 (stale state: a reset step, sweep or tray walk that raises or is cancelled clears recovering and opens the grace; a fresh broker publishes clean state at boot) | `tests/test_chip_state.py::test_a_reset_step_that_raises_or_is_cancelled_clears_recovering`, `tests/test_chip_state.py::test_the_galaxy_reset_sweep_clears_recovering_on_every_exit`, `tests/test_chip_state.py::test_the_tray_walk_clears_recovering_on_every_exit`, `tests/test_chip_state.py::test_a_fresh_broker_publishes_clean_state_over_a_stale_file` |
 | I66 (published state: atomic, every expected chip, path follows the device-op lock) | `tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip`, `tests/test_chip_state.py::test_the_default_path_follows_the_device_op_lock` |
 

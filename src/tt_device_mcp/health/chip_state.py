@@ -54,6 +54,9 @@ LOST_REPROBE_SEC = _env_float("TT_DEVICE_MCP_LOST_REPROBE_SEC", 30.0, 5.0)
 # GRACE_REPROBE_SEC for GRACE_SEC: covers the post-reset health check and the ladder's verify.
 GRACE_SEC = 120.0
 GRACE_REPROBE_SEC = 1.0
+# A decision read (:func:`may_read` ``probe``, :func:`reprobe_due`) reads a lost chip whose last real
+# read is at least this old: a check that makes several decisions reads a dead chip once, not once each.
+PROBE_MIN_SEC = 1.0
 
 _lock = threading.RLock()
 # idx -> {"since": iso, "reason": str, "node": identity or None, "next": monotonic}
@@ -187,6 +190,7 @@ def mark_lost(ids: Iterable, reason: str, nodes: Optional[dict] = None) -> list:
                 "reason": reason,
                 "node": node_identity(node) if node is not None else None,
                 "next": now + LOST_REPROBE_SEC,
+                "read": now,
             }
             fresh.append(idx)
     if fresh:
@@ -222,10 +226,10 @@ def may_read(idx, node: Path, *, probe: bool = False) -> bool:
     :data:`LOST_REPROBE_SEC`, one per :data:`GRACE_REPROBE_SEC` right after a reset step); False
     otherwise, and the caller reports the chip as all-ones without reading it.
 
-    ``probe`` is a health check's decision read (the gate's heartbeat verdict, the reset gate's
-    off-bus count), not a poll: the re-read is due now, so a chip that answers again on the same node
-    is seen by the check that judges it and never judged off the bus on a value nobody read. It is one
-    read per check and restarts the reprobe clock."""
+    ``probe`` is a decision read (see :func:`reprobe_due`), not a poll: the re-read is due once the
+    last real read is :data:`PROBE_MIN_SEC` old, so a chip that answers again on the same node is seen
+    by the check that judges it and never judged off the bus on a value nobody read. It restarts the
+    reprobe clock."""
     idx = str(idx)
     with _lock:
         rec = _lost.get(idx)
@@ -239,14 +243,27 @@ def may_read(idx, node: Path, *, probe: bool = False) -> bool:
         else:
             renewed = False
             now = time.monotonic()
-            if now < rec["next"] and not probe:
+            due = min(rec["next"], rec["read"] + PROBE_MIN_SEC) if probe else rec["next"]
+            if now < due:
                 return False
             rec["next"] = now + (GRACE_REPROBE_SEC if now < _grace_until else LOST_REPROBE_SEC)
+            rec["read"] = now
             if rec["node"] is None:
                 rec["node"] = ident
     if renewed:
         clear_lost(idx, "sysfs node re-created")
     return True
+
+
+def reprobe_due() -> None:
+    """Make each lost chip's next read real for a decision read through a plain reader (spec 03 I66):
+    the reset gate's and the recovery ladder's off-bus counts, the DOWN off-bus recheck, the
+    hold-deadline escalation, and job admission, exec and a Slurm step's verdict. A read already due
+    stays due; one whose last real read is younger than :data:`PROBE_MIN_SEC` stays gated, so
+    back-to-back decisions read a dead chip once."""
+    with _lock:
+        for rec in _lost.values():
+            rec["next"] = min(rec["next"], rec["read"] + PROBE_MIN_SEC)
 
 
 def observe(idx, value) -> None:

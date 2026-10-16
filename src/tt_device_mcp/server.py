@@ -1051,7 +1051,7 @@ _recovery_deps = RecoveryDeps(
         _emit_all_off_bus_power_cycle_required(log, off_bus, expected, context=context)
     ),
     host_escalation_kwargs=lambda: _host_escalation_kwargs(),
-    read_heartbeats=lambda: read_heartbeats(),
+    read_heartbeats=lambda: _decision_heartbeats(),
     heartbeat_supported=lambda: heartbeat_supported(),
     heartbeat_verdict=lambda expected: heartbeat_verdict(expected),
     gone_chip_confirm_settle_sec=lambda: GONE_CHIP_CONFIRM_SETTLE_SEC,
@@ -4213,7 +4213,7 @@ async def _attempt_down_offbus_recheck() -> None:
             expected = health_monitor.expected(len(indices))
             if heartbeat_supported():
                 # A chip still in sysfs but reading all-ones is still off the bus.
-                beats = await asyncio.to_thread(read_heartbeats)
+                beats = await asyncio.to_thread(_decision_heartbeats)
                 not_ready = await asyncio.to_thread(arc_not_ready_chips, beats)
                 off_bus = _offbus_count(beats, expected, not_ready)
                 if off_bus > 0:
@@ -5594,7 +5594,7 @@ async def device_health_gate(
         # walk maps its chip set onto trays, and the post-reset escalation compares against it to
         # tell a reset that recovered ground from one that REGRESSED the mesh off the bus. One read,
         # so all three decisions are made against the same picture of the mesh.
-        beats = await asyncio.to_thread(read_heartbeats)
+        beats = await asyncio.to_thread(_decision_heartbeats)
         # A reset already cycling in its own PID-1 scope must not read as a mass drop (it takes
         # every chip off the bus while it runs) and must not have a second reset started under it —
         # the concurrent-reset hazard this module exists to prevent. The router turns a live scope
@@ -5656,7 +5656,7 @@ async def device_health_gate(
             # decides on it: a chip that came back changes the count the floor keys on. No scope
             # re-read — our own rescan cannot open a foreign reset scope, and each rung left below
             # carries its own scope guard (the tray walk checks it, the reset adopts it).
-            beats = await asyncio.to_thread(read_heartbeats)
+            beats = await asyncio.to_thread(_decision_heartbeats)
             ev = replace(
                 ev,
                 off_bus=_offbus_count(beats, expected),
@@ -5798,7 +5798,7 @@ async def device_health_gate(
         # durable rate limits pass. The first four are the router's; the last two are read here,
         # after it, because both are live IO a pure decision must not do. Any of them absent and the
         # device stays flagged exactly as before.
-        beats_now = await asyncio.to_thread(read_heartbeats)
+        beats_now = await asyncio.to_thread(_decision_heartbeats)
         off_bus = _offbus_count(beats_now, expected)
         reboot_floor = _reboot_min_dead_chips(expected)
         # A reset that timed out is deliberately left cycling in its own scope for the next gate to
@@ -5957,7 +5957,7 @@ def _slurm_step_verdict(*, require_free: bool) -> dict:
     answers about the same device. Free is the reset gate's tenant rule: a holder `is_tenant`
     counts, or a scan too blind to rule one out (04 I7 fails closed).
     """
-    reason = _device_degraded_for_tenant()
+    reason = _device_degraded_for_decision()
     scan = enumerate_device_holders()
     foreign = [h for h in scan.holders if is_tenant(h)]
     holders = [{"pid": h.pid, "uid": h.uid, "username": h.username} for h in foreign]
@@ -5976,6 +5976,14 @@ def _slurm_step_verdict(*, require_free: bool) -> dict:
         "fsm_why": fsm.record.why,
         "holders": holders,
     }
+
+
+def _decision_heartbeats() -> dict:
+    """``read_heartbeats`` for a decision, not a poll: each lost chip is read for real (at most once
+    per ``chip_state.PROBE_MIN_SEC``), so no hold, rung or refusal rests on an all-ones nobody read
+    (spec 03 I66)."""
+    chip_state.reprobe_due()
+    return read_heartbeats()
 
 
 def _device_liveness_reason() -> str:
@@ -6075,6 +6083,14 @@ def _device_degraded_for_tenant() -> str:
     restart that dropped the in-memory dirty flag. Root-free, no device touch, no sleep,
     so it is cheap enough to answer a status query."""
     return _device_unavailable_for_tenant() or _device_liveness_reason()
+
+
+def _device_degraded_for_decision() -> str:
+    """_device_degraded_for_tenant for a decision that lets a tenant on or refuses one (admission,
+    exec, a Slurm step): each lost chip's live probe is a real read, so a chip that answers again is
+    not refused as off the bus on an all-ones nobody read. Status and /health stay gated (03 I66)."""
+    chip_state.reprobe_due()
+    return _device_degraded_for_tenant()
 
 
 def _device_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, str]]:
@@ -6309,7 +6325,7 @@ async def _force_escalate_stuck_hold() -> None:
         expected = health_monitor.expected(len(indices))
         if expected <= 0:
             return
-        beats = await asyncio.to_thread(read_heartbeats)
+        beats = await asyncio.to_thread(_decision_heartbeats)
         off_bus = _offbus_count(beats, expected)
         no_reset = "" if off_bus or isolated_chips else _fabric_no_reset_hold()
         if no_reset:
@@ -6800,7 +6816,7 @@ async def _await_device_free_for_tenant(job_log_file: Optional[Path]) -> str:
     # `break`, not a bare `return ""` — such a chip leaves fsm HEALTHY, and a read of the
     # 0xFFFFFFFF it now returns can stall the host CPU that issues it, so the job must
     # never be dispatched.
-    return _device_degraded_for_tenant()
+    return _device_degraded_for_decision()
 
 
 LEFTOVER_REBOOT_HINT = (
@@ -11325,7 +11341,7 @@ def create_mcp_server() -> MCPServer:
         # gates on rather than the op/dirty flags alone. Exec is a short synchronous call — a
         # reset+fabric pass can hold the device for twelve minutes — so it refuses and says why
         # rather than blocking the caller behind it.
-        blocked = _device_degraded_for_tenant()
+        blocked = _device_degraded_for_decision()
         if blocked:
             if logger:
                 logger.warning(f"  -> ERROR: device not free: {blocked}")
