@@ -90,6 +90,10 @@ FABRIC_CHECK_TIMEOUT_SEC = 180
 # override's inner bound is this same bound, so its timeout is frozen evidence here as on every
 # other path.
 ETH_POST_JOB_TIMEOUT_SEC = 10.0
+# The most the eth-heartbeat read waits for its own reader to finish exiting after killing it on
+# a timeout (see monitor._verify_eth_heartbeat_body): a SIGKILLed reader is normally gone in
+# milliseconds, and until it is, a holder scan still sees its pid through the driver.
+ETH_REAP_SEC = 2.0
 
 # The fabric check exits with this when it could not run at all (validator or
 # descriptor absent). It means "nothing was learned about the fabric" and must stay
