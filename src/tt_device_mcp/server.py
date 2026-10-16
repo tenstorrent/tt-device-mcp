@@ -135,6 +135,7 @@ from tt_device_mcp.health import (
     health_event,
     heartbeat_supported,
     heartbeat_verdict,
+    host_action_pending_sec,
     isolate_chip,
     eth_read_timed_out,
     journal_interrupted_fabric_check,
@@ -996,6 +997,9 @@ device_hold_job_bound_escalated: bool = False
 device_hold_escalation_trigger: str = ""
 device_hold_escalation_kind: str = ""  # machine-readable twin of the trigger text, for the event
 _forced_escalation_task: "Optional[asyncio.Task]" = None
+# The host-action request (see RecoveryMechanism.host_action_requested) whose suppression of the
+# forced ladder was already logged: one line per request, not one per sampler tick.
+_host_action_suppressed_logged: "Optional[tuple[str, float]]" = None
 # Jobs a reset SIGKILLed to take the device. Their deaths are ours, not the mesh's: a reset
 # kills the running job, the job dies mid-CCL, and that death then reads as evidence the
 # device needs resetting — by the reset that caused it. The set is drained as each is seen.
@@ -4051,6 +4055,12 @@ async def _attempt_idle_relift() -> None:
                             "present-mesh reset past the grace"
                         )
                         return
+                    # An episode tagged eth_frozen that recorded chips off the bus also owes the
+                    # full gate, fabric included, before it lifts (spec 03 I52).
+                    if _offbus_hold_open() and should_privsep():
+                        gate_ok, evidence = await _offbus_return_full_gate(expected, _log)
+                        if not gate_ok:
+                            return
                 else:
                     # Held for an off-bus drop below the reset floor: the chip LEFT THE BUS, which
                     # enum+ARC+sysfs see directly, so their agreement that it is back and answering is
@@ -4109,6 +4119,19 @@ async def _attempt_idle_relift() -> None:
 # Why classes a chip leaving the bus puts on the device: the gate's off-bus hold, and the sampler's
 # dead-chip mark (_isolate_dead_chips). Both are re-checked once every chip is back (spec 03 I52).
 OFFBUS_RECHECK_WHYS = frozenset({"off_bus", "heartbeat"})
+
+
+def _offbus_hold_open() -> bool:
+    """The open episode was placed for a chip off the bus, so only the full gate, fabric included,
+    lifts it (spec 03 I52). Besides OFFBUS_RECHECK_WHYS, an ``eth_frozen`` hold whose detail names
+    chips off the bus counts: a gate that saw a runtime-reported fault used to tag a drop that way,
+    and such an episode can still be open, carried across the restart that deploys this."""
+    if fsm.state is ServerState.HEALTHY:
+        return False
+    record = fsm.record
+    return record.why in OFFBUS_RECHECK_WHYS or (record.why == "eth_frozen" and "off the bus" in record.detail)
+
+
 # Monotonic time of the last DOWN off-bus re-check; paced like the relift (SELFHEAL_RELIFT_INTERVAL_SEC).
 _down_offbus_recheck_monotonic: float = 0.0
 
@@ -4137,7 +4160,7 @@ def _down_offbus_recheck_armed() -> bool:
     """A DOWN episode placed for a chip off the bus, with every expected device node back. DOWN is
     the terminal rung and runs no further reset, but chips that came back (a tray re-powered by an
     operator, a driver rescan) leave nothing for it to wait on: the full gate decides (spec 03 I52)."""
-    if fsm.state is not ServerState.DOWN or fsm.record.why not in OFFBUS_RECHECK_WHYS:
+    if fsm.state is not ServerState.DOWN or not _offbus_hold_open():
         return False
     if not should_privsep():
         return False  # a per-user daemon has no fabric validator: its full gate could never pass
@@ -5067,6 +5090,10 @@ async def device_health_gate(
         dirty = fsm.state is not ServerState.HEALTHY and fsm.record.dirty
         dirty_reason = fsm.record.detail or fsm.record.why
         dirty_job = fsm.record.job
+        # A hold placed for a chip off the bus lifts only on the full gate, fabric included (spec 03
+        # I52): the chip came back through a reset of some kind, broker-issued or not (no cached
+        # BDF, an external tray re-power, a driver rescan), and only a broker reset owes FABRIC_DEBT.
+        offbus_hold = _offbus_hold_open() and should_privsep()
 
         # A job that ended badly is a reason to LOOK HARD at the device, not a verdict
         # about it. A timeout or a kill says something about the job; the silicon it ran
@@ -5352,6 +5379,21 @@ async def device_health_gate(
         )
         stage = galaxy_recovery.next_stage(ev)
 
+        if stage == RELEASE and offbus_hold and fabric_ok is not True:
+            # Every chip is back and enum+ARC read healthy, but no fabric pass cleared the return
+            # (the pre-job gate never runs one: 03 I12). Keep the door shut as a clean off-bus hold,
+            # which the idle relift lifts on its full gate on the next idle window (03 I52).
+            _log(
+                "every chip back on the bus and enum+ARC healthy, but no fabric pass has cleared the "
+                "return — holding; the idle relift lifts it on the full gate, fabric included"
+            )
+            health_event("offbus_release_deferred", phase=phase, why=fsm.record.why, fabric_ok=fabric_ok)
+            _hold_device_unverified(
+                f"gate/{phase}: every chip back on the bus, enum+ARC healthy — held for the full gate "
+                f"(fabric included) after an off-bus drop"
+            )
+            return
+
         if stage == RELEASE:
             galaxy_recovery.tray_down_episode_end()  # spec 04 I19: a released mesh closes the onset latch
             # Every check the host can run says the mesh is fine. Resetting anyway —
@@ -5615,11 +5657,13 @@ async def device_health_gate(
             # visibly to those reads, so they suffice. But off_bus==0 means nothing left the bus —
             # the hold is a fabric/eth wedge, every chip present and ARC-ticking, which the relift's
             # enum+ARC pass is blind to (it never runs the traffic probe); so is a runtime-reported
-            # fault. Both must wait for an advancing eth heartbeat to lift, never enum+ARC alone, or
-            # the relift admits the next tenant onto the still-wedged mesh. With the reader
+            # fault on a present mesh. It must wait for an advancing eth heartbeat to lift, never
+            # enum+ARC alone, or the relift admits the next tenant onto the still-wedged mesh. A drop
+            # (off_bus>0) stays an off-bus hold even with a reported fault: its lift runs the full
+            # gate, fabric included (03 I52), which sees any wedge the fault named. With the reader
             # unconfigured the relift never lifts it, so it clears on the next startup gate (a
             # broker restart re-runs the fabric pass) — refusing tenants until then, the safe side.
-            needs_eth = bool(device_fault_reported) or ev.off_bus == 0
+            needs_eth = ev.off_bus == 0
             # Retire any runtime-reported fault into the hold: left set it would survive self-heal
             # and make a later enum+ARC-healthy gate skip the clear and reset an already-recovered
             # mesh. The door still holds on the fsm episode until a gate verifies recovery.
@@ -6039,7 +6083,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_deadline_bucket, device_hold_escalate_bucket
     global device_hold_offbus_escalated, device_hold_alert_next_bucket, device_hold_alert_gap
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
-    global device_hold_job_bound_escalated, _dispatch_reset_spent
+    global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold
     if reason and not device_hold_logged:
         device_hold_logged = True
         # Prefer a start this box already recorded: if the device was still held across a restart,
@@ -6073,7 +6117,13 @@ def _note_tenant_gate_verdict(reason: str) -> None:
             0,
             0.0,
         )
-        health_event("device_held", reason=reason)
+        # A hold carried over from the last broker and not yet released becomes this one: one
+        # device_held/device_released pair per open stretch, and this process's release closes it.
+        carried, _carried_hold = _carried_hold, None
+        if carried is not None:
+            health_event("device_held", reason=reason, carried_from=carried.get("iso") or carried.get("ts"))
+        else:
+            health_event("device_held", reason=reason)
     elif not reason and not device_hold_logged:
         _forget_stale_hold_episode()
         # No episode is open: a reset spent by a gate that then released without ever holding (the
@@ -6165,6 +6215,8 @@ async def _force_escalate_stuck_hold() -> None:
             return  # the hold cleared between the sampler spawning us and the lock
         if _fabric_77_only_hold():
             return  # a pass that could not run is never reset for; the idle relift re-runs it
+        if _host_action_blocks_escalation():
+            return  # a host reboot/power cycle was requested while this waited on the lock
         indices = _present_chip_indices()
         # No device nodes at all is the sysfs-blackout / all-off-bus case — the catastrophic drop that
         # most needs the cold rung, never a reason to bail. Bailing let the deadline watchdog keep
@@ -6252,12 +6304,58 @@ def _hold_without_reset(cause: str, expected: int, log) -> None:
     alert.send_alert(event, logger)
 
 
+def _host_action_blocks_escalation() -> bool:
+    """True while a host reboot or power cycle the broker requested is still pending: the forced
+    ladder then starts no device reset (bridge, tray re-power, galaxy reset) — one would only race the
+    host going down. The device stays held, and the full health check, fabric included, still runs
+    after the host comes back (startup, behind the hugepage gate). Bounded: past the pending window
+    the request reads as failed, is logged once, and the ladder resumes. A request that was refused or
+    failed to launch never set the marker, so it never blocks."""
+    global _host_action_suppressed_logged
+    req = recovery_mechanism.host_action_requested
+    pending = recovery_mechanism.host_action_pending()
+    if pending is None:
+        if req is not None:
+            bound = int(host_action_pending_sec())
+            health_event(
+                "host_action_request_expired", action=req[0], bound_sec=bound, held_since=device_hold_episode_since
+            )
+            if logger:
+                logger.error(
+                    f"HOLD-DEADLINE-ESCALATE host {req[0]} was requested over {bound}s ago and the host is "
+                    f"still up — treating the request as failed; the forced recovery ladder resumes"
+                )
+        return False
+    action, age = pending
+    if _host_action_suppressed_logged != req:
+        _host_action_suppressed_logged = req
+        health_event(
+            "hold_escalation_suppressed_host_action",
+            action=action,
+            age_sec=int(age),
+            bound_sec=int(host_action_pending_sec()),
+            trigger=device_hold_escalation_kind or "ceiling_window",
+            held_since=device_hold_episode_since,
+        )
+        if logger:
+            logger.error(
+                f"HOLD-DEADLINE-ESCALATE suppressed ({device_hold_escalation_kind or 'ceiling_window'}): a host "
+                f"{action} was requested {int(age)}s ago — no device reset starts while it is pending (up to "
+                f"{int(host_action_pending_sec())}s). Device stays HELD; the full health check runs after the "
+                f"host comes back"
+            )
+    return True
+
+
 def _maybe_spawn_forced_escalation() -> bool:
     """Start one forced escalation as its own task when a hold has outlived the ceiling and none is in
     flight. Detached from the sampler (like the relift): the reset/climb it runs takes tens of seconds,
-    and awaiting it inline would blind the sampler's dead-chip tripwire."""
+    and awaiting it inline would blind the sampler's dead-chip tripwire. Declines while a requested
+    host reboot or power cycle is pending, so the caller's window latch stays unspent."""
     global _forced_escalation_task
     if not _force_escalate_enabled():
+        return False
+    if _host_action_blocks_escalation():
         return False
     if _forced_escalation_task is not None and not _forced_escalation_task.done():
         return False
@@ -9473,15 +9571,27 @@ async def _record_startup_health() -> None:
             logger.error(f"STARTUP HEALTH check failed: {e}")
 
 
-def _close_orphaned_hold() -> None:
-    """Give a row to a hold the previous broker died holding.
+# The device_held row of a hold the previous broker died holding, while it is closed in the journal
+# (device_hold_orphan_closed) but not yet released: the device is not fit until this process's own
+# gate proves it so. Its device_released is written when the FSM next reaches HEALTHY
+# (_release_carried_hold), or handed to this process's own device_held if a tenant is refused first.
+_carried_hold: Optional[dict] = None
+
+
+def _close_orphaned_hold() -> Optional[dict]:
+    """Give a row to a hold the previous broker died holding, and return its device_held row.
 
     The episode is in-memory, so a broker that restarts while the device is held forgets it
     and the hold never gets its row: the window the device sat refused to everyone vanishes
     from the ledger precisely when someone is asking what happened to their box. The journal
     is durable and fsync'd per record, so it still knows — an unmatched device_held is an
-    episode nobody closed. Writing the released event back closes it, so this stays put after
-    the row exists rather than re-reporting the same hold on every start.
+    episode nobody closed. Writing ``device_hold_orphan_closed`` back closes it, so this stays put
+    after the row exists rather than re-reporting the same hold on every start.
+
+    It is not a ``device_released``: nothing has probed the device yet, and readers time recovery
+    from that row. The release is written once this process's startup gate (hugepages, fabric)
+    passes — see _release_carried_hold. A restart before that carries the same hold over again
+    with no second row, so the hold is returned either way.
 
     If the device is still degraded, the startup probe opens a fresh episode; this only
     settles the one that outlived its broker. It leaves the escalation clock on disk: nothing
@@ -9489,11 +9599,15 @@ def _close_orphaned_hold() -> None:
     The startup gate's verdict decides (see _forget_stale_hold_episode).
     """
     try:
-        events = read_health_events(kinds={"device_held", "device_released"})
+        events = read_health_events(kinds={"device_held", "device_released", "device_hold_orphan_closed"})
     except Exception:  # noqa: BLE001 - a missing journal must not block startup
-        return
-    if not events or events[-1].get("kind") != "device_held":
-        return  # nothing open
+        return None
+    if not events or events[-1].get("kind") == "device_released":
+        return None  # nothing open
+    if events[-1].get("kind") == "device_hold_orphan_closed":
+        # Already closed by an earlier start whose gate never passed: still unreleased.
+        prior = [e for e in events if e.get("kind") == "device_held"]
+        return prior[-1] if prior else None
     held = events[-1]
     try:
         held_for = max(0.0, time.time() - float(held.get("ts") or 0))
@@ -9512,9 +9626,43 @@ def _close_orphaned_hold() -> None:
         0,
         held_for,
     )
-    health_event("device_released", why="closed on broker start")
+    health_event("device_hold_orphan_closed", why="closed on broker start", reason=reason, held_s=round(held_for, 1))
     if logger:
         logger.info(f"STARTUP closed an orphaned hold of {int(held_for)}s: {reason}")
+    return held
+
+
+def _carry_hold_over(held: Optional[dict]) -> None:
+    """Arm the release of a hold the previous broker died holding: its ``device_released`` is
+    written when the device next reaches HEALTHY, which on broker start is only through the full
+    startup gate (hugepages, fabric — 04 I32)."""
+    global _carried_hold
+    _carried_hold = held
+    if held is not None:
+        fsm.on_next_close(_release_carried_hold)
+
+
+def _release_carried_hold(closed: FsmRecord) -> None:
+    """Write the ``device_released`` the carried-over hold has been waiting for. ``held_s`` runs
+    from its original ``device_held`` row, across the restart. Nothing to do when this process
+    already took the episode over with its own ``device_held``: that one's release closes it."""
+    global _carried_hold
+    held, _carried_hold = _carried_hold, None
+    if held is None or device_hold_logged:
+        return
+    try:
+        held_s = max(0.0, time.time() - float(held.get("ts") or 0))
+    except (TypeError, ValueError):
+        held_s = 0.0
+    health_event(
+        "device_released",
+        why="carried-over hold released after the startup gate",
+        prior_why=closed.why,
+        held_since=held.get("iso") or held.get("ts"),
+        held_s=round(held_s, 1),
+    )
+    if logger:
+        logger.info(f"STARTUP released the carried-over hold after {int(held_s)}s (last why: {closed.why})")
 
 
 # How long the startup fabric pass waits for the 1G hugepages before it records cannot-check, and
@@ -9664,7 +9812,8 @@ def _startup_hold_lifted_at(hold_ts: float) -> Optional[dict]:
             continue
         if row.get("kind") == "device_dirty_cleared" and row.get("verified") is True:
             return row
-        # "closed on broker start" is _close_orphaned_hold's bookkeeping, not a door that opened.
+        # "closed on broker start" is an older broker's orphan-close bookkeeping (now its own
+        # device_hold_orphan_closed kind), not a door that opened.
         if row.get("kind") == "device_released" and row.get("why") != "closed on broker start":
             return row
     return None
@@ -9696,17 +9845,27 @@ def _close_stale_startup_hold(hold: dict) -> None:
         logger.info(f"STARTUP closed a startup hold of {int(held_s)}s left open by the last broker")
 
 
-def _journal_startup_hold_released(closed: FsmRecord, held_since: Optional[float] = None) -> None:
+def _journal_startup_hold_released(
+    closed: FsmRecord, held_since: Optional[float] = None, carried_over: bool = False
+) -> None:
     """Close the ``startup_fabric_hold`` row: the door this broker start held is open again.
     ``prior_why`` is the last fault the episode carried — ``startup_unverified`` when the startup
     verify itself passed, something else when the hold turned into a real fault first.
     ``held_since`` is the hold row's own timestamp, so ``held_s`` is the hold's length whichever
-    path closed it, independent of the episode's ``since``."""
+    path closed it, independent of the episode's ``since``.
+
+    ``carried_over`` marks a fault episode this start inherited (a broker power cycle, a host
+    crash): it has no hold row, so ``held_s`` runs from the episode's own ``since`` and the row
+    names it (``episode_since``). Without this row the episode's end is in the journal only as a
+    verified clear, and a reader timing recovery runs it into the next episode."""
     try:
         held_s = max(0.0, time.time() - float(held_since)) if held_since else _episode_elapsed_sec(closed.since)
     except (TypeError, ValueError):
         held_s = _episode_elapsed_sec(closed.since)
-    health_event("startup_fabric_released", prior_why=closed.why, detail=closed.detail, held_s=round(held_s, 1))
+    extra = {"carried_over": True, "episode_since": closed.since} if carried_over else {}
+    health_event(
+        "startup_fabric_released", prior_why=closed.why, detail=closed.detail, held_s=round(held_s, 1), **extra
+    )
     if logger:
         logger.info(f"STARTUP hold released after {int(held_s)}s (last why: {closed.why})")
 
@@ -9860,8 +10019,9 @@ async def run_startup_tasks() -> None:
     FABRIC_DEBT.note_reset("broker start")
     # A hold the last broker died holding has no row yet; give it one before anything opens
     # a new episode over the top of it.
+    carried_hold = None
     try:
-        await asyncio.to_thread(_close_orphaned_hold)
+        carried_hold = await asyncio.to_thread(_close_orphaned_hold)
     except Exception as e:  # noqa: BLE001 - bookkeeping must never block startup
         if logger:
             logger.error(f"STARTUP orphaned-hold close failed: {e}")
@@ -9879,6 +10039,9 @@ async def run_startup_tasks() -> None:
     fsm.boot_merge(
         open_episode=open_episode, attributed_boot=recovery_mechanism.boot_from_broker_escalation(_current_boot_id())
     )
+    # Armed after boot_merge has closed the door, so only the startup gate (or a later full check)
+    # can release the carried-over hold.
+    _carry_hold_over(carried_hold)
     # The per-boot "door held pending the startup verify" row, durable in the health journal —
     # fsm.json records the episode but is not the timeline operators read — and its closing row.
     # A watcher that saw the hold waits for a release, and the device_held/device_released pair
@@ -9890,7 +10053,8 @@ async def run_startup_tasks() -> None:
     #     (the hold may since have turned into another fault, so the why is not checked);
     #   - a hold still open but a fresh episode: close the old hold, then hold afresh;
     #   - no hold open: only a startup_unverified episode gets one — a carried-over fault episode
-    #     already has its own rows and keeps its own why.
+    #     already has its own rows and keeps its own why, but its lift still gets the release row
+    #     (carried_over), so the journal shows where that episode ended.
     try:
         if open_hold is not None and open_episode is not None:
             fsm.on_next_close(functools.partial(_journal_startup_hold_released, held_since=open_hold.get("ts")))
@@ -9901,6 +10065,8 @@ async def run_startup_tasks() -> None:
                 held_since = time.time()
                 health_event("startup_fabric_hold", why="broker start: awaiting the startup fabric verify")
                 fsm.on_next_close(functools.partial(_journal_startup_hold_released, held_since=held_since))
+            elif open_episode is not None:
+                fsm.on_next_close(functools.partial(_journal_startup_hold_released, carried_over=True))
     except Exception as e:  # noqa: BLE001 - bookkeeping must never block startup
         if logger:
             logger.error(f"STARTUP startup-hold journal failed: {e}")

@@ -354,6 +354,10 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # escalation to the cold rung over a reset that never hard-failed. raising=False so a base tree
     # without the flag (a fails-on-base stash) still sets up cleanly.
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_exit_nonzero", False, raising=False)
+    # A host reboot/power cycle a test requested (with a stub fire) must not suppress the NEXT
+    # test's forced escalation. raising=False so a base tree without the marker still sets up.
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None, raising=False)
+    monkeypatch.setattr(srv, "_host_action_suppressed_logged", None, raising=False)
     monkeypatch.setattr(srv, "last_fabric_check_monotonic", 0.0)
     # When the last job's device work ended, the anchor the inter-job cooldown measures from.
     # Left set, a prior test's value would make the next runner test wait (or not) unexpectedly.
@@ -419,6 +423,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # test tripping it does not silence the next test's expected held event. raising=False
     # so a tree without the attribute yet (a fails-on-base stash) still sets up cleanly.
     monkeypatch.setattr(srv, "device_hold_logged", False, raising=False)
+    # A carried-over hold one startup test armed must not tag the next test's device_held.
+    monkeypatch.setattr(srv, "_carried_hold", None, raising=False)
     # The idle escalation's and the per-tray BMC reset's once-per-episode latches are per-episode
     # state on the fresh srv.fsm just constructed above, so they are already unarmed here — no
     # separate reset needed.
