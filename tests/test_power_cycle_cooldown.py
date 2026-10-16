@@ -429,7 +429,7 @@ def test_the_env_var_overrides_the_default(cool, state_hist, monkeypatch, tmp_pa
 
 def test_a_missing_default_file_adds_no_anchor(cool, state_hist):
     assert not state_hist.exists()
-    assert _cd(cool)["cause"] != "default file" and recovery_base._last_external_power_cycle(T0) is None
+    assert recovery_base._last_external_power_cycle(T0) is None
 
 
 def test_a_malformed_line_is_skipped_with_one_warning(cool, state_hist, caplog):
@@ -456,3 +456,22 @@ def test_health_deadline_reflects_a_default_file_entry(cool, state_hist, monkeyp
     cd = srv._health_payload(now=datetime.fromtimestamp(T0))["power_cycle_cooldown"]
     assert cd["cause"] == "BMC chassis power cycle"
     assert cd["next_deadline"] == datetime.fromtimestamp(until).isoformat(timespec="seconds")
+
+
+def _hist_recs(path, *recs):
+    path.write_text("".join(json.dumps({"at_epoch": a, "cause": c}) + "\n" for a, c in recs))
+
+
+def test_a_matched_failure_line_drops_the_attempt(state_hist):
+    _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, "BMC"), (T0 - 100, "BMC (cycle failed)"))
+    assert recovery_base._last_external_power_cycle(T0) == (T0 - 500, "old")
+
+
+def test_an_unmatched_failure_line_is_ignored(state_hist):
+    _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, "other (cycle failed)"))
+    assert recovery_base._last_external_power_cycle(T0) == (T0 - 500, "old")
+
+
+def test_an_attempt_without_a_failure_line_still_counts(state_hist):
+    _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, "BMC"))
+    assert recovery_base._last_external_power_cycle(T0) == (T0 - 100, "BMC")

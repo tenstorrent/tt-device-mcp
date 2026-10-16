@@ -136,6 +136,9 @@ def _epoch_after(value, than: float, now: float) -> bool:
     return True if at is None else than < at <= now
 
 
+POWER_CYCLE_FAILED_SUFFIX = " (cycle failed)"
+
+
 def _last_external_power_cycle(now_epoch: float) -> Optional[tuple[float, str]]:
     """The latest ``at_epoch`` in the external cycler's history file no later than ``now_epoch``, and
     its cause, or None when the file (env var, else the state dir default) is missing or cannot be read (the host's boot time still covers
@@ -145,7 +148,7 @@ def _last_external_power_cycle(now_epoch: float) -> Optional[tuple[float, str]]:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return None
-    best: Optional[tuple[float, str]] = None
+    recs: list[tuple[float, str]] = []
     warned = False
     for ln in lines:
         if not ln.strip():
@@ -158,8 +161,18 @@ def _last_external_power_cycle(now_epoch: float) -> Optional[tuple[float, str]]:
                 warned = True
                 log.warning("power-cycle history %s: skipping malformed line(s)", path)
             continue
-        if at is not None and (best is None or at > best[0]):
-            best = (at, str(rec.get("cause") or "external power cycle"))
+        if at is not None:
+            recs.append((at, str(rec.get("cause") or "external power cycle")))
+    # A failed cycle is logged as a second line with the same at_epoch and the attempt's cause plus
+    # POWER_CYCLE_FAILED_SUFFIX. It never counts, and it cancels the attempt line it matches; an
+    # unmatched failure line is ignored, and an attempt with no failure line still counts.
+    failed = {(at, c[: -len(POWER_CYCLE_FAILED_SUFFIX)]) for at, c in recs if c.endswith(POWER_CYCLE_FAILED_SUFFIX)}
+    best: Optional[tuple[float, str]] = None
+    for at, c in recs:
+        if c.endswith(POWER_CYCLE_FAILED_SUFFIX) or (at, c) in failed:
+            continue
+        if best is None or at > best[0]:
+            best = (at, c)
     return best
 
 
