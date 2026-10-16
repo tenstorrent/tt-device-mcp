@@ -603,12 +603,72 @@ def begin_offbus_reset(kind: str, off_bus: int) -> None:
         health_event("offbus_reset_intent_unwritable", error=repr(exc), host_at_risk=True)
 
 
+def _remove_intent_durably() -> None:
+    """Unlink the intent and fsync its directory. The intent itself is fsynced when written, so an
+    unlink still in the page cache when the power goes is undone on the next boot (a filesystem
+    replays the write and loses the unlink), and that boot reads it as a host crash."""
+    path = health_dir() / INTENT_FILE
+    path.unlink(missing_ok=True)
+    fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def end_offbus_reset() -> None:
     """The reset begun by :func:`begin_offbus_reset` is over and the host is still up."""
     global _INTENT_OPEN
     if _INTENT_OPEN:
         _INTENT_OPEN = False
-        (health_dir() / INTENT_FILE).unlink(missing_ok=True)
+        try:
+            _remove_intent_durably()
+        except OSError as exc:
+            health_event("offbus_reset_intent_unremovable", error=repr(exc))
+
+
+def close_offbus_reset_before_host_action(action: str, log: Callable[[str], None]) -> None:
+    """The broker is about to reboot or power-cycle the host itself: no off-bus reset is in flight
+    (the gate is serialized), so an intent still on disk is not a reset the host may die in. Remove it
+    durably, whoever wrote it, so the next boot does not latch the broker's own cycle as a host hang
+    (spec 04 I25). Never raises and never stops the action: the next boot's ledger check covers a
+    removal that failed."""
+    global _INTENT_OPEN
+    _INTENT_OPEN = False
+    try:
+        if (health_dir() / INTENT_FILE).exists():
+            _remove_intent_durably()
+            health_event("offbus_reset_intent_closed", action=action)
+    except OSError as exc:
+        log(f"could not remove the off-bus reset intent before the {action}: {exc!r}; going ahead")
+        health_event("offbus_reset_intent_unremovable", action=action, error=repr(exc))
+
+
+def _host_action_after(intent: dict) -> Optional[dict]:
+    """The newest reboot or power cycle the broker recorded in its auto-recovery ledger at or after
+    ``intent`` was written, on the intent's boot when both name one, or None. Such a row means the
+    broker took the host down itself after that reset: the intent is not a host hang."""
+    from tt_device_mcp.health.recovery.base import AUTO_RECOVERY_LEDGER, AUTO_RECOVERY_RANK  # lazy: base is heavy
+
+    try:
+        at = float(intent.get("at_epoch"))
+        lines = (health_dir() / AUTO_RECOVERY_LEDGER).read_text().splitlines()
+    except (OSError, TypeError, ValueError):
+        return None
+    if at != at:
+        return None
+    for ln in reversed(lines):
+        try:
+            row = json.loads(ln)
+            row_at = float(row.get("at_epoch"))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if row.get("action") not in AUTO_RECOVERY_RANK or row_at < at:
+            continue
+        if row.get("boot_id") and intent.get("boot_id") and row["boot_id"] != intent["boot_id"]:
+            continue
+        return row
+    return None
 
 
 def _read_latch() -> Optional[dict]:
@@ -742,6 +802,14 @@ def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
         return offbus_reset_latched()
     path.unlink(missing_ok=True)
     if intent.get("boot_id") == _boot_id() or not _latch_enabled():
+        return offbus_reset_latched()
+    row = _host_action_after(intent)
+    if row is not None:
+        log(
+            f"the {intent.get('kind')} intent of boot {str(intent.get('boot_id') or '?')[:8]} predates the "
+            f"broker's own {row.get('action')} ({row.get('reason')}): not a host hang, no hold latched"
+        )
+        health_event("offbus_reset_intent_closed", intent=intent, action=row.get("action"), at_boot=True)
         return offbus_reset_latched()
     rec = dict(intent, latched_on_boot=_boot_id(), latched_at_epoch=time.time())
     try:
