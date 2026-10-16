@@ -533,6 +533,79 @@ def test_an_offbus_hold_gets_one_fast_attempt_not_a_fast_cadence(monkeypatch):
     assert len(fired) == 2, "the early off-bus attempt is additive: the ceiling window still fires on its own clock"
 
 
+def test_a_one_shot_past_the_ceiling_claims_that_window(monkeypatch):
+    """Spec 03 I23: an off-bus one-shot that first runs past the general ceiling (it waited out a
+    tenant) is that ceiling window's forced run too. The next tick must not climb a second rung."""
+    monkeypatch.setattr(srv, "device_hold_episode_reason", "chip(s) 6 fell off the PCIe bus")
+    fired, since = _hold_deadline_probe(monkeypatch, isolated={"6"})
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 5))
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 15))
+    assert len(fired) == 1, "a one-shot past the ceiling and the ceiling window fired back to back"
+
+    srv._check_hold_deadline(now=since + timedelta(seconds=2 * ceiling + 1))
+    assert len(fired) == 2, "the next ceiling window still fires on its own clock"
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_deferred_ceiling_window_runs_on_the_next_idle_tick(monkeypatch, tmp_path):
+    """Spec 03 I23 with spec 04 I7: a ceiling window whose forced run stood down on a live tenant is
+    given back, not spent. While the tenant stays, each tick checks it quietly (no device op); the
+    first tick with no tenant runs the ladder, not the next window ten minutes on."""
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
+    fsm_dirty(srv, "eth/fabric fault on a present mesh", why="heartbeat")
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    dev = tmp_path / "tenstorrent"
+    dev.mkdir()
+    for i in range(32):
+        (dev / str(i)).write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(dev))
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: 32)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {})
+    monkeypatch.setattr(srv, "dead_chips", lambda beats: [])
+    monkeypatch.setattr(srv, "_offbus_count", lambda beats, expected, *a: 0)  # every chip on the bus
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
+    monkeypatch.setattr(srv, "device_op_lock", None)  # bind a fresh lock to this test's loop
+    monkeypatch.setattr(srv, "_forced_escalation_task", None)
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
+    since = datetime(2026, 8, 15, 1, 17, 33)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
+    tenant = {"on": True}
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: tenant["on"])
+    climbs = []
+
+    async def escalate(phase, indices, expected, log, **_):
+        climbs.append(phase)
+        srv.galaxy_recovery.tenant_deferred = tenant["on"]
+        return OUTCOME_WAITING if tenant["on"] else OUTCOME_RECOVERED
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    async def tick(sec):
+        srv._check_hold_deadline(now=since + timedelta(seconds=sec))
+        if srv._forced_escalation_task is not None:
+            await srv._forced_escalation_task
+
+    await tick(ceiling + 1)
+    assert climbs == ["present-forced"]
+    assert srv.device_hold_escalate_bucket == 0, "a run that stood down on a tenant spent the ceiling window"
+
+    await tick(ceiling + 11)
+    assert climbs == ["present-forced"] and events.count("device_op_begin") == 1
+    assert srv.device_hold_escalate_bucket == 0 and srv.device_hold_tenant_deferred is True
+
+    tenant["on"] = False
+    await tick(ceiling + 21)
+    assert climbs == ["present-forced", "present-forced"], "the first idle tick must run the window"
+    assert srv.device_hold_escalate_bucket == 1 and srv.device_hold_tenant_deferred is False
+
+
 @pytest.mark.asyncio
 async def test_forced_escalation_fires_on_a_hold_held_only_by_a_reported_fault(monkeypatch, tmp_path):
     """A hold whose sole cause is a runtime-reported eth/fabric fault must still get the forced ladder
