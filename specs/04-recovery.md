@@ -140,14 +140,23 @@ each rung fires only when the gentler one failed or cannot apply.
   without launching retracts its entry so the retry is not spent on a recovery that never happened.
   A power cycle whose following boot reached a verified-healthy release — a gate pass whose fabric
   check ran and passed (the startup gate's full check included), or a hold lifted on such a pass —
-  healed the box, so it no longer counts toward the power cycle's min interval or the per-boot cap:
-  a new whole-tray or all-off drop after it power-cycles at once. The proof is stamped in
+  healed the box, so it no longer counts toward any rung's min interval or the per-boot cap: a new
+  whole-tray or all-off drop after it power-cycles at once, and a partial drop or present-mesh wedge
+  after it takes the reboot the chooser picks at once (I10). The proof is stamped in
   `auto_recovery_verified.json` (boot id, time; the first per boot); a missing or unreadable stamp,
   a stamp from the cycle's own boot, or a row with no boot id keeps the row gating, so a cycle no
   later boot verified stays the boot-loop guard. A hard backstop counts every power cycle, verified
   or not: at `POWER_CYCLE_BACKSTOP_MAX` (3) inside `POWER_CYCLE_BACKSTOP_WINDOW_SEC` (7200 s) the
-  power cycle is refused, journalled `power_cycle_backstop` (`host_at_risk`) and paged once per cap
-  reached, so a flapping tray reaches its owners instead of cycling a serving host forever.
+  power cycle is refused, journalled `power_cycle_backstop` (`host_at_risk`, `allowed_at_epoch`)
+  once per cap reached and paged until the alert hook takes it, so a flapping tray reaches its owners
+  instead of cycling a serving host forever. The refusal names the epoch at which a cycle is allowed
+  again: when enough of the oldest cycles have left the window to bring the count below the cap.
+  A host death is never a cycle: only the broker's own requested escalations write the ledger, so a
+  boot the broker did not request neither gates a rung nor spends the per-boot cap, and it proves
+  nothing about an unverified cycle before it. **Time to recover:** a whole-tray or all-off drop in
+  a new episode within 30 min of a cycle a later boot verified goes from 30+ min (the interval,
+  while the mesh reset and the sweep repeat) to about 5-8 min (one power cycle, then the startup
+  gate's full check, fabric included, after hugepages are ready, before any release).
 - **I10 — Per-severity rate limiting.** The min interval gates per rank (`reboot` < `power-cycle`):
   a power cycle may escalate past a recent failed reboot inside the interval, but no rung re-fires
   itself inside it, and a stronger record blocks de-escalating to a weaker rung. An unclassifiable
@@ -155,6 +164,11 @@ each rung fires only when the gentler one failed or cannot apply.
   other limit also standing) is retried as that interval ends: the hold-deadline watchdog forces one
   ladder pass for that hold episode `POWER_CYCLE_RETRY_SLACK_SEC` (5 s) after it, instead of waiting
   for its next ceiling window. The governor still decides that pass, and it releases only through I32.
+  A power cycle a later boot verified healthy (I9) blocks nothing: the
+  fault after it is a new episode, not a boot loop, so the reboot is not held for the rest of the
+  interval. That exemption ends at the power-cycle backstop (I9): there every cycle in the window
+  blocks the reboot again, and the reboot's own interval and per-boot cap always apply, so a reboot
+  fires at most once per `AUTO_RECOVERY_MIN_INTERVAL_SEC`.
 - **I11 — One attempt, gentlest first, climb only on failure.** No rung fires twice back-to-back:
   the reset is one attempt then cooldown; the idle ladders latch once per hold episode (the latch
   expires after `HOLD_ESCALATION_REARM_SEC` so a hold never becomes permanent); the tray walk runs
@@ -466,8 +480,13 @@ each rung fires only when the gentler one failed or cannot apply.
   The walk never re-powers a single tray for a below-floor drop that sits on that one tray: a
   one-tray BMC re-power has taken the other trays off the bus with it (1 chip off -> 24 off), so it
   emits `ubb_reset_declined_single_tray`, spends no walk latch, holds for self-heal, and the stuck-hold
-  ladder's next rung owns it. `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1` turns the single-tray walk back on;
-  the tray-down-no-window sweep is not affected.
+  ladder's next rung owns it. Nor does it re-power a tray whose chips are all off the bus in a
+  below-floor drop, in the post-job gate or the idle escalation: a whole tray off the bus is a power
+  problem a re-power has made worse (one tray re-power took 20 more chips off, three times on one
+  Galaxy host in an hour), so it emits `ubb_reset_declined_whole_tray` and hands the hold straight to
+  the I27 power cycle with no grace (`offbus_gated_hold` phase `whole_tray_down`). A partial drop
+  (no tray wholly off) keeps the walk. `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1` turns the single-tray
+  and whole-tray walks back on; the tray-down-no-window sweep is not affected.
   Before an automatic mesh reset, tray re-power or sweep with a chip off the bus, the broker writes
   `offbus_reset_intent.json` (with the boot id) to the health dir and removes it after the reset's
   verify. A broker that starts on another boot id and finds that intent writes
@@ -531,7 +550,10 @@ each rung fires only when the gentler one failed or cannot apply.
   Each attempt is written, fsync'd, to
   `offbus_power_cycle.json` in the health dir before the command runs, and at most one attempt runs
   per `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` (default 21600 s), across restarts and
-  the cycle itself; a failed command keeps its error there. With the command unset, an attempt
+  the cycle itself; a failed command keeps its error there. Each attempt carries the boot it was
+  made on; an attempt a later boot verified healthy (I9) does not count toward this interval, so a
+  new off-bus episode after it takes its cycle at the grace. An attempt with no boot id or no
+  stamp to prove it healed still counts, and the I9 interval and backstop still apply. With the command unset, an attempt
   within the interval, or the mechanism's limits (I9, I10) denying it, the broker pages once per
   episode (`offbus_gated_hold_page`, `offbus_power_cycle_rate_limited`,
   `offbus_power_cycle_denied`, `offbus_power_cycle_unguarded`, naming the host, host at risk,
@@ -561,7 +583,7 @@ each rung fires only when the gentler one failed or cannot apply.
   host rung without the last-chance sweep, whose resets include the same mesh reset. The device
   stays held throughout: it is released only by the full health check, fabric included.
   **A regressed tray rung is bounded the same way.** When the gate allows resets but a tray
-  re-power on this boot took chips on other trays off the bus (the per-tray rung is declined, I25
+  re-power on this host (within the latch window below) took chips on other trays off the bus (the per-tray rung is declined, I25
   and the tray rung's walk below), no IPMI rung will run, so the off-bus hold takes the same grace
   and then the same power cycle, with every check above.
   Unset, the behaviour is I24's plus the I33 hand-off. `deploy/tt-manual-recovery-check.sh` is a template for the
@@ -586,7 +608,8 @@ each rung fires only when the gentler one failed or cannot apply.
   pass. An already-running reset in its own scope is still adopted, and the operator's reset tool
   is never held. The same holds the one present-mesh reset a green-fabric dispatch
   failure earns (spec 03 I55): the gate holds and pages, logs the held reset by name and never
-  promises an escalation. Pollers the broker owns (`tt_telemetry_server` as uid 0 in
+  promises an escalation. A clean exit's timed-out eth read (spec 03 I61) does not take that
+  reset under the hold either: it keeps the fabric pass in the same probe. Pollers the broker owns (`tt_telemetry_server` as uid 0 in
   `system.slice`, `tt-metrics-exporter`) are infrastructure, not tenants (`is_tenant`): they never
   block that reset, which stops them for its window and starts them again after it.
 
@@ -699,6 +722,17 @@ each rung fires only when the gentler one failed or cannot apply.
   never marks; one the host has not acted on within `TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC` (default
   900 s, capped at 3600 s; malformed or non-positive reads as the default) is journaled as
   `host_action_request_expired` and the next tick resumes the forced ladder.
+  The same rule holds on every path that could start a device reset, not only the watchdog:
+  `GalaxyRecovery.escalate` returns WAITING at its entry (before the tray-down prelude) for every
+  caller and phase; the health gate's ladder (any phase, pre-job, post-job or startup) runs no rung,
+  marks a healthy device dirty and holds it; an operator reset (`tt_device_reset` and its stream) is
+  refused unless forced, and a forced one is logged. Each path journals one
+  `reset_suppressed_host_action` event and one log line per request. A power-cycle command that timed
+  out, rather than exited non-zero or failed to start, may have launched its detached cycler, so it
+  keeps the request pending (`auto_power_cycle_failed` with `timed_out` true) under the same bound.
+  A job held past its bound while a request is pending says so (the action, its age, the bound)
+  instead of naming a device op in flight.
+
 - **I36 — A mesh reset that failed with the off-bus set unchanged is not repeated in that hold
   episode; the next window takes the next stronger rung.** The broker records, per hold episode, each
   mesh reset that RAN and failed, with the off-bus chip set before and after it; a reset the host gate
@@ -713,8 +747,33 @@ each rung fires only when the gentler one failed or cannot apply.
   the I33 hand-off, latched (no deadline, `act_by` null), and no further reset fires on that set. Any
   later reset still owes the I32 fabric pass, so nothing releases the device before the full health
   check, fabric included, passes. The record is keyed by the episode, so a new episode resets again.
+  A power cycle the rate limit denies, or one not opted in, never by itself ends resets for the rest of
+  the hold: a set that changed or shrank is reset again, and the gate's cooldown paces its retries.
   Bounds the loop one Galaxy host ran: six identical mesh resets in one hold, each exiting 1 after a
   263 s overrun, one per forced window.
+- **I37 — A whole-tray or all-off drop goes to the power cycle with no reset first (classes A
+  and C).** An exception to I19, I22 and I27 for two off-bus classes no further reset has been seen
+  to heal. Class A: the off-bus set is exactly one or more whole UBB trays (the I16 tray map places
+  every chip) and at least one chip is still on the bus. Class C: every chip is off the bus after a
+  mesh reset already ran and failed (nonzero exit or unhealthy verify) since the mesh was last
+  released. A whole-bus drop with no failed reset gets its one mesh reset first, at the startup gate
+  as at run time: the startup gate also runs after a broker restart, and one mesh reset has healed an
+  all-off bus there and at run time. When the
+  power cycle is opted in, `escalate()` requests it for these classes before any rung fires (after the
+  I19 rescan and capture, which still run once per episode): no mesh reset, no SBR, no tray re-power
+  and no last-chance sweep, and the host rung's own sweep skips itself for these classes
+  (`last_chance_sweep_skipped`). The request keeps every guard of the host rung: a reset cycling in
+  its scope, a tenant or an unreadable holder scan, an operator stand-back marker or check, and the
+  power-cycle rate limits (journaled as denied) each hold and fire nothing; the next window asks
+  again. The hold-deadline climb (`offbus-forced`) waives an unreadable scan, as the tray rung does,
+  but never a readable tenant or a running job. A missing manual-recovery check does not hold it, as
+  it does not hold the host rung this replaces. With no power cycle opted in, the ordinary ladder runs as before (I36 still stops a repeat
+  of a failed reset). The host that comes back runs the startup gate, which waits for the hugepage
+  pool and passes the full health check, fabric included, before any release (03 I4); a failed check
+  keeps the hold and climbs. Partial drops (a single chip, or part of one tray) keep the full ladder.
+  Evidence: no whole-tray drop healed without a power cycle (0 of 50, 0 of 23 and 0 of 90 on three
+  Galaxy hosts); on all-off drops whose first mesh reset failed, each repeat on the unchanged set ran
+  130-262 s and exited 1.
 
 ## Interfaces
 
@@ -832,11 +891,14 @@ re-power it rescans that tray's root ports (the whole bus only when none is know
 fabric included: a re-power does not undo a chip's sysfs `remove`. After a failed verify it re-reads
 the bus. If a chip that was on the bus before the walk is now off, the walk stops at once
 (`ubb_reset_regressed_offbus`) rather than re-power more trays, and the per-tray rung is declined
-for the rest of the boot (`ubb_tray_rung_disabled`). The record goes, fsync'd, to
-`ubb_tray_rung_disabled.json` in the health dir with the boot id, so a broker restart on the same
-boot keeps it (`ubb_tray_rung_disabled_restored`); a record from another boot is removed and the
-rung re-arms (`ubb_tray_rung_rearmed`). With this boot's id unreadable a record cannot be shown
-stale, so it counts. A delayed cross-tray drop latches the same record: when chips that were on the
+on this host for `TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS` (default 7) days (`ubb_tray_rung_disabled`).
+The record goes, fsync'd, to `ubb_tray_rung_disabled.json` in the health dir with the boot id, the
+host name and the time. A broker restart or a host power cycle keeps it
+(`ubb_tray_rung_disabled_restored`, with the boot id it was latched on): a power cycle does not
+repair the UBB whose re-power regressed, and a per-boot latch let the rung regress the mesh again
+after every cycle. A record older than the window, or written by another host, is removed and the
+rung re-arms (`ubb_tray_rung_rearmed`); one with no time of its own is aged by the file's mtime, and
+one whose age cannot be read counts. A delayed cross-tray drop latches the same record: when chips that were on the
 bus before the last tray re-power, on trays it did not re-power, leave the bus within
 `TRAY_PULSE_WINDOW_SEC` (900 s) of it and every one sits at in-tray position 5 (chips 5/13/21/29 on
 a Galaxy), the next look (the tray rung's evidence or the sweep) disables the rung; any other drop
@@ -1052,7 +1114,8 @@ sees a silent fabric pass.
 | I23 only the re-powered tray's root ports are rescanned; the global rescan only when none is known | `tests/test_pcie_guard.py::test_the_envelope_rescans_only_the_re_powered_trays_root_ports`, `::test_the_envelope_falls_back_to_the_global_rescan_when_no_tray_port_is_known`, `tests/test_device_safety.py::test_the_walk_rescans_only_the_re_powered_trays_root_ports` |
 | I23 a chip on another tray newly all-ones gets one remove + scoped rescan | `tests/test_pcie_guard.py::test_a_sibling_chip_newly_all_ones_gets_one_remove_and_scoped_rescan`, `::test_a_sibling_chip_already_all_ones_or_on_the_tray_is_not_touched` |
 | I25 a regressed walk disables the tray rung for the boot; the back-to-back sweep skips the tray re-power and stays complete | `tests/test_device_safety.py::test_a_regressed_walk_disables_the_tray_rung_for_the_process`, `tests/test_pcie_guard.py::test_a_disabled_tray_walk_leaves_the_envelope_armed`, `tests/test_ladder_v2.py::test_a_regressed_tray_rung_is_skipped_in_the_last_chance_sweep`, `::test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep` |
-| I25 the disabled tray rung survives a broker restart on the same boot; a new boot re-arms it | `tests/test_pcie_guard.py::test_a_disabled_tray_rung_survives_a_broker_restart_on_the_same_boot`, `::test_a_new_boot_re_arms_the_tray_rung` |
+| I25 the disabled tray rung survives a broker restart and a new boot on the same host, for a bounded window; another host's or an expired record re-arms it; a record with no time is aged by its file | `tests/test_pcie_guard.py::test_a_disabled_tray_rung_survives_a_broker_restart_on_the_same_boot`, `::test_a_new_boot_keeps_the_tray_rung_latch`, `::test_the_tray_rung_latch_expires_after_its_window`, `::test_a_tray_rung_record_from_another_host_never_counts`, `::test_a_tray_rung_record_without_a_time_is_aged_by_its_file`, `tests/test_offbus_power_cycle.py::test_a_regression_recorded_before_a_reboot_keeps_the_walk_off` |
+| I25/I27 a below-floor drop with a whole tray off is never re-powered: the post-job gate and the idle escalation hand it to the power cycle at once and keep the device held; a partial drop still walks and is released only after the full check, fabric included | `tests/test_offbus_power_cycle.py::test_the_post_job_gate_hands_a_whole_tray_drop_to_the_power_cycle`, `::test_by_default_the_one_tray_drop_is_never_walked`, `::test_a_partial_drop_below_the_floor_still_walks_and_releases_only_after_the_full_check`, `tests/test_device_safety.py::test_a_whole_tray_below_the_floor_is_not_re_powered_alone_but_two_trays_still_walk` |
 | I25 a tray pulse followed by position-5 chips on other trays leaving the bus disables the rung | `tests/test_device_safety.py::test_a_tray_pulse_that_drops_position_5_on_other_trays_disables_the_rung` |
 | I25 / I32 a skipped tray re-power releases only after the full health check, fabric included | `tests/test_ladder_v2.py::test_a_skipped_tray_rung_releases_only_after_the_full_health_check` |
 | I27 a regressed tray rung hands off to the power cycle past the grace | `tests/test_offbus_power_cycle.py::test_a_regressed_tray_rung_hands_off_past_the_grace` |
@@ -1124,9 +1187,11 @@ sees a silent fabric pass.
 | Reclaim never reports a permission-denied pid as signalled | `tests/test_device_holders.py::test_reclaim_does_not_report_a_permission_denied_pid_as_signalled` |
 | I8 galaxy floor holds below / resets at floor; keys on frozen chips too | `tests/test_device_safety.py::test_galaxy_reset_floor_holds_a_single_chip_wedge`, `tests/test_device_safety.py::test_galaxy_reset_floor_holds_just_below_the_floor`, `tests/test_device_safety.py::test_galaxy_reset_floor_resets_exactly_at_the_floor`, `tests/test_device_safety.py::test_galaxy_reset_floor_still_resets_a_mass_drop`, `tests/test_device_safety.py::test_cascade_router_keys_the_galaxy_floor_on_frozen_chips_too`, `tests/test_device_safety.py::test_a_reset_frac_above_one_fails_safe_to_the_default_floor_not_disabled` |
 | I9 ledger durable-before-fire, abort on unwritable, fail-closed read, retract | `tests/test_device_safety.py::test_auto_reboot_records_durably_before_it_fires`, `tests/test_device_safety.py::test_auto_reboot_aborts_when_the_ledger_cannot_be_written`, `tests/test_device_safety.py::test_governor_fails_closed_when_the_ledger_is_unreadable`, `tests/test_device_safety.py::test_governor_blocks_a_reboot_inside_the_min_interval`, `tests/test_device_safety.py::test_record_auto_recovery_round_trips_through_the_durable_ledger`, `tests/test_device_safety.py::test_ledger_skips_a_corrupt_line_without_losing_the_rest`, `tests/test_device_safety.py::test_a_power_cycle_that_fails_to_launch_retracts_its_ledger_entry` |
-| I9 a power cycle a later boot verified healthy does not gate the next; an unverified one still does; the backstop refuses and pages at the cap | `tests/test_power_cycle_verified_interval.py::test_a_verified_cycle_does_not_gate_a_new_drop`, `::test_an_unverified_cycle_inside_the_interval_is_still_refused`, `::test_a_stamp_that_cannot_prove_a_later_boot_keeps_the_guard`, `::test_the_backstop_refuses_and_pages_once_at_the_cap`, `::test_the_gate_stamps_only_a_release_whose_fabric_passed`, `::test_a_relift_stamps_only_on_a_passing_fabric_check` |
+| I9 a power cycle a later boot verified healthy does not gate the next; an unverified one still does; the backstop refuses and pages at the cap | `tests/test_power_cycle_verified_interval.py::test_a_verified_cycle_does_not_gate_a_new_drop`, `::test_an_unverified_cycle_inside_the_interval_is_still_refused`, `::test_a_stamp_that_cannot_prove_a_later_boot_keeps_the_guard`, `::test_the_backstop_refuses_and_pages_once_at_the_cap`, `::test_the_gate_stamps_only_a_release_whose_fabric_passed`, `::test_a_relift_stamps_only_on_a_passing_fabric_check`, `::test_a_relift_end_to_end_writes_the_stamp_that_frees_the_next_rung` |
+| I9 G8 replay: a new episode after a verified cycle takes one power cycle at once; a host death is never a cycle; the cycle it takes still gates until verified | `tests/test_power_cycle_new_episode_g8.py::test_g8_a_cycle_a_later_boot_verified_does_not_hold_off_the_next_episodes_cycle`, `::test_g8_a_host_death_is_never_counted_as_a_cycle`, `::test_g8_the_loop_bound_stands_for_an_unverified_cycle`, `::test_g8_the_ladder_takes_the_power_cycle_instead_of_holding_for_the_interval` |
 | I10 per-severity interval | `tests/test_device_safety.py::test_power_cycle_escalates_past_a_recent_reboot`, `tests/test_device_safety.py::test_power_cycle_does_not_escalate_past_a_recent_power_cycle`, `tests/test_device_safety.py::test_reboot_does_not_de_escalate_past_a_recent_power_cycle` |
 | I10 a power cycle refused by its interval alone is retried as the interval ends, once per refusal, and releases only after a passing fabric check | `tests/test_power_cycle_interval_retry.py::test_a_cycle_refused_by_its_interval_is_due_again_at_expiry`, `::test_the_interval_is_still_enforced`, `::test_no_retry_unless_the_interval_alone_refused_this_episode`, `::test_the_watchdog_forces_one_pass_at_expiry_not_at_the_next_window`, `::test_the_retried_pass_releases_only_after_a_passing_fabric_check` |
+| I10 a verified cycle does not block the reboot; the reboot keeps its own guards; past the backstop it blocks again | `tests/test_power_cycle_verified_interval.py::test_a_verified_cycle_does_not_block_the_reboot_rung`, `::test_a_reboot_after_a_verified_cycle_keeps_its_own_guards_and_hands_off_to_the_cycle`, `::test_past_the_backstop_a_verified_cycle_gates_the_reboot_again`, `::test_a_stamp_that_cannot_prove_a_later_boot_keeps_the_guard` |
 | I11 host rung only after exhausted reset (two strikes); once-per-episode latch | `tests/test_device_safety.py::test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted`, `tests/test_device_safety.py::test_stuck_hold_escalation_retries_on_the_grace_cadence`, `tests/test_device_safety.py::test_ubb_tray_reset_fires_at_most_once_per_hold_episode`, `tests/test_device_safety.py::test_escalate_forced_suffix_bypasses_the_retry_pacing` |
 | I12 quiesce + in-flight flag + restore rules | `tests/test_reset.py::test_streaming_reset_quiesces_pollers_and_flags_in_flight`, `tests/test_reset.py::test_reset_quiesce_restores_pollers_even_if_the_rescan_is_cancelled`, `tests/test_reset.py::test_reset_quiesce_leaves_pollers_off_when_the_reset_times_out`, `tests/test_reset.py::test_reset_quiesce_restores_pollers_when_a_failed_launch_leaves_no_scope`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_defers_the_dead_chip_sampler_during_the_transient_drop`, `tests/test_device_safety.py::test_no_clock_cap_keeper_in_the_default_pollers`, `tests/test_device_safety.py::test_the_specs_name_the_default_pollers`, `tests/test_device_safety.py::test_pollers_quiesce_skips_a_default_poller_the_host_does_not_have`, `tests/test_device_safety.py::test_pollers_quiesce_stops_and_restarts_an_opted_in_fmax_cap`, `tests/test_startup_fabric_hugepages.py::test_the_startup_fabric_check_runs_with_the_pollers_stopped`, `tests/test_startup_fabric_hugepages.py::test_the_startup_quiesce_restarts_the_pollers_when_the_gate_raises`, `tests/test_startup_fabric_hugepages.py::test_a_reset_inside_the_startup_check_defers_its_poller_restart`, `tests/test_startup_fabric_hugepages.py::test_the_startup_quiesce_leaves_the_pollers_off_while_a_reset_cycles` |
 | I13 mesh reset verify = fabric pass (pass/fail/77), single chip and no-fabric-check light | `tests/test_reset.py::test_an_operator_reset_on_a_mesh_releases_only_on_a_fabric_pass`, `tests/test_reset.py::test_an_operator_reset_whose_fabric_fails_is_not_released`, `tests/test_reset.py::test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified`, `tests/test_reset.py::test_a_single_chip_operator_reset_keeps_the_light_verify`, `tests/test_reset.py::test_a_mesh_with_no_fabric_check_keeps_the_light_verify`, `tests/test_reset.py::test_the_light_verify_checks_the_hosts_chip_count_not_the_survivors`, `tests/test_reset.py::test_a_blind_stream_verify_does_not_clear_the_reported_fault`, `tests/test_reset.py::test_the_stream_settles_an_operator_reset_like_the_tool` |
@@ -1138,6 +1203,7 @@ sees a silent fabric pass.
 | Cold rung fireable-or-off (ipmitool) | `tests/test_device_safety.py::test_a_host_without_ipmitool_serves_with_the_cold_rung_off`, `tests/test_device_safety.py::test_ipmitool_present_leaves_the_cold_rung_armed` |
 | I26 pre-power-cycle hook: opt-in, runs between record and fire, bounded, never gates the cycle | `tests/test_pre_power_cycle_hook.py::test_unset_hook_runs_nothing_and_the_cycle_is_unchanged`, `tests/test_pre_power_cycle_hook.py::test_the_hook_runs_after_the_record_and_before_the_fire`, `tests/test_pre_power_cycle_hook.py::test_a_failing_hook_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_a_hook_that_cannot_run_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_a_hung_hook_is_killed_with_its_children_and_the_cycle_goes_ahead`, `tests/test_pre_power_cycle_hook.py::test_a_background_child_holding_output_does_not_stretch_the_wait`, `tests/test_pre_power_cycle_hook.py::test_the_hook_never_runs_when_the_ledger_aborts_the_cycle`, `tests/test_pre_power_cycle_hook.py::test_a_hook_that_raises_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_cancelled_while_waiting_on_the_hook_retracts_the_ledger_entry`, `tests/test_pre_power_cycle_hook.py::test_the_warm_reboot_does_not_run_the_power_cycle_hook`, `tests/test_pre_power_cycle_hook.py::test_the_timeout_is_always_finite_and_positive` |
 | I27 the gated off-bus hold: safe rungs first, grace, idle and nothing standing back, then one power cycle per interval with the attempt on disk first; otherwise hold or page once | `tests/test_offbus_power_cycle.py::test_a_gate_that_allows_resets_hands_back_to_the_ladder`, `tests/test_offbus_power_cycle.py::test_no_power_cycle_before_the_safe_rungs_ran`, `tests/test_offbus_power_cycle.py::test_an_unset_command_pages_once_and_the_hold_stands`, `tests/test_offbus_power_cycle.py::test_within_the_grace_it_holds`, `tests/test_offbus_power_cycle.py::test_past_the_grace_and_idle_it_fires_once_with_the_attempt_on_disk_first`, `tests/test_offbus_power_cycle.py::test_the_ladder_then_the_power_cycle_through_the_escalation`, `tests/test_offbus_power_cycle.py::test_a_tenant_or_an_unreadable_scan_holds`, `tests/test_offbus_power_cycle.py::test_a_reset_in_its_own_scope_holds`, `tests/test_offbus_power_cycle.py::test_anything_objecting_stands_back`, `tests/test_offbus_power_cycle.py::test_checks_that_say_no_let_it_fire`, `tests/test_offbus_power_cycle.py::test_an_attempt_within_the_interval_pages_instead`, `tests/test_offbus_power_cycle.py::test_an_attempt_older_than_the_interval_does_not_limit`, `tests/test_offbus_power_cycle.py::test_the_mechanism_limits_still_apply`, `tests/test_offbus_power_cycle.py::test_an_unwritable_attempt_record_never_fires`, `tests/test_offbus_power_cycle.py::test_a_failed_fire_keeps_its_error_for_the_next_page`, `tests/test_offbus_power_cycle.py::test_fire_command_raises_on_a_non_zero_exit_and_passes_the_reason`, `tests/test_offbus_power_cycle.py::test_due_for_the_watchdog_once_per_episode`, `tests/test_offbus_power_cycle.py::test_the_hold_watchdog_forces_one_pass_at_the_grace`, `tests/test_offbus_power_cycle.py::test_the_knobs_default_and_reject_nonsense`, `tests/test_offbus_power_cycle.py::test_a_corrupt_state_file_reads_empty_and_a_bad_stamp_counts_as_now` |
+| I27 an attempt a later boot verified healthy does not count toward the off-bus interval; one it cannot prove healed still does | `tests/test_power_cycle_new_episode_g8.py::test_g8_the_off_bus_hold_interval_skips_a_cycle_a_later_boot_verified`, `::test_last_attempt_within_skips_only_what_healed_says` |
 | I27 bounded: a blocked cycle pages once (high severity) past grace + the bound; a page the hook drops is retried | `tests/test_offbus_power_cycle.py::test_a_blocked_power_cycle_pages_once_past_its_bound`, `tests/test_offbus_power_cycle.py::test_a_page_the_alert_hook_drops_is_sent_again`, `tests/test_offbus_power_cycle.py::test_the_blocked_page_bound_defaults_and_rejects_nonsense` |
 | I27 a failed BMC IPMI hands off to the power cycle at its bound, after the ladder ran once (also when the ladder's own tray rung failed it); only `BmcIpmiError` starts the clock | `tests/test_offbus_power_cycle.py::test_a_failed_bmc_ipmi_hands_off_past_its_bound`, `tests/test_offbus_power_cycle.py::test_within_the_ipmi_bound_it_holds_and_the_bound_is_configurable`, `tests/test_offbus_power_cycle.py::test_a_cycle_in_progress_stands_the_ipmi_hand_off_back`, `tests/test_offbus_power_cycle.py::test_the_whole_box_is_re_read_before_the_cycle`, `tests/test_offbus_power_cycle.py::test_only_a_bmc_ipmi_failure_starts_the_clock`, `tests/test_offbus_power_cycle.py::test_a_tray_sweep_the_bmc_failed_starts_the_clock`, `tests/test_offbus_power_cycle.py::test_the_watchdog_forces_a_pass_at_the_ipmi_bound`, `tests/test_offbus_power_cycle.py::test_the_ipmi_bound_defaults_and_rejects_nonsense`, `tests/test_offbus_power_cycle.py::test_the_ladder_noted_before_the_ipmi_failure_still_counts`, `tests/test_offbus_power_cycle.py::test_the_escalations_own_tray_rung_failing_over_ipmi_hands_off_at_the_bound` |
 | I27 a failed or regressed tray walk runs no below-floor mesh reset; it holds and hands off to the power cycle at its bound (or climbs without the sweep when the power cycle cannot fire), never releasing the device | `tests/test_offbus_power_cycle.py::test_a_regressed_tray_walk_hands_off_to_the_power_cycle_not_the_mesh_reset`, `tests/test_offbus_power_cycle.py::test_a_walk_that_did_not_recover_skips_the_mesh_reset_on_every_later_pass`, `tests/test_offbus_power_cycle.py::test_with_no_power_cycle_command_a_failed_walk_climbs_without_the_sweep`, `tests/test_offbus_power_cycle.py::test_the_watchdog_forces_a_pass_at_the_tray_walk_bound`, `tests/test_offbus_power_cycle.py::test_the_tray_walk_bound_defaults_and_rejects_nonsense`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_affected_tray_stays_off` |
@@ -1160,12 +1226,24 @@ sees a silent fabric pass.
 | I33 / I32 a lifted reset releases only after a passing full health check, fabric included; a reset the gate still refuses releases nothing | `tests/test_gated_hold_handoff.py::test_the_lifted_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_a_reset_the_gate_still_refuses_releases_nothing` |
 | I34 a requested power cycle or reboot suppresses every hold-deadline tick and a forced escalation waiting on the lock; the device stays held with the check owed; one line per request | `tests/test_host_action_suppress.py::test_power_cycle_request_suppresses_every_deadline_tick`, `::test_reboot_request_suppresses_the_deadline_tick`, `::test_escalation_waiting_on_the_lock_runs_no_rung` |
 | I34 bounded: a refused or failed request never suppresses; an expired one resumes the ladder; the window is always finite | `tests/test_host_action_suppress.py::test_power_cycle_that_fails_to_launch_does_not_suppress`, `::test_power_cycle_refused_by_the_ledger_does_not_suppress`, `::test_a_request_the_host_never_acted_on_expires_and_the_ladder_resumes`, `::test_pending_window_is_always_finite` |
+| I34 every path: escalate starts no rung for any phase, the gate ladder runs no rung and holds, an operator reset is refused on both routes unless forced, a timed-out fire stays pending, a held job names the pending action | `tests/test_host_action_suppress.py::test_escalate_starts_no_rung_while_a_host_action_is_pending`, `::test_the_gate_runs_no_rung_and_holds_while_a_host_action_is_pending`, `::test_an_operator_reset_is_refused_while_a_host_action_is_pending`, `::test_a_power_cycle_command_that_timed_out_stays_pending`, `::test_a_job_held_past_its_bound_names_the_pending_host_action` |
 | I36 a mesh reset that failed on an unchanged off-bus set is not repeated in its hold; with no host rung the hold is handed to an operator once, latched | `tests/test_no_repeat_failed_rung.py::test_a_failed_unchanged_reset_is_not_repeated_and_with_no_host_rung_is_handed_off_once` |
 | I36 the next window climbs: the last-chance sweep, then the power cycle; a rate-limited cycle holds and fires no reset | `tests/test_no_repeat_failed_rung.py::test_with_a_power_cycle_the_next_window_sweeps_then_power_cycles`, `::test_a_rate_limited_power_cycle_fires_no_reset` |
 | I36 a changed off-bus set, a new episode or a refused (never run) reset leaves the reset open | `tests/test_no_repeat_failed_rung.py::test_a_changed_off_bus_set_lets_the_reset_run_again`, `::test_a_new_hold_episode_resets_again`, `::test_a_refused_reset_is_not_recorded` |
 | I36 present mesh: a forced window skips the failed reset; the grace-cadence retry still resets | `tests/test_no_repeat_failed_rung.py::test_a_forced_present_mesh_window_skips_the_failed_reset`, `::test_a_non_forced_grace_retry_still_resets_a_present_mesh` |
 | I36 / I32 every reset on this path is followed by the full verify, fabric included; a failed verify keeps the hold and climbs | `tests/test_no_repeat_failed_rung.py::test_every_reset_is_verified_with_the_fabric_and_a_failed_verify_keeps_the_hold_and_climbs` |
 | I36 time to recover (fake-clock replay): power cycle at 923 s vs 1186 s, one reset vs one per window | `tests/test_no_repeat_failed_rung.py::test_replay_the_power_cycle_fires_one_reset_sooner`, `::test_replay_with_no_host_rung_the_reset_loop_ends_in_one_hand_off` |
+| I36 a power cycle that is rate-limited or not opted in never stops resets: a shrinking off-bus set resets again each forced window, and the gate retries its reset once its cooldown ran out | `tests/test_host_action_suppress.py::test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_fire`, `::test_the_gate_keeps_resetting_a_drop_whose_power_cycle_is_not_opted_in` |
+| I37 the fault class: whole trays with a chip still on the bus (A), all off after a failed mesh reset (C), at startup or at run time; partial drops and no tray map are neither | `tests/test_classac_power_cycle_direct.py::test_the_fault_class_of_an_off_bus_set` |
+| I37 class A (gate and idle hold): the rescan and capture, then the power cycle with no reset, tray re-power or sweep | `tests/test_classac_power_cycle_direct.py::test_a_whole_tray_goes_to_the_power_cycle_with_no_reset`, `::test_an_idle_whole_tray_hold_cycles_with_no_reset` |
+| I37 class C: all off at startup (a broker restart) with no failed reset gets exactly one mesh reset, then cycles; all off after a failed mesh reset cycles with no second reset and no sweep, at startup or at run time | `tests/test_classac_power_cycle_direct.py::test_all_off_at_startup_gets_one_mesh_reset_first`, `::test_all_off_at_startup_after_a_failed_reset_cycles_with_no_reset`, `::test_all_off_after_a_failed_mesh_reset_cycles_with_no_second_reset` |
+| I37 the failed-reset mark: set by a mesh reset that exits nonzero or verifies unhealthy, not by a healthy one; cleared at the episode end | `tests/test_classac_power_cycle_direct.py::test_the_failed_reset_mark_is_set_by_a_failed_reset_and_cleared_at_the_episode_end` |
+| I37 partial drops (one chip, part of one tray) keep the full ladder | `tests/test_classac_power_cycle_direct.py::test_a_partial_drop_keeps_the_ladder` |
+| I37 a reset in scope, a tenant, a stand-back marker or a rate-limit denial holds and fires nothing; no power cycle opted in keeps the ladder | `tests/test_classac_power_cycle_direct.py::test_a_guard_holds_the_power_cycle_and_fires_nothing`, `::test_with_no_power_cycle_opted_in_the_ladder_runs` |
+| I37 the hold-deadline climb waives an unreadable holder scan and cycles; a running job or a readable tenant still holds it, and nothing is released before the startup check | `tests/test_classac_power_cycle_direct.py::test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant` |
+| I37 the host rung's last-chance sweep skips itself for classes A and C | `tests/test_classac_power_cycle_direct.py::test_the_last_chance_sweep_skips_itself_for_a_and_c` |
+| I37 / goal of 03 I4: after the cycle the startup gate waits for hugepages and runs the fabric pass; a failed check keeps the hold | `tests/test_classac_power_cycle_direct.py::test_after_the_cycle_the_startup_gate_awaits_hugepages_and_the_fabric`, `::test_a_failed_startup_check_after_the_cycle_keeps_the_hold` |
+| I37 time to recover (fake clock): class A requests the cycle in the first window, class C after one failed reset | `tests/test_classac_power_cycle_direct.py::test_time_to_recover_on_a_fake_clock` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |
@@ -1184,7 +1262,7 @@ sees a silent fabric pass.
 | I16 a new GLX board type this build cannot map surfaces as `ubb_tray_table_missing` | `tests/test_ubb_tray_map.py::test_a_glx_board_type_with_no_matching_arch_suffix_journals_once` |
 | I19 a tray with 4+ chips off at first sighting is an onset; no map, an unplaced chip, or fewer off gets no prelude | `tests/test_tray_down_prelude.py::test_a_tray_with_four_or_more_chips_off_is_a_tray_down_onset`, `::test_no_map_or_an_unplaced_chip_never_classifies_as_tray_down`, `::test_one_to_three_chips_off_get_no_prelude` |
 | I19 replay: no recorded episode that recovered without a power cycle gets the prelude | `tests/test_tray_down_prelude.py::test_replay_the_prelude_runs_only_on_onsets_that_never_recovered_without_a_power_cycle` (fixture `tests/fixtures/tray_down_replay.tsv`) |
-| I19 order: rescan, capture, the full ladder, the power cycle only when the ladder fails | `tests/test_tray_down_prelude.py::test_a_tray_down_onset_rescans_captures_then_runs_the_full_ladder_and_power_cycles_only_when_it_fails`, `::test_a_ladder_that_recovers_the_tray_fires_no_power_cycle`, `::test_the_last_chance_sweep_still_gates_the_power_cycle_of_a_tray_down` |
+| I19 order: rescan, capture, the full ladder, the power cycle only when the ladder fails (a whole tray, class A, goes to the cycle after the capture: I37) | `tests/test_tray_down_prelude.py::test_a_tray_down_onset_rescans_captures_then_runs_its_ladder`, `::test_a_ladder_that_recovers_the_tray_fires_no_power_cycle`, `::test_the_last_chance_sweep_still_gates_the_power_cycle_of_a_tray_down` |
 | I19 `off_bus_after` is log-only: the event carries both counts, the host rung uses the onset count | `tests/test_ladder_v2.py::test_tray_down_no_window_power_cycle_logs_the_off_bus_count_after_the_verify`, `tests/test_ladder_v2.py::test_tray_down_no_window_escalation_uses_the_onset_count_not_the_count_after` |
 | I19 the prelude changes no ladder input (same stage, indices, evidence, beats and rungs as with it off) | `tests/test_tray_down_prelude.py::test_the_prelude_changes_no_ladder_input`, `::test_capture_off_runs_the_ladder_alone` |
 | I19 once per episode from any caller; a tenant defers the rescan, never the capture | `tests/test_tray_down_prelude.py::test_the_prelude_runs_once_per_episode_from_any_caller`, `::test_a_tenant_defers_the_rescan_but_not_the_capture` |

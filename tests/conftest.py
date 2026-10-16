@@ -58,6 +58,24 @@ def reset_post_reset_fabric_debt():
 
 
 @pytest.fixture(autouse=True)
+def reset_host_action_state():
+    """Clear the process-wide mechanism's pending host action (spec 04 I34) around every test:
+    escalate() refuses every rung under it, so one a test left behind would stop the next test's
+    ladder."""
+
+    def clear():
+        m = srv.recovery_mechanism
+        if m is None:
+            return
+        m.host_action_requested = None
+        m._host_action_reset_refused = None
+
+    clear()
+    yield
+    clear()
+
+
+@pytest.fixture(autouse=True)
 def isolate_process_globals():
     """Restore os.environ and sys.argv around every test.
 
