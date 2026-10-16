@@ -185,6 +185,76 @@ def test_the_device_op_bar_still_comes_first_and_is_logged(tmp_path):
     assert text.index("device op in flight") < text.index("if recovery_gate; then") < text.index("# Dispatch hold")
 
 
+def test_each_deferral_names_its_deadline(tmp_path):
+    # The deadline is the bound from the hold's start or from the first deferral, whichever is
+    # sooner: a 600 s old hold under a 1200 s bound applies about 600 s from now.
+    now = int(time.time())
+    done, _, log = _gate(tmp_path, health=[_health(held=True, state="recovering", age=600)])
+    assert "GATE PASSED" not in done.stdout
+    m = re.search(r"apply_by=([^\s)]+)", log[0])
+    assert m, log
+    got = subprocess.run(["date", "-d", m.group(1), "+%s"], capture_output=True, text=True, check=True)
+    assert abs(int(got.stdout) - (now + 600)) <= 5, (m.group(1), now)
+    # An earlier first deferral of this update is the sooner deadline.
+    sub = tmp_path / "pending"
+    sub.mkdir()
+    done, _, log = _gate(sub, health=[_health(held=True, age=60)], pending=f"{_NEW} {now - 1100}\n")
+    got = subprocess.run(
+        ["date", "-d", re.search(r"apply_by=([^\s)]+)", log[0]).group(1), "+%s"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert abs(int(got.stdout) - (now + 100)) <= 5, log
+
+
+_RESET_SCOPE = """systemctl() {
+    case "$*" in
+        list-units*ttdev-reset-*) echo "ttdev-reset-1234.scope loaded active running reset" ;;
+        restart*) echo "restart" >> TRACE ;;
+    esac
+}
+"""
+
+
+def test_a_running_reset_scope_always_defers_even_past_the_bound(tmp_path):
+    """A reset step is bounded, so it is waited out with no bound of the updater's own: a restart
+    mid-reset kills the running tt-smi. Holds well past the bound, or no /health at all, change
+    nothing."""
+    stand_ins = _RESET_SCOPE.replace("TRACE", str(tmp_path / "trace"))
+    for name, kw in (
+        ("held_past_bound", {"health": [_health(held=True, state="recovering", age=99999)]}),
+        ("healthy", {"health": [_health()]}),
+        ("no_health", {"curl_fails": True}),
+        ("bound_off", {"health": [_health(held=True, age=5)], "env": {"TTDEV_RECOVERY_DEFER_SEC": "0"}}),
+    ):
+        sub = tmp_path / name
+        sub.mkdir()
+        done, trace, log = _gate(sub, stand_ins=stand_ins, **kw)
+        assert done.returncode == 0, (name, done.stderr)
+        assert "GATE PASSED" not in done.stdout, name
+        assert "reset scope is still running" in done.stderr, name
+        assert len(log) == 1 and "decision=deferred" in log[0] and "device reset scope running" in log[0], log
+        assert "apply_by=" in log[0], log
+        assert "restart" not in trace, name
+
+
+def test_a_running_job_on_a_healthy_broker_is_left_to_the_idle_rule(tmp_path):
+    """A job is not a recovery: the recovery gate lets the lap through, and the existing idle gate
+    (TTDEV_MAX_DEFER_SEC, drain) after it decides, as before."""
+    body = json.loads(_health())
+    body.update(running=1, queued=2, total_jobs=3)
+    done, _, log = _gate(tmp_path, health=[json.dumps(body)])
+    assert "GATE PASSED" in done.stdout, done.stderr
+    assert log == []
+    assert not (tmp_path / "root" / "recovery.defer").exists()
+    text = _SCRIPT.read_text()
+    assert (
+        text.index("if recovery_gate; then") < text.index("# Idle gate, OFF by default") < text.index("count_busy\nif")
+    )
+    assert 'MAX_DEFER="${TTDEV_MAX_DEFER_SEC:-0}"' in text
+
+
 def test_the_deferral_touches_no_recovery_switch():
     """It delays the update's restart only; it never turns off or slows a rung (msg: recovery is
     the broker's, in code, and nothing in the updater weakens it)."""

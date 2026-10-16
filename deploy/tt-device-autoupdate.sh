@@ -118,7 +118,7 @@ if [ -f "$INHIBIT" ]; then
     read -r op_pid op_name < "$INHIBIT" 2>/dev/null || true
     if [ -n "${op_pid:-}" ] && kill -0 "$op_pid" 2>/dev/null; then
         echo "autoupdate: device op in flight (${op_name:-unknown}, pid $op_pid); deferring" >&2
-        au_log deferred "device op in flight (${op_name:-unknown})"
+        au_log deferred "device op in flight (${op_name:-unknown}); apply_by=when the op ends (bounded)"
         exit 0
     fi
     rm -f "$INHIBIT" 2>/dev/null || true   # stale: the broker that held it is gone
@@ -128,7 +128,7 @@ fi
 if systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null \
         | grep -q 'ttdev-reset-'; then
     echo "autoupdate: a device reset scope is still running; deferring" >&2
-    au_log deferred "device reset scope running"
+    au_log deferred "device reset scope running; apply_by=when the reset ends (bounded)"
     exit 0
 fi
 
@@ -173,7 +173,12 @@ EOF
     [ -n "${since:-}" ] || since="$now"
     echo "$remote_sha $since" > "$RECOVERY_PENDING"
     waited=$(( now - since ))
-    recovery_why="fsm=$state held=$held hold_age=${age:--1}s waited=${waited}s bound=${RECOVERY_DEFER}s"
+    # The deadline this deferral runs to: the bound from the first deferral, or from the hold's
+    # start if that comes sooner.
+    deadline=$(( since + RECOVERY_DEFER ))
+    [ "${age:--1}" -ge 0 ] 2>/dev/null && [ $(( now - age + RECOVERY_DEFER )) -lt "$deadline" ] \
+        && deadline=$(( now - age + RECOVERY_DEFER ))
+    recovery_why="fsm=$state held=$held hold_age=${age:--1}s waited=${waited}s bound=${RECOVERY_DEFER}s apply_by=$(date -d "@$deadline" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo "$deadline")"
     [ "${age:--1}" -lt "$RECOVERY_DEFER" ] 2>/dev/null || return 1
     [ "$waited" -lt "$RECOVERY_DEFER" ] || return 1
     return 0
