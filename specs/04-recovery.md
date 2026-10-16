@@ -405,7 +405,8 @@ each rung fires only when the gentler one failed or cannot apply.
   that only a host reboot clears a process stuck in the kernel), and `reset_with_quiesce`
   checks the broker's `reset_fence` first and returns without a rung (`reset_fenced` event), so
   no caller (the gate, the ladder, a tool) can reset over one. A reset cannot free such a
-  process and only hits the chips under it. The fence lifts once the holder is gone.
+  process and only hits the chips under it. The fence lifts once the holder is gone; one stuck
+  in the kernel is bounded by I70.
 
 - **I22 — No host rung without the full reset ladder.** A reboot or power cycle fires only after
   the last-chance sweep (SBR, per-tray re-power, mesh reset) ran COMPLETE and the one verify after
@@ -413,6 +414,8 @@ each rung fires only when the gentler one failed or cannot apply.
   off-bus set (I38: the sweep would repeat that reset, which I36 forbids). A sweep that was skipped (a reset already cycling in its own scope, a tenant) or
   incomplete (the I24 gate refused it, or the I23 envelope refused the tray fire) holds the host
   rung for that pass: `_settle_and_verify_before_host_rung` returns None and every caller holds.
+  I70 is the other exception: under an unkillable leftover every reset is fenced (I21), so its host
+  rung runs with no ladder and no sweep.
 
 - **I23 — A per-tray re-power runs inside a host-safety envelope** (`pcie_guard.safe_tray_repower`).
   In order: the tray map is cross-checked against sysfs (each chip's bus against tt-smi's tray
@@ -897,6 +900,42 @@ each rung fires only when the gentler one failed or cannot apply.
   never a boot loop, never an open-ended hold. Class A or C after a cycle a later boot verified, at
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
+- **I70 — An unkillable leftover fences the device for at most 600 s; then the broker takes the
+  host rung (fault class `J-unkillable-leftover`).** The class: a reaped job's leftover (01 I16)
+  stuck in the kernel (state D, or SIGKILL pending) still holds `/dev/tenstorrent`. No reset can
+  heal it: I21 refuses every reset over it, and a reset would not free the process anyway; only a
+  host reboot or power cycle ends it. Its clock starts at the first scan that finds such a holder and
+  stops at the first scan that finds none (the episode closes, the next one starts afresh; a scan
+  error neither starts nor stops it). The budget is `LEFTOVER_UNKILLABLE_BUDGET_SEC`, 600 s, a
+  constant: the runner has already spent its kill ladder (SIGINT 60 s, SIGTERM 15 s, SIGKILL) before
+  the fence opens; a kernel wait that does finish (a driver release unpinning its buffers, a slow
+  writeback) ends in seconds to about two minutes, and the kernel reports a task blocked past 120 s
+  as hung; 600 s is five such periods and the same as the stuck-hold ceiling, while the motivating
+  incident sat about an hour without clearing. Past the budget the idle sampler asks for the rung at
+  most once per `LEFTOVER_HOST_RUNG_RETRY_SEC` (60 s); each try first re-scans, and a leftover gone
+  by then fires nothing. The rung is chosen by `_host_escalation_for_drop` with the warm reboot
+  futile whenever a chip is off the bus on a multi-chip host (a reboot does not bring an off-bus
+  Galaxy chip back), so that case takes the power cycle; with every chip present the chooser's own
+  order holds (the warm reboot, which ends every process, then the power cycle). No reset, sweep or
+  tray re-power runs first (an exception to I22). Guards kept: a host action already pending (I34)
+  asks nothing more, a reset cycling in its scope, a running broker job or a readable tenant other
+  than the leftovers themselves (they are discounted; an unreadable scan is waived as on the
+  forced climb), the operator stand-back for the power cycle, and the governor (I9/I10 rate limits,
+  the I65 cooldown). A guard holds and fires nothing; the next try asks again, so a denial ends when
+  its cause does (the cooldown at its stated end). With no host rung opted in the episode goes to an
+  operator, journaled once. Journal: `leftover_unkillable_deadline` once per episode at the budget,
+  then `leftover_host_rung` each time its stage changes (`requested` with the action, `held` with
+  why, `no_host_rung`). While an unkillable leftover stands `/health` carries `leftover_fence`:
+  `fault_class`, `since`, `budget_sec`, `deadline`, `escalation_stage` (`waiting-budget`,
+  `requested`, `held`, `no-host-rung`), `detail` and the leftovers; `null` otherwise. The rung
+  releases nothing: the boot that follows runs the startup gate, which waits for the 1G hugepage
+  pool and passes the full health check, fabric included, before the queue is released (03 I4); a
+  failed check keeps the hold and climbs the bounded ladder. The clock lives in memory: a broker
+  restart starts it again at its first scan (one more budget at most). Time to recover for this
+  class: before, unbounded (until an operator rebooted the host; about an hour in the incident);
+  after, 600 s plus at most one 60 s retry tick to the request, then the host rung (a warm reboot
+  about 3-5 min, a power cycle about 5-8 min) and the startup check (about 3 min): about 16-21 min,
+  later only by the I65 cooldown when a cycle or boot fell within its last 30 min.
 
 ## Interfaces
 

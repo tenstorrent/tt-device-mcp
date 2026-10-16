@@ -738,7 +738,9 @@ job boundary.
   it is armed. When neither the self-heal relift nor the forced escalation is on
   (`TT_DEVICE_MCP_SELFHEAL_RELIFT=0`, `TT_DEVICE_MCP_FORCE_ESCALATE=0`), or I28 holds the mesh
   reset, the RUNG INVENTORY logs a `RUNG GAP` warning at boot and `/health` carries `hold_exit_gap`
-  naming why a held present mesh has no automatic exit (`null` otherwise).
+  naming why a held present mesh has no automatic exit (`null` otherwise). An unkillable reaped
+  leftover fencing every reset shows as `leftover_fence` with its fault class, deadline and
+  escalation stage (spec 04 I70).
 - **I56 A measured fabric failure on a present mesh resets on the first idle relift, no grace.**
   When a hold stands for a frozen/unverified eth (`eth_frozen`) on a fully present mesh, the last
   fabric pass measured a failure (`last_fabric_ok is False`, not a 77 skip) and the relift's eth
