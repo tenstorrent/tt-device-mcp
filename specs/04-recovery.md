@@ -815,7 +815,13 @@ each rung fires only when the gentler one failed or cannot apply.
   ladder on the new set (I36 allows one more mesh reset on a changed set); an unchanged set after it
   goes to I38. Releases nothing: the full health check, fabric included, still decides. Bounds the
   one-chip Galaxy case whose first reset exited 1 with the chip back on the bus and whose second reset,
-  at the 600 s window, healed it: about 580 s from onset instead of about 740 s.
+  at the 600 s window, healed it: about 580 s from onset instead of about 740 s. The 60 s default is
+  kept on measured evidence: in the Galaxy logs every second reset that healed came 99 s or more after
+  the failed one, and every second reset 7-11 s after it failed; the retry also never waits past the
+  ceiling. The stated bound for B1's first-reset-fails, second-heals pattern is about 10 min from
+  onset (one-shot 120 s, a failed reset of up to 262 s, the 60 s wait, a 62 s healing reset and a 63 s
+  fabric check: about 585 s, against a floor of 378-511 s with no wait at all). A B1 drop that one
+  reset heals keeps the 6 min bound.
 
 - **I58 — A mesh reset that failed is remembered for the boot, across broker restarts.** Every mesh
   reset that launched and failed (an exit code was read: nonzero, or zero with an unhealthy verify)
@@ -1367,7 +1373,9 @@ sees a silent fabric pass.
 | I37 / goal of 03 I4: after the cycle the startup gate waits for hugepages and runs the fabric pass; a failed check keeps the hold | `tests/test_classac_power_cycle_direct.py::test_after_the_cycle_the_startup_gate_awaits_hugepages_and_the_fabric`, `::test_a_failed_startup_check_after_the_cycle_keeps_the_hold` |
 | I37 time to recover (fake clock): class A requests the cycle in the first window, class C after one failed reset | `tests/test_classac_power_cycle_direct.py::test_time_to_recover_on_a_fake_clock` |
 | I38 partial off-bus (one chip, four chips): the power cycle fires right after the one failed reset, 252 s vs 924 s and 383 s vs 1186 s from onset; a denied cycle is asked again the next window with no reset between | `tests/test_no_repeat_failed_rung.py::test_partial_offbus_power_cycles_right_after_the_failed_reset`, `::test_a_denied_power_cycle_after_the_failed_reset_is_retried_next_window` |
-| I38 with I65: a partial off-bus whose reset failed within the cooldown after a host boot skips the ceiling wait and the sweep, holds with the cooldown deadline set and no second reset, then cycles once the cooldown has run out | `tests/test_no_repeat_failed_rung.py::test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cycle_cooldown` |
+| I38 with I65: a partial off-bus whose reset failed within the cooldown after a host boot skips the ceiling wait and the sweep, holds with the cooldown deadline set and no second reset, shows that deadline on /health (`power_cycle_cooldown.next_deadline`), is asked again by the watchdog at it, then cycles once the cooldown has run out | `tests/test_no_repeat_failed_rung.py::test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cycle_cooldown` |
+| I36 / I38 for each reset class (B1 one or two chips off, B2 four, D present mesh) and host rung (power cycle, reboot, none) over six forced windows: the mesh reset runs first and once on an unchanged set, the next rung follows in that same window (or one latched operator hand-off), nothing releases the hold | `tests/test_no_repeat_failed_rung.py::test_e3_offbus_classes_reset_once_then_take_the_next_rung`, `::test_e3_present_mesh_resets_once_then_takes_the_next_rung` |
+| I36 / I39 a set that shrank then stayed unchanged gets at most two resets (the one-shot and the progress retry) over six forced windows, then climbs or hands off once | `tests/test_no_repeat_failed_rung.py::test_e3_shrunk_then_unchanged_resets_at_most_twice_then_climbs` |
 | I39 a failed reset that brought chips back arms one retry per episode; the watchdog spawns it when due, before the ceiling, and never twice | `tests/test_no_repeat_failed_rung.py::test_progress_retry_is_armed_once_per_episode_and_comes_due`, `::test_the_watchdog_spawns_the_due_progress_retry_before_the_ceiling` |
 | I39 end to end: a failed reset that shrank the set arms the retry, the watchdog spawns it, it resets the changed set once and an unchanged set after it power-cycles (I38); an unchanged first set arms none; the retry releases only after the full verify, fabric included | `tests/test_no_repeat_failed_rung.py::test_a_failed_reset_that_shrank_the_set_retries_once_on_the_new_set_then_climbs`, `::test_a_failed_reset_on_an_unchanged_set_arms_no_retry_and_climbs_at_once`, `::test_the_progress_retry_releases_only_after_the_full_fabric_verify` |
 | I58 the failed-reset record survives a broker restart but not a new boot; a new episode on the same set does not reset again; only a launched reset is recorded | `tests/test_no_repeat_failed_rung.py::test_the_failed_reset_survives_a_broker_restart_but_not_a_new_boot`, `::test_a_new_hold_episode_on_the_same_set_does_not_reset_again`, `::test_a_reset_that_never_launched_is_not_recorded` |
