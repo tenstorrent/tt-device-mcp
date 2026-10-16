@@ -2113,6 +2113,7 @@ def _reset_for_testing():
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
     global _topology_hw_fault_paged, _dispatch_reset_spent
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
+    global _holder_deferred_since
     job_queue = None
     lock = None
     _action_row = None
@@ -2133,6 +2134,7 @@ def _reset_for_testing():
     _fabric_77_recheck_since = None
     _fabric_77_rechecks = 0
     _fabric_77_recheck_monotonic = 0.0
+    _holder_deferred_since = ""
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
@@ -4278,6 +4280,65 @@ def _maybe_spawn_eth_rearm() -> None:
     _eth_rearm_task = asyncio.create_task(_attempt_eth_rearm())
 
 
+# A dirty device whose gate a holder deferred (spec 03 I58). The episode's ``since`` when the gate
+# skipped, so a later episode never inherits the deferral; "" when none is owed.
+_holder_deferred_since: str = ""
+
+
+def _defer_dirty_gate(reason: str) -> None:
+    """The gate skipped a dirty device because a tenant or a reaped job's leftover holds it: owe the
+    episode that gate the moment the holder is gone (see _attempt_deferred_dirty_gate)."""
+    global _holder_deferred_since
+    if fsm.state is ServerState.HEALTHY or not fsm.record.dirty:
+        return
+    if _holder_deferred_since != fsm.record.since:
+        health_event("gate_deferred_by_holder", reason=reason, dirty_reason=fsm.record.why)
+    _holder_deferred_since = fsm.record.since
+
+
+def _deferred_dirty_gate_armed() -> bool:
+    """A deferred gate is owed to the open dirty episode, and the box is idle: no job queued,
+    running or re-adopted, no finished job still owed its own post-job gate, no external step. A
+    queued job is left to its own pre-job path, which waits the holder out and gates first."""
+    return (
+        bool(_holder_deferred_since)
+        and fsm.state is ServerState.RECOVERING
+        and fsm.record.dirty
+        and fsm.record.since == _holder_deferred_since
+        and current_process is None
+        and not post_job_gate_pending
+        and not readopted_scopes
+        and get_external_step_free_event().is_set()
+        and not any(j.status in (JobStatus.QUEUED, JobStatus.RUNNING) for j in jobs.values())
+    )
+
+
+async def _attempt_deferred_dirty_gate() -> None:
+    """Run the post-job gate a holder deferred, on the first idle tick after the holder is gone
+    (spec 03 I58). The gate is the one the hung job was owed: the full check with fabric, the reset
+    when it fails, and the post-reset check before any release. Holding still, with no probe at
+    all, while a tenant, a running job, a reaped job's leftover or an incomplete scan is seen.
+    Never raises: a detached task."""
+    global _holder_deferred_since
+    try:
+        scan = await asyncio.to_thread(enumerate_device_holders)
+        if galaxy_recovery._tenant_active(scan) or await asyncio.to_thread(_reaped_leftover_reason, scan):
+            return
+        if not _deferred_dirty_gate_armed():
+            return
+        held = _episode_elapsed_sec(fsm.record.since)
+        if logger:
+            logger.info(
+                f"HEALTH-GATE deferred gate: the holder is gone after {held:.0f}s — running the post-job gate now"
+            )
+        health_event("deferred_gate_run", dirty_reason=fsm.record.why, held_sec=int(held))
+        _holder_deferred_since = ""  # the gate defers it again if a holder is back
+        await _verify_device_after_job(None, job_failed=True)
+    except Exception as e:  # noqa: BLE001 - a detached task must never raise unretrieved
+        if logger:
+            logger.error(f"HEALTH-GATE deferred gate aborted: {e} — the device stays dirty; the next idle tick retries")
+
+
 def _maybe_spawn_idle_relift() -> None:
     """Start one idle relift as its own task when a re-verifiable hold is up and none is in flight.
     Detached from the sampler by design (see _relift_task): awaiting a possibly-60s eth read or a
@@ -4288,6 +4349,10 @@ def _maybe_spawn_idle_relift() -> None:
     global _relift_task
     _maybe_spawn_eth_rearm()
     if _relift_task is not None and not _relift_task.done():
+        return
+    if _deferred_dirty_gate_armed():
+        if not device_op_active:
+            _relift_task = asyncio.create_task(_attempt_deferred_dirty_gate())
         return
     if _down_offbus_recheck_armed():
         if not device_op_active:
@@ -4997,11 +5062,19 @@ async def device_health_gate(
         if not fsm.record.dirty:
             _mark_device_dirty(leftover, why="foreign_holder")
         fsm.note(f"{FOREIGN_HOLDER_NOTE}{leftover}")
+        _defer_dirty_gate(leftover)
         return
     foreign = [h for h in scan.holders if is_tenant(h)]
     if foreign:
         who = ", ".join(f"{h.username}(pid {h.pid})" for h in foreign)
         _log(f"skip: device held by {who}; not touching it")
+        if fsm.state is not ServerState.HEALTHY and fsm.record.dirty:
+            # A dirty device (a hung or killed job behind it) still owes the reset and the full
+            # check; a tenant beside it only defers them. Dropping the mark here released it on
+            # enum+ARC alone, or left it to the ceiling reset (spec 03 I58).
+            _defer_dirty_gate(f"foreign holder present: {who}")
+            fsm.note(f"{FOREIGN_HOLDER_NOTE}{who} holds the device; reset and full check deferred until it releases")
+            return
         _clear_device_dirty_unverified(f"foreign holder present: {who}", fault="foreign_holder")
         # A door already held (a startup verify, a prior fault) outlives this skip: the verify
         # cannot run beside a foreign tenant, so the hold waits them out — and reads to the tenant

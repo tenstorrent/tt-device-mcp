@@ -113,7 +113,8 @@ job boundary.
 - **I13 — The gate never resets over a tenant.** A foreign holder (uid ≥ `MIN_TENANT_UID`,
   1000, or below it in a broker job/exec scope or named in `TT_DEVICE_MCP_TENANT_UIDS`; 04 I6)
   skips the gate untouched: verification is deferred, an existing hold outlives the skip
-  (`why=foreign_holder`), and `fsm.note` names the holder. The host rungs re-scan at fire time,
+  (`why=foreign_holder`), and `fsm.note` names the holder. A dirty episode keeps its mark and its
+  `why` instead: the holder defers its gate, it does not drop it (I58). The host rungs re-scan at fire time,
   and an incomplete scan counts as a tenant. The skipped probes are not waved through: the next
   job waits while a holder it can SEE stays (spec 01 I15). An incomplete scan does not hold
   dispatch.
@@ -560,7 +561,8 @@ job boundary.
   marker ends the lift.
 - **I43 — A foreign-holder hold whose holder is gone is verified at once, not reset at the ceiling.**
   A hold placed only because a tenant held the device when the gate wanted to verify
-  (`why == "foreign_holder"`) carries no measured fault. When the idle relift reaches it (the generic
+  (`why == "foreign_holder"`, never dirty) carries no measured fault. A dirty device a holder
+  blocked is not this hold: it keeps its mark and takes I58. When the idle relift reaches it (the generic
   branch, so `TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE` must be on) and a fresh holder scan shows no
   tenant, no RUNNING job, no reaped job's leftover and a complete scan, it runs the pre-job verify
   (enum+ARC, no traffic pass) under the device-op lock. It lifts on a healthy read only when no
@@ -722,6 +724,25 @@ job boundary.
   (`TT_DEVICE_MCP_SELFHEAL_RELIFT=0`, `TT_DEVICE_MCP_FORCE_ESCALATE=0`), or I28 holds the mesh
   reset, the RUNG INVENTORY logs a `RUNG GAP` warning at boot and `/health` carries `hold_exit_gap`
   naming why a held present mesh has no automatic exit (`null` otherwise).
+- **I58 — A dirty device whose gate a holder deferred is gated on the first idle tick after the
+  holder is gone.** When the gate meets a dirty device (a hung, killed or failed job behind it)
+  that a tenant or a reaped job's leftover holds, it touches nothing, keeps the dirty mark and its
+  `why`, names the holder with `fsm.note`, and owes that episode the gate: one
+  `gate_deferred_by_holder` event (`reason`, `dirty_reason`) per episode. It never drops the mark
+  on an unverified clear, which used to release the device on enum+ARC alone or leave it to the
+  ceiling reset. The owed gate belongs to the episode that owed it (keyed on its `since`); a new
+  episode never inherits it. On each idle sampler tick a detached task checks it: a fresh holder
+  scan that shows a tenant, a reaped job's leftover or an incomplete scan means no probe at all.
+  Nothing runs while a job is queued, running or re-adopted, a finished job's own post-job gate is
+  pending, an external step holds the device or a device op is active; a queued job leaves it to
+  its own pre-job path, which waits the holder out and gates first (spec 01 I15). Otherwise it
+  emits `deferred_gate_run` (`dirty_reason`, `held_sec`) and runs the post-job gate the job was
+  owed: the full check with the fabric pass, a reset when it fails, and the full post-reset check
+  (fabric included) before any release (spec 04 I32). A failed post-reset check keeps the device
+  held and goes on up the bounded ladder; it never releases. A holder back mid-gate defers it
+  again. Time to recover for a hung or killed job whose own process or a tenant outlives it (fault
+  class H): the holder's lifetime, plus one sampler tick (10 s), plus the gate (about 60-90 s with
+  its reset and post-reset check). It no longer waits on the generic escalation's grace or pacing.
 
 ## Interfaces
 
@@ -997,7 +1018,7 @@ reset (spec 04).
 ```mermaid
 flowchart TB
   G["device_health_gate<br>phase: pre-job / post-job / startup / pre-step / post-step"] --> FH{"foreign holder<br>uid ≥ 1000?"}
-  FH -->|yes| FSKIP["skip untouched — hold unverified,<br>fault=foreign_holder, fsm.note names them"]
+  FH -->|yes| FSKIP["skip untouched — hold unverified,<br>fault=foreign_holder, fsm.note names them;<br>a dirty device keeps its mark, gate deferred (I58)"]
   FH -->|no| ND{"/dev/tenstorrent empty?"}
   ND -->|"yes, baseline expects chips"| ALLOFF["all chips off bus →<br>mark dirty (heartbeat), HOLD"]
   ND -->|"yes, never had chips"| NSKIP["skip, no hold"]
@@ -1225,7 +1246,7 @@ refuses.
 | I12 | `tests/test_device_safety.py::test_the_pre_job_gate_never_runs_the_slow_fabric_pass`, `tests/test_device_safety.py::test_a_clean_job_does_not_pay_for_a_fabric_pass`, `tests/test_device_safety.py::test_a_failed_job_forces_a_fabric_pass_even_inside_the_quiet_window`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[540-False]`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[660-True]`, `tests/test_device_safety.py::test_fabric_interval_defaults_to_twenty_minutes`, `tests/test_reset.py::test_an_operator_reset_on_a_mesh_releases_only_on_a_fabric_pass` |
 | I13 | `tests/test_readopt.py::test_startup_hold_names_the_foreign_holder_blocking_the_verify`, `tests/test_device_safety.py::test_governor_never_reboots_over_a_tenant`, `tests/test_device_safety.py::test_a_tenant_arriving_before_the_reboot_decision_blocks_it`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_under_a_foreign_tenant`, `tests/test_device_safety.py::test_the_gate_skips_over_a_scoped_service_account_holder` |
 | I14 | `tests/test_device_safety.py::test_an_empty_dev_dir_on_a_host_that_expects_chips_holds_not_releases`, `tests/test_device_safety.py::test_a_device_less_host_never_reads_an_empty_sysfs_as_a_drop` |
-| I15 | `tests/test_device_safety.py::test_an_unverified_clear_holds_the_device`, `tests/test_device_safety.py::test_a_gate_that_errored_holds`, `tests/test_device_safety.py::test_a_clean_device_is_not_held_by_an_unverified_clear`, `tests/test_device_safety.py::test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace`, `tests/test_device_safety.py::test_a_verified_clear_names_itself_and_records_it_was_verified` |
+| I15 | `tests/test_device_safety.py::test_an_unverified_clear_holds_the_device`, `tests/test_device_safety.py::test_a_gate_that_errored_holds`, `tests/test_device_safety.py::test_a_clean_device_is_not_held_by_an_unverified_clear`, `tests/test_device_safety.py::test_a_gate_a_tenant_blocked_leaves_a_durable_trace`, `tests/test_device_safety.py::test_a_verified_clear_names_itself_and_records_it_was_verified` |
 | I16 | `tests/test_device_safety.py::test_a_frozen_eth_verdict_is_held_not_reset`, `tests/test_device_safety.py::test_a_frozen_eth_verdict_holds_the_door_even_when_not_pre_dirty`, `tests/test_device_safety.py::test_frozen_eth_reset_needs_both_kill_switches`, `tests/test_device_safety.py::test_eth_heartbeat_hang_reads_as_frozen_not_skipped` |
 | I16 (a reader killed on its timeout is reaped within the caller's bound) | `tests/test_eth_probe.py::test_run_probe_reaps_its_timed_out_child_before_returning`, `tests/test_eth_link_baseline.py::test_the_eth_read_reaps_its_killed_reader_within_the_outer_bound` |
 | I17 | `tests/test_device_safety.py::test_dirty_device_is_not_reset_when_the_fabric_cannot_be_checked`, `tests/test_device_safety.py::test_an_unverified_fabric_is_never_recorded_as_verified_healthy`, `tests/test_fabric_probe.py::test_fabric_classification[77-cannot check-None]`, `tests/test_fabric_check_reason.py::test_first_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_fabric_check_reason.py::test_builtin_path_skip_detail_names_the_cause`, `tests/test_fabric_check_reason.py::test_override_path_reason_names_the_cause`, `tests/test_fabric_check_reason.py::test_wrapper_77_final_line_keeps_the_validators_first_error_line`, `tests/test_startup_fabric_hugepages.py::test_override_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_startup_fabric_hugepages.py::test_a_77_run_keeps_its_stderr_tail_and_exit_code_in_an_incident_bundle` |
@@ -1316,6 +1337,7 @@ refuses.
 | I55 (under the outage hold: no reset, held, paged, honest message) | `tests/test_dispatch_failure_reset.py::test_outage_hold_holds_and_pages_without_a_reset` |
 | I55 (the verdict names the dispatch failure, never the downgraded mismatch) | `tests/test_dispatch_failure_reset.py::test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch`, `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I55 (rung gap warned at boot and on /health; floor message honest) | `tests/test_dispatch_failure_reset.py::test_rung_gap_boot_warning_and_health_field`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
+| I58 | `tests/test_deferred_dirty_gate.py::test_a_hung_job_gate_deferred_by_its_own_exiting_process_runs_once_it_is_gone`, `tests/test_deferred_dirty_gate.py::test_a_failed_check_resets_and_releases_only_after_a_passing_fabric_pass`, `tests/test_deferred_dirty_gate.py::test_a_reset_whose_fabric_pass_fails_never_releases`, `tests/test_deferred_dirty_gate.py::test_a_reaped_jobs_leftover_defers_the_same_way`, `tests/test_deferred_dirty_gate.py::test_a_queued_job_keeps_the_gate_to_its_own_pre_job_path`, `tests/test_deferred_dirty_gate.py::test_a_hold_that_was_never_dirty_keeps_the_fast_verify_shape`, `tests/test_deferred_dirty_gate.py::test_a_new_episode_never_inherits_an_old_deferral`, `tests/test_device_safety.py::test_a_gate_a_tenant_blocked_leaves_a_durable_trace`, `tests/test_device_safety.py::test_the_gate_skips_over_a_scoped_service_account_holder` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

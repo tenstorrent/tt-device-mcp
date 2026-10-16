@@ -3005,19 +3005,21 @@ async def test_the_gate_skips_over_a_scoped_service_account_holder(monkeypatch, 
     srv._mark_device_dirty("job 511 ended killed (exit -9)")
     await srv._device_health_gate(None, phase="post-job", run_fabric=False)
 
-    assert srv.fsm.record.why == "foreign_holder", srv.fsm.record
+    # A dirty device keeps its mark and its why under the holder: the gate is deferred (03 I58).
+    assert srv.fsm.record.dirty and srv.fsm.record.why == "job_killed", srv.fsm.record
     assert "pid 4242" in srv.fsm.record.detail, srv.fsm.record
 
 
 @pytest.mark.asyncio
-async def test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace(monkeypatch, tmp_path):
-    """The gate meets a device a foreign tenant is using: it will not touch it, and it
-    drops the dirty flag. That is a real "the last job left this unverified" state going
-    away with nobody having looked at the silicon — so it must leave a mark on the health
-    timeline. A recovery clears the flag too, but the reset/verify it ran is the record;
-    this path has no such record, so the clear itself is the only thing worth journalling.
-    Without it, the device reads clean at 14:05 after reading dirty at 14:00 with no reset
-    between — a hole no postmortem can close."""
+async def test_a_gate_a_tenant_blocked_leaves_a_durable_trace(monkeypatch, tmp_path):
+    """The gate meets a device a foreign tenant is using: it will not touch it. Whatever it does
+    with the episode instead must leave a mark on the health timeline, or the device reads one way
+    at 14:00 and another at 14:05 with nothing between — a hole no postmortem can close.
+
+    A dirty device keeps its mark and its why: the gate is deferred, not dropped (spec 03 I58), and
+    the deferral is the record (``gate_deferred_by_holder``), never an unverified clear. A hold that
+    was never dirty still takes the I43 shape: reworded to ``foreign_holder``, its clear journalled
+    as unverified."""
     from tt_device_mcp.device_holders import DeviceHolder
 
     (tmp_path / "0").write_text("")
@@ -3025,6 +3027,7 @@ async def test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace(monke
     monkeypatch.setattr(
         srv, "enumerate_device_holders", lambda: HolderScan(holders=[DeviceHolder(pid=4242, uid=1000)], complete=True)
     )
+    monkeypatch.setattr(srv, "_holder_deferred_since", "", raising=False)
     srv.device_op_lock = None
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
 
@@ -3034,14 +3037,25 @@ async def test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace(monke
     srv._mark_device_dirty("job 511 ended killed (exit -9)")
     await srv._device_health_gate(None, phase="post-job", run_fabric=False)
 
+    assert srv.fsm.record.dirty and srv.fsm.record.why == "job_killed", "a tenant only defers a dirty gate"
+    assert not [k for k, _ in events if k == "device_dirty_cleared"], "nothing was cleared, so nothing says so"
+    deferred = [f for k, f in events if k == "gate_deferred_by_holder"]
+    assert len(deferred) == 1, "the deferral is the durable trace"
+    assert "pid 4242" in deferred[0]["reason"] and deferred[0]["dirty_reason"] == "job_killed"
+
+    events.clear()
+    fsm_dirty(srv, "startup verify pending", why="foreign_holder", dirty=False)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+
     assert (
         srv.fsm.record.why == "foreign_holder"
-    ), "the gate did not reword the hold once a foreign tenant blocked the verify"
+    ), "the gate did not reword an undirtied hold once a foreign tenant blocked the verify"
     cleared = [f for k, f in events if k == "device_dirty_cleared"]
-    assert cleared, "the dirty flag was dropped with no durable trace on the health timeline"
-    assert cleared[0]["prior_reason"] == "job 511 ended killed (exit -9)"
+    assert cleared, "the prior episode was moved off with no durable trace on the health timeline"
+    assert cleared[0]["prior_reason"] == "startup verify pending"
     assert "foreign holder" in cleared[0]["why"]
     assert cleared[0]["verified"] is False, "no silicon was checked; the clear must say so"
+    assert not [k for k, _ in events if k == "gate_deferred_by_holder"], "no gate is owed to an undirtied hold"
 
 
 @pytest.mark.asyncio
