@@ -333,6 +333,9 @@ class HealthMonitor:
         # A skip (None) never overwrites it: not knowing is not the same as knowing it is fit.
         self.last_fabric_ok: Optional[bool] = None
         self.last_fabric_output: str = ""
+        # When the run that produced last_fabric_output started (local naive datetime), None until
+        # one runs. An incident bundle keeps that output only when this pass produced it (spec 03 I57).
+        self.last_fabric_output_at: Optional[datetime] = None
         # (reason, monotonic, bundle path) of the last no-verdict fabric run kept in an incident bundle.
         self._fabric_skip_incident: Optional[tuple[str, float, str]] = None
         # A topology mismatch (the discovered links are not the descriptor's) passed on a
@@ -1065,6 +1068,7 @@ class HealthMonitor:
         # Keep the whole thing: the validator names the failing links, and the 400-char detail
         # the journal carries truncates exactly the part naming them.
         self.last_fabric_output = text
+        self.last_fabric_output_at = _t0
         last = text.splitlines()[-1][:200] if text else "(no output)"
         if override:
             # An operator's own wrapper has already done its own interpretation and reports it
@@ -1083,6 +1087,7 @@ class HealthMonitor:
                     desc, text, timeout_sec=timeout_sec, track=_track, cwd=cwd
                 )
                 self.last_fabric_output = text
+                self.last_fabric_output_at = _t0
         # Derived from ok, not rc: on the built-in path a measured-bad verdict can exit 77 (the
         # collision guard classify() applies), and a did-not-measure run can exit some other
         # code entirely — status must agree with the verdict actually being returned below, not
@@ -1101,18 +1106,12 @@ class HealthMonitor:
 
         self.last_fabric_skipped = ok is None
         if ok is True:
-            self.last_fabric_ok = True
-            FABRIC_DEBT.note_fabric(True)  # the one verdict that settles a post-reset debt (04 I32)
-            if self.fabric_known_fault:
-                health_event("fabric_known_fault_cleared", detail=self.fabric_known_fault)
-            self.fabric_known_fault, self._fabric_route_fault_streak = "", 0
             marker = fabric.find_topology_marker(text)
             if marker:
+                self._note_fabric_ok()
                 self._on_topology_mismatch(marker)
                 return True, f"fabric links healthy on discovered links ({dt:.0f}s); {marker}"
-            self.topology_lift_pending = False
-            _save_asic_bus_map()
-            self._restore_eth_high_water()
+            self.adopt_fabric_pass(text)
             return True, f"fabric links healthy ({dt:.0f}s)"
         if cable:
             # A missing cable is a hardware verdict, not a skip (I47): held as a known fabric fault,
@@ -1215,6 +1214,30 @@ class HealthMonitor:
         if ok is None:
             reason = no_verdict(f"traffic-only rerun: {reason}")
         return rc, combined, ok, reason
+
+    def _note_fabric_ok(self) -> None:
+        """What every healthy fabric verdict settles: the post-reset debt (04 I32) and a known fabric
+        fault (I46)."""
+        self.last_fabric_ok = True
+        FABRIC_DEBT.note_fabric(True)  # the one verdict that settles a post-reset debt (04 I32)
+        if self.fabric_known_fault:
+            health_event("fabric_known_fault_cleared", detail=self.fabric_known_fault)
+        self.fabric_known_fault, self._fabric_route_fault_streak = "", 0
+
+    def adopt_fabric_pass(self, output: str) -> str:
+        """Fold in a healthy fabric pass on the full topology, as a clean pass of the monitor's own
+        does, also one run outside the monitor (an operator verification job, spec 01 I21). A pass
+        whose output carries a topology marker ran on the discovered links only: it is adopted for
+        nothing and its marker returned, so the caller leaves the lift to the monitor's own pass
+        (I45). Returns "" once adopted."""
+        marker = fabric.find_topology_marker(output)
+        if marker:
+            return marker
+        self._note_fabric_ok()
+        self.topology_lift_pending = False
+        _save_asic_bus_map()
+        self._restore_eth_high_water()
+        return ""
 
     def _on_topology_mismatch(self, marker: str) -> None:
         """An OK verdict that carries a topology mismatch: journal it, name the trays that moved

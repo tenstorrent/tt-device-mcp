@@ -29,6 +29,7 @@ import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -85,7 +86,7 @@ from tt_device_mcp.device_holders import (
     read_proc_cpu,
     reclaim_foreign_holders,
 )
-from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec
+from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec, add_close_listener
 from tt_device_mcp.health import (
     _HOST_ESCALATION_ACTION,
     BLOCKED,
@@ -749,6 +750,11 @@ class Job:
     finished_at: Optional[str] = None
     log_file: Optional[str] = None
     idle_total_sec: Optional[float] = None  # DEVICE IDLE time over the run (spec 03 I54)
+    # "fabric" / "eth" for an operator verification job (see operator_verification_kind), else "".
+    # Derived from command + peer_uid on submit and on restore, never read from a spec file.
+    verification: str = ""
+    # The reset clock when a verification job started; its pass lifts nothing if a reset ran since.
+    reset_clock_at_start: Optional[float] = None
 
     @property
     def runtime_sec(self) -> Optional[float]:
@@ -771,7 +777,7 @@ class Job:
 
 # Server state (shared across all connections)
 jobs: dict[str, Job] = {}
-job_queue: asyncio.Queue[str] | None = None  # Lazy init - created at runtime
+job_queue: "JobQueue | None" = None  # Lazy init - created at runtime
 job_counter: int = 0  # Monotonic counter for job IDs; wraps at JOB_ID_MODULUS
 current_process: asyncio.subprocess.Process | None = None
 current_job_id: str | None = None  # job_id of current_process, so a kill can scope-route it
@@ -1457,7 +1463,7 @@ def _ensure_async_primitives():
     """Ensure async primitives are initialized (must be called with running event loop)."""
     global job_queue, lock
     if job_queue is None:
-        job_queue = asyncio.Queue()
+        job_queue = JobQueue()
     if lock is None:
         lock = asyncio.Lock()
 
@@ -2100,12 +2106,124 @@ def _set_device_op_detail(detail: str) -> None:
     device_op_stage_started_at = datetime.now().isoformat()
 
 
-def get_job_queue() -> asyncio.Queue[str]:
+class JobQueue(asyncio.Queue):
+    """The job queue: FIFO, except that an operator verification job goes to the head, ahead of
+    every tenant job and FIFO among its own kind (spec 01 I21).
+
+    A held queue is where that matters: a fabric_unverified hold can only be lifted by a fabric
+    pass, and the operator's own run of that pass sat behind the tenant jobs the hold was holding.
+    """
+
+    def _init(self, maxsize):
+        super()._init(maxsize)
+        self._head: set = set()  # queued verification job ids
+        self._back: set = set()  # a held tenant job handed back, pending its _put
+
+    def put_head_nowait(self, item) -> None:
+        """Queue a verification job behind the verification jobs already at the head."""
+        self._head.add(item)
+        self.put_nowait(item)
+
+    def put_back_nowait(self, item) -> None:
+        """Hand a dequeued tenant job back: first among the tenant jobs, behind the head."""
+        self._back.add(item)
+        self.put_nowait(item)
+
+    def _put(self, item):
+        n = 0
+        while n < len(self._queue) and self._queue[n] in self._head:
+            n += 1
+        if item in self._head or item in self._back:
+            self._back.discard(item)
+            self._queue.insert(n, item)
+        else:
+            self._queue.append(item)
+
+    def _get(self):
+        item = self._queue.popleft()
+        self._head.discard(item)
+        return item
+
+    def verification_waiting(self) -> bool:
+        """A verification job is queued (it sits at the head)."""
+        return bool(self._queue) and self._queue[0] in self._head
+
+
+def get_job_queue() -> "JobQueue":
     """Get the job queue, lazily initializing if needed."""
     global job_queue
     if job_queue is None:
-        job_queue = asyncio.Queue()
+        job_queue = JobQueue()
     return job_queue
+
+
+async def _enqueue_job(job: "Job") -> None:
+    """Put a job on the queue: a verification job at the head, every other job at the tail."""
+    queue = get_job_queue()
+    if job.verification and isinstance(queue, JobQueue):
+        queue.put_head_nowait(job.id)
+    else:
+        await queue.put(job.id)
+
+
+OPERATOR_UIDS_ENV = "TT_DEVICE_MCP_OPERATOR_UIDS"
+# The broker-shipped checks an operator verification job may run, by installed name (see
+# deploy/install-tt-device-broker.sh), and the kind each one verifies.
+VERIFICATION_CHECKS = {"fabric-check.sh": "fabric", "eth-heartbeat-probe.py": "eth"}
+# Anything that lets a shell run more than the one check. The class skips the queue and passes a
+# fabric_unverified hold, so it has to be exactly the check and its arguments.
+_VERIFICATION_SHELL_CHARS = frozenset(";&|`$<>(){}[]*?~!#\\\n\r")
+
+
+def _operator_uids() -> set:
+    """root, plus the uids in TT_DEVICE_MCP_OPERATOR_UIDS (comma- or space-separated)."""
+    uids = {0}
+    for tok in os.environ.get(OPERATOR_UIDS_ENV, "").replace(",", " ").split():
+        if tok.isdigit():
+            uids.add(int(tok))
+    return uids
+
+
+def _broker_root() -> str:
+    return os.path.normpath(os.environ.get("TTDEV_ROOT", "").strip() or "/opt/tt-device-broker")
+
+
+def _verification_argv(command: str) -> Optional[list]:
+    """The command's argv from the check on, when it runs a broker-shipped check under the broker
+    root, directly or through an interpreter installed there (the eth probe is a python script);
+    else None."""
+    if not command or any(c in _VERIFICATION_SHELL_CHARS for c in command):
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    root = _broker_root()
+
+    def _is_check(arg: str) -> bool:
+        return (
+            os.path.isabs(arg)
+            and os.path.dirname(os.path.normpath(arg)) == root
+            and os.path.basename(arg) in VERIFICATION_CHECKS
+        )
+
+    if argv and _is_check(argv[0]):
+        return argv
+    if len(argv) >= 2 and os.path.isabs(argv[0]) and os.path.normpath(argv[0]).startswith(root + "/"):
+        if _is_check(argv[1]):
+            return argv[1:]
+    return None
+
+
+def operator_verification_kind(command: str, peer_uid: Optional[int]) -> str:
+    """ "fabric" or "eth" when this job is an operator verification job: submitted by root or an
+    operator uid (TT_DEVICE_MCP_OPERATOR_UIDS), and running one broker-shipped check under the
+    broker root (TTDEV_ROOT, default /opt/tt-device-broker) and nothing else. '' otherwise — every
+    tenant job, and any job without a socket identity (spec 01 I21)."""
+    if peer_uid is None or peer_uid not in _operator_uids():
+        return ""
+    argv = _verification_argv(command)
+    return VERIFICATION_CHECKS[os.path.basename(argv[0])] if argv else ""
 
 
 def _reset_for_testing():
@@ -2978,6 +3096,7 @@ def _clear_device_reported_fault(why: str) -> None:
     global device_fault_reported
     if device_fault_reported:
         health_event("device_fault_cleared", why=why, prior=device_fault_reported)
+        _wake_held_jobs()
     device_fault_reported = ""
 
 
@@ -3103,12 +3222,17 @@ def _reopen_boot_carried_fabric_hold() -> bool:
     escalation holds a fabric-only hold without a reset, so it paged once and held forever. When the
     startup pass found every chip present and named no fault, reopen it RECOVERING on a fresh clock
     and owe it one startup pass (whatever TT_DEVICE_MCP_FABRIC_RELIFT says, as I39), so the relift,
-    the I48 backoff and the I40 bound verify it or fall back. Anything else keeps the hold as is."""
+    the I48 backoff and the I40 bound verify it or fall back. A runtime-named fault, an isolated chip
+    or a pass that measured the fabric bad keeps the hold as is.
+
+    The record is read after the gate's own hold, which set ``why`` to fabric_unverified and cleared
+    ``dirty``: whatever cause or dirty mark the carried DOWN had, a clean startup 77 reopens it, as it
+    would open a fresh 77 hold on a fresh record. The ``why`` check only refuses a caller that did not
+    place that hold first."""
     global device_hold_escalated_monotonic, _startup_fabric_owed_since
     record = fsm.record
     if (
         record.why != FABRIC_RELIFT_WHY
-        or record.dirty
         or device_fault_reported
         or isolated_chips
         or health_monitor.last_fabric_ok is False
@@ -3519,6 +3643,23 @@ def _fabric_77_eth_drop() -> str:
     if "hugepages not yet allocated" in str(fsm.record.detail or ""):  # the startup pass's hugepages hold
         return ""
     return drop
+
+
+def _fabric_hold_only(own_op: str = "") -> bool:
+    """Whether the open hold is a fabric_unverified hold and nothing else (spec 01 I21).
+
+    No broker device op is running (bar ``own_op``, the caller's own), the hold's why is the missing fabric verdict, nothing is dirty,
+    the runtime named no fault, and no chip is off the bus right now. That is the one hold an
+    operator verification job may pass, and the one its fabric pass may lift: every other hold
+    names a fault that a check run on the device cannot clear."""
+    return (
+        device_op_active in ("", own_op)
+        and fsm.state in (ServerState.RECOVERING, ServerState.DOWN)
+        and fsm.record.why == FABRIC_RELIFT_WHY
+        and not fsm.record.dirty
+        and not device_fault_reported
+        and not _device_liveness_reason()
+    )
 
 
 # The episode (its ``since``) of a 77-only hold that owes the startup fabric pass it never got: the
@@ -5096,6 +5237,9 @@ async def device_health_gate(
     an armed eth rung and an OK pass at most that old with no reset since, the forced pass becomes
     the same eth read; every cheap read must come back clean or the pass runs (spec 03 I38)."""
     global _dispatch_reset_spent
+    # Fabric output from before this pass is another pass's transcript: an incident bundle names
+    # it stale instead of presenting it as this pass's (spec 03 I57).
+    pass_started = datetime.now()
 
     def _log(msg: str) -> None:
         if logger:
@@ -5363,6 +5507,8 @@ async def device_health_gate(
                 reset_output=recovery_mechanism.last_reset_output,
                 fabric_output=health_monitor.last_fabric_output,
                 evidence=evidence,
+                fabric_output_at=getattr(health_monitor, "last_fabric_output_at", None),
+                fabric_since=pass_started,
             )
             if bundle:
                 _log(f"incident evidence saved: {bundle}")
@@ -6239,6 +6385,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     elif not reason and device_hold_logged:
         device_hold_logged = False
         health_event("device_released")
+        _wake_held_jobs()  # any other job parked behind this hold re-runs its own gate now
         # The hold's own row, written now that it has an end and a duration. While it was
         # held the jobs list showed it live, and that row is synthetic — it exists only for
         # as long as the hold does, so the moment the device came back the window it sat
@@ -7167,6 +7314,35 @@ def _hold_poll_sec_from_env(raw: Optional[str]) -> float:
 
 TENANT_HOLD_POLL_SEC = _hold_poll_sec_from_env(os.environ.get("TT_DEVICE_MCP_TENANT_HOLD_POLL_SEC"))
 
+# The poll above is only the governor. A held job is woken the moment a path lifts the device (any
+# close to HEALTHY, a tenant release, a retired runtime fault), so the queue resumes within about a
+# second of the release instead of up to a poll later. A wake only re-runs the gate: it never
+# dispatches by itself, so a release must still pass the full check, fabric included (spec 03 I65).
+# One event per parked job, each bound to the loop it waits on (a release can land off-loop).
+_hold_waiters: "set[tuple[asyncio.AbstractEventLoop, asyncio.Event]]" = set()
+# Floor between two gate passes of one hold, so a burst of wakes cannot spin the gate.
+TENANT_HOLD_WAKE_MIN_GAP_SEC = 1.0
+
+
+def _wake_held_jobs() -> None:
+    """Wake every job parked in the tenant hold so it re-runs its gate now. Cheap, never raises,
+    safe from any thread."""
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    for loop, event in list(_hold_waiters):
+        try:
+            if loop is running:
+                event.set()
+            elif not loop.is_closed():
+                loop.call_soon_threadsafe(event.set)
+        except Exception:  # noqa: BLE001 - a missed wake falls back to the poll
+            pass
+
+
+add_close_listener(_wake_held_jobs)
+
 
 def _tenant_hold_max_sec() -> float:
     """TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC: how long a degraded device may hold a tenant job at the
@@ -7272,9 +7448,31 @@ async def _hold_job_until_device_fit(job: "Job", job_log_file: Optional[Path], r
         except OSError as e:
             if logger:
                 logger.error(f"could not write hold note for job {job.id}: {e}")
+    wake = asyncio.Event()
+    waiter = (asyncio.get_running_loop(), wake)
+    _hold_waiters.add(waiter)
+    try:
+        return await _hold_loop(job, job_log_file, reason, bound, clock_start, wake)
+    finally:
+        _hold_waiters.discard(waiter)
+
+
+async def _hold_loop(
+    job: "Job", job_log_file: Optional[Path], reason: str, bound: float, clock_start: datetime, wake: asyncio.Event
+) -> str:
+    """The body of _hold_job_until_device_fit: re-run the gate on each wake or poll until fit."""
+    last_gate = time.monotonic()
     while reason:
         if job.status == JobStatus.KILLED:
             return reason  # released by a cancel, not by recovery — the device stays held
+        if _fabric_hold_only():
+            if job.verification:
+                # The hold narrowed to fabric-only while this verification job waited (spec 01 I21).
+                _pass_hold_for_verification(job, job_log_file, reason)
+                return ""
+            if get_job_queue().verification_waiting():
+                # The verification job behind this one is what can lift the hold (spec 01 I21).
+                return HOLD_YIELDED_TO_VERIFICATION
         _note_tenant_gate_verdict(reason)  # durable device_held (latched, idempotent)
         held = (datetime.now() - clock_start).total_seconds()
         if held >= bound:
@@ -7288,7 +7486,16 @@ async def _hold_job_until_device_fit(job: "Job", job_log_file: Optional[Path], r
                 f"held {int(held)}s, past the {int(bound)}s hold bound (TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC); "
                 f"{escalation} — {reason}"
             )
-        await asyncio.sleep(min(TENANT_HOLD_POLL_SEC, max(0.0, bound - held)))
+        # Sleep until a release wakes the hold, or the poll (the governor) or the bound comes due.
+        try:
+            await asyncio.wait_for(wake.wait(), timeout=min(TENANT_HOLD_POLL_SEC, max(0.0, bound - held)))
+            gap = TENANT_HOLD_WAKE_MIN_GAP_SEC - (time.monotonic() - last_gate)
+            if gap > 0:
+                await asyncio.sleep(gap)
+        except asyncio.TimeoutError:
+            pass
+        wake.clear()  # before the gate: a release landing during it wakes the next wait at once
+        last_gate = time.monotonic()
         await cleanup_finished_jobs()  # keep sweeping through a long hold
         # Re-run the gate, not just the passive predicate: it resets+verifies a dirty device,
         # so a recovered one lifts here instead of freezing on a flag the parked runner can
@@ -8616,6 +8823,122 @@ async def job_runner():
                 post_job_gate_pending = False
 
 
+# What _hold_job_until_device_fit returns when it hands a held tenant job back so a queued operator
+# verification job can run first (spec 01 I21). Never a reason: the runner re-queues the job.
+HOLD_YIELDED_TO_VERIFICATION = "\x00yielded to an operator verification job"
+
+
+def _pass_hold_for_verification(job: "Job", job_log_file: Optional[Path], reason: str) -> None:
+    """Record that an operator verification job runs through a fabric-only hold (spec 01 I21). The
+    hold stays open: only the job's own passing fabric check lifts it (_settle_verification_job)."""
+    if logger:
+        logger.warning(
+            f"CLEAN-GATE job {job.id} is an operator verification job ({job.verification}): "
+            f"dispatching it through the fabric_unverified hold — {reason}"
+        )
+    if job_log_file:
+        try:
+            with open(job_log_file, "a") as f:
+                f.write(
+                    f"[VERIFICATION] the device is held fabric_unverified ({reason}); this operator "
+                    f"{job.verification} check runs through the hold, which stays open until a "
+                    f"fabric check passes.\n"
+                )
+        except OSError:
+            pass
+    health_event("verification_passes_hold", job_id=job.id, check=job.verification, reason=reason)
+
+
+def _job_ttdev_env(job: "Job") -> dict:
+    """The TTDEV_* variables the job ran with: the activation script exports env_vars over the
+    broker's environment, or over none at all when privsep runs the job as a non-root submitter."""
+    base = {} if (should_privsep() and job.peer_uid not in (None, 0)) else dict(os.environ)
+    base.update(job.env_vars or {})
+    return {k: v for k, v in base.items() if k.startswith("TTDEV_")}
+
+
+VERIFICATION_LIFT_OP = "verification-lift"
+
+
+async def _settle_verification_job(job: "Job") -> bool:
+    """Lift a fabric_unverified hold on an operator fabric check that passed (spec 01 I21).
+
+    Only the broker-shipped fabric check, run with no arguments and the broker's own TTDEV_*
+    environment, completed with exit 0, while the hold is still fabric-only: that is the same
+    pass the idle relift would run, so its verdict is the broker's. An eth probe never lifts
+    (it proves the eth cores, not the fabric). The pass is the fabric half of the full check; the
+    broker then runs the enum+ARC half itself and lifts only on a healthy read with no reset since
+    the check started, so the full check, fabric included, has passed after the last reset (spec
+    03 I4). Returns True when it lifted the hold."""
+    if job.verification != "fabric":
+        return False
+    if job.status != JobStatus.COMPLETED or job.exit_code != 0:
+        return False
+    argv = _verification_argv(job.command)
+    if not argv or len(argv) != 1 or VERIFICATION_CHECKS.get(os.path.basename(argv[0])) != "fabric":
+        return False
+    if not _fabric_hold_only():
+        return False
+    broker_env = {k: v for k, v in os.environ.items() if k.startswith("TTDEV_")}
+    job_env = _job_ttdev_env(job)
+    if job_env != broker_env:
+        differs = sorted(k for k in set(job_env) | set(broker_env) if job_env.get(k) != broker_env.get(k))
+        if logger:
+            logger.warning(
+                f"CLEAN-GATE verification job {job.id} passed, but its TTDEV_* environment differs "
+                f"from the broker's ({', '.join(differs)}): the hold stays"
+            )
+        health_event("verification_not_lifted", job_id=job.id, reason="env mismatch", keys=differs)
+        return False
+
+    def _log(msg: str) -> None:
+        if logger:
+            logger.info(f"CLEAN-GATE verification job {job.id}: {msg}")
+
+    def _not_lifted(reason: str) -> bool:
+        if logger:
+            logger.warning(
+                f"CLEAN-GATE verification job {job.id} passed the fabric check, but {reason}: the hold stays"
+            )
+        health_event("verification_not_lifted", job_id=job.id, reason=reason)
+        return False
+
+    def _reset_since_start() -> bool:
+        return job.reset_clock_at_start is None or recovery_mechanism.last_reset_monotonic != job.reset_clock_at_start
+
+    if _reset_since_start():
+        return _not_lifted("a reset ran since the check started")
+    indices = _present_chip_indices()
+    if not indices:
+        return _not_lifted("no chip is present")
+    expected = health_monitor.expected(len(indices))
+    async with _device_op(VERIFICATION_LIFT_OP):
+        healthy, evidence = await fsm.observe(
+            expected, _log, run_fabric=False, phase="post-job", recovery=select_recovery()
+        )
+        # Re-checked after the read: the sampler's dead-chip path is lock-free and a fault can land
+        # during the await.
+        if not healthy:
+            return _not_lifted("the enum+ARC read is not healthy")
+        if _reset_since_start():
+            return _not_lifted("a reset ran since the check started")
+        if not _fabric_hold_only(own_op=VERIFICATION_LIFT_OP):
+            return _not_lifted("the hold is no longer fabric-only")
+        # No reset since the pass started, so it settles the post-reset fabric debt a broker start or
+        # a reset left (04 I32) as the monitor's own pass would; without that the release is refused.
+        if health_monitor is not None:
+            marker = health_monitor.adopt_fabric_pass(f"{job.output}\n{job.error}")
+            if marker:
+                return _not_lifted(f"the pass ran on the discovered links only ({marker})")
+        if not _clear_device_dirty(verified=True, why=f"operator verification job {job.id} passed"):
+            return _not_lifted("the release was refused")
+    if logger:
+        logger.info(f"CLEAN-GATE operator verification job {job.id} passed the fabric check and enum+ARC: hold lifted")
+    health_event("verification_lifted_hold", job_id=job.id)
+    health_event("device_relift", evidence=evidence)
+    return True
+
+
 async def _job_runner_loop():
     global current_process, current_job_id, last_job_end_monotonic, post_job_gate_pending, runner_job_id
 
@@ -8739,11 +9062,17 @@ async def _job_runner_loop():
             get_job_queue().task_done()
             continue
 
-        # One durable timeline entry when this device opens or lifts a tenant-refused hold,
-        # keyed off the same verdict the dispatch decision uses so the two can never
-        # disagree. Latched inside, so the outage that refuses a queue's worth of jobs is
-        # one held event and its recovery is one released event.
-        _note_tenant_gate_verdict(blocked_reason)
+        # An operator verification job passes a fabric_unverified hold and no other (spec 01 I21):
+        # the hold stays latched, since the device is not proven fit until the check passes.
+        if job.verification and blocked_reason and _fabric_hold_only():
+            _pass_hold_for_verification(job, job_log_file, blocked_reason)
+            blocked_reason = ""
+        else:
+            # One durable timeline entry when this device opens or lifts a tenant-refused hold,
+            # keyed off the same verdict the dispatch decision uses so the two can never
+            # disagree. Latched inside, so the outage that refuses a queue's worth of jobs is
+            # one held event and its recovery is one released event.
+            _note_tenant_gate_verdict(blocked_reason)
 
         # Env-gated (default ON, TT_DEVICE_MCP_TENANT_HOLD): HOLD a degraded device rather than
         # failing the arriving job. A degraded device holds the queue and this job dispatches the
@@ -8759,6 +9088,14 @@ async def _job_runner_loop():
                 # Cancelled while held: already terminal — just sweep it and take the next job.
                 await cleanup_finished_jobs()
                 get_job_queue().task_done()
+                continue
+            if blocked_reason == HOLD_YIELDED_TO_VERIFICATION:
+                # Still held, still QUEUED: back to the front of the tenant jobs, behind the
+                # verification job. The hold clock is per episode, so this job's bound carries over.
+                if logger:
+                    logger.info(f"JOB_RUNNER job_id={job_id} held: yielding to a queued operator verification job")
+                get_job_queue().task_done()
+                get_job_queue().put_back_nowait(job_id)
                 continue
 
         # The gate is BLOCKING, not advisory: a device the gate could not make fit for a
@@ -8824,6 +9161,8 @@ async def _job_runner_loop():
         async with get_lock():
             job.status = JobStatus.RUNNING
             job.started_at = datetime.now().isoformat()
+            if job.verification:
+                job.reset_clock_at_start = recovery_mechanism.last_reset_monotonic
             _update_queue_depth_metric()
             # Track device became busy
             if stats:
@@ -9421,6 +9760,12 @@ export {JOB_TAG_ENV}={job_tag}
                 # gates every later arrival: the runner is single-threaded, so a job
                 # that queues during the check waits for it — and any reset it
                 # triggers — before it starts.
+                if job.verification:
+                    try:
+                        await _settle_verification_job(job)
+                    except Exception as e:  # noqa: BLE001 - never crash the runner
+                        if logger:
+                            logger.error(f"JOB_RUNNER verification settle error for job_id={job_id}: {e}")
                 try:
                     # Any non-success exit means we do not know what the job did to the
                     # mesh, so the fabric is proved before the next tenant sees it — the
@@ -9597,14 +9942,26 @@ def _job_log_records_finish(log_file: Optional[str]) -> bool:
     return bool(_parse_job_log_footer(_tail_lines(log_file, FOOTER_TAIL_LINES)))
 
 
+def _restore_order_key(job: "Job") -> tuple:
+    """Restore order: queue time, then the id as a number. A queue time that will not parse sorts
+    after the ones that do, by id."""
+    try:
+        at = datetime.fromisoformat(job.queued_at).timestamp()
+    except (TypeError, ValueError, OverflowError, OSError):
+        at = None
+    num = int(job.id) if str(job.id).isdigit() else math.inf
+    return (at is None, at or 0.0, num, str(job.id))
+
+
 async def _restore_queued_jobs() -> None:
     """Put jobs that were still waiting when the last broker died back on the queue.
 
     Only specs we can actually read are restored: a spec that will not parse is moved aside,
     never guessed at and never silently dropped. A spec whose job log already carries the
     FINISHED footer is moved aside too (``.finished``): the job is over, and a spec that outlived
-    it must not run it again. Ordered by queue time so a restart preserves the order tenants
-    queued in.
+    it must not run it again. Ordered by queue time, then numeric job id, so a restart preserves
+    the order tenants queued in across the 999 -> 000 id wrap; an operator verification job goes
+    back to the head (spec 01 I6, I21).
     """
     if not job_log_dir:
         return
@@ -9612,7 +9969,8 @@ async def _restore_queued_jobs() -> None:
     if not d.is_dir():
         return
     restored, broken, dropped, finished = 0, 0, 0, 0
-    for p in sorted(d.glob("*.json")):
+    readable: list[tuple[Path, "Job"]] = []
+    for p in d.glob("*.json"):
         try:
             spec = json.loads(p.read_text())
             job = Job(
@@ -9637,6 +9995,11 @@ async def _restore_queued_jobs() -> None:
             except OSError:
                 pass
             continue
+        readable.append((p, job))
+    # Queue time, then job id as a number: the filename order sorted 000 (the id after 999 wraps)
+    # ahead of 998 and 999, so the newest job ran first. Verification jobs go to the head anyway.
+    readable.sort(key=lambda pj: _restore_order_key(pj[1]))
+    for p, job in readable:
         if job.id in jobs:
             continue  # already known (a re-adopted run) — the scope owns it, not the spec
         if _job_log_records_finish(job.log_file):
@@ -9660,8 +10023,9 @@ async def _restore_queued_jobs() -> None:
                 logger.warning(f"QUEUE-RESTORE dropping job_id={job.id} (killed by device recovery): {fault_reason}")
             health_event("queue_restore_skipped_device_fault", job_id=job.id, reason=fault_reason)
             continue
+        job.verification = operator_verification_kind(job.command, job.peer_uid)
         jobs[job.id] = job
-        await get_job_queue().put(job.id)
+        await _enqueue_job(job)
         _update_queue_depth_metric()
         restored += 1
     if (restored or broken or dropped or finished) and logger:
@@ -10910,9 +11274,12 @@ def create_mcp_server() -> MCPServer:
             preemptable=bool(preemptable),
             log_file=job_log_file,
         )
+        job.verification = operator_verification_kind(command, job.peer_uid)
+        if job.verification and logger:
+            logger.info(f"  -> operator verification job ({job.verification}): queued at the head")
         jobs[job_id] = job
         _persist_queued_job(job)
-        await get_job_queue().put(job_id)
+        await _enqueue_job(job)
         _update_queue_depth_metric()
 
         # Ensure job runner is started (may be first job via REST API before MCP session)
