@@ -884,7 +884,7 @@ def _present_rung_chain(monkeypatch, post_reset):
     return resets, checks
 
 
-# --- a 77 from a validator crash gets one reset per episode (I56) -------------------------------
+# --- a 77 from a validator crash gets one reset per episode (I62) -------------------------------
 #
 # A Galaxy host, 2026-10-14: after a rescan brought chips back, every post-job fabric pass exited
 # 77 with "what():  unordered_map::at". The relift re-ran it for the I40 bound and the hold ended

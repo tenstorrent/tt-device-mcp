@@ -156,6 +156,15 @@ class HolderScan:
     # because the two fail differently, and "the gate refused" is otherwise indistinguishable
     # between a device that is genuinely busy and a scan that had no privilege to look.
     source: str = "proc"
+    # Why ``complete`` is False, one short entry per blind spot (a pid the driver names that we
+    # could not attribute, a count of unreadable fd tables). The gates that defer on an
+    # incomplete scan quote these, so a deferral says what it could not see.
+    gaps: list[str] = field(default_factory=list)
+
+    def mark_incomplete(self, why: str) -> None:
+        """Record one blind spot and mark the scan incomplete."""
+        self.complete = False
+        self.gaps.append(why)
 
     def foreign_holders(self, caller_uid: int | None) -> list[DeviceHolder]:
         """Other real tenants holding the device — excludes the caller and system
@@ -260,13 +269,15 @@ def _scan_from_driver_pids(pids: "set[int]", complete: bool) -> HolderScan:
     holding the device would let the gate mistake a stranger for the caller's own holder, or name
     the wrong tenant in an audit.
     """
-    scan = HolderScan(complete=complete, source="driver")
+    scan = HolderScan(source="driver")
+    if not complete:
+        scan.mark_incomplete("a per-device driver pids file was unreadable")
     for pid in sorted(pids):
         uid = _proc_uid(pid)
         if uid is None:
             # A holder the driver can see and we cannot: another pid namespace, or it exited
             # between the driver's read and ours. Either way it is unattributed, not absent.
-            scan.complete = False
+            scan.mark_incomplete(f"pid {pid} named by the driver has no /proc entry here")
             continue
         try:
             confirmed = _process_holds_device(pid)
@@ -275,10 +286,14 @@ def _scan_from_driver_pids(pids: "set[int]", complete: bool) -> HolderScan:
             # already confirmed it, and the uid from stat is authoritative for this pid.
             confirmed = True
         except OSError:
-            scan.complete = False
+            scan.mark_incomplete(f"pid {pid} ({holder_comm(pid)}) named by the driver: fd table unreadable")
             continue
         if not confirmed:
-            scan.complete = False
+            # Also a process mid-exit: its fd table is already gone while the driver's release of
+            # the file still runs (a probe just killed on its timeout, before it is reaped).
+            scan.mark_incomplete(
+                f"pid {pid} ({holder_comm(pid)}, state {holder_state(pid)}) named by the driver holds no device fd here"
+            )
             continue
         scan.holders.append(DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid)))
     return scan
@@ -311,7 +326,7 @@ def _scan_by_walking_proc() -> HolderScan:
         pids = _iter_pids()
     except OSError as exc:
         logger.warning("device-holder scan: cannot list /proc: %s", exc)
-        scan.complete = False
+        scan.mark_incomplete(f"cannot list /proc: {exc}")
         return scan
 
     blocked = 0
@@ -321,7 +336,6 @@ def _scan_by_walking_proc() -> HolderScan:
         except PermissionError:
             # Another uid's process we cannot inspect -> visibility gap.
             blocked += 1
-            scan.complete = False
             continue
         except FileNotFoundError:
             # Process exited mid-scan; ignore.
@@ -332,11 +346,12 @@ def _scan_by_walking_proc() -> HolderScan:
         if holds:
             uid = _proc_uid(pid)
             if uid is None:
-                scan.complete = False
+                scan.mark_incomplete(f"holder pid {pid} exited before its owner was read")
                 continue
             scan.holders.append(DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid)))
 
     if blocked:
+        scan.mark_incomplete(f"{blocked} processes' fd tables unreadable")
         logger.warning(
             "device-holder scan incomplete: %d processes unreadable "
             "(need CAP_DAC_READ_SEARCH/root for full cross-user visibility, or a tt-kmd that "
@@ -416,6 +431,24 @@ def evaluate_reset_gate(
         foreign_holders=[],
         scan_complete=scan.complete,
     )
+
+
+def holder_comm(pid: int) -> str:
+    """The process name (``/proc/<pid>/comm``) for a log line; ``?`` when it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip() or "?"
+    except OSError:
+        return "?"
+
+
+def holder_state(pid: int) -> str:
+    """The one-letter run state (field 3 of ``/proc/<pid>/stat``: R, S, D, Z...); ``?`` if unreadable."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return "?"
 
 
 def _read_proc_starttime(pid: int) -> str | None:

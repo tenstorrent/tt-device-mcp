@@ -10,7 +10,13 @@ pass, that funnel holds the device fabric-unverified instead of releasing it.
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
-from tests.test_device_safety import _arm_offbus_stuck_hold, _clean_post_job_gate, _restart_broker
+from tests.test_device_safety import (
+    _arm_offbus_stuck_hold,
+    _arm_stuck_hold,
+    _clean_post_job_gate,
+    _restart_broker,
+    _setup_selfheal_hold,
+)
 from tests.test_startup_fabric_hugepages import _bound
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
@@ -237,6 +243,41 @@ async def test_the_idle_off_bus_bridge_reset(mesh, monkeypatch, verdict):
     patch_recovery(monkeypatch, "_recover_isolated_chips", bridge)
     _verify_returning(monkeypatch, evidence)
     assert await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    _assert_settled(released)
+
+
+@pytest.mark.asyncio
+async def test_the_measured_fabric_failure_reset_on_the_first_relift(mesh, monkeypatch, tmp_path, verdict):
+    """Spec 03 I56: a post-job hold on a measured fabric FAIL resets on the first idle relift, with no
+    grace. The real reset-and-verify path runs (only the reset command and the verify are stubbed): its
+    verify runs the fabric pass, and the hold clears only on a healthy fabric verdict."""
+    evidence, released = verdict
+    monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRY_SLEEP_SEC", 0)
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    _arm_stuck_hold(monkeypatch, held_minutes_ago=0.05)
+    g = srv.galaxy_recovery
+    monkeypatch.delattr(g, "_reset_and_verify_device")  # the real one, not _arm_stuck_hold's counter
+    monkeypatch.setattr(srv, "_clear_device_dirty", _REAL_CLEAR_DIRTY)
+    srv.health_monitor.last_fabric_ok = False
+    calls, resets = [], []
+
+    async def glx_reset(argv, log):
+        resets.append(len(calls))
+        FABRIC_DEBT.note_reset(" ".join(argv))
+        return 0, ""
+
+    async def eth_unreadable(timeout_sec=60.0):
+        return None, "eth read timed out"
+
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", glx_reset)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_unreadable)
+    _verify_returning(monkeypatch, evidence, calls)
+
+    await srv._attempt_idle_relift()
+
+    assert len(resets) == 1, "the measured fabric failure resets on the first relift, seconds into the hold"
+    after = calls[resets[0] :]
+    assert after and all(after), "every verify after the reset runs the fabric pass"
     _assert_settled(released)
 
 
