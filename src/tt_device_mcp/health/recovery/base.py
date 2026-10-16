@@ -1359,10 +1359,13 @@ class RecoveryMechanism:
     def restore_power_cycle_backoff(self, *, now_epoch: Optional[float] = None) -> Optional[dict]:
         """At broker start in a held episode: rebuild the cooldown, its deadline and the watchdog's
         retry from disk — the ledger, the boot, the heal marker and the saved fault (spec 03 I67).
+        Nothing to restore (no streak saved since the last verified release) leaves all as is.
         Never raises."""
         try:
             fault = self._read_power_cycle_backoff().get("fault")
-            cooldown = self.power_cycle_cooldown(now_epoch=now_epoch, fault=fault if isinstance(fault, dict) else None)
+            if not isinstance(fault, dict):
+                return None
+            cooldown = self.power_cycle_cooldown(now_epoch=now_epoch, fault=fault)
         except Exception:  # noqa: BLE001 - the governor recomputes it at its next ask anyway
             return None
         self.power_cycle_cooldown_state = cooldown

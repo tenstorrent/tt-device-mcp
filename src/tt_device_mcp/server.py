@@ -6044,9 +6044,10 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         _persist_hold_episode(device_hold_episode_since, tenant=_hold_is_tenant_held())
         # ...and the alert hook's backoff for that same episode, so a restart does not page again.
         device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
-        if restored:
-            # ...and the power cycle's backoff deadline and the watchdog's ask at it (spec 03 I67).
-            recovery_mechanism.restore_power_cycle_backoff()
+        # ...and the power cycle's backoff deadline and the watchdog's ask at it (spec 03 I67). Not
+        # only with a carried clock: the cycle's own reboot ends the episode clock but not the
+        # backoff, which only a verified release clears.
+        recovery_mechanism.restore_power_cycle_backoff()
         device_hold_episode_reason = reason
         # Reserve the ledger row now, so the live row and the durable one share id, start, and name.
         # Its start is THIS process's segment (row_since), NOT the restored escalation clock: a hold
