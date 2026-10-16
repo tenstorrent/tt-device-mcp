@@ -129,6 +129,12 @@ job boundary.
   (`TT_DEVICE_MCP_ETH_FREEZE_HOLD=0`) AND the mass-drop floor's
   (`TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC=0`, spec 04).
   A read that hangs past the caller's bound is frozen-core evidence (False), not a skip.
+  A built-in reader killed on its own (tighter) timeout is waited on until it has exited, up to
+  `ETH_REAP_SEC` (2s) and at most half the slack under the caller's bound, so the wait never turns
+  that skip into the caller's frozen verdict (2s at 60s/45s, 0.5s at the 10s post-job bound). A
+  holder scan run right after it then does not find the dying reader still listed by the driver
+  and defer an escalation as an incomplete scan (spec 04 I7). The override runs at the caller's
+  own bound, so it has no slack and does not wait.
 - **I17 — A fabric pass that ran but reached no verdict (exit 77) holds fabric-unverified and is
   never a reset trigger.** enum+ARC cannot see a wedged eth core, so "could not check" must not
   read as fit, and 77 is not a fault a reset fixes. Only a real healthy fabric verdict lifts it.
@@ -1205,6 +1211,7 @@ refuses.
 | I14 | `tests/test_device_safety.py::test_an_empty_dev_dir_on_a_host_that_expects_chips_holds_not_releases`, `tests/test_device_safety.py::test_a_device_less_host_never_reads_an_empty_sysfs_as_a_drop` |
 | I15 | `tests/test_device_safety.py::test_an_unverified_clear_holds_the_device`, `tests/test_device_safety.py::test_a_gate_that_errored_holds`, `tests/test_device_safety.py::test_a_clean_device_is_not_held_by_an_unverified_clear`, `tests/test_device_safety.py::test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace`, `tests/test_device_safety.py::test_a_verified_clear_names_itself_and_records_it_was_verified` |
 | I16 | `tests/test_device_safety.py::test_a_frozen_eth_verdict_is_held_not_reset`, `tests/test_device_safety.py::test_a_frozen_eth_verdict_holds_the_door_even_when_not_pre_dirty`, `tests/test_device_safety.py::test_frozen_eth_reset_needs_both_kill_switches`, `tests/test_device_safety.py::test_eth_heartbeat_hang_reads_as_frozen_not_skipped` |
+| I16 (a reader killed on its timeout is reaped within the caller's bound) | `tests/test_eth_probe.py::test_run_probe_reaps_its_timed_out_child_before_returning`, `tests/test_eth_link_baseline.py::test_the_eth_read_reaps_its_killed_reader_within_the_outer_bound` |
 | I17 | `tests/test_device_safety.py::test_dirty_device_is_not_reset_when_the_fabric_cannot_be_checked`, `tests/test_device_safety.py::test_an_unverified_fabric_is_never_recorded_as_verified_healthy`, `tests/test_fabric_probe.py::test_fabric_classification[77-cannot check-None]`, `tests/test_fabric_check_reason.py::test_first_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_fabric_check_reason.py::test_builtin_path_skip_detail_names_the_cause`, `tests/test_fabric_check_reason.py::test_override_path_reason_names_the_cause`, `tests/test_fabric_check_reason.py::test_wrapper_77_final_line_keeps_the_validators_first_error_line`, `tests/test_startup_fabric_hugepages.py::test_override_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_startup_fabric_hugepages.py::test_a_77_run_keeps_its_stderr_tail_and_exit_code_in_an_incident_bundle` |
 | I18 | `tests/test_device_safety.py::test_a_healthy_device_is_not_reset_just_because_a_job_timed_out`, `tests/test_device_safety.py::test_a_runtime_reported_fault_holds_the_device` |
 | I19 | `tests/test_device_safety.py::test_a_dead_chip_is_isolated_without_waiting_for_the_device_lock`, `tests/test_device_safety.py::test_a_chip_dead_on_two_consecutive_samples_is_isolated`, `tests/test_device_safety.py::test_a_transient_all_ones_does_not_amputate_a_chip`, `tests/test_device_safety.py::test_a_reset_in_flight_must_not_look_like_dead_chips`, `tests/test_device_safety.py::test_a_reset_that_outlives_our_wait_still_shields_its_chips`, `tests/test_device_safety.py::test_every_chip_at_once_is_a_global_event_not_32_dead_chips`, `tests/test_device_safety.py::test_a_dead_chip_kills_the_processes_that_still_map_it` |
