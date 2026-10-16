@@ -347,6 +347,63 @@ async def test_a_passing_fabric_check_lifts_the_hold(broker_root, fabric_hold, e
     assert [k for k, _ in events if k.startswith("verification_")] == ["verification_lifted_hold"]
 
 
+@pytest.fixture
+def debt_owed(monkeypatch):
+    """A 2-chip mesh with a fabric check configured and the debt a broker start leaves (04 I32)."""
+    from tt_device_mcp.health import post_reset
+
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "true")
+    monkeypatch.setattr(post_reset, "health_event", lambda kind, **f: None)
+    monkeypatch.setattr(srv.health_monitor, "fabric_known_fault", "")
+    srv.FABRIC_DEBT.owed = "broker start"
+    return srv.FABRIC_DEBT
+
+
+@pytest.mark.asyncio
+async def test_a_passing_check_settles_the_post_reset_debt_and_lifts(
+    monkeypatch, broker_root, fabric_hold, enum_arc, events, debt_owed
+):
+    """After a broker start or a reset the release is refused until a fabric pass settles the debt
+    (04 I32). The verification job's pass, with no reset since it started, is that pass: it settles
+    the debt and ends a known fabric fault, as the monitor's own pass would, and the hold lifts."""
+    monkeypatch.setattr(srv.health_monitor, "fabric_known_fault", "known fabric fault: 2 jobs in a row")
+    job = _finished(_job("507", f"{broker_root}/fabric-check.sh", peer_uid=0))
+    assert await srv._settle_verification_job(job)
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert debt_owed.owed == ""
+    assert srv.health_monitor.last_fabric_ok is True
+    assert srv.health_monitor.fabric_known_fault == ""
+    kinds = [k for k, _ in events]
+    assert "post_reset_release_refused" not in kinds
+    assert "verification_lifted_hold" in kinds and "device_relift" in kinds
+
+
+@pytest.mark.asyncio
+async def test_a_refused_release_is_not_reported_as_a_lift(monkeypatch, broker_root, fabric_hold, enum_arc, events):
+    """A release the post-reset gate refuses keeps the hold, and the journal says so: no lift and no
+    relift is recorded for a device that is still held."""
+    monkeypatch.setattr(srv, "_clear_device_dirty", lambda **k: False)
+    job = _finished(_job("508", f"{broker_root}/fabric-check.sh", peer_uid=0))
+    assert not await srv._settle_verification_job(job)
+    assert srv.fsm.state is ServerState.RECOVERING
+    kinds = [k for k, _ in events]
+    assert "verification_not_lifted" in kinds
+    assert "verification_lifted_hold" not in kinds and "device_relift" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_a_pass_on_the_discovered_links_lifts_nothing(broker_root, fabric_hold, enum_arc, events, debt_owed):
+    """A pass that only ran on the discovered links (a topology marker) proves no full mesh: it
+    settles no debt and lifts nothing; the monitor's own pass handles the mismatch (03 I45)."""
+    job = _finished(_job("509", f"{broker_root}/fabric-check.sh", peer_uid=0))
+    job.output = "TOPOLOGY MISMATCH vs galaxy.yaml: 2 missing, 0 extra port connections\nPASSED\n"
+    assert not await srv._settle_verification_job(job)
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert debt_owed.owed == "broker start"
+    assert srv.health_monitor.last_fabric_ok is None
+    assert [k for k, _ in events if k.startswith("verification_")] == ["verification_not_lifted"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case", ["unhealthy", "reset_during_check", "reset_during_read", "fault_during_read", "never_started"]

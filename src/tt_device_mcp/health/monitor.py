@@ -1038,18 +1038,12 @@ class HealthMonitor:
 
         self.last_fabric_skipped = ok is None
         if ok is True:
-            self.last_fabric_ok = True
-            FABRIC_DEBT.note_fabric(True)  # the one verdict that settles a post-reset debt (04 I32)
-            if self.fabric_known_fault:
-                health_event("fabric_known_fault_cleared", detail=self.fabric_known_fault)
-            self.fabric_known_fault, self._fabric_route_fault_streak = "", 0
             marker = fabric.find_topology_marker(text)
             if marker:
+                self._note_fabric_ok()
                 self._on_topology_mismatch(marker)
                 return True, f"fabric links healthy on discovered links ({dt:.0f}s); {marker}"
-            self.topology_lift_pending = False
-            _save_asic_bus_map()
-            self._restore_eth_high_water()
+            self.adopt_fabric_pass(text)
             return True, f"fabric links healthy ({dt:.0f}s)"
         if cable:
             # A missing cable is a hardware verdict, not a skip (I47): held as a known fabric fault,
@@ -1153,6 +1147,30 @@ class HealthMonitor:
             reason = no_verdict(f"traffic-only rerun: {reason}")
         return rc, combined, ok, reason
 
+    def _note_fabric_ok(self) -> None:
+        """What every healthy fabric verdict settles: the post-reset debt (04 I32) and a known fabric
+        fault (I46)."""
+        self.last_fabric_ok = True
+        FABRIC_DEBT.note_fabric(True)  # the one verdict that settles a post-reset debt (04 I32)
+        if self.fabric_known_fault:
+            health_event("fabric_known_fault_cleared", detail=self.fabric_known_fault)
+        self.fabric_known_fault, self._fabric_route_fault_streak = "", 0
+
+    def adopt_fabric_pass(self, output: str) -> str:
+        """Fold in a healthy fabric pass on the full topology, as a clean pass of the monitor's own
+        does, also one run outside the monitor (an operator verification job, spec 01 I21). A pass
+        whose output carries a topology marker ran on the discovered links only: it is adopted for
+        nothing and its marker returned, so the caller leaves the lift to the monitor's own pass
+        (I45). Returns "" once adopted."""
+        marker = fabric.find_topology_marker(output)
+        if marker:
+            return marker
+        self._note_fabric_ok()
+        self.topology_lift_pending = False
+        _save_asic_bus_map()
+        self._restore_eth_high_water()
+        return ""
+
     def _on_topology_mismatch(self, marker: str) -> None:
         """An OK verdict that carries a topology mismatch: journal it, name the trays that moved
         since the last clean pass, page the operator once per distinct mismatch, and watch the
@@ -1224,7 +1242,7 @@ class HealthMonitor:
         return self.fabric_known_fault
 
     def _declare_cable_fault(self, detail: str) -> None:
-        """A fabric pass found cables missing (spec 03 I50): open the known fabric fault (I46) at once,
+        """A fabric pass found cables missing (spec 03 I47): open the known fabric fault (I46) at once,
         journal it, page once per distinct fault. A fault already open is left as it is, so its
         bound still runs from the first declaration."""
         if self.fabric_known_fault == detail:

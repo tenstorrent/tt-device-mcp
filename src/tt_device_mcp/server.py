@@ -8670,9 +8670,14 @@ async def _settle_verification_job(job: "Job") -> bool:
             return _not_lifted("a reset ran since the check started")
         if not _fabric_hold_only(own_op=VERIFICATION_LIFT_OP):
             return _not_lifted("the hold is no longer fabric-only")
-        _clear_device_dirty(verified=True, why=f"operator verification job {job.id} passed")
+        # No reset since the pass started, so it settles the post-reset fabric debt a broker start or
+        # a reset left (04 I32) as the monitor's own pass would; without that the release is refused.
         if health_monitor is not None:
-            health_monitor.last_fabric_ok = True
+            marker = health_monitor.adopt_fabric_pass(f"{job.output}\n{job.error}")
+            if marker:
+                return _not_lifted(f"the pass ran on the discovered links only ({marker})")
+        if not _clear_device_dirty(verified=True, why=f"operator verification job {job.id} passed"):
+            return _not_lifted("the release was refused")
     if logger:
         logger.info(f"CLEAN-GATE operator verification job {job.id} passed the fabric check and enum+ARC: hold lifted")
     health_event("verification_lifted_hold", job_id=job.id)
