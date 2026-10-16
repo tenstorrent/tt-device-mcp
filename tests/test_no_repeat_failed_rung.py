@@ -428,7 +428,8 @@ async def test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cy
     """I38 with I65: the host booted 3 min ago and one chip stays off after the failed mesh reset. The
     climb still skips the ceiling wait and the sweep (I38), but the power cycle waits out the cooldown
     counted from that boot, with its deadline set for the watchdog; no reset fires meanwhile (I36,
-    I58), and the cycle fires once the cooldown has run out. Nothing releases the hold."""
+    I58). /health shows the deadline while it waits, the watchdog asks again at that deadline, and the
+    cycle fires once the cooldown has run out: bounded, never open-ended. Nothing releases the hold."""
     clock = [ONE_SHOT]
     counters, events, _ = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=1)
     mech = srv.recovery_mechanism
@@ -444,13 +445,39 @@ async def test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cy
     until = int(boot[0]) + POWER_CYCLE_MIN_INTERVAL_SEC
     assert mech.power_cycle_retry[0] == until, "the watchdog asks again at the cooldown's end"
     assert mech.power_cycle_cooldown_state["cause"] == "host boot"
+    # /health shows the bounded wait: the rung it waits for and the moment it is asked again.
+    monkeypatch.setattr(srv, "_device_hold_state", lambda now=None: ("chip off", srv.device_hold_episode_since))
+    shown = srv._health_payload()["power_cycle_cooldown"]
+    assert shown["escalation_stage"] == "power-cycle" and shown["cause"] == "host boot"
+    assert shown["next_deadline"] == datetime.fromtimestamp(until).isoformat(timespec="seconds")
     clock[0] = 600.0
     assert await _window() is True
     assert counters["resets"] == 1 and counters["power_cycles"] == 0 and counters["sweeps"] == 0
+    assert srv._health_payload()["power_cycle_cooldown"]["next_deadline"] == shown["next_deadline"]
+    # The watchdog asks again the moment the cooldown ends, not at the next ceiling window.
+    assert not mech.power_cycle_retry_due(until - 1)
+    spawned = _drive_watchdog_at(monkeypatch, datetime.fromtimestamp(until))
+    assert spawned[:1] == ["power_cycle_cooldown"], "the cooldown's end is asked first"
+    assert "power_cycle_cooldown" not in srv._health_payload(now=datetime.fromtimestamp(until))
     boot[0] -= POWER_CYCLE_MIN_INTERVAL_SEC  # the cooldown has run out
-    assert await _window() is True
+    assert await _window() is True  # the spawned escalation
     assert counters["resets"] == 1 and counters["power_cycles"] == 1 and counters["sweeps"] == 0
+    assert mech.power_cycle_cooldown_state is None and "power_cycle_cooldown" not in srv._health_payload()
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing released the hold"
+
+
+def _drive_watchdog_at(monkeypatch, now):
+    """Run the hold watchdog once at ``now`` (one-shot already spent, windows claimed); returns the
+    spawn kinds it chose."""
+    spawned = []
+    monkeypatch.setattr(
+        srv, "_maybe_spawn_forced_escalation", lambda: spawned.append(srv.device_hold_escalation_kind) or True
+    )
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", True)
+    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
+    srv.fsm.set_latch("escalated", False)
+    srv._check_hold_deadline(now=now)
+    return spawned
 
 
 # --- E3: one failed reset per unchanged set, then the next rung, for every reset class ----------------
