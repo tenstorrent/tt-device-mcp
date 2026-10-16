@@ -159,6 +159,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
@@ -7310,6 +7311,67 @@ async def _refuse_job_privsep_identity(job: "Job", job_log_file: Optional[Path],
                 logger.error(f"could not write privsep refusal footer for job {job.id}: {e}")
 
 
+# The output dir preflight stats a handful of paths; this only bounds a hung network mount.
+JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC = 2.0
+
+
+async def _job_output_dir_problems(job: "Job") -> list[str]:
+    """Why the job's user could not write its tt-metal output dirs (spec 01 I68); empty when
+    fine. Checked for the uid the job will run as: its submitter under privsep, else the broker.
+    Filesystem reads only, bounded by JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC; a check that errors or
+    runs out of time lets the job through (it never refuses on a guess) and never raises."""
+    scoped = privsep_prefix_for(job.peer_uid) is not None
+    uid = job.peer_uid if scoped else os.geteuid()
+    # A job scoped to another uid gets only its env_vars; a direct one inherits the broker's too.
+    inherited = None if scoped else dict(os.environ)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(preflight_output_dirs, job.workspace, job.env_vars or {}, inherited, uid),
+            timeout=JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        if logger:
+            logger.warning(f"JOB_RUNNER job_id={job.id} output dir preflight skipped: {e!r}")
+        return []
+
+
+async def _refuse_job_output_dirs(job: "Job", job_log_file: Optional[Path], problems: list[str]) -> None:
+    """End a job FAILED at the door because its tt-metal output dirs are not writable by its
+    user. The device is untouched: the next job is admitted through the normal gate. Never
+    raises — a bug here must not wedge the runner."""
+    reason = "; ".join(problems)
+    if logger:
+        logger.warning(f"JOB_RUNNER refusing job_id={job.id}: tt-metal output dir not writable: {reason}")
+    try:
+        async with get_lock():
+            job.status = JobStatus.FAILED
+            job.finished_at = datetime.now().isoformat()
+            job.error = f"job setup: tt-metal output dir not writable by the job's user: {reason}"
+            if stats:
+                stats.record_job_completion(job.status, job.wait_sec, job.runtime_sec)
+        _forget_queued_job(job.id)  # refused is terminal: a restart must not revive it
+        if job_log_file:
+            with open(job_log_file, "a") as f:
+                f.write(
+                    f"\n[REFUSED at {job.finished_at}] job setup: tt-metal output dir not writable "
+                    f"by the job's user:\n"
+                    + "".join(f"  {p}\n" for p in problems)
+                    + "The broker did not dispatch this job; the device was not touched. tt-metal "
+                    "writes under <TT_METAL_LOGS_PATH or the job's working dir>/generated/. Give "
+                    "those dirs back to the job's user (an earlier run as root often leaves them "
+                    "root-owned), move them aside, or set TT_METAL_LOGS_PATH to a writable dir in the job's "
+                    "env file.\n"
+                )
+            write_job_log_footer(job_log_file, job)
+    except Exception as e:
+        if logger:
+            logger.error(f"JOB_RUNNER output dir refusal error for job_id={job.id}: {e}")
+        job.status = JobStatus.FAILED
+        job.finished_at = job.finished_at or datetime.now().isoformat()
+        job.error = job.error or f"job setup: tt-metal output dir not writable by the job's user: {reason}"
+        _forget_queued_job(job.id)
+
+
 def _tenant_hold_enabled() -> bool:
     """Whether a degraded device HOLDS a tenant job (default) or FAILS it fast. Default ON:
     a queue must hold jobs while the device recovers, not bounce them back to the submitter.
@@ -9012,6 +9074,15 @@ async def _job_runner_loop():
 
         # Use existing log file (created at queue time)
         job_log_file = Path(job.log_file) if job.log_file else None
+
+        # Fail fast on tt-metal output dirs the job's user cannot write (spec 01 I68), before any
+        # cooldown, gate or hold: such a job dies at device open whatever the device's state.
+        output_dir_problems = await _job_output_dir_problems(job)
+        if output_dir_problems:
+            await _refuse_job_output_dirs(job, job_log_file, output_dir_problems)
+            await cleanup_finished_jobs()
+            get_job_queue().task_done()
+            continue
 
         # Let the mesh rest between consecutive jobs. Back-to-back saturating runs with no gap
         # is what pushed a marginal tray off the bus; this is the only idle the silicon is
