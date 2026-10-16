@@ -103,7 +103,10 @@ from tt_device_mcp.health.recovery.base import (
     HOLD_ESCALATION_REARM_SEC,
     RESET_COOLDOWN_SEC,
     RecoveryMechanism,
+    host_action_pending_sec,
     mesh_hold_repage_sec,
+    mesh_reset_hold_reason,
+    refuse_mesh_reset,
 )
 
 # The Galaxy escalation ladder's own thresholds and vocabulary. The gate takes its escalation
@@ -195,6 +198,10 @@ __all__ = [
     "_declared_reset_mode",
     # how often a standing hardware-fault hold is paged again (spec 03 I42)
     "mesh_hold_repage_sec",
+    # how long a requested host reboot/power cycle keeps the forced ladder from resetting
+    "host_action_pending_sec",
+    "mesh_reset_hold_reason",
+    "refuse_mesh_reset",
     # the escalation decision the gate acts on: the evidence it hands next_stage, and every
     # decision value that comes back which is not itself a stage name
     "Evidence",

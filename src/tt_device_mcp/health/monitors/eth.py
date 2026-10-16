@@ -384,13 +384,22 @@ def parse_link_count(text: str) -> Optional[int]:
 
 
 async def check(
-    argv: list[str], env: dict[str, str], *, timeout_sec: float, track: Track, cwd: Optional[str] = None
+    argv: list[str],
+    env: dict[str, str],
+    *,
+    timeout_sec: float,
+    track: Track,
+    cwd: Optional[str] = None,
+    reap_sec: float = 0.0,
 ) -> tuple[Optional[int], str]:
     """Run an already-built eth-heartbeat command (see ``build()``) and return ``(rc, output)``.
 
     ``terminate`` is deliberately left at ``run_probe``'s own default (a hard ``killpg``): a
     hung register read has no graceful unwind worth waiting for, unlike the fabric traffic
-    pass's own escalation ladder — it is either measuring or already wedged.
+    pass's own escalation ladder — it is either measuring or already wedged. ``reap_sec`` is
+    ``run_probe``'s bounded wait for the killed reader to finish exiting.
     """
-    rc, raw = await run_probe(argv, timeout_sec=timeout_sec, track=track, stream=False, env=env, cwd=cwd)
+    rc, raw = await run_probe(
+        argv, timeout_sec=timeout_sec, track=track, stream=False, env=env, cwd=cwd, reap_sec=reap_sec
+    )
     return rc, raw.decode("utf-8", "replace").strip()
