@@ -211,7 +211,9 @@ async def _run_ladder(g, indices, stages=(galaxy.STAGE_SMI_RESET, galaxy.STAGE_P
 async def test_a_tray_down_onset_rescans_captures_then_runs_its_ladder(rig, spec, ladder):
     off = _off(rig["map"], spec)
     rig["beats"] = _beats_without(off)
-    stages = (galaxy.STAGE_SMI_RESET,) if ladder == ["power_cycle"] else (galaxy.STAGE_SMI_RESET, galaxy.STAGE_POWER_CYCLE)
+    stages = (
+        (galaxy.STAGE_SMI_RESET,) if ladder == ["power_cycle"] else (galaxy.STAGE_SMI_RESET, galaxy.STAGE_POWER_CYCLE)
+    )
     outs = await _run_ladder(rig["g"], sorted(map(str, off)), stages=stages)
     assert rig["order"] == ["rescan", "capture", *ladder]
     assert outs == [galaxy.OUTCOME_WAITING] * len(stages)

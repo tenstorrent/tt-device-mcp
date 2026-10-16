@@ -1394,8 +1394,14 @@ class GalaxyRecovery(Recovery):
             # down, give every reset type one last back-to-back run, then ONE settle and ONE verify
             # (ladder-v2: the last-chance sweep gates every host rung): a drop that came back needs
             # no reboot or power cycle.
+            # No heartbeats passed: the sweep reads them itself, as the I37 hook does, rather than
+            # count every chip off and take a partial drop for class C.
             last_chance = await self._settle_and_verify_before_host_rung(
-                expected, log, gate_phase, offbus_chips=_offbus_chip_ids(beats or {}, expected), context="gate ladder"
+                expected,
+                log,
+                gate_phase,
+                offbus_chips=None if beats is None else _offbus_chip_ids(beats, expected),
+                context="gate ladder",
             )
             if last_chance:
                 return OUTCOME_RECOVERED
