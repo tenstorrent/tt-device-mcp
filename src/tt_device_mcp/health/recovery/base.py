@@ -101,6 +101,16 @@ def host_action_pending_sec() -> float:
 # loop guard), and a stronger rung that fired blocks de-escalating back to a weaker one.
 AUTO_RECOVERY_RANK = {"reboot": 1, "power-cycle": 2}
 
+# A power cycle whose following boot reached a VERIFIED-healthy release (a gate pass whose fabric
+# check ran and passed) recovered the box: a new fault after it is a new episode, not a boot loop, so
+# that cycle no longer spaces the next one (spec 04 I9). The stamp is durable beside the ledger. Only
+# a cycle no later boot ever verified still gates — the true loop. The hard backstop below counts
+# every power cycle, verified or not: past it the broker pages instead of cycling a flapping tray on
+# a serving host forever.
+AUTO_RECOVERY_VERIFIED = "auto_recovery_verified.json"
+POWER_CYCLE_BACKSTOP_MAX = 3
+POWER_CYCLE_BACKSTOP_WINDOW_SEC = 7200
+
 # The metrics.STAGES name for each auto-recovery action _fire_recovery_escalation ever fires. An
 # explicit table, not a ternary: a third action added here later must fail loud (KeyError) rather
 # than silently mislabel itself onto whichever branch a two-way ternary happened to default to.
@@ -200,6 +210,20 @@ def refuse_mesh_reset(context: str, argv: list, log, off_bus: int = 0) -> bool:
     return True
 
 
+def _verified_since(rec: dict, verified: dict) -> bool:
+    """Whether power-cycle ledger row ``rec`` was followed, on a LATER boot, by the verified-healthy
+    release ``verified``. Any unknown boot id or unreadable stamp reads False: the row still gates."""
+    if rec.get("action") != "power-cycle":
+        return False
+    rec_boot, ver_boot = rec.get("boot_id"), verified.get("boot_id")
+    if not rec_boot or not ver_boot or rec_boot == ver_boot:
+        return False
+    try:
+        return float(verified.get("at_epoch")) > float(rec.get("at_epoch"))
+    except (TypeError, ValueError):
+        return False
+
+
 class RecoveryMechanism:
     """Shared, platform-invariant machinery. ``Recovery`` (recovery/__init__.py) holds this by
     composition as ``self.mechanism`` — never by inheritance — because this object's state
@@ -247,6 +271,9 @@ class RecoveryMechanism:
         # sequence and they must build it identically, because the scope name is what every other
         # protection keys on.
         self.reset_scope_seq = 0
+        # The newest power-cycle stamp the backstop already paged for, so a held box pages once per
+        # cap reached, not on every gate pass.
+        self._power_cycle_backstop_paged: float = 0.0
 
         # True while a reset is actually executing. A reset TAKES THE CHIPS OFF THE BUS — that is
         # what a reset is — so during one they read all-ones exactly like a dead chip, and isolating
@@ -897,6 +924,11 @@ class RecoveryMechanism:
         if ledger is None:
             return False, "auto-recovery ledger unreadable; refusing to reboot without its rate-limit record"
         now_epoch = time.time() if now_epoch is None else now_epoch
+        verified = self.last_verified_release() if action == "power-cycle" else None
+        if action == "power-cycle":
+            backstop = self._power_cycle_backstop(ledger, now_epoch)
+            if backstop:
+                return False, backstop
         rank = AUTO_RECOVERY_RANK.get(action, max(AUTO_RECOVERY_RANK.values()))
         # The power cycle is spaced by its OWN interval (the user's 30-min cap), every other
         # action by the general loop-guard interval. For a power cycle rank==2 gates only prior
@@ -912,6 +944,8 @@ class RecoveryMechanism:
             # a record we cannot classify must never fail OPEN and wave a repeat action through.
             if AUTO_RECOVERY_RANK.get(rec.get("action"), max(AUTO_RECOVERY_RANK.values())) < rank:
                 continue
+            if verified and _verified_since(rec, verified):
+                continue  # a later boot proved that cycle healed the box: not a loop
             # A gating record we cannot read a timestamp from is treated as "just now": the interval
             # is the loop guard, so a missing/garbled stamp must block, never wave the action through.
             try:
@@ -1045,6 +1079,66 @@ class RecoveryMechanism:
                 except OSError:
                     pass
                 return
+
+    def _power_cycle_backstop(self, ledger: list[dict], now_epoch: float) -> str:
+        """The refusal text when POWER_CYCLE_BACKSTOP_MAX power cycles already ran inside the backstop
+        window, verified or not; "" otherwise. Pages once per cap reached: a tray that keeps dropping
+        after good cycles is a hardware fault for its owners, not a reason to keep cycling the host."""
+        stamps = []
+        for rec in ledger:
+            if rec.get("action") != "power-cycle":
+                continue
+            try:
+                at = float(rec.get("at_epoch"))
+            except (TypeError, ValueError):
+                continue  # the interval loop fails closed on it
+            if now_epoch - at < POWER_CYCLE_BACKSTOP_WINDOW_SEC:
+                stamps.append(at)
+        if len(stamps) < POWER_CYCLE_BACKSTOP_MAX:
+            return ""
+        why = (
+            f"{len(stamps)} power cycles in the last {POWER_CYCLE_BACKSTOP_WINDOW_SEC}s (backstop "
+            f"{POWER_CYCLE_BACKSTOP_MAX}): the fault keeps coming back after verified cycles; holding "
+            f"for an operator instead of cycling again"
+        )
+        newest = max(stamps)
+        if newest != self._power_cycle_backstop_paged:
+            health_event("power_cycle_backstop", count=len(stamps), reason=why, host_at_risk=True)
+            event = {"kind": "power_cycle_backstop", "count": len(stamps), "message": why}
+            if alert.send_alert(event) is not None or alert.alert_argv() is None:
+                self._power_cycle_backstop_paged = newest
+        return why
+
+    def last_verified_release(self) -> Optional[dict]:
+        """The last verified-healthy release (``boot_id``, ``at_epoch``), or None when none was
+        recorded or it cannot be read — read as "never verified", so the guard keeps every cycle."""
+        try:
+            rec = json.loads((health_dir() / AUTO_RECOVERY_VERIFIED).read_text())
+        except (OSError, ValueError):
+            return None
+        return rec if isinstance(rec, dict) else None
+
+    def record_verified_release(self, via: str, *, now_epoch: Optional[float] = None) -> None:
+        """Stamp a verified-healthy release (a gate pass whose fabric check ran and passed) on this
+        boot. Written atomically; never raises. A lost stamp only keeps the boot-loop guard on. The
+        first stamp of a boot is the one that counts (every cycle it clears was recorded under an
+        earlier boot), so later passes on the same boot write nothing."""
+        boot_id = self._current_boot_id()
+        if not boot_id or (self.last_verified_release() or {}).get("boot_id") == boot_id:
+            return
+        rec = {
+            "boot_id": boot_id,
+            "at_epoch": time.time() if now_epoch is None else now_epoch,
+            "via": via,
+        }
+        path = health_dir() / AUTO_RECOVERY_VERIFIED
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(rec, default=str))
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
     async def _fire_recovery_escalation(
         self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: str, pre_fire=None
