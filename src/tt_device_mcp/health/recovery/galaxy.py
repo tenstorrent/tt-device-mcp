@@ -539,38 +539,39 @@ def _host_escalation_for_drop(
     reboot_already_attempted: Callable[[], bool],
 ) -> tuple[Optional[str], bool]:
     """The host recovery rung to fire for an ``off_bus``/``expected`` drop, plus whether the warm
-    reboot was suppressed as unable to recover it.
+    reboot was suppressed as unable to recover it (spec 04 I71). Every host-rung path calls this.
 
-    Identical to :func:`_choose_recovery_escalation` for any drop that still leaves a chip on the
-    bus. The one exception is a WHOLE-bus drop on a multi-chip host — every chip off the bus
-    (``off_bus >= expected``), i.e. present==0. A warm reboot does not power-cycle a 6U-Galaxy's
-    UBBs, so ASICs that fell off the bus stay off across it (measured: 32/32 came back off the bus
-    after the auto-reboot, and only a cold chassis power cycle recovered them). Firing the reboot
-    rung there cannot work — it takes every tenant down for ~3 min and lands back in the dead state
-    — so the reboot is never the answer for it:
+    A single-chip host (``expected <= 1``) has no UBB re-enumeration failure mode: it keeps
+    :func:`_choose_recovery_escalation`'s order, the reboot first and the power cycle after it.
 
-      * power cycle opted in -> ``("power-cycle", False)``: skip straight to the cold rung.
-      * otherwise -> ``(None, True)``: no opted-in rung can recover it. The caller MUST emit the
-        loud actionable event and KEEP HOLDING — never fall through to the reboot.
+    On a multi-chip host the power cycle is THE host rung whenever it is armed:
 
-    ``warm_reboot_futile`` extends that same "the reboot cannot recover this" verdict to a PARTIAL
-    drop the caller has already proven a reboot cannot clear — a reset that regressed the mesh off
-    the bus, or one that hard-exited non-zero leaving chips off it. Those dropped ASICs are off the
-    bus too, so the reboot is as useless for them as for a whole-bus drop; route them the same way.
+      * any chip off the bus (``off_bus > 0``, or a caller-proven ``warm_reboot_futile``): a warm
+        reboot does not power-cycle a 6U-Galaxy's UBBs, so an ASIC that fell off the bus stays off
+        across it (measured: 32/32 came back off the bus after the auto-reboot; only a cold chassis
+        power cycle recovered them). The reboot would take every tenant down and land back in the
+        same state. Power cycle armed -> ``("power-cycle", False)``; otherwise ``(None, True)``: the
+        caller MUST emit the loud actionable event and KEEP HOLDING, never fall through to the reboot.
+      * a present mesh (``off_bus == 0``) that survived the reset ladder: no recorded episode shows
+        a warm reboot healing a wedge the mesh resets did not, so the power cycle goes first too.
+        The reboot stays this mesh's rung only where no power cycle is armed, as the last rung
+        before an operator.
 
-    Pure and side-effect-free; the caller acts on the result. ``expected > 1`` because a
-    single-chip host has no UBB-re-enumeration failure mode — its ordinary ladder applies."""
-    escalation = _choose_recovery_escalation(
-        auto_reboot_enabled=auto_reboot_enabled,
-        auto_power_cycle_enabled=auto_power_cycle_enabled,
-        reboot_already_attempted=reboot_already_attempted,
-    )
-    reboot_futile = expected > 1 and (warm_reboot_futile or off_bus >= expected)
-    if not reboot_futile or escalation == "power-cycle":
+    A power cycle the rate limits or the I65 cooldown deny is held and asked again when the wait
+    ends (I10, I65); it never falls back to the reboot here. ``reboot_already_attempted`` matters
+    only on a single-chip host. Pure and side-effect-free; the caller acts on the result."""
+    if expected <= 1:
+        escalation = _choose_recovery_escalation(
+            auto_reboot_enabled=auto_reboot_enabled,
+            auto_power_cycle_enabled=auto_power_cycle_enabled,
+            reboot_already_attempted=reboot_already_attempted,
+        )
         return escalation, False
     if auto_power_cycle_enabled():
         return "power-cycle", False
-    return None, True
+    if warm_reboot_futile or off_bus > 0:
+        return None, True
+    return ("reboot" if auto_reboot_enabled() else None), False
 
 
 # The ledger/auto_recovery_allowed vocabulary — what record_auto_recovery(action=...) and every
@@ -695,7 +696,7 @@ def _route(
     if last_action_recovered:
         return RELEASE
     if last_action == STAGE_SMI_RESET and last_action_recovered is False:
-        if reboot_blocked:
+        if reboot_blocked and not reset_scope_active:
             return BLOCKED
         if (
             host_escalation is not None
@@ -1112,22 +1113,12 @@ class GalaxyRecovery(Recovery):
         # every other call, exactly as the gate only pays for it once a galaxy reset has failed.
         host_escalation, reboot_blocked = None, False
         if ev.last_action == STAGE_SMI_RESET and ev.last_action_recovered is False:
-            reset_regressed = (
-                ev.expected > 1
-                and ev.off_bus_before is not None
-                and ev.off_bus > ev.off_bus_before
-                and not ev.scope_active
-            )
-            warm_reboot_futile = (
-                ev.expected > 1
-                and ev.off_bus > 0
-                and not ev.scope_active
-                and (reset_regressed or ev.reset_exit_nonzero or ev.episode_reset_regressed)
-            )
+            # Any chip off the bus makes the warm reboot futile on a multi-chip host (I71); the fold
+            # reads that from off_bus itself. A live reset scope's all-ones is not a verdict: _route
+            # waits on it before it reads reboot_blocked.
             host_escalation, reboot_blocked = _host_escalation_for_drop(
                 ev.off_bus,
                 ev.expected,
-                warm_reboot_futile=warm_reboot_futile,
                 auto_reboot_enabled=self.deps.auto_reboot_enabled,
                 auto_power_cycle_enabled=self.deps.auto_power_cycle_enabled,
                 reboot_already_attempted=self.mechanism._reboot_already_attempted,
@@ -1550,7 +1541,7 @@ class GalaxyRecovery(Recovery):
             # A fired host rung takes the box with it, so there is no verdict to report: WAITING
             # leaves the episode as it stands for the boot that comes back to verify it.
             if stage == STAGE_POWER_CYCLE:
-                await self.deps.auto_power_cycle_host(log, "reset and a host reboot could not recover the device")
+                await self.deps.auto_power_cycle_host(log, "the reset ladder could not recover the device")
             else:
                 await self._auto_reboot_host(log, "reset failed twice; device unrecoverable by reset")
             return OUTCOME_WAITING
@@ -3028,21 +3019,11 @@ class GalaxyRecovery(Recovery):
                 ceiling_sec=_stuck_hold_ceiling_sec(),
             )
             return
-        reboot_floor = _reboot_min_dead_chips(expected)
-        # A below-floor off-bus drop reaching this climb is NOT self-healing: it survived the 20-min grace
-        # and a reset that could not recover it. A dropped ASIC does not re-enumerate on a warm reboot (a
-        # 6U-Galaxy reboot does not power-cycle the UBBs), so the cold power cycle is the only rung that can
-        # recover it — never hold below the floor. Mark it warm-reboot-futile so the chooser routes it
-        # straight to the cold rung; the reboot floor only ever gated the mesh reset, not the power cycle.
-        below_floor_offbus = 0 < off_bus < reboot_floor
-        warm_reboot_futile = (
-            expected > 1
-            and off_bus > 0
-            and (reset_regressed or episode_regressed or self.mechanism.last_reset_exit_nonzero or below_floor_offbus)
-        )
-        escalation, reboot_blocked = _host_escalation_for_drop(
-            off_bus, expected, warm_reboot_futile=warm_reboot_futile, **self.deps.host_escalation_kwargs()
-        )
+        # An off-bus drop reaching this climb is NOT self-healing: it survived the grace and a reset that
+        # could not recover it. A dropped ASIC does not re-enumerate on a warm reboot (a 6U-Galaxy reboot
+        # does not power-cycle the UBBs), so on a multi-chip host the chooser routes any off_bus > 0 to
+        # the cold rung, below the floor included, and a present mesh too while it is armed (I71).
+        escalation, reboot_blocked = _host_escalation_for_drop(off_bus, expected, **self.deps.host_escalation_kwargs())
         if reboot_blocked:
             # No chassis power cycle is opted in and no rung can recover it: fail closed loudly and hold,
             # never fire a reboot that lands right back in the dead state. A whole-bus drop and a reset
