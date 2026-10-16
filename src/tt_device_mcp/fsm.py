@@ -119,6 +119,20 @@ class FsmRecord:
     dirty: bool = False
 
 
+# Process-wide listeners run on EVERY close to HEALTHY, whichever ServerFsm instance closes (the
+# broker has one; tests swap in fresh ones) — see add_close_listener.
+_close_listeners: "list[Callable[[], None]]" = []
+
+
+def add_close_listener(callback: "Callable[[], None]") -> None:
+    """Run ``callback()`` every time a device episode closes to HEALTHY, for the life of the
+    process. Unlike :meth:`ServerFsm.on_next_close` it is not one-shot: the tenant hold registers
+    here so a parked job re-runs its gate the moment any path lifts the device, not on its next
+    poll. Must be cheap and must not raise into a transition (a raise is logged and dropped)."""
+    if callback not in _close_listeners:
+        _close_listeners.append(callback)
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -507,6 +521,11 @@ class ServerFsm:
                     cb(prev)
                 except Exception:  # noqa: BLE001 - a journal hook must never break a transition
                     _logger.exception("fsm on-close callback failed")
+            for listener in list(_close_listeners):
+                try:
+                    listener()
+                except Exception:  # noqa: BLE001 - a wake hook must never break a transition
+                    _logger.exception("fsm close listener failed")
 
     def on_next_close(self, callback: "Callable[[FsmRecord], None]") -> None:
         """Run ``callback(closed_record)`` once, the next time the device reaches HEALTHY from any
