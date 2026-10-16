@@ -608,7 +608,8 @@ each rung fires only when the gentler one failed or cannot apply.
   pass. An already-running reset in its own scope is still adopted, and the operator's reset tool
   is never held. The same holds the one present-mesh reset a green-fabric dispatch
   failure earns (spec 03 I55): the gate holds and pages, logs the held reset by name and never
-  promises an escalation. Pollers the broker owns (`tt_telemetry_server` as uid 0 in
+  promises an escalation. A clean exit's timed-out eth read (spec 03 I61) does not take that
+  reset under the hold either: it keeps the fabric pass in the same probe. Pollers the broker owns (`tt_telemetry_server` as uid 0 in
   `system.slice`, `tt-metrics-exporter`) are infrastructure, not tenants (`is_tenant`): they never
   block that reset, which stops them for its window and starts them again after it.
 

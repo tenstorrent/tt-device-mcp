@@ -280,3 +280,17 @@ async def test_gate_refused_reset_leaves_the_latch_unspent(monkeypatch, mesh):
     assert srv._dispatch_reset_spent is False, "a gate-refused reset is not spent"
     assert srv.fsm.state is ServerState.RECOVERING
     assert "already ran" not in srv.fsm.record.detail
+
+
+@pytest.mark.asyncio
+async def test_a_clean_exit_dispatch_failure_whose_reset_fails_stays_held(mesh):
+    """The same reset from a clean exit (no episode open yet): the gate opens one before it fires,
+    so a failed post-reset check holds the door instead of leaving the FSM HEALTHY."""
+    srv.fsm.on_readings(srv._healthy_reading())
+    assert srv.fsm.state is ServerState.HEALTHY
+    mesh["reset_heals"] = False
+    await _gate()
+    assert mesh["resets"] == [["tt-smi", "-glx_reset"]]
+    assert mesh["verifies"][-1] is True, "the post-reset check ran the fabric pass"
+    assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
+    assert srv._device_unavailable_for_tenant()

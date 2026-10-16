@@ -765,6 +765,23 @@ job boundary.
   while the device is still held for any reason keeps the job held. The poll stays as the
   governor for holds no release path ends. Queue-resume latency after any hold is about 1 s, not
   up to 60 s, for every fault class.
+- **I61 — A clean exit's timed-out eth read on a present mesh takes the one present-mesh reset.**
+  When a post-job gate after a clean job exit (no dirty mark, no runtime-reported fault, no isolated
+  chip) reads the passive eth heartbeat and the read times out with no verdict (`could not check`:
+  `read timed out`, not a link-drop skip, not a frozen verdict, not a probe crash or exit 77), while
+  host-pci is OK and the snapshot shows every expected chip with ARC healthy on a multi-chip mesh,
+  the gate skips the pre-reset fabric traffic pass and fires the present-mesh rung
+  (`tt-smi -glx_reset`) through the same `STAGE_SMI_RESET` path and the same per-episode latch as
+  I55: one present-mesh reset per hold episode, shared by both. The incident is captured first
+  (`eth_timeout`, with the eth reason), the gate logs one line naming the cause and journals
+  `eth_timeout_mesh_reset`. Only the full post-reset check (fabric traffic and dispatch included)
+  releases the device; a failed one keeps it held and climbs the bounded ladder like I55. A spent
+  latch, an outage hold (spec 04 I28), a reset cooldown, a dirty exit, an off-bus chip, an
+  unhealthy ARC or host-pci keeps today's path (the fabric pass in the same probe). Time to
+  recover for this class drops by one fabric pass (~45-100 s): measured on two production Galaxy
+  hosts since 2026-09-14, 51 of 51 such timeouts were followed by a failed or skipped pass. No wait
+  is added. A rung the gate fires from a clean exit (I55 or I61) first opens the hold episode
+  (marked dirty, `probe_unhealthy`), so the door is shut while the reset is unproven.
 
 ## Interfaces
 
@@ -1365,6 +1382,11 @@ refuses.
 | I63 (a timeout kill and a signal outside a shutdown fail as before) | `tests/test_check_interrupted_by_shutdown.py::test_a_timeout_kill_keeps_the_old_failure_even_during_shutdown`, `tests/test_check_interrupted_by_shutdown.py::test_a_signal_outside_shutdown_keeps_the_old_failure`, `tests/test_check_interrupted_by_shutdown.py::test_fabric_signal_and_timeout_outside_shutdown_still_fail`, `tests/test_check_interrupted_by_shutdown.py::test_a_clean_or_failing_exit_never_asks` |
 | I63 (shutdown detection: systemd state, shutdown target jobs, own unit deactivating, the broker's stop signal) | `tests/test_check_interrupted_by_shutdown.py::test_shutdown_in_progress_reads_systemd`, `tests/test_check_interrupted_by_shutdown.py::test_the_broker_stop_signal_counts_without_systemd` |
 | I65 (a release wakes a held job at once; a wake while still held never dispatches; wakes cannot spin the gate) | `tests/test_tenant_hold_wake.py::test_startup_release_dispatches_a_held_job_within_a_second`, `tests/test_tenant_hold_wake.py::test_a_wake_while_still_held_does_not_dispatch`, `tests/test_tenant_hold_wake.py::test_a_release_from_another_thread_wakes_the_hold` |
+| I55/I61 (a rung fired from a clean exit opens the hold episode first; a failed post-reset check never releases) | `tests/test_dispatch_failure_reset.py::test_a_clean_exit_dispatch_failure_whose_reset_fails_stays_held`, `tests/test_eth_timeout_reset.py::test_the_door_is_shut_while_the_reset_is_unproven` |
+| I61 (a timed-out eth read on a present mesh: no pre-reset fabric pass, one reset, incident first) | `tests/test_eth_timeout_reset.py::test_a_timed_out_eth_read_resets_once_with_no_pre_reset_fabric_pass`, `tests/test_eth_timeout_reset.py::test_the_incident_is_captured_with_the_eth_reason_before_the_reset`, `tests/test_eth_timeout_reset.py::test_the_probe_pass_skips_the_fabric_pass_only_when_asked` |
+| I61 (the full post-reset check gates the release; a failure stays held and climbs) | `tests/test_eth_timeout_reset.py::test_the_full_check_after_the_reset_gates_the_release`, `tests/test_eth_timeout_reset.py::test_a_failed_post_reset_check_stays_held_and_climbs`, `tests/test_eth_timeout_reset.py::test_a_failed_post_reset_check_without_a_host_rung_stays_held` |
+| I61 (one reset per episode, latch shared with I55, re-armed at release) | `tests/test_eth_timeout_reset.py::test_a_second_timeout_in_the_episode_gets_no_second_reset`, `tests/test_eth_timeout_reset.py::test_a_spent_dispatch_reset_leaves_the_timeout_on_todays_path`, `tests/test_eth_timeout_reset.py::test_a_healed_reset_rearms_the_latch_at_the_next_admission` |
+| I61 (every other shape keeps today's path) | `tests/test_eth_timeout_reset.py::test_other_no_verdict_reads_keep_todays_fabric_pass`, `tests/test_eth_timeout_reset.py::test_a_frozen_read_keeps_todays_hold`, `tests/test_eth_timeout_reset.py::test_an_off_bus_chip_or_unhealthy_arc_keeps_todays_path`, `tests/test_eth_timeout_reset.py::test_host_pci_not_ok_keeps_todays_fabric_pass`, `tests/test_eth_timeout_reset.py::test_an_outage_hold_refuses_the_reset_and_keeps_todays_pass`, `tests/test_eth_timeout_reset.py::test_a_dirty_exit_still_runs_the_fabric_pass` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

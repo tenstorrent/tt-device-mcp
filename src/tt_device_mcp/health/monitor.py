@@ -252,6 +252,14 @@ def _verdict_label(ok: Optional[bool]) -> str:
 # below this host's high-water mark (see HealthMonitor.eth_link_drop). update() tells this skip
 # apart from a read that reached no verdict: the drop persists until an operator re-baselines.
 ETH_LINK_DROP_SKIP = "skipped (eth links unverified)"
+# The detail prefix of an eth read that reached no verdict at all (a timeout, a crash, the probe's 77).
+ETH_COULD_NOT_CHECK = "skipped (eth-heartbeat read could not check)"
+
+
+def eth_read_timed_out(detail: str) -> bool:
+    """Whether an eth read's detail is a could-not-check whose cause was the read's own timeout —
+    the stuck read the post-job present-mesh reset answers (spec 03 I61), never a crash or a 77."""
+    return (detail or "").startswith(ETH_COULD_NOT_CHECK) and eth.READ_TIMED_OUT in detail
 
 
 # Every board type tt-smi cannot identify, including the literal it emits when an ARC read fails.
@@ -370,6 +378,7 @@ class HealthMonitor:
         force_fabric: bool = False,
         run_eth: bool = False,
         fabric_stale: bool = True,
+        eth_timeout_reset: bool = False,
         indices: Optional[list] = None,
         expected: Optional[int] = None,
         log: Optional[Callable[[str], None]] = None,
@@ -388,6 +397,12 @@ class HealthMonitor:
         runs that traffic pass only when ``fabric_stale`` (no pass fresher than the caller's
         interval): the drop persists until an operator re-baselines, so running the pass on it
         would charge every clean job ~45-100s. Otherwise the skip is recorded and the pass ends.
+
+        ``eth_timeout_reset`` says the post-job gate can still grant this hold episode's one
+        present-mesh reset (spec 03 I61). A ``run_eth`` read that then TIMED OUT with no verdict, on
+        a pass whose host-pci read is OK and whose snapshot found every chip with a healthy ARC,
+        skips the fabric pass: the gate resets next, and the full check after the reset runs the
+        pass. Any guard that fails keeps the pass.
 
         Mirrors ``Recovery._verify_device``'s gentlest-first short-circuiting (a frozen heartbeat
         or a failed snapshot skips every heavier, more perturbing check below it — the traffic
@@ -534,11 +549,21 @@ class HealthMonitor:
             link_drop_held = (
                 not fabric_asked and eok is None and edetail.startswith(ETH_LINK_DROP_SKIP) and not fabric_stale
             )
+            # Spec 03 I61: a timed-out read on a present mesh goes straight to the gate's one
+            # present-mesh reset. The pass here failed or skipped after every such timeout measured.
+            reset_due = (
+                eth_timeout_reset and not fabric_asked and eok is None and eth_read_timed_out(edetail) and hp_ok is True
+            )
             if link_drop_held and log:
                 log("eth links unverified after a clean exit — a recent fabric pass covers it, not repeating it")
+            elif reset_due and log:
+                log(
+                    "eth-heartbeat read timed out after a clean exit on a present mesh — skipping the "
+                    "pre-reset fabric pass; the full check runs after the present-mesh reset"
+                )
             elif not fabric_asked and eok is None and log:
                 log("eth-heartbeat reached no verdict after a clean exit — running the fabric traffic pass")
-            if eok is not False and (fabric_asked or eok is None) and not link_drop_held:
+            if eok is not False and (fabric_asked or eok is None) and not link_drop_held and not reset_due:
                 self._deps.set_device_op_detail("health check: fabric traffic pass across all links (~45s)")
                 fok, fdetail = await self.verify_fabric_health()
                 if log:
@@ -1425,7 +1450,7 @@ class HealthMonitor:
                 # A crash, which a python that lost ttexalens in place causes: re-resolve next time.
                 # Not on a timeout or the probe's own 77: that python imported and ran the probe.
                 eth.forget_python()
-            return None, f"skipped (eth-heartbeat read could not check): {reason}"
+            return None, f"{ETH_COULD_NOT_CHECK}: {reason}"
         if ok is False:
             return False, f"a frozen active-eth core ({dt:.0f}s): {reason}"
         return True, f"all active-eth cores advancing ({dt:.0f}s)"
