@@ -6960,7 +6960,8 @@ async def test_gate_all_off_bus_holds_loudly_never_reboots(monkeypatch, tmp_path
 @pytest.mark.asyncio
 async def test_gate_all_off_bus_power_cycles_when_opted_in(monkeypatch, tmp_path, clear_job_state):
     """The other branch: with the chassis power cycle opted in, an all-off-bus mesh skips the reboot
-    (which cannot re-enumerate it) and fires the cold rung directly."""
+    (which cannot re-enumerate it) and fires the cold rung directly, with no reset first (spec 04
+    I37). Exactly once: the pending host action stops the gate's own host rung this pass (I34)."""
     reboots = _reach_reboot_rung(monkeypatch, tmp_path, n_present=32)
     srv.isolated_chips = set()
     srv.device_pci_map = {}
@@ -6972,14 +6973,24 @@ async def test_gate_all_off_bus_power_cycles_when_opted_in(monkeypatch, tmp_path
 
     async def fake_power_cycle(log, reason):
         power_cycles["n"] += 1
+        # As _fire_recovery_escalation does once the request is recorded: the host is going down.
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", srv.time.monotonic())
 
     monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
+    resets = {"n": 0}
+
+    async def fake_reset(argv, log, *a, **k):
+        resets["n"] += 1
+        return 0, ""
+
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_with_quiesce", fake_reset)
 
     await srv._device_health_gate(None, phase="post-job", run_fabric=False)
 
     assert (
         power_cycles["n"] == 1 and reboots["n"] == 0
     ), "an all-off-bus mesh with the cold rung opted in must power-cycle, not reboot"
+    assert resets["n"] == 0, "no mesh reset runs before the cycle on an all-off bus"
 
 
 @pytest.mark.asyncio

@@ -359,8 +359,8 @@ each rung fires only when the gentler one failed or cannot apply.
   chip back but not verifying, or any chip still off, runs the ladder. The rescan writes to the PCI
   subsystem, so it waits while a tenant holds the device (or the holder scan is incomplete); the
   capture only reads and never waits. Each runs once per episode, before that pass's ladder.
-  Everything else gets no prelude and keeps the ladder: the whole bus off (it has its own route
-  straight to the cold rung), no banked map, a chip the map does not place, fewer than 4 off on
+  Everything else gets no prelude: the whole bus off (class C, power-cycled at once with no ladder,
+  I37), and, keeping the ladder, no banked map, a chip the map does not place, fewer than 4 off on
   every tray, or an off set first seen after a reset — one fired by the ladder this episode, any
   `reset_with_quiesce` since the mesh was last released (the reset tool and the HTTP reset
   included), one still in flight, or a live reset scope (a reset can itself turn a 1-chip drop

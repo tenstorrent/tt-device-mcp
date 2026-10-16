@@ -490,7 +490,7 @@ async def test_the_gate_ladders_last_chance_sweep(mesh, monkeypatch, galaxy_tray
     evidence, released = sweep_verdict
     fsm_dirty(srv, "gate/post-job: mesh failed the verify after the reset", why="job_killed")
     g, host = _arm_last_chance_sweep(monkeypatch, mesh, evidence)
-    out = await g._fire_gate_rung("post-job", stage, ["0"], 32, lambda m: None, ev=None, beats={})
+    out = await g._fire_gate_rung("post-job", stage, ["0"], 32, lambda m: None, ev=None, beats={str(i): 100 for i in range(1, 32)})
     assert out == galaxy.OUTCOME_RECOVERED, "the gate stops climbing this pass: no further reset or host rung"
     srv._fold_rung_outcome(out, lambda m: None)
     assert host == [], "no reboot or power cycle on a mesh whose verify passed enum+ARC"

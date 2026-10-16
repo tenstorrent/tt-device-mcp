@@ -533,10 +533,11 @@ async def test_capture_off_runs_the_ladder_alone(rig, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_the_whole_bus_off_keeps_its_own_route(rig):
+    """No prelude and no ladder: every chip off the bus is class C, power-cycled at once (spec 04 I37)."""
     g = rig["g"]
     rig["beats"] = {}
     await g.escalate("offbus", [], 32, lambda m: None)
-    assert rig["order"] == ["offbus_ladder"] and g._td["path"] == "PARTIAL"
+    assert rig["order"] == ["power_cycle"] and g._td["path"] == "PARTIAL"
 
 
 # ---- the capture --------------------------------------------------------------------------------
