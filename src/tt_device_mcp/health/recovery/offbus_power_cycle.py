@@ -23,6 +23,10 @@ It applies too when this episode's per-tray reset walk fired and did not recover
 more chips off the bus: the ladder then holds instead of trying the below-floor mesh reset, and the
 command fires ``TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC`` (default 300 s) after the walk failed.
 
+A below-floor drop that takes a whole UBB tray off the bus goes to the command at once, with no grace
+(:func:`note_whole_tray_down`): a single-tray re-power of it took the other trays off the bus, the
+below-floor mesh reset inverts it, and no single reset has brought such a tray back.
+
 Every phase goes to the fsync'd health journal, and each attempt is written to a small state file in
 the health dir before the command runs, so a broker killed mid-cycle (the cycle itself) still counts
 the attempt against the rate limit.
@@ -321,6 +325,30 @@ def tray_walk_failed_age_sec(episode: str, now: Optional[datetime] = None) -> Op
 
 def tray_walk_detail(episode: str) -> str:
     return _pending.get("tray_walk_detail", "") if _pending.get("episode") == episode else ""
+
+
+def note_whole_tray_down(episode: str, detail: str, now: Optional[datetime] = None) -> None:
+    """A whole UBB tray is off the bus in this episode's below-floor drop: no tray re-power and no mesh
+    reset is tried for it, so the ladder counts as run and the command fires with no grace (idempotent)."""
+    if not episode:
+        return
+    _track(episode)
+    _pending["ladder_ran"] = True
+    if _pending.get("whole_tray_at") is None:
+        _pending["whole_tray_at"] = now or datetime.now()
+        _pending["whole_tray_detail"] = detail[-200:]
+        health_event("offbus_gated_hold", phase="whole_tray_down", held_since=episode, detail=detail[-200:])
+
+
+def whole_tray_down_age_sec(episode: str, now: Optional[datetime] = None) -> Optional[float]:
+    """Seconds since this episode's drop was found to hold a whole tray, or None when it has not."""
+    if not episode or _pending.get("episode") != episode or _pending.get("whole_tray_at") is None:
+        return None
+    return ((now or datetime.now()) - _pending["whole_tray_at"]).total_seconds()
+
+
+def whole_tray_detail(episode: str) -> str:
+    return _pending.get("whole_tray_detail", "") if _pending.get("episode") == episode else ""
 
 
 def note_ladder_ran(episode: str) -> None:
