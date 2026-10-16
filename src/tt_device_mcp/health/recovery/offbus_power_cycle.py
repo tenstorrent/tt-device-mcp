@@ -360,7 +360,7 @@ def note_hold_handoff(
     the hold to an operator with a deadline, once per episode (spec 04 I33). The manual-recovery check
     runs once here, so the page says whether an operator is already on it. ``latched`` names an operator
     gate (the I25 latch) that keeps the gate shut past the deadline. ``cause`` replaces the page's
-    default reason (no power-cycle command) when another path hands the hold off (spec 04 I34)."""
+    default reason (no power-cycle command) when another path hands the hold off (spec 04 I36)."""
     if not episode:
         return
     _track(episode)

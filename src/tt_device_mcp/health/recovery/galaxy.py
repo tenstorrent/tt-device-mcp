@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import alert, metrics, privileges
-from tt_device_mcp.device_holders import is_tenant
+from tt_device_mcp.device_holders import holder_comm, is_tenant, username_for_uid
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count
@@ -1449,11 +1449,44 @@ class GalaxyRecovery(Recovery):
         ``force`` (the hold-deadline backstop) still waives an UNREADABLE scan — that guard protects
         against blindness, not against a known tenant — but never waives a real one, fd-held or
         queue-known: resetting out from under a live job is the thing the guard is for."""
+        return self._tenant_blocker(scan, force=force) is not None
+
+    def _tenant_blocker(self, scan, *, force: bool = False) -> Optional[dict]:
+        """Which check of :meth:`_tenant_active` blocks, as health_event fields, or None when none does:
+        ``blocker`` is ``job_running``, ``tenant`` (with the first tenant's pid, uid, user and comm) or
+        ``scan_incomplete`` (with the scan's source and gaps). A deferral that names its blocker tells a
+        real tenant apart from a scan that merely could not see."""
         if self.deps.job_running():
-            return True
-        if any(is_tenant(h) for h in scan.holders):
-            return True
-        return not force and not scan.complete
+            return {"blocker": "job_running"}
+        tenants = [h for h in scan.holders if is_tenant(h)]
+        if tenants:
+            h = tenants[0]
+            return {
+                "blocker": "tenant",
+                "pid": h.pid,
+                "uid": h.uid,
+                "user": username_for_uid(h.uid),
+                "comm": holder_comm(h.pid),
+                "tenants": len(tenants),
+            }
+        if not force and not scan.complete:
+            return {"blocker": "scan_incomplete", "source": scan.source, "gaps": list(scan.gaps)}
+        return None
+
+    @staticmethod
+    def _describe_blocker(blocker: dict) -> str:
+        """The log-line form of a :meth:`_tenant_blocker` result."""
+        kind = blocker["blocker"]
+        if kind == "job_running":
+            return "a broker job is running"
+        if kind == "tenant":
+            more = f" (+{blocker['tenants'] - 1} more)" if blocker["tenants"] > 1 else ""
+            return (
+                f"tenant pid {blocker['pid']} uid {blocker['uid']} ({blocker['user']}) "
+                f"comm {blocker['comm']} holds the device{more}"
+            )
+        gaps = "; ".join(blocker["gaps"]) or "no detail"
+        return f"holder scan incomplete (source={blocker['source']}: {gaps})"
 
     def _note_bmc_ipmi_failure(self, exc: BaseException) -> None:
         """A tray re-power the BMC did not take over IPMI starts this hold episode's hand-off clock to the
@@ -1858,9 +1891,10 @@ class GalaxyRecovery(Recovery):
         if await asyncio.to_thread(self.mechanism.scope_active):
             return False
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        tenant_active = self._tenant_active(scan, force=force)
-        if tenant_active:
-            log("hold past the ceiling but a tenant holds the device — holding; escalates once idle")
+        blocker = self._tenant_blocker(scan, force=force)
+        if blocker is not None:
+            log(f"hold past the ceiling but {self._describe_blocker(blocker)} — holding; escalates once idle")
+            health_event("stuck_hold_deferred", mesh="present", forced=force, **blocker)
             return False
         log(
             f"present-mesh hold stood past the {_present_mesh_reset_grace_sec()}s grace with no tenant — "
@@ -1891,7 +1925,7 @@ class GalaxyRecovery(Recovery):
         if force and self.mechanism.rung_failed_unchanged(hold_since, "mesh_reset", ids_before):
             # The deadline watchdog's window: this episode's mesh reset already failed on this same mesh.
             # The grace-cadence retries above stay (a present mesh's retry is cheap before the ceiling),
-            # but a forced window takes the next stronger rung, never the same reset (spec 04 I34).
+            # but a forced window takes the next stronger rung, never the same reset (spec 04 I36).
             await self._climb_past_failed_rung(expected, ids_before, hold_since, log)
             return True
         stamp = self.mechanism.last_reset_monotonic
@@ -1911,7 +1945,7 @@ class GalaxyRecovery(Recovery):
         # galaxy reset that dropped this present mesh to all-0xFFFFFFFF — a mass drop a host
         # reboot/power cycle recovers and self-heal never will. Before the ceiling the climb defers
         # the host rungs (journaled) and the grace cadence retries the reset; at the ceiling the
-        # climb hands the mesh to the gate's host rung, or to an operator when there is none (I34).
+        # climb hands the mesh to the gate's host rung, or to an operator when there is none (I36).
         await self._climb_or_hand_off(expected, off_bus_before, hold_since, log)
         return True
 
@@ -2197,9 +2231,10 @@ class GalaxyRecovery(Recovery):
         if await asyncio.to_thread(self.mechanism.scope_active):
             return False
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        tenant_active = self._tenant_active(scan, force=force)
-        if tenant_active:
-            log("off-bus hold past the ceiling but a tenant holds the device — holding; escalates once idle")
+        blocker = self._tenant_blocker(scan, force=force)
+        if blocker is not None:
+            log(f"off-bus hold past the ceiling but {self._describe_blocker(blocker)} — holding; escalates once idle")
+            health_event("stuck_hold_deferred", mesh="offbus", forced=force, **blocker)
             return False
         if not force and self.mechanism.cooling():
             log(
@@ -2250,7 +2285,7 @@ class GalaxyRecovery(Recovery):
             # chips off the bus now. Re-running it repeats a known failure (one Galaxy host fired six
             # identical 263 s resets in one hold, one per window): take the next stronger rung, whose
             # last-chance sweep still runs every reset once before a power cycle (I22), or hand the hold
-            # to an operator when no host rung is available (spec 04 I34).
+            # to an operator when no host rung is available (spec 04 I36).
             await self._climb_past_failed_rung(expected, ids_now, hold_since, log)
             return True
         isolated_chips = self.deps.isolated_chips()
@@ -2419,14 +2454,14 @@ class GalaxyRecovery(Recovery):
         # A reset that did not recover must climb, never sit: a galaxy reset that dropped this drop to an
         # all-off-bus mesh is the mass drop a host reboot/power cycle recovers and self-heal never will.
         # This episode's one reset is spent and an idle box has no next-job gate to run another, so hand
-        # the mesh straight to the host rung, or to an operator when there is none (I34).
+        # the mesh straight to the host rung, or to an operator when there is none (I36).
         await self._climb_or_hand_off(expected, off_bus_before, hold_since, log)
         return True
 
     async def _note_mesh_reset_failed(
         self, recovered: Optional[bool], stamp: float, hold_since: str, ids_before: Optional[set], expected: int
     ) -> None:
-        """Record a mesh reset that RAN and failed (spec 04 I34). A reset the host gate or an outage
+        """Record a mesh reset that RAN and failed (spec 04 I36). A reset the host gate or an outage
         hold refused never stamps the reset clock: it did not happen, so it is not a failed rung."""
         if recovered is False and self.mechanism.last_reset_monotonic != stamp:
             ids_after = await self._offbus_ids_now(expected)
@@ -2434,7 +2469,7 @@ class GalaxyRecovery(Recovery):
 
     async def _climb_past_failed_rung(self, expected: int, ids_now: set, hold_since: str, log) -> None:
         """Skip a reset that already failed in this hold episode on the same off-bus set and take the
-        next stronger rung (spec 04 I34)."""
+        next stronger rung (spec 04 I36)."""
         off_bus = len(ids_now)
         log(
             f"{off_bus}/{expected} off-bus and this hold's mesh reset already failed on exactly these chips — "
@@ -2446,7 +2481,7 @@ class GalaxyRecovery(Recovery):
     async def _climb_or_hand_off(self, expected: int, off_bus: Optional[int], hold_since: str, log) -> None:
         """Climb a failed (or skipped) reset to the host rung. With no host rung available the hold goes
         to an operator, once per episode, and no further reset fires on it while its off-bus set stays
-        the same (spec 04 I34, I33)."""
+        the same (spec 04 I36, I33)."""
         if await self._climb_to_host_recovery_after_failed_reset(expected, off_bus, log) != NO_HOST_RUNG:
             return
         offbus_power_cycle.note_hold_handoff(

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""A mesh reset that failed with the off-bus set unchanged is not repeated in its hold (spec 04 I34).
+"""A mesh reset that failed with the off-bus set unchanged is not repeated in its hold (spec 04 I36).
 
 One Galaxy host ran six identical mesh resets in one hold, each exiting 1 after a 263 s overrun, one
 per forced hold-deadline window. These pin the bound: the next window climbs to the next stronger rung
