@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
 """The hold reason and /health say where a held device's escalation stands (spec 03 I59).
 
 A below-floor off-bus hold opens with "held for self-heal, not reset", and the hold watchdog then
