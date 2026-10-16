@@ -3893,7 +3893,7 @@ async def _attempt_idle_relift() -> None:
             if await asyncio.to_thread(recovery_mechanism.scope_active):
                 return
 
-            async def _escalate(rung: str) -> bool:
+            async def _escalate(rung: str, *, measured_fault: bool = False) -> bool:
                 """Run one rung and fold its outcome into ``fsm``. Returns True iff something
                 other than WAITING came back — the caller's cue to stop, the same way a direct
                 ``!= OUTCOME_WAITING`` check did before ``fsm`` needed telling too.
@@ -3902,9 +3902,10 @@ async def _attempt_idle_relift() -> None:
                 reason the gate's rungs are: the idle ladders apply on every platform (reset argv
                 is re-derived per platform inside _reset_and_verify_device), while a per-target
                 host's own escalate() has no ladder and reports WAITING forever — an idle hold
-                there would outlive every ceiling with no rung ever attempted."""
+                there would outlive every ceiling with no rung ever attempted. ``measured_fault``
+                lets the present ladder reset without the grace (spec 03 I56)."""
                 _void_fabric_ok(f"idle relift: {rung}")
-                outcome = await galaxy_recovery.escalate(rung, indices, expected, _log)
+                outcome = await galaxy_recovery.escalate(rung, indices, expected, _log, measured_fault=measured_fault)
                 if outcome == OUTCOME_TERMINAL and _fabric_77_only_hold():
                     # The rung ran and the fabric still only 77s: no fault was measured, so the episode
                     # is not the terminal DOWN no idle path re-checks. It stays held and RECOVERING, and
@@ -4007,6 +4008,11 @@ async def _attempt_idle_relift() -> None:
             else:
                 eok, edetail = await health_monitor.verify_eth_heartbeat()
                 if fsm.record.why == "eth_frozen":
+                    # The hold's last fabric pass MEASURED a failure (a post-job gate's rc 1, not a 77
+                    # skip) and no eth read says the cores are frozen: the fault is proven, so the
+                    # present-mesh reset runs on this relift, not after the grace (I56). A positive
+                    # frozen read keeps the grace — that is the eth wedge it was sized for.
+                    measured = health_monitor.last_fabric_ok is False and eok is not False
                     # Held for a frozen eth core, which enum+ARC cannot see. Lift ONLY on a positively-
                     # advancing heartbeat. `None` is "could not tell" (reader unconfigured, or a read a
                     # frozen core can itself hang), `False` is still frozen — both hold. The gate never
@@ -4017,7 +4023,7 @@ async def _attempt_idle_relift() -> None:
                         # unreadable — a present-mesh wedge no read the broker owns can clear. Left here
                         # the hold stands forever on an idle box (the 8h strand). Past the ceiling, with
                         # no tenant, escalate to the gate's galaxy reset, which re-inits every eth core.
-                        if await _escalate("present"):
+                        if await _escalate("present", measured_fault=measured):
                             return
                         _log(
                             f"held for a frozen eth core but the heartbeat is not confirmed advancing "
@@ -4032,8 +4038,9 @@ async def _attempt_idle_relift() -> None:
                         # real traffic verdict was FAIL and that no pass has cleared since. Same
                         # last-verdict guard as the off-bus branch below, but here the mesh is fully
                         # present, so this is exactly the state the present-mesh galaxy reset cures:
-                        # ride its guards (grace, pacing, tenant-free) instead of standing forever.
-                        if await _escalate("present"):
+                        # ride its guards (pacing, tenant-free; no grace on a measured fault, I56)
+                        # instead of standing forever.
+                        if await _escalate("present", measured_fault=measured):
                             return
                         _log(
                             "eth heartbeat advancing but the last fabric verdict was UNHEALTHY — "
@@ -4041,6 +4048,12 @@ async def _attempt_idle_relift() -> None:
                             "present-mesh reset past the grace"
                         )
                         return
+                    # An episode tagged eth_frozen that recorded chips off the bus also owes the
+                    # full gate, fabric included, before it lifts (spec 03 I52).
+                    if _offbus_hold_open() and should_privsep():
+                        gate_ok, evidence = await _offbus_return_full_gate(expected, _log)
+                        if not gate_ok:
+                            return
                 else:
                     # Held for an off-bus drop below the reset floor: the chip LEFT THE BUS, which
                     # enum+ARC+sysfs see directly, so their agreement that it is back and answering is
@@ -4099,6 +4112,19 @@ async def _attempt_idle_relift() -> None:
 # Why classes a chip leaving the bus puts on the device: the gate's off-bus hold, and the sampler's
 # dead-chip mark (_isolate_dead_chips). Both are re-checked once every chip is back (spec 03 I52).
 OFFBUS_RECHECK_WHYS = frozenset({"off_bus", "heartbeat"})
+
+
+def _offbus_hold_open() -> bool:
+    """The open episode was placed for a chip off the bus, so only the full gate, fabric included,
+    lifts it (spec 03 I52). Besides OFFBUS_RECHECK_WHYS, an ``eth_frozen`` hold whose detail names
+    chips off the bus counts: a gate that saw a runtime-reported fault used to tag a drop that way,
+    and such an episode can still be open, carried across the restart that deploys this."""
+    if fsm.state is ServerState.HEALTHY:
+        return False
+    record = fsm.record
+    return record.why in OFFBUS_RECHECK_WHYS or (record.why == "eth_frozen" and "off the bus" in record.detail)
+
+
 # Monotonic time of the last DOWN off-bus re-check; paced like the relift (SELFHEAL_RELIFT_INTERVAL_SEC).
 _down_offbus_recheck_monotonic: float = 0.0
 
@@ -4127,7 +4153,7 @@ def _down_offbus_recheck_armed() -> bool:
     """A DOWN episode placed for a chip off the bus, with every expected device node back. DOWN is
     the terminal rung and runs no further reset, but chips that came back (a tray re-powered by an
     operator, a driver rescan) leave nothing for it to wait on: the full gate decides (spec 03 I52)."""
-    if fsm.state is not ServerState.DOWN or fsm.record.why not in OFFBUS_RECHECK_WHYS:
+    if fsm.state is not ServerState.DOWN or not _offbus_hold_open():
         return False
     if not should_privsep():
         return False  # a per-user daemon has no fabric validator: its full gate could never pass
@@ -5057,6 +5083,10 @@ async def device_health_gate(
         dirty = fsm.state is not ServerState.HEALTHY and fsm.record.dirty
         dirty_reason = fsm.record.detail or fsm.record.why
         dirty_job = fsm.record.job
+        # A hold placed for a chip off the bus lifts only on the full gate, fabric included (spec 03
+        # I52): the chip came back through a reset of some kind, broker-issued or not (no cached
+        # BDF, an external tray re-power, a driver rescan), and only a broker reset owes FABRIC_DEBT.
+        offbus_hold = _offbus_hold_open() and should_privsep()
 
         # A job that ended badly is a reason to LOOK HARD at the device, not a verdict
         # about it. A timeout or a kill says something about the job; the silicon it ran
@@ -5316,6 +5346,21 @@ async def device_health_gate(
         )
         stage = galaxy_recovery.next_stage(ev)
 
+        if stage == RELEASE and offbus_hold and fabric_ok is not True:
+            # Every chip is back and enum+ARC read healthy, but no fabric pass cleared the return
+            # (the pre-job gate never runs one: 03 I12). Keep the door shut as a clean off-bus hold,
+            # which the idle relift lifts on its full gate on the next idle window (03 I52).
+            _log(
+                "every chip back on the bus and enum+ARC healthy, but no fabric pass has cleared the "
+                "return — holding; the idle relift lifts it on the full gate, fabric included"
+            )
+            health_event("offbus_release_deferred", phase=phase, why=fsm.record.why, fabric_ok=fabric_ok)
+            _hold_device_unverified(
+                f"gate/{phase}: every chip back on the bus, enum+ARC healthy — held for the full gate "
+                f"(fabric included) after an off-bus drop"
+            )
+            return
+
         if stage == RELEASE:
             galaxy_recovery.tray_down_episode_end()  # spec 04 I19: a released mesh closes the onset latch
             # Every check the host can run says the mesh is fine. Resetting anyway —
@@ -5574,11 +5619,13 @@ async def device_health_gate(
             # visibly to those reads, so they suffice. But off_bus==0 means nothing left the bus —
             # the hold is a fabric/eth wedge, every chip present and ARC-ticking, which the relift's
             # enum+ARC pass is blind to (it never runs the traffic probe); so is a runtime-reported
-            # fault. Both must wait for an advancing eth heartbeat to lift, never enum+ARC alone, or
-            # the relift admits the next tenant onto the still-wedged mesh. With the reader
+            # fault on a present mesh. It must wait for an advancing eth heartbeat to lift, never
+            # enum+ARC alone, or the relift admits the next tenant onto the still-wedged mesh. A drop
+            # (off_bus>0) stays an off-bus hold even with a reported fault: its lift runs the full
+            # gate, fabric included (03 I52), which sees any wedge the fault named. With the reader
             # unconfigured the relift never lifts it, so it clears on the next startup gate (a
             # broker restart re-runs the fabric pass) — refusing tenants until then, the safe side.
-            needs_eth = bool(device_fault_reported) or ev.off_bus == 0
+            needs_eth = ev.off_bus == 0
             # Retire any runtime-reported fault into the hold: left set it would survive self-heal
             # and make a later enum+ARC-healthy gate skip the clear and reset an already-recovered
             # mesh. The door still holds on the fsm episode until a gate verifies recovery.
