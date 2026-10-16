@@ -3474,6 +3474,26 @@ def _fabric_77_only_hold() -> bool:
     )
 
 
+def _fold_rung_outcome(outcome: str, log) -> None:
+    """Fold one ladder rung's outcome into ``fsm`` — the one place the gate, the idle relift and the
+    hold escalation do it, so none of them can lift a hold the release funnel placed.
+
+    A RECOVERED rung has already settled through ``_clear_device_dirty(verified=True)``; while a reset
+    still owes a fabric pass (spec 04 I32) that funnel refused and held the device fabric-unverified,
+    and folding RECOVERED here would reopen the door over it (the last-chance sweep did this on a
+    verify whose fabric pass could not run). The hold stays, and the fabric relift owns it. A TERMINAL
+    rung on a hold whose only cause is a fabric pass that could not run measured no fault: the episode
+    stays RECOVERING for the relift's backoff (03 I48) and its bound (03 I40), never the DOWN no idle
+    path re-checks."""
+    if outcome == OUTCOME_RECOVERED and _post_reset_debt():
+        log("the rung's verify passed, but a reset still owes a passing fabric pass — held fabric-unverified")
+        return
+    if outcome == OUTCOME_TERMINAL and _fabric_77_only_hold():
+        log("the rung left the fabric unverified (77), not failed — holding; re-checks continue")
+        return
+    fsm.on_outcome(outcome)
+
+
 def _fabric_77_eth_drop() -> str:
     """The eth link-count drop that makes a fabric 77 a fault, or "".
 
@@ -3914,13 +3934,7 @@ async def _attempt_idle_relift() -> None:
                 lets the present ladder reset without the grace (spec 03 I56)."""
                 _void_fabric_ok(f"idle relift: {rung}")
                 outcome = await galaxy_recovery.escalate(rung, indices, expected, _log, measured_fault=measured_fault)
-                if outcome == OUTCOME_TERMINAL and _fabric_77_only_hold():
-                    # The rung ran and the fabric still only 77s: no fault was measured, so the episode
-                    # is not the terminal DOWN no idle path re-checks. It stays held and RECOVERING, and
-                    # the relift keeps re-running the pass on its backoff (I48).
-                    _log("the rung left the fabric unverified (77), not failed — holding; re-checks continue")
-                else:
-                    fsm.on_outcome(outcome)
+                _fold_rung_outcome(outcome, _log)
                 return outcome != OUTCOME_WAITING
 
             if generic:
@@ -5609,7 +5623,7 @@ async def device_health_gate(
             outcome = await galaxy_recovery.escalate(
                 f"gate/{phase}", indices, expected, _log, stage=rung, ev=ev, beats=beats
             )
-            fsm.on_outcome(outcome)
+            _fold_rung_outcome(outcome, _log)
             return outcome == OUTCOME_RECOVERED
 
         if stage == DEFER and gone_queued:
@@ -6303,7 +6317,7 @@ async def _force_escalate_stuck_hold() -> None:
         outcome = await galaxy_recovery.escalate(
             "offbus-forced" if off_bus > 0 else "present-forced", indices, expected, log
         )
-        fsm.on_outcome(outcome)
+        _fold_rung_outcome(outcome, log)
 
 
 def _hold_without_reset(cause: str, expected: int, log) -> None:

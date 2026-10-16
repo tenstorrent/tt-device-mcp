@@ -1741,12 +1741,19 @@ class GalaxyRecovery(Recovery):
                 return None
             return False
         via = "last-chance-reset-sweep" if swept else "settle-before-host-rung"
-        log(f"the mesh verified after the {via} — no reboot or power cycle needed")
-        health_event("gate", phase=gate_phase, healthy=True, recovered_via=via, evidence=evidence)
         self.deps.clear_device_reported_fault(f"gate/{gate_phase}: mesh recovered before the host rung ({via})")
-        self.deps.clear_device_dirty(
+        released = self.deps.clear_device_dirty(
             verified=True, why=f"gate/{gate_phase}: mesh recovered before the host rung ({via})"
         )
+        if released is False:
+            # enum+ARC passed but the resets still owe a passing fabric pass (spec 04 I32): the funnel
+            # held the device fabric-unverified. No host rung on a verify that passed; the fabric relift
+            # owns the hold, bounded by 03 I40/I48.
+            log(f"the mesh passed enum+ARC after the {via}, but no fabric pass has passed since — held")
+            health_event("host_rung_sweep_unverified", context=context or gate_phase, via=via, evidence=evidence)
+            return True
+        log(f"the mesh verified after the {via} — no reboot or power cycle needed")
+        health_event("gate", phase=gate_phase, healthy=True, recovered_via=via, evidence=evidence)
         return True
 
     async def _fire_tray_down_no_window(
