@@ -850,6 +850,30 @@ each rung fires only when the gentler one failed or cannot apply.
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
 
+- **I68 — Each power cycle is confirmed by the boot id; one the host did not act on is re-fired once,
+  then backs off.** A power-cycle command may exit 0 once the cycle is accepted and still not cycle
+  the host. Before the fire the broker writes `power_cycle_confirm.json` in the health dir (fsynced,
+  so it survives a broker restart): the boot id, the fault class, the reason, the attempt count and
+  the confirm deadline, restamped at the hand-off. A fire that never launched restores the record it
+  replaced; a timed-out one keeps it. The next boot's first broker start (and any power-cycle ask)
+  settles it: a new boot id confirms the cycle (`power_cycle_confirmed`) and clears the record, and
+  the startup gate's full check, fabric included, then gates release as on every boot (03 I4). The
+  same boot id `TT_DEVICE_MCP_POWER_CYCLE_CONFIRM_SEC` after the hand-off (default 900 s, capped at
+  3600 s; garbage or non-positive reads as the default) marks it unconfirmed: logged at error level
+  (`POWER-CYCLE UNCONFIRMED`), journaled as `power_cycle_unconfirmed` with `host_at_risk` and paged.
+  An unconfirmed attempt caused no boot, so it counts as no cycle: this boot's power-cycle ledger
+  records are retracted, and neither they nor the external cycler's stamp for it anchor the I65
+  cooldown, the per-boot cap or the I9 backstop. The first unconfirmed attempt is re-fired at once;
+  each later one waits 1 h, 2 h, then 4 h at most. Until the deadline (or the backoff's end) the
+  governor denies the power cycle with a stated time, `/health` carries `power_cycle_confirm` (state,
+  fault class, attempts, unconfirmed count, `next_deadline`) inside the hold block, and the
+  hold-deadline watchdog asks again at that time. The device stays held throughout; nothing is
+  released without a passing full check. Time to recover, per class: before, a class A/C direct cycle
+  that did not act was asked again only when the I65 cooldown or the per-boot cap ended (30 min, and
+  each unconfirmed record grew the streak to 30, 30, 60, 120, 240 min), and the off-bus gated path
+  (I27) waited its 6 h interval. After, the re-fire comes at max(confirm bound, host-action pending
+  bound) = 15 min, then 1 h, 2 h and 4 h; a cycle that reboots the host is unaffected.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -1358,6 +1382,11 @@ sees a silent fabric pass.
 | I19 the whole bus off keeps its own route | `tests/test_tray_down_prelude.py::test_the_whole_bus_off_keeps_its_own_route` |
 | I19 the capture is read-only, CPLD reads (every configured tray, the PDB) come only from config, BMC reads get the long timeout, it meets its deadline, fsyncs, and is written even with no incident bundle | `tests/test_tray_down_prelude.py::test_the_allow_list_refuses_anything_but_the_read_shapes`, `::test_cpld_reads_come_only_from_config_and_cover_every_configured_tray`, `::test_bmc_reads_get_the_long_timeout_inside_the_deadline`, `::test_the_capture_meets_its_deadline_survives_a_missing_tool_and_fsyncs_the_bundle`, `::test_a_missing_incident_bundle_still_gets_the_bmc_reads_written` |
 | I19 lspci targets the upstream bridge of every off chip, by sysfs parent or secondary bus, plus the endpoint while present | `tests/test_tray_down_prelude.py::test_lspci_targets_the_bridge_above_each_off_chip`, `::test_the_capture_reads_the_bridge_of_every_off_chip` |
+| I68 an rc-0 cycle with the boot id unchanged is re-fired exactly once after the bound, then backs off | `tests/test_power_cycle_confirm.py::test_an_rc0_cycle_that_does_not_reboot_is_re_fired_once_after_the_bound`, `::test_the_backoff_and_the_bound`, `::test_the_confirm_bound_env` |
+| I68 a new boot id confirms the cycle, clears the record and re-fires nothing; the boot's first broker start settles it | `tests/test_power_cycle_confirm.py::test_a_new_boot_id_confirms_the_cycle_and_clears_the_record`, `::test_the_first_broker_start_of_a_boot_settles_the_record` |
+| I68 an unconfirmed cycle is on /health, its next step has a stated time the watchdog keeps, and the device stays held | `tests/test_power_cycle_confirm.py::test_an_unconfirmed_cycle_shows_on_health_and_its_next_step_is_bounded` |
+| I68 an unconfirmed attempt starts no I65 cooldown (ledger or external stamp) | `tests/test_power_cycle_confirm.py::test_an_unconfirmed_cycle_starts_no_cooldown` |
+| I68 the record survives a broker restart; a fire that never launched leaves none, a timed-out one keeps it | `tests/test_power_cycle_confirm.py::test_the_record_survives_a_broker_restart`, `::test_a_launch_failure_drops_the_record_and_a_timeout_keeps_it` |
 | Tray rung: plan/walk semantics, fabric-gated clear, decline cases | `tests/test_device_safety.py::test_ubb_reset_plan_maps_a_clean_whole_tray_drop_to_its_bitmap`, `tests/test_device_safety.py::test_ubb_tray_walk_plan_walks_only_the_affected_trays`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_stops_as_soon_as_the_mesh_is_healthy`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_does_not_clear_a_hold_on_an_unverified_fabric`, `tests/test_device_safety.py::test_ubb_tray_reset_declines_a_fully_off_bus_mesh_it_is_the_cold_rung`, `tests/test_device_safety.py::test_maybe_emit_ubb_reset_required_names_the_exact_bmc_command_on_a_tray_down`, `tests/test_device_safety.py::test_the_tray_reset_rung_is_armed_by_default` |
 | Tray rung walk: rescan and settle after each re-power, pollers quiesced across it, stops on a regression | `tests/test_device_safety.py::test_ubb_tray_reset_walk_rescans_after_each_tray_before_the_verify`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_stops_when_a_step_takes_a_healthy_chip_off_the_bus`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_re_powers_every_affected_tray`, `tests/test_device_safety.py::test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_affected_tray_stays_off` |
 | Tray fire argv/handshake (tt-smi compat, off-bus chip skipped) | `tests/test_ubb_reset_launch.py::test_fire_ubb_reset_imports_a_symbol_the_installed_tt_smi_defines`, `tests/test_ubb_reset_launch.py::test_fire_ubb_reset_pulses_the_tray_when_a_chip_is_already_off_the_bus`, `tests/test_ubb_reset_launch.py::test_fire_ubb_reset_falls_back_to_the_chip_reset_class_on_older_tt_smi` |

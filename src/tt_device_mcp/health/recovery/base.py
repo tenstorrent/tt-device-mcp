@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
+import logging
 import math
 import os
 import subprocess
@@ -25,6 +26,8 @@ from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors.heartbeat import returned_chips
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
+
+_logger = logging.getLogger("tt-device-mcp")
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
 # A daemon without systemd uses the local lock below for the same restart-adoption contract.
@@ -168,6 +171,39 @@ def host_action_pending_sec() -> float:
     if not 0 < v < float("inf"):
         return HOST_ACTION_PENDING_DEFAULT_SEC
     return min(v, HOST_ACTION_PENDING_MAX_SEC)
+
+
+# Spec 04 I68: a power-cycle command may exit 0 once the cycle is accepted and fail after that, so
+# the broker confirms each cycle by the boot id. The request is kept in this state-dir file (it
+# survives a broker restart); if the boot id has not changed this long after the hand-off, the cycle
+# reads as unconfirmed: it is logged at error level, it counts as no cycle for the cooldown, and it
+# is re-fired once at once. Each later unconfirmed attempt waits a stated backoff (1 h, 2 h, then
+# 4 h) before the next. The device stays held throughout. TT_DEVICE_MCP_POWER_CYCLE_CONFIRM_SEC
+# overrides the bound; garbage or non-positive reads as the default, and it is capped.
+POWER_CYCLE_CONFIRM_FILE = "power_cycle_confirm.json"
+POWER_CYCLE_CONFIRM_DEFAULT_SEC = 900.0
+POWER_CYCLE_CONFIRM_MAX_SEC = 3600.0
+POWER_CYCLE_UNCONFIRMED_BACKOFF_BASE_SEC = 3600
+
+
+def power_cycle_confirm_sec() -> float:
+    """How long after a power cycle's hand-off the boot id must have changed. Read per call."""
+    raw = os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_CONFIRM_SEC", "").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return POWER_CYCLE_CONFIRM_DEFAULT_SEC
+    if not 0 < v < float("inf"):
+        return POWER_CYCLE_CONFIRM_DEFAULT_SEC
+    return min(v, POWER_CYCLE_CONFIRM_MAX_SEC)
+
+
+def power_cycle_unconfirmed_backoff_sec(unconfirmed: int) -> int:
+    """The wait before the next power cycle after ``unconfirmed`` cycles in a row that the host did not
+    act on (spec 04 I68): none after the first (the one re-fire), then 1 h, 2 h, and 4 h at most."""
+    if unconfirmed < 2:
+        return 0
+    return min(POWER_CYCLE_UNCONFIRMED_BACKOFF_BASE_SEC * 2 ** (unconfirmed - 2), POWER_CYCLE_BACKOFF_CAP_SEC)
 
 
 class HostActionTimedOut(RuntimeError):
@@ -466,6 +502,9 @@ class RecoveryMechanism:
         # its record is on disk, cleared if it fails to launch; read by the hold watchdog, which
         # starts no device reset while one is pending (see host_action_pending).
         self.host_action_requested: Optional[tuple[str, float]] = None
+        # The fault class the next power cycle is for (spec 04 I68's confirm record and /health); set
+        # by the rung that asks for it, read once by the fire.
+        self.power_cycle_fault_class = ""
         # The request a device reset was last refused for (one log line per request, spec 04 I34).
         self._host_action_reset_refused: Optional[tuple[str, float]] = None
 
@@ -1168,6 +1207,14 @@ class RecoveryMechanism:
         Returns ``(allowed, reason)``. Fails CLOSED: any doubt about the durable record denies."""
         if tenant_active:
             return False, "a tenant holds the device; a reboot would destroy a running job"
+        if action == "power-cycle":
+            # Spec 04 I68: a cycle asked for this boot waits its confirm bound; one the host did not
+            # act on is retracted here (it caused no boot), so the cooldown below never counts it.
+            # Its own clock read: ``now_epoch`` below is taken after the ledger read, as before.
+            at = time.time() if now_epoch is None else now_epoch
+            wait = self._power_cycle_confirm_wait(self.settle_power_cycle_confirm(now_epoch=at), at)
+            if wait is not None:
+                return self._deny_power_cycle(wait)
         ledger = self.read_auto_recovery_ledger()
         if ledger is None:
             return False, "auto-recovery ledger unreadable; refusing to reboot without its rate-limit record"
@@ -1331,6 +1378,9 @@ class RecoveryMechanism:
             )
             anchors.append((btime, f"host boot after the broker {broker_last[1]}" if by_broker else "host boot"))
         external = _last_external_power_cycle(now_epoch)
+        unconfirmed_since = self._power_cycle_unconfirmed_since()
+        if external is not None and unconfirmed_since is not None and external[0] >= unconfirmed_since:
+            external = None  # the external cycler's stamp for a cycle that caused no boot (spec 04 I68)
         if external is not None and not (verified_at is not None and verified_at > external[0]):
             anchors.append(external)
         if not anchors:
@@ -1535,7 +1585,14 @@ class RecoveryMechanism:
     def power_cycle_healed(self, rec: dict) -> bool:
         """Whether power cycle ``rec`` (``boot_id``, ``at_epoch``) was followed, on a later boot, by
         the verified-healthy release on record: it healed the box, so a fault after it is a new
-        episode (spec 04 I9). No stamp, no boot id or an unreadable field reads False."""
+        episode (spec 04 I9). No stamp, no boot id or an unreadable field reads False. A cycle asked
+        for on this boot whose confirm bound has passed caused no boot, so it counts as no cycle and
+        reads True too (spec 04 I68)."""
+        boot_id = self._current_boot_id()
+        at = _epoch(rec.get("at_epoch"))
+        if boot_id and rec.get("boot_id") == boot_id and at is not None:
+            if time.time() - at >= power_cycle_confirm_sec():
+                return True
         verified = self.last_verified_release()
         return bool(verified) and _verified_since({**rec, "action": "power-cycle"}, verified, time.time())
 
@@ -1557,6 +1614,233 @@ class RecoveryMechanism:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(rec, default=str))
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    # -- spec 04 I68: each power cycle confirmed by the boot id --------------------------------------
+
+    def read_power_cycle_confirm(self) -> Optional[dict]:
+        """The pending power-cycle confirm record, or None (none, or unreadable)."""
+        try:
+            rec = json.loads((health_dir() / POWER_CYCLE_CONFIRM_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        return rec if isinstance(rec, dict) else None
+
+    def _write_power_cycle_confirm(self, rec: Optional[dict]) -> None:
+        """Write ``rec`` atomically and fsync it, or remove the file for None. Never raises: a lost
+        record only falls back to the I65 cooldown, which still bounds the next ask."""
+        path = health_dir() / POWER_CYCLE_CONFIRM_FILE
+        try:
+            if rec is None:
+                path.unlink(missing_ok=True)
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(rec, default=str))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _note_power_cycle_request(self, fault_class: str, reason: str, now_epoch: float) -> Optional[dict]:
+        """Record, before the fire, that a power cycle is asked for on this boot; returns the record it
+        replaced (restored if the fire does not launch). Without a boot id nothing can be confirmed,
+        so nothing is written and the I65 cooldown alone bounds the next ask."""
+        prev = self.read_power_cycle_confirm()
+        boot_id = self._current_boot_id()
+        if not boot_id:
+            return prev
+        rec = dict(prev) if prev and prev.get("boot_id") == boot_id else {"boot_id": boot_id, "unconfirmed": 0}
+        rec.setdefault("first_epoch", now_epoch)
+        rec["attempts"] = int(rec.get("attempts") or 0) + 1
+        rec["requests"] = (list(rec.get("requests") or []) + [now_epoch])[-8:]
+        rec.update(
+            state="awaiting_reboot",
+            fault_class=fault_class,
+            reason=reason,
+            hold_since=self._device_hold_episode_since() or "",
+            next_attempt_epoch=None,
+        )
+        self._stamp_power_cycle_request(rec, now_epoch)
+        return prev
+
+    def _stamp_power_cycle_request(self, rec: dict, now_epoch: float) -> None:
+        bound = power_cycle_confirm_sec()
+        rec.update(
+            requested_at_epoch=now_epoch,
+            requested_at=_local_time(now_epoch),
+            deadline_epoch=now_epoch + bound,
+            bound_sec=int(bound),
+        )
+        self._write_power_cycle_confirm(rec)
+        # The hold watchdog asks again at the bound, so an unconfirmed cycle is re-fired on time.
+        self.power_cycle_retry = (now_epoch + bound, self._device_hold_episode_since() or "")
+
+    def settle_power_cycle_confirm(self, *, now_epoch: Optional[float] = None) -> Optional[dict]:
+        """Settle the confirm record against the boot id now; returns it while it still applies to
+        this boot, else None. A new boot id confirms the cycle and clears the record (the startup full
+        health check, fabric included, then gates release as on every boot). The same boot id past
+        the bound marks it unconfirmed: logged at error level and paged, this boot's power-cycle
+        ledger records are retracted (they caused no boot, so they start no cooldown, cap or
+        backstop), and the next attempt is due after :func:`power_cycle_unconfirmed_backoff_sec`.
+        A stamp later than the bound allows (a clock that disagrees) is clamped to it."""
+        rec = self.read_power_cycle_confirm()
+        if rec is None:
+            return None
+        boot_id = self._current_boot_id()
+        if not boot_id:
+            return None
+        if rec.get("boot_id") != boot_id:
+            health_event(
+                "power_cycle_confirmed",
+                fault_class=rec.get("fault_class", ""),
+                attempts=rec.get("attempts"),
+                requested_at=rec.get("requested_at", ""),
+                boot_id=boot_id,
+            )
+            self._write_power_cycle_confirm(None)
+            return None
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        bound = power_cycle_confirm_sec()
+        deadline = _epoch(rec.get("deadline_epoch"))
+        if deadline is None or deadline > now_epoch + bound:
+            rec["deadline_epoch"] = deadline = now_epoch + bound
+            self._write_power_cycle_confirm(rec)
+        if rec.get("state") == "unconfirmed":
+            nxt = _epoch(rec.get("next_attempt_epoch"))
+            if nxt is None or nxt > now_epoch + POWER_CYCLE_BACKOFF_CAP_SEC:
+                rec["next_attempt_epoch"] = now_epoch + POWER_CYCLE_BACKOFF_CAP_SEC
+                self._write_power_cycle_confirm(rec)
+            return rec
+        if now_epoch < deadline:
+            return rec
+        unconfirmed = int(rec.get("unconfirmed") or 0) + 1
+        backoff = power_cycle_unconfirmed_backoff_sec(unconfirmed)
+        rec.update(state="unconfirmed", unconfirmed=unconfirmed, next_attempt_epoch=now_epoch + backoff)
+        self._write_power_cycle_confirm(rec)
+        first = _epoch(rec.get("first_epoch"))
+        self._retract_power_cycles_this_boot(boot_id, first if first is not None else 0.0)
+        what = (
+            f"power cycle requested {rec.get('requested_at', '?')} ({rec.get('fault_class') or 'unknown class'}) "
+            f"did not reboot the host within {int(bound)}s (boot id unchanged; attempt {rec.get('attempts')}, "
+            f"{unconfirmed} unconfirmed); "
+            + (
+                "re-firing it once now"
+                if backoff == 0
+                else f"next attempt at {_local_time(now_epoch + backoff)} ({backoff}s backoff)"
+            )
+            + "; the device stays held"
+        )
+        _logger.error(f"POWER-CYCLE UNCONFIRMED: {what}")
+        event = health_event(
+            "power_cycle_unconfirmed",
+            fault_class=rec.get("fault_class", ""),
+            attempts=rec.get("attempts"),
+            unconfirmed=unconfirmed,
+            requested_at=rec.get("requested_at", ""),
+            next_attempt_epoch=now_epoch + backoff,
+            bound_sec=int(bound),
+            host_at_risk=True,
+        )
+        alert.send_alert(event)
+        return rec
+
+    def _power_cycle_confirm_wait(self, rec: Optional[dict], now_epoch: float) -> Optional[dict]:
+        """The bounded wait (the :meth:`_deny_power_cycle` state) a settled confirm record imposes now,
+        or None when the next cycle may be asked for."""
+        if rec is None:
+            return None
+        last = _epoch(rec.get("requested_at_epoch")) or now_epoch
+        if rec.get("state") == "unconfirmed":
+            until = _epoch(rec.get("next_attempt_epoch")) or now_epoch
+            if now_epoch >= until:
+                return None
+            return {
+                "until": until,
+                "last": last,
+                "cause": "power cycle unconfirmed",
+                "interval_sec": int(until - now_epoch) + 1,
+                "why": (
+                    f"{rec.get('unconfirmed')} power cycle(s) in a row did not reboot the host; next attempt "
+                    f"at {_local_time(until)}, {int(until - now_epoch) + 1}s more (spec 04 I68 backoff)"
+                ),
+            }
+        until = _epoch(rec.get("deadline_epoch")) or now_epoch
+        return {
+            "until": until,
+            "last": last,
+            "cause": "power cycle awaiting reboot",
+            "interval_sec": int(power_cycle_confirm_sec()),
+            "why": (
+                f"a power cycle was requested {_local_time(last)} and the host has not rebooted yet; it is "
+                f"confirmed or re-fired at {_local_time(until)}, {int(until - now_epoch) + 1}s more"
+            ),
+        }
+
+    def _power_cycle_unconfirmed_since(self) -> Optional[float]:
+        """When this boot's first unconfirmed power cycle was asked for, or None."""
+        rec = self.read_power_cycle_confirm()
+        boot_id = self._current_boot_id()
+        if not rec or not boot_id or rec.get("boot_id") != boot_id or rec.get("state") != "unconfirmed":
+            return None
+        return _epoch(rec.get("first_epoch"))
+
+    def power_cycle_confirm_status(self) -> Optional[dict]:
+        """What /health shows of the confirm record on this boot (read-only), or None."""
+        rec = self.read_power_cycle_confirm()
+        boot_id = self._current_boot_id()
+        if not rec or not boot_id or rec.get("boot_id") != boot_id:
+            return None
+        unconfirmed = rec.get("state") == "unconfirmed"
+        nxt = _epoch(rec.get("next_attempt_epoch" if unconfirmed else "deadline_epoch"))
+        return {
+            "state": rec.get("state", ""),
+            "fault_class": rec.get("fault_class", ""),
+            "attempts": rec.get("attempts"),
+            "unconfirmed": rec.get("unconfirmed"),
+            "requested_at": rec.get("requested_at", ""),
+            "next_deadline": datetime.fromtimestamp(nxt).isoformat(timespec="seconds") if nxt is not None else "",
+            "next_deadline_epoch": nxt,
+            "bound_sec": rec.get("bound_sec"),
+        }
+
+    def _retract_power_cycles_this_boot(self, boot_id: str, since: float) -> None:
+        """Drop this boot's power-cycle ledger records stamped at or after ``since``: they provably
+        caused no boot. Atomic; a failed rewrite leaves them (the I65 cooldown then bounds the ask)."""
+        path = health_dir() / AUTO_RECOVERY_LEDGER
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return
+        kept = []
+        for ln in lines:
+            try:
+                rec = json.loads(ln)
+            except ValueError:
+                kept.append(ln)
+                continue
+            at = _epoch(rec.get("at_epoch")) if isinstance(rec, dict) else None
+            if (
+                isinstance(rec, dict)
+                and rec.get("action") == "power-cycle"
+                and rec.get("boot_id") == boot_id
+                and at is not None
+                and at >= since - 1
+            ):
+                continue
+            kept.append(ln)
+        if len(kept) == len(lines):
+            return
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("".join(f"{ln}\n" for ln in kept))
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, path)
         except OSError:
             pass
@@ -1594,6 +1878,10 @@ class RecoveryMechanism:
             return
         # From here the host is going down: no device reset may start under it.
         self.host_action_requested = (action, time.monotonic())
+        cycle = action == "power-cycle"
+        if cycle:
+            fault_class, self.power_cycle_fault_class = self.power_cycle_fault_class or label, ""
+            prev_confirm = self._note_power_cycle_request(fault_class, reason, time.time())
         self._write_action_log(row_owner, f"{label} — {reason}", 0.0, action, None)
         health_event(f"auto_{ev}_request", reason=reason)
         log(f"{label.upper()}: {detail} ({reason}); opted in + within limits — requesting it now")
@@ -1605,6 +1893,8 @@ class RecoveryMechanism:
                 # its ledger entry must not spend the retry the still-wedged box needs.
                 self.retract_last_auto_recovery(action)
                 self.host_action_requested = None
+                if cycle:
+                    self._write_power_cycle_confirm(prev_confirm)
                 raise
             except Exception as exc:  # noqa: BLE001 - the hook never gates recovery
                 hook = {"ran": False, "detail": f"failed: {exc!r}"}
@@ -1634,6 +1924,11 @@ class RecoveryMechanism:
                 self.host_action_requested = (action, time.monotonic())
             else:
                 self.host_action_requested = None
+                if cycle:
+                    # Never launched: it is not a cycle to confirm. A timed-out one may still act, so
+                    # its record stays and is confirmed or re-fired at the bound (spec 04 I68).
+                    self._write_power_cycle_confirm(prev_confirm)
+                    self.power_cycle_retry = None
             log(
                 f"{label.upper()} FAILED TO LAUNCH: {exc!r}; retracted the rate-limit entry so the rung "
                 f"can retry once the cause is fixed"
@@ -1649,4 +1944,9 @@ class RecoveryMechanism:
             return
         # The pending window counts from the hand-off, not from before a slow pre-fire hook.
         self.host_action_requested = (action, time.monotonic())
+        if cycle:
+            # So does the confirm bound (spec 04 I68).
+            rec = self.read_power_cycle_confirm()
+            if rec is not None and rec.get("boot_id") == self._current_boot_id():
+                self._stamp_power_cycle_request(rec, time.time())
         metrics.stage_fired(stage, "ok")

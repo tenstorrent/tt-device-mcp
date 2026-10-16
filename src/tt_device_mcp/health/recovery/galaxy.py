@@ -1304,6 +1304,7 @@ class GalaxyRecovery(Recovery):
             host_at_risk=True,
         )
         log(f"{what}: no further reset heals this class — power-cycling the host now (spec 04 I37)")
+        self.mechanism.power_cycle_fault_class = fault_class
         await self.deps.auto_power_cycle_host(log, f"{what}; no further reset heals this class")
         return True
 
