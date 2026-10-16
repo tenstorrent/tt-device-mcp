@@ -149,14 +149,18 @@ def preflight_output_dirs(
     """Every reason the job's tt-metal output dirs would refuse the job's uid; empty when fine.
 
     A missing dir whose ancestor already failed is not reported again: one root-owned
-    ``generated/`` is one problem, not seven.
+    ``generated/`` is one problem, not seven. A missing workspace is not checked here: the job
+    cannot start in it, and that fails the job with its own error.
     """
+    logs_dir = tt_metal_logs_dir(workspace, job_env, inherited_env)
+    if logs_dir == Path(workspace) and not logs_dir.is_dir():
+        return []
     gids = groups_for_uid(uid)
     if gids is None:
         gids = (os.getegid(),) if uid == os.geteuid() else ()
     problems: list[str] = []
     failed: list[Path] = []
-    for path in output_dirs(tt_metal_logs_dir(workspace, job_env, inherited_env)):
+    for path in output_dirs(logs_dir):
         if any(path.is_relative_to(bad) for bad in failed) and not path.exists():
             continue
         problem = check_dir(path, uid, gids)

@@ -131,6 +131,15 @@ def test_the_dirs_are_generated_and_its_subdirs_under_the_workspace_by_default(t
         assert tmp_path / "generated" / sub in dirs
 
 
+def test_a_missing_workspace_is_left_to_the_job_not_called_an_output_dir_problem(tmp_path):
+    # The job cannot cd there and fails with that error; "generated/ cannot be created under
+    # <the nearest existing ancestor>" would send the reader after the wrong thing.
+    assert pf.preflight_output_dirs(str(tmp_path / "no-such-ws"), {}, None, 4242) == []
+    # an explicit TT_METAL_LOGS_PATH is still checked when the workspace is missing
+    logs = tmp_path / "logs"
+    assert pf.preflight_output_dirs(str(tmp_path / "no-such-ws"), {pf.LOGS_PATH_ENV: str(logs)}, None, 0) == []
+
+
 def test_tt_metal_logs_path_overrides_the_workspace(tmp_path):
     ws, logs = tmp_path / "ws", tmp_path / "logs"
     # the job's own env wins over the env it inherits
