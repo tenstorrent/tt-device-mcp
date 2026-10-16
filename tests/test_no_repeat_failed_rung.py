@@ -501,9 +501,7 @@ def _record_cycle_order(monkeypatch, counters):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("power_cycle", [True, False], ids=["power-cycle", "no-host-rung"])
 @pytest.mark.parametrize("off_bus", [1, 2, 4], ids=["b1-one-chip", "b1-two-chips", "b2-four-chips"])
-async def test_e3_offbus_classes_reset_once_then_take_the_next_rung(
-    monkeypatch, clear_job_state, off_bus, power_cycle
-):
+async def test_e3_offbus_classes_reset_once_then_take_the_next_rung(monkeypatch, clear_job_state, off_bus, power_cycle):
     """B1 (one or two chips off) and B2 (four), with and without a power cycle, over six forced
     windows: the mesh reset runs first and once on the unchanged set, the next rung follows in that
     same window (the power cycle, or one operator hand-off), and no later window repeats the reset.
