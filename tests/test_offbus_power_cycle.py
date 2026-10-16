@@ -19,6 +19,7 @@ import pytest
 
 from tests.conftest import patch_recovery
 from tests.test_device_safety import _arm_offbus_stuck_hold
+from tests.test_ladder_v2 import _ev
 from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -462,7 +463,7 @@ async def test_the_mechanism_limits_still_apply(monkeypatch, tmp_path, clear_job
 async def test_an_unwritable_attempt_record_never_fires(monkeypatch, tmp_path, clear_job_state):
     hold_since, rec = _gated(monkeypatch, tmp_path)
 
-    def no_disk(state, now, episode, reason):
+    def no_disk(state, now, episode, reason, boot_id=""):
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(opc, "record_attempt", no_disk)
@@ -973,15 +974,106 @@ async def test_a_regressed_tray_walk_hands_off_to_the_power_cycle_not_the_mesh_r
 @pytest.mark.asyncio
 async def test_by_default_the_one_tray_drop_is_never_walked(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     """The same 10-14 drop (chips 0-7, all on tray 1, below the floor) without the single-tray opt-in:
-    the walk declines, so tray 1 is never re-powered and 16-31 cannot follow it off the bus. The device
-    stays held; nothing releases it without the full check, fabric included."""
+    a whole tray is off the bus, so tray 1 is never re-powered (16-31 cannot follow it off) and the hold
+    goes straight to the power cycle, with no grace. The device stays held; nothing releases it without
+    the full check, fabric included."""
     hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path, drops=range(16, 32))
     monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
     assert state["fired"] == [], "no single-tray re-power for a below-floor drop on one tray"
     assert state["off"] == set(range(8)), "the other trays stayed on the bus"
-    assert "ubb_reset_declined_single_tray" in [k for k, _ in rec["events"]]
+    kinds = [k for k, _ in rec["events"]]
+    assert "ubb_reset_declined_whole_tray" in kinds and "ubb_reset_begin" not in kinds
+    assert len(rec["fires"]) == 1 and "whole tray is off the bus" in rec["fires"][0]["reason"]
+    assert counters["resets"] == 0, "no mesh reset either"
     assert all(state["verifies"]), "every verify ran the fabric pass"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
+
+
+async def _gate_tray_rung(off):
+    """One post-job gate pass at the tray rung (escalate's STAGE_UBB_TRAY) with ``off`` off the bus and
+    no bridge window recorded, so the hold is GENERIC and takes the per-tray walk path."""
+    beats = {str(i): 100 for i in range(32) if i not in off}
+    return await srv.galaxy_recovery.escalate(
+        "gate/post-job",
+        sorted(str(c) for c in off),
+        EXPECTED,
+        lambda m: None,
+        stage=galaxy.STAGE_UBB_TRAY,
+        ev=_ev(off_bus=len(off)),
+        beats=beats,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_post_job_gate_hands_a_whole_tray_drop_to_the_power_cycle(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """The 10-15 replay through the post-job gate's tray rung: all of tray 1 (0-7) and four chips of
+    tray 4 off, below the floor. The gate used to walk trays 1 and 4 and the tray 1 re-power took 20
+    more chips off. Now a whole tray off the bus is never re-powered: the gate names it, asks for the
+    power cycle at once (no grace) and keeps the device held. Fails on base, which re-powers tray 1."""
+    hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path, drops=range(8, 28))
+    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
+    state["off"] = set(range(8)) | {24, 25, 28, 29}
+    out = await _gate_tray_rung(state["off"])
+    assert out == galaxy.OUTCOME_WAITING
+    assert state["fired"] == [], "no tray re-power for a whole-tray drop"
+    kinds = [k for k, _ in rec["events"]]
+    assert "ubb_reset_declined_whole_tray" in kinds and "ubb_reset_begin" not in kinds
+    assert len(rec["fires"]) == 1 and "whole tray is off the bus" in rec["fires"][0]["reason"]
+    assert counters["resets"] == 0 and counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+    # A second pass does not ask again inside the rate limit, and still never re-powers.
+    await _gate_tray_rung(state["off"])
+    assert len(rec["fires"]) == 1 and state["fired"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_partial_drop_below_the_floor_still_walks_and_releases_only_after_the_full_check(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """Partial drops keep the ladder: four chips each of trays 1 and 4 off, no whole tray, no regression
+    recorded. The gate walks the two trays, and the device is released only after a verify that ran
+    the fabric pass and passed."""
+    hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path)
+    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
+    state["off"] = {0, 1, 2, 3, 24, 25, 26, 27}
+    galaxy._fire_ubb_reset = lambda bitmap, ids: (state["fired"].append(bitmap), state["off"].clear())
+
+    async def verify(expected, log, run_fabric=True, **_):
+        state["verifies"].append(run_fabric)
+        return (not state["off"]) and run_fabric, {"snapshot": {"ok": not state["off"]}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    out = await _gate_tray_rung(set(state["off"]))
+    assert state["fired"], "a partial drop still walks its trays"
+    assert "ubb_reset_declined_whole_tray" not in [k for k, _ in rec["events"]] and rec["fires"] == []
+    assert out == galaxy.OUTCOME_RECOVERED
+    assert state["verifies"] and state["verifies"][-1] is True, "released only after a full verify, fabric included"
+
+
+@pytest.mark.asyncio
+async def test_a_regression_recorded_before_a_reboot_keeps_the_walk_off(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """10-15: the tray re-power regressed the mesh, the host was power-cycled, and the next post-job gate
+    re-armed the rung and did it again. The latch now outlives the boot: after a new boot id and a
+    broker restart (memory cleared) the same partial drop is never re-powered and the device stays
+    held. Fails on base, where a new boot id re-arms the rung."""
+    hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path)
+    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
+    monkeypatch.setattr(pcie_guard, "health_event", lambda kind, **f: rec["events"].append((kind, f)))
+    monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-before")
+    pcie_guard.disable_tray_rung(tray=[1], new_off=[str(c) for c in range(8, 28)])
+    monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-after")
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)  # a restarted broker reads the file
+    state["off"] = {0, 1, 2, 3, 24, 25, 26, 27}
+    out = await _gate_tray_rung(set(state["off"]))
+    assert out == galaxy.OUTCOME_WAITING
+    assert state["fired"] == [], "no tray re-power after a recorded regression, even on a new boot"
+    kinds = [k for k, _ in rec["events"]]
+    assert "ubb_tray_rung_disabled_restored" in kinds and "ubb_tray_rung_rearmed" not in kinds
+    assert "ubb_reset_begin" not in kinds
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
 
 

@@ -5126,18 +5126,21 @@ def test_governor_blocks_a_reboot_inside_the_min_interval(monkeypatch, tmp_path)
     assert "boot-loop guard" in why
 
 
-def test_governor_blocks_after_the_per_boot_cap(monkeypatch, tmp_path):
-    """Even past the min interval, a single boot may escalate only so many times. The cap is
-    counted against the running boot's id, and the record already sits at that id."""
+def test_governor_per_boot_cap_ends_with_the_interval(monkeypatch, tmp_path):
+    """The per-boot cap is counted against the running boot's id, and the record already sits at
+    that id — a request that never took the box down. It holds within the action's interval and
+    names its end; past it the request is asked again, never held for the rest of the boot (spec 04
+    I65: every denial ends at a stated time)."""
     _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-A")
     monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MIN_INTERVAL_SEC", 3600)
     monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MAX_PER_BOOT", 1)
     srv.recovery_mechanism.record_auto_recovery("reboot", "wedge", now_epoch=1000.0)
-    # now_epoch far enough past the interval that only the per-boot cap can block it
-    allowed, why = srv.recovery_mechanism.auto_recovery_allowed("reboot", tenant_active=False, now_epoch=1000.0 + 4000)
+    allowed, why = srv.recovery_mechanism.auto_recovery_allowed("reboot", tenant_active=False, now_epoch=1060.0)
     assert allowed is False
-    assert "this boot" in why
+    assert "until" in why
+    allowed, why = srv.recovery_mechanism.auto_recovery_allowed("reboot", tenant_active=False, now_epoch=1000.0 + 4000)
+    assert allowed is True, why
 
 
 def test_governor_allows_when_opted_in_idle_and_within_limits(monkeypatch, tmp_path):
@@ -5297,11 +5300,10 @@ def test_ipmitool_present_leaves_the_cold_rung_armed(monkeypatch):
     assert srv._auto_power_cycle_enabled() is True
 
 
-def test_power_cycle_escalates_past_a_recent_reboot(monkeypatch, tmp_path):
-    """The escalation the shared interval must NOT block: a warm reboot fired minutes ago and did
-    not clear a whole-bus wedge, so the broker must be free to escalate to the power cycle that
-    will — without waiting out the full loop-guard interval. The guard is per severity: a weaker
-    prior rung does not gate a stronger one."""
+def test_power_cycle_after_a_recent_reboot_waits_out_the_cooldown(monkeypatch, tmp_path):
+    """A warm reboot is a boot: the power cycle's cooldown counts from it (spec 04 I65, the cycle or
+    boot of any cause), so a cycle right after it is held to a stated time and fires at that time —
+    never a boot loop, never an open-ended hold."""
     d = _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-B")
     monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MIN_INTERVAL_SEC", 3600)
@@ -5310,12 +5312,16 @@ def test_power_cycle_escalates_past_a_recent_reboot(monkeypatch, tmp_path):
         '{"action": "reboot", "boot_id": "boot-A", "at_epoch": 1000.0}\n'
     )
     allowed, why = srv.recovery_mechanism.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=1060.0)
+    assert allowed is False
+    assert "cooldown until" in why and "broker reboot" in why
+    until = 1000.0 + recovery_base.POWER_CYCLE_MIN_INTERVAL_SEC
+    allowed, why = srv.recovery_mechanism.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=until)
     assert allowed is True, why
 
 
 def test_power_cycle_does_not_escalate_past_a_recent_power_cycle(monkeypatch, tmp_path):
     """Each rung's own loop guard holds: a power cycle that just fired and did not clear the mesh
-    will not clear it now, so a second one inside the interval is a loop, not a recovery."""
+    will not clear it now, so a second one inside the cooldown is a loop, not a recovery."""
     d = _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-B")
     monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MIN_INTERVAL_SEC", 3600)
@@ -5324,7 +5330,7 @@ def test_power_cycle_does_not_escalate_past_a_recent_power_cycle(monkeypatch, tm
     )
     allowed, why = srv.recovery_mechanism.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=1060.0)
     assert allowed is False
-    assert "boot-loop guard" in why
+    assert "cooldown until" in why and "broker power-cycle" in why
 
 
 def test_reboot_does_not_de_escalate_past_a_recent_power_cycle(monkeypatch, tmp_path):
@@ -11585,13 +11591,14 @@ async def test_a_whole_tray_below_the_floor_is_not_re_powered_alone_but_two_tray
     monkeypatch, clear_job_state, galaxy_trays
 ):
     """The guard is keyed on one affected tray below the floor, whatever the count on it: a whole tray
-    (8 off) is declined too. A below-floor drop across two trays still walks both (spec 04 I25)."""
+    (8 off) is declined too, as a whole-tray drop that goes to the power cycle. A below-floor partial
+    drop across two trays still walks both (spec 04 I25)."""
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
     tray3 = set(range(24, 32))
     fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(tray3)])
     out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(tray3), 8, 32, lambda m: None)
-    assert out is None and fired == []
-    assert "ubb_reset_declined_single_tray" in [n for n, _ in events]
+    assert out is False and fired == []
+    assert "ubb_reset_declined_whole_tray" in [n for n, _ in events]
 
     fired, events = _arm_ubb_walk(monkeypatch, [_beats_without({3, 24})])
     out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without({3, 24}), 2, 32, lambda m: None)
@@ -11755,8 +11762,8 @@ async def test_the_walk_rescans_only_the_re_powered_trays_root_ports(monkeypatch
     monkeypatch.setattr(galaxy, "UBB_WALK_RESCAN_SETTLE_SEC", 0)
     monkeypatch.setattr(pcie_guard, "rescan_trays", lambda trays, log: order.append(("tray", trays)) or ["rp"])
     monkeypatch.setattr(galaxy, "_pci_rescan", lambda: order.append(("global",)))
-    off = set(range(24, 32)) | {3}  # trays 1 and 3
-    await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(off), 9, 32, lambda m: None)
+    off = set(range(24, 28)) | {3}  # trays 1 and 3, neither wholly off (a whole tray is never walked)
+    await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(off), 5, 32, lambda m: None)
     assert order == [("tray", [1]), ("tray", [3])], "each tray's own ports, never the whole bus"
 
 
