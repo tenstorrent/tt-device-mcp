@@ -18,8 +18,7 @@ import pytest
 from tests.conftest import fsm_dirty, patch_health_event
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
-from tt_device_mcp.health.recovery import galaxy
-from tt_device_mcp.health.recovery import host_rung_latch
+from tt_device_mcp.health.recovery import galaxy, host_rung_latch
 
 REASON = "tray-down-no-window: every reset type ran back-to-back and the mesh did not verify"
 SINCE = datetime(2026, 10, 15, 11, 50, 0)
