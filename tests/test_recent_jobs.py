@@ -833,7 +833,8 @@ def test_a_hold_the_last_broker_died_holding_gets_a_row(monkeypatch, tmp_path, c
     assert "restart" in rows[0]["command"]
     assert rows[0]["status"] == "ended"
     assert 280 < float(rows[0]["runtime"].rstrip("s")) < 320, "the hold's duration was lost"
-    assert "device_released" in written, "the episode was left open to be re-reported forever"
+    assert "device_hold_orphan_closed" in written, "the episode was left open to be re-reported forever"
+    assert "device_released" not in written, "released on broker start, before any check had run"
     # Stamped at its END, like the normal release row: filed at the hold's start it sorts above
     # the whole recovery it closes, and every rung below reads as "after the hold ended".
     from datetime import datetime as _dt

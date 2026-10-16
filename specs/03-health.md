@@ -129,6 +129,12 @@ job boundary.
   (`TT_DEVICE_MCP_ETH_FREEZE_HOLD=0`) AND the mass-drop floor's
   (`TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC=0`, spec 04).
   A read that hangs past the caller's bound is frozen-core evidence (False), not a skip.
+  A built-in reader killed on its own (tighter) timeout is waited on until it has exited, up to
+  `ETH_REAP_SEC` (2s) and at most half the slack under the caller's bound, so the wait never turns
+  that skip into the caller's frozen verdict (2s at 60s/45s, 0.5s at the 10s post-job bound). A
+  holder scan run right after it then does not find the dying reader still listed by the driver
+  and defer an escalation as an incomplete scan (spec 04 I7). The override runs at the caller's
+  own bound, so it has no slack and does not wait.
 - **I17 — A fabric pass that ran but reached no verdict (exit 77) holds fabric-unverified and is
   never a reset trigger.** enum+ARC cannot see a wedged eth core, so "could not check" must not
   read as fit, and 77 is not a fault a reset fixes. Only a real healthy fabric verdict lifts it.
@@ -1165,11 +1171,29 @@ refuses.
   a hold still open whose episode `boot_merge` carried over gets its release re-armed and no second
   hold row (whatever fault it has turned into); a hold still open under a fresh episode is closed
   first (`prior_why: closed on broker start`), then the fresh hold is written. A carried-over
-  fault episode with no open hold gets neither row. `held_s` is the hold's own length, measured
-  from its `startup_fabric_hold` row on every path that closes it. A stale hold closed on broker
+  fault episode with no open hold (a broker power cycle, a host crash) gets no hold row, since its
+  own rows opened it, but the path that lifts it writes one `startup_fabric_released` with
+  `carried_over: true` and `episode_since` (the episode's `since`; `held_s` runs from it): without
+  it the episode's end shows only as a verified `device_dirty_cleared`, and a reader timing
+  recovery runs it into the next episode. A restart before the lift re-arms it with no second row,
+  and a startup check that fails (fabric included) writes none: the device stays held. Otherwise
+  `held_s` is the hold's own length, measured from its `startup_fabric_hold` row on every path
+  that closes it. A stale hold closed on broker
   start runs to the first row after it that shows the door reopened (a verified
-  `device_dirty_cleared`, or a `device_released` that is not this bookkeeping), and to the restart
-  only when the journal shows none.
+  `device_dirty_cleared`, or a `device_released` that is not an older broker's
+  `why: closed on broker start` bookkeeping), and to the restart only when the journal shows none.
+- **A carried-over `device_held` is released only after the startup gate.** A `device_held` the
+  last broker died holding is closed on start by a `device_hold_orphan_closed` row (`reason`,
+  `held_s`), never by `device_released`: readers time recovery from `device_released`, and nothing
+  has checked the device yet. Its `device_released` (`held_since`, `held_s` from the original hold,
+  `prior_why`) is written once the device next reaches HEALTHY, which after a start needs the full
+  check with a passing fabric pass (04 I32), run after the hugepages are ready (I33). A restart
+  before then carries the same hold over with no second close row. A tenant refused first opens
+  this broker's own `device_held` with `carried_from` naming the original hold, and that hold's
+  release is the only one. A carried-over fault episode (an `eth_frozen` persisted across a reboot)
+  writes no `startup_fabric_hold`, but the door is still shut: the FSM is not HEALTHY, so every
+  tenant is refused, and `held: false` on `/health` during the startup gate only means the gate's
+  own broker op is in flight.
 - **The fabric pass is billed to nobody.** It is both the authoritative check and the heaviest
   perturbation the broker aims at the mesh (a host was lost with one in flight), so it runs where
   it costs no submitter and no healthy silicon: post-job on failure (not after a fresh green
@@ -1189,7 +1213,7 @@ refuses.
 |---|---|
 | I2 | `tests/test_boot_platform.py::test_importing_the_server_never_touches_the_device` |
 | I3 | `tests/test_fsm.py::test_survives_restart`, `tests/test_fsm.py::test_dirty_survives_restart`, `tests/test_state_paths.py::test_fsm_survives_restart_at_the_per_user_default_health_dir` |
-| I4 | `tests/test_fsm.py::test_boot_with_no_open_episode_starts_closed`, `tests/test_fsm.py::test_boot_open_episode_is_adopted`, `tests/test_fsm.py::test_terminal_episode_survives_boot_merge`, `tests/test_fsm.py::test_boot_sentinel_is_not_an_open_episode`, `tests/test_readopt.py::test_a_per_user_daemon_start_runs_a_light_probe_and_a_pass_reads_healthy`, `tests/test_readopt.py::test_a_per_user_daemon_start_on_a_bad_device_stays_recovering`, `tests/test_readopt.py::test_a_per_user_daemon_start_beside_a_holder_stays_healthy`, `tests/test_readopt.py::test_a_failed_per_user_start_reopens_once_the_device_reads_healthy`, `tests/test_readopt.py::test_a_per_user_restart_keeps_a_loaded_open_episode`, `tests/test_readopt.py::test_a_per_user_restart_from_a_saved_healthy_state_probes_again`, `tests/test_readopt.py::test_a_per_user_start_probe_that_raises_holds_the_device`, `tests/test_readopt.py::test_the_privsep_broker_start_does_not_run_the_per_user_probe`, `tests/test_fsm.py::test_boot_merge_attributes_the_escalation_only_on_the_boots_first_broker_start`, `tests/test_device_safety.py::test_a_restart_later_in_the_boot_does_not_blame_the_boots_power_cycle`, `tests/test_device_safety.py::test_a_stale_startup_hold_is_closed_with_the_time_it_was_really_held`, `tests/test_device_safety.py::test_a_stale_startup_hold_with_no_lift_in_the_journal_runs_to_the_restart`, `tests/test_device_safety.py::test_the_startup_release_measures_held_s_from_the_hold_row` |
+| I4 | `tests/test_fsm.py::test_boot_with_no_open_episode_starts_closed`, `tests/test_fsm.py::test_boot_open_episode_is_adopted`, `tests/test_fsm.py::test_terminal_episode_survives_boot_merge`, `tests/test_fsm.py::test_boot_sentinel_is_not_an_open_episode`, `tests/test_readopt.py::test_a_per_user_daemon_start_runs_a_light_probe_and_a_pass_reads_healthy`, `tests/test_readopt.py::test_a_per_user_daemon_start_on_a_bad_device_stays_recovering`, `tests/test_readopt.py::test_a_per_user_daemon_start_beside_a_holder_stays_healthy`, `tests/test_readopt.py::test_a_failed_per_user_start_reopens_once_the_device_reads_healthy`, `tests/test_readopt.py::test_a_per_user_restart_keeps_a_loaded_open_episode`, `tests/test_readopt.py::test_a_per_user_restart_from_a_saved_healthy_state_probes_again`, `tests/test_readopt.py::test_a_per_user_start_probe_that_raises_holds_the_device`, `tests/test_readopt.py::test_the_privsep_broker_start_does_not_run_the_per_user_probe`, `tests/test_fsm.py::test_boot_merge_attributes_the_escalation_only_on_the_boots_first_broker_start`, `tests/test_device_safety.py::test_a_restart_later_in_the_boot_does_not_blame_the_boots_power_cycle`, `tests/test_device_safety.py::test_a_stale_startup_hold_is_closed_with_the_time_it_was_really_held`, `tests/test_device_safety.py::test_a_stale_startup_hold_with_no_lift_in_the_journal_runs_to_the_restart`, `tests/test_device_safety.py::test_the_startup_release_measures_held_s_from_the_hold_row`, `tests/test_device_safety.py::test_an_orphaned_hold_is_released_only_after_the_startup_gate_passes`, `tests/test_device_safety.py::test_a_restart_before_the_gate_carries_the_orphaned_hold_without_a_second_row`, `tests/test_device_safety.py::test_a_tenant_refused_before_the_gate_takes_over_the_carried_hold`, `tests/test_device_safety.py::test_a_persisted_eth_frozen_hold_dispatches_nothing_until_the_startup_fabric_pass`, `tests/test_recent_jobs.py::test_a_hold_the_last_broker_died_holding_gets_a_row`, `tests/test_device_safety.py::test_a_carried_over_episode_lifted_by_the_startup_gate_writes_one_release`, `tests/test_device_safety.py::test_a_carried_over_episode_stays_held_with_no_release_when_the_startup_check_fails`, `tests/test_device_safety.py::test_a_restart_before_a_carried_over_episode_lifts_writes_one_release` |
 | I5 | `tests/test_fsm.py::test_an_unknown_why_on_disk_clamps_on_load` |
 | I6 | `tests/test_fsm.py::test_cross_boot_load_voids_job_but_keeps_device_facts`, `tests/test_fsm.py::test_a_dirty_mark_survives_a_cross_boot_load`, `tests/test_fsm.py::test_a_file_with_no_boot_id_is_treated_as_cross_boot`, `tests/test_fsm.py::test_same_boot_restart_keeps_job_and_dirty` |
 | I3/I5 robustness | `tests/test_fsm.py::test_a_wrong_shape_file_degrades_to_boot_not_a_crash`, `tests/test_fsm.py::test_malformed_field_types_degrade_to_boot_not_a_crash`, `tests/test_device_safety.py::test_a_non_dict_job_on_disk_never_poisons_the_gate` |
@@ -1211,6 +1235,7 @@ refuses.
 | I14 | `tests/test_device_safety.py::test_an_empty_dev_dir_on_a_host_that_expects_chips_holds_not_releases`, `tests/test_device_safety.py::test_a_device_less_host_never_reads_an_empty_sysfs_as_a_drop` |
 | I15 | `tests/test_device_safety.py::test_an_unverified_clear_holds_the_device`, `tests/test_device_safety.py::test_a_gate_that_errored_holds`, `tests/test_device_safety.py::test_a_clean_device_is_not_held_by_an_unverified_clear`, `tests/test_device_safety.py::test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace`, `tests/test_device_safety.py::test_a_verified_clear_names_itself_and_records_it_was_verified` |
 | I16 | `tests/test_device_safety.py::test_a_frozen_eth_verdict_is_held_not_reset`, `tests/test_device_safety.py::test_a_frozen_eth_verdict_holds_the_door_even_when_not_pre_dirty`, `tests/test_device_safety.py::test_frozen_eth_reset_needs_both_kill_switches`, `tests/test_device_safety.py::test_eth_heartbeat_hang_reads_as_frozen_not_skipped` |
+| I16 (a reader killed on its timeout is reaped within the caller's bound) | `tests/test_eth_probe.py::test_run_probe_reaps_its_timed_out_child_before_returning`, `tests/test_eth_link_baseline.py::test_the_eth_read_reaps_its_killed_reader_within_the_outer_bound` |
 | I17 | `tests/test_device_safety.py::test_dirty_device_is_not_reset_when_the_fabric_cannot_be_checked`, `tests/test_device_safety.py::test_an_unverified_fabric_is_never_recorded_as_verified_healthy`, `tests/test_fabric_probe.py::test_fabric_classification[77-cannot check-None]`, `tests/test_fabric_check_reason.py::test_first_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_fabric_check_reason.py::test_builtin_path_skip_detail_names_the_cause`, `tests/test_fabric_check_reason.py::test_override_path_reason_names_the_cause`, `tests/test_fabric_check_reason.py::test_wrapper_77_final_line_keeps_the_validators_first_error_line`, `tests/test_startup_fabric_hugepages.py::test_override_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_startup_fabric_hugepages.py::test_a_77_run_keeps_its_stderr_tail_and_exit_code_in_an_incident_bundle` |
 | I18 | `tests/test_device_safety.py::test_a_healthy_device_is_not_reset_just_because_a_job_timed_out`, `tests/test_device_safety.py::test_a_runtime_reported_fault_holds_the_device` |
 | I19 | `tests/test_device_safety.py::test_a_dead_chip_is_isolated_without_waiting_for_the_device_lock`, `tests/test_device_safety.py::test_a_chip_dead_on_two_consecutive_samples_is_isolated`, `tests/test_device_safety.py::test_a_transient_all_ones_does_not_amputate_a_chip`, `tests/test_device_safety.py::test_a_reset_in_flight_must_not_look_like_dead_chips`, `tests/test_device_safety.py::test_a_reset_that_outlives_our_wait_still_shields_its_chips`, `tests/test_device_safety.py::test_every_chip_at_once_is_a_global_event_not_32_dead_chips`, `tests/test_device_safety.py::test_a_dead_chip_kills_the_processes_that_still_map_it` |
