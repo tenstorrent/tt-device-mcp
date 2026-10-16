@@ -170,6 +170,53 @@ async def test_a_new_hold_episode_on_the_same_set_does_not_reset_again(monkeypat
     assert counters["resets"] == 1 and SKIP in events
 
 
+def _heartbeats(monkeypatch, off_bus):
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(EXPECTED - off_bus)})
+
+
+@pytest.mark.asyncio
+async def test_a_shrinking_set_gets_at_most_two_failed_mesh_resets_per_hold(monkeypatch, clear_job_state):
+    """Each window's set shrinks, so I36's unchanged-set rule never fires; the cap does. Two failed
+    mesh resets in one hold, then the third window climbs with no third reset (the power cycle is in
+    its cooldown here, so it holds bounded instead). A new hold episode starts a fresh count."""
+    counters, events, _ = _episode(monkeypatch, power_cycle=True)
+    monkeypatch.setattr(
+        srv.recovery_mechanism,
+        "read_auto_recovery_ledger",
+        lambda: [{"action": "power-cycle", "at_epoch": time.time()}],
+    )
+    for off in (4, 3, 2):
+        _heartbeats(monkeypatch, off)
+        assert await _window() is True
+    assert counters["resets"] == 2
+    assert "reset_rung_skipped_cap" in events and counters["power_cycles"] == 0
+    srv.device_hold_episode_since = (datetime.now() + timedelta(seconds=1)).isoformat()
+    _heartbeats(monkeypatch, 1)
+    assert await _window() is True
+    assert counters["resets"] == 3, "a new hold episode gets its own two resets"
+
+
+@pytest.mark.asyncio
+async def test_with_no_host_rung_the_cap_does_not_apply(monkeypatch, clear_job_state):
+    """With no host rung opted in there is nothing stronger to climb to: a shrinking set resets again."""
+    counters, events, _ = _episode(monkeypatch)
+    for off in (4, 3, 2):
+        _heartbeats(monkeypatch, off)
+        assert await _window() is True
+    assert counters["resets"] == 3 and "reset_rung_skipped_cap" not in events
+
+
+@pytest.mark.asyncio
+async def test_failed_mesh_resets_are_counted_per_hold(monkeypatch, clear_job_state):
+    """The cap's count: each failed mesh reset of this hold episode, from the per-boot record."""
+    counters, events, _ = _episode(monkeypatch)
+    for off in (4, 3):
+        _heartbeats(monkeypatch, off)
+        assert await _window() is True
+    assert counters["resets"] == 2
+    assert srv.recovery_mechanism.mesh_resets_failed_this_hold() == 2
+
+
 @pytest.mark.asyncio
 async def test_a_reset_that_never_launched_is_not_recorded(monkeypatch, clear_job_state):
     """The reset clock is stamped before launch, so it cannot tell a launched reset from one that never
