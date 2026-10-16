@@ -756,6 +756,15 @@ job boundary.
   code and is never checked against shutdown), a signal outside a shutdown, and any doubt (a
   systemd read that fails counts as not stopping). Time to recover: unchanged for every fault
   class; the check costs at most three bounded systemd reads, only after a signal death.
+- **I65 A release wakes a held job at once; the wake never dispatches.** A tenant job held at the
+  door (spec 01 I15) waits on a wake, not only on `TENANT_HOLD_POLL_SEC`. Any close of the device
+  episode to HEALTHY (the startup gate, a reset, the idle relift, a forced escalation — every path
+  through the FSM), a `device_released`, and a retired runtime fault (`device_fault_cleared`) wake
+  every held job, which re-runs its full admission gate at once (at most one gate pass per
+  `TENANT_HOLD_WAKE_MIN_GAP_SEC`, 1 s, per hold). Only that gate's own verdict dispatches: a wake
+  while the device is still held for any reason keeps the job held. The poll stays as the
+  governor for holds no release path ends. Queue-resume latency after any hold is about 1 s, not
+  up to 60 s, for every fault class.
 
 ## Interfaces
 
@@ -1355,6 +1364,7 @@ refuses.
 | I63 (no reboot, no further rung, no release over a shutdown-killed post-reset verify) | `tests/test_check_interrupted_by_shutdown.py::test_post_reset_verify_killed_by_shutdown_requests_no_reboot_and_releases_nothing` |
 | I63 (a timeout kill and a signal outside a shutdown fail as before) | `tests/test_check_interrupted_by_shutdown.py::test_a_timeout_kill_keeps_the_old_failure_even_during_shutdown`, `tests/test_check_interrupted_by_shutdown.py::test_a_signal_outside_shutdown_keeps_the_old_failure`, `tests/test_check_interrupted_by_shutdown.py::test_fabric_signal_and_timeout_outside_shutdown_still_fail`, `tests/test_check_interrupted_by_shutdown.py::test_a_clean_or_failing_exit_never_asks` |
 | I63 (shutdown detection: systemd state, shutdown target jobs, own unit deactivating, the broker's stop signal) | `tests/test_check_interrupted_by_shutdown.py::test_shutdown_in_progress_reads_systemd`, `tests/test_check_interrupted_by_shutdown.py::test_the_broker_stop_signal_counts_without_systemd` |
+| I65 (a release wakes a held job at once; a wake while still held never dispatches; wakes cannot spin the gate) | `tests/test_tenant_hold_wake.py::test_startup_release_dispatches_a_held_job_within_a_second`, `tests/test_tenant_hold_wake.py::test_a_wake_while_still_held_does_not_dispatch`, `tests/test_tenant_hold_wake.py::test_a_release_from_another_thread_wakes_the_hold` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

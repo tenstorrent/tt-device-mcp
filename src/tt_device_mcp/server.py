@@ -85,7 +85,7 @@ from tt_device_mcp.device_holders import (
     read_proc_cpu,
     reclaim_foreign_holders,
 )
-from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec
+from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec, add_close_listener
 from tt_device_mcp.health import (
     _HOST_ESCALATION_ACTION,
     BLOCKED,
@@ -2977,6 +2977,7 @@ def _clear_device_reported_fault(why: str) -> None:
     global device_fault_reported
     if device_fault_reported:
         health_event("device_fault_cleared", why=why, prior=device_fault_reported)
+        _wake_held_jobs()
     device_fault_reported = ""
 
 
@@ -6189,6 +6190,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     elif not reason and device_hold_logged:
         device_hold_logged = False
         health_event("device_released")
+        _wake_held_jobs()  # any other job parked behind this hold re-runs its own gate now
         # The hold's own row, written now that it has an end and a duration. While it was
         # held the jobs list showed it live, and that row is synthetic — it exists only for
         # as long as the hold does, so the moment the device came back the window it sat
@@ -7117,6 +7119,35 @@ def _hold_poll_sec_from_env(raw: Optional[str]) -> float:
 
 TENANT_HOLD_POLL_SEC = _hold_poll_sec_from_env(os.environ.get("TT_DEVICE_MCP_TENANT_HOLD_POLL_SEC"))
 
+# The poll above is only the governor. A held job is woken the moment a path lifts the device (any
+# close to HEALTHY, a tenant release, a retired runtime fault), so the queue resumes within about a
+# second of the release instead of up to a poll later. A wake only re-runs the gate: it never
+# dispatches by itself, so a release must still pass the full check, fabric included (spec 03 I65).
+# One event per parked job, each bound to the loop it waits on (a release can land off-loop).
+_hold_waiters: "set[tuple[asyncio.AbstractEventLoop, asyncio.Event]]" = set()
+# Floor between two gate passes of one hold, so a burst of wakes cannot spin the gate.
+TENANT_HOLD_WAKE_MIN_GAP_SEC = 1.0
+
+
+def _wake_held_jobs() -> None:
+    """Wake every job parked in the tenant hold so it re-runs its gate now. Cheap, never raises,
+    safe from any thread."""
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    for loop, event in list(_hold_waiters):
+        try:
+            if loop is running:
+                event.set()
+            elif not loop.is_closed():
+                loop.call_soon_threadsafe(event.set)
+        except Exception:  # noqa: BLE001 - a missed wake falls back to the poll
+            pass
+
+
+add_close_listener(_wake_held_jobs)
+
 
 def _tenant_hold_max_sec() -> float:
     """TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC: how long a degraded device may hold a tenant job at the
@@ -7222,6 +7253,20 @@ async def _hold_job_until_device_fit(job: "Job", job_log_file: Optional[Path], r
         except OSError as e:
             if logger:
                 logger.error(f"could not write hold note for job {job.id}: {e}")
+    wake = asyncio.Event()
+    waiter = (asyncio.get_running_loop(), wake)
+    _hold_waiters.add(waiter)
+    try:
+        return await _hold_loop(job, job_log_file, reason, bound, clock_start, wake)
+    finally:
+        _hold_waiters.discard(waiter)
+
+
+async def _hold_loop(
+    job: "Job", job_log_file: Optional[Path], reason: str, bound: float, clock_start: datetime, wake: asyncio.Event
+) -> str:
+    """The body of _hold_job_until_device_fit: re-run the gate on each wake or poll until fit."""
+    last_gate = time.monotonic()
     while reason:
         if job.status == JobStatus.KILLED:
             return reason  # released by a cancel, not by recovery — the device stays held
@@ -7238,7 +7283,16 @@ async def _hold_job_until_device_fit(job: "Job", job_log_file: Optional[Path], r
                 f"held {int(held)}s, past the {int(bound)}s hold bound (TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC); "
                 f"{escalation} — {reason}"
             )
-        await asyncio.sleep(min(TENANT_HOLD_POLL_SEC, max(0.0, bound - held)))
+        # Sleep until a release wakes the hold, or the poll (the governor) or the bound comes due.
+        try:
+            await asyncio.wait_for(wake.wait(), timeout=min(TENANT_HOLD_POLL_SEC, max(0.0, bound - held)))
+            gap = TENANT_HOLD_WAKE_MIN_GAP_SEC - (time.monotonic() - last_gate)
+            if gap > 0:
+                await asyncio.sleep(gap)
+        except asyncio.TimeoutError:
+            pass
+        wake.clear()  # before the gate: a release landing during it wakes the next wait at once
+        last_gate = time.monotonic()
         await cleanup_finished_jobs()  # keep sweeping through a long hold
         # Re-run the gate, not just the passive predicate: it resets+verifies a dirty device,
         # so a recovered one lifts here instead of freezing on a flag the parked runner can
