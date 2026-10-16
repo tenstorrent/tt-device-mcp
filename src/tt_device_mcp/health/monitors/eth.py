@@ -400,6 +400,13 @@ async def check(
     ``run_probe``'s bounded wait for the killed reader to finish exiting.
     """
     rc, raw = await run_probe(
-        argv, timeout_sec=timeout_sec, track=track, stream=False, env=env, cwd=cwd, reap_sec=reap_sec
+        argv,
+        timeout_sec=timeout_sec,
+        track=track,
+        stream=False,
+        env=env,
+        cwd=cwd,
+        reap_sec=reap_sec,
+        name="eth-heartbeat",
     )
     return rc, raw.decode("utf-8", "replace").strip()

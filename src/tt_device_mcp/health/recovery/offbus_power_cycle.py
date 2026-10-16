@@ -509,9 +509,16 @@ def page_if_blocked(episode: str, age: float, log, why: str, *, bound: Optional[
 def fire_command(argv: list, reason: str, timeout: float = FIRE_TIMEOUT_DEFAULT_SEC) -> None:
     """Run the host's power-cycle command with the reason in ``TT_DEVICE_MCP_POWER_CYCLE_REASON``.
     Raises on a non-zero exit, a timeout or a command that cannot start, so the caller's ledger
-    retracts an action that never launched. Tests replace it: no test may cycle the host."""
+    retracts an action that never launched; a timeout raises HostActionTimedOut, which keeps the
+    request pending (it may still act). Tests replace it: no test may cycle the host."""
     env = {**os.environ, "TT_DEVICE_MCP_POWER_CYCLE_REASON": reason}
     rc, out = _run(argv, _int_env("TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC", int(timeout)), env)
+    if rc is None and out.startswith("timed out"):
+        # It may have started its detached cycler before it stopped answering: the request stays
+        # pending (spec 04 I34) rather than reading as never launched.
+        from tt_device_mcp.health.recovery.base import HostActionTimedOut
+
+        raise HostActionTimedOut(f"power-cycle command {out}")
     if rc != 0:
         raise RuntimeError(f"power-cycle command {'exited ' + str(rc) if rc is not None else out}: {out[-200:]}")
 
