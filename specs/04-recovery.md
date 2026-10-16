@@ -904,6 +904,21 @@ each rung fires only when the gentler one failed or cannot apply.
   never a boot loop, never an open-ended hold. Class A or C after a cycle a later boot verified, at
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
+- **I69 — A chip the broker removed is reset before anything re-enumerates it.** Isolating a dead
+  chip (sysfs `remove`) records its parent bridge first, because the remove takes the node and its
+  parent link with it; the record clears when the chip is back on the bus. The bridge rung resets
+  such a chip through that recorded bridge, only while the bridge is still enumerated, its
+  secondary bus is the chip's bus and nothing is enumerated on that bus (a stale record is refused
+  and the chip holds). Every removed chip of the pass is reset before the pass's first rescan. No
+  PCI rescan runs in that rung while a still-dead chip the broker removed was not reset this pass
+  (no usable bridge, no root/setpci, a failed write), nor when the per-host reset gate (I24) refused:
+  the rung journals `pci_rescan_withheld`, the chips stay isolated and the hold escalates through the
+  usual rungs. A rescan re-enumerates a hung, un-reset chip and lets the driver probe it, the step
+  that preceded host deaths on two Galaxy hosts. The bare rescan still runs for a chip whose node
+  vanished without a broker remove. Recovered chips pass the full check, fabric included, before
+  release (03 I4). Time to recover, removed all-ones chip: a ~1.1 s reset plus a rescan and up to
+  10 s for the driver to re-bind, up to 3 tries with a settle between (formerly a 3 s rescan with no
+  reset); a removed chip that cannot be reset now holds and goes to the next rung at once.
 
 ## Interfaces
 
@@ -1436,4 +1451,6 @@ sees a silent fabric pass.
 | Post-reboot verify runs on the boot's first broker start only, never on a same-boot restart | `tests/test_device_safety.py::test_post_reboot_verify_runs_on_the_boots_first_broker_start`, `tests/test_device_safety.py::test_a_restart_later_in_the_boot_does_not_rerun_the_post_reboot_verify` |
 | Reset tool contract: steps/attribution/no-devices/job stop | `tests/test_reset.py::test_reset_success_reports_steps_and_command`, `tests/test_reset.py::test_reset_failure_surfaces_returncode_and_output`, `tests/test_reset.py::test_explicit_reset_leaves_one_row_attributed_to_the_caller`, `tests/test_reset.py::test_reset_no_devices_does_not_call_tt_smi`, `tests/test_reset.py::test_a_reset_stops_the_running_job_gracefully`, `tests/test_reset.py::test_reset_device_quiesce_scope_routes_a_live_privsep_job` |
 | Rung inventory stated loudly at boot | `tests/test_rung_arming.py::test_a_rung_that_is_off_is_stated_loudly` |
+| I69 a removed chip is reset through its recorded bridge before the rescan; a stale record is refused; no rescan for a removed un-reset chip or when gated; the bare rescan stays for a chip the broker did not remove | `tests/test_removed_chip_rescan.py::test_isolate_records_the_parent_bridge_before_the_remove`, `::test_a_removed_chip_is_reset_through_its_recorded_bridge_then_rescanned`, `::test_a_stale_recorded_bridge_is_refused`, `::test_no_rescan_for_a_removed_chip_without_privilege`, `::test_no_rescan_when_the_host_reset_gate_refuses`, `::test_no_rescan_when_a_removed_chip_has_no_usable_bridge`, `::test_every_removed_chip_is_reset_before_the_first_rescan`, `::test_the_bare_rescan_stays_for_a_chip_the_broker_did_not_remove`, `::test_a_returned_chip_drops_its_removal_record` |
+| I69/03 I4 the bridge rung's gate path runs the full check, fabric included, before clearing dirty; a failed check holds | `tests/test_removed_chip_rescan.py::test_gate_bridge_stage_verifies_with_fabric_before_clearing_dirty`, `::test_gate_bridge_stage_failed_verify_holds` |
 | Stage metrics: structural inapplicability is not "blocked" | `tests/test_metrics.py::test_ubb_tray_no_tray_on_this_platform_is_not_applicable_not_blocked`, `tests/test_metrics.py::test_bridge_reset_missing_pci_address_is_not_applicable_not_blocked` |
