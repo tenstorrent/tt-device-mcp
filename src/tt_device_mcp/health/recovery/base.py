@@ -67,6 +67,29 @@ AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
 # 1800s (30 min); TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC overrides.
 POWER_CYCLE_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC", "1800"))
 
+# A host reboot or power cycle the broker has requested takes the box down, and an external cycler
+# (a POWER_CYCLE_CMD wrapper) may run it some time after the request returns. A device reset the
+# hold watchdog starts in between only races the cycle. So once one is requested the forced ladder
+# starts no reset — but only this long: a request the host has not acted on by then reads as
+# failed and the ladder resumes, so a cycle that is not coming never leaves the hold open-ended.
+# TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC overrides; garbage or non-positive reads as the default,
+# and it is capped so no setting means "wait forever".
+HOST_ACTION_PENDING_DEFAULT_SEC = 900.0
+HOST_ACTION_PENDING_MAX_SEC = 3600.0
+
+
+def host_action_pending_sec() -> float:
+    """How long a requested host reboot or power cycle suppresses the forced ladder. Read per call."""
+    raw = os.environ.get("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", "").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return HOST_ACTION_PENDING_DEFAULT_SEC
+    if not 0 < v < float("inf"):
+        return HOST_ACTION_PENDING_DEFAULT_SEC
+    return min(v, HOST_ACTION_PENDING_MAX_SEC)
+
+
 # The host-level recovery rungs, ordered by severity. A warm reboot recovers most wedges; a
 # whole-bus wedge survives it and only the chassis power cycle clears it (measured on box D).
 # The min-interval loop guard is therefore PER SEVERITY: a stronger rung may escalate past a
@@ -278,6 +301,26 @@ class RecoveryMechanism:
         # ladder is blocked / exhausted" event to once per episode instead of every gate pass on a
         # held box.
         self._auto_recovery_denied_episode = ""
+
+        # The host-level action (reboot / power-cycle) last requested and when (monotonic). Set once
+        # its record is on disk, cleared if it fails to launch; read by the hold watchdog, which
+        # starts no device reset while one is pending (see host_action_pending).
+        self.host_action_requested: Optional[tuple[str, float]] = None
+
+    def host_action_pending(self, now: Optional[float] = None) -> Optional[tuple[str, float]]:
+        """``(action, age_sec)`` while a requested host reboot or power cycle is still inside its
+        pending window, else None. Past the window the request is dropped — the host never acted on
+        it — and the caller sees None, so the ladder resumes instead of waiting on it for good."""
+        req = self.host_action_requested
+        if req is None:
+            return None
+        action, at = req
+        age = (time.monotonic() if now is None else now) - at
+        if age >= host_action_pending_sec():
+            self.host_action_requested = None
+            host_rung_latch.expire()  # every other reset path resumes with the watchdog (I34)
+            return None
+        return action, age
 
     def cooling(self) -> bool:
         """True while a reset that already failed is still inside its cooldown window.
@@ -999,6 +1042,8 @@ class RecoveryMechanism:
             health_event(f"auto_{ev}_aborted", reason=reason, why="ledger write failed")
             metrics.stage_fired(stage, "blocked")
             return
+        # From here the host is going down: no device reset may start under it.
+        self.host_action_requested = (action, time.monotonic())
         self._write_action_log(row_owner, f"{label} — {reason}", 0.0, action, None)
         health_event(f"auto_{ev}_request", reason=reason)
         log(f"{label.upper()}: {detail} ({reason}); opted in + within limits — requesting it now")
@@ -1009,6 +1054,7 @@ class RecoveryMechanism:
                 # Stopped while waiting on the hook (broker shutdown): the action never fired, so
                 # its ledger entry must not spend the retry the still-wedged box needs.
                 self.retract_last_auto_recovery(action)
+                self.host_action_requested = None
                 raise
             except Exception as exc:  # noqa: BLE001 - the hook never gates recovery
                 hook = {"ran": False, "detail": f"failed: {exc!r}"}
@@ -1029,6 +1075,7 @@ class RecoveryMechanism:
             # out. The ledger entry written above to rate-limit it would now count a recovery that never happened and
             # block the retry the still-wedged box needs, so retract it and surface loudly.
             self.retract_last_auto_recovery(action)
+            self.host_action_requested = None
             log(
                 f"{label.upper()} FAILED TO LAUNCH: {exc!r}; retracted the rate-limit entry so the rung "
                 f"can retry once the cause is fixed"
@@ -1036,6 +1083,8 @@ class RecoveryMechanism:
             health_event(f"auto_{ev}_failed", reason=reason, error=repr(exc))
             metrics.stage_fired(stage, "failed")
             return
+        # The pending window counts from the hand-off, not from before a slow pre-fire hook.
+        self.host_action_requested = (action, time.monotonic())
         # The fire returned normally: `systemctl reboot` and a BMC command return once the action is
         # queued, and the box goes down over the next seconds. No reset may run in that window (I34).
         host_rung_latch.latch(action, reason, attempt=attempt, rerequest=attempt == 1)
@@ -1074,7 +1123,7 @@ class RecoveryMechanism:
             if wait > 0:
                 await asyncio.sleep(wait)
                 continue
-            rec = host_rung_latch.expire()
+            rec = host_rung_latch.take_rerequest()
             if rec is None:
                 return
             break

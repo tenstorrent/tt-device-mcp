@@ -96,6 +96,14 @@ each rung fires only when the gentler one failed or cannot apply.
   paths an incomplete scan counts as a tenant. `auto_recovery_allowed` makes the tenant check
   absolute for reboot/power-cycle — a tenant outranks every other signal.
 
+  A ceiling escalation that defers says what blocked it, in its log line and in a
+  `stuck_hold_deferred` health event with the same fields: a running broker job, the tenant holder
+  (pid, uid, user, comm), or `holder scan incomplete (source=..., gaps)`. `HolderScan.gaps` lists
+  each blind spot that made the scan incomplete (a pid the driver names that has no `/proc` entry
+  here, an unreadable fd table, a pid that holds no device fd here — also a process mid-exit). The
+  forced pass waives an incomplete scan as before and emits no deferral. The broker's own eth
+  reader is reaped before such a scan runs (spec 03 I16), so it never blocks its own escalation.
+
   A caller with the authority to declare an allocation over (spec 07 `post-step`) may *reclaim*
   stragglers before the gate runs — `device_holders.reclaim_foreign_holders`. That is a pre-gate
   action outside the gate: it removes the tenant so this rule passes on its own, and never
@@ -556,7 +564,11 @@ each rung fires only when the gentler one failed or cannot apply.
   goes out again every `TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC` (default 3600; `0` pages once per
   hold), and again after a pass that found no hold; a page the hook drops is sent again on the next
   pass. An already-running reset in its own scope is still adopted, and the operator's reset tool
-  is never held.
+  is never held. The same holds the one present-mesh reset a green-fabric dispatch
+  failure earns (spec 03 I55): the gate holds and pages, logs the held reset by name and never
+  promises an escalation. Pollers the broker owns (`tt_telemetry_server` as uid 0 in
+  `system.slice`, `tt-metrics-exporter`) are infrastructure, not tenants (`is_tenant`): they never
+  block that reset, which stops them for its window and starts them again after it.
 
 - **I29 — One unverified reset per 77-only episode; the next escalation sweeps once, then climbs
   only on a measured failure.** A galaxy reset whose post-reset fabric is still a 77 after the
@@ -584,7 +596,9 @@ each rung fires only when the gentler one failed or cannot apply.
   on one Galaxy host a galaxy reset on a cabling mismatch took a chip off the bus and the ladder
   then re-powered its tray. An off-bus or dead-ARC chip, a runtime-reported fault, or a measured-bad
   fabric keeps the ladder. A known fabric fault (spec 03 I46) on a fabric-unverified hold is held the
-  same way (`known fabric fault`), even when an older pass measured the fabric bad.
+  same way (`known fabric fault`), even when an older pass measured the fabric bad. A hold or pass
+  that names the wrapper's `dispatch FAILED on a green fabric` is a measured fault, never a topology
+  mismatch, even when the descriptor run before it printed `Connection mismatch detected`.
 
 - **I31 — A galaxy reset that regressed an off-bus mesh is not repeated in that hold episode.**
   When a galaxy reset leaves more chips off the bus than before it (`reset_regressed_offbus`, on the
@@ -641,22 +655,36 @@ each rung fires only when the gentler one failed or cannot apply.
   passes; a failed check keeps it held for the next bounded rung, and a reset the gate still refuses
   releases nothing. The hand-off ends (gauge to 0, `operator_handoff` gone) when the hold ends.
 
-- **I34 — No reset runs once a host reboot or power cycle has been requested.** `systemctl reboot`
-  and a BMC power-cycle command return as soon as the action is queued, so the host rung's fire
-  returns while the box shuts down. A fire that returned normally latches the host rung in flight,
-  process-wide (`host_rung_in_flight`). While it is latched every reset path refuses and journals
-  `reset_refused_host_rung_in_flight` once per path: the hold watchdog's forced escalation (its window
-  stays unspent), the ladder (`escalate` reports WAITING), `reset_with_quiesce` (operator reset, gate,
-  ladder rungs), the bridge reset and its rescan, the tray re-power, and a second reboot or power
-  cycle. A fire that raised latches nothing. A reboot that really happens ends the process and the
-  latch with it; one that does not must not hold forever, so the latch has a deadline (I35). Refusing
-  a reset releases nothing: the device stays held and the I32 health check still gates every release.
+- **I34 — Once a host reboot or power cycle is requested, the hold watchdog starts no device reset
+  until the host acts or the request expires.** A cycle handed to a `TT_DEVICE_MCP_POWER_CYCLE_CMD`
+  wrapper can run some time after the request returns; a forced escalation (the off-bus one-shot, a
+  ceiling window, any other hold-deadline trigger) that ran a bridge reset, tray re-power or galaxy
+  reset in that gap would race the host going down. The request is marked once its I9 ledger record
+  is written; while it is pending the forced ladder declines without spending its window latch and
+  logs one `hold_escalation_suppressed_host_action` line per request. The device stays held and the
+  I32 fabric debt stands: it is settled by the startup pass after the host returns, behind the
+  hugepage gate (03 I33). Bounded: a request whose ledger write failed or whose fire did not launch
+  never marks; one the host has not acted on within `TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC` (default
+  900 s, capped at 3600 s; malformed or non-positive reads as the default) is journaled as
+  `host_action_request_expired` and the next tick resumes the forced ladder.
+
+  The other reset paths refuse too. `systemctl reboot` and a BMC power-cycle command return as soon
+  as the action is queued, so the host rung's fire returns while the box shuts down. A fire that
+  returned normally latches the host rung in flight, process-wide (`host_rung_in_flight`). While it
+  is latched every reset path refuses and journals `reset_refused_host_rung_in_flight` once per path:
+  the hold watchdog's forced escalation (its window stays unspent), the ladder (`escalate` reports
+  WAITING), `reset_with_quiesce` (operator reset, gate, ladder rungs), the bridge reset and its
+  rescan, the tray re-power, and a second reboot or power cycle. A fire that raised latches nothing.
+  A reboot that really happens ends the process and the latch with it; one that does not must not hold
+  forever, so the latch has a deadline, the same `TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC` bound, and
+  the watchdog and the other reset paths resume together (I35). Refusing a reset releases nothing: the
+  device stays held and the I32 health check still gates every release.
 
 - **I35 — A requested host rung that never happens ends in a bounded time.** The I34 latch is kept in
   `host_rung_latch.json` in the health dir with the boot id it was requested on, so a broker restart
   in the same boot keeps refusing, and the first look on a new boot ends it (`host_rung_completed`):
-  the request was carried out. Its deadline is `TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC` after the request
-  (default 1200 s; a non-positive or malformed value reads as the default). At the deadline of a first
+  the request was carried out. Its deadline is the I34 `TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC` bound
+  after the request. At the deadline of a first
   request, still on the same boot (the hand-off was lost, the cycle was declined, the host stayed up),
   the broker that fired it ends the latch (`host_rung_latch_expired`, `next=re-request`), logs it and
   re-requests the same action once (`host_rung_rerequest`), past the
@@ -664,8 +692,9 @@ each rung fires only when the gentler one failed or cannot apply.
   marker, an operator recovery, the stand-back command) skips the re-request
   (`host_rung_rerequest_skipped`). The re-request latches again with no re-request of its own; past its
   deadline the latch ends (`next=bounded escalation`) and the hold watchdog and ladder go on under their
-  own bounds and limiters. Until its deadline task runs, a first request's latch keeps refusing, and it
-  ends at twice the deadline should that task never run. None of this releases the device: it stays
+  own bounds and limiters. Until its deadline task runs, a first request's latch keeps refusing, also
+  when the watchdog's own request expires first (that expiry leaves the latch to the task), and it ends
+  at twice the deadline should that task never run. None of this releases the device: it stays
   held until a reset's full health check, fabric included, passes (I32).
 
 ## Interfaces
@@ -1064,6 +1093,7 @@ sees a silent fabric pass.
 | I6 driver record absent or wholly unreadable falls back to the walk | `tests/test_device_holders.py::TestDriverHolderRecord::test_an_absent_driver_dir_falls_back_to_the_walk`, `::test_a_driver_dir_with_no_devices_falls_back_to_the_walk`, `::test_wholly_unreadable_records_fall_back_rather_than_report_blind` |
 | I6 driver record against real hardware, unprivileged | `tests/test_device_hardware.py::test_the_driver_holder_record_answers_completely_without_root`, `::test_a_free_device_passes_the_reset_gate_without_root` |
 | I7 tenant blocks automatic action | `tests/test_device_safety.py::test_governor_never_reboots_over_a_tenant`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_under_a_foreign_tenant`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_when_the_holder_scan_is_incomplete`, `tests/test_device_safety.py::test_a_tenant_arriving_before_the_reboot_decision_blocks_it` |
+| I7 a deferral names its blocker (job, tenant, or incomplete scan with its gaps); the forced pass emits none | `tests/test_device_safety.py::test_stuck_hold_deferral_names_an_incomplete_scan_and_its_gaps`, `::test_stuck_hold_deferral_names_the_tenant_holder`, `::test_stuck_hold_deferral_names_a_running_broker_job`, `::test_forced_stuck_hold_waives_an_incomplete_scan_and_emits_no_deferral`, `::test_stuck_offbus_hold_deferral_names_an_incomplete_scan`, `tests/test_device_holders.py::test_holder_comm_and_state_read_unknown_for_a_gone_pid` |
 | I6 a broker-scoped holder or a `TT_DEVICE_MCP_TENANT_UIDS` uid is a tenant below the uid floor, in the gate, reclaim, the ladder and dispatch | `tests/test_tenant_scope.py::test_the_driver_record_marks_a_scoped_holder`, `::test_the_reset_gate_refuses_over_a_scoped_service_account_holder`, `::test_the_reset_gate_refuses_over_a_configured_tenant_uid`, `::test_reclaim_signals_a_scoped_service_account_holder`, `::test_the_ladder_counts_a_scoped_straggler_of_a_killed_job_as_a_tenant`, `::test_dispatch_waits_for_a_scoped_service_account_holder`, `::test_tenant_uids_env_never_makes_root_a_tenant`, `::test_an_unresolved_tenant_name_is_retried_not_cached` |
 | Reclaim removes the tenant without relaxing I6/I7 | `tests/test_device_holders.py::test_reclaim_signals_only_tenant_holders`, `tests/test_device_holders.py::test_reclaim_escalates_term_to_kill`, `tests/test_device_holders.py::test_reclaim_reports_a_survivor_rather_than_claiming_success`, `tests/test_device_holders.py::test_reclaim_carries_the_rescan_completeness` |
 | Reclaim never retargets onto a holder that appears after it began | `tests/test_device_holders.py::test_reclaim_never_retargets_onto_a_new_holder_that_appears_after_it_began` |
@@ -1094,6 +1124,8 @@ sees a silent fabric pass.
 | I28 an outage hold or `TT_DEVICE_MCP_AUTO_MESH_RESET=0` holds the gate, relift, watchdog and sweep mesh reset, also with a chip off the bus in the startup and pre-job gates, and pages again while it stands; one rung off alone, or `=1`, still resets | `tests/test_mesh_reset_hold.py::test_the_hold_reason_follows_the_flags`, `::test_the_gate_holds_the_mesh_reset_under_an_outage_hold_and_pages_once`, `::test_the_gate_holds_with_the_explicit_knob_alone`, `::test_the_gate_still_resets_with_only_the_tray_rung_off`, `::test_an_explicit_opt_in_re_arms_the_mesh_reset_under_an_outage_hold`, `::test_the_last_chance_sweep_is_refused_under_an_outage_hold`, `::test_a_dropped_page_is_sent_again_and_a_lifted_hold_re_arms_it`, `::test_the_gate_holds_with_a_chip_off_the_bus_under_an_outage_hold`, `::test_without_the_hold_a_chip_off_the_bus_still_gets_the_mesh_reset`, `::test_a_standing_hold_pages_again_after_the_repage_interval`, `::test_the_repage_knob_defaults_and_rejects_nonsense` |
 | I29 one unverified reset per 77-only episode; next escalation sweeps once, strict on 77, climbs only on a measured failure, a sweep still reading 77 holds and pages once | `tests/test_device_safety.py::test_a_reset_that_leaves_the_fabric_unverified_counts_toward_the_relift_bound`, `tests/test_device_safety.py::test_a_second_escalation_after_an_unverified_reset_sweeps_instead_of_resetting`, `tests/test_device_safety.py::test_an_incomplete_sweep_after_an_unverified_reset_does_not_climb`, `tests/test_device_safety.py::test_a_sweep_verify_that_reads_77_is_not_a_release`, `tests/test_device_safety.py::test_a_sweep_that_still_reads_77_holds_and_pages_once_instead_of_climbing` |
 | I30 deadline escalation holds a fabric-only present mesh without a reset; real faults keep the ladder | `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_fabric_only_present_mesh_without_a_reset`, `tests/test_device_safety.py::test_the_deadline_escalation_keeps_the_ladder_for_real_faults`, `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset` |
+| I30 a dispatch-failure hold is never classed a topology mismatch | `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
+| I28 a uid-0 broker poller never blocks the reset; pollers stop and restart around it | `tests/test_dispatch_failure_reset.py::test_a_uid0_telemetry_holder_does_not_block_the_reset` |
 | I31 a regressed galaxy reset is not repeated in its hold episode; climb or page instead | `tests/test_device_safety.py::test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset`, `tests/test_device_safety.py::test_forced_offbus_ladder_after_a_regression_sweeps_then_power_cycles_when_opted_in`, `tests/test_device_safety.py::test_an_early_regression_is_latched_before_the_ceiling_deferral`, `tests/test_device_safety.py::test_a_new_hold_episode_resets_again_after_a_regression`, `tests/test_device_safety.py::test_gate_skips_a_repeat_galaxy_reset_after_a_regression`, `tests/test_device_safety.py::test_gate_latches_a_regression_seen_before_any_hold` |
 | I32 every reset path releases only after a passing fabric pass: the debt settles only on a healthy verdict, the funnel holds fabric-unverified, exemptions | `tests/test_post_reset_gate.py::test_the_debt_settles_only_on_a_healthy_fabric_verdict`, `::test_a_single_chip_or_a_host_with_no_fabric_check_is_exempt`, `::test_a_verified_release_after_a_reset_holds_fabric_unverified`, `::test_no_debt_releases_as_before` |
 | I32 per path: operator reset, bridge rung, no-window sweep, idle off-bus bridge, adopted foreign scope, foreign-holder fast verify, broker start, tray-down prelude rescan | `tests/test_post_reset_gate.py::test_an_operator_reset_without_a_passing_fabric_pass_holds`, `::test_an_operator_reset_with_a_passing_fabric_pass_releases`, `::test_the_bridge_rung`, `::test_the_tray_down_no_window_sweep`, `::test_the_idle_off_bus_bridge_reset`, `::test_a_reset_adopted_from_a_foreign_scope`, `::test_the_foreign_holder_fast_verify_after_a_reset_holds`, `::test_a_broker_start_owes_a_fabric_pass_before_any_release`, `tests/test_tray_down_prelude.py::test_a_rescan_recovery_releases_only_on_a_passing_fabric_pass` |
@@ -1102,8 +1134,10 @@ sees a silent fabric pass.
 | I33 before the deadline the gate holds; past it the watchdog forces one pass, and only that pass runs the ladder with the gate lifted | `tests/test_gated_hold_handoff.py::test_before_the_deadline_the_gate_holds_and_no_reset_fires`, `::test_the_watchdog_forces_one_pass_at_the_handoff_bound`, `::test_past_the_deadline_the_ladder_runs_with_the_gate_lifted_for_that_pass_only` |
 | I33 an operator latch (`off`, the I25 latch) or an operator at work keeps the hold past the deadline | `tests/test_gated_hold_handoff.py::test_an_operator_latch_keeps_the_hold_past_the_deadline`, `::test_an_operator_at_work_keeps_the_gate_shut` |
 | I33 / I32 a lifted reset releases only after a passing full health check, fabric included; a reset the gate still refuses releases nothing | `tests/test_gated_hold_handoff.py::test_the_lifted_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_a_reset_the_gate_still_refuses_releases_nothing` |
-| I34 no reset after a requested reboot or power cycle: the next hold tick forces nothing; every reset entry point refuses; a fire that raised latches nothing; the latch expires; the knob | `tests/test_host_rung_latch.py::test_no_reset_on_the_hold_tick_after_a_reboot_was_requested`, `::test_without_a_host_rung_the_same_tick_forces_the_ladder`, `::test_every_reset_entry_point_refuses_while_a_host_rung_is_in_flight`, `::test_a_fire_that_did_not_launch_latches_nothing`, `::test_the_latch_expires_so_a_reboot_that_never_happened_does_not_hold_forever`, `::test_the_latch_knob` |
-| I35 past the deadline on the same boot the request is re-requested once, then the bounded escalation goes on; a stand-back skips the re-request; a reboot (new boot id) ends the latch with no re-request, a same-boot restart keeps it; a latch whose deadline task never runs still ends; nothing releases before a passing fabric check | `tests/test_host_rung_latch.py::test_past_the_deadline_with_no_reboot_the_cycle_is_re_requested_once`, `::test_past_the_second_deadline_the_bounded_escalation_goes_on`, `::test_an_operator_at_work_skips_the_re_request`, `::test_a_reboot_before_the_deadline_ends_the_latch_with_no_re_request`, `::test_the_deadline_task_does_not_re_request_after_a_reboot`, `::test_a_latch_whose_deadline_task_never_runs_still_ends`, `::test_no_release_across_the_deadline_without_a_passing_fabric_check` |
+| I34 a requested power cycle or reboot suppresses every hold-deadline tick and a forced escalation waiting on the lock; the device stays held with the check owed; one line per request | `tests/test_host_action_suppress.py::test_power_cycle_request_suppresses_every_deadline_tick`, `::test_reboot_request_suppresses_the_deadline_tick`, `::test_escalation_waiting_on_the_lock_runs_no_rung` |
+| I34 bounded: a refused or failed request never suppresses; an expired one resumes the ladder; the window is always finite | `tests/test_host_action_suppress.py::test_power_cycle_that_fails_to_launch_does_not_suppress`, `::test_power_cycle_refused_by_the_ledger_does_not_suppress`, `::test_a_request_the_host_never_acted_on_expires_and_the_ladder_resumes`, `::test_pending_window_is_always_finite` |
+| I34 no reset after a requested reboot or power cycle: the next hold tick forces nothing; every reset entry point refuses; a fire that raised latches nothing; the latch expires on the pending bound, and with the watchdog's request | `tests/test_host_rung_latch.py::test_no_reset_on_the_hold_tick_after_a_reboot_was_requested`, `::test_the_latch_alone_keeps_the_hold_tick_from_resetting`, `::test_without_a_host_rung_the_same_tick_forces_the_ladder`, `::test_every_reset_entry_point_refuses_while_a_host_rung_is_in_flight`, `::test_a_fire_that_did_not_launch_latches_nothing`, `::test_the_latch_expires_so_a_reboot_that_never_happened_does_not_hold_forever`, `::test_an_expired_watchdog_request_ends_the_latch_too`, `::test_the_latch_follows_the_host_action_pending_bound` |
+| I35 past the deadline on the same boot the request is re-requested once, then the bounded escalation goes on; a stand-back skips the re-request; a reboot (new boot id) ends the latch with no re-request, a same-boot restart keeps it; a latch whose deadline task never runs still ends; nothing releases before a passing fabric check | `tests/test_host_rung_latch.py::test_past_the_deadline_with_no_reboot_the_cycle_is_re_requested_once`, `::test_past_the_second_deadline_the_bounded_escalation_goes_on`, `::test_an_operator_at_work_skips_the_re_request`, `::test_a_reboot_before_the_deadline_ends_the_latch_with_no_re_request`, `::test_the_deadline_task_does_not_re_request_after_a_reboot`, `::test_a_latch_whose_deadline_task_never_runs_still_ends`, `::test_an_expired_watchdog_request_leaves_a_pending_re_request_to_its_task`, `::test_no_release_across_the_deadline_without_a_passing_fabric_check` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |

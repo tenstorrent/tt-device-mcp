@@ -43,6 +43,18 @@ async def test_timeout_cancels_the_inner_work_and_raises_timeout():
 
 
 @pytest.mark.asyncio
+async def test_a_timed_out_gather_raises_timeout_not_cancel():
+    """A cancelled gather ends with CancelledError as its exception rather than in the cancelled
+    state. The job runner waits on a gather of its stream readers, and a cancel there reads as a
+    broker shutdown: the job is left running and the runner exits."""
+    a = asyncio.ensure_future(asyncio.sleep(10))
+    b = asyncio.ensure_future(asyncio.sleep(10))
+    with pytest.raises(asyncio.TimeoutError):
+        await aio.wait_for(asyncio.gather(a, b), timeout=0.01)
+    assert a.cancelled() and b.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_result_and_exception_pass_through():
     async def ok():
         return 7

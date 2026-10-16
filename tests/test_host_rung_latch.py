@@ -131,6 +131,27 @@ async def test_no_reset_on_the_hold_tick_after_a_reboot_was_requested(monkeypatc
 
     assert issued == [], f"reset the device while the box was going down: {issued}"
     assert srv._forced_escalation_task is None
+    # The watchdog's own pending-request guard answers first; the latch backs it on every other path.
+    assert {"hold_escalation_suppressed_host_action", "reset_refused_host_rung_in_flight"} & set(events)
+    assert srv.device_hold_escalate_bucket == 0, "a refused window is not spent"
+
+
+@pytest.mark.asyncio
+async def test_the_latch_alone_keeps_the_hold_tick_from_resetting(monkeypatch, tmp_path, clear_job_state):
+    """The latch backs the watchdog's pending-request guard: with that request gone, the tick still
+    forces nothing and journals the latch refusal."""
+    issued = _held_past_ceiling(monkeypatch, tmp_path)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
+    go, fired = _fire_ok(monkeypatch)
+    await go()
+    srv.recovery_mechanism.host_action_requested = None
+
+    srv._check_hold_deadline()
+    if srv._forced_escalation_task is not None:
+        await srv._forced_escalation_task
+
+    assert issued == [] and srv._forced_escalation_task is None
     assert "reset_refused_host_rung_in_flight" in events
     assert srv.device_hold_escalate_bucket == 0, "a refused window is not spent"
 
@@ -205,20 +226,33 @@ async def test_a_fire_that_did_not_launch_latches_nothing(monkeypatch):
 def test_the_latch_expires_so_a_reboot_that_never_happened_does_not_hold_forever(monkeypatch):
     events = []
     patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
-    monkeypatch.delenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", raising=False)
     host_rung_latch.latch("reboot", "r", now=1000.0)
-    assert host_rung_latch.refuse("x", now=1000.0 + 1199)
-    assert host_rung_latch.refuse("x", now=1000.0 + 1200) == ""
+    assert host_rung_latch.refuse("x", now=1000.0 + 899)
+    assert host_rung_latch.refuse("x", now=1000.0 + 900) == ""
     assert "host_rung_latch_expired" in events
     assert host_rung_latch.in_flight() is None
 
 
-@pytest.mark.parametrize("value,expected", [(None, 1200.0), ("60", 60.0), ("0", 1200.0), ("x", 1200.0)])
-def test_the_latch_knob(monkeypatch, value, expected):
+def test_an_expired_watchdog_request_ends_the_latch_too(monkeypatch):
+    """One bound for every reset path: once the hold watchdog reads the request as failed, the bridge,
+    tray and operator paths resume with it, not on a later clock."""
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
+    host_rung_latch.latch("power-cycle", "r")
+    srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic() - 901)
+    assert srv.recovery_mechanism.host_action_pending() is None
+    assert host_rung_latch.in_flight() is None
+    assert host_rung_latch.refuse("bridge reset") == ""
+    assert "host_rung_latch_expired" in events
+
+
+@pytest.mark.parametrize("value,expected", [(None, 900.0), ("60", 60.0), ("0", 900.0), ("x", 900.0), ("99999", 3600.0)])
+def test_the_latch_follows_the_host_action_pending_bound(monkeypatch, value, expected):
     if value is None:
-        monkeypatch.delenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", raising=False)
+        monkeypatch.delenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", raising=False)
     else:
-        monkeypatch.setenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", value)
+        monkeypatch.setenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", value)
     assert host_rung_latch.latch_sec() == expected
 
 
@@ -227,7 +261,7 @@ def test_the_latch_knob(monkeypatch, value, expected):
 
 async def _past_first_deadline(monkeypatch, action="reboot"):
     """A first request whose fire returned, then its deadline task run to the end with the host up."""
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", "0.05")
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", "0.05")
     go, fired = _fire_ok(monkeypatch, action)
     await go()
     task = srv.recovery_mechanism._host_rung_deadline_task
@@ -263,6 +297,8 @@ async def test_past_the_second_deadline_the_bounded_escalation_goes_on(monkeypat
     assert issued == [] and srv._forced_escalation_task is None, "still refused under the re-request's latch"
 
     assert host_rung_latch.refuse("x", now=time.time() + 1) == ""
+    # One bound for the watchdog and the latch (I34): the watchdog's own request has expired with it.
+    srv.recovery_mechanism.host_action_requested = ("reboot", time.monotonic() - 1)
     assert ("host_rung_latch_expired", "bounded escalation") in [(k, f.get("next")) for k, f in events]
     assert not host_rung_latch._state_path().exists()
     srv._check_hold_deadline()
@@ -308,7 +344,7 @@ async def test_a_reboot_before_the_deadline_ends_the_latch_with_no_re_request(mo
 
 @pytest.mark.asyncio
 async def test_the_deadline_task_does_not_re_request_after_a_reboot(monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", "0.05")
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", "0.05")
     go, fired = _fire_ok(monkeypatch)
     await go()
     monkeypatch.setattr(host_rung_latch, "_boot_id", lambda: "boot-b")
@@ -317,10 +353,23 @@ async def test_the_deadline_task_does_not_re_request_after_a_reboot(monkeypatch)
 
 
 def test_a_latch_whose_deadline_task_never_runs_still_ends(monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", raising=False)
     host_rung_latch.latch("reboot", "r", now=1000.0, rerequest=True)
-    assert host_rung_latch.refuse("x", now=1000.0 + 1300), "waits for its deadline task past the deadline"
-    assert host_rung_latch.refuse("x", now=1000.0 + 2400) == ""
+    assert host_rung_latch.refuse("x", now=1000.0 + 1000), "waits for its deadline task past the deadline"
+    assert host_rung_latch.refuse("x", now=1000.0 + 1800) == ""
+
+
+def test_an_expired_watchdog_request_leaves_a_pending_re_request_to_its_task(monkeypatch):
+    """The watchdog's bound and the latch deadline are the same clock: the watchdog expiring first must
+    not race the deadline task's re-request away. Past the cap it still ends the latch."""
+    monkeypatch.delenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", raising=False)
+    host_rung_latch.latch("power-cycle", "r", now=1000.0, rerequest=True)
+    host_rung_latch.expire(now=1000.0 + 901)
+    assert host_rung_latch.refuse("bridge reset", now=1000.0 + 901), "left to the deadline task"
+    assert host_rung_latch.take_rerequest(now=1000.0 + 901)["action"] == "power-cycle"
+    host_rung_latch.latch("power-cycle", "r", now=2000.0, rerequest=True)
+    host_rung_latch.expire(now=2000.0 + 1800)
+    assert host_rung_latch.in_flight(now=2000.0 + 1800) is None
 
 
 @pytest.mark.asyncio

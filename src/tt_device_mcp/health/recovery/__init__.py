@@ -127,6 +127,9 @@ class Evidence:
     off_bus_before: Optional[int]
     reset_exit_nonzero: bool
     holding_fabric_unverified: bool = False
+    # Spec 03 I55: the fabric passed traffic but mesh dispatch failed over a present mesh, and this
+    # hold episode has not had its one present-mesh reset yet (nor does the outage hold forbid it).
+    dispatch_reset_due: bool = False
     # ladder-v2: the per-chip SBR outcome the bridge rung produced THIS pass — chip id ->
     # ``{"reason": "no_bridge"}`` for every chip whose secondary bus reset could not fire because
     # the endpoint left the bus (no bridge to write to). Threaded by the server's ``replace(ev, …)``

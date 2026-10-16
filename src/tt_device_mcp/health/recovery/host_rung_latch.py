@@ -12,8 +12,8 @@ So a fire that returned normally latches here, process-wide, and every reset ent
 while it is set. The latch is kept on disk with this boot's id, so a broker restart in the same boot
 keeps refusing, and the first look after a reboot sees a new boot id and ends it (the request was
 carried out). One that never happens (the hand-off was lost, the cycle was declined, the host stayed
-up) must not hold the device forever: the latch has a deadline, ``TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC``
-(default 1200 s). At the deadline, still on the same boot, the broker that fired it re-requests the
+up) must not hold the device forever: the latch has a deadline, the host-action pending bound
+(``TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC``, the same one the hold watchdog waits on). At the deadline, still on the same boot, the broker that fired it re-requests the
 same action once; past the deadline of that second request the latch ends and the bounded escalation
 goes on. Neither the latch nor its end releases the device: only a passing health check does."""
 
@@ -27,7 +27,6 @@ from typing import Optional
 
 from tt_device_mcp.health.evidence import health_dir, health_event
 
-HOST_RUNG_LATCH_SEC_DEFAULT = 1200
 STATE_FILE = "host_rung_latch.json"
 # A latch whose re-request is owned by a live deadline task in this process waits for that task, so no
 # reset slips in between the deadline and the re-request. Should the task never run, the latch still
@@ -44,13 +43,12 @@ _REFUSED_SEEN: set = set()
 
 
 def latch_sec() -> float:
-    """How long a latched host rung refuses resets before it is presumed not to have happened. A
-    non-positive or malformed value reads as the default: the latch is never switched off."""
-    try:
-        sec = float(os.environ.get("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", HOST_RUNG_LATCH_SEC_DEFAULT))
-    except ValueError:
-        return float(HOST_RUNG_LATCH_SEC_DEFAULT)
-    return sec if sec > 0 else float(HOST_RUNG_LATCH_SEC_DEFAULT)
+    """How long a latched host rung refuses resets before it is presumed not to have happened: the
+    host-action pending bound, so the watchdog and every other reset path resume together. Always
+    finite and positive (that bound reads garbage as its default and is capped)."""
+    from tt_device_mcp.health.recovery.base import host_action_pending_sec
+
+    return host_action_pending_sec()
 
 
 def _boot_id() -> str:
@@ -150,7 +148,28 @@ def in_flight(*, now: Optional[float] = None) -> Optional[dict]:
     return None
 
 
-def expire(*, now: Optional[float] = None) -> Optional[dict]:
+def expire(*, now: Optional[float] = None) -> None:
+    """Called when the hold watchdog's pending request expires, so no reset path stays refused past
+    it: drop the latch, loudly. A latch whose re-request a live deadline task owns is left to that
+    task (it re-requests or ends it within PENDING_REREQUEST_CAP deadlines), so the watchdog cannot
+    race the re-request away."""
+    if _LATCH is None:
+        return
+    age = (time.time() if now is None else now) - _LATCH["at"]
+    if _LATCH.get("rerequest") and age < latch_sec() * PENDING_REREQUEST_CAP:
+        return
+    health_event(
+        "host_rung_latch_expired",
+        action=_LATCH["action"],
+        reason=_LATCH["reason"],
+        attempt=_LATCH.get("attempt", 1),
+        age_sec=int(age),
+        next="bounded escalation",
+    )
+    _drop()
+
+
+def take_rerequest(*, now: Optional[float] = None) -> Optional[dict]:
     """Called by the deadline task: the latch it owns, now ended, once its deadline has passed with the
     box still on the same boot; None when there is nothing to re-request (no latch, one the task does not
     own, a reboot, or a deadline not reached yet)."""
