@@ -1204,7 +1204,9 @@ class GalaxyRecovery(Recovery):
         )
         if fault_class is None:
             return None
-        fired = await self._power_cycle_direct(fault_class, offbus, expected, log, context=gate_phase or rung)
+        fired = await self._power_cycle_direct(
+            fault_class, offbus, expected, log, context=gate_phase or rung, force=rung == "offbus-forced"
+        )
         if fired is None:
             return None
         if fired and rung != "gate":
@@ -1212,7 +1214,7 @@ class GalaxyRecovery(Recovery):
         return OUTCOME_WAITING
 
     async def _power_cycle_direct(
-        self, fault_class: str, offbus_chips: set, expected: int, log, *, context: str
+        self, fault_class: str, offbus_chips: set, expected: int, log, *, context: str, force: bool = False
     ) -> Optional[bool]:
         """Request the power cycle for an I37 class with no reset, sweep or tray re-power first.
 
@@ -1220,6 +1222,8 @@ class GalaxyRecovery(Recovery):
         repeat of a failed reset). False while it holds, firing nothing: a reset is cycling in its own
         scope, a tenant holds the device or the scan is unreadable, an operator stand-back, or the
         power-cycle rate limits deny it (journaled; the next window asks again). True once requested.
+        ``force`` (the hold-deadline climb) waives an unreadable scan, as on the tray rung, never a
+        readable tenant or a running job.
         The boot that comes back runs the startup gate, which waits for the hugepage pool and passes
         the full health check, fabric included, before it releases anything (goal 8)."""
         off_bus = len(offbus_chips)
@@ -1234,7 +1238,7 @@ class GalaxyRecovery(Recovery):
         if await asyncio.to_thread(self.mechanism.scope_active):
             log(f"{what}: a reset is cycling in its own scope — holding before the power cycle")
             return False
-        if self._tenant_active(await asyncio.to_thread(self.deps.enumerate_device_holders)):
+        if self._tenant_active(await asyncio.to_thread(self.deps.enumerate_device_holders), force=force):
             log(f"{what}: a tenant holds the device or the scan is unreadable — holding before the power cycle")
             return False
         # The operator's stand-back marker and command still hold it; a missing manual-recovery check

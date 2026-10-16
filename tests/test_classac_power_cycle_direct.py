@@ -10,6 +10,8 @@ the startup gate, or still off after a mesh reset already ran and failed. On one
 requested in the first window, behind the host rung's own guards, and partial drops keep the full
 ladder. No test reaches a real reset, sweep or power cycle."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from tests.conftest import patch_health_event
@@ -169,6 +171,38 @@ async def test_an_idle_whole_tray_hold_cycles_with_no_reset(rig, monkeypatch, ph
     assert rig["order"] == ["rescan", "capture", "power_cycle"] and ladders == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase, blocker, cycled",
+    [
+        ("offbus-forced", None, True),  # the deadline climb waives a scan it cannot read
+        ("offbus", None, False),  # before the deadline an unreadable scan still holds
+        ("offbus-forced", "job_running", False),
+        ("offbus-forced", "tenant", False),
+    ],
+)
+async def test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant(
+    rig, monkeypatch, phase, blocker, cycled
+):
+    """The hold-deadline climb waives an unreadable holder scan, as the tray rung does, so a class A
+    hold at its deadline is not held forever by a scan that cannot see; a running job or a readable
+    tenant still holds it. Nothing is released here: the boot after the cycle runs the startup gate's
+    full check, fabric included (03 I4)."""
+    rig["scan"] = HolderScan(holders=[], complete=False)
+    if blocker == "job_running":
+        monkeypatch.setattr(rig["g"].deps, "job_running", lambda: True)
+    elif blocker == "tenant":
+        monkeypatch.setattr(galaxy, "is_tenant", lambda h: True)
+        monkeypatch.setattr(galaxy, "holder_comm", lambda pid: "python")
+        rig["scan"] = HolderScan(holders=[SimpleNamespace(pid=4242, uid=1000)], complete=True)
+    rig["beats"] = _beats_without(_off(rig["map"], {2: 8}))
+    rig["g"]._td_reset_seen = True  # no prelude: only the guard is under test
+    out = await rig["g"].escalate(phase, [], EXPECTED, lambda m: None)
+    assert rig["order"] == (["power_cycle"] if cycled else [])
+    assert out == (galaxy.OUTCOME_TERMINAL if cycled else galaxy.OUTCOME_WAITING)
+    assert "released" not in rig["order"]
+
+
 # ---- class C ------------------------------------------------------------------------------------
 
 
@@ -247,7 +281,9 @@ async def test_a_guard_holds_the_power_cycle_and_fires_nothing(rig, monkeypatch,
         rig["scope"] = "tt-reset-1.scope"
     elif guard == "tenant":
         rig["scan"] = HolderScan(holders=[object()], complete=True)
-        monkeypatch.setattr(rig["g"], "_tenant_active", lambda scan: bool(scan.holders) or not scan.complete)
+        monkeypatch.setattr(
+            rig["g"], "_tenant_active", lambda scan, force=False: bool(scan.holders) or not (force or scan.complete)
+        )
     elif guard == "unreadable_scan":
         rig["scan"] = HolderScan(holders=[], complete=False)
     elif guard == "standback_file":

@@ -695,8 +695,9 @@ each rung fires only when the gentler one failed or cannot apply.
   (`last_chance_sweep_skipped`). The request keeps every guard of the host rung: a reset cycling in
   its scope, a tenant or an unreadable holder scan, an operator stand-back marker or check, and the
   power-cycle rate limits (journaled as denied) each hold and fire nothing; the next window asks
-  again. A missing manual-recovery check does not hold it, as it does not hold the host rung this
-  replaces. With no power cycle opted in, the ordinary ladder runs as before (I36 still stops a repeat
+  again. The hold-deadline climb (`offbus-forced`) waives an unreadable scan, as the tray rung does,
+  but never a readable tenant or a running job. A missing manual-recovery check does not hold it, as
+  it does not hold the host rung this replaces. With no power cycle opted in, the ordinary ladder runs as before (I36 still stops a repeat
   of a failed reset). The host that comes back runs the startup gate, which waits for the hugepage
   pool and passes the full health check, fabric included, before any release (03 I4); a failed check
   keeps the hold and climbs. Partial drops (a single chip, or part of one tray) keep the full ladder.
@@ -1154,6 +1155,7 @@ sees a silent fabric pass.
 | I37 the failed-reset mark: set by a mesh reset that exits nonzero or verifies unhealthy, not by a healthy one; cleared at the episode end | `tests/test_classac_power_cycle_direct.py::test_the_failed_reset_mark_is_set_by_a_failed_reset_and_cleared_at_the_episode_end` |
 | I37 partial drops (one chip, part of one tray) keep the full ladder | `tests/test_classac_power_cycle_direct.py::test_a_partial_drop_keeps_the_ladder` |
 | I37 a reset in scope, a tenant, a stand-back marker or a rate-limit denial holds and fires nothing; no power cycle opted in keeps the ladder | `tests/test_classac_power_cycle_direct.py::test_a_guard_holds_the_power_cycle_and_fires_nothing`, `::test_with_no_power_cycle_opted_in_the_ladder_runs` |
+| I37 the hold-deadline climb waives an unreadable holder scan and cycles; a running job or a readable tenant still holds it, and nothing is released before the startup check | `tests/test_classac_power_cycle_direct.py::test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant` |
 | I37 the host rung's last-chance sweep skips itself for classes A and C | `tests/test_classac_power_cycle_direct.py::test_the_last_chance_sweep_skips_itself_for_a_and_c` |
 | I37 / goal of 03 I4: after the cycle the startup gate waits for hugepages and runs the fabric pass; a failed check keeps the hold | `tests/test_classac_power_cycle_direct.py::test_after_the_cycle_the_startup_gate_awaits_hugepages_and_the_fabric`, `::test_a_failed_startup_check_after_the_cycle_keeps_the_hold` |
 | I37 time to recover (fake clock): class A requests the cycle in the first window, class C after one failed reset | `tests/test_classac_power_cycle_direct.py::test_time_to_recover_on_a_fake_clock` |
