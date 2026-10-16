@@ -367,7 +367,9 @@ def _present_mesh_reset_grace_sec() -> int:
     return v if v > 0 else 120
 
 
-def _stuck_hold_reset_due(hold_since: str, *, off_bus: int, now: Optional[datetime] = None) -> bool:
+def _stuck_hold_reset_due(
+    hold_since: str, *, off_bus: int, now: Optional[datetime] = None, measured_fault: bool = False
+) -> bool:
     """Whether an idle PRESENT-mesh hold has stood past the present-mesh reset grace and its class
     admits the gate's galaxy reset.
 
@@ -383,7 +385,12 @@ def _stuck_hold_reset_due(hold_since: str, *, off_bus: int, now: Optional[dateti
     is EXCLUDED: it self-heals and a galaxy reset there is the measured all-chip drop
     that inverts the mesh (1 off-bus -> 31), so it keeps holding to the ceiling. Age is read off the
     idle-latched episode clock; a missing or unparseable stamp fails closed (not due). The caller
-    applies the arm switch, retry-spacing, no-tenant and reset-scope guards on top."""
+    applies the arm switch, retry-spacing, no-tenant and reset-scope guards on top.
+
+    ``measured_fault`` (spec 03 I56): the hold's last fabric pass MEASURED a failure on this present
+    mesh (not a 77 skip), so the fault is already proven and the grace has nothing left to wait out
+    — the reset is due at once. A post-job hold on a measured fabric FAIL is exactly the class the
+    galaxy reset cures, and waiting the grace first only stretches its time-to-recover."""
     if off_bus != 0:
         return False
     if not hold_since:
@@ -392,6 +399,8 @@ def _stuck_hold_reset_due(hold_since: str, *, off_bus: int, now: Optional[dateti
         started = datetime.fromisoformat(hold_since)
     except ValueError:
         return False
+    if measured_fault:
+        return True
     now = now or datetime.now()
     return (now - started).total_seconds() >= _present_mesh_reset_grace_sec()
 
@@ -1071,6 +1080,7 @@ class GalaxyRecovery(Recovery):
         stage: Optional[str] = None,
         ev: Optional[Evidence] = None,
         beats: Optional[dict] = None,
+        measured_fault: bool = False,
     ) -> str:
         """Run the next justified rung of this ladder and report the outcome, replacing the
         direct ``_escalate_stuck_hold``/``_escalate_offbus_stuck_hold`` calls the idle relift and
@@ -1107,7 +1117,10 @@ class GalaxyRecovery(Recovery):
         and, before its first rung, given one PCI rescan and the read-only capture. Then the ladder
         runs exactly as it would have, with the caller's own evidence and stage: the prelude never
         picks a rung, skips one or fires a power cycle. Only a rescan that brought every chip back
-        onto a mesh that passes the full verify ends the episode before the ladder."""
+        onto a mesh that passes the full verify ends the episode before the ladder.
+
+        ``measured_fault`` reaches the present ladder only: the hold stands on a MEASURED fabric
+        failure, so its reset is due without the grace (spec 03 I56; see ``_stuck_hold_reset_due``)."""
         rung, _, gate_phase = phase.partition("/")
         if await self._tray_down_latch(expected, beats) == TRAY_DOWN_ONSET and not self._td["prelude_done"]:
             if await self._tray_down_prelude(expected, log, phase=gate_phase or rung):
@@ -1125,7 +1138,7 @@ class GalaxyRecovery(Recovery):
         if rung == "offbus":
             ran = await self._escalate_offbus_stuck_hold(indices, expected, log, force=force)
         elif rung == "present":
-            ran = await self._escalate_stuck_hold(indices, expected, log, force=force)
+            ran = await self._escalate_stuck_hold(indices, expected, log, force=force, measured_fault=measured_fault)
         else:
             raise ValueError(f"escalate(): unknown phase {phase!r}")
         if not ran:
@@ -1844,7 +1857,9 @@ class GalaxyRecovery(Recovery):
         )
         return OUTCOME_WAITING
 
-    async def _escalate_stuck_hold(self, indices: list, expected: int, log, *, force: bool = False) -> bool:
+    async def _escalate_stuck_hold(
+        self, indices: list, expected: int, log, *, force: bool = False, measured_fault: bool = False
+    ) -> bool:
         """Escalate a present-mesh hold the read-only relift cannot clear to the gate's galaxy reset
         once it has stood past the ceiling. Returns True iff a reset ran (recovered or not); False
         leaves the hold standing for the next window.
@@ -1874,7 +1889,7 @@ class GalaxyRecovery(Recovery):
         beats = await asyncio.to_thread(self.deps.read_heartbeats)
         off_bus = offbus_count(beats, expected)
         hold_since = self.deps.device_hold_episode_since()
-        if not force and not _stuck_hold_reset_due(hold_since, off_bus=off_bus):
+        if not force and not _stuck_hold_reset_due(hold_since, off_bus=off_bus, measured_fault=measured_fault):
             return False
         # Retry pacing, not a cap: the grace window between attempts replaces the failed-reset
         # cooldown here — that cooldown guards against repeat MMIO at a DEAD endpoint, but this mesh
@@ -1896,15 +1911,22 @@ class GalaxyRecovery(Recovery):
             log(f"hold past the ceiling but {self._describe_blocker(blocker)} — holding; escalates once idle")
             health_event("stuck_hold_deferred", mesh="present", forced=force, **blocker)
             return False
-        log(
-            f"present-mesh hold stood past the {_present_mesh_reset_grace_sec()}s grace with no tenant — "
-            f"escalating to the galaxy reset the next gate would run"
-        )
+        if measured_fault and not force:
+            log(
+                "present-mesh hold stands on a measured fabric failure with no tenant — escalating "
+                "to the galaxy reset the next gate would run, no grace"
+            )
+        else:
+            log(
+                f"present-mesh hold stood past the {_present_mesh_reset_grace_sec()}s grace with no tenant — "
+                f"escalating to the galaxy reset the next gate would run"
+            )
         health_event(
             "stuck_hold_escalation",
             held_since=hold_since,
             reason=self.deps.device_hold_episode_reason(),
             off_bus=off_bus,
+            measured_fault=measured_fault,
         )
         # Still latched for visibility (the deadline watchdog journals it), but no longer a cap on
         # this path: retries are paced by the grace window above.
@@ -2375,7 +2397,7 @@ class GalaxyRecovery(Recovery):
                 # rung above and the suppressed mesh reset; otherwise the command is named and the hold
                 # below stands. A reset that recovered clears the hold; one that fired but did not falls to
                 # the climb below, since a warm reboot cannot re-enumerate a still-off-bus tray.
-                outcome = await self._attempt_ubb_tray_reset(beats_pre, off_bus_pre, expected, log)
+                outcome = await self._attempt_ubb_tray_reset(beats_pre, off_bus_pre, expected, log, force=force)
                 if outcome is True:
                     self.deps.clear_device_reported_fault(
                         "idle off-bus escalation: per-tray BMC reset recovered the mesh"
@@ -2853,7 +2875,9 @@ class GalaxyRecovery(Recovery):
             reason=reason,
         )
 
-    async def _attempt_ubb_tray_reset(self, beats: dict, off_bus: int, expected: int, log) -> Optional[bool]:
+    async def _attempt_ubb_tray_reset(
+        self, beats: dict, off_bus: int, expected: int, log, *, force: bool = False
+    ) -> Optional[bool]:
         """The per-tray BMC reset rung, between the per-chip bridge reset and the mesh-wide reset. It walks
         the AFFECTED trays — those holding an off-bus chip — one at a time, re-verifying (chips back, ARC
         advancing, FABRIC re-checked) after each and stopping as soon as the whole mesh verifies healthy. It
@@ -2876,6 +2900,8 @@ class GalaxyRecovery(Recovery):
         The whole walk runs at most once per hold episode, never while a reset scope cycles, never with a
         tenant on the mesh: it re-powers silicon, so it carries the same guards as the other destructive
         rungs. Every guard falls back to naming the command and holding, never a half-done or repeated walk.
+        ``force`` (the hold-deadline climb) reads the tenant guard as the climb itself does: an unreadable
+        holder scan no longer blocks the walk, a real tenant or a running job still does.
         A fully-off-bus mesh is declined outright and NOT named as a tray-down — that is the cold-power-cycle
         case, and a BMC tray reset cannot verify a tray with no chip on the bus."""
         if expected > 0 and off_bus >= expected:
@@ -2948,7 +2974,7 @@ class GalaxyRecovery(Recovery):
             metrics.stage_fired("ubb_tray", "blocked")
             return None
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        if self._tenant_active(scan):
+        if self._tenant_active(scan, force=force):
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)
             log("tray-down but a tenant holds the device, the holder scan is unreadable, or a job is running — holding")
             metrics.stage_fired("ubb_tray", "blocked")
