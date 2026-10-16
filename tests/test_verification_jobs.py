@@ -1,5 +1,5 @@
 """Operator verification jobs (spec 01 I21), queue restore order (01 I6) and the fabric output an
-incident bundle keeps (03 I56).
+incident bundle keeps (03 I57).
 
 A fabric_unverified hold is lifted only by a fabric pass, and the operator's own run of that pass
 used to sit behind the tenant jobs the hold was holding. These pin the class that runs first and

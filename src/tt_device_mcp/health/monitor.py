@@ -325,7 +325,7 @@ class HealthMonitor:
         self.last_fabric_ok: Optional[bool] = None
         self.last_fabric_output: str = ""
         # When the run that produced last_fabric_output started (local naive datetime), None until
-        # one runs. An incident bundle keeps that output only when this pass produced it (spec 03 I56).
+        # one runs. An incident bundle keeps that output only when this pass produced it (spec 03 I57).
         self.last_fabric_output_at: Optional[datetime] = None
         # (reason, monotonic, bundle path) of the last no-verdict fabric run kept in an incident bundle.
         self._fabric_skip_incident: Optional[tuple[str, float, str]] = None

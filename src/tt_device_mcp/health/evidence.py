@@ -389,7 +389,7 @@ def capture_incident(
     produced ``fabric_output`` began. With ``fabric_since`` set, output from an earlier pass is
     stale: it is left out of the bundle, and incident.json says so, so no bundle presents another
     pass's transcript as this one's; fresh output goes to fabric.log under a header naming its run
-    time (spec 03 I56). Without ``fabric_since`` the output is kept as given.
+    time (spec 03 I57). Without ``fabric_since`` the output is kept as given.
 
     Never raises. Returns the bundle directory.
     """
