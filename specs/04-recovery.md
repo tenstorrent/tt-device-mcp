@@ -684,11 +684,13 @@ each rung fires only when the gentler one failed or cannot apply.
   Bounds the loop one Galaxy host ran: six identical mesh resets in one hold, each exiting 1 after a
   263 s overrun, one per forced window.
 - **I37 — A whole-tray or all-off drop goes to the power cycle with no reset first (classes A
-  and C).** An exception to I19, I22 and I27 for two off-bus classes no reset has been seen to heal.
-  Class A: the off-bus set is exactly one or more whole UBB trays (the I16 tray map places every chip)
-  and at least one chip is still on the bus. Class C: every chip is off the bus, either at the startup
-  gate or after a mesh reset already ran and failed (nonzero exit or unhealthy verify) since the mesh
-  was last released; a whole-bus drop first seen at run time still gets its one mesh reset. When the
+  and C).** An exception to I19, I22 and I27 for two off-bus classes no further reset has been seen
+  to heal. Class A: the off-bus set is exactly one or more whole UBB trays (the I16 tray map places
+  every chip) and at least one chip is still on the bus. Class C: every chip is off the bus after a
+  mesh reset already ran and failed (nonzero exit or unhealthy verify) since the mesh was last
+  released. A whole-bus drop with no failed reset gets its one mesh reset first, at the startup gate
+  as at run time: the startup gate also runs after a broker restart, and one mesh reset has healed an
+  all-off bus there and at run time. When the
   power cycle is opted in, `escalate()` requests it for these classes before any rung fires (after the
   I19 rescan and capture, which still run once per episode): no mesh reset, no SBR, no tray re-power
   and no last-chance sweep, and the host rung's own sweep skips itself for these classes
@@ -701,8 +703,9 @@ each rung fires only when the gentler one failed or cannot apply.
   of a failed reset). The host that comes back runs the startup gate, which waits for the hugepage
   pool and passes the full health check, fabric included, before any release (03 I4); a failed check
   keeps the hold and climbs. Partial drops (a single chip, or part of one tray) keep the full ladder.
-  Evidence from one Galaxy host: 0 of 50 whole-tray drops healed without a power cycle; on all-off
-  drops each repeat mesh reset ran 130-262 s and exited 1, and three of them took the host down.
+  Evidence: no whole-tray drop healed without a power cycle (0 of 50, 0 of 23 and 0 of 90 on three
+  Galaxy hosts); on all-off drops whose first mesh reset failed, each repeat on the unchanged set ran
+  130-262 s and exited 1.
 
 - **I58 — A mesh reset that failed is remembered for the boot, across broker restarts.** Every mesh
   reset that launched and failed (an exit code was read: nonzero, or zero with an unhealthy verify)
@@ -1173,9 +1176,9 @@ sees a silent fabric pass.
 | I36 present mesh: a forced window skips the failed reset; the grace-cadence retry still resets | `tests/test_no_repeat_failed_rung.py::test_a_forced_present_mesh_window_skips_the_failed_reset`, `::test_a_non_forced_grace_retry_still_resets_a_present_mesh` |
 | I36 / I32 every reset on this path is followed by the full verify, fabric included; a failed verify keeps the hold and climbs | `tests/test_no_repeat_failed_rung.py::test_every_reset_is_verified_with_the_fabric_and_a_failed_verify_keeps_the_hold_and_climbs` |
 | I36 time to recover (fake-clock replay): power cycle at 923 s vs 1186 s, one reset vs one per window | `tests/test_no_repeat_failed_rung.py::test_replay_the_power_cycle_fires_one_reset_sooner`, `::test_replay_with_no_host_rung_the_reset_loop_ends_in_one_hand_off` |
-| I37 the fault class: whole trays with a chip still on the bus (A), all off at startup or after a failed mesh reset (C); partial drops and no tray map are neither | `tests/test_classac_power_cycle_direct.py::test_the_fault_class_of_an_off_bus_set` |
+| I37 the fault class: whole trays with a chip still on the bus (A), all off after a failed mesh reset (C), at startup or at run time; partial drops and no tray map are neither | `tests/test_classac_power_cycle_direct.py::test_the_fault_class_of_an_off_bus_set` |
 | I37 class A (gate and idle hold): the rescan and capture, then the power cycle with no reset, tray re-power or sweep | `tests/test_classac_power_cycle_direct.py::test_a_whole_tray_goes_to_the_power_cycle_with_no_reset`, `::test_an_idle_whole_tray_hold_cycles_with_no_reset` |
-| I37 class C: all off at startup cycles at once; all off after one failed mesh reset cycles with no second reset and no sweep | `tests/test_classac_power_cycle_direct.py::test_all_off_at_startup_goes_straight_to_the_power_cycle`, `::test_all_off_after_a_failed_mesh_reset_cycles_with_no_second_reset` |
+| I37 class C: all off at startup (a broker restart) with no failed reset gets exactly one mesh reset, then cycles; all off after a failed mesh reset cycles with no second reset and no sweep, at startup or at run time | `tests/test_classac_power_cycle_direct.py::test_all_off_at_startup_gets_one_mesh_reset_first`, `::test_all_off_at_startup_after_a_failed_reset_cycles_with_no_reset`, `::test_all_off_after_a_failed_mesh_reset_cycles_with_no_second_reset` |
 | I37 the failed-reset mark: set by a mesh reset that exits nonzero or verifies unhealthy, not by a healthy one; cleared at the episode end | `tests/test_classac_power_cycle_direct.py::test_the_failed_reset_mark_is_set_by_a_failed_reset_and_cleared_at_the_episode_end` |
 | I37 partial drops (one chip, part of one tray) keep the full ladder | `tests/test_classac_power_cycle_direct.py::test_a_partial_drop_keeps_the_ladder` |
 | I37 a reset in scope, a tenant, a stand-back marker or a rate-limit denial holds and fires nothing; no power cycle opted in keeps the ladder | `tests/test_classac_power_cycle_direct.py::test_a_guard_holds_the_power_cycle_and_fires_nothing`, `::test_with_no_power_cycle_opted_in_the_ladder_runs` |
