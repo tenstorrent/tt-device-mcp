@@ -65,6 +65,10 @@ AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
 # unreadable-ledger fail-closed below are untouched — they remain the boot-loop denial. Default
 # 1800s (30 min); TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC overrides.
 POWER_CYCLE_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC", "1800"))
+# A power cycle that interval ALONE refused is retried this many seconds after the interval ends, by
+# the hold-deadline watchdog (power_cycle_retry_due), rather than at its next ceiling window — which
+# can land up to a whole window after the cap expired.
+POWER_CYCLE_RETRY_SLACK_SEC = 5
 
 # A host reboot or power cycle the broker has requested takes the box down, and an external cycler
 # (a POWER_CYCLE_CMD wrapper) may run it some time after the request returns. A device reset the
@@ -308,6 +312,9 @@ class RecoveryMechanism:
         # ladder is blocked / exhausted" event to once per episode instead of every gate pass on a
         # held box.
         self._auto_recovery_denied_episode = ""
+        # (hold episode, epoch) at which a power cycle refused only by its min interval may run again;
+        # ("", 0.0) when none is pending. Read by the hold-deadline watchdog.
+        self._power_cycle_retry: tuple[str, float] = ("", 0.0)
 
         # The host-level action (reboot / power-cycle) last requested and when (monotonic). Set once
         # its record is on disk, cleared if it fails to launch; read by the hold watchdog, which
@@ -920,6 +927,8 @@ class RecoveryMechanism:
         # action by the general loop-guard interval. For a power cycle rank==2 gates only prior
         # power cycles, so this interval is exactly "30 min between power cycles".
         min_interval = POWER_CYCLE_MIN_INTERVAL_SEC if action == "power-cycle" else AUTO_RECOVERY_MIN_INTERVAL_SEC
+        interval_why = ""
+        interval_ends = 0.0
         for rec in ledger:
             # A weaker prior rung does not gate a stronger escalation — that is what lets a failed
             # reboot hand off to the power cycle without waiting out the interval. Equal-or-stronger
@@ -939,21 +948,45 @@ class RecoveryMechanism:
                     f"(fail closed)"
                 )
             since = now_epoch - at
-            if since < min_interval:
-                return False, (
+            if since < min_interval and at + min_interval > interval_ends:
+                # The prior action may well have recovered the device and a new fault followed, so the
+                # text says only what is known: when it ran and when this one may.
+                interval_ends = at + min_interval
+                interval_why = (
                     f"a {rec.get('action')} auto-recovery was {int(since)}s ago (< "
-                    f"{min_interval}s min): a {action} that did not fix "
-                    f"the device will not fix it now — this is the boot-loop guard"
+                    f"{min_interval}s min): no {action} for {int(min_interval - since) + 1}s more — "
+                    f"this is the boot-loop guard"
                 )
+        cap_why = ""
         boot_id = self._current_boot_id()
         if boot_id:
             this_boot = sum(1 for r in ledger if r.get("boot_id") == boot_id)
             if this_boot >= AUTO_RECOVERY_MAX_PER_BOOT:
-                return False, (
+                cap_why = (
                     f"already auto-escalated {this_boot}x this boot "
                     f"(cap {AUTO_RECOVERY_MAX_PER_BOOT}); holding {action}"
                 )
+        if interval_why:
+            # Refused by the power cycle's interval alone: have the watchdog retry it as the interval
+            # ends. Any other limit also standing (the per-boot cap) schedules nothing.
+            if action == "power-cycle" and not cap_why:
+                episode = self._device_hold_episode_since() or ""
+                self._power_cycle_retry = (episode, interval_ends + POWER_CYCLE_RETRY_SLACK_SEC)
+            return False, interval_why
+        if cap_why:
+            return False, cap_why
         return True, ""
+
+    def power_cycle_retry_due(self, now_epoch: Optional[float] = None) -> bool:
+        """True once a power cycle refused only by its min interval may run again, in the hold episode
+        that was refused. The watchdog then forces one ladder pass; the governor still decides."""
+        episode, at = self._power_cycle_retry
+        if not at or not episode or episode != (self._device_hold_episode_since() or ""):
+            return False
+        return (time.time() if now_epoch is None else now_epoch) >= at
+
+    def clear_power_cycle_retry(self) -> None:
+        self._power_cycle_retry = ("", 0.0)
 
     def _reboot_already_attempted(self, *, now_epoch: Optional[float] = None) -> bool:
         """True if the broker already auto-rebooted for the wedge it is still looking at: a reboot
