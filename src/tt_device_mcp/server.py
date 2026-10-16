@@ -9757,17 +9757,27 @@ def _close_stale_startup_hold(hold: dict) -> None:
         logger.info(f"STARTUP closed a startup hold of {int(held_s)}s left open by the last broker")
 
 
-def _journal_startup_hold_released(closed: FsmRecord, held_since: Optional[float] = None) -> None:
+def _journal_startup_hold_released(
+    closed: FsmRecord, held_since: Optional[float] = None, carried_over: bool = False
+) -> None:
     """Close the ``startup_fabric_hold`` row: the door this broker start held is open again.
     ``prior_why`` is the last fault the episode carried — ``startup_unverified`` when the startup
     verify itself passed, something else when the hold turned into a real fault first.
     ``held_since`` is the hold row's own timestamp, so ``held_s`` is the hold's length whichever
-    path closed it, independent of the episode's ``since``."""
+    path closed it, independent of the episode's ``since``.
+
+    ``carried_over`` marks a fault episode this start inherited (a broker power cycle, a host
+    crash): it has no hold row, so ``held_s`` runs from the episode's own ``since`` and the row
+    names it (``episode_since``). Without this row the episode's end is in the journal only as a
+    verified clear, and a reader timing recovery runs it into the next episode."""
     try:
         held_s = max(0.0, time.time() - float(held_since)) if held_since else _episode_elapsed_sec(closed.since)
     except (TypeError, ValueError):
         held_s = _episode_elapsed_sec(closed.since)
-    health_event("startup_fabric_released", prior_why=closed.why, detail=closed.detail, held_s=round(held_s, 1))
+    extra = {"carried_over": True, "episode_since": closed.since} if carried_over else {}
+    health_event(
+        "startup_fabric_released", prior_why=closed.why, detail=closed.detail, held_s=round(held_s, 1), **extra
+    )
     if logger:
         logger.info(f"STARTUP hold released after {int(held_s)}s (last why: {closed.why})")
 
@@ -9955,7 +9965,8 @@ async def run_startup_tasks() -> None:
     #     (the hold may since have turned into another fault, so the why is not checked);
     #   - a hold still open but a fresh episode: close the old hold, then hold afresh;
     #   - no hold open: only a startup_unverified episode gets one — a carried-over fault episode
-    #     already has its own rows and keeps its own why.
+    #     already has its own rows and keeps its own why, but its lift still gets the release row
+    #     (carried_over), so the journal shows where that episode ended.
     try:
         if open_hold is not None and open_episode is not None:
             fsm.on_next_close(functools.partial(_journal_startup_hold_released, held_since=open_hold.get("ts")))
@@ -9966,6 +9977,8 @@ async def run_startup_tasks() -> None:
                 held_since = time.time()
                 health_event("startup_fabric_hold", why="broker start: awaiting the startup fabric verify")
                 fsm.on_next_close(functools.partial(_journal_startup_hold_released, held_since=held_since))
+            elif open_episode is not None:
+                fsm.on_next_close(functools.partial(_journal_startup_hold_released, carried_over=True))
     except Exception as e:  # noqa: BLE001 - bookkeeping must never block startup
         if logger:
             logger.error(f"STARTUP startup-hold journal failed: {e}")
