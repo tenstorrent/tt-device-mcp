@@ -1,6 +1,6 @@
 """Spec 04 I59: the broker's own device work never reads as a tenant.
 
-blx03 replay: a chip dropped during the post-reset fabric check; the dead-chip rescue SIGKILLed the
+Field replay: a chip dropped during the post-reset fabric check; the dead-chip rescue SIGKILLed the
 fabric check and a root helper, and the next holder scan, taken while both were still exiting (named
 by the driver, fd table gone), read incomplete. The host rung was then denied as "a tenant holds the
 device" and the hold sat 8 min to the next ceiling window.
