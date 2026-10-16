@@ -18,8 +18,11 @@ from tests.test_device_safety import _arm_offbus_stuck_hold, _arm_stuck_hold
 from tt_device_mcp import alert, privileges
 from tt_device_mcp import server as srv
 from tt_device_mcp.health import recovery as recovery_pkg
+from tt_device_mcp.health.evidence import health_dir
+from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery import offbus_power_cycle as opc
+from tt_device_mcp.health.recovery.base import POWER_CYCLE_MIN_INTERVAL_SEC, RESET_RECORD_FILE
 
 EXPECTED = 32
 OFF_BUS = 4  # chips 28-31 off the bus, below the galaxy-reset floor
@@ -38,11 +41,13 @@ def _episode(monkeypatch, *, power_cycle=False, clock=None, off_bus=OFF_BUS):
     monkeypatch.setattr(opc, "health_event", lambda kind, **f: events.append(kind))
     monkeypatch.setattr(alert, "send_alert", lambda event, log=None: alerts.append(event))
     counters["sweeps"] = counters["trays"] = 0
+    _fresh_reset_record(monkeypatch)
 
     async def reset(indices, log):
         # The reset ran (it stamps the reset clock, as the real one does before it fires) and exited 1.
         counters["resets"] += 1
         srv.recovery_mechanism.last_reset_monotonic = time.monotonic()
+        srv.recovery_mechanism.last_reset_rc = 1
         srv.recovery_mechanism.last_reset_exit_nonzero = True
         srv.recovery_mechanism.last_reset_failed = True
         if clock is not None:
@@ -72,6 +77,12 @@ def _episode(monkeypatch, *, power_cycle=False, clock=None, off_bus=OFF_BUS):
 
 async def _window(force=True):
     return await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=force)
+
+
+def _fresh_reset_record(monkeypatch):
+    """Each episode starts on a boot with no failed reset recorded (spec 04 I58)."""
+    (health_dir() / RESET_RECORD_FILE).unlink(missing_ok=True)
+    monkeypatch.setattr(srv.recovery_mechanism, "_reset_record_cache", None)
 
 
 def _ids():
@@ -148,13 +159,32 @@ async def test_a_changed_off_bus_set_lets_the_reset_run_again(monkeypatch, clear
 
 
 @pytest.mark.asyncio
-async def test_a_new_hold_episode_resets_again(monkeypatch, clear_job_state):
-    """The record is keyed by the episode: the same set in a new hold gets its reset."""
+async def test_a_new_hold_episode_on_the_same_set_does_not_reset_again(monkeypatch, clear_job_state):
+    """The record is keyed by the boot, not the episode (spec 04 I58): the same off-bus set in a new
+    hold of the same boot does not get the reset that already failed on it."""
     counters, events, _ = _episode(monkeypatch)
     assert await _window() is True and counters["resets"] == 1
     srv.device_hold_episode_since = (datetime.now() - timedelta(minutes=20)).isoformat()
     assert await _window() is True
-    assert counters["resets"] == 2 and SKIP not in events
+    assert counters["resets"] == 1 and SKIP in events
+
+
+@pytest.mark.asyncio
+async def test_a_reset_that_never_launched_is_not_recorded(monkeypatch, clear_job_state):
+    """The reset clock is stamped before launch, so it cannot tell a launched reset from one that never
+    exited (rc None, still cycling or not started): only a launched one that failed is recorded."""
+    counters, events, _ = _episode(monkeypatch)
+
+    async def unlaunched(indices, log):
+        counters["resets"] += 1
+        srv.recovery_mechanism.last_reset_monotonic = time.monotonic()
+        srv.recovery_mechanism.last_reset_rc = None
+        return False
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", unlaunched)
+    hold_since = srv.device_hold_episode_since
+    assert await _window() is True and counters["resets"] == 1
+    assert not srv.recovery_mechanism.rung_failed_unchanged(hold_since, "mesh_reset", _ids())
 
 
 @pytest.mark.asyncio
@@ -189,6 +219,7 @@ def _present_mesh(monkeypatch):
     async def reset(indices, log):
         counters["resets"] += 1
         srv.recovery_mechanism.last_reset_monotonic = time.monotonic()
+        srv.recovery_mechanism.last_reset_rc = 1
         srv.recovery_mechanism.last_reset_failed = True
         return False
 
@@ -390,6 +421,38 @@ async def test_a_denied_power_cycle_after_the_failed_reset_is_retried_next_windo
     assert counters["resets"] == 1 and counters["power_cycles"] == 1 and counters["sweeps"] == 0
 
 
+@pytest.mark.asyncio
+async def test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cycle_cooldown(
+    monkeypatch, clear_job_state
+):
+    """I38 with I65: the host booted 3 min ago and one chip stays off after the failed mesh reset. The
+    climb still skips the ceiling wait and the sweep (I38), but the power cycle waits out the cooldown
+    counted from that boot, with its deadline set for the watchdog; no reset fires meanwhile (I36,
+    I58), and the cycle fires once the cooldown has run out. Nothing releases the hold."""
+    clock = [ONE_SHOT]
+    counters, events, _ = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=1)
+    mech = srv.recovery_mechanism
+    boot = [time.time() - 180]
+    monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int(boot[0])))
+    monkeypatch.setattr(mech, "last_verified_release", lambda: None)
+    monkeypatch.setattr(mech, "power_cycle_retry", None)
+    monkeypatch.setattr(mech, "power_cycle_cooldown_state", None)
+    monkeypatch.delenv(recovery_base.POWER_CYCLE_HISTORY_FILE_ENV, raising=False)
+    assert await _window() is True
+    assert "host_rung_not_deferred" in events and counters["sweeps"] == 0, "I38: no ceiling wait, no sweep"
+    assert counters["resets"] == 1 and counters["power_cycles"] == 0, "I65: the cycle waits for the cooldown"
+    until = int(boot[0]) + POWER_CYCLE_MIN_INTERVAL_SEC
+    assert mech.power_cycle_retry[0] == until, "the watchdog asks again at the cooldown's end"
+    assert mech.power_cycle_cooldown_state["cause"] == "host boot"
+    clock[0] = 600.0
+    assert await _window() is True
+    assert counters["resets"] == 1 and counters["power_cycles"] == 0 and counters["sweeps"] == 0
+    boot[0] -= POWER_CYCLE_MIN_INTERVAL_SEC  # the cooldown has run out
+    assert await _window() is True
+    assert counters["resets"] == 1 and counters["power_cycles"] == 1 and counters["sweeps"] == 0
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing released the hold"
+
+
 # --- spec 04 I39: one early retry after a failed mesh reset whose off-bus set shrank -------------------
 
 
@@ -481,6 +544,7 @@ def _progress_episode(monkeypatch, after_each_reset):
         srv.recovery_mechanism.last_reset_monotonic = time.monotonic()
         srv.recovery_mechanism.last_reset_exit_nonzero = True
         srv.recovery_mechanism.last_reset_failed = True
+        srv.recovery_mechanism.last_reset_rc = 1
         clock[0] += 132
         state["off"] = set(after_each_reset[min(counters["resets"], len(after_each_reset)) - 1])
         return False
@@ -563,3 +627,27 @@ async def test_the_progress_retry_releases_only_after_the_full_fabric_verify(mon
     else:
         assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a failed verify keeps the hold"
         assert counters["power_cycles"] == 1, "and goes on to the host rung (I38)"
+
+
+# --- the record across a broker restart and a new boot (spec 04 I58) ------------------------------
+
+
+def _restart(monkeypatch):
+    """A broker restart: the in-memory state goes, the health dir stays."""
+    mech = srv.recovery_mechanism
+    monkeypatch.setattr(mech, "_reset_record_cache", None)
+    monkeypatch.setattr(mech, "mesh_reset_failed_since_release", False)
+    monkeypatch.setattr(mech, "last_reset_monotonic", 0.0)
+
+
+@pytest.mark.asyncio
+async def test_the_failed_reset_survives_a_broker_restart_but_not_a_new_boot(monkeypatch, clear_job_state):
+    counters, events, _ = _episode(monkeypatch)
+    assert await _window() is True and counters["resets"] == 1
+    _restart(monkeypatch)
+    assert await _window() is True
+    assert counters["resets"] == 1 and SKIP in events, "after the restart the failed reset is not run again"
+    _restart(monkeypatch)
+    monkeypatch.setattr(srv.recovery_mechanism, "_current_boot_id", lambda: "another-boot")
+    assert not srv.recovery_mechanism.rung_failed_unchanged("", "mesh_reset", _ids()), "a new boot starts fresh"
+    assert await _window() is True and counters["resets"] == 2

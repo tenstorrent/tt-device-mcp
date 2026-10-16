@@ -241,7 +241,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS` | 2 | Jobs in a row that die on the fabric's routing after a 77 pass before a known fabric fault holds without a reset (I46) | 03 |
 | `TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC` | 21600 | Age past which a known fabric fault expires and the usual 77 path gets one more try (I46) | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD` | 1 | Hold tenant jobs at the door while degraded (vs fail-fast) | 03 |
-| `TT_DEVICE_MCP_TENANT_HOLD_POLL_SEC` | 60 | Held-job re-check cadence | 03 |
+| `TT_DEVICE_MCP_TENANT_HOLD_POLL_SEC` | 60 | Held-job re-check cadence when no release wakes it (03 I65) | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` | hold deadline (1200) | Longest a held job waits before it fails and the hold escalates; no value disables it | 01 |
 | `TT_DEVICE_MCP_TENANT_UIDS` | unset | Comma-separated uids or user names below 1000 whose device holders count as tenants. Root is ignored; a name that does not resolve is retried on the next scan | 04 |
 | `TT_DEVICE_MCP_HOLD_DEADLINE_SEC` | 2× stuck ceiling (1200) | Hold age flagged STUCK to the durable timeline | 03 |
@@ -270,7 +270,8 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` | unset (off) | Opt-in command the broker runs and waits for before an auto power cycle (drain other workloads) | 04 |
 | `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC` | 300 (max 3600) | Pre-power-cycle hook timeout; its process group is killed past it and the cycle goes ahead | 04 |
 | `TT_DEVICE_MCP_AUTO_UBB_RESET` | 1 | Arm the per-tray UBB reset rung | 04 |
-| `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK` | 0 | `1` lets the tray walk re-power one tray for a below-floor drop on that tray (spec 04 I25) | 04 |
+| `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK` | 0 | `1` lets the tray walk re-power one tray for a below-floor drop on that tray, and a tray wholly off the bus in a below-floor drop (spec 04 I25) | 04 |
+| `TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS` | 7 | How long a tray re-power that regressed the mesh keeps the per-tray rung disabled on this host, across reboots (spec 04 I25) | 04 |
 | `TT_DEVICE_MCP_AUTO_MESH_RESET` | unset | `0` holds every automatic mesh reset, `1` arms it; unset, an outage hold (reboot, power cycle and tray reset all `0`) holds it | 04 |
 | `TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC` | 3600 | While a held mesh reset or a topology hardware-fault hold stands, page again after this long; `0` pages once per hold | 03, 04 |
 | `TT_DEVICE_MCP_UBB_RESET_SETTLE_SEC` | 28 | Settle time after a UBB tray reset | 04 |
@@ -291,6 +292,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC` | 1200 | With no `TT_DEVICE_MCP_POWER_CYCLE_CMD`, how long a gated off-bus hold stands for an operator, from the episode start, before the broker lifts the `hold` gate for one pass of its own reset ladder (I33); `off` keeps the hold for an operator | 04 |
 | `TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC` | 300 | How long after an off-bus hold's per-tray reset walk failed to recover the mesh (or regressed it) before the I27 power cycle may run; no below-floor mesh reset runs in between | 04 |
 | `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` | 21600 | At most one I27 attempt per this many seconds per host; within it the broker pages instead | 04 |
+| `TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE` | unset | Read-only: a JSON-lines file of power cycles an external cycler fired (`at_epoch`, optional `cause`); its latest record is one more anchor of the I65 power-cycle cooldown. Unset or unreadable adds none; it never shortens or skips the cooldown | 04 |
 | `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC` | 1800 | How long past the grace a tenant, a reset scope or a stand-back may block the I27 power cycle before the broker pages once | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE` | unset | `:`-separated marker paths; any that exists holds the I27 power cycle | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD` | unset | Command; exit 0 holds the I27 power cycle, 1 clears, anything else holds | 04 |

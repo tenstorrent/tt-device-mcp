@@ -127,6 +127,9 @@ class Evidence:
     off_bus_before: Optional[int]
     reset_exit_nonzero: bool
     holding_fabric_unverified: bool = False
+    # Spec 03 I61: a clean post-job eth read timed out on a present mesh, and this hold episode's one
+    # present-mesh reset is unspent and not refused by the outage hold. Routed like dispatch_reset_due.
+    eth_timeout_reset_due: bool = False
     # Spec 03 I55: the fabric passed traffic but mesh dispatch failed over a present mesh, and this
     # hold episode has not had its one present-mesh reset yet (nor does the outage hold forbid it).
     dispatch_reset_due: bool = False
@@ -376,6 +379,7 @@ class Recovery(ABC):
         phase: str = "verify_device",
         run_eth: bool = False,
         fabric_stale: bool = True,
+        eth_timeout_reset: bool = False,
     ) -> tuple[bool, dict]:
         """Is the mesh usable? A thin adapter over :meth:`HealthMonitor.update` — the ONE probe
         pass implementation (see monitor.py); this method exists only as the seam
@@ -392,7 +396,13 @@ class Recovery(ABC):
         placeholder string.
         """
         state = await self.monitor.update(
-            phase, run_fabric=run_fabric, run_eth=run_eth, fabric_stale=fabric_stale, expected=expected, log=log
+            phase,
+            run_fabric=run_fabric,
+            run_eth=run_eth,
+            fabric_stale=fabric_stale,
+            eth_timeout_reset=eth_timeout_reset,
+            expected=expected,
+            log=log,
         )
         return state.healthy, state.as_evidence()
 
@@ -631,6 +641,9 @@ class Recovery(ABC):
         # foreign scope or a clean-exit-but-unverified reset must not leave a stale hard-fail flag that
         # steers the next gate's escalation to the cold rung over a reset that never hard-failed.
         self.mechanism.last_reset_exit_nonzero = False
+        # Set only once a reset of ours launched and exited: a refused, adopted or still-cycling one
+        # leaves None, and only a launched one that failed goes in the boot's record (spec 04 I58).
+        self.mechanism.last_reset_rc = None
         argv = select_recovery(self.monitor, self.mechanism, self.deps).reset_argv(indices)
         expected = self.monitor.expected(len(indices))
 
@@ -681,6 +694,7 @@ class Recovery(ABC):
         finally:
             if aer_mask is not None:
                 await asyncio.to_thread(aer_mask.restore)
+        self.mechanism.last_reset_rc = rc
         if _journal_cpld_too_old(argv, out, log):
             # Latched on the mechanism both platforms share, so the NEXT rung and every later pass
             # resolve to the galaxy ladder rather than repeating the `-r` tt-smi just disowned.
@@ -699,6 +713,7 @@ class Recovery(ABC):
             if rc is not None:
                 self.mechanism.last_reset_failed = True
                 self.mechanism.last_reset_exit_nonzero = True
+                self.mechanism.mesh_reset_failed_since_release = True
             metrics.stage_fired("smi_reset", "timeout" if rc is None else "failed")
             return False
 
@@ -738,6 +753,8 @@ class Recovery(ABC):
             fabric_retries=retries,
         )
         self.mechanism.last_reset_failed = not healthy
+        if not healthy:
+            self.mechanism.mesh_reset_failed_since_release = True
         if healthy:
             log("reset complete + health verified")
             return True

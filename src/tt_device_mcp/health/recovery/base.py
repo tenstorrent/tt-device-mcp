@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
+import math
 import os
 import subprocess
 import time
@@ -55,6 +56,16 @@ HOLD_ESCALATION_REARM_SEC = int(os.environ.get("TT_DEVICE_MCP_HOLD_REARM_SEC", "
 AUTO_RECOVERY_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_AUTO_RECOVERY_INTERVAL_SEC", "3600"))
 AUTO_RECOVERY_MAX_PER_BOOT = 1
 AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
+# This boot's failed mesh resets (spec 04 I58): which off-bus set each one ran on and left, and its exit
+# code. On disk, so a broker restart in the middle of an episode does not forget a reset that already
+# failed and run it again; keyed by the kernel boot id, so the boot a power cycle brings starts empty.
+RESET_RECORD_FILE = "reset_record.json"
+RESET_RECORD_MAX = 64
+
+
+def _chip_key(chip: str) -> tuple:
+    return (0, int(chip), "") if chip.isdigit() else (1, 0, chip)
+
 
 # The power cycle's own spacing guard: at least this long between two power cycles. It is
 # wall-clock and durable on disk (the same ledger the boot-loop guard reads), so it spans the
@@ -65,10 +76,76 @@ AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
 # unreadable-ledger fail-closed below are untouched — they remain the boot-loop denial. Default
 # 1800s (30 min); TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC overrides.
 POWER_CYCLE_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC", "1800"))
-# A power cycle that interval ALONE refused is retried this many seconds after the interval ends, by
-# the hold-deadline watchdog (power_cycle_retry_due), rather than at its next ceiling window — which
-# can land up to a whole window after the cap expired.
-POWER_CYCLE_RETRY_SLACK_SEC = 5
+# Spec 04 I65: that interval is a cooldown counted from the LATEST power cycle or boot of this host,
+# whoever caused it — the broker's own reboot or power cycle (the ledger), the host's current boot
+# (a manual, datacenter or external cycle shows only there), and an external cycler's history file
+# when one is named and readable. After two consecutive broker power cycles no heal followed, it
+# doubles for each further one, capped here; a verified release (a passing full health check)
+# resets the streak.
+POWER_CYCLE_BACKOFF_CAP_SEC = 4 * 3600
+# A JSON-lines file an external power cycler appends to (``at_epoch``, optional ``cause``); read only.
+POWER_CYCLE_HISTORY_FILE_ENV = "TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE"
+POWER_CYCLE_HEALED_FILE = "power_cycle_healed.json"
+
+
+def power_cycle_interval_sec(failed_cycles: int) -> int:
+    """The cooldown after ``failed_cycles`` consecutive broker power cycles no heal followed: the
+    base interval for 0 or 1, then doubled for each further one, never above the cap (spec 04 I65)."""
+    base = POWER_CYCLE_MIN_INTERVAL_SEC
+    if failed_cycles < 2:
+        return base
+    return max(base, min(base * 2 ** (failed_cycles - 1), POWER_CYCLE_BACKOFF_CAP_SEC))
+
+
+def _local_time(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch).isoformat(sep=" ", timespec="seconds")
+
+
+def _epoch(value) -> Optional[float]:
+    """``value`` as a finite epoch, or None (missing, garbage, NaN or infinite)."""
+    try:
+        at = float(value)
+    except (TypeError, ValueError):
+        return None
+    return at if math.isfinite(at) else None
+
+
+def _past_epoch(value, now: float) -> Optional[float]:
+    """``value`` as a finite epoch no later than ``now``, or None. A stamp later than now (a clock that
+    disagrees) anchors nothing in the I65 cooldown: taken as is it would hold a cycle past the stated
+    gaps, and as the max it would hide every valid record before it."""
+    at = _epoch(value)
+    return at if at is not None and at <= now else None
+
+
+def _epoch_after(value, than: float, now: float) -> bool:
+    """A record stamped after ``than`` and not later than ``now``; an unreadable stamp counts."""
+    at = _epoch(value)
+    return True if at is None else than < at <= now
+
+
+def _last_external_power_cycle(now_epoch: float) -> Optional[tuple[float, str]]:
+    """The latest ``at_epoch`` in the external cycler's history file no later than ``now_epoch``, and
+    its cause, or None when no file is named or it cannot be read (the host's boot time still covers
+    any cycle that took the box down). Malformed, non-finite and future lines are skipped."""
+    name = os.environ.get(POWER_CYCLE_HISTORY_FILE_ENV, "").strip()
+    if not name:
+        return None
+    try:
+        lines = Path(name).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    best: Optional[tuple[float, str]] = None
+    for ln in lines:
+        try:
+            rec = json.loads(ln)
+            at = _past_epoch(rec.get("at_epoch"), now_epoch)
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if at is not None and (best is None or at > best[0]):
+            best = (at, str(rec.get("cause") or "external power cycle"))
+    return best
+
 
 # A host reboot or power cycle the broker has requested takes the box down, and an external cycler
 # (a POWER_CYCLE_CMD wrapper) may run it some time after the request returns. A device reset the
@@ -93,6 +170,12 @@ def host_action_pending_sec() -> float:
     return min(v, HOST_ACTION_PENDING_MAX_SEC)
 
 
+class HostActionTimedOut(RuntimeError):
+    """A host reboot / power-cycle command that timed out rather than exited non-zero. It may have
+    launched its detached cycler before it stopped answering, so the request stays pending (with its
+    normal bound) instead of reading as "never launched"."""
+
+
 # The host-level recovery rungs, ordered by severity. A warm reboot recovers most wedges; a
 # whole-bus wedge survives it and only the chassis power cycle clears it (measured on box D).
 # The min-interval loop guard is therefore PER SEVERITY: a stronger rung may escalate past a
@@ -100,6 +183,17 @@ def host_action_pending_sec() -> float:
 # before the power cycle that will — but no rung may re-fire itself inside the interval (its own
 # loop guard), and a stronger rung that fired blocks de-escalating back to a weaker one.
 AUTO_RECOVERY_RANK = {"reboot": 1, "power-cycle": 2}
+
+# A power cycle whose following boot reached a VERIFIED-healthy release (a gate pass whose fabric
+# check ran and passed) recovered the box: a new fault after it is a new episode, not a boot loop, so
+# that cycle gates no later rung — neither the next cycle nor a reboot (spec 04 I9, I10). The stamp is
+# durable beside the ledger. Only a cycle no later boot ever verified still gates — the true loop. The
+# hard backstop below counts every power cycle, verified or not: past it the broker pages instead of
+# cycling a flapping tray on a serving host forever, and every cycle in the window gates the reboot
+# again as an unverified one would.
+AUTO_RECOVERY_VERIFIED = "auto_recovery_verified.json"
+POWER_CYCLE_BACKSTOP_MAX = 3
+POWER_CYCLE_BACKSTOP_WINDOW_SEC = 7200
 
 # The metrics.STAGES name for each auto-recovery action _fire_recovery_escalation ever fires. An
 # explicit table, not a ternary: a third action added here later must fail loud (KeyError) rather
@@ -200,6 +294,49 @@ def refuse_mesh_reset(context: str, argv: list, log, off_bus: int = 0) -> bool:
     return True
 
 
+def _later_boot_verified(boot_id, at: Optional[float], verified: Optional[dict], now: float) -> bool:
+    """Whether the verified-healthy release ``verified`` came on a boot other than ``boot_id`` and
+    after ``at``: the box came up from that event and proved itself healthy. Any unknown boot id, or
+    a missing, non-finite or future stamp, reads False: the event still gates."""
+    if not verified or at is None:
+        return False
+    ver_boot = verified.get("boot_id")
+    ver_at = _past_epoch(verified.get("at_epoch"), now)
+    if not boot_id or not ver_boot or boot_id == ver_boot or ver_at is None:
+        return False
+    return ver_at > at
+
+
+def _verified_since(rec: dict, verified: dict, now: float) -> bool:
+    """Whether power-cycle ledger row ``rec`` was followed, on a LATER boot, by the verified-healthy
+    release ``verified``. Any unknown boot id or unreadable stamp reads False: the row still gates."""
+    if rec.get("action") != "power-cycle":
+        return False
+    return _later_boot_verified(rec.get("boot_id"), _epoch(rec.get("at_epoch")), verified, now)
+
+
+def _power_cycle_backstop_stamps(ledger: list[dict], now_epoch: float) -> list[float]:
+    """The times of every power cycle, verified or not, inside the backstop window. A row with no
+    readable stamp, or one later than now, is left out here; the interval loop fails closed on it."""
+    stamps = []
+    for rec in ledger:
+        if rec.get("action") != "power-cycle":
+            continue
+        at = _past_epoch(rec.get("at_epoch"), now_epoch)
+        if at is not None and now_epoch - at < POWER_CYCLE_BACKSTOP_WINDOW_SEC:
+            stamps.append(at)
+    return sorted(stamps)
+
+
+def _power_cycle_backstop_until(ledger: list[dict], now_epoch: float) -> Optional[float]:
+    """The epoch at which the backstop allows a power cycle again, or None when it is under the cap.
+    That is when enough of the oldest cycles left the window to bring the count below the cap."""
+    stamps = _power_cycle_backstop_stamps(ledger, now_epoch)
+    if len(stamps) < POWER_CYCLE_BACKSTOP_MAX:
+        return None
+    return stamps[-POWER_CYCLE_BACKSTOP_MAX] + POWER_CYCLE_BACKSTOP_WINDOW_SEC
+
+
 class RecoveryMechanism:
     """Shared, platform-invariant machinery. ``Recovery`` (recovery/__init__.py) holds this by
     composition as ``self.mechanism`` — never by inheritance — because this object's state
@@ -247,6 +384,10 @@ class RecoveryMechanism:
         # sequence and they must build it identically, because the scope name is what every other
         # protection keys on.
         self.reset_scope_seq = 0
+        # The newest power-cycle stamp the backstop already paged for, so a held box pages once per
+        # cap reached, not on every gate pass.
+        self._power_cycle_backstop_paged: float = 0.0
+        self._power_cycle_backstop_logged: float = 0.0
 
         # True while a reset is actually executing. A reset TAKES THE CHIPS OFF THE BUS — that is
         # what a reset is — so during one they read all-ones exactly like a dead chip, and isolating
@@ -258,6 +399,15 @@ class RecoveryMechanism:
         # Any reset_with_quiesce (the ladder's or a manual one) since the mesh was last released:
         # an off-bus set first seen after it is the reset's doing, never a tray-down onset (04 I19).
         self.reset_since_release = False
+        # A mesh reset ran to an exit and left the mesh unhealthy since the mesh was last released.
+        # With every chip still off the bus after it, a second one is futile (spec 04 I37): the
+        # episode goes straight to the power-cycle rung.
+        self.mesh_reset_failed_since_release = False
+        # Spec 04 I65: when a power cycle the cooldown denied may be asked again, and the hold episode
+        # it was denied in — the hold watchdog forces one escalation at that time. None when nothing waits.
+        self.power_cycle_retry: Optional[tuple[float, str]] = None
+        # The cooldown in force at the last power-cycle decision (until, last, cause, interval), for /health.
+        self.power_cycle_cooldown_state: Optional[dict] = None
 
         # The full transcript of the last reset, not the 3-line tail the journal carries: when a
         # mesh is left half-alive, the interesting line is usually somewhere in the middle.
@@ -279,12 +429,15 @@ class RecoveryMechanism:
         # made the drop worse — one Galaxy host went 4 -> 31 -> 32 off-bus across three — so the episode
         # goes straight to the host rung, or pages when none is opted in (spec 04 I31).
         self.regressed_reset_since: Optional[str] = None
-        # The hold episode (its ``since``) whose reset rungs failed, and per rung the off-bus set it
-        # failed with when it left that set unchanged. Firing it again on the same set measures nothing
-        # new (one Galaxy host ran six identical 263 s mesh resets in one hold, one per forced window),
-        # so the next window takes the next stronger rung instead (spec 04 I36).
-        self.failed_rungs_since: str = ""
-        self.failed_rungs: dict = {}
+        # This boot's reset rungs that ran and failed, with the off-bus set before and after each.
+        # Firing one again on a set it left unchanged measures nothing new (one Galaxy host ran six
+        # identical 263 s mesh resets in one hold, one per forced window), so the next window takes the
+        # next stronger rung instead (spec 04 I36). Loaded from RESET_RECORD_FILE on first use and
+        # written back before the next rung runs, so a broker restart keeps it (spec 04 I58).
+        self._reset_record_cache: Optional[tuple[Path, dict]] = None
+        # The exit code of the last reset this process launched; None when it was refused, never
+        # launched or timed out still cycling. Only a launched reset that failed is recorded.
+        self.last_reset_rc: Optional[int] = None
         # One early forced retry per hold episode after a failed mesh reset that brought chips back
         # (spec 04 I39): (episode, monotonic due time), and the episode that already spent it.
         self.progress_retry: Optional[tuple] = None
@@ -312,14 +465,13 @@ class RecoveryMechanism:
         # ladder is blocked / exhausted" event to once per episode instead of every gate pass on a
         # held box.
         self._auto_recovery_denied_episode = ""
-        # (hold episode, epoch) at which a power cycle refused only by its min interval may run again;
-        # ("", 0.0) when none is pending. Read by the hold-deadline watchdog.
-        self._power_cycle_retry: tuple[str, float] = ("", 0.0)
 
         # The host-level action (reboot / power-cycle) last requested and when (monotonic). Set once
         # its record is on disk, cleared if it fails to launch; read by the hold watchdog, which
         # starts no device reset while one is pending (see host_action_pending).
         self.host_action_requested: Optional[tuple[str, float]] = None
+        # The request a device reset was last refused for (one log line per request, spec 04 I34).
+        self._host_action_reset_refused: Optional[tuple[str, float]] = None
 
     def host_action_pending(self, now: Optional[float] = None) -> Optional[tuple[str, float]]:
         """``(action, age_sec)`` while a requested host reboot or power cycle is still inside its
@@ -332,8 +484,31 @@ class RecoveryMechanism:
         age = (time.monotonic() if now is None else now) - at
         if age >= host_action_pending_sec():
             self.host_action_requested = None
+            health_event("host_action_request_expired", action=action, bound_sec=int(host_action_pending_sec()))
             return None
         return action, age
+
+    def host_action_blocks_reset(self, log: Callable[[str], None], *, context: str) -> bool:
+        """True while a requested host reboot or power cycle is pending: no device reset (bridge,
+        tray re-power, galaxy/SMI reset) may start under it, whichever path asks (spec 04 I34). One
+        log line and one event per request; the device stays held, and the full health check runs
+        after the host comes back. Bounded by host_action_pending()'s window."""
+        pending = self.host_action_pending()
+        if pending is None:
+            return False
+        action, age = pending
+        req = self.host_action_requested
+        if self._host_action_reset_refused != req:
+            self._host_action_reset_refused = req
+            bound = int(host_action_pending_sec())
+            health_event(
+                "reset_suppressed_host_action", action=action, age_sec=int(age), bound_sec=bound, context=context
+            )
+            log(
+                f"{context}: no device reset — a host {action} was requested {int(age)}s ago and is pending "
+                f"(up to {bound}s); the device stays held until the host comes back and passes the full check"
+            )
+        return True
 
     def cooling(self) -> bool:
         """True while a reset that already failed is still inside its cooldown window.
@@ -356,18 +531,79 @@ class RecoveryMechanism:
         latched = self.regressed_reset_since
         return latched is not None and (latched == "*" or latched == hold_since)
 
-    def note_rung_failed(self, hold_since: str, rung: str, off_before, off_after) -> None:
-        """Record that ``rung`` failed in this hold episode (spec 04 I36). Only a failure that left the
-        off-bus set exactly as it found it is kept: a set that grew is a regression (I31) and one that
-        shrank is progress another try may finish."""
-        if not hold_since:
-            return
-        if self.failed_rungs_since != hold_since:
-            self.failed_rungs_since, self.failed_rungs = hold_since, {}
-        if off_before is not None and off_after is not None and set(off_before) == set(off_after):
-            self.failed_rungs[rung] = frozenset(off_after)
-        else:
-            self.failed_rungs.pop(rung, None)
+    def _reset_record(self) -> dict:
+        """This boot's failed-reset record, read from the health dir once per process (spec 04 I58).
+        A file from another boot, or with no boot id to match, starts a fresh record."""
+        path = health_dir() / RESET_RECORD_FILE
+        cached = self._reset_record_cache
+        if cached is not None and cached[0] == path:
+            return cached[1]
+        boot = self._current_boot_id() or ""
+        rec: dict = {"boot_id": boot, "failed": []}
+        raw = None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            health_event("reset_record_unreadable", path=str(path), error=repr(exc))
+        if isinstance(raw, dict) and boot and raw.get("boot_id") == boot and isinstance(raw.get("failed"), list):
+            rec["failed"] = [e for e in raw["failed"] if isinstance(e, dict)][-RESET_RECORD_MAX:]
+            if rec["failed"]:
+                health_event("reset_record_restored", boot_id=boot, failed=rec["failed"])
+        self._reset_record_cache = (path, rec)
+        return rec
+
+    def _save_reset_record(self, rec: dict) -> None:
+        path = health_dir() / RESET_RECORD_FILE
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(rec))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except OSError as exc:
+            # Kept in memory either way; only a broker restart before the next write forgets it.
+            health_event("reset_record_unwritable", path=str(path), error=repr(exc))
+
+    def note_rung_failed(self, hold_since: str, rung: str, off_before, off_after, rc: Optional[int] = None) -> None:
+        """Record that ``rung`` ran and failed this boot (spec 04 I36, I58), on disk before the caller
+        goes on to any other rung. Every launched failure counts toward class C (I37); only one that
+        left the off-bus set exactly as it found it stops a repeat: a set that grew is a regression
+        (I31) and one that shrank is progress another try may finish."""
+        rec = self._reset_record()
+        rec["failed"].append(
+            {
+                "rung": rung,
+                "rc": rc,
+                "off_before": None if off_before is None else sorted(map(str, off_before), key=_chip_key),
+                "off_after": None if off_after is None else sorted(map(str, off_after), key=_chip_key),
+                "episode": hold_since or "",
+                "at_epoch": time.time(),
+            }
+        )
+        del rec["failed"][:-RESET_RECORD_MAX]
+        self._save_reset_record(rec)
+
+    def failed_unchanged_entry(self, hold_since: str, rung: str, off_now) -> Optional[dict]:
+        """The record of ``rung`` failing this boot on exactly the off-bus set seen now, or None. A
+        non-empty set matches across hold episodes and broker restarts (I58); an empty set (a present
+        mesh) only within its own hold episode, as before (I36)."""
+        if off_now is None:
+            return None
+        now = set(map(str, off_now))
+        for entry in reversed(self._reset_record()["failed"]):
+            before, after = entry.get("off_before"), entry.get("off_after")
+            if entry.get("rung") != rung or before is None or after is None:
+                continue
+            if set(before) != now or set(after) != now:
+                continue
+            if not now and (not hold_since or entry.get("episode") != hold_since):
+                continue
+            return entry
+        return None
 
     def note_progress_retry(self, hold_since: str, delay_sec: float) -> bool:
         """Arm this episode's one early retry after a failed mesh reset whose off-bus set shrank (spec 04
@@ -391,11 +627,49 @@ class RecoveryMechanism:
         self.progress_retry = None
 
     def rung_failed_unchanged(self, hold_since: str, rung: str, off_now) -> bool:
-        """True when ``rung`` already failed in this hold episode on exactly the off-bus set seen now:
-        it is not fired again in the episode (spec 04 I36)."""
-        if not hold_since or off_now is None or self.failed_rungs_since != hold_since:
+        """True when ``rung`` already failed this boot on exactly the off-bus set seen now: no path
+        fires it again on that set (spec 04 I36, I58)."""
+        return self.failed_unchanged_entry(hold_since, rung, off_now) is not None
+
+    def mesh_reset_failed_this_boot(self, off_now=None) -> bool:
+        """A mesh reset already ran and failed on this mesh: in this process since the last release, or
+        in this boot's record (a broker restart included) leaving exactly the chips off now. Class C
+        reads it (spec 04 I37, I58); a reset that failed on some other set and was later healed does
+        not make a new whole-bus drop skip its one reset."""
+        if self.mesh_reset_failed_since_release:
+            return True
+        if off_now is None:
             return False
-        return self.failed_rungs.get(rung) == frozenset(off_now)
+        now = set(map(str, off_now))
+        return any(
+            e.get("rung") == "mesh_reset" and e.get("off_after") is not None and set(e["off_after"]) == now
+            for e in self._reset_record()["failed"]
+        )
+
+    def broker_cycled_this_episode(self) -> bool:
+        """The broker started a host reboot or power cycle for this fault: the boot now running is its
+        result (:meth:`boot_from_broker_escalation`), or one was requested this boot since the hold
+        episode began. Class C reads it with :meth:`mesh_reset_failed_this_boot` (spec 04 I37): a
+        whole bus still off after the broker's own cycle gets no mesh reset first."""
+        boot = self._current_boot_id() or ""
+        if self.boot_from_broker_escalation(boot) is not None:
+            return True
+        since = self._device_hold_episode_since()
+        try:
+            start = datetime.fromisoformat(since).timestamp() if since else None
+        except ValueError:
+            start = None
+        if not boot or start is None:
+            return False
+        for rec in self.read_auto_recovery_ledger() or []:
+            if rec.get("boot_id") != boot or rec.get("action") not in AUTO_RECOVERY_RANK:
+                continue
+            try:
+                if float(rec.get("at_epoch")) >= start:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     def _local_reset_lock_path(self) -> Path:
         return self._local_reset_dir() / LOCAL_RESET_LOCK
@@ -913,7 +1187,8 @@ class RecoveryMechanism:
           * a wall-clock min interval, which spans the reboot/power-cycle itself and so is the guard
             against a wedge no rung can fix turning into a loop. It is PER SEVERITY: only a record of
             equal-or-greater severity gates ``action``, so escalating reboot -> power-cycle within the
-            interval is allowed while re-firing the same rung, or de-escalating to a weaker one, is not;
+            interval is allowed while re-firing the same rung, or de-escalating to a weaker one, is not.
+            A power cycle a later boot verified healthy gates nothing, below the backstop (spec 04 I10);
           * a per-boot cap, so several wedges within one long-lived boot cannot escalate repeatedly.
         Returns ``(allowed, reason)``. Fails CLOSED: any doubt about the durable record denies."""
         if tenant_active:
@@ -922,11 +1197,23 @@ class RecoveryMechanism:
         if ledger is None:
             return False, "auto-recovery ledger unreadable; refusing to reboot without its rate-limit record"
         now_epoch = time.time() if now_epoch is None else now_epoch
+        # A cycle a later boot verified healthy gates no rung, the reboot included: the fault after
+        # it is a new episode, and the reboot the chooser picks for it is the shortest path, not a
+        # de-escalation inside a loop (spec 04 I9/I10). Past the backstop no cycle counts as proof.
+        verified = self.last_verified_release()
+        if action == "power-cycle":
+            backstop = self._power_cycle_backstop(ledger, now_epoch)
+            if backstop is not None:
+                return self._deny_power_cycle(backstop)
+        elif verified and _power_cycle_backstop_until(ledger, now_epoch) is not None:
+            verified = None
         rank = AUTO_RECOVERY_RANK.get(action, max(AUTO_RECOVERY_RANK.values()))
-        # The power cycle is spaced by its OWN interval (the user's 30-min cap), every other
-        # action by the general loop-guard interval. For a power cycle rank==2 gates only prior
-        # power cycles, so this interval is exactly "30 min between power cycles".
-        min_interval = POWER_CYCLE_MIN_INTERVAL_SEC if action == "power-cycle" else AUTO_RECOVERY_MIN_INTERVAL_SEC
+        # Spec 04 I65: the power cycle's spacing is its cooldown, counted from the latest cycle or
+        # boot of any cause that no verified release followed (power_cycle_cooldown); the loop below
+        # keeps only its fail-closed read for it. Every other action keeps the general loop guard.
+        cycle = action == "power-cycle"
+        min_interval = AUTO_RECOVERY_MIN_INTERVAL_SEC
+        boot_start = _past_epoch(self._boot_btime_id() or None, now_epoch)
         interval_why = ""
         interval_ends = 0.0
         for rec in ledger:
@@ -937,8 +1224,15 @@ class RecoveryMechanism:
             # a record we cannot classify must never fail OPEN and wave a repeat action through.
             if AUTO_RECOVERY_RANK.get(rec.get("action"), max(AUTO_RECOVERY_RANK.values())) < rank:
                 continue
+            if verified and _verified_since(rec, verified, now_epoch):
+                continue  # a later boot proved that cycle healed the box: not a loop
             # A gating record we cannot read a timestamp from is treated as "just now": the interval
             # is the loop guard, so a missing/garbled stamp must block, never wave the action through.
+            # The power cycle's one exception (spec 04 I65): with the boot's start known, such a
+            # record is bounded without it, by the host-boot anchor (a cycle that went down) or the
+            # per-boot cap below (one this boot), so it never refuses the rung for good.
+            if cycle and boot_start is not None:
+                continue
             try:
                 at = float(rec.get("at_epoch"))
             except (TypeError, ValueError):
@@ -947,6 +1241,8 @@ class RecoveryMechanism:
                     f"usable timestamp; refusing {action} rather than risk a boot loop "
                     f"(fail closed)"
                 )
+            if cycle:
+                continue
             since = now_epoch - at
             if since < min_interval and at + min_interval > interval_ends:
                 # The prior action may well have recovered the device and a new fault followed, so the
@@ -954,39 +1250,184 @@ class RecoveryMechanism:
                 interval_ends = at + min_interval
                 interval_why = (
                     f"a {rec.get('action')} auto-recovery was {int(since)}s ago (< "
-                    f"{min_interval}s min): no {action} for {int(min_interval - since) + 1}s more — "
-                    f"this is the boot-loop guard"
-                )
-        cap_why = ""
-        boot_id = self._current_boot_id()
-        if boot_id:
-            this_boot = sum(1 for r in ledger if r.get("boot_id") == boot_id)
-            if this_boot >= AUTO_RECOVERY_MAX_PER_BOOT:
-                cap_why = (
-                    f"already auto-escalated {this_boot}x this boot "
-                    f"(cap {AUTO_RECOVERY_MAX_PER_BOOT}); holding {action}"
+                    f"{min_interval}s min): no {action} for {int(min_interval - since) + 1}s more, "
+                    f"until {_local_time(at + min_interval)} — this is the boot-loop guard"
                 )
         if interval_why:
-            # Refused by the power cycle's interval alone: have the watchdog retry it as the interval
-            # ends. Any other limit also standing (the per-boot cap) schedules nothing.
-            if action == "power-cycle" and not cap_why:
-                episode = self._device_hold_episode_since() or ""
-                self._power_cycle_retry = (episode, interval_ends + POWER_CYCLE_RETRY_SLACK_SEC)
             return False, interval_why
-        if cap_why:
-            return False, cap_why
+        if cycle:
+            cooldown = self.power_cycle_cooldown(now_epoch=now_epoch, ledger=ledger)
+            if cooldown is not None:
+                return self._deny_power_cycle(cooldown)
+        boot_id = self._current_boot_id()
+        if boot_id:
+            # The per-boot cap counts this boot's requests within the action's interval only: a
+            # request recorded this boot never took the box down (else this would be a new boot),
+            # and holding on it for the rest of the boot was an open-ended hold (spec 04 I65). Past
+            # the interval it is asked again. An unreadable stamp counts as the boot's start, a fixed
+            # end (as now only when that is unknown, fail closed). For the power cycle a stamp later
+            # than now counts as nothing: the cooldown already runs from the host boot (I65).
+            interval = (
+                self.power_cycle_interval(ledger, now_epoch=now_epoch) if cycle else AUTO_RECOVERY_MIN_INTERVAL_SEC
+            )
+            stamps = []
+            for r in ledger:
+                if r.get("boot_id") != boot_id:
+                    continue
+                at = _epoch(r.get("at_epoch"))
+                if at is None:
+                    at = boot_start if boot_start is not None else now_epoch
+                elif cycle and at > now_epoch:
+                    continue
+                stamps.append(at)
+            recent = [t for t in stamps if now_epoch - t < interval]
+            if len(recent) >= AUTO_RECOVERY_MAX_PER_BOOT:
+                until = max(recent) + interval
+                why = (
+                    f"already auto-escalated {len(recent)}x this boot "
+                    f"(cap {AUTO_RECOVERY_MAX_PER_BOOT}); holding {action} until {_local_time(until)}"
+                )
+                if cycle:
+                    return self._deny_power_cycle(
+                        {
+                            "until": until,
+                            "last": max(recent),
+                            "cause": "broker request this boot",
+                            "interval_sec": interval,
+                            "why": why,
+                        }
+                    )
+                return False, why
+        if cycle:
+            self.power_cycle_retry = None
+            self.power_cycle_cooldown_state = None
         return True, ""
 
+    def power_cycle_interval(self, ledger: Optional[list[dict]] = None, *, now_epoch: Optional[float] = None) -> int:
+        """The power-cycle cooldown's length now: :func:`power_cycle_interval_sec` of the broker power
+        cycles recorded since the last verified release (spec 04 I65). A record stamped later than now
+        is not counted, so it cannot outlive a verified release."""
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        ledger = self.read_auto_recovery_ledger() if ledger is None else ledger
+        healed = self._power_cycle_healed_at(now_epoch)
+        failed = 0
+        for rec in ledger or []:
+            # An unreadable stamp counts: the longer (still capped) cooldown is the safe side.
+            if rec.get("action") == "power-cycle" and _epoch_after(rec.get("at_epoch"), healed, now_epoch):
+                failed += 1
+        return power_cycle_interval_sec(failed)
+
+    def power_cycle_cooldown(
+        self, *, now_epoch: Optional[float] = None, ledger: Optional[list[dict]] = None
+    ) -> Optional[dict]:
+        """The power-cycle cooldown in force now, or None when a cycle may fire at once (spec 04 I65).
+
+        Counted from the latest of: the broker's own last reboot or power cycle (its ledger); this
+        host's current boot, whatever caused it; and the last record of the external cycler's history
+        file when one is named and readable. A stamp later than now (a clock that disagrees) anchors
+        nothing, and neither does a non-finite or unreadable one; each source's anchor is its latest valid
+        past record. Returns ``until``/``last`` (epochs), ``cause``, ``interval_sec`` and ``why``, the
+        line the journal and /health carry."""
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        ledger = self.read_auto_recovery_ledger() if ledger is None else ledger
+        # A cycle or boot a verified-healthy release (a gate pass whose fabric check ran and passed)
+        # followed recovered the box: a new fault after it is a new episode, not a boot loop, so it
+        # anchors nothing (spec 04 I9). The backstop still counts every broker cycle.
+        verified = self.last_verified_release()
+        verified_at = _past_epoch((verified or {}).get("at_epoch"), now_epoch)
+        boot_id = self._current_boot_id()
+        verified_this_boot = verified_at is not None and bool(boot_id) and (verified or {}).get("boot_id") == boot_id
+        anchors: list[tuple[float, str]] = []
+        broker_last: Optional[tuple[float, str]] = None
+        for rec in ledger or []:
+            if rec.get("action") not in AUTO_RECOVERY_RANK:
+                continue
+            at = _past_epoch(rec.get("at_epoch"), now_epoch)
+            if at is None or _later_boot_verified(rec.get("boot_id"), at, verified, now_epoch):
+                continue
+            if broker_last is None or at > broker_last[0]:
+                broker_last = (at, str(rec.get("action")))
+        if broker_last is not None:
+            anchors.append((broker_last[0], f"broker {broker_last[1]}"))
+        btime = _past_epoch(self._boot_btime_id() or None, now_epoch)
+        if btime is not None and not (verified_this_boot and verified_at > btime):
+            by_broker = (
+                broker_last is not None and 0 <= btime - broker_last[0] <= BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC
+            )
+            anchors.append((btime, f"host boot after the broker {broker_last[1]}" if by_broker else "host boot"))
+        external = _last_external_power_cycle(now_epoch)
+        if external is not None and not (verified_at is not None and verified_at > external[0]):
+            anchors.append(external)
+        if not anchors:
+            return None
+        last, cause = max(anchors, key=lambda a: a[0])
+        interval = self.power_cycle_interval(ledger, now_epoch=now_epoch)
+        until = last + interval
+        if now_epoch >= until:
+            return None
+        return {
+            "until": until,
+            "last": last,
+            "cause": cause,
+            "interval_sec": interval,
+            "why": (
+                f"power cycle in cooldown until {_local_time(until)}, {int(until - now_epoch) + 1}s more "
+                f"(last cycle/boot {_local_time(last)}, {cause}; {interval}s cooldown) — this is the "
+                f"boot-loop guard"
+            ),
+        }
+
+    def _power_cycle_healed_at(self, now_epoch: float) -> float:
+        """When the last verified release ended the streak; 0.0 (no heal: every cycle counts, the
+        longer capped cooldown) when unknown, unreadable or later than now."""
+        try:
+            at = json.loads((health_dir() / POWER_CYCLE_HEALED_FILE).read_text()).get("at_epoch", 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return 0.0
+        return _past_epoch(at, now_epoch) or 0.0
+
+    def note_mesh_verified(self, *, now_epoch: Optional[float] = None) -> None:
+        """A verified release (a passing full health check, fabric included) ends any power-cycle
+        backoff streak (spec 04 I65) and any cooldown retry waiting. Writes only when a broker power
+        cycle is recorded after the last heal. Never raises."""
+        self.power_cycle_retry = None
+        self.power_cycle_cooldown_state = None
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        ledger = self.read_auto_recovery_ledger() or []
+        healed = self._power_cycle_healed_at(now_epoch)
+        if not any(
+            r.get("action") == "power-cycle" and _epoch_after(r.get("at_epoch"), healed, now_epoch) for r in ledger
+        ):
+            return
+        try:
+            path = health_dir() / POWER_CYCLE_HEALED_FILE
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"at_epoch": now_epoch, "at": _local_time(now_epoch)}))
+        except OSError:
+            pass
+
+    def _deny_power_cycle(self, state: dict) -> tuple[bool, str]:
+        """Refuse the power cycle for a stated, bounded wait (spec 04 I65): ``state`` (``until``,
+        ``last``, ``cause``, ``interval_sec``, ``why``) is what /health shows, and the hold watchdog
+        asks again at ``until`` in this hold episode."""
+        self.power_cycle_cooldown_state = state
+        self.power_cycle_retry = (state["until"], self._device_hold_episode_since() or "")
+        return False, state["why"]
+
     def power_cycle_retry_due(self, now_epoch: Optional[float] = None) -> bool:
-        """True once a power cycle refused only by its min interval may run again, in the hold episode
-        that was refused. The watchdog then forces one ladder pass; the governor still decides."""
-        episode, at = self._power_cycle_retry
-        if not at or not episode or episode != (self._device_hold_episode_since() or ""):
+        """True once a power cycle the cooldown (or the cap or backstop) refused may be asked again, in
+        the hold episode that was refused. The watchdog then forces one ladder pass; the governor still
+        decides."""
+        retry = self.power_cycle_retry
+        if retry is None:
             return False
-        return (time.time() if now_epoch is None else now_epoch) >= at
+        until, episode = retry
+        if not episode or episode != (self._device_hold_episode_since() or ""):
+            return False
+        return (time.time() if now_epoch is None else now_epoch) >= until
 
     def clear_power_cycle_retry(self) -> None:
-        self._power_cycle_retry = ("", 0.0)
+        self.power_cycle_retry = None
 
     def _reboot_already_attempted(self, *, now_epoch: Optional[float] = None) -> bool:
         """True if the broker already auto-rebooted for the wedge it is still looking at: a reboot
@@ -1071,6 +1512,80 @@ class RecoveryMechanism:
                     pass
                 return
 
+    def _power_cycle_backstop(self, ledger: list[dict], now_epoch: float) -> Optional[dict]:
+        """The refusal when POWER_CYCLE_BACKSTOP_MAX power cycles already ran inside the backstop
+        window, verified or not; None otherwise. Journals and pages once per cap reached: a tray that
+        keeps dropping after cycles is a hardware fault for its owners. The page is retried on later
+        passes until the alert hook takes it. The hold is bounded all the same (spec 04 I65):
+        ``until`` is when the oldest counted cycle leaves the window, and the cycle is asked again
+        then. A missing, non-finite or future stamp counts as nothing here (the interval loop fails
+        closed on an unreadable one), so no corrupt record can hold the cycle for good."""
+        until = _power_cycle_backstop_until(ledger, now_epoch)
+        if until is None:
+            return None
+        stamps = _power_cycle_backstop_stamps(ledger, now_epoch)
+        why = (
+            f"{len(stamps)} power cycles, verified or not, in the last {POWER_CYCLE_BACKSTOP_WINDOW_SEC}s "
+            f"(backstop {POWER_CYCLE_BACKSTOP_MAX}): paging an operator and holding the cycle until "
+            f"{_local_time(until)} (epoch {int(until)}), {int(until - now_epoch) + 1}s more, once the "
+            f"oldest leaves the window"
+        )
+        newest = stamps[-1]
+        if newest != self._power_cycle_backstop_logged:
+            self._power_cycle_backstop_logged = newest
+            health_event(
+                "power_cycle_backstop", count=len(stamps), reason=why, allowed_at_epoch=until, host_at_risk=True
+            )
+        if newest != self._power_cycle_backstop_paged:
+            event = {"kind": "power_cycle_backstop", "count": len(stamps), "message": why}
+            if alert.send_alert(event) is not None or alert.alert_argv() is None:
+                self._power_cycle_backstop_paged = newest
+        return {
+            "until": until,
+            "last": newest,
+            "cause": "power-cycle backstop",
+            "interval_sec": POWER_CYCLE_BACKSTOP_WINDOW_SEC,
+            "why": why,
+        }
+
+    def last_verified_release(self) -> Optional[dict]:
+        """The last verified-healthy release (``boot_id``, ``at_epoch``), or None when none was
+        recorded or it cannot be read — read as "never verified", so the guard keeps every cycle."""
+        try:
+            rec = json.loads((health_dir() / AUTO_RECOVERY_VERIFIED).read_text())
+        except (OSError, ValueError):
+            return None
+        return rec if isinstance(rec, dict) else None
+
+    def power_cycle_healed(self, rec: dict) -> bool:
+        """Whether power cycle ``rec`` (``boot_id``, ``at_epoch``) was followed, on a later boot, by
+        the verified-healthy release on record: it healed the box, so a fault after it is a new
+        episode (spec 04 I9). No stamp, no boot id or an unreadable field reads False."""
+        verified = self.last_verified_release()
+        return bool(verified) and _verified_since({**rec, "action": "power-cycle"}, verified, time.time())
+
+    def record_verified_release(self, via: str, *, now_epoch: Optional[float] = None) -> None:
+        """Stamp a verified-healthy release (a gate pass whose fabric check ran and passed) on this
+        boot. Written atomically; never raises. A lost stamp only keeps the boot-loop guard on. The
+        first stamp of a boot is the one that counts (every cycle it clears was recorded under an
+        earlier boot), so later passes on the same boot write nothing."""
+        boot_id = self._current_boot_id()
+        if not boot_id or (self.last_verified_release() or {}).get("boot_id") == boot_id:
+            return
+        rec = {
+            "boot_id": boot_id,
+            "at_epoch": time.time() if now_epoch is None else now_epoch,
+            "via": via,
+        }
+        path = health_dir() / AUTO_RECOVERY_VERIFIED
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(rec, default=str))
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
     async def _fire_recovery_escalation(
         self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: str, pre_fire=None
     ) -> None:
@@ -1136,12 +1651,25 @@ class RecoveryMechanism:
             # entry written above to rate-limit it would now count a recovery that never happened and
             # block the retry the still-wedged box needs, so retract it and surface loudly.
             self.retract_last_auto_recovery(action)
-            self.host_action_requested = None
+            timed_out = isinstance(exc, (HostActionTimedOut, subprocess.TimeoutExpired))
+            if timed_out:
+                # It may have launched its detached cycler before it stopped answering: keep the
+                # request pending (normal bound) so no device reset starts under a cycle that may
+                # still come.
+                self.host_action_requested = (action, time.monotonic())
+            else:
+                self.host_action_requested = None
             log(
                 f"{label.upper()} FAILED TO LAUNCH: {exc!r}; retracted the rate-limit entry so the rung "
                 f"can retry once the cause is fixed"
+                + (
+                    f"; it timed out and may still act, so device resets stay off for up to "
+                    f"{int(host_action_pending_sec())}s"
+                    if timed_out
+                    else ""
+                )
             )
-            health_event(f"auto_{ev}_failed", reason=reason, error=repr(exc))
+            health_event(f"auto_{ev}_failed", reason=reason, error=repr(exc), timed_out=timed_out)
             metrics.stage_fired(stage, "failed")
             return
         # The pending window counts from the hand-off, not from before a slow pre-fire hook.
