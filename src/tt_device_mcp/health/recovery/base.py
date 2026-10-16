@@ -65,16 +65,6 @@ AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
 # unreadable-ledger fail-closed below are untouched — they remain the boot-loop denial. Default
 # 1800s (30 min); TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC overrides.
 POWER_CYCLE_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC", "1800"))
-# A power cycle whose following boot reached a VERIFIED-healthy release (a gate pass whose fabric
-# check ran and passed) recovered the box: a new fault after it is a new episode, not a boot loop, so
-# that cycle no longer spaces the next one (spec 04 I10). The stamp is durable beside the ledger. Only
-# a cycle no later boot ever verified still gates — the true loop. The hard backstop below counts
-# every power cycle, verified or not: past it the broker pages instead of cycling a flapping tray on
-# a serving host forever.
-AUTO_RECOVERY_VERIFIED = "auto_recovery_verified.json"
-POWER_CYCLE_BACKSTOP_MAX = 3
-POWER_CYCLE_BACKSTOP_WINDOW_SEC = 7200
-
 # A host reboot or power cycle the broker has requested takes the box down, and an external cycler
 # (a POWER_CYCLE_CMD wrapper) may run it some time after the request returns. A device reset the
 # hold watchdog starts in between only races the cycle. So once one is requested the forced ladder
@@ -105,6 +95,16 @@ def host_action_pending_sec() -> float:
 # before the power cycle that will — but no rung may re-fire itself inside the interval (its own
 # loop guard), and a stronger rung that fired blocks de-escalating back to a weaker one.
 AUTO_RECOVERY_RANK = {"reboot": 1, "power-cycle": 2}
+
+# A power cycle whose following boot reached a VERIFIED-healthy release (a gate pass whose fabric
+# check ran and passed) recovered the box: a new fault after it is a new episode, not a boot loop, so
+# that cycle no longer spaces the next one (spec 04 I9). The stamp is durable beside the ledger. Only
+# a cycle no later boot ever verified still gates — the true loop. The hard backstop below counts
+# every power cycle, verified or not: past it the broker pages instead of cycling a flapping tray on
+# a serving host forever.
+AUTO_RECOVERY_VERIFIED = "auto_recovery_verified.json"
+POWER_CYCLE_BACKSTOP_MAX = 3
+POWER_CYCLE_BACKSTOP_WINDOW_SEC = 7200
 
 # The metrics.STAGES name for each auto-recovery action _fire_recovery_escalation ever fires. An
 # explicit table, not a ternary: a third action added here later must fail loud (KeyError) rather

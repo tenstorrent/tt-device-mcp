@@ -3034,7 +3034,7 @@ def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> b
 
 def _stamp_verified_release(evidence: dict, via: str) -> None:
     """A hold lifted on a pass whose fabric check ran and passed is proof the box heals: stamp it, so
-    a power cycle before it no longer reads as a boot loop (spec 04 I10). Any other lift stamps nothing."""
+    a power cycle before it no longer reads as a boot loop (spec 04 I9). Any other lift stamps nothing."""
     if (evidence.get("fabric") or {}).get("ok") is True:
         recovery_mechanism.record_verified_release(via)
 
@@ -5344,7 +5344,7 @@ async def device_health_gate(
                 _log("device healthy; no reset needed")
             released = _clear_device_dirty(verified=True, why=f"gate/{phase}: verified healthy")
             if released and state.fabric_ran and fabric_ok is True:
-                # Proof this boot heals: a power cycle before it no longer reads as a boot loop (04 I10).
+                # Proof this boot heals: a power cycle before it no longer reads as a boot loop (04 I9).
                 recovery_mechanism.record_verified_release(f"gate/{phase}")
             if released and device_hold_logged:
                 _note_tenant_gate_verdict("")
