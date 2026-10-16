@@ -154,6 +154,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.health.shutdown import note_broker_stopping
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
@@ -12102,8 +12103,16 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
     asyncio.create_task(_watchdog_heartbeat())
 
     if serve_http:
+
+        class _BrokerServer(uvicorn.Server):
+            # Note the stop signal first: a health probe the same cgroup-wide SIGTERM kills then
+            # reads as interrupted by shutdown, never as a failure (03 I58).
+            def handle_exit(self, sig, frame):
+                note_broker_stopping(sig)
+                super().handle_exit(sig, frame)
+
         config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
-        await uvicorn.Server(config).serve()
+        await _BrokerServer(config).serve()
     elif socket_server is not None:
         # Socket-only: block on the socket server's serve task to keep the process alive.
         await socket_server._tt_serve_task
