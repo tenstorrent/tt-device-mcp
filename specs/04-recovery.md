@@ -810,9 +810,11 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I65 — The power cycle waits out a cooldown counted from the last cycle or boot of any cause,
   then fires.** No power cycle fires within the cooldown of the latest of: the broker's own last
   reboot or power cycle (the I9 ledger), the host's current boot (whatever caused it: a manual, BMC,
-  datacenter or external cycle shows here), and the last record of an external cycler's history file
-  when `TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE` names a readable one (JSON lines with `at_epoch` and
-  an optional `cause`; unreadable or malformed lines are ignored). A stamp later than now (a clock
+  datacenter or external cycle shows here), and the last record of an out-of-band power-cycle log:
+  `TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE` when set, else `power_cycle_history.jsonl` in the broker's
+  state dir (the parent of the health dir; `/var/lib/tt-device-broker` on a system broker). JSON lines
+  with `at_epoch` and an optional `cause`; a missing or unreadable file adds no anchor, and a malformed
+  line is skipped with one warning. A stamp later than now (a clock
   that disagrees), non-finite or unreadable anchors nothing and never hides an earlier valid one:
   each source's anchor is its latest valid past record, so no stamp postpones a cycle past the stated
   gaps or skips the cooldown. A power-cycle record stamped later than now does not count toward the

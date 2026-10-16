@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
+import logging
 import math
 import os
 import subprocess
@@ -82,10 +83,21 @@ POWER_CYCLE_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_MIN
 # when one is named and readable. After two consecutive broker power cycles no heal followed, it
 # doubles for each further one, capped here; a verified release (a passing full health check)
 # resets the streak.
+log = logging.getLogger(__name__)
 POWER_CYCLE_BACKOFF_CAP_SEC = 4 * 3600
 # A JSON-lines file an external power cycler appends to (``at_epoch``, optional ``cause``); read only.
 POWER_CYCLE_HISTORY_FILE_ENV = "TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE"
 POWER_CYCLE_HEALED_FILE = "power_cycle_healed.json"
+# Used when the env var is unset: this file in the broker's state dir (the parent of the health dir,
+# /var/lib/tt-device-broker on a system broker).
+POWER_CYCLE_HISTORY_DEFAULT_FILE = "power_cycle_history.jsonl"
+
+
+def power_cycle_history_path() -> Path:
+    """The out-of-band power-cycle log: the env var when set, else ``power_cycle_history.jsonl`` in the
+    broker's state dir (spec 04 I65)."""
+    name = os.environ.get(POWER_CYCLE_HISTORY_FILE_ENV, "").strip()
+    return Path(name) if name else health_dir().parent / POWER_CYCLE_HISTORY_DEFAULT_FILE
 
 
 def power_cycle_interval_sec(failed_cycles: int) -> int:
@@ -126,21 +138,25 @@ def _epoch_after(value, than: float, now: float) -> bool:
 
 def _last_external_power_cycle(now_epoch: float) -> Optional[tuple[float, str]]:
     """The latest ``at_epoch`` in the external cycler's history file no later than ``now_epoch``, and
-    its cause, or None when no file is named or it cannot be read (the host's boot time still covers
+    its cause, or None when the file (env var, else the state dir default) is missing or cannot be read (the host's boot time still covers
     any cycle that took the box down). Malformed, non-finite and future lines are skipped."""
-    name = os.environ.get(POWER_CYCLE_HISTORY_FILE_ENV, "").strip()
-    if not name:
-        return None
+    path = power_cycle_history_path()
     try:
-        lines = Path(name).read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return None
     best: Optional[tuple[float, str]] = None
+    warned = False
     for ln in lines:
+        if not ln.strip():
+            continue
         try:
             rec = json.loads(ln)
             at = _past_epoch(rec.get("at_epoch"), now_epoch)
         except (ValueError, TypeError, AttributeError):
+            if not warned:
+                warned = True
+                log.warning("power-cycle history %s: skipping malformed line(s)", path)
             continue
         if at is not None and (best is None or at > best[0]):
             best = (at, str(rec.get("cause") or "external power cycle"))

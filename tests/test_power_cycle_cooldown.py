@@ -392,3 +392,67 @@ def test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not(cool, 
     assert m.broker_cycled_this_episode() is True
     monkeypatch.setattr(srv, "device_hold_episode_since", (episode + timedelta(hours=1)).isoformat())
     assert m.broker_cycled_this_episode() is False
+
+
+# ---- (h) the out-of-band power-cycle log defaults to the broker's state dir ------------------------
+
+
+@pytest.fixture
+def state_hist(cool, monkeypatch, tmp_path):
+    """The broker's state dir is the parent of the health dir; the env var is unset."""
+    (tmp_path / "state" / "health").mkdir(parents=True)
+    monkeypatch.setattr(recovery_base, "health_dir", lambda: tmp_path / "state" / "health")
+    return tmp_path / "state" / recovery_base.POWER_CYCLE_HISTORY_DEFAULT_FILE
+
+
+def _cd(cool):
+    return cool["g"].mechanism.power_cycle_cooldown(now_epoch=T0)
+
+
+def test_the_history_defaults_to_the_state_dir_file(cool, state_hist):
+    assert recovery_base.power_cycle_history_path() == state_hist
+    assert state_hist.name == "power_cycle_history.jsonl"
+    state_hist.write_text(json.dumps({"at_epoch": T0 - 100, "cause": "BMC chassis power cycle"}) + "\n")
+    cd = _cd(cool)
+    assert cd["last"] == T0 - 100 and cd["cause"] == "BMC chassis power cycle"
+    assert cd["until"] == T0 - 100 + POWER_CYCLE_MIN_INTERVAL_SEC
+
+
+def test_the_env_var_overrides_the_default(cool, state_hist, monkeypatch, tmp_path):
+    state_hist.write_text(json.dumps({"at_epoch": T0 - 100, "cause": "default file"}) + "\n")
+    other = tmp_path / "other.jsonl"
+    other.write_text(json.dumps({"at_epoch": T0 - 200, "cause": "env file"}) + "\n")
+    monkeypatch.setenv(recovery_base.POWER_CYCLE_HISTORY_FILE_ENV, str(other))
+    assert recovery_base.power_cycle_history_path() == other
+    assert _cd(cool)["cause"] == "env file"
+
+
+def test_a_missing_default_file_adds_no_anchor(cool, state_hist):
+    assert not state_hist.exists()
+    assert _cd(cool)["cause"] != "default file" and recovery_base._last_external_power_cycle(T0) is None
+
+
+def test_a_malformed_line_is_skipped_with_one_warning(cool, state_hist, caplog):
+    good = json.dumps({"at_epoch": T0 - 100, "cause": "BMC chassis power cycle"})
+    state_hist.write_text("not json\n[1]\n" + good + "\n{\n")
+    with caplog.at_level("WARNING", logger=recovery_base.log.name):
+        assert recovery_base._last_external_power_cycle(T0) == (T0 - 100, "BMC chassis power cycle")
+    assert len([r for r in caplog.records if "malformed" in r.getMessage()]) == 1
+
+
+def test_a_future_history_stamp_never_pushes_the_cooldown_past_its_bound(cool, state_hist):
+    state_hist.write_text(json.dumps({"at_epoch": T0 + 6 * 3600, "cause": "clock ahead"}) + "\n")
+    cd = _cd(cool)
+    assert cd is None or cd["until"] <= T0 + POWER_CYCLE_MIN_INTERVAL_SEC
+
+
+def test_health_deadline_reflects_a_default_file_entry(cool, state_hist, monkeypatch):
+    state_hist.write_text(json.dumps({"at_epoch": T0 - 100, "cause": "BMC chassis power cycle"}) + "\n")
+    m = cool["g"].mechanism
+    allowed, _ = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=T0)
+    assert not allowed
+    until = T0 - 100 + POWER_CYCLE_MIN_INTERVAL_SEC
+    monkeypatch.setattr(srv, "_device_hold_state", lambda now=None: ("tray off", srv.device_hold_episode_since))
+    cd = srv._health_payload(now=datetime.fromtimestamp(T0))["power_cycle_cooldown"]
+    assert cd["cause"] == "BMC chassis power cycle"
+    assert cd["next_deadline"] == datetime.fromtimestamp(until).isoformat(timespec="seconds")
