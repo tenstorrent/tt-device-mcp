@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.conftest import patch_health_event
-from tests.test_startup_fabric_hugepages import _shortfalls, _startup  # noqa: F401 - the fixture
+from tests.test_startup_fabric_hugepages import _shortfalls, _startup, _systemctl  # noqa: F401 - the fixture
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.recovery import galaxy
