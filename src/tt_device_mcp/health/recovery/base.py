@@ -93,6 +93,12 @@ def host_action_pending_sec() -> float:
     return min(v, HOST_ACTION_PENDING_MAX_SEC)
 
 
+class HostActionTimedOut(RuntimeError):
+    """A host reboot / power-cycle command that timed out rather than exited non-zero. It may have
+    launched its detached cycler before it stopped answering, so the request stays pending (with its
+    normal bound) instead of reading as "never launched"."""
+
+
 # The host-level recovery rungs, ordered by severity. A warm reboot recovers most wedges; a
 # whole-bus wedge survives it and only the chassis power cycle clears it (measured on box D).
 # The min-interval loop guard is therefore PER SEVERITY: a stronger rung may escalate past a
@@ -343,6 +349,8 @@ class RecoveryMechanism:
         # its record is on disk, cleared if it fails to launch; read by the hold watchdog, which
         # starts no device reset while one is pending (see host_action_pending).
         self.host_action_requested: Optional[tuple[str, float]] = None
+        # The request a device reset was last refused for (one log line per request, spec 04 I34).
+        self._host_action_reset_refused: Optional[tuple[str, float]] = None
 
     def host_action_pending(self, now: Optional[float] = None) -> Optional[tuple[str, float]]:
         """``(action, age_sec)`` while a requested host reboot or power cycle is still inside its
@@ -355,8 +363,31 @@ class RecoveryMechanism:
         age = (time.monotonic() if now is None else now) - at
         if age >= host_action_pending_sec():
             self.host_action_requested = None
+            health_event("host_action_request_expired", action=action, bound_sec=int(host_action_pending_sec()))
             return None
         return action, age
+
+    def host_action_blocks_reset(self, log: Callable[[str], None], *, context: str) -> bool:
+        """True while a requested host reboot or power cycle is pending: no device reset (bridge,
+        tray re-power, galaxy/SMI reset) may start under it, whichever path asks (spec 04 I34). One
+        log line and one event per request; the device stays held, and the full health check runs
+        after the host comes back. Bounded by host_action_pending()'s window."""
+        pending = self.host_action_pending()
+        if pending is None:
+            return False
+        action, age = pending
+        req = self.host_action_requested
+        if self._host_action_reset_refused != req:
+            self._host_action_reset_refused = req
+            bound = int(host_action_pending_sec())
+            health_event(
+                "reset_suppressed_host_action", action=action, age_sec=int(age), bound_sec=bound, context=context
+            )
+            log(
+                f"{context}: no device reset — a host {action} was requested {int(age)}s ago and is pending "
+                f"(up to {bound}s); the device stays held until the host comes back and passes the full check"
+            )
+        return True
 
     def cooling(self) -> bool:
         """True while a reset that already failed is still inside its cooldown window.
@@ -1205,12 +1236,25 @@ class RecoveryMechanism:
             # entry written above to rate-limit it would now count a recovery that never happened and
             # block the retry the still-wedged box needs, so retract it and surface loudly.
             self.retract_last_auto_recovery(action)
-            self.host_action_requested = None
+            timed_out = isinstance(exc, (HostActionTimedOut, subprocess.TimeoutExpired))
+            if timed_out:
+                # It may have launched its detached cycler before it stopped answering: keep the
+                # request pending (normal bound) so no device reset starts under a cycle that may
+                # still come.
+                self.host_action_requested = (action, time.monotonic())
+            else:
+                self.host_action_requested = None
             log(
                 f"{label.upper()} FAILED TO LAUNCH: {exc!r}; retracted the rate-limit entry so the rung "
                 f"can retry once the cause is fixed"
+                + (
+                    f"; it timed out and may still act, so device resets stay off for up to "
+                    f"{int(host_action_pending_sec())}s"
+                    if timed_out
+                    else ""
+                )
             )
-            health_event(f"auto_{ev}_failed", reason=reason, error=repr(exc))
+            health_event(f"auto_{ev}_failed", reason=reason, error=repr(exc), timed_out=timed_out)
             metrics.stage_fired(stage, "failed")
             return
         # The pending window counts from the hand-off, not from before a slow pre-fire hook.
