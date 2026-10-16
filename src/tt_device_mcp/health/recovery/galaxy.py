@@ -1237,7 +1237,10 @@ class GalaxyRecovery(Recovery):
         if self._tenant_active(await asyncio.to_thread(self.deps.enumerate_device_holders)):
             log(f"{what}: a tenant holds the device or the scan is unreadable — holding before the power cycle")
             return False
-        standback = await asyncio.to_thread(offbus_power_cycle.standback_reason)
+        # The operator's stand-back marker and command still hold it; a missing manual-recovery check
+        # does not, as on the ladder's own host rung this cycle replaces (holding there would leave the
+        # class with no recovery at all).
+        standback = await asyncio.to_thread(offbus_power_cycle.standback_reason, require_manual_check=False)
         if standback:
             log(f"{what}: standing back from the power cycle — {standback}")
             return False

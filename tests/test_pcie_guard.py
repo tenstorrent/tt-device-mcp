@@ -916,7 +916,8 @@ async def test_the_per_chip_bridge_reset_obeys_the_hold_gate_and_the_latch(sysfs
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("off, trays", [(set(range(24, 32)), [3]), (set(), [])])
+# Part of a tray: a whole one skips the sweep (spec 04 I37 class A).
+@pytest.mark.parametrize("off, trays", [(set(range(24, 30)), [3]), (set(), [])])
 async def test_the_last_chance_sweep_re_powers_only_the_affected_trays(
     monkeypatch, clear_job_state, galaxy_trays, off, trays
 ):

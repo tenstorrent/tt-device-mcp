@@ -198,22 +198,33 @@ async def _run_ladder(g, indices, stages=(galaxy.STAGE_SMI_RESET, galaxy.STAGE_P
 
 
 @pytest.mark.asyncio
-async def test_a_tray_down_onset_rescans_captures_then_runs_the_full_ladder_and_power_cycles_only_when_it_fails(rig):
-    off = _off(rig["map"], {3: 8})
+@pytest.mark.parametrize(
+    "spec, ladder",
+    [
+        # Part of a tray: the full ladder, and the power cycle only when every reset failed.
+        ({3: 5}, ["glx_reset", "last_chance", "power_cycle"]),
+        # The whole tray (spec 04 I37, class A): no reset heals it, so the first pass requests the
+        # cycle (the host goes down with it; the gate's power-cycle stage is not reached).
+        ({3: 8}, ["power_cycle"]),
+    ],
+)
+async def test_a_tray_down_onset_rescans_captures_then_runs_its_ladder(rig, spec, ladder):
+    off = _off(rig["map"], spec)
     rig["beats"] = _beats_without(off)
-    outs = await _run_ladder(rig["g"], sorted(map(str, off)))
-    assert rig["order"] == ["rescan", "capture", "glx_reset", "last_chance", "power_cycle"]
-    assert outs == [galaxy.OUTCOME_WAITING, galaxy.OUTCOME_WAITING]
+    stages = (galaxy.STAGE_SMI_RESET,) if ladder == ["power_cycle"] else (galaxy.STAGE_SMI_RESET, galaxy.STAGE_POWER_CYCLE)
+    outs = await _run_ladder(rig["g"], sorted(map(str, off)), stages=stages)
+    assert rig["order"] == ["rescan", "capture", *ladder]
+    assert outs == [galaxy.OUTCOME_WAITING] * len(stages)
     assert (
         "tray_down_latched",
-        {"path": "TRAY_DOWN", "off_per_tray": {3: 8}, "expected": 32, "after_reset": False},
+        {"path": "TRAY_DOWN", "off_per_tray": spec, "expected": 32, "after_reset": False},
     ) in rig["events"]
     assert "tray_down_prelude" in _kinds(rig)
 
 
 @pytest.mark.asyncio
 async def test_a_ladder_that_recovers_the_tray_fires_no_power_cycle(rig):
-    rig["beats"] = _beats_without(_off(rig["map"], {2: 8}))
+    rig["beats"] = _beats_without(_off(rig["map"], {2: 6}))
     rig["reset_ok"] = True
     assert (await _run_ladder(rig["g"], [], stages=(galaxy.STAGE_SMI_RESET,))) == [galaxy.OUTCOME_RECOVERED]
     assert rig["order"] == ["rescan", "capture", "glx_reset"]
@@ -221,7 +232,7 @@ async def test_a_ladder_that_recovers_the_tray_fires_no_power_cycle(rig):
 
 @pytest.mark.asyncio
 async def test_the_last_chance_sweep_still_gates_the_power_cycle_of_a_tray_down(rig):
-    rig["beats"] = _beats_without(_off(rig["map"], {2: 8}))
+    rig["beats"] = _beats_without(_off(rig["map"], {2: 6}))
     rig["last_chance_ok"] = True
     outs = await _run_ladder(rig["g"], [])
     assert outs == [galaxy.OUTCOME_WAITING, galaxy.OUTCOME_RECOVERED]
@@ -249,7 +260,7 @@ async def test_the_prelude_changes_no_ladder_input(rig, monkeypatch, stage, rung
         return await real(self, *a, **k)
 
     monkeypatch.setattr(galaxy.GalaxyRecovery, "_fire_gate_rung", spy)
-    beats = _beats_without(_off(rig["map"], {4: 8}))
+    beats = _beats_without(_off(rig["map"], {4: 6}))
     rig["beats"] = dict(beats)
     await g.escalate("gate/post-job", ["24"], 32, lambda m: None, stage=stage, ev=None, beats=dict(beats))
     with_prelude = [r for r in rig["order"] if r not in ("rescan", "capture")]
@@ -373,7 +384,7 @@ async def test_a_tenant_defers_the_rescan_but_not_the_capture(rig, monkeypatch):
     scans = [HolderScan(holders=[], complete=False), HolderScan(holders=[], complete=True)]
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scans.pop(0) if scans else scans_done)
     scans_done = HolderScan(holders=[], complete=True)
-    rig["beats"] = _beats_without(_off(rig["map"], {3: 8}))
+    rig["beats"] = _beats_without(_off(rig["map"], {3: 6}))
     await g.escalate("offbus", [], 32, lambda m: None)
     assert rig["order"] == ["capture", "offbus_ladder"]
     await g.escalate("offbus", [], 32, lambda m: None)
@@ -397,7 +408,7 @@ async def test_the_latch_does_not_change_after_a_reset_and_is_fresh_after_the_ep
 
     async def offbus_ladder(*a, **k):
         rig["order"].append("offbus_ladder")
-        rig["beats"] = _beats_without(_off(rig["map"], {3: 8}))  # the reset knocked the tray out
+        rig["beats"] = _beats_without(_off(rig["map"], {3: 6}))  # the reset knocked the tray out
         return False
 
     monkeypatch.setattr(g, "_escalate_offbus_stuck_hold", offbus_ladder)
@@ -424,13 +435,13 @@ async def test_a_manual_reset_before_the_first_sighting_is_not_an_onset(rig, mon
     monkeypatch.setattr(mech, "reset_since_release", False)
     await mech.reset_with_quiesce(["tt-smi", "-glx_reset"], lambda m: None, owner="manual")
     assert mech.reset_since_release
-    rig["beats"] = _beats_without(_off(rig["map"], {3: 8}))
+    rig["beats"] = _beats_without(_off(rig["map"], {3: 6}))
     await _run_ladder(g, [])
     assert rig["order"] == ["glx_reset", "last_chance", "power_cycle"], "no rescan, no capture"
     assert g._td["path"] == "PARTIAL"
     assert (
         "tray_down_latched",
-        {"path": "PARTIAL", "off_per_tray": {3: 8}, "expected": 32, "after_reset": True},
+        {"path": "PARTIAL", "off_per_tray": {3: 6}, "expected": 32, "after_reset": True},
     ) in rig["events"]
     g.tray_down_episode_end()
     assert not mech.reset_since_release, "the release clears it"
@@ -455,7 +466,7 @@ async def test_a_restarted_broker_latches_a_tray_still_missing_afresh(rig):
     at its first sighting and rescans and captures again; the ladder and the power-cycle guard are
     the same, so a restart buys no extra power cycle."""
     g = rig["g"]
-    rig["beats"] = _beats_without(_off(rig["map"], {3: 8}))
+    rig["beats"] = _beats_without(_off(rig["map"], {3: 6}))
     await g.escalate("offbus", [], 32, lambda m: None)
     assert g._td["path"] == "TRAY_DOWN"
 
@@ -500,7 +511,7 @@ async def test_the_gate_runs_the_prelude_then_its_ladder_end_to_end(rig, monkeyp
         return await real(self, gate_phase, stage, *a, **k)
 
     monkeypatch.setattr(galaxy.GalaxyRecovery, "_fire_gate_rung", spy)
-    rig["beats"] = _beats_without(_off(rig["map"], {3: 8}))
+    rig["beats"] = _beats_without(_off(rig["map"], {3: 6}))
 
     await srv._device_health_gate(None, phase="post-job", run_fabric=False)
 
@@ -513,7 +524,7 @@ async def test_the_gate_runs_the_prelude_then_its_ladder_end_to_end(rig, monkeyp
 async def test_capture_off_runs_the_ladder_alone(rig, monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_TRAY_DOWN_CAPTURE", "0")
     g = rig["g"]
-    rig["beats"] = _beats_without(_off(rig["map"], {3: 8}))
+    rig["beats"] = _beats_without(_off(rig["map"], {3: 6}))
     await _run_ladder(g, [])
     assert rig["order"] == ["glx_reset", "last_chance", "power_cycle"] and g._td is None
 
