@@ -1535,6 +1535,20 @@ async def test_the_done_callbacks_own_failure_does_not_leak_the_reservation(monk
         await asyncio.gather(runner, return_exceptions=True)
 
 
+async def _first_gate_started(started: asyncio.Event, task: asyncio.Task) -> None:
+    """Wait for the first step to reach its gate. If it returns without doing so (a leaked device
+    state can answer it before the gate), fail with what it returned, not a bare timeout."""
+    waiter = asyncio.ensure_future(started.wait())
+    await asyncio.wait({waiter, task}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+    if waiter.done():
+        return
+    waiter.cancel()
+    if not task.done():
+        pytest.fail("the first step neither reached its gate nor returned within 10 s")
+    outcome = task.exception() or task.result()
+    pytest.fail(f"the first step returned before its gate: {outcome!r}")
+
+
 @pytest.mark.asyncio
 async def test_a_second_step_waits_for_the_first_instead_of_overlapping(monkeypatch, clear_job_state):
     """Step routes serialize. An Epilog and the next Prolog used to both pass the in-flight check
@@ -1563,7 +1577,7 @@ async def test_a_second_step_waits_for_the_first_instead_of_overlapping(monkeypa
     try:
         monkeypatch.setattr(srv, "device_health_gate", gate_one)
         task_one = asyncio.create_task(_call_pre_step(pre_step))
-        await asyncio.wait_for(first_started.wait(), timeout=10)
+        await _first_gate_started(first_started, task_one)
 
         monkeypatch.setattr(srv, "device_health_gate", gate_two)
         task_two = asyncio.create_task(_call_pre_step(pre_step))
@@ -1609,7 +1623,7 @@ async def test_a_step_that_waits_past_its_deadline_reports_inconclusive(monkeypa
     try:
         monkeypatch.setattr(srv, "device_health_gate", gate_one)
         task_one = asyncio.create_task(_call_pre_step(pre_step))
-        await asyncio.wait_for(first_started.wait(), timeout=10)
+        await _first_gate_started(first_started, task_one)
 
         monkeypatch.setattr(srv, "device_health_gate", gate_two)
         body = await asyncio.wait_for(_call_pre_step(pre_step), timeout=10)
