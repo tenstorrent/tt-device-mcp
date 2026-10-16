@@ -502,7 +502,7 @@ each rung fires only when the gentler one failed or cannot apply.
   written on (`latched_on_boot`): it survives broker restarts on that boot, and it is bounded. It
   lifts on its own (`offbus_reset_hold_expired`, naming why) once a health pass sees every expected
   chip on the bus and host-pci OK, or once every chip is on the bus and the latch is older than
-  `TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC` (default 21600 s, one I27 interval; the gate checks that
+  `TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC` (default 21600 s; the gate checks that
   ceiling whenever it is asked with no chip off the bus). While a chip is off the bus or sysfs cannot
   be read it lifts only where `TT_DEVICE_MCP_POWER_CYCLE_CMD` is unset, at the same ceiling: there no
   I27 power cycle would ever end the hold. That expiry pages once (`offbus_reset_hold_expired_off_bus`,
@@ -555,10 +555,15 @@ each rung fires only when the gentler one failed or cannot apply.
   broker pages once (`offbus_power_cycle_unguarded`). A stand-back is re-checked on every pass, and
   the tenant and reset-scope checks run again after the stand-back checks, just before the cycle.
   Each attempt is written, fsync'd, to
-  `offbus_power_cycle.json` in the health dir before the command runs, and at most one attempt runs
-  per `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` (default 21600 s), across restarts and
-  the cycle itself; a failed command keeps its error there. Each attempt carries the boot it was
-  made on; an attempt a later boot verified healthy (I9) does not count toward this interval, so a
+  `offbus_power_cycle.json` in the health dir before the command runs; a failed command keeps its
+  error there. Attempts are spaced by the I65 cooldown alone (the gated fire goes through the
+  ledger, so I65 counts it), whatever the per-boot count. An operator may add a spacing with
+  `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` (default unset: none), across restarts and the
+  cycle itself, capped at the I65 backoff cap (4 h); it is a stated wait like the cooldown, on
+  /health as `power_cycle_cooldown` with its deadline and asked again by the watchdog at its end.
+  Inside either wait the hold stands with no reset (no fall-through to the mesh-reset ladder on a
+  whole tray). Each attempt carries the boot it was
+  made on; an attempt a later boot verified healthy (I9) does not count toward that spacing, so a
   new off-bus episode after it takes its cycle at the grace. An attempt with no boot id or no
   stamp to prove it healed still counts, and the I9 interval and backstop still apply. With the command unset, an attempt
   within the interval, or the mechanism's limits (I9, I10) denying it, the broker pages once per
@@ -1369,6 +1374,7 @@ sees a silent fabric pass.
 | I65 the broker's cycle then a boot with the tray still off: no second cycle before the cooldown ends, one at its end; an external cycler's history is an anchor; a future stamp is not | `tests/test_power_cycle_cooldown.py::test_after_the_broker_cycle_and_boot_no_second_cycle_before_the_cooldown_ends`, `::test_an_external_cycler_history_is_an_anchor`, `::test_a_boot_stamp_in_the_future_anchors_nothing` |
 | I65 backoff 30 min, 30 min, 1 h, 2 h, 4 h cap; a verified release resets it | `tests/test_power_cycle_cooldown.py::test_the_backoff_doubles_after_two_failed_cycles_and_caps_at_4h`, `::test_cycles_that_heal_nothing_back_off_and_a_verified_release_resets_it` |
 | I65 every denial ends at a stated time and is asked again then, in its own hold episode; the per-boot cap is bounded | `tests/test_power_cycle_cooldown.py::test_a_cycle_requested_this_boot_that_never_went_down_is_asked_again`, `::test_the_watchdog_retry_is_kept_to_its_own_hold_episode`, `tests/test_device_safety.py::test_governor_per_boot_cap_ends_with_the_interval`, `::test_power_cycle_after_a_recent_reboot_waits_out_the_cooldown` |
+| I65 a whole tray still off hours after a cycle that never took the host down cycles at once; inside the cooldown it holds with the deadline on /health and cycles at its end; an external reboot counts toward the cooldown; the off-bus (I27) path holds with a deadline and no ladder; an operator attempt spacing is a stated wait capped at the backoff cap, default none; a whole tray seen again among partial reads still cycles | `tests/test_whole_tray_cycle_every_boot.py::test_a_restart_hours_after_a_cycle_that_never_went_down_cycles_at_once`, `::test_inside_the_cooldown_the_hold_shows_its_deadline_and_cycles_when_it_ends`, `::test_an_external_reboot_counts_toward_the_cooldown_and_the_cycle_follows_it`, `::test_the_off_bus_path_no_longer_holds_six_hours_on_an_attempt_that_never_went_down`, `::test_the_off_bus_path_inside_the_cooldown_holds_with_a_deadline_and_no_ladder`, `::test_an_operator_attempt_interval_is_a_stated_wait_capped_at_the_backoff_cap`, `::test_the_attempt_interval_default_adds_no_wait_beyond_the_cooldown`, `::test_a_whole_tray_seen_again_among_partial_reads_still_cycles_at_the_deadline` |
 | I65 no recent cycle or boot: the cycle fires at once | `tests/test_power_cycle_cooldown.py::test_with_no_recent_cycle_or_boot_the_cycle_fires_at_once` |
 | I65 only a verified release with no fabric debt ends the streak; a refused one keeps the hold | `tests/test_power_cycle_cooldown.py::test_only_a_verified_release_with_no_fabric_debt_ends_the_streak` |
 | I65 a future, non-finite or unreadable stamp (history file, ledger, heal file) never hides a valid past anchor, never holds the cycle past the stated gap, never keeps the streak past a verified release; every cap denial is on /health | `tests/test_power_cycle_cooldown.py::test_a_nan_or_future_history_line_does_not_hide_the_valid_past_one`, `::test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle`, `::test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health`, `::test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end`, `::test_the_per_boot_cap_denial_shows_on_health`, `::test_a_future_record_does_not_keep_the_streak_past_a_verified_release` |
