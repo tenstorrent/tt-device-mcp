@@ -13,7 +13,7 @@ reset or power cycle: the ``rig`` records them."""
 import json
 import time
 import types
-from datetime import datetime, timedelta
+from datetime import datetime
 from functools import partial
 
 import pytest
@@ -361,10 +361,11 @@ def test_only_a_verified_release_with_no_fabric_debt_ends_the_streak(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_gets_one_reset(cool):
+async def test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_cycles_with_no_reset(cool):
+    """Class C needs no failed mesh reset first: with no recent cycle or boot it cycles at once."""
     cool["beats"] = {}
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
-    assert cool["order"] == ["glx_reset"]
+    assert cool["order"] == ["power_cycle"], "no mesh reset, sweep or re-power first"
 
 
 @pytest.mark.asyncio
@@ -380,15 +381,3 @@ async def test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_res
     cool["clk"][0] = T0 + 60 + POWER_CYCLE_MIN_INTERVAL_SEC
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
     assert cool["order"] == ["denied", "power_cycle"]
-
-
-def test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not(cool, monkeypatch):
-    m = cool["g"].mechanism
-    episode = datetime.fromtimestamp(T0)
-    monkeypatch.setattr(srv, "device_hold_episode_since", episode.isoformat())
-    _ledger({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": T0 - 600, "at": "x"})
-    assert m.broker_cycled_this_episode() is False
-    _ledger({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": T0 + 5, "at": "x"})
-    assert m.broker_cycled_this_episode() is True
-    monkeypatch.setattr(srv, "device_hold_episode_since", (episode + timedelta(hours=1)).isoformat())
-    assert m.broker_cycled_this_episode() is False

@@ -353,9 +353,11 @@ async def test_a_power_cycle_command_that_timed_out_stays_pending(held, monkeypa
 async def test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_fire(
     monkeypatch, clear_job_state, cold_rung
 ):
-    """A reset ran, failed and left chips off the bus; the power cycle is denied by its rate limit or
-    not opted in. A chip came back by the next forced window, so the reset runs again: nothing stops
-    resets for the rest of the hold while the cold rung cannot fire: no unbounded hold."""
+    """A reset ran, failed and left chips off the bus; the power cycle is denied by its cooldown or
+    not opted in. A chip came back by the next forced window, so the reset runs again. Not opted in:
+    nothing stops resets for the rest of the hold while the cold rung cannot fire, no unbounded hold.
+    Opted in but in its cooldown: the hold's two failed resets are its cap (spec 04 I36), so the third
+    window climbs instead and the cycle waits for a stated deadline, asked again then (I65)."""
     from tests import test_no_repeat_failed_rung as nr
 
     counters, events, _ = nr._episode(monkeypatch, power_cycle=cold_rung == "refused")
@@ -369,9 +371,16 @@ async def test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_f
     for still_off in (nr.OFF_BUS - 1, nr.OFF_BUS - 2):
         monkeypatch.setattr(srv, "read_heartbeats", lambda n=still_off: {str(i): 100 for i in range(nr.EXPECTED - n)})
         assert await nr._window() is True
-    assert counters["resets"] == 3, "each shrunk set earns its reset"
     assert "device_reset_skipped_power_cycle_required" not in events and nr.SKIP not in events
     assert counters["power_cycles"] == 0 and counters["dirty_cleared"] == 0, "the device stays held"
+    if cold_rung == "not-opted-in":
+        assert counters["resets"] == 3, "each shrunk set earns its reset"
+        assert "reset_rung_skipped_cap" not in events
+        return
+    assert counters["resets"] == 2, "the third window climbs past the capped reset"
+    assert "reset_rung_skipped_cap" in events
+    retry = srv.recovery_mechanism.power_cycle_retry
+    assert retry is not None and retry[0] > time.time(), "the refused cycle is asked again at a stated time"
 
 
 @pytest.mark.asyncio

@@ -61,6 +61,9 @@ AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
 # failed and run it again; keyed by the kernel boot id, so the boot a power cycle brings starts empty.
 RESET_RECORD_FILE = "reset_record.json"
 RESET_RECORD_MAX = 64
+# Failed mesh resets one hold episode may run before the next stronger rung takes over (spec 04 I36): a
+# repeat ran 130-262 s and healed nothing a power cycle would not, so a third is not tried.
+MESH_RESET_CAP_PER_HOLD = 2
 
 
 def _chip_key(chip: str) -> tuple:
@@ -606,45 +609,25 @@ class RecoveryMechanism:
         fires it again on that set (spec 04 I36, I58)."""
         return self.failed_unchanged_entry(hold_since, rung, off_now) is not None
 
-    def mesh_reset_failed_this_boot(self, off_now=None) -> bool:
-        """A mesh reset already ran and failed on this mesh: in this process since the last release, or
-        in this boot's record (a broker restart included) leaving exactly the chips off now. Class C
-        reads it (spec 04 I37, I58); a reset that failed on some other set and was later healed does
-        not make a new whole-bus drop skip its one reset."""
-        if self.mesh_reset_failed_since_release:
-            return True
-        if off_now is None:
-            return False
-        now = set(map(str, off_now))
-        return any(
-            e.get("rung") == "mesh_reset" and e.get("off_after") is not None and set(e["off_after"]) == now
-            for e in self._reset_record()["failed"]
-        )
-
-    def broker_cycled_this_episode(self) -> bool:
-        """The broker started a host reboot or power cycle for this fault: the boot now running is its
-        result (:meth:`boot_from_broker_escalation`), or one was requested this boot since the hold
-        episode began. Class C reads it with :meth:`mesh_reset_failed_this_boot` (spec 04 I37): a
-        whole bus still off after the broker's own cycle gets no mesh reset first."""
-        boot = self._current_boot_id() or ""
-        if self.boot_from_broker_escalation(boot) is not None:
-            return True
+    def mesh_resets_failed_this_hold(self, *, now_epoch: Optional[float] = None) -> int:
+        """How many mesh resets ran and failed in this boot since the current hold episode began (spec
+        04 I36). Counted by stamp, not by the episode string a caller passed, so the gate's resets (no
+        episode) and the idle ladders' count alike; a stamp later than now or unreadable counts nothing.
+        Zero with no hold episode: a verified release ends the episode and with it the count."""
         since = self._device_hold_episode_since()
         try:
             start = datetime.fromisoformat(since).timestamp() if since else None
         except ValueError:
             start = None
-        if not boot or start is None:
-            return False
-        for rec in self.read_auto_recovery_ledger() or []:
-            if rec.get("boot_id") != boot or rec.get("action") not in AUTO_RECOVERY_RANK:
-                continue
-            try:
-                if float(rec.get("at_epoch")) >= start:
-                    return True
-            except (TypeError, ValueError):
-                continue
-        return False
+        if start is None:
+            return 0
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        count = 0
+        for entry in self._reset_record()["failed"]:
+            at = _past_epoch(entry.get("at_epoch"), now_epoch)
+            if entry.get("rung") == "mesh_reset" and at is not None and at >= start:
+                count += 1
+        return count
 
     def _local_reset_lock_path(self) -> Path:
         return self._local_reset_dir() / LOCAL_RESET_LOCK

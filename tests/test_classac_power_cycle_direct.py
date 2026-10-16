@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Whole-tray and all-off drops go to the power cycle with no reset first (spec 04 I37).
 
-Class A is one or more whole trays off the bus with a chip still on it; class C is every chip still
-off after a mesh reset already ran and failed. No whole-tray drop healed without a power cycle, and
-on all-off drops whose first mesh reset failed each repeat ran 130-262 s and exited 1; one mesh reset
-has healed an all-off bus, at startup (after a broker restart) as at run time, so that one still
-runs. These pin the short path: the cycle is requested in the first window, behind the host rung's
-own guards, and partial drops keep the full ladder. No test reaches a real reset, sweep or power cycle."""
+Class A is one or more whole trays off the bus with a chip still on it; class C is every chip off
+the bus. No whole-tray drop healed without a power cycle, and on all-off drops each mesh reset ran
+130-262 s and exited 1, and a reset or all-tray re-power there has been followed by the host dying.
+These pin the short path: the cycle is requested in the first window, at startup as at run time,
+behind the host rung's own guards and its bounded cooldown, and partial drops keep the full ladder.
+No test reaches a real reset, sweep or power cycle."""
 
 from types import SimpleNamespace
 
@@ -137,19 +137,19 @@ def test_the_fault_class_of_an_off_bus_set(galaxy_trays):
     m = galaxy_trays
     every = set(range(EXPECTED))
 
-    def cls(off, *, failed=False, expected=EXPECTED, tray_map=m):
-        return galaxy._power_cycle_direct_class(off, expected, tray_map, mesh_reset_failed=failed)
+    def cls(off, *, expected=EXPECTED, tray_map=m):
+        return galaxy._power_cycle_direct_class(off, expected, tray_map)
 
     assert cls(_off(m, {3: 8})) == galaxy.FAULT_CLASS_WHOLE_TRAY
     assert cls(_off(m, {1: 8, 2: 8, 3: 8})) == galaxy.FAULT_CLASS_WHOLE_TRAY, "three trays, one still on"
-    assert cls(every, failed=True) == galaxy.FAULT_CLASS_ALL_OFF
-    assert cls(every) is None, "an all-off drop gets its one mesh reset first, at startup as at run time"
+    assert cls(every) == galaxy.FAULT_CLASS_ALL_OFF, "no mesh reset first, at startup as at run time"
+    assert cls(every, tray_map=None) == galaxy.FAULT_CLASS_ALL_OFF, "an all-off bus needs no tray map"
     assert cls(_off(m, {3: 1})) is None, "one chip: B1"
     assert cls(_off(m, {3: 4})) is None, "part of one tray: the ladder"
     assert cls(_off(m, {3: 8, 2: 1})) is None, "a whole tray plus a stray chip is not exactly whole trays"
     assert cls(_off(m, {3: 8}), tray_map=None) is None, "no map, no class"
-    assert cls({0, 1, 2, 3, 4, 5, 6, 7}, expected=8, failed=True) is None, "a single-tray host"
-    assert cls(set(), failed=True) is None
+    assert cls({0, 1, 2, 3, 4, 5, 6, 7}, expected=8) is None, "a single-tray host"
+    assert cls(set()) is None
 
 
 # ---- class A ------------------------------------------------------------------------------------
@@ -211,15 +211,13 @@ async def test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_ten
 
 
 @pytest.mark.asyncio
-async def test_all_off_at_startup_gets_one_mesh_reset_first(rig):
-    """The startup gate also runs after a broker restart, and one mesh reset has healed an all-off
-    bus there: with no failed reset this episode it runs exactly once, then the next pass cycles."""
+async def test_all_off_at_startup_cycles_with_no_reset_first(rig):
+    """The startup gate (after a boot or a broker restart) with every chip off the bus requests the
+    power cycle in its first pass: no glx_reset, SBR, sweep, mesh reset or tray re-power."""
     rig["beats"] = {}
-    await _gate(rig, galaxy.STAGE_SMI_RESET, phase="startup")
-    assert rig["order"] == ["glx_reset"], "one mesh reset, no power cycle yet"
-    assert "power_cycle_direct" not in _kinds(rig)
     assert await _gate(rig, galaxy.STAGE_SMI_RESET, phase="startup") == galaxy.OUTCOME_WAITING
-    assert rig["order"] == ["glx_reset", "power_cycle"], "no second reset, no sweep, no tray re-power"
+    assert rig["order"] == ["power_cycle"]
+    assert ("power_cycle_direct", "firing") in [(k, e.get("phase")) for k, e in rig["events"]]
 
 
 @pytest.mark.asyncio
@@ -231,17 +229,25 @@ async def test_all_off_at_startup_after_a_failed_reset_cycles_with_no_reset(rig)
 
 
 @pytest.mark.asyncio
-async def test_all_off_after_a_failed_mesh_reset_cycles_with_no_second_reset(rig):
-    """A run-time all-off drop gets one mesh reset; once it failed, the next pass cycles, whichever
-    stage the router names: the reset stage requests it directly, and the host rung's sweep skips."""
+async def test_all_off_at_run_time_cycles_with_no_reset(rig):
+    """A run-time all-off drop cycles in the first pass, whichever stage the router names: the reset
+    stage requests it directly, and the host rung's sweep skips itself."""
     rig["beats"] = {}
     await _gate(rig, galaxy.STAGE_SMI_RESET)
-    assert rig["order"] == ["glx_reset"]
-    await _gate(rig, galaxy.STAGE_SMI_RESET)
-    assert rig["order"] == ["glx_reset", "power_cycle"], "no second reset"
+    assert rig["order"] == ["power_cycle"], "no mesh reset first"
     await _gate(rig, galaxy.STAGE_POWER_CYCLE)
-    assert rig["order"] == ["glx_reset", "power_cycle", "power_cycle"], "no sweep before the host rung"
+    assert rig["order"] == ["power_cycle", "power_cycle"], "no sweep before the host rung"
     assert SKIPPED in _kinds(rig)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["offbus", "offbus-forced"])
+async def test_an_idle_all_off_hold_cycles_with_no_reset(rig, monkeypatch, phase):
+    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE", "1")
+    rig["beats"] = {}
+    out = await rig["g"].escalate(phase, [str(i) for i in range(EXPECTED)], EXPECTED, lambda m: None)
+    assert out == galaxy.OUTCOME_TERMINAL
+    assert rig["order"] == ["power_cycle"], "no glx_reset, SBR, sweep or all-tray re-power"
 
 
 @pytest.mark.asyncio
@@ -334,7 +340,7 @@ async def test_with_no_power_cycle_opted_in_the_ladder_runs(rig, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case, swept",
-    [("whole_tray", False), ("all_off_after_failed_reset", False), ("all_off_run_time", True), ("part_tray", True)],
+    [("whole_tray", False), ("all_off_after_failed_reset", False), ("all_off_run_time", False), ("part_tray", True)],
 )
 async def test_the_last_chance_sweep_skips_itself_for_a_and_c(rig, case, swept):
     m = rig["map"]
@@ -373,13 +379,14 @@ async def test_after_the_cycle_the_startup_gate_awaits_hugepages_and_the_fabric(
 
 @pytest.mark.asyncio
 async def test_a_failed_startup_check_after_the_cycle_keeps_the_hold(rig):
-    """The boot after the cycle starts with no failed reset, so an all-off mesh gets its one mesh
-    reset; when that fails the cycle is asked again, the rate limit denies it, and the hold stays."""
+    """The boot after the cycle still finds every chip off: the cycle is asked again at once, the
+    cooldown denies it, and the hold stays with no reset, no sweep and no release, pass after pass."""
     rig["beats"] = {}
-    rig["allowed"] = (False, "power cycle rate limit: 1 in the last 6 h")
-    await _gate(rig, galaxy.STAGE_SMI_RESET, phase="startup")
-    assert await _gate(rig, galaxy.STAGE_SMI_RESET, phase="startup") == galaxy.OUTCOME_WAITING
-    assert rig["order"] == ["glx_reset", "denied"], "one reset, no second one, no sweep, no release"
+    rig["allowed"] = (False, "power-cycle cooldown: until 10:30")
+    for _ in range(3):
+        assert await _gate(rig, galaxy.STAGE_SMI_RESET, phase="startup") == galaxy.OUTCOME_WAITING
+    assert rig["order"] == ["denied"] * 3, "no reset, no sweep, no release"
+    assert _kinds(rig).count("hold_cannot_escalate") == 3
 
 
 # ---- time to recover ----------------------------------------------------------------------------
@@ -388,8 +395,9 @@ async def test_a_failed_startup_check_after_the_cycle_keeps_the_hold(rig):
 @pytest.mark.asyncio
 async def test_time_to_recover_on_a_fake_clock(rig):
     """When the cycle is requested, on the clock each failed reset (262 s) and sweep (323 s) advance.
-    Class A: at once. Class C, at startup as at run time: after its one reset. The partial-tray
-    ladder (B2): after its one reset; the sweep would repeat it (I58), so it is skipped."""
+    Class A: at once. Class C, at startup as at run time: at once (it used to wait out one failed
+    reset, 262 s). The partial-tray ladder (B2): after its one reset; the sweep would repeat it
+    (I58), so it is skipped."""
 
     async def episode(beats, stages, phase="post-job"):
         g = rig["g"]
@@ -410,7 +418,7 @@ async def test_time_to_recover_on_a_fake_clock(rig):
     all_off_startup = await episode({}, climb, phase="startup")
     all_off_run_time = await episode({}, climb)
     part_tray = await episode(_beats_without(_off(rig["map"], {3: 5})), climb)
-    assert (whole_tray, all_off_startup, all_off_run_time, part_tray) == (0, RESET_SEC, RESET_SEC, RESET_SEC)
+    assert (whole_tray, all_off_startup, all_off_run_time, part_tray) == (0, 0, 0, RESET_SEC)
 
 
 # ---- across a broker restart (spec 04 I58) ------------------------------------------------------
@@ -423,8 +431,9 @@ async def test_replay_all_off_after_a_restart_cycles_with_no_second_reset(rig, m
     gate nor a later gate runs that reset again: the power cycle follows at once."""
     g = rig["g"]
     rig["beats"] = {}
-    await _gate(rig, galaxy.STAGE_SMI_RESET)
-    assert rig["order"][:1] == ["glx_reset"], "a first-seen all-off mesh at run time gets its one reset (I37)"
+    g.mechanism.last_reset_rc = 1
+    await g._note_mesh_reset_failed(False, "", set(map(str, range(EXPECTED))), EXPECTED)
+    assert g.mechanism._reset_record()["failed"], "the failed reset is on disk"
     rig["order"].clear()
     rig["cycled_at"].clear()
     # The restart: memory goes, the record on disk stays.
