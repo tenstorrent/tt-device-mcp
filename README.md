@@ -122,6 +122,12 @@ Start with [00-overview](specs/00-overview.md).
 Environment variables set paths, timeouts, and health thresholds. The full index
 is in [06-state-paths](specs/06-state-paths.md).
 
+The power-cycle cooldown also counts cycles that did not reboot the host (for example a BMC power
+cycle). An out-of-band tool can append them to `power_cycle_history.jsonl` in the broker's state dir
+(`/var/lib/tt-device-broker/`), one JSON object per line: `{"at_epoch": <seconds>, "cause": "<text>"}`.
+`TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE` names another file. A missing file or a malformed line is
+ignored.
+
 If other workloads share the host, an automatic power cycle cuts them too. Set
 `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` to a command that drains them; the broker
 runs it just before it power-cycles the host and waits for it to exit, up to

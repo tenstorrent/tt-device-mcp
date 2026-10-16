@@ -85,10 +85,21 @@ POWER_CYCLE_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_MIN
 # when one is named and readable. After two consecutive broker power cycles no heal followed, it
 # doubles for each further one, capped here; a verified release (a passing full health check)
 # resets the streak.
+log = logging.getLogger(__name__)
 POWER_CYCLE_BACKOFF_CAP_SEC = 4 * 3600
 # A JSON-lines file an external power cycler appends to (``at_epoch``, optional ``cause``); read only.
 POWER_CYCLE_HISTORY_FILE_ENV = "TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE"
 POWER_CYCLE_HEALED_FILE = "power_cycle_healed.json"
+# Used when the env var is unset: this file in the broker's state dir (the parent of the health dir,
+# /var/lib/tt-device-broker on a system broker).
+POWER_CYCLE_HISTORY_DEFAULT_FILE = "power_cycle_history.jsonl"
+
+
+def power_cycle_history_path() -> Path:
+    """The out-of-band power-cycle log: the env var when set, else ``power_cycle_history.jsonl`` in the
+    broker's state dir (spec 04 I65)."""
+    name = os.environ.get(POWER_CYCLE_HISTORY_FILE_ENV, "").strip()
+    return Path(name) if name else health_dir().parent / POWER_CYCLE_HISTORY_DEFAULT_FILE
 
 
 def power_cycle_interval_sec(failed_cycles: int) -> int:
@@ -127,26 +138,43 @@ def _epoch_after(value, than: float, now: float) -> bool:
     return True if at is None else than < at <= now
 
 
+POWER_CYCLE_FAILED_SUFFIX = " (cycle failed)"
+
+
 def _last_external_power_cycle(now_epoch: float) -> Optional[tuple[float, str]]:
     """The latest ``at_epoch`` in the external cycler's history file no later than ``now_epoch``, and
-    its cause, or None when no file is named or it cannot be read (the host's boot time still covers
+    its cause, or None when the file (env var, else the state dir default) is missing or cannot be read (the host's boot time still covers
     any cycle that took the box down). Malformed, non-finite and future lines are skipped."""
-    name = os.environ.get(POWER_CYCLE_HISTORY_FILE_ENV, "").strip()
-    if not name:
-        return None
+    path = power_cycle_history_path()
     try:
-        lines = Path(name).read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return None
-    best: Optional[tuple[float, str]] = None
+    recs: list[tuple[float, str]] = []
+    warned = False
     for ln in lines:
+        if not ln.strip():
+            continue
         try:
             rec = json.loads(ln)
             at = _past_epoch(rec.get("at_epoch"), now_epoch)
         except (ValueError, TypeError, AttributeError):
+            if not warned:
+                warned = True
+                log.warning("power-cycle history %s: skipping malformed line(s)", path)
             continue
-        if at is not None and (best is None or at > best[0]):
-            best = (at, str(rec.get("cause") or "external power cycle"))
+        if at is not None:
+            recs.append((at, str(rec.get("cause") or "external power cycle")))
+    # A failed cycle is logged as a second line with the same at_epoch and the attempt's cause plus
+    # POWER_CYCLE_FAILED_SUFFIX. It never counts, and it cancels the attempt line it matches; an
+    # unmatched failure line is ignored, and an attempt with no failure line still counts.
+    failed = {(at, c[: -len(POWER_CYCLE_FAILED_SUFFIX)]) for at, c in recs if c.endswith(POWER_CYCLE_FAILED_SUFFIX)}
+    best: Optional[tuple[float, str]] = None
+    for at, c in recs:
+        if c.endswith(POWER_CYCLE_FAILED_SUFFIX) or (at, c) in failed:
+            continue
+        if best is None or at > best[0]:
+            best = (at, c)
     return best
 
 
@@ -474,6 +502,10 @@ class RecoveryMechanism:
         # The exit code of the last reset this process launched; None when it was refused, never
         # launched or timed out still cycling. Only a launched reset that failed is recorded.
         self.last_reset_rc: Optional[int] = None
+        # One early forced retry per hold episode after a failed mesh reset that brought chips back
+        # (spec 04 I39): (episode, monotonic due time), and the episode that already spent it.
+        self.progress_retry: Optional[tuple] = None
+        self.progress_retry_spent_since: str = ""
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a
@@ -639,6 +671,27 @@ class RecoveryMechanism:
                 continue
             return entry
         return None
+
+    def note_progress_retry(self, hold_since: str, delay_sec: float) -> bool:
+        """Arm this episode's one early retry after a failed mesh reset whose off-bus set shrank (spec 04
+        I39). False when the episode has no clock or already spent its retry."""
+        if not hold_since or self.progress_retry_spent_since == hold_since:
+            return False
+        self.progress_retry = (hold_since, time.monotonic() + delay_sec)
+        return True
+
+    def progress_retry_due(self, hold_since: str, now: Optional[float] = None) -> bool:
+        """True once this episode's armed early retry is due (spec 04 I39)."""
+        armed = self.progress_retry
+        if not hold_since or armed is None or armed[0] != hold_since:
+            return False
+        return (time.monotonic() if now is None else now) >= armed[1]
+
+    def spend_progress_retry(self) -> None:
+        """The early retry started: it is spent for its episode and never re-armed in it."""
+        if self.progress_retry is not None:
+            self.progress_retry_spent_since = self.progress_retry[0]
+        self.progress_retry = None
 
     def rung_failed_unchanged(self, hold_since: str, rung: str, off_now) -> bool:
         """True when ``rung`` already failed this boot on exactly the off-bus set seen now: no path

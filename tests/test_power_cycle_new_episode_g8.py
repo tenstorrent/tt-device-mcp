@@ -132,10 +132,11 @@ async def test_g8_the_ladder_takes_the_power_cycle_instead_of_holding_for_the_in
 async def test_g8_the_off_bus_hold_interval_skips_a_cycle_a_later_boot_verified(
     monkeypatch, tmp_path, clear_job_state, case, fires
 ):
-    """(a) on the bounded off-bus hold (I27): its own 6 h interval counted every attempt. An attempt a
+    """(a) on the bounded off-bus hold (I27), with an attempt spacing set: it counted every attempt. An attempt a
     later boot verified healthy no longer holds the next episode's cycle; any attempt it cannot prove
     healed (no stamp, no boot id, or a stamp from its own boot) still gates and pages."""
     hold_since, rec = _gated(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", "3600")
     _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(opc, "health_dir", lambda: tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-2")
@@ -159,7 +160,7 @@ async def test_g8_the_off_bus_hold_interval_skips_a_cycle_a_later_boot_verified(
         assert out is True and len(rec["fires"]) == 1
         assert rec["fires"][0]["state"]["attempts"][0]["boot_id"] == "boot-2", "the new attempt names its boot"
     else:
-        assert out is None and rec["fires"] == []
+        assert out is False and rec["fires"] == [], "held to a stated deadline, no fall-through to the ladder"
         assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_rate_limited"]
 
 

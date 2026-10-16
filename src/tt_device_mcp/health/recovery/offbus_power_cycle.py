@@ -7,10 +7,12 @@ the power cycle cannot run, so before this the hold stood until a human power-cy
 the hold is bounded: once the episode has stood ``TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC`` (default
 300 s) and the ladder's safe rungs have run once, the broker runs the host's own power-cycle command
 ``TT_DEVICE_MCP_POWER_CYCLE_CMD`` — but only on a tenant-free box, with no operator recovery in
-progress and no stand-back marker or command active, and at most once per
-``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC`` (default 6 h). Past that, or with the command
-unset, it pages instead and the hold stands as before; a cycle blocked
-``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC`` (default 1800 s) past the grace pages too.
+progress and no stand-back marker or command active, and spaced by the power cycle's cooldown (spec 04
+I65). ``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC`` (unset by default) adds a spacing between
+attempts on top of it, never above the I65 backoff cap; either wait is stated on /health and the cycle
+is asked again the moment it ends. With the command unset it pages instead and the hold stands as
+before; a cycle blocked ``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC`` (default 1800 s) past
+the grace pages too.
 
 The same bounded end applies when the gate allows resets but the BMC's IPMI failed a tray re-power
 (:class:`~tt_device_mcp.health.recovery.stages.ubb_tray.BmcIpmiError`): the tray rung, the mesh reset
@@ -50,7 +52,7 @@ from tt_device_mcp.health.evidence import health_dir, health_event
 
 STATE_FILE = "offbus_power_cycle.json"
 GRACE_DEFAULT_SEC = 300
-MIN_INTERVAL_DEFAULT_SEC = 6 * 3600
+MIN_INTERVAL_DEFAULT_SEC = 0  # no spacing beyond the I65 cooldown unless an operator sets one
 CHECK_TIMEOUT_DEFAULT_SEC = 10.0
 FIRE_TIMEOUT_DEFAULT_SEC = 120.0
 BLOCKED_PAGE_DEFAULT_SEC = 1800
@@ -98,8 +100,14 @@ def tray_walk_handoff_sec() -> int:
 
 
 def min_interval_sec() -> int:
-    """At most one attempt per this many seconds per box (default 6 h); past it, page instead."""
-    return _int_env("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", MIN_INTERVAL_DEFAULT_SEC)
+    """Seconds an attempt holds the next one off, on top of the I65 cooldown; 0 (the default) adds
+    none. Never above the I65 backoff cap: a wait with no stated, bounded end is an open-ended hold."""
+    from tt_device_mcp.health.recovery.base import POWER_CYCLE_BACKOFF_CAP_SEC
+
+    return min(
+        _int_env("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", MIN_INTERVAL_DEFAULT_SEC),
+        POWER_CYCLE_BACKOFF_CAP_SEC,
+    )
 
 
 def _argv(name: str) -> Optional[list]:
