@@ -1128,7 +1128,12 @@ class GalaxyRecovery(Recovery):
         onto a mesh that passes the full verify ends the episode before the ladder.
 
         ``measured_fault`` reaches the present ladder only: the hold stands on a MEASURED fabric
-        failure, so its reset is due without the grace (spec 03 I56; see ``_stuck_hold_reset_due``)."""
+        failure, so its reset is due without the grace (spec 03 I56; see ``_stuck_hold_reset_due``).
+
+        A host reboot or power cycle still pending (spec 04 I34) stops every caller here, before
+        the prelude: nothing runs, WAITING, one log line per request."""
+        if self.mechanism.host_action_blocks_reset(log, context=f"escalate({phase})"):
+            return OUTCOME_WAITING
         rung, _, gate_phase = phase.partition("/")
         if await self._tray_down_latch(expected, beats) == TRAY_DOWN_ONSET and not self._td["prelude_done"]:
             if await self._tray_down_prelude(expected, log, phase=gate_phase or rung):

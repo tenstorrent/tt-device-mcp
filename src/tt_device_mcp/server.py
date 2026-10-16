@@ -5549,6 +5549,19 @@ async def device_health_gate(
                 _note_tenant_gate_verdict(f"device unverified: gate/{phase}: reset cooldown active ({int(left)}s left)")
             return
 
+        # spec 04 I34: a host reboot / power cycle still pending — no rung of this ladder (bridge,
+        # gone-chip bridge, tray re-power, galaxy/SMI reset, a second host rung) starts under it, and
+        # nothing read off a mesh going down is taken as a verdict. The device stays held; the full
+        # check runs once the host is back. Bounded by the request's pending window.
+        if recovery_mechanism.host_action_blocks_reset(_log, context=f"gate/{phase}"):
+            if fsm.state is ServerState.HEALTHY:
+                _mark_device_dirty(f"gate/{phase}: unhealthy while a host action is pending", why="probe_unhealthy")
+            metrics.stage_fired("smi_reset", "blocked")
+            _note_tenant_gate_verdict(
+                f"device unverified: gate/{phase}: a requested host reboot/power cycle is pending"
+            )
+            return
+
         reasons = ["failed health check"] if not healthy else []
         if device_fault_reported:
             # Say what actually brought us here. Every check passed; the runtime disagreed.
@@ -6391,10 +6404,8 @@ def _host_action_blocks_escalation() -> bool:
     pending = recovery_mechanism.host_action_pending()
     if pending is None:
         if req is not None:
+            # host_action_pending() emitted host_action_request_expired as it dropped the request.
             bound = int(host_action_pending_sec())
-            health_event(
-                "host_action_request_expired", action=req[0], bound_sec=bound, held_since=device_hold_episode_since
-            )
             if logger:
                 logger.error(
                     f"HOLD-DEADLINE-ESCALATE host {req[0]} was requested over {bound}s ago and the host is "
@@ -6420,6 +6431,25 @@ def _host_action_blocks_escalation() -> bool:
                 f"host comes back"
             )
     return True
+
+
+def _host_action_reset_refusal(force: bool) -> Optional[str]:
+    """Why an operator reset is refused while a requested host reboot / power cycle is pending
+    (spec 04 I34), or None. ``force`` overrides, loudly: the operator may know the host is not
+    going down. Bounded like every other path: an expired request no longer refuses."""
+    pending = recovery_mechanism.host_action_pending() if recovery_mechanism is not None else None
+    if pending is None:
+        return None
+    action, age = pending
+    why = (
+        f"a host {action} was requested {int(age)}s ago and is pending (up to "
+        f"{int(host_action_pending_sec())}s); a device reset now only races the host going down"
+    )
+    if force:
+        if logger:
+            logger.warning(f"reset: forced while {why}")
+        return None
+    return why
 
 
 def _maybe_spawn_forced_escalation() -> bool:
@@ -7138,6 +7168,12 @@ def _escalate_held_job_past_bound(job: "Job", held_sec: float, bound: float, rea
         if _maybe_spawn_forced_escalation():
             device_hold_job_bound_escalated = True
             return "forced recovery escalation started"
+        pending = recovery_mechanism.host_action_pending() if recovery_mechanism is not None else None
+        if pending is not None:
+            return (
+                f"forced escalation deferred: a host {pending[0]} was requested {int(pending[1])}s ago "
+                f"(pending up to {int(host_action_pending_sec())}s); the device stays held"
+            )
         return "forced escalation deferred (a device op is in flight); the hold watchdog retries it"
     except Exception as e:  # escalation bookkeeping must never keep the job held
         if logger:
@@ -10317,6 +10353,12 @@ def create_mcp_server() -> MCPServer:
             yield f"hint: {LEFTOVER_REBOOT_HINT}\n"
             yield "::status::refused\n"
             return
+        host_pending = _host_action_reset_refusal(force)
+        if host_pending:
+            yield f"host action REFUSED: {host_pending}\n"
+            yield "hint: wait for the host to come back, or pass --force\n"
+            yield "::status::refused\n"
+            return
 
         # Over the socket the caller's real uid scopes the gate. Over HTTP there is no peer
         # identity: on a privsep host an anonymous caller owns no holder, so every tenant is
@@ -11818,6 +11860,16 @@ def create_mcp_server() -> MCPServer:
                 "foreign_holders": [],
                 "steps": steps,
                 "hint": LEFTOVER_REBOOT_HINT,
+            }
+        host_pending = _host_action_reset_refusal(force)
+        if host_pending:
+            step(f"host action REFUSED: {host_pending}", "warning")
+            return {
+                "status": "refused",
+                "reason": host_pending,
+                "foreign_holders": [],
+                "steps": steps,
+                "hint": "Wait for the host to come back, or pass force=true to override.",
             }
         # Over the socket the caller's real uid scopes the gate. Over HTTP there is no peer
         # identity: on a privsep host an anonymous caller owns no holder, so every tenant is
