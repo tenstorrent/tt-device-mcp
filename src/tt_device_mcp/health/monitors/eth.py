@@ -348,7 +348,7 @@ def build_reason() -> str:
 
 
 # classify_exit's reason for a read that hit run_probe's own timeout. The post-job gate tells this
-# stuck read apart from a crash or the probe's own 77 (spec 03 I56).
+# stuck read apart from a crash or the probe's own 77 (spec 03 I61).
 READ_TIMED_OUT = "eth-heartbeat read timed out without reaching a verdict"
 
 

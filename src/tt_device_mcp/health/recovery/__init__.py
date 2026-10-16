@@ -127,7 +127,7 @@ class Evidence:
     off_bus_before: Optional[int]
     reset_exit_nonzero: bool
     holding_fabric_unverified: bool = False
-    # Spec 03 I56: a clean post-job eth read timed out on a present mesh, and this hold episode's one
+    # Spec 03 I61: a clean post-job eth read timed out on a present mesh, and this hold episode's one
     # present-mesh reset is unspent and not refused by the outage hold. Routed like dispatch_reset_due.
     eth_timeout_reset_due: bool = False
     # Spec 03 I55: the fabric passed traffic but mesh dispatch failed over a present mesh, and this
@@ -651,6 +651,7 @@ class Recovery(ABC):
             # untouched and the next gate fires another back-to-back galaxy reset — the repeat MMIO at
             # a dead endpoint the cooldown exists to prevent.
             self.mechanism.last_reset_monotonic = time.monotonic()
+            self.monitor.last_fabric_ok = None  # the pre-reset verdict describes a mesh that is gone
             healthy, evidence = await self._verify_device(expected, log)
             FABRIC_DEBT.note_evidence(evidence)
             self.mechanism.last_reset_failed = not healthy
@@ -715,6 +716,11 @@ class Recovery(ABC):
         # finds — a stage's own firing outcome is about the ACTION, not the fault it was meant to
         # clear, so this always reports "ok" whether or not the device comes back healthy.
         metrics.stage_fired("smi_reset", "ok")
+        # The reset re-inited every eth core, so a fabric FAIL measured before it no longer describes
+        # this mesh. Left standing, a post-reset 77 read as a measured fault and took the hold to the
+        # terminal DOWN no idle path re-checks, instead of the bounded 77 relift (spec 04 I32a). The
+        # release is still the debt's: only a passing pass after this reset settles it.
+        self.monitor.last_fabric_ok = None
         healthy, evidence, retries = await self._verify_device_after_reset(expected, log)
         if healthy is None:
             # A persistent post-reset 77 is UNKNOWN, not a failed recovery: the chips came back, and the

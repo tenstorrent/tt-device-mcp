@@ -144,7 +144,7 @@ __all__ = [
     # construction pieces ServerFsm.boot assembles into the process singletons
     "HealthMonitor",
     "journal_interrupted_fabric_check",
-    "eth_read_timed_out",  # spec 03 I56: the stuck eth read the post-job present-mesh reset answers
+    "eth_read_timed_out",  # spec 03 I61: the stuck eth read the post-job present-mesh reset answers
     "RecoveryMechanism",
     "RecoveryDeps",
     "GalaxyRecovery",

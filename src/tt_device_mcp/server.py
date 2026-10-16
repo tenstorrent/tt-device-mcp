@@ -3594,7 +3594,7 @@ def _names_topology_mismatch(text: str) -> bool:
 
 
 def _eth_timeout_reset_shape(evidence: dict) -> bool:
-    """Whether a probe pass took the spec 03 I56 skip: its eth read timed out with no verdict, host-pci
+    """Whether a probe pass took the spec 03 I61 skip: its eth read timed out with no verdict, host-pci
     and the snapshot were OK, and no fabric pass ran. Any other shape keeps today's path."""
     eth_ev = evidence.get("eth_heartbeat") or {}
     return (
@@ -3907,7 +3907,7 @@ async def _attempt_idle_relift() -> None:
             if await asyncio.to_thread(recovery_mechanism.scope_active):
                 return
 
-            async def _escalate(rung: str) -> bool:
+            async def _escalate(rung: str, *, measured_fault: bool = False) -> bool:
                 """Run one rung and fold its outcome into ``fsm``. Returns True iff something
                 other than WAITING came back — the caller's cue to stop, the same way a direct
                 ``!= OUTCOME_WAITING`` check did before ``fsm`` needed telling too.
@@ -3916,9 +3916,10 @@ async def _attempt_idle_relift() -> None:
                 reason the gate's rungs are: the idle ladders apply on every platform (reset argv
                 is re-derived per platform inside _reset_and_verify_device), while a per-target
                 host's own escalate() has no ladder and reports WAITING forever — an idle hold
-                there would outlive every ceiling with no rung ever attempted."""
+                there would outlive every ceiling with no rung ever attempted. ``measured_fault``
+                lets the present ladder reset without the grace (spec 03 I56)."""
                 _void_fabric_ok(f"idle relift: {rung}")
-                outcome = await galaxy_recovery.escalate(rung, indices, expected, _log)
+                outcome = await galaxy_recovery.escalate(rung, indices, expected, _log, measured_fault=measured_fault)
                 if outcome == OUTCOME_TERMINAL and _fabric_77_only_hold():
                     # The rung ran and the fabric still only 77s: no fault was measured, so the episode
                     # is not the terminal DOWN no idle path re-checks. It stays held and RECOVERING, and
@@ -4021,6 +4022,11 @@ async def _attempt_idle_relift() -> None:
             else:
                 eok, edetail = await health_monitor.verify_eth_heartbeat()
                 if fsm.record.why == "eth_frozen":
+                    # The hold's last fabric pass MEASURED a failure (a post-job gate's rc 1, not a 77
+                    # skip) and no eth read says the cores are frozen: the fault is proven, so the
+                    # present-mesh reset runs on this relift, not after the grace (I56). A positive
+                    # frozen read keeps the grace — that is the eth wedge it was sized for.
+                    measured = health_monitor.last_fabric_ok is False and eok is not False
                     # Held for a frozen eth core, which enum+ARC cannot see. Lift ONLY on a positively-
                     # advancing heartbeat. `None` is "could not tell" (reader unconfigured, or a read a
                     # frozen core can itself hang), `False` is still frozen — both hold. The gate never
@@ -4031,7 +4037,7 @@ async def _attempt_idle_relift() -> None:
                         # unreadable — a present-mesh wedge no read the broker owns can clear. Left here
                         # the hold stands forever on an idle box (the 8h strand). Past the ceiling, with
                         # no tenant, escalate to the gate's galaxy reset, which re-inits every eth core.
-                        if await _escalate("present"):
+                        if await _escalate("present", measured_fault=measured):
                             return
                         _log(
                             f"held for a frozen eth core but the heartbeat is not confirmed advancing "
@@ -4046,8 +4052,9 @@ async def _attempt_idle_relift() -> None:
                         # real traffic verdict was FAIL and that no pass has cleared since. Same
                         # last-verdict guard as the off-bus branch below, but here the mesh is fully
                         # present, so this is exactly the state the present-mesh galaxy reset cures:
-                        # ride its guards (grace, pacing, tenant-free) instead of standing forever.
-                        if await _escalate("present"):
+                        # ride its guards (pacing, tenant-free; no grace on a measured fault, I56)
+                        # instead of standing forever.
+                        if await _escalate("present", measured_fault=measured):
                             return
                         _log(
                             "eth heartbeat advancing but the last fabric verdict was UNHEALTHY — "
@@ -5191,7 +5198,7 @@ async def device_health_gate(
         # post-step is the same exit seen from outside the broker, and its worst case (the read, then
         # the bounded pass) is what a failed step already pays inside the same step deadline.
         run_eth = with_recover and phase in ("post-job", "post-step") and not full and eth_check_armed
-        # Spec 03 I56: on a clean post-job exit this episode's one present-mesh reset is still
+        # Spec 03 I61: on a clean post-job exit this episode's one present-mesh reset is still
         # grantable, so a timed-out eth read may skip the pre-reset fabric pass and reset instead.
         # Each guard here is one a reset would otherwise trip on; any that fails keeps today's pass.
         eth_timeout_reset = (
@@ -5223,7 +5230,7 @@ async def device_health_gate(
             last_fabric_ok_monotonic = time.monotonic()
         elif fabric_ok is False:
             last_fabric_ok_monotonic = 0.0
-        # The probe pass took the I56 skip: the read timed out, host-pci and the snapshot (every chip,
+        # The probe pass took the I61 skip: the read timed out, host-pci and the snapshot (every chip,
         # ARC healthy) were OK, and no fabric pass ran. The mesh is not proven, so it is not healthy.
         eth_timeout_due = eth_timeout_reset and healthy and _eth_timeout_reset_shape(evidence)
         if eth_timeout_due:
@@ -5565,7 +5572,7 @@ async def device_health_gate(
         dispatch_failed = fabric_ok is False and fabric.names_dispatch_failure(health_monitor.last_fabric_output or "")
         if dispatch_failed and not _dispatch_reset_spent and not mesh_reset_hold_reason():
             ev = replace(ev, dispatch_reset_due=True)
-        # Spec 03 I56: the same one reset, shared latch, for a clean exit's timed-out eth read.
+        # Spec 03 I61: the same one reset, shared latch, for a clean exit's timed-out eth read.
         if eth_timeout_due and not _dispatch_reset_spent and not mesh_reset_hold_reason():
             ev = replace(ev, eth_timeout_reset_due=True)
         stage = galaxy_recovery.next_stage(ev)
@@ -5577,7 +5584,7 @@ async def device_health_gate(
             caller is done. Reads ``ev``/``beats`` as they stand at the call, which is the evidence
             the decision being fired was made from."""
             if fsm.state is ServerState.HEALTHY:
-                # A rung fired from a clean exit (spec 03 I55/I56 on a present mesh) has no episode
+                # A rung fired from a clean exit (spec 03 I55/I61 on a present mesh) has no episode
                 # open yet. Open it before the reset, so a failed post-reset check leaves the door
                 # held and the ladder climbing; only the full check's pass releases it.
                 _mark_device_dirty(f"gate/{phase}: {'; '.join(reasons) or 'unhealthy'} — {rung}", why="probe_unhealthy")

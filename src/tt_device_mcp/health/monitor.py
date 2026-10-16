@@ -257,7 +257,7 @@ ETH_COULD_NOT_CHECK = "skipped (eth-heartbeat read could not check)"
 
 def eth_read_timed_out(detail: str) -> bool:
     """Whether an eth read's detail is a could-not-check whose cause was the read's own timeout —
-    the stuck read the post-job present-mesh reset answers (spec 03 I56), never a crash or a 77."""
+    the stuck read the post-job present-mesh reset answers (spec 03 I61), never a crash or a 77."""
     return (detail or "").startswith(ETH_COULD_NOT_CHECK) and eth.READ_TIMED_OUT in detail
 
 
@@ -398,7 +398,7 @@ class HealthMonitor:
         would charge every clean job ~45-100s. Otherwise the skip is recorded and the pass ends.
 
         ``eth_timeout_reset`` says the post-job gate can still grant this hold episode's one
-        present-mesh reset (spec 03 I56). A ``run_eth`` read that then TIMED OUT with no verdict, on
+        present-mesh reset (spec 03 I61). A ``run_eth`` read that then TIMED OUT with no verdict, on
         a pass whose host-pci read is OK and whose snapshot found every chip with a healthy ARC,
         skips the fabric pass: the gate resets next, and the full check after the reset runs the
         pass. Any guard that fails keeps the pass.
@@ -512,7 +512,7 @@ class HealthMonitor:
             link_drop_held = (
                 not fabric_asked and eok is None and edetail.startswith(ETH_LINK_DROP_SKIP) and not fabric_stale
             )
-            # Spec 03 I56: a timed-out read on a present mesh goes straight to the gate's one
+            # Spec 03 I61: a timed-out read on a present mesh goes straight to the gate's one
             # present-mesh reset. The pass here failed or skipped after every such timeout measured.
             reset_due = (
                 eth_timeout_reset and not fabric_asked and eok is None and eth_read_timed_out(edetail) and hp_ok is True

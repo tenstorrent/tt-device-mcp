@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Spec 03 I56: a clean post-job eth read that timed out with no verdict, on a present mesh, skips the
+"""Spec 03 I61: a clean post-job eth read that timed out with no verdict, on a present mesh, skips the
 pre-reset fabric pass and takes the one present-mesh reset of the hold episode (shared with I55's
 dispatch reset). Only the full check after it releases the device. Every other shape keeps the pass.
 
