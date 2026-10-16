@@ -363,8 +363,8 @@ async def test_the_last_chance_sweep_skips_itself_for_a_and_c(rig, case, swept):
 @pytest.mark.asyncio
 async def test_after_the_cycle_the_startup_gate_awaits_hugepages_and_the_fabric(monkeypatch, _startup):  # noqa: F811
     """The host the cycle brings back runs the startup pass only once the hugepage pool is full, with
-    the fabric pass; a mesh still all off there gets its one mesh reset, then requests the cycle again
-    behind its rate limit, holds, and never releases the device."""
+    the fabric pass; a mesh still all off there requests the cycle again with no mesh reset, behind
+    its rate limit, holds, and never releases the device."""
     events, rows, gate_calls = _startup
     runs = []
 

@@ -369,6 +369,28 @@ async def test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_cycles_wi
 
 
 @pytest.mark.asyncio
+async def test_all_off_held_by_the_cooldown_shows_its_deadline_and_cycles_at_it(cool, monkeypatch):
+    """Class C, the real I65 gate: a boot 3 min ago holds the cycle. /health names the deadline, the
+    hold_cannot_escalate event carries the same retry time, no reset runs meanwhile, and the hold
+    watchdog asks once at the deadline, where exactly one cycle fires."""
+    cool["boot"]["btime"] = T0 - 180
+    cool["beats"] = {}
+    until = T0 - 180 + POWER_CYCLE_MIN_INTERVAL_SEC
+    assert await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup") == galaxy.OUTCOME_WAITING
+    assert _cycles(cool) == 0 and not LADDER & set(cool["order"])
+    ((_, held),) = [(k, e) for k, e in cool["events"] if k == "hold_cannot_escalate"]
+    assert held["fault_class"] == galaxy.FAULT_CLASS_ALL_OFF and held["retry_at_epoch"] == until
+    monkeypatch.setattr(srv, "_device_hold_state", lambda now=None: ("all off", srv.device_hold_episode_since))
+    cd = srv._health_payload(now=datetime.fromtimestamp(T0))["power_cycle_cooldown"]
+    assert cd["next_deadline"] == datetime.fromtimestamp(until).isoformat(timespec="seconds") == held["retry_at"]
+    assert _watchdog(cool, monkeypatch, until - 1) == []
+    assert _watchdog(cool, monkeypatch, until) == [until], "asked the moment the cooldown ends"
+    cool["clk"][0] = until
+    await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
+    assert _cycles(cool) == 1 and not LADDER & set(cool["order"])
+
+
+@pytest.mark.asyncio
 async def test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_reset(cool):
     """The broker's own power cycle did not bring the bus back: no mesh reset first, the next cycle
     waits only for the cooldown and fires at its end."""
