@@ -956,6 +956,13 @@ def _maybe_emit_ubb_reset_required(beats: dict, off_bus: int, expected: int, log
     return trays
 
 
+# The recorded reason of the I29 host rung on a 77 (spec 04 I29): the boot it brings up reads it from the
+# reboot ledger, so a 77 that survives the reboot is handed to an operator instead of climbing again.
+FABRIC_77_HOST_RUNG_CAUSE = "idle escalation: fabric unverified (77) after the reset and the last-chance sweep"
+# How long a 77 the host rung did not end stands for an operator (the act-by time on its page).
+FABRIC_77_HANDOFF_SEC = 1200
+
+
 class GalaxyRecovery(Recovery):
     """Recovery for a 6U Galaxy: the mesh-wide reset, gentlest-first routing ahead of it (a
     per-chip bridge reset when a chip is surgically isolable), and the host reboot/power-cycle
@@ -965,6 +972,8 @@ class GalaxyRecovery(Recovery):
     # no-host-rung hold already paged (spec 04 I29).
     _sweep_read_77: bool = False
     _host_rung_77_paged_since: Optional[str] = None
+    # The operator hand-off of a 77 the host rung did not end (spec 04 I29): its episode and deadline.
+    _fabric_77_handoff: Optional[dict] = None
 
     async def _offbus_ids_now(self, expected: int) -> Optional[set]:
         """The chip ids off the bus now, or None when the heartbeats cannot be read."""
@@ -2448,10 +2457,13 @@ class GalaxyRecovery(Recovery):
 
         The sweep runs here, not behind the host-rung permission: the climb asks the reboot ledger
         first, and on one Galaxy host its boot-loop guard kept the sweep waiting an hour. A sweep whose verify
-        is still a 77 is not a recovery (the fallback that refused it measured more than a 77 can), and
-        not a fault either: no rung measured one, so it never climbs to a host rung (a reboot or power
-        cycle). The episode holds, pages once, and the idle relift keeps re-running the fabric pass on
-        its backoff (spec 03 I48)."""
+        is still a 77 is not a recovery (the fallback that refused it measured more than a 77 can). With
+        a known no-reset cause (a cable fault, a topology mismatch, hugepages not yet allocated, the
+        validator missing) it holds and pages once; the idle relift keeps re-running the fabric pass on
+        its backoff (spec 03 I48). Otherwise the one rung left that rebuilds what a 77 lacks is the host
+        rung (a reboot refills the 1G hugepages, reloads the driver and retrains every link): it climbs
+        there once per episode, through every guard of the climb. A 77 that rung did not end is handed
+        to an operator with a deadline, still held."""
         if self.mechanism.unverified_sweep_since != hold_since:
             self.mechanism.unverified_sweep_since = hold_since
             self._sweep_read_77 = False
@@ -2476,15 +2488,91 @@ class GalaxyRecovery(Recovery):
             if self._sweep_read_77:
                 self.mechanism.unverified_sweep_77_since = hold_since
         if self.mechanism.unverified_sweep_77_since == hold_since:
-            self._hold_77_without_host_rung(hold_since, expected, log)
+            no_reset = self.deps.fabric_77_no_reset_cause
+            if no_reset is not None and no_reset():
+                self._hold_77_without_host_rung(hold_since, expected, log)
+                return
+            spent = self._fabric_77_host_rung_spent(hold_since)
+            if not spent:
+                health_event("fabric_unverified_host_rung", held_since=hold_since, expected=expected)
+                log(
+                    "the reset and the last-chance sweep both left the fabric unverified (77) with no known "
+                    "no-reset cause — climbing once to the host rung, which refills the hugepages, reloads "
+                    "the driver and retrains the links"
+                )
+                if await self._climb_to_host_recovery_after_failed_reset(
+                    expected, off_bus_before, log, swept=True, cause=FABRIC_77_HOST_RUNG_CAUSE
+                ):
+                    self.mechanism.unverified_77_host_rung_since = hold_since
+                    return
+                spent = "the host rung could not run (not opted in, rate-limited or a tenant holds the mesh)"
+            self._hand_77_hold_to_operator(hold_since, expected, spent, log)
             return
         await self._climb_to_host_recovery_after_failed_reset(expected, off_bus_before, log, swept=True)
 
+    def _fabric_77_host_rung_spent(self, hold_since: str) -> str:
+        """Why this 77 episode's one host rung is spent, or "" (spec 04 I29): it already fired on this
+        episode, or this boot is that rung's result and no fabric pass has passed since the broker
+        started (the reboot did not end the 77). A pass after the boot frees the rung for a later
+        episode; the reboot ledger's rate limit still bounds it."""
+        if self.mechanism.unverified_77_host_rung_since == hold_since:
+            return "the host rung already ran on this hold"
+        if FABRIC_DEBT.passed_since_start:
+            return ""
+        rec = self.mechanism.boot_from_broker_escalation(self.deps.current_boot_id())
+        if rec and str(rec.get("reason", "")) == FABRIC_77_HOST_RUNG_CAUSE:
+            return f"this boot is the {rec.get('action')} that rung fired, and the fabric still reads 77"
+        return ""
+
+    def _hand_77_hold_to_operator(self, hold_since: str, expected: int, why: str, log) -> None:
+        """A 77 the host rung did not end: keep the device held and page an operator once per episode
+        with a deadline (spec 04 I29). The idle relift keeps re-running the full check, fabric
+        included, on its backoff (spec 03 I48); only a passing one releases it."""
+        h = self._fabric_77_handoff
+        if h and h["episode"] == hold_since:
+            log(f"fabric still unverified (77) and {why} — held, handed to an operator")
+            return
+        deadline = time.time() + FABRIC_77_HANDOFF_SEC
+        act_by = datetime.fromtimestamp(deadline).isoformat(timespec="seconds")
+        self._fabric_77_handoff = {"episode": hold_since, "deadline": deadline, "why": why}
+        event = {
+            "kind": "fabric_unverified_operator_handoff",
+            "held_since": hold_since,
+            "reason": self.deps.device_hold_episode_reason(),
+            "why": why,
+            "expected": expected,
+            "act_by": act_by,
+            "deadline_epoch": deadline,
+        }
+        health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
+        log(
+            f"the reset, the last-chance sweep and the host rung left the fabric unverified (77) — {why}. "
+            f"An operator must check the host (cables, hugepages, the fabric validator) by {act_by}; the "
+            f"device stays held and the broker re-runs the full health check, fabric included, on its "
+            f"backoff, releasing only on a pass"
+        )
+        alert.send_alert(event, _logger)
+
+    def fabric_77_handoff_status(self, episode: str) -> Optional[dict]:
+        """The /health ``operator_handoff`` field while this episode's 77 is handed off, or None."""
+        h = self._fabric_77_handoff
+        if not h or not episode or h["episode"] != episode:
+            return None
+        return {
+            "reason": f"fabric unverified (77): {h['why']}",
+            "owner": "operator",
+            "act_by": datetime.fromtimestamp(h["deadline"]).isoformat(timespec="seconds"),
+            "act_by_epoch": h["deadline"],
+            "then": "held; the broker re-runs the full health check, fabric included, and releases only on a pass",
+        }
+
     def _hold_77_without_host_rung(self, hold_since: str, expected: int, log) -> None:
         """Every lower rung ran on a 77-only episode (one reset, the sweep) and the fabric pass still could
-        not run: hold without a reboot or power cycle and page once per episode (spec 04 I29)."""
+        not run for a cause no reboot fixes (a cable fault, a topology mismatch, hugepages not yet
+        allocated, the validator missing): hold without a reboot or power cycle and page once per
+        episode (spec 04 I29)."""
         if self._host_rung_77_paged_since == hold_since:
-            log("fabric still unverified (77) after the reset and the sweep — holding; no host rung on a 77")
+            log("fabric still unverified (77) after the reset and the sweep, for a known no-reset cause — holding")
             return
         self._host_rung_77_paged_since = hold_since
         event = {
@@ -2495,14 +2583,14 @@ class GalaxyRecovery(Recovery):
         }
         health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
         log(
-            "the reset and the last-chance sweep both left the fabric unverified (77) — no rung measured a "
-            "fault, so no reboot or power cycle; holding, paging once, the idle relift keeps re-checking"
+            "the reset and the last-chance sweep both left the fabric unverified (77) for a known no-reset "
+            "cause — no reboot or power cycle; holding, paging once, the idle relift keeps re-checking"
         )
         alert.send_alert(event, _logger)
 
     async def _climb_to_host_recovery_after_failed_reset(
-        self, expected: int, off_bus_before: Optional[int], log, *, swept: bool = False
-    ) -> None:
+        self, expected: int, off_bus_before: Optional[int], log, *, swept: bool = False, cause: str = ""
+    ) -> bool:
         """Climb an idle escalation whose galaxy reset failed to revive the mesh to the host rung — a
         warm reboot, then a BMC power cycle above it — so a reset that did not recover does not sit.
         Bounded below by the hold ceiling: the host rungs never fire before the episode has stood the
@@ -2531,13 +2619,16 @@ class GalaxyRecovery(Recovery):
         6U-Galaxy reboot does not power-cycle the UBBs, so a dropped ASIC stays off across it. Route such
         a reset straight to the cold rung, never the warm reboot that just proved it cannot help — the
         same verdict the gate reaches, so a regression is handled the same on the idle path as at a job
-        boundary."""
+        boundary.
+
+        ``cause`` replaces the recorded reason (the I29 77 climb names itself, so the next boot can tell
+        it apart). Returns True iff it requested the reboot or power cycle."""
         if await asyncio.to_thread(self.mechanism.scope_active):
             log(
                 "reset did not recover but one is still cycling in its own scope — not escalating over "
                 "its in-flight all-ones; the next gate adopts and verifies it"
             )
-            return
+            return False
         # The host rungs are bounded BELOW by the hold ceiling: however futile the gentler rungs
         # look, a reboot or power cycle never fires before the episode has stood the full ladder.
         # The early off-bus pass (_offbus_hold_ceiling_sec) exists to fire the CHEAP rungs early,
@@ -2585,7 +2676,7 @@ class GalaxyRecovery(Recovery):
                 held_age_sec=int(hold_age),
                 ceiling_sec=_stuck_hold_ceiling_sec(),
             )
-            return
+            return False
         reboot_floor = _reboot_min_dead_chips(expected)
         # A below-floor off-bus drop reaching this climb is NOT self-healing: it survived the 20-min grace
         # and a reset that could not recover it. A dropped ASIC does not re-enumerate on a warm reboot (a
@@ -2615,13 +2706,13 @@ class GalaxyRecovery(Recovery):
             # reboot_blocked means specifically: this drop needs the cold rung and power-cycle is
             # not opted in — a power_cycle kill-switch decline, not a "no rung exists at all" case.
             metrics.stage_fired("power_cycle", "blocked")
-            return
+            return False
         if not escalation:
             # Both TT_DEVICE_MCP_AUTO_REBOOT and _AUTO_POWER_CYCLE are off (the default) —
             # gentlest-first, the reboot rung is the one this leaves declined.
             metrics.stage_fired("host_reboot", "blocked")
-            return
-        if off_bus == 0:
+            return False
+        if off_bus == 0 and not cause:
             # A PRESENT mesh (every chip on the bus, ARC-healthy) whose galaxy reset STILL did not verify
             # is an eth/fabric wedge the reset could not clear — and self-heal will not either, since it
             # already survived the deepest reset. The old code held it here (below the mass floor), which
@@ -2645,10 +2736,10 @@ class GalaxyRecovery(Recovery):
             )
             self.mechanism._journal_auto_recovery_denied(escalation, why)
             metrics.stage_fired(_HOST_ESCALATION_STAGE.get(escalation, escalation), "blocked")
-            return
+            return False
         # The recorded cause names what is actually true at this point — the old fixed string
         # blamed a galaxy reset even on paths where the reset was suppressed and never ran.
-        cause = (
+        cause = cause or (
             "idle escalation: present mesh failed the post-reset verify"
             if off_bus == 0
             else f"idle escalation: {off_bus}/{expected} chip(s) off the bus after the reset ladder"
@@ -2663,12 +2754,13 @@ class GalaxyRecovery(Recovery):
             )
             is not False
         ):
-            return
+            return False
         health_event("stuck_hold_host_escalation", escalation=escalation, off_bus=off_bus)
         if escalation == "power-cycle":
             await self.deps.auto_power_cycle_host(log, cause)
         else:
             await self._auto_reboot_host(log, cause)
+        return True
 
     async def _verify_post_reboot_recovery(self, off_bus: int, expected: int, log) -> None:
         """After a warm reboot the broker itself fired, confirm the mesh came back — and climb to the

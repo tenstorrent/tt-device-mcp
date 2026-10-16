@@ -533,7 +533,10 @@ job boundary.
   the startup checks at once), and this bound ends it. Not while a reset still owes a fabric pass
   (spec 04 I32): the startup checks prove no fabric after a reset, so such a pass climbs the
   present-mesh rung instead of releasing, and the reset's hold ends in a passing fabric pass or the
-  ladder's bounded climb (spec 04 I29). A 77-only hold that followed no reset releases as above.
+  ladder's bounded climb (spec 04 I29). That climb also reaches the host rung when the last-chance
+  sweep still reads a 77 with no known no-reset cause: once per episode, then an operator hand-off
+  (spec 04 I29), the device held until a full check with fabric passes. A 77-only hold that followed
+  no reset releases as above.
   Idle path only: no added time between
   jobs. The hardware fault of the first job after a
   topology-mismatch lift (I42) is outside this bound: no release or rung can fix cabling. A
@@ -628,7 +631,9 @@ job boundary.
   first step counts from the hold's opening, each later one from the last re-check that read a 77
   again. An owed startup pass (I39) is not held back. The I40 bound's third retry so lands about
   17 min into the episode, and a hold nothing could end gets a fresh pass every 20 min rather than on
-  every relift tick. A rung that ran and left the fabric still only 77ing measured no fault, so its
+  every relift tick. For a hold a reset left owing its fabric pass, the backoff is not the only end:
+  the escalation's sweep and host rung (spec 04 I29) bound it, and the backoff keeps re-checking
+  meanwhile. A rung that ran and left the fabric still only 77ing measured no fault, so its
   terminal outcome does not take the broker DOWN (a state no idle path re-checks): the hold stays
   RECOVERING and the backoff keeps re-checking. A hold with a measured fabric fault or a named
   runtime fault goes DOWN on a terminal rung as before. A 77 whose output names the hugepage pool

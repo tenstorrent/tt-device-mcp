@@ -276,6 +276,10 @@ class RecoveryDeps:
     # (server._note_fabric_77_reset_passes), so the next relift falls back at once instead of
     # re-running the passes the reset just spent.
     note_fabric_77_reset_passes: Optional[Callable[[int], None]] = None
+    # Whether the open hold's fabric 77 has a cause no reset or reboot fixes — a known cable fault (a 78),
+    # a topology mismatch or fault, hugepages not yet allocated, the validator missing
+    # (server._fabric_77_no_reset_cause). Such a 77 never climbs to a host rung (spec 04 I29).
+    fabric_77_no_reset_cause: Optional[Callable[[], bool]] = None
     refresh_idle_hold_ledger: Optional[Callable[[], None]] = None
     spawn_idle_relift: Optional[Callable[[], None]] = None
     watch_idle_holders: Optional[Callable[[], None]] = None
