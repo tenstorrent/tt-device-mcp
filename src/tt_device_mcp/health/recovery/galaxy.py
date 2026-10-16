@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import alert, metrics, privileges
-from tt_device_mcp.device_holders import is_tenant
+from tt_device_mcp.device_holders import holder_comm, is_tenant, username_for_uid
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count
@@ -367,7 +367,9 @@ def _present_mesh_reset_grace_sec() -> int:
     return v if v > 0 else 120
 
 
-def _stuck_hold_reset_due(hold_since: str, *, off_bus: int, now: Optional[datetime] = None) -> bool:
+def _stuck_hold_reset_due(
+    hold_since: str, *, off_bus: int, now: Optional[datetime] = None, measured_fault: bool = False
+) -> bool:
     """Whether an idle PRESENT-mesh hold has stood past the present-mesh reset grace and its class
     admits the gate's galaxy reset.
 
@@ -383,7 +385,12 @@ def _stuck_hold_reset_due(hold_since: str, *, off_bus: int, now: Optional[dateti
     is EXCLUDED: it self-heals and a galaxy reset there is the measured all-chip drop
     that inverts the mesh (1 off-bus -> 31), so it keeps holding to the ceiling. Age is read off the
     idle-latched episode clock; a missing or unparseable stamp fails closed (not due). The caller
-    applies the arm switch, retry-spacing, no-tenant and reset-scope guards on top."""
+    applies the arm switch, retry-spacing, no-tenant and reset-scope guards on top.
+
+    ``measured_fault`` (spec 03 I56): the hold's last fabric pass MEASURED a failure on this present
+    mesh (not a 77 skip), so the fault is already proven and the grace has nothing left to wait out
+    — the reset is due at once. A post-job hold on a measured fabric FAIL is exactly the class the
+    galaxy reset cures, and waiting the grace first only stretches its time-to-recover."""
     if off_bus != 0:
         return False
     if not hold_since:
@@ -392,6 +399,8 @@ def _stuck_hold_reset_due(hold_since: str, *, off_bus: int, now: Optional[dateti
         started = datetime.fromisoformat(hold_since)
     except ValueError:
         return False
+    if measured_fault:
+        return True
     now = now or datetime.now()
     return (now - started).total_seconds() >= _present_mesh_reset_grace_sec()
 
@@ -1069,6 +1078,7 @@ class GalaxyRecovery(Recovery):
         stage: Optional[str] = None,
         ev: Optional[Evidence] = None,
         beats: Optional[dict] = None,
+        measured_fault: bool = False,
     ) -> str:
         """Run the next justified rung of this ladder and report the outcome, replacing the
         direct ``_escalate_stuck_hold``/``_escalate_offbus_stuck_hold`` calls the idle relift and
@@ -1105,7 +1115,10 @@ class GalaxyRecovery(Recovery):
         and, before its first rung, given one PCI rescan and the read-only capture. Then the ladder
         runs exactly as it would have, with the caller's own evidence and stage: the prelude never
         picks a rung, skips one or fires a power cycle. Only a rescan that brought every chip back
-        onto a mesh that passes the full verify ends the episode before the ladder."""
+        onto a mesh that passes the full verify ends the episode before the ladder.
+
+        ``measured_fault`` reaches the present ladder only: the hold stands on a MEASURED fabric
+        failure, so its reset is due without the grace (spec 03 I56; see ``_stuck_hold_reset_due``)."""
         rung, _, gate_phase = phase.partition("/")
         if await self._tray_down_latch(expected, beats) == TRAY_DOWN_ONSET and not self._td["prelude_done"]:
             if await self._tray_down_prelude(expected, log, phase=gate_phase or rung):
@@ -1123,7 +1136,7 @@ class GalaxyRecovery(Recovery):
         if rung == "offbus":
             ran = await self._escalate_offbus_stuck_hold(indices, expected, log, force=force)
         elif rung == "present":
-            ran = await self._escalate_stuck_hold(indices, expected, log, force=force)
+            ran = await self._escalate_stuck_hold(indices, expected, log, force=force, measured_fault=measured_fault)
         else:
             raise ValueError(f"escalate(): unknown phase {phase!r}")
         if not ran:
@@ -1447,11 +1460,44 @@ class GalaxyRecovery(Recovery):
         ``force`` (the hold-deadline backstop) still waives an UNREADABLE scan — that guard protects
         against blindness, not against a known tenant — but never waives a real one, fd-held or
         queue-known: resetting out from under a live job is the thing the guard is for."""
+        return self._tenant_blocker(scan, force=force) is not None
+
+    def _tenant_blocker(self, scan, *, force: bool = False) -> Optional[dict]:
+        """Which check of :meth:`_tenant_active` blocks, as health_event fields, or None when none does:
+        ``blocker`` is ``job_running``, ``tenant`` (with the first tenant's pid, uid, user and comm) or
+        ``scan_incomplete`` (with the scan's source and gaps). A deferral that names its blocker tells a
+        real tenant apart from a scan that merely could not see."""
         if self.deps.job_running():
-            return True
-        if any(is_tenant(h) for h in scan.holders):
-            return True
-        return not force and not scan.complete
+            return {"blocker": "job_running"}
+        tenants = [h for h in scan.holders if is_tenant(h)]
+        if tenants:
+            h = tenants[0]
+            return {
+                "blocker": "tenant",
+                "pid": h.pid,
+                "uid": h.uid,
+                "user": username_for_uid(h.uid),
+                "comm": holder_comm(h.pid),
+                "tenants": len(tenants),
+            }
+        if not force and not scan.complete:
+            return {"blocker": "scan_incomplete", "source": scan.source, "gaps": list(scan.gaps)}
+        return None
+
+    @staticmethod
+    def _describe_blocker(blocker: dict) -> str:
+        """The log-line form of a :meth:`_tenant_blocker` result."""
+        kind = blocker["blocker"]
+        if kind == "job_running":
+            return "a broker job is running"
+        if kind == "tenant":
+            more = f" (+{blocker['tenants'] - 1} more)" if blocker["tenants"] > 1 else ""
+            return (
+                f"tenant pid {blocker['pid']} uid {blocker['uid']} ({blocker['user']}) "
+                f"comm {blocker['comm']} holds the device{more}"
+            )
+        gaps = "; ".join(blocker["gaps"]) or "no detail"
+        return f"holder scan incomplete (source={blocker['source']}: {gaps})"
 
     def _note_bmc_ipmi_failure(self, exc: BaseException) -> None:
         """A tray re-power the BMC did not take over IPMI starts this hold episode's hand-off clock to the
@@ -1809,7 +1855,9 @@ class GalaxyRecovery(Recovery):
         )
         return OUTCOME_WAITING
 
-    async def _escalate_stuck_hold(self, indices: list, expected: int, log, *, force: bool = False) -> bool:
+    async def _escalate_stuck_hold(
+        self, indices: list, expected: int, log, *, force: bool = False, measured_fault: bool = False
+    ) -> bool:
         """Escalate a present-mesh hold the read-only relift cannot clear to the gate's galaxy reset
         once it has stood past the ceiling. Returns True iff a reset ran (recovered or not); False
         leaves the hold standing for the next window.
@@ -1839,7 +1887,7 @@ class GalaxyRecovery(Recovery):
         beats = await asyncio.to_thread(self.deps.read_heartbeats)
         off_bus = offbus_count(beats, expected)
         hold_since = self.deps.device_hold_episode_since()
-        if not force and not _stuck_hold_reset_due(hold_since, off_bus=off_bus):
+        if not force and not _stuck_hold_reset_due(hold_since, off_bus=off_bus, measured_fault=measured_fault):
             return False
         # Retry pacing, not a cap: the grace window between attempts replaces the failed-reset
         # cooldown here — that cooldown guards against repeat MMIO at a DEAD endpoint, but this mesh
@@ -1856,19 +1904,27 @@ class GalaxyRecovery(Recovery):
         if await asyncio.to_thread(self.mechanism.scope_active):
             return False
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        tenant_active = self._tenant_active(scan, force=force)
-        if tenant_active:
-            log("hold past the ceiling but a tenant holds the device — holding; escalates once idle")
+        blocker = self._tenant_blocker(scan, force=force)
+        if blocker is not None:
+            log(f"hold past the ceiling but {self._describe_blocker(blocker)} — holding; escalates once idle")
+            health_event("stuck_hold_deferred", mesh="present", forced=force, **blocker)
             return False
-        log(
-            f"present-mesh hold stood past the {_present_mesh_reset_grace_sec()}s grace with no tenant — "
-            f"escalating to the galaxy reset the next gate would run"
-        )
+        if measured_fault and not force:
+            log(
+                "present-mesh hold stands on a measured fabric failure with no tenant — escalating "
+                "to the galaxy reset the next gate would run, no grace"
+            )
+        else:
+            log(
+                f"present-mesh hold stood past the {_present_mesh_reset_grace_sec()}s grace with no tenant — "
+                f"escalating to the galaxy reset the next gate would run"
+            )
         health_event(
             "stuck_hold_escalation",
             held_since=hold_since,
             reason=self.deps.device_hold_episode_reason(),
             off_bus=off_bus,
+            measured_fault=measured_fault,
         )
         # Still latched for visibility (the deadline watchdog journals it), but no longer a cap on
         # this path: retries are paced by the grace window above.
@@ -2186,9 +2242,10 @@ class GalaxyRecovery(Recovery):
         if await asyncio.to_thread(self.mechanism.scope_active):
             return False
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        tenant_active = self._tenant_active(scan, force=force)
-        if tenant_active:
-            log("off-bus hold past the ceiling but a tenant holds the device — holding; escalates once idle")
+        blocker = self._tenant_blocker(scan, force=force)
+        if blocker is not None:
+            log(f"off-bus hold past the ceiling but {self._describe_blocker(blocker)} — holding; escalates once idle")
+            health_event("stuck_hold_deferred", mesh="offbus", forced=force, **blocker)
             return False
         if not force and self.mechanism.cooling():
             log(
