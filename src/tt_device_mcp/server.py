@@ -129,6 +129,7 @@ from tt_device_mcp.health import (
     chip_snapshot_event,
     dead_chips,
     eth,
+    eth_deficit,
     fabric,
     gone_chip_bridge_reset_enabled,
     health_dir,
@@ -154,7 +155,6 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
-from tt_device_mcp.health import eth_deficit
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
     SpoolOffsets,

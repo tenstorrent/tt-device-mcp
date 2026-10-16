@@ -31,10 +31,10 @@ from tt_device_mcp.constants import (
     FABRIC_CHECK_HARDWARE_FAULT_RC,
     FABRIC_CHECK_TIMEOUT_SEC,
 )
+from tt_device_mcp.health import eth_deficit
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
-from tt_device_mcp.health import eth_deficit
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 

@@ -595,11 +595,7 @@ class Recovery(ABC):
             and retries < POST_RESET_FABRIC_RETRIES
         ):
             retries += 1
-            what = (
-                "came back short of eth links"
-                if _eth_link_drop(evidence)
-                else "found no trained link (77)"
-            )
+            what = "came back short of eth links" if _eth_link_drop(evidence) else "found no trained link (77)"
             log(
                 f"post-reset fabric {what} — waiting {POST_RESET_FABRIC_RETRY_SLEEP_SEC:.0f}s "
                 f"for eth training, then re-checking (retry {retries}/{POST_RESET_FABRIC_RETRIES})"

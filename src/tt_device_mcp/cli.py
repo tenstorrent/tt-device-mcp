@@ -1604,7 +1604,10 @@ def cmd_eth_links(args) -> int:
     action = args.eth_links_command or "show"
     if action == "show":
         print(f"link mark:        {mark or 'none'}")
-        for name, rec in (("accepted deficit", eth_deficit.read_accepted()), ("pending deficit", eth_deficit.read_pending())):
+        for name, rec in (
+            ("accepted deficit", eth_deficit.read_accepted()),
+            ("pending deficit", eth_deficit.read_pending()),
+        ):
             print(f"{name + ':':<17} {json.dumps(rec) if rec else 'none'}")
         return 0
     if action == "clear":

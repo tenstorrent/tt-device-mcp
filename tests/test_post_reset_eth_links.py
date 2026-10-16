@@ -18,9 +18,8 @@ import tt_device_mcp.server as srv
 from tests.conftest import patch_recovery
 from tests.test_device_safety import _arm_stuck_hold, _setup_selfheal_hold
 from tt_device_mcp.fsm import ServerState
-from tt_device_mcp.health import eth_deficit
+from tt_device_mcp.health import eth_deficit, post_reset
 from tt_device_mcp.health import monitor as monitor_mod
-from tt_device_mcp.health import post_reset
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import Verdict
 from tt_device_mcp.health.evidence import health_dir
