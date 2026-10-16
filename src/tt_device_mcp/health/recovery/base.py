@@ -11,6 +11,7 @@ import asyncio
 import fcntl
 import json
 import os
+import re
 import subprocess
 import time
 from datetime import datetime
@@ -73,27 +74,60 @@ def _chip_key(chip: str) -> tuple:
 # would otherwise have to; 30 min is enough to keep it from cycling on a wedge no rung can fix,
 # and the user asked for no heavier per-box rate limit than this). The per-boot cap and the
 # unreadable-ledger fail-closed below are untouched — they remain the boot-loop denial. Default
-# 1800s (30 min); TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC overrides.
-POWER_CYCLE_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC", "1800"))
+# 1800s (30 min); TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC overrides, clamped to 600..3600 s:
+# below 10 min a cycle could fire before the boot it caused has run its startup check, and above
+# 1 h a tuning knob would delay the first cycle of a whole-tray drop past its budget (spec 03 I67).
+POWER_CYCLE_MIN_INTERVAL_BOUNDS_SEC = (600, 3600)
+
+
+def _power_cycle_min_interval_env() -> int:
+    lo, hi = POWER_CYCLE_MIN_INTERVAL_BOUNDS_SEC
+    try:
+        v = int(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC", "1800"))
+    except ValueError:
+        return 1800
+    return max(lo, min(v, hi))
+
+
+POWER_CYCLE_MIN_INTERVAL_SEC = _power_cycle_min_interval_env()
 # Spec 04 I65: that interval is a cooldown counted from the LATEST power cycle or boot of this host,
 # whoever caused it — the broker's own reboot or power cycle (the ledger), the host's current boot
 # (a manual, datacenter or external cycle shows only there), and an external cycler's history file
-# when one is named and readable. After two consecutive broker power cycles no heal followed, it
-# doubles for each further one, capped here; a verified release (a passing full health check)
-# resets the streak.
+# when one is named and readable. Spec 03 I67: each broker power cycle that took the host down and
+# left the SAME fault (class and off-bus chips) doubles it, capped here — 30 min, 1 h, 2 h, then
+# 4 h — so a tray dead in hardware costs at most about six host boots a day, not 48. A verified
+# release (a passing full health check) or a different fault resets the streak. The cap is not a
+# setting: no knob lengthens the wait past it or switches the cycle off.
 POWER_CYCLE_BACKOFF_CAP_SEC = 4 * 3600
 # A JSON-lines file an external power cycler appends to (``at_epoch``, optional ``cause``); read only.
 POWER_CYCLE_HISTORY_FILE_ENV = "TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE"
 POWER_CYCLE_HEALED_FILE = "power_cycle_healed.json"
+# Spec 03 I67: the fault the last power-cycle decision was for, and a request the power-cycle command
+# did not carry out (its rc), so a broker restart restores the deadline and /health says why.
+POWER_CYCLE_BACKOFF_FILE = "power_cycle_backoff.json"
 
 
 def power_cycle_interval_sec(failed_cycles: int) -> int:
-    """The cooldown after ``failed_cycles`` consecutive broker power cycles no heal followed: the
-    base interval for 0 or 1, then doubled for each further one, never above the cap (spec 04 I65)."""
+    """The cooldown after ``failed_cycles`` consecutive broker power cycles that took the host down
+    and left the same fault: the base interval for none, doubled for each, never above the cap
+    (spec 03 I67)."""
     base = POWER_CYCLE_MIN_INTERVAL_SEC
-    if failed_cycles < 2:
-        return base
-    return max(base, min(base * 2 ** (failed_cycles - 1), POWER_CYCLE_BACKOFF_CAP_SEC))
+    n = max(0, min(int(failed_cycles), 16))
+    return max(base, min(base * 2**n, POWER_CYCLE_BACKOFF_CAP_SEC))
+
+
+def _fault_key(fault) -> Optional[tuple]:
+    """A power-cycle fault as (class, off-bus chips), or None when not given or unreadable."""
+    if not isinstance(fault, dict) or not fault.get("class"):
+        return None
+    try:
+        chips = tuple(sorted(str(c) for c in fault.get("off_bus") or ()))
+    except TypeError:
+        chips = ()
+    return (str(fault["class"]), chips)
+
+
+_RC_RE = re.compile(r"exited (-?\d+)")
 
 
 def _local_time(epoch: float) -> str:
@@ -327,6 +361,9 @@ class RecoveryMechanism:
         self.power_cycle_retry: Optional[tuple[float, str]] = None
         # The cooldown in force at the last power-cycle decision (until, last, cause, interval), for /health.
         self.power_cycle_cooldown_state: Optional[dict] = None
+        # Spec 03 I67: the fault (I37 class and off-bus chips) the power cycle being decided is for,
+        # set by the I37 path around its ask; None for a caller that names none.
+        self.power_cycle_fault: Optional[dict] = None
 
         # The full transcript of the last reset, not the 3-line tail the journal carries: when a
         # mesh is left half-alive, the interesting line is usually somewhere in the middle.
@@ -1113,7 +1150,9 @@ class RecoveryMechanism:
             # request recorded this boot never took the box down (else this would be a new boot),
             # and holding on it for the rest of the boot was an open-ended hold (spec 04 I65). Past
             # the interval it is asked again; an unreadable stamp counts as now (fail closed).
-            interval = self.power_cycle_interval(ledger) if cycle else AUTO_RECOVERY_MIN_INTERVAL_SEC
+            # A power cycle recorded this boot never took the box down: it waits the base interval
+            # only, never the I67 backoff, which counts cycles that did (spec 03 I67).
+            interval = POWER_CYCLE_MIN_INTERVAL_SEC if cycle else AUTO_RECOVERY_MIN_INTERVAL_SEC
             stamps = []
             for r in ledger:
                 if r.get("boot_id") != boot_id:
@@ -1135,37 +1174,61 @@ class RecoveryMechanism:
             self.power_cycle_retry = None
         return True, ""
 
-    def power_cycle_interval(self, ledger: Optional[list[dict]] = None) -> int:
-        """The power-cycle cooldown's length now: :func:`power_cycle_interval_sec` of the broker power
-        cycles recorded since the last verified release (spec 04 I65)."""
+    def power_cycle_attempts(self, ledger: Optional[list[dict]] = None, fault: Optional[dict] = None) -> int:
+        """Broker power cycles in a row that took the host down and left the fault ``fault`` (spec 03
+        I67): those after the last verified release, newest first, up to the first one recorded for a
+        different fault. One recorded this boot never took the box down (requested, or the command
+        did not carry it out) and is not counted. With no ``fault``, or a record that names none, every
+        such cycle counts (the longer cooldown is the safe side)."""
         ledger = self.read_auto_recovery_ledger() if ledger is None else ledger
         healed = self._power_cycle_healed_at()
-        failed = 0
-        for rec in ledger or []:
+        boot = self._current_boot_id()
+        key = _fault_key(fault)
+        n = 0
+        for rec in reversed(ledger or []):
             if rec.get("action") != "power-cycle":
                 continue
-            try:
-                at = float(rec.get("at_epoch"))
-            except (TypeError, ValueError):
-                at = float("inf")  # unreadable: count it, the longer cooldown is the safe side
-            if at > healed:
-                failed += 1
-        return power_cycle_interval_sec(failed)
+            if not _epoch_after(rec.get("at_epoch"), healed):
+                continue  # unreadable stamps read as after: counted, the longer cooldown
+            if boot and rec.get("boot_id") == boot:
+                continue
+            rec_key = _fault_key(rec.get("fault"))
+            if key is not None and rec_key is not None and rec_key != key:
+                break
+            n += 1
+        return n
+
+    def power_cycle_interval(self, ledger: Optional[list[dict]] = None, fault: Optional[dict] = None) -> int:
+        """The power-cycle cooldown's length now: :func:`power_cycle_interval_sec` of
+        :meth:`power_cycle_attempts` (spec 04 I65, spec 03 I67)."""
+        return power_cycle_interval_sec(self.power_cycle_attempts(ledger, fault))
 
     def power_cycle_cooldown(
-        self, *, now_epoch: Optional[float] = None, ledger: Optional[list[dict]] = None
+        self,
+        *,
+        now_epoch: Optional[float] = None,
+        ledger: Optional[list[dict]] = None,
+        fault: Optional[dict] = None,
     ) -> Optional[dict]:
         """The power-cycle cooldown in force now, or None when a cycle may fire at once (spec 04 I65).
 
         Counted from the latest of: the broker's own last reboot or power cycle (its ledger); this
         host's current boot, whatever caused it; and the last record of the external cycler's history
-        file when one is named and readable. A stamp later than now (a clock that disagrees) anchors
-        nothing. Returns ``until``/``last`` (epochs), ``cause``, ``interval_sec`` and ``why``, the line
-        the journal and /health carry."""
+        file when one is named and readable. A stamp later than now anchors nothing. The interval is
+        the I67 backoff for ``fault`` (default: the fault of the I37 ask in progress), except from a
+        power cycle requested this boot that did not take the box down — recorded, or refused by the
+        command — which waits the base interval only (spec 03 I67). Returns ``until``/``last``
+        (epochs), ``cause``, ``interval_sec``, ``attempts``, ``fault_class``, ``not_performed`` and
+        ``why``, the line the journal and /health carry."""
         now_epoch = time.time() if now_epoch is None else now_epoch
         ledger = self.read_auto_recovery_ledger() if ledger is None else ledger
-        anchors: list[tuple[float, str]] = []
-        broker_last: Optional[tuple[float, str]] = None
+        fault = self.power_cycle_fault if fault is None else fault
+        attempts = self.power_cycle_attempts(ledger, fault)
+        interval = power_cycle_interval_sec(attempts)
+        base = POWER_CYCLE_MIN_INTERVAL_SEC
+        boot = self._current_boot_id()
+        anchors: list[tuple[float, str, int]] = []
+        broker_last: Optional[tuple[float, str, bool]] = None
         for rec in ledger or []:
             if rec.get("action") not in AUTO_RECOVERY_RANK:
                 continue
@@ -1174,9 +1237,11 @@ class RecoveryMechanism:
             except (TypeError, ValueError):
                 continue
             if broker_last is None or at > broker_last[0]:
-                broker_last = (at, str(rec.get("action")))
+                this_boot = bool(boot) and rec.get("boot_id") == boot and rec.get("action") == "power-cycle"
+                broker_last = (at, str(rec.get("action")), this_boot)
         if broker_last is not None:
-            anchors.append((broker_last[0], f"broker {broker_last[1]}"))
+            at, action, this_boot = broker_last
+            anchors.append((at, f"broker {action}", base if this_boot else interval))
         try:
             btime = float(self._boot_btime_id() or "")
         except ValueError:
@@ -1185,26 +1250,39 @@ class RecoveryMechanism:
             by_broker = (
                 broker_last is not None and 0 <= btime - broker_last[0] <= BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC
             )
-            anchors.append((btime, f"host boot after the broker {broker_last[1]}" if by_broker else "host boot"))
+            anchors.append(
+                (btime, f"host boot after the broker {broker_last[1]}" if by_broker else "host boot", interval)
+            )
         external = _last_external_power_cycle()
         if external is not None:
-            anchors.append(external)
+            anchors.append((external[0], external[1], interval))
+        not_performed = self._power_cycle_not_performed()
+        if not_performed is not None:
+            anchors.append((not_performed["at_epoch"], "power cycle not performed", base))
         anchors = [a for a in anchors if a[0] <= now_epoch]
         if not anchors:
             return None
-        last, cause = max(anchors, key=lambda a: a[0])
-        interval = self.power_cycle_interval(ledger)
-        until = last + interval
+        last, cause, gap = max(anchors, key=lambda a: a[0] + a[2])
+        until = last + gap
         if now_epoch >= until:
             return None
+        key = _fault_key(fault)
+        rc_note = ""
+        if not_performed is not None and cause == "power cycle not performed":
+            rc_note = f", rc {not_performed.get('rc')}"
         return {
             "until": until,
             "last": last,
             "cause": cause,
-            "interval_sec": interval,
+            "interval_sec": gap,
+            "attempts": attempts,
+            "fault_class": key[0] if key else None,
+            "off_bus": list(key[1]) if key else None,
+            "not_performed": not_performed,
             "why": (
                 f"power cycle in cooldown until {_local_time(until)} "
-                f"(last cycle/boot {_local_time(last)}, {cause}; {interval}s cooldown)"
+                f"(last cycle/boot {_local_time(last)}, {cause}{rc_note}; {gap}s cooldown"
+                f"{f', {attempts} cycle(s) left this fault' if attempts else ''})"
             ),
         }
 
@@ -1214,12 +1292,95 @@ class RecoveryMechanism:
         except (OSError, ValueError, TypeError, AttributeError):
             return 0.0
 
+    def _read_power_cycle_backoff(self) -> dict:
+        try:
+            data = json.loads((health_dir() / POWER_CYCLE_BACKOFF_FILE).read_text())
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_power_cycle_backoff(self, data: dict) -> None:
+        path = health_dir() / POWER_CYCLE_BACKOFF_FILE
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(data, default=str))
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _power_cycle_not_performed(self) -> Optional[dict]:
+        """The last power-cycle request the command did not carry out, while this boot lasts (a boot
+        since then means the box went down after all), or None."""
+        rec = self._read_power_cycle_backoff().get("not_performed")
+        if not isinstance(rec, dict):
+            return None
+        boot = self._current_boot_id()
+        if boot and rec.get("boot_id") not in (boot, None):
+            return None
+        try:
+            return {**rec, "at_epoch": float(rec.get("at_epoch"))}
+        except (TypeError, ValueError):
+            return None
+
+    def note_power_cycle_not_performed(self, error: BaseException, *, now_epoch: Optional[float] = None) -> None:
+        """A power-cycle request the command did not carry out (non-zero rc, timeout, missing binary):
+        it is no cycle for the I67 backoff (its ledger entry is retracted), it is asked again after
+        the base interval, and /health shows it with the command's rc (spec 03 I67). Never raises."""
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        m = _RC_RE.search(str(error))
+        rec = {
+            "at_epoch": now_epoch,
+            "at": _local_time(now_epoch),
+            "boot_id": self._current_boot_id(),
+            "rc": int(m.group(1)) if m else None,
+            "detail": repr(error)[-300:],
+        }
+        data = self._read_power_cycle_backoff()
+        data["not_performed"] = rec
+        if self.power_cycle_fault is not None:
+            data["fault"] = self.power_cycle_fault
+        self._write_power_cycle_backoff(data)
+        cooldown = self.power_cycle_cooldown(now_epoch=now_epoch)
+        self.power_cycle_cooldown_state = cooldown
+        if cooldown is not None:
+            self.power_cycle_retry = (cooldown["until"], self._device_hold_episode_since())
+
+    def note_power_cycle_fault(self, fault: Optional[dict]) -> None:
+        """Keep the fault of the I37 ask on disk, so a broker restart rebuilds its backoff (I67)."""
+        self.power_cycle_fault = fault
+        if fault is None:
+            return
+        data = self._read_power_cycle_backoff()
+        if data.get("fault") != fault:
+            data["fault"] = fault
+            self._write_power_cycle_backoff(data)
+
+    def restore_power_cycle_backoff(self, *, now_epoch: Optional[float] = None) -> Optional[dict]:
+        """At broker start in a held episode: rebuild the cooldown, its deadline and the watchdog's
+        retry from disk — the ledger, the boot, the heal marker and the saved fault (spec 03 I67).
+        Never raises."""
+        try:
+            fault = self._read_power_cycle_backoff().get("fault")
+            cooldown = self.power_cycle_cooldown(now_epoch=now_epoch, fault=fault if isinstance(fault, dict) else None)
+        except Exception:  # noqa: BLE001 - the governor recomputes it at its next ask anyway
+            return None
+        self.power_cycle_cooldown_state = cooldown
+        if cooldown is not None:
+            self.power_cycle_retry = (cooldown["until"], self._device_hold_episode_since())
+        return cooldown
+
     def note_mesh_verified(self, *, now_epoch: Optional[float] = None) -> None:
         """A verified release (a passing full health check, fabric included) ends any power-cycle
-        backoff streak (spec 04 I65) and any cooldown retry waiting. Writes only when a broker power
-        cycle is recorded after the last heal. Never raises."""
+        backoff streak (spec 04 I65, spec 03 I67), any cooldown retry waiting and any record of a
+        cycle not performed. Writes only when there is something to end. Never raises."""
         self.power_cycle_retry = None
         self.power_cycle_cooldown_state = None
+        self.power_cycle_fault = None
+        try:
+            (health_dir() / POWER_CYCLE_BACKOFF_FILE).unlink()
+        except OSError:
+            pass
         ledger = self.read_auto_recovery_ledger() or []
         healed = self._power_cycle_healed_at()
         if not any(r.get("action") == "power-cycle" and _epoch_after(r.get("at_epoch"), healed) for r in ledger):
@@ -1278,6 +1439,8 @@ class RecoveryMechanism:
             "at_epoch": time.time() if now_epoch is None else now_epoch,
             "at": datetime.now().isoformat(),
         }
+        if action == "power-cycle" and self.power_cycle_fault is not None:
+            rec["fault"] = self.power_cycle_fault  # spec 03 I67: the backoff streak is per fault
         path = health_dir() / AUTO_RECOVERY_LEDGER
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1387,6 +1550,10 @@ class RecoveryMechanism:
             )
             health_event(f"auto_{ev}_failed", reason=reason, error=repr(exc))
             metrics.stage_fired(stage, "failed")
+            if action == "power-cycle":
+                # Spec 03 I67: not a cycle for the backoff; asked again after the base interval.
+                self.note_power_cycle_not_performed(exc)
+                log(f"POWER CYCLE NOT PERFORMED: {exc!r}; asking again at the end of the base interval")
             return
         # The pending window counts from the hand-off, not from before a slow pre-fire hook.
         self.host_action_requested = (action, time.monotonic())

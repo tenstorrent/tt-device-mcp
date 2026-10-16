@@ -5994,11 +5994,29 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
                 "last_cycle_or_boot": datetime.fromtimestamp(cooldown["last"]).isoformat(timespec="seconds"),
                 "cause": cooldown["cause"],
                 "interval_sec": cooldown["interval_sec"],
+                # Spec 03 I67: the fault the backoff is for, the cycles in a row that left it, and a
+                # request the power-cycle command did not carry out (with its rc).
+                "fault_class": cooldown.get("fault_class"),
+                "off_bus": cooldown.get("off_bus"),
+                "attempts": cooldown.get("attempts", 0),
+                "not_performed": _power_cycle_not_performed_view(cooldown.get("not_performed")),
                 "why": cooldown["why"],
             }
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
     return payload
+
+
+def _power_cycle_not_performed_view(rec: Optional[dict]) -> Optional[dict]:
+    """/health's view of a power-cycle request the command did not carry out (spec 03 I67)."""
+    if not rec:
+        return None
+    return {
+        "status": "power cycle not performed",
+        "at": datetime.fromtimestamp(rec["at_epoch"]).isoformat(timespec="seconds"),
+        "rc": rec.get("rc"),
+        "detail": rec.get("detail"),
+    }
 
 
 def _note_tenant_gate_verdict(reason: str) -> None:
@@ -6026,6 +6044,9 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         _persist_hold_episode(device_hold_episode_since, tenant=_hold_is_tenant_held())
         # ...and the alert hook's backoff for that same episode, so a restart does not page again.
         device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
+        if restored:
+            # ...and the power cycle's backoff deadline and the watchdog's ask at it (spec 03 I67).
+            recovery_mechanism.restore_power_cycle_backoff()
         device_hold_episode_reason = reason
         # Reserve the ledger row now, so the live row and the durable one share id, start, and name.
         # Its start is THIS process's segment (row_since), NOT the restored escalation clock: a hold
