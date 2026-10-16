@@ -180,7 +180,7 @@ def _hist(monkeypatch, tmp_path, *lines):
 @pytest.mark.parametrize("bad", ['{"at_epoch": NaN}', '{"at_epoch": Infinity}', "FUTURE"])
 @pytest.mark.parametrize("bad_first", [True, False])
 def test_a_nan_or_future_history_line_does_not_hide_the_valid_past_one(cool, monkeypatch, tmp_path, bad, bad_first):
-    """Review #968: one non-finite or future line (a clock that disagrees) took the max and was then
+    """one non-finite or future line (a clock that disagrees) took the max and was then
     dropped as future, so the real cycle 100 s ago anchored nothing and the cycle fired at once."""
     bad = bad.replace("FUTURE", json.dumps({"at_epoch": T0 + 6 * 3600, "cause": "clock ahead"}))
     good = json.dumps({"at_epoch": T0 - 100, "cause": "BMC chassis power cycle"})
@@ -201,7 +201,7 @@ def test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle(
 
 
 def test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health(cool, monkeypatch):
-    """Review #968: a this-boot ledger stamp 6 h ahead (the clock stepped back) held the cycle until
+    """a this-boot ledger stamp 6 h ahead (the clock stepped back) held the cycle until
     stamp + interval, 6.5 h, with nothing on /health. It now anchors nothing: the cooldown runs from
     the host boot, the denial is on /health, and the cycle is allowed at the boot's cooldown end."""
     m = cool["g"].mechanism
@@ -222,7 +222,7 @@ def test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_heal
 @pytest.mark.parametrize("action", ["reboot", "power-cycle"])
 @pytest.mark.parametrize("stamp", [None, "garbage", "NaN"])
 def test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end(cool, action, stamp):
-    """Review #968: an unreadable stamp counted as now, so its end moved forward on every ask and the
+    """an unreadable stamp counted as now, so its end moved forward on every ask and the
     cycle was held for the whole boot. It now ends at the boot's start plus the interval, a fixed
     time; a power-cycle record no longer refuses the rung for good either."""
     m = cool["g"].mechanism
@@ -282,7 +282,7 @@ def test_cycles_that_heal_nothing_back_off_and_a_verified_release_resets_it(cool
 
 
 def test_a_future_record_does_not_keep_the_streak_past_a_verified_release(cool):
-    """Review #968: a power-cycle record stamped later than now stayed 'after the heal', so a verified
+    """a power-cycle record stamped later than now stayed 'after the heal', so a verified
     release did not end the backoff streak. A heal file stamped later than now does not hide the
     cycles after it either (it reads as no heal: the longer, capped cooldown)."""
     m = cool["g"].mechanism
