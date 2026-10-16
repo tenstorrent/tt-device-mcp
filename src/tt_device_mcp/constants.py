@@ -40,7 +40,7 @@ SIGTERM_GRACE_SEC = 15
 
 # A preemptable job's whole stop window, from the first signal to SIGKILL. Its owner has
 # agreed to watch the queue and get off the device within this once another job is waiting
-# past its soft limit, so it is shorter than the ordinary ladder (SIGINT 60 s + SIGTERM 15 s).
+# past its time limit, so it is shorter than the ordinary ladder (SIGINT 60 s + SIGTERM 15 s).
 PREEMPT_GRACE_SEC = 60
 
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
