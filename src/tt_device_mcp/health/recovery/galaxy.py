@@ -977,6 +977,14 @@ class GalaxyRecovery(Recovery):
     # no-host-rung hold already paged (spec 04 I29).
     _sweep_read_77: bool = False
     _host_rung_77_paged_since: Optional[str] = None
+    # Whether the last idle-ladder escalate() stood down on a live tenant (spec 04 I7). The hold
+    # watchdog reads it to re-arm the window it spent, so the ladder runs once the tenant is gone
+    # rather than at the next window (spec 03 I23).
+    tenant_deferred: bool = False
+
+    def tenant_holds(self) -> bool:
+        """The forced ladders' own tenant check, alone: a running broker job or a readable tenant fd."""
+        return self._tenant_active(self.deps.enumerate_device_holders(), force=True)
 
     async def _offbus_ids_now(self, expected: int) -> Optional[set]:
         """The chip ids off the bus now, or None when the heartbeats cannot be read."""
@@ -1136,6 +1144,7 @@ class GalaxyRecovery(Recovery):
             force, rung = True, rung[: -len("-forced")]
         else:
             force = False
+        self.tenant_deferred = False
         if rung == "offbus":
             ran = await self._escalate_offbus_stuck_hold(indices, expected, log, force=force)
         elif rung == "present":
@@ -1744,12 +1753,19 @@ class GalaxyRecovery(Recovery):
                 return None
             return False
         via = "last-chance-reset-sweep" if swept else "settle-before-host-rung"
-        log(f"the mesh verified after the {via} — no reboot or power cycle needed")
-        health_event("gate", phase=gate_phase, healthy=True, recovered_via=via, evidence=evidence)
         self.deps.clear_device_reported_fault(f"gate/{gate_phase}: mesh recovered before the host rung ({via})")
-        self.deps.clear_device_dirty(
+        released = self.deps.clear_device_dirty(
             verified=True, why=f"gate/{gate_phase}: mesh recovered before the host rung ({via})"
         )
+        if released is False:
+            # enum+ARC passed but the resets still owe a passing fabric pass (spec 04 I32): the funnel
+            # held the device fabric-unverified. No host rung on a verify that passed; the fabric relift
+            # owns the hold, bounded by 03 I40/I48.
+            log(f"the mesh passed enum+ARC after the {via}, but no fabric pass has passed since — held")
+            health_event("host_rung_sweep_unverified", context=context or gate_phase, via=via, evidence=evidence)
+            return True
+        log(f"the mesh verified after the {via} — no reboot or power cycle needed")
+        health_event("gate", phase=gate_phase, healthy=True, recovered_via=via, evidence=evidence)
         return True
 
     async def _fire_tray_down_no_window(
@@ -1911,6 +1927,7 @@ class GalaxyRecovery(Recovery):
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
         blocker = self._tenant_blocker(scan, force=force)
         if blocker is not None:
+            self.tenant_deferred = True
             log(f"hold past the ceiling but {self._describe_blocker(blocker)} — holding; escalates once idle")
             health_event("stuck_hold_deferred", mesh="present", forced=force, **blocker)
             return False
@@ -2258,6 +2275,7 @@ class GalaxyRecovery(Recovery):
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
         blocker = self._tenant_blocker(scan, force=force)
         if blocker is not None:
+            self.tenant_deferred = True
             log(f"off-bus hold past the ceiling but {self._describe_blocker(blocker)} — holding; escalates once idle")
             health_event("stuck_hold_deferred", mesh="offbus", forced=force, **blocker)
             return False
