@@ -5082,13 +5082,6 @@ async def device_health_gate(
     # tool and against a gate running for another job: concurrent -glx_reset calls
     # at the same 32 ASICs turn one wedged chip into a mesh that needs a power-cycle.
     async with _device_op("health-gate/" + phase):
-        # The forced startup pass, queued behind an operator reset whose verify already proved the
-        # mesh (fabric included) since this broker started: that verify is the startup pass (I56).
-        counted = _startup_pass_from_reset_verify() if phase == "startup" and force_fabric else ""
-        if counted:
-            _log(f"skip: {counted}; counting it as the startup pass")
-            health_event("startup_gate_counted_reset_verify", detail=counted)
-            return
         # This pass's own snapshot of what the FSM already knew coming in — read once, used
         # throughout, never re-derived: a mid-pass fsm mutation (e.g. the eth-frozen hold below)
         # must not retroactively change what THIS pass decided "coming in dirty" meant.
@@ -5110,6 +5103,16 @@ async def device_health_gate(
         # instead of used. Only startup asks; the stale window bounds any run_fabric caller
         # to one pass per interval.
         global last_fabric_check_monotonic, last_fabric_ok_monotonic
+        # The forced startup pass, queued behind an operator reset whose verify already proved the
+        # mesh (fabric included) since this broker started: that verify is the startup pass (I56).
+        # Its healthy fabric pass is the newest one, so a later run_fabric caller sees it as fresh.
+        counted = _startup_pass_from_reset_verify() if phase == "startup" and force_fabric else ""
+        if counted:
+            _log(f"skip: {counted}; counting it as the startup pass")
+            health_event("startup_gate_counted_reset_verify", detail=counted)
+            last_fabric_check_monotonic = max(last_fabric_check_monotonic, _reset_verify_fabric_ok_monotonic)
+            last_fabric_ok_monotonic = max(last_fabric_ok_monotonic, _reset_verify_fabric_ok_monotonic)
+            return
         # 0.0 is the sentinel for "no pass this process" — the startup check after a boot.
         # It must count as stale outright: subtracting it treats the monotonic clock's own
         # value as an elapsed time, so on a host whose uptime is still below the interval

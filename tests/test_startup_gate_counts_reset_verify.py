@@ -84,6 +84,9 @@ async def test_a_passed_reset_verify_after_the_start_is_the_startup_pass(monkeyp
     assert calls["fabric"] == 0 and calls["eth"] == 0 and calls["resets"] == 0, "no second pass"
     assert len(_counted(events)) == 1
     assert srv.fsm.state is ServerState.HEALTHY
+    assert srv.last_fabric_check_monotonic == srv._reset_verify_fabric_ok_monotonic > 0, (
+        "the verify's pass is the newest fabric pass: the first run_fabric gate must not pay it again"
+    )
 
 
 @pytest.mark.asyncio
