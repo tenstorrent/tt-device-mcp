@@ -7954,14 +7954,13 @@ async def test_galaxy_reset_floor_holds_a_zero_off_bus_wedge_but_needs_eth_to_li
 
 
 @pytest.mark.asyncio
-async def test_galaxy_reset_floor_hold_with_a_reported_fault_requires_eth_to_lift(
+async def test_galaxy_reset_floor_hold_with_a_reported_fault_needs_the_full_gate_to_lift(
     monkeypatch, tmp_path, clear_job_state
 ):
     """A genuine below-floor off-bus drop that ALSO carries a runtime-reported fault is a wedge the
     relift's enum+ARC read cannot confirm cleared: the chip returning to the bus is not proof the
-    eth/fabric wedge that faulted is gone. So the hold must require a confirmed-advancing eth heartbeat
-    to lift, never enum+ARC alone — otherwise the relift admits the next tenant onto a chip whose wedge
-    only the eth reader can rule out."""
+    eth/fabric wedge that faulted is gone. Its hold keeps the off-bus class, so it lifts only on the
+    full gate, fabric included (I52), never on enum+ARC alone and never on an eth heartbeat alone."""
     _reach_reboot_rung(monkeypatch, tmp_path, n_present=31)
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(31)})  # 1 off-bus
     resets = _count_galaxy_resets(monkeypatch)
@@ -7972,9 +7971,8 @@ async def test_galaxy_reset_floor_hold_with_a_reported_fault_requires_eth_to_lif
 
     assert resets["n"] == 0, "1 off-bus is below the floor — held, not reset"
     assert srv.fsm.state is not ServerState.HEALTHY, "the door holds for the next tenant"
-    assert (
-        srv.fsm.record.why == "eth_frozen"
-    ), "a fault-carrying hold must wait for an advancing eth heartbeat, not enum+ARC alone"
+    assert srv.fsm.record.why == "off_bus", "a chip off the bus keeps the off-bus class whatever the fault says"
+    assert srv.fsm.record.why in srv.OFFBUS_RECHECK_WHYS, "its lift must run the full gate, fabric included"
 
 
 @pytest.mark.asyncio
