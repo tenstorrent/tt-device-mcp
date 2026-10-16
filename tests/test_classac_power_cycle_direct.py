@@ -273,7 +273,7 @@ async def test_a_partial_drop_keeps_the_ladder(rig, spec, prelude):
     await _gate(rig, galaxy.STAGE_SMI_RESET)
     await _gate(rig, galaxy.STAGE_POWER_CYCLE)
     # The mesh reset failed on this same set, so the last-chance sweep, whose last step is that same
-    # reset, is skipped and the host rung follows (spec 04 I38).
+    # reset, is skipped and the host rung follows (spec 04 I58).
     assert rig["order"] == [*prelude, "glx_reset", "power_cycle"]
     assert "power_cycle_direct" not in _kinds(rig)
     assert [f.get("reason") for k, f in rig["events"] if k == SKIPPED] == ["mesh_reset_failed_unchanged"]
@@ -374,7 +374,7 @@ async def test_a_failed_startup_check_after_the_cycle_keeps_the_hold(rig):
 async def test_time_to_recover_on_a_fake_clock(rig):
     """When the cycle is requested, on the clock each failed reset (262 s) and sweep (323 s) advance.
     Class A: at once. Class C at startup: at once. Class C at run time: after its one reset. The
-    partial-tray ladder (B2): after its one reset; the sweep would repeat it (I38), so it is skipped."""
+    partial-tray ladder (B2): after its one reset; the sweep would repeat it (I58), so it is skipped."""
 
     async def episode(beats, stages, phase="post-job"):
         g = rig["g"]
@@ -398,7 +398,7 @@ async def test_time_to_recover_on_a_fake_clock(rig):
     assert (whole_tray, all_off_startup, all_off_run_time, part_tray) == (0, 0, RESET_SEC, RESET_SEC)
 
 
-# ---- across a broker restart (spec 04 I38) ------------------------------------------------------
+# ---- across a broker restart (spec 04 I58) ------------------------------------------------------
 
 
 @pytest.mark.asyncio

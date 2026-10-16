@@ -79,7 +79,7 @@ async def _window(force=True):
 
 
 def _fresh_reset_record(monkeypatch):
-    """Each episode starts on a boot with no failed reset recorded (spec 04 I38)."""
+    """Each episode starts on a boot with no failed reset recorded (spec 04 I58)."""
     (health_dir() / RESET_RECORD_FILE).unlink(missing_ok=True)
     monkeypatch.setattr(srv.recovery_mechanism, "_reset_record_cache", None)
 
@@ -161,7 +161,7 @@ async def test_a_changed_off_bus_set_lets_the_reset_run_again(monkeypatch, clear
 
 @pytest.mark.asyncio
 async def test_a_new_hold_episode_on_the_same_set_does_not_reset_again(monkeypatch, clear_job_state):
-    """The record is keyed by the boot, not the episode (spec 04 I38): the same off-bus set in a new
+    """The record is keyed by the boot, not the episode (spec 04 I58): the same off-bus set in a new
     hold of the same boot does not get the reset that already failed on it."""
     counters, events, _ = _episode(monkeypatch)
     assert await _window() is True and counters["resets"] == 1
@@ -350,7 +350,7 @@ async def test_replay_with_no_host_rung_the_reset_loop_ends_in_one_hand_off(monk
     assert old_resets == 6 and new_resets == 1
 
 
-# --- the record across a broker restart and a new boot (spec 04 I38) ------------------------------
+# --- the record across a broker restart and a new boot (spec 04 I58) ------------------------------
 
 
 def _restart(monkeypatch):

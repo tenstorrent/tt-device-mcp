@@ -55,7 +55,7 @@ HOLD_ESCALATION_REARM_SEC = int(os.environ.get("TT_DEVICE_MCP_HOLD_REARM_SEC", "
 AUTO_RECOVERY_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_AUTO_RECOVERY_INTERVAL_SEC", "3600"))
 AUTO_RECOVERY_MAX_PER_BOOT = 1
 AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
-# This boot's failed mesh resets (spec 04 I38): which off-bus set each one ran on and left, and its exit
+# This boot's failed mesh resets (spec 04 I58): which off-bus set each one ran on and left, and its exit
 # code. On disk, so a broker restart in the middle of an episode does not forget a reset that already
 # failed and run it again; keyed by the kernel boot id, so the boot a power cycle brings starts empty.
 RESET_RECORD_FILE = "reset_record.json"
@@ -293,7 +293,7 @@ class RecoveryMechanism:
         # Firing one again on a set it left unchanged measures nothing new (one Galaxy host ran six
         # identical 263 s mesh resets in one hold, one per forced window), so the next window takes the
         # next stronger rung instead (spec 04 I36). Loaded from RESET_RECORD_FILE on first use and
-        # written back before the next rung runs, so a broker restart keeps it (spec 04 I38).
+        # written back before the next rung runs, so a broker restart keeps it (spec 04 I58).
         self._reset_record_cache: Optional[tuple[Path, dict]] = None
         # The exit code of the last reset this process launched; None when it was refused, never
         # launched or timed out still cycling. Only a launched reset that failed is recorded.
@@ -363,7 +363,7 @@ class RecoveryMechanism:
         return latched is not None and (latched == "*" or latched == hold_since)
 
     def _reset_record(self) -> dict:
-        """This boot's failed-reset record, read from the health dir once per process (spec 04 I38).
+        """This boot's failed-reset record, read from the health dir once per process (spec 04 I58).
         A file from another boot, or with no boot id to match, starts a fresh record."""
         path = health_dir() / RESET_RECORD_FILE
         cached = self._reset_record_cache
@@ -400,7 +400,7 @@ class RecoveryMechanism:
             health_event("reset_record_unwritable", path=str(path), error=repr(exc))
 
     def note_rung_failed(self, hold_since: str, rung: str, off_before, off_after, rc: Optional[int] = None) -> None:
-        """Record that ``rung`` ran and failed this boot (spec 04 I36, I38), on disk before the caller
+        """Record that ``rung`` ran and failed this boot (spec 04 I36, I58), on disk before the caller
         goes on to any other rung. Every launched failure counts toward class C (I37); only one that
         left the off-bus set exactly as it found it stops a repeat: a set that grew is a regression
         (I31) and one that shrank is progress another try may finish."""
@@ -420,7 +420,7 @@ class RecoveryMechanism:
 
     def failed_unchanged_entry(self, hold_since: str, rung: str, off_now) -> Optional[dict]:
         """The record of ``rung`` failing this boot on exactly the off-bus set seen now, or None. A
-        non-empty set matches across hold episodes and broker restarts (I38); an empty set (a present
+        non-empty set matches across hold episodes and broker restarts (I58); an empty set (a present
         mesh) only within its own hold episode, as before (I36)."""
         if off_now is None:
             return None
@@ -438,13 +438,13 @@ class RecoveryMechanism:
 
     def rung_failed_unchanged(self, hold_since: str, rung: str, off_now) -> bool:
         """True when ``rung`` already failed this boot on exactly the off-bus set seen now: no path
-        fires it again on that set (spec 04 I36, I38)."""
+        fires it again on that set (spec 04 I36, I58)."""
         return self.failed_unchanged_entry(hold_since, rung, off_now) is not None
 
     def mesh_reset_failed_this_boot(self, off_now=None) -> bool:
         """A mesh reset already ran and failed on this mesh: in this process since the last release, or
         in this boot's record (a broker restart included) leaving exactly the chips off now. Class C
-        reads it (spec 04 I37, I38); a reset that failed on some other set and was later healed does
+        reads it (spec 04 I37, I58); a reset that failed on some other set and was later healed does
         not make a new whole-bus drop skip its one reset."""
         if self.mesh_reset_failed_since_release:
             return True

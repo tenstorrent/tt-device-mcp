@@ -354,6 +354,9 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # escalation to the cold rung over a reset that never hard-failed. raising=False so a base tree
     # without the flag (a fails-on-base stash) still sets up cleanly.
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_exit_nonzero", False, raising=False)
+    # The exit code of the last launched reset. Left set, a test whose stub reset never sets it would
+    # record a failed reset in the boot's record (spec 04 I58) and skip the next test's reset.
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_rc", None, raising=False)
     # A host reboot/power cycle a test requested (with a stub fire) must not suppress the NEXT
     # test's forced escalation. raising=False so a base tree without the marker still sets up.
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None, raising=False)

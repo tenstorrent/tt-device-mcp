@@ -1391,7 +1391,7 @@ class GalaxyRecovery(Recovery):
             if stage == STAGE_SMI_RESET and ids_before and not await asyncio.to_thread(self.mechanism.scope_active):
                 failed = self.mechanism.failed_unchanged_entry("", "mesh_reset", ids_before)
                 if failed is not None:
-                    # Spec 04 I38: this boot's mesh reset already failed on exactly these chips, in this
+                    # Spec 04 I58: this boot's mesh reset already failed on exactly these chips, in this
                     # process or before a broker restart. Never fire it again on that set: report it as
                     # the failed rung it is, so the caller's routing takes the host rung or hands off.
                     log(
@@ -1861,7 +1861,7 @@ class GalaxyRecovery(Recovery):
             and self.mechanism.rung_failed_unchanged("", "mesh_reset", offbus_chips)
             and not await asyncio.to_thread(self.mechanism.scope_active)
         ):
-            # Spec 04 I38: this boot's mesh reset already ran and failed on exactly these chips, so the
+            # Spec 04 I58: this boot's mesh reset already ran and failed on exactly these chips, so the
             # sweep would end in the same reset again, which measures nothing new. Climb.
             log(
                 f"last chance before the host rung{where}: the mesh reset already failed on these chips this boot — skipping the sweep"
@@ -2663,7 +2663,7 @@ class GalaxyRecovery(Recovery):
         self, recovered: Optional[bool], hold_since: str, ids_before: Optional[set], expected: int
     ) -> None:
         """Record a mesh reset that RAN and failed in this boot's record, on disk before any next rung
-        (spec 04 I36, I38). Only a launched reset counts (``last_reset_rc`` set): one the host gate or an
+        (spec 04 I36, I58). Only a launched reset counts (``last_reset_rc`` set): one the host gate or an
         outage hold refused, or one still cycling at its timeout, did not fail here. The reset clock
         cannot tell, since it is stamped before launch."""
         rc = self.mechanism.last_reset_rc
