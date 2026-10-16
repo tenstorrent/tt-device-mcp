@@ -12736,12 +12736,11 @@ async def test_the_startup_release_is_written_when_a_held_start_recovers_later(m
     assert released[0]["prior_why"] == "foreign_holder"
 
 
-@pytest.mark.asyncio
-async def test_a_carried_over_episode_writes_no_startup_release(monkeypatch, tmp_path):
-    """Only the fresh startup hold gets the startup_fabric_hold row, so only it gets the release: an
-    episode carried across the restart keeps its own device_held/device_released rows."""
+async def _start_broker_carrying(monkeypatch, tmp_path, events):
+    """run_startup_tasks as a privsep broker on the first start of a new boot, inheriting an open
+    eth_frozen episode from the boot before (a broker power cycle, a host crash), with the fabric
+    pass held off so the test drives the startup gate itself."""
     after = _cross_boot_carry(tmp_path, ServerState.RECOVERING, "eth_frozen")
-    events = []
     patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
     monkeypatch.setattr(srv, "fsm", after)
     monkeypatch.setattr(srv, "_startup_tasks_done", False)
@@ -12760,8 +12759,80 @@ async def test_a_carried_over_episode_writes_no_startup_release(monkeypatch, tmp
     await srv.run_startup_tasks()
     assert srv.fsm.record.why == "eth_frozen"
 
-    srv.fsm.on_outcome(OUTCOME_RECOVERED)
-    assert not [k for k, _ in events if k.startswith("startup_fabric")]
+
+@pytest.mark.asyncio
+async def test_a_carried_over_episode_lifted_by_the_startup_gate_writes_one_release(monkeypatch, tmp_path):
+    """A fault episode inherited across a boot gets no startup_fabric_hold (its own rows opened
+    it), but when the startup gate lifts it the journal must say so: on base the only trace was a
+    verified device_dirty_cleared, so a reader timing recovery ran the episode into the next one.
+    Exactly one release, marked carried_over, timed from the episode's own since."""
+    _gate_with_verdict(monkeypatch, tmp_path, _HEALTHY_VERDICT)
+    events = []
+    await _start_broker_carrying(monkeypatch, tmp_path, events)
+    since = srv.fsm.record.since
+    assert not [k for k, _ in events if k.startswith("startup_fabric")], "a carried episode got a hold row"
+
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+
+    assert srv.fsm.state is ServerState.HEALTHY
+    released = [f for k, f in events if k == "startup_fabric_released"]
+    assert len(released) == 1, "the inherited episode lifted with no release row"
+    assert released[0]["prior_why"] == "eth_frozen"
+    assert released[0]["carried_over"] is True
+    assert released[0]["episode_since"] == since
+    assert released[0]["held_s"] >= 0
+
+    # Exactly once: a later episode on the same broker closes with no second startup release.
+    srv._mark_device_dirty("job ended timeout")
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert len([k for k, _ in events if k == "startup_fabric_released"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_carried_over_episode_stays_held_with_no_release_when_the_startup_check_fails(monkeypatch, tmp_path):
+    """The release row follows the door, never the attempt: the startup gate (run once the
+    hugepages are ready, fabric pass included) finds the fabric bad and its reset does not heal
+    it, so the inherited episode stays held and nothing is written that reads as its end."""
+    fabric_bad = (
+        False,
+        {
+            "snapshot": {"ok": True},
+            "eth_heartbeat": {"ok": True, "detail": "advancing"},
+            "fabric": {"ok": False, "detail": "links down"},
+        },
+    )
+    _gate_with_verdict(monkeypatch, tmp_path, fabric_bad)
+
+    async def reset_fails(indices, log):
+        return False
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", reset_fails)
+    verify_on_start = srv._verify_fabric_on_start
+    events = []
+    await _start_broker_carrying(monkeypatch, tmp_path, events)
+
+    order = []
+
+    async def hugepages_ready():
+        order.append("hugepages")
+        return True
+
+    real_gate = srv._device_health_gate
+
+    async def gate(*a, **k):
+        order.append(("gate", k.get("phase"), k.get("run_fabric"), k.get("force_fabric")))
+        return await real_gate(*a, **k)
+
+    monkeypatch.setattr(srv, "_await_startup_hugepages", hugepages_ready)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    monkeypatch.setattr(srv, "_device_health_gate", gate)
+    await verify_on_start()
+
+    assert order[0] == "hugepages" and order[1] == ("gate", "startup", True, True), order
+    assert srv.fsm.state is not ServerState.HEALTHY, "a failed startup check released the device"
+    assert "startup_fabric_released" not in [k for k, _ in events], "released while still held"
+    assert "device_released" not in [k for k, _ in events]
 
 
 async def _restart_broker(monkeypatch, fsm_path):
@@ -12806,6 +12877,23 @@ async def test_a_restart_during_the_startup_hold_pairs_one_hold_with_one_release
 
     srv.fsm.on_outcome(OUTCOME_RECOVERED)
     assert _startup_rows() == [("startup_fabric_hold", None), ("startup_fabric_released", "startup_unverified")]
+
+
+@pytest.mark.asyncio
+async def test_a_restart_before_a_carried_over_episode_lifts_writes_one_release(monkeypatch, tmp_path):
+    """The release hook for an inherited fault episode is in memory too. Brokers restarted twice
+    before the episode lifted each re-arm it; only the start that sees the lift writes the row.
+    Fails on base: no release at all."""
+    fsm_path = tmp_path / "fsmdir" / "fsm.json"
+    fsm_path.parent.mkdir()
+    ServerFsm(fsm_path, current_boot_id="boot-same").on_fault("eth_frozen", dirty=False)
+    await _restart_broker(monkeypatch, fsm_path)
+    await _restart_broker(monkeypatch, fsm_path)
+    assert srv.fsm.record.why == "eth_frozen"
+
+    srv.fsm.on_outcome(OUTCOME_RECOVERED)
+    assert _startup_rows() == [("startup_fabric_released", "eth_frozen")]
+    assert _startup_releases()[0]["carried_over"] is True
 
 
 @pytest.mark.asyncio
