@@ -2918,6 +2918,96 @@ async def test_pollers_quiesce_stops_and_restarts_an_opted_in_fmax_cap(monkeypat
     assert ("start", "tt-fmax-cap.service") in calls
 
 
+def _reset_that_fails(monkeypatch, rc=1):
+    """reset_with_quiesce's backend stubbed: the reset exits ``rc``, no scope is left cycling, and
+    the PCI rescan and settle sleep are no-ops."""
+
+    async def run_scoped(argv, log, owner="[broker]health-gate"):
+        return rc, "reset exited 1; device not recovered"
+
+    async def to_thread(fn, *a, **k):
+        return fn(*a, **k) if fn is srv.recovery_mechanism.scope_active else None
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", run_scoped)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    monkeypatch.setattr(srv.asyncio, "to_thread", to_thread)
+    monkeypatch.setattr(srv.asyncio, "sleep", no_sleep)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reset_on_a_held_mesh_leaves_the_pollers_stopped(monkeypatch):
+    """g15blx02 10-16: a hold-deadline mesh reset exited 1 with 8/32 chips still off the bus, and the
+    reset's restore started tt-telemetry anyway. It re-opened every chip, failed UMD init and
+    crash-looped every ~35 s for hours over the hold. A restore on a device that is not HEALTHY
+    (held, recovering) keeps the pollers stopped and says so."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+    _reset_that_fails(monkeypatch)
+    fsm_dirty(srv, "8/32 chip(s) off the bus, below the reset floor", why="off_bus")
+
+    rc, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-glx_reset"], lambda m: None)
+
+    assert rc == 1
+    assert [c for c in calls if c[0] == "stop"], "the reset still lands on a quiet bus"
+    assert not [c for c in calls if c[0] == "start"], calls
+    kept = health.read_health_events(kinds={"pollers_kept_quiesced"})
+    assert len(kept) == 1 and "recovering" in kept[0]["reason"], kept
+    assert srv._pollers_owed
+
+
+@pytest.mark.asyncio
+async def test_deferred_pollers_start_once_the_device_is_verified_healthy(monkeypatch):
+    """The pollers a held restore kept stopped start on the next close to HEALTHY (reached only
+    through a passing full check, fabric included), off the release path, and only once."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+    _reset_that_fails(monkeypatch)
+    fsm_dirty(srv, "8/32 chip(s) off the bus, below the reset floor", why="off_bus")
+    await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-glx_reset"], lambda m: None)
+    # A second failed reset in the same hold: still nothing started, and one journal row only.
+    await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-glx_reset"], lambda m: None)
+    assert not [c for c in calls if c[0] == "start"], calls
+    assert len(health.read_health_events(kinds={"pollers_kept_quiesced"})) == 1
+
+    fsm_healthy(srv)
+    await asyncio.gather(*list(srv._pollers_restore_tasks))
+
+    assert [c for c in calls if c[0] == "start"] == [("start", u) for u in DEFAULT_POLLERS]
+    assert srv._pollers_owed is None
+    # A later close with nothing owed starts nothing.
+    fsm_dirty(srv, "job left it dirty")
+    fsm_healthy(srv)
+    await asyncio.gather(*list(srv._pollers_restore_tasks))
+    assert len([c for c in calls if c[0] == "start"]) == len(DEFAULT_POLLERS)
+
+
+@pytest.mark.asyncio
+async def test_the_startup_quiesce_keeps_the_pollers_stopped_when_the_gate_holds(monkeypatch):
+    """The startup fabric block (g15blx02 10-16 11:28 and 12:12 PDT): the forced gate held the mesh
+    with 8/32 off the bus, and the block's exit restarted tt-telemetry onto it. A hold at the
+    block's exit keeps them stopped; a pass starts them as before."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+
+    async with srv._pollers_quiesced_for("the startup fabric check", lambda m: None):
+        fsm_dirty(srv, "8/32 chip(s) off the bus, below the reset floor", why="off_bus")
+    assert not [c for c in calls if c[0] == "start"], calls
+
+    calls.clear()
+    fsm_healthy(srv)
+    await asyncio.gather(*list(srv._pollers_restore_tasks))
+    async with srv._pollers_quiesced_for("the startup fabric check", lambda m: None):
+        pass
+    assert ("start", "tt-telemetry.service") in calls
+
+
 # --- the reset is exclusive --------------------------------------------------
 
 
