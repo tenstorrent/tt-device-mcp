@@ -55,6 +55,16 @@ HOLD_ESCALATION_REARM_SEC = int(os.environ.get("TT_DEVICE_MCP_HOLD_REARM_SEC", "
 AUTO_RECOVERY_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_AUTO_RECOVERY_INTERVAL_SEC", "3600"))
 AUTO_RECOVERY_MAX_PER_BOOT = 1
 AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
+# This boot's failed mesh resets (spec 04 I38): which off-bus set each one ran on and left, and its exit
+# code. On disk, so a broker restart in the middle of an episode does not forget a reset that already
+# failed and run it again; keyed by the kernel boot id, so the boot a power cycle brings starts empty.
+RESET_RECORD_FILE = "reset_record.json"
+RESET_RECORD_MAX = 64
+
+
+def _chip_key(chip: str) -> tuple:
+    return (0, int(chip), "") if chip.isdigit() else (1, 0, chip)
+
 
 # The power cycle's own spacing guard: at least this long between two power cycles. It is
 # wall-clock and durable on disk (the same ledger the boot-loop guard reads), so it spans the
@@ -279,12 +289,15 @@ class RecoveryMechanism:
         # made the drop worse — one Galaxy host went 4 -> 31 -> 32 off-bus across three — so the episode
         # goes straight to the host rung, or pages when none is opted in (spec 04 I31).
         self.regressed_reset_since: Optional[str] = None
-        # The hold episode (its ``since``) whose reset rungs failed, and per rung the off-bus set it
-        # failed with when it left that set unchanged. Firing it again on the same set measures nothing
-        # new (one Galaxy host ran six identical 263 s mesh resets in one hold, one per forced window),
-        # so the next window takes the next stronger rung instead (spec 04 I36).
-        self.failed_rungs_since: str = ""
-        self.failed_rungs: dict = {}
+        # This boot's reset rungs that ran and failed, with the off-bus set before and after each.
+        # Firing one again on a set it left unchanged measures nothing new (one Galaxy host ran six
+        # identical 263 s mesh resets in one hold, one per forced window), so the next window takes the
+        # next stronger rung instead (spec 04 I36). Loaded from RESET_RECORD_FILE on first use and
+        # written back before the next rung runs, so a broker restart keeps it (spec 04 I38).
+        self._reset_record_cache: Optional[tuple[Path, dict]] = None
+        # The exit code of the last reset this process launched; None when it was refused, never
+        # launched or timed out still cycling. Only a launched reset that failed is recorded.
+        self.last_reset_rc: Optional[int] = None
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a
@@ -349,25 +362,99 @@ class RecoveryMechanism:
         latched = self.regressed_reset_since
         return latched is not None and (latched == "*" or latched == hold_since)
 
-    def note_rung_failed(self, hold_since: str, rung: str, off_before, off_after) -> None:
-        """Record that ``rung`` failed in this hold episode (spec 04 I36). Only a failure that left the
-        off-bus set exactly as it found it is kept: a set that grew is a regression (I31) and one that
-        shrank is progress another try may finish."""
-        if not hold_since:
-            return
-        if self.failed_rungs_since != hold_since:
-            self.failed_rungs_since, self.failed_rungs = hold_since, {}
-        if off_before is not None and off_after is not None and set(off_before) == set(off_after):
-            self.failed_rungs[rung] = frozenset(off_after)
-        else:
-            self.failed_rungs.pop(rung, None)
+    def _reset_record(self) -> dict:
+        """This boot's failed-reset record, read from the health dir once per process (spec 04 I38).
+        A file from another boot, or with no boot id to match, starts a fresh record."""
+        path = health_dir() / RESET_RECORD_FILE
+        cached = self._reset_record_cache
+        if cached is not None and cached[0] == path:
+            return cached[1]
+        boot = self._current_boot_id() or ""
+        rec: dict = {"boot_id": boot, "failed": []}
+        raw = None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            health_event("reset_record_unreadable", path=str(path), error=repr(exc))
+        if isinstance(raw, dict) and boot and raw.get("boot_id") == boot and isinstance(raw.get("failed"), list):
+            rec["failed"] = [e for e in raw["failed"] if isinstance(e, dict)][-RESET_RECORD_MAX:]
+            if rec["failed"]:
+                health_event("reset_record_restored", boot_id=boot, failed=rec["failed"])
+        self._reset_record_cache = (path, rec)
+        return rec
+
+    def _save_reset_record(self, rec: dict) -> None:
+        path = health_dir() / RESET_RECORD_FILE
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(rec))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except OSError as exc:
+            # Kept in memory either way; only a broker restart before the next write forgets it.
+            health_event("reset_record_unwritable", path=str(path), error=repr(exc))
+
+    def note_rung_failed(self, hold_since: str, rung: str, off_before, off_after, rc: Optional[int] = None) -> None:
+        """Record that ``rung`` ran and failed this boot (spec 04 I36, I38), on disk before the caller
+        goes on to any other rung. Every launched failure counts toward class C (I37); only one that
+        left the off-bus set exactly as it found it stops a repeat: a set that grew is a regression
+        (I31) and one that shrank is progress another try may finish."""
+        rec = self._reset_record()
+        rec["failed"].append(
+            {
+                "rung": rung,
+                "rc": rc,
+                "off_before": None if off_before is None else sorted(map(str, off_before), key=_chip_key),
+                "off_after": None if off_after is None else sorted(map(str, off_after), key=_chip_key),
+                "episode": hold_since or "",
+                "at_epoch": time.time(),
+            }
+        )
+        del rec["failed"][:-RESET_RECORD_MAX]
+        self._save_reset_record(rec)
+
+    def failed_unchanged_entry(self, hold_since: str, rung: str, off_now) -> Optional[dict]:
+        """The record of ``rung`` failing this boot on exactly the off-bus set seen now, or None. A
+        non-empty set matches across hold episodes and broker restarts (I38); an empty set (a present
+        mesh) only within its own hold episode, as before (I36)."""
+        if off_now is None:
+            return None
+        now = set(map(str, off_now))
+        for entry in reversed(self._reset_record()["failed"]):
+            before, after = entry.get("off_before"), entry.get("off_after")
+            if entry.get("rung") != rung or before is None or after is None:
+                continue
+            if set(before) != now or set(after) != now:
+                continue
+            if not now and (not hold_since or entry.get("episode") != hold_since):
+                continue
+            return entry
+        return None
 
     def rung_failed_unchanged(self, hold_since: str, rung: str, off_now) -> bool:
-        """True when ``rung`` already failed in this hold episode on exactly the off-bus set seen now:
-        it is not fired again in the episode (spec 04 I36)."""
-        if not hold_since or off_now is None or self.failed_rungs_since != hold_since:
+        """True when ``rung`` already failed this boot on exactly the off-bus set seen now: no path
+        fires it again on that set (spec 04 I36, I38)."""
+        return self.failed_unchanged_entry(hold_since, rung, off_now) is not None
+
+    def mesh_reset_failed_this_boot(self, off_now=None) -> bool:
+        """A mesh reset already ran and failed on this mesh: in this process since the last release, or
+        in this boot's record (a broker restart included) leaving exactly the chips off now. Class C
+        reads it (spec 04 I37, I38); a reset that failed on some other set and was later healed does
+        not make a new whole-bus drop skip its one reset."""
+        if self.mesh_reset_failed_since_release:
+            return True
+        if off_now is None:
             return False
-        return self.failed_rungs.get(rung) == frozenset(off_now)
+        now = set(map(str, off_now))
+        return any(
+            e.get("rung") == "mesh_reset" and e.get("off_after") is not None and set(e["off_after"]) == now
+            for e in self._reset_record()["failed"]
+        )
 
     def _local_reset_lock_path(self) -> Path:
         return self._local_reset_dir() / LOCAL_RESET_LOCK

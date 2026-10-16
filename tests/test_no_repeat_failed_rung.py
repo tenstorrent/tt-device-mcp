@@ -18,8 +18,10 @@ from tests.test_device_safety import _arm_offbus_stuck_hold, _arm_stuck_hold
 from tt_device_mcp import alert, privileges
 from tt_device_mcp import server as srv
 from tt_device_mcp.health import recovery as recovery_pkg
+from tt_device_mcp.health.evidence import health_dir
 from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery import offbus_power_cycle as opc
+from tt_device_mcp.health.recovery.base import RESET_RECORD_FILE
 
 EXPECTED = 32
 OFF_BUS = 4  # chips 28-31 off the bus, below the galaxy-reset floor
@@ -38,11 +40,13 @@ def _episode(monkeypatch, *, power_cycle=False, clock=None, off_bus=OFF_BUS):
     monkeypatch.setattr(opc, "health_event", lambda kind, **f: events.append(kind))
     monkeypatch.setattr(alert, "send_alert", lambda event, log=None: alerts.append(event))
     counters["sweeps"] = counters["trays"] = 0
+    _fresh_reset_record(monkeypatch)
 
     async def reset(indices, log):
         # The reset ran (it stamps the reset clock, as the real one does before it fires) and exited 1.
         counters["resets"] += 1
         srv.recovery_mechanism.last_reset_monotonic = time.monotonic()
+        srv.recovery_mechanism.last_reset_rc = 1
         srv.recovery_mechanism.last_reset_exit_nonzero = True
         srv.recovery_mechanism.last_reset_failed = True
         if clock is not None:
@@ -72,6 +76,12 @@ def _episode(monkeypatch, *, power_cycle=False, clock=None, off_bus=OFF_BUS):
 
 async def _window(force=True):
     return await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=force)
+
+
+def _fresh_reset_record(monkeypatch):
+    """Each episode starts on a boot with no failed reset recorded (spec 04 I38)."""
+    (health_dir() / RESET_RECORD_FILE).unlink(missing_ok=True)
+    monkeypatch.setattr(srv.recovery_mechanism, "_reset_record_cache", None)
 
 
 def _ids():
@@ -150,13 +160,32 @@ async def test_a_changed_off_bus_set_lets_the_reset_run_again(monkeypatch, clear
 
 
 @pytest.mark.asyncio
-async def test_a_new_hold_episode_resets_again(monkeypatch, clear_job_state):
-    """The record is keyed by the episode: the same set in a new hold gets its reset."""
+async def test_a_new_hold_episode_on_the_same_set_does_not_reset_again(monkeypatch, clear_job_state):
+    """The record is keyed by the boot, not the episode (spec 04 I38): the same off-bus set in a new
+    hold of the same boot does not get the reset that already failed on it."""
     counters, events, _ = _episode(monkeypatch)
     assert await _window() is True and counters["resets"] == 1
     srv.device_hold_episode_since = (datetime.now() - timedelta(minutes=20)).isoformat()
     assert await _window() is True
-    assert counters["resets"] == 2 and SKIP not in events
+    assert counters["resets"] == 1 and SKIP in events
+
+
+@pytest.mark.asyncio
+async def test_a_reset_that_never_launched_is_not_recorded(monkeypatch, clear_job_state):
+    """The reset clock is stamped before launch, so it cannot tell a launched reset from one that never
+    exited (rc None, still cycling or not started): only a launched one that failed is recorded."""
+    counters, events, _ = _episode(monkeypatch)
+
+    async def unlaunched(indices, log):
+        counters["resets"] += 1
+        srv.recovery_mechanism.last_reset_monotonic = time.monotonic()
+        srv.recovery_mechanism.last_reset_rc = None
+        return False
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", unlaunched)
+    hold_since = srv.device_hold_episode_since
+    assert await _window() is True and counters["resets"] == 1
+    assert not srv.recovery_mechanism.rung_failed_unchanged(hold_since, "mesh_reset", _ids())
 
 
 @pytest.mark.asyncio
@@ -191,6 +220,7 @@ def _present_mesh(monkeypatch):
     async def reset(indices, log):
         counters["resets"] += 1
         srv.recovery_mechanism.last_reset_monotonic = time.monotonic()
+        srv.recovery_mechanism.last_reset_rc = 1
         srv.recovery_mechanism.last_reset_failed = True
         return False
 
@@ -318,3 +348,27 @@ async def test_replay_with_no_host_rung_the_reset_loop_ends_in_one_hand_off(monk
     new_at, new_resets = await _replay(monkeypatch, old=False, power_cycle=False, windows=6)
     assert old_at is None and new_at is None
     assert old_resets == 6 and new_resets == 1
+
+
+# --- the record across a broker restart and a new boot (spec 04 I38) ------------------------------
+
+
+def _restart(monkeypatch):
+    """A broker restart: the in-memory state goes, the health dir stays."""
+    mech = srv.recovery_mechanism
+    monkeypatch.setattr(mech, "_reset_record_cache", None)
+    monkeypatch.setattr(mech, "mesh_reset_failed_since_release", False)
+    monkeypatch.setattr(mech, "last_reset_monotonic", 0.0)
+
+
+@pytest.mark.asyncio
+async def test_the_failed_reset_survives_a_broker_restart_but_not_a_new_boot(monkeypatch, clear_job_state):
+    counters, events, _ = _episode(monkeypatch)
+    assert await _window() is True and counters["resets"] == 1
+    _restart(monkeypatch)
+    assert await _window() is True
+    assert counters["resets"] == 1 and SKIP in events, "after the restart the failed reset is not run again"
+    _restart(monkeypatch)
+    monkeypatch.setattr(srv.recovery_mechanism, "_current_boot_id", lambda: "another-boot")
+    assert not srv.recovery_mechanism.rung_failed_unchanged("", "mesh_reset", _ids()), "a new boot starts fresh"
+    assert await _window() is True and counters["resets"] == 2

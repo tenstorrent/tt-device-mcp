@@ -704,6 +704,30 @@ each rung fires only when the gentler one failed or cannot apply.
   Evidence from one Galaxy host: 0 of 50 whole-tray drops healed without a power cycle; on all-off
   drops each repeat mesh reset ran 130-262 s and exited 1, and three of them took the host down.
 
+- **I58 — A mesh reset that failed is remembered for the boot, across broker restarts.** Every mesh
+  reset that launched and failed (an exit code was read: nonzero, or zero with an unhealthy verify)
+  is recorded with its exit code, the off-bus set before and after, its hold episode and its time in
+  `reset_record.json` in the health dir, written atomically (temp file, fsync, rename) before any
+  next rung runs. The record is keyed by the kernel boot id: a broker restart loads it, a new boot
+  (the one a power cycle or reboot brings) starts empty. A reset that never launched or was still
+  cycling at its timeout (no exit code) is not recorded; the reset clock, stamped before launch,
+  cannot tell. Once a mesh reset failed with the off-bus set unchanged, no path fires it again on
+  that same set in this boot: not a gate (startup, post-job, relift), not the idle or hold-deadline
+  ladder, not a new hold episode, and not the last-chance sweep, whose last step is that reset (it
+  skips itself with `last_chance_sweep_skipped`, reason `mesh_reset_failed_unchanged`). The gate
+  journals `reset_rung_skipped_failed_unchanged` and routes on as after a failed reset, to the host
+  rung its chooser picks; with no host rung opted in, the ordinary ladder runs and I36's one latched
+  operator hand-off ends it. A set that shrank or changed gets one reset again. An empty set (a
+  present mesh) matches only within its own hold episode, as in I36. Class C of I37 reads the record
+  too, so an all-off mesh whose reset failed before a broker restart goes to the power cycle with no
+  second reset. Resets stay bounded at one failed mesh reset per distinct off-bus set per boot. A
+  power cycle the rate limit denies holds and is asked again at the next window, within the limit's
+  interval. Goal of 03 I4 holds: after the cycle the startup gate waits for the hugepage pool and
+  passes the full health check, fabric included, before any release. Time to the power-cycle
+  request, on the fake clock of the tests: class C after a failed reset and a broker restart, at
+  the first gate after the restart instead of after a second reset (262 s); class B (part of a tray)
+  after one failed reset instead of a reset and the sweep (585 s to 262 s).
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -1159,6 +1183,8 @@ sees a silent fabric pass.
 | I37 the host rung's last-chance sweep skips itself for classes A and C | `tests/test_classac_power_cycle_direct.py::test_the_last_chance_sweep_skips_itself_for_a_and_c` |
 | I37 / goal of 03 I4: after the cycle the startup gate waits for hugepages and runs the fabric pass; a failed check keeps the hold | `tests/test_classac_power_cycle_direct.py::test_after_the_cycle_the_startup_gate_awaits_hugepages_and_the_fabric`, `::test_a_failed_startup_check_after_the_cycle_keeps_the_hold` |
 | I37 time to recover (fake clock): class A requests the cycle in the first window, class C after one failed reset | `tests/test_classac_power_cycle_direct.py::test_time_to_recover_on_a_fake_clock` |
+| I58 the failed-reset record survives a broker restart but not a new boot; a new episode on the same set does not reset again; only a launched reset is recorded | `tests/test_no_repeat_failed_rung.py::test_the_failed_reset_survives_a_broker_restart_but_not_a_new_boot`, `::test_a_new_hold_episode_on_the_same_set_does_not_reset_again`, `::test_a_reset_that_never_launched_is_not_recorded` |
+| I58 all off after a failed reset and a broker restart: the startup or a later gate cycles with no second reset; the sweep skips a failed-unchanged set | `tests/test_classac_power_cycle_direct.py::test_replay_all_off_after_a_restart_cycles_with_no_second_reset`, `::test_a_partial_drop_keeps_the_ladder` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |
