@@ -97,7 +97,7 @@ def _held_past_ceiling(monkeypatch, tmp_path):
 
     issued = []
 
-    async def rung(indices, expected, log, *, force=False):
+    async def rung(indices, expected, log, *, force=False, measured_fault=None):
         issued.append("ladder")  # the bridge reset / SBR / tray re-power / mesh reset it would run
         return True
 
