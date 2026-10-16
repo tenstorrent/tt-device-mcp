@@ -2029,7 +2029,7 @@ class GalaxyRecovery(Recovery):
         state = offbus_power_cycle.load_state()
         now = offbus_power_cycle.now_epoch()
         interval = offbus_power_cycle.min_interval_sec()
-        last = offbus_power_cycle.last_attempt_within(state, now, interval)
+        last = offbus_power_cycle.last_attempt_within(state, now, interval, healed=self.mechanism.power_cycle_healed)
         if last is not None:
             offbus_power_cycle.page_once(
                 "offbus_power_cycle_rate_limited",
@@ -2059,7 +2059,7 @@ class GalaxyRecovery(Recovery):
         # On disk before anything runs: a cycle that takes the broker down with it still counts
         # against the rate limit on the boot that comes back.
         try:
-            offbus_power_cycle.record_attempt(state, now, hold_since, reason)
+            offbus_power_cycle.record_attempt(state, now, hold_since, reason, self.mechanism._current_boot_id() or "")
         except OSError as exc:
             log(f"off-bus power cycle NOT fired: could not record the attempt ({exc!r}); holding")
             health_event("offbus_gated_hold", phase="record_failed", held_since=hold_since, error=repr(exc))

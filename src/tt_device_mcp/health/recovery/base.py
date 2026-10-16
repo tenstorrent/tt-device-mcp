@@ -1090,6 +1090,13 @@ class RecoveryMechanism:
             return None
         return rec if isinstance(rec, dict) else None
 
+    def power_cycle_healed(self, rec: dict) -> bool:
+        """Whether power cycle ``rec`` (``boot_id``, ``at_epoch``) was followed, on a later boot, by
+        the verified-healthy release on record: it healed the box, so a fault after it is a new
+        episode (spec 04 I9). No stamp, no boot id or an unreadable field reads False."""
+        verified = self.last_verified_release()
+        return bool(verified) and _verified_since({**rec, "action": "power-cycle"}, verified)
+
     def record_verified_release(self, via: str, *, now_epoch: Optional[float] = None) -> None:
         """Stamp a verified-healthy release (a gate pass whose fabric check ran and passed) on this
         boot. Written atomically; never raises. A lost stamp only keeps the boot-loop guard on. The
