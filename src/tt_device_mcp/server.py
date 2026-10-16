@@ -3128,8 +3128,14 @@ async def _verify_operator_reset(present: int, recovery, log, source: str) -> tu
     retired (on the light path too: it is the strongest verify that host has, and the reset is the
     remedy the fault was pending); False unhealthy, the device marked dirty so the next gate owes it a real recovery; None
     the fabric could not be verified, held ``fabric_unverified`` with the reported fault kept."""
+    global _reset_verify_fabric_ok_monotonic
     expected = recovery.monitor.expected(present)
+    # Read before the verify: only a pass that started with the 1G pool ready can stand in for the
+    # startup gate's own (spec 03 I56), which never runs before the pool is ready.
+    started = time.monotonic()
+    pool_ready = False
     if expected > 1 and fabric.build_command() is not None:
+        pool_ready = await asyncio.to_thread(_hugepages_shortfall) is None
         ok, ev, _retries = await recovery._verify_device_after_reset(expected, log)
         verdict = True if ok else None if recovery._fabric_ran_but_unverified(ev) else False
     else:
@@ -3149,7 +3155,9 @@ async def _verify_operator_reset(present: int, recovery, log, source: str) -> tu
     )
     if verdict:
         _clear_device_reported_fault(f"{source}: verified healthy")
-        _clear_device_dirty(verified=True, why=f"{source}: verified healthy")
+        released = _clear_device_dirty(verified=True, why=f"{source}: verified healthy")
+        if released and pool_ready and (ev.get("fabric") or {}).get("ok") is True:
+            _reset_verify_fabric_ok_monotonic = started
     elif verdict is None:
         _hold_device_fabric_unverified(f"{source}: enum+ARC healthy, fabric unverified after the post-reset retries")
     else:
@@ -3157,6 +3165,29 @@ async def _verify_operator_reset(present: int, recovery, log, source: str) -> tu
             f"{source}: the mesh did not verify after the reset: {detail}", why="operator_reset_unhealthy"
         )
     return verdict, detail
+
+
+# When this privsep broker armed its startup gate (run_startup_tasks), and when the newest operator
+# reset verify that ran the fabric pass, passed it and released the device started, with the 1G pool
+# ready. Monotonic; 0.0 is never.
+_startup_gate_armed_monotonic: float = 0.0
+_reset_verify_fabric_ok_monotonic: float = 0.0
+
+
+def _startup_pass_from_reset_verify() -> str:
+    """Why the startup gate may count an operator reset's verify as its own pass, or "" to run it.
+
+    Spec 03 I56. A reset during the startup hold runs the full check, fabric included, and releases
+    the device on a pass; the deferred startup gate then ran a second full pass (~30 s on a galaxy)
+    over a mesh nothing had touched since. It counts only a verify that started after the gate was
+    armed and with the 1G pool ready, and only while the device is still HEALTHY, clean and owes no
+    fabric pass (a reset since it, or anything that dirtied or held the device, runs the gate)."""
+    since = _reset_verify_fabric_ok_monotonic
+    if not _startup_gate_armed_monotonic or since < _startup_gate_armed_monotonic:
+        return ""
+    if fsm.state is not ServerState.HEALTHY or fsm.record.dirty or FABRIC_DEBT.owed:
+        return ""
+    return f"an operator reset's full check passed with fabric {time.monotonic() - since:.0f}s ago"
 
 
 def _reset_health_label(verdict: Optional[bool]) -> str:
@@ -5051,6 +5082,13 @@ async def device_health_gate(
     # tool and against a gate running for another job: concurrent -glx_reset calls
     # at the same 32 ASICs turn one wedged chip into a mesh that needs a power-cycle.
     async with _device_op("health-gate/" + phase):
+        # The forced startup pass, queued behind an operator reset whose verify already proved the
+        # mesh (fabric included) since this broker started: that verify is the startup pass (I56).
+        counted = _startup_pass_from_reset_verify() if phase == "startup" and force_fabric else ""
+        if counted:
+            _log(f"skip: {counted}; counting it as the startup pass")
+            health_event("startup_gate_counted_reset_verify", detail=counted)
+            return
         # This pass's own snapshot of what the FSM already knew coming in — read once, used
         # throughout, never re-derived: a mid-pass fsm mutation (e.g. the eth-frozen hold below)
         # must not retroactively change what THIS pass decided "coming in dirty" meant.
@@ -9879,7 +9917,7 @@ async def run_startup_tasks() -> None:
     scopes, and a per-user daemon or test server claiming them would show another user's job
     as its own.
     """
-    global _startup_tasks_done
+    global _startup_tasks_done, _startup_gate_armed_monotonic
     if _startup_tasks_done:
         return
     _startup_tasks_done = True
@@ -9929,6 +9967,7 @@ async def run_startup_tasks() -> None:
     # A broker start is never trusted, whatever the last broker saw: the startup gate's own fabric
     # pass (after hugepages) settles this before anything is released (04 I32).
     FABRIC_DEBT.note_reset("broker start")
+    _startup_gate_armed_monotonic = time.monotonic()
     # A hold the last broker died holding has no row yet; give it one before anything opens
     # a new episode over the top of it.
     carried_hold = None
