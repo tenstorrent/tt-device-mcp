@@ -26,6 +26,7 @@ from typing import Callable, Optional
 from tt_device_mcp import aio, alert, metrics
 from tt_device_mcp.constants import (
     ETH_POST_JOB_TIMEOUT_SEC,
+    ETH_REAP_SEC,
     FABRIC_CHECK_CANNOT_CHECK_RC,
     FABRIC_CHECK_HARDWARE_FAULT_RC,
     FABRIC_CHECK_TIMEOUT_SEC,
@@ -1306,6 +1307,11 @@ class HealthMonitor:
         # two distinct timeout outcomes (a merely-slow read skipping vs. the caller's own hang
         # evidence) into one.
         probe_timeout = timeout_sec if override else min(eth.probe_timeout_sec(), timeout_sec * 0.9)
+        # A reader killed on its own timeout is waited on until it has exited (bounded), so the
+        # holder scan the idle relift's escalation runs next does not find its pid still listed by
+        # the driver and defer the reset as an incomplete scan. Capped to half the slack under the
+        # outer bound, so the wait never turns a skip into the outer bound's FROZEN verdict.
+        reap_sec = min(ETH_REAP_SEC, max(0.0, (timeout_sec - probe_timeout) / 2))
 
         # Survives track(None): run_probe's own `finally` clears fabric_check_proc on every exit
         # path, INCLUDING when the outer wait_for below cancels this call — a CancelledError
@@ -1326,7 +1332,7 @@ class HealthMonitor:
         _t0 = datetime.now()
         try:
             rc, text = await aio.wait_for(
-                eth.check(argv, env, timeout_sec=probe_timeout, track=_track, cwd=cwd),
+                eth.check(argv, env, timeout_sec=probe_timeout, track=_track, cwd=cwd, reap_sec=reap_sec),
                 timeout=timeout_sec,
             )
         except asyncio.TimeoutError:

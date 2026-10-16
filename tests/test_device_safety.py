@@ -3232,7 +3232,7 @@ async def test_a_link_drop_after_clean_jobs_pays_at_most_one_fabric_pass_per_int
     monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
     monkeypatch.setattr(eth_mod, "build", lambda: (["probe"], {}))
 
-    async def probe(argv, env, *, timeout_sec, track, cwd=None):
+    async def probe(argv, env, *, timeout_sec, track, cwd=None, reap_sec=0.0):
         return 0, "eth-links: measured=11 down=0 unreadable=0\nall 11 active-eth core heartbeat(s) advancing"
 
     monkeypatch.setattr(eth_mod, "check", probe)
@@ -8984,7 +8984,7 @@ async def test_idle_relift_holds_a_frozen_core_whose_link_went_down(monkeypatch,
     async def healthy(expected, log, run_fabric=True, **_):
         return True, {"snapshot": {"ok": True}}
 
-    async def probe(argv, env, *, timeout_sec, track, cwd=None):
+    async def probe(argv, env, *, timeout_sec, track, cwd=None, reap_sec=0.0):
         return 0, "eth-links: measured=11 down=1 unreadable=0\nall 11 active-eth core heartbeat(s) advancing"
 
     patch_recovery(monkeypatch, "_verify_device", healthy)
@@ -9463,6 +9463,89 @@ async def test_stuck_hold_escalation_holds_when_the_holder_scan_is_incomplete(mo
     ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
     assert ran is False
     assert counters["resets"] == 0
+
+
+def _deferral_capture(monkeypatch):
+    """Record the escalation's log lines and its stuck_hold_deferred events."""
+    lines, events = [], []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append(f) if kind == "stuck_hold_deferred" else None)
+    return lines, events
+
+
+@pytest.mark.asyncio
+async def test_stuck_hold_deferral_names_an_incomplete_scan_and_its_gaps(monkeypatch, clear_job_state):
+    """A deferral on a scan that could not see says so, with the scan's source and what it missed:
+    "a tenant holds the device" there read as a real tenant while the box sat for the whole ceiling."""
+    scan = HolderScan(holders=[], complete=False, source="driver")
+    scan.gaps.append("pid 777 (python3, state D) named by the driver holds no device fd here")
+    _arm_stuck_hold(monkeypatch, scan=scan)
+    lines, events = _deferral_capture(monkeypatch)
+    ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lines.append)
+    assert ran is False
+    assert lines == [
+        "hold past the ceiling but holder scan incomplete (source=driver: pid 777 (python3, state D) named by the "
+        "driver holds no device fd here) — holding; escalates once idle"
+    ]
+    assert events == [
+        {
+            "mesh": "present",
+            "forced": False,
+            "blocker": "scan_incomplete",
+            "source": "driver",
+            "gaps": ["pid 777 (python3, state D) named by the driver holds no device fd here"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stuck_hold_deferral_names_the_tenant_holder(monkeypatch, clear_job_state):
+    """A real tenant is named by pid, uid, user and comm, on the forced pass too (force never waives one)."""
+    tenant = DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)
+    counters = _arm_stuck_hold(monkeypatch, scan=HolderScan(holders=[tenant], complete=True))
+    monkeypatch.setattr(
+        "tt_device_mcp.health.recovery.galaxy.holder_comm", lambda pid: "tt-smi" if pid == 4242 else "?"
+    )
+    lines, events = _deferral_capture(monkeypatch)
+    ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lines.append, force=True)
+    assert ran is False and counters["resets"] == 0
+    assert lines == [
+        f"hold past the ceiling but tenant pid 4242 uid {tenant.uid} ({tenant.username}) comm tt-smi holds the "
+        "device — holding; escalates once idle"
+    ]
+    assert events == [
+        {
+            "mesh": "present",
+            "forced": True,
+            "blocker": "tenant",
+            "pid": 4242,
+            "uid": tenant.uid,
+            "user": tenant.username,
+            "comm": "tt-smi",
+            "tenants": 1,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stuck_hold_deferral_names_a_running_broker_job(monkeypatch, clear_job_state):
+    """A broker job in RUNNING state is named as such, ahead of whatever the holder scan read."""
+    _arm_stuck_hold(monkeypatch, scan=HolderScan(holders=[], complete=False))
+    monkeypatch.setattr(srv.galaxy_recovery.deps, "job_running", lambda: True)
+    lines, events = _deferral_capture(monkeypatch)
+    ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lines.append)
+    assert ran is False
+    assert lines == ["hold past the ceiling but a broker job is running — holding; escalates once idle"]
+    assert events == [{"mesh": "present", "forced": False, "blocker": "job_running"}]
+
+
+@pytest.mark.asyncio
+async def test_forced_stuck_hold_waives_an_incomplete_scan_and_emits_no_deferral(monkeypatch, clear_job_state):
+    """The hold-deadline pass still waives an unreadable scan (no deferral is logged or journaled)."""
+    counters = _arm_stuck_hold(monkeypatch, scan=HolderScan(holders=[], complete=False))
+    lines, events = _deferral_capture(monkeypatch)
+    ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lines.append, force=True)
+    assert ran is True and counters["resets"] == 1
+    assert events == [] and not any("holding" in line for line in lines)
 
 
 @pytest.mark.asyncio
@@ -10422,6 +10505,31 @@ async def test_stuck_offbus_hold_holds_under_a_foreign_tenant(monkeypatch, clear
     assert (
         counters["sbr"] == 0 and counters["resets"] == 0
     ), "a foreign tenant must block the off-bus escalation entirely"
+
+
+@pytest.mark.asyncio
+async def test_stuck_offbus_hold_deferral_names_an_incomplete_scan(monkeypatch, clear_job_state):
+    """The off-bus twin of the deferral names its blocker the same way."""
+    _arm_offbus_stuck_hold(monkeypatch, isolated={"8"})
+    scan = HolderScan(holders=[], complete=False, source="proc")
+    scan.gaps.append("3 processes' fd tables unreadable")
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scan)
+    lines, events = _deferral_capture(monkeypatch)
+    ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lines.append)
+    assert ran is False
+    assert (
+        "off-bus hold past the ceiling but holder scan incomplete (source=proc: 3 processes' fd tables "
+        "unreadable) — holding; escalates once idle"
+    ) in lines
+    assert events == [
+        {
+            "mesh": "offbus",
+            "forced": False,
+            "blocker": "scan_incomplete",
+            "source": "proc",
+            "gaps": ["3 processes' fd tables unreadable"],
+        }
+    ]
 
 
 @pytest.mark.asyncio

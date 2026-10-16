@@ -43,6 +43,7 @@ async def run_probe(
     env: dict[str, str],
     cwd: Optional[str] = None,
     terminate: Terminate = _killpg,
+    reap_sec: float = 0.0,
 ) -> tuple[Optional[int], bytes]:
     """Run ``argv`` to completion or to ``timeout_sec``, whichever comes first.
 
@@ -57,6 +58,11 @@ async def run_probe(
 
     ``track`` registers the live process for the caller's dead-chip kill path for exactly the
     duration of the call, and is always cleared again before returning, on every exit path.
+
+    ``reap_sec`` > 0 waits up to that long, after ``terminate``, for the killed process to finish
+    exiting. Until it does, the driver can still list its pid while its fd table is already gone,
+    so a holder scan run right after a timed-out probe reads as incomplete and defers a reset the
+    broker's own dead probe should never block.
     """
     proc: Optional[asyncio.subprocess.Process] = None
     try:
@@ -90,6 +96,11 @@ async def run_probe(
                 await terminate(proc.pid)
             except (ProcessLookupError, OSError):
                 pass
+            if reap_sec > 0:
+                try:
+                    await aio.wait_for(proc.wait(), timeout=reap_sec)
+                except asyncio.TimeoutError:
+                    pass  # still exiting (stuck in the driver): a later scan says so
         return None, b"".join(chunks)
     finally:
         if proc is not None:
