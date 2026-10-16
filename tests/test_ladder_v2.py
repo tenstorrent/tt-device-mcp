@@ -527,7 +527,15 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
         return True, {"snapshot": {"ok": True}}
 
     patch_recovery(monkeypatch, "_verify_device", healthy)
-    out = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={str(i): 100 for i in range(1, 32)})
+    out = await g._fire_gate_rung(
+        "post-job",
+        galaxy.STAGE_POWER_CYCLE,
+        ["0"],
+        32,
+        lambda m: None,
+        ev=None,
+        beats={str(i): 100 for i in range(1, 32)},
+    )
     assert (
         out == galaxy.OUTCOME_RECOVERED and cycles["n"] == 0
     ), "a mesh that returned during the settle skips the host rung"
@@ -539,7 +547,13 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
     # The sweep did not run (no holder scan stubbed, so it reads as a tenant): the full ladder has not
     # been tried, so the host rung holds (spec 04 I22).
     out_held = await g._fire_gate_rung(
-        "post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={str(i): 100 for i in range(1, 32)}
+        "post-job",
+        galaxy.STAGE_POWER_CYCLE,
+        ["0"],
+        32,
+        lambda m: None,
+        ev=None,
+        beats={str(i): 100 for i in range(1, 32)},
     )
     assert (
         out_held == galaxy.OUTCOME_WAITING and cycles["n"] == 0
@@ -554,7 +568,15 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
         return 0, ""
 
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", fake_reset)
-    out2 = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={str(i): 100 for i in range(1, 32)})
+    out2 = await g._fire_gate_rung(
+        "post-job",
+        galaxy.STAGE_POWER_CYCLE,
+        ["0"],
+        32,
+        lambda m: None,
+        ev=None,
+        beats={str(i): 100 for i in range(1, 32)},
+    )
     assert (
         out2 == galaxy.OUTCOME_WAITING and cycles["n"] == 1
     ), "a mesh still bad after the full sweep, settle and verify proceeds to the host rung"
@@ -717,7 +739,15 @@ async def test_gate_ladder_sweeps_every_reset_before_the_power_cycle(monkeypatch
     """The gate ladder's own host rung: SBR -> tray re-power -> mesh reset fire back-to-back, then
     the single settle+verify, and only then the power cycle."""
     g, order, cycles = _arm_sweep(monkeypatch)
-    out = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={str(i): 100 for i in range(1, 32)})
+    out = await g._fire_gate_rung(
+        "post-job",
+        galaxy.STAGE_POWER_CYCLE,
+        ["0"],
+        32,
+        lambda m: None,
+        ev=None,
+        beats={str(i): 100 for i in range(1, 32)},
+    )
     steps = [o if isinstance(o, str) else o[0] for o in order]
     assert steps == ["sbr", "tray", "mesh"], f"every reset type once, in order, before the power cycle; got {steps}"
     assert out == galaxy.OUTCOME_WAITING and cycles["n"] == 1, "still bad after the sweep -> the power cycle fires"
@@ -760,7 +790,15 @@ async def test_a_skipped_tray_rung_releases_only_after_the_full_health_check(mon
 async def test_a_sweep_that_recovers_the_mesh_cancels_the_power_cycle(monkeypatch, galaxy_trays):
     """The point of sweeping: if the last-chance resets bring the mesh back, the box is NOT cycled."""
     g, order, cycles = _arm_sweep(monkeypatch, verify_healthy=True)
-    out = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={str(i): 100 for i in range(1, 32)})
+    out = await g._fire_gate_rung(
+        "post-job",
+        galaxy.STAGE_POWER_CYCLE,
+        ["0"],
+        32,
+        lambda m: None,
+        ev=None,
+        beats={str(i): 100 for i in range(1, 32)},
+    )
     assert [o if isinstance(o, str) else o[0] for o in order] == ["sbr", "tray", "mesh"]
     assert out == galaxy.OUTCOME_RECOVERED and cycles["n"] == 0, "a mesh the sweep recovered must not be power-cycled"
 
