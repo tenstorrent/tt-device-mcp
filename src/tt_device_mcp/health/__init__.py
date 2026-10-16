@@ -75,6 +75,7 @@ from tt_device_mcp.health.monitors.pci import (
     chip_snapshot,
     chip_snapshot_event,
     isolate_chip,
+    sysfs_chip_ids,
 )
 
 # The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and
@@ -186,6 +187,7 @@ __all__ = [
     "aer_totals",
     "chip_node_present",
     "chip_pci_bdf",
+    "sysfs_chip_ids",
     "chip_sample",
     "chip_snapshot",
     "chip_snapshot_event",
