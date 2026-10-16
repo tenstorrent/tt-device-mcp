@@ -709,10 +709,12 @@ class HealthMonitor:
                 source=acc.get("source", ""),
                 reset=owed,
             )
-            self._logger.warning(
-                f"post-reset fabric passed on {measured} of {bar} eth links — at the accepted deficit "
-                f"({acc.get('source', '')}), released; `tt-device-mcp eth-links clear` restores the full bar"
-            )
+            lg = self._logger()
+            if lg:
+                lg.warning(
+                    f"post-reset fabric passed on {measured} of {bar} eth links — at the accepted deficit "
+                    f"({acc.get('source', '')}), released; `tt-device-mcp eth-links clear` restores the full bar"
+                )
             return None
         # A new deficit: its boot is this one, so a later boot can tell a broker power cycle ended it.
         spent = bool(pend and pend["links"] == measured and pend.get("reset_spent"))
