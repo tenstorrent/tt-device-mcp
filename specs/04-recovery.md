@@ -647,6 +647,23 @@ each rung fires only when the gentler one failed or cannot apply.
   passes; a failed check keeps it held for the next bounded rung, and a reset the gate still refuses
   releases nothing. The hand-off ends (gauge to 0, `operator_handoff` gone) when the hold ends.
 
+- **I34 — A mesh reset that failed with the off-bus set unchanged is not repeated in that hold
+  episode; the next window takes the next stronger rung.** The broker records, per hold episode, each
+  mesh reset that RAN and failed, with the off-bus chip set before and after it; a reset the host gate
+  or an outage hold refused did not run and is not recorded. Only a failure that left the set exactly
+  as it found it counts: a set that grew is I31, and one that shrank is progress another try may finish.
+  While the set off the bus is still that recorded set, the idle off-bus ladder (forced or not) fires
+  none of its reset rungs again, and a forced present-mesh window does not repeat the reset (the
+  grace-cadence retries before the ceiling stay). It journals `reset_rung_skipped_failed_unchanged` and
+  climbs: the host rung behind the last-chance sweep (I22), within one hold-deadline window of the
+  failure, rate limits kept (a denied cycle holds and fires no reset). When no host rung is available
+  (power cycle and reboot both off or unfireable) the hold goes to an operator once per episode through
+  the I33 hand-off, latched (no deadline, `act_by` null), and no further reset fires on that set. Any
+  later reset still owes the I32 fabric pass, so nothing releases the device before the full health
+  check, fabric included, passes. The record is keyed by the episode, so a new episode resets again.
+  Bounds the loop one Galaxy host ran: six identical mesh resets in one hold, each exiting 1 after a
+  263 s overrun, one per forced window.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.

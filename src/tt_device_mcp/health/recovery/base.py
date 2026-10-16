@@ -252,6 +252,12 @@ class RecoveryMechanism:
         # made the drop worse — one Galaxy host went 4 -> 31 -> 32 off-bus across three — so the episode
         # goes straight to the host rung, or pages when none is opted in (spec 04 I31).
         self.regressed_reset_since: Optional[str] = None
+        # The hold episode (its ``since``) whose reset rungs failed, and per rung the off-bus set it
+        # failed with when it left that set unchanged. Firing it again on the same set measures nothing
+        # new (one Galaxy host ran six identical 263 s mesh resets in one hold, one per forced window),
+        # so the next window takes the next stronger rung instead (spec 04 I34).
+        self.failed_rungs_since: str = ""
+        self.failed_rungs: dict = {}
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a
@@ -296,6 +302,26 @@ class RecoveryMechanism:
         reset on it is not tried (spec 04 I31)."""
         latched = self.regressed_reset_since
         return latched is not None and (latched == "*" or latched == hold_since)
+
+    def note_rung_failed(self, hold_since: str, rung: str, off_before, off_after) -> None:
+        """Record that ``rung`` failed in this hold episode (spec 04 I34). Only a failure that left the
+        off-bus set exactly as it found it is kept: a set that grew is a regression (I31) and one that
+        shrank is progress another try may finish."""
+        if not hold_since:
+            return
+        if self.failed_rungs_since != hold_since:
+            self.failed_rungs_since, self.failed_rungs = hold_since, {}
+        if off_before is not None and off_after is not None and set(off_before) == set(off_after):
+            self.failed_rungs[rung] = frozenset(off_after)
+        else:
+            self.failed_rungs.pop(rung, None)
+
+    def rung_failed_unchanged(self, hold_since: str, rung: str, off_now) -> bool:
+        """True when ``rung`` already failed in this hold episode on exactly the off-bus set seen now:
+        it is not fired again in the episode (spec 04 I34)."""
+        if not hold_since or off_now is None or self.failed_rungs_since != hold_since:
+            return False
+        return self.failed_rungs.get(rung) == frozenset(off_now)
 
     def _local_reset_lock_path(self) -> Path:
         return self._local_reset_dir() / LOCAL_RESET_LOCK
