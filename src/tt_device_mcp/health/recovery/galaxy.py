@@ -355,13 +355,14 @@ def _power_cycle_direct_class(
 ) -> Optional[str]:
     """The I37 fault class of an off-bus set, or None when the ordinary ladder applies.
 
-    ``FAULT_CLASS_ALL_OFF`` when every chip is off the bus and a mesh reset already ran and failed
-    since the mesh was last released. A whole-bus drop with no failed reset gets its one mesh reset
-    first, at the startup gate as at run time: the startup gate also runs after a broker restart, and
-    one mesh reset has brought a whole bus back there. ``FAULT_CLASS_WHOLE_TRAY`` when the set is
-    exactly one or more whole trays and at least one chip of the mesh is still on the bus. Anything else — a partial-tray drop, a single
-    chip, a host with fewer than two trays, or no tray map to say which chips share a tray — is
-    None. Pure and side-effect-free."""
+    ``FAULT_CLASS_ALL_OFF`` when every chip is off the bus and ``mesh_reset_failed``: a mesh reset
+    already ran and failed on it, or the broker's own reboot or power cycle for this fault did not
+    bring it back (the callers pass both, spec 04 I37). A whole-bus drop with no failed reset gets
+    its one mesh reset first, at the startup gate as at run time: the startup gate also runs after a
+    broker restart, and one mesh reset has brought a whole bus back there. ``FAULT_CLASS_WHOLE_TRAY``
+    when the set is exactly one or more whole trays and at least one chip of the mesh is still on the
+    bus. Anything else — a partial-tray drop, a single chip, a host with fewer than two trays, or no
+    tray map to say which chips share a tray — is None. Pure and side-effect-free."""
     if expected < 2 * UBB_CHIP_COUNT or not offbus_chips:
         return None
     if len(offbus_chips) >= expected:
@@ -1238,7 +1239,8 @@ class GalaxyRecovery(Recovery):
             offbus,
             expected,
             self._tray_map_now(),
-            mesh_reset_failed=self.mechanism.mesh_reset_failed_since_release,
+            mesh_reset_failed=self.mechanism.mesh_reset_failed_this_boot(offbus)
+            or self.mechanism.broker_cycled_this_episode(),
         )
         if fault_class is None:
             return None
@@ -1430,7 +1432,31 @@ class GalaxyRecovery(Recovery):
             # DEFER lands here too: a reset already cycling in its own scope is not a second reset
             # to start but one to ADOPT — _reset_and_verify_device waits that scope out
             # (await_foreign_scope) and verifies its result instead of issuing anything.
-            if not await self._reset_and_verify_device(indices, log):
+            ids_before = await self._offbus_ids_now(expected)
+            if stage == STAGE_SMI_RESET and ids_before and not await asyncio.to_thread(self.mechanism.scope_active):
+                failed = self.mechanism.failed_unchanged_entry("", "mesh_reset", ids_before)
+                if failed is not None:
+                    # Spec 04 I58: this boot's mesh reset already failed on exactly these chips, in this
+                    # process or before a broker restart. Never fire it again on that set: report it as
+                    # the failed rung it is, so the caller's routing takes the host rung or hands off.
+                    log(
+                        f"gate/{gate_phase}: {len(ids_before)}/{expected} off-bus and a mesh reset already "
+                        f"failed on exactly these chips this boot (rc {failed.get('rc')}) — not repeating it"
+                    )
+                    health_event(
+                        "reset_rung_skipped_failed_unchanged",
+                        rung="mesh_reset",
+                        path=f"gate/{gate_phase}",
+                        off_bus=len(ids_before),
+                        rc=failed.get("rc"),
+                    )
+                    self.mechanism.last_reset_exit_nonzero = failed.get("rc") not in (None, 0)
+                    self.mechanism.mesh_reset_failed_since_release = True
+                    metrics.stage_fired("smi_reset", "blocked")
+                    return OUTCOME_WAITING
+            recovered = await self._reset_and_verify_device(indices, log)
+            await self._note_mesh_reset_failed(recovered, "", ids_before, expected)
+            if not recovered:
                 return OUTCOME_WAITING
             self.deps.clear_device_reported_fault(f"gate/{gate_phase}: reset recovered the mesh")
             self.deps.clear_device_dirty(verified=True, why=f"gate/{gate_phase}: reset recovered the mesh")
@@ -1860,7 +1886,8 @@ class GalaxyRecovery(Recovery):
             offbus_chips,
             expected,
             tray_map,
-            mesh_reset_failed=self.mechanism.mesh_reset_failed_since_release,
+            mesh_reset_failed=self.mechanism.mesh_reset_failed_this_boot(offbus_chips)
+            or self.mechanism.broker_cycled_this_episode(),
         )
         if fault_class is not None and not await asyncio.to_thread(self.mechanism.scope_active):
             # Spec 04 I37: the sweep's tray re-power and mesh reset have not healed this class (a
@@ -1872,6 +1899,24 @@ class GalaxyRecovery(Recovery):
                 "last_chance_sweep_skipped",
                 context=context or gate_phase,
                 fault_class=fault_class,
+                off_bus=len(offbus_chips),
+                expected=expected,
+            )
+            return False
+        if (
+            offbus_chips
+            and self.mechanism.rung_failed_unchanged("", "mesh_reset", offbus_chips)
+            and not await asyncio.to_thread(self.mechanism.scope_active)
+        ):
+            # Spec 04 I58: this boot's mesh reset already ran and failed on exactly these chips, so the
+            # sweep would end in the same reset again, which measures nothing new. Climb.
+            log(
+                f"last chance before the host rung{where}: the mesh reset already failed on these chips this boot — skipping the sweep"
+            )
+            health_event(
+                "last_chance_sweep_skipped",
+                context=context or gate_phase,
+                reason="mesh_reset_failed_unchanged",
                 off_bus=len(offbus_chips),
                 expected=expected,
             )
@@ -2150,9 +2195,8 @@ class GalaxyRecovery(Recovery):
             # but a forced window takes the next stronger rung, never the same reset (spec 04 I36).
             await self._climb_past_failed_rung(expected, ids_before, hold_since, log)
             return True
-        stamp = self.mechanism.last_reset_monotonic
         recovered = await self._reset_and_verify_device(indices, log)
-        await self._note_mesh_reset_failed(recovered, stamp, hold_since, ids_before, expected)
+        await self._note_mesh_reset_failed(recovered, hold_since, ids_before, expected)
         if recovered is None:
             # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, and its
             # passes already count toward the relift's bound (spec 03 I40), so the next relift gates on
@@ -2668,9 +2712,8 @@ class GalaxyRecovery(Recovery):
             beats_before = await asyncio.to_thread(self.deps.read_heartbeats)
             off_bus_before = offbus_count(beats_before, expected)
         ids_before = await self._offbus_ids_now(expected)
-        stamp = self.mechanism.last_reset_monotonic
         recovered = await self._reset_and_verify_device(indices, log)
-        await self._note_mesh_reset_failed(recovered, stamp, hold_since, ids_before, expected)
+        await self._note_mesh_reset_failed(recovered, hold_since, ids_before, expected)
         if recovered is None:
             # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, which the
             # idle relift re-checks within its bound (spec 03 I40). Nothing measured a failure to climb on.
@@ -2687,13 +2730,16 @@ class GalaxyRecovery(Recovery):
         return True
 
     async def _note_mesh_reset_failed(
-        self, recovered: Optional[bool], stamp: float, hold_since: str, ids_before: Optional[set], expected: int
+        self, recovered: Optional[bool], hold_since: str, ids_before: Optional[set], expected: int
     ) -> None:
-        """Record a mesh reset that RAN and failed (spec 04 I36). A reset the host gate or an outage
-        hold refused never stamps the reset clock: it did not happen, so it is not a failed rung."""
-        if recovered is False and self.mechanism.last_reset_monotonic != stamp:
+        """Record a mesh reset that RAN and failed in this boot's record, on disk before any next rung
+        (spec 04 I36, I58). Only a launched reset counts (``last_reset_rc`` set): one the host gate or an
+        outage hold refused, or one still cycling at its timeout, did not fail here. The reset clock
+        cannot tell, since it is stamped before launch."""
+        rc = self.mechanism.last_reset_rc
+        if recovered is False and rc is not None:
             ids_after = await self._offbus_ids_now(expected)
-            self.mechanism.note_rung_failed(hold_since, "mesh_reset", ids_before, ids_after)
+            self.mechanism.note_rung_failed(hold_since, "mesh_reset", ids_before, ids_after, rc=rc)
 
     async def _climb_past_failed_rung(self, expected: int, ids_now: set, hold_since: str, log) -> None:
         """Skip a reset that already failed in this hold episode on the same off-bus set and take the

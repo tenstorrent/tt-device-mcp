@@ -57,6 +57,8 @@ def g8(monkeypatch, tmp_path):
 
 
 def _verify_g7():
+    # A verified release ends the I65 backoff streak and stamps the proof, as _clear_device_dirty does.
+    srv.recovery_mechanism.note_mesh_verified(now_epoch=G7_VERIFIED)
     srv.recovery_mechanism.record_verified_release("gate/startup", now_epoch=G7_VERIFIED)
 
 
