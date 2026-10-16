@@ -258,7 +258,10 @@ def test_the_restart_still_comes_after_the_last_look():
 def test_each_decision_line_has_time_both_shas_and_a_reason(tmp_path):
     done, trace, log = _gate(tmp_path, health=[_health(held=True, age=60)])
     line = log[0]
-    m = re.match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}) decision=deferred branch=main old=(\w+) new=(\w+) reason=(.+)$", line)
+    m = re.match(
+        r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}) decision=deferred branch=main old=(\w+) new=(\w+) reason=(.+)$",
+        line,
+    )
     assert m, line
     assert m.group(2) == _OLD and m.group(3) == _NEW and "broker recovery in progress" in m.group(4)
     # The same line goes to the journal under a stable tag.
