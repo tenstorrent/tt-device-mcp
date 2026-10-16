@@ -154,6 +154,7 @@ from tt_device_mcp.health import (
     read_health_events,
     read_heartbeats,
     refuse_mesh_reset,
+    sysfs_chip_ids,
     version_floor_warnings,
 )
 from tt_device_mcp.health import (
@@ -6199,6 +6200,14 @@ def _slurm_step_verdict(*, require_free: bool) -> dict:
     }
 
 
+def _startup_pci_map() -> dict:
+    """``{chip index: PCI address}`` for every chip with a sysfs class node. Built from the
+    enumeration, not from heartbeat reads: a chip whose heartbeat cannot be read (e.g. after a
+    failed reset) still has a node and an address, and it is exactly the chip a bridge reset may
+    need to reach."""
+    return {i: chip_pci_bdf(i) for i in sysfs_chip_ids()}
+
+
 def _device_liveness_reason() -> str:
     """A chip off the PCIe bus RIGHT NOW, read live from one root-free sysfs sample — ''
     if none. Catches the two degraded states no in-memory flag records: a chip gone to
@@ -6213,6 +6222,9 @@ def _device_liveness_reason() -> str:
         return ""  # detector absent on this host — the in-memory signals still stand
     beats = read_heartbeats()
     if not beats:
+        listed = sysfs_chip_ids()
+        if listed:
+            return f"{len(listed)} chip(s) in sysfs, heartbeat unreadable on {len(listed)}"
         return "no chips exposed in sysfs (driver wedged or all chips off the bus)"
     dead = dead_chips(beats)
     if dead:
@@ -10094,7 +10106,14 @@ async def _record_startup_health() -> None:
             expected = health_monitor.expected(len(beats))
             verdict, detail, _ev = await asyncio.to_thread(heartbeat_verdict, expected)
             ok = verdict is Verdict.HEALTHY
-            health_event("startup_health", healthy=ok, present=len(beats), expected=expected, detail=detail)
+            health_event(
+                "startup_health",
+                healthy=ok,
+                present=len(beats),
+                in_sysfs=len(await asyncio.to_thread(sysfs_chip_ids)),
+                expected=expected,
+                detail=detail,
+            )
             write_action_log(
                 "[broker]startup",
                 f"device on broker start: {detail}",
@@ -12688,11 +12707,11 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
             f"kernel={env.get('kernel')} chips={len(chips)}"
         )
 
-    # Cache every chip's PCI address while they are all still answering. Once a chip is
+    # Cache every chip's PCI address while its sysfs entry is still there. Once a chip is
     # removed from the kernel its sysfs entry is gone, and with it the path to the bridge
     # that is the only way to reset it.
     global device_pci_map
-    device_pci_map = {i: chip_pci_bdf(i) for i in await asyncio.to_thread(read_heartbeats)}
+    device_pci_map = await asyncio.to_thread(_startup_pci_map)
     if logger:
         logger.info(
             f"HEALTH mapped {len(device_pci_map)} chips to PCI addresses "

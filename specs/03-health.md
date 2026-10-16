@@ -1022,7 +1022,13 @@ short-circuit per I9. Each probe returns a tri-state that maps onto an `Observat
   Two samples 0.5s apart; UNHEALTHY on empty sysfs, all-ones (off the bus), a short count against
   `expected`, a chip vanishing mid-probe, or a frozen counter. An over-count against a stale
   high-water mark is healthy. Skipped only where the driver never exposed the attribute
-  (`heartbeat_supported()`; `sysfs_absent` never latches the cache off).
+  (`heartbeat_supported()`; `sysfs_absent` and `attr_unreadable`, the counter present but no chip
+  answering it, never latch the cache off). A chip whose heartbeat read fails is left out of the
+  read but is still enumerated: the verdict names chips listed in sysfs with an unreadable
+  heartbeat (`N chip(s) in sysfs, heartbeat unreadable on M`) apart from an empty sysfs, and the
+  startup chip-index-to-PCI-address map the bridge rung uses is built from the class nodes
+  (`pci.sysfs_chip_ids()`), never from heartbeat reads
+  (`tests/test_heartbeat_unreadable.py`).
 - **pci/snapshot** (`HealthMonitor.verify_device_health`): read-only `tt-smi -s`; healthy only if
   the snapshot succeeds, ≥ `expected` chips enumerate, and every chip has a board_id and live
   telemetry. Board types are cached from this snapshot — the reset argv must never issue a
