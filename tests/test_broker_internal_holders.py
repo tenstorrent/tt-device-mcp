@@ -73,3 +73,11 @@ def test_registrations_expire():
     note_broker_internal(GONE, now=0.0)
     assert dh.is_broker_internal(GONE, now=1.0)
     assert not dh.is_broker_internal(GONE, now=dh.BROKER_INTERNAL_TTL_SEC + 1)
+
+
+def test_a_holder_without_a_scope_field_is_discounted_not_crashed():
+    """Duck-typed holders (no `scoped`) count as unscoped: a registered pid is dropped, no AttributeError."""
+    note_broker_internal(GONE)
+    h = type("H", (), {"uid": 0, "pid": GONE})()
+    out = discount_broker_internal(HolderScan(holders=[h], complete=True, source="driver"))
+    assert out.holders == []

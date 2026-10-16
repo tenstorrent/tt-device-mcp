@@ -58,6 +58,17 @@ def reset_post_reset_fabric_debt():
 
 
 @pytest.fixture(autouse=True)
+def reset_broker_internal_pids():
+    """Clear the broker-internal pid registry (spec 04 I59) around every test: a probe one test
+    spawned through run_probe must not discount a holder in the next."""
+    from tt_device_mcp import device_holders
+
+    device_holders._clear_broker_internal()
+    yield
+    device_holders._clear_broker_internal()
+
+
+@pytest.fixture(autouse=True)
 def isolate_process_globals():
     """Restore os.environ and sys.argv around every test.
 

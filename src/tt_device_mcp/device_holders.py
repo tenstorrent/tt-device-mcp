@@ -542,7 +542,7 @@ def discount_broker_internal(scan):
     gap_pids = getattr(scan, "gap_pids", None)
     if not _broker_internal or gap_pids is None or len(gap_pids) != len(scan.gaps):
         return scan
-    holders = [h for h in scan.holders if h.scoped or not is_broker_internal(h.pid)]
+    holders = [h for h in scan.holders if getattr(h, "scoped", False) or not is_broker_internal(h.pid)]
     kept = [(why, pid) for why, pid in zip(scan.gaps, gap_pids) if pid is None or not is_broker_internal(pid)]
     if len(holders) == len(scan.holders) and len(kept) == len(scan.gaps):
         return scan
