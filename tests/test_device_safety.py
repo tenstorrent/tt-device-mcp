@@ -31,6 +31,7 @@ from tt_device_mcp.health.core import HealthState, Verdict
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitors import eth, heartbeat, pci
 from tt_device_mcp.health.monitors.heartbeat import heartbeat_verdict, read_heartbeats
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
     BLOCKED,
     BRIDGE_RESET_MAX_TRIES,
@@ -7967,14 +7968,13 @@ async def test_galaxy_reset_floor_holds_a_zero_off_bus_wedge_but_needs_eth_to_li
 
 
 @pytest.mark.asyncio
-async def test_galaxy_reset_floor_hold_with_a_reported_fault_requires_eth_to_lift(
+async def test_galaxy_reset_floor_hold_with_a_reported_fault_needs_the_full_gate_to_lift(
     monkeypatch, tmp_path, clear_job_state
 ):
     """A genuine below-floor off-bus drop that ALSO carries a runtime-reported fault is a wedge the
     relift's enum+ARC read cannot confirm cleared: the chip returning to the bus is not proof the
-    eth/fabric wedge that faulted is gone. So the hold must require a confirmed-advancing eth heartbeat
-    to lift, never enum+ARC alone — otherwise the relift admits the next tenant onto a chip whose wedge
-    only the eth reader can rule out."""
+    eth/fabric wedge that faulted is gone. Its hold keeps the off-bus class, so it lifts only on the
+    full gate, fabric included (I52), never on enum+ARC alone and never on an eth heartbeat alone."""
     _reach_reboot_rung(monkeypatch, tmp_path, n_present=31)
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(31)})  # 1 off-bus
     resets = _count_galaxy_resets(monkeypatch)
@@ -7985,9 +7985,8 @@ async def test_galaxy_reset_floor_hold_with_a_reported_fault_requires_eth_to_lif
 
     assert resets["n"] == 0, "1 off-bus is below the floor — held, not reset"
     assert srv.fsm.state is not ServerState.HEALTHY, "the door holds for the next tenant"
-    assert (
-        srv.fsm.record.why == "eth_frozen"
-    ), "a fault-carrying hold must wait for an advancing eth heartbeat, not enum+ARC alone"
+    assert srv.fsm.record.why == "off_bus", "a chip off the bus keeps the off-bus class whatever the fault says"
+    assert srv.fsm.record.why in srv.OFFBUS_RECHECK_WHYS, "its lift must run the full gate, fabric included"
 
 
 @pytest.mark.asyncio
@@ -8834,6 +8833,159 @@ async def test_a_per_user_daemon_neither_arms_the_down_offbus_recheck_nor_gates_
 
     assert srv.fsm.state is ServerState.HEALTHY, "a per-user start hold must lift once the device reads healthy"
     assert True not in calls, "a per-user daemon has no fabric pass to run"
+
+
+# --- an off-bus return lifts only on the full gate, whatever path saw it come back (spec 03 I52) --
+#
+# A chip can come back with no broker-issued reset (no cached BDF, an external tray re-power, a
+# driver rescan), so no FABRIC_DEBT is owed. The pre-job gate never runs the fabric pass (03 I12), and
+# a reported fault used to tag the drop eth_frozen; either way the door reopened on enum+ARC alone.
+
+
+def _relift_verify(monkeypatch, fabric_ok):
+    calls = []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        calls.append(run_fabric)
+        return True, {"snapshot": {"ok": True}, **({"fabric": {"ok": fabric_ok}} if run_fabric else {})}
+
+    async def eth_advancing(timeout_sec=60.0):
+        return True, "advancing"
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_advancing)
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+    srv.last_relift_monotonic = 0.0
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("why", sorted(srv.OFFBUS_RECHECK_WHYS))
+async def test_the_prejob_gate_holds_an_offbus_return_for_the_full_gate(monkeypatch, tmp_path, clear_job_state, why):
+    """Spec 03 I52 + I12. Every chip is back, enum+ARC read healthy and no reset debt is owed: the
+    pre-job gate keeps the door shut without running the fabric pass, as a clean off_bus hold, and the
+    idle relift lifts it only on a fabric ok=True. (A dirty mark pre-job already holds, fabric-unverified.)
+    Fails on base, where the pre-job gate released it verified on enum+ARC."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    resets = _gate_with_verdict(monkeypatch, tmp_path, (True, {"snapshot": {"ok": True}}))
+    gate_calls = _relift_verify(monkeypatch, None)
+    fsm_healthy(srv)
+    fsm_dirty(srv, "gate/post-job: 2/32 chip(s) off the bus, below the reset floor — held", why=why, dirty=False)
+    monkeypatch.setattr(FABRIC_DEBT, "owed", "")
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", True, raising=False)
+
+    await srv._device_health_gate(None, phase="pre-job", run_fabric=False)
+
+    assert True not in gate_calls, "the pre-job gate ran the fabric pass on the submitter's clock (03 I12)"
+    assert resets["n"] == 0
+    assert srv.fsm.state is ServerState.RECOVERING, "released an off-bus return with no fabric pass"
+    assert srv.fsm.record.why == "off_bus" and not srv.fsm.record.dirty, "not the hold the idle relift lifts"
+
+    unverified = _relift_verify(monkeypatch, None)
+    await srv._attempt_idle_relift()
+    assert unverified == [False, True], "the relift's full gate must run the fabric pass"
+    assert srv.fsm.state is ServerState.RECOVERING, "lifted on a fabric pass that could not verify"
+
+    passed = _relift_verify(monkeypatch, True)
+    await srv._attempt_idle_relift()
+    assert True in passed
+    assert srv.fsm.state is ServerState.HEALTHY, "the full gate passed but the hold did not lift"
+
+
+def _gate_offbus_hold_with_reported_fault(monkeypatch, tmp_path):
+    """Run the post-job gate with a runtime-reported fault and 2 of 32 chips off the bus (below the
+    reset floor) and return once it placed its hold."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=30)
+    _gate_with_verdict(monkeypatch, tmp_path, (False, {"snapshot": {"ok": False, "detail": "30 chips"}}))
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(30)})
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "device_pci_map", {})
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")
+    monkeypatch.setattr(srv, "device_fault_reported", "job 031 waiting for active ethernet core")
+    monkeypatch.setattr(FABRIC_DEBT, "owed", "")
+    fsm_healthy(srv)
+    srv._mark_device_dirty("job 031 waiting for active ethernet core")
+
+
+def _chips_back(monkeypatch, tmp_path):
+    for i in range(32):
+        (tmp_path / str(i)).write_text("")
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(32)})
+
+
+@pytest.mark.asyncio
+async def test_an_offbus_hold_with_a_reported_fault_lifts_only_on_the_full_gate(monkeypatch, tmp_path, clear_job_state):
+    """Spec 03 I52. A drop the runtime also reported a fault for is still an off-bus hold, so its lift
+    runs the full gate, fabric included, not just enum+ARC and an advancing eth heartbeat. Fails on
+    base, which tagged it eth_frozen and lifted it with no fabric pass."""
+    _gate_offbus_hold_with_reported_fault(monkeypatch, tmp_path)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert srv.fsm.record.why == "off_bus", "an off-bus drop was tagged as a present-mesh eth freeze"
+
+    _chips_back(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None, raising=False)
+    unverified = _relift_verify(monkeypatch, None)
+    await srv._attempt_idle_relift()
+    assert True in unverified, "the relift's full gate must run the fabric pass"
+    assert srv.fsm.state is ServerState.RECOVERING, "lifted on a fabric pass that could not verify"
+
+    passed = _relift_verify(monkeypatch, True)
+    await srv._attempt_idle_relift()
+    assert True in passed
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_down_episode_of_a_reported_fault_offbus_hold_is_rechecked(monkeypatch, tmp_path, clear_job_state):
+    """Spec 03 I52, goal of a bounded recovery: the same hold gone DOWN is re-checked once every chip
+    is back, and lifts on the full gate's pass. Fails on base, whose eth_frozen tag kept it out of the
+    DOWN off-bus re-check, so it stood until an operator or a restart."""
+    _gate_offbus_hold_with_reported_fault(monkeypatch, tmp_path)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    srv.fsm.on_outcome(OUTCOME_TERMINAL)
+    assert srv.fsm.state is ServerState.DOWN
+
+    _chips_back(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "_down_offbus_recheck_monotonic", 0.0)
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda *a: False)
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+    calls = _recording_verify(monkeypatch, True)
+    assert srv._down_offbus_recheck_armed()
+
+    await srv._attempt_down_offbus_recheck()
+
+    assert calls == [True], "one full gate, fabric included"
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_fabric_ok", [None, True])
+async def test_a_carried_eth_frozen_offbus_hold_lifts_only_on_the_full_gate(
+    monkeypatch, tmp_path, clear_job_state, last_fabric_ok
+):
+    """Spec 03 I52. An episode tagged eth_frozen by an older broker whose detail names chips off the
+    bus still owes the full gate: an advancing eth heartbeat alone does not lift it. Fails on base."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    fsm_healthy(srv)
+    srv._hold_device_unverified(
+        "gate/post-job: 1/32 chip(s) off the bus, below the reset floor — held for self-heal, not reset",
+        needs_eth_advancing=True,
+    )
+    assert srv.fsm.record.why == "eth_frozen"
+    monkeypatch.setattr(FABRIC_DEBT, "owed", "")
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", last_fabric_ok, raising=False)
+
+    unverified = _relift_verify(monkeypatch, None)
+    await srv._attempt_idle_relift()
+    assert True in unverified, "the relift's full gate must run the fabric pass"
+    assert srv.fsm.state is ServerState.RECOVERING
+
+    passed = _relift_verify(monkeypatch, True)
+    await srv._attempt_idle_relift()
+    assert True in passed
+    assert srv.fsm.state is ServerState.HEALTHY
 
 
 @pytest.mark.asyncio
