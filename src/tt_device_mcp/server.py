@@ -3022,6 +3022,9 @@ def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> b
         # Only proof retires it, whatever the device was flagged for — dirty or held.
         fsm.on_readings(_healthy_reading())
         _forget_stale_hold_episode()  # e.g. the startup gate: a clock left by a dead broker is over
+        # A passing full check (fabric included, the debt above) after a power cycle ends its
+        # backoff streak and any cooldown retry (spec 04 I65).
+        recovery_mechanism.note_mesh_verified()
     elif was_degraded:
         # Not proven fit, and nothing here names a new fault class — keep the open episode's own
         # why, just reword the detail and drop the dirty bit: dropping the flag ends the RESETTING
@@ -5981,6 +5984,18 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         handoff = offbus_power_cycle.hold_handoff_status(episode, now.timestamp() if now else None)
         if handoff is not None:
             payload["operator_handoff"] = handoff  # spec 04 I33: who must act on the hold, and by when
+        # Spec 04 I65: a power cycle the cooldown holds off, and the moment it is asked again.
+        cooldown = recovery_mechanism.power_cycle_cooldown_state
+        now_epoch = now.timestamp() if now else time.time()
+        if cooldown is not None and now_epoch < cooldown["until"]:
+            payload["power_cycle_cooldown"] = {
+                "escalation_stage": "power-cycle",
+                "next_deadline": datetime.fromtimestamp(cooldown["until"]).isoformat(timespec="seconds"),
+                "last_cycle_or_boot": datetime.fromtimestamp(cooldown["last"]).isoformat(timespec="seconds"),
+                "cause": cooldown["cause"],
+                "interval_sec": cooldown["interval_sec"],
+                "why": cooldown["why"],
+            }
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
     return payload
@@ -6350,6 +6365,21 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             device_hold_escalation_trigger = f"the {offbus_power_cycle.grace_sec()}s gated off-bus grace"
         if _maybe_spawn_forced_escalation():
             offbus_power_cycle.mark_spawned(device_hold_episode_since)
+    # Spec 04 I65: a power cycle the cooldown denied is asked again the moment the cooldown ends, not
+    # at the next ceiling window. Once per denial: the retry is cleared when the climb starts, and the
+    # governor sets it again if that ask is denied too.
+    retry = recovery_mechanism.power_cycle_retry
+    now_epoch = now.timestamp() if now else time.time()
+    if (
+        not only_77
+        and retry is not None
+        and retry[1] in (device_hold_episode_since, None, "")
+        and now_epoch >= retry[0]
+    ):
+        device_hold_escalation_kind = "power_cycle_cooldown"
+        device_hold_escalation_trigger = "the end of the power-cycle cooldown"
+        if _maybe_spawn_forced_escalation():
+            recovery_mechanism.power_cycle_retry = None
     if only_77:
         pass
     elif isolated_chips and not device_hold_offbus_escalated and age >= _offbus_hold_ceiling_sec():

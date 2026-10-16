@@ -290,6 +290,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC` | 1200 | With no `TT_DEVICE_MCP_POWER_CYCLE_CMD`, how long a gated off-bus hold stands for an operator, from the episode start, before the broker lifts the `hold` gate for one pass of its own reset ladder (I33); `off` keeps the hold for an operator | 04 |
 | `TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC` | 300 | How long after an off-bus hold's per-tray reset walk failed to recover the mesh (or regressed it) before the I27 power cycle may run; no below-floor mesh reset runs in between | 04 |
 | `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` | 21600 | At most one I27 attempt per this many seconds per host; within it the broker pages instead | 04 |
+| `TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE` | unset | Read-only: a JSON-lines file of power cycles an external cycler fired (`at_epoch`, optional `cause`); its latest record is one more anchor of the I65 power-cycle cooldown. Unset or unreadable adds none; it never shortens or skips the cooldown | 04 |
 | `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC` | 1800 | How long past the grace a tenant, a reset scope or a stand-back may block the I27 power cycle before the broker pages once | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE` | unset | `:`-separated marker paths; any that exists holds the I27 power cycle | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD` | unset | Command; exit 0 holds the I27 power cycle, 1 clears, anything else holds | 04 |

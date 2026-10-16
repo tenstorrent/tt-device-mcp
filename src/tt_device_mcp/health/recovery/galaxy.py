@@ -354,8 +354,9 @@ def _power_cycle_direct_class(
 ) -> Optional[str]:
     """The I37 fault class of an off-bus set, or None when the ordinary ladder applies.
 
-    ``FAULT_CLASS_ALL_OFF`` when every chip is off the bus and a mesh reset already ran and failed
-    since the mesh was last released. A whole-bus drop with no failed reset gets its one mesh reset
+    ``FAULT_CLASS_ALL_OFF`` when every chip is off the bus and ``mesh_reset_failed``: a mesh reset
+    already ran and failed on it, or the broker's own reboot or power cycle for this fault did not
+    bring it back (the callers pass both, spec 04 I37). A whole-bus drop with no failed reset gets its one mesh reset
     first, at the startup gate as at run time: the startup gate also runs after a broker restart, and
     one mesh reset has brought a whole bus back there. ``FAULT_CLASS_WHOLE_TRAY`` when the set is
     exactly one or more whole trays and at least one chip of the mesh is still on the bus. Anything else — a partial-tray drop, a single
@@ -1198,7 +1199,8 @@ class GalaxyRecovery(Recovery):
             offbus,
             expected,
             self._tray_map_now(),
-            mesh_reset_failed=self.mechanism.mesh_reset_failed_this_boot(offbus),
+            mesh_reset_failed=self.mechanism.mesh_reset_failed_this_boot(offbus)
+            or self.mechanism.broker_cycled_this_episode(),
         )
         if fault_class is None:
             return None
@@ -1839,7 +1841,8 @@ class GalaxyRecovery(Recovery):
             offbus_chips,
             expected,
             tray_map,
-            mesh_reset_failed=self.mechanism.mesh_reset_failed_this_boot(offbus_chips),
+            mesh_reset_failed=self.mechanism.mesh_reset_failed_this_boot(offbus_chips)
+            or self.mechanism.broker_cycled_this_episode(),
         )
         if fault_class is not None and not await asyncio.to_thread(self.mechanism.scope_active):
             # Spec 04 I37: the sweep's tray re-power and mesh reset have not healed this class (a

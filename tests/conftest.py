@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -44,6 +45,14 @@ from tt_device_mcp.server import (
 # aliases are the seams almost every test monkeypatches. probe_platform stays off: a test that
 # cares about the platform declares TT_DEVICE_MCP_RESET_MODE or drives resolve_platform itself.
 srv.boot_broker()
+
+
+@pytest.fixture(autouse=True)
+def old_host_boot(monkeypatch):
+    """Pin this host's boot time to a day ago around every test: the power-cycle cooldown counts from
+    the host's boot (spec 04 I65), and a suite run soon after the runner's own reboot must not see
+    every power cycle in cooldown. A test that needs another boot patches ``srv._boot_btime_id``."""
+    monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int(time.time()) - 86400))
 
 
 @pytest.fixture(autouse=True)
