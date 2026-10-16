@@ -405,6 +405,12 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv, "device_op_active", "")
     monkeypatch.setattr(srv, "device_op_detail", "")
     monkeypatch.setattr(srv, "device_op_owner", "[broker]", raising=False)
+    # A runner test cancelled mid-job never reaches the runner's own cleanup, so the dispatched
+    # job's id stays current; a re-adopt test can leave its scope behind the same way. Either one
+    # makes the next test's device look busy (_broker_work_in_flight refuses every step).
+    monkeypatch.setattr(srv, "current_job_id", None)
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "readopted_scopes", {})
     # The device-op mutex is created once and binds to the creating test's event loop; a later
     # test on its own loop acquiring the stale lock raises "bound to a different event loop".
     # Fresh per test, so anything running under _device_op (the startup probe included) is safe.
@@ -430,6 +436,10 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # test tripping it does not silence the next test's expected held event. raising=False
     # so a tree without the attribute yet (a fails-on-base stash) still sets up cleanly.
     monkeypatch.setattr(srv, "device_hold_logged", False, raising=False)
+    # A window given back on a tenant deferral keeps the next forced spawn checking for the tenant
+    # first; a leaked flag would make the next test's escalation stand down on its own stub scan.
+    monkeypatch.setattr(srv, "device_hold_tenant_deferred", False, raising=False)
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_deferred", False, raising=False)
     # A carried-over hold one startup test armed must not tag the next test's device_held.
     monkeypatch.setattr(srv, "_carried_hold", None, raising=False)
     # The idle escalation's and the per-tray BMC reset's once-per-episode latches are per-episode
