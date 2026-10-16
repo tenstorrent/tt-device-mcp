@@ -1,4 +1,4 @@
-"""The hold reason and /health say where a held device's escalation stands (spec 03 I55).
+"""The hold reason and /health say where a held device's escalation stands (spec 03 I59).
 
 A below-floor off-bus hold opens with "held for self-heal, not reset", and the hold watchdog then
 climbs the off-bus one-shot, the power-cycle grace and the ceiling windows underneath it. Without
@@ -183,7 +183,7 @@ async def test_a_forced_pass_updates_the_reason_and_keeps_the_hold(monkeypatch, 
     assert payload["held_reason"] != before
 
 
-# --- /health stays held while a broker op runs inside a hold (spec 03 I56) ----------------------
+# --- /health stays held while a broker op runs inside a hold (spec 03 I60) ----------------------
 
 
 def test_health_stays_held_while_a_forced_rung_runs(held, monkeypatch):
