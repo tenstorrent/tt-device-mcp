@@ -988,6 +988,10 @@ device_hold_escalate_bucket: int = 0
 # One early forced escalation per off-bus episode, tracked apart from the ceiling windows so it adds
 # an attempt rather than consuming one (see _offbus_hold_ceiling_sec).
 device_hold_offbus_escalated: bool = False
+# Whether the window above was given back because its forced run stood down on a live tenant (spec 04
+# I7): the next spawn first checks the tenant is gone, quietly, so a long tenant hold does not open a
+# device op, a timeline event and a log line every sampler tick (see _rearm_tenant_deferred_window).
+device_hold_tenant_deferred: bool = False
 # Whether a tenant job held past TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC already forced the recovery ladder
 # this episode (see _escalate_held_job_past_bound): once per episode, like the off-bus one-shot.
 device_hold_job_bound_escalated: bool = False
@@ -6116,6 +6120,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global device_hold_deadline_bucket, device_hold_escalate_bucket
     global device_hold_offbus_escalated, device_hold_alert_next_bucket, device_hold_alert_gap
+    global device_hold_tenant_deferred
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
     global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold
     if reason and not device_hold_logged:
@@ -6208,6 +6213,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_escalate_bucket = 0
         # ...and its own early off-bus attempt.
         device_hold_offbus_escalated = False
+        device_hold_tenant_deferred = False
         # ...and its held-job bound's attempt.
         device_hold_job_bound_escalated = False
         # A new episode gets its own single escalation and its own single per-tray BMC reset — the
@@ -6235,10 +6241,16 @@ async def _force_escalate_stuck_hold() -> None:
     rung. The only guards kept are a reset already cycling (never double-reset), a real readable tenant,
     and the host rungs' own boot-loop rate limiter. Fired once per ceiling window until recovery."""
 
+    global device_hold_tenant_deferred
+
     def log(msg: str) -> None:
         if logger:
             logger.error(f"HOLD-DEADLINE-ESCALATE {msg}")
 
+    kind = device_hold_escalation_kind  # the window this run claimed; the sampler may rewrite the global
+    if device_hold_tenant_deferred and await asyncio.to_thread(galaxy_recovery.tenant_holds):
+        _rearm_tenant_deferred_window(kind)  # still there: stay armed for the next tick, quietly
+        return
     async with _device_op("hold-deadline-escalate"):
         if await asyncio.to_thread(recovery_mechanism.scope_active):
             return
@@ -6306,10 +6318,29 @@ async def _force_escalate_stuck_hold() -> None:
         # base escalate() that always reports WAITING — these teeth silently bite nothing, and the
         # hold outlives every ceiling with no rung ever attempted.
         _void_fabric_ok("hold escalation")
+        device_hold_tenant_deferred = False
         outcome = await galaxy_recovery.escalate(
             "offbus-forced" if off_bus > 0 else "present-forced", indices, expected, log
         )
         _fold_rung_outcome(outcome, log)
+        if outcome == OUTCOME_WAITING and galaxy_recovery.tenant_deferred and _rearm_tenant_deferred_window(kind):
+            log(f"{kind} re-armed: it runs on the first sampler tick with no tenant, not at the next window")
+
+
+def _rearm_tenant_deferred_window(kind: str) -> bool:
+    """Give back the watchdog window a forced run claimed when it stood down on a live tenant and ran
+    no rung (spec 03 I23): the next idle sampler tick retries it. Spending it left an off-bus hold
+    waiting out the whole general ceiling once the tenant had gone. Only the one-shot and the ceiling
+    windows are given back; the other kinds keep their own once-per-episode bookkeeping."""
+    global device_hold_offbus_escalated, device_hold_escalate_bucket, device_hold_tenant_deferred
+    if kind == "offbus_one_shot":
+        device_hold_offbus_escalated = False
+    elif kind == "ceiling_window":
+        device_hold_escalate_bucket = max(0, device_hold_escalate_bucket - 1)
+    else:
+        return False
+    device_hold_tenant_deferred = True
+    return True
 
 
 def _hold_without_reset(cause: str, expected: int, log) -> None:
@@ -6483,6 +6514,9 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         device_hold_escalation_trigger = f"the {int(_offbus_hold_ceiling_sec())}s off-bus one-shot"
         if _maybe_spawn_forced_escalation():
             device_hold_offbus_escalated = True
+            # A one-shot that waited out a tenant past the ceiling is that window's run as well: one
+            # forced climb, not two back to back.
+            device_hold_escalate_bucket = max(device_hold_escalate_bucket, int(age // ceiling))
     else:
         # The old risky-reset floor window (a separate forced run partway to the ceiling) is gone
         # (ladder-v2): the below-floor mesh reset no longer waits, so the general ceiling window is

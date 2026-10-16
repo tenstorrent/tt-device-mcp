@@ -7,6 +7,8 @@ Every reset path settles through ``_clear_device_dirty(verified=True)``; while a
 pass, that funnel holds the device fabric-unverified instead of releasing it.
 """
 
+from datetime import datetime, timedelta
+
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
@@ -19,7 +21,7 @@ from tests.test_device_safety import (
 )
 from tests.test_startup_fabric_hugepages import _bound
 from tt_device_mcp import server as srv
-from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import post_reset
 from tt_device_mcp.health import recovery as recovery_pkg
@@ -244,6 +246,67 @@ async def test_the_idle_off_bus_bridge_reset(mesh, monkeypatch, verdict):
     _verify_returning(monkeypatch, evidence)
     assert await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None) is True
     _assert_settled(released)
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_deferred_off_bus_one_shot_runs_on_the_next_idle_tick(mesh, monkeypatch, verdict):
+    """Spec 03 I23: the off-bus one-shot that stood down on a live tenant is given back, not spent. The
+    first sampler tick with no tenant runs it, and its reset still releases only through the full
+    post-reset check, fabric included (spec 04 I32). Spending it left a one-chip drop held until the
+    general ceiling window, eight minutes after the tenant had gone."""
+    evidence, released = verdict
+    _arm_offbus_stuck_hold(monkeypatch, isolated={"8"})
+    patch_health_event(monkeypatch, lambda kind, **f: mesh.append((kind, f)))
+    monkeypatch.setattr(srv, "_clear_device_dirty", _REAL_CLEAR_DIRTY)
+    fsm_dirty(srv, "gate/post-job: 1/32 off-bus below the reset floor", why="job_killed")
+    monkeypatch.setattr(srv, "device_op_lock", None)  # bind a fresh lock to this test's loop
+    monkeypatch.setattr(srv, "_forced_escalation_task", None)
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    tenant = HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True)
+    scan = {"now": tenant}
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scan["now"])
+    bridges = []
+
+    async def bridge(log):
+        bridges.append("8")
+        FABRIC_DEBT.note_reset("bridge reset of chip 8")
+        return True
+
+    patch_recovery(monkeypatch, "_recover_isolated_chips", bridge)
+    calls = []
+    _verify_returning(monkeypatch, evidence, calls)
+    since = datetime.fromisoformat(srv.device_hold_episode_since)
+    one_shot = srv._offbus_hold_ceiling_sec()
+
+    def count(kind):
+        return sum(k == kind for k, _ in mesh)
+
+    async def tick(sec):
+        srv._check_hold_deadline(now=since + timedelta(seconds=sec))
+        if srv._forced_escalation_task is not None:
+            await srv._forced_escalation_task
+
+    await tick(one_shot + 1)
+    assert count("hold_deadline_forced_escalation") == 1 and bridges == []
+    assert srv.device_hold_offbus_escalated is False, "a run that stood down on a tenant spent the one-shot"
+
+    await tick(one_shot + 11)  # the tenant is still there
+    assert bridges == [] and count("hold_deadline_forced_escalation") == 1
+    assert count("device_op_begin") == 1, "a retry under a live tenant must check it quietly, not open a device op"
+    assert srv.device_hold_offbus_escalated is False
+
+    scan["now"] = HolderScan(holders=[], complete=True)
+    await tick(one_shot + 21)
+    assert bridges == ["8"], "the first idle tick must run the deferred one-shot"
+    assert count("hold_deadline_forced_escalation") == 2
+    assert srv.device_hold_offbus_escalated is True and srv.device_hold_tenant_deferred is False
+    assert calls and all(calls), "the retried run's post-reset verify skipped the fabric pass"
+    if released:
+        _assert_settled(released)
+    else:  # the forced climb may leave it DOWN, but never released over an unproven fabric
+        assert srv.fsm.state is not ServerState.HEALTHY and FABRIC_DEBT.owed == "bridge reset of chip 8"
+        assert count("post_reset_release_refused") == 1
 
 
 @pytest.mark.asyncio
