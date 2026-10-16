@@ -577,6 +577,25 @@ async def test_check_timeout_returns_none_rc():
     assert rc is None
 
 
+@pytest.mark.asyncio
+async def test_run_probe_reaps_its_timed_out_child_before_returning():
+    """A reader killed on its timeout is waited on (``reap_sec``) until it has exited, so a holder
+    scan run right after does not find its pid still listed by the driver (spec 04 I7)."""
+    from tt_device_mcp.health.monitors.subproc import run_probe
+
+    procs = []
+    rc, _ = await run_probe(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        timeout_sec=0.2,
+        track=lambda p: p is not None and procs.append(p),
+        stream=False,
+        env={**os.environ},
+        reap_sec=2,
+    )
+    assert rc is None
+    assert procs and procs[0].returncode is not None, "the killed reader was not reaped"
+
+
 # --- end-to-end: build() -> check() -> classify_exit(), the whole retired wrapper's job -------
 
 
