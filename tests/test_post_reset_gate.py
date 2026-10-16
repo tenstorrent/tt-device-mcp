@@ -309,6 +309,46 @@ async def test_a_tenant_deferred_off_bus_one_shot_runs_on_the_next_idle_tick(mes
         assert count("post_reset_release_refused") == 1
 
 
+@pytest.mark.parametrize("given_back", [True, False], ids=["given-back", "spent"])
+def test_a_given_back_one_shot_gives_back_the_ceiling_window_it_claimed(monkeypatch, given_back):
+    """Spec 03 I23: a one-shot that waited out a tenant past the ceiling claims that ceiling window as
+    its own run. Given back (it stood down on the tenant), the window goes back with it: when the chips
+    return meanwhile (no one-shot left to retry), the ceiling window runs on the next tick, not one
+    whole window (600 s) later. A one-shot that ran keeps the claim: one forced climb, not two."""
+    spawned = []
+    monkeypatch.setattr(srv, "health_event", lambda kind, **f: None)
+    monkeypatch.setattr(
+        srv, "_maybe_spawn_forced_escalation", lambda: spawned.append(srv.device_hold_escalation_kind) or True
+    )
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
+    monkeypatch.setattr(srv, "device_hold_offbus_prior_bucket", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
+    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
+    srv.fsm.set_latch("escalated", False)
+    monkeypatch.setattr(srv, "isolated_chips", {"13"})
+    monkeypatch.setattr(srv, "device_hold_episode_reason", "chip(s) 13 left the PCIe bus")
+    since = datetime(2026, 10, 15, 18, 43, 41)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 50))  # the tenant held it past the ceiling
+    assert spawned == ["offbus_one_shot"] and srv.device_hold_escalate_bucket == 1
+    if given_back:
+        assert srv._rearm_tenant_deferred_window("offbus_one_shot")
+    monkeypatch.setattr(srv, "isolated_chips", set())  # the chip came back; the hold stays
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 60))
+    if given_back:
+        assert spawned == ["offbus_one_shot", "ceiling_window"], "the given-back window must run now"
+        assert srv.device_hold_escalate_bucket == 1
+    else:
+        assert spawned == ["offbus_one_shot"], "the one-shot that ran is window 1's run"
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 70))
+    assert len(spawned) == (2 if given_back else 1), "one forced run per window"
+
+
 @pytest.mark.asyncio
 async def test_the_measured_fabric_failure_reset_on_the_first_relift(mesh, monkeypatch, tmp_path, verdict):
     """Spec 03 I56: a post-job hold on a measured fabric FAIL resets on the first idle relift, with no
