@@ -158,7 +158,13 @@ class AiclkCeiling:
     ) -> tuple[Optional[int], str]:
         try:
             rc, out = await run_probe(
-                argv, timeout_sec=timeout, track=self._track, stream=True, env=env, terminate=terminate
+                argv,
+                timeout_sec=timeout,
+                track=self._track,
+                stream=True,
+                env=env,
+                terminate=terminate,
+                name="aiclk-ceiling",
             )
         except Exception as e:  # noqa: BLE001 - a helper that cannot start is a host config fault
             rc, out = UNSUPPORTED_RC, f"could not start the helper: {e}".encode()

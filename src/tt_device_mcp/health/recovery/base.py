@@ -65,6 +65,10 @@ AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
 # unreadable-ledger fail-closed below are untouched — they remain the boot-loop denial. Default
 # 1800s (30 min); TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC overrides.
 POWER_CYCLE_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC", "1800"))
+# A power cycle that interval ALONE refused is retried this many seconds after the interval ends, by
+# the hold-deadline watchdog (power_cycle_retry_due), rather than at its next ceiling window — which
+# can land up to a whole window after the cap expired.
+POWER_CYCLE_RETRY_SLACK_SEC = 5
 
 # A host reboot or power cycle the broker has requested takes the box down, and an external cycler
 # (a POWER_CYCLE_CMD wrapper) may run it some time after the request returns. A device reset the
@@ -275,6 +279,12 @@ class RecoveryMechanism:
         # made the drop worse — one Galaxy host went 4 -> 31 -> 32 off-bus across three — so the episode
         # goes straight to the host rung, or pages when none is opted in (spec 04 I31).
         self.regressed_reset_since: Optional[str] = None
+        # The hold episode (its ``since``) whose reset rungs failed, and per rung the off-bus set it
+        # failed with when it left that set unchanged. Firing it again on the same set measures nothing
+        # new (one Galaxy host ran six identical 263 s mesh resets in one hold, one per forced window),
+        # so the next window takes the next stronger rung instead (spec 04 I36).
+        self.failed_rungs_since: str = ""
+        self.failed_rungs: dict = {}
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a
@@ -298,6 +308,9 @@ class RecoveryMechanism:
         # ladder is blocked / exhausted" event to once per episode instead of every gate pass on a
         # held box.
         self._auto_recovery_denied_episode = ""
+        # (hold episode, epoch) at which a power cycle refused only by its min interval may run again;
+        # ("", 0.0) when none is pending. Read by the hold-deadline watchdog.
+        self._power_cycle_retry: tuple[str, float] = ("", 0.0)
 
         # The host-level action (reboot / power-cycle) last requested and when (monotonic). Set once
         # its record is on disk, cleared if it fails to launch; read by the hold watchdog, which
@@ -338,6 +351,26 @@ class RecoveryMechanism:
         reset on it is not tried (spec 04 I31)."""
         latched = self.regressed_reset_since
         return latched is not None and (latched == "*" or latched == hold_since)
+
+    def note_rung_failed(self, hold_since: str, rung: str, off_before, off_after) -> None:
+        """Record that ``rung`` failed in this hold episode (spec 04 I36). Only a failure that left the
+        off-bus set exactly as it found it is kept: a set that grew is a regression (I31) and one that
+        shrank is progress another try may finish."""
+        if not hold_since:
+            return
+        if self.failed_rungs_since != hold_since:
+            self.failed_rungs_since, self.failed_rungs = hold_since, {}
+        if off_before is not None and off_after is not None and set(off_before) == set(off_after):
+            self.failed_rungs[rung] = frozenset(off_after)
+        else:
+            self.failed_rungs.pop(rung, None)
+
+    def rung_failed_unchanged(self, hold_since: str, rung: str, off_now) -> bool:
+        """True when ``rung`` already failed in this hold episode on exactly the off-bus set seen now:
+        it is not fired again in the episode (spec 04 I36)."""
+        if not hold_since or off_now is None or self.failed_rungs_since != hold_since:
+            return False
+        return self.failed_rungs.get(rung) == frozenset(off_now)
 
     def _local_reset_lock_path(self) -> Path:
         return self._local_reset_dir() / LOCAL_RESET_LOCK
@@ -870,6 +903,8 @@ class RecoveryMechanism:
         # action by the general loop-guard interval. For a power cycle rank==2 gates only prior
         # power cycles, so this interval is exactly "30 min between power cycles".
         min_interval = POWER_CYCLE_MIN_INTERVAL_SEC if action == "power-cycle" else AUTO_RECOVERY_MIN_INTERVAL_SEC
+        interval_why = ""
+        interval_ends = 0.0
         for rec in ledger:
             # A weaker prior rung does not gate a stronger escalation — that is what lets a failed
             # reboot hand off to the power cycle without waiting out the interval. Equal-or-stronger
@@ -889,21 +924,45 @@ class RecoveryMechanism:
                     f"(fail closed)"
                 )
             since = now_epoch - at
-            if since < min_interval:
-                return False, (
+            if since < min_interval and at + min_interval > interval_ends:
+                # The prior action may well have recovered the device and a new fault followed, so the
+                # text says only what is known: when it ran and when this one may.
+                interval_ends = at + min_interval
+                interval_why = (
                     f"a {rec.get('action')} auto-recovery was {int(since)}s ago (< "
-                    f"{min_interval}s min): a {action} that did not fix "
-                    f"the device will not fix it now — this is the boot-loop guard"
+                    f"{min_interval}s min): no {action} for {int(min_interval - since) + 1}s more — "
+                    f"this is the boot-loop guard"
                 )
+        cap_why = ""
         boot_id = self._current_boot_id()
         if boot_id:
             this_boot = sum(1 for r in ledger if r.get("boot_id") == boot_id)
             if this_boot >= AUTO_RECOVERY_MAX_PER_BOOT:
-                return False, (
+                cap_why = (
                     f"already auto-escalated {this_boot}x this boot "
                     f"(cap {AUTO_RECOVERY_MAX_PER_BOOT}); holding {action}"
                 )
+        if interval_why:
+            # Refused by the power cycle's interval alone: have the watchdog retry it as the interval
+            # ends. Any other limit also standing (the per-boot cap) schedules nothing.
+            if action == "power-cycle" and not cap_why:
+                episode = self._device_hold_episode_since() or ""
+                self._power_cycle_retry = (episode, interval_ends + POWER_CYCLE_RETRY_SLACK_SEC)
+            return False, interval_why
+        if cap_why:
+            return False, cap_why
         return True, ""
+
+    def power_cycle_retry_due(self, now_epoch: Optional[float] = None) -> bool:
+        """True once a power cycle refused only by its min interval may run again, in the hold episode
+        that was refused. The watchdog then forces one ladder pass; the governor still decides."""
+        episode, at = self._power_cycle_retry
+        if not at or not episode or episode != (self._device_hold_episode_since() or ""):
+            return False
+        return (time.time() if now_epoch is None else now_epoch) >= at
+
+    def clear_power_cycle_retry(self) -> None:
+        self._power_cycle_retry = ("", 0.0)
 
     def _reboot_already_attempted(self, *, now_epoch: Optional[float] = None) -> bool:
         """True if the broker already auto-rebooted for the wedge it is still looking at: a reboot
