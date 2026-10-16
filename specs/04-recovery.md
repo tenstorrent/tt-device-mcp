@@ -470,8 +470,10 @@ each rung fires only when the gentler one failed or cannot apply.
   below-floor drop, in the post-job gate or the idle escalation: a whole tray off the bus is a power
   problem a re-power has made worse (one tray re-power took 20 more chips off, three times on one
   Galaxy host in an hour), so it emits `ubb_reset_declined_whole_tray` and hands the hold straight to
-  the I27 power cycle with no grace (`offbus_gated_hold` phase `whole_tray_down`). A partial drop
-  (no tray wholly off) keeps the walk. `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1` turns the single-tray
+  the I27 power cycle with no grace (`offbus_gated_hold` phase `whole_tray_down`). No walk ran, so
+  the idle escalation journals it as `galaxy_reset_skipped_whole_tray` (`fault_class` `whole_tray`),
+  never as a failed walk, and starts no walk-failed clock. A partial drop (no tray wholly off) keeps
+  the walk. `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1` turns the single-tray
   and whole-tray walks back on; the tray-down-no-window sweep is not affected.
   Before an automatic mesh reset, tray re-power or sweep with a chip off the bus, the broker writes
   `offbus_reset_intent.json` (with the boot id) to the health dir and removes it after the reset's
@@ -533,6 +535,14 @@ each rung fires only when the gentler one failed or cannot apply.
   or the journal hides other users' entries). With neither, the power cycle never fires and the
   broker pages once (`offbus_power_cycle_unguarded`). A stand-back is re-checked on every pass, and
   the tenant and reset-scope checks run again after the stand-back checks, just before the cycle.
+  Then the whole box is re-read: with every chip back on the bus no cycle runs (phase
+  `back_on_bus`). A cycle due at no grace because a whole tray was off re-checks that a tray is
+  still wholly off; when the tray map places the drop and none is, it does not fire, clears the
+  whole-tray clock (phase `whole_tray_back`) and holds, so the partial drop goes back to the ladder
+  and the other bounded clocks. A read the map cannot place keeps the whole-tray verdict. The
+  `firing` event names `fault_class` (`whole_tray`, `all_off`, `tray_partial` for 4 or more chips,
+  `partial_offbus` for 1-3), `handoff` (`whole_tray`, `ipmi_unavailable`, `tray_walk_failed`,
+  `tray_rung_regressed`, `gate_refused`) and `hold_age_sec`, the hold's time to this cycle.
   Each attempt is written, fsync'd, to
   `offbus_power_cycle.json` in the health dir before the command runs, and at most one attempt runs
   per `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` (default 21600 s), across restarts and
@@ -554,8 +564,9 @@ each rung fires only when the gentler one failed or cannot apply.
   re-power does not count), no IPMI rung can end the hold, so the first such failure starts a clock
   and, once the ladder ran once this episode (whether the failure came from its own tray rung or
   not), the same power cycle runs `TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC` (default 300 s) after
-  it, with every check above; the watchdog forces one pass at that bound. Only the idle relift and the
-  watchdog reach it, never the between-jobs gate, so it adds no time between jobs. **A failed tray
+  it, with every check above; the watchdog forces one pass at that bound. The idle relift, the
+  watchdog and the between-jobs gate's tray rung (for a whole tray off the bus) reach it; the device
+  is already held there and no reset runs, so it adds no time to a job that could have run. **A failed tray
   walk is bounded the same way, and no below-floor mesh reset follows it.** When the I25 walk fired
   this episode and did not recover the mesh, or took chips on other trays off the bus with it, the
   idle off-bus escalation does not try the below-floor mesh reset (with a tray still off the bus it
@@ -850,18 +861,27 @@ re-power it rescans that tray's root ports (the whole bus only when none is know
 fabric included: a re-power does not undo a chip's sysfs `remove`. After a failed verify it re-reads
 the bus. If a chip that was on the bus before the walk is now off, the walk stops at once
 (`ubb_reset_regressed_offbus`) rather than re-power more trays, and the per-tray rung is declined
-on this host for `TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS` (default 7) days (`ubb_tray_rung_disabled`).
+on this host for `TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS` (default 7) days (`ubb_tray_rung_disabled`,
+with `latch_days` and `clear_with`, the operator's re-arm command). The decline is host-wide, not per
+tray: a single-tray re-power has taken the other trays off the bus with it.
 The record goes, fsync'd, to `ubb_tray_rung_disabled.json` in the health dir with the boot id, the
 host name and the time. A broker restart or a host power cycle keeps it
 (`ubb_tray_rung_disabled_restored`, with the boot id it was latched on): a power cycle does not
 repair the UBB whose re-power regressed, and a per-boot latch let the rung regress the mesh again
 after every cycle. A record older than the window, or written by another host, is removed and the
 rung re-arms (`ubb_tray_rung_rearmed`); one with no time of its own is aged by the file's mtime, and
-one whose age cannot be read counts. A delayed cross-tray drop latches the same record: when chips that were on the
+one whose age cannot be read counts. After the UBB is repaired an operator re-arms the rung with
+`python -m tt_device_mcp.health.recovery.pcie_guard --clear-tray-rung-latch [--health-dir DIR]`
+as root (`ubb_tray_rung_cleared`, `by` `operator`; exit 1 when the record cannot be removed, 2 on
+bad usage); a running broker whose written record is gone re-arms on its next look
+(`ubb_tray_rung_cleared`, `by` `file_removed`), without a restart. A delayed cross-tray drop latches the same record: when chips that were on the
 bus before the last tray re-power, on trays it did not re-power, leave the bus within
 `TRAY_PULSE_WINDOW_SEC` (900 s) of it and every one sits at in-tray position 5 (chips 5/13/21/29 on
 a Galaxy), the next look (the tray rung's evidence or the sweep) disables the rung; any other drop
-pattern, such as a mesh reset's, does not. While the rung is declined the walk holds (the next
+pattern, such as a mesh reset's, does not. The drop often lands after the pulse's own hold was
+released, so the match spans hold episodes inside the window; the record names the pulse's episode
+(`episode`) and, when it differs, the one the drop was seen in (`seen_in`), so an operator can tell
+an outside drop from the pulse's and re-arm the rung. While the rung is declined the walk holds (the next
 generic drop names the command), and the back-to-back sweep (TRAY_DOWN_NO_WINDOW and the
 last-chance sweep before a host rung) skips the tray re-power (`ubb_reset_skipped_regressed`), as
 when opted out: its SBR and mesh reset still run and the sweep still counts as complete (I22), so
@@ -1072,10 +1092,14 @@ sees a silent fabric pass.
 | I23 the envelope's order: mask every port, quiesce, remove, fire, rescan, re-init, restore | `tests/test_pcie_guard.py::test_envelope_masks_every_port_removes_the_tray_fires_rescans_and_restores`, `::test_envelope_restores_and_rescans_even_when_the_pulse_fails`, `::test_pollers_are_stopped_across_the_tray_fire` |
 | I23 only the re-powered tray's root ports are rescanned; the global rescan only when none is known | `tests/test_pcie_guard.py::test_the_envelope_rescans_only_the_re_powered_trays_root_ports`, `::test_the_envelope_falls_back_to_the_global_rescan_when_no_tray_port_is_known`, `tests/test_device_safety.py::test_the_walk_rescans_only_the_re_powered_trays_root_ports` |
 | I23 a chip on another tray newly all-ones gets one remove + scoped rescan | `tests/test_pcie_guard.py::test_a_sibling_chip_newly_all_ones_gets_one_remove_and_scoped_rescan`, `::test_a_sibling_chip_already_all_ones_or_on_the_tray_is_not_touched` |
-| I25 a regressed walk disables the tray rung for the boot; the back-to-back sweep skips the tray re-power and stays complete | `tests/test_device_safety.py::test_a_regressed_walk_disables_the_tray_rung_for_the_process`, `tests/test_pcie_guard.py::test_a_disabled_tray_walk_leaves_the_envelope_armed`, `tests/test_ladder_v2.py::test_a_regressed_tray_rung_is_skipped_in_the_last_chance_sweep`, `::test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep` |
+| I25 a regressed walk disables the tray rung on this host; the back-to-back sweep skips the tray re-power and stays complete | `tests/test_device_safety.py::test_a_regressed_walk_disables_the_tray_rung_for_the_process`, `tests/test_pcie_guard.py::test_a_disabled_tray_walk_leaves_the_envelope_armed`, `tests/test_ladder_v2.py::test_a_regressed_tray_rung_is_skipped_in_the_last_chance_sweep`, `::test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep` |
 | I25 the disabled tray rung survives a broker restart and a new boot on the same host, for a bounded window; another host's or an expired record re-arms it; a record with no time is aged by its file | `tests/test_pcie_guard.py::test_a_disabled_tray_rung_survives_a_broker_restart_on_the_same_boot`, `::test_a_new_boot_keeps_the_tray_rung_latch`, `::test_the_tray_rung_latch_expires_after_its_window`, `::test_a_tray_rung_record_from_another_host_never_counts`, `::test_a_tray_rung_record_without_a_time_is_aged_by_its_file`, `tests/test_offbus_power_cycle.py::test_a_regression_recorded_before_a_reboot_keeps_the_walk_off` |
 | I25/I27 a below-floor drop with a whole tray off is never re-powered: the post-job gate and the idle escalation hand it to the power cycle at once and keep the device held; a partial drop still walks and is released only after the full check, fabric included | `tests/test_offbus_power_cycle.py::test_the_post_job_gate_hands_a_whole_tray_drop_to_the_power_cycle`, `::test_by_default_the_one_tray_drop_is_never_walked`, `::test_a_partial_drop_below_the_floor_still_walks_and_releases_only_after_the_full_check`, `tests/test_device_safety.py::test_a_whole_tray_below_the_floor_is_not_re_powered_alone_but_two_trays_still_walk` |
 | I25 a tray pulse followed by position-5 chips on other trays leaving the bus disables the rung | `tests/test_device_safety.py::test_a_tray_pulse_that_drops_position_5_on_other_trays_disables_the_rung` |
+| I25 an operator re-arms the declined tray rung after a repair (exit 1 when it cannot remove the record, 2 on bad usage); a running broker re-arms when its written record is removed | `tests/test_pcie_guard.py::test_the_operator_re_arms_the_tray_rung_after_a_repair`, `::test_a_tray_rung_latch_that_cannot_be_removed_is_reported`, `::test_a_running_broker_re_arms_when_the_operator_removes_the_record` |
+| I25 a delayed position-5 drop in a later hold still latches and the record names both episodes | `tests/test_pcie_guard.py::test_a_position_5_drop_in_a_later_hold_still_latches_and_names_both_episodes` |
+| I25/I27 an idle whole-tray decline is journaled as `whole_tray`, never a failed walk; the firing event names the class and hand-off | `tests/test_offbus_power_cycle.py::test_an_idle_whole_tray_decline_is_journaled_as_whole_tray_not_a_failed_walk` |
+| I27 a whole tray that came back in part is not cycled at grace 0 and stays held; one still wholly off, or a re-read the map cannot place, fires at once | `tests/test_offbus_power_cycle.py::test_a_whole_tray_that_comes_back_in_part_is_not_cycled_at_grace_0`, `::test_a_tray_still_wholly_off_at_the_re_read_still_fires_at_once`, `::test_a_re_read_the_tray_map_cannot_place_keeps_the_whole_tray_verdict` |
 | I25 / I32 a skipped tray re-power releases only after the full health check, fabric included | `tests/test_ladder_v2.py::test_a_skipped_tray_rung_releases_only_after_the_full_health_check` |
 | I27 a regressed tray rung hands off to the power cycle past the grace | `tests/test_offbus_power_cycle.py::test_a_regressed_tray_rung_hands_off_past_the_grace` |
 | I23 holders: wait, then refuse | `tests/test_pcie_guard.py::test_envelope_waits_for_holders_then_refuses_without_touching_anything`, `::test_envelope_proceeds_once_the_holder_lets_go` |

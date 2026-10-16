@@ -1029,6 +1029,106 @@ async def test_the_post_job_gate_hands_a_whole_tray_drop_to_the_power_cycle(
 
 
 @pytest.mark.asyncio
+async def test_an_idle_whole_tray_decline_is_journaled_as_whole_tray_not_a_failed_walk(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """The idle relift declines the walk for a whole tray off the bus, so no walk ran. It
+    is journaled as its own class (``galaxy_reset_skipped_whole_tray``), never as a failed walk, and the
+    walk-failed clock stays unset. The cycle's own journal line names the class and the hand-off."""
+    hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path)
+    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
+    kinds = [k for k, _ in rec["events"]]
+    assert "galaxy_reset_skipped_whole_tray" in kinds
+    assert "galaxy_reset_skipped_after_tray_walk" not in kinds
+    assert opc.tray_walk_failed_age_sec(hold_since) is None, "no walk ran, so none failed"
+    skipped = dict(rec["events"])["galaxy_reset_skipped_whole_tray"]
+    assert skipped["fault_class"] == "whole_tray" and skipped["held_since"] == hold_since
+    declined = dict(rec["events"])["ubb_reset_declined_whole_tray"]
+    assert declined["fault_class"] == "whole_tray"
+    firing = [f for k, f in rec["events"] if k == "offbus_gated_hold" and f.get("phase") == "firing"]
+    assert len(firing) == 1 and firing[0]["fault_class"] == "whole_tray" and firing[0]["handoff"] == "whole_tray"
+    assert firing[0]["hold_age_sec"] is not None
+    assert len(rec["fires"]) == 1 and counters["resets"] == 0
+    assert all(state["verifies"]), "every verify ran the fabric pass"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
+
+
+def _tray_back_before_the_cycle(monkeypatch, state, back):
+    """Bring ``back`` on the bus right after the gate records the whole tray down, i.e. before the
+    re-read that precedes the cycle."""
+    note = opc.note_whole_tray_down
+
+    def noted(*a, **k):
+        note(*a, **k)
+        state["off"] -= set(back)
+
+    monkeypatch.setattr(opc, "note_whole_tray_down", noted)
+
+
+@pytest.mark.asyncio
+async def test_a_whole_tray_that_comes_back_in_part_is_not_cycled_at_grace_0(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """Tray 1 (0-7) is wholly off when the gate declines the walk, then chips 0-3 come back
+    before the cycle. The re-read before the cycle sees no whole tray off any more: no grace-0 cycle, the
+    whole-tray clock is cleared (journaled ``whole_tray_back``) and the device stays held for the ladder.
+    Fails on base, which re-reads only that some chip is still off and fires."""
+    hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path)
+    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
+    state["off"] = set(range(8)) | {24, 25, 28, 29}
+    _tray_back_before_the_cycle(monkeypatch, state, range(4))
+    out = await _gate_tray_rung(set(state["off"]))
+    assert out == galaxy.OUTCOME_WAITING
+    assert rec["fires"] == [] and state["fired"] == [], "no cycle and no re-power at grace 0"
+    assert opc.whole_tray_down_age_sec(hold_since) is None
+    back = [f for k, f in rec["events"] if k == "offbus_gated_hold" and f.get("phase") == "whole_tray_back"]
+    assert len(back) == 1 and back[0]["fault_class"] == "tray_partial" and back[0]["held_since"] == hold_since
+    assert counters["resets"] == 0 and counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_tray_still_wholly_off_at_the_re_read_still_fires_at_once(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """A whole-tray drop still goes to the power cycle through the re-check: the partial tray 4 coming back changes nothing while tray 1
+    is still wholly off, so the cycle fires at once, journaled as ``whole_tray``."""
+    hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path)
+    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
+    state["off"] = set(range(8)) | {24, 25, 28, 29}
+    _tray_back_before_the_cycle(monkeypatch, state, {24, 25, 28, 29})
+    await _gate_tray_rung(set(state["off"]))
+    assert len(rec["fires"]) == 1 and "whole tray is off the bus" in rec["fires"][0]["reason"]
+    firing = [f for k, f in rec["events"] if k == "offbus_gated_hold" and f.get("phase") == "firing"]
+    assert firing[0]["fault_class"] == "whole_tray" and firing[0]["off_bus"] == 8
+    assert "whole_tray_back" not in [f.get("phase") for k, f in rec["events"] if k == "offbus_gated_hold"]
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_re_read_the_tray_map_cannot_place_keeps_the_whole_tray_verdict(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """When the tray map is gone by the re-read, nothing proves the tray came back: the whole-tray verdict
+    stands and the cycle fires, rather than holding on a guess."""
+    hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path)
+    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
+    state["off"] = set(range(8)) | {24, 25, 28, 29}
+    g = srv.galaxy_recovery
+    note = opc.note_whole_tray_down
+
+    def noted(*a, **k):
+        note(*a, **k)
+        state["off"] -= set(range(4))
+        monkeypatch.setattr(g, "_tray_map_now", lambda: None)
+
+    monkeypatch.setattr(opc, "note_whole_tray_down", noted)
+    await _gate_tray_rung(set(state["off"]))
+    assert len(rec["fires"]) == 1 and "whole tray is off the bus" in rec["fires"][0]["reason"]
+    assert opc.whole_tray_down_age_sec(hold_since) is not None
+
+
+@pytest.mark.asyncio
 async def test_a_partial_drop_below_the_floor_still_walks_and_releases_only_after_the_full_check(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):

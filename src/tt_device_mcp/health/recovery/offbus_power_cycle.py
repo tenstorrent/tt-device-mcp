@@ -337,7 +337,31 @@ def note_whole_tray_down(episode: str, detail: str, now: Optional[datetime] = No
     if _pending.get("whole_tray_at") is None:
         _pending["whole_tray_at"] = now or datetime.now()
         _pending["whole_tray_detail"] = detail[-200:]
-        health_event("offbus_gated_hold", phase="whole_tray_down", held_since=episode, detail=detail[-200:])
+        health_event(
+            "offbus_gated_hold",
+            phase="whole_tray_down",
+            held_since=episode,
+            detail=detail[-200:],
+            fault_class="whole_tray",
+            hold_age_sec=episode_age_sec(episode, now),
+        )
+
+
+def clear_whole_tray_down(episode: str, detail: str, fault_class: str = "") -> None:
+    """The tray that made this episode a whole-tray drop is back on the bus in part: the no-grace power
+    cycle no longer applies (spec 04 I27). The hold keeps its other hand-off clocks; idempotent."""
+    if not episode or _pending.get("episode") != episode or _pending.get("whole_tray_at") is None:
+        return
+    _pending["whole_tray_at"] = None
+    _pending["whole_tray_detail"] = ""
+    health_event(
+        "offbus_gated_hold",
+        phase="whole_tray_back",
+        held_since=episode,
+        detail=detail[-200:],
+        fault_class=fault_class,
+        hold_age_sec=episode_age_sec(episode),
+    )
 
 
 def whole_tray_down_age_sec(episode: str, now: Optional[datetime] = None) -> Optional[float]:
