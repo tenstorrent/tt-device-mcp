@@ -791,6 +791,28 @@ job boundary.
   hosts since 2026-09-14, 51 of 51 such timeouts were followed by a failed or skipped pass. No wait
   is added. A rung the gate fires from a clean exit (I55 or I61) first opens the hold episode
   (marked dirty, `probe_unhealthy`), so the door is shut while the reset is unproven.
+- **I69 — A job the broker stopped mid-run is followed by a reset, then the full check.** A job
+  that hit its timeout, or a running job stopped by a requested kill (`tt_device_job_kill`, the
+  REST kill, or a `tt_device_job_run` whose client went away, spec 01 I66), owes the mesh one
+  reset: a kill mid-run is how a mesh is left wedged mid-collective, and a fabric pass that happens
+  to pass does not clear what it cannot see. The runner records the debt when the job ends; a job a
+  reset or recovery killed (its own kill), and one that named a known fabric or topology fault
+  (held without a reset, I42/I46), owe none. The next post-job gate pays it: it skips the
+  pre-reset fabric traffic pass and the passive eth read, captures the incident (`job_killed`),
+  logs one line and journals `kill_mesh_reset`, and fires `STAGE_SMI_RESET` through the same path
+  and per-episode latch as I55/I61 (`tt-smi -glx_reset` on a Galaxy, `tt-smi -r` per target
+  elsewhere). Only when every chip reads present and ARC healthy: anything else is a different
+  fault and takes its own rung on the same evidence. Only the full post-reset check (fabric
+  traffic and dispatch included, spec 04 I32) releases the device; a failed one keeps it held
+  and climbs the bounded ladder like I55, never a release. A spent latch, an outage hold (spec 04
+  I28) or a reset cooldown journals `kill_reset_skipped`, clears the debt and keeps today's path
+  (the dirty exit's fabric pass). Any reset since the job ended also settles the debt. Time to
+  recover (a timed-out or killed job, the job-kill class): kill ladder (unchanged, at most 75 s),
+  then one reset (bounded by `DEVICE_RESET_TIMEOUT_SEC`; ~62 s for a Galaxy `glx_reset`, ~15 s
+  for a per-target `tt-smi -r`), then one full check (fabric pass bounded by
+  `FABRIC_CHECK_TIMEOUT_SEC`). Against today, a wedged mesh saves the failed pre-reset fabric pass
+  (~45-100 s), and a mesh that was fine pays the reset minus that pass (~+0-20 s on a Galaxy,
+  ~+15 s per target). No wait is added.
 - **I57 — An incident bundle never presents another pass's fabric transcript as its own.** The
   monitor stamps `last_fabric_output_at` with the start of the run that produced
   `last_fabric_output`; the gate records when its pass began and hands both to
@@ -1411,6 +1433,10 @@ refuses.
 | I61 (the full post-reset check gates the release; a failure stays held and climbs) | `tests/test_eth_timeout_reset.py::test_the_full_check_after_the_reset_gates_the_release`, `tests/test_eth_timeout_reset.py::test_a_failed_post_reset_check_stays_held_and_climbs`, `tests/test_eth_timeout_reset.py::test_a_failed_post_reset_check_without_a_host_rung_stays_held` |
 | I61 (one reset per episode, latch shared with I55, re-armed at release) | `tests/test_eth_timeout_reset.py::test_a_second_timeout_in_the_episode_gets_no_second_reset`, `tests/test_eth_timeout_reset.py::test_a_spent_dispatch_reset_leaves_the_timeout_on_todays_path`, `tests/test_eth_timeout_reset.py::test_a_healed_reset_rearms_the_latch_at_the_next_admission` |
 | I61 (every other shape keeps today's path) | `tests/test_eth_timeout_reset.py::test_other_no_verdict_reads_keep_todays_fabric_pass`, `tests/test_eth_timeout_reset.py::test_a_frozen_read_keeps_todays_hold`, `tests/test_eth_timeout_reset.py::test_an_off_bus_chip_or_unhealthy_arc_keeps_todays_path`, `tests/test_eth_timeout_reset.py::test_host_pci_not_ok_keeps_todays_fabric_pass`, `tests/test_eth_timeout_reset.py::test_an_outage_hold_refuses_the_reset_and_keeps_todays_pass`, `tests/test_eth_timeout_reset.py::test_a_dirty_exit_still_runs_the_fabric_pass` |
+| I69 (a timeout always resets with no pre-reset fabric pass, then the full check, fabric included, before release) | `tests/test_job_kill_reset.py::test_a_timeout_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_requested_kill_of_a_running_job_owes_the_reset` |
+| I69 (a failed post-kill check stays held and climbs the bounded ladder, never released) | `tests/test_job_kill_reset.py::test_a_failed_post_kill_check_stays_held_and_climbs`, `tests/test_job_kill_reset.py::test_a_failed_post_kill_check_without_a_host_rung_stays_held` |
+| I69 (latch shared with I55/I61; outage hold or spent latch skip it onto today's path; a reset since settles it; a reset-killed or completed job owes none) | `tests/test_job_kill_reset.py::test_a_spent_latch_skips_the_kill_reset_onto_todays_path`, `tests/test_job_kill_reset.py::test_an_outage_hold_skips_the_kill_reset`, `tests/test_job_kill_reset.py::test_a_reset_since_the_kill_settles_the_debt`, `tests/test_job_kill_reset.py::test_no_debt_for_a_reset_killed_or_completed_job` |
+| I69 (router: the kill reset takes STAGE_SMI_RESET only on a present, unfrozen mesh) | `tests/test_job_kill_reset.py::test_router_kill_reset_needs_a_present_unfrozen_mesh` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
