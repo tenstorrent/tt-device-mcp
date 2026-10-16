@@ -139,6 +139,7 @@ from tt_device_mcp.health import (
     journal_interrupted_fabric_check,
     mark_boot,
     mesh_hold_repage_sec,
+    mesh_reset_hold_reason,
     offbus_count,
     offbus_power_cycle,
     pcie_guard_at_start,
@@ -146,6 +147,7 @@ from tt_device_mcp.health import (
     previous_boot_error,
     read_health_events,
     read_heartbeats,
+    refuse_mesh_reset,
     version_floor_warnings,
 )
 from tt_device_mcp.health import (
@@ -927,6 +929,9 @@ device_hold_logged: bool = False
 # has an end and a duration.
 device_hold_episode_since: str = ""
 device_hold_episode_reason: str = ""
+# Spec 03 I55: the present-mesh reset a dispatch failure on a green fabric earns ran this hold
+# episode. Cleared when the episode ends; in-process, so a broker restart grants one more.
+_dispatch_reset_spent: bool = False
 # The per-tray BMC reset's once-per-episode limit and the idle escalation's ran-at-all marker live
 # as named latches on ``fsm`` (see RecoveryDeps below): ``fsm.latch("escalated")`` (visibility for
 # the deadline watchdog — the present-mesh escalation itself retries on the grace cadence) and
@@ -2102,7 +2107,7 @@ def _reset_for_testing():
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
-    global _topology_hw_fault_paged
+    global _topology_hw_fault_paged, _dispatch_reset_spent
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
     job_queue = None
     lock = None
@@ -2111,6 +2116,7 @@ def _reset_for_testing():
     device_hold_logged = False
     device_hold_episode_since = ""
     device_hold_episode_reason = ""
+    _dispatch_reset_spent = False
     _hold_episode_restorable = True
     _hold_episode_tenant = False
     if recovery_mechanism is not None:
@@ -3355,6 +3361,11 @@ def log_rung_inventory() -> None:
         # elsewhere the inventory is the only place its OFF is ever explained.
         if not on and not (name == "eth-heartbeat" and should_privsep()):
             logger.warning(f"RUNG OFF {name}: {why}")
+    gap = _hold_exit_gap()
+    if gap:
+        logger.warning(
+            f"RUNG GAP: {gap} — a held present mesh has no automatic exit; it stays held until an operator acts"
+        )
 
 
 # The telemetry trace: what the chips were doing while the job ran. Snapshots at the gate
@@ -3380,6 +3391,40 @@ def _selfheal_relift_enabled() -> bool:
     is exactly what strands a below-floor hold, so this must be live for the reset floor to be safe.
     The kill switch (TT_DEVICE_MCP_SELFHEAL_RELIFT=0) restores the wait for an operator who needs it."""
     return os.environ.get("TT_DEVICE_MCP_SELFHEAL_RELIFT", "1").strip() != "0"
+
+
+def _hold_exit_gap() -> str:
+    """Why a held present mesh has NO automatic exit, or "" when it has one (spec 03 I55): the relift
+    and the forced escalation both switched off, and/or the outage hold (spec 04 I28) refusing the
+    present-mesh reset. Logged at boot as ``RUNG GAP`` and served on /health as ``hold_exit_gap``."""
+    gaps = []
+    if not _selfheal_relift_enabled() and not _force_escalate_enabled():
+        gaps.append("TT_DEVICE_MCP_SELFHEAL_RELIFT=0 and TT_DEVICE_MCP_FORCE_ESCALATE=0")
+    held = mesh_reset_hold_reason()
+    if held:
+        gaps.append(f"present-mesh reset held: {held}")
+    return "; ".join(gaps)
+
+
+def _hold_escalation_note(off_bus: int = 0) -> str:
+    """What happens next to a hold, stated only as far as it is armed (spec 03 I55): a message that
+    promises an escalation the host switched off sends the operator to wait for nothing."""
+    if _force_escalate_enabled():
+        if off_bus > 0:
+            return (
+                "The off-bus ladder escalates in ~2 min and no hold outlives the 10-min ceiling — do "
+                "not plan around waiting the wedge out."
+            )
+        return "The ladder escalates at the 10-min hold ceiling — do not plan around waiting the wedge out."
+    if _selfheal_relift_enabled():
+        return (
+            "Forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0): only the idle self-heal relift "
+            "can lift this hold."
+        )
+    return (
+        "Self-heal relift and forced escalation are both OFF: this hold has NO automatic exit — an "
+        "operator must act."
+    )
 
 
 def _fabric_relift_enabled() -> bool:
@@ -3430,7 +3475,7 @@ def _fabric_77_eth_drop() -> str:
         return ""
     if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
         return ""
-    if _TOPOLOGY_VALIDATOR_LINE in (health_monitor.last_fabric_output or ""):
+    if _validator_line_names_topology(health_monitor.last_fabric_output or ""):
         return ""
     if _last_77_was_hugepages() or fabric.validator_missing() is not None:
         return ""
@@ -3536,7 +3581,17 @@ _TOPOLOGY_VALIDATOR_LINE = "Connection mismatch detected"
 
 
 def _names_topology_mismatch(text: str) -> bool:
+    # A dispatch failure on a green fabric is a measured fault, never a topology hold (spec 04 I30),
+    # even when the descriptor run before it downgraded a "Connection mismatch detected" line.
+    if fabric.names_dispatch_failure(text):
+        return False
     return text.startswith(_TOPOLOGY_HOLD) or _TOPOLOGY_HW_FAULT in text or _TOPOLOGY_VALIDATOR_LINE in text
+
+
+def _validator_line_names_topology(output: str) -> bool:
+    """The validator's mismatch line in the last fabric output, unless the dispatch probe after it
+    failed: then the wrapper's verdict is the dispatch failure (spec 04 I30)."""
+    return _TOPOLOGY_VALIDATOR_LINE in output and not fabric.names_dispatch_failure(output)
 
 
 def _hold_details(evidence: dict) -> tuple[str, str]:
@@ -3592,7 +3647,7 @@ def _fabric_no_reset_hold() -> str:
         return "known fabric fault"
     if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
         return "topology mismatch"
-    if fabric_hold and _TOPOLOGY_VALIDATOR_LINE in (health_monitor.last_fabric_output or ""):
+    if fabric_hold and _validator_line_names_topology(health_monitor.last_fabric_output or ""):
         return "topology mismatch"
     if (
         fabric_hold
@@ -4916,6 +4971,7 @@ async def device_health_gate(
     (see ``_job_failed_exit1_clean``). With ``EXIT1_FABRIC_WINDOW_SEC`` set, a HEALTHY, clean device,
     an armed eth rung and an OK pass at most that old with no reset since, the forced pass becomes
     the same eth read; every cheap read must come back clean or the pass runs (spec 03 I38)."""
+    global _dispatch_reset_spent
 
     def _log(msg: str) -> None:
         if logger:
@@ -5320,9 +5376,7 @@ async def device_health_gate(
                 _log(
                     "active-eth-core heartbeat frozen — a single-chip wedge; NOT resetting (a "
                     "galaxy reset here is the measured all-chip drop). Holding the door: no tenant "
-                    "runs on the frozen mesh until a later gate verifies the core came back. The "
-                    "ladder escalates at the 10-min hold ceiling — do not plan around waiting the "
-                    "wedge out."
+                    "runs on the frozen mesh until a later gate verifies the core came back. " + _hold_escalation_note()
                 )
                 # A runtime-reported fault otherwise stands until a reset — the checks that cleared
                 # it "healthy" are blind to the wedge, but the heartbeat read is not, and every
@@ -5420,6 +5474,13 @@ async def device_health_gate(
             sbr_candidates=len(isolated_chips),
             scope_active=bool(await asyncio.to_thread(recovery_mechanism.scope_active)),
         )
+        # Spec 03 I55: the fabric moved traffic but mesh dispatch failed. On a present mesh no
+        # self-heal clears that (measured: a 100-min eth_frozen hold with no exit), so it earns the
+        # present-mesh reset once per hold episode; the full check, fabric included, decides the
+        # release after it. The outage hold (04 I28) forbids that reset: held and paged below.
+        dispatch_failed = fabric_ok is False and fabric.names_dispatch_failure(health_monitor.last_fabric_output or "")
+        if dispatch_failed and not _dispatch_reset_spent and not mesh_reset_hold_reason():
+            ev = replace(ev, dispatch_reset_due=True)
         stage = galaxy_recovery.next_stage(ev)
 
         async def _fire(rung: str) -> bool:
@@ -5487,12 +5548,19 @@ async def device_health_gate(
             if await _fire(STAGE_UBB_TRAY):
                 return
             reset_floor = _galaxy_reset_min_dead_chips(expected)
+            outage_held = mesh_reset_hold_reason() if dispatch_failed and ev.off_bus == 0 else ""
+            # Under the outage hold no rung may reset this mesh, so name the held reset rather than
+            # an escalation that will not come (spec 03 I55).
+            next_step = (
+                f"Its present-mesh reset is HELD ({outage_held}): an operator must reset or lift the hold."
+                if outage_held
+                else _hold_escalation_note(ev.off_bus)
+            )
             _log(
                 f"{ev.off_bus} of {expected} chip(s) off the bus — below the galaxy-reset "
                 f"floor ({reset_floor}). A galaxy reset here is the measured all-chip drop, so "
-                f"holding the mesh degraded rather than resetting in-flight work away. The off-bus "
-                f"ladder escalates in ~2 min and no hold outlives the 10-min ceiling — do not plan "
-                f"around waiting the wedge out."
+                f"holding the mesh degraded rather than resetting in-flight work away. "
+                f"{next_step}"
             )
             health_event(
                 "galaxy_reset_suppressed_below_mass_threshold", off_bus=ev.off_bus, expected=expected, floor=reset_floor
@@ -5515,7 +5583,28 @@ async def device_health_gate(
             # Name the ACTUAL cause. off_bus==0 is a present mesh (every chip on the bus) held for
             # an eth/fabric fault — "0/32 off-bus below the reset floor" reads as nonsense to
             # anyone watching. Only a real drop (off_bus>0) is an off-bus hold.
-            if ev.off_bus == 0:
+            if dispatch_failed and ev.off_bus == 0 and ev.frozen_chips == 0 and mesh_reset_hold_reason():
+                # Spec 03 I55 under the outage hold (04 I28): the one present-mesh reset this
+                # dispatch failure earns is refused — paged and journaled as mesh_reset_held, and the
+                # hold says so rather than promising a self-heal a dispatch failure never gets.
+                refuse_mesh_reset(f"gate/{phase}", galaxy_recovery.reset_argv(indices), _log, 0)
+                why = (
+                    f"gate/{phase}: dispatch failed on a green fabric over a present mesh (all "
+                    f"{expected} chips on the bus) — its present-mesh reset is HELD "
+                    f"({mesh_reset_hold_reason()}); an operator must reset or lift the hold"
+                )
+            elif dispatch_failed and ev.off_bus == 0 and _dispatch_reset_spent:
+                why = (
+                    f"gate/{phase}: dispatch failed on a green fabric over a present mesh (all "
+                    f"{expected} chips on the bus) — held; this episode's present-mesh reset already ran"
+                )
+            elif dispatch_failed and ev.off_bus == 0:
+                why = (
+                    f"gate/{phase}: dispatch failed on a green fabric over a present mesh (all "
+                    f"{expected} chips on the bus, {ev.frozen_chips} ARC-frozen) — held; no present-mesh "
+                    f"reset has run this episode"
+                )
+            elif ev.off_bus == 0:
                 why = (
                     f"gate/{phase}: eth/fabric fault on a present mesh (all {expected} chips on "
                     f"the bus) — held for self-heal, not reset"
@@ -5530,6 +5619,12 @@ async def device_health_gate(
             return
 
         _log("device needs reset — " + "; ".join(reasons))
+        if ev.dispatch_reset_due and stage == STAGE_SMI_RESET:
+            _log(
+                f"dispatch failed on a green fabric with all {expected} chips present — one "
+                f"present-mesh reset this hold episode, then the full check (fabric included)"
+            )
+            health_event("dispatch_failure_mesh_reset", phase=phase, expected=expected)
         # This hold's galaxy reset already made the drop WORSE (spec 04 I31): firing it again repeats
         # the action that regressed it (one Galaxy host went 4 -> 31 -> 32 off-bus across three). Skip
         # it and go to the post-reset verdict below as if it had failed — the cold rung (whose sweep
@@ -5547,8 +5642,19 @@ async def device_health_gate(
             )
             health_event("galaxy_reset_skipped_regressed", phase=phase, off_bus=ev.off_bus)
             metrics.stage_fired("smi_reset", "blocked")
-        elif await _fire(stage):
-            return
+        else:
+            reset_clock = recovery_mechanism.last_reset_monotonic
+            recovered = await _fire(stage)
+            # The latch is spent only once a reset actually started (the clock moves at reset begin):
+            # one the per-host gate or the outage hold refused leaves the episode's reset unspent.
+            if (
+                ev.dispatch_reset_due
+                and stage == STAGE_SMI_RESET
+                and recovery_mechanism.last_reset_monotonic != reset_clock
+            ):
+                _dispatch_reset_spent = True
+            if recovered:
+                return
 
         # Last rungs: the reset did not bring the mesh back. The host-level escalations — a warm
         # reboot, then a BMC power cycle above it — are the highest-risk actions here: each takes
@@ -5649,8 +5755,7 @@ async def device_health_gate(
             _log(
                 f"{off_bus} of {expected} chip(s) dead — below the reboot floor ({reboot_floor}). "
                 f"The holder-kill covers the MCE path, so holding the mesh degraded rather than "
-                f"rebooting in-flight work away. The ladder escalates at the 10-min hold ceiling — "
-                f"do not plan around waiting the wedge out."
+                f"rebooting in-flight work away. {_hold_escalation_note(off_bus)}"
             )
             health_event(
                 "reboot_suppressed_below_mass_threshold", off_bus=off_bus, expected=expected, floor=reboot_floor
@@ -5872,6 +5977,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         handoff = offbus_power_cycle.hold_handoff_status(episode, now.timestamp() if now else None)
         if handoff is not None:
             payload["operator_handoff"] = handoff  # spec 04 I33: who must act on the hold, and by when
+    # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
+    payload["hold_exit_gap"] = _hold_exit_gap() or None
     return payload
 
 
@@ -5887,7 +5994,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_deadline_bucket, device_hold_escalate_bucket
     global device_hold_offbus_escalated, device_hold_alert_next_bucket, device_hold_alert_gap
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
-    global device_hold_job_bound_escalated
+    global device_hold_job_bound_escalated, _dispatch_reset_spent
     if reason and not device_hold_logged:
         device_hold_logged = True
         # Prefer a start this box already recorded: if the device was still held across a restart,
@@ -5953,6 +6060,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         )
         _hold_row = None
         device_hold_episode_since = ""
+        _dispatch_reset_spent = False  # spec 03 I55: the next episode earns its own reset
         if recovery_mechanism is not None:
             recovery_mechanism.regressed_reset_since = None  # spec 04 I31: the next episode may reset again
         if galaxy_recovery is not None:

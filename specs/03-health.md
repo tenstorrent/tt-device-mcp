@@ -697,6 +697,26 @@ job boundary.
   post-job gate, so it adds nothing to the between-jobs path. It is status only: it never kills,
   signals or holds a job, and no reset or health path reads it. The job keeps its total idle time
   (footer `DEVICE IDLE:`, `idle_total_sec`).
+- **I55 — A dispatch failure on a green fabric over a present mesh resets once, then re-proves.**
+  When the fabric wrapper's links pass but its mesh dispatch fails (`dispatch FAILED on a green
+  fabric`), every expected chip is on the bus, no chip reads ARC-frozen and the eth heartbeat gave
+  no positive frozen reading, the gate does not hold the mesh for self-heal: no idle read can see a
+  dispatch path come back, so that hold had no exit but the relift and the deadline escalation.
+  It fires the present-mesh rung (`tt-smi -glx_reset`) once per hold episode, and only the full
+  post-reset check (fabric traffic and the dispatch probe) releases the device. A failed post-reset
+  check keeps it held and goes on up the bounded ladder (the host rungs when opted in, the idle
+  relift and the hold deadline); a second dispatch failure in the same episode takes the
+  self-heal hold and that ladder, never a second gate reset. Under an outage hold or
+  `TT_DEVICE_MCP_AUTO_MESH_RESET=0` (spec 04 I28) no reset fires: the gate holds and pages
+  (`mesh_reset_held`), and its log names the held reset instead of an escalation that will not come.
+  The fabric verdict names the dispatch failure: `first_reason()` reads the wrapper's dispatch line
+  first and, past a `TOPOLOGY MISMATCH` marker, never the descriptor run's downgraded
+  `Connection mismatch detected`; a hold naming a dispatch failure is never a topology-mismatch
+  hold (spec 04 I30). The below-floor and frozen-eth hold messages promise an escalation only when
+  it is armed. When neither the self-heal relift nor the forced escalation is on
+  (`TT_DEVICE_MCP_SELFHEAL_RELIFT=0`, `TT_DEVICE_MCP_FORCE_ESCALATE=0`), or I28 holds the mesh
+  reset, the RUNG INVENTORY logs a `RUNG GAP` warning at boot and `/health` carries `hold_exit_gap`
+  naming why a held present mesh has no automatic exit (`null` otherwise).
 
 ## Interfaces
 
@@ -1267,6 +1287,11 @@ refuses.
 | Eth/fabric exit-code contract | `tests/test_eth_probe.py::test_exit_laundering[0-True]`, `tests/test_eth_probe.py::test_exit_laundering[3-False]`, `tests/test_eth_probe.py::test_exit_laundering[77-None]`, `tests/test_eth_probe.py::test_hung_read_is_skipped_not_frozen`, `tests/test_fabric_probe.py::test_fabric_classification[0-all links healthy-True]`, `tests/test_fabric_probe.py::test_fabric_classification[None-partial output before hang-False]` |
 | B-Post-job clock check | `tests/test_device_safety.py::test_aiclk_left_busy_names_only_chips_above_the_idle_clock`, `tests/test_device_safety.py::test_a_job_that_left_chips_busy_is_recorded` |
 | I35 (AICLK ceiling: off unset, proven before traffic, fail-closed, door bounded, disarms on a host it cannot run on; startup waits for hugepages; a disarmed ceiling or a job's fmax restore never skips the capped full pass; <= ~10 s added per pass) | `tests/test_aiclk_ceiling.py::test_unset_or_invalid_ceiling_is_off`, `tests/test_aiclk_ceiling.py::test_update_unconfigured_has_no_ceiling_step`, `tests/test_aiclk_ceiling.py::test_update_applies_after_the_snapshot_and_before_any_traffic`, `tests/test_aiclk_ceiling.py::test_update_failed_ceiling_is_unhealthy_and_runs_no_traffic`, `tests/test_aiclk_ceiling.py::test_update_skips_the_ceiling_when_the_snapshot_failed`, `tests/test_aiclk_ceiling.py::test_startup_applies_before_the_startup_fabric_gate`, `tests/test_aiclk_ceiling.py::test_door_reapplies_an_owed_ceiling_before_admitting`, `tests/test_aiclk_ceiling.py::test_door_verified_ceiling_costs_nothing`, `tests/test_aiclk_ceiling.py::test_door_unverified_ceiling_flags_dirty_and_returns`, `tests/test_aiclk_ceiling.py::test_door_apply_error_flags_dirty_never_raises`, `tests/test_aiclk_ceiling.py::test_job_end_marks_the_ceiling_owed`, `tests/test_aiclk_ceiling.py::test_apply_cannot_run_here_disarms_once`, `tests/test_aiclk_ceiling.py::test_helper_sends_only_to_chips_above_the_ceiling`, `tests/test_aiclk_ceiling.py::test_helper_chip_that_keeps_its_clock_fails`, `tests/test_aiclk_ceiling.py::test_helper_no_chips_is_a_failure_not_a_pass`, `tests/test_aiclk_ceiling_goal8.py::test_every_reset_path_runs_ceiling_then_full_fabric_pass_then_releases`, `::test_fabric_fail_after_any_reset_keeps_the_hold_and_enters_bounded_recovery`, `::test_startup_waits_for_hugepages_then_ceiling_then_full_fabric_pass`, `::test_startup_without_hugepages_applies_no_ceiling_and_stays_held`, `::test_disarmed_ceiling_still_runs_the_full_fabric_pass`, `::test_job_restoring_fmax_is_capped_again_before_post_job_traffic`, `::test_ceiling_apply_adds_at_most_10s` |
+| I55 (a green-fabric dispatch failure on a present mesh: one glx_reset, then the full check; release only on a pass) | `tests/test_dispatch_failure_reset.py::test_dispatch_failure_on_a_present_mesh_resets_once_then_runs_the_full_check`, `tests/test_dispatch_failure_reset.py::test_a_second_dispatch_failure_in_the_episode_holds_instead_of_resetting_again` |
+| I55 (a failed post-reset check stays held and climbs the bounded ladder) | `tests/test_dispatch_failure_reset.py::test_a_failed_post_reset_check_stays_held_and_climbs` |
+| I55 (under the outage hold: no reset, held, paged, honest message) | `tests/test_dispatch_failure_reset.py::test_outage_hold_holds_and_pages_without_a_reset` |
+| I55 (the verdict names the dispatch failure, never the downgraded mismatch) | `tests/test_dispatch_failure_reset.py::test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch`, `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
+| I55 (rung gap warned at boot and on /health; floor message honest) | `tests/test_dispatch_failure_reset.py::test_rung_gap_boot_warning_and_health_field`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
