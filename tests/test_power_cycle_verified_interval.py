@@ -72,7 +72,7 @@ def test_a_stamp_that_cannot_prove_a_later_boot_keeps_the_guard(ledger, tmp_path
 
 
 def test_a_verified_cycle_does_not_block_the_reboot_rung(ledger, tmp_path):
-    """Spec 04 I10 (msg #338): a partial drop or a present-mesh wedge after a cycle a later boot
+    """Spec 04 I10: a partial drop or a present-mesh wedge after a cycle a later boot
     verified healthy is a new episode. The chooser picks the reboot for it, and the no-de-escalation
     rule must not hold it for the rest of the 3600 s interval. Fails on base, which read the stamp
     only for a power cycle."""
