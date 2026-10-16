@@ -297,18 +297,75 @@ def test_a_disabled_tray_rung_survives_a_broker_restart_on_the_same_boot(sysfs, 
     assert [n for n, _ in events].count("ubb_tray_rung_disabled") == 1, "restored: not latched again"
 
 
-def test_a_new_boot_re_arms_the_tray_rung(sysfs, monkeypatch):
-    """A record from another boot never counts: it is removed and the rung is armed again."""
+def test_a_new_boot_keeps_the_tray_rung_latch(sysfs, monkeypatch):
+    """A power cycle does not repair the UBB whose re-power regressed: a record from an earlier boot
+    still declines the rung (measured: re-armed on each new boot, the same tray re-power took 20 more
+    chips off three times in an hour)."""
     events = []
     monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
     _boot(sysfs, "boot-a")
-    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
+    pcie_guard.disable_tray_rung(tray=[1], new_off=[str(c) for c in range(8, 28)])
     path = pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE
     monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
     _boot(sysfs, "boot-b")
+    assert pcie_guard.tray_rung_disabled() == {"tray": [1], "new_off": [str(c) for c in range(8, 28)]}
+    assert path.exists()
+    restored = dict(events)["ubb_tray_rung_disabled_restored"]
+    assert restored["latched_boot_id"] == "boot-a" and restored["boot_id"] == "boot-b"
+    assert "ubb_tray_rung_rearmed" not in dict(events)
+
+
+def test_the_tray_rung_latch_expires_after_its_window(sysfs, monkeypatch):
+    """Bounded: a record older than TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS is removed and the rung re-arms,
+    from disk and in memory alike."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS", "2")
+    _boot(sysfs, "boot-a")
+    now = [1_000_000.0]
+    monkeypatch.setattr(pcie_guard.time, "time", lambda: now[0])
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
+    path = pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE
+    now[0] += 2 * 86400 - 60
+    assert pcie_guard.tray_rung_disabled() == {"tray": [3], "new_off": ["5"]}
+    now[0] += 120
+    assert pcie_guard.tray_rung_disabled() is None, "in memory: expired"
+    assert not path.exists() and "ubb_tray_rung_rearmed" in [n for n, _ in events]
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+    now[0] += 2 * 86400
+    assert pcie_guard.tray_rung_disabled() is None, "from disk: expired"
+    assert not path.exists()
+
+
+def test_a_tray_rung_record_from_another_host_never_counts(sysfs, monkeypatch):
+    """Per host: a record a different host wrote (a copied or shared health dir) is removed."""
+    monkeypatch.setattr(pcie_guard, "health_event", lambda *a, **k: None)
+    _boot(sysfs, "boot-a")
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
+    path = pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE
+    rec = json.loads(path.read_text())
+    path.write_text(json.dumps({**rec, "host": rec["host"] + "-other"}))
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
     assert pcie_guard.tray_rung_disabled() is None
     assert not path.exists()
-    assert "ubb_tray_rung_rearmed" in [n for n, _ in events]
+
+
+def test_a_tray_rung_record_without_a_time_is_aged_by_its_file(sysfs, monkeypatch):
+    """A record written before the time was kept (no at_epoch, no host) is aged by the file's mtime, so
+    it is bounded too: it counts inside the window and is removed past it."""
+    monkeypatch.setattr(pcie_guard, "health_event", lambda *a, **k: None)
+    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS", "1")
+    _boot(sysfs, "boot-a")
+    path = pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"why": {"tray": [3]}, "boot_id": "boot-old"}))
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+    assert pcie_guard.tray_rung_disabled() == {"tray": [3]}
+    old = path.stat().st_mtime - 2 * 86400
+    os.utime(path, (old, old))
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+    assert pcie_guard.tray_rung_disabled() is None and not path.exists()
 
 
 def test_an_unreadable_boot_id_keeps_the_tray_rung_record(sysfs, monkeypatch):

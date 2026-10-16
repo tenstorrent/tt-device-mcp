@@ -11200,13 +11200,14 @@ async def test_a_whole_tray_below_the_floor_is_not_re_powered_alone_but_two_tray
     monkeypatch, clear_job_state, galaxy_trays
 ):
     """The guard is keyed on one affected tray below the floor, whatever the count on it: a whole tray
-    (8 off) is declined too. A below-floor drop across two trays still walks both (spec 04 I25)."""
+    (8 off) is declined too, as a whole-tray drop that goes to the power cycle. A below-floor partial
+    drop across two trays still walks both (spec 04 I25)."""
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
     tray3 = set(range(24, 32))
     fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(tray3)])
     out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(tray3), 8, 32, lambda m: None)
-    assert out is None and fired == []
-    assert "ubb_reset_declined_single_tray" in [n for n, _ in events]
+    assert out is False and fired == []
+    assert "ubb_reset_declined_whole_tray" in [n for n, _ in events]
 
     fired, events = _arm_ubb_walk(monkeypatch, [_beats_without({3, 24})])
     out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without({3, 24}), 2, 32, lambda m: None)
@@ -11370,8 +11371,8 @@ async def test_the_walk_rescans_only_the_re_powered_trays_root_ports(monkeypatch
     monkeypatch.setattr(galaxy, "UBB_WALK_RESCAN_SETTLE_SEC", 0)
     monkeypatch.setattr(pcie_guard, "rescan_trays", lambda trays, log: order.append(("tray", trays)) or ["rp"])
     monkeypatch.setattr(galaxy, "_pci_rescan", lambda: order.append(("global",)))
-    off = set(range(24, 32)) | {3}  # trays 1 and 3
-    await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(off), 9, 32, lambda m: None)
+    off = set(range(24, 28)) | {3}  # trays 1 and 3, neither wholly off (a whole tray is never walked)
+    await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(off), 5, 32, lambda m: None)
     assert order == [("tray", [1]), ("tray", [3])], "each tray's own ports, never the whole bus"
 
 
