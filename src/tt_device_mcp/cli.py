@@ -42,6 +42,7 @@ from tt_device_mcp.constants import (
     POST_STEP_DEADLINE_ENV,
     PRE_STEP_DEADLINE_DEFAULT_SEC,
     PRE_STEP_DEADLINE_ENV,
+    PREEMPT_GRACE_SEC,
     RESET_STREAM_KEEPALIVE_LINE,
     resolve_socket,
     step_client_timeout_sec,
@@ -331,6 +332,7 @@ def cmd_run(args) -> int:
             "env": env_file,
             "inherited_env": inherited_env,
             "timeout_sec": timeout,
+            "preemptable": bool(getattr(args, "preemptable", False)),
         },
     )
 
@@ -416,6 +418,7 @@ def cmd_run_bg(args) -> int:
             "env": env_file,
             "inherited_env": inherited_env,
             "timeout_sec": timeout,
+            "preemptable": bool(getattr(args, "preemptable", False)),
         },
     )
 
@@ -610,7 +613,7 @@ def _fmt_when(iso) -> str:
 
 # ANSI styling — applied only when the destination is a terminal (see _overview),
 # so piping `status` into grep/files stays plain text.
-_ANSI = {"hdr": "\033[1;36m", "dim": "\033[2m", "off": "\033[0m"}
+_ANSI = {"hdr": "\033[1;36m", "dim": "\033[2m", "idle": "\033[1;33m", "off": "\033[0m"}
 
 
 def _style(text: str, key: str, color: bool) -> str:
@@ -735,6 +738,8 @@ def overview_lines(running, queued, rjobs, color: bool = False) -> list:
             jid = job.get("id", "?")[:10]
             icon, owner = _fmt_owner(job.get("owner", "?"))
             cmd = job.get("command", "?")[:80]
+            if job.get("preempt"):
+                cmd = f"[{job['preempt']}] {cmd}"
             runtime = "..."
             started = job.get("started_at")
             if started:
@@ -743,6 +748,11 @@ def overview_lines(running, queued, rjobs, color: bool = False) -> list:
                 except Exception:
                     pass
             lines.append(f"  {jid:<10}  {_pad(icon + _ICON_GAP + owner, max_w + 3)}  {runtime:<8} {cmd}")
+            # The job holds the device but has done no device work for over the threshold
+            # (spec 03 I54). Only IDLE gets a line: active is the normal case, and unknown is
+            # never shown as idle.
+            if job.get("activity") == "idle":
+                lines.append(_style(f"  {'':<10}  {job.get('activity_label') or 'DEVICE IDLE'}", "idle", color))
     else:
         lines.append(_style("  (none)", "dim", color))
 
@@ -800,7 +810,7 @@ def cmd_status(args) -> int:
 
         print(f"Job:     {result['job_id']}")
         print(f"Owner:   {result.get('owner', '?')}")
-        print(f"Status:  {result['status']}")
+        print(f"Status:  {result['status']}" + (f"  [{result['preempt']}]" if result.get("preempt") else ""))
         if result.get("cause"):
             print(f"Cause:   {result['cause']}")
         print(f"Command: {result.get('command', '?')}")
@@ -808,6 +818,10 @@ def cmd_status(args) -> int:
             print(f"Exit:    {result['exit_code']}")
         if result.get("runtime_sec"):
             print(f"Runtime: {result['runtime_sec']:.1f}s")
+        if result.get("activity_label"):
+            print(f"Device:  {result['activity_label']}")
+        elif result.get("idle_total_sec"):
+            print(f"Idle:    {result['idle_total_sec']:.1f}s with the device held and no device work")
         if result.get("log_file"):
             print(f"Log:     {result['log_file']}")
     else:
@@ -1210,6 +1224,8 @@ def _wait_and_stream(
                 print(f"Runtime: {result['runtime_sec']:.1f}s")
             if result["status"] == "timeout" and result.get("hint"):
                 print(f"\n!! TIMED OUT after {result.get('timeout_sec')}s !!\n{result['hint']}")
+            if result["status"] == "preempted":
+                print(f"\n!! PREEMPTED: another job was waiting past the {result.get('timeout_sec')}s soft limit !!")
 
             # Show last N lines summary if requested
             if output_lines > 0 and all_output:
@@ -1222,8 +1238,12 @@ def _wait_and_stream(
         time.sleep(1)
 
 
+WATCH_INTERVAL_SEC = 1.0
+
+
 def cmd_watch(args) -> int:
-    """Live `status`: the same overview, refreshed in place every 2s. Ctrl-C to exit."""
+    """Live `status`: the same overview, refreshed in place every second, so a DEVICE IDLE
+    marker (spec 03 I54) counts up as it happens. Ctrl-C to exit."""
     if not is_daemon_running(args.port):
         print(_server_down_message())
         return 1
@@ -1248,7 +1268,7 @@ def cmd_watch(args) -> int:
             else:
                 sys.stdout.write(frame + "\n")
             sys.stdout.flush()
-            time.sleep(2.0)
+            time.sleep(WATCH_INTERVAL_SEC)
     except KeyboardInterrupt:
         pass
     finally:
@@ -1700,6 +1720,14 @@ Examples:
     run_parser.add_argument("-e", "--env", help="Env file path")
     run_parser.add_argument("-t", "--timeout", type=int, default=600, help="Timeout in seconds")
     run_parser.add_argument(
+        "--preemptable",
+        action="store_true",
+        help=(
+            f"PREEMPTABLE: -t becomes a soft limit; past it the job runs on until another job is "
+            f"queued, then is stopped and SIGKILLed {PREEMPT_GRACE_SEC}s later. Watch the broker."
+        ),
+    )
+    run_parser.add_argument(
         "-o", "--output-lines", type=int, default=0, help="Show last N lines summary at end (default: 0 = no summary)"
     )
 
@@ -1723,6 +1751,14 @@ Examples:
     run_bg_parser.add_argument("-w", "--workspace", help="Workspace path (default: cwd)")
     run_bg_parser.add_argument("-e", "--env", help="Env file path")
     run_bg_parser.add_argument("-t", "--timeout", type=int, default=600, help="Timeout in seconds")
+    run_bg_parser.add_argument(
+        "--preemptable",
+        action="store_true",
+        help=(
+            f"PREEMPTABLE: -t becomes a soft limit; past it the job runs on until another job is "
+            f"queued, then is stopped and SIGKILLed {PREEMPT_GRACE_SEC}s later. Watch the broker."
+        ),
+    )
 
     status_parser = subparsers.add_parser(
         "status", help="[N] [-j ID]  — queue + last N recent (all users, default 15); -j for one job's detail"

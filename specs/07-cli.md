@@ -134,7 +134,7 @@ isolation knob).
 | `pre-step` | — (root) | `/api/tt_device_pre_step` | one verdict line; holders named when present | 0 iff device fit **and** free; 1 unfit / refused / inconclusive / server down |
 | `post-step` | `[--exit-code N] [--no-reclaim]` (root) | `/api/tt_device_post_step` | reclaim + verdict lines | 0 iff device ends fit; 1 otherwise |
 | `exec` | `<cmd> [-t sec] [-f/--force]` | `/api/tt_device_exec` | stdout→stdout, stderr→stderr | the diagnostic's `exit_code`; 1 on refusal / server down |
-| `watch` | `[N]` | `/api/tt_device_queue_status` + `/api/tt_device_recent_jobs` (looped) | the `status` overview, redrawn every 2 s | 0 (Ctrl-C); 1 server down at start |
+| `watch` | `[N]` | `/api/tt_device_queue_status` + `/api/tt_device_recent_jobs` (looped) | the `status` overview, redrawn every 1 s | 0 (Ctrl-C); 1 server down at start |
 | `smi` | `[tt-smi args]` | none — local exec (I7) | tt-smi owns the terminal | tt-smi's; 2 disallowed flag; 1 launch failure / missing wrapper |
 | `timezone` | `[City \| ±N \| pacific] [--list [TEXT]]` | none — local file | current zone + source, listing, or the new label | 0; 1 unknown/ambiguous zone, bad offset |
 | `lock` / `unlock` | — (sudo) | none — udev rule, unit edit, self-checks (mechanics: spec 05) | LOCKED/UNLOCKED or self-check verdict | 0 verified; 1 not root / no broker unit / self-check failed or inconclusive |
@@ -171,7 +171,9 @@ server's ceiling so the failure is a clear line rather than a validation error. 
 `-j ID` flag — job ids are bare digits, so they cannot share the positional (a numeric id in the
 positional is read as a count). A non-digit positional is silently ignored. The overview is one
 frame of `watch`: RUNNING and QUEUED from `queue_status`, RECENT from `recent_jobs` (durable
-across restarts; includes broker-owned resets and execs, marked by owner icon). ANSI styling only
+across restarts; includes broker-owned resets and execs, marked by owner icon). A running job
+that does no device work gets a `DEVICE IDLE for <n>` line under its row (spec 03 I54; active and
+unknown get none); `status -j ID` prints it as `Device:`, and a finished job's total as `Idle:`. ANSI styling only
 when stdout is a tty, so piping stays plain text. The TIME column renders server-side naive-UTC
 timestamps in the caller's zone (below); recent rows are stamped with start time (execution
 order), not queue time — WAIT already carries the queue delay.
@@ -214,7 +216,8 @@ same value in both — a deployment property, not something this code enforces (
 where each process gets its copy; `deploy/README.md`'s Slurm section covers what happens when
 only one side is set).
 
-**`watch`.** Client-side loop: fetch the same overview every 2 s and redraw. On a tty it enters
+**`watch`.** Client-side loop: fetch the same overview every 1 s and redraw, so a running job's
+`DEVICE IDLE for <n>` line (spec 03 I54) counts up live. On a tty it enters
 the alternate screen with the cursor hidden (like `top`), homes, redraws with per-line erase, and
 erases the remainder — no scrollback pollution — restoring the screen on Ctrl-C; piped output
 writes frames sequentially, plain. The header shows the caller's zone and current time.
@@ -308,6 +311,7 @@ non-zero keeps that bit honest; `exec` propagates the real exit code because a d
 | `post-step` carries the step's exit code and the reclaim switch | `tests/test_cli.py::test_post_step_sends_the_exit_code_and_reclaim_flag` |
 | `reset` asks for keepalives | `tests/test_cli.py::test_cmd_reset_opens_the_stream_with_the_arguments_it_was_given` |
 | `reset` hides keepalives and still reads the status | `tests/test_cli.py::test_reset_stream_hides_keepalives_and_still_reads_the_status` |
+| `watch` redraws every 1 s; `status` shows DEVICE IDLE (03 I54) | `tests/test_device_activity.py::test_watch_redraws_every_second`, `tests/test_device_activity.py::test_the_cli_overview_marks_only_an_idle_job`, `tests/test_device_activity.py::test_cli_status_of_one_job_prints_its_device_line` |
 | step verbs exist under the names a site scripts | `tests/test_cli.py::test_cli_step_commands_exist` |
 
 Unanchored (verified against `cli.py` directly, no test exercises them): I4's exit-code mapping

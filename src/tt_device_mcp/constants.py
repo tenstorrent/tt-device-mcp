@@ -49,6 +49,11 @@ SURVIVOR_TERM_GRACE_SEC = 5
 # driver), and no signal will move it.
 SURVIVOR_KILL_WAIT_SEC = 2
 
+# A preemptable job's whole stop window, from the first signal to SIGKILL. Its owner has
+# agreed to watch the queue and get off the device within this once another job is waiting
+# past its soft limit, so it is shorter than the ordinary ladder (SIGINT 60 s + SIGTERM 15 s).
+PREEMPT_GRACE_SEC = 60
+
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
 # is deliberately never killed, because one stopped partway through 32 ASICs is far worse

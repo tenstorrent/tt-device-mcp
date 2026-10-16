@@ -8,6 +8,7 @@ while the box shuts down. Without a latch the hold watchdog's next tick forced t
 same second and ran a parent-bridge reset plus a PCI rescan during the shutdown.
 """
 
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -108,6 +109,27 @@ async def test_no_reset_on_the_hold_tick_after_a_reboot_was_requested(monkeypatc
 
     assert issued == [], f"reset the device while the box was going down: {issued}"
     assert srv._forced_escalation_task is None
+    # The watchdog's own pending-request guard answers first; the latch backs it on every other path.
+    assert {"hold_escalation_suppressed_host_action", "reset_refused_host_rung_in_flight"} & set(events)
+    assert srv.device_hold_escalate_bucket == 0, "a refused window is not spent"
+
+
+@pytest.mark.asyncio
+async def test_the_latch_alone_keeps_the_hold_tick_from_resetting(monkeypatch, tmp_path, clear_job_state):
+    """The latch backs the watchdog's pending-request guard: with that request gone, the tick still
+    forces nothing and journals the latch refusal."""
+    issued = _held_past_ceiling(monkeypatch, tmp_path)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
+    go, fired = _fire_ok(monkeypatch)
+    await go()
+    srv.recovery_mechanism.host_action_requested = None
+
+    srv._check_hold_deadline()
+    if srv._forced_escalation_task is not None:
+        await srv._forced_escalation_task
+
+    assert issued == [] and srv._forced_escalation_task is None
     assert "reset_refused_host_rung_in_flight" in events
     assert srv.device_hold_escalate_bucket == 0, "a refused window is not spent"
 
@@ -182,18 +204,31 @@ async def test_a_fire_that_did_not_launch_latches_nothing(monkeypatch):
 def test_the_latch_expires_so_a_reboot_that_never_happened_does_not_hold_forever(monkeypatch):
     events = []
     patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
-    monkeypatch.delenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", raising=False)
     host_rung_latch.latch("reboot", "r", now=1000.0)
-    assert host_rung_latch.refuse("x", now=1000.0 + 1799)
-    assert host_rung_latch.refuse("x", now=1000.0 + 1800) == ""
+    assert host_rung_latch.refuse("x", now=1000.0 + 899)
+    assert host_rung_latch.refuse("x", now=1000.0 + 900) == ""
     assert "host_rung_latch_expired" in events
     assert host_rung_latch.in_flight() is None
 
 
-@pytest.mark.parametrize("value,expected", [(None, 1800.0), ("60", 60.0), ("0", 1800.0), ("x", 1800.0)])
-def test_the_latch_knob(monkeypatch, value, expected):
+def test_an_expired_watchdog_request_ends_the_latch_too(monkeypatch):
+    """One bound for every reset path: once the hold watchdog reads the request as failed, the bridge,
+    tray and operator paths resume with it, not on a later clock."""
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
+    host_rung_latch.latch("power-cycle", "r")
+    srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic() - 901)
+    assert srv.recovery_mechanism.host_action_pending() is None
+    assert host_rung_latch.in_flight() is None
+    assert host_rung_latch.refuse("bridge reset") == ""
+    assert "host_rung_latch_expired" in events
+
+
+@pytest.mark.parametrize("value,expected", [(None, 900.0), ("60", 60.0), ("0", 900.0), ("x", 900.0), ("99999", 3600.0)])
+def test_the_latch_follows_the_host_action_pending_bound(monkeypatch, value, expected):
     if value is None:
-        monkeypatch.delenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", raising=False)
+        monkeypatch.delenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", raising=False)
     else:
-        monkeypatch.setenv("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", value)
+        monkeypatch.setenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", value)
     assert host_rung_latch.latch_sec() == expected

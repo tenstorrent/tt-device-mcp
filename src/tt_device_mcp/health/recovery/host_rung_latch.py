@@ -11,18 +11,16 @@ a parent-bridge reset and a PCI rescan once ran in the same second the reboot wa
 So a fire that returned normally latches here, process-wide, and every reset entry point refuses
 while it is set. A reboot or power cycle that really happens ends the process, and the latch with it.
 One that never happens (cancelled, or a command that returned without acting) must not hold the
-device forever, so the latch expires after ``TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC`` (default 1800 s)
-and the ladder may act again."""
+device forever, so the latch expires after the host-action pending bound
+(``TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC``, the same one the hold watchdog waits on) and the ladder
+may act again."""
 
 from __future__ import annotations
 
-import os
 import time
 from typing import Optional
 
 from tt_device_mcp.health.evidence import health_event
-
-HOST_RUNG_LATCH_SEC_DEFAULT = 1800
 
 # {"action": "reboot" | "power-cycle", "reason": str, "at": epoch seconds}, or None.
 _LATCH: Optional[dict] = None
@@ -32,13 +30,12 @@ _REFUSED_SEEN: set = set()
 
 
 def latch_sec() -> float:
-    """How long a latched host rung refuses resets before it is presumed not to have happened. A
-    non-positive or malformed value reads as the default: the latch is never switched off."""
-    try:
-        sec = float(os.environ.get("TT_DEVICE_MCP_HOST_RUNG_LATCH_SEC", HOST_RUNG_LATCH_SEC_DEFAULT))
-    except ValueError:
-        return float(HOST_RUNG_LATCH_SEC_DEFAULT)
-    return sec if sec > 0 else float(HOST_RUNG_LATCH_SEC_DEFAULT)
+    """How long a latched host rung refuses resets before it is presumed not to have happened: the
+    host-action pending bound, so the watchdog and every other reset path resume together. Always
+    finite and positive (that bound reads garbage as its default and is capped)."""
+    from tt_device_mcp.health.recovery.base import host_action_pending_sec
+
+    return host_action_pending_sec()
 
 
 def latch(action: str, reason: str, *, now: Optional[float] = None) -> None:
@@ -57,10 +54,20 @@ def in_flight(*, now: Optional[float] = None) -> Optional[dict]:
     age = (time.time() if now is None else now) - _LATCH["at"]
     if age < latch_sec():
         return _LATCH
+    expire(now=now)
+    return None
+
+
+def expire(*, now: Optional[float] = None) -> None:
+    """Drop a latch whose request is presumed not to have happened, loudly. Also called when the hold
+    watchdog's pending request expires, so no reset path stays refused past it."""
+    global _LATCH
+    if _LATCH is None:
+        return
+    age = (time.time() if now is None else now) - _LATCH["at"]
     health_event("host_rung_latch_expired", action=_LATCH["action"], reason=_LATCH["reason"], age_sec=int(age))
     _LATCH = None
     _REFUSED_SEEN.clear()
-    return None
 
 
 def refuse(entry: str, log=None, *, now: Optional[float] = None) -> str:
