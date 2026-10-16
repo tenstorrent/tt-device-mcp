@@ -716,6 +716,17 @@ job boundary.
   (`TT_DEVICE_MCP_SELFHEAL_RELIFT=0`, `TT_DEVICE_MCP_FORCE_ESCALATE=0`), or I28 holds the mesh
   reset, the RUNG INVENTORY logs a `RUNG GAP` warning at boot and `/health` carries `hold_exit_gap`
   naming why a held present mesh has no automatic exit (`null` otherwise).
+- **I56 — A 77 from a validator crash gets one reset per hold episode.** When the last fabric pass
+  could not run because the validator crashed on `map::at` (`what(): unordered_map::at` or
+  `map::at`: it looked up a link or chip the mesh did not have), the fabric-unverified hold is
+  treated as I53 treats a measured link drop, even when no eth read recorded one: not a 77-only
+  hold and not a no-reset hold, so the idle relift sends it to the present-mesh rung (a galaxy reset,
+  then the full post-reset check, fabric included) and only a passing fabric verdict releases the
+  device. Only once per hold episode: after that episode's reset came back unverified (a 77 again),
+  a persistent crash is a 77-only hold again and keeps I48/I40 and the I40 fallback (whose climb
+  after an unverified reset is spec 04 I29), never a second reset from this rule. The I53
+  exclusions apply. Time-to-recover for this class drops from the
+  I40 bound (about 17 minutes) to the present-mesh grace plus one reset and check (about 4 minutes).
 
 ## Interfaces
 
@@ -1291,6 +1302,7 @@ refuses.
 | I55 (under the outage hold: no reset, held, paged, honest message) | `tests/test_dispatch_failure_reset.py::test_outage_hold_holds_and_pages_without_a_reset` |
 | I55 (the verdict names the dispatch failure, never the downgraded mismatch) | `tests/test_dispatch_failure_reset.py::test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch`, `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I55 (rung gap warned at boot and on /health; floor message honest) | `tests/test_dispatch_failure_reset.py::test_rung_gap_boot_warning_and_health_field`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
+| I56 | `tests/test_startup_fabric_hugepages.py::test_a_validator_crash_77_escalates_on_the_first_relift`, `tests/test_startup_fabric_hugepages.py::test_the_crash_reset_runs_the_full_check_and_releases_only_on_a_pass`, `tests/test_startup_fabric_hugepages.py::test_a_validator_crash_77_gets_no_second_reset_after_an_unverified_one`, `tests/test_startup_fabric_hugepages.py::test_a_validator_crash_77_keeps_its_no_reset_exclusions`, `tests/test_startup_fabric_hugepages.py::test_the_replayed_crash_hold_with_links_down_escalates_present` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

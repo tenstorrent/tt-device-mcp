@@ -3454,7 +3454,9 @@ def _fabric_77_only_hold() -> bool:
     never escalated to a reset by the idle relift, the deadline escalation or the watchdog; the
     idle relift re-runs the fabric pass instead, and a real verdict decides.
 
-    Not when the last eth read measured links down (see _fabric_77_eth_drop): that is a fault."""
+    Not when the last eth read measured links down (see _fabric_77_eth_drop), or the validator
+    crashed on a mesh this episode has not yet reset (see _fabric_77_validator_crash): those are
+    faults."""
     return (
         fsm.state is ServerState.RECOVERING
         and fsm.record.why == FABRIC_RELIFT_WHY
@@ -3462,7 +3464,7 @@ def _fabric_77_only_hold() -> bool:
         and not device_fault_reported
         and not isolated_chips
         and health_monitor.last_fabric_ok is not False
-        and not _fabric_77_eth_drop()
+        and not _fabric_77_reset_cause()
     )
 
 
@@ -3475,17 +3477,55 @@ def _fabric_77_eth_drop() -> str:
     bound only delays it. Not for a known cable fault (a 78), a topology mismatch or fault, or a
     missing prerequisite (hugepages, the validator): no reset fixes those."""
     drop = health_monitor.last_eth_link_drop if health_monitor is not None else ""
-    if not drop or health_monitor.known_fabric_fault() or health_monitor.topology_hw_fault:
-        return ""
-    if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
-        return ""
-    if _validator_line_names_topology(health_monitor.last_fabric_output or ""):
-        return ""
-    if _last_77_was_hugepages() or fabric.validator_missing() is not None:
-        return ""
-    if "hugepages not yet allocated" in str(fsm.record.detail or ""):  # the startup pass's hugepages hold
+    if not drop or _fabric_77_no_reset_cause():
         return ""
     return drop
+
+
+def _fabric_77_no_reset_cause() -> bool:
+    """Whether the 77 has a cause no reset fixes: a known cable fault (a 78), a topology mismatch or
+    fault, or a missing prerequisite (hugepages, the validator)."""
+    if health_monitor.known_fabric_fault() or health_monitor.topology_hw_fault:
+        return True
+    if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
+        return True
+    if _validator_line_names_topology(health_monitor.last_fabric_output or ""):
+        return True
+    if _last_77_was_hugepages() or fabric.validator_missing() is not None:
+        return True
+    return "hugepages not yet allocated" in str(fsm.record.detail or "")  # the startup pass's hugepages hold
+
+
+# The fabric validator's own crash on a mesh it cannot map (an unordered_map lookup of a link or chip
+# it did not find), which the wrapper reports as a 77.
+_VALIDATOR_CRASH_RE = re.compile(r"what\(\):\s+(unordered_)?map::at")
+
+
+def _fabric_77_validator_crash() -> str:
+    """The validator crash that makes a fabric 77 worth one reset, or "" (spec 03 I56).
+
+    A validator that dies on ``map::at`` found a mesh whose links or chips do not match what it
+    looked up: on one Galaxy host every such pass came after links went down, and a galaxy reset
+    healed it in under two minutes while the relift re-ran the pass for 17. So the crash gets the
+    present-mesh rung once per hold episode even when no eth read measured the drop. Once that
+    episode's reset came back unverified, a persistent crash is a missing verdict again: it goes to
+    the I40 bound and its fallback, never a second reset from here. Not for the causes no reset
+    fixes (see _fabric_77_no_reset_cause)."""
+    if health_monitor is None or not health_monitor.last_fabric_skipped:
+        return ""
+    found = _VALIDATOR_CRASH_RE.search(health_monitor.last_fabric_output or "")
+    if not found or not device_hold_episode_since:
+        return ""
+    if recovery_mechanism.unverified_reset_since == device_hold_episode_since:
+        return ""
+    if _fabric_77_no_reset_cause():
+        return ""
+    return f"the fabric validator crashed ({found.group(0)})"
+
+
+def _fabric_77_reset_cause() -> str:
+    """What makes this fabric 77 a fault the present-mesh rung can fix, or ""."""
+    return _fabric_77_eth_drop() or _fabric_77_validator_crash()
 
 
 # The episode (its ``since``) of a 77-only hold that owes the startup fabric pass it never got: the
@@ -3657,7 +3697,7 @@ def _fabric_no_reset_hold() -> str:
         fabric_hold
         and not device_fault_reported
         and health_monitor.last_fabric_ok is not False
-        and not _fabric_77_eth_drop()
+        and not _fabric_77_reset_cause()
     ):
         return "fabric check could not run (77)"
     return ""
@@ -3928,8 +3968,11 @@ async def _attempt_idle_relift() -> None:
                 if fsm.record.why == "foreign_holder" and await _foreign_holder_fast_verify(expected, _log):
                     return
                 drop = _fabric_77_eth_drop() if fsm.record.why == FABRIC_RELIFT_WHY else ""
+                crash = "" if drop or fsm.record.why != FABRIC_RELIFT_WHY else _fabric_77_validator_crash()
                 if drop:
                     _log(f"fabric 77 with eth links measured down ({drop}) — a fault: the present-mesh rung")
+                elif crash:
+                    _log(f"fabric 77: {crash} — a fault: the present-mesh rung, once this episode")
                 if await _escalate("present"):
                     return
                 _log(
