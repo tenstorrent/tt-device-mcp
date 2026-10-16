@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """The post-reset eth link-count check's durable state (spec 03 I64, spec 04 I57).
 
 A reset's verify proves enumeration, ARC and a fabric traffic pass; the traffic pass can still

@@ -20,6 +20,7 @@ from typing import Callable, Optional
 
 from tt_device_mcp import alert, metrics, privileges
 from tt_device_mcp.device_holders import holder_comm, is_tenant, username_for_uid
+from tt_device_mcp.health import eth_deficit
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count
@@ -1263,7 +1264,16 @@ class GalaxyRecovery(Recovery):
             # DEFER lands here too: a reset already cycling in its own scope is not a second reset
             # to start but one to ADOPT — _reset_and_verify_device waits that scope out
             # (await_foreign_scope) and verifies its result instead of issuing anything.
+            if stage == STAGE_SMI_RESET and await asyncio.to_thread(eth_deficit.reset_spent):
+                # An eth link deficit whose reset already came back short (spec 04 I57): another reset
+                # measures nothing new. Hold; the idle escalation climbs to the host rungs.
+                log("eth link deficit already had its reset rung — no second reset; the hold climbs to the host rungs")
+                health_event("eth_link_deficit_reset_skipped", path=f"gate/{gate_phase}")
+                metrics.stage_fired("smi_reset", "blocked")
+                return OUTCOME_WAITING
             if not await self._reset_and_verify_device(indices, log):
+                if self.last_reset_link_drop:
+                    await asyncio.to_thread(eth_deficit.mark_reset_spent)
                 return OUTCOME_WAITING
             self.deps.clear_device_reported_fault(f"gate/{gate_phase}: reset recovered the mesh")
             self.deps.clear_device_dirty(verified=True, why=f"gate/{gate_phase}: reset recovered the mesh")
@@ -1941,7 +1951,16 @@ class GalaxyRecovery(Recovery):
             # finally ran. Go straight to the last-chance sweep, then the host climb (spec 04 I29).
             await self._sweep_after_unverified_reset(expected, off_bus_before, hold_since, log)
             return True
+        if await asyncio.to_thread(eth_deficit.reset_spent):
+            # An eth link deficit whose reset already came back short (spec 04 I57): no reset loop on a
+            # missing link, and no last-chance sweep of more resets; straight to the host climb.
+            log("eth link deficit already had its reset rung — skipping the galaxy reset, climbing to the host rungs")
+            health_event("eth_link_deficit_reset_skipped", path="idle escalation", forced=force)
+            await self._climb_to_host_recovery_after_failed_reset(expected, off_bus_before, log, swept=True)
+            return True
         recovered = await self._reset_and_verify_device(indices, log)
+        if recovered is False and self.last_reset_link_drop:
+            await asyncio.to_thread(eth_deficit.mark_reset_spent)
         if recovered is None:
             # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, and its
             # passes already count toward the relift's bound (spec 03 I40), so the next relift gates on

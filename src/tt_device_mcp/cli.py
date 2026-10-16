@@ -1588,6 +1588,47 @@ def cmd_unlock(args) -> int:
     return 0
 
 
+def cmd_eth_links(args) -> int:
+    """Show, accept or clear the eth link deficit the post-reset check releases at (spec 03 I64).
+    Accepting tolerates a known missing link (a cable awaiting repair) so a reset no longer holds on
+    it; clearing restores the full link mark. Writes the broker's health dir: run as the broker's
+    user (sudo for the system broker). No daemon needed."""
+    from tt_device_mcp.health import eth_deficit
+    from tt_device_mcp.health.evidence import health_dir, health_event
+
+    try:
+        data = json.loads((health_dir() / "eth_link_baseline.json").read_text())
+        mark = max(int(data.get("links", 0)), int(data.get("high_water", 0) or 0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        mark = 0
+    action = args.eth_links_command or "show"
+    if action == "show":
+        print(f"link mark:        {mark or 'none'}")
+        for name, rec in (("accepted deficit", eth_deficit.read_accepted()), ("pending deficit", eth_deficit.read_pending())):
+            print(f"{name + ':':<17} {json.dumps(rec) if rec else 'none'}")
+        return 0
+    if action == "clear":
+        cleared = eth_deficit.clear_accepted()
+        cleared = eth_deficit.clear_pending() or cleared
+        if cleared:
+            health_event("eth_link_deficit_cleared", source="operator", high_water=mark)
+        print("cleared: the post-reset check needs the full link mark again" if cleared else "no deficit recorded")
+        return 0
+    pend = eth_deficit.read_pending()
+    links = args.links if args.links is not None else (pend["links"] if pend else None)
+    if links is None:
+        print("no pending deficit to accept; pass --links N", file=sys.stderr)
+        return 2
+    if links < 0 or (mark and links >= mark):
+        print(f"--links {links} is not below the link mark ({mark}): nothing to accept", file=sys.stderr)
+        return 2
+    rec = eth_deficit.write_accepted(links, mark, source="operator", ports=args.ports or None)
+    eth_deficit.clear_pending()
+    health_event("eth_link_deficit_accepted", links=links, high_water=mark, accepted=links, source="operator")
+    print(f"accepted: a post-reset pass with at least {links} of {mark} eth links releases ({json.dumps(rec)})")
+    return 0
+
+
 def cmd_timezone(args) -> int:
     """Show, list, or set this user's timezone for the TIME column. Stored per-user,
     so tenants on a shared box don't affect each other. No root, no daemon."""
@@ -1846,6 +1887,15 @@ Examples:
         metavar="TEXT",
         help="List timezone names matching TEXT (e.g. --list bel)",
     )
+    eth_links_parser = subparsers.add_parser(
+        "eth-links", help="show|accept [--links N] [--ports P ...]|clear  — the eth link deficit a reset releases at"
+    )
+    eth_links_sub = eth_links_parser.add_subparsers(dest="eth_links_command")
+    eth_links_sub.add_parser("show", help="the link mark, the accepted deficit and a pending one")
+    eth_accept = eth_links_sub.add_parser("accept", help="tolerate a known link deficit (default: the pending count)")
+    eth_accept.add_argument("--links", type=int, default=None, help="the link count to release at")
+    eth_accept.add_argument("--ports", nargs="*", default=None, help="the missing ports, for the record")
+    eth_links_sub.add_parser("clear", help="drop the deficit records: the full link mark applies again")
     subparsers.add_parser("refresh-banner", help=argparse.SUPPRESS)  # internal: reconcile login banner on update
     subparsers.add_parser("help", help="  — show this help (same as --help)")
 
@@ -1898,6 +1948,7 @@ Examples:
         "lock": cmd_lock,
         "unlock": cmd_unlock,
         "timezone": cmd_timezone,
+        "eth-links": cmd_eth_links,
         "refresh-banner": cmd_refresh_banner,
     }
 

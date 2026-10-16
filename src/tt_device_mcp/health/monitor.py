@@ -34,6 +34,7 @@ from tt_device_mcp.constants import (
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
+from tt_device_mcp.health import eth_deficit
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
@@ -346,6 +347,9 @@ class HealthMonitor:
         # The last measured eth link count's drop below the high-water mark ("" when it met the mark).
         # A 77 on a mesh with links measured down is a fault a reset can fix, not a missing verdict.
         self.last_eth_link_drop: str = ""
+        # The built-in eth read's measured link count this pass (None: no built-in count was read).
+        # The post-reset check compares it with the link mark (spec 03 I64).
+        self.last_eth_links: Optional[int] = None
         self._cable_fault_alerted: set[str] = set()
         self._fabric_route_fault_streak: int = 0
         # The in-flight fabric traffic pass. It maps every chip's BARs, so when a chip leaves the
@@ -411,6 +415,8 @@ class HealthMonitor:
                 indices = await asyncio.to_thread(self._present_chip_indices)
             expected = self.expected(len(indices))
         observations: list[Observation] = []
+        # The reset this pass verifies, if any: the fabric pass below settles the debt, so read it first.
+        owed = FABRIC_DEBT.owed
 
         def _record(monitor: str, ok: Optional[bool], detail: str, evidence: Optional[dict] = None) -> None:
             verdict = Verdict.HEALTHY if ok is True else Verdict.UNHEALTHY if ok is False else Verdict.SKIPPED
@@ -507,6 +513,14 @@ class HealthMonitor:
                 if log:
                     log(f"fabric: {'SKIPPED' if fok is None else ('OK' if fok else 'UNHEALTHY')} — {fdetail}")
                 _record("fabric", fok, fdetail)
+                if fok is True and owed and expected > 1 and self.last_eth_links is not None:
+                    drop = await asyncio.to_thread(self._post_reset_link_verdict, self.last_eth_links, owed)
+                    if drop is not None:
+                        if log:
+                            log(f"fabric: UNHEALTHY — {drop[0]}")
+                        observations[-1] = Observation(
+                            monitor="fabric", verdict=Verdict.UNHEALTHY, detail=drop[0], evidence=drop[1], phase=phase
+                        )
 
         return _store()
 
@@ -652,6 +666,62 @@ class HealthMonitor:
         if topo is not None:
             _write_json(self.ETH_LINK_BASELINE_FILE, {"links": max(links, topo[0])})
             health_event("eth_link_baseline_restored", links=max(links, topo[0]))
+
+    def _eth_link_bar(self) -> Optional[int]:
+        """The link count a post-reset pass must measure: the mark in force, read after this pass's
+        eth read ratcheted it. A plain mark is ``max(links, high_water)`` and never lowered here; a
+        topology re-baseline keyed to this chip-to-bus map (I45) is its own mark. None: no mark."""
+        try:
+            data = json.loads((health_dir() / self.ETH_LINK_BASELINE_FILE).read_text())
+            links = int(data.get("links", 0))
+            high = int(data.get("high_water", 0) or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+        topo = self._topology_baseline(data)
+        if topo is not None and not topo[2] and topo[1] == _asic_bus_map():
+            return links or None
+        return max(links, high) or None
+
+    def _post_reset_link_verdict(self, measured: int, owed: str) -> Optional[tuple[str, dict]]:
+        """Spec 03 I64: a post-reset fabric pass passed; did the reset bring every eth link back?
+        Returns None to keep the pass, else ``(detail, evidence)`` that fail it. A count at the mark
+        clears any deficit record; one at an accepted deficit passes loudly; a new deficit is pending
+        until a broker power cycle came back with it (then accepted), and fails until then."""
+        bar = self._eth_link_bar()
+        if bar is None or measured >= bar:
+            cleared = eth_deficit.clear_accepted()
+            if eth_deficit.clear_pending() or cleared:
+                health_event("eth_link_deficit_cleared", links=measured, high_water=bar, reset=owed)
+            return None
+        acc = eth_deficit.read_accepted()
+        boot = _read_boot_id()
+        pend = eth_deficit.read_pending()
+        if not (acc and measured >= acc["links"]) and pend and measured >= pend["links"]:
+            if eth_deficit.power_cycled_since(pend, boot):
+                acc = eth_deficit.write_accepted(measured, bar, source="power_cycle")
+                eth_deficit.clear_pending()
+        if acc and measured >= acc["links"]:
+            health_event(
+                "eth_link_deficit_accepted",
+                links=measured,
+                high_water=bar,
+                accepted=acc["links"],
+                source=acc.get("source", ""),
+                reset=owed,
+            )
+            self._logger.warning(
+                f"post-reset fabric passed on {measured} of {bar} eth links — at the accepted deficit "
+                f"({acc.get('source', '')}), released; `tt-device-mcp eth-links clear` restores the full bar"
+            )
+            return None
+        # A new deficit: its boot is this one, so a later boot can tell a broker power cycle ended it.
+        spent = bool(pend and pend["links"] == measured and pend.get("reset_spent"))
+        eth_deficit.write_pending(measured, bar, boot, reset_spent=spent)
+        health_event("eth_link_deficit_held", links=measured, high_water=bar, reset=owed, reset_spent=spent)
+        self.last_fabric_ok = False
+        FABRIC_DEBT.reopen(owed)
+        detail = f"fabric passed on {measured} of {bar} baseline eth links — link-count drop after a reset"
+        return detail, {"links": measured, "high_water": bar, "link_drop": True}
 
     def _health_check_enabled(self) -> bool:
         """Whether the tt-smi snapshot health check runs around jobs. On by default;
@@ -1277,6 +1347,7 @@ class HealthMonitor:
         return ok, detail
 
     async def _verify_eth_heartbeat_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
+        self.last_eth_links = None
         override = self._eth_heartbeat_cmd()
         # build() can shell out up to three candidate pythons (health.monitors.eth.resolve_python)
         # on a cache miss once armed — off the event loop, or a health gate stalls the job queue,
@@ -1367,6 +1438,7 @@ class HealthMonitor:
         else:
             ok, reason = eth.classify_exit(rc)
             links = eth.parse_link_count(text)
+            self.last_eth_links = links or None
             # A down link is invisible to the verdict above (the probe skips it), so a drop in the
             # measured count turns an all-advancing read into "could not vouch": the caller then
             # runs the traffic pass, which is what tests every link. A frozen verdict stays frozen.

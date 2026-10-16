@@ -82,6 +82,12 @@ POST_RESET_FABRIC_RETRIES = int(os.environ.get("TT_DEVICE_MCP_POST_RESET_FABRIC_
 POST_RESET_FABRIC_RETRY_SLEEP_SEC = float(os.environ.get("TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC", "60"))
 
 
+def _eth_link_drop(evidence: dict) -> bool:
+    """A fabric pass that passed on fewer eth links than the mark after a reset (spec 03 I64)."""
+    f = evidence.get("fabric")
+    return isinstance(f, dict) and bool(f.get("link_drop"))
+
+
 @dataclass(frozen=True)
 class Evidence:
     """The gate's live read of the mesh, reshaped for :meth:`Recovery.next_stage`.
@@ -314,6 +320,8 @@ class Recovery(ABC):
         # Set fresh by every _recover_isolated_chips call; defined here so the gate can read it
         # even when no bridge rung has run on this instance yet.
         self.last_bridge_reset_reasons: dict = {}
+        # Whether the last post-reset verify came back short of eth links (spec 03 I64).
+        self.last_reset_link_drop: bool = False
 
     @abstractmethod
     def next_stage(self, ev: Evidence) -> str:
@@ -582,14 +590,18 @@ class Recovery(ABC):
         healthy, evidence = await self._verify_device(expected, log)
         retries = 0
         while (
-            self._fabric_ran_but_unverified(evidence)
-            and healthy
+            ((self._fabric_ran_but_unverified(evidence) and healthy) or _eth_link_drop(evidence))
             and expected > 1
             and retries < POST_RESET_FABRIC_RETRIES
         ):
             retries += 1
+            what = (
+                "came back short of eth links"
+                if _eth_link_drop(evidence)
+                else "found no trained link (77)"
+            )
             log(
-                f"post-reset fabric found no trained link (77) — waiting {POST_RESET_FABRIC_RETRY_SLEEP_SEC:.0f}s "
+                f"post-reset fabric {what} — waiting {POST_RESET_FABRIC_RETRY_SLEEP_SEC:.0f}s "
                 f"for eth training, then re-checking (retry {retries}/{POST_RESET_FABRIC_RETRIES})"
             )
             await asyncio.sleep(POST_RESET_FABRIC_RETRY_SLEEP_SEC)
@@ -601,6 +613,8 @@ class Recovery(ABC):
             )
             healthy = None
         FABRIC_DEBT.note_evidence(evidence)
+        # Read by the ladder: a reset whose verify still came back short of links spent its rung (04 I57).
+        self.last_reset_link_drop = _eth_link_drop(evidence)
         return healthy, evidence, retries
 
     async def _reset_and_verify_device(self, indices: list, log) -> Optional[bool]:
@@ -631,6 +645,7 @@ class Recovery(ABC):
         # foreign scope or a clean-exit-but-unverified reset must not leave a stale hard-fail flag that
         # steers the next gate's escalation to the cold rung over a reset that never hard-failed.
         self.mechanism.last_reset_exit_nonzero = False
+        self.last_reset_link_drop = False
         argv = select_recovery(self.monitor, self.mechanism, self.deps).reset_argv(indices)
         expected = self.monitor.expected(len(indices))
 
@@ -644,6 +659,7 @@ class Recovery(ABC):
             self.monitor.last_fabric_ok = None  # the pre-reset verdict describes a mesh that is gone
             healthy, evidence = await self._verify_device(expected, log)
             FABRIC_DEBT.note_evidence(evidence)
+            self.last_reset_link_drop = _eth_link_drop(evidence)
             self.mechanism.last_reset_failed = not healthy
             return healthy
 

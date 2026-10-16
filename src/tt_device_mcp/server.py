@@ -154,6 +154,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.health import eth_deficit
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
@@ -6030,6 +6031,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
             payload["operator_handoff"] = handoff  # spec 04 I33: who must act on the hold, and by when
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
+    # Spec 03 I64: the eth link deficit this host releases at, below its link mark; null when none.
+    payload["eth_link_deficit"] = eth_deficit.read_accepted()
     return payload
 
 

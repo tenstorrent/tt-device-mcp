@@ -47,6 +47,13 @@ class FabricDebt:
             health_event("post_reset_fabric_settled", reset=self.owed)
             self.owed = ""
 
+    def reopen(self, what: str) -> None:
+        """A healthy pass that a later check of the same verify failed (spec 03 I64: the eth link
+        count came back short) settled nothing: owe the pass again."""
+        if not self.owed:
+            health_event("post_reset_fabric_reopened", reset=what)
+        self.owed = what
+
     def note_evidence(self, evidence: Optional[dict]) -> None:
         """Fold the fabric verdict of a verify pass's evidence in, when that pass ran one."""
         fab = (evidence or {}).get("fabric")
