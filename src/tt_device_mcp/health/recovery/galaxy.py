@@ -1735,9 +1735,7 @@ class GalaxyRecovery(Recovery):
             # held the device fabric-unverified. No host rung on a verify that passed; the fabric relift
             # owns the hold, bounded by 03 I40/I48.
             log(f"the mesh passed enum+ARC after the {via}, but no fabric pass has passed since — held")
-            health_event(
-                "host_rung_sweep_unverified", context=context or gate_phase, via=via, evidence=evidence
-            )
+            health_event("host_rung_sweep_unverified", context=context or gate_phase, via=via, evidence=evidence)
             return True
         log(f"the mesh verified after the {via} — no reboot or power cycle needed")
         health_event("gate", phase=gate_phase, healthy=True, recovered_via=via, evidence=evidence)
