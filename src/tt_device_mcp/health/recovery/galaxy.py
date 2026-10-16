@@ -516,6 +516,7 @@ def _route(
     host_escalation: Optional[str],
     reboot_blocked: bool,
     holding_fabric_unverified: bool = False,
+    dispatch_reset_due: bool = False,
 ) -> str:
     """The single gentlest-first recovery rung justified by the current degradation — THE escalation
     policy, reached through :class:`GalaxyRecovery`'s ``next_stage``, which folds the host-rung
@@ -575,6 +576,10 @@ def _route(
     * ``sbr_candidates > 0`` (and a bridge reset did not JUST fail) -> ``STAGE_BRIDGE_RESET``: chips
       eligible for a per-chip bridge reset (all-ones-isolated, or a below-floor gone chip when
       opted in) get that surgical rung first.
+    * ``dispatch_reset_due`` with every chip present and none frozen -> ``STAGE_SMI_RESET``: the
+      fabric passed traffic but mesh dispatch failed, which no self-heal clears; the caller grants
+      this once per hold episode, and the full check, fabric included, decides the release
+      (spec 03 I55).
     * below the galaxy floor with nothing to surgically reset -> ``STAGE_UBB_TRAY``: the per-tray
       BMC reset is the next-gentlest rung the gate always attempts before holding — a single/
       few-chip wedge self-heals otherwise, and a galaxy reset there is the measured
@@ -619,6 +624,8 @@ def _route(
         return DEFER
     if sbr_candidates > 0 and last_action != STAGE_BRIDGE_RESET:
         return STAGE_BRIDGE_RESET
+    if dispatch_reset_due and off_bus == 0 and frozen_chips == 0:
+        return STAGE_SMI_RESET
     if galaxy_floor is not None and off_bus + frozen_chips < galaxy_floor:
         return STAGE_UBB_TRAY
     return STAGE_SMI_RESET
@@ -1044,6 +1051,7 @@ class GalaxyRecovery(Recovery):
             host_escalation=host_escalation,
             reboot_blocked=reboot_blocked,
             holding_fabric_unverified=ev.holding_fabric_unverified,
+            dispatch_reset_due=ev.dispatch_reset_due,
         )
 
     def _platform_reset_argv(self, indices: list) -> list:
