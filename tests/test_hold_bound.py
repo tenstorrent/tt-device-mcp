@@ -106,6 +106,10 @@ def test_hold_messages_state_the_real_bound(monkeypatch):
     assert "20 min hold ceiling" in srv._hold_bound_text()
     monkeypatch.setenv("TT_DEVICE_MCP_STUCK_HOLD_SEC", "90")
     assert "90s hold ceiling" in srv._hold_bound_text()
+    # The call sites' note (spec 03 I55) states the same live bound, never a fixed "~2 min" / "10-min".
+    monkeypatch.setenv("TT_DEVICE_MCP_STUCK_HOLD_SEC", "1200")
+    assert "~5 min" in srv._hold_escalation_note(off_bus=1) and "20 min ceiling" in srv._hold_escalation_note(1)
+    assert "20 min hold ceiling" in srv._hold_escalation_note()
     _escalation_off(monkeypatch)
     for text in (srv._hold_bound_text(), srv._hold_bound_text(offbus=True)):
         assert "escalates" not in text and "ceiling" not in text
