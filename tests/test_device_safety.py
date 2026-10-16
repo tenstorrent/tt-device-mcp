@@ -2074,15 +2074,19 @@ async def test_a_transient_all_ones_does_not_amputate_a_chip(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_chip_dead_on_two_consecutive_samples_is_isolated(monkeypatch):
-    """The case that matters: a real chip drop still gets cut out, fast."""
+    """The case that matters: a real chip drop still gets cut out, fast. The pollers stop on the
+    first all-ones sample already (spec 03 I66), before the second confirms it."""
     isolated = _no_isolation(monkeypatch)
+    pollers = stub_device_pollers(monkeypatch)
 
     live = [100, 800, 800, 0, 0, 0]
     dead = {"0": live, "13": [heartbeat.ALL_ONES, 0, 0, 0, 0, 0], "31": live}
     await srv.sampler.check_for_dead_chips(dead)
+    assert pollers == [False] and isolated == []
     await srv.sampler.check_for_dead_chips(dead)
 
     assert isolated == ["13"], "a genuinely dead chip was not isolated"
+    assert chip_state.lost_chips() == ["13"]
 
 
 @pytest.mark.asyncio

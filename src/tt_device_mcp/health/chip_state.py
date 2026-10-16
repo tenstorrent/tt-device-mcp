@@ -8,8 +8,8 @@ for the root port's completion timeout and comes back all-ones; that wait stalls
 enough of them escalate to a fatal machine check that resets the host. So once the broker has
 confirmed a chip lost, nothing of the broker's keeps reading it on a poll clock (spec 03 I66):
 
-* ``lost`` — confirmed off the bus: all-ones on two consecutive sampler reads, or removed from the
-  kernel (``isolate_chip``). Every gated read of a lost chip (:func:`may_read`) is refused and reads
+* ``lost`` — confirmed off the bus: all-ones on two consecutive sampler reads (marked before the
+  sampler isolates the chip from the kernel). Every gated read of a lost chip (:func:`may_read`) is refused and reads
   as all-ones, which is what its last real read said, so every count and rung decides exactly as on
   a real read. A lost chip is read again only when (a) its sysfs node was re-created (a remove and
   rescan, a tray re-power or a hotplug: a new node is a new endpoint, so the read is safe to try),
@@ -76,8 +76,21 @@ def _sysfs_indices() -> list:
     return [n for n in names if n.isdigit()]
 
 
+def chip_nodes(ids: Iterable) -> dict:
+    """Index -> the chip's KMD sysfs class node, for :func:`mark_lost`."""
+    from tt_device_mcp.health.monitors import pci
+
+    return {str(i): pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}" for i in ids}
+
+
 _present: Callable[[], list] = _sysfs_indices
-_expected: Callable[[], int] = lambda: 0
+
+
+def _no_baseline() -> int:
+    return 0
+
+
+_expected: Callable[[], int] = _no_baseline
 
 
 def reset() -> None:
@@ -259,8 +272,12 @@ def snapshot() -> dict:
     chips = {}
     for i in ids:
         if i in marked:
-            chips[i] = {"lost": True, "recovering": rec_on, "lost_since": marked[i]["since"],
-                        "lost_reason": marked[i]["reason"]}
+            chips[i] = {
+                "lost": True,
+                "recovering": rec_on,
+                "lost_since": marked[i]["since"],
+                "lost_reason": marked[i]["reason"],
+            }
         elif i not in present:
             chips[i] = {"lost": True, "recovering": rec_on, "lost_since": None, "lost_reason": "not in sysfs"}
         else:

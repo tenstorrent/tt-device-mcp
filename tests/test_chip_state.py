@@ -1,0 +1,428 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Spec 03 I66: no broker poller reads a chip it has confirmed lost, or any chip while a reset step owns
+them. Each sysfs telemetry read is a PCIe read of the chip; a read to an endpoint that left the bus or
+hung stalls a core until the completion timeout, and enough of them take the host down."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from tests.conftest import fsm_healthy, patch_health_event, stub_device_pollers
+from tt_device_mcp import server as srv
+from tt_device_mcp.health import chip_state
+from tt_device_mcp.health import monitor as monitor_mod
+from tt_device_mcp.health.core import Verdict
+from tt_device_mcp.health.monitors import heartbeat, pci
+
+ALL_ONES = heartbeat.ALL_ONES
+N = 4
+
+
+class _Clock:
+    """chip_state's own monotonic clock, moved by hand (never the process-wide one asyncio uses)."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    c = _Clock()
+
+    class _T:
+        monotonic = staticmethod(c.monotonic)
+
+    monkeypatch.setattr(chip_state, "time", _T)
+    return c
+
+
+@pytest.fixture
+def sysfs(monkeypatch, tmp_path):
+    """N chips laid out as on a real host: the class entry is a link to a node under its PCI endpoint,
+    so a remove and rescan (a new endpoint) gives the class entry a new identity."""
+    cls_dir = tmp_path / "class"
+    cls_dir.mkdir()
+    monkeypatch.setattr(pci, "SYSFS_CLASS_DIR", cls_dir)
+    reads: list = []
+    real_read_text = Path.read_text
+
+    def spy(self, *a, **k):
+        if self.parent.name.startswith("tenstorrent!"):
+            reads.append((self.parent.name.rsplit("!", 1)[-1], self.name))
+        return real_read_text(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", spy)
+
+    def node(i: int, beat: int, *, endpoint: str = "a") -> Path:
+        ep = tmp_path / f"devices-{endpoint}" / f"0000:{i + 1:02x}:00.0"
+        real = ep / "tenstorrent" / f"tenstorrent!{i}"
+        real.mkdir(parents=True, exist_ok=True)
+        (real / "device").unlink(missing_ok=True)
+        (real / "device").symlink_to(ep)
+        for attr, val in (("tt_heartbeat", beat), ("tt_aiclk", 800), ("tt_arcclk", 800), ("tt_therm_trip_count", 0)):
+            (real / attr).write_text(f"{val}\n")
+        link = cls_dir / f"tenstorrent!{i}"
+        if link.is_symlink():
+            link.unlink()
+        link.symlink_to(real)
+        return link
+
+    for i in range(N):
+        node(i, 100)
+    return {"node": node, "reads": reads, "dir": cls_dir}
+
+
+def _reads_of(sysfs, idx):
+    return [a for i, a in sysfs["reads"] if i == str(idx)]
+
+
+# --- the gate on a lost chip ---------------------------------------------------------------------
+
+
+def test_a_lost_chip_is_not_read_again_within_the_reprobe_window(sysfs, clock):
+    """Once lost, read_heartbeats and chip_sample report the chip all-ones without a read, until its
+    backstop re-read is due; then exactly one read, and the window starts again."""
+    sysfs["node"](2, ALL_ONES)
+    chip_state.mark_lost(["2"], "test", {"2": sysfs["dir"] / "tenstorrent!2"})
+    sysfs["reads"].clear()
+
+    for _ in range(3):
+        assert heartbeat.read_heartbeats()["2"] == ALL_ONES
+        assert pci.chip_sample()["2"][:4] == [ALL_ONES, None, None, None]
+        clock.now += chip_state.LOST_REPROBE_SEC / 4
+    assert _reads_of(sysfs, 2) == [], "read a lost chip on the poll clock"
+    assert _reads_of(sysfs, 1), "the healthy chips are still read"
+    snap = pci.chip_snapshot()
+    assert snap["2"].get("lost") is True
+    assert _reads_of(sysfs, 2) == [], "the incident snapshot read a lost chip"
+
+    clock.now += chip_state.LOST_REPROBE_SEC
+    assert pci.chip_sample()["2"][0] == ALL_ONES
+    assert _reads_of(sysfs, 2) == ["tt_heartbeat"], "the due re-read is the heartbeat alone, once"
+    assert heartbeat.read_heartbeats()["2"] == ALL_ONES
+    assert _reads_of(sysfs, 2) == ["tt_heartbeat"], "the next re-read waits a full window again"
+    assert chip_state.is_lost("2")
+
+
+def test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost(sysfs, clock, monkeypatch):
+    """A remove and rescan (or a tray re-power) makes a new endpoint: it is read on the next poll, not a
+    window later, and a counter that is not all-ones clears the mark and the published file."""
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    monkeypatch.setattr("tt_device_mcp.health.evidence.health_event", lambda kind, **f: events.append((kind, f)))
+    sysfs["node"](3, ALL_ONES)
+    chip_state.mark_lost(["3"], "test", {"3": sysfs["dir"] / "tenstorrent!3"})
+    assert json.loads(chip_state.state_path().read_text())["lost"] == ["3"]
+    sysfs["reads"].clear()
+
+    sysfs["node"](3, 4242, endpoint="b")  # re-enumerated: a new node under a new endpoint
+    assert heartbeat.read_heartbeats()["3"] == 4242
+    assert _reads_of(sysfs, 3) == ["tt_heartbeat"]
+    assert not chip_state.is_lost("3")
+    assert any(k == "chip_lost_cleared" and f["chip"] == "3" and f["why"] == "sysfs node re-created" for k, f in events)
+    assert json.loads(chip_state.state_path().read_text())["lost"] == []
+
+    # Same node, the backstop re-read finds it answering: that clears it too.
+    chip_state.mark_lost(["1"], "test", {"1": sysfs["dir"] / "tenstorrent!1"})
+    clock.now += chip_state.LOST_REPROBE_SEC
+    assert heartbeat.read_heartbeats()["1"] == 100
+    assert not chip_state.is_lost("1")
+    assert any(k == "chip_lost_cleared" and f["why"] == "answering again" for k, f in events)
+
+
+def test_the_published_state_is_atomic_and_names_every_expected_chip(sysfs, monkeypatch):
+    """Third-party readers stay off a chip by this file: version, writer pid, recovering, lost (marked, or
+    expected with no sysfs node), written by rename so a reader never sees half a file."""
+    chip_state.configure(present=lambda: ["0", "1", "2"], expected=lambda: N)
+    monkeypatch.setattr(chip_state, "_present", lambda: ["0", "1", "2"])
+    replaced = []
+    real_replace = os.replace
+    monkeypatch.setattr(
+        chip_state.os, "replace", lambda a, b: replaced.append((Path(a).name, Path(b))) or real_replace(a, b)
+    )
+    chip_state.mark_lost(["1"], "all-ones on two samples")
+
+    path = chip_state.state_path()
+    assert replaced and replaced[-1][1] == path and replaced[-1][0].startswith(".chip-state.json.")
+    body = json.loads(path.read_text())
+    assert body["version"] == 1 and body["pid"] == os.getpid()
+    assert body["recovering"] is False and body["lost"] == ["1", "3"]
+    assert body["chips"]["1"]["lost_reason"] == "all-ones on two samples"
+    assert body["chips"]["3"]["lost_reason"] == "not in sysfs"
+    assert body["chips"]["0"] == {"lost": False, "recovering": False}
+    assert not list(path.parent.glob(".chip-state.json.*")), "no temp file left behind"
+
+    n = len(replaced)
+    chip_state.publish()
+    assert len(replaced) == n, "an unchanged state is not rewritten"
+    chip_state.set_recovering("op:1", True)
+    assert json.loads(path.read_text())["chips"]["0"]["recovering"] is True
+    chip_state.set_recovering("op:1", False)
+    assert json.loads(path.read_text())["recovering"] is False
+    assert oct(path.stat().st_mode & 0o777) == "0o644"
+
+
+def test_the_default_path_follows_the_device_op_lock(monkeypatch):
+    monkeypatch.delenv("TT_DEVICE_MCP_CHIP_STATE_FILE")
+    monkeypatch.delenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", raising=False)
+    assert chip_state.state_path() == Path("/run/tt-device-broker/chip-state.json")
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/run/user/1000/tt/device-op.lock")
+    assert chip_state.state_path() == Path("/run/user/1000/tt/chip-state.json")
+
+
+# --- the sampler ---------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_single_blip_is_not_marked_lost_but_two_samples_are(monkeypatch, sysfs):
+    isolated = []
+
+    async def fake(dead):
+        isolated.extend(dead)
+
+    monkeypatch.setattr(srv.sampler, "isolate_dead_chips", fake)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    stub_device_pollers(monkeypatch)
+    live = lambda b: [b, 800, 800, 0, 0, 0]  # noqa: E731
+    await srv.sampler.check_for_dead_chips({"0": live(1), "2": live(ALL_ONES), "3": live(1)})
+    assert chip_state.lost_chips() == [], "one sample is a blip"
+    await srv.sampler.check_for_dead_chips({"0": live(2), "2": live(3), "3": live(2)})
+    await srv.sampler.check_for_dead_chips({"0": live(3), "2": live(ALL_ONES), "3": live(3)})
+    assert chip_state.lost_chips() == [], "a cleared strike starts over"
+    await srv.sampler.check_for_dead_chips({"0": live(4), "2": live(ALL_ONES), "3": live(4)})
+    assert chip_state.lost_chips() == ["2"] and isolated == ["2"], "lost on the second sample, before isolation"
+
+
+def _one_pass(monkeypatch):
+    class _Stop(Exception):
+        pass
+
+    async def _sleep_once(_):
+        raise _Stop()
+
+    monkeypatch.setattr(srv.asyncio, "sleep", _sleep_once)
+    monkeypatch.setattr(srv, "_refresh_idle_hold_ledger", lambda: None)
+    monkeypatch.setattr(srv, "_spawn_idle_relift", lambda: None, raising=False)
+    with pytest.raises(_Stop):
+        asyncio.run(srv.sampler.run())
+
+
+@pytest.mark.parametrize("owner", ["reset_in_flight", "scope"])
+def test_the_sampler_reads_no_chip_while_a_reset_owns_them(monkeypatch, sysfs, owner):
+    """A reset step (our flag), or a reset scope we stopped waiting for, owns the chips: the sampler
+    takes no sample at all, and reads again once the step is over."""
+    samples = []
+    monkeypatch.setattr(srv, "chip_sample", lambda: samples.append(1) or {})
+    monkeypatch.setattr(srv, "append_trace", lambda s: None)
+    if owner == "reset_in_flight":
+        srv.recovery_mechanism.reset_in_flight = True
+    else:
+        monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "ttdev-reset-1-1")
+        srv.sampler.scope_seen = True
+        chip_state.set_recovering("scope", True)
+    _one_pass(monkeypatch)
+    assert samples == [], "sampled chips a reset owns"
+    assert json.loads(chip_state.state_path().read_text())["recovering"] is True
+
+    if owner == "reset_in_flight":
+        srv.recovery_mechanism.reset_in_flight = False
+    else:
+        monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    _one_pass(monkeypatch)
+    assert samples == [1]
+    assert not chip_state.recovering() and not srv.sampler.scope_seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["all-ones", "stalled heartbeat"])
+async def test_the_first_hung_sample_stops_the_pollers(monkeypatch, kind):
+    """A present chip that reads all-ones, or whose heartbeat did not move since the last sample, stops
+    the pollers on that first sample (isolation still waits for its second); once per episode."""
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv.sampler, "isolate_dead_chips", lambda d: asyncio.sleep(0))
+    events = []
+    patch_health_event(monkeypatch, lambda k, **f: events.append((k, f)))
+    monkeypatch.setattr(srv.sampler._deps, "health_event", lambda k, **f: events.append((k, f)), raising=False)
+    pollers = stub_device_pollers(monkeypatch, stopped=["tt-poller.service"])
+    row = lambda b: [b, 800, 800, 0, 0, 0]  # noqa: E731
+    await srv.sampler.check_for_dead_chips({str(i): row(100 + i) for i in range(N)})
+    assert pollers == []
+    bad = ALL_ONES if kind == "all-ones" else 101
+    hung = {"0": row(200), "1": row(bad), "2": row(202), "3": row(203)}
+    await srv.sampler.check_for_dead_chips(hung)
+    assert pollers == [False], "the pollers did not stop at the first hung sample"
+    stops = [f for k, f in events if k == "pollers_quiesced_hung_chip"]
+    assert stops and (stops[0]["all_ones"] if kind == "all-ones" else stops[0]["stalled"]) == ["1"]
+    hung2 = {"0": row(300), "1": row(bad), "2": row(302), "3": row(303)}
+    await srv.sampler.check_for_dead_chips(hung2)
+    assert pollers == [False], "one episode stops them once"
+
+
+@pytest.mark.asyncio
+async def test_a_whole_mesh_blip_or_a_reset_does_not_stop_the_pollers(monkeypatch):
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    patch_health_event(monkeypatch, lambda k, **f: None)
+    pollers = stub_device_pollers(monkeypatch)
+    await srv.sampler.check_for_dead_chips({str(i): [ALL_ONES] for i in range(N)})
+    assert pollers == [], "every chip at once is the re-init blip the blackout path proves on two samples"
+    srv.sampler.dead_chip_strikes = {}
+    srv.recovery_mechanism.reset_in_flight = True
+    await srv.sampler.check_for_dead_chips({"0": [ALL_ONES], "1": [5], "2": [5], "3": [5]})
+    assert pollers == [], "a reset's own all-ones never stops them"
+
+
+# --- a reset step --------------------------------------------------------------------------------
+
+
+def _reset_seams(monkeypatch, order, rc):
+    async def pollers(active, log):
+        order.append(f"pollers:{active}")
+        return ["telem"] if not active else []
+
+    async def run(argv, log, owner="[broker]health-gate"):
+        order.append(("reset", chip_state.recovering()))
+        return rc, "out"
+
+    async def to_thread(fn, *a, **k):
+        return None
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", run)
+    monkeypatch.setattr(srv.asyncio, "to_thread", to_thread)
+    monkeypatch.setattr(srv.asyncio, "sleep", no_sleep)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rc, restored", [(0, True), (1, False)])
+async def test_a_failed_reset_leaves_the_pollers_stopped(monkeypatch, rc, restored):
+    """A reset that exited non-zero leaves chips that may still be off the bus or hung, and the device
+    held: the pollers stay down (the health probe re-arms them). A completed one restores them. The
+    step is published as recovering while it runs."""
+    order = []
+    events = []
+    patch_health_event(monkeypatch, lambda k, **f: events.append((k, f)))
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None, raising=False)
+    _reset_seams(monkeypatch, order, rc)
+    got, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
+    assert got == rc
+    assert ("reset", True) in order, "the reset step was not published as recovering"
+    assert (order[-1] == "pollers:True") is restored, order
+    assert order.count("pollers:True") == (1 if restored else 0)
+    assert not chip_state.recovering()
+    if not restored:
+        assert any(k == "pollers_left_quiesced" for k, _ in events)
+
+
+def test_the_post_reset_grace_reads_lost_chips_for_real(sysfs, clock, monkeypatch):
+    """A blackout marks every chip lost. While the reset step runs its own reads go through; once it
+    ends, the verify's heartbeat_verdict reads every chip for real (at most once a second each) instead
+    of waiting out the backstop, so the post-reset check judges the chips as they are."""
+    chip_state.mark_lost(
+        [str(i) for i in range(N)], "blackout", {str(i): sysfs["dir"] / f"tenstorrent!{i}" for i in range(N)}
+    )
+    sysfs["reads"].clear()
+    assert heartbeat.read_heartbeats() == {str(i): ALL_ONES for i in range(N)}
+    assert sysfs["reads"] == [], "a lost chip read before any reset"
+
+    srv.recovery_mechanism.reset_in_flight = True
+    heartbeat.read_heartbeats()
+    assert len(sysfs["reads"]) == N, "the step's own reads are ungated"
+    srv.recovery_mechanism.reset_in_flight = False
+    sysfs["reads"].clear()
+
+    step = iter(range(200, 10_000, 100))
+
+    def advance(_):
+        v = next(step)
+        for i in range(N):
+            sysfs["node"](i, v + i)
+
+    monkeypatch.setattr(heartbeat.time, "sleep", advance)
+    verdict, detail, _ = heartbeat.heartbeat_verdict(expected_count=N)
+    assert verdict is Verdict.HEALTHY, detail
+    assert chip_state.lost_chips() == []
+    assert len(sysfs["reads"]) >= N
+
+
+@pytest.mark.asyncio
+async def test_the_post_reset_health_check_runs_fabric_on_chips_marked_lost(sysfs, monkeypatch):
+    """Goal of 03 I66 is fewer reads, never a skipped check: after a reset of a mesh whose chips were
+    marked lost, the full post-reset check (heartbeat, enumeration, eth, fabric) runs and passes."""
+    chip_state.mark_lost(
+        [str(i) for i in range(N)], "blackout", {str(i): sysfs["dir"] / f"tenstorrent!{i}" for i in range(N)}
+    )
+    srv.recovery_mechanism.reset_in_flight = True
+    srv.recovery_mechanism.reset_in_flight = False  # the step ended: grace
+
+    step = iter(range(200, 10_000, 100))
+
+    def advance(_):
+        v = next(step)
+        for i in range(N):
+            sysfs["node"](i, v + i)
+
+    monkeypatch.setattr(heartbeat.time, "sleep", advance)
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda *a: True)
+    monkeypatch.setattr(monitor_mod.hostpci, "host_pci_verdict", lambda: (True, "ok", {}))
+    ran = []
+
+    async def snap(expected):
+        ran.append("snapshot")
+        return True, "ok"
+
+    async def eth(**_):
+        ran.append("eth")
+        return True, "ok"
+
+    async def fabric(*a, **k):
+        ran.append("fabric")
+        return True, "fabric links healthy"
+
+    monkeypatch.setattr(srv.health_monitor, "_verify_device", snap)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth)
+    monkeypatch.setattr(srv.health_monitor, "verify_fabric_health", fabric)
+    fsm_healthy(srv)
+    state = await srv.health_monitor.update("post-reset", run_fabric=True, expected=N)
+    verdicts = {o.monitor: o.verdict for o in state.observations}
+    assert verdicts.get("heartbeat") is Verdict.HEALTHY, state.observations
+    assert ran == ["snapshot", "eth", "fabric"], "the post-reset check stopped short of the fabric pass"
+    assert verdicts.get("fabric") is Verdict.HEALTHY
+
+
+# --- /health --------------------------------------------------------------------------------------
+
+
+def test_health_reports_per_chip_state_and_reads_nothing_while_recovering(sysfs, monkeypatch, clear_job_state):
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda *a: True)
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: N + 1)
+    monkeypatch.setattr(srv.health_monitor, "_health_check_enabled", lambda: True)
+    monkeypatch.setattr(srv, "device_op_active", "")
+    fsm_healthy(srv)
+    sysfs["node"](2, ALL_ONES)  # present, not answering
+    payload = srv._health_payload()
+    assert payload["reset_in_flight"] is False and payload["recovering"] is False
+    assert payload["off_bus_chips"] == ["2", "4"] and payload["hung_chips"] == ["2"]
+    assert payload["lost_chips"] == [] and payload["resetting_chips"] == []
+
+    chip_state.mark_lost(["2"], "test", {"2": sysfs["dir"] / "tenstorrent!2"})
+    srv.recovery_mechanism.reset_in_flight = True
+    sysfs["reads"].clear()
+    payload = srv._health_payload()
+    assert sysfs["reads"] == [], "/health read a chip while a reset step owned them"
+    assert payload["reset_in_flight"] is True and payload["recovering"] is True
+    assert payload["lost_chips"] == ["2"]
+    assert payload["resetting_chips"] == [str(i) for i in range(N + 1)]
+    assert payload["off_bus_chips"] == ["2", "4"], "the last live picture is served while recovering"
+    assert "reset or recovery step" in payload["device_degraded"]

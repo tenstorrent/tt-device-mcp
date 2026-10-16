@@ -264,7 +264,8 @@ class TelemetrySampler:
         re-arms them once the device is idle and healthy). Every chip at once is the re-init blip
         the blackout path already proves on two samples, so it does not count here."""
         stalled = [
-            i for i, v in sample.items()
+            i
+            for i, v in sample.items()
             if v and isinstance(v[0], int) and v[0] != ALL_ONES and self.prev_beats.get(i) == v[0]
         ]
         self.prev_beats = {i: v[0] for i, v in sample.items() if v and isinstance(v[0], int)}
@@ -277,8 +278,9 @@ class TelemetrySampler:
             return
         self.pollers_stopped_for = hung
         log = self._deps.logger()
-        self._deps.health_event("pollers_quiesced_hung_chip", all_ones=sorted(dead, key=int),
-                                stalled=sorted(stalled, key=int))
+        self._deps.health_event(
+            "pollers_quiesced_hung_chip", all_ones=sorted(dead, key=int), stalled=sorted(stalled, key=int)
+        )
         await self._deps.set_device_pollers(False, lambda m: log.info(f"HUNG-CHIP {m}") if log else None)
 
     async def check_for_dead_chips(self, sample: dict) -> None:
@@ -427,9 +429,7 @@ class TelemetrySampler:
 
     @staticmethod
     def _nodes(ids) -> dict:
-        from tt_device_mcp.health.monitors import pci
-
-        return {str(i): pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}" for i in ids}
+        return chip_state.chip_nodes(ids)
 
     async def _check_short_count(self, present: int, expected: int, log) -> None:
         """Fewer chip nodes than the baseline on two consecutive samples -> dirty (spec 03 I31).
