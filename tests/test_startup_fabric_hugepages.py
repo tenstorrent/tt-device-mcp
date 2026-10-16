@@ -277,7 +277,34 @@ def _shortfalls(monkeypatch, seq):
 
 
 @pytest.fixture
-def _startup(monkeypatch, tmp_path, clear_job_state):
+def _systemctl(monkeypatch):
+    """The real poller quiesce over a fake ``systemctl``: every call's verb lands in the returned list,
+    and no reset scope is cycling unless a test says so."""
+    calls = []
+
+    class _Proc:
+        returncode = 0
+
+        async def wait(self):
+            return 0
+
+    async def fake_exec(program, *args, **kwargs):
+        assert program == "systemctl", f"unexpected spawn {program} {args}"
+        calls.append(args[0])
+        return _Proc()
+
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", fake_exec)
+    if srv.recovery_mechanism is None:
+        monkeypatch.setattr(srv, "recovery_mechanism", type("M", (), {"scope_active": staticmethod(lambda: None)})())
+    else:  # keep the rest of the real mechanism: startup calls more of it than scope_active
+        monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "_pollers_held_for", None, raising=False)
+    return calls
+
+
+@pytest.fixture
+def _startup(monkeypatch, tmp_path, clear_job_state, _systemctl):
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
     monkeypatch.setattr(srv, "device_op_lock", None)
     monkeypatch.setattr(srv, "device_op_active", "")
@@ -316,7 +343,86 @@ async def test_startup_fabric_pass_waits_for_hugepages_then_runs(monkeypatch, _s
 
 
 @pytest.mark.asyncio
-async def test_startup_records_cannot_check_when_hugepages_stay_short(monkeypatch, _startup):
+async def test_the_startup_fabric_check_runs_with_the_pollers_stopped(monkeypatch, _startup, _systemctl):
+    """A host died shortly after a broker restart, inside the startup fabric check, with the
+    pollers up and no reset running. The check now runs on a quiet bus, as resets do."""
+    events, rows, gate_calls = _startup
+    _shortfalls(monkeypatch, [None])
+    seen = []
+
+    async def gate(job_log_file, *, phase, run_fabric, force_fabric=False):
+        seen.append((phase, run_fabric, force_fabric, list(_systemctl)))
+
+    monkeypatch.setattr(srv, "_device_health_gate", gate)
+
+    await srv._verify_fabric_on_start()
+
+    assert seen == [("startup", True, True, ["stop"])], "stopped before the forced startup pass"
+    assert _systemctl == ["stop", "start"], "and started again once it is over"
+    assert srv._pollers_held_for is None
+
+
+@pytest.mark.asyncio
+async def test_the_startup_quiesce_restarts_the_pollers_when_the_gate_raises(monkeypatch, _startup, _systemctl):
+    events, rows, gate_calls = _startup
+    _shortfalls(monkeypatch, [None])
+
+    async def gate(job_log_file, *, phase, run_fabric, force_fabric=False):
+        raise RuntimeError("validator crashed")
+
+    monkeypatch.setattr(srv, "_device_health_gate", gate)
+
+    await srv._verify_fabric_on_start()
+
+    assert _systemctl == ["stop", "start"], "a failed check never leaves the pollers off"
+    assert srv.fsm.record.dirty, "the existing error path still owes a reset and verify"
+    assert any(k == "startup_fabric_verify_errored" for k, _ in events)
+    assert srv._pollers_held_for is None
+
+
+@pytest.mark.asyncio
+async def test_a_reset_inside_the_startup_check_defers_its_poller_restart(monkeypatch, _startup, _systemctl):
+    """A reset the startup gate climbs to quiesces and restores the pollers itself (reset_with_quiesce).
+    Inside the startup block its restore is deferred, so the post-reset verify runs on a quiet bus too."""
+    events, rows, gate_calls = _startup
+    _shortfalls(monkeypatch, [None])
+    during_verify = []
+
+    async def gate(job_log_file, *, phase, run_fabric, force_fabric=False):
+        log = lambda m: None  # noqa: E731
+        assert await srv._set_device_pollers(False, log) == ["tt-telemetry.service"]  # the reset's quiesce
+        assert await srv._set_device_pollers(True, log) == []  # its restore, deferred
+        during_verify.append(list(_systemctl))
+
+    monkeypatch.setattr(srv, "_device_health_gate", gate)
+
+    await srv._verify_fabric_on_start()
+
+    assert during_verify == [["stop", "stop"]], "no start until the startup check is over"
+    assert _systemctl == ["stop", "stop", "start"]
+    assert srv._pollers_held_for is None
+
+
+@pytest.mark.asyncio
+async def test_the_startup_quiesce_leaves_the_pollers_off_while_a_reset_cycles(monkeypatch, _startup, _systemctl):
+    """A reset that timed out inside the check may still be cycling the chips: restarting the pollers
+    then is MMIO at an off-bus endpoint, so they stay off, as reset_with_quiesce leaves them."""
+    events, rows, gate_calls = _startup
+    _shortfalls(monkeypatch, [None])
+    monkeypatch.setattr(
+        srv, "recovery_mechanism", type("M", (), {"scope_active": staticmethod(lambda: "tt-reset-1")})()
+    )
+
+    await srv._verify_fabric_on_start()
+
+    assert gate_calls == ["startup"]
+    assert _systemctl == ["stop"]
+    assert ("pollers_left_quiesced", {"after": "the startup fabric check", "scope": "tt-reset-1"}) in events
+    assert srv._pollers_held_for is None
+
+
+@pytest.mark.asyncio
+async def test_startup_records_cannot_check_when_hugepages_stay_short(monkeypatch, _startup, _systemctl):
     events, rows, gate_calls = _startup
     _shortfalls(monkeypatch, [(5, 32)])
     monkeypatch.setattr(srv, "STARTUP_HUGEPAGES_WAIT_SEC", 0.05)
@@ -324,6 +430,7 @@ async def test_startup_records_cannot_check_when_hugepages_stay_short(monkeypatc
     await srv._verify_fabric_on_start()
 
     assert gate_calls == [], "a pass run before the pool exists can only 77"
+    assert _systemctl == [], "no check ran, so the pollers were never stopped"
     assert srv.fsm.state is ServerState.RECOVERING
     assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY, "held as fabric-unverified, the 77-only hold"
     assert not srv.fsm.record.dirty, "a missing prerequisite owes no reset"
