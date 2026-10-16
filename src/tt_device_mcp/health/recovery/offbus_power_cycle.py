@@ -353,11 +353,14 @@ def _handoff_deadline(episode: str) -> Optional[float]:
         return None
 
 
-def note_hold_handoff(episode: str, off_bus: int, expected: int, why: str, log, *, latched: str = "") -> None:
+def note_hold_handoff(
+    episode: str, off_bus: int, expected: int, why: str, log, *, latched: str = "", cause: str = ""
+) -> None:
     """The gate refuses every reset of this episode's off-bus hold and no power cycle is configured: hand
     the hold to an operator with a deadline, once per episode (spec 04 I33). The manual-recovery check
     runs once here, so the page says whether an operator is already on it. ``latched`` names an operator
-    gate (the I25 latch) that keeps the gate shut past the deadline."""
+    gate (the I25 latch) that keeps the gate shut past the deadline. ``cause`` replaces the page's
+    default reason (no power-cycle command) when another path hands the hold off (spec 04 I36)."""
     if not episode:
         return
     _track(episode)
@@ -393,7 +396,7 @@ def note_hold_handoff(episode: str, off_bus: int, expected: int, why: str, log, 
         "offbus_gated_hold_page",
         log,
         f"{off_bus}/{expected} chip(s) off the bus and no reset can end the hold ({why}); "
-        f"TT_DEVICE_MCP_POWER_CYCLE_CMD is not set, so {then}; manual-recovery check: {h['operator_seen']}",
+        f"{cause or 'TT_DEVICE_MCP_POWER_CYCLE_CMD is not set'}, so {then}; manual-recovery check: {h['operator_seen']}",
         held_since=episode,
         off_bus=off_bus,
         expected=expected,
