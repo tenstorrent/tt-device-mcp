@@ -157,6 +157,9 @@ job boundary.
   scope is live (a reset reads all-ones by design), treats an all-chips blackout as a global event
   (report, never amputate), and kills device holders BEFORE removing the endpoint — a mapping
   outlives the endpoint and a read through it stalls a CPU core and reboots the host.
+  Its raw reads go through the chip-state gate (I66): it skips the sample while a reset step owns
+  the chips, a chip it has confirmed lost reads as all-ones without a PCIe read until its re-read
+  is due, and it stops the device pollers on the first hung sample, not the second.
 - **I20 — A stalled sampler withholds the systemd watchdog ping.** The escalation ladder must
   never sit silently behind a dead sampler; a stall past `STALL_SEC` gets the broker restarted.
 - **I21 — The idle relift lifts a hold only on proof, read-only for self-heal holds.**
@@ -756,6 +759,34 @@ job boundary.
   code and is never checked against shutdown), a signal outside a shutdown, and any doubt (a
   systemd read that fails counts as not stopping). Time to recover: unchanged for every fault
   class; the check costs at most three bounded systemd reads, only after a signal death.
+- **I66 — No broker poller reads a lost chip, or any chip while a reset step owns them.** Each read
+  of a chip's KMD sysfs telemetry (`tt_heartbeat`, `tt_aiclk`, ...) is a PCIe read of its BAR; on a
+  chip that left the bus or hung it waits for the completion timeout, stalls a CPU core, and enough
+  of them escalate to a machine check that resets the host. `health/chip_state.py` gates every
+  poller read (`read_heartbeats`, `chip_sample`, `chip_snapshot`, so the sampler, `/health`,
+  `device_dirty`/`capture_incident` snapshots and the idle relift's reads). A chip is *lost* once
+  the sampler reads it all-ones on two consecutive samples (marked before it is isolated); a gated
+  read of a lost chip returns all-ones without touching it, what its last real read said, so every
+  count and rung decides as before. A lost chip is read again only when (a) its sysfs node was
+  re-created (rescan, tray re-power, hotplug), (b) in the 120 s grace after a broker reset or
+  recovery step ends, at most once a second, so the post-reset verify reads the chip for real, or
+  (c) as a backstop once per `TT_DEVICE_MCP_LOST_REPROBE_SEC` (default 30 s, floor 5). A read that
+  is not all-ones clears *lost*. While a reset step owns the chips (`reset_in_flight`, or a reset
+  scope still cycling them after the broker stopped waiting) every chip is *recovering*: the
+  sampler skips its sample, `/health` serves the last live picture and reads nothing, and only the
+  step's own reads run, ungated. The device pollers (telemetry services) stop on the FIRST sample
+  that shows a present chip hung (all-ones, or a heartbeat that did not move), not the second; a
+  whole-mesh blip or a reset does not count. They are not restored after a failed or timed-out
+  reset, an unrecovered tray walk or a tray re-power that did not fire: the device stays held and
+  the health probe re-arms them once the broker reports it idle and healthy. The state is
+  published atomically to `chip-state.json` (spec 06) and on `/health`, so other readers on the
+  host can stay off a chip the broker knows is lost or under reset. The post-reset full health
+  check, fabric included (I4, 04 I32), is unchanged: it runs inside the op or its grace and reads
+  every chip. Time to recover: unchanged for whole-tray drop, partial off-bus, ARC not ready,
+  fabric/health-check failure, dispatch failure, hold-deadline expiry and dirty boot (their rungs
+  re-create the nodes or run in the op or its grace). A chip that returns on its own on the same
+  node, outside any broker step, is seen within 30 s instead of 10 s. Pollers left stopped after a
+  failed reset are a telemetry gap only.
 
 ## Interfaces
 
@@ -796,6 +827,11 @@ subsystem through the root:
   reset, tray re-power or PCI rescan that brought it back (the reset mechanism's rescan, each tray
   walk step, the tray-down prelude rescan, the isolated-chip rescan), whatever the verify after it
   says. Dropping it never releases the device or clears a hold: only the full gate does (I52).
+  The chip-state fields (I66): `reset_in_flight` (this broker's reset op is running),
+  `recovering` (a reset step owns the chips: nothing is read and `off_bus`/`arc_not_ready` are the
+  last live values), `lost_chips` (confirmed lost, not polled), `off_bus_chips` (the ids behind
+  `off_bus`), `hung_chips` (sysfs node present, reading all-ones) and `resetting_chips` (every
+  expected chip while `recovering`, else empty).
 
 **Test monkeypatch seams.** The module globals `server.health_monitor`,
 `server.recovery_mechanism`, `server.galaxy_recovery`, `server.per_target_recovery`,
@@ -1355,6 +1391,11 @@ refuses.
 | I63 (no reboot, no further rung, no release over a shutdown-killed post-reset verify) | `tests/test_check_interrupted_by_shutdown.py::test_post_reset_verify_killed_by_shutdown_requests_no_reboot_and_releases_nothing` |
 | I63 (a timeout kill and a signal outside a shutdown fail as before) | `tests/test_check_interrupted_by_shutdown.py::test_a_timeout_kill_keeps_the_old_failure_even_during_shutdown`, `tests/test_check_interrupted_by_shutdown.py::test_a_signal_outside_shutdown_keeps_the_old_failure`, `tests/test_check_interrupted_by_shutdown.py::test_fabric_signal_and_timeout_outside_shutdown_still_fail`, `tests/test_check_interrupted_by_shutdown.py::test_a_clean_or_failing_exit_never_asks` |
 | I63 (shutdown detection: systemd state, shutdown target jobs, own unit deactivating, the broker's stop signal) | `tests/test_check_interrupted_by_shutdown.py::test_shutdown_in_progress_reads_systemd`, `tests/test_check_interrupted_by_shutdown.py::test_the_broker_stop_signal_counts_without_systemd` |
+| I66 (a lost chip is not re-read within the reprobe window; a re-created node is read at once; a valid read clears lost) | `tests/test_chip_state.py::test_a_lost_chip_is_not_read_again_within_the_reprobe_window`, `tests/test_chip_state.py::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost`, `tests/test_chip_state.py::test_a_single_blip_is_not_marked_lost_but_two_samples_are` |
+| I66 (no poller read while a reset step owns the chips; /health reads nothing then) | `tests/test_chip_state.py::test_the_sampler_reads_no_chip_while_a_reset_owns_them`, `tests/test_chip_state.py::test_health_reports_per_chip_state_and_reads_nothing_while_recovering` |
+| I66 (pollers stop on the first hung sample, not on a mesh blip or reset; not restored after a failed reset) | `tests/test_chip_state.py::test_the_first_hung_sample_stops_the_pollers`, `tests/test_chip_state.py::test_a_whole_mesh_blip_or_a_reset_does_not_stop_the_pollers`, `tests/test_chip_state.py::test_a_failed_reset_leaves_the_pollers_stopped` |
+| I66 (post-reset grace reads lost chips for real; the full check, fabric included, still runs) | `tests/test_chip_state.py::test_the_post_reset_grace_reads_lost_chips_for_real`, `tests/test_chip_state.py::test_the_post_reset_health_check_runs_fabric_on_chips_marked_lost` |
+| I66 (published state: atomic, every expected chip, path follows the device-op lock) | `tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip`, `tests/test_chip_state.py::test_the_default_path_follows_the_device_op_lock` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
