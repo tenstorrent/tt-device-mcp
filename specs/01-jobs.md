@@ -227,6 +227,21 @@ the queue and a running job outlive the broker process.
   bounded recovery (`verification_not_lifted`): a differing environment, an unhealthy read, a reset
   since the start, a fault landing during the read, a topology marker or a refused release. A
   failed check never releases the device. An `eth` job never lifts it.
+- **I67** — A job process that is still alive `SURVIVOR_KILL_WAIT_SEC` (2 s) after the survivor
+  sweep's SIGKILL is not named a survivor that holds the device until the `/dev/tenstorrent`
+  holder scan has been polled for up to `HOLDER_RELEASE_WAIT_SEC` (30 s) after that SIGKILL.
+  The sweep runs after every job, so this covers the timeout, kill and hung paths, with or
+  without a privsep scope. A process that closes its device fds within the window, by exiting
+  or not, is no I16 leftover: the post-job gate runs at once, with its forced fabric pass, and
+  no hold is opened for it. One still listed as a holder when the window ends takes the I16
+  path unchanged (fence, dirty, the leftover names it). The wait is bounded and polls, so a
+  job with nothing left costs nothing, and a slow exit adds at most 28 s to the job's teardown,
+  in which the queue waits as it already waits for the sweep. The poll is one shared helper,
+  `device_holders.wait_device_released`, for every path that SIGKILLs device holders and must
+  know they let go before it acts on the device. Time to recover (class J, a job that timed out
+  or was killed and exits slowly): a holder that lets go within the window no longer turns a
+  ~1 min post-job check into a hold that waited for the next job or the 600 s ceiling (spec 03
+  I23).
 
 ## Interfaces
 
@@ -519,3 +534,4 @@ flowchart LR
 | B-Ids/`Job` basics | `tests/test_server.py::TestJob::test_job_status_values`, `tests/test_server.py::TestJob::test_runtime_sec_property`, `tests/test_server.py::TestJob::test_wait_sec_property` |
 | Re-adoption scope naming | `tests/test_readopt.py::test_scope_unit_roundtrip`, `tests/test_readopt.py::test_list_active_job_scopes_parses` |
 | B-Shutdown (a cancel that lands as a job ends still ends the runner) | `tests/test_aio.py::test_a_cancel_that_lands_as_the_inner_work_ends_is_not_dropped`, `tests/test_aio.py::test_cancel_also_cancels_the_inner_work`, `tests/test_aio.py::test_timeout_cancels_the_inner_work_and_raises_timeout` |
+| I67 (a SIGKILLed holder that lets go within the window is no leftover; one still holding when it ends is; the wait is bounded) | `tests/test_holder_release_wait.py::test_a_holder_that_releases_within_the_window_is_not_a_leftover`, `tests/test_holder_release_wait.py::test_a_holder_still_holding_after_the_window_is_named`, `tests/test_holder_release_wait.py::test_wait_device_released_with_nothing_to_wait_for_scans_nothing`, `tests/test_holder_release_wait.py::test_wait_device_released_returns_once_the_pids_let_go`, `tests/test_holder_release_wait.py::test_wait_device_released_gives_up_at_the_timeout` |
