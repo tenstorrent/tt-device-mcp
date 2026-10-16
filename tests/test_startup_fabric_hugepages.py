@@ -343,8 +343,8 @@ async def test_startup_fabric_pass_waits_for_hugepages_then_runs(monkeypatch, _s
 
 @pytest.mark.asyncio
 async def test_the_startup_fabric_check_runs_with_the_pollers_stopped(monkeypatch, _startup, _systemctl):
-    """g15blx02, 10-15 01:30 PDT: the host died 63 s after a broker restart, inside the startup fabric
-    check, with the pollers up and no reset running. The check now runs on a quiet bus, as resets do."""
+    """A host died shortly after a broker restart, inside the startup fabric check, with the
+    pollers up and no reset running. The check now runs on a quiet bus, as resets do."""
     events, rows, gate_calls = _startup
     _shortfalls(monkeypatch, [None])
     seen = []
