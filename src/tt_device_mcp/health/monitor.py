@@ -36,6 +36,7 @@ from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
+from tt_device_mcp.health.shutdown import CheckInterruptedByShutdown, interrupted_by_shutdown
 
 # How much of a fabric run's output the action-log row keeps for a run that got no healthy verdict:
 # all of it, since the validator's first error line (the cause) sits near the head and a wrapper's
@@ -420,7 +421,43 @@ class HealthMonitor:
         write to the job log, and each probe's own ``set_device_op_detail`` string — both are what
         ``Recovery._verify_device`` now delegates here for (see below); dropping them here would
         silently blank the job log and the queue's "what's it doing" detail for every caller.
+
+        A probe the host shutdown or the broker's own stop killed raises
+        ``CheckInterruptedByShutdown`` out of here, logged once: no readings are stored, and the
+        caller unwinds as from a cancellation, counting nothing (I63).
         """
+        try:
+            return await self._update(
+                phase,
+                run_fabric=run_fabric,
+                force_fabric=force_fabric,
+                run_eth=run_eth,
+                fabric_stale=fabric_stale,
+                indices=indices,
+                expected=expected,
+                log=log,
+            )
+        except CheckInterruptedByShutdown as e:
+            line = f"{e.probe}: INTERRUPTED BY SHUTDOWN — exit {e.rc}, {e.why}; not a verdict, device left as is"
+            if log:
+                log(line)
+            broker_log = self._logger()
+            if broker_log and broker_log is not log:
+                broker_log.warning(f"HEALTH {line}")
+            raise
+
+    async def _update(
+        self,
+        phase: str,
+        *,
+        run_fabric: bool,
+        force_fabric: bool,
+        run_eth: bool,
+        fabric_stale: bool,
+        indices: Optional[list],
+        expected: Optional[int],
+        log: Optional[Callable[[str], None]],
+    ) -> HealthState:
         if expected is None:
             if indices is None:
                 indices = await asyncio.to_thread(self._present_chip_indices)
@@ -879,6 +916,9 @@ class HealthMonitor:
             except subprocess.TimeoutExpired:
                 return False, f"tt-smi snapshot timed out after {timeout_sec:.0f}s (ARC unresponsive)"
             if proc.returncode != 0:
+                interrupted = interrupted_by_shutdown("tt-smi", proc.returncode)
+                if interrupted is not None:
+                    raise interrupted  # the shutdown killed it, not the chips (I63)
                 tail = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")[-200:]
                 return False, f"tt-smi snapshot exited {proc.returncode}: {tail}"
             try:
@@ -958,11 +998,12 @@ class HealthMonitor:
         _fabric_inflight_begin(self._fabric_check_cmd() or "built-in")
         try:
             ok, detail = await self._verify_fabric_health_body(timeout_sec)
-        except asyncio.CancelledError:
-            # Cancelled under us (a shutdown that unwinds the loop): say so now, the mark goes.
+        except asyncio.CancelledError as e:
+            # Cancelled under us (a shutdown that unwinds the loop), or the validator itself killed
+            # by the shutdown (I63): say so now, the mark goes.
             _journal_fabric_interrupted(
                 {"ts": time.time() - (time.monotonic() - _t0), "pid": os.getpid(), "boot_id": _read_boot_id()},
-                "cancelled",
+                "shutdown" if isinstance(e, CheckInterruptedByShutdown) else "cancelled",
             )
             raise
         finally:

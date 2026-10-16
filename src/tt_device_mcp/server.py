@@ -142,6 +142,7 @@ from tt_device_mcp.health import (
     mark_boot,
     mesh_hold_repage_sec,
     mesh_reset_hold_reason,
+    note_broker_stopping,
     offbus_count,
     offbus_power_cycle,
     pcie_guard_at_start,
@@ -3467,6 +3468,26 @@ def _fabric_77_only_hold() -> bool:
     )
 
 
+def _fold_rung_outcome(outcome: str, log) -> None:
+    """Fold one ladder rung's outcome into ``fsm`` — the one place the gate, the idle relift and the
+    hold escalation do it, so none of them can lift a hold the release funnel placed.
+
+    A RECOVERED rung has already settled through ``_clear_device_dirty(verified=True)``; while a reset
+    still owes a fabric pass (spec 04 I32) that funnel refused and held the device fabric-unverified,
+    and folding RECOVERED here would reopen the door over it (the last-chance sweep did this on a
+    verify whose fabric pass could not run). The hold stays, and the fabric relift owns it. A TERMINAL
+    rung on a hold whose only cause is a fabric pass that could not run measured no fault: the episode
+    stays RECOVERING for the relift's backoff (03 I48) and its bound (03 I40), never the DOWN no idle
+    path re-checks."""
+    if outcome == OUTCOME_RECOVERED and _post_reset_debt():
+        log("the rung's verify passed, but a reset still owes a passing fabric pass — held fabric-unverified")
+        return
+    if outcome == OUTCOME_TERMINAL and _fabric_77_only_hold():
+        log("the rung left the fabric unverified (77), not failed — holding; re-checks continue")
+        return
+    fsm.on_outcome(outcome)
+
+
 def _fabric_77_eth_drop() -> str:
     """The eth link-count drop that makes a fabric 77 a fault, or "".
 
@@ -3920,13 +3941,7 @@ async def _attempt_idle_relift() -> None:
                 lets the present ladder reset without the grace (spec 03 I56)."""
                 _void_fabric_ok(f"idle relift: {rung}")
                 outcome = await galaxy_recovery.escalate(rung, indices, expected, _log, measured_fault=measured_fault)
-                if outcome == OUTCOME_TERMINAL and _fabric_77_only_hold():
-                    # The rung ran and the fabric still only 77s: no fault was measured, so the episode
-                    # is not the terminal DOWN no idle path re-checks. It stays held and RECOVERING, and
-                    # the relift keeps re-running the pass on its backoff (I48).
-                    _log("the rung left the fabric unverified (77), not failed — holding; re-checks continue")
-                else:
-                    fsm.on_outcome(outcome)
+                _fold_rung_outcome(outcome, _log)
                 return outcome != OUTCOME_WAITING
 
             if generic:
@@ -4722,6 +4737,11 @@ def _stack_versions() -> dict:
     return env
 
 
+# What holds the device pollers stopped across more than one reset, or None. While set, a restart
+# asked for by a reset inside it is deferred to that holder (see _pollers_quiesced_for).
+_pollers_held_for: Optional[str] = None
+
+
 async def _set_device_pollers(active: bool, log) -> list[str]:
     """Stop (or restart) the daemons that continuously poll every chip.
 
@@ -4733,6 +4753,11 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
 
     Best-effort by design: a poller we cannot stop must not block the recovery.
     """
+    if active and _pollers_held_for:
+        # A wider quiesce (the startup fabric check) still owns the bus: a reset inside it restores
+        # nothing, so its post-reset verify runs on the same quiet bus. The owner restarts them.
+        log(f"device pollers kept stopped: {_pollers_held_for} still running")
+        return []
     verb = "start" if active else "stop"
     touched = []
     for svc in DEVICE_POLLER_SERVICES:
@@ -4761,6 +4786,48 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         health_event("pollers_none_active", verb=verb, configured=list(DEVICE_POLLER_SERVICES), host_at_risk=not active)
     health_event("pollers_" + ("restarted" if active else "quiesced"), services=touched)
     return touched
+
+
+@asynccontextmanager
+async def _pollers_quiesced_for(what: str, log):
+    """Hold the device pollers stopped for the whole of ``what``, and start them again on every exit.
+
+    A reset already lands on a quiet bus (``reset_with_quiesce``). The startup fabric check pushes
+    traffic over every link of a mesh nobody has vouched for since the last broker or boot, and with
+    the pollers up it ran beside their MMIO at whatever chip that broker left wedged — the window in
+    which a host died 63 s after a broker restart with no reset running. A reset the check climbs to
+    inside this block defers its own restore here, so its post-reset verify runs on the same quiet bus.
+
+    Best-effort, as for a reset: a poller that will not stop never blocks the check. The restart is
+    skipped only while a reset scope is still cycling the chips off the bus (a timed-out or abandoned
+    reset), where restarting them is the MMIO-at-a-dead-endpoint hazard the reset path also avoids;
+    the health probe re-arms them once the device is idle and healthy. Costs one ``systemctl stop``
+    before the check and one ``start`` after it, each bounded at 30 s per unit."""
+    global _pollers_held_for
+    stopped: list[str] = []
+    try:
+        stopped = await _set_device_pollers(False, log)
+    except Exception as exc:  # noqa: BLE001 - best-effort: never blocks the check
+        log(f"could not stop the device pollers before {what}: {exc!r}")
+    held_before = _pollers_held_for
+    if stopped and not held_before:
+        _pollers_held_for = what
+    try:
+        yield stopped
+    finally:
+        if stopped and not held_before:
+            _pollers_held_for = None
+            cycling = None
+            try:
+                mech = recovery_mechanism
+                cycling = await asyncio.to_thread(mech.scope_active) if mech is not None else None
+            except Exception:  # noqa: BLE001 - an unreadable scope list reads as none running
+                cycling = None
+            if cycling:
+                log(f"device pollers left stopped after {what}: reset {cycling} is still cycling the chips")
+                health_event("pollers_left_quiesced", after=what, scope=str(cycling))
+            else:
+                await asyncio.shield(_set_device_pollers(True, log))
 
 
 def _auto_reboot_enabled() -> bool:
@@ -5593,7 +5660,7 @@ async def device_health_gate(
             outcome = await galaxy_recovery.escalate(
                 f"gate/{phase}", indices, expected, _log, stage=rung, ev=ev, beats=beats
             )
-            fsm.on_outcome(outcome)
+            _fold_rung_outcome(outcome, _log)
             return outcome == OUTCOME_RECOVERED
 
         if stage == DEFER and gone_queued:
@@ -6287,7 +6354,7 @@ async def _force_escalate_stuck_hold() -> None:
         outcome = await galaxy_recovery.escalate(
             "offbus-forced" if off_bus > 0 else "present-forced", indices, expected, log
         )
-        fsm.on_outcome(outcome)
+        _fold_rung_outcome(outcome, log)
 
 
 def _hold_without_reset(cause: str, expected: int, log) -> None:
@@ -9886,6 +9953,11 @@ def _journal_startup_hold_released(
         logger.info(f"STARTUP hold released after {int(held_s)}s (last why: {closed.why})")
 
 
+def _startup_pollers_log(msg: str) -> None:
+    if logger:
+        logger.info(f"STARTUP FABRIC {msg}")
+
+
 async def _verify_fabric_on_start() -> None:
     """Prove the mesh moves data, not merely that every chip answers.
 
@@ -9920,7 +9992,9 @@ async def _verify_fabric_on_start() -> None:
         if not await _await_startup_hugepages():
             missing = missing or "hugepages not yet allocated"
         else:
-            await _device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+            # On a quiet bus, as every reset already is: see _pollers_quiesced_for.
+            async with _pollers_quiesced_for("the startup fabric check", _startup_pollers_log):
+                await _device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
         if missing and _fabric_77_only_hold():
             _startup_prereq_task = asyncio.create_task(_await_startup_prerequisites(missing))
     except Exception as e:  # noqa: BLE001 - startup must survive a check that cannot run
@@ -12166,8 +12240,16 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
     asyncio.create_task(_watchdog_heartbeat())
 
     if serve_http:
+
+        class _BrokerServer(uvicorn.Server):
+            # Note the stop signal first: a health probe the same cgroup-wide SIGTERM kills then
+            # reads as interrupted by shutdown, never as a failure (03 I63).
+            def handle_exit(self, sig, frame):
+                note_broker_stopping(sig)
+                super().handle_exit(sig, frame)
+
         config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
-        await uvicorn.Server(config).serve()
+        await _BrokerServer(config).serve()
     elif socket_server is not None:
         # Socket-only: block on the socket server's serve task to keep the process alive.
         await socket_server._tt_serve_task

@@ -333,6 +333,6 @@ async def check(
     ``os.environ`` and the broker's own process may already have that variable set.
     """
     rc, raw = await run_probe(
-        argv, timeout_sec=timeout_sec, track=track, stream=True, env=env, cwd=cwd, terminate=terminate
+        argv, timeout_sec=timeout_sec, track=track, stream=True, env=env, cwd=cwd, terminate=terminate, name="fabric"
     )
     return rc, raw.decode("utf-8", "replace").strip()

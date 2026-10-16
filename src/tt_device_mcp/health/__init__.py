@@ -137,6 +137,7 @@ from tt_device_mcp.health.recovery.stages.bridge_reset import (
 # through as the `fire` callback, so it needs the name itself, not a wrapper around it.
 from tt_device_mcp.health.recovery.stages.power_cycle import _fire_power_cycle
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook as _run_pre_power_cycle_hook
+from tt_device_mcp.health.shutdown import note_broker_stopping
 
 __all__ = [
     # AICLK ceiling state (start, door, job end, dead-chip kill)
@@ -145,6 +146,7 @@ __all__ = [
     "HealthMonitor",
     "journal_interrupted_fabric_check",
     "eth_read_timed_out",  # spec 03 I61: the stuck eth read the post-job present-mesh reset answers
+    "note_broker_stopping",
     "RecoveryMechanism",
     "RecoveryDeps",
     "GalaxyRecovery",
