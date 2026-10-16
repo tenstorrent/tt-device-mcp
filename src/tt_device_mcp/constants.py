@@ -38,6 +38,11 @@ GRACEFUL_KILL_GRACE_SEC = 60
 # to the reap, and reaching SIGKILL means the device was NOT released.
 SIGTERM_GRACE_SEC = 15
 
+# A preemptable job's whole stop window, from the first signal to SIGKILL. Its owner has
+# agreed to watch the queue and get off the device within this once another job is waiting
+# past its time limit, so it is shorter than the ordinary ladder (SIGINT 60 s + SIGTERM 15 s).
+PREEMPT_GRACE_SEC = 60
+
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
 # is deliberately never killed, because one stopped partway through 32 ASICs is far worse
