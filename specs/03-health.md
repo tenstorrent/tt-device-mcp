@@ -740,7 +740,21 @@ job boundary.
   instead of about 5. Every other guard stays: the arm switch, retry pacing (one grace window
   between resets), reset scope, and no tenant (I13). A positive frozen read, or no measured
   failure, keeps the grace.
-- **I63 A release wakes a held job at once; the wake never dispatches.** A tenant job held at the
+- **I63 — A probe killed by a host shutdown or the broker's own stop is not a verdict.** systemd
+  stops a unit by signalling its whole cgroup, so a host reboot SIGTERMs a running fabric,
+  eth-heartbeat, aiclk-ceiling or tt-smi probe in the same instant it SIGTERMs the broker. A probe
+  that exits by SIGTERM/SIGKILL (-15, -9, 143, 137) while the host is going down (system state
+  `stopping`, or a queued shutdown/reboot/poweroff/halt/kexec/final target job), the broker's unit
+  is `deactivating`, or the broker has received its stop signal, raises
+  `CheckInterruptedByShutdown` (a `CancelledError`): it is logged `INTERRUPTED BY SHUTDOWN` and
+  journaled `check_interrupted_by_shutdown`, and the pass unwinds as a cancellation. No failure is
+  counted, no hold escalates, no ladder rung fires, no reboot or power cycle is requested and the
+  device is not released: it stays as it was, and after the boot the hugepage-gated startup pass
+  decides (I4). Anything else fails as before: the broker's own timeout kill (it reports no exit
+  code and is never checked against shutdown), a signal outside a shutdown, and any doubt (a
+  systemd read that fails counts as not stopping). Time to recover: unchanged for every fault
+  class; the check costs at most three bounded systemd reads, only after a signal death.
+- **I65 A release wakes a held job at once; the wake never dispatches.** A tenant job held at the
   door (spec 01 I15) waits on a wake, not only on `TENANT_HOLD_POLL_SEC`. Any close of the device
   episode to HEALTHY (the startup gate, a reset, the idle relift, a forced escalation — every path
   through the FSM), a `device_released`, and a retired runtime fault (`device_fault_cleared`) wake
@@ -1344,7 +1358,11 @@ refuses.
 | I55 (the verdict names the dispatch failure, never the downgraded mismatch) | `tests/test_dispatch_failure_reset.py::test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch`, `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I55 (rung gap warned at boot and on /health; floor message honest) | `tests/test_dispatch_failure_reset.py::test_rung_gap_boot_warning_and_health_field`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
 | I56 (a measured fabric failure on a present mesh resets on the first relift; frozen read or no measured failure keeps the grace) | `tests/test_device_safety.py::test_idle_relift_resets_a_measured_fabric_failure_without_the_grace`, `tests/test_device_safety.py::test_idle_relift_keeps_the_grace_without_a_measured_fabric_failure`, `tests/test_post_reset_gate.py::test_the_measured_fabric_failure_reset_on_the_first_relift` (the real reset path: the verify after it runs the fabric pass, release only on a healthy verdict, 04 I32/I32a) |
-| I63 (a release wakes a held job at once; a wake while still held never dispatches; wakes cannot spin the gate) | `tests/test_tenant_hold_wake.py::test_startup_release_dispatches_a_held_job_within_a_second`, `tests/test_tenant_hold_wake.py::test_a_wake_while_still_held_does_not_dispatch`, `tests/test_tenant_hold_wake.py::test_a_release_from_another_thread_wakes_the_hold` |
+| I63 (a probe killed during a shutdown raises, journaled; no verdict) | `tests/test_check_interrupted_by_shutdown.py::test_a_probe_killed_during_shutdown_raises_and_is_journaled`, `tests/test_check_interrupted_by_shutdown.py::test_fabric_interrupted_by_shutdown_is_journaled_and_not_a_verdict`, `tests/test_check_interrupted_by_shutdown.py::test_tt_smi_killed_during_shutdown_raises_else_fails` |
+| I63 (no reboot, no further rung, no release over a shutdown-killed post-reset verify) | `tests/test_check_interrupted_by_shutdown.py::test_post_reset_verify_killed_by_shutdown_requests_no_reboot_and_releases_nothing` |
+| I63 (a timeout kill and a signal outside a shutdown fail as before) | `tests/test_check_interrupted_by_shutdown.py::test_a_timeout_kill_keeps_the_old_failure_even_during_shutdown`, `tests/test_check_interrupted_by_shutdown.py::test_a_signal_outside_shutdown_keeps_the_old_failure`, `tests/test_check_interrupted_by_shutdown.py::test_fabric_signal_and_timeout_outside_shutdown_still_fail`, `tests/test_check_interrupted_by_shutdown.py::test_a_clean_or_failing_exit_never_asks` |
+| I63 (shutdown detection: systemd state, shutdown target jobs, own unit deactivating, the broker's stop signal) | `tests/test_check_interrupted_by_shutdown.py::test_shutdown_in_progress_reads_systemd`, `tests/test_check_interrupted_by_shutdown.py::test_the_broker_stop_signal_counts_without_systemd` |
+| I65 (a release wakes a held job at once; a wake while still held never dispatches; wakes cannot spin the gate) | `tests/test_tenant_hold_wake.py::test_startup_release_dispatches_a_held_job_within_a_second`, `tests/test_tenant_hold_wake.py::test_a_wake_while_still_held_does_not_dispatch`, `tests/test_tenant_hold_wake.py::test_a_release_from_another_thread_wakes_the_hold` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

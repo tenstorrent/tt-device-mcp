@@ -113,7 +113,7 @@ the queue and a running job outlive the broker process.
 - **I15** — Job admission is blocking, not advisory: no job is dispatched onto a device the
   admission gate reports degraded, nor while the gate errors instead of reaching a verdict
   (see Queueing and dispatch). By default the job is HELD at the door and re-gated the moment
-  the device is released (spec 03 I63), else on `TENANT_HOLD_POLL_SEC` (60 s), until fit, at most `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` (I19;
+  the device is released (spec 03 I65), else on `TENANT_HOLD_POLL_SEC` (60 s), until fit, at most `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` (I19;
   a kill releases the hold sooner);
   with `TT_DEVICE_MCP_TENANT_HOLD=0` it is refused at the door as FAILED with the reason in
   its log. Gate internals are spec 03. Before the gate, a job waits while a process
