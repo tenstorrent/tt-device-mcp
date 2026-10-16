@@ -2377,7 +2377,7 @@ class GalaxyRecovery(Recovery):
                 # rung above and the suppressed mesh reset; otherwise the command is named and the hold
                 # below stands. A reset that recovered clears the hold; one that fired but did not falls to
                 # the climb below, since a warm reboot cannot re-enumerate a still-off-bus tray.
-                outcome = await self._attempt_ubb_tray_reset(beats_pre, off_bus_pre, expected, log)
+                outcome = await self._attempt_ubb_tray_reset(beats_pre, off_bus_pre, expected, log, force=force)
                 if outcome is True:
                     self.deps.clear_device_reported_fault(
                         "idle off-bus escalation: per-tray BMC reset recovered the mesh"
@@ -2816,7 +2816,9 @@ class GalaxyRecovery(Recovery):
             reason=reason,
         )
 
-    async def _attempt_ubb_tray_reset(self, beats: dict, off_bus: int, expected: int, log) -> Optional[bool]:
+    async def _attempt_ubb_tray_reset(
+        self, beats: dict, off_bus: int, expected: int, log, *, force: bool = False
+    ) -> Optional[bool]:
         """The per-tray BMC reset rung, between the per-chip bridge reset and the mesh-wide reset. It walks
         the AFFECTED trays — those holding an off-bus chip — one at a time, re-verifying (chips back, ARC
         advancing, FABRIC re-checked) after each and stopping as soon as the whole mesh verifies healthy. It
@@ -2839,6 +2841,8 @@ class GalaxyRecovery(Recovery):
         The whole walk runs at most once per hold episode, never while a reset scope cycles, never with a
         tenant on the mesh: it re-powers silicon, so it carries the same guards as the other destructive
         rungs. Every guard falls back to naming the command and holding, never a half-done or repeated walk.
+        ``force`` (the hold-deadline climb) reads the tenant guard as the climb itself does: an unreadable
+        holder scan no longer blocks the walk, a real tenant or a running job still does.
         A fully-off-bus mesh is declined outright and NOT named as a tray-down — that is the cold-power-cycle
         case, and a BMC tray reset cannot verify a tray with no chip on the bus."""
         if expected > 0 and off_bus >= expected:
@@ -2911,7 +2915,7 @@ class GalaxyRecovery(Recovery):
             metrics.stage_fired("ubb_tray", "blocked")
             return None
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        if self._tenant_active(scan):
+        if self._tenant_active(scan, force=force):
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)
             log("tray-down but a tenant holds the device, the holder scan is unreadable, or a job is running — holding")
             metrics.stage_fired("ubb_tray", "blocked")
