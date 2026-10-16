@@ -641,6 +641,9 @@ class Recovery(ABC):
         # foreign scope or a clean-exit-but-unverified reset must not leave a stale hard-fail flag that
         # steers the next gate's escalation to the cold rung over a reset that never hard-failed.
         self.mechanism.last_reset_exit_nonzero = False
+        # Set only once a reset of ours launched and exited: a refused, adopted or still-cycling one
+        # leaves None, and only a launched one that failed goes in the boot's record (spec 04 I58).
+        self.mechanism.last_reset_rc = None
         argv = select_recovery(self.monitor, self.mechanism, self.deps).reset_argv(indices)
         expected = self.monitor.expected(len(indices))
 
@@ -691,6 +694,7 @@ class Recovery(ABC):
         finally:
             if aer_mask is not None:
                 await asyncio.to_thread(aer_mask.restore)
+        self.mechanism.last_reset_rc = rc
         if _journal_cpld_too_old(argv, out, log):
             # Latched on the mechanism both platforms share, so the NEXT rung and every later pass
             # resolve to the galaxy ladder rather than repeating the `-r` tt-smi just disowned.

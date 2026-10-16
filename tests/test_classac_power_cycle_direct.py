@@ -15,10 +15,12 @@ from types import SimpleNamespace
 import pytest
 
 from tests.conftest import patch_health_event
-from tests.test_startup_fabric_hugepages import _shortfalls, _startup, _systemctl  # noqa: F401 - the fixture
+from tests.test_startup_fabric_hugepages import _shortfalls, _startup, _systemctl  # noqa: F401 - the fixtures
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.health.evidence import health_dir
 from tt_device_mcp.health.recovery import galaxy
+from tt_device_mcp.health.recovery.base import RESET_RECORD_FILE
 
 EXPECTED = 32
 RESET_SEC = 262  # the longest measured failed mesh reset (rc 1) on an all-off drop
@@ -65,6 +67,8 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
     monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", lambda action, tenant_active=False, **k: state["allowed"])
     monkeypatch.setattr(g.mechanism, "_journal_auto_recovery_denied", lambda *a, **k: order.append("denied"))
     monkeypatch.setattr(g.mechanism, "mesh_reset_failed_since_release", False)
+    monkeypatch.setattr(g.mechanism, "last_reset_rc", None)
+    monkeypatch.setattr(g.mechanism, "_reset_record_cache", None)
     monkeypatch.setattr(galaxy, "TRAY_DOWN_RESCAN_SETTLE_SEC", 0)
     monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
     # No operator check installed or configured, and no stand-back marker: nothing objects.
@@ -92,6 +96,7 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
         order.append("glx_reset")
         state["clock"][0] += RESET_SEC
         g.mechanism.mesh_reset_failed_since_release = True
+        g.mechanism.last_reset_rc = 1
         return False
 
     async def sweep(bitmap, ids, trays, expected, log, do_sbr=True):
@@ -279,8 +284,11 @@ async def test_a_partial_drop_keeps_the_ladder(rig, spec, prelude):
     rig["beats"] = _beats_without(_off(rig["map"], spec))
     await _gate(rig, galaxy.STAGE_SMI_RESET)
     await _gate(rig, galaxy.STAGE_POWER_CYCLE)
-    assert rig["order"] == [*prelude, "glx_reset", "sweep", "power_cycle"]
-    assert "power_cycle_direct" not in _kinds(rig) and SKIPPED not in _kinds(rig)
+    # The mesh reset failed on this same set, so the last-chance sweep, whose last step is that same
+    # reset, is skipped and the host rung follows (spec 04 I58).
+    assert rig["order"] == [*prelude, "glx_reset", "power_cycle"]
+    assert "power_cycle_direct" not in _kinds(rig)
+    assert [f.get("reason") for k, f in rig["events"] if k == SKIPPED] == ["mesh_reset_failed_unchanged"]
 
 
 # ---- the guards ---------------------------------------------------------------------------------
@@ -380,13 +388,14 @@ async def test_a_failed_startup_check_after_the_cycle_keeps_the_hold(rig):
 @pytest.mark.asyncio
 async def test_time_to_recover_on_a_fake_clock(rig):
     """When the cycle is requested, on the clock each failed reset (262 s) and sweep (323 s) advance.
-    Class A: at once. Class C, at startup as at run time: after its one reset. The
-    partial-tray ladder (B2, unchanged) for comparison: after the reset and the sweep."""
+    Class A: at once. Class C, at startup as at run time: after its one reset. The partial-tray
+    ladder (B2): after its one reset; the sweep would repeat it (I58), so it is skipped."""
 
     async def episode(beats, stages, phase="post-job"):
         g = rig["g"]
         g.tray_down_episode_end()
         g.mechanism.mesh_reset_failed_since_release = False
+        g.mechanism._reset_record_cache = (health_dir() / RESET_RECORD_FILE, {"boot_id": "", "failed": []})
         rig["clock"][0] = 0
         rig["cycled_at"].clear()
         rig["beats"] = beats
@@ -401,9 +410,26 @@ async def test_time_to_recover_on_a_fake_clock(rig):
     all_off_startup = await episode({}, climb, phase="startup")
     all_off_run_time = await episode({}, climb)
     part_tray = await episode(_beats_without(_off(rig["map"], {3: 5})), climb)
-    assert (whole_tray, all_off_startup, all_off_run_time, part_tray) == (
-        0,
-        RESET_SEC,
-        RESET_SEC,
-        RESET_SEC + SWEEP_SEC,
-    )
+    assert (whole_tray, all_off_startup, all_off_run_time, part_tray) == (0, RESET_SEC, RESET_SEC, RESET_SEC)
+
+
+# ---- across a broker restart (spec 04 I58) ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["startup", "post-job"])
+async def test_replay_all_off_after_a_restart_cycles_with_no_second_reset(rig, monkeypatch, phase):
+    """G6/G8: a mesh reset failed on the all-off mesh, then the broker restarted. Neither the startup
+    gate nor a later gate runs that reset again: the power cycle follows at once."""
+    g = rig["g"]
+    rig["beats"] = {}
+    await _gate(rig, galaxy.STAGE_SMI_RESET)
+    assert rig["order"][:1] == ["glx_reset"], "a first-seen all-off mesh at run time gets its one reset (I37)"
+    rig["order"].clear()
+    rig["cycled_at"].clear()
+    # The restart: memory goes, the record on disk stays.
+    g.mechanism.mesh_reset_failed_since_release = False
+    g.mechanism._reset_record_cache = None
+    g.tray_down_episode_end()
+    await _gate(rig, galaxy.STAGE_SMI_RESET, phase=phase)
+    assert rig["order"] == ["power_cycle"], "no second reset on the same all-off mesh"
