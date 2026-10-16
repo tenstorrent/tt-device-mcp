@@ -659,6 +659,33 @@ each rung fires only when the gentler one failed or cannot apply.
   never marks; one the host has not acted on within `TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC` (default
   900 s, capped at 3600 s; malformed or non-positive reads as the default) is journaled as
   `host_action_request_expired` and the next tick resumes the forced ladder.
+  The same rule holds on every path that could start a device reset, not only the watchdog:
+  `GalaxyRecovery.escalate` returns WAITING at its entry (before the tray-down prelude) for every
+  caller and phase; the health gate's ladder (any phase, pre-job, post-job or startup) runs no rung,
+  marks a healthy device dirty and holds it; an operator reset (`tt_device_reset` and its stream) is
+  refused unless forced, and a forced one is logged. Each path journals one
+  `reset_suppressed_host_action` event and one log line per request. A power-cycle command that timed
+  out, rather than exited non-zero or failed to start, may have launched its detached cycler, so it
+  keeps the request pending (`auto_power_cycle_failed` with `timed_out` true) under the same bound.
+  A job held past its bound while a request is pending says so (the action, its age, the bound)
+  instead of naming a device op in flight.
+
+- **I35 — Once a hold episode needs a power cycle after a device reset, no further device reset
+  runs in it.** When a device reset (bridge, tray re-power, galaxy or SMI reset, or the I22
+  last-chance sweep) ran in this hold episode and the host-rung chooser still routes the off-bus
+  drop to the cold rung (a power cycle, or BLOCKED when none is opted in), the broker latches the
+  episode (`power_cycle_required_since`; before any hold opened it latches the episode that opens
+  next). While the latch holds and chips are still off the bus, neither the idle off-bus ladder
+  (forced or not) nor the gate fires another device reset: each journals
+  `device_reset_skipped_power_cycle_required` and climbs to the host rung with the drop treated as
+  warm-reboot-futile. With a power cycle opted in that fires it, still behind the I22 sweep; without
+  one it pages and holds, as I31 does. A reset the gate
+  refused ran nothing and latches nothing, so I33's lifted pass may still run the ladder's own rungs
+  when no reset ran. The latch clears when the device is released and is in memory only (a broker
+  restart costs at most one more reset). Time-to-recover: a partial off-bus or ARC drop that needs a
+  power cycle no longer re-runs a device reset (each one overrunning its timeout, about 180 s) per
+  forced window; the host rung is decided on the next pass, so the time to the power cycle is the
+  same or shorter. Other fault classes are unchanged.
 
 ## Interfaces
 
@@ -1098,6 +1125,8 @@ sees a silent fabric pass.
 | I33 / I32 a lifted reset releases only after a passing full health check, fabric included; a reset the gate still refuses releases nothing | `tests/test_gated_hold_handoff.py::test_the_lifted_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_a_reset_the_gate_still_refuses_releases_nothing` |
 | I34 a requested power cycle or reboot suppresses every hold-deadline tick and a forced escalation waiting on the lock; the device stays held with the check owed; one line per request | `tests/test_host_action_suppress.py::test_power_cycle_request_suppresses_every_deadline_tick`, `::test_reboot_request_suppresses_the_deadline_tick`, `::test_escalation_waiting_on_the_lock_runs_no_rung` |
 | I34 bounded: a refused or failed request never suppresses; an expired one resumes the ladder; the window is always finite | `tests/test_host_action_suppress.py::test_power_cycle_that_fails_to_launch_does_not_suppress`, `::test_power_cycle_refused_by_the_ledger_does_not_suppress`, `::test_a_request_the_host_never_acted_on_expires_and_the_ladder_resumes`, `::test_pending_window_is_always_finite` |
+| I34 every path: escalate starts no rung for any phase, the gate ladder runs no rung and holds, an operator reset is refused on both routes unless forced, a timed-out fire stays pending, a held job names the pending action | `tests/test_host_action_suppress.py::test_escalate_starts_no_rung_while_a_host_action_is_pending`, `::test_the_gate_runs_no_rung_and_holds_while_a_host_action_is_pending`, `::test_an_operator_reset_is_refused_while_a_host_action_is_pending`, `::test_a_power_cycle_command_that_timed_out_stays_pending`, `::test_a_job_held_past_its_bound_names_the_pending_host_action` |
+| I35 after a reset ran and the verdict needs the cold rung, the idle ladder and the gate run no more device resets; with a power cycle allowed it fires at once; the latch is per episode and the release clears it | `tests/test_host_action_suppress.py::test_after_power_cycle_required_the_idle_ladder_runs_no_more_device_resets`, `::test_after_power_cycle_required_the_gate_runs_no_more_device_resets`, `::test_after_power_cycle_required_the_ladder_power_cycles_at_once_when_allowed`, `::test_the_power_cycle_required_latch_is_per_episode`, `::test_releasing_the_device_clears_the_power_cycle_required_latch` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |

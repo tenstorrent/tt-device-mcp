@@ -1105,7 +1105,12 @@ class GalaxyRecovery(Recovery):
         and, before its first rung, given one PCI rescan and the read-only capture. Then the ladder
         runs exactly as it would have, with the caller's own evidence and stage: the prelude never
         picks a rung, skips one or fires a power cycle. Only a rescan that brought every chip back
-        onto a mesh that passes the full verify ends the episode before the ladder."""
+        onto a mesh that passes the full verify ends the episode before the ladder.
+
+        A host reboot or power cycle still pending (spec 04 I34) stops every caller here, before
+        the prelude: nothing runs, WAITING, one log line per request."""
+        if self.mechanism.host_action_blocks_reset(log, context=f"escalate({phase})"):
+            return OUTCOME_WAITING
         rung, _, gate_phase = phase.partition("/")
         if await self._tray_down_latch(expected, beats) == TRAY_DOWN_ONSET and not self._td["prelude_done"]:
             if await self._tray_down_prelude(expected, log, phase=gate_phase or rung):
@@ -1780,6 +1785,9 @@ class GalaxyRecovery(Recovery):
         escalation, reboot_blocked = _host_escalation_for_drop(
             off_bus, expected, warm_reboot_futile=True, **self.deps.host_escalation_kwargs()
         )
+        # The sweep just ran every reset type and the mesh did not verify: no device reset heals this
+        # episode now (spec 04 I35).
+        self.mechanism.note_power_cycle_required(self.deps.device_hold_episode_since())
         if reboot_blocked or escalation != "power-cycle":
             log(
                 f"tray-down-no-window sweep did not recover the mesh; power cycle not auto-fired "
@@ -2233,6 +2241,21 @@ class GalaxyRecovery(Recovery):
             health_event("galaxy_reset_skipped_regressed", held_since=hold_since, off_bus=off_bus, phase="idle")
             await self._climb_to_host_recovery_after_failed_reset(expected, off_bus, log)
             return True
+        if off_bus > 0 and self.mechanism.power_cycle_required_in(hold_since):
+            # spec 04 I35: this episode already found that only a power cycle heals it. Another device
+            # reset (the below-floor mesh reset each window used to re-run, each overrunning its
+            # timeout) cannot, and only stresses a host that is already at risk: climb to the host rung
+            # now. It fires the power cycle once allowed (after the I22 last-chance sweep), or holds
+            # and pages when none can run.
+            log(
+                f"{off_bus}/{expected} off-bus and this hold already needs a power cycle — no further "
+                f"device reset; climbing to the host rung"
+            )
+            health_event(
+                "device_reset_skipped_power_cycle_required", held_since=hold_since, off_bus=off_bus, phase="idle"
+            )
+            await self._climb_to_host_recovery_after_failed_reset(expected, off_bus, log)
+            return True
         isolated_chips = self.deps.isolated_chips()
         device_pci_map = self.deps.device_pci_map()
         # A chip GONE from the bus entirely — absent from sysfs, not reading all-ones — never entered
@@ -2530,6 +2553,7 @@ class GalaxyRecovery(Recovery):
                 f"ASIC, so climbing to the cold rung, never the reboot; no further mesh reset this hold."
             )
         episode_regressed = self.mechanism.reset_regressed_in(hold_since)
+        pc_required = self.mechanism.power_cycle_required_in(hold_since)
         hold_age = _hold_age_sec(hold_since)
         if hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
             log(
@@ -2554,11 +2578,22 @@ class GalaxyRecovery(Recovery):
         warm_reboot_futile = (
             expected > 1
             and off_bus > 0
-            and (reset_regressed or episode_regressed or self.mechanism.last_reset_exit_nonzero or below_floor_offbus)
+            and (
+                reset_regressed
+                or episode_regressed
+                or pc_required
+                or self.mechanism.last_reset_exit_nonzero
+                or below_floor_offbus
+            )
         )
         escalation, reboot_blocked = _host_escalation_for_drop(
             off_bus, expected, warm_reboot_futile=warm_reboot_futile, **self.deps.host_escalation_kwargs()
         )
+        if off_bus > 0 and (reboot_blocked or escalation == "power-cycle") and self._reset_ran_this_episode(hold_since):
+            # A device reset ran this episode and the chooser still routes the drop to the cold rung:
+            # no further device reset heals it (spec 04 I35), even if the power cycle is held off
+            # below. A reset the gate refused ran nothing and latches nothing (I33's lifted pass).
+            self.mechanism.note_power_cycle_required(hold_since)
         if reboot_blocked:
             # No chassis power cycle is opted in and no rung can recover it: fail closed loudly and hold,
             # never fire a reboot that lands right back in the dead state. A whole-bus drop and a reset
@@ -2720,6 +2755,13 @@ class GalaxyRecovery(Recovery):
             return
         health_event("post_reboot_host_escalation", escalation=escalation, off_bus=off_bus, expected=expected)
         await self.deps.auto_power_cycle_host(log, "post-reboot verify: the warm reboot did not bring the mesh back")
+
+    def _reset_ran_this_episode(self, hold_since: str) -> bool:
+        """True when a device reset started inside this hold episode (the reset clock moves at reset
+        begin; a reset a gate refused never moves it)."""
+        at = self.mechanism.last_reset_monotonic
+        age = _hold_age_sec(hold_since)
+        return bool(at) and age is not None and time.monotonic() - at <= age
 
     def _emit_reset_unrecoverable_power_cycle_required(
         self, log, off_bus: int, expected: int, *, regressed: bool, context: str

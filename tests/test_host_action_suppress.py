@@ -15,10 +15,13 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from tests.conftest import fsm_dirty, patch_health_event
+from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
+from tt_device_mcp.health.recovery.offbus_power_cycle import (
+    fire_command as _real_fire_command,  # before the conftest tripwire
+)
 
 REASON = "tray-down-no-window: every reset type ran back-to-back and the mesh did not verify"
 SINCE = datetime(2026, 10, 15, 11, 50, 0)
@@ -195,3 +198,254 @@ async def test_a_request_the_host_never_acted_on_expires_and_the_ladder_resumes(
 def test_pending_window_is_always_finite(monkeypatch, raw, want):
     monkeypatch.setenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", raw)
     assert recovery_base.host_action_pending_sec() == want
+
+
+# --- every other reset path (spec 04 I34): relift, gate, operator reset; a timed-out fire ---------
+
+
+@pytest.fixture
+def ladder_spy(monkeypatch):
+    """Every rung escalate() can dispatch to, recorded instead of run."""
+    ran = []
+
+    async def _rung(name, *a, **k):
+        ran.append(name)
+        return True
+
+    # On the class: undoing a patch on the instance would leave the bound method behind as an
+    # instance attribute, shadowing a later test's class-level spy. Earlier tests that patched
+    # the instance left such attributes; hide them for this test.
+    gr = galaxy.GalaxyRecovery
+    for name in ("_escalate_offbus_stuck_hold", "_escalate_stuck_hold", "_fire_gate_rung", "_tray_down_prelude"):
+        if name in vars(srv.galaxy_recovery):
+            monkeypatch.delattr(srv.galaxy_recovery, name)
+    monkeypatch.setattr(gr, "_escalate_offbus_stuck_hold", lambda *a, **k: _rung("offbus", *a, **k))
+    monkeypatch.setattr(gr, "_escalate_stuck_hold", lambda *a, **k: _rung("present", *a, **k))
+    monkeypatch.setattr(gr, "_fire_gate_rung", lambda *a, **k: _rung("gate", *a, **k))
+    monkeypatch.setattr(gr, "_tray_down_prelude", lambda *a, **k: _rung("prelude", *a, **k))
+    return ran
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["offbus", "present", "offbus-forced", "gate/post-job"])
+async def test_escalate_starts_no_rung_while_a_host_action_is_pending(held, ladder_spy, phase):
+    """The relift, the gate and the forced pass all reach the ladder through escalate(): while a
+    requested power cycle is pending none of them runs a rung. One line per request; bounded."""
+    srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
+    lines = []
+    for _ in range(3):
+        out = await srv.galaxy_recovery.escalate(phase, ["0", "1"], 32, lines.append, stage="smi_reset")
+        assert out == galaxy.OUTCOME_WAITING
+    assert ladder_spy == [], "no rung may start under a pending host action"
+    suppressed = [f for k, f in held["events"] if k == "reset_suppressed_host_action"]
+    assert len(suppressed) == 1 and suppressed[0]["action"] == "power-cycle" and len(lines) == 1
+    assert srv._device_unavailable_for_tenant(), "a held device stays refused to tenants"
+
+    srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic() - 901)
+    await srv.galaxy_recovery.escalate(phase, ["0", "1"], 32, lines.append, stage="smi_reset")
+    assert ladder_spy, "an expired request hands the hold back to the ladder"
+    assert "host_action_request_expired" in _kinds(held["events"])
+
+
+@pytest.mark.asyncio
+async def test_the_gate_runs_no_rung_and_holds_while_a_host_action_is_pending(monkeypatch, tmp_path, clear_job_state):
+    """A between-jobs gate on an unhealthy mesh, with a power cycle pending: no reset, no host-rung
+    verdict read off a mesh going down, and the device stays held for tenants."""
+    from tests.test_device_safety import _reach_reboot_rung
+
+    events, resets = [], {"n": 0}
+    reboots = _reach_reboot_rung(monkeypatch, tmp_path, n_present=32)
+    srv.isolated_chips = set()
+    srv.device_pci_map = {}
+    srv.device_fault_reported = ""
+    fsm_dirty(srv, "", why="gate_error")
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(12)})
+
+    async def counting_reset(indices, log):
+        resets["n"] += 1
+        return False
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", counting_reset)
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+    monkeypatch.setattr(recovery_base, "health_event", lambda name, **k: events.append(name))
+    srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+
+    assert resets["n"] == 0 and reboots["n"] == 0
+    assert "reset_suppressed_host_action" in events
+    assert "reset_unrecoverable_power_cycle_required" not in events, "no verdict off a mesh going down"
+    assert srv._device_unavailable_for_tenant(), "the device stays held"
+
+
+def test_a_job_held_past_its_bound_names_the_pending_host_action(held):
+    srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
+
+    class _Job:
+        id, owner = "042", "tenant"
+
+    why = srv._escalate_held_job_past_bound(_Job(), 1300, 1200, "device held")
+    assert "power-cycle" in why and "device op is in flight" not in why
+    assert held["spawned"] == []
+
+
+@pytest.mark.parametrize("route", ["/api/tt_device_reset", "/api/tt_device_reset_stream"])
+def test_an_operator_reset_is_refused_while_a_host_action_is_pending(monkeypatch, tmp_path, route):
+    """Forced or not by the gate, an operator reset under a pending cycle races the host going down:
+    it is refused (``force`` overrides), and nothing reaches the device."""
+    from starlette.testclient import TestClient
+
+    from tt_device_mcp.device_holders import HolderScan
+
+    ran = []
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_with_quiesce", lambda *a, **k: ran.append(a))
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", ("power-cycle", time.monotonic()))
+    client = TestClient(srv.build_asgi_app(srv.create_mcp_server()))
+    resp = client.post(route, json={"force": False})
+    body = resp.text
+    if route.endswith("_stream"):
+        assert body.rstrip().endswith("::status::refused") and "power-cycle" in body
+    else:
+        assert resp.json()["status"] == "refused" and "power-cycle" in resp.json()["reason"]
+    assert ran == []
+    assert srv._host_action_reset_refusal(True) is None, "force overrides"
+
+
+@pytest.mark.asyncio
+async def test_a_power_cycle_command_that_timed_out_stays_pending(held, monkeypatch):
+    """A cycler that timed out may already have started its detached cycle: the mark stays, with
+    its normal bound, so no reset starts under it. A non-zero exit still clears it."""
+    from tt_device_mcp.health.recovery import offbus_power_cycle as opc
+
+    monkeypatch.setattr(opc, "_run", lambda *a, **k: (None, "timed out after 30s"))
+    with pytest.raises(recovery_base.HostActionTimedOut):
+        _real_fire_command(["cycler"], REASON)
+    monkeypatch.setattr(opc, "_run", lambda *a, **k: (1, "nope"))
+    with pytest.raises(RuntimeError) as err:
+        _real_fire_command(["cycler"], REASON)
+    assert not isinstance(err.value, recovery_base.HostActionTimedOut)
+
+    def _timed_out():
+        raise recovery_base.HostActionTimedOut("power-cycle command timed out after 30s")
+
+    monkeypatch.setattr(srv, "_fire_power_cycle", _timed_out)
+    await srv._auto_power_cycle_host(lambda m: None, REASON)
+    failed = [f for k, f in held["events"] if k == "auto_power_cycle_failed"]
+    assert failed and failed[0]["timed_out"] is True
+    assert srv.recovery_mechanism.host_action_pending() is not None
+    _offbus_tick()
+    assert srv._forced_escalation_task is None and held["spawned"] == []
+
+    srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic() - 901)
+    _offbus_tick()
+    await srv._forced_escalation_task
+    assert held["spawned"] == [True], "the bound still holds after a timeout"
+
+
+# --- spec 04 I35: once a power cycle is required, no further device reset in the episode ---------
+
+
+@pytest.mark.asyncio
+async def test_after_power_cycle_required_the_idle_ladder_runs_no_more_device_resets(monkeypatch, clear_job_state):
+    """A reset ran, hard-failed and left chips off the bus; no power cycle is opted in, so the
+    broker pages for one. Every later window used to re-run the same reset (each overrunning its
+    timeout); it now goes straight to the host rung and holds."""
+    from tests.test_device_safety import _arm_regressed_offbus_hold
+
+    counters, events = _arm_regressed_offbus_hold(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+
+    async def hard_failing_reset(indices, log):
+        counters["resets"] += 1
+        srv.recovery_mechanism.last_reset_monotonic = time.monotonic()
+        srv.recovery_mechanism.last_reset_exit_nonzero = True
+        return False
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", hard_failing_reset)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(16)})
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["resets"] == 1 and "reset_unrecoverable_power_cycle_required" in events
+    assert srv.recovery_mechanism.power_cycle_required_in(srv.device_hold_episode_since)
+    for _ in range(3):
+        events.clear()
+        await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+        assert "device_reset_skipped_power_cycle_required" in events
+        assert "reset_unrecoverable_power_cycle_required" in events, "it keeps paging for the cold rung"
+    assert counters["resets"] == 1 and counters["sbr"] == 0 and counters["trays"] == 0
+
+
+@pytest.mark.asyncio
+async def test_after_power_cycle_required_the_ladder_power_cycles_at_once_when_allowed(monkeypatch, clear_job_state):
+    """With the cold rung opted in, a latched episode skips the device reset and fires the power
+    cycle (after the last-chance sweep, I22) on the next window."""
+    from tests.test_device_safety import _arm_regressed_offbus_hold
+
+    counters, events = _arm_regressed_offbus_hold(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    cycles = []
+
+    async def _cycle(log, reason):
+        cycles.append(reason)
+
+    monkeypatch.setattr(srv.galaxy_recovery.deps, "auto_power_cycle_host", _cycle)
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda *a, **k: (True, ""))
+    srv.recovery_mechanism.note_power_cycle_required(srv.device_hold_episode_since)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(16)})
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["resets"] == 0 and counters["sweeps"] == 1 and len(cycles) == 1
+    assert "device_reset_skipped_power_cycle_required" in events
+
+
+def test_the_power_cycle_required_latch_is_per_episode():
+    m = srv.recovery_mechanism
+    m.power_cycle_required_since = None
+    m.note_power_cycle_required("2026-10-15T15:59:00")
+    assert m.power_cycle_required_in("2026-10-15T15:59:00")
+    assert not m.power_cycle_required_in("2026-10-15T18:00:00"), "a new episode may reset again"
+    m.power_cycle_required_since = None
+
+
+def test_releasing_the_device_clears_the_power_cycle_required_latch(clear_job_state):
+    """A latch set before any hold opened ("*") matches every episode, so only the release clears it:
+    the next episode may reset again."""
+    m = srv.recovery_mechanism
+    m.note_power_cycle_required("")
+    assert m.power_cycle_required_in("2026-10-15T18:00:00")
+    srv.device_hold_logged = True
+    srv._note_tenant_gate_verdict("")
+    assert m.power_cycle_required_since is None
+
+
+@pytest.mark.asyncio
+async def test_after_power_cycle_required_the_gate_runs_no_more_device_resets(monkeypatch, tmp_path, clear_job_state):
+    """The gate's reset ran, hard-failed and left the drop needing the cold rung, with none opted in:
+    the next gate pass of the same hold runs no device reset and pages for the power cycle again."""
+    from tests.test_device_safety import _reach_reboot_rung_with_regressing_reset
+
+    monkeypatch.setattr(srv, "device_hold_episode_since", datetime.now().isoformat(timespec="seconds"))
+    srv.device_hold_logged = True
+    reboots = _reach_reboot_rung_with_regressing_reset(monkeypatch, tmp_path, off_before=20, off_after=20)
+    events, resets = [], {"n": 0}
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+
+    async def hard_failing_reset(indices, log):
+        resets["n"] += 1
+        srv.recovery_mechanism.last_reset_monotonic = time.monotonic()
+        srv.recovery_mechanism.last_reset_exit_nonzero = True
+        return False
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", hard_failing_reset)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    assert resets["n"] == 1 and "reset_unrecoverable_power_cycle_required" in events
+    assert srv.recovery_mechanism.power_cycle_required_in(srv.device_hold_episode_since)
+    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)  # the reset cooldown ran out
+    events.clear()
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    assert resets["n"] == 1, "no further device reset once the hold needs a power cycle"
+    assert "device_reset_skipped_power_cycle_required" in events
+    assert "reset_unrecoverable_power_cycle_required" in events, "it pages for the cold rung instead"
+    assert reboots["n"] == 0

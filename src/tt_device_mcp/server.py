@@ -2125,6 +2125,7 @@ def _reset_for_testing():
     _hold_episode_tenant = False
     if recovery_mechanism is not None:
         recovery_mechanism.regressed_reset_since = None
+        recovery_mechanism.power_cycle_required_since = None
     _fabric_77_streak_since = None
     _fabric_77_streak = 0
     _fabric_77_fallback_release_monotonic = 0.0
@@ -5415,6 +5416,19 @@ async def device_health_gate(
                 _note_tenant_gate_verdict(f"device unverified: gate/{phase}: reset cooldown active ({int(left)}s left)")
             return
 
+        # spec 04 I34: a host reboot / power cycle still pending — no rung of this ladder (bridge,
+        # gone-chip bridge, tray re-power, galaxy/SMI reset, a second host rung) starts under it, and
+        # nothing read off a mesh going down is taken as a verdict. The device stays held; the full
+        # check runs once the host is back. Bounded by the request's pending window.
+        if recovery_mechanism.host_action_blocks_reset(_log, context=f"gate/{phase}"):
+            if fsm.state is ServerState.HEALTHY:
+                _mark_device_dirty(f"gate/{phase}: unhealthy while a host action is pending", why="probe_unhealthy")
+            metrics.stage_fired("smi_reset", "blocked")
+            _note_tenant_gate_verdict(
+                f"device unverified: gate/{phase}: a requested host reboot/power cycle is pending"
+            )
+            return
+
         reasons = ["failed health check"] if not healthy else []
         if device_fault_reported:
             # Say what actually brought us here. Every check passed; the runtime disagreed.
@@ -5639,7 +5653,23 @@ async def device_health_gate(
             and ev.off_bus > 0
             and recovery_mechanism.reset_regressed_in(device_hold_episode_since)
         )
-        if episode_regressed:
+        # spec 04 I35: this hold already needs a power cycle — a device reset cannot heal it; skip it
+        # the same way and decide the host rung now.
+        pc_required = (
+            stage == STAGE_SMI_RESET
+            and expected > 1
+            and ev.off_bus > 0
+            and recovery_mechanism.power_cycle_required_in(device_hold_episode_since)
+        )
+        gate_reset_ran = False
+        if pc_required and not episode_regressed:
+            _log(
+                f"{ev.off_bus}/{expected} chip(s) off the bus and this hold already needs a power cycle — "
+                f"no further device reset; deciding the host rung instead"
+            )
+            health_event("device_reset_skipped_power_cycle_required", phase=phase, off_bus=ev.off_bus)
+            metrics.stage_fired("smi_reset", "blocked")
+        elif episode_regressed:
             _log(
                 f"{ev.off_bus}/{expected} chip(s) off the bus and this hold's galaxy reset already "
                 f"regressed the mesh — not repeating it; deciding the host rung instead"
@@ -5649,6 +5679,7 @@ async def device_health_gate(
         else:
             reset_clock = recovery_mechanism.last_reset_monotonic
             recovered = await _fire(stage)
+            gate_reset_ran = recovery_mechanism.last_reset_monotonic != reset_clock
             # The latch is spent only once a reset actually started (the clock moves at reset begin):
             # one the per-host gate or the outage hold refused leaves the episode's reset unspent.
             if (
@@ -5687,7 +5718,7 @@ async def device_health_gate(
             reset_exit_nonzero=recovery_mechanism.last_reset_exit_nonzero,
             last_action=STAGE_SMI_RESET,
             last_action_recovered=False,
-            episode_reset_regressed=episode_regressed,
+            episode_reset_regressed=episode_regressed or pc_required,
         )
         stage = galaxy_recovery.next_stage(ev)
         # A reset that made the mesh WORSE off the bus (the incident's 8->32 inversion), or that
@@ -5719,6 +5750,9 @@ async def device_health_gate(
             )
             health_event("reboot_suppressed_reset_in_flight", phase=phase, off_bus=off_bus)
         elif stage == BLOCKED:
+            if gate_reset_ran and off_bus > 0:
+                # spec 04 I35: the reset ran and the drop still needs the cold rung — no more resets.
+                recovery_mechanism.note_power_cycle_required(device_hold_episode_since)
             # BLOCKED means specifically: this drop needs the cold rung (a warm reboot cannot
             # re-enumerate it) and no power cycle is opted in. Fail closed loudly and keep holding
             # rather than fire a reboot that lands right back in the dead state. A whole-bus drop and
@@ -5733,6 +5767,8 @@ async def device_health_gate(
             metrics.stage_fired("power_cycle", "blocked")
         elif stage in (STAGE_HOST_REBOOT, STAGE_POWER_CYCLE):
             action = _HOST_ESCALATION_ACTION[stage]
+            if stage == STAGE_POWER_CYCLE and gate_reset_ran and off_bus > 0:
+                recovery_mechanism.note_power_cycle_required(device_hold_episode_since)  # spec 04 I35
             scan2 = await asyncio.to_thread(enumerate_device_holders)
             # A scan that could not read every holder (no CAP_DAC_READ_SEARCH on a tenant's
             # /proc) must count as "a tenant is here": the highest-risk action does not get to
@@ -6067,6 +6103,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         _dispatch_reset_spent = False  # spec 03 I55: the next episode earns its own reset
         if recovery_mechanism is not None:
             recovery_mechanism.regressed_reset_since = None  # spec 04 I31: the next episode may reset again
+            recovery_mechanism.power_cycle_required_since = None  # spec 04 I35: likewise
         if galaxy_recovery is not None:
             galaxy_recovery.tray_down_episode_end()  # spec 04 I19: the next drop is a fresh onset
         offbus_power_cycle.end_hold_handoff()  # spec 04 I33: no hold is handed off any more
@@ -6222,10 +6259,8 @@ def _host_action_blocks_escalation() -> bool:
     pending = recovery_mechanism.host_action_pending()
     if pending is None:
         if req is not None:
+            # host_action_pending() emitted host_action_request_expired as it dropped the request.
             bound = int(host_action_pending_sec())
-            health_event(
-                "host_action_request_expired", action=req[0], bound_sec=bound, held_since=device_hold_episode_since
-            )
             if logger:
                 logger.error(
                     f"HOLD-DEADLINE-ESCALATE host {req[0]} was requested over {bound}s ago and the host is "
@@ -6251,6 +6286,25 @@ def _host_action_blocks_escalation() -> bool:
                 f"host comes back"
             )
     return True
+
+
+def _host_action_reset_refusal(force: bool) -> Optional[str]:
+    """Why an operator reset is refused while a requested host reboot / power cycle is pending
+    (spec 04 I34), or None. ``force`` overrides, loudly: the operator may know the host is not
+    going down. Bounded like every other path: an expired request no longer refuses."""
+    pending = recovery_mechanism.host_action_pending() if recovery_mechanism is not None else None
+    if pending is None:
+        return None
+    action, age = pending
+    why = (
+        f"a host {action} was requested {int(age)}s ago and is pending (up to "
+        f"{int(host_action_pending_sec())}s); a device reset now only races the host going down"
+    )
+    if force:
+        if logger:
+            logger.warning(f"reset: forced while {why}")
+        return None
+    return why
 
 
 def _maybe_spawn_forced_escalation() -> bool:
@@ -6959,6 +7013,12 @@ def _escalate_held_job_past_bound(job: "Job", held_sec: float, bound: float, rea
         if _maybe_spawn_forced_escalation():
             device_hold_job_bound_escalated = True
             return "forced recovery escalation started"
+        pending = recovery_mechanism.host_action_pending() if recovery_mechanism is not None else None
+        if pending is not None:
+            return (
+                f"forced escalation deferred: a host {pending[0]} was requested {int(pending[1])}s ago "
+                f"(pending up to {int(host_action_pending_sec())}s); the device stays held"
+            )
         return "forced escalation deferred (a device op is in flight); the hold watchdog retries it"
     except Exception as e:  # escalation bookkeeping must never keep the job held
         if logger:
@@ -10063,6 +10123,12 @@ def create_mcp_server() -> MCPServer:
             yield f"hint: {LEFTOVER_REBOOT_HINT}\n"
             yield "::status::refused\n"
             return
+        host_pending = _host_action_reset_refusal(force)
+        if host_pending:
+            yield f"host action REFUSED: {host_pending}\n"
+            yield "hint: wait for the host to come back, or pass --force\n"
+            yield "::status::refused\n"
+            return
 
         # Over the socket the caller's real uid scopes the gate. Over HTTP there is no peer
         # identity: on a privsep host an anonymous caller owns no holder, so every tenant is
@@ -11564,6 +11630,16 @@ def create_mcp_server() -> MCPServer:
                 "foreign_holders": [],
                 "steps": steps,
                 "hint": LEFTOVER_REBOOT_HINT,
+            }
+        host_pending = _host_action_reset_refusal(force)
+        if host_pending:
+            step(f"host action REFUSED: {host_pending}", "warning")
+            return {
+                "status": "refused",
+                "reason": host_pending,
+                "foreign_holders": [],
+                "steps": steps,
+                "hint": "Wait for the host to come back, or pass force=true to override.",
             }
         # Over the socket the caller's real uid scopes the gate. Over HTTP there is no peer
         # identity: on a privsep host an anonymous caller owns no holder, so every tenant is
