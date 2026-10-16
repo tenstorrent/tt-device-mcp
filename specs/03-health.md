@@ -740,6 +740,28 @@ job boundary.
   instead of about 5. Every other guard stays: the arm switch, retry pacing (one grace window
   between resets), reset scope, and no tenant (I13). A positive frozen read, or no measured
   failure, keeps the grace.
+- **I64 — A reset's fabric pass also brings every built-in eth link back.** While a reset debt
+  is owed (spec 04 I32) on a multi-chip mesh, a fabric pass that passed is also held to the link
+  mark: the built-in eth read's measured link count this pass must reach the mark in force, read
+  after the pass's own eth read ratcheted it. That mark is `max(links, high_water)` from
+  `eth_link_baseline.json`, or, while a topology-mismatch lift's re-baseline for this chip-to-bus
+  map stands (I45), that re-baseline; this check never lowers a mark itself. A count at the mark
+  keeps the pass and clears any deficit record (`eth_link_deficit_cleared`). A count below it
+  fails the pass (`fabric passed on N of M baseline eth links — link-count drop after a reset`,
+  evidence `link_drop`): the device stays held and the reset debt is reopened, so nothing is
+  released. Two records soften that, both in the health dir. An accepted deficit
+  (`eth_link_deficit.json`) lets a count at or above its `links` pass, loudly: a warning and an
+  `eth_link_deficit_accepted` journal line on every such pass. A new deficit is written as pending
+  (`eth_link_deficit_pending.json`, `eth_link_deficit_held`) with the current boot id, re-stamped
+  on every write; once a power cycle the broker itself fired (the auto-recovery ledger's last
+  escalation is a `power-cycle` stamped with the pending record's boot, and this is a later boot)
+  comes back with at least that count, it becomes the accepted deficit with source `power_cycle`.
+  A warm or manual reboot is not that proof. The operator accepts or clears a deficit with
+  `tt-device-mcp eth-links` (spec 07). `/health` carries `eth_link_deficit`: the accepted record,
+  `null` when none. A torn or unreadable record reads as none, so the full mark applies (fails
+  closed). Unchanged: a pass with no reset owed (between jobs), a single chip, and a host whose
+  eth read yields no built-in link count, which stays unchecked (no count, no bar). The ladder's
+  side (one training retry, one reset, then the host rungs) is spec 04 I57.
 
 ## Interfaces
 
@@ -1335,6 +1357,8 @@ refuses.
 | I55 (the verdict names the dispatch failure, never the downgraded mismatch) | `tests/test_dispatch_failure_reset.py::test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch`, `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I55 (rung gap warned at boot and on /health; floor message honest) | `tests/test_dispatch_failure_reset.py::test_rung_gap_boot_warning_and_health_field`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
 | I56 (a measured fabric failure on a present mesh resets on the first relift; frozen read or no measured failure keeps the grace) | `tests/test_device_safety.py::test_idle_relift_resets_a_measured_fabric_failure_without_the_grace`, `tests/test_device_safety.py::test_idle_relift_keeps_the_grace_without_a_measured_fabric_failure`, `tests/test_post_reset_gate.py::test_the_measured_fabric_failure_reset_on_the_first_relift` (the real reset path: the verify after it runs the fabric pass, release only on a healthy verdict, 04 I32/I32a) |
+| I64 (a reset's passing fabric pass short of the link mark fails and stays held; full count passes and clears; no reset owed, single chip and no built-in count unchanged) | `tests/test_post_reset_eth_links.py::test_a_reset_that_came_back_short_of_links_fails_its_fabric_pass`, `::test_the_full_count_after_a_reset_passes_and_clears_any_deficit`, `::test_a_pass_with_no_reset_owed_is_unchanged`, `::test_a_single_chip_is_unaffected`, `::test_a_host_with_no_built_in_count_stays_unchecked` |
+| I64 (an accepted deficit passes loudly, a loss beyond it holds; a deficit a broker power cycle came back with is accepted, one without stays held) | `tests/test_post_reset_eth_links.py::test_a_count_at_the_accepted_deficit_passes_loudly`, `::test_a_loss_beyond_the_accepted_deficit_is_held`, `::test_a_deficit_a_broker_power_cycle_came_back_with_is_accepted`, `::test_a_deficit_with_no_broker_power_cycle_since_stays_held` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

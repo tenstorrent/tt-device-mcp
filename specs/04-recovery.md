@@ -676,6 +676,25 @@ each rung fires only when the gentler one failed or cannot apply.
   900 s, capped at 3600 s; malformed or non-positive reads as the default) is journaled as
   `host_action_request_expired` and the next tick resumes the forced ladder.
 
+- **I57 — A reset that comes back short of eth links retries training once, spends one reset,
+  then climbs.** The post-reset verify treats a spec 03 I64 link drop like a 77: it waits
+  `TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC` (default 60 s) and re-runs the check up to
+  `TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES` times (default 1), so a link that was still training
+  releases on the retry. A verify still short after its retries marks the pending deficit
+  `reset_spent`. No reset rung fires again for that deficit, so a missing link never loops resets:
+  the gate's reset rung holds instead (`eth_link_deficit_reset_skipped`, path `gate/<phase>`; a
+  gate DEFER is not affected), and the idle hold escalation skips the galaxy reset and its
+  last-chance sweep and goes straight to the host rungs (`swept=True`): the warm reboot when armed,
+  then the power cycle. A deficit a broker power cycle came back with is accepted on its own (03
+  I64) and releases; the operator can accept one earlier or clear it (`tt-device-mcp eth-links`,
+  spec 07). Every reset still owes the full health check, fabric included (I32), and a verify short
+  of links never releases. Time to recover, per fault class: a transient training drop adds at
+  most retries x sleep (60 s by default); a real missing link costs one extra ladder rung (the
+  reset whose verify comes back short) before the existing host climb; a known cable fault adds no
+  reset after the first verified power cycle; whole-tray drop, ARC not ready, dispatch failure and
+  hold-deadline expiry are unchanged (the check reads only a fabric pass that passed with a reset
+  owed); between jobs nothing changes (no reset debt, no check).
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -1117,6 +1136,8 @@ sees a silent fabric pass.
 | I33 / I32 a lifted reset releases only after a passing full health check, fabric included; a reset the gate still refuses releases nothing | `tests/test_gated_hold_handoff.py::test_the_lifted_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_a_reset_the_gate_still_refuses_releases_nothing` |
 | I34 a requested power cycle or reboot suppresses every hold-deadline tick and a forced escalation waiting on the lock; the device stays held with the check owed; one line per request | `tests/test_host_action_suppress.py::test_power_cycle_request_suppresses_every_deadline_tick`, `::test_reboot_request_suppresses_the_deadline_tick`, `::test_escalation_waiting_on_the_lock_runs_no_rung` |
 | I34 bounded: a refused or failed request never suppresses; an expired one resumes the ladder; the window is always finite | `tests/test_host_action_suppress.py::test_power_cycle_that_fails_to_launch_does_not_suppress`, `::test_power_cycle_refused_by_the_ledger_does_not_suppress`, `::test_a_request_the_host_never_acted_on_expires_and_the_ladder_resumes`, `::test_pending_window_is_always_finite` |
+| I57 a short count that trains back on the retry releases; a persistent one holds, marks the reset spent and climbs with no second reset; the gate's reset rung does not fire again on a spent deficit | `tests/test_post_reset_eth_links.py::test_a_short_count_that_trains_back_on_the_retry_releases`, `::test_a_persistent_short_count_holds_and_climbs_without_another_reset`, `::test_the_gate_reset_rung_is_not_fired_again_on_a_spent_deficit` |
+| I57 a deficit a broker power cycle came back with is accepted; the operator accepts, shows and clears one | `tests/test_post_reset_eth_links.py::test_a_deficit_a_broker_power_cycle_came_back_with_is_accepted`, `::test_the_operator_accepts_shows_and_clears_a_deficit` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |

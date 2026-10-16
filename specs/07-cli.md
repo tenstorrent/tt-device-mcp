@@ -137,6 +137,7 @@ isolation knob).
 | `watch` | `[N]` | `/api/tt_device_queue_status` + `/api/tt_device_recent_jobs` (looped) | the `status` overview, redrawn every 1 s | 0 (Ctrl-C); 1 server down at start |
 | `smi` | `[tt-smi args]` | none — local exec (I7) | tt-smi owns the terminal | tt-smi's; 2 disallowed flag; 1 launch failure / missing wrapper |
 | `timezone` | `[City \| ±N \| pacific] [--list [TEXT]]` | none — local file | current zone + source, listing, or the new label | 0; 1 unknown/ambiguous zone, bad offset |
+| `eth-links` | `show \| accept [--links N] [--ports P ...] \| clear` (the broker's user; sudo for the system broker) | none — the health dir's deficit records (spec 03 I64, spec 04 I57) | `show`: the link mark, the accepted and the pending deficit; `accept`: the count a post-reset pass releases at (default the pending count); `clear`: the full mark applies again | 0; 2 on `accept` with no count (no `--links`, nothing pending) or `--links` at or above the mark |
 | `lock` / `unlock` | — (sudo) | none — udev rule, unit edit, self-checks (mechanics: spec 05) | LOCKED/UNLOCKED or self-check verdict | 0 verified; 1 not root / no broker unit / self-check failed or inconclusive |
 | `refresh-banner` | — (sudo, hidden) | none | — | 0; 1 not root |
 | `help` / bare tty | — | none | argparse help | 1 |
@@ -309,6 +310,7 @@ non-zero keeps that bit honest; `exec` propagates the real exit code because a d
 | I9 (a deferred dispatch is diagnosable: health_event + log line, holder named in queue/status) | `tests/test_slurm_steps.py::test_a_deferred_dispatch_is_visible_in_the_health_log_and_the_queue_status` |
 | I9 (a non-finite deadline env var falls back to the default, in both the deadline and the derived client timeout) | `tests/test_cli.py::test_a_non_finite_step_deadline_falls_back_to_the_default`, `tests/test_cli.py::test_a_non_finite_step_deadline_env_var_does_not_disable_the_cli_socket_timeout` |
 | `post-step` carries the step's exit code and the reclaim switch | `tests/test_cli.py::test_post_step_sends_the_exit_code_and_reclaim_flag` |
+| `eth-links` accepts, shows and clears; refuses the full mark or no count (rc 2) | `tests/test_post_reset_eth_links.py::test_the_operator_accepts_shows_and_clears_a_deficit`, `::test_the_operator_cannot_accept_the_full_mark_or_nothing` |
 | `reset` asks for keepalives | `tests/test_cli.py::test_cmd_reset_opens_the_stream_with_the_arguments_it_was_given` |
 | `reset` hides keepalives and still reads the status | `tests/test_cli.py::test_reset_stream_hides_keepalives_and_still_reads_the_status` |
 | `watch` redraws every 1 s; `status` shows DEVICE IDLE (03 I54) | `tests/test_device_activity.py::test_watch_redraws_every_second`, `tests/test_device_activity.py::test_the_cli_overview_marks_only_an_idle_job`, `tests/test_device_activity.py::test_cli_status_of_one_job_prints_its_device_line` |

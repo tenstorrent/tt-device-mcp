@@ -117,6 +117,8 @@ and job exit statuses never hit disk.
 | Remembered Tenstorrent root ports and chip archs (`tt_pci_topology.json`, spec 04 I23) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Chip-to-PCI-bus map at the last clean fabric pass (`fabric_ok_asic_bus.json`, spec 03 I42) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Topology mismatch cached per chip-to-bus map and descriptor (`fabric_topology_mismatch.json`, spec 03 I45) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
+| Accepted eth link deficit a post-reset pass releases at (`eth_link_deficit.json`, spec 03 I64) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
+| Pending eth link deficit, with its boot id and whether its reset is spent (`eth_link_deficit_pending.json`, spec 03 I64, spec 04 I57) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Server log + job logs | `/var/log/tt-device-broker/` (the unit passes `--log-dir`; the bare server defaults to CWD) | `<state>/` | `--log-dir` |
 | Stats | `<log-dir>/stats/` → `/var/log/tt-device-broker/stats/` | `<state>/stats/` | follows `--log-dir` |
 | Metrics textfile | `/var/lib/prometheus/node-exporter/tt_device_mcp.prom` | `<state>/metrics/tt_device_mcp.prom` | `TT_DEVICE_MCP_TEXTFILE_DIR` |
