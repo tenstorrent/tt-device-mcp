@@ -741,9 +741,9 @@ each rung fires only when the gentler one failed or cannot apply.
   when `TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE` names a readable one (JSON lines with `at_epoch` and
   an optional `cause`; unreadable or malformed lines are ignored). A stamp later than now anchors
   nothing. The cooldown is the power cycle's own interval (`POWER_CYCLE_MIN_INTERVAL_SEC`, 1800 s),
-  the governor's one check for this rung, not a second gate. After two consecutive broker power
-  cycles with no verified release between them it doubles for each further one, capped at 4 h:
-  30 min, 30 min, 1 h, 2 h, then 4 h. A verified release (the full health check, fabric included,
+  the governor's one check for this rung, not a second gate. Each broker power cycle that took the
+  host down and left the same fault doubles it, capped at 4 h: 30 min, 1 h, 2 h, then 4 h (spec 03
+  I67 owns the count, the clamp and the per-class time to recover). A verified release (the full health check, fabric included,
   with no I32 debt) ends the streak (`power_cycle_healed.json` in the health dir). While the cooldown
   runs the device stays held, the journal says `power cycle in cooldown until <time> (last
   cycle/boot <time>, <cause>; <n>s cooldown)`, and `/health` carries `power_cycle_cooldown` with
@@ -760,7 +760,7 @@ each rung fires only when the gentler one failed or cannot apply.
   the first gate or idle pass (0 s on the tests' fake clock); class A within the cooldown, at its end
   (at most 30 min after the anchor; a boot 3 min before startup gives 27 min); class C, after its one
   mesh reset (262 s) or with none after the broker's own cycle, then as class A. A fault no cycle
-  heals is cycled 30 min, 30 min, 1 h, 2 h, then every 4 h after each boot: at most 6 cycles a day,
+  heals is cycled 30 min, 1 h, 2 h, then every 4 h after each boot (spec 03 I67): at most 6 cycles a day,
   never a boot loop, never an open-ended hold.
 
 ## Interfaces
@@ -1221,7 +1221,7 @@ sees a silent fabric pass.
 | I58 the failed-reset record survives a broker restart but not a new boot; a new episode on the same set does not reset again; only a launched reset is recorded | `tests/test_no_repeat_failed_rung.py::test_the_failed_reset_survives_a_broker_restart_but_not_a_new_boot`, `::test_a_new_hold_episode_on_the_same_set_does_not_reset_again`, `::test_a_reset_that_never_launched_is_not_recorded` |
 | I65 a boot 3 min before startup with a whole tray off: held with the deadline on /health and no rung, then one cycle at the deadline | `tests/test_power_cycle_cooldown.py::test_a_boot_3_min_before_startup_holds_to_a_deadline_then_cycles_once`, `::test_health_carries_the_cooldown_deadline_while_held` |
 | I65 the broker's cycle then a boot with the tray still off: no second cycle before the cooldown ends, one at its end; an external cycler's history is an anchor; a future stamp is not | `tests/test_power_cycle_cooldown.py::test_after_the_broker_cycle_and_boot_no_second_cycle_before_the_cooldown_ends`, `::test_an_external_cycler_history_is_an_anchor`, `::test_a_boot_stamp_in_the_future_anchors_nothing` |
-| I65 backoff 30 min, 30 min, 1 h, 2 h, 4 h cap; a verified release resets it | `tests/test_power_cycle_cooldown.py::test_the_backoff_doubles_after_two_failed_cycles_and_caps_at_4h`, `::test_cycles_that_heal_nothing_back_off_and_a_verified_release_resets_it` |
+| I65 backoff 30 min, 1 h, 2 h, 4 h cap (03 I67); a verified release resets it | `tests/test_power_cycle_cooldown.py::test_the_backoff_doubles_after_each_failed_cycle_and_caps_at_4h`, `::test_cycles_that_heal_nothing_back_off_and_a_verified_release_resets_it` |
 | I65 every denial ends at a stated time and is asked again then, in its own hold episode; the per-boot cap is bounded | `tests/test_power_cycle_cooldown.py::test_a_cycle_requested_this_boot_that_never_went_down_is_asked_again`, `::test_the_watchdog_retry_is_kept_to_its_own_hold_episode`, `tests/test_device_safety.py::test_governor_per_boot_cap_ends_with_the_interval`, `::test_power_cycle_after_a_recent_reboot_waits_out_the_cooldown` |
 | I65 no recent cycle or boot: the cycle fires at once | `tests/test_power_cycle_cooldown.py::test_with_no_recent_cycle_or_boot_the_cycle_fires_at_once` |
 | I65 only a verified release with no fabric debt ends the streak; a refused one keeps the hold | `tests/test_power_cycle_cooldown.py::test_only_a_verified_release_with_no_fabric_debt_ends_the_streak` |

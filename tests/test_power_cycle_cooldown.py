@@ -6,8 +6,8 @@
 A power cycle is spaced from the latest power cycle or boot of any cause: the broker's own (its
 ledger), the host's current boot (a manual, datacenter or external cycle included) and an external
 cycler's history file. While the cooldown runs the hold stays and says until when; at its end the
-cycle fires at once if the fault persists. Repeated cycles that heal nothing back off (30 min,
-30 min, 1 h, 2 h, then 4 h at most); a verified release ends the streak. No test reaches a real
+cycle fires at once if the fault persists. Repeated cycles that leave the same fault back off
+(spec 03 I67: 30 min, 1 h, 2 h, then 4 h at most); a verified release ends the streak. No test reaches a real
 reset or power cycle: the ``rig`` records them."""
 
 import json
@@ -144,7 +144,9 @@ async def test_after_the_broker_cycle_and_boot_no_second_cycle_before_the_cooldo
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
     state = cool["g"].mechanism.power_cycle_cooldown_state
     assert state["cause"] == "host boot after the broker power-cycle"
-    until = T0 + 120 + POWER_CYCLE_MIN_INTERVAL_SEC  # the boot is the latest anchor
+    # The boot is the latest anchor; the broker's cycle took the host down and left the tray off,
+    # so the next one waits the doubled interval (spec 03 I67).
+    until = T0 + 120 + 2 * POWER_CYCLE_MIN_INTERVAL_SEC
     assert state["until"] == until and _cycles(cool) == 0
     cool["clk"][0] = until - 1
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
@@ -174,15 +176,15 @@ def test_a_boot_stamp_in_the_future_anchors_nothing(cool):
 # ---- (c) backoff ---------------------------------------------------------------------------------
 
 
-def test_the_backoff_doubles_after_two_failed_cycles_and_caps_at_4h():
+def test_the_backoff_doubles_after_each_failed_cycle_and_caps_at_4h():
     seq = [recovery_base.power_cycle_interval_sec(n) for n in range(8)]
-    assert seq == [1800, 1800, 3600, 7200, 14400, 14400, 14400, 14400]
+    assert seq == [1800, 3600, 7200, 14400, 14400, 14400, 14400, 14400]
     assert recovery_base.power_cycle_interval_sec(60) == recovery_base.POWER_CYCLE_BACKOFF_CAP_SEC == 4 * 3600
 
 
 def test_cycles_that_heal_nothing_back_off_and_a_verified_release_resets_it(cool):
     """A fault no cycle heals (a tray with a dead power feed): each cycle fires at its cooldown's
-    end, each boot 2 min after it. The gaps grow 30 min, 1 h, 2 h, then stay at 4 h: about six
+    end, each boot 2 min after it. The gaps grow 1 h, 2 h, then stay at 4 h: about six
     cycles a day at most, never a 30-min boot loop. A verified release ends the streak."""
     m = cool["g"].mechanism
     at, fired = T0, []
@@ -198,7 +200,7 @@ def test_cycles_that_heal_nothing_back_off_and_a_verified_release_resets_it(cool
         assert not allowed
         at = cd["until"]
     gaps = [b - a - 120 for a, b in zip(fired, fired[1:])]
-    assert gaps == [1800, 3600, 7200, 14400, 14400]
+    assert gaps == [3600, 7200, 14400, 14400, 14400]
     m.note_mesh_verified(now_epoch=at)
     assert m.power_cycle_interval() == POWER_CYCLE_MIN_INTERVAL_SEC
     assert m.power_cycle_retry is None
@@ -247,15 +249,15 @@ def test_only_a_verified_release_with_no_fabric_debt_ends_the_streak(monkeypatch
     monkeypatch.setattr(srv, "health_dir", lambda: tmp_path)
     monkeypatch.setattr(recovery_base, "health_dir", lambda: tmp_path)
     m = srv.recovery_mechanism
-    for i in range(3):
-        m.record_auto_recovery("power-cycle", "tray off", now_epoch=time.time() - 3000 + i)
-    assert m.power_cycle_interval() == 7200
+    # Three cycles that each took the host down (an earlier boot) and left the fault.
+    _ledger(*({"action": "power-cycle", "boot_id": f"old-{i}", "at_epoch": time.time() - 3000 + i} for i in range(3)))
+    assert m.power_cycle_interval() == 14400
     held = []
     monkeypatch.setattr(srv, "_hold_device_fabric_unverified", lambda why: held.append(why))
     monkeypatch.setattr(srv, "_post_reset_debt", lambda: FABRIC_DEBT.owed)  # a multi-chip mesh with a fabric check
     FABRIC_DEBT.owed = "power-cycle"
     assert srv._clear_device_dirty(verified=True, why="post-cycle check") is False
-    assert held and m.power_cycle_interval() == 7200, "no release, the streak stands"
+    assert held and m.power_cycle_interval() == 14400, "no release, the streak stands"
     FABRIC_DEBT.owed = ""
     assert srv._clear_device_dirty(verified=True, why="post-cycle check") is True
     assert m.power_cycle_interval() == POWER_CYCLE_MIN_INTERVAL_SEC
@@ -281,7 +283,7 @@ async def test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_res
     cool["clk"][0] = T0 + 300
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
     assert cool["order"] == ["denied"], "class C, held by the cooldown, no reset"
-    cool["clk"][0] = T0 + 60 + POWER_CYCLE_MIN_INTERVAL_SEC
+    cool["clk"][0] = T0 + 60 + 2 * POWER_CYCLE_MIN_INTERVAL_SEC  # one cycle left it: doubled (I67)
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
     assert cool["order"] == ["denied", "power_cycle"]
 

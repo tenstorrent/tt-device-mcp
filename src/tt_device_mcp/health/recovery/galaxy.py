@@ -1248,6 +1248,17 @@ class GalaxyRecovery(Recovery):
         if standback:
             log(f"{what}: standing back from the power cycle — {standback}")
             return False
+        # Spec 03 I67: the backoff counts the cycles that left THIS fault; the ask and its ledger
+        # record carry it, and it is kept on disk for a broker restart.
+        self.mechanism.note_power_cycle_fault({"class": fault_class, "off_bus": sorted(str(c) for c in offbus_chips)})
+        try:
+            return await self._power_cycle_direct_ask(fault_class, offbus_chips, expected, what, log, context=context)
+        finally:
+            self.mechanism.power_cycle_fault = None
+
+    async def _power_cycle_direct_ask(
+        self, fault_class: str, offbus_chips: set, expected: int, what: str, log, *, context: str
+    ) -> bool:
         allowed, why = self.mechanism.auto_recovery_allowed("power-cycle", tenant_active=False)
         if not allowed:
             log(f"{what}: power cycle held off: {why}")

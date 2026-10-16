@@ -113,6 +113,7 @@ and job exit statuses never hit disk.
 | Health journal (events, telemetry trace, buslock, chip and eth-link baselines, incidents/, the idle-time probe's `health_probe_state.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
 | Off-bus reset intent and host-hang latch (`offbus_reset_intent.json`, `offbus_reset_hold.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Gated off-bus power-cycle attempts (`offbus_power_cycle.json`, spec 04 I27) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
+| Failed mesh resets this boot (`reset_record.json`, spec 04 I58); the power cycle's heal marker (`power_cycle_healed.json`, spec 04 I65) and backoff fault and not-performed request (`power_cycle_backoff.json`, spec 03 I67) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Per-tray rung declined for this boot (`ubb_tray_rung_disabled.json`, with the boot id, spec 04 I25) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Remembered Tenstorrent root ports and chip archs (`tt_pci_topology.json`, spec 04 I23) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Chip-to-PCI-bus map at the last clean fabric pass (`fabric_ok_asic_bus.json`, spec 03 I42) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
@@ -266,6 +267,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_REBOOT_MIN_DEAD_FRAC` | 0.5 | Dead fraction gating the host-reboot rung | 04 |
 | `TT_DEVICE_MCP_AUTO_REBOOT` | 1 | Arm the warm host-reboot rung | 04 |
 | `TT_DEVICE_MCP_AUTO_POWER_CYCLE` | 1 | Arm the BMC power-cycle rung | 04 |
+| `TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC` | 1800 (clamped 600..3600) | Base of the power cycle's cooldown; each cycle that left the same fault doubles it, up to a fixed 4 h cap (04 I65, 03 I67) | 03, 04 |
 | `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` | unset (off) | Opt-in command the broker runs and waits for before an auto power cycle (drain other workloads) | 04 |
 | `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC` | 300 (max 3600) | Pre-power-cycle hook timeout; its process group is killed past it and the cycle goes ahead | 04 |
 | `TT_DEVICE_MCP_AUTO_UBB_RESET` | 1 | Arm the per-tray UBB reset rung | 04 |

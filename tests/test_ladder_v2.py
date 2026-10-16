@@ -566,13 +566,22 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
 def test_power_cycle_cooldown_is_thirty_minutes(monkeypatch):
     """A power cycle is denied less than 1800s (30 min) after the previous one, and allowed past it —
     the only per-box spacing guard. The old 3600s per-severity interval no longer gates a power
-    cycle (a power cycle 1900s ago used to be denied)."""
+    cycle (a power cycle 1900s ago used to be denied). The prior cycle was for another fault, so this
+    is the first cycle for the current one and waits the base, not the spec 03 I67 backoff."""
     rm = srv.recovery_mechanism
     now = 1_000_000.0
     monkeypatch.setattr(rm, "_current_boot_id", lambda: "this-boot")  # prior cycle took the box down -> different boot
+    monkeypatch.setattr(rm, "power_cycle_fault", {"class": "all_chips_off_bus", "off_bus": ["0", "1"]})
 
     def ledger_at(age):
-        return lambda: [{"action": "power-cycle", "boot_id": "prior-boot", "at_epoch": now - age}]
+        return lambda: [
+            {
+                "action": "power-cycle",
+                "boot_id": "prior-boot",
+                "at_epoch": now - age,
+                "fault": {"class": "reset_unrecoverable", "off_bus": []},
+            }
+        ]
 
     monkeypatch.setattr(rm, "read_auto_recovery_ledger", ledger_at(1700))
     allowed, why = rm.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=now)

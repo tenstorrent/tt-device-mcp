@@ -722,6 +722,36 @@ job boundary.
   (`TT_DEVICE_MCP_SELFHEAL_RELIFT=0`, `TT_DEVICE_MCP_FORCE_ESCALATE=0`), or I28 holds the mesh
   reset, the RUNG INVENTORY logs a `RUNG GAP` warning at boot and `/health` carries `hold_exit_gap`
   naming why a held present mesh has no automatic exit (`null` otherwise).
+- **I67 — A power cycle that leaves the same fault backs off, bounded, and always fires at its
+  deadline.** The power-cycle cooldown (spec 04 I65) has a base of `POWER_CYCLE_MIN_INTERVAL_SEC`,
+  1800 s, which `TT_DEVICE_MCP_POWER_CYCLE_MIN_INTERVAL_SEC` may set only within 600..3600 s (an
+  unreadable value reads as 1800): below 10 min a cycle could fire before the boot it caused has run
+  its startup check, above 1 h the first cycle of a whole-tray drop would wait past its budget. The
+  cooldown is the base times 2 for each counted cycle, capped at a fixed 4 h
+  (`POWER_CYCLE_BACKOFF_CAP_SEC`, not a setting): 30 min, 1 h, 2 h, then 4 h. A counted cycle is a
+  broker power cycle in the I9 ledger recorded in an earlier boot than the current one (it took the
+  host down), after the last verified release, whose fault (the spec 04 I37 class and the sorted
+  off-bus chips, stored with the ledger record) is the fault being decided now; counting stops at
+  the first record for a different fault. A verified release (the full check, fabric included, with
+  no I32 debt) or a different fault therefore starts again at the base. A cycle recorded this boot
+  never took the box down and waits the base only. A request the power-cycle command did not carry
+  out (it exited non-zero) is no cycle: its ledger entry is retracted, it is not counted, and it is
+  asked again after the base interval. The fault of the decision in progress and any not-performed
+  request (its rc and time) are kept in `power_cycle_backoff.json` in the health dir, and every hold
+  start (a broker restart included) rebuilds the deadline and the watchdog's ask from disk: the
+  ledger, the boot, the heal marker and that file. `/health`'s `power_cycle_cooldown` adds
+  `fault_class`, `off_bus`, `attempts` (the counted cycles) and `not_performed` (`null`, or the
+  status `power cycle not performed` with the command's rc). At the deadline the hold-deadline
+  watchdog asks once and exactly one cycle fires if the fault persists; no knob delays it past the
+  cap or switches it off. Goal 8 holds after every cycle: the startup gate waits for the hugepage
+  pool and only a passing full check, fabric included, releases the device and resets the count; a
+  failed check keeps the hold and the count. Time to recover per fault class:
+
+  | Fault class | Effect on time to recover |
+  |---|---|
+  | Whole tray or all off (I37 A/C), healed by the first cycle | unchanged: the first cycle fires as before (at once, or at the end of a 30 min cooldown from a recent cycle or boot) |
+  | Whole tray lost until hardware repair | cycles at boot + 1 h, then boot + 2 h, then every 4 h after each boot (at most about 6 a day, not 48); after the repair, recovery is delayed by at most 4 h plus a boot plus the startup check |
+  | Partial off-bus, ARC not ready, fabric or health-check failure, dispatch failure, hold-deadline expiry, dirty boot, and any fault whose cycle heals it | unchanged: the backoff counts only cycles in a row that left the same class and off-bus set |
 
 ## Interfaces
 
@@ -1316,6 +1346,13 @@ refuses.
 | I55 (under the outage hold: no reset, held, paged, honest message) | `tests/test_dispatch_failure_reset.py::test_outage_hold_holds_and_pages_without_a_reset` |
 | I55 (the verdict names the dispatch failure, never the downgraded mismatch) | `tests/test_dispatch_failure_reset.py::test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch`, `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I55 (rung gap warned at boot and on /health; floor message honest) | `tests/test_dispatch_failure_reset.py::test_rung_gap_boot_warning_and_health_field`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
+| I67 a tray that stays off: the first cycle at once, then 1 h, 2 h, 4 h, 4 h after each boot; on /health; one cycle at each deadline, no ladder rung | `tests/test_power_cycle_backoff.py::test_a_tray_that_stays_off_backs_off_30_60_120_240_and_caps`, `::test_the_field_sequence_cycle_then_boot_with_the_tray_still_off` |
+| I67 the base is clamped to 600..3600 s; the 4 h cap is not a setting | `tests/test_power_cycle_backoff.py::test_the_interval_knob_is_clamped` |
+| I67 the count and the deadline survive a broker restart; every hold start restores them from disk | `tests/test_power_cycle_backoff.py::test_the_count_and_deadline_survive_a_broker_restart`, `::test_a_new_hold_restores_the_saved_deadline`, `::test_a_new_hold_with_no_saved_streak_sets_no_ask` |
+| I67 a verified release or a different fault starts again at the base | `tests/test_power_cycle_backoff.py::test_a_verified_release_resets_the_count`, `::test_a_different_fault_starts_at_the_base` |
+| I67 a refused power cycle is not counted, shows on /health with its rc, and is asked again at the base | `tests/test_power_cycle_backoff.py::test_a_power_cycle_the_command_refused_is_not_counted_and_is_retried_at_the_base` |
+| I67 a cycle recorded this boot that never went down waits the base only | `tests/test_power_cycle_backoff.py::test_a_cycle_recorded_this_boot_that_never_went_down_waits_the_base_only` |
+| I67 after a cycle only a passing full check releases and resets the count (goal 8) | `tests/test_power_cycle_backoff.py::test_after_a_cycle_only_a_passing_full_check_releases_and_resets_the_count` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
