@@ -565,7 +565,7 @@ async def test_forced_escalation_fires_on_a_hold_held_only_by_a_reported_fault(m
 
     climbed = []
 
-    async def _fake_present(indices, expected, log, *, force=False):
+    async def _fake_present(indices, expected, log, *, force=False, **_):
         climbed.append(("present", force))
 
     async def _fake_offbus(indices, expected, log, *, force=False):
@@ -9077,6 +9077,58 @@ async def test_idle_relift_escalates_an_eth_hold_with_a_failed_fabric_to_the_pre
     await srv._attempt_idle_relift()
 
     assert counters["resets"] == 1, "past the grace, the fabric-failed present mesh must escalate to the galaxy reset"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eth", [None, True])
+async def test_idle_relift_resets_a_measured_fabric_failure_without_the_grace(
+    monkeypatch, tmp_path, clear_job_state, eth
+):
+    """Class J (job failed, post-job gate measured fabric rc 1 on a present mesh): the fault is
+    proven, so the first idle relift resets — seconds into the hold, not after the 120 s grace
+    (spec 03 I56). Replays g15blx02 10-14 (first relift 3 s in, eth read None) and blx01 10-12
+    (eth advancing). Fails on base, where the hold sits out the grace first."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=0.05)
+    srv.health_monitor.last_fabric_ok = False
+
+    async def healthy(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}}
+
+    async def eth_read(timeout_sec=60.0):
+        return eth, "eth read"
+
+    patch_recovery(monkeypatch, "_verify_device", healthy)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_read)
+
+    await srv._attempt_idle_relift()
+
+    assert counters["resets"] == 1, "a measured fabric failure must reset on the first relift, not after the grace"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eth,fabric", [(False, False), (None, None), (None, True)])
+async def test_idle_relift_keeps_the_grace_without_a_measured_fabric_failure(
+    monkeypatch, tmp_path, clear_job_state, eth, fabric
+):
+    """I56 is narrow: a positive frozen eth read, or no measured fabric failure (77 / healthy),
+    keeps the grace before the present-mesh reset."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=0.05)
+    srv.health_monitor.last_fabric_ok = fabric
+
+    async def healthy(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}}
+
+    async def eth_read(timeout_sec=60.0):
+        return eth, "eth read"
+
+    patch_recovery(monkeypatch, "_verify_device", healthy)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_read)
+
+    await srv._attempt_idle_relift()
+
+    assert counters["resets"] == 0, "inside the grace, a hold with no measured fabric failure must not reset"
 
 
 @pytest.mark.asyncio

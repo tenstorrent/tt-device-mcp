@@ -730,6 +730,16 @@ job boundary.
   (`TT_DEVICE_MCP_SELFHEAL_RELIFT=0`, `TT_DEVICE_MCP_FORCE_ESCALATE=0`), or I28 holds the mesh
   reset, the RUNG INVENTORY logs a `RUNG GAP` warning at boot and `/health` carries `hold_exit_gap`
   naming why a held present mesh has no automatic exit (`null` otherwise).
+- **I56 A measured fabric failure on a present mesh resets on the first idle relift, no grace.**
+  When a hold stands for a frozen/unverified eth (`eth_frozen`) on a fully present mesh, the last
+  fabric pass measured a failure (`last_fabric_ok is False`, not a 77 skip) and the relift's eth
+  read is not a positive frozen reading (`None` or advancing), the fault is already proven: the
+  present-mesh galaxy reset runs on that relift instead of after the present-mesh grace. This is
+  the job-failed class (a job dies, the post-job gate measures fabric rc 1 with every chip present),
+  budget 5 min: hold → first relift → glx_reset → full check, fabric included (04 I32), about 3 min
+  instead of about 5. Every other guard stays: the arm switch, retry pacing (one grace window
+  between resets), reset scope, and no tenant (I13). A positive frozen read, or no measured
+  failure, keeps the grace.
 
 ## Interfaces
 
@@ -1324,6 +1334,7 @@ refuses.
 | I55 (under the outage hold: no reset, held, paged, honest message) | `tests/test_dispatch_failure_reset.py::test_outage_hold_holds_and_pages_without_a_reset` |
 | I55 (the verdict names the dispatch failure, never the downgraded mismatch) | `tests/test_dispatch_failure_reset.py::test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch`, `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I55 (rung gap warned at boot and on /health; floor message honest) | `tests/test_dispatch_failure_reset.py::test_rung_gap_boot_warning_and_health_field`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
+| I56 (a measured fabric failure on a present mesh resets on the first relift; frozen read or no measured failure keeps the grace) | `tests/test_device_safety.py::test_idle_relift_resets_a_measured_fabric_failure_without_the_grace`, `tests/test_device_safety.py::test_idle_relift_keeps_the_grace_without_a_measured_fabric_failure`, `tests/test_post_reset_gate.py::test_the_measured_fabric_failure_reset_on_the_first_relift` (the real reset path: the verify after it runs the fabric pass, release only on a healthy verdict, 04 I32/I32a) |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
