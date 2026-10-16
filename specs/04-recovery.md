@@ -678,6 +678,22 @@ each rung fires only when the gentler one failed or cannot apply.
   never marks; one the host has not acted on within `TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC` (default
   900 s, capped at 3600 s; malformed or non-positive reads as the default) is journaled as
   `host_action_request_expired` and the next tick resumes the forced ladder.
+- **I36 — A mesh reset that failed with the off-bus set unchanged is not repeated in that hold
+  episode; the next window takes the next stronger rung.** The broker records, per hold episode, each
+  mesh reset that RAN and failed, with the off-bus chip set before and after it; a reset the host gate
+  or an outage hold refused did not run and is not recorded. Only a failure that left the set exactly
+  as it found it counts: a set that grew is I31, and one that shrank is progress another try may finish.
+  While the set off the bus is still that recorded set, the idle off-bus ladder (forced or not) fires
+  none of its reset rungs again, and a forced present-mesh window does not repeat the reset (the
+  grace-cadence retries before the ceiling stay). It journals `reset_rung_skipped_failed_unchanged` and
+  climbs: the host rung behind the last-chance sweep (I22), within one hold-deadline window of the
+  failure, rate limits kept (a denied cycle holds and fires no reset). When no host rung is available
+  (power cycle and reboot both off or unfireable) the hold goes to an operator once per episode through
+  the I33 hand-off, latched (no deadline, `act_by` null), and no further reset fires on that set. Any
+  later reset still owes the I32 fabric pass, so nothing releases the device before the full health
+  check, fabric included, passes. The record is keyed by the episode, so a new episode resets again.
+  Bounds the loop one Galaxy host ran: six identical mesh resets in one hold, each exiting 1 after a
+  263 s overrun, one per forced window.
 
 ## Interfaces
 
@@ -1121,6 +1137,12 @@ sees a silent fabric pass.
 | I33 / I32 a lifted reset releases only after a passing full health check, fabric included; a reset the gate still refuses releases nothing | `tests/test_gated_hold_handoff.py::test_the_lifted_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_a_reset_the_gate_still_refuses_releases_nothing` |
 | I34 a requested power cycle or reboot suppresses every hold-deadline tick and a forced escalation waiting on the lock; the device stays held with the check owed; one line per request | `tests/test_host_action_suppress.py::test_power_cycle_request_suppresses_every_deadline_tick`, `::test_reboot_request_suppresses_the_deadline_tick`, `::test_escalation_waiting_on_the_lock_runs_no_rung` |
 | I34 bounded: a refused or failed request never suppresses; an expired one resumes the ladder; the window is always finite | `tests/test_host_action_suppress.py::test_power_cycle_that_fails_to_launch_does_not_suppress`, `::test_power_cycle_refused_by_the_ledger_does_not_suppress`, `::test_a_request_the_host_never_acted_on_expires_and_the_ladder_resumes`, `::test_pending_window_is_always_finite` |
+| I36 a mesh reset that failed on an unchanged off-bus set is not repeated in its hold; with no host rung the hold is handed to an operator once, latched | `tests/test_no_repeat_failed_rung.py::test_a_failed_unchanged_reset_is_not_repeated_and_with_no_host_rung_is_handed_off_once` |
+| I36 the next window climbs: the last-chance sweep, then the power cycle; a rate-limited cycle holds and fires no reset | `tests/test_no_repeat_failed_rung.py::test_with_a_power_cycle_the_next_window_sweeps_then_power_cycles`, `::test_a_rate_limited_power_cycle_fires_no_reset` |
+| I36 a changed off-bus set, a new episode or a refused (never run) reset leaves the reset open | `tests/test_no_repeat_failed_rung.py::test_a_changed_off_bus_set_lets_the_reset_run_again`, `::test_a_new_hold_episode_resets_again`, `::test_a_refused_reset_is_not_recorded` |
+| I36 present mesh: a forced window skips the failed reset; the grace-cadence retry still resets | `tests/test_no_repeat_failed_rung.py::test_a_forced_present_mesh_window_skips_the_failed_reset`, `::test_a_non_forced_grace_retry_still_resets_a_present_mesh` |
+| I36 / I32 every reset on this path is followed by the full verify, fabric included; a failed verify keeps the hold and climbs | `tests/test_no_repeat_failed_rung.py::test_every_reset_is_verified_with_the_fabric_and_a_failed_verify_keeps_the_hold_and_climbs` |
+| I36 time to recover (fake-clock replay): power cycle at 923 s vs 1186 s, one reset vs one per window | `tests/test_no_repeat_failed_rung.py::test_replay_the_power_cycle_fires_one_reset_sooner`, `::test_replay_with_no_host_rung_the_reset_loop_ends_in_one_hand_off` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
 | Bridge reset: recovers, retries, inapplicable falls through, stale bus refused | `tests/test_device_safety.py::test_recovery_resets_through_the_bridge_and_clears_the_chip`, `tests/test_device_safety.py::test_bridge_reset_retries_before_escalating`, `tests/test_device_safety.py::test_an_inapplicable_bridge_reset_is_not_retried`, `tests/test_device_safety.py::test_an_all_inapplicable_bridge_reset_never_reads_as_recovered`, `tests/test_device_safety.py::test_a_reused_bus_refuses_the_bridge_so_a_stale_address_never_sbrs_live_silicon`, `tests/test_device_safety.py::test_bridge_reset_does_not_reach_a_gone_endpoint_by_default`, `tests/test_device_safety.py::test_a_bridge_less_chip_is_rescanned_before_anything_destructive` |
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_each_blackhole_bus_range_maps_to_its_tray_and_bmc_bit`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |
