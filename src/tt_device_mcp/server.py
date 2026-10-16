@@ -3038,6 +3038,13 @@ def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> b
     return True
 
 
+def _stamp_verified_release(evidence: dict, via: str) -> None:
+    """A hold lifted on a pass whose fabric check ran and passed is proof the box heals: stamp it, so
+    a power cycle before it no longer reads as a boot loop (spec 04 I9). Any other lift stamps nothing."""
+    if (evidence.get("fabric") or {}).get("ok") is True:
+        recovery_mechanism.record_verified_release(via)
+
+
 def _clear_device_dirty_unverified(why: str, *, holds: bool = True, fault: str = "gate_error") -> None:
     """Drop the dirty flag on a path that did NOT verify the silicon — a foreign tenant
     holds the device, no device nodes are present, health checks are off, or the gate
@@ -4137,7 +4144,8 @@ async def _attempt_idle_relift() -> None:
                 return
             _log("mesh verified healthy — hold lifted")
             health_event("device_relift", evidence=evidence)
-            _clear_device_dirty(verified=True, why="idle relift: verified healthy")
+            if _clear_device_dirty(verified=True, why="idle relift: verified healthy"):
+                _stamp_verified_release(evidence, "idle relift")
     except Exception:  # noqa: BLE001 - a detached relift task must never raise unretrieved
         _log("pass aborted on an unexpected error — holding; the sampler retries next window")
 
@@ -4242,7 +4250,8 @@ async def _attempt_down_offbus_recheck() -> None:
                 return
             _log("mesh verified healthy, fabric included — DOWN off-bus hold lifted")
             health_event("device_relift", evidence=evidence, from_state="down")
-            _clear_device_dirty(verified=True, why="idle relift: every chip back on the bus, full gate passed")
+            if _clear_device_dirty(verified=True, why="idle relift: every chip back on the bus, full gate passed"):
+                _stamp_verified_release(evidence, "idle relift: off-bus return")
     except Exception:  # noqa: BLE001 - a detached task must never raise unretrieved
         _log("DOWN off-bus re-check aborted on an unexpected error — holding; the next idle tick retries")
 
@@ -5489,7 +5498,11 @@ async def device_health_gate(
                 _log(f"device verified healthy (incl. fabric) despite: {dirty_reason}" f" — no reset needed")
             else:
                 _log("device healthy; no reset needed")
-            if _clear_device_dirty(verified=True, why=f"gate/{phase}: verified healthy") and device_hold_logged:
+            released = _clear_device_dirty(verified=True, why=f"gate/{phase}: verified healthy")
+            if released and state.fabric_ran and fabric_ok is True:
+                # Proof this boot heals: a power cycle before it no longer reads as a boot loop (04 I9).
+                recovery_mechanism.record_verified_release(f"gate/{phase}")
+            if released and device_hold_logged:
                 _note_tenant_gate_verdict("")
             return
 
@@ -5569,6 +5582,19 @@ async def device_health_gate(
                 health_event("reset_suppressed_cooldown", phase=phase, seconds_left=int(left))
                 metrics.stage_fired("smi_reset", "blocked")
                 _note_tenant_gate_verdict(f"device unverified: gate/{phase}: reset cooldown active ({int(left)}s left)")
+            return
+
+        # spec 04 I34: a host reboot / power cycle still pending — no rung of this ladder (bridge,
+        # gone-chip bridge, tray re-power, galaxy/SMI reset, a second host rung) starts under it, and
+        # nothing read off a mesh going down is taken as a verdict. The device stays held; the full
+        # check runs once the host is back. Bounded by the request's pending window.
+        if recovery_mechanism.host_action_blocks_reset(_log, context=f"gate/{phase}"):
+            if fsm.state is ServerState.HEALTHY:
+                _mark_device_dirty(f"gate/{phase}: unhealthy while a host action is pending", why="probe_unhealthy")
+            metrics.stage_fired("smi_reset", "blocked")
+            _note_tenant_gate_verdict(
+                f"device unverified: gate/{phase}: a requested host reboot/power cycle is pending"
+            )
             return
 
         reasons = ["failed health check"] if not healthy and not eth_timeout_due else []
@@ -6423,10 +6449,8 @@ def _host_action_blocks_escalation() -> bool:
     pending = recovery_mechanism.host_action_pending()
     if pending is None:
         if req is not None:
+            # host_action_pending() emitted host_action_request_expired as it dropped the request.
             bound = int(host_action_pending_sec())
-            health_event(
-                "host_action_request_expired", action=req[0], bound_sec=bound, held_since=device_hold_episode_since
-            )
             if logger:
                 logger.error(
                     f"HOLD-DEADLINE-ESCALATE host {req[0]} was requested over {bound}s ago and the host is "
@@ -6452,6 +6476,25 @@ def _host_action_blocks_escalation() -> bool:
                 f"host comes back"
             )
     return True
+
+
+def _host_action_reset_refusal(force: bool) -> Optional[str]:
+    """Why an operator reset is refused while a requested host reboot / power cycle is pending
+    (spec 04 I34), or None. ``force`` overrides, loudly: the operator may know the host is not
+    going down. Bounded like every other path: an expired request no longer refuses."""
+    pending = recovery_mechanism.host_action_pending() if recovery_mechanism is not None else None
+    if pending is None:
+        return None
+    action, age = pending
+    why = (
+        f"a host {action} was requested {int(age)}s ago and is pending (up to "
+        f"{int(host_action_pending_sec())}s); a device reset now only races the host going down"
+    )
+    if force:
+        if logger:
+            logger.warning(f"reset: forced while {why}")
+        return None
+    return why
 
 
 def _maybe_spawn_forced_escalation() -> bool:
@@ -7170,6 +7213,12 @@ def _escalate_held_job_past_bound(job: "Job", held_sec: float, bound: float, rea
         if _maybe_spawn_forced_escalation():
             device_hold_job_bound_escalated = True
             return "forced recovery escalation started"
+        pending = recovery_mechanism.host_action_pending() if recovery_mechanism is not None else None
+        if pending is not None:
+            return (
+                f"forced escalation deferred: a host {pending[0]} was requested {int(pending[1])}s ago "
+                f"(pending up to {int(host_action_pending_sec())}s); the device stays held"
+            )
         return "forced escalation deferred (a device op is in flight); the hold watchdog retries it"
     except Exception as e:  # escalation bookkeeping must never keep the job held
         if logger:
@@ -10349,6 +10398,12 @@ def create_mcp_server() -> MCPServer:
             yield f"hint: {LEFTOVER_REBOOT_HINT}\n"
             yield "::status::refused\n"
             return
+        host_pending = _host_action_reset_refusal(force)
+        if host_pending:
+            yield f"host action REFUSED: {host_pending}\n"
+            yield "hint: wait for the host to come back, or pass --force\n"
+            yield "::status::refused\n"
+            return
 
         # Over the socket the caller's real uid scopes the gate. Over HTTP there is no peer
         # identity: on a privsep host an anonymous caller owns no holder, so every tenant is
@@ -11850,6 +11905,16 @@ def create_mcp_server() -> MCPServer:
                 "foreign_holders": [],
                 "steps": steps,
                 "hint": LEFTOVER_REBOOT_HINT,
+            }
+        host_pending = _host_action_reset_refusal(force)
+        if host_pending:
+            step(f"host action REFUSED: {host_pending}", "warning")
+            return {
+                "status": "refused",
+                "reason": host_pending,
+                "foreign_holders": [],
+                "steps": steps,
+                "hint": "Wait for the host to come back, or pass force=true to override.",
             }
         # Over the socket the caller's real uid scopes the gate. Over HTTP there is no peer
         # identity: on a privsep host an anonymous caller owns no holder, so every tenant is
