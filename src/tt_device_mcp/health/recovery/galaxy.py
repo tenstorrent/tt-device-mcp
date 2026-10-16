@@ -336,11 +336,11 @@ def _classify_hold(
     return HOLD_CLASS_TRAY_DOWN_NO_WINDOW
 
 
-# The two off-bus fault classes no reset has been seen to heal (spec 04 I37). A: one or more whole UBB
-# trays off the bus (0/50 whole-tray drops on one Galaxy host healed without a power cycle). C: every
-# chip off the bus at startup, or still off after a mesh reset already ran and failed this episode.
-# Each goes to the power-cycle rung with no further reset, sweep or tray re-power: on those drops
-# each repeat mesh reset ran 130-262 s, exited 1, and three of them took the host down.
+# The two off-bus fault classes that go to the power cycle with no further reset (spec 04 I37). A: one
+# or more whole UBB trays off the bus (no whole-tray drop has healed without a power cycle: 0/50 on one
+# Galaxy host). C: every chip still off the bus after a mesh reset already ran and failed this episode
+# (one mesh reset has healed an all-off bus, so the first one still runs, at startup too; a repeat on
+# the unchanged set ran 130-262 s and exited 1). Neither gets a sweep or tray re-power.
 FAULT_CLASS_WHOLE_TRAY = "A"
 FAULT_CLASS_ALL_OFF = "C"
 
@@ -351,21 +351,20 @@ def _power_cycle_direct_class(
     tray_map: Optional[dict],
     *,
     mesh_reset_failed: bool,
-    startup: bool,
 ) -> Optional[str]:
     """The I37 fault class of an off-bus set, or None when the ordinary ladder applies.
 
-    ``FAULT_CLASS_ALL_OFF`` when every chip is off the bus and either this is the startup gate (no
-    reset has run since boot, and none ever brought a whole bus back) or a mesh reset already ran and
-    failed since the mesh was last released; a whole-bus drop seen first at run time still gets its
-    one mesh reset. ``FAULT_CLASS_WHOLE_TRAY`` when the set is exactly one or more whole trays and at
-    least one chip of the mesh is still on the bus. Anything else — a partial-tray drop, a single
+    ``FAULT_CLASS_ALL_OFF`` when every chip is off the bus and a mesh reset already ran and failed
+    since the mesh was last released. A whole-bus drop with no failed reset gets its one mesh reset
+    first, at the startup gate as at run time: the startup gate also runs after a broker restart, and
+    one mesh reset has brought a whole bus back there. ``FAULT_CLASS_WHOLE_TRAY`` when the set is
+    exactly one or more whole trays and at least one chip of the mesh is still on the bus. Anything else — a partial-tray drop, a single
     chip, a host with fewer than two trays, or no tray map to say which chips share a tray — is
     None. Pure and side-effect-free."""
     if expected < 2 * UBB_CHIP_COUNT or not offbus_chips:
         return None
     if len(offbus_chips) >= expected:
-        return FAULT_CLASS_ALL_OFF if (startup or mesh_reset_failed) else None
+        return FAULT_CLASS_ALL_OFF if mesh_reset_failed else None
     if _ubb_reset_plan(offbus_chips, expected, tray_map) is not None:
         return FAULT_CLASS_WHOLE_TRAY
     return None
@@ -1200,7 +1199,6 @@ class GalaxyRecovery(Recovery):
             expected,
             self._tray_map_now(),
             mesh_reset_failed=self.mechanism.mesh_reset_failed_since_release,
-            startup=rung == "gate" and gate_phase == "startup",
         )
         if fault_class is None:
             return None
@@ -1263,8 +1261,8 @@ class GalaxyRecovery(Recovery):
             context=context,
             host_at_risk=True,
         )
-        log(f"{what}: no reset heals this class — power-cycling the host now (spec 04 I37)")
-        await self.deps.auto_power_cycle_host(log, f"{what}; no reset heals this class")
+        log(f"{what}: no further reset heals this class — power-cycling the host now (spec 04 I37)")
+        await self.deps.auto_power_cycle_host(log, f"{what}; no further reset heals this class")
         return True
 
     # ---- the between-job gate's action rungs --------------------------------------------------
@@ -1818,12 +1816,13 @@ class GalaxyRecovery(Recovery):
             expected,
             tray_map,
             mesh_reset_failed=self.mechanism.mesh_reset_failed_since_release,
-            startup=gate_phase == "startup",
         )
         if fault_class is not None and not await asyncio.to_thread(self.mechanism.scope_active):
-            # Spec 04 I37: no reset heals this class, and on it the sweep's tray re-power and mesh
-            # reset dropped the sibling trays or took the host down. The caller climbs at once.
-            log(f"last chance before the host rung{where}: class {fault_class} — no reset heals it, skipping the sweep")
+            # Spec 04 I37: the sweep's tray re-power and mesh reset have not healed this class (a
+            # whole tray, or an all-off bus whose mesh reset already failed). The caller climbs at once.
+            log(
+                f"last chance before the host rung{where}: class {fault_class} — the sweep does not heal it, skipping it"
+            )
             health_event(
                 "last_chance_sweep_skipped",
                 context=context or gate_phase,
