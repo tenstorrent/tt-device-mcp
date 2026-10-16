@@ -5942,8 +5942,9 @@ def _offbus_count(beats: dict, expected: int, not_ready: Optional[set] = None) -
 def _live_offbus_state() -> dict:
     """The live off-bus picture for /health, read fresh from sysfs on every call (no device touch):
     ``off_bus`` (chips off the PCIe bus now), ``arc_not_ready`` (on the bus, heartbeat ENODATA) and
-    ``isolated_chips``. ``held_reason``/``fsm_why`` keep the reason the hold OPENED with; these say
-    where it stands now. Empty where the heartbeat detector is absent or no baseline is known."""
+    ``isolated_chips``. ``fsm_why`` keeps the reason the hold OPENED with, and ``held_reason`` that
+    reason plus its escalation stage (I59); these say where the chips stand now. Empty where the
+    heartbeat detector is absent or no baseline is known."""
     out: dict = {"isolated_chips": sorted(isolated_chips, key=int)}
     if not heartbeat_supported():
         return out

@@ -189,8 +189,8 @@ async def test_a_forced_pass_updates_the_reason_and_keeps_the_hold(monkeypatch, 
 
 
 def test_health_stays_held_while_a_forced_rung_runs(held, monkeypatch):
-    """g15blx02 10-15: /health read held:false, status ok, fsm recovering while the forced glx_reset of a
-    hold ran, then held:true again once it ended. The op inside an open hold episode is the recovery of
+    """Seen in the field: /health read held:false, status ok, fsm recovering while the forced glx_reset of
+    a hold ran, then held:true again once it ended. The op inside an open hold episode is the recovery of
     THAT hold: the device is still refused, and a probe or watcher that reads ``held`` must not see it
     lifted until the full gate, fabric included, passes."""
     srv._note_tenant_gate_verdict(f"device unverified: {REASON}")
