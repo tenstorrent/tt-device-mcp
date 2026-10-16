@@ -281,6 +281,10 @@ class RecoveryMechanism:
         # so the next window takes the next stronger rung instead (spec 04 I36).
         self.failed_rungs_since: str = ""
         self.failed_rungs: dict = {}
+        # One early forced retry per hold episode after a failed mesh reset that brought chips back
+        # (spec 04 I39): (episode, monotonic due time), and the episode that already spent it.
+        self.progress_retry: Optional[tuple] = None
+        self.progress_retry_spent_since: str = ""
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a
@@ -357,6 +361,27 @@ class RecoveryMechanism:
             self.failed_rungs[rung] = frozenset(off_after)
         else:
             self.failed_rungs.pop(rung, None)
+
+    def note_progress_retry(self, hold_since: str, delay_sec: float) -> bool:
+        """Arm this episode's one early retry after a failed mesh reset whose off-bus set shrank (spec 04
+        I39). False when the episode has no clock or already spent its retry."""
+        if not hold_since or self.progress_retry_spent_since == hold_since:
+            return False
+        self.progress_retry = (hold_since, time.monotonic() + delay_sec)
+        return True
+
+    def progress_retry_due(self, hold_since: str, now: Optional[float] = None) -> bool:
+        """True once this episode's armed early retry is due (spec 04 I39)."""
+        armed = self.progress_retry
+        if not hold_since or armed is None or armed[0] != hold_since:
+            return False
+        return (time.monotonic() if now is None else now) >= armed[1]
+
+    def spend_progress_retry(self) -> None:
+        """The early retry started: it is spent for its episode and never re-armed in it."""
+        if self.progress_retry is not None:
+            self.progress_retry_spent_since = self.progress_retry[0]
+        self.progress_retry = None
 
     def rung_failed_unchanged(self, hold_since: str, rung: str, off_now) -> bool:
         """True when ``rung`` already failed in this hold episode on exactly the off-bus set seen now:
