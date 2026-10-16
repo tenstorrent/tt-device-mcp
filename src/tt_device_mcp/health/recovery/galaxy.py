@@ -1520,10 +1520,17 @@ class GalaxyRecovery(Recovery):
         except Exception as exc:  # noqa: BLE001 - best-effort, as for a mesh reset: never blocks recovery
             log(f"could not stop the device pollers before the tray re-power: {exc!r}")
         FABRIC_DEBT.note_reset(f"tray re-power 0x{bitmap:02x}")
+        fired = False
         try:
-            return await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
+            plan = await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
+            fired = True
+            return plan
         finally:
-            if quiesced:
+            if quiesced and not fired:
+                # A refused or failed re-power leaves the tray as it was: off the bus (spec 03 I66).
+                log("device pollers left stopped: the tray re-power did not fire")
+                health_event("pollers_left_quiesced", after=f"tray re-power 0x{bitmap:02x}", services=list(quiesced))
+            elif quiesced:
                 await asyncio.shield(set_pollers(True, log))
 
     async def _issue_all_resets_back_to_back(
@@ -3008,6 +3015,7 @@ class GalaxyRecovery(Recovery):
         start_off = set(offbus_ids)
         quiesced: list = []
         cancelled_mid_fire = False
+        walk_recovered = False
         try:
             # A tray pulse takes chips off the bus: stop the pollers' MMIO across the walk, as for every reset.
             quiesced = await self.mechanism._set_device_pollers(False, log)
@@ -3095,6 +3103,7 @@ class GalaxyRecovery(Recovery):
                     isolated = self.deps.isolated_chips()
                     for c in start_off:
                         isolated.discard(c)
+                    walk_recovered = True
                     return True
                 off_now = _offbus_chip_ids(await asyncio.to_thread(self.deps.read_heartbeats) or {}, expected)
                 new_off = off_now - start_off
@@ -3129,5 +3138,5 @@ class GalaxyRecovery(Recovery):
         finally:
             self.mechanism.reset_in_flight = False
             pcie_guard.end_offbus_reset()
-            if quiesced and not cancelled_mid_fire:
-                await asyncio.shield(self.mechanism._set_device_pollers(True, log))
+            if not cancelled_mid_fire:
+                await self.mechanism.restore_pollers(quiesced, log, ok=walk_recovered, after="per-tray reset walk")

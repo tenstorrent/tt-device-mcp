@@ -25,6 +25,7 @@ from tt_device_mcp.health.aiclk_ceiling import CEILING
 
 # The shared health vocabulary: HealthMonitor.status() returns a HealthState, and server.py both
 # builds one of its own (_healthy_reading()) and compares a probe's Verdict directly.
+from tt_device_mcp.health import chip_state
 from tt_device_mcp.health.core import HealthState, Verdict
 
 # The durable event journal and forensic incident capture — genuinely server-facing: this IS
@@ -55,6 +56,7 @@ from tt_device_mcp.health.monitors.heartbeat import (
     dead_chips,
     heartbeat_supported,
     heartbeat_verdict,
+    offbus_chip_ids,
     offbus_count,
     read_heartbeats,
     returned_chips,
@@ -171,8 +173,10 @@ __all__ = [
     "eth",
     "fabric",
     "ALL_ONES",
+    "chip_state",
     "dead_chips",
     "arc_not_ready_chips",
+    "offbus_chip_ids",
     "offbus_count",
     "returned_chips",
     "heartbeat_supported",
