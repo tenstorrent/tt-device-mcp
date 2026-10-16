@@ -37,12 +37,14 @@ from tt_device_mcp.health.monitors.pci import chip_pci_bdf
 HEARTBEAT_SETTLE_SEC = 0.5
 
 
-def read_heartbeats() -> dict[str, int]:
+def read_heartbeats(*, probe_lost: bool = False) -> dict[str, int]:
     """Per-chip ARC heartbeat counters, keyed by device index.
 
     Each attribute read is a PCIe read of the chip (the KMD reads the counter from the chip's
     BAR), so a chip the broker has confirmed lost is not read again until :func:`chip_state.may_read`
-    allows it (spec 03 I66); it reports ALL_ONES, what its last real read said.
+    allows it (spec 03 I66); it reports ALL_ONES, what its last real read said. ``probe_lost`` is for
+    a health check's decision read: each lost chip is read for real once, so a chip that answers
+    again is judged on its answer, not on the mark.
 
     A chip whose attribute is missing or unreadable is omitted rather than zeroed,
     so the caller sees it as an absent chip (a real fault) and not as a chip whose
@@ -58,7 +60,7 @@ def read_heartbeats() -> dict[str, int]:
         idx = ent.name.rsplit("!", 1)[-1]
         if not idx.isdigit():
             continue
-        if not chip_state.may_read(idx, ent):
+        if not chip_state.may_read(idx, ent, probe=probe_lost):
             beats[idx] = ALL_ONES
             continue
         try:
@@ -253,7 +255,9 @@ def heartbeat_verdict(expected_count: int, settle_sec: float = HEARTBEAT_SETTLE_
 
 
 def _heartbeat_verdict_body(expected_count: int, settle_sec: float) -> tuple[Verdict, str, dict]:
-    first = read_heartbeats()
+    # A check, not a poll: a chip marked lost is read for real here (once; the second sample is
+    # gated again), so a chip that came back passes and one that did not is judged on a real read.
+    first = read_heartbeats(probe_lost=True)
     if not first:
         return (
             Verdict.UNHEALTHY,

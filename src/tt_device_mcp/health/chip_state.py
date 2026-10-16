@@ -215,12 +215,17 @@ def is_lost(idx) -> bool:
         return str(idx) in _lost
 
 
-def may_read(idx, node: Path) -> bool:
+def may_read(idx, node: Path, *, probe: bool = False) -> bool:
     """Whether a broker read of chip ``idx`` (sysfs node ``node``) may go to the chip now. True for a
     chip not marked lost, and for every read while this broker's own reset step runs. For a lost chip:
     True once its node was re-created (and the mark is cleared), or when a re-read is due (one per
     :data:`LOST_REPROBE_SEC`, one per :data:`GRACE_REPROBE_SEC` right after a reset step); False
-    otherwise, and the caller reports the chip as all-ones without reading it."""
+    otherwise, and the caller reports the chip as all-ones without reading it.
+
+    ``probe`` is a health check's decision read (the gate's heartbeat verdict, the reset gate's
+    off-bus count), not a poll: the re-read is due now, so a chip that answers again on the same node
+    is seen by the check that judges it and never judged off the bus on a value nobody read. It is one
+    read per check and restarts the reprobe clock."""
     idx = str(idx)
     with _lock:
         rec = _lost.get(idx)
@@ -234,7 +239,7 @@ def may_read(idx, node: Path) -> bool:
         else:
             renewed = False
             now = time.monotonic()
-            if now < rec["next"]:
+            if now < rec["next"] and not probe:
                 return False
             rec["next"] = now + (GRACE_REPROBE_SEC if now < _grace_until else LOST_REPROBE_SEC)
             if rec["node"] is None:

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import fsm_healthy, patch_health_event, stub_device_pollers
+from tests.conftest import fsm_healthy, patch_health_event, patch_recovery, stub_device_pollers
 from tt_device_mcp import server as srv
 from tt_device_mcp.health import chip_state
 from tt_device_mcp.health import monitor as monitor_mod
@@ -399,6 +399,218 @@ async def test_the_post_reset_health_check_runs_fabric_on_chips_marked_lost(sysf
     assert verdicts.get("heartbeat") is Verdict.HEALTHY, state.observations
     assert ran == ["snapshot", "eth", "fabric"], "the post-reset check stopped short of the fabric pass"
     assert verdicts.get("fabric") is Verdict.HEALTHY
+
+
+# --- a check is not a poll: it reads a lost chip for real ------------------------------------------
+
+
+def _ticking(monkeypatch, sysfs, ids):
+    """The settle sleep advances the counters of ``ids`` (the chips that answer)."""
+    step = iter(range(200, 10_000, 100))
+
+    def advance(_):
+        v = next(step)
+        for i in ids:
+            sysfs["node"](i, v + i)
+
+    monkeypatch.setattr(heartbeat.time, "sleep", advance)
+
+
+def test_a_lost_chip_that_answers_again_passes_the_health_check_inside_the_reprobe_window(sysfs, clock, monkeypatch):
+    """A chip marked lost (a whole-mesh blackout, a failed isolation) that answers again on the same node
+    must not be judged off the bus on a value nobody read: the gate's heartbeat verdict reads it for real,
+    at once, so it passes and the mark clears. Before, the gated all-ones failed every check (gate, dispatch
+    recheck, idle relift) as 'FELL OFF THE PCIe BUS' for up to the 30 s backstop."""
+    sysfs["node"](2, ALL_ONES)
+    chip_state.mark_lost(["2"], "all-ones on two samples", chip_state.chip_nodes(["2"]))
+    clock.now += 1.0  # well inside the reprobe window
+    sysfs["node"](2, 12345)  # same node, answering again
+    sysfs["reads"].clear()
+    assert heartbeat.read_heartbeats()["2"] == ALL_ONES, "a poll inside the window still reads nothing"
+    assert _reads_of(sysfs, 2) == []
+
+    _ticking(monkeypatch, sysfs, range(N))
+    verdict, detail, _ = heartbeat.heartbeat_verdict(expected_count=N)
+    assert verdict is Verdict.HEALTHY, detail
+    assert not chip_state.is_lost("2")
+
+
+def test_a_check_reads_a_still_lost_chip_once_and_judges_it_on_that_read(sysfs, clock, monkeypatch):
+    """A chip still off the bus is read once per check (not twice, not on the poll clock), and the check
+    fails on that real read. The reprobe clock restarts, so the pollers stay off it."""
+    sysfs["node"](2, ALL_ONES)
+    chip_state.mark_lost(["2"], "test", chip_state.chip_nodes(["2"]))
+    clock.now += 1.0
+    sysfs["reads"].clear()
+    _ticking(monkeypatch, sysfs, [0, 1, 3])
+    verdict, detail, ev = heartbeat.heartbeat_verdict(expected_count=N)
+    assert verdict is Verdict.UNHEALTHY and ev["dead"] == ["2"], detail
+    assert _reads_of(sysfs, 2) == ["tt_heartbeat"], "one real read per check"
+    assert chip_state.is_lost("2")
+    clock.now += chip_state.LOST_REPROBE_SEC / 2
+    heartbeat.read_heartbeats()
+    assert _reads_of(sysfs, 2) == ["tt_heartbeat"], "the check restarted the reprobe clock"
+
+
+def test_the_reset_gate_does_not_count_a_lost_chip_that_answers_again(sysfs, clock, monkeypatch):
+    """The per-host reset gate's off-bus count (spec 04 I24) is a decision too: a lost chip that answers
+    again on its node is on the bus and must not hold a mesh reset; one still all-ones counts."""
+    from tt_device_mcp.health.recovery import pcie_guard
+
+    monkeypatch.setattr(pcie_guard, "tt_endpoints", lambda: {f"0000:{i + 1:02x}:00.0": None for i in range(N)})
+    sysfs["node"](2, ALL_ONES)
+    chip_state.mark_lost(["2"], "test", chip_state.chip_nodes(["2"]))
+    clock.now += 1.0
+    assert pcie_guard.chips_off_bus(N) == 1
+    sysfs["node"](2, 777)
+    clock.now += 1.0
+    assert pcie_guard.chips_off_bus(N) == 0
+    assert not chip_state.is_lost("2")
+
+
+# --- stale gate state ----------------------------------------------------------------------------
+
+
+def _lost_chip_read_on_next_poll(sysfs) -> bool:
+    sysfs["reads"].clear()
+    heartbeat.read_heartbeats()
+    return _reads_of(sysfs, 2) == ["tt_heartbeat"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["raises", "cancelled"])
+async def test_a_reset_step_that_raises_or_is_cancelled_clears_recovering(sysfs, clock, monkeypatch, how):
+    """A reset that raises or is cancelled must not leave the chips gated: recovering clears on every exit
+    and the post-reset grace opens, so the next read of a lost chip goes to it at once."""
+    order: list = []
+    _reset_seams(monkeypatch, order, 0)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None, raising=False)
+    exc = RuntimeError("boom") if how == "raises" else asyncio.CancelledError()
+
+    async def run(argv, log, owner="[broker]health-gate"):
+        order.append(("reset", chip_state.recovering()))
+        raise exc
+
+    monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", run)
+    sysfs["node"](2, ALL_ONES)
+    chip_state.mark_lost(["2"], "test", chip_state.chip_nodes(["2"]))
+    clock.now += 1.0
+    with pytest.raises(type(exc)):
+        await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
+    assert ("reset", True) in order
+    assert not chip_state.recovering()
+    assert json.loads(chip_state.state_path().read_text())["recovering"] is False
+    assert _lost_chip_read_on_next_poll(sysfs), "the grace did not open after the step ended"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["raises", "cancelled"])
+async def test_the_galaxy_reset_sweep_clears_recovering_on_every_exit(sysfs, clock, monkeypatch, how):
+    """The back-to-back sweep holds recovering across all its rungs; a mesh reset that raises (the sweep
+    goes on to the host rung) or a cancel mid-sweep clears it and opens the grace."""
+    from tt_device_mcp.health.recovery import pcie_guard
+
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: 0)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    seen = []
+
+    async def reset(*a, **k):
+        seen.append(chip_state.recovering())
+        if how == "cancelled":
+            raise asyncio.CancelledError()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
+    sysfs["node"](2, ALL_ONES)
+    chip_state.mark_lost(["2"], "test", chip_state.chip_nodes(["2"]))
+    clock.now += 1.0
+    if how == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await g._issue_all_resets_back_to_back(0, [], [], N, lambda m: None, do_sbr=False)
+    else:
+        assert await g._issue_all_resets_back_to_back(0, [], [], N, lambda m: None, do_sbr=False) is True
+    assert seen == [True], "the sweep's mesh reset did not run under recovering"
+    assert not chip_state.recovering()
+    assert _lost_chip_read_on_next_poll(sysfs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["fails", "raises", "cancelled"])
+async def test_the_tray_walk_clears_recovering_on_every_exit(sysfs, clock, monkeypatch, how):
+    """The per-tray walk holds recovering across the walk; a fire that fails, a verify that raises and a
+    cancel mid-fire all clear it and open the grace."""
+    from tt_device_mcp.device_holders import HolderScan
+    from tt_device_mcp.health.recovery import galaxy, pcie_guard
+
+    g = srv.galaxy_recovery
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
+    srv.fsm.set_latch("ubb_reset_fired", False)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off: (True, ""))
+    monkeypatch.setattr(g, "_tray_map_now", lambda: {t: list(range((t - 1) * 8, t * 8)) for t in range(1, 5)})
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    stub_device_pollers(monkeypatch)
+    seen = []
+
+    def fire(bitmap, ids):
+        seen.append(chip_state.recovering())
+        if how == "fails":
+            raise RuntimeError("bmc unreachable")
+        if how == "cancelled":
+            raise asyncio.CancelledError()
+
+    async def verify(*a, **k):
+        raise RuntimeError("verify blew up")
+
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", fire, raising=False)
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    sysfs["node"](2, ALL_ONES)
+    chip_state.mark_lost(["2"], "test", chip_state.chip_nodes(["2"]))
+    clock.now += 1.0
+    beats = {str(i): 100 for i in range(32) if i != 2}
+    if how == "fails":
+        assert await g._attempt_ubb_tray_reset(beats, 1, 32, lambda m: None) is False
+    else:
+        with pytest.raises((RuntimeError, asyncio.CancelledError)):
+            await g._attempt_ubb_tray_reset(beats, 1, 32, lambda m: None)
+    assert seen == [True], "the walk did not fire under recovering"
+    assert not chip_state.recovering()
+    assert _lost_chip_read_on_next_poll(sysfs)
+
+
+def test_a_fresh_broker_publishes_clean_state_over_a_stale_file(monkeypatch):
+    """A broker that died mid-recovery leaves chip-state.json saying recovering (a per-user daemon's state
+    dir outlives the process). The next broker starts with no lost or recovering chip and rewrites the
+    file at boot, before any sampler tick."""
+    path = chip_state.state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 1, "pid": 1, "recovering": True, "lost": ["2"], "chips": {}}))
+    chip_state.reset()
+    assert not chip_state.recovering() and chip_state.lost_chips() == []
+    # Re-run boot_broker's once-only block around the subsystem this suite already built: the fsm hands
+    # back the same singletons, and every global it rebinds is restored after the test.
+    for name, attr in (
+        ("health_monitor", "monitor"),
+        ("recovery_mechanism", "mechanism"),
+        ("galaxy_recovery", "galaxy"),
+        ("per_target_recovery", "per_target"),
+        ("select_recovery", "select_recovery"),
+        ("sampler", "sampler"),
+    ):
+        monkeypatch.setattr(srv, name, getattr(srv, name))
+        monkeypatch.setattr(srv.fsm, attr, getattr(srv, name), raising=False)
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_fence", srv.recovery_mechanism.reset_fence, raising=False)
+    monkeypatch.setattr(srv, "_booted", False)
+    monkeypatch.setattr(srv.fsm, "boot", lambda deps: None)
+    monkeypatch.setattr(srv.fsm, "resolve_platform", lambda probe=None: None)
+    srv.boot_broker()
+    body = json.loads(path.read_text())
+    assert body["pid"] == os.getpid()
+    assert body["recovering"] is False and body["lost"] == []
 
 
 # --- /health --------------------------------------------------------------------------------------

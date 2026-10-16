@@ -1128,6 +1128,9 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
                 health_monitor.expected(0) if health_monitor and health_monitor._health_check_enabled() else 0
             )
         )
+        # A fresh process has no lost or recovering chip: publish that now, over whatever a process
+        # that died mid-recovery left in the file (a per-user daemon's state dir outlives it).
+        chip_state.publish()
         recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
         galaxy_recovery = fsm.galaxy
         per_target_recovery = fsm.per_target
