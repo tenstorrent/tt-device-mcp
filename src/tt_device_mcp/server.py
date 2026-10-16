@@ -6404,6 +6404,12 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         device_hold_escalation_trigger = f"the {int(_offbus_hold_ceiling_sec())}s off-bus one-shot"
         if _maybe_spawn_forced_escalation():
             device_hold_offbus_escalated = True
+    elif recovery_mechanism is not None and recovery_mechanism.progress_retry_due(device_hold_episode_since):
+        # spec 04 I39: a failed mesh reset brought chips back; its one retry runs now, not at the ceiling.
+        device_hold_escalation_kind = "progress_retry"
+        device_hold_escalation_trigger = "the retry after a failed reset that brought chips back"
+        if _maybe_spawn_forced_escalation():
+            recovery_mechanism.spend_progress_retry()
     else:
         # The old risky-reset floor window (a separate forced run partway to the ceiling) is gone
         # (ladder-v2): the below-floor mesh reset no longer waits, so the general ceiling window is

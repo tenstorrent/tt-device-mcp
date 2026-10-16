@@ -249,6 +249,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_STUCK_HOLD_RESET` | 1 | Kill switch: idle escalation may reset a stuck hold | 03 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_SEC` | 120 | Off-bus hold ceiling (an order below the general one) | 03 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE` | 1 | Kill switch: off-bus holds escalate early | 03 |
+| `TT_DEVICE_MCP_PROGRESS_RETRY_SEC` | 60 | Delay of the one retry after a failed mesh reset that brought chips back (capped at the hold ceiling) | 04 |
 | `TT_DEVICE_MCP_PRESENT_MESH_RESET_GRACE_SEC` | 300 | Present-mesh eth/fabric hold grace before reset | 03 |
 | `TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE` | 1 | Kill switch: generic holds join the idle escalation | 03 |
 | `TT_DEVICE_MCP_IDLE_HOLDER_SEC` | 900 | Seconds a foreign holder's CPU time stays flat before it is named (event + alert, never signalled); 0 turns it off | 03 |
