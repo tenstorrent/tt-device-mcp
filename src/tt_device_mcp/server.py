@@ -80,9 +80,11 @@ from tt_device_mcp.device_holders import (
     HolderScan,
     ReclaimResult,
     descends_from,
+    discount_broker_internal,
     enumerate_device_holders,
     evaluate_reset_gate,
     is_tenant,
+    note_broker_internal,
     read_proc_cpu,
     reclaim_foreign_holders,
 )
@@ -4649,6 +4651,10 @@ async def _kill_device_holders(reason: str) -> list:
         return killed
     for h in scan.holders:
         try:
+            if not is_tenant(h):
+                # Infrastructure we kill here can sit mid-exit for seconds, named by the driver with
+                # its fd table gone; the next scan must not read it as a tenant (spec 04 I59).
+                note_broker_internal(h.pid)
             os.kill(h.pid, signal.SIGKILL)
             killed.append({"pid": h.pid, "user": h.username})
         except ProcessLookupError:
@@ -6076,7 +6082,8 @@ async def device_health_gate(
             metrics.stage_fired("power_cycle", "blocked")
         elif stage in (STAGE_HOST_REBOOT, STAGE_POWER_CYCLE):
             action = _HOST_ESCALATION_ACTION[stage]
-            scan2 = await asyncio.to_thread(enumerate_device_holders)
+            # The broker's own probes and the holders it killed for a dead chip are not tenants (I59).
+            scan2 = discount_broker_internal(await asyncio.to_thread(enumerate_device_holders))
             # A scan that could not read every holder (no CAP_DAC_READ_SEARCH on a tenant's
             # /proc) must count as "a tenant is here": the highest-risk action does not get to
             # take the box down over a tenant it merely could not see.
@@ -6770,6 +6777,12 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             # A one-shot that waited out a tenant past the ceiling is that window's run as well: one
             # forced climb, not two back to back.
             device_hold_escalate_bucket = max(device_hold_escalate_bucket, int(age // ceiling))
+    elif recovery_mechanism is not None and recovery_mechanism.progress_retry_due(device_hold_episode_since):
+        # spec 04 I39: a failed mesh reset brought chips back; its one retry runs now, not at the ceiling.
+        device_hold_escalation_kind = "progress_retry"
+        device_hold_escalation_trigger = "the retry after a failed reset that brought chips back"
+        if _maybe_spawn_forced_escalation():
+            recovery_mechanism.spend_progress_retry()
     else:
         # The old risky-reset floor window (a separate forced run partway to the ceiling) is gone
         # (ladder-v2): the below-floor mesh reset no longer waits, so the general ceiling window is
