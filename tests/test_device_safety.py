@@ -564,7 +564,7 @@ async def test_forced_escalation_fires_on_a_hold_held_only_by_a_reported_fault(m
 
     climbed = []
 
-    async def _fake_present(indices, expected, log, *, force=False):
+    async def _fake_present(indices, expected, log, *, force=False, **_):
         climbed.append(("present", force))
 
     async def _fake_offbus(indices, expected, log, *, force=False):

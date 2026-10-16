@@ -1308,7 +1308,7 @@ refuses.
 | I55 (under the outage hold: no reset, held, paged, honest message) | `tests/test_dispatch_failure_reset.py::test_outage_hold_holds_and_pages_without_a_reset` |
 | I55 (the verdict names the dispatch failure, never the downgraded mismatch) | `tests/test_dispatch_failure_reset.py::test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch`, `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I55 (rung gap warned at boot and on /health; floor message honest) | `tests/test_dispatch_failure_reset.py::test_rung_gap_boot_warning_and_health_field`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
-| I56 (a measured fabric failure on a present mesh resets on the first relift; frozen read or no measured failure keeps the grace) | `tests/test_device_safety.py::test_idle_relift_resets_a_measured_fabric_failure_without_the_grace`, `tests/test_device_safety.py::test_idle_relift_keeps_the_grace_without_a_measured_fabric_failure` |
+| I56 (a measured fabric failure on a present mesh resets on the first relift; frozen read or no measured failure keeps the grace) | `tests/test_device_safety.py::test_idle_relift_resets_a_measured_fabric_failure_without_the_grace`, `tests/test_device_safety.py::test_idle_relift_keeps_the_grace_without_a_measured_fabric_failure`, `tests/test_post_reset_gate.py::test_the_measured_fabric_failure_reset_on_the_first_relift` (the real reset path: the verify after it runs the fabric pass, release only on a healthy verdict, 04 I32/I32a) |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
