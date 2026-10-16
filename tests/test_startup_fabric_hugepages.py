@@ -294,7 +294,10 @@ def _systemctl(monkeypatch):
 
     monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
     monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr(srv, "recovery_mechanism", type("M", (), {"scope_active": staticmethod(lambda: None)})())
+    if srv.recovery_mechanism is None:
+        monkeypatch.setattr(srv, "recovery_mechanism", type("M", (), {"scope_active": staticmethod(lambda: None)})())
+    else:  # keep the rest of the real mechanism: startup calls more of it than scope_active
+        monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "_pollers_held_for", None, raising=False)
     return calls
 
