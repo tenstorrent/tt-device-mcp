@@ -119,16 +119,15 @@ from tt_device_mcp.health import (
     aer_totals,
     append_trace,
     arc_not_ready_chips,
-    offbus_chip_ids,
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
     capture_incident,
     chip_node_present,
-    chip_state,
     chip_pci_bdf,
     chip_sample,
     chip_snapshot,
     chip_snapshot_event,
+    chip_state,
     dead_chips,
     eth,
     fabric,
@@ -144,6 +143,7 @@ from tt_device_mcp.health import (
     mesh_hold_repage_sec,
     mesh_reset_hold_reason,
     note_broker_stopping,
+    offbus_chip_ids,
     offbus_count,
     offbus_power_cycle,
     pcie_guard_at_start,
@@ -1124,7 +1124,9 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         recovery_mechanism = fsm.mechanism
         # The published chip state (spec 03 I66) lists every chip the baseline expects.
         chip_state.configure(
-            expected=lambda: health_monitor.expected(0) if health_monitor and health_monitor._health_check_enabled() else 0
+            expected=lambda: (
+                health_monitor.expected(0) if health_monitor and health_monitor._health_check_enabled() else 0
+            )
         )
         recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
         galaxy_recovery = fsm.galaxy

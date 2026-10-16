@@ -25,9 +25,9 @@ import time
 from typing import Optional
 
 from tt_device_mcp import metrics
+from tt_device_mcp.health import chip_state
 from tt_device_mcp.health.core import Verdict
 from tt_device_mcp.health.evidence import health_event
-from tt_device_mcp.health import chip_state
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.monitors.pci import chip_pci_bdf
 

@@ -111,10 +111,14 @@ def chip_snapshot() -> dict:
         try:
             pci = (ent / "device").resolve()
             rec["pci"] = pci.name
-            for f, key in () if lost else (
-                ("current_link_width", "link_width"),
-                ("max_link_width", "link_width_max"),
-                ("current_link_speed", "link_speed"),
+            for f, key in (
+                ()
+                if lost
+                else (
+                    ("current_link_width", "link_width"),
+                    ("max_link_width", "link_width_max"),
+                    ("current_link_speed", "link_speed"),
+                )
             ):
                 try:
                     rec[key] = (pci / f).read_text().strip()
