@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import alert, metrics, privileges
-from tt_device_mcp.device_holders import holder_comm, is_tenant, username_for_uid
+from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count
@@ -1484,6 +1484,9 @@ class GalaxyRecovery(Recovery):
         real tenant apart from a scan that merely could not see."""
         if self.deps.job_running():
             return {"blocker": "job_running"}
+        # The broker's own probes and the holders it killed for a dead chip are not tenants, nor is
+        # a gap they leave while exiting (spec 04 I59).
+        scan = discount_broker_internal(scan)
         tenants = [h for h in scan.holders if is_tenant(h)]
         if tenants:
             h = tenants[0]

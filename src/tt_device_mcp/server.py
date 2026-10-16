@@ -79,9 +79,11 @@ from tt_device_mcp.device_holders import (
     HolderScan,
     ReclaimResult,
     descends_from,
+    discount_broker_internal,
     enumerate_device_holders,
     evaluate_reset_gate,
     is_tenant,
+    note_broker_internal,
     read_proc_cpu,
     reclaim_foreign_holders,
 )
@@ -4463,6 +4465,10 @@ async def _kill_device_holders(reason: str) -> list:
         return killed
     for h in scan.holders:
         try:
+            if not is_tenant(h):
+                # Infrastructure we kill here can sit mid-exit for seconds, named by the driver with
+                # its fd table gone; the next scan must not read it as a tenant (spec 04 I59).
+                note_broker_internal(h.pid)
             os.kill(h.pid, signal.SIGKILL)
             killed.append({"pid": h.pid, "user": h.username})
         except ProcessLookupError:
@@ -5780,7 +5786,8 @@ async def device_health_gate(
             metrics.stage_fired("power_cycle", "blocked")
         elif stage in (STAGE_HOST_REBOOT, STAGE_POWER_CYCLE):
             action = _HOST_ESCALATION_ACTION[stage]
-            scan2 = await asyncio.to_thread(enumerate_device_holders)
+            # The broker's own probes and the holders it killed for a dead chip are not tenants (I59).
+            scan2 = discount_broker_internal(await asyncio.to_thread(enumerate_device_holders))
             # A scan that could not read every holder (no CAP_DAC_READ_SEARCH on a tenant's
             # /proc) must count as "a tenant is here": the highest-risk action does not get to
             # take the box down over a tenant it merely could not see.

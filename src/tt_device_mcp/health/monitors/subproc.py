@@ -19,6 +19,7 @@ import signal
 from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import aio
+from tt_device_mcp.device_holders import note_broker_internal
 
 Track = Callable[[Optional["asyncio.subprocess.Process"]], None]
 Terminate = Callable[[int], Awaitable[None]]
@@ -74,6 +75,8 @@ async def run_probe(
             cwd=cwd,
             start_new_session=True,
         )
+        # The broker's own device work: a holder scan taken while it exits is not a tenant (I59).
+        note_broker_internal(proc.pid)
         track(proc)
         chunks: list[bytes] = []
         if stream:
