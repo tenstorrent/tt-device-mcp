@@ -218,12 +218,25 @@ async def test_a_spent_dispatch_reset_leaves_the_timeout_on_todays_path(mesh, mo
 
 
 @pytest.mark.asyncio
-async def test_a_release_with_no_open_hold_rearms_the_latch(mesh):
+async def test_a_healed_reset_rearms_the_latch_at_the_next_admission(mesh):
+    """The reset held the door (the episode opened before it fired); the next admission ends that
+    episode (device_released) and re-arms the next one's reset."""
     await _gate()
-    assert srv._dispatch_reset_spent is True
-    assert srv.device_hold_logged is False
-    srv._note_tenant_gate_verdict("")  # the next tenant is admitted; no hold episode is open
+    assert srv._dispatch_reset_spent is True and srv.device_hold_logged is True
+    assert srv.fsm.state is ServerState.HEALTHY
+    srv._note_tenant_gate_verdict("")
+    assert "device_released" in mesh["events"]
     assert srv._dispatch_reset_spent is False
+
+
+@pytest.mark.asyncio
+async def test_the_door_is_shut_while_the_reset_is_unproven(mesh):
+    """Goal: a clean exit has no episode open, so the gate opens one before the reset fires. A failed
+    post-reset check then refuses the next tenant instead of dispatching onto the unproven mesh."""
+    mesh["reset_heals"] = False
+    await _gate()
+    assert srv.fsm.record.why == "probe_unhealthy"
+    assert srv._device_unavailable_for_tenant(), "no tenant runs on a mesh the post-reset check failed"
 
 
 @pytest.mark.asyncio

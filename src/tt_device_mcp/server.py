@@ -5576,6 +5576,11 @@ async def device_health_gate(
             semantics allow and reopened the door (see ``GalaxyRecovery._fire_gate_rung``), so the
             caller is done. Reads ``ev``/``beats`` as they stand at the call, which is the evidence
             the decision being fired was made from."""
+            if fsm.state is ServerState.HEALTHY:
+                # A rung fired from a clean exit (spec 03 I55/I56 on a present mesh) has no episode
+                # open yet. Open it before the reset, so a failed post-reset check leaves the door
+                # held and the ladder climbing; only the full check's pass releases it.
+                _mark_device_dirty(f"gate/{phase}: {'; '.join(reasons) or 'unhealthy'} — {rung}", why="probe_unhealthy")
             _note_tenant_gate_verdict(f"device unverified: gate/{phase}: {dirty_reason or 'unhealthy'}")
             _void_fabric_ok(f"gate/{phase} ladder: {rung}")
             outcome = await galaxy_recovery.escalate(
@@ -6126,9 +6131,6 @@ def _note_tenant_gate_verdict(reason: str) -> None:
             health_event("device_held", reason=reason)
     elif not reason and not device_hold_logged:
         _forget_stale_hold_episode()
-        # No episode is open: a reset spent by a gate that then released without ever holding (the
-        # I56 eth-timeout reset on a clean exit) must not starve the next episode of its own.
-        _dispatch_reset_spent = False
     elif not reason and device_hold_logged:
         device_hold_logged = False
         health_event("device_released")
