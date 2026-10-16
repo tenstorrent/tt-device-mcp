@@ -155,7 +155,7 @@ def _scripted_helper(monkeypatch, results, run_sec=0.0):
     starts = []
     results = list(results)
 
-    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate):
+    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate, name=""):
         starts.append(clock[0])
         clock[0] += run_sec
         return results.pop(0) if len(results) > 1 else results[0]

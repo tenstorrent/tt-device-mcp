@@ -156,6 +156,18 @@ class HolderScan:
     # because the two fail differently, and "the gate refused" is otherwise indistinguishable
     # between a device that is genuinely busy and a scan that had no privilege to look.
     source: str = "proc"
+    # Why ``complete`` is False, one short entry per blind spot (a pid the driver names that we
+    # could not attribute, a count of unreadable fd tables). The gates that defer on an
+    # incomplete scan quote these, so a deferral says what it could not see.
+    gaps: list[str] = field(default_factory=list)
+    # The pid each gap is about, or None for a gap no single pid explains; parallel to ``gaps``.
+    gap_pids: list = field(default_factory=list)
+
+    def mark_incomplete(self, why: str, pid: int | None = None) -> None:
+        """Record one blind spot and mark the scan incomplete."""
+        self.complete = False
+        self.gaps.append(why)
+        self.gap_pids.append(pid)
 
     def foreign_holders(self, caller_uid: int | None) -> list[DeviceHolder]:
         """Other real tenants holding the device — excludes the caller and system
@@ -260,13 +272,15 @@ def _scan_from_driver_pids(pids: "set[int]", complete: bool) -> HolderScan:
     holding the device would let the gate mistake a stranger for the caller's own holder, or name
     the wrong tenant in an audit.
     """
-    scan = HolderScan(complete=complete, source="driver")
+    scan = HolderScan(source="driver")
+    if not complete:
+        scan.mark_incomplete("a per-device driver pids file was unreadable")
     for pid in sorted(pids):
         uid = _proc_uid(pid)
         if uid is None:
             # A holder the driver can see and we cannot: another pid namespace, or it exited
             # between the driver's read and ours. Either way it is unattributed, not absent.
-            scan.complete = False
+            scan.mark_incomplete(f"pid {pid} named by the driver has no /proc entry here", pid)
             continue
         try:
             confirmed = _process_holds_device(pid)
@@ -275,10 +289,15 @@ def _scan_from_driver_pids(pids: "set[int]", complete: bool) -> HolderScan:
             # already confirmed it, and the uid from stat is authoritative for this pid.
             confirmed = True
         except OSError:
-            scan.complete = False
+            scan.mark_incomplete(f"pid {pid} ({holder_comm(pid)}) named by the driver: fd table unreadable", pid)
             continue
         if not confirmed:
-            scan.complete = False
+            # Also a process mid-exit: its fd table is already gone while the driver's release of
+            # the file still runs (a probe just killed on its timeout, before it is reaped).
+            scan.mark_incomplete(
+                f"pid {pid} ({holder_comm(pid)}, state {holder_state(pid)}) named by the driver holds no device fd here",
+                pid,
+            )
             continue
         scan.holders.append(DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid)))
     return scan
@@ -311,7 +330,7 @@ def _scan_by_walking_proc() -> HolderScan:
         pids = _iter_pids()
     except OSError as exc:
         logger.warning("device-holder scan: cannot list /proc: %s", exc)
-        scan.complete = False
+        scan.mark_incomplete(f"cannot list /proc: {exc}")
         return scan
 
     blocked = 0
@@ -321,7 +340,6 @@ def _scan_by_walking_proc() -> HolderScan:
         except PermissionError:
             # Another uid's process we cannot inspect -> visibility gap.
             blocked += 1
-            scan.complete = False
             continue
         except FileNotFoundError:
             # Process exited mid-scan; ignore.
@@ -332,11 +350,12 @@ def _scan_by_walking_proc() -> HolderScan:
         if holds:
             uid = _proc_uid(pid)
             if uid is None:
-                scan.complete = False
+                scan.mark_incomplete(f"holder pid {pid} exited before its owner was read", pid)
                 continue
             scan.holders.append(DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid)))
 
     if blocked:
+        scan.mark_incomplete(f"{blocked} processes' fd tables unreadable")
         logger.warning(
             "device-holder scan incomplete: %d processes unreadable "
             "(need CAP_DAC_READ_SEARCH/root for full cross-user visibility, or a tt-kmd that "
@@ -418,6 +437,24 @@ def evaluate_reset_gate(
     )
 
 
+def holder_comm(pid: int) -> str:
+    """The process name (``/proc/<pid>/comm``) for a log line; ``?`` when it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip() or "?"
+    except OSError:
+        return "?"
+
+
+def holder_state(pid: int) -> str:
+    """The one-letter run state (field 3 of ``/proc/<pid>/stat``: R, S, D, Z...); ``?`` if unreadable."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return "?"
+
+
 def _read_proc_starttime(pid: int) -> str | None:
     """Read field 22 (starttime, in clock ticks since boot) from /proc/<pid>/stat.
 
@@ -443,6 +480,76 @@ def _read_proc_starttime(pid: int) -> str | None:
         return raw.rsplit(")", 1)[1].split()[19]
     except (IndexError, ValueError):
         return None
+
+
+def _read_proc_pgid(pid: int) -> int | None:
+    """Read field 5 (pgrp) from /proc/<pid>/stat; None if the process is gone or unreadable."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    try:
+        return int(raw.rsplit(")", 1)[1].split()[2])
+    except (IndexError, ValueError):
+        return None
+
+
+# The broker's own device work: every probe it spawns (the fabric check, the health probes, each in
+# its own session, so its pid is its process group) and each non-tenant holder it SIGKILLed when a
+# chip left the bus. Such a process can sit for seconds mid-exit, still named by the driver with its
+# fd table already gone, and a holder scan then reads incomplete: the host rung was denied as "a
+# tenant holds the device" over the broker's own killed fabric check (spec 04 I59). pid -> (starttime
+# at registration, monotonic expiry). A pid no longer in /proc matches by number alone, since a gone
+# pid cannot have been handed to anyone else yet; a live one must keep its starttime.
+BROKER_INTERNAL_TTL_SEC = 600.0
+_broker_internal: dict[int, tuple] = {}
+
+
+def note_broker_internal(pid: int, *, now: float | None = None) -> None:
+    """Record ``pid`` (and the process group it leads) as the broker's own device work."""
+    now = time.monotonic() if now is None else now
+    _broker_internal[pid] = (_read_proc_starttime(pid), now + BROKER_INTERNAL_TTL_SEC)
+
+
+def _clear_broker_internal() -> None:
+    """Forget every registered broker-internal pid (tests)."""
+    _broker_internal.clear()
+
+
+def is_broker_internal(pid: int, *, now: float | None = None) -> bool:
+    """True when ``pid`` is broker-internal device work registered by :func:`note_broker_internal`:
+    the pid itself (same starttime, or gone from /proc) or a member of a process group it leads."""
+    now = time.monotonic() if now is None else now
+    for k in [k for k, (_, exp) in _broker_internal.items() if exp <= now]:
+        del _broker_internal[k]
+    entry = _broker_internal.get(pid)
+    if entry is not None:
+        start = _read_proc_starttime(pid)
+        if start is None or entry[0] is None or start == entry[0]:
+            return True
+    # Linux never hands out a pid equal to a live process group's id, so a member of the group a
+    # registered probe leads is that probe's child, whether or not the leader is still alive.
+    pgid = _read_proc_pgid(pid)
+    return pgid is not None and pgid != pid and pgid in _broker_internal
+
+
+def discount_broker_internal(scan):
+    """``scan`` with the broker's own device work taken out: its holders (never one in a broker job
+    or exec scope, which is a tenant's job) and the gaps a broker-internal pid caused. A scan that was
+    incomplete only because of those reads complete. Every other gap stays, so the scan still fails
+    closed on anything it could not see. Returns ``scan`` itself when nothing applies."""
+    gap_pids = getattr(scan, "gap_pids", None)
+    if not _broker_internal or gap_pids is None or len(gap_pids) != len(scan.gaps):
+        return scan
+    holders = [h for h in scan.holders if getattr(h, "scoped", False) or not is_broker_internal(h.pid)]
+    kept = [(why, pid) for why, pid in zip(scan.gaps, gap_pids) if pid is None or not is_broker_internal(pid)]
+    if len(holders) == len(scan.holders) and len(kept) == len(scan.gaps):
+        return scan
+    out = HolderScan(holders=holders, complete=scan.complete or not kept, source=scan.source)
+    out.gaps = [why for why, _ in kept]
+    out.gap_pids = [pid for _, pid in kept]
+    return out
 
 
 def _read_proc_ppid(pid: int) -> int | None:
