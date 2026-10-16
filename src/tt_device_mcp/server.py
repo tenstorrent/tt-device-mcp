@@ -4712,6 +4712,11 @@ def _stack_versions() -> dict:
     return env
 
 
+# What holds the device pollers stopped across more than one reset, or None. While set, a restart
+# asked for by a reset inside it is deferred to that holder (see _pollers_quiesced_for).
+_pollers_held_for: Optional[str] = None
+
+
 async def _set_device_pollers(active: bool, log) -> list[str]:
     """Stop (or restart) the daemons that continuously poll every chip.
 
@@ -4723,6 +4728,11 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
 
     Best-effort by design: a poller we cannot stop must not block the recovery.
     """
+    if active and _pollers_held_for:
+        # A wider quiesce (the startup fabric check) still owns the bus: a reset inside it restores
+        # nothing, so its post-reset verify runs on the same quiet bus. The owner restarts them.
+        log(f"device pollers kept stopped: {_pollers_held_for} still running")
+        return []
     verb = "start" if active else "stop"
     touched = []
     for svc in DEVICE_POLLER_SERVICES:
@@ -4751,6 +4761,48 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         health_event("pollers_none_active", verb=verb, configured=list(DEVICE_POLLER_SERVICES), host_at_risk=not active)
     health_event("pollers_" + ("restarted" if active else "quiesced"), services=touched)
     return touched
+
+
+@asynccontextmanager
+async def _pollers_quiesced_for(what: str, log):
+    """Hold the device pollers stopped for the whole of ``what``, and start them again on every exit.
+
+    A reset already lands on a quiet bus (``reset_with_quiesce``). The startup fabric check pushes
+    traffic over every link of a mesh nobody has vouched for since the last broker or boot, and with
+    the pollers up it ran beside their MMIO at whatever chip that broker left wedged — the window in
+    which a host died 63 s after a broker restart with no reset running. A reset the check climbs to
+    inside this block defers its own restore here, so its post-reset verify runs on the same quiet bus.
+
+    Best-effort, as for a reset: a poller that will not stop never blocks the check. The restart is
+    skipped only while a reset scope is still cycling the chips off the bus (a timed-out or abandoned
+    reset), where restarting them is the MMIO-at-a-dead-endpoint hazard the reset path also avoids;
+    the health probe re-arms them once the device is idle and healthy. Costs one ``systemctl stop``
+    before the check and one ``start`` after it, each bounded at 30 s per unit."""
+    global _pollers_held_for
+    stopped: list[str] = []
+    try:
+        stopped = await _set_device_pollers(False, log)
+    except Exception as exc:  # noqa: BLE001 - best-effort: never blocks the check
+        log(f"could not stop the device pollers before {what}: {exc!r}")
+    held_before = _pollers_held_for
+    if stopped and not held_before:
+        _pollers_held_for = what
+    try:
+        yield stopped
+    finally:
+        if stopped and not held_before:
+            _pollers_held_for = None
+            cycling = None
+            try:
+                mech = recovery_mechanism
+                cycling = await asyncio.to_thread(mech.scope_active) if mech is not None else None
+            except Exception:  # noqa: BLE001 - an unreadable scope list reads as none running
+                cycling = None
+            if cycling:
+                log(f"device pollers left stopped after {what}: reset {cycling} is still cycling the chips")
+                health_event("pollers_left_quiesced", after=what, scope=str(cycling))
+            else:
+                await asyncio.shield(_set_device_pollers(True, log))
 
 
 def _auto_reboot_enabled() -> bool:
@@ -9870,6 +9922,11 @@ def _journal_startup_hold_released(
         logger.info(f"STARTUP hold released after {int(held_s)}s (last why: {closed.why})")
 
 
+def _startup_pollers_log(msg: str) -> None:
+    if logger:
+        logger.info(f"STARTUP FABRIC {msg}")
+
+
 async def _verify_fabric_on_start() -> None:
     """Prove the mesh moves data, not merely that every chip answers.
 
@@ -9904,7 +9961,9 @@ async def _verify_fabric_on_start() -> None:
         if not await _await_startup_hugepages():
             missing = missing or "hugepages not yet allocated"
         else:
-            await _device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+            # On a quiet bus, as every reset already is: see _pollers_quiesced_for.
+            async with _pollers_quiesced_for("the startup fabric check", _startup_pollers_log):
+                await _device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
         if missing and _fabric_77_only_hold():
             _startup_prereq_task = asyncio.create_task(_await_startup_prerequisites(missing))
     except Exception as e:  # noqa: BLE001 - startup must survive a check that cannot run
