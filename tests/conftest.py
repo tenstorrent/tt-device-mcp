@@ -394,6 +394,12 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv, "device_op_active", "")
     monkeypatch.setattr(srv, "device_op_detail", "")
     monkeypatch.setattr(srv, "device_op_owner", "[broker]", raising=False)
+    # A runner test cancelled mid-job never reaches the runner's own cleanup, so the dispatched
+    # job's id stays current; a re-adopt test can leave its scope behind the same way. Either one
+    # makes the next test's device look busy (_broker_work_in_flight refuses every step).
+    monkeypatch.setattr(srv, "current_job_id", None)
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "readopted_scopes", {})
     # The device-op mutex is created once and binds to the creating test's event loop; a later
     # test on its own loop acquiring the stale lock raises "bound to a different event loop".
     # Fresh per test, so anything running under _device_op (the startup probe included) is safe.

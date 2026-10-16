@@ -1624,6 +1624,21 @@ async def test_a_step_that_waits_past_its_deadline_reports_inconclusive(monkeypa
         current_peer_uid.reset(tok)
 
 
+def test_a_runner_test_cancelled_mid_job_leaves_its_job_current():
+    """First of an ordered pair: writes what a runner test cancelled mid-job (and a re-adopt test
+    that never saw its scope end) leaves behind, without monkeypatch, so nothing here undoes it."""
+    srv.current_job_id = "leaked-043"
+    srv.readopted_scopes["leaked-907"] = "ttdev-job-leaked-907.scope"
+
+
+def test_the_next_test_starts_with_no_current_job_or_readopted_scope():
+    """Second of the pair: the fixtures must hand every test an idle device. A leaked
+    current_job_id or readopted scope made _broker_work_in_flight refuse every step, so a pre-step
+    test waiting for its gate to start timed out instead (seen only in a full-suite run)."""
+    assert srv.current_job_id is None, srv.current_job_id
+    assert srv.readopted_scopes == {}, srv.readopted_scopes
+
+
 def test_the_reservation_refcounts_so_one_release_cannot_free_another_holder():
     """Kept as a unit property even though the step routes now serialize and cannot produce two
     simultaneous holders: the release path is token-keyed so a second holder (a future caller, or
