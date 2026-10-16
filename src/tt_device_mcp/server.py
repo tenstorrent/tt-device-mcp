@@ -6428,6 +6428,13 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             device_hold_escalation_trigger = f"the {offbus_power_cycle.grace_sec()}s gated off-bus grace"
         if _maybe_spawn_forced_escalation():
             offbus_power_cycle.mark_spawned(device_hold_episode_since)
+    # A power cycle its min interval alone refused gets one forced pass as the interval ends, not at the
+    # next ceiling window, which can be most of a window late.
+    if not only_77 and recovery_mechanism.power_cycle_retry_due(now.timestamp() if now else None):
+        device_hold_escalation_kind = "power_cycle_interval_expiry"
+        device_hold_escalation_trigger = "the end of the power cycle's min interval"
+        if _maybe_spawn_forced_escalation():
+            recovery_mechanism.clear_power_cycle_retry()
     if only_77:
         pass
     elif isolated_chips and not device_hold_offbus_escalated and age >= _offbus_hold_ceiling_sec():
