@@ -433,3 +433,114 @@ async def test_replay_all_off_after_a_restart_cycles_with_no_second_reset(rig, m
     g.tray_down_episode_end()
     await _gate(rig, galaxy.STAGE_SMI_RESET, phase=phase)
     assert rig["order"] == ["power_cycle"], "no second reset on the same all-off mesh"
+
+
+# ---- class A with no tray map (a broker that never read a full mesh) -----------------------------
+
+# tt-smi's UBB bus groups, one per tray (BH: tray 1 0x00, 2 0x40, 3 0xC0, 4 0x80).
+UBB_TABLES = {
+    "tt-galaxy-bh": {1: 0x00, 2: 0x40, 3: 0xC0, 4: 0x80},
+    "tt-galaxy-wh": {1: 0xC0, 2: 0x80, 3: 0x00, 4: 0x40},
+}
+GROUPS = {0x00, 0x40, 0x80, 0xC0}
+
+
+def _present(groups: dict) -> dict:
+    """``{chip id: bus}`` for ``{group: n present}``, chips numbered in order as a short boot does."""
+    buses = [g + 1 + k for g, n in sorted(groups.items()) for k in range(n)]
+    return dict(enumerate(buses))
+
+
+def test_whole_trays_absent_reads_class_a_from_bus_presence_alone():
+    def absent(groups, off, expected=EXPECTED, tray_groups=GROUPS):
+        return galaxy._whole_trays_absent(_present(groups), expected, off, tray_groups)
+
+    assert absent({0x00: 8, 0x40: 8, 0x80: 8}, 8), "one tray (0xC0) with no chip on the bus"
+    assert absent({0x40: 8}, 24), "three trays off, one still on"
+    assert not absent({0x00: 8, 0x40: 8, 0x80: 7}, 9), "a tray with a chip missing is not whole"
+    assert not absent({0x00: 8, 0x40: 8, 0x80: 8}, 9), "a stray off-bus chip the empty tray does not explain"
+    assert not absent({0x00: 8, 0x40: 8, 0x80: 8, 0xC0: 8}, 8), "every tray full: off-bus chips unexplained"
+    assert not absent({0x00: 8, 0x40: 8, 0x80: 8}, 8, tray_groups=()), "no tt-smi tables, no class"
+    assert not absent({0x00: 8, 0x40: 8, 0x80: 8}, 8, expected=24), "not a four-tray host"
+    assert not galaxy._whole_trays_absent({0: 0x01, 1: 0x21}, EXPECTED, 30, GROUPS), "a bus in no known group"
+    assert not galaxy._whole_trays_absent({}, EXPECTED, 32, GROUPS), "no chip on the bus is class C's, not A's"
+    assert not galaxy._whole_trays_absent({0: None}, EXPECTED, 31, GROUPS)
+
+
+def test_the_class_reads_presence_only_with_no_map():
+    off24 = set(range(24, 32))
+    present = _present({0x00: 8, 0x40: 8, 0x80: 8})
+    cls = galaxy._power_cycle_direct_class
+    assert cls(off24, EXPECTED, None, mesh_reset_failed=False, present_buses=present, tray_groups=GROUPS) == "A"
+    assert cls(off24, EXPECTED, None, mesh_reset_failed=False) is None, "no map and no presence read"
+    partial = _present({0x00: 8, 0x40: 8, 0x80: 7, 0xC0: 1})
+    assert cls(off24, EXPECTED, None, mesh_reset_failed=False, present_buses=partial, tray_groups=GROUPS) is None
+
+
+@pytest.fixture
+def short_boot(rig, monkeypatch):
+    """The broker came up on 24 of 32 chips: no full read, so no tray map is banked (I16), and the
+    24 chips on the bus fill trays 1, 2 and 4."""
+    monkeypatch.setattr(rig["g"], "_tray_map_now", lambda: None)
+    monkeypatch.setattr(galaxy, "_ubb_bus_id_tables", lambda: UBB_TABLES)
+    rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 8})
+    monkeypatch.setattr(galaxy, "chip_pci_bdfs", lambda: {i: f"0000:{b:02x}:00.0" for i, b in rig["present"].items()})
+    rig["beats"] = _beats_without(set(range(24, 32)))
+    return rig
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["startup", "post-job"])
+async def test_a_whole_tray_drop_with_no_map_cycles_at_the_first_gate_pass(short_boot, phase):
+    """Spec 04 I37: below the reset floor the router names the tray rung; with no banked map the
+    class is read from the buses on the bus, so the cycle is requested now, not after the 600 s
+    ceiling and a mesh reset that has never healed a whole tray."""
+    rig = short_boot
+    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase=phase) == galaxy.OUTCOME_WAITING
+    assert "glx_reset" not in rig["order"] and "ubb_tray" not in rig["order"] and "sweep" not in rig["order"]
+    assert rig["order"][-1] == "power_cycle"
+    ((_, fired),) = [(k, f) for k, f in rig["events"] if k == "power_cycle_direct"]
+    assert fired["fault_class"] == galaxy.FAULT_CLASS_WHOLE_TRAY and fired["phase"] == "firing"
+    assert "released" not in rig["order"], "the boot after the cycle runs the full startup check"
+
+
+@pytest.mark.asyncio
+async def test_the_hold_deadline_climb_with_no_map_cycles_with_no_reset(short_boot):
+    rig = short_boot
+    assert await rig["g"].escalate("offbus-forced", [], EXPECTED, lambda m: None) == galaxy.OUTCOME_TERMINAL
+    assert "glx_reset" not in rig["order"] and rig["order"][-1] == "power_cycle"
+
+
+@pytest.mark.asyncio
+async def test_a_partial_drop_with_no_map_keeps_the_ladder(short_boot):
+    rig = short_boot
+    rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 7, 0xC0: 1})
+    await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup")
+    assert "power_cycle" not in rig["order"] and "power_cycle_direct" not in _kinds(rig)
+
+
+@pytest.mark.asyncio
+async def test_inside_the_cooldown_the_deadline_shows_at_once_and_no_reset_runs(short_boot, monkeypatch):
+    """Spec 04 I65 unchanged: the cooldown refuses the cycle for a bounded wait; /health shows the
+    deadline from the first gate pass, the watchdog re-asks then, and nothing resets meanwhile."""
+    import time
+    from datetime import datetime
+
+    rig, g = short_boot, short_boot["g"]
+    until = time.time() + 1800
+    monkeypatch.setattr(g.mechanism, "power_cycle_cooldown_state", None)
+    monkeypatch.setattr(g.mechanism, "power_cycle_retry", None)
+    cooldown = {"until": until, "last": until - 3600, "cause": "host boot", "interval_sec": 3600, "why": "cooldown"}
+    monkeypatch.setattr(
+        g.mechanism, "auto_recovery_allowed", lambda action, **k: g.mechanism._deny_power_cycle(dict(cooldown))
+    )
+    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup") == galaxy.OUTCOME_WAITING
+    assert rig["order"][-1] == "denied"
+    assert not {"glx_reset", "ubb_tray", "sweep", "power_cycle"} & set(rig["order"]), "no reset meanwhile"
+    assert g.mechanism.power_cycle_retry[0] == until
+    monkeypatch.setattr(srv, "recovery_mechanism", g.mechanism)
+    monkeypatch.setattr(srv, "_device_hold_state", lambda now=None: ("tray off", srv.device_hold_episode_since))
+    shown = srv._health_payload()["power_cycle_cooldown"]["next_deadline"]
+    assert shown == datetime.fromtimestamp(until).isoformat(timespec="seconds")
+    note = srv._hold_escalation_note(8)
+    assert datetime.fromtimestamp(until).strftime("%H:%M:%S") in note and "~2 min" not in note

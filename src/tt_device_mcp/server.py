@@ -3556,12 +3556,32 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
     """What happens next to a hold, stated only as far as it is armed (spec 03 I55): a message that
     promises an escalation the host switched off sends the operator to wait for nothing."""
     if _force_escalate_enabled():
+        ceiling_min = max(1, round(_stuck_hold_ceiling_sec() / 60))
+        cooldown = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
+        if cooldown is not None and time.time() < cooldown["until"]:
+            # Spec 04 I65: the power cycle this hold needs was refused for a bounded wait; the
+            # watchdog asks again at its end, so that, not the ceiling, is the next step.
+            until = datetime.fromtimestamp(cooldown["until"]).strftime("%H:%M:%S")
+            return (
+                f"Its power cycle waits for the cooldown ({cooldown['cause']}) and is asked again at "
+                f"{until} — /health power_cycle_cooldown.next_deadline."
+            )
+        if off_bus > 0 and isolated_chips:
+            first = max(1, round(_offbus_hold_ceiling_sec() / 60))
+            return (
+                f"The off-bus ladder escalates in ~{first} min (isolated chips) and again at each "
+                f"{ceiling_min}-min hold ceiling — do not plan around waiting the wedge out."
+            )
         if off_bus > 0:
             return (
-                "The off-bus ladder escalates in ~2 min and no hold outlives the 10-min ceiling — do "
-                "not plan around waiting the wedge out."
+                f"A whole-tray drop goes to the power cycle at once (spec 04 I37); any other off-bus "
+                f"hold climbs at the {ceiling_min}-min hold ceiling — do not plan around waiting the "
+                f"wedge out."
             )
-        return "The ladder escalates at the 10-min hold ceiling — do not plan around waiting the wedge out."
+        return (
+            f"The ladder escalates at the {ceiling_min}-min hold ceiling — do not plan around waiting "
+            f"the wedge out."
+        )
     if _selfheal_relift_enabled():
         return (
             "Forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0): only the idle self-heal relift "

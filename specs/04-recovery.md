@@ -766,7 +766,14 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I37 — A whole-tray or all-off drop goes to the power cycle with no reset first (classes A
   and C).** An exception to I19, I22 and I27 for two off-bus classes no further reset has been seen
   to heal. Class A: the off-bus set is exactly one or more whole UBB trays (the I16 tray map places
-  every chip) and at least one chip is still on the bus. Class C: every chip is off the bus after a
+  every chip) and at least one chip is still on the bus. A broker with no tray map (it never read a
+  full mesh, as on a boot that came up short) reads class A from presence instead: the chips still
+  on the bus, read live from sysfs and grouped by tt-smi's UBB bus groups (`bus & 0xF0`), fill whole
+  trays, at least one tray has none, and those trays' chips are exactly the off-bus count; anything
+  else, or no tt-smi tables, is not class A. So a whole-tray drop at the startup gate or at the hold
+  deadline requests the cycle at its first pass, not after the hold ceiling and a mesh reset; inside
+  the I65 cooldown the denial puts the deadline on /health at that pass and the watchdog asks again
+  then. Class C: every chip is off the bus after a
   mesh reset already ran and failed (nonzero exit or unhealthy verify) since the mesh was last
   released (or this boot, I58), or after a host reboot or power cycle the broker started for this
   fault: the boot it brought up, or one requested this boot since the hold episode began. A
@@ -1363,6 +1370,9 @@ sees a silent fabric pass.
 | I37 the hold-deadline climb waives an unreadable holder scan and cycles; a running job or a readable tenant still holds it, and nothing is released before the startup check | `tests/test_classac_power_cycle_direct.py::test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant` |
 | I37 the host rung's last-chance sweep skips itself for classes A and C | `tests/test_classac_power_cycle_direct.py::test_the_last_chance_sweep_skips_itself_for_a_and_c` |
 | I37 / goal of 03 I4: after the cycle the startup gate waits for hugepages and runs the fabric pass; a failed check keeps the hold | `tests/test_classac_power_cycle_direct.py::test_after_the_cycle_the_startup_gate_awaits_hugepages_and_the_fabric`, `::test_a_failed_startup_check_after_the_cycle_keeps_the_hold` |
+| I37 class A with no tray map: read from the buses still on the bus; a partial tray, a stray chip, unknown groups or no tables are not class A | `tests/test_classac_power_cycle_direct.py::test_whole_trays_absent_reads_class_a_from_bus_presence_alone`, `::test_the_class_reads_presence_only_with_no_map` |
+| I37 class A with no tray map (a short boot): the first gate pass, startup or run time, and the hold-deadline climb request the cycle with no mesh reset, tray re-power or sweep; a partial drop keeps the ladder | `tests/test_classac_power_cycle_direct.py::test_a_whole_tray_drop_with_no_map_cycles_at_the_first_gate_pass`, `::test_the_hold_deadline_climb_with_no_map_cycles_with_no_reset`, `::test_a_partial_drop_with_no_map_keeps_the_ladder` |
+| I37/I65 class A with no map inside the cooldown: the first pass is denied with the deadline on /health and in the hold message, and nothing resets | `tests/test_classac_power_cycle_direct.py::test_inside_the_cooldown_the_deadline_shows_at_once_and_no_reset_runs` |
 | I37 time to recover (fake clock): class A requests the cycle in the first window, class C after one failed reset | `tests/test_classac_power_cycle_direct.py::test_time_to_recover_on_a_fake_clock` |
 | I38 partial off-bus (one chip, four chips): the power cycle fires right after the one failed reset, 252 s vs 924 s and 383 s vs 1186 s from onset; a denied cycle is asked again the next window with no reset between | `tests/test_no_repeat_failed_rung.py::test_partial_offbus_power_cycles_right_after_the_failed_reset`, `::test_a_denied_power_cycle_after_the_failed_reset_is_retried_next_window` |
 | I38 with I65: a partial off-bus whose reset failed within the cooldown after a host boot skips the ceiling wait and the sweep, holds with the cooldown deadline set and no second reset, then cycles once the cooldown has run out | `tests/test_no_repeat_failed_rung.py::test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cycle_cooldown` |
