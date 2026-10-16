@@ -751,6 +751,8 @@ class Job:
     # "fabric" / "eth" for an operator verification job (see operator_verification_kind), else "".
     # Derived from command + peer_uid on submit and on restore, never read from a spec file.
     verification: str = ""
+    # The reset clock when a verification job started; its pass lifts nothing if a reset ran since.
+    reset_clock_at_start: Optional[float] = None
 
     @property
     def runtime_sec(self) -> Optional[float]:
@@ -3609,15 +3611,15 @@ def _fabric_77_eth_drop() -> str:
     return drop
 
 
-def _fabric_hold_only() -> bool:
+def _fabric_hold_only(own_op: str = "") -> bool:
     """Whether the open hold is a fabric_unverified hold and nothing else (spec 01 I21).
 
-    No broker device op is running, the hold's why is the missing fabric verdict, nothing is dirty,
+    No broker device op is running (bar ``own_op``, the caller's own), the hold's why is the missing fabric verdict, nothing is dirty,
     the runtime named no fault, and no chip is off the bus right now. That is the one hold an
     operator verification job may pass, and the one its fabric pass may lift: every other hold
     names a fault that a check run on the device cannot clear."""
     return (
-        not device_op_active
+        device_op_active in ("", own_op)
         and fsm.state in (ServerState.RECOVERING, ServerState.DOWN)
         and fsm.record.why == FABRIC_RELIFT_WHY
         and not fsm.record.dirty
@@ -8587,13 +8589,19 @@ def _job_ttdev_env(job: "Job") -> dict:
     return {k: v for k, v in base.items() if k.startswith("TTDEV_")}
 
 
-def _settle_verification_job(job: "Job") -> bool:
+VERIFICATION_LIFT_OP = "verification-lift"
+
+
+async def _settle_verification_job(job: "Job") -> bool:
     """Lift a fabric_unverified hold on an operator fabric check that passed (spec 01 I21).
 
     Only the broker-shipped fabric check, run with no arguments and the broker's own TTDEV_*
     environment, completed with exit 0, while the hold is still fabric-only: that is the same
     pass the idle relift would run, so its verdict is the broker's. An eth probe never lifts
-    (it proves the eth cores, not the fabric). Returns True when it lifted the hold."""
+    (it proves the eth cores, not the fabric). The pass is the fabric half of the full check; the
+    broker then runs the enum+ARC half itself and lifts only on a healthy read with no reset since
+    the check started, so the full check, fabric included, has passed after the last reset (spec
+    03 I4). Returns True when it lifted the hold."""
     if job.verification != "fabric":
         return False
     if job.status != JobStatus.COMPLETED or job.exit_code != 0:
@@ -8614,12 +8622,47 @@ def _settle_verification_job(job: "Job") -> bool:
             )
         health_event("verification_not_lifted", job_id=job.id, reason="env mismatch", keys=differs)
         return False
-    _clear_device_dirty(verified=True, why=f"operator verification job {job.id} passed")
-    if health_monitor is not None:
-        health_monitor.last_fabric_ok = True
+
+    def _log(msg: str) -> None:
+        if logger:
+            logger.info(f"CLEAN-GATE verification job {job.id}: {msg}")
+
+    def _not_lifted(reason: str) -> bool:
+        if logger:
+            logger.warning(
+                f"CLEAN-GATE verification job {job.id} passed the fabric check, but {reason}: the hold stays"
+            )
+        health_event("verification_not_lifted", job_id=job.id, reason=reason)
+        return False
+
+    def _reset_since_start() -> bool:
+        return job.reset_clock_at_start is None or recovery_mechanism.last_reset_monotonic != job.reset_clock_at_start
+
+    if _reset_since_start():
+        return _not_lifted("a reset ran since the check started")
+    indices = _present_chip_indices()
+    if not indices:
+        return _not_lifted("no chip is present")
+    expected = health_monitor.expected(len(indices))
+    async with _device_op(VERIFICATION_LIFT_OP):
+        healthy, evidence = await fsm.observe(
+            expected, _log, run_fabric=False, phase="post-job", recovery=select_recovery()
+        )
+        # Re-checked after the read: the sampler's dead-chip path is lock-free and a fault can land
+        # during the await.
+        if not healthy:
+            return _not_lifted("the enum+ARC read is not healthy")
+        if _reset_since_start():
+            return _not_lifted("a reset ran since the check started")
+        if not _fabric_hold_only(own_op=VERIFICATION_LIFT_OP):
+            return _not_lifted("the hold is no longer fabric-only")
+        _clear_device_dirty(verified=True, why=f"operator verification job {job.id} passed")
+        if health_monitor is not None:
+            health_monitor.last_fabric_ok = True
     if logger:
-        logger.info(f"CLEAN-GATE operator verification job {job.id} passed the fabric check: hold lifted")
+        logger.info(f"CLEAN-GATE operator verification job {job.id} passed the fabric check and enum+ARC: hold lifted")
     health_event("verification_lifted_hold", job_id=job.id)
+    health_event("device_relift", evidence=evidence)
     return True
 
 
@@ -8845,6 +8888,8 @@ async def _job_runner_loop():
         async with get_lock():
             job.status = JobStatus.RUNNING
             job.started_at = datetime.now().isoformat()
+            if job.verification:
+                job.reset_clock_at_start = recovery_mechanism.last_reset_monotonic
             _update_queue_depth_metric()
             # Track device became busy
             if stats:
@@ -9444,7 +9489,7 @@ export {JOB_TAG_ENV}={job_tag}
                 # triggers — before it starts.
                 if job.verification:
                     try:
-                        _settle_verification_job(job)
+                        await _settle_verification_job(job)
                     except Exception as e:  # noqa: BLE001 - never crash the runner
                         if logger:
                             logger.error(f"JOB_RUNNER verification settle error for job_id={job_id}: {e}")

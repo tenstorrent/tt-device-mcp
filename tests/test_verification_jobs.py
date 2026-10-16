@@ -47,6 +47,27 @@ def fabric_hold(monkeypatch):
 
 
 @pytest.fixture
+def enum_arc(monkeypatch):
+    """The broker's own enum+ARC read after a passing check: healthy unless a test says otherwise.
+    ``calls`` records each read's run_fabric; ``during`` runs inside the read (a fault landing)."""
+    state = {"healthy": True, "calls": [], "during": None}
+    monkeypatch.setattr(srv, "_present_chip_indices", lambda: ["0", "1"])
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: 2)
+    monkeypatch.setattr(srv, "device_op_lock", None)
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 100.0)
+
+    async def _observe(expected, log, *, run_fabric=True, **k):
+        state["calls"].append(run_fabric)
+        if state["during"]:
+            state["during"]()
+        return state["healthy"], {"snapshot": {"ok": state["healthy"]}}
+
+    monkeypatch.setattr(srv.fsm, "observe", _observe)
+    return state
+
+
+@pytest.fixture
 def events(monkeypatch):
     seen = []
     monkeypatch.setattr(srv, "health_event", lambda kind, **f: seen.append((kind, f)))
@@ -233,7 +254,7 @@ def _queue(job, tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_held_tenant_yields_to_a_verification_job_that_lifts_the_hold(
-    monkeypatch, tmp_path, clear_job_state, broker_root, fabric_hold, events
+    monkeypatch, tmp_path, clear_job_state, broker_root, fabric_hold, enum_arc, events
 ):
     """The whole path: a tenant job held on a fabric-only hold, an operator fabric check queued
     behind it. The tenant hands the runner back, the check runs through the hold, its pass lifts
@@ -259,6 +280,7 @@ async def test_a_held_tenant_yields_to_a_verification_job_that_lifts_the_hold(
     assert datetime.fromisoformat(check.started_at) < datetime.fromisoformat(tenant.started_at)
     assert srv.fsm.state is ServerState.HEALTHY
     assert srv.health_monitor.last_fabric_ok is True
+    assert enum_arc["calls"] == [False], "the broker read enum+ARC after the check, before the tenant"
     kinds = [k for k, _ in events]
     assert "verification_passes_hold" in kinds and "verification_lifted_hold" in kinds
     assert "[VERIFICATION]" in (tmp_path / "202.log").read_text()
@@ -309,22 +331,55 @@ async def test_a_held_tenant_does_not_yield_without_a_waiting_verification_job(
 
 def _finished(job, exit_code=0, status=srv.JobStatus.COMPLETED):
     job.status, job.exit_code = status, exit_code
+    job.reset_clock_at_start = srv.recovery_mechanism.last_reset_monotonic  # as the runner sets it
     return job
 
 
-def test_a_passing_fabric_check_lifts_the_hold(broker_root, fabric_hold, events):
+@pytest.mark.asyncio
+async def test_a_passing_fabric_check_lifts_the_hold(broker_root, fabric_hold, enum_arc, events):
+    """The check is the fabric half; the broker's own enum+ARC read is the other, and the hold
+    lifts only once both passed with no reset since the check started (01 I21)."""
     job = _finished(_job("501", f"{broker_root}/fabric-check.sh", peer_uid=0))
-    assert srv._settle_verification_job(job)
+    assert await srv._settle_verification_job(job)
+    assert enum_arc["calls"] == [False], "one enum+ARC read, no second fabric pass"
     assert srv.fsm.state is ServerState.HEALTHY
     assert srv.health_monitor.last_fabric_ok is True
     assert [k for k, _ in events if k.startswith("verification_")] == ["verification_lifted_hold"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["unhealthy", "reset_during_check", "reset_during_read", "fault_during_read", "never_started"]
+)
+async def test_a_passing_check_without_the_full_check_after_the_last_reset_does_not_lift(
+    monkeypatch, broker_root, fabric_hold, enum_arc, events, case
+):
+    """A passing fabric check lifts nothing unless enum+ARC also read healthy and no reset ran since
+    the check started; a failed read keeps the device held for the bounded recovery (01 I21)."""
+    job = _finished(_job("506", f"{broker_root}/fabric-check.sh", peer_uid=0))
+    if case == "unhealthy":
+        enum_arc["healthy"] = False
+    elif case == "reset_during_check":
+        monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 200.0)
+    elif case == "reset_during_read":
+        enum_arc["during"] = lambda: setattr(srv.recovery_mechanism, "last_reset_monotonic", 200.0)
+    elif case == "fault_during_read":
+        enum_arc["during"] = lambda: srv.fsm.on_fault("job_killed", detail="chip 1 isolated", dirty=True)
+    else:
+        job.reset_clock_at_start = None
+    assert not await srv._settle_verification_job(job)
+    assert enum_arc["calls"] == ([] if case in ("reset_during_check", "never_started") else [False])
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert srv.health_monitor.last_fabric_ok is None
+    assert [k for k, _ in events if k.startswith("verification_")] == ["verification_not_lifted"]
 
 
 @pytest.mark.parametrize(
     "case",
     ["exit_1", "failed", "args", "eth", "tenant", "hold_changed"],
 )
-def test_nothing_else_lifts_the_hold(monkeypatch, broker_root, fabric_hold, case):
+@pytest.mark.asyncio
+async def test_nothing_else_lifts_the_hold(monkeypatch, broker_root, fabric_hold, enum_arc, case):
     cmd, uid, exit_code, status = f"{broker_root}/fabric-check.sh", 0, 0, srv.JobStatus.COMPLETED
     if case == "exit_1":
         exit_code = 1
@@ -339,34 +394,39 @@ def test_nothing_else_lifts_the_hold(monkeypatch, broker_root, fabric_hold, case
     job = _finished(_job("502", cmd, peer_uid=uid), exit_code, status)
     if case == "hold_changed":
         srv.fsm.on_fault(srv.FABRIC_RELIFT_WHY, detail="job ended failed", dirty=True)
-    assert not srv._settle_verification_job(job)
+    assert not await srv._settle_verification_job(job)
     assert srv.fsm.state is not ServerState.HEALTHY
     assert srv.health_monitor.last_fabric_ok is None
+    assert enum_arc["calls"] == []
 
 
-def test_a_check_run_with_another_environment_does_not_lift(monkeypatch, broker_root, fabric_hold, events):
+@pytest.mark.asyncio
+async def test_a_check_run_with_another_environment_does_not_lift(
+    monkeypatch, broker_root, fabric_hold, enum_arc, events
+):
     monkeypatch.setenv("TTDEV_FABRIC_DESCRIPTOR", "/opt/descriptors/galaxy.yaml")
     job = _finished(
         _job(
             "503", f"{broker_root}/fabric-check.sh", peer_uid=0, env_vars={"TTDEV_FABRIC_DESCRIPTOR": "/tmp/mine.yaml"}
         )
     )
-    assert not srv._settle_verification_job(job)
+    assert not await srv._settle_verification_job(job)
     assert srv.fsm.state is not ServerState.HEALTHY
     assert [k for k, _ in events] == ["verification_not_lifted"]
     assert events[0][1]["keys"] == ["TTDEV_FABRIC_DESCRIPTOR"]
 
 
-def test_under_privsep_the_job_env_is_only_its_env_vars(monkeypatch, broker_root, fabric_hold):
+@pytest.mark.asyncio
+async def test_under_privsep_the_job_env_is_only_its_env_vars(monkeypatch, broker_root, fabric_hold, enum_arc):
     """A non-root job under privsep does not inherit the broker's environment, so a job whose
     env_vars leave out the broker's TTDEV_* settings ran another check; one that carries them lifts."""
     monkeypatch.setattr(srv, "should_privsep", lambda env=None: True)
     monkeypatch.setenv(srv.OPERATOR_UIDS_ENV, "1000")
     cmd = f"{broker_root}/fabric-check.sh"
-    assert not srv._settle_verification_job(_finished(_job("504", cmd, peer_uid=1000)))
+    assert not await srv._settle_verification_job(_finished(_job("504", cmd, peer_uid=1000)))
     broker = {k: v for k, v in os.environ.items() if k.startswith("TTDEV_")}
     assert broker, "the suite sets TTDEV_* for the broker"
-    assert srv._settle_verification_job(_finished(_job("505", cmd, peer_uid=1000, env_vars=dict(broker))))
+    assert await srv._settle_verification_job(_finished(_job("505", cmd, peer_uid=1000, env_vars=dict(broker))))
     assert srv.fsm.state is ServerState.HEALTHY
 
 
