@@ -997,6 +997,9 @@ device_hold_escalate_bucket: int = 0
 # One early forced escalation per off-bus episode, tracked apart from the ceiling windows so it adds
 # an attempt rather than consuming one (see _offbus_hold_ceiling_sec).
 device_hold_offbus_escalated: bool = False
+# The ceiling window the one-shot found claimed before it claimed its own (it waited out a tenant past
+# the ceiling), so giving the one-shot back gives that window back too; None while it holds no claim.
+device_hold_offbus_prior_bucket: Optional[int] = None
 # Whether the window above was given back because its forced run stood down on a live tenant (spec 04
 # I7): the next spawn first checks the tenant is gone, quietly, so a long tenant hold does not open a
 # device op, a timeline event and a log line every sampler tick (see _rearm_tenant_deferred_window).
@@ -6359,7 +6362,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global device_hold_deadline_bucket, device_hold_escalate_bucket
     global device_hold_offbus_escalated, device_hold_alert_next_bucket, device_hold_alert_gap
-    global device_hold_tenant_deferred
+    global device_hold_tenant_deferred, device_hold_offbus_prior_bucket
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
     global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold
     if reason and not device_hold_logged:
@@ -6453,6 +6456,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_escalate_bucket = 0
         # ...and its own early off-bus attempt.
         device_hold_offbus_escalated = False
+        device_hold_offbus_prior_bucket = None
         device_hold_tenant_deferred = False
         # ...and its held-job bound's attempt.
         device_hold_job_bound_escalated = False
@@ -6573,8 +6577,14 @@ def _rearm_tenant_deferred_window(kind: str) -> bool:
     waiting out the whole general ceiling once the tenant had gone. Only the one-shot and the ceiling
     windows are given back; the other kinds keep their own once-per-episode bookkeeping."""
     global device_hold_offbus_escalated, device_hold_escalate_bucket, device_hold_tenant_deferred
+    global device_hold_offbus_prior_bucket
     if kind == "offbus_one_shot":
         device_hold_offbus_escalated = False
+        # The window the one-shot claimed as its own run goes back with it: kept, a hold whose chips
+        # came back meanwhile (no one-shot to retry) waited out one more whole ceiling window.
+        if device_hold_offbus_prior_bucket is not None:
+            device_hold_escalate_bucket = device_hold_offbus_prior_bucket
+            device_hold_offbus_prior_bucket = None
     elif kind == "ceiling_window":
         device_hold_escalate_bucket = max(0, device_hold_escalate_bucket - 1)
     else:
@@ -6706,6 +6716,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     use; a missing or unparseable stamp is not held, so it is not flagged."""
     global device_hold_deadline_bucket, device_hold_escalate_bucket, device_hold_offbus_escalated
     global device_hold_risky_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
+    global device_hold_offbus_prior_bucket
     if not device_hold_episode_since:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
@@ -6775,7 +6786,8 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         if _maybe_spawn_forced_escalation():
             device_hold_offbus_escalated = True
             # A one-shot that waited out a tenant past the ceiling is that window's run as well: one
-            # forced climb, not two back to back.
+            # forced climb, not two back to back. Remember what it claimed over, to give back with it.
+            device_hold_offbus_prior_bucket = device_hold_escalate_bucket
             device_hold_escalate_bucket = max(device_hold_escalate_bucket, int(age // ceiling))
     elif recovery_mechanism is not None and recovery_mechanism.progress_retry_due(device_hold_episode_since):
         # spec 04 I39: a failed mesh reset brought chips back; its one retry runs now, not at the ceiling.
