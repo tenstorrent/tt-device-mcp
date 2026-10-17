@@ -757,8 +757,9 @@ async def test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false(mon
     await asyncio.sleep(0)
 
 
-def _present_hold_at_the_bound(r, monkeypatch, *, why, detail):
-    """A present-mesh hold of ``why``/``detail`` one second past the bound, on the rig's real ladder."""
+def _present_hold_at_the_bound(r, monkeypatch, *, why, detail, age=BOUND + 1):
+    """A present-mesh hold of ``why``/``detail`` ``age`` seconds old (one second past the bound unless
+    given), on the rig's real ladder."""
     r["beats"] = {str(i): 100 for i in range(EXPECTED)}  # every chip present with a live ARC
     fsm_dirty(srv, detail, why=why)
     monkeypatch.setattr(srv, "device_fault_reported", "")
@@ -768,7 +769,7 @@ def _present_hold_at_the_bound(r, monkeypatch, *, why, detail):
     monkeypatch.setattr(srv.health_monitor, "last_fabric_output", "")
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
     monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "")
-    since = _since(BOUND + 1)
+    since = _since(age)
     monkeypatch.setattr(srv, "device_hold_episode_since", since)
     monkeypatch.setattr(srv, "device_hold_episode_reason", detail)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
@@ -1108,3 +1109,217 @@ def test_a_held_job_past_its_bound_under_the_kill_switch_says_the_bound_still_ru
         assert said == "forced recovery escalation started" and spawned == [1]
     else:
         assert spawned == [] and "10-min hold bound" in said
+
+
+# Spec 04 I79 (the class D 77 climb) against I76 (the 10-min bound): one ladder and one power-cycle
+# request per episode, whichever path gets there first, and no wait past the I65 cooldown's end.
+_77 = "post-job: fabric check COULD NOT RUN (77)"
+
+
+def _77_climb_owed(rig, monkeypatch, *, age=BOUND + 1, fired=False):  # noqa: F811
+    """A 77-only hold whose one reset came back UNKNOWN and whose last-chance sweep read a 77 again, with
+    no known no-reset cause: only the I79 host rung is left. ``fired``: that climb already asked for the
+    power cycle on this episode. The rig's power cycle records the pending request as the real one does."""
+    g = rig["g"]
+    since = _present_hold_at_the_bound(rig, monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail=_77, age=age)
+    for name in ("unverified_reset_since", "unverified_sweep_since", "unverified_sweep_77_since"):
+        monkeypatch.setattr(g.mechanism, name, since)
+    monkeypatch.setattr(g.mechanism, "unverified_77_host_rung_since", since if fired else None)
+    monkeypatch.setattr(g.mechanism, "power_cycle_retry", None)
+    monkeypatch.setattr(g.mechanism, "_host_action_reset_refused", None)
+    monkeypatch.setattr(srv, "_host_action_suppressed_logged", None)
+    monkeypatch.setattr(srv, "_fabric_77_no_reset_cause", lambda: False)
+    monkeypatch.setattr(srv.FABRIC_DEBT, "passed_since_start", False)
+    monkeypatch.setattr(g, "_host_rung_77_paged_since", None)
+    monkeypatch.setattr(g, "_fabric_77_handoff", None)
+    if fired:
+        monkeypatch.setattr(g.mechanism, "host_action_requested", ("power-cycle", time.monotonic()))
+
+    async def power_cycle(log, reason):
+        rig["order"].append("power_cycle")
+        g.mechanism.host_action_requested = ("power-cycle", time.monotonic())
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    assert srv._fabric_77_only_hold()
+    return since
+
+
+def _cooldown_governor(r, monkeypatch, until: float):
+    """The I65 cooldown as the governor applies it: a power cycle asked before ``until`` is denied through
+    _deny_power_cycle, which arms the watchdog's retry for ``until`` in this episode."""
+    g, state = r["g"], {"on": True, "asked": 0}
+
+    def allowed(action, tenant_active=False, **k):
+        if action != "power-cycle":
+            return True, ""
+        state["asked"] += 1
+        if state["on"]:
+            return g.mechanism._deny_power_cycle({"until": until, "why": "power-cycle cooldown (I65)"})
+        return True, ""
+
+    monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", allowed)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_t1_a_77_climb_that_fired_before_the_bound_is_not_driven_again_at_the_bound(
+    rig, monkeypatch, clear_job_state  # noqa: F811
+):
+    """T1: the I79 climb asked for the power cycle below the bound and the request is pending. The bound's
+    tick runs no reset, no sweep and no second power cycle (it journals the suppression), and the relift's
+    own I79 path (escalate("present")) adds nothing either. Held: only the full check after the boot
+    releases it."""
+    order, g = rig["order"], rig["g"]
+    _77_climb_owed(rig, monkeypatch, fired=True)
+    assert not srv._fabric_77_climb_retry_due(), "the fired climb is spent"
+
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    kinds = [k for k, _ in rig["events"]]
+    assert "hold_escalation_suppressed_host_action" in kinds
+    await g.escalate("present", [str(i) for i in range(EXPECTED)], EXPECTED, lambda m: None)
+    assert "reset_suppressed_host_action" in [k for k, _ in rig["events"]]
+    assert order == [], "no glx_reset, no sweep, no second power cycle"
+    _tick(30)
+    await _drain()
+    assert order == [] and "released" not in order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["relift", "watchdog"])
+async def test_t2_a_cooldown_denied_77_climb_fires_one_power_cycle_whichever_path_runs_first(
+    rig, monkeypatch, clear_job_state, first  # noqa: F811
+):
+    """T2: at the bound the climb is owed and the I65 cooldown denies the power cycle (the retry is
+    armed). When the cooldown ends, the relift's I79 path and the watchdog's I65 retry both may ask:
+    whichever runs first fires the one power cycle and the other sees the pending request. No reset
+    runs either way."""
+    order, g = rig["order"], rig["g"]
+    _77_climb_owed(rig, monkeypatch)
+    until = time.time() + 900
+    gov = _cooldown_governor(rig, monkeypatch, until)
+
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert order.count("power_cycle") == 0 and gov["asked"] >= 1
+    assert g.mechanism.power_cycle_retry is not None, "the denial armed the cooldown retry"
+
+    gov["on"] = False
+    after = datetime.fromtimestamp(until + 1)
+    if first == "relift":
+        await g.escalate("present", [str(i) for i in range(EXPECTED)], EXPECTED, lambda m: None)
+        srv._check_hold_deadline(now=after)
+    else:
+        srv._check_hold_deadline(now=after)
+        await _drain()
+        await g.escalate("present", [str(i) for i in range(EXPECTED)], EXPECTED, lambda m: None)
+    await _drain()
+    srv._check_hold_deadline(now=after + timedelta(seconds=30))
+    await _drain()
+    assert order.count("power_cycle") == 1, order
+    assert "glx_reset" not in order and "sweep" not in order, "the sweep already ran: no reset again"
+    assert "released" not in order
+
+
+@pytest.mark.asyncio
+async def test_t3_a_77_on_the_boot_a_77_power_cycle_brought_up_still_gets_the_next_cycle_at_the_bound(
+    rig, monkeypatch, clear_job_state  # noqa: F811
+):
+    """T3: on the boot an I79 power cycle brought up, the 77 climb is spent and I79 hands the hold to an
+    operator. I76 still asks for the next power cycle at the bound (the governor's I65 doubling cooldown
+    decides when it fires) — the operator hand-off is never a reason to hold past the bound."""
+    order, g = rig["order"], rig["g"]
+    _77_climb_owed(rig, monkeypatch)
+    monkeypatch.setattr(
+        g.mechanism,
+        "boot_from_broker_escalation",
+        lambda boot: {"action": "power-cycle", "reason": galaxy.FABRIC_77_HOST_RUNG_CAUSE},
+    )
+    assert "this boot is the power-cycle" in g._fabric_77_host_rung_spent(srv.device_hold_episode_since)
+    assert not g.fabric_77_climb_owed(srv.device_hold_episode_since) or not g._fabric_77_cold_rung_due()
+
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    kinds = [k for k, _ in rig["events"]]
+    assert "fabric_unverified_operator_handoff" in kinds, "I79 hands the spent climb to an operator"
+    assert order.count("power_cycle") == 1, "I76 still asks for the next power cycle at the bound"
+    assert kinds.index("fabric_unverified_operator_handoff") < kinds.index("hold_bound_host_rung")
+    assert "glx_reset" not in order and "released" not in order
+
+
+@pytest.mark.asyncio
+async def test_a_77_climb_the_cooldown_denied_below_the_bound_fires_at_the_cooldowns_end(
+    rig, monkeypatch, clear_job_state  # noqa: F811
+):
+    """Gap (a): below the bound a 77-only hold is never forced, so the watchdog's I65 retry skipped it and
+    a climb the cooldown denied waited for the relift's next re-check (up to 120 s more). When only the
+    host rung is left (the reset and the sweep already ran), the retry asks for it at the cooldown's
+    end: one power cycle, no reset. Fails without the fix: nothing fires until the relift re-checks."""
+    g = rig["g"]
+
+    def acts():
+        return [o for o in rig["order"] if o != "denied"]  # the rig journals each governor denial too
+
+    _77_climb_owed(rig, monkeypatch, age=240)
+    until = time.time() + 60
+    gov = _cooldown_governor(rig, monkeypatch, until)
+    await g.escalate("present", [str(i) for i in range(EXPECTED)], EXPECTED, lambda m: None)
+    assert acts() == [] and gov["asked"] == 1 and g.mechanism.power_cycle_retry is not None
+
+    srv._check_hold_deadline(now=datetime.fromtimestamp(until - 5))
+    await _drain()
+    assert acts() == [], "not before the cooldown ends"
+    gov["on"] = False
+    srv._check_hold_deadline(now=datetime.fromtimestamp(until + 1))
+    await _drain()
+    assert acts() == ["power_cycle"], "the retry asks for the host rung the moment the cooldown ends"
+    assert g.mechanism.power_cycle_retry is None
+    srv._check_hold_deadline(now=datetime.fromtimestamp(until + 30))
+    await _drain()
+    await g.escalate("present", [str(i) for i in range(EXPECTED)], EXPECTED, lambda m: None)
+    assert acts() == ["power_cycle"], "one power-cycle request per episode"
+
+
+@pytest.mark.asyncio
+async def test_a_77_hold_whose_reset_has_not_run_is_still_never_forced_below_the_bound(
+    rig, monkeypatch, clear_job_state  # noqa: F811
+):
+    """Gap (a)'s let-through is only for a climb whose reset and sweep already ran: a 77-only hold with
+    a cooldown retry but no UNKNOWN reset on this episode is not reset for below the bound."""
+    order, g = rig["order"], rig["g"]
+    _77_climb_owed(rig, monkeypatch, age=240)
+    monkeypatch.setattr(g.mechanism, "unverified_reset_since", None)
+    monkeypatch.setattr(g.mechanism, "unverified_sweep_77_since", None)
+    monkeypatch.setattr(g.mechanism, "power_cycle_retry", (time.time() - 1, srv.device_hold_episode_since))
+    _tick()
+    await _drain()
+    assert order == [] and "hold_deadline_forced_escalation" not in [k for k, _ in rig["events"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", [False, True])
+async def test_the_idle_relift_runs_no_check_while_a_host_power_cycle_is_pending(
+    rig, monkeypatch, clear_job_state, pending  # noqa: F811
+):
+    """Gap (b): a 77-only hold's relift re-runs the fabric traffic pass. While a host power cycle the
+    broker asked for is pending it runs nothing (no traffic over a host going down, no lift just before
+    it cycles); the full check after the boot decides. Past the pending window it runs again."""
+    _77_climb_owed(rig, monkeypatch, age=240, fired=pending)
+    observed = []
+
+    async def observe(expected, log, run_fabric=True, **k):
+        observed.append(run_fabric)
+        return True, {"fabric": {"ok": None}}
+
+    monkeypatch.setattr(srv.fsm, "observe", observe)
+    monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
+    monkeypatch.setattr(srv, "_fabric_77_recheck_due", lambda: True)
+    monkeypatch.setattr(srv, "_fabric_77_bound_reached", lambda: False)
+    await srv._attempt_idle_relift()
+    assert observed == ([] if pending else [True])
+    if pending:
+        assert srv.last_relift_monotonic == 0.0, "a skipped relift does not start its interval"
+        monkeypatch.setenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", "0.001")
+        await asyncio.sleep(0.01)
+        await srv._attempt_idle_relift()
+        assert observed == [True], "past the pending window the relift runs again"
