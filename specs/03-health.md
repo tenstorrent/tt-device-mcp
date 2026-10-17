@@ -536,27 +536,24 @@ cooldown (spec 04 I65) holds longer.
   leaves the hold standing, and the debt never carries to a later episode. The watch stops as soon
   as the hold is lifted or replaced by any other path, and it never runs the pass itself. With the
   validator present at startup, the only added cost is up to three stat calls.
-- **I40 — A 77-only hold is bounded; past the bound the startup checks gate it, never forever.**
+- **I40 — A 77-only hold is bounded; past the bound it climbs the ladder, never forever.**
   Each idle-relift pass that 77s again on the same 77-only hold episode (I34) counts one retry.
   After `TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES` (3) retries, or once the episode is
   `TT_DEVICE_MCP_FABRIC_77_BOUND_SEC` (600 s) old with at least one retry behind it (a hugepage 77,
   I48, needs none), or on the first retry of a hold that owes the climb (04 I79: its reset already came
   back UNKNOWN, or this boot is a 77 reboot's result with the cold rung due), the broker
   journals `fabric_check_unrunnable_bound` (on every such pass), sends the alert hook (I37) once
-  per hold episode (a page the hook dropped goes out on the next pass) and gates on the startup
-  checks instead of the fabric pass: enum+ARC (already passed on that relift) plus a positively
-  healthy eth-heartbeat read, which also compares the up-link count with the host's baseline, so a
-  link that went down never reads healthy. Only that releases the hold, with a warning
-  (`device_relift_fabric_unverified`; the fabric stays unverified and the next gate re-runs the
-  pass), and at most once per `TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC` (6 h). A frozen or
-  unreadable eth read, a link-count drop, or a second 77-only hold inside the window climbs the
-  present-mesh rung of the ladder with every guard of the stuck-hold escalation. A post-reset
+  per hold episode (a page the hook dropped goes out on the next pass) and climbs the present-mesh
+  rung of the ladder with every guard of the stuck-hold escalation. The startup checks (enum+ARC,
+  the eth heartbeat) never release it: no traffic crossed the links, and only a passing full check,
+  fabric included, lifts a hold (I78), so the ladder's post-reset check decides, and the 10-min
+  bound (spec 04 I76) ends with the power cycle when that check still has no pass. A post-reset
   fabric that is still a 77 after the eth-training retries (spec 04) is UNKNOWN, not a failed
   reset: it never clears the hold, never arms the reset cooldown or the gate's two strikes, and
-  drives the idle ladder's host-rung climb only through a refused fallback, by way of spec 04 I29.
+  drives the idle ladder's host-rung climb only through the bound's climb, by way of spec 04 I29.
   The reset settles as this 77-only hold (not dirty, the reported fault it was the remedy for
-  retired), its post-reset passes count toward this bound (so the next relift that 77s gates on
-  the startup checks at once), and this bound ends it. Not while a reset still owes a fabric pass
+  retired), its post-reset passes count toward this bound (so the next relift that 77s climbs
+  at once), and this bound ends it. Not while a reset still owes a fabric pass
   (spec 04 I32): the startup checks prove no fabric after a reset, so such a pass climbs the
   present-mesh rung instead of releasing, and the reset's hold ends in a passing fabric pass or the
   ladder's bounded climb (spec 04 I29). That climb also reaches the host rung when the last-chance
@@ -595,8 +592,9 @@ cooldown (spec 04 I65) holds longer.
   mismatch check, so neither the post-reset output (the traffic-only rerun keeps the descriptor
   run's mismatch line) nor a hold detail or reason naming the mismatch parks it without the host rung.
   The latch pages nobody; the operator (cabling) is the ladder's own end, after a power cycle left
-  the ports missing. A clean pass without the marker and the start of an operator reset clear it (the
-  reset's post-reset check re-tests), so no broker restart is needed. Time to recover (class D, a
+  the ports missing. Only a clean pass without the marker clears it (I78): an operator reset keeps
+  it, its post-reset check re-tests, and only that check's clean pass ends it, so no broker restart
+  is needed. Time to recover (class D, a
   measured fabric fault, 15 min budget): the failed pass (~66 s plus the ~19 s descriptor rerun),
   the present-mesh reset (~4 min) and its full check, then the host rung no later than the 600 s
   stuck-hold ceiling when the idle relift ran the reset (only the bounded boot/post-cycle cooldown
@@ -614,10 +612,14 @@ cooldown (spec 04 I65) holds longer.
   A hold placed only because a tenant held the device when the gate wanted to verify
   (`why == "foreign_holder"`) carries no measured fault. When the idle relift reaches it (the generic
   branch, so `TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE` must be on) and a fresh holder scan shows no
-  tenant, no RUNNING job, no reaped job's leftover and a complete scan, it runs the pre-job verify
-  (enum+ARC, no traffic pass) under the device-op lock. It lifts on a healthy read only when no
-  runtime-named fault is pending and the last fabric verdict did not read UNHEALTHY, and only if the
-  hold is still the same undirtied foreign-holder hold after the verify. Any other outcome falls
+  tenant, no RUNNING job, no reaped job's leftover and a complete scan, it runs the full check (I78:
+  enum+ARC and a fabric pass on the full cabling, after the 1G hugepage pool is ready; the pre-job
+  verify, enum+ARC, on a host where no fabric pass can run) under the device-op lock. It lifts on a
+  pass only when no runtime-named fault is pending and the last fabric verdict did not read
+  UNHEALTHY, and only if the hold is still the same undirtied foreign-holder hold after the check.
+  A fabric pass that fails or finds a link missing keeps the hold. Time to recover (foreign holder):
+  the full check (~45-100 s) before the lift, against ~1 s before; a hold that fails it takes the
+  ceiling escalation and the 10-min bound (spec 04 I76). Any other outcome falls
   through to the existing ceiling escalation (I23 generic), which is unchanged. A tenant still there
   means no probe at all. It emits `foreign_holder_verify` with `lifted` either way.
 - **I44 — An idle foreign holder is named, never signalled.** A tenant process (`is_tenant`) that
@@ -930,6 +932,29 @@ cooldown (spec 04 I65) holds longer.
   (class D, a measured fabric fault): the failed pass (~66 s plus the ~19 s descriptor run), the
   reset (~4 min), then the host rung within the class budget, against before: a lift, a failed
   first job and an open-ended no-reset hold. No added time between jobs on a healthy mesh.
+
+- **I78 — A fabric hold on a missing or broken link lifts only on a passing full fabric check.** No
+  path lifts or clears an open hold, whatever its class or latch, or gives the device back to the
+  queue, unless the full health check, fabric included, has just passed. One test enforces it for
+  every caller, in the release funnel (`_clear_device_dirty(verified=True)`) and in the ladder's
+  outcome fold: the gate, the idle relift and its self-heal, foreign-holder (I43) and off-bus (I52)
+  lifts, the operator reset's verify (spec 04 I13), the verification job, the I40 bound and the
+  10-min bound (spec 04 I76). "Just passed" means the newest healthy fabric verdict is at most
+  `HOLD_LIFT_PASS_FRESH_SEC` (300 s) old and newer than the hold's latest fault. A pass that finds
+  fewer links than the cabling expects has failed (I71), and under the I42 latch any mismatch
+  fails; a moved tray (as many extra ports as missing) passes per I42. A refused lift journals
+  `hold_lift_refused` (`why`, `hold`, `reason`, `since`) and changes nothing: the hold, its episode
+  and its clock stay as they were, so the bounded recovery goes on: the ladder at the 10-min bound
+  and, when the full check after it still has no pass, the power cycle (spec 04 I76, after the I65
+  cooldown). The idle lifts run the full check themselves (`_full_check_gate`: it waits for the 1G
+  hugepage pool, then runs enum+ARC and the fabric pass). Exempt: a HEALTHY device (the light
+  between-jobs check is unchanged), a host where no fabric pass can run (one chip, no fabric check
+  configured, a per-user daemon: its own verify is all it can prove) and the config-off clears
+  (health checks off, no device nodes). Time to recover: a foreign-holder or eth_frozen hold whose
+  cause has gone pays the full check (~45-100 s) before it lifts; a 77-only hold past the I40 bound
+  climbs the ladder instead of a release on the startup checks; a missing-link or topology hold
+  never lifts on a check that skipped the fabric, so it reaches the power cycle at the 10-min bound
+  instead of a lift that fails the next job. No added time between jobs on a healthy mesh.
 
 ## Interfaces
 

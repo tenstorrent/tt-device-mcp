@@ -85,7 +85,6 @@ def _broker(monkeypatch, tmp_path, fsm, verdict=_FABRIC_77):
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
     monkeypatch.setattr(srv, "_fabric_77_streak", 0)
     monkeypatch.setattr(srv, "_fabric_77_paged_since", None)
-    monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", 0.0)
     monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
     events = []
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append((name, k)))

@@ -1276,7 +1276,6 @@ def test_an_owed_pass_does_not_carry_to_another_episode(monkeypatch, tmp_path, c
 def _bound(monkeypatch, tmp_path, eth):
     _hold_77(monkeypatch, tmp_path)
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "1")
-    monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", 0.0)
     monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
 
     async def verify(expected, log, run_fabric=True, **_):
@@ -1317,7 +1316,6 @@ async def test_a_77_only_hold_with_a_link_drop_climbs_the_ladder_not_released(mo
 @pytest.mark.asyncio
 async def test_a_second_77_only_hold_inside_the_window_climbs_the_ladder(monkeypatch, tmp_path, clear_job_state):
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
-    monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", srv.time.monotonic())
     await srv._attempt_idle_relift()
     assert rungs == ["present"]
     assert srv.fsm.state is ServerState.RECOVERING

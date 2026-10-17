@@ -2270,7 +2270,7 @@ def _reset_for_testing():
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant
-    global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
+    global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_paged_since
     global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
     job_queue = None
@@ -2290,7 +2290,6 @@ def _reset_for_testing():
         recovery_mechanism.regressed_reset_since = None
     _fabric_77_streak_since = None
     _fabric_77_streak = 0
-    _fabric_77_fallback_release_monotonic = 0.0
     _fabric_77_paged_since = None
     _fabric_77_recheck_since = None
     _fabric_77_rechecks = 0
@@ -3195,6 +3194,33 @@ def _post_reset_debt() -> str:
     return FABRIC_DEBT.blocks_release(health_monitor.expected(len(_present_chip_indices())))
 
 
+# Spec 03 I78: how old the passing fabric verdict a hold lifts on may be. The full check ends with the
+# fabric pass and every lift follows it at once; a verdict older than this belongs to another check.
+HOLD_LIFT_PASS_FRESH_SEC = 300.0
+
+
+def _hold_lift_unproven() -> str:
+    """Why the open hold may not lift now, or "" when it may (spec 03 I78): the one test every lift
+    passes, whatever the hold's class or latch. A hold lifts only when the full health check, fabric
+    included, has just passed: a healthy fabric verdict on the full cabling (a pass that finds fewer
+    links than the cabling expects FAILS, I71) no older than ``HOLD_LIFT_PASS_FRESH_SEC`` and newer than
+    the hold's latest fault. Nothing to lift (HEALTHY) and a host where no fabric pass can run (a single
+    chip, no fabric check configured) leave it to the caller's own verified check."""
+    if fsm.state is ServerState.HEALTHY or health_monitor is None:
+        return ""
+    if not FABRIC_DEBT.runs_here(health_monitor.expected(len(_present_chip_indices()))):
+        return ""
+    at = FABRIC_DEBT.pass_monotonic
+    if not at:
+        return "no fabric pass has passed on the full cabling"
+    if at < fsm.fault_monotonic:
+        return "the last passing fabric pass is older than the hold's latest fault"
+    age = time.monotonic() - at
+    if age > HOLD_LIFT_PASS_FRESH_SEC:
+        return f"the last passing fabric pass is {age:.0f}s old"
+    return ""
+
+
 def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> bool:
     """Mark the device clean, and record the transition on the durable health timeline.
 
@@ -3205,14 +3231,23 @@ def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> b
 
     Every verified release funnels through here, so this is where no reset may release a mesh no
     fabric pass has passed on since (spec 04 I32): with that debt open, the device is held
-    fabric-unverified instead, and the fabric relift or the bounded escalation settles it. Returns
-    whether the device was released (always True for an unverified clear).
+    fabric-unverified instead, and the fabric relift or the bounded escalation settles it. Nor does
+    any hold lift here unless the full check, fabric included, has just passed (spec 03 I78): the hold
+    stays exactly as it is, its episode and clock untouched, for a path that runs the full check or
+    the bounded ladder (spec 04 I76). Returns whether the device was released (always True for an
+    unverified clear).
     """
     if verified:
         owed = _post_reset_debt()
         if owed:
             health_event("post_reset_release_refused", why=why, reset=owed)
             _hold_device_fabric_unverified(f"{why}; reset ({owed}) has had no passing fabric pass since")
+            return False
+        unproven = _hold_lift_unproven()
+        if unproven:
+            health_event("hold_lift_refused", why=why, hold=fsm.record.why, reason=unproven, since=fsm.record.since)
+            if logger:
+                logger.warning(f"HOLD-LIFT refused ({why}): {unproven} — the hold stays")
             return False
     was_degraded = fsm.state is not ServerState.HEALTHY
     _journal_fsm_transition(why, verified=verified)
@@ -3720,6 +3755,10 @@ def _fold_rung_outcome(outcome: str, log) -> None:
     if outcome == OUTCOME_RECOVERED and _post_reset_debt():
         log("the rung's verify passed, but a reset still owes a passing fabric pass — held fabric-unverified")
         return
+    unproven = _hold_lift_unproven() if outcome == OUTCOME_RECOVERED else ""
+    if unproven:
+        log(f"the rung came back, but {unproven} — the hold stays (spec 03 I78)")
+        return
     if outcome == OUTCOME_TERMINAL and _fabric_77_only_hold():
         log("the rung left the fabric unverified (77), not failed — holding; re-checks continue")
         return
@@ -3845,9 +3884,6 @@ def _idle_relift_armed() -> tuple[bool, bool, bool]:
 # with at least one retry behind it, the fabric pass stops being the gate (see _fabric_77_fallback).
 _fabric_77_streak_since: Optional[str] = None
 _fabric_77_streak: int = 0
-# Monotonic time of the last release the fallback granted on a still-unverified fabric. A second
-# 77-only hold within FABRIC_77_RELEASE_WINDOW_SEC of it goes to the ladder, not another release.
-_fabric_77_fallback_release_monotonic: float = 0.0
 # The hold episode (its ``since``) whose bound the alert hook has already paged. Every relift pass past
 # the bound runs the fallback again; only the first on an episode pages.
 _fabric_77_paged_since: Optional[str] = None
@@ -3934,25 +3970,6 @@ def _validator_line_names_topology(output: str) -> bool:
 
 def _hold_details(evidence: dict) -> tuple[str, str]:
     return str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or "")
-
-
-def _fabric_link_hold(evidence: dict) -> str:
-    """Why the open hold is on a missing or broken fabric link, or "" (spec 03 I77): the I42 latch, a
-    pass that found descriptor ports missing (I71), or a topology mismatch named by the hold, its
-    episode, this pass or the last fabric output. Such a hold lifts only on a passing full fabric
-    check, never on the startup checks: no traffic crossed the links in doubt."""
-    if health_monitor is not None and health_monitor.topology_hw_fault:
-        return "the topology-mismatch lift's first job failed on the fabric"
-    texts = (*_hold_details(evidence), str(device_hold_episode_reason or ""))
-    if any(fabric.names_links_missing(t) for t in texts) or (
-        health_monitor is not None and (health_monitor.fabric_topology or {}).get("verdict") == "failed"
-    ):
-        return "descriptor ports missing"
-    if any(_TOPOLOGY_HOLD in t or _TOPOLOGY_VALIDATOR_LINE in t for t in texts) or (
-        health_monitor is not None and _TOPOLOGY_VALIDATOR_LINE in (health_monitor.last_fabric_output or "")
-    ):
-        return "topology mismatch"
-    return ""
 
 
 def _known_fabric_fault_hold() -> bool:
@@ -4096,69 +4113,32 @@ def _note_fabric_77_reset_passes(passes: int) -> None:
 
 
 async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
-    """The fabric check could not run on a bounded number of retries: alert, then gate on the startup
-    checks instead. enum+ARC already passed (the caller's observe returned healthy); add the eth
-    heartbeat, which also compares the measured up-link count with the host's baseline, so a link
-    that went down reads as no-verdict rather than healthy. A 77 is never a healthy fabric: only a
-    positively healthy read, and no fallback release in the window, lifts the hold, with a warning.
-    Frozen, unreadable, a link-count drop, or a second 77-only hold inside the window climbs the
-    ladder (the present-mesh rung, with every guard of _escalate_stuck_hold). Pages once per hold
-    episode: a later pass on the same episode journals but does not page again, and a page the hook
-    dropped is tried again on the next pass. Returns True when it settled the hold."""
-    global _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
-    window = _env_int("TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC", 21600, 0)
-    recent = bool(_fabric_77_fallback_release_monotonic) and (
-        time.monotonic() - _fabric_77_fallback_release_monotonic < window
-    )
+    """The fabric check could not run on a bounded number of retries: alert, then climb the ladder (the
+    present-mesh rung, with every guard of _escalate_stuck_hold). A 77 is never a healthy fabric, and
+    the startup checks (enum+ARC, the eth heartbeat) say nothing about links no traffic crossed, so the
+    bound never releases on them: only a passing full check, fabric included, lifts the hold (spec 03
+    I78), and the ladder's own post-reset check is the next one. Pages once per hold episode: a later
+    pass on the same episode journals but does not page again, and a page the hook dropped is tried
+    again on the next pass. Returns True when the climb settled the hold."""
+    global _fabric_77_paged_since
     event = {
         "kind": "fabric_check_unrunnable_bound",
         "host": socket.gethostname(),
         "held_since": fsm.record.since,
         "retries": _fabric_77_streak,
         "detail": str((evidence.get("fabric") or {}).get("detail", ""))[:300],
-        "repeat_within_window": recent,
     }
     health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
     if logger:
         logger.warning(
             f"FABRIC-77-BOUND the fabric check could not run on {_fabric_77_streak} retries of this hold "
-            "— falling back to the startup checks as the gate"
+            "— climbing the recovery ladder; only a passing full check lifts the hold"
         )
     if _fabric_77_paged_since != fsm.record.since and (
         alert.send_alert(event, logger) is not None or alert.alert_argv() is None
     ):
         _fabric_77_paged_since = fsm.record.since
-    eok, edetail = await health_monitor.verify_eth_heartbeat()
-    # A reset with no passing fabric pass since may not be released on the startup checks (04 I32).
-    owed = _post_reset_debt()
-    # Nor a hold on a missing or broken link: only a passing full fabric check lifts it (03 I77).
-    link = _fabric_link_hold(evidence)
-    if eok is True and not recent and not owed and not link:
-        _fabric_77_fallback_release_monotonic = time.monotonic()
-        log(
-            f"startup checks pass (enum+ARC healthy, eth heartbeat {edetail or eok!r}) — hold lifted "
-            "WITH A WARNING: the fabric is unverified, the next gate re-runs the pass"
-        )
-        health_event("device_relift_fabric_unverified", evidence=evidence, retries=_fabric_77_streak)
-        _clear_device_dirty(
-            verified=True, why="idle relift: fabric check unrunnable past its bound; startup checks pass"
-        )
-        return True
-    log(
-        "startup checks do not clear it ("
-        + (
-            f"a reset ({owed}) has had no passing fabric pass since"
-            if eok is True and owed
-            else f"a hold on a missing or broken link ({link}) lifts only on a passing fabric check"
-            if eok is True and link
-            else (
-                "a fallback release already ran inside the window"
-                if eok is True
-                else f"eth heartbeat {'frozen' if eok is False else 'gave no verdict'}: {edetail}"
-            )
-        )
-        + ") — climbing the recovery ladder"
-    )
+    log("the startup checks never lift a hold the fabric check could not verify — climbing the recovery ladder")
     if (
         galaxy_recovery is not None
         and device_hold_episode_since
@@ -4344,7 +4324,8 @@ async def _attempt_idle_relift() -> None:
                     and _fabric_77_bound_reached()
                 ):
                     # I40: a pass that cannot run is retried a bounded number of times, never
-                    # forever. Past the bound the startup checks become the gate.
+                    # forever. Past the bound the ladder climbs: the startup checks never lift a
+                    # hold (I78).
                     if await _fabric_77_fallback(evidence, _log, _escalate):
                         return
                 if (
@@ -4405,12 +4386,12 @@ async def _attempt_idle_relift() -> None:
                             "present-mesh reset past the grace"
                         )
                         return
-                    # An episode tagged eth_frozen that recorded chips off the bus also owes the
-                    # full gate, fabric included, before it lifts (spec 03 I52).
-                    if _offbus_hold_open() and should_privsep():
-                        gate_ok, evidence = await _offbus_return_full_gate(expected, _log)
-                        if not gate_ok:
-                            return
+                    # Like every hold, an eth_frozen one lifts only on a passing full check, fabric
+                    # included (spec 03 I78; an episode that recorded chips off the bus, I52).
+                    gate_ok, gate_evidence = await _full_check_gate(expected, _log)
+                    if not gate_ok:
+                        return
+                    evidence = gate_evidence or evidence
                 else:
                     # Held for an off-bus drop below the reset floor: the chip LEFT THE BUS, which
                     # enum+ARC+sysfs see directly, so their agreement that it is back and answering is
@@ -4437,12 +4418,12 @@ async def _attempt_idle_relift() -> None:
                     # failure: none of that is the gate. A chip that left the bus came back through a
                     # reset of some kind (its own, a tray's, the driver's), so the lift waits for the
                     # full health gate, fabric included, exactly as after any reset (spec 03 I52).
-                    # A per-user daemon has no staged fabric validator, so no pass of its could ever
-                    # read True; its start-probe hold (also off_bus) lifts on the enum+ARC re-read.
-                    if should_privsep():
-                        gate_ok, evidence = await _offbus_return_full_gate(expected, _log)
-                        if not gate_ok:
-                            return
+                    # A host where no fabric pass can run (a per-user daemon has no staged fabric
+                    # validator) lifts its start-probe hold (also off_bus) on the enum+ARC re-read.
+                    gate_ok, gate_evidence = await _full_check_gate(expected, _log)
+                    if not gate_ok:
+                        return
+                    evidence = gate_evidence or evidence
             # Re-assert under the lock AFTER the long awaits above: the sampler's dead-chip path is
             # lock-free (_isolate_dead_chips marks the device dirty without _device_op), so a chip can
             # have dropped during _verify_device or the eth read, re-raising dirty after the guard at
@@ -4487,20 +4468,28 @@ def _offbus_hold_open() -> bool:
 _down_offbus_recheck_monotonic: float = 0.0
 
 
-async def _offbus_return_full_gate(expected: int, log: Callable[[str], None]) -> tuple[bool, dict]:
-    """The full health gate, fabric included, for a mesh whose dropped chips are back (spec 03 I52).
+async def _full_check_gate(
+    expected: int, log: Callable[[str], None], *, recovery: Optional[object] = None
+) -> tuple[bool, dict]:
+    """The full health check, fabric included, that an idle hold lift runs first (spec 03 I78): a mesh
+    whose dropped chips are back (I52), an eth_frozen hold, a foreign holder that left (I43).
     ``(True, evidence)`` only when enum+ARC pass AND the fabric pass returns an explicit healthy
-    verdict: a 77 (``ok`` None) or a failure holds. A pass before the 1G hugepages exist can only 77,
-    so it waits for the count first and holds without running."""
+    verdict: a 77 (``ok`` None), a failure, or a pass that found fewer links than the cabling expects
+    (I71) holds. A pass before the 1G hugepages exist can only 77, so it waits for the count first
+    and holds without running (``(False, {})``). A host where no fabric pass can run (a single chip,
+    no fabric check configured, a per-user daemon) has nothing more to prove: ``(True, {})``, and
+    the caller's own verify stands."""
+    if not FABRIC_DEBT.runs_here(expected):
+        return True, {}
     short = await asyncio.to_thread(_hugepages_shortfall)
     if short is not None:
         log(f"full gate waits: hugepages not yet allocated: {short[0]}/{short[1]} — holding")
         return False, {}
-    healthy, evidence = await fsm.observe(expected, log, run_fabric=True, recovery=galaxy_recovery)
+    healthy, evidence = await fsm.observe(expected, log, run_fabric=True, recovery=recovery or galaxy_recovery)
     fabric_ok = (evidence.get("fabric") or {}).get("ok")
     if not healthy or fabric_ok is not True:
         log(
-            f"every chip back on the bus but the full gate did not pass (healthy={healthy}, "
+            f"the full check did not pass (healthy={healthy}, "
             f"fabric={fabric_ok!r}) — holding; the door never reopens onto unverified fabric"
         )
         return False, evidence
@@ -4557,7 +4546,7 @@ async def _attempt_down_offbus_recheck() -> None:
                 f"every chip is back on the bus ({len(indices)}/{expected}) on a DOWN off-bus hold — "
                 "running the full health gate, fabric included"
             )
-            ok, evidence = await _offbus_return_full_gate(expected, _log)
+            ok, evidence = await _full_check_gate(expected, _log)
             if not ok:
                 _note_hold_bound_check_failed(_log)  # spec 04 I76: the host rung on the next tick
                 return
@@ -4581,20 +4570,33 @@ async def _foreign_holder_fast_verify(expected: int, log: Callable[[str], None])
     to the ceiling escalation, which is what a failed verify needs.
 
     The hold was placed because the gate could not verify beside a tenant, not on a measured fault,
-    so the verify the next job's gate would run is all it owes: enum+ARC, no traffic pass, released
-    on a healthy read with no runtime-named fault. Stricter than the gate in one way: a last fabric
-    verdict that read UNHEALTHY is not lifted here, it goes to the ceiling reset. The tenant check
+    but like every hold it lifts only on a passing full check, fabric included (spec 03 I78): enum+ARC
+    and a fabric pass on the full cabling, with no runtime-named fault. A last fabric verdict that
+    read UNHEALTHY, or a full check that does not pass, is not lifted here: it goes to the ceiling
+    reset, then the 10-min bound (spec 04 I76). A check still waiting on the 1G hugepage pool holds
+    and runs on a later pass. The tenant check
     is the escalation's own (an fd holder, a RUNNING job, or a scan it cannot fully read), plus a
     reaped job's leftover, so nothing is probed beside anyone."""
     scan = await asyncio.to_thread(enumerate_device_holders)
     if galaxy_recovery._tenant_active(scan) or await asyncio.to_thread(_reaped_leftover_reason, scan):
         log("foreign-holder hold: a tenant or a running job still holds the device — holding")
         return True
-    log("foreign-holder hold: the holder is gone and no job runs — running the pre-job verify now")
-    healthy, evidence = await fsm.observe(expected, log, run_fabric=False, phase="pre-job", recovery=select_recovery())
+    if FABRIC_DEBT.runs_here(expected):
+        log("foreign-holder hold: the holder is gone and no job runs — running the full check now")
+        healthy, evidence = await _full_check_gate(expected, log, recovery=select_recovery())
+        if not healthy and not evidence:
+            return True  # the full check waits on the 1G hugepage pool: nothing ran, nothing failed
+    else:
+        log("foreign-holder hold: the holder is gone and no job runs — running the pre-job verify now")
+        healthy, evidence = await fsm.observe(
+            expected, log, run_fabric=False, phase="pre-job", recovery=select_recovery()
+        )
     if not healthy or device_fault_reported or health_monitor.last_fabric_ok is False:
+        fabric_ok = (evidence.get("fabric") or {}).get("ok")
         why = (
-            "the mesh reads unhealthy"
+            f"the full check did not pass (fabric={fabric_ok!r})"
+            if not healthy and FABRIC_DEBT.runs_here(expected)
+            else "the mesh reads unhealthy"
             if not healthy
             else (
                 f"the runtime reported '{device_fault_reported}'"
@@ -4610,10 +4612,11 @@ async def _foreign_holder_fast_verify(expected: int, log: Callable[[str], None])
     if fsm.state is not ServerState.RECOVERING or fsm.record.dirty or fsm.record.why != "foreign_holder":
         log("state changed mid-verify (a chip dropped, or a gate took over) — holding; the pre-job gate owns it now")
         return True
-    log("foreign-holder hold: pre-job verify healthy — hold lifted without a reset")
+    if not _clear_device_dirty(verified=True, why="idle relift: foreign holder gone, full check passed"):
+        return True
+    log("foreign-holder hold: the full check passed — hold lifted without a reset")
     health_event("foreign_holder_verify", lifted=True, healthy=True, reason="holder gone")
     health_event("device_relift", evidence=evidence)
-    _clear_device_dirty(verified=True, why="idle relift: foreign holder gone, pre-job verify healthy")
     return True
 
 
@@ -11821,7 +11824,7 @@ def create_mcp_server() -> MCPServer:
         recovery = select_recovery()
         argv = recovery.reset_argv(indices)
         # The I42 latch stays through an operator reset: it withholds no check, so the post-reset check
-        # runs the descriptor and only its clean pass ends the latch (spec 03 I77). Clearing it here let
+        # runs the descriptor and only its clean pass ends the latch (spec 03 I78). Clearing it here let
         # that check lift the mismatch onto the links the first job already failed on.
         yield f"$ {' '.join(argv)}   ({len(indices)} device(s); ~30-60s)\n"
         reset_owner = _reset_action_owner()
@@ -13366,7 +13369,7 @@ def create_mcp_server() -> MCPServer:
         recovery = select_recovery()
         argv = recovery.reset_argv(indices)
         # The I42 latch stays through an operator reset: it withholds no check, so the post-reset check
-        # runs the descriptor and only its clean pass ends the latch (spec 03 I77). Clearing it here let
+        # runs the descriptor and only its clean pass ends the latch (spec 03 I78). Clearing it here let
         # that check lift the mismatch onto the links the first job already failed on.
         command = " ".join(argv)
         step(f"exec: {command}  ({len(indices)} device(s); ~30-60s on a Galaxy)")

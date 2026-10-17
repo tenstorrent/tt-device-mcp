@@ -1031,7 +1031,7 @@ each rung fires only when the gentler one failed or cannot apply.
   rung at once (event `hold_bound_leftover`); a running job or any other readable tenant still
   refuses it. At the bound the I46 latch is lifted
   (`hold_bound_latch_cleared`), so the full health check after the ladder, fabric included, gets a
-  real verdict and only a pass releases (goal of I8/spec 03 I4); a job that fails the same way
+  real verdict and only a pass releases (goal of I8/spec 03 I4, I78); a job that fails the same way
   declares it again. The spec 03 I42 latch stays: it withholds no check (a latched hold already takes
   the ladder), it makes a topology mismatch FAIL the check, so the post-ladder check cannot pass on
   the links the lift's first job failed on. A post-ladder check that finds any descriptor port

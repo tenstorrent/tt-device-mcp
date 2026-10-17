@@ -498,7 +498,7 @@ async def test_a_latched_hold_whose_reset_heals_releases_only_on_a_full_pass(lat
 @pytest.mark.parametrize("route", ["/api/tt_device_reset", "/api/tt_device_reset_stream"])
 @pytest.mark.parametrize("heals", [True, False])
 def test_an_operator_reset_keeps_the_latch_and_only_a_clean_fabric_pass_ends_it(monkeypatch, tmp_path, route, heals):
-    """Spec 03 I77: both operator reset routes keep the I42 latch through the reset, and the post-reset
+    """Spec 03 I78: both operator reset routes keep the I42 latch through the reset, and the post-reset
     check runs the fabric pass (never withheld): a clean descriptor run ends the latch and releases, a
     mismatch still there FAILS under the latch and keeps the hold (never a watched lift)."""
     from starlette.testclient import TestClient

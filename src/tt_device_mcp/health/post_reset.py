@@ -22,6 +22,7 @@ followed no reset.
 from __future__ import annotations
 
 import os
+import time
 from typing import Optional
 
 from tt_device_mcp.health.evidence import health_event
@@ -36,6 +37,10 @@ class FabricDebt:
         # Whether any fabric pass has passed since this broker started (spec 04 I29: a boot a 77 host
         # rung brought up has spent that rung until one does).
         self.passed_since_start: bool = False
+        # When the newest healthy fabric verdict came in (time.monotonic(), 0.0 for none, or after a
+        # failed pass): a hold lifts only on one that is fresh and newer than its latest fault (spec 03
+        # I78).
+        self.pass_monotonic: float = 0.0
 
     def note_reset(self, what: str) -> None:
         """A reset (or a broker start) happened: the fabric is unproven until a pass clears it.
@@ -48,6 +53,9 @@ class FabricDebt:
         """Fold one fabric verdict in: only a healthy one settles the debt."""
         if ok is True:
             self.passed_since_start = True
+            self.pass_monotonic = time.monotonic()
+        elif ok is False:
+            self.pass_monotonic = 0.0
         if ok is True and self.owed:
             health_event("post_reset_fabric_settled", reset=self.owed)
             self.owed = ""
@@ -60,9 +68,15 @@ class FabricDebt:
 
     def blocks_release(self, expected: int) -> str:
         """The reset that still owes a fabric pass, or "" when a release may proceed."""
-        if not self.owed or expected <= 1 or not _fabric_check_configured():
+        if not self.owed or not self.runs_here(expected):
             return ""
         return self.owed
+
+    @staticmethod
+    def runs_here(expected: int) -> bool:
+        """Whether a fabric pass can run on this host at all: a mesh (more than one chip) with a fabric
+        check configured."""
+        return expected > 1 and _fabric_check_configured()
 
 
 def _fabric_check_configured() -> bool:

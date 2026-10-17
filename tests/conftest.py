@@ -62,8 +62,10 @@ def reset_post_reset_fabric_debt():
     from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
     FABRIC_DEBT.owed = ""
+    FABRIC_DEBT.pass_monotonic = 0.0
     yield
     FABRIC_DEBT.owed = ""
+    FABRIC_DEBT.pass_monotonic = 0.0
 
 
 @pytest.fixture(autouse=True)
