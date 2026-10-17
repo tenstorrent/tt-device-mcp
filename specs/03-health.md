@@ -166,7 +166,7 @@ job boundary.
   overwrites the fabric latch. The relift is
   rate-limited (`SELFHEAL_RELIFT_INTERVAL_SEC`, default 120s), single-flight, re-checks every
   guard under the device-op lock, and bails when the hold was re-dirtied or a chip drops
-  mid-verify — a dirty device belongs to the pre-job gate.
+  mid-verify — a dirty device belongs to the pre-job gate, or with nothing queued to I68.
 - **I22 — The fabric relift is the only relift path that runs the traffic pass, and it is off by
   default** (`TT_DEVICE_MCP_FABRIC_RELIFT`) except for a 77-only hold (I34) and an off-bus return
   (I52). It lifts only on an
@@ -801,6 +801,21 @@ job boundary.
   from an earlier pass, or with no stamp, is left out: no `fabric.log`, and `incident.json`
   records `fabric_output: {at, stale: true, omitted: true}`. A caller that passes no pass start
   keeps the output as given.
+- **I68 — A dirty device with nothing queued gets the post-job gate from the idle relift.** The
+  relift's other categories bail on a dirty device (I21), and the gate that owns one runs only
+  with a job. So a device left dirty with an empty queue (most often a job's leftover that let go
+  after the post-job gate skipped over it, spec 01 I16 and I67) waited for the next job or the
+  600 s ceiling (I23). The idle relift now runs the post-job gate itself, with the forced fabric
+  pass (the full check), on a device that is RECOVERING and dirty with `why` `job_killed` or
+  `foreign_holder`, while no job is queued, running, re-adopted or owed its own post-job gate,
+  no device op or reset scope runs, no external step holds the device, no chip is off the bus,
+  and the holder scan sees no tenant and no reaped leftover. It runs once per hold episode (keyed
+  on `since`) and rechecks those conditions every `DIRTY_IDLE_GATE_RECHECK_SEC` (10 s); a
+  dropped chip, a different `why` or a held job keeps today's owner. The gate releases only on a
+  pass; a failure takes its own ladder (a reset, then the full check after it, fabric
+  included) and the hold stays with the bounded escalation of I23 if that does not heal it.
+  Time to recover (class J): from the release of the last holder to the gate's start is at most
+  one recheck period plus one sampler tick, against waiting up to the 600 s ceiling before.
 
 ## Interfaces
 
@@ -1413,6 +1428,7 @@ refuses.
 | I61 (the full post-reset check gates the release; a failure stays held and climbs) | `tests/test_eth_timeout_reset.py::test_the_full_check_after_the_reset_gates_the_release`, `tests/test_eth_timeout_reset.py::test_a_failed_post_reset_check_stays_held_and_climbs`, `tests/test_eth_timeout_reset.py::test_a_failed_post_reset_check_without_a_host_rung_stays_held` |
 | I61 (one reset per episode, latch shared with I55, re-armed at release) | `tests/test_eth_timeout_reset.py::test_a_second_timeout_in_the_episode_gets_no_second_reset`, `tests/test_eth_timeout_reset.py::test_a_spent_dispatch_reset_leaves_the_timeout_on_todays_path`, `tests/test_eth_timeout_reset.py::test_a_healed_reset_rearms_the_latch_at_the_next_admission` |
 | I61 (every other shape keeps today's path) | `tests/test_eth_timeout_reset.py::test_other_no_verdict_reads_keep_todays_fabric_pass`, `tests/test_eth_timeout_reset.py::test_a_frozen_read_keeps_todays_hold`, `tests/test_eth_timeout_reset.py::test_an_off_bus_chip_or_unhealthy_arc_keeps_todays_path`, `tests/test_eth_timeout_reset.py::test_host_pci_not_ok_keeps_todays_fabric_pass`, `tests/test_eth_timeout_reset.py::test_an_outage_hold_refuses_the_reset_and_keeps_todays_pass`, `tests/test_eth_timeout_reset.py::test_a_dirty_exit_still_runs_the_fabric_pass` |
+| I68 (a dirty job_killed/foreign_holder hold with nothing queued gets the post-job gate, fabric forced, once per episode; a failure keeps the hold; anything else owning the device defers it) | `tests/test_holder_release_wait.py::test_a_dirty_killed_hold_with_an_empty_queue_runs_the_full_post_job_gate_once`, `tests/test_holder_release_wait.py::test_a_failed_idle_gate_keeps_the_hold_and_runs_once_per_episode`, `tests/test_holder_release_wait.py::test_an_idle_gate_that_raises_keeps_the_device_held`, `tests/test_holder_release_wait.py::test_the_idle_gate_is_rate_limited`, `tests/test_holder_release_wait.py::test_no_idle_gate_while_anything_else_owns_the_device` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

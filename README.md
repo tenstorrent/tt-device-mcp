@@ -106,6 +106,10 @@ your project's `AGENTS.md`.
 
 Every submission enters one queue. The runner takes one job at a time.
 
+Before a job starts, the broker checks that the job's user can write the
+dirs tt-metal will write (`generated/` and its subdirs), and fails the job at
+once if not.
+
 Between jobs a gate probes the device (chip count, ARC heartbeat, ethernet
 links, fabric traffic). If the device is unfit, the gate holds the queue and
 climbs a reset ladder until the device recovers. It never resets while another
@@ -181,6 +185,14 @@ See [deploy/README.md](deploy/README.md) for the timeout arithmetic
   and require users to go through `tt-device-mcp run`.
 - Hosts are unlocked by default and stay cooperative. A direct run works, and
   collides with whatever the queue is running.
+
+**A job failed at once with "tt-metal output dir not writable".**
+
+- tt-metal writes under `generated/` in the job's working directory, or under
+  `$TT_METAL_LOGS_PATH`. A run as root there leaves it root-owned, and the
+  broker refuses jobs that could not write it rather than let them fail later.
+- The error names each path, its owner and mode. Give the dirs back to your
+  user, move them aside, or set `TT_METAL_LOGS_PATH` in the job's env file.
 
 **A job died with no output.**
 
