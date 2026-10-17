@@ -343,8 +343,11 @@ def test_only_a_verified_release_with_no_fabric_debt_ends_the_streak(monkeypatch
     monkeypatch.setattr(srv, "health_dir", lambda: tmp_path)
     monkeypatch.setattr(recovery_base, "health_dir", lambda: tmp_path)
     m = srv.recovery_mechanism
+    # Each cycle took the host down: recorded on an earlier boot (spec 04 I72).
+    monkeypatch.setattr(m, "_current_boot_id", lambda: "boot-earlier")
     for i in range(3):
         m.record_auto_recovery("power-cycle", "tray off", now_epoch=time.time() - 3000 + i)
+    monkeypatch.setattr(m, "_current_boot_id", lambda: "boot-now")
     assert m.power_cycle_interval() == 7200
     held = []
     monkeypatch.setattr(srv, "_hold_device_fabric_unverified", lambda why: held.append(why))

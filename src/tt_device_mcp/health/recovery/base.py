@@ -204,6 +204,54 @@ def host_action_pending_sec() -> float:
     return min(v, HOST_ACTION_PENDING_MAX_SEC)
 
 
+# Spec 04 I72: a power-cycle request whose pending window ran out on the same boot never took the
+# host down (an unreachable BMC, a cycler that failed after it detached). It is a missed attempt, not
+# a cycle: it neither anchors the I65 cooldown, nor counts toward its doubling, the per-boot cap or the
+# backstop. The cycle is asked again this long after each miss's window (the last value repeats): at
+# once for the first, since the window already gave the cycler its time, so the next request goes out at
+# most the window plus 5 min after one the BMC missed. From the second miss on an operator is paged,
+# about once an hour, while the retries go on.
+POWER_CYCLE_MISS_RETRY_SEC = (0, 300)
+POWER_CYCLE_MISS_PAGE_AFTER = 2
+POWER_CYCLE_MISS_REPAGE_SEC = 3600
+
+
+def _power_cycle_missed(rec: dict, boot_id: str, now: float) -> bool:
+    """Whether ledger row ``rec`` is a power-cycle request that never took the host down: marked so,
+    or recorded on the current boot more than the pending window ago (had it acted, this would be a
+    new boot). An unknown boot id or an unreadable stamp reads False: the row still counts as a cycle."""
+    if rec.get("action") != "power-cycle":
+        return False
+    if rec.get("took_host_down") is False:
+        return True
+    at = _past_epoch(rec.get("at_epoch"), now)
+    return bool(boot_id) and rec.get("boot_id") == boot_id and at is not None and now - at >= host_action_pending_sec()
+
+
+def _late_power_cycle(ledger: list[dict], boot_id: str, btime: Optional[float], now: float) -> Optional[dict]:
+    """Spec 04 I72: the power-cycle row marked missed that brought this boot up after all (a cycler
+    that acted after its pending window). It is the last escalation row before this boot started,
+    from an earlier boot, and this boot started within the pending window plus the attribution window
+    of it. A cycle that ran counts (the boot-loop-safe side). None otherwise, or when this boot or its
+    start is unknown."""
+    if not boot_id or btime is None:
+        return None
+    last: Optional[tuple[float, dict]] = None
+    for rec in ledger:
+        at = _past_epoch(rec.get("at_epoch"), now)
+        if rec.get("action") in AUTO_RECOVERY_RANK and at is not None and at <= btime:
+            if last is None or at >= last[0]:
+                last = (at, rec)
+    if last is None:
+        return None
+    at, rec = last
+    if rec.get("action") != "power-cycle" or rec.get("took_host_down") is not False:
+        return None
+    if not rec.get("boot_id") or rec.get("boot_id") == boot_id:
+        return None
+    return rec if btime - at <= host_action_pending_sec() + BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC else None
+
+
 class HostActionTimedOut(RuntimeError):
     """A host reboot / power-cycle command that timed out rather than exited non-zero. It may have
     launched its detached cycler before it stopped answering, so the request stays pending (with its
@@ -422,6 +470,8 @@ class RecoveryMechanism:
         # cap reached, not on every gate pass.
         self._power_cycle_backstop_paged: float = 0.0
         self._power_cycle_backstop_logged: float = 0.0
+        # Spec 04 I72: when (monotonic) the missed-power-cycle page last went out; 0.0 = never.
+        self._power_cycle_miss_paged: float = 0.0
 
         # True while a reset is actually executing. A reset TAKES THE CHIPS OFF THE BUS — that is
         # what a reset is — so during one they read all-ones exactly like a dead chip, and isolating
@@ -521,6 +571,8 @@ class RecoveryMechanism:
         if age >= host_action_pending_sec():
             self.host_action_requested = None
             health_event("host_action_request_expired", action=action, bound_sec=int(host_action_pending_sec()))
+            if action == "power-cycle":
+                self.note_missed_power_cycles()
             return None
         return action, age
 
@@ -1260,7 +1312,14 @@ class RecoveryMechanism:
             gap = float(btime) - float(at)
         except (TypeError, ValueError):
             return None
-        if not (0 <= gap <= BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC):
+        # Spec 04 I72: a request marked missed brought nothing up, unless it is the late cycle that
+        # brought this boot up; a late one (marked so, or found now) gets its pending window too.
+        late = last.get("late") is True
+        if last.get("took_host_down") is False:
+            late = _late_power_cycle(ledger, current_boot_id, float(btime), time.time()) is last
+            if not late:
+                return None
+        if not (0 <= gap <= BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC + (host_action_pending_sec() if late else 0)):
             return None
         return last
 
@@ -1303,10 +1362,14 @@ class RecoveryMechanism:
         # de-escalation inside a loop (spec 04 I9/I10). Past the backstop no cycle counts as proof.
         verified = self.last_verified_release()
         if action == "power-cycle":
+            # Spec 04 I72: a request that never took the host down is a missed attempt, not a cycle.
+            # It gates only by its own short retry backoff (below), nothing else here.
+            self._mark_missed_power_cycles(ledger, now_epoch)
+            requests, ledger = ledger, self._cycles_that_ran(ledger, now_epoch)
             backstop = self._power_cycle_backstop(ledger, now_epoch)
             if backstop is not None:
                 return self._deny_power_cycle(backstop)
-        elif verified and _power_cycle_backstop_until(ledger, now_epoch) is not None:
+        elif verified and _power_cycle_backstop_until(self._cycles_that_ran(ledger, now_epoch), now_epoch) is not None:
             verified = None
         rank = AUTO_RECOVERY_RANK.get(action, max(AUTO_RECOVERY_RANK.values()))
         # Spec 04 I65: the power cycle's spacing is its cooldown, counted from the latest cycle or
@@ -1360,6 +1423,12 @@ class RecoveryMechanism:
             cooldown = self.power_cycle_cooldown(now_epoch=now_epoch, ledger=ledger)
             if cooldown is not None:
                 return self._deny_power_cycle(cooldown)
+            pending = self._power_cycle_still_pending(now_epoch)
+            if pending is not None:
+                return self._deny_power_cycle(pending)
+            missed = self.power_cycle_miss_state(requests, now_epoch=now_epoch)
+            if missed is not None and now_epoch < missed["until"]:
+                return self._deny_power_cycle(missed)
         boot_id = self._current_boot_id()
         if boot_id:
             # The per-boot cap counts this boot's requests within the action's interval only: a
@@ -1404,15 +1473,183 @@ class RecoveryMechanism:
             self.power_cycle_cooldown_state = None
         return True, ""
 
+    def _cycles_that_ran(self, ledger: list[dict], now_epoch: float) -> list[dict]:
+        """``ledger`` without the power-cycle requests that never took the host down (spec 04 I72). A
+        missed one that brought this boot up late is a cycle that ran and stays."""
+        boot_id = self._current_boot_id()
+        late = _late_power_cycle(ledger, boot_id, self._btime(now_epoch), now_epoch)
+        return [r for r in ledger if r is late or not _power_cycle_missed(r, boot_id, now_epoch)]
+
+    def _btime(self, now_epoch: float) -> Optional[float]:
+        return _past_epoch(self._boot_btime_id() or None, now_epoch)
+
+    def _power_cycle_still_pending(self, now_epoch: float) -> Optional[dict]:
+        """Spec 04 I72: the stated wait while the last power-cycle request is still inside its pending
+        window in memory (it counts from the hand-off, after the pre-fire hook, so it can end after the
+        ledger row's window). No retry goes out on top of a cycle that may still come. None otherwise."""
+        req = self.host_action_requested
+        if req is None or req[0] != "power-cycle":
+            return None
+        window = host_action_pending_sec()
+        age = max(0.0, time.monotonic() - req[1])
+        if age >= window:
+            return None
+        until = now_epoch + window - age
+        return {
+            "until": until,
+            "last": now_epoch - age,
+            "cause": "power-cycle request still pending",
+            "interval_sec": int(window),
+            "why": (
+                f"a power cycle requested {int(age)}s ago is still pending (window {int(window)}s): not "
+                f"asking again before {_local_time(until)}, {int(window - age) + 1}s more"
+            ),
+        }
+
+    def power_cycle_miss_state(
+        self, ledger: Optional[list[dict]] = None, *, now_epoch: Optional[float] = None
+    ) -> Optional[dict]:
+        """Spec 04 I72: the retry after the power-cycle requests that never took the host down, or None
+        when there is none since this boot (or the last verified release, if later). ``missed`` counts
+        them; ``until`` is the last one's pending window plus the backoff for that count. Same keys as
+        :meth:`power_cycle_cooldown`, so /health and the watchdog read it the same way."""
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        ledger = self.read_auto_recovery_ledger() if ledger is None else ledger
+        boot_id = self._current_boot_id()
+        since = max(self._btime(now_epoch) or 0.0, self._streak_start(now_epoch))
+        stamps = []
+        for rec in ledger or []:
+            at = _past_epoch(rec.get("at_epoch"), now_epoch)
+            if at is not None and at > since and _power_cycle_missed(rec, boot_id, now_epoch):
+                stamps.append(at)
+        if not stamps:
+            return None
+        count, last = len(stamps), max(stamps)
+        backoff = POWER_CYCLE_MISS_RETRY_SEC[min(count, len(POWER_CYCLE_MISS_RETRY_SEC)) - 1]
+        until = last + host_action_pending_sec() + backoff
+        page = (
+            "; paging an operator: check the BMC and the power-cycle command"
+            if count >= POWER_CYCLE_MISS_PAGE_AFTER
+            else ""
+        )
+        return {
+            "until": until,
+            "last": last,
+            "cause": "missed power-cycle request",
+            "interval_sec": backoff,
+            "missed": count,
+            "why": (
+                f"{count} power-cycle request(s) this boot never took the host down (last {_local_time(last)}): "
+                f"asking again at {_local_time(until)}, {max(0, int(until - now_epoch)) + 1}s more{page}"
+            ),
+        }
+
+    def _mark_missed_power_cycles(self, ledger: list[dict], now_epoch: float, *, late_only: bool = False) -> None:
+        """Mark each power-cycle row this boot whose pending window ran out ``took_host_down: false``
+        in ``ledger`` and on disk, so a later boot still knows it was no cycle (spec 04 I72). A missed
+        row that brought this boot up after all is marked ``took_host_down: true, late: true``, so
+        every later boot counts it as the cycle it was. One event per row marked; the page from the
+        second miss on. ``late_only`` writes only the late mark. A ledger that cannot be rewritten
+        keeps the rows as they were (logged): on this boot they read the same all the same. Never
+        raises."""
+        boot_id = self._current_boot_id()
+        fresh = (
+            []
+            if late_only
+            else [r for r in ledger if "took_host_down" not in r and _power_cycle_missed(r, boot_id, now_epoch)]
+        )
+        late = _late_power_cycle(ledger, boot_id, self._btime(now_epoch), now_epoch)
+        if not fresh and late is None:
+            return
+        marks = {(r.get("boot_id"), r.get("at_epoch")): {"took_host_down": False} for r in fresh}
+        if late is not None:
+            marks[(late.get("boot_id"), late.get("at_epoch"))] = {"took_host_down": True, "late": True}
+            late.update(took_host_down=True, late=True)
+            health_event(
+                "power_cycle_request_late",
+                requested_at=late.get("at"),
+                bound_sec=int(host_action_pending_sec() + BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC),
+            )
+        for r in fresh:
+            r["took_host_down"] = False
+        path = health_dir() / AUTO_RECOVERY_LEDGER
+        try:
+            out = []
+            for ln in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    rec = json.loads(ln)
+                except ValueError:
+                    out.append(ln)
+                    continue
+                mark = marks.get((rec.get("boot_id"), rec.get("at_epoch"))) if isinstance(rec, dict) else None
+                if mark and rec.get("action") == "power-cycle" and rec.get("took_host_down") is not True:
+                    rec.update(mark)
+                    ln = json.dumps(rec, default=str)
+                out.append(ln)
+            tmp = path.with_name(path.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("".join(f"{ln}\n" for ln in out))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except OSError as e:
+            log.warning(f"auto-recovery ledger not rewritten, power-cycle rows left as they were (spec 04 I72): {e}")
+        if not fresh:
+            return
+        state = self.power_cycle_miss_state(ledger, now_epoch=now_epoch)
+        for r in fresh:
+            health_event(
+                "power_cycle_request_missed",
+                requested_at=r.get("at"),
+                bound_sec=int(host_action_pending_sec()),
+                missed=(state or {}).get("missed"),
+                retry_at_epoch=(state or {}).get("until"),
+                host_at_risk=True,
+            )
+        if state is not None and state["missed"] >= POWER_CYCLE_MISS_PAGE_AFTER:
+            mono = time.monotonic()
+            if not self._power_cycle_miss_paged or mono - self._power_cycle_miss_paged >= POWER_CYCLE_MISS_REPAGE_SEC:
+                event = {"kind": "power_cycle_missed", "count": state["missed"], "message": state["why"]}
+                if alert.send_alert(event) is not None or alert.alert_argv() is None:
+                    self._power_cycle_miss_paged = mono
+
+    def mark_late_power_cycle(self, *, now_epoch: Optional[float] = None) -> None:
+        """Run once at broker startup: if a power-cycle request marked missed brought this boot up
+        after all, write its late mark now (spec 04 I72). Otherwise only this boot's power-cycle gate
+        or a window running out writes it, and a boot that escalates by reboot, or not at all, leaves
+        the row missed, so later boots drop that cycle from the I65 doubling and the backstop.
+        Idempotent: a row already marked is no longer found. An unreadable ledger is left as it is and
+        logged. Never raises."""
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        ledger = self.read_auto_recovery_ledger()
+        if ledger is None:
+            log.warning("auto-recovery ledger unreadable at startup: no late power-cycle mark written (spec 04 I72)")
+            return
+        if ledger:
+            self._mark_missed_power_cycles(ledger, now_epoch, late_only=True)
+
+    def note_missed_power_cycles(self, *, now_epoch: Optional[float] = None) -> None:
+        """Called when a power-cycle request's pending window runs out with the host still up: mark it
+        missed and put its retry deadline on /health and the hold watchdog (spec 04 I72). Never raises."""
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        ledger = self.read_auto_recovery_ledger()
+        if not ledger:
+            return
+        self._mark_missed_power_cycles(ledger, now_epoch)
+        state = self.power_cycle_miss_state(ledger, now_epoch=now_epoch)
+        if state is not None:
+            # A retry due now (the first miss) is still a deadline: the watchdog asks at once.
+            self._deny_power_cycle(state)
+
     def power_cycle_interval(self, ledger: Optional[list[dict]] = None, *, now_epoch: Optional[float] = None) -> int:
         """The power-cycle cooldown's length now: :func:`power_cycle_interval_sec` of the broker power
         cycles recorded since the last verified release (spec 04 I65). A record stamped later than now
         is not counted, so it cannot outlive a verified release."""
         now_epoch = time.time() if now_epoch is None else now_epoch
         ledger = self.read_auto_recovery_ledger() if ledger is None else ledger
-        healed = self._power_cycle_healed_at(now_epoch)
+        healed = self._streak_start(now_epoch)
         failed = 0
-        for rec in ledger or []:
+        for rec in self._cycles_that_ran(ledger or [], now_epoch):
             # An unreadable stamp counts: the longer (still capped) cooldown is the safe side.
             if rec.get("action") == "power-cycle" and _epoch_after(rec.get("at_epoch"), healed, now_epoch):
                 failed += 1
@@ -1440,7 +1677,7 @@ class RecoveryMechanism:
         verified_this_boot = verified_at is not None and bool(boot_id) and (verified or {}).get("boot_id") == boot_id
         anchors: list[tuple[float, str]] = []
         broker_last: Optional[tuple[float, str]] = None
-        for rec in ledger or []:
+        for rec in self._cycles_that_ran(ledger or [], now_epoch):
             if rec.get("action") not in AUTO_RECOVERY_RANK:
                 continue
             at = _past_epoch(rec.get("at_epoch"), now_epoch)
@@ -1478,6 +1715,13 @@ class RecoveryMechanism:
             ),
         }
 
+    def _streak_start(self, now_epoch: float) -> float:
+        """When the power-cycle backoff streak last ended: the later of the heal file and the last
+        verified release (spec 04 I65). A cycle a later verified release followed healed the box, heal
+        file or not (one written before the heal file existed has none). 0.0 when neither is known."""
+        verified = _past_epoch((self.last_verified_release() or {}).get("at_epoch"), now_epoch)
+        return max(self._power_cycle_healed_at(now_epoch), verified or 0.0)
+
     def _power_cycle_healed_at(self, now_epoch: float) -> float:
         """When the last verified release ended the streak; 0.0 (no heal: every cycle counts, the
         longer capped cooldown) when unknown, unreadable or later than now."""
@@ -1493,6 +1737,7 @@ class RecoveryMechanism:
         cycle is recorded after the last heal. Never raises."""
         self.power_cycle_retry = None
         self.power_cycle_cooldown_state = None
+        self._power_cycle_miss_paged = 0.0
         now_epoch = time.time() if now_epoch is None else now_epoch
         ledger = self.read_auto_recovery_ledger() or []
         healed = self._power_cycle_healed_at(now_epoch)
