@@ -1106,6 +1106,7 @@ _recovery_deps = RecoveryDeps(
     chip_pci_bdf=lambda idx: chip_pci_bdf(idx),
     health_event=lambda kind, **f: health_event(kind, **f),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
+    owe_device_pollers=lambda reason: _owe_device_pollers(reason),
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
     hold_device_fabric_unverified=lambda why: _hold_device_fabric_unverified(why),
     note_fabric_77_reset_passes=lambda n: _note_fabric_77_reset_passes(n),
@@ -5249,11 +5250,17 @@ def _pollers_unfit_reason() -> Optional[str]:
     """Why the device is not fit for the pollers to start on, or None. Only a HEALTHY FSM is: every
     route to it is a passing gate (spec 03), and every reset leaves the FSM off it until then. A
     poller started on a held mesh re-opens every chip in a loop, chips off the bus included: a
-    telemetry poller crash-looped every ~35 s over a 32-chip mesh held with 8 chips off the bus."""
+    telemetry poller crash-looped every ~35 s over a 32-chip mesh held with 8 chips off the bus.
+    An operator reset leaves the FSM HEALTHY, so a reset that still owes its fabric pass (spec 04
+    I32) is unfit too: its verify (I13) runs on a quiet bus, and the settle starts them."""
     rec = fsm.record
-    if rec.state is ServerState.HEALTHY:
-        return None
-    return f"device {rec.state.value} ({rec.why or '?'})"
+    if rec.state is not ServerState.HEALTHY:
+        return f"device {rec.state.value} ({rec.why or '?'})"
+    try:
+        debt = _post_reset_debt()
+    except Exception:  # noqa: BLE001 - an unreadable debt never keeps the pollers off a HEALTHY device
+        debt = ""
+    return f"fabric unverified since {debt}" if debt else None
 
 
 async def _set_device_pollers(active: bool, log) -> list[str]:
@@ -5272,16 +5279,14 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         # nothing, so its post-reset verify runs on the same quiet bus. The owner restarts them.
         log(f"device pollers kept stopped: {_pollers_held_for} still running")
         return []
-    global _pollers_owed, _pollers_owed_loop
+    global _pollers_owed
     if active:
         unfit = _pollers_unfit_reason()
         if unfit:
             # A failed reset, or one whose verify has not passed yet: the pollers wait for the device to
-            # be proven healthy, and the close listener starts them then. Costs no recovery time.
-            if _pollers_owed is None:
-                health_event("pollers_kept_quiesced", reason=unfit, services=list(DEVICE_POLLER_SERVICES))
-            _pollers_owed = unfit
-            _pollers_owed_loop = asyncio.get_running_loop()
+            # be proven healthy, and the close (or fabric-settle) listener starts them then. Costs no
+            # recovery time.
+            _owe_device_pollers(unfit)
             log(f"device pollers kept stopped until the device is verified healthy: {unfit}")
             return []
         _pollers_owed = None
@@ -5368,10 +5373,26 @@ def _pollers_log(line: str) -> None:
         logger.info(f"HEALTH {line}")
 
 
+def _owe_device_pollers(reason: str) -> None:
+    """Record that the pollers are stopped and owed a restart: the next close to HEALTHY, or the
+    fabric pass that settles a post-reset debt, starts them (``_restore_pollers_on_close``). For a
+    deferred restore, and for a stop with no paired restore (the dead-chip valve, which an idle
+    relift may close without any reset). Journaled once per owed stretch."""
+    global _pollers_owed, _pollers_owed_loop
+    if _pollers_owed is None:
+        health_event("pollers_kept_quiesced", reason=reason, services=list(DEVICE_POLLER_SERVICES))
+    _pollers_owed = reason
+    try:
+        _pollers_owed_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        pass  # no loop on this thread: keep the one an earlier deferral recorded
+
+
 async def _restore_owed_pollers() -> None:
     """Start the pollers a restart deferred, once the device is proven healthy. Best-effort and off
-    the release path: the queue never waits on it."""
-    if _pollers_owed is None:
+    the release path: the queue never waits on it. A settle on a device still unfit (a ladder
+    verify passing its fabric while the FSM is still recovering) leaves them owed, quietly."""
+    if _pollers_owed is None or _pollers_unfit_reason() is not None:
         return
     try:
         await _set_device_pollers(True, _pollers_log)
@@ -5380,8 +5401,9 @@ async def _restore_owed_pollers() -> None:
 
 
 def _restore_pollers_on_close() -> None:
-    """Close listener: the device just reached HEALTHY, so start the pollers a restart deferred.
-    Cheap, never raises, safe from any thread."""
+    """Close and fabric-settle listener: the device just reached HEALTHY, or a passing fabric pass
+    just settled a post-reset debt, so start the pollers a restart deferred. Cheap, never raises,
+    safe from any thread."""
     loop = _pollers_owed_loop
     if _pollers_owed is None or loop is None or loop.is_closed():
         return
@@ -5405,6 +5427,8 @@ def _restore_pollers_on_close() -> None:
 
 
 add_close_listener(_restore_pollers_on_close)
+# An operator reset never leaves HEALTHY, so its fabric verify settling the debt is its "close".
+FABRIC_DEBT.add_settle_listener(_restore_pollers_on_close)
 
 
 def _auto_reboot_enabled() -> bool:

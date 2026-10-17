@@ -275,6 +275,9 @@ class RecoveryDeps:
     chip_pci_bdf: Optional[Callable[[str], Optional[str]]] = None
     health_event: Optional[Callable[..., None]] = None
     kill_device_holders: Optional[Callable[[str], Awaitable[list]]] = None
+    # Marks the pollers the dead-chip valve stopped as owed a restart (server._owe_device_pollers):
+    # that stop has no paired restore, and an idle relift can close the episode with no reset.
+    owe_device_pollers: Optional[Callable[[str], None]] = None
     mark_device_dirty: Optional[Callable[..., None]] = None
     # Places a not-dirty fabric-unverified hold (server._hold_device_fabric_unverified): a reset whose
     # fabric stayed a 77 settles there, never as a failed reset.

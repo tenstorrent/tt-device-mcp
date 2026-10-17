@@ -3048,6 +3048,33 @@ async def test_deferred_pollers_start_once_the_device_is_verified_healthy(monkey
 
 
 @pytest.mark.asyncio
+async def test_a_dead_chip_stop_owes_the_pollers_a_restart_on_the_next_close(monkeypatch):
+    """The dead-chip valve stops the pollers with no paired restore. An episode that then closes
+    through the idle relift, with no reset, left tt-telemetry stopped for good. The stop owes the
+    restart: nothing starts while the chip is out, and the next close to HEALTHY starts them."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+    srv.isolated_chips = set()
+    monkeypatch.setattr(srv, "isolate_chip", lambda idx: True)
+    monkeypatch.setattr(srv, "chip_pci_bdf", lambda idx: f"0000:46:00.{idx}")
+    monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+
+    await srv.sampler.isolate_dead_chips(["13"])
+
+    assert [c for c in calls if c[0] == "stop"] == [("stop", u) for u in DEFAULT_POLLERS]
+    assert not [c for c in calls if c[0] == "start"], calls
+    assert srv._pollers_owed and "13" in srv._pollers_owed
+    assert srv.fsm.state is not ServerState.HEALTHY
+
+    fsm_healthy(srv)  # the idle relift's passing full check
+    await asyncio.gather(*list(srv._pollers_restore_tasks))
+
+    assert [c for c in calls if c[0] == "start"] == [("start", u) for u in DEFAULT_POLLERS]
+    assert srv._pollers_owed is None
+
+
+@pytest.mark.asyncio
 async def test_the_startup_quiesce_keeps_the_pollers_stopped_when_the_gate_holds(monkeypatch):
     """The startup fabric block: the forced gate held the mesh
     with 8/32 off the bus, and the block's exit restarted tt-telemetry onto it. A hold at the
