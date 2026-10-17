@@ -223,6 +223,11 @@ AUTO_RECOVERY_RANK = {"reboot": 1, "power-cycle": 2}
 AUTO_RECOVERY_VERIFIED = "auto_recovery_verified.json"
 POWER_CYCLE_BACKSTOP_MAX = 3
 POWER_CYCLE_BACKSTOP_WINDOW_SEC = 7200
+# A broker reboot no verified release followed counts as tried for the whole hold episode (spec 04
+# I10), so the next host rung is the power cycle at its I65 cooldown's end, never a second reboot.
+# With no verified release on record (none yet, or unreadable) the episode has no known start: a
+# reboot then counts for this long, which outlasts the reboot, its boot and the longest cooldown.
+REBOOT_EPISODE_UNVERIFIED_MAX_SEC = AUTO_RECOVERY_MIN_INTERVAL_SEC + POWER_CYCLE_BACKOFF_CAP_SEC
 
 # The metrics.STAGES name for each auto-recovery action _fire_recovery_escalation ever fires. An
 # explicit table, not a ternary: a third action added here later must fail loud (KeyError) rather
@@ -1462,11 +1467,19 @@ class RecoveryMechanism:
         self.power_cycle_retry = None
 
     def _reboot_already_attempted(self, *, now_epoch: Optional[float] = None) -> bool:
+        """The chooser's read: :meth:`reboot_tried_this_episode`."""
+        return self.reboot_tried_this_episode(now_epoch=now_epoch)
+
+    def reboot_tried_this_episode(self, *, now_epoch: Optional[float] = None) -> bool:
         """True if the broker already auto-rebooted for the wedge it is still looking at: a reboot
-        record from a PREVIOUS boot (this boot is the one that came back up) within the loop-guard
-        interval. That is the signal a warm reboot did not clear the mesh, and only then is the more
-        drastic power cycle the right rung. An unreadable ledger reads as 'not attempted' here — the
-        governor is what fails closed on it; this only chooses which rung to offer the governor."""
+        record from a PREVIOUS boot (this boot is the one that came back up) stamped after the last
+        verified-healthy release (spec 04 I10). That is the signal a warm reboot did not clear
+        the mesh, and only then is the more drastic power cycle the right rung. It holds for the whole
+        episode, not for a fixed time: the I65 cooldown after the reboot's boot can outlast any fixed
+        window, and a reboot re-chosen at its end loops on reboots while the cycle never fires. With
+        no verified release on record a reboot counts for REBOOT_EPISODE_UNVERIFIED_MAX_SEC. An
+        unreadable ledger reads as 'not attempted' here — the governor is what fails closed on it;
+        this only chooses which rung to offer the governor."""
         ledger = self.read_auto_recovery_ledger()
         if not ledger:
             return False
@@ -1480,16 +1493,19 @@ class RecoveryMechanism:
             # path with no loop guard at all.
             return False
         now_epoch = time.time() if now_epoch is None else now_epoch
+        verified_at = _past_epoch((self.last_verified_release() or {}).get("at_epoch"), now_epoch)
         for rec in reversed(ledger):
             if rec.get("action") != "reboot":
                 continue
             if rec.get("boot_id") == boot_id:
                 continue  # a reboot recorded under THIS boot has not taken the box down yet
-            try:
-                at = float(rec.get("at_epoch"))
-            except (TypeError, ValueError):
+            at = _past_epoch(rec.get("at_epoch"), now_epoch)
+            if at is None:
                 continue
-            if now_epoch - at < AUTO_RECOVERY_MIN_INTERVAL_SEC:
+            if verified_at is not None:
+                if at > verified_at:
+                    return True  # no verified release since it: the same episode
+            elif now_epoch - at < REBOOT_EPISODE_UNVERIFIED_MAX_SEC:
                 return True
         return False
 
