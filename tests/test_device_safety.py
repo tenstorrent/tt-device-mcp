@@ -11002,8 +11002,16 @@ async def test_stuck_offbus_hold_reset_regression_holds_loudly_never_reboots(mon
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # galaxy + reboot floor = 16
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    sweeps = []
+
+    async def sweep(*a, **k):
+        sweeps.append(k.get("context"))
+        return False
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", sweep)
     ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
     assert ran is True and counters["resets"] == 1
+    assert len(sweeps) == 1, "past the 10-min bound the failed sweep runs before the page (spec 04 I31/I76)"
     assert (
         counters["reboots"] == 0
     ), "a reset that regressed the mesh off the bus must never warm-reboot on the idle path"
@@ -11100,7 +11108,8 @@ def _arm_regressed_offbus_hold(monkeypatch, *, held_minutes_ago=21):
 @pytest.mark.asyncio
 async def test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset(monkeypatch, clear_job_state):
     """The next forced window after a regressing reset fires no reset rung: it pages for the cold rung and
-    holds. Fails on base, which fires the same galaxy reset again (resets == 2)."""
+    holds. Fails on base, which fires the same galaxy reset again (resets == 2). Past the 10-min bound the
+    last-chance sweep still runs once per episode before the page (spec 04 I31/I76), never twice."""
     counters, events = _arm_regressed_offbus_hold(monkeypatch)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
     first = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
@@ -11112,7 +11121,8 @@ async def test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset(mon
     assert counters["sbr"] == 0 and counters["trays"] == 0, "no gentler reset rung re-runs either"
     assert "galaxy_reset_skipped_regressed" in events
     assert "reset_unrecoverable_power_cycle_required" in events, "with no power cycle opted in it pages"
-    assert counters["reboots"] == 0 and counters["power_cycles"] == 0 and counters["sweeps"] == 0
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0
+    assert counters["sweeps"] == 1, "the bound's full ladder sweeps once per episode, then pages"
 
 
 @pytest.mark.asyncio

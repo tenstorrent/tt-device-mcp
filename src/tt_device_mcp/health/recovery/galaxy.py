@@ -1092,6 +1092,8 @@ class GalaxyRecovery(Recovery):
     _fabric_77_handoff: Optional[dict] = None
     # Why auto_recovery_allowed last held a host rung off (a cooldown, the rate limit, a tenant).
     _host_rung_denied_why: str = ""
+    # The episode whose 10-min-bound sweep already ran with no host rung to climb to (spec 04 I31/I76).
+    _bound_sweep_since: Optional[str] = None
     # Whether the last idle-ladder escalate() stood down on a live tenant (spec 04 I7). The hold
     # watchdog reads it to re-arm the window it spent, so the ladder runs once the tenant is gone
     # rather than at the next window (spec 03 I23).
@@ -3265,6 +3267,24 @@ class GalaxyRecovery(Recovery):
         escalation, reboot_blocked = _host_escalation_for_drop(
             off_bus, expected, warm_reboot_futile=warm_reboot_futile, **self.deps.host_escalation_kwargs()
         )
+        if (
+            (reboot_blocked or not escalation)
+            and not swept
+            and not failed_unchanged
+            and (hold_age is None or hold_age >= _stuck_hold_ceiling_sec())
+            and self._bound_sweep_since != (hold_since or "")
+        ):
+            # Spec 04 I76/I31: at the 10-min bound the full ladder, last-chance sweep included, runs
+            # once per episode before any page, even with no host rung to climb to. Only the sweep's
+            # own full check, fabric included, releases; a failed one pages below and keeps the hold.
+            # A sweep a tenant or a live reset scope held off (None) is not spent: the next window retries.
+            bound_sweep = await self._settle_and_verify_before_host_rung(
+                expected, log, "idle-escalation", context=f"10-min hold bound, {off_bus}/{expected} off the bus"
+            )
+            if bound_sweep is not None:
+                self._bound_sweep_since = hold_since or ""
+            if bound_sweep is not False:
+                return HOST_RUNG_DEFERRED
         if reboot_blocked:
             # No chassis power cycle is opted in and no rung can recover it: fail closed loudly and hold,
             # never fire a reboot that lands right back in the dead state. A whole-bus drop and a reset
