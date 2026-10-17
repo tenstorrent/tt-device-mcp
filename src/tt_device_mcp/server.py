@@ -5596,7 +5596,10 @@ async def device_health_gate(
         # Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, paid here with no
         # pre-reset fabric pass or eth read: the full check after the reset runs both. A spent latch,
         # the outage hold or a cooldown clears the debt and keeps today's path (the dirty exit's pass).
-        kill_debt = _kill_reset_debt() if with_recover and phase == "post-job" else ""
+        # The startup gate pays a debt it finds the same way (I74): a re-adopted job the broker stopped
+        # before it ran. Its one full check, fabric included, then follows the reset instead of a pass
+        # before it, and the post-job gate owes nothing after. A debt owed after this gate stays open.
+        kill_debt = _kill_reset_debt() if with_recover and phase in ("post-job", "startup") else ""
         if kill_debt:
             refused = (
                 "this hold episode's present-mesh reset is spent"
@@ -8975,7 +8978,8 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                 )
             # Spec 03 I69: a re-adopted job the broker stopped (its timeout, or a requested kill) owes
             # the same one reset + full check as one the runner stopped. This path has no post-job
-            # gate: the I68 idle gate pays it on an idle queue, the runner's door before a waiting job.
+            # gate: the startup gate pays it when it is still open there (I74), else the I68 idle gate
+            # on an idle queue or the runner's door before a waiting job.
             if not fault and not reset_killed and (timed_out or request_killed):
                 _owe_kill_reset(f"re-adopted job {job_id} {job.status.value}")
             if job.log_file:
