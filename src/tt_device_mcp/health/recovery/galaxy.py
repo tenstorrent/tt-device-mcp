@@ -1090,6 +1090,8 @@ class GalaxyRecovery(Recovery):
     _host_rung_77_paged_since: Optional[str] = None
     # The operator hand-off of a 77 the host rung did not end (spec 04 I29): its episode and deadline.
     _fabric_77_handoff: Optional[dict] = None
+    # Why auto_recovery_allowed last held a host rung off (a cooldown, the rate limit, a tenant).
+    _host_rung_denied_why: str = ""
     # Whether the last idle-ladder escalate() stood down on a live tenant (spec 04 I7). The hold
     # watchdog reads it to re-arm the window it spent, so the ladder runs once the tenant is gone
     # rather than at the next window (spec 03 I23).
@@ -2967,7 +2969,17 @@ class GalaxyRecovery(Recovery):
                     # Only waiting (the ladder ceiling, a reset in its scope): no page, the next
                     # escalation of the episode retries the climb.
                     return
-                spent = "the host rung could not run (not opted in, rate-limited or a tenant holds the mesh)"
+                if outcome == HOST_RUNG_DENIED:
+                    # Held off for now (the I65 cooldown, the rate limit, a tenant): the rung is not
+                    # spent, so every later re-check of the episode climbs again and fires it once
+                    # allowed (spec 04 I79). The page says so; an operator acts only if it never can.
+                    spent = (
+                        f"the host rung could not run yet ({self._host_rung_denied_why}); the broker retries "
+                        "it on every re-check and fires it once allowed"
+                    )
+                    self._hand_77_hold_to_operator(hold_since, expected, spent, log, broker_retries=True)
+                    return
+                spent = "the host rung could not run (not opted in)"
             self._hand_77_hold_to_operator(hold_since, expected, spent, log)
             return
         await self._climb_to_host_recovery_after_failed_reset(
@@ -3008,17 +3020,27 @@ class GalaxyRecovery(Recovery):
             return False
         return self.mechanism.unverified_reset_since == hold_since or self._fabric_77_cold_rung_due()
 
-    def _hand_77_hold_to_operator(self, hold_since: str, expected: int, why: str, log) -> None:
+    def _hand_77_hold_to_operator(
+        self, hold_since: str, expected: int, why: str, log, *, broker_retries: bool = False
+    ) -> None:
         """A 77 the host rung did not end: keep the device held and page an operator once per episode
         with a deadline (spec 04 I29). The idle relift keeps re-running the full check, fabric
-        included, on its backoff (spec 03 I48); only a passing one releases it."""
+        included, on its backoff (spec 03 I48); only a passing one releases it. ``broker_retries``:
+        the rung was only held off (a cooldown, the rate limit, a tenant) and the broker fires it
+        itself once allowed (I79), so the page and /health name the broker as the owner meanwhile."""
         h = self._fabric_77_handoff
         if h and h["episode"] == hold_since:
+            h["why"], h["broker_retries"] = why, broker_retries
             log(f"fabric still unverified (77) and {why} — held, handed to an operator")
             return
         deadline = time.time() + FABRIC_77_HANDOFF_SEC
         act_by = datetime.fromtimestamp(deadline).isoformat(timespec="seconds")
-        self._fabric_77_handoff = {"episode": hold_since, "deadline": deadline, "why": why}
+        self._fabric_77_handoff = {
+            "episode": hold_since,
+            "deadline": deadline,
+            "why": why,
+            "broker_retries": broker_retries,
+        }
         event = {
             "kind": "fabric_unverified_operator_handoff",
             "held_since": hold_since,
@@ -3027,11 +3049,13 @@ class GalaxyRecovery(Recovery):
             "expected": expected,
             "act_by": act_by,
             "deadline_epoch": deadline,
+            "broker_retries": broker_retries,
         }
         health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
         log(
             f"the reset, the last-chance sweep and the host rung left the fabric unverified (77) — {why}. "
-            f"An operator must check the host (cables, hugepages, the fabric validator) by {act_by}; the "
+            + ("If it never can, an operator" if broker_retries else "An operator")
+            + f" must check the host (cables, hugepages, the fabric validator) by {act_by}; the "
             f"device stays held and the broker re-runs the full health check, fabric included, on its "
             f"backoff, releasing only on a pass"
         )
@@ -3042,12 +3066,18 @@ class GalaxyRecovery(Recovery):
         h = self._fabric_77_handoff
         if not h or not episode or h["episode"] != episode:
             return None
+        retries = bool(h.get("broker_retries"))
         return {
             "reason": f"fabric unverified (77): {h['why']}",
-            "owner": "operator",
+            "owner": "broker" if retries else "operator",
             "act_by": datetime.fromtimestamp(h["deadline"]).isoformat(timespec="seconds"),
             "act_by_epoch": h["deadline"],
-            "then": "held; the broker re-runs the full health check, fabric included, and releases only on a pass",
+            "then": (
+                "held; the broker retries the host rung on every re-check and fires it once allowed, "
+                if retries
+                else "held; "
+            )
+            + "the broker re-runs the full health check, fabric included, and releases only on a pass",
         }
 
     def _hold_77_without_host_rung(self, hold_since: str, expected: int, log) -> None:
@@ -3276,6 +3306,7 @@ class GalaxyRecovery(Recovery):
             )
             self.mechanism._journal_auto_recovery_denied(escalation, why)
             metrics.stage_fired(_HOST_ESCALATION_STAGE.get(escalation, escalation), "blocked")
+            self._host_rung_denied_why = why
             return HOST_RUNG_DENIED
         # The recorded cause names what is actually true at this point — the old fixed string
         # blamed a galaxy reset even on paths where the reset was suppressed and never ran.

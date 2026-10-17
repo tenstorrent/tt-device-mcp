@@ -13931,7 +13931,8 @@ async def test_a_boot_the_77_reboot_brought_up_climbs_cold_once_and_a_power_cycl
     """Spec 04 I79: with a power cycle opted in, the boot the 77 climb's warm reboot brought up (no
     fabric pass since the start) owes the climb at once and takes the cold rung, never a second
     reboot and never an operator page first. The boot that power cycle brought up is spent and goes
-    to an operator, still held."""
+    to an operator, still held. Once means once: the next escalation of the episode fires no second
+    cold rung; the spent rung goes to an operator with one page."""
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     counters, climbs, alerts = _arm_sweep_still_77(monkeypatch)
     monkeypatch.setattr(srv.FABRIC_DEBT, "passed_since_start", False)
@@ -13946,9 +13947,18 @@ async def test_a_boot_the_77_reboot_brought_up_climbs_cold_once_and_a_power_cycl
     if cold_climb:
         assert [c.get("cold") for c in climbs] == [True]
         assert alerts == []
+        assert srv.recovery_mechanism.unverified_77_host_rung_since == srv.device_hold_episode_since
     else:
         assert climbs == []
         assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"]
+
+    for _ in range(2):
+        assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    assert len(climbs) == (1 if cold_climb else 0), "the cold rung fires once per episode, never again"
+    assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"], "one page per episode"
+    assert g.fabric_77_handoff_status(srv.device_hold_episode_since)["owner"] == "operator"
+    if cold_climb:
+        assert g.fabric_77_climb_owed(srv.device_hold_episode_since) is False, "the fired cold rung is spent"
     assert counters["dirty_cleared"] == 0, "held: only a passing full check releases it"
 
 
@@ -14096,7 +14106,10 @@ async def test_a_77_host_rung_that_cannot_run_pages_once_and_a_later_rung_clears
         assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"], "exactly one page"
     assert "could not run" in alerts[0]["why"]
-    assert g.fabric_77_handoff_status(srv.device_hold_episode_since)["owner"] == "operator"
+    # A denied rung is only held off: the broker fires it itself once allowed (spec 04 I79).
+    owner = "operator" if cannot_run == "not_opted_in" else "broker"
+    assert g.fabric_77_handoff_status(srv.device_hold_episode_since)["owner"] == owner
+    assert alerts[0]["broker_retries"] is (cannot_run == "denied")
     assert reasons == [] and "fabric_unverified_host_rung" not in events
 
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
@@ -14105,6 +14118,113 @@ async def test_a_77_host_rung_that_cannot_run_pages_once_and_a_later_rung_clears
     assert reasons == [galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE] and len(alerts) == 1
     assert g.fabric_77_handoff_status(srv.device_hold_episode_since) is None, "the fired rung ends the hand-off"
     assert counters["dirty_cleared"] == 0
+
+
+def _arm_77_reboot_boot_cold_rung(monkeypatch):
+    """The I79 boot a 77 climb's warm reboot brought up, with a power cycle opted in and no fabric pass
+    since the broker started, through the real climb and its guards. Returns the end-to-end tuple of
+    _arm_77_host_rung_end_to_end plus ``asked``, the host actions auto_recovery_allowed was asked for."""
+    armed = _arm_77_host_rung_end_to_end(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    monkeypatch.setattr(
+        srv.recovery_mechanism,
+        "boot_from_broker_escalation",
+        lambda boot: {"action": "reboot", "reason": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE},
+    )
+    asked = []
+    return (*armed, asked)
+
+
+@pytest.mark.asyncio
+async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires_one_power_cycle(
+    monkeypatch, clear_job_state
+):
+    """Spec 04 I79: on the 77 reboot's boot, a cold rung the I65 cooldown holds off is not spent. The
+    first escalation fires nothing and pages once, naming the cooldown and the broker as the owner
+    (it retries by itself). Each later re-check climbs again; the first one the cooldown no longer
+    denies fires exactly one power cycle, never a reboot, and ends the hand-off. A further
+    escalation fires nothing more. Held throughout: only a passing full check releases it."""
+    counters, g, alerts, reasons, events, age, asked = _arm_77_reboot_boot_cold_rung(monkeypatch)
+    age["v"] = 250
+    cooldown = {"on": True}
+
+    def allowed(esc, *, tenant_active):
+        asked.append(esc)
+        if cooldown["on"]:
+            return False, "power-cycle cooldown: the last boot was 300s ago (I65), until 12:00:00"
+        return True, "ok"
+
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
+    for _ in range(2):
+        assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    assert asked == ["power-cycle"] * 2, "the cold rung, never a second reboot, asked on every re-check"
+    assert counters["power_cycles"] == 0 and reasons == []
+    assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"], "one page per episode"
+    assert "cooldown" in alerts[0]["why"] and "retries" in alerts[0]["why"]
+    status = g.fabric_77_handoff_status(srv.device_hold_episode_since)
+    assert status["owner"] == "broker" and "retries the host rung" in status["then"]
+    assert srv.recovery_mechanism.unverified_77_host_rung_since is None, "a denied rung is not spent"
+    assert g.fabric_77_climb_owed(srv.device_hold_episode_since) is True
+
+    cooldown["on"] = False
+    assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    assert counters["power_cycles"] == 1 and reasons == [], "one power cycle once the cooldown ends"
+    assert g.fabric_77_handoff_status(srv.device_hold_episode_since) is None, "the fired rung ends the hand-off"
+    assert srv.recovery_mechanism.unverified_77_host_rung_since == srv.device_hold_episode_since
+
+    for _ in range(2):
+        assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    assert counters["power_cycles"] == 1 and reasons == [], "at most one power cycle per episode"
+    assert len(asked) == 3
+    assert counters["resets"] == 0 and counters["dirty_cleared"] == 0, "held, never released unverified"
+
+
+@pytest.mark.asyncio
+async def test_the_77_bound_fallback_on_the_77_reboots_boot_marks_the_episode_and_takes_the_cold_rung(
+    monkeypatch, clear_job_state
+):
+    """Spec 04 I79: on the boot a 77 climb's warm reboot brought up, the I40 fallback that the startup
+    checks cannot clear marks the episode's reset as already spent before it escalates, so the
+    ladder runs its sweep (not a fresh reset) and climbs straight to the cold rung: one power cycle,
+    no reboot. A first-time 77 (not that boot) is not marked. Fails without the marking: the
+    escalation would run a fresh grace reset instead."""
+    counters, g, alerts, reasons, events, age, asked = _arm_77_reboot_boot_cold_rung(monkeypatch)
+    age["v"] = 250
+    monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", None)
+    monkeypatch.setattr(srv, "_post_reset_debt", lambda: "broker start")
+
+    async def eth_ok():
+        return True, "all active-eth cores advancing"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_ok)
+    marked = []
+
+    async def escalate(rung):
+        marked.append(srv.recovery_mechanism.unverified_reset_since)
+        return await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
+
+    evidence = {"fabric": {"ok": None, "detail": "rc 77"}}
+    assert await srv._fabric_77_fallback(evidence, lambda m: None, escalate) is True
+    assert marked == [srv.device_hold_episode_since], "the episode is marked before the ladder runs"
+    assert counters["resets"] == 0, "no fresh reset: the reboot already ran the episode's reset"
+    assert counters["power_cycles"] == 1 and reasons == [], "the cold rung, never a second reboot"
+    assert counters["dirty_cleared"] == 0, "held: only a passing full check releases it"
+
+    assert await srv._fabric_77_fallback(evidence, lambda m: None, escalate) is True
+    assert counters["power_cycles"] == 1, "the spent cold rung fires no second power cycle"
+
+    # A first-time 77 on a boot no 77 climb brought up is not marked: it keeps its reset.
+    monkeypatch.setattr(srv.recovery_mechanism, "boot_from_broker_escalation", lambda boot: None)
+    monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "unverified_77_host_rung_since", None)
+    marked.clear()
+
+    async def record_only(rung):
+        marked.append(srv.recovery_mechanism.unverified_reset_since)
+        return True
+
+    assert await srv._fabric_77_fallback(evidence, lambda m: None, record_only) is True
+    assert marked == [None]
 
 
 @pytest.mark.asyncio
