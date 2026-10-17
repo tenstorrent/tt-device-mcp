@@ -39,7 +39,10 @@ each rung fires only when the gentler one failed or cannot apply.
   no further reset fires for `RESET_COOLDOWN_SEC` (600 s); the device stays flagged throughout. The
   cooldown is armed only by a real outcome — a non-zero exit, a clean exit whose verify failed, or
   an adopted foreign reset that verified unhealthy — never by a timeout whose scope is still
-  cycling (that reset may yet succeed; the next caller adopts it).
+  cycling (that reset may yet succeed; the next caller adopts it). The cooldown never parks a hold:
+  a measured fault the reset did not heal (e.g. class D, lost fabric links or a latched topology
+  mismatch, spec 03 I42/I71) climbs to the host rung at the 600 s stuck-hold ceiling, so its time to
+  recover is the failed pass, the reset (~4 min) and the power cycle within the 15 min class budget.
 - **I4 — Every reset survives its broker.** For root on a systemd host, `RecoveryMechanism.run_scoped` wraps
   reset argv in `systemd-run --scope --unit=ttdev-reset-<pid>-<seq>
   --property=KillMode=mixed`. Otherwise it starts a new-session child with an inherited

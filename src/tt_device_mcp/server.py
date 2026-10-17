@@ -143,7 +143,6 @@ from tt_device_mcp.health import (
     isolate_chip,
     journal_interrupted_fabric_check,
     mark_boot,
-    mesh_hold_repage_sec,
     mesh_reset_hold_reason,
     note_broker_stopping,
     offbus_count,
@@ -2246,7 +2245,7 @@ def _reset_for_testing():
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
-    global _topology_hw_fault_paged, _dispatch_reset_spent
+    global _dispatch_reset_spent
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
     job_queue = None
     lock = None
@@ -2264,7 +2263,6 @@ def _reset_for_testing():
     _fabric_77_streak = 0
     _fabric_77_fallback_release_monotonic = 0.0
     _fabric_77_paged_since = None
-    _topology_hw_fault_paged = None
     _fabric_77_recheck_since = None
     _fabric_77_rechecks = 0
     _fabric_77_recheck_monotonic = 0.0
@@ -3666,7 +3664,7 @@ def _fabric_77_eth_drop() -> str:
     bound only delays it. Not for a known cable fault (a 78), a topology mismatch or fault, or a
     missing prerequisite (hugepages, the validator): no reset fixes those."""
     drop = health_monitor.last_eth_link_drop if health_monitor is not None else ""
-    if not drop or health_monitor.known_fabric_fault() or health_monitor.topology_hw_fault:
+    if not drop or health_monitor.known_fabric_fault():
         return ""
     if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
         return ""
@@ -3786,7 +3784,6 @@ def _env_int(name: str, default: int, floor: int) -> int:
 # traffic-only rerun could not run is inside the bound (I45): its eth read is judged against the
 # link mark re-baselined for this chip-to-bus map, and a release is watched like a lift.
 _TOPOLOGY_HOLD = "topology mismatch"
-_TOPOLOGY_HW_FAULT = "hardware fault: the first job after a topology-mismatch lift"
 # The validator's own line for it, which reaches the broker as a 77 ("COULD NOT RUN") wherever the
 # topology-mismatch path has not relabelled it yet.
 _TOPOLOGY_VALIDATOR_LINE = "Connection mismatch detected"
@@ -3794,10 +3791,11 @@ _TOPOLOGY_VALIDATOR_LINE = "Connection mismatch detected"
 
 def _names_topology_mismatch(text: str) -> bool:
     # A dispatch failure on a green fabric is a measured fault, never a topology hold (spec 04 I30),
-    # even when the descriptor run before it downgraded a "Connection mismatch detected" line.
-    if fabric.names_dispatch_failure(text):
+    # even when the descriptor run before it downgraded a "Connection mismatch detected" line. Nor
+    # is a pass that found descriptor ports missing (spec 03 I71): that is a failed check.
+    if fabric.names_dispatch_failure(text) or fabric.names_links_missing(text):
         return False
-    return text.startswith(_TOPOLOGY_HOLD) or _TOPOLOGY_HW_FAULT in text or _TOPOLOGY_VALIDATOR_LINE in text
+    return text.startswith(_TOPOLOGY_HOLD) or _TOPOLOGY_VALIDATOR_LINE in text
 
 
 def _eth_timeout_reset_shape(evidence: dict) -> bool:
@@ -3815,48 +3813,23 @@ def _eth_timeout_reset_shape(evidence: dict) -> bool:
 
 def _validator_line_names_topology(output: str) -> bool:
     """The validator's mismatch line in the last fabric output, unless the dispatch probe after it
-    failed: then the wrapper's verdict is the dispatch failure (spec 04 I30)."""
-    return _TOPOLOGY_VALIDATOR_LINE in output and not fabric.names_dispatch_failure(output)
+    failed: then the wrapper's verdict is the dispatch failure (spec 04 I30), or the pass found
+    descriptor ports missing: then the verdict is that failure (spec 03 I71)."""
+    return (
+        _TOPOLOGY_VALIDATOR_LINE in output
+        and not fabric.names_dispatch_failure(output)
+        and not fabric.names_links_missing(output)
+    )
 
 
 def _hold_details(evidence: dict) -> tuple[str, str]:
     return str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or "")
 
 
-# (hold episode since, monotonic time of its last page) of the I42 first-job hardware-fault hold. That
-# hold stands until an operator restarts the broker, so its page is its only bound: see
-# _repage_topology_hw_fault.
-_topology_hw_fault_paged: Optional[tuple[str, float]] = None
-
-
-def _repage_topology_hw_fault() -> None:
-    """I42: page a standing first-job hardware-fault hold again every mesh_hold_repage_sec() (0: never
-    again). Called on each idle-relift pass that holds. The fault's own page counts for the episode it
-    opened; a page the hook dropped is tried on the next pass, and a new hold episode pages anew."""
-    global _topology_hw_fault_paged
-    fault = health_monitor.topology_hw_fault if health_monitor is not None else ""
-    if not fault:
-        return
-    since = fsm.record.since
-    last: Optional[float] = None
-    if _topology_hw_fault_paged is not None and _topology_hw_fault_paged[0] == since:
-        last = _topology_hw_fault_paged[1]
-    elif _topology_hw_fault_paged is None and health_monitor.topology_hw_fault_paged:
-        last = health_monitor.topology_hw_fault_paged
-        _topology_hw_fault_paged = (since, last)
-    repage = mesh_hold_repage_sec()
-    if last is not None and (repage == 0 or time.monotonic() - last < repage):
-        return
-    event = {"kind": "fabric_topology_hw_fault", "detail": fault, "held_since": since, "repage": last is not None}
-    if alert.send_alert(event, logger) is not None or alert.alert_argv() is None:
-        _topology_hw_fault_paged = (since, time.monotonic())
-
-
-def _topology_hw_fault_hold(evidence: dict) -> bool:
-    # A known fabric fault (03 I46) is outside the I40 bound too: its release is what failed.
-    if health_monitor is not None and health_monitor.known_fabric_fault():
-        return True
-    return bool(health_monitor.topology_hw_fault) or any(_TOPOLOGY_HW_FAULT in d for d in _hold_details(evidence))
+def _known_fabric_fault_hold() -> bool:
+    # A known fabric fault (03 I46) is outside the I40 bound: its release is what failed. The I42
+    # first-job latch is not: its check runs and fails, so it takes the ladder.
+    return health_monitor is not None and bool(health_monitor.known_fabric_fault())
 
 
 def _fabric_no_reset_hold() -> str:
@@ -4146,7 +4119,10 @@ async def _attempt_idle_relift() -> None:
                 drop = _fabric_77_eth_drop() if fsm.record.why == FABRIC_RELIFT_WHY else ""
                 if drop:
                     _log(f"fabric 77 with eth links measured down ({drop}) — a fault: the present-mesh rung")
-                if await _escalate("present"):
+                # The I42 latch: the lift's first job measured the fabric bad, so the reset runs
+                # now, without the grace, and its full post-reset check decides (I56).
+                latched = fsm.record.why == FABRIC_RELIFT_WHY and bool(health_monitor.topology_hw_fault)
+                if await _escalate("present", measured_fault=latched):
                     return
                 _log(
                     "held-unverified and no read-only check clears this hold class — holding; "
@@ -4206,15 +4182,23 @@ async def _attempt_idle_relift() -> None:
                 if (
                     fabric_ok is None
                     and _fabric_77_only_hold()
-                    and not _topology_hw_fault_hold(evidence)
+                    and not _known_fabric_fault_hold()
                     and _fabric_77_bound_reached()
                 ):
                     # I40: a pass that cannot run is retried a bounded number of times, never
                     # forever. Past the bound the startup checks become the gate.
                     if await _fabric_77_fallback(evidence, _log, _escalate):
                         return
+                if (
+                    fabric_ok is False
+                    and health_monitor.last_fabric_ok is False
+                    and await _escalate("present", measured_fault=True)
+                ):
+                    # The relift's own pass MEASURED the fabric bad (the I42 latch's mismatch, I71's
+                    # missing ports): the fault is proven, so the present-mesh rung runs now and its
+                    # full post-reset check decides, as on an eth_frozen hold (I56).
+                    return
                 if fabric_ok is not True:
-                    _repage_topology_hw_fault()
                     _log(
                         f"fabric still could not verify on retry ({fabric_ok!r}) — holding; "
                         "the door never reopens onto unverified fabric"
@@ -6447,6 +6431,9 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
             }
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
+    # Spec 03 I71: the descriptor's port connections the last fabric pass found missing or extra, by
+    # name; null after a clean pass on the full topology.
+    payload["fabric_topology"] = (getattr(health_monitor, "fabric_topology", None) or None) if health_monitor else None
     return payload
 
 
@@ -9873,7 +9860,7 @@ export {JOB_TAG_ENV}={job_tag}
                 # the jobs that died of it, leaving a generic "ended failed" the gate then
                 # cleared on the word of checks that cannot see this fault at all.
                 # The first job after a topology-mismatch lift is the bound on that lift: one that
-                # dies on the fabric makes it a hardware fault, held without a reset (03 I42).
+                # dies on the fabric latches it, held so the ladder resets it (03 I42).
                 # Jobs that keep dying on the fabric's routing after passes that could not run are a
                 # known fabric fault: held, never the dirty-flag reset that only ends in another 77 (03 I46).
                 known = None
@@ -11061,6 +11048,9 @@ def create_mcp_server() -> MCPServer:
 
         recovery = select_recovery()
         argv = recovery.reset_argv(indices)
+        # An operator reset re-tests the I42 latch: its post-reset check decides, no restart needed.
+        if health_monitor is not None:
+            health_monitor.clear_topology_hw_fault("operator reset")
         yield f"$ {' '.join(argv)}   ({len(indices)} device(s); ~30-60s)\n"
         reset_owner = _reset_action_owner()
         _plog = (lambda m: logger.info(m)) if logger else (lambda m: None)
@@ -12581,6 +12571,9 @@ def create_mcp_server() -> MCPServer:
 
         recovery = select_recovery()
         argv = recovery.reset_argv(indices)
+        # An operator reset re-tests the I42 latch: its post-reset check decides, no restart needed.
+        if health_monitor is not None:
+            health_monitor.clear_topology_hw_fault("operator reset")
         command = " ".join(argv)
         step(f"exec: {command}  ({len(indices)} device(s); ~30-60s on a Galaxy)")
 
