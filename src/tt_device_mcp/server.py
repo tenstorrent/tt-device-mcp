@@ -4001,6 +4001,10 @@ def _fabric_77_bound_reached() -> bool:
         opened = None
     if opened is None or not _last_77_was_hugepages():
         _fabric_77_streak += 1
+        if _fabric_77_climb_owed():
+            # The episode's one reset already came back UNKNOWN, or this boot is the warm reboot a 77
+            # climb fired: more retries measure nothing new; the climb is owed now (spec 04 I79).
+            return True
     if _fabric_77_streak >= _env_int("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", 3, 1):
         return True
     if opened is None:
@@ -4047,6 +4051,8 @@ def _fabric_77_recheck_due() -> bool:
     hold opened, then each further step after the last re-check that 77'd again. A hugepage 77 re-checks
     every FABRIC_77_HUGEPAGES_RECHECK_SEC."""
     steps = [FABRIC_77_HUGEPAGES_RECHECK_SEC] if _last_77_was_hugepages() else _fabric_77_backoff_sec()
+    if _fabric_77_climb_owed():
+        steps = steps[:1]  # the climb is owed: its first step only, never the longer backoff (04 I79)
     if _fabric_77_recheck_since != fsm.record.since or not _fabric_77_rechecks:
         try:
             opened = datetime.strptime(str(fsm.record.since), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -4055,6 +4061,11 @@ def _fabric_77_recheck_due() -> bool:
         return (datetime.now(timezone.utc) - opened).total_seconds() >= steps[0]
     wait = steps[min(_fabric_77_rechecks, len(steps) - 1)]
     return time.monotonic() - _fabric_77_recheck_monotonic >= wait
+
+
+def _fabric_77_climb_owed() -> bool:
+    """Whether the open 77 hold owes the climb at once (spec 04 I79; the galaxy recovery decides)."""
+    return galaxy_recovery is not None and galaxy_recovery.fabric_77_climb_owed(device_hold_episode_since)
 
 
 def _note_fabric_77_recheck() -> None:
@@ -4138,6 +4149,15 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
         )
         + ") — climbing the recovery ladder"
     )
+    if (
+        galaxy_recovery is not None
+        and device_hold_episode_since
+        and galaxy_recovery.fabric_77_climb_owed(device_hold_episode_since)
+    ):
+        # This boot is the warm reboot an earlier 77 climb fired: that episode's reset and sweep already
+        # ran and the reboot did not end the 77. The ladder's sweep (every reset type, then the full
+        # check) runs once more before the cold rung, never a fresh I40 round first (spec 04 I79).
+        galaxy_recovery.mechanism.unverified_reset_since = device_hold_episode_since
     return await escalate("present")
 
 

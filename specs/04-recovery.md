@@ -649,14 +649,15 @@ each rung fires only when the gentler one failed or cannot apply.
   both still read 77 leave the host rung as the only path left (a reboot refills hugepages, reloads
   the driver and retrains the links), so the episode climbs to it once (`fabric_unverified_host_rung`,
   logged only as the rung fires, recorded in the reboot ledger under its own cause, every guard of I22
-  and the host rungs kept). A climb that only waits (the hold younger than the ladder ceiling, a reset
-  still in its scope) pages no one and leaves no hand-off; the next escalation retries it. The
-  boot that rung brought up reads that cause from the ledger: while no fabric pass has passed since
-  the broker started, it never fires that rung again. Once the rung is spent, or when it could not
+  and the host rungs kept). The climb after the sweep never waits for the ladder ceiling (I79). A
+  climb that only waits (a reset still in its scope) pages no one and leaves no hand-off; the next
+  escalation retries it. The boot that rung brought up reads that cause from the ledger: while no
+  fabric pass has passed since the broker started, it never fires that rung again; a warm reboot's
+  boot with a power cycle opted in climbs once more, to the cold rung (I79). Once the rung is spent, or when it could not
   run (not opted in, rate-limited, a tenant), the hold goes to an operator once per episode (I33
   shape: one `fabric_unverified_operator_handoff` page, a `FABRIC_77_HANDOFF_SEC` (1200 s) act-by,
-  `/health` `operator_handoff`); a rung that could not run is tried again on the next escalation, and
-  once it fires it ends that hand-off. The
+  `/health` `operator_handoff`; `owner=broker` while a held-off rung is still retried, I79); a rung
+  that could not run is tried again on the next escalation, and once it fires it ends that hand-off. The
   device stays held until a passing full check with fabric releases it, never on the hand-off. Before
   this, such a hold re-ran the fabric pass every 1200 s with no end. A sweep that could not run in full holds that pass and
   fires no host rung (I22); the episode's next escalation tries it again. Bounds the loop of
@@ -935,6 +936,38 @@ each rung fires only when the gentler one failed or cannot apply.
   never a boot loop, never an open-ended hold. Class A or C after a cycle a later boot verified, at
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
+
+- **I79 — A hold whose reset and full check already failed climbs at once, not at the ceiling.**
+  The stuck-hold ceiling (600 s) bounds how long the host rungs wait for the gentler rungs to have
+  their try; it never adds a wait once they had it. Three cases climb as soon as their last gentler
+  rung has failed, at any hold age:
+  - **A 77 hold that owes its fabric pass** (class D after a reset): the episode's one reset came back
+    UNKNOWN (I29) and the full last-chance sweep, every reset type once and then the full check with
+    fabric, still failed. The I40 bound counts as reached on the first re-check and the I48 backoff
+    uses its first step only (120 s), so the sweep runs on the first re-check after the reset and the
+    host rung fires right after it. The `host_rung_not_deferred` event records
+    `reason=reset_and_sweep_failed`.
+  - **A present mesh whose galaxy reset failed its full check** (an eth/fabric wedge, classes D and J):
+    the climb still runs the last-chance sweep first (I22), then fires the host rung without the
+    ceiling wait (`reason=present_mesh_reset_failed`).
+  - **The boot an I29 77 reboot brought up** (with no fabric pass since the broker started) and a
+    power cycle opted in: the 77 is not handed to an operator. The episode owes the climb at once. The
+    earlier episode's reset counts as its one reset, the sweep runs on the first re-check, and the
+    climb takes the cold rung (warm reboot futile), once. The I40 fallback marks the episode's reset
+    as spent before it escalates, so the ladder sweeps rather than resetting again. The boot that power
+    cycle brought up is spent: the hold goes to an operator with a deadline (I29). A cold rung that
+    `auto_recovery_allowed` holds off (the I65 cooldown, the rate limit, a tenant) is not spent: it is
+    retried on every 120 s re-check and fires once allowed, at most once per episode. Meanwhile the
+    page and `/health` `operator_handoff` name the reason, say the broker retries, and read
+    `owner=broker`; the operator deadline still stands in case it never can.
+  A first-time 77 (no reset yet on the episode, and not a 77-rung boot) keeps the I40 retries and the
+  I48 backoff unchanged. Nothing here releases a device: only a full check that passes, fabric
+  included, after the last reset releases it (03 I32, goal of I22). Time to recover, from the hold
+  opening after the UNKNOWN reset: the host rung fires at about 8 min (120 s re-check plus a sweep of
+  about 5 to 6.5 min), where it used to fire at about 18.5 min (the 600 s ceiling, reached on the
+  next 600 s backoff step). The post-reboot boot asks for the power cycle about 8 min after its hold
+  opens, or, if the I65 cooldown ends later, up to 120 s after it ends (the next re-check). A present mesh's failed reset climbs about
+  8 min earlier than before; the hold age no longer matters.
 
 ## Interfaces
 
@@ -1371,7 +1404,9 @@ sees a silent fabric pass.
 | I27 the manual-recovery guard fails closed: no check configured never fires (pages once), the installed template is the default, a check that is unreadable, raises or times out stands back, a clean check lets it fire, and the tenant is re-read after the checks | `tests/test_offbus_power_cycle.py::test_no_manual_recovery_check_never_fires_and_pages_once`, `tests/test_offbus_power_cycle.py::test_the_installed_check_is_the_default`, `tests/test_offbus_power_cycle.py::test_a_manual_recovery_check_that_cannot_answer_holds_until_the_bound`, `tests/test_offbus_power_cycle.py::test_checks_that_say_no_let_it_fire`, `tests/test_offbus_power_cycle.py::test_a_tenant_arriving_during_the_checks_holds`, `tests/test_offbus_power_cycle.py::test_the_pages_name_the_host` |
 | I27 the manual-recovery check template: operator power actions count, read-only BMC queries do not, an unreadable journal or auth.log cannot answer | `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_template`, `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_cannot_answer_on_an_unreadable_journal`, `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_cannot_answer_when_auth_log_fails_to_read`, `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_never_globs_an_auth_log_line`, `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_cannot_answer_on_an_unreadable_auth_log`, `tests/test_offbus_power_cycle.py::test_the_manual_recovery_check_reads_auth_log_within_the_window` |
 | I28 an outage hold or `TT_DEVICE_MCP_AUTO_MESH_RESET=0` holds the gate, relift, watchdog and sweep mesh reset, also with a chip off the bus in the startup and pre-job gates, and pages again while it stands; one rung off alone, or `=1`, still resets | `tests/test_mesh_reset_hold.py::test_the_hold_reason_follows_the_flags`, `::test_the_gate_holds_the_mesh_reset_under_an_outage_hold_and_pages_once`, `::test_the_gate_holds_with_the_explicit_knob_alone`, `::test_the_gate_still_resets_with_only_the_tray_rung_off`, `::test_an_explicit_opt_in_re_arms_the_mesh_reset_under_an_outage_hold`, `::test_the_last_chance_sweep_is_refused_under_an_outage_hold`, `::test_a_dropped_page_is_sent_again_and_a_lifted_hold_re_arms_it`, `::test_the_gate_holds_with_a_chip_off_the_bus_under_an_outage_hold`, `::test_without_the_hold_a_chip_off_the_bus_still_gets_the_mesh_reset`, `::test_a_standing_hold_pages_again_after_the_repage_interval`, `::test_the_repage_knob_defaults_and_rejects_nonsense` |
-| I29 one unverified reset per 77-only episode; next escalation sweeps once, strict on 77, climbs on a measured failure; a sweep still reading 77 holds and pages once for a known no-reset cause, else climbs to the host rung once per episode (ledger-latched across the boot) and then hands off to an operator with a deadline, never releasing | `tests/test_device_safety.py::test_a_reset_that_leaves_the_fabric_unverified_counts_toward_the_relift_bound`, `tests/test_device_safety.py::test_a_second_escalation_after_an_unverified_reset_sweeps_instead_of_resetting`, `tests/test_device_safety.py::test_an_incomplete_sweep_after_an_unverified_reset_does_not_climb`, `tests/test_device_safety.py::test_a_sweep_verify_that_reads_77_is_not_a_release`, `tests/test_device_safety.py::test_a_sweep_that_still_reads_77_holds_and_pages_once_instead_of_climbing`, `tests/test_device_safety.py::test_a_sweep_still_reading_77_with_no_known_cause_climbs_to_the_host_rung_once`, `tests/test_device_safety.py::test_a_77_host_rung_that_could_not_run_hands_off_and_retries`, `tests/test_device_safety.py::test_a_boot_the_77_host_rung_brought_up_hands_off_instead_of_climbing_again`, `tests/test_device_safety.py::test_the_77_host_rung_fires_the_reboot_through_the_climbs_guards`, `tests/test_device_safety.py::test_a_77_host_rung_deferred_by_a_young_hold_pages_no_one_then_fires_at_the_ceiling`, `tests/test_device_safety.py::test_a_77_host_rung_that_cannot_run_pages_once_and_a_later_rung_clears_the_hand_off`, `tests/test_device_safety.py::test_the_host_rung_climb_reports_fired_deferred_or_cannot_run` |
+| I29 one unverified reset per 77-only episode; next escalation sweeps once, strict on 77, climbs on a measured failure; a sweep still reading 77 holds and pages once for a known no-reset cause, else climbs to the host rung once per episode (ledger-latched across the boot) and then hands off to an operator with a deadline, never releasing | `tests/test_device_safety.py::test_a_reset_that_leaves_the_fabric_unverified_counts_toward_the_relift_bound`, `tests/test_device_safety.py::test_a_second_escalation_after_an_unverified_reset_sweeps_instead_of_resetting`, `tests/test_device_safety.py::test_an_incomplete_sweep_after_an_unverified_reset_does_not_climb`, `tests/test_device_safety.py::test_a_sweep_verify_that_reads_77_is_not_a_release`, `tests/test_device_safety.py::test_a_sweep_that_still_reads_77_holds_and_pages_once_instead_of_climbing`, `tests/test_device_safety.py::test_a_sweep_still_reading_77_with_no_known_cause_climbs_to_the_host_rung_once`, `tests/test_device_safety.py::test_a_77_host_rung_that_could_not_run_hands_off_and_retries`, `tests/test_device_safety.py::test_a_boot_the_77_host_rung_brought_up_hands_off_instead_of_climbing_again`, `tests/test_device_safety.py::test_the_77_host_rung_fires_the_reboot_through_the_climbs_guards`, `tests/test_device_safety.py::test_an_owed_pass_77_reaches_the_host_rung_after_the_sweep_not_at_the_ceiling`, `tests/test_device_safety.py::test_a_77_host_rung_that_cannot_run_pages_once_and_a_later_rung_clears_the_hand_off`, `tests/test_device_safety.py::test_the_host_rung_climb_reports_fired_deferred_or_cannot_run` |
+| I79 an owed-pass 77 climbs at the sweep's end, not at the ceiling; the I40 bound is reached and the I48 backoff uses its first step; a first-time 77 keeps both; a present mesh's failed reset sweeps then climbs; a 77 reboot's boot takes the cold rung once and a power cycle's boot hands off; never released without a passing full check | `tests/test_device_safety.py::test_an_owed_pass_77_reaches_the_host_rung_after_the_sweep_not_at_the_ceiling`, `tests/test_device_safety.py::test_an_owed_77_hold_skips_the_i40_retries_and_the_i48_backoff_and_a_first_time_77_keeps_them`, `tests/test_device_safety.py::test_present_mesh_failed_reset_sweeps_then_climbs_without_the_ceiling_wait`, `tests/test_device_safety.py::test_present_mesh_failed_reset_whose_sweep_recovers_does_not_climb`, `tests/test_device_safety.py::test_a_boot_the_77_reboot_brought_up_climbs_cold_once_and_a_power_cycle_boot_hands_off` |
+| I79 the 77 reboot's boot: the I40 fallback marks the episode before it escalates, so the ladder sweeps and takes one power cycle, no reset and no reboot; a cooldown-denied cold rung is retried on each re-check, pages once naming the broker as owner, fires one power cycle once allowed and never again | `tests/test_device_safety.py::test_the_77_bound_fallback_on_the_77_reboots_boot_marks_the_episode_and_takes_the_cold_rung`, `tests/test_device_safety.py::test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires_one_power_cycle` |
 | I30 deadline escalation holds a fabric-only present mesh without a reset; real faults keep the ladder | `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_fabric_only_present_mesh_without_a_reset`, `tests/test_device_safety.py::test_the_deadline_escalation_keeps_the_ladder_for_real_faults`, `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset`, `tests/test_device_safety.py::test_the_deadline_escalation_climbs_a_present_mesh_eth_frozen_self_heal_hold` |
 | I30 a dispatch-failure hold is never classed a topology mismatch | `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I28 a uid-0 broker poller never blocks the reset; pollers stop and restart around it | `tests/test_dispatch_failure_reset.py::test_a_uid0_telemetry_holder_does_not_block_the_reset` |
