@@ -342,6 +342,34 @@ async def test_startup_fabric_pass_waits_for_hugepages_then_runs(monkeypatch, _s
 
 
 @pytest.mark.asyncio
+async def test_a_startup_hold_with_the_pool_ready_reaches_the_full_check_within_10s(monkeypatch, _startup):
+    """startup_unverified time-to-recover: a broker start held for its fabric verify, with the 1G pool
+    already full and no re-adopted job to wait behind, reaches the full health check (fabric forced)
+    within 10 s of fake time. Every sleep on the way counts on the fake clock."""
+    events, rows, gate_calls = _startup
+    fsm_dirty(srv, "broker start: awaiting the startup fabric verify", why="startup_unverified")
+    _shortfalls(monkeypatch, [None])
+    fake, at_gate, real_sleep = [0.0], [], asyncio.sleep
+
+    async def sleep(sec, *a, **k):
+        fake[0] += sec
+        await real_sleep(0)
+
+    async def gate(job_log_file, *, phase, run_fabric, force_fabric=False):
+        at_gate.append((phase, run_fabric, force_fabric, fake[0]))
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    monkeypatch.setattr(srv, "_device_health_gate", gate)
+    assert srv._hugepages_shortfall() is None and not srv.readopted_scopes
+
+    await srv._verify_fabric_on_start()
+
+    assert [a[:3] for a in at_gate] == [("startup", True, True)], "the full check, fabric forced"
+    assert at_gate[0][3] < 10, f"reached the gate after {at_gate[0][3]} s"
+    assert rows == []
+
+
+@pytest.mark.asyncio
 async def test_the_startup_fabric_check_runs_with_the_pollers_stopped(monkeypatch, _startup, _systemctl):
     """A host died shortly after a broker restart, inside the startup fabric check, with the
     pollers up and no reset running. The check now runs on a quiet bus, as resets do."""
