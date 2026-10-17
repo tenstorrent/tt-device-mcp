@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Autoupdate and a broker in recovery (spec 08 I21), and the update decision log (I22).
+"""Autoupdate and a broker in recovery (spec 08 I23), and the update decision log (I22).
 
 A restart between two rungs of a hold throws the episode back to the startup check, a forced
 fabric pass on a mesh the broker already knows is bad. So while /health reports a hold, or the
@@ -259,7 +259,7 @@ def test_the_deferral_touches_no_recovery_switch():
     """It delays the update's restart only; it never turns off or slows a rung (msg: recovery is
     the broker's, in code, and nothing in the updater weakens it)."""
     text = _SCRIPT.read_text()
-    section = text[text.index("# Recovery deferral (spec 08 I21)") : text.index("# Dispatch hold")]
+    section = text[text.index("# Recovery deferral (spec 08 I23)") : text.index("# Dispatch hold")]
     for switch in ("AUTO_REBOOT", "AUTO_POWER_CYCLE", "AUTO_UBB_RESET", "hold-release", "/hold", "POST", "systemctl"):
         assert switch not in section, switch
 

@@ -132,7 +132,7 @@ if systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttd
     exit 0
 fi
 
-# Recovery deferral (spec 08 I21). The device-op bar above covers a rung while it runs, not the
+# Recovery deferral (spec 08 I23). The device-op bar above covers a rung while it runs, not the
 # hold around it: between rungs (a settle, a backoff, the wait for the hold deadline) no op is in
 # flight, and a restart there throws the episode back to the startup check, a forced fabric pass
 # on a mesh the broker already knows is bad, and can turn a heal in progress into a longer one.
@@ -386,7 +386,7 @@ if [ ! -x "$clone/deploy/apply-host-config.sh" ]; then
 fi
 bash "$clone/deploy/apply-host-config.sh" "$clone" \
     || { echo "autoupdate: host-config apply failed (required); not marking current" >&2; exit 1; }
-# Last look before the restart (spec 08 I7, I21). The install above takes a minute or more, and
+# Last look before the restart (spec 08 I7, I23). The install above takes a minute or more, and
 # the broker starts device ops and holds on its own meanwhile. A device op is waited out, bounded
 # like the op itself (DEVICE_RESET_TIMEOUT_SEC); one still running after that, or a hold that
 # began within the deferral bound, ends the lap without the restart and before installed.sha

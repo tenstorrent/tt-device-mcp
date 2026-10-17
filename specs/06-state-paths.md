@@ -343,7 +343,7 @@ Behavior).
 | `TTDEV_AUTOUPDATE` | `1` | Autoupdate master switch. Read at install to seed the config file, and by every lap; `sudo TTDEV_AUTOUPDATE=0 ./install.sh` turns a host off outright (after `sudo`, which resets the environment) |
 | `TTDEV_MAX_DEFER_SEC` | 0 (off — apply immediately; jobs re-adopt) | Opt-in busy/idle gate: seconds autoupdate waits for an idle window. The in-flight device-op bar is separate and unconditional (spec 08) |
 | `TTDEV_DRAIN_AFTER_SEC` | 300 | With the idle gate on: seconds a pending update waits on a busy box before autoupdate drains it (holds dispatch, lets the running job finish, applies at the job boundary); also the back-off after a drain that timed out (spec 08 I20) |
-| `TTDEV_RECOVERY_DEFER_SEC` | 1200 (capped at 1800; 0 off) | Seconds an update waits while the broker is held or recovering: it applies once the hold is that old or the update has waited that long (spec 08 I21). Delays only the update's restart, never a recovery step |
+| `TTDEV_RECOVERY_DEFER_SEC` | 1200 (capped at 1800; 0 off) | Seconds an update waits while the broker is held or recovering: it applies once the hold is that old or the update has waited that long (spec 08 I23). Delays only the update's restart, never a recovery step |
 | `TTDEV_DRAIN_TIMEOUT_SEC` | 300 | Bound on one drain: a job still running after it is left alone and dispatch is released (spec 08 I20) |
 | `TTDEV_LOCK` | 0 | Apply the udev device lock at install (shared host) |
 | `TTDEV_HEALTH_PROBE` | 1 | Read by `apply-host-config.sh` from the config file: `0` disables `tt-device-health-probe.timer` (spec 08 I17), anything else enables it |
