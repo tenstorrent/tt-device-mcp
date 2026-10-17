@@ -67,6 +67,17 @@ def reset_post_reset_fabric_debt():
 
 
 @pytest.fixture(autouse=True)
+def reset_removed_chip_records():
+    """Clear the record of chips the broker removed (spec 04 I69) around every test: a chip one test
+    isolated must not read as removed, and so withhold the rescan, in the next."""
+    from tt_device_mcp.health.monitors import pci
+
+    pci.REMOVED_CHIPS.clear()
+    yield
+    pci.REMOVED_CHIPS.clear()
+
+
+@pytest.fixture(autouse=True)
 def reset_broker_internal_pids():
     """Clear the broker-internal pid registry (spec 04 I59) around every test: a probe one test
     spawned through run_probe must not discount a holder in the next."""

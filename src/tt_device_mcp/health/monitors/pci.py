@@ -12,6 +12,7 @@ holds the value, so a probe here is a file read and nothing reaches the chip.
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -270,6 +271,36 @@ def pci_bus_number(address) -> Optional[int]:
         return None
 
 
+# Chips this broker cut out of the kernel itself (isolate_chip), chip index -> {"bdf", "bridge"}.
+# Once the endpoint's node is removed its parent link is gone with it, so the bridge a reset must
+# go through is recorded HERE, before the remove. A chip in this map is hung AND un-enumerated by
+# us: re-enumerating it without a reset first lets the driver probe a hung chip (spec 04 I69).
+REMOVED_CHIPS: dict = {}
+
+_BDF_RE = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]")
+
+
+def parent_bridge(bdf: Optional[str]) -> Optional[str]:
+    """The BDF of the bridge directly above an enumerated endpoint, or None."""
+    if not bdf:
+        return None
+    try:
+        bridge = (PCI_DEVICES_DIR / bdf).resolve().parent.name
+    except OSError:
+        return None
+    return bridge if _BDF_RE.fullmatch(bridge) else None
+
+
+def removed_chip(idx) -> Optional[dict]:
+    """The record isolate_chip left for a chip it removed, or None when the broker did not remove it."""
+    return REMOVED_CHIPS.get(str(idx))
+
+
+def forget_removed_chip(idx) -> None:
+    """Drop the removal record of a chip that is back on the bus."""
+    REMOVED_CHIPS.pop(str(idx), None)
+
+
 def isolate_chip(idx: str) -> bool:
     """Remove a dead chip from the kernel, so nothing on the box can reach it any more.
 
@@ -290,10 +321,13 @@ def isolate_chip(idx: str) -> bool:
         # A silent False here reads as "isolated" to the caller; journal it as the hazard.
         evidence.health_event("chip_isolation_failed", chip=idx, reason="no_pci_bdf", host_at_risk=True)
         return False
+    # Record the bridge BEFORE the remove: afterwards the node and its parent link are gone.
+    REMOVED_CHIPS[str(idx)] = {"bdf": bdf, "bridge": parent_bridge(bdf)}
     try:
         (PCI_DEVICES_DIR / bdf / "remove").write_text("1")
         return True
     except OSError as e:
+        forget_removed_chip(idx)
         evidence.health_event(
             "chip_isolation_failed", chip=idx, bdf=bdf, reason="remove_write_failed", error=str(e), host_at_risk=True
         )

@@ -29,6 +29,7 @@ from tt_device_mcp import constants, metrics
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
+from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import pcie_guard
 from tt_device_mcp.health.recovery.base import (
@@ -41,6 +42,7 @@ from tt_device_mcp.health.recovery.stages.bridge_reset import (
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
     reset_chip_via_bridge,
+    reset_removed_chip,
 )
 
 # A `next_stage` decision that is not a stage name: WAIT (the wedge may self-heal; do nothing),
@@ -457,11 +459,57 @@ class Recovery(ABC):
         if gated:
             log(f"per-chip bridge reset NOT fired: {why} — trying a PCI rescan")
             health_event("host_reset_gated", context="bridge_reset", chips=targets, reason=why, host_at_risk=True)
+        # Spec 04 I69: a chip the broker removed is still hung, and any rescan this pass would
+        # re-enumerate it for the driver to probe. So reset every one of them through its recorded
+        # bridge first, then rescan once. If any cannot be reset, no rescan runs this pass at all
+        # (each per-chip reset below rescans too): the chips stay isolated and the hold escalates.
+        reset_this_pass: set = set()
+        withheld: list = []
+        removed = [t for t in targets if pci.removed_chip(t)]
+        unreset: list = []
+        if sbr and not gated and removed:
+            for idx in removed:
+                for attempt in range(BRIDGE_RESET_MAX_TRIES):
+                    FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
+                    fired = await asyncio.to_thread(reset_removed_chip, idx)
+                    if fired:
+                        reset_this_pass.add(idx)
+                        break
+                    if fired is None:
+                        # Same no-window signal as reset_chip_via_bridge's no_bridge (see below).
+                        self.last_bridge_reset_reasons[idx] = {"reason": "no_bridge"}
+                        break
+                    if attempt + 1 < BRIDGE_RESET_MAX_TRIES:
+                        await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
+                if idx not in reset_this_pass:
+                    unreset.append(idx)
+            if not unreset:
+                log(f"chip(s) {removed} reset through their recorded bridges — rescanning once")
+                try:
+                    await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
+                except OSError as e:
+                    log(f"PCI rescan after the bridge reset could not run ({e})")
+                for _ in range(20):
+                    await asyncio.sleep(0.5)
+                    if all((pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}").exists() for i in removed):
+                        break
         for idx in targets:
             if gated:
                 inapplicable.append(idx)
                 self.last_bridge_reset_reasons[idx] = {"reason": "gated"}
                 metrics.stage_fired("bridge_reset", "blocked")
+                continue
+            if sbr and unreset:
+                withheld.append(idx)
+                if idx not in unreset:
+                    self.last_bridge_reset_reasons[idx] = {"reason": "rescan_withheld"}
+                metrics.stage_fired("bridge_reset", "blocked")
+                continue
+            if idx in reset_this_pass and (pci.SYSFS_CLASS_DIR / f"tenstorrent!{idx}").exists():
+                # Reset above and back on the bus from the pass's rescan (or a later chip's).
+                pci.forget_removed_chip(idx)
+                recovered.append(idx)
+                metrics.stage_fired("bridge_reset", "ok")
                 continue
             if not sbr:
                 inapplicable.append(idx)
@@ -493,7 +541,11 @@ class Recovery(ABC):
             # the identical no-op. Firing a rung that cannot work here only delays the next one, so
             # record the chip inapplicable and fall through now (the incident burnt ~64s spinning
             # a no_bridge reset 3x per gone chip, then again on the stuck-hold escalation).
-            for attempt in range(BRIDGE_RESET_MAX_TRIES):
+            # A removed chip already spent one try on the reset above.
+            tries = BRIDGE_RESET_MAX_TRIES - 1 if idx in reset_this_pass else BRIDGE_RESET_MAX_TRIES
+            for attempt in range(tries):
+                if idx in reset_this_pass and attempt == 0:
+                    await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
                 FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
                 # A bridge reset clears the chip's firmware clock cap like any reset (spec 03 I35).
                 CEILING.mark_owed(f"bridge reset of chip {idx}")
@@ -512,7 +564,7 @@ class Recovery(ABC):
                     self.last_bridge_reset_reasons[idx] = {"reason": "no_bridge"}
                     metrics.stage_fired("bridge_reset", "not_applicable")
                     break
-                if attempt + 1 < BRIDGE_RESET_MAX_TRIES:
+                if attempt + 1 < tries:
                     await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
             else:
                 lost.append(idx)
@@ -522,7 +574,7 @@ class Recovery(ABC):
             isolated_chips.discard(idx)
         # An inapplicable chip is NOT recovered — it stays isolated and forces the not-recovered
         # branch, so an all-gone mesh (every chip no_bridge) can never read as healed and release.
-        still_dead = sorted(set(lost) | set(inapplicable), key=int)
+        still_dead = sorted(set(lost) | set(inapplicable) | set(withheld), key=int)
         health_event(
             "chip_recovery", recovered=recovered, still_dead=still_dead, inapplicable=sorted(inapplicable, key=int)
         )
@@ -537,7 +589,17 @@ class Recovery(ABC):
             len(still_dead),
         )
 
-        if still_dead:
+        # Spec 04 I69: never re-enumerate a removed chip that was not reset this pass, and never
+        # rescan past a refused host reset gate — the rescan lets the driver probe a hung chip.
+        unreset_dead = [i for i in still_dead if pci.removed_chip(i) and i not in reset_this_pass]
+        withhold = "host_reset_gated" if gated else ("removed_chip_not_reset" if unreset_dead else "")
+        if still_dead and withhold:
+            health_event("pci_rescan_withheld", chips=still_dead, unreset=unreset_dead, reason=withhold)
+            log(
+                f"PCI rescan withheld ({withhold}) for chip(s) {still_dead}: re-enumerating a hung chip "
+                f"that was not reset can take the host down; they stay isolated, escalating to a heavier rung"
+            )
+        if still_dead and not withhold:
             # Cheapest rung there is, and the one that was missing: a bare PCI rescan. A chip with no
             # parent bridge is not necessarily a departed ASIC — measured twice on this host, the
             # endpoint was still in lspci AND still bound to the driver, and only its /dev node was
@@ -551,7 +613,7 @@ class Recovery(ABC):
             except OSError as e:
                 log(f"PCI rescan could not run ({e}); falling through to the heavier rungs")
             else:
-                back = [i for i in still_dead if Path(f"/sys/class/tenstorrent/tenstorrent!{i}").exists()]
+                back = [i for i in still_dead if Path(f"{pci.SYSFS_CLASS_DIR}/tenstorrent!{i}").exists()]
                 # The rescan may bring back more than the chips this pass targeted.
                 back = sorted(set(back) | set(drop_returned_isolated(isolated_chips, "PCI rescan", log)), key=int)
                 if back:
@@ -565,6 +627,7 @@ class Recovery(ABC):
                     )
                 if not still_dead:
                     return True
+        if still_dead:
             if inapplicable:
                 log(
                     f"chip(s) {sorted(inapplicable, key=int)} have no bridge to reset — they left "
