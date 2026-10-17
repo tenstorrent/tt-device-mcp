@@ -89,7 +89,7 @@ from tt_device_mcp.device_holders import (
     reclaim_foreign_holders,
 )
 from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec, add_close_listener
-from tt_device_mcp.health import (
+from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 I72)
     _HOST_ESCALATION_ACTION,
     BLOCKED,
     CEILING,
@@ -106,6 +106,7 @@ from tt_device_mcp.health import (
     RESET_MODE_TARGET,
     SAMPLE_INTERVAL_SEC,
     SAMPLE_RING_SIZE,
+    UBB_CHIP_COUNT,
     WAIT,
     Evidence,
     HealthState,
@@ -115,10 +116,13 @@ from tt_device_mcp.health import (
     _eth_freeze_holds,
     _fire_power_cycle,
     _galaxy_reset_min_dead_chips,
+    _normalized_board,
     _offbus_hold_ceiling_sec,
+    _power_cycle_direct_class,
     _reboot_min_dead_chips,
     _run_pre_power_cycle_hook,
     _stuck_hold_ceiling_sec,
+    _ubb_bus_id_tables,
     _ubb_reset_enabled,
     aer_totals,
     append_trace,
@@ -128,6 +132,7 @@ from tt_device_mcp.health import (
     capture_incident,
     chip_node_present,
     chip_pci_bdf,
+    chip_pci_bdfs,
     chip_sample,
     chip_snapshot,
     chip_snapshot_event,
@@ -140,6 +145,7 @@ from tt_device_mcp.health import (
     health_event,
     heartbeat_supported,
     heartbeat_verdict,
+    hold_report,
     host_action_pending_sec,
     isolate_chip,
     journal_interrupted_fabric_check,
@@ -147,8 +153,10 @@ from tt_device_mcp.health import (
     mesh_hold_repage_sec,
     mesh_reset_hold_reason,
     note_broker_stopping,
+    offbus_chip_ids,
     offbus_count,
     offbus_power_cycle,
+    pci_bus_number,
     pcie_guard_at_start,
     previous_boot_bus_locks,
     previous_boot_error,
@@ -6638,6 +6646,194 @@ def _device_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, st
     return reason, device_held_since
 
 
+def _hold_tray_groups() -> dict:
+    """``{UBB bus group: tray number}`` from tt-smi's own tables (spec 04 I16). The tray number is
+    filled only when the mesh reports one board type; otherwise every known group maps to None.
+    Empty where tt-smi's tables cannot be imported (not a Galaxy, or tt-smi missing)."""
+    tables = _ubb_bus_id_tables() or {}
+    if not tables:
+        return {}
+    boards: set = set()
+    deps = getattr(galaxy_recovery, "deps", None)
+    provider = getattr(deps, "board_types_provider", None)
+    if provider is not None:
+        try:
+            boards = {_normalized_board(t) for t in (provider() or ())}
+        except Exception:  # noqa: BLE001 - a read-only report never fails /health
+            boards = set()
+    table = tables.get(boards.pop()) if len(boards) == 1 else None
+    if table:
+        return {group: tray for tray, group in table.items()}
+    return {group: None for t in tables.values() for group in t.values()}
+
+
+# Names for the watchdog's off-bus forced-pass bounds (offbus_power_cycle.watchdog_due_at kinds).
+_HOLD_OFFBUS_DUE_SOURCES = {
+    "gated_offbus_grace": "gated off-bus grace",
+    "ipmi_handoff_bound": "BMC IPMI hand-off bound",
+    "tray_walk_handoff_bound": "failed tray walk hand-off bound",
+    "gated_hold_handoff_bound": "gated off-bus operator hand-off bound",
+}
+
+
+def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
+    """The next rung the broker has armed for this hold and when it fires (spec 04 I75), mirroring
+    ``_check_hold_deadline``'s clocks AND its guards: none without the episode clock the watchdog keys
+    on; while a requested host action is pending, that request and the end of its window (every forced
+    spawn declines until then). Otherwise the earliest of the off-bus forced pass (gated grace, IPMI,
+    tray-walk and operator hand-off bounds), the I65 retry of a refused power cycle in this episode, the
+    host rung the 10-min bound asks after its ladder (spec 04 I76), then the watchdog's own branch
+    order: the off-bus one-shot once due, the I39 progress retry once due, else the next unspent
+    ceiling window (reported at its own time even when past: a declined spawn retries it every tick).
+    A branch not yet due does not hide a later one that fires first: an armed progress retry or
+    one-shot is reported next to the ceiling window, and the earlier one wins. Below the 10-min bound
+    the kill-switch and a 77-only hold keep every forced run back, so each candidate fires no earlier
+    than the bound. Plus any registered deadline feed. Read-only: it never claims, moves or expires a
+    clock."""
+    episode = device_hold_episode_since
+    try:
+        started = datetime.fromisoformat(episode).timestamp() if episode else None
+    except ValueError:
+        started = None
+    if started is None:
+        return None
+    m = recovery_mechanism
+    cooldown = m.power_cycle_cooldown_state if m is not None else None
+    cooldown_until = None
+    try:
+        if cooldown and now_epoch < float(cooldown["until"]):
+            cooldown_until = float(cooldown["until"])
+    except (KeyError, TypeError, ValueError):
+        cooldown_until = None
+    fed = hold_report.fed_candidates(started, now_epoch, cooldown_until)
+    ceiling = _stuck_hold_ceiling_sec()
+    # Spec 04 I76: below the bound the kill-switch declines every forced spawn and the watchdog forces
+    # no 77-only hold; from the bound on, neither holds a rung back.
+    floor = started + ceiling if not _force_escalate_enabled() or _fabric_77_only_hold() else None
+
+    def done(candidates: list) -> Optional[hold_report.RungCandidate]:
+        if floor is not None:
+            candidates = [c if c.at >= floor else replace(c, at=floor) for c in candidates]
+        return hold_report.next_rung(fed + candidates)
+
+    # Read the request without host_action_pending(), which drops an expired one and journals it.
+    req = getattr(m, "host_action_requested", None) if m is not None else None
+    if req is not None:
+        left = host_action_pending_sec() - (time.monotonic() - req[1])
+        if left > 0:
+            return done(
+                [
+                    hold_report.RungCandidate(
+                        now_epoch + left,
+                        f"forced ladder if the requested host {req[0]} has not happened by then",
+                        "host_action_pending",
+                    )
+                ]
+            )
+    candidates = []
+    due = offbus_power_cycle.watchdog_due_at(episode)
+    if due is not None:
+        candidates.append(hold_report.RungCandidate(due[0], "forced ladder", _HOLD_OFFBUS_DUE_SOURCES[due[1]]))
+    retry = getattr(m, "power_cycle_retry", None) if m is not None else None
+    if retry is not None and retry[1] and retry[1] == episode:
+        candidates.append(hold_report.cooldown_candidate(cooldown, float(retry[0])))
+    host_rung = "power cycle" if _auto_power_cycle_enabled() else "warm reboot" if _auto_reboot_enabled() else None
+    age = now_epoch - started
+    if _hold_bound_cycle_due(age):
+        # The watchdog's first branch: it asks the bound's host rung every tick until it is requested.
+        if host_rung:
+            candidates.append(hold_report.RungCandidate(now_epoch, host_rung, "hold bound host rung"))
+        return done(candidates)
+    lad = _hold_bound_ladder_age
+    if (
+        host_rung
+        and lad is not None
+        and lad >= ceiling
+        and (_hold_bound_cycle_age is None or _hold_bound_cycle_age < lad)
+    ):
+        # The full check after the bound's ladder still has its time; the host rung follows at its end.
+        candidates.append(
+            hold_report.RungCandidate(started + lad + _HOLD_BOUND_CHECK_SEC, host_rung, "hold bound host rung")
+        )
+    if isolated_chips and not device_hold_offbus_escalated:
+        one_shot = started + _offbus_one_shot_sec()
+        candidates.append(hold_report.RungCandidate(one_shot, "forced ladder", "off-bus one-shot"))
+        if age >= _offbus_one_shot_sec():
+            return done(candidates)  # due: the watchdog's chain stops at it
+    if m is not None and m.progress_retry is not None and m.progress_retry[0] == episode:
+        left = m.progress_retry[1] - time.monotonic()
+        candidates.append(hold_report.RungCandidate(now_epoch + max(0.0, left), "forced ladder", "progress retry"))
+        if left <= 0:
+            return done(candidates)  # due: the watchdog's chain stops at it
+    window = max(1, device_hold_escalate_bucket + 1)
+    candidates.append(
+        hold_report.RungCandidate(started + window * ceiling, "forced ladder", f"hold ceiling window {window}")
+    )
+    return done(candidates)
+
+
+def _hold_report(now: Optional[datetime] = None) -> dict:
+    """The read-only hold fields for /health while the FSM is RECOVERING or DOWN (spec 03 I72):
+    ``hold_class``, ``hold_started_at``, ``next_rung``/``next_rung_at`` and ``trays_present``.
+    Uses only the sysfs enumeration and heartbeat reads /health already makes; never calls a chip
+    healthy, admits a job or moves a rung."""
+    now = now or datetime.now()
+    now_epoch = now.timestamp()
+    out: dict = {}
+    since = device_hold_episode_since or device_held_since or fsm.record.since
+    started: Optional[float] = None
+    try:
+        started = datetime.fromisoformat(since).timestamp() if since else None
+    except ValueError:
+        started = None
+    out["hold_started_at"] = datetime.fromtimestamp(started).isoformat(timespec="seconds") if started else None
+    cooldown = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
+    ac_needed = bool(cooldown and now_epoch < cooldown.get("until", 0) and cooldown.get("ac_power_needed"))
+    expected = 0
+    if heartbeat_supported() and health_monitor is not None and health_monitor._health_check_enabled():
+        expected = health_monitor.expected(0)
+    groups = _hold_tray_groups()
+    hold_class = hold_report.CLASS_AC_NEEDED if ac_needed else None
+    trays = None
+    if expected > 0:
+        beats = read_heartbeats()
+        not_ready = arc_not_ready_chips(beats)
+        off_ids = {int(i) for i in offbus_chip_ids(beats, expected, not_ready)}
+        present = {i: pci_bus_number(a) for i, a in chip_pci_bdfs().items()}
+        whole = False
+        if off_ids and len(off_ids) < expected:
+            tray_map = galaxy_recovery._tray_map_now() if galaxy_recovery is not None else None
+            whole = (
+                _power_cycle_direct_class(
+                    off_ids, expected, tray_map, mesh_reset_failed=True, present_buses=present, tray_groups=set(groups)
+                )
+                == "A"
+            )
+        hold_class = hold_report.classify_hold(
+            expected=expected, off_bus=len(off_ids), whole_trays=whole, ac_power_needed=ac_needed
+        )
+        alive = {i for i in beats if i not in set(dead_chips(beats))}
+        if groups:
+            # A chip reading all-ones still has its KMD node, so chip_pci_bdfs lists it; it is off the
+            # bus all the same (hold_class counts it so), so the tray rows leave it out. The
+            # classifier above keeps the ladder's own present_buses input.
+            on_bus = {i: b for i, b in present.items() if int(i) not in off_ids}
+            read_at = now.isoformat(timespec="seconds")
+            trays = hold_report.trays_present(on_bus, alive, groups, read_at, UBB_CHIP_COUNT)
+    out["hold_class"] = hold_class
+    rung = _hold_next_rung(now_epoch)
+    out["next_rung"] = rung.rung if rung else None
+    out["next_rung_at"] = datetime.fromtimestamp(rung.at).isoformat(timespec="seconds") if rung else None
+    out["next_rung_source"] = rung.source if rung else None
+    # Past its time and not yet run (a declined spawn: a device op or escalation in flight): the
+    # watchdog retries it every tick.
+    out["next_rung_due"] = bool(rung and rung.at <= now_epoch)
+    out["trays_present"] = (
+        {"verified": False, "label": hold_report.NOT_VERIFIED, "trays": trays} if trays is not None else None
+    )
+    return out
+
+
 def _health_payload(now: Optional[datetime] = None) -> dict:
     """The /health body. Beyond broker liveness it reports the DEVICE hold state, so a poller
     cannot read a box sitting held-and-refused as 'ok' — the gap that let a stuck hold go
@@ -6699,6 +6895,9 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         payload["hold_bound"] = _hold_bound_health(now)
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
+    # Spec 03 I72: the hold's class, start, next rung and per-tray presence, read-only.
+    if fsm.state in (ServerState.RECOVERING, ServerState.DOWN):
+        payload.update(_hold_report(now))
     return payload
 
 
