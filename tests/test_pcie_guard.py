@@ -1530,3 +1530,18 @@ def test_an_unreadable_sysfs_under_guard_logs_a_mask_failure(sysfs, monkeypatch)
     assert logs and "cannot read" in logs[0]
     assert sorted(mask.ports) == sorted(PORTS) and all(_masked(sysfs, p) for p in PORTS)
     mask.restore(quiet_sec=0)
+
+
+def test_the_latch_never_lifts_while_a_listed_link_reads_down(sysfs, monkeypatch):
+    """#1042 (b): an endpoint the kernel still lists whose link reads down (speed Unknown, width 63)
+    is not back on the bus, so it cannot lift the I25 hold as "every chip is back"."""
+    events = []
+    _latched(monkeypatch, sysfs, events)
+    ep = pcie_guard._pci_dir() / f"0000:{CHIPS[0][1]:02x}:00.0"
+    (ep / "current_link_speed").write_text("Unknown\n")
+    (ep / "current_link_width").write_text("63\n")
+    assert pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, lambda m: None) is None
+    assert pcie_guard.offbus_reset_latched() is not None
+    (ep / "current_link_speed").write_text("16.0 GT/s PCIe\n")
+    (ep / "current_link_width").write_text("16\n")
+    assert pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, lambda m: None)

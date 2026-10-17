@@ -42,6 +42,7 @@ from typing import Callable, Optional
 from tt_device_mcp import alert
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors.heartbeat import ALL_ONES, dead_chips, read_heartbeats
+from tt_device_mcp.health.monitors.hostpci import link_down
 
 _logger = logging.getLogger("tt-device-mcp")
 
@@ -678,7 +679,8 @@ def expire_offbus_reset_latch(
     off = off_bus > 0
     if expected is not None:
         eps = tt_endpoints()
-        off = off or expected <= 0 or eps is None or len(eps) < expected
+        # A listed endpoint whose link reads down (speed Unknown, width 63) is not back on the bus.
+        off = off or expected <= 0 or eps is None or sum(1 for b in eps if not link_down(b, _pci_dir())) < expected
     if off and _power_cycle_bounds_latch():
         return None
     if host_pci_ok is True and expected is not None and not off:

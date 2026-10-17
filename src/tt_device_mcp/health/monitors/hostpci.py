@@ -108,10 +108,11 @@ def _aer_totals(dev: Path) -> dict:
 LINK_DOWN_WIDTH = "63"
 
 
-def link_down(bdf: str) -> bool:
+def link_down(bdf: str, devices_dir: Optional[Path] = None) -> bool:
     """Whether this function's PCIe link reads as down (speed ``Unknown`` or width 63), so a listed
-    node is not counted as a chip on the bus. An attribute that cannot be read is no evidence: False."""
-    dev = pci.PCI_DEVICES_DIR / bdf
+    node is not counted as a chip on the bus. An attribute that cannot be read is no evidence: False.
+    ``devices_dir`` defaults to :data:`pci.PCI_DEVICES_DIR`."""
+    dev = (devices_dir or pci.PCI_DEVICES_DIR) / bdf
     speed = _read(dev / "current_link_speed")
     return (speed is not None and speed.startswith("Unknown")) or _read(dev / "current_link_width") == LINK_DOWN_WIDTH
 
