@@ -7104,13 +7104,18 @@ def _hold_bound_cycle_due(age: float) -> bool:
 def _lift_hold_bound_latches(log) -> None:
     """At the bound, the latches that withhold or skip the fabric check (spec 03 I42's topology
     hardware fault, I46's known fabric fault) are lifted, so the check after the ladder gets a real
-    verdict and only a pass releases. A job that fails the same way declares them again."""
+    verdict and only a pass releases. A job that fails the same way declares them again. A lifted
+    topology latch leaves its lift disproven: a pass on the discovered links only fails the check, so the
+    host rung follows instead of a release that would fail the next job and latch again (spec 03 I42)."""
     if health_monitor is None:
         return
     for name in ("topology_hw_fault", "fabric_known_fault"):
         detail = getattr(health_monitor, name, "")
         if detail:
             setattr(health_monitor, name, "")
+            if name == "topology_hw_fault":
+                # The lift that latch came from failed its job: only a full-topology pass releases now.
+                health_monitor.topology_lift_disproven = detail
             health_event("hold_bound_latch_cleared", latch=name, detail=detail, held_since=device_hold_episode_since)
             log(f"10-min hold bound: lifting the {name} latch ({detail}) so the full check after the ladder decides")
 
