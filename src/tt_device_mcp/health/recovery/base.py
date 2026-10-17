@@ -777,6 +777,7 @@ class RecoveryMechanism:
         log(f"a reset is already in flight ({unit}); waiting for it rather than starting another")
         health_event("reset_scope_adopted", unit=unit)
         FABRIC_DEBT.note_reset(f"adopted {unit}")
+        CEILING.mark_owed(f"adopted {unit}")
         deadline = time.monotonic() + DEVICE_RESET_TIMEOUT_SEC
         while time.monotonic() < deadline:
             await asyncio.sleep(2)
