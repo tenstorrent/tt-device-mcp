@@ -265,3 +265,100 @@ async def test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan(monkeypatc
     for _ in range(5):
         await asyncio.sleep(0)
     assert all(t.done() for t in pending), "no rescan task left running"
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_reset_cleanup(
+    monkeypatch, clear_job_state
+):
+    """tt-smi has exited but the driver-wait sysfs write is still running when the caller is cancelled
+    (an operator's reset call dropped). The cancel still reaches the caller, but only after the cleanup
+    every reset owes: the in-flight flag clear (or the dead-chip sampler stays blind), the rescan after
+    the reset, the returned chip dropped from the isolated set, and the pollers back."""
+    srv.isolated_chips = {"31"}
+    monkeypatch.setattr(base, "health_event", lambda *a, **k: None)
+    monkeypatch.setattr(base, "returned_chips", lambda iso: sorted(iso))
+    gate = asyncio.Event()
+    rescans, pollers_calls = [], []
+    real_sleep = asyncio.sleep
+
+    async def to_thread(fn, *a, **k):
+        if getattr(fn, "__self__", None) == RESCAN:
+            rescans.append("driver wait" if not rescans else "after")
+            if len(rescans) == 1:
+                await gate.wait()  # a slow sysfs write, still running when tt-smi exits
+            return None
+        return fn(*a, **k)
+
+    async def run_scoped(argv, log, owner="[broker]health-gate", on_output=None):
+        on_output(SETTLE + "\n")
+        await real_sleep(0)
+        return 1, "tt-smi exited"
+
+    async def pollers(active, log):
+        pollers_calls.append(active)
+        return ["tt-telemetry"]
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", run_scoped)
+    monkeypatch.setattr(srv.asyncio, "to_thread", to_thread)
+    task = asyncio.ensure_future(srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-glx_reset"], lambda m: None))
+    for _ in range(10):
+        await real_sleep(0)
+    assert rescans == ["driver wait"] and srv.recovery_mechanism.reset_in_flight is True
+    monkeypatch.setattr(srv.asyncio, "sleep", no_sleep)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert srv.recovery_mechanism.reset_in_flight is False, "the dead-chip sampler is not left blind"
+    assert rescans == ["driver wait", "after"], "the rescan after the reset still ran"
+    assert srv.isolated_chips == set(), "the returned chip left the isolated set"
+    assert pollers_calls == [False, True], "the pollers are back"
+    gate.set()
+    for _ in range(5):
+        await real_sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_output_after_a_cancelled_reset_starts_no_driver_wait_rescan(monkeypatch, clear_job_state):
+    """After a mid-reset cancel the backend's shielded output reader keeps feeding the callback. A driver
+    wait marker that arrives then starts no rescan (it would be nobody's to cancel); the caller's own
+    callback still sees the output."""
+    srv.isolated_chips = {"31"}
+    monkeypatch.setattr(base, "health_event", lambda *a, **k: None)
+    rescans, seen, feed = [], [], []
+
+    async def to_thread(fn, *a, **k):
+        if getattr(fn, "__self__", None) == RESCAN:
+            rescans.append(fn)
+        return None
+
+    async def run_scoped(argv, log, owner="[broker]health-gate", on_output=None):
+        feed.append(on_output)
+        on_output("Issuing USER_RESET to all chips\n")
+        await asyncio.sleep(3600)
+
+    async def pollers(active, log):
+        return []
+
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", run_scoped)
+    monkeypatch.setattr(srv.asyncio, "to_thread", to_thread)
+    task = asyncio.ensure_future(
+        srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-glx_reset"], lambda m: None, on_output=seen.append)
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    feed[0](SETTLE + "\n")  # the shielded reader, still running after the cancel
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert rescans == [], "no rescan starts after the reset was cancelled"
+    assert seen[-1] == SETTLE + "\n"

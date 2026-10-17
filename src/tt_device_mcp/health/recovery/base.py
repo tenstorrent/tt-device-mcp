@@ -1071,6 +1071,7 @@ class RecoveryMechanism:
         self.reset_since_release = True
         stream, driver_wait = self._driver_wait_rescan_hook(argv, on_output, log)
         cancelled_mid = False
+        late_cancel = False
         rc = None
         try:
             if stream is None:
@@ -1082,13 +1083,21 @@ class RecoveryMechanism:
             cancelled_mid = True  # abandoned mid-reset; the detached backend keeps cycling the chips
             raise
         finally:
+            # Disarm the driver-wait watcher first: after a mid-reset cancel the backend's shielded
+            # output reader still feeds it, and a rescan it started now would be nobody's to cancel.
+            driver_wait["disarmed"] = True
             rescan_task = driver_wait.get("task")
             if rescan_task is not None:
                 if cancelled_mid:
                     rescan_task.cancel()
                 else:
                     try:
-                        await rescan_task
+                        # Shielded: tt-smi has exited, so a cancel that lands while the sysfs write
+                        # finishes must not cut the cleanup below short (the flag, the rescan, the
+                        # pollers). It is re-raised once that cleanup is done.
+                        await asyncio.shield(rescan_task)
+                    except asyncio.CancelledError:
+                        late_cancel = not rescan_task.cancelled()
                     except Exception:  # noqa: BLE001 - the rescan below still runs
                         pass
             # Clear on every exit, including a mid-reset cancel. The flag gates the dead-chip sampler
@@ -1128,6 +1137,8 @@ class RecoveryMechanism:
                     # rather than leaving a telemetry gap.
                     if quiesced:
                         await asyncio.shield(self._set_device_pollers(True, log))
+            if late_cancel:
+                raise asyncio.CancelledError()
 
     def _driver_wait_rescan_hook(self, argv: list[str], on_output, log):
         """Spec 04 I81: let a mesh reset bring back the chips this broker isolated, in the same reset.
@@ -1161,7 +1172,7 @@ class RecoveryMechanism:
             health_event("reset_driver_wait_rescan", chips=chips, ok=True)
 
         def watch(chunk: str) -> None:
-            if state["task"] is None:
+            if state["task"] is None and not state.get("disarmed"):
                 seen = state["tail"] + chunk
                 if GLX_DRIVER_WAIT.search(seen):
                     state["task"] = asyncio.get_running_loop().create_task(rescan())
