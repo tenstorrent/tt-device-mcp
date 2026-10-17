@@ -14416,7 +14416,7 @@ def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output=""
     srv.device_hold_episode_reason = detail
     escalations, alerts, events = [], [], []
 
-    async def escalate(kind, indices, expected, log):
+    async def escalate(kind, indices, expected, log, **_):
         escalations.append(kind)
         return None
 

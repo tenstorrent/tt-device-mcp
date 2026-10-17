@@ -119,7 +119,7 @@ async def test_the_retried_pass_releases_only_after_a_passing_fabric_check(ledge
     monkeypatch.setattr(srv, "device_hold_escalation_kind", "power_cycle_cooldown")
     fsm_dirty(srv, "chips 10,11 off the bus", why="job_killed")
 
-    async def ladder(phase, indices, expected, log):
+    async def ladder(phase, indices, expected, log, **_):
         # The ladder's reset verified enum+ARC; the funnel decides whether that may release.
         FABRIC_DEBT.note_reset("tt-smi -glx_reset")
         released = srv._clear_device_dirty(verified=True, why="hold-deadline: reset verified")
