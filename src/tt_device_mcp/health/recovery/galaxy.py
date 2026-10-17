@@ -1320,14 +1320,17 @@ class GalaxyRecovery(Recovery):
 
         def classify(off: set) -> tuple:
             present_buses, groups = (None, ()) if tray_map is not None else self._presence_read(off, expected)
-            return _power_cycle_direct_class(
-                off,
-                expected,
-                tray_map,
-                mesh_reset_failed=mesh_reset_failed,
-                present_buses=present_buses,
-                tray_groups=groups,
-            ), present_buses
+            return (
+                _power_cycle_direct_class(
+                    off,
+                    expected,
+                    tray_map,
+                    mesh_reset_failed=mesh_reset_failed,
+                    present_buses=present_buses,
+                    tray_groups=groups,
+                ),
+                present_buses,
+            )
 
         fault_class, present_buses = classify(offbus)
         unreadable: set = set()

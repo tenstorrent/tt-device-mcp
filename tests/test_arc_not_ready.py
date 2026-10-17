@@ -274,4 +274,3 @@ def test_eio_chips_still_count_off_the_bus_for_the_rungs(monkeypatch, tmp_path):
     beats = heartbeat.read_heartbeats()
     assert heartbeat.offbus_chip_ids(beats, EXPECTED) == {"3", "4"}
     assert heartbeat.offbus_count(beats, EXPECTED) == 2
-
