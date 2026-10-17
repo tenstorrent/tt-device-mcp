@@ -585,7 +585,8 @@ def _reboot_fallback_eligible(off_bus: int, expected: int, *, warm_reboot_futile
     (spec 04 I71): exactly the drops :func:`_host_escalation_for_drop` would hand the reboot with no
     power cycle armed. A whole-bus drop and a caller-proven ``warm_reboot_futile`` drop are not: the
     reboot cannot bring an off-bus chip back there, so they hold for the cycle instead. The
-    reboot's own limits (one per boot, the ledger interval) bound how often the fallback fires."""
+    reboot's own limits (one per boot, the ledger interval) and the one-per-wedge rule
+    (:meth:`~RecoveryMechanism.reboot_fallback_spent`) bound how often the fallback fires."""
     if expected <= 1 or off_bus <= 0:
         return True
     return not (warm_reboot_futile or off_bus >= expected)
@@ -1208,12 +1209,13 @@ class GalaxyRecovery(Recovery):
     def reboot_fallback_allowed(self, ev: Evidence, *, tenant_active: bool) -> tuple[bool, str]:
         """Whether the gate may fire the warm reboot in place of a power cycle the governor or the
         I65 cooldown just denied (spec 04 I71). Only for a drop the reboot can still recover
-        (:func:`_reboot_fallback_eligible`), with the reboot opted in and its own limits passing."""
+        (:func:`_reboot_fallback_eligible`), with the reboot opted in, not yet spent on this wedge and
+        its own limits passing."""
         if not _reboot_fallback_eligible(ev.off_bus, ev.expected, warm_reboot_futile=self._gate_warm_reboot_futile(ev)):
             return False, "a warm reboot cannot recover this drop"
         if not self.deps.auto_reboot_enabled():
             return False, "the warm reboot is not opted in"
-        return self.mechanism.auto_recovery_allowed("reboot", tenant_active=tenant_active)
+        return self.mechanism.fallback_reboot_allowed(tenant_active=tenant_active)
 
     async def _reboot_after_cycle_launch_failure(self, log, cause: str, *, eligible: bool) -> bool:
         """The in-band fallback for a power cycle that did not launch (spec 04 I71): an unreachable
@@ -1224,7 +1226,7 @@ class GalaxyRecovery(Recovery):
         if not eligible or not self.deps.auto_reboot_enabled():
             return False
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        allowed, why = self.mechanism.auto_recovery_allowed("reboot", tenant_active=self._tenant_active(scan))
+        allowed, why = self.mechanism.fallback_reboot_allowed(tenant_active=self._tenant_active(scan))
         if not allowed:
             log(f"the power cycle did not launch and the warm-reboot fallback is held off: {why}")
             return False
@@ -3269,8 +3271,8 @@ class GalaxyRecovery(Recovery):
         fallback_eligible = _reboot_fallback_eligible(off_bus, expected, warm_reboot_futile=warm_reboot_futile)
         if not allowed and escalation == "power-cycle" and fallback_eligible and self.deps.auto_reboot_enabled():
             # I71: a denied cycle on a drop the reboot can still recover takes the in-band rung now
-            # rather than hold to the cooldown's end; the reboot's own limits bound it.
-            reboot_ok, reboot_why = self.mechanism.auto_recovery_allowed("reboot", tenant_active=tenant_active)
+            # rather than hold to the cooldown's end; once per wedge, within the reboot's own limits.
+            reboot_ok, reboot_why = self.mechanism.fallback_reboot_allowed(tenant_active=tenant_active)
             if reboot_ok:
                 log(f"a host power cycle is held off ({why}); firing the warm reboot as the in-band fallback")
                 health_event("power_cycle_reboot_fallback", trigger="denied", reason=why, off_bus=off_bus)

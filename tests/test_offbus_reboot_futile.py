@@ -6,17 +6,24 @@ present mesh (off_bus == 0) and a single-chip host keep the warm reboot first. A
 denied or does not launch falls back to the warm reboot on a drop the reboot can still recover. With
 no power cycle armed the older verdict stands unchanged."""
 
+import json
+import subprocess
+import time
+import types
+
 import pytest
 
 from tests.conftest import patch_health_event
 from tests.test_device_safety import (
     _arm_offbus_stuck_hold,
     _arm_stuck_hold,
+    _ledger_dir,
     _reach_reboot_rung_with_regressing_reset,
     _rung,
 )
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import BLOCKED, DEFER, STAGE_HOST_REBOOT, STAGE_POWER_CYCLE, WAIT
+from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as galaxy_mod
 
 
@@ -296,3 +303,220 @@ def test_a_live_scope_waits_instead_of_blocking(monkeypatch, health_deps):
     assert d in (WAIT, DEFER)
     d = _rung(monkeypatch, health_deps, off_bus=32, was_failing=True, reset_recovered=False, host_escalation="reboot")
     assert d == BLOCKED
+
+
+# ---- review #1246 F1: one fallback reboot per wedge ------------------------------------------------
+
+
+def _reboot_already_ran(monkeypatch, *, verified_before=True):
+    """The ledger holds a broker reboot 10 min ago and no verified-healthy release since it: the wedge
+    it was fired for is still on the box."""
+    now = time.time()
+    rec = {"action": "reboot", "boot_id": "boot-before", "at_epoch": now - 600}
+    monkeypatch.setattr(srv.recovery_mechanism, "read_auto_recovery_ledger", lambda: [rec])
+    verified = {"boot_id": "boot-older", "at_epoch": now - 7200} if verified_before else None
+    monkeypatch.setattr(srv.recovery_mechanism, "last_verified_release", lambda: verified)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verified_before", [True, False])
+async def test_a_denied_cycle_takes_no_second_fallback_reboot_on_the_idle_climb(
+    monkeypatch, clear_job_state, verified_before
+):
+    """F1, idle climb, denied cycle: a reboot already ran for this wedge, so the fallback is spent and
+    the hold waits for the cycle at its cooldown end. Only the cycle is asked for the host rung."""
+    counters = _arm_partial_drop(monkeypatch, 16)
+    _reboot_already_ran(monkeypatch, verified_before=verified_before)
+    asked = _deny(monkeypatch, "power-cycle")
+    events = []
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert "reboot" not in asked, "a spent fallback never even asks the governor for a reboot"
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0
+    assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
+    assert "power_cycle_reboot_fallback" not in events
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_that_does_not_launch_takes_no_second_fallback_reboot(monkeypatch, clear_job_state):
+    """F1, idle climb, launch failure: the same one-per-wedge rule."""
+    counters = _arm_partial_drop(monkeypatch, 16)
+    _reboot_already_ran(monkeypatch)
+    cycles = _cycle_never_launches(monkeypatch)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+
+    asked = _deny(monkeypatch)  # the cycle is allowed; it just does not launch
+
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert cycles["n"] == 1 and counters["reboots"] == 0
+    assert "reboot" not in asked
+
+
+@pytest.mark.asyncio
+async def test_the_gate_takes_no_second_fallback_reboot_when_the_cycle_is_denied(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """F1 at the gate, denied cycle: the fallback is spent, so the gate holds (the cycle is asked
+    again at the cooldown end) and never reboots or releases."""
+    reboots = _gate_partial_drop(monkeypatch, tmp_path)
+    _reboot_already_ran(monkeypatch)
+    cycles = {"n": 0}
+
+    async def fake_power_cycle(log, reason):
+        cycles["n"] += 1
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
+    asked = _deny(monkeypatch, "power-cycle")
+    cleared = []
+    monkeypatch.setattr(srv, "_clear_device_dirty", lambda **kw: cleared.append(kw))
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    assert cycles["n"] == 0 and reboots["n"] == 0
+    assert "reboot" not in asked
+    assert cleared == [], "the held drop is never released"
+
+
+@pytest.mark.asyncio
+async def test_the_gate_takes_no_second_fallback_reboot_when_the_cycle_does_not_launch(
+    monkeypatch, tmp_path, clear_job_state
+):
+    reboots = _gate_partial_drop(monkeypatch, tmp_path)
+    _reboot_already_ran(monkeypatch)
+    cycles = _cycle_never_launches(monkeypatch)
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    assert cycles["n"] == 1 and reboots["n"] == 0
+
+
+@pytest.mark.parametrize(
+    "ledger, verified_ago, spent",
+    [
+        ([], 7200, False),  # no reboot at all
+        ([("reboot", 600)], 7200, True),  # a reboot since the verified release
+        ([("reboot", 600)], 300, False),  # a verified release followed it: it healed, a new wedge
+        ([("power-cycle", 600)], 7200, False),  # only a cycle: the reboot is still untried
+        ([("reboot", 600)], None, True),  # nothing verified on record: a recent reboot counts
+        ([("reboot", recovery_base.POWER_CYCLE_BACKOFF_CAP_SEC + 60)], None, False),  # too old to hold the cycle
+        ([("reboot", None)], 7200, True),  # an unreadable stamp counts (the cycle side is the safe one)
+    ],
+)
+def test_reboot_fallback_spent_counts_a_reboot_since_the_last_verified_release(
+    monkeypatch, ledger, verified_ago, spent
+):
+    now = 1_900_000_000.0
+    recs = [{"action": a, "boot_id": "b0", "at_epoch": None if ago is None else now - ago} for a, ago in ledger]
+    rm = srv.recovery_mechanism
+    monkeypatch.setattr(rm, "read_auto_recovery_ledger", lambda: recs)
+    verified = None if verified_ago is None else {"boot_id": "b1", "at_epoch": now - verified_ago}
+    monkeypatch.setattr(rm, "last_verified_release", lambda: verified)
+    assert bool(rm.reboot_fallback_spent(now_epoch=now)) is spent
+    if spent:
+        monkeypatch.setattr(rm, "auto_recovery_allowed", lambda *a, **k: (True, "ok"))
+        allowed, why = rm.fallback_reboot_allowed(tenant_active=False, now_epoch=now)
+        assert allowed is False and "already ran for this wedge" in why
+
+
+@pytest.mark.asyncio
+async def test_an_unhealed_fallback_reboot_hands_the_next_rung_to_the_cycle_with_the_real_governor(
+    monkeypatch, clear_job_state, tmp_path
+):
+    """F1 with the real governor and ledger: two unhealed cycles double the I65 interval to 1 h, then
+    a fallback reboot ran and came back still wedged. At record + 1 h the reboot's own interval has
+    lapsed but the cycle's cooldown (anchored on that reboot's boot) has not: the old code rebooted
+    again here, and on every hour after, so the cycle never fired. Now the drop holds, and the cycle
+    fires the moment the cooldown ends."""
+    counters = _arm_partial_drop(monkeypatch, 16)
+    _ledger_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(recovery_base, "POWER_CYCLE_MIN_INTERVAL_SEC", 1800)
+    monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MIN_INTERVAL_SEC", 3600)
+    monkeypatch.delenv(recovery_base.POWER_CYCLE_HISTORY_FILE_ENV, raising=False)
+    rm = srv.recovery_mechanism
+    for name in ("read_auto_recovery_ledger", "auto_recovery_allowed", "last_verified_release"):
+        monkeypatch.setattr(rm, name, getattr(type(rm), name).__get__(rm))
+    reboot_at = 1_900_000_000.0
+    boot_btime = reboot_at + 60  # the reboot's boot, still wedged
+    (tmp_path / recovery_base.AUTO_RECOVERY_LEDGER).write_text(
+        "".join(
+            json.dumps(r) + "\n"
+            for r in (
+                {"action": "power-cycle", "boot_id": "boot-A", "at_epoch": reboot_at - 2 * 3600},
+                {"action": "power-cycle", "boot_id": "boot-B", "at_epoch": reboot_at - 3600},
+                {"action": "reboot", "boot_id": "boot-C", "at_epoch": reboot_at},
+            )
+        )
+    )
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-D")
+    monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int(boot_btime)))
+    clk = [reboot_at + 3630]  # the reboot interval has lapsed; the 1 h cooldown ends at boot + 3600
+    fake_time = types.SimpleNamespace(**{n: getattr(time, n) for n in dir(time) if not n.startswith("_")})
+    fake_time.time = lambda: clk[0]
+    monkeypatch.setattr(recovery_base, "time", fake_time)
+    assert rm.power_cycle_interval(now_epoch=clk[0]) == 3600
+    assert rm.auto_recovery_allowed("reboot", tenant_active=False)[0] is True, "the old loop's opening"
+    assert rm.power_cycle_cooldown()["until"] == boot_btime + 3600
+
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0, "held for the cycle, no second reboot"
+
+    clk[0] = boot_btime + 3600  # the I65 retry: the watchdog's forced pass at the cooldown end
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["power_cycles"] == 1 and counters["reboots"] == 0, "the cycle fires at the cooldown end"
+    assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
+
+
+# ---- review #1246 N-a: the launch verdict the I71 fallback reads -------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case, returns, kept, pending",
+    [
+        ("ledger write fails", False, False, False),  # nothing fired: the fallback may run
+        ("fire raises", False, False, False),  # did not launch: retracted, no pending request
+        ("fire times out", True, False, True),  # may still act: no fallback, resets stay off
+        ("subprocess timeout", True, False, True),
+        ("fire returns", True, True, True),  # issued: the record stays as the rate limit
+    ],
+)
+async def test_fire_recovery_escalation_reports_whether_the_action_may_have_launched(
+    monkeypatch, tmp_path, case, returns, kept, pending
+):
+    """``_fire_recovery_escalation`` returns False only when the action certainly did not launch (the
+    I71 launch-failure fallback fires only then); a timeout or a normal return reads True."""
+    _ledger_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-A")
+    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    rm = srv.recovery_mechanism
+    monkeypatch.setattr(rm, "host_action_requested", None)
+    if case == "ledger write fails":
+        monkeypatch.setattr(rm, "record_auto_recovery", lambda *a, **k: False)
+    fired = []
+
+    def fire():
+        fired.append(case)
+        if case == "fire raises":
+            raise FileNotFoundError("ipmitool")
+        if case == "fire times out":
+            raise recovery_base.HostActionTimedOut("no answer")
+        if case == "subprocess timeout":
+            raise subprocess.TimeoutExpired("ipmitool", 30)
+
+    got = await rm._fire_recovery_escalation(
+        "power-cycle",
+        row_owner="[broker]power-cycle-request",
+        label="auto BMC power cycle",
+        detail="the ladder could not recover",
+        fire=fire,
+        log=lambda m: None,
+        reason="wedge",
+    )
+    assert got is returns
+    assert fired == ([] if case == "ledger write fails" else [case]), "no record, no fire"
+    ledger = tmp_path / recovery_base.AUTO_RECOVERY_LEDGER
+    recs = [json.loads(ln) for ln in ledger.read_text().splitlines() if ln.strip()] if ledger.exists() else []
+    assert any(r.get("action") == "power-cycle" for r in recs) is kept
+    assert (rm.host_action_requested is not None) is pending
+    if pending:
+        assert rm.host_action_requested[0] == "power-cycle"

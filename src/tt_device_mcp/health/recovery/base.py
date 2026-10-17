@@ -1493,6 +1493,39 @@ class RecoveryMechanism:
                 return True
         return False
 
+    def reboot_fallback_spent(self, *, now_epoch: Optional[float] = None) -> Optional[str]:
+        """Why the I71 warm-reboot fallback is spent for the wedge still on the box, or None when it
+        may fire: a broker reboot (a fallback or the reboot rung) recorded after the last verified-
+        healthy release did not heal it. Another one would re-anchor the I65 cooldown on its boot and
+        push the power cycle out again; with an I65 interval of an hour or more the reboot's own
+        interval lapses first, so an unhealed drop would reboot hourly and never cycle (spec 04 I71).
+        With no verified release on record only a reboot within the longest I65 cooldown counts: an
+        older one no longer holds the cycle off. A record with no readable stamp counts. An
+        unreadable ledger reads as not spent here; the governor denies the reboot on it."""
+        ledger = self.read_auto_recovery_ledger()
+        if not ledger:
+            return None
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        verified_at = _past_epoch((self.last_verified_release() or {}).get("at_epoch"), now_epoch)
+        since = verified_at if verified_at is not None else now_epoch - POWER_CYCLE_BACKOFF_CAP_SEC
+        for rec in reversed(ledger):
+            if rec.get("action") == "reboot" and _epoch_after(rec.get("at_epoch"), since, now_epoch):
+                return (
+                    "a broker reboot already ran for this wedge and no verified-healthy release "
+                    "followed it; the power cycle is next, at the end of its cooldown"
+                )
+        return None
+
+    def fallback_reboot_allowed(self, *, tenant_active: bool, now_epoch: Optional[float] = None) -> tuple[bool, str]:
+        """Whether the I71 warm reboot may fire in place of a power cycle that was denied or did not
+        launch: at most once per wedge (:meth:`reboot_fallback_spent`), and within the reboot's own
+        limits (:meth:`auto_recovery_allowed`). Returns ``(allowed, reason)``."""
+        spent = self.reboot_fallback_spent(now_epoch=now_epoch)
+        if spent:
+            return False, spent
+        clock = {} if now_epoch is None else {"now_epoch": now_epoch}
+        return self.auto_recovery_allowed("reboot", tenant_active=tenant_active, **clock)
+
     def record_auto_recovery(self, action: str, reason: str, *, now_epoch: Optional[float] = None) -> bool:
         """Append one escalation to the durable ledger and fsync it BEFORE the action fires.
 

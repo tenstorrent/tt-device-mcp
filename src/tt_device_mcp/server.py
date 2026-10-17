@@ -6325,7 +6325,7 @@ async def device_health_gate(
                 return
             if stage == STAGE_POWER_CYCLE:
                 # I71: a denied cycle on a drop the reboot can still recover takes the in-band rung
-                # now rather than hold to the cooldown's end; the reboot's own limits bound it.
+                # now rather than hold to the cooldown's end; once per wedge, within the reboot's own limits.
                 fallback_ok, fallback_why = galaxy_recovery.reboot_fallback_allowed(ev, tenant_active=tenant_active)
                 if fallback_ok:
                     _log(f"auto-power-cycle held off ({why}); firing the warm reboot as the in-band fallback")

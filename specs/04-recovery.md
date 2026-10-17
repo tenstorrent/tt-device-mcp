@@ -948,9 +948,14 @@ each rung fires only when the gentler one failed or cannot apply.
   falls back to the warm reboot at once, at the gate and on the idle climb
   (`power_cycle_reboot_fallback`, trigger `denied` or `launch_failed`), but only for a drop the
   reboot can recover (`_reboot_fallback_eligible`: the drops the no-cycle verdict hands the
-  reboot), only with the reboot opted in, and only within the reboot's own limits (one per boot,
-  the ledger interval). A whole-bus or reboot-futile drop never falls back: it holds and asks for
-  the cycle again at the deadline shown on /health. `_route` returns BLOCKED only when no reset
+  reboot), only with the reboot opted in, only within the reboot's own limits (one per boot,
+  the ledger interval), and at most once per wedge: a broker reboot recorded since the last
+  verified-healthy release (with none on record, within the longest I65 cooldown; an unreadable
+  stamp counts) spends it (`reboot_fallback_spent`). A reboot that did not heal re-anchors the I65
+  cooldown on its boot, and with an interval of an hour or more the reboot's own interval lapses
+  first, so a second fallback would reboot hourly and the cycle would never fire; instead the hold
+  asks for the cycle at that cooldown's end. A whole-bus or reboot-futile drop never falls back:
+  it holds and asks for the cycle again at the deadline shown on /health. `_route` returns BLOCKED only when no reset
   scope is live; under a live scope it waits. The full health check, fabric included, runs after
   the cycle and after every fallback reboot before any release (03 I4). The I76 10-min hold bound
   is unchanged. Time to recover, armed multi-chip host, against the base: D and G2 unchanged
@@ -958,7 +963,10 @@ each rung fires only when the gentler one failed or cannot apply.
   reboot-futile and cycled); a non-futile partial drop with 16-31 chips off now cycles right after
   the ladder (about 5-8 min) instead of rebooting first and cycling after the reboot's boot and
   cooldown, and on a denied or failed cycle reboots at once instead of holding up to 30 min (4 h
-  after repeated unhealed cycles) or retrying a cycle that cannot launch without bound; whole-bus
+  after repeated unhealed cycles) or retrying a cycle that cannot launch without bound; if that one
+  reboot does not heal it, worst case the ladder, the reboot (about 3-5 min), its boot and the I65
+  interval (30 min; 1 h, 2 h, then 4 h after repeated unhealed cycles), then the cycle, never a
+  second fallback reboot; D and G2 take no second fallback reboot either; whole-bus
   and other reboot-futile drops, class A, C, single-chip hosts and hosts with no power cycle armed
   are unchanged.
 
@@ -1453,6 +1461,7 @@ sees a silent fabric pass.
 | I71 multi-chip with a chip off the bus names the power cycle over the reboot when armed; a present mesh and a single chip keep the reboot first; with no cycle armed the old verdict stands | `tests/test_offbus_reboot_futile.py::test_multi_chip_offbus_takes_the_power_cycle_over_the_reboot_when_armed`, `::test_a_present_mesh_keeps_the_reboot_first`, `::test_single_chip_keeps_the_reboot_first`, `::test_without_a_power_cycle_the_old_verdict_stands` |
 | I71 a partial drop past the full ladder cycles with no reboot; a present-mesh wedge reboots first with both rungs armed, and with no cycle armed | `tests/test_offbus_reboot_futile.py::test_partial_drop_past_the_ladder_cycles_without_a_reboot`, `::test_present_mesh_wedge_reboots_first_with_both_rungs_armed`, `::test_present_mesh_wedge_still_reboots_with_no_power_cycle`, `::test_next_stage_names_the_power_cycle_for_a_failed_reset_partial_drop`, `::test_next_stage_present_mesh_reboots_first_with_both_rungs_armed`, `::test_next_stage_present_mesh_with_no_power_cycle_still_reboots` |
 | I71 a denied or unlaunched cycle falls back to the reboot only on a drop the reboot can recover, at the gate and on the idle climb; a futile drop and a cooldown denial on one hold; BLOCKED only with no live reset scope | `tests/test_offbus_reboot_futile.py::test_the_reboot_fallback_is_only_for_drops_a_reboot_can_recover`, `::test_a_denied_cycle_falls_back_to_the_reboot_on_a_recoverable_drop`, `::test_both_rungs_denied_holds`, `::test_a_cycle_that_does_not_launch_falls_back_to_the_reboot`, `::test_a_cycle_that_does_not_launch_on_a_futile_drop_never_reboots`, `::test_the_gate_falls_back_to_the_reboot_when_the_cycle_is_denied`, `::test_the_gate_falls_back_to_the_reboot_when_the_cycle_does_not_launch`, `::test_the_gate_cycles_a_partial_drop_when_allowed`, `::test_a_cooldown_denial_on_a_futile_drop_holds_and_never_reboots`, `::test_a_live_scope_waits_instead_of_blocking` |
+| I71 the fallback reboot fires at most once per wedge: a broker reboot since the last verified release spends it at the gate and on the idle climb, denied or unlaunched; the cycle fires at the cooldown end that reboot anchored; the launch verdict the fallback reads | `tests/test_offbus_reboot_futile.py::test_reboot_fallback_spent_counts_a_reboot_since_the_last_verified_release`, `::test_a_denied_cycle_takes_no_second_fallback_reboot_on_the_idle_climb`, `::test_a_cycle_that_does_not_launch_takes_no_second_fallback_reboot`, `::test_the_gate_takes_no_second_fallback_reboot_when_the_cycle_is_denied`, `::test_the_gate_takes_no_second_fallback_reboot_when_the_cycle_does_not_launch`, `::test_an_unhealed_fallback_reboot_hands_the_next_rung_to_the_cycle_with_the_real_governor`, `::test_fire_recovery_escalation_reports_whether_the_action_may_have_launched` |
 | I37/I65 class C at startup: one mesh reset with no failed reset or broker cycle; none after the broker's own cycle, which then waits only for the cooldown | `tests/test_power_cycle_cooldown.py::test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_gets_one_reset`, `::test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_reset`, `::test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not` |
 | I58 all off after a failed reset and a broker restart: the startup or a later gate cycles with no second reset; the sweep skips a failed-unchanged set | `tests/test_classac_power_cycle_direct.py::test_replay_all_off_after_a_restart_cycles_with_no_second_reset`, `::test_a_partial_drop_keeps_the_ladder` |
 | I36 a power cycle that is rate-limited or not opted in never stops resets: a shrinking off-bus set resets again each forced window, and the gate retries its reset once its cooldown ran out | `tests/test_host_action_suppress.py::test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_fire`, `::test_the_gate_keeps_resetting_a_drop_whose_power_cycle_is_not_opted_in` |
