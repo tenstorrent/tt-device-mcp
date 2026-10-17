@@ -7,13 +7,21 @@ Every reset path settles through ``_clear_device_dirty(verified=True)``; while a
 pass, that funnel holds the device fabric-unverified instead of releasing it.
 """
 
+from datetime import datetime, timedelta
+
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
-from tests.test_device_safety import _arm_offbus_stuck_hold, _clean_post_job_gate, _restart_broker
+from tests.test_device_safety import (
+    _arm_offbus_stuck_hold,
+    _arm_stuck_hold,
+    _clean_post_job_gate,
+    _restart_broker,
+    _setup_selfheal_hold,
+)
 from tests.test_startup_fabric_hugepages import _bound
 from tt_device_mcp import server as srv
-from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import post_reset
 from tt_device_mcp.health import recovery as recovery_pkg
@@ -240,6 +248,142 @@ async def test_the_idle_off_bus_bridge_reset(mesh, monkeypatch, verdict):
     _assert_settled(released)
 
 
+@pytest.mark.asyncio
+async def test_a_tenant_deferred_off_bus_one_shot_runs_on_the_next_idle_tick(mesh, monkeypatch, verdict):
+    """Spec 03 I23: the off-bus one-shot that stood down on a live tenant is given back, not spent. The
+    first sampler tick with no tenant runs it, and its reset still releases only through the full
+    post-reset check, fabric included (spec 04 I32). Spending it left a one-chip drop held until the
+    general ceiling window, eight minutes after the tenant had gone."""
+    evidence, released = verdict
+    _arm_offbus_stuck_hold(monkeypatch, isolated={"8"})
+    patch_health_event(monkeypatch, lambda kind, **f: mesh.append((kind, f)))
+    monkeypatch.setattr(srv, "_clear_device_dirty", _REAL_CLEAR_DIRTY)
+    fsm_dirty(srv, "gate/post-job: 1/32 off-bus below the reset floor", why="job_killed")
+    monkeypatch.setattr(srv, "device_op_lock", None)  # bind a fresh lock to this test's loop
+    monkeypatch.setattr(srv, "_forced_escalation_task", None)
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    tenant = HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True)
+    scan = {"now": tenant}
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scan["now"])
+    bridges = []
+
+    async def bridge(log):
+        bridges.append("8")
+        FABRIC_DEBT.note_reset("bridge reset of chip 8")
+        return True
+
+    patch_recovery(monkeypatch, "_recover_isolated_chips", bridge)
+    calls = []
+    _verify_returning(monkeypatch, evidence, calls)
+    since = datetime.fromisoformat(srv.device_hold_episode_since)
+    one_shot = srv._offbus_hold_ceiling_sec()
+
+    def count(kind):
+        return sum(k == kind for k, _ in mesh)
+
+    async def tick(sec):
+        srv._check_hold_deadline(now=since + timedelta(seconds=sec))
+        if srv._forced_escalation_task is not None:
+            await srv._forced_escalation_task
+
+    await tick(one_shot + 1)
+    assert count("hold_deadline_forced_escalation") == 1 and bridges == []
+    assert srv.device_hold_offbus_escalated is False, "a run that stood down on a tenant spent the one-shot"
+
+    await tick(one_shot + 11)  # the tenant is still there
+    assert bridges == [] and count("hold_deadline_forced_escalation") == 1
+    assert count("device_op_begin") == 1, "a retry under a live tenant must check it quietly, not open a device op"
+    assert srv.device_hold_offbus_escalated is False
+
+    scan["now"] = HolderScan(holders=[], complete=True)
+    await tick(one_shot + 21)
+    assert bridges == ["8"], "the first idle tick must run the deferred one-shot"
+    assert count("hold_deadline_forced_escalation") == 2
+    assert srv.device_hold_offbus_escalated is True and srv.device_hold_tenant_deferred is False
+    assert calls and all(calls), "the retried run's post-reset verify skipped the fabric pass"
+    if released:
+        _assert_settled(released)
+    else:  # the forced climb may leave it DOWN, but never released over an unproven fabric
+        assert srv.fsm.state is not ServerState.HEALTHY and FABRIC_DEBT.owed == "bridge reset of chip 8"
+        assert count("post_reset_release_refused") == 1
+
+
+@pytest.mark.parametrize("given_back", [True, False], ids=["given-back", "spent"])
+def test_a_given_back_one_shot_gives_back_the_ceiling_window_it_claimed(monkeypatch, given_back):
+    """Spec 03 I23: a one-shot that waited out a tenant past the ceiling claims that ceiling window as
+    its own run. Given back (it stood down on the tenant), the window goes back with it: when the chips
+    return meanwhile (no one-shot left to retry), the ceiling window runs on the next tick, not one
+    whole window (600 s) later. A one-shot that ran keeps the claim: one forced climb, not two."""
+    spawned = []
+    monkeypatch.setattr(srv, "health_event", lambda kind, **f: None)
+    monkeypatch.setattr(
+        srv, "_maybe_spawn_forced_escalation", lambda: spawned.append(srv.device_hold_escalation_kind) or True
+    )
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
+    monkeypatch.setattr(srv, "device_hold_offbus_prior_bucket", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
+    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
+    srv.fsm.set_latch("escalated", False)
+    monkeypatch.setattr(srv, "isolated_chips", {"13"})
+    monkeypatch.setattr(srv, "device_hold_episode_reason", "chip(s) 13 left the PCIe bus")
+    since = datetime(2026, 10, 15, 18, 43, 41)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 50))  # the tenant held it past the ceiling
+    assert spawned == ["offbus_one_shot"] and srv.device_hold_escalate_bucket == 1
+    if given_back:
+        assert srv._rearm_tenant_deferred_window("offbus_one_shot")
+    monkeypatch.setattr(srv, "isolated_chips", set())  # the chip came back; the hold stays
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 60))
+    if given_back:
+        assert spawned == ["offbus_one_shot", "ceiling_window"], "the given-back window must run now"
+        assert srv.device_hold_escalate_bucket == 1
+    else:
+        assert spawned == ["offbus_one_shot"], "the one-shot that ran is window 1's run"
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 70))
+    assert len(spawned) == (2 if given_back else 1), "one forced run per window"
+
+
+@pytest.mark.asyncio
+async def test_the_measured_fabric_failure_reset_on_the_first_relift(mesh, monkeypatch, tmp_path, verdict):
+    """Spec 03 I56: a post-job hold on a measured fabric FAIL resets on the first idle relift, with no
+    grace. The real reset-and-verify path runs (only the reset command and the verify are stubbed): its
+    verify runs the fabric pass, and the hold clears only on a healthy fabric verdict."""
+    evidence, released = verdict
+    monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRY_SLEEP_SEC", 0)
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    _arm_stuck_hold(monkeypatch, held_minutes_ago=0.05)
+    g = srv.galaxy_recovery
+    monkeypatch.delattr(g, "_reset_and_verify_device")  # the real one, not _arm_stuck_hold's counter
+    monkeypatch.setattr(srv, "_clear_device_dirty", _REAL_CLEAR_DIRTY)
+    srv.health_monitor.last_fabric_ok = False
+    calls, resets = [], []
+
+    async def glx_reset(argv, log):
+        resets.append(len(calls))
+        FABRIC_DEBT.note_reset(" ".join(argv))
+        return 0, ""
+
+    async def eth_unreadable(timeout_sec=60.0):
+        return None, "eth read timed out"
+
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", glx_reset)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_unreadable)
+    _verify_returning(monkeypatch, evidence, calls)
+
+    await srv._attempt_idle_relift()
+
+    assert len(resets) == 1, "the measured fabric failure resets on the first relift, seconds into the hold"
+    after = calls[resets[0] :]
+    assert after and all(after), "every verify after the reset runs the fabric pass"
+    _assert_settled(released)
+
+
 class _FastAsyncio:
     """``asyncio`` for recovery.base with its 2 s scope poll made instant."""
 
@@ -270,6 +414,120 @@ async def test_a_reset_adopted_from_a_foreign_scope(mesh, monkeypatch, verdict):
     assert calls == [True], "the adopted reset's verify runs the fabric pass"
     srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy")
     _assert_settled(released)
+
+
+# ---- a re-power owes the AICLK ceiling too: the next job-door apply runs (spec 03 I35) ----------
+
+
+@pytest.fixture
+def ceiling(monkeypatch):
+    """An armed ceiling verified before the path runs. No real helper runs: every apply is recorded
+    and verifies, as the door's would on a healthy host. Returns the applies, by ``where``."""
+    from tt_device_mcp.health import aiclk_ceiling as ac
+    from tt_device_mcp.health.aiclk_ceiling import CEILING
+
+    monkeypatch.setenv(ac.ENV_MHZ, "900")
+    monkeypatch.setattr(ac, "health_event", lambda kind, **f: None)
+    monkeypatch.setattr(CEILING, "owed", False)
+    monkeypatch.setattr(CEILING, "disarmed", "")
+    applies = []
+
+    async def apply(where, **_):
+        applies.append(where)
+        CEILING.owed = False
+        return True, "ceiling 900 MHz applied", {}
+
+    monkeypatch.setattr(CEILING, "apply", apply)
+    return applies
+
+
+async def _door_applies_the_owed_ceiling(applies):
+    from tt_device_mcp.health.aiclk_ceiling import CEILING
+
+    assert CEILING.owed, "a re-power left the ceiling marked verified: the job door would skip it"
+    assert applies == [], "nothing in the path re-applied it, so only the door can"
+    await srv._ensure_aiclk_ceiling(None)
+    assert applies == ["pre-job"] and not CEILING.owed
+
+
+@pytest.mark.asyncio
+async def test_a_real_bridge_reset_owes_the_ceiling(mesh, monkeypatch, verdict, ceiling):
+    evidence, released = verdict
+    fsm_dirty(srv, "gate/post-job: chip 8 off the bus", why="job_killed")
+    monkeypatch.setattr(srv, "isolated_chips", {"8"})
+    monkeypatch.setattr(srv, "device_pci_map", {"8": "0000:46:00.0"})
+    monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", lambda idx, bdf: True)
+    monkeypatch.setattr(srv, "_set_device_op_detail", lambda d: None)
+    _verify_returning(monkeypatch, evidence)
+    g = srv.galaxy_recovery
+    out = await g._fire_gate_rung("post-job", galaxy.STAGE_BRIDGE_RESET, ["8"], 32, lambda m: None, ev=None, beats=None)
+    assert out == galaxy.OUTCOME_RECOVERED
+    _assert_settled(released)
+    await _door_applies_the_owed_ceiling(ceiling)
+
+
+@pytest.mark.asyncio
+async def test_a_tray_re_power_owes_the_ceiling(mesh, monkeypatch, galaxy_trays, verdict, ceiling):
+    evidence, released = verdict
+    fsm_dirty(srv, "gate/post-job: tray 3 off the bus", why="job_killed")
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
+    fired = []
+
+    async def no_bridge(log):
+        return False
+
+    async def mesh_reset(argv, log, *a, **k):
+        return 0, ""
+
+    patch_recovery(monkeypatch, "_recover_isolated_chips", no_bridge)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap))
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh_reset)
+    _verify_returning(monkeypatch, evidence)
+    offbus = {str(i) for i in range(24, 32)}
+    out = await g._fire_tray_down_no_window(offbus, 32, lambda m: None, gate_phase="post-job", ev=None)
+    assert out == galaxy.OUTCOME_RECOVERED and fired
+    _assert_settled(released)
+    await _door_applies_the_owed_ceiling(ceiling)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", list(UNPROVEN.values()), ids=list(UNPROVEN))
+async def test_a_tray_walk_re_power_owes_the_ceiling(mesh, monkeypatch, galaxy_trays, evidence, ceiling):
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    srv.fsm.set_latch("ubb_reset_fired", False)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    fired = []
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap))
+    _verify_returning(monkeypatch, evidence)
+    beats = {str(i): 100 for i in range(24)}
+    # Recovered or not by the walk's own verify, the tray was re-powered.
+    await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None)
+    assert fired
+    assert FABRIC_DEBT.owed, "the walk's re-power owes a fabric pass before release"
+    await _door_applies_the_owed_ceiling(ceiling)
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_reset_owes_the_ceiling(mesh, monkeypatch, verdict, ceiling):
+    from tt_device_mcp.health.recovery import base
+
+    evidence, released = verdict
+    fsm_dirty(srv, "gate/post-job: reset", why="job_killed")
+    g = srv.galaxy_recovery
+    scopes = iter(["ttdev-reset-1.scope"])
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: next(scopes, None))
+    monkeypatch.setattr(base, "asyncio", _FastAsyncio())
+    _verify_returning(monkeypatch, evidence)
+    assert await g._reset_and_verify_device([str(i) for i in range(32)], lambda m: None) is True
+    srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy")
+    _assert_settled(released)
+    await _door_applies_the_owed_ceiling(ceiling)
 
 
 @pytest.mark.asyncio
@@ -317,3 +575,119 @@ async def test_a_pre_job_gate_never_runs_the_owed_pass(monkeypatch, tmp_path):
     FABRIC_DEBT.note_reset("tt-smi -glx_reset")
     await srv._device_health_gate(None, phase="pre-job", run_fabric=False)
     assert calls["fabric"] == 0
+
+
+# ---- the last-chance sweep before a host rung (04 I22/I32): a verify that proves no fabric holds ----
+
+# The fabric check could not run at all (spawn failure): no verdict, and the pass journals
+# fabric_check_unavailable. Like a 77, it must hold, never release.
+FUNAVAIL = {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": "skipped (fabric check not runnable: x)"}}
+
+
+@pytest.fixture(params=["fabric-77", "no-fabric-verdict", "fabric-unavailable", "fabric-ok"])
+def sweep_verdict(request):
+    if request.param == "fabric-ok":
+        return FOK, True
+    return (FUNAVAIL if request.param == "fabric-unavailable" else UNPROVEN[request.param]), False
+
+
+def _arm_last_chance_sweep(monkeypatch, mesh, evidence):
+    """Stub every reset the sweep fires (the mesh reset records the debt, as reset_with_quiesce
+    does) and the host rungs; return the list of host rungs that fired."""
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
+    monkeypatch.setattr(g.deps, "isolated_chips", lambda: set())
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: None)
+    host = []
+
+    async def mesh_reset(argv, log, *a, **k):
+        FABRIC_DEBT.note_reset("tt-smi -glx_reset")
+        return 0, ""
+
+    async def power_cycle(log, reason):
+        host.append("power-cycle")
+
+    async def reboot(log, reason):
+        host.append("reboot")
+
+    async def verify(expected, log, run_fabric=True, **_):
+        if (evidence.get("fabric") or {}).get("detail", "").startswith("skipped"):
+            mesh.append(("fabric_check_unavailable", {"detail": "not_runnable"}))
+        return True, dict(evidence)
+
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh_reset)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    monkeypatch.setattr(g, "_auto_reboot_host", reboot)
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    return g, host
+
+
+def _assert_no_release(mesh):
+    assert _held(), "the sweep released a reset mesh no fabric pass has passed on since"
+    assert FABRIC_DEBT.owed == "tt-smi -glx_reset"
+    kinds = [k for k, _ in mesh]
+    # The funnel's own hold journals the dropped dirty bit as unverified; a verified clear is a release.
+    assert not any(k == "device_dirty_cleared" and f.get("verified") for k, f in mesh), "released as verified"
+    assert not any(k == "gate" and f.get("healthy") for k, f in mesh), "journaled as a healthy gate"
+    assert "post_reset_release_refused" in kinds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", [galaxy.STAGE_HOST_REBOOT, galaxy.STAGE_POWER_CYCLE])
+async def test_the_gate_ladders_last_chance_sweep(mesh, monkeypatch, galaxy_trays, sweep_verdict, stage):
+    """The gate's host rung runs the sweep; its verify passes enum+ARC. Folded into the FSM the way the
+    gate's ``_fire`` does, the device is released only on a passing fabric pass; otherwise it stays
+    held fabric-unverified (the relift owns it), and no host rung fires on a verify that passed."""
+    evidence, released = sweep_verdict
+    fsm_dirty(srv, "gate/post-job: mesh failed the verify after the reset", why="job_killed")
+    g, host = _arm_last_chance_sweep(monkeypatch, mesh, evidence)
+    out = await g._fire_gate_rung("post-job", stage, ["0"], 32, lambda m: None, ev=None, beats={})
+    assert out == galaxy.OUTCOME_RECOVERED, "the gate stops climbing this pass: no further reset or host rung"
+    srv._fold_rung_outcome(out, lambda m: None)
+    assert host == [], "no reboot or power cycle on a mesh whose verify passed enum+ARC"
+    if released:
+        assert srv.fsm.state is ServerState.HEALTHY and FABRIC_DEBT.owed == ""
+        assert any(k == "gate" and f.get("recovered_via") == "last-chance-reset-sweep" for k, f in mesh)
+    else:
+        _assert_no_release(mesh)
+        assert srv._idle_relift_armed()[1], "the fabric relift owns the hold: bounded, never open-ended"
+
+
+@pytest.mark.parametrize(
+    "owed, outcome, expect",
+    [
+        (True, galaxy.OUTCOME_RECOVERED, "held"),  # the funnel refused: never reopened by the fold
+        (False, galaxy.OUTCOME_RECOVERED, "healthy"),
+        (True, galaxy.OUTCOME_TERMINAL, "held"),  # a 77-only hold measured no fault: not DOWN
+        (False, galaxy.OUTCOME_WAITING, "held"),
+    ],
+)
+def test_no_rung_outcome_lifts_a_fabric_unverified_hold(mesh, owed, outcome, expect):
+    """The gate, the idle relift and the hold escalation fold a rung's outcome through one helper, so
+    none of them reopens the door the release funnel held (I32), nor parks a 77-only hold in DOWN."""
+    if owed:
+        FABRIC_DEBT.note_reset("tt-smi -glx_reset")
+    srv._hold_device_fabric_unverified("fabric check exited 77")
+    srv._fold_rung_outcome(outcome, lambda m: None)
+    if expect == "healthy":
+        assert srv.fsm.state is ServerState.HEALTHY
+    else:
+        assert _held()
+
+
+def test_a_terminal_rung_on_a_measured_fault_still_goes_down(mesh):
+    fsm_dirty(srv, "gate/post-job: mesh failed the verify after the reset", why="job_killed")
+    srv._fold_rung_outcome(galaxy.OUTCOME_TERMINAL, lambda m: None)
+    assert srv.fsm.state is ServerState.DOWN
+
+
+def test_every_rung_outcome_folds_through_the_helper():
+    import inspect
+
+    src = inspect.getsource(srv)
+    body = src.replace(inspect.getsource(srv._fold_rung_outcome), "")
+    assert "fsm.on_outcome(" not in body, "a rung outcome folded around the I32 guard"
+    assert src.count("_fold_rung_outcome(outcome, ") == 3, "the gate, the idle relift and the hold escalation"

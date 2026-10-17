@@ -119,6 +119,20 @@ class FsmRecord:
     dirty: bool = False
 
 
+# Process-wide listeners run on EVERY close to HEALTHY, whichever ServerFsm instance closes (the
+# broker has one; tests swap in fresh ones) — see add_close_listener.
+_close_listeners: "list[Callable[[], None]]" = []
+
+
+def add_close_listener(callback: "Callable[[], None]") -> None:
+    """Run ``callback()`` every time a device episode closes to HEALTHY, for the life of the
+    process. Unlike :meth:`ServerFsm.on_next_close` it is not one-shot: the tenant hold registers
+    here so a parked job re-runs its gate the moment any path lifts the device, not on its next
+    poll. Must be cheap and must not raise into a transition (a raise is logged and dropped)."""
+    if callback not in _close_listeners:
+        _close_listeners.append(callback)
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -303,6 +317,7 @@ class ServerFsm:
         run_fabric: bool = True,
         run_eth: bool = False,
         fabric_stale: bool = True,
+        eth_timeout_reset: bool = False,
         recovery: "Optional[Recovery]" = None,
     ) -> tuple[bool, dict]:
         """Trigger one probe pass of the system — the root's read of the mesh, routed through the
@@ -316,11 +331,13 @@ class ServerFsm:
         that pass on the same choice; omitted, the platform is selected fresh. ``run_eth`` asks for
         the passive eth read without the traffic pass (spec 03 I30); it and ``fabric_stale`` (may a
         link-drop skip of that read buy the traffic pass) are passed on only when ``run_eth`` is
-        set, so a ``_verify_device`` test fake that predates them keeps its signature."""
+        set, so a ``_verify_device`` test fake that predates them keeps its signature.
+        ``eth_timeout_reset`` (spec 03 I61) is passed on only when set, for the same reason."""
         r = recovery if recovery is not None else self.select_recovery()
         if run_eth:
+            extra = {"eth_timeout_reset": True} if eth_timeout_reset else {}
             healthy, evidence = await r._verify_device(
-                expected, log, run_fabric=run_fabric, phase=phase, run_eth=True, fabric_stale=fabric_stale
+                expected, log, run_fabric=run_fabric, phase=phase, run_eth=True, fabric_stale=fabric_stale, **extra
             )
         else:
             healthy, evidence = await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase)
@@ -533,6 +550,11 @@ class ServerFsm:
                     cb(prev)
                 except Exception:  # noqa: BLE001 - a journal hook must never break a transition
                     _logger.exception("fsm on-close callback failed")
+            for listener in list(_close_listeners):
+                try:
+                    listener()
+                except Exception:  # noqa: BLE001 - a wake hook must never break a transition
+                    _logger.exception("fsm close listener failed")
 
     def on_next_close(self, callback: "Callable[[FsmRecord], None]") -> None:
         """Run ``callback(closed_record)`` once, the next time the device reaches HEALTHY from any

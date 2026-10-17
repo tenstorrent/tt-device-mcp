@@ -19,6 +19,8 @@ import signal
 from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import aio
+from tt_device_mcp.device_holders import note_broker_internal
+from tt_device_mcp.health.shutdown import SIGNAL_RCS, interrupted_by_shutdown
 
 Track = Callable[[Optional["asyncio.subprocess.Process"]], None]
 Terminate = Callable[[int], Awaitable[None]]
@@ -44,6 +46,7 @@ async def run_probe(
     cwd: Optional[str] = None,
     terminate: Terminate = _killpg,
     reap_sec: float = 0.0,
+    name: str = "",
 ) -> tuple[Optional[int], bytes]:
     """Run ``argv`` to completion or to ``timeout_sec``, whichever comes first.
 
@@ -63,6 +66,10 @@ async def run_probe(
     exiting. Until it does, the driver can still list its pid while its fd table is already gone,
     so a holder scan run right after a timed-out probe reads as incomplete and defers a reset the
     broker's own dead probe should never block.
+
+    A probe that ends by SIGTERM/SIGKILL while the host or the broker is shutting down raises
+    ``shutdown.CheckInterruptedByShutdown`` (``name`` labels it, else ``argv[0]``): the shutdown
+    killed it, it measured nothing, and no caller may count it (spec 03 I63).
     """
     proc: Optional[asyncio.subprocess.Process] = None
     try:
@@ -74,6 +81,8 @@ async def run_probe(
             cwd=cwd,
             start_new_session=True,
         )
+        # The broker's own device work: a holder scan taken while it exits is not a tenant (I59).
+        note_broker_internal(proc.pid)
         track(proc)
         chunks: list[bytes] = []
         if stream:
@@ -89,6 +98,12 @@ async def run_probe(
             out, _ = await aio.wait_for(proc.communicate(), timeout=timeout_sec)
             if out:
                 chunks.append(out)
+        if proc.returncode in SIGNAL_RCS:
+            interrupted = await asyncio.to_thread(
+                interrupted_by_shutdown, name or os.path.basename(argv[0]), proc.returncode
+            )
+            if interrupted is not None:
+                raise interrupted
         return proc.returncode, b"".join(chunks)
     except asyncio.TimeoutError:
         if proc is not None:

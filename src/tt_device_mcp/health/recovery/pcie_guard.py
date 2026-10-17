@@ -998,20 +998,36 @@ def _recover_siblings(plan: TrayPlan, live: dict, log: Callable[[str], None], sl
 
 # Set by :func:`disable_tray_rung` once a per-tray re-power took chips on other trays off the bus
 # (``ubb_reset_regressed_offbus``): the per-tray rung (the verify-between walk and the sweep's tray
-# re-power) is declined for the rest of this boot. Written to ``TRAY_RUNG_FILE`` in the health dir with
-# the boot id, so a broker restart on the same boot keeps it; a record from another boot is dropped.
+# re-power) is declined on this host for ``TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS`` (default 7). Written to
+# ``TRAY_RUNG_FILE`` in the health dir with the host name and time, so a broker restart and a reboot or
+# power cycle both keep it: the UBB that regressed is still the same one after a cycle (measured: the
+# rung re-armed on each new boot and the same re-power took 20 more chips off three times in an hour).
+# A record from another host or older than the window is dropped.
 TRAY_RUNG_FILE = "ubb_tray_rung_disabled.json"
+TRAY_RUNG_LATCH_DEFAULT_DAYS = 7.0
 _TRAY_RUNG_DISABLED: Optional[dict] = None
+_TRAY_RUNG_AT = 0.0  # when the in-memory record was latched (epoch s)
+
+
+def tray_rung_latch_sec() -> float:
+    """How long a recorded tray re-power regression declines the per-tray rung on this host. A malformed
+    or non-positive ``TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS`` reads as the default."""
+    try:
+        days = float(os.environ.get("TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS", "") or TRAY_RUNG_LATCH_DEFAULT_DAYS)
+    except ValueError:
+        days = TRAY_RUNG_LATCH_DEFAULT_DAYS
+    return (days if days > 0 else TRAY_RUNG_LATCH_DEFAULT_DAYS) * 86400.0
 
 
 def disable_tray_rung(**why) -> None:
-    """Decline the per-tray rung for the rest of this boot (``ubb_tray_rung_disabled``, once). The record
-    goes to the health dir with the boot id, so it survives a broker restart on this boot."""
-    global _TRAY_RUNG_DISABLED
+    """Decline the per-tray rung on this host for :func:`tray_rung_latch_sec` (``ubb_tray_rung_disabled``,
+    once). The record goes to the health dir with the host name and time, so it survives a broker
+    restart, a reboot and a power cycle."""
+    global _TRAY_RUNG_DISABLED, _TRAY_RUNG_AT
     if tray_rung_disabled() is not None:
         return
-    _TRAY_RUNG_DISABLED = dict(why)
-    rec = {"why": dict(why), "boot_id": _boot_id(), "at_epoch": time.time()}
+    rec = {"why": dict(why), "boot_id": _boot_id(), "host": socket.gethostname(), "at_epoch": time.time()}
+    _TRAY_RUNG_DISABLED, _TRAY_RUNG_AT = dict(why), rec["at_epoch"]
     try:
         path = health_dir() / TRAY_RUNG_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1025,26 +1041,46 @@ def disable_tray_rung(**why) -> None:
 
 
 def tray_rung_disabled() -> Optional[dict]:
-    """Why the per-tray rung is disabled on this boot, or None while it is armed. Reads the record an
-    earlier broker process of this boot wrote; one from another boot is removed and never counts. With
-    this boot's id unreadable a record cannot be shown stale, so it counts (as for the host-hang latch):
-    the hold it routes to is the bounded I27 hand-off."""
-    global _TRAY_RUNG_DISABLED
+    """Why the per-tray rung is disabled on this host, or None while it is armed. Reads the record an
+    earlier broker process wrote, on this boot or an earlier one: a power cycle does not repair the UBB
+    whose re-power regressed. A record from another host, or older than :func:`tray_rung_latch_sec`, is
+    removed and never counts. One with no time of its own is aged by the file's mtime; one whose age cannot
+    be read at all cannot be shown stale, so it counts: the hold it routes to is the bounded I27 hand-off."""
+    global _TRAY_RUNG_DISABLED, _TRAY_RUNG_AT
     if _TRAY_RUNG_DISABLED is not None:
-        return _TRAY_RUNG_DISABLED
+        if time.time() - _TRAY_RUNG_AT < tray_rung_latch_sec():
+            return _TRAY_RUNG_DISABLED
+        _TRAY_RUNG_DISABLED = None
     path = health_dir() / TRAY_RUNG_FILE
     try:
         rec = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
     current = _boot_id()
-    if not isinstance(rec, dict) or (current and rec.get("boot_id") != current):
+    at = rec.get("at_epoch") if isinstance(rec, dict) else None
+    if not isinstance(at, (int, float)):  # a record from before the time was kept: the file's own
+        try:
+            at = path.stat().st_mtime
+        except OSError:
+            at = None
+    age = time.time() - at if isinstance(at, (int, float)) else None
+    host = rec.get("host") if isinstance(rec, dict) else None
+    stale = (host and host != socket.gethostname()) or (age is not None and age >= tray_rung_latch_sec())
+    if not isinstance(rec, dict) or stale:
         path.unlink(missing_ok=True)
-        health_event("ubb_tray_rung_rearmed", latch=rec, boot_id=current)
+        health_event("ubb_tray_rung_rearmed", latch=rec, boot_id=current, age_sec=age)
         return None
     why = rec.get("why")
     _TRAY_RUNG_DISABLED = dict(why) if isinstance(why, dict) else {}
-    health_event("ubb_tray_rung_disabled_restored", **_TRAY_RUNG_DISABLED, boot_id=current, host_at_risk=True)
+    _TRAY_RUNG_AT = at if age is not None else time.time()
+    health_event(
+        "ubb_tray_rung_disabled_restored",
+        **_TRAY_RUNG_DISABLED,
+        boot_id=current,
+        latched_boot_id=rec.get("boot_id"),
+        age_sec=age,
+        host_at_risk=True,
+    )
     return _TRAY_RUNG_DISABLED
 
 
