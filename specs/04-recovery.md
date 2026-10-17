@@ -1154,6 +1154,9 @@ that just failed), or holds loudly naming the BMC command when the cold rung is 
 on the boot's first broker start only (`fsm.restarted_this_boot` false): the ledger entry stays
 adjacent to the boot for its whole life, and a restart later in the same boot that finds a fresh
 degradation is not that reboot's verdict — it stays held for the forced startup gate and its ladder.
+The boot's jobs-list row is written once per boot, keyed on the kernel boot_id; where that is
+unreadable, on `/proc/stat` btime matched within `_BTIME_DEDUP_SLACK_SEC` (10 s), because a
+wall-clock step moves btime within one boot and an exact match would count one reboot twice.
 Absence is never health: every blocked/exhausted path emits a loud actionable event
 (`ubb_reset_required`, `all-off-bus power-cycle required`,
 `reset_unrecoverable_power_cycle_required`) rather than a silent hold.
