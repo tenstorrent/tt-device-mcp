@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """Spec 04 I59: the broker's own device work never reads as a tenant.
 
 Field replay: a chip dropped during the post-reset fabric check; the dead-chip rescue SIGKILLed the
