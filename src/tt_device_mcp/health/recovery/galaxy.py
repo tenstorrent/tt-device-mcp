@@ -20,6 +20,7 @@ from typing import Callable, Optional
 
 from tt_device_mcp import alert, metrics, privileges
 from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
+from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count
@@ -1788,6 +1789,8 @@ class GalaxyRecovery(Recovery):
         except Exception as exc:  # noqa: BLE001 - best-effort, as for a mesh reset: never blocks recovery
             log(f"could not stop the device pollers before the tray re-power: {exc!r}")
         FABRIC_DEBT.note_reset(f"tray re-power 0x{bitmap:02x}")
+        # A re-power clears the tray's firmware clock cap (spec 03 I35).
+        CEILING.mark_owed(f"tray re-power 0x{bitmap:02x}")
         try:
             return await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
         finally:
@@ -3430,6 +3433,7 @@ class GalaxyRecovery(Recovery):
                     # stopped across the whole walk, so not _fire_tray_repower, which would restart them
                     # between trays.
                     FABRIC_DEBT.note_reset(f"tray re-power 0x{bitmap:02x}")
+                    CEILING.mark_owed(f"tray re-power 0x{bitmap:02x}")
                     pcie_guard.note_tray_pulse(walk[: step + 1], tray_map, start_off)
                     plan = await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
                 except asyncio.CancelledError:

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """Operator verification jobs (spec 01 I21), queue restore order (01 I6) and the fabric output an
 incident bundle keeps (03 I57).
 
