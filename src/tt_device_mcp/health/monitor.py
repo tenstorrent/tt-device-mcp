@@ -254,6 +254,9 @@ def _verdict_label(ok: Optional[bool]) -> str:
 ETH_LINK_DROP_SKIP = "skipped (eth links unverified)"
 # The detail prefix of an eth read that reached no verdict at all (a timeout, a crash, the probe's 77).
 ETH_COULD_NOT_CHECK = "skipped (eth-heartbeat read could not check)"
+# The detail of a traffic pass that passed with no cabling descriptor while the eth read counted
+# fewer links than the high-water mark (see HealthMonitor.links_unseen_by_traffic, spec 03 I28).
+FABRIC_LINKS_UNSEEN = "eth links below the high-water mark, which a traffic pass with no cabling descriptor cannot see"
 
 
 def eth_read_timed_out(detail: str) -> bool:
@@ -666,6 +669,10 @@ class HealthMonitor:
             if "high_water" in data:
                 data["high_water"] = max(int(data["high_water"]), measured)
             _write_json(self.ETH_LINK_BASELINE_FILE, data)
+            if corrupt or not baseline:
+                # A new mark (first read, an operator's delete to re-baseline, a rewritten file):
+                # the only ways it can come down, so each is journaled.
+                health_event("eth_link_baseline_seeded", links=measured, corrupt=corrupt)
         self.last_eth_link_drop = ""
         if corrupt:
             return f"eth link baseline unreadable; re-baselined at {measured} up link(s)"
@@ -1111,7 +1118,15 @@ class HealthMonitor:
                 self._note_fabric_ok()
                 self._on_topology_mismatch(marker)
                 return True, f"fabric links healthy on discovered links ({dt:.0f}s); {marker}"
-            self.adopt_fabric_pass(text)
+            unseen = self.adopt_fabric_pass(text)
+            if unseen:
+                # A measured fault (I28): the ladder runs, then a power cycle; never a release.
+                self.last_fabric_ok = False
+                health_event("fabric_links_unseen", detail=unseen[:400])
+                log = self._logger()
+                if log:
+                    log.error(f"FABRIC {unseen}")
+                return False, f"fabric check FAILED ({dt:.0f}s): {unseen[:400]}"
             return True, f"fabric links healthy ({dt:.0f}s)"
         if cable:
             # A missing cable is a hardware verdict, not a skip (I47): held as a known fabric fault,
@@ -1229,15 +1244,31 @@ class HealthMonitor:
         does, also one run outside the monitor (an operator verification job, spec 01 I21). A pass
         whose output carries a topology marker ran on the discovered links only: it is adopted for
         nothing and its marker returned, so the caller leaves the lift to the monitor's own pass
-        (I45). Returns "" once adopted."""
+        (I45). Nor is a pass the eth read's link count says missed a link (``links_unseen_by_traffic``):
+        its reason is returned. Returns "" once adopted."""
         marker = fabric.find_topology_marker(output)
         if marker:
             return marker
+        unseen = self.links_unseen_by_traffic()
+        if unseen:
+            return unseen
         self._note_fabric_ok()
         self.topology_lift_pending = False
         _save_asic_bus_map()
         self._restore_eth_high_water()
         return ""
+
+    def links_unseen_by_traffic(self) -> str:
+        """The eth link drop a passing traffic pass could not have seen, or "" (spec 03 I28).
+
+        With no cabling descriptor the validator builds its mesh from the links it discovers, so a
+        link that went down is simply left out and the traffic over the rest passes. The last eth
+        read's count against the high-water mark is then the only measurement of the loss, so the
+        pass cannot vouch for the fabric: it fails the check rather than release a mesh short a link.
+        With a descriptor the validator compares the links itself and names what is missing."""
+        if not self.last_eth_link_drop or fabric._validator_paths()[2]:
+            return ""
+        return f"{FABRIC_LINKS_UNSEEN}: {self.last_eth_link_drop}"
 
     def _on_topology_mismatch(self, marker: str) -> None:
         """An OK verdict that carries a topology mismatch: journal it, name the trays that moved
