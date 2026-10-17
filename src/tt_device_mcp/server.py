@@ -1495,7 +1495,7 @@ _leftover_rung_task: "Optional[asyncio.Task]" = None
 # D state that long does not end on its own), and it fences every rung that re-enumerates PCI.
 DEAD_CHIP_STUCK_BUDGET_SEC = 120
 DEAD_CHIP_STUCK_CLASS = "J-dead-chip-stuck-holder"
-_dead_chip_stuck: dict[int, tuple[str, str, int]] = {}  # pid -> (label, starttime, uid)
+_dead_chip_stuck: dict[int, tuple[str, str, int, tuple]] = {}  # pid -> (label, starttime, uid, bdfs)
 _dead_chip_stuck_lock = threading.Lock()
 _dead_chip_page_pending: Optional[dict] = None  # a page the alert hook dropped, sent again next scan
 _leftover_dead_chip: bool = False  # the open I70 episode names a dead-chip stuck holder
@@ -7385,14 +7385,7 @@ def _note_dead_chip_stuck_holders(chips: list, killed: list) -> list[int]:
     with it. Returns the stuck pids. Never raises."""
     global _dead_chip_page_pending
     label = DEAD_CHIP_LABEL_PREFIX + ",".join(str(c) for c in chips)
-    bdfs = []
-    for c in chips:
-        try:
-            bdf = chip_pci_bdf(c)
-        except Exception:  # noqa: BLE001 - an unknown BAR path still leaves the fd and node checks
-            bdf = None
-        if bdf:
-            bdfs.append(bdf)
+    bdfs = _dead_chip_bdfs(chips)
     stuck: list[ReapedLeftover] = []
     for k in killed:
         pid = k.get("pid") if isinstance(k, dict) else None
@@ -7404,7 +7397,7 @@ def _note_dead_chip_stuck_holders(chips: list, killed: list) -> list[int]:
             if f is None:
                 continue
             with _dead_chip_stuck_lock:
-                _dead_chip_stuck[pid] = (label, read_proc_starttime(pid) or "", f.uid)
+                _dead_chip_stuck[pid] = (label, read_proc_starttime(pid) or "", f.uid, bdfs)
             stuck.append(f)
         except Exception as e:  # noqa: BLE001 - one unreadable pid must not hide the others
             if logger:
@@ -7442,6 +7435,21 @@ def _note_dead_chip_stuck_holders(chips: list, killed: list) -> list[int]:
     return [f.pid for f in stuck]
 
 
+def _dead_chip_bdfs(chips: list) -> tuple:
+    """The chips' PCI addresses, read once while they are still enumerated: after the removal the
+    sysfs link is gone and resolves to no address. One that cannot be read is left out (the fd and
+    device-node checks still apply)."""
+    bdfs = []
+    for c in chips:
+        try:
+            bdf = chip_pci_bdf(c)
+        except Exception:  # noqa: BLE001 - an unknown BAR path still leaves the fd and node checks
+            bdf = None
+        if bdf and ":" in bdf:
+            bdfs.append(bdf)
+    return tuple(bdfs)
+
+
 def _send_dead_chip_page() -> None:
     """Send the pending I77 page; one the alert hook drops (a run still in flight) is sent again on
     the next leftover scan."""
@@ -7461,10 +7469,9 @@ def _dead_chip_stuck_leftovers(exclude: set) -> list[ReapedLeftover]:
     with _dead_chip_stuck_lock:
         entries = list(_dead_chip_stuck.items())
     found = []
-    for pid, (label, starttime, uid) in entries:
+    for pid, (label, starttime, uid, bdfs) in entries:
         f = None
         if not starttime or read_proc_starttime(pid) == starttime:
-            bdfs = [b for b in (chip_pci_bdf(c) for c in label[len(DEAD_CHIP_LABEL_PREFIX) :].split(",") if c) if b]
             f = stuck_device_holder(pid, label, uid, bdfs)
         if f is None:
             with _dead_chip_stuck_lock:

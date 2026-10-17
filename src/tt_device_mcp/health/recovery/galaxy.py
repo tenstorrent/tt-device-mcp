@@ -3370,11 +3370,6 @@ class GalaxyRecovery(Recovery):
             # without bound on every such host.
             metrics.stage_fired("ubb_tray", "not_applicable")
             return None  # no tray to re-power — the caller's existing hold owns it
-        if reenumerate_withheld(self.mechanism, "per-tray BMC reset", log):
-            # A tray re-power and its rescan re-enumerate under a stuck holder of a removed chip
-            # (spec 04 I77): name nothing new and hold; the broker's I70 escalation owns the bound.
-            metrics.stage_fired("ubb_tray", "blocked")
-            return None
         if not _ubb_reset_enabled():
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)  # name it + hold (the default)
             metrics.stage_fired("ubb_tray", "blocked")
@@ -3402,6 +3397,12 @@ class GalaxyRecovery(Recovery):
             )
             metrics.stage_fired("ubb_tray", "blocked")
             return False
+        if reenumerate_withheld(self.mechanism, "per-tray BMC reset", log):
+            # A tray re-power and its rescan re-enumerate under a stuck holder of a removed chip
+            # (spec 04 I77): hold; the broker's I70 escalation owns the bound. Below the
+            # whole-tray hand-off above, which re-powers nothing: the power cycle is the rung that clears it.
+            metrics.stage_fired("ubb_tray", "blocked")
+            return None
         pcie_guard.latch_tray_pulse_drop(offbus_ids)
         if len(walk) == 1 and (reset_floor is None or off_bus < reset_floor) and not _ubb_single_tray_walk_enabled():
             # A below-floor drop on one tray: re-powering that tray has dropped the other trays too
