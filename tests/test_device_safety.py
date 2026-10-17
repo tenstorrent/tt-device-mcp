@@ -4838,11 +4838,14 @@ async def test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation(
     assert spawns == [], f"a spent forced run was repeated on the job's clock: {spawns}"
     assert srv.device_hold_job_bound_escalated is False
 
-    # Kill switch off: the job still fails at the bound, and says why nothing escalated.
+    # Kill switch off: it governs only escalations below the 10-min hold bound (spec 04 I76).
+    # This hold is 900 s old, past that bound, so the job's escalation still starts.
     monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
     monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     out = await asyncio.wait_for(srv._hold_job_until_device_fit(job, None, "chip 1 off the bus"), 2)
-    assert "FORCE_ESCALATE=0" in out and spawns == [], (out, spawns)
+    assert "forced recovery escalation started" in out and len(spawns) == 1, (out, spawns)
+    monkeypatch.setattr(srv, "device_hold_job_bound_escalated", False)
+    spawns.clear()
 
     # Within the bound and recovered: no refusal, the job dispatches.
     monkeypatch.setattr(srv, "device_hold_episode_since", datetime.now().isoformat())

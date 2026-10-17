@@ -867,3 +867,32 @@ async def test_the_operator_kill_switch_does_not_stop_the_bound(monkeypatch, cle
     srv._check_hold_deadline()
     await _drain()
     assert escalations == ["present-forced"], "at the bound the ladder runs whatever the kill-switch says"
+
+
+@pytest.mark.parametrize("past_bound", [False, True])
+def test_a_held_job_past_its_bound_under_the_kill_switch_says_the_bound_still_runs(
+    monkeypatch, clear_job_state, past_bound
+):
+    """TT_DEVICE_MCP_FORCE_ESCALATE=0 governs only runs below the bound: a held job's note never says the
+    device stays held with no exit, and past the bound its escalation starts as the watchdog's would."""
+    _arm_fabric_only_deadline_hold(
+        monkeypatch,
+        why="eth_frozen",
+        detail="gate/post-job: eth/fabric fault on a present mesh",
+        age_min=BOUND / 60 + (0.1 if past_bound else -1),
+    )
+    _watchdog(monkeypatch)
+    monkeypatch.setattr(srv, "device_hold_job_bound_escalated", False)
+    monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
+    spawned = []
+    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: spawned.append(1) or True)
+
+    class _Job:
+        id, owner = "7", "tenant"
+
+    said = srv._escalate_held_job_past_bound(_Job(), 2 * BOUND, 2 * BOUND, "device held")
+    assert "stays held" not in said
+    if past_bound:
+        assert said == "forced recovery escalation started" and spawned == [1]
+    else:
+        assert spawned == [] and "10-min hold bound" in said

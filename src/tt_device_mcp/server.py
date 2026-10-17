@@ -3618,12 +3618,11 @@ def _selfheal_relift_enabled() -> bool:
 
 
 def _hold_exit_gap() -> str:
-    """Why a held present mesh has NO automatic exit, or "" when it has one (spec 03 I55): the relift
-    and the forced escalation both switched off, and/or the outage hold (spec 04 I28) refusing the
-    present-mesh reset. Logged at boot as ``RUNG GAP`` and served on /health as ``hold_exit_gap``."""
+    """Why a held present mesh has NO automatic exit, or "" when it has one (spec 03 I55): the outage
+    hold (spec 04 I28) refusing the present-mesh reset. The relift and the forced escalation both off
+    is no gap: the 10-min hold bound's ladder ignores the kill switch (spec 04 I76). Logged at boot as
+    ``RUNG GAP`` and served on /health as ``hold_exit_gap``."""
     gaps = []
-    if not _selfheal_relift_enabled() and not _force_escalate_enabled():
-        gaps.append("TT_DEVICE_MCP_SELFHEAL_RELIFT=0 and TT_DEVICE_MCP_FORCE_ESCALATE=0")
     held = mesh_reset_hold_reason()
     if held:
         gaps.append(f"present-mesh reset held: {held}")
@@ -3661,15 +3660,17 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
             f"The ladder escalates at the {ceiling_min}-min hold ceiling — do not plan around waiting "
             f"the wedge out."
         )
+    # Spec 04 I76: the kill switch governs only the runs below the bound; the bound's own ladder runs.
+    bound = (
+        f"the ladder still runs at the {max(1, round(_stuck_hold_ceiling_sec() / 60))}-min hold bound "
+        f"(spec 04 I76), then the power cycle if the full check after it fails."
+    )
     if _selfheal_relift_enabled():
         return (
-            "Forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0): only the idle self-heal relift "
-            "can lift this hold."
+            "Forced escalation below the hold bound is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0): the idle "
+            f"self-heal relift may lift this hold sooner; {bound}"
         )
-    return (
-        "Self-heal relift and forced escalation are both OFF: this hold has NO automatic exit — an "
-        "operator must act."
-    )
+    return f"Forced escalation below the hold bound is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0): {bound}"
 
 
 def _fabric_relift_enabled() -> bool:
@@ -8172,8 +8173,12 @@ def _escalate_held_job_past_bound(job: "Job", held_sec: float, bound: float, rea
             return "recovery already escalated this episode; the hold watchdog keeps escalating"
         if _forced_escalation_task is not None and not _forced_escalation_task.done():
             return "a forced recovery escalation is already running"
-        if not _force_escalate_enabled():
-            return "forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0); the device stays held"
+        if not _force_escalate_enabled() and _hold_age_now() < _stuck_hold_ceiling_sec():
+            return (
+                f"forced escalation below the hold bound is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0); the "
+                f"watchdog runs the ladder at the {max(1, round(_stuck_hold_ceiling_sec() / 60))}-min hold "
+                f"bound (spec 04 I76)"
+            )
         device_hold_escalation_kind = "tenant_hold_bound"
         device_hold_escalation_trigger = f"the {int(bound)}s tenant-hold bound (job {job.id})"
         if _maybe_spawn_forced_escalation():

@@ -765,10 +765,11 @@ cooldown (spec 04 I65) holds longer.
   first and, past a `TOPOLOGY MISMATCH` marker, never the descriptor run's downgraded
   `Connection mismatch detected`; a hold naming a dispatch failure is never a topology-mismatch
   hold (spec 04 I30). The below-floor and frozen-eth hold messages promise an escalation only when
-  it is armed. When neither the self-heal relift nor the forced escalation is on
-  (`TT_DEVICE_MCP_SELFHEAL_RELIFT=0`, `TT_DEVICE_MCP_FORCE_ESCALATE=0`), or I28 holds the mesh
-  reset, the RUNG INVENTORY logs a `RUNG GAP` warning at boot and `/health` carries `hold_exit_gap`
-  naming why a held present mesh has no automatic exit (`null` otherwise).
+  it is armed. With `TT_DEVICE_MCP_FORCE_ESCALATE=0` they say that the ladder still runs at the
+  10-min hold bound (spec 04 I76), never that the hold has no automatic exit. When I28 holds the
+  mesh reset, the RUNG INVENTORY logs a `RUNG GAP` warning at boot and `/health` carries
+  `hold_exit_gap` naming why a held present mesh has no automatic exit (`null` otherwise); the
+  relift and forced-escalation switches alone open no gap, since the I76 bound ignores them.
 - **I56 A measured fabric failure on a present mesh resets on the first idle relift, no grace.**
   When a hold stands for a frozen/unverified eth (`eth_frozen`) on a fully present mesh, the last
   fabric pass measured a failure (`last_fabric_ok is False`, not a 77 skip) and the relift's eth
