@@ -10,13 +10,14 @@ the kernel could not place, is unusable no matter what its ARC heartbeat says, a
 are invisible to every probe we had: the heartbeat reads a chip's own counter, and the snapshot
 asks tt-smi, which needs the very mapping an unplaced BAR denies it.
 
-Two questions get a verdict, because either answer makes the device unusable and that is the
+Three questions get a verdict, because any answer makes the device unusable and that is the
 only question a verdict answers (see health.core.Verdict — there is no third state):
 
-  * every Tenstorrent function on the bus is bound to tt-kmd, and
-  * no implemented BAR is left unassigned.
+  * every Tenstorrent function on the bus is bound to tt-kmd,
+  * no implemented BAR is left unassigned, and
+  * no function's link reads as down (speed ``Unknown`` or width 63: :func:`link_down`).
 
-Everything else this reads — IOMMU grouping, link speed and width, AER totals on the endpoints
+Everything else this reads — IOMMU grouping, a live link's speed and width, AER totals on the endpoints
 *and* their upstream bridges — is recorded as evidence and never alerts. A correctable-error
 count is a trend, not a state: non-zero is ordinary on a healthy link, and a probe that held the
 device over one would be wrong far more often than right. The counters are here because the
@@ -102,6 +103,19 @@ def _aer_totals(dev: Path) -> dict:
     return out
 
 
+# A link that is down reads all-ones from config space: the kernel shows its speed as "Unknown" and
+# its width as 63 (the six-bit field all set). The node is still listed, so it looks present.
+LINK_DOWN_WIDTH = "63"
+
+
+def link_down(bdf: str) -> bool:
+    """Whether this function's PCIe link reads as down (speed ``Unknown`` or width 63), so a listed
+    node is not counted as a chip on the bus. An attribute that cannot be read is no evidence: False."""
+    dev = pci.PCI_DEVICES_DIR / bdf
+    speed = _read(dev / "current_link_speed")
+    return (speed is not None and speed.startswith("Unknown")) or _read(dev / "current_link_width") == LINK_DOWN_WIDTH
+
+
 def tt_functions() -> list[str]:
     """Every Tenstorrent function on the PCI bus, by BDF.
 
@@ -127,6 +141,7 @@ def host_pci_verdict() -> tuple[Optional[bool], str, dict]:
         return None, "no Tenstorrent function on the PCI bus", {}
 
     unbound: list[str] = []
+    downlinks: list[str] = []
     badbars: dict[str, list[int]] = {}
     devices: dict[str, dict] = {}
     bridges: dict[str, dict] = {}
@@ -139,6 +154,8 @@ def host_pci_verdict() -> tuple[Optional[bool], str, dict]:
         bars = _unassigned_bars(dev)
         if bars:
             badbars[bdf] = bars
+        if link_down(bdf):
+            downlinks.append(bdf)
 
         rec: dict = {"driver": driver}
         for attr, key in (
@@ -182,6 +199,8 @@ def host_pci_verdict() -> tuple[Optional[bool], str, dict]:
     problems = []
     if unbound:
         problems.append(f"tt-kmd not bound to {len(unbound)}/{len(bdfs)}: {', '.join(unbound)}")
+    if downlinks:
+        problems.append(f"PCIe link down on {len(downlinks)}/{len(bdfs)}: {', '.join(downlinks)}")
     if badbars:
         listed = ", ".join(f"{bdf} BAR{'/'.join(str(b) for b in bars)}" for bdf, bars in badbars.items())
         problems.append(f"unassigned BARs on {len(badbars)}/{len(bdfs)}: {listed}")

@@ -23,6 +23,7 @@ from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, 
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
+from tt_device_mcp.health.monitors.hostpci import link_down
 from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count, unreadable_on_bus_chips
 from tt_device_mcp.health.monitors.pci import chip_node_present, chip_pci_bdfs, pci_bus_number
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
@@ -1294,14 +1295,17 @@ class GalaxyRecovery(Recovery):
         """``(present_buses, tray_groups)`` for :func:`_absent_tray_groups`: tt-smi's UBB bus groups
         and ``{chip id: PCI bus}`` of the chips sysfs lists that are not in ``offbus``. A chip the
         heartbeat calls off the bus is not present even if its node lingers (an all-ones endpoint the
-        kernel still lists), so it cannot fill a tray it left. ``(None, ())`` with no tables."""
+        kernel still lists), nor is one whose link reads down (:func:`hostpci.link_down`), so neither
+        can fill a tray it left. ``(None, ())`` with no tables."""
         if not 0 < len(offbus) < expected:
             return None, ()
         groups = {g for table in (_ubb_bus_id_tables() or {}).values() for g in table.values()}
         if not groups:
             return None, ()
         off = {str(i) for i in offbus}
-        return {i: pci_bus_number(a) for i, a in chip_pci_bdfs().items() if str(i) not in off}, groups
+        return {
+            i: pci_bus_number(a) for i, a in chip_pci_bdfs().items() if str(i) not in off and not link_down(a)
+        }, groups
 
     def _power_cycle_direct_class_now(self, offbus: set, expected: int, tray_map: Optional[dict], log) -> Optional[str]:
         """:func:`_power_cycle_direct_class` on this broker's live state. With no tray map, the chips

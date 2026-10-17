@@ -496,6 +496,8 @@ def short_boot(rig, monkeypatch):
     monkeypatch.setattr(galaxy, "_ubb_bus_id_tables", lambda: UBB_TABLES)
     rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 8})
     monkeypatch.setattr(galaxy, "chip_pci_bdfs", lambda: {i: f"0000:{b:02x}:00.0" for i, b in rig["present"].items()})
+    rig["link_down"] = set()
+    monkeypatch.setattr(galaxy, "link_down", lambda bdf: bdf in rig["link_down"])
     rig["beats"] = _beats_without(set(range(24, 32)))
     return rig
 
@@ -660,3 +662,15 @@ async def test_the_tray_rung_with_no_map_keeps_a_partial_drop_on_the_ladder(real
     assert await rung(rig["beats"], 8) is None
     assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is None
     assert "ubb_reset_declined_whole_tray" not in _kinds(rig)
+
+
+@pytest.mark.asyncio
+async def test_a_listed_node_whose_link_is_down_does_not_fill_a_tray(short_boot):
+    """#1042 (b): a node the kernel still lists with its link down (speed Unknown, width 63) is not on
+    the bus. Chips 0-7's heartbeats read, but their tray shows one link down: not whole trays."""
+    rig = short_boot
+    rig["link_down"] = {f"0000:{rig['present'][0]:02x}:00.0"}
+    present_buses, _ = rig["g"]._presence_read(set(range(24, 32)), EXPECTED)
+    assert 0 not in present_buses and 1 in present_buses
+    await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup")
+    assert "power_cycle" not in rig["order"], "the read does not add up to whole trays: the ladder decides"
