@@ -11056,6 +11056,7 @@ def _arm_regressed_partial_drop(monkeypatch, *, held_sec=136, sweep_heals=True):
     srv.device_hold_episode_since = (datetime.now() - timedelta(seconds=held_sec)).isoformat()
     srv.recovery_mechanism.note_reset_regressed(srv.device_hold_episode_since)
     monkeypatch.setattr(srv.galaxy_recovery, "_regressed_sweep_since", None)
+    monkeypatch.setattr(srv.galaxy_recovery, "_regressed_sweep_ids", None)
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
@@ -11078,10 +11079,10 @@ def _arm_regressed_partial_drop(monkeypatch, *, held_sec=136, sweep_heals=True):
 
 @pytest.mark.asyncio
 async def test_a_regressed_partial_drop_sweeps_at_once_and_heals_before_the_ceiling(monkeypatch, clear_job_state):
-    """Spec 04 I80, the 10-17 sequence: the one-shot at 136 s skips the regressed galaxy reset (I31) and,
-    instead of deferring everything to the 600 s ceiling, runs the last-chance sweep now. Its verify runs
-    the fabric and the device is released verified; no host rung fires. Fails on base, which ran the
-    sweep only at the ceiling (hold 13m48s on 10-17)."""
+    """Spec 04 I80: the one-shot at 136 s skips the regressed galaxy reset (I31) and, instead of
+    deferring everything to the 600 s ceiling, runs the last-chance sweep now. Its verify runs the
+    fabric and the device is released verified; no host rung fires. Fails on base, which ran the
+    sweep only at the ceiling."""
     counters, events = _arm_regressed_partial_drop(monkeypatch)
     ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
     assert ran is True and "galaxy_reset_skipped_regressed" in events
@@ -11110,20 +11111,112 @@ async def test_a_failed_early_sweep_still_defers_the_host_rung_and_does_not_swee
     assert "regressed_offbus_early_sweep" not in events and "host_rung_deferred_until_ladder_end" in events
 
 
+async def _reach_the_ceiling_after_a_failed_early_sweep(monkeypatch, *, beats_at_ceiling=None):
+    """Run the early pass (its sweep fails), then put the same episode past the ceiling with the
+    regression latched and the early sweep's record kept, and run the forced pass there."""
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    ids = srv.galaxy_recovery._regressed_sweep_ids
+    srv.device_hold_episode_since = (datetime.now() - timedelta(minutes=11)).isoformat()
+    srv.recovery_mechanism.note_reset_regressed(srv.device_hold_episode_since)
+    srv.galaxy_recovery._regressed_sweep_since = srv.device_hold_episode_since
+    srv.galaxy_recovery._regressed_sweep_ids = ids
+    srv.device_hold_episode_escalated = False
+    if beats_at_ceiling is not None:
+        monkeypatch.setattr(srv, "read_heartbeats", lambda: beats_at_ceiling)
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+
+
 @pytest.mark.asyncio
-async def test_a_failed_early_sweep_climbs_at_the_ceiling_to_the_sweep_then_the_power_cycle(
+async def test_a_failed_early_sweep_climbs_at_the_ceiling_to_the_power_cycle_without_a_second_sweep(
     monkeypatch, clear_job_state
 ):
-    """At the ceiling the bounded ladder still runs: the full sweep again, then the power cycle."""
+    """Spec 04 I80/I31: the early sweep was the episode's full ladder. At the ceiling, with the same chips
+    still off the bus, the climb does not sweep again (a third mesh reset after the regression, the loop
+    I31 bounds); it requests the power cycle. Fails on the reviewed head, which swept twice."""
     counters, events = _arm_regressed_partial_drop(monkeypatch, sweep_heals=False)
+    await _reach_the_ceiling_after_a_failed_early_sweep(monkeypatch)
+    assert counters["sweeps"] == 1, "no second sweep on the set the early sweep already failed on"
+    assert "reset_rung_skipped_failed_unchanged" in events
+    assert counters["power_cycles"] == 1 and counters["reboots"] == 0
+    assert counters["dirty_cleared"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_early_sweep_that_grew_the_drop_is_journaled_and_not_swept_again(monkeypatch, clear_job_state):
+    """An early sweep that left more chips off the bus regressed the mesh as a reset would: it journals
+    reset_regressed_offbus, and the larger set at the ceiling goes to the power cycle with no new sweep."""
+    counters, events = _arm_regressed_partial_drop(monkeypatch, sweep_heals=False)
+    two_off = {str(i): 100 for i in range(30)}
+
+    async def back_to_back(*a, **k):
+        counters["sweeps"] += 1
+        monkeypatch.setattr(srv, "read_heartbeats", lambda: two_off)
+        return True
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_issue_all_resets_back_to_back", back_to_back)
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert "reset_regressed_offbus" in events and counters["sweeps"] == 1
+    events.clear()
     srv.device_hold_episode_since = (datetime.now() - timedelta(minutes=11)).isoformat()
     srv.recovery_mechanism.note_reset_regressed(srv.device_hold_episode_since)
     srv.galaxy_recovery._regressed_sweep_since = srv.device_hold_episode_since
     srv.device_hold_episode_escalated = False
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
-    assert counters["sweeps"] == 2, "the ceiling ladder sweeps once more before any power cycle (I22)"
-    assert counters["power_cycles"] == 1
+    assert counters["sweeps"] == 1 and counters["power_cycles"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_drop_that_shrank_after_a_failed_early_sweep_is_swept_again_at_the_ceiling(
+    monkeypatch, clear_job_state
+):
+    """A set smaller than the one the early sweep left is progress another sweep may finish: the ceiling
+    ladder sweeps once more before the power cycle (I22)."""
+    counters, events = _arm_regressed_partial_drop(monkeypatch, sweep_heals=False)
+
+    async def back_to_back(*a, **k):
+        counters["sweeps"] += 1
+        monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(30)})
+        return True
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_issue_all_resets_back_to_back", back_to_back)
+    await _reach_the_ceiling_after_a_failed_early_sweep(monkeypatch, beats_at_ceiling={str(i): 100 for i in range(31)})
+    assert counters["sweeps"] == 2 and counters["power_cycles"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_early_sweep_does_not_use_up_the_episodes_one_try(monkeypatch, clear_job_state):
+    """A sweep a tenant or a live reset scope skipped (None) never ran: the next forced pass in the same
+    episode tries it again, and the ceiling climb still sweeps."""
+    counters, events = _arm_regressed_partial_drop(monkeypatch, sweep_heals=False)
+    real = srv.galaxy_recovery._settle_and_verify_before_host_rung
+    calls = {"n": 0}
+
+    async def first_skipped(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real(*a, **k)
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", first_skipped)
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["sweeps"] == 0 and srv.galaxy_recovery._regressed_sweep_since is None
+    srv.device_hold_episode_escalated = False
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["sweeps"] == 1, "the early sweep runs on the next pass"
+    assert srv.galaxy_recovery._regressed_sweep_since == srv.device_hold_episode_since
+
+
+@pytest.mark.asyncio
+async def test_a_failed_early_sweep_without_a_power_cycle_pages_and_holds_at_the_ceiling(monkeypatch, clear_job_state):
+    """Spec 04 I31/I80 with no power cycle opted in: the early sweep still runs (the one full ladder),
+    and at the ceiling the broker pages reset_unrecoverable_power_cycle_required and holds: no second
+    sweep, no reboot, no power cycle."""
+    counters, events = _arm_regressed_partial_drop(monkeypatch, sweep_heals=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    await _reach_the_ceiling_after_a_failed_early_sweep(monkeypatch)
+    assert counters["sweeps"] == 1 and "regressed_offbus_early_sweep" in events
+    assert "reset_unrecoverable_power_cycle_required" in events
+    assert counters["power_cycles"] == 0 and counters["reboots"] == 0 and counters["dirty_cleared"] == 0
 
 
 @pytest.mark.asyncio
