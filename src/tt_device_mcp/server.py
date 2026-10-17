@@ -139,6 +139,7 @@ from tt_device_mcp.health import (
     health_event,
     heartbeat_supported,
     heartbeat_verdict,
+    hold_report,
     host_action_pending_sec,
     isolate_chip,
     journal_interrupted_fabric_check,
@@ -160,7 +161,6 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
-from tt_device_mcp.health import hold_report
 from tt_device_mcp.health.monitor import _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids
 from tt_device_mcp.health.monitors.pci import chip_pci_bdfs, pci_bus_number

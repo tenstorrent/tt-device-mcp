@@ -22,7 +22,9 @@ T0 = 1_800_000_000.0
 START = T0 - 60  # the hold began a minute before the read
 EXPECTED = 32
 TABLES = {"tt-galaxy-bh": {1: 0x00, 2: 0x40, 3: 0xC0, 4: 0x80}}
-TRAY_CHIPS = {g: [i for i, a in enumerate(GALAXY_BUS_IDS) if int(a[5:7], 16) & 0xF0 == g] for g in (0, 0x40, 0x80, 0xC0)}
+TRAY_CHIPS = {
+    g: [i for i, a in enumerate(GALAXY_BUS_IDS) if int(a[5:7], 16) & 0xF0 == g] for g in (0, 0x40, 0x80, 0xC0)
+}
 
 
 def _cool(**kw) -> dict:
