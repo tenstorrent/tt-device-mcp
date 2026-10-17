@@ -2851,9 +2851,12 @@ class GalaxyRecovery(Recovery):
             self.mechanism.note_rung_failed(hold_since, "mesh_reset", ids_before, ids_after, rc=rc)
             # Chips came back but the mesh did not verify: another reset may finish the job (one Galaxy
             # host's second reset healed a drop the first had half-fixed). Retry once, soon, rather than
-            # at the next ceiling window (spec 04 I39).
+            # at the next ceiling window (spec 04 I39). With every chip back the wait buys nothing: the
+            # reset's own rescan and settle already ran, so the retry is due at once. A tt-smi glx_reset
+            # that started while a chip was removed from the kernel fails its 32-chip driver-load wait
+            # (rc 1) even though the rescan after it brings the chip back.
             if ids_before and ids_after is not None and set(ids_after) < set(ids_before):
-                delay = _progress_retry_sec()
+                delay = 0 if not ids_after else _progress_retry_sec()
                 if self.mechanism.note_progress_retry(hold_since, delay):
                     health_event(
                         "mesh_reset_progress_retry_armed",

@@ -841,7 +841,10 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I39 — A failed mesh reset that brought chips back gets one early retry, not the ceiling wait.**
   When the mesh reset fails but the off-bus set after it is a strict subset of the set before it, the
   failure records `mesh_reset_progress_retry_armed` and arms one forced escalation for this hold
-  episode, due `TT_DEVICE_MCP_PROGRESS_RETRY_SEC` (default 60 s, never past the hold ceiling) later.
+  episode, due at once when every chip is back, otherwise after `TT_DEVICE_MCP_PROGRESS_RETRY_SEC`
+  (60; never past the hold ceiling). With every chip back the reset's own rescan and settle already
+  ran, so a wait buys nothing; a glx_reset started while a chip was out of the kernel fails its
+  full-mesh driver-load wait (rc 1) even though the rescan after it brings the chip back.
   The hold watchdog spawns it when due (trigger kind `progress_retry`); it is spent on a real spawn and
   never re-armed in the episode, and a new episode starts with none. The retry climbs the ordinary
   ladder on the new set (I36 allows one more mesh reset on a changed set); an unchanged set after it
@@ -853,8 +856,10 @@ each rung fires only when the gentler one failed or cannot apply.
   ceiling. The stated bound for B1's first-reset-fails, second-heals pattern is about 10 min from
   onset (one-shot 10-20 s on an idle box, spec 03 I23, 120 s while a tenant holds the device; a failed
   reset of up to 262 s, the 60 s wait, a 62 s healing reset and a 63 s fabric check: about 485 s idle,
-  about 585 s with a tenant, against a floor of 378-511 s with no wait at all). A B1 drop that one
-  reset heals keeps the 6 min bound.
+  about 585 s with a tenant, against a floor of 378-511 s with no wait at all). When the failed reset
+  left every chip back the wait is gone: about 60 s sooner (about 425 s idle, about 525 s with a
+  tenant; one Galaxy host's 627 s episode becomes about 567 s). A B1 drop that one reset heals keeps
+  the 6 min bound; one with chips still off keeps the 60 s wait.
 
 - **I58 — A mesh reset that failed is remembered for the boot, across broker restarts.** Every mesh
   reset that launched and failed (an exit code was read: nonzero, or zero with an unhealthy verify)
@@ -1448,6 +1453,7 @@ sees a silent fabric pass.
 | I36 / I39 a set that shrank then stayed unchanged gets at most two resets (the one-shot and the progress retry) over six forced windows, then climbs or hands off once | `tests/test_no_repeat_failed_rung.py::test_e3_shrunk_then_unchanged_resets_at_most_twice_then_climbs` |
 | I39 a failed reset that brought chips back arms one retry per episode; the watchdog spawns it when due, before the ceiling, and never twice | `tests/test_no_repeat_failed_rung.py::test_progress_retry_is_armed_once_per_episode_and_comes_due`, `::test_the_watchdog_spawns_the_due_progress_retry_before_the_ceiling` |
 | I39 end to end: a failed reset that shrank the set arms the retry, the watchdog spawns it, it resets the changed set once and an unchanged set after it power-cycles (I38); an unchanged first set arms none; the retry releases only after the full verify, fabric included | `tests/test_no_repeat_failed_rung.py::test_a_failed_reset_that_shrank_the_set_retries_once_on_the_new_set_then_climbs`, `::test_a_failed_reset_on_an_unchanged_set_arms_no_retry_and_climbs_at_once`, `::test_the_progress_retry_releases_only_after_the_full_fabric_verify` |
+| I39 a failed reset that left every chip back arms the retry at once and the watchdog's next sample spawns it; chips still off keep the 60 s wait; B1 first reset fails with every chip back, the second heals inside 600 s, verified (fabric) before release; the 600 s ceiling window still fires after the spent retry | `tests/test_no_repeat_failed_rung.py::test_a_failed_reset_that_left_every_chip_back_arms_the_retry_at_once`, `::test_a_failed_reset_that_left_chips_off_keeps_the_60s_wait`, `::test_b1_first_reset_fails_with_every_chip_back_second_heals_inside_ten_minutes`, `::test_the_ten_minute_ceiling_window_still_fires_after_the_spent_retry` |
 | I58 the failed-reset record survives a broker restart but not a new boot; a new episode on the same set does not reset again; only a launched reset is recorded | `tests/test_no_repeat_failed_rung.py::test_the_failed_reset_survives_a_broker_restart_but_not_a_new_boot`, `::test_a_new_hold_episode_on_the_same_set_does_not_reset_again`, `::test_a_reset_that_never_launched_is_not_recorded` |
 | I59 a gap or holder left by the broker's own exiting probe or killed holder is not a tenant; any other gap still fails closed; scoped holders and reused pids are never discounted | `tests/test_broker_internal_holders.py` |
 | I65 a boot 3 min before startup with a whole tray off: held with the deadline on /health and no rung, then one cycle at the deadline | `tests/test_power_cycle_cooldown.py::test_a_boot_3_min_before_startup_holds_to_a_deadline_then_cycles_once`, `::test_health_carries_the_cooldown_deadline_while_held` |
