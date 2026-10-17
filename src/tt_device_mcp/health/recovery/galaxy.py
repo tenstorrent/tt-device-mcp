@@ -254,13 +254,13 @@ def _stuck_hold_ceiling_sec() -> int:
     ceiling has already had every gentler rung and their retries; the box is idle and
     tenant-refused, so climbing then costs nothing a longer wait would save. Parsed defensively — a
     malformed or non-positive value reads as the default, never 0 (which would escalate the instant
-    a hold latched)."""
+    a hold latched). Never above 600 (spec 04 I76): the env may shorten the bound, never lengthen it."""
     raw = os.environ.get("TT_DEVICE_MCP_STUCK_HOLD_SEC", "").strip()
     try:
         v = int(raw)
     except ValueError:
         return 600
-    return v if v > 0 else 600
+    return v if 0 < v <= 600 else 600
 
 
 def _offbus_hold_ceiling_sec() -> int:

@@ -143,7 +143,8 @@ the queue and a running job outlive the broker process.
   `reaped_leftover_holds_device` event opens the episode and one `reaped_leftover_released`
   closes it; repeated scans emit nothing. The health gate skips its probes over a leftover and
   keeps the device dirty (`foreign_holder`), so the verify runs once it is gone. A scan error
-  reads as no leftover. Motivating incident: a reaped job's process stuck in state D with
+  reads as no leftover. A hold it keeps past the 10-min bound gets the host rung (spec 04 I76),
+  since no reset can run over it. Motivating incident: a reaped job's process stuck in state D with
   SIGKILL pending kept 192 device fds open for about an hour until a host reboot; in that time
   a reset ran over it and a new job was dispatched beside it.
 - **I17** — A job's output outlives the broker that spawned it. Its stdout and stderr go to
@@ -182,8 +183,9 @@ the queue and a running job outlive the broker process.
   already spent is not repeated on the job's clock, since that would climb the ladder (warm
   reboot, power cycle) on a short timer. The deadline watchdog keeps escalating per window. No
   value turns the bound off: garbage, non-finite or non-positive reads as the default. With
-  `TT_DEVICE_MCP_FORCE_ESCALATE=0` the job still fails at the bound and its error says nothing
-  was escalated.
+  `TT_DEVICE_MCP_FORCE_ESCALATE=0` a job failing below the device's 10-min hold bound says
+  nothing was escalated and that the watchdog runs the ladder at that bound; past it the
+  escalation still starts (spec 04 I76).
 - **I20** — A job submitted with `preemptable` has no timeout except on contention:
   `timeout_sec` is a soft limit. Past it the job runs on for as long as no other job is
   queued. Once one is (and the limit has passed), the broker starts a stop window of

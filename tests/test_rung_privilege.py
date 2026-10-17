@@ -277,3 +277,13 @@ async def test_without_setpci_the_rescan_still_runs_and_no_chip_is_called_no_bri
     assert all(r["reason"] == "no_privilege" for r in reasons.values()), reasons
     assert ("bridge_reset", "blocked") in fired, "operator-fixable, so not not_applicable"
     assert any("rescan" in path for path in rescanned), f"the cheap rung was skipped: {rescanned}"
+
+
+def test_the_force_escalate_kill_switch_warns_that_the_hold_bound_ignores_it(monkeypatch, said):
+    """FORCE_ESCALATE=0 turns off only the forced runs below the 10-min hold bound (spec 04 I76): the
+    boot warning must say so, not promise a watchdog that is fully off."""
+    monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
+    srv.log_rung_inventory()
+    assert any(
+        "RUNG OFF forced-escalation" in m and "I76" in m and "ignore" in m for lvl, m in said if lvl == "warning"
+    )
