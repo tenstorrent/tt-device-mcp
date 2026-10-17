@@ -123,9 +123,10 @@ async def test_the_full_ladder_runs_10_min_after_the_last_cycle_or_boot_then_the
     cool["clk"][0] = boot + CLASS_A_LADDER_AFTER_SEC - 1
     await _forced(cool)
     assert _ladder_runs(cool) == 0, "a whole tray goes to the cycle, not the ladder, before the 10-min mark"
+    before = len(cool["order"])
     cool["clk"][0] = boot + CLASS_A_LADDER_AFTER_SEC
     await _forced(cool)
-    assert cool["order"] == ["denied", "ubb_tray"], "the 10-min pass runs the tray re-power only: glx_reset is suppressed, no sweep"
+    assert cool["order"][before:] == ["denied", "ubb_tray"], "the 10-min pass runs the tray re-power only: glx_reset is suppressed, no sweep"
     assert _cycles(cool) == 2, "the cooldown still holds the cycle"
     ran = _ladder_runs(cool)
     for later in (1200, 1800):
