@@ -476,6 +476,7 @@ def _hold_deadline_probe(monkeypatch, *, isolated):
     monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
     monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
     monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
+    monkeypatch.setattr(srv, "device_hold_offbus_tenant_wait", False)
     monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
     srv.fsm.set_latch("escalated", False)
     monkeypatch.setattr(srv, "isolated_chips", set(isolated))
@@ -489,7 +490,7 @@ def test_an_offbus_hold_escalates_long_before_the_general_ceiling(monkeypatch):
     exists for a self-healing ARC wedge. Its answer is the cheap bridge-reset + rescan rung."""
     monkeypatch.setattr(srv, "device_hold_episode_reason", "chip(s) 6,7 fell off the PCIe bus")
     fired, since = _hold_deadline_probe(monkeypatch, isolated={"6", "7"})
-    offbus = srv._offbus_hold_ceiling_sec()
+    offbus = srv._offbus_one_shot_sec()
     assert offbus < srv._stuck_hold_ceiling_sec(), "the off-bus ceiling is the whole point — it must be shorter"
 
     srv._check_hold_deadline(now=since + timedelta(seconds=offbus - 1))
@@ -659,7 +660,7 @@ async def test_forced_escalation_fires_on_a_hold_held_only_by_a_reported_fault(m
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "kind,window_attr", [("offbus_one_shot", "_offbus_hold_ceiling_sec"), ("ceiling_window", "_stuck_hold_ceiling_sec")]
+    "kind,window_attr", [("offbus_one_shot", "_offbus_one_shot_sec"), ("ceiling_window", "_stuck_hold_ceiling_sec")]
 )
 async def test_forced_escalation_event_names_trigger_and_thresholds(monkeypatch, tmp_path, kind, window_attr):
     """The event must explain itself: which trigger fired and the window, ceiling and deadline in force."""
@@ -4837,11 +4838,14 @@ async def test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation(
     assert spawns == [], f"a spent forced run was repeated on the job's clock: {spawns}"
     assert srv.device_hold_job_bound_escalated is False
 
-    # Kill switch off: the job still fails at the bound, and says why nothing escalated.
+    # Kill switch off: it governs only escalations below the 10-min hold bound (spec 04 I76).
+    # This hold is 900 s old, past that bound, so the job's escalation still starts.
     monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
     monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     out = await asyncio.wait_for(srv._hold_job_until_device_fit(job, None, "chip 1 off the bus"), 2)
-    assert "FORCE_ESCALATE=0" in out and spawns == [], (out, spawns)
+    assert "forced recovery escalation started" in out and len(spawns) == 1, (out, spawns)
+    monkeypatch.setattr(srv, "device_hold_job_bound_escalated", False)
+    spawns.clear()
 
     # Within the bound and recovered: no refusal, the job dispatches.
     monkeypatch.setattr(srv, "device_hold_episode_since", datetime.now().isoformat())
@@ -15542,7 +15546,7 @@ def test_forced_escalation_names_the_watchdog_clock_that_fired(monkeypatch):
         srv._check_hold_deadline()
         return srv.device_hold_escalation_trigger
 
-    assert held_for(122) == "the 120s off-bus one-shot"
+    assert held_for(12) == f"the {int(srv.SAMPLE_INTERVAL_SEC)}s off-bus one-shot"
     assert held_for(603) == "the 600s ceiling (window 1)"
 
 
