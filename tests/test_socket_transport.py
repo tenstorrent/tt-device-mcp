@@ -33,6 +33,33 @@ def _tool_payload(result):
     return json.loads(result.content[0].text)
 
 
+# Each teardown step gets its own deadline, so a stuck one fails here, naming itself, in seconds
+# rather than as pytest-timeout's 120 s hang in the event loop's own close.
+STOP_DEADLINE_SEC = 10.0
+
+
+async def _stop_server_and_runner(uv_server):
+    """Stop the unix-socket server, then the job runner a submit started on this loop.
+
+    The loop's close cancels every task left and waits for them with no deadline: a runner that
+    drops its cancel (bpo-42130, see aio.wait_for) went back to its queue and that close never
+    returned. Cancel it here, bounded, and fail loudly if it does not end."""
+    task = getattr(uv_server, "_tt_serve_task", None)
+    uv_server.should_exit = True
+    if task is not None:
+        done, _ = await asyncio.wait({task}, timeout=STOP_DEADLINE_SEC)
+        if not done:
+            uv_server.force_exit = True
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=STOP_DEADLINE_SEC)
+        assert done, f"the unix-socket server did not stop within {2 * STOP_DEADLINE_SEC:.0f}s"
+    runner = server.job_runner_task
+    if runner is not None and not runner.done() and runner.get_loop() is asyncio.get_running_loop():
+        runner.cancel()
+        done, _ = await asyncio.wait({runner}, timeout=STOP_DEADLINE_SEC)
+        assert done, f"job_runner did not end within {STOP_DEADLINE_SEC:.0f}s of its cancel: {runner!r}"
+
+
 class TestPeerUidScope:
     def test_peer_uid_from_unix_scope(self):
         scope = {"type": "http", "client": (PEERCRED_MARKER, 1234)}
@@ -160,13 +187,7 @@ async def test_socket_jsonrpc_round_trip(tmp_path):
                     "refused",
                 )
     finally:
-        uv_server.should_exit = True
-        task = getattr(uv_server, "_tt_serve_task", None)
-        if task is not None:
-            try:
-                await asyncio.wait_for(task, timeout=5)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                task.cancel()
+        await _stop_server_and_runner(uv_server)
 
 
 @pytest.mark.asyncio
@@ -220,13 +241,7 @@ async def test_the_surface_that_carried_the_submit_is_what_tags_the_owner(tmp_pa
                     agent = _tool_payload(await session.call_tool("tt_device_job_run_bg", {"params": submit}))
                     assert "job_id" in agent, agent
     finally:
-        uv_server.should_exit = True
-        task = getattr(uv_server, "_tt_serve_task", None)
-        if task is not None:
-            try:
-                await asyncio.wait_for(task, timeout=5)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                task.cancel()
+        await _stop_server_and_runner(uv_server)
 
     assert server.jobs[rest["job_id"]].owner == me, "a /api/* submit must be attributed to the person"
     assert server.jobs[agent["job_id"]].owner == f"[agent]{me}", "an /mcp submit must carry the agent tag"

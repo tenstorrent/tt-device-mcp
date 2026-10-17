@@ -245,7 +245,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` | hold deadline (1200) | Longest a held job waits before it fails and the hold escalates; no value disables it | 01 |
 | `TT_DEVICE_MCP_TENANT_UIDS` | unset | Comma-separated uids or user names below 1000 whose device holders count as tenants. Root is ignored; a name that does not resolve is retried on the next scan | 04 |
 | `TT_DEVICE_MCP_HOLD_DEADLINE_SEC` | 2× stuck ceiling (1200) | Hold age flagged STUCK to the durable timeline | 03 |
-| `TT_DEVICE_MCP_STUCK_HOLD_SEC` | 600 | General hold ceiling before forced escalation | 03 |
+| `TT_DEVICE_MCP_STUCK_HOLD_SEC` | 600 | General hold ceiling before forced escalation; values above 600 read as 600 (04 I76) | 03 |
 | `TT_DEVICE_MCP_STUCK_HOLD_RESET` | 1 | Kill switch: idle escalation may reset a stuck hold | 03 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_SEC` | 120 | Off-bus one-shot wait while a tenant holds the device (a tenant-free hold runs it after one sampler interval) | 03 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE` | 1 | Kill switch: off-bus holds escalate early | 03 |
@@ -255,7 +255,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_IDLE_HOLDER_SEC` | 900 | Seconds a foreign holder's CPU time stays flat before it is named (event + alert, never signalled); 0 turns it off | 03 |
 | `TT_DEVICE_MCP_ACTIVITY_INTERVAL_SEC` | 1 | Seconds between device-activity samples of a running job (03 I54); malformed, 0 or negative falls back to 1 | 03 |
 | `TT_DEVICE_MCP_DEVICE_IDLE_AFTER_SEC` | 1 | Seconds a running job must do no device work, without a break, before its status reads `DEVICE IDLE` (03 I54) | 03 |
-| `TT_DEVICE_MCP_FORCE_ESCALATE` | 1 | Kill switch: past-ceiling forced escalation | 03 |
+| `TT_DEVICE_MCP_FORCE_ESCALATE` | 1 | Kill switch: forced escalation below the 10-min hold bound; the bound (04 I76) ignores it | 03 |
 | `TT_DEVICE_MCP_ETH_FREEZE_HOLD` | 1 | Frozen-eth verdict holds instead of resetting | 03 |
 | `TT_DEVICE_MCP_HOLD_REARM_SEC` | 1800 | Re-arm window for hold-escalation alerts | 03 |
 | `TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ` | 800 | Highest AI clock a chip may read once a job has ended; above it the job is recorded as not having closed the device (a bad value falls back to 800) | 03 |
