@@ -5260,16 +5260,17 @@ def _emit_all_off_bus_power_cycle_required(log, off_bus: int, expected: int, *, 
     )
 
 
-async def _auto_power_cycle_host(log, reason: str) -> None:
+async def _auto_power_cycle_host(log, reason: str) -> bool:
     """Fire the final recovery rung: a BMC chassis power cycle, above the warm reboot because it
     recovers a whole-bus wedge the reboot cannot. The caller has already confirmed both the env
-    opt-in AND ``RecoveryMechanism.auto_recovery_allowed``."""
+    opt-in AND ``RecoveryMechanism.auto_recovery_allowed``. False when it certainly did not launch
+    (the caller may then take the in-band fallback, spec 04 I71)."""
     _void_fabric_ok("auto power cycle")
-    await recovery_mechanism._fire_recovery_escalation(
+    return await recovery_mechanism._fire_recovery_escalation(
         "power-cycle",
         row_owner="[broker]power-cycle-request",
         label="auto BMC power cycle",
-        detail="reset and a host reboot could not recover the device",
+        detail="the reset ladder could not recover the device",
         fire=_fire_power_cycle,
         log=log,
         reason=reason,
@@ -6314,6 +6315,16 @@ async def device_health_gate(
             if allowed:
                 await _fire(stage)
                 return
+            if stage == STAGE_POWER_CYCLE:
+                # I71: a denied cycle on a drop the reboot can still recover takes the in-band rung
+                # now rather than hold to the cooldown's end; the reboot's own limits bound it.
+                fallback_ok, fallback_why = galaxy_recovery.reboot_fallback_allowed(ev, tenant_active=tenant_active)
+                if fallback_ok:
+                    _log(f"auto-power-cycle held off ({why}); firing the warm reboot as the in-band fallback")
+                    health_event("power_cycle_reboot_fallback", trigger="denied", reason=why, phase=phase, off_bus=off_bus)
+                    await _fire(STAGE_HOST_REBOOT)
+                    return
+                why = f"{why}; warm-reboot fallback: {fallback_why}"
             _log(f"auto-{action} opted in but held off: {why}")
             recovery_mechanism._journal_auto_recovery_denied(action, why)
             metrics.stage_fired(stage, "blocked")

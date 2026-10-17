@@ -1620,7 +1620,7 @@ class RecoveryMechanism:
 
     async def _fire_recovery_escalation(
         self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: str, pre_fire=None
-    ) -> None:
+    ) -> bool:
         """Shared body of the two host-level recovery rungs (reboot, BMC power cycle). Records the
         escalation durably — the rate limiter — and leaves a visible jobs-list row BEFORE the action
         takes the box down, so both survive it; G6b back-fills the boot when the broker restarts. If
@@ -1638,7 +1638,11 @@ class RecoveryMechanism:
         ``pre_fire(log, reason)``, when given, runs after the record and row and just before
         ``fire`` (spec 04 I26): a bounded, blocking call that never raises and whose outcome never
         stops the fire. Running it after the record means it only runs for an action that is
-        really about to happen, never for one the ledger then aborts."""
+        really about to happen, never for one the ledger then aborts.
+
+        Returns False when the action certainly did not launch (the record could not be written, or
+        ``fire`` raised anything but a timeout), so a caller may take an in-band fallback (spec 04
+        I71); True when it was issued or timed out and may still act."""
         ev = action.replace("-", "_")
         stage = _ACTION_TO_STAGE[action]
         if not self.record_auto_recovery(action, reason):
@@ -1648,7 +1652,7 @@ class RecoveryMechanism:
             )
             health_event(f"auto_{ev}_aborted", reason=reason, why="ledger write failed")
             metrics.stage_fired(stage, "blocked")
-            return
+            return False
         # From here the host is going down: no device reset may start under it.
         self.host_action_requested = (action, time.monotonic())
         self._write_action_log(row_owner, f"{label} — {reason}", 0.0, action, None)
@@ -1703,7 +1707,8 @@ class RecoveryMechanism:
             )
             health_event(f"auto_{ev}_failed", reason=reason, error=repr(exc), timed_out=timed_out)
             metrics.stage_fired(stage, "failed")
-            return
+            return timed_out
         # The pending window counts from the hand-off, not from before a slow pre-fire hook.
         self.host_action_requested = (action, time.monotonic())
         metrics.stage_fired(stage, "ok")
+        return True
