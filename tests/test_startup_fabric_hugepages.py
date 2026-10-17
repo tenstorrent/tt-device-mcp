@@ -1339,6 +1339,22 @@ async def test_the_first_job_hardware_fault_takes_the_ladder_without_the_grace(m
     assert calls == [("present", True)]
 
 
+def test_the_first_job_hardware_fault_is_no_77_no_reset_cause(monkeypatch, tmp_path, clear_job_state):
+    """I42 with spec 04 I29: the latch is a measured fault, so a 77 after its reset still climbs to
+    the host rung once (every hold ends in the power-cycle rung). Counting the latch as a cause no
+    reset fixes would park that 77 without the host rung."""
+    _hold_77(monkeypatch, tmp_path, last_fabric_ok=False)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: False)
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "")
+    monkeypatch.setattr(srv.health_monitor, "last_eth_link_drop", "eth links 60 < 64")
+    fault = "hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)"
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", fault)
+    fsm_dirty(srv, f"job 7: {fault}", why="fabric_unverified")
+    assert not srv._fabric_77_no_reset_cause()
+    assert srv._fabric_77_eth_drop() == "eth links 60 < 64"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reset_passes, lifted", [(2, True), (0, False)])
 async def test_after_an_unknown_reset_the_next_relift_77_reaches_the_bound(

@@ -388,7 +388,7 @@ async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dirty", [True, False])
 @pytest.mark.parametrize("reboot, rung", [("0", "power-cycle"), ("1", "reboot")])
-async def test_a_latched_hold_no_relift_reset_reaches_takes_the_ladder_at_the_ceiling(
+async def test_a_latched_hold_no_relift_reset_takes_the_ladder_at_the_ceiling(
     monkeypatch, tmp_path, mesh, dirty, reboot, rung  # noqa: F811
 ):
     """I42 with the 10-min bound: a real lift leaves the validator's mismatch line in the last fabric
