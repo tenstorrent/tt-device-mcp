@@ -492,7 +492,8 @@ def chips_off_bus(expected: int) -> int:
     eps = tt_endpoints()
     if eps is None:
         return expected if _pci_dir().is_dir() else 0
-    return max(0, expected - len(eps)) + len(dead_chips(read_heartbeats()))
+    # A decision read, not a poll: a lost chip that answers again must not hold a reset (spec 03 I66).
+    return max(0, expected - len(eps)) + len(dead_chips(read_heartbeats(probe_lost=True)))
 
 
 _HOLD_LIFTED: contextvars.ContextVar = contextvars.ContextVar("tt_device_mcp_hold_lifted", default="")

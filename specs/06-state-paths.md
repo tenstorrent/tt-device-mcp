@@ -125,6 +125,7 @@ and job exit statuses never hit disk.
 | Job output spool | `/run/tt-device-broker-spool/` (0700; outside the unit's RuntimeDirectory, so it survives a broker restart) | `<state>/jobspool/` (exported by the CLI) | `TT_DEVICE_MCP_JOB_SPOOL_DIR` |
 | Dispatch hold (autoupdate) | `/run/tt-device-broker/dispatch-hold` | `<state>/dispatch-hold` (sibling of the inhibit lock) | `TT_DEVICE_MCP_DISPATCH_HOLD` |
 | Device-op advisory flock (I8) | `/run/tt-device-broker/device-op.flock` | `<state>/device-op.flock` (sibling of the inhibit lock) | `TT_DEVICE_MCP_DEVICE_OP_FLOCK` |
+| Chip state (published, 03 I66) | `/run/tt-device-broker/chip-state.json` (0644, atomic rename) | `<state>/chip-state.json` (sibling of the inhibit lock) | `TT_DEVICE_MCP_CHIP_STATE_FILE` |
 | Daemon pid / daemon stdout | n/a (systemd / journald) | `<state>/daemon.pid`, `<state>/daemon.log` | follows the state base |
 | Host config | `/etc/default/tt-device-broker` (written by installer, sourced by apply-host-config, autoupdate, and the Slurm hooks) | n/a | `TTDEV_ETC_DEFAULT` (apply-host-config's render/test seam; also a real runtime override for the Slurm hooks, which source it unconditionally on every invocation) |
 | Per-user client prefs (CLI-side, any shape) | `~/.config/tt-device-mcp/timezone` (`XDG_CONFIG_HOME` honored) | same | `TT_DEVICE_MCP_TZ` beats the saved timezone |
@@ -198,6 +199,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_JOB_SPOOL_DIR` | `/run/tt-device-broker-spool` | Where a job's stdout/stderr are spooled so they outlive a broker restart (01 I17); unusable → pipes | 06 |
 | `TT_DEVICE_MCP_DISPATCH_HOLD` | sibling `dispatch-hold` of the inhibit file | Autoupdate's hold on dispatch across its busy check and restart (01 I18, 08 I18) | 06 |
 | `TT_DEVICE_MCP_DEVICE_OP_FLOCK` | sibling `device-op.flock` of the inhibit file | Advisory flock held for every device op, for external device writers (I8) | 06 |
+| `TT_DEVICE_MCP_CHIP_STATE_FILE` | sibling `chip-state.json` of the inhibit file | Where the broker publishes per-chip `lost`/`recovering` for other readers on the host (03 I66) | 06 |
 | `TT_DEVICE_MCP_DEVICE_OP_FLOCK_TIMEOUT_SEC` | `10` | Longest the broker waits on an external holder before going ahead without the flock (I8) | 06 |
 | `TT_DEVICE_MCP_INSTALL_DIR` | `/tmp/tt-device-mcp-<uid>` | Per-user base: venv, CLI symlink, and `state/` (deploy-defined, install-user.sh) | 06/08 |
 | `TT_DEVICE_MCP_PRIVSEP` | unset (off) | Run each job as its submitter via systemd-run | 05 |
@@ -226,6 +228,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_SAMPLE_INTERVAL_SEC` | 10 | Telemetry sampler cadence | 03 |
 | `TT_DEVICE_MCP_SAMPLE_RING` | 120 | Sampler ring size | 03 |
 | `TT_DEVICE_MCP_SAMPLER_STALL_SEC` | 120 | Sampler-stall watchdog threshold | 03 |
+| `TT_DEVICE_MCP_LOST_REPROBE_SEC` | 30 (floor 5) | Backstop re-read of a chip confirmed lost whose sysfs node did not change (03 I66) | 03 |
 | `TT_DEVICE_MCP_BOOT_PROBE_TIMEOUT_SEC` | 20 | Boot platform-probe timeout | 03 |
 | `TT_DEVICE_MCP_DISPATCH_RECHECK_SEC` | 300 | Re-check a HEALTHY device before dispatch when its last verdict is older than this (0 off) | 03 |
 | `TT_DEVICE_MCP_PREJOB_DISPATCH` | 0 | Opt-in pre-job single-kernel dispatch proof | 03 |

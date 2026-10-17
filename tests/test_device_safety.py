@@ -25,6 +25,7 @@ from tt_device_mcp import server as srv
 from tt_device_mcp.constants import ETH_POST_JOB_TIMEOUT_SEC, FABRIC_CHECK_CANNOT_CHECK_RC
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.fsm import ServerFsm, ServerState
+from tt_device_mcp.health import chip_state
 from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState, Verdict
@@ -1414,6 +1415,7 @@ async def test_a_reset_that_outlives_our_wait_still_shields_its_chips(monkeypatc
     monkeypatch.setattr(srv.sampler, "isolate_dead_chips", lambda d: isolated.append(d))
     monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **kw: marks.append(reason))
     patch_health_event(monkeypatch, lambda kind, **f: None)
+    pollers = stub_device_pollers(monkeypatch, stopped=["tt-poller.service"])
 
     half = {str(i): (heartbeat.ALL_ONES,) for i in range(8)}  # a tray, mid-reset
     half.update({str(i): (100,) for i in range(8, 32)})
@@ -1421,6 +1423,8 @@ async def test_a_reset_that_outlives_our_wait_still_shields_its_chips(monkeypatc
     await srv.sampler.check_for_dead_chips(half)  # two samples: would be "confirmed" without the guard
     assert isolated == [], "amputated a chip out of a live reset scope"
     assert marks == [], "dirtied the device on a reset's own all-ones"
+    assert pollers == [False], "the pollers stay off the all-ones tray (03 I66), stopped once"
+    assert srv.sampler.scope_seen and chip_state.recovering(), "the live scope is published as recovering"
 
     blackout = {str(i): (heartbeat.ALL_ONES,) for i in range(32)}
     await srv.sampler.check_for_dead_chips(blackout)
@@ -2114,11 +2118,14 @@ async def test_a_transient_all_ones_does_not_amputate_a_chip(monkeypatch):
     """One sample is not enough. A dead chip stays dead; a blip does not. 20s of patience is a
     rounding error against the ~130s a host survives after a chip drops."""
     isolated = _no_isolation(monkeypatch)
+    pollers = stub_device_pollers(monkeypatch, stopped=["tt-poller.service"])
 
     live = [100, 800, 800, 0, 0, 0]
     blip = {"0": live, "13": [heartbeat.ALL_ONES, 0, 0, 0, 0, 0], "31": live}
     await srv.sampler.check_for_dead_chips(blip)
     assert isolated == [], "isolated on a single sample"
+    assert pollers == [False], "the pollers stop at the first all-ones sample (03 I66); isolation waits"
+    assert chip_state.lost_chips() == [], "one sample is not lost"
 
     healthy = {"0": live, "13": live, "31": live}
     await srv.sampler.check_for_dead_chips(healthy)  # it recovered — strike cleared
@@ -2128,15 +2135,19 @@ async def test_a_transient_all_ones_does_not_amputate_a_chip(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_chip_dead_on_two_consecutive_samples_is_isolated(monkeypatch):
-    """The case that matters: a real chip drop still gets cut out, fast."""
+    """The case that matters: a real chip drop still gets cut out, fast. The pollers stop on the
+    first all-ones sample already (spec 03 I66), before the second confirms it."""
     isolated = _no_isolation(monkeypatch)
+    pollers = stub_device_pollers(monkeypatch)
 
     live = [100, 800, 800, 0, 0, 0]
     dead = {"0": live, "13": [heartbeat.ALL_ONES, 0, 0, 0, 0, 0], "31": live}
     await srv.sampler.check_for_dead_chips(dead)
+    assert pollers == [False] and isolated == []
     await srv.sampler.check_for_dead_chips(dead)
 
     assert isolated == ["13"], "a genuinely dead chip was not isolated"
+    assert chip_state.lost_chips() == ["13"]
 
 
 @pytest.mark.asyncio
@@ -3094,6 +3105,45 @@ async def test_the_startup_quiesce_keeps_the_pollers_stopped_when_the_gate_holds
     async with srv._pollers_quiesced_for("the startup fabric check", lambda m: None):
         pass
     assert ("start", "tt-telemetry.service") in calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step", ["reset", "tray re-power"])
+async def test_a_step_that_did_not_complete_owes_the_pollers_even_on_a_healthy_fsm(monkeypatch, step):
+    """Spec 03 I66 with 04 I12: a reset that exited non-zero, or a tray re-power that never fired,
+    starts no poller even while the FSM still reads HEALTHY (its chips may be off the bus or hung),
+    and hands them to the owed restart, so the next close to HEALTHY (a passing full check, fabric
+    included) starts them once, as for a restore deferred on a held device."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+    fsm_healthy(srv)
+    assert srv._pollers_unfit_reason() is None
+
+    if step == "reset":
+        _reset_that_fails(monkeypatch)
+        rc, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
+        assert rc == 1
+    else:
+
+        def refuse(*a, **k):
+            raise pcie_guard.TrayRepowerRefused("tray map disagrees")
+
+        monkeypatch.setattr(galaxy_mod, "_fire_ubb_reset", refuse)
+        with pytest.raises(pcie_guard.TrayRepowerRefused):
+            await srv.galaxy_recovery._fire_tray_repower(0b1000, [3], lambda m: None)
+
+    assert [c for c in calls if c[0] == "stop"], "the step still lands on a quiet bus"
+    assert not [c for c in calls if c[0] == "start"], calls
+    assert health.read_health_events(kinds={"pollers_left_quiesced"})
+    assert len(health.read_health_events(kinds={"pollers_kept_quiesced"})) == 1
+    assert srv._pollers_owed
+
+    fsm_dirty(srv, "the step did not complete")
+    fsm_healthy(srv)
+    await asyncio.gather(*list(srv._pollers_restore_tasks))
+    assert [c for c in calls if c[0] == "start"] == [("start", u) for u in DEFAULT_POLLERS]
+    assert srv._pollers_owed is None
 
 
 # --- the reset is exclusive --------------------------------------------------
@@ -11922,7 +11972,7 @@ async def test_ubb_tray_reset_walk_rescans_after_each_tray_before_the_verify(
 ):
     """A tray re-power does not undo the dead-chip sampler's `remove`, so each step rescans the PCI bus
     (and settles) before its verify, and the pollers stay stopped across the walk and come back at the
-    end. A failed rescan still verifies. A walk that recovers takes its chips out of isolated_chips,
+    end of a walk that recovered (an unrecovered one leaves them stopped, spec 03 I66). A failed rescan still verifies. A walk that recovers takes its chips out of isolated_chips,
     so the next gate does not bridge-reset them. Fails on base, which never rescanned."""
     monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     order = []
@@ -11943,7 +11993,7 @@ async def test_ubb_tray_reset_walk_rescans_after_each_tray_before_the_verify(
     assert order == [
         step for bitmap in (0x01, 0x04) for step in (("fire", bitmap), ("rescan",), ("verify",))
     ], "fire, rescan, verify for every tray"
-    assert pollers == [False, True], "pollers stopped once across the walk, restarted at the end"
+    assert pollers == [False], "pollers stopped once across the walk; an unrecovered walk leaves them down (03 I66)"
 
     # A failed rescan is logged and the verify still runs; a recovered walk un-isolates its chips.
     _arm_ubb_walk(monkeypatch, [_beats_without(set())], verify_healthy=[True])
@@ -11958,6 +12008,7 @@ async def test_ubb_tray_reset_walk_rescans_after_each_tray_before_the_verify(
     assert out is True
     assert any("PCI rescan after the tray 3 re-power failed" in m for m in lines)
     assert srv.isolated_chips == {"3"}, "the walk's chips are back on the bus, so no longer isolated"
+    assert pollers == [False, False, True], "a recovered walk restarts the pollers at the end"
 
 
 @pytest.mark.asyncio
@@ -15141,27 +15192,31 @@ async def test_the_sampler_dirties_a_short_count_after_two_samples(monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
     events = []
     patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
-    short = {str(i): [0x1000 + i] for i in range(24)}
-    full = {str(i): [0x1000 + i] for i in range(32)}
+    tick = iter(range(0x1000, 0x10000, 0x100))  # live heartbeats move between samples (a stall is a hang)
+
+    def sample(n):
+        t = next(tick)
+        return {str(i): [t + i] for i in range(n)}
 
     for _ in range(3):  # a reset takes chips off the bus by design: excused, no strike
-        await srv.sampler.check_for_dead_chips(short)
+        await srv.sampler.check_for_dead_chips(sample(24))
     assert srv.sampler.short_count_strikes == 0 and srv.fsm.state is ServerState.HEALTHY
     monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", False)
 
-    await srv.sampler.check_for_dead_chips(short)
-    await srv.sampler.check_for_dead_chips(full)  # recovered: the strike is forgiven
-    await srv.sampler.check_for_dead_chips(short)
+    await srv.sampler.check_for_dead_chips(sample(24))
+    await srv.sampler.check_for_dead_chips(sample(32))  # recovered: the strike is forgiven
+    await srv.sampler.check_for_dead_chips(sample(24))
     assert srv.fsm.state is ServerState.HEALTHY, "one short sample at a time is a blip"
     assert not [k for k, _ in events if k == "chips_missing"]
 
-    await srv.sampler.check_for_dead_chips(short)
+    await srv.sampler.check_for_dead_chips(sample(24))
     missing = [f for k, f in events if k == "chips_missing"]
     assert missing == [{"present": 24, "expected": 32}], events
     assert srv.fsm.record.dirty is True and srv.fsm.record.why == "heartbeat"
 
-    await srv.sampler.check_for_dead_chips(short)
+    await srv.sampler.check_for_dead_chips(sample(24))
     assert len([k for k, _ in events if k == "chips_missing"]) == 1, "no re-journal once dirty"
+    assert not [k for k, _ in events if k == "pollers_quiesced_hung_chip"], "a short count is no hung chip"
 
 
 @pytest.mark.asyncio
