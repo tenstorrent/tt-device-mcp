@@ -348,6 +348,10 @@ class HealthMonitor:
         self.topology_hw_fault: str = ""
         # Monotonic time the fault's page went out (0.0: not sent). The idle relift re-pages from it.
         self.topology_hw_fault_paged: float = 0.0
+        # The 10-min hold bound (spec 04 I76) lifted that latch: the lift it came from is disproven, so
+        # until a pass on the full topology, a pass on the discovered links only is not a pass (a
+        # release there would only fail the next job and latch again, never reaching the power cycle).
+        self.topology_lift_disproven: str = ""
         self._topology_alerted: set[str] = set()
         # Whether the last fabric pass that ran reached no verdict (a 77). A job that then dies on the
         # fabric's routing ran on a mesh no pass cleared; consecutive ones are a known fabric fault
@@ -1107,6 +1111,14 @@ class HealthMonitor:
         self.last_fabric_skipped = ok is None
         if ok is True:
             marker = fabric.find_topology_marker(text)
+            if marker and self.topology_lift_disproven:
+                log = self._logger()
+                if log:
+                    log.error(f"FABRIC passed on the discovered links only ({marker}); a disproven lift is not a pass")
+                return False, (
+                    f"fabric FAILED ({dt:.0f}s): passed on the discovered links only ({marker}), and the first "
+                    "job after the last such lift failed on the fabric; only a full-topology pass releases"
+                )
             if marker:
                 self._note_fabric_ok()
                 self._on_topology_mismatch(marker)
@@ -1235,6 +1247,7 @@ class HealthMonitor:
             return marker
         self._note_fabric_ok()
         self.topology_lift_pending = False
+        self.topology_lift_disproven = ""
         _save_asic_bus_map()
         self._restore_eth_high_water()
         return ""
@@ -1261,9 +1274,10 @@ class HealthMonitor:
     def note_job_after_topology_lift(self, failed: bool, log_tail: Optional[str]) -> Optional[str]:
         """Called once per finished job. Only the first job after a topology-mismatch lift
         counts: if it failed on the fabric, the skipped links are a hardware fault, so the
-        fabric check is withheld from now on (the hold this makes is 77-only: no reset, reboot or
-        power cycle below the 10-min bound, where spec 04 I76 lifts the latch and runs the ladder)
-        and the operator is paged. Returns the hold reason, or None."""
+        fabric check is withheld from now on (the hold this makes is 77-only, and the lift is
+        disproven, so spec 04 I76's bound applies after one sampler tick: it lifts the latch, runs the
+        ladder and the full check, then the power cycle) and the operator is paged. Returns the hold
+        reason, or None."""
         if not self.topology_lift_pending:
             return None
         self.topology_lift_pending = False

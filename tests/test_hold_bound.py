@@ -22,10 +22,15 @@ from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health.core import HealthState
+from tt_device_mcp.health.monitors import fabric
 from tt_device_mcp.health.recovery import OUTCOME_RECOVERED, OUTCOME_TERMINAL, galaxy
 from tt_device_mcp.job_reap import ReapedLeftover
 
 BOUND = 600
+# Class D (moved tray, latched I42 hold): its time-to-recover budget, and the measured worst of the full
+# ladder plus the full check with fabric after it, from the ladder's start to the host rung's request.
+_CLASS_D_BUDGET_SEC = 900
+_LADDER_AND_CHECK_WORST_SEC = 630
 _REAL_HOST_RUNG = srv._hold_bound_host_rung  # captured at import, before any test stubs it
 MISMATCH = "what(): Connection mismatch detected: 1 missing port"
 
@@ -454,10 +459,15 @@ async def test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("post_check", ["fails", "discovered_links_pass"])
 @pytest.mark.parametrize("driver", ["watchdog", "tenant_hold_bound"])
 async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_check_and_power_cycle(
-    rig, monkeypatch, clear_job_state, driver  # noqa: F811
+    rig, monkeypatch, clear_job_state, driver, post_check, tmp_path  # noqa: F811
 ):
+    """``discovered_links_pass``: the moved tray's check after the bound ladder passes on the discovered
+    links again, through the monitor's real fabric verdict. The lift that latch came from failed its job,
+    so that pass is no pass (spec 03 I42): no release (which would fail the next job, latch again and hold
+    another 10 min), and the power cycle follows."""
     order, g = rig["order"], rig["g"]
     mon = srv.health_monitor
     rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
@@ -491,13 +501,35 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
         order.append("glx_reset")
         ok, _ = await g._verify_device(EXPECTED, log, run_fabric=True)
         checks.append(ok)
-        return False
+        return ok
 
     async def full_check(expected, log, run_fabric=True, **k):
         assert run_fabric, "the post-reset check includes the fabric (goal 8)"
         assert not mon.topology_hw_fault, "the latch is lifted, so the fabric pass really runs"
-        return False, {"fabric": {"ok": False, "detail": MISMATCH}}
+        if post_check == "fails":
+            return False, {"fabric": {"ok": False, "detail": MISMATCH}}
+        ok, detail = await mon._verify_fabric_health_body(60)
+        return ok is True, {"fabric": {"ok": ok, "detail": detail}}
 
+    if post_check == "discovered_links_pass":
+        # The descriptor run mismatches; the traffic-only rerun passes on the links it found.
+        desc = "/desc.textproto"
+
+        async def fabric_run(argv, env, **kw):
+            return (134, MISMATCH) if "--cabling-descriptor-path" in argv else (0, "all links ok\n")
+
+        def build_command(descriptor=True):
+            return ["run_cluster_validation"] + (["--cabling-descriptor-path", desc] if descriptor else []), {}
+
+        monkeypatch.setattr(mon, "_fabric_check_cmd", lambda: "")
+        monkeypatch.setattr(mon, "_begin_action_row", lambda *a, **k: None)
+        monkeypatch.setattr(mon, "_write_action_log", lambda *a, **k: None)
+        monkeypatch.setattr(fabric, "build_command", build_command)
+        monkeypatch.setattr(fabric, "check", fabric_run)
+        monkeypatch.setattr(fabric, "_validator_paths", lambda: ("bin", "root", desc))
+        monkeypatch.setattr(monitor_mod, "health_dir", lambda: tmp_path)
+        monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0xC1})
+        monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: None)
     monkeypatch.setattr(g, "_reset_and_verify_device", reset_then_full_check)
     monkeypatch.setattr(g, "_verify_device", full_check)
     rig_cycle = srv._auto_power_cycle_host
@@ -529,14 +561,16 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
 
 
 @pytest.mark.asyncio
-async def test_replay_a_post_job_77_hold_that_only_relifts_gets_the_ladder_at_the_bound_then_the_power_cycle(
+async def test_replay_a_disproven_lift_hold_gets_the_ladder_and_power_cycle_within_the_class_d_budget(
     rig, monkeypatch, clear_job_state  # noqa: F811
 ):
     """A Galaxy host's post-job hold: a job's fabric failure after a topology lift sets the I42 latch, the
-    hold is 77-only, and for its whole life only idle relifts ran (each withheld by the latch). The
-    stuck-hold event at the deadline read escalated=false and no rung had run. Walked tick by tick:
-    nothing is forced below the bound; at 600 s the full ladder runs, the full check after it (fabric
-    included) fails, the broker asks for the power cycle, and the deadline event reads escalated."""
+    hold is 77-only, and only idle relifts ran (each withheld by the latch). The lift is disproven, so the
+    bound applies after one sampler tick, not 600 s (which ran no rung and put the power cycle ~20 min
+    after the job, over the 15-min class D budget). Walked tick by tick: below one tick nothing runs; at
+    the tick the full ladder runs, the full check after it (fabric included) fails, the broker asks for
+    the power cycle; the 10-min mark adds no second ladder or cycle while it is pending, and the
+    deadline event reads escalated."""
     order, g = rig["order"], rig["g"]
     mon = srv.health_monitor
     rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
@@ -578,29 +612,50 @@ async def test_replay_a_post_job_77_hold_that_only_relifts_gets_the_ladder_at_th
     monkeypatch.setattr(g, "_verify_device", full_check)
     rig_cycle = srv._auto_power_cycle_host
 
+    cycle_ages = []
+
     async def cycle_and_mark(log, reason):
+        cycle_ages.append(hold_age[0])
         await rig_cycle(log, reason)
         srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
 
     monkeypatch.setattr(srv, "_auto_power_cycle_host", cycle_and_mark)
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
 
-    for age in range(10, BOUND, 10):  # one sampler tick every 10 s; the idle relift stays withheld
+    tick = float(srv.SAMPLE_INTERVAL_SEC)
+    hold_age = [0.0]
+    assert srv._hold_bound_sec() == tick < BOUND, "a disproven lift's bound is one sampler tick"
+    for age in (1, tick / 2):  # below the tick the idle relift stays withheld and nothing is forced
+        hold_age[0] = age
         monkeypatch.setattr(srv, "device_hold_episode_since", _since(age))
         withheld, detail = await mon._verify_fabric_health_body(1)
         assert withheld is None and "withheld" in detail
         srv._check_hold_deadline(now=datetime.now())
         await _drain()
-        assert "glx_reset" not in order and "power_cycle" not in order, f"a rung ran at {age}s, below the bound"
+        assert "glx_reset" not in order and "power_cycle" not in order, f"a rung ran at {age}s, below one tick"
 
-    monkeypatch.setattr(srv, "device_hold_episode_since", _since(BOUND))
+    hold_age[0] = tick
+    monkeypatch.setattr(srv, "device_hold_episode_since", _since(tick))
     srv._check_hold_deadline(now=datetime.now())
     await _drain()
-    assert "glx_reset" in order, "the full ladder ran at the bound"
+    assert "glx_reset" in order, "the full ladder ran at the first tick, not at 600 s"
     assert checks == [False], "the full check after the ladder, fabric included, failed"
     assert order.count("power_cycle") == 1, "then the broker's own code asked for the power cycle"
     assert order.index("glx_reset") < order.index("power_cycle")
     assert "released" not in order, "nothing released on a failed check"
+    # TTR: the rung is asked at the hold age the ladder started, plus the ladder and its full check
+    # (measured worst ~630 s: glx_reset 62-263 s, last-chance sweep, fabric check 85-420 s).
+    assert cycle_ages == [tick], "the power cycle was asked in the run the first tick started"
+    rung_age = cycle_ages[0]
+    assert rung_age + _LADDER_AND_CHECK_WORST_SEC <= _CLASS_D_BUDGET_SEC, "within the class D budget"
+    assert BOUND + _LADDER_AND_CHECK_WORST_SEC > _CLASS_D_BUDGET_SEC, "the old 600 s wait was over it"
+
+    # The 10-min mark: the requested cycle is pending, so no second ladder and no second cycle.
+    hold_age[0] = BOUND + 1
+    monkeypatch.setattr(srv, "device_hold_episode_since", _since(BOUND + 1))
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert order.count("glx_reset") == 1 and order.count("power_cycle") == 1
 
     monkeypatch.setattr(srv, "device_hold_episode_since", _since(srv._hold_deadline_sec() + 1))
     srv._check_hold_deadline(now=datetime.now())
@@ -1108,3 +1163,77 @@ def test_a_held_job_past_its_bound_under_the_kill_switch_says_the_bound_still_ru
         assert said == "forced recovery escalation started" and spawned == [1]
     else:
         assert spawned == [] and "10-min hold bound" in said
+
+
+def _arm_disproven_lift_hold(monkeypatch, *, age_sec, latched=True):
+    """A 77-only present-mesh hold whose topology-mismatch lift is disproven (spec 03 I42): the latch is
+    set, or the bound already lifted it and no full-topology pass has cleared the lift since."""
+    escalations, alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail="post-job: fabric check COULD NOT RUN (77)", age_min=age_sec / 60
+    )
+    monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: True)
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", MISMATCH if latched else "")
+    monkeypatch.setattr(srv.health_monitor, "topology_lift_disproven", "" if latched else MISMATCH)
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault_paged", 0.0)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+    _watchdog(monkeypatch)
+    return escalations, alerts, events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kill_switch", [False, True])
+async def test_a_disproven_lift_runs_the_bound_ladder_after_one_tick_whatever_the_kill_switch(
+    monkeypatch, clear_job_state, kill_switch
+):
+    """Spec 03 I42 / 04 I76: a disproven lift's bound is one sampler tick, and like the 10-min bound it
+    is not switchable off (TT_DEVICE_MCP_FORCE_ESCALATE=0 governs only the forced runs below it)."""
+    if kill_switch:
+        monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
+    tick = float(srv.SAMPLE_INTERVAL_SEC)
+    escalations, _alerts, events = _arm_disproven_lift_hold(monkeypatch, age_sec=tick + 2)
+    assert srv._hold_bound_sec() == tick
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == ["present-forced"], "the full ladder ran one tick into the hold"
+    assert "hold_bound_latch_cleared" in events, "the latch was lifted so the check after it really runs"
+    assert srv.health_monitor.topology_lift_disproven, "a discovered-links pass still cannot release it"
+    assert srv.hold_bound_deadline() is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "detail, output",
+    [("post-job: fabric unverified", MISMATCH), ("post-job: fabric check COULD NOT RUN (77)", "")],
+)
+async def test_a_hold_with_no_disproven_lift_keeps_the_600s_bound_and_its_fast_path(
+    monkeypatch, clear_job_state, detail, output
+):
+    """Only a disproven lift moves the bound: a plain topology-mismatch or 77 hold one tick in runs no
+    rung and its bound stays the ceiling (I30's no-reset fast path is unchanged)."""
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail=detail, fabric_output=output, age_min=0.2
+    )
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", "")
+    monkeypatch.setattr(srv.health_monitor, "topology_lift_disproven", "")
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+    _watchdog(monkeypatch)
+    assert srv._hold_bound_sec() == srv._stuck_hold_ceiling_sec() == BOUND
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == [] and "host_rung" not in events
+
+
+@pytest.mark.asyncio
+async def test_the_10_min_mark_reruns_the_full_ladder_after_an_early_disproven_lift_run(monkeypatch, clear_job_state):
+    """Goal 10: the early ladder one tick in does not count as the 10-min one. With no host action
+    pending, a hold still standing at 600 s gets the full ladder again (not only the host rung)."""
+    escalations, _alerts, _events = _arm_disproven_lift_hold(monkeypatch, age_sec=BOUND + 6, latched=False)
+    monkeypatch.setattr(srv, "_hold_bound_episode", srv.device_hold_episode_since)
+    monkeypatch.setattr(srv, "_hold_bound_ladder_age", 10.0)
+    monkeypatch.setattr(srv, "_hold_bound_cycle_age", 10.0)
+    monkeypatch.setattr(srv, "_hold_bound_check_failed_age", 10.0)
+    monkeypatch.setattr(srv, "_hold_bound_rung_pending", False)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == ["present-forced"], "the 10-min mark ran the full ladder again"
+    assert srv.device_hold_escalation_kind == "ceiling_window"

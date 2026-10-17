@@ -3629,6 +3629,12 @@ def _hold_exit_gap() -> str:
     return "; ".join(gaps)
 
 
+_DISPROVEN_LIFT_NOTE = (
+    "The first job after the topology-mismatch lift failed on the fabric (spec 03 I42): the full ladder "
+    "runs within one sampler tick, then the power cycle if the full check after it fails."
+)
+
+
 def _hold_escalation_note(off_bus: int = 0) -> str:
     """What happens next to a hold, stated only as far as it is armed (spec 03 I55): a message that
     promises an escalation the host switched off sends the operator to wait for nothing."""
@@ -3643,6 +3649,8 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
                 f"Its power cycle waits for the cooldown ({cooldown['cause']}) and is asked again at "
                 f"{until} — /health power_cycle_cooldown.next_deadline."
             )
+        if off_bus <= 0 and _disproven_lift_hold():
+            return _DISPROVEN_LIFT_NOTE
         if off_bus > 0 and isolated_chips:
             first = int(_offbus_one_shot_sec())
             return (
@@ -3665,6 +3673,8 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
         f"the ladder still runs at the {max(1, round(_stuck_hold_ceiling_sec() / 60))}-min hold bound "
         f"(spec 04 I76), then the power cycle if the full check after it fails."
     )
+    if off_bus <= 0 and _disproven_lift_hold():
+        return _DISPROVEN_LIFT_NOTE
     if _selfheal_relift_enabled():
         return (
             "Forced escalation below the hold bound is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0): the idle "
@@ -6844,7 +6854,7 @@ async def _force_escalate_stuck_hold() -> None:
             logger.error(f"HOLD-DEADLINE-ESCALATE {msg}")
 
     kind = device_hold_escalation_kind  # the window this run claimed; the sampler may rewrite the global
-    past_bound = _hold_age_now() >= _stuck_hold_ceiling_sec()
+    past_bound = _hold_age_now() >= _hold_bound_sec()
     if device_hold_tenant_deferred or (kind == "hold_bound_cycle" and _hold_bound_rung_pending):
         blocker = await asyncio.to_thread(_bound_tenant_blocker, past_bound)
         if blocker is not None:
@@ -6870,7 +6880,7 @@ async def _force_escalate_stuck_hold() -> None:
         # Spec 04 I76: from the 10-min bound on, no 77, latch or no-reset class keeps the ladder (and
         # the host rung after it) from running. Below the bound the faster class paths stay as they are.
         held_age = _hold_age_now()
-        bound = held_age >= _stuck_hold_ceiling_sec()
+        bound = held_age >= _hold_bound_sec()
         if _fabric_77_only_hold() and not bound:
             return  # a pass that could not run is never reset for; the idle relift re-runs it
         if _host_action_blocks_escalation():
@@ -7016,11 +7026,39 @@ def _hold_bound_sync() -> None:
         _hold_bound_tenant_blocker = None
 
 
+def _disproven_lift_hold() -> bool:
+    """Whether the open hold follows a topology-mismatch lift whose first job failed on the fabric (spec
+    03 I42): the latch is set, or the bound lifted it and no full-topology pass has cleared it since."""
+    return health_monitor is not None and bool(
+        health_monitor.topology_hw_fault or health_monitor.topology_lift_disproven
+    )
+
+
+def _hold_bound_sec() -> float:
+    """The hold age at which spec 04 I76's bound applies to the open hold: the stuck-hold ceiling, or one
+    sampler tick for a hold whose topology lift its first job disproved (spec 03 I42). That hold runs no
+    rung below the bound, so waiting out the ceiling there only delays the ladder and the power cycle."""
+    ceiling = _stuck_hold_ceiling_sec()
+    if _disproven_lift_hold():
+        return min(ceiling, max(1.0, float(SAMPLE_INTERVAL_SEC)))
+    return ceiling
+
+
+def _disproven_lift_bound_due(age: float) -> bool:
+    """Whether a disproven-lift hold (spec 03 I42) is due its early bound ladder: it reached
+    _hold_bound_sec() and no bound ladder of this episode has run yet. A run that ran nothing (a reset
+    scope still cycling, a tenant, a lost lock race) leaves it due, so the next tick asks again."""
+    if not _disproven_lift_hold() or age < _hold_bound_sec():
+        return False
+    _hold_bound_sync()
+    return _hold_bound_ladder_age is None and _hold_bound_cycle_age is None and not _hold_bound_rung_pending
+
+
 def _note_hold_bound_ladder(age: float, outcome: str) -> None:
     """Record the bound's own ladder. A forced run that started below the bound (the off-bus one-shot,
     a progress retry, a gated grace) is not it: the bound still runs its ladder at the 10-min mark."""
     global _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_tenant_blocker
-    if age < _stuck_hold_ceiling_sec():
+    if age < _hold_bound_sec():
         return
     _hold_bound_sync()
     _hold_bound_tenant_blocker = None
@@ -7037,7 +7075,7 @@ def _hold_bound_check_pending(age: float) -> bool:
     return (
         _hold_bound_ladder_recovered
         and lad is not None
-        and lad >= _stuck_hold_ceiling_sec()
+        and lad >= _hold_bound_sec()
         and age < lad + _HOLD_BOUND_CHECK_SEC
         and (_hold_bound_cycle_age is None or _hold_bound_cycle_age < lad)
         and (_hold_bound_check_failed_age is None or _hold_bound_check_failed_age < lad)
@@ -7093,7 +7131,7 @@ def _hold_bound_cycle_due(age: float) -> bool:
     if _hold_bound_rung_pending:
         return True
     lad = _hold_bound_ladder_age
-    if lad is None or lad < _stuck_hold_ceiling_sec():
+    if lad is None or lad < _hold_bound_sec():
         return False
     failed = _hold_bound_check_failed_age is not None and _hold_bound_check_failed_age >= lad
     if not failed and age < lad + _HOLD_BOUND_CHECK_SEC:
@@ -7104,13 +7142,18 @@ def _hold_bound_cycle_due(age: float) -> bool:
 def _lift_hold_bound_latches(log) -> None:
     """At the bound, the latches that withhold or skip the fabric check (spec 03 I42's topology
     hardware fault, I46's known fabric fault) are lifted, so the check after the ladder gets a real
-    verdict and only a pass releases. A job that fails the same way declares them again."""
+    verdict and only a pass releases. A job that fails the same way declares them again. A lifted
+    topology latch leaves its lift disproven: a pass on the discovered links only fails the check, so the
+    host rung follows instead of a release that would fail the next job and latch again (spec 03 I42)."""
     if health_monitor is None:
         return
     for name in ("topology_hw_fault", "fabric_known_fault"):
         detail = getattr(health_monitor, name, "")
         if detail:
             setattr(health_monitor, name, "")
+            if name == "topology_hw_fault":
+                # The lift that latch came from failed its job: only a full-topology pass releases now.
+                health_monitor.topology_lift_disproven = detail
             health_event("hold_bound_latch_cleared", latch=name, detail=detail, held_since=device_hold_episode_since)
             log(f"10-min hold bound: lifting the {name} latch ({detail}) so the full check after the ladder decides")
 
@@ -7271,7 +7314,7 @@ def hold_bound_deadline(now: Optional[datetime] = None) -> Optional[datetime]:
     if not device_hold_episode_since:
         return None
     try:
-        deadline = datetime.fromisoformat(device_hold_episode_since) + timedelta(seconds=_stuck_hold_ceiling_sec())
+        deadline = datetime.fromisoformat(device_hold_episode_since) + timedelta(seconds=_hold_bound_sec())
     except ValueError:
         return None
     cd = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
@@ -7290,7 +7333,7 @@ def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
     if not device_hold_episode_since:
         return None
     _hold_bound_sync()
-    ceiling = _stuck_hold_ceiling_sec()
+    ceiling = _hold_bound_sec()
     age = _hold_age_now(now)
     deadline = _hold_bound_deadline_iso(now)
     lad, cyc = _hold_bound_ladder_age, _hold_bound_cycle_age
@@ -7420,7 +7463,7 @@ def _maybe_spawn_forced_escalation() -> bool:
     host reboot or power cycle is pending, so the caller's window latch stays unspent. The operator
     kill-switch governs only runs below the 10-min hold bound (spec 04 I76)."""
     global _forced_escalation_task
-    if not _force_escalate_enabled() and _hold_age_now() < _stuck_hold_ceiling_sec():
+    if not _force_escalate_enabled() and _hold_age_now() < _hold_bound_sec():
         return False
     if _host_action_blocks_escalation():
         return False
@@ -7514,7 +7557,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # A hold whose only cause is a fabric pass that could not run (a 77) is never forced: a reset
     # cannot give a pass its missing prerequisite, and the idle relift re-runs the pass instead.
     # Spec 04 I76: from the 10-min bound on, a 77-only hold is forced like any other.
-    only_77 = _fabric_77_only_hold() and age < ceiling
+    only_77 = _fabric_77_only_hold() and age < _hold_bound_sec()
     # A gated off-bus hold (spec 04 I27) gets one forced pass the moment its grace runs out, so the
     # bounded power cycle fires at the grace and not at the next ceiling window; so does a hold whose
     # tray re-power the BMC's IPMI failed, or whose tray walk did not recover, at its hand-off bound.
@@ -7571,6 +7614,13 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             # forced climb, not two back to back. Remember what it claimed over, to give back with it.
             device_hold_offbus_prior_bucket = device_hold_escalate_bucket
             device_hold_escalate_bucket = max(device_hold_escalate_bucket, int(age // ceiling))
+    elif _disproven_lift_bound_due(age):
+        # Spec 03 I42: the first job after a topology-mismatch lift failed on the fabric, so the lift is
+        # disproven and waiting out the ceiling runs no rung. The bound's ladder, its full check and the
+        # host rung run now (spec 04 I76); the 10-min mark still runs the ladder again if the hold stands.
+        device_hold_escalation_kind = "disproven_lift"
+        device_hold_escalation_trigger = "the disproven topology-mismatch lift (spec 03 I42)"
+        _maybe_spawn_forced_escalation()
     elif recovery_mechanism is not None and recovery_mechanism.progress_retry_due(device_hold_episode_since):
         # spec 04 I39: a failed mesh reset brought chips back; its one retry runs now, not at the ceiling.
         device_hold_escalation_kind = "progress_retry"
@@ -8271,7 +8321,7 @@ def _escalate_held_job_past_bound(job: "Job", held_sec: float, bound: float, rea
             return "recovery already escalated this episode; the hold watchdog keeps escalating"
         if _forced_escalation_task is not None and not _forced_escalation_task.done():
             return "a forced recovery escalation is already running"
-        if not _force_escalate_enabled() and _hold_age_now() < _stuck_hold_ceiling_sec():
+        if not _force_escalate_enabled() and _hold_age_now() < _hold_bound_sec():
             return (
                 f"forced escalation below the hold bound is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0); the "
                 f"watchdog runs the ladder at the {max(1, round(_stuck_hold_ceiling_sec() / 60))}-min hold "

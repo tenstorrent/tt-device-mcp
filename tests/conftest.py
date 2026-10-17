@@ -96,6 +96,21 @@ def reset_host_action_state():
 
 
 @pytest.fixture(autouse=True)
+def reset_topology_lift_disproven():
+    """Clear the monitor's disproven topology lift (spec 03 I42) around every test: the hold bound sets
+    it on the shared monitor when it lifts the latch, and one a test left behind would move the next
+    test's hold bound (spec 04 I76) to one sampler tick."""
+
+    def clear():
+        if srv.health_monitor is not None:
+            srv.health_monitor.topology_lift_disproven = ""
+
+    clear()
+    yield
+    clear()
+
+
+@pytest.fixture(autouse=True)
 def isolate_process_globals():
     """Restore os.environ and sys.argv around every test.
 
