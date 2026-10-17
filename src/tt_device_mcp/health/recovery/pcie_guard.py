@@ -729,11 +729,41 @@ def _expire_stale_latch(log: Callable[[str], None]) -> None:
     health_event("offbus_reset_hold_expired", latch=rec, boot_id=_boot_id())
 
 
+def _broker_took_host_down(intent: dict) -> Optional[dict]:
+    """The broker's own reboot or power cycle recorded in the auto-recovery ledger on the intent's
+    boot at or after the intent's ``at_epoch``, or None. The broker was alive to record it after the
+    reset began, so that boot ended in the broker's action, not in a host hang inside the reset. An
+    intent with no boot or stamp, or an unreadable ledger, finds nothing (the latch stays the guard)."""
+    from tt_device_mcp.health.recovery.base import AUTO_RECOVERY_LEDGER, AUTO_RECOVERY_RANK  # it imports us
+
+    boot = intent.get("boot_id")
+    try:
+        began = float(intent.get("at_epoch"))
+    except (TypeError, ValueError):
+        return None
+    if not boot or began != began:
+        return None
+    try:
+        lines = (health_dir() / AUTO_RECOVERY_LEDGER).read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    for ln in reversed(lines):
+        try:
+            rec = json.loads(ln)
+            at = float(rec.get("at_epoch"))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if rec.get("boot_id") == boot and rec.get("action") in AUTO_RECOVERY_RANK and at >= began:
+            return rec
+    return None
+
+
 def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
     """At broker start: an intent left by another boot is an off-bus reset the host did not survive.
     Latch the gate to ``hold`` for off-bus resets, report it, and return the record. An intent from
-    this same boot (the broker restarted, the host did not) is dropped. A latch an earlier boot
-    wrote is dropped first: it is scoped to its own boot."""
+    this same boot (the broker restarted, the host did not) is dropped, and so is one whose boot the
+    broker itself ended with a recorded reboot or power cycle after the reset began: that is no host
+    hang. A latch an earlier boot wrote is dropped first: it is scoped to its own boot."""
     _expire_stale_latch(log)
     path = health_dir() / INTENT_FILE
     try:
@@ -742,6 +772,14 @@ def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
         return offbus_reset_latched()
     path.unlink(missing_ok=True)
     if intent.get("boot_id") == _boot_id() or not _latch_enabled():
+        return offbus_reset_latched()
+    ended = _broker_took_host_down(intent)
+    if ended is not None:
+        log(
+            f"the {intent.get('kind')} on boot {str(intent.get('boot_id'))[:8]} was still open when the broker's "
+            f"own {ended.get('action')} took the host down: no host hang, no hold latched"
+        )
+        health_event("offbus_reset_hold_skipped", intent=intent, action=ended.get("action"), at=ended.get("at"))
         return offbus_reset_latched()
     rec = dict(intent, latched_on_boot=_boot_id(), latched_at_epoch=time.time())
     try:
