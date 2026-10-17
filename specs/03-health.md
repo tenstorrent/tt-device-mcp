@@ -605,7 +605,10 @@ cooldown (spec 04 I65) holds longer.
   about 4-6 min later (about 14-16 min into the hold: the ~4 min reset plus its check and the
   sweep), against before: a withheld check on every relift and on the operator reset, an
   open-ended hold (55+ min measured) and no power-cycle rung. The startup gate
-  takes the same path: a lost link there FAILS (I71) and the carried hold stays held. Any later job is outside the bound. A clean pass without the
+  takes the same path: a lost link there FAILS (I71) and the carried hold stays held. The 10-min bound (spec 04 I76) holds
+  here too: the latch stands through it (the latched hold already takes the ladder), and a
+  post-ladder check that still finds a port missing (I71) or, under the latch, any mismatch FAILS, so
+  the power cycle follows and the device is never released. Any later job is outside the bound. A clean pass without the
   marker ends the lift.
 - **I43 — A foreign-holder hold whose holder is gone is verified at once, not reset at the ceiling.**
   A hold placed only because a tenant held the device when the gate wanted to verify

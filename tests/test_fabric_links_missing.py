@@ -11,6 +11,7 @@ known-dead port into a lift. No device is opened: the validator, the chip snapsh
 the alert hook are stand-ins."""
 
 import json
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -237,14 +238,16 @@ async def test_a_lost_link_resets_and_only_a_full_post_reset_pass_releases(lost_
 
 @pytest.mark.asyncio
 async def test_a_lost_link_that_a_reset_does_not_heal_stays_held(lost_mesh):
-    """No release on a failed post-reset check; the hold climbs to the host rung at the 600 s ladder end."""
+    """No release on a failed post-reset check; the last-chance sweep runs and the hold climbs to the host
+    rung at once, not at the 600 s ceiling (spec 04 I79)."""
     lost_mesh["reset_heals"] = False
     await _gate_then_relift()
     assert lost_mesh["resets"] and lost_mesh["verifies"][-1] is True
     assert srv.fsm.state is not ServerState.HEALTHY, "a failed post-reset check never releases"
     assert srv.device_hold_episode_since, "the episode stays open: the hold ceiling forces the next rung"
     assert "reset_ineffective" in lost_mesh["events"]
-    assert "host_rung_deferred_until_ladder_end" in lost_mesh["events"], "the host rung follows at the ladder end"
+    assert "host_rung_not_deferred" in lost_mesh["events"], "the host rung follows the sweep at once (04 I79)"
+    assert "host_rung_deferred_until_ladder_end" not in lost_mesh["events"]
 
 
 @pytest.mark.asyncio
@@ -350,8 +353,9 @@ async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
     monkeypatch, latched_mesh, reboot, rung
 ):
     """I42: the idle relift resets the latched hold with no grace; the post-reset check runs the
-    descriptor, the latched mismatch FAILS it (never withheld, never a lift), and the hold climbs to
-    the host rung at the ladder end: bounded, never an open-ended hold."""
+    descriptor, the latched mismatch FAILS it (never withheld, never a lift), the last-chance sweep
+    runs and the hold climbs to the host rung at once (spec 04 I79): bounded, never an open-ended
+    hold. A later forced window asks for no second host rung and still releases nothing."""
     from tt_device_mcp.health.recovery import galaxy
 
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", reboot)
@@ -360,11 +364,19 @@ async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
 
     async def power_cycle(log, reason):
         cycles.append(reason)
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
 
+    async def host_reboot(log, reason):
+        latched_mesh["reboots"] += 1
+        srv.recovery_mechanism.host_action_requested = ("reboot", time.monotonic())
+
+    # Like the real rungs, each stand-in leaves its request pending.
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", host_reboot)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
     latched_mesh["reset_heals"] = False
     await srv._attempt_idle_relift()
-    assert latched_mesh["resets"] == [["tt-smi", "-glx_reset"]], "the latched hold takes the present-mesh rung"
+    assert latched_mesh["resets"] == [["tt-smi", "-glx_reset"]] * 2, "the present-mesh rung, then the sweep (04 I79)"
     assert latched_mesh["verifies"][-1] is True, "the post-reset check runs the fabric pass"
     ok, detail = latched_mesh["fabric"][-1]
     assert ok is False and fabric.LINKS_MISSING in detail and "withheld" not in detail
@@ -373,15 +385,15 @@ async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
     assert srv.health_monitor.topology_hw_fault, "a failed check leaves the latch standing"
     assert srv.fsm.state is not ServerState.HEALTHY, "a failed post-reset check never releases"
     assert "reset_ineffective" in latched_mesh["events"]
-    assert "host_rung_deferred_until_ladder_end" in latched_mesh["events"], "the host rung follows"
-    assert latched_mesh["reboots"] == 0 and cycles == [], "no host rung before the ladder end"
-    # The ladder end: the hold-deadline watchdog's forced window fires the host rung.
+    assert "host_rung_not_deferred" in latched_mesh["events"], "the host rung follows the sweep at once"
+    fired = "reboot" if latched_mesh["reboots"] else "power-cycle" if cycles else None
+    assert fired == rung, f"the relift's ladder fires the {rung} rung"
+    # The ceiling: the hold-deadline watchdog's forced window asks for no second host rung.
     ceiling = galaxy._stuck_hold_ceiling_sec()
     since = datetime.now() - timedelta(seconds=ceiling + 1)
     monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
     await srv._force_escalate_stuck_hold()
-    fired = "reboot" if latched_mesh["reboots"] else "power-cycle" if cycles else None
-    assert fired == rung, f"the forced window fires the {rung} rung"
+    assert latched_mesh["reboots"] + len(cycles) == 1, "the host rung is asked for once"
     assert srv.fsm.state is not ServerState.HEALTHY, "no release without a passing full check"
 
 
@@ -422,6 +434,52 @@ async def test_a_latched_hold_no_relift_reset_takes_the_ladder_at_the_ceiling(
     fired = "reboot" if mesh["reboots"] else "power-cycle" if cycles else None
     assert fired == rung, f"the same window fires the {rung} rung once the ladder's check fails"
     assert srv.fsm.state is not ServerState.HEALTHY, "no release without a passing full check"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("latched", [False, True], ids=["no-latch", "i42-latch"])
+async def test_replay_a_held_77_whose_bound_ladder_leaves_a_port_missing_power_cycles_once(
+    monkeypatch, tmp_path, mesh, latched  # noqa: F811
+):
+    """Replay of a held rc 77 (spec 04 I76 with spec 03 I71): the hold reaches the 10-min bound, the
+    bound's ladder runs glx_reset and it exits 0, but the full check after it still finds one
+    descriptor port missing while the traffic-only rerun passes. That check FAILS: the device is
+    never released and the broker asks for exactly one power cycle; a later watchdog tick asks for
+    no second one while the first is pending."""
+    from tt_device_mcp.health.recovery import galaxy
+
+    m = _monitor_fabric(monkeypatch, tmp_path, mesh)
+    if latched:
+        ok, _detail = await m._verify_fabric_health_body(60)
+        assert ok is not False, "a real lift"
+        dfr.fsm_dirty(srv, f"job 7: {_latch(m)}", why=srv.FABRIC_RELIFT_WHY)
+    else:
+        dfr.fsm_dirty(srv, "post-job: fabric unverified (rc 77)", why=srv.FABRIC_RELIFT_WHY)
+    mesh["descriptor_out"] = _LOST
+    mesh["reset_heals"] = False
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    cycles = []
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+    since = datetime.now() - timedelta(seconds=galaxy._stuck_hold_ceiling_sec() + 1)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
+    await srv._force_escalate_stuck_hold()
+    assert mesh["resets"] and all(r == ["tt-smi", "-glx_reset"] for r in mesh["resets"]), "the bound's ladder"
+    ok, detail = mesh["fabric"][-1]
+    assert ok is False and fabric.LINKS_MISSING in detail and _LOST_PORT in detail, "one port missing FAILS"
+    assert mesh["calls"][-1] == ["run_cluster_validation"], "even though the traffic-only rerun passed"
+    assert srv.fsm.state is not ServerState.HEALTHY, "a failed post-ladder check never releases"
+    assert "device_released" not in mesh["events"]
+    assert mesh["reboots"] == 0 and len(cycles) == 1, "exactly one power cycle is asked for"
+    await srv._force_escalate_stuck_hold()
+    assert len(cycles) == 1, "no second power cycle while the first is pending"
+    assert srv.fsm.state is not ServerState.HEALTHY and "device_released" not in mesh["events"]
 
 
 @pytest.mark.asyncio

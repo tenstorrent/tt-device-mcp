@@ -105,7 +105,9 @@ async def test_below_the_bound_a_no_reset_hold_keeps_its_fast_path(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_a_latched_i42_hold_still_escalates_and_its_latch_is_lifted(monkeypatch, clear_job_state):
+async def test_a_latched_i42_hold_still_escalates_and_its_latch_stands(monkeypatch, clear_job_state):
+    """The I42 latch withholds no check: it makes a mismatch FAIL, so the bound keeps it and the check
+    after the ladder cannot pass on the links the lift's first job failed on."""
     escalations, _alerts, events = _arm_fabric_only_deadline_hold(
         monkeypatch,
         why=srv.FABRIC_RELIFT_WHY,
@@ -113,12 +115,12 @@ async def test_a_latched_i42_hold_still_escalates_and_its_latch_is_lifted(monkey
         fabric_output=MISMATCH,
         age_min=10.1,
     )
-    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", "hardware fault: needs an operator")
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", "hardware fault: a mismatch now fails")
     monkeypatch.setattr(srv.health_monitor, "fabric_known_fault", "", raising=False)
     await srv._force_escalate_stuck_hold()
     assert escalations == ["present-forced"]
-    assert "hold_bound_latch_cleared" in events
-    assert srv.health_monitor.topology_hw_fault == "", "the check after the ladder gets a real verdict"
+    assert "hold_bound_latch_cleared" not in events
+    assert srv.health_monitor.topology_hw_fault, "the latch stands, so a mismatch after the ladder fails"
 
 
 @pytest.mark.asyncio
@@ -436,7 +438,8 @@ async def test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_
     assert order.index("glx_reset") < order.index("power_cycle")
     assert "released" not in order, "nothing released on a failed check"
     kinds = [k for k, _ in rig["events"]]
-    assert "hold_bound_latch_cleared" in kinds
+    assert "hold_bound_latch_cleared" not in kinds, "the I42 latch stands: a mismatch after the ladder fails"
+    assert srv.health_monitor.topology_hw_fault
     assert srv._hold_escalated_report(), "a stuck-hold event past the bound reports the escalation"
 
 
@@ -466,17 +469,14 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
     monkeypatch.setattr(mon, "last_fabric_output", MISMATCH)
     monkeypatch.setattr(mon, "last_fabric_ok", None)
     monkeypatch.setattr(mon, "topology_hw_fault", "")
-    monkeypatch.setattr(mon, "topology_hw_fault_paged", 0.0)
     monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
     # The mismatch lift arms the one-job watch; that job dies on the fabric and sets the latch.
     monkeypatch.setattr(mon, "topology_lift_pending", True)
     why = mon.note_job_after_topology_lift(True, "... could not find any forwarding direction ...")
-    assert why and "needs an operator (cabling)" in why
+    assert why and "a reset and then a power cycle run" in why
     srv._hold_device_fabric_unverified(f"job 922: {why}")
-    withheld, detail = await mon._verify_fabric_health_body(1)
-    assert withheld is None and "withheld" in detail, "the latch withholds every later fabric check"
-    assert srv._fabric_77_only_hold(), "a 77-only hold: the old forced run returned here, running no rung"
+    assert srv._fabric_no_reset_hold() == "", "a latched hold is measured (03 I42): never a no-reset hold"
     age = BOUND + 1 if driver == "watchdog" else 2 * BOUND + 1
     monkeypatch.setattr(srv, "device_hold_episode_since", _since(age))
     monkeypatch.setattr(srv, "device_hold_episode_reason", f"job 922: {why}")
@@ -492,7 +492,7 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
 
     async def full_check(expected, log, run_fabric=True, **k):
         assert run_fabric, "the post-reset check includes the fabric (goal 8)"
-        assert not mon.topology_hw_fault, "the latch is lifted, so the fabric pass really runs"
+        assert mon.topology_hw_fault, "the latch stands through the bound: a mismatch here fails"
         return False, {"fabric": {"ok": False, "detail": MISMATCH}}
 
     monkeypatch.setattr(g, "_reset_and_verify_device", reset_then_full_check)
@@ -522,7 +522,7 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
     assert order.count("power_cycle") == 1, "the broker's own code asked for the power cycle"
     assert order.index("glx_reset") < order.index("power_cycle")
     assert "released" not in order, "nothing released on a failed check"
-    assert ("hold_bound_latch_cleared", "topology_hw_fault") in [(k, e.get("latch")) for k, e in rig["events"]]
+    assert ("hold_bound_latch_cleared", "topology_hw_fault") not in [(k, e.get("latch")) for k, e in rig["events"]]
 
 
 @pytest.mark.asyncio
@@ -530,7 +530,7 @@ async def test_replay_a_post_job_77_hold_that_only_relifts_gets_the_ladder_at_th
     rig, monkeypatch, clear_job_state  # noqa: F811
 ):
     """A Galaxy host's post-job hold: a job's fabric failure after a topology lift sets the I42 latch, the
-    hold is 77-only, and for its whole life only idle relifts ran (each withheld by the latch). The
+    hold is 77-only, and for its whole life no idle relift reset ran (the old latch withheld each one). The
     stuck-hold event at the deadline read escalated=false and no rung had run. Walked tick by tick:
     nothing is forced below the bound; at 600 s the full ladder runs, the full check after it (fabric
     included) fails, the broker asks for the power cycle, and the deadline event reads escalated."""
@@ -545,14 +545,13 @@ async def test_replay_a_post_job_77_hold_that_only_relifts_gets_the_ladder_at_th
     monkeypatch.setattr(mon, "last_fabric_output", MISMATCH)
     monkeypatch.setattr(mon, "last_fabric_ok", None)
     monkeypatch.setattr(mon, "topology_hw_fault", "")
-    monkeypatch.setattr(mon, "topology_hw_fault_paged", 0.0)
     monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
     monkeypatch.setattr(mon, "topology_lift_pending", True)
     why = mon.note_job_after_topology_lift(True, "... could not find any forwarding direction ...")
     assert why, "the job's fabric failure after the lift sets the latch"
     srv._hold_device_fabric_unverified(f"job 930: {why}")
-    assert srv._fabric_77_only_hold()
+    assert srv._fabric_no_reset_hold() == "", "a latched hold is measured (03 I42): never a no-reset hold"
     monkeypatch.setattr(srv, "device_hold_episode_reason", f"job 930: {why}")
     _watchdog(monkeypatch)
     srv.fsm.set_latch("escalated", False)
@@ -568,7 +567,7 @@ async def test_replay_a_post_job_77_hold_that_only_relifts_gets_the_ladder_at_th
 
     async def full_check(expected, log, run_fabric=True, **k):
         assert run_fabric, "the post-reset check includes the fabric (goal 8)"
-        assert not mon.topology_hw_fault, "the latch is lifted, so the fabric pass really runs"
+        assert mon.topology_hw_fault, "the latch stands through the bound: a mismatch here fails"
         return False, {"fabric": {"ok": False, "detail": MISMATCH}}
 
     monkeypatch.setattr(g, "_reset_and_verify_device", reset_then_full_check)
@@ -582,10 +581,8 @@ async def test_replay_a_post_job_77_hold_that_only_relifts_gets_the_ladder_at_th
     monkeypatch.setattr(srv, "_auto_power_cycle_host", cycle_and_mark)
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
 
-    for age in range(10, BOUND, 10):  # one sampler tick every 10 s; the idle relift stays withheld
+    for age in range(10, BOUND, 10):  # one watchdog tick every 10 s, no idle relift reset in between
         monkeypatch.setattr(srv, "device_hold_episode_since", _since(age))
-        withheld, detail = await mon._verify_fabric_health_body(1)
-        assert withheld is None and "withheld" in detail
         srv._check_hold_deadline(now=datetime.now())
         await _drain()
         assert "glx_reset" not in order and "power_cycle" not in order, f"a rung ran at {age}s, below the bound"

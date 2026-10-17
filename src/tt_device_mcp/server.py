@@ -7122,11 +7122,11 @@ def _hold_bound_cycle_due(age: float) -> bool:
 
 
 def _lift_hold_bound_latches(log) -> None:
-    """At the bound, the latch that skips the fabric check (spec 03 I46's known fabric fault) is
-    lifted, so the check after the ladder gets a real verdict and only a pass releases. A job that
-    fails the same way declares it again. The I42 topology latch stays: it withholds no check (a
-    mismatch FAILS while it stands), and lifting it let the post-ladder check lift the mismatch
-    again onto the links the first job already failed on (spec 03 I77)."""
+    """At the bound, the latch that skips the fabric check (spec 03 I46's known fabric fault) is lifted,
+    so the check after the ladder gets a real verdict and only a pass releases. A job that fails the
+    same way declares it again. Spec 03 I42's topology hardware fault stays: it withholds nothing, it
+    makes a mismatch FAIL the check, so lifting it would let the post-ladder check pass on the links the
+    lift's first job already failed on and release the device onto them."""
     if health_monitor is None:
         return
     for name in ("fabric_known_fault",):

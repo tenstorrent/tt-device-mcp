@@ -106,16 +106,17 @@ def _mon_events(st) -> list[str]:
     return [ev for ev, _ in st["mon_events"]]
 
 
-async def _hold_then_reset(st):
+async def _hold_then_reset(st, resets=1):
     """The post-job gate measures the lost port and holds (no reset on a present mesh below the
-    floor); the idle relift resets the held mesh with no grace (03 I56) and runs the full check."""
+    floor); the idle relift resets the held mesh with no grace (03 I56) and runs the full check.
+    A check that still fails runs the last-chance sweep too (spec 04 I79): two resets."""
     fsm_dirty(srv, "job 7 crashed: could not find any forwarding direction", why="job_killed")
     await etr._gate()
     assert st["resets"] == [] and srv.fsm.state is ServerState.RECOVERING
     st["log"].said.clear()
     srv.last_relift_monotonic = 0.0
     await srv._attempt_idle_relift()
-    assert st["resets"] == [["tt-smi", "-glx_reset"]], "the held mesh takes the present-mesh reset"
+    assert st["resets"] == [["tt-smi", "-glx_reset"]] * resets, "the held mesh takes the present-mesh reset"
 
 
 def _post_reset_descriptor_runs(st) -> list[bool]:
@@ -129,17 +130,20 @@ async def test_a_post_reset_link_drop_skip_with_a_missing_port_stays_held(replay
     reaches no verdict, the descriptor run finds one port missing and none extra, and the
     traffic-only rerun passes. The post-reset check fails, the device stays held, the eth mark
     stays at 256, and the next between-jobs gate fails the same way instead of lifting."""
-    await _hold_then_reset(replay)
+    await _hold_then_reset(replay, resets=2)
     said = replay["log"].text()
     assert f"eth-heartbeat: SKIPPED — {ETH_LINK_DROP_SKIP}: {LEFT} of {HIGH_WATER}" in said, "the real skip verdict"
-    assert _post_reset_descriptor_runs(replay) == [True], "the post-reset check ran the descriptor"
+    assert _post_reset_descriptor_runs(replay) == [
+        True,
+        True,
+    ], "the post-reset and post-sweep checks ran the descriptor"
     assert replay["calls"][-1] == ["run_cluster_validation"], "and its traffic-only rerun"
     assert "fabric: UNHEALTHY — fabric check FAILED" in said and fabric.LINKS_MISSING in said and _LOST_PORT in said
     assert srv.health_monitor.last_fabric_ok is False and srv.health_monitor.topology_lift_pending is False
     assert srv.fsm.state is not ServerState.HEALTHY, "a failed post-reset check never releases"
     assert srv._device_unavailable_for_tenant(), "the hold is kept: no tenant reaches the mesh"
     assert srv.device_hold_episode_since, "the episode stays open for the next rung"
-    assert "reset_ineffective" in replay["events"] and "host_rung_deferred_until_ladder_end" in replay["events"]
+    assert "reset_ineffective" in replay["events"] and "host_rung_not_deferred" in replay["events"]
     assert _mark(replay) == HIGH_WATER, "the eth mark is never lowered to the links that are left"
     assert "eth_link_rebaselined" not in _mon_events(replay)
 
@@ -148,7 +152,7 @@ async def test_a_post_reset_link_drop_skip_with_a_missing_port_stays_held(replay
     replay["log"].said.clear()
     await etr._gate()
     said = replay["log"].text()
-    assert _post_reset_descriptor_runs(replay) == [True, True], "the gate ran the descriptor again"
+    assert _post_reset_descriptor_runs(replay) == [True, True, True], "the gate ran the descriptor again"
     assert f"{ETH_LINK_DROP_SKIP}: {LEFT} of {HIGH_WATER}" in said and _LOST_PORT in said
     assert srv.fsm.state is not ServerState.HEALTHY and srv._device_unavailable_for_tenant()
     assert "device_released" not in replay["events"]
