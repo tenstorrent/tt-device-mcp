@@ -7222,6 +7222,7 @@ async def _force_escalate_stuck_hold() -> None:
             expected,
             log,
             stand_down=lambda: _startup_verify_owns_hold(kind),
+            hold_bound=bound,
         )
         if outcome == OUTCOME_WAITING and galaxy_recovery.startup_verify_deferred:
             _defer_to_startup_verify(kind, log, journaled=True)  # spec 03 I75: the job ended inside the ladder
@@ -7844,13 +7845,6 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         device_hold_escalation_trigger = "the end of the power-cycle cooldown"
         if _maybe_spawn_forced_escalation():
             recovery_mechanism.clear_power_cycle_retry()
-    # Spec 04 I73: a whole tray whose cycle the cooldown refuses gets the full ladder at the 10-min
-    # mark after its last cycle or boot, not at the next ceiling window (up to a window late).
-    if not only_77 and recovery_mechanism.class_a_ladder_watch_due(now.timestamp() if now else None):
-        device_hold_escalation_kind = "class_a_ladder"
-        device_hold_escalation_trigger = "10 min since the last power cycle or boot (whole tray off)"
-        if _maybe_spawn_forced_escalation():
-            recovery_mechanism.class_a_ladder_spawned(now.timestamp() if now else None)
     if _hold_bound_cycle_due(age):
         # Spec 04 I76: the bound ladder brought the mesh back but its full check has not released the
         # hold — the host rung now.

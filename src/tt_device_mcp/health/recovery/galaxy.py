@@ -48,7 +48,6 @@ from tt_device_mcp.health.recovery import (
     pcie_guard,
 )
 from tt_device_mcp.health.recovery.base import (
-    CLASS_A_LADDER_AFTER_SEC,
     HOLD_ESCALATION_REARM_SEC,
     drop_returned_isolated,
     refuse_mesh_reset,
@@ -1245,6 +1244,7 @@ class GalaxyRecovery(Recovery):
         beats: Optional[dict] = None,
         measured_fault: bool = False,
         stand_down: Optional[Callable[[], bool]] = None,
+        hold_bound: bool = False,
     ) -> str:
         """Run the next justified rung of this ladder and report the outcome, replacing the
         direct ``_escalate_stuck_hold``/``_escalate_offbus_stuck_hold`` calls the idle relift and
@@ -1286,6 +1286,9 @@ class GalaxyRecovery(Recovery):
         ``measured_fault`` reaches the present ladder only: the hold stands on a MEASURED fabric
         failure, so its reset is due without the grace (spec 03 I56; see ``_stuck_hold_reset_due``).
 
+        ``hold_bound``: this forced run is the 10-min hold bound's (spec 04 I76). A whole tray whose
+        power cycle the cooldown refuses then gets the full ladder, once per cycle or boot (I73).
+
         A host reboot or power cycle still pending (spec 04 I34) stops every caller here, before
         the prelude: nothing runs, WAITING, one log line per request.
 
@@ -1296,7 +1299,15 @@ class GalaxyRecovery(Recovery):
         self.startup_verify_deferred = False
         try:
             return await self._escalate_phase(
-                phase, indices, expected, log, stage=stage, ev=ev, beats=beats, measured_fault=measured_fault
+                phase,
+                indices,
+                expected,
+                log,
+                stage=stage,
+                ev=ev,
+                beats=beats,
+                measured_fault=measured_fault,
+                hold_bound=hold_bound,
             )
         finally:
             self._stand_down = None
@@ -1312,6 +1323,7 @@ class GalaxyRecovery(Recovery):
         ev: Optional[Evidence],
         beats: Optional[dict],
         measured_fault: bool,
+        hold_bound: bool,
     ) -> str:
         """:meth:`escalate`'s body, run with its ``stand_down`` in place."""
         if self.mechanism.host_action_blocks_reset(log, context=f"escalate({phase})"):
@@ -1320,7 +1332,9 @@ class GalaxyRecovery(Recovery):
         if await self._tray_down_latch(expected, beats) == TRAY_DOWN_ONSET and not self._td["prelude_done"]:
             if await self._tray_down_prelude(expected, log, phase=gate_phase or rung):
                 return OUTCOME_RECOVERED
-        direct = await self._power_cycle_direct_from_escalate(rung, gate_phase, stage, expected, beats, log)
+        direct = await self._power_cycle_direct_from_escalate(
+            rung, gate_phase, stage, expected, beats, log, hold_bound=hold_bound
+        )
         if direct is not None:
             return direct
         # Anything that reaches a ladder from here may reset: an onset first sighted after this is
@@ -1419,7 +1433,15 @@ class GalaxyRecovery(Recovery):
         return fault_class
 
     async def _power_cycle_direct_from_escalate(
-        self, rung: str, gate_phase: str, stage: Optional[str], expected: int, beats: Optional[dict], log
+        self,
+        rung: str,
+        gate_phase: str,
+        stage: Optional[str],
+        expected: int,
+        beats: Optional[dict],
+        log,
+        *,
+        hold_bound: bool = False,
     ) -> Optional[str]:
         """Spec 04 I37 at the ladder's entry: an off-bus set of class A or C goes to the power cycle
         before any rung fires. None when it does not apply (the ladder runs as before); else the
@@ -1455,14 +1477,14 @@ class GalaxyRecovery(Recovery):
             fired is False
             and rung == "offbus-forced"
             and fault_class == FAULT_CLASS_WHOLE_TRAY
-            and self.mechanism.class_a_ladder_due()
+            and self.mechanism.class_a_ladder_due(hold_bound=hold_bound)
         ):
-            # Spec 04 I73: the cooldown refused the cycle, and the hold has stood 10 min since its last
-            # cycle or boot. The full ladder runs once now (each reset followed by the full health
+            # Spec 04 I73/I76: the cooldown refused the cycle, and this is the 10-min hold bound's run.
+            # The full ladder runs once per cycle or boot (each reset followed by the full health
             # check, fabric included); the cycle still fires the moment the cooldown ends.
             log(
-                f"whole tray(s) off and the power cycle in cooldown {CLASS_A_LADDER_AFTER_SEC}s after the last "
-                f"cycle or boot — running the full ladder; the cycle follows at the cooldown's end if it fails"
+                "whole tray(s) off and the power cycle in cooldown at the 10-min hold bound — running the "
+                "full ladder; the cycle follows at the cooldown's end if it fails"
             )
             health_event("class_a_cooldown_ladder", off_bus=sorted(offbus, key=int), expected=expected)
             return None

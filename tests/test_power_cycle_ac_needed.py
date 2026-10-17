@@ -6,8 +6,8 @@
 After POWER_CYCLE_AC_NEEDED_AFTER broker power cycles that took the host down with the same whole
 tray still off the bus and no verified release since, the broker names the state on /health (chips,
 attempts, last cycle), pages once and then hourly, and keeps recovering: the next cycle fires the
-moment each cooldown ends (I65), and a hold that has stood 10 min since its last cycle or boot gets
-the full ladder once. A tray that comes back is released only by a passing full health check, fabric
+moment each cooldown ends (I65), and the 10-min hold bound's run (I76) gives each cycle or boot's
+hold the full ladder once. A tray that comes back is released only by a passing full health check, fabric
 included. External cycles space the cooldown (I65) but never count as attempts. No test reaches a
 real reset or power cycle."""
 
@@ -16,19 +16,28 @@ from datetime import datetime
 import pytest
 
 from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401
-from tests.test_power_cycle_cooldown import LADDER, T0, _cycles, _ledger, _tray_off, _watchdog, cool  # noqa: F401
+from tests.test_power_cycle_cooldown import (  # noqa: F401
+    LADDER,
+    T0,
+    _bound_watchdog,
+    _cycles,
+    _ledger,
+    _tray_off,
+    _watchdog,
+    cool,
+)
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery.base import (
     AC_POWER_REPAGE_SEC,
-    CLASS_A_LADDER_AFTER_SEC,
     POWER_CYCLE_AC_NEEDED_AFTER,
     POWER_CYCLE_MIN_INTERVAL_SEC,
 )
 
 BOOT = 120  # seconds from a cycle to the boot it brings
+BOUND = 600  # the 10-min hold bound (spec 04 I76)
 
 
 @pytest.fixture
@@ -77,6 +86,21 @@ async def _forced(cool):  # noqa: F811
     return await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda msg: None)
 
 
+async def _bound_forced(cool):  # noqa: F811
+    """The watchdog's forced run now, marked as the 10-min hold bound's (I76) once the hold reached it."""
+    bound = srv._hold_age_now(datetime.fromtimestamp(cool["clk"][0])) >= srv._stuck_hold_ceiling_sec()
+    return await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda msg: None, hold_bound=bound)
+
+
+def _new_episode(cool, monkeypatch):  # noqa: F811
+    """The hold the broker opens at this boot's startup (an episode never outlives its boot)."""
+    start = cool["clk"][0]
+    monkeypatch.setattr(srv, "device_hold_episode_since", datetime.fromtimestamp(start).isoformat())
+    for name in ("device_hold_escalate_bucket", "device_hold_deadline_bucket"):
+        monkeypatch.setattr(srv, name, 0)
+    return start
+
+
 @pytest.mark.asyncio
 async def test_cycles_continue_at_cooldown_spacing_past_the_ac_needed_state(cool, monkeypatch, paged):  # noqa: F811
     """No cycle limit. Past the two attempts the state is on /health and paged, but
@@ -111,57 +135,57 @@ async def test_cycles_continue_at_cooldown_spacing_past_the_ac_needed_state(cool
 
 
 @pytest.mark.asyncio
-async def test_the_full_ladder_runs_10_min_after_the_last_cycle_or_boot_then_the_cycle(cool):  # noqa: F811
-    """A hold never stands 10 min past its last cycle or boot without the full ladder. The
-    ladder runs once at that mark inside the cooldown; a ladder that did not heal leaves the cycle to
-    fire at the cooldown's end."""
+async def test_the_full_ladder_runs_at_the_10_min_hold_bound_then_the_cycle(cool, monkeypatch):  # noqa: F811
+    """A hold never passes its 10-min bound inside the cooldown without the full ladder: the bound's
+    run (I76) reaches it, once per cycle or boot; a ladder that did not heal leaves the cycle to fire
+    at the cooldown's end. Any other forced pass inside the cooldown runs no ladder."""
     await _two_cycles_that_do_not_heal(cool)
     m = cool["g"].mechanism
-    boot = cool["boot"]["btime"]
+    start = _new_episode(cool, monkeypatch)
     until = m.power_cycle_retry[0]
-    assert CLASS_A_LADDER_AFTER_SEC == 600 and until - boot > CLASS_A_LADDER_AFTER_SEC
-    cool["clk"][0] = boot + CLASS_A_LADDER_AFTER_SEC - 1
+    assert srv._stuck_hold_ceiling_sec() == BOUND and until - start > 3 * BOUND
+    cool["clk"][0] = start + BOUND - 1
+    await _bound_forced(cool)
+    assert _ladder_runs(cool) == 0, "a whole tray goes to the cycle, not the ladder, before the bound"
+    cool["clk"][0] = start + BOUND
     await _forced(cool)
-    assert _ladder_runs(cool) == 0, "a whole tray goes to the cycle, not the ladder, before the 10-min mark"
+    assert _ladder_runs(cool) == 0, "only the bound's run opens the ladder (one trigger)"
     before = len(cool["order"])
-    cool["clk"][0] = boot + CLASS_A_LADDER_AFTER_SEC
-    await _forced(cool)
+    await _bound_forced(cool)
     assert cool["order"][before:] == [
         "denied",
         "ubb_tray",
-    ], "the 10-min pass runs the tray re-power only: glx_reset is suppressed, no sweep"
+    ], "the bound's pass runs the tray re-power only: glx_reset is suppressed, no sweep"
     assert _cycles(cool) == 2, "the cooldown still holds the cycle"
     ran = _ladder_runs(cool)
-    for later in (1200, 1800):
-        cool["clk"][0] = boot + later
-        await _forced(cool)
+    for later in (2 * BOUND, 3 * BOUND):
+        cool["clk"][0] = start + later
+        await _bound_forced(cool)
     assert _ladder_runs(cool) == ran, "once per cycle or boot, not every window"
     cool["clk"][0] = until
-    await _forced(cool)
+    await _bound_forced(cool)
     assert _cycles(cool) == 3, "the ladder did not heal it: the cycle fires at the cooldown's end"
-    # The next boot gets its own 10-min ladder.
+    # The next boot's hold gets its own ladder at its own bound.
     _boot(cool, until + BOOT, "boot-D")
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
-    cool["clk"][0] = until + BOOT + CLASS_A_LADDER_AFTER_SEC
-    await _forced(cool)
+    start = _new_episode(cool, monkeypatch)
+    cool["clk"][0] = start + BOUND
+    await _bound_forced(cool)
     assert _ladder_runs(cool) > ran
 
 
 @pytest.mark.asyncio
-async def test_the_watchdog_starts_the_class_a_ladder_at_the_10_min_mark(cool, monkeypatch):  # noqa: F811
-    """The 10-min ladder is not left to the next ceiling window: the hold watchdog starts one forced
-    pass at the mark (a declined start asks again), and only one per cycle or boot."""
+async def test_the_hold_bound_is_the_one_trigger_of_the_class_a_ladder(cool, monkeypatch):  # noqa: F811
+    """At the 10-min mark the watchdog starts exactly one forced run, the I76 bound's (no second
+    class-A start beside it), and that run reaches the full ladder."""
     await _two_cycles_that_do_not_heal(cool)
-    boot = cool["boot"]["btime"]
-    mark = boot + CLASS_A_LADDER_AFTER_SEC
-    assert _watchdog(cool, monkeypatch, mark - 1) == []
-    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: False)
-    srv._check_hold_deadline(now=datetime.fromtimestamp(mark))
-    assert _watchdog(cool, monkeypatch, mark) == [mark], "a declined start is asked again"
-    assert srv.device_hold_escalation_kind == "class_a_ladder"
-    assert _watchdog(cool, monkeypatch, mark + 60) == [], "one start per cycle or boot"
+    start = _new_episode(cool, monkeypatch)
+    mark = start + BOUND
+    assert _bound_watchdog(cool, monkeypatch, mark - 1) == []
+    assert _bound_watchdog(cool, monkeypatch, mark) == ["ceiling_window"]
+    assert _bound_watchdog(cool, monkeypatch, mark + 60) == [], "one start per bound window"
     cool["clk"][0] = mark
-    await _forced(cool)
+    await _bound_forced(cool)
     assert _ladder_runs(cool) >= 1
 
 
@@ -183,15 +207,14 @@ async def test_the_ac_hold_pages_once_then_hourly(cool, monkeypatch, paged):  # 
 
 @pytest.mark.asyncio
 async def test_at_the_10_min_mark_a_failed_bound_check_keeps_the_power_cycle_step(cool, monkeypatch):  # noqa: F811
-    """Spec 04 I73 with I76: when the class-A 10-min mark falls on the tick where the bound's ladder
-    already ran and its full check failed, the watchdog's run is the bound's host rung (the power
-    cycle, which the cooldown then gates), not a second ladder. The AC-needed state stops neither."""
+    """Spec 04 I73 with I76: on a tick where the bound's ladder already ran and its full check failed,
+    the watchdog's one run is the bound's host rung (the power cycle, which the cooldown then gates),
+    not a second ladder. The AC-needed state stops neither."""
     m = cool["g"].mechanism
-    for name in ("_class_a_ladder_anchor", "_class_a_ladder_spawned"):
-        monkeypatch.setattr(m, name, None)  # the shared mechanism may carry an earlier test's anchor
+    monkeypatch.setattr(m, "_class_a_ladder_anchor", None)  # the shared mechanism may carry an earlier anchor
     await _two_cycles_that_do_not_heal(cool)
     assert m.power_cycle_cooldown_state.get("ac_power_needed")
-    mark = cool["boot"]["btime"] + CLASS_A_LADDER_AFTER_SEC
+    mark = cool["boot"]["btime"] + BOUND
     age = srv._hold_age_now(datetime.fromtimestamp(mark))
     assert age >= 600, "the hold is past the 10-min bound"
     for name, value in (
@@ -213,7 +236,7 @@ async def test_at_the_10_min_mark_a_failed_bound_check_keeps_the_power_cycle_ste
         srv, "_maybe_spawn_forced_escalation", lambda: asked.append(srv.device_hold_escalation_kind) or True
     )
     srv._check_hold_deadline(now=datetime.fromtimestamp(mark))
-    assert asked == ["class_a_ladder", "hold_bound_cycle"]
+    assert asked == ["hold_bound_cycle"], "one run: no class-A start beside the bound's"
     assert srv.device_hold_escalation_kind == "hold_bound_cycle", "the run the watchdog started is the host rung"
     assert srv._hold_bound_cycle_next(srv.device_hold_escalation_kind, age)
 
@@ -246,7 +269,7 @@ async def test_a_returning_tray_leaves_the_ac_state(cool):  # noqa: F811
     m = cool["g"].mechanism
     # An operator removed AC power; the same broker (no restart) reads the whole mesh on the bus again.
     cool["beats"] = _beats_without(set())
-    cool["clk"][0] += CLASS_A_LADDER_AFTER_SEC
+    cool["clk"][0] += BOUND
     await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda msg: None)
     assert m.whole_tray_off is None, "no whole tray off: the AC count no longer applies"
     assert _cycles(cool) == 2, "a returning tray is never cycled"

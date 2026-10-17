@@ -16,7 +16,16 @@ from datetime import datetime
 import pytest
 
 from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401
-from tests.test_power_cycle_cooldown import LADDER, T0, _cycles, _ledger, _tray_off, _watchdog, cool  # noqa: F401
+from tests.test_power_cycle_cooldown import (  # noqa: F401
+    LADDER,
+    T0,
+    _bound_watchdog,
+    _cycles,
+    _ledger,
+    _tray_off,
+    _watchdog,
+    cool,
+)
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
@@ -65,9 +74,13 @@ async def test_a_restart_hours_after_a_cycle_that_never_went_down_cycles_at_once
 
 @pytest.mark.asyncio
 async def test_inside_the_cooldown_the_hold_shows_its_deadline_and_cycles_when_it_ends(cool, monkeypatch):  # noqa: F811
-    """Restart 10 min after the second request: held to its stated end, with the full ladder once at
-    the hold's 10-min mark (spec 04 I73); then the watchdog asks once and the cycle fires, whatever
-    the per-boot count."""
+    """Restart 10 min after the second request: held to its stated end, with the full ladder once in
+    the 10-min hold bound's run (spec 04 I76 with I73); then the watchdog asks once and the cycle
+    fires, whatever the per-boot count."""
+    # The hold opened at boot B's startup; the restarted broker keeps it (same boot), windows fresh.
+    monkeypatch.setattr(srv, "device_hold_episode_since", datetime.fromtimestamp(BOOT_B + 60).isoformat())
+    for name in ("device_hold_escalate_bucket", "device_hold_deadline_bucket"):
+        monkeypatch.setattr(srv, name, 0)
     _replay(cool, monkeypatch, now=CYCLE_2 + 600)
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
     until = CYCLE_2 + recovery_base.power_cycle_interval_sec(2)
@@ -76,15 +89,17 @@ async def test_inside_the_cooldown_the_hold_shows_its_deadline_and_cycles_when_i
     cd = _health_cooldown(cool, monkeypatch, CYCLE_2 + 600)
     assert cd["escalation_stage"] == "power-cycle"
     assert cd["next_deadline"] == datetime.fromtimestamp(until).isoformat(timespec="seconds")
-    mark = cool["g"].mechanism._class_a_ladder_anchor_now(CYCLE_2 + 600) + recovery_base.CLASS_A_LADDER_AFTER_SEC
-    assert CYCLE_2 + 600 <= mark < until
-    assert _watchdog(cool, monkeypatch, mark - 1) == []
-    assert _watchdog(cool, monkeypatch, mark) == [mark], "the full ladder at the hold's 10-min mark"
+    # Past the bound and 10 min past the anchor (the missed request): the first tick is the bound's run.
+    mark = CYCLE_2 + 600
+    assert _bound_watchdog(cool, monkeypatch, mark) == ["ceiling_window"], "one run: the I76 bound's"
+    assert _bound_watchdog(cool, monkeypatch, mark + 10) == [], "once per bound window"
+    await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda m: None, hold_bound=True)
+    assert cool["order"][-2:] == ["denied", "ubb_tray"] and _cycles(cool) == 0, "the full ladder, cycle still gated"
     assert _watchdog(cool, monkeypatch, until - 1) == []
     assert _watchdog(cool, monkeypatch, until) == [until]
     cool["clk"][0] = until
     assert await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda m: None) == galaxy.OUTCOME_TERMINAL
-    assert _cycles(cool) == 1 and not LADDER & set(cool["order"])
+    assert _cycles(cool) == 1
 
 
 @pytest.mark.asyncio
