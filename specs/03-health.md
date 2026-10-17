@@ -806,6 +806,42 @@ job boundary.
   hosts since 2026-09-14, 51 of 51 such timeouts were followed by a failed or skipped pass. No wait
   is added. A rung the gate fires from a clean exit (I55 or I61) first opens the hold episode
   (marked dirty, `probe_unhealthy`), so the door is shut while the reset is unproven.
+- **I69 — A job the broker stopped mid-run is followed by a reset, then the full check.** A job
+  that hit its timeout, one the hung reaper stopped (HUNG), or a running job stopped by a requested
+  kill (`tt_device_job_kill`, the REST kill, or a `tt_device_job_run` whose client went away, spec
+  01 I66), owes the mesh one reset: a kill mid-run is how a mesh is left wedged mid-collective, and
+  a fabric pass that happens to pass does not clear what it cannot see. Every submit path (MCP,
+  REST `tt_device_job_run_bg`, the CLI) runs through the same runner, so each owes it the same way.
+  The runner records the debt when the job ends, and `_monitor_readopted_scope` records it for a
+  re-adopted job (spec 01 I7) that its timeout or a requested kill stopped; that path drops the
+  job's requested-kill mark at the job's end either way. A job a reset or recovery killed (its own
+  kill), and one that named a known fabric or topology fault (held without a reset, I42/I46), owe
+  none. Every process tree the broker kills logs one INFO line in server.log (`JOB_RUNNER
+  job_id=<id> KILLED process tree: reason=<why>; ...`) naming the unit or process group and pids
+  it stopped and the ladder step that ended it. The next post-job gate pays it: it skips the
+  pre-reset fabric traffic pass and the passive eth read, captures the incident (`job_killed`),
+  logs one line and journals `kill_mesh_reset`, and fires `STAGE_SMI_RESET` through the same path
+  and per-episode latch as I55/I61 (`tt-smi -glx_reset` on a Galaxy, `tt-smi -r` per target
+  elsewhere). Only when every chip reads present and ARC healthy: anything else is a different
+  fault and takes its own rung on the same evidence. Only the full post-reset check (fabric
+  traffic and dispatch included, spec 04 I32) releases the device; a failed one keeps it held
+  and climbs the bounded ladder like I55, never a release. A spent latch, an outage hold (spec 04
+  I28) or a reset cooldown journals `kill_reset_skipped`, clears the debt and keeps today's path
+  (the dirty exit's fabric pass). Any reset since the job ended also settles the debt. A debt
+  still open when the runner takes the next job (a re-adopted job's, which has no post-job gate of
+  its own) is paid before that job's door by the same post-job gate (`job_failed`: one reset, then
+  the full check), never by the pre-job gate, which runs no fabric pass; on an idle queue the I68
+  relift pays it. A reaped job's leftover still holding the device (spec 01 I16) makes the gate
+  skip before it reads the debt: no reset runs over it, the debt and the dirty flag stay, and no
+  wait is added (the leftover's own escalation bounds that hold). The debt lives in memory only:
+  a broker restart or host reboot drops it, and the startup gate (I4) re-proves the mesh with the
+  full check, fabric included. Time to
+  recover (a timed-out or killed job, the job-kill class): kill ladder (unchanged, at most 75 s),
+  then one reset (bounded by `DEVICE_RESET_TIMEOUT_SEC`; ~62 s for a Galaxy `glx_reset`, ~15 s
+  for a per-target `tt-smi -r`), then one full check (fabric pass bounded by
+  `FABRIC_CHECK_TIMEOUT_SEC`). Against today, a wedged mesh saves the failed pre-reset fabric pass
+  (~45-100 s), and a mesh that was fine pays the reset minus that pass (~+0-20 s on a Galaxy,
+  ~+15 s per target). No wait is added.
 - **I57 — An incident bundle never presents another pass's fabric transcript as its own.** The
   monitor stamps `last_fabric_output_at` with the start of the run that produced
   `last_fabric_output`; the gate records when its pass began and hands both to
@@ -1465,6 +1501,14 @@ refuses.
 | I61 (one reset per episode, latch shared with I55, re-armed at release) | `tests/test_eth_timeout_reset.py::test_a_second_timeout_in_the_episode_gets_no_second_reset`, `tests/test_eth_timeout_reset.py::test_a_spent_dispatch_reset_leaves_the_timeout_on_todays_path`, `tests/test_eth_timeout_reset.py::test_a_healed_reset_rearms_the_latch_at_the_next_admission` |
 | I61 (every other shape keeps today's path) | `tests/test_eth_timeout_reset.py::test_other_no_verdict_reads_keep_todays_fabric_pass`, `tests/test_eth_timeout_reset.py::test_a_frozen_read_keeps_todays_hold`, `tests/test_eth_timeout_reset.py::test_an_off_bus_chip_or_unhealthy_arc_keeps_todays_path`, `tests/test_eth_timeout_reset.py::test_host_pci_not_ok_keeps_todays_fabric_pass`, `tests/test_eth_timeout_reset.py::test_an_outage_hold_refuses_the_reset_and_keeps_todays_pass`, `tests/test_eth_timeout_reset.py::test_a_dirty_exit_still_runs_the_fabric_pass` |
 | I68 (a dirty job_killed/foreign_holder hold with nothing queued gets the post-job gate, fabric forced, once per episode; a failure keeps the hold; anything else owning the device defers it) | `tests/test_holder_release_wait.py::test_a_dirty_killed_hold_with_an_empty_queue_runs_the_full_post_job_gate_once`, `tests/test_holder_release_wait.py::test_a_failed_idle_gate_keeps_the_hold_and_runs_once_per_episode`, `tests/test_holder_release_wait.py::test_an_idle_gate_that_raises_keeps_the_device_held`, `tests/test_holder_release_wait.py::test_the_idle_gate_is_rate_limited`, `tests/test_holder_release_wait.py::test_no_idle_gate_while_anything_else_owns_the_device` |
+| I69 (a timeout always resets with no pre-reset fabric pass, then the full check, fabric included, before release) | `tests/test_job_kill_reset.py::test_a_timeout_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_requested_kill_of_a_running_job_owes_the_reset` |
+| I69 (a failed post-kill check stays held and climbs the bounded ladder, never released) | `tests/test_job_kill_reset.py::test_a_failed_post_kill_check_stays_held_and_climbs`, `tests/test_job_kill_reset.py::test_a_failed_post_kill_check_without_a_host_rung_stays_held` |
+| I69 (latch shared with I55/I61; outage hold or spent latch skip it onto today's path; a reset since settles it; a reset-killed or completed job owes none) | `tests/test_job_kill_reset.py::test_a_spent_latch_skips_the_kill_reset_onto_todays_path`, `tests/test_job_kill_reset.py::test_an_outage_hold_skips_the_kill_reset`, `tests/test_job_kill_reset.py::test_a_reset_since_the_kill_settles_the_debt`, `tests/test_job_kill_reset.py::test_no_debt_for_a_reset_killed_or_completed_job` |
+| I69 (router: the kill reset takes STAGE_SMI_RESET only on a present, unfrozen mesh) | `tests/test_job_kill_reset.py::test_router_kill_reset_needs_a_present_unfrozen_mesh` |
+| I69 (HUNG, runner and REST run-bg timeouts, and a re-adopted job's timeout or requested kill each owe the reset; the re-adopted path leaves no requested-kill id) | `tests/test_job_kill_reset.py::test_a_hung_job_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_runner_timeout_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_rest_run_bg_timeout_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_readopted_job_past_its_timeout_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_requested_kill_of_a_readopted_job_owes_the_reset_and_leaves_no_id` |
+| I69 (a debt open at the next job is paid by the post-job gate before its door, the job still QUEUED) | `tests/test_job_kill_reset.py::test_the_runner_pays_an_owed_debt_before_a_queued_job` |
+| I69 (every broker kill logs one KILLED process-tree line) | `tests/test_job_kill_reset.py::test_a_broker_kill_logs_the_process_tree_it_stopped` |
+| I69 (a reaped leftover skips before the debt: no reset, debt kept, no wait; a reboot drops it and the startup full check runs; a cooldown skips and clears it with no wait) | `tests/test_job_kill_reset.py::test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait`, `tests/test_job_kill_reset.py::test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait` |
 | I71 (descriptor ports missing after a passing rerun fail the check by port name; a moved tray still lifts) | `tests/test_fabric_links_missing.py::test_topology_ports_names_each_missing_and_extra_connection`, `tests/test_fabric_links_missing.py::test_the_marker_carries_the_names_and_they_parse_back`, `tests/test_fabric_links_missing.py::test_a_long_port_list_is_capped_with_a_count`, `tests/test_fabric_links_missing.py::test_a_wrapper_marker_without_names_takes_them_from_the_validator_output`, `tests/test_fabric_links_missing.py::test_more_missing_than_extra_is_links_missing_and_a_moved_tray_is_not`, `tests/test_fabric_links_missing.py::test_a_lost_link_whose_rerun_passes_fails_the_check_and_names_the_port`, `tests/test_fabric_links_missing.py::test_an_override_wrapper_that_exits_0_on_a_lost_link_still_fails`, `tests/test_fabric_links_missing.py::test_health_names_the_ports`, `tests/test_fabric_cable_fault.py::test_a_missing_cable_whose_rerun_passes_fails_the_check_by_port_name` |
 | I71 (only an accept list naming every missing port lifts; the eth mark is never lowered otherwise) | `tests/test_fabric_links_missing.py::test_only_an_explicit_accept_list_naming_every_missing_port_lifts`, `tests/test_fabric_links_missing.py::test_a_moved_tray_still_lifts_and_never_lowers_the_mark`, `tests/test_fabric_links_missing.py::test_a_mark_lowered_before_this_fix_is_restored` |
 | I71 (a measured fault: the reset runs, the full check after it decides the release; no heal stays held and climbs) | `tests/test_fabric_links_missing.py::test_a_links_missing_hold_is_not_a_no_reset_topology_hold`, `tests/test_fabric_links_missing.py::test_a_lost_link_resets_and_only_a_full_post_reset_pass_releases`, `tests/test_fabric_links_missing.py::test_a_lost_link_that_a_reset_does_not_heal_stays_held`, `tests/test_fabric_links_missing.py::test_a_lost_link_at_the_startup_gate_fails_and_keeps_the_carried_hold` |
