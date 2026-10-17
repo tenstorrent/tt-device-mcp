@@ -686,6 +686,22 @@ each rung fires only when the gentler one failed or cannot apply.
   most one more reset. Bounds the loop one Galaxy host ran: three mesh resets, one per forced
   window, took a 4-chip drop to 31 and then 32 off the bus.
 
+- **I80 — A reset that regressed a partial off-bus drop runs the last-chance sweep at once.** When
+  this hold episode's reset regressed an off-bus mesh (I31) and the chips still off the bus are a
+  partial drop (more than none, fewer than the reboot floor), the forced escalation does not wait
+  for the stuck-hold ceiling: I31 already bars the mesh reset alone, so the wait only adds time. It
+  journals `regressed_offbus_early_sweep` and runs the last-chance sweep (I22: the off-bus chips'
+  bridge resets, the affected tray's re-power, the mesh reset, then the full verify, fabric
+  included, spec 03 I69/I32) once per hold episode. A passing verify releases the device; a failed
+  one keeps it held, no sweep runs again early in that episode, and the host rungs still wait for
+  the ceiling: the full ladder at the 10-min mark, then the power cycle when opted in (I22). A
+  mass drop (at or above the reboot floor) keeps its ceiling deferral. Time to recover (partial
+  off-bus drop, a reset that regressed it): the sweep starts as soon as the escalation sees the
+  regression instead of at 600 s. On the Galaxy host this was measured on, a re-adopted job's
+  kill-reset regressed a chip at 136 s into the hold and recovery took 828 s; with the early sweep
+  (~220 s for the sweep and its verify) it is ~356 s. The worst case is unchanged: the ceiling
+  ladder at 600 s, then the power cycle.
+
 - **I32 — No reset releases the device until a fabric pass has passed since.** Every reset action
   records a post-reset fabric debt (`post_reset_fabric_owed`): a `tt-smi -r` or `-glx_reset` through
   `reset_with_quiesce` (operator reset, ladder rungs, the last-chance sweep), a reset this broker
@@ -1368,6 +1384,7 @@ sees a silent fabric pass.
 | I30 a dispatch-failure hold is never classed a topology mismatch | `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I28 a uid-0 broker poller never blocks the reset; pollers stop and restart around it | `tests/test_dispatch_failure_reset.py::test_a_uid0_telemetry_holder_does_not_block_the_reset` |
 | I31 a regressed galaxy reset is not repeated in its hold episode; climb or page instead | `tests/test_device_safety.py::test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset`, `tests/test_device_safety.py::test_forced_offbus_ladder_after_a_regression_sweeps_then_power_cycles_when_opted_in`, `tests/test_device_safety.py::test_an_early_regression_is_latched_before_the_ceiling_deferral`, `tests/test_device_safety.py::test_a_new_hold_episode_resets_again_after_a_regression`, `tests/test_device_safety.py::test_gate_skips_a_repeat_galaxy_reset_after_a_regression`, `tests/test_device_safety.py::test_gate_latches_a_regression_seen_before_any_hold` |
+| I80 a regressed partial drop runs the last-chance sweep at once, once per episode; a failed sweep keeps the hold and the ceiling ladder then the power cycle; a mass drop keeps its ceiling deferral | `tests/test_device_safety.py::test_a_regressed_partial_drop_sweeps_at_once_and_heals_before_the_ceiling`, `tests/test_device_safety.py::test_a_failed_early_sweep_still_defers_the_host_rung_and_does_not_sweep_again`, `tests/test_device_safety.py::test_a_failed_early_sweep_climbs_at_the_ceiling_to_the_sweep_then_the_power_cycle`, `tests/test_device_safety.py::test_a_regressed_mass_drop_keeps_its_ceiling_deferral` |
 | I32 every reset path releases only after a passing fabric pass: the debt settles only on a healthy verdict, the funnel holds fabric-unverified, exemptions | `tests/test_post_reset_gate.py::test_the_debt_settles_only_on_a_healthy_fabric_verdict`, `::test_a_single_chip_or_a_host_with_no_fabric_check_is_exempt`, `::test_a_verified_release_after_a_reset_holds_fabric_unverified`, `::test_no_debt_releases_as_before` |
 | I32 per path: operator reset, bridge rung, no-window sweep, idle off-bus bridge, adopted foreign scope, foreign-holder fast verify, broker start, tray-down prelude rescan | `tests/test_post_reset_gate.py::test_an_operator_reset_without_a_passing_fabric_pass_holds`, `::test_an_operator_reset_with_a_passing_fabric_pass_releases`, `::test_the_bridge_rung`, `::test_the_tray_down_no_window_sweep`, `::test_the_idle_off_bus_bridge_reset`, `::test_a_reset_adopted_from_a_foreign_scope`, `::test_the_foreign_holder_fast_verify_after_a_reset_holds`, `::test_a_broker_start_owes_a_fabric_pass_before_any_release`, `tests/test_tray_down_prelude.py::test_a_rescan_recovery_releases_only_on_a_passing_fabric_pass` |
 | I32 no rung outcome lifts the funnel's hold: the last-chance sweep on a fabric 77, no verdict or an unavailable check holds fabric-unverified with no host rung; a 77-only hold never goes DOWN | `tests/test_post_reset_gate.py::test_the_gate_ladders_last_chance_sweep`, `::test_no_rung_outcome_lifts_a_fabric_unverified_hold`, `::test_a_terminal_rung_on_a_measured_fault_still_goes_down`, `::test_every_rung_outcome_folds_through_the_helper` |
