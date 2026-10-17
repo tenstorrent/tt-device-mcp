@@ -80,7 +80,9 @@ the queue and a running job outlive the broker process.
   aside (`.finished`), not requeued — nor one whose id a live job holds (ids wrap).
 - **I7** — A re-adopted job keeps its original `timeout_sec` reservation, with time already
   served counted against it (`_readopted_deadline`); re-adoption never grants a fresh
-  clock, and the deadline is enforced by `_monitor_readopted_scope`. A re-adopted
+  clock, and the deadline is enforced by `_monitor_readopted_scope`. A re-adopted job that
+  deadline or a requested kill stopped owes the mesh one reset, then the full check (spec 03
+  I69), paid before the next job's door or by the idle relift. A re-adopted
   preemptable job (header `PREEMPTABLE: yes`) is held to I20 instead: past its deadline it
   is preempted only once another job waits.
 - **I8** — A job's exit status comes from the job itself: the shell preamble
@@ -228,6 +230,19 @@ the queue and a running job outlive the broker process.
   bounded recovery (`verification_not_lifted`): a differing environment, an unhealthy read, a reset
   since the start, a fault landing during the read, a topology marker or a refused release. A
   failed check never releases the device. An `eth` job never lifts it.
+- **I66** — A `tt_device_job_run` whose client goes away kills its job. A client cancel
+  (`notifications/cancelled`) and a dropped HTTP stream both cancel the tool's handler; the
+  handler then stops the job through the same path as `tt_device_job_kill` (a running job gets
+  the SIGINT, SIGTERM, SIGKILL ladder on its scope or process group; a queued one is cancelled and
+  its spec dropped). The kill runs on its own task, because an await inside the cancelled handler
+  is cancelled again before it can act. It is logged and journaled (`job_run_client_gone`). A
+  caller that wants the job to outlive it sets `keep_running_on_disconnect`; the job then runs to
+  its own end or timeout as before. `tt_device_job_run_bg` is unchanged: it returns at once and its
+  jobs never belonged to a connection. A job killed this way is a requested kill of a running job,
+  so the post-job gate resets the device and runs the full check before release (spec 03 I69).
+  Time to recover (a job whose client gave up): the device is freed after the kill ladder (at most
+  `GRACEFUL_KILL_GRACE_SEC` + `SIGTERM_GRACE_SEC`, 75 s) and the I69 reset and check, instead of
+  only at the job's own exit or its timeout (at most `MAX_TIMEOUT_SEC`, 1500 s).
 - **I67** — A job process that is still alive `SURVIVOR_KILL_WAIT_SEC` (2 s) after the survivor
   sweep's SIGKILL is not named a survivor that holds the device until the `/dev/tenstorrent`
   holder scan has been polled for up to `HOLDER_RELEASE_WAIT_SEC` (30 s) after that SIGKILL.
@@ -542,6 +557,7 @@ flowchart LR
 | I19 | `tests/test_device_safety.py::test_held_job_fails_past_the_hold_bound_and_escalates`, `tests/test_device_safety.py::test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation`, `tests/test_device_safety.py::test_tenant_hold_max_sec_has_no_unbounded_value` |
 | I20 | `tests/test_preemptable.py::test_a_preemptable_job_runs_past_its_limit_while_nobody_waits`, `tests/test_preemptable.py::test_an_ordinary_job_still_times_out_at_its_limit`, `tests/test_preemptable.py::test_contention_inside_the_limit_does_not_preempt`, `tests/test_preemptable.py::test_contention_past_the_limit_stops_the_job_and_still_runs_the_full_gate`, `tests/test_preemptable.py::test_a_job_that_ignores_the_stop_is_killed_at_the_window_end`, `tests/test_preemptable.py::test_the_stop_window_runs_to_its_end_after_the_shell_exits`, `tests/test_preemptable.py::test_preempt_labels`, `tests/test_preemptable.py::test_queue_status_and_cli_show_the_preempt_label`, `tests/test_preemptable.py::test_preempted_wedge_risk`, `tests/test_preemptable.py::test_rest_submit_carries_the_option_into_the_job_and_its_log`, `tests/test_preemptable.py::test_a_readopted_preemptable_job_past_its_limit_is_left_alone_while_nobody_waits`, `tests/test_preemptable.py::test_a_readopted_preemptable_job_is_preempted_once_a_job_waits`, `tests/test_preemptable.py::test_a_preempted_readopted_job_never_releases_the_device_clean` |
 | I21 | `tests/test_verification_jobs.py::test_only_an_operator_running_exactly_one_shipped_check_is_a_verification_job`, `tests/test_verification_jobs.py::test_a_verification_job_queues_at_the_head_and_tenants_stay_fifo`, `tests/test_verification_jobs.py::test_a_job_handed_back_goes_first_among_the_tenants_behind_the_head`, `tests/test_verification_jobs.py::test_only_a_fabric_only_hold_counts`, `tests/test_verification_jobs.py::test_a_held_tenant_yields_to_a_verification_job_that_lifts_the_hold`, `tests/test_verification_jobs.py::test_a_verification_job_passes_no_other_hold`, `tests/test_verification_jobs.py::test_a_held_tenant_does_not_yield_without_a_waiting_verification_job`, `tests/test_verification_jobs.py::test_a_passing_fabric_check_lifts_the_hold`, `tests/test_verification_jobs.py::test_a_passing_check_without_the_full_check_after_the_last_reset_does_not_lift`, `tests/test_verification_jobs.py::test_a_passing_check_settles_the_post_reset_debt_and_lifts`, `tests/test_verification_jobs.py::test_a_refused_release_is_not_reported_as_a_lift`, `tests/test_verification_jobs.py::test_a_pass_on_the_discovered_links_lifts_nothing`, `tests/test_verification_jobs.py::test_nothing_else_lifts_the_hold`, `tests/test_verification_jobs.py::test_a_check_run_with_another_environment_does_not_lift`, `tests/test_verification_jobs.py::test_under_privsep_the_job_env_is_only_its_env_vars`, `tests/test_verification_jobs.py::test_restore_puts_a_verification_job_back_at_the_head` |
+| I66 (a job_run client cancel or disconnect kills its job, whole process group; opt-out keeps it; a queued job is cancelled; job_run_bg unchanged) | `tests/test_job_kill_reset.py::test_a_disconnect_kills_the_whole_process_group`, `tests/test_job_kill_reset.py::test_keep_running_on_disconnect_leaves_the_job_running`, `tests/test_job_kill_reset.py::test_a_cancel_while_queued_cancels_the_job`, `tests/test_job_kill_reset.py::test_the_kill_runs_on_its_own_task_outside_the_cancelled_scope` |
 | I68 | `tests/test_job_preflight.py::test_a_root_owned_existing_dir_is_refused_with_its_owner_and_mode`, `tests/test_job_preflight.py::test_a_writable_dir_passes`, `tests/test_job_preflight.py::test_a_missing_dir_with_a_writable_parent_passes_and_is_not_created`, `tests/test_job_preflight.py::test_a_missing_dir_with_an_unwritable_parent_is_refused_naming_the_parent`, `tests/test_job_preflight.py::test_tt_metal_logs_path_overrides_the_workspace`, `tests/test_job_preflight.py::test_a_missing_workspace_is_left_to_the_job_not_called_an_output_dir_problem`, `tests/test_job_preflight.py::test_the_override_is_what_gets_checked`, `tests/test_job_preflight.py::test_the_runner_fails_the_job_at_the_door_and_spawns_nothing`, `tests/test_job_preflight.py::test_the_runner_checks_as_the_privsep_submitter_with_only_its_env`, `tests/test_job_preflight.py::test_a_preflight_that_errors_or_hangs_lets_the_job_through` |
 | B-Submission (burst cap) | `tests/test_device_safety.py::test_an_armed_burst_cap_refuses_one_owners_flood_but_not_another`, `tests/test_device_safety.py::test_the_default_off_burst_cap_admits_every_submit`, `tests/test_device_safety.py::test_job_burst_decision_prunes_the_window_and_gates_on_the_cap[2-60.0-recent2-110.0-False-50.0-expect_kept2]` |
 | B-Submission (owner derived from the peer uid and the surface) | `tests/test_device_safety.py::test_the_owner_comes_from_the_peer_uid_and_the_surface` |
