@@ -10612,20 +10612,42 @@ async def test_below_floor_hold_past_the_ceiling_climbs_to_the_power_cycle(monke
 
 
 @pytest.mark.asyncio
-async def test_present_mesh_failed_reset_defers_host_rung_before_ladder_end(monkeypatch, clear_job_state):
-    """The present-mesh twin of the ladder-end bound: an eth-wedged mesh whose galaxy reset ran at the
-    grace and did not verify must NOT reboot there — the host rungs wait for the hold ceiling, the
-    deferral is journaled, and the grace cadence keeps retrying the reset meanwhile."""
+async def test_present_mesh_failed_reset_sweeps_then_climbs_without_the_ceiling_wait(monkeypatch, clear_job_state):
+    """Spec 04 I79 (G1): an eth-wedged present mesh whose galaxy reset ran at the grace and failed its
+    full check has no rung left below the host pair but the sweep. The sweep runs, then the host rung
+    fires on the 6-minute-old hold, not at the 600 s ceiling; the skip is journaled."""
     events = []
+    swept = []
     counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=6, reset_result=False)
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
 
+    async def sweep(*a, **k):
+        swept.append(k.get("context"))
+        return False
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", sweep)
     ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
     assert ran is True
     assert counters["resets"] == 1, "the grace-time galaxy reset still fires"
-    assert counters["reboots"] == 0 and counters["power_cycles"] == 0, "a 6-minute-old hold must not reach a host rung"
-    assert "host_rung_deferred_until_ladder_end" in events
+    assert len(swept) == 1, "the last-chance sweep still runs before the host rung (I22)"
+    assert counters["reboots"] == 1 and counters["power_cycles"] == 0
+    assert "host_rung_not_deferred" in events and "host_rung_deferred_until_ladder_end" not in events
+    assert counters["dirty_cleared"] == 0, "nothing releases the device without a passing full check"
+
+
+@pytest.mark.asyncio
+async def test_present_mesh_failed_reset_whose_sweep_recovers_does_not_climb(monkeypatch, clear_job_state):
+    """Spec 04 I79: the no-wait climb still stops at a sweep that ends the hold."""
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=6, reset_result=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
+
+    async def sweep(*a, **k):
+        return True
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", sweep)
+    assert await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0
 
 
 # (ladder-v2 removed the watchdog's separate risky-floor window; the general ceiling window is now
@@ -13740,12 +13762,14 @@ async def test_a_second_escalation_after_an_unverified_reset_sweeps_instead_of_r
     assert ran is True
     assert counters["resets"] == 0, "no second identical reset on an episode whose reset came back UNKNOWN"
     assert len(sweeps) == 1 and sweeps[0].get("fabric_77_unverified") is True
-    assert climbs == [{"swept": True}], "a sweep that did not recover climbs, with the sweep marked spent"
+    assert climbs == [
+        {"swept": True, "ladder_ran": True}
+    ], "a sweep that did not recover climbs, with the sweep marked spent"
 
     ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
     assert ran is True and counters["resets"] == 0
     assert len(sweeps) == 1, "one sweep per episode: the next escalation climbs without a second one"
-    assert climbs == [{"swept": True}, {"swept": True}]
+    assert climbs == [{"swept": True, "ladder_ran": True}] * 2
 
 
 @pytest.mark.asyncio
@@ -13794,7 +13818,7 @@ async def test_a_sweep_that_still_reads_77_holds_and_pages_once_instead_of_climb
         assert climbs == [], "a 77 is no measured fault: never a host rung"
         assert alerts == ["fabric_unverified_no_host_rung"], "one page per episode"
     else:
-        assert climbs == [{"swept": True}] * 2
+        assert climbs == [{"swept": True, "ladder_ran": True}] * 2
         assert alerts == []
     assert counters["reboots"] == 0 and counters["power_cycles"] == 0
 
@@ -13840,7 +13864,7 @@ async def test_a_sweep_still_reading_77_with_no_known_cause_climbs_to_the_host_r
     counters, climbs, alerts = _arm_sweep_still_77(monkeypatch)
     g = srv.galaxy_recovery
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert climbs == [{"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE}]
+    assert climbs == [{"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True, "cold": False}]
     assert alerts == [], "the host rung is the automatic end; no operator page yet"
     assert srv.recovery_mechanism.unverified_77_host_rung_since == srv.device_hold_episode_since
 
@@ -13893,6 +13917,72 @@ async def test_a_boot_the_77_host_rung_brought_up_hands_off_instead_of_climbing_
     assert await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     assert bool(climbs) is climbs_again
     assert [a["kind"] for a in alerts] == ([] if climbs_again else ["fabric_unverified_operator_handoff"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action,cold_climb",
+    [("reboot", True), ("power-cycle", False)],
+)
+async def test_a_boot_the_77_reboot_brought_up_climbs_cold_once_and_a_power_cycle_boot_hands_off(
+    monkeypatch, clear_job_state, action, cold_climb
+):
+    """Spec 04 I79: with a power cycle opted in, the boot the 77 climb's warm reboot brought up (no
+    fabric pass since the start) owes the climb at once and takes the cold rung, never a second
+    reboot and never an operator page first. The boot that power cycle brought up is spent and goes
+    to an operator, still held."""
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    counters, climbs, alerts = _arm_sweep_still_77(monkeypatch)
+    monkeypatch.setattr(srv.FABRIC_DEBT, "passed_since_start", False)
+    monkeypatch.setattr(
+        srv.recovery_mechanism,
+        "boot_from_broker_escalation",
+        lambda boot: {"action": action, "reason": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE},
+    )
+    g = srv.galaxy_recovery
+    assert g._fabric_77_cold_rung_due() is cold_climb
+    assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    if cold_climb:
+        assert [c.get("cold") for c in climbs] == [True]
+        assert alerts == []
+    else:
+        assert climbs == []
+        assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"]
+    assert counters["dirty_cleared"] == 0, "held: only a passing full check releases it"
+
+
+def test_an_owed_77_hold_skips_the_i40_retries_and_the_i48_backoff_and_a_first_time_77_keeps_them(
+    monkeypatch, clear_job_state
+):
+    """Spec 04 I79 / spec 03 I40, I48: a 77 hold whose episode reset came back UNKNOWN reaches the I40
+    bound on its first re-check and re-checks on the first backoff step only. A first-time 77 (no
+    reset on the episode, not a 77-rung boot) keeps its three retries and the full backoff."""
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 30))
+    monkeypatch.setattr(srv.fsm.record, "since", since)
+    monkeypatch.setattr(srv, "device_hold_episode_since", "2026-10-17T00:00:00")
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: False)
+    monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
+    monkeypatch.setattr(srv.FABRIC_DEBT, "passed_since_start", False)
+    monkeypatch.setattr(srv.recovery_mechanism, "boot_from_broker_escalation", lambda boot: None)
+    monkeypatch.setattr(srv.recovery_mechanism, "unverified_77_host_rung_since", None)
+
+    monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", None)
+    assert srv._fabric_77_climb_owed() is False
+    assert srv._fabric_77_bound_reached() is False, "a first-time 77 keeps its I40 retries"
+    monkeypatch.setattr(srv, "_fabric_77_recheck_since", srv.fsm.record.since)
+    monkeypatch.setattr(srv, "_fabric_77_rechecks", 1)
+    monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", time.monotonic() - 130)
+    assert srv._fabric_77_recheck_due() is False, "a first-time 77 waits its 300 s second step"
+
+    monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", srv.device_hold_episode_since)
+    monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
+    assert srv._fabric_77_climb_owed() is True
+    assert srv._fabric_77_bound_reached() is True, "an owed 77 falls back on its first re-check"
+    monkeypatch.setattr(srv, "_fabric_77_recheck_since", srv.fsm.record.since)
+    assert srv._fabric_77_recheck_due() is True, "an owed 77 re-checks on the 120 s step, not 300 s"
+
+    monkeypatch.setattr(srv.recovery_mechanism, "unverified_77_host_rung_since", srv.device_hold_episode_since)
+    assert srv._fabric_77_climb_owed() is False, "once its host rung fired, the episode owes no climb"
 
 
 @pytest.mark.asyncio
@@ -13968,31 +14058,22 @@ def _arm_77_host_rung_end_to_end(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_77_host_rung_deferred_by_a_young_hold_pages_no_one_then_fires_at_the_ceiling(
-    monkeypatch, clear_job_state
-):
-    """Spec 04 I29: a 77 climb that only waits for the ladder ceiling (hold age 250 s < 600 s, AUTO_REBOOT=1)
-    pages no operator, leaves no hand-off and logs no host rung; the next escalation retries it. At 700 s
-    the reboot fires under the 77 cause and no hand-off is left. Held throughout: never released unverified.
-    Fails on 9a9f3ea, which paged at 250 s and left that stale hand-off on /health after the reboot."""
+async def test_an_owed_pass_77_reaches_the_host_rung_after_the_sweep_not_at_the_ceiling(monkeypatch, clear_job_state):
+    """Spec 04 I79: a 77 hold whose reset came back UNKNOWN and whose sweep still reads 77 climbs at
+    the sweep's end, on a 250 s-old hold, not at the 600 s ceiling: the reboot fires under the 77 cause,
+    no page, no hand-off. Held throughout: never released unverified. Fails on 4485fb8, which deferred
+    it to the ceiling and so fired the rung about 18.5 min into the hold."""
     counters, g, alerts, reasons, events, age = _arm_77_host_rung_end_to_end(monkeypatch)
     age["v"] = 250
-    for _ in range(2):
-        assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert alerts == [], "a climb deferred to the ladder ceiling pages no one"
-    assert g.fabric_77_handoff_status(srv.device_hold_episode_since) is None
-    assert reasons == [] and "fabric_unverified_host_rung" not in events
-    assert events.count("host_rung_deferred_until_ladder_end") == 2
-    assert srv.recovery_mechanism.unverified_77_host_rung_since is None, "a deferred rung is not spent"
-
-    age["v"] = 700
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    assert "host_rung_deferred_until_ladder_end" not in events
+    assert "host_rung_not_deferred" in events
     assert reasons == [galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE]
-    assert events.count("fabric_unverified_host_rung") == 1
     assert events.index("fabric_unverified_host_rung") < events.index("stuck_hold_host_escalation")
     assert alerts == [] and g.fabric_77_handoff_status(srv.device_hold_episode_since) is None
     assert srv.recovery_mechanism.unverified_77_host_rung_since == srv.device_hold_episode_since
     assert counters["resets"] == 0 and counters["dirty_cleared"] == 0, "held, never released unverified"
+    assert g.fabric_77_climb_owed(srv.device_hold_episode_since) is False, "the fired rung is spent"
 
 
 @pytest.mark.asyncio

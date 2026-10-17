@@ -521,7 +521,8 @@ job boundary.
   Each idle-relift pass that 77s again on the same 77-only hold episode (I34) counts one retry.
   After `TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES` (3) retries, or once the episode is
   `TT_DEVICE_MCP_FABRIC_77_BOUND_SEC` (600 s) old with at least one retry behind it (a hugepage 77,
-  I48, needs none), the broker
+  I48, needs none), or on the first retry of a hold that owes the climb (04 I79: its reset already came
+  back UNKNOWN, or this boot is a 77 reboot's result with the cold rung due), the broker
   journals `fabric_check_unrunnable_bound` (on every such pass), sends the alert hook (I37) once
   per hold episode (a page the hook dropped goes out on the next pass) and gates on the startup
   checks instead of the fabric pass: enum+ARC (already passed on that relift) plus a positively
@@ -633,7 +634,8 @@ job boundary.
 - **I48 — A 77-only hold re-checks on a backoff and is never stranded.** The idle relift re-runs
   the fabric pass of a 77-only hold (I34) only once its next step of
   `TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC` is due (comma-separated seconds, default `120,300,600,1200`,
-  each clamped to 60..1200 s, the last step repeating; a malformed value reads as the default). The
+  each clamped to 60..1200 s, the last step repeating; a malformed value reads as the default; a hold
+  that owes the climb, 04 I79, uses the first step only). The
   first step counts from the hold's opening, each later one from the last re-check that read a 77
   again. An owed startup pass (I39) is not held back. The I40 bound's third retry so lands about
   17 min into the episode, and a hold nothing could end gets a fresh pass every 20 min rather than on

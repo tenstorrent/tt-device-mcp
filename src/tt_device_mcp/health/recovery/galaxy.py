@@ -2299,7 +2299,9 @@ class GalaxyRecovery(Recovery):
         # reboot/power cycle recovers and self-heal never will. Before the ceiling the climb defers
         # the host rungs (journaled) and the grace cadence retries the reset; at the ceiling the
         # climb hands the mesh to the gate's host rung, or to an operator when there is none (I36).
-        await self._climb_or_hand_off(expected, off_bus_before, hold_since, log)
+        await self._climb_or_hand_off(
+            expected, off_bus_before, hold_since, log, present_reset_failed=off_bus_before == 0
+        )
         return True
 
     async def _offbus_gated_power_cycle(self, off_bus: int, expected: int, hold_since: str, log) -> Optional[bool]:
@@ -2870,11 +2872,18 @@ class GalaxyRecovery(Recovery):
         health_event("reset_rung_skipped_failed_unchanged", rung="mesh_reset", held_since=hold_since, off_bus=off_bus)
         await self._climb_or_hand_off(expected, off_bus, hold_since, log)
 
-    async def _climb_or_hand_off(self, expected: int, off_bus: Optional[int], hold_since: str, log) -> None:
+    async def _climb_or_hand_off(
+        self, expected: int, off_bus: Optional[int], hold_since: str, log, *, present_reset_failed: bool = False
+    ) -> None:
         """Climb a failed (or skipped) reset to the host rung. With no host rung available the hold goes
         to an operator, once per episode, and no further reset fires on it while its off-bus set stays
         the same (spec 04 I36, I33)."""
-        if await self._climb_to_host_recovery_after_failed_reset(expected, off_bus, log) != NO_HOST_RUNG:
+        if (
+            await self._climb_to_host_recovery_after_failed_reset(
+                expected, off_bus, log, present_reset_failed=present_reset_failed
+            )
+            != NO_HOST_RUNG
+        ):
             return
         offbus_power_cycle.note_hold_handoff(
             hold_since,
@@ -2942,7 +2951,14 @@ class GalaxyRecovery(Recovery):
                     )
 
                 outcome = await self._climb_to_host_recovery_after_failed_reset(
-                    expected, off_bus_before, log, swept=True, cause=FABRIC_77_HOST_RUNG_CAUSE, on_fire=on_fire
+                    expected,
+                    off_bus_before,
+                    log,
+                    swept=True,
+                    cause=FABRIC_77_HOST_RUNG_CAUSE,
+                    on_fire=on_fire,
+                    ladder_ran=True,
+                    cold=self._fabric_77_cold_rung_due(),
                 )
                 if outcome == HOST_RUNG_FIRED:
                     self.mechanism.unverified_77_host_rung_since = hold_since
@@ -2954,7 +2970,9 @@ class GalaxyRecovery(Recovery):
                 spent = "the host rung could not run (not opted in, rate-limited or a tenant holds the mesh)"
             self._hand_77_hold_to_operator(hold_since, expected, spent, log)
             return
-        await self._climb_to_host_recovery_after_failed_reset(expected, off_bus_before, log, swept=True)
+        await self._climb_to_host_recovery_after_failed_reset(
+            expected, off_bus_before, log, swept=True, ladder_ran=True
+        )
 
     def _fabric_77_host_rung_spent(self, hold_since: str) -> str:
         """Why this 77 episode's one host rung is spent, or "" (spec 04 I29): it already fired on this
@@ -2966,9 +2984,29 @@ class GalaxyRecovery(Recovery):
         if FABRIC_DEBT.passed_since_start:
             return ""
         rec = self.mechanism.boot_from_broker_escalation(self.deps.current_boot_id())
-        if rec and str(rec.get("reason", "")) == FABRIC_77_HOST_RUNG_CAUSE:
+        if rec and str(rec.get("reason", "")) == FABRIC_77_HOST_RUNG_CAUSE and not self._fabric_77_cold_rung_due():
             return f"this boot is the {rec.get('action')} that rung fired, and the fabric still reads 77"
         return ""
+
+    def _fabric_77_cold_rung_due(self) -> bool:
+        """Whether this boot is the warm reboot a 77 climb fired, the fabric has not passed since the
+        broker started, and a power cycle is opted in: the climb then takes the cold rung, once
+        (spec 04 I79). A boot that is that power cycle's result is spent and goes to an operator."""
+        if FABRIC_DEBT.passed_since_start:
+            return False
+        rec = self.mechanism.boot_from_broker_escalation(self.deps.current_boot_id())
+        if not rec or str(rec.get("reason", "")) != FABRIC_77_HOST_RUNG_CAUSE or rec.get("action") != "reboot":
+            return False
+        return bool(self.deps.host_escalation_kwargs()["auto_power_cycle_enabled"]())
+
+    def fabric_77_climb_owed(self, hold_since: str) -> bool:
+        """Whether a 77-only hold owes the climb at once rather than the I40/I48 waits (spec 04 I79):
+        its one reset already came back UNKNOWN on this episode, or this boot is the warm reboot an
+        earlier 77 climb fired and the cold rung is still due. False once this episode's host rung has
+        fired. Counts nothing; the caller decides."""
+        if not hold_since or self.mechanism.unverified_77_host_rung_since == hold_since:
+            return False
+        return self.mechanism.unverified_reset_since == hold_since or self._fabric_77_cold_rung_due()
 
     def _hand_77_hold_to_operator(self, hold_since: str, expected: int, why: str, log) -> None:
         """A 77 the host rung did not end: keep the device held and page an operator once per episode
@@ -3043,6 +3081,9 @@ class GalaxyRecovery(Recovery):
         swept: bool = False,
         cause: str = "",
         on_fire: Optional[Callable[[], None]] = None,
+        ladder_ran: bool = False,
+        cold: bool = False,
+        present_reset_failed: bool = False,
     ) -> str:
         """Climb an idle escalation whose galaxy reset failed to revive the mesh to the host rung — a
         warm reboot, then a BMC power cycle above it — so a reset that did not recover does not sit.
@@ -3140,6 +3181,27 @@ class GalaxyRecovery(Recovery):
                 ceiling_sec=_stuck_hold_ceiling_sec(),
                 reason="mesh_reset_failed_unchanged",
             )
+        elif (
+            (ladder_ran or (present_reset_failed and off_bus == 0))
+            and hold_age is not None
+            and hold_age < _stuck_hold_ceiling_sec()
+        ):
+            # This hold already ran its reset and failed the full check after it on a present mesh (an
+            # eth/fabric wedge), or ran the reset and the full last-chance sweep and still failed: the
+            # ceiling wait has no rung left to try. A present mesh still runs the sweep below before the
+            # host rung; one already swept climbs now (spec 04 I79).
+            log(
+                f"this {int(hold_age)}s-old hold's reset "
+                + ("and the full last-chance sweep both failed" if ladder_ran else "failed its check on a present mesh")
+                + f" — not waiting for the {_stuck_hold_ceiling_sec()}s ladder end"
+            )
+            health_event(
+                "host_rung_not_deferred",
+                held_since=hold_since,
+                held_age_sec=int(hold_age),
+                ceiling_sec=_stuck_hold_ceiling_sec(),
+                reason="reset_and_sweep_failed" if ladder_ran else "present_mesh_reset_failed",
+            )
         elif hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
             log(
                 f"mesh unrecovered after the reset ladder but the hold is only {int(hold_age)}s "
@@ -3160,7 +3222,9 @@ class GalaxyRecovery(Recovery):
         # recover it — never hold below the floor. Mark it warm-reboot-futile so the chooser routes it
         # straight to the cold rung; the reboot floor only ever gated the mesh reset, not the power cycle.
         below_floor_offbus = 0 < off_bus < reboot_floor
-        warm_reboot_futile = (
+        # ``cold``: this boot is the warm reboot an earlier 77 climb fired and the fabric still reads 77,
+        # so a second reboot is futile and the cold rung is the one left (spec 04 I79).
+        warm_reboot_futile = cold or (
             expected > 1
             and off_bus > 0
             and (reset_regressed or episode_regressed or self.mechanism.last_reset_exit_nonzero or below_floor_offbus)
