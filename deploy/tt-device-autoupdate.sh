@@ -96,17 +96,26 @@ echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >
 # The stamp is written just before the restart, so a failed apply retries on the next lap.
 # The limit is for a healthy broker only: a broker that is not running, restarts itself, holds the
 # device or fails its health check may be broken by the last apply, and the next sha may be its
-# fix, so it applies at once (broker_broken below). Escape by hand: rm "$ROOT/last-apply" (the
+# fix, so it applies at once (broker_broken below). A broker still in its startup check is booting,
+# not broken, and stays limited, for a bounded time. Escape by hand: rm "$ROOT/last-apply" (the
 # config file sourced above wins over an env override on the command line).
 LAST_APPLY="$ROOT/last-apply"
 LAST_APPLY_NRESTARTS="$ROOT/last-apply-nrestarts"
 MIN_APPLY="${TTDEV_MIN_APPLY_INTERVAL_SEC:-0}"
-# Why the broker is not a healthy one to rate-limit, or nothing. Not active (failed, activating,
-# inactive); systemd restarted it since the last apply (NRestarts grew past the count saved right
-# after that apply's restart: a crash loop); or /health silent, held, or an FSM that is
-# recovering/down. "boot" is the startup check in progress, not a fault: it ends healthy or held.
+# Every start opens RECOVERING(startup_unverified) and holds the device until the startup check
+# passes: the hugepage wait (STARTUP_HUGEPAGES_WAIT_SEC, 120 s, spec 03 I33) and then one full gate
+# pass with its fabric check (436 s at most, spec 04 reset duration bound). That is a broker
+# booting, not a broken one, so it stays limited for STARTUP_BOUND from the last apply: 120 + 436
+# s plus 44 s for the restart itself. Past the bound it counts as broken. A failed startup check
+# names its fault in fsm_why (and a dirty episode is held as one), so it is broken at once.
+STARTUP_BOUND=600
+# Why the broker is not a healthy one to rate-limit, or nothing; $1 is the seconds since the last
+# apply. Not active (failed, activating, inactive); systemd restarted it since the last apply
+# (NRestarts grew past the count saved right after that apply's restart: a crash loop); /health
+# silent; or an FSM that is recovering/down or holds the device, unless that is the startup check
+# above, within STARTUP_BOUND, held for nothing but that check.
 broker_broken() {
-    local st n base h
+    local st n base h age="${1:-0}"
     st="$(systemctl is-active tt-device-broker 2>/dev/null)"
     if [ "$st" != active ]; then echo "is ${st:-unknown}, not active"; return; fi
     n="$(systemctl show tt-device-broker -p NRestarts --value 2>/dev/null)"
@@ -118,6 +127,16 @@ broker_broken() {
     fi
     h="$(curl -s --max-time 5 --unix-socket /run/tt-device-broker/broker.sock http://localhost/health 2>/dev/null)"
     if [ -z "$h" ]; then echo "does not answer /health"; return; fi
+    if printf '%s' "$h" | grep -Eq '"fsm_state": *"recovering"' \
+            && printf '%s' "$h" | grep -Eq '"fsm_why": *"startup_unverified"'; then
+        if [ "$age" -gt "$STARTUP_BOUND" ]; then
+            echo "is still in its startup check ${age}s after the last apply (bound ${STARTUP_BOUND}s)"; return
+        fi
+        if ! printf '%s' "$h" | grep -Eq '"held": *true' \
+                || printf '%s' "$h" | grep -Eq '"held_reason": *"device unverified: '; then
+            return   # booting: the startup check is running
+        fi
+    fi
     if printf '%s' "$h" | grep -Eq '"held": *true'; then echo "holds the device"; return; fi
     if printf '%s' "$h" | grep -Eq '"fsm_state": *"(recovering|down)"'; then
         echo "fails its health check (fsm $(printf '%s' "$h" | grep -Eo '"fsm_state": *"[a-z]*"' | grep -Eo '[a-z]*"$' | tr -d '"'))"
@@ -130,7 +149,7 @@ if [ "$MIN_APPLY" -gt 0 ] 2>/dev/null; then
     # Read base 10, so a hand-written leading zero is not taken for octal.
     case "$last" in ''|*[!0-9]*) last="" ;; *) last=$(( 10#$last )) ;; esac
     if [ -n "$last" ] && [ "$last" -le "$now" ] && [ $(( now - last )) -lt "$MIN_APPLY" ]; then
-        broken="$(broker_broken)"
+        broken="$(broker_broken "$(( now - last ))")"
         if [ -z "$broken" ]; then
             echo "autoupdate: rate-limited: last apply $(( now - last ))s ago (min ${MIN_APPLY}s); ${remote_sha:0:9} applies in $(( last + MIN_APPLY - now ))s" >&2
             exit 0

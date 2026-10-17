@@ -8,12 +8,19 @@ included. With TTDEV_MIN_APPLY_INTERVAL_SEC set, a burst of pushes becomes one r
 newest sha. The laps below run the script's own lines, cut from it, under a fake clock and a stub
 `systemctl restart` that records each restart. The limit is for a healthy broker only: one that is
 down, restarting itself, holding the device or failing its health check applies a new sha at once.
+A broker in its startup check is booting, not broken, and stays limited for a bounded time.
 """
 
+import json
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from tt_device_mcp import server as srv
+from tt_device_mcp.constants import FABRIC_CHECK_TIMEOUT_SEC
+from tt_device_mcp.fsm import ServerFsm
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"
 
@@ -144,16 +151,76 @@ def test_a_broken_broker_applies_a_new_sha_inside_the_interval(tmp_path, state):
     "broker",
     [
         dict(),
-        dict(health='{"status":"ok","held":false,"fsm_state":"boot","fsm_why":null}'),
         dict(health='{"status": "ok", "held": false, "fsm_state": "healthy"}'),
     ],
-    ids=["healthy", "startup-check-in-progress", "spaced-json"],
+    ids=["healthy", "spaced-json"],
 )
 def test_a_healthy_broker_stays_rate_limited(tmp_path, broker):
     _lap(tmp_path, now=10_000, sha="a1", interval=3600)
     done, restarts, _ = _lap(tmp_path, now=10_060, sha="b2", interval=3600, **broker)
     assert restarts == ["10000 a1"], done.stderr
     assert "rate-limited" in done.stderr, done.stderr
+
+
+def _startup_health(tmp_path, monkeypatch, *, op=False, fault=None, dirty=False):
+    """The /health body the broker itself serves right after a start: the real _health_payload()
+    once fsm.boot_merge() has opened RECOVERING(startup_unverified). `op` is the startup gate
+    running (a broker device op); `fault` is a failed startup check holding for its fault; `dirty` is a
+    fault found during the startup check (a dead chip, say), which keeps the why and marks the episode
+    dirty: held for that fault, not for the check."""
+    f = ServerFsm(tmp_path / "fsm.json")
+    monkeypatch.setattr(srv, "fsm", f)
+    f.boot_merge(open_episode=None)
+    if op:
+        monkeypatch.setattr(srv, "device_op_active", "health-gate")
+    if fault:
+        f.on_fault(fault, detail="startup gate failed", dirty=False)
+    if dirty:
+        f.on_fault("heartbeat", detail="chip 3 heartbeat frozen")
+    body = json.dumps(srv._health_payload())
+    assert "'" not in body
+    return body
+
+
+def _startup_bound():
+    return int(re.search(r"^STARTUP_BOUND=(\d+)$", _SCRIPT.read_text(), re.M).group(1))
+
+
+def test_the_startup_bound_covers_the_hugepage_wait_and_the_fabric_check():
+    assert _startup_bound() >= srv.STARTUP_HUGEPAGES_WAIT_SEC + FABRIC_CHECK_TIMEOUT_SEC
+
+
+@pytest.mark.parametrize("op", [False, True], ids=["held-for-the-startup-check", "startup-gate-running"])
+def test_a_booting_broker_stays_rate_limited(tmp_path, monkeypatch, op):
+    # Every start is RECOVERING(startup_unverified) until its startup check passes; within the
+    # bound that is a broker booting, and a push then waits out the interval.
+    health = _startup_health(tmp_path, monkeypatch, op=op)
+    assert '"fsm_state": "recovering"' in health and '"fsm_why": "startup_unverified"' in health
+    _lap(tmp_path, now=10_000, sha="a1", interval=3600)
+    for t in (10_060, 10_000 + _startup_bound()):
+        done, restarts, _ = _lap(tmp_path, now=t, sha="b2", interval=3600, health=health)
+        assert restarts == ["10000 a1"], done.stderr
+        assert "rate-limited" in done.stderr, done.stderr
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["past-the-bound", "startup-check-failed", "startup-episode-dirty"],
+)
+def test_a_startup_check_past_its_bound_or_held_applies_at_once(tmp_path, monkeypatch, case):
+    health = _startup_health(
+        tmp_path,
+        monkeypatch,
+        fault="fabric_unverified" if case == "startup-check-failed" else None,
+        dirty=case == "startup-episode-dirty",
+    )
+    if case == "startup-episode-dirty":
+        assert '"fsm_why": "startup_unverified"' in health and '"held": true' in health
+    _lap(tmp_path, now=10_000, sha="a1", interval=3600)
+    t = 10_001 + _startup_bound() if case == "past-the-bound" else 10_060
+    done, restarts, _ = _lap(tmp_path, now=t, sha="b2", interval=3600, health=health)
+    assert restarts == ["10000 a1", f"{t} b2"], done.stderr
+    assert "rate limit skipped: the broker" in done.stderr and "b2 applies now" in done.stderr, done.stderr
 
 
 def test_the_crash_loop_baseline_is_the_count_after_the_last_apply(tmp_path):
