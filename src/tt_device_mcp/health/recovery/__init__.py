@@ -603,7 +603,7 @@ class Recovery(ABC):
             except OSError as e:
                 log(f"PCI rescan could not run ({e}); falling through to the heavier rungs")
             else:
-                back = [i for i in still_dead if Path(f"/sys/class/tenstorrent/tenstorrent!{i}").exists()]
+                back = [i for i in still_dead if (pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}").exists()]
                 # The rescan may bring back more than the chips this pass targeted.
                 back = sorted(set(back) | set(drop_returned_isolated(isolated_chips, "PCI rescan", log)), key=int)
                 if back:
