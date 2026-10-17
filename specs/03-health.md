@@ -164,7 +164,9 @@ job boundary.
   journaled (`dead_chip_holders_lingering`) and the removal goes ahead as before: the episode is
   dirty, so the device stays held until recovery's reset and full post-reset check, fabric
   included, pass. Time to recover (dead chip): zero added when the killed holders are already
-  gone (one scan), the release time when one lingers, at most 30 s.
+  gone (one scan), the release time when one lingers, at most 30 s. A killed holder still alive
+  and stuck in the kernel on the chip at the bound is spec 04 I77: no rung re-enumerates PCI under
+  it, and the host rung follows within 120 s.
 - **I20 — A stalled sampler withholds the systemd watchdog ping.** The escalation ladder must
   never sit silently behind a dead sampler; a stall past `STALL_SEC` gets the broker restarted.
 - **I21 — The idle relift lifts a hold only on proof, read-only for self-heal holds.**
