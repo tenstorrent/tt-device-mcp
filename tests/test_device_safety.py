@@ -2939,7 +2939,7 @@ def _reset_that_fails(monkeypatch, rc=1):
 
 @pytest.mark.asyncio
 async def test_a_failed_reset_on_a_held_mesh_leaves_the_pollers_stopped(monkeypatch):
-    """g15blx02 10-16: a hold-deadline mesh reset exited 1 with 8/32 chips still off the bus, and the
+    """A hold-deadline mesh reset exited 1 with 8/32 chips still off the bus, and the
     reset's restore started tt-telemetry anyway. It re-opened every chip, failed UMD init and
     crash-looped every ~35 s for hours over the hold. A restore on a device that is not HEALTHY
     (held, recovering) keeps the pollers stopped and says so."""
@@ -2988,7 +2988,7 @@ async def test_deferred_pollers_start_once_the_device_is_verified_healthy(monkey
 
 @pytest.mark.asyncio
 async def test_the_startup_quiesce_keeps_the_pollers_stopped_when_the_gate_holds(monkeypatch):
-    """The startup fabric block (g15blx02 10-16 11:28 and 12:12 PDT): the forced gate held the mesh
+    """The startup fabric block: the forced gate held the mesh
     with 8/32 off the bus, and the block's exit restarted tt-telemetry onto it. A hold at the
     block's exit keeps them stopped; a pass starts them as before."""
     monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)

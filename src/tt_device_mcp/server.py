@@ -4912,8 +4912,8 @@ _pollers_owed: Optional[str] = None
 def _pollers_unfit_reason() -> Optional[str]:
     """Why the device is not fit for the pollers to start on, or None. Only a HEALTHY FSM is: every
     route to it is a passing gate (spec 03), and every reset leaves the FSM off it until then. A
-    poller started on a held mesh re-opens every chip in a loop, chips off the bus included: on
-    g15blx02 tt-telemetry crash-looped every ~35 s for hours over an 8/32 off-bus hold."""
+    poller started on a held mesh re-opens every chip in a loop, chips off the bus included: a
+    telemetry poller crash-looped every ~35 s over a 32-chip mesh held with 8 chips off the bus."""
     rec = fsm.record
     if rec.state is ServerState.HEALTHY:
         return None
