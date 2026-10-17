@@ -6377,6 +6377,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
                 "cause": cooldown["cause"],
                 "interval_sec": cooldown["interval_sec"],
                 "why": cooldown["why"],
+                # Spec 04 I72: power-cycle requests this boot that never took the host down.
+                "missed_requests": cooldown.get("missed", 0),
             }
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None

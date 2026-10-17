@@ -191,9 +191,10 @@ async def test_a_whole_tray_seen_again_among_partial_reads_still_cycles_at_the_d
 ):  # noqa: F811
     """A flapping tray: forced passes alternate a whole-tray read (8 off) and a partial one (3 off)
     inside the cooldown. No read clears the episode's whole-tray clock, every pass holds with the
-    same stated deadline, and the first pass at the deadline cycles, whichever read it sees."""
-    _replay(cool, monkeypatch, now=CYCLE_2 + 600)
-    until = CYCLE_2 + recovery_base.power_cycle_interval_sec(2)
+    same stated deadline, and the first pass at the deadline cycles, whichever read it sees. Here the
+    second cycle took the host down (boot C), so it counts as a cycle (spec 04 I72)."""
+    _replay(cool, monkeypatch, now=CYCLE_2 + 600, boot_btime=CYCLE_2 + 120, boot_id="boot-C")
+    until = CYCLE_2 + 120 + recovery_base.power_cycle_interval_sec(2)
     for i, off in enumerate((8, 3, 8, 3, 3, 8)):
         cool["clk"][0] = CYCLE_2 + 600 + i * 300
         assert await cool["g"]._offbus_gated_power_cycle(off, EXPECTED, gated, lambda m: None) is False

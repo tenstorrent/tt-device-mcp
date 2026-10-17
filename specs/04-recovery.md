@@ -882,15 +882,18 @@ each rung fires only when the gentler one failed or cannot apply.
   the governor's one check for this rung, not a second gate. After two consecutive broker power
   cycles with no verified release between them it doubles for each further one, capped at 4 h:
   30 min, 30 min, 1 h, 2 h, then 4 h. A verified release (the full health check, fabric included,
-  with no I32 debt) ends the streak (`power_cycle_healed.json` in the health dir). While the cooldown
+  with no I32 debt) ends the streak (`power_cycle_healed.json` in the health dir). The streak starts
+  at the later of that heal file and the last verified release (I9, `auto_recovery_verified.json`),
+  heal file or not: a cycle a verified release on a later boot followed healed the box and never
+  counts (a release written before the heal file existed left none). While the cooldown
   runs the device stays held, the journal says `power cycle in cooldown until <time>, <n>s more
   (last cycle/boot <time>, <cause>; <n>s cooldown) — this is the boot-loop guard`, and `/health` carries `power_cycle_cooldown` with
   `escalation_stage` `power-cycle`, `next_deadline`, the anchor, its cause and the interval. No other
   rung runs in its place: classes A and C stay on the I37 path. At the deadline the hold-deadline
   watchdog asks once (a forced escalation in the same hold episode), and the cycle fires then if the
   fault persists, behind I37's stand-back, tenant and scope guards. Every governor denial names its
-  end: the per-boot cap counts only records within the interval, so a cycle requested this boot that
-  never took the box down is asked again at the interval's end rather than never. There an unreadable
+  end: the per-boot cap counts only records within the interval and never a missed request (I72),
+  which is asked again on its own short backoff rather than never. There an unreadable
   stamp counts as the boot's start (a fixed end, not now), a stamp later than now does not count for
   the power cycle, and with the boot's start known an unreadable power-cycle record never refuses the
   rung for good. A cap or backstop (I9) denial of the power cycle shows on `/health` like the
@@ -910,6 +913,27 @@ each rung fires only when the gentler one failed or cannot apply.
   never a boot loop, never an open-ended hold. Class A or C after a cycle a later boot verified, at
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
+
+- **I72 — A power-cycle request that never took the host down is a missed attempt, asked again
+  within 15 min.** The power-cycle command can return while the cycle never happens (an unreachable
+  BMC, a cycler that failed after it detached). A request whose pending window
+  (`host_action_pending_sec`) ran out with the host still up on the same boot is marked
+  `took_host_down: false` in the I9 ledger, on disk, so a later boot still reads it as no cycle; a
+  same-boot row older than the window reads as missed after a broker restart too. A missed request
+  anchors no I65 cooldown, counts toward neither its doubling nor the per-boot cap nor the I9 backstop,
+  and is not a broker escalation that brought a later boot up. It is asked again
+  `POWER_CYCLE_MISS_RETRY_SEC` after its window: 5 min, 10 min, then every 15 min, never stopping.
+  Each miss journals `power_cycle_request_missed` with the count and the retry time; from the second
+  miss on an operator is paged (about once an hour) to check the BMC and the power-cycle command
+  while the retries go on. The retry is a stated deadline like the cooldown's: `/health`
+  `power_cycle_cooldown` shows it with cause `missed power-cycle request` and `missed_requests` (0
+  for a plain cooldown), and the hold-deadline watchdog asks again at it, through the same I37
+  path, stand-back, tenant and scope guards. The count runs from the later of this boot and the last
+  verified release; a verified release clears it. A cycle that did take the host down still anchors
+  and doubles the cooldown (I65), and its release waits for the full post-reset check, fabric
+  included (03 I4, I32). Time to recover for class A and B2 with a BMC that does not answer: from
+  30 min-4 h (each miss anchored and doubled the cooldown) to at most 15 min after the BMC answers
+  again (one 5/10/15-min retry after each 15-min window).
 
 ## Interfaces
 
@@ -1397,6 +1421,10 @@ sees a silent fabric pass.
 | I65 a whole tray still off hours after a cycle that never took the host down cycles at once; inside the cooldown it holds with the deadline on /health and cycles at its end; an external reboot counts toward the cooldown; the off-bus (I27) path holds with a deadline and no ladder; an operator attempt spacing is a stated wait capped at the backoff cap, default none; a whole tray seen again among partial reads still cycles | `tests/test_whole_tray_cycle_every_boot.py::test_a_restart_hours_after_a_cycle_that_never_went_down_cycles_at_once`, `::test_inside_the_cooldown_the_hold_shows_its_deadline_and_cycles_when_it_ends`, `::test_an_external_reboot_counts_toward_the_cooldown_and_the_cycle_follows_it`, `::test_the_off_bus_path_no_longer_holds_six_hours_on_an_attempt_that_never_went_down`, `::test_the_off_bus_path_inside_the_cooldown_holds_with_a_deadline_and_no_ladder`, `::test_an_operator_attempt_interval_is_a_stated_wait_capped_at_the_backoff_cap`, `::test_the_attempt_interval_default_adds_no_wait_beyond_the_cooldown`, `::test_a_whole_tray_seen_again_among_partial_reads_still_cycles_at_the_deadline` |
 | I65 no recent cycle or boot: the cycle fires at once | `tests/test_power_cycle_cooldown.py::test_with_no_recent_cycle_or_boot_the_cycle_fires_at_once` |
 | I65 only a verified release with no fabric debt ends the streak; a refused one keeps the hold | `tests/test_power_cycle_cooldown.py::test_only_a_verified_release_with_no_fabric_debt_ends_the_streak` |
+| I65 a verified release on a later boot ends the streak with no heal file; one before the cycles does not | `tests/test_power_cycle_missed_request.py::test_a_verified_release_on_a_later_boot_ends_the_streak_without_a_heal_file`, `::test_a_verified_release_before_the_cycles_does_not_end_their_streak` |
+| I72 a missed request is marked on disk and asked again 5, 10, then every 15 min after its window, through the whole-tray path; a restarted broker reads an old same-boot row as missed | `tests/test_power_cycle_missed_request.py::test_a_request_the_host_never_acted_on_is_asked_again_5_min_after_its_window`, `::test_the_retries_back_off_5_10_then_15_min_and_never_stop`, `::test_a_whole_tray_drop_still_goes_to_the_power_cycle_after_a_missed_request`, `::test_a_restarted_broker_still_reads_an_old_same_boot_request_as_missed` |
+| I72 missed requests neither double nor anchor the cooldown nor count toward the cap or backstop, on this boot or the next; the second pages; a real cycle still anchors and doubles | `tests/test_power_cycle_missed_request.py::test_two_missed_requests_leave_the_interval_at_base_and_page`, `::test_a_missed_row_still_counts_for_nothing_on_the_next_boot`, `::test_a_cycle_that_took_the_host_down_still_anchors_the_cooldown_and_doubles` |
+| I72 a retried cycle that heals releases only after the full fabric check, which clears the retry; /health shows the missed count and the next retry | `tests/test_power_cycle_missed_request.py::test_a_retried_cycle_that_heals_releases_only_after_the_full_fabric_check`, `::test_health_shows_the_missed_count_and_the_next_retry`, `::test_health_shows_no_missed_requests_for_a_plain_cooldown` |
 | I65 a failed out-of-band cycle (a second line, same `at_epoch`, cause + ` (cycle failed)`) never counts and cancels its attempt line; an unmatched failure line is ignored; an attempt with no failure line still counts; host boots are unchanged | `tests/test_power_cycle_cooldown.py::test_a_matched_failure_line_drops_the_attempt`, `::test_an_unmatched_failure_line_is_ignored`, `::test_an_attempt_without_a_failure_line_still_counts` |
 | I65 a future, non-finite or unreadable stamp (history file, ledger, heal file) never hides a valid past anchor, never holds the cycle past the stated gap, never keeps the streak past a verified release; every cap denial is on /health | `tests/test_power_cycle_cooldown.py::test_a_nan_or_future_history_line_does_not_hide_the_valid_past_one`, `::test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle`, `::test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health`, `::test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end`, `::test_the_per_boot_cap_denial_shows_on_health`, `::test_a_future_record_does_not_keep_the_streak_past_a_verified_release` |
 | I37/I65 class C at startup: one mesh reset with no failed reset or broker cycle; none after the broker's own cycle, which then waits only for the cooldown | `tests/test_power_cycle_cooldown.py::test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_gets_one_reset`, `::test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_reset`, `::test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not` |
