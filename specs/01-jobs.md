@@ -80,7 +80,9 @@ the queue and a running job outlive the broker process.
   aside (`.finished`), not requeued — nor one whose id a live job holds (ids wrap).
 - **I7** — A re-adopted job keeps its original `timeout_sec` reservation, with time already
   served counted against it (`_readopted_deadline`); re-adoption never grants a fresh
-  clock, and the deadline is enforced by `_monitor_readopted_scope`. A re-adopted
+  clock, and the deadline is enforced by `_monitor_readopted_scope`. A re-adopted job that
+  deadline or a requested kill stopped owes the mesh one reset, then the full check (spec 03
+  I69), paid before the next job's door or by the idle relift. A re-adopted
   preemptable job (header `PREEMPTABLE: yes`) is held to I20 instead: past its deadline it
   is preempted only once another job waits.
 - **I8** — A job's exit status comes from the job itself: the shell preamble
