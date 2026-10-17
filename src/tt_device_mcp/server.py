@@ -3431,7 +3431,7 @@ async def selftest_eth_heartbeat() -> None:
                 env=env,
                 preexec_fn=os.setsid,
             )
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=ETH_CHECK_SELFTEST_BUDGET_SEC)
+            out, _ = await aio.wait_for(proc.communicate(), timeout=ETH_CHECK_SELFTEST_BUDGET_SEC)
             rc = proc.returncode
             dt = (datetime.now() - t0).total_seconds()
             tail = (out.decode("utf-8", "replace") if out else "").strip().splitlines()
@@ -7175,7 +7175,7 @@ async def _preempt_job(job_id: str, pid: Optional[int]) -> None:
     scope's `systemctl stop` can wait longer than the window)."""
     sigint_window = max(1.0, PREEMPT_GRACE_SEC - SIGTERM_GRACE_SEC)
     try:
-        how = await asyncio.wait_for(_terminate_job(job_id, pid, grace_sec=sigint_window), timeout=PREEMPT_GRACE_SEC)
+        how = await aio.wait_for(_terminate_job(job_id, pid, grace_sec=sigint_window), timeout=PREEMPT_GRACE_SEC)
         _log_job_tree_killed(job_id, "preempted (a job waited past its soft limit)", how)
         return
     except asyncio.TimeoutError:
@@ -7569,7 +7569,7 @@ async def _job_output_dir_problems(job: "Job") -> list[str]:
     # A job scoped to another uid gets only its env_vars; a direct one inherits the broker's too.
     inherited = None if scoped else dict(os.environ)
     try:
-        return await asyncio.wait_for(
+        return await aio.wait_for(
             asyncio.to_thread(preflight_output_dirs, job.workspace, job.env_vars or {}, inherited, uid),
             timeout=JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC,
         )
@@ -7825,7 +7825,7 @@ async def _hold_loop(
             )
         # Sleep until a release wakes the hold, or the poll (the governor) or the bound comes due.
         try:
-            await asyncio.wait_for(wake.wait(), timeout=min(TENANT_HOLD_POLL_SEC, max(0.0, bound - held)))
+            await aio.wait_for(wake.wait(), timeout=min(TENANT_HOLD_POLL_SEC, max(0.0, bound - held)))
             gap = TENANT_HOLD_WAKE_MIN_GAP_SEC - (time.monotonic() - last_gate)
             if gap > 0:
                 await asyncio.sleep(gap)
