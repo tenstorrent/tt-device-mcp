@@ -193,17 +193,28 @@ def test_class_d_arc_not_ready_chip_is_present_but_not_alive(held, monkeypatch):
     assert 9 not in row["arc_alive"]
 
 
-def test_fabric_77_only_hold_names_no_forced_rung(held, monkeypatch):
+def test_fabric_77_only_hold_names_the_10_min_bound(held, monkeypatch):
+    """Below the bound a 77-only hold is never forced; at the bound it runs the ladder (spec 04 I76)."""
     monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: True)
     p = _payload()
     assert p["hold_class"] == "D"
-    assert p["next_rung"] is None and p["next_rung_at"] is None
+    assert (p["next_rung_source"], p["next_rung_at"], p["next_rung_due"]) == (
+        "hold ceiling window 1",
+        _iso(START + 600),
+        False,
+    )
+    assert _fires(START + 599, monkeypatch) == [] and _fires(START + 600, monkeypatch) == ["ceiling_window"]
 
 
-def test_force_escalate_off_names_no_forced_rung(held, monkeypatch):
+def test_force_escalate_off_names_the_10_min_bound(held, monkeypatch):
+    """The kill-switch holds every forced run back below the bound, never past it (spec 04 I76): an
+    off-bus one-shot due after one sampler tick fires at the 10-min mark instead."""
     monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
-    held["off"] = set(TRAY_CHIPS[0x40])
-    assert _payload()["next_rung"] is None
+    held["off"] = {3, 4}
+    monkeypatch.setattr(srv, "isolated_chips", {"3", "4"})
+    p = _payload()
+    assert (p["next_rung_source"], p["next_rung_at"]) == ("off-bus one-shot", _iso(START + 600))
+    assert _fires(START + 599, monkeypatch) == [] and _fires(START + 600, monkeypatch) == ["offbus_one_shot"]
 
 
 def test_ac_needed_reports_the_recheck(held):
@@ -231,7 +242,7 @@ def test_a_later_ceiling_window_is_reported_after_the_first(held, monkeypatch):
 
 def test_the_hold_bound_feed_wins_when_earlier(held, monkeypatch):
     """The hook the universal hold bound feeds: with a 30-min ceiling, its 10-min mark is next."""
-    monkeypatch.setenv("TT_DEVICE_MCP_STUCK_HOLD_SEC", "1800")
+    monkeypatch.setattr(srv, "_stuck_hold_ceiling_sec", lambda: 1800)
     held["off"] = {3}
     assert _payload()["next_rung_at"] == _iso(START + 1800), "no feed: no 10-min mark is claimed"
     hr.register_deadline_feed("hold_bound", hr.hold_bound_candidate)
@@ -292,7 +303,8 @@ def _fires(t: float, monkeypatch) -> list:
     asked: list = []
 
     def spawn():
-        if srv._force_escalate_enabled():  # the real spawn's first guard: the kill-switch declines it
+        # The real spawn's first guard: the kill-switch declines it below the 10-min bound (I76).
+        if srv._force_escalate_enabled() or t - START >= srv._stuck_hold_ceiling_sec():
             asked.append(srv.device_hold_escalation_kind)
         return False
 
@@ -378,6 +390,66 @@ def test_a_declined_window_stays_reported_as_due(held, monkeypatch):
     assert _fires(START + 599, monkeypatch) == [] and _fires(START + 600, monkeypatch) == ["ceiling_window"]
 
 
+def test_an_armed_progress_retry_does_not_hide_a_due_ceiling_window(held, monkeypatch):
+    """Review #1304 F2a: an I39 retry armed but not yet due leaves the watchdog's ceiling branch live.
+    At 610 s window 1 (due at 600 s) fires, not the retry due at 640 s; before 600 s the retry is next."""
+    held["off"] = {3, 4, 5, 6}
+    now = START + 610
+    held["m"].progress_retry = (_episode(), srv.time.monotonic() + 30)
+    p = srv._health_payload(now=datetime.fromtimestamp(now))
+    assert (p["next_rung_source"], p["next_rung_at"], p["next_rung_due"]) == (
+        "hold ceiling window 1",
+        _iso(START + 600),
+        True,
+    )
+    assert _fires(now, monkeypatch) == ["ceiling_window"]
+    p = srv._health_payload(now=datetime.fromtimestamp(START + 560))
+    assert p["next_rung_source"] == "progress retry" and p["next_rung_due"] is False
+    held["m"].progress_retry = (_episode(), srv.time.monotonic() - 1)  # due: the chain stops at it
+    p = srv._health_payload(now=datetime.fromtimestamp(now))
+    assert (p["next_rung_source"], p["next_rung_at"]) == ("progress retry", _iso(now))
+    assert _fires(now, monkeypatch) == ["progress_retry"]
+
+
+def test_an_off_bus_one_shot_not_yet_due_does_not_hide_an_earlier_retry(held, monkeypatch):
+    """The one-shot branch needs its age; before it, a due progress retry still fires and is named."""
+    held["off"] = {3, 4}
+    monkeypatch.setattr(srv, "isolated_chips", {"3", "4"})
+    monkeypatch.setattr(srv, "device_hold_offbus_tenant_wait", True)  # one-shot at the 120 s tenant bound
+    held["m"].progress_retry = (_episode(), srv.time.monotonic() - 1)
+    p = _payload()
+    assert (p["next_rung_source"], p["next_rung_at"], p["next_rung_due"]) == ("progress retry", _iso(T0), True)
+    assert _fires(T0, monkeypatch) == ["progress_retry"]
+    assert _fires(START + 120, monkeypatch) == ["offbus_one_shot"]
+    p = srv._health_payload(now=datetime.fromtimestamp(START + 130))
+    assert p["next_rung_source"] == "off-bus one-shot", "due: the watchdog's chain stops at it"
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_the_bound_host_rung_follows_the_bound_ladder(held, monkeypatch, failed):
+    """Spec 04 I76: after the bound's ladder the host rung is next, at the end of the post-ladder check
+    bound, or at once when that full check failed; reported where the watchdog asks it."""
+    held["off"] = {3, 4, 5, 6}
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv, "_hold_bound_episode", _episode())
+    monkeypatch.setattr(srv, "_hold_bound_ladder_age", 620.0)
+    monkeypatch.setattr(srv, "_hold_bound_ladder_recovered", True)
+    monkeypatch.setattr(srv, "_hold_bound_cycle_age", None)
+    monkeypatch.setattr(srv, "_hold_bound_rung_pending", False)
+    monkeypatch.setattr(srv, "_hold_bound_check_failed_age", 700.0 if failed else None)
+    now = START + 720
+    p = srv._health_payload(now=datetime.fromtimestamp(now))
+    at = now if failed else START + 620 + srv._HOLD_BOUND_CHECK_SEC
+    assert (p["next_rung"], p["next_rung_source"], p["next_rung_at"]) == (
+        "power cycle",
+        "hold bound host rung",
+        _iso(at),
+    )
+    assert _fires(now, monkeypatch) == (["hold_bound_cycle"] if failed else [])
+    assert _fires(at, monkeypatch) == ["hold_bound_cycle"]
+
+
 def test_no_episode_clock_names_no_forced_rung(held, monkeypatch):
     """F2b: the watchdog keys on the episode clock and fires nothing without it, so the report names
     no forced rung (the start may still come from the held stamp)."""
@@ -395,7 +467,8 @@ def test_no_episode_clock_names_no_forced_rung(held, monkeypatch):
 @pytest.mark.parametrize("case", ["force_off", "only_77", "other_episode", "no_retry"])
 def test_the_cooldown_retry_is_named_only_when_the_watchdog_asks_it(held, monkeypatch, case):
     """F2c: the watchdog asks a refused power cycle again only in the episode it was refused in,
-    through the forced spawn (kill-switch on), and never on a 77-only hold."""
+    and below the 10-min bound only through the forced spawn (kill-switch on) and never on a 77-only
+    hold; from the bound on it asks it then (spec 04 I76)."""
     held["off"] = set(TRAY_CHIPS[0x40])
     _deny(held["m"], START + 300, last=START - 1500)
     if case == "force_off":
@@ -407,9 +480,12 @@ def test_the_cooldown_retry_is_named_only_when_the_watchdog_asks_it(held, monkey
     else:
         held["m"].power_cycle_retry = None
     p = _payload()
-    assert p["next_rung_source"] != "power_cycle_cooldown"
     if case in ("force_off", "only_77"):
-        assert p["next_rung"] is None
+        assert (p["next_rung_source"], p["next_rung_at"]) == ("power_cycle_cooldown", _iso(START + 600))
+        assert _fires(START + 599, monkeypatch) == []
+        assert _fires(START + 600, monkeypatch)[0] == "power_cycle_cooldown", "the watchdog's first ask"
+    else:
+        assert p["next_rung_source"] != "power_cycle_cooldown"
     assert "power_cycle_cooldown" not in _fires(START + 300, monkeypatch)
     assert p["power_cycle_cooldown"]["next_deadline"] == _iso(START + 300), "the cooldown end still shows"
 

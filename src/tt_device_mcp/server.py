@@ -6679,13 +6679,17 @@ _HOLD_OFFBUS_DUE_SOURCES = {
 def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
     """The next rung the broker has armed for this hold and when it fires (spec 04 I75), mirroring
     ``_check_hold_deadline``'s clocks AND its guards: none without the episode clock the watchdog keys
-    on; no forced candidate when the kill-switch is off or the hold is 77-only; while a requested host
-    action is pending, that request and the end of its window (every forced spawn declines until then).
-    Otherwise the earliest of the off-bus forced pass (gated grace, IPMI, tray-walk and operator
-    hand-off bounds), the I65 retry of a refused power cycle in this episode, then the watchdog's own
-    branch order: the off-bus one-shot, the I39 progress retry, or the next unspent ceiling window
-    (reported at its own time even when past: a declined spawn retries it every tick). Plus any
-    registered deadline feed. Read-only: it never claims, moves or expires a clock."""
+    on; while a requested host action is pending, that request and the end of its window (every forced
+    spawn declines until then). Otherwise the earliest of the off-bus forced pass (gated grace, IPMI,
+    tray-walk and operator hand-off bounds), the I65 retry of a refused power cycle in this episode, the
+    host rung the 10-min bound asks after its ladder (spec 04 I76), then the watchdog's own branch
+    order: the off-bus one-shot once due, the I39 progress retry once due, else the next unspent
+    ceiling window (reported at its own time even when past: a declined spawn retries it every tick).
+    A branch not yet due does not hide a later one that fires first: an armed progress retry or
+    one-shot is reported next to the ceiling window, and the earlier one wins. Below the 10-min bound
+    the kill-switch and a 77-only hold keep every forced run back, so each candidate fires no earlier
+    than the bound. Plus any registered deadline feed. Read-only: it never claims, moves or expires a
+    clock."""
     episode = device_hold_episode_since
     try:
         started = datetime.fromisoformat(episode).timestamp() if episode else None
@@ -6702,39 +6706,70 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
     except (KeyError, TypeError, ValueError):
         cooldown_until = None
     fed = hold_report.fed_candidates(started, now_epoch, cooldown_until)
-    if not _force_escalate_enabled() or _fabric_77_only_hold():
-        return hold_report.next_rung(fed)
+    ceiling = _stuck_hold_ceiling_sec()
+    # Spec 04 I76: below the bound the kill-switch declines every forced spawn and the watchdog forces
+    # no 77-only hold; from the bound on, neither holds a rung back.
+    floor = started + ceiling if not _force_escalate_enabled() or _fabric_77_only_hold() else None
+
+    def done(candidates: list) -> Optional[hold_report.RungCandidate]:
+        if floor is not None:
+            candidates = [c if c.at >= floor else replace(c, at=floor) for c in candidates]
+        return hold_report.next_rung(fed + candidates)
+
     # Read the request without host_action_pending(), which drops an expired one and journals it.
     req = getattr(m, "host_action_requested", None) if m is not None else None
     if req is not None:
         left = host_action_pending_sec() - (time.monotonic() - req[1])
         if left > 0:
-            return hold_report.RungCandidate(
-                now_epoch + left,
-                f"forced ladder if the requested host {req[0]} has not happened by then",
-                "host_action_pending",
+            return done(
+                [
+                    hold_report.RungCandidate(
+                        now_epoch + left,
+                        f"forced ladder if the requested host {req[0]} has not happened by then",
+                        "host_action_pending",
+                    )
+                ]
             )
-    candidates = list(fed)
+    candidates = []
     due = offbus_power_cycle.watchdog_due_at(episode)
     if due is not None:
         candidates.append(hold_report.RungCandidate(due[0], "forced ladder", _HOLD_OFFBUS_DUE_SOURCES[due[1]]))
     retry = getattr(m, "power_cycle_retry", None) if m is not None else None
     if retry is not None and retry[1] and retry[1] == episode:
         candidates.append(hold_report.cooldown_candidate(cooldown, float(retry[0])))
-    if isolated_chips and not device_hold_offbus_escalated:
+    host_rung = "power cycle" if _auto_power_cycle_enabled() else "warm reboot" if _auto_reboot_enabled() else None
+    age = now_epoch - started
+    if _hold_bound_cycle_due(age):
+        # The watchdog's first branch: it asks the bound's host rung every tick until it is requested.
+        if host_rung:
+            candidates.append(hold_report.RungCandidate(now_epoch, host_rung, "hold bound host rung"))
+        return done(candidates)
+    lad = _hold_bound_ladder_age
+    if (
+        host_rung
+        and lad is not None
+        and lad >= ceiling
+        and (_hold_bound_cycle_age is None or _hold_bound_cycle_age < lad)
+    ):
+        # The full check after the bound's ladder still has its time; the host rung follows at its end.
         candidates.append(
-            hold_report.RungCandidate(started + _offbus_one_shot_sec(), "forced ladder", "off-bus one-shot")
+            hold_report.RungCandidate(started + lad + _HOLD_BOUND_CHECK_SEC, host_rung, "hold bound host rung")
         )
-    elif m is not None and m.progress_retry is not None and m.progress_retry[0] == episode:
+    if isolated_chips and not device_hold_offbus_escalated:
+        one_shot = started + _offbus_one_shot_sec()
+        candidates.append(hold_report.RungCandidate(one_shot, "forced ladder", "off-bus one-shot"))
+        if age >= _offbus_one_shot_sec():
+            return done(candidates)  # due: the watchdog's chain stops at it
+    if m is not None and m.progress_retry is not None and m.progress_retry[0] == episode:
         left = m.progress_retry[1] - time.monotonic()
         candidates.append(hold_report.RungCandidate(now_epoch + max(0.0, left), "forced ladder", "progress retry"))
-    else:
-        ceiling = _stuck_hold_ceiling_sec()
-        window = max(1, device_hold_escalate_bucket + 1)
-        candidates.append(
-            hold_report.RungCandidate(started + window * ceiling, "forced ladder", f"hold ceiling window {window}")
-        )
-    return hold_report.next_rung(candidates)
+        if left <= 0:
+            return done(candidates)  # due: the watchdog's chain stops at it
+    window = max(1, device_hold_escalate_bucket + 1)
+    candidates.append(
+        hold_report.RungCandidate(started + window * ceiling, "forced ladder", f"hold ceiling window {window}")
+    )
+    return done(candidates)
 
 
 def _hold_report(now: Optional[datetime] = None) -> dict:

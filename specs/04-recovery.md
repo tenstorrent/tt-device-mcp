@@ -948,7 +948,10 @@ each rung fires only when the gentler one failed or cannot apply.
   guards, takes the earliest armed deadline and reports its rung, time and source:
   - with no hold-episode clock (the one the watchdog keys on), no forced candidate: the watchdog
     fires none, so only a registered feed may name one;
-  - with the forced escalation off or a fabric-77-only hold, no forced candidate either;
+  - with the forced escalation off or a fabric-77-only hold, every forced candidate below fires no
+    earlier than the 10-min bound (hold start plus the ceiling): below it the watchdog forces no
+    77-only hold and the kill-switch declines every forced spawn; from the bound on neither holds a
+    rung back (I76);
   - while a host reboot or power cycle the broker requested is still pending, that request: every
     forced spawn declines until the pending window ends, so the time is the window's end (source
     `host_action_pending`);
@@ -958,10 +961,17 @@ each rung fires only when the gentler one failed or cannot apply.
     I33 operator hand-off deadline; each named in the source); the I65 retry of a power cycle the
     governor refused, only while that retry is armed for this hold episode (`power cycle`, source
     `power_cycle_cooldown`, or `power_cycle_missed_retry` / `ac_power_needed` when the refusal
-    record says so); then, in the watchdog's own branch order, the off-bus one-shot (hold start plus
-    the one-shot wait, while chips are off the bus and the episode's one-shot has not run), else the
-    I39 progress retry when armed for the episode, else the next unspent ceiling window
-    (`device_hold_escalate_bucket + 1`, at least 1, at hold start plus that many ceilings);
+    record says so); the I76 host rung (`power cycle`, or `warm reboot` where only that is opted
+    in; source `hold bound host rung`) once the bound's ladder ran and no host rung was asked since,
+    at once when the full check after that ladder failed or the rung is still pending, else at the
+    end of that check's bound; once it is due the watchdog's branch chain stops there, so nothing
+    below is a candidate; then, in the watchdog's own branch order, the off-bus one-shot (hold start
+    plus the one-shot wait, while chips are off the bus and the episode's one-shot has not run), the
+    I39 progress retry while armed for the episode, and the next unspent ceiling window
+    (`device_hold_escalate_bucket + 1`, at least 1, at hold start plus that many ceilings). A branch
+    stops the chain only once it is due (the one-shot's wait has passed, the retry's time has come),
+    as the watchdog's own guard does; one not yet due is reported beside the branches after it, and
+    the earliest wins, so an armed retry never hides a ceiling window that fires first;
   - every registered deadline feed.
   A deadline that has passed but whose spawn was declined (a device op or an escalation in flight)
   is reported at its own time with `next_rung_due: true`, never moved to a later window: the
@@ -1630,7 +1640,8 @@ sees a silent fabric pass.
 | Rung inventory stated loudly at boot | `tests/test_rung_arming.py::test_a_rung_that_is_off_is_stated_loudly` |
 | Stage metrics: structural inapplicability is not "blocked" | `tests/test_metrics.py::test_ubb_tray_no_tray_on_this_platform_is_not_applicable_not_blocked`, `tests/test_metrics.py::test_bridge_reset_missing_pci_address_is_not_applicable_not_blocked` |
 | I75 (the earliest armed deadline: cooldown end, missed retry, AC-power recheck, off-bus one-shot, ceiling window) | `tests/test_health_hold_report.py::test_class_a_inside_the_cooldown_reports_the_cycle_at_the_cooldown_end`, `tests/test_health_hold_report.py::test_missed_power_cycle_retry_is_named`, `tests/test_health_hold_report.py::test_ac_needed_reports_the_recheck`, `tests/test_health_hold_report.py::test_class_b1_isolated_chips_report_the_off_bus_one_shot`, `tests/test_health_hold_report.py::test_class_b1_after_its_one_shot_reports_the_ceiling`, `tests/test_health_hold_report.py::test_a_later_ceiling_window_is_reported_after_the_first`, `tests/test_health_hold_report.py::test_cooldown_candidate_and_next_rung` |
-| I75 (no forced rung on a fabric-77-only hold or with the forced escalation off) | `tests/test_health_hold_report.py::test_fabric_77_only_hold_names_no_forced_rung`, `tests/test_health_hold_report.py::test_force_escalate_off_names_no_forced_rung` |
+| I75 (a fabric-77-only hold or the forced escalation off: forced rungs no earlier than the I76 bound) | `tests/test_health_hold_report.py::test_fabric_77_only_hold_names_the_10_min_bound`, `tests/test_health_hold_report.py::test_force_escalate_off_names_the_10_min_bound` |
+| I75 (a branch stops the chain only once due: an armed progress retry or a one-shot not yet due hides no earlier rung; the I76 host rung after the bound's ladder) | `tests/test_health_hold_report.py::test_an_armed_progress_retry_does_not_hide_a_due_ceiling_window`, `tests/test_health_hold_report.py::test_an_off_bus_one_shot_not_yet_due_does_not_hide_an_earlier_retry`, `tests/test_health_hold_report.py::test_the_bound_host_rung_follows_the_bound_ladder` |
 | I75 (the off-bus forced pass bounds: gated grace, IPMI and tray-walk hand-offs, gated operator hand-off; only after the ladder ran; the I39 progress retry) | `tests/test_health_hold_report.py::test_the_off_bus_forced_pass_bounds_are_named_when_they_fire`, `tests/test_health_hold_report.py::test_the_off_bus_pass_waits_for_the_ladder_to_have_run`, `tests/test_health_hold_report.py::test_the_i39_progress_retry_is_named` |
 | I75 (a declined deadline stays reported with `next_rung_due`; no episode clock names no forced rung) | `tests/test_health_hold_report.py::test_a_declined_window_stays_reported_as_due`, `tests/test_health_hold_report.py::test_no_episode_clock_names_no_forced_rung` |
 | I75 (the I65 retry only when armed for the episode and not refused by a guard; a pending host action is reported, never dropped) | `tests/test_health_hold_report.py::test_the_cooldown_retry_is_named_only_when_the_watchdog_asks_it`, `tests/test_health_hold_report.py::test_the_cooldown_retry_fires_when_reported`, `tests/test_health_hold_report.py::test_a_pending_host_action_is_reported_and_left_alone` |
