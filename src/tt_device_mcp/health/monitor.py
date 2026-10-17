@@ -348,6 +348,11 @@ class HealthMonitor:
         self.topology_hw_fault: str = ""
         # Monotonic time the fault's page went out (0.0: not sent). The idle relift re-pages from it.
         self.topology_hw_fault_paged: float = 0.0
+        # Set by the broker once a hold reaches the 10-min bound (04 I76): from then on until the
+        # hold ends, a topology mismatch is no longer lifted. The descriptor run always decides,
+        # and an OK on the discovered links alone is a hardware verdict that keeps the device held,
+        # so the bound's power cycle follows instead of a release onto the same missing link.
+        self.topology_lift_refused: str = ""
         self._topology_alerted: set[str] = set()
         # Whether the last fabric pass that ran reached no verdict (a 77). A job that then dies on the
         # fabric's routing ran on a mesh no pass cleared; consecutive ones are a known fabric fault
@@ -1048,7 +1053,9 @@ class HealthMonitor:
             self.fabric_check_proc = proc
 
         desc = "" if override else fabric._validator_paths()[2]
-        cached = _cached_topology_mismatch(desc) if desc else None
+        # Past the hold bound the descriptor run decides (04 I76): a link the ladder brought back
+        # must read clean, so the cached mismatch never stands in for it.
+        cached = _cached_topology_mismatch(desc) if desc and not self.topology_lift_refused else None
         if cached:
             # This chip-to-bus map already mismatched the descriptor: that run would only throw the
             # same mismatch again, so go straight to the traffic-only rerun (I45).
@@ -1107,6 +1114,17 @@ class HealthMonitor:
         self.last_fabric_skipped = ok is None
         if ok is True:
             marker = fabric.find_topology_marker(text)
+            if marker and self.topology_lift_refused:
+                # No lift past the hold bound (04 I76): the descriptor's links are still missing after
+                # the bound's ladder, so this is no pass. Withheld as a hardware verdict (never a
+                # cable fault: that latch is what the bound lifts), and the bound's cycle follows.
+                self.last_fabric_skipped = True
+                why = (
+                    f"links the cabling descriptor expects are still missing past the hold bound "
+                    f"({self.topology_lift_refused}); no topology lift past the bound; {marker}"
+                )
+                health_event("hold_bound_lift_refused", marker=marker, bound=self.topology_lift_refused)
+                return None, f"fabric HARDWARE FAULT ({dt:.0f}s): {why}"
             if marker:
                 self._note_fabric_ok()
                 self._on_topology_mismatch(marker)

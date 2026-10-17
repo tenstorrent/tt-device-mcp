@@ -2297,6 +2297,7 @@ def _reset_for_testing():
     _fabric_77_recheck_since = None
     _fabric_77_rechecks = 0
     _fabric_77_recheck_monotonic = 0.0
+    _end_topology_lift_refusal()
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
@@ -4128,7 +4129,9 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
     eok, edetail = await health_monitor.verify_eth_heartbeat()
     # A reset with no passing fabric pass since may not be released on the startup checks (04 I32).
     owed = _post_reset_debt()
-    if eok is True and not recent and not owed:
+    # Past the 10-min hold bound only a full check that passes releases (04 I76): no fallback lift.
+    refused = getattr(health_monitor, "topology_lift_refused", "")
+    if eok is True and not recent and not owed and not refused:
         _fabric_77_fallback_release_monotonic = time.monotonic()
         log(
             f"startup checks pass (enum+ARC healthy, eth heartbeat {edetail or eok!r}) — hold lifted "
@@ -4147,6 +4150,8 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
         + (
             f"a reset ({owed}) has had no passing fabric pass since"
             if eok is True and owed
+            else f"the hold is past its 10-min bound ({refused}): only a full check that passes releases it"
+            if eok is True and refused
             else (
                 "a fallback release already ran inside the window"
                 if eok is True
@@ -6757,6 +6762,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         else:
             health_event("device_held", reason=reason)
     elif not reason and not device_hold_logged:
+        _end_topology_lift_refusal()
         _forget_stale_hold_episode()
     elif not reason and device_hold_logged:
         device_hold_logged = False
@@ -6788,6 +6794,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         )
         _hold_row = None
         device_hold_episode_since = ""
+        _end_topology_lift_refusal()  # spec 04 I76: the next episode may be lifted below its bound again
         _dispatch_reset_spent = False  # spec 03 I55: the next episode earns its own reset
         if recovery_mechanism is not None:
             recovery_mechanism.regressed_reset_since = None  # spec 04 I31: the next episode may reset again
@@ -7107,12 +7114,39 @@ def _lift_hold_bound_latches(log) -> None:
     verdict and only a pass releases. A job that fails the same way declares them again."""
     if health_monitor is None:
         return
+    if not getattr(health_monitor, "topology_lift_refused", ""):
+        # Until the hold ends no topology-mismatch lift releases it (04 I76): the check after the
+        # ladder must pass on the descriptor's links, or the bound's power cycle follows.
+        health_monitor.topology_lift_refused = f"held since {device_hold_episode_since or 'unknown'}"
+        log("10-min hold bound: no topology-mismatch lift releases this hold; the descriptor's links must pass")
     for name in ("topology_hw_fault", "fabric_known_fault"):
         detail = getattr(health_monitor, name, "")
         if detail:
             setattr(health_monitor, name, "")
             health_event("hold_bound_latch_cleared", latch=name, detail=detail, held_since=device_hold_episode_since)
             log(f"10-min hold bound: lifting the {name} latch ({detail}) so the full check after the ladder decides")
+
+
+def _end_topology_lift_refusal() -> None:
+    """The hold is over (a pass released it): the next episode's topology mismatch may be lifted
+    again below its own bound (spec 03 I45)."""
+    if health_monitor is not None:
+        health_monitor.topology_lift_refused = ""
+
+
+def _refuse_topology_lift_for_carried_hold() -> None:
+    """A broker restart within the boot carries a hold already past the bound (spec 04 I76): the
+    startup gate must not lift it either. A reboot ends the episode (_restore_hold_episode), so a
+    power cycle's fresh boot is judged afresh."""
+    since = _restore_hold_episode()
+    if not since or health_monitor is None:
+        return
+    try:
+        age = (datetime.now() - datetime.fromisoformat(since)).total_seconds()
+    except ValueError:
+        return
+    if age >= _stuck_hold_ceiling_sec():
+        health_monitor.topology_lift_refused = f"held since {since}, carried over a broker restart"
 
 
 async def _hold_bound_host_rung(age: float, log) -> None:
@@ -11535,6 +11569,7 @@ async def run_startup_tasks() -> None:
     # Armed after boot_merge has closed the door, so only the startup gate (or a later full check)
     # can release the carried-over hold.
     _carry_hold_over(carried_hold)
+    _refuse_topology_lift_for_carried_hold()
     # The per-boot "door held pending the startup verify" row, durable in the health journal —
     # fsm.json records the episode but is not the timeline operators read — and its closing row.
     # A watcher that saw the hold waits for a release, and the device_held/device_released pair
