@@ -342,3 +342,79 @@ async def test_keep_running_on_disconnect_leaves_the_job_running(runner_env, mon
     )
     assert rec.seen == [] and job.status is srv.JobStatus.QUEUED, "the opt-out keeps the job"
     assert "job_run_client_gone" in runner_env["events"]
+
+
+# ---------------------------------------------------------------- spec 03 I69: every broker kill
+
+
+@pytest.mark.asyncio
+async def test_a_hung_job_owes_the_reset(runner_env, monkeypatch):
+    monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 1)
+    monkeypatch.setattr(srv, "HUNG_POLL_SEC", 0.05)
+    job, runner = await _start("934", "echo working; sleep 600")
+    try:
+        assert await _until(lambda: job.finished_at is not None)
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.HUNG
+    assert srv._kill_reset_debt().startswith("job 934"), "the hung reaper's kill owes the reset too"
+
+
+@pytest.mark.asyncio
+async def test_a_runner_timeout_owes_the_reset(runner_env):
+    job, runner = await _start("935", "sleep 600", timeout_sec=1)
+    try:
+        assert await _until(lambda: job.finished_at is not None)
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.TIMEOUT
+    assert srv._kill_reset_debt().startswith("job 935")
+
+
+def _readopted_job(job_id, served_sec, timeout_sec):
+    started = (srv.datetime.now() - srv.timedelta(seconds=served_sec)).isoformat()
+    job = srv.Job(
+        id=job_id,
+        owner="o",
+        workspace="/w",
+        command="c",
+        queued_at="",
+        status=srv.JobStatus.RUNNING,
+        started_at=started,
+    )
+    job.timeout_sec = timeout_sec
+    srv.jobs[job_id] = job
+    return job
+
+
+@pytest.mark.asyncio
+async def test_a_readopted_job_past_its_timeout_owes_the_reset(monkeypatch, tmp_path, clear_job_state):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    active = {"v": True}
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: active["v"])
+
+    async def fake_terminate(scope, grace_sec=0):
+        active["v"] = False
+        return False
+
+    monkeypatch.setattr(srv, "_terminate_scope", fake_terminate)
+    _readopted_job("940", 2400, 1500)
+    await asyncio.wait_for(srv._monitor_readopted_scope("940", "ttdev-job-940.scope"), timeout=5)
+    assert srv.jobs["940"].status is srv.JobStatus.TIMEOUT
+    assert srv._kill_reset_debt().startswith("re-adopted job 940"), "a re-adopted timeout owes the reset"
+
+
+@pytest.mark.asyncio
+async def test_a_requested_kill_of_a_readopted_job_owes_the_reset_and_leaves_no_id(
+    monkeypatch, tmp_path, clear_job_state
+):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    job = _readopted_job("941", 10, 1500)
+    job.status = srv.JobStatus.KILLED  # what _kill_job stamps before it stops the scope
+    srv.request_killed_job_ids.add("941")
+    await asyncio.wait_for(srv._monitor_readopted_scope("941", "ttdev-job-941.scope"), timeout=5)
+    assert srv._kill_reset_debt().startswith("re-adopted job 941")
+    assert "941" not in srv.request_killed_job_ids, "the id leaked past the job's end"
