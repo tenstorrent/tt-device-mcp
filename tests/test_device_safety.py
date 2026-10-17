@@ -14013,7 +14013,9 @@ async def test_a_latched_hold_whose_sweep_still_reads_a_mismatch_77_climbs_to_th
     g = srv.galaxy_recovery
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     if latched:
-        assert climbs == [{"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True, "cold": False}]
+        assert climbs == [
+            {"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True, "cold": False}
+        ]
         assert [a["kind"] for a in alerts] == []
     else:
         assert climbs == []
