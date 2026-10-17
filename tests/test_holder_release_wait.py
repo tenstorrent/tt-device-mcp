@@ -6,7 +6,9 @@
 The survivor sweep waits, bounded, for a SIGKILLed process to let go of the device before it names
 it a leftover, and a dirty job_killed / foreign_holder hold with nothing queued gets the post-job
 gate, fabric forced, from the idle tick instead of waiting for the next job or the hold ceiling.
-No device is touched: the holder scan, the gate and the liveness read are stubbed.
+The dead-chip isolation waits the same way for the holders it killed before it removes the
+endpoint (spec 03 I19). No device is touched: the holder scan, the gate and the liveness read are
+stubbed.
 """
 
 import asyncio
@@ -280,3 +282,86 @@ async def test_no_idle_gate_while_anything_else_owns_the_device(dirty_idle, monk
 
 async def _noop():
     await asyncio.sleep(0)
+
+
+# --- spec 03 I19: the dead-chip path removes the endpoint once its killed holders let go --------
+
+
+def _dead_chip_harness(monkeypatch, holding_scans):
+    """A dead chip with one tenant (pid 4242) mapping it. The tenant stays in the holder scan for
+    ``holding_scans`` scans after the kill (None: for ever). Records the order of kill, scans and
+    endpoint removal, and the journal."""
+    srv.device_op_lock = None
+    srv.isolated_chips = set()
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    order, events = [], []
+    state = {"scans": 0, "killed": False}
+
+    def scan():
+        if state["killed"]:
+            state["scans"] += 1
+        held = not state["killed"] or holding_scans is None or state["scans"] <= holding_scans
+        order.append(("scan", held))
+        return HolderScan(holders=[DeviceHolder(pid=4242, uid=1000)] if held else [], complete=True)
+
+    def kill(pid, sig):
+        state["killed"] = True
+        order.append(("kill", pid))
+
+    async def pollers(active, log):
+        return []
+
+    monkeypatch.setattr(srv, "enumerate_device_holders", scan)
+    monkeypatch.setattr(device_holders, "enumerate_device_holders", scan)
+    monkeypatch.setattr(srv.os, "kill", kill)
+    monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None, raising=False)
+    monkeypatch.setattr(srv, "current_process", None, raising=False)
+    monkeypatch.setattr(srv, "isolate_chip", lambda idx: order.append(("remove", idx)) or True)
+    monkeypatch.setattr(srv, "chip_pci_bdf", lambda idx: "0000:46:00.0")
+    monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    return order, events
+
+
+@pytest.mark.asyncio
+async def test_a_dead_chip_is_removed_right_after_its_killed_holder_lets_go(monkeypatch):
+    order, events = _dead_chip_harness(monkeypatch, holding_scans=2)
+    start = time.monotonic()
+    await srv.sampler.isolate_dead_chips(["13"])
+    elapsed = time.monotonic() - start
+
+    removal = order.index(("remove", "13"))
+    assert order.index(("kill", 4242)) < removal
+    assert ("scan", True) in order[order.index(("kill", 4242)) : removal], "the killed holder was waited for"
+    assert order[removal - 1] == ("scan", False), "the endpoint is removed only once the holder let go"
+    assert elapsed < 5, "the removal follows the release at once, not the 30 s bound"
+    assert not [k for k, _ in events if k == "dead_chip_holders_lingering"]
+    assert ("chip_isolated", {"chips": ["13"]}) in events
+
+
+@pytest.mark.asyncio
+async def test_a_dead_chip_whose_killed_holders_are_gone_costs_one_scan(monkeypatch):
+    order, _events = _dead_chip_harness(monkeypatch, holding_scans=0)
+    await srv.sampler.isolate_dead_chips(["13"])
+    after_kill = order[order.index(("kill", 4242)) + 1 : order.index(("remove", "13"))]
+    assert after_kill == [("scan", False)], "a holder already gone adds one scan and no wait"
+
+
+@pytest.mark.asyncio
+async def test_a_killed_holder_still_holding_at_the_bound_goes_on_to_removal_and_a_dirty_hold(monkeypatch):
+    monkeypatch.setattr(srv, "HOLDER_RELEASE_WAIT_SEC", 0.6)
+    order, events = _dead_chip_harness(monkeypatch, holding_scans=None)
+    start = time.monotonic()
+    await srv.sampler.isolate_dead_chips(["13"])
+    elapsed = time.monotonic() - start
+
+    assert 0.6 <= elapsed < 5, "the wait runs to its bound and no longer: never open-ended"
+    assert ("remove", "13") in order, "a lingering holder never stops the endpoint removal"
+    lingering = [f for k, f in events if k == "dead_chip_holders_lingering"]
+    assert lingering and lingering[-1]["pids"] == [4242], "the holder still holding is named"
+    # The existing escalation: the device stays dirty and held, so only recovery's reset and its
+    # full post-reset check (fabric included) can release it.
+    assert srv.fsm.state is not ServerState.HEALTHY
+    assert srv.fsm.record.dirty
