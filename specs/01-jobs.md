@@ -139,7 +139,8 @@ the queue and a running job outlive the broker process.
   before the tenant filter of I15 and ignores uid and parentage: a process stuck in the kernel
   is never reaped, so it can still be the broker's child. The fence names each holder (job,
   pid, state, wchan, SIGKILL pending) and says that one stuck in the kernel with SIGKILL
-  pending cannot be killed and only a host reboot clears it. One
+  pending cannot be killed and only a host reboot clears it; the broker requests that host rung
+  itself once such a holder has stood for 600 s (spec 04 I70), so the fence never holds open-ended. One
   `reaped_leftover_holds_device` event opens the episode and one `reaped_leftover_released`
   closes it; repeated scans emit nothing. The health gate skips its probes over a leftover and
   keeps the device dirty (`foreign_holder`), so the verify runs once it is gone. A scan error
@@ -253,10 +254,10 @@ the queue and a running job outlive the broker process.
   job with nothing left costs nothing, and a slow exit adds at most 28 s to the job's teardown,
   in which the queue waits as it already waits for the sweep. The poll is one shared helper,
   `device_holders.wait_device_released`, for every path that SIGKILLs device holders and must
-  know they let go before it acts on the device. Time to recover (class J, a job that timed out
-  or was killed and exits slowly): a holder that lets go within the window no longer turns a
-  ~1 min post-job check into a hold that waited for the next job or the 600 s ceiling (spec 03
-  I23).
+  know they let go before it acts on the device; the dead-chip isolation is the other such path
+  (spec 03 I19). Time to recover (class J, a job that timed out or was killed and exits slowly): a
+  holder that lets go within the window no longer turns a ~1 min post-job check into a hold that
+  waited for the next job or the 600 s ceiling (spec 03 I23).
 
 - **I68** — A job whose tt-metal output dirs its user cannot write is refused at the door,
   before the cooldown, the gate or any hold, and never spawned. tt-metal writes under

@@ -296,6 +296,33 @@ def drop_returned_isolated(isolated: set, context: str, log=None) -> list:
     return back
 
 
+# The last reason journaled per context by reenumerate_withheld: a ladder pass that meets the same
+# fence again logs, but journals only when the reason changes (spec 04 I77).
+_reenumerate_withheld_journaled: dict[str, str] = {}
+
+
+def reenumerate_withheld(mechanism, context: str, log) -> str:
+    """Why a rung that re-enumerates PCI (a rescan, a bridge/secondary bus reset, a tray re-power,
+    a re-bind) may not run now -- '' when it may (spec 04 I77). The broker sets
+    ``mechanism.reenumerate_fence`` to name a killed holder still stuck in the kernel (state D) with
+    a removed chip's node or BAR mapped: re-enumerating under it can hang the host. Logged on every
+    refusal, journaled host_at_risk when the reason changes. Never raises."""
+    fence = getattr(mechanism, "reenumerate_fence", None)
+    try:
+        reason = fence() if callable(fence) else ""
+    except Exception as e:  # noqa: BLE001 - as the reset fence: a check bug must not hold the ladder
+        log(f"{context}: stuck-holder check failed ({e}); not withheld")
+        reason = ""
+    if not isinstance(reason, str) or not reason:
+        _reenumerate_withheld_journaled.pop(context, None)
+        return ""
+    log(f"{context} withheld: {reason}")
+    if _reenumerate_withheld_journaled.get(context) != reason:
+        _reenumerate_withheld_journaled[context] = reason
+        health_event("reenumerate_withheld", context=context, reason=reason, host_at_risk=True)
+    return reason
+
+
 def refuse_mesh_reset(context: str, argv: list, log, off_bus: int = 0) -> bool:
     """True when :func:`mesh_reset_hold_reason` holds the mesh reset: logged, journaled and paged
     once per hold, again every :func:`mesh_hold_repage_sec` while it stands and after a pass that
@@ -408,6 +435,9 @@ class RecoveryMechanism:
         # 01 I16): a reaped job's process still holding the device, which a reset cannot free.
         # Checked here, where every reset passes, so no caller can reset over one.
         self.reset_fence: Optional[Callable[[], str]] = None
+        # Why no rung may re-enumerate PCI now -- '' when one may (spec 04 I77): a killed holder stuck
+        # in state D with a removed chip's BAR mapped. Read through reenumerate_withheld.
+        self.reenumerate_fence: Optional[Callable[[], str]] = None
 
         # Two callers (the auto-recovery reset launcher and the operator-run reset tool) need this
         # sequence and they must build it identically, because the scope name is what every other

@@ -435,11 +435,39 @@ class TelemetrySampler:
         #
         # These processes are already lost — the chip under them is gone — and a dead job is a
         # far better outcome than a reboot that destroys every other tenant's work as well.
-        await self._deps.kill_device_holders(f"chip(s) {','.join(fresh)} left the PCIe bus")
+        killed = await self._deps.kill_device_holders(f"chip(s) {','.join(fresh)} left the PCIe bus")
 
         # Then the pollers: tt-telemetry reads every chip in a loop, and on a dead one it
         # segfaults and systemd restarts it straight back into the same read.
         await self._deps.set_device_pollers(False, lambda m: log.info(f"DEAD-CHIP {m}") if log else None)
+
+        # A SIGKILLed holder can sit in the driver's release for seconds after the signal, its
+        # device fds still open. Remove the endpoint (and let recovery reset the bridge) only
+        # once the killed pids have let go, or the bound has passed (spec 03 I19, 01 I67): a
+        # killed process issues no further reads, so the wait costs nothing in host risk, and
+        # one already gone costs one scan.
+        wait = self._deps.wait_device_released
+        pids = [k["pid"] for k in killed or () if isinstance(k.get("pid"), int)]
+        if wait is not None and pids:
+            lingering = sorted(await wait(pids))
+            if lingering:
+                # Bounded: the removal goes ahead as before; the episode is dirty, so the device
+                # stays held until recovery's reset and full post-reset check pass.
+                if log:
+                    log.error(
+                        f"DEAD-CHIP killed holder(s) {lingering} still hold the device at the "
+                        f"release bound; removing the endpoint anyway"
+                    )
+                self._deps.health_event("dead_chip_holders_lingering", chips=fresh, pids=lingering)
+
+        # A killed holder that is still alive past the bound is stuck in the kernel, most often
+        # reading the dead BAR (state D) — it never acts on its SIGKILL. Name it, page, and fence
+        # every rung that would re-enumerate PCI under it (spec 04 I77); the broker's bounded
+        # escalation takes the host rung if it outlives its budget.
+        stuck_holders = []
+        note = self._deps.note_stuck_holders
+        if note is not None and killed:
+            stuck_holders = await asyncio.to_thread(note, list(fresh), list(killed))
 
         removed = []
         for idx in fresh:
@@ -459,6 +487,13 @@ class TelemetrySampler:
                     f"a core stall that reboots it. Removed only {removed}."
                 )
             self._deps.health_event("chip_isolation_incomplete", stuck=stuck, removed=removed, host_at_risk=True)
+        elif stuck_holders:
+            if log:
+                log.error(
+                    f"DEAD CHIP(S) {removed} removed from the kernel, but killed holder(s) "
+                    f"{stuck_holders} are stuck on them in the kernel — the host is STILL at "
+                    f"risk; no rung re-enumerates PCI until they are gone (spec 04 I77)"
+                )
         elif log:
             log.error(
                 f"DEAD CHIP(S) {removed} removed from the kernel — the host is out of "

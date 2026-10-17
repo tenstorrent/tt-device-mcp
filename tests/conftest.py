@@ -271,6 +271,17 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     monkeypatch.delenv(device_holders.TENANT_UIDS_ENV, raising=False)
     monkeypatch.setattr(srv, "reaped_survivors", {})
     monkeypatch.setattr(srv, "_leftover_fence_detail", "")
+    monkeypatch.setattr(srv, "_leftover_unkillable_since", None)
+    monkeypatch.setattr(srv, "_leftover_unkillable_mono", None)
+    monkeypatch.setattr(srv, "_leftover_deadline_paged", False)
+    monkeypatch.setattr(srv, "_leftover_rung_last_try", 0.0)
+    monkeypatch.setattr(srv, "_leftover_rung_stage", "")
+    monkeypatch.setattr(srv, "_leftover_rung_detail", "")
+    monkeypatch.setattr(srv, "_leftover_rung_task", None)
+    monkeypatch.setattr(srv, "_dead_chip_stuck", {})
+    monkeypatch.setattr(srv, "_dead_chip_page_pending", None)
+    monkeypatch.setattr(srv, "_leftover_dead_chip", False)
+    monkeypatch.setattr(recovery_base, "_reenumerate_withheld_journaled", {})
     # The reset argv/mode env vars are read live (never cached), so an operator's own shell/CI
     # environment leaks straight into whatever argv a test builds — cleared here for a
     # deterministic floor; a test exercising a declared mode/override sets it itself afterward.

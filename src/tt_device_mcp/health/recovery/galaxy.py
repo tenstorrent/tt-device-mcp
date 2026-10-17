@@ -9,6 +9,7 @@ the one the between-job health gate now steers on.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import math
 import os
@@ -45,7 +46,12 @@ from tt_device_mcp.health.recovery import (
     offbus_power_cycle,
     pcie_guard,
 )
-from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC, drop_returned_isolated, refuse_mesh_reset
+from tt_device_mcp.health.recovery.base import (
+    HOLD_ESCALATION_REARM_SEC,
+    drop_returned_isolated,
+    reenumerate_withheld,
+    refuse_mesh_reset,
+)
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
@@ -1378,6 +1384,54 @@ class GalaxyRecovery(Recovery):
         await self.deps.auto_power_cycle_host(log, f"{what}; no further reset heals this class")
         return True
 
+    async def leftover_host_rung(self, leftover_pids, expected: int, log, *, what: str) -> tuple[str, str]:
+        """Take the host rung for an unkillable reaped leftover past its budget (spec 04 I70).
+
+        Every reset is fenced while the leftover stands (I21) and none would free it, so no ladder or
+        sweep runs first (the I22 exception). Returns ``(stage, detail)``: ``requested`` with the
+        action once fired, ``held`` with why while a guard stands (the caller asks again on its next
+        try), ``no-host-rung`` when the host opted into neither rung. The guards are the forced
+        climb's: a reset cycling in its own scope, a running broker job or a readable tenant other
+        than the leftovers themselves (an unreadable scan is waived), the operator stand-back for the
+        power cycle, and the governor (rate limits, the I65 cooldown).
+        The boot that comes back runs the startup gate, which waits for the hugepage pool and passes
+        the full health check, fabric included, before it releases anything (goal 8)."""
+        if await asyncio.to_thread(self.mechanism.scope_active):
+            return "held", "a reset is cycling in its own scope"
+        leftovers = {int(p) for p in leftover_pids}
+        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
+        others = dataclasses.replace(scan, holders=[h for h in scan.holders if int(h.pid) not in leftovers])
+        blocker = self._tenant_blocker(others, force=True)
+        if blocker is not None:
+            return "held", self._describe_blocker(blocker)
+        beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        off_bus = len(_offbus_chip_ids(beats, expected)) if expected > 1 else 0
+        # A warm reboot does not bring an off-bus Galaxy chip back, so any chip off the bus on a
+        # multi-chip host routes to the power cycle; with every chip present the reboot, which ends
+        # every process, comes first in the chooser's own order.
+        escalation, _ = _host_escalation_for_drop(
+            off_bus, expected, warm_reboot_futile=off_bus > 0, **self.deps.host_escalation_kwargs()
+        )
+        if escalation is None:
+            return "no-host-rung", (
+                f"no host rung is opted in ({off_bus}/{expected} chip(s) off the bus); "
+                "an operator must reboot or power-cycle the host"
+            )
+        if escalation == "power-cycle":
+            standback = await asyncio.to_thread(offbus_power_cycle.standback_reason, require_manual_check=False)
+            if standback:
+                return "held", f"standing back from the power cycle: {standback}"
+        allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=False)
+        if not allowed:
+            return "held", f"{escalation} held off: {why}"
+        reason = f"{what}; no reset can free it (spec 04 I70)"
+        log(f"{what}: past its budget, no reset can free it — requesting the host {escalation} (spec 04 I70)")
+        if escalation == "power-cycle":
+            await self.deps.auto_power_cycle_host(log, reason)
+        else:
+            await self._auto_reboot_host(log, reason)
+        return "requested", f"{escalation} ({off_bus}/{expected} chip(s) off the bus)"
+
     # ---- the between-job gate's action rungs --------------------------------------------------
     #
     # The gate (server.py) DECIDES: it builds the Evidence, asks next_stage for the one rung that
@@ -1663,6 +1717,8 @@ class GalaxyRecovery(Recovery):
         if not td["rescanned"]:
             if tenant_active:
                 rescan = "waiting (a tenant holds the device)"
+            elif reenumerate_withheld(self.mechanism, "tray-down PCI rescan", log):
+                rescan = "withheld (a killed holder is stuck on a removed chip)"
             else:
                 td["rescanned"] = True
                 try:
@@ -1814,6 +1870,9 @@ class GalaxyRecovery(Recovery):
         Returns whether the sweep was COMPLETE: False when the per-host gate refused it (spec 04 I24)
         or the tray envelope refused to cut power (I23). An incomplete sweep is not the full ladder,
         so the caller must not climb to a power cycle or reboot on it (I22)."""
+        # Every step re-enumerates PCI: none runs under a stuck holder of a removed chip (I77).
+        if reenumerate_withheld(self.mechanism, "back-to-back reset sweep", log):
+            return False
         off_bus = pcie_guard.chips_off_bus(expected)
         allowed, why = pcie_guard.host_reset_gate(off_bus)
         if not allowed:
@@ -3341,6 +3400,12 @@ class GalaxyRecovery(Recovery):
             )
             metrics.stage_fired("ubb_tray", "blocked")
             return False
+        if reenumerate_withheld(self.mechanism, "per-tray BMC reset", log):
+            # A tray re-power and its rescan re-enumerate under a stuck holder of a removed chip
+            # (spec 04 I77): hold; the broker's I70 escalation owns the bound. Below the
+            # whole-tray hand-off above, which re-powers nothing: the power cycle is the rung that clears it.
+            metrics.stage_fired("ubb_tray", "blocked")
+            return None
         pcie_guard.latch_tray_pulse_drop(offbus_ids)
         if len(walk) == 1 and (reset_floor is None or off_bus < reset_floor) and not _ubb_single_tray_walk_enabled():
             # A below-floor drop on one tray: re-powering that tray has dropped the other trays too

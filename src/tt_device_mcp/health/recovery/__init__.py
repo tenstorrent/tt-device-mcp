@@ -35,6 +35,7 @@ from tt_device_mcp.health.recovery.base import (
     RESET_COOLDOWN_SEC,
     RecoveryMechanism,
     drop_returned_isolated,
+    reenumerate_withheld,
     refuse_mesh_reset,
 )
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
@@ -275,6 +276,13 @@ class RecoveryDeps:
     chip_pci_bdf: Optional[Callable[[str], Optional[str]]] = None
     health_event: Optional[Callable[..., None]] = None
     kill_device_holders: Optional[Callable[[str], Awaitable[list]]] = None
+    # Bounded wait for the pids it killed to drop out of the holder scan; returns those still
+    # listed (spec 03 I19, the shared spec 01 I67 helper).
+    wait_device_released: Optional[Callable[[list], Awaitable[set]]] = None
+    # Spec 04 I77: names each killed pid that is stuck in the kernel still referencing the dead
+    # chip(s), journals host_at_risk, pages, and fences every re-enumerating rung while it lives.
+    # Returns the stuck pids.
+    note_stuck_holders: Optional[Callable[[list, list], list]] = None
     mark_device_dirty: Optional[Callable[..., None]] = None
     # Places a not-dirty fabric-unverified hold (server._hold_device_fabric_unverified): a reset whose
     # fabric stayed a 77 settles there, never as a failed reset.
@@ -431,6 +439,14 @@ class Recovery(ABC):
         if not isolated_chips:
             return True
         targets = sorted(isolated_chips, key=int)
+        # A killed holder stuck in the kernel with a removed chip's BAR mapped (spec 04 I77): the
+        # bridge reset and the rescan both re-enumerate under it, so neither runs. The chips stay
+        # out and the hold stands; the broker's I70 escalation owns the bound.
+        if reenumerate_withheld(self.mechanism, f"bridge reset of chip(s) {','.join(targets)}", log):
+            for idx in targets:
+                self.last_bridge_reset_reasons[idx] = {"reason": "stuck_holder"}
+            metrics.stage_fired("bridge_reset", "blocked")
+            return False
         _t0 = datetime.now()
         self.deps.begin_action_row("[broker]bridge-reset", f"bridge-reset chip(s) {','.join(targets)}")
         self.deps.set_device_op_detail(f"recovering chip(s) {','.join(targets)} " f"via bridge reset (~10s)")
