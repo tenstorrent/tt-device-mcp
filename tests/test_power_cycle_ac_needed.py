@@ -181,6 +181,43 @@ async def test_the_ac_hold_pages_once_then_hourly(cool, monkeypatch, paged):  # 
     assert len(pages()) == 2, "paged again after an hour"
 
 
+@pytest.mark.asyncio
+async def test_at_the_10_min_mark_a_failed_bound_check_keeps_the_power_cycle_step(cool, monkeypatch):  # noqa: F811
+    """Spec 04 I73 with I76: when the class-A 10-min mark falls on the tick where the bound's ladder
+    already ran and its full check failed, the watchdog's run is the bound's host rung (the power
+    cycle, which the cooldown then gates), not a second ladder. The AC-needed state stops neither."""
+    m = cool["g"].mechanism
+    for name in ("_class_a_ladder_anchor", "_class_a_ladder_spawned"):
+        monkeypatch.setattr(m, name, None)  # the shared mechanism may carry an earlier test's anchor
+    await _two_cycles_that_do_not_heal(cool)
+    assert m.power_cycle_cooldown_state.get("ac_power_needed")
+    mark = cool["boot"]["btime"] + CLASS_A_LADDER_AFTER_SEC
+    age = srv._hold_age_now(datetime.fromtimestamp(mark))
+    assert age >= 600, "the hold is past the 10-min bound"
+    for name, value in (
+        ("_hold_bound_episode", srv.device_hold_episode_since),
+        ("_hold_bound_ladder_age", age - 120),
+        ("_hold_bound_ladder_recovered", True),
+        ("_hold_bound_check_failed_age", age - 60),
+        ("_hold_bound_cycle_age", None),
+        ("_hold_bound_rung_pending", False),
+        ("device_hold_escalate_bucket", 10**6),
+        ("device_hold_deadline_bucket", 10**6),
+        ("device_hold_escalation_kind", ""),
+        ("device_hold_escalation_trigger", ""),
+    ):
+        monkeypatch.setattr(srv, name, value)
+    monkeypatch.setattr(srv.offbus_power_cycle, "due_for_watchdog", lambda *a, **k: False)
+    asked = []
+    monkeypatch.setattr(
+        srv, "_maybe_spawn_forced_escalation", lambda: asked.append(srv.device_hold_escalation_kind) or True
+    )
+    srv._check_hold_deadline(now=datetime.fromtimestamp(mark))
+    assert asked == ["class_a_ladder", "hold_bound_cycle"]
+    assert srv.device_hold_escalation_kind == "hold_bound_cycle", "the run the watchdog started is the host rung"
+    assert srv._hold_bound_cycle_next(srv.device_hold_escalation_kind, age)
+
+
 # ---- (2) the cooldown is honoured between the cycles ----------------------------------------------
 
 
