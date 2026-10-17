@@ -911,6 +911,27 @@ each rung fires only when the gentler one failed or cannot apply.
   never a boot loop, never an open-ended hold. Class A or C after a cycle a later boot verified, at
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
+- **I75 — The next rung `/health` names is the earliest one some code will fire.** One helper
+  (`health/hold_report.py`, used by spec 03 I72) takes the earliest of these armed deadlines and
+  reports its rung, time and source:
+  - the governor's wait on `power_cycle_cooldown_state`: the I65 cooldown end (`power cycle`,
+    source `power_cycle_cooldown`), the same field carrying a missed power-cycle request's retry
+    (source `power_cycle_missed_retry`) or an AC-power recheck of the bus (source
+    `ac_power_needed`);
+  - the off-bus one-shot: hold start plus the off-bus ceiling, while chips are off the bus and that
+    hold episode's one-shot has not fired (`forced ladder`, source `off-bus one-shot`);
+  - the next hold-ceiling window not yet escalated (`forced ladder`, source `hold ceiling window
+    <n>`);
+  - every registered deadline feed.
+  The off-bus one-shot and the ceiling windows appear only while the forced escalation is on and the
+  hold is not a fabric-77-only hold, the same conditions the hold-deadline watchdog checks; with no
+  armed deadline the fields are `null`. A feed that raises reports nothing, so `/health` always
+  answers. The helper mirrors the watchdog's clocks and never claims or moves one. A hold bound
+  registers through `register_deadline_feed`: `hold_bound_candidate` reports the full ladder, then a
+  power cycle, at hold start plus 600 s, or at the boot/post-cycle cooldown's end when that is
+  later. It is not registered until the code that enforces the bound registers it, because
+  `/health` names only rungs some code will fire. TTR effect 0 for every class: nothing here changes
+  when or whether a rung fires.
 
 ## Interfaces
 
@@ -1446,3 +1467,6 @@ sees a silent fabric pass.
 | Reset tool contract: steps/attribution/no-devices/job stop | `tests/test_reset.py::test_reset_success_reports_steps_and_command`, `tests/test_reset.py::test_reset_failure_surfaces_returncode_and_output`, `tests/test_reset.py::test_explicit_reset_leaves_one_row_attributed_to_the_caller`, `tests/test_reset.py::test_reset_no_devices_does_not_call_tt_smi`, `tests/test_reset.py::test_a_reset_stops_the_running_job_gracefully`, `tests/test_reset.py::test_reset_device_quiesce_scope_routes_a_live_privsep_job` |
 | Rung inventory stated loudly at boot | `tests/test_rung_arming.py::test_a_rung_that_is_off_is_stated_loudly` |
 | Stage metrics: structural inapplicability is not "blocked" | `tests/test_metrics.py::test_ubb_tray_no_tray_on_this_platform_is_not_applicable_not_blocked`, `tests/test_metrics.py::test_bridge_reset_missing_pci_address_is_not_applicable_not_blocked` |
+| I75 (the earliest armed deadline: cooldown end, missed retry, AC-power recheck, off-bus one-shot, ceiling window) | `tests/test_health_hold_report.py::test_class_a_inside_the_cooldown_reports_the_cycle_at_the_cooldown_end`, `tests/test_health_hold_report.py::test_missed_power_cycle_retry_is_named`, `tests/test_health_hold_report.py::test_ac_needed_reports_the_recheck`, `tests/test_health_hold_report.py::test_class_b1_isolated_chips_report_the_off_bus_one_shot`, `tests/test_health_hold_report.py::test_class_b1_after_its_one_shot_reports_the_ceiling`, `tests/test_health_hold_report.py::test_a_later_ceiling_window_is_reported_after_the_first`, `tests/test_health_hold_report.py::test_cooldown_candidate_and_next_rung` |
+| I75 (no forced rung on a fabric-77-only hold or with the forced escalation off) | `tests/test_health_hold_report.py::test_fabric_77_only_hold_names_no_forced_rung`, `tests/test_health_hold_report.py::test_force_escalate_off_names_no_forced_rung` |
+| I75 (deadline feeds: the hold bound wins when earlier, moves to the cooldown end inside it; a broken feed reports nothing) | `tests/test_health_hold_report.py::test_the_hold_bound_feed_wins_when_earlier`, `tests/test_health_hold_report.py::test_the_hold_bound_inside_the_cooldown_moves_to_its_end`, `tests/test_health_hold_report.py::test_a_broken_feed_reports_nothing` |
