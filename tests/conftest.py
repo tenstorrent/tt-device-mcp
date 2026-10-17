@@ -278,6 +278,10 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(srv, "_leftover_rung_stage", "")
     monkeypatch.setattr(srv, "_leftover_rung_detail", "")
     monkeypatch.setattr(srv, "_leftover_rung_task", None)
+    monkeypatch.setattr(srv, "_dead_chip_stuck", {})
+    monkeypatch.setattr(srv, "_dead_chip_page_pending", None)
+    monkeypatch.setattr(srv, "_leftover_dead_chip", False)
+    monkeypatch.setattr(recovery_base, "_reenumerate_withheld_journaled", {})
     # The reset argv/mode env vars are read live (never cached), so an operator's own shell/CI
     # environment leaks straight into whatever argv a test builds — cleared here for a
     # deterministic floor; a test exercising a declared mode/override sets it itself afterward.
