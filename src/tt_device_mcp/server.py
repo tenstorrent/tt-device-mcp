@@ -2285,6 +2285,7 @@ def _reset_for_testing():
     _kill_reset_owed = ""
     _kill_reset_owed_at = 0.0
     request_killed_job_ids.clear()
+    reset_killed_job_ids.clear()
     _hold_episode_restorable = True
     _hold_episode_tenant = False
     if recovery_mechanism is not None:
