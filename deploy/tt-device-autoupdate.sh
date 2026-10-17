@@ -86,6 +86,27 @@ installed_sha="$(cat "$STATE" 2>/dev/null || true)"
 
 echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >&2
 
+# Decision log (spec 08 I22). Every lap that has an update to make records what it decided
+# (deferred, applied, failed), when, and from which sha to which, in the broker's log dir and
+# the journal under a stable tag. The stderr lines above and below land in the reconcile unit's
+# journal, which may not survive a reboot; this file does, so an operator can match a broker
+# restart (and the startup pass after it) to the update that caused it. Kept to about 1 MiB.
+AU_LOG="${TTDEV_LOG_DIR:-/var/log/tt-device-broker}/autoupdate.log"
+au_logged=0
+au_log() {  # <decision> <reason>
+    local line
+    line="$(date '+%Y-%m-%dT%H:%M:%S%z') decision=$1 branch=$BR old=${installed_sha:-none} new=$remote_sha reason=$2"
+    au_logged=1
+    logger -t tt-device-autoupdate -- "$line" 2>/dev/null || true
+    {
+        mkdir -p "${AU_LOG%/*}"
+        if [ "$(stat -c %s "$AU_LOG" 2>/dev/null || echo 0)" -ge 1048576 ]; then
+            mv -f "$AU_LOG" "$AU_LOG.1"
+        fi
+        echo "$line" >> "$AU_LOG"
+    } 2>/dev/null || true
+}
+
 # An in-flight device operation is an ABSOLUTE bar — not the bounded defer below.
 # Restarting the broker mid-reset lets KillMode=control-group SIGTERM the running
 # tt-smi, leaving 32 ASICs half-reset, which is the state that costs a power-cycle.
@@ -97,6 +118,7 @@ if [ -f "$INHIBIT" ]; then
     read -r op_pid op_name < "$INHIBIT" 2>/dev/null || true
     if [ -n "${op_pid:-}" ] && kill -0 "$op_pid" 2>/dev/null; then
         echo "autoupdate: device op in flight (${op_name:-unknown}, pid $op_pid); deferring" >&2
+        au_log deferred "device op in flight (${op_name:-unknown}); apply_by=when the op ends (bounded)"
         exit 0
     fi
     rm -f "$INHIBIT" 2>/dev/null || true   # stale: the broker that held it is gone
@@ -106,8 +128,73 @@ fi
 if systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null \
         | grep -q 'ttdev-reset-'; then
     echo "autoupdate: a device reset scope is still running; deferring" >&2
+    au_log deferred "device reset scope running; apply_by=when the reset ends (bounded)"
     exit 0
 fi
+
+# Recovery deferral (spec 08 I23). The device-op bar above covers a rung while it runs, not the
+# hold around it: between rungs (a settle, a backoff, the wait for the hold deadline) no op is in
+# flight, and a restart there throws the episode back to the startup check, a forced fabric pass
+# on a mesh the broker already knows is bad, and can turn a heal in progress into a longer one.
+# So while the broker's /health reports a hold, or its FSM is recovering or down, the update
+# waits, bounded: it applies once the hold has lasted RECOVERY_DEFER (every fault class's
+# time-to-recover budget is shorter, so a recovery still over it is over budget and the update
+# may be its fix), or once this pending update has waited RECOVERY_DEFER in all, so a hold that
+# keeps coming back cannot starve a box of a fix. Never more than 30 min; 0 turns it off. A
+# broker that does not answer /health is not deferred for: an update may be what it needs.
+# The deferral delays only the restart; no rung, reset, power cycle or escalation waits on it.
+RECOVERY_DEFER="${TTDEV_RECOVERY_DEFER_SEC:-1200}"
+[ "$RECOVERY_DEFER" -le 1800 ] 2>/dev/null || RECOVERY_DEFER=1800
+RECOVERY_PENDING="$ROOT/recovery.defer"
+SOCK=/run/tt-device-broker/broker.sock
+broker_hold() {  # prints "<held 0|1> <fsm_state> <held_age_sec, -1 unknown>", nothing if no answer
+    curl -fsS --max-time 5 --unix-socket "$SOCK" http://localhost/health 2>/dev/null \
+        | "$VENV/bin/python" -I -c 'import json, sys
+h = json.load(sys.stdin)
+age = h.get("held_age_sec")
+print(int(bool(h.get("held"))), h.get("fsm_state") or "unknown", age if isinstance(age, int) else -1)' 2>/dev/null
+}
+# Succeeds (and names why in $recovery_why) while the update should wait for the recovery.
+recovery_gate() {
+    local held="" state="" age="" now since="" sha="" waited
+    recovery_why=""
+    read -r held state age <<EOF
+$(broker_hold)
+EOF
+    case "${held:-0}:${state:-}" in
+        1:*|*:recovering|*:down) ;;
+        *) return 1 ;;
+    esac
+    [ "$RECOVERY_DEFER" -gt 0 ] 2>/dev/null || return 1
+    now="$(date +%s)"
+    [ -f "$RECOVERY_PENDING" ] && read -r sha since < "$RECOVERY_PENDING" 2>/dev/null
+    # Clocked from the FIRST deferral of a pending update: a newer commit does not restart it.
+    [ -n "${since:-}" ] || since="$now"
+    echo "$remote_sha $since" > "$RECOVERY_PENDING"
+    waited=$(( now - since ))
+    # The deadline this deferral runs to: the bound from the first deferral, or from the hold's
+    # start if that comes sooner.
+    deadline=$(( since + RECOVERY_DEFER ))
+    [ "${age:--1}" -ge 0 ] 2>/dev/null && [ $(( now - age + RECOVERY_DEFER )) -lt "$deadline" ] \
+        && deadline=$(( now - age + RECOVERY_DEFER ))
+    recovery_why="fsm=$state held=$held hold_age=${age:--1}s waited=${waited}s bound=${RECOVERY_DEFER}s apply_by=$(date -d "@$deadline" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo "$deadline")"
+    [ "${age:--1}" -lt "$RECOVERY_DEFER" ] 2>/dev/null || return 1
+    [ "$waited" -lt "$RECOVERY_DEFER" ] || return 1
+    return 0
+}
+if recovery_gate; then
+    echo "autoupdate: broker recovery in progress ($recovery_why); deferring" >&2
+    au_log deferred "broker recovery in progress ($recovery_why)"
+    exit 0
+fi
+[ -n "$recovery_why" ] && echo "autoupdate: broker recovery past the deferral bound ($recovery_why); applying" >&2
+# Drops the dispatch hold on every exit of an applying lap, and records an apply that stopped.
+au_exit() {
+    local rc=$?
+    rm -f "$HOLD" "$HOLD.$$" 2>/dev/null || true
+    [ "$rc" -eq 0 ] || [ "$au_logged" -eq 1 ] \
+        || au_log failed "apply stopped before the restart (exit $rc); installed.sha unchanged, the next lap retries"
+}
 
 # Dispatch hold (spec 08 I18, spec 01 I18). Taken before anything is counted, then a short
 # settle so a dispatch already past the broker's check shows up as a child. A lap that restarts
@@ -230,6 +317,7 @@ count_busy
 if [ "$busy" -ne 0 ]; then
     if ! wait_job_boundary drain; then
         rm -f "$HOLD" 2>/dev/null || true
+        au_log deferred "device op still in flight at the job cap (${JOB_CAP}s); dispatch released, the next lap retries"
         exit 0
     fi
     # The apply's own stretch, under the broker's overdue bound, starts now.
@@ -237,6 +325,7 @@ if [ "$busy" -ne 0 ]; then
 fi
 
 echo "autoupdate: applying ${remote_sha:0:9}" >&2
+trap au_exit EXIT
 # Reset to the sha this lap decided on, NOT to origin/$BR: the drain above can wait for
 # minutes, and a branch that moved in the meantime would otherwise install something this lap
 # never looked at and never announced — and installed.sha would then name the wrong commit.
@@ -320,11 +409,29 @@ count_busy
 if [ $(( kids + holders + ${scopes:-0} )) -ne 0 ] || op_in_flight; then
     if ! wait_job_boundary "restart point"; then
         echo "autoupdate: not restarting, not marking current" >&2
+        au_log deferred "device op still in flight at restart time (job cap ${JOB_CAP}s)"
         exit 0
     fi
+fi
+# Then the recovery deferral again (spec 08 I23): the install and any wait above take a minute or
+# more, and the broker starts holds on its own meanwhile. A hold that began within the deferral
+# bound ends the lap without the restart and before installed.sha moves, so the next lap goes
+# through every gate again.
+if recovery_gate; then
+    echo "autoupdate: broker recovery began during the install ($recovery_why); deferring the restart" >&2
+    au_log deferred "broker recovery in progress at restart time ($recovery_why)"
+    exit 0
 fi
 echo "$remote_sha" > "$STATE"
 chmod -R a+rX "$VENV" 2>/dev/null || true
 
-systemctl restart tt-device-broker
-echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
+rc=0
+systemctl restart tt-device-broker || rc=$?
+rm -f "$RECOVERY_PENDING" 2>/dev/null || true
+if [ "$rc" -eq 0 ]; then
+    echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
+    au_log applied "broker restarted${recovery_why:+ (recovery past the deferral bound: $recovery_why)}"
+else
+    echo "autoupdate: broker restart at ${remote_sha:0:9} failed (exit $rc); reconcile starts it" >&2
+    au_log failed "broker restart failed (exit $rc)"
+fi

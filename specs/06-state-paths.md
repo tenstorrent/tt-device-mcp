@@ -124,6 +124,7 @@ and job exit statuses never hit disk.
 | Device-op inhibit lock | `/run/tt-device-broker/device-op.lock` | `<state>/device-op.lock` (exported by the CLI) | `TT_DEVICE_MCP_DEVICE_OP_LOCK` |
 | Job output spool | `/run/tt-device-broker-spool/` (0700; outside the unit's RuntimeDirectory, so it survives a broker restart) | `<state>/jobspool/` (exported by the CLI) | `TT_DEVICE_MCP_JOB_SPOOL_DIR` |
 | Dispatch hold (autoupdate) | `/run/tt-device-broker/dispatch-hold` | `<state>/dispatch-hold` (sibling of the inhibit lock) | `TT_DEVICE_MCP_DISPATCH_HOLD` |
+| Autoupdate decision log (spec 08 I22) | `/var/log/tt-device-broker/autoupdate.log` (+ `.1`), and the journal tag `tt-device-autoupdate` | n/a (system autoupdate only) | follows `TTDEV_LOG_DIR` |
 | Device-op advisory flock (I8) | `/run/tt-device-broker/device-op.flock` | `<state>/device-op.flock` (sibling of the inhibit lock) | `TT_DEVICE_MCP_DEVICE_OP_FLOCK` |
 | Daemon pid / daemon stdout | n/a (systemd / journald) | `<state>/daemon.pid`, `<state>/daemon.log` | follows the state base |
 | Host config | `/etc/default/tt-device-broker` (written by installer, sourced by apply-host-config, autoupdate, and the Slurm hooks) | n/a | `TTDEV_ETC_DEFAULT` (apply-host-config's render/test seam; also a real runtime override for the Slurm hooks, which source it unconditionally on every invocation) |
@@ -343,6 +344,7 @@ Behavior).
 | `TTDEV_UNIT_PATH` | `/etc/systemd/system/tt-device-broker.service` | Unit path (render seam) |
 | `TTDEV_BRANCH` | `main` | Branch autoupdate tracks — the **only** settable part of the update source (08 I16); the repository itself is a constant in `autoupdate.sh`, not configuration |
 | `TTDEV_AUTOUPDATE` | `1` | Autoupdate master switch. Read at install to seed the config file, and by every lap; `sudo TTDEV_AUTOUPDATE=0 ./install.sh` turns a host off outright (after `sudo`, which resets the environment) |
+| `TTDEV_RECOVERY_DEFER_SEC` | 1200 (capped at 1800; 0 off) | Seconds an update waits while the broker is held or recovering: it applies once the hold is that old or the update has waited that long (spec 08 I23). Delays only the update's restart, never a recovery step |
 | `TTDEV_LOCK` | 0 | Apply the udev device lock at install (shared host) |
 | `TTDEV_HEALTH_PROBE` | 1 | Read by `apply-host-config.sh` from the config file: `0` disables `tt-device-health-probe.timer` (spec 08 I17), anything else enables it |
 | `TTDEV_NO_LOCK` | unset | Back-compat: force cooperative (no lock) |
