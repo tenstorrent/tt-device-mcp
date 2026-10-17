@@ -21,10 +21,11 @@ from typing import Callable, Optional
 
 from tt_device_mcp import alert, metrics, privileges
 from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
+from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count
-from tt_device_mcp.health.monitors.pci import chip_node_present, pci_bus_number
+from tt_device_mcp.health.monitors.pci import chip_node_present, chip_pci_bdfs, pci_bus_number
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
     BLOCKED,
@@ -366,6 +367,8 @@ def _power_cycle_direct_class(
     tray_map: Optional[dict],
     *,
     mesh_reset_failed: bool,
+    present_buses: Optional[Mapping] = None,
+    tray_groups=(),
 ) -> Optional[str]:
     """The I37 fault class of an off-bus set, or None when the ordinary ladder applies.
 
@@ -375,15 +378,47 @@ def _power_cycle_direct_class(
     its one mesh reset first, at the startup gate as at run time: the startup gate also runs after a
     broker restart, and one mesh reset has brought a whole bus back there. ``FAULT_CLASS_WHOLE_TRAY``
     when the set is exactly one or more whole trays and at least one chip of the mesh is still on the
-    bus. Anything else — a partial-tray drop, a single chip, a host with fewer than two trays, or no
-    tray map to say which chips share a tray — is None. Pure and side-effect-free."""
+    bus. With no tray map (a broker that never read a full mesh, as on a boot that came up short),
+    ``present_buses`` (``{chip id: PCI bus}`` of the chips still on the bus) and ``tray_groups`` (the
+    UBB bus groups) decide it instead, see :func:`_whole_trays_absent`. Anything else — a
+    partial-tray drop, a single chip, a host with fewer than two trays, or neither a map nor a
+    presence read that says which chips share a tray — is None. Pure and side-effect-free."""
     if expected < 2 * UBB_CHIP_COUNT or not offbus_chips:
         return None
     if len(offbus_chips) >= expected:
         return FAULT_CLASS_ALL_OFF if mesh_reset_failed else None
     if _ubb_reset_plan(offbus_chips, expected, tray_map) is not None:
         return FAULT_CLASS_WHOLE_TRAY
+    if tray_map is None and _whole_trays_absent(present_buses, expected, len(offbus_chips), tray_groups):
+        return FAULT_CLASS_WHOLE_TRAY
     return None
+
+
+def _whole_trays_absent(present_buses: Optional[Mapping], expected: int, off_bus: int, tray_groups) -> bool:
+    """Whether the chips still on the bus fill whole trays and every chip off the bus is accounted for
+    by trays with none left on it: class A read from presence alone (spec 04 I37), for a broker with
+    no I16 tray map. A tray's chips share one PCI bus group (``bus & 0xF0``, the key tt-smi's UBB
+    tables use), so this needs no board type and no chip numbering, only the live buses.
+
+    True only when the host has exactly ``len(tray_groups)`` trays of ``UBB_CHIP_COUNT`` chips, every
+    present chip sits in a known group, each group holds all or none of its chips, at least one group
+    is empty and one full, and the empty groups' chips are exactly the ``off_bus`` count. Anything
+    unreadable or out of shape is False: the ladder decides, as before. Pure and side-effect-free."""
+    groups = set(tray_groups or ())
+    if not present_buses or not groups or off_bus <= 0 or len(groups) * UBB_CHIP_COUNT != expected:
+        return False
+    if len(present_buses) + off_bus != expected:
+        return False
+    counts = dict.fromkeys(groups, 0)
+    for bus in present_buses.values():
+        group = bus & 0xF0 if isinstance(bus, int) else None
+        if group not in counts:
+            return False
+        counts[group] += 1
+    if any(n not in (0, UBB_CHIP_COUNT) for n in counts.values()):
+        return False
+    empty = sum(1 for n in counts.values() if n == 0)
+    return 0 < empty < len(groups) and empty * UBB_CHIP_COUNT == off_bus
 
 
 def _hold_age_sec(hold_since: str) -> Optional[float]:
@@ -1224,6 +1259,32 @@ class GalaxyRecovery(Recovery):
             return OUTCOME_WAITING
         return OUTCOME_RECOVERED if was_degraded and not self.deps.device_degraded() else OUTCOME_TERMINAL
 
+    def _power_cycle_direct_class_now(self, offbus: set, expected: int, tray_map: Optional[dict], log) -> Optional[str]:
+        """:func:`_power_cycle_direct_class` on this broker's live state. With no tray map, the chips
+        still on the bus are read from sysfs and grouped by tt-smi's UBB bus groups, so a whole-tray
+        drop the broker never saw a full mesh before (a short boot, a restart into a drop) is still
+        class A at its first gate pass, not after the hold ceiling and a mesh reset (spec 04 I37)."""
+        present_buses, groups = None, ()
+        if tray_map is None and 0 < len(offbus) < expected:
+            groups = {g for table in (_ubb_bus_id_tables() or {}).values() for g in table.values()}
+            if groups:
+                present_buses = {i: pci_bus_number(a) for i, a in chip_pci_bdfs().items()}
+        fault_class = _power_cycle_direct_class(
+            offbus,
+            expected,
+            tray_map,
+            mesh_reset_failed=self.mechanism.mesh_reset_failed_this_boot(offbus)
+            or self.mechanism.broker_cycled_this_episode(),
+            present_buses=present_buses,
+            tray_groups=groups,
+        )
+        if fault_class == FAULT_CLASS_WHOLE_TRAY and present_buses is not None:
+            log(
+                f"no tray map banked: the {len(present_buses)} chip(s) on the bus fill whole trays and "
+                f"{len(offbus)} chip(s) are off — class A from bus presence"
+            )
+        return fault_class
+
     async def _power_cycle_direct_from_escalate(
         self, rung: str, gate_phase: str, stage: Optional[str], expected: int, beats: Optional[dict], log
     ) -> Optional[str]:
@@ -1249,13 +1310,7 @@ class GalaxyRecovery(Recovery):
             except Exception:  # noqa: BLE001 - unreadable: no class, the ladder decides as before
                 return None
         offbus = _offbus_chip_ids(beats or {}, expected)
-        fault_class = _power_cycle_direct_class(
-            offbus,
-            expected,
-            self._tray_map_now(),
-            mesh_reset_failed=self.mechanism.mesh_reset_failed_this_boot(offbus)
-            or self.mechanism.broker_cycled_this_episode(),
-        )
+        fault_class = self._power_cycle_direct_class_now(offbus, expected, self._tray_map_now(), log)
         if fault_class is None:
             return None
         fired = await self._power_cycle_direct(
@@ -1783,6 +1838,8 @@ class GalaxyRecovery(Recovery):
         except Exception as exc:  # noqa: BLE001 - best-effort, as for a mesh reset: never blocks recovery
             log(f"could not stop the device pollers before the tray re-power: {exc!r}")
         FABRIC_DEBT.note_reset(f"tray re-power 0x{bitmap:02x}")
+        # A re-power clears the tray's firmware clock cap (spec 03 I35).
+        CEILING.mark_owed(f"tray re-power 0x{bitmap:02x}")
         try:
             return await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
         finally:
@@ -1947,13 +2004,7 @@ class GalaxyRecovery(Recovery):
                 log(f"could not read the heartbeats for the last-chance sweep: {exc!r}")
                 beats = {}
             offbus_chips = _offbus_chip_ids(beats or {}, expected)
-        fault_class = _power_cycle_direct_class(
-            offbus_chips,
-            expected,
-            tray_map,
-            mesh_reset_failed=self.mechanism.mesh_reset_failed_this_boot(offbus_chips)
-            or self.mechanism.broker_cycled_this_episode(),
-        )
+        fault_class = self._power_cycle_direct_class_now(offbus_chips, expected, tray_map, log)
         if fault_class is not None and not await asyncio.to_thread(self.mechanism.scope_active):
             # Spec 04 I37: the sweep's tray re-power and mesh reset have not healed this class (a
             # whole tray, or an all-off bus whose mesh reset already failed). The caller climbs at once.
@@ -3431,6 +3482,7 @@ class GalaxyRecovery(Recovery):
                     # stopped across the whole walk, so not _fire_tray_repower, which would restart them
                     # between trays.
                     FABRIC_DEBT.note_reset(f"tray re-power 0x{bitmap:02x}")
+                    CEILING.mark_owed(f"tray re-power 0x{bitmap:02x}")
                     pcie_guard.note_tray_pulse(walk[: step + 1], tray_map, start_off)
                     plan = await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
                 except asyncio.CancelledError:

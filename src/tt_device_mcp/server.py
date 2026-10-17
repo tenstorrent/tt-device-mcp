@@ -154,6 +154,7 @@ from tt_device_mcp.health import (
     read_health_events,
     read_heartbeats,
     refuse_mesh_reset,
+    sysfs_chip_ids,
     version_floor_warnings,
 )
 from tt_device_mcp.health import (
@@ -997,6 +998,9 @@ device_hold_escalate_bucket: int = 0
 # One early forced escalation per off-bus episode, tracked apart from the ceiling windows so it adds
 # an attempt rather than consuming one (see _offbus_hold_ceiling_sec).
 device_hold_offbus_escalated: bool = False
+# The ceiling window the one-shot found claimed before it claimed its own (it waited out a tenant past
+# the ceiling), so giving the one-shot back gives that window back too; None while it holds no claim.
+device_hold_offbus_prior_bucket: Optional[int] = None
 # Whether the window above was given back because its forced run stood down on a live tenant (spec 04
 # I7): the next spawn first checks the tenant is gone, quietly, so a long tenant hold does not open a
 # device op, a timeline event and a log line every sampler tick (see _rearm_tenant_deferred_window).
@@ -3569,12 +3573,32 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
     """What happens next to a hold, stated only as far as it is armed (spec 03 I55): a message that
     promises an escalation the host switched off sends the operator to wait for nothing."""
     if _force_escalate_enabled():
+        ceiling_min = max(1, round(_stuck_hold_ceiling_sec() / 60))
+        cooldown = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
+        if cooldown is not None and time.time() < cooldown["until"]:
+            # Spec 04 I65: the power cycle this hold needs was refused for a bounded wait; the
+            # watchdog asks again at its end, so that, not the ceiling, is the next step.
+            until = datetime.fromtimestamp(cooldown["until"]).strftime("%H:%M:%S")
+            return (
+                f"Its power cycle waits for the cooldown ({cooldown['cause']}) and is asked again at "
+                f"{until} — /health power_cycle_cooldown.next_deadline."
+            )
+        if off_bus > 0 and isolated_chips:
+            first = max(1, round(_offbus_hold_ceiling_sec() / 60))
+            return (
+                f"The off-bus ladder escalates in ~{first} min (isolated chips) and again at each "
+                f"{ceiling_min}-min hold ceiling — do not plan around waiting the wedge out."
+            )
         if off_bus > 0:
             return (
-                "The off-bus ladder escalates in ~2 min and no hold outlives the 10-min ceiling — do "
-                "not plan around waiting the wedge out."
+                f"A whole-tray drop goes to the power cycle at once (spec 04 I37); any other off-bus "
+                f"hold climbs at the {ceiling_min}-min hold ceiling — do not plan around waiting the "
+                f"wedge out."
             )
-        return "The ladder escalates at the 10-min hold ceiling — do not plan around waiting the wedge out."
+        return (
+            f"The ladder escalates at the {ceiling_min}-min hold ceiling — do not plan around waiting "
+            f"the wedge out."
+        )
     if _selfheal_relift_enabled():
         return (
             "Forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0): only the idle self-heal relift "
@@ -6213,6 +6237,14 @@ def _slurm_step_verdict(*, require_free: bool) -> dict:
     }
 
 
+def _startup_pci_map() -> dict:
+    """``{chip index: PCI address}`` for every chip with a sysfs class node. Built from the
+    enumeration, not from heartbeat reads: a chip whose heartbeat cannot be read (e.g. after a
+    failed reset) still has a node and an address, and it is exactly the chip a bridge reset may
+    need to reach."""
+    return {i: chip_pci_bdf(i) for i in sysfs_chip_ids()}
+
+
 def _device_liveness_reason() -> str:
     """A chip off the PCIe bus RIGHT NOW, read live from one root-free sysfs sample — ''
     if none. Catches the two degraded states no in-memory flag records: a chip gone to
@@ -6227,6 +6259,9 @@ def _device_liveness_reason() -> str:
         return ""  # detector absent on this host — the in-memory signals still stand
     beats = read_heartbeats()
     if not beats:
+        listed = sysfs_chip_ids()
+        if listed:
+            return f"{len(listed)} chip(s) in sysfs, heartbeat unreadable on {len(listed)}"
         return "no chips exposed in sysfs (driver wedged or all chips off the bus)"
     dead = dead_chips(beats)
     if dead:
@@ -6375,7 +6410,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global device_hold_deadline_bucket, device_hold_escalate_bucket
     global device_hold_offbus_escalated, device_hold_alert_next_bucket, device_hold_alert_gap
-    global device_hold_tenant_deferred
+    global device_hold_tenant_deferred, device_hold_offbus_prior_bucket
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
     global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold
     if reason and not device_hold_logged:
@@ -6469,6 +6504,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_escalate_bucket = 0
         # ...and its own early off-bus attempt.
         device_hold_offbus_escalated = False
+        device_hold_offbus_prior_bucket = None
         device_hold_tenant_deferred = False
         # ...and its held-job bound's attempt.
         device_hold_job_bound_escalated = False
@@ -6589,8 +6625,14 @@ def _rearm_tenant_deferred_window(kind: str) -> bool:
     waiting out the whole general ceiling once the tenant had gone. Only the one-shot and the ceiling
     windows are given back; the other kinds keep their own once-per-episode bookkeeping."""
     global device_hold_offbus_escalated, device_hold_escalate_bucket, device_hold_tenant_deferred
+    global device_hold_offbus_prior_bucket
     if kind == "offbus_one_shot":
         device_hold_offbus_escalated = False
+        # The window the one-shot claimed as its own run goes back with it: kept, a hold whose chips
+        # came back meanwhile (no one-shot to retry) waited out one more whole ceiling window.
+        if device_hold_offbus_prior_bucket is not None:
+            device_hold_escalate_bucket = device_hold_offbus_prior_bucket
+            device_hold_offbus_prior_bucket = None
     elif kind == "ceiling_window":
         device_hold_escalate_bucket = max(0, device_hold_escalate_bucket - 1)
     else:
@@ -6722,6 +6764,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     use; a missing or unparseable stamp is not held, so it is not flagged."""
     global device_hold_deadline_bucket, device_hold_escalate_bucket, device_hold_offbus_escalated
     global device_hold_risky_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
+    global device_hold_offbus_prior_bucket
     if not device_hold_episode_since:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
@@ -6791,7 +6834,8 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         if _maybe_spawn_forced_escalation():
             device_hold_offbus_escalated = True
             # A one-shot that waited out a tenant past the ceiling is that window's run as well: one
-            # forced climb, not two back to back.
+            # forced climb, not two back to back. Remember what it claimed over, to give back with it.
+            device_hold_offbus_prior_bucket = device_hold_escalate_bucket
             device_hold_escalate_bucket = max(device_hold_escalate_bucket, int(age // ceiling))
     elif recovery_mechanism is not None and recovery_mechanism.progress_retry_due(device_hold_episode_since):
         # spec 04 I39: a failed mesh reset brought chips back; its one retry runs now, not at the ceiling.
@@ -10205,7 +10249,14 @@ async def _record_startup_health() -> None:
             expected = health_monitor.expected(len(beats))
             verdict, detail, _ev = await asyncio.to_thread(heartbeat_verdict, expected)
             ok = verdict is Verdict.HEALTHY
-            health_event("startup_health", healthy=ok, present=len(beats), expected=expected, detail=detail)
+            health_event(
+                "startup_health",
+                healthy=ok,
+                present=len(beats),
+                in_sysfs=len(await asyncio.to_thread(sysfs_chip_ids)),
+                expected=expected,
+                detail=detail,
+            )
             write_action_log(
                 "[broker]startup",
                 f"device on broker start: {detail}",
@@ -12799,11 +12850,11 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
             f"kernel={env.get('kernel')} chips={len(chips)}"
         )
 
-    # Cache every chip's PCI address while they are all still answering. Once a chip is
+    # Cache every chip's PCI address while its sysfs entry is still there. Once a chip is
     # removed from the kernel its sysfs entry is gone, and with it the path to the bridge
     # that is the only way to reset it.
     global device_pci_map
-    device_pci_map = {i: chip_pci_bdf(i) for i in await asyncio.to_thread(read_heartbeats)}
+    device_pci_map = await asyncio.to_thread(_startup_pci_map)
     if logger:
         logger.info(
             f"HEALTH mapped {len(device_pci_map)} chips to PCI addresses "

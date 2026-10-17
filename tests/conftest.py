@@ -481,6 +481,7 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # first; a leaked flag would make the next test's escalation stand down on its own stub scan.
     monkeypatch.setattr(srv, "device_hold_tenant_deferred", False, raising=False)
     monkeypatch.setattr(srv.galaxy_recovery, "tenant_deferred", False, raising=False)
+    monkeypatch.setattr(srv, "device_hold_offbus_prior_bucket", None, raising=False)
     # A carried-over hold one startup test armed must not tag the next test's device_held.
     monkeypatch.setattr(srv, "_carried_hold", None, raising=False)
     # The idle escalation's and the per-tray BMC reset's once-per-episode latches are per-episode
