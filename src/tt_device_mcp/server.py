@@ -7776,7 +7776,9 @@ def _preempt_ladder_forced(how) -> bool:
     returns nothing counts as unwound."""
     if not isinstance(how, str) or not how:
         return False
-    return not how.endswith(("ladder ended at SIGINT", "ladder ended at already gone", "nothing to stop (no live scope or pid)"))
+    return not how.endswith(
+        ("ladder ended at SIGINT", "ladder ended at already gone", "nothing to stop (no live scope or pid)")
+    )
 
 
 # How often a silent job is noted in its own log. This is the only hang signal that does not
