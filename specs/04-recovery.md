@@ -215,8 +215,8 @@ each rung fires only when the gentler one failed or cannot apply.
   could not run it (I17) — armed means armed AND fireable. A warm reboot is never fired where it
   provably cannot help: a whole-bus drop, a reset that regressed the mesh off the bus, or one that
   hard-exited leaving chips off it routes to the cold rung or holds loudly (`reboot_blocked`),
-  never to a reboot that lands back in the dead state. On a multi-chip mesh with the power cycle armed the reboot is not
-  taken at all (I71).
+  never to a reboot that lands back in the dead state. On a multi-chip mesh with a chip off the bus
+  and the power cycle armed, the cycle goes first and the reboot is only its fallback (I71).
 - **I15 — The mesh-wide reset never fires on a guessed mode.** On a multi-chip host whose reset
   mode could not be declared or derived, the per-target `-r` is still issued (a no-op on a Galaxy
   lets the cascade climb) but a loud `reset_mode_unknown` event marks it — it must never land
@@ -928,27 +928,37 @@ each rung fires only when the gentler one failed or cannot apply.
   never a boot loop, never an open-ended hold. Class A or C after a cycle a later boot verified, at
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
-- **I71 — On a multi-chip mesh the host rung is the power cycle; a warm reboot is not taken while
-  the power cycle is armed.** `_host_escalation_for_drop` names the power cycle for every
-  multi-chip climb when `_auto_power_cycle_enabled` (I14): a partial drop (classes B1, B2), a
-  present-mesh wedge (class D) and a fabric or dispatch fault the ladder could not clear (G2). A
-  warm reboot cannot re-power a UBB or re-enumerate a chip that left the bus, and a whole-bus
-  drop stayed 32/32 off after it; the BMC power cycle does all a reboot does (host restart, PCIe
-  re-enumeration, process teardown, driver reload) and also re-powers the trays. The ladder below
-  the host rung is unchanged: a partial drop still runs the bridge, tray and mesh resets first,
-  and a present-mesh wedge takes its second `glx_reset` (`was_failing`) before the cycle; only a
-  whole-tray or all-off drop goes straight to the cycle (I37). With no power cycle armed the older
-  verdict stands, so no host loses a rung it had: a whole-bus drop, or a reset that regressed the
-  mesh, hard-exited or left chips off below the floor, is `reboot_blocked` and holds loudly;
-  anything else takes the warm reboot. A single-chip host keeps the reboot first. `_route` returns
-  BLOCKED only when no reset scope is live; under a live scope it waits. A governor or I65
-  cooldown denial of the cycle holds and asks again at the stated deadline shown on /health; it
-  never falls back to the reboot. The full health check, fabric included, runs after the cycle
-  before any release (03 I4). Time to recover, armed multi-chip host: B1, B2, D and G2 drop the
-  warm reboot and the boot, startup check and I65 cooldown it started (about 5 min of reboot,
-  then up to 30 min of cooldown before the cycle could follow); the cycle comes right after the
-  ladder, or at the cooldown end when a boot or cycle is less than 30 min old. A, C, single-chip
-  and hosts with no power cycle armed are unchanged.
+- **I71 — With a chip off the bus on a multi-chip mesh, the host rung is the power cycle; the
+  warm reboot is its in-band fallback.** `_host_escalation_for_drop` names the power cycle first
+  for a multi-chip climb with a chip off the bus (`off_bus > 0`: classes B1, B2) when
+  `_auto_power_cycle_enabled` (I14). A warm reboot cannot re-power a UBB or re-enumerate a chip
+  that left the bus (a whole-bus drop stayed 32/32 off after it); the BMC power cycle does all a
+  reboot does and also re-powers the trays. A present mesh (`off_bus == 0`: a wedge, class D, or a
+  fabric or dispatch fault the ladder could not clear, G2) and a single-chip host keep the older
+  order: the warm reboot first (faster: no BMC, no I65 cooldown), the power cycle after it. The
+  ladder below the host rung is unchanged: a partial drop still runs the bridge, tray and mesh
+  resets first, and a present-mesh wedge takes its second `glx_reset` (`was_failing`) before the
+  host rung; only a whole-tray or all-off drop goes straight to the cycle (I37). With no power
+  cycle armed the older verdict stands, so no host loses a rung it had: a whole-bus drop, or a
+  reset that regressed the mesh, hard-exited or left chips off below the floor, is
+  `reboot_blocked` and holds loudly; anything else takes the warm reboot. A power cycle that the
+  governor or the I65 cooldown denies, or that does not launch (unreachable BMC, failing command),
+  falls back to the warm reboot at once, at the gate and on the idle climb
+  (`power_cycle_reboot_fallback`, trigger `denied` or `launch_failed`), but only for a drop the
+  reboot can recover (`_reboot_fallback_eligible`: the drops the no-cycle verdict hands the
+  reboot), only with the reboot opted in, and only within the reboot's own limits (one per boot,
+  the ledger interval). A whole-bus or reboot-futile drop never falls back: it holds and asks for
+  the cycle again at the deadline shown on /health. `_route` returns BLOCKED only when no reset
+  scope is live; under a live scope it waits. The full health check, fabric included, runs after
+  the cycle and after every fallback reboot before any release (03 I4). The I76 10-min hold bound
+  is unchanged. Time to recover, armed multi-chip host, against the base: D and G2 unchanged
+  (reboot, about 3-5 min, then the cycle); a below-floor partial drop unchanged (it was already
+  reboot-futile and cycled); a non-futile partial drop with 16-31 chips off now cycles right after
+  the ladder (about 5-8 min) instead of rebooting first and cycling after the reboot's boot and
+  cooldown, and on a denied or failed cycle reboots at once instead of holding up to 30 min (4 h
+  after repeated unhealed cycles) or retrying a cycle that cannot launch without bound; whole-bus
+  and other reboot-futile drops, class A, C, single-chip hosts and hosts with no power cycle armed
+  are unchanged.
 
 ## Interfaces
 
@@ -1438,9 +1448,9 @@ sees a silent fabric pass.
 | I65 only a verified release with no fabric debt ends the streak; a refused one keeps the hold | `tests/test_power_cycle_cooldown.py::test_only_a_verified_release_with_no_fabric_debt_ends_the_streak` |
 | I65 a failed out-of-band cycle (a second line, same `at_epoch`, cause + ` (cycle failed)`) never counts and cancels its attempt line; an unmatched failure line is ignored; an attempt with no failure line still counts; host boots are unchanged | `tests/test_power_cycle_cooldown.py::test_a_matched_failure_line_drops_the_attempt`, `::test_an_unmatched_failure_line_is_ignored`, `::test_an_attempt_without_a_failure_line_still_counts` |
 | I65 a future, non-finite or unreadable stamp (history file, ledger, heal file) never hides a valid past anchor, never holds the cycle past the stated gap, never keeps the streak past a verified release; every cap denial is on /health | `tests/test_power_cycle_cooldown.py::test_a_nan_or_future_history_line_does_not_hide_the_valid_past_one`, `::test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle`, `::test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health`, `::test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end`, `::test_the_per_boot_cap_denial_shows_on_health`, `::test_a_future_record_does_not_keep_the_streak_past_a_verified_release` |
-| I71 multi-chip names the power cycle over the reboot when armed (present mesh, partial and whole-bus); single-chip keeps the reboot first; with no cycle armed the old verdict stands | `tests/test_offbus_reboot_futile.py::test_multi_chip_takes_the_power_cycle_over_the_reboot_when_armed`, `::test_single_chip_keeps_the_reboot_first`, `::test_without_a_power_cycle_the_old_verdict_stands` |
-| I71 a partial drop past the full ladder and a present-mesh wedge cycle with no reboot; with no cycle armed the wedge still reboots | `tests/test_offbus_reboot_futile.py::test_partial_drop_past_the_ladder_cycles_without_a_reboot`, `::test_present_mesh_wedge_cycles_instead_of_rebooting`, `::test_present_mesh_wedge_still_reboots_with_no_power_cycle`, `::test_next_stage_names_the_power_cycle_for_a_failed_reset_partial_drop`, `::test_next_stage_present_mesh_with_no_power_cycle_still_reboots` |
-| I71 a cooldown denial holds with no reboot fallback; BLOCKED only with no live reset scope | `tests/test_offbus_reboot_futile.py::test_a_cooldown_denial_holds_and_never_falls_back_to_the_reboot`, `::test_a_live_scope_waits_instead_of_blocking` |
+| I71 multi-chip with a chip off the bus names the power cycle over the reboot when armed; a present mesh and a single chip keep the reboot first; with no cycle armed the old verdict stands | `tests/test_offbus_reboot_futile.py::test_multi_chip_offbus_takes_the_power_cycle_over_the_reboot_when_armed`, `::test_a_present_mesh_keeps_the_reboot_first`, `::test_single_chip_keeps_the_reboot_first`, `::test_without_a_power_cycle_the_old_verdict_stands` |
+| I71 a partial drop past the full ladder cycles with no reboot; a present-mesh wedge reboots first with both rungs armed, and with no cycle armed | `tests/test_offbus_reboot_futile.py::test_partial_drop_past_the_ladder_cycles_without_a_reboot`, `::test_present_mesh_wedge_reboots_first_with_both_rungs_armed`, `::test_present_mesh_wedge_still_reboots_with_no_power_cycle`, `::test_next_stage_names_the_power_cycle_for_a_failed_reset_partial_drop`, `::test_next_stage_present_mesh_reboots_first_with_both_rungs_armed`, `::test_next_stage_present_mesh_with_no_power_cycle_still_reboots` |
+| I71 a denied or unlaunched cycle falls back to the reboot only on a drop the reboot can recover, at the gate and on the idle climb; a futile drop and a cooldown denial on one hold; BLOCKED only with no live reset scope | `tests/test_offbus_reboot_futile.py::test_the_reboot_fallback_is_only_for_drops_a_reboot_can_recover`, `::test_a_denied_cycle_falls_back_to_the_reboot_on_a_recoverable_drop`, `::test_both_rungs_denied_holds`, `::test_a_cycle_that_does_not_launch_falls_back_to_the_reboot`, `::test_a_cycle_that_does_not_launch_on_a_futile_drop_never_reboots`, `::test_the_gate_falls_back_to_the_reboot_when_the_cycle_is_denied`, `::test_the_gate_falls_back_to_the_reboot_when_the_cycle_does_not_launch`, `::test_the_gate_cycles_a_partial_drop_when_allowed`, `::test_a_cooldown_denial_on_a_futile_drop_holds_and_never_reboots`, `::test_a_live_scope_waits_instead_of_blocking` |
 | I37/I65 class C at startup: one mesh reset with no failed reset or broker cycle; none after the broker's own cycle, which then waits only for the cooldown | `tests/test_power_cycle_cooldown.py::test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_gets_one_reset`, `::test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_reset`, `::test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not` |
 | I58 all off after a failed reset and a broker restart: the startup or a later gate cycles with no second reset; the sweep skips a failed-unchanged set | `tests/test_classac_power_cycle_direct.py::test_replay_all_off_after_a_restart_cycles_with_no_second_reset`, `::test_a_partial_drop_keeps_the_ladder` |
 | I36 a power cycle that is rate-limited or not opted in never stops resets: a shrinking off-bus set resets again each forced window, and the gate retries its reset once its cooldown ran out | `tests/test_host_action_suppress.py::test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_fire`, `::test_the_gate_keeps_resetting_a_drop_whose_power_cycle_is_not_opted_in` |
