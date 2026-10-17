@@ -7,17 +7,21 @@ Every reset path settles through ``_clear_device_dirty(verified=True)``; while a
 pass, that funnel holds the device fabric-unverified instead of releasing it.
 """
 
+import asyncio
 from datetime import datetime, timedelta
 
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
 from tests.test_device_safety import (
+    DEFAULT_POLLERS,
     _arm_offbus_stuck_hold,
     _arm_stuck_hold,
     _clean_post_job_gate,
+    _reset_that_fails,
     _restart_broker,
     _setup_selfheal_hold,
+    _systemctl_with_units,
 )
 from tests.test_startup_fabric_hugepages import _bound
 from tt_device_mcp import server as srv
@@ -137,6 +141,57 @@ async def test_an_operator_reset_with_a_passing_fabric_pass_releases(mesh, monke
     patch_recovery(monkeypatch, "_verify_device", verify)
     got, _ = await srv._verify_operator_reset(32, srv.galaxy_recovery, lambda m: None, "operator reset")
     assert got is True and srv.fsm.state is ServerState.HEALTHY and FABRIC_DEBT.owed == ""
+
+
+async def _operator_reset_on_a_healthy_mesh(monkeypatch, evidence):
+    """An operator reset (rc 0) on a HEALTHY 32-chip mesh, then its I13 verify returning ``evidence``.
+    Returns (systemctl calls, the poller starts seen while the verify ran)."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    monkeypatch.setattr(srv, "_post_reset_debt", lambda: FABRIC_DEBT.owed)  # a mesh with a fabric check
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+    to_thread, sleep = srv.asyncio.to_thread, srv.asyncio.sleep
+    _reset_that_fails(monkeypatch, rc=0)
+    assert srv.fsm.state is ServerState.HEALTHY
+
+    rc, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-glx_reset"], lambda m: None)
+    assert rc == 0 and srv.fsm.state is ServerState.HEALTHY
+    monkeypatch.setattr(srv.asyncio, "to_thread", to_thread)
+    monkeypatch.setattr(srv.asyncio, "sleep", sleep)
+    monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRY_SLEEP_SEC", 0)
+    seen = []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        seen.extend(c for c in calls if c[0] == "start")
+        return True, dict(evidence)
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    await srv._verify_operator_reset(32, srv.galaxy_recovery, lambda m: None, "operator reset")
+    await asyncio.gather(*list(srv._pollers_restore_tasks))
+    return calls, seen
+
+
+@pytest.mark.asyncio
+async def test_an_operator_reset_starts_the_pollers_only_once_its_fabric_verify_passes(mesh, monkeypatch):
+    """An operator reset leaves the FSM HEALTHY, so its restore started the pollers before the I13
+    fabric verify, which then ran beside their MMIO. The restore waits for the post-reset debt, and
+    the passing fabric pass that settles it starts them, once."""
+    calls, seen = await _operator_reset_on_a_healthy_mesh(monkeypatch, FOK)
+
+    assert seen == [], "the pollers ran during the fabric verify"
+    assert FABRIC_DEBT.owed == "" and srv.fsm.state is ServerState.HEALTHY
+    assert [c for c in calls if c[0] == "start"] == [("start", u) for u in DEFAULT_POLLERS]
+    assert srv._pollers_owed is None
+    assert "pollers_kept_quiesced" in [k for k, _ in mesh]
+
+
+@pytest.mark.asyncio
+async def test_an_operator_reset_whose_fabric_stays_unverified_keeps_the_pollers_stopped(mesh, monkeypatch):
+    """A 77 after the retries holds the mesh: the pollers stay stopped and owed, for the close."""
+    calls, seen = await _operator_reset_on_a_healthy_mesh(monkeypatch, F77)
+
+    assert seen == [] and not [c for c in calls if c[0] == "start"], calls
+    assert _held() and FABRIC_DEBT.owed and srv._pollers_owed
 
 
 @pytest.mark.asyncio

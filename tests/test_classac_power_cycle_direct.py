@@ -69,6 +69,9 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
     monkeypatch.setattr(g.mechanism, "mesh_reset_failed_since_release", False)
     monkeypatch.setattr(g.mechanism, "last_reset_rc", None)
     monkeypatch.setattr(g.mechanism, "_reset_record_cache", None)
+    monkeypatch.setattr(g.mechanism, "whole_tray_off", None)  # spec 04 I73 latch: the mechanism is shared
+    monkeypatch.setattr(g.mechanism, "_ac_power_paged", 0.0)
+    monkeypatch.setattr(g.mechanism, "_ac_power_logged", set())
     monkeypatch.setattr(galaxy, "TRAY_DOWN_RESCAN_SETTLE_SEC", 0)
     monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
     # No operator check installed or configured, and no stand-back marker: nothing objects.
