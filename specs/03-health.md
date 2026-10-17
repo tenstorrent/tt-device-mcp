@@ -866,17 +866,20 @@ job boundary.
   included) and the hold stays with the bounded escalation of I23 if that does not heal it.
   Time to recover (class J): from the release of the last holder to the gate's start is at most
   one recheck period plus one sampler tick, against waiting up to the 600 s ceiling before.
-- **I72 — While the device is held, `/health` says what the hold is and what fires next, read-only.**
-  While the FSM is RECOVERING or DOWN, `/health` carries `hold_class`, `hold_started_at`,
-  `next_rung`, `next_rung_at`, `next_rung_source` and `trays_present`; in any other state none of
-  them is present. `hold_class` is the fault class from the live off-bus count: `A` (whole UBB trays
-  off, the rest on the bus, by the spec 04 I37 classifier), `B1` (1-3 chips off, not whole trays),
-  `B2` (4 or more chips off, not whole trays), `C` (every expected chip off), `D` (every expected
-  chip on the bus: a fabric, eth, ARC or dirty-job hold) or `AC-needed` (in-band power cycles did not
-  heal it); it is `null` with no baseline chip count. `hold_started_at` is the hold episode's start.
-  The next rung and its time come from spec 04 I75. `trays_present` groups the chips on the bus by
-  UBB bus group (spec 04 I16, never by index), with the chips that answer their ARC heartbeat and
-  the time of the one read they come from; it is `null` where tt-smi's tray tables are missing.
+- **I72 — While the device is held, `/health` says what the hold is and what fires next,
+  read-only.** While the FSM is RECOVERING or DOWN, `/health` carries `hold_class`,
+  `hold_started_at`, `next_rung`, `next_rung_at`, `next_rung_source`, `next_rung_due` and
+  `trays_present`; in any other state none of them is present. `hold_class` is the fault class from
+  the live off-bus count: `A` (whole UBB trays off, the rest on the bus, by the spec 04 I37
+  classifier), `B1` (1-3 chips off, not whole trays), `B2` (4 or more chips off, not whole trays),
+  `C` (every expected chip off), `D` (every expected chip on the bus: a fabric, eth, ARC or
+  dirty-job hold) or `AC-needed` (in-band power cycles did not heal it); it is `null` with no
+  baseline chip count. `hold_started_at` is the hold episode's start. The next rung and its time
+  come from spec 04 I75. `next_rung_due` is true when that time has passed and the rung has not run
+  yet. `trays_present` groups the chips on the bus by UBB bus group (spec 04 I16, never by index),
+  with the chips that answer their ARC heartbeat and the time of the one read they come from; a chip
+  the hold counts off the bus (missing from the read, or reading all-ones though its KMD node is
+  still there) is in no tray's `chips_present`; it is `null` where tt-smi's tray tables are missing.
   It is labelled `verified: false` with the text `not verified: sysfs presence and ARC heartbeat
   only; no health check has passed`. The report uses only the sysfs enumeration and heartbeat reads
   `/health` already makes: it never touches a chip, never calls a chip healthy, never admits a job,
@@ -1497,6 +1500,7 @@ refuses.
 | I61 (every other shape keeps today's path) | `tests/test_eth_timeout_reset.py::test_other_no_verdict_reads_keep_todays_fabric_pass`, `tests/test_eth_timeout_reset.py::test_a_frozen_read_keeps_todays_hold`, `tests/test_eth_timeout_reset.py::test_an_off_bus_chip_or_unhealthy_arc_keeps_todays_path`, `tests/test_eth_timeout_reset.py::test_host_pci_not_ok_keeps_todays_fabric_pass`, `tests/test_eth_timeout_reset.py::test_an_outage_hold_refuses_the_reset_and_keeps_todays_pass`, `tests/test_eth_timeout_reset.py::test_a_dirty_exit_still_runs_the_fabric_pass` |
 | I68 (a dirty job_killed/foreign_holder hold with nothing queued gets the post-job gate, fabric forced, once per episode; a failure keeps the hold; anything else owning the device defers it) | `tests/test_holder_release_wait.py::test_a_dirty_killed_hold_with_an_empty_queue_runs_the_full_post_job_gate_once`, `tests/test_holder_release_wait.py::test_a_failed_idle_gate_keeps_the_hold_and_runs_once_per_episode`, `tests/test_holder_release_wait.py::test_an_idle_gate_that_raises_keeps_the_device_held`, `tests/test_holder_release_wait.py::test_the_idle_gate_is_rate_limited`, `tests/test_holder_release_wait.py::test_no_idle_gate_while_anything_else_owns_the_device` |
 | I72 (each fault class is named, with its start and per-tray presence by bus group) | `tests/test_health_hold_report.py::test_class_a_whole_tray_reports_its_tray_by_bus_and_the_ceiling_window`, `tests/test_health_hold_report.py::test_class_b1_isolated_chips_report_the_off_bus_one_shot`, `tests/test_health_hold_report.py::test_class_b2_part_of_one_tray`, `tests/test_health_hold_report.py::test_class_c_all_off_lists_every_tray_empty`, `tests/test_health_hold_report.py::test_class_d_present_mesh_with_a_dead_arc`, `tests/test_health_hold_report.py::test_class_d_arc_not_ready_chip_is_present_but_not_alive`, `tests/test_health_hold_report.py::test_ac_needed_reports_the_recheck`, `tests/test_health_hold_report.py::test_classify_hold`, `tests/test_health_hold_report.py::test_classify_hold_with_no_baseline`, `tests/test_health_hold_report.py::test_trays_group_by_bus_never_by_index` |
+| I72 (a chip off the bus, missing or all-ones with its node present, is in no tray's `chips_present`) | `tests/test_health_hold_report.py::test_an_all_ones_chip_is_in_no_tray_row`, `tests/test_health_hold_report.py::test_class_d_present_mesh_with_a_dead_arc` |
 | I72 (only while RECOVERING or DOWN; unknown baseline or tables report null) | `tests/test_health_hold_report.py::test_recovering_reports_too_and_healthy_does_not`, `tests/test_health_hold_report.py::test_no_baseline_and_no_tables_report_unknown` |
 | I72 (read-only: no rung clock moves, the hold and FSM state stay, no job admitted, never called healthy) | `tests/test_health_hold_report.py::test_the_report_is_read_only` |
 | I69 (a timeout always resets with no pre-reset fabric pass, then the full check, fabric included, before release) | `tests/test_job_kill_reset.py::test_a_timeout_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_requested_kill_of_a_running_job_owes_the_reset` |

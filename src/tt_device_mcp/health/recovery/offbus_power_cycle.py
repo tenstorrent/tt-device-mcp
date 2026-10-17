@@ -493,6 +493,31 @@ def due_for_watchdog(episode: str, now: Optional[datetime] = None) -> bool:
     return bool(_pending.get("gated")) and age is not None and age >= grace_sec()
 
 
+def watchdog_due_at(episode: str) -> Optional[tuple[float, str]]:
+    """``(epoch, kind)``: when :func:`due_for_watchdog` turns true for this episode and the bound that
+    turns it, named as the hold watchdog names it; the earliest when several are armed. None when it
+    never will as things stand (not tracked, already spawned, the ladder has not run, nothing armed).
+    Read-only, for the /health hold report (spec 04 I75): moves no clock."""
+    if not episode or _pending.get("episode") != episode or _pending.get("spawned"):
+        return None
+    if power_cycle_argv() is None:
+        h = _pending.get("handoff")
+        return (float(h["deadline"]), "gated_hold_handoff_bound") if h and h["deadline"] else None
+    if not _pending.get("ladder_ran"):
+        return None
+    out = []
+    if _pending.get("ipmi_at") is not None:
+        out.append((_pending["ipmi_at"].timestamp() + ipmi_handoff_sec(), "ipmi_handoff_bound"))
+    if _pending.get("tray_walk_at") is not None:
+        out.append((_pending["tray_walk_at"].timestamp() + tray_walk_handoff_sec(), "tray_walk_handoff_bound"))
+    if _pending.get("gated"):
+        try:
+            out.append((datetime.fromisoformat(episode).timestamp() + grace_sec(), "gated_offbus_grace"))
+        except (TypeError, ValueError):
+            pass
+    return min(out) if out else None
+
+
 def mark_spawned(episode: str) -> None:
     if _pending.get("episode") == episode:
         _pending["spawned"] = True

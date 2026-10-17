@@ -105,22 +105,16 @@ def classify_hold(
     return CLASS_PARTIAL if off_bus <= PARTIAL_MAX_OFF else CLASS_TRAY_PARTIAL
 
 
-def cooldown_candidate(cooldown: Optional[Mapping], now: float) -> Optional[RungCandidate]:
-    """The governor's armed wait: the I65 cooldown end, or the same field carrying a missed
-    power-cycle retry or an AC-power recheck. None when no wait is running."""
-    if not cooldown:
-        return None
-    try:
-        until = float(cooldown["until"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    if now >= until:
-        return None
+def cooldown_candidate(cooldown: Optional[Mapping], at: float) -> RungCandidate:
+    """The hold watchdog's retry of a power cycle the governor refused (spec 04 I65), due at ``at``:
+    named by the refusal's record as the I65 cooldown end, a missed power-cycle request's retry or an
+    AC-power recheck. The caller passes it only while that retry is armed for this hold episode."""
+    cooldown = cooldown or {}
     if cooldown.get("ac_power_needed"):
-        return RungCandidate(until, "AC-power recheck of the bus", "ac_power_needed")
+        return RungCandidate(at, "AC-power recheck of the bus", "ac_power_needed")
     if cooldown.get("missed"):
-        return RungCandidate(until, "power cycle (retry of a missed request)", "power_cycle_missed_retry")
-    return RungCandidate(until, "power cycle", "power_cycle_cooldown")
+        return RungCandidate(at, "power cycle (retry of a missed request)", "power_cycle_missed_retry")
+    return RungCandidate(at, "power cycle", "power_cycle_cooldown")
 
 
 def next_rung(candidates) -> Optional[RungCandidate]:

@@ -930,24 +930,33 @@ each rung fires only when the gentler one failed or cannot apply.
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
 - **I75 — The next rung `/health` names is the earliest one some code will fire.** One helper
-  (`health/hold_report.py`, used by spec 03 I72) takes the earliest of these armed deadlines and
-  reports its rung, time and source:
-  - the governor's wait on `power_cycle_cooldown_state`: the I65 cooldown end (`power cycle`,
-    source `power_cycle_cooldown`), the same field carrying a missed power-cycle request's retry
-    (source `power_cycle_missed_retry`) or an AC-power recheck of the bus (source
-    `ac_power_needed`);
-  - the off-bus one-shot: hold start plus the off-bus ceiling, while chips are off the bus and that
-    hold episode's one-shot has not fired (`forced ladder`, source `off-bus one-shot`);
-  - the next hold-ceiling window not yet escalated (`forced ladder`, source `hold ceiling window
-    <n>`);
+  (`health/hold_report.py`, used by spec 03 I72) mirrors the hold-deadline watchdog's clocks and its
+  guards, takes the earliest armed deadline and reports its rung, time and source:
+  - with no hold-episode clock (the one the watchdog keys on), no forced candidate: the watchdog
+    fires none, so only a registered feed may name one;
+  - with the forced escalation off or a fabric-77-only hold, no forced candidate either;
+  - while a host reboot or power cycle the broker requested is still pending, that request: every
+    forced spawn declines until the pending window ends, so the time is the window's end (source
+    `host_action_pending`);
+  - otherwise the earliest of: the off-bus forced pass at the bound
+    `offbus_power_cycle.watchdog_due_at` reports for this episode (the gated off-bus grace, the BMC
+    IPMI hand-off bound, the failed tray walk hand-off bound, or with no power-cycle command the
+    I33 operator hand-off deadline; each named in the source); the I65 retry of a power cycle the
+    governor refused, only while that retry is armed for this hold episode (`power cycle`, source
+    `power_cycle_cooldown`, or `power_cycle_missed_retry` / `ac_power_needed` when the refusal
+    record says so); then, in the watchdog's own branch order, the off-bus one-shot (hold start plus
+    the one-shot wait, while chips are off the bus and the episode's one-shot has not run), else the
+    I39 progress retry when armed for the episode, else the next unspent ceiling window
+    (`device_hold_escalate_bucket + 1`, at least 1, at hold start plus that many ceilings);
   - every registered deadline feed.
-  The off-bus one-shot and the ceiling windows appear only while the forced escalation is on and the
-  hold is not a fabric-77-only hold, the same conditions the hold-deadline watchdog checks; with no
-  armed deadline the fields are `null`. A feed that raises reports nothing, so `/health` always
-  answers. The helper mirrors the watchdog's clocks and never claims or moves one. A hold bound
-  registers through `register_deadline_feed`: `hold_bound_candidate` reports the full ladder, then a
-  power cycle, at hold start plus 600 s, or at the boot/post-cycle cooldown's end when that is
-  later. It is not registered until the code that enforces the bound registers it, because
+  A deadline that has passed but whose spawn was declined (a device op or an escalation in flight)
+  is reported at its own time with `next_rung_due: true`, never moved to a later window: the
+  watchdog retries it every tick. With no armed deadline the fields are `null`. A feed that raises
+  reports nothing, so `/health` always answers. The helper never claims, moves or expires a clock (it
+  reads a pending host request without `host_action_pending()`, which drops an expired one). A
+  hold bound registers through `register_deadline_feed`: `hold_bound_candidate` reports the full
+  ladder, then a power cycle, at hold start plus 600 s, or at the boot/post-cycle cooldown's end when
+  that is later. It is not registered until the code that enforces the bound registers it, because
   `/health` names only rungs some code will fire. TTR effect 0 for every class: nothing here changes
   when or whether a rung fires.
 
@@ -1487,4 +1496,7 @@ sees a silent fabric pass.
 | Stage metrics: structural inapplicability is not "blocked" | `tests/test_metrics.py::test_ubb_tray_no_tray_on_this_platform_is_not_applicable_not_blocked`, `tests/test_metrics.py::test_bridge_reset_missing_pci_address_is_not_applicable_not_blocked` |
 | I75 (the earliest armed deadline: cooldown end, missed retry, AC-power recheck, off-bus one-shot, ceiling window) | `tests/test_health_hold_report.py::test_class_a_inside_the_cooldown_reports_the_cycle_at_the_cooldown_end`, `tests/test_health_hold_report.py::test_missed_power_cycle_retry_is_named`, `tests/test_health_hold_report.py::test_ac_needed_reports_the_recheck`, `tests/test_health_hold_report.py::test_class_b1_isolated_chips_report_the_off_bus_one_shot`, `tests/test_health_hold_report.py::test_class_b1_after_its_one_shot_reports_the_ceiling`, `tests/test_health_hold_report.py::test_a_later_ceiling_window_is_reported_after_the_first`, `tests/test_health_hold_report.py::test_cooldown_candidate_and_next_rung` |
 | I75 (no forced rung on a fabric-77-only hold or with the forced escalation off) | `tests/test_health_hold_report.py::test_fabric_77_only_hold_names_no_forced_rung`, `tests/test_health_hold_report.py::test_force_escalate_off_names_no_forced_rung` |
+| I75 (the off-bus forced pass bounds: gated grace, IPMI and tray-walk hand-offs, gated operator hand-off; only after the ladder ran; the I39 progress retry) | `tests/test_health_hold_report.py::test_the_off_bus_forced_pass_bounds_are_named_when_they_fire`, `tests/test_health_hold_report.py::test_the_off_bus_pass_waits_for_the_ladder_to_have_run`, `tests/test_health_hold_report.py::test_the_i39_progress_retry_is_named` |
+| I75 (a declined deadline stays reported with `next_rung_due`; no episode clock names no forced rung) | `tests/test_health_hold_report.py::test_a_declined_window_stays_reported_as_due`, `tests/test_health_hold_report.py::test_no_episode_clock_names_no_forced_rung` |
+| I75 (the I65 retry only when armed for the episode and not refused by a guard; a pending host action is reported, never dropped) | `tests/test_health_hold_report.py::test_the_cooldown_retry_is_named_only_when_the_watchdog_asks_it`, `tests/test_health_hold_report.py::test_the_cooldown_retry_fires_when_reported`, `tests/test_health_hold_report.py::test_a_pending_host_action_is_reported_and_left_alone` |
 | I75 (deadline feeds: the hold bound wins when earlier, moves to the cooldown end inside it; a broken feed reports nothing) | `tests/test_health_hold_report.py::test_the_hold_bound_feed_wins_when_earlier`, `tests/test_health_hold_report.py::test_the_hold_bound_inside_the_cooldown_moves_to_its_end`, `tests/test_health_hold_report.py::test_a_broken_feed_reports_nothing` |

@@ -17,6 +17,8 @@ from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import hold_report as hr
 from tt_device_mcp.health.monitors.heartbeat import ALL_ONES
+from tt_device_mcp.health.monitors.pci import SAMPLE_INTERVAL_SEC
+from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 
 T0 = 1_800_000_000.0
 START = T0 - 60  # the hold began a minute before the read
@@ -47,6 +49,7 @@ def held(monkeypatch, galaxy_trays):
     monkeypatch.setattr(srv, "device_hold_episode_since", datetime.fromtimestamp(START).isoformat())
     monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
     monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
+    monkeypatch.setattr(srv, "device_hold_offbus_tenant_wait", False)
     monkeypatch.setattr(srv, "isolated_chips", set())
     monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: False)
     monkeypatch.setattr(srv, "heartbeat_supported", lambda refresh=False: True)
@@ -54,6 +57,12 @@ def held(monkeypatch, galaxy_trays):
     monkeypatch.setattr(srv.health_monitor, "expected", lambda present: EXPECTED)
     monkeypatch.setattr(srv, "_ubb_bus_id_tables", lambda: TABLES)
     monkeypatch.setattr(m, "power_cycle_cooldown_state", None)
+    monkeypatch.setattr(m, "power_cycle_retry", None)
+    monkeypatch.setattr(m, "progress_retry", None)
+    monkeypatch.setattr(m, "host_action_requested", None)
+    monkeypatch.setattr(opc, "_pending", {})
+    monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_STUCK_HOLD_SEC", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_HOLD_SEC", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_FORCE_ESCALATE", raising=False)
@@ -66,10 +75,9 @@ def held(monkeypatch, galaxy_trays):
     monkeypatch.setattr(srv, "read_heartbeats", beats)
     monkeypatch.setattr(srv, "arc_not_ready_chips", lambda b: set())
     monkeypatch.setattr(srv, "_live_offbus_state", lambda: {})
+    # Like the real one: every KMD node, a chip reading all-ones included.
     monkeypatch.setattr(
-        srv,
-        "chip_pci_bdfs",
-        lambda: {i: a for i, a in enumerate(GALAXY_BUS_IDS) if i not in st["off"] and i not in st["dead"]},
+        srv, "chip_pci_bdfs", lambda: {i: a for i, a in enumerate(GALAXY_BUS_IDS) if i not in st["off"]}
     )
     # Anything that would move a rung or touch a chip fails the test outright.
     monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: pytest.fail("the report spawned a rung"))
@@ -80,6 +88,16 @@ def held(monkeypatch, galaxy_trays):
 
 def _payload():
     return srv._health_payload(now=datetime.fromtimestamp(T0))
+
+
+def _episode() -> str:
+    return srv.device_hold_episode_since
+
+
+def _deny(m, until: float, **kw) -> None:
+    """What the governor's refusal sets (base._deny_power_cycle): the record and this episode's retry."""
+    m.power_cycle_cooldown_state = _cool(until=until, **{"last": START - 1500, **kw})
+    m.power_cycle_retry = (until, _episode())
 
 
 def _rows(p):
@@ -105,7 +123,7 @@ def test_class_a_whole_tray_reports_its_tray_by_bus_and_the_ceiling_window(held)
 
 def test_class_a_inside_the_cooldown_reports_the_cycle_at_the_cooldown_end(held):
     held["off"] = set(TRAY_CHIPS[0x40])
-    held["m"].power_cycle_cooldown_state = _cool(until=START + 300, last=START - 1500)
+    _deny(held["m"], START + 300, last=START - 1500)
     p = _payload()
     assert p["hold_class"] == "A"
     assert (p["next_rung"], p["next_rung_at"]) == ("power cycle", _iso(START + 300))
@@ -114,12 +132,17 @@ def test_class_a_inside_the_cooldown_reports_the_cycle_at_the_cooldown_end(held)
 
 
 def test_class_b1_isolated_chips_report_the_off_bus_one_shot(held, monkeypatch):
+    """The one-shot's own wait (one sampler interval on a tenant-free box, the tenant bound after a
+    tenant deferred it), not the off-bus ceiling."""
     held["off"] = {3, 4}
     monkeypatch.setattr(srv, "isolated_chips", {"3", "4"})
     p = _payload()
     assert p["hold_class"] == "B1"
     assert (p["next_rung"], p["next_rung_source"]) == ("forced ladder", "off-bus one-shot")
-    assert p["next_rung_at"] == _iso(START + 120)
+    assert p["next_rung_at"] == _iso(START + SAMPLE_INTERVAL_SEC) and p["next_rung_due"] is True
+    monkeypatch.setattr(srv, "device_hold_offbus_tenant_wait", True)
+    p = _payload()
+    assert p["next_rung_at"] == _iso(START + 120) and p["next_rung_due"] is False
     assert _rows(p)["0x00"]["chips_present"] == [0, 1, 2, 5, 6, 7]
 
 
@@ -185,7 +208,7 @@ def test_force_escalate_off_names_no_forced_rung(held, monkeypatch):
 
 def test_ac_needed_reports_the_recheck(held):
     held["off"] = set(TRAY_CHIPS[0x40])
-    held["m"].power_cycle_cooldown_state = _cool(until=T0 + 240, last=T0 - 60, ac_power_needed={"attempts": 2})
+    _deny(held["m"], T0 + 240, last=T0 - 60, ac_power_needed={"attempts": 2})
     p = _payload()
     assert p["hold_class"] == "AC-needed"
     assert (p["next_rung"], p["next_rung_at"]) == ("AC-power recheck of the bus", _iso(T0 + 240))
@@ -193,7 +216,7 @@ def test_ac_needed_reports_the_recheck(held):
 
 def test_missed_power_cycle_retry_is_named(held):
     held["off"] = set(TRAY_CHIPS[0x40])
-    held["m"].power_cycle_cooldown_state = _cool(until=T0 + 30, last=T0 - 900, missed=1)
+    _deny(held["m"], T0 + 30, last=T0 - 900, missed=1)
     p = _payload()
     assert p["next_rung"] == "power cycle (retry of a missed request)"
     assert p["next_rung_source"] == "power_cycle_missed_retry" and p["next_rung_at"] == _iso(T0 + 30)
@@ -260,6 +283,176 @@ def test_the_report_is_read_only(held):
     assert "healthy" not in str(p["trays_present"]).lower()
 
 
+# ---- review findings: the report mirrors the watchdog's clocks and guards -------------------------
+
+
+def _fires(t: float, monkeypatch) -> list:
+    """The trigger kinds _check_hold_deadline asks a forced spawn for at epoch ``t``. The spawn
+    declines, so no latch moves and the call repeats."""
+    asked: list = []
+
+    def spawn():
+        if srv._force_escalate_enabled():  # the real spawn's first guard: the kill-switch declines it
+            asked.append(srv.device_hold_escalation_kind)
+        return False
+
+    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", spawn)
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 10**6)  # keep the deadline alert quiet
+    srv._check_hold_deadline(now=datetime.fromtimestamp(t))
+    return asked
+
+
+def _gated(monkeypatch, **pending) -> None:
+    """An off-bus whole-tray hold the gate refuses, its one-shot spent, the ladder's safe rungs run."""
+    monkeypatch.setattr(srv, "isolated_chips", {str(i) for i in TRAY_CHIPS[0x40]})
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", True)
+    opc._pending.update(episode=_episode(), ladder_ran=True, spawned=False, **pending)
+
+
+@pytest.mark.parametrize(
+    "pending, cmd, at, source",
+    [
+        ({"gated": True}, True, START + 300, "gated off-bus grace"),
+        ({"ipmi_at": datetime.fromtimestamp(START + 30)}, True, START + 330, "BMC IPMI hand-off bound"),
+        ({"tray_walk_at": datetime.fromtimestamp(START + 20)}, True, START + 320, "failed tray walk hand-off bound"),
+        (
+            {"handoff": {"deadline": START + 1200, "why": "w", "latched": "", "operator_seen": "none"}},
+            False,
+            START + 1200,
+            "gated off-bus operator hand-off bound",
+        ),
+    ],
+)
+def test_the_off_bus_forced_pass_bounds_are_named_when_they_fire(held, monkeypatch, pending, cmd, at, source):
+    """F1: the watchdog forces a pass at each of these bounds, before the ceiling window (the hand-off
+    one outlasts window 1 and is reported once that window is spent)."""
+    held["off"] = set(TRAY_CHIPS[0x40])
+    _gated(monkeypatch, **pending)
+    if cmd:
+        monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "/bin/true")
+    if at > START + 600:
+        monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
+        monkeypatch.setattr(srv, "_stuck_hold_ceiling_sec", lambda: 1800)
+    p = _payload()
+    assert (p["next_rung"], p["next_rung_source"], p["next_rung_at"]) == ("forced ladder", source, _iso(at))
+    assert not _fires(at - 1, monkeypatch) and _fires(at, monkeypatch), "the watchdog fires at the reported time"
+    opc.mark_spawned(_episode())
+    assert srv._health_payload(now=datetime.fromtimestamp(T0))["next_rung_source"] != source, "spent: not again"
+
+
+def test_the_off_bus_pass_waits_for_the_ladder_to_have_run(held, monkeypatch):
+    held["off"] = set(TRAY_CHIPS[0x40])
+    _gated(monkeypatch, gated=True)
+    opc._pending["ladder_ran"] = False
+    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "/bin/true")
+    assert _payload()["next_rung_source"] == "hold ceiling window 1"
+    assert opc.watchdog_due_at(_episode()) is None and opc.watchdog_due_at("other") is None
+
+
+def test_the_i39_progress_retry_is_named(held, monkeypatch):
+    """F1: a failed mesh reset that brought chips back retries early, not at the ceiling."""
+    held["off"] = {3, 4, 5, 6}
+    held["m"].progress_retry = (_episode(), srv.time.monotonic() + 45)
+    p = _payload()
+    assert p["next_rung_source"] == "progress retry"
+    assert abs(datetime.fromisoformat(p["next_rung_at"]).timestamp() - (T0 + 45)) <= 2
+    held["m"].progress_retry = (_episode(), srv.time.monotonic() - 1)
+    p = _payload()
+    assert p["next_rung_at"] == _iso(T0) and p["next_rung_due"] is True
+    assert _fires(T0, monkeypatch) == ["progress_retry"]
+    held["m"].progress_retry = ("another episode", srv.time.monotonic() - 1)
+    assert _payload()["next_rung_source"] == "hold ceiling window 1"
+
+
+def test_a_declined_window_stays_reported_as_due(held, monkeypatch):
+    """F2a: window 1 is due at 600 s; its spawn was declined, so at 700 s it is still window 1 (the
+    watchdog retries it every tick), never window 2 at 1200 s."""
+    held["off"] = set(TRAY_CHIPS[0x40])
+    p = srv._health_payload(now=datetime.fromtimestamp(START + 700))
+    assert (p["next_rung_source"], p["next_rung_at"], p["next_rung_due"]) == (
+        "hold ceiling window 1",
+        _iso(START + 600),
+        True,
+    )
+    assert _fires(START + 700, monkeypatch) == ["ceiling_window"]
+    assert _fires(START + 599, monkeypatch) == [] and _fires(START + 600, monkeypatch) == ["ceiling_window"]
+
+
+def test_no_episode_clock_names_no_forced_rung(held, monkeypatch):
+    """F2b: the watchdog keys on the episode clock and fires nothing without it, so the report names
+    no forced rung (the start may still come from the held stamp)."""
+    held["off"] = set(TRAY_CHIPS[0x40])
+    monkeypatch.setattr(srv, "isolated_chips", {"9"})
+    monkeypatch.setattr(srv, "device_hold_episode_since", "")
+    monkeypatch.setattr(srv, "device_held_since", datetime.fromtimestamp(START).isoformat())
+    _deny(held["m"], T0 + 30)
+    p = _payload()
+    assert p["next_rung"] is None and p["next_rung_at"] is None and p["next_rung_due"] is False
+    assert p["hold_started_at"] == _iso(START)
+    assert _fires(START + 3600, monkeypatch) == []
+
+
+@pytest.mark.parametrize("case", ["force_off", "only_77", "other_episode", "no_retry"])
+def test_the_cooldown_retry_is_named_only_when_the_watchdog_asks_it(held, monkeypatch, case):
+    """F2c: the watchdog asks a refused power cycle again only in the episode it was refused in,
+    through the forced spawn (kill-switch on), and never on a 77-only hold."""
+    held["off"] = set(TRAY_CHIPS[0x40])
+    _deny(held["m"], START + 300, last=START - 1500)
+    if case == "force_off":
+        monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
+    elif case == "only_77":
+        monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: True)
+    elif case == "other_episode":
+        held["m"].power_cycle_retry = (START + 300, "2020-01-01T00:00:00")
+    else:
+        held["m"].power_cycle_retry = None
+    p = _payload()
+    assert p["next_rung_source"] != "power_cycle_cooldown"
+    if case in ("force_off", "only_77"):
+        assert p["next_rung"] is None
+    assert "power_cycle_cooldown" not in _fires(START + 300, monkeypatch)
+    assert p["power_cycle_cooldown"]["next_deadline"] == _iso(START + 300), "the cooldown end still shows"
+
+
+def test_the_cooldown_retry_fires_when_reported(held, monkeypatch):
+    held["off"] = set(TRAY_CHIPS[0x40])
+    _deny(held["m"], START + 300, last=START - 1500)
+    assert _payload()["next_rung_at"] == _iso(START + 300)
+    assert "power_cycle_cooldown" not in _fires(START + 299, monkeypatch)
+    assert "power_cycle_cooldown" in _fires(START + 300, monkeypatch)
+
+
+def test_a_pending_host_action_is_reported_and_left_alone(held, monkeypatch):
+    """F2c: while a requested host action is pending every forced spawn declines; the report names
+    the request and its window end, and reading it neither drops nor journals the request."""
+    held["off"] = set(TRAY_CHIPS[0x40])
+    _deny(held["m"], T0 + 30)
+    monkeypatch.setattr(srv, "host_action_pending_sec", lambda: 900.0)
+    req = ("power-cycle", srv.time.monotonic() - 100)
+    held["m"].host_action_requested = req
+    p = _payload()
+    assert p["next_rung_source"] == "host_action_pending" and "power-cycle" in p["next_rung"]
+    assert abs(datetime.fromisoformat(p["next_rung_at"]).timestamp() - (T0 + 800)) <= 2
+    held["m"].host_action_requested = ("reboot", srv.time.monotonic() - 1000)  # expired
+    expired = held["m"].host_action_requested
+    events: list = []
+    monkeypatch.setattr(srv, "health_event", lambda *a, **k: events.append(a))
+    assert _payload()["next_rung_source"] == "power_cycle_cooldown", "past the window the retry is next"
+    assert held["m"].host_action_requested is expired and not events, "the report expires nothing"
+
+
+def test_an_all_ones_chip_is_in_no_tray_row(held):
+    """F3: chip_pci_bdfs lists an all-ones chip's KMD node; the hold counts it off the bus, so its
+    tray row does not list it, and the classifier still sees the ladder's input."""
+    held["dead"] = {9}
+    p = _payload()
+    assert 9 in srv.chip_pci_bdfs(), "the fixture lists it like the real enumeration"
+    assert p["hold_class"] == "B1"
+    rows = _rows(p)
+    assert all(9 not in r["chips_present"] and 9 not in r["arc_alive"] for r in rows.values())
+    assert sum(len(r["chips_present"]) for r in rows.values()) == EXPECTED - 1
+
+
 # ---- the pure helpers ----------------------------------------------------------------------------
 
 
@@ -299,9 +492,8 @@ def test_trays_group_by_bus_never_by_index():
 
 
 def test_cooldown_candidate_and_next_rung():
-    assert hr.cooldown_candidate(None, T0) is None
-    assert hr.cooldown_candidate({"until": T0}, T0) is None, "an ended wait arms nothing"
-    assert hr.cooldown_candidate({"until": "bad"}, T0) is None
+    assert hr.cooldown_candidate(None, T0) == hr.RungCandidate(T0, "power cycle", "power_cycle_cooldown")
+    assert hr.cooldown_candidate({"missed": 1}, T0).source == "power_cycle_missed_retry"
     a = hr.RungCandidate(T0 + 5, "x", "a")
     b = hr.RungCandidate(T0 + 1, "y", "b")
     assert hr.next_rung([None, a, b]) is b and hr.next_rung([]) is None

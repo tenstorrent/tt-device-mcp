@@ -6558,26 +6558,73 @@ def _hold_tray_groups() -> dict:
     return {group: None for t in tables.values() for group in t.values()}
 
 
-def _hold_next_rung(started: float, now_epoch: float) -> Optional[hold_report.RungCandidate]:
-    """The next rung the broker has armed for this hold and when it fires (spec 04 I75): the
-    earliest of the governor's wait (the I65 cooldown end, a missed power-cycle retry or an AC-power
-    recheck, all on ``power_cycle_cooldown_state``), the off-bus one-shot, the next hold-ceiling
-    window, and any registered deadline feed (the universal hold bound's hook). Read-only: it
-    mirrors ``_check_hold_deadline``'s clocks and never claims or moves one."""
-    cooldown = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
-    candidates = [hold_report.cooldown_candidate(cooldown, now_epoch)]
-    cooldown_until = candidates[0].at if candidates[0] is not None else None
-    if _force_escalate_enabled() and not _fabric_77_only_hold():
-        if isolated_chips and not device_hold_offbus_escalated:
-            candidates.append(
-                hold_report.RungCandidate(started + _offbus_hold_ceiling_sec(), "forced ladder", "off-bus one-shot")
+# Names for the watchdog's off-bus forced-pass bounds (offbus_power_cycle.watchdog_due_at kinds).
+_HOLD_OFFBUS_DUE_SOURCES = {
+    "gated_offbus_grace": "gated off-bus grace",
+    "ipmi_handoff_bound": "BMC IPMI hand-off bound",
+    "tray_walk_handoff_bound": "failed tray walk hand-off bound",
+    "gated_hold_handoff_bound": "gated off-bus operator hand-off bound",
+}
+
+
+def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
+    """The next rung the broker has armed for this hold and when it fires (spec 04 I75), mirroring
+    ``_check_hold_deadline``'s clocks AND its guards: none without the episode clock the watchdog keys
+    on; no forced candidate when the kill-switch is off or the hold is 77-only; while a requested host
+    action is pending, that request and the end of its window (every forced spawn declines until then).
+    Otherwise the earliest of the off-bus forced pass (gated grace, IPMI, tray-walk and operator
+    hand-off bounds), the I65 retry of a refused power cycle in this episode, then the watchdog's own
+    branch order: the off-bus one-shot, the I39 progress retry, or the next unspent ceiling window
+    (reported at its own time even when past: a declined spawn retries it every tick). Plus any
+    registered deadline feed. Read-only: it never claims, moves or expires a clock."""
+    episode = device_hold_episode_since
+    try:
+        started = datetime.fromisoformat(episode).timestamp() if episode else None
+    except ValueError:
+        started = None
+    if started is None:
+        return None
+    m = recovery_mechanism
+    cooldown = m.power_cycle_cooldown_state if m is not None else None
+    cooldown_until = None
+    try:
+        if cooldown and now_epoch < float(cooldown["until"]):
+            cooldown_until = float(cooldown["until"])
+    except (KeyError, TypeError, ValueError):
+        cooldown_until = None
+    fed = hold_report.fed_candidates(started, now_epoch, cooldown_until)
+    if not _force_escalate_enabled() or _fabric_77_only_hold():
+        return hold_report.next_rung(fed)
+    # Read the request without host_action_pending(), which drops an expired one and journals it.
+    req = getattr(m, "host_action_requested", None) if m is not None else None
+    if req is not None:
+        left = host_action_pending_sec() - (time.monotonic() - req[1])
+        if left > 0:
+            return hold_report.RungCandidate(
+                now_epoch + left,
+                f"forced ladder if the requested host {req[0]} has not happened by then",
+                "host_action_pending",
             )
+    candidates = list(fed)
+    due = offbus_power_cycle.watchdog_due_at(episode)
+    if due is not None:
+        candidates.append(hold_report.RungCandidate(due[0], "forced ladder", _HOLD_OFFBUS_DUE_SOURCES[due[1]]))
+    retry = getattr(m, "power_cycle_retry", None) if m is not None else None
+    if retry is not None and retry[1] and retry[1] == episode:
+        candidates.append(hold_report.cooldown_candidate(cooldown, float(retry[0])))
+    if isolated_chips and not device_hold_offbus_escalated:
+        candidates.append(
+            hold_report.RungCandidate(started + _offbus_one_shot_sec(), "forced ladder", "off-bus one-shot")
+        )
+    elif m is not None and m.progress_retry is not None and m.progress_retry[0] == episode:
+        left = m.progress_retry[1] - time.monotonic()
+        candidates.append(hold_report.RungCandidate(now_epoch + max(0.0, left), "forced ladder", "progress retry"))
+    else:
         ceiling = _stuck_hold_ceiling_sec()
-        window = max(device_hold_escalate_bucket + 1, int((now_epoch - started) // ceiling) + 1)
+        window = max(1, device_hold_escalate_bucket + 1)
         candidates.append(
             hold_report.RungCandidate(started + window * ceiling, "forced ladder", f"hold ceiling window {window}")
         )
-    candidates.extend(hold_report.fed_candidates(started, now_epoch, cooldown_until))
     return hold_report.next_rung(candidates)
 
 
@@ -6623,13 +6670,20 @@ def _hold_report(now: Optional[datetime] = None) -> dict:
         )
         alive = {i for i in beats if i not in set(dead_chips(beats))}
         if groups:
+            # A chip reading all-ones still has its KMD node, so chip_pci_bdfs lists it; it is off the
+            # bus all the same (hold_class counts it so), so the tray rows leave it out. The
+            # classifier above keeps the ladder's own present_buses input.
+            on_bus = {i: b for i, b in present.items() if int(i) not in off_ids}
             read_at = now.isoformat(timespec="seconds")
-            trays = hold_report.trays_present(present, alive, groups, read_at, UBB_CHIP_COUNT)
+            trays = hold_report.trays_present(on_bus, alive, groups, read_at, UBB_CHIP_COUNT)
     out["hold_class"] = hold_class
-    rung = _hold_next_rung(started, now_epoch) if started is not None else None
+    rung = _hold_next_rung(now_epoch)
     out["next_rung"] = rung.rung if rung else None
     out["next_rung_at"] = datetime.fromtimestamp(rung.at).isoformat(timespec="seconds") if rung else None
     out["next_rung_source"] = rung.source if rung else None
+    # Past its time and not yet run (a declined spawn: a device op or escalation in flight): the
+    # watchdog retries it every tick.
+    out["next_rung_due"] = bool(rung and rung.at <= now_epoch)
     out["trays_present"] = (
         {"verified": False, "label": hold_report.NOT_VERIFIED, "trays": trays} if trays is not None else None
     )
