@@ -3131,7 +3131,7 @@ async def _verify_operator_reset(present: int, recovery, log, source: str) -> tu
     global _reset_verify_fabric_ok_monotonic
     expected = recovery.monitor.expected(present)
     # Read before the verify: only a pass that started with the 1G pool ready can stand in for the
-    # startup gate's own (spec 03 I56), which never runs before the pool is ready.
+    # startup gate's own (spec 03 I73), which never runs before the pool is ready.
     started = time.monotonic()
     pool_ready = False
     if expected > 1 and fabric.build_command() is not None:
@@ -3177,7 +3177,7 @@ _reset_verify_fabric_ok_monotonic: float = 0.0
 def _startup_pass_from_reset_verify() -> str:
     """Why the startup gate may count an operator reset's verify as its own pass, or "" to run it.
 
-    Spec 03 I56. A reset during the startup hold runs the full check, fabric included, and releases
+    Spec 03 I73. A reset during the startup hold runs the full check, fabric included, and releases
     the device on a pass; the deferred startup gate then ran a second full pass (~30 s on a galaxy)
     over a mesh nothing had touched since. It counts only a verify that started after the gate was
     armed and with the 1G pool ready, and only while the device is still HEALTHY, clean and owes no
@@ -5104,7 +5104,7 @@ async def device_health_gate(
         # to one pass per interval.
         global last_fabric_check_monotonic, last_fabric_ok_monotonic
         # The forced startup pass, queued behind an operator reset whose verify already proved the
-        # mesh (fabric included) since this broker started: that verify is the startup pass (I56).
+        # mesh (fabric included) since this broker started: that verify is the startup pass (I73).
         # Its healthy fabric pass is the newest one, so a later run_fabric caller sees it as fresh.
         counted = _startup_pass_from_reset_verify() if phase == "startup" and force_fabric else ""
         if counted:

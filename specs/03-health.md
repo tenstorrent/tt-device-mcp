@@ -39,7 +39,7 @@ job boundary.
   RECOVERING(`startup_unverified`) absent an open episode; an episode still open on disk
   (RECOVERING or DOWN) is adopted unconditionally. There is no "clean boot, skip the verify"
   branch. Only the forced startup gate pass may open the door, or an operator reset's full check
-  that stands in for it (I56). A per-user daemon has no
+  that stands in for it (I73). A per-user daemon has no
   `boot_merge` and no fabric validator, but its start is not trusted either: it runs one light,
   read-only gate pass (`phase="startup"`, `with_recover=False`: host PCI, ARC heartbeat, tt-smi
   snapshot; no fabric, no ladder) before it serves, and a pass that finds the device unhealthy
@@ -723,7 +723,7 @@ job boundary.
   (`TT_DEVICE_MCP_SELFHEAL_RELIFT=0`, `TT_DEVICE_MCP_FORCE_ESCALATE=0`), or I28 holds the mesh
   reset, the RUNG INVENTORY logs a `RUNG GAP` warning at boot and `/health` carries `hold_exit_gap`
   naming why a held present mesh has no automatic exit (`null` otherwise).
-- **I56 — A passed operator-reset check stands in for the startup pass.** When an operator reset
+- **I73 — A passed operator-reset check stands in for the startup pass.** When an operator reset
   (the tool or the stream, `_verify_operator_reset`) runs during the startup hold, its full check,
   fabric pass included, released the device; the forced startup gate, queued behind it on the
   device lock, used to run a second full pass (~30 s on a galaxy) over a mesh nothing had touched
@@ -1330,7 +1330,7 @@ refuses.
 | I55 (under the outage hold: no reset, held, paged, honest message) | `tests/test_dispatch_failure_reset.py::test_outage_hold_holds_and_pages_without_a_reset` |
 | I55 (the verdict names the dispatch failure, never the downgraded mismatch) | `tests/test_dispatch_failure_reset.py::test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch`, `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I55 (rung gap warned at boot and on /health; floor message honest) | `tests/test_dispatch_failure_reset.py::test_rung_gap_boot_warning_and_health_field`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
-| I56 (a passed operator-reset check after the start, pool ready, stands in for the startup pass; anything else runs it) | `tests/test_startup_gate_counts_reset_verify.py::test_a_passed_reset_verify_after_the_start_is_the_startup_pass`, `tests/test_startup_gate_counts_reset_verify.py::test_a_failed_or_unverified_reset_verify_keeps_the_hold_and_the_startup_gate_runs`, `tests/test_startup_gate_counts_reset_verify.py::test_a_reset_verify_started_before_the_pool_was_ready_does_not_count`, `tests/test_startup_gate_counts_reset_verify.py::test_a_reset_verify_from_before_the_start_does_not_count`, `tests/test_startup_gate_counts_reset_verify.py::test_a_reset_after_the_verify_runs_the_startup_gate`, `tests/test_startup_gate_counts_reset_verify.py::test_a_device_dirtied_after_the_verify_runs_the_startup_gate` |
+| I73 (a passed operator-reset check after the start, pool ready, stands in for the startup pass; anything else runs it) | `tests/test_startup_gate_counts_reset_verify.py::test_a_passed_reset_verify_after_the_start_is_the_startup_pass`, `tests/test_startup_gate_counts_reset_verify.py::test_a_failed_or_unverified_reset_verify_keeps_the_hold_and_the_startup_gate_runs`, `tests/test_startup_gate_counts_reset_verify.py::test_a_reset_verify_started_before_the_pool_was_ready_does_not_count`, `tests/test_startup_gate_counts_reset_verify.py::test_a_reset_verify_from_before_the_start_does_not_count`, `tests/test_startup_gate_counts_reset_verify.py::test_a_reset_after_the_verify_runs_the_startup_gate`, `tests/test_startup_gate_counts_reset_verify.py::test_a_device_dirtied_after_the_verify_runs_the_startup_gate` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

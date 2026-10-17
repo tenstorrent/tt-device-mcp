@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""The startup gate counts an operator reset's passed full check as its own pass (spec 03 I56).
+"""The startup gate counts an operator reset's passed full check as its own pass (spec 03 I73).
 
 A broker restart arms the forced startup pass; an operator reset run during the startup hold
 verified the mesh with the fabric pass and released it, and the startup gate, queued behind that
