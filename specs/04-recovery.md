@@ -914,6 +914,24 @@ each rung fires only when the gentler one failed or cannot apply.
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
 
+- **I78 — A mesh reset re-adds the chips the broker removed once its pulse has fired.** When
+  `tt-smi -glx_reset` starts while the broker has removed chips from the kernel (dead-chip isolation),
+  `reset_with_quiesce` watches the reset's output for `Waiting for 30 seconds`, the line tt-smi prints
+  as soon as its IPMI pulse returns. From then on it writes `/sys/bus/pci/rescan`, re-reads sysfs and
+  drops each returned chip from the isolated set, every `MESH_PULSE_RESCAN_EVERY_SEC` (5 s), until no
+  chip is isolated, the reset ends or `MESH_PULSE_RESCAN_TRIES` (30) pass; the journal records
+  `mesh_reset_pulse_seen`. Without it tt-smi waits for 32 chips that cannot all appear, because a
+  removed chip's node comes back only on a rescan: the reset exits 1 after its 100 s driver-load wait
+  (262 s in all) and the next attempt heals. Never before the pulse: a removed chip may be hung, and
+  no rescan re-enumerates a hung chip that no reset reached. The pulse resets every ASIC of every tray
+  through the BMC, removed or not. If the line never comes (the pulse failed, or another tt-smi
+  prints otherwise) nothing is rescanned before the reset ends, and the post-reset rescan (I12) runs
+  as before. Releases nothing: the full health check, fabric included, still decides (I32), and a
+  failed reset keeps I36, I38, I39 and the 10 min ladder bound. Time to recover, class B1 (one chip
+  off the bus, healed by a mesh reset): the first reset now heals in about 62 s instead of failing at
+  262 s and waiting 60 s for the I39 retry. Measured onset to release, before: about 575 s (one-shot
+  120 s, failed reset 266 s, 62 s wait, healing reset 65 s, fabric check 57 s); after: about 250 s.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -1403,6 +1421,7 @@ sees a silent fabric pass.
 | I65 a failed out-of-band cycle (a second line, same `at_epoch`, cause + ` (cycle failed)`) never counts and cancels its attempt line; an unmatched failure line is ignored; an attempt with no failure line still counts; host boots are unchanged | `tests/test_power_cycle_cooldown.py::test_a_matched_failure_line_drops_the_attempt`, `::test_an_unmatched_failure_line_is_ignored`, `::test_an_attempt_without_a_failure_line_still_counts` |
 | I65 a future, non-finite or unreadable stamp (history file, ledger, heal file) never hides a valid past anchor, never holds the cycle past the stated gap, never keeps the streak past a verified release; every cap denial is on /health | `tests/test_power_cycle_cooldown.py::test_a_nan_or_future_history_line_does_not_hide_the_valid_past_one`, `::test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle`, `::test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health`, `::test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end`, `::test_the_per_boot_cap_denial_shows_on_health`, `::test_a_future_record_does_not_keep_the_streak_past_a_verified_release` |
 | I37/I65 class C at startup: one mesh reset with no failed reset or broker cycle; none after the broker's own cycle, which then waits only for the cooldown | `tests/test_power_cycle_cooldown.py::test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_gets_one_reset`, `::test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_reset`, `::test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not` |
+| I78 a mesh reset over a removed chip rescans after the pulse line, never before it; it stops when every chip is back; a reset with no removed chip, or a non-mesh reset, rescans nothing extra; a pulse that never comes leaves only the post-reset rescan; a chunk-split line still counts; the loop is bounded and a cancelled reset stops it | `tests/test_mesh_reset_readd.py::test_the_removed_chip_is_re_added_after_the_pulse_and_the_reset_heals`, `::test_no_rescan_runs_before_the_pulse_line`, `::test_the_rescan_repeats_until_the_chip_is_back_and_then_stops`, `::test_no_extra_rescan_without_a_removed_chip_or_for_a_non_mesh_reset`, `::test_a_pulse_line_split_across_chunks_still_counts`, `::test_the_callers_output_callback_still_gets_every_chunk`, `::test_no_rescan_when_the_pulse_line_never_comes`, `::test_the_rescan_gives_up_after_its_tries`, `::test_a_cancelled_reset_stops_the_rescans` |
 | I58 all off after a failed reset and a broker restart: the startup or a later gate cycles with no second reset; the sweep skips a failed-unchanged set | `tests/test_classac_power_cycle_direct.py::test_replay_all_off_after_a_restart_cycles_with_no_second_reset`, `::test_a_partial_drop_keeps_the_ladder` |
 | I36 a power cycle that is rate-limited or not opted in never stops resets: a shrinking off-bus set resets again each forced window, and the gate retries its reset once its cooldown ran out | `tests/test_host_action_suppress.py::test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_fire`, `::test_the_gate_keeps_resetting_a_drop_whose_power_cycle_is_not_opted_in` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |
