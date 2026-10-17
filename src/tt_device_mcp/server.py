@@ -6563,6 +6563,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     # Spec 03 I71: the descriptor's port connections the last fabric pass found missing or extra, by
     # name; null after a clean pass on the full topology.
     payload["fabric_topology"] = (getattr(health_monitor, "fabric_topology", None) or None) if health_monitor else None
+    # Spec 03 I71: the ports an operator accepted as dead, so a lift on them is never silent.
+    payload["fabric_accepted_missing_ports"] = sorted(fabric.accepted_missing_ports())
     return payload
 
 

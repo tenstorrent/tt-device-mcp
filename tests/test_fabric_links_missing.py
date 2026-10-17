@@ -183,6 +183,13 @@ def test_health_names_the_ports(monkeypatch):
     assert srv._health_payload()["fabric_topology"]["missing_ports"] == [_LOST_PORT]
 
 
+def test_health_shows_the_accepted_ports(monkeypatch):
+    monkeypatch.delenv(ACCEPT, raising=False)
+    assert srv._health_payload()["fabric_accepted_missing_ports"] == [], "nothing is accepted by default"
+    monkeypatch.setenv(ACCEPT, f"{_LOST_PORT}, b")
+    assert srv._health_payload()["fabric_accepted_missing_ports"] == sorted([_LOST_PORT, "b"])
+
+
 @pytest.fixture
 def lost_mesh(monkeypatch, mesh):  # noqa: F811
     """The mesh fixture failing on a lost link instead of a dispatch failure. Read-only (no fabric
