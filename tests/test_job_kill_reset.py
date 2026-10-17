@@ -8,8 +8,10 @@ post-reset check stays held and climbs, never releases.
 The gate tests run the real probe pass on the eth-timeout tests' mesh (only leaf probes stubbed)."""
 
 import asyncio
+import logging
 import os
 
+import httpx2
 import pytest
 
 from tests.conftest import fsm_dirty
@@ -418,3 +420,94 @@ async def test_a_requested_kill_of_a_readopted_job_owes_the_reset_and_leaves_no_
     await asyncio.wait_for(srv._monitor_readopted_scope("941", "ttdev-job-941.scope"), timeout=5)
     assert srv._kill_reset_debt().startswith("re-adopted job 941")
     assert "941" not in srv.request_killed_job_ids, "the id leaked past the job's end"
+
+
+@pytest.mark.asyncio
+async def test_the_runner_pays_an_owed_debt_before_a_queued_job(runner_env, monkeypatch):
+    calls = []
+
+    async def gate(job_log_file, job_failed=False, **k):
+        calls.append((job_failed, srv.jobs["952"].status))
+        srv._clear_kill_reset_debt()
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", gate)
+    srv.readopted_scopes["950"] = "ttdev-job-950.scope"
+    srv._owe_kill_reset("re-adopted job 950 timeout")
+    job, runner = await _start("952", "true")
+    try:
+        await asyncio.sleep(0.3)
+        assert calls == [] and job.status is srv.JobStatus.QUEUED, "nothing runs beside the re-adopted job"
+        srv.readopted_scopes.pop("950")
+        assert await _until(lambda: job.finished_at is not None)
+    finally:
+        await _stop(runner)
+    assert calls[0] == (True, srv.JobStatus.QUEUED), "paid by the post-job gate, before the job's door"
+    assert job.status is srv.JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_a_broker_kill_logs_the_process_tree_it_stopped(runner_env, monkeypatch, caplog):
+    log = logging.getLogger("tt-device-mcp-test-kill")
+    monkeypatch.setattr(srv, "logger", log)
+    job, runner = await _start("953", "sleep 600 | sleep 600", timeout_sec=1)
+    with caplog.at_level(logging.INFO, logger=log.name):
+        try:
+            assert await _until(lambda: job.finished_at is not None)
+        finally:
+            await _stop(runner)
+    lines = [r.getMessage() for r in caplog.records if "KILLED process tree" in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert "job_id=953" in lines[0] and "reason=timeout after 1s" in lines[0]
+    assert f"pgid {job.pid}" in lines[0] and "ladder ended at SIGINT" in lines[0]
+
+
+@pytest.mark.asyncio
+async def test_a_rest_run_bg_timeout_owes_the_reset(runner_env):
+    app = srv.build_asgi_app(srv.create_mcp_server())
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://broker") as client:
+        res = (
+            await client.post(
+                "/api/tt_device_job_run_bg", json={"workspace": "/tmp", "command": "sleep 600", "timeout_sec": 1}
+            )
+        ).json()
+    job = srv.jobs[res["job_id"]]
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        assert await _until(lambda: job.finished_at is not None)
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.TIMEOUT
+    assert srv._kill_reset_debt().startswith(f"job {job.id}"), "REST run-bg is the same runner: same debt"
+
+
+@pytest.mark.asyncio
+async def test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait(killed, monkeypatch):
+    leftover = "device held by 1 leftover process(es) of reaped job(s): pid 4242 (job 7)"
+    monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda scan=None: leftover)
+    started = srv.time.monotonic()
+    await _gate()
+    assert srv.time.monotonic() - started < 2.0, "the skip adds no wait"
+    assert killed["resets"] == [] and killed["fabric"] == [] and killed["eth_reads"] == 0
+    assert srv._kill_reset_debt() == "job 7 timeout", "the debt is kept for the gate after the leftover"
+    assert srv.fsm.record.dirty, "still dirty: no tenant runs before the verify"
+    # A host reboot ends the process, and the debt with it (memory only): the startup gate re-proves
+    # the mesh with the full check, fabric included, and pays no kill reset.
+    monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda scan=None: "")
+    srv._clear_kill_reset_debt()
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+    assert killed["resets"] == [] and killed["fabric"] == [0], "the startup full check ran its fabric pass"
+    assert "kill_mesh_reset" not in killed["events"]
+
+
+@pytest.mark.asyncio
+async def test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait(killed, monkeypatch):
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", True)
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", srv._kill_reset_owed_at - 1.0)
+    assert srv.recovery_mechanism.cooling() and srv._kill_reset_debt()
+    started = srv.time.monotonic()
+    await _gate()
+    assert srv.time.monotonic() - started < 2.0, "no new wait (msg #455 bounds holds, not this skip)"
+    assert "kill_reset_skipped" in killed["events"] and "kill_mesh_reset" not in killed["events"]
+    assert killed["resets"] == [], "no reset inside the cooldown"
+    assert killed["fabric"] and killed["fabric"][0] == 0, "the dirty exit's full check ran instead"
+    assert srv._kill_reset_debt() == "", "the debt is cleared, not carried"
