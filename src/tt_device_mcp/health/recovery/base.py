@@ -1180,7 +1180,9 @@ class RecoveryMechanism:
                 try:
                     await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
                 except OSError as e:
-                    log(f"PCI rescan at tt-smi's driver wait could not run ({e}); the rescan after the reset still runs")
+                    log(
+                        f"PCI rescan at tt-smi's driver wait could not run ({e}); the rescan after the reset still runs"
+                    )
                     if attempt == 1:
                         health_event("reset_driver_wait_rescan", chips=chips, ok=False, error=str(e))
                     return
@@ -1195,7 +1197,9 @@ class RecoveryMechanism:
                 if not still:
                     return
                 if attempt == DRIVER_WAIT_RESCAN_TRIES:
-                    log(f"chip(s) {sorted(still, key=int)} still missing after {attempt} rescans in tt-smi's driver wait")
+                    log(
+                        f"chip(s) {sorted(still, key=int)} still missing after {attempt} rescans in tt-smi's driver wait"
+                    )
                     health_event("reset_driver_wait_rescan_spent", tries=attempt, still_isolated=sorted(still, key=int))
                     return
                 try:
