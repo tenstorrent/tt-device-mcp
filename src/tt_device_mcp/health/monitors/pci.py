@@ -250,6 +250,20 @@ def chip_pci_bdf(idx: str) -> Optional[str]:
         return None
 
 
+def sysfs_chip_ids() -> list[str]:
+    """Every chip index the KMD exposes a class node for, sorted, from the directory listing alone.
+
+    No attribute is read, so a chip whose heartbeat (or any other attribute) cannot be read is
+    still listed: this is enumeration, not liveness. Use it wherever "which chips does the kernel
+    have" is the question, e.g. the startup chip-index-to-PCI-address map the bridge rung needs."""
+    try:
+        entries = list(SYSFS_CLASS_DIR.iterdir())
+    except OSError:
+        return []
+    ids = (ent.name.rsplit("!", 1)[-1] for ent in entries)
+    return sorted((i for i in ids if i.isdigit()), key=int)
+
+
 def chip_pci_bdfs() -> dict:
     """Every chip index the KMD currently exposes, mapped to its PCI address:
     ``{0: '0000:01:00.0', ...}``. A chip whose address cannot be read is left out.

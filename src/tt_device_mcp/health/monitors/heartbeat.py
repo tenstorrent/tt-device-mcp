@@ -177,6 +177,9 @@ def heartbeat_absence_reason() -> Optional[str]:
       "attr_absent"  — nodes are present but none expose tt_heartbeat: this KMD
                        predates the counter. The detector genuinely does not exist
                        on this host, and falling through to tt-smi is correct.
+      "attr_unreadable" — nodes are present and expose tt_heartbeat, but no read of it
+                       succeeds right now (e.g. every chip left in a bad state by a failed
+                       reset). The driver HAS the counter; the chips are not answering.
     Returns None as soon as one chip exposes a readable counter — the probe works.
     """
     try:
@@ -188,10 +191,12 @@ def heartbeat_absence_reason() -> Optional[str]:
         return "sysfs_absent"
     for ent in nodes:
         try:
-            int((ent / "tt_heartbeat").read_text().strip())
+            int(_read_beat(ent))
             return None
         except (OSError, ValueError):
             continue
+    if any((ent / "tt_heartbeat").exists() for ent in nodes):
+        return "attr_unreadable"
     return "attr_absent"
 
 
@@ -212,7 +217,9 @@ def heartbeat_supported(refresh: bool = False) -> bool:
         whether the driver WOULD expose the counter is unknowable. Leave the cache
         undecided (do NOT latch False) and re-probe next call: a box that boots dead
         and is later cold-power-cycled back — with no broker restart — re-arms this
-        detector instead of having it disabled for the life of the process. Reports
+        detector instead of having it disabled for the life of the process.
+      - ``attr_unreadable``: the counter exists but no chip answers it right now. Also
+        undecided, for the same reason: the driver supports it, the chips are bad. Reports
         unsupported meanwhile (nothing to sample), journaled once per absence so an
         empty class dir where chips are expected reaches a human without burying the
         log on every idle poll.
@@ -221,7 +228,7 @@ def heartbeat_supported(refresh: bool = False) -> bool:
     if _heartbeat_supported is not None and not refresh:
         return _heartbeat_supported
     reason = heartbeat_absence_reason()
-    if reason == "sysfs_absent":
+    if reason in ("sysfs_absent", "attr_unreadable"):
         _heartbeat_supported = None  # undecided until chips enumerate — re-probe next call
         if not _heartbeat_absent_journaled:
             health_event("heartbeat_unsupported", reason=reason)
@@ -258,12 +265,17 @@ def _heartbeat_verdict_body(expected_count: int, settle_sec: float) -> tuple[Ver
     # A check, not a poll: a chip marked lost is read for real here (once; the second sample is
     # gated again), so a chip that came back passes and one that did not is judged on a real read.
     first = read_heartbeats(probe_lost=True)
-    if not first:
+    # read_heartbeats() leaves out a chip whose read fails, so a short (or empty) read is not a
+    # short sysfs: count the class nodes too, so chips that are listed but unreadable are named as
+    # such and never reported as "no chips exposed".
+    in_sysfs = pci.sysfs_chip_ids() if len(first) < expected_count or not first else sorted(first, key=int)
+    if not first and not in_sysfs:
         return (
             Verdict.UNHEALTHY,
             "no chips exposed in sysfs (driver wedged or chips off the bus)",
             {"expected_count": expected_count},
         )
+    unreadable = sorted(set(in_sysfs) - set(first), key=int)
 
     # Checked before anything else, and reported distinctly, because the response is
     # different: a chip returning all-ones has left the bus, and the correct move is to cut
@@ -282,7 +294,7 @@ def _heartbeat_verdict_body(expected_count: int, settle_sec: float) -> tuple[Ver
     # Only a short count is a drop. An over-count means MORE chips are on the bus than
     # ``expected_count`` — a stale high-water mark baked while degraded, cleared by a reset
     # that recovered the rest — and that is a healthy mesh, not chips that fell off it.
-    if len(first) < expected_count:
+    if len(first) < expected_count or not first:
         # A chip whose heartbeat read gives ENODATA on a bound endpoint is on the bus with its ARC not
         # ready: still unhealthy, but named as such, so nobody reads it as a drop (spec 04 I24).
         not_ready = sorted(arc_not_ready_chips(first), key=int)
@@ -294,8 +306,21 @@ def _heartbeat_verdict_body(expected_count: int, settle_sec: float) -> tuple[Ver
                 f"{off} off the bus",
                 {
                     "present": sorted(first),
+                    "in_sysfs": len(in_sysfs),
                     "arc_not_ready": not_ready,
                     "off_bus": off,
+                    "expected_count": expected_count,
+                },
+            )
+        if unreadable:
+            return (
+                Verdict.UNHEALTHY,
+                f"{len(in_sysfs)} chip(s) in sysfs, heartbeat unreadable on {len(unreadable)} "
+                f"[{','.join(unreadable)}], expected {expected_count}",
+                {
+                    "present": sorted(first),
+                    "in_sysfs": len(in_sysfs),
+                    "heartbeat_unreadable": unreadable,
                     "expected_count": expected_count,
                 },
             )

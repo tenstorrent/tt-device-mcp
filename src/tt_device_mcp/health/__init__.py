@@ -42,7 +42,7 @@ from tt_device_mcp.health.evidence import (
     previous_boot_error,
     read_health_events,
 )
-from tt_device_mcp.health.monitor import HealthMonitor, journal_interrupted_fabric_check
+from tt_device_mcp.health.monitor import HealthMonitor, eth_read_timed_out, journal_interrupted_fabric_check
 
 # The fabric probe module itself, not a wrapping function: server.py's own preflight check reads
 # fabric.build_command() directly to warn when no fabric check is configured OR installed, and a
@@ -79,6 +79,7 @@ from tt_device_mcp.health.monitors.pci import (
     chip_snapshot,
     chip_snapshot_event,
     isolate_chip,
+    sysfs_chip_ids,
 )
 
 # The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and
@@ -150,6 +151,7 @@ __all__ = [
     "HealthMonitor",
     "journal_interrupted_fabric_check",
     "note_broker_stopping",
+    "eth_read_timed_out",  # spec 03 I61: the stuck eth read the post-job present-mesh reset answers
     "RecoveryMechanism",
     "RecoveryDeps",
     "GalaxyRecovery",
@@ -191,6 +193,7 @@ __all__ = [
     "aer_totals",
     "chip_node_present",
     "chip_pci_bdf",
+    "sysfs_chip_ids",
     "chip_sample",
     "chip_snapshot",
     "chip_snapshot_event",

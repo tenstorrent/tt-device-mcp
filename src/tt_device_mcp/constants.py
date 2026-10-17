@@ -49,6 +49,12 @@ SURVIVOR_TERM_GRACE_SEC = 5
 # driver), and no signal will move it.
 SURVIVOR_KILL_WAIT_SEC = 2
 
+# How long, counted from a SIGKILL, to keep polling the /dev/tenstorrent holders for the killed
+# processes to let go before naming one a holder that will not (spec 01 I67). An exit can sit in
+# the driver's release for seconds; reading that as a leftover skipped the post-job gate and left
+# the device held until the next job or the hold ceiling.
+HOLDER_RELEASE_WAIT_SEC = 30
+
 # A preemptable job's whole stop window, from the first signal to SIGKILL. Its owner has
 # agreed to watch the queue and get off the device within this once another job is waiting
 # past its soft limit, so it is shorter than the ordinary ladder (SIGINT 60 s + SIGTERM 15 s).
