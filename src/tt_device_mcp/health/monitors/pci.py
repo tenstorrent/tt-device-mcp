@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from tt_device_mcp.health import evidence
+from tt_device_mcp.health import chip_state, evidence
 
 SYSFS_CLASS_DIR = Path(os.environ.get("TT_DEVICE_MCP_SYSFS_DIR", "/sys/class/tenstorrent"))
 
@@ -73,7 +73,8 @@ def _sum_aer(path: Path) -> Optional[int]:
 
 
 def chip_snapshot() -> dict:
-    """Everything the host knows about the chips without touching them.
+    """Everything the host knows about the chips. The telemetry attributes and link config are
+    PCIe reads of each chip, so a chip confirmed lost is listed without them (spec 03 I66).
 
     This is the record that makes a post-mortem possible. When a chip wedges, the
     question is always "what was it doing beforehand" — was it hot, was it throttling,
@@ -96,7 +97,12 @@ def chip_snapshot() -> dict:
         if not idx.isdigit():
             continue
         rec: dict = {}
-        for attr in _CHIP_ATTRS:
+        # A chip confirmed lost is not read (spec 03 I66): its attributes and its link config are
+        # PCIe reads that would stall on it. The AER counters below are kernel memory and stay.
+        lost = chip_state.is_lost(idx) and not chip_state.op_running()
+        if lost:
+            rec["lost"] = True
+        for attr in () if lost else _CHIP_ATTRS:
             try:
                 val = (ent / attr).read_text().strip()
             except OSError:
@@ -107,9 +113,13 @@ def chip_snapshot() -> dict:
             pci = (ent / "device").resolve()
             rec["pci"] = pci.name
             for f, key in (
-                ("current_link_width", "link_width"),
-                ("max_link_width", "link_width_max"),
-                ("current_link_speed", "link_speed"),
+                ()
+                if lost
+                else (
+                    ("current_link_width", "link_width"),
+                    ("max_link_width", "link_width_max"),
+                    ("current_link_speed", "link_speed"),
+                )
             ):
                 try:
                     rec[key] = (pci / f).read_text().strip()
@@ -184,11 +194,15 @@ SAMPLE_RING_SIZE = int(os.environ.get("TT_DEVICE_MCP_SAMPLE_RING", "120"))
 
 
 def chip_sample() -> dict:
-    """One compact sample of every chip's volatile state. Zero device touches.
+    """One compact sample of every chip's volatile state.
 
     Compact on purpose: this runs every few seconds for the life of a job, so it carries
     the moving values only, as a flat list per chip — [heartbeat, aiclk, arcclk,
     therm_trips, aer_correctable, aer_fatal].
+
+    The four telemetry values are PCIe reads of the chip. A chip confirmed lost reads as
+    [ALL_ONES, None, None, None, ...] without touching it; when its re-read is due
+    (:func:`chip_state.may_read`) only its heartbeat is read, once (spec 03 I66).
     """
     out: dict = {}
     try:
@@ -200,12 +214,22 @@ def chip_sample() -> dict:
         if not idx.isdigit():
             continue
         row = []
-        for attr in _VOLATILE:
+        lost = chip_state.is_lost(idx)
+        attrs = _VOLATILE
+        if lost and not chip_state.may_read(idx, ent):
+            attrs = ()
+            row = [chip_state.ALL_ONES, None, None, None]
+        elif lost and chip_state.is_lost(idx):
+            attrs = _VOLATILE[:1]
+        for attr in attrs:
             try:
                 v = (ent / attr).read_text().strip()
                 row.append(int(v) if v.isdigit() else v)
             except OSError:
                 row.append(None)
+        if attrs == _VOLATILE[:1]:
+            chip_state.observe(idx, row[0])
+            row.extend([None, None, None])
         try:
             pci = (ent / "device").resolve()
             row.append(_sum_aer(pci / "aer_dev_correctable"))

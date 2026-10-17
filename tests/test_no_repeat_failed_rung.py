@@ -428,7 +428,8 @@ async def test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cy
     """I38 with I65: the host booted 3 min ago and one chip stays off after the failed mesh reset. The
     climb still skips the ceiling wait and the sweep (I38), but the power cycle waits out the cooldown
     counted from that boot, with its deadline set for the watchdog; no reset fires meanwhile (I36,
-    I58), and the cycle fires once the cooldown has run out. Nothing releases the hold."""
+    I58). /health shows the deadline while it waits, the watchdog asks again at that deadline, and the
+    cycle fires once the cooldown has run out: bounded, never open-ended. Nothing releases the hold."""
     clock = [ONE_SHOT]
     counters, events, _ = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=1)
     mech = srv.recovery_mechanism
@@ -444,13 +445,120 @@ async def test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cy
     until = int(boot[0]) + POWER_CYCLE_MIN_INTERVAL_SEC
     assert mech.power_cycle_retry[0] == until, "the watchdog asks again at the cooldown's end"
     assert mech.power_cycle_cooldown_state["cause"] == "host boot"
+    # /health shows the bounded wait: the rung it waits for and the moment it is asked again.
+    monkeypatch.setattr(srv, "_device_hold_state", lambda now=None: ("chip off", srv.device_hold_episode_since))
+    shown = srv._health_payload()["power_cycle_cooldown"]
+    assert shown["escalation_stage"] == "power-cycle" and shown["cause"] == "host boot"
+    assert shown["next_deadline"] == datetime.fromtimestamp(until).isoformat(timespec="seconds")
     clock[0] = 600.0
     assert await _window() is True
     assert counters["resets"] == 1 and counters["power_cycles"] == 0 and counters["sweeps"] == 0
+    assert srv._health_payload()["power_cycle_cooldown"]["next_deadline"] == shown["next_deadline"]
+    # The watchdog asks again the moment the cooldown ends, not at the next ceiling window.
+    assert not mech.power_cycle_retry_due(until - 1)
+    spawned = _drive_watchdog_at(monkeypatch, datetime.fromtimestamp(until))
+    assert spawned[:1] == ["power_cycle_cooldown"], "the cooldown's end is asked first"
+    assert "power_cycle_cooldown" not in srv._health_payload(now=datetime.fromtimestamp(until))
     boot[0] -= POWER_CYCLE_MIN_INTERVAL_SEC  # the cooldown has run out
-    assert await _window() is True
+    assert await _window() is True  # the spawned escalation
     assert counters["resets"] == 1 and counters["power_cycles"] == 1 and counters["sweeps"] == 0
+    assert mech.power_cycle_cooldown_state is None and "power_cycle_cooldown" not in srv._health_payload()
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing released the hold"
+
+
+def _drive_watchdog_at(monkeypatch, now):
+    """Run the hold watchdog once at ``now`` (one-shot already spent, windows claimed); returns the
+    spawn kinds it chose."""
+    spawned = []
+    monkeypatch.setattr(
+        srv, "_maybe_spawn_forced_escalation", lambda: spawned.append(srv.device_hold_escalation_kind) or True
+    )
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", True)
+    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
+    srv.fsm.set_latch("escalated", False)
+    srv._check_hold_deadline(now=now)
+    return spawned
+
+
+# --- E3: one failed reset per unchanged set, then the next rung, for every reset class ----------------
+
+WINDOWS = 6  # the forced hold-deadline windows the incident ran one mesh reset in each
+
+
+def _record_cycle_order(monkeypatch, counters):
+    """Each power cycle notes how many resets had run when it fired: partial off-bus gets its mesh
+    reset first (the host rung never jumps the queue), and only one."""
+    order = []
+
+    async def power_cycle(log, reason):
+        counters["power_cycles"] += 1
+        order.append(counters["resets"])
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    return order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("power_cycle", [True, False], ids=["power-cycle", "no-host-rung"])
+@pytest.mark.parametrize("off_bus", [1, 2, 4], ids=["b1-one-chip", "b1-two-chips", "b2-four-chips"])
+async def test_e3_offbus_classes_reset_once_then_take_the_next_rung(monkeypatch, clear_job_state, off_bus, power_cycle):
+    """B1 (one or two chips off) and B2 (four), with and without a power cycle, over six forced
+    windows: the mesh reset runs first and once on the unchanged set, the next rung follows in that
+    same window (the power cycle, or one operator hand-off), and no later window repeats the reset.
+    Nothing releases the hold: release waits for the full check after a reset that heals."""
+    clock = [ONE_SHOT]
+    counters, events, alerts = _episode(monkeypatch, power_cycle=power_cycle, clock=clock, off_bus=off_bus)
+    order = _record_cycle_order(monkeypatch, counters)
+    assert await _window() is True
+    assert counters["resets"] == 1
+    if power_cycle:
+        assert order == [1], "the mesh reset ran first, then the power cycle in the same window"
+        assert counters["sweeps"] == 0, "no last-chance sweep: its last step is the failed mesh reset"
+    else:
+        pages = [a for a in alerts if a["kind"] == "offbus_gated_hold_page"]
+        assert len(pages) == 1 and opc._pending["handoff"]["latched"], "handed to an operator at once"
+    for w in range(1, WINDOWS):
+        clock[0] = max(clock[0], 600.0 * w)
+        assert await _window() is True
+    assert counters["resets"] == 1, "the failed reset is never repeated on the unchanged set"
+    assert events.count(SKIP) >= WINDOWS - 1, "every later window skips it"
+    if not power_cycle:
+        assert len([a for a in alerts if a["kind"] == "offbus_gated_hold_page"]) == 1, "one page per episode"
+        assert counters["power_cycles"] == 0 and counters["reboots"] == 0
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_rung", ["power-cycle", "reboot", "none"])
+async def test_e3_present_mesh_resets_once_then_takes_the_next_rung(monkeypatch, clear_job_state, host_rung):
+    """D (every chip present, the mesh reset fails its verify) over six forced windows: one reset,
+    then the host rung in that same window (the power cycle, else the warm reboot; both are on by
+    default), and with both opted out no further reset at all: the hold stays for an operator."""
+    counters, events = _present_mesh(monkeypatch)
+    if host_rung != "power-cycle":
+        monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1" if host_rung == "reboot" else "0")
+    monkeypatch.setattr(privileges, "is_root", lambda: True)
+    monkeypatch.setattr(privileges, "has_systemd", lambda: True)
+    order = _record_cycle_order(monkeypatch, counters)
+    reboots_at = []
+
+    async def reboot(log, reason):
+        counters["reboots"] += 1
+        reboots_at.append(counters["resets"])
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", reboot)
+    assert await _present_window(True) is True
+    assert counters["resets"] == 1
+    fired = {"power-cycle": order, "reboot": reboots_at, "none": []}[host_rung]
+    assert fired == ([] if host_rung == "none" else [1]), "the host rung fired right after the failed reset"
+    for _ in range(1, WINDOWS):
+        assert await _present_window(True) is True
+    assert counters["resets"] == 1, "the failed reset is never repeated on the unchanged mesh"
+    assert events.count(SKIP) == WINDOWS - 1
+    if host_rung == "none":
+        assert counters["power_cycles"] == 0 and counters["reboots"] == 0
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
 
 
 # --- spec 04 I39: one early retry after a failed mesh reset whose off-bus set shrank -------------------
@@ -507,8 +615,9 @@ def _beats_with_off(off):
     return {str(c): 100 for c in range(EXPECTED) if str(c) not in off}
 
 
-def _drive_progress_retry_watchdog(monkeypatch):
-    """Make the armed retry due now and run the hold watchdog once; returns the spawn kinds it chose."""
+def _drive_progress_retry_watchdog(monkeypatch, backdate=True, age_sec=200):
+    """Make the armed retry due now (``backdate``; else leave it as armed) and run the hold watchdog once
+    at ``age_sec`` into the hold; returns the spawn kinds it chose."""
     spawned = []
     monkeypatch.setattr(
         srv, "_maybe_spawn_forced_escalation", lambda: spawned.append(srv.device_hold_escalation_kind) or True
@@ -519,18 +628,18 @@ def _drive_progress_retry_watchdog(monkeypatch):
     monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
     srv.fsm.set_latch("escalated", False)
     armed = srv.recovery_mechanism.progress_retry
-    if armed is not None:
+    if backdate and armed is not None:
         srv.recovery_mechanism.progress_retry = (armed[0], time.monotonic() - 1)
     since = datetime.fromisoformat(srv.device_hold_episode_since)
-    srv._check_hold_deadline(now=since + timedelta(seconds=200))
+    srv._check_hold_deadline(now=since + timedelta(seconds=age_sec))
     return spawned
 
 
-def _progress_episode(monkeypatch, after_each_reset):
+def _progress_episode(monkeypatch, after_each_reset, power_cycle=True):
     """An off-bus hold at the 120 s one-shot whose mesh resets exit 1; ``after_each_reset`` is the list
     of off-bus id sets the heartbeats show after the 1st, 2nd, ... reset."""
     clock = [ONE_SHOT]
-    counters, events, alerts = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=2)
+    counters, events, alerts = _episode(monkeypatch, power_cycle=power_cycle, clock=clock, off_bus=2)
     monkeypatch.setattr(srv.recovery_mechanism, "progress_retry", None)
     monkeypatch.setattr(srv.recovery_mechanism, "progress_retry_spent_since", "")
     state = {"off": {"30", "31"}}
@@ -627,6 +736,207 @@ async def test_the_progress_retry_releases_only_after_the_full_fabric_verify(mon
     else:
         assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a failed verify keeps the hold"
         assert counters["power_cycles"] == 1, "and goes on to the host rung (I38)"
+
+
+def _record_retry_delays(monkeypatch, events):
+    """Keep every event kind in ``events`` and return the armed retries' ``retry_in_sec`` values."""
+    delays = []
+
+    def record(kind, **f):
+        events.append(kind)
+        if kind == "mesh_reset_progress_retry_armed":
+            delays.append(f["retry_in_sec"])
+
+    patch_health_event(monkeypatch, record)
+    return delays
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reset_that_left_every_chip_back_arms_the_retry_at_once(monkeypatch, clear_job_state):
+    """I39: the reset exits 1 but its own rescan brought both chips back (a glx_reset started while a
+    chip was out of the kernel fails its full-mesh driver-load wait). Waiting buys nothing: the retry is
+    armed with no delay and the watchdog's next dead-chip sample spawns it, without any backdating."""
+    counters, events, _, _, _ = _progress_episode(monkeypatch, [set()])
+    delays = _record_retry_delays(monkeypatch, events)
+    assert await _window() is True
+    assert delays == [0], "every chip is back: the retry is due at once"
+    assert _drive_progress_retry_watchdog(monkeypatch, backdate=False) == ["progress_retry"]
+    assert srv.recovery_mechanism.progress_retry is None, "spent on the spawn"
+    assert counters["power_cycles"] == 0 and counters["dirty_cleared"] == 0, "nothing climbed or released yet"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reset_that_left_chips_off_keeps_the_60s_wait(monkeypatch, clear_job_state):
+    """The control: 2 -> 1 chips off after the exit 1. The retry keeps its 60 s wait, so the watchdog's
+    next sample spawns nothing; once the 60 s pass it does."""
+    counters, events, _, _, _ = _progress_episode(monkeypatch, [{"31"}])
+    delays = _record_retry_delays(monkeypatch, events)
+    assert await _window() is True
+    assert delays == [60]
+    assert _drive_progress_retry_watchdog(monkeypatch, backdate=False) == [], "not due before its 60 s"
+    assert _drive_progress_retry_watchdog(monkeypatch) == ["progress_retry"]
+
+
+@pytest.mark.asyncio
+async def test_b1_first_reset_fails_with_every_chip_back_second_heals_inside_ten_minutes(monkeypatch, clear_job_state):
+    """B1 end to end on the real reset path and a fake clock. The off-bus one-shot at 120 s runs a mesh
+    reset that exits 1 after 262 s with both chips back; the retry fires on the next dead-chip sample
+    (5 s), its reset exits 0 after 62 s and the full verify, fabric included (63 s), passes. The hold
+    ends at 512 s, 60 s sooner than with the wait and inside the first 600 s window. The verify (and
+    its reset_verified row) comes before the release, never after it."""
+    counters, events, _, _, clock = _progress_episode(monkeypatch, [set()])
+    state_off = [{"30", "31"}]
+    order = []
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: _beats_with_off(state_off[0]))
+    monkeypatch.delattr(srv.galaxy_recovery, "_reset_and_verify_device")
+    patch_health_event(monkeypatch, lambda kind, **f: (events.append(kind), order.append(kind)))
+
+    def release(**kw):
+        counters["dirty_cleared"] += 1
+        order.append("device_released")
+
+    monkeypatch.setattr(srv, "_clear_device_dirty", release)
+    runs = iter([(1, 262), (0, 62)])
+
+    async def reset_cmd(argv, log, *a, **k):
+        rc, took = next(runs)
+        clock[0] += took
+        state_off[0] = set()  # the first reset's rescan brought both chips back
+        return rc, ""
+
+    async def verify(expected, log, run_fabric=None, **_):
+        assert run_fabric in (None, True), "the post-reset verify runs the fabric pass"
+        clock[0] += 63
+        return True, {"snapshot": {"ok": True}}
+
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_with_quiesce", reset_cmd)
+    monkeypatch.setattr(srv.recovery_mechanism, "await_foreign_scope", lambda log: _false())
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    assert await _window() is True
+    assert events.count("mesh_reset_progress_retry_armed") == 1 and counters["dirty_cleared"] == 0
+    clock[0] += 5  # the next dead-chip sample
+    assert _drive_progress_retry_watchdog(monkeypatch, backdate=False, age_sec=clock[0]) == ["progress_retry"]
+    assert await _window() is True
+    assert counters["dirty_cleared"] == 1 and counters["power_cycles"] == 0 and counters["sweeps"] == 0
+    assert clock[0] == 512 and clock[0] < 600, "healed inside the first ceiling window"
+    assert order.index("reset_verified") < order.index("device_released"), "verified before released"
+
+
+@pytest.mark.asyncio
+async def test_b1_all_back_retry_whose_fabric_verify_fails_keeps_the_hold_for_the_ladder(monkeypatch, clear_job_state):
+    """Goal of the post-reset check (I32) on I39's zero-delay path: the one-shot's mesh reset exits 1
+    with every chip back, the retry fires on the next dead-chip sample and its reset exits 0, but the
+    full verify, fabric included, fails. Nothing releases the queue or clears the hold, the retry is
+    spent, and the hold goes on to the bounded recovery: the full ladder at the 600 s window (I76),
+    whose reset is verified again and, still failing, ends in the power cycle."""
+    counters, events, _, _, clock = _progress_episode(monkeypatch, [set()])
+    state_off = [{"30", "31"}]
+    verifies = []
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: _beats_with_off(state_off[0]))
+    monkeypatch.delattr(srv.galaxy_recovery, "_reset_and_verify_device")
+    delays = _record_retry_delays(monkeypatch, events)
+    runs = iter([(1, 262), (0, 62), (0, 62)])
+
+    async def reset_cmd(argv, log, *a, **k):
+        rc, took = next(runs)
+        clock[0] += took
+        state_off[0] = set()  # the first reset's rescan brought both chips back
+        return rc, ""
+
+    async def verify(expected, log, run_fabric=None, **_):
+        verifies.append(run_fabric)
+        assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing cleared before it"
+        clock[0] += 63
+        return False, {"snapshot": {"ok": False}}
+
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_with_quiesce", reset_cmd)
+    monkeypatch.setattr(srv.recovery_mechanism, "await_foreign_scope", lambda log: _false())
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    hold_since = srv.device_hold_episode_since
+    assert await _window() is True
+    assert delays == [0] and verifies == [], "every chip is back: the retry is due at once"
+    clock[0] += 5  # the next dead-chip sample
+    assert _drive_progress_retry_watchdog(monkeypatch, backdate=False, age_sec=clock[0]) == ["progress_retry"]
+    assert await _window() is True
+    assert verifies and all(v in (None, True) for v in verifies), "the retry's verify runs the fabric pass"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a failed verify keeps the hold"
+    assert srv.device_hold_episode_since == hold_since, "the same hold episode stands"
+    assert srv.recovery_mechanism.progress_retry is None and delays == [0], "spent, never re-armed"
+    assert counters["power_cycles"] == 0 and clock[0] == 512, "the host rung waits for the ladder"
+
+    spawned = []
+    monkeypatch.setattr(
+        srv, "_maybe_spawn_forced_escalation", lambda: spawned.append(srv.device_hold_escalation_kind) or True
+    )
+    since = datetime.fromisoformat(hold_since)
+    srv._check_hold_deadline(now=since + timedelta(seconds=599))
+    assert spawned == [], "no further early retry inside the window"
+    srv._check_hold_deadline(now=since + timedelta(seconds=600))
+    assert spawned == ["ceiling_window"], "the full ladder at the 10 min mark"
+    verifies.clear()
+    clock[0] = 600.0
+    assert await _window() is True
+    assert verifies and all(v in (None, True) for v in verifies), "the ladder's reset is verified with the fabric"
+    assert counters["sweeps"] == 1 and counters["power_cycles"] == 1, "still failing: the power cycle"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing released the device"
+
+
+def test_the_ten_minute_ceiling_window_still_fires_after_the_spent_retry(monkeypatch):
+    """The zero-delay retry changes nothing past it: with the retry spent, the hold's 600 s ceiling
+    window (the full ladder) still fires at 600 s, and not before."""
+    spawned = []
+    monkeypatch.setattr(srv, "health_event", lambda kind, **f: None)
+    monkeypatch.setattr(
+        srv, "_maybe_spawn_forced_escalation", lambda: spawned.append(srv.device_hold_escalation_kind) or True
+    )
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", True)
+    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
+    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry_spent_since", "")
+    srv.fsm.set_latch("escalated", False)
+    monkeypatch.setattr(srv, "isolated_chips", {30})
+    monkeypatch.setattr(srv, "device_hold_episode_reason", "chip(s) 30 fell off the PCIe bus")
+    since = datetime(2026, 10, 16, 3, 0, 0)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
+    assert galaxy._stuck_hold_ceiling_sec() == 600
+    assert srv.recovery_mechanism.note_progress_retry(since.isoformat(), 0)
+    srv._check_hold_deadline(now=since + timedelta(seconds=390))
+    assert spawned == ["progress_retry"]
+    srv._check_hold_deadline(now=since + timedelta(seconds=599))
+    assert spawned == ["progress_retry"], "nothing else before the ceiling"
+    srv._check_hold_deadline(now=since + timedelta(seconds=600))
+    assert spawned == ["progress_retry", "ceiling_window"], "the 10 min window still runs the ladder"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("power_cycle", [True, False], ids=["power-cycle", "no-host-rung"])
+async def test_e3_shrunk_then_unchanged_resets_at_most_twice_then_climbs(monkeypatch, clear_job_state, power_cycle):
+    """E3 with I39 over six forced windows: the one-shot's reset shrinks 2 -> 1 chips off, the one
+    progress retry runs on the new set and leaves it unchanged, and from then on the hold climbs (the
+    power cycle in that same window, or one operator hand-off) and never resets again."""
+    counters, events, alerts, seen, clock = _progress_episode(monkeypatch, [{"31"}, {"31"}], power_cycle=power_cycle)
+    order = _record_cycle_order(monkeypatch, counters)
+    assert await _window() is True and counters["resets"] == 1 and order == []
+    assert _drive_progress_retry_watchdog(monkeypatch) == ["progress_retry"]
+    assert await _window() is True
+    assert counters["resets"] == 2 and seen == [{"30", "31"}, {"31"}]
+    if power_cycle:
+        assert order == [2], "the power cycle fired right after the retry failed on the unchanged set"
+    else:
+        pages = [a for a in alerts if a["kind"] == "offbus_gated_hold_page"]
+        assert len(pages) == 1 and opc._pending["handoff"]["latched"], "handed to an operator at once"
+    for w in range(1, WINDOWS):
+        clock[0] = max(clock[0], 600.0 * w)
+        assert _drive_progress_retry_watchdog(monkeypatch) == [], "one retry per episode"
+        assert await _window() is True
+    assert counters["resets"] == 2, "at most two resets: the one-shot and the progress retry"
+    assert counters["sweeps"] == 0
+    if not power_cycle:
+        assert counters["power_cycles"] == 0 and counters["reboots"] == 0
+        assert len([a for a in alerts if a["kind"] == "offbus_gated_hold_page"]) == 1
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
 
 
 # --- the record across a broker restart and a new boot (spec 04 I58) ------------------------------
