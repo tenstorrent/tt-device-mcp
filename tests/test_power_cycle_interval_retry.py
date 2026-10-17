@@ -22,7 +22,7 @@ from tt_device_mcp.health.recovery import base as recovery_base
 
 INTERVAL = 1800
 CYCLED_AT = 1000.0  # the earlier power cycle, recorded under the boot before this one
-EXPIRY = CYCLED_AT + INTERVAL + recovery_base.POWER_CYCLE_RETRY_SLACK_SEC
+EXPIRY = CYCLED_AT + INTERVAL  # spec 04 I65: asked the moment the cooldown ends, no slack
 
 
 @pytest.fixture
@@ -31,7 +31,7 @@ def ledger(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-B")
     monkeypatch.setattr(recovery_base, "POWER_CYCLE_MIN_INTERVAL_SEC", INTERVAL)
     monkeypatch.setattr(srv, "device_hold_episode_since", "2026-10-15T09:00:00")
-    monkeypatch.setattr(srv.recovery_mechanism, "_power_cycle_retry", ("", 0.0))
+    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
     path = d / recovery_base.AUTO_RECOVERY_LEDGER
     path.write_text(f'{{"action": "power-cycle", "boot_id": "boot-A", "at_epoch": {CYCLED_AT}}}\n')
     return path
@@ -56,13 +56,10 @@ def test_the_interval_is_still_enforced(ledger):
     assert _allowed(at=CYCLED_AT + INTERVAL)[0] is True
 
 
-@pytest.mark.parametrize("case", ["per-boot cap", "reboot", "other episode", "no episode"])
-def test_no_retry_unless_the_interval_alone_refused_this_episode(ledger, monkeypatch, case):
+@pytest.mark.parametrize("case", ["reboot", "other episode", "no episode"])
+def test_no_retry_for_a_reboot_or_outside_the_refused_episode(ledger, monkeypatch, case):
     action = "power-cycle"
-    if case == "per-boot cap":
-        with ledger.open("a") as f:
-            f.write(f'{{"action": "reboot", "boot_id": "boot-B", "at_epoch": {CYCLED_AT}}}\n')
-    elif case == "reboot":
+    if case == "reboot":
         action = "reboot"
     elif case == "no episode":
         monkeypatch.setattr(srv, "device_hold_episode_since", "")
@@ -70,6 +67,19 @@ def test_no_retry_unless_the_interval_alone_refused_this_episode(ledger, monkeyp
     if case == "other episode":
         monkeypatch.setattr(srv, "device_hold_episode_since", "2026-10-15T10:00:00")
     assert not srv.recovery_mechanism.power_cycle_retry_due(EXPIRY + 3600)
+
+
+def test_a_cycle_the_per_boot_cap_also_refuses_is_still_asked_again_at_its_end(ledger):
+    # Was the "per-boot cap" case of the no-retry test: the merged gate bounds the cap by the cooldown
+    # interval too (spec 04 I65), so the cycle is asked again as both end, never left to the ceiling.
+    with ledger.open("a") as f:
+        f.write(f'{{"action": "reboot", "boot_id": "boot-B", "at_epoch": {CYCLED_AT}}}\n')
+    assert _allowed()[0] is False
+    rm = srv.recovery_mechanism
+    assert rm.power_cycle_cooldown_state["until"] == EXPIRY
+    assert not rm.power_cycle_retry_due(EXPIRY - 1)
+    assert rm.power_cycle_retry_due(EXPIRY)
+    assert _allowed(at=EXPIRY)[0] is True
 
 
 def test_the_watchdog_forces_one_pass_at_expiry_not_at_the_next_window(ledger, monkeypatch):
@@ -89,7 +99,7 @@ def test_the_watchdog_forces_one_pass_at_expiry_not_at_the_next_window(ledger, m
     monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: fired.append(True) or True)
     srv._check_hold_deadline(now=now_at(EXPIRY + 1))
     assert fired == [True]
-    assert srv.device_hold_escalation_kind == "power_cycle_interval_expiry"
+    assert srv.device_hold_escalation_kind == "power_cycle_cooldown"
     srv._check_hold_deadline(now=now_at(EXPIRY + 2))
     assert fired == [True], "one pass per refusal"
 
@@ -106,7 +116,7 @@ async def test_the_retried_pass_releases_only_after_a_passing_fabric_check(ledge
     monkeypatch.setattr(srv, "_fabric_no_reset_hold", lambda: "")
     monkeypatch.setattr(srv, "health_event", lambda kind, **f: None)
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "device_hold_escalation_kind", "power_cycle_interval_expiry")
+    monkeypatch.setattr(srv, "device_hold_escalation_kind", "power_cycle_cooldown")
     fsm_dirty(srv, "chips 10,11 off the bus", why="job_killed")
 
     async def ladder(phase, indices, expected, log):

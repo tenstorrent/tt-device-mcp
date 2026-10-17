@@ -96,7 +96,10 @@ def test_classify_hold_names_the_two_branches(galaxy_trays):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("walk_disabled", [False, True])
-async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(monkeypatch, galaxy_trays, walk_disabled):
+@pytest.mark.parametrize("opted_in", [False, True])
+async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(
+    monkeypatch, galaxy_trays, walk_disabled, opted_in
+):
     """Through escalate()'s gate path (the live STAGE_UBB_TRAY rung, not the helper directly): a whole
     tray off the bus whose every off-bus chip reported no_bridge — threaded onto
     Evidence.bridge_reset_failed by the server — is classified TRAY_DOWN_NO_WINDOW and dispatched to
@@ -104,7 +107,11 @@ async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(monkey
     NO verify between, exactly ONE settle + ONE verify, then the power cycle. The generic
     verify-between walk must NOT run. After a tray re-power on this boot regressed other trays (spec 04
     I25) the sweep skips only the tray re-power: SBR, the mesh reset, the one verify and the power cycle
-    still run."""
+    still run.
+
+    That sweep runs only while no power cycle is opted in (it then ends in the power-cycle-required
+    page). With the power cycle opted in, this whole-tray drop is spec 04 I37 class A: the cycle is
+    requested at once, with no reset, sweep or verify before it."""
     g = srv.galaxy_recovery
     if walk_disabled:
         pcie_guard.disable_tray_rung(tray=1, new_off=["13"])
@@ -144,7 +151,7 @@ async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(monkey
 
     monkeypatch.setattr(g, "_attempt_ubb_tray_reset", generic_walk)
 
-    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: opted_in)
     monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", lambda action, tenant_active=False, **k: (True, ""))
     cycles = {"n": 0}
@@ -164,6 +171,10 @@ async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(monkey
 
     assert out == galaxy.OUTCOME_WAITING
     steps = [o if isinstance(o, str) else o[0] for o in order]
+    assert generic["n"] == 0, "the generic verify-between walk must NOT run for a tray-down-no-window drop"
+    if opted_in:
+        assert (steps, verify_calls["n"], cycles["n"]) == ([], 0, 1), "I37 class A: the cycle with no reset first"
+        return
     if walk_disabled:
         assert steps == ["sbr", "mesh"], "a regressed tray re-power on this boot is skipped in the sweep"
     else:
@@ -172,8 +183,7 @@ async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(monkey
         # tray-1 (1-based tray, 0-based bit) so UBB3 → bit 2, not bit 3 (which would be UBB4 on BH).
         assert order[1] == ("tray", 1 << 2), "the affected tray (UBB3) is re-powered"
     assert verify_calls["n"] == 1, "exactly ONE settle+verify after the whole sweep — no retries, no ceiling"
-    assert cycles["n"] == 1, "a sweep that did not recover climbs straight to the cold power cycle"
-    assert generic["n"] == 0, "the generic verify-between walk must NOT run for a tray-down-no-window drop"
+    assert cycles["n"] == 0, "no power cycle opted in: the sweep ends in the page, not a cycle"
 
 
 @pytest.mark.asyncio
@@ -720,7 +730,7 @@ async def test_a_regressed_tray_rung_is_skipped_in_the_last_chance_sweep(monkeyp
     counts as the full ladder and the caller climbs (False), never the open-ended hold (None)."""
     g, order, cycles = _arm_sweep(monkeypatch)
     pcie_guard.disable_tray_rung(tray=1, new_off=["13"])
-    off = {str(i) for i in range(24, 32)}  # UBB3
+    off = {str(i) for i in range(24, 30)}  # part of UBB3 (a whole tray skips the sweep, spec 04 I37)
     assert await g._settle_and_verify_before_host_rung(32, lambda m: None, "post-job", offbus_chips=off) is False
     assert order == ["sbr", "mesh"], f"the tray re-power is skipped in the sweep; got {order}"
 
@@ -739,7 +749,7 @@ async def test_a_skipped_tray_rung_releases_only_after_the_full_health_check(mon
 
     patch_recovery(monkeypatch, "_verify_device", verify)
     pcie_guard.disable_tray_rung(tray=[3], new_off=["5", "13"], signature="position5")
-    off = {str(i) for i in range(24, 32)}
+    off = {str(i) for i in range(24, 30)}  # part of UBB3 (a whole tray skips the sweep, spec 04 I37)
     out = await g._settle_and_verify_before_host_rung(32, lambda m: None, "post-job", offbus_chips=off)
     assert order == ["sbr", "mesh"]
     assert checks and all(checks), "every verify after the resets runs the fabric check"
