@@ -22,6 +22,7 @@ from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import aio, alert, metrics, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
+from tt_device_mcp.health import chip_state
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
 from tt_device_mcp.health.evidence import health_dir, health_event
@@ -413,6 +414,9 @@ class RecoveryMechanism:
         # 01 I16): a reaped job's process still holding the device, which a reset cannot free.
         # Checked here, where every reset passes, so no caller can reset over one.
         self.reset_fence: Optional[Callable[[], str]] = None
+        # Owes the pollers a step left stopped to the broker's next close to HEALTHY (spec 03 I66,
+        # 04 I12); the broker sets it. Called with what the step was.
+        self.owe_device_pollers: Optional[Callable[[str], None]] = None
 
         # Two callers (the auto-recovery reset launcher and the operator-run reset tool) need this
         # sequence and they must build it identically, because the scope name is what every other
@@ -429,7 +433,7 @@ class RecoveryMechanism:
         # only thing that separates "the chip died" from "we are resetting the chip". It guards
         # nothing else: during a fabric check or a health probe, chips going all-ones IS a failure and
         # must still be acted on — that is precisely how a host was lost.
-        self.reset_in_flight = False
+        self._reset_in_flight = False
         # Any reset_with_quiesce (the ladder's or a manual one) since the mesh was last released:
         # an off-bus set first seen after it is the reset's doing, never a tray-down onset (04 I19).
         self.reset_since_release = False
@@ -1132,13 +1136,50 @@ class RecoveryMechanism:
                 except OSError:
                     pass
                 finally:
-                    # The reset is done and the chips are back, so restoring is safe; put it in the
-                    # rescan's finally under shield so a cancellation during the rescan still restores
-                    # rather than leaving a telemetry gap.
-                    if quiesced:
-                        await asyncio.shield(self._set_device_pollers(True, log))
+                    # Only a completed reset brings the chips back, so only then is restoring safe; put
+                    # it in the rescan's finally under shield so a cancellation during the rescan still
+                    # restores rather than leaving a telemetry gap. A reset that ran and failed (rc != 0)
+                    # leaves the device held with chips that may still be off the bus or hung: pollers
+                    # stay down. rc None here is a launch failure or a raise with no scope left running.
+                    await self.restore_pollers(quiesced, log, ok=rc in (0, None), after=f"reset rc={rc}")
+
             if late_cancel:
                 raise asyncio.CancelledError()
+
+    @property
+    def reset_in_flight(self) -> bool:
+        return self._reset_in_flight
+
+    @reset_in_flight.setter
+    def reset_in_flight(self, on: bool) -> None:
+        # Published as the chips' ``recovering`` state (spec 03 I66): while it is set the pollers
+        # (sampler, /health) read no chip, and only this step's own reads reach them.
+        self._reset_in_flight = bool(on)
+        chip_state.set_recovering(f"op:{id(self)}", bool(on))
+
+    async def restore_pollers(self, quiesced: list, log, *, ok: bool, after: str) -> None:
+        """Start the device pollers a reset step stopped, but only after a step that completed
+        (spec 03 I66). After a failed, timed-out or unrecovered step the chips may still be off the
+        bus or hung and the device stays held, so the pollers stay stopped, owed to the next close to
+        HEALTHY (reached only through a passing full check, fabric included; spec 04 I12)."""
+        if not quiesced:
+            return
+        if not ok:
+            log(f"device pollers left stopped after {after}: the step did not complete, the device stays held")
+            health_event("pollers_left_quiesced", after=after, services=list(quiesced))
+            self.owe_pollers(after)
+            return
+        await asyncio.shield(self._set_device_pollers(True, log))
+
+    def owe_pollers(self, after: str) -> None:
+        """Hand the pollers a step left stopped to the broker's close-to-HEALTHY restart. Never raises."""
+        owe = self.owe_device_pollers
+        if owe is None:
+            return
+        try:
+            owe(after)
+        except Exception:  # noqa: BLE001 - a missed restart leaves them for the health probe
+            pass
 
     def _driver_wait_rescan_hook(self, argv: list[str], on_output, log):
         """Spec 04 I81: let a mesh reset bring back the chips this broker isolated, in the same reset.

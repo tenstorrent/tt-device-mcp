@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 from tt_device_mcp import metrics
-from tt_device_mcp.health import ALL_ONES, SAMPLE_INTERVAL_SEC, SAMPLE_RING_SIZE
+from tt_device_mcp.health import ALL_ONES, SAMPLE_INTERVAL_SEC, SAMPLE_RING_SIZE, chip_state
 
 if TYPE_CHECKING:
     from tt_device_mcp.health import HealthMonitor, RecoveryDeps, RecoveryMechanism
@@ -173,6 +173,12 @@ class TelemetrySampler:
         # with nothing to run on and no way back except a rescan. Treat it as a fault to
         # report, not to amputate.
         self.dead_chip_strikes: dict = {}
+        # A reset scope seen still cycling the chips after our wait for it ended: no chip read until
+        # it is gone (spec 03 I66). Re-checked once per tick only while set.
+        self.scope_seen = False
+        # The hung chips the pollers were last stopped for, so one episode stops them once.
+        self.pollers_stopped_for: frozenset = frozenset()
+        self.prev_beats: dict = {}
         # Consecutive samples with NO chip nodes in sysfs — every chip off the bus, or the
         # driver wedged. chip_sample() omits an off-bus chip, so an all-gone drop reads as an
         # empty sample the all-ones blackout above never sees. Debounced like that blackout: a
@@ -213,11 +219,15 @@ class TelemetrySampler:
             # gate trips.
             self.tick()
             try:
-                sample = await asyncio.to_thread(self._deps.chip_sample)
-                self.ring.append({"ts": time.time(), "chips": sample})
-                await asyncio.to_thread(self._deps.append_trace, sample)
+                # A reset or recovery step on the chips owns them while it runs: they are off the bus
+                # by design, and only the step's own reads may reach them (spec 03 I66).
+                if not await self.recovering_now():
+                    sample = await asyncio.to_thread(self._deps.chip_sample)
+                    self.ring.append({"ts": time.time(), "chips": sample})
+                    await asyncio.to_thread(self._deps.append_trace, sample)
 
-                await self.check_for_dead_chips(sample)
+                    await self.check_for_dead_chips(sample)
+                await asyncio.to_thread(chip_state.publish)
                 # The one loop that runs with an empty queue, so the one place an idle-degraded
                 # window can be caught and put on the durable timeline as it happens.
                 self._deps.refresh_idle_hold_ledger()
@@ -233,6 +243,45 @@ class TelemetrySampler:
             except Exception:  # noqa: BLE001 - a sampler must never take the runner down
                 pass
             await asyncio.sleep(SAMPLE_INTERVAL_SEC)
+
+    async def recovering_now(self) -> bool:
+        """Whether a reset or recovery step is running on the chips: this broker's own (the flag),
+        or a reset scope we stopped waiting for that is still cycling them."""
+        if self._mechanism.reset_in_flight:
+            return True
+        if self.scope_seen:
+            if await asyncio.to_thread(self._mechanism.scope_active):
+                return True
+            self.scope_seen = False
+            chip_state.set_recovering("scope", False)
+        return False
+
+    async def stop_pollers_for_hung(self, sample: dict, dead: list) -> None:
+        """Stop the device pollers at the FIRST sample that shows a present chip hung — reading
+        all-ones, or a heartbeat that did not move since the previous sample — not at the second
+        (spec 03 I66). Their reads to it are the MMIO a hung endpoint never completes. Isolation
+        still waits for its two-sample proof; the pollers are cheap to bring back (the health probe
+        re-arms them once the device is idle and healthy). Every chip at once is the re-init blip
+        the blackout path already proves on two samples, so it does not count here."""
+        stalled = [
+            i
+            for i, v in sample.items()
+            if v and isinstance(v[0], int) and v[0] != ALL_ONES and self.prev_beats.get(i) == v[0]
+        ]
+        self.prev_beats = {i: v[0] for i, v in sample.items() if v and isinstance(v[0], int)}
+        hung = frozenset(dead) | frozenset(stalled)
+        if not hung or len(hung) >= len(sample):
+            if not hung:
+                self.pollers_stopped_for = frozenset()
+            return
+        if hung <= self.pollers_stopped_for:
+            return
+        self.pollers_stopped_for = hung
+        log = self._deps.logger()
+        self._deps.health_event(
+            "pollers_quiesced_hung_chip", all_ones=sorted(dead, key=int), stalled=sorted(stalled, key=int)
+        )
+        await self._deps.set_device_pollers(False, lambda m: log.info(f"HUNG-CHIP {m}") if log else None)
 
     async def check_for_dead_chips(self, sample: dict) -> None:
         """Decide whether all-ones means a chip died — or something else entirely.
@@ -264,6 +313,8 @@ class TelemetrySampler:
         """
         log = self._deps.logger()
         dead = sorted((i for i, v in sample.items() if v and v[0] == ALL_ONES), key=int)
+        if not self._mechanism.reset_in_flight:
+            await self.stop_pollers_for_hung(sample, dead)
         if sample and not dead:
             self.dead_chip_strikes = {}
             self.all_chips_gone_strikes = 0
@@ -289,6 +340,8 @@ class TelemetrySampler:
         # healthy box ends up short a tray. The reset scope outlives our timer, so ask the
         # scope, not the timer.
         if await asyncio.to_thread(self._mechanism.scope_active):
+            self.scope_seen = True
+            chip_state.set_recovering("scope", True)
             return
 
         if not sample:
@@ -355,6 +408,7 @@ class TelemetrySampler:
                     f"chip failures. NOT isolating (removing every device would leave "
                     f"nothing to run on)."
                 )
+            chip_state.mark_lost(dead, "all chips all-ones on two samples", self._nodes(dead))
             self._deps.health_event("all_chips_blackout", chips=len(dead))
             self._deps.mark_device_dirty(f"all {len(dead)} chips stopped answering on the PCIe bus", why="heartbeat")
             return
@@ -368,7 +422,14 @@ class TelemetrySampler:
                 del self.dead_chip_strikes[i]
 
         if confirmed:
+            # Lost before the isolation runs: a chip the kernel will not let go of is still never
+            # read on the poll clock again (spec 03 I66).
+            chip_state.mark_lost(confirmed, "all-ones on two samples", self._nodes(confirmed))
             await self.isolate_dead_chips(confirmed)
+
+    @staticmethod
+    def _nodes(ids) -> dict:
+        return chip_state.chip_nodes(ids)
 
     async def _check_short_count(self, present: int, expected: int, log) -> None:
         """Fewer chip nodes than the baseline on two consecutive samples -> dirty (spec 03 I31).

@@ -131,6 +131,7 @@ from tt_device_mcp.health import (
     chip_sample,
     chip_snapshot,
     chip_snapshot_event,
+    chip_state,
     dead_chips,
     eth,
     eth_read_timed_out,
@@ -147,6 +148,7 @@ from tt_device_mcp.health import (
     mesh_hold_repage_sec,
     mesh_reset_hold_reason,
     note_broker_stopping,
+    offbus_chip_ids,
     offbus_count,
     offbus_power_cycle,
     pcie_guard_at_start,
@@ -1092,7 +1094,7 @@ _recovery_deps = RecoveryDeps(
         _emit_all_off_bus_power_cycle_required(log, off_bus, expected, context=context)
     ),
     host_escalation_kwargs=lambda: _host_escalation_kwargs(),
-    read_heartbeats=lambda: read_heartbeats(),
+    read_heartbeats=lambda: _decision_heartbeats(),
     heartbeat_supported=lambda: heartbeat_supported(),
     heartbeat_verdict=lambda expected: heartbeat_verdict(expected),
     gone_chip_confirm_settle_sec=lambda: GONE_CHIP_CONFIRM_SETTLE_SEC,
@@ -1164,7 +1166,19 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         fsm.boot(_recovery_deps)
         health_monitor = fsm.monitor
         recovery_mechanism = fsm.mechanism
+        # The published chip state (spec 03 I66) lists every chip the baseline expects.
+        chip_state.configure(
+            expected=lambda: (
+                health_monitor.expected(0) if health_monitor and health_monitor._health_check_enabled() else 0
+            )
+        )
+        # A fresh process has no lost or recovering chip: publish that now, over whatever a process
+        # that died mid-recovery left in the file (a per-user daemon's state dir outlives it).
+        chip_state.publish()
         recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
+        recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
+            _pollers_unfit_reason() or f"{after} did not complete"
+        )
         galaxy_recovery = fsm.galaxy
         per_target_recovery = fsm.per_target
         select_recovery = fsm.select_recovery
@@ -4526,7 +4540,7 @@ async def _attempt_down_offbus_recheck() -> None:
             expected = health_monitor.expected(len(indices))
             if heartbeat_supported():
                 # A chip still in sysfs but reading all-ones is still off the bus.
-                beats = await asyncio.to_thread(read_heartbeats)
+                beats = await asyncio.to_thread(_decision_heartbeats)
                 not_ready = await asyncio.to_thread(arc_not_ready_chips, beats)
                 off_bus = _offbus_count(beats, expected, not_ready)
                 if off_bus > 0:
@@ -5155,16 +5169,13 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         # nothing, so its post-reset verify runs on the same quiet bus. The owner restarts them.
         log(f"device pollers kept stopped: {_pollers_held_for} still running")
         return []
-    global _pollers_owed, _pollers_owed_loop
+    global _pollers_owed
     if active:
         unfit = _pollers_unfit_reason()
         if unfit:
             # A failed reset, or one whose verify has not passed yet: the pollers wait for the device to
             # be proven healthy, and the close listener starts them then. Costs no recovery time.
-            if _pollers_owed is None:
-                health_event("pollers_kept_quiesced", reason=unfit, services=list(DEVICE_POLLER_SERVICES))
-            _pollers_owed = unfit
-            _pollers_owed_loop = asyncio.get_running_loop()
+            _owe_device_pollers(unfit)
             log(f"device pollers kept stopped until the device is verified healthy: {unfit}")
             return []
         _pollers_owed = None
@@ -5244,6 +5255,19 @@ async def _pollers_quiesced_for(what: str, log):
 # The loop a deferred restart was asked on, and the restart tasks in flight (held so they finish).
 _pollers_owed_loop: Optional[asyncio.AbstractEventLoop] = None
 _pollers_restore_tasks: "set[asyncio.Task]" = set()
+
+
+def _owe_device_pollers(why: str) -> None:
+    """Leave the pollers stopped and owe their start to the next close to HEALTHY (see
+    _restore_pollers_on_close). Also the hook a reset step that did not complete calls (spec 03 I66):
+    its chips may still be off the bus or hung, so it starts nothing, even on a HEALTHY FSM."""
+    global _pollers_owed, _pollers_owed_loop
+    if _pollers_held_for:
+        return  # the wider quiesce's owner restarts them, through the same fitness rule
+    if _pollers_owed is None:
+        health_event("pollers_kept_quiesced", reason=why, services=list(DEVICE_POLLER_SERVICES))
+    _pollers_owed = why
+    _pollers_owed_loop = asyncio.get_running_loop()
 
 
 def _pollers_log(line: str) -> None:
@@ -6142,7 +6166,7 @@ async def device_health_gate(
         # walk maps its chip set onto trays, and the post-reset escalation compares against it to
         # tell a reset that recovered ground from one that REGRESSED the mesh off the bus. One read,
         # so all three decisions are made against the same picture of the mesh.
-        beats = await asyncio.to_thread(read_heartbeats)
+        beats = await asyncio.to_thread(_decision_heartbeats)
         # A reset already cycling in its own PID-1 scope must not read as a mass drop (it takes
         # every chip off the bus while it runs) and must not have a second reset started under it —
         # the concurrent-reset hazard this module exists to prevent. The router turns a live scope
@@ -6215,7 +6239,7 @@ async def device_health_gate(
             # decides on it: a chip that came back changes the count the floor keys on. No scope
             # re-read — our own rescan cannot open a foreign reset scope, and each rung left below
             # carries its own scope guard (the tray walk checks it, the reset adopts it).
-            beats = await asyncio.to_thread(read_heartbeats)
+            beats = await asyncio.to_thread(_decision_heartbeats)
             ev = replace(
                 ev,
                 off_bus=_offbus_count(beats, expected),
@@ -6357,7 +6381,7 @@ async def device_health_gate(
         # durable rate limits pass. The first four are the router's; the last two are read here,
         # after it, because both are live IO a pure decision must not do. Any of them absent and the
         # device stays flagged exactly as before.
-        beats_now = await asyncio.to_thread(read_heartbeats)
+        beats_now = await asyncio.to_thread(_decision_heartbeats)
         off_bus = _offbus_count(beats_now, expected)
         reboot_floor = _reboot_min_dead_chips(expected)
         # A reset that timed out is deliberately left cycling in its own scope for the next gate to
@@ -6517,7 +6541,7 @@ def _slurm_step_verdict(*, require_free: bool) -> dict:
     answers about the same device. Free is the reset gate's tenant rule: a holder `is_tenant`
     counts, or a scan too blind to rule one out (04 I7 fails closed).
     """
-    reason = _device_degraded_for_tenant()
+    reason = _device_degraded_for_decision()
     scan = enumerate_device_holders()
     foreign = [h for h in scan.holders if is_tenant(h)]
     holders = [{"pid": h.pid, "uid": h.uid, "username": h.username} for h in foreign]
@@ -6536,6 +6560,14 @@ def _slurm_step_verdict(*, require_free: bool) -> dict:
         "fsm_why": fsm.record.why,
         "holders": holders,
     }
+
+
+def _decision_heartbeats() -> dict:
+    """``read_heartbeats`` for a decision, not a poll: each lost chip is read for real (at most once
+    per ``chip_state.PROBE_MIN_SEC``), so no hold, rung or refusal rests on an all-ones nobody read
+    (spec 03 I66)."""
+    chip_state.reprobe_due()
+    return read_heartbeats()
 
 
 def _startup_pci_map() -> dict:
@@ -6558,6 +6590,10 @@ def _device_liveness_reason() -> str:
     the between-job gate runs, and a single sample must not sleep on a caller's path."""
     if not heartbeat_supported():
         return ""  # detector absent on this host — the in-memory signals still stand
+    if chip_state.recovering():
+        # A reset or recovery step owns the chips: they are off the bus by design and no status
+        # query reads them (spec 03 I66). Not fit for a tenant until the step and its verify pass.
+        return "a device reset or recovery step is still running on the chips"
     beats = read_heartbeats()
     if not beats:
         listed = sysfs_chip_ids()
@@ -6591,18 +6627,47 @@ def _live_offbus_state() -> dict:
     ``off_bus`` (chips off the PCIe bus now), ``arc_not_ready`` (on the bus, heartbeat ENODATA) and
     ``isolated_chips``. ``held_reason``/``fsm_why`` keep the reason the hold OPENED with; these say
     where it stands now. Empty where the heartbeat detector is absent or no baseline is known."""
-    out: dict = {"isolated_chips": sorted(isolated_chips, key=int)}
+    global _last_offbus_state
+    mech = recovery_mechanism
+    recovering = chip_state.recovering()
+    out: dict = {
+        "isolated_chips": sorted(isolated_chips, key=int),
+        # Spec 03 I66: the per-chip state a third-party reader stays off a chip by.
+        "reset_in_flight": bool(mech is not None and mech.reset_in_flight),
+        "recovering": recovering,
+        "lost_chips": chip_state.lost_chips(),
+    }
     if not heartbeat_supported():
         return out
     expected = health_monitor.expected(0) if health_monitor and health_monitor._health_check_enabled() else 0
     if expected <= 0:
         return out
+    if recovering:
+        # No chip read while a reset step owns them: the last live picture, every chip resetting.
+        out.update(_last_offbus_state)
+        out["resetting_chips"] = [str(i) for i in range(expected)]
+        out["expected_chips"] = expected
+        return out
     beats = read_heartbeats()
     not_ready = arc_not_ready_chips(beats)
-    out["off_bus"] = _offbus_count(beats, expected, not_ready)
-    out["arc_not_ready"] = sorted(not_ready, key=int)
+    off = offbus_chip_ids(beats, expected, not_ready)
+    present = set(chip_state._sysfs_indices())
+    live = {
+        "off_bus": _offbus_count(beats, expected, not_ready),
+        "off_bus_chips": sorted(off, key=int),
+        "arc_not_ready": sorted(not_ready, key=int),
+        # Node present, reads all-ones: on the bus, not answering.
+        "hung_chips": sorted((i for i in dead_chips(beats) if i in present), key=int),
+    }
+    _last_offbus_state = live
+    out.update(live)
+    out["resetting_chips"] = []
     out["expected_chips"] = expected
     return out
+
+
+# The last live off-bus picture _live_offbus_state read; served while a reset step owns the chips.
+_last_offbus_state: dict = {}
 
 
 def _device_degraded_for_tenant() -> str:
@@ -6613,6 +6678,14 @@ def _device_degraded_for_tenant() -> str:
     restart that dropped the in-memory dirty flag. Root-free, no device touch, no sleep,
     so it is cheap enough to answer a status query."""
     return _device_unavailable_for_tenant() or _device_liveness_reason()
+
+
+def _device_degraded_for_decision() -> str:
+    """_device_degraded_for_tenant for a decision that lets a tenant on or refuses one (admission,
+    exec, a Slurm step): each lost chip's live probe is a real read, so a chip that answers again is
+    not refused as off the bus on an all-ones nobody read. Status and /health stay gated (03 I66)."""
+    chip_state.reprobe_due()
+    return _device_degraded_for_tenant()
 
 
 def _device_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, str]]:
@@ -6885,7 +6958,7 @@ async def _force_escalate_stuck_hold() -> None:
         expected = health_monitor.expected(len(indices))
         if expected <= 0:
             return
-        beats = await asyncio.to_thread(read_heartbeats)
+        beats = await asyncio.to_thread(_decision_heartbeats)
         off_bus = _offbus_count(beats, expected)
         no_reset = "" if off_bus or isolated_chips else _fabric_no_reset_hold()
         if no_reset:
@@ -7824,7 +7897,7 @@ async def _await_device_free_for_tenant(job_log_file: Optional[Path]) -> str:
     # `break`, not a bare `return ""` — such a chip leaves fsm HEALTHY, and a read of the
     # 0xFFFFFFFF it now returns can stall the host CPU that issues it, so the job must
     # never be dispatched.
-    return _device_degraded_for_tenant()
+    return _device_degraded_for_decision()
 
 
 LEFTOVER_REBOOT_HINT = (
@@ -12731,7 +12804,7 @@ def create_mcp_server() -> MCPServer:
         # gates on rather than the op/dirty flags alone. Exec is a short synchronous call — a
         # reset+fabric pass can hold the device for twelve minutes — so it refuses and says why
         # rather than blocking the caller behind it.
-        blocked = _device_degraded_for_tenant()
+        blocked = _device_degraded_for_decision()
         if blocked:
             if logger:
                 logger.warning(f"  -> ERROR: device not free: {blocked}")
