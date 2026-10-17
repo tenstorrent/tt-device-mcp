@@ -575,9 +575,12 @@ job boundary.
   reset's post-reset check re-tests), so no broker restart is needed. Time to recover (class D, a
   measured fabric fault, 15 min budget): the failed pass (~66 s plus the ~19 s descriptor rerun),
   the present-mesh reset (~4 min) and its full check, then the host rung no later than the 600 s
-  stuck-hold ceiling (the full ladder at the 10 min mark, then the power cycle; only the bounded
-  boot/post-cycle cooldown may delay it), against before: a withheld check on every relift and on
-  the operator reset, an open-ended hold (55+ min measured) and no power-cycle rung. The startup gate
+  stuck-hold ceiling when the idle relift ran the reset (only the bounded boot/post-cycle cooldown
+  may delay it). Class D exception, the watchdog path (no idle relift reset ran first): the full
+  ladder starts at the 10 min mark, and its reset, full check and last-chance sweep put the host rung
+  about 4-6 min later (about 14-16 min into the hold: the ~4 min reset plus its check and the
+  sweep), against before: a withheld check on every relift and on the operator reset, an
+  open-ended hold (55+ min measured) and no power-cycle rung. The startup gate
   takes the same path: a lost link there FAILS (I71) and the carried hold stays held. Any later job is outside the bound. A clean pass without the
   marker ends the lift.
 - **I43 — A foreign-holder hold whose holder is gone is verified at once, not reset at the ceiling.**
