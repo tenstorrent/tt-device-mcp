@@ -3936,6 +3936,25 @@ def _hold_details(evidence: dict) -> tuple[str, str]:
     return str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or "")
 
 
+def _fabric_link_hold(evidence: dict) -> str:
+    """Why the open hold is on a missing or broken fabric link, or "" (spec 03 I77): the I42 latch, a
+    pass that found descriptor ports missing (I71), or a topology mismatch named by the hold, its
+    episode, this pass or the last fabric output. Such a hold lifts only on a passing full fabric
+    check, never on the startup checks: no traffic crossed the links in doubt."""
+    if health_monitor is not None and health_monitor.topology_hw_fault:
+        return "the topology-mismatch lift's first job failed on the fabric"
+    texts = (*_hold_details(evidence), str(device_hold_episode_reason or ""))
+    if any(fabric.names_links_missing(t) for t in texts) or (
+        health_monitor is not None and (health_monitor.fabric_topology or {}).get("verdict") == "failed"
+    ):
+        return "descriptor ports missing"
+    if any(_TOPOLOGY_HOLD in t or _TOPOLOGY_VALIDATOR_LINE in t for t in texts) or (
+        health_monitor is not None and _TOPOLOGY_VALIDATOR_LINE in (health_monitor.last_fabric_output or "")
+    ):
+        return "topology mismatch"
+    return ""
+
+
 def _known_fabric_fault_hold() -> bool:
     # A known fabric fault (03 I46) is outside the I40 bound: its release is what failed. The I42
     # first-job latch is not: its check runs and fails, so it takes the ladder.
@@ -4112,16 +4131,15 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
     eok, edetail = await health_monitor.verify_eth_heartbeat()
     # A reset with no passing fabric pass since may not be released on the startup checks (04 I32).
     owed = _post_reset_debt()
-    if eok is True and not recent and not owed:
+    # Nor a hold on a missing or broken link: only a passing full fabric check lifts it (03 I77).
+    link = _fabric_link_hold(evidence)
+    if eok is True and not recent and not owed and not link:
         _fabric_77_fallback_release_monotonic = time.monotonic()
         log(
             f"startup checks pass (enum+ARC healthy, eth heartbeat {edetail or eok!r}) — hold lifted "
             "WITH A WARNING: the fabric is unverified, the next gate re-runs the pass"
         )
         health_event("device_relift_fabric_unverified", evidence=evidence, retries=_fabric_77_streak)
-        if any(_TOPOLOGY_HOLD in d for d in _hold_details(evidence)):
-            # The release is a lift onto links no traffic crossed: the first job bounds it (I42).
-            health_monitor.topology_lift_pending = True
         _clear_device_dirty(
             verified=True, why="idle relift: fabric check unrunnable past its bound; startup checks pass"
         )
@@ -4131,6 +4149,8 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
         + (
             f"a reset ({owed}) has had no passing fabric pass since"
             if eok is True and owed
+            else f"a hold on a missing or broken link ({link}) lifts only on a passing fabric check"
+            if eok is True and link
             else (
                 "a fallback release already ran inside the window"
                 if eok is True
@@ -7102,12 +7122,14 @@ def _hold_bound_cycle_due(age: float) -> bool:
 
 
 def _lift_hold_bound_latches(log) -> None:
-    """At the bound, the latches that withhold or skip the fabric check (spec 03 I42's topology
-    hardware fault, I46's known fabric fault) are lifted, so the check after the ladder gets a real
-    verdict and only a pass releases. A job that fails the same way declares them again."""
+    """At the bound, the latch that skips the fabric check (spec 03 I46's known fabric fault) is
+    lifted, so the check after the ladder gets a real verdict and only a pass releases. A job that
+    fails the same way declares it again. The I42 topology latch stays: it withholds no check (a
+    mismatch FAILS while it stands), and lifting it let the post-ladder check lift the mismatch
+    again onto the links the first job already failed on (spec 03 I77)."""
     if health_monitor is None:
         return
-    for name in ("topology_hw_fault", "fabric_known_fault"):
+    for name in ("fabric_known_fault",):
         detail = getattr(health_monitor, name, "")
         if detail:
             setattr(health_monitor, name, "")
@@ -11798,9 +11820,9 @@ def create_mcp_server() -> MCPServer:
 
         recovery = select_recovery()
         argv = recovery.reset_argv(indices)
-        # An operator reset re-tests the I42 latch: its post-reset check decides, no restart needed.
-        if health_monitor is not None:
-            health_monitor.clear_topology_hw_fault("operator reset")
+        # The I42 latch stays through an operator reset: it withholds no check, so the post-reset check
+        # runs the descriptor and only its clean pass ends the latch (spec 03 I77). Clearing it here let
+        # that check lift the mismatch onto the links the first job already failed on.
         yield f"$ {' '.join(argv)}   ({len(indices)} device(s); ~30-60s)\n"
         reset_owner = _reset_action_owner()
         _plog = (lambda m: logger.info(m)) if logger else (lambda m: None)
@@ -13343,9 +13365,9 @@ def create_mcp_server() -> MCPServer:
 
         recovery = select_recovery()
         argv = recovery.reset_argv(indices)
-        # An operator reset re-tests the I42 latch: its post-reset check decides, no restart needed.
-        if health_monitor is not None:
-            health_monitor.clear_topology_hw_fault("operator reset")
+        # The I42 latch stays through an operator reset: it withholds no check, so the post-reset check
+        # runs the descriptor and only its clean pass ends the latch (spec 03 I77). Clearing it here let
+        # that check lift the mismatch onto the links the first job already failed on.
         command = " ".join(argv)
         step(f"exec: {command}  ({len(indices)} device(s); ~30-60s on a Galaxy)")
 
