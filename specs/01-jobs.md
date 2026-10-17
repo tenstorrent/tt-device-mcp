@@ -466,9 +466,11 @@ flowchart LR
 - That cancel always ends the runner, even when it lands as a job ends. Before Python 3.12,
   `asyncio.wait_for` returns the inner result and drops a cancel that arrives in the same loop
   step (bpo-42130); the runner then went back to the queue and waited forever, so shutdown
-  never finished. The timed waits the runner makes (the job's output readers and, between
-  jobs, the dispatch probe, eth read, subprocess probes, reset wait and poller stop/start) use
-  `aio.wait_for`, which has `asyncio.wait_for`'s contract but is built on `asyncio.wait`.
+  never finished. The timed waits the runner makes (the output-dir preflight, the job's output
+  readers, the preempt ladder, the tenant hold wait and, between jobs, the dispatch probe, eth
+  read, subprocess probes, reset wait and poller stop/start) and the startup eth self-test use
+  `aio.wait_for`, which has `asyncio.wait_for`'s contract but is built on `asyncio.wait`. Only
+  request handlers may keep a plain `asyncio.wait_for` in `server.py`.
 - At startup, `reconcile_running_scopes` re-adopts every active `ttdev-job-*.scope`:
   the job is reconstructed from its log header (`_job_from_log` — owner, command,
   queued/started, TIMEOUT), registered RUNNING, and `_monitor_readopted_scope` polls the
@@ -571,5 +573,5 @@ flowchart LR
 | B-Completion (runner fails closed) | `tests/test_device_safety.py::test_an_error_escaping_job_cleanup_fails_closed` |
 | B-Ids/`Job` basics | `tests/test_server.py::TestJob::test_job_status_values`, `tests/test_server.py::TestJob::test_runtime_sec_property`, `tests/test_server.py::TestJob::test_wait_sec_property` |
 | Re-adoption scope naming | `tests/test_readopt.py::test_scope_unit_roundtrip`, `tests/test_readopt.py::test_list_active_job_scopes_parses` |
-| B-Shutdown (a cancel that lands as a job ends still ends the runner) | `tests/test_aio.py::test_a_cancel_that_lands_as_the_inner_work_ends_is_not_dropped`, `tests/test_aio.py::test_cancel_also_cancels_the_inner_work`, `tests/test_aio.py::test_timeout_cancels_the_inner_work_and_raises_timeout` |
+| B-Shutdown (a cancel that lands as a job ends still ends the runner) | `tests/test_aio.py::test_a_cancel_that_lands_as_the_inner_work_ends_is_not_dropped`, `tests/test_aio.py::test_cancel_also_cancels_the_inner_work`, `tests/test_aio.py::test_timeout_cancels_the_inner_work_and_raises_timeout`, `tests/test_aio.py::test_the_broker_tasks_that_shutdown_cancels_use_aio_wait_for`, `tests/test_job_preflight.py::test_a_cancel_that_lands_as_the_preflight_ends_is_not_dropped` |
 | I67 (a SIGKILLed holder that lets go within the window is no leftover; one still holding when it ends is; the wait is bounded) | `tests/test_holder_release_wait.py::test_a_holder_that_releases_within_the_window_is_not_a_leftover`, `tests/test_holder_release_wait.py::test_a_holder_still_holding_after_the_window_is_named`, `tests/test_holder_release_wait.py::test_wait_device_released_with_nothing_to_wait_for_scans_nothing`, `tests/test_holder_release_wait.py::test_wait_device_released_returns_once_the_pids_let_go`, `tests/test_holder_release_wait.py::test_wait_device_released_gives_up_at_the_timeout` |
