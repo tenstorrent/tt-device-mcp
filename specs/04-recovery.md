@@ -826,8 +826,9 @@ each rung fires only when the gentler one failed or cannot apply.
   health check, fabric included, behind the hugepage gate, and a failure keeps the hold. A set that
   shrank or changed is not covered and keeps the ordinary ladder. Partial off-bus time to power cycle
   falls from the 600 s ceiling window plus a second reset and a sweep (924 s for one chip with a 132 s
-  reset; 1186 s for four chips with 263 s resets) to the one-shot plus the one failed reset (252 s and
-  383 s), when no cycle or boot fell within the last cooldown; within one, at the cooldown's end
+  reset; 1186 s for four chips with 263 s resets) to the one-shot plus the one failed reset (about
+  150 s and 280 s with the 10-20 s idle one-shot of spec 03 I23; 252 s and 383 s while a tenant holds
+  the 120 s wait), when no cycle or boot fell within the last cooldown; within one, at the cooldown's end
   (I65). Bounds the idle 5-6 min one Galaxy host sat between a failed mesh reset and the ceiling
   window; a second mesh reset on the same chips after an exit 1 killed another host.
 - **I39 — A failed mesh reset that brought chips back gets one early retry, not the ceiling wait.**
@@ -843,8 +844,9 @@ each rung fires only when the gentler one failed or cannot apply.
   kept on measured evidence: in the Galaxy logs every second reset that healed came 99 s or more after
   the failed one, and every second reset 7-11 s after it failed; the retry also never waits past the
   ceiling. The stated bound for B1's first-reset-fails, second-heals pattern is about 10 min from
-  onset (one-shot 120 s, a failed reset of up to 262 s, the 60 s wait, a 62 s healing reset and a 63 s
-  fabric check: about 585 s, against a floor of 378-511 s with no wait at all). A B1 drop that one
+  onset (one-shot 10-20 s on an idle box, spec 03 I23, 120 s while a tenant holds the device; a failed
+  reset of up to 262 s, the 60 s wait, a 62 s healing reset and a 63 s fabric check: about 485 s idle,
+  about 585 s with a tenant, against a floor of 378-511 s with no wait at all). A B1 drop that one
   reset heals keeps the 6 min bound.
 
 - **I58 — A mesh reset that failed is remembered for the boot, across broker restarts.** Every mesh
