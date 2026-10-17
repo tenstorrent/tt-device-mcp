@@ -1113,6 +1113,7 @@ _recovery_deps = RecoveryDeps(
     episode_dirty=lambda: fsm.record.dirty,
     episode_open=lambda: fsm.state is not ServerState.HEALTHY,
     episode_job=lambda: dict(fsm.record.job),
+    eth_rearm=lambda: _rearm_eth_before_check(),
 )
 
 # The root constructs the health subsystem, once, while still in its BOOT state — never per gate
@@ -3395,10 +3396,28 @@ eth_check_disarm_reason: str = "startup self-test has not run yet"
 eth_rearm_retryable: bool = False
 ETH_CHECK_REARM_INTERVAL_SEC = 600.0
 _last_eth_rearm_monotonic: float = 0.0
+# Counts the self-test retries _rearm_eth_before_check ran; a relift compares it across its own pass.
+_eth_rearm_retries: int = 0
 _eth_rearm_task: Optional[asyncio.Task] = None
 
 
-async def selftest_eth_heartbeat() -> None:
+async def _eth_read_rearmed() -> tuple[Optional[bool], str]:
+    """The idle relift's eth read, after re-arming a rung a failed self-test left off. A self-test
+    that hung during the open episode reads FROZEN (see selftest_eth_heartbeat)."""
+    hung = await _rearm_eth_before_check()
+    if hung:
+        return False, hung
+    return await health_monitor.verify_eth_heartbeat()
+
+
+def _fault_episode_open() -> bool:
+    """Whether the device is held or dirty for a fault. The startup_unverified hold every broker
+    start opens is not one. Read off the record, so before boot_merge it answers for the episode
+    the last broker left open."""
+    return fsm.state in (ServerState.RECOVERING, ServerState.DOWN) and fsm.record.why != "startup_unverified"
+
+
+async def selftest_eth_heartbeat() -> str:
     """Time the passive eth read once per broker start; arm the rung only on a fast answer.
 
     Slow is the dangerous outcome, not failing: past its timeout the gate reads a frozen core and
@@ -3410,6 +3429,11 @@ async def selftest_eth_heartbeat() -> None:
     weeks — 25 SKIPPED, 0 verdicts — because "nobody armed it" and "it is broken" look identical
     from outside. So the box proves the detector on itself, here, once, and says at WARNING which
     rung is off and why when it cannot.
+
+    Returns a FROZEN detail when the read hung past its budget during an open fault episode, else
+    "". There a hung read is the wedge itself, not a slow host: on one box every broker start over
+    a frozen eth core hung the read past the budget, and the read took 0.79s after the reboot. The
+    caller holds the device on it; the rung stays off and retryable either way.
     """
     global eth_check_armed, eth_check_disarm_reason, eth_rearm_retryable, _last_eth_rearm_monotonic
     # Stamped here, so the first idle retry comes a full interval after this attempt.
@@ -3422,6 +3446,7 @@ async def selftest_eth_heartbeat() -> None:
     # Off the event loop: build() can shell out to three candidate pythons, and the idle retry
     # (see _maybe_spawn_eth_rearm) must not stall the sampler or the watchdog ping on them.
     built = await asyncio.to_thread(eth.build)
+    hung = False
     if built is None:
         eth_check_disarm_reason = "no runnable eth read on this host (no python that imports ttexalens)"
     else:
@@ -3480,6 +3505,7 @@ async def selftest_eth_heartbeat() -> None:
                 f"read hung past the {ETH_CHECK_SELFTEST_BUDGET_SEC:.0f}s self-test budget — too slow "
                 "to distinguish from a frozen core"
             )
+            hung = True
         except Exception as e:  # noqa: BLE001 - a self-test must never block startup
             eth_check_disarm_reason = f"read not runnable: {e}"
     if not eth_check_armed:
@@ -3491,9 +3517,44 @@ async def selftest_eth_heartbeat() -> None:
         if logger:
             logger.warning(
                 f"RUNG OFF eth-heartbeat: {eth_check_disarm_reason}. The passive frozen-eth detector "
-                "produces NO verdict this run, so a frozen core is left to the traffic pass, which can "
-                "knock it off the PCIe bus instead of naming it."
+                "produces NO verdict until a retry arms it"
+                + (" (retried at the next full health check or reset)" if eth_rearm_retryable else "")
+                + ", so a frozen core is left to the traffic pass, which can knock it off the PCIe bus "
+                "instead of naming it."
             )
+    if not (hung and _fault_episode_open()):
+        return ""
+    why = fsm.record.why
+    detail = (
+        f"eth self-test read hung past its {ETH_CHECK_SELFTEST_BUDGET_SEC:.0f}s budget during an open "
+        f"fault episode ({why}): counted as a frozen eth core"
+    )
+    health_event("eth_selftest_hung", episode=why, budget_sec=ETH_CHECK_SELFTEST_BUDGET_SEC)
+    if logger:
+        logger.warning(f"RUNG SELFTEST eth-heartbeat: {detail} — the device stays held")
+    return detail
+
+
+async def _rearm_eth_before_check() -> str:
+    """Retry a failed eth self-test at the head of a full health pass, before it reads the mesh
+    (spec 03 I28). The caller holds the device-op lock (every full pass does). Unpaced inside a
+    fault episode: a reset or a held device's re-check must not run with the rung off just because
+    a broker start found the core frozen. Outside one it keeps the idle tick's ETH_CHECK_REARM_INTERVAL_SEC
+    pace, so a core that stays frozen is not retried at every full pass. Returns the self-test's
+    FROZEN detail, or ""."""
+    global _eth_rearm_retries
+    if eth_check_armed or not eth_rearm_retryable:
+        return ""
+    if not _fault_episode_open() and time.monotonic() - _last_eth_rearm_monotonic < ETH_CHECK_REARM_INTERVAL_SEC:
+        return ""
+    _eth_rearm_retries += 1
+    _set_device_op_detail("health check: eth-heartbeat self-test (re-arming)")
+    try:
+        return await selftest_eth_heartbeat() or ""
+    except Exception as e:  # noqa: BLE001 - a retry must never break the pass it heads
+        if logger:
+            logger.error(f"RUNG SELFTEST eth-heartbeat retry failed: {e}")
+        return ""
 
 
 def _opted_out(var: str) -> str:
@@ -4095,7 +4156,7 @@ def _note_fabric_77_reset_passes(passes: int) -> None:
     _fabric_77_streak = max(_fabric_77_streak + passes, _env_int("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", 3, 1) - 1)
 
 
-async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
+async def _fabric_77_fallback(evidence: dict, log, escalate, retried: bool = False) -> bool:
     """The fabric check could not run on a bounded number of retries: alert, then gate on the startup
     checks instead. enum+ARC already passed (the caller's observe returned healthy); add the eth
     heartbeat, which also compares the measured up-link count with the host's baseline, so a link
@@ -4128,7 +4189,11 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
         alert.send_alert(event, logger) is not None or alert.alert_argv() is None
     ):
         _fabric_77_paged_since = fsm.record.since
-    eok, edetail = await health_monitor.verify_eth_heartbeat()
+    # ``retried``: this relift's own pass already ran the re-arm retry, so a second one is skipped.
+    if retried:
+        eok, edetail = await health_monitor.verify_eth_heartbeat()
+    else:
+        eok, edetail = await _eth_read_rearmed()
     # A reset with no passing fabric pass since may not be released on the startup checks (04 I32).
     owed = _post_reset_debt()
     if eok is True and not recent and not owed:
@@ -4224,6 +4289,7 @@ async def _attempt_idle_relift() -> None:
         expected = health_monitor.expected(len(indices))
 
         async with _device_op("idle-relift"):
+            retries_at_start = _eth_rearm_retries
             # Re-checked under the lock: a job's gate or a reset can have taken over — and lifted or
             # re-dirtied the device — between the sampler's unlocked read and here. Recompute the mode
             # too: the hold class can have changed under the lock. The dirty axis is re-read
@@ -4341,7 +4407,9 @@ async def _attempt_idle_relift() -> None:
                 ):
                     # I40: a pass that cannot run is retried a bounded number of times, never
                     # forever. Past the bound the startup checks become the gate.
-                    if await _fabric_77_fallback(evidence, _log, _escalate):
+                    if await _fabric_77_fallback(
+                        evidence, _log, _escalate, retried=_eth_rearm_retries != retries_at_start
+                    ):
                         return
                 if fabric_ok is not True:
                     _repage_topology_hw_fault()
@@ -4351,7 +4419,7 @@ async def _attempt_idle_relift() -> None:
                     )
                     return
             else:
-                eok, edetail = await health_monitor.verify_eth_heartbeat()
+                eok, edetail = await _eth_read_rearmed()
                 if fsm.record.why == "eth_frozen":
                     # The hold's last fabric pass MEASURED a failure (a post-job gate's rc 1, not a 77
                     # skip) and no eth read says the cores are frozen: the fault is proven, so the
