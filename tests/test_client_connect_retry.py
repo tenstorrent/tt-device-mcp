@@ -112,3 +112,57 @@ def test_no_resend_after_connect(monkeypatch, tmp_path):
     assert "error" in res
     assert sleeps == [] and len(accepted) == 1
     assert os.path.exists(path)
+
+
+def _refused_socket(tmp_path):
+    """A socket file with no listener: connect() raises ConnectionRefusedError."""
+    path = str(tmp_path / "dead.sock")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(path)
+    s.close()
+    return path
+
+
+def _count_attempts(monkeypatch):
+    calls = []
+    real = utils.retry_unreachable
+
+    def spy(attempt, **kw):
+        def counted():
+            calls.append(1)
+            return attempt()
+
+        return real(counted, **kw)
+
+    monkeypatch.setattr(utils, "retry_unreachable", spy)
+    return calls
+
+
+@pytest.mark.parametrize("kind", ["refused", "missing"])
+def test_health_probe_fails_fast_without_retry(monkeypatch, tmp_path, capsys, kind):
+    """The root health probe must see a dead broker at once: one connect, no wait."""
+    from tt_device_mcp import health_probe
+
+    path = _refused_socket(tmp_path) if kind == "refused" else str(tmp_path / "none.sock")
+    monkeypatch.setattr(health_probe, "DEFAULT_SOCKET", path)
+    monkeypatch.delenv(utils.CONNECT_DELAY_ENV)  # real 1 s default: a retry would show
+    sleeps = []
+    monkeypatch.setattr(utils.time, "sleep", sleeps.append)
+    attempts = _count_attempts(monkeypatch)
+    res = health_probe.Probe(root=tmp_path).health()
+    assert res["error"].startswith("Connection failed:")
+    assert attempts == [1] and sleeps == []
+    assert "broker restart may be in progress" not in capsys.readouterr().err
+
+
+def test_normal_client_still_retries_refused_connect(monkeypatch, tmp_path):
+    """Contrast: the same refused socket is retried for a normal client call."""
+    path = _refused_socket(tmp_path)
+    monkeypatch.setattr(utils, "resolve_socket", lambda *a: path)
+    sleeps = []
+    monkeypatch.setattr(utils.time, "sleep", sleeps.append)
+    attempts = _count_attempts(monkeypatch)
+    res = utils.api_call(0, "/health", method="GET")
+    assert res["error"].startswith("Connection failed:")
+    assert len(attempts) == utils.DEFAULT_CONNECT_RETRIES + 1
+    assert len(sleeps) == utils.DEFAULT_CONNECT_RETRIES

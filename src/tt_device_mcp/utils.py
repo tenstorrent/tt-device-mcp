@@ -29,13 +29,16 @@ def _env_num(name: str, default, cast):
     return val if val >= 0 else default
 
 
-def retry_unreachable(attempt, *, sleep=None):
+def retry_unreachable(attempt, *, sleep=None, retries=None):
     """Call ``attempt()`` (a connect step); on ConnectionRefusedError or FileNotFoundError
     only, wait and retry up to TT_DEVICE_MCP_CONNECT_RETRIES times (default 5 x 1 s,
     TT_DEVICE_MCP_CONNECT_DELAY_SEC). Prints one line to stderr on the first wait. After
-    the last retry the original exception is raised. Other errors propagate at once."""
+    the last retry the original exception is raised. Other errors propagate at once.
+    ``retries`` overrides the env/default count; 0 means one attempt, no wait (probes
+    that must report a dead broker at once)."""
     sleep = sleep or time.sleep
-    retries = _env_num(CONNECT_RETRIES_ENV, DEFAULT_CONNECT_RETRIES, int)
+    if retries is None:
+        retries = _env_num(CONNECT_RETRIES_ENV, DEFAULT_CONNECT_RETRIES, int)
     delay = _env_num(CONNECT_DELAY_ENV, DEFAULT_CONNECT_DELAY_SEC, float)
     for n in range(retries + 1):
         try:
@@ -53,7 +56,7 @@ def retry_unreachable(attempt, *, sleep=None):
             sleep(delay)
 
 
-def _connect_uds(socket_path: str, timeout) -> socket.socket:
+def _connect_uds(socket_path: str, timeout, *, retries=None) -> socket.socket:
     """Connect to a unix socket, retrying a refused connect / missing socket (see
     retry_unreachable). Each attempt uses a fresh socket."""
 
@@ -67,15 +70,16 @@ def _connect_uds(socket_path: str, timeout) -> socket.socket:
             raise
         return sock
 
-    return retry_unreachable(attempt)
+    return retry_unreachable(attempt, retries=retries)
 
 
-def _uds_api_call(socket_path: str, endpoint: str, method: str, data: dict, timeout: int) -> dict:
-    """Same request/response as api_call, but over a unix domain socket (the broker)."""
+def _uds_api_call(socket_path: str, endpoint: str, method: str, data: dict, timeout: int, *, retries=None) -> dict:
+    """Same request/response as api_call, but over a unix domain socket (the broker).
+    ``retries`` is the connect retry count (see retry_unreachable; None = env/default)."""
     conn = http.client.HTTPConnection("localhost", timeout=timeout)
     # http.client speaks HTTP; we just swap its TCP connect for an AF_UNIX one.
     try:
-        conn.sock = _connect_uds(socket_path, timeout)
+        conn.sock = _connect_uds(socket_path, timeout, retries=retries)
         body = json.dumps(data).encode("utf-8") if data else None
         conn.request(method, endpoint, body=body, headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
