@@ -228,11 +228,13 @@ def test_floor_message_promises_escalation_only_when_armed(monkeypatch):
     monkeypatch.delenv("TT_DEVICE_MCP_SELFHEAL_RELIFT", raising=False)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_cooldown_state", None)
     monkeypatch.setattr(srv, "isolated_chips", set())
-    assert "~2 min" not in srv._hold_escalation_note(off_bus=1), "no 2-min rung for a drop with no isolated chip"
+    assert "~10 s" not in srv._hold_escalation_note(off_bus=1), "no early rung for a drop with no isolated chip"
     assert "climbs at the 10-min hold ceiling" in srv._hold_escalation_note(off_bus=1)
     assert "escalates at the 10-min hold ceiling" in srv._hold_escalation_note()
     monkeypatch.setattr(srv, "isolated_chips", {7})
-    assert "escalates in ~2 min (isolated chips)" in srv._hold_escalation_note(off_bus=1)
+    assert "escalates in ~10 s (isolated chips; 120 s while a tenant holds the device)" in srv._hold_escalation_note(
+        off_bus=1
+    )
     monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     for off_bus in (0, 1):
         note = srv._hold_escalation_note(off_bus)

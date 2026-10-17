@@ -174,8 +174,17 @@ job boundary.
   with any trace of a fault falls into the generic escalate category rather than standing forever.
 - **I23 — Every hold terminates.** The hold-deadline watchdog puts a stuck hold on the durable
   timeline once per window; past the ceiling (`_stuck_hold_ceiling_sec`, default 600s; off-bus
-  holds get one early attempt at `_offbus_hold_ceiling_sec`, default 120s) a tenant-free hold is
+  holds with an isolated chip get one early attempt, the one-shot) a tenant-free hold is
   force-escalated through the gate's own gentlest-first ladder (spec 04). Both re-arm per episode.
+  The one-shot is due one sampler interval into the hold (`_offbus_one_shot_sec`, 10 s, so it runs
+  10-20 s after the hold opens): the hold opened on a gate that declined to reset below the
+  galaxy-reset floor, and a chip that left the bus never returns by waiting. The early run checks
+  for a tenant quietly first; if one holds the device it gives the one-shot back with no device op,
+  event or rung, and the one-shot then waits `_offbus_hold_ceiling_sec` (default 120s) from the hold
+  start, where the stand-down below and spec 04 I7 apply. A pending host action (spec 04 I34)
+  suppresses the early run as it does any forced run. Time to the first rung for an idle partial
+  off-bus hold (spec 04 class B1) falls from about 120 s to 10-20 s; with a tenant, the ceiling
+  windows, the whole-tray path (spec 04 I37) and the worst case are unchanged.
   A window whose forced run stood down on a live tenant is given back, not spent: the next tick
   with no tenant (checked quietly first) runs it. A one-shot past the ceiling claims that window; a one-shot given back on a
   live tenant gives back the window it claimed too, so a hold whose chips came back meanwhile runs
@@ -539,7 +548,10 @@ job boundary.
   the startup checks at once), and this bound ends it. Not while a reset still owes a fabric pass
   (spec 04 I32): the startup checks prove no fabric after a reset, so such a pass climbs the
   present-mesh rung instead of releasing, and the reset's hold ends in a passing fabric pass or the
-  ladder's bounded climb (spec 04 I29). A 77-only hold that followed no reset releases as above.
+  ladder's bounded climb (spec 04 I29). That climb also reaches the host rung when the last-chance
+  sweep still reads a 77 with no known no-reset cause: once per episode, then an operator hand-off
+  (spec 04 I29), the device held until a full check with fabric passes. A 77-only hold that followed
+  no reset releases as above.
   Idle path only: no added time between
   jobs. The hardware fault of the first job after a
   topology-mismatch lift (I42) is outside this bound: no release or rung can fix cabling. A
@@ -634,7 +646,9 @@ job boundary.
   first step counts from the hold's opening, each later one from the last re-check that read a 77
   again. An owed startup pass (I39) is not held back. The I40 bound's third retry so lands about
   17 min into the episode, and a hold nothing could end gets a fresh pass every 20 min rather than on
-  every relift tick. A rung that ran and left the fabric still only 77ing measured no fault, so its
+  every relift tick. For a hold a reset left owing its fabric pass, the backoff is not the only end:
+  the escalation's sweep and host rung (spec 04 I29) bound it, and the backoff keeps re-checking
+  meanwhile. A rung that ran and left the fabric still only 77ing measured no fault, so its
   terminal outcome does not take the broker DOWN (a state no idle path re-checks): the hold stays
   RECOVERING and the backoff keeps re-checking. A hold with a measured fabric fault or a named
   runtime fault goes DOWN on a terminal rung as before. A 77 whose output names the hugepage pool
@@ -1387,6 +1401,7 @@ refuses.
 | I21 | `tests/test_device_safety.py::test_idle_relift_lifts_a_self_healed_hold`, `tests/test_device_safety.py::test_idle_relift_lifts_an_off_bus_floor_hold_without_the_eth_reader`, `tests/test_device_safety.py::test_idle_relift_still_holds_an_off_bus_hold_whose_eth_is_frozen`, `tests/test_device_safety.py::test_idle_relift_holds_an_off_bus_hold_while_the_fabric_is_unhealthy`, `tests/test_device_safety.py::test_idle_relift_holds_when_eth_read_is_inconclusive`, `tests/test_device_safety.py::test_idle_relift_holds_a_still_frozen_eth_core`, `tests/test_device_safety.py::test_idle_relift_holds_a_still_off_bus_chip_without_resetting`, `tests/test_device_safety.py::test_idle_relift_bails_if_a_chip_drops_during_the_verify`, `tests/test_device_safety.py::test_idle_relift_bails_on_a_re_dirtied_hold`, `tests/test_device_safety.py::test_idle_relift_is_rate_limited`, `tests/test_device_safety.py::test_maybe_spawn_idle_relift_gates_and_single_flights`, `tests/test_device_safety.py::test_idle_relift_is_inert_when_kill_switched` |
 | I22 | `tests/test_device_safety.py::test_fabric_relift_is_off_by_default`, `tests/test_device_safety.py::test_idle_relift_lifts_a_fabric_unverified_hold_when_fabric_reverifies`, `tests/test_device_safety.py::test_idle_relift_holds_a_fabric_unverified_hold_when_the_check_still_cannot_run`, `tests/test_device_safety.py::test_idle_relift_holds_a_fabric_unverified_hold_when_fabric_now_fails`, `tests/test_device_safety.py::test_idle_relift_escalates_a_fabric_unverified_hold_when_relift_is_off` |
 | I23 | `tests/test_device_safety.py::test_a_hold_that_outlives_the_deadline_is_flagged_to_the_durable_timeline`, `tests/test_device_safety.py::test_a_hold_within_the_deadline_is_not_flagged_stuck`, `tests/test_device_safety.py::test_the_stuck_hold_watchdog_re_alerts_each_window_and_re_arms_per_episode`, `tests/test_device_safety.py::test_an_offbus_hold_escalates_long_before_the_general_ceiling`, `tests/test_device_safety.py::test_a_present_mesh_hold_still_waits_the_full_ceiling`, `tests/test_device_safety.py::test_a_closed_episode_re_arms_the_forced_escalation_windows`, `tests/test_device_safety.py::test_idle_relift_escalates_a_generic_arms_neither_hold`, `tests/test_device_safety.py::test_a_one_shot_past_the_ceiling_claims_that_window`, `tests/test_device_safety.py::test_a_tenant_deferred_ceiling_window_runs_on_the_next_idle_tick`, `tests/test_post_reset_gate.py::test_a_tenant_deferred_off_bus_one_shot_runs_on_the_next_idle_tick`, `tests/test_post_reset_gate.py::test_a_given_back_one_shot_gives_back_the_ceiling_window_it_claimed` |
+| I23 (off-bus one-shot: one sampler interval on a tenant-free box, the tenant wait once a tenant is found, suppressed by a pending host action; a failed early run keeps the hold and the ceiling window still climbs to the power cycle; release only through the full post-reset check, fabric included) | `tests/test_offbus_one_shot_idle.py::test_an_idle_below_floor_offbus_hold_escalates_within_two_sampler_ticks`, `tests/test_offbus_one_shot_idle.py::test_a_live_tenant_keeps_the_offbus_tenant_wait`, `tests/test_offbus_one_shot_idle.py::test_a_pending_power_cycle_request_still_suppresses_the_early_one_shot`, `tests/test_offbus_one_shot_idle.py::test_a_failed_early_one_shot_keeps_the_hold_and_reaches_the_power_cycle_at_the_ceiling`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
 | I23 (episode clock: restored only while held since broker start, in the same boot, from a device-fault hold; cleared by the first fit verdict) | `tests/test_device_safety.py::test_the_hold_clock_survives_a_broker_restart`, `tests/test_device_safety.py::test_a_healthy_startup_gate_clears_a_dead_brokers_hold_clock`, `tests/test_device_safety.py::test_a_hold_after_the_device_was_seen_fit_never_inherits_the_clock`, `tests/test_device_safety.py::test_a_device_held_at_broker_start_keeps_counting_from_the_original_drop`, `tests/test_device_safety.py::test_closing_an_orphaned_hold_leaves_the_clock_for_the_startup_verdict`, `tests/test_device_safety.py::test_a_hold_clock_from_an_earlier_boot_is_not_restored`, `tests/test_device_safety.py::test_a_tenant_holds_clock_is_not_restored_after_a_restart`, `tests/test_device_safety.py::test_a_foreign_holder_fault_marks_the_clock_as_a_tenant_hold`, `tests/test_device_safety.py::test_a_bare_timestamp_clock_carries_only_within_this_boot`, `tests/test_device_safety.py::test_the_hold_clock_file_stays_a_bare_timestamp_for_an_older_broker`, `tests/test_device_safety.py::test_an_unreadable_boot_id_falls_back_to_btime`, `tests/test_device_safety.py::test_an_unparseable_hold_clock_is_never_restored`, `tests/test_device_safety.py::test_a_corrupt_or_foreign_sidecar_falls_back_to_btime`, `tests/test_device_safety.py::test_a_sidecar_left_after_an_older_broker_cleared_the_clock_restores_nothing`, `tests/test_device_safety.py::test_a_fault_hold_a_foreign_holder_later_joins_still_carries`, `tests/test_device_safety.py::test_a_tenant_hold_that_turns_into_a_fault_starts_carrying_its_clock`, `tests/test_device_safety.py::test_an_orphaned_pre_boot_hold_does_not_drive_the_deadline_escalation`, `tests/test_device_safety.py::test_a_hold_clock_with_an_earlier_boot_id_is_ignored_by_the_deadline`, `tests/test_device_safety.py::test_a_fresh_post_boot_hold_still_escalates_at_its_deadline` |
 | I24 | `tests/test_health_surface.py::test_imports_only_the_facade[src/tt_device_mcp/server.py]`, `tests/test_health_surface.py::test_imports_only_the_facade[src/tt_device_mcp/fsm.py]`, `tests/test_health_surface.py::test_imports_only_the_facade[src/tt_device_mcp/telemetry.py]` |
 | I25 | `tests/test_device_safety.py::test_switched_off_verification_does_not_brick_the_host`, `tests/test_device_safety.py::test_a_non_root_daemon_without_tt_smi_degrades_to_a_serializer`, `tests/test_device_safety.py::test_the_same_host_as_root_still_refuses_to_serve` |
