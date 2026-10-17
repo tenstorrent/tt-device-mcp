@@ -148,6 +148,11 @@ Environment="TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK=/usr/local/bin/drain-jobs --reas
 Environment=TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC=300
 ```
 
+The broker checks that each power cycle really rebooted the host: if the boot id
+has not changed `TT_DEVICE_MCP_POWER_CYCLE_CONFIRM_SEC` (default 900 s) after
+the request, it logs an error, pages, and asks for the cycle once more; later
+misses wait 1 h, 2 h, then 4 h. The device stays held meanwhile.
+
 ## Slurm
 
 The health gate is also reachable from outside the queue, as two root-only REST

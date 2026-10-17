@@ -5039,6 +5039,8 @@ def _record_previous_boot_error() -> None:
     # operator's record of what touched the device. Back-fill a visible row for it, once
     # per boot (the boot-id dedup above already guards that), anchored at this boot's start
     # so it lands in history where the reboot happened rather than at broker-start.
+    # Spec 04 I68: a power cycle asked for on the last boot is confirmed by this one.
+    recovery_mechanism.settle_power_cycle_confirm()
     escalation = recovery_mechanism.boot_from_broker_escalation(boot_id)
     if escalation:
         action = escalation["action"]
@@ -6586,6 +6588,10 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
                 "interval_sec": cooldown["interval_sec"],
                 "why": cooldown["why"],
             }
+        # Spec 04 I68: a power cycle not yet confirmed by a new boot id, or one the host did not act on.
+        confirm = recovery_mechanism.power_cycle_confirm_status()
+        if confirm is not None:
+            payload["power_cycle_confirm"] = confirm
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
     return payload
