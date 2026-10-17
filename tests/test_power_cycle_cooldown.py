@@ -23,7 +23,11 @@ from tt_device_mcp import server as srv
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
-from tt_device_mcp.health.recovery.base import AUTO_RECOVERY_LEDGER, POWER_CYCLE_MIN_INTERVAL_SEC
+from tt_device_mcp.health.recovery.base import (
+    AUTO_RECOVERY_LEDGER,
+    CLASS_A_LADDER_AFTER_SEC,
+    POWER_CYCLE_MIN_INTERVAL_SEC,
+)
 
 T0 = 1_800_000_000.0
 LADDER = {"glx_reset", "ubb_tray", "sweep"}
@@ -89,7 +93,8 @@ def _watchdog(r, monkeypatch, at):
 async def test_a_boot_3_min_before_startup_holds_to_a_deadline_then_cycles_once(cool, monkeypatch):
     """The box came up 3 min ago from a cycle the broker did not fire (manual, BMC, datacenter): a
     whole tray is off at startup. The hold stays with its deadline on /health; no ladder rung runs
-    meanwhile; at the deadline the watchdog asks once and exactly one cycle fires."""
+    before the 10-min mark, where the watchdog starts the full ladder once (spec 04 I73); at the
+    deadline it asks once more and exactly one cycle fires."""
     cool["boot"]["btime"] = T0 - 180
     _tray_off(cool)
     assert await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup") == galaxy.OUTCOME_WAITING
@@ -106,6 +111,10 @@ async def test_a_boot_3_min_before_startup_holds_to_a_deadline_then_cycles_once(
     cool["clk"][0] = T0 + 600
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
     assert _cycles(cool) == 0 and not LADDER & set(cool["order"])
+    mark = cool["g"].mechanism._class_a_ladder_anchor_now(T0 + 600) + CLASS_A_LADDER_AFTER_SEC
+    assert T0 < mark < until
+    assert _watchdog(cool, monkeypatch, mark - 1) == []
+    assert _watchdog(cool, monkeypatch, mark) == [mark], "the full ladder at the 10-min mark"
     assert _watchdog(cool, monkeypatch, until - 1) == []
     assert _watchdog(cool, monkeypatch, until) == [until], "asked the moment the cooldown ends"
     assert _watchdog(cool, monkeypatch, until + 30) == [], "once per denial"
