@@ -1530,3 +1530,70 @@ def test_an_unreadable_sysfs_under_guard_logs_a_mask_failure(sysfs, monkeypatch)
     assert logs and "cannot read" in logs[0]
     assert sorted(mask.ports) == sorted(PORTS) and all(_masked(sysfs, p) for p in PORTS)
     mask.restore(quiet_sec=0)
+
+
+def test_the_operator_re_arms_the_tray_rung_after_a_repair(sysfs, monkeypatch, capsys):
+    """A recorded regression declines the per-tray rung on this host for days. The operator
+    re-arms it after the repair with the command the journal names; a second clear says nothing was
+    latched, and bad usage is refused."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    _boot(sysfs, "boot-a")
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5", "13"], signature="position5")
+    disabled = dict(events)["ubb_tray_rung_disabled"]
+    assert disabled["clear_with"] == pcie_guard.clear_tray_rung_cmd() and disabled["latch_days"] > 0
+    cmd = pcie_guard.clear_tray_rung_cmd()
+    assert cmd.startswith("sudo ") and "--clear-tray-rung-latch" in cmd and str(pcie_guard.health_dir()) in cmd
+    rec = pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE
+    assert rec.exists()
+    assert pcie_guard.main(["--clear-tray-rung-latch", "--health-dir", str(pcie_guard.health_dir())]) == 0
+    assert "re-armed" in capsys.readouterr().out
+    assert not rec.exists() and pcie_guard.tray_rung_disabled() is None
+    assert dict(events)["ubb_tray_rung_cleared"]["by"] == "operator"
+    assert pcie_guard.main(["--clear-tray-rung-latch", "--health-dir", str(pcie_guard.health_dir())]) == 0
+    assert "was not latched off" in capsys.readouterr().out
+    assert pcie_guard.main(["--clear-tray-rung-latch", "--bogus"]) == 2
+
+
+def test_a_tray_rung_latch_that_cannot_be_removed_is_reported(sysfs, monkeypatch, capsys):
+    _boot(sysfs, "boot-a")
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
+
+    def denied(self, *a, **k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(pcie_guard.Path, "unlink", denied)
+    assert pcie_guard.main(["--clear-tray-rung-latch", "--health-dir", str(pcie_guard.health_dir())]) == 1
+    assert "could not be re-armed" in capsys.readouterr().out
+    assert pcie_guard.tray_rung_disabled() is not None, "still latched"
+
+
+def test_a_running_broker_re_arms_when_the_operator_removes_the_record(sysfs, monkeypatch):
+    """The clear runs in another process: the running broker sees its persisted record gone and re-arms,
+    without a restart. A record that never reached disk keeps the in-memory decline."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    _boot(sysfs, "boot-a")
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
+    assert pcie_guard.tray_rung_disabled() is not None
+    (pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE).unlink()
+    assert pcie_guard.tray_rung_disabled() is None
+    assert dict(events)["ubb_tray_rung_cleared"]["by"] == "file_removed"
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", {"tray": [1]})
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_AT", time.time(), raising=False)
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_PERSISTED", False)
+    assert pcie_guard.tray_rung_disabled() == {"tray": [1]}, "an unwritten record is not read as cleared"
+
+
+def test_a_position_5_drop_in_a_later_hold_still_latches_and_names_both_episodes(sysfs, monkeypatch):
+    """The delayed position-5 drop often lands after the pulse's own hold was released: it still latches
+    inside the window, and the record names the pulse's episode and the one the drop was seen in, so an
+    operator can tell an outside drop from the pulse's and re-arm the rung."""
+    _boot(sysfs, "boot-a")
+    monkeypatch.setattr(pcie_guard, "_LAST_TRAY_PULSE", None)
+    tray_map = {t: list(range(8 * t, 8 * t + 8)) for t in range(4)}
+    start = {str(c) for c in range(24, 32)}
+    pcie_guard.note_tray_pulse([3], tray_map, start, episode="2026-10-16T01:00:00")
+    why = pcie_guard.latch_tray_pulse_drop(start | {"5", "13"}, episode="2026-10-16T01:03:00")
+    assert why is not None and why["episode"] == "2026-10-16T01:00:00" and why["seen_in"] == "2026-10-16T01:03:00"
+    assert pcie_guard.tray_rung_disabled()["episode"] == "2026-10-16T01:00:00"
