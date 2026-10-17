@@ -94,16 +94,48 @@ echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >
 # Checked before the device-op bar and the dispatch hold: a lap that will not apply holds nothing.
 # Only the timing of an apply moves; the startup check after it is never skipped or shortened.
 # The stamp is written just before the restart, so a failed apply retries on the next lap.
+# The limit is for a healthy broker only: a broker that is not running, restarts itself, holds the
+# device or fails its health check may be broken by the last apply, and the next sha may be its
+# fix, so it applies at once (broker_broken below). Escape by hand: rm "$ROOT/last-apply" (the
+# config file sourced above wins over an env override on the command line).
 LAST_APPLY="$ROOT/last-apply"
+LAST_APPLY_NRESTARTS="$ROOT/last-apply-nrestarts"
 MIN_APPLY="${TTDEV_MIN_APPLY_INTERVAL_SEC:-0}"
+# Why the broker is not a healthy one to rate-limit, or nothing. Not active (failed, activating,
+# inactive); systemd restarted it since the last apply (NRestarts grew past the count saved right
+# after that apply's restart: a crash loop); or /health silent, held, or an FSM that is
+# recovering/down. "boot" is the startup check in progress, not a fault: it ends healthy or held.
+broker_broken() {
+    local st n base h
+    st="$(systemctl is-active tt-device-broker 2>/dev/null)"
+    if [ "$st" != active ]; then echo "is ${st:-unknown}, not active"; return; fi
+    n="$(systemctl show tt-device-broker -p NRestarts --value 2>/dev/null)"
+    base=""; { read -r base < "$LAST_APPLY_NRESTARTS"; } 2>/dev/null || true
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    case "$base" in ''|*[!0-9]*) base=0 ;; esac
+    if [ $(( 10#$n )) -gt $(( 10#$base )) ]; then
+        echo "restarted itself since the last apply (NRestarts $(( 10#$base )) -> $(( 10#$n )))"; return
+    fi
+    h="$(curl -s --max-time 5 --unix-socket /run/tt-device-broker/broker.sock http://localhost/health 2>/dev/null)"
+    if [ -z "$h" ]; then echo "does not answer /health"; return; fi
+    if printf '%s' "$h" | grep -Eq '"held": *true'; then echo "holds the device"; return; fi
+    if printf '%s' "$h" | grep -Eq '"fsm_state": *"(recovering|down)"'; then
+        echo "fails its health check (fsm $(printf '%s' "$h" | grep -Eo '"fsm_state": *"[a-z]*"' | grep -Eo '[a-z]*"$' | tr -d '"'))"
+    fi
+}
 if [ "$MIN_APPLY" -gt 0 ] 2>/dev/null; then
-    last=""; read -r last < "$LAST_APPLY" 2>/dev/null || true
+    last=""; { read -r last < "$LAST_APPLY"; } 2>/dev/null || true
     now="$(date +%s)"
     # A stamp that is not a number, or lies in the future (the clock stepped back), bars nothing.
-    case "$last" in ''|*[!0-9]*) last="" ;; esac
+    # Read base 10, so a hand-written leading zero is not taken for octal.
+    case "$last" in ''|*[!0-9]*) last="" ;; *) last=$(( 10#$last )) ;; esac
     if [ -n "$last" ] && [ "$last" -le "$now" ] && [ $(( now - last )) -lt "$MIN_APPLY" ]; then
-        echo "autoupdate: rate-limited: last apply $(( now - last ))s ago (min ${MIN_APPLY}s); ${remote_sha:0:9} applies in $(( last + MIN_APPLY - now ))s" >&2
-        exit 0
+        broken="$(broker_broken)"
+        if [ -z "$broken" ]; then
+            echo "autoupdate: rate-limited: last apply $(( now - last ))s ago (min ${MIN_APPLY}s); ${remote_sha:0:9} applies in $(( last + MIN_APPLY - now ))s" >&2
+            exit 0
+        fi
+        echo "autoupdate: rate limit skipped: the broker $broken; ${remote_sha:0:9} applies now (last apply $(( now - last ))s ago)" >&2
     fi
 fi
 
@@ -321,4 +353,6 @@ chmod -R a+rX "$VENV" 2>/dev/null || true
 
 date +%s > "$LAST_APPLY" 2>/dev/null || true   # I21: the rate limit counts from this restart
 systemctl restart tt-device-broker
+# I21: the crash-loop baseline, read after the restart (an explicit restart may zero NRestarts).
+systemctl show tt-device-broker -p NRestarts --value > "$LAST_APPLY_NRESTARTS" 2>/dev/null || true
 echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2

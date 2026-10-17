@@ -6,11 +6,14 @@
 Every apply restarts the broker, and every start runs the full startup check, fabric traffic pass
 included. With TTDEV_MIN_APPLY_INTERVAL_SEC set, a burst of pushes becomes one restart onto its
 newest sha. The laps below run the script's own lines, cut from it, under a fake clock and a stub
-`systemctl restart` that records each restart.
+`systemctl restart` that records each restart. The limit is for a healthy broker only: one that is
+down, restarting itself, holding the device or failing its health check applies a new sha at once.
 """
 
 import subprocess
 from pathlib import Path
+
+import pytest
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"
 
@@ -20,9 +23,13 @@ def _cut(text, start, end):
     return text[i : text.index(end, i)]
 
 
-def _lap(tmp_path, *, now, sha, interval=None):
+_HEALTHY = '{"status":"ok","held":false,"fsm_state":"healthy","fsm_why":null}'
+
+
+def _lap(tmp_path, *, now, sha, interval=None, active="active", nrestarts="0", health=_HEALTHY):
     """One lap at fake time `now` that has just resolved `sha`: the already-current check and the
-    rate limit, then (as if every gate passed) the tail that marks the sha current and restarts."""
+    rate limit, then (as if every gate passed) the tail that marks the sha current and restarts.
+    `active`, `nrestarts` and `health` are what systemd and the broker's /health report."""
     text = _SCRIPT.read_text()
     head = _cut(text, 'installed_sha="$(cat "$STATE"', "INHIBIT=/run/")
     tail = text[text.index('echo "$remote_sha" > "$STATE"') :]
@@ -34,7 +41,14 @@ ROOT={root}; STATE={root}/installed.sha; VENV={tmp_path}/venv; BR=main; src_desc
 remote_sha={sha}
 date() {{ echo {now}; }}
 chmod() {{ :; }}
-systemctl() {{ case "$*" in restart*) echo "{now} $(cat "$STATE")" >> {restarts} ;; esac; }}
+systemctl() {{
+    case "$*" in
+        restart*) echo "{now} $(cat "$STATE")" >> {restarts} ;;
+        is-active*) echo '{active}'; [ '{active}' = active ] ;;
+        show*NRestarts*) echo '{nrestarts}' ;;
+    esac
+}}
+curl() {{ printf '%s' '{health}'; }}
 """
     env = {"PATH": "/usr/bin:/bin"}
     if interval is not None:
@@ -102,3 +116,61 @@ def test_the_stamp_is_written_only_by_an_apply_that_restarts():
     stamp = text.index('date +%s > "$LAST_APPLY"')
     assert text.rindex("exit 1", 0, len(text)) < stamp
     assert text.index("systemctl restart tt-device-broker", stamp) - stamp < 120
+
+
+# The throttle must never delay a fix to a broken broker. Each lap below comes
+# 60 s after an apply, well inside the interval.
+_BROKEN = {
+    "failed": dict(active="failed"),
+    "activating": dict(active="activating"),
+    "inactive": dict(active="inactive"),
+    "crash-looping": dict(nrestarts="3"),
+    "silent": dict(health=""),
+    "held": dict(health='{"status":"degraded","held":true,"held_reason":"fabric","fsm_state":"down"}'),
+    "recovering": dict(health='{"status":"ok","held":false,"fsm_state":"recovering","fsm_why":"heartbeat"}'),
+    "down": dict(health='{"status":"ok","held": false,"fsm_state": "down"}'),
+}
+
+
+@pytest.mark.parametrize("state", sorted(_BROKEN))
+def test_a_broken_broker_applies_a_new_sha_inside_the_interval(tmp_path, state):
+    _lap(tmp_path, now=10_000, sha="a1", interval=3600)
+    done, restarts, _ = _lap(tmp_path, now=10_060, sha="b2", interval=3600, **_BROKEN[state])
+    assert restarts == ["10000 a1", "10060 b2"], done.stderr
+    assert "rate limit skipped: the broker" in done.stderr and "b2 applies now" in done.stderr, done.stderr
+
+
+@pytest.mark.parametrize(
+    "broker",
+    [
+        dict(),
+        dict(health='{"status":"ok","held":false,"fsm_state":"boot","fsm_why":null}'),
+        dict(health='{"status": "ok", "held": false, "fsm_state": "healthy"}'),
+    ],
+    ids=["healthy", "startup-check-in-progress", "spaced-json"],
+)
+def test_a_healthy_broker_stays_rate_limited(tmp_path, broker):
+    _lap(tmp_path, now=10_000, sha="a1", interval=3600)
+    done, restarts, _ = _lap(tmp_path, now=10_060, sha="b2", interval=3600, **broker)
+    assert restarts == ["10000 a1"], done.stderr
+    assert "rate-limited" in done.stderr, done.stderr
+
+
+def test_the_crash_loop_baseline_is_the_count_after_the_last_apply(tmp_path):
+    # systemd restarts counted before the last apply are not a crash loop of the applied sha.
+    _lap(tmp_path, now=10_000, sha="a1", interval=3600, nrestarts="2")
+    assert (tmp_path / "root" / "last-apply-nrestarts").read_text().strip() == "2"
+    _, restarts, _ = _lap(tmp_path, now=10_060, sha="b2", interval=3600, nrestarts="2")
+    assert restarts == ["10000 a1"]
+    _, restarts, _ = _lap(tmp_path, now=10_120, sha="b2", interval=3600, nrestarts="3")
+    assert restarts == ["10000 a1", "10120 b2"]
+
+
+def test_a_missing_stamp_is_silent_and_a_leading_zero_stamp_is_decimal(tmp_path):
+    # No "No such file" noise before the first stamp, and "0900" is 900, not octal.
+    done, _, root = _lap(tmp_path, now=1000, sha="a1", interval=3600)
+    assert "No such file" not in done.stderr, done.stderr
+    (root / "last-apply").write_text("0900\n")
+    done, restarts, _ = _lap(tmp_path, now=1000, sha="b2", interval=3600)
+    assert "last apply 100s ago" in done.stderr, done.stderr
+    assert restarts == ["1000 a1"]
