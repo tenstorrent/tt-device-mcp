@@ -16177,3 +16177,78 @@ async def test_the_startup_verify_state_hides_no_hold_bound(monkeypatch, tmp_pat
     finally:
         stuck.set()
         await srv._startup_verify_task
+
+
+def _fsm_file_readopted_jobs():
+    return json.loads(srv.fsm._path.read_text())["readopted_jobs"]
+
+
+@pytest.mark.asyncio
+async def test_fsm_json_names_the_readopted_job_while_it_runs_and_clears_when_it_ends(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76: fsm.json's readopted_jobs mirrors /health startup_verify.readopted_job_ids, so a
+    client reading the file tells the startup hold behind a live re-adopted job from a fault. Set when
+    the startup gate takes the hold over the re-adopted job and on each scope poll; [] once the job
+    ends. Report-only: the hold and the startup gate are unchanged."""
+    *_, release_job, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    job = _readopted_running_job()
+    srv._sync_fsm_readopted_jobs()  # what run_startup_tasks does once the startup gate owns the hold
+    assert _fsm_file_readopted_jobs() == ["428"]
+
+    seen = []
+
+    def scope_active(scope):
+        seen.append(_fsm_file_readopted_jobs())
+        if len(seen) < 3:
+            return True
+        job.status = srv.JobStatus.COMPLETED
+        return False
+
+    monkeypatch.setattr(srv, "_scope_active", scope_active)
+    srv.fsm.set_readopted_jobs([])  # the poll alone must set it again
+    await asyncio.wait_for(srv._monitor_readopted_scope("428", "ttdev-job-428.scope"), timeout=5)
+    assert seen[1:] == [["428"], ["428"]], "each scope poll writes the live re-adopted job"
+    assert _fsm_file_readopted_jobs() == [], "the job ended: nothing re-adopted holds the hold"
+    assert srv.fsm.state is ServerState.RECOVERING and srv.fsm.record.why == "startup_unverified"
+    await release_job()
+    assert srv.fsm.state is ServerState.HEALTHY and _fsm_file_readopted_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_fsm_json_readopted_jobs_clear_on_release(monkeypatch, tmp_path, clear_job_state):
+    """Spec 03 I76: the startup gate's pass releases the queue and empties the field."""
+    *_, release_job, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    job = _readopted_running_job()
+    srv._sync_fsm_readopted_jobs()
+    assert _fsm_file_readopted_jobs() == ["428"]
+    job.status = srv.JobStatus.COMPLETED
+    await release_job()  # drops the scope without a monitor sync; the release itself must clear it
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert _fsm_file_readopted_jobs() == [] and srv.fsm.readopted_jobs == []
+
+
+@pytest.mark.asyncio
+async def test_fsm_json_readopted_jobs_empty_when_the_job_is_gone_or_a_fault_shows(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76: the field is never wider than startup_verify: a re-adopted job that disappeared, or
+    any fault sign, leaves it []. It hides no hold and no fault."""
+    _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    _readopted_running_job()
+    srv._sync_fsm_readopted_jobs()
+    assert _fsm_file_readopted_jobs() == ["428"]
+
+    monkeypatch.setattr(srv, "_device_liveness_reason", lambda: "chip 3 off the PCIe bus")
+    srv._sync_fsm_readopted_jobs()
+    assert _fsm_file_readopted_jobs() == [], "a fault sign is not 'wait'"
+    monkeypatch.setattr(srv, "_device_liveness_reason", lambda: "")
+    srv._sync_fsm_readopted_jobs()
+    assert _fsm_file_readopted_jobs() == ["428"]
+
+    del srv.jobs["428"]
+    srv._sync_fsm_readopted_jobs()
+    assert _fsm_file_readopted_jobs() == [], "a re-adopted job that disappeared holds nothing"
+    assert srv._device_unavailable_for_tenant(), "the hold itself stands"
+    srv._startup_verify_task.cancel()

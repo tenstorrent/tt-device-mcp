@@ -892,7 +892,13 @@ job boundary.
   end) and nothing says fault, `/health` carries a `startup_verify` object (`phase`:
   `readopted_job_running` or `verifying`, `readopted_job_ids`, `fault: false`, `since`);
   `tt_device_queue_status` carries the same field and a hold row that says it is no fault; a
-  re-adopted job's `tt_device_job_status` carries `readopted: true` and the same object. The field
+  re-adopted job's `tt_device_job_status` carries `readopted: true` and the same object. The
+  persisted `fsm.json` carries `readopted_jobs`, a list of job id strings equal to
+  `startup_verify.readopted_job_ids` (`[]` while the object is null), for a client that reads the
+  file rather than `/health`: synced when the startup gate takes the hold, on each re-adopted scope
+  poll and when a re-adopted job ends; the FSM itself empties it on a release (HEALTHY) or DOWN and
+  never keeps it outside `boot`/`recovering`; a reboot drops it; a file written before the field
+  loads with `[]`. Nothing in the broker reads it back. The field
   is null as soon as anything says fault: a dirty mark, a runtime fault report, an owed kill reset, a
   requested kill of a re-adopted job, an isolated chip, a live liveness finding (a chip off the bus),
   or the hold's `why` turning into another class. `status` keeps its two values (`degraded` while
@@ -900,7 +906,7 @@ job boundary.
   is down. Reporting only: `fsm_state`/`fsm_why` keep their contract, `held`/`held_since`/
   `held_age_sec` keep counting, tenants stay refused, the startup gate still runs the full check,
   fabric included, after the hugepage wait and alone releases the queue, a kill still owes the reset
-  plus the full check, and no hold bound, ladder or power-cycle escalation reads the field. Time to
+  plus the full check, and no hold bound, ladder or power-cycle escalation reads either field. Time to
   recover: no class gets slower and no wait is added. Class S (restart over a live re-adopted job),
   for a client that reads the field instead of killing its job: the startup gate after the job's own
   end (about 1-2 min), against a lost job plus one reset, its settle and the full check (about 4-6
@@ -1531,7 +1537,7 @@ refuses.
 | I69 (every broker kill logs one KILLED process-tree line) | `tests/test_job_kill_reset.py::test_a_broker_kill_logs_the_process_tree_it_stopped` |
 | I69 (a reaped leftover skips before the debt: no reset, debt kept, no wait; a reboot drops it and the startup full check runs; a cooldown skips and clears it with no wait) | `tests/test_job_kill_reset.py::test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait`, `tests/test_job_kill_reset.py::test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait` |
 | I75 | `tests/test_device_safety.py::test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_gate_not_reset`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_next_tick`, `tests/test_device_safety.py::test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladder`, `tests/test_device_safety.py::test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate` |
-| I76 | `tests/test_device_safety.py::test_health_names_a_startup_hold_behind_a_live_readopted_job_as_no_fault`, `tests/test_device_safety.py::test_the_startup_check_still_runs_and_gates_the_queue_after_the_readopted_job_ends`, `tests/test_device_safety.py::test_a_startup_check_that_passes_after_the_readopted_job_releases_the_queue`, `tests/test_device_safety.py::test_killing_the_readopted_job_drops_the_startup_verify_state_and_still_owes_the_reset`, `tests/test_device_safety.py::test_a_fault_during_the_startup_verify_state_reads_as_a_fault`, `tests/test_device_safety.py::test_the_startup_verify_state_hides_no_hold_bound` |
+| I76 | `tests/test_device_safety.py::test_health_names_a_startup_hold_behind_a_live_readopted_job_as_no_fault`, `tests/test_device_safety.py::test_the_startup_check_still_runs_and_gates_the_queue_after_the_readopted_job_ends`, `tests/test_device_safety.py::test_a_startup_check_that_passes_after_the_readopted_job_releases_the_queue`, `tests/test_device_safety.py::test_killing_the_readopted_job_drops_the_startup_verify_state_and_still_owes_the_reset`, `tests/test_device_safety.py::test_a_fault_during_the_startup_verify_state_reads_as_a_fault`, `tests/test_device_safety.py::test_the_startup_verify_state_hides_no_hold_bound`, `tests/test_device_safety.py::test_fsm_json_names_the_readopted_job_while_it_runs_and_clears_when_it_ends`, `tests/test_device_safety.py::test_fsm_json_readopted_jobs_clear_on_release`, `tests/test_device_safety.py::test_fsm_json_readopted_jobs_empty_when_the_job_is_gone_or_a_fault_shows`, `tests/test_fsm.py::test_readopted_jobs_persist_and_survive_a_same_boot_restart`, `tests/test_fsm.py::test_readopted_jobs_clear_on_release_and_on_down`, `tests/test_fsm.py::test_readopted_jobs_clear_when_the_job_ends`, `tests/test_fsm.py::test_an_fsm_file_without_readopted_jobs_still_loads` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

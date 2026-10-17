@@ -8985,6 +8985,7 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                     + ("systemctl stop (survived SIGINT)" if reaped else "SIGINT"),
                 )
                 break
+            _sync_fsm_readopted_jobs()  # spec 03 I76: a fault sign while it runs clears it
             await asyncio.sleep(_SCOPE_POLL_SEC)
         scope_ended = True
     finally:
@@ -9068,6 +9069,7 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                     pass
         clear_job_exit_file(job_id)
         readopted_scopes.pop(job_id, None)
+        _sync_fsm_readopted_jobs()  # spec 03 I76: this job no longer holds the startup hold
         if logger:
             logger.info(
                 f"RE-ADOPT job_id={job_id} scope {scope} ended; finalized " f"exit={job.exit_code if job else '?'}"
@@ -10796,6 +10798,19 @@ def _startup_verify_view() -> Optional[dict]:
     }
 
 
+def _sync_fsm_readopted_jobs() -> None:
+    """Spec 03 I76: mirror startup_verify.readopted_job_ids into fsm.json's readopted_jobs ([] when the
+    view is null), so a client that reads the file gets the answer /health gives. Called when the startup
+    gate starts, on each re-adopted scope poll and when a re-adopted job ends; the FSM clears it itself on
+    a release or DOWN. Report-only, and never raises into its caller."""
+    try:
+        view = _startup_verify_view()
+        fsm.set_readopted_jobs(view["readopted_job_ids"] if view else [])
+    except Exception as e:  # noqa: BLE001 - a report must never break the monitor or startup
+        if logger:
+            logger.warning(f"fsm readopted_jobs sync failed: {e}")
+
+
 async def _await_startup_prerequisites(missing: str) -> None:
     """Owe the startup fabric pass again once what it lacked has landed (spec 03 I39).
 
@@ -11146,6 +11161,7 @@ async def run_startup_tasks() -> None:
     # healthy verdict, holds/escalates on a wedge.
     _startup_verify_ready_at = None
     _startup_verify_task = asyncio.create_task(_verify_fabric_on_start())
+    _sync_fsm_readopted_jobs()  # spec 03 I76: the jobs re-adopted above, now the gate owns the hold
 
 
 @asynccontextmanager
