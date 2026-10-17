@@ -685,6 +685,58 @@ def test_an_intent_from_this_boot_does_not_latch(sysfs):
     assert pcie_guard.offbus_reset_latched() is None
 
 
+def _intent_then_new_boot(sysfs, monkeypatch, *ledger) -> list:
+    """An off-bus reset intent left open on boot A at T, ``ledger`` records, then a broker start on boot B."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
+    _boot(sysfs, "boot-a")
+    monkeypatch.setattr(pcie_guard.time, "time", lambda: 1_800_000_000.0)
+    pcie_guard.begin_offbus_reset("reset sweep", 8)
+    monkeypatch.setattr(pcie_guard, "_INTENT_OPEN", False)
+    (pcie_guard.health_dir() / "auto_recovery.jsonl").write_text("".join(json.dumps(r) + "\n" for r in ledger))
+    _boot(sysfs, "boot-b")
+    return events
+
+
+def test_an_intent_whose_boot_the_brokers_own_power_cycle_ended_does_not_latch(sysfs, monkeypatch):
+    """The reset sweep's intent was still open when the broker recorded its own power cycle on that
+    boot (T+300): the broker was alive after the reset began, so the host did not hang in it."""
+    cycle = {"action": "power-cycle", "boot_id": "boot-a", "at_epoch": 1_800_000_300.0, "at": "x"}
+    events = _intent_then_new_boot(sysfs, monkeypatch, cycle)
+    logs = []
+    assert pcie_guard.check_offbus_reset_latch(logs.append) is None
+    assert pcie_guard.offbus_reset_latched() is None and pcie_guard.host_reset_gate(8)[0] is True
+    assert not (pcie_guard.health_dir() / pcie_guard.INTENT_FILE).exists()
+    assert [e[0] for e in events] == ["offbus_reset_hold_skipped"] and any("power-cycle" in m for m in logs)
+
+
+@pytest.mark.parametrize("action", ["reboot", "power-cycle"])
+def test_a_brokers_host_action_at_the_intents_start_also_ends_it(sysfs, monkeypatch, action):
+    _intent_then_new_boot(
+        sysfs, monkeypatch, {"action": action, "boot_id": "boot-a", "at_epoch": 1_800_000_000.0, "at": "x"}
+    )
+    assert pcie_guard.check_offbus_reset_latch(lambda m: None) is None
+
+
+@pytest.mark.parametrize(
+    "ledger",
+    [
+        [],  # a genuine host hang: nothing recorded
+        [{"action": "power-cycle", "boot_id": "boot-a", "at_epoch": 1_799_999_000.0}],  # before the reset began
+        [{"action": "power-cycle", "boot_id": "boot-z", "at_epoch": 1_800_000_300.0}],  # another boot's
+        [{"action": "glx_reset", "boot_id": "boot-a", "at_epoch": 1_800_000_300.0}],  # not a host action
+        [{"action": "power-cycle", "boot_id": "boot-a", "at_epoch": "garbage"}],  # no usable stamp
+    ],
+)
+def test_a_genuine_host_hang_still_latches(sysfs, monkeypatch, ledger):
+    events = _intent_then_new_boot(sysfs, monkeypatch, *ledger)
+    latch = pcie_guard.check_offbus_reset_latch(lambda m: None)
+    assert latch is not None and latch["boot_id"] == "boot-a" and latch["latched_on_boot"] == "boot-b"
+    assert events[-1][0] == "offbus_reset_hold_latched"
+    assert pcie_guard.host_reset_gate(8)[0] is False
+
+
 def test_a_latch_holds_only_on_the_boot_it_was_written_in(sysfs, monkeypatch):
     """The host-hang record is scoped to its boot: once the host boots again it never holds a rung,
     and the broker drops it at start with an event; a latch that names no boot is no exception."""

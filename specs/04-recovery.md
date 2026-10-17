@@ -499,7 +499,13 @@ each rung fires only when the gentler one failed or cannot apply.
   `offbus_reset_intent.json` (with the boot id) to the health dir and removes it after the reset's
   verify. A broker that starts on another boot id and finds that intent writes
   `offbus_reset_hold.json`, emits `offbus_reset_hold_latched` (host at risk), and from then on runs
-  the I24 gate as `hold`, whatever it is configured to. The latch is scoped to the boot it was
+  the I24 gate as `hold`, whatever it is configured to. Not when the I9 ledger holds the broker's own
+  reboot or power cycle on the intent's boot at or after the intent's `at_epoch`: the broker was alive
+  after the reset began, so that boot ended in its own host action, not a hang. That intent is dropped
+  with `offbus_reset_hold_skipped` and no latch; a hang the ledger shows no such action for still
+  latches. Time-to-recover: after the broker's own cycle, the off-bus resets of the next boot (the
+  class B1 mesh reset) no longer wait for the latch's lift, its 6 h ceiling or an operator; the power
+  cycle itself was never held by the latch, so class A is unchanged by this rule. The latch is scoped to the boot it was
   written on (`latched_on_boot`): it survives broker restarts on that boot, and it is bounded. It
   lifts on its own (`offbus_reset_hold_expired`, naming why) once a health pass sees every expected
   chip on the bus and host-pci OK, or once every chip is on the bus and the latch is older than
@@ -911,6 +917,26 @@ each rung fires only when the gentler one failed or cannot apply.
   never a boot loop, never an open-ended hold. Class A or C after a cycle a later boot verified, at
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
+  For one hold episode the power-cycle deadline set at the first cooldown denial never moves later (beyond the stated post-boot settle).
+  The first denial writes that deadline (`power_cycle_deadline.json` in the health dir: `until`,
+  `set_at`, the anchor, its cause and the interval), so it outlives a broker restart and a host boot;
+  the hold episode the server tracks does not cross a boot, this record does. A later boot of any
+  cause (a warm or operator reboot, an external cycle) only raises the deadline to that boot plus
+  `POWER_CYCLE_POST_BOOT_SETTLE_SEC` (300 s: the startup gate's own bound, the 120 s hugepage wait
+  plus the 180 s fabric pass), and only when that is later; it never restarts the interval. An
+  earlier plain anchor still wins. The journal adds `fixed for this hold at <time>` (and the boot plus
+  settle when that applies); `/health` shows the deadline as `next_deadline` and the record as
+  `fixed_at`. The episode ends at a verified release with no I32 debt (the record is removed; a
+  release refused for fabric debt keeps it and the hold), at the broker's next power cycle (that
+  cycle's boot starts a fresh interval with the streak, the boot-loop guard above), or 4 h past the
+  deadline (stale). A record that is unreadable, non-finite, set later than now or incomplete is
+  ignored, and a broker cycle whose stamp cannot be read ends the episode (the longer wait). The
+  settle is a wait on the cycle only: no reset or release happens in it, and 03 I4's startup gate
+  still holds the device until its full check passes. Time to recover, classes A and B1 held across
+  reboots: before, each boot inside the hold restarted the full interval (up to 4 h at the cap), so
+  repeated reboots deferred the cycle without bound (one incident sat about 640 min); after, the
+  cycle fires at the deadline fixed at the first denial (at most one interval after the anchor), or
+  at most 300 s after the last boot when that boot came at or after it.
 
 ## Interfaces
 
@@ -1265,6 +1291,7 @@ sees a silent fabric pass.
 | I25 the walk and the sweep re-power only affected trays; X alone recovers chips off on X; a failed walk climbs to the mesh reset | `tests/test_ubb_tray_map.py::test_the_walk_covers_only_the_affected_trays`, `tests/test_device_safety.py::test_ubb_tray_walk_plan_walks_only_the_affected_trays`, `::test_ubb_tray_reset_walk_recovers_chips_off_on_any_tray_by_re_powering_that_tray_alone`, `::test_ubb_tray_reset_walk_never_sweeps_healthy_trays_when_the_affected_tray_does_not_recover`, `::test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_affected_tray_stays_off`, `tests/test_pcie_guard.py::test_the_last_chance_sweep_re_powers_only_the_affected_trays` |
 | I25 a below-floor drop on one tray is not re-powered alone; the hold goes to the next rung; an opted-in single-tray walk releases only on the full check | `tests/test_device_safety.py::test_a_one_chip_drop_on_a_full_galaxy_never_re_powers_its_tray`, `::test_a_whole_tray_below_the_floor_is_not_re_powered_alone_but_two_trays_still_walk`, `::test_gate_holds_a_one_chip_drop_without_a_tray_re_power`, `::test_a_declined_tray_walk_hands_the_stuck_hold_to_the_next_rung`, `::test_an_opted_in_single_tray_walk_releases_only_after_the_full_check`, `tests/test_offbus_power_cycle.py::test_by_default_the_one_tray_drop_is_never_walked` |
 | I25 the host-hang latch: intent, latch on a new boot, not on the same boot, clear, opt-out | `tests/test_pcie_guard.py::test_an_off_bus_reset_writes_an_intent_and_removes_it_when_done`, `::test_an_intent_from_a_boot_that_died_latches_hold_until_cleared`, `::test_an_intent_from_this_boot_does_not_latch`, `::test_the_latch_can_be_switched_off`, `::test_a_tray_re_power_carries_an_intent_and_ends_it` |
+| I25 an intent whose boot the broker's own reboot or power cycle ended (ledger, same boot, at or after the intent) latches nothing; a genuine hang (no such record, an earlier one, another boot's, an unreadable stamp) still latches | `tests/test_pcie_guard.py::test_an_intent_whose_boot_the_brokers_own_power_cycle_ended_does_not_latch`, `::test_a_brokers_host_action_at_the_intents_start_also_ends_it`, `::test_a_genuine_host_hang_still_latches` |
 | I24 gate modes: off by default, hold on an off-bus chip, guard on a flood | `tests/test_pcie_guard.py::test_gate_is_off_by_default`, `::test_hold_refuses_a_reset_over_chips_already_off_the_bus`, `::test_guard_refuses_during_an_aer_flood`, `::test_first_look_after_a_recent_boot_counts_errors_since_boot`, `::test_hold_gate_stops_an_automatic_mesh_reset_over_an_off_bus_chip`, `::test_guard_masks_the_root_ports_around_an_automatic_mesh_reset` |
 | I23 an off-bus chip's remembered root port is masked (tray fire and mesh reset); a port gone from sysfs is not | `tests/test_pcie_guard.py::test_an_off_bus_chips_root_port_is_masked_for_its_trays_re_power`, `::test_guard_masks_an_off_bus_chips_port_around_a_mesh_reset`, `::test_a_remembered_port_gone_from_sysfs_is_not_masked` |
 | I23 the topology is recorded at broker start and in each between-jobs check, rewritten only on change; a port never seen is not known | `tests/test_pcie_guard.py::test_broker_start_records_the_topology_for_the_first_tray_drop`, `::test_the_between_jobs_check_records_the_topology_for_the_first_tray_drop`, `::test_an_unchanged_topology_is_not_rewritten`, `::test_without_a_healthy_look_an_off_bus_chips_port_is_not_known` |
@@ -1398,6 +1425,10 @@ sees a silent fabric pass.
 | I65 a whole tray still off hours after a cycle that never took the host down cycles at once; inside the cooldown it holds with the deadline on /health and cycles at its end; an external reboot counts toward the cooldown; the off-bus (I27) path holds with a deadline and no ladder; an operator attempt spacing is a stated wait capped at the backoff cap, default none; a whole tray seen again among partial reads still cycles | `tests/test_whole_tray_cycle_every_boot.py::test_a_restart_hours_after_a_cycle_that_never_went_down_cycles_at_once`, `::test_inside_the_cooldown_the_hold_shows_its_deadline_and_cycles_when_it_ends`, `::test_an_external_reboot_counts_toward_the_cooldown_and_the_cycle_follows_it`, `::test_the_off_bus_path_no_longer_holds_six_hours_on_an_attempt_that_never_went_down`, `::test_the_off_bus_path_inside_the_cooldown_holds_with_a_deadline_and_no_ladder`, `::test_an_operator_attempt_interval_is_a_stated_wait_capped_at_the_backoff_cap`, `::test_the_attempt_interval_default_adds_no_wait_beyond_the_cooldown`, `::test_a_whole_tray_seen_again_among_partial_reads_still_cycles_at_the_deadline` |
 | I65 no recent cycle or boot: the cycle fires at once | `tests/test_power_cycle_cooldown.py::test_with_no_recent_cycle_or_boot_the_cycle_fires_at_once` |
 | I65 only a verified release with no fabric debt ends the streak; a refused one keeps the hold | `tests/test_power_cycle_cooldown.py::test_only_a_verified_release_with_no_fabric_debt_ends_the_streak` |
+| I65 for one hold episode the power-cycle deadline set at the first cooldown denial never moves later (beyond the stated post-boot settle): boots at +20, +40 and +60 min keep it, the last adds the 300 s settle, and the cycle is allowed then | `tests/test_power_cycle_cooldown.py::test_reboots_inside_one_hold_never_move_its_power_cycle_deadline_later` |
+| I65 a boot inside the hold: the startup gate holds with no rung or release, /health shows the same deadline, the cycle fires at it | `tests/test_power_cycle_cooldown.py::test_an_operator_shutdown_inside_the_hold_keeps_the_deadline_and_the_cycle_fires_at_it` |
+| I65 the broker's next cycle ends the episode deadline (a fresh interval with the streak); a verified release removes it; a refused release keeps it | `tests/test_power_cycle_cooldown.py::test_the_brokers_next_cycle_spends_the_deadline_and_the_boot_loop_guard_holds`, `::test_a_verified_release_ends_the_episode_deadline`, `::test_only_a_verified_release_with_no_fabric_debt_ends_the_streak` |
+| I65 an unusable deadline record leaves the plain cooldown; a broker cycle with an unreadable stamp ends the episode; the settle is within the startup gate's bound | `tests/test_power_cycle_cooldown.py::test_an_unusable_deadline_record_leaves_the_plain_cooldown`, `::test_a_broker_cycle_with_an_unreadable_stamp_spends_the_deadline`, `::test_the_post_boot_settle_is_within_the_startup_gates_own_bound` |
 | I65 a failed out-of-band cycle (a second line, same `at_epoch`, cause + ` (cycle failed)`) never counts and cancels its attempt line; an unmatched failure line is ignored; an attempt with no failure line still counts; host boots are unchanged | `tests/test_power_cycle_cooldown.py::test_a_matched_failure_line_drops_the_attempt`, `::test_an_unmatched_failure_line_is_ignored`, `::test_an_attempt_without_a_failure_line_still_counts` |
 | I65 a future, non-finite or unreadable stamp (history file, ledger, heal file) never hides a valid past anchor, never holds the cycle past the stated gap, never keeps the streak past a verified release; every cap denial is on /health | `tests/test_power_cycle_cooldown.py::test_a_nan_or_future_history_line_does_not_hide_the_valid_past_one`, `::test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle`, `::test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health`, `::test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end`, `::test_the_per_boot_cap_denial_shows_on_health`, `::test_a_future_record_does_not_keep_the_streak_past_a_verified_release` |
 | I37/I65 class C at startup: one mesh reset with no failed reset or broker cycle; none after the broker's own cycle, which then waits only for the cooldown | `tests/test_power_cycle_cooldown.py::test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_gets_one_reset`, `::test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_reset`, `::test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not` |
