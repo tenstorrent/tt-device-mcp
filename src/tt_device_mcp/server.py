@@ -160,6 +160,11 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.health import hold_report
+from tt_device_mcp.health.monitor import _normalized_board
+from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids
+from tt_device_mcp.health.monitors.pci import chip_pci_bdfs, pci_bus_number
+from tt_device_mcp.health.recovery.galaxy import UBB_CHIP_COUNT, _power_cycle_direct_class, _ubb_bus_id_tables
 from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
@@ -6390,6 +6395,105 @@ def _device_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, st
     return reason, device_held_since
 
 
+def _hold_tray_groups() -> dict:
+    """``{UBB bus group: tray number}`` from tt-smi's own tables (spec 04 I16). The tray number is
+    filled only when the mesh reports one board type; otherwise every known group maps to None.
+    Empty where tt-smi's tables cannot be imported (not a Galaxy, or tt-smi missing)."""
+    tables = _ubb_bus_id_tables() or {}
+    if not tables:
+        return {}
+    boards: set = set()
+    deps = getattr(galaxy_recovery, "deps", None)
+    provider = getattr(deps, "board_types_provider", None)
+    if provider is not None:
+        try:
+            boards = {_normalized_board(t) for t in (provider() or ())}
+        except Exception:  # noqa: BLE001 - a read-only report never fails /health
+            boards = set()
+    table = tables.get(boards.pop()) if len(boards) == 1 else None
+    if table:
+        return {group: tray for tray, group in table.items()}
+    return {group: None for t in tables.values() for group in t.values()}
+
+
+def _hold_next_rung(started: float, now_epoch: float) -> Optional[hold_report.RungCandidate]:
+    """The next rung the broker has armed for this hold and when it fires (spec 04 I75): the
+    earliest of the governor's wait (the I65 cooldown end, a missed power-cycle retry or an AC-power
+    recheck, all on ``power_cycle_cooldown_state``), the off-bus one-shot, the next hold-ceiling
+    window, and any registered deadline feed (the universal hold bound's hook). Read-only: it
+    mirrors ``_check_hold_deadline``'s clocks and never claims or moves one."""
+    cooldown = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
+    candidates = [hold_report.cooldown_candidate(cooldown, now_epoch)]
+    cooldown_until = candidates[0].at if candidates[0] is not None else None
+    if _force_escalate_enabled() and not _fabric_77_only_hold():
+        if isolated_chips and not device_hold_offbus_escalated:
+            candidates.append(
+                hold_report.RungCandidate(started + _offbus_hold_ceiling_sec(), "forced ladder", "off-bus one-shot")
+            )
+        ceiling = _stuck_hold_ceiling_sec()
+        window = max(device_hold_escalate_bucket + 1, int((now_epoch - started) // ceiling) + 1)
+        candidates.append(
+            hold_report.RungCandidate(started + window * ceiling, "forced ladder", f"hold ceiling window {window}")
+        )
+    candidates.extend(hold_report.fed_candidates(started, now_epoch, cooldown_until))
+    return hold_report.next_rung(candidates)
+
+
+def _hold_report(now: Optional[datetime] = None) -> dict:
+    """The read-only hold fields for /health while the FSM is RECOVERING or DOWN (spec 03 I72):
+    ``hold_class``, ``hold_started_at``, ``next_rung``/``next_rung_at`` and ``trays_present``.
+    Uses only the sysfs enumeration and heartbeat reads /health already makes; never calls a chip
+    healthy, admits a job or moves a rung."""
+    now = now or datetime.now()
+    now_epoch = now.timestamp()
+    out: dict = {}
+    since = device_hold_episode_since or device_held_since or fsm.record.since
+    started: Optional[float] = None
+    try:
+        started = datetime.fromisoformat(since).timestamp() if since else None
+    except ValueError:
+        started = None
+    out["hold_started_at"] = datetime.fromtimestamp(started).isoformat(timespec="seconds") if started else None
+    cooldown = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
+    ac_needed = bool(cooldown and now_epoch < cooldown.get("until", 0) and cooldown.get("ac_power_needed"))
+    expected = 0
+    if heartbeat_supported() and health_monitor is not None and health_monitor._health_check_enabled():
+        expected = health_monitor.expected(0)
+    groups = _hold_tray_groups()
+    hold_class = hold_report.CLASS_AC_NEEDED if ac_needed else None
+    trays = None
+    if expected > 0:
+        beats = read_heartbeats()
+        not_ready = arc_not_ready_chips(beats)
+        off_ids = {int(i) for i in offbus_chip_ids(beats, expected, not_ready)}
+        present = {i: pci_bus_number(a) for i, a in chip_pci_bdfs().items()}
+        whole = False
+        if off_ids and len(off_ids) < expected:
+            tray_map = galaxy_recovery._tray_map_now() if galaxy_recovery is not None else None
+            whole = (
+                _power_cycle_direct_class(
+                    off_ids, expected, tray_map, mesh_reset_failed=True, present_buses=present, tray_groups=set(groups)
+                )
+                == "A"
+            )
+        hold_class = hold_report.classify_hold(
+            expected=expected, off_bus=len(off_ids), whole_trays=whole, ac_power_needed=ac_needed
+        )
+        alive = {i for i in beats if i not in set(dead_chips(beats))}
+        if groups:
+            read_at = now.isoformat(timespec="seconds")
+            trays = hold_report.trays_present(present, alive, groups, read_at, UBB_CHIP_COUNT)
+    out["hold_class"] = hold_class
+    rung = _hold_next_rung(started, now_epoch) if started is not None else None
+    out["next_rung"] = rung.rung if rung else None
+    out["next_rung_at"] = datetime.fromtimestamp(rung.at).isoformat(timespec="seconds") if rung else None
+    out["next_rung_source"] = rung.source if rung else None
+    out["trays_present"] = (
+        {"verified": False, "label": hold_report.NOT_VERIFIED, "trays": trays} if trays is not None else None
+    )
+    return out
+
+
 def _health_payload(now: Optional[datetime] = None) -> dict:
     """The /health body. Beyond broker liveness it reports the DEVICE hold state, so a poller
     cannot read a box sitting held-and-refused as 'ok' — the gap that let a stuck hold go
@@ -6447,6 +6551,9 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
             }
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
+    # Spec 03 I72: the hold's class, start, next rung and per-tray presence, read-only.
+    if fsm.state in (ServerState.RECOVERING, ServerState.DOWN):
+        payload.update(_hold_report(now))
     return payload
 
 
