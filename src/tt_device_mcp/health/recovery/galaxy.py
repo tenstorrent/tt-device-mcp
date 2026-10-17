@@ -612,6 +612,7 @@ def _route(
     holding_fabric_unverified: bool = False,
     dispatch_reset_due: bool = False,
     eth_timeout_reset_due: bool = False,
+    kill_reset_due: bool = False,
 ) -> str:
     """The single gentlest-first recovery rung justified by the current degradation — THE escalation
     policy, reached through :class:`GalaxyRecovery`'s ``next_stage``, which folds the host-rung
@@ -675,7 +676,8 @@ def _route(
       fabric passed traffic but mesh dispatch failed, which no self-heal clears; the caller grants
       this once per hold episode, and the full check, fabric included, decides the release
       (spec 03 I55). ``eth_timeout_reset_due`` takes the same rung: a clean post-job eth read timed
-      out with no verdict on a present mesh (spec 03 I61).
+      out with no verdict on a present mesh (spec 03 I61), and so does ``kill_reset_due``: a job the
+      broker stopped mid-run, by its timeout or a requested kill (spec 03 I69).
     * below the galaxy floor with nothing to surgically reset -> ``STAGE_UBB_TRAY``: the per-tray
       BMC reset is the next-gentlest rung the gate always attempts before holding — a single/
       few-chip wedge self-heals otherwise, and a galaxy reset there is the measured
@@ -720,7 +722,7 @@ def _route(
         return DEFER
     if sbr_candidates > 0 and last_action != STAGE_BRIDGE_RESET:
         return STAGE_BRIDGE_RESET
-    if (dispatch_reset_due or eth_timeout_reset_due) and off_bus == 0 and frozen_chips == 0:
+    if (dispatch_reset_due or eth_timeout_reset_due or kill_reset_due) and off_bus == 0 and frozen_chips == 0:
         return STAGE_SMI_RESET
     if galaxy_floor is not None and off_bus + frozen_chips < galaxy_floor:
         return STAGE_UBB_TRAY
@@ -1157,6 +1159,7 @@ class GalaxyRecovery(Recovery):
             holding_fabric_unverified=ev.holding_fabric_unverified,
             dispatch_reset_due=ev.dispatch_reset_due,
             eth_timeout_reset_due=ev.eth_timeout_reset_due,
+            kill_reset_due=ev.kill_reset_due,
         )
 
     def _platform_reset_argv(self, indices: list) -> list:
