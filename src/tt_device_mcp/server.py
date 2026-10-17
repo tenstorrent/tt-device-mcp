@@ -6598,7 +6598,8 @@ async def _force_escalate_stuck_hold() -> None:
             logger.error(f"HOLD-DEADLINE-ESCALATE {msg}")
 
     kind = device_hold_escalation_kind  # the window this run claimed; the sampler may rewrite the global
-    if device_hold_tenant_deferred and await asyncio.to_thread(galaxy_recovery.tenant_holds):
+    past_bound = _hold_age_now() >= _stuck_hold_ceiling_sec()
+    if device_hold_tenant_deferred and await asyncio.to_thread(_bound_tenant_holds, past_bound):
         _rearm_tenant_deferred_window(kind)  # still there: stay armed for the next tick, quietly
         return
     async with _device_op("hold-deadline-escalate"):
@@ -6640,6 +6641,14 @@ async def _force_escalate_stuck_hold() -> None:
                 log("10-min hold bound: the full check after the bound's ladder still has its time")
                 return
             if _hold_bound_cycle_next(kind, held_age):
+                await _hold_bound_host_rung(held_age, log)
+                return
+            leftover = await asyncio.to_thread(_reaped_leftover_reason)
+            if leftover:
+                # A killed job's process still holds the device (spec 01 I16): every rung's reset is
+                # fenced and only a host rung clears it, so the bound asks for that rung now.
+                health_event("hold_bound_leftover", held_age_sec=int(held_age), held_since=device_hold_episode_since)
+                log(f"10-min hold bound: {leftover} — no reset can run; the host rung is next")
                 await _hold_bound_host_rung(held_age, log)
                 return
         health_event(
@@ -6850,7 +6859,7 @@ async def _hold_bound_host_rung(age: float, log) -> None:
             alert.send_alert(event, logger)
         log("10-min hold bound: the ladder did not heal the hold and the operator opted out of both host rungs")
         return
-    tenant = await asyncio.to_thread(galaxy_recovery.tenant_holds)
+    tenant = await asyncio.to_thread(_bound_tenant_holds, True)
     allowed, why = recovery_mechanism.auto_recovery_allowed(action, tenant_active=tenant)
     health_event(
         "hold_bound_host_rung",
@@ -6870,6 +6879,20 @@ async def _hold_bound_host_rung(age: float, log) -> None:
         await _auto_power_cycle_host(log, cause)
     else:
         await galaxy_recovery._auto_reboot_host(log, cause)
+
+
+def _bound_tenant_holds(bound: bool) -> bool:
+    """The forced ladders' tenant check (galaxy_recovery.tenant_holds), except that from the 10-min bound
+    on a reaped job's leftover (spec 01 I16) is no tenant: its job already ended and only a host rung
+    clears one stuck in the kernel (spec 04 I76). A running job or any other readable tenant still is."""
+    if bound:
+        scan = enumerate_device_holders()
+        leftover = {f.pid for f in _reaped_leftovers(scan)}
+        if leftover:
+            return galaxy_recovery._tenant_active(
+                replace(scan, holders=[h for h in scan.holders if h.pid not in leftover]), force=True
+            )
+    return galaxy_recovery.tenant_holds()
 
 
 def _hold_escalated_report() -> bool:

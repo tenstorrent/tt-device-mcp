@@ -922,7 +922,17 @@ each rung fires only when the gentler one failed or cannot apply.
   I42, including the latch the first job after a topology-mismatch lift sets when it fails on the
   fabric) or a known fabric fault (spec 03 I46). This holds whichever trigger starts the forced run
   past the bound: the watchdog's ceiling window or a held job's tenant-hold bound; neither returns
-  at the 77-only early exit any more. At the bound the I42 and I46 latches are lifted
+  at the 77-only early exit any more. The exits that end a hold with no rung below the bound, and
+  that the bound overrides: the watchdog's 77-only early return; the I30 no-reset hold
+  (`_hold_without_reset`: a topology mismatch or missing cable, a known fabric fault, a 77 with no
+  fault measured), which still pages and then runs the ladder; the I29 77 hold with no host rung
+  after the episode's reset and last-chance sweep, which the bound's ladder reaches and follows with
+  the host rung in the same run (the reset and sweep it already ran are not repeated, I36); the I42
+  and I46 latches; and a killed job's leftover holder (spec 01 I16). That leftover read as a tenant,
+  so the ladder stood down and re-armed every window; from the bound on it is no tenant. Its fence
+  keeps every reset off the device and only a host rung clears it, so the bound asks for the host
+  rung at once (event `hold_bound_leftover`); a running job or any other readable tenant still
+  refuses it. At the bound the I42 and I46 latches are lifted
   (`hold_bound_latch_cleared`), so the full health check after the ladder, fabric included, gets a
   real verdict and only a pass releases (goal of I8/spec 03 I4); a job that fails the same way
   declares them again. Below the bound the faster class paths stay as they are. When the ladder
@@ -952,7 +962,12 @@ each rung fires only when the gentler one failed or cannot apply.
   hold no class path heals (e.g. a topology-mismatch or 77-only hold, class D): at most 600 s +
   the ladder when the ladder or its full check fails (+ one 10 s sampler tick when a relift check
   gave the verdict), or 600 s + the ladder + 300 s while the check hangs or waits on hugepages; then the cycle, the boot and
-  the startup check. Bounds the about 70 min one Galaxy host sat in a latched topology-mismatch hold
+  the startup check. Per class: a fabric-only hold (77, topology mismatch, known fabric fault,
+  latched I42/I46; class D), as above; a 77 the episode's reset and sweep already left unverified
+  (I29), at most 600 s + one sampler tick, with no second reset; a killed job's leftover stuck in the
+  kernel (class J), was open-ended (the hold stood until an operator rebooted), now at most 600 s +
+  one sampler tick; class A (whole tray) and C keep the I37 direct cycle, well inside the bound. Each
+  waits only on a running boot / post-power-cycle cooldown (I65) and fires as it ends. Bounds the about 70 min one Galaxy host sat in a latched topology-mismatch hold
   with no rung run.
 
 ## Interfaces
@@ -1445,6 +1460,7 @@ sees a silent fabric pass.
 | I65 a future, non-finite or unreadable stamp (history file, ledger, heal file) never hides a valid past anchor, never holds the cycle past the stated gap, never keeps the streak past a verified release; every cap denial is on /health | `tests/test_power_cycle_cooldown.py::test_a_nan_or_future_history_line_does_not_hide_the_valid_past_one`, `::test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle`, `::test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health`, `::test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end`, `::test_the_per_boot_cap_denial_shows_on_health`, `::test_a_future_record_does_not_keep_the_streak_past_a_verified_release` |
 | I37/I65 class C at startup: one mesh reset with no failed reset or broker cycle; none after the broker's own cycle, which then waits only for the cooldown | `tests/test_power_cycle_cooldown.py::test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_gets_one_reset`, `::test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_reset`, `::test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not` |
 | I76 every hold kind (77-only, topology mismatch, known fabric fault, latched, generic) runs the full ladder at the 10-min bound, then the host rung; below the bound a no-reset hold keeps its fast path; a latched I42 hold escalates with its latch lifted | `tests/test_hold_bound.py::test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung`, `::test_below_the_bound_a_no_reset_hold_keeps_its_fast_path`, `::test_a_latched_i42_hold_still_escalates_and_its_latch_is_lifted`, `::test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_power_cycle` |
+| I76 the I29 77 hold with no host rung (reset and sweep already ran this episode) gets the power cycle at the bound in the same run; a killed job's leftover holder (01 I16) does not stand the bound down: no reset runs over it and the host rung is asked for, which a live tenant still refuses | `tests/test_hold_bound.py::test_replay_a_77_held_with_no_host_rung_gets_the_power_cycle_at_the_bound`, `::test_a_killed_jobs_leftover_holder_does_not_stop_the_bound` |
 | I76 a cooldown denial of the host rung arms the retry, which fires at the cooldown's end | `tests/test_hold_bound.py::test_a_cooldown_denial_arms_the_retry_and_the_host_rung_fires_at_its_end` |
 | I76 a bound ladder that brings the mesh back but whose full check ends with no pass (77-only, topology mismatch / I42 latch, known fabric fault, generic) does not release and asks for the host rung in the same run; a relift check that fails after the ladder asks for it on the next tick; a check that passes asks for none | `tests/test_hold_bound.py::test_a_failed_check_after_the_bound_ladder_asks_for_the_host_rung_at_once`, `::test_a_relift_that_fails_after_the_bound_ladder_cycles_on_the_next_tick`, `::test_a_passing_check_after_the_bound_ladder_asks_for_no_host_rung` |
 | I76 a check still waiting on hugepages (or hanging) after the bound ladder gets the 300 s check bound, then the host rung; another run inside that bound does not cut the check short | `tests/test_hold_bound.py::test_a_check_still_waiting_on_hugepages_is_bounded_by_the_check_window`, `::test_another_run_inside_the_check_bound_does_not_cut_the_full_check_short` |

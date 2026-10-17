@@ -18,7 +18,9 @@ from tests.conftest import fsm_dirty, patch_health_event
 from tests.test_classac_power_cycle_direct import EXPECTED, rig  # noqa: F401 - the fixture
 from tests.test_device_safety import _arm_fabric_only_deadline_hold
 from tt_device_mcp import server as srv
+from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.health.recovery import OUTCOME_RECOVERED, OUTCOME_TERMINAL, galaxy
+from tt_device_mcp.job_reap import ReapedLeftover
 
 BOUND = 600
 _REAL_HOST_RUNG = srv._hold_bound_host_rung  # captured at import, before any test stubs it
@@ -541,3 +543,97 @@ async def test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false(mon
     stuck = [k for kind, k in seen if kind == "hold_stuck_past_deadline"]
     assert stuck and all(k["escalated"] for k in stuck)
     await asyncio.sleep(0)
+
+
+def _present_hold_at_the_bound(r, monkeypatch, *, why, detail):
+    """A present-mesh hold of ``why``/``detail`` one second past the bound, on the rig's real ladder."""
+    r["beats"] = {str(i): 100 for i in range(EXPECTED)}  # every chip present with a live ARC
+    fsm_dirty(srv, detail, why=why)
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "_present_chip_indices", lambda: [str(i) for i in range(EXPECTED)])
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda n: EXPECTED)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_output", "")
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "")
+    since = _since(BOUND + 1)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since)
+    monkeypatch.setattr(srv, "device_hold_episode_reason", detail)
+    monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
+    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+    _watchdog(monkeypatch)
+    return since
+
+
+@pytest.mark.asyncio
+async def test_replay_a_77_held_with_no_host_rung_gets_the_power_cycle_at_the_bound(
+    rig, monkeypatch, clear_job_state  # noqa: F811
+):
+    """galaxy's _hold_77_without_host_rung (spec 04 I29): the episode's reset came back with the fabric
+    unverified (77) and its last-chance sweep, the full check after it, read a 77 again. Below the
+    bound that holds with no host rung; at the bound the watchdog's forced ladder reaches the same exit
+    and the broker's own code asks for the power cycle in that run."""
+    order, g = rig["order"], rig["g"]
+    detail = "post-job: fabric check COULD NOT RUN (77)"
+    since = _present_hold_at_the_bound(rig, monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail=detail)
+    # The ladder this episode already climbed: a reset that left the fabric unverified, then the sweep.
+    monkeypatch.setattr(g.mechanism, "unverified_reset_since", since)
+    monkeypatch.setattr(g.mechanism, "unverified_sweep_since", since)
+    monkeypatch.setattr(g.mechanism, "unverified_sweep_77_since", since)
+    monkeypatch.setattr(g, "_host_rung_77_paged_since", None)
+    assert srv._fabric_77_only_hold() and srv._fabric_no_reset_hold() == "fabric check could not run (77)"
+
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+
+    kinds = [k for k, _ in rig["events"]]
+    assert "stuck_hold_escalation" in kinds, "the forced ladder ran at the bound"
+    assert "fabric_unverified_no_host_rung" in kinds, "it reached the 77 no-host-rung exit"
+    assert order.count("power_cycle") == 1, "the bound asked for the power cycle past that exit"
+    assert kinds.index("fabric_unverified_no_host_rung") < kinds.index("hold_bound_host_rung")
+    assert "released" not in order
+
+
+def _leftover_scan(monkeypatch, r, *, tenant: bool):
+    """A reaped job's process stuck in the kernel still holding /dev/tenstorrent (spec 01 I16), and,
+    with ``tenant``, a live user process beside it."""
+    stuck = DeviceHolder(pid=4242, uid=1001, scoped=True)
+    holders = [stuck] + ([DeviceHolder(pid=5151, uid=1002)] if tenant else [])
+    r["scan"] = HolderScan(holders=holders, complete=True)
+    leftover = ReapedLeftover("7", 4242, 1001, "D", "tt_ioctl", True)
+    monkeypatch.setattr(
+        srv, "find_reaped_leftovers", lambda hs, live, survivors=None: [leftover] if stuck in list(hs) else []
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tenant", [False, True])
+async def test_a_killed_jobs_leftover_holder_does_not_stop_the_bound(
+    rig, monkeypatch, clear_job_state, tenant  # noqa: F811
+):
+    """A killed job whose process is stuck in the kernel keeps its device fds (spec 01 I16, after the
+    I67 release wait). Every reset is fenced while it holds, and it read as a tenant, so the bound's
+    ladder stood down and re-armed forever. At the bound it is no tenant: the ladder's resets cannot
+    run, so the broker asks for the host rung, which is what clears it. A live tenant still refuses."""
+    order = rig["order"]
+    _present_hold_at_the_bound(rig, monkeypatch, why="job_killed", detail="job 7 killed: device left dirty")
+    _leftover_scan(monkeypatch, rig, tenant=tenant)
+    assert srv.galaxy_recovery.tenant_holds(), "the leftover reads as a tenant to the ladder"
+    monkeypatch.setattr(  # the real governor's first rule: a tenant refuses a host rung
+        rig["g"].mechanism,
+        "auto_recovery_allowed",
+        lambda action, tenant_active=False, **k: (False, "a tenant holds the device") if tenant_active else (True, ""),
+    )
+
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+
+    kinds = [k for k, _ in rig["events"]]
+    assert "glx_reset" not in order, "no reset runs over a leftover (01 I16)"
+    if tenant:
+        assert "power_cycle" not in order, "a live tenant still refuses the host rung"
+        return
+    assert "hold_bound_leftover" in kinds
+    assert order.count("power_cycle") == 1, "the bound asked for the host rung that clears the leftover"
+    assert "released" not in order
