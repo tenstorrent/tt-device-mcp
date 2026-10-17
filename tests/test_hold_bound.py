@@ -254,6 +254,29 @@ async def test_a_failed_check_after_the_bound_ladder_asks_for_the_host_rung_at_o
 
 
 @pytest.mark.asyncio
+async def test_a_passing_check_after_the_bound_ladder_asks_for_no_host_rung(monkeypatch, clear_job_state):
+    """The ladder brings the mesh back and its full check passes: no hold_bound_check_failed, no host
+    rung, then or on a later tick."""
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
+    )
+    _watchdog(monkeypatch)
+
+    async def recovered_and_passed(kind, indices, expected, log):
+        escalations.append(kind)
+        monkeypatch.setattr(srv, "_recovery_degraded", lambda: False)  # the full check passed
+        return OUTCOME_RECOVERED
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", recovered_and_passed)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == ["present-forced"]
+    srv._check_hold_deadline(now=datetime.now() + timedelta(seconds=10))  # the next sampler tick
+    await _drain()
+    assert "hold_bound_check_failed" not in events and "host_rung" not in events
+
+
+@pytest.mark.asyncio
 async def test_a_relift_that_fails_after_the_bound_ladder_cycles_on_the_next_tick(monkeypatch, clear_job_state):
     """A check that was still waiting on hugepages after the ladder, then ends with no pass, asks for
     the host rung on the next watchdog tick, not at the end of the check window."""
