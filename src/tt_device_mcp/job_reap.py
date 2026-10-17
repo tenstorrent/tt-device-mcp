@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
 from tt_device_mcp import device_holders
-from tt_device_mcp.constants import SURVIVOR_KILL_WAIT_SEC, SURVIVOR_TERM_GRACE_SEC
+from tt_device_mcp.constants import HOLDER_RELEASE_WAIT_SEC, SURVIVOR_KILL_WAIT_SEC, SURVIVOR_TERM_GRACE_SEC
 
 logger = logging.getLogger("tt-device-mcp")
 
@@ -213,13 +213,16 @@ async def reap_job_survivors(
     *,
     term_grace_sec: float = SURVIVOR_TERM_GRACE_SEC,
     kill_wait_sec: float = SURVIVOR_KILL_WAIT_SEC,
+    release_wait_sec: float = HOLDER_RELEASE_WAIT_SEC,
     log: Callable[[str], None] = logger.warning,
 ) -> list[Survivor]:
     """End every process the job left behind: SIGTERM, ``term_grace_sec``, SIGKILL.
 
     Returns the processes still alive ``kill_wait_sec`` after the SIGKILL (empty in the
-    normal case, where the job left nothing behind and this costs one /proc scan). Each
-    process found is logged through ``log``. Never raises."""
+    normal case, where the job left nothing behind and this costs one /proc scan). One that
+    may still hold the device then gets until ``release_wait_sec`` after the SIGKILL to drop
+    out of the holder scan before it is returned (spec 01 I67). Each process found is logged
+    through ``log``. Never raises."""
     try:
         found = await asyncio.to_thread(job_processes, pid, scope, tag)
         if not found:
@@ -235,7 +238,16 @@ async def reap_job_survivors(
         left = await _wait_gone(found, term_grace_sec)
         if left:
             _signal(left.values(), signal.SIGKILL, pid)
-            await _wait_gone(left, kill_wait_sec)
+            left = await _wait_gone(left, kill_wait_sec)
+            # Alive after SIGKILL is not yet a leftover: an exit can sit in the driver's release
+            # for seconds. Poll the holder scan, bounded, before the rescan names it (01 I67).
+            holding = [p for p in left if _holds_device(p) is not False]
+            if holding and release_wait_sec > kill_wait_sec:
+                log(
+                    f"REAP job {job_id}: pid {', '.join(map(str, holding))} still alive {kill_wait_sec:g}s "
+                    f"after SIGKILL; waiting up to {release_wait_sec - kill_wait_sec:g}s more for it to release the device"
+                )
+                await device_holders.wait_device_released(holding, release_wait_sec - kill_wait_sec)
         # Re-scan: anything the job forked during the sweep is a survivor too.
         rescan = await asyncio.to_thread(job_processes, pid, scope, tag)
         survivors = [
