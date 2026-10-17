@@ -192,6 +192,17 @@ job log, so every "installed" claim below is verified, not assumed.
   lap, and the reconcile that runs it, for at most `TTDEV_DRAIN_TIMEOUT_SEC`. The restart after an
   apply is an ordinary broker start, so the queue opens only once the startup check (spec 03 I4:
   the forced fabric pass, after the 1G hugepage pool is ready) has passed.
+- **I21 — Applies are rate-limited per box, and the limit only moves when an apply happens.**
+  Every apply restarts the broker, and every start runs the full startup check, fabric traffic
+  pass included (spec 03 I4), so a burst of pushes is a burst of fabric passes. With
+  `TTDEV_MIN_APPLY_INTERVAL_SEC` > 0 (default 0, off; 3600 suggested on a Galaxy), a lap that finds
+  a new sha less than that long after the last apply exits 0 and says when the sha will apply; the
+  first lap past the interval applies the newest sha, so a burst becomes one restart. The check
+  runs before the device-op bar and the I18 hold, so a rate-limited lap holds nothing. The last
+  apply is the epoch in `$ROOT/last-apply`, written just before `systemctl restart`, so an apply
+  that fails before the restart is retried on the next lap; a missing, non-numeric or future stamp
+  bars nothing. The drain and idle gate (I18, I20) are unchanged, and the startup check after the
+  restart is never skipped, deferred or shortened.
 
 ## Interfaces
 
@@ -314,7 +325,7 @@ clones it into `$ROOT/src` under `umask 077` on the first lap (removing any non-
 leftover first), fetches the tracked branch thereafter, and reads the sha with
 `rev-parse --verify -q refs/remotes/origin/$TTDEV_BRANCH`; an unmakeable clone, an unreachable
 network and a missing branch each name the fault and exit 0. If that sha equals `installed.sha`,
-exit. Otherwise: device-op bar and reset-scope check
+exit. Otherwise: the apply rate limit (I21); device-op bar and reset-scope check
 (I7 — the scope check asks systemd, because a reset outlives the broker by design); dispatch hold and busy/idle
 gate per I7 and I18; then materialize the tree — `reset --hard` to **the sha this lap resolved**, not to
 `origin/<branch>` re-read after the gate, so a branch that moved during a defer is not installed
@@ -518,6 +529,7 @@ script exists, the claim stands on the script (listed below).
 | I18 (dispatch hold from the busy check through the restart; queued specs and job scopes count as busy) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_hold_is_taken_before_anything_is_counted`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_hold_appears_whole`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_queued_job_defers_an_opted_in_update_and_drops_the_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_idle_box_applies_and_keeps_the_hold_until_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_running_job_scope_counts_as_busy` |
 | I19 (an in-progress broker is not reset or started; logged once) | `tests/test_deploy_reconcile_activating.py::test_an_in_progress_broker_is_not_reset_or_started`, `tests/test_deploy_reconcile_activating.py::test_an_in_progress_broker_logs_once_per_episode`, `tests/test_deploy_reconcile_activating.py::test_a_down_broker_is_still_reset_and_started`, `tests/test_deploy_reconcile_activating.py::test_an_active_broker_is_left_alone` |
 | I20 (drain: past DRAIN_AFTER the hold is kept until the running job ends, then the update applies with no job running; a back-to-back queue cannot slip a job in; a job past DRAIN_TIMEOUT is left alone and the next drain waits DRAIN_AFTER; a device op holds the apply; the restart opens the queue only after the startup fabric pass, after hugepages) | `tests/test_deploy_autoupdate_idle_gate.py::test_a_busy_box_defers_until_the_drain_is_due`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_due_drain_keeps_the_hold_and_applies_at_the_job_boundary`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_back_to_back_queue_cannot_slip_a_job_into_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_drain_that_outlives_its_bound_lets_the_job_run_and_backs_off`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_backed_off_drain_waits_its_turn`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_holds_a_drained_apply`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_drain_refreshes_the_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_apply_ends_in_a_full_broker_restart`, `tests/test_restart_drain.py::test_a_job_held_across_an_update_waits_for_the_startup_fabric_pass`, `tests/test_restart_drain.py::test_a_failed_startup_pass_after_an_update_keeps_the_queue_held` |
+| I21 (apply rate limit: off by default; a burst of pushes is one restart onto the newest sha after the interval; checked before the device-op bar and the hold; the stamp is written only by an apply that restarts; a missing, bad or future stamp bars nothing) | `tests/test_deploy_autoupdate_rate_limit.py::test_the_rate_limit_is_off_by_default`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_burst_of_pushes_becomes_one_restart_onto_the_newest_sha`, `tests/test_deploy_autoupdate_rate_limit.py::test_the_wait_names_the_time_left`, `tests/test_deploy_autoupdate_rate_limit.py::test_no_stamp_a_bad_stamp_or_a_future_stamp_bars_nothing`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_rate_limited_lap_holds_nothing_and_skips_no_check`, `tests/test_deploy_autoupdate_rate_limit.py::test_the_stamp_is_written_only_by_an_apply_that_restarts` |
 
 **Unanchored (the claim stands on the script):** I2 (wheel/venv from this tree —
 `install-tt-device-broker.sh`); the installer's flow ordering and lock opt-in; Galaxy detection
