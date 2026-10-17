@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """Spec 04 I71: on a multi-chip mesh the host rung is the power cycle; a warm reboot is not taken
 while the power cycle is armed. With no power cycle armed the older verdict stands unchanged."""
 
