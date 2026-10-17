@@ -1630,15 +1630,20 @@ class RecoveryMechanism:
             ),
         }
 
-    def _mark_missed_power_cycles(self, ledger: list[dict], now_epoch: float) -> None:
+    def _mark_missed_power_cycles(self, ledger: list[dict], now_epoch: float, *, late_only: bool = False) -> None:
         """Mark each power-cycle row this boot whose pending window ran out ``took_host_down: false``
         in ``ledger`` and on disk, so a later boot still knows it was no cycle (spec 04 I72). A missed
         row that brought this boot up after all is marked ``took_host_down: true, late: true``, so
         every later boot counts it as the cycle it was. One event per row marked; the page from the
-        second miss on. A ledger that cannot be rewritten keeps the rows as they were: on this boot
-        they read the same all the same. Never raises."""
+        second miss on. ``late_only`` writes only the late mark. A ledger that cannot be rewritten
+        keeps the rows as they were (logged): on this boot they read the same all the same. Never
+        raises."""
         boot_id = self._current_boot_id()
-        fresh = [r for r in ledger if "took_host_down" not in r and _power_cycle_missed(r, boot_id, now_epoch)]
+        fresh = (
+            []
+            if late_only
+            else [r for r in ledger if "took_host_down" not in r and _power_cycle_missed(r, boot_id, now_epoch)]
+        )
         late = _late_power_cycle(ledger, boot_id, self._btime(now_epoch), now_epoch)
         if not fresh and late is None:
             return
@@ -1673,8 +1678,8 @@ class RecoveryMechanism:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, path)
-        except OSError:
-            pass
+        except OSError as e:
+            log.warning(f"auto-recovery ledger not rewritten, power-cycle rows left as they were (spec 04 I72): {e}")
         if not fresh:
             return
         state = self.power_cycle_miss_state(ledger, now_epoch=now_epoch)
@@ -1693,6 +1698,21 @@ class RecoveryMechanism:
                 event = {"kind": "power_cycle_missed", "count": state["missed"], "message": state["why"]}
                 if alert.send_alert(event) is not None or alert.alert_argv() is None:
                     self._power_cycle_miss_paged = mono
+
+    def mark_late_power_cycle(self, *, now_epoch: Optional[float] = None) -> None:
+        """Run once at broker startup: if a power-cycle request marked missed brought this boot up
+        after all, write its late mark now (spec 04 I72). Otherwise only this boot's power-cycle gate
+        or a window running out writes it, and a boot that escalates by reboot, or not at all, leaves
+        the row missed, so later boots drop that cycle from the I65 doubling and the backstop.
+        Idempotent: a row already marked is no longer found. An unreadable ledger is left as it is and
+        logged. Never raises."""
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        ledger = self.read_auto_recovery_ledger()
+        if ledger is None:
+            log.warning("auto-recovery ledger unreadable at startup: no late power-cycle mark written (spec 04 I72)")
+            return
+        if ledger:
+            self._mark_missed_power_cycles(ledger, now_epoch, late_only=True)
 
     def note_missed_power_cycles(self, *, now_epoch: Optional[float] = None) -> None:
         """Called when a power-cycle request's pending window runs out with the host still up: mark it

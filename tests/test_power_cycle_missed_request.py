@@ -260,6 +260,74 @@ def test_cycles_that_land_after_their_window_still_double_the_cooldown_and_count
     assert paged == []
 
 
+def _broker_starts(monkeypatch, tmp_path):
+    """The broker's startup step on the current boot (the real one), with the firmware's account of
+    the last boot clean and nothing written outside ``tmp_path``."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "previous_boot_error", lambda: {"present": False})
+    monkeypatch.setattr(srv, "previous_boot_bus_locks", lambda: 0)
+    monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "mark_boot", lambda *a, **k: None)
+    srv._record_previous_boot_error()
+
+
+def test_a_late_cycle_whose_boot_only_reboots_still_doubles_the_cooldown_on_later_boots(
+    cool, monkeypatch, tmp_path, paged  # noqa: F811
+):
+    """The loop guard (spec 04 I65/I72) when the boot a late cycle brought up runs no power-cycle
+    gate: it escalates by reboot once the 1 h loop guard allows it. Broker startup writes the late
+    mark, so the boot after that reboot still counts the cycle: the cooldown doubles 30 min, 1 h,
+    2 h, then 4 h, and the backstop counts the late cycles (two once two fall in its window)."""
+    m = cool["g"].mechanism
+    assert srv.recovery_mechanism is m
+    at, intervals, live_backstop, later_backstop = T0, [], [], []
+    for n in range(4):
+        _request(cool, at)
+        _window_ends(cool, at + WINDOW)
+        btime = at + WINDOW + 120
+        cool["boot"].update(id=f"boot-{n}a", btime=btime)
+        m.host_action_requested = None
+        cool["clk"][0] = btime + 30
+        _broker_starts(monkeypatch, tmp_path)
+        _broker_starts(monkeypatch, tmp_path)  # a restart on the same boot changes nothing
+        ran = m._cycles_that_ran(_rows(), btime + 30)
+        live_backstop.append(len(_power_cycle_backstop_stamps(ran, btime + 30)))
+        t = at + 3600 + 30
+        cool["clk"][0] = t
+        allowed, why = m.auto_recovery_allowed("reboot", tenant_active=False, now_epoch=t)
+        assert allowed, why
+        m.record_auto_recovery("reboot", "wedge", now_epoch=t)
+        later = t + 60
+        cool["boot"].update(id=f"boot-{n}b", btime=later)
+        cool["clk"][0] = later + 1
+        cd = m.power_cycle_cooldown(now_epoch=later + 1)
+        assert cd is not None
+        intervals.append(cd["interval_sec"])
+        ran = m._cycles_that_ran(_rows(), later + 1)
+        later_backstop.append(len(_power_cycle_backstop_stamps(ran, later + 1)))
+        at = cd["until"]
+    assert intervals == [1800, 3600, 7200, 14400]
+    assert live_backstop[:2] == [1, 2] and all(c >= 1 for c in live_backstop)
+    assert later_backstop == [1, 1, 1, 1]
+    cycles = [r for r in _rows() if r["action"] == "power-cycle"]
+    assert len(cycles) == 4 and all(r.get("took_host_down") is True and r.get("late") is True for r in cycles)
+    assert paged == []
+
+
+def test_the_startup_mark_leaves_an_unreadable_ledger_as_it_is(cool, monkeypatch, caplog):  # noqa: F811
+    """Fail-safe: a ledger the broker cannot read at startup is left as it is and logged."""
+    m = cool["g"].mechanism
+    _request(cool, T0)
+    _window_ends(cool, T0 + WINDOW)
+    cool["boot"].update(id="boot-B", btime=T0 + WINDOW + 120)
+    before = (recovery_base.health_dir() / AUTO_RECOVERY_LEDGER).read_text()
+    monkeypatch.setattr(m, "read_auto_recovery_ledger", lambda: None)
+    with caplog.at_level("WARNING"):
+        m.mark_late_power_cycle(now_epoch=T0 + WINDOW + 180)
+    assert (recovery_base.health_dir() / AUTO_RECOVERY_LEDGER).read_text() == before
+    assert "unreadable" in caplog.text
+
+
 # ---- (4) goal 8: a healed retry releases only after the full check --------------------------------
 
 

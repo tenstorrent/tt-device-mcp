@@ -4837,6 +4837,15 @@ def _record_previous_boot_error() -> None:
     # boot_id still records one row per boot instead of a fresh back-fill on every broker restart
     # within the boot. boot_id itself, not this key, drives the escalation attribution and
     # mark_boot below — those need the kernel id and fail closed without it.
+    # Spec 04 I72: a late power cycle that brought this boot up is marked so on disk at startup,
+    # whatever this boot does later (it may only reboot, or never escalate), so every later boot
+    # still counts it for the I65 doubling and the backstop. Idempotent, so it runs before the
+    # once-per-boot guard: a broker restart retries a mark an earlier start could not write.
+    try:
+        recovery_mechanism.mark_late_power_cycle()
+    except Exception as e:
+        if logger:
+            logger.warning(f"late power-cycle mark not written at startup (spec 04 I72): {e}")
     boot_key = boot_id or _boot_btime_id()
     marker = health_dir() / f".boot_recorded_{boot_key or 'unknown'}"
     if boot_key and marker.exists():
