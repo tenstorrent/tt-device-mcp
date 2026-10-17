@@ -452,9 +452,7 @@ class TelemetrySampler:
             # single untrusted sample takes a healthy box offline. Hold it to the same
             # two-sample proof a single dead chip must pass; a real blackout stays, a re-init
             # blip does not.
-            blackout_strikes = [
-                i for i in dead if self.dead_chip_strikes.get(i, 0) >= 1 and self._lasted(f"chip:{i}")
-            ]
+            blackout_strikes = [i for i in dead if self.dead_chip_strikes.get(i, 0) >= 1 and self._lasted(f"chip:{i}")]
             for i in dead:
                 self.dead_chip_strikes[i] = self.dead_chip_strikes.get(i, 0) + 1
                 self._mark_bad(f"chip:{i}")
