@@ -13799,6 +13799,10 @@ async def test_a_sweep_that_still_reads_77_holds_and_pages_once_instead_of_climb
     assert counters["reboots"] == 0 and counters["power_cycles"] == 0
 
 
+# The real helper, before any test stubs it.
+_REAL_FABRIC_77_NO_RESET_CAUSE = srv._fabric_77_no_reset_cause
+
+
 def _arm_sweep_still_77(monkeypatch, *, climb_outcome=galaxy_mod.HOST_RUNG_FIRED):
     """An I29 episode whose reset came back UNKNOWN and whose sweep still reads a 77 with no known
     no-reset cause. Returns (counters, climbs, alerts); the climb stub returns ``climb_outcome``."""
@@ -13853,6 +13857,40 @@ async def test_a_sweep_still_reading_77_with_no_known_cause_climbs_to_the_host_r
     assert status["owner"] == "operator" and status["act_by_epoch"] == alerts[0]["deadline_epoch"]
     assert g.fabric_77_handoff_status("another-episode") is None, "the hand-off ends with its hold"
     assert counters["resets"] == 0 and counters["dirty_cleared"] == 0, "held, never released unverified"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("latched", [True, False])
+async def test_a_latched_hold_whose_sweep_still_reads_a_mismatch_77_climbs_to_the_host_rung(
+    monkeypatch, clear_job_state, latched
+):
+    """Spec 04 I29 with spec 03 I42: a latched hold whose reset and sweep still read a 77 climbs once to
+    the host rung, though the 77 output keeps the descriptor run's mismatch line and the hold names the
+    mismatch: the latch is a measured fault, read before the mismatch checks. Without the latch the
+    same reading is a topology mismatch: it holds and pages once, no host rung."""
+    counters, climbs, alerts = _arm_sweep_still_77(monkeypatch)
+    monkeypatch.setattr(srv, "_fabric_77_no_reset_cause", _REAL_FABRIC_77_NO_RESET_CAUSE)
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "")
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: False)
+    fault = "hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)"
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", fault if latched else "")
+    monkeypatch.setattr(
+        srv.health_monitor,
+        "last_fabric_output",
+        "  what():  Connection mismatch detected. Check console output for details.\n"
+        "fabric-check: topology mismatch (2 ports moved)\ntraffic-only rerun: exit 77, no link tested\n",
+    )
+    monkeypatch.setattr(srv, "device_hold_episode_reason", "topology mismatch: 2 ports moved")
+    g = srv.galaxy_recovery
+    assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    if latched:
+        assert climbs == [{"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE}]
+        assert [a["kind"] for a in alerts] == []
+    else:
+        assert climbs == []
+        assert [a["kind"] for a in alerts] == ["fabric_unverified_no_host_rung"]
+    assert counters["dirty_cleared"] == 0, "held, never released unverified"
 
 
 @pytest.mark.asyncio

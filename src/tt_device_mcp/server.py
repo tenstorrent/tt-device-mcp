@@ -3729,9 +3729,14 @@ def _fabric_77_eth_drop() -> str:
 def _fabric_77_no_reset_cause() -> bool:
     """Whether the 77 has a cause no reset fixes: a known cable fault (a 78), a topology mismatch, or
     a missing prerequisite (hugepages, the validator). Not the I42 latch: its first job measured the
-    fabric bad, so it takes the ladder, and a 77 after its reset still climbs to the host rung."""
+    fabric bad, so it takes the ladder, and a 77 after its reset still climbs to the host rung. The
+    latch is read before the mismatch checks, as _fabric_no_reset_hold reads it: the latched hold's
+    detail and its post-reset output (the traffic-only rerun keeps the descriptor run's mismatch
+    line) both name the mismatch, and either would park the hold with no host rung."""
     if health_monitor.known_fabric_fault():
         return True
+    if health_monitor.topology_hw_fault:
+        return False
     if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
         return True
     if _validator_line_names_topology(health_monitor.last_fabric_output or ""):

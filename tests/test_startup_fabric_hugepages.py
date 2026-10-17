@@ -1355,6 +1355,45 @@ def test_the_first_job_hardware_fault_is_no_77_no_reset_cause(monkeypatch, tmp_p
     assert srv._fabric_77_eth_drop() == "eth links 60 < 64"
 
 
+# The latched hold's post-reset 77: the descriptor run's mismatch line, the marker, then the
+# traffic-only rerun that could not measure.
+_LATCHED_77_OUTPUT = (
+    "  what():  Connection mismatch detected. Check console output for details.\n"
+    "fabric-check: topology mismatch (descriptor 4x8, found 4x8 with 2 ports moved)\n"
+    "traffic-only rerun: exit 77, no link tested\n"
+)
+
+
+@pytest.mark.parametrize("named_in", ["output", "detail", "episode_reason"])
+@pytest.mark.parametrize("latched", [True, False])
+def test_a_latched_hold_whose_77_names_the_mismatch_is_no_77_no_reset_cause(
+    monkeypatch, tmp_path, clear_job_state, named_in, latched
+):
+    """I42 with spec 04 I29: the latch is read before the mismatch checks. The latched hold's
+    post-reset 77 keeps the validator's mismatch line (the rerun output includes the descriptor run),
+    and its detail or episode reason may name the mismatch; none of these parks the hold with no host
+    rung. Without the latch the same reading is a topology mismatch, a cause no reset fixes."""
+    _hold_77(monkeypatch, tmp_path, last_fabric_ok=False)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: False)
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "")
+    monkeypatch.setattr(srv.health_monitor, "last_eth_link_drop", "eth links 60 < 64")
+    fault = "hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)"
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", fault if latched else "")
+    output, detail, reason = "no link tested (77)", "gate/relift: fabric unverified (could not run)", ""
+    if named_in == "output":
+        output = _LATCHED_77_OUTPUT
+    elif named_in == "detail":
+        detail = "topology mismatch: descriptor 4x8, 2 ports moved"
+    else:
+        reason = "topology mismatch: descriptor 4x8, 2 ports moved"
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_output", output)
+    monkeypatch.setattr(srv, "device_hold_episode_reason", reason)
+    fsm_dirty(srv, detail, why="fabric_unverified")
+    assert srv._fabric_77_no_reset_cause() is not latched
+    assert srv._fabric_77_eth_drop() == ("eth links 60 < 64" if latched else "")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reset_passes, lifted", [(2, True), (0, False)])
 async def test_after_an_unknown_reset_the_next_relift_77_reaches_the_bound(
