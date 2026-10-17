@@ -740,6 +740,26 @@ job boundary.
   instead of about 5. Every other guard stays: the arm switch, retry pacing (one grace window
   between resets), reset scope, and no tenant (I13). A positive frozen read, or no measured
   failure, keeps the grace.
+- **I79 The sampler watches the kernel's PCIe error record between samples and samples sooner
+  when it moves.** Every `LINK_WATCH_SEC` (1 s) between samples the sampler reads
+  `link_signals()`: the KMD chip node list and the uncorrectable AER counters (`aer_dev_nonfatal`,
+  `aer_dev_fatal`, `aer_rootport_total_err_nonfatal`/`_fatal`) of every chip's endpoint and every
+  port above it up to the root port. These are kernel memory: no read reaches a chip, switch or
+  config space. Correctable counters are left out (routine on a healthy link). A rise in any
+  counter, or a chip node that left sysfs, takes a sample at once and keeps the cadence at
+  `FAST_SAMPLE_SEC` (2 s) until `FAST_WINDOW_SEC` (30 s) after the last signal; the first arm in a
+  window journals `offbus_watch_armed`. The signal decides nothing: the existing two-sample proof
+  (I19, I31 and the all-gone/blackout checks) still confirms, into the same classification and
+  dirty mark, and under the fast cadence the bad reading must also have lasted
+  `FAST_CONFIRM_SEC` (4 s, at least three samples), so a transient AER with live heartbeats, or a
+  blip under 4 s, never strikes a reset. The idle hold ledger, the idle relift and the holder scan
+  keep `SAMPLE_INTERVAL_SEC`; the watch adds no lift path and no lift attempt, and every hold still
+  lifts only on a full health check, fabric included, that has just passed (04 I32);
+  the hold-deadline escalation (04 I27: ladder, then power cycle) and the whole-tray power cycle behind the boot
+  cooldown are unchanged. TTR effect: detection of class A (whole-tray or whole-mesh drop) and
+  class B1 (partial off-bus) moves from 10-20 s after the first off-bus reading to about 4-5 s when
+  the kernel counted the fault (AER rise or node removal); about 10 s saved on average, up to 15 s.
+  With no kernel signal the regular cadence and its 10-20 s stand. No class gets slower.
 
 ## Interfaces
 
@@ -1335,6 +1355,7 @@ refuses.
 | I55 (the verdict names the dispatch failure, never the downgraded mismatch) | `tests/test_dispatch_failure_reset.py::test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch`, `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I55 (rung gap warned at boot and on /health; floor message honest) | `tests/test_dispatch_failure_reset.py::test_rung_gap_boot_warning_and_health_field`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
 | I56 (a measured fabric failure on a present mesh resets on the first relift; frozen read or no measured failure keeps the grace) | `tests/test_device_safety.py::test_idle_relift_resets_a_measured_fabric_failure_without_the_grace`, `tests/test_device_safety.py::test_idle_relift_keeps_the_grace_without_a_measured_fabric_failure`, `tests/test_post_reset_gate.py::test_the_measured_fabric_failure_reset_on_the_first_relift` (the real reset path: the verify after it runs the fabric pass, release only on a healthy verdict, 04 I32/I32a) |
+| I79 (early off-bus watch: kernel AER/node signal samples sooner; 4 s confirm bound; lift path unchanged) | `tests/test_offbus_early_watch.py` (all: signal source, arming, early confirmation for A and B1, transient-AER and sub-bound blip debounce, housekeeping/relift cadence, no lift) |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
