@@ -23,6 +23,7 @@ from tests.test_ladder_v2 import _ev
 from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
+from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy, pcie_guard
 from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 
@@ -141,10 +142,13 @@ async def test_past_the_grace_and_idle_it_fires_once_with_the_attempt_on_disk_fi
     attempts = fired["state"].get("attempts")
     assert attempts and attempts[0]["episode"] == hold_since, "the attempt is on disk before the command runs"
     assert ("offbus_gated_hold", "firing") in [(k, f.get("phase")) for k, f in rec["events"]]
-    # The same episode a pass later: the attempt counts, so it pages instead of firing again.
-    assert await _pass(hold_since) is None
+    # The same episode a pass later, with an attempt spacing set: the attempt counts, so it pages and
+    # holds to a stated deadline (spec 04 I65) instead of firing again.
+    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", "3600")
+    assert await _pass(hold_since) is False
     assert len(rec["fires"]) == 1
     assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_rate_limited"]
+    assert srv.recovery_mechanism.power_cycle_cooldown_state["until"] == attempts[0]["at_epoch"] + 3600
 
 
 @pytest.mark.asyncio
@@ -427,10 +431,16 @@ def test_the_pages_name_the_host(monkeypatch):
 @pytest.mark.asyncio
 async def test_an_attempt_within_the_interval_pages_instead(monkeypatch, tmp_path, clear_job_state):
     hold_since, rec = _gated(monkeypatch, tmp_path)
-    opc.save_state({"attempts": [{"at_epoch": opc.now_epoch() - 3600, "episode": "earlier"}], "last_error": "boom"})
+    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", "21600")
+    last = opc.now_epoch() - 3600
+    opc.save_state({"attempts": [{"at_epoch": last, "episode": "earlier"}], "last_error": "boom"})
     _ladder_ran(hold_since)
-    assert await _pass(hold_since) is None
-    assert await _pass(hold_since) is None
+    assert await _pass(hold_since) is False
+    assert await _pass(hold_since) is False
+    # The spacing is capped at the I65 backoff cap and stated on /health, retried at its end.
+    until = last + recovery_base.POWER_CYCLE_BACKOFF_CAP_SEC
+    assert srv.recovery_mechanism.power_cycle_cooldown_state["until"] == until
+    assert srv.recovery_mechanism.power_cycle_retry[0] == until
     assert rec["fires"] == []
     assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_rate_limited"]
     assert rec["alerts"][0]["last_error"] == "boom"
@@ -484,7 +494,8 @@ async def test_a_failed_fire_keeps_its_error_for_the_next_page(monkeypatch, tmp_
     assert await _pass(hold_since) is True
     state = opc.load_state()
     assert "BMC unreachable" in state["last_error"] and len(state["attempts"]) == 1
-    assert await _pass(hold_since) is None
+    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", "3600")
+    assert await _pass(hold_since) is False
     assert "BMC unreachable" in rec["alerts"][0]["last_error"]
 
 
@@ -548,11 +559,11 @@ def test_the_hold_watchdog_forces_one_pass_at_the_grace(monkeypatch, clear_job_s
 def test_the_knobs_default_and_reject_nonsense(monkeypatch):
     for name in ("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", "TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC"):
         monkeypatch.delenv(name, raising=False)
-    assert opc.grace_sec() == 300 and opc.min_interval_sec() == 21600
+    assert opc.grace_sec() == 300 and opc.min_interval_sec() == 0
     for bad in ("0", "-5", "soon", ""):
         monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", bad)
         monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", bad)
-        assert opc.grace_sec() == 300 and opc.min_interval_sec() == 21600
+        assert opc.grace_sec() == 300 and opc.min_interval_sec() == 0
     monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", "90")
     assert opc.grace_sec() == 90
     monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "")

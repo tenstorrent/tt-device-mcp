@@ -80,9 +80,11 @@ from tt_device_mcp.device_holders import (
     HolderScan,
     ReclaimResult,
     descends_from,
+    discount_broker_internal,
     enumerate_device_holders,
     evaluate_reset_gate,
     is_tenant,
+    note_broker_internal,
     read_proc_cpu,
     reclaim_foreign_holders,
 )
@@ -152,11 +154,13 @@ from tt_device_mcp.health import (
     read_health_events,
     read_heartbeats,
     refuse_mesh_reset,
+    sysfs_chip_ids,
     version_floor_warnings,
 )
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
@@ -337,6 +341,14 @@ class JobRunInput(JobSubmitInput):
         ge=0,
         le=1000,
         description="Number of output lines to include in the result. Default: 20. Set to 0 to omit output.",
+    )
+    keep_running_on_disconnect: bool = Field(
+        False,
+        description=(
+            "Keep the job running (or queued) if this call is cancelled or the client disconnects. "
+            "Default: false, the job is killed, since nobody is left to read its result. Prefer "
+            "tt_device_job_run_bg for work that should outlive the call."
+        ),
     )
 
 
@@ -849,6 +861,10 @@ FABRIC_RELIFT_WHY = "fabric_unverified"
 # these were placed for, so they never lift on a read; past the ceiling they escalate to the gate's
 # own recovery ladder instead of standing until a broker restart.
 GENERIC_ESCALATE_WHYS = frozenset({"gate_error", "foreign_holder", "startup_unverified"})
+# why values of a DIRTY hold the idle tick hands to the post-job gate when nothing is queued (spec 03
+# I68): a job's kill or its leftover, owed a full check that only a job's gate would otherwise run.
+DIRTY_IDLE_GATE_WHYS = frozenset({"job_killed", "foreign_holder"})
+DIRTY_IDLE_GATE_RECHECK_SEC = 10
 
 # Set when the RUNTIME named a device fault in a job's output. Outranks our own checks,
 # which are blind to this class of fault, and only a reset retires it. Independent of the FSM:
@@ -995,6 +1011,9 @@ device_hold_escalate_bucket: int = 0
 # One early forced escalation per off-bus episode, tracked apart from the ceiling windows so it adds
 # an attempt rather than consuming one (see _offbus_hold_ceiling_sec).
 device_hold_offbus_escalated: bool = False
+# The ceiling window the one-shot found claimed before it claimed its own (it waited out a tenant past
+# the ceiling), so giving the one-shot back gives that window back too; None while it holds no claim.
+device_hold_offbus_prior_bucket: Optional[int] = None
 # Whether the window above was given back because its forced run stood down on a live tenant (spec 04
 # I7): the next spawn first checks the tenant is gone, quietly, so a long tenant hold does not open a
 # device op, a timeline event and a log line every sampler tick (see _rearm_tenant_deferred_window).
@@ -1015,6 +1034,16 @@ _host_action_suppressed_logged: "Optional[tuple[str, float]]" = None
 # kills the running job, the job dies mid-CCL, and that death then reads as evidence the
 # device needs resetting — by the reset that caused it. The set is drained as each is seen.
 reset_killed_job_ids: set = set()
+# Spec 03 I69: running jobs a requested kill stopped (tt_device_job_kill, the REST kill, a job_run
+# whose client went away). The runner reads it when the job ends, then drops the id.
+request_killed_job_ids: set = set()
+# Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset before release. The job
+# and why, and when the debt was taken (monotonic); 0.0 is none. Any reset since settles it.
+_kill_reset_owed: str = ""
+_kill_reset_owed_at: float = 0.0
+# Spec 01 I66: the kills a job_run started as its client went away, kept so none is collected
+# while it runs.
+_client_gone_kills: set = set()
 
 # Everything the health package needs FROM this module: server-state accessors wrapped in
 # lambdas over this module's OWN globals (not bound directly) so a test that monkeypatches e.g.
@@ -1070,6 +1099,7 @@ _recovery_deps = RecoveryDeps(
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
     hold_device_fabric_unverified=lambda why: _hold_device_fabric_unverified(why),
     note_fabric_77_reset_passes=lambda n: _note_fabric_77_reset_passes(n),
+    fabric_77_no_reset_cause=lambda: _fabric_77_no_reset_cause(),
     refresh_idle_hold_ledger=lambda: _refresh_idle_hold_ledger(),
     spawn_idle_relift=lambda: _maybe_spawn_idle_relift(),
     watch_idle_holders=lambda: _maybe_spawn_idle_holder_watch(),
@@ -2235,7 +2265,7 @@ def _reset_for_testing():
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
-    global _topology_hw_fault_paged, _dispatch_reset_spent
+    global _topology_hw_fault_paged, _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
     job_queue = None
     lock = None
@@ -2245,6 +2275,9 @@ def _reset_for_testing():
     device_hold_episode_since = ""
     device_hold_episode_reason = ""
     _dispatch_reset_spent = False
+    _kill_reset_owed = ""
+    _kill_reset_owed_at = 0.0
+    request_killed_job_ids.clear()
     _hold_episode_restorable = True
     _hold_episode_tenant = False
     if recovery_mechanism is not None:
@@ -2680,7 +2713,7 @@ async def _group_gone(pid: int, deadline: float) -> bool:
         await asyncio.sleep(0.25)
 
 
-async def _terminate_process_group(pid: int, grace_sec: float = GRACEFUL_KILL_GRACE_SEC) -> None:
+async def _terminate_process_group(pid: int, grace_sec: float = GRACEFUL_KILL_GRACE_SEC) -> str:
     """Stop a job's process group so it RELEASES THE DEVICE: SIGINT, then SIGTERM,
     then SIGKILL only for a job that is genuinely hung.
 
@@ -2698,15 +2731,18 @@ async def _terminate_process_group(pid: int, grace_sec: float = GRACEFUL_KILL_GR
     Reaching SIGKILL means the job did NOT release the device: log it loudly, because
     the mesh is probably wedged and the clean-device gate will have to reset it.
 
-    ``pid`` is the pgid (jobs are spawned with os.setsid, so pid == pgid)."""
+    ``pid`` is the pgid (jobs are spawned with os.setsid, so pid == pgid). Returns the ladder step
+    that ended the group: "already gone", "SIGINT", "SIGTERM" or "SIGKILL"."""
     loop = asyncio.get_event_loop()
+    step = "already gone"
     for sig, window in ((signal.SIGINT, grace_sec), (signal.SIGTERM, SIGTERM_GRACE_SEC)):
         try:
             os.killpg(pid, sig)
         except (ProcessLookupError, OSError):
-            return  # already gone
+            return step
+        step = sig.name
         if await _group_gone(pid, loop.time() + window):
-            return
+            return step
         if logger:
             logger.info(f"TERMINATE pgid={pid} survived {sig.name} for {window}s; escalating")
     try:
@@ -2717,7 +2753,39 @@ async def _terminate_process_group(pid: int, grace_sec: float = GRACEFUL_KILL_GR
                 f"The mesh is likely wedged; the clean-device gate will need to reset it."
             )
     except (ProcessLookupError, OSError):
-        pass
+        return f"{step} (gone before SIGKILL)"
+    return "SIGKILL"
+
+
+def _pgid_pids(pgid: int) -> list[int]:
+    """The live pids in process group ``pgid``, read from /proc. Best effort, for the log only."""
+    out = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if len(fields) > 2 and fields[0] != "Z" and fields[2] == str(pgid):
+            out.append(int(name))
+    return sorted(out)
+
+
+def _log_job_tree_killed(job_id: str, reason: str, how) -> None:
+    """One INFO line in server.log for every job process tree the broker kills (spec 03 I69): the
+    job, why, what was stopped and the ladder step that ended it. ``how`` is _terminate_job's
+    return; a stand-in that returns nothing logs as unknown."""
+    if logger:
+        logger.info(
+            f"JOB_RUNNER job_id={job_id} KILLED process tree: reason={reason}; "
+            f"{how if isinstance(how, str) and how else 'stopped (ladder step unknown)'}"
+        )
 
 
 def _is_wedge_risk_exit(status: "JobStatus", exit_code: Optional[int]) -> bool:
@@ -3071,7 +3139,7 @@ async def _reset_recheck_in_op(force: bool, log) -> Optional[dict]:
     if pid_to_stop:
         _note_reset_killed_job()
         if job_id_to_stop:
-            await _terminate_job(job_id_to_stop, pid_to_stop)
+            _log_job_tree_killed(job_id_to_stop, "device reset", await _terminate_job(job_id_to_stop, pid_to_stop))
         else:
             await _terminate_process_group(pid_to_stop)
         async with get_lock():
@@ -3147,6 +3215,9 @@ def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> b
         # Only proof retires it, whatever the device was flagged for — dirty or held.
         fsm.on_readings(_healthy_reading())
         _forget_stale_hold_episode()  # e.g. the startup gate: a clock left by a dead broker is over
+        # A passing full check (fabric included, the debt above) after a power cycle ends its
+        # backoff streak and any cooldown retry (spec 04 I65).
+        recovery_mechanism.note_mesh_verified()
     elif was_degraded:
         # Not proven fit, and nothing here names a new fault class — keep the open episode's own
         # why, just reword the detail and drop the dirty bit: dropping the flag ends the RESETTING
@@ -3551,12 +3622,32 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
     """What happens next to a hold, stated only as far as it is armed (spec 03 I55): a message that
     promises an escalation the host switched off sends the operator to wait for nothing."""
     if _force_escalate_enabled():
+        ceiling_min = max(1, round(_stuck_hold_ceiling_sec() / 60))
+        cooldown = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
+        if cooldown is not None and time.time() < cooldown["until"]:
+            # Spec 04 I65: the power cycle this hold needs was refused for a bounded wait; the
+            # watchdog asks again at its end, so that, not the ceiling, is the next step.
+            until = datetime.fromtimestamp(cooldown["until"]).strftime("%H:%M:%S")
+            return (
+                f"Its power cycle waits for the cooldown ({cooldown['cause']}) and is asked again at "
+                f"{until} — /health power_cycle_cooldown.next_deadline."
+            )
+        if off_bus > 0 and isolated_chips:
+            first = max(1, round(_offbus_hold_ceiling_sec() / 60))
+            return (
+                f"The off-bus ladder escalates in ~{first} min (isolated chips) and again at each "
+                f"{ceiling_min}-min hold ceiling — do not plan around waiting the wedge out."
+            )
         if off_bus > 0:
             return (
-                "The off-bus ladder escalates in ~2 min and no hold outlives the 10-min ceiling — do "
-                "not plan around waiting the wedge out."
+                f"A whole-tray drop goes to the power cycle at once (spec 04 I37); any other off-bus "
+                f"hold climbs at the {ceiling_min}-min hold ceiling — do not plan around waiting the "
+                f"wedge out."
             )
-        return "The ladder escalates at the 10-min hold ceiling — do not plan around waiting the wedge out."
+        return (
+            f"The ladder escalates at the {ceiling_min}-min hold ceiling — do not plan around waiting "
+            f"the wedge out."
+        )
     if _selfheal_relift_enabled():
         return (
             "Forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0): only the idle self-heal relift "
@@ -3817,6 +3908,32 @@ def _eth_timeout_reset_shape(evidence: dict) -> bool:
         and (evidence.get("snapshot") or {}).get("ok") is True
         and "fabric" not in evidence
     )
+
+
+def _owe_kill_reset(why: str) -> None:
+    """Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, then the full check."""
+    global _kill_reset_owed, _kill_reset_owed_at
+    _kill_reset_owed = why
+    _kill_reset_owed_at = time.monotonic()
+    if logger:
+        logger.info(f"CLEAN-GATE {why}: the mesh owes one reset, then the full check, before release")
+    health_event("kill_reset_owed", why=why)
+
+
+def _clear_kill_reset_debt() -> None:
+    global _kill_reset_owed, _kill_reset_owed_at
+    _kill_reset_owed = ""
+    _kill_reset_owed_at = 0.0
+
+
+def _kill_reset_debt() -> str:
+    """The open spec 03 I69 debt's reason, or "". Any reset since the debt was taken settles it."""
+    if not _kill_reset_owed:
+        return ""
+    if recovery_mechanism is not None and recovery_mechanism.last_reset_monotonic > _kill_reset_owed_at:
+        _clear_kill_reset_debt()
+        return ""
+    return _kill_reset_owed
 
 
 def _validator_line_names_topology(output: str) -> bool:
@@ -4483,19 +4600,23 @@ async def _foreign_holder_fast_verify(expected: int, log: Callable[[str], None])
     return True
 
 
-def _eth_rearm_idle() -> bool:
-    """Whether the device is idle enough for the eth self-test's one read: HEALTHY, no tenant job
-    queued, running or re-adopted, no finished job still owed its post-job gate, and no external
-    step reservation. Device ops are checked by the caller (the retry takes the device-op lock
-    itself)."""
+def _queue_idle() -> bool:
+    """No tenant job queued, running or re-adopted, no finished job still owed its post-job gate,
+    and no external step reservation. Device ops are the caller's to check."""
     return (
-        fsm.state is ServerState.HEALTHY
-        and current_process is None
+        current_process is None
         and not post_job_gate_pending
         and not readopted_scopes
         and get_external_step_free_event().is_set()
         and not any(j.status in (JobStatus.QUEUED, JobStatus.RUNNING) for j in jobs.values())
     )
+
+
+def _eth_rearm_idle() -> bool:
+    """Whether the device is idle enough for the eth self-test's one read: HEALTHY and the queue
+    idle (see _queue_idle). Device ops are checked by the caller (the retry takes the device-op
+    lock itself)."""
+    return fsm.state is ServerState.HEALTHY and _queue_idle()
 
 
 async def _attempt_eth_rearm() -> None:
@@ -4530,6 +4651,61 @@ def _maybe_spawn_eth_rearm() -> None:
     _eth_rearm_task = asyncio.create_task(_attempt_eth_rearm())
 
 
+# The dirty idle gate (spec 03 I68): the last time it ran its checks, and the hold episode (its
+# ``since``) it already gave its one gate.
+_dirty_idle_gate_monotonic: float = 0.0
+_dirty_idle_gate_spent_since: Optional[str] = None
+
+
+def _dirty_idle_gate_armed() -> bool:
+    """A dirty job_killed/foreign_holder hold on an idle device that has not had its idle gate yet:
+    RECOVERING, nothing queued or owed (see _queue_idle), no device op, no chip off the bus."""
+    rec = fsm.record
+    return (
+        fsm.state is ServerState.RECOVERING
+        and rec.dirty
+        and rec.why in DIRTY_IDLE_GATE_WHYS
+        and rec.since != _dirty_idle_gate_spent_since
+        and not device_op_active
+        and _queue_idle()
+        and not _device_liveness_reason()
+    )
+
+
+async def _attempt_dirty_idle_gate() -> None:
+    """Run the post-job gate, fabric forced, on a dirty hold left with nothing queued (spec 03 I68).
+
+    Once per hold episode: a pass lifts it, a failure takes the gate's own ladder and the hold stays
+    with the bounded escalation (I23). Skipped while a reset scope cycles, a tenant or a reaped
+    job's leftover holds the device, or the episode changed. Never raises."""
+    global _dirty_idle_gate_monotonic, _dirty_idle_gate_spent_since
+    now = time.monotonic()
+    if _dirty_idle_gate_monotonic and (now - _dirty_idle_gate_monotonic) < DIRTY_IDLE_GATE_RECHECK_SEC:
+        return
+    _dirty_idle_gate_monotonic = now
+    try:
+        if await asyncio.to_thread(recovery_mechanism.scope_active):
+            return
+        scan = await asyncio.to_thread(enumerate_device_holders)
+        if galaxy_recovery._tenant_active(scan) or await asyncio.to_thread(_reaped_leftover_reason, scan):
+            return
+        if not _dirty_idle_gate_armed():
+            return
+        rec = fsm.record
+        _dirty_idle_gate_spent_since = rec.since
+        if logger:
+            logger.info(
+                f"IDLE-GATE dirty {rec.why} hold with nothing queued — running the post-job gate, fabric forced"
+            )
+        health_event("dirty_idle_gate", why=rec.why, since=rec.since)
+        # Not under _device_op: the gate takes it itself, and the lock is not reentrant.
+        await _device_health_gate(None, phase="post-job", run_fabric=True, force_fabric=True)
+    except Exception as e:  # noqa: BLE001 - a detached task must never raise unretrieved
+        _mark_device_dirty(f"idle post-job gate error: {e}", why="gate_error")
+        if logger:
+            logger.error(f"IDLE-GATE post-job gate error: {e}")
+
+
 def _maybe_spawn_idle_relift() -> None:
     """Start one idle relift as its own task when a re-verifiable hold is up and none is in flight.
     Detached from the sampler by design (see _relift_task): awaiting a possibly-60s eth read or a
@@ -4544,6 +4720,9 @@ def _maybe_spawn_idle_relift() -> None:
     if _down_offbus_recheck_armed():
         if not device_op_active:
             _relift_task = asyncio.create_task(_attempt_down_offbus_recheck())
+        return
+    if _dirty_idle_gate_armed():
+        _relift_task = asyncio.create_task(_attempt_dirty_idle_gate())
         return
     selfheal, fabric, generic = _idle_relift_armed()
     if not ((selfheal or fabric or generic) and not device_op_active):
@@ -4689,6 +4868,10 @@ async def _kill_device_holders(reason: str) -> list:
         return killed
     for h in scan.holders:
         try:
+            if not is_tenant(h):
+                # Infrastructure we kill here can sit mid-exit for seconds, named by the driver with
+                # its fd table gone; the next scan must not read it as a tenant (spec 04 I59).
+                note_broker_internal(h.pid)
             os.kill(h.pid, signal.SIGKILL)
             killed.append({"pid": h.pid, "user": h.username})
         except ProcessLookupError:
@@ -5447,6 +5630,23 @@ async def device_health_gate(
         # where it costs nobody: post-job, at startup, and inside the recovery ladder, all of which
         # pass force_fabric or run with the device idle.
         prejob = phase == "pre-job"
+        # Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, paid here with no
+        # pre-reset fabric pass or eth read: the full check after the reset runs both. A spent latch,
+        # the outage hold or a cooldown clears the debt and keeps today's path (the dirty exit's pass).
+        kill_debt = _kill_reset_debt() if with_recover and phase == "post-job" else ""
+        if kill_debt:
+            refused = (
+                "this hold episode's present-mesh reset is spent"
+                if _dispatch_reset_spent
+                else mesh_reset_hold_reason()
+                or ("a failed reset's cooldown is running" if recovery_mechanism.cooling() else "")
+            )
+            if refused:
+                _log(f"{kill_debt}: no reset before release ({refused}); the full check decides")
+                health_event("kill_reset_skipped", phase=phase, why=kill_debt[:200], refused=str(refused)[:200])
+                _clear_kill_reset_debt()
+                kill_debt = ""
+        kill_reset = bool(kill_debt)
         # with_recover=False never pays for the traffic pass: it is the one thing in this
         # function that costs real time, and a read-only pass has no rung to spend it on.
         # A reset with no passing fabric pass since (04 I32) runs the pass here too, so the gate
@@ -5454,6 +5654,7 @@ async def device_health_gate(
         full = (
             with_recover
             and (not prejob)
+            and not kill_reset
             and (dirty or force_fabric or (run_fabric and stale) or bool(_post_reset_debt()))
         )
         # A clean post-job exit still gets the passive eth read when the rung is armed (I30): chips
@@ -5464,7 +5665,9 @@ async def device_health_gate(
         # operator re-baselines, and an unlimited pass on it charges every clean job. A clean Slurm
         # post-step is the same exit seen from outside the broker, and its worst case (the read, then
         # the bounded pass) is what a failed step already pays inside the same step deadline.
-        run_eth = with_recover and phase in ("post-job", "post-step") and not full and eth_check_armed
+        run_eth = (
+            with_recover and phase in ("post-job", "post-step") and not full and not kill_reset and eth_check_armed
+        )
         # Spec 03 I61: on a clean post-job exit this episode's one present-mesh reset is still
         # grantable, so a timed-out eth read may skip the pre-reset fabric pass and reset instead.
         # Each guard here is one a reset would otherwise trip on; any that fails keeps today's pass.
@@ -5508,6 +5711,19 @@ async def device_health_gate(
                 f"and ARC healthy ({eth_reason}) — one present-mesh reset, then the full check"
             )
             health_event("eth_timeout_mesh_reset", phase=phase, expected=expected, eth=eth_reason[:200])
+        # Spec 03 I69: the gate has taken the debt. With every chip present and ARC healthy it is paid
+        # by the present-mesh reset below; anything else is another fault, whose own rung (and the
+        # full check that rung's verify runs) decides. Either way it is not owed twice.
+        kill_reset_due = kill_reset and healthy
+        if kill_reset:
+            _clear_kill_reset_debt()
+        if kill_reset_due:
+            healthy = False
+            _log(
+                f"{kill_debt}: all {expected} chip(s) present and ARC healthy, but a kill mid-run can "
+                f"leave the mesh wedged — one reset, then the full check, before release"
+            )
+            health_event("kill_mesh_reset", phase=phase, expected=expected, why=kill_debt[:200])
         if relax_exit1 and healthy and fabric_ok is None:
             # Worded so nothing reads it as a fabric verdict: no pass ran, so it is neither an OK nor
             # an exit-77 skip.
@@ -5543,7 +5759,11 @@ async def device_health_gate(
         if not healthy or dirty:
             bundle = await asyncio.to_thread(
                 capture_incident,
-                "eth_timeout" if eth_timeout_due else "unhealthy" if not healthy else "dirty",
+                (
+                    "eth_timeout"
+                    if eth_timeout_due
+                    else "job_killed" if kill_reset_due else "unhealthy" if not healthy else "dirty"
+                ),
                 job=dirty_job,
                 job_log=job_log_file,
                 trace=list(sampler.ring),
@@ -5786,9 +6006,11 @@ async def device_health_gate(
             )
             return
 
-        reasons = ["failed health check"] if not healthy and not eth_timeout_due else []
+        reasons = ["failed health check"] if not healthy and not eth_timeout_due and not kill_reset_due else []
         if eth_timeout_due:
             reasons.append("eth-heartbeat read timed out after a clean exit")
+        if kill_reset_due:
+            reasons.append(f"{kill_debt}: reset before release")
         if device_fault_reported:
             # Say what actually brought us here. Every check passed; the runtime disagreed.
             reasons.append(f"runtime reported: {device_fault_reported}")
@@ -5861,6 +6083,9 @@ async def device_health_gate(
         # Spec 03 I61: the same one reset, shared latch, for a clean exit's timed-out eth read.
         if eth_timeout_due and not _dispatch_reset_spent and not mesh_reset_hold_reason():
             ev = replace(ev, eth_timeout_reset_due=True)
+        # Spec 03 I69: the same one reset, shared latch, for a job the broker stopped mid-run.
+        if kill_reset_due and not _dispatch_reset_spent and not mesh_reset_hold_reason():
+            ev = replace(ev, kill_reset_due=True)
         stage = galaxy_recovery.next_stage(ev)
 
         async def _fire(rung: str) -> bool:
@@ -6035,7 +6260,7 @@ async def device_health_gate(
             # The latch is spent only once a reset actually started (the clock moves at reset begin):
             # one the per-host gate or the outage hold refused leaves the episode's reset unspent.
             if (
-                (ev.dispatch_reset_due or ev.eth_timeout_reset_due)
+                (ev.dispatch_reset_due or ev.eth_timeout_reset_due or ev.kill_reset_due)
                 and stage == STAGE_SMI_RESET
                 and recovery_mechanism.last_reset_monotonic != reset_clock
             ):
@@ -6116,7 +6341,8 @@ async def device_health_gate(
             metrics.stage_fired("power_cycle", "blocked")
         elif stage in (STAGE_HOST_REBOOT, STAGE_POWER_CYCLE):
             action = _HOST_ESCALATION_ACTION[stage]
-            scan2 = await asyncio.to_thread(enumerate_device_holders)
+            # The broker's own probes and the holders it killed for a dead chip are not tenants (I59).
+            scan2 = discount_broker_internal(await asyncio.to_thread(enumerate_device_holders))
             # A scan that could not read every holder (no CAP_DAC_READ_SEARCH on a tenant's
             # /proc) must count as "a tenant is here": the highest-risk action does not get to
             # take the box down over a tenant it merely could not see.
@@ -6232,6 +6458,14 @@ def _slurm_step_verdict(*, require_free: bool) -> dict:
     }
 
 
+def _startup_pci_map() -> dict:
+    """``{chip index: PCI address}`` for every chip with a sysfs class node. Built from the
+    enumeration, not from heartbeat reads: a chip whose heartbeat cannot be read (e.g. after a
+    failed reset) still has a node and an address, and it is exactly the chip a bridge reset may
+    need to reach."""
+    return {i: chip_pci_bdf(i) for i in sysfs_chip_ids()}
+
+
 def _device_liveness_reason() -> str:
     """A chip off the PCIe bus RIGHT NOW, read live from one root-free sysfs sample — ''
     if none. Catches the two degraded states no in-memory flag records: a chip gone to
@@ -6246,6 +6480,9 @@ def _device_liveness_reason() -> str:
         return ""  # detector absent on this host — the in-memory signals still stand
     beats = read_heartbeats()
     if not beats:
+        listed = sysfs_chip_ids()
+        if listed:
+            return f"{len(listed)} chip(s) in sysfs, heartbeat unreadable on {len(listed)}"
         return "no chips exposed in sysfs (driver wedged or all chips off the bus)"
     dead = dead_chips(beats)
     if dead:
@@ -6362,8 +6599,22 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         # Keyed on the hold EPISODE (survives a broker restart), the clock the hand-off was armed on.
         episode = device_hold_episode_since or since
         handoff = offbus_power_cycle.hold_handoff_status(episode, now.timestamp() if now else None)
+        if handoff is None and galaxy_recovery is not None:
+            handoff = galaxy_recovery.fabric_77_handoff_status(episode)  # spec 04 I29: a 77 past its host rung
         if handoff is not None:
             payload["operator_handoff"] = handoff  # spec 04 I33: who must act on the hold, and by when
+        # Spec 04 I65: a power cycle the cooldown holds off, and the moment it is asked again.
+        cooldown = recovery_mechanism.power_cycle_cooldown_state
+        now_epoch = now.timestamp() if now else time.time()
+        if cooldown is not None and now_epoch < cooldown["until"]:
+            payload["power_cycle_cooldown"] = {
+                "escalation_stage": "power-cycle",
+                "next_deadline": datetime.fromtimestamp(cooldown["until"]).isoformat(timespec="seconds"),
+                "last_cycle_or_boot": datetime.fromtimestamp(cooldown["last"]).isoformat(timespec="seconds"),
+                "cause": cooldown["cause"],
+                "interval_sec": cooldown["interval_sec"],
+                "why": cooldown["why"],
+            }
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
     return payload
@@ -6380,7 +6631,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global device_hold_deadline_bucket, device_hold_escalate_bucket
     global device_hold_offbus_escalated, device_hold_alert_next_bucket, device_hold_alert_gap
-    global device_hold_tenant_deferred
+    global device_hold_tenant_deferred, device_hold_offbus_prior_bucket
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
     global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold
     if reason and not device_hold_logged:
@@ -6474,6 +6725,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_escalate_bucket = 0
         # ...and its own early off-bus attempt.
         device_hold_offbus_escalated = False
+        device_hold_offbus_prior_bucket = None
         device_hold_tenant_deferred = False
         # ...and its held-job bound's attempt.
         device_hold_job_bound_escalated = False
@@ -6594,8 +6846,14 @@ def _rearm_tenant_deferred_window(kind: str) -> bool:
     waiting out the whole general ceiling once the tenant had gone. Only the one-shot and the ceiling
     windows are given back; the other kinds keep their own once-per-episode bookkeeping."""
     global device_hold_offbus_escalated, device_hold_escalate_bucket, device_hold_tenant_deferred
+    global device_hold_offbus_prior_bucket
     if kind == "offbus_one_shot":
         device_hold_offbus_escalated = False
+        # The window the one-shot claimed as its own run goes back with it: kept, a hold whose chips
+        # came back meanwhile (no one-shot to retry) waited out one more whole ceiling window.
+        if device_hold_offbus_prior_bucket is not None:
+            device_hold_escalate_bucket = device_hold_offbus_prior_bucket
+            device_hold_offbus_prior_bucket = None
     elif kind == "ceiling_window":
         device_hold_escalate_bucket = max(0, device_hold_escalate_bucket - 1)
     else:
@@ -6727,6 +6985,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     use; a missing or unparseable stamp is not held, so it is not flagged."""
     global device_hold_deadline_bucket, device_hold_escalate_bucket, device_hold_offbus_escalated
     global device_hold_risky_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
+    global device_hold_offbus_prior_bucket
     if not device_hold_episode_since:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
@@ -6778,11 +7037,14 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             device_hold_escalation_trigger = f"the {offbus_power_cycle.grace_sec()}s gated off-bus grace"
         if _maybe_spawn_forced_escalation():
             offbus_power_cycle.mark_spawned(device_hold_episode_since)
-    # A power cycle its min interval alone refused gets one forced pass as the interval ends, not at the
-    # next ceiling window, which can be most of a window late.
+    # Spec 04 I65: a power cycle the cooldown (or the per-boot cap or the backstop) denied is asked
+    # again the moment that wait ends, not at the next ceiling window, which can be most of a window
+    # late. Once per denial and only in the hold episode it was denied in: the retry is cleared when
+    # the climb starts (a declined spawn keeps it), and the governor sets it again if that ask is
+    # denied too.
     if not only_77 and recovery_mechanism.power_cycle_retry_due(now.timestamp() if now else None):
-        device_hold_escalation_kind = "power_cycle_interval_expiry"
-        device_hold_escalation_trigger = "the end of the power cycle's min interval"
+        device_hold_escalation_kind = "power_cycle_cooldown"
+        device_hold_escalation_trigger = "the end of the power-cycle cooldown"
         if _maybe_spawn_forced_escalation():
             recovery_mechanism.clear_power_cycle_retry()
     if only_77:
@@ -6793,8 +7055,15 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         if _maybe_spawn_forced_escalation():
             device_hold_offbus_escalated = True
             # A one-shot that waited out a tenant past the ceiling is that window's run as well: one
-            # forced climb, not two back to back.
+            # forced climb, not two back to back. Remember what it claimed over, to give back with it.
+            device_hold_offbus_prior_bucket = device_hold_escalate_bucket
             device_hold_escalate_bucket = max(device_hold_escalate_bucket, int(age // ceiling))
+    elif recovery_mechanism is not None and recovery_mechanism.progress_retry_due(device_hold_episode_since):
+        # spec 04 I39: a failed mesh reset brought chips back; its one retry runs now, not at the ceiling.
+        device_hold_escalation_kind = "progress_retry"
+        device_hold_escalation_trigger = "the retry after a failed reset that brought chips back"
+        if _maybe_spawn_forced_escalation():
+            recovery_mechanism.spend_progress_retry()
     else:
         # The old risky-reset floor window (a separate forced run partway to the ceiling) is gone
         # (ladder-v2): the below-floor mesh reset no longer waits, so the general ceiling window is
@@ -6943,7 +7212,8 @@ async def _preempt_job(job_id: str, pid: Optional[int]) -> None:
     scope's `systemctl stop` can wait longer than the window)."""
     sigint_window = max(1.0, PREEMPT_GRACE_SEC - SIGTERM_GRACE_SEC)
     try:
-        await asyncio.wait_for(_terminate_job(job_id, pid, grace_sec=sigint_window), timeout=PREEMPT_GRACE_SEC)
+        how = await asyncio.wait_for(_terminate_job(job_id, pid, grace_sec=sigint_window), timeout=PREEMPT_GRACE_SEC)
+        _log_job_tree_killed(job_id, "preempted (a job waited past its soft limit)", how)
         return
     except asyncio.TimeoutError:
         pass
@@ -7320,6 +7590,67 @@ async def _refuse_job_privsep_identity(job: "Job", job_log_file: Optional[Path],
         except OSError as e:
             if logger:
                 logger.error(f"could not write privsep refusal footer for job {job.id}: {e}")
+
+
+# The output dir preflight stats a handful of paths; this only bounds a hung network mount.
+JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC = 2.0
+
+
+async def _job_output_dir_problems(job: "Job") -> list[str]:
+    """Why the job's user could not write its tt-metal output dirs (spec 01 I68); empty when
+    fine. Checked for the uid the job will run as: its submitter under privsep, else the broker.
+    Filesystem reads only, bounded by JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC; a check that errors or
+    runs out of time lets the job through (it never refuses on a guess) and never raises."""
+    scoped = privsep_prefix_for(job.peer_uid) is not None
+    uid = job.peer_uid if scoped else os.geteuid()
+    # A job scoped to another uid gets only its env_vars; a direct one inherits the broker's too.
+    inherited = None if scoped else dict(os.environ)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(preflight_output_dirs, job.workspace, job.env_vars or {}, inherited, uid),
+            timeout=JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        if logger:
+            logger.warning(f"JOB_RUNNER job_id={job.id} output dir preflight skipped: {e!r}")
+        return []
+
+
+async def _refuse_job_output_dirs(job: "Job", job_log_file: Optional[Path], problems: list[str]) -> None:
+    """End a job FAILED at the door because its tt-metal output dirs are not writable by its
+    user. The device is untouched: the next job is admitted through the normal gate. Never
+    raises — a bug here must not wedge the runner."""
+    reason = "; ".join(problems)
+    if logger:
+        logger.warning(f"JOB_RUNNER refusing job_id={job.id}: tt-metal output dir not writable: {reason}")
+    try:
+        async with get_lock():
+            job.status = JobStatus.FAILED
+            job.finished_at = datetime.now().isoformat()
+            job.error = f"job setup: tt-metal output dir not writable by the job's user: {reason}"
+            if stats:
+                stats.record_job_completion(job.status, job.wait_sec, job.runtime_sec)
+        _forget_queued_job(job.id)  # refused is terminal: a restart must not revive it
+        if job_log_file:
+            with open(job_log_file, "a") as f:
+                f.write(
+                    f"\n[REFUSED at {job.finished_at}] job setup: tt-metal output dir not writable "
+                    f"by the job's user:\n"
+                    + "".join(f"  {p}\n" for p in problems)
+                    + "The broker did not dispatch this job; the device was not touched. tt-metal "
+                    "writes under <TT_METAL_LOGS_PATH or the job's working dir>/generated/. Give "
+                    "those dirs back to the job's user (an earlier run as root often leaves them "
+                    "root-owned), move them aside, or set TT_METAL_LOGS_PATH to a writable dir in the job's "
+                    "env file.\n"
+                )
+            write_job_log_footer(job_log_file, job)
+    except Exception as e:
+        if logger:
+            logger.error(f"JOB_RUNNER output dir refusal error for job_id={job.id}: {e}")
+        job.status = JobStatus.FAILED
+        job.finished_at = job.finished_at or datetime.now().isoformat()
+        job.error = job.error or f"job setup: tt-metal output dir not writable by the job's user: {reason}"
+        _forget_queued_job(job.id)
 
 
 def _tenant_hold_enabled() -> bool:
@@ -8383,7 +8714,7 @@ def _scope_active(scope: str) -> bool:
         return False
 
 
-async def _terminate_job(job_id: str, pid: Optional[int], grace_sec: float = GRACEFUL_KILL_GRACE_SEC) -> None:
+async def _terminate_job(job_id: str, pid: Optional[int], grace_sec: float = GRACEFUL_KILL_GRACE_SEC) -> str:
     """Gracefully terminate a RUNNING job (hung / timed-out) so it RELEASES THE DEVICE.
 
     A privsep job runs in its own systemd --scope, and killpg on the broker-captured pid does
@@ -8394,12 +8725,18 @@ async def _terminate_job(job_id: str, pid: Optional[int], grace_sec: float = GRA
     Signal the SCOPE instead so systemd hits the whole cgroup; a non-privsep job has no scope, so
     fall back to the process group. Both terminators lead with SIGINT -- the only signal a ttnn job
     unwinds on to close the mesh (see _terminate_process_group / _terminate_scope).
+
+    Returns what it stopped and the ladder step that ended it, for _log_job_tree_killed.
     """
     scope = job_scope_unit(job_id)
     if await asyncio.to_thread(_scope_active, scope):
-        await _terminate_scope(scope, grace_sec=grace_sec)
-    elif pid:
-        await _terminate_process_group(pid, grace_sec=grace_sec)
+        reaped = await _terminate_scope(scope, grace_sec=grace_sec)
+        return f"stopped unit {scope}; ladder ended at " + ("systemctl stop (survived SIGINT)" if reaped else "SIGINT")
+    if pid:
+        members = await asyncio.to_thread(_pgid_pids, pid)
+        step = await _terminate_process_group(pid, grace_sec=grace_sec)
+        return f"stopped pgid {pid} pids {members or [pid]}; ladder ended at {step}"
+    return "nothing to stop (no live scope or pid)"
 
 
 def _readopted_deadline(job: "Job") -> float:
@@ -8594,7 +8931,13 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                         f"JOB_RUNNER job_id={job_id} TIMEOUT after {job0.timeout_sec}s "
                         f"(re-adopted across a broker restart); stopping scope {scope}"
                     )
-                await _terminate_scope(scope)
+                reaped = await _terminate_scope(scope)
+                _log_job_tree_killed(
+                    job_id,
+                    f"timeout after {job0.timeout_sec}s (re-adopted)",
+                    f"stopped unit {scope}; ladder ended at "
+                    + ("systemctl stop (survived SIGINT)" if reaped else "SIGINT"),
+                )
                 break
             await asyncio.sleep(_SCOPE_POLL_SEC)
         scope_ended = True
@@ -8605,6 +8948,9 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
             await asyncio.gather(follow, return_exceptions=True)
         if scope_ended:
             remove_job_spool(job_id)
+        # A kill requested while re-adopted is this job's last use of the set: never leave it behind.
+        request_killed = job_id in request_killed_job_ids
+        request_killed_job_ids.discard(job_id)
         job = jobs.get(job_id)
         if job is not None:
             rc = await asyncio.to_thread(read_job_exit_code, job_id)
@@ -8664,6 +9010,11 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                     + (f" (exit {job.exit_code})" if job.exit_code is not None else ""),
                     job=job,
                 )
+            # Spec 03 I69: a re-adopted job the broker stopped (its timeout, or a requested kill) owes
+            # the same one reset + full check as one the runner stopped. This path has no post-job
+            # gate: the I68 idle gate pays it on an idle queue, the runner's door before a waiting job.
+            if not fault and not reset_killed and (timed_out or request_killed):
+                _owe_kill_reset(f"re-adopted job {job_id} {job.status.value}")
             if job.log_file:
                 try:
                     write_job_log_footer(Path(job.log_file), job)
@@ -9024,6 +9375,21 @@ async def _job_runner_loop():
 
         # Use existing log file (created at queue time)
         job_log_file = Path(job.log_file) if job.log_file else None
+
+        # Spec 03 I69: a kill-reset still owed here (a re-adopted job the broker stopped, which had
+        # no post-job gate of its own) is paid before this job's door, by the same post-job gate:
+        # one reset, then the full check, fabric included. The pre-job gate runs no fabric pass.
+        if _kill_reset_debt():
+            await _verify_device_after_job(job_log_file, job_failed=True)
+
+        # Fail fast on tt-metal output dirs the job's user cannot write (spec 01 I68), before any
+        # cooldown, gate or hold: such a job dies at device open whatever the device's state.
+        output_dir_problems = await _job_output_dir_problems(job)
+        if output_dir_problems:
+            await _refuse_job_output_dirs(job, job_log_file, output_dir_problems)
+            await cleanup_finished_jobs()
+            get_job_queue().task_done()
+            continue
 
         # Let the mesh rest between consecutive jobs. Back-to-back saturating runs with no gap
         # is what pushed a marginal tray off the bus; this is the only idle the silicon is
@@ -9421,7 +9787,11 @@ export {JOB_TAG_ENV}={job_tag}
                                 f"(grace {DOOMED_GRACE_SEC}s) -> terminating"
                             )
                         reaping = True
-                        await _terminate_job(job_id, job.pid)
+                        _log_job_tree_killed(
+                            job_id,
+                            "doomed (runtime declared the device unrecoverable)",
+                            await _terminate_job(job_id, job.pid),
+                        )
                         return
 
                     if HUNG_NOTICE_SEC > 0 and silent - announced >= HUNG_NOTICE_SEC:
@@ -9447,7 +9817,9 @@ export {JOB_TAG_ENV}={job_tag}
                         # Kill the whole scope for a privsep job — killpg on the wrapper pid leaves the
                         # scoped payload running and wedges the eth. See _terminate_job.
                         reaping = True
-                        await _terminate_job(job_id, job.pid)
+                        _log_job_tree_killed(
+                            job_id, f"hung (no output for {int(silent)}s)", await _terminate_job(job_id, job.pid)
+                        )
                         return
 
                     await asyncio.sleep(HUNG_POLL_SEC)
@@ -9564,7 +9936,7 @@ export {JOB_TAG_ENV}={job_tag}
                 # The hung reaper is already running the ladder.
                 await asyncio.gather(watchdog, return_exceptions=True)
             else:
-                await _terminate_job(job_id, job.pid)
+                _log_job_tree_killed(job_id, f"timeout after {job.timeout_sec}s", await _terminate_job(job_id, job.pid))
 
             async with get_lock():
                 job.status = JobStatus.TIMEOUT
@@ -9589,7 +9961,7 @@ export {JOB_TAG_ENV}={job_tag}
             # chips stay at the busy clock until something opens and closes them again.
             if job.pid:
                 try:
-                    await _terminate_job(job_id, job.pid)
+                    _log_job_tree_killed(job_id, f"runner error ({e})", await _terminate_job(job_id, job.pid))
                 except asyncio.CancelledError:
                     # Shutdown mid-ladder: leave whatever is left for the next broker to re-adopt.
                     cancelled = True
@@ -9708,6 +10080,8 @@ export {JOB_TAG_ENV}={job_tag}
                 # Jobs that keep dying on the fabric's routing after passes that could not run are a
                 # known fabric fault: held, never the dirty-flag reset that only ends in another 77 (03 I46).
                 known = None
+                topo = None
+                killed_by_reset = job_id in reset_killed_job_ids
                 if health_monitor is not None:
                     tail = _read_job_log_tail(job_log_file)
                     topo = health_monitor.note_job_after_topology_lift(job.status != JobStatus.COMPLETED, tail)
@@ -9754,6 +10128,19 @@ export {JOB_TAG_ENV}={job_tag}
                         + (f" (exit {job.exit_code})" if job.exit_code is not None else ""),
                         job=job,
                     )
+                # Spec 03 I69: a job the broker stopped mid-run (its timeout, the hung/doomed reaper,
+                # or a requested kill) can leave the mesh wedged in a way the passive checks pass and the next job's
+                # dispatch hangs on. The next post-job gate pays one reset, then the full check.
+                # Not a job our own reset killed, nor one that named a known fabric/topology fault:
+                # those already have their own path.
+                if (
+                    not killed_by_reset
+                    and not known
+                    and not topo
+                    and (job.status in (JobStatus.TIMEOUT, JobStatus.HUNG) or job_id in request_killed_job_ids)
+                ):
+                    _owe_kill_reset(f"job {job_id} {job.status.value}")
+                request_killed_job_ids.discard(job_id)
                 # Last, so its detail is the one the hold shows: the next job waits until this
                 # process is gone and the device verifies, and the operator learns which job
                 # left it and that no signal will move it.
@@ -10106,7 +10493,14 @@ async def _record_startup_health() -> None:
             expected = health_monitor.expected(len(beats))
             verdict, detail, _ev = await asyncio.to_thread(heartbeat_verdict, expected)
             ok = verdict is Verdict.HEALTHY
-            health_event("startup_health", healthy=ok, present=len(beats), expected=expected, detail=detail)
+            health_event(
+                "startup_health",
+                healthy=ok,
+                present=len(beats),
+                in_sysfs=len(await asyncio.to_thread(sysfs_chip_ids)),
+                expected=expected,
+                detail=detail,
+            )
             write_action_log(
                 "[broker]startup",
                 f"device on broker start: {detail}",
@@ -10864,7 +11258,7 @@ def create_mcp_server() -> MCPServer:
             # Scope-route a privsep job: killpg on the broker-held pid hits the wrapper,
             # not the payload, and would reset over a job still holding the mesh.
             if job_id_to_stop:
-                await _terminate_job(job_id_to_stop, pid_to_stop)
+                _log_job_tree_killed(job_id_to_stop, "device reset", await _terminate_job(job_id_to_stop, pid_to_stop))
             else:
                 await _terminate_process_group(pid_to_stop)
         elif scope_to_stop:
@@ -11167,6 +11561,8 @@ def create_mcp_server() -> MCPServer:
                 job.status = JobStatus.KILLED
                 job.finished_at = datetime.now().isoformat()
                 action = "killed"
+                # Spec 03 I69: a kill mid-run owes the mesh one reset before the next job.
+                request_killed_job_ids.add(job_id)
             elif job.status == JobStatus.QUEUED:
                 job.status = JobStatus.KILLED
                 job.finished_at = datetime.now().isoformat()
@@ -11187,7 +11583,7 @@ def create_mcp_server() -> MCPServer:
 
         if terminate is not None:
             # Outside the lock so the job can release the device before SIGKILL.
-            await _terminate_job(*terminate)
+            _log_job_tree_killed(job_id, f"kill requested by {caller_owner}", await _terminate_job(*terminate))
 
         return {"status": action, "job_id": job_id}
 
@@ -11459,12 +11855,32 @@ def create_mcp_server() -> MCPServer:
         job_id = result["job_id"]
         log_file = result.get("log_file", "")
 
-        # Report queue status prominently
-        await ctx.info(f"Job {job_id}: {result.get('message', 'submitted')}")
-        await ctx.info(f"Log file: {log_file}")
+        try:
+            # Report queue status prominently
+            await ctx.info(f"Job {job_id}: {result.get('message', 'submitted')}")
+            await ctx.info(f"Log file: {log_file}")
 
-        # Wait for completion with log streaming
-        return await _wait_for_job_impl(job_id, ctx, stream_logs=True, output_lines=params.output_lines)
+            # Wait for completion with log streaming
+            return await _wait_for_job_impl(job_id, ctx, stream_logs=True, output_lines=params.output_lines)
+        except asyncio.CancelledError:
+            # Spec 01 I66: a cancel or a disconnect cancels this handler. Nobody is left to read the
+            # result, so the job is killed through tt_device_job_kill's own path. That path awaits
+            # the terminate ladder, and any await in this cancelled scope is cancelled again, so the
+            # kill runs on its own task (it inherits the caller's identity for the owner check).
+            job = jobs.get(job_id)
+            if job is not None and job.status in (JobStatus.RUNNING, JobStatus.QUEUED):
+                if params.keep_running_on_disconnect:
+                    if logger:
+                        logger.info(f"job_run {job_id}: client gone, job kept (keep_running_on_disconnect)")
+                    health_event("job_run_client_gone", job_id=job_id, action="kept")
+                else:
+                    if logger:
+                        logger.info(f"job_run {job_id}: client gone, killing the job")
+                    health_event("job_run_client_gone", job_id=job_id, action="kill")
+                    task = asyncio.get_running_loop().create_task(_kill_job(job_id, job.owner))
+                    _client_gone_kills.add(task)
+                    task.add_done_callback(_client_gone_kills.discard)
+            raise
 
     @mcp.tool(
         name="tt_device_job_status",
@@ -12385,7 +12801,7 @@ def create_mcp_server() -> MCPServer:
             # Scope-route a privsep job: killpg on the broker-held pid hits the wrapper,
             # not the payload, and would reset over a job still holding the mesh.
             if job_id_to_stop:
-                await _terminate_job(job_id_to_stop, pid_to_stop)
+                _log_job_tree_killed(job_id_to_stop, "device reset", await _terminate_job(job_id_to_stop, pid_to_stop))
             else:
                 await _terminate_process_group(pid_to_stop)
         elif scope_to_stop:
@@ -12700,11 +13116,11 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
             f"kernel={env.get('kernel')} chips={len(chips)}"
         )
 
-    # Cache every chip's PCI address while they are all still answering. Once a chip is
+    # Cache every chip's PCI address while its sysfs entry is still there. Once a chip is
     # removed from the kernel its sysfs entry is gone, and with it the path to the bridge
     # that is the only way to reset it.
     global device_pci_map
-    device_pci_map = {i: chip_pci_bdf(i) for i in await asyncio.to_thread(read_heartbeats)}
+    device_pci_map = await asyncio.to_thread(_startup_pci_map)
     if logger:
         logger.info(
             f"HEALTH mapped {len(device_pci_map)} chips to PCI addresses "

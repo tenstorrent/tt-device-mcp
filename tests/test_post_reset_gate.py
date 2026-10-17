@@ -309,6 +309,46 @@ async def test_a_tenant_deferred_off_bus_one_shot_runs_on_the_next_idle_tick(mes
         assert count("post_reset_release_refused") == 1
 
 
+@pytest.mark.parametrize("given_back", [True, False], ids=["given-back", "spent"])
+def test_a_given_back_one_shot_gives_back_the_ceiling_window_it_claimed(monkeypatch, given_back):
+    """Spec 03 I23: a one-shot that waited out a tenant past the ceiling claims that ceiling window as
+    its own run. Given back (it stood down on the tenant), the window goes back with it: when the chips
+    return meanwhile (no one-shot left to retry), the ceiling window runs on the next tick, not one
+    whole window (600 s) later. A one-shot that ran keeps the claim: one forced climb, not two."""
+    spawned = []
+    monkeypatch.setattr(srv, "health_event", lambda kind, **f: None)
+    monkeypatch.setattr(
+        srv, "_maybe_spawn_forced_escalation", lambda: spawned.append(srv.device_hold_escalation_kind) or True
+    )
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
+    monkeypatch.setattr(srv, "device_hold_offbus_prior_bucket", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
+    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
+    srv.fsm.set_latch("escalated", False)
+    monkeypatch.setattr(srv, "isolated_chips", {"13"})
+    monkeypatch.setattr(srv, "device_hold_episode_reason", "chip(s) 13 left the PCIe bus")
+    since = datetime(2026, 10, 15, 18, 43, 41)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 50))  # the tenant held it past the ceiling
+    assert spawned == ["offbus_one_shot"] and srv.device_hold_escalate_bucket == 1
+    if given_back:
+        assert srv._rearm_tenant_deferred_window("offbus_one_shot")
+    monkeypatch.setattr(srv, "isolated_chips", set())  # the chip came back; the hold stays
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 60))
+    if given_back:
+        assert spawned == ["offbus_one_shot", "ceiling_window"], "the given-back window must run now"
+        assert srv.device_hold_escalate_bucket == 1
+    else:
+        assert spawned == ["offbus_one_shot"], "the one-shot that ran is window 1's run"
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 70))
+    assert len(spawned) == (2 if given_back else 1), "one forced run per window"
+
+
 @pytest.mark.asyncio
 async def test_the_measured_fabric_failure_reset_on_the_first_relift(mesh, monkeypatch, tmp_path, verdict):
     """Spec 03 I56: a post-job hold on a measured fabric FAIL resets on the first idle relift, with no
@@ -374,6 +414,120 @@ async def test_a_reset_adopted_from_a_foreign_scope(mesh, monkeypatch, verdict):
     assert calls == [True], "the adopted reset's verify runs the fabric pass"
     srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy")
     _assert_settled(released)
+
+
+# ---- a re-power owes the AICLK ceiling too: the next job-door apply runs (spec 03 I35) ----------
+
+
+@pytest.fixture
+def ceiling(monkeypatch):
+    """An armed ceiling verified before the path runs. No real helper runs: every apply is recorded
+    and verifies, as the door's would on a healthy host. Returns the applies, by ``where``."""
+    from tt_device_mcp.health import aiclk_ceiling as ac
+    from tt_device_mcp.health.aiclk_ceiling import CEILING
+
+    monkeypatch.setenv(ac.ENV_MHZ, "900")
+    monkeypatch.setattr(ac, "health_event", lambda kind, **f: None)
+    monkeypatch.setattr(CEILING, "owed", False)
+    monkeypatch.setattr(CEILING, "disarmed", "")
+    applies = []
+
+    async def apply(where, **_):
+        applies.append(where)
+        CEILING.owed = False
+        return True, "ceiling 900 MHz applied", {}
+
+    monkeypatch.setattr(CEILING, "apply", apply)
+    return applies
+
+
+async def _door_applies_the_owed_ceiling(applies):
+    from tt_device_mcp.health.aiclk_ceiling import CEILING
+
+    assert CEILING.owed, "a re-power left the ceiling marked verified: the job door would skip it"
+    assert applies == [], "nothing in the path re-applied it, so only the door can"
+    await srv._ensure_aiclk_ceiling(None)
+    assert applies == ["pre-job"] and not CEILING.owed
+
+
+@pytest.mark.asyncio
+async def test_a_real_bridge_reset_owes_the_ceiling(mesh, monkeypatch, verdict, ceiling):
+    evidence, released = verdict
+    fsm_dirty(srv, "gate/post-job: chip 8 off the bus", why="job_killed")
+    monkeypatch.setattr(srv, "isolated_chips", {"8"})
+    monkeypatch.setattr(srv, "device_pci_map", {"8": "0000:46:00.0"})
+    monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", lambda idx, bdf: True)
+    monkeypatch.setattr(srv, "_set_device_op_detail", lambda d: None)
+    _verify_returning(monkeypatch, evidence)
+    g = srv.galaxy_recovery
+    out = await g._fire_gate_rung("post-job", galaxy.STAGE_BRIDGE_RESET, ["8"], 32, lambda m: None, ev=None, beats=None)
+    assert out == galaxy.OUTCOME_RECOVERED
+    _assert_settled(released)
+    await _door_applies_the_owed_ceiling(ceiling)
+
+
+@pytest.mark.asyncio
+async def test_a_tray_re_power_owes_the_ceiling(mesh, monkeypatch, galaxy_trays, verdict, ceiling):
+    evidence, released = verdict
+    fsm_dirty(srv, "gate/post-job: tray 3 off the bus", why="job_killed")
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
+    fired = []
+
+    async def no_bridge(log):
+        return False
+
+    async def mesh_reset(argv, log, *a, **k):
+        return 0, ""
+
+    patch_recovery(monkeypatch, "_recover_isolated_chips", no_bridge)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap))
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh_reset)
+    _verify_returning(monkeypatch, evidence)
+    offbus = {str(i) for i in range(24, 32)}
+    out = await g._fire_tray_down_no_window(offbus, 32, lambda m: None, gate_phase="post-job", ev=None)
+    assert out == galaxy.OUTCOME_RECOVERED and fired
+    _assert_settled(released)
+    await _door_applies_the_owed_ceiling(ceiling)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", list(UNPROVEN.values()), ids=list(UNPROVEN))
+async def test_a_tray_walk_re_power_owes_the_ceiling(mesh, monkeypatch, galaxy_trays, evidence, ceiling):
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    srv.fsm.set_latch("ubb_reset_fired", False)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    fired = []
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap))
+    _verify_returning(monkeypatch, evidence)
+    beats = {str(i): 100 for i in range(24)}
+    # Recovered or not by the walk's own verify, the tray was re-powered.
+    await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None)
+    assert fired
+    assert FABRIC_DEBT.owed, "the walk's re-power owes a fabric pass before release"
+    await _door_applies_the_owed_ceiling(ceiling)
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_reset_owes_the_ceiling(mesh, monkeypatch, verdict, ceiling):
+    from tt_device_mcp.health.recovery import base
+
+    evidence, released = verdict
+    fsm_dirty(srv, "gate/post-job: reset", why="job_killed")
+    g = srv.galaxy_recovery
+    scopes = iter(["ttdev-reset-1.scope"])
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: next(scopes, None))
+    monkeypatch.setattr(base, "asyncio", _FastAsyncio())
+    _verify_returning(monkeypatch, evidence)
+    assert await g._reset_and_verify_device([str(i) for i in range(32)], lambda m: None) is True
+    srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy")
+    _assert_settled(released)
+    await _door_applies_the_owed_ceiling(ceiling)
 
 
 @pytest.mark.asyncio
