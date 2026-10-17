@@ -1274,9 +1274,10 @@ class HealthMonitor:
     def note_job_after_topology_lift(self, failed: bool, log_tail: Optional[str]) -> Optional[str]:
         """Called once per finished job. Only the first job after a topology-mismatch lift
         counts: if it failed on the fabric, the skipped links are a hardware fault, so the
-        fabric check is withheld from now on (the hold this makes is 77-only: no reset, reboot or
-        power cycle below the 10-min bound, where spec 04 I76 lifts the latch and runs the ladder)
-        and the operator is paged. Returns the hold reason, or None."""
+        fabric check is withheld from now on (the hold this makes is 77-only, and the lift is
+        disproven, so spec 04 I76's bound applies after one sampler tick: it lifts the latch, runs the
+        ladder and the full check, then the power cycle) and the operator is paged. Returns the hold
+        reason, or None."""
         if not self.topology_lift_pending:
             return None
         self.topology_lift_pending = False

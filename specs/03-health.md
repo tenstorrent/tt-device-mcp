@@ -563,7 +563,8 @@ cooldown (spec 04 I65) holds longer.
   no reset releases as above.
   Idle path only: no added time between
   jobs. The hardware fault of the first job after a
-  topology-mismatch lift (I42) is outside this bound: no release or rung can fix cabling. A
+  topology-mismatch lift (I42) is outside this bound: no release can fix cabling; its own bound is
+  one sampler tick (I42, spec 04 I76). A
   topology mismatch whose traffic-only rerun could not run is inside it (I45). Below the 10-min
   bound the deadline escalation resets neither (spec 04 I30); at the bound it runs the full ladder,
   then the power cycle (spec 04 I76). The validator's `Encountered
@@ -581,8 +582,12 @@ cooldown (spec 04 I65) holds longer.
   pages the operator once per distinct mismatch. The first job after that lift is watched: if it
   fails on the fabric, the skipped links are a hardware fault, the device is held fabric-unverified
   and every later fabric check is withheld (a 77-only hold, no reset, reboot or power cycle) until
-  an operator restarts the broker or the hold reaches the 10-min bound, where spec 04 I76 lifts the
-  latch, runs the full ladder and lets the full check decide, then the power cycle. That lift is
+  an operator restarts the broker or the hold reaches its bound. For this disproven lift the bound is
+  one sampler tick (`TT_DEVICE_MCP_SAMPLE_INTERVAL_SEC`, 10 s), not 10 min: waiting out the ceiling
+  runs no rung and put the power cycle ~20 min after the job, over class D's 15-min budget. There
+  spec 04 I76 lifts the latch, runs the full ladder and lets the full check decide, then the power
+  cycle (host rung asked at ~T0+10 s + ladder and check, ≤ ~10.7 min). The 10-min mark still runs
+  the full ladder again if the hold stands and no host action is pending. That lift is
   disproven: until a clean pass without the marker, a pass on the discovered links only FAILS the
   check (`passed on the discovered links only`), so the bound goes on to the host rung instead of a
   release that would fail the next job, latch again and hold another 10 min, never reaching the
