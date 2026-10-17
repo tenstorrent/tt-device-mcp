@@ -1099,6 +1099,7 @@ _recovery_deps = RecoveryDeps(
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
     hold_device_fabric_unverified=lambda why: _hold_device_fabric_unverified(why),
     note_fabric_77_reset_passes=lambda n: _note_fabric_77_reset_passes(n),
+    fabric_77_no_reset_cause=lambda: _fabric_77_no_reset_cause(),
     refresh_idle_hold_ledger=lambda: _refresh_idle_hold_ledger(),
     spawn_idle_relift=lambda: _maybe_spawn_idle_relift(),
     watch_idle_holders=lambda: _maybe_spawn_idle_holder_watch(),
@@ -3722,17 +3723,23 @@ def _fabric_77_eth_drop() -> str:
     bound only delays it. Not for a known cable fault (a 78), a topology mismatch or fault, or a
     missing prerequisite (hugepages, the validator): no reset fixes those."""
     drop = health_monitor.last_eth_link_drop if health_monitor is not None else ""
-    if not drop or health_monitor.known_fabric_fault() or health_monitor.topology_hw_fault:
-        return ""
-    if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
-        return ""
-    if _validator_line_names_topology(health_monitor.last_fabric_output or ""):
-        return ""
-    if _last_77_was_hugepages() or fabric.validator_missing() is not None:
-        return ""
-    if "hugepages not yet allocated" in str(fsm.record.detail or ""):  # the startup pass's hugepages hold
+    if not drop or _fabric_77_no_reset_cause():
         return ""
     return drop
+
+
+def _fabric_77_no_reset_cause() -> bool:
+    """Whether the 77 has a cause no reset fixes: a known cable fault (a 78), a topology mismatch or
+    fault, or a missing prerequisite (hugepages, the validator)."""
+    if health_monitor.known_fabric_fault() or health_monitor.topology_hw_fault:
+        return True
+    if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
+        return True
+    if _validator_line_names_topology(health_monitor.last_fabric_output or ""):
+        return True
+    if _last_77_was_hugepages() or fabric.validator_missing() is not None:
+        return True
+    return "hugepages not yet allocated" in str(fsm.record.detail or "")  # the startup pass's hugepages hold
 
 
 def _fabric_hold_only(own_op: str = "") -> bool:
@@ -6555,6 +6562,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         # Keyed on the hold EPISODE (survives a broker restart), the clock the hand-off was armed on.
         episode = device_hold_episode_since or since
         handoff = offbus_power_cycle.hold_handoff_status(episode, now.timestamp() if now else None)
+        if handoff is None and galaxy_recovery is not None:
+            handoff = galaxy_recovery.fabric_77_handoff_status(episode)  # spec 04 I29: a 77 past its host rung
         if handoff is not None:
             payload["operator_handoff"] = handoff  # spec 04 I33: who must act on the hold, and by when
         # Spec 04 I65: a power cycle the cooldown holds off, and the moment it is asked again.
