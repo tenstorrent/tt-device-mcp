@@ -21,6 +21,7 @@ from tests.test_reaped_leftover import LEFTOVER_PID, _stage, leftover  # noqa: F
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.health.recovery import base as recovery_base
+from tt_device_mcp.health.recovery import galaxy
 
 BUDGET = srv.LEFTOVER_UNKILLABLE_BUDGET_SEC
 RETRY = srv.LEFTOVER_HOST_RUNG_RETRY_SEC
@@ -118,6 +119,81 @@ async def test_a_leftover_gone_at_the_deadline_fires_nothing_and_closes_the_epis
     assert srv._leftover_unkillable_mono is None and srv._leftover_unkillable_since is None
     assert _events(fence["rig"], "leftover_unkillable_deadline") == []
     assert srv._health_payload()["leftover_fence"] is None
+
+
+async def test_a_leftover_that_leaves_while_the_try_waits_on_the_lock_fires_nothing(fence, monkeypatch):
+    """The try's own scan saw the leftover; it exits before the rung, under the device lock, scans."""
+
+    calls = []
+
+    def pending_then_gone():
+        calls.append(1)
+        if len(calls) > 1:  # the first read is the sampler's, before the spawn; this one is the rung's
+            fence["holders"] = []  # it closed its fds while the try waited on the lock
+        return None
+
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_pending", pending_then_gone)
+    t0 = _open(fence)
+
+    assert await _tick(t0 + BUDGET)
+    assert fence["order"] == []
+    (rung,) = _events(fence["rig"], "leftover_host_rung")
+    assert rung["phase"] == "gone"
+    assert srv._leftover_unkillable_mono is None, "the rung's 'gone' closes the episode"
+    assert srv._health_payload()["leftover_fence"] is None
+
+
+@pytest.mark.parametrize("change", ["gone", "tenant", "scope"])
+@pytest.mark.parametrize("during", ["stand-back", "governor"])
+async def test_a_change_during_the_last_checks_holds_the_rung(fence, monkeypatch, during, change):
+    """The stand-back command can run for its whole timeout: a leftover that exits, a tenant that
+    arrives or a reset scope that starts meanwhile is seen on a fresh scan and nothing fires."""
+    r = fence["rig"]
+    g = r["g"]
+
+    def arrive():
+        if change == "gone":
+            fence["holders"] = []
+        elif change == "tenant":
+            fence["holders"] = fence["holders"] + [DeviceHolder(pid=7300, uid=2345)]
+        else:
+            r["scope"] = "tt-reset-1.scope"
+
+    if during == "stand-back":  # the power-cycle path: a tray off the bus
+        r["beats"] = {str(i): 100 for i in range(EXPECTED) if i >= 4}
+        monkeypatch.setattr(galaxy.offbus_power_cycle, "standback_reason", lambda **k: arrive() or "")
+    else:
+        monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", lambda action, **k: arrive() or (True, ""))
+    t0 = _open(fence)
+
+    assert await _tick(t0 + BUDGET)
+    assert fence["order"] == [], "nothing fires"
+    (rung,) = _events(r, "leftover_host_rung")
+    if change == "gone":
+        assert rung["phase"] == "gone" and srv._leftover_unkillable_mono is None
+    else:
+        want = "tenant pid 7300" if change == "tenant" else "a reset is cycling in its own scope"
+        assert rung["phase"] == "held" and want in rung["detail"]
+        assert srv._health_payload()["leftover_fence"]["escalation_stage"] == "held"
+
+
+async def test_the_operator_stand_back_holds_the_power_cycle_until_it_is_gone(fence, monkeypatch, tmp_path):
+    fence["rig"]["beats"] = {str(i): 100 for i in range(EXPECTED) if i >= 4}  # a tray off the bus
+    marker = tmp_path / "cycle-in-progress"
+    marker.write_text("")
+    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE", str(marker))
+    t0 = _open(fence)
+
+    assert await _tick(t0 + BUDGET)
+    assert fence["order"] == []
+    fenced = srv._health_payload()["leftover_fence"]
+    assert fenced["escalation_stage"] == "held"
+    assert "standing back from the power cycle" in fenced["detail"] and str(marker) in fenced["detail"]
+
+    marker.unlink()
+    assert await _tick(t0 + BUDGET + RETRY)
+    assert fence["order"] == ["power_cycle"]
+    assert [e["phase"] for e in _events(fence["rig"], "leftover_host_rung")] == ["held", "requested"]
 
 
 async def test_a_governor_denial_holds_then_fires_on_a_later_try(fence):

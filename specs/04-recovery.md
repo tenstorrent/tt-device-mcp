@@ -969,21 +969,30 @@ each rung fires only when the gentler one failed or cannot apply.
   that launch timed out and retracted its governor record), a reset cycling in its scope, a running broker job or a readable tenant other
   than the leftovers themselves (they are discounted; an unreadable scan is waived as on the
   forced climb), the operator stand-back for the power cycle, and the governor (I9/I10 rate limits,
-  the I65 cooldown). A guard holds and fires nothing; the next try asks again, so a denial ends when
+  the I65 cooldown). After the stand-back and the governor (the stand-back command can run for its
+  whole timeout) the rung scans again and fires only if a reset scope still does not cycle, no
+  tenant arrived and a leftover is still in that scan. A leftover that left at any point before the
+  fire (between the try's first scan and the device lock, or during the last checks) fires nothing:
+  the stage is `gone` and the try's own re-scan closes the episode. A guard holds and fires nothing; the next try asks again, so a denial ends when
   its cause does (the cooldown at its stated end). With no host rung opted in the episode goes to an
   operator, journaled once. Journal: `leftover_unkillable_deadline` once per episode at the budget,
   then `leftover_host_rung` each time its stage changes (`requested` with the action, `held` with
-  why, `no_host_rung`). While an unkillable leftover stands `/health` carries `leftover_fence`:
+  why, `gone`, `no_host_rung`). While an unkillable leftover stands `/health` carries `leftover_fence`:
   `fault_class`, `since`, `budget_sec`, `deadline`, `escalation_stage` (`waiting-budget`,
-  `requested`, `held`, `no-host-rung`), `detail` and the leftovers; `null` otherwise. The rung
+  `requested`, `held`, `gone`, `no-host-rung`), `detail` and the leftovers; `null` otherwise. The rung
   releases nothing: the boot that follows runs the startup gate, which waits for the 1G hugepage
   pool and passes the full health check, fabric included, before the queue is released (03 I4); a
   failed check keeps the hold and climbs the bounded ladder. The clock lives in memory: a broker
   restart starts it again at its first scan (one more budget at most). Time to recover for this
   class: before, unbounded (until an operator rebooted the host; about an hour in the incident);
-  after, 600 s plus at most one 60 s retry tick to the request, then the host rung (a warm reboot
-  about 3-5 min, a power cycle about 5-8 min) and the startup check (about 3 min): about 16-21 min,
-  later only by the I65 cooldown when a cycle or boot fell within its last 30 min.
+  after, up to `IDLE_HOLDER_SCAN_SEC` (60 s) while idle before the first scan opens the clock, 600 s
+  plus at most one 60 s retry tick to the request, then the host rung (a warm reboot about 3-5 min,
+  a power cycle about 5-8 min) and the startup check (about 3 min): about 17-23 min (17-20 min by
+  reboot, 19-23 min by power cycle). Later only while the governor holds the rung, each bounded and
+  shown as `held` on `/health`: the I65 cooldown when a cycle or boot fell within its last 30 min,
+  and, on a host with no power cycle opted in, the reboot loop guard
+  (`AUTO_RECOVERY_MIN_INTERVAL_SEC`, 3600 s since the last automatic reboot). The `gone` stage and
+  the second scan add no wait.
 
 - **I79 — A hold whose reset and full check already failed climbs at once, not at the ceiling.**
   The stuck-hold ceiling (600 s) bounds how long the host rungs wait for the gentler rungs to have
@@ -1517,7 +1526,7 @@ sees a silent fabric pass.
 | I21 every reset is refused over a reaped job's leftover, forced or not, through `reset_with_quiesce` too; it lifts once the holder is gone | `tests/test_reaped_leftover.py::test_the_reset_tool_is_refused_even_with_force`, `tests/test_reaped_leftover.py::test_the_streaming_reset_is_refused_even_with_force`, `tests/test_reaped_leftover.py::test_reset_with_quiesce_is_refused_through_the_fence`, `tests/test_reaped_leftover.py::test_the_broker_wires_the_fence_into_the_recovery_mechanism` |
 | I70 an unkillable leftover asks for no host rung before its 600 s budget; past it, the reboot with every chip present, the power cycle with a chip off the bus | `tests/test_unkillable_leftover_escalation.py::test_no_rung_before_the_budget`, `tests/test_unkillable_leftover_escalation.py::test_a_reboot_once_past_the_budget_with_every_chip_present`, `tests/test_unkillable_leftover_escalation.py::test_a_power_cycle_with_chips_off_the_bus` |
 | I70 the clock opens on an unkillable leftover only, closes when none is left (a leftover gone at the deadline fires nothing), and a scan error leaves it as it is; the idle-holder scan keeps it | `tests/test_unkillable_leftover_escalation.py::test_a_killable_leftover_starts_no_clock`, `tests/test_unkillable_leftover_escalation.py::test_a_leftover_gone_at_the_deadline_fires_nothing_and_closes_the_episode`, `tests/test_unkillable_leftover_escalation.py::test_a_scan_error_leaves_the_clock_as_it_is`, `tests/test_unkillable_leftover_escalation.py::test_the_idle_holder_scan_keeps_the_clock` |
-| I70 guards: a governor/cooldown denial holds and the next try fires; a pending host action or a device op asks nothing; another tenant or a running job blocks, the leftover itself does not; no host rung opted in journals `no_host_rung` | `tests/test_unkillable_leftover_escalation.py::test_a_governor_denial_holds_then_fires_on_a_later_try`, `tests/test_unkillable_leftover_escalation.py::test_a_held_stage_is_journaled_once_while_it_stands`, `tests/test_unkillable_leftover_escalation.py::test_a_pending_host_action_asks_for_nothing`, `tests/test_unkillable_leftover_escalation.py::test_a_device_op_in_flight_defers_the_try`, `tests/test_unkillable_leftover_escalation.py::test_another_tenant_blocks_the_rung_but_the_leftover_itself_does_not`, `tests/test_unkillable_leftover_escalation.py::test_a_running_job_blocks_the_rung`, `tests/test_unkillable_leftover_escalation.py::test_no_host_rung_opted_in_journals_no_host_rung` |
+| I70 guards: a governor/cooldown denial holds and the next try fires; the operator stand-back holds the power cycle and a later try fires it once the marker is gone; a pending host action or a device op asks nothing; another tenant or a running job blocks, the leftover itself does not; a leftover that leaves while the try waits on the lock, or a leftover leaving, a tenant arriving or a reset scope starting during the stand-back or governor check, fires nothing (`gone` closes the episode); no host rung opted in journals `no_host_rung` | `tests/test_unkillable_leftover_escalation.py::test_a_governor_denial_holds_then_fires_on_a_later_try`, `tests/test_unkillable_leftover_escalation.py::test_a_held_stage_is_journaled_once_while_it_stands`, `tests/test_unkillable_leftover_escalation.py::test_the_operator_stand_back_holds_the_power_cycle_until_it_is_gone`, `tests/test_unkillable_leftover_escalation.py::test_a_leftover_that_leaves_while_the_try_waits_on_the_lock_fires_nothing`, `tests/test_unkillable_leftover_escalation.py::test_a_change_during_the_last_checks_holds_the_rung`, `tests/test_unkillable_leftover_escalation.py::test_a_pending_host_action_asks_for_nothing`, `tests/test_unkillable_leftover_escalation.py::test_a_device_op_in_flight_defers_the_try`, `tests/test_unkillable_leftover_escalation.py::test_another_tenant_blocks_the_rung_but_the_leftover_itself_does_not`, `tests/test_unkillable_leftover_escalation.py::test_a_running_job_blocks_the_rung`, `tests/test_unkillable_leftover_escalation.py::test_no_host_rung_opted_in_journals_no_host_rung` |
 | I70/I76 a killed job's leftover past 600 s and the 10-min hold bound request one power cycle per episode, in either order, with a leftover try spawned before the bound's request, and whether the launch ran or timed out; the device stays held with the full check owed | `tests/test_unkillable_leftover_escalation.py::test_replay_the_bound_and_the_leftover_budget_request_one_power_cycle` |
 | I70 `/health` `leftover_fence`, the sampler wiring, and the bounded time to request (at most 660 s) with nothing on the path releasing the device | `tests/test_unkillable_leftover_escalation.py::test_the_health_fields`, `tests/test_unkillable_leftover_escalation.py::test_the_sampler_drives_the_escalation`, `tests/test_unkillable_leftover_escalation.py::test_time_to_request_is_bounded_and_nothing_releases_the_device` |
 | I14 warm reboot never fired where futile; blocked climbs are loud | `tests/test_device_safety.py::test_host_escalation_for_drop_sends_all_off_bus_to_the_cold_rung`, `tests/test_device_safety.py::test_host_escalation_for_drop_routes_a_futile_reboot_to_the_cold_rung`, `tests/test_device_safety.py::test_gate_all_off_bus_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_reset_regression_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_all_off_bus_power_cycles_when_opted_in` |

@@ -7946,8 +7946,8 @@ def _maybe_spawn_leftover_escalation(now: Optional[float] = None) -> bool:
 
 
 async def _escalate_unkillable_leftover() -> None:
-    """One host-rung try for an unkillable leftover past its budget (spec 04 I70). Re-scans first: a
-    leftover gone by now fires nothing and closes the episode. Releases nothing: the boot that follows
+    """One host-rung try for an unkillable leftover past its budget (spec 04 I70). Re-scans first, and
+    the rung again under the device lock: a leftover gone by either fires nothing and closes the episode. Releases nothing: the boot that follows
     runs the startup gate (hugepages, then the full health check, fabric included). Never raises."""
     global _leftover_deadline_paged, _leftover_rung_stage, _leftover_rung_detail
 
@@ -7983,6 +7983,8 @@ async def _escalate_unkillable_leftover() -> None:
         if (stage, why) != (_leftover_rung_stage, _leftover_rung_detail):
             _leftover_rung_stage, _leftover_rung_detail = stage, why
             health_event("leftover_host_rung", phase=stage.replace("-", "_"), detail=why, leftovers=detail)
+        if stage == "gone":  # it left while the try waited or checked: this scan closes the episode
+            await asyncio.to_thread(_reaped_leftovers)
     except Exception:  # noqa: BLE001 - a detached task must never raise unretrieved
         if logger:
             logger.exception("LEFTOVER-HOST-RUNG try failed — retrying next window")
