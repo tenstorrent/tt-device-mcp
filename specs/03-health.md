@@ -866,6 +866,23 @@ job boundary.
   included) and the hold stays with the bounded escalation of I23 if that does not heal it.
   Time to recover (class J): from the release of the last holder to the gate's start is at most
   one recheck period plus one sampler tick, against waiting up to the 600 s ceiling before.
+- **I75 — A startup hold behind a re-adopted job is lifted by the startup gate, not reset by the
+  ceiling escalation.** A broker restart that re-adopts a running job (an auto-update deploy) opens
+  the `startup_unverified` hold, and the startup gate waits for the job's scope to end. A job that
+  outlives the 600 s ceiling (I23) left the window re-armed on the job; when the job ended, the
+  forced ladder and the idle relift's generic branch raced the startup gate for the device and could
+  reset a mesh no check had found at fault, with the gate then running on top. While the startup
+  gate task is still to run and the hold's `why` is `startup_unverified`, both stand down: the
+  forced run gives its window back (as on a tenant) and logs once per episode
+  (`stuck_hold_deferred`, blocker `startup_verify`); the relift returns. The startup gate runs the
+  full check, fabric included (goal: a health check after every reset or start), and releases only
+  on a pass. A gate that leaves the hold standing is escalated on the first sampler tick after it.
+  Bounded: `STARTUP_VERIFY_DEFER_MAX_SEC` (hugepage wait + fabric timeout + 120 s, 420 s) after the
+  re-adopted jobs end, the escalations act as before. A dirty or faulted job end keeps the gate's
+  own reset + full check. Time to recover (class S, restart over a re-adopted job longer than the
+  ceiling): from the job's end, one scope poll plus the startup gate (about 1-2 min), against a
+  galaxy reset, its settle and verify, then the gate (about 4-6 min) before. Other classes:
+  unchanged.
 
 ## Interfaces
 
@@ -1488,6 +1505,7 @@ refuses.
 | I69 (a debt open at the next job is paid by the post-job gate before its door, the job still QUEUED) | `tests/test_job_kill_reset.py::test_the_runner_pays_an_owed_debt_before_a_queued_job` |
 | I69 (every broker kill logs one KILLED process-tree line) | `tests/test_job_kill_reset.py::test_a_broker_kill_logs_the_process_tree_it_stopped` |
 | I69 (a reaped leftover skips before the debt: no reset, debt kept, no wait; a reboot drops it and the startup full check runs; a cooldown skips and clears it with no wait) | `tests/test_job_kill_reset.py::test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait`, `tests/test_job_kill_reset.py::test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait` |
+| I75 | `tests/test_device_safety.py::test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_gate_not_reset`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_next_tick`, `tests/test_device_safety.py::test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladder`, `tests/test_device_safety.py::test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

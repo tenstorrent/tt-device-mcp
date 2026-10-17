@@ -414,6 +414,10 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # happened to share its `since` would arm a relift it never asked for.
     monkeypatch.setattr(srv, "_startup_fabric_owed_since", None, raising=False)
     monkeypatch.setattr(srv, "_startup_prereq_task", None, raising=False)
+    # The startup gate task (spec 03 I75): left pending, a later test's startup hold would never escalate.
+    monkeypatch.setattr(srv, "_startup_verify_task", None, raising=False)
+    monkeypatch.setattr(srv, "_startup_verify_ready_at", None, raising=False)
+    monkeypatch.setattr(srv, "_startup_verify_deferral_logged", None, raising=False)
     monkeypatch.setattr(srv, "post_job_gate_pending", False, raising=False)
     # The per-owner burst-cap ledger. Left populated, one test's submissions would count against
     # the next test's cap. Fresh dict so state never bleeds; raising=False so a base tree without
