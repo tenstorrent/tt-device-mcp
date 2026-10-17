@@ -847,7 +847,29 @@ each rung fires only when the gentler one failed or cannot apply.
   onset (one-shot 10-20 s on an idle box, spec 03 I23, 120 s while a tenant holds the device; a failed
   reset of up to 262 s, the 60 s wait, a 62 s healing reset and a 63 s fabric check: about 485 s idle,
   about 585 s with a tenant, against a floor of 378-511 s with no wait at all). A B1 drop that one
-  reset heals keeps the 6 min bound.
+  reset heals keeps the 6 min bound. The commonest cause of that pattern, a chip the broker had
+  isolated that the first reset re-powered but tt-smi never saw, is gone under I81: such a reset now
+  heals the chip itself. I39 still bounds a first reset that fails for any other reason.
+
+- **I81 — A mesh reset re-adds the chips the broker isolated at tt-smi's driver wait.**
+  `tt-smi -glx_reset` re-powers every tray, counts a 30 s settle, then waits up to 100 s for every
+  chip to show up in /dev/tenstorrent, and exits 1 with no re-init when one never does. A chip the
+  broker isolated (its PCI endpoint removed) cannot show up on its own: only a PCI rescan adds it
+  back, and the rescan `reset_with_quiesce` ends with runs after tt-smi has exited. So before I81
+  every mesh reset over an isolated chip failed after about 263 s even when the re-power had healed
+  the chip, and the I39 retry's second reset finished the job. Now, when a `-glx_reset` runs with at
+  least one isolated chip, `reset_with_quiesce` watches the reset's output and, at the first marker
+  of that wait (`Waiting for 30 seconds: 30`, the settle's end, or `Waiting for all N chips to show
+  up`, matched across split reads), runs one global PCI rescan, journaled as
+  `reset_driver_wait_rescan` with `ok` and the chips. It fires at most once per reset, never for
+  another reset command or with no isolated chip, is cancelled with a cancelled reset, and a failed
+  write is journaled and the reset runs on; the rescan after the reset still runs. A chip still dead
+  stays off the bus, as before. Releases nothing: the full health check, fabric included, still
+  decides (I32). TTR: class B1 with the chip isolated, from the hold, goes
+  from about 505 s (one-shot 120 s, a failed 263 s reset, the 60 s I39 wait, a 62 s healing reset)
+  to about 182 s (one-shot 120 s and one 62 s reset), inside the 6 min budget. Mass or whole-tray
+  drops with isolated chips that a mesh reset heals save the same ~320 s. Paths with no isolated chip
+  or no `-glx_reset` are unchanged.
 
 - **I58 — A mesh reset that failed is remembered for the boot, across broker restarts.** Every mesh
   reset that launched and failed (an exit code was read: nonzero, or zero with an unhealthy verify)
@@ -1407,6 +1429,8 @@ sees a silent fabric pass.
 | I36 / I39 a set that shrank then stayed unchanged gets at most two resets (the one-shot and the progress retry) over six forced windows, then climbs or hands off once | `tests/test_no_repeat_failed_rung.py::test_e3_shrunk_then_unchanged_resets_at_most_twice_then_climbs` |
 | I39 a failed reset that brought chips back arms one retry per episode; the watchdog spawns it when due, before the ceiling, and never twice | `tests/test_no_repeat_failed_rung.py::test_progress_retry_is_armed_once_per_episode_and_comes_due`, `::test_the_watchdog_spawns_the_due_progress_retry_before_the_ceiling` |
 | I39 end to end: a failed reset that shrank the set arms the retry, the watchdog spawns it, it resets the changed set once and an unchanged set after it power-cycles (I38); an unchanged first set arms none; the retry releases only after the full verify, fabric included | `tests/test_no_repeat_failed_rung.py::test_a_failed_reset_that_shrank_the_set_retries_once_on_the_new_set_then_climbs`, `::test_a_failed_reset_on_an_unchanged_set_arms_no_retry_and_climbs_at_once`, `::test_the_progress_retry_releases_only_after_the_full_fabric_verify` |
+| I81 B1 replay: an isolated chip's tray is re-powered, the rescan at tt-smi's driver wait re-adds it, one mesh reset heals it inside the 6 min budget and the full verify, fabric included, runs before release | `tests/test_glx_reset_isolated_rescan.py::test_b1_replay_one_mesh_reset_heals_an_isolated_chip_inside_the_budget` |
+| I81 the rescan fires once at the driver-wait marker (one line, split read, split inside the count) and the caller still sees every output chunk; never with no isolated chip or off a mesh reset; a failed rescan is journaled and the reset runs on; a cancelled reset cancels a pending rescan | `tests/test_glx_reset_isolated_rescan.py::test_the_rescan_fires_once_at_the_driver_wait_and_the_caller_still_sees_the_output`, `::test_no_early_rescan_without_an_isolated_chip_or_off_a_mesh_reset`, `::test_a_failed_driver_wait_rescan_is_journaled_and_the_reset_runs_on`, `::test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan` |
 | I58 the failed-reset record survives a broker restart but not a new boot; a new episode on the same set does not reset again; only a launched reset is recorded | `tests/test_no_repeat_failed_rung.py::test_the_failed_reset_survives_a_broker_restart_but_not_a_new_boot`, `::test_a_new_hold_episode_on_the_same_set_does_not_reset_again`, `::test_a_reset_that_never_launched_is_not_recorded` |
 | I59 a gap or holder left by the broker's own exiting probe or killed holder is not a tenant; any other gap still fails closed; scoped holders and reused pids are never discounted | `tests/test_broker_internal_holders.py` |
 | I65 a boot 3 min before startup with a whole tray off: held with the deadline on /health and no rung, then one cycle at the deadline | `tests/test_power_cycle_cooldown.py::test_a_boot_3_min_before_startup_holds_to_a_deadline_then_cycles_once`, `::test_health_carries_the_cooldown_deadline_while_held` |

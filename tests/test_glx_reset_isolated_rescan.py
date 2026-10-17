@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Spec 04 I81: a mesh reset brings back the chips the broker isolated, in the same reset.
 
 `tt-smi -glx_reset` re-powers every tray, counts a 30 s settle, then waits up to 100 s for every chip to
