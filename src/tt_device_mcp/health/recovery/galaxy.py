@@ -1092,6 +1092,8 @@ class GalaxyRecovery(Recovery):
     _fabric_77_handoff: Optional[dict] = None
     # Why auto_recovery_allowed last held a host rung off (a cooldown, the rate limit, a tenant).
     _host_rung_denied_why: str = ""
+    # The (episode, until) of the last I65 cooldown a 77 climb waited on without a page (spec 04 I79).
+    _fabric_77_cooldown_logged: Optional[tuple[str, float]] = None
     # Whether the last idle-ladder escalate() stood down on a live tenant (spec 04 I7). The hold
     # watchdog reads it to re-arm the window it spent, so the ladder runs once the tenant is gone
     # rather than at the next window (spec 03 I23).
@@ -2972,10 +2974,12 @@ class GalaxyRecovery(Recovery):
                     # Only waiting (the ladder ceiling, a reset in its scope): no page, the next
                     # escalation of the episode retries the climb.
                     return
+                if outcome == HOST_RUNG_DENIED and self._wait_77_cold_rung_cooldown(hold_since, log):
+                    return
                 if outcome == HOST_RUNG_DENIED:
-                    # Held off for now (the I65 cooldown, the rate limit, a tenant): the rung is not
-                    # spent, so every later re-check of the episode climbs again and fires it once
-                    # allowed (spec 04 I79). The page says so; an operator acts only if it never can.
+                    # Held off for now (the rate limit, a tenant): the rung is not spent, so every
+                    # later re-check of the episode climbs again and fires it once allowed (spec 04
+                    # I79). The page says so; an operator acts only if it never can.
                     spent = (
                         f"the host rung could not run yet ({self._host_rung_denied_why}); the broker retries "
                         "it on every re-check and fires it once allowed"
@@ -2988,6 +2992,33 @@ class GalaxyRecovery(Recovery):
         await self._climb_to_host_recovery_after_failed_reset(
             expected, off_bus_before, log, swept=True, ladder_ran=True
         )
+
+    def _wait_77_cold_rung_cooldown(self, hold_since: str, log) -> bool:
+        """True when the 77 climb's power cycle was denied only by the bounded I65 cooldown (or its cap
+        or backstop, each with an end): no page and no hand-off, since the broker fires the cycle
+        itself at the first re-check after ``until`` (spec 04 I79). /health shows the deadline as
+        ``power_cycle_cooldown.next_deadline``. Journaled once per episode and deadline."""
+        cd = self.mechanism.power_cycle_cooldown_state
+        if not cd or cd.get("why") != self._host_rung_denied_why or not cd.get("until"):
+            return False
+        until = float(cd["until"])
+        if until <= time.time():
+            return False
+        until_iso = datetime.fromtimestamp(until).isoformat(timespec="seconds")
+        if self._fabric_77_cooldown_logged != (hold_since, until):
+            self._fabric_77_cooldown_logged = (hold_since, until)
+            health_event(
+                "fabric_unverified_host_rung_cooldown",
+                held_since=hold_since,
+                until=until_iso,
+                until_epoch=until,
+                cause=cd.get("cause"),
+            )
+        log(
+            f"fabric still unverified (77); its power cycle waits for the cooldown ({cd.get('cause')}) "
+            f"until {until_iso} — held, no page: the broker fires it on the first re-check after that"
+        )
+        return True
 
     def _fabric_77_host_rung_spent(self, hold_since: str) -> str:
         """Why this 77 episode's one host rung is spent, or "" (spec 04 I29): it already fired on this
