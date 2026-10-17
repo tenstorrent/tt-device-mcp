@@ -1109,7 +1109,7 @@ _recovery_deps = RecoveryDeps(
     fabric_77_no_reset_cause=lambda: _fabric_77_no_reset_cause(),
     refresh_idle_hold_ledger=lambda: _refresh_idle_hold_ledger(),
     spawn_idle_relift=lambda: _maybe_spawn_idle_relift(),
-    watch_idle_holders=lambda: _maybe_spawn_idle_holder_watch(),
+    watch_idle_holders=lambda: (_maybe_spawn_idle_holder_watch(), _maybe_spawn_leftover_escalation()),
     episode_dirty=lambda: fsm.record.dirty,
     episode_open=lambda: fsm.state is not ServerState.HEALTHY,
     episode_job=lambda: dict(fsm.record.job),
@@ -1486,6 +1486,19 @@ reaped_survivors: dict[int, tuple[str, str]] = {}
 # The leftovers the current fence episode names ('' when no fence stands): the operator hint is
 # emitted once per episode, not on every scan.
 _leftover_fence_detail: str = ""
+# Spec 04 I70, class J-unkillable-leftover: an unkillable leftover fences every reset, so past
+# LEFTOVER_UNKILLABLE_BUDGET_SEC the idle sampler asks for the host rung, at most once per
+# LEFTOVER_HOST_RUNG_RETRY_SEC. The clock opens at the first scan that finds one stuck in the kernel
+# and closes at the first scan that finds none; a scan error leaves it as it is.
+LEFTOVER_UNKILLABLE_BUDGET_SEC = 600
+LEFTOVER_HOST_RUNG_RETRY_SEC = 60
+_leftover_unkillable_since: Optional[float] = None  # epoch, for /health
+_leftover_unkillable_mono: Optional[float] = None  # monotonic twin the budget is measured on
+_leftover_deadline_paged: bool = False
+_leftover_rung_last_try: float = 0.0  # monotonic
+_leftover_rung_stage: str = ""
+_leftover_rung_detail: str = ""
+_leftover_rung_task: "Optional[asyncio.Task]" = None
 stats: Stats | None = None  # Session statistics
 stats_dir: Path | None = None  # Directory for stats files
 stats_file: Path | None = None  # Current stats file
@@ -4831,6 +4844,7 @@ async def _idle_holder_watch_pass() -> None:
     try:
         scan = await asyncio.to_thread(enumerate_device_holders)
         await asyncio.to_thread(_watch_idle_foreign_holders, scan, time.monotonic())
+        _reaped_leftovers(scan)  # keeps the I70 clock while idle, from the same scan
     except Exception:  # noqa: BLE001 - a detached watch task must never raise unretrieved
         if logger:
             logger.exception("IDLE-HOLDER scan failed — retrying next window")
@@ -6699,6 +6713,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         payload["hold_bound"] = _hold_bound_health(now)
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
+    # Spec 04 I70: an unkillable leftover fencing every reset, with its deadline and rung stage.
+    payload["leftover_fence"] = _leftover_fence_payload()
     return payload
 
 
@@ -7849,7 +7865,8 @@ def _reaped_leftovers(scan: Optional[HolderScan] = None) -> list[ReapedLeftover]
     Opens a fence episode the first time one is seen (one error log and one operator-hint event
     naming each holder) and closes it once none remain. Never raises: a scan bug must not fence a
     free device, so it reads as no leftover."""
-    global _leftover_fence_detail
+    global _leftover_fence_detail, _leftover_unkillable_since, _leftover_unkillable_mono
+    global _leftover_deadline_paged, _leftover_rung_stage, _leftover_rung_detail
     try:
         if scan is None:
             scan = enumerate_device_holders()
@@ -7890,7 +7907,103 @@ def _reaped_leftovers(scan: Optional[HolderScan] = None) -> list[ReapedLeftover]
             logger.info(f"LEFTOVER released the device: {_leftover_fence_detail}")
         health_event("reaped_leftover_released", leftovers=_leftover_fence_detail)
     _leftover_fence_detail = detail
+    if any(f.unkillable for f in found):
+        if _leftover_unkillable_mono is None:
+            _leftover_unkillable_since, _leftover_unkillable_mono = time.time(), time.monotonic()
+    elif _leftover_unkillable_mono is not None:
+        _leftover_unkillable_since = _leftover_unkillable_mono = None
+        _leftover_deadline_paged = False
+        _leftover_rung_stage = _leftover_rung_detail = ""
     return found
+
+
+def _maybe_spawn_leftover_escalation(now: Optional[float] = None) -> bool:
+    """Driven by the sampler (spec 04 I70): start one host-rung try as its own task once an unkillable
+    leftover has fenced the device past its budget, at most once per LEFTOVER_HOST_RUNG_RETRY_SEC.
+    Declines while a requested host reboot or power cycle is pending (I34), while a try or a broker
+    device op is in flight, and before the budget."""
+    global _leftover_rung_task, _leftover_rung_last_try
+    if _leftover_unkillable_mono is None:
+        return False
+    now = time.monotonic() if now is None else now
+    if now - _leftover_unkillable_mono < LEFTOVER_UNKILLABLE_BUDGET_SEC:
+        return False
+    if _leftover_rung_last_try and now - _leftover_rung_last_try < LEFTOVER_HOST_RUNG_RETRY_SEC:
+        return False
+    if _leftover_rung_task is not None and not _leftover_rung_task.done():
+        return False
+    if device_op_active:
+        return False
+    if _host_action_blocks_escalation():
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False  # no event loop (the sampler always has one; a sync unit test may not)
+    _leftover_rung_last_try = now
+    _leftover_rung_task = loop.create_task(_escalate_unkillable_leftover())
+    return True
+
+
+async def _escalate_unkillable_leftover() -> None:
+    """One host-rung try for an unkillable leftover past its budget (spec 04 I70). Re-scans first, and
+    the rung again under the device lock: a leftover gone by either fires nothing and closes the episode. Releases nothing: the boot that follows
+    runs the startup gate (hugepages, then the full health check, fabric included). Never raises."""
+    global _leftover_deadline_paged, _leftover_rung_stage, _leftover_rung_detail
+
+    def log(msg: str) -> None:
+        if logger:
+            logger.error(f"LEFTOVER-HOST-RUNG {msg}")
+
+    try:
+        found = [f for f in await asyncio.to_thread(_reaped_leftovers) if f.unkillable]
+        if not found or _leftover_unkillable_mono is None:
+            return
+        detail = "; ".join(f.describe() for f in found)
+        if not _leftover_deadline_paged:
+            _leftover_deadline_paged = True
+            health_event(
+                "leftover_unkillable_deadline",
+                fault_class="J-unkillable-leftover",
+                since=_leftover_unkillable_since,
+                budget_sec=LEFTOVER_UNKILLABLE_BUDGET_SEC,
+                leftovers=detail,
+            )
+            log(
+                f"an unkillable leftover has fenced the device past its {LEFTOVER_UNKILLABLE_BUDGET_SEC}s "
+                f"budget: {detail}; only a host reboot clears it"
+            )
+        async with _device_op("leftover-host-rung"):
+            stage, why = await galaxy_recovery.leftover_host_rung(
+                [f.pid for f in found],
+                health_monitor.expected(len(_present_chip_indices())),
+                log,
+                what=f"unkillable leftover fences the device ({detail})",
+            )
+        if (stage, why) != (_leftover_rung_stage, _leftover_rung_detail):
+            _leftover_rung_stage, _leftover_rung_detail = stage, why
+            health_event("leftover_host_rung", phase=stage.replace("-", "_"), detail=why, leftovers=detail)
+        if stage == "gone":  # it left while the try waited or checked: this scan closes the episode
+            await asyncio.to_thread(_reaped_leftovers)
+    except Exception:  # noqa: BLE001 - a detached task must never raise unretrieved
+        if logger:
+            logger.exception("LEFTOVER-HOST-RUNG try failed — retrying next window")
+
+
+def _leftover_fence_payload() -> Optional[dict]:
+    """/health's ``leftover_fence`` (spec 03, 04 I70): the unkillable-leftover episode, or None."""
+    if _leftover_unkillable_mono is None:
+        return None
+    since = _leftover_unkillable_since or time.time()
+    return {
+        "fault_class": "J-unkillable-leftover",
+        "since": datetime.fromtimestamp(since).isoformat(timespec="seconds"),
+        "budget_sec": LEFTOVER_UNKILLABLE_BUDGET_SEC,
+        "deadline": datetime.fromtimestamp(since + LEFTOVER_UNKILLABLE_BUDGET_SEC).isoformat(timespec="seconds"),
+        "escalation_stage": _leftover_rung_stage or "waiting-budget",
+        "detail": _leftover_rung_detail or None,
+        "leftovers": _leftover_fence_detail,
+    }
 
 
 def _reaped_leftover_reason(scan: Optional[HolderScan] = None) -> str:

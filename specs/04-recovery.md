@@ -412,7 +412,8 @@ each rung fires only when the gentler one failed or cannot apply.
   that only a host reboot clears a process stuck in the kernel), and `reset_with_quiesce`
   checks the broker's `reset_fence` first and returns without a rung (`reset_fenced` event), so
   no caller (the gate, the ladder, a tool) can reset over one. A reset cannot free such a
-  process and only hits the chips under it. The fence lifts once the holder is gone.
+  process and only hits the chips under it. The fence lifts once the holder is gone; one stuck
+  in the kernel is bounded by I70.
 
 - **I22 — No host rung without the full reset ladder.** A reboot or power cycle fires only after
   the last-chance sweep (SBR, per-tray re-power, mesh reset) ran COMPLETE and the one verify after
@@ -420,6 +421,8 @@ each rung fires only when the gentler one failed or cannot apply.
   off-bus set (I38: the sweep would repeat that reset, which I36 forbids). A sweep that was skipped (a reset already cycling in its own scope, a tenant) or
   incomplete (the I24 gate refused it, or the I23 envelope refused the tray fire) holds the host
   rung for that pass: `_settle_and_verify_before_host_rung` returns None and every caller holds.
+  I70 is the other exception: under an unkillable leftover every reset is fenced (I21), so its host
+  rung runs with no ladder and no sweep.
 
 - **I23 — A per-tray re-power runs inside a host-safety envelope** (`pcie_guard.safe_tray_repower`).
   In order: the tray map is cross-checked against sysfs (each chip's bus against tt-smi's tray
@@ -969,6 +972,53 @@ each rung fires only when the gentler one failed or cannot apply.
   never a boot loop, never an open-ended hold. Class A or C after a cycle a later boot verified, at
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
+- **I70 — An unkillable leftover fences the device for at most 600 s; then the broker takes the
+  host rung (fault class `J-unkillable-leftover`).** The class: a reaped job's leftover (01 I16)
+  stuck in the kernel (state D, or SIGKILL pending) still holds `/dev/tenstorrent`. No reset can
+  heal it: I21 refuses every reset over it, and a reset would not free the process anyway; only a
+  host reboot or power cycle ends it. Its clock starts at the first scan that finds such a holder (the dispatch
+  and reset-fence scans, and the idle-holder scan while idle) and stops at the first scan that finds none (the episode closes, the next one starts afresh; a scan
+  error neither starts nor stops it). The budget is `LEFTOVER_UNKILLABLE_BUDGET_SEC`, 600 s, a
+  constant: the runner has already spent its kill ladder (SIGINT 60 s, SIGTERM 15 s, SIGKILL) before
+  the fence opens; a kernel wait that does finish (a driver release unpinning its buffers, a slow
+  writeback) ends in seconds to about two minutes, and the kernel reports a task blocked past 120 s
+  as hung; 600 s is five such periods and the same as the stuck-hold ceiling, while the motivating
+  incident sat about an hour without clearing. Past the budget the idle sampler asks for the rung at
+  most once per `LEFTOVER_HOST_RUNG_RETRY_SEC` (60 s); each try first re-scans, and a leftover gone
+  by then fires nothing. The rung is chosen by `_host_escalation_for_drop` with the warm reboot
+  futile whenever a chip is off the bus on a multi-chip host (a reboot does not bring an off-bus
+  Galaxy chip back), so that case takes the power cycle; with every chip present the chooser's own
+  order holds (the warm reboot, which ends every process, then the power cycle). No reset, sweep or
+  tray re-power runs first (an exception to I22). Guards kept: a host action already pending (I34)
+  asks nothing more (re-read under the device lock, so a try spawned before another path's request,
+  such as the I76 bound's host rung, asks nothing: one power-cycle request per episode even when
+  that launch timed out and retracted its governor record), a reset cycling in its scope, a running broker job or a readable tenant other
+  than the leftovers themselves (they are discounted; an unreadable scan is waived as on the
+  forced climb), the operator stand-back for the power cycle, and the governor (I9/I10 rate limits,
+  the I65 cooldown). After the stand-back and the governor (the stand-back command can run for its
+  whole timeout) the rung scans again and fires only if a reset scope still does not cycle, no
+  tenant arrived and a leftover is still in that scan. A leftover that left at any point before the
+  fire (between the try's first scan and the device lock, or during the last checks) fires nothing:
+  the stage is `gone` and the try's own re-scan closes the episode. A guard holds and fires nothing; the next try asks again, so a denial ends when
+  its cause does (the cooldown at its stated end). With no host rung opted in the episode goes to an
+  operator, journaled once. Journal: `leftover_unkillable_deadline` once per episode at the budget,
+  then `leftover_host_rung` each time its stage changes (`requested` with the action, `held` with
+  why, `gone`, `no_host_rung`). While an unkillable leftover stands `/health` carries `leftover_fence`:
+  `fault_class`, `since`, `budget_sec`, `deadline`, `escalation_stage` (`waiting-budget`,
+  `requested`, `held`, `gone`, `no-host-rung`), `detail` and the leftovers; `null` otherwise. The rung
+  releases nothing: the boot that follows runs the startup gate, which waits for the 1G hugepage
+  pool and passes the full health check, fabric included, before the queue is released (03 I4); a
+  failed check keeps the hold and climbs the bounded ladder. The clock lives in memory: a broker
+  restart starts it again at its first scan (one more budget at most). Time to recover for this
+  class: before, unbounded (until an operator rebooted the host; about an hour in the incident);
+  after, up to `IDLE_HOLDER_SCAN_SEC` (60 s) while idle before the first scan opens the clock, 600 s
+  plus at most one 60 s retry tick to the request, then the host rung (a warm reboot about 3-5 min,
+  a power cycle about 5-8 min) and the startup check (about 3 min): about 17-23 min (17-20 min by
+  reboot, 19-23 min by power cycle). Later only while the governor holds the rung, each bounded and
+  shown as `held` on `/health`: the I65 cooldown when a cycle or boot fell within its last 30 min,
+  and, on a host with no power cycle opted in, the reboot loop guard
+  (`AUTO_RECOVERY_MIN_INTERVAL_SEC`, 3600 s since the last automatic reboot). The `gone` stage and
+  the second scan add no wait.
 
 - **I79 — A hold whose reset and full check already failed climbs at once, not at the ceiling.**
   The stuck-hold ceiling (600 s) bounds how long the host rungs wait for the gentler rungs to have
@@ -1500,6 +1550,11 @@ sees a silent fabric pass.
 | I13 light verify; unhealthy downgrade | `tests/test_reset.py::test_reset_tool_reports_health`, `tests/test_reset.py::test_verify_health_fails_on_short_chip_count`, `tests/test_reset.py::test_verify_health_fails_on_wedged_arc`, `tests/test_reset.py::test_verify_health_passes_on_over_count_from_stale_expected` |
 | I20 the AICLK ceiling is re-applied after the rescan, before the pollers return, re-read within a bounded settle window | `tests/test_aiclk_ceiling.py::test_reset_reapplies_after_the_rescan_before_the_pollers_return`, `tests/test_aiclk_ceiling.py::test_reset_failed_rung_leaves_the_ceiling_owed`, `tests/test_aiclk_ceiling.py::test_reset_apply_error_never_breaks_the_rung`, `tests/test_aiclk_ceiling.py::test_reset_unconfigured_runs_no_ceiling`, `tests/test_aiclk_ceiling.py::test_reset_reapply_reads_back_within_the_settle_window`, `tests/test_aiclk_ceiling.py::test_post_reset_readback_that_settles_in_the_window_is_verified`, `tests/test_aiclk_ceiling.py::test_post_reset_readback_high_for_the_whole_window_is_unverified_once`, `tests/test_aiclk_ceiling.py::test_post_reset_settle_wait_is_bounded`, `tests/test_aiclk_ceiling.py::test_settle_never_reruns_a_verified_timed_out_or_unsupported_helper`, `tests/test_aiclk_ceiling.py::test_without_settle_a_high_readback_is_reported_at_once`, `tests/test_aiclk_ceiling.py::test_settle_window_config`, `tests/test_aiclk_ceiling.py::test_post_reset_apply_realistic_run_is_well_inside_the_budget`, `tests/test_aiclk_ceiling.py::test_post_reset_apply_hung_first_run_stops_at_the_helper_timeout`, `tests/test_aiclk_ceiling.py::test_post_reset_apply_retry_hung_near_the_window_end_stays_in_budget`, `tests/test_aiclk_ceiling.py::test_post_reset_apply_worst_case_is_under_the_budget` |
 | I21 every reset is refused over a reaped job's leftover, forced or not, through `reset_with_quiesce` too; it lifts once the holder is gone | `tests/test_reaped_leftover.py::test_the_reset_tool_is_refused_even_with_force`, `tests/test_reaped_leftover.py::test_the_streaming_reset_is_refused_even_with_force`, `tests/test_reaped_leftover.py::test_reset_with_quiesce_is_refused_through_the_fence`, `tests/test_reaped_leftover.py::test_the_broker_wires_the_fence_into_the_recovery_mechanism` |
+| I70 an unkillable leftover asks for no host rung before its 600 s budget; past it, the reboot with every chip present, the power cycle with a chip off the bus | `tests/test_unkillable_leftover_escalation.py::test_no_rung_before_the_budget`, `tests/test_unkillable_leftover_escalation.py::test_a_reboot_once_past_the_budget_with_every_chip_present`, `tests/test_unkillable_leftover_escalation.py::test_a_power_cycle_with_chips_off_the_bus` |
+| I70 the clock opens on an unkillable leftover only, closes when none is left (a leftover gone at the deadline fires nothing), and a scan error leaves it as it is; the idle-holder scan keeps it | `tests/test_unkillable_leftover_escalation.py::test_a_killable_leftover_starts_no_clock`, `tests/test_unkillable_leftover_escalation.py::test_a_leftover_gone_at_the_deadline_fires_nothing_and_closes_the_episode`, `tests/test_unkillable_leftover_escalation.py::test_a_scan_error_leaves_the_clock_as_it_is`, `tests/test_unkillable_leftover_escalation.py::test_the_idle_holder_scan_keeps_the_clock` |
+| I70 guards: a governor/cooldown denial holds and the next try fires; the operator stand-back holds the power cycle and a later try fires it once the marker is gone; a pending host action or a device op asks nothing; another tenant or a running job blocks, the leftover itself does not; a leftover that leaves while the try waits on the lock, or a leftover leaving, a tenant arriving or a reset scope starting during the stand-back or governor check, fires nothing (`gone` closes the episode); no host rung opted in journals `no_host_rung` | `tests/test_unkillable_leftover_escalation.py::test_a_governor_denial_holds_then_fires_on_a_later_try`, `tests/test_unkillable_leftover_escalation.py::test_a_held_stage_is_journaled_once_while_it_stands`, `tests/test_unkillable_leftover_escalation.py::test_the_operator_stand_back_holds_the_power_cycle_until_it_is_gone`, `tests/test_unkillable_leftover_escalation.py::test_a_leftover_that_leaves_while_the_try_waits_on_the_lock_fires_nothing`, `tests/test_unkillable_leftover_escalation.py::test_a_change_during_the_last_checks_holds_the_rung`, `tests/test_unkillable_leftover_escalation.py::test_a_pending_host_action_asks_for_nothing`, `tests/test_unkillable_leftover_escalation.py::test_a_device_op_in_flight_defers_the_try`, `tests/test_unkillable_leftover_escalation.py::test_another_tenant_blocks_the_rung_but_the_leftover_itself_does_not`, `tests/test_unkillable_leftover_escalation.py::test_a_running_job_blocks_the_rung`, `tests/test_unkillable_leftover_escalation.py::test_no_host_rung_opted_in_journals_no_host_rung` |
+| I70/I76 a killed job's leftover past 600 s and the 10-min hold bound request one power cycle per episode, in either order, with a leftover try spawned before the bound's request, and whether the launch ran or timed out; the device stays held with the full check owed | `tests/test_unkillable_leftover_escalation.py::test_replay_the_bound_and_the_leftover_budget_request_one_power_cycle` |
+| I70 `/health` `leftover_fence`, the sampler wiring, and the bounded time to request (at most 660 s) with nothing on the path releasing the device | `tests/test_unkillable_leftover_escalation.py::test_the_health_fields`, `tests/test_unkillable_leftover_escalation.py::test_the_sampler_drives_the_escalation`, `tests/test_unkillable_leftover_escalation.py::test_time_to_request_is_bounded_and_nothing_releases_the_device` |
 | I14 warm reboot never fired where futile; blocked climbs are loud | `tests/test_device_safety.py::test_host_escalation_for_drop_sends_all_off_bus_to_the_cold_rung`, `tests/test_device_safety.py::test_host_escalation_for_drop_routes_a_futile_reboot_to_the_cold_rung`, `tests/test_device_safety.py::test_gate_all_off_bus_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_reset_regression_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_all_off_bus_power_cycles_when_opted_in` |
 | Cold rung fireable-or-off (ipmitool) | `tests/test_device_safety.py::test_a_host_without_ipmitool_serves_with_the_cold_rung_off`, `tests/test_device_safety.py::test_ipmitool_present_leaves_the_cold_rung_armed` |
 | I26 pre-power-cycle hook: opt-in, runs between record and fire, bounded, never gates the cycle | `tests/test_pre_power_cycle_hook.py::test_unset_hook_runs_nothing_and_the_cycle_is_unchanged`, `tests/test_pre_power_cycle_hook.py::test_the_hook_runs_after_the_record_and_before_the_fire`, `tests/test_pre_power_cycle_hook.py::test_a_failing_hook_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_a_hook_that_cannot_run_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_a_hung_hook_is_killed_with_its_children_and_the_cycle_goes_ahead`, `tests/test_pre_power_cycle_hook.py::test_a_background_child_holding_output_does_not_stretch_the_wait`, `tests/test_pre_power_cycle_hook.py::test_the_hook_never_runs_when_the_ledger_aborts_the_cycle`, `tests/test_pre_power_cycle_hook.py::test_a_hook_that_raises_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_cancelled_while_waiting_on_the_hook_retracts_the_ledger_entry`, `tests/test_pre_power_cycle_hook.py::test_the_warm_reboot_does_not_run_the_power_cycle_hook`, `tests/test_pre_power_cycle_hook.py::test_the_timeout_is_always_finite_and_positive` |
