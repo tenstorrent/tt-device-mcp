@@ -99,6 +99,7 @@ def test_a_verified_release_after_a_reset_holds_fabric_unverified(mesh):
 
 def test_no_debt_releases_as_before(mesh):
     fsm_dirty(srv, "gate/post-job: exit 1", why="job_killed")
+    FABRIC_DEBT.note_fabric(True)  # the full check, fabric included, just passed (03 I78)
     assert srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy") is True
     assert srv.fsm.state is ServerState.HEALTHY
 
@@ -152,21 +153,24 @@ async def test_the_77_fallback_never_releases_a_reset_with_no_passing_fabric_pas
 
 @pytest.mark.asyncio
 async def test_the_foreign_holder_fast_verify_after_a_reset_holds(mesh, monkeypatch):
-    """Its enum+ARC-only pass cannot settle a reset's debt: the hold turns fabric-unverified."""
+    """It runs the full check, fabric included (03 I78): a pass that brings no fabric verdict cannot
+    settle a reset's debt, so nothing is released and the debt stays owed."""
     fsm_dirty(srv, "foreign holder", why="foreign_holder", dirty=False)
     FABRIC_DEBT.note_reset("adopted ttdev-reset-x.scope")
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda scan: "")
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+    runs = []
 
     async def verify(expected, log, run_fabric=True, **_):
-        assert not run_fabric
+        runs.append(run_fabric)
         return True, {"snapshot": {"ok": True}}
 
     patch_recovery(monkeypatch, "_verify_device", verify)
-    assert await srv._foreign_holder_fast_verify(32, lambda m: None) is True
-    assert srv.fsm.state is ServerState.RECOVERING and srv.fsm.record.why == srv.FABRIC_RELIFT_WHY
-    assert srv._idle_relift_armed()[1], "the fabric relift owns it: bounded, never an open-ended hold"
+    await srv._foreign_holder_fast_verify(32, lambda m: None)
+    assert runs == [True], "the full check, fabric included"
+    assert srv.fsm.state is ServerState.RECOVERING and FABRIC_DEBT.owed, "held, the debt still owed"
 
 
 # ---- every reset path, one at a time: an unproven verify holds, a passing fabric pass releases ----
@@ -661,6 +665,7 @@ async def test_the_gate_ladders_last_chance_sweep(mesh, monkeypatch, galaxy_tray
     [
         (True, galaxy.OUTCOME_RECOVERED, "held"),  # the funnel refused: never reopened by the fold
         (False, galaxy.OUTCOME_RECOVERED, "healthy"),
+        (None, galaxy.OUTCOME_RECOVERED, "held"),  # no fabric pass since the hold: refused (03 I78)
         (True, galaxy.OUTCOME_TERMINAL, "held"),  # a 77-only hold measured no fault: not DOWN
         (False, galaxy.OUTCOME_WAITING, "held"),
     ],
@@ -671,6 +676,8 @@ def test_no_rung_outcome_lifts_a_fabric_unverified_hold(mesh, owed, outcome, exp
     if owed:
         FABRIC_DEBT.note_reset("tt-smi -glx_reset")
     srv._hold_device_fabric_unverified("fabric check exited 77")
+    if owed is False and outcome == galaxy.OUTCOME_RECOVERED:
+        FABRIC_DEBT.note_fabric(True)  # the rung's verify ran the full check and it passed
     srv._fold_rung_outcome(outcome, lambda m: None)
     if expect == "healthy":
         assert srv.fsm.state is ServerState.HEALTHY
