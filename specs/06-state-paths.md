@@ -245,16 +245,17 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` | hold deadline (1200) | Longest a held job waits before it fails and the hold escalates; no value disables it | 01 |
 | `TT_DEVICE_MCP_TENANT_UIDS` | unset | Comma-separated uids or user names below 1000 whose device holders count as tenants. Root is ignored; a name that does not resolve is retried on the next scan | 04 |
 | `TT_DEVICE_MCP_HOLD_DEADLINE_SEC` | 2× stuck ceiling (1200) | Hold age flagged STUCK to the durable timeline | 03 |
-| `TT_DEVICE_MCP_STUCK_HOLD_SEC` | 600 | General hold ceiling before forced escalation | 03 |
+| `TT_DEVICE_MCP_STUCK_HOLD_SEC` | 600 | General hold ceiling before forced escalation; values above 600 read as 600 (04 I76) | 03 |
 | `TT_DEVICE_MCP_STUCK_HOLD_RESET` | 1 | Kill switch: idle escalation may reset a stuck hold | 03 |
-| `TT_DEVICE_MCP_OFFBUS_HOLD_SEC` | 120 | Off-bus hold ceiling (an order below the general one) | 03 |
+| `TT_DEVICE_MCP_OFFBUS_HOLD_SEC` | 120 | Off-bus one-shot wait while a tenant holds the device (a tenant-free hold runs it after one sampler interval) | 03 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE` | 1 | Kill switch: off-bus holds escalate early | 03 |
+| `TT_DEVICE_MCP_PROGRESS_RETRY_SEC` | 60 | Delay of the one retry after a failed mesh reset that brought chips back (capped at the hold ceiling) | 04 |
 | `TT_DEVICE_MCP_PRESENT_MESH_RESET_GRACE_SEC` | 300 | Present-mesh eth/fabric hold grace before reset | 03 |
 | `TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE` | 1 | Kill switch: generic holds join the idle escalation | 03 |
 | `TT_DEVICE_MCP_IDLE_HOLDER_SEC` | 900 | Seconds a foreign holder's CPU time stays flat before it is named (event + alert, never signalled); 0 turns it off | 03 |
 | `TT_DEVICE_MCP_ACTIVITY_INTERVAL_SEC` | 1 | Seconds between device-activity samples of a running job (03 I54); malformed, 0 or negative falls back to 1 | 03 |
 | `TT_DEVICE_MCP_DEVICE_IDLE_AFTER_SEC` | 1 | Seconds a running job must do no device work, without a break, before its status reads `DEVICE IDLE` (03 I54) | 03 |
-| `TT_DEVICE_MCP_FORCE_ESCALATE` | 1 | Kill switch: past-ceiling forced escalation | 03 |
+| `TT_DEVICE_MCP_FORCE_ESCALATE` | 1 | Kill switch: forced escalation below the 10-min hold bound; the bound (04 I76) ignores it | 03 |
 | `TT_DEVICE_MCP_ETH_FREEZE_HOLD` | 1 | Frozen-eth verdict holds instead of resetting | 03 |
 | `TT_DEVICE_MCP_HOLD_REARM_SEC` | 1800 | Re-arm window for hold-escalation alerts | 03 |
 | `TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ` | 800 | Highest AI clock a chip may read once a job has ended; above it the job is recorded as not having closed the device (a bad value falls back to 800) | 03 |
@@ -290,7 +291,8 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC` | 300 | How long after the BMC's IPMI first fails a tray re-power in an off-bus hold before the I27 power cycle may run (the ladder still runs once first) | 04 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC` | 1200 | With no `TT_DEVICE_MCP_POWER_CYCLE_CMD`, how long a gated off-bus hold stands for an operator, from the episode start, before the broker lifts the `hold` gate for one pass of its own reset ladder (I33); `off` keeps the hold for an operator | 04 |
 | `TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC` | 300 | How long after an off-bus hold's per-tray reset walk failed to recover the mesh (or regressed it) before the I27 power cycle may run; no below-floor mesh reset runs in between | 04 |
-| `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` | 21600 | At most one I27 attempt per this many seconds per host; within it the broker pages instead | 04 |
+| `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` | unset (none) | Extra spacing between I27 attempts on top of the I65 cooldown, capped at 14400 (the I65 backoff cap); within it the hold pages and stands to a deadline on /health | 04 |
+| `TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE` | `<state dir>/power_cycle_history.jsonl` | Read-only: a JSON-lines file of power cycles an out-of-band tool fired (`at_epoch`, optional `cause`; a line whose cause ends ` (cycle failed)` never counts and cancels the attempt line with the same `at_epoch` and cause); its latest record is one more anchor of the I65 power-cycle cooldown. Missing or unreadable adds none; it never shortens or skips the cooldown | 04 |
 | `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC` | 1800 | How long past the grace a tenant, a reset scope or a stand-back may block the I27 power cycle before the broker pages once | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE` | unset | `:`-separated marker paths; any that exists holds the I27 power cycle | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD` | unset | Command; exit 0 holds the I27 power cycle, 1 clears, anything else holds | 04 |
@@ -341,9 +343,6 @@ Behavior).
 | `TTDEV_UNIT_PATH` | `/etc/systemd/system/tt-device-broker.service` | Unit path (render seam) |
 | `TTDEV_BRANCH` | `main` | Branch autoupdate tracks — the **only** settable part of the update source (08 I16); the repository itself is a constant in `autoupdate.sh`, not configuration |
 | `TTDEV_AUTOUPDATE` | `1` | Autoupdate master switch. Read at install to seed the config file, and by every lap; `sudo TTDEV_AUTOUPDATE=0 ./install.sh` turns a host off outright (after `sudo`, which resets the environment) |
-| `TTDEV_MAX_DEFER_SEC` | 0 (off — apply immediately; jobs re-adopt) | Opt-in busy/idle gate: seconds autoupdate waits for an idle window. The in-flight device-op bar is separate and unconditional (spec 08) |
-| `TTDEV_DRAIN_AFTER_SEC` | 300 | With the idle gate on: seconds a pending update waits on a busy box before autoupdate drains it (holds dispatch, lets the running job finish, applies at the job boundary); also the back-off after a drain that timed out (spec 08 I20) |
-| `TTDEV_DRAIN_TIMEOUT_SEC` | 300 | Bound on one drain: a job still running after it is left alone and dispatch is released (spec 08 I20) |
 | `TTDEV_LOCK` | 0 | Apply the udev device lock at install (shared host) |
 | `TTDEV_HEALTH_PROBE` | 1 | Read by `apply-host-config.sh` from the config file: `0` disables `tt-device-health-probe.timer` (spec 08 I17), anything else enables it |
 | `TTDEV_NO_LOCK` | unset | Back-compat: force cooperative (no lock) |

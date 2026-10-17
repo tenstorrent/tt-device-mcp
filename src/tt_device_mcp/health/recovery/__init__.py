@@ -27,6 +27,7 @@ from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import constants, metrics
 from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import pcie_guard
@@ -130,6 +131,9 @@ class Evidence:
     # Spec 03 I61: a clean post-job eth read timed out on a present mesh, and this hold episode's one
     # present-mesh reset is unspent and not refused by the outage hold. Routed like dispatch_reset_due.
     eth_timeout_reset_due: bool = False
+    # Spec 03 I69: a job the broker stopped mid-run (its timeout, or a requested kill) owes the mesh
+    # one reset before release, on the same unspent latch. Routed like dispatch_reset_due.
+    kill_reset_due: bool = False
     # Spec 03 I55: the fabric passed traffic but mesh dispatch failed over a present mesh, and this
     # hold episode has not had its one present-mesh reset yet (nor does the outage hold forbid it).
     dispatch_reset_due: bool = False
@@ -279,6 +283,10 @@ class RecoveryDeps:
     # (server._note_fabric_77_reset_passes), so the next relift falls back at once instead of
     # re-running the passes the reset just spent.
     note_fabric_77_reset_passes: Optional[Callable[[int], None]] = None
+    # Whether the open hold's fabric 77 has a cause no reset or reboot fixes — a known cable fault (a 78),
+    # a topology mismatch or fault, hugepages not yet allocated, the validator missing
+    # (server._fabric_77_no_reset_cause). Such a 77 never climbs to a host rung (spec 04 I29).
+    fabric_77_no_reset_cause: Optional[Callable[[], bool]] = None
     refresh_idle_hold_ledger: Optional[Callable[[], None]] = None
     spawn_idle_relift: Optional[Callable[[], None]] = None
     watch_idle_holders: Optional[Callable[[], None]] = None
@@ -487,6 +495,8 @@ class Recovery(ABC):
             # a no_bridge reset 3x per gone chip, then again on the stuck-hold escalation).
             for attempt in range(BRIDGE_RESET_MAX_TRIES):
                 FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
+                # A bridge reset clears the chip's firmware clock cap like any reset (spec 03 I35).
+                CEILING.mark_owed(f"bridge reset of chip {idx}")
                 result = await asyncio.to_thread(reset_chip_via_bridge, idx, bdf)
                 if result:
                     recovered.append(idx)
@@ -641,6 +651,9 @@ class Recovery(ABC):
         # foreign scope or a clean-exit-but-unverified reset must not leave a stale hard-fail flag that
         # steers the next gate's escalation to the cold rung over a reset that never hard-failed.
         self.mechanism.last_reset_exit_nonzero = False
+        # Set only once a reset of ours launched and exited: a refused, adopted or still-cycling one
+        # leaves None, and only a launched one that failed goes in the boot's record (spec 04 I58).
+        self.mechanism.last_reset_rc = None
         argv = select_recovery(self.monitor, self.mechanism, self.deps).reset_argv(indices)
         expected = self.monitor.expected(len(indices))
 
@@ -691,6 +704,7 @@ class Recovery(ABC):
         finally:
             if aer_mask is not None:
                 await asyncio.to_thread(aer_mask.restore)
+        self.mechanism.last_reset_rc = rc
         if _journal_cpld_too_old(argv, out, log):
             # Latched on the mechanism both platforms share, so the NEXT rung and every later pass
             # resolve to the galaxy ladder rather than repeating the `-r` tt-smi just disowned.

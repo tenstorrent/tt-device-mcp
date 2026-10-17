@@ -64,7 +64,7 @@ def _fake_sysfs(monkeypatch, tmp_path, *, missing=(), unbound=(), enodata=(), ei
         return real(node)
 
     monkeypatch.setattr(heartbeat, "_read_beat", read_beat)
-    return {"add": add, "nodata": nodata}
+    return {"add": add, "nodata": nodata, "eio": io_error}
 
 
 def _live_health(monkeypatch) -> None:
