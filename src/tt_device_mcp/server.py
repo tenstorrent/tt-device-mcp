@@ -33,6 +33,7 @@ import shlex
 import shutil
 import signal
 import socket
+import threading
 import subprocess
 import sys
 import time
@@ -88,6 +89,8 @@ from tt_device_mcp.device_holders import (
     note_broker_internal,
     read_proc_cpu,
     reclaim_foreign_holders,
+    proc_uid,
+    read_proc_starttime,
     wait_device_released,
 )
 from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec, add_close_listener
@@ -163,7 +166,14 @@ from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
 from tt_device_mcp.job_preflight import preflight_output_dirs
-from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
+from tt_device_mcp.job_reap import (
+    DEAD_CHIP_LABEL_PREFIX,
+    JOB_TAG_ENV,
+    ReapedLeftover,
+    find_reaped_leftovers,
+    reap_job_survivors,
+    stuck_device_holder,
+)
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
     SpoolTail,
@@ -1081,6 +1091,7 @@ _recovery_deps = RecoveryDeps(
     health_event=lambda kind, **f: health_event(kind, **f),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     wait_device_released=lambda pids: wait_device_released(pids, HOLDER_RELEASE_WAIT_SEC),
+    note_stuck_holders=lambda chips, killed: _note_dead_chip_stuck_holders(chips, killed),
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
     hold_device_fabric_unverified=lambda why: _hold_device_fabric_unverified(why),
     note_fabric_77_reset_passes=lambda n: _note_fabric_77_reset_passes(n),
@@ -1142,6 +1153,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         health_monitor = fsm.monitor
         recovery_mechanism = fsm.mechanism
         recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
+        recovery_mechanism.reenumerate_fence = lambda: _dead_chip_stuck_reason()
         galaxy_recovery = fsm.galaxy
         per_target_recovery = fsm.per_target
         select_recovery = fsm.select_recovery
@@ -1476,6 +1488,17 @@ _leftover_rung_last_try: float = 0.0  # monotonic
 _leftover_rung_stage: str = ""
 _leftover_rung_detail: str = ""
 _leftover_rung_task: "Optional[asyncio.Task]" = None
+# Spec 04 I77, class J-dead-chip-stuck-holder: a process the dead-chip path killed that is still
+# alive stuck in the kernel with the removed chip referenced (state D, most often a read of the dead
+# BAR). It joins the I70 leftovers, so every reset and every dispatch is fenced and the same host-rung
+# escalation applies, on the shorter DEAD_CHIP_STUCK_BUDGET_SEC (the kernel's hung-task threshold: a
+# D state that long does not end on its own), and it fences every rung that re-enumerates PCI.
+DEAD_CHIP_STUCK_BUDGET_SEC = 120
+DEAD_CHIP_STUCK_CLASS = "J-dead-chip-stuck-holder"
+_dead_chip_stuck: dict[int, tuple[str, str, int]] = {}  # pid -> (label, starttime, uid)
+_dead_chip_stuck_lock = threading.Lock()
+_dead_chip_page_pending: Optional[dict] = None  # a page the alert hook dropped, sent again next scan
+_leftover_dead_chip: bool = False  # the open I70 episode names a dead-chip stuck holder
 stats: Stats | None = None  # Session statistics
 stats_dir: Path | None = None  # Directory for stats files
 stats_file: Path | None = None  # Current stats file
@@ -7183,7 +7206,7 @@ def _reaped_leftovers(scan: Optional[HolderScan] = None) -> list[ReapedLeftover]
     naming each holder) and closes it once none remain. Never raises: a scan bug must not fence a
     free device, so it reads as no leftover."""
     global _leftover_fence_detail, _leftover_unkillable_since, _leftover_unkillable_mono
-    global _leftover_deadline_paged, _leftover_rung_stage, _leftover_rung_detail
+    global _leftover_deadline_paged, _leftover_rung_stage, _leftover_rung_detail, _leftover_dead_chip
     try:
         if scan is None:
             scan = enumerate_device_holders()
@@ -7192,6 +7215,7 @@ def _reaped_leftovers(scan: Optional[HolderScan] = None) -> list[ReapedLeftover]
             held = {h.pid for h in scan.holders}
             for pid in [p for p in reaped_survivors if p not in held]:
                 reaped_survivors.pop(pid, None)
+        found += _dead_chip_stuck_leftovers({f.pid for f in found})
     except Exception as e:
         if logger:
             logger.error(f"LEFTOVER scan error: {e}")
@@ -7224,6 +7248,7 @@ def _reaped_leftovers(scan: Optional[HolderScan] = None) -> list[ReapedLeftover]
             logger.info(f"LEFTOVER released the device: {_leftover_fence_detail}")
         health_event("reaped_leftover_released", leftovers=_leftover_fence_detail)
     _leftover_fence_detail = detail
+    _leftover_dead_chip = any(f.unkillable and f.job_id.startswith(DEAD_CHIP_LABEL_PREFIX) for f in found)
     if any(f.unkillable for f in found):
         if _leftover_unkillable_mono is None:
             _leftover_unkillable_since, _leftover_unkillable_mono = time.time(), time.monotonic()
@@ -7243,7 +7268,7 @@ def _maybe_spawn_leftover_escalation(now: Optional[float] = None) -> bool:
     if _leftover_unkillable_mono is None:
         return False
     now = time.monotonic() if now is None else now
-    if now - _leftover_unkillable_mono < LEFTOVER_UNKILLABLE_BUDGET_SEC:
+    if now - _leftover_unkillable_mono < _leftover_budget_sec():
         return False
     if _leftover_rung_last_try and now - _leftover_rung_last_try < LEFTOVER_HOST_RUNG_RETRY_SEC:
         return False
@@ -7281,13 +7306,13 @@ async def _escalate_unkillable_leftover() -> None:
             _leftover_deadline_paged = True
             health_event(
                 "leftover_unkillable_deadline",
-                fault_class="J-unkillable-leftover",
+                fault_class=_leftover_fault_class(),
                 since=_leftover_unkillable_since,
-                budget_sec=LEFTOVER_UNKILLABLE_BUDGET_SEC,
+                budget_sec=_leftover_budget_sec(),
                 leftovers=detail,
             )
             log(
-                f"an unkillable leftover has fenced the device past its {LEFTOVER_UNKILLABLE_BUDGET_SEC}s "
+                f"an unkillable leftover has fenced the device past its {_leftover_budget_sec()}s "
                 f"budget: {detail}; only a host reboot clears it"
             )
         async with _device_op("leftover-host-rung"):
@@ -7310,11 +7335,12 @@ def _leftover_fence_payload() -> Optional[dict]:
     if _leftover_unkillable_mono is None:
         return None
     since = _leftover_unkillable_since or time.time()
+    budget = _leftover_budget_sec()
     return {
-        "fault_class": "J-unkillable-leftover",
+        "fault_class": _leftover_fault_class(),
         "since": datetime.fromtimestamp(since).isoformat(timespec="seconds"),
-        "budget_sec": LEFTOVER_UNKILLABLE_BUDGET_SEC,
-        "deadline": datetime.fromtimestamp(since + LEFTOVER_UNKILLABLE_BUDGET_SEC).isoformat(timespec="seconds"),
+        "budget_sec": budget,
+        "deadline": datetime.fromtimestamp(since + budget).isoformat(timespec="seconds"),
         "escalation_stage": _leftover_rung_stage or "waiting-budget",
         "detail": _leftover_rung_detail or None,
         "leftovers": _leftover_fence_detail,
@@ -7338,6 +7364,132 @@ def _reaped_leftover_reason(scan: Optional[HolderScan] = None) -> str:
         + "; ".join(f.describe() for f in found)
         + reboot
         + "; no reset runs and no job is dispatched until it closes its /dev/tenstorrent fds"
+    )
+
+
+def _leftover_budget_sec() -> int:
+    """The open I70 episode's budget: DEAD_CHIP_STUCK_BUDGET_SEC once it names a killed holder stuck
+    on a dead chip (spec 04 I77), else LEFTOVER_UNKILLABLE_BUDGET_SEC."""
+    return DEAD_CHIP_STUCK_BUDGET_SEC if _leftover_dead_chip else LEFTOVER_UNKILLABLE_BUDGET_SEC
+
+
+def _leftover_fault_class() -> str:
+    return DEAD_CHIP_STUCK_CLASS if _leftover_dead_chip else "J-unkillable-leftover"
+
+
+def _note_dead_chip_stuck_holders(chips: list, killed: list) -> list[int]:
+    """The dead-chip path's check after its release wait (spec 04 I77): each pid it killed that is
+    still alive stuck in the kernel (state D or SIGKILL pending) with a /dev/tenstorrent fd or a
+    mapping of the dead chips' node or BARs (unreadable counts as held) is registered as a leftover,
+    journaled ``dead_chip_holder_stuck`` with host_at_risk, and paged at once. The I70 episode opens
+    with it. Returns the stuck pids. Never raises."""
+    global _dead_chip_page_pending
+    label = DEAD_CHIP_LABEL_PREFIX + ",".join(str(c) for c in chips)
+    bdfs = []
+    for c in chips:
+        try:
+            bdf = chip_pci_bdf(c)
+        except Exception:  # noqa: BLE001 - an unknown BAR path still leaves the fd and node checks
+            bdf = None
+        if bdf:
+            bdfs.append(bdf)
+    stuck: list[ReapedLeftover] = []
+    for k in killed:
+        pid = k.get("pid") if isinstance(k, dict) else None
+        if not isinstance(pid, int):
+            continue
+        try:
+            uid = proc_uid(pid)
+            f = stuck_device_holder(pid, label, -1 if uid is None else uid, bdfs)
+            if f is None:
+                continue
+            with _dead_chip_stuck_lock:
+                _dead_chip_stuck[pid] = (label, read_proc_starttime(pid) or "", f.uid)
+            stuck.append(f)
+        except Exception as e:  # noqa: BLE001 - one unreadable pid must not hide the others
+            if logger:
+                logger.error(f"DEAD-CHIP stuck-holder check of pid {pid} failed: {e}")
+    if not stuck:
+        return []
+    detail = "; ".join(f.describe() for f in stuck)
+    message = (
+        f"killed holder(s) of dead chip(s) {','.join(str(c) for c in chips)} survived SIGKILL stuck in "
+        f"the kernel: {detail}. The host is at risk: no rung re-enumerates PCI while they live, and past "
+        f"{DEAD_CHIP_STUCK_BUDGET_SEC}s the broker requests the host rung (spec 04 I77)"
+    )
+    if logger:
+        logger.error(f"DEAD-CHIP {message}")
+    fields = {
+        "chips": [str(c) for c in chips],
+        "holders": [
+            {"pid": f.pid, "uid": f.uid, "state": f.state, "wchan": f.wchan, "sigkill_pending": f.sigkill_pending}
+            for f in stuck
+        ],
+        "fault_class": DEAD_CHIP_STUCK_CLASS,
+        "budget_sec": DEAD_CHIP_STUCK_BUDGET_SEC,
+    }
+    health_event("dead_chip_holder_stuck", message=message, host_at_risk=True, severity="high", **fields)
+    _dead_chip_page_pending = {
+        "kind": "dead_chip_holder_stuck",
+        "message": message,
+        "host": socket.gethostname(),
+        "host_at_risk": True,
+        "severity": "high",
+        **fields,
+    }
+    _send_dead_chip_page()
+    _reaped_leftovers()  # open the I70 episode now: its clock and /health's leftover_fence
+    return [f.pid for f in stuck]
+
+
+def _send_dead_chip_page() -> None:
+    """Send the pending I77 page; one the alert hook drops (a run still in flight) is sent again on
+    the next leftover scan."""
+    global _dead_chip_page_pending
+    event = _dead_chip_page_pending
+    if event is None:
+        return
+    if alert.send_alert(event, logger) is not None or alert.alert_argv() is None:
+        _dead_chip_page_pending = None
+
+
+def _dead_chip_stuck_leftovers(exclude: set) -> list[ReapedLeftover]:
+    """The registered dead-chip stuck holders still stuck (spec 04 I77), as leftovers; ``exclude``
+    names pids already found as a job's. One that is gone (or a reused pid), a zombie, or no longer
+    stuck with a device reference is dropped and journaled ``dead_chip_holder_released``."""
+    _send_dead_chip_page()
+    with _dead_chip_stuck_lock:
+        entries = list(_dead_chip_stuck.items())
+    found = []
+    for pid, (label, starttime, uid) in entries:
+        f = None
+        if not starttime or read_proc_starttime(pid) == starttime:
+            bdfs = [b for b in (chip_pci_bdf(c) for c in label[len(DEAD_CHIP_LABEL_PREFIX) :].split(",") if c) if b]
+            f = stuck_device_holder(pid, label, uid, bdfs)
+        if f is None:
+            with _dead_chip_stuck_lock:
+                _dead_chip_stuck.pop(pid, None)
+            if logger:
+                logger.info(f"DEAD-CHIP stuck holder pid {pid} ({label}) is gone")
+            health_event("dead_chip_holder_released", pid=pid, label=label)
+        elif pid not in exclude:
+            found.append(f)
+    return found
+
+
+def _dead_chip_stuck_reason() -> str:
+    """The re-enumeration fence (spec 04 I77, ``mechanism.reenumerate_fence``): why no bridge reset,
+    PCI rescan, tray re-power or reset sweep may run — '' when no killed holder is stuck on a dead
+    chip. Refreshes the I70 episode as it reads. Never raises."""
+    if not _dead_chip_stuck:
+        return ""
+    stuck = [f for f in _reaped_leftovers() if f.job_id.startswith(DEAD_CHIP_LABEL_PREFIX)]
+    if not stuck:
+        return ""
+    return (
+        "killed holder(s) stuck in the kernel on a removed chip: "
+        + "; ".join(f.describe() for f in stuck)
+        + "; re-enumerating PCI under them can stall the host (spec 04 I77)"
     )
 
 

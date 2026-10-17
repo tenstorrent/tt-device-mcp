@@ -460,6 +460,15 @@ class TelemetrySampler:
                     )
                 self._deps.health_event("dead_chip_holders_lingering", chips=fresh, pids=lingering)
 
+        # A killed holder that is still alive past the bound is stuck in the kernel, most often
+        # reading the dead BAR (state D) — it never acts on its SIGKILL. Name it, page, and fence
+        # every rung that would re-enumerate PCI under it (spec 04 I77); the broker's bounded
+        # escalation takes the host rung if it outlives its budget.
+        stuck_holders = []
+        note = self._deps.note_stuck_holders
+        if note is not None and killed:
+            stuck_holders = await asyncio.to_thread(note, list(fresh), list(killed))
+
         removed = []
         for idx in fresh:
             if await asyncio.to_thread(self._deps.isolate_chip, idx):
@@ -478,6 +487,13 @@ class TelemetrySampler:
                     f"a core stall that reboots it. Removed only {removed}."
                 )
             self._deps.health_event("chip_isolation_incomplete", stuck=stuck, removed=removed, host_at_risk=True)
+        elif stuck_holders:
+            if log:
+                log.error(
+                    f"DEAD CHIP(S) {removed} removed from the kernel, but killed holder(s) "
+                    f"{stuck_holders} are stuck on them in the kernel — the host is STILL at "
+                    f"risk; no rung re-enumerates PCI until they are gone (spec 04 I77)"
+                )
         elif log:
             log.error(
                 f"DEAD CHIP(S) {removed} removed from the kernel — the host is out of "

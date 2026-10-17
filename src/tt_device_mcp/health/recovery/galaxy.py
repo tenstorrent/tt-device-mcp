@@ -46,7 +46,12 @@ from tt_device_mcp.health.recovery import (
     offbus_power_cycle,
     pcie_guard,
 )
-from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC, drop_returned_isolated, refuse_mesh_reset
+from tt_device_mcp.health.recovery.base import (
+    HOLD_ESCALATION_REARM_SEC,
+    drop_returned_isolated,
+    reenumerate_withheld,
+    refuse_mesh_reset,
+)
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
@@ -1709,6 +1714,8 @@ class GalaxyRecovery(Recovery):
         if not td["rescanned"]:
             if tenant_active:
                 rescan = "waiting (a tenant holds the device)"
+            elif reenumerate_withheld(self.mechanism, "tray-down PCI rescan", log):
+                rescan = "withheld (a killed holder is stuck on a removed chip)"
             else:
                 td["rescanned"] = True
                 try:
@@ -1860,6 +1867,9 @@ class GalaxyRecovery(Recovery):
         Returns whether the sweep was COMPLETE: False when the per-host gate refused it (spec 04 I24)
         or the tray envelope refused to cut power (I23). An incomplete sweep is not the full ladder,
         so the caller must not climb to a power cycle or reboot on it (I22)."""
+        # Every step re-enumerates PCI: none runs under a stuck holder of a removed chip (I77).
+        if reenumerate_withheld(self.mechanism, "back-to-back reset sweep", log):
+            return False
         off_bus = pcie_guard.chips_off_bus(expected)
         allowed, why = pcie_guard.host_reset_gate(off_bus)
         if not allowed:
@@ -3360,6 +3370,11 @@ class GalaxyRecovery(Recovery):
             # without bound on every such host.
             metrics.stage_fired("ubb_tray", "not_applicable")
             return None  # no tray to re-power — the caller's existing hold owns it
+        if reenumerate_withheld(self.mechanism, "per-tray BMC reset", log):
+            # A tray re-power and its rescan re-enumerate under a stuck holder of a removed chip
+            # (spec 04 I77): name nothing new and hold; the broker's I70 escalation owns the bound.
+            metrics.stage_fired("ubb_tray", "blocked")
+            return None
         if not _ubb_reset_enabled():
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)  # name it + hold (the default)
             metrics.stage_fired("ubb_tray", "blocked")
