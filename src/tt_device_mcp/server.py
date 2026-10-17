@@ -3651,10 +3651,15 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
                 f"{ceiling_min}-min hold ceiling — do not plan around waiting the wedge out."
             )
         if off_bus > 0:
+            whole = (
+                "A whole-tray drop goes to the power cycle at once (spec 04 I37)"
+                if _auto_power_cycle_enabled()
+                else "Auto power cycle is not armed on this host, so a whole-tray drop cannot be power-cycled "
+                "by the broker"
+            )
             return (
-                f"A whole-tray drop goes to the power cycle at once (spec 04 I37); any other off-bus "
-                f"hold climbs at the {ceiling_min}-min hold ceiling — do not plan around waiting the "
-                f"wedge out."
+                f"{whole}; any other off-bus hold climbs at the {ceiling_min}-min hold ceiling — do not plan "
+                f"around waiting the wedge out."
             )
         return (
             f"The ladder escalates at the {ceiling_min}-min hold ceiling — do not plan around waiting "
