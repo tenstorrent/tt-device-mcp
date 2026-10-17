@@ -978,6 +978,10 @@ each rung fires only when the gentler one failed or cannot apply.
   reboot does and also re-powers the trays. A present mesh (`off_bus == 0`: a wedge, class D, or a
   fabric or dispatch fault the ladder could not clear, G2) and a single-chip host keep the older
   order: the warm reboot first (faster: no BMC, no I65 cooldown), the power cycle after it. The
+  one exception is a present mesh on the boot an I29 77 reboot brought up (the I79 cold flag,
+  passed as `warm_reboot_futile`): that reboot already ran and failed, so the multi-chip climb takes
+  the power cycle when it is armed, holds loudly (`reboot_blocked`) when it is not, and never takes
+  the fallback reboot below, even once the reboot's ledger interval has passed. The
   ladder below the host rung is unchanged: a partial drop still runs the bridge, tray and mesh
   resets first, and a present-mesh wedge takes its second `glx_reset` (`was_failing`) before the
   host rung; only a whole-tray or all-off drop goes straight to the cycle (I37). With no power
@@ -1006,7 +1010,9 @@ each rung fires only when the gentler one failed or cannot apply.
   after repeated unhealed cycles) or retrying a cycle that cannot launch without bound; if that one
   reboot does not heal it, worst case the ladder, the reboot (about 3-5 min), its boot and the I65
   interval (30 min; 1 h, 2 h, then 4 h after repeated unhealed cycles), then the cycle, never a
-  second fallback reboot; D and G2 take no second fallback reboot either; whole-bus
+  second fallback reboot; D and G2 take no second fallback reboot either; a D hold on the 77
+  reboot's boot keeps I79's cold rung (one power cycle once the I65 cooldown allows it, never a
+  second reboot), the same as the base; whole-bus
   and other reboot-futile drops, class A, C, single-chip hosts and hosts with no power cycle armed
   are unchanged.
 
@@ -1026,7 +1032,9 @@ each rung fires only when the gentler one failed or cannot apply.
   - **The boot an I29 77 reboot brought up** (with no fabric pass since the broker started) and a
     power cycle opted in: the 77 is not handed to an operator. The episode owes the climb at once. The
     earlier episode's reset counts as its one reset, the sweep runs on the first re-check, and the
-    climb takes the cold rung (warm reboot futile), once. The I40 fallback marks the episode's reset
+    climb takes the cold rung (warm reboot futile), once. The cold flag holds on a present mesh too:
+    `_host_escalation_for_drop` names the power cycle for it, and I71's fallback reboot never
+    replaces a cold rung the cooldown or the governor denies. The I40 fallback marks the episode's reset
     as spent before it escalates, so the ladder sweeps rather than resetting again. The boot that power
     cycle brought up is spent: the hold goes to an operator with a deadline (I29). A cold rung that
     `auto_recovery_allowed` holds off (the I65 cooldown, the rate limit, a tenant) is not spent: it is
@@ -1610,6 +1618,7 @@ sees a silent fabric pass.
 | I65 a failed out-of-band cycle (a second line, same `at_epoch`, cause + ` (cycle failed)`) never counts and cancels its attempt line; an unmatched failure line is ignored; an attempt with no failure line still counts; host boots are unchanged | `tests/test_power_cycle_cooldown.py::test_a_matched_failure_line_drops_the_attempt`, `::test_an_unmatched_failure_line_is_ignored`, `::test_an_attempt_without_a_failure_line_still_counts` |
 | I65 a future, non-finite or unreadable stamp (history file, ledger, heal file) never hides a valid past anchor, never holds the cycle past the stated gap, never keeps the streak past a verified release; every cap denial is on /health | `tests/test_power_cycle_cooldown.py::test_a_nan_or_future_history_line_does_not_hide_the_valid_past_one`, `::test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle`, `::test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health`, `::test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end`, `::test_the_per_boot_cap_denial_shows_on_health`, `::test_a_future_record_does_not_keep_the_streak_past_a_verified_release` |
 | I71 multi-chip with a chip off the bus names the power cycle over the reboot when armed; a present mesh and a single chip keep the reboot first; with no cycle armed the old verdict stands | `tests/test_offbus_reboot_futile.py::test_multi_chip_offbus_takes_the_power_cycle_over_the_reboot_when_armed`, `::test_a_present_mesh_keeps_the_reboot_first`, `::test_single_chip_keeps_the_reboot_first`, `::test_without_a_power_cycle_the_old_verdict_stands` |
+| I71 with I79: a present mesh carrying the cold flag names the power cycle (or holds with none armed) and is not fallback-eligible; on the 77 reboot's boot a cooldown-denied cycle holds with no fallback reboot, then fires one power cycle | `tests/test_offbus_reboot_futile.py::test_the_i79_cold_flag_sends_a_present_mesh_to_the_power_cycle`, `::test_the_cold_rung_on_the_77_reboots_boot_never_falls_back_to_a_second_reboot` |
 | I71 a partial drop past the full ladder cycles with no reboot; a present-mesh wedge reboots first with both rungs armed, and with no cycle armed | `tests/test_offbus_reboot_futile.py::test_partial_drop_past_the_ladder_cycles_without_a_reboot`, `::test_present_mesh_wedge_reboots_first_with_both_rungs_armed`, `::test_present_mesh_wedge_still_reboots_with_no_power_cycle`, `::test_next_stage_names_the_power_cycle_for_a_failed_reset_partial_drop`, `::test_next_stage_present_mesh_reboots_first_with_both_rungs_armed`, `::test_next_stage_present_mesh_with_no_power_cycle_still_reboots` |
 | I71 a denied or unlaunched cycle falls back to the reboot only on a drop the reboot can recover, at the gate and on the idle climb; a futile drop and a cooldown denial on one hold; BLOCKED only with no live reset scope | `tests/test_offbus_reboot_futile.py::test_the_reboot_fallback_is_only_for_drops_a_reboot_can_recover`, `::test_a_denied_cycle_falls_back_to_the_reboot_on_a_recoverable_drop`, `::test_both_rungs_denied_holds`, `::test_a_cycle_that_does_not_launch_falls_back_to_the_reboot`, `::test_a_cycle_that_does_not_launch_on_a_futile_drop_never_reboots`, `::test_the_gate_falls_back_to_the_reboot_when_the_cycle_is_denied`, `::test_the_gate_falls_back_to_the_reboot_when_the_cycle_does_not_launch`, `::test_the_gate_cycles_a_partial_drop_when_allowed`, `::test_a_cooldown_denial_on_a_futile_drop_holds_and_never_reboots`, `::test_a_live_scope_waits_instead_of_blocking` |
 | I71 the fallback reboot fires at most once per wedge: a broker reboot since the last verified release spends it at the gate and on the idle climb, denied or unlaunched; the cycle fires at the cooldown end that reboot anchored; the launch verdict the fallback reads | `tests/test_offbus_reboot_futile.py::test_reboot_fallback_spent_counts_a_reboot_since_the_last_verified_release`, `::test_a_denied_cycle_takes_no_second_fallback_reboot_on_the_idle_climb`, `::test_a_cycle_that_does_not_launch_takes_no_second_fallback_reboot`, `::test_the_gate_takes_no_second_fallback_reboot_when_the_cycle_is_denied`, `::test_the_gate_takes_no_second_fallback_reboot_when_the_cycle_does_not_launch`, `::test_an_unhealed_fallback_reboot_hands_the_next_rung_to_the_cycle_with_the_real_governor`, `::test_fire_recovery_escalation_reports_whether_the_action_may_have_launched` |

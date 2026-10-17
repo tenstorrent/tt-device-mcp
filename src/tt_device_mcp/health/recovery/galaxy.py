@@ -548,7 +548,11 @@ def _host_escalation_for_drop(
     A present mesh (``off_bus == 0``) that survived the reset ladder (class D, or a fabric or
     dispatch fault the ladder could not clear, G2) keeps that order too: every chip is on the bus,
     so the reason a reboot cannot help an off-bus chip does not apply, and no cause-checked record
-    shows a reboot never heals it. The reboot is the faster rung (no BMC, no I65 cooldown).
+    shows a reboot never heals it. The reboot is the faster rung (no BMC, no I65 cooldown). The one
+    exception is a caller-proven ``warm_reboot_futile`` on a multi-chip host: the I79 cold flag (this
+    boot is the warm reboot a 77 climb fired, and the fabric still reads 77) means the reboot has
+    already run and failed, so that drop takes the power cycle like an off-bus one, or holds loudly
+    when it is not armed (spec 04 I79).
 
     On a multi-chip host with a chip off the bus (``off_bus > 0``) the power cycle is THE host rung
     whenever it is armed: a warm reboot does not power-cycle a Galaxy's UBBs, so an ASIC that fell
@@ -566,7 +570,7 @@ def _host_escalation_for_drop(
     to the warm reboot when :func:`_reboot_fallback_eligible` allows it (the callers do this, I71);
     otherwise it is held and asked again when the wait ends (I10, I65). Pure and side-effect-free;
     the caller acts on the result."""
-    if expected <= 1 or off_bus <= 0:
+    if expected <= 1 or (off_bus <= 0 and not warm_reboot_futile):
         escalation = _choose_recovery_escalation(
             auto_reboot_enabled=auto_reboot_enabled,
             auto_power_cycle_enabled=auto_power_cycle_enabled,
@@ -586,8 +590,10 @@ def _reboot_fallback_eligible(off_bus: int, expected: int, *, warm_reboot_futile
     power cycle armed. A whole-bus drop and a caller-proven ``warm_reboot_futile`` drop are not: the
     reboot cannot bring an off-bus chip back there, so they hold for the cycle instead. The
     reboot's own limits (one per boot, the ledger interval) and the one-per-wedge rule
-    (:meth:`~RecoveryMechanism.reboot_fallback_spent`) bound how often the fallback fires."""
-    if expected <= 1 or off_bus <= 0:
+    (:meth:`~RecoveryMechanism.reboot_fallback_spent`) bound how often the fallback fires. A present
+    mesh carrying the I79 cold flag (``warm_reboot_futile``) is not eligible: the reboot already ran
+    on it and failed."""
+    if expected <= 1 or (off_bus <= 0 and not warm_reboot_futile):
         return True
     return not (warm_reboot_futile or off_bus >= expected)
 

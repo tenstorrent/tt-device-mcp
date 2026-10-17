@@ -15,6 +15,7 @@ import pytest
 
 from tests.conftest import patch_health_event
 from tests.test_device_safety import (
+    _arm_77_reboot_boot_cold_rung,
     _arm_offbus_stuck_hold,
     _arm_stuck_hold,
     _ledger_dir,
@@ -77,6 +78,46 @@ def test_the_reboot_fallback_is_only_for_drops_a_reboot_can_recover():
     assert eligible(16, 32, warm_reboot_futile=False)
     assert not eligible(16, 32, warm_reboot_futile=True)
     assert not eligible(32, 32, warm_reboot_futile=False)
+
+
+def test_the_i79_cold_flag_sends_a_present_mesh_to_the_power_cycle():
+    """I79 on top of I71: a present mesh on the boot a 77 climb's warm reboot brought up carries the
+    cold flag (``warm_reboot_futile``). That reboot already ran and failed, so the drop takes the
+    power cycle even when the reboot is armed and no reboot is on the ledger, holds loudly with no
+    cycle armed, and is never eligible for the I71 fallback reboot. A single-chip host is unchanged."""
+    assert _choose(0, 32, reboot=True, power_cycle=True, futile=True) == ("power-cycle", False)
+    assert _choose(0, 32, reboot=True, power_cycle=False, futile=True) == (None, True)
+    assert not galaxy_mod._reboot_fallback_eligible(0, 32, warm_reboot_futile=True)
+    assert _choose(0, 1, reboot=True, power_cycle=True, futile=True) == ("reboot", False)
+
+
+@pytest.mark.asyncio
+async def test_the_cold_rung_on_the_77_reboots_boot_never_falls_back_to_a_second_reboot(monkeypatch, clear_job_state):
+    """I79 with I71 merged: on the 77 reboot's boot (every chip present) with both rungs armed, the
+    reboot's ledger interval passed and the fallback reboot itself allowed, a cooldown-denied power
+    cycle holds; it never takes the I71 fallback reboot. Once the cooldown ends, one power cycle
+    fires and no reboot. Held throughout: nothing is released unverified."""
+    counters, g, alerts, reasons, events, age, asked = _arm_77_reboot_boot_cold_rung(monkeypatch)
+    age["v"] = 250
+    monkeypatch.setattr(srv.recovery_mechanism, "_reboot_already_attempted", lambda: False)
+    monkeypatch.setattr(srv.recovery_mechanism, "fallback_reboot_allowed", lambda **_: (True, "ok"))
+    cooldown = {"on": True}
+
+    def allowed(esc, *, tenant_active):
+        asked.append(esc)
+        if cooldown["on"] and esc == "power-cycle":
+            return False, "power-cycle cooldown (I65)"
+        return True, "ok"
+
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
+    assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    assert asked == ["power-cycle"], "the cold rung only; no warm reboot asked for"
+    assert reasons == [] and counters["power_cycles"] == 0
+
+    cooldown["on"] = False
+    assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    assert counters["power_cycles"] == 1 and reasons == [], "one power cycle, never a second reboot"
+    assert counters["resets"] == 0 and counters["dirty_cleared"] == 0, "held, never released unverified"
 
 
 def _arm_partial_drop(monkeypatch, off_bus):
