@@ -272,6 +272,9 @@ class RecoveryDeps:
     chip_pci_bdf: Optional[Callable[[str], Optional[str]]] = None
     health_event: Optional[Callable[..., None]] = None
     kill_device_holders: Optional[Callable[[str], Awaitable[list]]] = None
+    # Bounded wait for the pids it killed to drop out of the holder scan; returns those still
+    # listed (spec 03 I19, the shared spec 01 I67 helper).
+    wait_device_released: Optional[Callable[[list], Awaitable[set]]] = None
     mark_device_dirty: Optional[Callable[..., None]] = None
     # Places a not-dirty fabric-unverified hold (server._hold_device_fabric_unverified): a reset whose
     # fabric stayed a 77 settles there, never as a failed reset.
