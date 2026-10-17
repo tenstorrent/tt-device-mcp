@@ -1412,6 +1412,12 @@ class GalaxyRecovery(Recovery):
         the full health check, fabric included, before it releases anything (goal 8)."""
         if await asyncio.to_thread(self.mechanism.scope_active):
             return "held", "a reset is cycling in its own scope"
+        # Read under the caller's device lock: a try spawned before another path's request (the I76
+        # bound's host rung) reaches here after it. A launch that timed out retracted its ledger record,
+        # so the governor alone would let a second cycle through (I34).
+        pending = self.mechanism.host_action_pending()
+        if pending is not None:
+            return "held", f"a host {pending[0]} requested {int(pending[1])}s ago is still pending"
         leftovers = {int(p) for p in leftover_pids}
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
         others = dataclasses.replace(scan, holders=[h for h in scan.holders if int(h.pid) not in leftovers])
