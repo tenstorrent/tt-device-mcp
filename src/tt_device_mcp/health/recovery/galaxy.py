@@ -553,8 +553,9 @@ def _host_escalation_for_drop(
       * a present mesh (``off_bus == 0``) that survived the reset ladder: the power cycle goes
         first too, for the same reason.
 
-    With no power cycle armed the warm reboot stays the fallback, then a hold: a whole-bus drop
-    (``off_bus >= expected``) or a caller-proven ``warm_reboot_futile`` (a whole-tray sweep, a
+    With no power cycle armed the old rule stands unchanged, so no host loses a rung it had: a
+    whole-bus drop (``off_bus >= expected``) or a caller-proven ``warm_reboot_futile`` (a reset that
+    regressed or hard-failed the drop, a below-floor drop past its grace, a whole-tray sweep, a
     reboot that already ran) returns ``(None, True)`` and the caller MUST emit the loud actionable
     event and KEEP HOLDING; any other drop or a present mesh gets ``"reboot"`` when it is armed.
     No cause-checked record shows a reboot never heals a partial drop, so it keeps that rung.
@@ -635,7 +636,8 @@ def _route(
     pass ALREADY ran and did not recover; only now is a host rung reachable:
 
     * ``reboot_blocked`` and no reset scope is live -> ``BLOCKED``: no opted-in rung can recover
-      this drop (a whole-bus drop with no power cycle opted in to catch it) — distinct from
+      this drop (a whole-bus drop, or a reset that regressed/hard-failed a partial one, with no
+      power cycle opted in to catch it) — distinct from
       ``WAIT``, which means the wedge may still self-heal. A live scope's reads are not a verdict,
       so it waits on the scope first.
     * a host rung is opted in (``host_escalation``), a prior cycle failed too (``was_failing`` — one
@@ -696,7 +698,7 @@ def _route(
     ``galaxy_floor`` is None only when an operator opts out to the old reset-any-unhealthy behavior;
     then any off-bus chip resets. ``host_escalation``/``reboot_blocked`` are the caller's already-
     folded verdict — :func:`_host_escalation_for_drop`'s result (``GalaxyRecovery.next_stage``
-    derives it from ``off_bus``/``expected``, never this function, which stays pure and
+    derives it from ``off_bus_before``/``reset_exit_nonzero``, never this function, which stays pure and
     side-effect-free: the gate does the acting, this only names the rung)."""
     if last_action_recovered:
         return RELEASE
@@ -1118,11 +1120,24 @@ class GalaxyRecovery(Recovery):
         # every other call, exactly as the gate only pays for it once a galaxy reset has failed.
         host_escalation, reboot_blocked = None, False
         if ev.last_action == STAGE_SMI_RESET and ev.last_action_recovered is False:
-            # On a multi-chip host the fold picks the power cycle whenever it is armed (I71). A live
-            # reset scope's all-ones is not a verdict: _route waits on it before it reads reboot_blocked.
+            # On a multi-chip host the fold picks the power cycle whenever it is armed (I71). Without
+            # it, a reset proven unable to clear the drop holds loudly instead of the warm reboot.
+            reset_regressed = (
+                ev.expected > 1
+                and ev.off_bus_before is not None
+                and ev.off_bus > ev.off_bus_before
+                and not ev.scope_active
+            )
+            warm_reboot_futile = (
+                ev.expected > 1
+                and ev.off_bus > 0
+                and not ev.scope_active
+                and (reset_regressed or ev.reset_exit_nonzero or ev.episode_reset_regressed)
+            )
             host_escalation, reboot_blocked = _host_escalation_for_drop(
                 ev.off_bus,
                 ev.expected,
+                warm_reboot_futile=warm_reboot_futile,
                 auto_reboot_enabled=self.deps.auto_reboot_enabled,
                 auto_power_cycle_enabled=self.deps.auto_power_cycle_enabled,
                 reboot_already_attempted=self.mechanism._reboot_already_attempted,
@@ -3023,12 +3038,22 @@ class GalaxyRecovery(Recovery):
                 ceiling_sec=_stuck_hold_ceiling_sec(),
             )
             return
+        reboot_floor = _reboot_min_dead_chips(expected)
         # An off-bus drop reaching this climb is NOT self-healing: it survived the grace and a reset that
         # could not recover it. A dropped ASIC does not re-enumerate on a warm reboot (a 6U-Galaxy reboot
         # does not power-cycle the UBBs), so on a multi-chip host the chooser routes it to the cold rung
         # whenever that is armed, below the floor included, and a present mesh too (I71). With no cold
-        # rung armed a partial drop keeps the warm reboot as its fallback; a whole-bus drop holds.
-        escalation, reboot_blocked = _host_escalation_for_drop(off_bus, expected, **self.deps.host_escalation_kwargs())
+        # rung armed the old verdict stands: a reset proven unable to clear it (regressed, hard-failed,
+        # or a below-floor drop) holds loudly; any other drop keeps the warm reboot as its fallback.
+        below_floor_offbus = 0 < off_bus < reboot_floor
+        warm_reboot_futile = (
+            expected > 1
+            and off_bus > 0
+            and (reset_regressed or episode_regressed or self.mechanism.last_reset_exit_nonzero or below_floor_offbus)
+        )
+        escalation, reboot_blocked = _host_escalation_for_drop(
+            off_bus, expected, warm_reboot_futile=warm_reboot_futile, **self.deps.host_escalation_kwargs()
+        )
         if reboot_blocked:
             # No chassis power cycle is opted in and no rung can recover it: fail closed loudly and hold,
             # never fire a reboot that lands right back in the dead state. A whole-bus drop and a reset
