@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """Spec 04 I78: a mesh reset re-adds a chip the broker removed from the kernel once its pulse fires.
 
 tt-smi -glx_reset pulses every tray, settles 30 s and then waits for all 32 chips in /dev/tenstorrent.
