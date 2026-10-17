@@ -121,8 +121,10 @@ from tt_device_mcp.health.recovery.galaxy import (
     _galaxy_reset_min_dead_chips,
     _is_galaxy,
     _offbus_hold_ceiling_sec,
+    _offbus_hold_escalate_enabled,
     _reboot_min_dead_chips,
     _stuck_hold_ceiling_sec,
+    _stuck_hold_reset_enabled,
     _ubb_reset_enabled,
 )
 from tt_device_mcp.health.recovery.pcie_guard import pcie_guard_at_start
@@ -222,8 +224,10 @@ __all__ = [
     "_galaxy_reset_min_dead_chips",
     "_HOST_ESCALATION_ACTION",
     "_offbus_hold_ceiling_sec",
+    "_offbus_hold_escalate_enabled",
     "_reboot_min_dead_chips",
     "_stuck_hold_ceiling_sec",
+    "_stuck_hold_reset_enabled",
     "_ubb_reset_enabled",
     "bridge_reset_enabled",
     "bridge_reset_unavailable_reason",

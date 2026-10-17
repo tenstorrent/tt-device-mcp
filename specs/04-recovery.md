@@ -991,8 +991,9 @@ Class structure: see the diagram in 03-health.md.
 **Rung inventory at boot.** `log_rung_inventory()` MUST state every optional rung ON or OFF at
 startup (`RUNG INVENTORY:` line, plus a `RUNG OFF <name>:` warning naming the cause for each off
 rung); an off rung is readable in the journal, never inferred from an absence of verdicts. The
-line names the hold bound (`hold-bound=<N>s`, or `hold-bound=NONE` when forced escalation is
-off, spec 03 I23); with none it also logs an error and runs the alert hook once. The
+line names the hold bound (`hold-bound=<N>s`, or `hold-bound=NONE` when no rung bounds any hold
+class, spec 03 I23) and any class left without one (`hold-unbounded=off-bus+fabric-77`); with an
+unbounded class it also logs an error and runs the alert hook once. The
 power-cycle entry distinguishes the operator's `=0` opt-out from an armed rung whose `ipmitool` is
 missing. `resolve_platform()` runs first (a declared mode without touching the device; otherwise
 one tt-smi snapshot), so `BOOT platform:` precedes any preflight or gate line.

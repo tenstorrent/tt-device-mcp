@@ -115,9 +115,11 @@ from tt_device_mcp.health import (
     _fire_power_cycle,
     _galaxy_reset_min_dead_chips,
     _offbus_hold_ceiling_sec,
+    _offbus_hold_escalate_enabled,
     _reboot_min_dead_chips,
     _run_pre_power_cycle_hook,
     _stuck_hold_ceiling_sec,
+    _stuck_hold_reset_enabled,
     _ubb_reset_enabled,
     aer_totals,
     append_trace,
@@ -3498,6 +3500,7 @@ def log_rung_inventory() -> None:
         ("tenant-hold", _tenant_hold_enabled(), "TT_DEVICE_MCP_TENANT_HOLD=0"),
     ]
     bound = _hold_bound_sec()
+    unbounded = _unbounded_hold_classes()
     fsm.set_recovery_armed(bound is not None, bound)
     if not logger:
         return
@@ -3512,6 +3515,7 @@ def log_rung_inventory() -> None:
         "RUNG INVENTORY: "
         + ", ".join(f"{name}={'on' if on else 'OFF'}" for name, on, _ in rungs)
         + f", hold-bound={f'{bound}s' if bound is not None else 'NONE'}"
+        + (f", hold-unbounded={'+'.join(unbounded)}" if unbounded and bound is not None else "")
         + f", exit1-fabric-window={EXIT1_FABRIC_WINDOW_SEC:.0f}s"
     )
     for name, on, why in rungs:
@@ -3519,18 +3523,20 @@ def log_rung_inventory() -> None:
         # elsewhere the inventory is the only place its OFF is ever explained.
         if not on and not (name == "eth-heartbeat" and should_privsep()):
             logger.warning(f"RUNG OFF {name}: {why}")
-    if bound is None:
+    if unbounded:
         # A box that admits jobs with no rung able to end a hold must say so where an operator looks
         # first, and page once: the watchdog's per-window line is the only other trace.
         logger.error(
-            "RUNG INVENTORY hold bound: NONE — forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0), "
-            "so a hold that does not clear on its own stays held until an operator acts"
+            f"RUNG INVENTORY hold bound: NONE for {', '.join(unbounded)} holds — no armed rung ends them "
+            f"(forced escalation, the idle escalation or the fabric relift is off), so such a hold that "
+            f"does not clear on its own stays held until an operator acts"
         )
         alert.send_alert(
             {
                 "kind": "hold_unbounded",
                 "host": socket.gethostname(),
                 "rungs_off": [name for name, on, _ in rungs if not on],
+                "unbounded_classes": unbounded,
             },
             logger,
         )
@@ -3606,6 +3612,8 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
                 f"wedge out."
             )
         return f"{_hold_bound_text()} — do not plan around waiting the wedge out."
+    if _hold_bound_sec(off_bus > 0) is not None:
+        return f"{_hold_bound_text(offbus=off_bus > 0)} — do not plan around waiting the wedge out."
     if _selfheal_relift_enabled():
         return (
             "Forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0): only the idle self-heal relift "
@@ -6427,11 +6435,13 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         # The FSM's own record, straight from the source every field above is now derived from.
         "fsm_state": fsm.state.value,
         "fsm_why": fsm.record.why,
-        # Whether an armed rung ends a hold, and when: without one a hold is NOT recovering.
-        "recovery_armed": _recovery_armed(),
-        "hold_bound_sec": _hold_bound_sec(),
     }
-    payload.update(_live_offbus_state())
+    live = _live_offbus_state()
+    # Whether an armed rung ends the open hold (by its class), and when: without one it is NOT recovering.
+    bound = _live_hold_bound_sec(live.get("off_bus", 0))
+    payload["recovery_armed"] = bound is not None
+    payload["hold_bound_sec"] = bound
+    payload.update(live)
     # Whether the running job is doing device work (spec 03 I54); absent while no job runs.
     for j in jobs.values():
         view = job_activity_view(j.id) if j.status == JobStatus.RUNNING else None
@@ -6594,17 +6604,52 @@ def _force_escalate_enabled() -> bool:
     return os.environ.get("TT_DEVICE_MCP_FORCE_ESCALATE", "1").strip() != "0"
 
 
-def _hold_bound_sec() -> Optional[int]:
-    """Seconds after which an armed rung starts ending ANY hold, or None when none is armed. Only the
-    forced escalation runs on the hold's own clock: the self-heal relift lifts only a hold whose
-    fault cleared by itself, and the host rungs fire only from a gate the held device never runs on
-    its own. So with TT_DEVICE_MCP_FORCE_ESCALATE=0 nothing bounds a hold, whatever else is on."""
-    return _stuck_hold_ceiling_sec() if _force_escalate_enabled() else None
+def _idle_escalation_armed(offbus: bool) -> bool:
+    """Whether the idle relift's own escalation ends a hold of this class past the ceiling, forced
+    escalation aside: an off-bus hold climbs through the self-heal relift
+    (TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE), a present-mesh hold (a generic hold, or a mass wedge the
+    self-heal relift sees) goes to the gate's galaxy reset (TT_DEVICE_MCP_STUCK_HOLD_RESET)."""
+    if offbus:
+        return _selfheal_relift_enabled() and _offbus_hold_escalate_enabled()
+    return _stuck_hold_reset_enabled() and (_generic_hold_escalate_enabled() or _selfheal_relift_enabled())
 
 
-def _recovery_armed() -> bool:
-    """Whether a hold is bounded by an armed rung (see _hold_bound_sec)."""
-    return _hold_bound_sec() is not None
+def _hold_bound_sec(offbus: Optional[bool] = None) -> Optional[int]:
+    """Seconds after which an armed rung starts ending a hold of this class (off-bus or present mesh;
+    None: either class), or None when none is armed. The forced escalation ends every class on the
+    hold's own clock; with it off, the idle escalation still ends each class it is armed for, by the
+    same ceiling (a present mesh at its shorter reset grace, an off-bus hold at the ceiling)."""
+    classes = (True, False) if offbus is None else (offbus,)
+    if _force_escalate_enabled() or any(_idle_escalation_armed(c) for c in classes):
+        return _stuck_hold_ceiling_sec()
+    return None
+
+
+def _unbounded_hold_classes() -> list:
+    """The hold classes no armed rung ends on the hold's own clock, at config level (spec 03 I23). A
+    77-only fabric hold is never forced or escalated; only the fabric relift and its I40 bound end it."""
+    out = [name for name, off in (("off-bus", True), ("present-mesh", False)) if _hold_bound_sec(off) is None]
+    if not _fabric_77_relift_enabled():
+        out.append("fabric-77")
+    return out
+
+
+def _live_hold_bound_sec(off_bus: Optional[int] = None) -> Optional[int]:
+    """The bound of the hold open now, by its class, or the config-level bound with no hold open. A
+    77-only hold is bounded only by the fabric relift (I40 bound); any other by _hold_bound_sec of
+    its class, off-bus when a chip is off the bus or isolated (``off_bus`` read live when None)."""
+    if fsm.state is not ServerState.RECOVERING:
+        return _hold_bound_sec()
+    if _fabric_77_only_hold():
+        return _env_int("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", 600, 60) if _idle_relift_armed()[1] else None
+    if off_bus is None:
+        off_bus = _live_offbus_state().get("off_bus", 0)
+    return _hold_bound_sec(offbus=bool(off_bus or isolated_chips))
+
+
+def _recovery_armed(off_bus: Optional[int] = None) -> bool:
+    """Whether the hold open now (any hold, with none open) is bounded by an armed rung."""
+    return _live_hold_bound_sec(off_bus) is not None
 
 
 def _fmt_bound(sec: int) -> str:
@@ -6614,12 +6659,18 @@ def _fmt_bound(sec: int) -> str:
 def _hold_bound_text(offbus: bool = False) -> str:
     """What a hold message may promise: the armed bound read from the live config, or that there is
     none. A hard-coded "escalates in ~2 min" read as a promise on a box with escalation off."""
-    bound = _hold_bound_sec()
+    bound = _hold_bound_sec(offbus)
     if bound is None:
         relift = " — only the self-heal relift can lift it" if _selfheal_relift_enabled() else ""
         return (
-            f"Forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0), so no rung ends this hold on "
-            f"a timer{relift}; manual recovery is required if it does not clear"
+            f"Forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0) and so is the idle escalation "
+            f"for this hold, so no rung ends it on a timer{relift}; manual recovery is required if it "
+            f"does not clear"
+        )
+    if not _force_escalate_enabled():
+        return (
+            f"Forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0); the idle escalation climbs the "
+            f"ladder at the {_fmt_bound(bound)} hold ceiling"
         )
     if offbus:
         return (
@@ -6982,8 +7033,8 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     elif logger and not _recovery_armed():
         logger.error(
             f"HOLD-WATCHDOG device HELD {int(age)}s — past the {deadline}s deadline — and still "
-            f"refused to tenants: {device_hold_episode_reason!r}. Forced escalation is OFF "
-            f"(TT_DEVICE_MCP_FORCE_ESCALATE=0): no rung will end this hold. Manual recovery is "
+            f"refused to tenants: {device_hold_episode_reason!r}. Forced escalation and the idle "
+            f"escalation are OFF for this hold: no rung will end this hold. Manual recovery is "
             f"required — a hold must terminate."
         )
     elif logger:
@@ -7008,6 +7059,7 @@ def _maybe_alert_stuck_hold(bucket: int, deadline: int, age: float) -> None:
     if bucket < device_hold_alert_next_bucket or alert.alert_argv() is None:
         return
     gap = alert.next_gap_windows(device_hold_alert_gap, deadline)
+    bound = _live_hold_bound_sec()
     event = {
         "kind": "hold_stuck_past_deadline",
         "host": socket.gethostname(),
@@ -7016,8 +7068,8 @@ def _maybe_alert_stuck_hold(bucket: int, deadline: int, age: float) -> None:
         "held_age_sec": int(age),
         "deadline_sec": deadline,
         "escalated": fsm.latch("escalated"),
-        "recovery_armed": _recovery_armed(),
-        "hold_bound_sec": _hold_bound_sec(),
+        "recovery_armed": bound is not None,
+        "hold_bound_sec": bound,
         "next_alert_after_sec": gap * deadline,
     }
     if alert.send_alert(event, logger) is None:

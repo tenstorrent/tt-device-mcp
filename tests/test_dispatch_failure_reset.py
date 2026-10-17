@@ -235,8 +235,12 @@ def test_floor_message_promises_escalation_only_when_armed(monkeypatch):
     assert "escalates in ~2 min (isolated chips)" in srv._hold_escalation_note(off_bus=1)
     monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     for off_bus in (0, 1):
+        assert "idle escalation climbs the ladder at the 10 min" in srv._hold_escalation_note(off_bus)
+    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_STUCK_HOLD_RESET", "0")
+    for off_bus in (0, 1):
         note = srv._hold_escalation_note(off_bus)
-        assert "escalates" not in note and "only the idle self-heal relift" in note
+        assert "escalat" not in note.replace("Forced escalation", "") and "only the idle self-heal relift" in note
     monkeypatch.setenv("TT_DEVICE_MCP_SELFHEAL_RELIFT", "0")
     note = srv._hold_escalation_note(1)
     assert "escalates" not in note and "NO automatic exit" in note
