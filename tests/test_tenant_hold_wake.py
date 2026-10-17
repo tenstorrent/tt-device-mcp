@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """A release wakes a held tenant job at once; the wake never dispatches by itself (spec 03 I65).
 
 A job held at the door re-ran its gate only every TENANT_HOLD_POLL_SEC (60 s). A job restored

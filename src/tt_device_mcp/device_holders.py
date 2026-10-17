@@ -14,12 +14,14 @@ own processes' fds. We degrade gracefully and report whether the scan was
 complete so the gate can decide how much to trust it.
 """
 
+import asyncio
 import logging
 import os
 import pwd
 import signal
 import time
 from dataclasses import dataclass, field
+from typing import Iterable
 
 from tt_device_mcp.peercred import username_for_uid
 
@@ -315,6 +317,36 @@ def enumerate_device_holders() -> HolderScan:
     if driver is not None:
         return _scan_from_driver_pids(*driver)
     return _scan_by_walking_proc()
+
+
+# How often wait_device_released re-reads the holder scan.
+RELEASE_POLL_SEC = 0.25
+
+
+async def wait_device_released(
+    pids: Iterable[int], timeout_sec: float, *, poll_sec: float = RELEASE_POLL_SEC
+) -> set[int]:
+    """Poll the holder scan until none of ``pids`` holds a device node, for at most ``timeout_sec``.
+
+    Returns the pids still listed as holders when it stopped: empty once all let go. For a caller
+    that just SIGKILLed device holders and must know they let go before it acts on the device
+    (spec 01 I67): an exit can sit in the driver's release for seconds after the signal. Bounded
+    and polling, so a set already gone costs one scan. A scan that raises leaves the set as it
+    was (it may still hold), so the caller's own check decides. Never raises."""
+    waiting = set(pids)
+    if not waiting:
+        return waiting
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        try:
+            scan = await asyncio.to_thread(enumerate_device_holders)
+            waiting &= {h.pid for h in scan.holders}
+        except Exception as e:  # noqa: BLE001 - a scan bug must not end the caller's teardown
+            logger.warning(f"holder scan failed while waiting for {sorted(waiting)} to release the device: {e}")
+        left = deadline - time.monotonic()
+        if not waiting or left <= 0:
+            return waiting
+        await asyncio.sleep(min(poll_sec, left))
 
 
 def _scan_by_walking_proc() -> HolderScan:
