@@ -6321,7 +6321,9 @@ async def device_health_gate(
                 fallback_ok, fallback_why = galaxy_recovery.reboot_fallback_allowed(ev, tenant_active=tenant_active)
                 if fallback_ok:
                     _log(f"auto-power-cycle held off ({why}); firing the warm reboot as the in-band fallback")
-                    health_event("power_cycle_reboot_fallback", trigger="denied", reason=why, phase=phase, off_bus=off_bus)
+                    health_event(
+                        "power_cycle_reboot_fallback", trigger="denied", reason=why, phase=phase, off_bus=off_bus
+                    )
                     await _fire(STAGE_HOST_REBOOT)
                     return
                 why = f"{why}; warm-reboot fallback: {fallback_why}"

@@ -236,9 +236,7 @@ async def test_the_gate_falls_back_to_the_reboot_when_the_cycle_is_denied(monkey
 
 
 @pytest.mark.asyncio
-async def test_the_gate_falls_back_to_the_reboot_when_the_cycle_does_not_launch(
-    monkeypatch, tmp_path, clear_job_state
-):
+async def test_the_gate_falls_back_to_the_reboot_when_the_cycle_does_not_launch(monkeypatch, tmp_path, clear_job_state):
     reboots = _gate_partial_drop(monkeypatch, tmp_path)
     cycles = _cycle_never_launches(monkeypatch)
 
