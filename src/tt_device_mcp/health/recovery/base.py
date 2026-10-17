@@ -8,6 +8,7 @@ what "safe" means."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import json
 import logging
@@ -91,6 +92,15 @@ POWER_CYCLE_HEALED_FILE = "power_cycle_healed.json"
 # Used when the env var is unset: this file in the broker's state dir (the parent of the health dir,
 # /var/lib/tt-device-broker on a system broker).
 POWER_CYCLE_HISTORY_DEFAULT_FILE = "power_cycle_history.jsonl"
+# Spec 04 I65: one hold episode's power-cycle deadline, fixed at its first cooldown denial and kept on
+# disk across broker restarts and boots. A boot after it (an operator's, an external one, the broker's
+# warm reboot: none of them heals a whole tray or a partial off-bus) never re-arms the full interval;
+# it moves the deadline at most to its own start plus the settle below. The broker's next power cycle
+# spends it, and a verified release ends the episode.
+POWER_CYCLE_DEADLINE_FILE = "power_cycle_deadline.json"
+# The most a boot inside that episode adds past its own start: the startup gate's own bound, its 120 s
+# hugepage wait plus one 180 s fabric pass, so the gate sees the fault before the cycle fires.
+POWER_CYCLE_POST_BOOT_SETTLE_SEC = 300
 
 
 def power_cycle_history_path() -> Path:
@@ -1287,6 +1297,7 @@ class RecoveryMechanism:
         if cycle:
             cooldown = self.power_cycle_cooldown(now_epoch=now_epoch, ledger=ledger)
             if cooldown is not None:
+                self._fix_episode_power_cycle_deadline(cooldown, now_epoch)
                 return self._deny_power_cycle(cooldown)
         boot_id = self._current_boot_id()
         if boot_id:
@@ -1392,19 +1403,83 @@ class RecoveryMechanism:
         last, cause = max(anchors, key=lambda a: a[0])
         interval = self.power_cycle_interval(ledger, now_epoch=now_epoch)
         until = last + interval
+        fixed = self._episode_power_cycle_deadline(ledger, now_epoch)
+        settle = ""
+        if fixed is not None:
+            # A cycle or boot since the deadline was fixed moves it no later than its own start plus
+            # the settle: it never re-arms the interval (a warm or external reboot heals no class A/B1).
+            since = [a for a, _ in anchors if a > fixed["set_at"]]
+            floor = max(since) + POWER_CYCLE_POST_BOOT_SETTLE_SEC if since else 0.0
+            if max(fixed["until"], floor) < until:
+                until = max(fixed["until"], floor)
+                last, cause, interval = fixed["last"], fixed["cause"], fixed["interval_sec"]
+                if floor > fixed["until"]:
+                    settle = f", then a boot at {_local_time(max(since))} + {POWER_CYCLE_POST_BOOT_SETTLE_SEC}s settle"
         if now_epoch >= until:
             return None
-        return {
+        state = {
             "until": until,
             "last": last,
             "cause": cause,
             "interval_sec": interval,
             "why": (
                 f"power cycle in cooldown until {_local_time(until)}, {int(until - now_epoch) + 1}s more "
-                f"(last cycle/boot {_local_time(last)}, {cause}; {interval}s cooldown) — this is the "
-                f"boot-loop guard"
+                f"(last cycle/boot {_local_time(last)}, {cause}; {interval}s cooldown"
+                + (f"; fixed for this hold at {_local_time(fixed['set_at'])}{settle}" if fixed is not None else "")
+                + ") — this is the boot-loop guard"
             ),
         }
+        if fixed is not None:
+            state["fixed_at"] = fixed["set_at"]
+        return state
+
+    def _episode_power_cycle_deadline(self, ledger: Optional[list[dict]], now_epoch: float) -> Optional[dict]:
+        """The power-cycle deadline this hold episode's first cooldown denial fixed (spec 04 I65:
+        ``until``, ``set_at``, ``last``, ``cause``, ``interval_sec``), or None when none stands: no file
+        or an unreadable one, fixed later than now, spent by a broker power cycle recorded since (one
+        with an unreadable stamp counts), ended by a verified release since, or more than the backoff
+        cap past its own deadline (an episode that ended unrecorded; the plain cooldown applies)."""
+        try:
+            rec = json.loads((health_dir() / POWER_CYCLE_DEADLINE_FILE).read_text())
+            out = {
+                "until": float(rec["until"]),
+                "set_at": float(rec["set_at"]),
+                "last": float(rec["last"]),
+                "cause": str(rec["cause"]),
+                "interval_sec": int(rec["interval_sec"]),
+            }
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            return None
+        if not all(math.isfinite(out[k]) for k in ("until", "set_at", "last")) or out["set_at"] > now_epoch:
+            return None
+        if now_epoch > out["until"] + POWER_CYCLE_BACKOFF_CAP_SEC:
+            return None
+        verified_at = _past_epoch((self.last_verified_release() or {}).get("at_epoch"), now_epoch)
+        if verified_at is not None and verified_at >= out["set_at"]:
+            return None
+        for r in ledger or []:
+            if r.get("action") == "power-cycle":
+                at = _epoch(r.get("at_epoch"))
+                if at is None or out["set_at"] <= at <= now_epoch:
+                    return None
+        return out
+
+    def _fix_episode_power_cycle_deadline(self, state: dict, now_epoch: float) -> None:
+        """Keep the first cooldown denial's deadline for the rest of the hold episode (spec 04 I65),
+        atomically. A deadline already fixed stays as it is. Never raises: a lost record only leaves
+        the plain cooldown, counted from the latest cycle or boot."""
+        if "fixed_at" in state:
+            return
+        rec = {k: state[k] for k in ("until", "last", "cause", "interval_sec")}
+        rec.update(set_at=now_epoch, deadline=_local_time(state["until"]))
+        path = health_dir() / POWER_CYCLE_DEADLINE_FILE
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(rec))
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
     def _power_cycle_healed_at(self, now_epoch: float) -> float:
         """When the last verified release ended the streak; 0.0 (no heal: every cycle counts, the
@@ -1421,6 +1496,8 @@ class RecoveryMechanism:
         cycle is recorded after the last heal. Never raises."""
         self.power_cycle_retry = None
         self.power_cycle_cooldown_state = None
+        with contextlib.suppress(OSError):
+            (health_dir() / POWER_CYCLE_DEADLINE_FILE).unlink(missing_ok=True)  # the hold episode is over
         now_epoch = time.time() if now_epoch is None else now_epoch
         ledger = self.read_auto_recovery_ledger() or []
         healed = self._power_cycle_healed_at(now_epoch)

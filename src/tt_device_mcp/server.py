@@ -6378,6 +6378,10 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
                 "interval_sec": cooldown["interval_sec"],
                 "why": cooldown["why"],
             }
+            if cooldown.get("fixed_at") is not None:  # this hold's deadline, fixed at its first denial
+                payload["power_cycle_cooldown"]["fixed_at"] = datetime.fromtimestamp(cooldown["fixed_at"]).isoformat(
+                    timespec="seconds"
+                )
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
     return payload
