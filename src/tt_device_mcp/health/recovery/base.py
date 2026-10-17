@@ -450,9 +450,11 @@ class RecoveryMechanism:
         self.unverified_reset_since: Optional[str] = None
         # The episode whose last-chance sweep that path already ran; the next escalation climbs.
         self.unverified_sweep_since: Optional[str] = None
-        # The episode whose sweep verify still read a fabric 77: no rung measured a fault, so it never
-        # climbs to a host rung; it holds, pages once and the idle relift keeps re-checking.
+        # The episode whose sweep verify still read a fabric 77. With no known no-reset cause it climbs to
+        # the host rung once (unverified_77_host_rung_since), then hands the hold to an operator.
         self.unverified_sweep_77_since: Optional[str] = None
+        # The episode whose 77 already climbed to a host reboot or power cycle (spec 04 I29).
+        self.unverified_77_host_rung_since: Optional[str] = None
         # The hold episode (its ``since``) whose galaxy reset REGRESSED an off-bus mesh (more chips off
         # the bus after it than before). Another mesh reset on that episode repeats the action that just
         # made the drop worse — one Galaxy host went 4 -> 31 -> 32 off-bus across three — so the episode
