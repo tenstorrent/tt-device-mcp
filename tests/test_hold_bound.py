@@ -19,6 +19,9 @@ from tests.test_classac_power_cycle_direct import EXPECTED, rig  # noqa: F401 - 
 from tests.test_device_safety import _arm_fabric_only_deadline_hold
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
+from tt_device_mcp.fsm import ServerState
+from tt_device_mcp.health import monitor as monitor_mod
+from tt_device_mcp.health.core import HealthState
 from tt_device_mcp.health.recovery import OUTCOME_RECOVERED, OUTCOME_TERMINAL, galaxy
 from tt_device_mcp.job_reap import ReapedLeftover
 
@@ -602,6 +605,134 @@ async def test_replay_a_post_job_77_hold_that_only_relifts_gets_the_ladder_at_th
     stuck = [k for kind, k in seen if kind == "hold_stuck_past_deadline"]
     assert stuck and all(k["escalated"] for k in stuck), stuck
     assert order.count("power_cycle") == 1, "the requested cycle is not asked for twice"
+
+
+@pytest.mark.asyncio
+async def test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladder_at_the_bound(
+    rig, monkeypatch, clear_job_state  # noqa: F811
+):
+    """The same latch reached from an off-bus hold, with a tenant job parked at the door behind it.
+
+    An off-bus hold is healed by a mesh reset; the post-reset check passes with a topology mismatch and
+    lifts. The first job fails on the fabric and sets the I42 latch, which opens a new hold episode at
+    that job's end. The next tenant job is dequeued and held at the CLEAN-GATE (it opens no device fd).
+    At the bound the watchdog runs the ladder with the latch standing, so the full check fails on the
+    mismatch and the power cycle is asked for once. The gated job never dispatches, and its own bound
+    refuses it."""
+    order, g = rig["order"], rig["g"]
+    mon = srv.health_monitor
+    rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "_present_chip_indices", lambda: [str(i) for i in range(EXPECTED)])
+    monkeypatch.setattr(mon, "expected", lambda n: EXPECTED)
+    monkeypatch.setattr(mon, "known_fabric_fault", lambda: "")
+    monkeypatch.setattr(mon, "last_fabric_ok", None)
+    monkeypatch.setattr(mon, "topology_hw_fault", "")
+    monkeypatch.setattr(mon, "topology_lift_pending", False)
+    monkeypatch.setattr(mon, "_topology_alerted", set())
+    monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {})  # no chip-to-bus map off the host
+    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
+    monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
+    monkeypatch.setattr(srv, "device_hold_logged", False)
+    monkeypatch.setattr(srv, "device_hold_episode_since", "")
+    monkeypatch.setattr(srv, "_hold_episode_restorable", False)
+    real_datetime, offset = srv.datetime, [0.0]
+
+    class _Clock(real_datetime):  # the broker's wall clock, moved on by ``offset`` seconds
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime.now(tz) + timedelta(seconds=offset[0])
+
+    monkeypatch.setattr(srv, "datetime", _Clock)
+
+    # 1-2. The off-bus hold heals on a mesh reset; the post-reset check passes with a topology mismatch.
+    fsm_dirty(srv, "chip 29 off the bus", why="gate_error")
+    order.append("glx_reset")
+    monkeypatch.setattr(mon, "last_fabric_output", MISMATCH)
+    mon._on_topology_mismatch(MISMATCH)
+    srv.fsm.on_readings(HealthState(phase="test", at=datetime.now(), expected=0))
+    assert srv.fsm.state is ServerState.HEALTHY and mon.topology_lift_pending, "a lift onto the mismatch"
+
+    # 3. The first job fails on the fabric and sets the I42 latch.
+    why = mon.note_job_after_topology_lift(True, "... could not find any forwarding direction ...")
+    assert why and mon.topology_hw_fault
+    srv._hold_device_fabric_unverified(f"job 922: {why}")
+    assert not srv._fabric_77_only_hold() and mon.last_fabric_ok is False, "the latch measured the fabric bad"
+    assert srv._fabric_no_reset_hold() == "", "a latched hold is measured (03 I42): never a no-reset hold"
+    _watchdog(monkeypatch)
+    monkeypatch.setattr(srv, "device_hold_job_bound_escalated", False)
+
+    # 4. The next tenant job is dequeued and parked at the CLEAN-GATE (its refusal opens the new hold
+    # episode, at job 922's end); it holds no device fd.
+    assert not srv.galaxy_recovery.tenant_holds(), "the gated job opens no /dev/tenstorrent"
+    monkeypatch.setattr(srv, "TENANT_HOLD_POLL_SEC", 60.0)
+    monkeypatch.setattr(srv, "TENANT_HOLD_WAKE_MIN_GAP_SEC", 0.0)
+    gate_passes = []
+
+    async def gate(job, job_log_file):
+        gate_passes.append(srv.fsm.state)
+        return "" if srv.fsm.state is ServerState.HEALTHY else f"device held: job 922: {why}"
+
+    monkeypatch.setattr(srv, "_admission_verdict", gate)
+    job = srv.Job(id="923", owner="tenant", workspace="/tmp", command="true", queued_at="t")
+    srv.jobs[job.id] = job
+    hold = asyncio.create_task(srv._hold_job_until_device_fit(job, None, f"device held: job 922: {why}"))
+    await asyncio.sleep(0.05)
+    assert not hold.done(), "inside its own bound the gated job waits at the door"
+    assert srv.device_hold_episode_since, "the gated job's refusal opened the hold episode"
+
+    checks = []
+
+    async def reset_then_full_check(indices, log):
+        order.append("glx_reset")
+        ok, _ = await g._verify_device(EXPECTED, log, run_fabric=True)
+        checks.append(ok)
+        return False
+
+    async def full_check(expected, log, run_fabric=True, **k):
+        checks.append(("run_fabric", run_fabric))
+        assert mon.topology_hw_fault, "the latch stands through the bound: a mismatch here fails"
+        return False, {"fabric": {"ok": False, "detail": MISMATCH}}
+
+    monkeypatch.setattr(g, "_reset_and_verify_device", reset_then_full_check)
+    monkeypatch.setattr(g, "_verify_device", full_check)
+    rig_cycle = srv._auto_power_cycle_host
+
+    async def cycle_and_mark(log, reason):
+        await rig_cycle(log, reason)
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", cycle_and_mark)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+
+    # BOUND+1: the watchdog runs the ladder with the latch standing; the full check fails; one power cycle.
+    before = len(order)
+    offset[0] = BOUND + 1
+    srv._check_hold_deadline()
+    await _drain()
+    bound_run = order[before:]
+    assert mon.topology_hw_fault, "the I42 latch stands through the bound"
+    assert ("hold_bound_latch_cleared", "topology_hw_fault") not in [(k, e.get("latch")) for k, e in rig["events"]]
+    assert "glx_reset" in bound_run, "the full ladder ran at the 10-min mark"
+    assert ("run_fabric", True) in checks and False in checks, "the full check, fabric included, failed"
+    assert bound_run.count("power_cycle") == 1, "the broker's own code asked for the power cycle"
+    assert bound_run.index("glx_reset") < bound_run.index("power_cycle")
+    assert "released" not in order and srv.fsm.state is not ServerState.HEALTHY
+    assert not hold.done() and job.status is srv.JobStatus.QUEUED, "the gated job is never dispatched"
+
+    # 2*BOUND: the gated job's own bound refuses it at the door, and asks for no second cycle.
+    offset[0] = 2 * BOUND + 1
+    srv._wake_held_jobs()
+    refused = await asyncio.wait_for(hold, timeout=5.0)
+    await _drain()
+    assert refused and f"past the {2 * BOUND}s hold bound" in refused, refused
+    assert job.status is srv.JobStatus.QUEUED, "refused at the door: the caller fails it, never dispatches it"
+    assert ServerState.HEALTHY not in gate_passes, "no gate pass ever found the device fit"
+    held = [e for k, e in rig["events"] if k == "tenant_hold_bound_exceeded"]
+    assert len(held) == 1 and held[0]["job_id"] == "923" and held[0]["held_sec"] >= 2 * BOUND
+    assert order.count("power_cycle") == 1, "the tenant-hold bound asks for no second power cycle"
+    assert "released" not in order
 
 
 @pytest.mark.asyncio
