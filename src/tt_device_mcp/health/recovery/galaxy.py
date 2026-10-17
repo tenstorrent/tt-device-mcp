@@ -1096,6 +1096,12 @@ class GalaxyRecovery(Recovery):
     # watchdog reads it to re-arm the window it spent, so the ladder runs once the tenant is gone
     # rather than at the next window (spec 03 I23).
     tenant_deferred: bool = False
+    # Spec 03 I75: the caller's stand-down for the escalate() now running (True while the startup gate
+    # is still to run on a startup hold), re-read at every tenant check; and whether that run stood down
+    # on it. The caller reads its predicate once before the device-op lock, and the re-adopted job can
+    # end in any read after that, so the last read is the one right before a rung acts.
+    _stand_down: Optional[Callable[[], bool]] = None
+    startup_verify_deferred: bool = False
 
     def tenant_holds(self) -> bool:
         """The forced ladders' own tenant check, alone: a running broker job or a readable tenant fd."""
@@ -1207,6 +1213,7 @@ class GalaxyRecovery(Recovery):
         ev: Optional[Evidence] = None,
         beats: Optional[dict] = None,
         measured_fault: bool = False,
+        stand_down: Optional[Callable[[], bool]] = None,
     ) -> str:
         """Run the next justified rung of this ladder and report the outcome, replacing the
         direct ``_escalate_stuck_hold``/``_escalate_offbus_stuck_hold`` calls the idle relift and
@@ -1249,7 +1256,33 @@ class GalaxyRecovery(Recovery):
         failure, so its reset is due without the grace (spec 03 I56; see ``_stuck_hold_reset_due``).
 
         A host reboot or power cycle still pending (spec 04 I34) stops every caller here, before
-        the prelude: nothing runs, WAITING, one log line per request."""
+        the prelude: nothing runs, WAITING, one log line per request.
+
+        ``stand_down`` (spec 03 I75) is re-read at every tenant check of this run: while it reads True
+        no rung acts, the run reports WAITING with ``tenant_deferred`` and ``startup_verify_deferred``
+        set, and the caller leaves the hold to the startup gate."""
+        self._stand_down = stand_down
+        self.startup_verify_deferred = False
+        try:
+            return await self._escalate_phase(
+                phase, indices, expected, log, stage=stage, ev=ev, beats=beats, measured_fault=measured_fault
+            )
+        finally:
+            self._stand_down = None
+
+    async def _escalate_phase(
+        self,
+        phase: str,
+        indices: list,
+        expected: int,
+        log,
+        *,
+        stage: Optional[str],
+        ev: Optional[Evidence],
+        beats: Optional[dict],
+        measured_fault: bool,
+    ) -> str:
+        """:meth:`escalate`'s body, run with its ``stand_down`` in place."""
         if self.mechanism.host_action_blocks_reset(log, context=f"escalate({phase})"):
             return OUTCOME_WAITING
         rung, _, gate_phase = phase.partition("/")
@@ -1754,11 +1787,15 @@ class GalaxyRecovery(Recovery):
 
     def _tenant_blocker(self, scan, *, force: bool = False) -> Optional[dict]:
         """Which check of :meth:`_tenant_active` blocks, as health_event fields, or None when none does:
-        ``blocker`` is ``job_running``, ``tenant`` (with the first tenant's pid, uid, user and comm) or
-        ``scan_incomplete`` (with the scan's source and gaps). A deferral that names its blocker tells a
+        ``blocker`` is ``job_running``, ``startup_verify`` (the running escalate's I75 stand-down), ``tenant``
+        (with the first tenant's pid, uid, user and comm) or ``scan_incomplete`` (with the scan's source
+        and gaps). A deferral that names its blocker tells a
         real tenant apart from a scan that merely could not see."""
         if self.deps.job_running():
             return {"blocker": "job_running"}
+        if self._stand_down is not None and self._stand_down():
+            self.startup_verify_deferred = True
+            return {"blocker": "startup_verify"}
         # The broker's own probes and the holders it killed for a dead chip are not tenants, nor is
         # a gap they leave while exiting (spec 04 I59).
         scan = discount_broker_internal(scan)
@@ -1783,6 +1820,8 @@ class GalaxyRecovery(Recovery):
         kind = blocker["blocker"]
         if kind == "job_running":
             return "a broker job is running"
+        if kind == "startup_verify":
+            return "the startup gate (full check, fabric included) runs next on this startup hold"
         if kind == "tenant":
             more = f" (+{blocker['tenants'] - 1} more)" if blocker["tenants"] > 1 else ""
             return (

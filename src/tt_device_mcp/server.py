@@ -4250,7 +4250,9 @@ async def _attempt_idle_relift() -> None:
                 there would outlive every ceiling with no rung ever attempted. ``measured_fault``
                 lets the present ladder reset without the grace (spec 03 I56)."""
                 _void_fabric_ok(f"idle relift: {rung}")
-                outcome = await galaxy_recovery.escalate(rung, indices, expected, _log, measured_fault=measured_fault)
+                outcome = await galaxy_recovery.escalate(
+                    rung, indices, expected, _log, measured_fault=measured_fault, stand_down=_startup_verify_owns_hold
+                )
                 _fold_rung_outcome(outcome, _log)
                 return outcome != OUTCOME_WAITING
 
@@ -4274,6 +4276,8 @@ async def _attempt_idle_relift() -> None:
                     _log(f"fabric 77 with eth links measured down ({drop}) — a fault: the present-mesh rung")
                 if await _escalate("present"):
                     return
+                if galaxy_recovery.startup_verify_deferred:
+                    return  # spec 03 I75: the re-adopted job ended inside the ladder; the gate runs next
                 _log(
                     "held-unverified and no read-only check clears this hold class — holding; "
                     "escalates to the gate's galaxy reset once idle past the ceiling"
@@ -6892,6 +6896,11 @@ async def _force_escalate_stuck_hold() -> None:
         if expected <= 0:
             return
         beats = await asyncio.to_thread(read_heartbeats)
+        if _startup_verify_owns_hold(kind):
+            # Spec 03 I75, re-read under the lock after this run's reads: the re-adopted job can have
+            # ended since the check before the lock. The ladder re-reads it at its tenant check too.
+            _defer_to_startup_verify(kind, log)
+            return
         off_bus = _offbus_count(beats, expected)
         no_reset = "" if off_bus or isolated_chips else _fabric_no_reset_hold()
         if no_reset:
@@ -6910,6 +6919,9 @@ async def _force_escalate_stuck_hold() -> None:
                 await _hold_bound_host_rung(held_age, log)
                 return
             leftover = await asyncio.to_thread(_reaped_leftover_reason)
+            if _startup_verify_owns_hold(kind):
+                _defer_to_startup_verify(kind, log)  # spec 03 I75: re-read after the leftover scan
+                return
             if leftover:
                 # A killed job's process still holds the device (spec 01 I16): every rung's reset is
                 # fenced and only a host rung clears it, so the bound asks for that rung now.
@@ -6952,8 +6964,15 @@ async def _force_escalate_stuck_hold() -> None:
         _void_fabric_ok("hold escalation")
         device_hold_tenant_deferred = False
         outcome = await galaxy_recovery.escalate(
-            "offbus-forced" if off_bus > 0 else "present-forced", indices, expected, log
+            "offbus-forced" if off_bus > 0 else "present-forced",
+            indices,
+            expected,
+            log,
+            stand_down=lambda: _startup_verify_owns_hold(kind),
         )
+        if outcome == OUTCOME_WAITING and galaxy_recovery.startup_verify_deferred:
+            _defer_to_startup_verify(kind, log, journaled=True)  # spec 03 I75: the job ended inside the ladder
+            return
         stood_down = outcome == OUTCOME_WAITING and galaxy_recovery.tenant_deferred
         if not stood_down:
             _note_hold_bound_ladder(held_age, outcome)  # a run that stood down on a tenant ran no rung
@@ -7314,11 +7333,14 @@ def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
     return out
 
 
-def _defer_to_startup_verify(kind: str, log) -> None:
+def _defer_to_startup_verify(kind: str, log, *, journaled: bool = False) -> None:
     """Spec 03 I75: leave a startup hold to the startup gate that is about to run on it, and give the
-    window back so a gate that fails is escalated on the next sampler tick. Logged once per episode."""
+    window back so a gate that fails is escalated on the next sampler tick. Logged once per episode;
+    ``journaled`` when the ladder's tenant check already logged and journaled this stand-down."""
     global _startup_verify_deferral_logged
     _rearm_tenant_deferred_window(kind)
+    if journaled:
+        _startup_verify_deferral_logged = device_hold_episode_since
     if _startup_verify_deferral_logged == device_hold_episode_since:
         return
     _startup_verify_deferral_logged = device_hold_episode_since
