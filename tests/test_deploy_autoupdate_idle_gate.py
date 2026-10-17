@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""The auto-update's two busy gates, which are not the same gate.
+"""The auto-update's two busy gates (spec 08 I7, I24).
 
-A running JOB must not hold an update back: it lives in its own scope and is re-adopted
-across the restart (test_readopt), so waiting for idle buys no safety and leaves a host
-stale on the fix it is waiting for. An in-flight DEVICE OP must: re-adoption covers a job,
-not a tt-smi that KillMode=control-group SIGTERMs mid-reset, which is a half-reset mesh and
-a chassis power cycle.
+A running JOB holds an update back (spec 08 I24): it is re-adopted across a restart, but the
+restart still drops its client's socket and holds the queue for the new broker's startup checks
+until it ends, so the update waits for a job boundary (defer, then drain) and never restarts the
+broker under it. An in-flight DEVICE OP bars the update outright: re-adoption covers a job, not a
+tt-smi that KillMode=control-group SIGTERMs mid-reset, which is a half-reset mesh and a chassis
+power cycle.
 """
 
 import os
@@ -18,15 +19,12 @@ from pathlib import Path
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"
 
 
-def test_the_idle_gate_is_off_by_default():
-    assert 'MAX_DEFER="${TTDEV_MAX_DEFER_SEC:-0}"' in _SCRIPT.read_text()
-
-
-def test_a_host_can_still_ask_for_an_idle_window():
-    # The bounded wait stays reachable for a host that sets the knob; only the default moved.
+def test_the_idle_gate_is_on_by_default():
+    # spec 08 I24: unset or 0 takes the default bound; no value turns the gate off.
     text = _SCRIPT.read_text()
-    assert '[ "$waited" -lt "$MAX_DEFER" ]' in text
-    assert '[ "$MAX_DEFER" -gt 0 ]' in text
+    assert '[ "$MAX_DEFER" -gt 0 ] 2>/dev/null || MAX_DEFER=3600' in text
+    assert 'if [ "$busy" -ne 0 ]; then' in text
+    assert "applying anyway" not in text and "idle gate off" not in text
 
 
 def test_an_in_flight_device_op_still_bars_the_update():
@@ -43,16 +41,37 @@ def test_an_in_flight_device_op_still_bars_the_update():
 # restart that ends an applying lap and records whether the hold was still there.
 
 
-def _gate(tmp_path, *, scopes="", queued=0, max_defer=600, stand_ins="", pending=None, env=None, hold_dir=True):
+def _gate(
+    tmp_path,
+    *,
+    scopes="",
+    queued=0,
+    max_defer=600,
+    stand_ins="",
+    pending=None,
+    env=None,
+    hold_dir=True,
+    main_pid=4242,
+    install=None,
+):
+    """`install`: also run the last look before the restart (spec 08 I24), with this shell text
+    standing in for the install between the gate and it; the restart then follows the STATE write."""
     text = _SCRIPT.read_text()
     start = text.index("# Dispatch hold (spec 08 I18")
     end = text.index('echo "autoupdate: applying', start)
     gate = text[start:end]
+    if install is not None:
+        look = text.index("# Last look before the restart (spec 08 I24)")
+        state_write = text.index('echo "$remote_sha" > "$STATE"', look)
+        gate += 'echo "autoupdate: applying"\n' + install + "\n" + text[look:state_write]
     hold = tmp_path / "run" / "dispatch-hold"
     if hold_dir:
         hold.parent.mkdir()
     assert gate.count("HOLD=/run/tt-device-broker/dispatch-hold\n") == 1
     gate = gate.replace("HOLD=/run/tt-device-broker/dispatch-hold\n", f"HOLD={hold}\n")
+    # No real /proc holders, and no scan of the host's processes on every poll of a long drain.
+    assert gate.count("for p in /proc/[0-9]*; do") == 1
+    gate = gate.replace("for p in /proc/[0-9]*; do", f"for p in {tmp_path}/proc/[0-9]*; do")
     trace = tmp_path / "trace"
     logs = tmp_path / "logs"
     (logs / "queued").mkdir(parents=True)
@@ -63,7 +82,7 @@ def _gate(tmp_path, *, scopes="", queued=0, max_defer=600, stand_ins="", pending
     if pending is not None:
         (root / "pending.defer").write_text(pending)
     prelude = f"""set -u
-ROOT={root}; remote_sha=abc123; INHIBIT={tmp_path / "device-op.lock"}
+ROOT={root}; remote_sha=abc123; INHIBIT={tmp_path / "device-op.lock"}; STATE={root / "installed.sha"}
 on_restart() {{ :; }}
 seen() {{ if [ -e "$HOLD" ]; then echo "$1 held $(cat "$HOLD")" >> {trace}; else echo "$1 free" >> {trace}; fi; }}
 sleep() {{ seen "sleep $*"; }}
@@ -72,16 +91,17 @@ ls() {{ :; }}  # no real /proc holders
 systemctl() {{
     case "$*" in
         *list-units*ttdev-job-*) seen scopes; [ -n "{scopes}" ] && echo "{scopes}" ;;
-        show*) echo 4242 ;;
+        show*) echo {main_pid} ;;
         restart*) on_restart; seen restart ;;
     esac
 }}
 {stand_ins}
 """
-    script = prelude + gate + 'echo "autoupdate: applying"\nsystemctl restart tt-device-broker\n'
+    tail = 'echo "autoupdate: applying"\n' if install is None else 'echo "$remote_sha" > "$STATE"\n'
+    script = prelude + gate + tail + "systemctl restart tt-device-broker\n"
     env = {
         "PATH": "/usr/bin:/bin",
-        "TTDEV_MAX_DEFER_SEC": str(max_defer),
+        **({} if max_defer is None else {"TTDEV_MAX_DEFER_SEC": str(max_defer)}),
         "TTDEV_HOLD_SETTLE_SEC": "7",
         "TTDEV_LOG_DIR": str(logs),
         **(env or {}),
@@ -298,3 +318,92 @@ def test_the_apply_ends_in_a_full_broker_restart():
     assert tail.count("systemctl restart tt-device-broker") == 1
     for shortcut in ("reload", "kill -HUP", "SKIP", "--no-block"):
         assert shortcut not in tail, shortcut
+
+
+# --- spec 08 I24: never a restart under a running tenant job ---------------------------------------
+
+
+def test_a_busy_box_with_no_max_defer_set_still_defers(tmp_path):
+    """The idle gate used to be off unless TTDEV_MAX_DEFER_SEC was set, so a busy lap restarted
+    the broker under the running job. Unset or 0, it now takes the default bound and defers."""
+    for name, max_defer in (("unset", None), ("zero", 0)):
+        case = tmp_path / name
+        case.mkdir()
+        done, trace, hold = _drain(case, running=5, queue=1, max_defer=max_defer, pending=_since(100))
+        assert done.returncode == 0, done.stderr
+        assert "deferring" in done.stderr and "waited 100s/3600s" in done.stderr, done.stderr
+        assert "applying" not in done.stdout + done.stderr
+        assert not any(t.startswith("restart") for t in trace), f"{name}: restarted under a job: {trace}"
+        assert not hold.exists()
+
+
+def test_past_max_defer_the_drain_outwaits_a_long_job_and_applies_at_its_end(tmp_path):
+    # A job that runs about 500 s: longer than the short bound, well under the long one.
+    done, trace, hold = _drain(tmp_path, running=101, queue=2, max_defer=None, pending=_since(4000))
+    assert done.returncode == 0, done.stderr
+    assert "(bound 1800s)" in done.stderr and "drained after 495s" in done.stderr, done.stderr
+    assert "dispatch" not in trace and "job cut by restart" not in trace, trace
+    assert trace[-1].startswith("restart held "), trace
+    assert not (tmp_path / "root" / "pending.defer").exists()
+
+    # Before MAX_DEFER the same job outlives the short bound: the drain backs off, no restart.
+    early = tmp_path / "early"
+    early.mkdir()
+    done, trace, _ = _drain(early, running=101, queue=2, max_defer=None, pending=_since(400))
+    assert "(bound 300s)" in done.stderr and "drain timed out after 300s" in done.stderr, done.stderr
+    assert not any(t.startswith("restart") for t in trace), trace
+
+
+def test_a_job_past_the_long_bound_is_left_alone_and_the_drain_backs_off(tmp_path):
+    done, trace, hold = _drain(
+        tmp_path,
+        running=10_000,
+        queue=1,
+        max_defer=None,
+        pending=_since(4000),
+        stand_ins='kill() { seen "kill $*"; }\n',
+    )
+    assert done.returncode == 0, done.stderr
+    assert "drain timed out after 1800s" in done.stderr, done.stderr
+    assert "applying" not in done.stdout + done.stderr
+    assert not any(t.startswith(("restart", "kill")) for t in trace), f"the running job was touched: {trace}"
+    assert not hold.exists()
+    since, next_drain = (tmp_path / "root" / "pending.defer").read_text().split()[1:]
+    assert since == str(_T0 - 4000) and next_drain == str(_T0 + 1800 + 300)
+
+
+def test_a_job_running_at_the_restart_point_blocks_the_restart(tmp_path):
+    """The gate saw an idle box, but a job is running by the time the install is done: the lap
+    waits for it up to DRAIN_TIMEOUT, then leaves installed.sha alone and restarts nothing."""
+    start_job = "echo 10000 > $M/running"
+    done, trace, hold = _drain(tmp_path, running=0, queue=0, install=start_job)
+    assert done.returncode == 0, done.stderr
+    assert "applying" in done.stdout and "a job is running at the restart point after 300s" in done.stderr
+    assert not any(t.startswith("restart") for t in trace), trace
+    assert not (tmp_path / "root" / "installed.sha").exists(), "a restart that did not run was marked current"
+    assert (tmp_path / "root" / "pending.defer").read_text().split()[2] == str(_T0 + 300 + 300)
+    assert not hold.exists()
+    looks = [t for t in trace if t.startswith("pgrep")][1:]
+    assert looks and all(" held " in t for t in looks), f"the last look let go of dispatch: {trace}"
+
+
+def test_a_job_that_ends_at_the_restart_point_is_waited_out(tmp_path):
+    done, trace, hold = _drain(tmp_path, running=0, queue=0, install="echo 4 > $M/running")
+    assert done.returncode == 0, done.stderr
+    assert "job cut by restart" not in trace, trace
+    assert trace[-1].startswith("restart held "), trace
+    assert (tmp_path / "root" / "installed.sha").read_text().strip() == "abc123"
+
+
+def test_a_stopped_broker_has_no_children_to_count(tmp_path):
+    """MainPID 0 is a stopped broker, and `pgrep -P 0` lists init and kthreadd."""
+    init_kids = "pgrep() { seen pgrep; echo 1; echo 2; }\n"
+    done, trace, hold = _gate(tmp_path, main_pid=0, stand_ins=init_kids)
+    assert done.returncode == 0, done.stderr
+    assert "deferring" not in done.stderr and not any(t.startswith("pgrep") for t in trace), trace
+    assert trace[-1].startswith("restart held "), trace
+
+    running = tmp_path / "running"
+    running.mkdir()
+    done, _, _ = _gate(running, stand_ins=init_kids)
+    assert "deferring" in done.stderr and "children=2" in done.stderr, done.stderr

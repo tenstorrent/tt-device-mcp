@@ -126,12 +126,17 @@ if [ -d "${HOLD%/*}" ]; then
     sleep "${TTDEV_HOLD_SETTLE_SEC:-2}"
 fi
 
-# Idle gate, OFF by default. A job runs in its own scope and is re-adopted across a restart
-# (tests/test_readopt.py), so a busy box is not a reason to hold an update back: waiting buys
-# no safety, only a host left stale on the fix it is waiting for. A host that does want an idle
-# window sets TTDEV_MAX_DEFER_SEC to the seconds it will wait. The in-flight device-op bar above
-# is separate and unconditional — re-adoption covers a job, not a tt-smi killed mid-reset.
+# Idle gate (spec 08 I24), always on. A running job is re-adopted across a restart
+# (tests/test_readopt.py), but the restart still costs it: the socket drops for seconds under a
+# polling client, and the new broker holds the queue for its startup checks until the re-adopted
+# job ends. So an update never restarts the broker under a running job: a busy lap defers, and
+# the drain below applies at a job boundary. TTDEV_MAX_DEFER_SEC (unset or 0: 3600) is how long
+# the drains keep their short bound; past it each drain waits up to TTDEV_DRAIN_LONG_SEC (1800),
+# longer than the broker's hard job timeout plus its kill grace, so a box busy around the clock
+# still updates at its next job boundary. The in-flight device-op bar above is separate.
 MAX_DEFER="${TTDEV_MAX_DEFER_SEC:-0}"
+[ "$MAX_DEFER" -gt 0 ] 2>/dev/null || MAX_DEFER=3600
+DRAIN_LONG="${TTDEV_DRAIN_LONG_SEC:-1800}"
 # Drain (spec 08 I20). A box whose queue is never empty (jobs back to back, a second apart) has no
 # idle tick, so an update waiting for one waits forever. Once a pending update has waited
 # DRAIN_AFTER, the lap keeps the dispatch hold instead of dropping it: the running job finishes,
@@ -144,7 +149,9 @@ PENDING="$ROOT/pending.defer"
 count_busy() {
     local mp p uu q
     mp="$(systemctl show tt-device-broker -p MainPID --value 2>/dev/null)"
-    kids="$(pgrep -P "${mp:-0}" 2>/dev/null | wc -l)"
+    # A stopped broker reads MainPID 0, and `pgrep -P 0` lists init and kthreadd: count no kids.
+    kids=0
+    [ "${mp:-0}" -gt 0 ] 2>/dev/null && kids="$(pgrep -P "$mp" 2>/dev/null | wc -l)"
     holders=0
     for p in /proc/[0-9]*; do
         if ls -l "$p/fd" 2>/dev/null | grep -q tenstorrent; then
@@ -173,7 +180,7 @@ op_in_flight() {
         | grep -q 'ttdev-reset-'
 }
 count_busy
-if [ "$busy" -ne 0 ] && [ "$MAX_DEFER" -gt 0 ]; then
+if [ "$busy" -ne 0 ]; then
     now="$(date +%s)"
     p_sha=""; p_since=""; p_drain=""
     [ -f "$PENDING" ] && read -r p_sha p_since p_drain < "$PENDING" 2>/dev/null
@@ -184,40 +191,38 @@ if [ "$busy" -ne 0 ] && [ "$MAX_DEFER" -gt 0 ]; then
     [ -n "${p_drain:-}" ] || p_drain=$(( p_since + DRAIN_AFTER ))
     echo "$remote_sha $p_since $p_drain" > "$PENDING"
     waited=$(( now - p_since ))
-    if [ "$waited" -lt "$MAX_DEFER" ] && [ "$now" -lt "$p_drain" ]; then
+    if [ "$now" -lt "$p_drain" ]; then
         echo "autoupdate: deferring (busy: children=$kids holders=$holders scopes=${scopes:-0} queued=$queued; waited ${waited}s/${MAX_DEFER}s, drain in $(( p_drain - now ))s)" >&2
         rm -f "$HOLD" 2>/dev/null || true
         exit 0
     fi
-    if [ "$waited" -lt "$MAX_DEFER" ]; then
-        echo "autoupdate: busy for ${waited}s -> draining: dispatch held, the running job finishes, then the update applies (bound ${DRAIN_TIMEOUT}s)" >&2
-        d_start="$now"
-        while :; do
-            count_busy
-            running=$(( kids + holders + ${scopes:-0} ))
-            if [ "$running" -eq 0 ] && ! op_in_flight; then
-                break
-            fi
-            d_now="$(date +%s)"
-            if [ $(( d_now - d_start )) -ge "$DRAIN_TIMEOUT" ]; then
-                echo "$remote_sha $p_since $(( d_now + DRAIN_AFTER ))" > "$PENDING"
-                echo "autoupdate: drain timed out after $(( d_now - d_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); the running job is left alone, dispatch released, next drain in ${DRAIN_AFTER}s" >&2
-                rm -f "$HOLD" 2>/dev/null || true
-                exit 0
-            fi
-            sleep 5
-            # Refreshed, so the broker's overdue bound on a hold counts from the last poll: a drain
-            # that hangs lets go of dispatch on its own, one that polls keeps it.
-            hold_write
-        done
-        echo "autoupdate: drained after $(( $(date +%s) - d_start ))s (queued=$queued wait for the new broker)" >&2
-        # The apply's own stretch, under the broker's overdue bound, starts now.
+    # Past MAX_DEFER the drain outwaits any job with a hard timeout; before it, a long job only
+    # pushes the next drain DRAIN_AFTER on. Either way nothing restarts under the running job.
+    d_bound="$DRAIN_TIMEOUT"
+    [ "$waited" -ge "$MAX_DEFER" ] && [ "$DRAIN_LONG" -gt "$d_bound" ] && d_bound="$DRAIN_LONG"
+    echo "autoupdate: busy for ${waited}s -> draining: dispatch held, the running job finishes, then the update applies (bound ${d_bound}s)" >&2
+    d_start="$now"
+    while :; do
+        count_busy
+        running=$(( kids + holders + ${scopes:-0} ))
+        if [ "$running" -eq 0 ] && ! op_in_flight; then
+            break
+        fi
+        d_now="$(date +%s)"
+        if [ $(( d_now - d_start )) -ge "$d_bound" ]; then
+            echo "$remote_sha $p_since $(( d_now + DRAIN_AFTER ))" > "$PENDING"
+            echo "autoupdate: drain timed out after $(( d_now - d_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); the running job is left alone, dispatch released, next drain in ${DRAIN_AFTER}s" >&2
+            rm -f "$HOLD" 2>/dev/null || true
+            exit 0
+        fi
+        sleep 5
+        # Refreshed, so the broker's overdue bound on a hold counts from the last poll: a drain
+        # that hangs lets go of dispatch on its own, one that polls keeps it.
         hold_write
-    else
-        echo "autoupdate: busy for ${waited}s (>= ${MAX_DEFER}s) -> applying anyway; re-adoption preserves the running job" >&2
-    fi
-elif [ "$busy" -ne 0 ]; then
-    echo "autoupdate: busy (children=$kids holders=$holders scopes=${scopes:-0} queued=$queued); idle gate off -> applying, the running job is re-adopted" >&2
+    done
+    echo "autoupdate: drained after $(( $(date +%s) - d_start ))s (queued=$queued wait for the new broker)" >&2
+    # The apply's own stretch, under the broker's overdue bound, starts now.
+    hold_write
 fi
 rm -f "$PENDING" 2>/dev/null || true
 
@@ -295,6 +300,28 @@ if [ ! -x "$clone/deploy/apply-host-config.sh" ]; then
 fi
 bash "$clone/deploy/apply-host-config.sh" "$clone" \
     || { echo "autoupdate: host-config apply failed (required); not marking current" >&2; exit 1; }
+# Last look before the restart (spec 08 I24). The install ran under the dispatch hold, but a job
+# can still be running here: a tenant that opened the device on its own, or a dispatch after an
+# install slow enough for the broker to drop the hold as overdue. Wait for it up to DRAIN_TIMEOUT;
+# if it runs on, restart nothing and leave installed.sha on the old sha, so the next lap retries
+# at a job boundary.
+hold_write
+l_start="$(date +%s)"
+while :; do
+    count_busy
+    running=$(( kids + holders + ${scopes:-0} ))
+    if [ "$running" -eq 0 ] && ! op_in_flight; then
+        break
+    fi
+    l_now="$(date +%s)"
+    if [ $(( l_now - l_start )) -ge "$DRAIN_TIMEOUT" ]; then
+        echo "$remote_sha ${p_since:-$l_now} $(( l_now + DRAIN_AFTER ))" > "$PENDING"
+        echo "autoupdate: a job is running at the restart point after $(( l_now - l_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); not restarting under it, not marking current; next drain in ${DRAIN_AFTER}s" >&2
+        exit 0
+    fi
+    sleep 5
+    hold_write
+done
 echo "$remote_sha" > "$STATE"
 chmod -R a+rX "$VENV" 2>/dev/null || true
 

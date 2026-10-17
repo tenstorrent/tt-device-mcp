@@ -343,9 +343,10 @@ Behavior).
 | `TTDEV_UNIT_PATH` | `/etc/systemd/system/tt-device-broker.service` | Unit path (render seam) |
 | `TTDEV_BRANCH` | `main` | Branch autoupdate tracks — the **only** settable part of the update source (08 I16); the repository itself is a constant in `autoupdate.sh`, not configuration |
 | `TTDEV_AUTOUPDATE` | `1` | Autoupdate master switch. Read at install to seed the config file, and by every lap; `sudo TTDEV_AUTOUPDATE=0 ./install.sh` turns a host off outright (after `sudo`, which resets the environment) |
-| `TTDEV_MAX_DEFER_SEC` | 0 (off — apply immediately; jobs re-adopt) | Opt-in busy/idle gate: seconds autoupdate waits for an idle window. The in-flight device-op bar is separate and unconditional (spec 08) |
-| `TTDEV_DRAIN_AFTER_SEC` | 300 | With the idle gate on: seconds a pending update waits on a busy box before autoupdate drains it (holds dispatch, lets the running job finish, applies at the job boundary); also the back-off after a drain that timed out (spec 08 I20) |
+| `TTDEV_MAX_DEFER_SEC` | 0 (= 3600) | Busy gate, always on (spec 08 I24): seconds a pending update keeps the short drain bound on a busy box; past it each drain waits up to `TTDEV_DRAIN_LONG_SEC`. No value applies over a running job. The in-flight device-op bar is separate and unconditional (spec 08 I7) |
+| `TTDEV_DRAIN_AFTER_SEC` | 300 | Seconds a pending update waits on a busy box before autoupdate drains it (holds dispatch, lets the running job finish, applies at the job boundary); also the back-off after a drain that timed out (spec 08 I20) |
 | `TTDEV_DRAIN_TIMEOUT_SEC` | 300 | Bound on one drain: a job still running after it is left alone and dispatch is released (spec 08 I20) |
+| `TTDEV_DRAIN_LONG_SEC` | 1800 | Bound on one drain once the pending update has waited `TTDEV_MAX_DEFER_SEC`; a job still running after it is left alone too, and the drain backs off (spec 08 I20, I24) |
 | `TTDEV_LOCK` | 0 | Apply the udev device lock at install (shared host) |
 | `TTDEV_HEALTH_PROBE` | 1 | Read by `apply-host-config.sh` from the config file: `0` disables `tt-device-health-probe.timer` (spec 08 I17), anything else enables it |
 | `TTDEV_NO_LOCK` | unset | Back-compat: force cooperative (no lock) |

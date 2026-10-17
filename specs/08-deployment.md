@@ -62,10 +62,9 @@ job log, so every "installed" claim below is verified, not assumed.
 - **I7 — An in-flight device operation is an unconditional bar to autoupdate.** The device-op
   inhibit lock (live pid) or a running `ttdev-reset-*` scope defers the update outright —
   restarting the broker mid-reset SIGTERMs the running `tt-smi` and half-resets the mesh. This
-  bar is separate from the *busy/idle* gate, which is OFF by default: `TTDEV_MAX_DEFER_SEC=0`
-  applies immediately even on a busy box (jobs are re-adopted across the restart); a host that
-  wants an idle window sets it to a max wait, clocked from the FIRST pending update so a commit
-  burst cannot starve a busy host forever; a box that never goes idle is drained (I20).
+  bar is separate from the *busy/idle* gate (I24), which is always on: a busy box defers the
+  update, its wait clocked from the FIRST pending update so a commit burst cannot reset it, and a
+  box that never goes idle is drained (I20) rather than restarted under a running job.
 - **I8 — Autoupdate marks a sha current only after every required stage lands.** Staging the
   deploy scripts (`reconcile.sh`, `client-setup.sh`, `autoupdate.sh`, `fabric-check.sh`,
   `eth-heartbeat-probe.py`) and the host-config apply are each fail-closed: on failure
@@ -177,8 +176,7 @@ job log, so every "installed" claim below is verified, not assumed.
   state is kept in `/run/tt-device-broker/reconcile_inprogress`, cleared once the broker is
   `active` or down). Every other non-`active` state is still reset and started.
 - **I20 — A box that is never idle is drained, not waited on forever, and no job is killed for
-  it.** With the idle gate on (`TTDEV_MAX_DEFER_SEC` > 0), a lap that finds the box busy defers
-  only until the pending update has waited `TTDEV_DRAIN_AFTER_SEC` (default 300). From then on the
+  it.** A lap that finds the box busy (I24) defers only until the pending update has waited `TTDEV_DRAIN_AFTER_SEC` (default 300). From then on the
   lap drains: it keeps the I18 hold, so the running job finishes and nothing new starts, polls
   every 5 s until no broker child, device holder or job scope remains and no device op (I7) is in
   flight, and applies at that job boundary; queued jobs wait, persisted, for the new broker. A
@@ -187,11 +185,30 @@ job log, so every "installed" claim below is verified, not assumed.
   dropped, the queue runs again, and the next drain starts `TTDEV_DRAIN_AFTER_SEC` later (kept in
   `pending.defer` as a third field). The hold is rewritten on every poll and once more as the
   apply starts, so the broker's overdue bound (`DISPATCH_HOLD_MAX_SEC`) counts from the updater's
-  last sign of life, never from the start of a long drain. `TTDEV_MAX_DEFER_SEC` keeps its
-  meaning as the outer bound: past it the lap applies anyway, on re-adoption. A drain blocks its
-  lap, and the reconcile that runs it, for at most `TTDEV_DRAIN_TIMEOUT_SEC`. The restart after an
-  apply is an ordinary broker start, so the queue opens only once the startup check (spec 03 I4:
-  the forced fabric pass, after the 1G hugepage pool is ready) has passed.
+  last sign of life, never from the start of a long drain. Once the pending update has waited
+  `TTDEV_MAX_DEFER_SEC` (unset or 0: 3600), each drain is bounded by `TTDEV_DRAIN_LONG_SEC`
+  (default 1800, longer than the broker's hard job timeout plus its kill grace) instead, so a box
+  busy around the clock still updates at its next job boundary; a drain that outlives even that
+  backs off the same way and never applies anyway (I24). A drain blocks its lap, and the
+  reconcile that runs it, for at most its bound. The restart after an apply is an ordinary broker
+  start, so the queue opens only once the startup check (spec 03 I4: the forced fabric pass,
+  after the 1G hugepage pool is ready) has passed.
+- **I24 — An update never restarts the broker under a running tenant job.** A running job is
+  re-adopted across a restart (spec 01), but the restart still costs it: its client's socket
+  drops for seconds, and the new broker holds the queue for its startup checks until the
+  re-adopted job ends. So the busy gate is always on: no value of `TTDEV_MAX_DEFER_SEC` turns it
+  off, and no bound ends in an apply over a running job. A busy lap defers and drains (I20); a
+  drain that times out leaves the job alone and backs off. After the install, just before it
+  writes `installed.sha` and restarts, the lap looks once more under the I18 hold (rewritten as it
+  polls): a broker child, device holder or job scope still running (a tenant that opened the
+  device on its own, or a dispatch after the broker dropped an overdue hold), or a device op
+  (I7), is waited on for up to `TTDEV_DRAIN_TIMEOUT_SEC`; if it runs on, the lap restarts nothing,
+  leaves `installed.sha` on the old sha, and sets the next drain `TTDEV_DRAIN_AFTER_SEC` later, so
+  the next lap retries at a job boundary. A stopped broker (MainPID 0) has no children to count.
+  Worst case on a busy box: the update applies at the first job boundary within a drain, at most
+  about `TTDEV_MAX_DEFER_SEC` + `TTDEV_DRAIN_AFTER_SEC` + `TTDEV_DRAIN_LONG_SEC` for jobs under the
+  broker's hard timeout; a job with no hard limit delays the update until it ends. The deferral
+  delays only the restart: no reset, ladder rung, power cycle or hold escalation waits on it.
 
 ## Interfaces
 
@@ -316,7 +333,7 @@ leftover first), fetches the tracked branch thereafter, and reads the sha with
 network and a missing branch each name the fault and exit 0. If that sha equals `installed.sha`,
 exit. Otherwise: device-op bar and reset-scope check
 (I7 — the scope check asks systemd, because a reset outlives the broker by design); dispatch hold and busy/idle
-gate per I7 and I18; then materialize the tree — `reset --hard` to **the sha this lap resolved**, not to
+gate per I7, I18, I20 and I24; then materialize the tree — `reset --hard` to **the sha this lap resolved**, not to
 `origin/<branch>` re-read after the gate, so a branch that moved during a defer is not installed
 under a sha `installed.sha` would misname; pip install into the broker venv (on failure, clear broken
 `dist-info` metadata and retry `--ignore-installed` — recovery from a half-installed venv that
@@ -490,7 +507,7 @@ script exists, the claim stands on the script (listed below).
 | I3 (/health fail-closed, polled) | `tests/test_deploy_broker_health_failclosed.py::test_broker_health_failure_aborts_with_journal_hint`, `tests/test_deploy_broker_health_failclosed.py::test_broker_health_is_polled_in_a_loop` |
 | I4 (sudoers visudo fail-closed, removed first) | `tests/test_deploy_sudoers_failclosed.py::test_invalid_shipped_sudoers_aborts`, `tests/test_deploy_sudoers_failclosed.py::test_invalid_shipped_sudoers_is_removed_before_aborting` |
 | I5/I6 (timers enabled AND verified active) | `tests/test_deploy_timer_enable_failclosed.py::test_reconcile_timer_enable_is_verified`, `tests/test_deploy_timer_enable_failclosed.py::test_fabric_validator_timer_enable_is_verified`, `tests/test_deploy_timer_enable_failclosed.py::test_is_active_check_follows_the_enable` |
-| I7 (idle gate off by default; opt-in window; device-op bar unconditional) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_idle_gate_is_off_by_default`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_host_can_still_ask_for_an_idle_window`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_in_flight_device_op_still_bars_the_update` |
+| I7 (device-op bar unconditional, separate from the I24 busy gate) | `tests/test_deploy_autoupdate_idle_gate.py::test_an_in_flight_device_op_still_bars_the_update`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_holds_a_drained_apply` |
 | I8 (autoupdate required stages fail-closed; apply precedes installed.sha; staged sources exist) | `tests/test_deploy_required_install_failclosed.py::test_autoupdate_required_stages_fail_closed`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_host_config_apply_fails_closed`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_host_config_apply_precedes_installed_sha`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_staged_sources_exist_in_deploy` |
 | Installer staging split (fabric fatal; heartbeat loud-not-fatal) | `tests/test_deploy_required_install_failclosed.py::test_installer_fabric_check_stage_is_fatal_not_swallowed`, `tests/test_deploy_required_install_failclosed.py::test_installer_eth_heartbeat_stage_is_loud_but_not_fatal` |
 | I9 (stray broker: detected, not killed, deduped) | `tests/test_deploy_stray_broker_detected.py::test_reconcile_detects_a_stray_broker`, `tests/test_deploy_stray_broker_detected.py::test_reconcile_does_not_kill_the_stray`, `tests/test_deploy_stray_broker_detected.py::test_reconcile_dedups_a_persistent_stray` |
@@ -518,6 +535,7 @@ script exists, the claim stands on the script (listed below).
 | I18 (dispatch hold from the busy check through the restart; queued specs and job scopes count as busy) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_hold_is_taken_before_anything_is_counted`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_hold_appears_whole`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_queued_job_defers_an_opted_in_update_and_drops_the_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_idle_box_applies_and_keeps_the_hold_until_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_running_job_scope_counts_as_busy` |
 | I19 (an in-progress broker is not reset or started; logged once) | `tests/test_deploy_reconcile_activating.py::test_an_in_progress_broker_is_not_reset_or_started`, `tests/test_deploy_reconcile_activating.py::test_an_in_progress_broker_logs_once_per_episode`, `tests/test_deploy_reconcile_activating.py::test_a_down_broker_is_still_reset_and_started`, `tests/test_deploy_reconcile_activating.py::test_an_active_broker_is_left_alone` |
 | I20 (drain: past DRAIN_AFTER the hold is kept until the running job ends, then the update applies with no job running; a back-to-back queue cannot slip a job in; a job past DRAIN_TIMEOUT is left alone and the next drain waits DRAIN_AFTER; a device op holds the apply; the restart opens the queue only after the startup fabric pass, after hugepages) | `tests/test_deploy_autoupdate_idle_gate.py::test_a_busy_box_defers_until_the_drain_is_due`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_due_drain_keeps_the_hold_and_applies_at_the_job_boundary`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_back_to_back_queue_cannot_slip_a_job_into_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_drain_that_outlives_its_bound_lets_the_job_run_and_backs_off`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_backed_off_drain_waits_its_turn`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_holds_a_drained_apply`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_drain_refreshes_the_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_apply_ends_in_a_full_broker_restart`, `tests/test_restart_drain.py::test_a_job_held_across_an_update_waits_for_the_startup_fabric_pass`, `tests/test_restart_drain.py::test_a_failed_startup_pass_after_an_update_keeps_the_queue_held` |
+| I24 (no restart under a running tenant job: busy gate always on, MAX_DEFER unset or 0 = 3600; past MAX_DEFER the drain bound is DRAIN_LONG 1800 and the update applies at the job boundary; past that the job is left alone and the drain backs off; a job running at the restart point blocks the restart and installed.sha stays old; MainPID 0 counts no children) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_idle_gate_is_on_by_default`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_busy_box_with_no_max_defer_set_still_defers`, `tests/test_deploy_autoupdate_idle_gate.py::test_past_max_defer_the_drain_outwaits_a_long_job_and_applies_at_its_end`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_past_the_long_bound_is_left_alone_and_the_drain_backs_off`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_running_at_the_restart_point_blocks_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_that_ends_at_the_restart_point_is_waited_out`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_stopped_broker_has_no_children_to_count` |
 
 **Unanchored (the claim stands on the script):** I2 (wheel/venv from this tree —
 `install-tt-device-broker.sh`); the installer's flow ordering and lock opt-in; Galaxy detection
