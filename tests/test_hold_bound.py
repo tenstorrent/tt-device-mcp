@@ -64,6 +64,7 @@ _KINDS = {
         "present-forced",
     ),
     "off-bus": ("gate_error", "chip 29 off the bus", "", {str(i): 100 for i in range(31)}, "offbus-forced"),
+    "foreign holder gone": ("foreign_holder", "gate/pre-job: could not verify: foreign holder", "", None, "present-forced"),
     "generic": ("eth_frozen", "gate/post-job: eth/fabric fault on a present mesh", "", None, "present-forced"),
 }
 
