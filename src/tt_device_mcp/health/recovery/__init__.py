@@ -131,6 +131,9 @@ class Evidence:
     # Spec 03 I61: a clean post-job eth read timed out on a present mesh, and this hold episode's one
     # present-mesh reset is unspent and not refused by the outage hold. Routed like dispatch_reset_due.
     eth_timeout_reset_due: bool = False
+    # Spec 03 I69: a job the broker stopped mid-run (its timeout, or a requested kill) owes the mesh
+    # one reset before release, on the same unspent latch. Routed like dispatch_reset_due.
+    kill_reset_due: bool = False
     # Spec 03 I55: the fabric passed traffic but mesh dispatch failed over a present mesh, and this
     # hold episode has not had its one present-mesh reset yet (nor does the outage hold forbid it).
     dispatch_reset_due: bool = False
