@@ -5548,8 +5548,13 @@ def test_an_unconfigured_host_still_has_a_terminating_ladder(monkeypatch, tmp_pa
 
     assert srv._auto_reboot_enabled(), "the warm-reboot rung must be armed on an unconfigured host"
     assert srv._auto_power_cycle_enabled(), "the cold rung must be armed on an unconfigured host"
-    # Gentlest-first still holds: an ordinary partial drop takes the reboot, not the power cycle.
-    assert galaxy._host_escalation_for_drop(off_bus=1, expected=8, **srv._host_escalation_kwargs()) == ("reboot", False)
+    # Spec 04 I71: on a multi-chip host the cold rung goes first, a partial drop included; a warm
+    # reboot does not re-power the trays. A single-chip host keeps the reboot first.
+    assert galaxy._host_escalation_for_drop(off_bus=1, expected=8, **srv._host_escalation_kwargs()) == (
+        "power-cycle",
+        False,
+    )
+    assert galaxy._host_escalation_for_drop(off_bus=1, expected=1, **srv._host_escalation_kwargs()) == ("reboot", False)
     # The drop that used to strand the queue: reboot proven futile, so climb — never (None, True).
     assert galaxy._host_escalation_for_drop(
         off_bus=3, expected=8, warm_reboot_futile=True, **srv._host_escalation_kwargs()
