@@ -526,6 +526,88 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
 
 
 @pytest.mark.asyncio
+async def test_replay_a_post_job_77_hold_that_only_relifts_gets_the_ladder_at_the_bound_then_the_power_cycle(
+    rig, monkeypatch, clear_job_state  # noqa: F811
+):
+    """A Galaxy host's post-job hold: a job's fabric failure after a topology lift sets the I42 latch, the
+    hold is 77-only, and for its whole life only idle relifts ran (each withheld by the latch). The
+    stuck-hold event at the deadline read escalated=false and no rung had run. Walked tick by tick:
+    nothing is forced below the bound; at 600 s the full ladder runs, the full check after it (fabric
+    included) fails, the broker asks for the power cycle, and the deadline event reads escalated."""
+    order, g = rig["order"], rig["g"]
+    mon = srv.health_monitor
+    rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "_present_chip_indices", lambda: [str(i) for i in range(EXPECTED)])
+    monkeypatch.setattr(mon, "expected", lambda n: EXPECTED)
+    monkeypatch.setattr(mon, "known_fabric_fault", lambda: "")
+    monkeypatch.setattr(mon, "last_fabric_output", MISMATCH)
+    monkeypatch.setattr(mon, "last_fabric_ok", None)
+    monkeypatch.setattr(mon, "topology_hw_fault", "")
+    monkeypatch.setattr(mon, "topology_hw_fault_paged", 0.0)
+    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
+    monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
+    monkeypatch.setattr(mon, "topology_lift_pending", True)
+    why = mon.note_job_after_topology_lift(True, "... could not find any forwarding direction ...")
+    assert why, "the job's fabric failure after the lift sets the latch"
+    srv._hold_device_fabric_unverified(f"job 930: {why}")
+    assert srv._fabric_77_only_hold()
+    monkeypatch.setattr(srv, "device_hold_episode_reason", f"job 930: {why}")
+    _watchdog(monkeypatch)
+    srv.fsm.set_latch("escalated", False)
+    seen = []
+    patch_health_event(monkeypatch, lambda kind, **k: seen.append((kind, k)))
+    checks = []
+
+    async def reset_then_full_check(indices, log):
+        order.append("glx_reset")
+        ok, _ = await g._verify_device(EXPECTED, log, run_fabric=True)
+        checks.append(ok)
+        return False
+
+    async def full_check(expected, log, run_fabric=True, **k):
+        assert run_fabric, "the post-reset check includes the fabric (goal 8)"
+        assert not mon.topology_hw_fault, "the latch is lifted, so the fabric pass really runs"
+        return False, {"fabric": {"ok": False, "detail": MISMATCH}}
+
+    monkeypatch.setattr(g, "_reset_and_verify_device", reset_then_full_check)
+    monkeypatch.setattr(g, "_verify_device", full_check)
+    rig_cycle = srv._auto_power_cycle_host
+
+    async def cycle_and_mark(log, reason):
+        await rig_cycle(log, reason)
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", cycle_and_mark)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+
+    for age in range(10, BOUND, 10):  # one sampler tick every 10 s; the idle relift stays withheld
+        monkeypatch.setattr(srv, "device_hold_episode_since", _since(age))
+        withheld, detail = await mon._verify_fabric_health_body(1)
+        assert withheld is None and "withheld" in detail
+        srv._check_hold_deadline(now=datetime.now())
+        await _drain()
+        assert "glx_reset" not in order and "power_cycle" not in order, f"a rung ran at {age}s, below the bound"
+
+    monkeypatch.setattr(srv, "device_hold_episode_since", _since(BOUND))
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert "glx_reset" in order, "the full ladder ran at the bound"
+    assert checks == [False], "the full check after the ladder, fabric included, failed"
+    assert order.count("power_cycle") == 1, "then the broker's own code asked for the power cycle"
+    assert order.index("glx_reset") < order.index("power_cycle")
+    assert "released" not in order, "nothing released on a failed check"
+
+    monkeypatch.setattr(srv, "device_hold_episode_since", _since(srv._hold_deadline_sec() + 1))
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    stuck = [k for kind, k in seen if kind == "hold_stuck_past_deadline"]
+    assert stuck and all(k["escalated"] for k in stuck), stuck
+    assert order.count("power_cycle") == 1, "the requested cycle is not asked for twice"
+
+
+@pytest.mark.asyncio
 async def test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false(monkeypatch, clear_job_state):
     """The deadline event reports the bound's ladder: on the old code it said escalated=false while the
     I42 latch kept every rung off."""
