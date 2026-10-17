@@ -1088,10 +1088,9 @@ class GalaxyRecovery(Recovery):
     # no-host-rung hold already paged (spec 04 I29).
     _sweep_read_77: bool = False
     _host_rung_77_paged_since: Optional[str] = None
-    # The episode whose regressed partial drop already ran its early last-chance sweep (spec 04 I80),
-    # and the chip ids still off the bus after it failed: the ceiling climb does not sweep that set again.
+    # The episode whose regressed partial drop already ran its early last-chance sweep (spec 04 I80):
+    # no second early sweep before the 10-min mark, where the bound's ladder sweeps again (I76).
     _regressed_sweep_since: Optional[str] = None
-    _regressed_sweep_ids: Optional[frozenset] = None
     # The operator hand-off of a 77 the host rung did not end (spec 04 I29): its episode and deadline.
     _fabric_77_handoff: Optional[dict] = None
     # Why auto_recovery_allowed last held a host rung off (a cooldown, the rate limit, a tenant).
@@ -3242,9 +3241,10 @@ class GalaxyRecovery(Recovery):
             # Spec 04 I80: this episode's reset regressed a partial drop (a few chips, below the reboot
             # floor). The mesh reset may not run alone again (I31), so the ceiling wait adds nothing but
             # time; the rung that heals it is the sweep (SBR, the affected tray's re-power, the mesh
-            # reset, then the full verify, fabric included). Run it now, once per episode, instead of
-            # at the ceiling. The host rungs still wait for the ceiling below. A sweep the tenant or a
-            # live reset scope skipped (None) has not run, so it does not use up the episode's one try.
+            # reset, then the full verify, fabric included). Run it now, once before the ceiling; it is
+            # not the bound's ladder, so the ceiling climb sweeps again (I76). The host rungs still wait
+            # for the ceiling below. A sweep the tenant or a live reset scope skipped (None) has not
+            # run, so it does not use up the episode's one early try.
             if (
                 episode_regressed
                 and not swept
@@ -3359,18 +3359,8 @@ class GalaxyRecovery(Recovery):
             health_event(
                 "reset_rung_skipped_failed_unchanged", rung="last_chance_sweep", held_since=hold_since, off_bus=off_bus
             )
-        elif not swept and self._early_sweep_failed_on(hold_since, offbus_ids):
-            # Spec 04 I80/I31: this episode's early sweep already ran the full ladder (SBR, tray re-power,
-            # mesh reset, full verify) and failed, and the chips off the bus now are that set or more. A
-            # second sweep would be a third mesh reset after the regression, the loop I31 bounds: climb.
-            log("last-chance sweep skipped: this hold's early sweep already failed on these chips")
-            health_event(
-                "reset_rung_skipped_failed_unchanged",
-                rung="last_chance_sweep",
-                reason="early_sweep_failed",
-                held_since=hold_since,
-                off_bus=off_bus,
-            )
+        # A failed I80 early sweep ran below the 10-min mark, so it does not stand in for the bound's
+        # ladder (spec 04 I76): the sweep runs again here, then the host rung if its full check fails.
         elif not swept and (
             await self._settle_and_verify_before_host_rung(
                 expected, log, "idle-escalation", context=f"idle escalation, {off_bus}/{expected} off the bus"
@@ -3390,12 +3380,11 @@ class GalaxyRecovery(Recovery):
     async def _note_failed_early_sweep(
         self, hold_since: Optional[str], off_bus_before: int, expected: int, log
     ) -> None:
-        """Record a spec 04 I80 early sweep that ran and failed: the episode's one try is spent, and the
-        chips still off the bus are kept so the ceiling climb does not sweep that set again. A sweep that
-        left more chips off the bus regressed the mesh too: journal it as the climb does a reset's."""
+        """Record a spec 04 I80 early sweep that ran and failed: the episode's one early try is spent (the
+        10-min bound's ladder still sweeps, I76). A sweep that left more chips off the bus regressed the
+        mesh too: journal it as the climb does a reset's."""
         self._regressed_sweep_since = hold_since
         ids_after = await self._offbus_ids_now(expected)
-        self._regressed_sweep_ids = frozenset(ids_after) if ids_after is not None else None
         if ids_after is not None and expected > 1 and len(ids_after) > off_bus_before:
             self.mechanism.note_reset_regressed(hold_since)
             health_event(
@@ -3408,20 +3397,8 @@ class GalaxyRecovery(Recovery):
             )
             log(
                 f"the early last-chance sweep REGRESSED the mesh — {off_bus_before} -> {len(ids_after)} of "
-                f"{expected} chip(s) off the bus; no further sweep on this set this hold"
+                f"{expected} chip(s) off the bus; no further early sweep this hold"
             )
-
-    def _early_sweep_failed_on(self, hold_since: Optional[str], offbus_ids: Optional[set]) -> bool:
-        """Whether this hold episode's early sweep (spec 04 I80) ran and failed, and every chip it left off
-        the bus is still off (the set is unchanged or larger). A set that shrank is progress another sweep
-        may finish; an unreadable read decides nothing."""
-        return (
-            hold_since is not None
-            and self._regressed_sweep_since == hold_since
-            and self._regressed_sweep_ids is not None
-            and bool(offbus_ids)
-            and self._regressed_sweep_ids <= set(offbus_ids)
-        )
 
     async def _verify_post_reboot_recovery(self, off_bus: int, expected: int, log) -> None:
         """After a warm reboot the broker itself fired, confirm the mesh came back — and climb to the
