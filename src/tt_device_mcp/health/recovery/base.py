@@ -1720,6 +1720,10 @@ class RecoveryMechanism:
             return
         # From here the host is going down: no device reset may start under it.
         self.host_action_requested = (action, time.monotonic())
+        # Our own cycle is not a host hang: the next boot must not latch an off-bus intent (I25).
+        from tt_device_mcp.health.recovery import pcie_guard  # the package imports this module
+
+        pcie_guard.close_offbus_reset_before_host_action(action, log)
         self._write_action_log(row_owner, f"{label} — {reason}", 0.0, action, None)
         health_event(f"auto_{ev}_request", reason=reason)
         log(f"{label.upper()}: {detail} ({reason}); opted in + within limits — requesting it now")
