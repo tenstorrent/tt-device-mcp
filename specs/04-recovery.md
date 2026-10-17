@@ -935,7 +935,9 @@ each rung fires only when the gentler one failed or cannot apply.
   refuses it. At the bound the I42 and I46 latches are lifted
   (`hold_bound_latch_cleared`), so the full health check after the ladder, fabric included, gets a
   real verdict and only a pass releases (goal of I8/spec 03 I4); a job that fails the same way
-  declares them again. Below the bound the faster class paths stay as they are. When the ladder
+  declares them again. Below the bound the faster class paths stay as they are; a forced run that
+  started below the bound (the off-bus one-shot, a progress retry, a gated grace) is not the bound's
+  ladder, so at the bound the full ladder runs again before any host rung. When the ladder
   leaves the mesh unrecovered, the broker's own code asks for the host rung at once: the BMC power
   cycle, or the warm reboot where only that is opted in. When the ladder brings the mesh back, only its
   full check, fabric included, releases the hold. A full check that ends with no pass (a failed
@@ -945,16 +947,26 @@ each rung fires only when the gentler one failed or cannot apply.
   (`_HOLD_BOUND_CHECK_SEC`) bounds only a check that is still running, hangs or waits on hugepages;
   no other run in that window starts a ladder or a host rung over it, and if the hold still stands
   at its end the watchdog asks for the host rung (`hold_bound_cycle`). A later bound window whose last window already ran a
-  ladder goes straight to the host rung. The governor still decides that rung: a readable tenant
-  refuses it, a reset still cycling in its own scope defers it, and a cooldown, per-boot cap or
-  backstop denial (I65, I9) arms the retry the watchdog fires the moment that wait ends. Only that
-  bounded boot / post-power-cycle cooldown may hold longer than the bound. With both host rungs
+  ladder goes straight to the host rung. The governor still decides that rung. A reset still
+  cycling in its own scope defers the bound's ladder or host rung only until that scope ends
+  (bounded by the scope's own limit): the rung stays pending and the first sampler tick after the
+  scope asks again, never a whole window later. A cooldown, per-boot cap or backstop denial (I65, I9)
+  arms the retry the watchdog fires the moment that wait ends; a denial that arms no retry keeps the
+  rung pending, is asked again every tick and is journaled once per distinct reason
+  (`hold_bound_host_rung`). Only that bounded boot / post-power-cycle cooldown may hold longer than
+  the bound, with one exception: a live readable tenant that is not a broker job's leftover (invariant
+  4, I6/I7) still refuses every rung, so such a hold is bounded only by the tenant. It is never silent:
+  at the bound the broker journals and pages `hold_bound_tenant_blocked` once per episode, naming the
+  blocker (pid, user, command), `/health` shows `next_step` `tenant_blocked` with `blocked_by`, and
+  on the first sampler tick after the tenant leaves the ladder runs, then the host rung if the full
+  check fails. With both host rungs
   opted out (`TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` and `TT_DEVICE_MCP_AUTO_REBOOT=0`) the hold pages
   `hold_bound_no_host_rung` once per episode. The operator kill switch
-  `TT_DEVICE_MCP_FORCE_ESCALATE=0` still turns the whole watchdog off, and the bound with it; the
-  doctor reports it as a recovery gap. `/health` carries `hold_bound` while a hold is open:
-  `bound_sec`, `deadline`, `held_age_sec`, `next_step` (`ladder` or `power-cycle`) and, while the
-  host rung waits on it, `cooldown_until`. One helper, `hold_bound_deadline()`, gives the open
+  `TT_DEVICE_MCP_FORCE_ESCALATE=0` turns off only the forced runs below the bound; the bound's ladder
+  and host rung ignore it, no env or config switches the bound off, and the boot rung inventory's
+  `RUNG OFF forced-escalation` warning says so. `/health` carries `hold_bound` while a hold is open:
+  `bound_sec`, `deadline`, `held_age_sec`, `next_step` (`ladder`, `power-cycle` or
+  `tenant_blocked` with `blocked_by`) and, while the host rung waits on it, `cooldown_until`. One helper, `hold_bound_deadline()`, gives the open
   hold's escalation deadline for every hold kind: its start + the ceiling, or the end of a running
   power-cycle cooldown when that is later; `/health`'s `deadline` and the stuck-hold event's and
   alert's `escalation_deadline` all read it. A stuck-hold event past the bound reports `escalated`
@@ -966,7 +978,11 @@ each rung fires only when the gentler one failed or cannot apply.
   latched I42/I46; class D), as above; a 77 the episode's reset and sweep already left unverified
   (I29), at most 600 s + one sampler tick, with no second reset; a killed job's leftover stuck in the
   kernel (class J), was open-ended (the hold stood until an operator rebooted), now at most 600 s +
-  one sampler tick; class A (whole tray) and C keep the I37 direct cycle, well inside the bound. Each
+  one sampler tick; an off-bus hold (class B1/B2) whose one-shot below the bound left it unhealed
+  now gets the bound's own ladder at 600 s and then the host rung (before, the one-shot stood in for
+  it); a hold under `TT_DEVICE_MCP_FORCE_ESCALATE=0` was open-ended, now bounded as above; a host
+  rung deferred by a reset scope or a retry-less denial fires one sampler tick after the deferral
+  ends (before, a whole window later); class A (whole tray) and C keep the I37 direct cycle, well inside the bound. Each
   waits only on a running boot / post-power-cycle cooldown (I65) and fires as it ends. Bounds the about 70 min one Galaxy host sat in a latched topology-mismatch hold
   with no rung run.
 
@@ -1467,6 +1483,10 @@ sees a silent fabric pass.
 | I76 /health shows the bound; the env shortens it, never lengthens it; a stuck-hold event past the bound never reads `escalated` false | `tests/test_hold_bound.py::test_health_shows_the_bound`, `::test_env_shortens_the_bound_never_lengthens_it`, `::test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false` |
 | I76 the latch set by a fabric failure of the first job after a topology-mismatch lift: at the bound (watchdog window or tenant-hold bound) the full ladder runs, the full check with fabric still fails, the broker asks for the power cycle | `tests/test_hold_bound.py::test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_check_and_power_cycle` |
 | I76 every hold kind's escalation deadline is start + bound, or a running power-cycle cooldown's end when later; /health, the stuck-hold event and the alert read the one helper | `tests/test_hold_bound.py::test_every_hold_kind_reports_one_escalation_deadline` |
+| I76 a forced run below the bound (off-bus one-shot) is not the bound's ladder: at the bound the full ladder runs again, then the host rung | `tests/test_hold_bound.py::test_a_ladder_below_the_bound_does_not_stand_in_for_the_bounds_ladder` |
+| I76 a host rung or bound ladder a reset scope defers fires on the first sampler tick after the scope ends; a retry-less denial is asked again each tick and journaled once | `tests/test_hold_bound.py::test_a_host_rung_deferred_by_a_reset_scope_fires_on_the_first_tick_after_it`, `tests/test_hold_bound.py::test_a_bound_ladder_deferred_by_a_reset_scope_runs_on_the_first_tick_after_it`, `tests/test_hold_bound.py::test_a_host_rung_denied_with_no_retry_is_asked_again_each_tick_and_journaled_once` |
+| I76 a live tenant at the bound is paged once (`hold_bound_tenant_blocked`, naming it), /health shows `tenant_blocked`, and the ladder then the host rung run on the first tick after it leaves | `tests/test_hold_bound.py::test_a_live_tenant_at_the_bound_is_paged_once_and_the_ladder_runs_when_it_leaves`, `tests/test_hold_bound.py::test_a_killed_jobs_leftover_holder_does_not_stop_the_bound` |
+| I76 `TT_DEVICE_MCP_FORCE_ESCALATE=0` does not stop the bound, and the boot warning says so | `tests/test_hold_bound.py::test_the_operator_kill_switch_does_not_stop_the_bound`, `tests/test_rung_privilege.py::test_the_force_escalate_kill_switch_warns_that_the_hold_bound_ignores_it` |
 | I58 all off after a failed reset and a broker restart: the startup or a later gate cycles with no second reset; the sweep skips a failed-unchanged set | `tests/test_classac_power_cycle_direct.py::test_replay_all_off_after_a_restart_cycles_with_no_second_reset`, `::test_a_partial_drop_keeps_the_ladder` |
 | I36 a power cycle that is rate-limited or not opted in never stops resets: a shrinking off-bus set resets again each forced window, and the gate retries its reset once its cooldown ran out | `tests/test_host_action_suppress.py::test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_fire`, `::test_the_gate_keeps_resetting_a_drop_whose_power_cycle_is_not_opted_in` |
 | Host-rung chooser order | `tests/test_device_safety.py::test_choose_escalation_prefers_reboot_then_power_cycle`, `tests/test_device_safety.py::test_choose_escalation_power_cycle_alone_goes_straight_to_it`, `tests/test_device_safety.py::test_choose_escalation_none_when_neither_opted_in` |

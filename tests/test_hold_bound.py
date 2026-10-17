@@ -633,7 +633,207 @@ async def test_a_killed_jobs_leftover_holder_does_not_stop_the_bound(
     assert "glx_reset" not in order, "no reset runs over a leftover (01 I16)"
     if tenant:
         assert "power_cycle" not in order, "a live tenant still refuses the host rung"
+        assert kinds.count("hold_bound_tenant_blocked") == 1, "the tenant-blocked hold is paged, naming it"
+        assert dict(rig["events"])["hold_bound_tenant_blocked"]["pid"] == 5151
+        assert srv._hold_bound_health()["next_step"] == "tenant_blocked"
+        _leftover_scan(monkeypatch, rig, tenant=False)  # the tenant leaves; the leftover stays
+        _tick()
+        await _drain()
+        assert order.count("power_cycle") == 1, "the first tick after the tenant leaves asks for the host rung"
+        assert [k for k, _ in rig["events"]].count("hold_bound_tenant_blocked") == 1
         return
     assert "hold_bound_leftover" in kinds
     assert order.count("power_cycle") == 1, "the bound asked for the host rung that clears the leftover"
     assert "released" not in order
+
+
+def _real_host_rung(monkeypatch, cycles, allowed=lambda action: (True, "")):
+    """The real I76 host rung over a stub governor (``allowed``) and a recorded power cycle."""
+    monkeypatch.setattr(srv, "_hold_bound_host_rung", _REAL_HOST_RUNG)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv.recovery_mechanism, "_journal_auto_recovery_denied", lambda *a: cycles.append("denied"))
+    monkeypatch.setattr(
+        srv.recovery_mechanism, "auto_recovery_allowed", lambda action, tenant_active=False, **k: allowed(action)
+    )
+
+    async def power_cycle(log, reason):
+        cycles.append("power_cycle")
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+
+
+def _tick(seconds=10):
+    srv._check_hold_deadline(now=datetime.now() + timedelta(seconds=seconds))
+
+
+@pytest.mark.asyncio
+async def test_a_ladder_below_the_bound_does_not_stand_in_for_the_bounds_ladder(monkeypatch, clear_job_state):
+    """An off-bus one-shot (or any forced run) at 2 min is not the bound's ladder: at the 10-min mark the
+    bound runs the full ladder again, and only then asks for the host rung."""
+    why, detail, _output, beats, ladder = _KINDS["off-bus"]
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why=why, detail=detail, beats=beats, age_min=BOUND / 60 + 0.05
+    )
+    monkeypatch.setattr(srv, "dead_chips", lambda b: [])
+
+    async def failed_ladder(kind, indices, expected, log):
+        escalations.append(kind)
+        return OUTCOME_TERMINAL
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", failed_ladder)
+    real_age = srv._hold_age_now
+    monkeypatch.setattr(srv, "_hold_age_now", lambda now=None: 120.0)  # the one-shot, 2 min into the hold
+    monkeypatch.setattr(srv, "device_hold_escalation_kind", "offbus_one_shot")
+    await srv._force_escalate_stuck_hold()
+    assert escalations == [ladder] and "host_rung" not in events
+    monkeypatch.setattr(srv, "_hold_age_now", real_age)
+    assert srv._hold_bound_health()["next_step"] == "ladder"
+    srv.device_hold_escalation_kind = "ceiling_window"  # the window the watchdog claims at the bound
+    await srv._force_escalate_stuck_hold()
+    assert escalations == [ladder, ladder], "the bound runs its own ladder at the 10-min mark"
+    assert events.count("host_rung") == 1
+    assert events.index("hold_deadline_forced_escalation", 1) < events.index("host_rung")
+
+
+@pytest.mark.asyncio
+async def test_a_host_rung_deferred_by_a_reset_scope_fires_on_the_first_tick_after_it(monkeypatch, clear_job_state):
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
+    )
+    _watchdog(monkeypatch)
+    cycles, scope = [], {"active": None}
+    _real_host_rung(monkeypatch, cycles)
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: scope["active"])
+
+    async def failed_ladder(kind, indices, expected, log):
+        escalations.append(kind)
+        scope["active"] = "a reset still cycling"
+        return OUTCOME_TERMINAL
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", failed_ladder)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == ["present-forced"] and cycles == []
+    assert srv._hold_bound_cycle_age is None, "a deferred host rung is not one that was asked"
+    _tick()
+    await _drain()
+    assert cycles == [], "still in its scope"
+    scope["active"] = None
+    _tick(20)
+    await _drain()
+    assert cycles == ["power_cycle"], "the first tick after the scope ends asks for the host rung"
+    assert escalations == ["present-forced"]
+
+
+@pytest.mark.asyncio
+async def test_a_bound_ladder_deferred_by_a_reset_scope_runs_on_the_first_tick_after_it(monkeypatch, clear_job_state):
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
+    )
+    _watchdog(monkeypatch)
+    scope = {"active": "a reset still cycling"}
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: scope["active"])
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == [] and srv.device_hold_escalate_bucket == 0, "the window is given back"
+    scope["active"] = None
+    _tick()
+    await _drain()
+    assert escalations == ["present-forced"], "the bound's ladder runs on the first tick after the scope"
+
+
+@pytest.mark.asyncio
+async def test_a_host_rung_denied_with_no_retry_is_asked_again_each_tick_and_journaled_once(
+    monkeypatch, clear_job_state
+):
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
+    )
+    _watchdog(monkeypatch)
+    cycles, gov = [], {"ok": False}
+    _real_host_rung(monkeypatch, cycles, lambda action: (True, "") if gov["ok"] else (False, "ledger unreadable"))
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
+
+    async def failed_ladder(kind, indices, expected, log):
+        escalations.append(kind)
+        return OUTCOME_TERMINAL
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", failed_ladder)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    _tick()
+    await _drain()
+    assert cycles == ["denied"], "the same denial is journaled once"
+    gov["ok"] = True
+    _tick(20)
+    await _drain()
+    assert cycles == ["denied", "power_cycle"] and escalations == ["present-forced"]
+
+
+@pytest.mark.asyncio
+async def test_a_live_tenant_at_the_bound_is_paged_once_and_the_ladder_runs_when_it_leaves(
+    monkeypatch, clear_job_state
+):
+    """Past the bound a live tenant still keeps every reset and the host rung off the device (no reset over
+    a tenant). That hold is the one past the bound with no deadline of its own, so it is not silent: one
+    page per episode naming the blocker, and /health shows it. The first tick after it leaves runs the ladder."""
+    escalations, alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
+    )
+    _watchdog(monkeypatch)
+    monkeypatch.setattr(srv, "device_hold_tenant_deferred", False)
+    tenant = {"on": True}
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: tenant["on"])
+    monkeypatch.setattr(
+        srv,
+        "enumerate_device_holders",
+        lambda: HolderScan(holders=[DeviceHolder(pid=5151, uid=1002)] if tenant["on"] else [], complete=True),
+    )
+    monkeypatch.setattr(galaxy, "is_tenant", lambda h: True)
+    monkeypatch.setattr(galaxy, "discount_broker_internal", lambda scan: scan)
+    monkeypatch.setattr(galaxy, "holder_comm", lambda pid: "python3")
+
+    async def ladder(kind, indices, expected, log):
+        if tenant["on"]:
+            srv.galaxy_recovery.tenant_deferred = True
+            return galaxy.OUTCOME_WAITING
+        srv.galaxy_recovery.tenant_deferred = False
+        escalations.append(kind)
+        return OUTCOME_TERMINAL
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", ladder)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    _tick()
+    await _drain()
+    pages = [a for a in alerts if a["kind"] == "hold_bound_tenant_blocked"]
+    assert len(pages) == 1 and pages[0]["pid"] == 5151 and "5151" in pages[0]["blocked_by"]
+    assert events.count("hold_bound_tenant_blocked") == 1
+    health = srv._hold_bound_health()
+    assert health["next_step"] == "tenant_blocked" and "5151" in health["blocked_by"]
+    assert escalations == [] and "host_rung" not in events
+    tenant["on"] = False
+    _tick(20)
+    await _drain()
+    assert escalations == ["present-forced"] and events.count("host_rung") == 1
+    assert srv._hold_bound_health()["next_step"] != "tenant_blocked"
+
+
+@pytest.mark.asyncio
+async def test_the_operator_kill_switch_does_not_stop_the_bound(monkeypatch, clear_job_state):
+    """TT_DEVICE_MCP_FORCE_ESCALATE=0 governs only forced runs below the bound."""
+    monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=9
+    )
+    _watchdog(monkeypatch)
+    monkeypatch.setattr(srv, "isolated_chips", {"3"})  # the off-bus one-shot is due below the bound
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == [], "below the bound the kill-switch still holds"
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "device_hold_episode_since", _since(BOUND + 5))
+    srv._check_hold_deadline()
+    await _drain()
+    assert escalations == ["present-forced"], "at the bound the ladder runs whatever the kill-switch says"
