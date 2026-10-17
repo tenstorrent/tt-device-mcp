@@ -3292,8 +3292,13 @@ async def test_a_link_drop_after_clean_jobs_pays_at_most_one_fabric_pass_per_int
     """Spec 03 I30 + I28. The real eth read on an armed host whose measured link count sits below
     the high-water mark skips (links unverified). That drop stays until an operator re-baselines,
     so it buys the traffic pass only when no pass is fresher than FABRIC_CHECK_MIN_INTERVAL_SEC:
-    two clean jobs in a row pay one pass at most, and none when a pass is already fresh."""
+    two clean jobs in a row pay one pass at most, and none when a pass is already fresh. A host
+    with a cabling descriptor: its validator names a missing link itself (with none, the drop
+    fails the check, test_eth_link_drop_no_descriptor)."""
     from tt_device_mcp.health.monitors import eth as eth_mod
+    from tt_device_mcp.health.monitors import fabric as fabric_mod
+
+    monkeypatch.setattr(fabric_mod, "_validator_paths", lambda: ("bin", "root", "/x/descriptor"))
 
     real_eth_read = srv.health_monitor.verify_eth_heartbeat
     calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=None, chips=4)

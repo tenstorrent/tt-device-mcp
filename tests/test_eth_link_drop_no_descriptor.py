@@ -217,3 +217,169 @@ async def test_the_held_drop_runs_the_ladder_at_the_10_min_mark_then_the_host_ru
     fired = "reboot" if nodesc_mesh["reboots"] else "power-cycle" if cycles else None
     assert fired == rung, f"the window requests the {rung} rung once the ladder's check fails"
     assert srv.fsm.state is not ServerState.HEALTHY
+
+
+# --- a clean exit's check: no rate limit over a drop no pass can see (review F1) -------------------
+
+
+def _count_passes(monkeypatch, st):
+    async def fabric_check(argv, env, **kw):
+        st["passes"] = st.get("passes", 0) + 1
+        return 0, "all links ok\n"
+
+    monkeypatch.setattr(fabric, "check", fabric_check)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale", [False, True])
+async def test_a_clean_exit_link_drop_fails_without_a_pass_whatever_the_rate_limit(monkeypatch, tmp_path, stale):
+    """A clean exit's eth read counts a link below the mark with no descriptor configured: the check
+    fails at once (no ~45s pass, which could not see it), fresh pass or not, as the post-reset one does."""
+    st = {"bad": True}
+    m = _wire(monkeypatch, tmp_path, st)
+    _count_passes(monkeypatch, st)
+
+    async def snapshot_ok(expected):
+        return True, "ok"
+
+    monkeypatch.setattr(m, "_verify_device", snapshot_ok)
+    state = await m.update(
+        phase="post-job", run_fabric=False, run_eth=True, fabric_stale=stale, indices=[0, 1], expected=2
+    )
+    obs = {o.monitor: o for o in state.observations}
+    assert state.healthy is False, "a clean exit released a mesh short a link"
+    assert obs["fabric"].verdict is Verdict.UNHEALTHY and FABRIC_LINKS_UNSEEN in obs["fabric"].detail
+    assert st.get("passes", 0) == 0, "a pass that cannot see the drop was run for it"
+    assert m.last_fabric_ok is False and "fabric_links_unseen" in st["events"]
+
+
+@pytest.mark.asyncio
+async def test_a_clean_exit_full_count_releases_without_a_pass(monkeypatch, tmp_path):
+    """No false hold: every link counted, a fresh pass, the clean exit's read alone releases."""
+    st = {"bad": False}
+    m = _wire(monkeypatch, tmp_path, st)
+    _count_passes(monkeypatch, st)
+
+    async def snapshot_ok(expected):
+        return True, "ok"
+
+    monkeypatch.setattr(m, "_verify_device", snapshot_ok)
+    state = await m.update(
+        phase="post-job", run_fabric=False, run_eth=True, fabric_stale=False, indices=[0, 1], expected=2
+    )
+    assert state.healthy is True
+    assert "fabric" not in {o.monitor for o in state.observations} and st.get("passes", 0) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [True, False])
+async def test_the_clean_post_job_gate_holds_a_descriptorless_drop_inside_the_fabric_interval(
+    monkeypatch, tmp_path, bad
+):
+    """Through the broker's gate: a clean exit, a fabric pass fresher than the interval, the real eth
+    read one link short. The gate fails the check and runs no traffic pass: the ladder takes it (its
+    reset here does not heal, so the device stays withheld from the next tenant). A full count
+    releases with no reset."""
+    from tests.conftest import patch_recovery
+    from tests.test_device_safety import _clean_post_job_gate
+
+    real_eth_read = srv.health_monitor.verify_eth_heartbeat
+    calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=None, chips=4)
+    st = {"bad": bad}
+    m = _wire(monkeypatch, tmp_path, st)
+
+    async def eth_read(timeout_sec=60.0):
+        calls["eth"] += 1
+        return await real_eth_read(timeout_sec=timeout_sec)
+
+    monkeypatch.setattr(m, "verify_eth_heartbeat", eth_read)
+
+    async def reset_unhealed(indices, log):
+        calls["resets"] += 1
+        return False
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", reset_unhealed)
+    assert srv.last_fabric_check_monotonic > 0.0, "a pass inside the interval"
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+
+    assert calls["eth"] >= 1
+    assert calls["fabric"] == 0, "no traffic pass for a drop it cannot see"
+    if bad:
+        assert calls["resets"] >= 1, "the failed check takes the ladder"
+        assert srv.fsm.state is not ServerState.HEALTHY, "released a mesh short a link"
+        assert srv._device_unavailable_for_tenant()
+        assert "fabric_links_unseen" in st["events"]
+    else:
+        assert calls["resets"] == 0
+        assert srv.fsm.state is ServerState.HEALTHY
+
+
+# --- the drop belongs to the read that measured it (review F2) --------------------------------------
+
+
+def _no_count_read(monkeypatch, kind):
+    """A later eth read that prints no link count: a crash, the probe's own 77, a disarmed reader,
+    an operator's override command."""
+    if kind == "disarmed":
+        monkeypatch.setattr(eth, "build", lambda: None)
+        return
+    if kind == "override":
+        monkeypatch.setenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", "my-eth-check")
+    rc, text = {"crash": (1, "Traceback: boom"), "77": (77, "no devices attached"), "override": (0, "ok")}[kind]
+
+    async def eth_nocount(argv, env, *, timeout_sec, track, cwd=None, reap_sec=0.0):
+        return rc, text
+
+    monkeypatch.setattr(eth, "check", eth_nocount)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["crash", "77", "disarmed", "override"])
+async def test_a_read_with_no_count_leaves_no_old_drop_to_fail_a_healed_mesh(monkeypatch, tmp_path, kind):
+    """A drop was measured; the reset healed the link; the next read counts nothing. The old drop must
+    not fail the passing post-reset check (a false hold, then a needless ladder and power cycle)."""
+    st = {"bad": True}
+    m = _wire(monkeypatch, tmp_path, st)
+    await m.verify_eth_heartbeat()
+    assert m.last_eth_link_drop
+    _no_count_read(monkeypatch, kind)
+
+    async def snapshot_ok(expected):
+        return True, "ok"
+
+    monkeypatch.setattr(m, "_verify_device", snapshot_ok)
+    monkeypatch.setattr(FABRIC_DEBT, "owed", "glx_reset")
+    state = await m.update(phase="post-reset", run_fabric=True, force_fabric=True, indices=[0, 1], expected=2)
+    obs = {o.monitor: o for o in state.observations}
+    assert m.last_eth_link_drop == ""
+    assert obs["fabric"].verdict is Verdict.HEALTHY, obs["fabric"].detail
+    assert FABRIC_DEBT.owed == "", "a passing full check settles the debt"
+
+
+@pytest.mark.asyncio
+async def test_a_counted_read_still_below_the_mark_still_fails(monkeypatch, tmp_path):
+    """The other side: a second read that counts the link still down keeps the drop and fails."""
+    st = {"bad": True}
+    m = _wire(monkeypatch, tmp_path, st)
+    await m.verify_eth_heartbeat()
+
+    async def snapshot_ok(expected):
+        return True, "ok"
+
+    monkeypatch.setattr(m, "_verify_device", snapshot_ok)
+    state = await m.update(phase="post-reset", run_fabric=True, force_fabric=True, indices=[0, 1], expected=2)
+    obs = {o.monitor: o for o in state.observations}
+    assert obs["fabric"].verdict is Verdict.UNHEALTHY and FABRIC_LINKS_UNSEEN in obs["fabric"].detail
+
+
+@pytest.mark.asyncio
+async def test_a_selftest_read_with_no_count_clears_an_old_drop(monkeypatch, tmp_path):
+    """The startup self-test is an eth read too: with no count it leaves no old drop behind."""
+    m = _wire(monkeypatch, tmp_path, {"bad": True})
+    await m.verify_eth_heartbeat()
+    assert m.last_eth_link_drop
+    monkeypatch.setattr(srv, "eth_check_armed", False)
+    monkeypatch.setattr(eth, "build", lambda: (["/bin/sh", "-c", "echo 'all advancing'; exit 0"], {}))
+    await srv.selftest_eth_heartbeat()
+    assert m.last_eth_link_drop == ""

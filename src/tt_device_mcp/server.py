@@ -3439,6 +3439,8 @@ async def selftest_eth_heartbeat() -> None:
             # Same override/built-in split verify_eth_heartbeat applies: an operator's own command
             # reports purely through its exit code, so a bare 1 there IS a verdict; only the
             # built-in probe reserves 1 for a crash and signals frozen with its own sentinel (3).
+            # A read that counts no links leaves no earlier drop behind (spec 03 I28).
+            health_monitor.last_eth_link_drop = ""
             if health_monitor._eth_heartbeat_cmd():
                 verdict = True if rc == 0 else None if rc == FABRIC_CHECK_CANNOT_CHECK_RC else False
             else:
