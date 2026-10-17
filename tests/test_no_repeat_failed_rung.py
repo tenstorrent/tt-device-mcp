@@ -428,7 +428,8 @@ async def test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cy
     """I38 with I65: the host booted 3 min ago and one chip stays off after the failed mesh reset. The
     climb still skips the ceiling wait and the sweep (I38), but the power cycle waits out the cooldown
     counted from that boot, with its deadline set for the watchdog; no reset fires meanwhile (I36,
-    I58), and the cycle fires once the cooldown has run out. Nothing releases the hold."""
+    I58). /health shows the deadline while it waits, the watchdog asks again at that deadline, and the
+    cycle fires once the cooldown has run out: bounded, never open-ended. Nothing releases the hold."""
     clock = [ONE_SHOT]
     counters, events, _ = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=1)
     mech = srv.recovery_mechanism
@@ -444,13 +445,120 @@ async def test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cy
     until = int(boot[0]) + POWER_CYCLE_MIN_INTERVAL_SEC
     assert mech.power_cycle_retry[0] == until, "the watchdog asks again at the cooldown's end"
     assert mech.power_cycle_cooldown_state["cause"] == "host boot"
+    # /health shows the bounded wait: the rung it waits for and the moment it is asked again.
+    monkeypatch.setattr(srv, "_device_hold_state", lambda now=None: ("chip off", srv.device_hold_episode_since))
+    shown = srv._health_payload()["power_cycle_cooldown"]
+    assert shown["escalation_stage"] == "power-cycle" and shown["cause"] == "host boot"
+    assert shown["next_deadline"] == datetime.fromtimestamp(until).isoformat(timespec="seconds")
     clock[0] = 600.0
     assert await _window() is True
     assert counters["resets"] == 1 and counters["power_cycles"] == 0 and counters["sweeps"] == 0
+    assert srv._health_payload()["power_cycle_cooldown"]["next_deadline"] == shown["next_deadline"]
+    # The watchdog asks again the moment the cooldown ends, not at the next ceiling window.
+    assert not mech.power_cycle_retry_due(until - 1)
+    spawned = _drive_watchdog_at(monkeypatch, datetime.fromtimestamp(until))
+    assert spawned[:1] == ["power_cycle_cooldown"], "the cooldown's end is asked first"
+    assert "power_cycle_cooldown" not in srv._health_payload(now=datetime.fromtimestamp(until))
     boot[0] -= POWER_CYCLE_MIN_INTERVAL_SEC  # the cooldown has run out
-    assert await _window() is True
+    assert await _window() is True  # the spawned escalation
     assert counters["resets"] == 1 and counters["power_cycles"] == 1 and counters["sweeps"] == 0
+    assert mech.power_cycle_cooldown_state is None and "power_cycle_cooldown" not in srv._health_payload()
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing released the hold"
+
+
+def _drive_watchdog_at(monkeypatch, now):
+    """Run the hold watchdog once at ``now`` (one-shot already spent, windows claimed); returns the
+    spawn kinds it chose."""
+    spawned = []
+    monkeypatch.setattr(
+        srv, "_maybe_spawn_forced_escalation", lambda: spawned.append(srv.device_hold_escalation_kind) or True
+    )
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", True)
+    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
+    srv.fsm.set_latch("escalated", False)
+    srv._check_hold_deadline(now=now)
+    return spawned
+
+
+# --- E3: one failed reset per unchanged set, then the next rung, for every reset class ----------------
+
+WINDOWS = 6  # the forced hold-deadline windows the incident ran one mesh reset in each
+
+
+def _record_cycle_order(monkeypatch, counters):
+    """Each power cycle notes how many resets had run when it fired: partial off-bus gets its mesh
+    reset first (the host rung never jumps the queue), and only one."""
+    order = []
+
+    async def power_cycle(log, reason):
+        counters["power_cycles"] += 1
+        order.append(counters["resets"])
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    return order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("power_cycle", [True, False], ids=["power-cycle", "no-host-rung"])
+@pytest.mark.parametrize("off_bus", [1, 2, 4], ids=["b1-one-chip", "b1-two-chips", "b2-four-chips"])
+async def test_e3_offbus_classes_reset_once_then_take_the_next_rung(monkeypatch, clear_job_state, off_bus, power_cycle):
+    """B1 (one or two chips off) and B2 (four), with and without a power cycle, over six forced
+    windows: the mesh reset runs first and once on the unchanged set, the next rung follows in that
+    same window (the power cycle, or one operator hand-off), and no later window repeats the reset.
+    Nothing releases the hold: release waits for the full check after a reset that heals."""
+    clock = [ONE_SHOT]
+    counters, events, alerts = _episode(monkeypatch, power_cycle=power_cycle, clock=clock, off_bus=off_bus)
+    order = _record_cycle_order(monkeypatch, counters)
+    assert await _window() is True
+    assert counters["resets"] == 1
+    if power_cycle:
+        assert order == [1], "the mesh reset ran first, then the power cycle in the same window"
+        assert counters["sweeps"] == 0, "no last-chance sweep: its last step is the failed mesh reset"
+    else:
+        pages = [a for a in alerts if a["kind"] == "offbus_gated_hold_page"]
+        assert len(pages) == 1 and opc._pending["handoff"]["latched"], "handed to an operator at once"
+    for w in range(1, WINDOWS):
+        clock[0] = max(clock[0], 600.0 * w)
+        assert await _window() is True
+    assert counters["resets"] == 1, "the failed reset is never repeated on the unchanged set"
+    assert events.count(SKIP) >= WINDOWS - 1, "every later window skips it"
+    if not power_cycle:
+        assert len([a for a in alerts if a["kind"] == "offbus_gated_hold_page"]) == 1, "one page per episode"
+        assert counters["power_cycles"] == 0 and counters["reboots"] == 0
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_rung", ["power-cycle", "reboot", "none"])
+async def test_e3_present_mesh_resets_once_then_takes_the_next_rung(monkeypatch, clear_job_state, host_rung):
+    """D (every chip present, the mesh reset fails its verify) over six forced windows: one reset,
+    then the host rung in that same window (the power cycle, else the warm reboot; both are on by
+    default), and with both opted out no further reset at all: the hold stays for an operator."""
+    counters, events = _present_mesh(monkeypatch)
+    if host_rung != "power-cycle":
+        monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1" if host_rung == "reboot" else "0")
+    monkeypatch.setattr(privileges, "is_root", lambda: True)
+    monkeypatch.setattr(privileges, "has_systemd", lambda: True)
+    order = _record_cycle_order(monkeypatch, counters)
+    reboots_at = []
+
+    async def reboot(log, reason):
+        counters["reboots"] += 1
+        reboots_at.append(counters["resets"])
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", reboot)
+    assert await _present_window(True) is True
+    assert counters["resets"] == 1
+    fired = {"power-cycle": order, "reboot": reboots_at, "none": []}[host_rung]
+    assert fired == ([] if host_rung == "none" else [1]), "the host rung fired right after the failed reset"
+    for _ in range(1, WINDOWS):
+        assert await _present_window(True) is True
+    assert counters["resets"] == 1, "the failed reset is never repeated on the unchanged mesh"
+    assert events.count(SKIP) == WINDOWS - 1
+    if host_rung == "none":
+        assert counters["power_cycles"] == 0 and counters["reboots"] == 0
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
 
 
 # --- spec 04 I39: one early retry after a failed mesh reset whose off-bus set shrank -------------------
@@ -526,11 +634,11 @@ def _drive_progress_retry_watchdog(monkeypatch):
     return spawned
 
 
-def _progress_episode(monkeypatch, after_each_reset):
+def _progress_episode(monkeypatch, after_each_reset, power_cycle=True):
     """An off-bus hold at the 120 s one-shot whose mesh resets exit 1; ``after_each_reset`` is the list
     of off-bus id sets the heartbeats show after the 1st, 2nd, ... reset."""
     clock = [ONE_SHOT]
-    counters, events, alerts = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=2)
+    counters, events, alerts = _episode(monkeypatch, power_cycle=power_cycle, clock=clock, off_bus=2)
     monkeypatch.setattr(srv.recovery_mechanism, "progress_retry", None)
     monkeypatch.setattr(srv.recovery_mechanism, "progress_retry_spent_since", "")
     state = {"off": {"30", "31"}}
@@ -627,6 +735,35 @@ async def test_the_progress_retry_releases_only_after_the_full_fabric_verify(mon
     else:
         assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a failed verify keeps the hold"
         assert counters["power_cycles"] == 1, "and goes on to the host rung (I38)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("power_cycle", [True, False], ids=["power-cycle", "no-host-rung"])
+async def test_e3_shrunk_then_unchanged_resets_at_most_twice_then_climbs(monkeypatch, clear_job_state, power_cycle):
+    """E3 with I39 over six forced windows: the one-shot's reset shrinks 2 -> 1 chips off, the one
+    progress retry runs on the new set and leaves it unchanged, and from then on the hold climbs (the
+    power cycle in that same window, or one operator hand-off) and never resets again."""
+    counters, events, alerts, seen, clock = _progress_episode(monkeypatch, [{"31"}, {"31"}], power_cycle=power_cycle)
+    order = _record_cycle_order(monkeypatch, counters)
+    assert await _window() is True and counters["resets"] == 1 and order == []
+    assert _drive_progress_retry_watchdog(monkeypatch) == ["progress_retry"]
+    assert await _window() is True
+    assert counters["resets"] == 2 and seen == [{"30", "31"}, {"31"}]
+    if power_cycle:
+        assert order == [2], "the power cycle fired right after the retry failed on the unchanged set"
+    else:
+        pages = [a for a in alerts if a["kind"] == "offbus_gated_hold_page"]
+        assert len(pages) == 1 and opc._pending["handoff"]["latched"], "handed to an operator at once"
+    for w in range(1, WINDOWS):
+        clock[0] = max(clock[0], 600.0 * w)
+        assert _drive_progress_retry_watchdog(monkeypatch) == [], "one retry per episode"
+        assert await _window() is True
+    assert counters["resets"] == 2, "at most two resets: the one-shot and the progress retry"
+    assert counters["sweeps"] == 0
+    if not power_cycle:
+        assert counters["power_cycles"] == 0 and counters["reboots"] == 0
+        assert len([a for a in alerts if a["kind"] == "offbus_gated_hold_page"]) == 1
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
 
 
 # --- the record across a broker restart and a new boot (spec 04 I58) ------------------------------
