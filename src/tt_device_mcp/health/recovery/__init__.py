@@ -275,6 +275,9 @@ class RecoveryDeps:
     chip_pci_bdf: Optional[Callable[[str], Optional[str]]] = None
     health_event: Optional[Callable[..., None]] = None
     kill_device_holders: Optional[Callable[[str], Awaitable[list]]] = None
+    # Marks the pollers the dead-chip valve stopped as owed a restart (server._owe_device_pollers):
+    # that stop has no paired restore, and an idle relift can close the episode with no reset.
+    owe_device_pollers: Optional[Callable[[str], None]] = None
     mark_device_dirty: Optional[Callable[..., None]] = None
     # Places a not-dirty fabric-unverified hold (server._hold_device_fabric_unverified): a reset whose
     # fabric stayed a 77 settles there, never as a failed reset.
@@ -303,6 +306,10 @@ class RecoveryDeps:
     # short count IS that fault, and re-dirtying it would disable the hold's idle relift.
     episode_open: Optional[Callable[[], bool]] = None
     episode_job: Optional[Callable[[], dict]] = None
+    # Re-runs a failed eth self-test at the head of a full health pass (server._rearm_eth_before_check,
+    # spec 03 I28). Returns a FROZEN detail when the self-test hung during an open fault episode,
+    # else "". None (the conftest deps fixture) skips the retry.
+    eth_rearm: Optional[Callable[[], Awaitable[str]]] = None
 
 
 class Recovery(ABC):
