@@ -9,6 +9,7 @@ the one the between-job health gate now steers on.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import math
 import os
@@ -1398,6 +1399,78 @@ class GalaxyRecovery(Recovery):
         log(f"{what}: no further reset heals this class — power-cycling the host now (spec 04 I37)")
         await self.deps.auto_power_cycle_host(log, f"{what}; no further reset heals this class")
         return True
+
+    async def leftover_host_rung(self, leftover_pids, expected: int, log, *, what: str) -> tuple[str, str]:
+        """Take the host rung for an unkillable reaped leftover past its budget (spec 04 I70).
+
+        Every reset is fenced while the leftover stands (I21) and none would free it, so no ladder or
+        sweep runs first (the I22 exception). Returns ``(stage, detail)``: ``requested`` with the
+        action once fired, ``held`` with why while a guard stands (the caller asks again on its next
+        try), ``gone`` when no leftover pid is still in the scan (nothing fires; the caller re-scans,
+        which closes the episode), ``no-host-rung`` when the host opted into neither rung. The guards
+        are the forced climb's: a reset cycling in its own scope, a running broker job or a readable
+        tenant other than the leftovers themselves (an unreadable scan is waived), the operator
+        stand-back for the power cycle, and the governor (rate limits, the I65 cooldown). The scan
+        guards run again on a fresh scan after the stand-back and the governor, just before firing.
+        The boot that comes back runs the startup gate, which waits for the hugepage pool and passes
+        the full health check, fabric included, before it releases anything (goal 8)."""
+        # Read under the caller's device lock: a try spawned before another path's request (the I76
+        # bound's host rung) reaches here after it. A launch that timed out retracted its ledger record,
+        # so the governor alone would let a second cycle through (I34).
+        pending = self.mechanism.host_action_pending()
+        if pending is not None:
+            return "held", f"a host {pending[0]} requested {int(pending[1])}s ago is still pending"
+        leftovers = {int(p) for p in leftover_pids}
+        guard = await self._leftover_scan_guard(leftovers)
+        if guard is not None:
+            return guard
+        beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        off_bus = len(_offbus_chip_ids(beats, expected)) if expected > 1 else 0
+        # A warm reboot does not bring an off-bus Galaxy chip back, so any chip off the bus on a
+        # multi-chip host routes to the power cycle; with every chip present the reboot, which ends
+        # every process, comes first in the chooser's own order.
+        escalation, _ = _host_escalation_for_drop(
+            off_bus, expected, warm_reboot_futile=off_bus > 0, **self.deps.host_escalation_kwargs()
+        )
+        if escalation is None:
+            return "no-host-rung", (
+                f"no host rung is opted in ({off_bus}/{expected} chip(s) off the bus); "
+                "an operator must reboot or power-cycle the host"
+            )
+        if escalation == "power-cycle":
+            standback = await asyncio.to_thread(offbus_power_cycle.standback_reason, require_manual_check=False)
+            if standback:
+                return "held", f"standing back from the power cycle: {standback}"
+        allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=False)
+        if not allowed:
+            return "held", f"{escalation} held off: {why}"
+        # The stand-back command can run for its whole timeout: the leftover may have exited, a tenant
+        # arrived or a reset scope started meanwhile. Fire only on a fresh scan that still says go.
+        guard = await self._leftover_scan_guard(leftovers)
+        if guard is not None:
+            return guard
+        reason = f"{what}; no reset can free it (spec 04 I70)"
+        log(f"{what}: past its budget, no reset can free it — requesting the host {escalation} (spec 04 I70)")
+        if escalation == "power-cycle":
+            await self.deps.auto_power_cycle_host(log, reason)
+        else:
+            await self._auto_reboot_host(log, reason)
+        return "requested", f"{escalation} ({off_bus}/{expected} chip(s) off the bus)"
+
+    async def _leftover_scan_guard(self, leftovers: set) -> Optional[tuple[str, str]]:
+        """The I70 rung's scan guards on a fresh scan, or None to go on: ``gone`` once none of
+        ``leftovers`` still holds the device, ``held`` while a reset cycles in its own scope or a
+        running broker job or a readable tenant other than the leftovers holds it."""
+        if await asyncio.to_thread(self.mechanism.scope_active):
+            return "held", "a reset is cycling in its own scope"
+        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
+        if not leftovers & {int(h.pid) for h in scan.holders}:
+            return "gone", "the leftover no longer holds the device; nothing fired"
+        others = dataclasses.replace(scan, holders=[h for h in scan.holders if int(h.pid) not in leftovers])
+        blocker = self._tenant_blocker(others, force=True)
+        if blocker is not None:
+            return "held", self._describe_blocker(blocker)
+        return None
 
     # ---- the between-job gate's action rungs --------------------------------------------------
     #

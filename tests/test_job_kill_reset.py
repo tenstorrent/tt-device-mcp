@@ -340,6 +340,7 @@ async def test_a_disconnect_kills_the_whole_process_group(runner_env, monkeypatc
         job = await _job_run_then_cancel(_params(runner_env["tmp"], "sleep 600 | sleep 600"), running)
         assert await _until(lambda: _runner_done(job)), "the job outlived its client"
         assert await _until(lambda: not _pgid_members(job.pid))
+        assert await _until(srv._kill_reset_debt), "the runner reaps after the group is gone"
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.KILLED
@@ -392,6 +393,7 @@ async def test_a_hung_job_owes_the_reset(runner_env, monkeypatch):
     job, runner = await _start("934", "echo working; sleep 600")
     try:
         assert await _until(lambda: _runner_done(job))
+        assert await _until(srv._kill_reset_debt)
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.HUNG
@@ -403,6 +405,7 @@ async def test_a_runner_timeout_owes_the_reset(runner_env):
     job, runner = await _start("935", "sleep 600", timeout_sec=1)
     try:
         assert await _until(lambda: _runner_done(job))
+        assert await _until(srv._kill_reset_debt)
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.TIMEOUT
@@ -536,6 +539,7 @@ async def test_a_rest_run_bg_timeout_owes_the_reset(runner_env):
     runner = asyncio.create_task(srv.job_runner())
     try:
         assert await _until(lambda: _runner_done(job))
+        assert await _until(srv._kill_reset_debt)
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.TIMEOUT
