@@ -1947,6 +1947,7 @@ class GalaxyRecovery(Recovery):
         offbus_chips: Optional[set] = None,
         context: str = "",
         fabric_77_unverified: bool = False,
+        host_rung_follows: bool = True,
     ) -> Optional[bool]:
         """The LAST-CHANCE gate every host rung passes through: fire every reset type once more,
         back-to-back, then ONE settle and ONE verify — and only if the mesh is still bad does the
@@ -2016,6 +2017,11 @@ class GalaxyRecovery(Recovery):
         bitmap = 0
         for t in trays:
             bitmap |= 1 << (t - 1)
+        if not host_rung_follows and len(trays) == 1 and not _ubb_single_tray_walk_enabled():
+            # No power cycle follows to heal a cross-tray drop that a single-tray re-power can cause, so
+            # the sweep keeps the walk's single-tray rule (spec 04 I31): SBR and the mesh reset only.
+            log(f"last chance{where}: no host rung follows — skipping the single-tray re-power of trays {trays}")
+            bitmap = 0
         # Chip ids come from the tray map (I16), not index arithmetic — bus 0x80 is tray 4 on BH
         # and index arithmetic would target the wrong silicon.
         tray_chip_ids = [c for t in trays for c in (tray_map or {}).get(t, [])]
@@ -3276,14 +3282,19 @@ class GalaxyRecovery(Recovery):
         ):
             # Spec 04 I76/I31: at the 10-min bound the full ladder, last-chance sweep included, runs
             # once per episode before any page, even with no host rung to climb to. Only the sweep's
-            # own full check, fabric included, releases; a failed one pages below and keeps the hold.
-            # A sweep a tenant or a live reset scope held off (None) is not spent: the next window retries.
+            # own full check, fabric included, releases; a failed or incomplete one pages below and keeps
+            # the hold. An incomplete sweep (None: a tenant, a live reset scope, a gate) is not spent:
+            # the next window retries it.
             bound_sweep = await self._settle_and_verify_before_host_rung(
-                expected, log, "idle-escalation", context=f"10-min hold bound, {off_bus}/{expected} off the bus"
+                expected,
+                log,
+                "idle-escalation",
+                context=f"10-min hold bound, {off_bus}/{expected} off the bus",
+                host_rung_follows=False,
             )
             if bound_sweep is not None:
                 self._bound_sweep_since = hold_since or ""
-            if bound_sweep is not False:
+            if bound_sweep:
                 return HOST_RUNG_DEFERRED
         if reboot_blocked:
             # No chassis power cycle is opted in and no rung can recover it: fail closed loudly and hold,

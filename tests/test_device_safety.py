@@ -10585,7 +10585,9 @@ async def test_stuck_offbus_hold_below_floor_climbs_loud_when_no_host_rung_opted
     a chance at recovery). A reset that did not recover climbs; with no host rung opted in the climb
     fails closed LOUDLY (reset_unrecoverable_power_cycle_required), never a silent hold."""
     events = []
-    counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=8, isolated=set(), reset_result=False)
+    counters = _arm_offbus_stuck_hold(
+        monkeypatch, off_bus=8, isolated=set(), reset_result=False, sbr_verify_healthy=False
+    )
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
     monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
@@ -10596,6 +10598,7 @@ async def test_stuck_offbus_hold_below_floor_climbs_loud_when_no_host_rung_opted
         counters["sbr"] == 0 and counters["resets"] == 1
     ), "no surgical candidate -> the mesh reset gets its attempt, below the floor included"
     assert "stuck_hold_galaxy_reset_below_floor_attempt" in events
+    assert "last_chance_reset_sweep" in events, "the 10-min bound's full ladder runs first (spec 04 I31/I76)"
     assert (
         "reset_unrecoverable_power_cycle_required" in events
     ), "with no host rung opted in the climb must be loud, never a silent hold"
@@ -10973,7 +10976,9 @@ async def test_stuck_offbus_hold_failed_reset_all_off_bus_holds_loudly_never_reb
     the reboot opted in the climb holds loudly. Same failed-reset climb the present-mesh path uses.
     Fails on base, which warm-reboots the whole-bus wedge instead of holding for the cold rung."""
     events = []
-    counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=16, isolated=set(), reset_result=False, beats_after_reset={})
+    counters = _arm_offbus_stuck_hold(
+        monkeypatch, off_bus=16, isolated=set(), reset_result=False, beats_after_reset={}, sbr_verify_healthy=False
+    )
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
@@ -11051,7 +11056,7 @@ async def test_stuck_offbus_hold_hard_failed_reset_holds_loudly_never_reboots(mo
     off-bus ASICs stay off across a reboot. Route it to the cold rung, held — not a warm reboot. Base
     warm-reboots. No regression, so only the unrecoverable event fires, not reset_regressed_offbus."""
     events = []
-    counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=16, isolated=set())
+    counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=16, isolated=set(), sbr_verify_healthy=False)
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # galaxy + reboot floor = 16
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
@@ -11123,6 +11128,60 @@ async def test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset(mon
     assert "reset_unrecoverable_power_cycle_required" in events, "with no power cycle opted in it pages"
     assert counters["reboots"] == 0 and counters["power_cycles"] == 0
     assert counters["sweeps"] == 1, "the bound's full ladder sweeps once per episode, then pages"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("check_passes", [True, False])
+async def test_the_bound_ladder_with_no_power_cycle_releases_only_on_a_passing_full_check(
+    monkeypatch, clear_job_state, check_passes
+):
+    """Spec 04 I31/I76: past the 10-min bound with no power cycle opted in, the full ladder (the
+    last-chance sweep) runs before any page. Only a full check that passes right after it releases;
+    a failed one (e.g. fewer fabric links than the cabling expects) pages and keeps the hold."""
+    events = []
+    counters = _arm_offbus_stuck_hold(
+        monkeypatch, off_bus=8, isolated=set(), reset_result=False, sbr_verify_healthy=check_passes
+    )
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
+    swept = []
+
+    async def all_resets(*a, **k):
+        swept.append(events.count("reset_unrecoverable_power_cycle_required"))
+        return True
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_issue_all_resets_back_to_back", all_resets)
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert swept == [0], "the bound's sweep runs once, before any page"
+    assert counters["reboots"] == 0 and counters["power_cycles"] == 0
+    if check_passes:
+        assert counters["fault_cleared"] >= 1, "a full check that passes after the sweep releases"
+        assert "reset_unrecoverable_power_cycle_required" not in events
+    else:
+        assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0, "a failed check keeps the hold"
+        assert "reset_unrecoverable_power_cycle_required" in events, "and pages with the hold reason"
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_bound_sweep_still_pages_and_is_retried_next_window(monkeypatch, clear_job_state):
+    """A bound sweep a tenant, a live reset scope or a gate held off (None) is not the full ladder: the
+    hold pages and stays, and the next forced window runs the sweep again (spec 04 I31/I76)."""
+    counters, events = _arm_regressed_offbus_hold(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+
+    async def held_off(*a, **k):
+        counters["sweeps"] += 1
+        return None
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", held_off)
+    for window in (1, 2):
+        events.clear()
+        await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+        assert counters["sweeps"] == window, "an incomplete sweep is retried each window"
+        assert "reset_unrecoverable_power_cycle_required" in events
+    assert counters["fault_cleared"] == 0 and counters["reboots"] == 0 and counters["power_cycles"] == 0
 
 
 @pytest.mark.asyncio
@@ -11770,7 +11829,9 @@ async def test_a_declined_tray_walk_hands_the_stuck_hold_to_the_next_rung(monkey
     """On the stuck-hold ladder the declined walk is not a dead end: the climb goes on to the next rung
     (the mesh reset, then the host rungs), and a reset that does not verify never clears the hold."""
     fired = {"n": 0}
-    counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=1, isolated=set(), reset_result=False)
+    counters = _arm_offbus_stuck_hold(
+        monkeypatch, off_bus=1, isolated=set(), reset_result=False, sbr_verify_healthy=False
+    )
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
     monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)

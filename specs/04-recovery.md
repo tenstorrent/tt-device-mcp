@@ -689,8 +689,16 @@ each rung fires only when the gentler one failed or cannot apply.
   fires the bridge, tray or mesh reset rungs again: each journals `galaxy_reset_skipped_regressed`
   and goes straight to the post-reset verdict, with the drop treated as warm-reboot-futile. With a
   power cycle opted in that is the cold rung, still behind the last-chance sweep (I22), so the full
-  ladder runs once more before any power cycle. Without one it pages
-  (`reset_unrecoverable_power_cycle_required` or `all_chips_off_bus_power_cycle_required`) and holds.
+  ladder runs once more before any power cycle. Without one (no power cycle opted in, or no host
+  rung at all) it pages (`reset_unrecoverable_power_cycle_required` or
+  `all_chips_off_bus_power_cycle_required`) and holds, but at or past the I76 bound it first runs the
+  last-chance sweep once per episode, so the hold still gets the full ladder at 10 min. With no power
+  cycle to follow, that sweep keeps the walk's single-tray rule: a drop on one tray gets the SBR and
+  the mesh reset, not a re-power of that tray (it can drop the other trays, and nothing would heal
+  them). Only the full check after the sweep, fabric included, releases; a failed one pages and keeps
+  the hold. A sweep a tenant, a live reset scope or a gate held off is not spent: the hold pages, and
+  the next forced window runs it again. A mesh reset that already failed on the same chips (I38)
+  still skips it.
   The latch clears when the device is released; it is in memory only, so a broker restart costs at
   most one more reset. Bounds the loop one Galaxy host ran: three mesh resets, one per forced
   window, took a 4-chip drop to 31 and then 32 off the bus.
@@ -1027,7 +1035,9 @@ each rung fires only when the gentler one failed or cannot apply.
   started below the bound (the off-bus one-shot, a progress retry, a gated grace) is not the bound's
   ladder, so at the bound the full ladder runs again before any host rung. When the ladder
   leaves the mesh unrecovered, the broker's own code asks for the host rung at once: the BMC power
-  cycle, or the warm reboot where only that is opted in. When the ladder brings the mesh back, only its
+  cycle, or the warm reboot where only that is opted in. With no host rung for the drop (I31's
+  no-power-cycle path), the bound's ladder still runs its last-chance sweep before the page, and the
+  hold stays until a full check passes. When the ladder brings the mesh back, only its
   full check, fabric included, releases the hold. A full check that ends with no pass (a failed
   verdict, or a fabric pass that could not run for any cause but a 1G hugepage pool still filling)
   asks for the host rung at once (event `hold_bound_check_failed`): inside the forced run when the
@@ -1517,7 +1527,7 @@ sees a silent fabric pass.
 | I30 deadline escalation holds a fabric-only present mesh without a reset; real faults keep the ladder | `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_fabric_only_present_mesh_without_a_reset`, `tests/test_device_safety.py::test_the_deadline_escalation_keeps_the_ladder_for_real_faults`, `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset`, `tests/test_device_safety.py::test_the_deadline_escalation_climbs_a_present_mesh_eth_frozen_self_heal_hold` |
 | I30 a dispatch-failure hold is never classed a topology mismatch | `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I28 a uid-0 broker poller never blocks the reset; pollers stop and restart around it | `tests/test_dispatch_failure_reset.py::test_a_uid0_telemetry_holder_does_not_block_the_reset` |
-| I31 a regressed galaxy reset is not repeated in its hold episode; climb or page instead | `tests/test_device_safety.py::test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset`, `tests/test_device_safety.py::test_forced_offbus_ladder_after_a_regression_sweeps_then_power_cycles_when_opted_in`, `tests/test_device_safety.py::test_an_early_regression_is_latched_before_the_ceiling_deferral`, `tests/test_device_safety.py::test_a_new_hold_episode_resets_again_after_a_regression`, `tests/test_device_safety.py::test_gate_skips_a_repeat_galaxy_reset_after_a_regression`, `tests/test_device_safety.py::test_gate_latches_a_regression_seen_before_any_hold` |
+| I31 a regressed galaxy reset is not repeated in its hold episode; climb or page instead; with no power cycle, the bound's sweep runs before the page, releases only on a passing full check and is retried when held off | `tests/test_device_safety.py::test_the_bound_ladder_with_no_power_cycle_releases_only_on_a_passing_full_check`, `tests/test_device_safety.py::test_an_incomplete_bound_sweep_still_pages_and_is_retried_next_window`, `tests/test_device_safety.py::test_stuck_offbus_hold_below_floor_climbs_loud_when_no_host_rung_opted_in`, `tests/test_device_safety.py::test_a_declined_tray_walk_hands_the_stuck_hold_to_the_next_rung`, `tests/test_device_safety.py::test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset`, `tests/test_device_safety.py::test_forced_offbus_ladder_after_a_regression_sweeps_then_power_cycles_when_opted_in`, `tests/test_device_safety.py::test_an_early_regression_is_latched_before_the_ceiling_deferral`, `tests/test_device_safety.py::test_a_new_hold_episode_resets_again_after_a_regression`, `tests/test_device_safety.py::test_gate_skips_a_repeat_galaxy_reset_after_a_regression`, `tests/test_device_safety.py::test_gate_latches_a_regression_seen_before_any_hold` |
 | I32 every reset path releases only after a passing fabric pass: the debt settles only on a healthy verdict, the funnel holds fabric-unverified, exemptions | `tests/test_post_reset_gate.py::test_the_debt_settles_only_on_a_healthy_fabric_verdict`, `::test_a_single_chip_or_a_host_with_no_fabric_check_is_exempt`, `::test_a_verified_release_after_a_reset_holds_fabric_unverified`, `::test_no_debt_releases_as_before` |
 | I32 per path: operator reset, bridge rung, no-window sweep, idle off-bus bridge, adopted foreign scope, foreign-holder fast verify, broker start, tray-down prelude rescan | `tests/test_post_reset_gate.py::test_an_operator_reset_without_a_passing_fabric_pass_holds`, `::test_an_operator_reset_with_a_passing_fabric_pass_releases`, `::test_the_bridge_rung`, `::test_the_tray_down_no_window_sweep`, `::test_the_idle_off_bus_bridge_reset`, `::test_a_reset_adopted_from_a_foreign_scope`, `::test_the_foreign_holder_fast_verify_after_a_reset_holds`, `::test_a_broker_start_owes_a_fabric_pass_before_any_release`, `tests/test_tray_down_prelude.py::test_a_rescan_recovery_releases_only_on_a_passing_fabric_pass` |
 | I32 no rung outcome lifts the funnel's hold: the last-chance sweep on a fabric 77, no verdict or an unavailable check holds fabric-unverified with no host rung; a 77-only hold never goes DOWN | `tests/test_post_reset_gate.py::test_the_gate_ladders_last_chance_sweep`, `::test_no_rung_outcome_lifts_a_fabric_unverified_hold`, `::test_a_terminal_rung_on_a_measured_fault_still_goes_down`, `::test_every_rung_outcome_folds_through_the_helper` |
