@@ -16101,6 +16101,8 @@ async def test_killing_the_readopted_job_drops_the_startup_verify_state_and_stil
     monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
     job = _readopted_running_job()
     assert srv._startup_verify_view() is not None
+    srv._sync_fsm_readopted_jobs()
+    assert json.loads(srv.fsm._path.read_text())["readopted_jobs"] == ["428"]
     job.status = srv.JobStatus.KILLED  # what _kill_job stamps before it stops the scope
     srv.request_killed_job_ids.add("428")
     assert srv._startup_verify_view() is None, "a requested kill is not 'no fault'"
@@ -16108,6 +16110,7 @@ async def test_killing_the_readopted_job_drops_the_startup_verify_state_and_stil
     await asyncio.wait_for(srv._monitor_readopted_scope("428", "ttdev-job-428.scope"), timeout=5)
     assert srv._kill_reset_debt().startswith("re-adopted job 428"), "the kill still owes one reset + full check"
     assert srv._startup_verify_view() is None
+    assert json.loads(srv.fsm._path.read_text())["readopted_jobs"] == [], "fsm.json still names the killed job"
     srv._startup_verify_task.cancel()
 
 
@@ -16214,6 +16217,33 @@ async def test_fsm_json_names_the_readopted_job_while_it_runs_and_clears_when_it
     assert srv.fsm.state is ServerState.RECOVERING and srv.fsm.record.why == "startup_unverified"
     await release_job()
     assert srv.fsm.state is ServerState.HEALTHY and _fsm_file_readopted_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_a_same_boot_restart_that_readopts_no_job_empties_a_stale_fsm_json_list(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76: a previous broker of this boot wrote readopted_jobs ['428'] and died; job 428 died
+    with it. The same-boot load keeps the list, and only run_startup_tasks' sync, once the startup gate
+    owns the hold, empties it. Without that sync the file names a dead job until HEALTHY or DOWN, and a
+    client reading it waits on a job that no longer exists. The hold itself stands: report-only."""
+    fsm_path = tmp_path / "fsmdir" / "fsm.json"
+    fsm_path.parent.mkdir()
+    before = ServerFsm(fsm_path, current_boot_id="boot-same")
+    before.on_fault("startup_unverified", dirty=False)
+    before.set_readopted_jobs(["428"])
+    assert json.loads(fsm_path.read_text())["readopted_jobs"] == ["428"]
+
+    after = ServerFsm(fsm_path, current_boot_id="boot-same")
+    assert after.readopted_jobs == ["428"], "the same-boot load keeps the list until the startup sync"
+    monkeypatch.setattr(srv, "fsm", after)
+    monkeypatch.setattr(srv, "readopted_scopes", {})  # this restart re-adopts no live scope
+    _gate_with_verdict(monkeypatch, tmp_path, _HEALTHY_VERDICT)
+    await _start_broker_holding(monkeypatch, [])
+
+    assert srv._startup_verify_task is not None
+    assert json.loads(fsm_path.read_text())["readopted_jobs"] == [] and srv.fsm.readopted_jobs == []
+    assert srv.fsm.state is ServerState.RECOVERING and srv.fsm.record.why == "startup_unverified"
 
 
 @pytest.mark.asyncio
