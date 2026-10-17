@@ -104,6 +104,7 @@ from tt_device_mcp.health import (
     RESET_COOLDOWN_SEC,
     RESET_MODE_GALAXY,
     RESET_MODE_TARGET,
+    SAMPLE_INTERVAL_SEC,
     SAMPLE_RING_SIZE,
     WAIT,
     Evidence,
@@ -1011,6 +1012,12 @@ device_hold_escalate_bucket: int = 0
 # One early forced escalation per off-bus episode, tracked apart from the ceiling windows so it adds
 # an attempt rather than consuming one (see _offbus_hold_ceiling_sec).
 device_hold_offbus_escalated: bool = False
+# Whether the early one-shot (see _offbus_one_shot_sec) found a live tenant: the hold then keeps the
+# tenant's _offbus_hold_ceiling_sec wait for its one-shot. Re-arms (False) with the episode.
+device_hold_offbus_tenant_wait: bool = False
+# Whether the one-shot the watchdog last spawned fired on the early, tenant-free clock (younger than
+# _offbus_hold_ceiling_sec, no tenant found yet): only that run checks for a tenant before it starts.
+device_hold_offbus_idle_early: bool = False
 # The ceiling window the one-shot found claimed before it claimed its own (it waited out a tenant past
 # the ceiling), so giving the one-shot back gives that window back too; None while it holds no claim.
 device_hold_offbus_prior_bucket: Optional[int] = None
@@ -3633,9 +3640,10 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
                 f"{until} — /health power_cycle_cooldown.next_deadline."
             )
         if off_bus > 0 and isolated_chips:
-            first = max(1, round(_offbus_hold_ceiling_sec() / 60))
+            first = int(_offbus_one_shot_sec())
             return (
-                f"The off-bus ladder escalates in ~{first} min (isolated chips) and again at each "
+                f"The off-bus ladder escalates in ~{first} s (isolated chips; "
+                f"{int(_offbus_hold_ceiling_sec())} s while a tenant holds the device) and again at each "
                 f"{ceiling_min}-min hold ceiling — do not plan around waiting the wedge out."
             )
         if off_bus > 0:
@@ -6597,7 +6605,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global device_hold_deadline_bucket, device_hold_escalate_bucket
     global device_hold_offbus_escalated, device_hold_alert_next_bucket, device_hold_alert_gap
-    global device_hold_tenant_deferred, device_hold_offbus_prior_bucket
+    global device_hold_tenant_deferred, device_hold_offbus_prior_bucket, device_hold_offbus_tenant_wait
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
     global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold
     if reason and not device_hold_logged:
@@ -6692,6 +6700,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # ...and its own early off-bus attempt.
         device_hold_offbus_escalated = False
         device_hold_offbus_prior_bucket = None
+        device_hold_offbus_tenant_wait = False
         device_hold_tenant_deferred = False
         # ...and its held-job bound's attempt.
         device_hold_job_bound_escalated = False
@@ -6730,6 +6739,13 @@ async def _force_escalate_stuck_hold() -> None:
     if device_hold_tenant_deferred and await asyncio.to_thread(galaxy_recovery.tenant_holds):
         _rearm_tenant_deferred_window(kind)  # still there: stay armed for the next tick, quietly
         return
+    if (
+        kind == "offbus_one_shot"
+        and device_hold_offbus_idle_early
+        and await asyncio.to_thread(galaxy_recovery.tenant_holds)
+    ):
+        _defer_offbus_one_shot_to_tenant_bound()  # quietly: no device op, no event, no rung
+        return
     async with _device_op("hold-deadline-escalate"):
         if await asyncio.to_thread(recovery_mechanism.scope_active):
             return
@@ -6766,7 +6782,7 @@ async def _force_escalate_stuck_hold() -> None:
             host_at_risk=True,
             trigger=device_hold_escalation_kind or "ceiling_window",
             window_sec=int(
-                _offbus_hold_ceiling_sec()
+                _offbus_one_shot_sec()
                 if device_hold_escalation_kind == "offbus_one_shot"
                 else _stuck_hold_ceiling_sec()
             ),
@@ -6933,6 +6949,37 @@ def _maybe_spawn_forced_escalation() -> bool:
     return True
 
 
+def _offbus_one_shot_sec() -> float:
+    """Seconds an off-bus hold waits before its one-shot forced escalation. On a tenant-free box, one
+    sampler interval: the first sampler tick at or past it is the second since the hold opened, so two
+    samples have seen the chip still off on top of the drop's own confirmation, and a chip that left
+    the bus never returns by waiting (see _offbus_hold_ceiling_sec). The hold opens on a gate that
+    declined to reset below the galaxy-reset floor, so waiting longer only adds idle time. Once the
+    early one-shot has found a live tenant, the tenant's _offbus_hold_ceiling_sec wait applies (the
+    run still stands down on a tenant then, spec 04 I7). Never longer than that wait."""
+    tenant_bound = _offbus_hold_ceiling_sec()
+    if device_hold_offbus_tenant_wait:
+        return tenant_bound
+    return min(tenant_bound, max(1.0, float(SAMPLE_INTERVAL_SEC)))
+
+
+def _defer_offbus_one_shot_to_tenant_bound() -> None:
+    """The early one-shot found a live tenant: give it back, with any window it claimed, and leave the
+    hold on the tenant's _offbus_hold_ceiling_sec wait. Nothing ran, so nothing is spent."""
+    global device_hold_offbus_escalated, device_hold_escalate_bucket, device_hold_offbus_prior_bucket
+    global device_hold_offbus_tenant_wait
+    device_hold_offbus_tenant_wait = True
+    device_hold_offbus_escalated = False
+    if device_hold_offbus_prior_bucket is not None:
+        device_hold_escalate_bucket = device_hold_offbus_prior_bucket
+        device_hold_offbus_prior_bucket = None
+    if logger:
+        logger.warning(
+            f"HOLD-DEADLINE-ESCALATE a tenant holds the device: the off-bus one-shot waits "
+            f"{int(_offbus_hold_ceiling_sec())}s from the hold start, not {int(SAMPLE_INTERVAL_SEC)}s"
+        )
+
+
 def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     """Flag a hold that has outlived the deadline to the durable timeline, so none sits silent.
 
@@ -6951,7 +6998,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     use; a missing or unparseable stamp is not held, so it is not flagged."""
     global device_hold_deadline_bucket, device_hold_escalate_bucket, device_hold_offbus_escalated
     global device_hold_risky_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
-    global device_hold_offbus_prior_bucket
+    global device_hold_offbus_prior_bucket, device_hold_offbus_idle_early
     if not device_hold_episode_since:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
@@ -6967,7 +7014,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # relift's and class-escalators' fail-closed guards (unconfigured eth reader, last-fabric verdict
     # that never re-runs idle, unreadable tenant scan, one-reset latch) do not give on their own.
     ceiling = _stuck_hold_ceiling_sec()
-    # An off-bus hold gets its FIRST attempt early (see _offbus_hold_ceiling_sec) and only its
+    # An off-bus hold gets its FIRST attempt early (see _offbus_one_shot_sec) and only its
     # first: the rung that answers it is the cheap surgical one, but each further window forces
     # the ladder past the one-reset-per-episode latch, so repeating on the short clock would walk
     # a shared box to a warm reboot and a BMC power cycle within minutes. Claiming bucket 1 here
@@ -7015,9 +7062,10 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             recovery_mechanism.clear_power_cycle_retry()
     if only_77:
         pass
-    elif isolated_chips and not device_hold_offbus_escalated and age >= _offbus_hold_ceiling_sec():
+    elif isolated_chips and not device_hold_offbus_escalated and age >= _offbus_one_shot_sec():
         device_hold_escalation_kind = "offbus_one_shot"
-        device_hold_escalation_trigger = f"the {int(_offbus_hold_ceiling_sec())}s off-bus one-shot"
+        device_hold_escalation_trigger = f"the {int(_offbus_one_shot_sec())}s off-bus one-shot"
+        device_hold_offbus_idle_early = not device_hold_offbus_tenant_wait and age < _offbus_hold_ceiling_sec()
         if _maybe_spawn_forced_escalation():
             device_hold_offbus_escalated = True
             # A one-shot that waited out a tenant past the ceiling is that window's run as well: one
