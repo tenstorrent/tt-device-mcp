@@ -440,6 +440,10 @@ class TelemetrySampler:
         # Then the pollers: tt-telemetry reads every chip in a loop, and on a dead one it
         # segfaults and systemd restarts it straight back into the same read.
         await self._deps.set_device_pollers(False, lambda m: log.info(f"DEAD-CHIP {m}") if log else None)
+        # No reset pairs this stop with a restore, and an idle relift may close the episode without
+        # one: owe the restart, so the next close to HEALTHY (a passing full check) starts them.
+        if self._deps.owe_device_pollers is not None:
+            self._deps.owe_device_pollers(f"chip(s) {','.join(fresh)} left the PCIe bus")
 
         removed = []
         for idx in fresh:
