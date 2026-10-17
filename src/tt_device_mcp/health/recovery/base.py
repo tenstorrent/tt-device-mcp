@@ -208,6 +208,15 @@ POWER_CYCLE_MISS_RETRY_SEC = (300, 600, 900)
 POWER_CYCLE_MISS_PAGE_AFTER = 2
 POWER_CYCLE_MISS_REPAGE_SEC = 3600
 
+# Spec 04 I73: a whole tray (class A) still off the bus after this many broker power cycles that took
+# the host down, with no verified release since, is a fault no in-band cycle heals on this hardware
+# (it took AC removal). The broker stops cycling, holds the device stating that AC power must be
+# removed, pages once and then hourly, and re-reads the bus this often: a returning tray goes through
+# the normal reset and full health check before any release.
+POWER_CYCLE_AC_NEEDED_AFTER = 2
+AC_POWER_RECHECK_SEC = 300
+AC_POWER_REPAGE_SEC = 3600
+
 
 def _power_cycle_missed(rec: dict, boot_id: str, now: float) -> bool:
     """Whether ledger row ``rec`` is a power-cycle request that never took the host down: marked so,
@@ -441,6 +450,12 @@ class RecoveryMechanism:
         self._power_cycle_backstop_logged: float = 0.0
         # Spec 04 I72: when (monotonic) the missed-power-cycle page last went out; 0.0 = never.
         self._power_cycle_miss_paged: float = 0.0
+        # Spec 04 I73: the chips of the whole tray(s) the last class check saw off the bus (None when
+        # the off-bus set is not class A), the AC-needed page's monotonic stamp (0.0 = never) and the
+        # ledger stamps already journaled as cycles that did not heal.
+        self.whole_tray_off: Optional[list] = None
+        self._ac_power_paged: float = 0.0
+        self._ac_power_logged: set = set()
 
         # True while a reset is actually executing. A reset TAKES THE CHIPS OFF THE BUS — that is
         # what a reset is — so during one they read all-ones exactly like a dead chip, and isolating
@@ -1261,6 +1276,9 @@ class RecoveryMechanism:
             # It gates only by its own short retry backoff (below), nothing else here.
             self._mark_missed_power_cycles(ledger, now_epoch)
             requests, ledger = ledger, self._cycles_that_ran(ledger, now_epoch)
+            ac_needed = self._ac_power_needed(ledger, now_epoch, requests)
+            if ac_needed is not None:
+                return self._deny_power_cycle(ac_needed)
             backstop = self._power_cycle_backstop(ledger, now_epoch)
             if backstop is not None:
                 return self._deny_power_cycle(backstop)
@@ -1369,6 +1387,109 @@ class RecoveryMechanism:
         """``ledger`` without the power-cycle requests that never took the host down (spec 04 I72)."""
         boot_id = self._current_boot_id()
         return [r for r in ledger if not _power_cycle_missed(r, boot_id, now_epoch)]
+
+    def _unhealed_tray_cycles(
+        self, ledger: list[dict], chips: list, now_epoch: float, requests: Optional[list[dict]] = None
+    ) -> list[dict]:
+        """Spec 04 I73: the broker power cycles since the streak last ended that took the host down
+        (recorded before this boot) for the whole tray(s) ``chips`` names, oldest first. A row with no
+        ``off_bus`` (one written before rows carried it) counts; one naming other chips does not.
+        Only the broker's own ledger counts: an external cycle's kind and off-time are unknown. So the
+        last counted cycle needs proof that it took the host down: a later request (``requests``, the
+        unfiltered ledger) under another boot, or this boot beginning within its pending window
+        (host_action_pending_sec). A boot long after it was some other cycle, never this attempt."""
+        streak = self._streak_start(now_epoch)
+        boot_start = _past_epoch(self._boot_btime_id() or None, now_epoch)
+        boot_id = self._current_boot_id()
+        want = {str(c) for c in chips}
+        rows = []
+        for rec in ledger:
+            if rec.get("action") != "power-cycle":
+                continue
+            at = _past_epoch(rec.get("at_epoch"), now_epoch)
+            if at is None or at <= streak:
+                continue
+            if boot_start is not None:
+                if at >= boot_start:
+                    continue  # this boot's own request: it has not taken the host down yet
+            elif not boot_id or not rec.get("boot_id") or rec.get("boot_id") == boot_id:
+                continue
+            off = rec.get("off_bus")
+            if isinstance(off, list) and not want & {str(c) for c in off}:
+                continue
+            rows.append(rec)
+        rows.sort(key=lambda r: _epoch(r.get("at_epoch")) or 0.0)
+        if rows and boot_start is not None:
+            last = rows[-1]
+            at = _epoch(last.get("at_epoch"))
+            later_boot = any(
+                (_epoch(r.get("at_epoch")) or 0.0) > at and r.get("boot_id") not in (None, last.get("boot_id"), boot_id)
+                for r in (requests if requests is not None else ledger)
+            )
+            if not later_boot and boot_start - at > host_action_pending_sec():
+                rows.pop()
+        return rows
+
+    def _ac_power_needed(
+        self, ledger: list[dict], now_epoch: float, requests: Optional[list[dict]] = None
+    ) -> Optional[dict]:
+        """Spec 04 I73: the refusal once a whole tray is still off the bus after
+        POWER_CYCLE_AC_NEEDED_AFTER broker power cycles with no verified release since, or None.
+        No in-band cycle healed that on this hardware, AC removal did, so the broker stops cycling
+        and holds the device dirty, saying so on /health. ``until`` is the next presence check: the
+        hold watchdog re-reads the bus then, and a tray that came back takes the ordinary reset and
+        full health check (fabric included) before any release. Journals once per episode and per
+        counted cycle; pages once, then every AC_POWER_REPAGE_SEC."""
+        chips = self.whole_tray_off
+        if not chips:
+            return None
+        rows = self._unhealed_tray_cycles(ledger, chips, now_epoch, requests)
+        if len(rows) < POWER_CYCLE_AC_NEEDED_AFTER:
+            return None
+        last = max(_epoch(r.get("at_epoch")) or 0.0 for r in rows)
+        until = now_epoch + AC_POWER_RECHECK_SEC
+        why = (
+            f"AC power removal needed: chips {','.join(str(c) for c in chips)} (whole tray) still off the bus after "
+            f"{len(rows)} broker power cycle(s) (last {_local_time(last)}); no in-band cycle heals this. "
+            f"Holding the device dirty with no further cycle; remove AC power from the host. Re-checking "
+            f"the bus every {AC_POWER_RECHECK_SEC}s, next {_local_time(until)}: a returning tray is "
+            f"released only after the full health check passes"
+        )
+        state = {
+            "until": until,
+            "last": last,
+            "cause": "AC power needed",
+            "interval_sec": AC_POWER_RECHECK_SEC,
+            "why": why,
+            "ac_power_needed": {
+                "chips": list(chips),
+                "attempts": len(rows),
+                "last_cycle": _local_time(last),
+                "last_cycle_epoch": last,
+                "next_presence_check": _local_time(until),
+                "next_presence_check_epoch": until,
+            },
+        }
+        for r in rows:
+            key = r.get("at_epoch")
+            if key not in self._ac_power_logged:
+                self._ac_power_logged.add(key)
+                health_event("power_cycle_did_not_heal", fault_class="A", off_bus=list(chips), cycled_at=r.get("at"))
+        if not self._ac_power_paged:
+            health_event(
+                "power_cycle_ac_power_needed",
+                off_bus=list(chips),
+                attempts=len(rows),
+                last_cycle_epoch=last,
+                recheck_sec=AC_POWER_RECHECK_SEC,
+                host_at_risk=False,
+            )
+        mono = time.monotonic()
+        if not self._ac_power_paged or mono - self._ac_power_paged >= AC_POWER_REPAGE_SEC:
+            event = {"kind": "power_cycle_ac_power_needed", "chips": list(chips), "attempts": len(rows), "message": why}
+            if alert.send_alert(event) is not None or alert.alert_argv() is None:
+                self._ac_power_paged = mono
+        return state
 
     def power_cycle_miss_state(
         self, ledger: Optional[list[dict]] = None, *, now_epoch: Optional[float] = None
@@ -1572,6 +1693,9 @@ class RecoveryMechanism:
         self.power_cycle_retry = None
         self.power_cycle_cooldown_state = None
         self._power_cycle_miss_paged = 0.0
+        self.whole_tray_off = None
+        self._ac_power_paged = 0.0
+        self._ac_power_logged = set()
         now_epoch = time.time() if now_epoch is None else now_epoch
         ledger = self.read_auto_recovery_ledger() or []
         healed = self._power_cycle_healed_at(now_epoch)
@@ -1655,6 +1779,8 @@ class RecoveryMechanism:
             "at_epoch": time.time() if now_epoch is None else now_epoch,
             "at": datetime.now().isoformat(),
         }
+        if action == "power-cycle" and self.whole_tray_off:
+            rec["off_bus"] = list(self.whole_tray_off)  # spec 04 I73: which tray this cycle was for
         path = health_dir() / AUTO_RECOVERY_LEDGER
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

@@ -3562,6 +3562,15 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
     if _force_escalate_enabled():
         ceiling_min = max(1, round(_stuck_hold_ceiling_sec() / 60))
         cooldown = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
+        if cooldown is not None and time.time() < cooldown["until"] and cooldown.get("ac_power_needed"):
+            # Spec 04 I73: no further cycle comes; a human must remove AC power. The bus is re-read
+            # at next_deadline and a returning tray is released only on a full health check.
+            until = datetime.fromtimestamp(cooldown["until"]).strftime("%H:%M:%S")
+            return (
+                f"No further power cycle: the whole tray stayed off after "
+                f"{cooldown['ac_power_needed']['attempts']} cycle(s) and needs AC power removed; the bus "
+                f"is re-checked at {until} — /health power_cycle_cooldown.ac_power_needed."
+            )
         if cooldown is not None and time.time() < cooldown["until"]:
             # Spec 04 I65: the power cycle this hold needs was refused for a bounded wait; the
             # watchdog asks again at its end, so that, not the ceiling, is the next step.
@@ -6371,7 +6380,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         now_epoch = now.timestamp() if now else time.time()
         if cooldown is not None and now_epoch < cooldown["until"]:
             payload["power_cycle_cooldown"] = {
-                "escalation_stage": "power-cycle",
+                # Spec 04 I73: past the class-A attempts, the next stage is AC removal, not a cycle.
+                "escalation_stage": "ac-power-removal" if cooldown.get("ac_power_needed") else "power-cycle",
                 "next_deadline": datetime.fromtimestamp(cooldown["until"]).isoformat(timespec="seconds"),
                 "last_cycle_or_boot": datetime.fromtimestamp(cooldown["last"]).isoformat(timespec="seconds"),
                 "cause": cooldown["cause"],
@@ -6379,6 +6389,9 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
                 "why": cooldown["why"],
                 # Spec 04 I72: power-cycle requests this boot that never took the host down.
                 "missed_requests": cooldown.get("missed", 0),
+                # Spec 04 I73: a whole tray no in-band cycle healed: chips, attempts, last cycle and the
+                # next presence check (next_deadline). Null otherwise.
+                "ac_power_needed": cooldown.get("ac_power_needed"),
             }
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None

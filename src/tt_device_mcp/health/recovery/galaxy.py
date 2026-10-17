@@ -1276,6 +1276,9 @@ class GalaxyRecovery(Recovery):
             present_buses=present_buses,
             tray_groups=groups,
         )
+        # Spec 04 I73: the governor counts the broker cycles for this tray, and stops at the AC-needed
+        # hold, only while a whole tray is what is off; any other read clears it.
+        self.mechanism.whole_tray_off = sorted(offbus, key=int) if fault_class == FAULT_CLASS_WHOLE_TRAY else None
         if fault_class == FAULT_CLASS_WHOLE_TRAY and present_buses is not None:
             log(
                 f"no tray map banked: the {len(present_buses)} chip(s) on the bus fill whole trays and "
