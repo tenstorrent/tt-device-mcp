@@ -221,6 +221,12 @@ async def _start(job_id: str, command: str, timeout_sec: int = 600):
     return job, runner
 
 
+def _runner_done(job):
+    """The runner has booked the job's end. A kill sets ``finished_at`` before the runner sees the
+    exit, and a runner cancelled before then leaves the job for re-adoption, owing no reset."""
+    return job.finished_at is not None and srv.current_job_id != job.id
+
+
 async def _stop(runner):
     runner.cancel()
     await asyncio.gather(runner, return_exceptions=True)
