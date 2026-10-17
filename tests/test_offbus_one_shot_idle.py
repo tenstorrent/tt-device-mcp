@@ -4,6 +4,7 @@
 """Spec 03 I23: on a tenant-free box the off-bus one-shot fires on the second sampler tick of the hold,
 not after the tenant wait (``_offbus_hold_ceiling_sec``). A live tenant keeps that wait."""
 
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -137,6 +138,16 @@ async def test_a_failed_early_one_shot_keeps_the_hold_and_reaches_the_power_cycl
     monkeypatch.setattr(srv, "device_hold_offbus_tenant_wait", False)
     monkeypatch.setattr(srv, "device_hold_offbus_idle_early", False)
     monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    rig_cycle = srv._auto_power_cycle_host
+
+    async def cycle_and_mark(log, reason):
+        # As the real one: a launched request is marked pending, so nothing asks for a second cycle
+        # (the spec 04 I76 bound's host rung after this ladder stands down on it).
+        await rig_cycle(log, reason)
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", cycle_and_mark)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
 
     async def tick(sec):
         # The real clock reads the hold's age from datetime.now(); move the hold start, not the clock.
