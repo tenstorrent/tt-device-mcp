@@ -523,7 +523,7 @@ each rung fires only when the gentler one failed or cannot apply.
   the I24 gate as `hold`, whatever it is configured to. The latch is scoped to the boot it was
   written on (`latched_on_boot`): it survives broker restarts on that boot, and it is bounded. It
   lifts on its own (`offbus_reset_hold_expired`, naming why) once a health pass sees every expected
-  chip on the bus and host-pci OK, or once every chip is on the bus and the latch is older than
+  chip on the bus and host-pci OK (a listed endpoint whose link reads down, 03 I9, is not on the bus), or once every chip is on the bus and the latch is older than
   `TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC` (default 21600 s; the gate checks that
   ceiling whenever it is asked with no chip off the bus). While a chip is off the bus or sysfs cannot
   be read it lifts only where `TT_DEVICE_MCP_POWER_CYCLE_CMD` is unset, at the same ceiling: there no
@@ -822,8 +822,22 @@ each rung fires only when the gentler one failed or cannot apply.
   every chip) and at least one chip is still on the bus. A broker with no tray map (it never read a
   full mesh, as on a boot that came up short) reads class A from presence instead: the chips still
   on the bus, read live from sysfs and grouped by tt-smi's UBB bus groups (`bus & 0xF0`), fill whole
-  trays, at least one tray has none, and those trays' chips are exactly the off-bus count; anything
-  else, or no tt-smi tables, is not class A. So a whole-tray drop at the startup gate or at the hold
+  trays, at least one tray has none, and those trays' chips are exactly the off-bus count, and the
+  chip ids missing from that read are exactly the off-bus ids (a heartbeat read and a sysfs read that
+  raced never pair the wrong chips); anything else, or no tt-smi tables, is not class A. A chip the
+  heartbeat calls off the bus is not present even if the kernel still lists its node, nor is a node
+  whose link reads down (speed `Unknown` or width 63, 03 I9), so neither fills a tray it left. When
+  the set as read is not class A, its chips that are enumerated and bound to tt-kmd but whose
+  heartbeat read fails with an error other than ENODATA (EIO, a missing attribute), and whose link
+  does not read down (03 I9), are taken as on the bus, on the bus but unhealthy, and the set is
+  classified again, for class A only
+  (`class_a_unreadable_survivors`, naming them); every other answer, and every rung's own off-bus
+  count, is the one the set as read gives. Without this, such survivors of a whole-tray drop make it
+  read all-off (one mesh reset, then class C) or partial (the full ladder). With no map the tray
+  rung itself runs the same presence read (EIO survivors included) for a below-floor drop: a clean
+  whole-tray drop emits `ubb_reset_declined_whole_tray` and goes to the power cycle as in I25,
+  where before it declined for want of a map and held to the ceiling; a partial drop keeps the
+  ladder. So a whole-tray drop at the startup gate or at the hold
   deadline requests the cycle at its first pass, not after the hold ceiling and a mesh reset; inside
   the I65 cooldown the denial puts the deadline on /health at that pass and the watchdog asks again
   then. Class C: every chip is off the bus after a
@@ -900,7 +914,7 @@ each rung fires only when the gentler one failed or cannot apply.
   least one isolated chip, `reset_with_quiesce` watches the reset's output and, at the first marker
   of that wait (`Waiting for 30 seconds: 30`, the settle's end, or `Waiting for all N chips to show
   up`, matched across split reads), runs one global PCI rescan, journaled as
-  `reset_driver_wait_rescan` with `ok` and the chips. It fires at most once per reset, never for
+  `reset_driver_wait_rescan` with `ok` and the chips. It fires once per reset (I78 repeats it, bounded, while an isolated chip is still missing), never for
   another reset command or with no isolated chip, and a failed write is journaled and the reset runs
   on; the rescan after the reset still runs. A cancelled reset cancels a pending rescan and disarms the
   watcher, so output the backend still reads after the cancel starts none; a sysfs write already
@@ -908,11 +922,12 @@ each rung fires only when the gentler one failed or cannot apply.
   tt-smi exited, while the rescan's write finishes, still runs the reset's whole cleanup (the
   in-flight flag cleared, the rescan after the reset, returned chips dropped from the isolated set,
   the pollers back) and only then reaches the caller. A chip still dead stays off the bus, as before.
-  The one rescan comes at the start of the wait: an isolated chip whose link trains later in tt-smi's
-  100 s wait still misses this reset and keeps the I39 path and its bound. Releases nothing: the full health check, fabric included, still
+  The rescan comes at the start of the wait; an isolated chip whose link trains later in tt-smi's
+  100 s wait is picked up by I78's repeat. Releases nothing: the full health check, fabric included, still
   decides (I32). TTR: class B1 with the chip isolated, from the hold, goes
   from about 505 s (one-shot 120 s, a failed 263 s reset, the 60 s I39 wait, a 62 s healing reset)
-  to about 182 s (one-shot 120 s and one 62 s reset), inside the 6 min budget. Mass or whole-tray
+  to about 182 s (one-shot 120 s and one 62 s reset), inside the 6 min budget; both figures leave out
+  the full check before release (about 60 s, I78 gives the measured episode). Mass or whole-tray
   drops with isolated chips that a mesh reset heals save the same ~320 s. Paths with no isolated chip
   or no `-glx_reset` are unchanged.
 
@@ -1050,6 +1065,29 @@ each rung fires only when the gentler one failed or cannot apply.
   (`AUTO_RECOVERY_MIN_INTERVAL_SEC`, 3600 s since the last automatic reboot). The `gone` stage and
   the second scan add no wait.
 
+- **I78 — The I81 driver-wait rescan repeats, bounded, until every isolated chip is back.** I81's
+  one rescan comes at the start of tt-smi's 100 s driver wait; a chip whose link trains later in that
+  wait would still miss the reset, which then exits 1 and leaves the I39 retry to heal. So after the
+  I81 rescan, while an isolated chip is still missing, `reset_with_quiesce` drops each returned chip
+  from the isolated set (journaled `isolated_chips_returned`, context `mesh reset driver wait`) and
+  rescans again every `DRIVER_WAIT_RESCAN_EVERY_SEC` (5 s), at most `DRIVER_WAIT_RESCAN_TRIES` (20)
+  rescans in all, which span the 100 s wait. It stops as soon as no chip is isolated, the reset ends
+  (its cleanup sets a stop event, so the reset never waits on a repeat), the reset is cancelled, or
+  the tries are spent, journaled `reset_driver_wait_rescan_spent` with the tries and the chips still
+  missing. The trigger is I81's: the settle's last count, never its first. tt-smi prints the first
+  count as soon as the IPMI re-power returns, and a rescan then can enumerate a chip whose firmware
+  is not up yet. Both reset backends deliver the last count only once the settle is over: the scoped
+  backend reads by line, and tt-smi's countdown ends its line only after the last count; the local
+  backend polls the output file and sees the last count when it is written. Releases nothing: the
+  full health check, fabric included, still decides (I32), and a failed reset keeps I36, I38, I39 and
+  the 10 min ladder bound, then the power cycle (I76). Time to recover, class B1 (one chip off the
+  bus, isolated, healed by a mesh reset). Measured before, one episode, onset to release: about
+  575 s (about 123 s to the first reset, a failed 263 s mesh reset, a 65 s wait for the I39 retry, a
+  62 s healing reset, about 60 s of full check with fabric before release). With I81 and I78, est.:
+  about 245 s (123 s, one 62 s healing reset, 60 s check); a chip that trains late in the wait adds
+  at most the rest of the 100 s wait instead of a failed reset and a retry. Worst case, a chip that
+  never comes back: unchanged, the failed 263 s reset, then I39, inside the 10 min ladder bound and
+  then the power cycle; the repeat adds no time to it, since it ends with the reset.
 - **I79 — A hold whose reset and full check already failed climbs at once, not at the ceiling.**
   The stuck-hold ceiling (600 s) bounds how long the host rungs wait for the gentler rungs to have
   their try; it never adds a wait once they had it. Three cases climb as soon as their last gentler
@@ -1636,7 +1674,7 @@ sees a silent fabric pass.
 | I24 the flood is a rate; the flood window refuses even under `off`; a refused reset is not recorded | `tests/test_pcie_guard.py::test_a_steady_trickle_between_distant_looks_is_not_a_flood`, `::test_a_trickle_since_an_old_boot_is_not_a_flood`, `::test_the_flood_window_holds_automatic_resets_even_with_the_gate_off`, `::test_after_a_kept_masked_port_the_stuck_hold_mesh_reset_does_not_fire`, `::test_a_gated_mesh_reset_records_no_reset_and_arms_no_cooldown` |
 | I25 the clear command finds the system broker's latch; one it cannot remove is reported | `tests/test_pcie_guard.py::test_the_clear_command_finds_the_system_brokers_latch`, `::test_a_latch_that_cannot_be_removed_is_reported_not_called_absent` |
 | I25 the latch is scoped to its boot: a later boot ignores and drops it, and it never holds the I27 power cycle | `tests/test_pcie_guard.py::test_a_latch_holds_only_on_the_boot_it_was_written_in`, `::test_a_latch_from_an_ended_boot_never_gates_even_if_the_broker_never_restarted`, `tests/test_offbus_power_cycle.py::test_a_latch_never_blocks_a_rung_after_its_boot_nor_the_power_cycle_on_it` |
-| I25 the latch is bounded: it lifts with every chip on the bus and host-pci OK, or at its ceiling with every chip on the bus; with a chip off or sysfs unreadable only at its ceiling with no power cycle configured (paged once, the gate falls back to its mode); one it cannot remove keeps holding; the hold names both boots | `tests/test_pcie_guard.py::test_the_latch_lifts_once_every_chip_is_back_and_host_pci_is_ok`, `::test_the_latch_never_lifts_while_a_chip_is_off_the_bus`, `::test_with_no_power_cycle_a_latch_with_a_chip_off_lifts_at_its_ceiling`, `::test_with_no_power_cycle_the_gate_itself_lifts_a_latch_past_its_ceiling`, `::test_with_a_power_cycle_a_latch_with_a_chip_off_still_holds_past_its_ceiling`, `::test_the_hold_message_names_both_boots`, `::test_the_latch_lifts_at_its_ceiling_with_every_chip_on_the_bus`, `::test_the_latch_ceiling_defaults_and_rejects_nonsense`, `::test_a_latch_that_cannot_be_removed_keeps_holding`, `::test_the_between_jobs_check_lifts_the_latch_once_the_mesh_is_back` |
+| I25 the latch is bounded: it lifts with every chip on the bus (a link that reads down is not) and host-pci OK, or at its ceiling with every chip on the bus; with a chip off or sysfs unreadable only at its ceiling with no power cycle configured (paged once, the gate falls back to its mode); one it cannot remove keeps holding; the hold names both boots | `tests/test_pcie_guard.py::test_the_latch_lifts_once_every_chip_is_back_and_host_pci_is_ok`, `::test_the_latch_never_lifts_while_a_chip_is_off_the_bus`, `::test_the_latch_never_lifts_while_a_listed_link_reads_down`, `::test_with_no_power_cycle_a_latch_with_a_chip_off_lifts_at_its_ceiling`, `::test_with_no_power_cycle_the_gate_itself_lifts_a_latch_past_its_ceiling`, `::test_with_a_power_cycle_a_latch_with_a_chip_off_still_holds_past_its_ceiling`, `::test_the_hold_message_names_both_boots`, `::test_the_latch_lifts_at_its_ceiling_with_every_chip_on_the_bus`, `::test_the_latch_ceiling_defaults_and_rejects_nonsense`, `::test_a_latch_that_cannot_be_removed_keeps_holding`, `::test_the_between_jobs_check_lifts_the_latch_once_the_mesh_is_back` |
 | I17 a rung the process cannot execute reads OFF (reboot, power cycle, tray, bridge) | `tests/test_rung_privilege.py::test_a_non_root_daemon_has_no_reboot_rung`, `::test_a_host_without_systemd_has_no_reboot_rung`, `::test_an_unreachable_bmc_has_no_power_cycle_rung`, `::test_an_unreachable_bmc_has_no_tray_rung`, `::test_a_non_root_daemon_has_no_bridge_rung` |
 | I17 the inventory reads the tray rung OFF on a committed per-target host, naming the platform; unresolved or Galaxy keeps it | `tests/test_rung_privilege.py::test_a_per_target_host_has_no_tray_rung`, `::test_an_unresolved_platform_keeps_the_tray_rung`, `::test_a_galaxy_keeps_the_tray_rung` |
 | I17 privilege is a second conjunct, never a replacement for the opt-out | `tests/test_rung_privilege.py::test_the_opt_out_still_wins_where_the_privilege_exists` |
@@ -1752,6 +1790,9 @@ sees a silent fabric pass.
 | I37 class A with no tray map (a short boot): the first gate pass, startup or run time, and the hold-deadline climb request the cycle with no mesh reset, tray re-power or sweep; a partial drop keeps the ladder | `tests/test_classac_power_cycle_direct.py::test_a_whole_tray_drop_with_no_map_cycles_at_the_first_gate_pass`, `::test_the_hold_deadline_climb_with_no_map_cycles_with_no_reset`, `::test_a_partial_drop_with_no_map_keeps_the_ladder` |
 | I37/I65 class A with no map inside the cooldown: the first pass is denied with the deadline on /health and in the hold message, and nothing resets | `tests/test_classac_power_cycle_direct.py::test_inside_the_cooldown_the_deadline_shows_at_once_and_no_reset_runs` |
 | I37 time to recover (fake clock): class A requests the cycle in the first window, class C after one failed reset | `tests/test_classac_power_cycle_direct.py::test_time_to_recover_on_a_fake_clock` |
+| I37 with no map the missing chip ids must be exactly the off-bus ids; a lingering node the heartbeat calls off, or a node whose link reads down, never fills a tray | `tests/test_classac_power_cycle_direct.py::test_whole_trays_absent_needs_the_off_bus_ids_to_be_the_missing_ones`, `::test_a_no_map_tray_of_lingering_nodes_is_class_a`, `::test_a_listed_node_whose_link_is_down_does_not_fill_a_tray` |
+| I37 EIO survivors: enumerated, bound chips whose heartbeat read fails are on the bus for the class A read only (map or no map), unless their link reads down; every chip unreadable is not class A; a partial drop with such chips keeps the ladder; the rungs still count them off; lingering link-down EIO nodes leave an all-off bus its one mesh reset, and a tray of them with one link-up EIO survivor is class A | `tests/test_classac_power_cycle_direct.py::test_a_whole_tray_with_eio_survivors_cycles_with_the_map`, `::test_a_whole_tray_with_eio_survivors_cycles_with_no_map`, `::test_all_chips_unreadable_is_not_class_a`, `::test_a_partial_drop_with_eio_survivors_keeps_the_ladder`, `::test_lingering_link_down_nodes_leave_an_all_off_bus_its_mesh_reset`, `::test_a_tray_of_link_down_nodes_with_one_eio_survivor_is_class_a`, `tests/test_arc_not_ready.py::test_unreadable_on_bus_chips_names_bound_eio_chips_only`, `::test_unreadable_on_bus_chips_skips_a_node_whose_link_is_down`, `::test_eio_chips_still_count_off_the_bus_for_the_rungs` |
+| I37/I25 the tray rung with no map runs the presence read: a whole-tray drop (EIO survivors included) is declined whole-tray and handed to the power cycle; a partial drop keeps the ladder | `tests/test_classac_power_cycle_direct.py::test_the_tray_rung_with_no_map_hands_a_whole_tray_to_the_power_cycle`, `::test_the_tray_rung_with_no_map_and_eio_survivors_hands_off_too`, `::test_the_tray_rung_with_no_map_keeps_a_partial_drop_on_the_ladder` |
 | I38 partial off-bus (one chip, four chips): the power cycle fires right after the one failed reset, 252 s vs 924 s and 383 s vs 1186 s from onset; a denied cycle is asked again the next window with no reset between | `tests/test_no_repeat_failed_rung.py::test_partial_offbus_power_cycles_right_after_the_failed_reset`, `::test_a_denied_power_cycle_after_the_failed_reset_is_retried_next_window` |
 | I38 with I65: a partial off-bus whose reset failed within the cooldown after a host boot skips the ceiling wait and the sweep, holds with the cooldown deadline set and no second reset, shows that deadline on /health (`power_cycle_cooldown.next_deadline`), is asked again by the watchdog at it, then cycles once the cooldown has run out | `tests/test_no_repeat_failed_rung.py::test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cycle_cooldown` |
 | I36 / I38 for each reset class (B1 one or two chips off, B2 four, D present mesh) and host rung (power cycle, reboot, none) over six forced windows: the mesh reset runs first and once on an unchanged set, the next rung follows in that same window (or one latched operator hand-off), nothing releases the hold | `tests/test_no_repeat_failed_rung.py::test_e3_offbus_classes_reset_once_then_take_the_next_rung`, `::test_e3_present_mesh_resets_once_then_takes_the_next_rung` |
@@ -1785,6 +1826,7 @@ sees a silent fabric pass.
 | I65 a failed out-of-band cycle (a second line, same `at_epoch`, cause + ` (cycle failed)`) never counts and cancels its attempt line; an unmatched failure line is ignored; an attempt with no failure line still counts; host boots are unchanged | `tests/test_power_cycle_cooldown.py::test_a_matched_failure_line_drops_the_attempt`, `::test_an_unmatched_failure_line_is_ignored`, `::test_an_attempt_without_a_failure_line_still_counts` |
 | I65 a future, non-finite or unreadable stamp (history file, ledger, heal file) never hides a valid past anchor, never holds the cycle past the stated gap, never keeps the streak past a verified release; every cap denial is on /health | `tests/test_power_cycle_cooldown.py::test_a_nan_or_future_history_line_does_not_hide_the_valid_past_one`, `::test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle`, `::test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health`, `::test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end`, `::test_the_per_boot_cap_denial_shows_on_health`, `::test_a_future_record_does_not_keep_the_streak_past_a_verified_release` |
 | I37/I65 class C at startup: one mesh reset with no failed reset or broker cycle; none after the broker's own cycle, which then waits only for the cooldown | `tests/test_power_cycle_cooldown.py::test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_gets_one_reset`, `::test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_reset`, `::test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not` |
+| I78 the driver-wait rescan repeats until every isolated chip is back and then stops; it gives up after its tries, journaled; it ends with the reset and never delays its cleanup; a cancelled reset stops it; no rescan while the settle counts; on both backends (line reader and file reader) the rescan runs after the settle and inside the driver wait | `tests/test_mesh_reset_readd.py::test_the_rescan_repeats_until_the_chip_is_back_and_then_stops`, `::test_the_repeat_gives_up_after_its_tries`, `::test_the_repeat_ends_with_the_reset_and_never_delays_its_cleanup`, `::test_a_cancelled_reset_stops_the_repeats`, `::test_no_rescan_while_the_settle_counts`, `::test_both_backends_rescan_only_once_the_settle_is_over` |
 | I76 every hold kind (77-only, topology mismatch, known fabric fault, latched, generic) runs the full ladder at the 10-min bound, then the host rung; below the bound a no-reset hold keeps its fast path; a latched I42 hold escalates with its latch lifted | `tests/test_hold_bound.py::test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung`, `::test_below_the_bound_a_no_reset_hold_keeps_its_fast_path`, `::test_a_latched_i42_hold_still_escalates_and_its_latch_is_lifted`, `::test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_power_cycle` |
 | I76 the I29 77 hold with no host rung (reset and sweep already ran this episode) gets the power cycle at the bound in the same run; a killed job's leftover holder (01 I16) does not stand the bound down: no reset runs over it and the host rung is asked for, which a live tenant still refuses | `tests/test_hold_bound.py::test_replay_a_77_held_with_no_host_rung_gets_the_power_cycle_at_the_bound`, `::test_a_killed_jobs_leftover_holder_does_not_stop_the_bound` |
 | I76 a cooldown denial of the host rung arms the retry, which fires at the cooldown's end | `tests/test_hold_bound.py::test_a_cooldown_denial_arms_the_retry_and_the_host_rung_fires_at_its_end` |
