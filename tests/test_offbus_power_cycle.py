@@ -1098,6 +1098,75 @@ async def test_a_whole_tray_that_comes_back_in_part_is_not_cycled_at_grace_0(
     assert counters["resets"] == 0 and counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
 
 
+def _flapping_tray(monkeypatch, state, chip):
+    """``chip`` flickers: back on the bus right after the whole tray is recorded down, off again once
+    the re-read clears it, so every whole-tray read is followed by a partial one."""
+    note, clear = opc.note_whole_tray_down, opc.clear_whole_tray_down
+
+    def noted(*a, **k):
+        note(*a, **k)
+        state["off"].discard(chip)
+
+    def cleared(*a, **k):
+        clear(*a, **k)
+        state["off"].add(chip)
+
+    monkeypatch.setattr(opc, "note_whole_tray_down", noted)
+    monkeypatch.setattr(opc, "clear_whole_tray_down", cleared)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["idle_forced", "post_job_gate"])
+async def test_a_flapping_whole_tray_still_reaches_the_power_cycle(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays, path
+):
+    """Chip 0 of tray 1 flickers, so each whole-tray read is followed by a partial
+    re-read before the cycle. The re-check holds the cycle back once per episode; the next pass that
+    sees the whole tray off fires at grace 0. Before, every pass cleared the whole-tray clock and held,
+    so the hold never ended (6 forced passes: 0 cycles). No tray re-power and no reset runs, and the
+    device stays held."""
+    hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path)
+    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
+    state["off"] = set(range(8))
+    _flapping_tray(monkeypatch, state, 0)
+
+    async def one_pass():
+        if path == "idle_forced":
+            await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
+        else:
+            await _gate_tray_rung(set(state["off"]))
+
+    await one_pass()
+    assert rec["fires"] == [], "the first partial re-read holds the cycle back"
+    assert opc.whole_tray_deferred(hold_since)
+    await one_pass()
+    assert len(rec["fires"]) == 1 and "whole tray is off the bus" in rec["fires"][0]["reason"]
+    for _ in range(4):
+        await one_pass()
+    phases = [f.get("phase") for k, f in rec["events"] if k == "offbus_gated_hold"]
+    assert phases.count("whole_tray_back") == 1, "the deferral runs once per episode"
+    firing = [f for k, f in rec["events"] if k == "offbus_gated_hold" and f.get("phase") == "firing"]
+    assert firing[0]["handoff"] == "whole_tray" and firing[0]["held_since"] == hold_since
+    assert state["fired"] == [] and counters["resets"] == 0, "no tray re-power and no reset"
+    assert all(state["verifies"]), "every verify ran the fabric pass"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
+
+
+def test_the_whole_tray_deferral_is_per_episode():
+    """A new hold episode gets its own one deferral; the old episode's mark does not carry over."""
+    opc._pending.clear()
+    opc.note_whole_tray_down("2026-10-16T01:00:00", "trays [1]")
+    opc.clear_whole_tray_down("2026-10-16T01:00:00", "partial")
+    assert opc.whole_tray_deferred("2026-10-16T01:00:00")
+    opc.note_whole_tray_down("2026-10-16T01:00:00", "trays [1]")
+    assert opc.whole_tray_deferred("2026-10-16T01:00:00"), "seeing the whole tray again keeps the mark"
+    assert not opc.whole_tray_deferred("2026-10-16T02:00:00")
+    opc.note_whole_tray_down("2026-10-16T02:00:00", "trays [1]")
+    assert not opc.whole_tray_deferred("2026-10-16T02:00:00")
+    assert not opc.whole_tray_deferred("")
+    opc._pending.clear()
+
+
 @pytest.mark.asyncio
 async def test_a_tray_still_wholly_off_at_the_re_read_still_fires_at_once(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays

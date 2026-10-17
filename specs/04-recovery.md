@@ -567,7 +567,10 @@ each rung fires only when the gentler one failed or cannot apply.
   `back_on_bus`). A cycle due at no grace because a whole tray was off re-checks that a tray is
   still wholly off; when the tray map places the drop and none is, it does not fire, clears the
   whole-tray clock (phase `whole_tray_back`) and holds, so the partial drop goes back to the ladder
-  and the other bounded clocks. A read the map cannot place keeps the whole-tray verdict. The
+  and the other bounded clocks. That deferral runs once per hold episode: a whole tray seen off again
+  in the same episode (a tray whose read flaps) fires at grace 0 on that pass without the re-check, so
+  the deferral adds at most one pass to a whole-tray hold. A read the map cannot place keeps the
+  whole-tray verdict. The
   `firing` event names `fault_class` (`whole_tray`, `all_off`, `tray_partial` for 4 or more chips,
   `partial_offbus` for 1-3), `handoff` (`whole_tray`, `ipmi_unavailable`, `tray_walk_failed`,
   `tray_rung_regressed`, `gate_refused`) and `hold_age_sec`, the hold's time to this cycle.
@@ -1441,7 +1444,7 @@ sees a silent fabric pass.
 | I25 an operator re-arms the declined tray rung after a repair (exit 1 when it cannot remove the record, 2 on bad usage); a running broker re-arms when its written record is removed | `tests/test_pcie_guard.py::test_the_operator_re_arms_the_tray_rung_after_a_repair`, `::test_a_tray_rung_latch_that_cannot_be_removed_is_reported`, `::test_a_running_broker_re_arms_when_the_operator_removes_the_record` |
 | I25 a delayed position-5 drop in a later hold still latches and the record names both episodes | `tests/test_pcie_guard.py::test_a_position_5_drop_in_a_later_hold_still_latches_and_names_both_episodes` |
 | I25/I27 an idle whole-tray decline is journaled as `whole_tray`, never a failed walk; the firing event names the class and hand-off | `tests/test_offbus_power_cycle.py::test_an_idle_whole_tray_decline_is_journaled_as_whole_tray_not_a_failed_walk` |
-| I27 a whole tray that came back in part is not cycled at grace 0 and stays held; one still wholly off, or a re-read the map cannot place, fires at once | `tests/test_offbus_power_cycle.py::test_a_whole_tray_that_comes_back_in_part_is_not_cycled_at_grace_0`, `::test_a_tray_still_wholly_off_at_the_re_read_still_fires_at_once`, `::test_a_re_read_the_tray_map_cannot_place_keeps_the_whole_tray_verdict` |
+| I27 a whole tray that came back in part is not cycled at grace 0 and stays held, once per episode (a flapping tray fires on the next whole-tray read); one still wholly off, or a re-read the map cannot place, fires at once | `tests/test_offbus_power_cycle.py::test_a_whole_tray_that_comes_back_in_part_is_not_cycled_at_grace_0`, `::test_a_flapping_whole_tray_still_reaches_the_power_cycle`, `::test_the_whole_tray_deferral_is_per_episode`, `::test_a_tray_still_wholly_off_at_the_re_read_still_fires_at_once`, `::test_a_re_read_the_tray_map_cannot_place_keeps_the_whole_tray_verdict` |
 | I25 / I32 a skipped tray re-power releases only after the full health check, fabric included | `tests/test_ladder_v2.py::test_a_skipped_tray_rung_releases_only_after_the_full_health_check` |
 | I27 a regressed tray rung hands off to the power cycle past the grace | `tests/test_offbus_power_cycle.py::test_a_regressed_tray_rung_hands_off_past_the_grace` |
 | I23 holders: wait, then refuse | `tests/test_pcie_guard.py::test_envelope_waits_for_holders_then_refuses_without_touching_anything`, `::test_envelope_proceeds_once_the_holder_lets_go` |

@@ -359,11 +359,13 @@ def note_whole_tray_down(episode: str, detail: str, now: Optional[datetime] = No
 
 def clear_whole_tray_down(episode: str, detail: str, fault_class: str = "") -> None:
     """The tray that made this episode a whole-tray drop is back on the bus in part: the no-grace power
-    cycle no longer applies (spec 04 I27). The hold keeps its other hand-off clocks; idempotent."""
+    cycle no longer applies (spec 04 I27). The hold keeps its other hand-off clocks; idempotent. Marks the
+    episode's one deferral (:func:`whole_tray_deferred`), which this call never undoes."""
     if not episode or _pending.get("episode") != episode or _pending.get("whole_tray_at") is None:
         return
     _pending["whole_tray_at"] = None
     _pending["whole_tray_detail"] = ""
+    _pending["whole_tray_deferred"] = True
     health_event(
         "offbus_gated_hold",
         phase="whole_tray_back",
@@ -372,6 +374,13 @@ def clear_whole_tray_down(episode: str, detail: str, fault_class: str = "") -> N
         fault_class=fault_class,
         hold_age_sec=episode_age_sec(episode),
     )
+
+
+def whole_tray_deferred(episode: str) -> bool:
+    """True once this episode's no-grace cycle was held back because the tray came back in part
+    (:func:`clear_whole_tray_down`). That deferral happens once per episode: a whole tray seen off again
+    in the same episode fires without the re-check, so a tray whose read flaps cannot hold it forever."""
+    return bool(episode) and _pending.get("episode") == episode and bool(_pending.get("whole_tray_deferred"))
 
 
 def whole_tray_down_age_sec(episode: str, now: Optional[datetime] = None) -> Optional[float]:

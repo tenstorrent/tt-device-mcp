@@ -2454,11 +2454,17 @@ class GalaxyRecovery(Recovery):
         offbus_now = _offbus_chip_ids(beats, expected)
         tray_map = self._tray_map_now()
         whole_now = bool(_whole_trays_off(offbus_now, expected, tray_map))
-        if handoff == "whole_tray" and not whole_now and _offbus_ids_on_trays(offbus_now, expected, tray_map):
+        if (
+            handoff == "whole_tray"
+            and not whole_now
+            and _offbus_ids_on_trays(offbus_now, expected, tray_map)
+            and not offbus_power_cycle.whole_tray_deferred(hold_since)
+        ):
             # The no-grace cycle is for a whole tray off the bus. One that came back in part since the
             # decline is a partial drop: hold, and the next pass hands it to the ladder (the walk) or to
             # its own bounded grace, never to a grace-0 cycle. A read the tray map cannot place keeps the
-            # verdict: a whole-tray drop goes to the power cycle.
+            # verdict: a whole-tray drop goes to the power cycle. This deferral runs once per episode: a
+            # whole tray seen off again in it (a flapping read) fires on that pass without the re-check.
             fault_class = _offbus_fault_class(off_bus, expected, whole=False)
             log(
                 f"off-bus hold: no whole tray is off the bus any more ({off_bus}/{expected} chip(s) off) — "
@@ -2468,6 +2474,11 @@ class GalaxyRecovery(Recovery):
                 hold_since, f"{off_bus}/{expected} off the bus, no whole tray", fault_class
             )
             return False
+        if handoff == "whole_tray" and not whole_now:
+            log(
+                f"off-bus hold: a whole tray was seen off again after this episode's one partial re-read "
+                f"({off_bus}/{expected} chip(s) off now) — the tray flaps; power cycle at grace 0"
+            )
         fault_class = _offbus_fault_class(off_bus, expected, whole=whole_now)
         state = offbus_power_cycle.load_state()
         now = offbus_power_cycle.now_epoch()
