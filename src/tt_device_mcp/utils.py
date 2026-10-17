@@ -29,11 +29,12 @@ def _env_num(name: str, default, cast):
     return val if val >= 0 else default
 
 
-def retry_unreachable(attempt, *, sleep=time.sleep):
+def retry_unreachable(attempt, *, sleep=None):
     """Call ``attempt()`` (a connect step); on ConnectionRefusedError or FileNotFoundError
     only, wait and retry up to TT_DEVICE_MCP_CONNECT_RETRIES times (default 5 x 1 s,
     TT_DEVICE_MCP_CONNECT_DELAY_SEC). Prints one line to stderr on the first wait. After
     the last retry the original exception is raised. Other errors propagate at once."""
+    sleep = sleep or time.sleep
     retries = _env_num(CONNECT_RETRIES_ENV, DEFAULT_CONNECT_RETRIES, int)
     delay = _env_num(CONNECT_DELAY_ENV, DEFAULT_CONNECT_DELAY_SEC, float)
     for n in range(retries + 1):
