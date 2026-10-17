@@ -14298,30 +14298,50 @@ async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires
     monkeypatch, clear_job_state
 ):
     """Spec 04 I79: on the 77 reboot's boot, a cold rung the I65 cooldown holds off is not spent. The
-    first escalation fires nothing and pages once, naming the cooldown and the broker as the owner
-    (it retries by itself). Each later re-check climbs again; the first one the cooldown no longer
-    denies fires exactly one power cycle, never a reboot, and ends the hand-off. A further
-    escalation fires nothing more. Held throughout: only a passing full check releases it."""
+    escalations inside the cooldown fire nothing and page no one (the broker fires the cycle itself
+    once the cooldown ends), journal the wait once and show its deadline on /health. Each later
+    re-check climbs again; the first one the cooldown no longer denies fires exactly one power cycle,
+    never a reboot. A further escalation fires nothing more. Held throughout: only a passing full
+    check releases it. Fails on 2fdd088, which paged an operator for the cooldown."""
     counters, g, alerts, reasons, events, age, asked = _arm_77_reboot_boot_cold_rung(monkeypatch)
     age["v"] = 250
+    mech = srv.recovery_mechanism
+    monkeypatch.setattr(mech, "power_cycle_cooldown_state", None)
+    monkeypatch.setattr(mech, "power_cycle_retry", None)
+    until = time.time() + 900
     cooldown = {"on": True}
 
     def allowed(esc, *, tenant_active):
         asked.append(esc)
         if cooldown["on"]:
-            return False, "power-cycle cooldown: the last boot was 300s ago (I65), until 12:00:00"
+            return mech._deny_power_cycle(
+                {
+                    "until": until,
+                    "last": until - 1800,
+                    "cause": "host boot",
+                    "interval_sec": 1800,
+                    "why": "power-cycle cooldown: the last boot was 900s ago (I65)",
+                }
+            )
+        mech.power_cycle_cooldown_state = None  # as the real governor does on an allow
         return True, "ok"
 
-    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
+    monkeypatch.setattr(mech, "auto_recovery_allowed", allowed)
     for _ in range(2):
         assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     assert asked == ["power-cycle"] * 2, "the cold rung, never a second reboot, asked on every re-check"
     assert counters["power_cycles"] == 0 and reasons == []
-    assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"], "one page per episode"
-    assert "cooldown" in alerts[0]["why"] and "retries" in alerts[0]["why"]
-    status = g.fabric_77_handoff_status(srv.device_hold_episode_since)
-    assert status["owner"] == "broker" and "retries the host rung" in status["then"]
-    assert srv.recovery_mechanism.unverified_77_host_rung_since is None, "a denied rung is not spent"
+    assert alerts == [], "a bounded cooldown pages no one"
+    assert g.fabric_77_handoff_status(srv.device_hold_episode_since) is None
+    assert events.count("fabric_unverified_host_rung_cooldown") == 1, "journaled once per deadline"
+    monkeypatch.setattr(srv, "_device_hold_state", lambda now=None: ("fabric 77", srv.device_hold_episode_since))
+    payload = srv._health_payload()
+    assert "operator_handoff" not in payload
+    assert payload["power_cycle_cooldown"]["next_deadline"] == datetime.fromtimestamp(until).isoformat(
+        timespec="seconds"
+    ), "/health shows when the cycle is asked again"
+    assert mech.power_cycle_retry == (until, srv.device_hold_episode_since), "the watchdog asks again at its end"
+    assert mech.unverified_77_host_rung_since is None, "a denied rung is not spent"
     assert g.fabric_77_climb_owed(srv.device_hold_episode_since) is True
 
     cooldown["on"] = False
@@ -14334,6 +14354,40 @@ async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires
         assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     assert counters["power_cycles"] == 1 and reasons == [], "at most one power cycle per episode"
     assert len(asked) == 3
+    assert counters["resets"] == 0 and counters["dirty_cleared"] == 0, "held, never released unverified"
+    assert [a["why"] for a in alerts] == ["the host rung already ran on this hold"], "paged only once spent"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("denial", ["tenant", "stale_cooldown"])
+async def test_a_cold_rung_denied_for_a_reason_other_than_the_cooldown_pages_once(monkeypatch, clear_job_state, denial):
+    """Spec 04 I79: on the 77 reboot's boot, a cold rung held off by anything but a bounded I65
+    cooldown (a tenant; or a rate limit while an older cooldown record still lingers) is not spent and
+    still pages once per episode, naming the broker as the owner while it retries. No cooldown wait is
+    journaled for it. Held throughout."""
+    counters, g, alerts, reasons, events, age, asked = _arm_77_reboot_boot_cold_rung(monkeypatch)
+    age["v"] = 250
+    mech = srv.recovery_mechanism
+    monkeypatch.setattr(mech, "power_cycle_retry", None)
+    stale = {"until": time.time() + 900, "last": time.time(), "cause": "host boot", "interval_sec": 900}
+    monkeypatch.setattr(mech, "power_cycle_cooldown_state", {**stale, "why": "an earlier cooldown"})
+    if denial == "tenant":
+        why = "a tenant holds the device; a reboot would destroy a running job"
+    else:
+        why = "already auto-escalated 1x this boot (cap 1)"
+
+    def allowed(esc, *, tenant_active):
+        asked.append(esc)
+        return False, why
+
+    monkeypatch.setattr(mech, "auto_recovery_allowed", allowed)
+    for _ in range(2):
+        assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
+    assert asked == ["power-cycle"] * 2 and counters["power_cycles"] == 0 and reasons == []
+    assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"], "one page per episode"
+    assert why in alerts[0]["why"] and alerts[0]["broker_retries"] is True
+    assert g.fabric_77_handoff_status(srv.device_hold_episode_since)["owner"] == "broker"
+    assert "fabric_unverified_host_rung_cooldown" not in events
     assert counters["resets"] == 0 and counters["dirty_cleared"] == 0, "held, never released unverified"
 
 
