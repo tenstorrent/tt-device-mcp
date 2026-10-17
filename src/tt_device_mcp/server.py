@@ -54,6 +54,7 @@ from tt_device_mcp import __version__, aio, alert, device_activity, metrics, pri
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
     FABRIC_CHECK_CANNOT_CHECK_RC,
+    FABRIC_CHECK_TIMEOUT_SEC,
     GRACEFUL_KILL_GRACE_SEC,
     JOB_RETENTION_SEC,
     POST_STEP_DEADLINE_DEFAULT_SEC,
@@ -4266,6 +4267,8 @@ async def _attempt_idle_relift() -> None:
                 # and pay a reset (spec 03 I43). Only a verify that fails falls through to the ceiling.
                 if fsm.record.why == "foreign_holder" and await _foreign_holder_fast_verify(expected, _log):
                     return
+                if _startup_verify_owns_hold():
+                    return  # spec 03 I75: the startup gate runs on this hold next, no reset first
                 drop = _fabric_77_eth_drop() if fsm.record.why == FABRIC_RELIFT_WHY else ""
                 if drop:
                     _log(f"fabric 77 with eth links measured down ({drop}) — a fault: the present-mesh rung")
@@ -6860,6 +6863,9 @@ async def _force_escalate_stuck_hold() -> None:
     ):
         _defer_offbus_one_shot_to_tenant_bound()  # quietly: no device op, no event, no rung
         return
+    if _startup_verify_owns_hold(kind):
+        _defer_to_startup_verify(kind, log)
+        return
     async with _device_op("hold-deadline-escalate"):
         if await asyncio.to_thread(recovery_mechanism.scope_active):
             if past_bound:
@@ -7306,6 +7312,21 @@ def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
     if cooling:
         out["cooldown_until"] = datetime.fromtimestamp(cd["until"]).isoformat(timespec="seconds")
     return out
+
+
+def _defer_to_startup_verify(kind: str, log) -> None:
+    """Spec 03 I75: leave a startup hold to the startup gate that is about to run on it, and give the
+    window back so a gate that fails is escalated on the next sampler tick. Logged once per episode."""
+    global _startup_verify_deferral_logged
+    _rearm_tenant_deferred_window(kind)
+    if _startup_verify_deferral_logged == device_hold_episode_since:
+        return
+    _startup_verify_deferral_logged = device_hold_episode_since
+    log(
+        "startup hold: the startup gate (full check, fabric included) runs as soon as the re-adopted "
+        "jobs end — no reset first; escalates on the first tick after it if the hold stands"
+    )
+    health_event("stuck_hold_deferred", mesh="present", forced=True, blocker="startup_verify")
 
 
 def _rearm_tenant_deferred_window(kind: str) -> bool:
@@ -11219,6 +11240,44 @@ STARTUP_PREREQ_WAIT_SEC = 2.5 * 3600
 STARTUP_PREREQ_POLL_MIN_SEC = 5.0
 STARTUP_PREREQ_POLL_MAX_SEC = 60.0
 _startup_prereq_task: Optional[asyncio.Task] = None
+# Spec 03 I75: the startup gate task, and when it stopped waiting on re-adopted jobs (monotonic).
+_startup_verify_task: Optional[asyncio.Task] = None
+_startup_verify_ready_at: Optional[float] = None
+_startup_verify_deferral_logged: Optional[str] = None
+# How long past the re-adopted jobs' end the escalations still leave a startup hold to that gate:
+# its hugepage wait, its fabric pass and the rest of the full check, with margin.
+STARTUP_VERIFY_DEFER_MAX_SEC = STARTUP_HUGEPAGES_WAIT_SEC + FABRIC_CHECK_TIMEOUT_SEC + 120.0
+
+
+# The forced-run kinds the I75 stand-down may defer: the ones _rearm_tenant_deferred_window gives back,
+# so a deferred run is retried on the next tick. Every other kind spent its latch on spawn and runs.
+_STARTUP_VERIFY_DEFERRABLE_KINDS = ("ceiling_window", "offbus_one_shot")
+
+
+def _startup_verify_owns_hold(kind: Optional[str] = None) -> bool:
+    """Spec 03 I75: True while the startup gate (the full check, fabric included) is still to run on
+    the startup hold, so the ceiling escalation and the idle relift leave that hold to it.
+
+    A job re-adopted across a broker restart can outlive the 600 s ceiling. When it ends, the startup
+    gate starts within one scope poll; a forced escalation that won the device lock first reset a mesh
+    no check had found at fault, and the gate then ran on top of that. Bounded: past
+    STARTUP_VERIFY_DEFER_MAX_SEC from the re-adopted jobs' end the escalations act as before.
+
+    Only the gap from the job's end to the gate's verdict: while a job still runs, the escalations meet
+    it as before (deferred on ``job_running``, journaled). A hold with chips off the bus keeps the
+    off-bus one-shot and its ladder (spec 03 I23), and a forced run of a kind whose window cannot be
+    given back (``kind`` outside _STARTUP_VERIFY_DEFERRABLE_KINDS) runs, so neither waits on the gate."""
+    task = _startup_verify_task
+    if task is None or task.done():
+        return False
+    if fsm.state is not ServerState.RECOVERING or fsm.record.why != "startup_unverified":
+        return False
+    if kind is not None and kind not in _STARTUP_VERIFY_DEFERRABLE_KINDS:
+        return False
+    if isolated_chips or any(j.status == JobStatus.RUNNING for j in jobs.values()):
+        return False
+    ready = _startup_verify_ready_at
+    return ready is None or time.monotonic() - ready < STARTUP_VERIFY_DEFER_MAX_SEC
 
 
 async def _await_startup_prerequisites(missing: str) -> None:
@@ -11378,10 +11437,11 @@ async def _verify_fabric_on_start() -> None:
     A pass that exited 77 because the validator or the hugepages were not there yet is owed again
     once they are (see _await_startup_prerequisites).
     """
-    global _startup_prereq_task
+    global _startup_prereq_task, _startup_verify_ready_at
     try:
         while readopted_scopes:
             await asyncio.sleep(_SCOPE_POLL_SEC)
+        _startup_verify_ready_at = time.monotonic()
         # A boot or power cycle cleared any firmware clock cap. Put the operator's ceiling back
         # first, so the startup traffic pass below never runs above it. The gate's probe pass
         # re-proves it and owns the verdict, so a failure here is only logged.
@@ -11460,7 +11520,7 @@ async def run_startup_tasks() -> None:
     scopes, and a per-user daemon or test server claiming them would show another user's job
     as its own.
     """
-    global _startup_tasks_done
+    global _startup_tasks_done, _startup_verify_task, _startup_verify_ready_at
     if _startup_tasks_done:
         return
     _startup_tasks_done = True
@@ -11568,7 +11628,8 @@ async def run_startup_tasks() -> None:
     asyncio.create_task(_record_startup_health())
     # And then answers it properly, once the device is ours to test — this lifts the hold above on a
     # healthy verdict, holds/escalates on a wedge.
-    asyncio.create_task(_verify_fabric_on_start())
+    _startup_verify_ready_at = None
+    _startup_verify_task = asyncio.create_task(_verify_fabric_on_start())
 
 
 @asynccontextmanager
