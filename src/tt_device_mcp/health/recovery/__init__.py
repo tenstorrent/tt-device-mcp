@@ -83,6 +83,14 @@ POST_RESET_FABRIC_RETRIES = int(os.environ.get("TT_DEVICE_MCP_POST_RESET_FABRIC_
 POST_RESET_FABRIC_RETRY_SLEEP_SEC = float(os.environ.get("TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC", "60"))
 
 
+def _fabric_of(monitor) -> dict:
+    """The post-reset check's fabric verdict for the reset's own event (spec 03 I78): pass/fail, and
+    how far the links found fall short of the cabling."""
+    verdict = getattr(monitor, "fabric_verdict", None)
+    out = verdict() if callable(verdict) else None
+    return out if isinstance(out, dict) else {"result": "none"}
+
+
 @dataclass(frozen=True)
 class Evidence:
     """The gate's live read of the mesh, reshaped for :meth:`Recovery.next_stage`.
@@ -744,7 +752,9 @@ class Recovery(ABC):
             # strikes, and drove the idle ladder toward a host rung on no evidence. Hold fabric-unverified
             # (not dirty) instead: the reset was the remedy a reported fault was pending, so retire that,
             # and the hold is 77-only — the idle relift re-runs the pass, bounded by spec 03 I40.
-            health_event("reset_unverified", rc=rc, evidence=evidence, fabric_retries=retries)
+            health_event(
+                "reset_unverified", rc=rc, evidence=evidence, fabric_retries=retries, fabric=_fabric_of(self.monitor)
+            )
             self.mechanism.last_reset_failed = False
             self.deps.clear_device_reported_fault("reset ran and enum+ARC verify; the fabric is unknown")
             if self.deps.hold_device_fabric_unverified is not None:
@@ -762,6 +772,7 @@ class Recovery(ABC):
             healthy=healthy,
             evidence=evidence,
             fabric_retries=retries,
+            fabric=_fabric_of(self.monitor),
         )
         self.mechanism.last_reset_failed = not healthy
         if not healthy:

@@ -332,6 +332,9 @@ class HealthMonitor:
         # do, and lifting there admits the next tenant onto a fabric that still cannot move data.
         # A skip (None) never overwrites it: not knowing is not the same as knowing it is fit.
         self.last_fabric_ok: Optional[bool] = None
+        # The last fabric check's verdict as every hold-lift and release event carries it (spec 03 I78):
+        # see fabric_verdict(). Empty until a check runs.
+        self._fabric_verdict: dict = {}
         self.last_fabric_output: str = ""
         # When the run that produced last_fabric_output started (local naive datetime), None until
         # one runs. An incident bundle keeps that output only when this pass produced it (spec 03 I57).
@@ -1032,7 +1035,35 @@ class HealthMonitor:
         finally:
             _fabric_inflight_end()
         metrics.probe_observed("fabric", _verdict_label(ok), time.monotonic() - _t0)
+        self._note_fabric_verdict(ok, detail)
         return ok, detail
+
+    def _note_fabric_verdict(self, ok: Optional[bool], detail: str) -> None:
+        """Keep what fabric_verdict() reports: pass/fail/skipped, and how far the links the check found
+        fall short of the cabling descriptor (a topology marker in its detail or kept output)."""
+        missing, extra = fabric.marker_counts(detail)
+        if not (missing or extra) and ok is False:
+            missing, extra = fabric.marker_counts(self.last_fabric_output)
+        self._fabric_verdict = {
+            "result": "pass" if ok is True else "fail" if ok is False else "skipped",
+            "missing_vs_cabling": missing,
+            "extra_vs_cabling": extra,
+            "detail": (detail or "")[:200],
+            "_at": time.monotonic(),
+        }
+
+    def fabric_verdict(self) -> dict:
+        """The last fabric verdict, for the detail of every hold-lift and release event (spec 03 I78):
+        ``result`` (pass/fail/skipped/none), ``missing_vs_cabling``/``extra_vs_cabling`` (port connections
+        the links found lack, or add, against the cabling descriptor: 0/0 on a clean pass means every
+        cabled link was found), ``links_short`` (True when more are missing than extra, which FAILS the
+        check, I71) and ``age_s``. ``result`` "none" once a reset voided it or before any check ran."""
+        v = dict(self._fabric_verdict)
+        if not v or self.last_fabric_ok is None and v["result"] != "skipped":
+            return {"result": "none"}
+        v["links_short"] = v["missing_vs_cabling"] > v["extra_vs_cabling"]
+        v["age_s"] = round(time.monotonic() - v.pop("_at"), 1)
+        return v
 
     async def _verify_fabric_health_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
         override = self._fabric_check_cmd()
@@ -1277,6 +1308,7 @@ class HealthMonitor:
         if marker:
             return marker
         self._note_fabric_ok()
+        self._note_fabric_verdict(True, "a clean fabric pass on the full cabling")
         self.topology_lift_pending = False
         self.clear_topology_hw_fault("a clean fabric pass")
         self.fabric_topology = {}

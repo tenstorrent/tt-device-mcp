@@ -56,8 +56,9 @@ _LINKS_MISSING_AFTER_RETRAIN = re.compile(r"Encountered unrecoverable state")
 
 # The validator's own throw when the links it discovered do not match the cabling descriptor. Its
 # tray ids come from PCI bus numbers, so a tray whose uplink lands on another bus, or a cable that
-# is simply not there, mismatches on every run: a board reset cannot change either. Never
-# measured-bad; the caller reruns once without the descriptor (traffic over the discovered links).
+# is simply not there, mismatches on every run. Not a measurement by itself; the caller reruns
+# once without the descriptor (traffic over the discovered links). A link missing with none extra
+# is still a failed check (``links_missing``): a reset or power cycle can bring a dead link back.
 _TOPOLOGY_MISMATCH = re.compile(r"Connection mismatch detected")
 # The wrapper's own line once that traffic-only rerun passed. It carries the mismatch onto an OK
 # verdict, so the operator still hears that the cabling is not what the descriptor says.
@@ -128,7 +129,7 @@ def topology_marker(desc: str, missing: int, extra: int, ports: tuple[list[str],
     appends the port names it read (``ports`` from :func:`topology_ports`)."""
     marker = (
         f"TOPOLOGY MISMATCH vs {desc}: {missing} missing, {extra} extra port connections "
-        "(tray ids come from PCI bus numbers; a board reset cannot change this)"
+        "(tray ids come from PCI bus numbers)"
     )
     if ports[0]:
         marker += f"; missing ports: {_names(ports[0])}"
@@ -196,6 +197,14 @@ def links_missing(marker: str, accepted: frozenset[str] = frozenset()) -> str:
         f"{LINKS_MISSING}: {missing} port connection(s) of the cabling descriptor missing, {extra} extra, "
         f"after traffic passed on the discovered links{named}; a job routing over the whole mesh fails"
     )
+
+
+def marker_counts(text: str) -> tuple[int, int]:
+    """(missing, extra) port connections against the cabling descriptor that the topology marker in
+    ``text`` names, or (0, 0) when it carries none: the validator prints no link totals, only how far
+    the links it found fall short of (or beyond) the cabling."""
+    m = _MARKER_COUNTS.search(find_topology_marker(text or "") or "")
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
 def missing_cables(marker: str) -> int:
@@ -323,7 +332,7 @@ def classify(rc: Optional[int], output: str) -> tuple[Optional[bool], str]:
         missing, extra = topology_counts(output)
         return None, (
             f"{TOPOLOGY_MISMATCH}: {missing} missing, {extra} extra port connections vs the cabling "
-            "descriptor (tray ids come from PCI bus numbers; a board reset cannot change this)"
+            "descriptor (tray ids come from PCI bus numbers)"
         )
     if _LINKS_MISSING_AFTER_RETRAIN.search(output):
         return False, "links the cabling descriptor expects are still missing after the validator's retrains"

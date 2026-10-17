@@ -1395,7 +1395,8 @@ refuses.
   restart closes the door and only the forced startup gate — the one caller of the fabric pass on
   broker start — opens it. `/health` reports `fsm_state: recovering, fsm_why: startup_unverified`
   until then, by contract. In the health journal the fresh hold is a `startup_fabric_hold` row,
-  closed by exactly one `startup_fabric_released` row (`prior_why`, `detail`, `held_s`) on
+  closed by exactly one `startup_fabric_released` row (`prior_why`, `prior_detail`, `held_s`, and
+  `fabric`: this release's own fabric verdict, I78) on
   whichever path next reaches HEALTHY — normally the startup gate itself, with
   `prior_why: startup_unverified`; another value means the hold turned into that fault before it
   lifted. This pair is separate from `device_held`/`device_released`, which is written only once a
