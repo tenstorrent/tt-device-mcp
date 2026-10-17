@@ -582,7 +582,10 @@ each rung fires only when the gentler one failed or cannot apply.
   whole-tray clock (phase `whole_tray_back`) and holds, so the partial drop goes back to the ladder
   and the other bounded clocks. That deferral runs once per hold episode: a whole tray seen off again
   in the same episode (a tray whose read flaps) fires at grace 0 on that pass without the re-check, so
-  the deferral adds at most one pass to a whole-tray hold. A read the map cannot place keeps the
+  the deferral moves a flapping whole tray's power-cycle request to hold age 600 s at the latest (the
+  stuck-hold ceiling, I76), the next pass that can fire: forced passes run once per episode and the
+  unforced idle climb waits for hold age 600 s. Worst case about 590 s later than an immediate
+  grace-0 cycle. A read the map cannot place keeps the
   whole-tray verdict. The
   `firing` event names `fault_class` (`whole_tray`, `all_off`, `tray_partial` for 4 or more chips,
   `partial_offbus` for 1-3), `handoff` (`whole_tray`, `ipmi_unavailable`, `tray_walk_failed`,
