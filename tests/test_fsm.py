@@ -3,10 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """The server FSM: BOOT/HEALTHY/RECOVERING/DOWN, and the durable record behind it."""
 
+import json
 from datetime import datetime
 
 from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState
-from tt_device_mcp.health import OUTCOME_RECOVERED
+from tt_device_mcp.health import OUTCOME_RECOVERED, OUTCOME_TERMINAL
 from tt_device_mcp.health.core import HealthState
 
 
@@ -356,3 +357,72 @@ def test_a_failing_close_hook_does_not_break_the_transition(tmp_path):
     f.on_next_close(boom)
     f.on_readings(HealthState(phase="test", at=datetime.now(), expected=0))
     assert f.state is ServerState.HEALTHY
+
+
+def _startup_hold(path, boot_id="boot-aaa"):
+    f = ServerFsm(path, current_boot_id=boot_id)
+    f.boot_merge(open_episode=None)  # RECOVERING(startup_unverified)
+    return f
+
+
+def test_readopted_jobs_persist_and_survive_a_same_boot_restart(tmp_path):
+    """Spec 03 I76: fsm.json carries the re-adopted jobs the startup hold waits on, so a client that
+    reads the file can tell that hold from a fault; it survives a broker restart within the boot."""
+    path = tmp_path / "fsm.json"
+    f = _startup_hold(path)
+    assert f.readopted_jobs == [] and json.loads(path.read_text())["readopted_jobs"] == []
+    f.set_readopted_jobs(["428", "430"])
+    assert json.loads(path.read_text())["readopted_jobs"] == ["428", "430"]
+
+    g = ServerFsm(path, current_boot_id="boot-aaa")
+    assert g.readopted_jobs == ["428", "430"]
+    assert ServerFsm(path, current_boot_id="boot-bbb").readopted_jobs == [], "no job survives a reboot"
+
+
+def test_readopted_jobs_clear_on_release_and_on_down(tmp_path):
+    """Spec 03 I76: a release (the startup gate's healthy verdict) or DOWN ends what the field reports."""
+    path = tmp_path / "fsm.json"
+    f = _startup_hold(path)
+    f.set_readopted_jobs(["428"])
+    f.on_readings(HealthState(phase="startup", at=datetime.now(), expected=0))
+    assert f.state is ServerState.HEALTHY
+    assert f.readopted_jobs == [] and json.loads(path.read_text())["readopted_jobs"] == []
+    f.set_readopted_jobs(["428"])
+    assert f.readopted_jobs == [], "only a held device (boot or recovering) reports re-adopted jobs"
+
+    g = _startup_hold(tmp_path / "down.json")
+    g.set_readopted_jobs(["428"])
+    g.on_outcome(OUTCOME_TERMINAL)
+    assert g.state is ServerState.DOWN
+    assert json.loads((tmp_path / "down.json").read_text())["readopted_jobs"] == []
+
+
+def test_readopted_jobs_clear_when_the_job_ends(tmp_path):
+    path = tmp_path / "fsm.json"
+    f = _startup_hold(path)
+    f.set_readopted_jobs(["428"])
+    f.set_readopted_jobs([])
+    assert json.loads(path.read_text())["readopted_jobs"] == []
+    assert f.state is ServerState.RECOVERING and f.record.why == "startup_unverified", "the hold stands"
+
+
+def test_an_fsm_file_without_readopted_jobs_still_loads(tmp_path):
+    """Spec 03 I76: a file written before the field existed loads whole, with readopted_jobs []; a
+    malformed value degrades to [] too."""
+    path = tmp_path / "fsm.json"
+    old = {
+        "state": "recovering",
+        "why": "startup_unverified",
+        "since": "2026-10-17T05:08:50",
+        "detail": "",
+        "job": {},
+        "dirty": False,
+        "latches": {"x": True},
+        "boot_id": "boot-aaa",
+    }
+    path.write_text(json.dumps(old))
+    f = ServerFsm(path, current_boot_id="boot-aaa")
+    assert f.state is ServerState.RECOVERING and f.record.why == "startup_unverified" and f.latch("x")
+    assert f.readopted_jobs == []
+    path.write_text(json.dumps({**old, "readopted_jobs": "428"}))
+    assert ServerFsm(path, current_boot_id="boot-aaa").readopted_jobs == []
