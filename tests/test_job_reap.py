@@ -53,6 +53,13 @@ def _kill_quietly(pid: int) -> None:
         pass
 
 
+def _unique_tag(name: str) -> str:
+    """A job tag no other run shares. The sweep matches the tag host-wide, so a fixed one would
+    also find the child of a second test run of the same test on the host (the real runner's
+    tags carry a random suffix too)."""
+    return f"{name}-{os.getpid()}-{os.urandom(4).hex()}"
+
+
 def _escaped_child(tag: str) -> tuple[int, int]:
     """A job shell that starts a child in its OWN session (setsid) and exits: the child is out of
     the job's process group and session, and its parent chain is gone. Returns (job pid, child pid)."""
@@ -66,7 +73,8 @@ async def test_a_child_that_left_the_session_is_found_by_its_tag_and_ended():
     """The common escape on a host without privsep: the ladder and the final killpg reach only
     the job's process group, and a child that called setsid is not in it. Its parent has exited,
     so no parent chain leads to it either; only the job's tag in its environment does."""
-    job_pid, child = _escaped_child("t-escaped-1")
+    tag = _unique_tag("t-escaped-1")
+    job_pid, child = _escaped_child(tag)
     try:
         assert _alive(child)
         # What the runner used to rely on: the group is empty, so killpg cannot reach the child.
@@ -75,7 +83,7 @@ async def test_a_child_that_left_the_session_is_found_by_its_tag_and_ended():
             os.killpg(job_pid, 0)
 
         survivors = await job_reap.reap_job_survivors(
-            "t1", job_pid, None, "t-escaped-1", term_grace_sec=2, kill_wait_sec=1, log=lambda _m: None
+            "t1", job_pid, None, tag, term_grace_sec=2, kill_wait_sec=1, log=lambda _m: None
         )
         assert survivors == []
         assert _wait_dead(child), "a child that left the job's session outlived the sweep"
@@ -150,14 +158,15 @@ async def test_a_survivor_that_ignores_sigterm_is_sigkilled_after_the_grace():
 async def test_a_process_that_outlives_sigkill_is_named(monkeypatch):
     """A process stuck in the kernel ignores SIGKILL. It cannot be made in a test, so the
     signals are swallowed instead: the sweep must report it, with whether it holds the device."""
-    job_pid, child = _escaped_child("t-stuck")
+    tag = _unique_tag("t-stuck")
+    job_pid, child = _escaped_child(tag)
     monkeypatch.setattr(job_reap.os, "kill", lambda *a: None)
     monkeypatch.setattr(job_reap.os, "killpg", lambda *a: None)
     monkeypatch.setattr(job_reap, "_holds_device", lambda pid: True)
     lines = []
     try:
         survivors = await job_reap.reap_job_survivors(
-            "086", job_pid, None, "t-stuck", term_grace_sec=0.2, kill_wait_sec=0.2, log=lines.append
+            "086", job_pid, None, tag, term_grace_sec=0.2, kill_wait_sec=0.2, log=lines.append
         )
         assert [s.pid for s in survivors] == [child]
         assert survivors[0].holds_device is True
