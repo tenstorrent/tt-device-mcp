@@ -808,11 +808,14 @@ def _deadline(monkeypatch):
     return fired, since
 
 
-def test_the_hold_deadline_never_forces_a_reset_on_a_77_only_hold(monkeypatch, tmp_path, clear_job_state):
+def test_the_hold_deadline_forces_a_77_only_hold_only_at_the_bound(monkeypatch, tmp_path, clear_job_state):
+    """Below the 10-min bound a 77-only hold is never forced; at the bound it is (spec 04 I76)."""
     _hold_77(monkeypatch, tmp_path)
     fired, since = _deadline(monkeypatch)
-    srv._check_hold_deadline(now=since + timedelta(seconds=3 * srv._stuck_hold_ceiling_sec() + 1))
+    srv._check_hold_deadline(now=since + timedelta(seconds=srv._stuck_hold_ceiling_sec() - 1))
     assert fired == []
+    srv._check_hold_deadline(now=since + timedelta(seconds=srv._stuck_hold_ceiling_sec() + 1))
+    assert fired == [True]
 
 
 def test_the_hold_deadline_still_escalates_a_measured_fabric_fault(monkeypatch, tmp_path, clear_job_state):
@@ -944,7 +947,8 @@ async def test_a_78_cable_fault_with_eth_links_down_holds_without_a_reset(monkey
     monkeypatch.setattr(srv.galaxy_recovery, "_escalate_offbus_stuck_hold", rung)
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})
     monkeypatch.setattr(srv, "dead_chips", lambda beats: [])
-    monkeypatch.setattr(srv, "device_hold_episode_since", "2026-10-14T22:18:18")
+    # Below the 10-min bound (spec 04 I76), where the no-reset class still holds.
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(minutes=5)).isoformat())
     await srv._force_escalate_stuck_hold()
     assert climbed == [], "a 78 is held, never reset"
 
