@@ -4170,6 +4170,10 @@ async def _attempt_idle_relift() -> None:
                     _startup_fabric_owed_since = None
                     _log("running the startup fabric pass a missing prerequisite deferred")
             healthy, evidence = await fsm.observe(expected, _log, run_fabric=fabric, recovery=galaxy_recovery)
+            if not healthy or (fabric and (evidence.get("fabric") or {}).get("ok") is not True):
+                # Spec 04 I76: a full check after the bound's ladder that ends with no pass hands the
+                # hold to the host rung on the next sampler tick, not at the end of the check bound.
+                _note_hold_bound_check_failed(_log)
             if not healthy:
                 # A chip is still off the bus: read-only there is nothing left to re-verify, and an
                 # idle box has no next-job gate to run the gone-chip recovery cascade, so left here
@@ -4417,6 +4421,7 @@ async def _attempt_down_offbus_recheck() -> None:
             )
             ok, evidence = await _offbus_return_full_gate(expected, _log)
             if not ok:
+                _note_hold_bound_check_failed(_log)  # spec 04 I76: the host rung on the next tick
                 return
             # Re-assert after the long awaits: the sampler's dead-chip mark is lock-free.
             now_episode = (fsm.record.since, fsm.record.why, fsm.record.detail, fsm.record.dirty)
@@ -6683,10 +6688,15 @@ async def _force_escalate_stuck_hold() -> None:
             return
         # Spec 04 I76: a bound ladder that left the mesh unrecovered (its rungs failed, or its post-reset
         # sweep could not get a fabric verdict) goes on to the host rung now, unless the ladder already
-        # asked for one. A ladder that brought the mesh back owes the full health check; the watchdog
-        # fires the host rung if that check has not released the hold within _HOLD_BOUND_CHECK_SEC.
-        if bound and outcome != OUTCOME_RECOVERED and _recovery_degraded() and not _host_action_blocks_escalation():
-            await _hold_bound_host_rung(_hold_age_now(), log)
+        # asked for one. So does a ladder whose rung came back but whose own full check after the reset,
+        # fabric included, ended with no pass: the hold still stands, and waiting adds nothing. Only a
+        # check still waiting on the 1G hugepage pool keeps its _HOLD_BOUND_CHECK_SEC, which the watchdog
+        # bounds.
+        if bound and _recovery_degraded() and not _host_action_blocks_escalation():
+            if outcome == OUTCOME_RECOVERED:
+                _note_hold_bound_check_failed(log)
+            if outcome != OUTCOME_RECOVERED or _hold_bound_cycle_due(_hold_age_now()):
+                await _hold_bound_host_rung(_hold_age_now(), log)
 
 
 # Spec 04 I76 — the 10-min hold bound. The hold age at which this episode's last forced ladder finished
@@ -6695,9 +6705,12 @@ _hold_bound_episode: str = ""
 _hold_bound_ladder_age: Optional[float] = None
 _hold_bound_ladder_recovered: bool = False
 _hold_bound_cycle_age: Optional[float] = None
+# The hold age at which a full check after the bound's ladder ended with no pass (spec 04 I76).
+_hold_bound_check_failed_age: Optional[float] = None
 _hold_bound_unarmed_paged: str = ""
-# How long the full health check (fabric included) may take after a bound ladder brought the mesh back
-# before the host rung fires anyway: a fabric traffic pass plus its retries fit well inside it.
+# The upper bound on a full health check (fabric included) after a bound ladder brought the mesh back
+# that is still running, hangs or waits on the hugepage pool: past it the host rung fires anyway. A
+# check that ends with no pass does not wait it out; the host rung fires then.
 _HOLD_BOUND_CHECK_SEC = 300
 
 
@@ -6712,9 +6725,10 @@ def _hold_age_now(now: Optional[datetime] = None) -> float:
 def _hold_bound_sync() -> None:
     """Drop the bound's bookkeeping once it belongs to an episode that is no longer open."""
     global _hold_bound_episode, _hold_bound_ladder_age, _hold_bound_cycle_age, _hold_bound_ladder_recovered
+    global _hold_bound_check_failed_age
     if _hold_bound_episode != device_hold_episode_since:
         _hold_bound_episode = device_hold_episode_since
-        _hold_bound_ladder_age = _hold_bound_cycle_age = None
+        _hold_bound_ladder_age = _hold_bound_cycle_age = _hold_bound_check_failed_age = None
         _hold_bound_ladder_recovered = False
 
 
@@ -6727,7 +6741,8 @@ def _note_hold_bound_ladder(age: float, outcome: str) -> None:
 
 def _hold_bound_check_pending(age: float) -> bool:
     """True while the full health check after a bound ladder that brought the mesh back still has its
-    _HOLD_BOUND_CHECK_SEC: no other run in that window starts a ladder or the host rung over it."""
+    _HOLD_BOUND_CHECK_SEC and has not ended with no pass: no other run in that window starts a ladder
+    or the host rung over it."""
     _hold_bound_sync()
     lad = _hold_bound_ladder_age
     return (
@@ -6736,7 +6751,28 @@ def _hold_bound_check_pending(age: float) -> bool:
         and lad >= _stuck_hold_ceiling_sec()
         and age < lad + _HOLD_BOUND_CHECK_SEC
         and (_hold_bound_cycle_age is None or _hold_bound_cycle_age < lad)
+        and (_hold_bound_check_failed_age is None or _hold_bound_check_failed_age < lad)
     )
+
+
+def _note_hold_bound_check_failed(log) -> bool:
+    """A full health check after the bound's ladder ended with no pass (a failed verdict, or a fabric
+    pass that could not run for any cause but a hugepage pool still filling): the host rung is due now,
+    not at the end of _HOLD_BOUND_CHECK_SEC (spec 04 I76). A no-op unless such a check is pending.
+    Returns whether it recorded one."""
+    global _hold_bound_check_failed_age
+    age = _hold_age_now()
+    if not _hold_bound_check_pending(age) or _last_77_was_hugepages():
+        return False
+    _hold_bound_check_failed_age = age
+    health_event(
+        "hold_bound_check_failed",
+        held_age_sec=int(age),
+        ladder_age_sec=int(_hold_bound_ladder_age or 0),
+        held_since=device_hold_episode_since,
+    )
+    log("10-min hold bound: the full check after the ladder ended with no pass — the host rung is next")
+    return True
 
 
 def _hold_bound_ladder_in_last_window(age: float) -> bool:
@@ -6761,11 +6797,14 @@ def _hold_bound_cycle_next(kind: str, age: float) -> bool:
 
 
 def _hold_bound_cycle_due(age: float) -> bool:
-    """True once a bound ladder brought the mesh back but the hold still stands _HOLD_BOUND_CHECK_SEC
-    later, and no host rung was asked since that ladder."""
+    """True once a bound ladder brought the mesh back but its full check ended with no pass, or the
+    hold still stands _HOLD_BOUND_CHECK_SEC later, and no host rung was asked since that ladder."""
     _hold_bound_sync()
     lad = _hold_bound_ladder_age
-    if lad is None or lad < _stuck_hold_ceiling_sec() or age < lad + _HOLD_BOUND_CHECK_SEC:
+    if lad is None or lad < _stuck_hold_ceiling_sec():
+        return False
+    failed = _hold_bound_check_failed_age is not None and _hold_bound_check_failed_age >= lad
+    if not failed and age < lad + _HOLD_BOUND_CHECK_SEC:
         return False
     return _hold_bound_cycle_age is None or _hold_bound_cycle_age < lad
 
@@ -7092,7 +7131,12 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         # Spec 04 I76: the bound ladder brought the mesh back but its full check has not released the
         # hold — the host rung now.
         device_hold_escalation_kind = "hold_bound_cycle"
-        device_hold_escalation_trigger = f"the {_HOLD_BOUND_CHECK_SEC}s post-ladder check bound"
+        device_hold_escalation_trigger = (
+            "the failed full check after the bound's ladder"
+            if _hold_bound_check_failed_age is not None
+            and _hold_bound_check_failed_age >= (_hold_bound_ladder_age or 0)
+            else f"the {_HOLD_BOUND_CHECK_SEC}s post-ladder check bound"
+        )
         _maybe_spawn_forced_escalation()
     elif only_77:
         pass

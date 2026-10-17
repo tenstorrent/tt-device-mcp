@@ -165,13 +165,14 @@ async def test_a_cooldown_denial_arms_the_retry_and_the_host_rung_fires_at_its_e
 
 
 @pytest.mark.asyncio
-async def test_a_recovered_ladder_with_fabric_debt_does_not_release_and_cycles_after_the_check_bound(
-    monkeypatch, clear_job_state
-):
+async def test_a_check_still_waiting_on_hugepages_is_bounded_by_the_check_window(monkeypatch, clear_job_state):
+    """A full check after the bound's ladder that has no verdict yet (a 77 while the 1G hugepage pool
+    fills, or a check that hangs) gets _HOLD_BOUND_CHECK_SEC, then the host rung."""
     escalations, _alerts, events = _arm_fabric_only_deadline_hold(
         monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
     )
     _watchdog(monkeypatch)
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: True)
 
     async def recovered_ladder(kind, indices, expected, log):
         escalations.append(kind)
@@ -207,11 +208,76 @@ async def test_another_run_inside_the_check_bound_does_not_cut_the_full_check_sh
         return OUTCOME_RECOVERED
 
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", recovered_ladder)
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: True)  # the check has no verdict yet
     monkeypatch.setattr(srv, "device_hold_escalation_kind", "ceiling_window")
     await srv._force_escalate_stuck_hold()
     monkeypatch.setattr(srv, "device_hold_escalation_kind", "progress_retry")
     await srv._force_escalate_stuck_hold()
     assert escalations == ["present-forced"] and "host_rung" not in events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold", ["77-only", "topology mismatch", "known fabric fault", "generic"])
+async def test_a_failed_check_after_the_bound_ladder_asks_for_the_host_rung_at_once(monkeypatch, clear_job_state, hold):
+    """The ladder brings the mesh back but its full check (fabric included) ends with no pass: the
+    host rung is asked in the same run, not 300 s later, so the hold ends well inside 15 min."""
+    why, detail, output, beats, _ladder = _KINDS[hold]
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why=why, detail=detail, fabric_output=output, beats=beats, age_min=BOUND / 60 + 0.05
+    )
+    _watchdog(monkeypatch)
+    monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: hold == "77-only")
+    if hold == "known fabric fault":
+        monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "known fabric fault: 2 jobs in a row")
+        monkeypatch.setattr(srv.health_monitor, "fabric_known_fault", "known fabric fault", raising=False)
+    if hold == "topology mismatch":
+        monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", "hardware fault: needs an operator")
+    ages = []
+
+    async def host_rung(age, log):
+        events.append("host_rung")
+        ages.append(srv._hold_age_now())
+
+    monkeypatch.setattr(srv, "_hold_bound_host_rung", host_rung)
+
+    async def recovered_ladder(kind, indices, expected, log):
+        escalations.append(kind)
+        return OUTCOME_RECOVERED  # chips back, the full check gave no pass: the hold stands
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", recovered_ladder)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == ["present-forced"], "the ladder runs at the bound"
+    assert srv._recovery_degraded(), "no release without a passing full check"
+    assert events.index("hold_bound_check_failed") < events.index("host_rung")
+    assert events.count("host_rung") == 1 and ages[0] < BOUND + 60 <= 15 * 60
+
+
+@pytest.mark.asyncio
+async def test_a_relift_that_fails_after_the_bound_ladder_cycles_on_the_next_tick(monkeypatch, clear_job_state):
+    """A check that was still waiting on hugepages after the ladder, then ends with no pass, asks for
+    the host rung on the next watchdog tick, not at the end of the check window."""
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
+    )
+    _watchdog(monkeypatch)
+    pending = {"hugepages": True}
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: pending["hugepages"])
+
+    async def recovered_ladder(kind, indices, expected, log):
+        escalations.append(kind)
+        return OUTCOME_RECOVERED
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", recovered_ladder)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert "host_rung" not in events and not srv._note_hold_bound_check_failed(lambda m: None)
+    pending["hugepages"] = False  # the relift's fabric pass ran and failed
+    assert srv._note_hold_bound_check_failed(lambda m: None)
+    srv._check_hold_deadline(now=datetime.now() + timedelta(seconds=10))  # one sampler tick
+    await _drain()
+    assert srv.device_hold_escalation_kind == "hold_bound_cycle"
+    assert events.count("host_rung") == 1 and escalations == ["present-forced"]
 
 
 def test_health_shows_the_bound(monkeypatch, clear_job_state):

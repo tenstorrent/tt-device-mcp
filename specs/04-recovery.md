@@ -927,10 +927,14 @@ each rung fires only when the gentler one failed or cannot apply.
   real verdict and only a pass releases (goal of I8/spec 03 I4); a job that fails the same way
   declares them again. Below the bound the faster class paths stay as they are. When the ladder
   leaves the mesh unrecovered, the broker's own code asks for the host rung at once: the BMC power
-  cycle, or the warm reboot where only that is opted in. When the ladder brings the mesh back, its
-  full check has 300 s (`_HOLD_BOUND_CHECK_SEC`) to release the hold; no other run in that window
-  starts a ladder or a host rung over it, and if the hold still stands at its end the watchdog asks
-  for the host rung (`hold_bound_cycle`). A later bound window whose last window already ran a
+  cycle, or the warm reboot where only that is opted in. When the ladder brings the mesh back, only its
+  full check, fabric included, releases the hold. A full check that ends with no pass (a failed
+  verdict, or a fabric pass that could not run for any cause but a 1G hugepage pool still filling)
+  asks for the host rung at once (event `hold_bound_check_failed`): inside the forced run when the
+  ladder's own check gave it, on the next sampler tick when a relift check did. 300 s
+  (`_HOLD_BOUND_CHECK_SEC`) bounds only a check that is still running, hangs or waits on hugepages;
+  no other run in that window starts a ladder or a host rung over it, and if the hold still stands
+  at its end the watchdog asks for the host rung (`hold_bound_cycle`). A later bound window whose last window already ran a
   ladder goes straight to the host rung. The governor still decides that rung: a readable tenant
   refuses it, a reset still cycling in its own scope defers it, and a cooldown, per-boot cap or
   backstop denial (I65, I9) arms the retry the watchdog fires the moment that wait ends. Only that
@@ -946,7 +950,8 @@ each rung fires only when the gentler one failed or cannot apply.
   alert's `escalation_deadline` all read it. A stuck-hold event past the bound reports `escalated`
   true once the bound ran a ladder or asked for the host rung. Time to the power-cycle request for a
   hold no class path heals (e.g. a topology-mismatch or 77-only hold, class D): at most 600 s +
-  the ladder + 300 s for the check, or 600 s + the ladder when it fails; then the cycle, the boot and
+  the ladder when the ladder or its full check fails (+ one 10 s sampler tick when a relift check
+  gave the verdict), or 600 s + the ladder + 300 s while the check hangs or waits on hugepages; then the cycle, the boot and
   the startup check. Bounds the about 70 min one Galaxy host sat in a latched topology-mismatch hold
   with no rung run.
 
@@ -1441,7 +1446,8 @@ sees a silent fabric pass.
 | I37/I65 class C at startup: one mesh reset with no failed reset or broker cycle; none after the broker's own cycle, which then waits only for the cooldown | `tests/test_power_cycle_cooldown.py::test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_gets_one_reset`, `::test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_reset`, `::test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not` |
 | I76 every hold kind (77-only, topology mismatch, known fabric fault, latched, generic) runs the full ladder at the 10-min bound, then the host rung; below the bound a no-reset hold keeps its fast path; a latched I42 hold escalates with its latch lifted | `tests/test_hold_bound.py::test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung`, `::test_below_the_bound_a_no_reset_hold_keeps_its_fast_path`, `::test_a_latched_i42_hold_still_escalates_and_its_latch_is_lifted`, `::test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_power_cycle` |
 | I76 a cooldown denial of the host rung arms the retry, which fires at the cooldown's end | `tests/test_hold_bound.py::test_a_cooldown_denial_arms_the_retry_and_the_host_rung_fires_at_its_end` |
-| I76 a recovered bound ladder with fabric debt does not release and cycles after the 300 s check bound; another run inside that bound does not cut the check short | `tests/test_hold_bound.py::test_a_recovered_ladder_with_fabric_debt_does_not_release_and_cycles_after_the_check_bound`, `::test_another_run_inside_the_check_bound_does_not_cut_the_full_check_short` |
+| I76 a bound ladder that brings the mesh back but whose full check ends with no pass (77-only, topology mismatch / I42 latch, known fabric fault, generic) does not release and asks for the host rung in the same run; a relift check that fails after the ladder asks for it on the next tick | `tests/test_hold_bound.py::test_a_failed_check_after_the_bound_ladder_asks_for_the_host_rung_at_once`, `::test_a_relift_that_fails_after_the_bound_ladder_cycles_on_the_next_tick` |
+| I76 a check still waiting on hugepages (or hanging) after the bound ladder gets the 300 s check bound, then the host rung; another run inside that bound does not cut the check short | `tests/test_hold_bound.py::test_a_check_still_waiting_on_hugepages_is_bounded_by_the_check_window`, `::test_another_run_inside_the_check_bound_does_not_cut_the_full_check_short` |
 | I76 /health shows the bound; the env shortens it, never lengthens it; a stuck-hold event past the bound never reads `escalated` false | `tests/test_hold_bound.py::test_health_shows_the_bound`, `::test_env_shortens_the_bound_never_lengthens_it`, `::test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false` |
 | I76 the latch set by a fabric failure of the first job after a topology-mismatch lift: at the bound (watchdog window or tenant-hold bound) the full ladder runs, the full check with fabric still fails, the broker asks for the power cycle | `tests/test_hold_bound.py::test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_check_and_power_cycle` |
 | I76 every hold kind's escalation deadline is start + bound, or a running power-cycle cooldown's end when later; /health, the stuck-hold event and the alert read the one helper | `tests/test_hold_bound.py::test_every_hold_kind_reports_one_escalation_deadline` |
