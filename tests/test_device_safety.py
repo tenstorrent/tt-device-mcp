@@ -1787,11 +1787,28 @@ def test_reboot_row_dedups_even_when_the_kernel_boot_id_is_unreadable(monkeypatc
         return real_read_text(self, *a, **k)
 
     monkeypatch.setattr(srv.Path, "read_text", read_text_no_boot_id)
+    monkeypatch.setattr(srv, "_boot_btime_id", lambda: "1760000000")  # not the real, NTP-steppable clock
 
     srv._record_previous_boot_error()
     srv._record_previous_boot_error()
 
     assert len(_reboot_rows(tmp_path)) == 1
+
+
+@pytest.mark.parametrize("second_btime, rows", [("1760000002", 1), ("1759999998", 1), ("1760000003", 2)])
+def test_reboot_row_dedup_tolerates_btime_jitter_but_not_a_real_reboot(monkeypatch, tmp_path, second_btime, rows):
+    """btime steps by a second or two while NTP syncs after boot: that is still one boot (one row);
+    a btime 3 s or more away is a different boot."""
+    _boot_recording(monkeypatch, tmp_path, {"present": False})
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "")
+    current = ["1760000000"]
+    monkeypatch.setattr(srv, "_boot_btime_id", lambda: current[0])
+
+    srv._record_previous_boot_error()
+    current[0] = second_btime
+    srv._record_previous_boot_error()
+
+    assert len(_reboot_rows(tmp_path)) == rows
 
 
 def test_reboot_row_maps_fault_class_and_status():

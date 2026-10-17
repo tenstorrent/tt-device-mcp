@@ -4881,6 +4881,26 @@ def _consume_pre_down_escalation_row(action: str) -> None:
             return
 
 
+BTIME_JITTER_SEC = 2
+
+
+def _btime_marker_within_jitter(btime_key: str) -> bool:
+    """True if a per-boot marker keyed on a btime within BTIME_JITTER_SEC of this one exists.
+    btime is now minus uptime, so it can step a second or two while NTP syncs the clock after
+    boot; the same boot must not record a second reboot row for that."""
+    try:
+        now = float(btime_key)
+        for p in health_dir().glob(".boot_recorded_*"):
+            try:
+                if abs(float(p.name.removeprefix(".boot_recorded_")) - now) <= BTIME_JITTER_SEC:
+                    return True
+            except ValueError:
+                continue  # a kernel boot_id (uuid) marker, not a btime one
+    except (ValueError, OSError):
+        pass
+    return False
+
+
 def _record_previous_boot_error() -> None:
     """Journal the firmware's account of the last crash, once per boot.
 
@@ -4897,7 +4917,7 @@ def _record_previous_boot_error() -> None:
     # mark_boot below — those need the kernel id and fail closed without it.
     boot_key = boot_id or _boot_btime_id()
     marker = health_dir() / f".boot_recorded_{boot_key or 'unknown'}"
-    if boot_key and marker.exists():
+    if boot_key and (marker.exists() or (not boot_id and _btime_marker_within_jitter(boot_key))):
         return
 
     rec = previous_boot_error()
