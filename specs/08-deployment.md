@@ -547,3 +547,5 @@ reconcile steps 1–5 other than stray detection (revive predicate, socket perms
 lock drift, log aging, per-user wiring cadence); the validator build flow and atomic flip
 (`install-fabric-validator.sh`); the crash-recorder installer and `tt-crash-recorder.py`
 capture logic; login-heal; client-setup's config-file writes; timer schedules (unit files).
+
+  A successful apply appends one `autoupdate_apply` line (`from_sha`, `to_sha`, `idle`, `drained_s`, plus the usual `ts`/`iso`) to `health_events.jsonl`; a failed write only warns.

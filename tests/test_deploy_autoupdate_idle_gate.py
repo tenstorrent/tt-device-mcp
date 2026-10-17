@@ -453,3 +453,36 @@ def test_a_stopped_broker_has_no_children_to_count(tmp_path):
     running.mkdir()
     done, _, _ = _gate(running, stand_ins=init_kids, scopes="ttdev-job-1.scope loaded active running", job_age=1600)
     assert "draining" in done.stderr and "children=2" in done.stderr, done.stderr
+
+
+# --- the autoupdate_apply event: a restart the update caused, traceable from the journal ----------
+
+
+def _apply_event(tmp_path, health_dir, idle="true", drained_s=0):
+    text = _SCRIPT.read_text()
+    block = text[text.index("# One line in the broker's event journal") :]
+    script = f"set -u\ninstalled_sha=old111; remote_sha=new222; idle={idle}; drained_s={drained_s}\n" + block
+    env = {"PATH": "/usr/bin:/bin", "TTDEV_HEALTH_DIR": str(health_dir)}
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
+
+
+def test_apply_appends_one_autoupdate_apply_event_in_the_broker_schema(tmp_path):
+    import json
+
+    health = tmp_path / "health"
+    health.mkdir()
+    (health / "health_events.jsonl").write_text('{"kind": "x"}\n')
+    done = _apply_event(tmp_path, health, idle="false", drained_s=37)
+    assert done.returncode == 0, done.stderr
+    lines = (health / "health_events.jsonl").read_text().splitlines()
+    assert len(lines) == 2
+    rec = json.loads(lines[1])
+    assert rec["kind"] == "autoupdate_apply"
+    assert (rec["from_sha"], rec["to_sha"], rec["idle"], rec["drained_s"]) == ("old111", "new222", False, 37)
+    assert isinstance(rec["ts"], float) and rec["iso"].endswith("Z") and len(rec["iso"]) == 20
+
+
+def test_a_failed_event_write_only_warns(tmp_path):
+    done = _apply_event(tmp_path, tmp_path / "missing")
+    assert done.returncode == 0
+    assert "warning: could not append autoupdate_apply" in done.stderr
