@@ -19,6 +19,8 @@ from tests.test_classac_power_cycle_direct import EXPECTED, rig  # noqa: F401 - 
 from tests.test_device_safety import _arm_fabric_only_deadline_hold
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
+from tt_device_mcp.health import monitor as monitor_mod
+from tt_device_mcp.health.monitors import fabric
 from tt_device_mcp.health.recovery import OUTCOME_RECOVERED, OUTCOME_TERMINAL, galaxy
 from tt_device_mcp.job_reap import ReapedLeftover
 
@@ -451,10 +453,15 @@ async def test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("post_check", ["fails", "discovered_links_pass"])
 @pytest.mark.parametrize("driver", ["watchdog", "tenant_hold_bound"])
 async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_check_and_power_cycle(
-    rig, monkeypatch, clear_job_state, driver  # noqa: F811
+    rig, monkeypatch, clear_job_state, driver, post_check, tmp_path  # noqa: F811
 ):
+    """``discovered_links_pass``: the moved tray's check after the bound ladder passes on the discovered
+    links again, through the monitor's real fabric verdict. The lift that latch came from failed its job,
+    so that pass is no pass (spec 03 I42): no release (which would fail the next job, latch again and hold
+    another 10 min), and the power cycle follows."""
     order, g = rig["order"], rig["g"]
     mon = srv.health_monitor
     rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
@@ -488,13 +495,35 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
         order.append("glx_reset")
         ok, _ = await g._verify_device(EXPECTED, log, run_fabric=True)
         checks.append(ok)
-        return False
+        return ok
 
     async def full_check(expected, log, run_fabric=True, **k):
         assert run_fabric, "the post-reset check includes the fabric (goal 8)"
         assert not mon.topology_hw_fault, "the latch is lifted, so the fabric pass really runs"
-        return False, {"fabric": {"ok": False, "detail": MISMATCH}}
+        if post_check == "fails":
+            return False, {"fabric": {"ok": False, "detail": MISMATCH}}
+        ok, detail = await mon._verify_fabric_health_body(60)
+        return ok is True, {"fabric": {"ok": ok, "detail": detail}}
 
+    if post_check == "discovered_links_pass":
+        # The descriptor run mismatches; the traffic-only rerun passes on the links it found.
+        desc = "/desc.textproto"
+
+        async def fabric_run(argv, env, **kw):
+            return (134, MISMATCH) if "--cabling-descriptor-path" in argv else (0, "all links ok\n")
+
+        def build_command(descriptor=True):
+            return ["run_cluster_validation"] + (["--cabling-descriptor-path", desc] if descriptor else []), {}
+
+        monkeypatch.setattr(mon, "_fabric_check_cmd", lambda: "")
+        monkeypatch.setattr(mon, "_begin_action_row", lambda *a, **k: None)
+        monkeypatch.setattr(mon, "_write_action_log", lambda *a, **k: None)
+        monkeypatch.setattr(fabric, "build_command", build_command)
+        monkeypatch.setattr(fabric, "check", fabric_run)
+        monkeypatch.setattr(fabric, "_validator_paths", lambda: ("bin", "root", desc))
+        monkeypatch.setattr(monitor_mod, "health_dir", lambda: tmp_path)
+        monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0xC1})
+        monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: None)
     monkeypatch.setattr(g, "_reset_and_verify_device", reset_then_full_check)
     monkeypatch.setattr(g, "_verify_device", full_check)
     rig_cycle = srv._auto_power_cycle_host
