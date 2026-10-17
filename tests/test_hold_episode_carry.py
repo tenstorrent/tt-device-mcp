@@ -426,7 +426,9 @@ async def test_replay_a_restart_whose_startup_check_releases_then_a_failed_first
 
 
 @pytest.mark.asyncio
-async def test_replay_a_restart_whose_real_startup_gate_releases_keeps_the_carry(monkeypatch, tmp_path, clear_job_state):
+async def test_replay_a_restart_whose_real_startup_gate_releases_keeps_the_carry(
+    monkeypatch, tmp_path, clear_job_state
+):
     """The 09:02 replay through the real startup gate: its full check releases the hold the dead broker left
     open and saves the carry; the same pass must not end it. Fails on eb54d67: the gate's own full-check
     drop ended that carry, so the first job's re-hold was seconds old and the host rung never due."""
