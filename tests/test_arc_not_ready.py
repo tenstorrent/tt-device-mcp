@@ -257,3 +257,21 @@ def test_dropping_a_returned_chip_never_clears_the_hold(monkeypatch, tmp_path, c
     assert srv.isolated_chips == set()
     assert (srv.fsm.state, srv.fsm.record.since, srv.fsm.record.why) == before
     assert srv._health_payload()["held"] is True
+
+
+def test_unreadable_on_bus_chips_names_bound_eio_chips_only(monkeypatch, tmp_path):
+    """A bound, enumerated chip whose heartbeat read fails with EIO is on the bus (unhealthy) for the
+    class A read; ENODATA has its own path, and a missing or unbound chip stays off the bus."""
+    _fake_sysfs(monkeypatch, tmp_path, missing={8}, unbound={9}, enodata={10}, eio={9, 11, 12})
+    assert heartbeat.unreadable_on_bus_chips({8, 9, 10, 11, "12", 13}) == {"11", "12"}
+    assert heartbeat.unreadable_on_bus_chips(set()) == set()
+
+
+def test_eio_chips_still_count_off_the_bus_for_the_rungs(monkeypatch, tmp_path):
+    """Pins the current count: only the class A read takes EIO chips as on the bus; every rung, floor
+    and the /health off_bus field still count them off (spec 04 I24 is unchanged)."""
+    _fake_sysfs(monkeypatch, tmp_path, eio={3, 4})
+    beats = heartbeat.read_heartbeats()
+    assert heartbeat.offbus_chip_ids(beats, EXPECTED) == {"3", "4"}
+    assert heartbeat.offbus_count(beats, EXPECTED) == 2
+

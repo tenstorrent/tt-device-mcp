@@ -453,7 +453,8 @@ def _present(groups: dict) -> dict:
 
 def test_whole_trays_absent_reads_class_a_from_bus_presence_alone():
     def absent(groups, off, expected=EXPECTED, tray_groups=GROUPS):
-        return galaxy._whole_trays_absent(_present(groups), expected, off, tray_groups)
+        present = _present(groups)
+        return galaxy._whole_trays_absent(present, expected, set(range(len(present), len(present) + off)), tray_groups)
 
     assert absent({0x00: 8, 0x40: 8, 0x80: 8}, 8), "one tray (0xC0) with no chip on the bus"
     assert absent({0x40: 8}, 24), "three trays off, one still on"
@@ -462,9 +463,19 @@ def test_whole_trays_absent_reads_class_a_from_bus_presence_alone():
     assert not absent({0x00: 8, 0x40: 8, 0x80: 8, 0xC0: 8}, 8), "every tray full: off-bus chips unexplained"
     assert not absent({0x00: 8, 0x40: 8, 0x80: 8}, 8, tray_groups=()), "no tt-smi tables, no class"
     assert not absent({0x00: 8, 0x40: 8, 0x80: 8}, 8, expected=24), "not a four-tray host"
-    assert not galaxy._whole_trays_absent({0: 0x01, 1: 0x21}, EXPECTED, 30, GROUPS), "a bus in no known group"
-    assert not galaxy._whole_trays_absent({}, EXPECTED, 32, GROUPS), "no chip on the bus is class C's, not A's"
-    assert not galaxy._whole_trays_absent({0: None}, EXPECTED, 31, GROUPS)
+    assert not galaxy._whole_trays_absent({0: 0x01, 1: 0x21}, EXPECTED, set(range(2, 32)), GROUPS), "unknown group"
+    assert not galaxy._whole_trays_absent({}, EXPECTED, set(range(32)), GROUPS), "no chip on the bus is class C's"
+    assert not galaxy._whole_trays_absent({0: None}, EXPECTED, set(range(1, 32)), GROUPS)
+
+
+def test_whole_trays_absent_needs_the_off_bus_ids_to_be_the_missing_ones():
+    """Review #1040 (a): matching counts are not enough. A heartbeat read and a sysfs read that raced
+    can name different chips; the presence read then says nothing and the ladder decides."""
+    present = _present({0x00: 8, 0x40: 8, 0x80: 8})  # chips 0-23 on the bus
+    assert galaxy._whole_trays_absent(present, EXPECTED, {str(i) for i in range(24, 32)}, GROUPS)
+    raced = {str(i) for i in range(23, 31)}  # 8 ids, but 23 is present and 31 is not named
+    assert not galaxy._whole_trays_absent(present, EXPECTED, raced, GROUPS)
+    assert galaxy._absent_tray_groups(present, EXPECTED, set(range(24, 32)), GROUPS) == [0xC0]
 
 
 def test_the_class_reads_presence_only_with_no_map():
