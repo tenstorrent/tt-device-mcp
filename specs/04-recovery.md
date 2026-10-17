@@ -648,9 +648,8 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I30 — The deadline escalation never resets a fabric-only present mesh.** Past the escalation
   ceiling, when the fresh heartbeat read shows every expected chip present with a live ARC
   heartbeat, no chip is isolated, and the hold names only the fabric — a topology mismatch (the
-  hold's detail or reason starts `topology mismatch`, names the hardware fault of the first job
-  after a topology-mismatch lift, or a fabric-unverified hold's last pass printed the validator's
-  `Connection mismatch detected`), or a fabric pass that could not run (a 77) with no runtime fault
+  hold's detail or reason starts `topology mismatch`, or a fabric-unverified hold's last pass
+  printed the validator's `Connection mismatch detected`), or a fabric pass that could not run (a 77) with no runtime fault
   reported and no pass that measured the fabric bad — the forced escalation runs no galaxy reset
   and no ladder rung. It holds, journals `hold_deadline_no_reset` and sends the alert hook once per
   episode; later ceiling windows stay quiet. A reset cannot fix cabling or a missing verdict, and
@@ -659,7 +658,10 @@ each rung fires only when the gentler one failed or cannot apply.
   fabric keeps the ladder. A known fabric fault (spec 03 I46) on a fabric-unverified hold is held the
   same way (`known fabric fault`), even when an older pass measured the fabric bad. A hold or pass
   that names the wrapper's `dispatch FAILED on a green fabric` is a measured fault, never a topology
-  mismatch, even when the descriptor run before it printed `Connection mismatch detected`.
+  mismatch, even when the descriptor run before it printed `Connection mismatch detected`. Nor is
+  a pass that found descriptor ports missing (spec 03 I71), nor any hold while the spec 03 I42
+  first-job latch stands: that job measured the fault, so the mismatch line the lift left in the
+  last fabric output names no cabling-only hold, and the forced window runs the ladder.
 
 - **I31 — A galaxy reset that regressed an off-bus mesh is not repeated in that hold episode.**
   When a galaxy reset leaves more chips off the bus than before it (`reset_regressed_offbus`, on the
@@ -1355,6 +1357,7 @@ sees a silent fabric pass.
 | I29 one unverified reset per 77-only episode; next escalation sweeps once, strict on 77, climbs only on a measured failure, a sweep still reading 77 holds and pages once | `tests/test_device_safety.py::test_a_reset_that_leaves_the_fabric_unverified_counts_toward_the_relift_bound`, `tests/test_device_safety.py::test_a_second_escalation_after_an_unverified_reset_sweeps_instead_of_resetting`, `tests/test_device_safety.py::test_an_incomplete_sweep_after_an_unverified_reset_does_not_climb`, `tests/test_device_safety.py::test_a_sweep_verify_that_reads_77_is_not_a_release`, `tests/test_device_safety.py::test_a_sweep_that_still_reads_77_holds_and_pages_once_instead_of_climbing` |
 | I30 deadline escalation holds a fabric-only present mesh without a reset; real faults keep the ladder | `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_fabric_only_present_mesh_without_a_reset`, `tests/test_device_safety.py::test_the_deadline_escalation_keeps_the_ladder_for_real_faults`, `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset`, `tests/test_device_safety.py::test_the_deadline_escalation_climbs_a_present_mesh_eth_frozen_self_heal_hold` |
 | I30 a dispatch-failure hold is never classed a topology mismatch | `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
+| I30 a lost-link hold or a hold under the spec 03 I42 latch is never a no-reset hold; the forced window runs the ladder | `tests/test_fabric_links_missing.py::test_a_links_missing_hold_is_not_a_no_reset_topology_hold`, `tests/test_fabric_links_missing.py::test_a_latched_hold_no_relift_reset_reaches_takes_the_ladder_at_the_ceiling` |
 | I28 a uid-0 broker poller never blocks the reset; pollers stop and restart around it | `tests/test_dispatch_failure_reset.py::test_a_uid0_telemetry_holder_does_not_block_the_reset` |
 | I31 a regressed galaxy reset is not repeated in its hold episode; climb or page instead | `tests/test_device_safety.py::test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset`, `tests/test_device_safety.py::test_forced_offbus_ladder_after_a_regression_sweeps_then_power_cycles_when_opted_in`, `tests/test_device_safety.py::test_an_early_regression_is_latched_before_the_ceiling_deferral`, `tests/test_device_safety.py::test_a_new_hold_episode_resets_again_after_a_regression`, `tests/test_device_safety.py::test_gate_skips_a_repeat_galaxy_reset_after_a_regression`, `tests/test_device_safety.py::test_gate_latches_a_regression_seen_before_any_hold` |
 | I32 every reset path releases only after a passing fabric pass: the debt settles only on a healthy verdict, the funnel holds fabric-unverified, exemptions | `tests/test_post_reset_gate.py::test_the_debt_settles_only_on_a_healthy_fabric_verdict`, `::test_a_single_chip_or_a_host_with_no_fabric_check_is_exempt`, `::test_a_verified_release_after_a_reset_holds_fabric_unverified`, `::test_no_debt_releases_as_before` |

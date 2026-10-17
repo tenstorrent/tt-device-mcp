@@ -3834,9 +3834,10 @@ def _env_int(name: str, default: int, floor: int) -> int:
         return default
 
 
-# The hardware fault the first job after a topology-mismatch lift names is a hold no fallback release
-# may lift: that job proved the links the traffic-only pass skipped are needed, and enum+ARC and the
-# eth read cannot see them. It stays outside the I40 budget and release. A topology mismatch whose
+# The hardware fault the first job after a topology-mismatch lift names (the I42 latch) is a hold no
+# fallback release may lift: that job proved the links the traffic-only pass skipped are needed, and
+# enum+ARC and the eth read cannot see them. It is a measured fault, never a no-reset topology hold:
+# it takes the ladder, and only a full post-reset pass releases it. A topology mismatch whose
 # traffic-only rerun could not run is inside the bound (I45): its eth read is judged against the
 # link mark re-baselined for this chip-to-bus map, and a release is watched like a lift.
 _TOPOLOGY_HOLD = "topology mismatch"
@@ -3921,10 +3922,14 @@ def _fabric_no_reset_hold() -> str:
     validator's mismatch line) is cabling that differs from the descriptor; a fabric pass that could
     not run (a 77) with no fault measured or reported is a missing verdict. The caller has already
     read every chip present with a live ARC heartbeat, so a reset has nothing to fix in either case.
-    A measured-bad fabric or a runtime-reported fault is not this: those keep the ladder."""
+    A measured-bad fabric or a runtime-reported fault is not this: those keep the ladder. Nor is the
+    I42 latch: its first job measured the fault, so a mismatch line the lift left in the last
+    fabric output names no cabling-only hold, and the 10-min watchdog runs the reset."""
     fabric_hold = fsm.record.why == FABRIC_RELIFT_WHY
     if fabric_hold and not device_fault_reported and health_monitor.known_fabric_fault():
         return "known fabric fault"
+    if health_monitor.topology_hw_fault:
+        return ""
     if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
         return "topology mismatch"
     if fabric_hold and _validator_line_names_topology(health_monitor.last_fabric_output or ""):
