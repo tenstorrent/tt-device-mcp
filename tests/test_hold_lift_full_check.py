@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """Spec 03 I78: no hold lifts unless the full health check, fabric included, has just passed.
 
 Every lift path is driven with a stubbed check that passes, fails, or finds a link the cabling expects
