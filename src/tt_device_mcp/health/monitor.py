@@ -552,9 +552,14 @@ class HealthMonitor:
             if log:
                 log(f"eth-heartbeat: {'SKIPPED' if eok is None else ('OK' if eok else 'FROZEN')} — {edetail}")
             _record("eth_heartbeat", eok, edetail)
-            # A link-drop skip is a standing condition, not a stuck read: rate-limit its pass.
+            # A link-drop skip is a standing condition, not a stuck read: rate-limit its pass. Only a
+            # recent PASSING pass covers it: a failed or unknown last verdict is no cover (03 I30).
             link_drop_held = (
-                not fabric_asked and eok is None and edetail.startswith(ETH_LINK_DROP_SKIP) and not fabric_stale
+                not fabric_asked
+                and eok is None
+                and edetail.startswith(ETH_LINK_DROP_SKIP)
+                and not fabric_stale
+                and self.last_fabric_ok is True
             )
             # Spec 03 I61: a timed-out read on a present mesh goes straight to the gate's one
             # present-mesh reset. The pass here failed or skipped after every such timeout measured.
@@ -562,7 +567,9 @@ class HealthMonitor:
                 eth_timeout_reset and not fabric_asked and eok is None and eth_read_timed_out(edetail) and hp_ok is True
             )
             if link_drop_held and log:
-                log("eth links unverified after a clean exit — a recent fabric pass covers it, not repeating it")
+                log(
+                    "eth links unverified after a clean exit — a recent passing fabric pass covers it, not repeating it"
+                )
             elif reset_due and log:
                 log(
                     "eth-heartbeat read timed out after a clean exit on a present mesh — skipping the "

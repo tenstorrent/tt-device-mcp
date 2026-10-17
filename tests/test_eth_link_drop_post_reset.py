@@ -168,3 +168,44 @@ async def test_the_same_sequence_with_no_missing_port_releases(replay, links_aft
     assert srv.fsm.state is ServerState.HEALTHY, "a passing full post-reset check releases"
     assert not srv._device_unavailable_for_tenant()
     assert _mark(replay) == HIGH_WATER and "eth_link_rebaselined" not in _mon_events(replay)
+
+
+async def _no_reset_hold_then_second_gate(st):
+    """A crashed job's post-job gate runs the full check (no reset yet, so no fabric debt) and its
+    fabric pass decides; then a second post-job gate inside FABRIC_CHECK_MIN_INTERVAL_SEC, whose eth
+    read takes the link-count-drop skip again."""
+    fsm_dirty(srv, "job 7 crashed: could not find any forwarding direction", why="job_killed")
+    await etr._gate()
+    assert st["resets"] == [] and not FABRIC_DEBT.owed, "no reset, so no fabric debt"
+    first = len(st["fabric_out"])
+    st["log"].said.clear()
+    await etr._gate()
+    said = st["log"].text()
+    assert f"eth-heartbeat: SKIPPED — {ETH_LINK_DROP_SKIP}: {LEFT} of {HIGH_WATER}" in said
+    return first, said
+
+
+@pytest.mark.asyncio
+async def test_a_failed_fabric_pass_is_never_cover_for_a_link_drop_skip(replay):
+    """03 I30/I71: the link-drop skip's rate limit leans on a recent PASSING fabric pass only. A hold
+    on a missing port with no reset yet failed its fabric pass; a second post-job gate inside the
+    1200 s window must run the pass again (and fail on the same port) rather than release on the
+    strength of the failed one."""
+    first, said = await _no_reset_hold_then_second_gate(replay)
+    assert "a recent passing fabric pass covers it" not in said, "a failed pass was taken as cover"
+    assert len(replay["fabric_out"]) > first and replay["fabric_out"][first][1:] == (True, True)
+    assert _LOST_PORT in said and srv.health_monitor.last_fabric_ok is False
+    assert srv.fsm.state is not ServerState.HEALTHY and srv._device_unavailable_for_tenant()
+    assert "device_released" not in replay["events"]
+
+
+@pytest.mark.asyncio
+async def test_a_passing_fabric_pass_still_covers_a_link_drop_skip(replay):
+    """Control: with every port present the first gate's fabric pass is green and releases; the
+    second gate inside the window takes that green pass as cover (no second pass) and releases."""
+    replay["lost"] = False
+    first, said = await _no_reset_hold_then_second_gate(replay)
+    assert "a recent passing fabric pass covers it" in said
+    assert len(replay["fabric_out"]) == first, "a fresh green pass is not repeated"
+    assert srv.health_monitor.last_fabric_ok is True
+    assert srv.fsm.state is ServerState.HEALTHY and not srv._device_unavailable_for_tenant()
