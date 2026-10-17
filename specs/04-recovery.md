@@ -1076,6 +1076,29 @@ each rung fires only when the gentler one failed or cannot apply.
   waits only on a running boot / post-power-cycle cooldown (I65) and fires as it ends. Bounds the about 70 min one Galaxy host sat in a latched topology-mismatch hold
   with no rung run.
 
+- **I82 — A release followed by a quick re-hold does not restart the 10-min clock.** The I76
+  bound counts from the first moment the device stopped being healthy in the episode. A release
+  (a latch lift, a relift check, the bound ladder's own check, a startup check after a broker
+  restart) that a new hold follows within `_HOLD_CARRY_SEC` (300 s), or before
+  `_HOLD_CARRY_SEC` after the end of the first job started in that window, continues the episode:
+  the new hold keeps the released hold's `held_since` and the bound's ladder state, whatever its
+  class or latch (a re-latch, a failed first job, a class change). A bound ladder whose check
+  released a device that is held again did not heal it, so it counts as a failed check: the host
+  rung is due at once (`hold_bound_carried`, `host_rung_due` true), not after another ladder; the
+  I65 boot / post-power-cycle cooldown still applies and the rung fires as it ends. The carry
+  (`hold_carry.json`) and the bound ladder's age (in the episode record) are on disk, so a broker
+  restart keeps them: a hold the last broker left open escalates no later than its own start +
+  600 s (at once when that is past), and a hold that one past its bound ladder goes to the host
+  rung; only a hold whose start is unknown counts from the restart. The carry never crosses a
+  reboot or power cycle (the boot id must match): a cycle ends the episode, and the startup check
+  after hugepages gates release as before (spec 03). A re-hold after the window with no job, or
+  around a job started after it, is a new episode. At most one power-cycle request per episode
+  (I76, I65). Time to the power-cycle request for a hold whose bound ladder releases and whose
+  first job then fails on the same fault (on one Galaxy host on 2026-10-17, a missing-port hold
+  looped ladder, release, failed job, new hold, about every 13 min for about 4 h): was open-ended,
+  now max(start + 600 s + the ladder, cooldown end) + one sampler tick after the re-hold. The
+  full health check, fabric included, still runs after every reset and gates every release.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -1581,6 +1604,8 @@ sees a silent fabric pass.
 | I76 a forced run below the bound (off-bus one-shot) is not the bound's ladder: at the bound the full ladder runs again, then the host rung | `tests/test_hold_bound.py::test_a_ladder_below_the_bound_does_not_stand_in_for_the_bounds_ladder` |
 | I76 a host rung or bound ladder a reset scope defers fires on the first sampler tick after the scope ends; a retry-less denial is asked again each tick and journaled once | `tests/test_hold_bound.py::test_a_host_rung_deferred_by_a_reset_scope_fires_on_the_first_tick_after_it`, `tests/test_hold_bound.py::test_a_bound_ladder_deferred_by_a_reset_scope_runs_on_the_first_tick_after_it`, `tests/test_hold_bound.py::test_an_offbus_one_shot_past_the_bound_deferred_by_a_reset_scope_runs_on_the_first_tick_after_it`, `tests/test_hold_bound.py::test_a_host_rung_denied_with_no_retry_is_asked_again_each_tick_and_journaled_once` |
 | I76 a live tenant at the bound is paged once (`hold_bound_tenant_blocked`, naming it), /health shows `tenant_blocked`, and the ladder then the host rung run on the first tick after it leaves | `tests/test_hold_bound.py::test_a_live_tenant_at_the_bound_is_paged_once_and_the_ladder_runs_when_it_leaves`, `tests/test_hold_bound.py::test_a_killed_jobs_leftover_holder_does_not_stop_the_bound` |
+| I82 a bound ladder's release then a failed first job (missing port, I42 latch, known fabric fault, 77-only, generic) goes to the power cycle at the next hold, not another ladder; a class change keeps the clock; a re-hold past the window with no job, or around a job started after it, is a new episode; the carry never crosses a reboot | `tests/test_hold_episode_carry.py::test_replay_a_release_after_the_bound_ladder_then_a_failed_first_job_goes_to_the_power_cycle`, `::test_a_class_change_on_the_rehold_keeps_the_clock`, `::test_a_rehold_after_the_carry_window_with_no_job_is_a_new_episode`, `::test_a_job_started_in_the_window_keeps_the_carry_until_it_ends`, `::test_a_job_started_after_the_window_does_not_extend_it`, `::test_the_carry_does_not_cross_a_reboot` |
+| I82 a broker restart keeps the clock: a released episode's re-hold goes to the power cycle, a hold open past its bound escalates at once, one past its bound ladder goes to the host rung | `tests/test_hold_episode_carry.py::test_replay_a_restart_whose_startup_check_releases_then_a_failed_first_job_goes_to_the_power_cycle`, `::test_a_hold_open_across_a_restart_escalates_at_once_when_past_the_bound`, `::test_a_hold_open_across_a_restart_after_its_bound_ladder_goes_to_the_host_rung` |
 | I76 `TT_DEVICE_MCP_FORCE_ESCALATE=0` does not stop the bound, and the boot warning says so; a held job past the bound still starts its escalation and below it names the bound; no message claims the hold has no automatic exit | `tests/test_hold_bound.py::test_the_operator_kill_switch_does_not_stop_the_bound`, `tests/test_rung_privilege.py::test_the_force_escalate_kill_switch_warns_that_the_hold_bound_ignores_it`, `tests/test_hold_bound.py::test_a_held_job_past_its_bound_under_the_kill_switch_says_the_bound_still_runs`, `tests/test_device_safety.py::test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
 | I58 all off after a failed reset and a broker restart: the startup or a later gate cycles with no second reset; the sweep skips a failed-unchanged set | `tests/test_classac_power_cycle_direct.py::test_replay_all_off_after_a_restart_cycles_with_no_second_reset`, `::test_a_partial_drop_keeps_the_ladder` |
 | I36 a power cycle that is rate-limited or not opted in never stops resets: a shrinking off-bus set resets again each forced window, and the gate retries its reset once its cooldown ran out | `tests/test_host_action_suppress.py::test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_fire`, `::test_the_gate_keeps_resetting_a_drop_whose_power_cycle_is_not_opted_in` |
