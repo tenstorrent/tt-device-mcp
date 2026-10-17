@@ -75,6 +75,7 @@ class TestEnumerateDeviceHolders:
         result = dh.enumerate_device_holders()
         assert result.complete is False
         assert result.holders == []
+        assert result.gaps == ["1 processes' fd tables unreadable"], "an incomplete scan must say what it missed"
 
     def test_vanished_process_is_skipped(self, monkeypatch):
         """A process that exits mid-scan (FileNotFoundError) is ignored, scan stays complete."""
@@ -516,6 +517,7 @@ class TestDriverHolderRecord:
 
         assert scan.holders == []
         assert scan.complete is False, "an unattributable holder read as an empty, complete scan"
+        assert scan.gaps == [f"pid {absent} named by the driver has no /proc entry here"]
         assert dh.evaluate_reset_gate(os.getuid(), scan).allowed is False
 
     def test_a_pid_that_holds_no_device_here_is_not_attributed(self, tmp_path, monkeypatch):
@@ -535,6 +537,11 @@ class TestDriverHolderRecord:
 
         assert scan.holders == [], "a pid holding no device node was attributed as a holder"
         assert scan.complete is False
+        # The same shape as a probe killed on its timeout and not yet reaped (fd table gone, the
+        # driver's release still running): the gap names the pid, its comm and its run state.
+        comm, state = dh.holder_comm(os.getpid()), dh.holder_state(os.getpid())
+        assert comm != "?" and state != "?"
+        assert scan.gaps == [f"pid {os.getpid()} ({comm}, state {state}) named by the driver holds no device fd here"]
 
     def test_an_unreadable_device_file_marks_the_scan_incomplete(self, tmp_path, monkeypatch):
         """Readable devices still answer, but the driver knows of holders we could not enumerate."""
@@ -549,6 +556,7 @@ class TestDriverHolderRecord:
 
         assert scan.source == "driver"
         assert scan.complete is False
+        assert scan.gaps == ["a per-device driver pids file was unreadable"]
 
     def test_an_absent_driver_dir_falls_back_to_the_walk(self, tmp_path, monkeypatch):
         """A host whose tt-kmd predates this interface must not read as 'no holders'."""
@@ -601,3 +609,10 @@ def test_read_proc_ppid_reads_this_process_parent():
     """The real /proc parse (no device involved): our own ppid, and None for a pid that is gone."""
     assert dh._read_proc_ppid(os.getpid()) == os.getppid()
     assert dh._read_proc_ppid(2**22 + 1) is None  # above pid_max
+
+
+def test_holder_comm_and_state_read_unknown_for_a_gone_pid():
+    """A log line about a holder never raises over a pid that has already exited."""
+    gone = 2**22 - 1
+    assert dh.holder_comm(gone) == "?"
+    assert dh.holder_state(gone) == "?"
