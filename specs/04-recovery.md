@@ -992,9 +992,12 @@ each rung fires only when the gentler one failed or cannot apply.
   last cycle or boot and when the next cycle comes. Inside any class-A cooldown (two counted cycles
   or not), once the hold has stood `CLASS_A_LADDER_AFTER_SEC` (600 s) since the later of the last
   cycle or boot and the hold's start, the hold-deadline watchdog starts one forced pass at that mark
-  (not at the next ceiling window) and the full off-bus ladder runs once (bridge reset, `glx_reset`,
-  tray re-power, sweep), each reset followed by the full health check, fabric included; a check that
-  fails keeps the hold, and the cycle follows at the cooldown's end. A tray that came back takes the
+  (not at the next ceiling window) and the broker's own off-bus ladder runs once, as its gates allow:
+  for a whole-tray drop that is the per-tray re-power only (`glx_reset` is suppressed after a failed
+  tray walk below the galaxy-reset floor, and the last-chance sweep is skipped for class A and C,
+  I37). It runs once per anchor (the later of the last cycle or boot and the hold's start). Each
+  reset is followed by the full health check, fabric included; a check that fails keeps the hold,
+  and the cycle follows at the cooldown's end. The bounded I65 cooldown is the only longer hold. A tray that came back takes the
   ordinary reset path, and the device is released only after the full post-reset health check,
   fabric included, passes (03 I4, I32). A tray that drops again before any verified release is
   cycled again at its cooldown's end. Time to recover for class A (budget 1 h): unchanged when one
