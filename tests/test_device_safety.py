@@ -13832,9 +13832,11 @@ async def test_a_sweep_verify_that_reads_77_is_not_a_release(
     assert g._sweep_read_77 is fabric_77_unverified, "the 77 is noted so the escalation holds, not climbs"
 
 
-def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output="", beats=None, fault=""):
-    """A present-mesh hold past the ceiling for the forced (deadline) escalation; galaxy escalate, the
-    alert hook and the 77-only shortcut are stubbed. Returns (escalations, alerts, events)."""
+def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output="", beats=None, fault="", age_min=11.0):
+    """A present-mesh hold (past the ceiling by default) for the forced (deadline) escalation; galaxy
+    escalate, the I76 host rung, the alert hook and the 77-only shortcut are stubbed. Returns
+    (escalations, alerts, events); a host rung the 10-min bound asked for lands in events as
+    ``host_rung``."""
     srv._mark_device_dirty(detail)
     monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, why=why))
     monkeypatch.setattr(srv, "device_fault_reported", fault)
@@ -13849,13 +13851,18 @@ def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output=""
     )
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
-    srv.device_hold_episode_since = (datetime.now() - timedelta(minutes=11)).isoformat()
+    srv.device_hold_episode_since = (datetime.now() - timedelta(minutes=age_min)).isoformat()
     srv.device_hold_episode_reason = detail
     escalations, alerts, events = [], [], []
 
     async def escalate(kind, indices, expected, log):
         escalations.append(kind)
         return None
+
+    async def host_rung(age, log):
+        events.append("host_rung")
+
+    monkeypatch.setattr(srv, "_hold_bound_host_rung", host_rung)
 
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
     monkeypatch.setattr(srv.fsm, "on_outcome", lambda outcome: None)
@@ -13887,12 +13894,13 @@ def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output=""
 async def test_the_deadline_escalation_holds_a_fabric_only_present_mesh_without_a_reset(
     monkeypatch, clear_job_state, why, detail, fabric_output, cause
 ):
-    """Spec 04 I30: past the ceiling, every chip present with a live ARC heartbeat and a hold that names
-    only the fabric (a 77 or a cabling mismatch) gets no galaxy reset and no ladder: it holds and pages
-    once per episode. Fails on base, where the forced escalation ran tt-smi -glx_reset on a cabling
-    mismatch, which took a chip off the bus and the ladder then re-powered its tray."""
+    """Spec 04 I30: below the 10-min bound (I76), every chip present with a live ARC heartbeat and a hold
+    that names only the fabric (a 77 or a cabling mismatch) gets no galaxy reset and no ladder from an
+    early forced run: it holds and pages once per episode. Fails on base, where the forced escalation ran
+    tt-smi -glx_reset on a cabling mismatch, which took a chip off the bus and the ladder then re-powered
+    its tray."""
     escalations, alerts, events = _arm_fabric_only_deadline_hold(
-        monkeypatch, why=why, detail=detail, fabric_output=fabric_output
+        monkeypatch, why=why, detail=detail, fabric_output=fabric_output, age_min=5
     )
     await srv._force_escalate_stuck_hold()
     await srv._force_escalate_stuck_hold()  # the next ceiling window: still no reset, no second page
@@ -15473,10 +15481,11 @@ async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch,
 
 @pytest.mark.asyncio
 async def test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset(monkeypatch, clear_job_state):
-    """03 I46 with 04 I30: a known fabric fault holds and pages at the ceiling even when an old pass
-    measured the fabric bad, since every reset on it has ended in another 77 and another dead job."""
+    """03 I46 with 04 I30: below the 10-min bound (04 I76), a known fabric fault holds and pages even
+    when an old pass measured the fabric bad, since every reset on it has ended in another 77 and
+    another dead job."""
     escalations, alerts, events = _arm_fabric_only_deadline_hold(
-        monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail="job 9: known fabric fault: 2 jobs in a row"
+        monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail="job 9: known fabric fault: 2 jobs in a row", age_min=5.0
     )
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)
     monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "known fabric fault: 2 jobs in a row")

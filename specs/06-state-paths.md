@@ -245,7 +245,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_TENANT_HOLD_MAX_SEC` | hold deadline (1200) | Longest a held job waits before it fails and the hold escalates; no value disables it | 01 |
 | `TT_DEVICE_MCP_TENANT_UIDS` | unset | Comma-separated uids or user names below 1000 whose device holders count as tenants. Root is ignored; a name that does not resolve is retried on the next scan | 04 |
 | `TT_DEVICE_MCP_HOLD_DEADLINE_SEC` | 2× stuck ceiling (1200) | Hold age flagged STUCK to the durable timeline | 03 |
-| `TT_DEVICE_MCP_STUCK_HOLD_SEC` | 600 | General hold ceiling before forced escalation | 03 |
+| `TT_DEVICE_MCP_STUCK_HOLD_SEC` | 600 | General hold ceiling before forced escalation; values above 600 read as 600 (04 I76) | 03 |
 | `TT_DEVICE_MCP_STUCK_HOLD_RESET` | 1 | Kill switch: idle escalation may reset a stuck hold | 03 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_SEC` | 120 | Off-bus hold ceiling (an order below the general one) | 03 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE` | 1 | Kill switch: off-bus holds escalate early | 03 |
