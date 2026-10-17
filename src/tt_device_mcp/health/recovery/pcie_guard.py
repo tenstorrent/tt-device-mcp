@@ -1070,11 +1070,39 @@ def _recover_siblings(plan: TrayPlan, live: dict, log: Callable[[str], None], sl
 # ``TRAY_RUNG_FILE`` in the health dir with the host name and time, so a broker restart and a reboot or
 # power cycle both keep it: the UBB that regressed is still the same one after a cycle (measured: the
 # rung re-armed on each new boot and the same re-power took 20 more chips off three times in an hour).
-# A record from another host or older than the window is dropped.
+# A record from another host or older than the window is dropped. An operator clears it after a repair
+# with :func:`clear_tray_rung_cmd`; a running broker sees the file gone and re-arms the rung.
 TRAY_RUNG_FILE = "ubb_tray_rung_disabled.json"
 TRAY_RUNG_LATCH_DEFAULT_DAYS = 7.0
 _TRAY_RUNG_DISABLED: Optional[dict] = None
 _TRAY_RUNG_AT = 0.0  # when the in-memory record was latched (epoch s)
+_TRAY_RUNG_PERSISTED = False  # the in-memory record is backed by TRAY_RUNG_FILE
+
+
+def clear_tray_rung_cmd() -> str:
+    """The exact command that re-arms the per-tray rung on THIS broker after a hardware repair (its
+    interpreter and health dir, as root), as :func:`clear_latch_cmd` does for the host-hang latch."""
+    return (
+        f"sudo {sys.executable} -m tt_device_mcp.health.recovery.pcie_guard --clear-tray-rung-latch "
+        f"--health-dir {health_dir()}"
+    )
+
+
+def clear_tray_rung_latch(dirs: Optional[list] = None) -> list:
+    """Operator step: re-arm the per-tray rung in each of ``dirs`` (default :func:`latch_dirs`), e.g.
+    after the UBB whose re-power regressed was repaired. Returns the files removed. Raises OSError when
+    one exists but cannot be removed (not root)."""
+    global _TRAY_RUNG_DISABLED, _TRAY_RUNG_PERSISTED
+    cleared = []
+    for d in latch_dirs() if dirs is None else dirs:
+        path = Path(d) / TRAY_RUNG_FILE
+        if path.exists():
+            path.unlink()
+            cleared.append(path)
+            health_event("ubb_tray_rung_cleared", path=str(path), by="operator")
+    if cleared:
+        _TRAY_RUNG_DISABLED, _TRAY_RUNG_PERSISTED = None, False
+    return cleared
 
 
 def tray_rung_latch_sec() -> float:
@@ -1091,11 +1119,11 @@ def disable_tray_rung(**why) -> None:
     """Decline the per-tray rung on this host for :func:`tray_rung_latch_sec` (``ubb_tray_rung_disabled``,
     once). The record goes to the health dir with the host name and time, so it survives a broker
     restart, a reboot and a power cycle."""
-    global _TRAY_RUNG_DISABLED, _TRAY_RUNG_AT
+    global _TRAY_RUNG_DISABLED, _TRAY_RUNG_AT, _TRAY_RUNG_PERSISTED
     if tray_rung_disabled() is not None:
         return
     rec = {"why": dict(why), "boot_id": _boot_id(), "host": socket.gethostname(), "at_epoch": time.time()}
-    _TRAY_RUNG_DISABLED, _TRAY_RUNG_AT = dict(why), rec["at_epoch"]
+    _TRAY_RUNG_DISABLED, _TRAY_RUNG_AT, _TRAY_RUNG_PERSISTED = dict(why), rec["at_epoch"], False
     try:
         path = health_dir() / TRAY_RUNG_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1103,9 +1131,17 @@ def disable_tray_rung(**why) -> None:
             f.write(json.dumps(rec))
             f.flush()
             os.fsync(f.fileno())
+        _TRAY_RUNG_PERSISTED = True
     except OSError as exc:
         health_event("ubb_tray_rung_disabled_unwritable", error=repr(exc), host_at_risk=True)
-    health_event("ubb_tray_rung_disabled", **why, boot_id=rec["boot_id"], host_at_risk=True)
+    health_event(
+        "ubb_tray_rung_disabled",
+        **why,
+        boot_id=rec["boot_id"],
+        latch_days=tray_rung_latch_sec() / 86400.0,
+        clear_with=clear_tray_rung_cmd(),
+        host_at_risk=True,
+    )
 
 
 def tray_rung_disabled() -> Optional[dict]:
@@ -1114,12 +1150,17 @@ def tray_rung_disabled() -> Optional[dict]:
     whose re-power regressed. A record from another host, or older than :func:`tray_rung_latch_sec`, is
     removed and never counts. One with no time of its own is aged by the file's mtime; one whose age cannot
     be read at all cannot be shown stale, so it counts: the hold it routes to is the bounded I27 hand-off."""
-    global _TRAY_RUNG_DISABLED, _TRAY_RUNG_AT
+    global _TRAY_RUNG_DISABLED, _TRAY_RUNG_AT, _TRAY_RUNG_PERSISTED
+    path = health_dir() / TRAY_RUNG_FILE
     if _TRAY_RUNG_DISABLED is not None:
+        if _TRAY_RUNG_PERSISTED and not path.exists():
+            # An operator cleared it (:func:`clear_tray_rung_cmd`) while this broker ran: re-arm now.
+            health_event("ubb_tray_rung_cleared", path=str(path), by="file_removed", latch=_TRAY_RUNG_DISABLED)
+            _TRAY_RUNG_DISABLED, _TRAY_RUNG_PERSISTED = None, False
+            return None
         if time.time() - _TRAY_RUNG_AT < tray_rung_latch_sec():
             return _TRAY_RUNG_DISABLED
         _TRAY_RUNG_DISABLED = None
-    path = health_dir() / TRAY_RUNG_FILE
     try:
         rec = json.loads(path.read_text())
     except (OSError, ValueError):
@@ -1141,12 +1182,14 @@ def tray_rung_disabled() -> Optional[dict]:
     why = rec.get("why")
     _TRAY_RUNG_DISABLED = dict(why) if isinstance(why, dict) else {}
     _TRAY_RUNG_AT = at if age is not None else time.time()
+    _TRAY_RUNG_PERSISTED = True
     health_event(
         "ubb_tray_rung_disabled_restored",
         **_TRAY_RUNG_DISABLED,
         boot_id=current,
         latched_boot_id=rec.get("boot_id"),
         age_sec=age,
+        clear_with=clear_tray_rung_cmd(),
         host_at_risk=True,
     )
     return _TRAY_RUNG_DISABLED
@@ -1155,13 +1198,17 @@ def tray_rung_disabled() -> Optional[dict]:
 # The last per-tray re-power of this process, for :func:`latch_tray_pulse_drop`: chips on the trays it
 # did NOT re-power that leave the bus within ``TRAY_PULSE_WINDOW_SEC`` of it, all at in-tray position 5
 # (chips 5/13/21/29 on a Galaxy), are the cross-tray signature some UBBs show a minute after a pulse.
+# The drop often lands after the pulse's own hold was released, in a new hold episode, so the match spans
+# episodes inside the window. The record names the pulse's episode and trays, so an operator who finds
+# the drop was someone else's (e.g. an outside load test) re-arms the rung with clear_tray_rung_cmd().
 TRAY_PULSE_WINDOW_SEC = 900.0
 TRAY_PULSE_POSITION = 5
 _LAST_TRAY_PULSE: Optional[dict] = None
 
 
-def note_tray_pulse(trays, tray_map: Optional[dict], off_before) -> None:
-    """A per-tray re-power of ``trays`` was fired with ``off_before`` (chip ids) off the bus."""
+def note_tray_pulse(trays, tray_map: Optional[dict], off_before, episode: str = "") -> None:
+    """A per-tray re-power of ``trays`` was fired with ``off_before`` (chip ids) off the bus, in the hold
+    episode ``episode`` (its onset; empty when unknown)."""
     global _LAST_TRAY_PULSE
     if not tray_map:
         return
@@ -1170,14 +1217,16 @@ def note_tray_pulse(trays, tray_map: Optional[dict], off_before) -> None:
         "tray_map": {int(t): sorted(int(c) for c in chips) for t, chips in tray_map.items()},
         "off_before": {str(c) for c in off_before},
         "at": time.monotonic(),
+        "episode": episode or "",
     }
 
 
-def latch_tray_pulse_drop(off_now) -> Optional[dict]:
+def latch_tray_pulse_drop(off_now, episode: str = "") -> Optional[dict]:
     """Disable the per-tray rung (:func:`disable_tray_rung`) when chips that were on the bus before the
     last tray re-power, on trays it did not re-power, are now off and every one of them sits at in-tray
     position 5. Only that signature counts: a mesh reset fired after the pulse drops other chips too.
-    Returns why it latched, or None."""
+    The record names the pulse's hold episode, and ``episode`` (the hold the drop was seen in) when it
+    is another one. Returns why it latched, or None."""
     pulse = _LAST_TRAY_PULSE
     if pulse is None or time.monotonic() - pulse["at"] > TRAY_PULSE_WINDOW_SEC:
         return None
@@ -1192,6 +1241,10 @@ def latch_tray_pulse_drop(off_now) -> Optional[dict]:
     if not elsewhere or set(elsewhere.values()) != {TRAY_PULSE_POSITION}:
         return None
     why = {"tray": pulse["trays"], "new_off": [str(c) for c in sorted(elsewhere)], "signature": "position5"}
+    if pulse.get("episode"):
+        why["episode"] = pulse["episode"]
+    if episode and episode != pulse.get("episode"):
+        why["seen_in"] = episode
     health_event("ubb_reset_regressed_offbus", **why, host_at_risk=True)
     disable_tray_rung(**why)
     return why
@@ -1332,6 +1385,22 @@ def main(argv: Optional[list] = None) -> int:
     """``python -m tt_device_mcp.health.recovery.pcie_guard <bitmap> [chip ...]``: print the plan a
     per-tray re-power would follow. Reads sysfs only; never touches a device."""
     args = sys.argv[1:] if argv is None else argv
+    if args[:1] == ["--clear-tray-rung-latch"]:
+        rest = args[1:]
+        if rest and (len(rest) != 2 or rest[0] != "--health-dir"):
+            print("usage: pcie_guard --clear-tray-rung-latch [--health-dir DIR]")
+            return 2
+        dirs = latch_dirs(rest[1] if rest else None)
+        try:
+            cleared = clear_tray_rung_latch(dirs)
+        except OSError as exc:
+            print(f"the per-tray rung is latched off but could not be re-armed ({exc}); run it as root (sudo)")
+            return 1
+        if cleared:
+            print("per-tray rung re-armed: " + ", ".join(str(p) for p in cleared))
+        else:
+            print("the per-tray rung was not latched off in " + ", ".join(str(d) for d in dirs))
+        return 0
     if args[:1] == ["--clear-hang-latch"]:
         rest = args[1:]
         if rest and (len(rest) != 2 or rest[0] != "--health-dir"):
@@ -1349,7 +1418,10 @@ def main(argv: Optional[list] = None) -> int:
             print("no host-hang hold was latched in " + ", ".join(str(d) for d in dirs))
         return 0
     if not args:
-        print("usage: pcie_guard <bitmap> [chip ...] | --clear-hang-latch [--health-dir DIR]")
+        print(
+            "usage: pcie_guard <bitmap> [chip ...] | --clear-hang-latch [--health-dir DIR] "
+            "| --clear-tray-rung-latch [--health-dir DIR]"
+        )
         return 2
     plan = plan_tray_repower(int(args[0], 0), [int(a) for a in args[1:]])
     print(f"trays {plan.trays}\nfunctions {plan.functions}\nchips {plan.chips}\nroot ports {plan.root_ports}")
@@ -1358,6 +1430,9 @@ def main(argv: Optional[list] = None) -> int:
     latch = offbus_reset_latched()
     if latch is not None:
         print(f"host-hang hold LATCHED: {_latch_boots(latch)} ({latch}); clear with `{clear_latch_cmd()}`")
+    rung = tray_rung_disabled()
+    if rung is not None:
+        print(f"per-tray rung LATCHED OFF ({rung}); re-arm after a repair with `{clear_tray_rung_cmd()}`")
     return 1 if plan.mismatch else 0
 
 
