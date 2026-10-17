@@ -304,6 +304,9 @@ async def test_a_disconnect_kills_the_whole_process_group(runner_env, monkeypatc
         job = await _job_run_then_cancel(_params(runner_env["tmp"], "sleep 600 | sleep 600"), running)
         assert await _until(lambda: job.finished_at is not None), "the job outlived its client"
         assert await _until(lambda: not _pgid_members(job.pid))
+        # The kill handler stamps finished_at at once; the runner takes the debt only after it reaps
+        # the job, so stopping it before then would race the assert below.
+        assert await _until(lambda: "kill_reset_owed" in runner_env["events"]), "the runner never took the debt"
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.KILLED
