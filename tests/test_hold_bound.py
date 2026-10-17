@@ -117,10 +117,12 @@ def test_hold_messages_state_the_real_bound(monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_STUCK_HOLD_SEC", "1200")
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_cooldown_state", None)
     monkeypatch.setattr(srv, "isolated_chips", {7})
-    assert "~5 min" in srv._hold_escalation_note(off_bus=1) and "each 20 min hold ceiling" in srv._hold_escalation_note(1)
+    note = srv._hold_escalation_note(off_bus=1)
+    assert "~5 min" in note and "each 20 min hold ceiling" in note
     assert "20 min hold ceiling" in srv._hold_escalation_note()
     monkeypatch.setattr(srv, "isolated_chips", set())
-    assert "~5 min" not in srv._hold_escalation_note(1) and "climbs at the 20 min hold ceiling" in srv._hold_escalation_note(1)
+    note = srv._hold_escalation_note(1)
+    assert "~5 min" not in note and "climbs at the 20 min hold ceiling" in note
     _escalation_off(monkeypatch)
     for text in (srv._hold_bound_text(), srv._hold_bound_text(offbus=True)):
         assert "escalates" not in text and "ceiling" not in text
@@ -171,7 +173,8 @@ def _defaults_but_force_off(monkeypatch):
 def _offbus_hold(monkeypatch, off_bus=1):
     srv.fsm.on_fault("off_bus", detail=f"{off_bus} of 32 chips off the bus")
     monkeypatch.setattr(srv, "isolated_chips", {7} if off_bus else set())
-    monkeypatch.setattr(srv, "_live_offbus_state", lambda: {"isolated_chips": [7] if off_bus else [], "off_bus": off_bus})
+    offbus_state = {"isolated_chips": [7] if off_bus else [], "off_bus": off_bus}
+    monkeypatch.setattr(srv, "_live_offbus_state", lambda: offbus_state)
     monkeypatch.setattr(srv, "_device_degraded_for_tenant", lambda: "held: off-bus below the floor")
     monkeypatch.setattr(srv, "device_op_active", False)
     monkeypatch.setattr(srv, "device_held_since", "")
