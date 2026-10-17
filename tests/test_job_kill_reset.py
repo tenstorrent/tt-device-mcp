@@ -214,6 +214,12 @@ async def _start(job_id: str, command: str, timeout_sec: int = 600):
     return job, runner
 
 
+def _runner_done(job):
+    """The runner has booked the job's end. A kill sets ``finished_at`` before the runner sees the
+    exit, and a runner cancelled before then leaves the job for re-adoption, owing no reset."""
+    return job.finished_at is not None and srv.current_job_id != job.id
+
+
 async def _stop(runner):
     runner.cancel()
     await asyncio.gather(runner, return_exceptions=True)
@@ -227,7 +233,7 @@ async def test_a_requested_kill_of_a_running_job_owes_the_reset(runner_env):
         assert await _until(lambda: len(_pgid_members(job.pid)) >= 2)
         mcp = srv.create_mcp_server()
         await mcp.call_tool("tt_device_job_kill", {"params": {"job_id": "931", "owner": job.owner}})
-        assert await _until(lambda: job.finished_at is not None)
+        assert await _until(lambda: _runner_done(job))
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.KILLED
@@ -240,7 +246,7 @@ async def test_a_requested_kill_of_a_running_job_owes_the_reset(runner_env):
 async def test_no_debt_for_a_reset_killed_or_completed_job(runner_env):
     job, runner = await _start("932", "true")
     try:
-        assert await _until(lambda: job.finished_at is not None)
+        assert await _until(lambda: _runner_done(job))
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.COMPLETED and srv._kill_reset_debt() == ""
@@ -250,7 +256,7 @@ async def test_no_debt_for_a_reset_killed_or_completed_job(runner_env):
         assert await _until(lambda: job.status is srv.JobStatus.RUNNING and job.pid)
         srv.reset_killed_job_ids.add("933")  # our own reset took the device from it
         os.killpg(job.pid, 9)
-        assert await _until(lambda: job.finished_at is not None)
+        assert await _until(lambda: _runner_done(job))
     finally:
         await _stop(runner)
     assert srv._kill_reset_debt() == "", "a death our own reset caused owes no second reset"
@@ -302,7 +308,7 @@ async def test_a_disconnect_kills_the_whole_process_group(runner_env, monkeypatc
             return False
 
         job = await _job_run_then_cancel(_params(runner_env["tmp"], "sleep 600 | sleep 600"), running)
-        assert await _until(lambda: job.finished_at is not None), "the job outlived its client"
+        assert await _until(lambda: _runner_done(job)), "the job outlived its client"
         assert await _until(lambda: not _pgid_members(job.pid))
     finally:
         await _stop(runner)
@@ -355,7 +361,7 @@ async def test_a_hung_job_owes_the_reset(runner_env, monkeypatch):
     monkeypatch.setattr(srv, "HUNG_POLL_SEC", 0.05)
     job, runner = await _start("934", "echo working; sleep 600")
     try:
-        assert await _until(lambda: job.finished_at is not None)
+        assert await _until(lambda: _runner_done(job))
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.HUNG
@@ -366,7 +372,7 @@ async def test_a_hung_job_owes_the_reset(runner_env, monkeypatch):
 async def test_a_runner_timeout_owes_the_reset(runner_env):
     job, runner = await _start("935", "sleep 600", timeout_sec=1)
     try:
-        assert await _until(lambda: job.finished_at is not None)
+        assert await _until(lambda: _runner_done(job))
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.TIMEOUT
@@ -438,7 +444,7 @@ async def test_the_runner_pays_an_owed_debt_before_a_queued_job(runner_env, monk
         await asyncio.sleep(0.3)
         assert calls == [] and job.status is srv.JobStatus.QUEUED, "nothing runs beside the re-adopted job"
         srv.readopted_scopes.pop("950")
-        assert await _until(lambda: job.finished_at is not None)
+        assert await _until(lambda: _runner_done(job))
     finally:
         await _stop(runner)
     assert calls[0] == (True, srv.JobStatus.QUEUED), "paid by the post-job gate, before the job's door"
@@ -452,7 +458,7 @@ async def test_a_broker_kill_logs_the_process_tree_it_stopped(runner_env, monkey
     job, runner = await _start("953", "sleep 600 | sleep 600", timeout_sec=1)
     with caplog.at_level(logging.INFO, logger=log.name):
         try:
-            assert await _until(lambda: job.finished_at is not None)
+            assert await _until(lambda: _runner_done(job))
         finally:
             await _stop(runner)
     lines = [r.getMessage() for r in caplog.records if "KILLED process tree" in r.getMessage()]
@@ -473,7 +479,7 @@ async def test_a_rest_run_bg_timeout_owes_the_reset(runner_env):
     job = srv.jobs[res["job_id"]]
     runner = asyncio.create_task(srv.job_runner())
     try:
-        assert await _until(lambda: job.finished_at is not None)
+        assert await _until(lambda: _runner_done(job))
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.TIMEOUT
