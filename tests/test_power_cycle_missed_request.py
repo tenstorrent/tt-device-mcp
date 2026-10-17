@@ -6,10 +6,12 @@
 
 The power-cycle command can return 0 while the cycle never happens (its BMC call failed). The host
 stays up on the same boot past the pending window. That request is a missed attempt, not a cycle: it
-neither anchors the cooldown nor counts toward its doubling, and it is asked again 5, 10, then every
-15 min after its window, with an operator paged from the second miss on. A cycle a verified release
-followed on a later boot healed the box, whether or not a heal file was written. No test reaches a
-real reset or power cycle: the ``rig`` records them."""
+neither anchors the cooldown nor counts toward its doubling, and it is asked again as its window ends,
+then 5 min after each later window, with an operator paged from the second miss on. A cycle that lands
+after its window (the next boot starts within the window plus the attribution window) still ran: it
+counts for the doubling, the backstop and the boot's attribution. A cycle a verified release followed
+on a later boot healed the box, whether or not a heal file was written. No test reaches a real reset
+or power cycle: the ``rig`` records them."""
 
 import json
 import time
@@ -25,8 +27,11 @@ from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery.base import (
     AUTO_RECOVERY_LEDGER,
+    BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC,
     POWER_CYCLE_HEALED_FILE,
     POWER_CYCLE_MIN_INTERVAL_SEC,
+    POWER_CYCLE_MISS_RETRY_SEC,
+    _power_cycle_backstop_stamps,
     host_action_pending_sec,
 )
 
@@ -70,30 +75,25 @@ def paged(cool, monkeypatch):  # noqa: F811
     return sent
 
 
-# ---- (1) a missed request is asked again within 15 min --------------------------------------------
+# ---- (1) a missed request is asked again as its window ends -----------------------------------------
 
 
-def test_a_request_the_host_never_acted_on_is_asked_again_5_min_after_its_window(
-    cool, monkeypatch, paged  # noqa: F811
-):
+def test_a_request_the_host_never_acted_on_is_asked_again_as_its_window_ends(cool, monkeypatch, paged):  # noqa: F811
     """The request returned, the host never went down: at the end of its window it is marked missed
-    on disk, the watchdog asks again 5 min later, and the governor allows it then, not 30 min or 4 h
-    after the request."""
+    on disk and asked again at once, with no backoff on top of the window that already gave the
+    cycler its time; not 30 min or 4 h after the request."""
     m = cool["g"].mechanism
     _request(cool, T0)
     _window_ends(cool, T0 + WINDOW)
     assert _rows()[-1]["took_host_down"] is False
-    retry_at = T0 + WINDOW + 300
-    assert m.power_cycle_retry[0] == retry_at <= T0 + WINDOW + 900
-    assert m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=retry_at - 1)[0] is False
-    assert _watchdog(cool, monkeypatch, retry_at - 1) == []
-    assert _watchdog(cool, monkeypatch, retry_at) == [retry_at]
-    allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=retry_at)
+    assert m.power_cycle_retry[0] == T0 + WINDOW
+    assert _watchdog(cool, monkeypatch, T0 + WINDOW) == [T0 + WINDOW]
+    allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=T0 + WINDOW)
     assert allowed, why
     assert paged == [], "one miss pages no one"
 
 
-def test_the_retries_back_off_5_10_then_15_min_and_never_stop(cool, paged):  # noqa: F811
+def test_later_retries_wait_5_min_after_their_window_and_never_stop(cool, paged):  # noqa: F811
     m = cool["g"].mechanism
     at, waits = T0, []
     for _ in range(5):
@@ -101,9 +101,58 @@ def test_the_retries_back_off_5_10_then_15_min_and_never_stop(cool, paged):  # n
         _window_ends(cool, at + WINDOW)
         nxt = m.power_cycle_retry[0]
         waits.append(nxt - at - WINDOW)
+        assert m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=nxt - 1)[0] is False
         at = nxt
-    assert waits == [300, 600, 900, 900, 900]
+    assert waits == [0, 300, 300, 300, 300]
     assert m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=at)[0] is True
+
+
+@pytest.mark.parametrize("misses", [1, 2, 6])
+def test_the_retry_comes_at_most_the_window_plus_5_min_after_a_request_the_bmc_missed(cool, misses):  # noqa: F811
+    """The stated bound (spec 04 I72): the BMC answers again just after a request it missed. The
+    next request goes out at most ``host_action_pending_sec()`` + 5 min after that one (the window
+    alone for the first miss), whatever the miss count: 15 min, then 20 min, by default."""
+    m = cool["g"].mechanism
+    at = T0
+    for _ in range(misses - 1):
+        _request(cool, at)
+        _window_ends(cool, at + WINDOW)
+        at = m.power_cycle_retry[0]
+    _request(cool, at)  # the BMC answers again right after this one went out
+    _window_ends(cool, at + WINDOW)
+    worst = WINDOW + (0 if misses == 1 else 300)
+    assert m.power_cycle_retry[0] - at == worst <= WINDOW + max(POWER_CYCLE_MISS_RETRY_SEC)
+    assert max(POWER_CYCLE_MISS_RETRY_SEC) <= 300
+    assert m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=at + worst)[0] is True
+
+
+def test_no_retry_while_the_earlier_request_is_still_pending(cool):  # noqa: F811
+    """The pending window counts from the hand-off, after the pre-fire hook, so it can end a little
+    after the ledger row's window. Until it does the retry is refused with a stated deadline: never
+    a second cycle on top of one that may still come."""
+    m = cool["g"].mechanism
+    _request(cool, T0)
+    m.host_action_requested = ("power-cycle", time.monotonic() - WINDOW + 20)  # handed off 20 s after the row
+    allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=T0 + WINDOW)
+    assert not allowed and "still pending" in why
+    assert abs(m.power_cycle_retry[0] - (T0 + WINDOW + 20)) < 5
+    m.host_action_requested = None
+    assert m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=T0 + WINDOW + 20)[0] is True
+
+
+def test_a_late_cycle_before_the_retry_is_never_cycled_again_on_top(cool):  # noqa: F811
+    """The retry's boot check: the host went down a minute after the window (a slow cycler). On the
+    boot it brought up that request is a cycle that ran, so no second cycle follows before the
+    cooldown it anchors ends."""
+    m = cool["g"].mechanism
+    _request(cool, T0)
+    _window_ends(cool, T0 + WINDOW)
+    cool["boot"].update(id="boot-B", btime=T0 + WINDOW + 60)
+    now = T0 + WINDOW + 180
+    allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=now)
+    assert not allowed and "cooldown" in why
+    assert m.power_cycle_cooldown_state.get("missed", 0) == 0
+    assert m.boot_from_broker_escalation("boot-B") is not None
 
 
 @pytest.mark.asyncio
@@ -142,26 +191,26 @@ def test_two_missed_requests_leave_the_interval_at_base_and_page(cool, paged):  
 
 def test_a_missed_row_still_counts_for_nothing_on_the_next_boot(cool):  # noqa: F811
     """The on-disk mark keeps a missed request out of the streak after the host does come back on a
-    new boot (the BMC answered later, or an operator cycled it)."""
+    new boot past the attribution window (an operator cycled it later)."""
     m = cool["g"].mechanism
     _request(cool, T0)
     _window_ends(cool, T0 + WINDOW)
     _request(cool, m.power_cycle_retry[0])
     _window_ends(cool, cool["clk"][0] + WINDOW)
-    cool["boot"].update(id="boot-B", btime=cool["clk"][0] + 60)
+    cool["boot"].update(id="boot-B", btime=cool["clk"][0] + BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC + 60)
     assert m.power_cycle_interval(now_epoch=cool["clk"][0] + 120) == POWER_CYCLE_MIN_INTERVAL_SEC
     assert m.boot_from_broker_escalation("boot-B") is None
 
 
 def test_a_restarted_broker_still_reads_an_old_same_boot_request_as_missed(cool):  # noqa: F811
     """No pending window in memory after a broker restart: a same-boot row older than the window is
-    missed all the same, and its retry is due 5 min after its window, not after the 30-min cooldown."""
+    missed all the same, and its retry is due as its window ends, not after the 30-min cooldown."""
     m = cool["g"].mechanism
     _ledger({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": T0, "at": "x"})
     now = T0 + WINDOW + 10
     allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=now)
-    assert not allowed and "never took the host down" in why
-    assert m.power_cycle_retry[0] == T0 + WINDOW + 300
+    assert allowed, why
+    assert _rows()[-1]["took_host_down"] is False
 
 
 # ---- (3) a real cycle still anchors and doubles ----------------------------------------------------
@@ -179,6 +228,36 @@ def test_a_cycle_that_took_the_host_down_still_anchors_the_cooldown_and_doubles(
         at = cd["until"]
     assert [r.get("took_host_down") for r in _rows()] == [None, None, None]
     assert m.power_cycle_interval(now_epoch=at) == 7200
+
+
+def test_cycles_that_land_after_their_window_still_double_the_cooldown_and_count_for_the_backstop(
+    cool, paged  # noqa: F811
+):
+    """The loop guard (spec 04 I65/I72): a slow cycler takes the host down 2 min after each window
+    ran out, so each row was marked missed first. The next boot starts within the window plus the
+    attribution window of it with no other escalation between: it is a cycle that ran (late), on that
+    boot and every later one. The cooldown doubles 30 min, 1 h, 2 h, then 4 h; the backstop and
+    the boot's attribution count it; no miss is paged."""
+    m = cool["g"].mechanism
+    at, intervals = T0, []
+    for n in range(5):
+        _request(cool, at)
+        _window_ends(cool, at + WINDOW)
+        btime = at + WINDOW + 120
+        cool["boot"].update(id=f"boot-{n}", btime=btime)
+        m.host_action_requested = None
+        cool["clk"][0] = btime + 60
+        assert m.boot_from_broker_escalation(f"boot-{n}") is not None
+        cd = m.power_cycle_cooldown(now_epoch=btime + 60)
+        assert cd is not None and cd["last"] == btime
+        intervals.append(cd["interval_sec"])
+        if n == 1:
+            ran = m._cycles_that_ran(_rows(), btime + 60)
+            assert len(_power_cycle_backstop_stamps(ran, btime + 60)) == 2
+        at = cd["until"]
+    assert intervals == [1800, 3600, 7200, 14400, 14400]
+    assert all(r.get("late") is True and r.get("took_host_down") is True for r in _rows()[:4])
+    assert paged == []
 
 
 # ---- (4) goal 8: a healed retry releases only after the full check --------------------------------
@@ -221,10 +300,13 @@ def test_health_shows_the_missed_count_and_the_next_retry(cool, monkeypatch):  #
     m = cool["g"].mechanism
     _request(cool, T0)
     _window_ends(cool, T0 + WINDOW)
-    cd = _health(monkeypatch, T0 + WINDOW + 1)
-    assert cd["missed_requests"] == 1 and cd["cause"] == "missed power-cycle request"
-    assert cd["next_deadline"] == datetime.fromtimestamp(T0 + WINDOW + 300).isoformat(timespec="seconds")
-    assert cd["interval_sec"] == 300 and m.power_cycle_retry[0] == T0 + WINDOW + 300
+    second = T0 + WINDOW
+    _request(cool, second)
+    _window_ends(cool, second + WINDOW)
+    cd = _health(monkeypatch, second + WINDOW + 1)
+    assert cd["missed_requests"] == 2 and cd["cause"] == "missed power-cycle request"
+    assert cd["next_deadline"] == datetime.fromtimestamp(second + WINDOW + 300).isoformat(timespec="seconds")
+    assert cd["interval_sec"] == 300 and m.power_cycle_retry[0] == second + WINDOW + 300
 
 
 def test_health_shows_no_missed_requests_for_a_plain_cooldown(cool, monkeypatch):  # noqa: F811
