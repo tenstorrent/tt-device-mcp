@@ -7081,7 +7081,15 @@ def _rearm_after_scope(kind: str) -> None:
     """A bound run that found a reset still cycling in its own scope ran nothing: its step runs on the
     first watchdog tick after that scope ends, not a whole window later (spec 04 I76)."""
     global device_hold_escalate_bucket, _hold_bound_rung_pending
-    if kind == "ceiling_window":
+    global device_hold_offbus_escalated, device_hold_offbus_prior_bucket
+    if kind == "offbus_one_shot":
+        # The one-shot and the window it claimed over go back together: kept, the bound's ladder
+        # waited for the next window whether the chip was still off or came back meanwhile.
+        device_hold_offbus_escalated = False
+        if device_hold_offbus_prior_bucket is not None:
+            device_hold_escalate_bucket = device_hold_offbus_prior_bucket
+            device_hold_offbus_prior_bucket = None
+    elif kind == "ceiling_window":
         device_hold_escalate_bucket = max(0, device_hold_escalate_bucket - 1)
     elif kind == "power_cycle_cooldown":
         _hold_bound_sync()

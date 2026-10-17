@@ -744,6 +744,36 @@ async def test_a_bound_ladder_deferred_by_a_reset_scope_runs_on_the_first_tick_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("chip_back", [False, True])
+async def test_an_offbus_one_shot_past_the_bound_deferred_by_a_reset_scope_runs_on_the_first_tick_after_it(
+    monkeypatch, clear_job_state, chip_back
+):
+    """A one-shot that fires past the bound (given back earlier, e.g. to a tenant) and meets a reset
+    still cycling ran nothing: it gives back its claim and the window it took with it, so the bound's
+    ladder runs on the first tick after the scope, whether the chip is still off or came back."""
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
+    )
+    _watchdog(monkeypatch)
+    monkeypatch.setattr(srv, "isolated_chips", {"3"})
+    monkeypatch.setattr(srv, "device_hold_offbus_tenant_wait", True)  # a tenant stood the early one-shot down
+    monkeypatch.setattr(srv, "device_hold_offbus_prior_bucket", None)
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
+    scope = {"active": "a reset still cycling"}
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: scope["active"])
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == [], "the scope ran nothing"
+    assert not srv.device_hold_offbus_escalated and srv.device_hold_escalate_bucket == 0, "the claim is given back"
+    scope["active"] = None
+    if chip_back:
+        monkeypatch.setattr(srv, "isolated_chips", set())
+    _tick()
+    await _drain()
+    assert escalations == ["present-forced"], "the bound's ladder runs on the first tick after the scope"
+
+
+@pytest.mark.asyncio
 async def test_a_host_rung_denied_with_no_retry_is_asked_again_each_tick_and_journaled_once(
     monkeypatch, clear_job_state
 ):
