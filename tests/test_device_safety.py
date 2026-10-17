@@ -533,6 +533,79 @@ def test_an_offbus_hold_gets_one_fast_attempt_not_a_fast_cadence(monkeypatch):
     assert len(fired) == 2, "the early off-bus attempt is additive: the ceiling window still fires on its own clock"
 
 
+def test_a_one_shot_past_the_ceiling_claims_that_window(monkeypatch):
+    """Spec 03 I23: an off-bus one-shot that first runs past the general ceiling (it waited out a
+    tenant) is that ceiling window's forced run too. The next tick must not climb a second rung."""
+    monkeypatch.setattr(srv, "device_hold_episode_reason", "chip(s) 6 fell off the PCIe bus")
+    fired, since = _hold_deadline_probe(monkeypatch, isolated={"6"})
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 5))
+    srv._check_hold_deadline(now=since + timedelta(seconds=ceiling + 15))
+    assert len(fired) == 1, "a one-shot past the ceiling and the ceiling window fired back to back"
+
+    srv._check_hold_deadline(now=since + timedelta(seconds=2 * ceiling + 1))
+    assert len(fired) == 2, "the next ceiling window still fires on its own clock"
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_deferred_ceiling_window_runs_on_the_next_idle_tick(monkeypatch, tmp_path):
+    """Spec 03 I23 with spec 04 I7: a ceiling window whose forced run stood down on a live tenant is
+    given back, not spent. While the tenant stays, each tick checks it quietly (no device op); the
+    first tick with no tenant runs the ladder, not the next window ten minutes on."""
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
+    fsm_dirty(srv, "eth/fabric fault on a present mesh", why="heartbeat")
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    dev = tmp_path / "tenstorrent"
+    dev.mkdir()
+    for i in range(32):
+        (dev / str(i)).write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(dev))
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: 32)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {})
+    monkeypatch.setattr(srv, "dead_chips", lambda beats: [])
+    monkeypatch.setattr(srv, "_offbus_count", lambda beats, expected, *a: 0)  # every chip on the bus
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
+    monkeypatch.setattr(srv, "device_op_lock", None)  # bind a fresh lock to this test's loop
+    monkeypatch.setattr(srv, "_forced_escalation_task", None)
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
+    since = datetime(2026, 8, 15, 1, 17, 33)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
+    tenant = {"on": True}
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: tenant["on"])
+    climbs = []
+
+    async def escalate(phase, indices, expected, log, **_):
+        climbs.append(phase)
+        srv.galaxy_recovery.tenant_deferred = tenant["on"]
+        return OUTCOME_WAITING if tenant["on"] else OUTCOME_RECOVERED
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    async def tick(sec):
+        srv._check_hold_deadline(now=since + timedelta(seconds=sec))
+        if srv._forced_escalation_task is not None:
+            await srv._forced_escalation_task
+
+    await tick(ceiling + 1)
+    assert climbs == ["present-forced"]
+    assert srv.device_hold_escalate_bucket == 0, "a run that stood down on a tenant spent the ceiling window"
+
+    await tick(ceiling + 11)
+    assert climbs == ["present-forced"] and events.count("device_op_begin") == 1
+    assert srv.device_hold_escalate_bucket == 0 and srv.device_hold_tenant_deferred is True
+
+    tenant["on"] = False
+    await tick(ceiling + 21)
+    assert climbs == ["present-forced", "present-forced"], "the first idle tick must run the window"
+    assert srv.device_hold_escalate_bucket == 1 and srv.device_hold_tenant_deferred is False
+
+
 @pytest.mark.asyncio
 async def test_forced_escalation_fires_on_a_hold_held_only_by_a_reported_fault(monkeypatch, tmp_path):
     """A hold whose sole cause is a runtime-reported eth/fabric fault must still get the forced ladder
@@ -5053,18 +5126,21 @@ def test_governor_blocks_a_reboot_inside_the_min_interval(monkeypatch, tmp_path)
     assert "boot-loop guard" in why
 
 
-def test_governor_blocks_after_the_per_boot_cap(monkeypatch, tmp_path):
-    """Even past the min interval, a single boot may escalate only so many times. The cap is
-    counted against the running boot's id, and the record already sits at that id."""
+def test_governor_per_boot_cap_ends_with_the_interval(monkeypatch, tmp_path):
+    """The per-boot cap is counted against the running boot's id, and the record already sits at
+    that id — a request that never took the box down. It holds within the action's interval and
+    names its end; past it the request is asked again, never held for the rest of the boot (spec 04
+    I65: every denial ends at a stated time)."""
     _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-A")
     monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MIN_INTERVAL_SEC", 3600)
     monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MAX_PER_BOOT", 1)
     srv.recovery_mechanism.record_auto_recovery("reboot", "wedge", now_epoch=1000.0)
-    # now_epoch far enough past the interval that only the per-boot cap can block it
-    allowed, why = srv.recovery_mechanism.auto_recovery_allowed("reboot", tenant_active=False, now_epoch=1000.0 + 4000)
+    allowed, why = srv.recovery_mechanism.auto_recovery_allowed("reboot", tenant_active=False, now_epoch=1060.0)
     assert allowed is False
-    assert "this boot" in why
+    assert "until" in why
+    allowed, why = srv.recovery_mechanism.auto_recovery_allowed("reboot", tenant_active=False, now_epoch=1000.0 + 4000)
+    assert allowed is True, why
 
 
 def test_governor_allows_when_opted_in_idle_and_within_limits(monkeypatch, tmp_path):
@@ -5224,11 +5300,10 @@ def test_ipmitool_present_leaves_the_cold_rung_armed(monkeypatch):
     assert srv._auto_power_cycle_enabled() is True
 
 
-def test_power_cycle_escalates_past_a_recent_reboot(monkeypatch, tmp_path):
-    """The escalation the shared interval must NOT block: a warm reboot fired minutes ago and did
-    not clear a whole-bus wedge, so the broker must be free to escalate to the power cycle that
-    will — without waiting out the full loop-guard interval. The guard is per severity: a weaker
-    prior rung does not gate a stronger one."""
+def test_power_cycle_after_a_recent_reboot_waits_out_the_cooldown(monkeypatch, tmp_path):
+    """A warm reboot is a boot: the power cycle's cooldown counts from it (spec 04 I65, the cycle or
+    boot of any cause), so a cycle right after it is held to a stated time and fires at that time —
+    never a boot loop, never an open-ended hold."""
     d = _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-B")
     monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MIN_INTERVAL_SEC", 3600)
@@ -5237,12 +5312,16 @@ def test_power_cycle_escalates_past_a_recent_reboot(monkeypatch, tmp_path):
         '{"action": "reboot", "boot_id": "boot-A", "at_epoch": 1000.0}\n'
     )
     allowed, why = srv.recovery_mechanism.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=1060.0)
+    assert allowed is False
+    assert "cooldown until" in why and "broker reboot" in why
+    until = 1000.0 + recovery_base.POWER_CYCLE_MIN_INTERVAL_SEC
+    allowed, why = srv.recovery_mechanism.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=until)
     assert allowed is True, why
 
 
 def test_power_cycle_does_not_escalate_past_a_recent_power_cycle(monkeypatch, tmp_path):
     """Each rung's own loop guard holds: a power cycle that just fired and did not clear the mesh
-    will not clear it now, so a second one inside the interval is a loop, not a recovery."""
+    will not clear it now, so a second one inside the cooldown is a loop, not a recovery."""
     d = _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-B")
     monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MIN_INTERVAL_SEC", 3600)
@@ -5251,7 +5330,7 @@ def test_power_cycle_does_not_escalate_past_a_recent_power_cycle(monkeypatch, tm
     )
     allowed, why = srv.recovery_mechanism.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=1060.0)
     assert allowed is False
-    assert "boot-loop guard" in why
+    assert "cooldown until" in why and "broker power-cycle" in why
 
 
 def test_reboot_does_not_de_escalate_past_a_recent_power_cycle(monkeypatch, tmp_path):
@@ -11512,13 +11591,14 @@ async def test_a_whole_tray_below_the_floor_is_not_re_powered_alone_but_two_tray
     monkeypatch, clear_job_state, galaxy_trays
 ):
     """The guard is keyed on one affected tray below the floor, whatever the count on it: a whole tray
-    (8 off) is declined too. A below-floor drop across two trays still walks both (spec 04 I25)."""
+    (8 off) is declined too, as a whole-tray drop that goes to the power cycle. A below-floor partial
+    drop across two trays still walks both (spec 04 I25)."""
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
     tray3 = set(range(24, 32))
     fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(tray3)])
     out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(tray3), 8, 32, lambda m: None)
-    assert out is None and fired == []
-    assert "ubb_reset_declined_single_tray" in [n for n, _ in events]
+    assert out is False and fired == []
+    assert "ubb_reset_declined_whole_tray" in [n for n, _ in events]
 
     fired, events = _arm_ubb_walk(monkeypatch, [_beats_without({3, 24})])
     out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without({3, 24}), 2, 32, lambda m: None)
@@ -11682,8 +11762,8 @@ async def test_the_walk_rescans_only_the_re_powered_trays_root_ports(monkeypatch
     monkeypatch.setattr(galaxy, "UBB_WALK_RESCAN_SETTLE_SEC", 0)
     monkeypatch.setattr(pcie_guard, "rescan_trays", lambda trays, log: order.append(("tray", trays)) or ["rp"])
     monkeypatch.setattr(galaxy, "_pci_rescan", lambda: order.append(("global",)))
-    off = set(range(24, 32)) | {3}  # trays 1 and 3
-    await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(off), 9, 32, lambda m: None)
+    off = set(range(24, 28)) | {3}  # trays 1 and 3, neither wholly off (a whole tray is never walked)
+    await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(off), 5, 32, lambda m: None)
     assert order == [("tray", [1]), ("tray", [3])], "each tray's own ports, never the whole bus"
 
 
