@@ -3397,7 +3397,10 @@ async def _verify_operator_reset(present: int, recovery, log, source: str) -> tu
     )
     if verdict:
         _clear_device_reported_fault(f"{source}: verified healthy")
-        _clear_device_dirty(verified=True, why=f"{source}: verified healthy")
+        if not _clear_device_dirty(verified=True, why=f"{source}: verified healthy"):
+            # The funnel kept the hold (spec 03 I78, or a reset's fabric debt): report it as not
+            # verified, never as an OK the device did not get.
+            verdict = None
     elif verdict is None:
         _hold_device_fabric_unverified(f"{source}: enum+ARC healthy, fabric unverified after the post-reset retries")
     else:
@@ -4596,15 +4599,17 @@ async def _foreign_holder_fast_verify(expected: int, log: Callable[[str], None])
         why = (
             f"the full check did not pass (fabric={fabric_ok!r})"
             if not healthy and FABRIC_DEBT.runs_here(expected)
-            else "the mesh reads unhealthy"
-            if not healthy
             else (
-                f"the runtime reported '{device_fault_reported}'"
-                if device_fault_reported
-                else "the last fabric verdict was UNHEALTHY"
+                "the mesh reads unhealthy"
+                if not healthy
+                else (
+                    f"the runtime reported '{device_fault_reported}'"
+                    if device_fault_reported
+                    else "the last fabric verdict was UNHEALTHY"
+                )
             )
         )
-        log(f"foreign-holder hold: pre-job verify did not clear it ({why}) — the ceiling escalation owns it")
+        log(f"foreign-holder hold: the check did not clear it ({why}) — the ceiling escalation owns it")
         health_event("foreign_holder_verify", lifted=False, healthy=healthy, reason=why)
         return False
     # Same re-assert as the relift's own lift: the sampler's dead-chip path is lock-free and can

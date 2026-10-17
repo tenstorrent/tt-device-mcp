@@ -107,7 +107,7 @@ def test_no_debt_releases_as_before(mesh):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "evidence, verdict",
-    [(F77, None), ({"snapshot": {"ok": True}}, True)],
+    [(F77, None), ({"snapshot": {"ok": True}}, None)],  # held, so never reported OK (03 I78)
     ids=["fabric-77", "no-fabric-verdict"],
 )
 async def test_an_operator_reset_without_a_passing_fabric_pass_holds(mesh, monkeypatch, evidence, verdict):
