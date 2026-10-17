@@ -883,6 +883,29 @@ job boundary.
   ceiling): from the job's end, one scope poll plus the startup gate (about 1-2 min), against a
   galaxy reset, its settle and verify, then the gate (about 4-6 min) before. Other classes:
   unchanged.
+- **I76 — A startup hold behind a live re-adopted job is reported as startup verify, not as a fault.**
+  After a restart that re-adopts a running job, the `startup_unverified` hold (I4) waits for that job
+  and then the startup gate. A client that read the hold as a device in recovery stopped its healthy
+  re-adopted job to let the broker verify; the kill then owed the mesh a reset plus the full check
+  (I69), so the restart cost a job and made recovery longer. While the startup gate still owns the
+  hold (I75: its task is still to run, within `STARTUP_VERIFY_DEFER_MAX_SEC` of the re-adopted jobs'
+  end) and nothing says fault, `/health` carries a `startup_verify` object (`phase`:
+  `readopted_job_running` or `verifying`, `readopted_job_ids`, `fault: false`, `since`);
+  `tt_device_queue_status` carries the same field and a hold row that says it is no fault; a
+  re-adopted job's `tt_device_job_status` carries `readopted: true` and the same object. The field
+  is null as soon as anything says fault: a dirty mark, a runtime fault report, an owed kill reset, a
+  requested kill of a re-adopted job, an isolated chip, a live liveness finding (a chip off the bus),
+  or the hold's `why` turning into another class. `status` keeps its two values (`degraded` while
+  held): clients, the CLI's own reachability probe among them, read any other value as a broker that
+  is down. Reporting only: `fsm_state`/`fsm_why` keep their contract, `held`/`held_since`/
+  `held_age_sec` keep counting, tenants stay refused, the startup gate still runs the full check,
+  fabric included, after the hugepage wait and alone releases the queue, a kill still owes the reset
+  plus the full check, and no hold bound, ladder or power-cycle escalation reads the field. Time to
+  recover: no class gets slower and no wait is added. Class S (restart over a live re-adopted job),
+  for a client that reads the field instead of killing its job: the startup gate after the job's own
+  end (about 1-2 min), against a lost job plus one reset, its settle and the full check (about 4-6
+  min) before. A fault that appears during the window (off-bus, ARC/heartbeat, runtime fault,
+  fabric) keeps its own class's path: the field drops the moment the fault is visible.
 
 ## Interfaces
 
@@ -913,7 +936,9 @@ subsystem through the root:
   *Free* (`require_free=True`, `pre-step` only) applies the reset gate's tenant rule: a holder at
   or above `MIN_TENANT_UID`, or an incomplete scan, is not free (04 I7).
 - `/health` (REST, `server._health_payload`) — `status: ok|degraded` (degraded exactly while the
-  device is HELD: degraded, refused to tenants, no recovery op running), `fsm_state`, `fsm_why`,
+  device is HELD: degraded, refused to tenants, no recovery op running), `startup_verify` (non-null
+  while that hold is only a startup hold behind a live re-adopted job or its startup gate, I76),
+  `fsm_state`, `fsm_why`,
   `held`/`held_since`/`held_reason`/`held_age_sec`, `device_degraded`, queue counts, version.
   `held_reason` and `fsm_why` keep the reason the hold opened with; the live fields say where it
   stands now, read fresh from sysfs on every call with no device touch: `isolated_chips` (always),
@@ -1506,6 +1531,7 @@ refuses.
 | I69 (every broker kill logs one KILLED process-tree line) | `tests/test_job_kill_reset.py::test_a_broker_kill_logs_the_process_tree_it_stopped` |
 | I69 (a reaped leftover skips before the debt: no reset, debt kept, no wait; a reboot drops it and the startup full check runs; a cooldown skips and clears it with no wait) | `tests/test_job_kill_reset.py::test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait`, `tests/test_job_kill_reset.py::test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait` |
 | I75 | `tests/test_device_safety.py::test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_gate_not_reset`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_next_tick`, `tests/test_device_safety.py::test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladder`, `tests/test_device_safety.py::test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate` |
+| I76 | `tests/test_device_safety.py::test_health_names_a_startup_hold_behind_a_live_readopted_job_as_no_fault`, `tests/test_device_safety.py::test_the_startup_check_still_runs_and_gates_the_queue_after_the_readopted_job_ends`, `tests/test_device_safety.py::test_a_startup_check_that_passes_after_the_readopted_job_releases_the_queue`, `tests/test_device_safety.py::test_killing_the_readopted_job_drops_the_startup_verify_state_and_still_owes_the_reset`, `tests/test_device_safety.py::test_a_fault_during_the_startup_verify_state_reads_as_a_fault`, `tests/test_device_safety.py::test_the_startup_verify_state_hides_no_hold_bound` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

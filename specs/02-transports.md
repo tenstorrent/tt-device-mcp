@@ -103,8 +103,9 @@ socket (I8). All `/api/*` routes are POST with a JSON body.
 | `/api/tt_device_pre_step` | POST | `_pre_step_impl` | REST only — no MCP tool |
 | `/api/tt_device_post_step` | POST | `_post_step_impl` | REST only — no MCP tool |
 
-`/health` payload fields (`status`, `fsm_state`, `fsm_why`, `held*`, `device_degraded`, queue
-counts, version) are specified in spec 03 `Interfaces`.
+`/health` payload fields (`status`, `startup_verify`, `fsm_state`, `fsm_why`, `held*`,
+`device_degraded`, queue counts, version) are specified in spec 03 `Interfaces` (I76 for
+`startup_verify`, also on `tt_device_queue_status` and a re-adopted job's `tt_device_job_status`).
 
 ### Sockets and discovery
 

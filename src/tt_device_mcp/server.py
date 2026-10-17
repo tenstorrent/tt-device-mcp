@@ -6554,6 +6554,9 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         # The FSM's own record, straight from the source every field above is now derived from.
         "fsm_state": fsm.state.value,
         "fsm_why": fsm.record.why,
+        # Spec 03 I76: a startup hold behind a live re-adopted job, told apart from a fault; else null.
+        # `status` keeps its two values: clients read any other as a broker that is down.
+        "startup_verify": _startup_verify_view(),
     }
     payload.update(_live_offbus_state())
     # Whether the running job is doing device work (spec 03 I54); absent while no job runs.
@@ -8341,14 +8344,23 @@ def _get_queue_status() -> dict:
     # visible HOLD job; it makes device_busy True, which is what "not available to a
     # tenant" means. Suppressed while an op runs (that op is already the RUNNING row).
     hold = _device_hold_state()
+    startup_verify = _startup_verify_view()  # spec 03 I76
     if hold:
         reason, since = hold
+        command = f"device HELD (degraded): {reason} — new tenant jobs refused until recovered"
+        if startup_verify:
+            readopted = ", ".join(startup_verify["readopted_job_ids"])
+            command = (
+                "device HELD for the startup check, not a fault: "
+                + (f"re-adopted job {readopted} running" if readopted else "the full check is running")
+                + " — new tenant jobs wait for the check"
+            )
         rows.insert(
             0,
             {
                 "id": "--",
                 "owner": "[broker]",
-                "command": f"device HELD (degraded): {reason} — new tenant jobs refused until recovered",
+                "command": command,
                 "workspace": "-",
                 "started_at": since,
                 "op": "hold",
@@ -8376,6 +8388,8 @@ def _get_queue_status() -> dict:
         ],
         "device_busy": bool(rows),
         "device_degraded": degraded,
+        # Spec 03 I76: a startup hold behind a live re-adopted job, told apart from a fault; else null.
+        "startup_verify": startup_verify,
         # "" when no external step holds a reservation; otherwise every current holder's phase
         # name (comma joined — two can overlap, see _reserve_external_step). Also carried in the
         # RUNNING row above for `status`/`watch`; surfaced here too as a plain field for a caller
@@ -10758,6 +10772,30 @@ def _startup_verify_owns_hold() -> bool:
     return ready is None or time.monotonic() - ready < STARTUP_VERIFY_DEFER_MAX_SEC
 
 
+def _startup_verify_view() -> Optional[dict]:
+    """Spec 03 I76: the startup hold while all it waits on is the startup gate — a re-adopted job still
+    running on the device, or the gate itself inside its I75 bound — told apart from a fault.
+
+    A client that reads that hold as 'recovering' stops its healthy re-adopted job to let the broker
+    verify, and the kill then owes the mesh a reset plus the full check (I69). None as soon as anything
+    says fault: a dirty mark, a reported fault, an owed kill reset, a kill already requested, an isolated
+    chip, a live liveness finding, or the hold's `why` turning into a fault class. Reporting only: no
+    gate, wait or escalation reads it, so the startup gate and every hold bound act as before."""
+    if not _startup_verify_owns_hold():
+        return None
+    if fsm.record.dirty or device_fault_reported or _kill_reset_owed or isolated_chips:
+        return None
+    live = [jid for jid in readopted_scopes if (job := jobs.get(jid)) is not None and job.status is JobStatus.RUNNING]
+    if len(live) != len(readopted_scopes) or _device_liveness_reason():
+        return None
+    return {
+        "phase": "readopted_job_running" if live else "verifying",
+        "readopted_job_ids": live,
+        "fault": False,
+        "since": device_hold_episode_since or None,
+    }
+
+
 async def _await_startup_prerequisites(missing: str) -> None:
     """Owe the startup fabric pass again once what it lacked has landed (spec 03 I39).
 
@@ -11549,6 +11587,12 @@ def create_mcp_server() -> MCPServer:
             result["cause"] = job.error
         if job.status == JobStatus.RUNNING:
             result.update(job_activity_view(job_id) or {})  # DEVICE IDLE (spec 03 I54)
+        if job_id in readopted_scopes:
+            result["readopted"] = True
+            # Spec 03 I76: the broker's startup hold waits on this job; it is not a fault.
+            view = _startup_verify_view()
+            if view and job_id in view["readopted_job_ids"]:
+                result["startup_verify"] = view
         elif job.idle_total_sec is not None:
             result["idle_total_sec"] = job.idle_total_sec
         if job.preemptable:

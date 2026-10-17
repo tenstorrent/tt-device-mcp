@@ -15995,3 +15995,185 @@ async def test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate(mon
     srv.last_relift_monotonic = 0.0
     await srv._attempt_idle_relift()
     assert counters["resets"] == 1, "once the startup gate is done, a hold still standing escalates as before"
+
+
+def _readopted_running_job(job_id="428"):
+    job = srv.Job(id=job_id, owner="o", workspace="/w", command="c", queued_at="", status=srv.JobStatus.RUNNING)
+    srv.jobs[job_id] = job
+    return job
+
+
+@pytest.mark.asyncio
+async def test_health_names_a_startup_hold_behind_a_live_readopted_job_as_no_fault(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76: a restart re-adopted a healthy job and its startup hold
+    read as a device in recovery; a client yielded by killing the job, which then owed the mesh a reset
+    plus the full check. /health, the queue status and the job's own status now name the state and the
+    job, and say it is no fault. The hold itself stays visible: held, its start and its age, and the
+    FSM's own record. Fails on base, which has no startup_verify field."""
+    since, *_ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    _readopted_running_job()
+    srv._hold_episode_restorable = False
+
+    body = srv._health_payload(now=since + timedelta(seconds=700))
+    assert body["status"] == "degraded", "status keeps its two values: a client reads any other as broker down"
+    assert body["startup_verify"] == {
+        "phase": "readopted_job_running",
+        "readopted_job_ids": ["428"],
+        "fault": False,
+        "since": since.isoformat(),
+    }
+    assert body["fsm_state"] == "recovering" and body["fsm_why"] == "startup_unverified", "the FSM contract stands"
+    assert body["held"] is True and body["held_age_sec"] is not None, "the hold and its clock are not hidden"
+    assert body["device_degraded"], "a new tenant job is still refused until the startup check passes"
+
+    queue = srv._get_queue_status()
+    assert queue["startup_verify"]["readopted_job_ids"] == ["428"]
+    hold_row = next(r for r in queue["running"] if r.get("op") == "hold")
+    assert "not a fault" in hold_row["command"] and "428" in hold_row["command"]
+
+    from tt_device_mcp.socket_transport import current_peer_uid, current_via_mcp
+
+    mcp = srv.create_mcp_server()
+    tok, mtok = current_peer_uid.set(4242), current_via_mcp.set(False)
+    try:
+        out = json.loads((await mcp.call_tool("tt_device_job_status", {"params": {"job_id": "428"}})).content[0].text)
+    finally:
+        current_peer_uid.reset(tok)
+        current_via_mcp.reset(mtok)
+    assert out["readopted"] is True and out["startup_verify"]["phase"] == "readopted_job_running"
+    srv._startup_verify_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_the_startup_check_still_runs_and_gates_the_queue_after_the_readopted_job_ends(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76 (goal: a full check after every reset or start): the new state is reporting only.
+    While it shows, tenants stay refused; the startup gate still runs the full check, fabric included,
+    once the re-adopted job ends, and only its pass releases the queue. A gate that fails leaves an
+    ordinary fault hold: the state is gone."""
+    since, tenant, climbs, gate_calls, gate_heals, release_job, _ = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    job = _readopted_running_job()
+    assert srv._startup_verify_view()["phase"] == "readopted_job_running"
+    assert srv._device_unavailable_for_tenant(), "the queue opened before the startup check"
+
+    gate_heals["on"] = False
+    tenant["on"] = False
+    job.status = srv.JobStatus.COMPLETED
+    await release_job()
+    assert gate_calls == [("startup", True, True, [])], "the startup gate runs the full check, fabric included"
+    assert srv._startup_verify_view() is None, "a hold the startup gate left standing is a fault hold"
+    assert srv._health_payload()["startup_verify"] is None
+    assert srv._device_unavailable_for_tenant()
+
+
+@pytest.mark.asyncio
+async def test_a_startup_check_that_passes_after_the_readopted_job_releases_the_queue(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76: the 'verifying' phase covers the gate's own run; its pass opens the queue and
+    clears the state."""
+    *_, release_job, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    job = _readopted_running_job()
+    srv.readopted_scopes.pop("428")
+    job.status = srv.JobStatus.COMPLETED
+    assert srv._startup_verify_view()["phase"] == "verifying"
+    await release_job()
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert srv._startup_verify_view() is None
+    body = srv._health_payload()
+    assert body["status"] == "ok" and body["startup_verify"] is None
+
+
+@pytest.mark.asyncio
+async def test_killing_the_readopted_job_drops_the_startup_verify_state_and_still_owes_the_reset(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76 with I69: the state never covers a kill. Once a kill of the re-adopted job is
+    requested the hold reads as a fault again, and the job's end owes the mesh one reset plus the
+    full check, as before."""
+    *_, release_job, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    job = _readopted_running_job()
+    assert srv._startup_verify_view() is not None
+    job.status = srv.JobStatus.KILLED  # what _kill_job stamps before it stops the scope
+    srv.request_killed_job_ids.add("428")
+    assert srv._startup_verify_view() is None, "a requested kill is not 'no fault'"
+    assert srv._health_payload()["startup_verify"] is None
+    await asyncio.wait_for(srv._monitor_readopted_scope("428", "ttdev-job-428.scope"), timeout=5)
+    assert srv._kill_reset_debt().startswith("re-adopted job 428"), "the kill still owes one reset + full check"
+    assert srv._startup_verify_view() is None
+    srv._startup_verify_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_fault_during_the_startup_verify_state_reads_as_a_fault(monkeypatch, tmp_path, clear_job_state):
+    """Spec 03 I76: anything that says fault ends the state at once, so the fault's class keeps its own
+    shortest path and its clients see it: a chip the live probe finds off the bus, a runtime fault
+    report, an isolated chip, or the hold turning into a fault class."""
+    _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    _readopted_running_job()
+    assert srv._startup_verify_view() is not None
+
+    monkeypatch.setattr(srv, "_device_liveness_reason", lambda: "chip 3 off the PCIe bus")
+    assert srv._startup_verify_view() is None
+    monkeypatch.setattr(srv, "_device_liveness_reason", lambda: "")
+    assert srv._startup_verify_view() is not None
+
+    monkeypatch.setattr(srv, "device_fault_reported", "ttnn: ethernet core timeout")
+    assert srv._startup_verify_view() is None
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+
+    monkeypatch.setattr(srv, "isolated_chips", {5})
+    assert srv._startup_verify_view() is None
+    monkeypatch.setattr(srv, "isolated_chips", set())
+
+    fsm_dirty(srv, "chip 3 dropped", why="job_killed")
+    assert srv._startup_verify_view() is None
+    assert srv._health_payload()["startup_verify"] is None
+    srv._startup_verify_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_the_startup_verify_state_hides_no_hold_bound(monkeypatch, tmp_path, clear_job_state):
+    """Spec 03 I76 with I23/I75: the state is reporting only. While the re-adopted job runs past the
+    ceiling the hold stands down on that tenant exactly as before (and its age keeps counting on
+    /health); once the job has ended and the startup gate is stuck past STARTUP_VERIFY_DEFER_MAX_SEC
+    the state is gone and the ceiling ladder climbs on the next tick."""
+    since, tenant, climbs, _, _, _, tick = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    job = _readopted_running_job()
+    srv._hold_episode_restorable = False
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    await tick(ceiling + 1)
+    assert climbs == [] and srv.device_hold_tenant_deferred is True, "stood down on the live tenant, as before"
+    body = srv._health_payload(now=since + timedelta(seconds=ceiling + 1))
+    assert body["startup_verify"]["phase"] == "readopted_job_running" and body["held_age_sec"] is not None
+
+    tenant["on"] = False
+    job.status = srv.JobStatus.COMPLETED
+    srv.readopted_scopes.clear()
+    await asyncio.sleep(0)
+    gate_started = asyncio.Event()
+    stuck = asyncio.Event()
+
+    async def hung_gate():
+        gate_started.set()
+        await stuck.wait()
+
+    srv._startup_verify_task.cancel()
+    srv._startup_verify_task = asyncio.create_task(hung_gate())
+    await gate_started.wait()
+    monkeypatch.setattr(srv, "_startup_verify_ready_at", time.monotonic() - srv.STARTUP_VERIFY_DEFER_MAX_SEC - 1)
+    try:
+        assert srv._startup_verify_view() is None, "past its bound the startup gate no longer owns the hold"
+        await tick(ceiling + 11)
+        assert climbs == ["present-forced"]
+    finally:
+        stuck.set()
+        await srv._startup_verify_task
