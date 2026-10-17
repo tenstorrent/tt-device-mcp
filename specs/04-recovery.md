@@ -925,9 +925,12 @@ each rung fires only when the gentler one failed or cannot apply.
   (a slow cycler) is a cycle that ran: when the last escalation row before this boot's start is a
   missed power-cycle row from an earlier boot, and this boot started within `host_action_pending_sec`
   plus the boot attribution window (`TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC`) of it, that row
-  counts for the doubling, the per-boot cap, the backstop and the boot's attribution, and is marked
-  `took_host_down: true, late: true` on disk so every later boot counts it too
-  (`power_cycle_request_late`). Counting it is the boot-loop-safe side. The first miss is asked again
+  counts for the doubling, the backstop and the boot's attribution (not the per-boot cap, which counts
+  only this boot's rows), and is marked `took_host_down: true, late: true` on disk so every later boot
+  counts it too (`power_cycle_request_late`). Broker startup writes that mark for the boot it starts
+  on, whatever the boot does later: it may escalate only by reboot, or not at all, and its power-cycle
+  gate never runs. The mark is idempotent, and a ledger the broker cannot read or rewrite is left as
+  it is and logged. Counting it is the boot-loop-safe side. The first miss is asked again
   as its window ends, with no backoff on top: the window already gave the cycler its time. Later
   misses are asked again `POWER_CYCLE_MISS_RETRY_SEC` (5 min) after their window, never stopping.
   Before a retry goes out the governor checks the boot and the earlier request: a boot since the
@@ -955,7 +958,7 @@ each rung fires only when the gentler one failed or cannot apply.
   |---|---|---|---|
   | A whole tray, missed request | 30 min-4 h (each miss anchored and doubled the cooldown) | first miss 15 min, later 20 min (window + 0 / + 5 min) | 10 min; missed-request exception: window + 5 min |
   | B2 four chips off, missed request | 30 min-4 h (same) | first miss 15 min, later 20 min | 12 min; same exception |
-  | A or B1 after a cycle that landed late | doubles 30 min, 1 h, 2 h, 4 h | unchanged: the late cycle counts and doubles | I65 boot-loop guard (stated exception) |
+  | A or B1 after a cycle that landed late | doubles 30 min, 1 h, 2 h, 4 h | unchanged: the late cycle counts and doubles on every path, also when its boot escalates only by reboot (the startup mark) | I65 boot-loop guard (stated exception) |
   | A, B1 or B2 after a cycle that took the host down | I65 cooldown, doubling | unchanged | unchanged |
 
   I72 adds no wait before the first power-cycle request and gates only the power-cycle rung, never a
@@ -1453,7 +1456,7 @@ sees a silent fabric pass.
 | I65 a verified release on a later boot ends the streak with no heal file; one before the cycles does not | `tests/test_power_cycle_missed_request.py::test_a_verified_release_on_a_later_boot_ends_the_streak_without_a_heal_file`, `::test_a_verified_release_before_the_cycles_does_not_end_their_streak` |
 | I72 a missed request is marked on disk and asked again as its window ends, later ones 5 min after theirs, through the whole-tray path; a restarted broker reads an old same-boot row as missed | `tests/test_power_cycle_missed_request.py::test_a_request_the_host_never_acted_on_is_asked_again_as_its_window_ends`, `::test_later_retries_wait_5_min_after_their_window_and_never_stop`, `::test_a_whole_tray_drop_still_goes_to_the_power_cycle_after_a_missed_request`, `::test_a_restarted_broker_still_reads_an_old_same_boot_request_as_missed` |
 | I72 stated bound: the next request at most the window (first miss) or the window + 5 min after one the BMC missed; no retry while the earlier request is still pending; a late cycle before the retry is not cycled again on top | `tests/test_power_cycle_missed_request.py::test_the_retry_comes_at_most_the_window_plus_5_min_after_a_request_the_bmc_missed`, `::test_no_retry_while_the_earlier_request_is_still_pending`, `::test_a_late_cycle_before_the_retry_is_never_cycled_again_on_top` |
-| I72/I65 a cycle that lands after its window counts as a cycle that ran on every later boot: the cooldown doubles, the backstop and the boot's attribution count it | `tests/test_power_cycle_missed_request.py::test_cycles_that_land_after_their_window_still_double_the_cooldown_and_count_for_the_backstop` |
+| I72/I65 a cycle that lands after its window counts as a cycle that ran on every later boot: the cooldown doubles, the backstop and the boot's attribution count it; broker startup writes the late mark, so a boot that only reboots keeps it; an unreadable ledger is left as it is | `tests/test_power_cycle_missed_request.py::test_cycles_that_land_after_their_window_still_double_the_cooldown_and_count_for_the_backstop`, `::test_a_late_cycle_whose_boot_only_reboots_still_doubles_the_cooldown_on_later_boots`, `::test_the_startup_mark_leaves_an_unreadable_ledger_as_it_is` |
 | I72 missed requests neither double nor anchor the cooldown nor count toward the cap or backstop, on this boot or the next; the second pages; a real cycle still anchors and doubles | `tests/test_power_cycle_missed_request.py::test_two_missed_requests_leave_the_interval_at_base_and_page`, `::test_a_missed_row_still_counts_for_nothing_on_the_next_boot`, `::test_a_cycle_that_took_the_host_down_still_anchors_the_cooldown_and_doubles` |
 | I72 a retried cycle that heals releases only after the full fabric check, which clears the retry; /health shows the missed count and the next retry | `tests/test_power_cycle_missed_request.py::test_a_retried_cycle_that_heals_releases_only_after_the_full_fabric_check`, `::test_health_shows_the_missed_count_and_the_next_retry`, `::test_health_shows_no_missed_requests_for_a_plain_cooldown` |
 | I65 a failed out-of-band cycle (a second line, same `at_epoch`, cause + ` (cycle failed)`) never counts and cancels its attempt line; an unmatched failure line is ignored; an attempt with no failure line still counts; host boots are unchanged | `tests/test_power_cycle_cooldown.py::test_a_matched_failure_line_drops_the_attempt`, `::test_an_unmatched_failure_line_is_ignored`, `::test_an_attempt_without_a_failure_line_still_counts` |
