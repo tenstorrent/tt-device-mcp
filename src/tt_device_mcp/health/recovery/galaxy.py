@@ -2513,13 +2513,24 @@ class GalaxyRecovery(Recovery):
         lift = await self._offbus_hold_lift(expected, log)
         if not lift:
             return await self._climb_offbus_stuck_hold(indices, expected, log, force=force)
-        with pcie_guard.hold_lifted(lift):
-            return await self._climb_offbus_stuck_hold(indices, expected, log, force=force)
+        try:
+            with pcie_guard.hold_lifted(lift):
+                return await self._climb_offbus_stuck_hold(indices, expected, log, force=force)
+        finally:
+            offbus_power_cycle.rearm_after_partial_reset(self.deps.device_hold_episode_since())
 
     async def _offbus_hold_lift(self, expected: int, log) -> str:
-        """Why this pass may lift the ``hold`` gate (spec 04 I33), or "" to keep it."""
+        """Why this pass may lift the ``hold`` gate, or "" to keep it: with no power cycle configured,
+        once the operator hand-off ran out (spec 04 I33); with one configured, once per episode past
+        the grace for a partial off-bus drop, so the mesh reset is tried before the power cycle. A
+        whole tray down (every off-bus chip's tray fully off, :func:`_ubb_reset_plan`) keeps the gate
+        shut and goes to the power cycle (I27)."""
         hold_since = self.deps.device_hold_episode_since()
-        if not offbus_power_cycle.hold_handoff_due(hold_since) or offbus_power_cycle.power_cycle_argv() is not None:
+        cycle = offbus_power_cycle.power_cycle_argv() is not None
+        if cycle:
+            if not offbus_power_cycle.partial_reset_due(hold_since):
+                return ""
+        elif not offbus_power_cycle.hold_handoff_due(hold_since):
             return ""
         if not _hold_gate_liftable():
             return ""
@@ -2527,9 +2538,17 @@ class GalaxyRecovery(Recovery):
         off_bus = offbus_count(beats, expected)
         if off_bus <= 0:
             return ""
+        if cycle and _ubb_reset_plan(_offbus_chip_ids(beats, expected), expected, self._tray_map_now()) is not None:
+            log(
+                f"{off_bus}/{expected} chip(s) off the bus fill whole trays — no reset first; straight to the power cycle"
+            )
+            return ""
         standback = await asyncio.to_thread(offbus_power_cycle.standback_reason, require_manual_check=False)
         if standback:
-            log(f"off-bus hold past its operator hand-off, but {standback} — holding; the gate stays shut")
+            log(
+                f"off-bus hold past its {'grace' if cycle else 'operator hand-off'}, but {standback} — holding; "
+                f"the gate stays shut"
+            )
             offbus_power_cycle.page_if_blocked(
                 hold_since,
                 offbus_power_cycle.episode_age_sec(hold_since) or 0.0,
@@ -2539,7 +2558,14 @@ class GalaxyRecovery(Recovery):
                 off_bus=off_bus,
             )
             return ""
-        why = f"the {offbus_power_cycle.hold_handoff_sec()}s operator hand-off of this off-bus hold ran out"
+        if cycle:
+            why = (
+                f"a partial off-bus drop outlived its {offbus_power_cycle.grace_sec()}s grace: "
+                f"the reset ladder runs once before the power cycle"
+            )
+            offbus_power_cycle.note_partial_reset(hold_since)
+        else:
+            why = f"the {offbus_power_cycle.hold_handoff_sec()}s operator hand-off of this off-bus hold ran out"
         log(
             f"{off_bus}/{expected} chip(s) off the bus and {why} — lifting TT_DEVICE_MCP_HOST_RESET_GATE=hold "
             f"for this pass: the ladder's own rungs may fire, then the full health check"
