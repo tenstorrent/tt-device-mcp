@@ -247,7 +247,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_HOLD_DEADLINE_SEC` | 2× stuck ceiling (1200) | Hold age flagged STUCK to the durable timeline | 03 |
 | `TT_DEVICE_MCP_STUCK_HOLD_SEC` | 600 | General hold ceiling before forced escalation | 03 |
 | `TT_DEVICE_MCP_STUCK_HOLD_RESET` | 1 | Kill switch: idle escalation may reset a stuck hold | 03 |
-| `TT_DEVICE_MCP_OFFBUS_HOLD_SEC` | 120 | Off-bus hold ceiling (an order below the general one) | 03 |
+| `TT_DEVICE_MCP_OFFBUS_HOLD_SEC` | 120 | Off-bus one-shot wait while a tenant holds the device (a tenant-free hold runs it after one sampler interval) | 03 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE` | 1 | Kill switch: off-bus holds escalate early | 03 |
 | `TT_DEVICE_MCP_PROGRESS_RETRY_SEC` | 60 | Delay of the one retry after a failed mesh reset that brought chips back (capped at the hold ceiling) | 04 |
 | `TT_DEVICE_MCP_PRESENT_MESH_RESET_GRACE_SEC` | 300 | Present-mesh eth/fabric hold grace before reset | 03 |
