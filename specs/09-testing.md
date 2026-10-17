@@ -423,8 +423,13 @@ deployment shape, one venv owning the package — `pip install -e ".[dev]"`, the
 
 A hang fails fast instead of holding a runner for GitHub's 6 h default: pytest's `timeout =
 120` (pyproject) fails any single test after 120 s and prints every thread's stack, and the
-test job has `timeout-minutes: 20`. The whole device-free suite runs in a few minutes, so
-both limits leave wide margin.
+test job has `timeout-minutes: 40`. The whole device-free suite takes about 20 min on a
+runner (2,800+ tests), so the job cap leaves about 2x margin; the per-test limit, not the job
+cap, is what catches a hang.
+
+The org-wide spdx-checker job fails a PR on any source file without the SPDX header. It runs
+only in CI, so `tests/test_spdx_headers.py` checks every `.py` under `src/` and `tests/` in the
+device-free suite as well.
 
 That is the whole pipeline: no device stage, no lint stage, no matrix beyond 3.10. CI
 therefore proves exactly I4 — the suite passes device-free on a systemd-bearing VM — and the

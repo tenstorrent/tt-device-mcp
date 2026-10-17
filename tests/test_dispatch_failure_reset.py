@@ -226,8 +226,13 @@ def test_rung_gap_boot_warning_and_health_field(monkeypatch):
 def test_floor_message_promises_escalation_only_when_armed(monkeypatch):
     monkeypatch.delenv("TT_DEVICE_MCP_FORCE_ESCALATE", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_SELFHEAL_RELIFT", raising=False)
-    assert "escalates in ~2 min" in srv._hold_escalation_note(off_bus=1)
+    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_cooldown_state", None)
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    assert "~2 min" not in srv._hold_escalation_note(off_bus=1), "no 2-min rung for a drop with no isolated chip"
+    assert "climbs at the 10-min hold ceiling" in srv._hold_escalation_note(off_bus=1)
     assert "escalates at the 10-min hold ceiling" in srv._hold_escalation_note()
+    monkeypatch.setattr(srv, "isolated_chips", {7})
+    assert "escalates in ~2 min (isolated chips)" in srv._hold_escalation_note(off_bus=1)
     monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     for off_bus in (0, 1):
         note = srv._hold_escalation_note(off_bus)
@@ -280,3 +285,17 @@ async def test_gate_refused_reset_leaves_the_latch_unspent(monkeypatch, mesh):
     assert srv._dispatch_reset_spent is False, "a gate-refused reset is not spent"
     assert srv.fsm.state is ServerState.RECOVERING
     assert "already ran" not in srv.fsm.record.detail
+
+
+@pytest.mark.asyncio
+async def test_a_clean_exit_dispatch_failure_whose_reset_fails_stays_held(mesh):
+    """The same reset from a clean exit (no episode open yet): the gate opens one before it fires,
+    so a failed post-reset check holds the door instead of leaving the FSM HEALTHY."""
+    srv.fsm.on_readings(srv._healthy_reading())
+    assert srv.fsm.state is ServerState.HEALTHY
+    mesh["reset_heals"] = False
+    await _gate()
+    assert mesh["resets"] == [["tt-smi", "-glx_reset"]]
+    assert mesh["verifies"][-1] is True, "the post-reset check ran the fabric pass"
+    assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
+    assert srv._device_unavailable_for_tenant()
