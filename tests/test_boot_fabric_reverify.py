@@ -32,12 +32,12 @@ _FABRIC_77 = (
 _FABRIC_OK = (True, {"snapshot": {"ok": True}, "fabric": {"ok": True, "detail": "fabric healthy"}})
 
 
-def _carried(tmp_path, *, boot_after="boot-after", state=ServerState.DOWN):
+def _carried(tmp_path, *, boot_after="boot-after", state=ServerState.DOWN, why="fabric_unverified"):
     """An episode written under one boot and loaded under ``boot_after``, as run_startup_tasks does."""
     path = tmp_path / "fsmdir" / "fsm.json"
     path.parent.mkdir(exist_ok=True)
     before = ServerFsm(path, current_boot_id="boot-before")
-    before.on_fault("fabric_unverified", detail=_HOLD_DETAIL, dirty=False)
+    before.on_fault(why, detail=_HOLD_DETAIL, dirty=False)
     before.set_latch("escalated", True)
     before.set_latch("ubb_reset_fired", True)
     if state is ServerState.DOWN:
@@ -198,6 +198,51 @@ async def test_a_reopened_known_fabric_fault_is_held_without_a_climb(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_a_carried_dirty_down_of_another_cause_reopens_on_a_clean_startup_77(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The reopen reads the record after the gate's own 77 hold (why fabric_unverified, dirty
+    cleared), so a carried DOWN of any cause or dirty mark reopens, as a fresh record's 77 would."""
+    path = tmp_path / "fsmdir" / "fsm.json"
+    path.parent.mkdir()
+    before = ServerFsm(path, current_boot_id="boot-before")
+    before.on_fault("job_killed", detail="chip 3 isolated by the sampler", dirty=True)
+    before.on_outcome("terminal")
+    raw = json.loads(path.read_text())
+    raw["since"] = _OLD_SINCE
+    path.write_text(json.dumps(raw))
+    fsm = ServerFsm(path, current_boot_id="boot-after")
+    fsm.boot_merge(open_episode=fsm.record, attributed_boot=None)
+    assert fsm.state is ServerState.DOWN and fsm.record.dirty
+    _events, seen = _broker(monkeypatch, tmp_path, fsm)
+
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY and not srv.fsm.record.dirty
+    assert srv.fsm.record.since != _OLD_SINCE
+    assert srv._startup_fabric_owed()
+
+
+@pytest.mark.asyncio
+async def test_with_the_relift_off_the_reopened_hold_gets_only_the_owed_pass(monkeypatch, tmp_path, clear_job_state):
+    """TT_DEVICE_MCP_FABRIC_RELIFT=0 (I34): one owed pass; a second 77 leaves the hold standing."""
+    _events, seen = await _reopened(monkeypatch, tmp_path)
+    runs = len(seen["fabric"])
+
+    await srv._attempt_idle_relift()
+    assert len(seen["fabric"]) == runs + 1, "the owed pass runs"
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert not srv._startup_fabric_owed()
+
+    monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
+    await srv._attempt_idle_relift()
+    assert len(seen["fabric"]) == runs + 1, "no further pass with the relift off"
+    assert seen["resets"] == 0 and seen["rungs"] == []
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
 async def test_a_same_boot_down_is_not_reopened(monkeypatch, tmp_path, clear_job_state):
     """Within one boot, DOWN is the verdict of a ladder that ran on this silicon: it stands."""
     fsm = _carried(tmp_path, boot_after="boot-before")
@@ -211,19 +256,19 @@ async def test_a_same_boot_down_is_not_reopened(monkeypatch, tmp_path, clear_job
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("finding", ["fabric_bad", "dirty", "fault_reported", "isolated"])
+@pytest.mark.parametrize("finding", ["fabric_bad", "fault_reported", "isolated", "no_hold"])
 async def test_a_carried_down_with_a_finding_is_not_reopened(monkeypatch, tmp_path, clear_job_state, finding):
     """Only a startup 77 with every chip healthy and nothing named reopens the hold."""
-    fsm = _carried(tmp_path)
+    fsm = _carried(tmp_path, why="eth_frozen" if finding == "no_hold" else "fabric_unverified")
     events, _seen = _broker(monkeypatch, tmp_path, fsm)
-    srv._hold_device_fabric_unverified(_HOLD_DETAIL)
+    if finding != "no_hold":
+        srv._hold_device_fabric_unverified(_HOLD_DETAIL)
+    # else a caller that did not place the 77 hold first: the record still names its carried cause.
     if finding == "fabric_bad":
         monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)
-    elif finding == "dirty":
-        srv.fsm.on_fault("job_killed", detail="chip 3 isolated by the sampler", dirty=True)
     elif finding == "fault_reported":
         monkeypatch.setattr(srv, "device_fault_reported", "runtime: ethernet core timeout")
-    else:
+    elif finding == "isolated":
         monkeypatch.setattr(srv, "isolated_chips", {3})
 
     assert srv._reopen_boot_carried_fabric_hold() is False

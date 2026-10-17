@@ -7,10 +7,12 @@ the power cycle cannot run, so before this the hold stood until a human power-cy
 the hold is bounded: once the episode has stood ``TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC`` (default
 300 s) and the ladder's safe rungs have run once, the broker runs the host's own power-cycle command
 ``TT_DEVICE_MCP_POWER_CYCLE_CMD`` — but only on a tenant-free box, with no operator recovery in
-progress and no stand-back marker or command active, and at most once per
-``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC`` (default 6 h). Past that, or with the command
-unset, it pages instead and the hold stands as before; a cycle blocked
-``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC`` (default 1800 s) past the grace pages too.
+progress and no stand-back marker or command active, and spaced by the power cycle's cooldown (spec 04
+I65). ``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC`` (unset by default) adds a spacing between
+attempts on top of it, never above the I65 backoff cap; either wait is stated on /health and the cycle
+is asked again the moment it ends. With the command unset it pages instead and the hold stands as
+before; a cycle blocked ``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC`` (default 1800 s) past
+the grace pages too.
 
 The same bounded end applies when the gate allows resets but the BMC's IPMI failed a tray re-power
 (:class:`~tt_device_mcp.health.recovery.stages.ubb_tray.BmcIpmiError`): the tray rung, the mesh reset
@@ -22,6 +24,10 @@ same checks, stand-backs and rate limit.
 It applies too when this episode's per-tray reset walk fired and did not recover the mesh, or took
 more chips off the bus: the ladder then holds instead of trying the below-floor mesh reset, and the
 command fires ``TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC`` (default 300 s) after the walk failed.
+
+A below-floor drop that takes a whole UBB tray off the bus goes to the command at once, with no grace
+(:func:`note_whole_tray_down`): a single-tray re-power of it took the other trays off the bus, the
+below-floor mesh reset inverts it, and no single reset has brought such a tray back.
 
 Every phase goes to the fsync'd health journal, and each attempt is written to a small state file in
 the health dir before the command runs, so a broker killed mid-cycle (the cycle itself) still counts
@@ -46,7 +52,7 @@ from tt_device_mcp.health.evidence import health_dir, health_event
 
 STATE_FILE = "offbus_power_cycle.json"
 GRACE_DEFAULT_SEC = 300
-MIN_INTERVAL_DEFAULT_SEC = 6 * 3600
+MIN_INTERVAL_DEFAULT_SEC = 0  # no spacing beyond the I65 cooldown unless an operator sets one
 CHECK_TIMEOUT_DEFAULT_SEC = 10.0
 FIRE_TIMEOUT_DEFAULT_SEC = 120.0
 BLOCKED_PAGE_DEFAULT_SEC = 1800
@@ -94,8 +100,14 @@ def tray_walk_handoff_sec() -> int:
 
 
 def min_interval_sec() -> int:
-    """At most one attempt per this many seconds per box (default 6 h); past it, page instead."""
-    return _int_env("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", MIN_INTERVAL_DEFAULT_SEC)
+    """Seconds an attempt holds the next one off, on top of the I65 cooldown; 0 (the default) adds
+    none. Never above the I65 backoff cap: a wait with no stated, bounded end is an open-ended hold."""
+    from tt_device_mcp.health.recovery.base import POWER_CYCLE_BACKOFF_CAP_SEC
+
+    return min(
+        _int_env("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", MIN_INTERVAL_DEFAULT_SEC),
+        POWER_CYCLE_BACKOFF_CAP_SEC,
+    )
 
 
 def _argv(name: str) -> Optional[list]:
@@ -222,21 +234,23 @@ def save_state(state: dict) -> None:
     os.replace(tmp, path)
 
 
-def last_attempt_within(state: dict, now: float, interval: int) -> Optional[float]:
-    """Epoch of an attempt younger than ``interval``, or None. An unreadable stamp counts as now."""
+def last_attempt_within(state: dict, now: float, interval: int, healed=None) -> Optional[float]:
+    """Epoch of an attempt younger than ``interval``, or None. An unreadable stamp counts as now. An
+    attempt ``healed(rec)`` says a later boot verified healthy is skipped: the hold after it is a new
+    episode, not a loop (spec 04 I9); the ledger's backstop still caps every cycle."""
     for rec in state.get("attempts") or []:
         try:
             at = float(rec.get("at_epoch"))
         except (AttributeError, TypeError, ValueError):
             return now
-        if now - at < interval:
+        if now - at < interval and not (healed and healed(rec)):
             return at
     return None
 
 
-def record_attempt(state: dict, now: float, episode: str, reason: str) -> None:
+def record_attempt(state: dict, now: float, episode: str, reason: str, boot_id: str = "") -> None:
     attempts = list(state.get("attempts") or [])
-    attempts.insert(0, {"at_epoch": now, "episode": episode, "reason": reason})
+    attempts.insert(0, {"at_epoch": now, "episode": episode, "reason": reason, "boot_id": boot_id})
     state["attempts"] = attempts[:MAX_ATTEMPTS_KEPT]
     save_state(state)
 
@@ -323,6 +337,30 @@ def tray_walk_detail(episode: str) -> str:
     return _pending.get("tray_walk_detail", "") if _pending.get("episode") == episode else ""
 
 
+def note_whole_tray_down(episode: str, detail: str, now: Optional[datetime] = None) -> None:
+    """A whole UBB tray is off the bus in this episode's below-floor drop: no tray re-power and no mesh
+    reset is tried for it, so the ladder counts as run and the command fires with no grace (idempotent)."""
+    if not episode:
+        return
+    _track(episode)
+    _pending["ladder_ran"] = True
+    if _pending.get("whole_tray_at") is None:
+        _pending["whole_tray_at"] = now or datetime.now()
+        _pending["whole_tray_detail"] = detail[-200:]
+        health_event("offbus_gated_hold", phase="whole_tray_down", held_since=episode, detail=detail[-200:])
+
+
+def whole_tray_down_age_sec(episode: str, now: Optional[datetime] = None) -> Optional[float]:
+    """Seconds since this episode's drop was found to hold a whole tray, or None when it has not."""
+    if not episode or _pending.get("episode") != episode or _pending.get("whole_tray_at") is None:
+        return None
+    return ((now or datetime.now()) - _pending["whole_tray_at"]).total_seconds()
+
+
+def whole_tray_detail(episode: str) -> str:
+    return _pending.get("whole_tray_detail", "") if _pending.get("episode") == episode else ""
+
+
 def note_ladder_ran(episode: str) -> None:
     """The safe rungs ran for this episode. Tracks it even when nothing armed it yet: the ladder's own
     tray rung may start the IPMI clock only after this (tracking alone forces no pass)."""
@@ -353,11 +391,14 @@ def _handoff_deadline(episode: str) -> Optional[float]:
         return None
 
 
-def note_hold_handoff(episode: str, off_bus: int, expected: int, why: str, log, *, latched: str = "") -> None:
+def note_hold_handoff(
+    episode: str, off_bus: int, expected: int, why: str, log, *, latched: str = "", cause: str = ""
+) -> None:
     """The gate refuses every reset of this episode's off-bus hold and no power cycle is configured: hand
     the hold to an operator with a deadline, once per episode (spec 04 I33). The manual-recovery check
     runs once here, so the page says whether an operator is already on it. ``latched`` names an operator
-    gate (the I25 latch) that keeps the gate shut past the deadline."""
+    gate (the I25 latch) that keeps the gate shut past the deadline. ``cause`` replaces the page's
+    default reason (no power-cycle command) when another path hands the hold off (spec 04 I36)."""
     if not episode:
         return
     _track(episode)
@@ -393,7 +434,7 @@ def note_hold_handoff(episode: str, off_bus: int, expected: int, why: str, log, 
         "offbus_gated_hold_page",
         log,
         f"{off_bus}/{expected} chip(s) off the bus and no reset can end the hold ({why}); "
-        f"TT_DEVICE_MCP_POWER_CYCLE_CMD is not set, so {then}; manual-recovery check: {h['operator_seen']}",
+        f"{cause or 'TT_DEVICE_MCP_POWER_CYCLE_CMD is not set'}, so {then}; manual-recovery check: {h['operator_seen']}",
         held_since=episode,
         off_bus=off_bus,
         expected=expected,
@@ -506,9 +547,16 @@ def page_if_blocked(episode: str, age: float, log, why: str, *, bound: Optional[
 def fire_command(argv: list, reason: str, timeout: float = FIRE_TIMEOUT_DEFAULT_SEC) -> None:
     """Run the host's power-cycle command with the reason in ``TT_DEVICE_MCP_POWER_CYCLE_REASON``.
     Raises on a non-zero exit, a timeout or a command that cannot start, so the caller's ledger
-    retracts an action that never launched. Tests replace it: no test may cycle the host."""
+    retracts an action that never launched; a timeout raises HostActionTimedOut, which keeps the
+    request pending (it may still act). Tests replace it: no test may cycle the host."""
     env = {**os.environ, "TT_DEVICE_MCP_POWER_CYCLE_REASON": reason}
     rc, out = _run(argv, _int_env("TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC", int(timeout)), env)
+    if rc is None and out.startswith("timed out"):
+        # It may have started its detached cycler before it stopped answering: the request stays
+        # pending (spec 04 I34) rather than reading as never launched.
+        from tt_device_mcp.health.recovery.base import HostActionTimedOut
+
+        raise HostActionTimedOut(f"power-cycle command {out}")
     if rc != 0:
         raise RuntimeError(f"power-cycle command {'exited ' + str(rc) if rc is not None else out}: {out[-200:]}")
 
