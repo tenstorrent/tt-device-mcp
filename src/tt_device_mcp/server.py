@@ -1176,6 +1176,9 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         # that died mid-recovery left in the file (a per-user daemon's state dir outlives it).
         chip_state.publish()
         recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
+        recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
+            _pollers_unfit_reason() or f"{after} did not complete"
+        )
         galaxy_recovery = fsm.galaxy
         per_target_recovery = fsm.per_target
         select_recovery = fsm.select_recovery
@@ -5166,16 +5169,13 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         # nothing, so its post-reset verify runs on the same quiet bus. The owner restarts them.
         log(f"device pollers kept stopped: {_pollers_held_for} still running")
         return []
-    global _pollers_owed, _pollers_owed_loop
+    global _pollers_owed
     if active:
         unfit = _pollers_unfit_reason()
         if unfit:
             # A failed reset, or one whose verify has not passed yet: the pollers wait for the device to
             # be proven healthy, and the close listener starts them then. Costs no recovery time.
-            if _pollers_owed is None:
-                health_event("pollers_kept_quiesced", reason=unfit, services=list(DEVICE_POLLER_SERVICES))
-            _pollers_owed = unfit
-            _pollers_owed_loop = asyncio.get_running_loop()
+            _owe_device_pollers(unfit)
             log(f"device pollers kept stopped until the device is verified healthy: {unfit}")
             return []
         _pollers_owed = None
@@ -5255,6 +5255,19 @@ async def _pollers_quiesced_for(what: str, log):
 # The loop a deferred restart was asked on, and the restart tasks in flight (held so they finish).
 _pollers_owed_loop: Optional[asyncio.AbstractEventLoop] = None
 _pollers_restore_tasks: "set[asyncio.Task]" = set()
+
+
+def _owe_device_pollers(why: str) -> None:
+    """Leave the pollers stopped and owe their start to the next close to HEALTHY (see
+    _restore_pollers_on_close). Also the hook a reset step that did not complete calls (spec 03 I66):
+    its chips may still be off the bus or hung, so it starts nothing, even on a HEALTHY FSM."""
+    global _pollers_owed, _pollers_owed_loop
+    if _pollers_held_for:
+        return  # the wider quiesce's owner restarts them, through the same fitness rule
+    if _pollers_owed is None:
+        health_event("pollers_kept_quiesced", reason=why, services=list(DEVICE_POLLER_SERVICES))
+    _pollers_owed = why
+    _pollers_owed_loop = asyncio.get_running_loop()
 
 
 def _pollers_log(line: str) -> None:

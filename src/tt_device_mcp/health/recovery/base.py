@@ -414,6 +414,9 @@ class RecoveryMechanism:
         # 01 I16): a reaped job's process still holding the device, which a reset cannot free.
         # Checked here, where every reset passes, so no caller can reset over one.
         self.reset_fence: Optional[Callable[[], str]] = None
+        # Owes the pollers a step left stopped to the broker's next close to HEALTHY (spec 03 I66,
+        # 04 I12); the broker sets it. Called with what the step was.
+        self.owe_device_pollers: Optional[Callable[[str], None]] = None
 
         # Two callers (the auto-recovery reset launcher and the operator-run reset tool) need this
         # sequence and they must build it identically, because the scope name is what every other
@@ -1157,15 +1160,26 @@ class RecoveryMechanism:
     async def restore_pollers(self, quiesced: list, log, *, ok: bool, after: str) -> None:
         """Start the device pollers a reset step stopped, but only after a step that completed
         (spec 03 I66). After a failed, timed-out or unrecovered step the chips may still be off the
-        bus or hung and the device stays held, so the pollers stay stopped: the health probe re-arms
-        them once the broker reports the device idle and healthy."""
+        bus or hung and the device stays held, so the pollers stay stopped, owed to the next close to
+        HEALTHY (reached only through a passing full check, fabric included; spec 04 I12)."""
         if not quiesced:
             return
         if not ok:
             log(f"device pollers left stopped after {after}: the step did not complete, the device stays held")
             health_event("pollers_left_quiesced", after=after, services=list(quiesced))
+            self.owe_pollers(after)
             return
         await asyncio.shield(self._set_device_pollers(True, log))
+
+    def owe_pollers(self, after: str) -> None:
+        """Hand the pollers a step left stopped to the broker's close-to-HEALTHY restart. Never raises."""
+        owe = self.owe_device_pollers
+        if owe is None:
+            return
+        try:
+            owe(after)
+        except Exception:  # noqa: BLE001 - a missed restart leaves them for the health probe
+            pass
 
     def _driver_wait_rescan_hook(self, argv: list[str], on_output, log):
         """Spec 04 I81: let a mesh reset bring back the chips this broker isolated, in the same reset.

@@ -1823,6 +1823,9 @@ class GalaxyRecovery(Recovery):
                 # A refused or failed re-power leaves the tray as it was: off the bus (spec 03 I66).
                 log("device pollers left stopped: the tray re-power did not fire")
                 health_event("pollers_left_quiesced", after=f"tray re-power 0x{bitmap:02x}", services=list(quiesced))
+                owe = getattr(self.mechanism, "owe_pollers", None)
+                if owe is not None:
+                    owe(f"tray re-power 0x{bitmap:02x}")
             elif quiesced:
                 await asyncio.shield(set_pollers(True, log))
 
