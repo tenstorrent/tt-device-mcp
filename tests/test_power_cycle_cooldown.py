@@ -601,4 +601,6 @@ def test_a_broker_cycle_with_an_unreadable_stamp_spends_the_deadline(cool, stamp
 def test_the_post_boot_settle_is_within_the_startup_gates_own_bound():
     from tt_device_mcp.constants import FABRIC_CHECK_TIMEOUT_SEC
 
-    assert 0 < recovery_base.POWER_CYCLE_POST_BOOT_SETTLE_SEC <= srv.STARTUP_HUGEPAGES_WAIT_SEC + FABRIC_CHECK_TIMEOUT_SEC
+    assert (
+        0 < recovery_base.POWER_CYCLE_POST_BOOT_SETTLE_SEC <= srv.STARTUP_HUGEPAGES_WAIT_SEC + FABRIC_CHECK_TIMEOUT_SEC
+    )
