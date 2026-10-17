@@ -4001,6 +4001,10 @@ def _fabric_77_bound_reached() -> bool:
         opened = None
     if opened is None or not _last_77_was_hugepages():
         _fabric_77_streak += 1
+        if _fabric_77_climb_owed():
+            # The episode's one reset already came back UNKNOWN, or this boot is the warm reboot a 77
+            # climb fired: more retries measure nothing new; the climb is owed now (spec 04 I79).
+            return True
     if _fabric_77_streak >= _env_int("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", 3, 1):
         return True
     if opened is None:
@@ -4047,6 +4051,8 @@ def _fabric_77_recheck_due() -> bool:
     hold opened, then each further step after the last re-check that 77'd again. A hugepage 77 re-checks
     every FABRIC_77_HUGEPAGES_RECHECK_SEC."""
     steps = [FABRIC_77_HUGEPAGES_RECHECK_SEC] if _last_77_was_hugepages() else _fabric_77_backoff_sec()
+    if _fabric_77_climb_owed():
+        steps = steps[:1]  # the climb is owed: its first step only, never the longer backoff (04 I79)
     if _fabric_77_recheck_since != fsm.record.since or not _fabric_77_rechecks:
         try:
             opened = datetime.strptime(str(fsm.record.since), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -4055,6 +4061,11 @@ def _fabric_77_recheck_due() -> bool:
         return (datetime.now(timezone.utc) - opened).total_seconds() >= steps[0]
     wait = steps[min(_fabric_77_rechecks, len(steps) - 1)]
     return time.monotonic() - _fabric_77_recheck_monotonic >= wait
+
+
+def _fabric_77_climb_owed() -> bool:
+    """Whether the open 77 hold owes the climb at once (spec 04 I79; the galaxy recovery decides)."""
+    return galaxy_recovery is not None and galaxy_recovery.fabric_77_climb_owed(device_hold_episode_since)
 
 
 def _note_fabric_77_recheck() -> None:
@@ -4138,6 +4149,15 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
         )
         + ") — climbing the recovery ladder"
     )
+    if (
+        galaxy_recovery is not None
+        and device_hold_episode_since
+        and galaxy_recovery.fabric_77_climb_owed(device_hold_episode_since)
+    ):
+        # This boot is the warm reboot an earlier 77 climb fired: that episode's reset and sweep already
+        # ran and the reboot did not end the 77. The ladder's sweep (every reset type, then the full
+        # check) runs once more before the cold rung, never a fresh I40 round first (spec 04 I79).
+        galaxy_recovery.mechanism.unverified_reset_since = device_hold_episode_since
     return await escalate("present")
 
 
@@ -5091,6 +5111,21 @@ def _stack_versions() -> dict:
 # What holds the device pollers stopped across more than one reset, or None. While set, a restart
 # asked for by a reset inside it is deferred to that holder (see _pollers_quiesced_for).
 _pollers_held_for: Optional[str] = None
+# Why a restart found the device unfit for the pollers (held, recovering, down), or None. While
+# set, the next close to HEALTHY — reached only through a passing full check, fabric included —
+# starts them (see _restore_owed_pollers).
+_pollers_owed: Optional[str] = None
+
+
+def _pollers_unfit_reason() -> Optional[str]:
+    """Why the device is not fit for the pollers to start on, or None. Only a HEALTHY FSM is: every
+    route to it is a passing gate (spec 03), and every reset leaves the FSM off it until then. A
+    poller started on a held mesh re-opens every chip in a loop, chips off the bus included: a
+    telemetry poller crash-looped every ~35 s over a 32-chip mesh held with 8 chips off the bus."""
+    rec = fsm.record
+    if rec.state is ServerState.HEALTHY:
+        return None
+    return f"device {rec.state.value} ({rec.why or '?'})"
 
 
 async def _set_device_pollers(active: bool, log) -> list[str]:
@@ -5109,6 +5144,19 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         # nothing, so its post-reset verify runs on the same quiet bus. The owner restarts them.
         log(f"device pollers kept stopped: {_pollers_held_for} still running")
         return []
+    global _pollers_owed, _pollers_owed_loop
+    if active:
+        unfit = _pollers_unfit_reason()
+        if unfit:
+            # A failed reset, or one whose verify has not passed yet: the pollers wait for the device to
+            # be proven healthy, and the close listener starts them then. Costs no recovery time.
+            if _pollers_owed is None:
+                health_event("pollers_kept_quiesced", reason=unfit, services=list(DEVICE_POLLER_SERVICES))
+            _pollers_owed = unfit
+            _pollers_owed_loop = asyncio.get_running_loop()
+            log(f"device pollers kept stopped until the device is verified healthy: {unfit}")
+            return []
+        _pollers_owed = None
     verb = "start" if active else "stop"
     touched = []
     for svc in DEVICE_POLLER_SERVICES:
@@ -5152,7 +5200,8 @@ async def _pollers_quiesced_for(what: str, log):
     Best-effort, as for a reset: a poller that will not stop never blocks the check. The restart is
     skipped only while a reset scope is still cycling the chips off the bus (a timed-out or abandoned
     reset), where restarting them is the MMIO-at-a-dead-endpoint hazard the reset path also avoids;
-    the health probe re-arms them once the device is idle and healthy. Costs one ``systemctl stop``
+    the health probe re-arms them once the device is idle and healthy. A check that held the mesh
+    leaves them stopped too, until the device is verified healthy (``_set_device_pollers``). Costs one ``systemctl stop``
     before the check and one ``start`` after it, each bounded at 30 s per unit."""
     global _pollers_held_for
     stopped: list[str] = []
@@ -5179,6 +5228,55 @@ async def _pollers_quiesced_for(what: str, log):
                 health_event("pollers_left_quiesced", after=what, scope=str(cycling))
             else:
                 await asyncio.shield(_set_device_pollers(True, log))
+
+
+# The loop a deferred restart was asked on, and the restart tasks in flight (held so they finish).
+_pollers_owed_loop: Optional[asyncio.AbstractEventLoop] = None
+_pollers_restore_tasks: "set[asyncio.Task]" = set()
+
+
+def _pollers_log(line: str) -> None:
+    if logger:
+        logger.info(f"HEALTH {line}")
+
+
+async def _restore_owed_pollers() -> None:
+    """Start the pollers a restart deferred, once the device is proven healthy. Best-effort and off
+    the release path: the queue never waits on it."""
+    if _pollers_owed is None:
+        return
+    try:
+        await _set_device_pollers(True, _pollers_log)
+    except Exception as exc:  # noqa: BLE001 - best-effort, as every poller restart is
+        _pollers_log(f"could not restart the device pollers after the device was verified: {exc!r}")
+
+
+def _restore_pollers_on_close() -> None:
+    """Close listener: the device just reached HEALTHY, so start the pollers a restart deferred.
+    Cheap, never raises, safe from any thread."""
+    loop = _pollers_owed_loop
+    if _pollers_owed is None or loop is None or loop.is_closed():
+        return
+
+    def _spawn() -> None:
+        task = loop.create_task(_restore_owed_pollers())
+        _pollers_restore_tasks.add(task)
+        task.add_done_callback(_pollers_restore_tasks.discard)
+
+    try:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            _spawn()
+        else:
+            loop.call_soon_threadsafe(_spawn)
+    except Exception:  # noqa: BLE001 - a missed restart leaves them for the next one
+        pass
+
+
+add_close_listener(_restore_pollers_on_close)
 
 
 def _auto_reboot_enabled() -> bool:
