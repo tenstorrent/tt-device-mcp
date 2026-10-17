@@ -1788,11 +1788,71 @@ def test_reboot_row_dedups_even_when_the_kernel_boot_id_is_unreadable(monkeypatc
         return real_read_text(self, *a, **k)
 
     monkeypatch.setattr(srv.Path, "read_text", read_text_no_boot_id)
+    # Pin btime: the real /proc/stat value can shift by a second between two reads in one boot
+    # (covered on its own below), which made this test flaky under the full suite.
+    monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int(srv.time.time()) - 600))
 
     srv._record_previous_boot_error()
     srv._record_previous_boot_error()
 
     assert len(_reboot_rows(tmp_path)) == 1
+
+
+def _no_boot_id(monkeypatch):
+    real_read_text = srv.Path.read_text
+
+    def read_text_no_boot_id(self, *a, **k):
+        if str(self) == "/proc/sys/kernel/random/boot_id":
+            raise OSError("boot_id unreadable")
+        return real_read_text(self, *a, **k)
+
+    monkeypatch.setattr(srv.Path, "read_text", read_text_no_boot_id)
+
+
+@pytest.mark.parametrize("shift", [1, -1, srv._BTIME_DEDUP_SLACK_SEC, -srv._BTIME_DEDUP_SLACK_SEC])
+def test_reboot_row_dedups_when_btime_shifts_within_one_boot(monkeypatch, tmp_path, shift):
+    """/proc/stat btime is wall clock minus uptime, so it is not fixed within a boot: kernel
+    rounding moves it by a second between reads, and NTP slewing drifts it further over a long
+    uptime. Matching the marker on the exact value gave one boot two reboot rows, which
+    double-counts reboots in any audit of them. A shift within the slack is the same boot."""
+    _boot_recording(monkeypatch, tmp_path, {"present": False})
+    _no_boot_id(monkeypatch)
+    btime = int(srv.time.time()) - 600
+    reads = iter([str(btime), str(btime + shift)])
+    current = {"v": ""}
+
+    def btime_id():
+        return current["v"]
+
+    monkeypatch.setattr(srv, "_boot_btime_id", btime_id)
+
+    current["v"] = next(reads)
+    srv._record_previous_boot_error()
+    current["v"] = next(reads)
+    srv._record_previous_boot_error()
+
+    assert len(_reboot_rows(tmp_path)) == 1
+    # The marker follows the clock, so drift is measured from the latest reading.
+    markers = [p.name for p in (tmp_path / "health").glob(".boot_recorded_*")]
+    assert markers == [f".boot_recorded_{btime + shift}"]
+
+
+@pytest.mark.parametrize("gap", [srv._BTIME_DEDUP_SLACK_SEC + 1, 300])
+def test_reboot_row_is_written_for_a_real_reboot_without_a_boot_id(monkeypatch, tmp_path, gap):
+    """The btime slack must not swallow a real reboot: the next boot's btime is at least the
+    previous boot's uptime plus the down time later, far past the slack."""
+    _boot_recording(monkeypatch, tmp_path, {"present": False})
+    _no_boot_id(monkeypatch)
+    btime = int(srv.time.time()) - 600
+    current = {"v": str(btime - gap)}
+    monkeypatch.setattr(srv, "_boot_btime_id", lambda: current["v"])
+
+    srv._record_previous_boot_error()
+    current["v"] = str(btime)
+    srv._record_previous_boot_error()
+
+    assert len(_reboot_rows(tmp_path)) == 2
+    assert [p.name for p in (tmp_path / "health").glob(".boot_recorded_*")] == [f".boot_recorded_{btime}"]
 
 
 def test_reboot_row_maps_fault_class_and_status():

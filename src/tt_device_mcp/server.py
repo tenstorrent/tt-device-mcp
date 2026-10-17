@@ -5012,6 +5012,32 @@ def _consume_pre_down_escalation_row(action: str) -> None:
             return
 
 
+# How far /proc/stat btime may move within one boot and still name the same boot. btime is wall
+# clock minus uptime, so a wall-clock step (an NTP correction, a leap second, a manual set) moves
+# it, and one crossing a second boundary changes the integer. Two real boots' btimes are apart by
+# at least the earlier boot's uptime at broker start plus the whole down time and POST, far more.
+_BTIME_DEDUP_SLACK_SEC = 10
+
+
+def _btime_marker_within_slack(btime: str, marker: Path) -> bool:
+    """Whether a ``.boot_recorded_<btime>`` marker within _BTIME_DEDUP_SLACK_SEC of ``btime``
+    exists, i.e. this boot was already recorded under a btime the clock has since moved. A match
+    is renamed to ``marker`` so later drift is measured from the latest reading, not the first."""
+    try:
+        now = int(btime)
+    except ValueError:
+        return False
+    for old in health_dir().glob(".boot_recorded_*"):
+        seen = old.name[len(".boot_recorded_") :]
+        if seen.isdigit() and abs(int(seen) - now) <= _BTIME_DEDUP_SLACK_SEC:
+            try:
+                old.replace(marker)
+            except OSError:
+                pass
+            return True
+    return False
+
+
 def _record_previous_boot_error() -> None:
     """Journal the firmware's account of the last crash, once per boot.
 
@@ -5029,6 +5055,8 @@ def _record_previous_boot_error() -> None:
     boot_key = boot_id or _boot_btime_id()
     marker = health_dir() / f".boot_recorded_{boot_key or 'unknown'}"
     if boot_key and marker.exists():
+        return
+    if not boot_id and boot_key and _btime_marker_within_slack(boot_key, marker):
         return
 
     rec = previous_boot_error()
