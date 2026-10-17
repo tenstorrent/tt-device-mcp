@@ -160,6 +160,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
@@ -852,6 +853,10 @@ FABRIC_RELIFT_WHY = "fabric_unverified"
 # these were placed for, so they never lift on a read; past the ceiling they escalate to the gate's
 # own recovery ladder instead of standing until a broker restart.
 GENERIC_ESCALATE_WHYS = frozenset({"gate_error", "foreign_holder", "startup_unverified"})
+# why values of a DIRTY hold the idle tick hands to the post-job gate when nothing is queued (spec 03
+# I68): a job's kill or its leftover, owed a full check that only a job's gate would otherwise run.
+DIRTY_IDLE_GATE_WHYS = frozenset({"job_killed", "foreign_holder"})
+DIRTY_IDLE_GATE_RECHECK_SEC = 10
 
 # Set when the RUNTIME named a device fault in a job's output. Outranks our own checks,
 # which are blind to this class of fault, and only a reset retires it. Independent of the FSM:
@@ -4469,19 +4474,23 @@ async def _foreign_holder_fast_verify(expected: int, log: Callable[[str], None])
     return True
 
 
-def _eth_rearm_idle() -> bool:
-    """Whether the device is idle enough for the eth self-test's one read: HEALTHY, no tenant job
-    queued, running or re-adopted, no finished job still owed its post-job gate, and no external
-    step reservation. Device ops are checked by the caller (the retry takes the device-op lock
-    itself)."""
+def _queue_idle() -> bool:
+    """No tenant job queued, running or re-adopted, no finished job still owed its post-job gate,
+    and no external step reservation. Device ops are the caller's to check."""
     return (
-        fsm.state is ServerState.HEALTHY
-        and current_process is None
+        current_process is None
         and not post_job_gate_pending
         and not readopted_scopes
         and get_external_step_free_event().is_set()
         and not any(j.status in (JobStatus.QUEUED, JobStatus.RUNNING) for j in jobs.values())
     )
+
+
+def _eth_rearm_idle() -> bool:
+    """Whether the device is idle enough for the eth self-test's one read: HEALTHY and the queue
+    idle (see _queue_idle). Device ops are checked by the caller (the retry takes the device-op
+    lock itself)."""
+    return fsm.state is ServerState.HEALTHY and _queue_idle()
 
 
 async def _attempt_eth_rearm() -> None:
@@ -4516,6 +4525,61 @@ def _maybe_spawn_eth_rearm() -> None:
     _eth_rearm_task = asyncio.create_task(_attempt_eth_rearm())
 
 
+# The dirty idle gate (spec 03 I68): the last time it ran its checks, and the hold episode (its
+# ``since``) it already gave its one gate.
+_dirty_idle_gate_monotonic: float = 0.0
+_dirty_idle_gate_spent_since: Optional[str] = None
+
+
+def _dirty_idle_gate_armed() -> bool:
+    """A dirty job_killed/foreign_holder hold on an idle device that has not had its idle gate yet:
+    RECOVERING, nothing queued or owed (see _queue_idle), no device op, no chip off the bus."""
+    rec = fsm.record
+    return (
+        fsm.state is ServerState.RECOVERING
+        and rec.dirty
+        and rec.why in DIRTY_IDLE_GATE_WHYS
+        and rec.since != _dirty_idle_gate_spent_since
+        and not device_op_active
+        and _queue_idle()
+        and not _device_liveness_reason()
+    )
+
+
+async def _attempt_dirty_idle_gate() -> None:
+    """Run the post-job gate, fabric forced, on a dirty hold left with nothing queued (spec 03 I68).
+
+    Once per hold episode: a pass lifts it, a failure takes the gate's own ladder and the hold stays
+    with the bounded escalation (I23). Skipped while a reset scope cycles, a tenant or a reaped
+    job's leftover holds the device, or the episode changed. Never raises."""
+    global _dirty_idle_gate_monotonic, _dirty_idle_gate_spent_since
+    now = time.monotonic()
+    if _dirty_idle_gate_monotonic and (now - _dirty_idle_gate_monotonic) < DIRTY_IDLE_GATE_RECHECK_SEC:
+        return
+    _dirty_idle_gate_monotonic = now
+    try:
+        if await asyncio.to_thread(recovery_mechanism.scope_active):
+            return
+        scan = await asyncio.to_thread(enumerate_device_holders)
+        if galaxy_recovery._tenant_active(scan) or await asyncio.to_thread(_reaped_leftover_reason, scan):
+            return
+        if not _dirty_idle_gate_armed():
+            return
+        rec = fsm.record
+        _dirty_idle_gate_spent_since = rec.since
+        if logger:
+            logger.info(
+                f"IDLE-GATE dirty {rec.why} hold with nothing queued — running the post-job gate, fabric forced"
+            )
+        health_event("dirty_idle_gate", why=rec.why, since=rec.since)
+        # Not under _device_op: the gate takes it itself, and the lock is not reentrant.
+        await _device_health_gate(None, phase="post-job", run_fabric=True, force_fabric=True)
+    except Exception as e:  # noqa: BLE001 - a detached task must never raise unretrieved
+        _mark_device_dirty(f"idle post-job gate error: {e}", why="gate_error")
+        if logger:
+            logger.error(f"IDLE-GATE post-job gate error: {e}")
+
+
 def _maybe_spawn_idle_relift() -> None:
     """Start one idle relift as its own task when a re-verifiable hold is up and none is in flight.
     Detached from the sampler by design (see _relift_task): awaiting a possibly-60s eth read or a
@@ -4530,6 +4594,9 @@ def _maybe_spawn_idle_relift() -> None:
     if _down_offbus_recheck_armed():
         if not device_op_active:
             _relift_task = asyncio.create_task(_attempt_down_offbus_recheck())
+        return
+    if _dirty_idle_gate_armed():
+        _relift_task = asyncio.create_task(_attempt_dirty_idle_gate())
         return
     selfheal, fabric, generic = _idle_relift_armed()
     if not ((selfheal or fabric or generic) and not device_op_active):
@@ -7354,6 +7421,67 @@ async def _refuse_job_privsep_identity(job: "Job", job_log_file: Optional[Path],
                 logger.error(f"could not write privsep refusal footer for job {job.id}: {e}")
 
 
+# The output dir preflight stats a handful of paths; this only bounds a hung network mount.
+JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC = 2.0
+
+
+async def _job_output_dir_problems(job: "Job") -> list[str]:
+    """Why the job's user could not write its tt-metal output dirs (spec 01 I68); empty when
+    fine. Checked for the uid the job will run as: its submitter under privsep, else the broker.
+    Filesystem reads only, bounded by JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC; a check that errors or
+    runs out of time lets the job through (it never refuses on a guess) and never raises."""
+    scoped = privsep_prefix_for(job.peer_uid) is not None
+    uid = job.peer_uid if scoped else os.geteuid()
+    # A job scoped to another uid gets only its env_vars; a direct one inherits the broker's too.
+    inherited = None if scoped else dict(os.environ)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(preflight_output_dirs, job.workspace, job.env_vars or {}, inherited, uid),
+            timeout=JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        if logger:
+            logger.warning(f"JOB_RUNNER job_id={job.id} output dir preflight skipped: {e!r}")
+        return []
+
+
+async def _refuse_job_output_dirs(job: "Job", job_log_file: Optional[Path], problems: list[str]) -> None:
+    """End a job FAILED at the door because its tt-metal output dirs are not writable by its
+    user. The device is untouched: the next job is admitted through the normal gate. Never
+    raises — a bug here must not wedge the runner."""
+    reason = "; ".join(problems)
+    if logger:
+        logger.warning(f"JOB_RUNNER refusing job_id={job.id}: tt-metal output dir not writable: {reason}")
+    try:
+        async with get_lock():
+            job.status = JobStatus.FAILED
+            job.finished_at = datetime.now().isoformat()
+            job.error = f"job setup: tt-metal output dir not writable by the job's user: {reason}"
+            if stats:
+                stats.record_job_completion(job.status, job.wait_sec, job.runtime_sec)
+        _forget_queued_job(job.id)  # refused is terminal: a restart must not revive it
+        if job_log_file:
+            with open(job_log_file, "a") as f:
+                f.write(
+                    f"\n[REFUSED at {job.finished_at}] job setup: tt-metal output dir not writable "
+                    f"by the job's user:\n"
+                    + "".join(f"  {p}\n" for p in problems)
+                    + "The broker did not dispatch this job; the device was not touched. tt-metal "
+                    "writes under <TT_METAL_LOGS_PATH or the job's working dir>/generated/. Give "
+                    "those dirs back to the job's user (an earlier run as root often leaves them "
+                    "root-owned), move them aside, or set TT_METAL_LOGS_PATH to a writable dir in the job's "
+                    "env file.\n"
+                )
+            write_job_log_footer(job_log_file, job)
+    except Exception as e:
+        if logger:
+            logger.error(f"JOB_RUNNER output dir refusal error for job_id={job.id}: {e}")
+        job.status = JobStatus.FAILED
+        job.finished_at = job.finished_at or datetime.now().isoformat()
+        job.error = job.error or f"job setup: tt-metal output dir not writable by the job's user: {reason}"
+        _forget_queued_job(job.id)
+
+
 def _tenant_hold_enabled() -> bool:
     """Whether a degraded device HOLDS a tenant job (default) or FAILS it fast. Default ON:
     a queue must hold jobs while the device recovers, not bounce them back to the submitter.
@@ -9056,6 +9184,15 @@ async def _job_runner_loop():
 
         # Use existing log file (created at queue time)
         job_log_file = Path(job.log_file) if job.log_file else None
+
+        # Fail fast on tt-metal output dirs the job's user cannot write (spec 01 I68), before any
+        # cooldown, gate or hold: such a job dies at device open whatever the device's state.
+        output_dir_problems = await _job_output_dir_problems(job)
+        if output_dir_problems:
+            await _refuse_job_output_dirs(job, job_log_file, output_dir_problems)
+            await cleanup_finished_jobs()
+            get_job_queue().task_done()
+            continue
 
         # Let the mesh rest between consecutive jobs. Back-to-back saturating runs with no gap
         # is what pushed a marginal tray off the bus; this is the only idle the silicon is

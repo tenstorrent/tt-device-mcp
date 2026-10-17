@@ -227,6 +227,42 @@ the queue and a running job outlive the broker process.
   bounded recovery (`verification_not_lifted`): a differing environment, an unhealthy read, a reset
   since the start, a fault landing during the read, a topology marker or a refused release. A
   failed check never releases the device. An `eth` job never lifts it.
+- **I67** — A job process that is still alive `SURVIVOR_KILL_WAIT_SEC` (2 s) after the survivor
+  sweep's SIGKILL is not named a survivor that holds the device until the `/dev/tenstorrent`
+  holder scan has been polled for up to `HOLDER_RELEASE_WAIT_SEC` (30 s) after that SIGKILL.
+  The sweep runs after every job, so this covers the timeout, kill and hung paths, with or
+  without a privsep scope. A process that closes its device fds within the window, by exiting
+  or not, is no I16 leftover: the post-job gate runs at once, with its forced fabric pass, and
+  no hold is opened for it. One still listed as a holder when the window ends takes the I16
+  path unchanged (fence, dirty, the leftover names it). The wait is bounded and polls, so a
+  job with nothing left costs nothing, and a slow exit adds at most 28 s to the job's teardown,
+  in which the queue waits as it already waits for the sweep. The poll is one shared helper,
+  `device_holders.wait_device_released`, for every path that SIGKILLs device holders and must
+  know they let go before it acts on the device. Time to recover (class J, a job that timed out
+  or was killed and exits slowly): a holder that lets go within the window no longer turns a
+  ~1 min post-job check into a hold that waited for the next job or the 600 s ceiling (spec 03
+  I23).
+
+- **I68** — A job whose tt-metal output dirs its user cannot write is refused at the door,
+  before the cooldown, the gate or any hold, and never spawned. tt-metal writes under
+  `<logs dir>/generated/` (`watcher/`, `dprint/`, `inspector/`, `fabric/`, `profiler/`,
+  `noc_data/`); the logs dir is `TT_METAL_LOGS_PATH` from the job's `env_vars`, else from the
+  broker's environment when the job inherits it (not under privsep with a non-root submitter),
+  else the job's workspace, where it starts; a relative value is taken from the workspace. Each
+  dir is checked for the uid the job runs as (its submitter under privsep, else the broker) and
+  that uid's groups: an existing one must be a directory it can write and search, a missing one
+  must have a nearest existing ancestor it can write. Checked as the broker's own uid the kernel
+  answers (`access`); for another uid the mode bits do, and a dir with a POSIX ACL passes. The
+  job ends FAILED with `error` naming each path, owner and mode, and a `[REFUSED at ...]` note in
+  its log; its queued spec is forgotten. The check only reads (`stat`, `listxattr`, `access`):
+  it creates, chowns and removes nothing and touches no device. It runs off the event loop,
+  bounded by `JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC` (2 s); a check that errors or times out lets the
+  job through. It changes no gate, reset, hold or recovery path, so no fault class's
+  time-to-recover; the next job is admitted through the normal gate. A command that changes
+  directory or sets `TT_METAL_LOGS_PATH` inline is checked where it starts. A missing workspace
+  with no `TT_METAL_LOGS_PATH` is not checked: the job fails on its own start error instead. Motivating incident:
+  a root-run tt-metal session left a workspace's `generated/` root-owned; the owner's next job
+  failed every run on `Permission denied [.../generated/watcher/]` and sat until its 600 s timeout.
 
 ## Interfaces
 
@@ -505,6 +541,7 @@ flowchart LR
 | I19 | `tests/test_device_safety.py::test_held_job_fails_past_the_hold_bound_and_escalates`, `tests/test_device_safety.py::test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation`, `tests/test_device_safety.py::test_tenant_hold_max_sec_has_no_unbounded_value` |
 | I20 | `tests/test_preemptable.py::test_a_preemptable_job_runs_past_its_limit_while_nobody_waits`, `tests/test_preemptable.py::test_an_ordinary_job_still_times_out_at_its_limit`, `tests/test_preemptable.py::test_contention_inside_the_limit_does_not_preempt`, `tests/test_preemptable.py::test_contention_past_the_limit_stops_the_job_and_still_runs_the_full_gate`, `tests/test_preemptable.py::test_a_job_that_ignores_the_stop_is_killed_at_the_window_end`, `tests/test_preemptable.py::test_the_stop_window_runs_to_its_end_after_the_shell_exits`, `tests/test_preemptable.py::test_preempt_labels`, `tests/test_preemptable.py::test_queue_status_and_cli_show_the_preempt_label`, `tests/test_preemptable.py::test_preempted_wedge_risk`, `tests/test_preemptable.py::test_rest_submit_carries_the_option_into_the_job_and_its_log`, `tests/test_preemptable.py::test_a_readopted_preemptable_job_past_its_limit_is_left_alone_while_nobody_waits`, `tests/test_preemptable.py::test_a_readopted_preemptable_job_is_preempted_once_a_job_waits`, `tests/test_preemptable.py::test_a_preempted_readopted_job_never_releases_the_device_clean` |
 | I21 | `tests/test_verification_jobs.py::test_only_an_operator_running_exactly_one_shipped_check_is_a_verification_job`, `tests/test_verification_jobs.py::test_a_verification_job_queues_at_the_head_and_tenants_stay_fifo`, `tests/test_verification_jobs.py::test_a_job_handed_back_goes_first_among_the_tenants_behind_the_head`, `tests/test_verification_jobs.py::test_only_a_fabric_only_hold_counts`, `tests/test_verification_jobs.py::test_a_held_tenant_yields_to_a_verification_job_that_lifts_the_hold`, `tests/test_verification_jobs.py::test_a_verification_job_passes_no_other_hold`, `tests/test_verification_jobs.py::test_a_held_tenant_does_not_yield_without_a_waiting_verification_job`, `tests/test_verification_jobs.py::test_a_passing_fabric_check_lifts_the_hold`, `tests/test_verification_jobs.py::test_a_passing_check_without_the_full_check_after_the_last_reset_does_not_lift`, `tests/test_verification_jobs.py::test_a_passing_check_settles_the_post_reset_debt_and_lifts`, `tests/test_verification_jobs.py::test_a_refused_release_is_not_reported_as_a_lift`, `tests/test_verification_jobs.py::test_a_pass_on_the_discovered_links_lifts_nothing`, `tests/test_verification_jobs.py::test_nothing_else_lifts_the_hold`, `tests/test_verification_jobs.py::test_a_check_run_with_another_environment_does_not_lift`, `tests/test_verification_jobs.py::test_under_privsep_the_job_env_is_only_its_env_vars`, `tests/test_verification_jobs.py::test_restore_puts_a_verification_job_back_at_the_head` |
+| I68 | `tests/test_job_preflight.py::test_a_root_owned_existing_dir_is_refused_with_its_owner_and_mode`, `tests/test_job_preflight.py::test_a_writable_dir_passes`, `tests/test_job_preflight.py::test_a_missing_dir_with_a_writable_parent_passes_and_is_not_created`, `tests/test_job_preflight.py::test_a_missing_dir_with_an_unwritable_parent_is_refused_naming_the_parent`, `tests/test_job_preflight.py::test_tt_metal_logs_path_overrides_the_workspace`, `tests/test_job_preflight.py::test_a_missing_workspace_is_left_to_the_job_not_called_an_output_dir_problem`, `tests/test_job_preflight.py::test_the_override_is_what_gets_checked`, `tests/test_job_preflight.py::test_the_runner_fails_the_job_at_the_door_and_spawns_nothing`, `tests/test_job_preflight.py::test_the_runner_checks_as_the_privsep_submitter_with_only_its_env`, `tests/test_job_preflight.py::test_a_preflight_that_errors_or_hangs_lets_the_job_through` |
 | B-Submission (burst cap) | `tests/test_device_safety.py::test_an_armed_burst_cap_refuses_one_owners_flood_but_not_another`, `tests/test_device_safety.py::test_the_default_off_burst_cap_admits_every_submit`, `tests/test_device_safety.py::test_job_burst_decision_prunes_the_window_and_gates_on_the_cap[2-60.0-recent2-110.0-False-50.0-expect_kept2]` |
 | B-Submission (owner derived from the peer uid and the surface) | `tests/test_device_safety.py::test_the_owner_comes_from_the_peer_uid_and_the_surface` |
 | B-Submission (blocking run) | `tests/test_server.py::test_a_blocking_job_run_reports_progress_through_the_mcp_layer` |
@@ -519,3 +556,4 @@ flowchart LR
 | B-Ids/`Job` basics | `tests/test_server.py::TestJob::test_job_status_values`, `tests/test_server.py::TestJob::test_runtime_sec_property`, `tests/test_server.py::TestJob::test_wait_sec_property` |
 | Re-adoption scope naming | `tests/test_readopt.py::test_scope_unit_roundtrip`, `tests/test_readopt.py::test_list_active_job_scopes_parses` |
 | B-Shutdown (a cancel that lands as a job ends still ends the runner) | `tests/test_aio.py::test_a_cancel_that_lands_as_the_inner_work_ends_is_not_dropped`, `tests/test_aio.py::test_cancel_also_cancels_the_inner_work`, `tests/test_aio.py::test_timeout_cancels_the_inner_work_and_raises_timeout` |
+| I67 (a SIGKILLed holder that lets go within the window is no leftover; one still holding when it ends is; the wait is bounded) | `tests/test_holder_release_wait.py::test_a_holder_that_releases_within_the_window_is_not_a_leftover`, `tests/test_holder_release_wait.py::test_a_holder_still_holding_after_the_window_is_named`, `tests/test_holder_release_wait.py::test_wait_device_released_with_nothing_to_wait_for_scans_nothing`, `tests/test_holder_release_wait.py::test_wait_device_released_returns_once_the_pids_let_go`, `tests/test_holder_release_wait.py::test_wait_device_released_gives_up_at_the_timeout` |
