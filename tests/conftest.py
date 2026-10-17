@@ -374,6 +374,9 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     fresh_fsm = ServerFsm(health_tmp / "fsm.json")
     fresh_fsm.on_readings(HealthState(phase="test", at=datetime.now(), expected=0))
     monkeypatch.setattr(srv, "fsm", fresh_fsm)
+    # A poller restart one test deferred must not fire on the next test's close to HEALTHY.
+    monkeypatch.setattr(srv, "_pollers_owed", None)
+    monkeypatch.setattr(srv, "_pollers_owed_loop", None)
 
     # No board types seen yet: the conservative default, and the machine type reads as unknown.
     # Nothing here can shell out — the cache is only ever filled by a health snapshot — so the

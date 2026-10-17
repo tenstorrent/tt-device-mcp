@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import time
 from datetime import datetime
@@ -32,6 +33,10 @@ from tt_device_mcp.health.post_reset import FABRIC_DEBT
 RESET_SCOPE_PREFIX = "ttdev-reset-"
 LOCAL_RESET_NAME = "ttdev-local-reset"
 LOCAL_RESET_LOCK = "local-reset.lock"
+
+# `tt-smi -glx_reset` re-powers every tray, counts a 30 s settle, then waits up to 100 s for every chip
+# to show up in /dev/tenstorrent. Either line marks the start of that wait (spec 04 I81).
+GLX_DRIVER_WAIT = re.compile(r"Waiting for all \d+ chips to show up|Waiting for (\d+) seconds: \1\b")
 
 # A reset that did not fix the device will not fix it on the next attempt either,
 # and each extra reset is another chance to trip the root complex into the fatal
@@ -450,9 +455,11 @@ class RecoveryMechanism:
         self.unverified_reset_since: Optional[str] = None
         # The episode whose last-chance sweep that path already ran; the next escalation climbs.
         self.unverified_sweep_since: Optional[str] = None
-        # The episode whose sweep verify still read a fabric 77: no rung measured a fault, so it never
-        # climbs to a host rung; it holds, pages once and the idle relift keeps re-checking.
+        # The episode whose sweep verify still read a fabric 77. With no known no-reset cause it climbs to
+        # the host rung once (unverified_77_host_rung_since), then hands the hold to an operator.
         self.unverified_sweep_77_since: Optional[str] = None
+        # The episode whose 77 already climbed to a host reboot or power cycle (spec 04 I29).
+        self.unverified_77_host_rung_since: Optional[str] = None
         # The hold episode (its ``since``) whose galaxy reset REGRESSED an off-bus mesh (more chips off
         # the bus after it than before). Another mesh reset on that episode repeats the action that just
         # made the drop worse — one Galaxy host went 4 -> 31 -> 32 off-bus across three — so the episode
@@ -1062,18 +1069,37 @@ class RecoveryMechanism:
         # up with no devices at all.
         self.reset_in_flight = True
         self.reset_since_release = True
+        stream, driver_wait = self._driver_wait_rescan_hook(argv, on_output, log)
         cancelled_mid = False
+        late_cancel = False
         rc = None
         try:
-            if on_output is None:
+            if stream is None:
                 rc, text = await self.run_scoped(argv, log, owner)
             else:
-                rc, text = await self.run_scoped(argv, log, owner, on_output)
+                rc, text = await self.run_scoped(argv, log, owner, stream)
             return rc, text
         except asyncio.CancelledError:
             cancelled_mid = True  # abandoned mid-reset; the detached backend keeps cycling the chips
             raise
         finally:
+            # Disarm the driver-wait watcher first: after a mid-reset cancel the backend's shielded
+            # output reader still feeds it, and a rescan it started now would be nobody's to cancel.
+            driver_wait["disarmed"] = True
+            rescan_task = driver_wait.get("task")
+            if rescan_task is not None:
+                if cancelled_mid:
+                    rescan_task.cancel()
+                else:
+                    try:
+                        # Shielded: tt-smi has exited, so a cancel that lands while the sysfs write
+                        # finishes must not cut the cleanup below short (the flag, the rescan, the
+                        # pollers). It is re-raised once that cleanup is done.
+                        await asyncio.shield(rescan_task)
+                    except asyncio.CancelledError:
+                        late_cancel = not rescan_task.cancelled()
+                    except Exception:  # noqa: BLE001 - the rescan below still runs
+                        pass
             # Clear on every exit, including a mid-reset cancel. The flag gates the dead-chip sampler
             # (it returns early while set), so leaving it set on a now-healthy box blinds the sampler to
             # a real chip drop until the next completed reset. Once clear the sampler still defers on
@@ -1111,6 +1137,51 @@ class RecoveryMechanism:
                     # rather than leaving a telemetry gap.
                     if quiesced:
                         await asyncio.shield(self._set_device_pollers(True, log))
+            if late_cancel:
+                raise asyncio.CancelledError()
+
+    def _driver_wait_rescan_hook(self, argv: list[str], on_output, log):
+        """Spec 04 I81: let a mesh reset bring back the chips this broker isolated, in the same reset.
+
+        `tt-smi -glx_reset` re-powers every tray, waits 30 s, then waits up to 100 s for every chip to
+        show up in /dev/tenstorrent; when one never does it exits 1 with no POST_RESET and no re-init.
+        A chip isolated here (its endpoint `remove`d) cannot show up on its own: only a PCI rescan adds
+        it back, and the one in reset_with_quiesce runs after tt-smi has exited. So every mesh reset
+        over an isolated chip failed after about 260 s, even when the re-power had healed the chip,
+        and a second reset had to finish the job. One global rescan as that wait starts adds the
+        re-powered endpoint in time. It is the same rescan the reset already ends with, moved to the
+        point where tt-smi itself expects every chip back; a chip still dead stays off the bus, as
+        before. Releases nothing: the full health check, fabric included, still decides.
+
+        Returns (the output callback to run the reset with, a dict that holds the rescan task once it
+        starts). With no isolated chip, or not a mesh reset, the callback is the caller's own."""
+        isolated = self._isolated_chips() if self._isolated_chips is not None else None
+        if "-glx_reset" not in argv or not isolated:
+            return on_output, {}
+        chips = sorted(isolated, key=int)
+        state: dict = {"tail": "", "task": None}
+
+        async def rescan() -> None:
+            try:
+                await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
+            except OSError as e:
+                log(f"PCI rescan at tt-smi's driver wait could not run ({e}); the rescan after the reset still runs")
+                health_event("reset_driver_wait_rescan", chips=chips, ok=False, error=str(e))
+                return
+            log(f"tt-smi is waiting for every chip: PCI rescan to add back isolated chip(s) {chips}")
+            health_event("reset_driver_wait_rescan", chips=chips, ok=True)
+
+        def watch(chunk: str) -> None:
+            if state["task"] is None and not state.get("disarmed"):
+                seen = state["tail"] + chunk
+                if GLX_DRIVER_WAIT.search(seen):
+                    state["task"] = asyncio.get_running_loop().create_task(rescan())
+                else:
+                    state["tail"] = seen[-200:]  # a marker split across two reads still matches
+            if on_output is not None:
+                on_output(chunk)
+
+        return watch, state
 
     async def _reapply_aiclk_ceiling(self, log) -> None:
         """Put an operator's AICLK ceiling back on the freshly reset chips, before the pollers
