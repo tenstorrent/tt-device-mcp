@@ -3438,7 +3438,7 @@ async def selftest_eth_heartbeat() -> None:
                 env=env,
                 preexec_fn=os.setsid,
             )
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=ETH_CHECK_SELFTEST_BUDGET_SEC)
+            out, _ = await aio.wait_for(proc.communicate(), timeout=ETH_CHECK_SELFTEST_BUDGET_SEC)
             rc = proc.returncode
             dt = (datetime.now() - t0).total_seconds()
             tail = (out.decode("utf-8", "replace") if out else "").strip().splitlines()
@@ -3538,7 +3538,12 @@ def log_rung_inventory() -> None:
             "TT_DEVICE_MCP_PREJOB_DISPATCH is not 1 — the mesh is not proven to run a kernel before a "
             "tenant is admitted",
         ),
-        ("forced-escalation", _force_escalate_enabled(), "TT_DEVICE_MCP_FORCE_ESCALATE=0"),
+        (
+            "forced-escalation",
+            _force_escalate_enabled(),
+            "TT_DEVICE_MCP_FORCE_ESCALATE=0 — below the 10-min hold bound only; the bound's ladder and "
+            "host rung (spec 04 I76) ignore it",
+        ),
         # Each host rung has two distinct OFF causes and the inventory must name the right one: an
         # operator who armed a rung the process cannot execute would otherwise read their own "=0"
         # opt-out back at them, and go looking in the wrong place.
@@ -3613,12 +3618,11 @@ def _selfheal_relift_enabled() -> bool:
 
 
 def _hold_exit_gap() -> str:
-    """Why a held present mesh has NO automatic exit, or "" when it has one (spec 03 I55): the relift
-    and the forced escalation both switched off, and/or the outage hold (spec 04 I28) refusing the
-    present-mesh reset. Logged at boot as ``RUNG GAP`` and served on /health as ``hold_exit_gap``."""
+    """Why a held present mesh has NO automatic exit, or "" when it has one (spec 03 I55): the outage
+    hold (spec 04 I28) refusing the present-mesh reset. The relift and the forced escalation both off
+    is no gap: the 10-min hold bound's ladder ignores the kill switch (spec 04 I76). Logged at boot as
+    ``RUNG GAP`` and served on /health as ``hold_exit_gap``."""
     gaps = []
-    if not _selfheal_relift_enabled() and not _force_escalate_enabled():
-        gaps.append("TT_DEVICE_MCP_SELFHEAL_RELIFT=0 and TT_DEVICE_MCP_FORCE_ESCALATE=0")
     held = mesh_reset_hold_reason()
     if held:
         gaps.append(f"present-mesh reset held: {held}")
@@ -3656,15 +3660,17 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
             f"The ladder escalates at the {ceiling_min}-min hold ceiling — do not plan around waiting "
             f"the wedge out."
         )
+    # Spec 04 I76: the kill switch governs only the runs below the bound; the bound's own ladder runs.
+    bound = (
+        f"the ladder still runs at the {max(1, round(_stuck_hold_ceiling_sec() / 60))}-min hold bound "
+        f"(spec 04 I76), then the power cycle if the full check after it fails."
+    )
     if _selfheal_relift_enabled():
         return (
-            "Forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0): only the idle self-heal relift "
-            "can lift this hold."
+            "Forced escalation below the hold bound is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0): the idle "
+            f"self-heal relift may lift this hold sooner; {bound}"
         )
-    return (
-        "Self-heal relift and forced escalation are both OFF: this hold has NO automatic exit — an "
-        "operator must act."
-    )
+    return f"Forced escalation below the hold bound is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0): {bound}"
 
 
 def _fabric_relift_enabled() -> bool:
@@ -4001,6 +4007,10 @@ def _fabric_77_bound_reached() -> bool:
         opened = None
     if opened is None or not _last_77_was_hugepages():
         _fabric_77_streak += 1
+        if _fabric_77_climb_owed():
+            # The episode's one reset already came back UNKNOWN, or this boot is the warm reboot a 77
+            # climb fired: more retries measure nothing new; the climb is owed now (spec 04 I79).
+            return True
     if _fabric_77_streak >= _env_int("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", 3, 1):
         return True
     if opened is None:
@@ -4047,6 +4057,8 @@ def _fabric_77_recheck_due() -> bool:
     hold opened, then each further step after the last re-check that 77'd again. A hugepage 77 re-checks
     every FABRIC_77_HUGEPAGES_RECHECK_SEC."""
     steps = [FABRIC_77_HUGEPAGES_RECHECK_SEC] if _last_77_was_hugepages() else _fabric_77_backoff_sec()
+    if _fabric_77_climb_owed():
+        steps = steps[:1]  # the climb is owed: its first step only, never the longer backoff (04 I79)
     if _fabric_77_recheck_since != fsm.record.since or not _fabric_77_rechecks:
         try:
             opened = datetime.strptime(str(fsm.record.since), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -4055,6 +4067,11 @@ def _fabric_77_recheck_due() -> bool:
         return (datetime.now(timezone.utc) - opened).total_seconds() >= steps[0]
     wait = steps[min(_fabric_77_rechecks, len(steps) - 1)]
     return time.monotonic() - _fabric_77_recheck_monotonic >= wait
+
+
+def _fabric_77_climb_owed() -> bool:
+    """Whether the open 77 hold owes the climb at once (spec 04 I79; the galaxy recovery decides)."""
+    return galaxy_recovery is not None and galaxy_recovery.fabric_77_climb_owed(device_hold_episode_since)
 
 
 def _note_fabric_77_recheck() -> None:
@@ -4138,6 +4155,15 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
         )
         + ") — climbing the recovery ladder"
     )
+    if (
+        galaxy_recovery is not None
+        and device_hold_episode_since
+        and galaxy_recovery.fabric_77_climb_owed(device_hold_episode_since)
+    ):
+        # This boot is the warm reboot an earlier 77 climb fired: that episode's reset and sweep already
+        # ran and the reboot did not end the 77. The ladder's sweep (every reset type, then the full
+        # check) runs once more before the cold rung, never a fresh I40 round first (spec 04 I79).
+        galaxy_recovery.mechanism.unverified_reset_since = device_hold_episode_since
     return await escalate("present")
 
 
@@ -4267,6 +4293,10 @@ async def _attempt_idle_relift() -> None:
                     _startup_fabric_owed_since = None
                     _log("running the startup fabric pass a missing prerequisite deferred")
             healthy, evidence = await fsm.observe(expected, _log, run_fabric=fabric, recovery=galaxy_recovery)
+            if not healthy or (fabric and (evidence.get("fabric") or {}).get("ok") is not True):
+                # Spec 04 I76: a full check after the bound's ladder that ends with no pass hands the
+                # hold to the host rung on the next sampler tick, not at the end of the check bound.
+                _note_hold_bound_check_failed(_log)
             if not healthy:
                 # A chip is still off the bus: read-only there is nothing left to re-verify, and an
                 # idle box has no next-job gate to run the gone-chip recovery cascade, so left here
@@ -4514,6 +4544,7 @@ async def _attempt_down_offbus_recheck() -> None:
             )
             ok, evidence = await _offbus_return_full_gate(expected, _log)
             if not ok:
+                _note_hold_bound_check_failed(_log)  # spec 04 I76: the host rung on the next tick
                 return
             # Re-assert after the long awaits: the sampler's dead-chip mark is lock-free.
             now_episode = (fsm.record.since, fsm.record.why, fsm.record.detail, fsm.record.dirty)
@@ -5091,6 +5122,21 @@ def _stack_versions() -> dict:
 # What holds the device pollers stopped across more than one reset, or None. While set, a restart
 # asked for by a reset inside it is deferred to that holder (see _pollers_quiesced_for).
 _pollers_held_for: Optional[str] = None
+# Why a restart found the device unfit for the pollers (held, recovering, down), or None. While
+# set, the next close to HEALTHY — reached only through a passing full check, fabric included —
+# starts them (see _restore_owed_pollers).
+_pollers_owed: Optional[str] = None
+
+
+def _pollers_unfit_reason() -> Optional[str]:
+    """Why the device is not fit for the pollers to start on, or None. Only a HEALTHY FSM is: every
+    route to it is a passing gate (spec 03), and every reset leaves the FSM off it until then. A
+    poller started on a held mesh re-opens every chip in a loop, chips off the bus included: a
+    telemetry poller crash-looped every ~35 s over a 32-chip mesh held with 8 chips off the bus."""
+    rec = fsm.record
+    if rec.state is ServerState.HEALTHY:
+        return None
+    return f"device {rec.state.value} ({rec.why or '?'})"
 
 
 async def _set_device_pollers(active: bool, log) -> list[str]:
@@ -5109,6 +5155,19 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         # nothing, so its post-reset verify runs on the same quiet bus. The owner restarts them.
         log(f"device pollers kept stopped: {_pollers_held_for} still running")
         return []
+    global _pollers_owed, _pollers_owed_loop
+    if active:
+        unfit = _pollers_unfit_reason()
+        if unfit:
+            # A failed reset, or one whose verify has not passed yet: the pollers wait for the device to
+            # be proven healthy, and the close listener starts them then. Costs no recovery time.
+            if _pollers_owed is None:
+                health_event("pollers_kept_quiesced", reason=unfit, services=list(DEVICE_POLLER_SERVICES))
+            _pollers_owed = unfit
+            _pollers_owed_loop = asyncio.get_running_loop()
+            log(f"device pollers kept stopped until the device is verified healthy: {unfit}")
+            return []
+        _pollers_owed = None
     verb = "start" if active else "stop"
     touched = []
     for svc in DEVICE_POLLER_SERVICES:
@@ -5152,7 +5211,8 @@ async def _pollers_quiesced_for(what: str, log):
     Best-effort, as for a reset: a poller that will not stop never blocks the check. The restart is
     skipped only while a reset scope is still cycling the chips off the bus (a timed-out or abandoned
     reset), where restarting them is the MMIO-at-a-dead-endpoint hazard the reset path also avoids;
-    the health probe re-arms them once the device is idle and healthy. Costs one ``systemctl stop``
+    the health probe re-arms them once the device is idle and healthy. A check that held the mesh
+    leaves them stopped too, until the device is verified healthy (``_set_device_pollers``). Costs one ``systemctl stop``
     before the check and one ``start`` after it, each bounded at 30 s per unit."""
     global _pollers_held_for
     stopped: list[str] = []
@@ -5179,6 +5239,55 @@ async def _pollers_quiesced_for(what: str, log):
                 health_event("pollers_left_quiesced", after=what, scope=str(cycling))
             else:
                 await asyncio.shield(_set_device_pollers(True, log))
+
+
+# The loop a deferred restart was asked on, and the restart tasks in flight (held so they finish).
+_pollers_owed_loop: Optional[asyncio.AbstractEventLoop] = None
+_pollers_restore_tasks: "set[asyncio.Task]" = set()
+
+
+def _pollers_log(line: str) -> None:
+    if logger:
+        logger.info(f"HEALTH {line}")
+
+
+async def _restore_owed_pollers() -> None:
+    """Start the pollers a restart deferred, once the device is proven healthy. Best-effort and off
+    the release path: the queue never waits on it."""
+    if _pollers_owed is None:
+        return
+    try:
+        await _set_device_pollers(True, _pollers_log)
+    except Exception as exc:  # noqa: BLE001 - best-effort, as every poller restart is
+        _pollers_log(f"could not restart the device pollers after the device was verified: {exc!r}")
+
+
+def _restore_pollers_on_close() -> None:
+    """Close listener: the device just reached HEALTHY, so start the pollers a restart deferred.
+    Cheap, never raises, safe from any thread."""
+    loop = _pollers_owed_loop
+    if _pollers_owed is None or loop is None or loop.is_closed():
+        return
+
+    def _spawn() -> None:
+        task = loop.create_task(_restore_owed_pollers())
+        _pollers_restore_tasks.add(task)
+        task.add_done_callback(_pollers_restore_tasks.discard)
+
+    try:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            _spawn()
+        else:
+            loop.call_soon_threadsafe(_spawn)
+    except Exception:  # noqa: BLE001 - a missed restart leaves them for the next one
+        pass
+
+
+add_close_listener(_restore_pollers_on_close)
 
 
 def _auto_reboot_enabled() -> bool:
@@ -6599,6 +6708,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
                 "interval_sec": cooldown["interval_sec"],
                 "why": cooldown["why"],
             }
+        # Spec 04 I76: the 10-min bound, the step it runs next and any cooldown that step waits on.
+        payload["hold_bound"] = _hold_bound_health(now)
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
     return payload
@@ -6746,9 +6857,15 @@ async def _force_escalate_stuck_hold() -> None:
             logger.error(f"HOLD-DEADLINE-ESCALATE {msg}")
 
     kind = device_hold_escalation_kind  # the window this run claimed; the sampler may rewrite the global
-    if device_hold_tenant_deferred and await asyncio.to_thread(galaxy_recovery.tenant_holds):
-        _rearm_tenant_deferred_window(kind)  # still there: stay armed for the next tick, quietly
-        return
+    past_bound = _hold_age_now() >= _stuck_hold_ceiling_sec()
+    if device_hold_tenant_deferred or (kind == "hold_bound_cycle" and _hold_bound_rung_pending):
+        blocker = await asyncio.to_thread(_bound_tenant_blocker, past_bound)
+        if blocker is not None:
+            if device_hold_tenant_deferred:
+                _rearm_tenant_deferred_window(kind)  # still there: stay armed for the next tick, quietly
+            if past_bound:
+                _hold_bound_tenant_blocked(blocker, log)
+            return
     if (
         kind == "offbus_one_shot"
         and device_hold_offbus_idle_early
@@ -6758,10 +6875,16 @@ async def _force_escalate_stuck_hold() -> None:
         return
     async with _device_op("hold-deadline-escalate"):
         if await asyncio.to_thread(recovery_mechanism.scope_active):
+            if past_bound:
+                _rearm_after_scope(kind)  # spec 04 I76: the bound's step runs on the first tick after it
             return
         if not _recovery_degraded():
             return  # the hold cleared between the sampler spawning us and the lock
-        if _fabric_77_only_hold():
+        # Spec 04 I76: from the 10-min bound on, no 77, latch or no-reset class keeps the ladder (and
+        # the host rung after it) from running. Below the bound the faster class paths stay as they are.
+        held_age = _hold_age_now()
+        bound = held_age >= _stuck_hold_ceiling_sec()
+        if _fabric_77_only_hold() and not bound:
             return  # a pass that could not run is never reset for; the idle relift re-runs it
         if _host_action_blocks_escalation():
             return  # a host reboot/power cycle was requested while this waited on the lock
@@ -6783,7 +6906,24 @@ async def _force_escalate_stuck_hold() -> None:
             # or a cabling mismatch. A galaxy reset cannot fix either, and on one Galaxy host it took a
             # chip off the bus and the ladder then re-powered its tray. Hold, page once (spec 04 I30).
             _hold_without_reset(no_reset, expected, log)
-            return
+            if not bound:
+                return
+        if bound:
+            _lift_hold_bound_latches(log)
+            if kind != "hold_bound_cycle" and _hold_bound_check_pending(held_age):
+                log("10-min hold bound: the full check after the bound's ladder still has its time")
+                return
+            if _hold_bound_cycle_next(kind, held_age):
+                await _hold_bound_host_rung(held_age, log)
+                return
+            leftover = await asyncio.to_thread(_reaped_leftover_reason)
+            if leftover:
+                # A killed job's process still holds the device (spec 01 I16): every rung's reset is
+                # fenced and only a host rung clears it, so the bound asks for that rung now.
+                health_event("hold_bound_leftover", held_age_sec=int(held_age), held_since=device_hold_episode_since)
+                log(f"10-min hold bound: {leftover} — no reset can run; the host rung is next")
+                await _hold_bound_host_rung(held_age, log)
+                return
         health_event(
             "hold_deadline_forced_escalation",
             off_bus=off_bus,
@@ -6799,12 +6939,6 @@ async def _force_escalate_stuck_hold() -> None:
             ceiling_sec=int(_stuck_hold_ceiling_sec()),
             deadline_sec=int(_hold_deadline_sec()),
         )
-        held_age = 0.0
-        if device_hold_episode_since:
-            try:
-                held_age = (datetime.now() - datetime.fromisoformat(device_hold_episode_since)).total_seconds()
-            except ValueError:
-                held_age = 0.0
         trigger = device_hold_escalation_trigger or f"the {int(_stuck_hold_ceiling_sec())}s ceiling"
         log(
             f"device HELD {int(held_age)}s — past {trigger} and not lifted — forcing the gentlest-first "
@@ -6827,9 +6961,364 @@ async def _force_escalate_stuck_hold() -> None:
         outcome = await galaxy_recovery.escalate(
             "offbus-forced" if off_bus > 0 else "present-forced", indices, expected, log
         )
+        stood_down = outcome == OUTCOME_WAITING and galaxy_recovery.tenant_deferred
+        if not stood_down:
+            _note_hold_bound_ladder(held_age, outcome)  # a run that stood down on a tenant ran no rung
+        elif bound:
+            blocker = await asyncio.to_thread(_bound_tenant_blocker, True)
+            if blocker is not None:
+                _hold_bound_tenant_blocked(blocker, log)
         _fold_rung_outcome(outcome, log)
-        if outcome == OUTCOME_WAITING and galaxy_recovery.tenant_deferred and _rearm_tenant_deferred_window(kind):
+        if stood_down and _rearm_tenant_deferred_window(kind):
             log(f"{kind} re-armed: it runs on the first sampler tick with no tenant, not at the next window")
+            return
+        # Spec 04 I76: a bound ladder that left the mesh unrecovered (its rungs failed, or its post-reset
+        # sweep could not get a fabric verdict) goes on to the host rung now, unless the ladder already
+        # asked for one. So does a ladder whose rung came back but whose own full check after the reset,
+        # fabric included, ended with no pass: the hold still stands, and waiting adds nothing. Only a
+        # check still waiting on the 1G hugepage pool keeps its _HOLD_BOUND_CHECK_SEC, which the watchdog
+        # bounds.
+        if bound and _recovery_degraded() and not _host_action_blocks_escalation():
+            if outcome == OUTCOME_RECOVERED:
+                _note_hold_bound_check_failed(log)
+            if outcome != OUTCOME_RECOVERED or _hold_bound_cycle_due(_hold_age_now()):
+                await _hold_bound_host_rung(_hold_age_now(), log)
+
+
+# Spec 04 I76 — the 10-min hold bound. The hold age at which this episode's last forced ladder finished
+# and at which the bound last asked for the host rung, keyed by the episode they belong to.
+_hold_bound_episode: str = ""
+_hold_bound_ladder_age: Optional[float] = None
+_hold_bound_ladder_recovered: bool = False
+_hold_bound_cycle_age: Optional[float] = None
+# The hold age at which a full check after the bound's ladder ended with no pass (spec 04 I76).
+_hold_bound_check_failed_age: Optional[float] = None
+_hold_bound_unarmed_paged: str = ""
+# The host rung the bound asked for and has not yet requested: a reset scope still cycling, a live
+# tenant, or a governor denial that armed no retry. The watchdog asks again on every tick until it is
+# requested, a cooldown retry is armed or no host rung is configured (spec 04 I76).
+_hold_bound_rung_pending: bool = False
+_hold_bound_denied_why: str = ""
+# The live tenant that keeps the bound's ladder or host rung from running (paged once per episode) and
+# what it is, for /health (spec 04 I76).
+_hold_bound_tenant_paged: str = ""
+_hold_bound_tenant_blocker: Optional[dict] = None
+# The upper bound on a full health check (fabric included) after a bound ladder brought the mesh back
+# that is still running, hangs or waits on the hugepage pool: past it the host rung fires anyway. A
+# check that ends with no pass does not wait it out; the host rung fires then.
+_HOLD_BOUND_CHECK_SEC = 300
+
+
+def _hold_age_now(now: Optional[datetime] = None) -> float:
+    """Seconds the open hold episode has stood; 0 without a parseable episode clock."""
+    try:
+        return ((now or datetime.now()) - datetime.fromisoformat(device_hold_episode_since)).total_seconds()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _hold_bound_sync() -> None:
+    """Drop the bound's bookkeeping once it belongs to an episode that is no longer open."""
+    global _hold_bound_episode, _hold_bound_ladder_age, _hold_bound_cycle_age, _hold_bound_ladder_recovered
+    global _hold_bound_check_failed_age, _hold_bound_rung_pending, _hold_bound_denied_why, _hold_bound_tenant_blocker
+    if _hold_bound_episode != device_hold_episode_since:
+        _hold_bound_episode = device_hold_episode_since
+        _hold_bound_ladder_age = _hold_bound_cycle_age = _hold_bound_check_failed_age = None
+        _hold_bound_ladder_recovered = _hold_bound_rung_pending = False
+        _hold_bound_denied_why = ""
+        _hold_bound_tenant_blocker = None
+
+
+def _note_hold_bound_ladder(age: float, outcome: str) -> None:
+    """Record the bound's own ladder. A forced run that started below the bound (the off-bus one-shot,
+    a progress retry, a gated grace) is not it: the bound still runs its ladder at the 10-min mark."""
+    global _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_tenant_blocker
+    if age < _stuck_hold_ceiling_sec():
+        return
+    _hold_bound_sync()
+    _hold_bound_tenant_blocker = None
+    _hold_bound_ladder_age = max(age, _hold_age_now())
+    _hold_bound_ladder_recovered = outcome == OUTCOME_RECOVERED
+
+
+def _hold_bound_check_pending(age: float) -> bool:
+    """True while the full health check after a bound ladder that brought the mesh back still has its
+    _HOLD_BOUND_CHECK_SEC and has not ended with no pass: no other run in that window starts a ladder
+    or the host rung over it."""
+    _hold_bound_sync()
+    lad = _hold_bound_ladder_age
+    return (
+        _hold_bound_ladder_recovered
+        and lad is not None
+        and lad >= _stuck_hold_ceiling_sec()
+        and age < lad + _HOLD_BOUND_CHECK_SEC
+        and (_hold_bound_cycle_age is None or _hold_bound_cycle_age < lad)
+        and (_hold_bound_check_failed_age is None or _hold_bound_check_failed_age < lad)
+    )
+
+
+def _note_hold_bound_check_failed(log) -> bool:
+    """A full health check after the bound's ladder ended with no pass (a failed verdict, or a fabric
+    pass that could not run for any cause but a hugepage pool still filling): the host rung is due now,
+    not at the end of _HOLD_BOUND_CHECK_SEC (spec 04 I76). A no-op unless such a check is pending.
+    Returns whether it recorded one."""
+    global _hold_bound_check_failed_age
+    age = _hold_age_now()
+    if not _hold_bound_check_pending(age) or _last_77_was_hugepages():
+        return False
+    _hold_bound_check_failed_age = age
+    health_event(
+        "hold_bound_check_failed",
+        held_age_sec=int(age),
+        ladder_age_sec=int(_hold_bound_ladder_age or 0),
+        held_since=device_hold_episode_since,
+    )
+    log("10-min hold bound: the full check after the ladder ended with no pass — the host rung is next")
+    return True
+
+
+def _hold_bound_ladder_in_last_window(age: float) -> bool:
+    """True when a forced ladder of this episode finished inside the last bound window before ``age``."""
+    _hold_bound_sync()
+    if _hold_bound_ladder_age is None:
+        return False
+    ceiling = _stuck_hold_ceiling_sec()
+    return _hold_bound_ladder_age >= max(ceiling, (int(age // ceiling) - 1) * ceiling)
+
+
+def _hold_bound_cycle_next(kind: str, age: float) -> bool:
+    """Whether a bound run skips the ladder and goes straight to the host rung: the post-ladder check
+    bound ran out, a cooldown the bound's own request waited on ended, or a ladder already finished in
+    the last window (spec 04 I76)."""
+    _hold_bound_sync()
+    if kind == "hold_bound_cycle":
+        return True
+    if kind == "power_cycle_cooldown" and _hold_bound_cycle_age is not None:
+        return True
+    return _hold_bound_ladder_in_last_window(age)
+
+
+def _hold_bound_cycle_due(age: float) -> bool:
+    """True once a bound ladder brought the mesh back but its full check ended with no pass, or the
+    hold still stands _HOLD_BOUND_CHECK_SEC later, and no host rung was asked since that ladder; or a host
+    rung the bound asked for is still pending."""
+    _hold_bound_sync()
+    if _hold_bound_rung_pending:
+        return True
+    lad = _hold_bound_ladder_age
+    if lad is None or lad < _stuck_hold_ceiling_sec():
+        return False
+    failed = _hold_bound_check_failed_age is not None and _hold_bound_check_failed_age >= lad
+    if not failed and age < lad + _HOLD_BOUND_CHECK_SEC:
+        return False
+    return _hold_bound_cycle_age is None or _hold_bound_cycle_age < lad
+
+
+def _lift_hold_bound_latches(log) -> None:
+    """At the bound, the latches that withhold or skip the fabric check (spec 03 I42's topology
+    hardware fault, I46's known fabric fault) are lifted, so the check after the ladder gets a real
+    verdict and only a pass releases. A job that fails the same way declares them again."""
+    if health_monitor is None:
+        return
+    for name in ("topology_hw_fault", "fabric_known_fault"):
+        detail = getattr(health_monitor, name, "")
+        if detail:
+            setattr(health_monitor, name, "")
+            health_event("hold_bound_latch_cleared", latch=name, detail=detail, held_since=device_hold_episode_since)
+            log(f"10-min hold bound: lifting the {name} latch ({detail}) so the full check after the ladder decides")
+
+
+async def _hold_bound_host_rung(age: float, log) -> None:
+    """Spec 04 I76: the step after a bound ladder that did not heal the hold — a BMC power cycle, or a
+    warm reboot where only that is opted in. The governor still decides: a live tenant refuses it (paged
+    once), and a cooldown denial arms the retry the watchdog fires the moment the cooldown ends. Until the
+    rung is requested or such a retry is armed it stays pending, and the watchdog asks again each tick."""
+    global _hold_bound_cycle_age, _hold_bound_unarmed_paged, _hold_bound_rung_pending, _hold_bound_denied_why
+    global _hold_bound_tenant_blocker
+    _hold_bound_sync()
+    _hold_bound_rung_pending = True
+    if await asyncio.to_thread(recovery_mechanism.scope_active):
+        log("10-min hold bound: a reset is still cycling in its own scope — the host rung waits for it")
+        return
+    if _auto_power_cycle_enabled():
+        action = "power-cycle"
+    elif _auto_reboot_enabled():
+        action = "reboot"
+    else:
+        _hold_bound_rung_pending, _hold_bound_cycle_age = False, age
+        if _hold_bound_unarmed_paged != device_hold_episode_since:
+            _hold_bound_unarmed_paged = device_hold_episode_since
+            event = {
+                "kind": "hold_bound_no_host_rung",
+                "host": socket.gethostname(),
+                "held_since": device_hold_episode_since,
+                "held_age_sec": int(age),
+            }
+            health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
+            alert.send_alert(event, logger)
+        log("10-min hold bound: the ladder did not heal the hold and the operator opted out of both host rungs")
+        return
+    blocker = await asyncio.to_thread(_bound_tenant_blocker, True)
+    if blocker is not None:
+        _hold_bound_tenant_blocked(blocker, log)
+        return
+    _hold_bound_tenant_blocker = None
+    allowed, why = recovery_mechanism.auto_recovery_allowed(action, tenant_active=False)
+    if allowed or getattr(recovery_mechanism, "power_cycle_retry", None) is not None:
+        _hold_bound_rung_pending, _hold_bound_cycle_age = False, age
+    if not allowed and why == _hold_bound_denied_why:
+        return  # the same denial as the last tick's: asked again, quietly
+    _hold_bound_denied_why = "" if allowed else why
+    health_event(
+        "hold_bound_host_rung",
+        action=action,
+        allowed=allowed,
+        why=why,
+        held_age_sec=int(age),
+        held_since=device_hold_episode_since,
+    )
+    if not allowed:
+        log(f"10-min hold bound: {action} held off: {why}")
+        recovery_mechanism._journal_auto_recovery_denied(action, why)
+        return
+    cause = f"10-min hold bound: held {int(age)}s and the full ladder did not heal it"
+    log(f"{cause} — firing the {action}")
+    if action == "power-cycle":
+        await _auto_power_cycle_host(log, cause)
+    else:
+        await galaxy_recovery._auto_reboot_host(log, cause)
+
+
+def _rearm_after_scope(kind: str) -> None:
+    """A bound run that found a reset still cycling in its own scope ran nothing: its step runs on the
+    first watchdog tick after that scope ends, not a whole window later (spec 04 I76)."""
+    global device_hold_escalate_bucket, _hold_bound_rung_pending
+    global device_hold_offbus_escalated, device_hold_offbus_prior_bucket
+    if kind == "offbus_one_shot":
+        # The one-shot and the window it claimed over go back together: kept, the bound's ladder
+        # waited for the next window whether the chip was still off or came back meanwhile.
+        device_hold_offbus_escalated = False
+        if device_hold_offbus_prior_bucket is not None:
+            device_hold_escalate_bucket = device_hold_offbus_prior_bucket
+            device_hold_offbus_prior_bucket = None
+    elif kind == "ceiling_window":
+        device_hold_escalate_bucket = max(0, device_hold_escalate_bucket - 1)
+    elif kind == "power_cycle_cooldown":
+        _hold_bound_sync()
+        if _hold_bound_cycle_age is not None:
+            _hold_bound_rung_pending = True  # the spawn spent the cooldown retry this run never asked
+
+
+def _bound_tenant_blocker(bound: bool) -> Optional[dict]:
+    """What keeps the forced ladders off the device (see _bound_tenant_holds), as galaxy's
+    _tenant_blocker fields, or None when nothing does."""
+    if not _bound_tenant_holds(bound):
+        return None
+    try:
+        scan = enumerate_device_holders()
+        if bound:
+            leftover = {f.pid for f in _reaped_leftovers(scan)}
+            scan = replace(scan, holders=[h for h in scan.holders if h.pid not in leftover])
+        blocker = galaxy_recovery._tenant_blocker(scan, force=True)
+    except Exception:  # noqa: BLE001 - naming the blocker never decides whether one holds
+        blocker = None
+    return blocker or {"blocker": "tenant"}
+
+
+def _describe_bound_blocker(blocker: dict) -> str:
+    try:
+        return galaxy_recovery._describe_blocker(blocker)
+    except (KeyError, TypeError, AttributeError):
+        return "a tenant holds the device"
+
+
+def _hold_bound_tenant_blocked(blocker: dict, log) -> None:
+    """Spec 04 I76's one exception besides the boot cooldown: past the bound, a live tenant on the device
+    keeps the ladder and the host rung off it (no reset runs over a tenant). Journaled and paged once per
+    episode, naming the blocker; /health shows it. The ladder runs on the first tick after it leaves."""
+    global _hold_bound_tenant_paged, _hold_bound_tenant_blocker
+    _hold_bound_sync()
+    _hold_bound_tenant_blocker = blocker
+    if _hold_bound_tenant_paged == device_hold_episode_since:
+        return
+    _hold_bound_tenant_paged = device_hold_episode_since
+    desc = _describe_bound_blocker(blocker)
+    event = {
+        "kind": "hold_bound_tenant_blocked",
+        "host": socket.gethostname(),
+        "held_since": device_hold_episode_since,
+        "held_age_sec": int(_hold_age_now()),
+        "blocked_by": desc,
+        **{k: v for k, v in blocker.items() if k != "kind"},
+    }
+    health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
+    alert.send_alert(event, logger)
+    log(f"10-min hold bound: {desc} — no reset or host rung runs over a live tenant; it runs once the tenant leaves")
+
+
+def _bound_tenant_holds(bound: bool) -> bool:
+    """The forced ladders' tenant check (galaxy_recovery.tenant_holds), except that from the 10-min bound
+    on a reaped job's leftover (spec 01 I16) is no tenant: its job already ended and only a host rung
+    clears one stuck in the kernel (spec 04 I76). A running job or any other readable tenant still is."""
+    if bound:
+        scan = enumerate_device_holders()
+        leftover = {f.pid for f in _reaped_leftovers(scan)}
+        if leftover:
+            return galaxy_recovery._tenant_active(
+                replace(scan, holders=[h for h in scan.holders if h.pid not in leftover]), force=True
+            )
+    return galaxy_recovery.tenant_holds()
+
+
+def _hold_escalated_report() -> bool:
+    """The ``escalated`` a stuck-hold event reports: fsm's latch, or a ladder or host rung the 10-min
+    bound ran this episode (spec 04 I76), which the forced path runs without setting the latch."""
+    _hold_bound_sync()
+    return bool(fsm.latch("escalated")) or _hold_bound_ladder_age is not None or _hold_bound_cycle_age is not None
+
+
+def hold_bound_deadline(now: Optional[datetime] = None) -> Optional[datetime]:
+    """When the open hold escalates under the 10-min bound (spec 04 I76), whatever its kind: the hold's
+    start + the stuck-hold ceiling, or the end of a running power-cycle cooldown (I65), whichever is
+    later. None when nothing is held or the episode clock cannot be read."""
+    if not device_hold_episode_since:
+        return None
+    try:
+        deadline = datetime.fromisoformat(device_hold_episode_since) + timedelta(seconds=_stuck_hold_ceiling_sec())
+    except ValueError:
+        return None
+    cd = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
+    if cd and cd.get("until") and cd["until"] > (now.timestamp() if now else time.time()):
+        deadline = max(deadline, datetime.fromtimestamp(cd["until"], deadline.tzinfo))
+    return deadline
+
+
+def _hold_bound_deadline_iso(now: Optional[datetime] = None) -> Optional[str]:
+    deadline = hold_bound_deadline(now)
+    return deadline.isoformat(timespec="seconds") if deadline is not None else None
+
+
+def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
+    """/health's view of the 10-min hold bound for the open episode, or None when nothing is held."""
+    if not device_hold_episode_since:
+        return None
+    _hold_bound_sync()
+    ceiling = _stuck_hold_ceiling_sec()
+    age = _hold_age_now(now)
+    deadline = _hold_bound_deadline_iso(now)
+    lad, cyc = _hold_bound_ladder_age, _hold_bound_cycle_age
+    cd = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
+    cooling = bool(cd and cd.get("until") and cd["until"] > (now.timestamp() if now else time.time()))
+    # After the bound's ladder, the host rung is next: now, or at the end of the cooldown it waits on.
+    step = "power-cycle" if lad is not None and (cooling or cyc is None or cyc < lad) else "ladder"
+    out = {"bound_sec": int(ceiling), "deadline": deadline, "held_age_sec": int(age), "next_step": step}
+    if _hold_bound_tenant_blocker is not None:
+        # The one hold past the bound with no deadline of its own: it waits for the tenant to leave.
+        out["next_step"] = "tenant_blocked"
+        out["blocked_by"] = _describe_bound_blocker(_hold_bound_tenant_blocker)
+    if cooling:
+        out["cooldown_until"] = datetime.fromtimestamp(cd["until"]).isoformat(timespec="seconds")
+    return out
 
 
 def _rearm_tenant_deferred_window(kind: str) -> bool:
@@ -6941,9 +7430,10 @@ def _maybe_spawn_forced_escalation() -> bool:
     """Start one forced escalation as its own task when a hold has outlived the ceiling and none is in
     flight. Detached from the sampler (like the relift): the reset/climb it runs takes tens of seconds,
     and awaiting it inline would blind the sampler's dead-chip tripwire. Declines while a requested
-    host reboot or power cycle is pending, so the caller's window latch stays unspent."""
+    host reboot or power cycle is pending, so the caller's window latch stays unspent. The operator
+    kill-switch governs only runs below the 10-min hold bound (spec 04 I76)."""
     global _forced_escalation_task
-    if not _force_escalate_enabled():
+    if not _force_escalate_enabled() and _hold_age_now() < _stuck_hold_ceiling_sec():
         return False
     if _host_action_blocks_escalation():
         return False
@@ -7036,7 +7526,8 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # outlives its ceiling with no rung ever attempted.
     # A hold whose only cause is a fabric pass that could not run (a 77) is never forced: a reset
     # cannot give a pass its missing prerequisite, and the idle relift re-runs the pass instead.
-    only_77 = _fabric_77_only_hold()
+    # Spec 04 I76: from the 10-min bound on, a 77-only hold is forced like any other.
+    only_77 = _fabric_77_only_hold() and age < ceiling
     # A gated off-bus hold (spec 04 I27) gets one forced pass the moment its grace runs out, so the
     # bounded power cycle fires at the grace and not at the next ceiling window; so does a hold whose
     # tray re-power the BMC's IPMI failed, or whose tray walk did not recover, at its hand-off bound.
@@ -7070,7 +7561,18 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         device_hold_escalation_trigger = "the end of the power-cycle cooldown"
         if _maybe_spawn_forced_escalation():
             recovery_mechanism.clear_power_cycle_retry()
-    if only_77:
+    if _hold_bound_cycle_due(age):
+        # Spec 04 I76: the bound ladder brought the mesh back but its full check has not released the
+        # hold — the host rung now.
+        device_hold_escalation_kind = "hold_bound_cycle"
+        device_hold_escalation_trigger = (
+            "the failed full check after the bound's ladder"
+            if _hold_bound_check_failed_age is not None
+            and _hold_bound_check_failed_age >= (_hold_bound_ladder_age or 0)
+            else f"the {_HOLD_BOUND_CHECK_SEC}s post-ladder check bound"
+        )
+        _maybe_spawn_forced_escalation()
+    elif only_77:
         pass
     elif isolated_chips and not device_hold_offbus_escalated and age >= _offbus_one_shot_sec():
         device_hold_escalation_kind = "offbus_one_shot"
@@ -7108,7 +7610,8 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         held_since=device_hold_episode_since,
         reason=device_hold_episode_reason,
         held_age_sec=int(age),
-        escalated=fsm.latch("escalated"),
+        escalated=_hold_escalated_report(),
+        escalation_deadline=_hold_bound_deadline_iso(now),
         host_at_risk=True,
     )
     if logger and only_77:
@@ -7147,7 +7650,8 @@ def _maybe_alert_stuck_hold(bucket: int, deadline: int, age: float) -> None:
         "reason": device_hold_episode_reason,
         "held_age_sec": int(age),
         "deadline_sec": deadline,
-        "escalated": fsm.latch("escalated"),
+        "escalated": _hold_escalated_report(),
+        "escalation_deadline": _hold_bound_deadline_iso(),
         "next_alert_after_sec": gap * deadline,
     }
     if alert.send_alert(event, logger) is None:
@@ -7236,7 +7740,7 @@ async def _preempt_job(job_id: str, pid: Optional[int]) -> None:
     scope's `systemctl stop` can wait longer than the window)."""
     sigint_window = max(1.0, PREEMPT_GRACE_SEC - SIGTERM_GRACE_SEC)
     try:
-        how = await asyncio.wait_for(_terminate_job(job_id, pid, grace_sec=sigint_window), timeout=PREEMPT_GRACE_SEC)
+        how = await aio.wait_for(_terminate_job(job_id, pid, grace_sec=sigint_window), timeout=PREEMPT_GRACE_SEC)
         _log_job_tree_killed(job_id, "preempted (a job waited past its soft limit)", how)
         return
     except asyncio.TimeoutError:
@@ -7630,7 +8134,7 @@ async def _job_output_dir_problems(job: "Job") -> list[str]:
     # A job scoped to another uid gets only its env_vars; a direct one inherits the broker's too.
     inherited = None if scoped else dict(os.environ)
     try:
-        return await asyncio.wait_for(
+        return await aio.wait_for(
             asyncio.to_thread(preflight_output_dirs, job.workspace, job.env_vars or {}, inherited, uid),
             timeout=JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC,
         )
@@ -7780,8 +8284,12 @@ def _escalate_held_job_past_bound(job: "Job", held_sec: float, bound: float, rea
             return "recovery already escalated this episode; the hold watchdog keeps escalating"
         if _forced_escalation_task is not None and not _forced_escalation_task.done():
             return "a forced recovery escalation is already running"
-        if not _force_escalate_enabled():
-            return "forced escalation is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0); the device stays held"
+        if not _force_escalate_enabled() and _hold_age_now() < _stuck_hold_ceiling_sec():
+            return (
+                f"forced escalation below the hold bound is OFF (TT_DEVICE_MCP_FORCE_ESCALATE=0); the "
+                f"watchdog runs the ladder at the {max(1, round(_stuck_hold_ceiling_sec() / 60))}-min hold "
+                f"bound (spec 04 I76)"
+            )
         device_hold_escalation_kind = "tenant_hold_bound"
         device_hold_escalation_trigger = f"the {int(bound)}s tenant-hold bound (job {job.id})"
         if _maybe_spawn_forced_escalation():
@@ -7886,7 +8394,7 @@ async def _hold_loop(
             )
         # Sleep until a release wakes the hold, or the poll (the governor) or the bound comes due.
         try:
-            await asyncio.wait_for(wake.wait(), timeout=min(TENANT_HOLD_POLL_SEC, max(0.0, bound - held)))
+            await aio.wait_for(wake.wait(), timeout=min(TENANT_HOLD_POLL_SEC, max(0.0, bound - held)))
             gap = TENANT_HOLD_WAKE_MIN_GAP_SEC - (time.monotonic() - last_gate)
             if gap > 0:
                 await asyncio.sleep(gap)
