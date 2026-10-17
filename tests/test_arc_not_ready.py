@@ -29,9 +29,12 @@ def _bdf(i: int) -> str:
     return f"0000:{0x01 + i:02x}:00.0"
 
 
-def _fake_sysfs(monkeypatch, tmp_path, *, missing=(), unbound=(), enodata=(), eio=()) -> dict:
+def _fake_sysfs(
+    monkeypatch, tmp_path, *, missing=(), unbound=(), enodata=(), eio=(), speed_unknown=(), width_63=()
+) -> dict:
     """32 chips; ``missing`` have no class node, ``unbound`` an endpoint with no driver, ``enodata``
-    (``eio``) a heartbeat read that fails with ENODATA (EIO). Returns a handle to bring a chip back."""
+    (``eio``) a heartbeat read that fails with ENODATA (EIO), ``speed_unknown`` (``width_63``) an
+    endpoint whose link reads down by its speed (width). Returns a handle to bring a chip back."""
     cls_dir = tmp_path / "sys/class/tenstorrent"
     devs = tmp_path / "sys/bus/pci/devices"
     cls_dir.mkdir(parents=True)
@@ -46,6 +49,8 @@ def _fake_sysfs(monkeypatch, tmp_path, *, missing=(), unbound=(), enodata=(), ei
         ep.mkdir(exist_ok=True)
         if bound:
             (ep / "driver").mkdir(exist_ok=True)
+        (ep / "current_link_speed").write_text("Unknown\n" if i in speed_unknown else "32.0 GT/s PCIe\n")
+        (ep / "current_link_width").write_text("63\n" if i in width_63 else "16\n")
         node = cls_dir / f"tenstorrent!{i}"
         node.mkdir()
         (node / "device").symlink_to(ep)
@@ -265,6 +270,13 @@ def test_unreadable_on_bus_chips_names_bound_eio_chips_only(monkeypatch, tmp_pat
     _fake_sysfs(monkeypatch, tmp_path, missing={8}, unbound={9}, enodata={10}, eio={9, 11, 12})
     assert heartbeat.unreadable_on_bus_chips({8, 9, 10, 11, "12", 13}) == {"11", "12"}
     assert heartbeat.unreadable_on_bus_chips(set()) == set()
+
+
+def test_unreadable_on_bus_chips_skips_a_node_whose_link_is_down(monkeypatch, tmp_path):
+    """Spec 03 I9: a node whose link reads down (speed Unknown, width 63) is never on the bus, even
+    bound with an EIO read; spec 04 I37 then cannot take it as a survivor that fills its tray."""
+    _fake_sysfs(monkeypatch, tmp_path, eio={11, 12, 13}, speed_unknown={12}, width_63={13})
+    assert heartbeat.unreadable_on_bus_chips({11, 12, 13}) == {"11"}
 
 
 def test_eio_chips_still_count_off_the_bus_for_the_rungs(monkeypatch, tmp_path):

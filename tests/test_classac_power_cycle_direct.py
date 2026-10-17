@@ -15,10 +15,12 @@ from types import SimpleNamespace
 import pytest
 
 from tests.conftest import patch_health_event
+from tests.test_arc_not_ready import _fake_sysfs
 from tests.test_startup_fabric_hugepages import _shortfalls, _startup, _systemctl  # noqa: F401 - the fixtures
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.evidence import health_dir
+from tt_device_mcp.health.monitors import heartbeat
 from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery.base import RESET_RECORD_FILE
 
@@ -469,7 +471,7 @@ def test_whole_trays_absent_reads_class_a_from_bus_presence_alone():
 
 
 def test_whole_trays_absent_needs_the_off_bus_ids_to_be_the_missing_ones():
-    """Review #1040 (a): matching counts are not enough. A heartbeat read and a sysfs read that raced
+    """Spec 04 I37 id-set match: matching counts are not enough. A heartbeat read and a sysfs read that raced
     can name different chips; the presence read then says nothing and the ladder decides."""
     present = _present({0x00: 8, 0x40: 8, 0x80: 8})  # chips 0-23 on the bus
     assert galaxy._whole_trays_absent(present, EXPECTED, {str(i) for i in range(24, 32)}, GROUPS)
@@ -619,6 +621,44 @@ async def test_a_partial_drop_with_eio_survivors_keeps_the_ladder(rig, monkeypat
     assert "power_cycle_direct" not in _kinds(rig) and "class_a_unreadable_survivors" not in _kinds(rig)
 
 
+def _lingering_link_down(monkeypatch, tmp_path, *, gone=(), eio=(), down=()):
+    """Real sysfs reads: ``gone`` chips have no node, ``eio`` chips are bound with an EIO heartbeat
+    read, and ``down`` of them still listed with their link down (half by speed, half by width)."""
+    down = sorted(down)
+    _fake_sysfs(
+        monkeypatch, tmp_path, missing=set(gone), eio=set(eio), speed_unknown=set(down[::2]), width_63=set(down[1::2])
+    )
+    monkeypatch.setattr(galaxy, "unreadable_on_bus_chips", heartbeat.unreadable_on_bus_chips)
+
+
+@pytest.mark.asyncio
+async def test_lingering_link_down_nodes_leave_an_all_off_bus_its_mesh_reset(rig, monkeypatch, tmp_path):
+    """Spec 03 I9 and 04 I37: one tray's nodes are gone and the other trays' linger, bound, with an EIO
+    read and the link down. Every chip is off the bus, so the one mesh reset still runs; the lingering
+    nodes are not survivors that make the drop look like class A."""
+    gone = set(rig["map"][max(rig["map"])])
+    lingering = set(range(EXPECTED)) - gone
+    _lingering_link_down(monkeypatch, tmp_path, gone=gone, eio=lingering, down=lingering)
+    rig["beats"] = {}
+    await _gate(rig, galaxy.STAGE_SMI_RESET)
+    assert "glx_reset" in rig["order"]
+    assert "class_a_unreadable_survivors" not in _kinds(rig) and "power_cycle_direct" not in _kinds(rig)
+
+
+@pytest.mark.asyncio
+async def test_a_tray_of_link_down_nodes_with_one_eio_survivor_is_class_a(rig, monkeypatch, tmp_path):
+    """A whole tray lingers with its links down and one chip elsewhere reads EIO with its link up: only
+    that chip is on the bus, the tray is off, and the drop is class A (straight to the power cycle)."""
+    tray = set(rig["map"][3])
+    survivor = sorted(rig["map"][1])[0]
+    _lingering_link_down(monkeypatch, tmp_path, eio=tray | {survivor}, down=tray)
+    rig["beats"] = _beats_without(tray | {survivor})
+    assert await _gate(rig, galaxy.STAGE_SMI_RESET) == galaxy.OUTCOME_WAITING
+    assert "glx_reset" not in rig["order"] and rig["order"][-1] == "power_cycle"
+    ((_, ev),) = [(k, f) for k, f in rig["events"] if k == "class_a_unreadable_survivors"]
+    assert ev["unreadable"] == [str(survivor)] and ev["off_bus"] == sorted(map(str, tray), key=int)
+
+
 # ---- the tray rung with no map (Part 2 of spec 04 I37) ------------------------------------------
 
 
@@ -666,7 +706,7 @@ async def test_the_tray_rung_with_no_map_keeps_a_partial_drop_on_the_ladder(real
 
 @pytest.mark.asyncio
 async def test_a_listed_node_whose_link_is_down_does_not_fill_a_tray(short_boot):
-    """#1042 (b): a node the kernel still lists with its link down (speed Unknown, width 63) is not on
+    """Spec 03 I9 link-down: a node the kernel still lists with its link down (speed Unknown, width 63) is not on
     the bus. Chips 0-7's heartbeats read, but their tray shows one link down: not whole trays."""
     rig = short_boot
     rig["link_down"] = {f"0000:{rig['present'][0]:02x}:00.0"}

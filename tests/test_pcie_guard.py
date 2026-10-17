@@ -1533,7 +1533,7 @@ def test_an_unreadable_sysfs_under_guard_logs_a_mask_failure(sysfs, monkeypatch)
 
 
 def test_the_latch_never_lifts_while_a_listed_link_reads_down(sysfs, monkeypatch):
-    """#1042 (b): an endpoint the kernel still lists whose link reads down (speed Unknown, width 63)
+    """Spec 03 I9 link-down: an endpoint the kernel still lists whose link reads down (speed Unknown, width 63)
     is not back on the bus, so it cannot lift the I25 hold as "every chip is back"."""
     events = []
     _latched(monkeypatch, sysfs, events)

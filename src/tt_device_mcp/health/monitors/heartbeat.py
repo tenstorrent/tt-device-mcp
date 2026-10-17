@@ -27,7 +27,7 @@ from typing import Optional
 from tt_device_mcp import metrics
 from tt_device_mcp.health.core import Verdict
 from tt_device_mcp.health.evidence import health_event
-from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.health.monitors import hostpci, pci
 from tt_device_mcp.health.monitors.pci import chip_pci_bdf
 
 # The ARC counter ticks ~10Hz. This is the dwell between the two samples whose
@@ -123,10 +123,12 @@ def arc_not_ready_chips(beats: dict[str, int]) -> set[str]:
 def unreadable_on_bus_chips(ids) -> set[str]:
     """Of ``ids``, the chips whose KMD node is there with its PCI endpoint bound to the driver but
     whose heartbeat read fails with an error other than ENODATA (EIO, or the attribute missing on
-    that node). :func:`offbus_chip_ids` counts such a chip off the bus; it is enumerated and bound,
-    so it is on the bus but unhealthy. Only the class A read uses this (spec 04 I37): survivors of a
-    whole-tray drop that read like this must not hide the drop's shape. A chip that reads now (a
-    counter or all-ones) or reads ENODATA is not in it; those have their own handling."""
+    that node), and whose link does not read as down. :func:`offbus_chip_ids` counts such a chip off
+    the bus; it is enumerated and bound, so it is on the bus but unhealthy. Only the class A read uses
+    this (spec 04 I37): survivors of a whole-tray drop that read like this must not hide the drop's
+    shape. A chip that reads now (a counter or all-ones) or reads ENODATA is not in it; those have
+    their own handling. Nor is a lingering node whose link is down (speed ``Unknown`` or width 63,
+    :func:`hostpci.link_down`): spec 03 I9 never counts it back on the bus."""
     out: set[str] = set()
     for idx in sorted({str(i) for i in ids}, key=int):
         node = pci.SYSFS_CLASS_DIR / f"tenstorrent!{idx}"
@@ -143,7 +145,7 @@ def unreadable_on_bus_chips(ids) -> set[str]:
             bound = bool(bdf) and node.is_dir() and (pci.PCI_DEVICES_DIR / bdf / "driver").exists()
         except OSError:
             bound = False
-        if bound:
+        if bound and not hostpci.link_down(bdf):
             out.add(idx)
     return out
 
