@@ -4074,6 +4074,22 @@ def _fabric_77_climb_owed() -> bool:
     return galaxy_recovery is not None and galaxy_recovery.fabric_77_climb_owed(device_hold_episode_since)
 
 
+def _fabric_77_climb_retry_due() -> bool:
+    """Whether a 77-only hold owes ONLY the host rung (spec 04 I79): its one reset came back UNKNOWN,
+    its last-chance sweep read a 77 again, and the climb has not fired on this episode. The watchdog's
+    I65 cooldown retry then asks for that rung the moment the cooldown ends, not at the relift's next
+    re-check (up to its first backoff step, 120 s, later). The forced ladder this drives runs no fresh
+    reset: galaxy goes from the recorded sweep straight to the climb, through every guard of it."""
+    if galaxy_recovery is None or not device_hold_episode_since:
+        return False
+    m = galaxy_recovery.mechanism
+    return (
+        galaxy_recovery.fabric_77_climb_owed(device_hold_episode_since)
+        and m.unverified_reset_since == device_hold_episode_since
+        and m.unverified_sweep_77_since == device_hold_episode_since
+    )
+
+
 def _note_fabric_77_recheck() -> None:
     """Record an idle re-check that 77'd again on the open hold, so the next one backs off (I48)."""
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
@@ -4167,6 +4183,15 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
     return await escalate("present")
 
 
+def _relift_waits_on_host_action() -> bool:
+    """True while a host reboot or power cycle the broker requested is pending (spec 04 I34): the idle
+    relift then runs no check at all — no fabric traffic pass over a host going down, and no lift that
+    would hand a tenant a device the host is about to cycle. The full check after the boot (startup,
+    behind the hugepage gate) decides instead. Bounded by host_action_pending()'s window: past it the
+    request reads as failed and the relift resumes on its next tick."""
+    return recovery_mechanism is not None and recovery_mechanism.host_action_pending() is not None
+
+
 async def _attempt_idle_relift() -> None:
     """Re-verify a device HELD while idle and lift the hold once the mesh proves fit — never a reset.
 
@@ -4205,6 +4230,8 @@ async def _attempt_idle_relift() -> None:
         return
     if fabric and _fabric_77_only_hold() and not _startup_fabric_owed() and not _fabric_77_recheck_due():
         return  # I48: a 77-only hold re-runs the pass on its backoff, not every relift tick
+    if _relift_waits_on_host_action():
+        return
     last_relift_monotonic = time.monotonic()
 
     def _log(msg: str) -> None:
@@ -4236,6 +4263,8 @@ async def _attempt_idle_relift() -> None:
                 return
             if await asyncio.to_thread(recovery_mechanism.scope_active):
                 return
+            if _relift_waits_on_host_action():
+                return  # requested while this waited on the lock
 
             async def _escalate(rung: str, *, measured_fault: bool = False) -> bool:
                 """Run one rung and fold its outcome into ``fsm``. Returns True iff something
@@ -6871,7 +6900,10 @@ async def _force_escalate_stuck_hold() -> None:
         # the host rung after it) from running. Below the bound the faster class paths stay as they are.
         held_age = _hold_age_now()
         bound = held_age >= _stuck_hold_ceiling_sec()
-        if _fabric_77_only_hold() and not bound:
+        # The one exception below the bound: the I65 retry of a 77 climb the cooldown denied, whose
+        # reset and sweep already ran — it asks for the host rung, never a reset (spec 04 I79).
+        climb_77 = kind == "power_cycle_cooldown" and _fabric_77_climb_retry_due()
+        if _fabric_77_only_hold() and not bound and not climb_77:
             return  # a pass that could not run is never reset for; the idle relift re-runs it
         if _host_action_blocks_escalation():
             return  # a host reboot/power cycle was requested while this waited on the lock
@@ -6887,7 +6919,7 @@ async def _force_escalate_stuck_hold() -> None:
             return
         beats = await asyncio.to_thread(read_heartbeats)
         off_bus = _offbus_count(beats, expected)
-        no_reset = "" if off_bus or isolated_chips else _fabric_no_reset_hold()
+        no_reset = "" if off_bus or isolated_chips or climb_77 else _fabric_no_reset_hold()
         if no_reset:
             # Every chip enumerates with a live ARC heartbeat and the hold names only the fabric: a 77
             # or a cabling mismatch. A galaxy reset cannot fix either, and on one Galaxy host it took a
@@ -7515,6 +7547,9 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # cannot give a pass its missing prerequisite, and the idle relift re-runs the pass instead.
     # Spec 04 I76: from the 10-min bound on, a 77-only hold is forced like any other.
     only_77 = _fabric_77_only_hold() and age < ceiling
+    # Spec 04 I79: unless the sweep already ran and only the host rung the cooldown denied is left; its
+    # I65 retry below then runs at the cooldown's end.
+    climb_77 = only_77 and _fabric_77_climb_retry_due()
     # A gated off-bus hold (spec 04 I27) gets one forced pass the moment its grace runs out, so the
     # bounded power cycle fires at the grace and not at the next ceiling window; so does a hold whose
     # tray re-power the BMC's IPMI failed, or whose tray walk did not recover, at its hand-off bound.
@@ -7543,7 +7578,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # late. Once per denial and only in the hold episode it was denied in: the retry is cleared when
     # the climb starts (a declined spawn keeps it), and the governor sets it again if that ask is
     # denied too.
-    if not only_77 and recovery_mechanism.power_cycle_retry_due(now.timestamp() if now else None):
+    if (not only_77 or climb_77) and recovery_mechanism.power_cycle_retry_due(now.timestamp() if now else None):
         device_hold_escalation_kind = "power_cycle_cooldown"
         device_hold_escalation_trigger = "the end of the power-cycle cooldown"
         if _maybe_spawn_forced_escalation():
