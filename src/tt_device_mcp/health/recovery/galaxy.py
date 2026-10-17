@@ -1088,6 +1088,8 @@ class GalaxyRecovery(Recovery):
     # no-host-rung hold already paged (spec 04 I29).
     _sweep_read_77: bool = False
     _host_rung_77_paged_since: Optional[str] = None
+    # The episode whose regressed partial drop already ran its early last-chance sweep (spec 04 I80).
+    _regressed_sweep_since: Optional[str] = None
     # The operator hand-off of a 77 the host rung did not end (spec 04 I29): its episode and deadline.
     _fabric_77_handoff: Optional[dict] = None
     # Whether the last idle-ladder escalate() stood down on a live tenant (spec 04 I7). The hold
@@ -3141,6 +3143,35 @@ class GalaxyRecovery(Recovery):
                 reason="mesh_reset_failed_unchanged",
             )
         elif hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
+            # Spec 04 I80: this episode's reset regressed a partial drop (a few chips, below the reboot
+            # floor). The mesh reset may not run alone again (I31), so the ceiling wait adds nothing but
+            # time; the rung that heals it is the sweep (SBR, the affected tray's re-power, the mesh
+            # reset, then the full verify, fabric included). Run it now, once per episode, instead of
+            # at the ceiling. The host rungs still wait for the ceiling below.
+            if (
+                episode_regressed
+                and not swept
+                and 0 < off_bus < _reboot_min_dead_chips(expected)
+                and self._regressed_sweep_since != hold_since
+            ):
+                self._regressed_sweep_since = hold_since
+                health_event(
+                    "regressed_offbus_early_sweep",
+                    held_since=hold_since,
+                    held_age_sec=int(hold_age),
+                    off_bus=off_bus,
+                    expected=expected,
+                )
+                if (
+                    await self._settle_and_verify_before_host_rung(
+                        expected,
+                        log,
+                        "idle-escalation",
+                        context=f"regressed partial drop, {off_bus}/{expected} off the bus",
+                    )
+                    is True
+                ):
+                    return HOST_RUNG_DEFERRED
             log(
                 f"mesh unrecovered after the reset ladder but the hold is only {int(hold_age)}s "
                 f"old — the host rungs (reboot/power-cycle) wait for the "
