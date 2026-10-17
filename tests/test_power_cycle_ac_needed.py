@@ -1,28 +1,29 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""A whole tray no in-band power cycle heals ends in the AC-power-needed hold (spec 04 I73).
+"""A whole tray no in-band power cycle heals: the AC-power-needed state (spec 04 I73).
 
 After POWER_CYCLE_AC_NEEDED_AFTER broker power cycles that took the host down with the same whole
-tray still off the bus and no verified release since, the broker stops cycling. It holds the device
-dirty, names the state on /health (chips, attempts, last cycle, next presence check), pages once and
-then hourly, and re-reads the bus on a fixed interval. A tray that comes back takes the ordinary path
-and is released only by a passing full health check, fabric included. External cycles space the
-cooldown (I65) but never count as attempts. No test reaches a real reset or power cycle."""
+tray still off the bus and no verified release since, the broker names the state on /health (chips,
+attempts, last cycle), pages once and then hourly, and keeps recovering: the next cycle fires the
+moment each cooldown ends (I65), and a hold that has stood 10 min since its last cycle or boot gets
+the full ladder once. A tray that comes back is released only by a passing full health check, fabric
+included. External cycles space the cooldown (I65) but never count as attempts. No test reaches a
+real reset or power cycle."""
 
 from datetime import datetime
 
 import pytest
 
 from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401
-from tests.test_power_cycle_cooldown import T0, _cycles, _ledger, _tray_off, _watchdog, cool  # noqa: F401
+from tests.test_power_cycle_cooldown import LADDER, T0, _cycles, _ledger, _tray_off, _watchdog, cool  # noqa: F401
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery.base import (
-    AC_POWER_RECHECK_SEC,
     AC_POWER_REPAGE_SEC,
+    CLASS_A_LADDER_AFTER_SEC,
     POWER_CYCLE_AC_NEEDED_AFTER,
     POWER_CYCLE_MIN_INTERVAL_SEC,
 )
@@ -64,27 +65,100 @@ async def _two_cycles_that_do_not_heal(cool):  # noqa: F811
     return await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
 
 
-# ---- (1) two cycles that do not heal: the held state, and no third cycle --------------------------
+# ---- (1) two cycles that do not heal: the AC state, and the cycles go on -------------------------
+
+
+def _ladder_runs(cool):  # noqa: F811
+    return sum(1 for step in cool["order"] if step in LADDER)
+
+
+async def _forced(cool):  # noqa: F811
+    """One forced pass of the hold watchdog (a ceiling window or the cooldown's end)."""
+    return await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda msg: None)
 
 
 @pytest.mark.asyncio
-async def test_two_cycles_that_do_not_heal_end_in_the_ac_hold_and_no_third_cycle_fires(
-    cool, monkeypatch, paged  # noqa: F811
-):
+async def test_cycles_continue_at_cooldown_spacing_past_the_ac_needed_state(cool, monkeypatch, paged):  # noqa: F811
+    """No cycle limit. Past the two attempts the state is on /health and paged, but
+    each later cycle still fires the moment its cooldown ends, and never before it."""
     assert POWER_CYCLE_AC_NEEDED_AFTER == 2
     assert await _two_cycles_that_do_not_heal(cool) == galaxy.OUTCOME_WAITING
     m = cool["g"].mechanism
     state = m.power_cycle_cooldown_state
-    assert state["cause"] == "AC power needed" and "AC power removal needed" in state["why"]
-    assert state["ac_power_needed"]["attempts"] == 2
+    assert state["ac_power_needed"]["attempts"] == 2 and "AC power removal may be needed" in state["why"]
     assert state["ac_power_needed"]["chips"] == [str(c) for c in sorted(_off(cool["map"], {2: 8}), key=int)]
-    # Every later pass, the watchdog's forced climb included, holds with no cycle: hours later too.
-    for later in (60, 3600, 4 * 3600, 24 * 3600):
-        cool["clk"][0] = T0 + later + 2 * POWER_CYCLE_MIN_INTERVAL_SEC
-        await _gate(cool, galaxy.STAGE_SMI_RESET, phase="run")
-        await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda msg: None)
-    assert _cycles(cool) == 2 and m.power_cycle_cooldown_state["cause"] == "AC power needed"
-    assert not {"glx_reset", "ubb_tray", "sweep"} & set(cool["order"]), "no reset or tray re-power in between"
+    gaps = []
+    for n, boot in ((3, "boot-D"), (4, "boot-E"), (5, "boot-F")):
+        last = m.power_cycle_cooldown_state["last"]
+        for _ in range(3):  # the cooldown, or the backstop restating it: each a stated, bounded end
+            until = m.power_cycle_retry[0]
+            assert until - cool["clk"][0] <= 4 * 3600, "every wait is bounded (I65)"
+            cool["clk"][0] = until - 1
+            await _forced(cool)
+            assert _cycles(cool) == n - 1, "no cycle before the stated end"
+            assert _watchdog(cool, monkeypatch, until) == [until], "the watchdog asks at the stated end"
+            cool["clk"][0] = until
+            await _forced(cool)
+            if _cycles(cool) == n:
+                break
+        assert _cycles(cool) == n, f"cycle {n} fires the moment its wait ends"
+        gaps.append(cool["clk"][0] - last)
+        _boot(cool, cool["clk"][0] + BOOT, boot)
+        await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
+        assert m.power_cycle_cooldown_state["ac_power_needed"]["attempts"] == n
+    assert gaps == sorted(gaps) and gaps[-1] <= 4 * 3600, "spaced by the doubling cooldown, capped at 4 h"
+    assert any(e["kind"] == "power_cycle_ac_power_needed" for e in paged), "the AC page still goes out"
+
+
+@pytest.mark.asyncio
+async def test_the_full_ladder_runs_10_min_after_the_last_cycle_or_boot_then_the_cycle(cool):  # noqa: F811
+    """A hold never stands 10 min past its last cycle or boot without the full ladder. The
+    ladder runs once at that mark inside the cooldown; a ladder that did not heal leaves the cycle to
+    fire at the cooldown's end."""
+    await _two_cycles_that_do_not_heal(cool)
+    m = cool["g"].mechanism
+    boot = cool["boot"]["btime"]
+    until = m.power_cycle_retry[0]
+    assert CLASS_A_LADDER_AFTER_SEC == 600 and until - boot > CLASS_A_LADDER_AFTER_SEC
+    cool["clk"][0] = boot + CLASS_A_LADDER_AFTER_SEC - 1
+    await _forced(cool)
+    assert _ladder_runs(cool) == 0, "a whole tray goes to the cycle, not the ladder, before the 10-min mark"
+    cool["clk"][0] = boot + CLASS_A_LADDER_AFTER_SEC
+    await _forced(cool)
+    assert _ladder_runs(cool) >= 1, "the full ladder runs at the 10-min mark"
+    assert _cycles(cool) == 2, "the cooldown still holds the cycle"
+    ran = _ladder_runs(cool)
+    for later in (1200, 1800):
+        cool["clk"][0] = boot + later
+        await _forced(cool)
+    assert _ladder_runs(cool) == ran, "once per cycle or boot, not every window"
+    cool["clk"][0] = until
+    await _forced(cool)
+    assert _cycles(cool) == 3, "the ladder did not heal it: the cycle fires at the cooldown's end"
+    # The next boot gets its own 10-min ladder.
+    _boot(cool, until + BOOT, "boot-D")
+    await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
+    cool["clk"][0] = until + BOOT + CLASS_A_LADDER_AFTER_SEC
+    await _forced(cool)
+    assert _ladder_runs(cool) > ran
+
+
+@pytest.mark.asyncio
+async def test_the_watchdog_starts_the_class_a_ladder_at_the_10_min_mark(cool, monkeypatch):  # noqa: F811
+    """The 10-min ladder is not left to the next ceiling window: the hold watchdog starts one forced
+    pass at the mark (a declined start asks again), and only one per cycle or boot."""
+    await _two_cycles_that_do_not_heal(cool)
+    boot = cool["boot"]["btime"]
+    mark = boot + CLASS_A_LADDER_AFTER_SEC
+    assert _watchdog(cool, monkeypatch, mark - 1) == []
+    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: False)
+    srv._check_hold_deadline(now=datetime.fromtimestamp(mark))
+    assert _watchdog(cool, monkeypatch, mark) == [mark], "a declined start is asked again"
+    assert srv.device_hold_escalation_kind == "class_a_ladder"
+    assert _watchdog(cool, monkeypatch, mark + 60) == [], "one start per cycle or boot"
+    cool["clk"][0] = mark
+    await _forced(cool)
+    assert _ladder_runs(cool) >= 1
 
 
 @pytest.mark.asyncio
@@ -126,18 +200,12 @@ async def test_the_cooldown_is_honoured_between_the_two_cycles(cool):  # noqa: F
 
 
 @pytest.mark.asyncio
-async def test_the_bus_is_rechecked_on_the_interval_and_a_returning_tray_leaves_the_ac_hold(
-    cool, monkeypatch  # noqa: F811
-):
+async def test_a_returning_tray_leaves_the_ac_state(cool):  # noqa: F811
     await _two_cycles_that_do_not_heal(cool)
     m = cool["g"].mechanism
-    until = m.power_cycle_retry[0]
-    assert until == cool["clk"][0] + AC_POWER_RECHECK_SEC
-    assert _watchdog(cool, monkeypatch, until - 1) == []
-    assert _watchdog(cool, monkeypatch, until) == [until], "the presence re-check is forced at its deadline"
     # An operator removed AC power; the same broker (no restart) reads the whole mesh on the bus again.
     cool["beats"] = _beats_without(set())
-    cool["clk"][0] = until
+    cool["clk"][0] += CLASS_A_LADDER_AFTER_SEC
     await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda msg: None)
     assert m.whole_tray_off is None, "no whole tray off: the AC count no longer applies"
     assert _cycles(cool) == 2, "a returning tray is never cycled"
@@ -165,7 +233,7 @@ def test_a_returning_tray_is_released_only_after_the_full_fabric_check_passes(mo
     monkeypatch.setattr(FABRIC_DEBT, "owed", "glx_reset")
     # (4) the check after the tray came back has not passed its fabric pass: still held, still dirty.
     assert srv._clear_device_dirty(verified=True, why="tray back") is False
-    assert held and m.power_cycle_cooldown_state["cause"] == "AC power needed"
+    assert held and m.power_cycle_cooldown_state["ac_power_needed"]["attempts"] == 2
     # (3) the full check passes: the release clears the AC hold and ends the streak.
     FABRIC_DEBT.owed = ""
     assert srv._clear_device_dirty(verified=True, why="tray back") is True
@@ -173,33 +241,39 @@ def test_a_returning_tray_is_released_only_after_the_full_fabric_check_passes(mo
 
 
 @pytest.mark.asyncio
-async def test_a_tray_that_drops_again_before_any_verified_release_holds_with_no_third_cycle(cool):  # noqa: F811
+async def test_a_tray_that_drops_again_before_any_verified_release_is_cycled_at_the_cooldowns_end(cool):  # noqa: F811
     await _two_cycles_that_do_not_heal(cool)
+    m = cool["g"].mechanism
+    until = m.power_cycle_retry[0]
     cool["beats"] = _beats_without(set())
     await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda msg: None)  # the tray read back once
     _tray_off(cool)  # its check failed: the same tray is off again
-    cool["clk"][0] += AC_POWER_RECHECK_SEC
+    cool["clk"][0] = until - 1
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="run")
-    assert _cycles(cool) == 2 and cool["g"].mechanism.power_cycle_cooldown_state["cause"] == "AC power needed"
+    assert _cycles(cool) == 2, "the cooldown still spaces the cycles"
+    cool["clk"][0] = until
+    await _gate(cool, galaxy.STAGE_SMI_RESET, phase="run")
+    assert _cycles(cool) == 3, "no 'no third cycle': the next one fires at the cooldown's end"
 
 
 # ---- (5) /health shows the state and its next check -----------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_health_shows_the_ac_needed_state_and_its_next_presence_check(cool, monkeypatch):  # noqa: F811
+async def test_health_shows_the_ac_needed_state_and_the_next_cycle(cool, monkeypatch):  # noqa: F811
     await _two_cycles_that_do_not_heal(cool)
     now = cool["clk"][0]
     cd = _health(monkeypatch, now)
     ac = cd["ac_power_needed"]
-    assert cd["escalation_stage"] == "ac-power-removal" and cd["cause"] == "AC power needed"
+    until = cool["g"].mechanism.power_cycle_retry[0]
+    assert cd["escalation_stage"] == "power-cycle", "the AC state never stops the cycles"
     assert ac["attempts"] == 2 and len(ac["chips"]) == 8
-    assert ac["next_presence_check_epoch"] == now + AC_POWER_RECHECK_SEC
-    assert cd["next_deadline"] == datetime.fromtimestamp(now + AC_POWER_RECHECK_SEC).isoformat(timespec="seconds")
+    assert cd["next_deadline"] == datetime.fromtimestamp(until).isoformat(timespec="seconds"), "the next cycle"
     assert ac["last_cycle_epoch"] == T0 + BOOT + POWER_CYCLE_MIN_INTERVAL_SEC
     monkeypatch.setattr(srv, "_force_escalate_enabled", lambda: True)
     monkeypatch.setattr(srv.time, "time", lambda: now)
-    assert "needs AC power removed" in srv._hold_escalation_note(off_bus=8)
+    note = srv._hold_escalation_note(off_bus=8)
+    assert "may need AC power removed" in note and "the next cycle at" in note
 
 
 @pytest.mark.asyncio
@@ -226,7 +300,7 @@ def test_external_cycles_space_the_cooldown_but_are_never_attempts(cool, monkeyp
     monkeypatch.setenv(recovery_base.POWER_CYCLE_HISTORY_FILE_ENV, str(hist))
     cool["boot"].update(id="boot-X", btime=T0 - 480)
     allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=T0)
-    assert not allowed and m.power_cycle_cooldown_state["cause"] != "AC power needed"
+    assert not allowed and m.power_cycle_cooldown_state.get("ac_power_needed") is None
     assert m.power_cycle_cooldown_state["until"] == T0 - 480 + POWER_CYCLE_MIN_INTERVAL_SEC
 
 
@@ -274,7 +348,7 @@ def test_a_partial_off_bus_set_never_enters_the_ac_hold(cool):  # noqa: F811
     )
     m.whole_tray_off = None
     m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=T0)
-    assert (m.power_cycle_cooldown_state or {}).get("cause") != "AC power needed"
+    assert (m.power_cycle_cooldown_state or {}).get("ac_power_needed") is None
 
 
 def test_a_power_cycle_row_names_the_tray_it_was_for(cool):  # noqa: F811

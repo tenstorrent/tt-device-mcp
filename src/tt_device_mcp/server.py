@@ -3563,13 +3563,13 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
         ceiling_min = max(1, round(_stuck_hold_ceiling_sec() / 60))
         cooldown = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
         if cooldown is not None and time.time() < cooldown["until"] and cooldown.get("ac_power_needed"):
-            # Spec 04 I73: no further cycle comes; a human must remove AC power. The bus is re-read
-            # at next_deadline and a returning tray is released only on a full health check.
+            # Spec 04 I73: a human may need to remove AC power, but recovery keeps running: the ladder
+            # within 10 min of the last cycle or boot, the next cycle at the cooldown's end.
             until = datetime.fromtimestamp(cooldown["until"]).strftime("%H:%M:%S")
             return (
-                f"No further power cycle: the whole tray stayed off after "
-                f"{cooldown['ac_power_needed']['attempts']} cycle(s) and needs AC power removed; the bus "
-                f"is re-checked at {until} — /health power_cycle_cooldown.ac_power_needed."
+                f"The whole tray stayed off after {cooldown['ac_power_needed']['attempts']} power cycle(s) and "
+                f"may need AC power removed; the broker keeps recovering: the full ladder 10 min after the last "
+                f"cycle or boot, the next cycle at {until} — /health power_cycle_cooldown.ac_power_needed."
             )
         if cooldown is not None and time.time() < cooldown["until"]:
             # Spec 04 I65: the power cycle this hold needs was refused for a bounded wait; the
@@ -6380,8 +6380,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         now_epoch = now.timestamp() if now else time.time()
         if cooldown is not None and now_epoch < cooldown["until"]:
             payload["power_cycle_cooldown"] = {
-                # Spec 04 I73: past the class-A attempts, the next stage is AC removal, not a cycle.
-                "escalation_stage": "ac-power-removal" if cooldown.get("ac_power_needed") else "power-cycle",
+                # Spec 04 I73: the AC-needed state never stops the cycles; the next stage stays a cycle.
+                "escalation_stage": "power-cycle",
                 "next_deadline": datetime.fromtimestamp(cooldown["until"]).isoformat(timespec="seconds"),
                 "last_cycle_or_boot": datetime.fromtimestamp(cooldown["last"]).isoformat(timespec="seconds"),
                 "cause": cooldown["cause"],
@@ -6389,8 +6389,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
                 "why": cooldown["why"],
                 # Spec 04 I72: power-cycle requests this boot that never took the host down.
                 "missed_requests": cooldown.get("missed", 0),
-                # Spec 04 I73: a whole tray no in-band cycle healed: chips, attempts, last cycle and the
-                # next presence check (next_deadline). Null otherwise.
+                # Spec 04 I73: a whole tray the broker's cycles did not heal (AC removal may be needed):
+                # chips, attempts, last cycle. The next cycle is still next_deadline. Null otherwise.
                 "ac_power_needed": cooldown.get("ac_power_needed"),
             }
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
@@ -6825,6 +6825,13 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         device_hold_escalation_trigger = "the end of the power-cycle cooldown"
         if _maybe_spawn_forced_escalation():
             recovery_mechanism.clear_power_cycle_retry()
+    # Spec 04 I73: a whole tray whose cycle the cooldown refuses gets the full ladder at the 10-min
+    # mark after its last cycle or boot, not at the next ceiling window (up to a window late).
+    if not only_77 and recovery_mechanism.class_a_ladder_watch_due(now.timestamp() if now else None):
+        device_hold_escalation_kind = "class_a_ladder"
+        device_hold_escalation_trigger = "10 min since the last power cycle or boot (whole tray off)"
+        if _maybe_spawn_forced_escalation():
+            recovery_mechanism.class_a_ladder_spawned(now.timestamp() if now else None)
     if only_77:
         pass
     elif isolated_chips and not device_hold_offbus_escalated and age >= _offbus_hold_ceiling_sec():

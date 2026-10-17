@@ -209,13 +209,13 @@ POWER_CYCLE_MISS_PAGE_AFTER = 2
 POWER_CYCLE_MISS_REPAGE_SEC = 3600
 
 # Spec 04 I73: a whole tray (class A) still off the bus after this many broker power cycles that took
-# the host down, with no verified release since, is a fault no in-band cycle heals on this hardware
-# (it took AC removal). The broker stops cycling, holds the device stating that AC power must be
-# removed, pages once and then hourly, and re-reads the bus this often: a returning tray goes through
-# the normal reset and full health check before any release.
+# the host down, with no verified release since, may need AC removal (no in-band cycle healed some such
+# drops on this hardware). The broker says so on /health, pages once and then hourly, and keeps
+# recovering: a cycle at the end of each cooldown (I65), and the full ladder once the hold has stood
+# CLASS_A_LADDER_AFTER_SEC since its last cycle or boot. Nothing stops the cycles but the cooldown.
 POWER_CYCLE_AC_NEEDED_AFTER = 2
-AC_POWER_RECHECK_SEC = 300
 AC_POWER_REPAGE_SEC = 3600
+CLASS_A_LADDER_AFTER_SEC = 600
 
 
 def _power_cycle_missed(rec: dict, boot_id: str, now: float) -> bool:
@@ -456,6 +456,12 @@ class RecoveryMechanism:
         self.whole_tray_off: Optional[list] = None
         self._ac_power_paged: float = 0.0
         self._ac_power_logged: set = set()
+        # The AC-needed state the last power-cycle ask found (None: not reached); a cooldown denial
+        # carries it to /health. And the anchor (last cycle, boot or hold start) the class-A 10-min
+        # ladder last ran for, and the one the watchdog last started a pass for: once per anchor.
+        self._ac_power_info: Optional[dict] = None
+        self._class_a_ladder_anchor: Optional[float] = None
+        self._class_a_ladder_spawned: Optional[float] = None
 
         # True while a reset is actually executing. A reset TAKES THE CHIPS OFF THE BUS — that is
         # what a reset is — so during one they read all-ones exactly like a dead chip, and isolating
@@ -1276,9 +1282,9 @@ class RecoveryMechanism:
             # It gates only by its own short retry backoff (below), nothing else here.
             self._mark_missed_power_cycles(ledger, now_epoch)
             requests, ledger = ledger, self._cycles_that_ran(ledger, now_epoch)
-            ac_needed = self._ac_power_needed(ledger, now_epoch, requests)
-            if ac_needed is not None:
-                return self._deny_power_cycle(ac_needed)
+            # Spec 04 I73: past the attempts the AC-needed state pages and shows on /health; it never
+            # refuses the cycle. The cooldown below spaces the cycles, as for any class A.
+            self._ac_power_info = self._ac_power_needed(ledger, now_epoch, requests)
             backstop = self._power_cycle_backstop(ledger, now_epoch)
             if backstop is not None:
                 return self._deny_power_cycle(backstop)
@@ -1433,13 +1439,12 @@ class RecoveryMechanism:
     def _ac_power_needed(
         self, ledger: list[dict], now_epoch: float, requests: Optional[list[dict]] = None
     ) -> Optional[dict]:
-        """Spec 04 I73: the refusal once a whole tray is still off the bus after
+        """Spec 04 I73: the AC-needed state once a whole tray is still off the bus after
         POWER_CYCLE_AC_NEEDED_AFTER broker power cycles with no verified release since, or None.
-        No in-band cycle healed that on this hardware, AC removal did, so the broker stops cycling
-        and holds the device dirty, saying so on /health. ``until`` is the next presence check: the
-        hold watchdog re-reads the bus then, and a tray that came back takes the ordinary reset and
-        full health check (fabric included) before any release. Journals once per episode and per
-        counted cycle; pages once, then every AC_POWER_REPAGE_SEC."""
+        Some such drops on this hardware came back only after AC removal, so a human is told; the
+        broker refuses nothing for it and keeps cycling at the cooldown's spacing (I65), with the
+        class-A 10-min ladder in between. A cooldown denial carries it to /health. Journals once per
+        counted cycle and per episode; pages once, then every AC_POWER_REPAGE_SEC."""
         chips = self.whole_tray_off
         if not chips:
             return None
@@ -1447,28 +1452,19 @@ class RecoveryMechanism:
         if len(rows) < POWER_CYCLE_AC_NEEDED_AFTER:
             return None
         last = max(_epoch(r.get("at_epoch")) or 0.0 for r in rows)
-        until = now_epoch + AC_POWER_RECHECK_SEC
         why = (
-            f"AC power removal needed: chips {','.join(str(c) for c in chips)} (whole tray) still off the bus after "
-            f"{len(rows)} broker power cycle(s) (last {_local_time(last)}); no in-band cycle heals this. "
-            f"Holding the device dirty with no further cycle; remove AC power from the host. Re-checking "
-            f"the bus every {AC_POWER_RECHECK_SEC}s, next {_local_time(until)}: a returning tray is "
-            f"released only after the full health check passes"
+            f"AC power removal may be needed: chips {','.join(str(c) for c in chips)} (whole tray) still off the "
+            f"bus after {len(rows)} broker power cycle(s) (last {_local_time(last)}). The broker keeps "
+            f"recovering: the full ladder {CLASS_A_LADDER_AFTER_SEC}s after each cycle or boot, then the next "
+            f"power cycle as soon as its cooldown ends; the device is released only after the full health "
+            f"check passes"
         )
-        state = {
-            "until": until,
-            "last": last,
-            "cause": "AC power needed",
-            "interval_sec": AC_POWER_RECHECK_SEC,
+        info = {
+            "chips": list(chips),
+            "attempts": len(rows),
+            "last_cycle": _local_time(last),
+            "last_cycle_epoch": last,
             "why": why,
-            "ac_power_needed": {
-                "chips": list(chips),
-                "attempts": len(rows),
-                "last_cycle": _local_time(last),
-                "last_cycle_epoch": last,
-                "next_presence_check": _local_time(until),
-                "next_presence_check_epoch": until,
-            },
         }
         for r in rows:
             key = r.get("at_epoch")
@@ -1481,7 +1477,6 @@ class RecoveryMechanism:
                 off_bus=list(chips),
                 attempts=len(rows),
                 last_cycle_epoch=last,
-                recheck_sec=AC_POWER_RECHECK_SEC,
                 host_at_risk=False,
             )
         mono = time.monotonic()
@@ -1489,7 +1484,49 @@ class RecoveryMechanism:
             event = {"kind": "power_cycle_ac_power_needed", "chips": list(chips), "attempts": len(rows), "message": why}
             if alert.send_alert(event) is not None or alert.alert_argv() is None:
                 self._ac_power_paged = mono
-        return state
+        return info
+
+    def _class_a_ladder_anchor_now(self, now: float) -> Optional[float]:
+        """The anchor of the class-A 10-min ladder (spec 04 I73): the later of the last cycle or boot
+        the cooldown counts from and this hold's start, while a whole tray is off and the cooldown
+        refuses its cycle; None otherwise (no cooldown, or its end has come and the cycle is due)."""
+        state = self.power_cycle_cooldown_state
+        if state is None or not self.whole_tray_off or now >= state["until"]:
+            return None
+        anchor = _epoch(state.get("last")) or 0.0
+        since = self._device_hold_episode_since()
+        try:
+            return max(anchor, datetime.fromisoformat(since).timestamp() if since else 0.0)
+        except ValueError:
+            return anchor
+
+    def class_a_ladder_watch_due(self, now_epoch: Optional[float] = None) -> bool:
+        """True once the class-A 10-min mark is reached and no forced pass has been started for it:
+        the hold watchdog then starts one at the mark, not at its next ceiling window. Call
+        :meth:`class_a_ladder_spawned` once that pass started (a declined spawn asks again)."""
+        now = time.time() if now_epoch is None else now_epoch
+        anchor = self._class_a_ladder_anchor_now(now)
+        if anchor is None or now - anchor < CLASS_A_LADDER_AFTER_SEC:
+            return False
+        return anchor not in (self._class_a_ladder_anchor, self._class_a_ladder_spawned)
+
+    def class_a_ladder_spawned(self, now_epoch: Optional[float] = None) -> None:
+        now = time.time() if now_epoch is None else now_epoch
+        self._class_a_ladder_spawned = self._class_a_ladder_anchor_now(now)
+
+    def class_a_ladder_due(self, now_epoch: Optional[float] = None) -> bool:
+        """Spec 04 I73 / user rule: a class-A hold whose power cycle the cooldown refused never stands
+        past CLASS_A_LADDER_AFTER_SEC since its last cycle or boot (or its own start, if later) without
+        the full ladder. True once per such anchor, when that mark is reached inside the cooldown: the
+        hold watchdog's forced pass then runs the ladder, whose reset is followed by the full health
+        check (fabric included) and, if that fails, the power cycle the cooldown releases at its end.
+        False past the cooldown (the cycle itself is due) and with no cooldown standing."""
+        now = time.time() if now_epoch is None else now_epoch
+        anchor = self._class_a_ladder_anchor_now(now)
+        if anchor is None or now - anchor < CLASS_A_LADDER_AFTER_SEC or self._class_a_ladder_anchor == anchor:
+            return False
+        self._class_a_ladder_anchor = anchor
+        return True
 
     def power_cycle_miss_state(
         self, ledger: Optional[list[dict]] = None, *, now_epoch: Optional[float] = None
@@ -1696,6 +1733,9 @@ class RecoveryMechanism:
         self.whole_tray_off = None
         self._ac_power_paged = 0.0
         self._ac_power_logged = set()
+        self._ac_power_info = None
+        self._class_a_ladder_anchor = None
+        self._class_a_ladder_spawned = None
         now_epoch = time.time() if now_epoch is None else now_epoch
         ledger = self.read_auto_recovery_ledger() or []
         healed = self._power_cycle_healed_at(now_epoch)
@@ -1714,6 +1754,11 @@ class RecoveryMechanism:
         """Refuse the power cycle for a stated, bounded wait (spec 04 I65): ``state`` (``until``,
         ``last``, ``cause``, ``interval_sec``, ``why``) is what /health shows, and the hold watchdog
         asks again at ``until`` in this hold episode."""
+        ac = self._ac_power_info
+        if ac is not None:
+            # Spec 04 I73: the wait is still the cooldown's; /health also says AC removal may be needed.
+            state = {**state, "ac_power_needed": {k: v for k, v in ac.items() if k != "why"}}
+            state["why"] = f"{ac['why']}. {state['why']}"
         self.power_cycle_cooldown_state = state
         self.power_cycle_retry = (state["until"], self._device_hold_episode_since() or "")
         return False, state["why"]

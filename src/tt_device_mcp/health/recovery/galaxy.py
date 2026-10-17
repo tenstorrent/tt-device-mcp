@@ -44,7 +44,12 @@ from tt_device_mcp.health.recovery import (
     offbus_power_cycle,
     pcie_guard,
 )
-from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC, drop_returned_isolated, refuse_mesh_reset
+from tt_device_mcp.health.recovery.base import (
+    CLASS_A_LADDER_AFTER_SEC,
+    HOLD_ESCALATION_REARM_SEC,
+    drop_returned_isolated,
+    refuse_mesh_reset,
+)
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
@@ -1276,8 +1281,8 @@ class GalaxyRecovery(Recovery):
             present_buses=present_buses,
             tray_groups=groups,
         )
-        # Spec 04 I73: the governor counts the broker cycles for this tray, and stops at the AC-needed
-        # hold, only while a whole tray is what is off; any other read clears it.
+        # Spec 04 I73: the governor counts the broker cycles for this tray, and flags the AC-needed
+        # state, only while a whole tray is what is off; any other read clears it.
         self.mechanism.whole_tray_off = sorted(offbus, key=int) if fault_class == FAULT_CLASS_WHOLE_TRAY else None
         if fault_class == FAULT_CLASS_WHOLE_TRAY and present_buses is not None:
             log(
@@ -1318,6 +1323,21 @@ class GalaxyRecovery(Recovery):
             fault_class, offbus, expected, log, context=gate_phase or rung, force=rung == "offbus-forced"
         )
         if fired is None:
+            return None
+        if (
+            fired is False
+            and rung == "offbus-forced"
+            and fault_class == FAULT_CLASS_WHOLE_TRAY
+            and self.mechanism.class_a_ladder_due()
+        ):
+            # Spec 04 I73: the cooldown refused the cycle, and the hold has stood 10 min since its last
+            # cycle or boot. The full ladder runs once now (each reset followed by the full health
+            # check, fabric included); the cycle still fires the moment the cooldown ends.
+            log(
+                f"whole tray(s) off and the power cycle in cooldown {CLASS_A_LADDER_AFTER_SEC}s after the last "
+                f"cycle or boot — running the full ladder; the cycle follows at the cooldown's end if it fails"
+            )
+            health_event("class_a_cooldown_ladder", off_bus=sorted(offbus, key=int), expected=expected)
             return None
         if fired and rung != "gate":
             return OUTCOME_TERMINAL
