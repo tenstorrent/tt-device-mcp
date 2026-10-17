@@ -33,9 +33,9 @@ import shlex
 import shutil
 import signal
 import socket
-import threading
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -87,10 +87,10 @@ from tt_device_mcp.device_holders import (
     evaluate_reset_gate,
     is_tenant,
     note_broker_internal,
-    read_proc_cpu,
-    reclaim_foreign_holders,
     proc_uid,
+    read_proc_cpu,
     read_proc_starttime,
+    reclaim_foreign_holders,
     wait_device_released,
 )
 from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec, add_close_listener

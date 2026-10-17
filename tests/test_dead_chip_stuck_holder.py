@@ -17,15 +17,13 @@ import time
 
 import pytest
 
-from tests.conftest import patch_health_event
 from tests.test_classac_power_cycle_direct import EXPECTED, rig  # noqa: F401 - the fixture
 from tests.test_reaped_leftover import SIGKILL_PENDING, _stage
 from tests.test_ubb_tray_map import galaxy_seen  # noqa: F401 - the fixture
 from tt_device_mcp import job_reap
 from tt_device_mcp import server as srv
-from tt_device_mcp.health.recovery import galaxy
-from tt_device_mcp.health.recovery import offbus_power_cycle
 from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.health.recovery import galaxy, offbus_power_cycle
 
 PID = 6300
 CHIP = "3"
@@ -46,7 +44,9 @@ def _stage_holder(proc, pid=PID, *, state="D", sigpnd="0" * 16, fds=("/dev/tenst
         for n, target in enumerate(fds, start=5):
             os.symlink(target, d / "fd" / str(n))
     if maps is not None:
-        (d / "maps").write_text("".join(f"7f00000{n}000-7f00000{n}fff rw-s 00000000 00:05 1 {m}\n" for n, m in enumerate(maps)))
+        (d / "maps").write_text(
+            "".join(f"7f00000{n}000-7f00000{n}fff rw-s 00000000 00:05 1 {m}\n" for n, m in enumerate(maps))
+        )
     return d
 
 
@@ -88,7 +88,9 @@ def stuck(rig, monkeypatch, tmp_path):  # noqa: F811 - the imported fixture
     pages = []
     s = {"proc": proc, "pages": pages, "order": rig["order"], "events": rig["events"], "rig": rig, "deliver": True}
     monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["page"])
-    monkeypatch.setattr(srv.alert, "send_alert", lambda e, log=None: (pages.append(e), object())[1] if s["deliver"] else None)
+    monkeypatch.setattr(
+        srv.alert, "send_alert", lambda e, log=None: (pages.append(e), object())[1] if s["deliver"] else None
+    )
     return s
 
 
@@ -122,7 +124,9 @@ async def _tick(now):
 def test_refs_name_device_fds_node_maps_and_bar_maps(tmp_path, monkeypatch):
     proc = tmp_path / "proc"
     proc.mkdir()
-    _stage_holder(proc, fds=("/dev/tenstorrent/3 (deleted)", "/tmp/log"), maps=("/dev/tenstorrent/3", BAR, "/usr/lib/libc.so.6"))
+    _stage_holder(
+        proc, fds=("/dev/tenstorrent/3 (deleted)", "/tmp/log"), maps=("/dev/tenstorrent/3", BAR, "/usr/lib/libc.so.6")
+    )
     monkeypatch.setattr(job_reap, "LEFTOVER_PROC_DIR", str(proc))
 
     refs = job_reap.device_refs(PID, [BDF])
@@ -167,7 +171,9 @@ def test_a_maps_read_that_blocks_is_bounded_and_fds_still_count(tmp_path, monkey
     monkeypatch.setattr(job_reap, "LEFTOVER_PROC_DIR", str(proc))
     release = threading.Event()
     real = job_reap._read_leftover
-    monkeypatch.setattr(job_reap, "_read_leftover", lambda pid, name: release.wait(5) if name == "maps" else real(pid, name))
+    monkeypatch.setattr(
+        job_reap, "_read_leftover", lambda pid, name: release.wait(5) if name == "maps" else real(pid, name)
+    )
     try:
         t0 = time.monotonic()
         refs = job_reap.device_refs(PID, [BDF], maps_timeout=0.2)
@@ -247,7 +253,9 @@ async def test_the_bridge_rung_is_withheld_and_the_hold_stays_generic(stuck, mon
     _note(stuck)
     srv.isolated_chips = {CHIP}
     srv.device_pci_map = {CHIP: BDF}
-    monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", lambda *a: pytest.fail("bridge reset under a stuck holder"))
+    monkeypatch.setattr(
+        recovery_pkg, "reset_chip_via_bridge", lambda *a: pytest.fail("bridge reset under a stuck holder")
+    )
     g = srv.galaxy_recovery
 
     assert await g._recover_isolated_chips(lambda m: None) is False
@@ -259,9 +267,9 @@ async def test_the_bridge_rung_is_withheld_and_the_hold_stays_generic(stuck, mon
     # A stuck-holder window is not the no-window class: the generic branch (and its whole-tray
     # power-cycle hand-off) owns the hold, never the sweep that is itself fenced.
     tray = set(range(24, 32))
-    assert galaxy._classify_hold(tray, EXPECTED, {c: {"reason": "stuck_holder"} for c in tray}, stuck["rig"]["map"]) == (
-        galaxy.HOLD_CLASS_GENERIC
-    )
+    assert galaxy._classify_hold(
+        tray, EXPECTED, {c: {"reason": "stuck_holder"} for c in tray}, stuck["rig"]["map"]
+    ) == (galaxy.HOLD_CLASS_GENERIC)
 
 
 async def test_the_tray_down_rescan_is_withheld(stuck, monkeypatch):
@@ -269,8 +277,15 @@ async def test_the_tray_down_rescan_is_withheld(stuck, monkeypatch):
     g = srv.galaxy_recovery
     monkeypatch.setattr(galaxy, "_pci_rescan", lambda: pytest.fail("PCI rescan under a stuck holder"))
     monkeypatch.setattr(g, "_tray_down_capture", lambda onset, expected: {})
-    g._td = {"path": "TRAY_DOWN", "onset": {4: 8}, "off": list(range(24, 32)), "epoch": time.time(),
-             "rescanned": False, "captured": False, "prelude_done": False}
+    g._td = {
+        "path": "TRAY_DOWN",
+        "onset": {4: 8},
+        "off": list(range(24, 32)),
+        "epoch": time.time(),
+        "rescanned": False,
+        "captured": False,
+        "prelude_done": False,
+    }
 
     assert await g._tray_down_prelude(EXPECTED, lambda m: None, phase="gate") is False
     assert g._td["rescanned"] is False and g._td["prelude_done"] is False, "the rescan runs once the holder is gone"
@@ -440,7 +455,9 @@ async def test_the_dead_chip_path_notes_stuck_holders_and_says_the_host_is_still
     monkeypatch.setattr(srv, "HOLDER_RELEASE_WAIT_SEC", 0.2)
     order, _ = _dead_chip_harness(monkeypatch, holding_scans=None)
     noted = []
-    monkeypatch.setattr(srv, "_note_dead_chip_stuck_holders", lambda chips, killed: noted.append((chips, killed)) or [4242])
+    monkeypatch.setattr(
+        srv, "_note_dead_chip_stuck_holders", lambda chips, killed: noted.append((chips, killed)) or [4242]
+    )
     lines = []
 
     class Capture(logging.Handler):
