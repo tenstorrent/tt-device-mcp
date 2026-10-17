@@ -16,8 +16,8 @@ import pytest
 
 from tests.test_device_safety import _arm_fabric_only_deadline_hold
 from tests.test_hold_bound import BOUND, MISMATCH, _drain, _watchdog
-from tt_device_mcp.health import evidence as health
 from tt_device_mcp import server as srv
+from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health.recovery import OUTCOME_RECOVERED
 
 # Hold classes whose bound ladder can end in a release on a device that still has the fault:
