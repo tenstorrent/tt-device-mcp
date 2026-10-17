@@ -33,6 +33,9 @@ class FabricDebt:
 
     def __init__(self) -> None:
         self.owed: str = ""
+        # Whether any fabric pass has passed since this broker started (spec 04 I29: a boot a 77 host
+        # rung brought up has spent that rung until one does).
+        self.passed_since_start: bool = False
 
     def note_reset(self, what: str) -> None:
         """A reset (or a broker start) happened: the fabric is unproven until a pass clears it.
@@ -43,6 +46,8 @@ class FabricDebt:
 
     def note_fabric(self, ok: Optional[bool]) -> None:
         """Fold one fabric verdict in: only a healthy one settles the debt."""
+        if ok is True:
+            self.passed_since_start = True
         if ok is True and self.owed:
             health_event("post_reset_fabric_settled", reset=self.owed)
             self.owed = ""

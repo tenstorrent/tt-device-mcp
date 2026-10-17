@@ -87,6 +87,7 @@ systemctl() {{
 }}
 op_in_flight() {{ return 1; }}
 hold_write() {{ :; }}
+count_busy() {{ kids=0; holders=0; scopes=0; queued=0; busy=0; }}
 {stand_ins}
 """
     env = {"PATH": "/usr/bin:/bin", "TTDEV_LOG_DIR": str(logs), **(env or {})}
@@ -240,8 +241,8 @@ def test_a_running_reset_scope_always_defers_even_past_the_bound(tmp_path):
 
 
 def test_a_running_job_on_a_healthy_broker_is_left_to_the_idle_rule(tmp_path):
-    """A job is not a recovery: the recovery gate lets the lap through, and the existing idle gate
-    (TTDEV_MAX_DEFER_SEC, drain) after it decides, as before."""
+    """A job is not a recovery: the recovery gate lets the lap through, and the idle gate after it
+    (spec 08 I20, I24: drain at once, bounded by the job cap) decides."""
     body = json.loads(_health())
     body.update(running=1, queued=2, total_jobs=3)
     done, _, log = _gate(tmp_path, health=[json.dumps(body)])
@@ -249,10 +250,8 @@ def test_a_running_job_on_a_healthy_broker_is_left_to_the_idle_rule(tmp_path):
     assert log == []
     assert not (tmp_path / "root" / "recovery.defer").exists()
     text = _SCRIPT.read_text()
-    assert (
-        text.index("if recovery_gate; then") < text.index("# Idle gate, OFF by default") < text.index("count_busy\nif")
-    )
-    assert 'MAX_DEFER="${TTDEV_MAX_DEFER_SEC:-0}"' in text
+    assert text.index("if recovery_gate; then") < text.index("# Idle gate (spec 08 I24)") < text.index("count_busy\nif")
+    assert "TTDEV_MAX_DEFER_SEC" not in text
 
 
 def test_the_deferral_touches_no_recovery_switch():
@@ -267,9 +266,18 @@ def test_the_deferral_touches_no_recovery_switch():
 # --- the last look before the restart ------------------------------------------------------------
 
 
+def _waits():
+    """The job-boundary wait the last look uses (spec 08 I20, I24), cut from the script. The
+    busy count and the device-op probe stay the stand-ins'."""
+    text = _SCRIPT.read_text()
+    age = text[text.index("youngest_job_age() {") : text.index("# The device-op bar above, asked again")]
+    wait = text[text.index("wait_job_boundary() {") : text.index("\ncount_busy\nif")]
+    return "JOB_CAP=1560\nUPTIME=/proc/uptime\n" + age + wait + "\n"
+
+
 def _apply(tmp_path, **kw):
     """The top gate (healthy at first) and the restart tail, with the install in between elided."""
-    body = _top() + 'echo "autoupdate: applying"\ntrap au_exit EXIT\n' + _tail()
+    body = _top() + _waits() + 'echo "autoupdate: applying"\ntrap au_exit EXIT\n' + _tail()
     return _run(tmp_path, body, **kw)
 
 
@@ -291,9 +299,9 @@ def test_a_hold_that_began_during_the_install_defers_the_restart(tmp_path):
 
 
 def test_a_device_op_at_restart_time_is_waited_out(tmp_path):
-    ops = tmp_path / "ops"
-    ops.write_text("3")
-    stand_in = f'op_in_flight() {{ n=$(cat {ops}); [ "$n" -gt 0 ] || return 1; echo $((n-1)) > {ops}; return 0; }}'
+    # The op ends after three 5 s polls.
+    trace = tmp_path / "trace"
+    stand_in = f'op_in_flight() {{ [ "$(cat {trace} 2>/dev/null | grep -c "^sleep")" -lt 3 ]; }}'
     done, trace, log = _apply(tmp_path, health=[_health()], stand_ins=stand_in)
     assert done.returncode == 0, done.stderr
     steps = [t for t in trace if not t.startswith("logger ")]
@@ -313,12 +321,13 @@ def test_a_device_op_that_outlives_the_wait_is_never_restarted_over(tmp_path):
     assert done.returncode == 0, done.stderr
     assert "restart" not in trace
     assert (tmp_path / "root" / "installed.sha").read_text().strip() == _OLD
-    assert "decision=deferred" in log[-1] and "device op still in flight" in log[-1]
+    assert "decision=deferred" in log[-1] and "device op still in flight at restart time" in log[-1]
+    assert "job cap 1560s" in log[-1], log
 
 
 def test_the_restart_still_comes_after_the_last_look():
     tail = _tail()
-    assert tail.index("while op_in_flight") < tail.index("if recovery_gate") < tail.index('> "$STATE"')
+    assert tail.index('wait_job_boundary "restart point"') < tail.index("if recovery_gate") < tail.index('> "$STATE"')
     assert tail.index('> "$STATE"') < tail.index("systemctl restart tt-device-broker")
 
 
