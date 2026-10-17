@@ -1396,10 +1396,12 @@ def _note_hold_carry_job(edge: str, *, ok: bool = False) -> None:
     _write_hold_carry()
 
 
-def _note_full_check_passed() -> None:
+def _note_full_check_passed(prior: Optional[dict]) -> None:
     """A full health check (fabric included) passed with no hold open: the device served and proved
-    fit since the release, so a later hold is a new episode (spec 04 I82)."""
-    if not device_hold_logged:
+    fit since the release, so a later hold is a new episode (spec 04 I82). ``prior`` is the carry
+    from before this pass; only that one ends. A carry this pass's own release saved (the startup
+    check releasing a hold a dead broker left open) is the release itself, not proof since it."""
+    if not device_hold_logged and prior is not None and _load_hold_carry() is prior:
         _drop_hold_carry()
 
 
@@ -6164,12 +6166,12 @@ async def device_health_gate(
                 _log(f"device verified healthy (incl. fabric) despite: {dirty_reason}" f" — no reset needed")
             else:
                 _log("device healthy; no reset needed")
+            prior_carry = _load_hold_carry()  # spec 04 I82: the release below may save a new one
             released = _clear_device_dirty(verified=True, why=f"gate/{phase}: verified healthy")
             if released and state.fabric_ran and fabric_ok is True:
                 # Proof this boot heals: a power cycle before it no longer reads as a boot loop (04 I9).
                 recovery_mechanism.record_verified_release(f"gate/{phase}")
-            if state.fabric_ran and fabric_ok is True:
-                _note_full_check_passed()  # spec 04 I82; before the release below saves a new carry
+                _note_full_check_passed(prior_carry)  # spec 04 I82; before the release below saves one
             if released and device_hold_logged:
                 _note_tenant_gate_verdict("")
             return

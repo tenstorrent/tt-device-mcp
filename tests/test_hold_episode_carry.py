@@ -207,14 +207,46 @@ async def test_a_passing_full_check_with_no_hold_open_drops_the_carry(monkeypatc
     assert _age() < 60 and not srv._hold_bound_cycle_due(_age())
 
 
-def test_a_passing_full_check_that_releases_a_hold_keeps_the_new_carry(monkeypatch, tmp_path, clear_job_state):
-    """The pass that releases a hold is the release itself, not proof since it: the carry it saves stays."""
+@pytest.mark.asyncio
+async def test_a_pass_whose_release_is_refused_keeps_the_carry(monkeypatch, tmp_path, clear_job_state):
+    """A pass that did not release the device (a reset still owes its fabric pass, spec 04 I32) proved
+    nothing since the release: the carry stays for the hold that follows."""
     _isolate(monkeypatch, tmp_path)
     _watchdog(monkeypatch)
-    _open_hold(monkeypatch, "missing port (topology mismatch)", 200)
-    srv._note_full_check_passed()  # the gate calls it before it releases
-    srv._note_tenant_gate_verdict("")
-    assert srv._hold_carry is not None
+    escalations, events, _detail = _open_hold(monkeypatch, "missing port (topology mismatch)", BOUND + 5)
+    await _bound_ladder_releases(monkeypatch, escalations, events)
+    _gate_passes(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "_post_reset_debt", lambda: "a reset")
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True, force_fabric=True)
+    assert srv._hold_carry is not None and (tmp_path / srv.HOLD_CARRY_FILE).exists()
+
+
+def _gate_passes(monkeypatch, tmp_path):
+    """The real gate's next pass finds the device healthy, fabric included."""
+    from tests.test_boot_fabric_reverify import _FABRIC_OK, _broker
+    from tests.test_device_safety import _ledger_dir
+    from tt_device_mcp.fsm import ServerFsm
+
+    _ledger_dir(monkeypatch, tmp_path)
+    _broker(monkeypatch, tmp_path, ServerFsm(tmp_path / "fsmdir" / "fsm.json", current_boot_id="boot-a"), _FABRIC_OK)
+    monkeypatch.setattr(srv, "_post_reset_debt", lambda: "")
+
+
+@pytest.mark.asyncio
+async def test_a_passing_full_check_that_releases_a_hold_keeps_the_new_carry(monkeypatch, tmp_path, clear_job_state):
+    """The pass that releases a hold is the release itself, not proof since it: the carry it saves stays,
+    and a failed first job continues the episode."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    _escalations, _events, detail = _open_hold(monkeypatch, "missing port (topology mismatch)", 200)
+    since = srv.device_hold_episode_since
+    _gate_passes(monkeypatch, tmp_path)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True, force_fabric=True)
+
+    assert not srv.device_hold_logged and not srv.device_hold_episode_since  # released
+    assert srv._hold_carry is not None and (tmp_path / srv.HOLD_CARRY_FILE).exists()
+    srv._note_tenant_gate_verdict(f"job 8: {detail}")
+    assert srv.device_hold_episode_since == since and _age() >= 200
 
 
 def _open_tenant_hold(monkeypatch, age_sec):
@@ -391,6 +423,30 @@ async def test_replay_a_restart_whose_startup_check_releases_then_a_failed_first
     srv._check_hold_deadline(now=datetime.now())
     await _drain()
     assert escalations == [] and events.count("host_rung") == 1
+
+
+@pytest.mark.asyncio
+async def test_replay_a_restart_whose_real_startup_gate_releases_keeps_the_carry(monkeypatch, tmp_path, clear_job_state):
+    """The 09:02 replay through the real startup gate: its full check releases the hold the dead broker left
+    open and saves the carry; the same pass must not end it. Fails on eb54d67: the gate's own full-check
+    drop ended that carry, so the first job's re-hold was seconds old and the host rung never due."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    _escalations, _events, detail = _open_hold(monkeypatch, "missing port (topology mismatch)", BOUND + 5)
+    since = srv.device_hold_episode_since
+    srv._note_hold_bound_ladder(BOUND + 5, OUTCOME_RECOVERED)  # the bound ladder ran before the restart
+    _restart_broker(monkeypatch)
+    _gate_passes(monkeypatch, tmp_path)
+    assert not srv.device_hold_logged  # no tenant refused yet: the usual startup
+
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+
+    assert srv._hold_carry is not None and (tmp_path / srv.HOLD_CARRY_FILE).exists()
+    srv._note_hold_carry_job("start")
+    srv._note_hold_carry_job("end")  # the first job dies on the same link
+    srv._note_tenant_gate_verdict(f"job 8: {detail}")
+    assert srv.device_hold_episode_since == since, "the restart's startup check did not restart the clock"
+    assert srv._hold_bound_cycle_due(_age()), "the ladder before the restart counts: the host rung is due"
 
 
 @pytest.mark.asyncio
