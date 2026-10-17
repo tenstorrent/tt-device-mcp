@@ -1301,7 +1301,12 @@ def _forget_stale_hold_episode() -> None:
     if since:
         # Spec 04 I82: a hold the last broker left open that this one's first check released is a
         # release like any other: a new hold right after it continues that episode.
-        _save_hold_carry(since, "", ladder_age=_recorded_hold_bound_ladder_age(since))
+        _save_hold_carry(
+            since,
+            "",
+            ladder_age=_recorded_hold_bound_ladder_age(since),
+            ladder_early=_recorded_hold_bound_ladder_early(since),
+        )
     _persist_hold_episode("")
 
 
@@ -1342,7 +1347,9 @@ def _load_hold_carry() -> Optional[dict]:
     return _hold_carry
 
 
-def _save_hold_carry(since: str, reason: str, *, ladder_age: Optional[float] = None) -> None:
+def _save_hold_carry(
+    since: str, reason: str, *, ladder_age: Optional[float] = None, ladder_early: bool = False
+) -> None:
     """Remember the episode a release just ended (spec 04 I82)."""
     global _hold_carry, _hold_carry_loaded
     if not since:
@@ -1354,10 +1361,12 @@ def _save_hold_carry(since: str, reason: str, *, ladder_age: Optional[float] = N
         "released": time.time(),
         "boot_id": _current_boot_id(),
         "ladder_age": ladder_age,
+        "ladder_early": ladder_early,
         "cycle_age": None,
     }
     if _hold_bound_episode == since and _hold_bound_ladder_age is not None:
         _hold_carry["ladder_age"] = _hold_bound_ladder_age
+        _hold_carry["ladder_early"] = _hold_bound_early
         _hold_carry["cycle_age"] = _hold_bound_cycle_age
     _write_hold_carry()
 
@@ -1424,6 +1433,15 @@ def _recorded_hold_bound_ladder_age(since: str) -> Optional[float]:
     return None
 
 
+def _recorded_hold_bound_ladder_early(since: str) -> bool:
+    """Whether the ladder the episode record names for ``since`` was spec 04 I83's at-start one."""
+    try:
+        rec = json.loads((health_dir() / HOLD_EPISODE_RECORD_FILE).read_text())
+        return isinstance(rec, dict) and rec.get("since") == since and bool(rec.get("bound_ladder_early"))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _record_hold_bound_ladder() -> None:
     """Add the bound ladder's hold age to the episode record, so a broker restart keeps it (spec 04 I82)."""
     path = health_dir() / HOLD_EPISODE_RECORD_FILE
@@ -1431,6 +1449,7 @@ def _record_hold_bound_ladder() -> None:
         rec = json.loads(path.read_text())
         if isinstance(rec, dict) and rec.get("since") == device_hold_episode_since:
             rec["bound_ladder_age"] = _hold_bound_ladder_age
+            rec["bound_ladder_early"] = _hold_bound_early
             path.write_text(json.dumps(rec))
     except (OSError, ValueError):
         pass
@@ -1441,13 +1460,14 @@ def _resume_hold_bound(carry: dict) -> None:
     whose check released a device that is held again did not heal it: its host rung is due now, not
     after another ladder. One the bound already asked the host rung for runs the ladder at once."""
     global _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_cycle_age
-    global _hold_bound_check_failed_age
+    global _hold_bound_check_failed_age, _hold_bound_early
     _hold_bound_sync()
     age = _hold_age_now()
     lad = carry.get("ladder_age")
     if lad is None or carry.get("since") != device_hold_episode_since:
         return
     _hold_bound_ladder_age = float(lad)
+    _hold_bound_early = bool(carry.get("ladder_early"))
     _hold_bound_ladder_recovered = True
     cyc = carry.get("cycle_age")
     _hold_bound_cycle_age = None if cyc is None else float(cyc)
@@ -4149,6 +4169,27 @@ def _fabric_no_reset_hold() -> str:
     ):
         return "fabric check could not run (77)"
     return ""
+
+
+# Spec 04 I83: the no-reset causes that are a fabric link-short hold — every chip on the bus, but the
+# full check counts fewer links (or ports) than the cabling expects.
+_FABRIC_LINK_SHORT_CAUSES = ("topology mismatch", "known fabric fault")
+
+
+def _fabric_link_short_hold() -> str:
+    """The open hold's fabric link-short cause (spec 04 I83), or "". An off-bus chip is another class."""
+    if isolated_chips:
+        return ""
+    cause = _fabric_no_reset_hold()
+    return cause if cause in _FABRIC_LINK_SHORT_CAUSES else ""
+
+
+def _fabric_link_short_ladder_due(age: float) -> bool:
+    """True while a fabric link-short hold below the bound has not yet had its one at-start ladder."""
+    if age >= _stuck_hold_ceiling_sec():
+        return False
+    _hold_bound_sync()
+    return _hold_bound_ladder_age is None and bool(_fabric_link_short_hold())
 
 
 # The hold episode (its ``since``) whose no-reset deadline hold has already logged and paged.
@@ -6895,7 +6936,12 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         if restored and carry is None and device_hold_episode_since == restored:
             ladder_age = _recorded_hold_bound_ladder_age(restored)  # read before the rewrite below
             if ladder_age is not None:
-                carry = {"since": restored, "ladder_age": ladder_age, "released": time.time()}
+                carry = {
+                    "since": restored,
+                    "ladder_age": ladder_age,
+                    "ladder_early": _recorded_hold_bound_ladder_early(restored),
+                    "released": time.time(),
+                }
         _persist_hold_episode(device_hold_episode_since, tenant=_hold_is_tenant_held())
         # ...and the alert hook's backoff for that same episode, so a restart does not page again.
         device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
@@ -7053,7 +7099,10 @@ async def _force_escalate_stuck_hold() -> None:
         # the host rung after it) from running. Below the bound the faster class paths stay as they are.
         held_age = _hold_age_now()
         bound = held_age >= _stuck_hold_ceiling_sec()
-        if _fabric_77_only_hold() and not bound:
+        # Spec 04 I83: a fabric link-short hold gets its one ladder at hold start, and every later run
+        # in the episode is the bound's (the host rung), not a second ladder.
+        early = not bound and (kind == "fabric_link_short" or _hold_bound_early) and bool(_fabric_link_short_hold())
+        if _fabric_77_only_hold() and not bound and not early:
             return  # a pass that could not run is never reset for; the idle relift re-runs it
         if _host_action_blocks_escalation():
             return  # a host reboot/power cycle was requested while this waited on the lock
@@ -7070,14 +7119,18 @@ async def _force_escalate_stuck_hold() -> None:
         beats = await asyncio.to_thread(read_heartbeats)
         off_bus = _offbus_count(beats, expected)
         no_reset = "" if off_bus or isolated_chips else _fabric_no_reset_hold()
-        if no_reset:
+        if early and no_reset not in _FABRIC_LINK_SHORT_CAUSES:
+            return  # the chips or the cause changed since the sampler spawned this: not the I83 class now
+        if kind == "fabric_link_short" and not early:
+            return
+        if no_reset and not early:
             # Every chip enumerates with a live ARC heartbeat and the hold names only the fabric: a 77
             # or a cabling mismatch. A galaxy reset cannot fix either, and on one Galaxy host it took a
             # chip off the bus and the ladder then re-powered its tray. Hold, page once (spec 04 I30).
             _hold_without_reset(no_reset, expected, log)
             if not bound:
                 return
-        if bound:
+        if bound or early:
             _lift_hold_bound_latches(log)
             if kind != "hold_bound_cycle" and _hold_bound_check_pending(held_age):
                 log("10-min hold bound: the full check after the bound's ladder still has its time")
@@ -7132,7 +7185,7 @@ async def _force_escalate_stuck_hold() -> None:
         )
         stood_down = outcome == OUTCOME_WAITING and galaxy_recovery.tenant_deferred
         if not stood_down:
-            _note_hold_bound_ladder(held_age, outcome)  # a run that stood down on a tenant ran no rung
+            _note_hold_bound_ladder(held_age, outcome, early=early)  # one that stood down on a tenant ran none
         elif bound:
             blocker = await asyncio.to_thread(_bound_tenant_blocker, True)
             if blocker is not None:
@@ -7147,7 +7200,8 @@ async def _force_escalate_stuck_hold() -> None:
         # fabric included, ended with no pass: the hold still stands, and waiting adds nothing. Only a
         # check still waiting on the 1G hugepage pool keeps its _HOLD_BOUND_CHECK_SEC, which the watchdog
         # bounds.
-        if bound and _recovery_degraded() and not _host_action_blocks_escalation():
+        # Spec 04 I83: the same holds for a fabric link-short hold's at-start ladder, below the bound.
+        if (bound or early) and _recovery_degraded() and not _host_action_blocks_escalation():
             if outcome == OUTCOME_RECOVERED:
                 _note_hold_bound_check_failed(log)
             if outcome != OUTCOME_RECOVERED or _hold_bound_cycle_due(_hold_age_now()):
@@ -7159,6 +7213,9 @@ async def _force_escalate_stuck_hold() -> None:
 _hold_bound_episode: str = ""
 _hold_bound_ladder_age: Optional[float] = None
 _hold_bound_ladder_recovered: bool = False
+# Spec 04 I83: the episode's ladder was the fabric link-short class's at-start pass. It stands in for
+# the bound's ladder: no later window runs another, the host rung is next.
+_hold_bound_early: bool = False
 _hold_bound_cycle_age: Optional[float] = None
 # The hold age at which a full check after the bound's ladder ended with no pass (spec 04 I76).
 _hold_bound_check_failed_age: Optional[float] = None
@@ -7190,25 +7247,41 @@ def _hold_bound_sync() -> None:
     """Drop the bound's bookkeeping once it belongs to an episode that is no longer open."""
     global _hold_bound_episode, _hold_bound_ladder_age, _hold_bound_cycle_age, _hold_bound_ladder_recovered
     global _hold_bound_check_failed_age, _hold_bound_rung_pending, _hold_bound_denied_why, _hold_bound_tenant_blocker
+    global _hold_bound_early
     if _hold_bound_episode != device_hold_episode_since:
         _hold_bound_episode = device_hold_episode_since
         _hold_bound_ladder_age = _hold_bound_cycle_age = _hold_bound_check_failed_age = None
-        _hold_bound_ladder_recovered = _hold_bound_rung_pending = False
+        _hold_bound_ladder_recovered = _hold_bound_rung_pending = _hold_bound_early = False
         _hold_bound_denied_why = ""
         _hold_bound_tenant_blocker = None
 
 
-def _note_hold_bound_ladder(age: float, outcome: str) -> None:
+def _note_hold_bound_ladder(age: float, outcome: str, *, early: bool = False) -> None:
     """Record the bound's own ladder. A forced run that started below the bound (the off-bus one-shot,
-    a progress retry, a gated grace) is not it: the bound still runs its ladder at the 10-min mark."""
-    global _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_tenant_blocker
-    if age < _stuck_hold_ceiling_sec():
+    a progress retry, a gated grace) is not it: the bound still runs its ladder at the 10-min mark.
+    Spec 04 I83's at-start pass of a fabric link-short hold (``early``) is: it is that class's ladder."""
+    global _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_tenant_blocker, _hold_bound_early
+    if age < _stuck_hold_ceiling_sec() and not early:
         return
     _hold_bound_sync()
     _hold_bound_tenant_blocker = None
     _hold_bound_ladder_age = max(age, _hold_age_now())
+    _hold_bound_early = _hold_bound_early or early
     _hold_bound_ladder_recovered = outcome == OUTCOME_RECOVERED
     _record_hold_bound_ladder()  # spec 04 I82: a broker restart keeps it
+
+
+def _hold_bound_ladder_counts(lad: Optional[float]) -> bool:
+    """Whether the episode's last forced ladder is the bound's: one that ran at the bound, or spec 04
+    I83's at-start pass of a fabric link-short hold."""
+    return lad is not None and (lad >= _stuck_hold_ceiling_sec() or _hold_bound_early)
+
+
+def _hold_bound_check_end(lad: float) -> float:
+    """The hold age by which the full check after the bound's ladder must have passed. After I83's
+    at-start pass it ends at the bound at the latest, so the host rung is asked for within 10 min."""
+    end = lad + _HOLD_BOUND_CHECK_SEC
+    return min(end, max(lad, _stuck_hold_ceiling_sec())) if _hold_bound_early else end
 
 
 def _hold_bound_check_pending(age: float) -> bool:
@@ -7219,9 +7292,8 @@ def _hold_bound_check_pending(age: float) -> bool:
     lad = _hold_bound_ladder_age
     return (
         _hold_bound_ladder_recovered
-        and lad is not None
-        and lad >= _stuck_hold_ceiling_sec()
-        and age < lad + _HOLD_BOUND_CHECK_SEC
+        and _hold_bound_ladder_counts(lad)
+        and age < _hold_bound_check_end(lad)
         and (_hold_bound_cycle_age is None or _hold_bound_cycle_age < lad)
         and (_hold_bound_check_failed_age is None or _hold_bound_check_failed_age < lad)
     )
@@ -7252,6 +7324,8 @@ def _hold_bound_ladder_in_last_window(age: float) -> bool:
     _hold_bound_sync()
     if _hold_bound_ladder_age is None:
         return False
+    if _hold_bound_early:
+        return True  # spec 04 I83: the at-start pass is this episode's only ladder
     ceiling = _stuck_hold_ceiling_sec()
     return _hold_bound_ladder_age >= max(ceiling, (int(age // ceiling) - 1) * ceiling)
 
@@ -7276,10 +7350,10 @@ def _hold_bound_cycle_due(age: float) -> bool:
     if _hold_bound_rung_pending:
         return True
     lad = _hold_bound_ladder_age
-    if lad is None or lad < _stuck_hold_ceiling_sec():
+    if not _hold_bound_ladder_counts(lad):
         return False
     failed = _hold_bound_check_failed_age is not None and _hold_bound_check_failed_age >= lad
-    if not failed and age < lad + _HOLD_BOUND_CHECK_SEC:
+    if not failed and age < _hold_bound_check_end(lad):
         return False
     return _hold_bound_cycle_age is None or _hold_bound_cycle_age < lad
 
@@ -7507,7 +7581,7 @@ def _rearm_tenant_deferred_window(kind: str) -> bool:
             device_hold_offbus_prior_bucket = None
     elif kind == "ceiling_window":
         device_hold_escalate_bucket = max(0, device_hold_escalate_bucket - 1)
-    else:
+    elif kind != "fabric_link_short":  # spec 04 I83: no ladder ran, so it is still due on the next tick
         return False
     device_hold_tenant_deferred = True
     return True
@@ -7697,7 +7771,8 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # A hold whose only cause is a fabric pass that could not run (a 77) is never forced: a reset
     # cannot give a pass its missing prerequisite, and the idle relift re-runs the pass instead.
     # Spec 04 I76: from the 10-min bound on, a 77-only hold is forced like any other.
-    only_77 = _fabric_77_only_hold() and age < ceiling
+    # Spec 04 I83: a fabric link-short hold is not 77-only: it gets its at-start ladder and the cooldown.
+    only_77 = _fabric_77_only_hold() and age < ceiling and not _fabric_link_short_hold()
     # A gated off-bus hold (spec 04 I27) gets one forced pass the moment its grace runs out, so the
     # bounded power cycle fires at the grace and not at the next ceiling window; so does a hold whose
     # tray re-power the BMC's IPMI failed, or whose tray walk did not recover, at its hand-off bound.
@@ -7741,6 +7816,12 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             and _hold_bound_check_failed_age >= (_hold_bound_ladder_age or 0)
             else f"the {_HOLD_BOUND_CHECK_SEC}s post-ladder check bound"
         )
+        _maybe_spawn_forced_escalation()
+    elif _fabric_link_short_ladder_due(age):
+        # Spec 04 I83: chips on the bus, the fabric short of links. One ladder now, then its full
+        # check; a check that still counts short asks for the host rung at once.
+        device_hold_escalation_kind = "fabric_link_short"
+        device_hold_escalation_trigger = "the start of a fabric link-short hold"
         _maybe_spawn_forced_escalation()
     elif only_77:
         pass

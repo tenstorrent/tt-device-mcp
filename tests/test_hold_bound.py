@@ -529,14 +529,16 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
 
 
 @pytest.mark.asyncio
-async def test_replay_a_post_job_77_hold_that_only_relifts_gets_the_ladder_at_the_bound_then_the_power_cycle(
+async def test_replay_a_post_job_link_short_latch_hold_gets_one_ladder_at_start_then_the_power_cycle(
     rig, monkeypatch, clear_job_state  # noqa: F811
 ):
     """A Galaxy host's post-job hold: a job's fabric failure after a topology lift sets the I42 latch, the
     hold is 77-only, and for its whole life only idle relifts ran (each withheld by the latch). The
-    stuck-hold event at the deadline read escalated=false and no rung had run. Walked tick by tick:
-    nothing is forced below the bound; at 600 s the full ladder runs, the full check after it (fabric
-    included) fails, the broker asks for the power cycle, and the deadline event reads escalated."""
+    stuck-hold event at the deadline read escalated=false and no rung had run. The last fabric pass
+    counted one port short of the cabling, so this is spec 04 I83's link-short class. Walked tick by
+    tick: the full ladder runs on the first tick, the full check after it (fabric included) fails, the
+    broker asks for the power cycle at once, and no later tick (the bound, the deadline) runs another
+    glx_reset or ladder; the deadline event reads escalated and nothing was released."""
     order, g = rig["order"], rig["g"]
     mon = srv.health_monitor
     rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
@@ -585,22 +587,22 @@ async def test_replay_a_post_job_77_hold_that_only_relifts_gets_the_ladder_at_th
     monkeypatch.setattr(srv, "_auto_power_cycle_host", cycle_and_mark)
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
 
-    for age in range(10, BOUND, 10):  # one sampler tick every 10 s; the idle relift stays withheld
-        monkeypatch.setattr(srv, "device_hold_episode_since", _since(age))
-        withheld, detail = await mon._verify_fabric_health_body(1)
-        assert withheld is None and "withheld" in detail
-        srv._check_hold_deadline(now=datetime.now())
-        await _drain()
-        assert "glx_reset" not in order and "power_cycle" not in order, f"a rung ran at {age}s, below the bound"
-
-    monkeypatch.setattr(srv, "device_hold_episode_since", _since(BOUND))
+    monkeypatch.setattr(srv, "device_hold_episode_since", _since(10))
+    withheld, detail = await mon._verify_fabric_health_body(1)
+    assert withheld is None and "withheld" in detail
     srv._check_hold_deadline(now=datetime.now())
     await _drain()
-    assert "glx_reset" in order, "the full ladder ran at the bound"
+    assert order.count("glx_reset") == 1, "the full ladder ran once, at hold start"
     assert checks == [False], "the full check after the ladder, fabric included, failed"
-    assert order.count("power_cycle") == 1, "then the broker's own code asked for the power cycle"
+    assert order.count("power_cycle") == 1, "then the broker's own code asked for the power cycle at once"
     assert order.index("glx_reset") < order.index("power_cycle")
     assert "released" not in order, "nothing released on a failed check"
+
+    for age in range(20, BOUND + 20, 10):  # later ticks, the bound included: no second glx_reset or ladder
+        monkeypatch.setattr(srv, "device_hold_episode_since", _since(age))
+        srv._check_hold_deadline(now=datetime.now())
+        await _drain()
+    assert order.count("glx_reset") == 1 and order.count("power_cycle") == 1, order
 
     monkeypatch.setattr(srv, "device_hold_episode_since", _since(srv._hold_deadline_sec() + 1))
     srv._check_hold_deadline(now=datetime.now())
