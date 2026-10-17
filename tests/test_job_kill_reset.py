@@ -108,6 +108,53 @@ async def test_no_debt_without_a_kill_keeps_todays_path(mesh):  # noqa: F811
     assert mesh["fabric"] and mesh["fabric"][0] == 0, "a plain dirty exit keeps its pre-reset fabric pass"
 
 
+# ---------------------------------------------------------------- spec 03 I74: the startup gate pays
+
+
+async def _startup_gate(**kw):
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True, **kw)
+
+
+@pytest.mark.asyncio
+async def test_the_startup_gate_pays_an_open_debt_with_one_full_check(killed):
+    """A re-adopted job the broker stopped before the startup check: one reset, then the one full
+    check, fabric included, before release; no pass before the reset and no second gate after."""
+    await _startup_gate()
+    assert killed["resets"] == [["tt-smi", "-glx_reset"]], "one present-mesh reset"
+    assert killed["fabric"] == [1], "one fabric pass, after the reset; none before it"
+    assert killed["events"].count("kill_mesh_reset") == 1
+    assert srv.fsm.state is ServerState.HEALTHY, "the full check after the reset released it"
+    assert srv._kill_reset_debt() == "", "paid: the runner's door owes nothing after"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_startup_kill_check_stays_held(killed):
+    killed["reset_heals"] = False
+    await _startup_gate()
+    assert len(killed["resets"]) == 1
+    assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
+    assert srv._device_unavailable_for_tenant()
+
+
+@pytest.mark.asyncio
+async def test_the_read_only_startup_probe_leaves_the_debt(killed):
+    await srv._device_health_gate(None, phase="startup", run_fabric=False, with_recover=False)
+    assert killed["resets"] == [] and "kill_mesh_reset" not in killed["events"]
+    assert srv._kill_reset_debt() == "job 7 timeout", "a read-only pass has no rung to pay it with"
+
+
+@pytest.mark.asyncio
+async def test_a_debt_owed_after_the_startup_check_is_paid_by_the_post_job_gate(mesh):  # noqa: F811
+    mesh["eth"] = ADVANCING
+    await _startup_gate()
+    assert mesh["resets"] == [] and mesh["fabric"] == [0], "no debt: the startup pass ran as before"
+    fsm_dirty(srv, "job 8 ended timeout")
+    srv._owe_kill_reset("job 8 timeout")
+    await _gate()
+    assert mesh["resets"] == [["tt-smi", "-glx_reset"]] and mesh["fabric"] == [0, 1]
+    assert srv.fsm.state is ServerState.HEALTHY and srv._kill_reset_debt() == ""
+
+
 _PRESENT = dict(
     healthy=False,
     fault_reported=False,

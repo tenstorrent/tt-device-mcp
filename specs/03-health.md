@@ -851,13 +851,24 @@ cooldown (spec 04 I65) holds longer.
   skip before it reads the debt: no reset runs over it, the debt and the dirty flag stay, and no
   wait is added (the leftover's own escalation bounds that hold). The debt lives in memory only:
   a broker restart or host reboot drops it, and the startup gate (I4) re-proves the mesh with the
-  full check, fabric included. Time to
+  full check, fabric included. A debt still open at the startup gate is paid there (I74). Time to
   recover (a timed-out or killed job, the job-kill class): kill ladder (unchanged, at most 75 s),
   then one reset (bounded by `DEVICE_RESET_TIMEOUT_SEC`; ~62 s for a Galaxy `glx_reset`, ~15 s
   for a per-target `tt-smi -r`), then one full check (fabric pass bounded by
   `FABRIC_CHECK_TIMEOUT_SEC`). Against today, a wedged mesh saves the failed pre-reset fabric pass
   (~45-100 s), and a mesh that was fine pays the reset minus that pass (~+0-20 s on a Galaxy,
   ~+15 s per target). No wait is added.
+- **I74 — The startup gate pays a kill-reset debt it finds open: reset, then the one full check.**
+  A re-adopted job (spec 01 I7) that the broker stopped before the startup check ran (its timeout
+  or a requested kill) leaves an I69 debt open when the startup gate (I4) runs. That gate pays it
+  the way the post-job gate does: no fabric pass or eth read before the reset, one reset
+  (`kill_mesh_reset`, same latch and skips as I69), then the one full check, fabric included,
+  before release. A failed post-reset check keeps the device held and climbs the bounded ladder; it
+  never releases. The read-only startup probe (`with_recover=False`) leaves the debt open. A debt
+  owed after the startup gate is still paid by the post-job gate (I69). Time to recover (the
+  job-kill class at broker start): one forced fabric pass (~55-60 s on a Galaxy) less, and no
+  release then re-hold between the startup check and the runner's door. The hold clock of any
+  off-bus episode the reset starts is not shortened.
 - **I57 — An incident bundle never presents another pass's fabric transcript as its own.** The
   monitor stamps `last_fabric_output_at` with the start of the run that produced
   `last_fabric_output`; the gate records when its pass began and hands both to
@@ -1503,6 +1514,7 @@ refuses.
 | I69 (a debt open at the next job is paid by the post-job gate before its door, the job still QUEUED) | `tests/test_job_kill_reset.py::test_the_runner_pays_an_owed_debt_before_a_queued_job` |
 | I69 (every broker kill logs one KILLED process-tree line) | `tests/test_job_kill_reset.py::test_a_broker_kill_logs_the_process_tree_it_stopped` |
 | I69 (a reaped leftover skips before the debt: no reset, debt kept, no wait; a reboot drops it and the startup full check runs; a cooldown skips and clears it with no wait) | `tests/test_job_kill_reset.py::test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait`, `tests/test_job_kill_reset.py::test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait` |
+| I74 (the startup gate pays an open debt: one reset, one full check after it, no pass before; a failed check stays held; the read-only probe leaves it; a later debt is paid by the post-job gate) | `tests/test_job_kill_reset.py::test_the_startup_gate_pays_an_open_debt_with_one_full_check`, `tests/test_job_kill_reset.py::test_a_failed_startup_kill_check_stays_held`, `tests/test_job_kill_reset.py::test_the_read_only_startup_probe_leaves_the_debt`, `tests/test_job_kill_reset.py::test_a_debt_owed_after_the_startup_check_is_paid_by_the_post_job_gate` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
