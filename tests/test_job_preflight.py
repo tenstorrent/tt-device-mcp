@@ -256,3 +256,32 @@ async def test_a_preflight_that_errors_or_hangs_lets_the_job_through(monkeypatch
     monkeypatch.setattr(srv, "preflight_output_dirs", slow)
     monkeypatch.setattr(srv, "JOB_OUTPUT_PREFLIGHT_TIMEOUT_SEC", 0.05)
     assert await srv._job_output_dir_problems(job) == []
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_that_lands_as_the_preflight_ends_is_not_dropped(monkeypatch, tmp_path):
+    """The preflight runs at the start of every job, on the runner task. On Python 3.10 a plain
+    asyncio.wait_for returns the result when the cancel lands in the same loop step as the work
+    finishing, so the runner ran the job, went back to its queue and never ended (spec 01, broker
+    shutdown). Land the cancel at every loop step while the call is still pending: it always wins."""
+    job = srv.Job(id="984", owner="t", workspace=str(tmp_path), command="true", queued_at="t")
+
+    def finished_at_once(func, *args):
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result(func(*args))
+        return fut
+
+    monkeypatch.setattr(srv, "preflight_output_dirs", lambda *a: [])
+    monkeypatch.setattr(srv.asyncio, "to_thread", finished_at_once)
+    landed = 0
+    for steps in range(8):
+        task = asyncio.ensure_future(srv._job_output_dir_problems(job))
+        for _ in range(steps):
+            await asyncio.sleep(0)
+        if task.done():
+            break
+        task.cancel()
+        landed += 1
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert landed >= 3, "the sweep never reached the step where the work has finished"

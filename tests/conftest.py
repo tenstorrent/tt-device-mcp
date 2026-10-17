@@ -374,6 +374,9 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     fresh_fsm = ServerFsm(health_tmp / "fsm.json")
     fresh_fsm.on_readings(HealthState(phase="test", at=datetime.now(), expected=0))
     monkeypatch.setattr(srv, "fsm", fresh_fsm)
+    # A poller restart one test deferred must not fire on the next test's close to HEALTHY.
+    monkeypatch.setattr(srv, "_pollers_owed", None)
+    monkeypatch.setattr(srv, "_pollers_owed_loop", None)
 
     # No board types seen yet: the conservative default, and the machine type reads as unknown.
     # Nothing here can shell out — the cache is only ever filled by a health snapshot — so the
@@ -418,6 +421,21 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv, "_startup_verify_task", None, raising=False)
     monkeypatch.setattr(srv, "_startup_verify_ready_at", None, raising=False)
     monkeypatch.setattr(srv, "_startup_verify_deferral_logged", None, raising=False)
+    # The 10-min hold bound's bookkeeping (spec 04 I76) is keyed by the episode's start stamp: two tests
+    # that open a hold at the same fixed stamp would share one ladder record.
+    for name, value in (
+        ("_hold_bound_episode", ""),
+        ("_hold_bound_ladder_age", None),
+        ("_hold_bound_ladder_recovered", False),
+        ("_hold_bound_cycle_age", None),
+        ("_hold_bound_check_failed_age", None),
+        ("_hold_bound_unarmed_paged", ""),
+        ("_hold_bound_rung_pending", False),
+        ("_hold_bound_denied_why", ""),
+        ("_hold_bound_tenant_paged", ""),
+        ("_hold_bound_tenant_blocker", None),
+    ):
+        monkeypatch.setattr(srv, name, value, raising=False)
     monkeypatch.setattr(srv, "post_job_gate_pending", False, raising=False)
     # The per-owner burst-cap ledger. Left populated, one test's submissions would count against
     # the next test's cap. Fresh dict so state never bleeds; raising=False so a base tree without

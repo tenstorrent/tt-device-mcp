@@ -213,9 +213,9 @@ def test_rung_gap_boot_warning_and_health_field(monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     log.said.clear()
     srv.log_rung_inventory()
-    gaps = [m for lvl, m in log.said if lvl == "warning" and "RUNG GAP" in m]
-    assert len(gaps) == 1 and "TT_DEVICE_MCP_FORCE_ESCALATE=0" in gaps[0]
-    assert "TT_DEVICE_MCP_SELFHEAL_RELIFT=0" in srv._health_payload()["hold_exit_gap"]
+    # Spec 04 I76: the 10-min hold bound ignores the kill switch, so its ladder is still an exit.
+    assert not any("RUNG GAP" in m for _, m in log.said)
+    assert srv._health_payload()["hold_exit_gap"] is None
 
     monkeypatch.delenv("TT_DEVICE_MCP_SELFHEAL_RELIFT")
     monkeypatch.delenv("TT_DEVICE_MCP_FORCE_ESCALATE")
@@ -238,10 +238,12 @@ def test_floor_message_promises_escalation_only_when_armed(monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     for off_bus in (0, 1):
         note = srv._hold_escalation_note(off_bus)
-        assert "escalates" not in note and "only the idle self-heal relift" in note
+        assert "~10 s" not in note and "self-heal relift" in note
+        assert "the ladder still runs at the 10-min hold bound" in note, "the bound ignores the kill switch"
     monkeypatch.setenv("TT_DEVICE_MCP_SELFHEAL_RELIFT", "0")
     note = srv._hold_escalation_note(1)
-    assert "escalates" not in note and "NO automatic exit" in note
+    assert "relift" not in note and "NO automatic exit" not in note and "operator must act" not in note
+    assert "the ladder still runs at the 10-min hold bound" in note
 
 
 @pytest.mark.asyncio
