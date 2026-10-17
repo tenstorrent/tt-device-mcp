@@ -1044,6 +1044,9 @@ reset_killed_job_ids: set = set()
 # Spec 03 I69: running jobs a requested kill stopped (tt_device_job_kill, the REST kill, a job_run
 # whose client went away). The runner reads it when the job ends, then drops the id.
 request_killed_job_ids: set = set()
+# Spec 03 I69: preempted jobs whose stop went past SIGINT (SIGTERM, `systemctl stop` or the window's
+# SIGKILL). A broker-side timeout like any other; the job's end reads it, then drops the id.
+preempt_forced_job_ids: set = set()
 # Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset before release. The job
 # and why, and when the debt was taken (monotonic); 0.0 is none. Any reset since settles it.
 _kill_reset_owed: str = ""
@@ -2285,6 +2288,7 @@ def _reset_for_testing():
     _kill_reset_owed = ""
     _kill_reset_owed_at = 0.0
     request_killed_job_ids.clear()
+    preempt_forced_job_ids.clear()
     _hold_episode_restorable = True
     _hold_episode_tenant = False
     if recovery_mechanism is not None:
@@ -3105,7 +3109,12 @@ async def _stop_readopted_job_for_reset(job_id: str, scope: str) -> None:
 
     Waiting for the monitor keeps the order the live path has: the job's end is classified (its
     log scanned for a fault the reset should answer) before the reset, never after its verify."""
-    await _terminate_scope(scope)
+    reaped = await _terminate_scope(scope)
+    _log_job_tree_killed(
+        job_id,
+        "device reset",
+        f"stopped unit {scope}; ladder ended at " + ("systemctl stop (survived SIGINT)" if reaped else "SIGINT"),
+    )
     loop = asyncio.get_event_loop()
     deadline = loop.time() + READOPTED_FINALIZE_WAIT_SEC
     while job_id in readopted_scopes and loop.time() < deadline:
@@ -7724,24 +7733,50 @@ async def _preempt_job(job_id: str, pid: Optional[int]) -> None:
     """Stop a preemptable job inside PREEMPT_GRACE_SEC: the normal scope-aware ladder
     (_terminate_job: SIGINT, then SIGTERM), sized so SIGTERM lands SIGTERM_GRACE_SEC before the
     window ends, then a SIGKILL at the window's end whatever the ladder is still waiting on (a
-    scope's `systemctl stop` can wait longer than the window)."""
+    scope's `systemctl stop` can wait longer than the window).
+
+    Spec 03 I69: a preemption the job did not end on SIGINT alone (the ladder reached SIGTERM or
+    `systemctl stop`, or the window's SIGKILL) is a broker-side timeout. The job never unwound, so
+    it is put in preempt_forced_job_ids and its end owes the mesh one reset, then the full check."""
+    reason = "preempted (a job waited past its soft limit)"
     sigint_window = max(1.0, PREEMPT_GRACE_SEC - SIGTERM_GRACE_SEC)
     try:
         how = await aio.wait_for(_terminate_job(job_id, pid, grace_sec=sigint_window), timeout=PREEMPT_GRACE_SEC)
-        _log_job_tree_killed(job_id, "preempted (a job waited past its soft limit)", how)
+        _log_job_tree_killed(job_id, reason, how)
+        if _preempt_ladder_forced(how):
+            preempt_forced_job_ids.add(job_id)
         return
     except asyncio.TimeoutError:
         pass
+    preempt_forced_job_ids.add(job_id)
     if logger:
         logger.warning(f"PREEMPT job_id={job_id} still running {PREEMPT_GRACE_SEC}s after the stop; SIGKILL")
     scope = job_scope_unit(job_id)
+    stopped = []
     if await asyncio.to_thread(_scope_active, scope):
         await asyncio.to_thread(subprocess.run, ["systemctl", "kill", "--signal=SIGKILL", scope], capture_output=True)
+        stopped.append(f"unit {scope}")
     if pid:
         try:
             os.killpg(pid, signal.SIGKILL)
         except (ProcessLookupError, OSError):
             pass
+        stopped.append(f"pgid {pid}")
+    _log_job_tree_killed(
+        job_id,
+        reason,
+        f"stopped {' and '.join(stopped) or 'nothing (no live scope or pid)'}; "
+        "ladder ended at SIGKILL (preempt window)",
+    )
+
+
+def _preempt_ladder_forced(how) -> bool:
+    """True when _terminate_job's ``how`` says the job outlived SIGINT (spec 03 I69): only an exit
+    on SIGINT, or one before any signal, let it unwind and release the mesh. A stand-in that
+    returns nothing counts as unwound."""
+    if not isinstance(how, str) or not how:
+        return False
+    return not how.endswith(("ladder ended at SIGINT", "ladder ended at already gone", "nothing to stop (no live scope or pid)"))
 
 
 # How often a silent job is noted in its own log. This is the only hang signal that does not
@@ -9470,6 +9505,8 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
         # A kill requested while re-adopted is this job's last use of the set: never leave it behind.
         request_killed = job_id in request_killed_job_ids
         request_killed_job_ids.discard(job_id)
+        preempt_forced = job_id in preempt_forced_job_ids
+        preempt_forced_job_ids.discard(job_id)
         job = jobs.get(job_id)
         if job is not None:
             rc = await asyncio.to_thread(read_job_exit_code, job_id)
@@ -9529,10 +9566,11 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                     + (f" (exit {job.exit_code})" if job.exit_code is not None else ""),
                     job=job,
                 )
-            # Spec 03 I69: a re-adopted job the broker stopped (its timeout, or a requested kill) owes
-            # the same one reset + full check as one the runner stopped. This path has no post-job
-            # gate: the I68 idle gate pays it on an idle queue, the runner's door before a waiting job.
-            if not fault and not reset_killed and (timed_out or request_killed):
+            # Spec 03 I69: a re-adopted job the broker stopped (its timeout, a requested kill, or a
+            # preemption that went past SIGINT) owes the same one reset + full check as one the runner
+            # stopped. This path has no post-job gate: the I68 idle gate pays it on an idle queue, the
+            # runner's door before a waiting job.
+            if not fault and not reset_killed and (timed_out or request_killed or preempt_forced):
                 _owe_kill_reset(f"re-adopted job {job_id} {job.status.value}")
             if job.log_file:
                 try:
@@ -9895,12 +9933,6 @@ async def _job_runner_loop():
         # Use existing log file (created at queue time)
         job_log_file = Path(job.log_file) if job.log_file else None
 
-        # Spec 03 I69: a kill-reset still owed here (a re-adopted job the broker stopped, which had
-        # no post-job gate of its own) is paid before this job's door, by the same post-job gate:
-        # one reset, then the full check, fabric included. The pre-job gate runs no fabric pass.
-        if _kill_reset_debt():
-            await _verify_device_after_job(job_log_file, job_failed=True)
-
         # Fail fast on tt-metal output dirs the job's user cannot write (spec 01 I68), before any
         # cooldown, gate or hold: such a job dies at device open whatever the device's state.
         output_dir_problems = await _job_output_dir_problems(job)
@@ -9975,6 +10007,14 @@ async def _job_runner_loop():
                     f"({external_step_active or 'unknown'}); dispatch resumes once it releases"
                 )
             await _external_step_wait.wait()
+
+        # Spec 03 I69: a kill-reset still owed here (a re-adopted job the broker stopped, which had
+        # no post-job gate of its own) is paid before this job's door, by the same post-job gate:
+        # one reset, then the full check, fabric included. The pre-job gate runs no fabric pass.
+        # Paid after the foreign-holder and external-step waits, just before the pre-job gate, so
+        # its holder scan is not one a pre-step gate has since made stale.
+        if _kill_reset_debt():
+            await _verify_device_after_job(job_log_file, job_failed=True)
 
         # The gate. No job starts while a broker device op holds the device, or while the
         # device is dirty and unverified: a job that ends abnormally can leave the mesh
@@ -10648,7 +10688,7 @@ export {JOB_TAG_ENV}={job_tag}
                         job=job,
                     )
                 # Spec 03 I69: a job the broker stopped mid-run (its timeout, the hung/doomed reaper,
-                # or a requested kill) can leave the mesh wedged in a way the passive checks pass and the next job's
+                # a requested kill, or a preemption that went past SIGINT) can leave the mesh wedged in a way the passive checks pass and the next job's
                 # dispatch hangs on. The next post-job gate pays one reset, then the full check.
                 # Not a job our own reset killed, nor one that named a known fabric/topology fault:
                 # those already have their own path.
@@ -10656,10 +10696,15 @@ export {JOB_TAG_ENV}={job_tag}
                     not killed_by_reset
                     and not known
                     and not topo
-                    and (job.status in (JobStatus.TIMEOUT, JobStatus.HUNG) or job_id in request_killed_job_ids)
+                    and (
+                        job.status in (JobStatus.TIMEOUT, JobStatus.HUNG)
+                        or job_id in request_killed_job_ids
+                        or job_id in preempt_forced_job_ids
+                    )
                 ):
                     _owe_kill_reset(f"job {job_id} {job.status.value}")
                 request_killed_job_ids.discard(job_id)
+                preempt_forced_job_ids.discard(job_id)
                 # Last, so its detail is the one the hold shows: the next job waits until this
                 # process is gone and the device verifies, and the operator learns which job
                 # left it and that no signal will move it.

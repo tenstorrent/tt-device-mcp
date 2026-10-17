@@ -446,6 +446,32 @@ async def test_the_runner_pays_an_owed_debt_before_a_queued_job(runner_env, monk
 
 
 @pytest.mark.asyncio
+async def test_the_door_payment_waits_out_an_external_step(runner_env, monkeypatch):
+    """The debt is paid after the external-step wait, just before the pre-job gate: a pre-step gate
+    holding the device is never overlapped, and the payment's holder scan is taken after it."""
+    calls = []
+
+    async def gate(job_log_file, job_failed=False, **k):
+        calls.append(srv.external_step_active)
+        srv._clear_kill_reset_debt()
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", gate)
+    srv._owe_kill_reset("re-adopted job 954 timeout")
+    token = srv._reserve_external_step("pre-step 1.0")
+    job, runner = await _start("955", "true")
+    try:
+        await asyncio.sleep(0.3)
+        assert calls == [] and job.status is srv.JobStatus.QUEUED, "paid under a pre-step gate's holder scan"
+        srv._release_external_step(token)
+        assert await _until(lambda: job.finished_at is not None)
+    finally:
+        srv._release_external_step(token)
+        await _stop(runner)
+    assert calls[0] == "", "paid once the external step released"
+    assert job.status is srv.JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_a_broker_kill_logs_the_process_tree_it_stopped(runner_env, monkeypatch, caplog):
     log = logging.getLogger("tt-device-mcp-test-kill")
     monkeypatch.setattr(srv, "logger", log)
@@ -511,3 +537,146 @@ async def test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait(ki
     assert killed["resets"] == [], "no reset inside the cooldown"
     assert killed["fabric"] and killed["fabric"][0] == 0, "the dirty exit's full check ran instead"
     assert srv._kill_reset_debt() == "", "the debt is cleared, not carried"
+
+
+# ------------------------------------------- spec 03 I69: preemption kills and re-adopted resets
+
+
+@pytest.mark.asyncio
+async def test_a_preempt_sigkill_overrun_logs_the_process_tree(monkeypatch, caplog, clear_job_state):
+    """The window's SIGKILL is a kill like any other: one KILLED line naming the group and the step."""
+    log = logging.getLogger("tt-device-mcp-test-preempt-kill")
+    monkeypatch.setattr(srv, "logger", log)
+    monkeypatch.setattr(srv, "PREEMPT_GRACE_SEC", 0.3)
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+
+    async def stuck_ladder(job_id, pid, grace_sec=0):
+        await asyncio.sleep(30)  # the ladder still waiting when the window ends
+
+    monkeypatch.setattr(srv, "_terminate_job", stuck_ladder)
+    proc = await asyncio.create_subprocess_exec("sleep", "600", start_new_session=True)
+    try:
+        with caplog.at_level(logging.INFO, logger=log.name):
+            await srv._preempt_job("960", proc.pid)
+        assert await asyncio.wait_for(proc.wait(), timeout=5) == -9, "the window's SIGKILL reached the group"
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+    lines = [r.getMessage() for r in caplog.records if "KILLED process tree" in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert "job_id=960" in lines[0] and "reason=preempted (a job waited past its soft limit)" in lines[0]
+    assert f"pgid {proc.pid}" in lines[0] and "ladder ended at SIGKILL (preempt window)" in lines[0]
+    assert "960" in srv.preempt_forced_job_ids, "a SIGKILL-ended preemption is a broker-side timeout"
+
+
+@pytest.mark.asyncio
+async def test_a_reset_that_stops_a_readopted_job_logs_the_process_tree(monkeypatch, caplog, clear_job_state):
+    log = logging.getLogger("tt-device-mcp-test-readopted-reset")
+    monkeypatch.setattr(srv, "logger", log)
+
+    async def reaped(scope, grace_sec=0):
+        return True  # outlived SIGINT; `systemctl stop` reaped it
+
+    monkeypatch.setattr(srv, "_terminate_scope", reaped)
+    with caplog.at_level(logging.INFO, logger=log.name):
+        await srv._stop_readopted_job_for_reset("961", "ttdev-job-961.scope")
+    lines = [r.getMessage() for r in caplog.records if "KILLED process tree" in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert "job_id=961" in lines[0] and "reason=device reset" in lines[0]
+    assert "stopped unit ttdev-job-961.scope; ladder ended at systemctl stop (survived SIGINT)" in lines[0]
+
+
+@pytest.mark.parametrize(
+    "how, forced",
+    [
+        ("stopped pgid 5 pids [5]; ladder ended at SIGINT", False),
+        ("stopped pgid 5 pids [5]; ladder ended at already gone", False),
+        ("stopped unit ttdev-job-1.scope; ladder ended at SIGINT", False),
+        ("nothing to stop (no live scope or pid)", False),
+        (None, False),
+        ("stopped pgid 5 pids [5]; ladder ended at SIGTERM", True),
+        ("stopped pgid 5 pids [5]; ladder ended at SIGTERM (gone before SIGKILL)", True),
+        ("stopped pgid 5 pids [5]; ladder ended at SIGKILL", True),
+        ("stopped unit ttdev-job-1.scope; ladder ended at systemctl stop (survived SIGINT)", True),
+    ],
+)
+def test_a_preemption_past_sigint_is_a_broker_side_timeout(how, forced):
+    assert srv._preempt_ladder_forced(how) is forced
+
+
+@pytest.mark.asyncio
+async def test_a_preemption_that_unwinds_on_sigint_owes_no_reset(monkeypatch, clear_job_state):
+    monkeypatch.setattr(srv, "PREEMPT_GRACE_SEC", 5)
+
+    async def unwound(job_id, pid, grace_sec=0):
+        return f"stopped pgid {pid} pids [{pid}]; ladder ended at SIGINT"
+
+    monkeypatch.setattr(srv, "_terminate_job", unwound)
+    await srv._preempt_job("962", 12345)
+    assert "962" not in srv.preempt_forced_job_ids, "a job that unwound released the mesh itself"
+
+
+@pytest.mark.asyncio
+async def test_a_sigkill_ended_preemption_owes_and_pays_the_reset_before_the_next_job(runner_env, monkeypatch):
+    """Spec 03 I69: a preemption the broker could only end with SIGKILL owes one reset, then the full
+    check, paid by the preempted job's own post-job gate before the waiting job is dispatched."""
+    monkeypatch.setattr(srv, "PREEMPT_POLL_SEC", 0.05)
+    monkeypatch.setattr(srv, "PREEMPT_GRACE_SEC", 1)
+    monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 0)
+    calls = []
+
+    async def gate(job_log_file, job_failed=False, **k):
+        calls.append((job_failed, srv._kill_reset_debt(), srv.jobs["971"].status))
+        srv._clear_kill_reset_debt()  # the gate's reset is what settles it
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", gate)
+    preempted = srv.Job(
+        id="970",
+        owner="t",
+        workspace="/tmp",
+        command="trap '' INT TERM; sleep 30",  # ignores the stop: only the window's SIGKILL ends it
+        queued_at="t",
+        timeout_sec=1,
+        preemptable=True,
+    )
+    srv.jobs["970"] = preempted
+    await srv.get_job_queue().put("970")
+    waiting, runner = await _start("971", "true")
+    try:
+        assert await _until(lambda: waiting.finished_at is not None, tries=600)
+    finally:
+        await _stop(runner)
+    assert preempted.status is srv.JobStatus.PREEMPTED
+    assert calls[0][0] is True and calls[0][1].startswith("job 970 preempted"), calls
+    assert calls[0][2] is srv.JobStatus.QUEUED, "paid before the waiting job's door"
+    assert "kill_reset_owed" in runner_env["events"]
+    assert "970" not in srv.preempt_forced_job_ids, "the id leaked past the job's end"
+    assert waiting.status is srv.JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_a_preemption_debt_resets_then_runs_the_full_check_before_release(mesh):  # noqa: F811
+    """The gate pays a preemption's debt like a timeout's: one reset, then the full check, fabric included."""
+    mesh["eth"] = ADVANCING
+    fsm_dirty(srv, "job 8 ended preempted (exit -9)")
+    srv._owe_kill_reset("job 8 preempted")
+    await _gate()
+    assert mesh["resets"] == [["tt-smi", "-glx_reset"]], "one present-mesh reset"
+    assert mesh["fabric"] == [1], "the full check after the reset ran the fabric pass"
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert srv._kill_reset_debt() == ""
+
+
+@pytest.mark.asyncio
+async def test_a_preempted_readopted_job_past_sigint_owes_the_reset(monkeypatch, tmp_path, clear_job_state):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    job = _readopted_job("963", 10, 1500)
+    job.preempt_deadline_monotonic = 1.0  # the monitor's preemption started the stop window
+    srv.preempt_forced_job_ids.add("963")
+    await asyncio.wait_for(srv._monitor_readopted_scope("963", "ttdev-job-963.scope"), timeout=5)
+    assert srv.jobs["963"].status is srv.JobStatus.PREEMPTED
+    assert srv._kill_reset_debt().startswith("re-adopted job 963")
+    assert "963" not in srv.preempt_forced_job_ids, "the id leaked past the job's end"
