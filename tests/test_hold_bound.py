@@ -1014,10 +1014,10 @@ def _77_climb_owed(rig, monkeypatch, *, age=BOUND + 1, fired=False):  # noqa: F8
     return since
 
 
-def _cooldown_governor(rig, monkeypatch, until: float):
+def _cooldown_governor(r, monkeypatch, until: float):
     """The I65 cooldown as the governor applies it: a power cycle asked before ``until`` is denied through
     _deny_power_cycle, which arms the watchdog's retry for ``until`` in this episode."""
-    g, state = rig["g"], {"on": True, "asked": 0}
+    g, state = r["g"], {"on": True, "asked": 0}
 
     def allowed(action, tenant_active=False, **k):
         if action != "power-cycle":
