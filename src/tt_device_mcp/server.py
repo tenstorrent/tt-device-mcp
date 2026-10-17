@@ -1445,15 +1445,6 @@ def _resume_hold_bound(carry: dict) -> None:
     _hold_bound_sync()
     age = _hold_age_now()
     lad = carry.get("ladder_age")
-    health_event(
-        "hold_episode_carried",
-        held_since=device_hold_episode_since,
-        held_age_sec=int(age),
-        released_sec=int(max(0.0, time.time() - float(carry.get("released") or 0.0))),
-        prior_reason=str(carry.get("reason") or ""),
-        reason=device_hold_episode_reason,
-        bound_ladder_ran=lad is not None,
-    )
     if lad is None or carry.get("since") != device_hold_episode_since:
         return
     _hold_bound_ladder_age = float(lad)
@@ -1462,6 +1453,13 @@ def _resume_hold_bound(carry: dict) -> None:
     _hold_bound_cycle_age = None if cyc is None else float(cyc)
     if _hold_bound_cycle_age is None or _hold_bound_cycle_age < _hold_bound_ladder_age:
         _hold_bound_check_failed_age = max(age, _hold_bound_ladder_age)
+    health_event(
+        "hold_bound_carried",
+        held_since=device_hold_episode_since,
+        held_age_sec=int(age),
+        ladder_age_sec=int(_hold_bound_ladder_age),
+        host_rung_due=_hold_bound_check_failed_age is not None,
+    )
 
 
 # The alert hook's backoff for that episode, on disk beside it. In memory alone a restart during a
@@ -6902,10 +6900,6 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # ...and the alert hook's backoff for that same episode, so a restart does not page again.
         device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
         device_hold_episode_reason = reason
-        if carry:
-            _resume_hold_bound(carry)
-            if _hold_bound_ladder_age is not None:
-                _record_hold_bound_ladder()
         # Reserve the ledger row now, so the live row and the durable one share id, start, and name.
         # Its start is THIS process's segment (row_since), NOT the restored escalation clock: a hold
         # split by a restart then reads as adjacent rows — the orphaned-close for the prior segment,
@@ -6929,10 +6923,20 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # A hold carried over from the last broker and not yet released becomes this one: one
         # device_held/device_released pair per open stretch, and this process's release closes it.
         carried, _carried_hold = _carried_hold, None
+        # A hold that continues an episode a release ended moments ago says so (spec 04 I82).
+        cont = (
+            {"continues_episode": device_hold_episode_since, "prior_reason": str(carry.get("reason") or "")}
+            if carry
+            else {}
+        )
         if carried is not None:
-            health_event("device_held", reason=reason, carried_from=carried.get("iso") or carried.get("ts"))
+            health_event("device_held", reason=reason, carried_from=carried.get("iso") or carried.get("ts"), **cont)
         else:
-            health_event("device_held", reason=reason)
+            health_event("device_held", reason=reason, **cont)
+        if carry:
+            _resume_hold_bound(carry)
+            if _hold_bound_ladder_age is not None:
+                _record_hold_bound_ladder()
     elif not reason and not device_hold_logged:
         _forget_stale_hold_episode()
     elif not reason and device_hold_logged:
