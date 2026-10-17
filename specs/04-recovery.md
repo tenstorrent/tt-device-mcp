@@ -43,6 +43,8 @@ each rung fires only when the gentler one failed or cannot apply.
   a measured fault the reset did not heal (e.g. class D, lost fabric links or a latched topology
   mismatch, spec 03 I42/I71) climbs to the host rung at the 600 s stuck-hold ceiling, so its time to
   recover is the failed pass, the reset (~4 min) and the power cycle within the 15 min class budget.
+  The one stated exception is spec 03 I42's watchdog path: with no idle relift reset first, the reset
+  starts at 600 s and the host rung follows about 4-6 min later.
 - **I4 — Every reset survives its broker.** For root on a systemd host, `RecoveryMechanism.run_scoped` wraps
   reset argv in `systemd-run --scope --unit=ttdev-reset-<pid>-<seq>
   --property=KillMode=mixed`. Otherwise it starts a new-session child with an inherited
