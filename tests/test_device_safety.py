@@ -3020,6 +3020,45 @@ async def test_the_startup_quiesce_keeps_the_pollers_stopped_when_the_gate_holds
     assert ("start", "tt-telemetry.service") in calls
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step", ["reset", "tray re-power"])
+async def test_a_step_that_did_not_complete_owes_the_pollers_even_on_a_healthy_fsm(monkeypatch, step):
+    """Spec 03 I66 with 04 I12: a reset that exited non-zero, or a tray re-power that never fired,
+    starts no poller even while the FSM still reads HEALTHY (its chips may be off the bus or hung),
+    and hands them to the owed restart, so the next close to HEALTHY (a passing full check, fabric
+    included) starts them once, as for a restore deferred on a held device."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+    fsm_healthy(srv)
+    assert srv._pollers_unfit_reason() is None
+
+    if step == "reset":
+        _reset_that_fails(monkeypatch)
+        rc, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
+        assert rc == 1
+    else:
+
+        def refuse(*a, **k):
+            raise pcie_guard.TrayRepowerRefused("tray map disagrees")
+
+        monkeypatch.setattr(galaxy_mod, "_fire_ubb_reset", refuse)
+        with pytest.raises(pcie_guard.TrayRepowerRefused):
+            await srv.galaxy_recovery._fire_tray_repower(0b1000, [3], lambda m: None)
+
+    assert [c for c in calls if c[0] == "stop"], "the step still lands on a quiet bus"
+    assert not [c for c in calls if c[0] == "start"], calls
+    assert health.read_health_events(kinds={"pollers_left_quiesced"})
+    assert len(health.read_health_events(kinds={"pollers_kept_quiesced"})) == 1
+    assert srv._pollers_owed
+
+    fsm_dirty(srv, "the step did not complete")
+    fsm_healthy(srv)
+    await asyncio.gather(*list(srv._pollers_restore_tasks))
+    assert [c for c in calls if c[0] == "start"] == [("start", u) for u in DEFAULT_POLLERS]
+    assert srv._pollers_owed is None
+
+
 # --- the reset is exclusive --------------------------------------------------
 
 

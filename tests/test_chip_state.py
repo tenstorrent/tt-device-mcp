@@ -308,7 +308,7 @@ def _reset_seams(monkeypatch, order, rc):
 @pytest.mark.parametrize("rc, restored", [(0, True), (1, False)])
 async def test_a_failed_reset_leaves_the_pollers_stopped(monkeypatch, rc, restored):
     """A reset that exited non-zero leaves chips that may still be off the bus or hung, and the device
-    held: the pollers stay down (the health probe re-arms them). A completed one restores them. The
+    held: the pollers stay down, owed to the next HEALTHY (04 I12). A completed one restores them. The
     step is published as recovering while it runs."""
     order = []
     events = []
