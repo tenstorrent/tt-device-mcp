@@ -120,6 +120,34 @@ def arc_not_ready_chips(beats: dict[str, int]) -> set[str]:
     return out
 
 
+def unreadable_on_bus_chips(ids) -> set[str]:
+    """Of ``ids``, the chips whose KMD node is there with its PCI endpoint bound to the driver but
+    whose heartbeat read fails with an error other than ENODATA (EIO, or the attribute missing on
+    that node). :func:`offbus_chip_ids` counts such a chip off the bus; it is enumerated and bound,
+    so it is on the bus but unhealthy. Only the class A read uses this (spec 04 I37): survivors of a
+    whole-tray drop that read like this must not hide the drop's shape. A chip that reads now (a
+    counter or all-ones) or reads ENODATA is not in it; those have their own handling."""
+    out: set[str] = set()
+    for idx in sorted({str(i) for i in ids}, key=int):
+        node = pci.SYSFS_CLASS_DIR / f"tenstorrent!{idx}"
+        try:
+            _read_beat(node)
+            continue
+        except OSError as e:
+            if e.errno == errno.ENODATA:
+                continue
+        except ValueError:
+            continue
+        bdf = chip_pci_bdf(idx)
+        try:
+            bound = bool(bdf) and node.is_dir() and (pci.PCI_DEVICES_DIR / bdf / "driver").exists()
+        except OSError:
+            bound = False
+        if bound:
+            out.add(idx)
+    return out
+
+
 def offbus_chip_ids(beats: dict[str, int], expected: int, not_ready: Optional[set] = None) -> set[str]:
     """The chips off the PCIe bus by this heartbeat read: every expected index missing from
     ``beats``, other than an ARC-not-ready chip (:func:`arc_not_ready_chips`), plus every chip
