@@ -51,9 +51,12 @@ def fence(leftover, rig, monkeypatch):  # noqa: F811 - the imported fixtures
 
 
 def _open(fence):
-    """The first scan opens the episode; returns its monotonic start."""
+    """The first scan opens the episode; returns its monotonic start, pinned to a whole second.
+    A fractional start makes the tick arithmetic inexact: ``(t0 + 600) - t0`` can come out just
+    under 600, and the try at the budget would read as one before it."""
     srv._reaped_leftovers()
     assert srv._leftover_unkillable_mono is not None
+    srv._leftover_unkillable_mono = float(int(srv._leftover_unkillable_mono))
     return srv._leftover_unkillable_mono
 
 
@@ -247,7 +250,7 @@ async def test_time_to_request_is_bounded_and_nothing_releases_the_device(fence)
         await _tick(t0 + s)
         if fence["order"] and requested_at is None:
             requested_at = s
-    assert requested_at is not None and requested_at <= BUDGET + RETRY
+    assert requested_at == BUDGET  # the first tick at the budget asks, well inside budget + one retry
     assert fence["order"] == ["reboot"]  # one request, then the pending host action / stage holds
     assert "released" not in fence["order"] and "cleared_dirty" not in fence["order"]
     assert srv._leftover_unkillable_mono == t0  # the fence episode still stands until the host goes
