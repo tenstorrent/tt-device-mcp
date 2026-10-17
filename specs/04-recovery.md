@@ -910,7 +910,10 @@ each rung fires only when the gentler one failed or cannot apply.
   (at most 30 min after the anchor; a boot 3 min before startup gives 27 min); class C, after its one
   mesh reset (262 s) or with none after the broker's own cycle, then as class A. A fault no cycle
   heals is cycled 30 min, 30 min, 1 h, 2 h, then every 4 h after each boot: at most 6 cycles a day,
-  never a boot loop, never an open-ended hold. Class A or C after a cycle a later boot verified, at
+  never a boot loop, never an open-ended hold. Class A is the exception: on this hardware a whole tray
+  that no in-band cycle heals needs AC removal, so after `POWER_CYCLE_AC_NEEDED_AFTER` broker cycles
+  that did not heal it the broker stops cycling and holds for AC power (I73), the documented end of
+  the class-A ladder. Class A or C after a cycle a later boot verified, at
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
 
@@ -934,6 +937,36 @@ each rung fires only when the gentler one failed or cannot apply.
   included (03 I4, I32). Time to recover for class A and B2 with a BMC that does not answer: from
   30 min-4 h (each miss anchored and doubled the cooldown) to at most 15 min after the BMC answers
   again (one 5/10/15-min retry after each 15-min window).
+
+- **I73 — A whole tray still off the bus after two broker power cycles that did not heal it holds
+  for AC power, with no further cycle.** On this hardware an in-band power cycle healed a whole-tray
+  drop (class A) on some dates and not on others; the drops it did not heal came back only after AC
+  power was removed from the host, which no broker-reachable path can do. So once a whole tray is off
+  after `POWER_CYCLE_AC_NEEDED_AFTER` (2) broker power cycles for that tray, with no verified release
+  (I9) since the streak began (I65), the governor refuses every further cycle and the device stays
+  held dirty. This hold is the documented end of the class-A ladder: AC removal is a human or
+  datacenter action. A cycle counts only when the broker's own ledger shows it was requested for that
+  tray (`off_bus` on the row names one of its chips; a row with no `off_bus` counts) and took the host
+  down: the request was before this boot and is not a missed request (I72), and the last one is
+  followed by a later request under another boot or by this boot beginning within its pending window
+  (`host_action_pending_sec`). A boot long after the last request was some other cycle, not that
+  attempt. External cycles (a manual, BMC or datacenter cycle, the out-of-band history file) count
+  toward the I65 cooldown, which spaces the broker's two cycles, but never toward the two: their kind
+  and off-time are unknown, and external events are not broker evidence. A partial off-bus set (B1)
+  never enters this hold. While it holds, the journal records `power_cycle_did_not_heal` once per
+  counted cycle and `power_cycle_ac_power_needed` once per episode, and an operator is paged once and
+  then every `AC_POWER_REPAGE_SEC` (1 h). `/health` `power_cycle_cooldown` carries `escalation_stage`
+  `ac-power-removal`, cause `AC power needed` and `ac_power_needed` (the chips, attempts, the last
+  cycle and the next presence check; null on any other cooldown), and the hold message says no
+  further cycle comes. The hold-deadline watchdog re-reads the bus every `AC_POWER_RECHECK_SEC`
+  (300 s, a cheap sysfs read): a tray that came back leaves the AC hold and takes the ordinary reset
+  path, and the device is released only after the full post-reset health check, fabric included,
+  passes (03 I4, I32); a failed check keeps the hold. A tray that drops again before any verified
+  release holds again with no third cycle. Time to recover for class A: unchanged when one cycle
+  heals it; when none does, the hold for AC power is reached after the second cycle (about 35 min
+  from the drop: the first cycle at once, the second after the 30-min cooldown, plus a boot) instead
+  of cycling every 4 h without end, and the device is back within 300 s plus the full check after AC
+  power returns.
 
 ## Interfaces
 
@@ -1425,6 +1458,10 @@ sees a silent fabric pass.
 | I72 a missed request is marked on disk and asked again 5, 10, then every 15 min after its window, through the whole-tray path; a restarted broker reads an old same-boot row as missed | `tests/test_power_cycle_missed_request.py::test_a_request_the_host_never_acted_on_is_asked_again_5_min_after_its_window`, `::test_the_retries_back_off_5_10_then_15_min_and_never_stop`, `::test_a_whole_tray_drop_still_goes_to_the_power_cycle_after_a_missed_request`, `::test_a_restarted_broker_still_reads_an_old_same_boot_request_as_missed` |
 | I72 missed requests neither double nor anchor the cooldown nor count toward the cap or backstop, on this boot or the next; the second pages; a real cycle still anchors and doubles | `tests/test_power_cycle_missed_request.py::test_two_missed_requests_leave_the_interval_at_base_and_page`, `::test_a_missed_row_still_counts_for_nothing_on_the_next_boot`, `::test_a_cycle_that_took_the_host_down_still_anchors_the_cooldown_and_doubles` |
 | I72 a retried cycle that heals releases only after the full fabric check, which clears the retry; /health shows the missed count and the next retry | `tests/test_power_cycle_missed_request.py::test_a_retried_cycle_that_heals_releases_only_after_the_full_fabric_check`, `::test_health_shows_the_missed_count_and_the_next_retry`, `::test_health_shows_no_missed_requests_for_a_plain_cooldown` |
+| I73 two broker cycles that do not heal a whole tray end in the AC hold with no third cycle; the cooldown still spaces the two; the page goes once, then hourly | `tests/test_power_cycle_ac_needed.py::test_two_cycles_that_do_not_heal_end_in_the_ac_hold_and_no_third_cycle_fires`, `::test_the_cooldown_is_honoured_between_the_two_cycles`, `::test_the_ac_hold_pages_once_then_hourly` |
+| I73 the bus is re-read every 300 s; a returning tray leaves the AC hold and is released only after the full check, fabric included; one that drops again before a verified release holds with no third cycle | `tests/test_power_cycle_ac_needed.py::test_the_bus_is_rechecked_on_the_interval_and_a_returning_tray_leaves_the_ac_hold`, `::test_a_returning_tray_is_released_only_after_the_full_fabric_check_passes`, `::test_a_tray_that_drops_again_before_any_verified_release_holds_with_no_third_cycle` |
+| I73 `/health` shows `ac_power_needed` with `escalation_stage` `ac-power-removal` and the next presence check; null on an ordinary cooldown | `tests/test_power_cycle_ac_needed.py::test_health_shows_the_ac_needed_state_and_its_next_presence_check`, `::test_health_shows_no_ac_state_on_an_ordinary_cooldown` |
+| I73 only broker cycles for this tray that took the host down since the last verified release count (not this boot's request, a missed one, another tray's, or the last one a much later boot followed); external cycles space the cooldown but never count; a partial off-bus never enters the hold; each cycle row names its tray | `tests/test_power_cycle_ac_needed.py::test_only_broker_cycles_that_took_the_host_down_for_this_tray_count`, `::test_external_cycles_space_the_cooldown_but_are_never_attempts`, `::test_a_partial_off_bus_set_never_enters_the_ac_hold`, `::test_a_power_cycle_row_names_the_tray_it_was_for` |
 | I65 a failed out-of-band cycle (a second line, same `at_epoch`, cause + ` (cycle failed)`) never counts and cancels its attempt line; an unmatched failure line is ignored; an attempt with no failure line still counts; host boots are unchanged | `tests/test_power_cycle_cooldown.py::test_a_matched_failure_line_drops_the_attempt`, `::test_an_unmatched_failure_line_is_ignored`, `::test_an_attempt_without_a_failure_line_still_counts` |
 | I65 a future, non-finite or unreadable stamp (history file, ledger, heal file) never hides a valid past anchor, never holds the cycle past the stated gap, never keeps the streak past a verified release; every cap denial is on /health | `tests/test_power_cycle_cooldown.py::test_a_nan_or_future_history_line_does_not_hide_the_valid_past_one`, `::test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle`, `::test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health`, `::test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end`, `::test_the_per_boot_cap_denial_shows_on_health`, `::test_a_future_record_does_not_keep_the_streak_past_a_verified_release` |
 | I37/I65 class C at startup: one mesh reset with no failed reset or broker cycle; none after the broker's own cycle, which then waits only for the cooldown | `tests/test_power_cycle_cooldown.py::test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_gets_one_reset`, `::test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_reset`, `::test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not` |

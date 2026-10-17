@@ -68,7 +68,9 @@ async def _two_cycles_that_do_not_heal(cool):  # noqa: F811
 
 
 @pytest.mark.asyncio
-async def test_two_cycles_that_do_not_heal_end_in_the_ac_hold_and_no_third_cycle_fires(cool, monkeypatch, paged):
+async def test_two_cycles_that_do_not_heal_end_in_the_ac_hold_and_no_third_cycle_fires(
+    cool, monkeypatch, paged  # noqa: F811
+):
     assert POWER_CYCLE_AC_NEEDED_AFTER == 2
     assert await _two_cycles_that_do_not_heal(cool) == galaxy.OUTCOME_WAITING
     m = cool["g"].mechanism
@@ -86,7 +88,7 @@ async def test_two_cycles_that_do_not_heal_end_in_the_ac_hold_and_no_third_cycle
 
 
 @pytest.mark.asyncio
-async def test_the_ac_hold_pages_once_then_hourly(cool, monkeypatch, paged):
+async def test_the_ac_hold_pages_once_then_hourly(cool, monkeypatch, paged):  # noqa: F811
     mono = [1000.0]
     monkeypatch.setattr(recovery_base.time, "monotonic", lambda: mono[0])
     await _two_cycles_that_do_not_heal(cool)
@@ -105,7 +107,7 @@ async def test_the_ac_hold_pages_once_then_hourly(cool, monkeypatch, paged):
 
 
 @pytest.mark.asyncio
-async def test_the_cooldown_is_honoured_between_the_two_cycles(cool):
+async def test_the_cooldown_is_honoured_between_the_two_cycles(cool):  # noqa: F811
     _tray_off(cool)
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="run")
     _boot(cool, T0 + BOOT, "boot-B")
@@ -124,7 +126,9 @@ async def test_the_cooldown_is_honoured_between_the_two_cycles(cool):
 
 
 @pytest.mark.asyncio
-async def test_the_bus_is_rechecked_on_the_interval_and_a_returning_tray_leaves_the_ac_hold(cool, monkeypatch):
+async def test_the_bus_is_rechecked_on_the_interval_and_a_returning_tray_leaves_the_ac_hold(
+    cool, monkeypatch  # noqa: F811
+):
     await _two_cycles_that_do_not_heal(cool)
     m = cool["g"].mechanism
     until = m.power_cycle_retry[0]
@@ -169,7 +173,7 @@ def test_a_returning_tray_is_released_only_after_the_full_fabric_check_passes(mo
 
 
 @pytest.mark.asyncio
-async def test_a_tray_that_drops_again_before_any_verified_release_holds_with_no_third_cycle(cool):
+async def test_a_tray_that_drops_again_before_any_verified_release_holds_with_no_third_cycle(cool):  # noqa: F811
     await _two_cycles_that_do_not_heal(cool)
     cool["beats"] = _beats_without(set())
     await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda msg: None)  # the tray read back once
@@ -183,7 +187,7 @@ async def test_a_tray_that_drops_again_before_any_verified_release_holds_with_no
 
 
 @pytest.mark.asyncio
-async def test_health_shows_the_ac_needed_state_and_its_next_presence_check(cool, monkeypatch):
+async def test_health_shows_the_ac_needed_state_and_its_next_presence_check(cool, monkeypatch):  # noqa: F811
     await _two_cycles_that_do_not_heal(cool)
     now = cool["clk"][0]
     cd = _health(monkeypatch, now)
@@ -199,7 +203,7 @@ async def test_health_shows_the_ac_needed_state_and_its_next_presence_check(cool
 
 
 @pytest.mark.asyncio
-async def test_health_shows_no_ac_state_on_an_ordinary_cooldown(cool, monkeypatch):
+async def test_health_shows_no_ac_state_on_an_ordinary_cooldown(cool, monkeypatch):  # noqa: F811
     _tray_off(cool)
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="run")
     _boot(cool, T0 + BOOT, "boot-B")
@@ -211,7 +215,7 @@ async def test_health_shows_no_ac_state_on_an_ordinary_cooldown(cool, monkeypatc
 # ---- what counts as an attempt ---------------------------------------------------------------------
 
 
-def test_external_cycles_space_the_cooldown_but_are_never_attempts(cool, monkeypatch, tmp_path):
+def test_external_cycles_space_the_cooldown_but_are_never_attempts(cool, monkeypatch, tmp_path):  # noqa: F811
     """One broker cycle, then an external manual cycle (history file and a new boot): the external
     one anchors the cooldown (I65) but is not a second attempt, so no AC hold yet."""
     m = cool["g"].mechanism
@@ -242,7 +246,7 @@ def test_external_cycles_space_the_cooldown_but_are_never_attempts(cool, monkeyp
         ([("boot-A", -9000), ("boot-B", -7200)], 1),
     ],
 )
-def test_only_broker_cycles_that_took_the_host_down_for_this_tray_count(cool, tmp_path, rows, counted):
+def test_only_broker_cycles_that_took_the_host_down_for_this_tray_count(cool, tmp_path, rows, counted):  # noqa: F811
     m = cool["g"].mechanism
     cool["boot"].update(id="boot-C", btime=T0 - 600)
     (recovery_base.health_dir() / recovery_base.AUTO_RECOVERY_VERIFIED).write_text(
@@ -261,7 +265,7 @@ def test_only_broker_cycles_that_took_the_host_down_for_this_tray_count(cool, tm
     assert len(m._unhealed_tray_cycles(ledger, chips, T0, recs)) == counted
 
 
-def test_a_partial_off_bus_set_never_enters_the_ac_hold(cool):
+def test_a_partial_off_bus_set_never_enters_the_ac_hold(cool):  # noqa: F811
     """Class B1 and C keep their own ladders: the count applies only while a whole tray is off."""
     m = cool["g"].mechanism
     _ledger(
@@ -273,7 +277,7 @@ def test_a_partial_off_bus_set_never_enters_the_ac_hold(cool):
     assert (m.power_cycle_cooldown_state or {}).get("cause") != "AC power needed"
 
 
-def test_a_power_cycle_row_names_the_tray_it_was_for(cool):
+def test_a_power_cycle_row_names_the_tray_it_was_for(cool):  # noqa: F811
     m = cool["g"].mechanism
     m.whole_tray_off = ["16", "17"]
     m.record_auto_recovery("power-cycle", "tray off", now_epoch=T0)
