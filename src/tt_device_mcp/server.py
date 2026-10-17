@@ -1310,7 +1310,8 @@ def _forget_stale_hold_episode() -> None:
 # lift, re-latch, failed first job, class change or broker restart restarts it. On one Galaxy host each
 # bound ladder's check released the device, the first job died on the same missing link, and the new
 # hold started a new clock, so the host rung after the ladder was never due. Only within one boot: a
-# reboot or power cycle ends the episode.
+# reboot or power cycle ends the episode. A successful first job or a full check passed with no hold
+# open ends the carry; a tenant hold neither saves, takes nor spends one.
 HOLD_CARRY_FILE = "hold_carry.json"
 _HOLD_CARRY_SEC = 300
 _hold_carry: Optional[dict] = None
@@ -1370,11 +1371,16 @@ def _drop_hold_carry() -> None:
         _write_hold_carry()
 
 
-def _note_hold_carry_job(edge: str) -> None:
+def _note_hold_carry_job(edge: str, *, ok: bool = False) -> None:
     """A job started inside the carry window keeps it open until _HOLD_CARRY_SEC after that job ends:
-    the first job after a release is the one that shows whether the release was right (spec 04 I82)."""
+    the first job after a release is the one that shows whether the release was right (spec 04 I82).
+    ``ok``: the job ended completed, exit 0, naming no device or fabric fault. That proves the release
+    right, so the carry is dropped and the next hold is a fresh episode with its own class path."""
     rec = _load_hold_carry()
     if not isinstance(rec, dict):
+        return
+    if edge == "end" and ok:
+        _drop_hold_carry()
         return
     now = time.time()
     try:
@@ -1388,6 +1394,13 @@ def _note_hold_carry_job(edge: str) -> None:
     else:
         return
     _write_hold_carry()
+
+
+def _note_full_check_passed() -> None:
+    """A full health check (fabric included) passed with no hold open: the device served and proved
+    fit since the release, so a later hold is a new episode (spec 04 I82)."""
+    if not device_hold_logged:
+        _drop_hold_carry()
 
 
 def _take_hold_carry() -> Optional[dict]:
@@ -6155,6 +6168,8 @@ async def device_health_gate(
             if released and state.fabric_ran and fabric_ok is True:
                 # Proof this boot heals: a power cycle before it no longer reads as a boot loop (04 I9).
                 recovery_mechanism.record_verified_release(f"gate/{phase}")
+            if state.fabric_ran and fabric_ok is True:
+                _note_full_check_passed()  # spec 04 I82; before the release below saves a new carry
             if released and device_hold_logged:
                 _note_tenant_gate_verdict("")
             return
@@ -6888,15 +6903,17 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         row_since = datetime.now().isoformat()
         restored = _restore_hold_episode() if _hold_episode_restorable else ""
         _hold_episode_restorable = False
-        # ...or the start of the episode a release ended moments ago (spec 04 I82).
-        carry = _take_hold_carry()
+        # ...or the start of the episode a release ended moments ago (spec 04 I82). A tenant hold is
+        # not a device fault: it neither takes nor spends a fault hold's carry.
+        tenant = _hold_is_tenant_held()
+        carry = None if tenant else _take_hold_carry()
         starts = [s for s in (restored, str(carry["since"]) if carry else "") if s]
         device_hold_episode_since = min(starts, key=datetime.fromisoformat) if starts else row_since
         if restored and carry is None and device_hold_episode_since == restored:
             ladder_age = _recorded_hold_bound_ladder_age(restored)  # read before the rewrite below
             if ladder_age is not None:
                 carry = {"since": restored, "ladder_age": ladder_age, "released": time.time()}
-        _persist_hold_episode(device_hold_episode_since, tenant=_hold_is_tenant_held())
+        _persist_hold_episode(device_hold_episode_since, tenant=tenant)
         # ...and the alert hook's backoff for that same episode, so a restart does not page again.
         device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
         device_hold_episode_reason = reason
@@ -6968,7 +6985,8 @@ def _note_tenant_gate_verdict(reason: str) -> None:
             held_for,
         )
         _hold_row = None
-        _save_hold_carry(device_hold_episode_since, device_hold_episode_reason)  # spec 04 I82
+        if not _hold_episode_tenant:  # spec 04 I82: a tenant's hold time is not fault time
+            _save_hold_carry(device_hold_episode_since, device_hold_episode_reason)
         device_hold_episode_since = ""
         _dispatch_reset_spent = False  # spec 03 I55: the next episode earns its own reset
         if recovery_mechanism is not None:
@@ -10785,7 +10803,6 @@ export {JOB_TAG_ENV}={job_tag}
                 known = None
                 topo = None
                 killed_by_reset = job_id in reset_killed_job_ids
-                _note_hold_carry_job("end")  # spec 04 I82
                 if health_monitor is not None:
                     tail = _read_job_log_tail(job_log_file)
                     topo = health_monitor.note_job_after_topology_lift(job.status != JobStatus.COMPLETED, tail)
@@ -10795,6 +10812,10 @@ export {JOB_TAG_ENV}={job_tag}
                     if known:
                         _hold_device_fabric_unverified(f"job {job_id}: {known}")
                 fault = _scan_output_for_device_fault(job_log_file)
+                _note_hold_carry_job(  # spec 04 I82
+                    "end",
+                    ok=job.status == JobStatus.COMPLETED and job.exit_code == 0 and not (fault or topo or known),
+                )
                 if fault:
                     _mark_device_reported_fault(f"job {job_id} {fault}", job=job)
                 elif job_id in reset_killed_job_ids:

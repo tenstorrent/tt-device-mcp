@@ -9,13 +9,14 @@ in that window, does not restart it, nor does a latch lift, a failed first job, 
 restart. A bound ladder whose check released a device that is held again did not heal it, so the next
 bound step is the host rung, not another ladder. No test reaches a real reset or power cycle."""
 
+import dataclasses
 import time
 from datetime import datetime, timedelta
 
 import pytest
 
 from tests.test_device_safety import _arm_fabric_only_deadline_hold
-from tests.test_hold_bound import BOUND, MISMATCH, _drain, _watchdog
+from tests.test_hold_bound import _REAL_HOST_RUNG, BOUND, MISMATCH, _drain, _watchdog
 from tt_device_mcp import server as srv
 from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health.recovery import OUTCOME_RECOVERED
@@ -140,8 +141,9 @@ async def test_a_rehold_after_the_carry_window_with_no_job_is_a_new_episode(monk
 
 
 @pytest.mark.asyncio
-async def test_a_job_started_in_the_window_keeps_the_carry_until_it_ends(monkeypatch, tmp_path, clear_job_state):
-    """The first job after a release shows whether the release was right, however long it runs."""
+async def test_a_failed_first_job_keeps_the_carry_however_long_it_ran(monkeypatch, tmp_path, clear_job_state):
+    """A first job that fails shows the release was wrong, however long it ran: a re-hold at its end continues
+    the episode, so a device that keeps failing can never loop below the bound."""
     _isolate(monkeypatch, tmp_path)
     _watchdog(monkeypatch)
     escalations, events, detail = _open_hold(monkeypatch, "missing port (topology mismatch)", BOUND + 5)
@@ -149,10 +151,178 @@ async def test_a_job_started_in_the_window_keeps_the_carry_until_it_ends(monkeyp
     await _bound_ladder_releases(monkeypatch, escalations, events)
     srv._note_hold_carry_job("start")
     srv._hold_carry["released"] = time.time() - 3600  # the job ran an hour
-    srv._note_hold_carry_job("end")
+    srv._note_hold_carry_job("end", ok=False)
+    assert (tmp_path / srv.HOLD_CARRY_FILE).exists(), "a failed first job keeps the carry"
     srv._note_tenant_gate_verdict(f"job 8: {detail}")
     assert srv.device_hold_episode_since == since
     assert srv._hold_bound_cycle_due(_age())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_hours", [0.01, 2])
+async def test_a_successful_first_job_ends_the_episode(monkeypatch, tmp_path, clear_job_state, job_hours):
+    """Review finding: the bound ladder healed, the first job completed, then a new fault held the device. That
+    hold is a fresh episode with its own class path, never a power cycle asked at once with no ladder."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, events, detail = _open_hold(monkeypatch, "generic", BOUND + 5)
+    await _bound_ladder_releases(monkeypatch, escalations, events)
+    srv._note_hold_carry_job("start")
+    srv._hold_carry["job_started"] = time.time() - job_hours * 3600
+    srv._note_hold_carry_job("end", ok=True)
+    assert not (tmp_path / srv.HOLD_CARRY_FILE).exists(), "a successful first job drops the carry, on disk too"
+    srv._note_tenant_gate_verdict("gate/post-job: eth/fabric fault on a present mesh")
+    assert _age() < 60, "a fresh episode"
+    assert "hold_bound_carried" not in events
+    assert not srv._hold_bound_cycle_due(_age())
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == [] and "host_rung" not in events, "below the bound: no ladder and no cycle"
+
+
+@pytest.mark.asyncio
+async def test_a_passing_full_check_with_no_hold_open_drops_the_carry(monkeypatch, tmp_path, clear_job_state):
+    """The between-jobs gate's full check (fabric included) passed on a device with no hold open: the device
+    proved fit since the release, so the next hold is a new episode."""
+    from tests.test_boot_fabric_reverify import _FABRIC_OK, _broker
+    from tests.test_device_safety import _ledger_dir
+    from tt_device_mcp.fsm import ServerFsm
+
+    _isolate(monkeypatch, tmp_path)
+    _ledger_dir(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, events, detail = _open_hold(monkeypatch, "missing port (topology mismatch)", BOUND + 5)
+    await _bound_ladder_releases(monkeypatch, escalations, events)
+    assert (tmp_path / srv.HOLD_CARRY_FILE).exists()
+    srv._note_hold_carry_job("start")
+    srv._note_hold_carry_job("end", ok=False)  # the job failed, yet the full check after it passes
+
+    _broker(monkeypatch, tmp_path, ServerFsm(tmp_path / "fsmdir" / "fsm.json", current_boot_id="boot-a"), _FABRIC_OK)
+    monkeypatch.setattr(srv, "_post_reset_debt", lambda: "")
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True, force_fabric=True)
+
+    assert not srv.device_hold_logged
+    assert not (tmp_path / srv.HOLD_CARRY_FILE).exists() and srv._hold_carry is None
+    srv._note_tenant_gate_verdict(f"job 9: {detail}")
+    assert _age() < 60 and not srv._hold_bound_cycle_due(_age())
+
+
+def test_a_passing_full_check_that_releases_a_hold_keeps_the_new_carry(monkeypatch, tmp_path, clear_job_state):
+    """The pass that releases a hold is the release itself, not proof since it: the carry it saves stays."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    _open_hold(monkeypatch, "missing port (topology mismatch)", 200)
+    srv._note_full_check_passed()  # the gate calls it before it releases
+    srv._note_tenant_gate_verdict("")
+    assert srv._hold_carry is not None
+
+
+def _open_tenant_hold(monkeypatch, age_sec):
+    """A hold opened because a foreign process holds the device, ``age_sec`` old."""
+    monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, why="foreign_holder"))
+    srv._note_tenant_gate_verdict("device held by a foreign process (pid 4242)")
+    assert srv._hold_episode_tenant
+    srv.device_hold_episode_since = (datetime.now() - timedelta(seconds=age_sec)).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_hold_leaves_no_carry(monkeypatch, tmp_path, clear_job_state):
+    """Review finding: a 30-min tenant hold was released and a fault hold opened within the window inherited
+    age 1800, so the bound forced the full ladder at once and skipped the class's fast path."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, events, detail = _open_hold(monkeypatch, "generic", 0)
+    srv._note_tenant_gate_verdict("")  # a fault hold before it, released long ago: no carry in force
+    srv._hold_carry["released"] = time.time() - srv._HOLD_CARRY_SEC - 1
+    srv._note_tenant_gate_verdict(detail)
+    srv._note_tenant_gate_verdict("")
+    srv._drop_hold_carry()
+    events.clear()
+
+    _open_tenant_hold(monkeypatch, 1800)
+    srv._note_tenant_gate_verdict("")  # the tenant left
+    assert srv._hold_carry is None and not (tmp_path / srv.HOLD_CARRY_FILE).exists(), "nothing on disk"
+    monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, why="eth_frozen"))
+    srv._note_tenant_gate_verdict(detail)
+    assert _age() < 60, "the fault hold's clock starts fresh: the tenant's time is not fault time"
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == [], "no forced ladder: the class's own path runs first"
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_hold_between_does_not_spend_a_fault_holds_carry(monkeypatch, tmp_path, clear_job_state):
+    """A fault hold's carry stays for a later fault hold in its window: a tenant hold in between neither takes
+    it nor continues it."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, events, detail = _open_hold(monkeypatch, "generic", BOUND + 5)
+    since = srv.device_hold_episode_since
+    await _bound_ladder_releases(monkeypatch, escalations, events)
+
+    _open_tenant_hold(monkeypatch, 30)
+    assert srv.device_hold_episode_since != since, "the tenant hold does not continue the fault episode"
+    assert "hold_bound_carried" not in events
+    srv._note_tenant_gate_verdict("")
+    assert srv._hold_carry is not None and srv._hold_carry["since"] == since, "the fault carry is untouched"
+
+    monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, why="eth_frozen"))
+    srv._note_tenant_gate_verdict(detail)
+    assert srv.device_hold_episode_since == since
+    assert srv._hold_bound_cycle_due(_age())
+
+
+@pytest.mark.asyncio
+async def test_the_carried_host_rung_waits_out_the_cooldown_and_asks_once(monkeypatch, tmp_path, clear_job_state):
+    """On the carried path the host rung is due at once, yet the I65 cooldown still holds it off: no ladder and
+    no cycle inside it, the request fires when it ends, and exactly one per episode however many ticks run."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, events, detail = _open_hold(monkeypatch, "generic", BOUND + 5)
+    monkeypatch.setattr(srv, "_hold_bound_host_rung", _REAL_HOST_RUNG)  # the governor decides below
+    await _bound_ladder_releases(monkeypatch, escalations, events)
+    srv._note_hold_carry_job("start")
+    srv._note_hold_carry_job("end", ok=False)
+    srv._note_tenant_gate_verdict(f"job 8: {detail}")
+    assert srv._hold_bound_cycle_due(_age())
+
+    cycles, until = [], datetime.now().timestamp() + 900
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
+    monkeypatch.setattr(srv.recovery_mechanism, "_journal_auto_recovery_denied", lambda *a: None)
+    state = {"cooling": True}
+
+    def allowed(action, tenant_active=False, **k):
+        if state["cooling"]:
+            return srv.recovery_mechanism._deny_power_cycle(
+                {"until": until, "last": until - 1800, "cause": "boot", "interval_sec": 1800, "why": "cooldown"}
+            )
+        return True, ""
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+        srv.recovery_mechanism.power_cycle_retry = None  # the cycle ran: the governor's retry is spent
+
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+
+    for _ in range(3):  # inside the cooldown
+        srv._check_hold_deadline(now=datetime.now())
+        await _drain()
+    assert escalations == [] and cycles == [], "inside the cooldown: no ladder, no cycle"
+    assert srv.recovery_mechanism.power_cycle_retry is not None, "the denial armed the retry"
+
+    # The cooldown ends: the governor's armed retry is due now. Every tick reads one clock, so the
+    # episode age and the window bookkeeping agree.
+    state["cooling"] = False
+    _until, episode = srv.recovery_mechanism.power_cycle_retry
+    srv.recovery_mechanism.power_cycle_retry = (time.time() - 1, episode)
+    for _ in range(3):  # the cooldown's end, then later ticks
+        srv._check_hold_deadline(now=datetime.now())
+        await _drain()
+    assert escalations == [], "the carried path never runs a second ladder"
+    assert len(cycles) == 1, "exactly one power-cycle request per episode"
+    assert "10-min hold bound" in cycles[0]
 
 
 @pytest.mark.asyncio
