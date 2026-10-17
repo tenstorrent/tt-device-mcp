@@ -16127,10 +16127,13 @@ def test_a_fresh_post_boot_hold_still_escalates_at_its_deadline(monkeypatch, tmp
 def _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path):
     """Spec 03 I75: a broker restart re-adopted a running job (an auto-update deploy), so the startup
     hold waits on it while the startup gate waits for its scope to end. The job outlives the 600 s
-    ceiling. Returns (since, tenant, climbs, gate_calls, release_job, tick)."""
+    ceiling. Returns (since, job, climbs, gate_calls, gate_heals, release_job, tick, events): ``job`` is
+    the re-adopted job, RUNNING until a test ends it; ``climbs`` the forced ladders that ran a rung,
+    ``events`` the (kind, blocker) of each health event."""
     from contextlib import asynccontextmanager
 
-    patch_health_event(monkeypatch, lambda kind, **f: None)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f.get("blocker"))))
     fsm_dirty(srv, "startup: the mesh has not been re-proven since the last exit", why="startup_unverified")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
     dev = tmp_path / "tenstorrent"
@@ -16152,14 +16155,22 @@ def _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
     since = datetime(2026, 10, 17, 5, 8, 50)
     monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
-    tenant = {"on": True}  # the re-adopted job is RUNNING
-    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: tenant["on"])
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    job = srv.Job(id="428", owner="u", workspace="/", command="(re-adopted)", queued_at="")
+    job.status = srv.JobStatus.RUNNING
+    monkeypatch.setattr(srv, "jobs", {"428": job})
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", srv.galaxy_recovery.deps.job_running)
     climbs = []
 
     async def escalate(phase, indices, expected, log, **_):
+        # The real ladder's tenant check: a RUNNING job stands it down and journals blocker=job_running.
+        running = srv.galaxy_recovery.deps.job_running()
+        srv.galaxy_recovery.tenant_deferred = running
+        if running:
+            srv.health_event("stuck_hold_deferred", mesh="present", forced=True, blocker="job_running")
+            return OUTCOME_WAITING
         climbs.append(phase)
-        srv.galaxy_recovery.tenant_deferred = tenant["on"]
-        return OUTCOME_WAITING if tenant["on"] else OUTCOME_RECOVERED
+        return OUTCOME_RECOVERED
 
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
 
@@ -16199,7 +16210,7 @@ def _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path):
         if srv._forced_escalation_task is not None:
             await srv._forced_escalation_task
 
-    return since, tenant, climbs, gate_calls, gate_heals, release_job, tick
+    return since, job, climbs, gate_calls, gate_heals, release_job, tick, events
 
 
 @pytest.mark.asyncio
@@ -16210,7 +16221,7 @@ async def test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_ga
     then the gate on top of it. Now the window stands down while the startup gate is still to run, and
     the gate (full check, fabric included) alone lifts the hold: no reset, and time to recover after
     the job is the gate's own. Fails on base, which climbs the present-mesh ladder once the job ends."""
-    since, tenant, climbs, gate_calls, _, release_job, tick = _setup_startup_hold_behind_readopted_job(
+    since, job, climbs, gate_calls, _, release_job, tick, events = _setup_startup_hold_behind_readopted_job(
         monkeypatch, tmp_path
     )
     ceiling = srv._stuck_hold_ceiling_sec()
@@ -16219,9 +16230,10 @@ async def test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_ga
     assert climbs == [] and srv.device_hold_tenant_deferred is True
     assert srv.device_hold_escalate_bucket == 0, "the window stood down and must stay armed"
 
-    tenant["on"] = False  # the job ended; its scope is not yet reaped and the gate has not started
+    job.status = srv.JobStatus.COMPLETED  # the job ended; its scope is not yet reaped, the gate not started
     await tick(ceiling + 11)
     assert climbs == [], "a forced reset raced the startup gate on a hold no check had found at fault"
+    assert ("stuck_hold_deferred", "startup_verify") in events
 
     await release_job()
     assert gate_calls == [("startup", True, True, [])], "the startup gate runs the full check, fabric included"
@@ -16235,14 +16247,14 @@ async def test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_ga
 async def test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_next_tick(monkeypatch, tmp_path):
     """Spec 03 I75: the stand-down only lasts while the startup gate is still to run. A gate that leaves
     the hold standing hands it to the ladder on the first sampler tick after it, not a window later."""
-    since, tenant, climbs, gate_calls, gate_heals, release_job, tick = _setup_startup_hold_behind_readopted_job(
+    since, job, climbs, gate_calls, gate_heals, release_job, tick, _ = _setup_startup_hold_behind_readopted_job(
         monkeypatch, tmp_path
     )
     gate_heals["on"] = False
     ceiling = srv._stuck_hold_ceiling_sec()
 
     await tick(ceiling + 1)
-    tenant["on"] = False
+    job.status = srv.JobStatus.COMPLETED
     await release_job()
     assert gate_calls and climbs == []
 
@@ -16254,8 +16266,8 @@ async def test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_nex
 async def test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladder(monkeypatch, tmp_path):
     """Spec 03 I75: the stand-down is bounded. A startup gate still not done STARTUP_VERIFY_DEFER_MAX_SEC
     after the re-adopted jobs ended no longer keeps the ceiling window from climbing."""
-    since, tenant, climbs, _, _, _, tick = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
-    tenant["on"] = False
+    since, job, climbs, _, _, _, tick, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    job.status = srv.JobStatus.COMPLETED
     srv.readopted_scopes.clear()
     await asyncio.sleep(0)
     gate_started = asyncio.Event()
@@ -16274,6 +16286,156 @@ async def test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladde
         assert climbs == ["present-forced"]
     finally:
         stuck.set()
+        await srv._startup_verify_task
+
+
+@pytest.mark.asyncio
+async def test_a_running_readopted_job_still_defers_the_startup_hold_on_job_running(monkeypatch, tmp_path):
+    """Spec 03 I75 covers only the gap from the re-adopted job's end to the startup gate's verdict. While
+    the job still runs, the forced run meets it as before: the ladder stands down on blocker=job_running
+    (journaled, the startup-tenant class measures it), not on the startup gate, and runs no rung."""
+    since, job, climbs, _, _, release_job, tick, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    await tick(ceiling + 1)
+    assert climbs == []
+    assert ("stuck_hold_deferred", "job_running") in events
+    assert ("stuck_hold_deferred", "startup_verify") not in events, "a running job was hidden behind the gate"
+
+    job.status = srv.JobStatus.COMPLETED  # ended; the gate still waits on the scope
+    events.clear()
+    await tick(ceiling + 11)
+    assert climbs == [] and events.count(("stuck_hold_deferred", "startup_verify")) == 1
+    await release_job()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_startup_gate_behind_a_readopted_job_gets_the_bound_ladder_then_one_power_cycle(
+    monkeypatch, tmp_path
+):
+    """Spec 03 I75 with spec 04 I76: a re-adopted job ran past the 10-min bound; once it ends the startup
+    gate runs first. When the gate fails, the bound's own ladder runs on the next tick, and when the full
+    check after it still fails the power cycle is asked for. Each runs once: no second ladder or cycle."""
+    since, job, climbs, gate_calls, gate_heals, release_job, tick, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    gate_heals["on"] = False
+    cycles = []
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda action, tenant_active: (True, ""))
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    ladder = srv.galaxy_recovery.escalate
+
+    async def unhealed_ladder(phase, indices, expected, log, **kw):
+        outcome = await ladder(phase, indices, expected, log, **kw)
+        return OUTCOME_WAITING if outcome == OUTCOME_RECOVERED else outcome  # its full check failed
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", unhealed_ladder)
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    await tick(ceiling + 1)  # past the bound while the job runs: the job blocks it
+    assert climbs == [] and cycles == []
+    job.status = srv.JobStatus.COMPLETED
+    await tick(ceiling + 6)  # the gate has not run yet: the bound waits for it
+    assert climbs == [] and cycles == []
+    await release_job()
+    assert len(gate_calls) == 1 and srv.fsm.state is ServerState.RECOVERING
+
+    await tick(ceiling + 11)
+    assert climbs == ["present-forced"], "the bound's ladder runs on the first tick after a failed gate"
+    assert len(cycles) == 1, "a full check after the bound's ladder that still fails asks for the power cycle"
+
+    await tick(ceiling + 21)
+    await tick(2 * ceiling - 1)
+    assert climbs == ["present-forced"] and len(cycles) == 1, "the hold was driven twice"
+
+
+@pytest.mark.asyncio
+async def test_an_offbus_startup_hold_keeps_its_one_shot_while_the_startup_gate_is_pending(monkeypatch, tmp_path):
+    """Spec 03 I75 / I23: a chip that leaves the bus while the startup gate is still to run keeps the
+    hold's why at startup_unverified. Its off-bus one-shot runs one sampler interval in, as on any
+    off-bus hold (classes A/B1/B2/C), and does not wait up to STARTUP_VERIFY_DEFER_MAX_SEC on the gate."""
+    since, job, climbs, _, _, release_job, tick, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    job.status = srv.JobStatus.COMPLETED
+    monkeypatch.setattr(srv, "isolated_chips", {5})
+    monkeypatch.setattr(srv, "_offbus_count", lambda beats, expected, *a: 1)
+    assert srv.fsm.record.why == "startup_unverified"
+
+    await tick(srv._offbus_one_shot_sec() + 1)
+    assert climbs == ["offbus-forced"], "the off-bus one-shot waited on the startup gate"
+    assert ("stuck_hold_deferred", "startup_verify") not in events
+    srv.readopted_scopes.clear()
+    srv._startup_verify_task.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "power_cycle_cooldown",
+        "progress_retry",
+        "ipmi_handoff_bound",
+        "tray_walk_handoff_bound",
+        "gated_hold_handoff_bound",
+        "gated_offbus_grace",
+    ],
+)
+async def test_a_forced_run_whose_window_cannot_be_given_back_is_not_deferred_to_the_startup_gate(
+    monkeypatch, tmp_path, kind
+):
+    """Spec 03 I75: only the ceiling window and the off-bus one-shot, whose windows the stand-down gives
+    back, wait for the startup gate. The other forced kinds spent their latch on spawn; deferred, the
+    request was dropped until the next ceiling window. They run as before."""
+    since, job, climbs, _, _, _, _, events = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    job.status = srv.JobStatus.COMPLETED
+    assert srv._startup_verify_owns_hold("ceiling_window"), "control: the ceiling window still stands down"
+    monkeypatch.setattr(srv, "device_hold_escalation_kind", kind)
+    try:
+        await srv._force_escalate_stuck_hold()
+        assert climbs == ["present-forced"]
+        assert ("stuck_hold_deferred", "startup_verify") not in events
+    finally:
+        srv.readopted_scopes.clear()
+        srv._startup_verify_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_idle_relift_meets_a_running_readopted_job_on_job_running(monkeypatch, tmp_path, clear_job_state):
+    """Spec 03 I75: while the re-adopted job runs, the idle relift reaches the ladder's tenant check as
+    before and journals stuck_hold_deferred blocker=job_running; only after the job ends does it leave
+    the hold to the startup gate, which is still to run."""
+    _setup_generic_hold(monkeypatch, tmp_path)
+    fsm_dirty(srv, "startup: the mesh has not been re-proven since the last exit", why="startup_unverified")
+    counters = _arm_stuck_hold(monkeypatch)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f.get("blocker"))))
+    job = srv.Job(id="428", owner="u", workspace="/", command="(re-adopted)", queued_at="")
+    job.status = srv.JobStatus.RUNNING
+    monkeypatch.setattr(srv, "jobs", {"428": job})
+    pending = asyncio.Event()
+    monkeypatch.setattr(srv, "_startup_verify_task", asyncio.create_task(pending.wait()))
+    monkeypatch.setattr(srv, "_startup_verify_ready_at", None)
+    try:
+        await srv._attempt_idle_relift()
+        assert counters["resets"] == 0
+        assert ("stuck_hold_deferred", "job_running") in events, "the running job was hidden from the journal"
+
+        job.status = srv.JobStatus.COMPLETED
+        events.clear()
+        srv.last_relift_monotonic = 0.0
+        await srv._attempt_idle_relift()
+        assert counters["resets"] == 0, "the relift reset a startup hold its startup gate was about to verify"
+        assert ("stuck_hold_deferred", "job_running") not in events
+    finally:
+        pending.set()
         await srv._startup_verify_task
 
 

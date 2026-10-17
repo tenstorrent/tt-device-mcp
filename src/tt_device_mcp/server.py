@@ -6863,7 +6863,7 @@ async def _force_escalate_stuck_hold() -> None:
     ):
         _defer_offbus_one_shot_to_tenant_bound()  # quietly: no device op, no event, no rung
         return
-    if _startup_verify_owns_hold():
+    if _startup_verify_owns_hold(kind):
         _defer_to_startup_verify(kind, log)
         return
     async with _device_op("hold-deadline-escalate"):
@@ -11249,18 +11249,32 @@ _startup_verify_deferral_logged: Optional[str] = None
 STARTUP_VERIFY_DEFER_MAX_SEC = STARTUP_HUGEPAGES_WAIT_SEC + FABRIC_CHECK_TIMEOUT_SEC + 120.0
 
 
-def _startup_verify_owns_hold() -> bool:
+# The forced-run kinds the I75 stand-down may defer: the ones _rearm_tenant_deferred_window gives back,
+# so a deferred run is retried on the next tick. Every other kind spent its latch on spawn and runs.
+_STARTUP_VERIFY_DEFERRABLE_KINDS = ("ceiling_window", "offbus_one_shot")
+
+
+def _startup_verify_owns_hold(kind: Optional[str] = None) -> bool:
     """Spec 03 I75: True while the startup gate (the full check, fabric included) is still to run on
     the startup hold, so the ceiling escalation and the idle relift leave that hold to it.
 
     A job re-adopted across a broker restart can outlive the 600 s ceiling. When it ends, the startup
     gate starts within one scope poll; a forced escalation that won the device lock first reset a mesh
     no check had found at fault, and the gate then ran on top of that. Bounded: past
-    STARTUP_VERIFY_DEFER_MAX_SEC from the re-adopted jobs' end the escalations act as before."""
+    STARTUP_VERIFY_DEFER_MAX_SEC from the re-adopted jobs' end the escalations act as before.
+
+    Only the gap from the job's end to the gate's verdict: while a job still runs, the escalations meet
+    it as before (deferred on ``job_running``, journaled). A hold with chips off the bus keeps the
+    off-bus one-shot and its ladder (spec 03 I23), and a forced run of a kind whose window cannot be
+    given back (``kind`` outside _STARTUP_VERIFY_DEFERRABLE_KINDS) runs, so neither waits on the gate."""
     task = _startup_verify_task
     if task is None or task.done():
         return False
     if fsm.state is not ServerState.RECOVERING or fsm.record.why != "startup_unverified":
+        return False
+    if kind is not None and kind not in _STARTUP_VERIFY_DEFERRABLE_KINDS:
+        return False
+    if isolated_chips or any(j.status == JobStatus.RUNNING for j in jobs.values()):
         return False
     ready = _startup_verify_ready_at
     return ready is None or time.monotonic() - ready < STARTUP_VERIFY_DEFER_MAX_SEC
