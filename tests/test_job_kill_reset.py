@@ -506,7 +506,7 @@ async def test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait(ki
     assert srv.recovery_mechanism.cooling() and srv._kill_reset_debt()
     started = srv.time.monotonic()
     await _gate()
-    assert srv.time.monotonic() - started < 2.0, "no new wait (msg #455 bounds holds, not this skip)"
+    assert srv.time.monotonic() - started < 2.0, "the skip adds no wait"
     assert "kill_reset_skipped" in killed["events"] and "kill_mesh_reset" not in killed["events"]
     assert killed["resets"] == [], "no reset inside the cooldown"
     assert killed["fabric"] and killed["fabric"][0] == 0, "the dirty exit's full check ran instead"
