@@ -573,3 +573,59 @@ def test_cooldown_candidate_and_next_rung():
     a = hr.RungCandidate(T0 + 5, "x", "a")
     b = hr.RungCandidate(T0 + 1, "y", "b")
     assert hr.next_rung([None, a, b]) is b and hr.next_rung([]) is None
+
+
+# ---- rungs rollout-3 added beside the watchdog chain (spec 04 I73, I70) ---------------------------
+
+
+def test_the_class_a_10_min_ladder_is_named_and_fires_when_reported(held, monkeypatch):
+    """Spec 04 I73: a whole tray whose cycle the cooldown refuses gets the full ladder 10 min after its
+    last cycle or boot. With the first ceiling window spent, that mark comes before the next window
+    and before the cooldown's own retry, and the report names it at the time the watchdog asks it."""
+    held["off"] = set(TRAY_CHIPS[0x40])
+    monkeypatch.setattr(held["m"], "whole_tray_off", list(TRAY_CHIPS[0x40]))
+    monkeypatch.setattr(held["m"], "_class_a_ladder_anchor", None)
+    monkeypatch.setattr(held["m"], "_class_a_ladder_spawned", None)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
+    _deny(held["m"], START + 400 + 1800, last=START + 400)
+    p = _payload()
+    assert (p["next_rung"], p["next_rung_source"]) == ("forced ladder", "class A 10-min ladder")
+    assert p["next_rung_at"] == _iso(START + 1000) and p["next_rung_due"] is False
+    assert "class_a_ladder" not in _fires(START + 999, monkeypatch)
+    assert "class_a_ladder" in _fires(START + 1000, monkeypatch)
+    held["m"]._class_a_ladder_spawned = START + 400  # its pass started: the next window is next
+    assert _payload()["next_rung_source"] == "hold ceiling window 2"
+
+
+def test_the_class_a_ladder_is_not_named_when_the_cooldown_ends_first(held, monkeypatch):
+    held["off"] = set(TRAY_CHIPS[0x40])
+    monkeypatch.setattr(held["m"], "whole_tray_off", list(TRAY_CHIPS[0x40]))
+    monkeypatch.setattr(held["m"], "_class_a_ladder_anchor", None)
+    monkeypatch.setattr(held["m"], "_class_a_ladder_spawned", None)
+    _deny(held["m"], START + 300, last=START - 1500)
+    assert held["m"].class_a_ladder_watch_at(T0) is None
+    assert _payload()["next_rung_source"] == "power_cycle_cooldown"
+
+
+def test_the_unkillable_leftover_host_rung_is_named(held, monkeypatch):
+    """Spec 04 I70: the sampler's host rung for an unkillable leftover, at its budget's end, then one
+    retry interval after each try; never moved to the 10-min floor (it is no forced spawn)."""
+    held["off"] = set(TRAY_CHIPS[0x40])
+    monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
+    mono = srv.time.monotonic()
+    monkeypatch.setattr(srv, "_leftover_unkillable_mono", mono - 100)
+    monkeypatch.setattr(srv, "_leftover_rung_last_try", 0.0)
+    monkeypatch.setattr(srv, "_leftover_rung_stage", "")
+    p = _payload()
+    assert (p["next_rung"], p["next_rung_source"]) == ("host reboot or power cycle", "unkillable leftover budget")
+    assert abs(datetime.fromisoformat(p["next_rung_at"]).timestamp() - (T0 + 500)) <= 2
+    monkeypatch.setattr(srv, "_leftover_unkillable_mono", mono - 700)
+    monkeypatch.setattr(srv, "_leftover_rung_last_try", mono - 20)
+    monkeypatch.setattr(srv, "_leftover_rung_stage", "held")
+    p = _payload()
+    assert abs(datetime.fromisoformat(p["next_rung_at"]).timestamp() - (T0 + 40)) <= 2
+    monkeypatch.setattr(srv, "_leftover_rung_stage", "no-host-rung")
+    assert _payload()["next_rung_source"] != "unkillable leftover budget"
+    monkeypatch.setattr(srv, "_leftover_rung_stage", "")
+    monkeypatch.setattr(srv, "_leftover_unkillable_mono", None)
+    assert _payload()["next_rung_source"] != "unkillable leftover budget"

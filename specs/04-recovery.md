@@ -1046,6 +1046,13 @@ each rung fires only when the gentler one failed or cannot apply.
     stops the chain only once it is due (the one-shot's wait has passed, the retry's time has come),
     as the watchdog's own guard does; one not yet due is reported beside the branches after it, and
     the earliest wins, so an armed retry never hides a ceiling window that fires first;
+  - the I73 class-A 10-min ladder (`forced ladder`, source `class A 10-min ladder`) while a whole tray
+    is off and the cooldown refuses its cycle: 10 min after the later of the last cycle or boot and
+    the hold's start, unless its pass for that anchor already started or the cooldown ends first;
+  - the I70 host rung for an unkillable leftover (`host reboot or power cycle`, source
+    `unkillable leftover budget`): at the end of its budget, then one retry interval after its last
+    try; none once its episode closed or with no host rung opted in. It is the sampler's own rung,
+    not a forced spawn, so the 10-min floor above does not move it;
   - every registered deadline feed.
   A deadline that has passed but whose spawn was declined (a device op or an escalation in flight)
   is reported at its own time with `next_rung_due: true`, never moved to a later window: the
@@ -1929,5 +1936,6 @@ sees a silent fabric pass.
 | I75 (a branch stops the chain only once due: an armed progress retry or a one-shot not yet due hides no earlier rung; the I76 host rung after the bound's ladder) | `tests/test_health_hold_report.py::test_an_armed_progress_retry_does_not_hide_a_due_ceiling_window`, `tests/test_health_hold_report.py::test_an_off_bus_one_shot_not_yet_due_does_not_hide_an_earlier_retry`, `tests/test_health_hold_report.py::test_the_bound_host_rung_follows_the_bound_ladder` |
 | I75 (the off-bus forced pass bounds: gated grace, IPMI and tray-walk hand-offs, gated operator hand-off; only after the ladder ran; the I39 progress retry) | `tests/test_health_hold_report.py::test_the_off_bus_forced_pass_bounds_are_named_when_they_fire`, `tests/test_health_hold_report.py::test_the_off_bus_pass_waits_for_the_ladder_to_have_run`, `tests/test_health_hold_report.py::test_the_i39_progress_retry_is_named` |
 | I75 (a declined deadline stays reported with `next_rung_due`; no episode clock names no forced rung) | `tests/test_health_hold_report.py::test_a_declined_window_stays_reported_as_due`, `tests/test_health_hold_report.py::test_no_episode_clock_names_no_forced_rung` |
+| I75 (the I73 class-A 10-min ladder and the I70 unkillable-leftover host rung are named when the code fires them) | `tests/test_health_hold_report.py::test_the_class_a_10_min_ladder_is_named_and_fires_when_reported`, `tests/test_health_hold_report.py::test_the_class_a_ladder_is_not_named_when_the_cooldown_ends_first`, `tests/test_health_hold_report.py::test_the_unkillable_leftover_host_rung_is_named` |
 | I75 (the I65 retry only when armed for the episode and not refused by a guard; a pending host action is reported, never dropped) | `tests/test_health_hold_report.py::test_the_cooldown_retry_is_named_only_when_the_watchdog_asks_it`, `tests/test_health_hold_report.py::test_the_cooldown_retry_fires_when_reported`, `tests/test_health_hold_report.py::test_a_pending_host_action_is_reported_and_left_alone` |
 | I75 (deadline feeds: the hold bound wins when earlier, moves to the cooldown end inside it; a broken feed reports nothing) | `tests/test_health_hold_report.py::test_the_hold_bound_feed_wins_when_earlier`, `tests/test_health_hold_report.py::test_the_hold_bound_inside_the_cooldown_moves_to_its_end`, `tests/test_health_hold_report.py::test_a_broken_feed_reports_nothing` |

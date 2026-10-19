@@ -6926,8 +6926,8 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
     on; while a requested host action is pending, that request and the end of its window (every forced
     spawn declines until then). Otherwise the earliest of the off-bus forced pass (gated grace, IPMI,
     tray-walk and operator hand-off bounds), the I65 retry of a refused power cycle in this episode, the
-    host rung the 10-min bound asks after its ladder (spec 04 I76), then the watchdog's own branch
-    order: the off-bus one-shot once due, the I39 progress retry once due, else the next unspent
+    I73 class-A 10-min ladder, the I70 unkillable-leftover host rung (never floored), the host rung
+    the 10-min bound asks after its ladder (spec 04 I76), then the watchdog's own branch order: the off-bus one-shot once due, the I39 progress retry once due, else the next unspent
     ceiling window (reported at its own time even when past: a declined spawn retries it every tick).
     A branch not yet due does not hide a later one that fires first: an armed progress retry or
     one-shot is reported next to the ceiling window, and the earlier one wins. Below the 10-min bound
@@ -6981,6 +6981,11 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
     retry = getattr(m, "power_cycle_retry", None) if m is not None else None
     if retry is not None and retry[1] and retry[1] == episode:
         candidates.append(hold_report.cooldown_candidate(cooldown, float(retry[0])))
+    class_a = m.class_a_ladder_watch_at(now_epoch) if m is not None else None
+    if class_a is not None:
+        candidates.append(hold_report.RungCandidate(class_a, "forced ladder", "class A 10-min ladder"))
+    # Spec 04 I70: the sampler's own host rung for an unkillable leftover; no forced spawn, so no floor.
+    fed = fed + _leftover_rung_candidates(now_epoch)
     host_rung = "power cycle" if _auto_power_cycle_enabled() else "warm reboot" if _auto_reboot_enabled() else None
     age = now_epoch - started
     if _hold_bound_cycle_due(age):
@@ -7014,6 +7019,19 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
         hold_report.RungCandidate(started + window * ceiling, "forced ladder", f"hold ceiling window {window}")
     )
     return done(candidates)
+
+
+def _leftover_rung_candidates(now_epoch: float) -> list:
+    """The I70 host rung for an unkillable leftover, as ``_maybe_spawn_leftover_escalation`` will next
+    try it: at the end of its budget, then one retry interval after its last try. Empty once the
+    episode closed or no host rung is opted in. Read-only (spec 04 I75)."""
+    if _leftover_unkillable_mono is None or _leftover_rung_stage == "no-host-rung":
+        return []
+    due = _leftover_unkillable_mono + LEFTOVER_UNKILLABLE_BUDGET_SEC
+    if _leftover_rung_last_try:
+        due = max(due, _leftover_rung_last_try + LEFTOVER_HOST_RUNG_RETRY_SEC)
+    at = now_epoch + max(0.0, due - time.monotonic())
+    return [hold_report.RungCandidate(at, "host reboot or power cycle", "unkillable leftover budget")]
 
 
 def _hold_report(now: Optional[datetime] = None) -> dict:

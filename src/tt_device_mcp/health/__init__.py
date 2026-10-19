@@ -19,14 +19,12 @@ both files) — every name either of them needs from here is either:
 
 from __future__ import annotations
 
-# The per-chip lost/recovering gate in front of every poller read of a chip (spec 03 I66).
-from tt_device_mcp.health import chip_state
-
-# The /health hold report (spec 03 I72, spec 04 I75): its pure helpers, plus the read-only probes
+# chip_state: the per-chip lost/recovering gate in front of every poller read of a chip (spec 03 I66).
+# hold_report: the /health hold report (spec 03 I72, spec 04 I75): its pure helpers, plus the read-only probes
 # server.py feeds them (board-type normalising, off-bus chip ids, PCI bus numbers, the UBB tray
 # tables and the whole-tray classifier the power-cycle rung itself uses), so the report names a
 # hold the way the ladder does.
-from tt_device_mcp.health import hold_report
+from tt_device_mcp.health import chip_state, hold_report
 
 # The operator's AICLK ceiling state: server.py re-applies it at broker start and at the job door,
 # marks it owed when a job ends, and must be able to kill its helper on the dead-chip path.
