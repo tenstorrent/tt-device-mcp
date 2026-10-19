@@ -16359,6 +16359,8 @@ def _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     job = srv.Job(id="428", owner="u", workspace="/", command="(re-adopted)", queued_at="")
     job.status = srv.JobStatus.RUNNING
+    # A 1500 s job that started just now: inside its stated end (spec 03 I75) for the whole test.
+    job.started_at, job.timeout_sec = datetime.now().isoformat(), srv.MAX_TIMEOUT_SEC
     monkeypatch.setattr(srv, "jobs", {"428": job})
     monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", srv.galaxy_recovery.deps.job_running)
     climbs = []
@@ -16615,7 +16617,8 @@ async def test_replay_a_20_min_readopted_job_then_the_startup_check(monkeypatch,
     assert climbs == [] and cycles == []
     assert "hold_bound_tenant_blocked" not in [k for k, _ in events], "the job's run time paged as hold"
     health = srv._hold_bound_health(since + timedelta(seconds=2 * ceiling - 1))
-    assert health["next_step"] == "readopted_job" and health["deadline"] is None
+    assert health["next_step"] == "readopted_job"
+    assert health["deadline"] == srv._readopted_job_service_end(job).isoformat(timespec="seconds"), "no end shown"
 
     _ended_ago(job, 0)
     health = srv._hold_bound_health()
@@ -16634,6 +16637,106 @@ async def test_replay_a_20_min_readopted_job_then_the_startup_check(monkeypatch,
         assert srv.fsm.state is ServerState.HEALTHY
     else:
         assert climbs == ["present-forced"] and len(cycles) == 1, "one ladder, then one power-cycle request"
+
+
+def _capture_alerts(monkeypatch):
+    """The operator's alert hook, armed; returns the events it was handed."""
+    sent = []
+    monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["alert-cmd"])
+    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log: sent.append(event) or 0)
+    monkeypatch.setattr(srv, "_persist_hold_alert_backoff", lambda *a: None)
+    monkeypatch.setattr(srv, "device_hold_alert_next_bucket", 1)
+    monkeypatch.setattr(srv, "device_hold_alert_gap", 0)
+    monkeypatch.setattr(srv, "_readopted_service_credit", None)
+    return sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_kind", ["placeholder", "preemptable_past_soft_limit"])
+async def test_a_readopted_job_serves_the_startup_hold_only_up_to_its_stated_end(monkeypatch, tmp_path, job_kind):
+    """Spec 03 I75 / 04 I76 (review of 10-19, F1): the re-adopted job's run time is service only up to its
+    stated end, its start + timeout + the stop's grace, or the hold's start + its timeout for a job with no
+    known start. A placeholder rebuilt without its log, or a preemptable job past its soft limit with
+    nothing queued, which the broker never stops, kept the 10-min bound off without end before: /health
+    showed next_step readopted_job and no deadline. Now /health shows the stated end as the deadline,
+    and past it the bound acts as on any hold: it pages the job as the blocking tenant, the stuck-hold
+    watchdog flags the hold, and once the job leaves, a failed full check gets one ladder, then one
+    power-cycle request."""
+    since, job, climbs, gate_calls, gate_heals, release_job, tick, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    if job_kind == "placeholder":
+        job.started_at, job.timeout_sec = None, srv.DEFAULT_TIMEOUT_SEC  # Job(...) rebuilt in reconcile
+    else:
+        job.preemptable, job.started_at = True, (since - timedelta(seconds=60)).isoformat()
+        job.timeout_sec = srv.DEFAULT_TIMEOUT_SEC
+    gate_heals["on"] = False
+    cycles = _arm_unhealed_power_cycle(monkeypatch)
+    sent = _capture_alerts(monkeypatch)
+    pages = []
+    patch_health_event(
+        monkeypatch, lambda kind, **f: (events.append((kind, f.get("blocker"))), pages.append((kind, f)))
+    )
+    ceiling, stuck = srv._stuck_hold_ceiling_sec(), srv._hold_deadline_sec()
+    end = srv._readopted_job_service_end(job)
+    assert since < end <= since + timedelta(seconds=ceiling + srv.READOPTED_SERVICE_GRACE_SEC)
+
+    health = srv._hold_bound_health(since + timedelta(seconds=300))
+    assert health["next_step"] == "readopted_job"
+    assert health["deadline"] == end.isoformat(timespec="seconds"), "a deadline, set while the job serves"
+    past = int((end - since).total_seconds()) + 1
+    for sec in (past, past + 30, past + 60):
+        await tick(sec)
+    assert climbs == [] and cycles == [], "no reset under the running job"
+    blocked = [f for k, f in pages if k == "hold_bound_tenant_blocked"]
+    assert len(blocked) == 1 and blocked[0]["job_id"] == "428", "past its stated end the job is paged, named"
+    health = srv._hold_bound_health(since + timedelta(seconds=past + 60))
+    assert health["deadline"] is not None and health["next_step"] == "tenant_blocked"
+    assert "re-adopted job 428" in health["blocked_by"]
+    await tick(stuck + 1)
+    assert "hold_stuck_past_deadline" in [k for k, _ in events], "a hold past the stated end is flagged"
+    assert [e for e in sent if e["kind"] == "hold_stuck_past_deadline"], "and alerted"
+
+    _ended_ago(job, 0)
+    await release_job()
+    assert gate_calls == [("startup", True, True, [])], "the full check, fabric included, runs first"
+    for sec in (stuck + 11, stuck + 21, stuck + 60):
+        await tick(sec)
+    assert climbs == ["present-forced"] and len(cycles) == 1, "one ladder, then one power-cycle request"
+    assert srv.fsm.state is not ServerState.HEALTHY, "a failed full check never lifts the hold"
+
+
+@pytest.mark.asyncio
+async def test_the_stuck_hold_watchdog_counts_a_readopted_job_from_its_end(monkeypatch, tmp_path):
+    """Spec 03 I75 (review of 10-19, F2): 2x the ceiling into a healthy re-adopted job on the startup hold,
+    the stuck-hold watchdog wrote hold_stuck_past_deadline ('Manual recovery is likely required') and fired
+    the operator's alert hook over the broker's own job. The job's run inside its stated end is service:
+    no event or alert while it runs; after its end the watchdog counts from it, so one deadline after
+    the job's end a hold that still stands is flagged and alerted."""
+    since, job, climbs, _, gate_heals, release_job, tick, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    gate_heals["on"] = False
+    cycles = _arm_unhealed_power_cycle(monkeypatch)
+    sent = _capture_alerts(monkeypatch)
+    ceiling, stuck = srv._stuck_hold_ceiling_sec(), srv._hold_deadline_sec()
+    assert stuck == 2 * ceiling
+    job_end = stuck + 300  # the job runs past 2x the ceiling
+    for sec in (ceiling + 1, stuck + 1, job_end):
+        await tick(sec)
+    assert "hold_stuck_past_deadline" not in [k for k, _ in events], "the job's run time flagged as stuck"
+    assert sent == [], "the operator was alerted over the broker's own job"
+
+    _ended_ago(job, 0)
+    await release_job()  # the full check fails, the ladder's too: the hold stands
+    await tick(job_end + 11)
+    await tick(job_end + 21)
+    assert climbs == ["present-forced"] and len(cycles) == 1
+    await tick(job_end + stuck - 1)
+    assert "hold_stuck_past_deadline" not in [k for k, _ in events]
+    await tick(job_end + stuck + 1)
+    assert "hold_stuck_past_deadline" in [k for k, _ in events], "the hold went silent after the job's end"
+    assert [e["kind"] for e in sent] == ["hold_stuck_past_deadline"]
 
 
 @pytest.mark.asyncio

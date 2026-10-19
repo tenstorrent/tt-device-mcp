@@ -1185,8 +1185,11 @@ each rung fires only when the gentler one failed or cannot apply.
   and then `startup_check`, spec 03 I75) and, while the host rung waits on it, `cooldown_until`. One helper, `hold_bound_deadline()`, gives the open
   hold's escalation deadline for every hold kind: its start + the ceiling, or the end of a running
   power-cycle cooldown when that is later; for a `startup_unverified` hold behind a re-adopted
-  job, none while the job runs and at least its end + `STARTUP_VERIFY_DEFER_MAX_SEC` after it
-  (spec 03 I75: the job's run time is service, not hold); `/health`'s `deadline` and the stuck-hold event's and
+  job, at least the job's stated end (its start + timeout + 60 s grace, or the hold's start + its
+  timeout with no known start) while it runs, and at least its end + `STARTUP_VERIFY_DEFER_MAX_SEC`
+  after it (spec 03 I75: the job's run time is service, not hold, up to that stated end; past it the
+  bound pages the job as the tenant it waits on, and the stuck-hold watchdog, which counts from the
+  job's end inside it, counts from the hold's start again); `/health`'s `deadline` and the stuck-hold event's and
   alert's `escalation_deadline` all read it. A stuck-hold event past the bound reports `escalated`
   true once the bound ran a ladder or asked for the host rung. Time to the power-cycle request for a
   hold no class path heals (e.g. a topology-mismatch or 77-only hold, class D): at most 600 s +

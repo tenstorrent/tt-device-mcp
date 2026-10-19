@@ -998,10 +998,21 @@ cooldown (spec 04 I65) holds longer.
   re-adopted jobs end, the escalations act as before. That clock starts when the gate stops
   waiting on their scopes or, while a scope outlives its job (a killed job's scope still exiting),
   at the job's `finished_at`: a scope that lingers never holds the ladder off past it. The
-  re-adopted job's run time is service, not hold (no reset runs under a live job, issue #3): while
-  it runs on the `startup_unverified` hold, the I76 bound neither fires nor pages
-  `hold_bound_tenant_blocked` over the broker's own job, and `/health` `hold_bound` shows
-  `next_step` `readopted_job` with no deadline. Once it ends, `next_step` is `startup_check` and the
+  re-adopted job's run time is service, not hold (no reset runs under a live job, issue #3), up to
+  its stated end: its `started_at` + its `timeout_sec` (at most `MAX_TIMEOUT_SEC`) + the stop's grace
+  (`READOPTED_SERVICE_GRACE_SEC`, 60 s), the latest a job the broker stops at its timeout still runs;
+  a job with no known start (a placeholder rebuilt without its log) counts from the hold's start, the
+  broker start it predates. While it runs inside that end on the `startup_unverified` hold, the I76
+  bound neither fires nor pages `hold_bound_tenant_blocked` over the broker's own job, the stuck-hold
+  watchdog (I37) writes no `hold_stuck_past_deadline` and fires no alert, and `/health` `hold_bound`
+  shows `next_step` `readopted_job` with the stated end (or the episode start + 600 s if later) as its
+  deadline. A job still running past its stated end (a placeholder, or a preemptable job past its
+  soft limit with nothing queued, which the broker does not stop) is no longer service: the bound
+  acts as on any hold, paging `hold_bound_tenant_blocked` once with the job named (`job_id`,
+  `service_end`), the watchdog counts from the episode start, and the ladder runs on the first tick
+  after the job leaves, then the power cycle if the full check after it fails. After a job that ended
+  inside its stated end, the watchdog counts from the last tick it served, so a hold that still stands
+  is flagged and alerted one deadline after the job's end. Once it ends, `next_step` is `startup_check` and the
   deadline is the later of the episode start + 600 s and the job's end +
   `STARTUP_VERIFY_DEFER_MAX_SEC`, so at most 10 min after the job's end. One ladder and at most one
   power-cycle request per episode, as I76. A fault hold open before the restart (a `why` other than
@@ -1016,8 +1027,13 @@ cooldown (spec 04 I65) holds longer.
   episode start + 600 s and the job's end + 420 s, at most 10 min after the job's end (unchanged).
   Class S, a re-adopted job's scope outliving the job: the ladder by the job's end + 420 s (or the
   episode start + 600 s if later), then the power cycle if its full check fails; before, no ladder
-  until the scope exited, open-ended. Other classes, off-bus ones (A, B1, B2, C) on a startup hold
-  included: unchanged.
+  until the scope exited, open-ended. Class S, a re-adopted job running past its stated end: before,
+  no bound, page or deadline for as long as it ran, open-ended; now the tenant-blocked page at the
+  stated end + one tick, then the startup gate and the ladder within 420 s of the job leaving, then
+  one power-cycle request, bounded only by the tenant as I76 states. Alerts: no stuck-hold event or
+  alert over a re-adopted job inside its stated end (before, one 20 min into the episode); one
+  deadline after its end if the hold stands. Other classes, off-bus ones (A, B1, B2, C) on a startup
+  hold included: unchanged.
 
 ## Interfaces
 
@@ -1663,7 +1679,8 @@ refuses.
 | I75 | `tests/test_device_safety.py::test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_gate_not_reset`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_next_tick`, `tests/test_device_safety.py::test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladder`, `tests/test_device_safety.py::test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate` |
 | I75 (the stand-down is re-read under the lock and at the ladder's tenant check: a job ending mid-run gets no reset before the gate) | `tests/test_device_safety.py::test_a_readopted_job_ending_during_a_forced_run_gets_no_reset_before_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_after_a_job_ended_during_a_forced_run_escalates_next_tick`, `tests/test_device_safety.py::test_idle_relift_gives_no_reset_when_the_readopted_job_ends_inside_the_ladder`, `tests/test_ladder_v2.py::test_the_i75_stand_down_blocks_only_inside_the_escalate_that_carries_it`, `tests/test_ladder_v2.py::test_escalate_carries_the_stand_down_only_for_its_own_run`, `tests/test_classac_power_cycle_direct.py::test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant` |
 | I75 (a running re-adopted job still defers on `job_running`; off-bus and non-rearmable forced kinds never wait on the gate; a failed gate gets the I76 ladder then one power cycle) | `tests/test_device_safety.py::test_a_running_readopted_job_still_defers_the_startup_hold_on_job_running`, `tests/test_device_safety.py::test_idle_relift_meets_a_running_readopted_job_on_job_running`, `tests/test_device_safety.py::test_an_offbus_startup_hold_keeps_its_one_shot_while_the_startup_gate_is_pending`, `tests/test_device_safety.py::test_a_forced_run_whose_window_cannot_be_given_back_is_not_deferred_to_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_gets_the_bound_ladder_then_one_power_cycle` |
-| I75 (the re-adopted job's run time is service: no bound, page or deadline while it runs; the gate's full check first at its end; a failed, hung or never-run check gets one ladder within 10 min of the job's end, then one power cycle; a pre-restart fault hold keeps its clock) | `tests/test_device_safety.py::test_replay_a_20_min_readopted_job_then_the_startup_check`, `tests/test_device_safety.py::test_a_hung_startup_check_gets_the_ladder_by_its_bound_after_the_readopted_jobs_end`, `tests/test_device_safety.py::test_replay_a_1_min_readopted_job_whose_startup_check_fails_or_never_runs`, `tests/test_device_safety.py::test_a_fault_hold_from_before_the_restart_keeps_its_clock_behind_a_readopted_job` |
+| I75 (the re-adopted job's run time is service only up to its stated end: past it the bound pages the job named, flags the hold and runs the ladder once it leaves; the stuck-hold watchdog counts from the job's end) | `tests/test_device_safety.py::test_a_readopted_job_serves_the_startup_hold_only_up_to_its_stated_end`, `tests/test_device_safety.py::test_the_stuck_hold_watchdog_counts_a_readopted_job_from_its_end` |
+| I75 (the re-adopted job's run time is service: no bound or page while it runs, the stated end as the deadline; the gate's full check first at its end; a failed, hung or never-run check gets one ladder within 10 min of the job's end, then one power cycle; a pre-restart fault hold keeps its clock) | `tests/test_device_safety.py::test_replay_a_20_min_readopted_job_then_the_startup_check`, `tests/test_device_safety.py::test_a_hung_startup_check_gets_the_ladder_by_its_bound_after_the_readopted_jobs_end`, `tests/test_device_safety.py::test_replay_a_1_min_readopted_job_whose_startup_check_fails_or_never_runs`, `tests/test_device_safety.py::test_a_fault_hold_from_before_the_restart_keeps_its_clock_behind_a_readopted_job` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

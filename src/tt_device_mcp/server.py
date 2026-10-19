@@ -7268,6 +7268,8 @@ _hold_bound_denied_why: str = ""
 # The live tenant that keeps the bound's ladder or host rung from running (paged once per episode) and
 # what it is, for /health (spec 04 I76).
 _hold_bound_tenant_paged: str = ""
+# (episode, last tick a re-adopted job served its startup hold): the stuck-hold watchdog counts from it (spec 03 I75).
+_readopted_service_credit: Optional[tuple[str, datetime]] = None
 _hold_bound_tenant_blocker: Optional[dict] = None
 # The upper bound on a full health check (fabric included) after a bound ladder brought the mesh back
 # that is still running, hangs or waits on the hugepage pool: past it the host rung fires anyway. A
@@ -7488,14 +7490,22 @@ def _bound_tenant_blocker(bound: bool) -> Optional[dict]:
         blocker = galaxy_recovery._tenant_blocker(scan, force=True)
     except Exception:  # noqa: BLE001 - naming the blocker never decides whether one holds
         blocker = None
+    overran = _readopted_job_overran()
+    if overran is not None and (blocker is None or blocker.get("blocker") == "job_running"):
+        # Spec 03 I75: a re-adopted job past its stated end is no longer service; name it.
+        job, end = overran
+        blocker = {"blocker": "job_running", "job_id": job.id, "service_end": end.isoformat(timespec="seconds")}
     return blocker or {"blocker": "tenant"}
 
 
 def _describe_bound_blocker(blocker: dict) -> str:
     try:
-        return galaxy_recovery._describe_blocker(blocker)
+        desc = galaxy_recovery._describe_blocker(blocker)
     except (KeyError, TypeError, AttributeError):
         return "a tenant holds the device"
+    if blocker.get("job_id"):
+        desc += f" (re-adopted job {blocker['job_id']}, past its stated end {blocker.get('service_end')})"
+    return desc
 
 
 def _hold_bound_tenant_blocked(blocker: dict, log) -> None:
@@ -7546,17 +7556,21 @@ def _hold_escalated_report() -> bool:
 def hold_bound_deadline(now: Optional[datetime] = None) -> Optional[datetime]:
     """When the open hold escalates under the 10-min bound (spec 04 I76), whatever its kind: the hold's
     start + the stuck-hold ceiling, or the end of a running power-cycle cooldown (I65), whichever is
-    later. A startup hold behind a re-adopted job (spec 03 I75) has none while the job runs, and while the
-    startup gate still has it, the later of that and the job's end + STARTUP_VERIFY_DEFER_MAX_SEC: the
+    later. A startup hold behind a re-adopted job (spec 03 I75): while the job runs inside its stated end
+    (_readopted_job_service_end), the later of that and the job's stated end; while the startup gate
+    still has it after the job, the later of that and the job's end + STARTUP_VERIFY_DEFER_MAX_SEC: the
     gate's full check runs first, the ladder no later than that. None when nothing is held or the
     episode clock cannot be read."""
-    if not device_hold_episode_since or _readopted_job_serves_startup_hold():
+    if not device_hold_episode_since:
         return None
     try:
         deadline = datetime.fromisoformat(device_hold_episode_since) + timedelta(seconds=_stuck_hold_ceiling_sec())
     except ValueError:
         return None
-    if _startup_verify_owns_hold():
+    serving = _readopted_service_until(now)
+    if serving is not None:
+        deadline = max(deadline, serving.replace(tzinfo=deadline.tzinfo))
+    elif _startup_verify_owns_hold():
         ended = _readopted_jobs_end()
         if ended is not None:
             deadline = max(
@@ -7587,8 +7601,8 @@ def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
     # After the bound's ladder, the host rung is next: now, or at the end of the cooldown it waits on.
     step = "power-cycle" if lad is not None and (cooling or cyc is None or cyc < lad) else "ladder"
     out = {"bound_sec": int(ceiling), "deadline": deadline, "held_age_sec": int(age), "next_step": step}
-    if _readopted_job_serves_startup_hold():
-        out["next_step"] = "readopted_job"  # spec 03 I75: the bound counts from the job's end
+    if _readopted_job_serves_startup_hold(now):
+        out["next_step"] = "readopted_job"  # spec 03 I75: the bound counts from the job's (stated) end
     elif _startup_verify_owns_hold():
         out["next_step"] = "startup_check"  # spec 03 I75: the full check first, the ladder if it fails
     if _hold_bound_tenant_blocker is not None:
@@ -7905,7 +7919,10 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             if _maybe_spawn_forced_escalation():
                 device_hold_escalate_bucket = ebucket
     deadline = _hold_deadline_sec()
-    bucket = int(age // deadline)
+    watch_age = _hold_watchdog_age(age, now)
+    if watch_age is None:
+        return  # spec 03 I75: a re-adopted job serves the startup hold inside its stated end
+    bucket = int(watch_age // deadline)
     if bucket < 1 or bucket <= device_hold_deadline_bucket:
         return
     device_hold_deadline_bucket = bucket
@@ -7933,6 +7950,24 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             f"a killed relift). Manual recovery is likely required — a hold must terminate."
         )
     _maybe_alert_stuck_hold(bucket, deadline, age)
+
+
+def _hold_watchdog_age(age: float, now: Optional[datetime] = None) -> Optional[float]:
+    """The stuck-hold watchdog's age (spec 03 I75): the episode's ``age``, except on a startup hold behind a
+    re-adopted job. Inside the job's stated end its run is service, not hold: None (no stuck event), and
+    once it ended the age counts from the last tick it served, so the event and the alert hook fire one
+    deadline after the job's end if the hold still stands. A job still running past its stated end gets no
+    credit: the episode clock, flagged as any other hold, so the hold never goes silent."""
+    global _readopted_service_credit
+    now = now or datetime.now()
+    if _readopted_job_serves_startup_hold(now):
+        _readopted_service_credit = (device_hold_episode_since, now)
+        return None
+    credit = _readopted_service_credit
+    if credit is None or credit[0] != device_hold_episode_since or _readopted_job_overran(now) is not None:
+        _readopted_service_credit = None
+        return age
+    return min(age, (now - credit[1]).total_seconds())
 
 
 def _maybe_alert_stuck_hold(bucket: int, deadline: int, age: float) -> None:
@@ -11745,13 +11780,60 @@ def _readopted_jobs_ended_at() -> Optional[datetime]:
     return ended
 
 
-def _readopted_job_serves_startup_hold() -> bool:
-    """True while a job this broker start re-adopted still runs on the startup hold (spec 03 I75). Its
-    run time is service, not hold: no reset runs under a live job (issue #3), so that hold's 10-min
-    bound (spec 04 I76) counts from the job's end, not from the broker start."""
+# Past its timeout the broker stops a re-adopted job's scope within this (SIGINT, then the reap).
+READOPTED_SERVICE_GRACE_SEC = max(GRACEFUL_KILL_GRACE_SEC, PREEMPT_GRACE_SEC)
+
+
+def _readopted_job_service_end(job: Job) -> Optional[datetime]:
+    """The stated end of a re-adopted job's run as service on the startup hold (spec 03 I75): its start +
+    its timeout (at most MAX_TIMEOUT_SEC) + READOPTED_SERVICE_GRACE_SEC, the latest a job the broker stops
+    at its timeout still runs. A job with no known start (a placeholder rebuilt without its log) counts
+    from the hold's start, the broker start it predates. A preemptable job past its soft limit with
+    nothing queued may run on, but no longer as service. None when neither clock can be read."""
+    try:
+        start = datetime.fromisoformat(job.started_at or device_hold_episode_since)
+    except (TypeError, ValueError):
+        return None
+    run = min(job.timeout_sec or DEFAULT_TIMEOUT_SEC, MAX_TIMEOUT_SEC)
+    return start.replace(tzinfo=None) + timedelta(seconds=run + READOPTED_SERVICE_GRACE_SEC)
+
+
+def _readopted_running_on_startup_hold() -> list[tuple[Job, Optional[datetime]]]:
+    """(job, stated end) of each job this broker start re-adopted that still runs on the startup hold."""
     if fsm.state is not ServerState.RECOVERING or fsm.record.why != "startup_unverified":
-        return False
-    return any(jid in jobs and jobs[jid].status == JobStatus.RUNNING for jid in readopted_scopes)
+        return []
+    return [
+        (jobs[jid], _readopted_job_service_end(jobs[jid]))
+        for jid in readopted_scopes
+        if jid in jobs and jobs[jid].status == JobStatus.RUNNING
+    ]
+
+
+def _readopted_service_until(now: Optional[datetime] = None) -> Optional[datetime]:
+    """The stated end of a re-adopted job still serving the startup hold, or None when none does."""
+    at = (now or datetime.now()).replace(tzinfo=None)
+    ends = [end for _, end in _readopted_running_on_startup_hold() if end is not None and end > at]
+    return max(ends, default=None)
+
+
+def _readopted_job_overran(now: Optional[datetime] = None) -> Optional[tuple[Job, datetime]]:
+    """A re-adopted job still running on the startup hold past its stated end, with that end, or None."""
+    if _readopted_service_until(now) is not None:
+        return None
+    at = (now or datetime.now()).replace(tzinfo=None)
+    for job, end in _readopted_running_on_startup_hold():
+        if end is None or end <= at:
+            return job, end or at
+    return None
+
+
+def _readopted_job_serves_startup_hold(now: Optional[datetime] = None) -> bool:
+    """True while a job this broker start re-adopted still runs on the startup hold (spec 03 I75), inside
+    its stated end (_readopted_job_service_end). That run time is service, not hold: no reset runs under
+    a live job (issue #3), so that hold's 10-min bound (spec 04 I76) counts from the job's end, not from
+    the broker start. Past the stated end it counts as on any hold: the bound pages the job as the tenant
+    that blocks it and runs the ladder once it leaves."""
+    return _readopted_service_until(now) is not None
 
 
 async def _await_startup_prerequisites(missing: str) -> None:
