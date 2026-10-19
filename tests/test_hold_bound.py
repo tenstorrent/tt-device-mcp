@@ -616,7 +616,7 @@ async def test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladde
     An off-bus hold is healed by a mesh reset; the post-reset check passes with a topology mismatch and
     lifts. The first job fails on the fabric and sets the I42 latch, which opens a new hold episode at
     that job's end. The next tenant job is dequeued and held at the CLEAN-GATE (it opens no device fd).
-    At the bound the watchdog lifts the latch and runs the ladder; the full check fails and the power
+    At the bound the watchdog runs the ladder with the latch standing; the full check fails and the power
     cycle is asked for once. The gated job never dispatches, and its own bound refuses it."""
     order, g = rig["order"], rig["g"]
     mon = srv.health_monitor
@@ -628,7 +628,6 @@ async def test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladde
     monkeypatch.setattr(mon, "known_fabric_fault", lambda: "")
     monkeypatch.setattr(mon, "last_fabric_ok", None)
     monkeypatch.setattr(mon, "topology_hw_fault", "")
-    monkeypatch.setattr(mon, "topology_hw_fault_paged", 0.0)
     monkeypatch.setattr(mon, "topology_lift_pending", False)
     monkeypatch.setattr(mon, "_topology_alerted", set())
     monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {})  # no chip-to-bus map off the host
@@ -658,7 +657,7 @@ async def test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladde
     why = mon.note_job_after_topology_lift(True, "... could not find any forwarding direction ...")
     assert why and mon.topology_hw_fault
     srv._hold_device_fabric_unverified(f"job 922: {why}")
-    assert srv._fabric_77_only_hold(), "a 77-only hold: below the bound no rung runs"
+    assert srv._fabric_no_reset_hold() == "", "a latched hold is measured (03 I42): never a no-reset hold"
     _watchdog(monkeypatch)
     monkeypatch.setattr(srv, "device_hold_job_bound_escalated", False)
 
@@ -691,7 +690,7 @@ async def test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladde
 
     async def full_check(expected, log, run_fabric=True, **k):
         checks.append(("run_fabric", run_fabric))
-        assert not mon.topology_hw_fault, "the latch is lifted, so the fabric pass really runs"
+        assert mon.topology_hw_fault, "the latch stands through the bound: a mismatch here fails"
         return False, {"fabric": {"ok": False, "detail": MISMATCH}}
 
     monkeypatch.setattr(g, "_reset_and_verify_device", reset_then_full_check)
@@ -705,14 +704,14 @@ async def test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladde
     monkeypatch.setattr(srv, "_auto_power_cycle_host", cycle_and_mark)
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
 
-    # BOUND+1: the watchdog lifts the latch and runs the ladder; the full check fails; one power cycle.
+    # BOUND+1: the watchdog runs the ladder with the latch standing; the full check fails; one power cycle.
     before = len(order)
     offset[0] = BOUND + 1
     srv._check_hold_deadline()
     await _drain()
     bound_run = order[before:]
-    assert not mon.topology_hw_fault, "the bound lifted the I42 latch"
-    assert ("hold_bound_latch_cleared", "topology_hw_fault") in [(k, e.get("latch")) for k, e in rig["events"]]
+    assert mon.topology_hw_fault, "the I42 latch stands through the bound"
+    assert ("hold_bound_latch_cleared", "topology_hw_fault") not in [(k, e.get("latch")) for k, e in rig["events"]]
     assert "glx_reset" in bound_run, "the full ladder ran at the 10-min mark"
     assert ("run_fabric", True) in checks and False in checks, "the full check, fabric included, failed"
     assert bound_run.count("power_cycle") == 1, "the broker's own code asked for the power cycle"
