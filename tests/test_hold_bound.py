@@ -317,6 +317,87 @@ async def test_a_relift_that_fails_after_the_bound_ladder_cycles_on_the_next_tic
     assert events.count("host_rung") == 1 and escalations == ["present-forced"]
 
 
+async def _bound_check_pending(monkeypatch, why, detail):
+    """An episode at the bound whose ladder brought the mesh back and whose own post-ladder check is
+    still waiting on the hugepage pool: the next full check that fails is the one that counts."""
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(monkeypatch, why=why, detail=detail, age_min=10.1)
+    _watchdog(monkeypatch)
+    pending = {"hugepages": True}
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: pending["hugepages"])
+
+    async def recovered_ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        return OUTCOME_RECOVERED
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", recovered_ladder)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert "hold_bound_check_failed" not in events and "host_rung" not in events
+    pending["hugepages"] = False
+    monkeypatch.setattr(srv.FABRIC_DEBT, "runs_here", lambda expected: True)
+    return escalations, events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verdict", [(False, {"fabric": {"ok": True}}), (True, {"fabric": {"ok": None}}), (True, {"fabric": {"ok": False}})]
+)
+@pytest.mark.parametrize(
+    "why, detail",
+    [
+        ("eth_frozen", "gate/post-job: eth/fabric fault on a present mesh"),  # the eth_frozen lift
+        ("off_bus", "gate/post-job: 1/32 chip(s) off the bus"),  # the off-bus floor lift
+    ],
+)
+async def test_a_failed_lift_check_after_the_bound_ladder_asks_for_the_host_rung(
+    monkeypatch, clear_job_state, verdict, why, detail
+):
+    """Review #1495 F4: every idle lift path runs _full_check_gate; a check there that ends with no
+    pass after the bound's ladder hands the hold to the host rung on the next tick (spec 04 I76)."""
+    escalations, events = await _bound_check_pending(monkeypatch, why, detail)
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+
+    async def observe(expected, log, **_):
+        return verdict
+
+    monkeypatch.setattr(srv.fsm, "observe", observe)
+    ok, _evidence = await srv._full_check_gate(EXPECTED, lambda m: None)
+    assert not ok and events.count("hold_bound_check_failed") == 1
+    srv._check_hold_deadline(now=datetime.now() + timedelta(seconds=10))  # one sampler tick
+    await _drain()
+    assert srv.device_hold_escalation_kind == "hold_bound_cycle"
+    assert events.count("host_rung") == 1 and len(escalations) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_lift_check_still_waiting_on_hugepages_asks_for_no_host_rung(monkeypatch, clear_job_state):
+    """A full check that could not run because the 1G pool is still filling is no failed check."""
+    _escalations, events = await _bound_check_pending(
+        monkeypatch, "eth_frozen", "gate/post-job: eth/fabric fault on a present mesh"
+    )
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: (12, 32))
+    assert await srv._full_check_gate(EXPECTED, lambda m: None) == (False, {})
+    assert "hold_bound_check_failed" not in events
+
+
+@pytest.mark.asyncio
+async def test_a_failed_foreign_holder_check_after_the_bound_ladder_asks_for_the_host_rung(
+    monkeypatch, clear_job_state
+):
+    """Review #1495 F4, the foreign-holder lift (spec 03 I43): its failed full check counts too."""
+    _escalations, events = await _bound_check_pending(monkeypatch, "foreign_holder", "foreign holder")
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda scan: "")
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+
+    async def observe(expected, log, **_):
+        return True, {"fabric": {"ok": False}}
+
+    monkeypatch.setattr(srv.fsm, "observe", observe)
+    await srv._foreign_holder_fast_verify(EXPECTED, lambda m: None)
+    assert events.count("hold_bound_check_failed") == 1
+
+
 def test_health_shows_the_bound(monkeypatch, clear_job_state):
     srv._mark_device_dirty("gate/post-job: eth/fabric fault on a present mesh")
     monkeypatch.setattr(srv, "device_hold_episode_since", _since(120))

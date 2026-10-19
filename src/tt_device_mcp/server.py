@@ -4617,6 +4617,9 @@ async def _full_check_gate(
             f"the full check did not pass (healthy={healthy}, "
             f"fabric={fabric_ok!r}) — holding; the door never reopens onto unverified fabric"
         )
+        # Spec 04 I76: a failed check after the bound's ladder hands the hold to the host rung on the
+        # next tick, whichever lift path ran it (eth_frozen, off-bus floor, foreign holder, DOWN).
+        _note_hold_bound_check_failed(log)
         return False, evidence
     return True, evidence
 
@@ -4673,8 +4676,7 @@ async def _attempt_down_offbus_recheck() -> None:
             )
             ok, evidence = await _full_check_gate(expected, _log)
             if not ok:
-                _note_hold_bound_check_failed(_log)  # spec 04 I76: the host rung on the next tick
-                return
+                return  # _full_check_gate noted a failed check for the 10-min bound (spec 04 I76)
             # Re-assert after the long awaits: the sampler's dead-chip mark is lock-free.
             now_episode = (fsm.record.since, fsm.record.why, fsm.record.detail, fsm.record.dirty)
             if fsm.state is not ServerState.DOWN or now_episode != episode:
