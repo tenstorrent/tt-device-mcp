@@ -99,18 +99,170 @@ async def test_no_second_glx_reset_or_ladder_in_the_episode(monkeypatch, clear_j
     assert events.count("host_rung") == 1 and "device_released" not in events
 
 
+class _Clock(datetime):
+    """The broker's ``datetime`` with a settable offset: every age the watchdog and the forced run read
+    moves together, and the hold episode (its ``since``) stays the same."""
+
+    offset = 0.0
+
+    @classmethod
+    def now(cls, tz=None):
+        return datetime.now(tz) + timedelta(seconds=cls.offset)
+
+
+def _clock(monkeypatch):
+    monkeypatch.setattr(_Clock, "offset", 0.0)
+    monkeypatch.setattr(srv, "datetime", _Clock)
+    return _Clock
+
+
+async def _walk(clock, start, stop, step=10):
+    """One watchdog tick every ``step`` s of hold age from ``start`` (relative to the hold's opening
+    age) up to ``stop``, each run drained before the next tick."""
+    for after in range(start, stop, step):
+        clock.offset = after
+        srv._check_hold_deadline()
+        await _drain()
+
+
 @pytest.mark.asyncio
-async def test_a_latched_mismatch_gets_the_power_cycle_and_no_release(monkeypatch, clear_job_state):
-    """The I42 hardware-fault latch on a one-port-short mismatch is lifted for the ladder, and the full
-    check after it counts the same port short: one power-cycle request, no device_released."""
+async def test_a_latched_mismatch_keeps_the_latch_and_is_not_released(monkeypatch, clear_job_state):
+    """Spec 03 I42's latch on a one-port-short mismatch is not this class (spec 04 I30): no ladder at hold
+    start. At the 10-min bound I76 runs the full ladder with the latch still set, the full check after it
+    counts the same port short and fails, the broker asks for the power cycle, and nothing is released."""
     escalations, _alerts, events = _arm(monkeypatch, "topology mismatch", latched=True)
     _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
-    _tick(0)
-    await _drain()
-    assert "hold_bound_latch_cleared" in events
-    assert escalations == ["present-forced"]
-    assert events.count("hold_bound_check_failed") == 1
+    clock = _clock(monkeypatch)
+    assert srv._fabric_link_short_hold() == "", "a latched hold is measured, never a link-short no-reset hold"
+    await _walk(clock, 0, BOUND - 10)
+    assert escalations == [] and "host_rung" not in events, "nothing forced below the bound"
+    await _walk(clock, BOUND - 10, BOUND + 30)
+    assert escalations == ["present-forced"], "the bound's full ladder"
+    assert srv.health_monitor.topology_hw_fault, "the I42 latch stands through the bound"
+    assert "hold_bound_latch_cleared" not in events
+    assert events.count("hold_bound_check_failed") == 1, "the check after the ladder fails on the short count"
     assert events.count("host_rung") == 1 and "device_released" not in events
+    assert srv._recovery_degraded()
+
+
+def _carry_an_at_start_ladder(monkeypatch, hold, *, restart):
+    """A link-short episode whose at-start ladder ran 20 s in and whose check released the device; it is
+    held again 30 s in, now as ``hold`` (spec 04 I82 carry, or a broker restart's resume)."""
+    escalations, _alerts, events = _arm(monkeypatch, hold, age_sec=30)
+    srv._hold_bound_sync()
+    carry = {"since": srv.device_hold_episode_since, "ladder_age": 20.0, "ladder_early": True, "cycle_age": None}
+    if restart:
+        monkeypatch.setattr(srv, "_hold_bound_episode", "")  # a new broker process: no bound state in memory
+        srv._hold_bound_sync()
+    srv._resume_hold_bound(carry)
+    assert srv._hold_bound_early and srv._hold_bound_cycle_due(srv._hold_age_now())
+    _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
+    return escalations, events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True], ids=["carry", "broker-restart"])
+@pytest.mark.parametrize("hold", ["off-bus", "generic", "77-only"])
+async def test_a_rehold_of_another_class_after_a_carried_at_start_ladder_asks_for_the_host_rung_once(
+    monkeypatch, clear_job_state, hold, restart
+):
+    """After a carried at-start ladder, a re-hold of another class below the bound goes to the
+    host rung once; it never runs an unrecorded forced ladder on every tick."""
+    escalations, events = _carry_an_at_start_ladder(monkeypatch, hold, restart=restart)
+    monkeypatch.setattr(srv, "_offbus_one_shot_sec", lambda: 10_000.0)
+    clock = _clock(monkeypatch)
+    await _walk(clock, 0, 300)
+    assert escalations == [], "no ladder below the bound: the carried one already ran"
+    assert events.count("host_rung") == 1
+
+
+async def _opted_out_or_denied(monkeypatch, escalations, events, how):
+    """The real host rung, with both host rungs opted out or the power cycle denied for a reason that is
+    not the cooldown (a stand-back check)."""
+    monkeypatch.setattr(srv, "_hold_bound_host_rung", _REAL_HOST_RUNG)
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
+    monkeypatch.setattr(srv, "_bound_tenant_blocker", lambda *a: None)
+    monkeypatch.setattr(srv.recovery_mechanism, "_journal_auto_recovery_denied", lambda *a: None)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: how == "denied")
+    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
+    monkeypatch.setattr(
+        srv.recovery_mechanism, "auto_recovery_allowed", lambda action, **k: (False, "another host action stands")
+    )
+
+    async def no_cycle(log, reason):
+        raise AssertionError("a denied power cycle never fires")
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", no_cycle)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["opted-out", "denied"])
+async def test_an_at_start_ladder_whose_host_rung_never_fired_does_not_stand_in_for_the_bounds_ladder(
+    monkeypatch, clear_job_state, how
+):
+    """The at-start ladder is a forced run below the
+    bound. When the host rung after it was never granted, the full ladder still runs at the 10-min mark,
+    and the later windows follow I76 as for any hold (a ladder each window when both host rungs are opted
+    out; a denied rung stays pending and is asked again each tick)."""
+    escalations, _alerts, events = _arm(monkeypatch, "topology mismatch")
+    await _opted_out_or_denied(monkeypatch, escalations, events, how)
+    _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
+    clock = _clock(monkeypatch)
+    await _walk(clock, 0, BOUND - 20)
+    assert escalations == ["present-forced"], "the at-start ladder, and none other below the bound"
+    await _walk(clock, BOUND - 20, BOUND + 20)
+    assert escalations == ["present-forced"] * 2, "the bound's own full ladder at 10 min"
+    await _walk(clock, BOUND + 20, 3 * BOUND + 20)
+    if how == "opted-out":
+        assert escalations.count("present-forced") >= 3, "a later window runs the ladder again (I76)"
+    else:
+        assert escalations == ["present-forced"] * 2, "a denied rung stays pending, asked each tick (I76)"
+        assert srv._hold_bound_rung_pending
+    assert "device_released" not in events and srv._recovery_degraded()
+
+
+@pytest.mark.asyncio
+async def test_a_granted_host_rung_after_the_at_start_ladder_runs_no_second_ladder_at_the_bound(
+    monkeypatch, clear_job_state
+):
+    """Only a host rung the governor granted (or a cooldown retry it armed) lets the at-start
+    ladder stand in for the bound's: then no ladder runs at 10 min."""
+    escalations, _alerts, events = _arm(monkeypatch, "topology mismatch")
+    _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
+
+    async def host_rung(age, log):
+        events.append("host_rung")
+        srv._hold_bound_rung_pending, srv._hold_bound_cycle_age = False, age
+        srv._hold_bound_granted_age = age  # the power cycle was requested and has not healed it yet
+
+    monkeypatch.setattr(srv, "_hold_bound_host_rung", host_rung)
+    clock = _clock(monkeypatch)
+    await _walk(clock, 0, BOUND + 30)
+    assert escalations == ["present-forced"] and events.count("host_rung") >= 1
+
+
+@pytest.mark.asyncio
+async def test_an_at_start_run_that_found_another_class_is_not_spawned_again(monkeypatch, clear_job_state):
+    """A chip off the bus by heartbeat (none isolated yet) is not the link-short class. The
+    at-start run declines once, and no later tick spawns it again below the bound."""
+    escalations, _alerts, events = _arm(monkeypatch, "topology mismatch")
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(31)})
+    monkeypatch.setattr(srv, "_offbus_one_shot_sec", lambda: 10_000.0)
+    monkeypatch.setattr(srv, "dead_chips", lambda b: [])
+    _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
+    runs = []
+    real = srv._maybe_spawn_forced_escalation
+
+    def spawn():
+        if srv.device_hold_escalation_kind == "fabric_link_short":
+            runs.append(1)
+        return real()
+
+    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", spawn)
+    clock = _clock(monkeypatch)
+    await _walk(clock, 0, 300)
+    assert len(runs) == 1, "one declined run, not one per tick"
+    assert escalations == []
 
 
 @pytest.mark.asyncio
