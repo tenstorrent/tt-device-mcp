@@ -1021,9 +1021,13 @@ cooldown (spec 04 I65) holds longer.
   reset scope still running, or `chip_state.recovering()`), a signal only moves the baseline and
   arms nothing: a reset journals no `offbus_watch_armed`. The signal decides nothing: the existing
   two-sample proof (I19, I31 and the all-gone/blackout checks) still confirms, into the same
-  classification and dirty mark, and under the fast cadence the bad reading must also have lasted
-  `FAST_CONFIRM_SEC` (4 s, at least three samples), so a transient AER with live heartbeats, or a
-  blip under 4 s, never strikes a reset. An armed watch therefore lowers the effective debounce
+  classification and dirty mark, and a bad reading that began under the fast cadence must also have
+  lasted `FAST_CONFIRM_SEC` (4 s, at least three samples), so a transient AER with live heartbeats,
+  or a blip under 4 s, never strikes a reset. The bound follows the reading, not the window: it
+  still applies on the samples after the window ends (by its natural end or the storm cap), since
+  the first of them comes only `FAST_SAMPLE_SEC` after the last fast one. A reading that began after
+  the window is proved by the regular cadence as before. A chip node the sampler removed itself
+  (isolating a dead chip) moves the baseline and arms nothing. An armed watch therefore lowers the effective debounce
   from about `SAMPLE_INTERVAL_SEC` (10 s, two regular samples) to `FAST_CONFIRM_SEC` (4 s); it
   never goes lower. A chip all-ones on two consecutive samples is marked lost (I66) on the second,
   whatever the cadence; only isolation, the blackout event and the dirty mark wait for
@@ -1686,6 +1690,7 @@ refuses.
 | I79 (early off-bus watch: kernel AER/node signal samples sooner; 4 s confirm bound; lift path unchanged) | `tests/test_offbus_early_watch.py` (all: signal source, arming, early confirmation for A and B1, transient-AER and sub-bound blip debounce, housekeeping/relift cadence, no lift) |
 | I79 (no sample gap under `FAST_SAMPLE_SEC`; a storm keeps the fast cadence at most `FAST_MAX_SEC`, re-arms after a quiet window; a reset arms nothing) | `tests/test_offbus_early_watch.py::test_a_sustained_aer_storm_keeps_every_gap_and_is_capped`, `test_a_capped_storm_rearms_only_after_a_quiet_window`, `test_the_arming_edge_never_samples_sooner_than_the_fast_interval`, `test_a_reset_moves_the_baseline_without_arming` |
 | I79/I66 (two fast all-ones samples mark the chip lost before the confirm bound; one gated real read while it is pending) | `tests/test_offbus_early_watch.py::test_two_fast_all_ones_samples_mark_a_chip_lost_before_the_confirm_bound`, `test_two_fast_blackout_samples_mark_every_chip_lost_before_the_confirm_bound` |
+| I79 (the 4 s confirm bound holds across the window end and the storm cap, for the per-chip, blackout, all-gone and short-count paths; a later reading keeps the regular proof; an isolated chip's node arms nothing) | `tests/test_offbus_early_watch.py::test_the_confirm_bound_holds_across_the_end_of_a_fast_window`, `test_a_pending_chip_past_the_window_still_gets_its_real_read`, `test_a_reading_that_began_after_the_window_keeps_the_regular_proof`, `test_a_chip_the_sampler_isolated_arms_nothing_when_its_node_leaves` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

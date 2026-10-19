@@ -35,9 +35,9 @@ if TYPE_CHECKING:
 # One storm (signals less than FAST_WINDOW_SEC apart) keeps the fast cadence at most FAST_MAX_SEC
 # from its first signal; after that the regular cadence runs until the link has been quiet for
 # FAST_WINDOW_SEC. The signal itself decides nothing: the off-bus verdict is still
-# check_for_dead_chips on real samples, with the same two-sample proof, and under the fast cadence
-# the bad reading must also have lasted FAST_CONFIRM_SEC, so a transient that clears in under 4 s
-# never isolates a chip or dirties the device.
+# check_for_dead_chips on real samples, with the same two-sample proof, and a bad reading that
+# began under the fast cadence must also have lasted FAST_CONFIRM_SEC, even past the window's end,
+# so a transient that clears in under 4 s never isolates a chip or dirties the device.
 LINK_WATCH_SEC = 1.0
 FAST_SAMPLE_SEC = 2.0
 FAST_WINDOW_SEC = 30.0
@@ -322,7 +322,10 @@ class TelemetrySampler:
         if prev is None:
             return None
         why = []
-        gone = sorted(set(prev.get("chips") or ()) - set(now.get("chips") or ()), key=int)
+        # A node the sampler removed itself (isolate_dead_chips) only moves the baseline.
+        isolated = getattr(self._deps, "isolated_chips", None)
+        ours = set(isolated() if isolated is not None else ())
+        gone = sorted(set(prev.get("chips") or ()) - set(now.get("chips") or ()) - ours, key=int)
         if gone:
             why.append(f"chip node(s) {', '.join(gone)} left sysfs")
         before = prev.get("aer") or {}
@@ -370,12 +373,14 @@ class TelemetrySampler:
                 deadline = min(deadline, self._cycle_at + FAST_SAMPLE_SEC)
 
     def _lasted(self, key: str) -> bool:
-        """The second-sample proof may stand (I79). On the regular cadence the samples are already
-        SAMPLE_INTERVAL_SEC apart; on the fast cadence the bad reading must also have lasted
-        FAST_CONFIRM_SEC, so a faster cadence never shortens the debounce below that."""
-        if not self.fast_active():
-            return True
+        """The second-sample proof may stand (I79). A bad reading that began on the regular cadence
+        is already proved by samples SAMPLE_INTERVAL_SEC apart. One that began under the fast
+        cadence must also have lasted FAST_CONFIRM_SEC, even once the window has ended: the sample
+        after the last fast one still comes FAST_SAMPLE_SEC later, so the bound follows the
+        reading, not the mode, and a faster cadence never shortens the debounce below it."""
         since = self.bad_since.get(key)
+        if not self.fast_active() and (since is None or since >= self.fast_until):
+            return True
         return since is not None and self._clock() - since >= FAST_CONFIRM_SEC
 
     def _mark_bad(self, key: str) -> None:

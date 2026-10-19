@@ -473,3 +473,96 @@ async def test_two_fast_blackout_samples_mark_every_chip_lost_before_the_confirm
     await s.check_for_dead_chips(black)
     assert "all_chips_blackout" in _kinds(events)
     assert isolated == [], "a blackout never isolates"
+
+
+# --- the confirm bound holds across the end of a fast window --------------------------------------
+
+
+def _end_window(s, clock, capped: bool) -> None:
+    """Arm the watch and put the clock 1 s before the fast window ends: by its natural end
+    (FAST_WINDOW_SEC after the last signal) or by the storm cap (FAST_MAX_SEC after the first)."""
+    s.arm_fast("uncorrectable AER errors on 0000:00:01.1")
+    if capped:
+        t0 = clock.t
+        while clock.t < t0 + telemetry.FAST_MAX_SEC - telemetry.LINK_WATCH_SEC:
+            clock.t += telemetry.LINK_WATCH_SEC
+            s.arm_fast("storm")
+        assert s.fast_until == t0 + telemetry.FAST_MAX_SEC
+    clock.t = s.fast_until - 1.0
+
+
+_PATHS = {
+    # path: (expected chips, the bad sample, the event its verdict journals)
+    "per-chip": (3, {"0": LIVE, "13": DEAD, "31": LIVE}, "chip_dead"),
+    "blackout": (3, {"0": DEAD, "13": DEAD, "31": DEAD}, "all_chips_blackout"),
+    "all-gone": (3, {}, "all_chips_off_bus"),
+    "short-count": (3, {"0": LIVE, "31": LIVE}, "chips_missing"),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capped", [False, True], ids=["window-end", "storm-cap"])
+@pytest.mark.parametrize("path", list(_PATHS))
+async def test_the_confirm_bound_holds_across_the_end_of_a_fast_window(watch, monkeypatch, path, capped):
+    """A bad reading that began on a fast sample keeps the FAST_CONFIRM_SEC bound after the window
+    ends: the sample after the last fast one still comes FAST_SAMPLE_SEC later, and two samples 2 s
+    apart are never the debounce, whatever ended the window (I79: it never goes lower than 4 s)."""
+    s, clock, isolated, events = watch
+    expected, bad, verdict = _PATHS[path]
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", str(expected))
+    monkeypatch.setattr(srv, "device_op_active", "")
+    _end_window(s, clock, capped)
+
+    await s.check_for_dead_chips(bad)  # the last fast sample
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    assert not s.fast_active()
+    await s.check_for_dead_chips(bad)  # 2 s later, the window over
+    assert isolated == [], "two samples 2 s apart isolated a chip"
+    assert verdict not in _kinds(events), "two samples 2 s apart reached a verdict"
+    assert srv.fsm.state is ServerState.HEALTHY
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    await s.check_for_dead_chips(bad)  # lasted FAST_CONFIRM_SEC
+    if path == "per-chip":
+        assert isolated == ["13"]
+    else:
+        assert verdict in _kinds(events)
+        assert srv.fsm.state is not ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_pending_chip_past_the_window_still_gets_its_real_read(watch):
+    """A chip still inside the bound when the window ends is lost and owes one real heartbeat read,
+    as it would inside the window (I66)."""
+    s, clock, isolated, _ = watch
+    _end_window(s, clock, capped=False)
+    bad = {"0": LIVE, "13": DEAD, "31": LIVE}
+    await s.check_for_dead_chips(bad)
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    await s.check_for_dead_chips(bad)
+    assert chip_state.is_lost("13") and isolated == []
+    rec = chip_state._lost["13"]
+    assert rec["next"] <= rec["read"] + chip_state.PROBE_MIN_SEC
+
+
+@pytest.mark.asyncio
+async def test_a_reading_that_began_after_the_window_keeps_the_regular_proof(watch):
+    """Past the window the regular cadence is the debounce: two samples SAMPLE_INTERVAL_SEC apart
+    confirm, as they did before the watch existed."""
+    s, clock, isolated, _ = watch
+    s.arm_fast("uncorrectable AER errors on 0000:00:01.1")
+    clock.t = s.fast_until
+    bad = {"0": LIVE, "13": DEAD, "31": LIVE}
+    await s.check_for_dead_chips(bad)
+    clock.t += telemetry.SAMPLE_INTERVAL_SEC
+    await s.check_for_dead_chips(bad)
+    assert isolated == ["13"]
+
+
+def test_a_chip_the_sampler_isolated_arms_nothing_when_its_node_leaves(watch, monkeypatch):
+    """Isolating a dead chip removes its node: that removal is the broker's own act, so it moves the
+    baseline and is not a new signal. Another chip's node leaving still is."""
+    s, _, _, _ = watch
+    monkeypatch.setattr(srv, "isolated_chips", {"13"})
+    assert s.link_signal({"chips": ["0", "13", "31"], "aer": {}}) is None
+    assert s.link_signal({"chips": ["0", "31"], "aer": {}}) is None
+    assert s.link_signal({"chips": ["0"], "aer": {}}) == "chip node(s) 31 left sysfs"
