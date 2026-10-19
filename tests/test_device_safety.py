@@ -16566,6 +16566,67 @@ async def test_a_failed_startup_gate_behind_a_readopted_job_gets_the_bound_ladde
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("report", ["on", "off"])
+async def test_the_startup_verify_report_never_hides_or_delays_the_10min_hold_bound(monkeypatch, tmp_path, report):
+    """Spec 03 I76 with spec 04 I76: the startup_verify report is reporting only.
+    With the report on, /health still carries hold_bound (deadline, age, next step) beside it, and the
+    bound's ladder and then its one power cycle fire on the same ticks as with the report forced off."""
+    since, job, climbs, gate_calls, gate_heals, release_job, tick, _ = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    if report == "off":
+        monkeypatch.setattr(srv, "_startup_verify_view", lambda: None)
+    gate_heals["on"] = False
+    cycles = []
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda action, tenant_active: (True, ""))
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    ladder = srv.galaxy_recovery.escalate
+
+    async def unhealed_ladder(phase, indices, expected, log, **kw):
+        outcome = await ladder(phase, indices, expected, log, **kw)
+        return OUTCOME_WAITING if outcome == OUTCOME_RECOVERED else outcome
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", unhealed_ladder)
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    def health(sec, phase):
+        now = since + timedelta(seconds=sec)
+        body = srv._health_payload(now=now)
+        bound = body["hold_bound"]
+        assert bound is not None and bound["bound_sec"] == int(ceiling), "startup_verify hid the hold bound"
+        assert bound["deadline"] == srv._hold_bound_deadline_iso(now) is not None
+        assert body["held_age_sec"] is not None
+        if report == "on":
+            assert body["startup_verify"]["phase"] == phase and body["startup_verify"]["fault"] is False
+        else:
+            assert body["startup_verify"] is None
+        return bound
+
+    await tick(ceiling - 60)
+    assert health(ceiling - 60, "readopted_job_running")["next_step"] == "ladder"
+    await tick(ceiling + 1)  # past the bound while the job runs: only the live tenant blocks it
+    health(ceiling + 1, "readopted_job_running")
+    assert climbs == [] and cycles == []
+    job.status = srv.JobStatus.COMPLETED
+    srv.readopted_scopes.pop(job.id, None)  # its scope ended: only the startup gate is left to run
+    await tick(ceiling + 6)
+    health(ceiling + 6, "verifying")
+    assert climbs == [] and cycles == []
+    await release_job()
+    assert len(gate_calls) == 1 and srv.fsm.state is ServerState.RECOVERING
+
+    await tick(ceiling + 11)
+    assert climbs == ["present-forced"], "the bound's ladder runs on the first tick after the failed gate"
+    assert len(cycles) == 1, "then the power cycle, on the same tick, report or not"
+    assert srv._health_payload(now=since + timedelta(seconds=ceiling + 11))["startup_verify"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("ends_in", ["prelude", "ladder"])
 async def test_a_readopted_job_ending_during_a_forced_run_gets_no_reset_before_the_startup_gate(
     monkeypatch, tmp_path, ends_in
