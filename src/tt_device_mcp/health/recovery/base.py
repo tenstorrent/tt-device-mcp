@@ -1534,7 +1534,7 @@ class RecoveryMechanism:
         if cycle:
             cooldown = self.power_cycle_cooldown(now_epoch=now_epoch, ledger=ledger)
             if cooldown is not None:
-                self._fix_episode_power_cycle_deadline(cooldown, now_epoch)
+                self._fix_episode_power_cycle_deadline(cooldown, now_epoch, ledger)
                 return self._deny_power_cycle(cooldown)
             pending = self._power_cycle_still_pending(now_epoch)
             if pending is not None:
@@ -1982,8 +1982,9 @@ class RecoveryMechanism:
         """The power-cycle deadline this hold episode's first cooldown denial fixed (spec 04 I65:
         ``until``, ``set_at``, ``last``, ``cause``, ``interval_sec``), or None when none stands: no file
         or an unreadable one, fixed later than now, spent by a broker power cycle recorded since (one
-        with an unreadable stamp counts), ended by a verified release since, or more than the backoff
-        cap past its own deadline (an episode that ended unrecorded; the plain cooldown applies)."""
+        with an unreadable stamp counts only when the ledger holds more such rows than when the deadline
+        was fixed), ended by a verified release since, or more than the backoff cap past its
+        own deadline (an episode that ended unrecorded; the plain cooldown applies)."""
         try:
             rec = json.loads((health_dir() / POWER_CYCLE_DEADLINE_FILE).read_text())
             out = {
@@ -2002,22 +2003,40 @@ class RecoveryMechanism:
         verified_at = _past_epoch((self.last_verified_release() or {}).get("at_epoch"), now_epoch)
         if verified_at is not None and verified_at >= out["set_at"]:
             return None
+        unstamped = 0
         for r in ledger or []:
             if r.get("action") == "power-cycle":
                 at = _epoch(r.get("at_epoch"))
-                if at is None or out["set_at"] <= at <= now_epoch:
+                if at is None:
+                    unstamped += 1
+                elif out["set_at"] <= at <= now_epoch:
                     return None
+        try:
+            if unstamped > int(rec["unstamped_cycles"]):
+                return None
+        except (KeyError, ValueError, TypeError):
+            if unstamped:  # a record from before the count was kept: any unreadable stamp spends it
+                return None
         return out
 
-    def _fix_episode_power_cycle_deadline(self, state: dict, now_epoch: float) -> None:
+    def _fix_episode_power_cycle_deadline(
+        self, state: dict, now_epoch: float, ledger: Optional[list[dict]] = None
+    ) -> None:
         """Keep the first cooldown denial's deadline for the rest of the hold episode (spec 04 I65),
-        atomically. A deadline already fixed stays as it is. Never raises: a lost record only leaves
-        the plain cooldown, counted from the latest cycle or boot."""
+        atomically, with the count of power-cycle rows whose stamp cannot be read then. A deadline already
+        fixed stays as it is, and so does one fixed later than now (the clock went back): rewriting
+        it would re-arm the interval. Never raises: a lost record only leaves the plain cooldown,
+        counted from the latest cycle or boot."""
         if "fixed_at" in state:
             return
-        rec = {k: state[k] for k in ("until", "last", "cause", "interval_sec")}
-        rec.update(set_at=now_epoch, deadline=_local_time(state["until"]))
         path = health_dir() / POWER_CYCLE_DEADLINE_FILE
+        with contextlib.suppress(OSError, ValueError, TypeError, KeyError, AttributeError):
+            fixed_at = float(json.loads(path.read_text())["set_at"])
+            if math.isfinite(fixed_at) and fixed_at > now_epoch:
+                return
+        rec = {k: state[k] for k in ("until", "last", "cause", "interval_sec")}
+        unstamped = sum(1 for r in ledger or [] if r.get("action") == "power-cycle" and _epoch(r.get("at_epoch")) is None)
+        rec.update(set_at=now_epoch, deadline=_local_time(state["until"]), unstamped_cycles=unstamped)
         tmp = path.with_name(path.name + ".tmp")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

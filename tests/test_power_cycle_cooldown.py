@@ -610,6 +610,40 @@ def test_a_broker_cycle_with_an_unreadable_stamp_spends_the_deadline(cool, stamp
     assert m._episode_power_cycle_deadline(m.read_auto_recovery_ledger(), T0) is None
 
 
+def test_an_old_unreadable_stamp_does_not_void_a_later_deadline(cool):
+    """A cycle row the ledger could never date, there before the deadline was fixed, does not spend
+    it: only one more such row than at fixing time does (each denial would otherwise fall back to the
+    plain cooldown, re-armed per boot)."""
+    m = cool["g"].mechanism
+    rec = {"until": T0 + 60, "set_at": T0 - 1200, "last": T0 - 1740, "cause": "x", "interval_sec": 1800}
+    old = {"action": "power-cycle", "boot_id": "boot-0", "at_epoch": "garbage", "at": "x"}
+    _deadline_file().write_text(json.dumps(dict(rec, unstamped_cycles=1)))
+    _ledger(old)
+    cool["boot"].update(id="boot-B", btime=T0 - 300)
+    assert m._episode_power_cycle_deadline(m.read_auto_recovery_ledger(), T0)["until"] == T0 + 60
+    _ledger(old, dict(old, boot_id="boot-1"))
+    assert m._episode_power_cycle_deadline(m.read_auto_recovery_ledger(), T0) is None
+
+
+def test_the_first_denial_records_how_many_cycles_had_no_stamp(cool):
+    m = cool["g"].mechanism
+    _ledger({"action": "power-cycle", "boot_id": "boot-0", "at_epoch": None, "at": "x"})
+    cool["boot"].update(id="boot-B", btime=T0 - 600)
+    assert _ask(m, T0)[0] is False
+    assert json.loads(_deadline_file().read_text())["unstamped_cycles"] == 1
+
+
+def test_a_deadline_fixed_later_than_now_is_kept_not_rewritten(cool):
+    """The clock went back after a boot: the record reads as fixed in the future, so it is ignored for
+    now, but it is not overwritten with a fresh (later) deadline that would re-arm the interval."""
+    m = cool["g"].mechanism
+    rec = {"until": T0 + 900, "set_at": T0 + 600, "last": T0 - 900, "cause": "x", "interval_sec": 1800}
+    _deadline_file().write_text(json.dumps(rec))
+    cool["boot"].update(id="boot-B", btime=T0 - 600)
+    assert _ask(m, T0)[0] is False
+    assert json.loads(_deadline_file().read_text()) == rec
+
+
 def test_the_post_boot_settle_is_within_the_startup_gates_own_bound():
     from tt_device_mcp.constants import FABRIC_CHECK_TIMEOUT_SEC
 
