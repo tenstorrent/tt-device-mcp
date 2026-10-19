@@ -65,8 +65,9 @@ async def test_a_restart_hours_after_a_cycle_that_never_went_down_cycles_at_once
 
 @pytest.mark.asyncio
 async def test_inside_the_cooldown_the_hold_shows_its_deadline_and_cycles_when_it_ends(cool, monkeypatch):  # noqa: F811
-    """Restart 10 min after the second request: held to its stated end, then the watchdog asks once
-    and the cycle fires, whatever the per-boot count."""
+    """Restart 10 min after the second request: held to its stated end, with the full ladder once at
+    the hold's 10-min mark (spec 04 I73); then the watchdog asks once and the cycle fires, whatever
+    the per-boot count."""
     _replay(cool, monkeypatch, now=CYCLE_2 + 600)
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
     until = CYCLE_2 + recovery_base.power_cycle_interval_sec(2)
@@ -75,6 +76,10 @@ async def test_inside_the_cooldown_the_hold_shows_its_deadline_and_cycles_when_i
     cd = _health_cooldown(cool, monkeypatch, CYCLE_2 + 600)
     assert cd["escalation_stage"] == "power-cycle"
     assert cd["next_deadline"] == datetime.fromtimestamp(until).isoformat(timespec="seconds")
+    mark = cool["g"].mechanism._class_a_ladder_anchor_now(CYCLE_2 + 600) + recovery_base.CLASS_A_LADDER_AFTER_SEC
+    assert CYCLE_2 + 600 <= mark < until
+    assert _watchdog(cool, monkeypatch, mark - 1) == []
+    assert _watchdog(cool, monkeypatch, mark) == [mark], "the full ladder at the hold's 10-min mark"
     assert _watchdog(cool, monkeypatch, until - 1) == []
     assert _watchdog(cool, monkeypatch, until) == [until]
     cool["clk"][0] = until
