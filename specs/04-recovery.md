@@ -1304,8 +1304,10 @@ each rung fires only when the gentler one failed or cannot apply.
   wrapper's reason names the cap line ahead of any validator error line above it, so the test reads
   the cap and not an earlier line. Time to recover: classes H/J (dirty after a job) and every other
   class whose reset is followed by this verify drop by the 60 s wait when the first pass hits the
-  dispatch cap (a g15blx02 job kill on 10-17: 321 s, over the 5 min class J budget; 261 s with this);
-  no class gets slower, and the worst-case bound only shrinks.
+  dispatch cap (a galaxy job kill: 321 s, over the 5 min class J budget; 261 s with this). The
+  worst-case bound is unchanged: the 60 s wait is dropped only where its stated purpose (eth
+  training) is already proven, and a re-check that stalls again is the 77-only hold of 03 I40 with
+  or without the wait.
 
 ## Interfaces
 
