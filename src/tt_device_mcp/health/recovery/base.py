@@ -2035,7 +2035,9 @@ class RecoveryMechanism:
             if math.isfinite(fixed_at) and fixed_at > now_epoch:
                 return
         rec = {k: state[k] for k in ("until", "last", "cause", "interval_sec")}
-        unstamped = sum(1 for r in ledger or [] if r.get("action") == "power-cycle" and _epoch(r.get("at_epoch")) is None)
+        unstamped = sum(
+            1 for r in ledger or [] if r.get("action") == "power-cycle" and _epoch(r.get("at_epoch")) is None
+        )
         rec.update(set_at=now_epoch, deadline=_local_time(state["until"]), unstamped_cycles=unstamped)
         tmp = path.with_name(path.name + ".tmp")
         try:
