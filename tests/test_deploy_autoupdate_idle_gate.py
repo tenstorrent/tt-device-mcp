@@ -431,7 +431,7 @@ def _op_at_the_restart_point(tmp_path, *, op_polls):
     count = tmp_path / "op-polls"
     trace = tmp_path / "trace"
     on_sleep = (
-        f'[ -e {inhibit} ] && echo x >> {count}; '
+        f"[ -e {inhibit} ] && echo x >> {count}; "
         f'[ -e {inhibit} ] && [ "$(wc -l < {count})" -ge {op_polls} ] && rm -f {inhibit} && echo "op ended" >> {trace};'
     )
     return _drain(tmp_path, running=0, queue=0, scope=True, job_age=1600, install=start_op, on_sleep=on_sleep)
