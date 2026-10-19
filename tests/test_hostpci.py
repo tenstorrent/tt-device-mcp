@@ -45,6 +45,9 @@ def _bus(tmp_path, monkeypatch, devices):
         d.mkdir()
         (d / "vendor").write_text(spec.get("vendor", hostpci.TT_VENDOR_ID) + "\n")
         (d / "resource").write_text(spec.get("resource", HEALTHY_RESOURCE))
+        for attr in ("current_link_speed", "current_link_width"):
+            if attr in spec:
+                (d / attr).write_text(spec[attr] + "\n")
         driver = spec.get("driver")
         if driver is not None:
             target = drivers / driver
@@ -330,3 +333,29 @@ class TestVersionFloors:
         hostpci.version_floor_warnings()
 
         assert calls == [], "the version floors spawned a subprocess"
+
+
+@pytest.mark.parametrize(
+    "link, down",
+    [
+        ({"current_link_speed": "Unknown", "current_link_width": "63"}, True),
+        ({"current_link_speed": "Unknown"}, True),
+        ({"current_link_speed": "16.0 GT/s PCIe", "current_link_width": "63"}, True),
+        ({"current_link_speed": "16.0 GT/s PCIe", "current_link_width": "16"}, False),
+        ({"current_link_speed": "2.5 GT/s PCIe", "current_link_width": "1"}, False),  # degraded, not down
+        ({}, False),  # unreadable: no evidence
+    ],
+)
+def test_a_link_that_reads_down_fails_the_verdict(tmp_path, monkeypatch, link, down):
+    """A dead link reads all-ones from config space: speed Unknown, width 63. Its node is still
+    listed and its driver still bound, so only the link read shows it is off the bus."""
+    _bus(
+        tmp_path,
+        monkeypatch,
+        {"0000:31:00.0": {"driver": "tenstorrent", **link}, "0000:4b:00.0": {"driver": "tenstorrent"}},
+    )
+    assert hostpci.link_down("0000:31:00.0") is down
+    ok, detail, _ = hostpci.host_pci_verdict()
+    assert ok is (not down), detail
+    if down:
+        assert "PCIe link down on 1/2: 0000:31:00.0" in detail

@@ -21,9 +21,10 @@ followed no reset.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitors import fabric
@@ -41,6 +42,15 @@ class FabricDebt:
         # failed pass): a hold lifts only on one that is fresh and newer than its latest fault (spec 03
         # I78).
         self.pass_monotonic: float = 0.0
+        # Run on every settle (owed -> clear): see add_settle_listener.
+        self._settle_listeners: "list[Callable[[], None]]" = []
+
+    def add_settle_listener(self, callback: "Callable[[], None]") -> None:
+        """Run ``callback()`` every time a healthy fabric pass settles an owed debt, for the life of
+        the process. An operator reset never leaves HEALTHY, so this is the moment its verify passed.
+        Must be cheap and thread-safe; a raise is logged and dropped."""
+        if callback not in self._settle_listeners:
+            self._settle_listeners.append(callback)
 
     def note_reset(self, what: str) -> None:
         """A reset (or a broker start) happened: the fabric is unproven until a pass clears it.
@@ -59,6 +69,11 @@ class FabricDebt:
         if ok is True and self.owed:
             health_event("post_reset_fabric_settled", reset=self.owed)
             self.owed = ""
+            for listener in list(self._settle_listeners):
+                try:
+                    listener()
+                except Exception:  # noqa: BLE001 - a settle hook must never break the verdict
+                    logging.getLogger(__name__).exception("fabric settle listener failed")
 
     def note_evidence(self, evidence: Optional[dict]) -> None:
         """Fold the fabric verdict of a verify pass's evidence in, when that pass ran one."""
