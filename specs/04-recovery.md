@@ -1181,9 +1181,12 @@ each rung fires only when the gentler one failed or cannot apply.
   and host rung ignore it, no env or config switches the bound off, and the boot rung inventory's
   `RUNG OFF forced-escalation` warning says so. `/health` carries `hold_bound` while a hold is open:
   `bound_sec`, `deadline`, `held_age_sec`, `next_step` (`ladder`, `power-cycle` or
-  `tenant_blocked` with `blocked_by`) and, while the host rung waits on it, `cooldown_until`. One helper, `hold_bound_deadline()`, gives the open
+  `tenant_blocked` with `blocked_by`, or on a startup hold behind a re-adopted job `readopted_job`
+  and then `startup_check`, spec 03 I75) and, while the host rung waits on it, `cooldown_until`. One helper, `hold_bound_deadline()`, gives the open
   hold's escalation deadline for every hold kind: its start + the ceiling, or the end of a running
-  power-cycle cooldown when that is later; `/health`'s `deadline` and the stuck-hold event's and
+  power-cycle cooldown when that is later; for a `startup_unverified` hold behind a re-adopted
+  job, none while the job runs and at least its end + `STARTUP_VERIFY_DEFER_MAX_SEC` after it
+  (spec 03 I75: the job's run time is service, not hold); `/health`'s `deadline` and the stuck-hold event's and
   alert's `escalation_deadline` all read it. A stuck-hold event past the bound reports `escalated`
   true once the bound ran a ladder or asked for the host rung. Time to the power-cycle request for a
   hold no class path heals (e.g. a topology-mismatch or 77-only hold, class D): at most 600 s +

@@ -16565,6 +16565,166 @@ async def test_a_failed_startup_gate_behind_a_readopted_job_gets_the_bound_ladde
     assert climbs == ["present-forced"] and len(cycles) == 1, "the hold was driven twice"
 
 
+def _arm_unhealed_power_cycle(monkeypatch, healed=False):
+    """The power-cycle rung as the existing I75/I76 tests stub it, with the bound ladder's full check
+    after its reset failing unless ``healed``. Returns the power-cycle requests."""
+    cycles = []
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda action, tenant_active: (True, ""))
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    ladder = srv.galaxy_recovery.escalate
+
+    async def ladder_then_check(phase, indices, expected, log, **kw):
+        outcome = await ladder(phase, indices, expected, log, **kw)
+        if outcome == OUTCOME_RECOVERED and healed:
+            fsm_healthy(srv)  # the full check after the ladder's reset passed
+            return outcome
+        return OUTCOME_WAITING if outcome == OUTCOME_RECOVERED else outcome  # its full check failed
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", ladder_then_check)
+    return cycles
+
+
+def _ended_ago(job, sec):
+    job.status = srv.JobStatus.COMPLETED
+    job.finished_at = (datetime.now() - timedelta(seconds=sec)).isoformat()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("check", ["passes", "fails", "fails_after_the_ladder_too"])
+async def test_replay_a_20_min_readopted_job_then_the_startup_check(monkeypatch, tmp_path, check):
+    """Spec 03 I75 with spec 04 I76 (ordering of 10-17): a broker restart re-adopted a job that runs
+    20 min. Its run time is service, not hold: the bound neither pages nor names the broker's own job
+    as a tenant while it runs, and /health shows no deadline yet. At its end the startup gate's full
+    check runs first. A pass releases the device with no ladder. A failure gets the bound's ladder on
+    the next tick, once; when the full check after it fails too, one power-cycle request. Fails on base,
+    which paged hold_bound_tenant_blocked over the broker's own re-adopted job at the 10-min mark."""
+    since, job, climbs, gate_calls, gate_heals, release_job, tick, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    gate_heals["on"] = check == "passes"
+    cycles = _arm_unhealed_power_cycle(monkeypatch, healed=check == "fails")
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    for sec in (ceiling + 1, ceiling + 300, 2 * ceiling - 1):  # the job runs for 20 min
+        await tick(sec)
+    assert climbs == [] and cycles == []
+    assert "hold_bound_tenant_blocked" not in [k for k, _ in events], "the job's run time paged as hold"
+    health = srv._hold_bound_health(since + timedelta(seconds=2 * ceiling - 1))
+    assert health["next_step"] == "readopted_job" and health["deadline"] is None
+
+    _ended_ago(job, 0)
+    health = srv._hold_bound_health()
+    assert health["next_step"] == "startup_check"
+    deadline = datetime.fromisoformat(health["deadline"])
+    assert deadline <= datetime.now() + timedelta(seconds=srv.STARTUP_VERIFY_DEFER_MAX_SEC + 1)
+    await release_job()
+    assert gate_calls == [("startup", True, True, [])], "the full check, fabric included, runs first"
+
+    for sec in (2 * ceiling + 11, 2 * ceiling + 21, 3 * ceiling - 1):
+        await tick(sec)
+    if check == "passes":
+        assert srv.fsm.state is ServerState.HEALTHY and climbs == [] and cycles == []
+    elif check == "fails":
+        assert climbs == ["present-forced"] and cycles == [], "one ladder; its passing check asks for no cycle"
+        assert srv.fsm.state is ServerState.HEALTHY
+    else:
+        assert climbs == ["present-forced"] and len(cycles) == 1, "one ladder, then one power-cycle request"
+
+
+@pytest.mark.asyncio
+async def test_a_hung_startup_check_gets_the_ladder_by_its_bound_after_the_readopted_jobs_end(monkeypatch, tmp_path):
+    """Spec 03 I75 / 04 I76: a startup check that hangs after a 20 min re-adopted job holds the ladder
+    off only until STARTUP_VERIFY_DEFER_MAX_SEC (420 s) after the job's end, inside 10 min of it."""
+    since, job, climbs, _, _, _, tick, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    cycles = _arm_unhealed_power_cycle(monkeypatch)
+    ceiling = srv._stuck_hold_ceiling_sec()
+    await tick(2 * ceiling - 1)
+    started, stuck = asyncio.Event(), asyncio.Event()
+
+    async def hung_gate(*a, **kw):
+        started.set()
+        await stuck.wait()
+
+    monkeypatch.setattr(srv, "_device_health_gate", hung_gate)
+    _ended_ago(job, 0)
+    srv.readopted_scopes.clear()
+    await started.wait()
+    try:
+        await tick(2 * ceiling + 1)
+        assert climbs == [], "the startup check runs first"
+        assert srv.STARTUP_VERIFY_DEFER_MAX_SEC < 600
+        monkeypatch.setattr(srv, "_startup_verify_ready_at", time.monotonic() - srv.STARTUP_VERIFY_DEFER_MAX_SEC - 1)
+        await tick(2 * ceiling + srv.STARTUP_VERIFY_DEFER_MAX_SEC + 1)
+        assert climbs == ["present-forced"] and len(cycles) == 1
+    finally:
+        stuck.set()
+        await srv._startup_verify_task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", ["fails", "never_runs"])
+async def test_replay_a_1_min_readopted_job_whose_startup_check_fails_or_never_runs(monkeypatch, tmp_path, gate):
+    """The 10-17 06:27-06:41 PDT episode: a broker restart re-adopted a live job that ended after 1 min.
+    The startup hold then stood 12m50s with no ladder at the 10-min mark. Now: the startup check runs as
+    soon as the job ends; when it fails, or never runs because the job's scope outlives the job (a killed
+    job still exiting), the bound's ladder runs no later than 10 min after the job's end, and a full
+    check that still fails after it asks for one power cycle. Fails on base for ``never_runs``: the I75
+    stand-down had no clock until the gate stopped waiting on the scope, so it kept the ladder off."""
+    since, job, climbs, gate_calls, gate_heals, release_job, tick, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    gate_heals["on"] = False
+    cycles = _arm_unhealed_power_cycle(monkeypatch)
+    ceiling = srv._stuck_hold_ceiling_sec()
+    job_end = 60
+    if gate == "fails":
+        _ended_ago(job, 0)
+        await release_job()
+        assert gate_calls == [("startup", True, True, [])]
+    else:
+        job.status = srv.JobStatus.KILLED  # its scope is still exiting: the gate keeps waiting on it
+    await tick(job_end + 300)
+    assert climbs == [] and cycles == []
+
+    if gate == "never_runs":
+        _ended_ago(job, ceiling - job_end + 1)
+    await tick(ceiling + 1)  # 9 min after the job's end
+    assert climbs == ["present-forced"], "no ladder by 10 min after the re-adopted job's end"
+    assert len(cycles) == 1, "the full check after the ladder failed: one power-cycle request"
+    await tick(ceiling + 21)
+    await tick(2 * ceiling - 1)
+    assert climbs == ["present-forced"] and len(cycles) == 1, "the hold was driven twice"
+    if gate == "never_runs":
+        assert gate_calls == []
+        srv.readopted_scopes.clear()
+        await srv._startup_verify_task
+
+
+@pytest.mark.asyncio
+async def test_a_fault_hold_from_before_the_restart_keeps_its_clock_behind_a_readopted_job(monkeypatch, tmp_path):
+    """Spec 04 I76 (ordering of 10-17): a fault hold open before the restart keeps its original start.
+    A re-adopted job that ended does not restart its clock or hand it to the startup gate: the ladder
+    runs at 10 min from the original start, then one power cycle; /health shows that deadline."""
+    since, job, climbs, _, _, _, tick, events = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    fsm_dirty(srv, "gate: eth/fabric fault before the restart", why="gate_error")
+    cycles = _arm_unhealed_power_cycle(monkeypatch)
+    ceiling = srv._stuck_hold_ceiling_sec()
+    _ended_ago(job, 0)  # the restart re-adopted a job; its scope is still exiting
+    assert srv._hold_bound_health(since)["deadline"] == (since + timedelta(seconds=ceiling)).isoformat()
+    await tick(ceiling - 1)
+    assert climbs == []
+    await tick(ceiling + 1)
+    assert climbs == ["present-forced"] and len(cycles) == 1
+    assert ("stuck_hold_deferred", "startup_verify") not in events
+    srv.readopted_scopes.clear()
+    await srv._startup_verify_task
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ends_in", ["prelude", "ladder"])
 async def test_a_readopted_job_ending_during_a_forced_run_gets_no_reset_before_the_startup_gate(

@@ -7104,7 +7104,8 @@ async def _force_escalate_stuck_hold() -> None:
             logger.error(f"HOLD-DEADLINE-ESCALATE {msg}")
 
     kind = device_hold_escalation_kind  # the window this run claimed; the sampler may rewrite the global
-    past_bound = _hold_age_now() >= _stuck_hold_ceiling_sec()
+    # A job re-adopted onto the startup hold is service, not hold: the bound counts from its end (I75).
+    past_bound = _hold_age_now() >= _stuck_hold_ceiling_sec() and not _readopted_job_serves_startup_hold()
     if device_hold_tenant_deferred or (kind == "hold_bound_cycle" and _hold_bound_rung_pending):
         blocker = await asyncio.to_thread(_bound_tenant_blocker, past_bound)
         if blocker is not None:
@@ -7133,7 +7134,7 @@ async def _force_escalate_stuck_hold() -> None:
         # Spec 04 I76: from the 10-min bound on, no 77, latch or no-reset class keeps the ladder (and
         # the host rung after it) from running. Below the bound the faster class paths stay as they are.
         held_age = _hold_age_now()
-        bound = held_age >= _stuck_hold_ceiling_sec()
+        bound = held_age >= _stuck_hold_ceiling_sec() and not _readopted_job_serves_startup_hold()
         if _fabric_77_only_hold() and not bound:
             return  # a pass that could not run is never reset for; the idle relift re-runs it
         if _host_action_blocks_escalation():
@@ -7545,13 +7546,22 @@ def _hold_escalated_report() -> bool:
 def hold_bound_deadline(now: Optional[datetime] = None) -> Optional[datetime]:
     """When the open hold escalates under the 10-min bound (spec 04 I76), whatever its kind: the hold's
     start + the stuck-hold ceiling, or the end of a running power-cycle cooldown (I65), whichever is
-    later. None when nothing is held or the episode clock cannot be read."""
-    if not device_hold_episode_since:
+    later. A startup hold behind a re-adopted job (spec 03 I75) has none while the job runs, and while the
+    startup gate still has it, the later of that and the job's end + STARTUP_VERIFY_DEFER_MAX_SEC: the
+    gate's full check runs first, the ladder no later than that. None when nothing is held or the
+    episode clock cannot be read."""
+    if not device_hold_episode_since or _readopted_job_serves_startup_hold():
         return None
     try:
         deadline = datetime.fromisoformat(device_hold_episode_since) + timedelta(seconds=_stuck_hold_ceiling_sec())
     except ValueError:
         return None
+    if _startup_verify_owns_hold():
+        ended = _readopted_jobs_end()
+        if ended is not None:
+            deadline = max(
+                deadline, ended.replace(tzinfo=deadline.tzinfo) + timedelta(seconds=STARTUP_VERIFY_DEFER_MAX_SEC)
+            )
     cd = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
     if cd and cd.get("until") and cd["until"] > (now.timestamp() if now else time.time()):
         deadline = max(deadline, datetime.fromtimestamp(cd["until"], deadline.tzinfo))
@@ -7577,6 +7587,10 @@ def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
     # After the bound's ladder, the host rung is next: now, or at the end of the cooldown it waits on.
     step = "power-cycle" if lad is not None and (cooling or cyc is None or cyc < lad) else "ladder"
     out = {"bound_sec": int(ceiling), "deadline": deadline, "held_age_sec": int(age), "next_step": step}
+    if _readopted_job_serves_startup_hold():
+        out["next_step"] = "readopted_job"  # spec 03 I75: the bound counts from the job's end
+    elif _startup_verify_owns_hold():
+        out["next_step"] = "startup_check"  # spec 03 I75: the full check first, the ladder if it fails
     if _hold_bound_tenant_blocker is not None:
         # The one hold past the bound with no deadline of its own: it waits for the tenant to leave.
         out["next_step"] = "tenant_blocked"
@@ -11693,8 +11707,51 @@ def _startup_verify_owns_hold(kind: Optional[str] = None) -> bool:
         return False
     if isolated_chips or any(j.status == JobStatus.RUNNING for j in jobs.values()):
         return False
-    ready = _startup_verify_ready_at
-    return ready is None or time.monotonic() - ready < STARTUP_VERIFY_DEFER_MAX_SEC
+    waited = _startup_verify_waited_sec()
+    return waited is None or waited < STARTUP_VERIFY_DEFER_MAX_SEC
+
+
+def _startup_verify_waited_sec(now: Optional[datetime] = None) -> Optional[float]:
+    """Seconds since the re-adopted jobs ended, by which the I75 stand-down is bounded: from when the
+    startup gate stopped waiting on their scopes, or, while it still waits on a scope that outlives its
+    job (a killed job's scope still exiting), from that job's ``finished_at``. Without that second clock
+    a scope that never ended kept the stand-down, and so the 10-min bound's ladder, off the hold for
+    good. None while no re-adopted job's end is known."""
+    ended = _readopted_jobs_end()
+    return None if ended is None else ((now or datetime.now()) - ended).total_seconds()
+
+
+def _readopted_jobs_end() -> Optional[datetime]:
+    """When the re-adopted jobs ended, for the I75 stand-down's bound: the startup gate's own clock once
+    it stopped waiting on their scopes, else the jobs' ``finished_at``; None while unknown."""
+    if _startup_verify_ready_at is not None:
+        return datetime.now() - timedelta(seconds=time.monotonic() - _startup_verify_ready_at)
+    return _readopted_jobs_ended_at()
+
+
+def _readopted_jobs_ended_at() -> Optional[datetime]:
+    """When the last job re-adopted by this broker start whose scope has not been reaped yet ended
+    (its ``finished_at``), or None when none is known to have ended or one still runs."""
+    ended: Optional[datetime] = None
+    for jid in readopted_scopes:
+        job = jobs.get(jid)
+        if job is None or job.status == JobStatus.RUNNING or not job.finished_at:
+            return None
+        try:
+            at = datetime.fromisoformat(job.finished_at)
+        except ValueError:
+            return None
+        ended = at if ended is None or at > ended else ended
+    return ended
+
+
+def _readopted_job_serves_startup_hold() -> bool:
+    """True while a job this broker start re-adopted still runs on the startup hold (spec 03 I75). Its
+    run time is service, not hold: no reset runs under a live job (issue #3), so that hold's 10-min
+    bound (spec 04 I76) counts from the job's end, not from the broker start."""
+    if fsm.state is not ServerState.RECOVERING or fsm.record.why != "startup_unverified":
+        return False
+    return any(jid in jobs and jobs[jid].status == JobStatus.RUNNING for jid in readopted_scopes)
 
 
 async def _await_startup_prerequisites(missing: str) -> None:
