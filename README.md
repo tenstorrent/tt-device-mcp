@@ -148,6 +148,28 @@ Environment="TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK=/usr/local/bin/drain-jobs --reas
 Environment=TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC=300
 ```
 
+## Reading chip state from other tools
+
+A read of a chip's sysfs telemetry (`/sys/class/tenstorrent/*/tt_*`) is a PCIe
+read of the chip. On a chip that has left the bus, hung, or is being reset, it
+can stall a CPU core, and many such reads can take the host down. Tools that
+poll those files should check the broker's published chip state first:
+`/run/tt-device-broker/chip-state.json` (world-readable, replaced atomically).
+
+```json
+{"version": 1, "pid": 1234, "recovering": false, "lost": ["7"],
+ "chips": {"0": {"lost": false, "recovering": false},
+           "7": {"lost": true, "recovering": false,
+                 "lost_since": "2026-01-01T12:00:00", "lost_reason": "..."}}}
+```
+
+- Do not read a chip whose `lost` or `recovering` is true. While the top-level
+  `recovering` is true, a reset owns every chip: read none of them.
+- Trust the file only while the process `pid` is alive; a stale file from a
+  stopped broker says nothing about the chips now.
+- The same fields are on `/health` (`lost_chips`, `recovering`,
+  `resetting_chips`).
+
 ## Slurm
 
 The health gate is also reachable from outside the queue, as two root-only REST
