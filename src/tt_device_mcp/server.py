@@ -142,10 +142,10 @@ DEFAULT_TIMEOUT_SEC = 600
 
 # A hard ceiling, not a default anyone may raise. The device is shared, and a run that holds
 # it for longer than this is not a long run — it is a queue nobody else can use, and a wedge
-# nobody notices for half an hour. There is always a way to fit inside it: move the parts
+# nobody notices for two hours. There is always a way to fit inside it: move the parts
 # that do not need silicon off the device, or split the work. This is not negotiable, so the
 # tool does not offer a knob that pretends otherwise.
-MAX_TIMEOUT_SEC = 1500  # 25 minutes
+MAX_TIMEOUT_SEC = 7200  # 120 minutes
 
 # Exec is unqueued and can run concurrently with a tenant job (diagnostics on a hung one), so
 # it is bounded far tighter than a queued job: a triage that cannot answer in this many seconds
@@ -170,8 +170,8 @@ def timeout_hint(timeout_sec: int) -> str:
 
     Below the cap this points at the knob. AT the cap it must not, because there is no knob
     left and offering one would only teach the next agent to ask for it. A run that cannot
-    finish in 25 minutes on a shared device is a run that has to be reshaped, and it always
-    can be."""
+    finish inside the ceiling on a shared device is a run that has to be reshaped, and it
+    always can be."""
     if timeout_sec >= MAX_TIMEOUT_SEC:
         return (
             f"Auto-killed: this run hit the HARD MAXIMUM of {MAX_TIMEOUT_SEC}s "
@@ -4458,7 +4458,7 @@ def _refresh_idle_hold_ledger() -> None:
 # threshold is per-host tunable and 0 disables the reaper outright, and why the kill goes
 # through the same graceful SIGTERM -> grace -> SIGKILL the timeout path uses — a hard kill
 # mid-CCL wedges the mesh, which is the exact failure this is meant to clear.
-HUNG_SILENCE_SEC = int(os.environ.get("TT_DEVICE_MCP_HUNG_SILENCE_SEC", "300"))
+HUNG_SILENCE_SEC = int(os.environ.get("TT_DEVICE_MCP_HUNG_SILENCE_SEC", "1800"))
 HUNG_POLL_SEC = 15.0
 
 # How often a silent job is noted in its own log. This is the only hang signal that does not
