@@ -337,14 +337,21 @@ fi
 echo "$remote_sha" > "$STATE"
 
 systemctl restart tt-device-broker
-echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
+restart_rc=$?
+if [ "$restart_rc" -eq 0 ]; then
+    echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
+else
+    echo "autoupdate: broker restart at ${remote_sha:0:9} failed (rc=$restart_rc, via $src_desc)" >&2
+fi
 
 # One line in the broker's event journal (same fields as health_event(): ts, iso, kind), so a restart
-# the update caused is traceable without the systemd journal. A single O_APPEND write of one short
-# line, by root like the broker; a failed write only warns, the apply is already done.
-EVENTS="${TTDEV_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
+# the update caused is traceable without the systemd journal. restart_rc is the restart's exit code:
+# a failed restart is recorded as such, not as a clean apply. Same journal dir as the broker
+# (TT_DEVICE_MCP_HEALTH_DIR, else root's default). A single O_APPEND write of one short line, by
+# root like the broker; a failed write only warns, the apply is already done.
+EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
 now="$(date +%s.%N)"
-printf '{"ts": %s, "iso": "%s", "kind": "autoupdate_apply", "from_sha": "%s", "to_sha": "%s", "idle": %s, "drained_s": %s}\n' \
-    "$now" "$(date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ)" "$installed_sha" "$remote_sha" "$idle" "$drained_s" \
+printf '{"ts": %s, "iso": "%s", "kind": "autoupdate_apply", "from_sha": "%s", "to_sha": "%s", "idle": %s, "drained_s": %s, "restart_rc": %s}\n' \
+    "$now" "$(date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ)" "$installed_sha" "$remote_sha" "$idle" "$drained_s" "$restart_rc" \
     >> "$EVENTS" 2>/dev/null \
     || echo "autoupdate: warning: could not append autoupdate_apply to $EVENTS" >&2
