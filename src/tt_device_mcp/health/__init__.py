@@ -19,6 +19,9 @@ both files) — every name either of them needs from here is either:
 
 from __future__ import annotations
 
+# The per-chip lost/recovering gate in front of every poller read of a chip (spec 03 I66).
+from tt_device_mcp.health import chip_state
+
 # The operator's AICLK ceiling state: server.py re-applies it at broker start and at the job door,
 # marks it owed when a job ends, and must be able to kill its helper on the dead-chip path.
 from tt_device_mcp.health.aiclk_ceiling import CEILING
@@ -55,6 +58,7 @@ from tt_device_mcp.health.monitors.heartbeat import (
     dead_chips,
     heartbeat_supported,
     heartbeat_verdict,
+    offbus_chip_ids,
     offbus_count,
     read_heartbeats,
     returned_chips,
@@ -173,8 +177,10 @@ __all__ = [
     "eth",
     "fabric",
     "ALL_ONES",
+    "chip_state",
     "dead_chips",
     "arc_not_ready_chips",
+    "offbus_chip_ids",
     "offbus_count",
     "returned_chips",
     "heartbeat_supported",
