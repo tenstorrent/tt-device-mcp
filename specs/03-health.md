@@ -119,7 +119,12 @@ cooldown (spec 04 I65) holds longer.
   ratchets up; an unreadable baseline file fails closed to a nonzero expectation (its existence
   proves the host has shown chips).
 - **I12 — The fabric traffic pass never runs on a submitter's clock.** Pre-job the gate never
-  runs it, dirty or not — the flag is already the answer. It runs post-job on a failed job
+  runs it, dirty or not — the flag is already the answer — with one stated exception: a held,
+  dirty device whose lift I78 would refuse (no passing full check fresher than 300 s and newer
+  than the hold's fault) runs one full check, fabric included, in the pre-job gate (~45-100 s),
+  and only once the 1G hugepages exist; without it the funnel refuses the gate's release on every
+  job and the hold waits for the 10-min bound (spec 04 I76). A HEALTHY mesh, a clean hold, a dirty
+  hold with a fresh pass and a host with no fabric check keep the fast pre-job path. It runs post-job on a failed job
   (forced, unless I36 or I38 lets a fresh green pass stand in), at startup (forced), inside the recovery ladder, after an operator's reset of a mesh
   (spec 04 I13 — the operator's clock, not a submitter's), on a `run_fabric` caller only when
   no pass is fresher than `FABRIC_CHECK_MIN_INTERVAL_SEC` (default 1200s), and post-job on a
@@ -1080,7 +1085,23 @@ cooldown (spec 04 I65) holds longer.
   cause has gone pays the full check (~45-100 s) before it lifts; a 77-only hold past the I40 bound
   climbs the ladder instead of a release on the startup checks; a missing-link or topology hold
   never lifts on a check that skipped the fabric, so it reaches the power cycle at the 10-min bound
-  instead of a lift that fails the next job. No added time between jobs on a healthy mesh.
+  instead of a lift that fails the next job. No added time between jobs on a healthy mesh. Per
+  class (the full check is ~45-100 s; the idle relift paces at `SELFHEAL_RELIFT_INTERVAL_SEC`,
+  120 s; any check that ends with no pass hands the hold to the 10-min ladder, then the power cycle,
+  spec 04 I76):
+
+  | Class | Before I78 | With I78 |
+  |---|---|---|
+  | eth_frozen hold, cause gone | lift on enum+ARC+eth read on the next relift (≤120 s + ~2 s) | next relift + one full check (≤120 s + ~45-100 s) |
+  | off-bus floor, chip back, privsep host | next relift + one full check (≤120 s + ~45-100 s) | unchanged |
+  | off-bus floor, chip back, non-privsep host with a fabric check configured | lift on enum+ARC re-read (≤120 s + ~2 s) | next relift + one full check (≤120 s + ~45-100 s); a pass that cannot run there holds to the 10-min ladder |
+  | off-bus floor, chip back, no fabric check (one chip, none configured) | ≤120 s + ~2 s | unchanged: nothing more can be proven there |
+  | dirty hold, jobs queued, pre-job gate, no fresh pass | lift on the light pre-job verify, no fabric pass (~2-60 s) | one full check in the gate (~45-100 s), after hugepages (I12 exception); without it, a refused lift up to the 10-min bound |
+  | dirty hold, post-job gate | one full check (~45-100 s) | unchanged |
+  | release whose last pass is older than 300 s or older than the fault | lifted on that pass (+0 s) | one more full check (+~45-100 s) |
+  | release whose fresh pass is ≤300 s old and newer than the fault | +0 s | +0 s |
+  | foreign holder gone, hugepages still filling (after a boot) | lift on the pre-job verify (~2 s) | waits for the 1G pool (re-read on each relift, 120 s apart), then one full check; bounded by the 10-min ladder and its 300 s check window (spec 04 I76) |
+  | foreign holder gone, hugepages ready | ~2 s | one full check (~45-100 s) |
 
 ## Interfaces
 
@@ -1412,8 +1433,10 @@ Normative points the diagram compresses:
 
 - The gate reads the FSM's coming-in state once per pass (`dirty`, reason, job) and never
   re-derives it mid-pass.
-- `full` (run the fabric pass) is `with_recover and (not pre-job) and (dirty or force_fabric or
-  (run_fabric and stale))` — I12, I29; a failed job that never reached the device clears
+- `full` (run the fabric pass) is `with_recover and not kill_reset and (held_unproven or ((not
+  pre-job) and (dirty or force_fabric or (run_fabric and stale) or post_reset_debt)))` — I12, I29;
+  `held_unproven` is pre-job on a dirty hold whose lift I78 would refuse, once the 1G hugepages
+  exist (I12's one exception); a failed job that never reached the device clears
   `force_fabric` first when a fresh green pass stands in (I36), and so does a clean exit-1 failure
   inside `EXIT1_FABRIC_WINDOW_SEC` (I38). A clean post-job or post-step exit pays no fabric pass;
   when the eth rung is armed it pays the passive eth read instead (~1s, the read bounded at 10s),
@@ -1560,7 +1583,8 @@ refuses.
   perturbation the broker aims at the mesh (a host was lost with one in flight), so it runs where
   it costs no submitter and no healthy silicon: post-job on failure (not after a fresh green
   pass when the job never reached the device, I36, nor inside the exit-1 window, I38), post-job on a clean exit
-  whose eth read reached no verdict (I30), startup, ladder, stale-window — never pre-job (I12),
+  whose eth read reached no verdict (I30), startup, ladder, stale-window — never pre-job (I12;
+  the one exception is a held, dirty device whose lift I78 would refuse),
   never on a frozen core (I9), never as a relift default (I22).
 - **Asymmetric error costs** (`health.core.Verdict`): a needless reset of an idle device costs
   ~60s; a missed wedge costs everyone on the box. So a broken check is UNHEALTHY, not
@@ -1593,7 +1617,7 @@ refuses.
 | I9 AER totals do not double-count the kernel's own TOTAL_ERR line | `tests/test_device_safety.py::test_sum_aer_does_not_double_count_the_kernels_own_total` |
 | I10 | `tests/test_monitor.py::test_status_never_blocks_before_the_first_update`, `tests/test_monitor.py::test_update_overwrites_readings` |
 | I11 | `tests/test_device_safety.py::test_a_mesh_that_lost_chips_does_not_lower_its_own_bar`, `tests/test_device_safety.py::test_expected_chip_count_survives_an_unreadable_baseline`, `tests/test_device_safety.py::test_an_unreadable_baseline_with_no_chips_present_is_not_read_as_device_less`, `tests/test_device_safety.py::test_a_host_with_no_baseline_and_no_chips_stays_device_less` |
-| I12 | `tests/test_device_safety.py::test_the_pre_job_gate_never_runs_the_slow_fabric_pass`, `tests/test_device_safety.py::test_a_clean_job_does_not_pay_for_a_fabric_pass`, `tests/test_device_safety.py::test_a_failed_job_forces_a_fabric_pass_even_inside_the_quiet_window`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[540-False]`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[660-True]`, `tests/test_device_safety.py::test_fabric_interval_defaults_to_twenty_minutes`, `tests/test_reset.py::test_an_operator_reset_on_a_mesh_releases_only_on_a_fabric_pass` |
+| I12 | `tests/test_device_safety.py::test_the_pre_job_gate_never_runs_the_slow_fabric_pass`, `tests/test_device_safety.py::test_a_clean_job_does_not_pay_for_a_fabric_pass`, `tests/test_device_safety.py::test_a_failed_job_forces_a_fabric_pass_even_inside_the_quiet_window`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[540-False]`, `tests/test_device_safety.py::test_gate_fabric_pass_respects_the_stale_interval[660-True]`, `tests/test_device_safety.py::test_fabric_interval_defaults_to_twenty_minutes`, `tests/test_reset.py::test_an_operator_reset_on_a_mesh_releases_only_on_a_fabric_pass`, `tests/test_hold_lift_gate.py::test_a_dirty_hold_with_no_fresh_pass_runs_the_full_check_pre_job`, `tests/test_hold_lift_gate.py::test_a_dirty_hold_with_a_fresh_pass_pays_no_fabric_pass_pre_job`, `tests/test_hold_lift_gate.py::test_a_healthy_mesh_pays_no_fabric_pass_pre_job`, `tests/test_hold_lift_gate.py::test_the_pre_job_full_check_waits_for_hugepages` |
 | I13 | `tests/test_readopt.py::test_startup_hold_names_the_foreign_holder_blocking_the_verify`, `tests/test_device_safety.py::test_governor_never_reboots_over_a_tenant`, `tests/test_device_safety.py::test_a_tenant_arriving_before_the_reboot_decision_blocks_it`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_under_a_foreign_tenant`, `tests/test_device_safety.py::test_the_gate_skips_over_a_scoped_service_account_holder` |
 | I14 | `tests/test_device_safety.py::test_an_empty_dev_dir_on_a_host_that_expects_chips_holds_not_releases`, `tests/test_device_safety.py::test_a_device_less_host_never_reads_an_empty_sysfs_as_a_drop` |
 | I15 | `tests/test_device_safety.py::test_an_unverified_clear_holds_the_device`, `tests/test_device_safety.py::test_a_gate_that_errored_holds`, `tests/test_device_safety.py::test_a_clean_device_is_not_held_by_an_unverified_clear`, `tests/test_device_safety.py::test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace`, `tests/test_device_safety.py::test_a_verified_clear_names_itself_and_records_it_was_verified` |
@@ -1731,7 +1755,7 @@ refuses.
 | I75 | `tests/test_device_safety.py::test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_gate_not_reset`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_next_tick`, `tests/test_device_safety.py::test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladder`, `tests/test_device_safety.py::test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate` |
 | I75 (the stand-down is re-read under the lock and at the ladder's tenant check: a job ending mid-run gets no reset before the gate) | `tests/test_device_safety.py::test_a_readopted_job_ending_during_a_forced_run_gets_no_reset_before_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_after_a_job_ended_during_a_forced_run_escalates_next_tick`, `tests/test_device_safety.py::test_idle_relift_gives_no_reset_when_the_readopted_job_ends_inside_the_ladder`, `tests/test_ladder_v2.py::test_the_i75_stand_down_blocks_only_inside_the_escalate_that_carries_it`, `tests/test_ladder_v2.py::test_escalate_carries_the_stand_down_only_for_its_own_run`, `tests/test_classac_power_cycle_direct.py::test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant` |
 | I75 (a running re-adopted job still defers on `job_running`; off-bus and non-rearmable forced kinds never wait on the gate; a failed gate gets the I76 ladder then one power cycle) | `tests/test_device_safety.py::test_a_running_readopted_job_still_defers_the_startup_hold_on_job_running`, `tests/test_device_safety.py::test_idle_relift_meets_a_running_readopted_job_on_job_running`, `tests/test_device_safety.py::test_an_offbus_startup_hold_keeps_its_one_shot_while_the_startup_gate_is_pending`, `tests/test_device_safety.py::test_a_forced_run_whose_window_cannot_be_given_back_is_not_deferred_to_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_gets_the_bound_ladder_then_one_power_cycle` |
-| I78 | `tests/test_hold_lift_full_check.py::test_the_release_funnel_lifts_only_on_a_fresh_passing_fabric_verdict`, `tests/test_hold_lift_full_check.py::test_the_startup_and_post_reset_releases_refuse_a_missing_link`, `tests/test_hold_lift_full_check.py::test_a_pass_from_before_the_fault_or_too_long_ago_is_refused`, `tests/test_hold_lift_full_check.py::test_a_rung_recovered_outcome_lifts_only_on_a_passing_fabric_verdict`, `tests/test_hold_lift_full_check.py::test_an_eth_frozen_hold_lifts_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_an_off_bus_floor_hold_lifts_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_a_down_off_bus_recheck_lifts_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_a_foreign_holder_hold_lifts_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_an_operator_reset_releases_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_an_operator_reset_whose_release_the_funnel_refuses_reports_unverified`, `tests/test_hold_lift_full_check.py::test_replay_a_missing_link_hold_survives_every_lift_attempt_until_a_full_pass`, `tests/test_startup_fabric_hugepages.py::test_a_77_only_hold_past_its_bound_climbs_even_on_a_healthy_eth_read`, `tests/test_fabric_links_missing.py::test_replay_a_held_77_whose_bound_ladder_leaves_a_port_missing_power_cycles_once` |
+| I78 | `tests/test_hold_lift_full_check.py::test_the_release_funnel_lifts_only_on_a_fresh_passing_fabric_verdict`, `tests/test_hold_lift_full_check.py::test_the_startup_and_post_reset_releases_refuse_a_missing_link`, `tests/test_hold_lift_full_check.py::test_a_pass_from_before_the_fault_or_too_long_ago_is_refused`, `tests/test_hold_lift_full_check.py::test_a_rung_recovered_outcome_lifts_only_on_a_passing_fabric_verdict`, `tests/test_hold_lift_full_check.py::test_an_eth_frozen_hold_lifts_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_an_off_bus_floor_hold_lifts_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_a_down_off_bus_recheck_lifts_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_a_foreign_holder_hold_lifts_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_an_operator_reset_releases_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_an_operator_reset_whose_release_the_funnel_refuses_reports_unverified`, `tests/test_hold_lift_full_check.py::test_replay_a_missing_link_hold_survives_every_lift_attempt_until_a_full_pass`, `tests/test_startup_fabric_hugepages.py::test_a_77_only_hold_past_its_bound_climbs_even_on_a_healthy_eth_read`, `tests/test_fabric_links_missing.py::test_replay_a_held_77_whose_bound_ladder_leaves_a_port_missing_power_cycles_once`, `tests/test_hold_lift_gate.py::test_a_dirty_hold_with_no_fresh_pass_runs_the_full_check_pre_job`, `tests/test_hold_lift_gate.py::test_a_gate_whose_check_passed_still_lifts_only_through_the_funnel`, `tests/test_hold_lift_gate.py::test_the_post_job_gate_lifts_a_dirty_hold_only_on_a_passing_full_check`, `tests/test_hold_lift_gate.py::test_the_kill_reset_gate_lifts_only_on_a_passing_full_check_after_the_reset` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
