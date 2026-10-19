@@ -1104,7 +1104,7 @@ async def test_a_validator_crash_77_escalates_on_the_first_relift(monkeypatch, t
 async def test_the_crash_reset_runs_the_full_check_and_releases_only_on_a_pass(
     monkeypatch, tmp_path, clear_job_state, post_reset, released
 ):
-    """The rung fires once the 120 s present-mesh grace has passed, well inside the 5 min D77 budget;
+    """The rung fires once the 120 s present-mesh grace has passed, well inside the 5 min budget;
     goal 8: the reset is followed by the full check, fabric included, and only ok=True releases."""
     since = (datetime.now() - timedelta(seconds=galaxy_mod._present_mesh_reset_grace_sec() + 5)).isoformat()
     assert galaxy_mod._present_mesh_reset_grace_sec() <= 120
@@ -1118,6 +1118,43 @@ async def test_the_crash_reset_runs_the_full_check_and_releases_only_on_a_pass(
     assert (srv.fsm.state is ServerState.HEALTHY) is released
     if not released:
         assert srv._recovery_degraded(), "a post-reset check that did not pass keeps the device held"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop", ["", _DROP], ids=["crash", "eth_drop"])
+async def test_a_tick_before_the_grace_does_not_push_the_reset_past_it(monkeypatch, tmp_path, clear_job_state, drop):
+    """A relift tick that comes while the hold is younger than the grace gets not-due from the rung.
+    It must not use up a whole relift interval: the next relift is due when the grace ends, so the
+    reset runs one sampler tick after the grace, not up to one interval later."""
+    grace = galaxy_mod._present_mesh_reset_grace_sec()
+    interval = srv.SELFHEAL_RELIFT_INTERVAL_SEC
+    assert grace <= interval, "the case this guards: a not-due tick would push the rung a full interval"
+    _hold_77_crash(monkeypatch, tmp_path, drop=drop, since=(datetime.now() - timedelta(seconds=5)).isoformat())
+    resets, checks = _present_rung_chain(monkeypatch, {"ok": True, "detail": "fabric links healthy"})
+    monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
+
+    await srv._attempt_idle_relift()
+    assert resets == [], "inside the grace the present rung is not due"
+    due_in = srv.last_relift_monotonic + interval - srv.time.monotonic()
+    assert grace - 5 - 2 <= due_in <= grace - 5 + 1, "the next relift is due at the grace end"
+
+    # The grace has passed: the hold is older and the relift clock moved on by the same amount.
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(seconds=grace + 1)).isoformat())
+    monkeypatch.setattr(srv, "last_relift_monotonic", srv.last_relift_monotonic - (grace - 4))
+    await srv._attempt_idle_relift()
+    assert len(resets) == 1, "the reset runs on the first tick past the grace"
+    assert checks == [True] and srv.fsm.state is ServerState.HEALTHY
+
+
+def test_a_not_due_tick_past_the_grace_keeps_the_interval(monkeypatch, clear_job_state):
+    """Past the grace (the rung waits on something else, e.g. a tenant) the relift keeps its interval."""
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(minutes=5)).isoformat())
+    monkeypatch.setattr(srv, "last_relift_monotonic", 123.0)
+    srv._relift_at_present_grace()
+    assert srv.last_relift_monotonic == 123.0
+    monkeypatch.setattr(srv, "device_hold_episode_since", "")
+    srv._relift_at_present_grace()
+    assert srv.last_relift_monotonic == 123.0
 
 
 @pytest.mark.asyncio

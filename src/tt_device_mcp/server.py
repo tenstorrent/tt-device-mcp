@@ -116,6 +116,7 @@ from tt_device_mcp.health import (
     _fire_power_cycle,
     _galaxy_reset_min_dead_chips,
     _offbus_hold_ceiling_sec,
+    _present_mesh_reset_grace_sec,
     _reboot_min_dead_chips,
     _run_pre_power_cycle_hook,
     _stuck_hold_ceiling_sec,
@@ -3905,6 +3906,22 @@ def _fabric_77_reset_cause() -> str:
     return _fabric_77_eth_drop() or _fabric_77_validator_crash()
 
 
+def _relift_at_present_grace() -> None:
+    """Make the next relift due when the hold reaches the present-mesh grace (spec 03 I62).
+
+    A relift tick on a fault 77 (I53, I62) before the grace gets not-due from the present rung. If it
+    used up a whole relift interval, the rung would fire up to one interval after the grace instead
+    of at it. A hold already past the grace keeps the normal interval."""
+    global last_relift_monotonic
+    try:
+        age = (datetime.now() - datetime.fromisoformat(device_hold_episode_since)).total_seconds()
+    except (TypeError, ValueError):
+        return
+    left = _present_mesh_reset_grace_sec() - age
+    if 0 < left < SELFHEAL_RELIFT_INTERVAL_SEC:
+        last_relift_monotonic = time.monotonic() - SELFHEAL_RELIFT_INTERVAL_SEC + left
+
+
 def _fabric_hold_only(own_op: str = "") -> bool:
     """Whether the open hold is a fabric_unverified hold and nothing else (spec 01 I21).
 
@@ -4428,6 +4445,8 @@ async def _attempt_idle_relift() -> None:
                     _log(f"fabric 77: {crash} — a fault: the present-mesh rung, once this episode")
                 if await _escalate("present"):
                     return
+                if drop or crash:
+                    _relift_at_present_grace()
                 _log(
                     "held-unverified and no read-only check clears this hold class — holding; "
                     "escalates to the gate's galaxy reset once idle past the ceiling"
