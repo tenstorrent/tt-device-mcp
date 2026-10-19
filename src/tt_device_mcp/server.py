@@ -5946,15 +5946,29 @@ async def device_health_gate(
                 _clear_kill_reset_debt()
                 kill_debt = ""
         kill_reset = bool(kill_debt)
+        # Spec 03 I78: a dirty hold lifts only on a fresh passing full check, fabric included. Pre-job,
+        # with no such pass on record, the funnel would refuse this gate's release on every job, and
+        # nothing else runs a fabric pass on a dirty hold with jobs queued until the 10-min bound
+        # (04 I76). So a held, dirty device with no fresh pass runs the full check here (~45-100 s),
+        # once the 1G hugepages exist (a pass before them can only 77). A HEALTHY mesh, a clean hold
+        # and a host with no fabric check never get here: the fast pre-job check stays fast.
+        held_unproven = prejob and with_recover and dirty and bool(_hold_lift_unproven())
+        if held_unproven:
+            short = await asyncio.to_thread(_hugepages_shortfall)
+            if short is not None:
+                _log(f"full check waits: hugepages not yet allocated: {short[0]}/{short[1]} — holding")
+                held_unproven = False
         # with_recover=False never pays for the traffic pass: it is the one thing in this
         # function that costs real time, and a read-only pass has no rung to spend it on.
         # A reset with no passing fabric pass since (04 I32) runs the pass here too, so the gate
         # settles it in place; a job boundary that followed no reset adds no time.
         full = (
             with_recover
-            and (not prejob)
             and not kill_reset
-            and (dirty or force_fabric or (run_fabric and stale) or bool(_post_reset_debt()))
+            and (
+                held_unproven
+                or ((not prejob) and (dirty or force_fabric or (run_fabric and stale) or bool(_post_reset_debt())))
+            )
         )
         # A clean post-job exit still gets the passive eth read when the rung is armed (I30): chips
         # that all tick say nothing about a wedged eth core, and the next tenant is the one who
