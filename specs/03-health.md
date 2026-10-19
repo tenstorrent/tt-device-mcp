@@ -994,6 +994,34 @@ cooldown (spec 04 I65) holds longer.
   `/health` already makes: it never touches a chip, never calls a chip healthy, never admits a job,
   and never moves or claims a rung clock. Time to recover: unchanged for every class (it only
   reports).
+- **I75 — A startup hold behind a re-adopted job is lifted by the startup gate, not reset by the
+  ceiling escalation.** A broker restart that re-adopts a running job (an auto-update deploy) opens
+  the `startup_unverified` hold, and the startup gate waits for the job's scope to end. A job that
+  outlives the 600 s ceiling (I23) left the window re-armed on the job; when the job ended, the
+  forced ladder and the idle relift's generic branch raced the startup gate for the device and could
+  reset a mesh no check had found at fault, with the gate then running on top. While the startup
+  gate task is still to run, the hold's `why` is `startup_unverified`, no broker job is RUNNING and
+  no chip is isolated off the bus, both stand down: the forced run gives its window back (as on a
+  tenant) and logs once per episode (`stuck_hold_deferred`, blocker `startup_verify`); the relift
+  returns. The stand-down is re-read after every await of the forced run's prelude, under the
+  device-op lock, and again at the ladder's last tenant check before any rung (as blocker
+  `startup_verify`, after `job_running`): a re-adopted job that ends while the forced run or the
+  relift is already on its way gets no reset before the startup gate. Only the ceiling window and the off-bus one-shot stand down, the kinds whose window is
+  given back; every other forced kind (power-cycle cooldown retry, I39 progress retry, the off-bus
+  hand-off bounds, the I76 host rung) runs as before. While the re-adopted job runs, both meet it
+  as before: the ladder defers on blocker `job_running`. A chip that drops while the gate is
+  pending keeps the off-bus one-shot (I23) and its ladder; it does not wait for the gate. The startup gate runs the
+  full check, fabric included (goal: a health check after every reset or start), and releases only
+  on a pass. A gate that leaves the hold standing is escalated on the first sampler tick after it.
+  Bounded: `STARTUP_VERIFY_DEFER_MAX_SEC` (hugepage wait + fabric timeout + 120 s, 420 s) after the
+  re-adopted jobs end, the escalations act as before. A dirty or faulted job end keeps the gate's
+  own reset + full check. Time to recover (class S, restart over a re-adopted job longer than the
+  ceiling): from the job's end, one scope poll plus the startup gate (about 1-2 min), against a
+  galaxy reset, its settle and verify, then the gate (about 4-6 min) before. A gate that fails
+  hands the hold to the I76 bound's ladder on the next tick (the bound is already past after a
+  job longer than 600 s), then the power cycle if the full check after it fails, each once; the
+  job's end to that ladder is at most `STARTUP_VERIFY_DEFER_MAX_SEC`, inside 10 min. Other
+  classes, off-bus ones (A, B1, B2, C) on a startup hold included: unchanged.
 
 ## Interfaces
 
@@ -1640,6 +1668,9 @@ refuses.
 | I69 (a preemption past SIGINT owes the reset and its job's own post-job gate pays it, reset then full check, before the waiting job's door; one that unwound on SIGINT owes none; the re-adopted path too, leaving no id) | `tests/test_job_kill_reset.py::test_a_preemption_past_sigint_is_a_broker_side_timeout`, `tests/test_job_kill_reset.py::test_a_preemption_that_unwinds_on_sigint_owes_no_reset`, `tests/test_job_kill_reset.py::test_a_sigkill_ended_preemption_owes_and_pays_the_reset_before_the_next_job`, `tests/test_job_kill_reset.py::test_a_preemption_debt_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_preempted_readopted_job_past_sigint_owes_the_reset` |
 | I69 (the door payment waits out an external step's reservation) | `tests/test_job_kill_reset.py::test_the_door_payment_waits_out_an_external_step` |
 | I69 (a reaped leftover skips before the debt: no reset, debt kept, no wait; a reboot drops it and the startup full check runs; a cooldown skips and clears it with no wait) | `tests/test_job_kill_reset.py::test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait`, `tests/test_job_kill_reset.py::test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait` |
+| I75 | `tests/test_device_safety.py::test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_gate_not_reset`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_next_tick`, `tests/test_device_safety.py::test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladder`, `tests/test_device_safety.py::test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate` |
+| I75 (the stand-down is re-read under the lock and at the ladder's tenant check: a job ending mid-run gets no reset before the gate) | `tests/test_device_safety.py::test_a_readopted_job_ending_during_a_forced_run_gets_no_reset_before_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_after_a_job_ended_during_a_forced_run_escalates_next_tick`, `tests/test_device_safety.py::test_idle_relift_gives_no_reset_when_the_readopted_job_ends_inside_the_ladder`, `tests/test_ladder_v2.py::test_the_i75_stand_down_blocks_only_inside_the_escalate_that_carries_it`, `tests/test_ladder_v2.py::test_escalate_carries_the_stand_down_only_for_its_own_run`, `tests/test_classac_power_cycle_direct.py::test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant` |
+| I75 (a running re-adopted job still defers on `job_running`; off-bus and non-rearmable forced kinds never wait on the gate; a failed gate gets the I76 ladder then one power cycle) | `tests/test_device_safety.py::test_a_running_readopted_job_still_defers_the_startup_hold_on_job_running`, `tests/test_device_safety.py::test_idle_relift_meets_a_running_readopted_job_on_job_running`, `tests/test_device_safety.py::test_an_offbus_startup_hold_keeps_its_one_shot_while_the_startup_gate_is_pending`, `tests/test_device_safety.py::test_a_forced_run_whose_window_cannot_be_given_back_is_not_deferred_to_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_gets_the_bound_ladder_then_one_power_cycle` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
