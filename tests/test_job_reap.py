@@ -116,17 +116,18 @@ async def test_survivors_get_sigterm_before_sigkill(tmp_path):
     """SIGTERM first, so a leftover that handles it gets to clean up."""
     marker = tmp_path / "got-term"
     # A child that records SIGTERM and exits on it.
+    tag = _unique_tag("t-term-2")
     job = _spawn_job(
         f"setsid bash -c 'trap \"touch {marker}; exit 0\" TERM; while :; do sleep 0.1; done' "
         ">/dev/null 2>&1 < /dev/null & echo $!",
-        tag="t-term-2",
+        tag=tag,
     )
     out, _ = job.communicate(timeout=5)
     child = int(out.strip())
     try:
         time.sleep(0.3)  # let the trap install
         await job_reap.reap_job_survivors(
-            "t3", job.pid, None, "t-term-2", term_grace_sec=3, kill_wait_sec=1, log=lambda _m: None
+            "t3", job.pid, None, tag, term_grace_sec=3, kill_wait_sec=1, log=lambda _m: None
         )
         assert _wait_dead(child)
         assert marker.exists(), "the survivor was SIGKILLed without a SIGTERM first"
@@ -136,8 +137,9 @@ async def test_survivors_get_sigterm_before_sigkill(tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_survivor_that_ignores_sigterm_is_sigkilled_after_the_grace():
+    tag = _unique_tag("t-ignore")
     job = _spawn_job(
-        "setsid bash -c \"trap '' TERM; exec sleep 60\" >/dev/null 2>&1 < /dev/null & echo $!", tag="t-ignore"
+        "setsid bash -c \"trap '' TERM; exec sleep 60\" >/dev/null 2>&1 < /dev/null & echo $!", tag=tag
     )
     out, _ = job.communicate(timeout=5)
     child = int(out.strip())
@@ -145,7 +147,7 @@ async def test_a_survivor_that_ignores_sigterm_is_sigkilled_after_the_grace():
         time.sleep(0.2)
         start = time.monotonic()
         survivors = await job_reap.reap_job_survivors(
-            "t4", job.pid, None, "t-ignore", term_grace_sec=0.5, kill_wait_sec=1, log=lambda _m: None
+            "t4", job.pid, None, tag, term_grace_sec=0.5, kill_wait_sec=1, log=lambda _m: None
         )
         assert survivors == []
         assert _wait_dead(child)
@@ -179,10 +181,11 @@ async def test_a_process_that_outlives_sigkill_is_named(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_nothing_left_behind_costs_no_wait():
-    job = _spawn_job("true")
+    tag = _unique_tag("t-none")
+    job = _spawn_job("true", tag=tag)
     job.wait(timeout=5)
     start = time.monotonic()
-    survivors = await job_reap.reap_job_survivors("t6", job.pid, None, "t-none", term_grace_sec=5, log=lambda _m: None)
+    survivors = await job_reap.reap_job_survivors("t6", job.pid, None, tag, term_grace_sec=5, log=lambda _m: None)
     assert survivors == []
     assert time.monotonic() - start < 2
 
