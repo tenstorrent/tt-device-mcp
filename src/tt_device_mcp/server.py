@@ -6889,12 +6889,17 @@ def _health_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, st
     is the recovery of THIS hold, and the device stays refused until the full gate, fabric included,
     passes and closes the episode. The jobs list keeps one row for it (the op's), but a watcher that
     reads ``held`` must not see the hold lift for the length of a glx_reset. A routine op on a device
-    no hold was open for is not a hold. The reason and clock are the hold's own, not the op's."""
+    no hold was open for is not a hold. The reason and clock are the hold's own, not the op's: a hold
+    opened inside the op latches ``device_held_since`` to the clock reported here, so it does not
+    jump forward when the op ends and :func:`_device_hold_state` takes over."""
+    global device_held_since
     hold = _device_hold_state(now)
     if hold is not None or not (device_op_active and device_hold_logged):
         return hold
     reason = device_hold_episode_reason or _device_degraded_for_tenant()
     since = device_held_since or device_hold_episode_since or (now or datetime.now()).isoformat()
+    if _device_degraded_for_tenant():
+        device_held_since = since
     return reason, since
 
 

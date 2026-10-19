@@ -99,3 +99,20 @@ def test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held(monkeypat
     payload = srv._health_payload()
     assert payload["held"] is False and payload["status"] == "ok"
     assert payload["device_degraded"]
+
+
+def test_a_hold_opened_inside_an_op_keeps_its_held_since_after_the_op(held, monkeypatch):
+    """A hold the post-job gate opens while its op runs: /health showed the episode start during the
+    op, then the op-suppressed latch stamped a fresh held_since when the op ended, so held_since
+    jumped forward and held_age_sec fell (300 -> 0) with the hold still open. One clock per episode."""
+    monkeypatch.setattr(srv, "device_op_active", "health-gate/post-job")
+    srv._note_tenant_gate_verdict(f"device unverified: {REASON}")
+    monkeypatch.setattr(srv, "device_hold_episode_since", held.isoformat())
+    during = srv._health_payload(now=held + timedelta(seconds=300))
+    assert during["held"] is True and during["held_since"] == held.isoformat()
+
+    monkeypatch.setattr(srv, "device_op_active", "")
+    after = srv._health_payload(now=held + timedelta(seconds=310))
+    assert after["held"] is True
+    assert after["held_since"] == during["held_since"], "the hold keeps its clock when the op ends"
+    assert after["held_age_sec"] >= during["held_age_sec"]
