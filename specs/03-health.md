@@ -975,6 +975,15 @@ cooldown (spec 04 I65) holds longer.
   included) and the hold stays with the bounded escalation of I23 if that does not heal it.
   Time to recover (class J): from the release of the last holder to the gate's start is at most
   one recheck period plus one sampler tick, against waiting up to the 600 s ceiling before.
+- **I80 — A hold stays held through its own recovery.** A broker op that runs while a hold episode
+  is open (a forced ladder rung such as a glx_reset, any reset, the check after it) keeps `/health`
+  `held: true` and `status: degraded`, with the hold's own `held_since` and `held_reason`, until
+  the full gate, fabric included, passes and closes the episode. Neither the op starting nor the op
+  ending lifts it. This is reporting only (`server._health_hold_state`, read by `/health` alone):
+  the jobs list still shows one row for the device, the op's, and the gate, the release and the
+  hold watchdog keep `_device_hold_state`, so it changes no recovery step and no time to recover.
+  A routine op on a device no hold was open for (a between-jobs check, a post-job reset) does not
+  read as held; `device_degraded` names it.
 
 ## Interfaces
 
@@ -1005,7 +1014,8 @@ subsystem through the root:
   *Free* (`require_free=True`, `pre-step` only) applies the reset gate's tenant rule: a holder at
   or above `MIN_TENANT_UID`, or an incomplete scan, is not free (04 I7).
 - `/health` (REST, `server._health_payload`) — `status: ok|degraded` (degraded exactly while the
-  device is HELD: degraded, refused to tenants, no recovery op running), `fsm_state`, `fsm_why`,
+  device is HELD: degraded, refused to tenants, no recovery op running, or an op running inside an
+  open hold, I80), `fsm_state`, `fsm_why`,
   `held`/`held_since`/`held_reason`/`held_age_sec`, `device_degraded`, queue counts, version.
   `held_reason` and `fsm_why` keep the reason the hold opened with; the live fields say where it
   stands now, read fresh from sysfs on every call with no device touch: `isolated_chips` (always),
@@ -1617,6 +1627,7 @@ refuses.
 | I69 (a preemption past SIGINT owes the reset and its job's own post-job gate pays it, reset then full check, before the waiting job's door; one that unwound on SIGINT owes none; the re-adopted path too, leaving no id) | `tests/test_job_kill_reset.py::test_a_preemption_past_sigint_is_a_broker_side_timeout`, `tests/test_job_kill_reset.py::test_a_preemption_that_unwinds_on_sigint_owes_no_reset`, `tests/test_job_kill_reset.py::test_a_sigkill_ended_preemption_owes_and_pays_the_reset_before_the_next_job`, `tests/test_job_kill_reset.py::test_a_preemption_debt_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_preempted_readopted_job_past_sigint_owes_the_reset` |
 | I69 (the door payment waits out an external step's reservation) | `tests/test_job_kill_reset.py::test_the_door_payment_waits_out_an_external_step` |
 | I69 (a reaped leftover skips before the debt: no reset, debt kept, no wait; a reboot drops it and the startup full check runs; a cooldown skips and clears it with no wait) | `tests/test_job_kill_reset.py::test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait`, `tests/test_job_kill_reset.py::test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait` |
+| I80 | `tests/test_health_held_during_op.py::test_health_stays_held_while_a_forced_rung_runs`, `tests/test_health_held_during_op.py::test_health_lifts_the_hold_only_when_the_gate_passes_inside_the_op`, `tests/test_health_held_during_op.py::test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

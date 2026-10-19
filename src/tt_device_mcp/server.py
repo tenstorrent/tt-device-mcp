@@ -6883,17 +6883,33 @@ def _device_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, st
     return reason, device_held_since
 
 
+def _health_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, str]]:
+    """The hold as /health reports it (spec 03 I80): :func:`_device_hold_state`, plus a broker op
+    running inside an open hold episode. That op (a forced ladder rung, a reset, the check after it)
+    is the recovery of THIS hold, and the device stays refused until the full gate, fabric included,
+    passes and closes the episode. The jobs list keeps one row for it (the op's), but a watcher that
+    reads ``held`` must not see the hold lift for the length of a glx_reset. A routine op on a device
+    no hold was open for is not a hold. The reason and clock are the hold's own, not the op's."""
+    hold = _device_hold_state(now)
+    if hold is not None or not (device_op_active and device_hold_logged):
+        return hold
+    reason = device_hold_episode_reason or _device_degraded_for_tenant()
+    since = device_held_since or device_hold_episode_since or (now or datetime.now()).isoformat()
+    return reason, since
+
+
 def _health_payload(now: Optional[datetime] = None) -> dict:
     """The /health body. Beyond broker liveness it reports the DEVICE hold state, so a poller
     cannot read a box sitting held-and-refused as 'ok' — the gap that let a stuck hold go
     unseen for hours. ``status`` is 'degraded' exactly while the device is HELD (degraded,
-    refused to tenants, no recovery op running); a transient broker op does not flip it, so a
-    routine reset does not read as a stuck box. ``held``/``held_age_sec``/``held_reason`` carry
+    refused to tenants, no recovery op running, or an op running inside an open hold: I80); a
+    routine broker op on a device that was not held does not flip it, so a routine reset does not
+    read as a stuck box. ``held``/``held_age_sec``/``held_reason`` carry
     the precise latch for a monitor that alarms on how long the device has been unusable, and
     ``device_degraded`` still names an in-flight recovery that ``status`` deliberately hides."""
     running = sum(1 for j in jobs.values() if j.status == JobStatus.RUNNING)
     queued = sum(1 for j in jobs.values() if j.status == JobStatus.QUEUED)
-    hold = _device_hold_state(now)
+    hold = _health_hold_state(now)
     payload = {
         "status": "degraded" if hold else "ok",
         "version": __version__,

@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""/health stays held while a broker op runs inside an open hold (spec 03 I80).
+
+The jobs list suppresses the HOLD row while a broker op runs (the op's row is the recovery), and
+/health used to read the same latch, so a forced rung such as a glx_reset read as a lifted hold for
+its whole length. /health now keeps the hold until the full gate, fabric included, passes.
+"""
+
+from datetime import datetime, timedelta
+
+import pytest
+
+from tests.conftest import fsm_dirty
+from tt_device_mcp import server as srv
+from tt_device_mcp.fsm import ServerState
+
+REASON = "gate/startup: 1/32 chip(s) off the bus, below the reset floor — held for self-heal, not reset"
+
+
+def _isolate_hold(monkeypatch):
+    """Every hold global these tests touch is restored afterwards, so no hold leaks into later tests."""
+    for name, value in (
+        ("device_hold_logged", False),
+        ("device_hold_episode_since", ""),
+        ("device_hold_episode_reason", ""),
+        ("device_held_since", ""),
+        ("_hold_row", None),
+        ("device_hold_escalation_trigger", ""),
+    ):
+        monkeypatch.setattr(srv, name, value)
+    monkeypatch.setattr(srv, "health_event", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "_persist_hold_episode", lambda *a, **k: None)
+
+
+@pytest.fixture
+def held(monkeypatch, clear_job_state, tmp_path):
+    """A below-floor off-bus hold opened at the returned episode start."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    _isolate_hold(monkeypatch)
+    monkeypatch.setattr(srv, "isolated_chips", {"8"})
+    fsm_dirty(srv, REASON, why="off_bus")
+    since = datetime(2026, 10, 15, 1, 36, 0)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
+    return since
+
+
+def test_health_stays_held_while_a_forced_rung_runs(held, monkeypatch):
+    """/health read held:false, status ok, while the forced glx_reset of a hold ran, then held:true again
+    once it ended. The op inside an open hold episode is the recovery of THAT hold: the device is still
+    refused, and a watcher that reads ``held`` must not see it lifted until the full gate, fabric
+    included, passes."""
+    srv._note_tenant_gate_verdict(f"device unverified: {REASON}")
+    before = srv._health_payload(now=held + timedelta(seconds=30))
+    assert before["held"] is True
+
+    class Running:
+        def done(self):
+            return False
+
+    monkeypatch.setattr(srv, "_forced_escalation_task", Running())
+    monkeypatch.setattr(srv, "device_op_active", "hold-deadline-escalate")
+    monkeypatch.setattr(srv, "device_op_detail", "galaxy reset")
+    during = srv._health_payload(now=held + timedelta(seconds=700))
+    assert during["held"] is True, "a forced rung must not read as a lifted hold"
+    assert during["status"] == "degraded" and during["fsm_state"] != ServerState.HEALTHY.value
+    assert during["held_since"] == before["held_since"], "the hold keeps its clock across the op"
+    assert during["held_age_sec"] >= before["held_age_sec"]
+    assert during["held_reason"] == f"device unverified: {REASON}", "the hold's own reason, not the op's"
+    assert "broker device op in flight" in during["device_degraded"]
+    assert not [
+        r for r in srv._recent_jobs(20) if r["job_id"] == "--" and "HELD" in r["command"]
+    ], "the jobs list still shows the op's row, not a second hold row"
+    assert srv._device_hold_state() is None, "the jobs list, gate and release keep the op-suppressed latch"
+
+    # The rung ended but the post-reset check has not passed: still held.
+    monkeypatch.setattr(srv, "device_op_active", "")
+    monkeypatch.setattr(srv, "_forced_escalation_task", None)
+    assert srv._health_payload(now=held + timedelta(seconds=760))["held"] is True
+
+
+def test_health_lifts_the_hold_only_when_the_gate_passes_inside_the_op(held, monkeypatch):
+    """The post-reset check runs inside the op; held drops the moment that full gate passes (it closes
+    the episode), not when the op ends and not before."""
+    srv._note_tenant_gate_verdict(f"device unverified: {REASON}")
+    monkeypatch.setattr(srv, "device_op_active", "health-gate/post-reset")
+    assert srv._health_payload()["held"] is True
+    srv._note_tenant_gate_verdict("")  # the gate passed, fabric included
+    payload = srv._health_payload()
+    assert payload["held"] is False and "held_reason" not in payload
+
+
+def test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held(monkeypatch, clear_job_state):
+    """A between-jobs check or reset on a device no hold was open for is not a hold: status stays ok and
+    device_degraded names the op, as before."""
+    _isolate_hold(monkeypatch)
+    monkeypatch.setattr(srv, "device_op_active", "health-gate/post-job")
+    fsm_dirty(srv, "job 070 ended killed")
+    payload = srv._health_payload()
+    assert payload["held"] is False and payload["status"] == "ok"
+    assert payload["device_degraded"]
