@@ -138,9 +138,7 @@ async def test_survivors_get_sigterm_before_sigkill(tmp_path):
 @pytest.mark.asyncio
 async def test_a_survivor_that_ignores_sigterm_is_sigkilled_after_the_grace():
     tag = _unique_tag("t-ignore")
-    job = _spawn_job(
-        "setsid bash -c \"trap '' TERM; exec sleep 60\" >/dev/null 2>&1 < /dev/null & echo $!", tag=tag
-    )
+    job = _spawn_job("setsid bash -c \"trap '' TERM; exec sleep 60\" >/dev/null 2>&1 < /dev/null & echo $!", tag=tag)
     out, _ = job.communicate(timeout=5)
     child = int(out.strip())
     try:
