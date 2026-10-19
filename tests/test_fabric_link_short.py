@@ -51,7 +51,7 @@ def _arm(monkeypatch, hold, age_sec=10, latched=False):
 
 
 def _ladder(monkeypatch, escalations, outcome, *, passes=False):
-    async def ladder(kind, indices, expected, log):
+    async def ladder(kind, indices, expected, log, **_):
         escalations.append(kind)
         if passes:
             monkeypatch.setattr(srv, "_recovery_degraded", lambda: False)  # the full check passed

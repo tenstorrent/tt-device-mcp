@@ -1732,3 +1732,18 @@ def test_a_position_5_drop_in_a_later_hold_still_latches_and_names_both_episodes
     why = pcie_guard.latch_tray_pulse_drop(start | {"5", "13"}, episode="2026-10-16T01:03:00")
     assert why is not None and why["episode"] == "2026-10-16T01:00:00" and why["seen_in"] == "2026-10-16T01:03:00"
     assert pcie_guard.tray_rung_disabled()["episode"] == "2026-10-16T01:00:00"
+
+
+def test_the_latch_never_lifts_while_a_listed_link_reads_down(sysfs, monkeypatch):
+    """Spec 03 I9 link-down: an endpoint the kernel still lists whose link reads down (speed Unknown, width 63)
+    is not back on the bus, so it cannot lift the I25 hold as "every chip is back"."""
+    events = []
+    _latched(monkeypatch, sysfs, events)
+    ep = pcie_guard._pci_dir() / f"0000:{CHIPS[0][1]:02x}:00.0"
+    (ep / "current_link_speed").write_text("Unknown\n")
+    (ep / "current_link_width").write_text("63\n")
+    assert pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, lambda m: None) is None
+    assert pcie_guard.offbus_reset_latched() is not None
+    (ep / "current_link_speed").write_text("16.0 GT/s PCIe\n")
+    (ep / "current_link_width").write_text("16\n")
+    assert pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, lambda m: None)

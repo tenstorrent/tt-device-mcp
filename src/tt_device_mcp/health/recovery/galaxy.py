@@ -24,7 +24,8 @@ from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, 
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
-from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count
+from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count, unreadable_on_bus_chips
+from tt_device_mcp.health.monitors.hostpci import link_down
 from tt_device_mcp.health.monitors.pci import chip_node_present, chip_pci_bdfs, pci_bus_number
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
@@ -46,7 +47,12 @@ from tt_device_mcp.health.recovery import (
     offbus_power_cycle,
     pcie_guard,
 )
-from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC, drop_returned_isolated, refuse_mesh_reset
+from tt_device_mcp.health.recovery.base import (
+    CLASS_A_LADDER_AFTER_SEC,
+    HOLD_ESCALATION_REARM_SEC,
+    drop_returned_isolated,
+    refuse_mesh_reset,
+)
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
@@ -390,36 +396,46 @@ def _power_cycle_direct_class(
         return FAULT_CLASS_ALL_OFF if mesh_reset_failed else None
     if _ubb_reset_plan(offbus_chips, expected, tray_map) is not None:
         return FAULT_CLASS_WHOLE_TRAY
-    if tray_map is None and _whole_trays_absent(present_buses, expected, len(offbus_chips), tray_groups):
+    if tray_map is None and _whole_trays_absent(present_buses, expected, offbus_chips, tray_groups):
         return FAULT_CLASS_WHOLE_TRAY
     return None
 
 
-def _whole_trays_absent(present_buses: Optional[Mapping], expected: int, off_bus: int, tray_groups) -> bool:
+def _whole_trays_absent(present_buses: Optional[Mapping], expected: int, offbus_chips, tray_groups) -> bool:
     """Whether the chips still on the bus fill whole trays and every chip off the bus is accounted for
     by trays with none left on it: class A read from presence alone (spec 04 I37), for a broker with
-    no I16 tray map. A tray's chips share one PCI bus group (``bus & 0xF0``, the key tt-smi's UBB
-    tables use), so this needs no board type and no chip numbering, only the live buses.
+    no I16 tray map. See :func:`_absent_tray_groups`. Pure and side-effect-free."""
+    return bool(_absent_tray_groups(present_buses, expected, offbus_chips, tray_groups))
 
-    True only when the host has exactly ``len(tray_groups)`` trays of ``UBB_CHIP_COUNT`` chips, every
-    present chip sits in a known group, each group holds all or none of its chips, at least one group
-    is empty and one full, and the empty groups' chips are exactly the ``off_bus`` count. Anything
-    unreadable or out of shape is False: the ladder decides, as before. Pure and side-effect-free."""
+
+def _absent_tray_groups(present_buses: Optional[Mapping], expected: int, offbus_chips, tray_groups) -> list:
+    """The sorted UBB bus groups with no chip on the bus when the presence read is a clean whole-tray
+    drop, else []. A tray's chips share one PCI bus group (``bus & 0xF0``, the key tt-smi's UBB tables
+    use), so this needs no board type and no chip numbering, only the live buses.
+
+    Non-empty only when the host has exactly ``len(tray_groups)`` trays of ``UBB_CHIP_COUNT`` chips,
+    the chip ids missing from ``present_buses`` are exactly ``offbus_chips`` (a heartbeat read and a
+    sysfs read that raced can never pair the wrong chips), every present chip sits in a known group,
+    each group holds all or none of its chips, at least one group is empty and one full, and the empty
+    groups' chips are exactly the off-bus count. Anything unreadable or out of shape is []: the
+    ladder decides, as before. Pure and side-effect-free."""
     groups = set(tray_groups or ())
-    if not present_buses or not groups or off_bus <= 0 or len(groups) * UBB_CHIP_COUNT != expected:
-        return False
-    if len(present_buses) + off_bus != expected:
-        return False
+    off = {str(i) for i in offbus_chips or ()}
+    if not present_buses or not groups or not off or len(groups) * UBB_CHIP_COUNT != expected:
+        return []
+    present_ids = {str(i) for i in present_buses}
+    if len(present_ids) + len(off) != expected or {str(i) for i in range(expected)} - present_ids != off:
+        return []
     counts = dict.fromkeys(groups, 0)
     for bus in present_buses.values():
         group = bus & 0xF0 if isinstance(bus, int) else None
         if group not in counts:
-            return False
+            return []
         counts[group] += 1
     if any(n not in (0, UBB_CHIP_COUNT) for n in counts.values()):
-        return False
-    empty = sum(1 for n in counts.values() if n == 0)
-    return 0 < empty < len(groups) and empty * UBB_CHIP_COUNT == off_bus
+        return []
+    empty = sorted(g for g, n in counts.items() if n == 0)
+    return empty if 0 < len(empty) < len(groups) and len(empty) * UBB_CHIP_COUNT == len(off) else []
 
 
 def _hold_age_sec(hold_since: str) -> Optional[float]:
@@ -1111,6 +1127,12 @@ class GalaxyRecovery(Recovery):
     # watchdog reads it to re-arm the window it spent, so the ladder runs once the tenant is gone
     # rather than at the next window (spec 03 I23).
     tenant_deferred: bool = False
+    # Spec 03 I75: the caller's stand-down for the escalate() now running (True while the startup gate
+    # is still to run on a startup hold), re-read at every tenant check; and whether that run stood down
+    # on it. The caller reads its predicate once before the device-op lock, and the re-adopted job can
+    # end in any read after that, so the last read is the one right before a rung acts.
+    _stand_down: Optional[Callable[[], bool]] = None
+    startup_verify_deferred: bool = False
 
     def tenant_holds(self) -> bool:
         """The forced ladders' own tenant check, alone: a running broker job or a readable tenant fd."""
@@ -1222,6 +1244,7 @@ class GalaxyRecovery(Recovery):
         ev: Optional[Evidence] = None,
         beats: Optional[dict] = None,
         measured_fault: bool = False,
+        stand_down: Optional[Callable[[], bool]] = None,
     ) -> str:
         """Run the next justified rung of this ladder and report the outcome, replacing the
         direct ``_escalate_stuck_hold``/``_escalate_offbus_stuck_hold`` calls the idle relift and
@@ -1264,7 +1287,33 @@ class GalaxyRecovery(Recovery):
         failure, so its reset is due without the grace (spec 03 I56; see ``_stuck_hold_reset_due``).
 
         A host reboot or power cycle still pending (spec 04 I34) stops every caller here, before
-        the prelude: nothing runs, WAITING, one log line per request."""
+        the prelude: nothing runs, WAITING, one log line per request.
+
+        ``stand_down`` (spec 03 I75) is re-read at every tenant check of this run: while it reads True
+        no rung acts, the run reports WAITING with ``tenant_deferred`` and ``startup_verify_deferred``
+        set, and the caller leaves the hold to the startup gate."""
+        self._stand_down = stand_down
+        self.startup_verify_deferred = False
+        try:
+            return await self._escalate_phase(
+                phase, indices, expected, log, stage=stage, ev=ev, beats=beats, measured_fault=measured_fault
+            )
+        finally:
+            self._stand_down = None
+
+    async def _escalate_phase(
+        self,
+        phase: str,
+        indices: list,
+        expected: int,
+        log,
+        *,
+        stage: Optional[str],
+        ev: Optional[Evidence],
+        beats: Optional[dict],
+        measured_fault: bool,
+    ) -> str:
+        """:meth:`escalate`'s body, run with its ``stand_down`` in place."""
         if self.mechanism.host_action_blocks_reset(log, context=f"escalate({phase})"):
             return OUTCOME_WAITING
         rung, _, gate_phase = phase.partition("/")
@@ -1295,29 +1344,77 @@ class GalaxyRecovery(Recovery):
             return OUTCOME_WAITING
         return OUTCOME_RECOVERED if was_degraded and not self.deps.device_degraded() else OUTCOME_TERMINAL
 
+    def _presence_read(self, offbus: set, expected: int) -> tuple:
+        """``(present_buses, tray_groups)`` for :func:`_absent_tray_groups`: tt-smi's UBB bus groups
+        and ``{chip id: PCI bus}`` of the chips sysfs lists that are not in ``offbus``. A chip the
+        heartbeat calls off the bus is not present even if its node lingers (an all-ones endpoint the
+        kernel still lists), nor is one whose link reads down (:func:`hostpci.link_down`), so neither
+        can fill a tray it left. ``(None, ())`` with no tables."""
+        if not 0 < len(offbus) < expected:
+            return None, ()
+        groups = {g for table in (_ubb_bus_id_tables() or {}).values() for g in table.values()}
+        if not groups:
+            return None, ()
+        off = {str(i) for i in offbus}
+        return {
+            i: pci_bus_number(a) for i, a in chip_pci_bdfs().items() if str(i) not in off and not link_down(a)
+        }, groups
+
     def _power_cycle_direct_class_now(self, offbus: set, expected: int, tray_map: Optional[dict], log) -> Optional[str]:
         """:func:`_power_cycle_direct_class` on this broker's live state. With no tray map, the chips
         still on the bus are read from sysfs and grouped by tt-smi's UBB bus groups, so a whole-tray
         drop the broker never saw a full mesh before (a short boot, a restart into a drop) is still
-        class A at its first gate pass, not after the hold ceiling and a mesh reset (spec 04 I37)."""
-        present_buses, groups = None, ()
-        if tray_map is None and 0 < len(offbus) < expected:
-            groups = {g for table in (_ubb_bus_id_tables() or {}).values() for g in table.values()}
-            if groups:
-                present_buses = {i: pci_bus_number(a) for i, a in chip_pci_bdfs().items()}
-        fault_class = _power_cycle_direct_class(
-            offbus,
-            expected,
-            tray_map,
-            mesh_reset_failed=self.mechanism.mesh_reset_failed_this_boot(offbus)
-            or self.mechanism.broker_cycled_this_episode(),
-            present_buses=present_buses,
-            tray_groups=groups,
+        class A at its first gate pass, not after the hold ceiling and a mesh reset (spec 04 I37).
+
+        When the set as read is not class A, the chips in it that are enumerated and bound but whose
+        heartbeat read fails (EIO, a missing attribute: :func:`unreadable_on_bus_chips`) are taken as
+        on the bus and the set is classified again, for class A only: survivors of a whole-tray drop
+        that read like this would otherwise make it look all-off (one mesh reset, then class C) or
+        partial (the full ladder). Every other answer is the one the set as read gives."""
+        mesh_reset_failed = (
+            self.mechanism.mesh_reset_failed_this_boot(offbus) or self.mechanism.broker_cycled_this_episode()
         )
+
+        def classify(off: set) -> tuple:
+            present_buses, groups = (None, ()) if tray_map is not None else self._presence_read(off, expected)
+            return (
+                _power_cycle_direct_class(
+                    off,
+                    expected,
+                    tray_map,
+                    mesh_reset_failed=mesh_reset_failed,
+                    present_buses=present_buses,
+                    tray_groups=groups,
+                ),
+                present_buses,
+            )
+
+        fault_class, present_buses = classify(offbus)
+        unreadable: set = set()
+        if fault_class != FAULT_CLASS_WHOLE_TRAY and offbus and expected >= 2 * UBB_CHIP_COUNT:
+            unreadable = unreadable_on_bus_chips(offbus) & {str(i) for i in offbus}
+            if unreadable:
+                on_bus_class, on_bus_present = classify({str(i) for i in offbus} - unreadable)
+                if on_bus_class == FAULT_CLASS_WHOLE_TRAY:
+                    fault_class, present_buses = on_bus_class, on_bus_present
+                    log(
+                        f"chip(s) [{','.join(sorted(unreadable, key=int))}] are enumerated and bound but their "
+                        f"heartbeat read fails — on the bus, unhealthy; the rest of the off-bus set is whole "
+                        f"tray(s): class A"
+                    )
+                    health_event(
+                        "class_a_unreadable_survivors",
+                        unreadable=sorted(unreadable, key=int),
+                        off_bus=sorted({str(i) for i in offbus} - unreadable, key=int),
+                        expected=expected,
+                    )
+        # Spec 04 I73: the governor counts the broker cycles for this tray, and flags the AC-needed
+        # state, only while a whole tray is what is off; any other read clears it.
+        self.mechanism.whole_tray_off = sorted(offbus, key=int) if fault_class == FAULT_CLASS_WHOLE_TRAY else None
         if fault_class == FAULT_CLASS_WHOLE_TRAY and present_buses is not None:
             log(
                 f"no tray map banked: the {len(present_buses)} chip(s) on the bus fill whole trays and "
-                f"{len(offbus)} chip(s) are off — class A from bus presence"
+                f"{len(offbus) - len(unreadable)} chip(s) are off — class A from bus presence"
             )
         return fault_class
 
@@ -1353,6 +1450,21 @@ class GalaxyRecovery(Recovery):
             fault_class, offbus, expected, log, context=gate_phase or rung, force=rung == "offbus-forced"
         )
         if fired is None:
+            return None
+        if (
+            fired is False
+            and rung == "offbus-forced"
+            and fault_class == FAULT_CLASS_WHOLE_TRAY
+            and self.mechanism.class_a_ladder_due()
+        ):
+            # Spec 04 I73: the cooldown refused the cycle, and the hold has stood 10 min since its last
+            # cycle or boot. The full ladder runs once now (each reset followed by the full health
+            # check, fabric included); the cycle still fires the moment the cooldown ends.
+            log(
+                f"whole tray(s) off and the power cycle in cooldown {CLASS_A_LADDER_AFTER_SEC}s after the last "
+                f"cycle or boot — running the full ladder; the cycle follows at the cooldown's end if it fails"
+            )
+            health_event("class_a_cooldown_ladder", off_bus=sorted(offbus, key=int), expected=expected)
             return None
         if fired and rung != "gate":
             return OUTCOME_TERMINAL
@@ -1841,11 +1953,15 @@ class GalaxyRecovery(Recovery):
 
     def _tenant_blocker(self, scan, *, force: bool = False) -> Optional[dict]:
         """Which check of :meth:`_tenant_active` blocks, as health_event fields, or None when none does:
-        ``blocker`` is ``job_running``, ``tenant`` (with the first tenant's pid, uid, user and comm) or
-        ``scan_incomplete`` (with the scan's source and gaps). A deferral that names its blocker tells a
+        ``blocker`` is ``job_running``, ``startup_verify`` (the running escalate's I75 stand-down), ``tenant``
+        (with the first tenant's pid, uid, user and comm) or ``scan_incomplete`` (with the scan's source
+        and gaps). A deferral that names its blocker tells a
         real tenant apart from a scan that merely could not see."""
         if self.deps.job_running():
             return {"blocker": "job_running"}
+        if self._stand_down is not None and self._stand_down():
+            self.startup_verify_deferred = True
+            return {"blocker": "startup_verify"}
         # The broker's own probes and the holders it killed for a dead chip are not tenants, nor is
         # a gap they leave while exiting (spec 04 I59).
         scan = discount_broker_internal(scan)
@@ -1870,6 +1986,8 @@ class GalaxyRecovery(Recovery):
         kind = blocker["blocker"]
         if kind == "job_running":
             return "a broker job is running"
+        if kind == "startup_verify":
+            return "the startup gate (full check, fabric included) runs next on this startup hold"
         if kind == "tenant":
             more = f" (+{blocker['tenants'] - 1} more)" if blocker["tenants"] > 1 else ""
             return (
@@ -3715,7 +3833,21 @@ class GalaxyRecovery(Recovery):
         offbus_ids = _offbus_chip_ids(beats, expected)
         tray_map = self._tray_map_now()
         walk = _ubb_tray_walk_plan(offbus_ids, expected, tray_map)
-        if walk is None:
+        reset_floor = _galaxy_reset_min_dead_chips(expected)
+        below_floor = reset_floor is None or off_bus < reset_floor
+        absent_groups: list = []
+        if tray_map is None and below_floor:
+            # Spec 04 I37's presence read: with no I16 map nothing can be walked, but a drop that is
+            # exactly whole trays (by tt-smi's UBB bus groups) still goes to the bounded power cycle.
+            present_buses, groups = self._presence_read(offbus_ids, expected)
+            absent_groups = _absent_tray_groups(present_buses, expected, offbus_ids, groups)
+            unreadable = set() if absent_groups else unreadable_on_bus_chips(offbus_ids) & set(offbus_ids)
+            if unreadable:
+                # Enumerated, bound chips whose heartbeat read fails are on the bus (see
+                # _power_cycle_direct_class_now): read the drop's shape without them.
+                present_buses, groups = self._presence_read(set(offbus_ids) - unreadable, expected)
+                absent_groups = _absent_tray_groups(present_buses, expected, set(offbus_ids) - unreadable, groups)
+        if walk is None and not absent_groups:
             # Two shapes both classify as not_applicable, not blocked: (1) a per-target (non-Galaxy)
             # host, where there is no tray concept at all — every below-floor off-bus drop lands
             # here; (2) a Galaxy whose gate never banked a bus-id map (spec 04 I16), so the tray a
@@ -3728,10 +3860,10 @@ class GalaxyRecovery(Recovery):
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)  # name it + hold (the default)
             metrics.stage_fired("ubb_tray", "blocked")
             return None
-        reset_floor = _galaxy_reset_min_dead_chips(expected)
-        below_floor = reset_floor is None or off_bus < reset_floor
         whole = _whole_trays_off(offbus_ids, expected, tray_map) if below_floor else []
-        if whole and not _ubb_single_tray_walk_enabled():
+        if absent_groups:
+            whole = [f"bus group 0x{g:02x}" for g in absent_groups]
+        if whole and (absent_groups or not _ubb_single_tray_walk_enabled()):
             # Measured on a Galaxy, three times in an hour: re-powering a whole-down tray of a below-floor
             # drop took 20 more chips on the other trays off the bus. No reset brings such a tray back, so
             # no walk: the hold goes straight to the bounded power cycle (I27), no grace.
