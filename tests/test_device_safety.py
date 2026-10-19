@@ -11276,17 +11276,85 @@ async def test_forced_offbus_ladder_after_a_regression_sweeps_then_power_cycles_
 
 @pytest.mark.asyncio
 async def test_an_early_regression_is_latched_before_the_ceiling_deferral(monkeypatch, clear_job_state):
-    """A regression on an early forced pass (hold younger than the ceiling, so the host rung defers) is
-    still latched: the next pass does not reset again. Fails on base, which only looked for a
-    regression after the deferral returned."""
+    """A regression on an early forced pass (hold younger than the ceiling) is still latched: the next
+    pass does not reset again. Fails on base, which only looked for a regression after the deferral
+    returned. Since I79's regressed case the early pass no longer defers: with no power cycle opted in
+    it pages for the cold rung at once."""
     counters, events = _arm_regressed_offbus_hold(monkeypatch, held_minutes_ago=3)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
     assert counters["resets"] == 1
-    assert "reset_regressed_offbus" in events and "host_rung_deferred_until_ladder_end" in events
+    assert "reset_regressed_offbus" in events and "host_rung_deferred_until_ladder_end" not in events
+    assert "reset_unrecoverable_power_cycle_required" in events
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
     assert counters["resets"] == 1, "an early regression must latch the episode too"
     assert counters["reboots"] == 0 and counters["power_cycles"] == 0
+
+
+def _arm_regressed_b1_hold_before_the_ceiling(monkeypatch, sweep_result):
+    """Replay of a class B1 episode: a post-job reset dropped one chip (1/32 off the bus, the regression
+    latched before the hold opened) and the first forced pass comes 96 s into the hold, power cycle
+    opted in. The sweep stub records whether the cold rung had fired before it ran."""
+    counters, events = _arm_regressed_offbus_hold(monkeypatch, held_minutes_ago=1.6)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(31)})  # 1 off-bus
+    srv.recovery_mechanism.note_reset_regressed(srv.device_hold_episode_since)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    counters["cycled_before_sweep"] = 0
+
+    async def sweep(*a, **k):
+        counters["sweeps"] += 1
+        counters["cycled_before_sweep"] += counters["power_cycles"]
+        return sweep_result
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", sweep)
+    return counters, events
+
+
+@pytest.mark.asyncio
+async def test_a_regressed_offbus_hold_sweeps_then_power_cycles_before_the_ceiling(monkeypatch, clear_job_state):
+    """Spec 04 I79/I31, class B1: a hold whose reset regressed the mesh has no reset rung left (I31), so
+    the climb does not wait for the 600 s ceiling: it sweeps (I22), then requests the power cycle on the
+    first forced pass. Fails on base, which deferred to the ceiling (host_rung_deferred_until_ladder_end,
+    no sweep, no cycle): one 8-chip hold waited 512 s there and was released at 904 s, over the 900 s
+    B1 power-cycle budget."""
+    counters, events = _arm_regressed_b1_hold_before_the_ceiling(monkeypatch, sweep_result=False)
+    ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    hold_age = (datetime.now() - datetime.fromisoformat(srv.device_hold_episode_since)).total_seconds()
+    assert ran is True and "galaxy_reset_skipped_regressed" in events
+    assert "host_rung_not_deferred" in events and "host_rung_deferred_until_ladder_end" not in events
+    assert counters["resets"] == 0 and counters["sbr"] == 0 and counters["trays"] == 0, "I31: no reset rung"
+    assert counters["sweeps"] == 1 and counters["cycled_before_sweep"] == 0, "the full ladder runs first (I22)"
+    assert counters["power_cycles"] == 1 and counters["reboots"] == 0, "warm reboot futile: the cold rung"
+    assert hold_age < 600, "the cycle is asked on the first forced pass, not at the ceiling"
+    # Time to recover with the measured rung times of that episode: sweep 110 s, cycle to broker start
+    # 151 s, startup full check with fabric 33 s (03 I4, before any release). Base asked at the 609 s
+    # forced pass: 903 s; now about 390 s.
+    assert hold_age + 110 + 151 + 33 < 900 / 2
+
+
+@pytest.mark.asyncio
+async def test_a_regressed_offbus_hold_whose_sweep_recovers_does_not_power_cycle(monkeypatch, clear_job_state):
+    """Spec 04 I79: the early climb still stops at a sweep whose full check passes (a per-tray re-power
+    healed one such Galaxy drop); only the cycle is skipped, never the sweep."""
+    counters, events = _arm_regressed_b1_hold_before_the_ceiling(monkeypatch, sweep_result=True)
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["sweeps"] == 1 and "host_rung_not_deferred" in events
+    assert counters["power_cycles"] == 0 and counters["reboots"] == 0 and counters["resets"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_regressed_offbus_hold_whose_cycle_is_held_off_neither_sweeps_nor_resets(monkeypatch, clear_job_state):
+    """Spec 04 I79: a cold rung auto_recovery_allowed holds off (the I65 cooldown here) before the ceiling
+    returns before the sweep, as it does at the ceiling: no sweep is repeated each forced window and no
+    reset rung runs (I31); the next window asks again."""
+    counters, events = _arm_regressed_b1_hold_before_the_ceiling(monkeypatch, sweep_result=False)
+    monkeypatch.setattr(
+        srv.recovery_mechanism, "auto_recovery_allowed", lambda *a, **k: (False, "power-cycle cooldown")
+    )
+    for _ in range(2):
+        await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["sweeps"] == 0 and counters["resets"] == 0 and counters["trays"] == 0
+    assert counters["power_cycles"] == 0 and counters["reboots"] == 0
 
 
 @pytest.mark.asyncio
