@@ -271,6 +271,13 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     monkeypatch.delenv(device_holders.TENANT_UIDS_ENV, raising=False)
     monkeypatch.setattr(srv, "reaped_survivors", {})
     monkeypatch.setattr(srv, "_leftover_fence_detail", "")
+    monkeypatch.setattr(srv, "_leftover_unkillable_since", None)
+    monkeypatch.setattr(srv, "_leftover_unkillable_mono", None)
+    monkeypatch.setattr(srv, "_leftover_deadline_paged", False)
+    monkeypatch.setattr(srv, "_leftover_rung_last_try", 0.0)
+    monkeypatch.setattr(srv, "_leftover_rung_stage", "")
+    monkeypatch.setattr(srv, "_leftover_rung_detail", "")
+    monkeypatch.setattr(srv, "_leftover_rung_task", None)
     # The reset argv/mode env vars are read live (never cached), so an operator's own shell/CI
     # environment leaks straight into whatever argv a test builds — cleared here for a
     # deterministic floor; a test exercising a declared mode/override sets it itself afterward.
@@ -389,6 +396,13 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv, "device_fault_reported", "", raising=False)
     # Many tests assign srv.isolated_chips directly; a leaked chip makes a later hold not 77-only.
     monkeypatch.setattr(srv, "isolated_chips", set())
+    # Spec 03 I66: the lost/recovering registry is process-wide; each test starts with none, and
+    # publishes into its own tmp file, never /run.
+    monkeypatch.setenv("TT_DEVICE_MCP_CHIP_STATE_FILE", str(tmp_path_factory.mktemp("chipstate") / "chip-state.json"))
+    from tt_device_mcp.health import chip_state
+
+    chip_state.reset()
+    monkeypatch.setattr(srv, "_last_offbus_state", {})
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
     # Whether the last reset EXITED non-zero. Left set it would steer the NEXT test's gate
@@ -448,6 +462,11 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # The short-count debouncer and the dispatch recheck's clock (spec 03 I31/I32), for the same
     # reason. raising=False so a base tree without them (a fails-on-base stash) still sets up.
     monkeypatch.setattr(srv.sampler, "short_count_strikes", 0, raising=False)
+    # The hung-chip poller stop's per-episode latch and its previous heartbeats, and the reset scope
+    # the sampler saw still running (spec 03 I66), for the same reason.
+    monkeypatch.setattr(srv.sampler, "pollers_stopped_for", frozenset(), raising=False)
+    monkeypatch.setattr(srv.sampler, "prev_beats", {}, raising=False)
+    monkeypatch.setattr(srv.sampler, "scope_seen", False, raising=False)
     monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None, raising=False)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
     # A link drop an eth test measured on the singleton would turn the next test's 77 hold into a fault.
@@ -542,6 +561,7 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
     # A regressed tray walk disables the rung for the rest of the process: every test starts armed.
     monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_PERSISTED", False, raising=False)
     monkeypatch.setattr(pcie_guard, "_LAST_TRAY_PULSE", None, raising=False)
 
     # The bounded off-bus hold (spec 04 I27) runs a host-supplied power-cycle command: unset here, a
