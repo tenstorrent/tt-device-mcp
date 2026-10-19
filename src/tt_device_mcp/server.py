@@ -6928,19 +6928,24 @@ _HOLD_OFFBUS_DUE_SOURCES = {
 
 
 def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
-    """The next rung the broker has armed for this hold and when it fires (spec 04 I75), mirroring
-    ``_check_hold_deadline``'s clocks AND its guards: none without the episode clock the watchdog keys
-    on; while a requested host action is pending, that request and the end of its window (every forced
-    spawn declines until then). Otherwise the earliest of the off-bus forced pass (gated grace, IPMI,
-    tray-walk and operator hand-off bounds), the I65 retry of a refused power cycle in this episode, the
-    I73 class-A 10-min ladder, the I70 unkillable-leftover host rung (never floored), the host rung
-    the 10-min bound asks after its ladder (spec 04 I76), then the watchdog's own branch order: the off-bus one-shot once due, the I39 progress retry once due, else the next unspent
-    ceiling window (reported at its own time even when past: a declined spawn retries it every tick).
-    A branch not yet due does not hide a later one that fires first: an armed progress retry or
-    one-shot is reported next to the ceiling window, and the earlier one wins. Below the 10-min bound
-    the kill-switch and a 77-only hold keep every forced run back, so each candidate fires no earlier
-    than the bound. Plus any registered deadline feed. Read-only: it never claims, moves or expires a
-    clock."""
+    """The next rung the broker has armed for this hold and when it fires (spec 04 I75). Each forced
+    candidate comes from ``_check_hold_deadline``'s own clocks and branch order, and what it does at its
+    time is read from ``_forced_run_route``, the routing ``_force_escalate_stuck_hold`` itself acts on:
+    a forced ladder, the bound's host rung (power cycle or warm reboot), the startup gate's stand-down
+    until its bounded end, or nothing while the full check after the bound's ladder still has its time.
+
+    None without the episode clock the watchdog keys on; while a requested host action is pending, that
+    request and the end of its window (every forced spawn declines until then). Otherwise the earliest
+    of the off-bus forced pass (gated grace, IPMI, tray-walk and operator hand-off bounds), the I65
+    retry of a refused power cycle in this episode, the I73 class-A 10-min ladder, the I70
+    unkillable-leftover host rung (the sampler's own, never floored or routed), the bound's host rung
+    after its ladder (spec 04 I76), then the watchdog's chain: the off-bus one-shot once due, the I39
+    progress retry once due, else the next unspent ceiling window (reported at its own time even when
+    past: a declined spawn retries it every tick). A branch not yet due does not hide a later one that
+    fires first, and a run that would do nothing is no candidate (its latch is spent, so the chain goes
+    on). Below the 10-min bound the kill-switch and a 77-only hold keep every forced run back, so each
+    candidate fires no earlier than the bound. Plus any registered deadline feed. Read-only: it never
+    claims, moves or expires a clock."""
     episode = device_hold_episode_since
     try:
         started = datetime.fromisoformat(episode).timestamp() if episode else None
@@ -6961,11 +6966,47 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
     # Spec 04 I76: below the bound the kill-switch declines every forced spawn and the watchdog forces
     # no 77-only hold; from the bound on, neither holds a rung back.
     floor = started + ceiling if not _force_escalate_enabled() or _fabric_77_only_hold() else None
+    host_rung = "power cycle" if _auto_power_cycle_enabled() else "warm reboot" if _auto_reboot_enabled() else None
+    now_mono = time.monotonic()
 
     def done(candidates: list) -> Optional[hold_report.RungCandidate]:
         if floor is not None:
             candidates = [c if c.at >= floor else replace(c, at=floor) for c in candidates]
         return hold_report.next_rung(fed + candidates)
+
+    def routed(c: hold_report.RungCandidate, kind: str) -> Optional[hold_report.RungCandidate]:
+        """``c`` as a forced run of ``kind`` takes it at its time (the floor applied; a past one at the
+        next tick), by _forced_run_route; None when that run does nothing."""
+        at = c.at if floor is None else max(c.at, floor)
+        t = max(at, now_epoch)
+        route = _forced_run_route(kind, t - started, now_mono + (t - now_epoch))
+        if route.action == ROUTE_STAND_DOWN:
+            # Spec 03 I75: the window is given back each tick until the gate's verdict or its bound;
+            # then the run goes the bound's way.
+            end = started + (route.until_age or 0.0)
+            then = _hold_bound_route(kind, end - started).action
+            if then == ROUTE_CHECK_PENDING or (then == ROUTE_HOST_RUNG and not host_rung):
+                return hold_report.RungCandidate(end, "startup health check", f"startup gate stand-down ({c.source})")
+            step = host_rung if then == ROUTE_HOST_RUNG else "forced ladder"
+            return hold_report.RungCandidate(
+                end, f"startup health check, then {step}", f"startup gate stand-down ({c.source})"
+            )
+        if route.action == ROUTE_CHECK_PENDING:
+            return None  # the run returns: the bound's own host-rung candidate is at the check's end
+        if route.action == ROUTE_HOST_RUNG:
+            if not host_rung:
+                return None  # the bound pages that no host rung is opted in; nothing runs
+            if c.rung != "forced ladder":
+                return replace(c, at=at)  # already names the host step (a cooldown retry)
+            source = c.source if kind == "hold_bound_cycle" else f"hold bound host rung at {c.source}"
+            return hold_report.RungCandidate(at, host_rung, source)
+        return replace(c, at=at)
+
+    def add(candidates: list, c: hold_report.RungCandidate, kind: str) -> bool:
+        r = routed(c, kind)
+        if r is not None:
+            candidates.append(r)
+        return r is not None
 
     # Read the request without host_action_pending(), which drops an expired one and journals it.
     req = getattr(m, "host_action_requested", None) if m is not None else None
@@ -6981,50 +7022,49 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
                     )
                 ]
             )
-    candidates = []
+    candidates: list = []
     due = offbus_power_cycle.watchdog_due_at(episode)
     if due is not None:
-        candidates.append(hold_report.RungCandidate(due[0], "forced ladder", _HOLD_OFFBUS_DUE_SOURCES[due[1]]))
+        add(candidates, hold_report.RungCandidate(due[0], "forced ladder", _HOLD_OFFBUS_DUE_SOURCES[due[1]]), due[1])
     retry = getattr(m, "power_cycle_retry", None) if m is not None else None
     if retry is not None and retry[1] and retry[1] == episode:
-        candidates.append(hold_report.cooldown_candidate(cooldown, float(retry[0])))
+        add(candidates, hold_report.cooldown_candidate(cooldown, float(retry[0])), "power_cycle_cooldown")
     class_a = m.class_a_ladder_watch_at(now_epoch) if m is not None else None
     if class_a is not None:
-        candidates.append(hold_report.RungCandidate(class_a, "forced ladder", "class A 10-min ladder"))
+        add(candidates, hold_report.RungCandidate(class_a, "forced ladder", "class A 10-min ladder"), "class_a_ladder")
     # Spec 04 I70: the sampler's own host rung for an unkillable leftover; no forced spawn, so no floor.
     fed = fed + _leftover_rung_candidates(now_epoch)
-    host_rung = "power cycle" if _auto_power_cycle_enabled() else "warm reboot" if _auto_reboot_enabled() else None
     age = now_epoch - started
+    bound_rung = hold_report.RungCandidate(now_epoch, "forced ladder", "hold bound host rung")
     if _hold_bound_cycle_due(age):
         # The watchdog's first branch: it asks the bound's host rung every tick until it is requested.
-        if host_rung:
-            candidates.append(hold_report.RungCandidate(now_epoch, host_rung, "hold bound host rung"))
-        return done(candidates)
+        if add(candidates, bound_rung, "hold_bound_cycle"):
+            return done(candidates)
     lad = _hold_bound_ladder_age
-    if (
-        host_rung
-        and lad is not None
-        and lad >= ceiling
-        and (_hold_bound_cycle_age is None or _hold_bound_cycle_age < lad)
-    ):
+    if lad is not None and lad >= ceiling and (_hold_bound_cycle_age is None or _hold_bound_cycle_age < lad):
         # The full check after the bound's ladder still has its time; the host rung follows at its end.
-        candidates.append(
-            hold_report.RungCandidate(started + lad + _HOLD_BOUND_CHECK_SEC, host_rung, "hold bound host rung")
-        )
+        add(candidates, replace(bound_rung, at=started + lad + _HOLD_BOUND_CHECK_SEC), "hold_bound_cycle")
     if isolated_chips and not device_hold_offbus_escalated:
         one_shot = started + _offbus_one_shot_sec()
-        candidates.append(hold_report.RungCandidate(one_shot, "forced ladder", "off-bus one-shot"))
-        if age >= _offbus_one_shot_sec():
+        acts = add(
+            candidates, hold_report.RungCandidate(one_shot, "forced ladder", "off-bus one-shot"), "offbus_one_shot"
+        )
+        if acts and age >= _offbus_one_shot_sec():
             return done(candidates)  # due: the watchdog's chain stops at it
     if m is not None and m.progress_retry is not None and m.progress_retry[0] == episode:
         left = m.progress_retry[1] - time.monotonic()
-        candidates.append(hold_report.RungCandidate(now_epoch + max(0.0, left), "forced ladder", "progress retry"))
-        if left <= 0:
+        retry_c = hold_report.RungCandidate(now_epoch + max(0.0, left), "forced ladder", "progress retry")
+        if add(candidates, retry_c, "progress_retry") and left <= 0:
             return done(candidates)  # due: the watchdog's chain stops at it
     window = max(1, device_hold_escalate_bucket + 1)
-    candidates.append(
-        hold_report.RungCandidate(started + window * ceiling, "forced ladder", f"hold ceiling window {window}")
-    )
+    # A window whose run would do nothing is spent all the same; the next one is then the candidate.
+    for w in range(window, window + 3):
+        if add(
+            candidates,
+            hold_report.RungCandidate(started + w * ceiling, "forced ladder", f"hold ceiling window {w}"),
+            "ceiling_window",
+        ):
+            break
     return done(candidates)
 
 
@@ -7336,7 +7376,7 @@ async def _force_escalate_stuck_hold() -> None:
     ):
         _defer_offbus_one_shot_to_tenant_bound()  # quietly: no device op, no event, no rung
         return
-    if _startup_verify_owns_hold(kind):
+    if _forced_run_route(kind, _hold_age_now()).action == ROUTE_STAND_DOWN:
         _defer_to_startup_verify(kind, log)
         return
     async with _device_op("hold-deadline-escalate"):
@@ -7365,7 +7405,7 @@ async def _force_escalate_stuck_hold() -> None:
         if expected <= 0:
             return
         beats = await asyncio.to_thread(_decision_heartbeats)
-        if _startup_verify_owns_hold(kind):
+        if _forced_run_route(kind, held_age).action == ROUTE_STAND_DOWN:
             # Spec 03 I75, re-read under the lock after this run's reads: the re-adopted job can have
             # ended since the check before the lock. The ladder re-reads it at its tenant check too.
             _defer_to_startup_verify(kind, log)
@@ -7381,14 +7421,16 @@ async def _force_escalate_stuck_hold() -> None:
                 return
         if bound:
             _lift_hold_bound_latches(log)
-            if kind != "hold_bound_cycle" and _hold_bound_check_pending(held_age):
+            # Unchanged since the stand-down read above (no await between), so never ROUTE_STAND_DOWN.
+            route = _forced_run_route(kind, held_age).action
+            if route == ROUTE_CHECK_PENDING:
                 log("10-min hold bound: the full check after the bound's ladder still has its time")
                 return
-            if _hold_bound_cycle_next(kind, held_age):
+            if route == ROUTE_HOST_RUNG:
                 await _hold_bound_host_rung(held_age, log)
                 return
             leftover = await asyncio.to_thread(_reaped_leftover_reason)
-            if _startup_verify_owns_hold(kind):
+            if _forced_run_route(kind, held_age).action == ROUTE_STAND_DOWN:
                 _defer_to_startup_verify(kind, log)  # spec 03 I75: re-read after the leftover scan
                 return
             if leftover:
@@ -7437,7 +7479,7 @@ async def _force_escalate_stuck_hold() -> None:
             indices,
             expected,
             log,
-            stand_down=lambda: _startup_verify_owns_hold(kind),
+            stand_down=lambda: _forced_run_route(kind, held_age).action == ROUTE_STAND_DOWN,
         )
         if outcome == OUTCOME_WAITING and galaxy_recovery.startup_verify_deferred:
             _defer_to_startup_verify(kind, log, journaled=True)  # spec 03 I75: the job ended inside the ladder
@@ -7593,6 +7635,50 @@ def _hold_bound_cycle_due(age: float) -> bool:
     if not failed and age < lad + _HOLD_BOUND_CHECK_SEC:
         return False
     return _hold_bound_cycle_age is None or _hold_bound_cycle_age < lad
+
+
+# Spec 04 I75: what a forced run of one kind does at one hold age, as _forced_run_route answers it.
+ROUTE_STAND_DOWN = "startup_verify"  # the startup gate owns the hold (spec 03 I75): the window is given back
+ROUTE_CHECK_PENDING = "check_pending"  # the full check after the bound's ladder still has its time
+ROUTE_HOST_RUNG = "host_rung"  # the bound skips the ladder and asks the host rung
+ROUTE_LADDER = "ladder"
+
+
+@dataclass(frozen=True)
+class ForcedRoute:
+    """``action`` is one of the ROUTE_* names; ``until_age`` is the hold age at which a stand-down or a
+    pending check ends (None for the others)."""
+
+    action: str
+    until_age: Optional[float] = None
+
+
+def _forced_run_route(kind: Optional[str], age: float, mono: Optional[float] = None) -> ForcedRoute:
+    """The one routing of a forced run (spec 04 I75/I76, spec 03 I75): what _force_escalate_stuck_hold
+    does with a run of ``kind`` at hold age ``age`` (and monotonic time ``mono``, now by default), from
+    the broker's own records. _force_escalate_stuck_hold acts on it, and the /health next-rung report
+    reads it at each candidate time, so the two cannot diverge. It reads no device and moves no clock;
+    the device reads (a reset scope, the off-bus count, a no-reset hold, a leftover holder) stay in
+    the run."""
+    if _startup_verify_owns_hold(kind, mono):
+        ready = _startup_verify_ready_at
+        now_mono = time.monotonic() if mono is None else mono
+        # Not stopped waiting on the re-adopted jobs yet: that ends within one scope poll.
+        left = (ready if ready is not None else now_mono + _SCOPE_POLL_SEC) + STARTUP_VERIFY_DEFER_MAX_SEC - now_mono
+        return ForcedRoute(ROUTE_STAND_DOWN, age + max(0.0, left))
+    return _hold_bound_route(kind, age)
+
+
+def _hold_bound_route(kind: Optional[str], age: float) -> ForcedRoute:
+    """_forced_run_route past the startup stand-down: from the 10-min bound on, a pending post-ladder
+    check or the host rung in place of the ladder (spec 04 I76); below it, the ladder."""
+    if age < _stuck_hold_ceiling_sec():
+        return ForcedRoute(ROUTE_LADDER)
+    if kind != "hold_bound_cycle" and _hold_bound_check_pending(age):
+        return ForcedRoute(ROUTE_CHECK_PENDING, (_hold_bound_ladder_age or 0.0) + _HOLD_BOUND_CHECK_SEC)
+    if _hold_bound_cycle_next(kind or "", age):
+        return ForcedRoute(ROUTE_HOST_RUNG)
+    return ForcedRoute(ROUTE_LADDER)
 
 
 def _lift_hold_bound_latches(log) -> None:
@@ -11887,7 +11973,7 @@ STARTUP_VERIFY_DEFER_MAX_SEC = STARTUP_HUGEPAGES_WAIT_SEC + FABRIC_CHECK_TIMEOUT
 _STARTUP_VERIFY_DEFERRABLE_KINDS = ("ceiling_window", "offbus_one_shot")
 
 
-def _startup_verify_owns_hold(kind: Optional[str] = None) -> bool:
+def _startup_verify_owns_hold(kind: Optional[str] = None, mono: Optional[float] = None) -> bool:
     """Spec 03 I75: True while the startup gate (the full check, fabric included) is still to run on
     the startup hold, so the ceiling escalation and the idle relift leave that hold to it.
 
@@ -11899,7 +11985,8 @@ def _startup_verify_owns_hold(kind: Optional[str] = None) -> bool:
     Only the gap from the job's end to the gate's verdict: while a job still runs, the escalations meet
     it as before (deferred on ``job_running``, journaled). A hold with chips off the bus keeps the
     off-bus one-shot and its ladder (spec 03 I23), and a forced run of a kind whose window cannot be
-    given back (``kind`` outside _STARTUP_VERIFY_DEFERRABLE_KINDS) runs, so neither waits on the gate."""
+    given back (``kind`` outside _STARTUP_VERIFY_DEFERRABLE_KINDS) runs, so neither waits on the gate.
+    ``mono`` reads the bound at another monotonic time (the /health next-rung report, spec 04 I75)."""
     task = _startup_verify_task
     if task is None or task.done():
         return False
@@ -11910,7 +11997,7 @@ def _startup_verify_owns_hold(kind: Optional[str] = None) -> bool:
     if isolated_chips or any(j.status == JobStatus.RUNNING for j in jobs.values()):
         return False
     ready = _startup_verify_ready_at
-    return ready is None or time.monotonic() - ready < STARTUP_VERIFY_DEFER_MAX_SEC
+    return ready is None or (time.monotonic() if mono is None else mono) - ready < STARTUP_VERIFY_DEFER_MAX_SEC
 
 
 async def _await_startup_prerequisites(missing: str) -> None:

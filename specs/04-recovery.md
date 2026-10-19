@@ -1018,8 +1018,11 @@ each rung fires only when the gentler one failed or cannot apply.
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
   the window (at most 2 h).
 - **I75 — The next rung `/health` names is the earliest one some code will fire.** One helper
-  (`health/hold_report.py`, used by spec 03 I72) mirrors the hold-deadline watchdog's clocks and its
-  guards, takes the earliest armed deadline and reports its rung, time and source:
+  (`health/hold_report.py`, used by spec 03 I72) reads the hold-deadline watchdog's clocks, takes the
+  earliest armed deadline that acts, and reports its rung, time and source. What a forced run does
+  with a deadline comes from one pure routing function, `_forced_run_route(kind, age, mono)`, which
+  `_force_escalate_stuck_hold` itself calls and the report evaluates at each candidate's time; the
+  report never keeps its own copy of the forced run's guards:
   - with no hold-episode clock (the one the watchdog keys on), no forced candidate: the watchdog
     fires none, so only a registered feed may name one;
   - with the forced escalation off or a fabric-77-only hold, every forced candidate below fires no
@@ -1054,6 +1057,17 @@ each rung fires only when the gentler one failed or cannot apply.
     try; none once its episode closed or with no host rung opted in. It is the sampler's own rung,
     not a forced spawn, so the 10-min floor above does not move it;
   - every registered deadline feed.
+  Each forced candidate above (the off-bus forced pass, the I65 retry, the class-A ladder, the I76
+  host rung, the one-shot, the progress retry, the ceiling windows) is routed at its time: a
+  startup-gate stand-down (spec 03 I75: a ceiling window or one-shot while the startup gate owns the
+  hold) is reported as `startup health check, then <rung>` at the stand-down's bounded end (the
+  re-adopted jobs' end plus `STARTUP_VERIFY_DEFER_MAX_SEC`), source `startup gate stand-down
+  (<source>)`; a run that returns while the bound ladder's post-ladder check is pending is no
+  candidate, so the next window or the host rung at that check's end is reported instead; a run
+  routed to the I76 host rung reports `power cycle` (or `warm reboot`), source `hold bound host
+  rung at <source>`, or nothing when no host rung is opted in; a ceiling window that does not act
+  hands over to the next one. The pending host request, the feeds and the I70 leftover rung are not
+  forced runs and are not routed.
   A deadline that has passed but whose spawn was declined (a device op or an escalation in flight)
   is reported at its own time with `next_rung_due: true`, never moved to a later window: the
   watchdog retries it every tick. With no armed deadline the fields are `null`. A feed that raises
@@ -1938,4 +1952,5 @@ sees a silent fabric pass.
 | I75 (a declined deadline stays reported with `next_rung_due`; no episode clock names no forced rung) | `tests/test_health_hold_report.py::test_a_declined_window_stays_reported_as_due`, `tests/test_health_hold_report.py::test_no_episode_clock_names_no_forced_rung` |
 | I75 (the I73 class-A 10-min ladder and the I70 unkillable-leftover host rung are named when the code fires them) | `tests/test_health_hold_report.py::test_the_class_a_10_min_ladder_is_named_and_fires_when_reported`, `tests/test_health_hold_report.py::test_the_class_a_ladder_is_not_named_when_the_cooldown_ends_first`, `tests/test_health_hold_report.py::test_the_unkillable_leftover_host_rung_is_named` |
 | I75 (the I65 retry only when armed for the episode and not refused by a guard; a pending host action is reported, never dropped) | `tests/test_health_hold_report.py::test_the_cooldown_retry_is_named_only_when_the_watchdog_asks_it`, `tests/test_health_hold_report.py::test_the_cooldown_retry_fires_when_reported`, `tests/test_health_hold_report.py::test_a_pending_host_action_is_reported_and_left_alone` |
+| I75 (one routing for the report and the forced run: a window inside the post-ladder check, a window after a ladder that did not recover, a class-A mark inside the check window, a startup-gate stand-down; each reported where the watchdog acts) | `tests/test_health_hold_report.py::test_the_report_names_the_rung_the_forced_run_routes_to`, `tests/test_health_hold_report.py::test_a_class_a_ladder_mark_inside_the_check_window_is_not_reported`, `tests/test_health_hold_report.py::test_a_startup_verify_stand_down_is_reported_with_its_bounded_end` |
 | I75 (deadline feeds: the hold bound wins when earlier, moves to the cooldown end inside it; a broken feed reports nothing) | `tests/test_health_hold_report.py::test_the_hold_bound_feed_wins_when_earlier`, `tests/test_health_hold_report.py::test_the_hold_bound_inside_the_cooldown_moves_to_its_end`, `tests/test_health_hold_report.py::test_a_broken_feed_reports_nothing` |

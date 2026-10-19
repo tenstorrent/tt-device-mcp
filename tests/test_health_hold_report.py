@@ -629,3 +629,105 @@ def test_the_unkillable_leftover_host_rung_is_named(held, monkeypatch):
     monkeypatch.setattr(srv, "_leftover_rung_stage", "")
     monkeypatch.setattr(srv, "_leftover_unkillable_mono", None)
     assert _payload()["next_rung_source"] != "unkillable leftover budget"
+
+
+# ---- one routing for the report and the watchdog (spec 04 I75) -----------------------------------
+
+_ROUTE_RUNG = {srv.ROUTE_LADDER: "forced ladder", srv.ROUTE_HOST_RUNG: "power cycle"}
+
+
+def _acts_at(t: float, monkeypatch, read_at: float):
+    """What the watchdog really does at epoch ``t``: the first kind its tick spawns, routed by the
+    forced run's own routing (the monotonic clock moved on by ``t - read_at``). None when no spawn
+    acts: nothing fires, or the run returns on a pending post-ladder check or a startup stand-down."""
+    kinds = _fires(t, monkeypatch)
+    if not kinds:
+        return None
+    route = srv._forced_run_route(kinds[0], t - START, srv.time.monotonic() + (t - read_at))
+    return _ROUTE_RUNG.get(route.action)
+
+
+def _first_act(read_at: float, until: float, monkeypatch, step: float = 10.0):
+    t = read_at
+    while t <= until:
+        act = _acts_at(t, monkeypatch, read_at)
+        if act is not None:
+            return t, act
+        t += step
+    return None
+
+
+def _report(read_at: float):
+    p = srv._health_payload(now=datetime.fromtimestamp(read_at))
+    return p["next_rung"], p["next_rung_source"], p["next_rung_at"]
+
+
+def _bound_ladder_ran(monkeypatch, lad: float, recovered: bool) -> None:
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv, "_hold_bound_episode", _episode())
+    monkeypatch.setattr(srv, "_hold_bound_ladder_age", lad)
+    monkeypatch.setattr(srv, "_hold_bound_ladder_recovered", recovered)
+    monkeypatch.setattr(srv, "_hold_bound_cycle_age", None)
+    monkeypatch.setattr(srv, "_hold_bound_rung_pending", False)
+    monkeypatch.setattr(srv, "_hold_bound_check_failed_age", None)
+
+
+@pytest.mark.parametrize(
+    "recovered, at, source",
+    [(True, 1300, "hold bound host rung"), (False, 1200, "hold bound host rung at hold ceiling window 2")],
+)
+def test_the_report_names_the_rung_the_forced_run_routes_to(held, monkeypatch, recovered, at, source):
+    """A bound ladder ran at 1000 s. Window 2 (1200 s) is then no ladder: while its post-ladder check
+    is pending the run returns, so the host rung follows at the check's end (1300 s); when that ladder
+    did not bring the mesh back, window 2 itself goes to the host rung. The report answers what the
+    watchdog's own routing does, at the same time."""
+    held["off"] = {3, 4, 5, 6}
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
+    _bound_ladder_ran(monkeypatch, 1000.0, recovered)
+    read_at = START + 1100
+    assert _report(read_at) == ("power cycle", source, _iso(START + at))
+    assert _first_act(read_at, START + 1900, monkeypatch) == (START + at, "power cycle")
+
+
+def test_a_class_a_ladder_mark_inside_the_check_window_is_not_reported(held, monkeypatch):
+    """The class A 10-min ladder falls due at 1000 s while the bound ladder's check (900 s + 300 s)
+    is pending: the run returns there, so the report skips it and names the host rung at 1200 s."""
+    held["off"] = set(TRAY_CHIPS[0x40])
+    monkeypatch.setattr(held["m"], "whole_tray_off", list(TRAY_CHIPS[0x40]))
+    monkeypatch.setattr(held["m"], "_class_a_ladder_anchor", None)
+    monkeypatch.setattr(held["m"], "_class_a_ladder_spawned", None)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
+    _deny(held["m"], START + 400 + 1800, last=START + 400)
+    _bound_ladder_ran(monkeypatch, 900.0, True)
+    read_at = START + 950
+    assert "class_a_ladder" in _fires(START + 1000, monkeypatch), "the mark is due inside the window"
+    rung, source, at = _report(read_at)
+    assert source != "class A 10-min ladder"
+    assert _first_act(read_at, START + 2400, monkeypatch) == (datetime.fromisoformat(at).timestamp(), rung)
+
+
+def test_a_startup_verify_stand_down_is_reported_with_its_bounded_end(held, monkeypatch):
+    """Spec 03 I75: a ceiling window due while the startup gate still owns the hold stands down; the
+    report names the gate first and the window's ladder at the stand-down's bounded end, when the
+    watchdog's run stops standing down."""
+    held["state"] = ServerState.RECOVERING
+    srv.fsm.on_fault("startup_unverified", detail="broker start", dirty=False)
+    monkeypatch.setattr(srv, "jobs", {})
+
+    class _Pending:
+        def done(self):
+            return False
+
+    monkeypatch.setattr(srv, "_startup_verify_task", _Pending())
+    monkeypatch.setattr(srv, "_startup_verify_ready_at", srv.time.monotonic() - 30)
+    read_at = START + 620
+    assert srv._forced_run_route("ceiling_window", 620).action == srv.ROUTE_STAND_DOWN
+    rung, source, at = _report(read_at)
+    end = read_at + srv.STARTUP_VERIFY_DEFER_MAX_SEC - 30
+    assert (rung, source) == (
+        "startup health check, then forced ladder",
+        "startup gate stand-down (hold ceiling window 1)",
+    )
+    assert abs(datetime.fromisoformat(at).timestamp() - end) <= 2
+    t, act = _first_act(read_at, end + 60, monkeypatch, step=5.0)
+    assert act == "forced ladder" and abs(t - end) <= 5
