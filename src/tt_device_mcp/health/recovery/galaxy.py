@@ -9,6 +9,7 @@ the one the between-job health gate now steers on.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import math
 import os
@@ -19,11 +20,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import alert, metrics, privileges
-from tt_device_mcp.device_holders import holder_comm, is_tenant, username_for_uid
+from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
+from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
-from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count
-from tt_device_mcp.health.monitors.pci import chip_node_present, pci_bus_number
+from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count, unreadable_on_bus_chips
+from tt_device_mcp.health.monitors.hostpci import link_down
+from tt_device_mcp.health.monitors.pci import chip_node_present, chip_pci_bdfs, pci_bus_number
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
     BLOCKED,
@@ -44,7 +47,12 @@ from tt_device_mcp.health.recovery import (
     offbus_power_cycle,
     pcie_guard,
 )
-from tt_device_mcp.health.recovery.base import HOLD_ESCALATION_REARM_SEC, drop_returned_isolated, refuse_mesh_reset
+from tt_device_mcp.health.recovery.base import (
+    CLASS_A_LADDER_AFTER_SEC,
+    HOLD_ESCALATION_REARM_SEC,
+    drop_returned_isolated,
+    refuse_mesh_reset,
+)
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
@@ -225,8 +233,9 @@ def _ubb_reset_enabled() -> bool:
     BMC, so a host with no reachable BMC reports the rung OFF rather than choosing it and raising.
 
     A re-power that took chips on other trays off the bus (``ubb_reset_regressed_offbus``) declines the
-    walk and the back-to-back sweep's tray re-power for the rest of the boot
-    (:func:`pcie_guard.disable_tray_rung`, kept across broker restarts); it leaves this switch as it is.
+    walk and the back-to-back sweep's tray re-power on this host for ``TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS``
+    (:func:`pcie_guard.disable_tray_rung`, kept across broker restarts and reboots, re-armed by
+    :func:`pcie_guard.clear_tray_rung_cmd`); it leaves this switch as it is.
     """
     if os.environ.get("TT_DEVICE_MCP_AUTO_UBB_RESET", "1").strip() == "0":
         return False
@@ -240,8 +249,9 @@ def _ubb_single_tray_walk_enabled() -> bool:
     A single-tray re-power is not isolated on a Galaxy: the BMC pulse has taken the other trays off the
     bus with it (measured: one chip off tray 3 on a 32/32 box, tray 3 re-powered, 24 chips off the bus
     40 s later). A drop that small self-heals or is cleared by the whole-box host rung, so the walk
-    holds for those instead of re-powering. The tray-down-no-window sweep, which ends in the power cycle
-    anyway, is not affected."""
+    holds for those instead of re-powering. It also turns back on the walk of a drop that holds a whole
+    tray, which otherwise goes straight to the bounded power cycle. The tray-down-no-window sweep, which
+    ends in the power cycle anyway, is not affected."""
     return os.environ.get("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "0").strip() == "1"
 
 
@@ -252,13 +262,13 @@ def _stuck_hold_ceiling_sec() -> int:
     ceiling has already had every gentler rung and their retries; the box is idle and
     tenant-refused, so climbing then costs nothing a longer wait would save. Parsed defensively — a
     malformed or non-positive value reads as the default, never 0 (which would escalate the instant
-    a hold latched)."""
+    a hold latched). Never above 600 (spec 04 I76): the env may shorten the bound, never lengthen it."""
     raw = os.environ.get("TT_DEVICE_MCP_STUCK_HOLD_SEC", "").strip()
     try:
         v = int(raw)
     except ValueError:
         return 600
-    return v if v > 0 else 600
+    return v if 0 < v <= 600 else 600
 
 
 def _offbus_hold_ceiling_sec() -> int:
@@ -302,6 +312,19 @@ def _settle_before_host_rung_sec() -> int:
     return v if v > 0 else 60
 
 
+def _progress_retry_sec() -> int:
+    """Seconds between a failed mesh reset that brought chips back and its one forced retry (spec 04
+    I39). Long enough for the pollers and re-enumeration to settle after the reset, far short of the
+    600 s ceiling window. ``TT_DEVICE_MCP_PROGRESS_RETRY_SEC``; malformed or non-positive reads as the
+    default (60), and it is capped at the hold ceiling so it can never wait longer than before."""
+    raw = os.environ.get("TT_DEVICE_MCP_PROGRESS_RETRY_SEC", "").strip()
+    try:
+        v = int(raw)
+    except ValueError:
+        v = 60
+    return min(v if v > 0 else 60, _stuck_hold_ceiling_sec())
+
+
 def _classify_hold(
     offbus_chips: set,
     expected: int,
@@ -334,6 +357,85 @@ def _classify_hold(
         if not isinstance(rec, dict) or rec.get("reason") != "no_bridge":
             return HOLD_CLASS_GENERIC
     return HOLD_CLASS_TRAY_DOWN_NO_WINDOW
+
+
+# The two off-bus fault classes that go to the power cycle with no further reset (spec 04 I37). A: one
+# or more whole UBB trays off the bus (no whole-tray drop has healed without a power cycle: 0/50 on one
+# Galaxy host). C: every chip still off the bus after a mesh reset already ran and failed this episode
+# (one mesh reset has healed an all-off bus, so the first one still runs, at startup too; a repeat on
+# the unchanged set ran 130-262 s and exited 1). Neither gets a sweep or tray re-power.
+FAULT_CLASS_WHOLE_TRAY = "A"
+FAULT_CLASS_ALL_OFF = "C"
+
+
+def _power_cycle_direct_class(
+    offbus_chips: set,
+    expected: int,
+    tray_map: Optional[dict],
+    *,
+    mesh_reset_failed: bool,
+    present_buses: Optional[Mapping] = None,
+    tray_groups=(),
+) -> Optional[str]:
+    """The I37 fault class of an off-bus set, or None when the ordinary ladder applies.
+
+    ``FAULT_CLASS_ALL_OFF`` when every chip is off the bus and ``mesh_reset_failed``: a mesh reset
+    already ran and failed on it, or the broker's own reboot or power cycle for this fault did not
+    bring it back (the callers pass both, spec 04 I37). A whole-bus drop with no failed reset gets
+    its one mesh reset first, at the startup gate as at run time: the startup gate also runs after a
+    broker restart, and one mesh reset has brought a whole bus back there. ``FAULT_CLASS_WHOLE_TRAY``
+    when the set is exactly one or more whole trays and at least one chip of the mesh is still on the
+    bus. With no tray map (a broker that never read a full mesh, as on a boot that came up short),
+    ``present_buses`` (``{chip id: PCI bus}`` of the chips still on the bus) and ``tray_groups`` (the
+    UBB bus groups) decide it instead, see :func:`_whole_trays_absent`. Anything else — a
+    partial-tray drop, a single chip, a host with fewer than two trays, or neither a map nor a
+    presence read that says which chips share a tray — is None. Pure and side-effect-free."""
+    if expected < 2 * UBB_CHIP_COUNT or not offbus_chips:
+        return None
+    if len(offbus_chips) >= expected:
+        return FAULT_CLASS_ALL_OFF if mesh_reset_failed else None
+    if _ubb_reset_plan(offbus_chips, expected, tray_map) is not None:
+        return FAULT_CLASS_WHOLE_TRAY
+    if tray_map is None and _whole_trays_absent(present_buses, expected, offbus_chips, tray_groups):
+        return FAULT_CLASS_WHOLE_TRAY
+    return None
+
+
+def _whole_trays_absent(present_buses: Optional[Mapping], expected: int, offbus_chips, tray_groups) -> bool:
+    """Whether the chips still on the bus fill whole trays and every chip off the bus is accounted for
+    by trays with none left on it: class A read from presence alone (spec 04 I37), for a broker with
+    no I16 tray map. See :func:`_absent_tray_groups`. Pure and side-effect-free."""
+    return bool(_absent_tray_groups(present_buses, expected, offbus_chips, tray_groups))
+
+
+def _absent_tray_groups(present_buses: Optional[Mapping], expected: int, offbus_chips, tray_groups) -> list:
+    """The sorted UBB bus groups with no chip on the bus when the presence read is a clean whole-tray
+    drop, else []. A tray's chips share one PCI bus group (``bus & 0xF0``, the key tt-smi's UBB tables
+    use), so this needs no board type and no chip numbering, only the live buses.
+
+    Non-empty only when the host has exactly ``len(tray_groups)`` trays of ``UBB_CHIP_COUNT`` chips,
+    the chip ids missing from ``present_buses`` are exactly ``offbus_chips`` (a heartbeat read and a
+    sysfs read that raced can never pair the wrong chips), every present chip sits in a known group,
+    each group holds all or none of its chips, at least one group is empty and one full, and the empty
+    groups' chips are exactly the off-bus count. Anything unreadable or out of shape is []: the
+    ladder decides, as before. Pure and side-effect-free."""
+    groups = set(tray_groups or ())
+    off = {str(i) for i in offbus_chips or ()}
+    if not present_buses or not groups or not off or len(groups) * UBB_CHIP_COUNT != expected:
+        return []
+    present_ids = {str(i) for i in present_buses}
+    if len(present_ids) + len(off) != expected or {str(i) for i in range(expected)} - present_ids != off:
+        return []
+    counts = dict.fromkeys(groups, 0)
+    for bus in present_buses.values():
+        group = bus & 0xF0 if isinstance(bus, int) else None
+        if group not in counts:
+            return []
+        counts[group] += 1
+    if any(n not in (0, UBB_CHIP_COUNT) for n in counts.values()):
+        return []
+    empty = sorted(g for g, n in counts.items() if n == 0)
+    return empty if 0 < len(empty) < len(groups) and len(empty) * UBB_CHIP_COUNT == len(off) else []
 
 
 def _hold_age_sec(hold_since: str) -> Optional[float]:
@@ -527,6 +629,8 @@ def _route(
     reboot_blocked: bool,
     holding_fabric_unverified: bool = False,
     dispatch_reset_due: bool = False,
+    eth_timeout_reset_due: bool = False,
+    kill_reset_due: bool = False,
 ) -> str:
     """The single gentlest-first recovery rung justified by the current degradation — THE escalation
     policy, reached through :class:`GalaxyRecovery`'s ``next_stage``, which folds the host-rung
@@ -589,7 +693,9 @@ def _route(
     * ``dispatch_reset_due`` with every chip present and none frozen -> ``STAGE_SMI_RESET``: the
       fabric passed traffic but mesh dispatch failed, which no self-heal clears; the caller grants
       this once per hold episode, and the full check, fabric included, decides the release
-      (spec 03 I55).
+      (spec 03 I55). ``eth_timeout_reset_due`` takes the same rung: a clean post-job eth read timed
+      out with no verdict on a present mesh (spec 03 I61), and so does ``kill_reset_due``: a job the
+      broker stopped mid-run, by its timeout or a requested kill (spec 03 I69).
     * below the galaxy floor with nothing to surgically reset -> ``STAGE_UBB_TRAY``: the per-tray
       BMC reset is the next-gentlest rung the gate always attempts before holding — a single/
       few-chip wedge self-heals otherwise, and a galaxy reset there is the measured
@@ -634,7 +740,7 @@ def _route(
         return DEFER
     if sbr_candidates > 0 and last_action != STAGE_BRIDGE_RESET:
         return STAGE_BRIDGE_RESET
-    if dispatch_reset_due and off_bus == 0 and frozen_chips == 0:
+    if (dispatch_reset_due or eth_timeout_reset_due or kill_reset_due) and off_bus == 0 and frozen_chips == 0:
         return STAGE_SMI_RESET
     if galaxy_floor is not None and off_bus + frozen_chips < galaxy_floor:
         return STAGE_UBB_TRAY
@@ -916,6 +1022,26 @@ def tray_down_onset(off_ids, chip_buses, board_type) -> Optional[dict]:
     return _tray_down_counts(off_ids, _tray_map(chip_buses, board_type))
 
 
+def _whole_trays_off(offbus_chips: set, expected: int, tray_map: Optional[dict]) -> list:
+    """The sorted trays every chip of which is off the bus (others may be partly off too), or [] on
+    every condition :func:`_offbus_ids_on_trays` refuses. Pure and side-effect-free."""
+    ids = _offbus_ids_on_trays(offbus_chips, expected, tray_map)
+    if ids is None:
+        return []
+    return sorted(tray for tray, chips in tray_map.items() if chips and set(chips) <= ids)
+
+
+def _offbus_fault_class(off_bus: int, expected: int, whole: bool) -> str:
+    """The time-to-recover class an off-bus hold is measured in (spec 04 I27): ``whole_tray`` (a whole UBB
+    tray off the bus), ``all_off``, ``tray_partial`` (4 or more chips, no whole tray) or ``partial_offbus``
+    (1-3 chips). Carried on the hand-off's journal events so per-class sweeps need not guess it."""
+    if whole:
+        return "whole_tray"
+    if expected > 0 and off_bus >= expected:
+        return "all_off"
+    return "tray_partial" if off_bus >= 4 else "partial_offbus"
+
+
 def _ubb_tray_walk_plan(offbus_chips: set, expected: int, tray_map: Optional[dict]) -> Optional[list]:
     """Order the trays for a one-at-a-time per-tray reset walk: the AFFECTED trays only (those that
     hold an off-bus chip, sorted), re-verifying between each. A tray whose chips are all on the bus is
@@ -967,6 +1093,21 @@ def _maybe_emit_ubb_reset_required(beats: dict, off_bus: int, expected: int, log
     return trays
 
 
+# The recorded reason of the I29 host rung on a 77 (spec 04 I29): the boot it brings up reads it from the
+# reboot ledger, so a 77 that survives the reboot is handed to an operator instead of climbing again.
+FABRIC_77_HOST_RUNG_CAUSE = "idle escalation: fabric unverified (77) after the reset and the last-chance sweep"
+# How long a 77 the host rung did not end stands for an operator (the act-by time on its page).
+FABRIC_77_HANDOFF_SEC = 1200
+# What _climb_to_host_recovery_after_failed_reset did besides NO_HOST_RUNG: requested the reboot or power
+# cycle; only waited (the hold is younger than the ladder ceiling, a reset still cycles in its scope, the
+# sweep recovered or could not run in full), so a later escalation retries; or auto_recovery_allowed denied
+# the opted-in rung (rate limit, tenant). NO_HOST_RUNG and a denial are the two ways it cannot run.
+HOST_RUNG_FIRED = "fired"
+HOST_RUNG_DEFERRED = "deferred"
+HOST_RUNG_DENIED = "denied"
+HOST_RUNG_CANNOT_RUN = (NO_HOST_RUNG, HOST_RUNG_DENIED)
+
+
 class GalaxyRecovery(Recovery):
     """Recovery for a 6U Galaxy: the mesh-wide reset, gentlest-first routing ahead of it (a
     per-chip bridge reset when a chip is surgically isolable), and the host reboot/power-cycle
@@ -976,6 +1117,26 @@ class GalaxyRecovery(Recovery):
     # no-host-rung hold already paged (spec 04 I29).
     _sweep_read_77: bool = False
     _host_rung_77_paged_since: Optional[str] = None
+    # The operator hand-off of a 77 the host rung did not end (spec 04 I29): its episode and deadline.
+    _fabric_77_handoff: Optional[dict] = None
+    # Why auto_recovery_allowed last held a host rung off (a cooldown, the rate limit, a tenant).
+    _host_rung_denied_why: str = ""
+    # The (episode, until) of the last I65 cooldown a 77 climb waited on without a page (spec 04 I79).
+    _fabric_77_cooldown_logged: Optional[tuple[str, float]] = None
+    # Whether the last idle-ladder escalate() stood down on a live tenant (spec 04 I7). The hold
+    # watchdog reads it to re-arm the window it spent, so the ladder runs once the tenant is gone
+    # rather than at the next window (spec 03 I23).
+    tenant_deferred: bool = False
+    # Spec 03 I75: the caller's stand-down for the escalate() now running (True while the startup gate
+    # is still to run on a startup hold), re-read at every tenant check; and whether that run stood down
+    # on it. The caller reads its predicate once before the device-op lock, and the re-adopted job can
+    # end in any read after that, so the last read is the one right before a rung acts.
+    _stand_down: Optional[Callable[[], bool]] = None
+    startup_verify_deferred: bool = False
+
+    def tenant_holds(self) -> bool:
+        """The forced ladders' own tenant check, alone: a running broker job or a readable tenant fd."""
+        return self._tenant_active(self.deps.enumerate_device_holders(), force=True)
 
     async def _offbus_ids_now(self, expected: int) -> Optional[set]:
         """The chip ids off the bus now, or None when the heartbeats cannot be read."""
@@ -1053,6 +1214,8 @@ class GalaxyRecovery(Recovery):
             reboot_blocked=reboot_blocked,
             holding_fabric_unverified=ev.holding_fabric_unverified,
             dispatch_reset_due=ev.dispatch_reset_due,
+            eth_timeout_reset_due=ev.eth_timeout_reset_due,
+            kill_reset_due=ev.kill_reset_due,
         )
 
     def _platform_reset_argv(self, indices: list) -> list:
@@ -1081,6 +1244,7 @@ class GalaxyRecovery(Recovery):
         ev: Optional[Evidence] = None,
         beats: Optional[dict] = None,
         measured_fault: bool = False,
+        stand_down: Optional[Callable[[], bool]] = None,
     ) -> str:
         """Run the next justified rung of this ladder and report the outcome, replacing the
         direct ``_escalate_stuck_hold``/``_escalate_offbus_stuck_hold`` calls the idle relift and
@@ -1120,11 +1284,45 @@ class GalaxyRecovery(Recovery):
         onto a mesh that passes the full verify ends the episode before the ladder.
 
         ``measured_fault`` reaches the present ladder only: the hold stands on a MEASURED fabric
-        failure, so its reset is due without the grace (spec 03 I56; see ``_stuck_hold_reset_due``)."""
+        failure, so its reset is due without the grace (spec 03 I56; see ``_stuck_hold_reset_due``).
+
+        A host reboot or power cycle still pending (spec 04 I34) stops every caller here, before
+        the prelude: nothing runs, WAITING, one log line per request.
+
+        ``stand_down`` (spec 03 I75) is re-read at every tenant check of this run: while it reads True
+        no rung acts, the run reports WAITING with ``tenant_deferred`` and ``startup_verify_deferred``
+        set, and the caller leaves the hold to the startup gate."""
+        self._stand_down = stand_down
+        self.startup_verify_deferred = False
+        try:
+            return await self._escalate_phase(
+                phase, indices, expected, log, stage=stage, ev=ev, beats=beats, measured_fault=measured_fault
+            )
+        finally:
+            self._stand_down = None
+
+    async def _escalate_phase(
+        self,
+        phase: str,
+        indices: list,
+        expected: int,
+        log,
+        *,
+        stage: Optional[str],
+        ev: Optional[Evidence],
+        beats: Optional[dict],
+        measured_fault: bool,
+    ) -> str:
+        """:meth:`escalate`'s body, run with its ``stand_down`` in place."""
+        if self.mechanism.host_action_blocks_reset(log, context=f"escalate({phase})"):
+            return OUTCOME_WAITING
         rung, _, gate_phase = phase.partition("/")
         if await self._tray_down_latch(expected, beats) == TRAY_DOWN_ONSET and not self._td["prelude_done"]:
             if await self._tray_down_prelude(expected, log, phase=gate_phase or rung):
                 return OUTCOME_RECOVERED
+        direct = await self._power_cycle_direct_from_escalate(rung, gate_phase, stage, expected, beats, log)
+        if direct is not None:
+            return direct
         # Anything that reaches a ladder from here may reset: an onset first sighted after this is
         # not an onset any more (the ladder can turn a 1-chip drop into a whole tray off).
         self._td_reset_seen = True
@@ -1135,6 +1333,7 @@ class GalaxyRecovery(Recovery):
             force, rung = True, rung[: -len("-forced")]
         else:
             force = False
+        self.tenant_deferred = False
         if rung == "offbus":
             ran = await self._escalate_offbus_stuck_hold(indices, expected, log, force=force)
         elif rung == "present":
@@ -1144,6 +1343,258 @@ class GalaxyRecovery(Recovery):
         if not ran:
             return OUTCOME_WAITING
         return OUTCOME_RECOVERED if was_degraded and not self.deps.device_degraded() else OUTCOME_TERMINAL
+
+    def _presence_read(self, offbus: set, expected: int) -> tuple:
+        """``(present_buses, tray_groups)`` for :func:`_absent_tray_groups`: tt-smi's UBB bus groups
+        and ``{chip id: PCI bus}`` of the chips sysfs lists that are not in ``offbus``. A chip the
+        heartbeat calls off the bus is not present even if its node lingers (an all-ones endpoint the
+        kernel still lists), nor is one whose link reads down (:func:`hostpci.link_down`), so neither
+        can fill a tray it left. ``(None, ())`` with no tables."""
+        if not 0 < len(offbus) < expected:
+            return None, ()
+        groups = {g for table in (_ubb_bus_id_tables() or {}).values() for g in table.values()}
+        if not groups:
+            return None, ()
+        off = {str(i) for i in offbus}
+        return {
+            i: pci_bus_number(a) for i, a in chip_pci_bdfs().items() if str(i) not in off and not link_down(a)
+        }, groups
+
+    def _power_cycle_direct_class_now(self, offbus: set, expected: int, tray_map: Optional[dict], log) -> Optional[str]:
+        """:func:`_power_cycle_direct_class` on this broker's live state. With no tray map, the chips
+        still on the bus are read from sysfs and grouped by tt-smi's UBB bus groups, so a whole-tray
+        drop the broker never saw a full mesh before (a short boot, a restart into a drop) is still
+        class A at its first gate pass, not after the hold ceiling and a mesh reset (spec 04 I37).
+
+        When the set as read is not class A, the chips in it that are enumerated and bound but whose
+        heartbeat read fails (EIO, a missing attribute: :func:`unreadable_on_bus_chips`) are taken as
+        on the bus and the set is classified again, for class A only: survivors of a whole-tray drop
+        that read like this would otherwise make it look all-off (one mesh reset, then class C) or
+        partial (the full ladder). Every other answer is the one the set as read gives."""
+        mesh_reset_failed = (
+            self.mechanism.mesh_reset_failed_this_boot(offbus) or self.mechanism.broker_cycled_this_episode()
+        )
+
+        def classify(off: set) -> tuple:
+            present_buses, groups = (None, ()) if tray_map is not None else self._presence_read(off, expected)
+            return (
+                _power_cycle_direct_class(
+                    off,
+                    expected,
+                    tray_map,
+                    mesh_reset_failed=mesh_reset_failed,
+                    present_buses=present_buses,
+                    tray_groups=groups,
+                ),
+                present_buses,
+            )
+
+        fault_class, present_buses = classify(offbus)
+        unreadable: set = set()
+        if fault_class != FAULT_CLASS_WHOLE_TRAY and offbus and expected >= 2 * UBB_CHIP_COUNT:
+            unreadable = unreadable_on_bus_chips(offbus) & {str(i) for i in offbus}
+            if unreadable:
+                on_bus_class, on_bus_present = classify({str(i) for i in offbus} - unreadable)
+                if on_bus_class == FAULT_CLASS_WHOLE_TRAY:
+                    fault_class, present_buses = on_bus_class, on_bus_present
+                    log(
+                        f"chip(s) [{','.join(sorted(unreadable, key=int))}] are enumerated and bound but their "
+                        f"heartbeat read fails — on the bus, unhealthy; the rest of the off-bus set is whole "
+                        f"tray(s): class A"
+                    )
+                    health_event(
+                        "class_a_unreadable_survivors",
+                        unreadable=sorted(unreadable, key=int),
+                        off_bus=sorted({str(i) for i in offbus} - unreadable, key=int),
+                        expected=expected,
+                    )
+        # Spec 04 I73: the governor counts the broker cycles for this tray, and flags the AC-needed
+        # state, only while a whole tray is what is off; any other read clears it.
+        self.mechanism.whole_tray_off = sorted(offbus, key=int) if fault_class == FAULT_CLASS_WHOLE_TRAY else None
+        if fault_class == FAULT_CLASS_WHOLE_TRAY and present_buses is not None:
+            log(
+                f"no tray map banked: the {len(present_buses)} chip(s) on the bus fill whole trays and "
+                f"{len(offbus) - len(unreadable)} chip(s) are off — class A from bus presence"
+            )
+        return fault_class
+
+    async def _power_cycle_direct_from_escalate(
+        self, rung: str, gate_phase: str, stage: Optional[str], expected: int, beats: Optional[dict], log
+    ) -> Optional[str]:
+        """Spec 04 I37 at the ladder's entry: an off-bus set of class A or C goes to the power cycle
+        before any rung fires. None when it does not apply (the ladder runs as before); else the
+        outcome — WAITING while it holds (a tenant, a reset in scope, a stand-back, a rate limit) or
+        on the gate after the cycle was requested, TERMINAL on an idle ladder that requested it.
+
+        The gate's host-rung stages keep their own path (the last-chance sweep there skips itself
+        for these classes, see :meth:`_settle_and_verify_before_host_rung`), and a reset already
+        cycling in its scope is adopted and verified first. The present-mesh ladder has no chip off
+        the bus, and an idle off-bus hold whose escalation is switched off stays read-only."""
+        if rung == "gate":
+            if stage in (STAGE_HOST_REBOOT, STAGE_POWER_CYCLE, DEFER):
+                return None
+        elif rung == "offbus-forced":
+            pass
+        elif rung != "offbus" or not _offbus_hold_escalate_enabled():
+            return None
+        if beats is None:
+            try:
+                beats = await asyncio.to_thread(self.deps.read_heartbeats)
+            except Exception:  # noqa: BLE001 - unreadable: no class, the ladder decides as before
+                return None
+        offbus = _offbus_chip_ids(beats or {}, expected)
+        fault_class = self._power_cycle_direct_class_now(offbus, expected, self._tray_map_now(), log)
+        if fault_class is None:
+            return None
+        fired = await self._power_cycle_direct(
+            fault_class, offbus, expected, log, context=gate_phase or rung, force=rung == "offbus-forced"
+        )
+        if fired is None:
+            return None
+        if (
+            fired is False
+            and rung == "offbus-forced"
+            and fault_class == FAULT_CLASS_WHOLE_TRAY
+            and self.mechanism.class_a_ladder_due()
+        ):
+            # Spec 04 I73: the cooldown refused the cycle, and the hold has stood 10 min since its last
+            # cycle or boot. The full ladder runs once now (each reset followed by the full health
+            # check, fabric included); the cycle still fires the moment the cooldown ends.
+            log(
+                f"whole tray(s) off and the power cycle in cooldown {CLASS_A_LADDER_AFTER_SEC}s after the last "
+                f"cycle or boot — running the full ladder; the cycle follows at the cooldown's end if it fails"
+            )
+            health_event("class_a_cooldown_ladder", off_bus=sorted(offbus, key=int), expected=expected)
+            return None
+        if fired and rung != "gate":
+            return OUTCOME_TERMINAL
+        return OUTCOME_WAITING
+
+    async def _power_cycle_direct(
+        self, fault_class: str, offbus_chips: set, expected: int, log, *, context: str, force: bool = False
+    ) -> Optional[bool]:
+        """Request the power cycle for an I37 class with no reset, sweep or tray re-power first.
+
+        None when no power cycle is opted in: the caller runs its ordinary ladder (I36 still stops a
+        repeat of a failed reset). False while it holds, firing nothing: a reset is cycling in its own
+        scope, a tenant holds the device or the scan is unreadable, an operator stand-back, or the
+        power-cycle rate limits deny it (journaled; the next window asks again). True once requested.
+        ``force`` (the hold-deadline climb) waives an unreadable scan, as on the tray rung, never a
+        readable tenant or a running job.
+        The boot that comes back runs the startup gate, which waits for the hugepage pool and passes
+        the full health check, fabric included, before it releases anything (goal 8)."""
+        off_bus = len(offbus_chips)
+        name = {FAULT_CLASS_WHOLE_TRAY: "whole tray(s) off the bus", FAULT_CLASS_ALL_OFF: "every chip off the bus"}
+        what = f"class {fault_class} ({name.get(fault_class, fault_class)}): {off_bus}/{expected} chip(s) off"
+        escalation, _ = _host_escalation_for_drop(
+            off_bus, expected, warm_reboot_futile=True, **self.deps.host_escalation_kwargs()
+        )
+        if escalation != "power-cycle":
+            health_event("power_cycle_direct", phase="not_opted_in", fault_class=fault_class, context=context)
+            return None
+        if await asyncio.to_thread(self.mechanism.scope_active):
+            log(f"{what}: a reset is cycling in its own scope — holding before the power cycle")
+            return False
+        if self._tenant_active(await asyncio.to_thread(self.deps.enumerate_device_holders), force=force):
+            log(f"{what}: a tenant holds the device or the scan is unreadable — holding before the power cycle")
+            return False
+        # The operator's stand-back marker and command still hold it; a missing manual-recovery check
+        # does not, as on the ladder's own host rung this cycle replaces (holding there would leave the
+        # class with no recovery at all).
+        standback = await asyncio.to_thread(offbus_power_cycle.standback_reason, require_manual_check=False)
+        if standback:
+            log(f"{what}: standing back from the power cycle — {standback}")
+            return False
+        allowed, why = self.mechanism.auto_recovery_allowed("power-cycle", tenant_active=False)
+        if not allowed:
+            log(f"{what}: power cycle held off: {why}")
+            self.mechanism._journal_auto_recovery_denied("power-cycle", why)
+            metrics.stage_fired("power_cycle", "blocked")
+            return False
+        health_event(
+            "power_cycle_direct",
+            phase="firing",
+            fault_class=fault_class,
+            off_bus=sorted(offbus_chips, key=int),
+            expected=expected,
+            context=context,
+            host_at_risk=True,
+        )
+        log(f"{what}: no further reset heals this class — power-cycling the host now (spec 04 I37)")
+        await self.deps.auto_power_cycle_host(log, f"{what}; no further reset heals this class")
+        return True
+
+    async def leftover_host_rung(self, leftover_pids, expected: int, log, *, what: str) -> tuple[str, str]:
+        """Take the host rung for an unkillable reaped leftover past its budget (spec 04 I70).
+
+        Every reset is fenced while the leftover stands (I21) and none would free it, so no ladder or
+        sweep runs first (the I22 exception). Returns ``(stage, detail)``: ``requested`` with the
+        action once fired, ``held`` with why while a guard stands (the caller asks again on its next
+        try), ``gone`` when no leftover pid is still in the scan (nothing fires; the caller re-scans,
+        which closes the episode), ``no-host-rung`` when the host opted into neither rung. The guards
+        are the forced climb's: a reset cycling in its own scope, a running broker job or a readable
+        tenant other than the leftovers themselves (an unreadable scan is waived), the operator
+        stand-back for the power cycle, and the governor (rate limits, the I65 cooldown). The scan
+        guards run again on a fresh scan after the stand-back and the governor, just before firing.
+        The boot that comes back runs the startup gate, which waits for the hugepage pool and passes
+        the full health check, fabric included, before it releases anything (goal 8)."""
+        # Read under the caller's device lock: a try spawned before another path's request (the I76
+        # bound's host rung) reaches here after it. A launch that timed out retracted its ledger record,
+        # so the governor alone would let a second cycle through (I34).
+        pending = self.mechanism.host_action_pending()
+        if pending is not None:
+            return "held", f"a host {pending[0]} requested {int(pending[1])}s ago is still pending"
+        leftovers = {int(p) for p in leftover_pids}
+        guard = await self._leftover_scan_guard(leftovers)
+        if guard is not None:
+            return guard
+        beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        off_bus = len(_offbus_chip_ids(beats, expected)) if expected > 1 else 0
+        # A warm reboot does not bring an off-bus Galaxy chip back, so any chip off the bus on a
+        # multi-chip host routes to the power cycle; with every chip present the reboot, which ends
+        # every process, comes first in the chooser's own order.
+        escalation, _ = _host_escalation_for_drop(
+            off_bus, expected, warm_reboot_futile=off_bus > 0, **self.deps.host_escalation_kwargs()
+        )
+        if escalation is None:
+            return "no-host-rung", (
+                f"no host rung is opted in ({off_bus}/{expected} chip(s) off the bus); "
+                "an operator must reboot or power-cycle the host"
+            )
+        if escalation == "power-cycle":
+            standback = await asyncio.to_thread(offbus_power_cycle.standback_reason, require_manual_check=False)
+            if standback:
+                return "held", f"standing back from the power cycle: {standback}"
+        allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=False)
+        if not allowed:
+            return "held", f"{escalation} held off: {why}"
+        # The stand-back command can run for its whole timeout: the leftover may have exited, a tenant
+        # arrived or a reset scope started meanwhile. Fire only on a fresh scan that still says go.
+        guard = await self._leftover_scan_guard(leftovers)
+        if guard is not None:
+            return guard
+        reason = f"{what}; no reset can free it (spec 04 I70)"
+        log(f"{what}: past its budget, no reset can free it — requesting the host {escalation} (spec 04 I70)")
+        if escalation == "power-cycle":
+            await self.deps.auto_power_cycle_host(log, reason)
+        else:
+            await self._auto_reboot_host(log, reason)
+        return "requested", f"{escalation} ({off_bus}/{expected} chip(s) off the bus)"
+
+    async def _leftover_scan_guard(self, leftovers: set) -> Optional[tuple[str, str]]:
+        """The I70 rung's scan guards on a fresh scan, or None to go on: ``gone`` once none of
+        ``leftovers`` still holds the device, ``held`` while a reset cycles in its own scope or a
+        running broker job or a readable tenant other than the leftovers holds it."""
+        if await asyncio.to_thread(self.mechanism.scope_active):
+            return "held", "a reset is cycling in its own scope"
+        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
+        if not leftovers & {int(h.pid) for h in scan.holders}:
+            return "gone", "the leftover no longer holds the device; nothing fired"
+        others = dataclasses.replace(scan, holders=[h for h in scan.holders if int(h.pid) not in leftovers])
+        blocker = self._tenant_blocker(others, force=True)
+        if blocker is not None:
+            return "held", self._describe_blocker(blocker)
+        return None
 
     # ---- the between-job gate's action rungs --------------------------------------------------
     #
@@ -1257,6 +1708,11 @@ class GalaxyRecovery(Recovery):
             # instead) where there is no tray to re-power, the fire is not opted in, or a guard
             # blocks it — each reads as "did not recover" and the gate's below-floor hold owns it.
             if await self._attempt_ubb_tray_reset(beats or {}, ev.off_bus if ev else 0, expected, log) is not True:
+                hold_since = self.deps.device_hold_episode_since()
+                if offbus_power_cycle.whole_tray_down_age_sec(hold_since) is not None:
+                    # A whole tray is down: the bounded power cycle now, not at the next idle window. It
+                    # runs no reset and holds the device; the post-boot startup gate re-proves the mesh.
+                    await self._offbus_gated_power_cycle(len(offbus_set), expected, hold_since, log)
                 return OUTCOME_WAITING
             self.deps.clear_device_reported_fault(f"gate/{gate_phase}: per-tray BMC reset recovered the mesh")
             self.deps.clear_device_dirty(verified=True, why=f"gate/{gate_phase}: per-tray BMC reset recovered the mesh")
@@ -1265,7 +1721,31 @@ class GalaxyRecovery(Recovery):
             # DEFER lands here too: a reset already cycling in its own scope is not a second reset
             # to start but one to ADOPT — _reset_and_verify_device waits that scope out
             # (await_foreign_scope) and verifies its result instead of issuing anything.
-            if not await self._reset_and_verify_device(indices, log):
+            ids_before = await self._offbus_ids_now(expected)
+            if stage == STAGE_SMI_RESET and ids_before and not await asyncio.to_thread(self.mechanism.scope_active):
+                failed = self.mechanism.failed_unchanged_entry("", "mesh_reset", ids_before)
+                if failed is not None:
+                    # Spec 04 I58: this boot's mesh reset already failed on exactly these chips, in this
+                    # process or before a broker restart. Never fire it again on that set: report it as
+                    # the failed rung it is, so the caller's routing takes the host rung or hands off.
+                    log(
+                        f"gate/{gate_phase}: {len(ids_before)}/{expected} off-bus and a mesh reset already "
+                        f"failed on exactly these chips this boot (rc {failed.get('rc')}) — not repeating it"
+                    )
+                    health_event(
+                        "reset_rung_skipped_failed_unchanged",
+                        rung="mesh_reset",
+                        path=f"gate/{gate_phase}",
+                        off_bus=len(ids_before),
+                        rc=failed.get("rc"),
+                    )
+                    self.mechanism.last_reset_exit_nonzero = failed.get("rc") not in (None, 0)
+                    self.mechanism.mesh_reset_failed_since_release = True
+                    metrics.stage_fired("smi_reset", "blocked")
+                    return OUTCOME_WAITING
+            recovered = await self._reset_and_verify_device(indices, log)
+            await self._note_mesh_reset_failed(recovered, "", ids_before, expected)
+            if not recovered:
                 return OUTCOME_WAITING
             self.deps.clear_device_reported_fault(f"gate/{gate_phase}: reset recovered the mesh")
             self.deps.clear_device_dirty(verified=True, why=f"gate/{gate_phase}: reset recovered the mesh")
@@ -1276,8 +1756,14 @@ class GalaxyRecovery(Recovery):
             # down, give every reset type one last back-to-back run, then ONE settle and ONE verify
             # (ladder-v2: the last-chance sweep gates every host rung): a drop that came back needs
             # no reboot or power cycle.
+            # No heartbeats passed: the sweep reads them itself, as the I37 hook does, rather than
+            # count every chip off and take a partial drop for class C.
             last_chance = await self._settle_and_verify_before_host_rung(
-                expected, log, gate_phase, offbus_chips=_offbus_chip_ids(beats or {}, expected), context="gate ladder"
+                expected,
+                log,
+                gate_phase,
+                offbus_chips=None if beats is None else _offbus_chip_ids(beats, expected),
+                context="gate ladder",
             )
             if last_chance:
                 return OUTCOME_RECOVERED
@@ -1308,6 +1794,7 @@ class GalaxyRecovery(Recovery):
         self._td = None
         self._td_reset_seen = False
         self.mechanism.reset_since_release = False
+        self.mechanism.mesh_reset_failed_since_release = False
 
     async def _tray_down_latch(self, expected: int, beats: Optional[dict]) -> Optional[str]:
         """``TRAY_DOWN_ONSET``/``"PARTIAL"`` for the open episode, latching it at the first off-bus
@@ -1466,11 +1953,18 @@ class GalaxyRecovery(Recovery):
 
     def _tenant_blocker(self, scan, *, force: bool = False) -> Optional[dict]:
         """Which check of :meth:`_tenant_active` blocks, as health_event fields, or None when none does:
-        ``blocker`` is ``job_running``, ``tenant`` (with the first tenant's pid, uid, user and comm) or
-        ``scan_incomplete`` (with the scan's source and gaps). A deferral that names its blocker tells a
+        ``blocker`` is ``job_running``, ``startup_verify`` (the running escalate's I75 stand-down), ``tenant``
+        (with the first tenant's pid, uid, user and comm) or ``scan_incomplete`` (with the scan's source
+        and gaps). A deferral that names its blocker tells a
         real tenant apart from a scan that merely could not see."""
         if self.deps.job_running():
             return {"blocker": "job_running"}
+        if self._stand_down is not None and self._stand_down():
+            self.startup_verify_deferred = True
+            return {"blocker": "startup_verify"}
+        # The broker's own probes and the holders it killed for a dead chip are not tenants, nor is
+        # a gap they leave while exiting (spec 04 I59).
+        scan = discount_broker_internal(scan)
         tenants = [h for h in scan.holders if is_tenant(h)]
         if tenants:
             h = tenants[0]
@@ -1492,6 +1986,8 @@ class GalaxyRecovery(Recovery):
         kind = blocker["blocker"]
         if kind == "job_running":
             return "a broker job is running"
+        if kind == "startup_verify":
+            return "the startup gate (full check, fabric included) runs next on this startup hold"
         if kind == "tenant":
             more = f" (+{blocker['tenants'] - 1} more)" if blocker["tenants"] > 1 else ""
             return (
@@ -1520,10 +2016,22 @@ class GalaxyRecovery(Recovery):
         except Exception as exc:  # noqa: BLE001 - best-effort, as for a mesh reset: never blocks recovery
             log(f"could not stop the device pollers before the tray re-power: {exc!r}")
         FABRIC_DEBT.note_reset(f"tray re-power 0x{bitmap:02x}")
+        # A re-power clears the tray's firmware clock cap (spec 03 I35).
+        CEILING.mark_owed(f"tray re-power 0x{bitmap:02x}")
+        fired = False
         try:
-            return await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
+            plan = await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
+            fired = True
+            return plan
         finally:
-            if quiesced:
+            if quiesced and not fired:
+                # A refused or failed re-power leaves the tray as it was: off the bus (spec 03 I66).
+                log("device pollers left stopped: the tray re-power did not fire")
+                health_event("pollers_left_quiesced", after=f"tray re-power 0x{bitmap:02x}", services=list(quiesced))
+                owe = getattr(self.mechanism, "owe_pollers", None)
+                if owe is not None:
+                    owe(f"tray re-power 0x{bitmap:02x}")
+            elif quiesced:
                 await asyncio.shield(set_pollers(True, log))
 
     async def _issue_all_resets_back_to_back(
@@ -1570,7 +2078,7 @@ class GalaxyRecovery(Recovery):
                 # A delayed cross-tray drop from an earlier pulse (position 5 on the other trays) latches here.
                 off_now = await self._offbus_ids_now(expected)
                 if off_now is not None:
-                    pcie_guard.latch_tray_pulse_drop(off_now)
+                    pcie_guard.latch_tray_pulse_drop(off_now, self.deps.device_hold_episode_since() or "")
                 if not _ubb_reset_enabled():
                     log(
                         f"per-tray BMC re-power of trays {trays} is not opted in "
@@ -1579,12 +2087,12 @@ class GalaxyRecovery(Recovery):
                     )
                     health_event("ubb_reset_required", trays=trays, command=" ".join(_ubb_reset_argv(bitmap)))
                 elif pcie_guard.tray_rung_disabled() is not None:
-                    # A tray re-power on this boot already took chips on other trays off the bus: skip it,
+                    # A tray re-power on this host already took chips on other trays off the bus: skip it,
                     # as when opted out, so the mesh reset and the bounded hand-off (I27) follow.
                     log(
-                        f"per-tray BMC re-power of trays {trays} skipped: an earlier re-power on this boot took "
+                        f"per-tray BMC re-power of trays {trays} skipped: an earlier re-power on this host took "
                         f"chips on other trays off the bus ({pcie_guard.tray_rung_disabled()}); continuing to "
-                        f"the mesh reset"
+                        f"the mesh reset; re-arm after a repair with `{pcie_guard.clear_tray_rung_cmd()}`"
                     )
                     health_event("ubb_reset_skipped_regressed", trays=trays, why=pcie_guard.tray_rung_disabled())
                 else:
@@ -1595,7 +2103,9 @@ class GalaxyRecovery(Recovery):
                     for tray in trays:
                         log(f"per-tray BMC re-power (sweep): {_tray_label(tray, tray_map or {})}: `{command}`")
                     try:
-                        pcie_guard.note_tray_pulse(trays, tray_map, off_now or ())
+                        pcie_guard.note_tray_pulse(
+                            trays, tray_map, off_now or (), self.deps.device_hold_episode_since() or ""
+                        )
                         await self._fire_tray_repower(bitmap, tray_chip_ids, log)
                     except pcie_guard.TrayRepowerRefused as exc:
                         complete = False
@@ -1684,6 +2194,39 @@ class GalaxyRecovery(Recovery):
                 log(f"could not read the heartbeats for the last-chance sweep: {exc!r}")
                 beats = {}
             offbus_chips = _offbus_chip_ids(beats or {}, expected)
+        fault_class = self._power_cycle_direct_class_now(offbus_chips, expected, tray_map, log)
+        if fault_class is not None and not await asyncio.to_thread(self.mechanism.scope_active):
+            # Spec 04 I37: the sweep's tray re-power and mesh reset have not healed this class (a
+            # whole tray, or an all-off bus whose mesh reset already failed). The caller climbs at once.
+            log(
+                f"last chance before the host rung{where}: class {fault_class} — the sweep does not heal it, skipping it"
+            )
+            health_event(
+                "last_chance_sweep_skipped",
+                context=context or gate_phase,
+                fault_class=fault_class,
+                off_bus=len(offbus_chips),
+                expected=expected,
+            )
+            return False
+        if (
+            offbus_chips
+            and self.mechanism.rung_failed_unchanged("", "mesh_reset", offbus_chips)
+            and not await asyncio.to_thread(self.mechanism.scope_active)
+        ):
+            # Spec 04 I58: this boot's mesh reset already ran and failed on exactly these chips, so the
+            # sweep would end in the same reset again, which measures nothing new. Climb.
+            log(
+                f"last chance before the host rung{where}: the mesh reset already failed on these chips this boot — skipping the sweep"
+            )
+            health_event(
+                "last_chance_sweep_skipped",
+                context=context or gate_phase,
+                reason="mesh_reset_failed_unchanged",
+                off_bus=len(offbus_chips),
+                expected=expected,
+            )
+            return False
         trays = _affected_trays(offbus_chips, expected, tray_map) or []
         bitmap = 0
         for t in trays:
@@ -1741,12 +2284,19 @@ class GalaxyRecovery(Recovery):
                 return None
             return False
         via = "last-chance-reset-sweep" if swept else "settle-before-host-rung"
-        log(f"the mesh verified after the {via} — no reboot or power cycle needed")
-        health_event("gate", phase=gate_phase, healthy=True, recovered_via=via, evidence=evidence)
         self.deps.clear_device_reported_fault(f"gate/{gate_phase}: mesh recovered before the host rung ({via})")
-        self.deps.clear_device_dirty(
+        released = self.deps.clear_device_dirty(
             verified=True, why=f"gate/{gate_phase}: mesh recovered before the host rung ({via})"
         )
+        if released is False:
+            # enum+ARC passed but the resets still owe a passing fabric pass (spec 04 I32): the funnel
+            # held the device fabric-unverified. No host rung on a verify that passed; the fabric relift
+            # owns the hold, bounded by 03 I40/I48.
+            log(f"the mesh passed enum+ARC after the {via}, but no fabric pass has passed since — held")
+            health_event("host_rung_sweep_unverified", context=context or gate_phase, via=via, evidence=evidence)
+            return True
+        log(f"the mesh verified after the {via} — no reboot or power cycle needed")
+        health_event("gate", phase=gate_phase, healthy=True, recovered_via=via, evidence=evidence)
         return True
 
     async def _fire_tray_down_no_window(
@@ -1908,6 +2458,7 @@ class GalaxyRecovery(Recovery):
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
         blocker = self._tenant_blocker(scan, force=force)
         if blocker is not None:
+            self.tenant_deferred = True
             log(f"hold past the ceiling but {self._describe_blocker(blocker)} — holding; escalates once idle")
             health_event("stuck_hold_deferred", mesh="present", forced=force, **blocker)
             return False
@@ -1950,9 +2501,8 @@ class GalaxyRecovery(Recovery):
             # but a forced window takes the next stronger rung, never the same reset (spec 04 I36).
             await self._climb_past_failed_rung(expected, ids_before, hold_since, log)
             return True
-        stamp = self.mechanism.last_reset_monotonic
         recovered = await self._reset_and_verify_device(indices, log)
-        await self._note_mesh_reset_failed(recovered, stamp, hold_since, ids_before, expected)
+        await self._note_mesh_reset_failed(recovered, hold_since, ids_before, expected)
         if recovered is None:
             # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, and its
             # passes already count toward the relift's bound (spec 03 I40), so the next relift gates on
@@ -1968,7 +2518,9 @@ class GalaxyRecovery(Recovery):
         # reboot/power cycle recovers and self-heal never will. Before the ceiling the climb defers
         # the host rungs (journaled) and the grace cadence retries the reset; at the ceiling the
         # climb hands the mesh to the gate's host rung, or to an operator when there is none (I36).
-        await self._climb_or_hand_off(expected, off_bus_before, hold_since, log)
+        await self._climb_or_hand_off(
+            expected, off_bus_before, hold_since, log, present_reset_failed=off_bus_before == 0
+        )
         return True
 
     async def _offbus_gated_power_cycle(self, off_bus: int, expected: int, hold_since: str, log) -> Optional[bool]:
@@ -1978,8 +2530,10 @@ class GalaxyRecovery(Recovery):
         the ladder's safe rungs have not run yet this episode, the command is unset, no
         manual-recovery check is configured, or it is rate-limited — those page first), False while
         it holds (grace, a tenant, a reset in its own scope, a stand-back; past the grace plus the
-        blocked-page bound those page once), True once the power cycle was requested. Only the idle
-        relift and the hold watchdog reach it, never the between-jobs gate, so it adds no time between jobs.
+        blocked-page bound those page once), True once the power cycle was requested. The idle relift and
+        the hold watchdog reach it, and the between-jobs gate's tray rung does for a whole-tray drop
+        (:meth:`escalate`): the device is already held there, the call runs no reset, and a fire hands the
+        host to the power cycle, so it adds no time to a job that could have run.
 
         A gate that allows resets hands back to the ladder, unless the BMC's IPMI failed a tray re-power
         this episode: then the IPMI rungs (the tray re-power, the mesh reset that re-powers trays through
@@ -1988,31 +2542,38 @@ class GalaxyRecovery(Recovery):
         when this episode's per-tray reset walk did not recover the mesh (the ladder no longer tries the
         below-floor mesh reset after it), counted from the walk on
         ``TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC``. The same applies, on the plain grace, when a tray
-        re-power on this boot took chips on other trays off the bus (the tray rung is declined for the
-        boot). It still waits for the ladder to have run once, and it runs no reset itself."""
+        re-power on this host took chips on other trays off the bus (the tray rung is declined, I25). A
+        below-floor drop holding a whole tray (:func:`offbus_power_cycle.note_whole_tray_down`) fires with
+        no grace. It still waits for the ladder to have run once, and it runs no reset itself."""
         if off_bus <= 0 or not hold_since:
             return None
         allowed, why = pcie_guard.host_reset_gate(off_bus)
         ipmi_age = offbus_power_cycle.ipmi_unavailable_age_sec(hold_since)
         walk_age = offbus_power_cycle.tray_walk_failed_age_sec(hold_since)
         tray_regressed = pcie_guard.tray_rung_disabled()
-        if allowed and ipmi_age is None and walk_age is None and tray_regressed is None:
+        whole_age = offbus_power_cycle.whole_tray_down_age_sec(hold_since)
+        if allowed and ipmi_age is None and walk_age is None and tray_regressed is None and whole_age is None:
             return None
-        if allowed and ipmi_age is not None:
+        if allowed and whole_age is not None:
+            why = f"a whole tray is off the bus: {offbus_power_cycle.whole_tray_detail(hold_since)}"
+            age, grace, handoff = whole_age, 0, "whole_tray"
+        elif allowed and ipmi_age is not None:
             why = f"the BMC's IPMI failed the tray re-power: {offbus_power_cycle.ipmi_detail(hold_since)}"
-            age, grace = ipmi_age, offbus_power_cycle.ipmi_handoff_sec()
+            age, grace, handoff = ipmi_age, offbus_power_cycle.ipmi_handoff_sec(), "ipmi_unavailable"
         elif allowed and walk_age is not None:
             why = f"the per-tray reset walk did not recover the mesh: {offbus_power_cycle.tray_walk_detail(hold_since)}"
-            age, grace = walk_age, offbus_power_cycle.tray_walk_handoff_sec()
+            age, grace, handoff = walk_age, offbus_power_cycle.tray_walk_handoff_sec(), "tray_walk_failed"
         elif allowed:
-            # A tray re-power on this boot took chips on other trays off the bus: the per-tray rung is
+            # A tray re-power on this host took chips on other trays off the bus: the per-tray rung is
             # declined, so the same bounded end as a refused gate applies (grace, then the power cycle).
-            why = f"a tray re-power on this boot took chips on other trays off the bus ({tray_regressed})"
+            why = f"a tray re-power on this host took chips on other trays off the bus ({tray_regressed})"
             offbus_power_cycle.arm(hold_since)
             age, grace = offbus_power_cycle.episode_age_sec(hold_since) or 0.0, offbus_power_cycle.grace_sec()
+            handoff = "tray_rung_regressed"
         else:
             offbus_power_cycle.arm(hold_since)
             age, grace = offbus_power_cycle.episode_age_sec(hold_since) or 0.0, offbus_power_cycle.grace_sec()
+            handoff = "gate_refused"
             if offbus_power_cycle.power_cycle_argv() is None:
                 # No host rung to end it: hand the hold to an operator with a deadline (spec 04 I33).
                 offbus_power_cycle.note_hold_handoff(
@@ -2093,23 +2654,67 @@ class GalaxyRecovery(Recovery):
             log("off-bus hold: every chip is back on the bus — no power cycle")
             health_event("offbus_gated_hold", phase="back_on_bus", held_since=hold_since)
             return None
+        offbus_now = _offbus_chip_ids(beats, expected)
+        tray_map = self._tray_map_now()
+        whole_now = bool(_whole_trays_off(offbus_now, expected, tray_map))
+        if (
+            handoff == "whole_tray"
+            and not whole_now
+            and _offbus_ids_on_trays(offbus_now, expected, tray_map)
+            and not offbus_power_cycle.whole_tray_deferred(hold_since)
+        ):
+            # The no-grace cycle is for a whole tray off the bus. One that came back in part since the
+            # decline is a partial drop: hold, and the next pass hands it to the ladder (the walk) or to
+            # its own bounded grace, never to a grace-0 cycle. A read the tray map cannot place keeps the
+            # verdict: a whole-tray drop goes to the power cycle. This deferral runs once per episode: a
+            # whole tray seen off again in it (a flapping read) fires on that pass without the re-check.
+            fault_class = _offbus_fault_class(off_bus, expected, whole=False)
+            log(
+                f"off-bus hold: no whole tray is off the bus any more ({off_bus}/{expected} chip(s) off) — "
+                f"no power cycle at grace 0; the ladder owns the partial drop"
+            )
+            offbus_power_cycle.clear_whole_tray_down(
+                hold_since, f"{off_bus}/{expected} off the bus, no whole tray", fault_class
+            )
+            return False
+        if handoff == "whole_tray" and not whole_now:
+            log(
+                f"off-bus hold: a whole tray was seen off again after this episode's one partial re-read "
+                f"({off_bus}/{expected} chip(s) off now) — the tray flaps; power cycle at grace 0"
+            )
+        fault_class = _offbus_fault_class(off_bus, expected, whole=whole_now)
         state = offbus_power_cycle.load_state()
         now = offbus_power_cycle.now_epoch()
         interval = offbus_power_cycle.min_interval_sec()
-        last = offbus_power_cycle.last_attempt_within(state, now, interval)
+        last = (
+            offbus_power_cycle.last_attempt_within(state, now, interval, healed=self.mechanism.power_cycle_healed)
+            if interval > 0
+            else None
+        )
         if last is not None:
+            # Spec 04 I65: an attempt spacing is a stated, bounded wait like the cooldown — on /health,
+            # asked again by the watchdog at its end — and the hold runs no reset meanwhile.
+            until = last + interval
+            _, why = self.mechanism._deny_power_cycle(
+                {
+                    "until": until,
+                    "last": last,
+                    "cause": "off-bus power-cycle attempt",
+                    "interval_sec": interval,
+                    "why": f"off-bus power cycle last attempted {int(now - last)}s ago (spacing {interval}s): "
+                    f"held until {datetime.fromtimestamp(until).isoformat(sep=' ', timespec='seconds')}",
+                }
+            )
             offbus_power_cycle.page_once(
                 "offbus_power_cycle_rate_limited",
                 log,
-                f"{off_bus}/{expected} chip(s) still off the bus {int(age)}s into the hold; this host's "
-                f"power cycle already ran {int(now - last)}s ago (limit one per {interval}s) — paging "
-                f"instead; the hold stands",
+                f"{off_bus}/{expected} chip(s) still off the bus {int(age)}s into the hold; {why}",
                 held_since=hold_since,
                 off_bus=off_bus,
                 last_attempt_epoch=last,
                 last_error=state.get("last_error", ""),
             )
-            return None
+            return False
         allowed, deny = self.mechanism.auto_recovery_allowed("power-cycle", tenant_active=False)
         if not allowed:
             offbus_power_cycle.page_once(
@@ -2119,19 +2724,31 @@ class GalaxyRecovery(Recovery):
                 held_since=hold_since,
                 off_bus=off_bus,
             )
-            return None
+            # A cooldown denial (I65) is a stated wait the watchdog ends: hold, no reset meanwhile.
+            # Any other denial hands back to the plain hold as before.
+            cooldown = self.mechanism.power_cycle_cooldown_state
+            return False if cooldown is not None and cooldown.get("why") == deny else None
         reason = (
             f"{off_bus}/{expected} chip(s) off the bus, {int(age)}s past the last rung, no reset can end it ({why})"
         )
         # On disk before anything runs: a cycle that takes the broker down with it still counts
         # against the rate limit on the boot that comes back.
         try:
-            offbus_power_cycle.record_attempt(state, now, hold_since, reason)
+            offbus_power_cycle.record_attempt(state, now, hold_since, reason, self.mechanism._current_boot_id() or "")
         except OSError as exc:
             log(f"off-bus power cycle NOT fired: could not record the attempt ({exc!r}); holding")
             health_event("offbus_gated_hold", phase="record_failed", held_since=hold_since, error=repr(exc))
             return False
-        health_event("offbus_gated_hold", phase="firing", held_since=hold_since, off_bus=off_bus, reason=reason)
+        health_event(
+            "offbus_gated_hold",
+            phase="firing",
+            held_since=hold_since,
+            off_bus=off_bus,
+            reason=reason,
+            fault_class=fault_class,
+            handoff=handoff,
+            hold_age_sec=offbus_power_cycle.episode_age_sec(hold_since),
+        )
         await self.mechanism._fire_recovery_escalation(
             "power-cycle",
             row_owner="[broker]power-cycle-request",
@@ -2255,6 +2872,7 @@ class GalaxyRecovery(Recovery):
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
         blocker = self._tenant_blocker(scan, force=force)
         if blocker is not None:
+            self.tenant_deferred = True
             log(f"off-bus hold past the ceiling but {self._describe_blocker(blocker)} — holding; escalates once idle")
             health_event("stuck_hold_deferred", mesh="offbus", forced=force, **blocker)
             return False
@@ -2415,21 +3033,41 @@ class GalaxyRecovery(Recovery):
                     # fire (no command, rate-limited), climb without the last-chance sweep, whose
                     # back-to-back resets include the same mesh reset.
                     hold_since = self.deps.device_hold_episode_since()
-                    offbus_power_cycle.note_tray_walk_failed(
-                        hold_since, f"{off_bus_pre}/{expected} chip(s) off the bus after the walk"
-                    )
-                    log(
-                        f"{off_bus_pre} of {expected} chip(s) off the bus — below the galaxy-reset floor "
-                        f"({reset_floor}) and this hold's per-tray reset walk did not recover it; not "
-                        f"trying the mesh-wide reset, holding for the bounded power cycle"
-                    )
-                    health_event(
-                        "galaxy_reset_skipped_after_tray_walk",
-                        held_since=hold_since,
-                        off_bus=off_bus_pre,
-                        expected=expected,
-                        floor=reset_floor,
-                    )
+                    if offbus_power_cycle.whole_tray_down_age_sec(hold_since) is not None:
+                        # No walk ran: a whole tray is off the bus, so the walk was declined (I25) and the
+                        # power cycle has no grace. Journaled as its own class, not as a failed walk.
+                        log(
+                            f"{off_bus_pre} of {expected} chip(s) off the bus with a whole tray down — below "
+                            f"the galaxy-reset floor ({reset_floor}); no tray re-power and no mesh-wide reset, "
+                            f"holding for the bounded power cycle"
+                        )
+                        health_event(
+                            "galaxy_reset_skipped_whole_tray",
+                            held_since=hold_since,
+                            off_bus=off_bus_pre,
+                            expected=expected,
+                            floor=reset_floor,
+                            fault_class="whole_tray",
+                            hold_age_sec=offbus_power_cycle.episode_age_sec(hold_since),
+                        )
+                    else:
+                        offbus_power_cycle.note_tray_walk_failed(
+                            hold_since, f"{off_bus_pre}/{expected} chip(s) off the bus after the walk"
+                        )
+                        log(
+                            f"{off_bus_pre} of {expected} chip(s) off the bus — below the galaxy-reset floor "
+                            f"({reset_floor}) and this hold's per-tray reset walk did not recover it; not "
+                            f"trying the mesh-wide reset, holding for the bounded power cycle"
+                        )
+                        health_event(
+                            "galaxy_reset_skipped_after_tray_walk",
+                            held_since=hold_since,
+                            off_bus=off_bus_pre,
+                            expected=expected,
+                            floor=reset_floor,
+                            fault_class=_offbus_fault_class(off_bus_pre, expected, whole=False),
+                            hold_age_sec=offbus_power_cycle.episode_age_sec(hold_since),
+                        )
                     metrics.stage_fired("smi_reset", "blocked")
                     gated = await self._offbus_gated_power_cycle(off_bus_pre, expected, hold_since, log)
                     if gated is None:
@@ -2462,9 +3100,8 @@ class GalaxyRecovery(Recovery):
             beats_before = await asyncio.to_thread(self.deps.read_heartbeats)
             off_bus_before = offbus_count(beats_before, expected)
         ids_before = await self._offbus_ids_now(expected)
-        stamp = self.mechanism.last_reset_monotonic
         recovered = await self._reset_and_verify_device(indices, log)
-        await self._note_mesh_reset_failed(recovered, stamp, hold_since, ids_before, expected)
+        await self._note_mesh_reset_failed(recovered, hold_since, ids_before, expected)
         if recovered is None:
             # The fabric is UNKNOWN after the reset (a persistent 77): held fabric-unverified, which the
             # idle relift re-checks within its bound (spec 03 I40). Nothing measured a failure to climb on.
@@ -2481,13 +3118,32 @@ class GalaxyRecovery(Recovery):
         return True
 
     async def _note_mesh_reset_failed(
-        self, recovered: Optional[bool], stamp: float, hold_since: str, ids_before: Optional[set], expected: int
+        self, recovered: Optional[bool], hold_since: str, ids_before: Optional[set], expected: int
     ) -> None:
-        """Record a mesh reset that RAN and failed (spec 04 I36). A reset the host gate or an outage
-        hold refused never stamps the reset clock: it did not happen, so it is not a failed rung."""
-        if recovered is False and self.mechanism.last_reset_monotonic != stamp:
+        """Record a mesh reset that RAN and failed in this boot's record, on disk before any next rung
+        (spec 04 I36, I58). Only a launched reset counts (``last_reset_rc`` set): one the host gate or an
+        outage hold refused, or one still cycling at its timeout, did not fail here. The reset clock
+        cannot tell, since it is stamped before launch."""
+        rc = self.mechanism.last_reset_rc
+        if recovered is False and rc is not None:
             ids_after = await self._offbus_ids_now(expected)
-            self.mechanism.note_rung_failed(hold_since, "mesh_reset", ids_before, ids_after)
+            self.mechanism.note_rung_failed(hold_since, "mesh_reset", ids_before, ids_after, rc=rc)
+            # Chips came back but the mesh did not verify: another reset may finish the job (one Galaxy
+            # host's second reset healed a drop the first had half-fixed). Retry once, soon, rather than
+            # at the next ceiling window (spec 04 I39). With every chip back the wait buys nothing: the
+            # reset's own rescan and settle already ran, so the retry is due at once. A tt-smi glx_reset
+            # that started while a chip was removed from the kernel fails its 32-chip driver-load wait
+            # (rc 1) even though the rescan after it brings the chip back.
+            if ids_before and ids_after is not None and set(ids_after) < set(ids_before):
+                delay = 0 if not ids_after else _progress_retry_sec()
+                if self.mechanism.note_progress_retry(hold_since, delay):
+                    health_event(
+                        "mesh_reset_progress_retry_armed",
+                        held_since=hold_since,
+                        off_bus_before=len(ids_before),
+                        off_bus_after=len(ids_after),
+                        retry_in_sec=delay,
+                    )
 
     async def _climb_past_failed_rung(self, expected: int, ids_now: set, hold_since: str, log) -> None:
         """Skip a reset that already failed in this hold episode on the same off-bus set and take the
@@ -2500,11 +3156,18 @@ class GalaxyRecovery(Recovery):
         health_event("reset_rung_skipped_failed_unchanged", rung="mesh_reset", held_since=hold_since, off_bus=off_bus)
         await self._climb_or_hand_off(expected, off_bus, hold_since, log)
 
-    async def _climb_or_hand_off(self, expected: int, off_bus: Optional[int], hold_since: str, log) -> None:
+    async def _climb_or_hand_off(
+        self, expected: int, off_bus: Optional[int], hold_since: str, log, *, present_reset_failed: bool = False
+    ) -> None:
         """Climb a failed (or skipped) reset to the host rung. With no host rung available the hold goes
         to an operator, once per episode, and no further reset fires on it while its off-bus set stays
         the same (spec 04 I36, I33)."""
-        if await self._climb_to_host_recovery_after_failed_reset(expected, off_bus, log) != NO_HOST_RUNG:
+        if (
+            await self._climb_to_host_recovery_after_failed_reset(
+                expected, off_bus, log, present_reset_failed=present_reset_failed
+            )
+            != NO_HOST_RUNG
+        ):
             return
         offbus_power_cycle.note_hold_handoff(
             hold_since,
@@ -2522,10 +3185,13 @@ class GalaxyRecovery(Recovery):
 
         The sweep runs here, not behind the host-rung permission: the climb asks the reboot ledger
         first, and on one Galaxy host its boot-loop guard kept the sweep waiting an hour. A sweep whose verify
-        is still a 77 is not a recovery (the fallback that refused it measured more than a 77 can), and
-        not a fault either: no rung measured one, so it never climbs to a host rung (a reboot or power
-        cycle). The episode holds, pages once, and the idle relift keeps re-running the fabric pass on
-        its backoff (spec 03 I48)."""
+        is still a 77 is not a recovery (the fallback that refused it measured more than a 77 can). With
+        a known no-reset cause (a cable fault, a topology mismatch, hugepages not yet allocated, the
+        validator missing) it holds and pages once; the idle relift keeps re-running the fabric pass on
+        its backoff (spec 03 I48). Otherwise the one rung left that rebuilds what a 77 lacks is the host
+        rung (a reboot refills the 1G hugepages, reloads the driver and retrains every link): it climbs
+        there once per episode, through every guard of the climb. A 77 that rung did not end is handed
+        to an operator with a deadline, still held."""
         if self.mechanism.unverified_sweep_since != hold_since:
             self.mechanism.unverified_sweep_since = hold_since
             self._sweep_read_77 = False
@@ -2550,15 +3216,188 @@ class GalaxyRecovery(Recovery):
             if self._sweep_read_77:
                 self.mechanism.unverified_sweep_77_since = hold_since
         if self.mechanism.unverified_sweep_77_since == hold_since:
-            self._hold_77_without_host_rung(hold_since, expected, log)
+            no_reset = self.deps.fabric_77_no_reset_cause
+            if no_reset is not None and no_reset():
+                self._hold_77_without_host_rung(hold_since, expected, log)
+                return
+            spent = self._fabric_77_host_rung_spent(hold_since)
+            if not spent:
+
+                def on_fire() -> None:
+                    # Logged as the rung fires, before the reboot can take the broker down; a stale
+                    # hand-off of an earlier "could not run" ends here.
+                    self._fabric_77_handoff = None
+                    health_event("fabric_unverified_host_rung", held_since=hold_since, expected=expected)
+                    log(
+                        "the reset and the last-chance sweep both left the fabric unverified (77) with no "
+                        "known no-reset cause — climbing once to the host rung, which refills the hugepages, "
+                        "reloads the driver and retrains the links"
+                    )
+
+                outcome = await self._climb_to_host_recovery_after_failed_reset(
+                    expected,
+                    off_bus_before,
+                    log,
+                    swept=True,
+                    cause=FABRIC_77_HOST_RUNG_CAUSE,
+                    on_fire=on_fire,
+                    ladder_ran=True,
+                    cold=self._fabric_77_cold_rung_due(),
+                )
+                if outcome == HOST_RUNG_FIRED:
+                    self.mechanism.unverified_77_host_rung_since = hold_since
+                    return
+                if outcome not in HOST_RUNG_CANNOT_RUN:
+                    # Only waiting (the ladder ceiling, a reset in its scope): no page, the next
+                    # escalation of the episode retries the climb.
+                    return
+                if outcome == HOST_RUNG_DENIED and self._wait_77_cold_rung_cooldown(hold_since, log):
+                    return
+                if outcome == HOST_RUNG_DENIED:
+                    # Held off for now (the rate limit, a tenant): the rung is not spent, so every
+                    # later re-check of the episode climbs again and fires it once allowed (spec 04
+                    # I79). The page says so; an operator acts only if it never can.
+                    spent = (
+                        f"the host rung could not run yet ({self._host_rung_denied_why}); the broker retries "
+                        "it on every re-check and fires it once allowed"
+                    )
+                    self._hand_77_hold_to_operator(hold_since, expected, spent, log, broker_retries=True)
+                    return
+                spent = "the host rung could not run (not opted in)"
+            self._hand_77_hold_to_operator(hold_since, expected, spent, log)
             return
-        await self._climb_to_host_recovery_after_failed_reset(expected, off_bus_before, log, swept=True)
+        await self._climb_to_host_recovery_after_failed_reset(
+            expected, off_bus_before, log, swept=True, ladder_ran=True
+        )
+
+    def _wait_77_cold_rung_cooldown(self, hold_since: str, log) -> bool:
+        """True when the 77 climb's power cycle was denied only by the bounded I65 cooldown (or its cap
+        or backstop, each with an end): no page and no hand-off, since the broker fires the cycle
+        itself at the first re-check after ``until`` (spec 04 I79). /health shows the deadline as
+        ``power_cycle_cooldown.next_deadline``. Journaled once per episode and deadline."""
+        cd = self.mechanism.power_cycle_cooldown_state
+        if not cd or cd.get("why") != self._host_rung_denied_why or not cd.get("until"):
+            return False
+        until = float(cd["until"])
+        if until <= time.time():
+            return False
+        until_iso = datetime.fromtimestamp(until).isoformat(timespec="seconds")
+        if self._fabric_77_cooldown_logged != (hold_since, until):
+            self._fabric_77_cooldown_logged = (hold_since, until)
+            health_event(
+                "fabric_unverified_host_rung_cooldown",
+                held_since=hold_since,
+                until=until_iso,
+                until_epoch=until,
+                cause=cd.get("cause"),
+            )
+        log(
+            f"fabric still unverified (77); its power cycle waits for the cooldown ({cd.get('cause')}) "
+            f"until {until_iso} — held, no page: the broker fires it on the first re-check after that"
+        )
+        return True
+
+    def _fabric_77_host_rung_spent(self, hold_since: str) -> str:
+        """Why this 77 episode's one host rung is spent, or "" (spec 04 I29): it already fired on this
+        episode, or this boot is that rung's result and no fabric pass has passed since the broker
+        started (the reboot did not end the 77). A pass after the boot frees the rung for a later
+        episode; the reboot ledger's rate limit still bounds it."""
+        if self.mechanism.unverified_77_host_rung_since == hold_since:
+            return "the host rung already ran on this hold"
+        if FABRIC_DEBT.passed_since_start:
+            return ""
+        rec = self.mechanism.boot_from_broker_escalation(self.deps.current_boot_id())
+        if rec and str(rec.get("reason", "")) == FABRIC_77_HOST_RUNG_CAUSE and not self._fabric_77_cold_rung_due():
+            return f"this boot is the {rec.get('action')} that rung fired, and the fabric still reads 77"
+        return ""
+
+    def _fabric_77_cold_rung_due(self) -> bool:
+        """Whether this boot is the warm reboot a 77 climb fired, the fabric has not passed since the
+        broker started, and a power cycle is opted in: the climb then takes the cold rung, once
+        (spec 04 I79). A boot that is that power cycle's result is spent and goes to an operator."""
+        if FABRIC_DEBT.passed_since_start:
+            return False
+        rec = self.mechanism.boot_from_broker_escalation(self.deps.current_boot_id())
+        if not rec or str(rec.get("reason", "")) != FABRIC_77_HOST_RUNG_CAUSE or rec.get("action") != "reboot":
+            return False
+        return bool(self.deps.host_escalation_kwargs()["auto_power_cycle_enabled"]())
+
+    def fabric_77_climb_owed(self, hold_since: str) -> bool:
+        """Whether a 77-only hold owes the climb at once rather than the I40/I48 waits (spec 04 I79):
+        its one reset already came back UNKNOWN on this episode, or this boot is the warm reboot an
+        earlier 77 climb fired and the cold rung is still due. False once this episode's host rung has
+        fired. Counts nothing; the caller decides."""
+        if not hold_since or self.mechanism.unverified_77_host_rung_since == hold_since:
+            return False
+        return self.mechanism.unverified_reset_since == hold_since or self._fabric_77_cold_rung_due()
+
+    def _hand_77_hold_to_operator(
+        self, hold_since: str, expected: int, why: str, log, *, broker_retries: bool = False
+    ) -> None:
+        """A 77 the host rung did not end: keep the device held and page an operator once per episode
+        with a deadline (spec 04 I29). The idle relift keeps re-running the full check, fabric
+        included, on its backoff (spec 03 I48); only a passing one releases it. ``broker_retries``:
+        the rung was only held off (a cooldown, the rate limit, a tenant) and the broker fires it
+        itself once allowed (I79), so the page and /health name the broker as the owner meanwhile."""
+        h = self._fabric_77_handoff
+        if h and h["episode"] == hold_since:
+            h["why"], h["broker_retries"] = why, broker_retries
+            log(f"fabric still unverified (77) and {why} — held, handed to an operator")
+            return
+        deadline = time.time() + FABRIC_77_HANDOFF_SEC
+        act_by = datetime.fromtimestamp(deadline).isoformat(timespec="seconds")
+        self._fabric_77_handoff = {
+            "episode": hold_since,
+            "deadline": deadline,
+            "why": why,
+            "broker_retries": broker_retries,
+        }
+        event = {
+            "kind": "fabric_unverified_operator_handoff",
+            "held_since": hold_since,
+            "reason": self.deps.device_hold_episode_reason(),
+            "why": why,
+            "expected": expected,
+            "act_by": act_by,
+            "deadline_epoch": deadline,
+            "broker_retries": broker_retries,
+        }
+        health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
+        log(
+            f"the reset, the last-chance sweep and the host rung left the fabric unverified (77) — {why}. "
+            + ("If it never can, an operator" if broker_retries else "An operator")
+            + f" must check the host (cables, hugepages, the fabric validator) by {act_by}; the "
+            f"device stays held and the broker re-runs the full health check, fabric included, on its "
+            f"backoff, releasing only on a pass"
+        )
+        alert.send_alert(event, _logger)
+
+    def fabric_77_handoff_status(self, episode: str) -> Optional[dict]:
+        """The /health ``operator_handoff`` field while this episode's 77 is handed off, or None."""
+        h = self._fabric_77_handoff
+        if not h or not episode or h["episode"] != episode:
+            return None
+        retries = bool(h.get("broker_retries"))
+        return {
+            "reason": f"fabric unverified (77): {h['why']}",
+            "owner": "broker" if retries else "operator",
+            "act_by": datetime.fromtimestamp(h["deadline"]).isoformat(timespec="seconds"),
+            "act_by_epoch": h["deadline"],
+            "then": (
+                "held; the broker retries the host rung on every re-check and fires it once allowed, "
+                if retries
+                else "held; "
+            )
+            + "the broker re-runs the full health check, fabric included, and releases only on a pass",
+        }
 
     def _hold_77_without_host_rung(self, hold_since: str, expected: int, log) -> None:
         """Every lower rung ran on a 77-only episode (one reset, the sweep) and the fabric pass still could
-        not run: hold without a reboot or power cycle and page once per episode (spec 04 I29)."""
+        not run for a cause no reboot fixes (a cable fault, a topology mismatch, hugepages not yet
+        allocated, the validator missing): hold without a reboot or power cycle and page once per
+        episode (spec 04 I29)."""
         if self._host_rung_77_paged_since == hold_since:
-            log("fabric still unverified (77) after the reset and the sweep — holding; no host rung on a 77")
+            log("fabric still unverified (77) after the reset and the sweep, for a known no-reset cause — holding")
             return
         self._host_rung_77_paged_since = hold_since
         event = {
@@ -2569,14 +3408,24 @@ class GalaxyRecovery(Recovery):
         }
         health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
         log(
-            "the reset and the last-chance sweep both left the fabric unverified (77) — no rung measured a "
-            "fault, so no reboot or power cycle; holding, paging once, the idle relift keeps re-checking"
+            "the reset and the last-chance sweep both left the fabric unverified (77) for a known no-reset "
+            "cause — no reboot or power cycle; holding, paging once, the idle relift keeps re-checking"
         )
         alert.send_alert(event, _logger)
 
     async def _climb_to_host_recovery_after_failed_reset(
-        self, expected: int, off_bus_before: Optional[int], log, *, swept: bool = False
-    ) -> Optional[str]:
+        self,
+        expected: int,
+        off_bus_before: Optional[int],
+        log,
+        *,
+        swept: bool = False,
+        cause: str = "",
+        on_fire: Optional[Callable[[], None]] = None,
+        ladder_ran: bool = False,
+        cold: bool = False,
+        present_reset_failed: bool = False,
+    ) -> str:
         """Climb an idle escalation whose galaxy reset failed to revive the mesh to the host rung — a
         warm reboot, then a BMC power cycle above it — so a reset that did not recover does not sit.
         Bounded below by the hold ceiling: the host rungs never fire before the episode has stood the
@@ -2605,13 +3454,18 @@ class GalaxyRecovery(Recovery):
         6U-Galaxy reboot does not power-cycle the UBBs, so a dropped ASIC stays off across it. Route such
         a reset straight to the cold rung, never the warm reboot that just proved it cannot help — the
         same verdict the gate reaches, so a regression is handled the same on the idle path as at a job
-        boundary."""
+        boundary.
+
+        ``cause`` replaces the recorded reason (the I29 77 climb names itself, so the next boot can tell
+        it apart); ``on_fire`` runs just before the rung fires. Returns HOST_RUNG_FIRED once it requested the
+        reboot or power cycle, HOST_RUNG_DEFERRED when it only waited (a later escalation retries),
+        NO_HOST_RUNG when no rung is available, or HOST_RUNG_DENIED when auto_recovery_allowed refused it."""
         if await asyncio.to_thread(self.mechanism.scope_active):
             log(
                 "reset did not recover but one is still cycling in its own scope — not escalating over "
                 "its in-flight all-ones; the next gate adopts and verifies it"
             )
-            return
+            return HOST_RUNG_DEFERRED
         # The host rungs are bounded BELOW by the hold ceiling: however futile the gentler rungs
         # look, a reboot or power cycle never fires before the episode has stood the full ladder.
         # The early off-bus pass (_offbus_hold_ceiling_sec) exists to fire the CHEAP rungs early,
@@ -2646,8 +3500,50 @@ class GalaxyRecovery(Recovery):
                 f"ASIC, so climbing to the cold rung, never the reboot; no further mesh reset this hold."
             )
         episode_regressed = self.mechanism.reset_regressed_in(hold_since)
+        # This episode's mesh reset already ran and failed on exactly the chips off the bus now (I36).
+        # Every rung below the host pair has had its one try and the mesh reset may not run again on
+        # this set, so neither the ceiling wait nor the last-chance sweep (whose last step is that same
+        # mesh reset) has anything left to try: the host rung fires now (spec 04 I38). A second mesh
+        # reset after an rc 1 on the same chips killed one Galaxy host.
+        failed_unchanged = off_bus > 0 and self.mechanism.rung_failed_unchanged(
+            hold_since, "mesh_reset", await self._offbus_ids_now(expected)
+        )
         hold_age = _hold_age_sec(hold_since)
-        if hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
+        if failed_unchanged and hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
+            log(
+                f"{off_bus}/{expected} off-bus and this hold's mesh reset already failed on exactly these "
+                f"chips — every rung below the host pair has run once; not waiting for the "
+                f"{_stuck_hold_ceiling_sec()}s ladder end"
+            )
+            health_event(
+                "host_rung_not_deferred",
+                held_since=hold_since,
+                held_age_sec=int(hold_age),
+                ceiling_sec=_stuck_hold_ceiling_sec(),
+                reason="mesh_reset_failed_unchanged",
+            )
+        elif (
+            (ladder_ran or (present_reset_failed and off_bus == 0))
+            and hold_age is not None
+            and hold_age < _stuck_hold_ceiling_sec()
+        ):
+            # This hold already ran its reset and failed the full check after it on a present mesh (an
+            # eth/fabric wedge), or ran the reset and the full last-chance sweep and still failed: the
+            # ceiling wait has no rung left to try. A present mesh still runs the sweep below before the
+            # host rung; one already swept climbs now (spec 04 I79).
+            log(
+                f"this {int(hold_age)}s-old hold's reset "
+                + ("and the full last-chance sweep both failed" if ladder_ran else "failed its check on a present mesh")
+                + f" — not waiting for the {_stuck_hold_ceiling_sec()}s ladder end"
+            )
+            health_event(
+                "host_rung_not_deferred",
+                held_since=hold_since,
+                held_age_sec=int(hold_age),
+                ceiling_sec=_stuck_hold_ceiling_sec(),
+                reason="reset_and_sweep_failed" if ladder_ran else "present_mesh_reset_failed",
+            )
+        elif hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
             log(
                 f"mesh unrecovered after the reset ladder but the hold is only {int(hold_age)}s "
                 f"old — the host rungs (reboot/power-cycle) wait for the "
@@ -2659,7 +3555,7 @@ class GalaxyRecovery(Recovery):
                 held_age_sec=int(hold_age),
                 ceiling_sec=_stuck_hold_ceiling_sec(),
             )
-            return
+            return HOST_RUNG_DEFERRED
         reboot_floor = _reboot_min_dead_chips(expected)
         # A below-floor off-bus drop reaching this climb is NOT self-healing: it survived the 20-min grace
         # and a reset that could not recover it. A dropped ASIC does not re-enumerate on a warm reboot (a
@@ -2667,7 +3563,9 @@ class GalaxyRecovery(Recovery):
         # recover it — never hold below the floor. Mark it warm-reboot-futile so the chooser routes it
         # straight to the cold rung; the reboot floor only ever gated the mesh reset, not the power cycle.
         below_floor_offbus = 0 < off_bus < reboot_floor
-        warm_reboot_futile = (
+        # ``cold``: this boot is the warm reboot an earlier 77 climb fired and the fabric still reads 77,
+        # so a second reboot is futile and the cold rung is the one left (spec 04 I79).
+        warm_reboot_futile = cold or (
             expected > 1
             and off_bus > 0
             and (reset_regressed or episode_regressed or self.mechanism.last_reset_exit_nonzero or below_floor_offbus)
@@ -2695,7 +3593,7 @@ class GalaxyRecovery(Recovery):
             # gentlest-first, the reboot rung is the one this leaves declined.
             metrics.stage_fired("host_reboot", "blocked")
             return NO_HOST_RUNG
-        if off_bus == 0:
+        if off_bus == 0 and not cause:
             # A PRESENT mesh (every chip on the bus, ARC-healthy) whose galaxy reset STILL did not verify
             # is an eth/fabric wedge the reset could not clear — and self-heal will not either, since it
             # already survived the deepest reset. The old code held it here (below the mass floor), which
@@ -2719,10 +3617,11 @@ class GalaxyRecovery(Recovery):
             )
             self.mechanism._journal_auto_recovery_denied(escalation, why)
             metrics.stage_fired(_HOST_ESCALATION_STAGE.get(escalation, escalation), "blocked")
-            return
+            self._host_rung_denied_why = why
+            return HOST_RUNG_DENIED
         # The recorded cause names what is actually true at this point — the old fixed string
         # blamed a galaxy reset even on paths where the reset was suppressed and never ran.
-        cause = (
+        cause = cause or (
             "idle escalation: present mesh failed the post-reset verify"
             if off_bus == 0
             else f"idle escalation: {off_bus}/{expected} chip(s) off the bus after the reset ladder"
@@ -2731,18 +3630,26 @@ class GalaxyRecovery(Recovery):
         # is the road MOST real power cycles took (the idle/stuck-hold escalation), and before ladder-v2
         # it climbed to the host rung without ever re-trying the cheaper rungs. Skipped when the caller
         # already swept this episode (_sweep_after_unverified_reset).
-        if not swept and (
+        if failed_unchanged and not swept:
+            log("last-chance sweep skipped: its mesh reset already failed on these chips in this hold")
+            health_event(
+                "reset_rung_skipped_failed_unchanged", rung="last_chance_sweep", held_since=hold_since, off_bus=off_bus
+            )
+        elif not swept and (
             await self._settle_and_verify_before_host_rung(
                 expected, log, "idle-escalation", context=f"idle escalation, {off_bus}/{expected} off the bus"
             )
             is not False
         ):
-            return
+            return HOST_RUNG_DEFERRED
+        if on_fire is not None:
+            on_fire()
         health_event("stuck_hold_host_escalation", escalation=escalation, off_bus=off_bus)
         if escalation == "power-cycle":
             await self.deps.auto_power_cycle_host(log, cause)
         else:
             await self._auto_reboot_host(log, cause)
+        return HOST_RUNG_FIRED
 
     async def _verify_post_reboot_recovery(self, off_bus: int, expected: int, log) -> None:
         """After a warm reboot the broker itself fired, confirm the mesh came back — and climb to the
@@ -2891,6 +3798,11 @@ class GalaxyRecovery(Recovery):
         before the walk (``ubb_reset_regressed_offbus``). The device pollers are stopped across the walk,
         as for every other reset.
 
+        A drop that holds a WHOLE tray is not walked (spec 04 I25): a single-tray re-power of it took the
+        other trays off the bus, so it goes to the bounded power cycle at once
+        (:func:`offbus_power_cycle.note_whole_tray_down`) and returns False, unless
+        ``TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1``. A partial drop keeps the walk.
+
         Returns True when a tray reset recovered the mesh (the caller clears the hold), False when the walk
         ran and did not (the caller holds; a warm reboot cannot revive a still-off-bus tray, so the next rung
         is the cold power cycle, and the deadline watchdog keeps the hold visible), and None when nothing
@@ -2921,7 +3833,21 @@ class GalaxyRecovery(Recovery):
         offbus_ids = _offbus_chip_ids(beats, expected)
         tray_map = self._tray_map_now()
         walk = _ubb_tray_walk_plan(offbus_ids, expected, tray_map)
-        if walk is None:
+        reset_floor = _galaxy_reset_min_dead_chips(expected)
+        below_floor = reset_floor is None or off_bus < reset_floor
+        absent_groups: list = []
+        if tray_map is None and below_floor:
+            # Spec 04 I37's presence read: with no I16 map nothing can be walked, but a drop that is
+            # exactly whole trays (by tt-smi's UBB bus groups) still goes to the bounded power cycle.
+            present_buses, groups = self._presence_read(offbus_ids, expected)
+            absent_groups = _absent_tray_groups(present_buses, expected, offbus_ids, groups)
+            unreadable = set() if absent_groups else unreadable_on_bus_chips(offbus_ids) & set(offbus_ids)
+            if unreadable:
+                # Enumerated, bound chips whose heartbeat read fails are on the bus (see
+                # _power_cycle_direct_class_now): read the drop's shape without them.
+                present_buses, groups = self._presence_read(set(offbus_ids) - unreadable, expected)
+                absent_groups = _absent_tray_groups(present_buses, expected, set(offbus_ids) - unreadable, groups)
+        if walk is None and not absent_groups:
             # Two shapes both classify as not_applicable, not blocked: (1) a per-target (non-Galaxy)
             # host, where there is no tray concept at all — every below-floor off-bus drop lands
             # here; (2) a Galaxy whose gate never banked a bus-id map (spec 04 I16), so the tray a
@@ -2934,8 +3860,31 @@ class GalaxyRecovery(Recovery):
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)  # name it + hold (the default)
             metrics.stage_fired("ubb_tray", "blocked")
             return None
-        pcie_guard.latch_tray_pulse_drop(offbus_ids)
-        reset_floor = _galaxy_reset_min_dead_chips(expected)
+        whole = _whole_trays_off(offbus_ids, expected, tray_map) if below_floor else []
+        if absent_groups:
+            whole = [f"bus group 0x{g:02x}" for g in absent_groups]
+        if whole and (absent_groups or not _ubb_single_tray_walk_enabled()):
+            # Measured on a Galaxy, three times in an hour: re-powering a whole-down tray of a below-floor
+            # drop took 20 more chips on the other trays off the bus. No reset brings such a tray back, so
+            # no walk: the hold goes straight to the bounded power cycle (I27), no grace.
+            log(
+                f"{off_bus}/{expected} chip(s) off the bus with whole tray(s) {whole} down — not re-powering "
+                f"a tray (it takes the other trays off the bus); handing the hold to the power cycle"
+            )
+            health_event(
+                "ubb_reset_declined_whole_tray",
+                trays=whole,
+                off_bus=sorted(offbus_ids, key=int),
+                expected=expected,
+                fault_class="whole_tray",
+                host_at_risk=True,
+            )
+            offbus_power_cycle.note_whole_tray_down(
+                self.deps.device_hold_episode_since(), f"trays {whole}, {off_bus}/{expected} off the bus"
+            )
+            metrics.stage_fired("ubb_tray", "blocked")
+            return False
+        pcie_guard.latch_tray_pulse_drop(offbus_ids, self.deps.device_hold_episode_since() or "")
         if len(walk) == 1 and (reset_floor is None or off_bus < reset_floor) and not _ubb_single_tray_walk_enabled():
             # A below-floor drop on one tray: re-powering that tray has dropped the other trays too
             # (1 chip off -> 24 off), so hold for self-heal; the stuck-hold ladder's next rungs own it.
@@ -2954,12 +3903,14 @@ class GalaxyRecovery(Recovery):
             metrics.stage_fired("ubb_tray", "blocked")
             return None
         if pcie_guard.tray_rung_disabled() is not None:
-            # A tray re-power on this boot took chips on other trays off the bus: decline the walk for the
-            # rest of the boot. The hold goes to its bounded hand-off (I27, _offbus_gated_power_cycle).
+            # A tray re-power on this host took chips on other trays off the bus: decline the walk for
+            # TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS. The hold goes to its bounded hand-off (I27,
+            # _offbus_gated_power_cycle).
             _maybe_emit_ubb_reset_required(beats, off_bus, expected, log, tray_map)
             log(
-                f"tray-down but the per-tray walk is disabled on this boot "
-                f"({pcie_guard.tray_rung_disabled()}) — holding"
+                f"tray-down but the per-tray walk is declined on this host "
+                f"({pcie_guard.tray_rung_disabled()}) — holding; re-arm after a repair with "
+                f"`{pcie_guard.clear_tray_rung_cmd()}`"
             )
             metrics.stage_fired("ubb_tray", "blocked")
             return None
@@ -3001,6 +3952,7 @@ class GalaxyRecovery(Recovery):
         start_off = set(offbus_ids)
         quiesced: list = []
         cancelled_mid_fire = False
+        walk_recovered = False
         try:
             # A tray pulse takes chips off the bus: stop the pollers' MMIO across the walk, as for every reset.
             quiesced = await self.mechanism._set_device_pollers(False, log)
@@ -3030,7 +3982,10 @@ class GalaxyRecovery(Recovery):
                     # stopped across the whole walk, so not _fire_tray_repower, which would restart them
                     # between trays.
                     FABRIC_DEBT.note_reset(f"tray re-power 0x{bitmap:02x}")
-                    pcie_guard.note_tray_pulse(walk[: step + 1], tray_map, start_off)
+                    CEILING.mark_owed(f"tray re-power 0x{bitmap:02x}")
+                    pcie_guard.note_tray_pulse(
+                        walk[: step + 1], tray_map, start_off, self.deps.device_hold_episode_since() or ""
+                    )
                     plan = await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
                 except asyncio.CancelledError:
                     # Abandoned while the BMC pulse runs on in its thread: the tray may still be off the
@@ -3088,6 +4043,7 @@ class GalaxyRecovery(Recovery):
                     isolated = self.deps.isolated_chips()
                     for c in start_off:
                         isolated.discard(c)
+                    walk_recovered = True
                     return True
                 off_now = _offbus_chip_ids(await asyncio.to_thread(self.deps.read_heartbeats) or {}, expected)
                 new_off = off_now - start_off
@@ -3108,8 +4064,8 @@ class GalaxyRecovery(Recovery):
                         expected=expected,
                         host_at_risk=True,
                     )
-                    # Every such re-power so far cost the other trays a chip: decline the rung for the
-                    # rest of the boot (kept across broker restarts), so the hold goes to its bounded end.
+                    # Every such re-power so far cost the other trays a chip: decline the rung on this host
+                    # (kept across broker restarts and reboots), so the hold goes to its bounded end.
                     pcie_guard.disable_tray_rung(tray=tray, new_off=sorted(new_off, key=int))
                     return False
             log(
@@ -3122,5 +4078,5 @@ class GalaxyRecovery(Recovery):
         finally:
             self.mechanism.reset_in_flight = False
             pcie_guard.end_offbus_reset()
-            if quiesced and not cancelled_mid_fire:
-                await asyncio.shield(self.mechanism._set_device_pollers(True, log))
+            if not cancelled_mid_fire:
+                await self.mechanism.restore_pollers(quiesced, log, ok=walk_recovered, after="per-tray reset walk")

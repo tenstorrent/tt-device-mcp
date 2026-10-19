@@ -16,6 +16,7 @@ from tests.conftest import patch_health_event
 from tt_device_mcp import server as srv
 from tt_device_mcp import telemetry
 from tt_device_mcp.fsm import ServerState
+from tt_device_mcp.health import chip_state
 from tt_device_mcp.health.monitors import heartbeat, pci
 
 LIVE = [100, 800, 800, 0, 0, 0]
@@ -40,12 +41,22 @@ def watch(monkeypatch):
     monkeypatch.setattr(s, "_link_prev", None)
     monkeypatch.setattr(s, "bad_since", {})
     monkeypatch.setattr(s, "_housekeeping_at", 0.0)
+    monkeypatch.setattr(s, "_storm_start", None)
+    monkeypatch.setattr(s, "_last_signal", None)
+    monkeypatch.setattr(s, "_storm_capped", False)
+    monkeypatch.setattr(s, "_cycle_at", 0.0)
+    monkeypatch.setattr(s, "scope_seen", False)
     monkeypatch.setattr(s, "dead_chip_strikes", {})
     monkeypatch.setattr(s, "all_chips_gone_strikes", 0)
     monkeypatch.setattr(s, "short_count_strikes", 0)
     monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", False)
     monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: None)
     monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+
+    async def no_pollers(*a, **k):
+        return None
+
+    monkeypatch.setattr(srv, "_set_device_pollers", no_pollers)
     isolated: list = []
 
     async def fake_isolate(dead):
@@ -127,7 +138,7 @@ async def test_an_aer_rise_brings_the_next_sample_forward(watch, monkeypatch):
         clock.t += sec
 
     monkeypatch.setattr(telemetry.asyncio, "sleep", fake_sleep)
-    start = clock.t
+    start = s._cycle_at = clock.t
     await s.wait_for_next_sample()
 
     assert clock.t - start == 2 * telemetry.LINK_WATCH_SEC, "the wait must end on the signal"
@@ -288,6 +299,8 @@ def test_the_fast_cadence_leaves_housekeeping_and_relift_on_the_regular_cadence(
         asyncio.run(s.run())
 
     assert len(samples) >= 10, "the armed watch must sample fast"
+    sample_gaps = [b - a for a, b in zip(samples, samples[1:])]
+    assert all(g >= telemetry.FAST_SAMPLE_SEC for g in sample_gaps), sample_gaps
     assert len(relift) <= 30 // telemetry.SAMPLE_INTERVAL_SEC + 1, "relift must keep the regular cadence"
     assert len(ledger) == len(relift)
     gaps = [b - a for a, b in zip(relift, relift[1:])]
@@ -313,3 +326,150 @@ async def test_an_early_detection_lifts_nothing(watch, monkeypatch):
         await s.check_for_dead_chips(healthy)
         clock.t += telemetry.FAST_SAMPLE_SEC
     assert srv.fsm.state is not ServerState.HEALTHY, "the sampler must never lift a hold"
+
+
+# --- the fast cadence is bounded ---------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_arming_edge_never_samples_sooner_than_the_fast_interval(watch, monkeypatch):
+    """A signal one poll after a sample arms the watch, and the next sample still waits for
+    FAST_SAMPLE_SEC after the last one: the edge brings it forward, never closer than that."""
+    s, clock, _, _ = watch
+    s._link_prev = {"chips": ["0"], "aer": {"0000:00:01.1": 0}}
+    monkeypatch.setattr(srv, "link_signals", lambda: {"chips": ["0"], "aer": {"0000:00:01.1": 9}})
+
+    async def fake_sleep(sec):
+        clock.t += sec
+
+    monkeypatch.setattr(telemetry.asyncio, "sleep", fake_sleep)
+    start = s._cycle_at = clock.t
+    await s.wait_for_next_sample()
+    assert s.fast_active()
+    assert clock.t - start == telemetry.FAST_SAMPLE_SEC
+
+
+def test_a_sustained_aer_storm_keeps_every_gap_and_is_capped(watch, monkeypatch):
+    """A counter that rises on every poll: samples stay at least FAST_SAMPLE_SEC apart (later
+    signals never cut a wait short), the fast cadence ends FAST_MAX_SEC after the storm's first
+    signal, and the regular cadence runs while the storm goes on."""
+    s, clock, _, events = watch
+    samples: list = []
+    monkeypatch.setattr(srv, "chip_sample", lambda: samples.append(clock.t) or {"0": LIVE})
+    monkeypatch.setattr(srv, "append_trace", lambda sample: None)
+    monkeypatch.setattr(srv, "_refresh_idle_hold_ledger", lambda: None)
+    monkeypatch.setattr(srv, "_maybe_spawn_idle_relift", lambda: None)
+    monkeypatch.setattr(srv, "_maybe_spawn_idle_holder_watch", lambda: None)
+    count = iter(range(10_000))
+    monkeypatch.setattr(srv, "link_signals", lambda: {"chips": ["0"], "aer": {"0000:00:01.1": next(count)}})
+
+    class _Stop(Exception):
+        pass
+
+    begin = clock.t
+    end = begin + 3 * telemetry.FAST_MAX_SEC
+
+    async def fake_sleep(sec):
+        clock.t += sec
+        if clock.t >= end:
+            raise _Stop()
+
+    monkeypatch.setattr(telemetry.asyncio, "sleep", fake_sleep)
+    with pytest.raises(_Stop):
+        asyncio.run(s.run())
+
+    gaps = [(a, b - a) for a, b in zip(samples, samples[1:])]
+    assert all(g >= telemetry.FAST_SAMPLE_SEC for _, g in gaps), gaps
+    first_signal = begin + 2 * telemetry.LINK_WATCH_SEC  # the first poll is only the baseline
+    fast = [a for a, g in gaps if g < telemetry.SAMPLE_INTERVAL_SEC]
+    assert fast, "the storm must arm the fast cadence"
+    assert max(fast) < first_signal + telemetry.FAST_MAX_SEC, "the fast cadence must end at the cap"
+    late = [g for a, g in gaps if a >= first_signal + telemetry.FAST_MAX_SEC]
+    assert late and all(g == telemetry.SAMPLE_INTERVAL_SEC for g in late), late
+    assert (
+        len(samples)
+        <= telemetry.FAST_MAX_SEC / telemetry.FAST_SAMPLE_SEC
+        + (2 * telemetry.FAST_MAX_SEC / telemetry.SAMPLE_INTERVAL_SEC)
+        + 3
+    )
+    assert _kinds(events) == ["offbus_watch_armed"], "one storm, one event"
+
+
+def test_a_capped_storm_rearms_only_after_a_quiet_window(watch):
+    s, clock, _, events = watch
+    assert s.arm_fast("storm")
+    t0 = clock.t
+    while clock.t < t0 + telemetry.FAST_MAX_SEC:
+        clock.t += telemetry.LINK_WATCH_SEC
+        s.arm_fast("storm")
+    assert not s.fast_active(), "the cap ends the fast cadence while the storm goes on"
+    clock.t += telemetry.FAST_WINDOW_SEC - telemetry.LINK_WATCH_SEC
+    assert not s.arm_fast("storm"), "a pause shorter than FAST_WINDOW_SEC is the same storm"
+    clock.t += telemetry.FAST_WINDOW_SEC
+    assert s.arm_fast("new storm"), "a quiet FAST_WINDOW_SEC ends the storm; the next one arms"
+    assert s.fast_until == clock.t + telemetry.FAST_WINDOW_SEC
+    assert _kinds(events) == ["offbus_watch_armed", "offbus_watch_armed"]
+
+
+@pytest.mark.asyncio
+async def test_a_reset_moves_the_baseline_without_arming(watch, monkeypatch):
+    """A reset takes the chips off the bus by design: the AER counters and node list it moves become
+    the new baseline, with no offbus_watch_armed event and no fast cadence."""
+    s, _, _, events = watch
+    reads = iter(
+        [
+            {"chips": ["0", "1"], "aer": {"0000:00:01.1": 0}},
+            {"chips": ["0"], "aer": {"0000:00:01.1": 7}},  # during the reset
+            {"chips": ["0", "1"], "aer": {"0000:00:01.1": 7}},  # after it: nothing new
+        ]
+    )
+    monkeypatch.setattr(srv, "link_signals", lambda: next(reads))
+    assert not await s.poll_link()
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", True)
+    assert not await s.poll_link()
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", False)
+    assert not await s.poll_link()
+    assert not s.fast_active() and events == []
+
+
+# --- a dead chip is marked lost on the second sample -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_two_fast_all_ones_samples_mark_a_chip_lost_before_the_confirm_bound(watch):
+    """Under the fast cadence the second all-ones sample marks the chip lost (spec 03 I66), so the
+    poll clock does no full read of it again; only the isolation waits for FAST_CONFIRM_SEC. The
+    next sample reads its heartbeat once for real, so the proof never rests on a value nobody read."""
+    s, clock, isolated, _ = watch
+    s.arm_fast("uncorrectable AER errors on 0000:00:01.1")
+    bad = {"0": LIVE, "13": DEAD, "31": LIVE}
+
+    await s.check_for_dead_chips(bad)
+    assert not chip_state.is_lost("13"), "one sample is not the proof"
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    await s.check_for_dead_chips(bad)
+    assert chip_state.is_lost("13"), "the second all-ones sample marks it lost"
+    assert isolated == [], "the isolation still waits for FAST_CONFIRM_SEC"
+    rec = chip_state._lost["13"]
+    assert rec["next"] <= rec["read"] + chip_state.PROBE_MIN_SEC, "the next sample reads it for real"
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    await s.check_for_dead_chips(bad)
+    assert isolated == ["13"]
+
+
+@pytest.mark.asyncio
+async def test_two_fast_blackout_samples_mark_every_chip_lost_before_the_confirm_bound(watch):
+    s, clock, isolated, events = watch
+    s.arm_fast("uncorrectable AER errors on 0000:00:01.1")
+    black = {"0": DEAD, "13": DEAD, "31": DEAD}
+
+    await s.check_for_dead_chips(black)
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    await s.check_for_dead_chips(black)
+    assert sorted(chip_state.lost_chips(), key=int) == ["0", "13", "31"]
+    assert "all_chips_blackout" not in _kinds(events)
+    assert srv.fsm.state is ServerState.HEALTHY
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    await s.check_for_dead_chips(black)
+    assert "all_chips_blackout" in _kinds(events)
+    assert isolated == [], "a blackout never isolates"

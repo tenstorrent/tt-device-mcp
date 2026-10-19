@@ -106,6 +106,10 @@ your project's `AGENTS.md`.
 
 Every submission enters one queue. The runner takes one job at a time.
 
+Before a job starts, the broker checks that the job's user can write the
+dirs tt-metal will write (`generated/` and its subdirs), and fails the job at
+once if not.
+
 Between jobs a gate probes the device (chip count, ARC heartbeat, ethernet
 links, fabric traffic). If the device is unfit, the gate holds the queue and
 climbs a reset ladder until the device recovers. It never resets while another
@@ -122,6 +126,12 @@ Start with [00-overview](specs/00-overview.md).
 Environment variables set paths, timeouts, and health thresholds. The full index
 is in [06-state-paths](specs/06-state-paths.md).
 
+The power-cycle cooldown also counts cycles that did not reboot the host (for example a BMC power
+cycle). An out-of-band tool can append them to `power_cycle_history.jsonl` in the broker's state dir
+(`/var/lib/tt-device-broker/`), one JSON object per line: `{"at_epoch": <seconds>, "cause": "<text>"}`.
+`TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE` names another file. A missing file or a malformed line is
+ignored.
+
 If other workloads share the host, an automatic power cycle cuts them too. Set
 `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` to a command that drains them; the broker
 runs it just before it power-cycles the host and waits for it to exit, up to
@@ -137,6 +147,28 @@ drop-in for the broker:
 Environment="TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK=/usr/local/bin/drain-jobs --reason power-cycle"
 Environment=TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC=300
 ```
+
+## Reading chip state from other tools
+
+A read of a chip's sysfs telemetry (`/sys/class/tenstorrent/*/tt_*`) is a PCIe
+read of the chip. On a chip that has left the bus, hung, or is being reset, it
+can stall a CPU core, and many such reads can take the host down. Tools that
+poll those files should check the broker's published chip state first:
+`/run/tt-device-broker/chip-state.json` (world-readable, replaced atomically).
+
+```json
+{"version": 1, "pid": 1234, "recovering": false, "lost": ["7"],
+ "chips": {"0": {"lost": false, "recovering": false},
+           "7": {"lost": true, "recovering": false,
+                 "lost_since": "2026-01-01T12:00:00", "lost_reason": "..."}}}
+```
+
+- Do not read a chip whose `lost` or `recovering` is true. While the top-level
+  `recovering` is true, a reset owns every chip: read none of them.
+- Trust the file only while the process `pid` is alive; a stale file from a
+  stopped broker says nothing about the chips now.
+- The same fields are on `/health` (`lost_chips`, `recovering`,
+  `resetting_chips`).
 
 ## Slurm
 
@@ -175,6 +207,14 @@ See [deploy/README.md](deploy/README.md) for the timeout arithmetic
   and require users to go through `tt-device-mcp run`.
 - Hosts are unlocked by default and stay cooperative. A direct run works, and
   collides with whatever the queue is running.
+
+**A job failed at once with "tt-metal output dir not writable".**
+
+- tt-metal writes under `generated/` in the job's working directory, or under
+  `$TT_METAL_LOGS_PATH`. A run as root there leaves it root-owned, and the
+  broker refuses jobs that could not write it rather than let them fail later.
+- The error names each path, its owner and mode. Give the dirs back to your
+  user, move them aside, or set `TT_METAL_LOGS_PATH` in the job's env file.
 
 **A job died with no output.**
 

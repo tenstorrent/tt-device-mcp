@@ -213,9 +213,9 @@ def test_rung_gap_boot_warning_and_health_field(monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     log.said.clear()
     srv.log_rung_inventory()
-    gaps = [m for lvl, m in log.said if lvl == "warning" and "RUNG GAP" in m]
-    assert len(gaps) == 1 and "TT_DEVICE_MCP_FORCE_ESCALATE=0" in gaps[0]
-    assert "TT_DEVICE_MCP_SELFHEAL_RELIFT=0" in srv._health_payload()["hold_exit_gap"]
+    # Spec 04 I76: the 10-min hold bound ignores the kill switch, so its ladder is still an exit.
+    assert not any("RUNG GAP" in m for _, m in log.said)
+    assert srv._health_payload()["hold_exit_gap"] is None
 
     monkeypatch.delenv("TT_DEVICE_MCP_SELFHEAL_RELIFT")
     monkeypatch.delenv("TT_DEVICE_MCP_FORCE_ESCALATE")
@@ -226,15 +226,30 @@ def test_rung_gap_boot_warning_and_health_field(monkeypatch):
 def test_floor_message_promises_escalation_only_when_armed(monkeypatch):
     monkeypatch.delenv("TT_DEVICE_MCP_FORCE_ESCALATE", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_SELFHEAL_RELIFT", raising=False)
-    assert "escalates in ~2 min" in srv._hold_escalation_note(off_bus=1)
+    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_cooldown_state", None)
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    assert "~10 s" not in srv._hold_escalation_note(off_bus=1), "no early rung for a drop with no isolated chip"
+    assert "climbs at the 10-min hold ceiling" in srv._hold_escalation_note(off_bus=1)
     assert "escalates at the 10-min hold ceiling" in srv._hold_escalation_note()
+    # Spec 03 I55: the whole-tray power cycle is promised only while it is armed.
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    assert "goes to the power cycle at once" in srv._hold_escalation_note(off_bus=8)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
+    note = srv._hold_escalation_note(off_bus=8)
+    assert "goes to the power cycle" not in note and "not armed" in note and "climbs at the 10-min" in note
+    monkeypatch.setattr(srv, "isolated_chips", {7})
+    assert "escalates in ~10 s (isolated chips; 120 s while a tenant holds the device)" in srv._hold_escalation_note(
+        off_bus=1
+    )
     monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     for off_bus in (0, 1):
         note = srv._hold_escalation_note(off_bus)
-        assert "escalates" not in note and "only the idle self-heal relift" in note
+        assert "~10 s" not in note and "self-heal relift" in note
+        assert "the ladder still runs at the 10-min hold bound" in note, "the bound ignores the kill switch"
     monkeypatch.setenv("TT_DEVICE_MCP_SELFHEAL_RELIFT", "0")
     note = srv._hold_escalation_note(1)
-    assert "escalates" not in note and "NO automatic exit" in note
+    assert "relift" not in note and "NO automatic exit" not in note and "operator must act" not in note
+    assert "the ladder still runs at the 10-min hold bound" in note
 
 
 @pytest.mark.asyncio
@@ -280,3 +295,17 @@ async def test_gate_refused_reset_leaves_the_latch_unspent(monkeypatch, mesh):
     assert srv._dispatch_reset_spent is False, "a gate-refused reset is not spent"
     assert srv.fsm.state is ServerState.RECOVERING
     assert "already ran" not in srv.fsm.record.detail
+
+
+@pytest.mark.asyncio
+async def test_a_clean_exit_dispatch_failure_whose_reset_fails_stays_held(mesh):
+    """The same reset from a clean exit (no episode open yet): the gate opens one before it fires,
+    so a failed post-reset check holds the door instead of leaving the FSM HEALTHY."""
+    srv.fsm.on_readings(srv._healthy_reading())
+    assert srv.fsm.state is ServerState.HEALTHY
+    mesh["reset_heals"] = False
+    await _gate()
+    assert mesh["resets"] == [["tt-smi", "-glx_reset"]]
+    assert mesh["verifies"][-1] is True, "the post-reset check ran the fabric pass"
+    assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
+    assert srv._device_unavailable_for_tenant()
