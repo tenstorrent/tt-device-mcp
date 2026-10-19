@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """Spec 09 I7: the autouse per-test reset leaves no broker job, hold, hold-bound or escalation state
 behind, so no test's result depends on the order it runs in or on the xdist worker it lands on."""
 
