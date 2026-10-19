@@ -16,6 +16,9 @@ from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitors import pci
 
 _BDF_RE = r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]"
+# After a Secondary Bus Reset release the link must retrain before a rescan reads config space
+# (PCIe: at least 100 ms); every SBR here waits this long before its rescan.
+SBR_RETRAIN_SETTLE_SEC = 1.0
 
 
 def bridge_reset_enabled() -> bool:
@@ -88,7 +91,7 @@ def reset_chip_via_bridge(idx: str, bdf: str) -> Optional[bool]:
     if not fired:
         return fired
     try:
-        time.sleep(1.0)
+        time.sleep(SBR_RETRAIN_SETTLE_SEC)
         Path("/sys/bus/pci/rescan").write_text("1")
         # The endpoint has to re-enumerate and the driver rebind before it is usable.
         for _ in range(20):
@@ -105,8 +108,9 @@ def reset_chip_via_bridge(idx: str, bdf: str) -> Optional[bool]:
 
 def reset_removed_chip(idx: str) -> Optional[bool]:
     """Fire the Secondary Bus Reset of a chip the broker removed, through its recorded bridge, and
-    do NOT rescan: the caller resets every removed chip of the pass first and rescans once, so no
-    rescan re-enumerates a removed chip that is still hung (spec 04 I69). ``True`` the reset fired,
+    do NOT rescan: the caller resets every removed chip of the pass first, waits
+    SBR_RETRAIN_SETTLE_SEC once and rescans once, so no rescan re-enumerates a removed chip that is
+    still hung (spec 04 I69). ``True`` the reset fired,
     ``False`` a setpci write failed, ``None`` no usable bridge or no setpci."""
     bridge = recorded_bridge(idx)
     if not bridge:

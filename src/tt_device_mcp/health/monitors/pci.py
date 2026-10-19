@@ -320,6 +320,11 @@ def removed_chip(idx) -> Optional[dict]:
     return REMOVED_CHIPS.get(str(idx))
 
 
+def removed_chip_ids() -> list:
+    """Every chip that still has a removal record, sorted by index."""
+    return sorted(REMOVED_CHIPS, key=int)
+
+
 def forget_removed_chip(idx) -> None:
     """Drop the removal record of a chip that is back on the bus."""
     REMOVED_CHIPS.pop(str(idx), None)

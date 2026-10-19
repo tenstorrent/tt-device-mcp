@@ -25,7 +25,7 @@ from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import offbus_chip_ids, offbus_count
-from tt_device_mcp.health.monitors.pci import chip_node_present, chip_pci_bdfs, pci_bus_number
+from tt_device_mcp.health.monitors.pci import chip_node_present, chip_pci_bdfs, pci_bus_number, removed_chip_ids
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
     BLOCKED,
@@ -1789,9 +1789,17 @@ class GalaxyRecovery(Recovery):
         tenant_active = self._tenant_active(scan)
         rescan = "not run"
         t0 = time.monotonic()
+        # Spec 04 I69: this rescan resets nothing, so it must not re-enumerate a chip the broker removed
+        # while hung. Withheld once for the episode, with no wait: the ladder's resets follow at once.
+        removed = removed_chip_ids()
         if not td["rescanned"]:
             if tenant_active:
                 rescan = "waiting (a tenant holds the device)"
+            elif removed:
+                td["rescanned"] = True
+                rescan = "withheld (removed chip not reset)"
+                health_event("pci_rescan_withheld", chips=removed, unreset=removed, reason="removed_chip_not_reset")
+                log(f"tray-down: PCI rescan withheld, chip(s) {removed} were removed and not reset — to the ladder")
             else:
                 td["rescanned"] = True
                 try:

@@ -39,6 +39,7 @@ from tt_device_mcp.health.recovery.base import (
     refuse_mesh_reset,
 )
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
+    SBR_RETRAIN_SETTLE_SEC,
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
     reset_chip_via_bridge,
@@ -456,7 +457,10 @@ class Recovery(ABC):
         # needs no setpci.
         sbr = bridge_reset_enabled()
         if not sbr:
-            log(f"per-chip bridge reset unavailable ({bridge_reset_unavailable_reason()}) — trying a PCI rescan")
+            log(
+                f"per-chip bridge reset unavailable ({bridge_reset_unavailable_reason()}) — a PCI rescan follows "
+                "unless a chip the broker removed is still un-reset"
+            )
         # An SBR takes its chip off the bus like any reset, so the per-host gate (spec 04 I24) holds it
         # too: the isolated chips are off the bus by definition.
         gated, why = False, ""
@@ -464,7 +468,10 @@ class Recovery(ABC):
             allowed, why = pcie_guard.host_reset_gate(len(targets))
             gated = not allowed
         if gated:
-            log(f"per-chip bridge reset NOT fired: {why} — trying a PCI rescan")
+            log(
+                f"per-chip bridge reset NOT fired: {why} — a PCI rescan follows unless a chip the broker "
+                "removed is still un-reset"
+            )
             health_event("host_reset_gated", context="bridge_reset", chips=targets, reason=why, host_at_risk=True)
         # Spec 04 I69: a chip the broker removed is still hung, and any rescan this pass would
         # re-enumerate it for the driver to probe. So reset every one of them through its recorded
@@ -478,6 +485,8 @@ class Recovery(ABC):
             for idx in removed:
                 for attempt in range(BRIDGE_RESET_MAX_TRIES):
                     FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
+                    # An SBR clears the chip's firmware clock cap like any reset (spec 03 I35).
+                    CEILING.mark_owed(f"bridge reset of chip {idx}")
                     fired = await asyncio.to_thread(reset_removed_chip, idx)
                     if fired:
                         reset_this_pass.add(idx)
@@ -492,6 +501,9 @@ class Recovery(ABC):
                     unreset.append(idx)
             if not unreset:
                 log(f"chip(s) {removed} reset through their recorded bridges — rescanning once")
+                # One link-retrain settle for the batch, after the last SBR release, as
+                # reset_chip_via_bridge waits before its own rescan.
+                await asyncio.sleep(SBR_RETRAIN_SETTLE_SEC)
                 try:
                     await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
                 except OSError as e:
@@ -596,10 +608,12 @@ class Recovery(ABC):
             len(still_dead),
         )
 
-        # Spec 04 I69: never re-enumerate a removed chip that was not reset this pass, and never
-        # rescan past a refused host reset gate — the rescan lets the driver probe a hung chip.
+        # Spec 04 I69: never re-enumerate a removed chip that was not reset this pass — the rescan
+        # lets the driver probe a hung chip. A refused host reset gate withholds it only then (the
+        # removed chips were not reset because of it); chips the broker never removed keep the
+        # bare rescan, as before the gate.
         unreset_dead = [i for i in still_dead if pci.removed_chip(i) and i not in reset_this_pass]
-        withhold = "host_reset_gated" if gated else ("removed_chip_not_reset" if unreset_dead else "")
+        withhold = ("host_reset_gated" if gated else "removed_chip_not_reset") if unreset_dead else ""
         if still_dead and withhold:
             health_event("pci_rescan_withheld", chips=still_dead, unreset=unreset_dead, reason=withhold)
             log(

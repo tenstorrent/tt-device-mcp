@@ -217,16 +217,89 @@ async def test_no_rescan_for_a_removed_chip_without_privilege(tmp_path, monkeypa
     assert srv.isolated_chips == {"13"}
 
 
-@pytest.mark.parametrize("removed", [True, False])
 @pytest.mark.asyncio
-async def test_no_rescan_when_the_host_reset_gate_refuses(tmp_path, monkeypatch, rung, removed):
+async def test_no_rescan_when_the_host_reset_gate_refuses(tmp_path, monkeypatch, rung):
+    """The gate refused the reset of a removed chip, so it is still hung: no rescan."""
     bus = FakeBus(tmp_path, monkeypatch)
-    if removed:
-        bus.remove("13")
+    bus.remove("13")
     monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda n: (False, "too many resets"))
     assert await _run({"13"}) is False
     assert bus.trace == []
     assert _kinds(rung, "pci_rescan_withheld")[0]["reason"] == "host_reset_gated"
+
+
+@pytest.mark.asyncio
+async def test_a_gate_refusal_keeps_the_bare_rescan_for_a_chip_the_broker_did_not_remove(tmp_path, monkeypatch, rung):
+    """A gate refusal stops the SBR, not the rescan: with no removed chip in the pass the 3 s rescan
+    still runs, as before I69, and a chip whose /dev node only went missing comes back on it."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    (bus.cls / "tenstorrent!13" / "device").unlink()
+    (bus.cls / "tenstorrent!13").rmdir()
+    bus.reset_since_remove.add("13")  # the rescan re-creates its node
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda n: (False, "too many resets"))
+    assert await _run({"13"}) is True
+    assert bus.trace == [("rescan",)], "no SBR past the gate, one bare rescan"
+    assert not _kinds(rung, "pci_rescan_withheld")
+    assert srv.isolated_chips == set()
+
+
+@pytest.mark.asyncio
+async def test_a_removed_chip_reset_owes_the_aiclk_ceiling(tmp_path, monkeypatch, rung):
+    """Spec 03 I35: an SBR clears the firmware clock cap like any reset, including the batched reset
+    of a removed chip that returns on the pass's one rescan."""
+    owed = []
+    monkeypatch.setattr(recovery_pkg.CEILING, "mark_owed", lambda reason: owed.append(reason))
+    bus = FakeBus(tmp_path, monkeypatch)
+    bus.remove("13")
+    assert await _run({"13"}) is True
+    assert bus.trace[:2] == [("sbr", "0000:40:01.1"), ("rescan",)], bus.trace
+    assert owed == ["bridge reset of chip 13"]
+
+
+@pytest.mark.asyncio
+async def test_the_link_retrains_after_the_last_sbr_before_the_rescan(tmp_path, monkeypatch, rung):
+    """PCIe needs the link retrained before config reads: one SBR_RETRAIN_SETTLE_SEC wait follows the
+    last SBR release of the batch and precedes the pass's one rescan (not one wait per chip)."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    bus.remove("13")
+    bus.remove("14")
+    real_sleep = asyncio.sleep
+
+    async def traced_sleep(delay, *a, **k):
+        bus.trace.append(("sleep", delay))
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", traced_sleep)
+    assert await _run({"13", "14"}) is True
+    first_rescan = bus.trace.index(("rescan",))
+    assert bus.trace[first_rescan - 1] == ("sleep", bridge.SBR_RETRAIN_SETTLE_SEC), bus.trace
+    assert bridge.SBR_RETRAIN_SETTLE_SEC >= 1.0
+    before = bus.trace[:first_rescan]
+    assert [t[0] for t in before] == ["sbr", "sbr", "sleep"], before
+
+
+@pytest.mark.asyncio
+async def test_a_removed_chip_rung_stays_inside_its_stated_worst_case(tmp_path, monkeypatch, rung):
+    """The I69 time bound for a removed chip that never returns: three SBRs, each followed by the 1 s
+    retrain settle and the 10 s re-bind poll, with the 4 s settle between tries, then the 3 s rescan
+    the pass ends with (the chip was reset this pass, so it may run): 44.3 s of waits."""
+    bus = FakeBus(tmp_path, monkeypatch, come_back=False)
+    bus.remove("13")
+    monkeypatch.setattr(recovery_pkg, "BRIDGE_RESET_SETTLE_SEC", 4)
+    waited = []
+    real_sleep = asyncio.sleep
+
+    async def timed_sleep(delay, *a, **k):
+        waited.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", timed_sleep)
+    monkeypatch.setattr(bridge.time, "sleep", lambda s: waited.append(s))
+    assert await _run({"13"}) is False
+    tries = recovery_pkg.BRIDGE_RESET_MAX_TRIES
+    assert [t[0] for t in bus.trace].count("sbr") == tries
+    bound = tries * (0.1 + bridge.SBR_RETRAIN_SETTLE_SEC + 20 * 0.5) + (tries - 1) * 4 + 3
+    assert sum(waited) == pytest.approx(bound) and bound == pytest.approx(44.3), waited
 
 
 @pytest.mark.asyncio
