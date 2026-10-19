@@ -259,9 +259,8 @@ async def test_a_whole_tray_down_goes_straight_to_the_power_cycle(monkeypatch, t
     _beats_off(monkeypatch, range(24, 32))
     counters = {"resets": 0}
     seen = _gate_seen_by_reset(monkeypatch, counters)
-    await _escalate()  # the episode's first climb: the gate refuses every rung
-    assert rec["fires"] == []
-    assert await _escalate() is True
+    await _escalate()
+    await _escalate()
     assert len(rec["fires"]) == 1, "the power cycle fired"
     assert counters["resets"] == 0 and not any(seen), "no mesh reset before it"
     assert ("offbus_gated_hold", "gate_lifted") not in [(k, f.get("phase")) for k, f in rec["events"]]
@@ -272,8 +271,8 @@ async def test_a_whole_tray_down_goes_straight_to_the_power_cycle(monkeypatch, t
 async def test_a_partial_drop_gets_the_mesh_reset_first_and_the_power_cycle_only_if_it_fails(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
-    """g15blx02, 10-15 01:37-01:48 PDT: one chip off, gate ``hold``, power cycle configured. It went to the
-    power cycle and the mesh reset never ran. Now the pass at the grace lifts the gate once and the
+    """One chip off, gate ``hold``, power cycle configured: the hold went to the power cycle and the
+    mesh reset never ran. Now the pass at the grace lifts the gate once and the
     mesh reset runs; it fails, the watchdog forces one more pass, and that one fires the power cycle
     with the gate shut again. Fails on base, which never lifts the gate with a power cycle set."""
     hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=400, cmd=CYCLE)
@@ -293,6 +292,48 @@ async def test_a_partial_drop_gets_the_mesh_reset_first_and_the_power_cycle_only
     assert await _escalate() is True
     assert len(rec["fires"]) == 1 and counters["resets"] == 1, "then the power cycle, no second reset"
     assert not opc.due_for_watchdog(hold_since), "re-armed once only"
+
+
+def _decline(monkeypatch, how):
+    """Make the climb's own guards decline the next pass: an active reset scope, a readable tenant, or
+    (``below_ceiling``) a non-forced pass while the hold is still under the 600 s ceiling."""
+    rec = srv.galaxy_recovery
+    if how == "scope":
+        monkeypatch.setattr(rec.mechanism, "scope_active", lambda: True)
+    elif how == "tenant":
+        monkeypatch.setattr(rec, "_tenant_blocker", lambda scan, force=False: {"pid": 4242, "user": "dev"})
+        monkeypatch.setattr(rec, "_describe_blocker", lambda blocker: "a tenant holds the device")
+    return how != "below_ceiling"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["scope", "tenant", "below_ceiling"])
+async def test_a_declined_lifted_pass_is_not_spent_and_the_mesh_reset_still_runs_first(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays, how
+):
+    """The one lifted pass is spent only when its climb reaches the rungs. A pass the climb's guards
+    decline (a reset cycling in its own scope, a tenant, a non-forced pass below the ceiling) runs no
+    reset, stays due and re-arms nothing; the next pass that does run gets the mesh reset, and only
+    after it fails does the power cycle fire. Fails on the base, which spent the pass in the lift."""
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=400, cmd=CYCLE)
+    _beats_off(monkeypatch, [17])
+    counters = {"resets": 0}
+    _gate_seen_by_reset(monkeypatch, counters)  # the reset fails: the chip stays off
+    await _escalate()  # the first climb, gate shut
+    assert opc.partial_reset_due(hold_since)
+    opc.mark_spawned(hold_since)
+    with monkeypatch.context() as m:
+        force = _decline(m, how)
+        assert await _escalate(force=force) is False
+    assert counters["resets"] == 0 and rec["fires"] == [], "a declined pass runs no reset and no power cycle"
+    assert opc.partial_reset_due(hold_since), "a declined climb leaves the lifted pass due"
+    assert not opc._pending.get("partial_rearmed"), "and re-arms nothing"
+    assert await _escalate() is True
+    assert counters["resets"] == 1 and rec["fires"] == [], "the next pass runs the mesh reset"
+    assert not opc.partial_reset_due(hold_since)
+    opc.mark_spawned(hold_since)
+    assert await _escalate() is True
+    assert len(rec["fires"]) == 1 and counters["resets"] == 1, "then the power cycle"
 
 
 @pytest.mark.asyncio

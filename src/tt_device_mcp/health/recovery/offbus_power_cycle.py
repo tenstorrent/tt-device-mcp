@@ -36,6 +36,8 @@ the attempt against the rate limit.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import os
 import shlex
@@ -401,6 +403,8 @@ def note_ladder_ran(episode: str) -> None:
         return
     _track(episode)
     _pending["ladder_ran"] = True
+    if _PARTIAL_PASS.get() == episode:
+        _pending["partial_reset"] = True  # the lifted pass reached its rungs: spent, whatever its outcome
 
 
 def ladder_ran(episode: str) -> bool:
@@ -420,15 +424,32 @@ def partial_reset_due(episode: str, now: Optional[datetime] = None) -> bool:
     return age is not None and age >= grace_sec()
 
 
-def note_partial_reset(episode: str) -> None:
-    """This episode's one lifted pass is starting: it is spent whatever its outcome."""
-    _track(episode)
-    _pending["partial_reset"] = True
+_PARTIAL_PASS: contextvars.ContextVar = contextvars.ContextVar("tt_device_mcp_partial_pass", default="")
+
+
+@contextlib.contextmanager
+def partial_pass(episode: str):
+    """Scope this episode's one lifted pass (spec 04 I27). It is spent only once its climb has passed
+    the climb's own guards (ceiling, latch, reset scope, tenant, cooldown) and reaches the rungs
+    (:func:`note_ladder_ran`): a climb those guards decline leaves it due, so the mesh reset is never
+    skipped on the way to the power cycle. A spent pass that leaves the hold standing re-arms the
+    watchdog once (:func:`rearm_after_partial_reset`). With no power cycle configured the lift is the
+    I33 operator hand-off's, not this pass: nothing is tracked."""
+    if power_cycle_argv() is None:
+        yield
+        return
+    token = _PARTIAL_PASS.set(episode)
+    try:
+        yield
+    finally:
+        _PARTIAL_PASS.reset(token)
+        rearm_after_partial_reset(episode)
 
 
 def rearm_after_partial_reset(episode: str) -> None:
-    """The lifted pass ended with the hold still standing: the watchdog forces one more pass, which
-    fires the power cycle, instead of waiting for the next ceiling window (once per episode)."""
+    """The lifted pass ran and ended with the hold still standing: the watchdog forces one more pass,
+    which fires the power cycle, instead of waiting for the next ceiling window (once per episode). A
+    pass that never reached its rungs re-arms nothing."""
     if _pending.get("episode") == episode and _pending.get("partial_reset") and not _pending.get("partial_rearmed"):
         _pending["partial_rearmed"] = True
         _pending["spawned"] = False

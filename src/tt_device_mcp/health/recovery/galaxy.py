@@ -2772,11 +2772,8 @@ class GalaxyRecovery(Recovery):
         lift = await self._offbus_hold_lift(expected, log)
         if not lift:
             return await self._climb_offbus_stuck_hold(indices, expected, log, force=force)
-        try:
-            with pcie_guard.hold_lifted(lift):
-                return await self._climb_offbus_stuck_hold(indices, expected, log, force=force)
-        finally:
-            offbus_power_cycle.rearm_after_partial_reset(self.deps.device_hold_episode_since())
+        with pcie_guard.hold_lifted(lift), offbus_power_cycle.partial_pass(self.deps.device_hold_episode_since()):
+            return await self._climb_offbus_stuck_hold(indices, expected, log, force=force)
 
     async def _offbus_hold_lift(self, expected: int, log) -> str:
         """Why this pass may lift the ``hold`` gate, or "" to keep it: with no power cycle configured,
@@ -2822,7 +2819,6 @@ class GalaxyRecovery(Recovery):
                 f"a partial off-bus drop outlived its {offbus_power_cycle.grace_sec()}s grace: "
                 f"the reset ladder runs once before the power cycle"
             )
-            offbus_power_cycle.note_partial_reset(hold_since)
         else:
             why = f"the {offbus_power_cycle.hold_handoff_sec()}s operator hand-off of this off-bus hold ran out"
         log(
