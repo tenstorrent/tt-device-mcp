@@ -275,9 +275,17 @@ def _waits():
     return "JOB_CAP=1560\nUPTIME=/proc/uptime\n" + age + wait + "\n"
 
 
+def _pre_install():
+    """From the idle gate's drain through the last recovery check before the install."""
+    text = _SCRIPT.read_text()
+    return text[text.index("\ncount_busy\nif") : text.index("trap au_exit EXIT\n")]
+
+
 def _apply(tmp_path, **kw):
-    """The top gate (healthy at first) and the restart tail, with the install in between elided."""
-    body = _top() + _waits() + 'echo "autoupdate: applying"\ntrap au_exit EXIT\n' + _tail()
+    """The top gate (healthy at first), the drain and the check before the install, and the
+    restart tail, with the install in between elided. /health is asked once at the top, once
+    before the install and once before the restart."""
+    body = _top() + _waits() + _pre_install() + 'trap au_exit EXIT\necho "INSTALLED"\n' + _tail()
     return _run(tmp_path, body, **kw)
 
 
@@ -289,13 +297,48 @@ def test_a_clean_apply_restarts_and_logs_it(tmp_path):
     assert len(log) == 1 and "decision=applied" in log[0], log
 
 
-def test_a_hold_that_began_during_the_install_defers_the_restart(tmp_path):
-    done, trace, log = _apply(tmp_path, health=[_health(), _health(held=True, state="recovering", age=20)])
+def test_a_hold_that_began_during_the_drain_defers_before_the_install(tmp_path):
+    hold = tmp_path / "dispatch-hold"
+    stand_in = f"hold_write() {{ : > {hold}; }}"
+    done, trace, log = _apply(
+        tmp_path,
+        health=[_health(), _health(held=True, state="recovering", age=20)],
+        stand_ins=stand_in + "\nhold_write",
+    )
     assert done.returncode == 0, done.stderr
-    assert "restart" not in trace, "the restart landed in a hold that began during the install"
-    # installed.sha stays on the old sha, so the next lap goes through every gate again.
+    assert "INSTALLED" not in done.stdout, "the lap installed and then stopped short of the restart"
+    assert "restart" not in trace
+    # installed.sha stays on the old sha, so the next lap goes through every gate again, and the
+    # dispatch hold the drain took is dropped.
     assert (tmp_path / "root" / "installed.sha").read_text().strip() == _OLD
-    assert len(log) == 1 and "decision=deferred" in log[0] and "at restart time" in log[0], log
+    assert not hold.exists()
+    assert len(log) == 1 and "decision=deferred" in log[0] and "before the install" in log[0], log
+    assert "hold_age=20s" in log[0], log
+
+
+def test_a_hold_that_began_during_the_install_does_not_stop_the_restart(tmp_path):
+    """pip and apply-host-config have changed the broker's code by then: an old broker left on it
+    is worse than a restart, whose startup check holds the device again."""
+    done, trace, log = _apply(tmp_path, health=[_health(), _health(), _health(held=True, state="recovering", age=20)])
+    assert done.returncode == 0, done.stderr
+    assert "INSTALLED" in done.stdout
+    assert "restart" in trace
+    assert (tmp_path / "root" / "installed.sha").read_text().strip() == _NEW
+    assert "began during the install" in done.stderr
+    assert len(log) == 1 and "decision=applied" in log[0] and "into a recovery" in log[0], log
+    assert not (tmp_path / "root" / "recovery.defer").exists()
+
+
+def test_no_recovery_deferral_comes_after_the_install_starts():
+    """Every recovery deferral is decided before pip runs. The only stop after it is the device-op
+    bar (I7, I24), which a restart may never cross."""
+    text = _SCRIPT.read_text()
+    install = text.index('"$VENV/bin/pip" install')
+    assert text.rindex("if recovery_gate; then") < text.index('git -C "$clone" reset --hard') < install
+    after = text[install:]
+    assert "if recovery_gate" not in after
+    deferrals = re.findall(r'au_log deferred "([^"]*)"', after)
+    assert deferrals == ["device op still in flight at restart time (job cap ${JOB_CAP}s)"], deferrals
 
 
 def test_a_device_op_at_restart_time_is_waited_out(tmp_path):
@@ -327,7 +370,7 @@ def test_a_device_op_that_outlives_the_wait_is_never_restarted_over(tmp_path):
 
 def test_the_restart_still_comes_after_the_last_look():
     tail = _tail()
-    assert tail.index('wait_job_boundary "restart point"') < tail.index("if recovery_gate") < tail.index('> "$STATE"')
+    assert tail.index('wait_job_boundary "restart point"') < tail.index("recovery_gate || :") < tail.index('> "$STATE"')
     assert tail.index('> "$STATE"') < tail.index("systemctl restart tt-device-broker")
 
 

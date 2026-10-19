@@ -104,6 +104,7 @@ sleep() {{ seen "sleep $*"; }}
 pgrep() {{ seen pgrep; }}
 ls() {{ :; }}  # no real /proc holders
 job_scopes() {{ [ -n "{scopes}" ] && echo "{scopes}"; }}
+recovery_gate() {{ recovery_why=""; return 1; }}  # a healthy broker: spec 08 I23 has its own tests
 systemctl() {{
     case "$*" in
         *list-units*ttdev-job-*) seen scopes; job_scopes ;;

@@ -137,12 +137,15 @@ fi
 # flight, and a restart there throws the episode back to the startup check, a forced fabric pass
 # on a mesh the broker already knows is bad, and can turn a heal in progress into a longer one.
 # So while the broker's /health reports a hold, or its FSM is recovering or down, the update
-# waits, bounded: it applies once the hold has lasted RECOVERY_DEFER (every fault class's
-# time-to-recover budget is shorter, so a recovery still over it is over budget and the update
-# may be its fix), or once this pending update has waited RECOVERY_DEFER in all, so a hold that
-# keeps coming back cannot starve a box of a fix. Never more than 30 min; 0 turns it off. A
-# broker that does not answer /health is not deferred for: an update may be what it needs.
-# The deferral delays only the restart; no rung, reset, power cycle or escalation waits on it.
+# waits, bounded: it applies once the hold has lasted RECOVERY_DEFER (above every fault class's
+# own time-to-recover budget, so a recovery still over it is over budget and the update may be
+# its fix; a hold waiting out the power-cycle cooldown can be longer, and its durable anchors
+# keep the cycle's deadline across the restart), or once this pending update has waited
+# RECOVERY_DEFER in all, so a hold that keeps coming back cannot starve a box of a fix. Never
+# more than 30 min; 0 turns it off. A broker that does not answer /health is not deferred for:
+# an update may be what it needs. Every recovery deferral comes before the install: once pip has
+# run, the lap restarts. The deferral delays only the restart; no rung, reset, power cycle or
+# escalation waits on it.
 RECOVERY_DEFER="${TTDEV_RECOVERY_DEFER_SEC:-1200}"
 [ "$RECOVERY_DEFER" -le 1800 ] 2>/dev/null || RECOVERY_DEFER=1800
 RECOVERY_PENDING="$ROOT/recovery.defer"
@@ -324,6 +327,20 @@ if [ "$busy" -ne 0 ]; then
     hold_write
 fi
 
+# The recovery deferral once more, and for the last time (spec 08 I23): the drain above can wait
+# out a whole job, and the broker starts holds on its own meanwhile. Nothing is installed yet. From
+# the install on, pip and apply-host-config change the broker's venv, units and timer, and a lap
+# that stopped after them would leave the old broker running on the new code (it imports some
+# modules lazily, at a fault's onset) until a later lap. So a lap defers here or not at all, and
+# one that defers drops the dispatch hold and leaves the tree and installed.sha alone.
+if recovery_gate; then
+    rm -f "$HOLD" 2>/dev/null || true
+    echo "autoupdate: broker recovery began before the install ($recovery_why); deferring" >&2
+    au_log deferred "broker recovery in progress before the install ($recovery_why)"
+    exit 0
+fi
+[ -n "$recovery_why" ] && echo "autoupdate: broker recovery past the deferral bound ($recovery_why); applying" >&2
+
 echo "autoupdate: applying ${remote_sha:0:9}" >&2
 trap au_exit EXIT
 # Reset to the sha this lap decided on, NOT to origin/$BR: the drain above can wait for
@@ -413,15 +430,13 @@ if [ $(( kids + holders + ${scopes:-0} )) -ne 0 ] || op_in_flight; then
         exit 0
     fi
 fi
-# Then the recovery deferral again (spec 08 I23): the install and any wait above take a minute or
-# more, and the broker starts holds on its own meanwhile. A hold that began within the deferral
-# bound ends the lap without the restart and before installed.sha moves, so the next lap goes
-# through every gate again.
-if recovery_gate; then
-    echo "autoupdate: broker recovery began during the install ($recovery_why); deferring the restart" >&2
-    au_log deferred "broker recovery in progress at restart time ($recovery_why)"
-    exit 0
-fi
+# No recovery deferral from here on (spec 08 I23): the install has already changed the broker's
+# code, and an old broker left running on it is worse than a restart. A hold that began during the
+# install is named and the restart goes ahead; the new broker's startup check (I20, fabric
+# included) holds the device again until it passes.
+recovery_gate || :
+[ -n "$recovery_why" ] \
+    && echo "autoupdate: broker recovery began during the install ($recovery_why); restarting, the install has changed the broker's code" >&2
 echo "$remote_sha" > "$STATE"
 chmod -R a+rX "$VENV" 2>/dev/null || true
 
@@ -430,7 +445,7 @@ systemctl restart tt-device-broker || rc=$?
 rm -f "$RECOVERY_PENDING" 2>/dev/null || true
 if [ "$rc" -eq 0 ]; then
     echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
-    au_log applied "broker restarted${recovery_why:+ (recovery past the deferral bound: $recovery_why)}"
+    au_log applied "broker restarted${recovery_why:+ (into a recovery: $recovery_why)}"
 else
     echo "autoupdate: broker restart at ${remote_sha:0:9} failed (exit $rc); reconcile starts it" >&2
     au_log failed "broker restart failed (exit $rc)"
