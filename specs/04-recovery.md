@@ -1308,7 +1308,9 @@ each rung fires only when the gentler one failed or cannot apply.
   not spawned again; the hold keeps its own class's path. That pass stands in for the episode's bound
   ladder only once the host rung after it was granted or its cooldown retry armed: then no later tick
   (the 10-min bound, a later ceiling window, the hold deadline) runs a second glx_reset or ladder, and
-  the host rung is next (persisted with the I82 carry, so a broker restart keeps it). When no host
+  the host rung is next. The I82 carry and a broker restart keep the pass's age and its at-start
+  mark but not the grant, so after either the bound still runs one more full ladder (about 220 s,
+  bounded), then the host rung. When no host
   rung was granted (both host rungs opted out, or a denial other than the cooldown), the pass is a
   forced run below the bound and the full ladder runs again at the 10-min mark, then the I76 cadence.
   A re-hold of another class in the same episode below the bound (I82 carry or a broker restart)
@@ -1326,6 +1328,18 @@ each rung fires only when the gentler one failed or cannot apply.
   when later. With no host rung grantable it adds one ladder plus check at the bound (about 220 s),
   then I76's cadence. Latched and missing-port holds: the I76 path, ladder at 600 s then the host rung.
   A carried re-hold of another class: the host rung at once instead of a ladder on every tick.
+  A run that declines (a heartbeat read once showed a chip off the bus) declines for the whole
+  episode, so a link-short hold whose heartbeat glitched once waits for the I76 bound: its ladder at
+  600 s, then the host rung (bounded). On a startup hold (spec 03 I75) the at-start pass stands down
+  like the ceiling window: while a re-adopted job runs it meets it on `job_running`; from the job's
+  end to the startup gate's verdict it leaves the hold to the gate (blocker `startup_verify`, its
+  window given back) and runs no rung. Only the gate's full check, fabric included, lifts the hold; a
+  gate that fails gets the at-start ladder on the next tick, then the power cycle if the check after
+  it still fails. A host rung due below the bound meets a running re-adopted job as a tenant
+  (`job_running`) and fires on the first tick after the job ends. Time to recover (link-short on a
+  startup hold): job end to the gate's verdict (about 1-2 min, at most `STARTUP_VERIFY_DEFER_MAX_SEC`)
+  when the gate passes; plus one ladder and check, then the power-cycle request, when it fails, inside
+  the 10-min bound.
 - **I73 — A whole tray still off the bus after two broker power cycles that did not heal it pages
   that AC removal may be needed, and recovery keeps running.** On this hardware an in-band power cycle
   healed a whole-tray drop (class A) on some dates and not on others; the drops it did not heal came
@@ -1924,6 +1938,7 @@ sees a silent fabric pass.
 | I83 a run that found another class declines once and is not spawned again | `tests/test_fabric_link_short.py::test_an_at_start_run_that_found_another_class_is_not_spawned_again` |
 | I83 the at-start pass stands in for the bound's ladder only after a granted host rung; otherwise the ladder runs at 10 min, then I76 | `tests/test_fabric_link_short.py::test_an_at_start_ladder_whose_host_rung_never_fired_does_not_stand_in_for_the_bounds_ladder`, `::test_a_granted_host_rung_after_the_at_start_ladder_runs_no_second_ladder_at_the_bound` |
 | I83 a re-hold of another class after a carried at-start ladder (carry or broker restart) asks for the host rung once, no ladder per tick | `tests/test_fabric_link_short.py::test_a_rehold_of_another_class_after_a_carried_at_start_ladder_asks_for_the_host_rung_once` |
+| I83 with spec 03 I75: on a startup hold the at-start ladder meets a running re-adopted job on `job_running`, stands down to the pending startup gate after the job ends, the gate's full check alone lifts; a failed gate gets the ladder then one power cycle; a below-bound host rung never fires over the running job | `tests/test_fabric_link_short.py::test_a_startup_hold_link_short_leaves_the_at_start_ladder_to_the_startup_gate`, `tests/test_fabric_link_short.py::test_a_below_bound_host_rung_never_fires_over_a_running_readopted_job` |
 | I76 `TT_DEVICE_MCP_FORCE_ESCALATE=0` does not stop the bound, and the boot warning says so; a held job past the bound still starts its escalation and below it names the bound; no message claims the hold has no automatic exit | `tests/test_hold_bound.py::test_the_operator_kill_switch_does_not_stop_the_bound`, `tests/test_rung_privilege.py::test_the_force_escalate_kill_switch_warns_that_the_hold_bound_ignores_it`, `tests/test_hold_bound.py::test_a_held_job_past_its_bound_under_the_kill_switch_says_the_bound_still_runs`, `tests/test_device_safety.py::test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
 | I58 all off after a failed reset and a broker restart: the startup or a later gate cycles with no second reset; the sweep skips a failed-unchanged set | `tests/test_classac_power_cycle_direct.py::test_replay_all_off_after_a_restart_cycles_with_no_second_reset`, `::test_a_partial_drop_keeps_the_ladder` |
 | I36 a power cycle that is rate-limited or not opted in never stops resets: a shrinking off-bus set resets again each forced window, and the gate retries its reset once its cooldown ran out | `tests/test_host_action_suppress.py::test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_fire`, `::test_the_gate_keeps_resetting_a_drop_whose_power_cycle_is_not_opted_in` |

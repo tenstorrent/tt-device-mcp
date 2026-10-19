@@ -11969,7 +11969,8 @@ STARTUP_VERIFY_DEFER_MAX_SEC = STARTUP_HUGEPAGES_WAIT_SEC + FABRIC_CHECK_TIMEOUT
 
 # The forced-run kinds the I75 stand-down may defer: the ones _rearm_tenant_deferred_window gives back,
 # so a deferred run is retried on the next tick. Every other kind spent its latch on spawn and runs.
-_STARTUP_VERIFY_DEFERRABLE_KINDS = ("ceiling_window", "offbus_one_shot")
+# Spec 04 I83's at-start ladder is one: it spends nothing on spawn and is due again on the next tick.
+_STARTUP_VERIFY_DEFERRABLE_KINDS = ("ceiling_window", "offbus_one_shot", "fabric_link_short")
 
 
 def _startup_verify_owns_hold(kind: Optional[str] = None) -> bool:

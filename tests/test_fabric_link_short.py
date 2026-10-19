@@ -14,10 +14,11 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from tests.test_device_safety import _arm_fabric_only_deadline_hold
+from tests.test_device_safety import _arm_fabric_only_deadline_hold, _setup_startup_hold_behind_readopted_job
 from tests.test_hold_bound import _KINDS, _REAL_HOST_RUNG, BOUND, _drain, _watchdog
 from tt_device_mcp import server as srv
-from tt_device_mcp.health.recovery import OUTCOME_RECOVERED, OUTCOME_TERMINAL
+from tt_device_mcp.fsm import ServerState
+from tt_device_mcp.health.recovery import OUTCOME_RECOVERED, OUTCOME_TERMINAL, OUTCOME_WAITING
 
 LINK_SHORT = ["topology mismatch", "known fabric fault"]
 
@@ -360,3 +361,122 @@ def test_an_offbus_chip_is_not_the_link_short_class(monkeypatch, clear_job_state
     monkeypatch.setattr(srv, "isolated_chips", {"29"})
     assert srv._fabric_link_short_hold() == ""
     assert not srv._fabric_link_short_ladder_due(10)
+
+
+def _startup_link_short_hold(monkeypatch, tmp_path):
+    """Spec 03 I75 with spec 04 I83: a broker restart re-adopted a running job and opened the startup
+    hold 30 s ago, and the episode it continues names a topology mismatch, so the hold reads as the
+    link-short class below the bound. The host rung's governor grants a power cycle, stubbed."""
+    since, job, climbs, gate_calls, gate_heals, release_job, _tick_fixed, events = (
+        _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    )
+    clock = _clock(monkeypatch)
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(seconds=30)).isoformat())
+    monkeypatch.setattr(srv, "device_hold_episode_reason", "topology mismatch: 1 port connection differs")
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", "")
+    monkeypatch.setattr(srv, "_fabric_link_short_declined", None)
+    monkeypatch.setattr(srv, "_hold_bound_episode", "")
+    cycles = []
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())  # as the real rung
+
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda action, tenant_active: (True, ""))
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+
+    async def tick(after_sec):
+        clock.offset = after_sec
+        srv._check_hold_deadline()
+        if srv._forced_escalation_task is not None:
+            await srv._forced_escalation_task
+
+    assert srv._fabric_link_short_hold() == "topology mismatch"
+    return job, climbs, gate_calls, gate_heals, release_job, tick, events, cycles
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate_passes", [True, False], ids=["gate passes", "gate fails"])
+async def test_a_startup_hold_link_short_leaves_the_at_start_ladder_to_the_startup_gate(
+    monkeypatch, tmp_path, gate_passes
+):
+    """Spec 03 I75 with spec 04 I83: while the re-adopted job runs, the at-start ladder meets it on
+    job_running and no host rung is asked for. Once the job ends and before the startup gate's verdict,
+    the at-start ladder stands down to the gate (blocker startup_verify) and runs no rung. Only the gate's
+    full check, fabric included, lifts the hold. A gate that fails gets the at-start ladder on the next
+    tick and, when the full check after it still fails, one power cycle; no second ladder by the bound.
+    Fails before fabric_link_short joined the I75 deferrable kinds: the ladder reset over the pending gate."""
+    job, climbs, gate_calls, gate_heals, release_job, tick, events, cycles = _startup_link_short_hold(
+        monkeypatch, tmp_path
+    )
+    gate_heals["on"] = gate_passes
+    ladder = srv.galaxy_recovery.escalate
+
+    async def unhealed_ladder(phase, indices, expected, log, **kw):
+        outcome = await ladder(phase, indices, expected, log, **kw)
+        return OUTCOME_WAITING if outcome == OUTCOME_RECOVERED else outcome  # its full check failed
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", unhealed_ladder)
+    try:
+        await tick(0)
+        assert srv.device_hold_escalation_kind == "fabric_link_short"
+        assert climbs == [] and cycles == [], "a rung over the running re-adopted job"
+        assert ("stuck_hold_deferred", "job_running") in events
+
+        job.status = srv.JobStatus.COMPLETED
+        await tick(10)
+        await tick(20)
+        assert climbs == [] and cycles == [], "the at-start ladder reset before the startup gate's verdict"
+        assert ("stuck_hold_deferred", "startup_verify") in events
+        assert gate_calls == []
+
+        await release_job()
+        assert len(gate_calls) == 1 and gate_calls[0][1], "the startup gate runs the full check, fabric included"
+        assert gate_calls[0][3] == [], "a reset ran before the gate"
+        if gate_passes:
+            assert srv.fsm.state is not ServerState.RECOVERING, "only the gate's passing full check lifts it"
+            await tick(30)
+            assert climbs == [] and cycles == []
+            return
+        assert srv.fsm.state is ServerState.RECOVERING, "a failed gate never lifts the hold"
+        await tick(30)
+        assert climbs == ["present-forced"], "the at-start ladder runs on the first tick after a failed gate"
+        assert len(cycles) == 1, "the full check after it still fails: the power cycle at once"
+        clock_bound = int(BOUND) + 30
+        for after in range(40, clock_bound, 10):
+            await tick(after)
+        assert climbs == ["present-forced"] and len(cycles) == 1, "the hold was driven twice"
+        assert srv.fsm.state is ServerState.RECOVERING
+    finally:
+        srv.readopted_scopes.clear()
+        srv._startup_verify_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_below_bound_host_rung_never_fires_over_a_running_readopted_job(monkeypatch, tmp_path):
+    """Spec 04 I83/I82 with spec 03 I75: a host rung due below the bound (an at-start ladder carried
+    across the restart that did not heal) meets the running re-adopted job as a tenant (job_running): no
+    power cycle is asked for while the job runs. Once it has ended, the rung is asked for."""
+    job, climbs, _gate_calls, _gate_heals, _release_job, _tick, events, cycles = _startup_link_short_hold(
+        monkeypatch, tmp_path
+    )
+    try:
+        srv._hold_bound_sync()
+        monkeypatch.setattr(srv, "_hold_bound_ladder_age", 20.0)
+        monkeypatch.setattr(srv, "_hold_bound_early", True)
+        monkeypatch.setattr(srv, "_hold_bound_check_failed_age", 25.0)
+        assert srv._hold_bound_cycle_due(30.0), "control: the carried ladder's host rung is due"
+        monkeypatch.setattr(srv, "device_hold_escalation_kind", "hold_bound_cycle")
+        await srv._force_escalate_stuck_hold()
+        assert cycles == [] and climbs == [], "a power cycle over the running re-adopted job"
+        assert srv._hold_bound_tenant_blocker == {"blocker": "job_running"}
+
+        job.status = srv.JobStatus.COMPLETED
+        monkeypatch.setattr(srv, "device_hold_tenant_deferred", False)
+        await srv._force_escalate_stuck_hold()
+        assert len(cycles) == 1 and climbs == [], "the host rung after the job, no second ladder"
+    finally:
+        srv.readopted_scopes.clear()
+        srv._startup_verify_task.cancel()
