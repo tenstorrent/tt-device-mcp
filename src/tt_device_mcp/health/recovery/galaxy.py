@@ -1094,6 +1094,8 @@ class GalaxyRecovery(Recovery):
     _host_rung_denied_why: str = ""
     # The episode whose 10-min-bound sweep already ran with no host rung to climb to (spec 04 I31/I76).
     _bound_sweep_since: Optional[str] = None
+    # The episode whose bound sweep had no reset rung allowed (the goal-10 exception, spec 04 I31/I76).
+    _bound_no_rung_since: Optional[str] = None
     # The (episode, until) of the last I65 cooldown a 77 climb waited on without a page (spec 04 I79).
     _fabric_77_cooldown_logged: Optional[tuple[str, float]] = None
     # Whether the last idle-ladder escalate() stood down on a live tenant (spec 04 I7). The hold
@@ -1824,7 +1826,15 @@ class GalaxyRecovery(Recovery):
                 await asyncio.shield(set_pollers(True, log))
 
     async def _issue_all_resets_back_to_back(
-        self, bitmap: int, tray_chip_ids: list, trays: list, expected: int, log, *, do_sbr: bool = True
+        self,
+        bitmap: int,
+        tray_chip_ids: list,
+        trays: list,
+        expected: int,
+        log,
+        *,
+        do_sbr: bool = True,
+        mesh_reset: bool = True,
     ) -> bool:
         """Fire EVERY reset type once, back-to-back, with no waiting or verifying between them: SBR on
         any chip still bridged, then a per-tray BMC re-power of ``bitmap``, then the mesh-wide reset —
@@ -1833,6 +1843,8 @@ class GalaxyRecovery(Recovery):
         rung, so the two can never drift apart. Never verifies and never raises: a rung that fails to
         launch is logged and the next one is issued anyway — before a reboot or a power cycle there is
         nothing left to lose. The caller owns the guards (tenant, scope), the settle and the verify.
+        ``mesh_reset=False`` leaves the mesh reset out: the 10-min bound's sweep with no host rung to
+        follow, where a repeat mesh reset on the same chips is a measured host risk (spec 04 I31).
 
         Returns whether the sweep was COMPLETE: False when the per-host gate refused it (spec 04 I24)
         or the tray envelope refused to cut power (I23). An incomplete sweep is not the full ladder,
@@ -1922,17 +1934,18 @@ class GalaxyRecovery(Recovery):
             # 3) mesh-wide reset, no verify (the ONE verify belongs to the caller). Lazy import:
             # select_recovery lives in the package __init__ that imports THIS module, so a top-level
             # import would be circular; by call time the package is fully loaded.
-            from tt_device_mcp.health.recovery import select_recovery
+            if mesh_reset:
+                from tt_device_mcp.health.recovery import select_recovery
 
-            argv = select_recovery(self.monitor, self.mechanism, self.deps).reset_argv(
-                [str(i) for i in range(expected)]
-            )
-            aer_mask = pcie_guard.mask_for_mesh_reset(log)
-            try:
-                await self.mechanism.reset_with_quiesce(argv, log)
-            finally:
-                if aer_mask is not None:
-                    await asyncio.to_thread(aer_mask.restore)
+                argv = select_recovery(self.monitor, self.mechanism, self.deps).reset_argv(
+                    [str(i) for i in range(expected)]
+                )
+                aer_mask = pcie_guard.mask_for_mesh_reset(log)
+                try:
+                    await self.mechanism.reset_with_quiesce(argv, log)
+                finally:
+                    if aer_mask is not None:
+                        await asyncio.to_thread(aer_mask.restore)
         except Exception as exc:  # noqa: BLE001 - the host rung above must fire even if a reset blew up
             log(f"the back-to-back reset sweep raised {exc!r} — continuing to the host rung")
             health_event("last_chance_reset_sweep_error", error=repr(exc))
@@ -1950,6 +1963,7 @@ class GalaxyRecovery(Recovery):
         context: str = "",
         fabric_77_unverified: bool = False,
         host_rung_follows: bool = True,
+        skip_mesh_reset: bool = False,
     ) -> Optional[bool]:
         """The LAST-CHANCE gate every host rung passes through: fire every reset type once more,
         back-to-back, then ONE settle and ONE verify — and only if the mesh is still bad does the
@@ -1970,6 +1984,12 @@ class GalaxyRecovery(Recovery):
         settle and verify still run — when a tenant holds the mesh or a reset is already cycling in its
         own scope: those are the two guards a destructive rung never crosses.
 
+        ``host_rung_follows=False`` is the 10-min bound's sweep with no power cycle to follow (spec 04
+        I31/I76). Futile is not unsafe there, so the I37 class skip does not apply. A mesh reset already
+        failed on these chips (I38/I58, or ``skip_mesh_reset``) still leaves the mesh reset out, and the
+        other allowed rungs run. With no rung allowed at all, nothing fires and only the full check runs:
+        that is the one goal-10 exception, journaled as ``bound_sweep_no_allowed_rung``.
+
         Returns True when the mesh came back, False when the FULL sweep ran and it did not (the caller
         climbs), and None when the sweep was skipped or incomplete and the mesh is still bad: the
         full ladder has not run, so the caller holds and fires no host rung this pass (I22)."""
@@ -1983,7 +2003,11 @@ class GalaxyRecovery(Recovery):
                 beats = {}
             offbus_chips = _offbus_chip_ids(beats or {}, expected)
         fault_class = self._power_cycle_direct_class_now(offbus_chips, expected, tray_map, log)
-        if fault_class is not None and not await asyncio.to_thread(self.mechanism.scope_active):
+        if fault_class is not None and not host_rung_follows:
+            # Spec 04 I31/I76: no power cycle follows, so skipping the sweep for a class it may not heal
+            # would leave the hold with no ladder at all. Futile is not unsafe: it runs.
+            log(f"last chance{where}: class {fault_class} — no host rung follows, so the sweep runs anyway")
+        elif fault_class is not None and not await asyncio.to_thread(self.mechanism.scope_active):
             # Spec 04 I37: the sweep's tray re-power and mesh reset have not healed this class (a
             # whole tray, or an all-off bus whose mesh reset already failed). The caller climbs at once.
             log(
@@ -1997,7 +2021,15 @@ class GalaxyRecovery(Recovery):
                 expected=expected,
             )
             return False
-        if (
+        mesh_reset = True
+        if not host_rung_follows and (
+            skip_mesh_reset or (offbus_chips and self.mechanism.rung_failed_unchanged("", "mesh_reset", offbus_chips))
+        ):
+            # Spec 04 I31/I38/I58: a repeat mesh reset on chips it already failed on killed one Galaxy
+            # host. With no host rung to climb to, the sweep still runs every other allowed rung.
+            log(f"last chance{where}: the mesh reset already failed on these chips — sweeping without it")
+            mesh_reset = False
+        elif (
             offbus_chips
             and self.mechanism.rung_failed_unchanged("", "mesh_reset", offbus_chips)
             and not await asyncio.to_thread(self.mechanism.scope_active)
@@ -2027,8 +2059,28 @@ class GalaxyRecovery(Recovery):
         # Chip ids come from the tray map (I16), not index arithmetic — bus 0x80 is tray 4 on BH
         # and index arithmetic would target the wrong silicon.
         tray_chip_ids = [c for t in trays for c in (tray_map or {}).get(t, [])]
+        do_sbr = bool(self.deps.isolated_chips())
         swept = False
-        if await asyncio.to_thread(self.mechanism.scope_active):
+        no_rung = (
+            not mesh_reset
+            and not do_sbr
+            and not (bitmap and _ubb_reset_enabled() and pcie_guard.tray_rung_disabled() is None)
+        )
+        if no_rung:
+            # The goal-10 exception (spec 04 I31/I76): the mesh reset may not repeat, no chip is bridged
+            # for an SBR and no tray re-power is allowed. Nothing fires; the full check below still runs,
+            # and only its pass releases. Not spent: the next window checks again.
+            log(f"last chance{where}: no reset rung is allowed (mesh reset failed on these chips) — check only")
+            self._bound_no_rung_since = self.deps.device_hold_episode_since() or None
+            health_event(
+                "bound_sweep_no_allowed_rung",
+                context=context or gate_phase,
+                reason="mesh_reset_failed_unchanged",
+                trays=trays,
+                off_bus=len(offbus_chips or set()),
+                expected=expected,
+            )
+        elif await asyncio.to_thread(self.mechanism.scope_active):
             log(f"last chance before the host rung{where}: a reset is already cycling in its own scope — adopting it")
         else:
             scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
@@ -2051,7 +2103,7 @@ class GalaxyRecovery(Recovery):
                     f"reboot or power cycle"
                 )
                 swept = await self._issue_all_resets_back_to_back(
-                    bitmap, tray_chip_ids, trays, expected, log, do_sbr=bool(self.deps.isolated_chips())
+                    bitmap, tray_chip_ids, trays, expected, log, do_sbr=do_sbr, mesh_reset=mesh_reset
                 )
         settle = _settle_before_host_rung_sec()
         log(f"settling {settle}s for re-enumeration, then one verify before the host rung")
@@ -2802,7 +2854,9 @@ class GalaxyRecovery(Recovery):
                     metrics.stage_fired("smi_reset", "blocked")
                     gated = await self._offbus_gated_power_cycle(off_bus_pre, expected, hold_since, log)
                     if gated is None:
-                        await self._climb_to_host_recovery_after_failed_reset(expected, off_bus_pre, log, swept=True)
+                        await self._climb_to_host_recovery_after_failed_reset(
+                            expected, off_bus_pre, log, swept=True, walk_failed=True
+                        )
                     return True
                 # The tray reset did not recover it (or was not opted in). The gate keeps the mesh
                 # reset suppressed below the floor (it can invert a below-floor drop all-off-bus),
@@ -3156,6 +3210,7 @@ class GalaxyRecovery(Recovery):
         ladder_ran: bool = False,
         cold: bool = False,
         present_reset_failed: bool = False,
+        walk_failed: bool = False,
     ) -> str:
         """Climb an idle escalation whose galaxy reset failed to revive the mesh to the host rung — a
         warm reboot, then a BMC power cycle above it — so a reset that did not recover does not sit.
@@ -3306,37 +3361,50 @@ class GalaxyRecovery(Recovery):
         )
         if (
             (reboot_blocked or not escalation)
-            and not swept
-            and not failed_unchanged
+            and (not swept or walk_failed)
             and (hold_age is None or hold_age >= _stuck_hold_ceiling_sec())
-            and self._bound_sweep_since != (hold_since or "")
+            and (not hold_since or self._bound_sweep_since != hold_since)
         ):
             # Spec 04 I76/I31: at the 10-min bound the full ladder, last-chance sweep included, runs
-            # once per episode before any page, even with no host rung to climb to. Only the sweep's
-            # own full check, fabric included, releases; a failed or incomplete one pages below and keeps
-            # the hold. An incomplete sweep (None: a tenant, a live reset scope, a gate) is not spent:
-            # the next window retries it.
+            # once per episode before any page, even with no host rung to climb to. A mesh reset that
+            # already failed on these chips (I38), or a failed tray walk whose mesh reset deepened the
+            # drop, leaves only the mesh reset out. Only the sweep's own full check, fabric included,
+            # releases; a failed or incomplete one pages below and keeps the hold. An incomplete sweep, or
+            # one with no rung allowed (None), is not spent: the next window retries it. With no hold
+            # clock there is no episode to latch, so each window sweeps.
             bound_sweep = await self._settle_and_verify_before_host_rung(
                 expected,
                 log,
                 "idle-escalation",
                 context=f"10-min hold bound, {off_bus}/{expected} off the bus",
                 host_rung_follows=False,
+                skip_mesh_reset=failed_unchanged or walk_failed,
             )
-            if bound_sweep is not None:
-                self._bound_sweep_since = hold_since or ""
+            if bound_sweep is not None and hold_since:
+                self._bound_sweep_since = hold_since
             if bound_sweep:
                 return HOST_RUNG_DEFERRED
+        bound_exception = (
+            "10-min bound: no reset rung allowed (the mesh reset already failed on these chips)"
+            if hold_since and self._bound_no_rung_since == hold_since
+            else ""
+        )
         if reboot_blocked:
             # No chassis power cycle is opted in and no rung can recover it: fail closed loudly and hold,
             # never fire a reboot that lands right back in the dead state. A whole-bus drop and a reset
             # that regressed/hard-failed a partial drop off the bus each need the cold rung, but name
             # them apart so the count is not misreported as all-off-bus.
+            where = f"idle escalation; {bound_exception}" if bound_exception else "idle escalation"
             if off_bus >= expected:
-                self.deps.emit_all_off_bus_power_cycle_required(log, off_bus, expected, "idle escalation")
+                self.deps.emit_all_off_bus_power_cycle_required(log, off_bus, expected, where)
             else:
                 self._emit_reset_unrecoverable_power_cycle_required(
-                    log, off_bus, expected, regressed=reset_regressed or episode_regressed, context="idle escalation"
+                    log,
+                    off_bus,
+                    expected,
+                    regressed=reset_regressed or episode_regressed,
+                    context=where,
+                    bound_exception=bound_exception,
                 )
             # reboot_blocked means specifically: this drop needs the cold rung and power-cycle is
             # not opted in — a power_cycle kill-switch decline, not a "no rung exists at all" case.
@@ -3499,7 +3567,7 @@ class GalaxyRecovery(Recovery):
         await self.deps.auto_power_cycle_host(log, "post-reboot verify: the warm reboot did not bring the mesh back")
 
     def _emit_reset_unrecoverable_power_cycle_required(
-        self, log, off_bus: int, expected: int, *, regressed: bool, context: str
+        self, log, off_bus: int, expected: int, *, regressed: bool, context: str, bound_exception: str = ""
     ) -> None:
         """Fail closed, loudly, on a PARTIAL drop a warm reboot cannot recover: a reset that regressed
         the mesh off the bus, or hard-exited leaving chips off it, with no auto power cycle opted in.
@@ -3515,6 +3583,7 @@ class GalaxyRecovery(Recovery):
             regressed=regressed,
             auto_power_cycle_enabled=self.deps.auto_power_cycle_enabled(),
             host_at_risk=True,
+            **({"bound_exception": bound_exception} if bound_exception else {}),
         )
         log(
             f"a reset {cause} — {off_bus}/{expected} chip(s) off the PCIe bus [{context}] — which a warm "
