@@ -46,6 +46,11 @@ GLX_DRIVER_WAIT = re.compile(r"Waiting for all \d+ chips to show up|Waiting for 
 # this long. The device stays flagged throughout, so no tenant job reaches it.
 RESET_COOLDOWN_SEC = 600
 
+# Spec 04 I78. The I81 rescan at tt-smi's driver wait repeats this often while an isolated chip is
+# still missing, at most this many rescans in all: 20 x 5 s spans tt-smi's 100 s driver wait.
+DRIVER_WAIT_RESCAN_EVERY_SEC = 5
+DRIVER_WAIT_RESCAN_TRIES = 20
+
 # The escalation latch stops an episode climbing twice, but "does not repeat" must never mean
 # "never again": keyed on the episode alone, a recovery that failed left the ladder with nothing to
 # do and the device HELD until a human noticed — measured at 25 minutes with a tenant queued behind
@@ -1165,6 +1170,8 @@ class RecoveryMechanism:
             # Disarm the driver-wait watcher first: after a mid-reset cancel the backend's shielded
             # output reader still feeds it, and a rescan it started now would be nobody's to cancel.
             driver_wait["disarmed"] = True
+            if "stop" in driver_wait:
+                driver_wait["stop"].set()  # ends an I78 repeat's wait at once
             rescan_task = driver_wait.get("task")
             if rescan_task is not None:
                 if cancelled_mid:
@@ -1269,23 +1276,53 @@ class RecoveryMechanism:
         point where tt-smi itself expects every chip back; a chip still dead stays off the bus, as
         before. Releases nothing: the full health check, fabric included, still decides.
 
+        Spec 04 I78: a chip whose link trains later in that wait misses one rescan, so while an isolated
+        chip is still missing the rescan repeats every DRIVER_WAIT_RESCAN_EVERY_SEC, at most
+        DRIVER_WAIT_RESCAN_TRIES in all, and stops as soon as every chip is back or the reset ends.
+        The trigger is the settle's last count, which both backends deliver only once the settle is
+        over (tt-smi prints the count with end='' and \\r, so a line reader gets it at the newline and a
+        file reader sees `seconds: 30` only then): never before the re-power has had its 30 s.
+
         Returns (the output callback to run the reset with, a dict that holds the rescan task once it
         starts). With no isolated chip, or not a mesh reset, the callback is the caller's own."""
         isolated = self._isolated_chips() if self._isolated_chips is not None else None
         if "-glx_reset" not in argv or not isolated:
             return on_output, {}
         chips = sorted(isolated, key=int)
-        state: dict = {"tail": "", "task": None}
+        state: dict = {"tail": "", "task": None, "stop": asyncio.Event()}
 
         async def rescan() -> None:
-            try:
-                await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
-            except OSError as e:
-                log(f"PCI rescan at tt-smi's driver wait could not run ({e}); the rescan after the reset still runs")
-                health_event("reset_driver_wait_rescan", chips=chips, ok=False, error=str(e))
-                return
-            log(f"tt-smi is waiting for every chip: PCI rescan to add back isolated chip(s) {chips}")
-            health_event("reset_driver_wait_rescan", chips=chips, ok=True)
+            for attempt in range(1, DRIVER_WAIT_RESCAN_TRIES + 1):
+                try:
+                    await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
+                except OSError as e:
+                    log(
+                        f"PCI rescan at tt-smi's driver wait could not run ({e}); the rescan after the reset still runs"
+                    )
+                    if attempt == 1:
+                        health_event("reset_driver_wait_rescan", chips=chips, ok=False, error=str(e))
+                    return
+                if attempt == 1:
+                    log(f"tt-smi is waiting for every chip: PCI rescan to add back isolated chip(s) {chips}")
+                    health_event("reset_driver_wait_rescan", chips=chips, ok=True)
+                if state.get("disarmed"):
+                    return  # the reset ended: the rescan after it takes over
+                still = self._isolated_chips()
+                if still:
+                    await asyncio.to_thread(drop_returned_isolated, still, "mesh reset driver wait", log)
+                if not still:
+                    return
+                if attempt == DRIVER_WAIT_RESCAN_TRIES:
+                    log(
+                        f"chip(s) {sorted(still, key=int)} still missing after {attempt} rescans in tt-smi's driver wait"
+                    )
+                    health_event("reset_driver_wait_rescan_spent", tries=attempt, still_isolated=sorted(still, key=int))
+                    return
+                try:
+                    await asyncio.wait_for(state["stop"].wait(), timeout=DRIVER_WAIT_RESCAN_EVERY_SEC)
+                    return
+                except asyncio.TimeoutError:
+                    pass
 
         def watch(chunk: str) -> None:
             if state["task"] is None and not state.get("disarmed"):

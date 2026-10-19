@@ -231,6 +231,12 @@ def test_floor_message_promises_escalation_only_when_armed(monkeypatch):
     assert "~10 s" not in srv._hold_escalation_note(off_bus=1), "no early rung for a drop with no isolated chip"
     assert "climbs at the 10-min hold ceiling" in srv._hold_escalation_note(off_bus=1)
     assert "escalates at the 10-min hold ceiling" in srv._hold_escalation_note()
+    # Spec 03 I55: the whole-tray power cycle is promised only while it is armed.
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    assert "goes to the power cycle at once" in srv._hold_escalation_note(off_bus=8)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
+    note = srv._hold_escalation_note(off_bus=8)
+    assert "goes to the power cycle" not in note and "not armed" in note and "climbs at the 10-min" in note
     monkeypatch.setattr(srv, "isolated_chips", {7})
     assert "escalates in ~10 s (isolated chips; 120 s while a tenant holds the device)" in srv._hold_escalation_note(
         off_bus=1
