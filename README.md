@@ -81,8 +81,9 @@ the kill, during that last minute.
 
 **If you use this option, you must watch the broker** (`tt-device-mcp status` or the
 job's status). As soon as a job queues after the limit, shut down gracefully within
-one minute or be killed. The MCP/REST field is `no_timeout_except_on_contention`;
-`--preemptable` is a short alias for the flag.
+one minute or be killed. The MCP/REST field is `no_timeout_except_on_contention`
+(its earlier name `preemptable` is still accepted); `--preemptable` is a short alias for
+the flag.
 
 `tt-device-mcp help` lists the rest: `reset`, `exec`, `smi`, `timezone`,
 `lock`/`unlock`.

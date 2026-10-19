@@ -46,7 +46,7 @@ from typing import Callable, Optional
 
 import yaml
 from mcp.server.mcpserver import Context, MCPServer
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
@@ -326,6 +326,8 @@ class JobSubmitInput(BaseModel):
     )
     no_timeout_except_on_contention: bool = Field(
         False,
+        # "preemptable" is the field's earlier name; clients that send it keep working.
+        validation_alias=AliasChoices("no_timeout_except_on_contention", "preemptable"),
         description=(
             "No timeout except on contention. timeout_sec is the job's time limit, but while no other "
             "job is waiting the job is never stopped for time, before or after that limit. Once the "
@@ -764,6 +766,7 @@ class Job:
     doomed_monotonic: Optional[float] = None  # first sight of an unrecoverable-device line, if any
     preemptable: bool = False  # no timeout except on contention: timeout_sec is enforced only while another job waits
     preempt_deadline_monotonic: Optional[float] = None  # set when preemption starts: the SIGKILL instant
+    queued_monotonic: Optional[float] = None  # time.monotonic() at queueing: the preemption clock's arrival
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     log_file: Optional[str] = None
@@ -7972,15 +7975,21 @@ PREEMPT_POLL_SEC = 1.0
 
 
 def _first_waiter_arrival() -> Optional[float]:
-    """When (epoch seconds) the earliest job now waiting for the device was queued, or None while
-    nobody waits. A queued_at that does not parse counts as arriving now."""
-    now = time.time()
+    """When (time.monotonic) the earliest job now waiting for the device was queued, or None while
+    nobody waits. The monotonic clock keeps a wall-clock step or DST change from moving the kill.
+    A job queued before a broker restart has only its queued_at, read against the wall clock once;
+    one that does not parse counts as arriving now."""
+    now = time.monotonic()
     arrivals = []
     for j in jobs.values():
         if j.status != JobStatus.QUEUED:
             continue
+        if j.queued_monotonic is not None:
+            arrivals.append(min(now, j.queued_monotonic))
+            continue
         try:
-            arrivals.append(min(now, datetime.fromisoformat(j.queued_at).timestamp()))
+            ago = time.time() - datetime.fromisoformat(j.queued_at).timestamp()
+            arrivals.append(now - max(0.0, ago))
         except (TypeError, ValueError):
             arrivals.append(now)
     return min(arrivals) if arrivals else None
@@ -7988,16 +7997,15 @@ def _first_waiter_arrival() -> Optional[float]:
 
 def _preempt_kill_deadline(limit_end: float) -> Optional[float]:
     """The SIGKILL instant (time.monotonic) for a no-timeout-except-on-contention job whose time
-    limit ends at ``limit_end`` (epoch seconds), or None while it may run on: before the limit,
+    limit ends at ``limit_end`` (time.monotonic), or None while it may run on: before the limit,
     or with nobody waiting. Once both hold the kill is due PREEMPT_GRACE_SEC after the later of
     the two, never later, however late the watchdog's poll noticed."""
-    now = time.time()
-    if now < limit_end:
+    if time.monotonic() < limit_end:
         return None
     arrival = _first_waiter_arrival()
     if arrival is None:
         return None
-    return time.monotonic() + (max(limit_end, arrival) + PREEMPT_GRACE_SEC - now)
+    return max(limit_end, arrival) + PREEMPT_GRACE_SEC
 
 
 def preempt_label(job: "Job") -> Optional[str]:
@@ -9844,8 +9852,10 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                 deadline = started.timestamp() + job0.timeout_sec
             except (TypeError, ValueError):
                 deadline = None
+        # The preemption clock is monotonic: read the epoch limit against the wall clock once.
+        limit_mono = None if deadline is None else time.monotonic() - (time.time() - deadline)
         while await asyncio.to_thread(_scope_active, scope):
-            kill_at = _preempt_kill_deadline(deadline) if deadline is not None and job0.preemptable else None
+            kill_at = _preempt_kill_deadline(limit_mono) if limit_mono is not None and job0.preemptable else None
             if kill_at is not None:
                 # Limit passed and a job is waiting (one restored from the queue): the same
                 # bounded stop the runner gives a no-timeout-except-on-contention job.
@@ -10611,7 +10621,7 @@ export {JOB_TAG_ENV}={job_tag}
                 current_process = proc
                 current_job_id = job_id
                 job.pid = proc.pid
-                limit_end = time.time() + job.timeout_sec  # start + x, for preempt_watchdog
+                limit_end = time.monotonic() + job.timeout_sec  # start + x, for preempt_watchdog
                 # A job that never emits a line at all is still measured for silence, so the
                 # clock starts at spawn rather than at first output.
                 job.last_output_monotonic = time.monotonic()
@@ -10783,7 +10793,7 @@ export {JOB_TAG_ENV}={job_tag}
                     kill_at = _preempt_kill_deadline(limit_end)
                     if kill_at is not None:
                         break
-                    if not announced and time.time() >= limit_end:
+                    if not announced and time.monotonic() >= limit_end:
                         announced = True
                         note(
                             f"PREEMPTABLE: past the {job.timeout_sec}s limit; running on until another "
@@ -12075,7 +12085,7 @@ def create_mcp_server() -> MCPServer:
             env=data.get("env"),
             inherited_env=data.get("inherited_env"),
             timeout_sec=data.get("timeout_sec", DEFAULT_TIMEOUT_SEC),
-            preemptable=bool(data.get("no_timeout_except_on_contention", False)),
+            preemptable=bool(data.get("no_timeout_except_on_contention", data.get("preemptable", False))),
         )
         return JSONResponse(result)
 
@@ -12449,6 +12459,7 @@ def create_mcp_server() -> MCPServer:
             result["idle_total_sec"] = job.idle_total_sec
         if job.preemptable:
             result["no_timeout_except_on_contention"] = True
+            result["preemptable"] = True  # the earlier name, for clients that read it
             result["timeout_sec"] = job.timeout_sec
             if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
                 result["preempt"] = preempt_label(job)
@@ -12666,6 +12677,7 @@ def create_mcp_server() -> MCPServer:
             timeout_sec=timeout_sec,
             preemptable=bool(preemptable),
             log_file=job_log_file,
+            queued_monotonic=time.monotonic(),
         )
         job.verification = operator_verification_kind(command, job.peer_uid)
         if job.verification and logger:

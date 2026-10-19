@@ -279,7 +279,8 @@ def test_preempted_wedge_risk(exit_code, risk):
 
 
 @pytest.mark.asyncio
-async def test_rest_submit_carries_the_option_into_the_job_and_its_log(monkeypatch, clear_job_state, tmp_path):
+@pytest.mark.parametrize("key", ["no_timeout_except_on_contention", "preemptable"])
+async def test_rest_submit_carries_the_option_into_the_job_and_its_log(monkeypatch, clear_job_state, tmp_path, key):
     srv.device_op_lock = None
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     monkeypatch.setattr(srv, "get_activation_script", lambda *a, **k: ("", {}))
@@ -301,7 +302,7 @@ async def test_rest_submit_carries_the_option_into_the_job_and_its_log(monkeypat
                 "workspace": "/tmp",
                 "command": "sleep 100",
                 "timeout_sec": 300,
-                "no_timeout_except_on_contention": True,
+                key: True,  # "preemptable" is the earlier name and still accepted
             },
         ).json()
         assert "job_id" in res, res
@@ -310,6 +311,7 @@ async def test_rest_submit_carries_the_option_into_the_job_and_its_log(monkeypat
     job = srv.jobs[res["job_id"]]
     assert job.preemptable is True and job.timeout_sec == 300
     assert status["no_timeout_except_on_contention"] is True and status["preempt"] == "PREEMPTABLE 5min"
+    assert status["preemptable"] is True
     assert "PREEMPTABLE: yes" in open(job.log_file).read()
     # A restart re-reads the option from the header.
     assert srv._job_from_log(res["job_id"]).preemptable is True
@@ -458,6 +460,7 @@ async def test_a_preempted_readopted_job_never_releases_the_device_clean(monkeyp
 def _waiting_since(job_id, ago_sec):
     j = _waiting_job(job_id)
     j.queued_at = (srv.datetime.now() - srv.timedelta(seconds=ago_sec)).isoformat()
+    j.queued_monotonic = time.monotonic() - ago_sec
     return j
 
 
@@ -466,34 +469,59 @@ def _secs_left(kill_at):
 
 
 def test_no_kill_deadline_while_nobody_waits_even_long_past_the_limit(clear_job_state):
-    assert srv._preempt_kill_deadline(time.time() - 3600) is None
+    assert srv._preempt_kill_deadline(time.monotonic() - 3600) is None
 
 
 def test_no_kill_deadline_before_the_limit_even_with_a_waiter(clear_job_state):
     _waiting_since("960", ago_sec=30)
-    assert srv._preempt_kill_deadline(time.time() + 5) is None
+    assert srv._preempt_kill_deadline(time.monotonic() + 5) is None
 
 
 def test_a_waiter_after_the_limit_starts_the_minute_at_its_arrival(clear_job_state):
     # Limit passed 10 s ago; the waiter arrived 3 s ago: kill 60 s after the arrival, 57 s from now,
     # however late the poll noticed.
     _waiting_since("961", ago_sec=3)
-    left = _secs_left(srv._preempt_kill_deadline(time.time() - 10))
+    left = _secs_left(srv._preempt_kill_deadline(time.monotonic() - 10))
     assert 56 <= left <= 57.5, left
 
 
 def test_a_waiter_before_the_limit_starts_the_minute_at_the_limit(clear_job_state):
     # Waiting for 30 s; the limit passed 10 s ago: kill 60 s after the limit, 50 s from now.
     _waiting_since("962", ago_sec=30)
-    left = _secs_left(srv._preempt_kill_deadline(time.time() - 10))
+    left = _secs_left(srv._preempt_kill_deadline(time.monotonic() - 10))
     assert 49 <= left <= 50.5, left
 
 
 def test_the_earliest_waiter_sets_the_deadline(clear_job_state):
     _waiting_since("963", ago_sec=2)
     _waiting_since("964", ago_sec=8)
-    left = _secs_left(srv._preempt_kill_deadline(time.time() - 20))
+    left = _secs_left(srv._preempt_kill_deadline(time.monotonic() - 20))
     assert 51 <= left <= 52.5, left
+
+
+def test_a_wall_clock_step_does_not_move_the_kill_deadline(monkeypatch, clear_job_state):
+    # The clock is monotonic: an NTP step or a DST change an hour forward or back while the job
+    # runs neither kills it early nor gives it an extra hour.
+    _waiting_since("965", ago_sec=3)
+    limit_end = time.monotonic() - 10
+    real = time.time
+    for step in (3600, -3600):
+        monkeypatch.setattr(srv.time, "time", lambda s=step: real() + s)
+        left = _secs_left(srv._preempt_kill_deadline(limit_end))
+        assert 56 <= left <= 57.5, (step, left)
+
+
+def test_a_waiter_restored_after_a_restart_is_read_from_its_queued_at(clear_job_state):
+    # A job restored from the queue spool has no monotonic arrival: its queued_at is read once.
+    j = _waiting_since("966", ago_sec=30)
+    j.queued_monotonic = None
+    left = _secs_left(srv._preempt_kill_deadline(time.monotonic() - 10))
+    assert 49 <= left <= 50.5, left
+
+
+def test_the_earlier_field_name_is_still_accepted():
+    params = srv.JobSubmitInput(workspace="/tmp", command="true", preemptable=True)
+    assert params.no_timeout_except_on_contention is True
 
 
 @pytest.mark.asyncio
