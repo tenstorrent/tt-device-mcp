@@ -586,6 +586,9 @@ class RecoveryMechanism:
         # its record is on disk, cleared if it fails to launch; read by the hold watchdog, which
         # starts no device reset while one is pending (see host_action_pending).
         self.host_action_requested: Optional[tuple[str, float]] = None
+        # When a power cycle last failed to launch on this boot (epoch; the fire raised, not timed out).
+        # It lets the reboot back in once per episode (spec 04 I10, reboot_tried_this_episode).
+        self.power_cycle_unlaunched_at: Optional[float] = None
         # The request a device reset was last refused for (one log line per request, spec 04 I34).
         self._host_action_reset_refused: Optional[tuple[str, float]] = None
 
@@ -2001,7 +2004,8 @@ class RecoveryMechanism:
         the mesh, and only then is the more drastic power cycle the right rung. It holds for the whole
         episode, not for a fixed time: the I65 cooldown after the reboot's boot can outlast any fixed
         window, and a reboot re-chosen at its end loops on reboots while the cycle never fires. With
-        no verified release on record a reboot counts for REBOOT_EPISODE_UNVERIFIED_MAX_SEC. An
+        no verified release on record a reboot counts for REBOOT_EPISODE_UNVERIFIED_MAX_SEC. A power
+        cycle that failed to launch on this boot lets the reboot back in once per episode. An
         unreadable ledger reads as 'not attempted' here — the governor is what fails closed on it;
         this only chooses which rung to offer the governor."""
         ledger = self.read_auto_recovery_ledger()
@@ -2017,8 +2021,14 @@ class RecoveryMechanism:
             # path with no loop guard at all.
             return False
         now_epoch = time.time() if now_epoch is None else now_epoch
-        verified_at = _past_epoch((self.last_verified_release() or {}).get("at_epoch"), now_epoch)
-        for rec in reversed(ledger):
+        verified = self.last_verified_release() or {}
+        verified_at = _past_epoch(verified.get("at_epoch"), now_epoch)
+        if verified_at is not None and verified.get("boot_id") == boot_id:
+            # Verified healthy on this boot: every earlier-boot reboot came before it, whatever the
+            # stamps say (a clock that stepped back across the boot). A future stamp proves nothing.
+            return False
+        tried = 0
+        for rec in ledger:
             if rec.get("action") != "reboot":
                 continue
             if rec.get("boot_id") == boot_id:
@@ -2027,11 +2037,15 @@ class RecoveryMechanism:
             if at is None:
                 continue
             if verified_at is not None:
-                if at > verified_at:
-                    return True  # no verified release since it: the same episode
+                tried += at > verified_at  # no verified release since it: the same episode
             elif now_epoch - at < REBOOT_EPISODE_UNVERIFIED_MAX_SEC:
-                return True
-        return False
+                tried += 1
+        if tried == 1 and self.power_cycle_unlaunched_at is not None:
+            # The power cycle failed to launch on this boot (so after that reboot): offer the reboot
+            # once more in the episode, under its own interval and per-boot cap, rather than leave the
+            # hold with no host rung that can run. A second reboot in the episode spends it.
+            return False
+        return tried > 0
 
     def record_auto_recovery(self, action: str, reason: str, *, now_epoch: Optional[float] = None) -> bool:
         """Append one escalation to the durable ledger and fsync it BEFORE the action fires.
@@ -2230,6 +2244,8 @@ class RecoveryMechanism:
             # block the retry the still-wedged box needs, so retract it and surface loudly.
             self.retract_last_auto_recovery(action)
             timed_out = isinstance(exc, (HostActionTimedOut, subprocess.TimeoutExpired))
+            if action == "power-cycle" and not timed_out:
+                self.power_cycle_unlaunched_at = time.time()
             if timed_out:
                 # It may have launched its detached cycler before it stopped answering: keep the
                 # request pending (normal bound) so no device reset starts under a cycle that may
