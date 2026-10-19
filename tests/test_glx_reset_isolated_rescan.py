@@ -268,13 +268,15 @@ async def test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rc", [0, 1])
 async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_reset_cleanup(
-    monkeypatch, clear_job_state
+    monkeypatch, clear_job_state, rc
 ):
     """tt-smi has exited but the driver-wait sysfs write is still running when the caller is cancelled
     (an operator's reset call dropped). The cancel still reaches the caller, but only after the cleanup
     every reset owes: the in-flight flag clear (or the dead-chip sampler stays blind), the rescan after
-    the reset, the returned chip dropped from the isolated set, and the pollers back."""
+    the reset, the returned chip dropped from the isolated set, and the pollers: back after a completed
+    reset, left stopped and owed to the next HEALTHY after a failed one (spec 03 I66)."""
     srv.isolated_chips = {"31"}
     monkeypatch.setattr(base, "health_event", lambda *a, **k: None)
     monkeypatch.setattr(base, "returned_chips", lambda iso: sorted(iso))
@@ -293,7 +295,7 @@ async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_res
     async def run_scoped(argv, log, owner="[broker]health-gate", on_output=None):
         on_output(SETTLE + "\n")
         await real_sleep(0)
-        return 1, "tt-smi exited"
+        return rc, "tt-smi exited"
 
     async def pollers(active, log):
         pollers_calls.append(active)
@@ -302,8 +304,10 @@ async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_res
     async def no_sleep(_):
         return None
 
+    owed = []
     monkeypatch.setattr(srv, "_set_device_pollers", pollers)
     monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", run_scoped)
+    monkeypatch.setattr(srv.recovery_mechanism, "owe_device_pollers", owed.append)
     monkeypatch.setattr(srv.asyncio, "to_thread", to_thread)
     task = asyncio.ensure_future(srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-glx_reset"], lambda m: None))
     for _ in range(10):
@@ -317,7 +321,10 @@ async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_res
     assert srv.recovery_mechanism.reset_in_flight is False, "the dead-chip sampler is not left blind"
     assert rescans == ["driver wait", "after"], "the rescan after the reset still ran"
     assert srv.isolated_chips == set(), "the returned chip left the isolated set"
-    assert pollers_calls == [False, True], "the pollers are back"
+    if rc == 0:
+        assert pollers_calls == [False, True] and owed == [], "the pollers are back"
+    else:
+        assert pollers_calls == [False] and owed == ["reset rc=1"], "the pollers stay stopped, owed"
     gate.set()
     for _ in range(5):
         await real_sleep(0)

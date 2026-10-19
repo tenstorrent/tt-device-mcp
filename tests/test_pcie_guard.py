@@ -685,6 +685,141 @@ def test_an_intent_from_this_boot_does_not_latch(sysfs):
     assert pcie_guard.offbus_reset_latched() is None
 
 
+def _watch_dir_fsyncs(monkeypatch) -> list:
+    """Record each fsync of the health dir, with whether the intent was still there at that moment."""
+    hd = pcie_guard.health_dir()
+    hd.mkdir(parents=True, exist_ok=True)
+    ino, real, seen = hd.stat().st_ino, os.fsync, []
+
+    def fsync(fd):
+        if os.fstat(fd).st_ino == ino:
+            seen.append((hd / pcie_guard.INTENT_FILE).exists())
+        return real(fd)
+
+    monkeypatch.setattr(pcie_guard.os, "fsync", fsync)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_that_fails_its_verify_leaves_no_intent_for_the_power_cycle(
+    sysfs, monkeypatch, tmp_path, clear_job_state
+):
+    """The last-chance sweep, its failed verify, then the broker's own power cycle: when the cycle's
+    command runs, the intent is gone AND that unlink reached the disk (the directory was fsynced after
+    it). An unlink still in the page cache is undone by the power loss, and the next boot latched the
+    broker's own cycle as a host hang (spec 04 I25)."""
+    _boot(sysfs, "boot-a")
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
+    monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: 8)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    intent = pcie_guard.health_dir() / pcie_guard.INTENT_FILE
+    during = []
+
+    async def mesh(argv, log, *a, **k):
+        during.append(intent.exists())
+        return 1, "glx_reset failed"
+
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh)
+
+    async def verify(expected, log, run_fabric=True, **k):
+        return False, {"snapshot": {"ok": False}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    fsyncs = _watch_dir_fsyncs(monkeypatch)
+    fired = []
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append((intent.exists(), list(fsyncs))))
+
+    assert await g._settle_and_verify_before_host_rung(32, lambda m: None, "idle", offbus_chips=set()) is False
+    await srv._auto_power_cycle_host(lambda m: None, "idle escalation: 8/32 chip(s) off the bus")
+
+    assert during == [True], "the sweep ran under its intent"
+    assert len(fired) == 1
+    present, synced = fired[0]
+    assert not present, "the intent is gone before the power-cycle command runs"
+    assert False in synced, "and its removal was made durable (directory fsynced after the unlink)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["power-cycle", "reboot"])
+async def test_a_broker_host_action_closes_an_open_intent_durably_before_it_fires(sysfs, monkeypatch, tmp_path, action):
+    """Whoever left the intent open, the broker's own reboot or power cycle removes it, durably, after
+    its ledger row and before the fire: the host going down next is the broker's, not a hang."""
+    _boot(sysfs, "boot-a")
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    pcie_guard.begin_offbus_reset("reset sweep", 8)
+    intent = pcie_guard.health_dir() / pcie_guard.INTENT_FILE
+    fsyncs = _watch_dir_fsyncs(monkeypatch)
+    fired = []
+    m = srv.recovery_mechanism
+    await m._fire_recovery_escalation(
+        action,
+        row_owner=f"[broker]{action}-request",
+        label=f"auto {action}",
+        detail="test",
+        fire=lambda: fired.append((intent.exists(), list(fsyncs), m.read_auto_recovery_ledger()[-1]["action"])),
+        log=lambda msg: None,
+        reason="test",
+    )
+    assert fired == [(False, [False], action)], "intent removed and synced after the ledger row, before the fire"
+    assert pcie_guard._INTENT_OPEN is False
+
+
+def _intent_then_cycle(sysfs, *, row_action, row_boot="boot-a", row_dt=60.0):
+    """An intent left on boot-a, a ledger row ``row_dt`` s after it, and the host now on boot-b."""
+    _boot(sysfs, "boot-a")
+    pcie_guard.begin_offbus_reset("reset sweep", 8)
+    at = json.loads((pcie_guard.health_dir() / pcie_guard.INTENT_FILE).read_text())["at_epoch"]
+    if row_action:
+        row = {"action": row_action, "reason": "idle escalation", "boot_id": row_boot, "at_epoch": at + row_dt}
+        (pcie_guard.health_dir() / "auto_recovery.jsonl").write_text(json.dumps(row) + "\n")
+    _boot(sysfs, "boot-b")
+
+
+@pytest.mark.parametrize("action", ["power-cycle", "reboot"])
+def test_an_intent_older_than_the_brokers_own_cycle_does_not_latch(sysfs, monkeypatch, action):
+    """The boot after the broker's own power cycle or reboot: an intent left from before it (an unlink
+    the power loss undid) is not a host hang. No latch, no event, and the mesh reset is not gated, so
+    the off-bus hold's ladder runs at once (spec 04 I25)."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
+    _intent_then_cycle(sysfs, row_action=action)
+
+    assert srv.pcie_guard_at_start(lambda m: None) is None
+    assert "offbus_reset_hold_latched" not in [n for n, _ in events]
+    assert ("offbus_reset_intent_closed", True) in [(n, k.get("at_boot")) for n, k in events]
+    assert not (pcie_guard.health_dir() / pcie_guard.INTENT_FILE).exists()
+    assert pcie_guard.offbus_reset_latched() is None
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_OFF
+    assert pcie_guard.host_reset_gate(8) == (True, ""), "glx_reset over the off-bus chips is not gated"
+
+
+@pytest.mark.parametrize(
+    "row_action, row_boot, row_dt",
+    [
+        (None, "boot-a", 60.0),  # no host action recorded: the host went down on its own
+        ("power-cycle", "boot-a", -60.0),  # the only cycle predates the reset
+        ("power-cycle", "boot-z", 60.0),  # a cycle on another boot says nothing about this one
+        ("reset", "boot-a", 60.0),  # not a host action
+    ],
+)
+def test_an_intent_with_no_later_host_action_still_latches(sysfs, monkeypatch, row_action, row_boot, row_dt):
+    """A real host crash inside an off-bus reset keeps its latch: only a reboot or power cycle the
+    broker recorded at or after the intent, on the intent's boot, excuses it."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    _intent_then_cycle(sysfs, row_action=row_action, row_boot=row_boot, row_dt=row_dt)
+
+    latch = srv.pcie_guard_at_start(lambda m: None)
+    assert latch is not None and latch["kind"] == "reset sweep"
+    assert "offbus_reset_hold_latched" in [n for n, _ in events]
+    assert pcie_guard.host_reset_gate(8)[0] is False
+
+
 def test_a_latch_holds_only_on_the_boot_it_was_written_in(sysfs, monkeypatch):
     """The host-hang record is scoped to its boot: once the host boots again it never holds a rung,
     and the broker drops it at start with an event; a latch that names no boot is no exception."""
@@ -1530,3 +1665,85 @@ def test_an_unreadable_sysfs_under_guard_logs_a_mask_failure(sysfs, monkeypatch)
     assert logs and "cannot read" in logs[0]
     assert sorted(mask.ports) == sorted(PORTS) and all(_masked(sysfs, p) for p in PORTS)
     mask.restore(quiet_sec=0)
+
+
+def test_the_operator_re_arms_the_tray_rung_after_a_repair(sysfs, monkeypatch, capsys):
+    """A recorded regression declines the per-tray rung on this host for days. The operator
+    re-arms it after the repair with the command the journal names; a second clear says nothing was
+    latched, and bad usage is refused."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    _boot(sysfs, "boot-a")
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5", "13"], signature="position5")
+    disabled = dict(events)["ubb_tray_rung_disabled"]
+    assert disabled["clear_with"] == pcie_guard.clear_tray_rung_cmd() and disabled["latch_days"] > 0
+    cmd = pcie_guard.clear_tray_rung_cmd()
+    assert cmd.startswith("sudo ") and "--clear-tray-rung-latch" in cmd and str(pcie_guard.health_dir()) in cmd
+    rec = pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE
+    assert rec.exists()
+    assert pcie_guard.main(["--clear-tray-rung-latch", "--health-dir", str(pcie_guard.health_dir())]) == 0
+    assert "re-armed" in capsys.readouterr().out
+    assert not rec.exists() and pcie_guard.tray_rung_disabled() is None
+    assert dict(events)["ubb_tray_rung_cleared"]["by"] == "operator"
+    assert pcie_guard.main(["--clear-tray-rung-latch", "--health-dir", str(pcie_guard.health_dir())]) == 0
+    assert "was not latched off" in capsys.readouterr().out
+    assert pcie_guard.main(["--clear-tray-rung-latch", "--bogus"]) == 2
+
+
+def test_a_tray_rung_latch_that_cannot_be_removed_is_reported(sysfs, monkeypatch, capsys):
+    _boot(sysfs, "boot-a")
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
+
+    def denied(self, *a, **k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(pcie_guard.Path, "unlink", denied)
+    assert pcie_guard.main(["--clear-tray-rung-latch", "--health-dir", str(pcie_guard.health_dir())]) == 1
+    assert "could not be re-armed" in capsys.readouterr().out
+    assert pcie_guard.tray_rung_disabled() is not None, "still latched"
+
+
+def test_a_running_broker_re_arms_when_the_operator_removes_the_record(sysfs, monkeypatch):
+    """The clear runs in another process: the running broker sees its persisted record gone and re-arms,
+    without a restart. A record that never reached disk keeps the in-memory decline."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    _boot(sysfs, "boot-a")
+    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
+    assert pcie_guard.tray_rung_disabled() is not None
+    (pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE).unlink()
+    assert pcie_guard.tray_rung_disabled() is None
+    assert dict(events)["ubb_tray_rung_cleared"]["by"] == "file_removed"
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", {"tray": [1]})
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_AT", time.time(), raising=False)
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_PERSISTED", False)
+    assert pcie_guard.tray_rung_disabled() == {"tray": [1]}, "an unwritten record is not read as cleared"
+
+
+def test_a_position_5_drop_in_a_later_hold_still_latches_and_names_both_episodes(sysfs, monkeypatch):
+    """The delayed position-5 drop often lands after the pulse's own hold was released: it still latches
+    inside the window, and the record names the pulse's episode and the one the drop was seen in, so an
+    operator can tell an outside drop from the pulse's and re-arm the rung."""
+    _boot(sysfs, "boot-a")
+    monkeypatch.setattr(pcie_guard, "_LAST_TRAY_PULSE", None)
+    tray_map = {t: list(range(8 * t, 8 * t + 8)) for t in range(4)}
+    start = {str(c) for c in range(24, 32)}
+    pcie_guard.note_tray_pulse([3], tray_map, start, episode="2026-10-16T01:00:00")
+    why = pcie_guard.latch_tray_pulse_drop(start | {"5", "13"}, episode="2026-10-16T01:03:00")
+    assert why is not None and why["episode"] == "2026-10-16T01:00:00" and why["seen_in"] == "2026-10-16T01:03:00"
+    assert pcie_guard.tray_rung_disabled()["episode"] == "2026-10-16T01:00:00"
+
+
+def test_the_latch_never_lifts_while_a_listed_link_reads_down(sysfs, monkeypatch):
+    """Spec 03 I9 link-down: an endpoint the kernel still lists whose link reads down (speed Unknown, width 63)
+    is not back on the bus, so it cannot lift the I25 hold as "every chip is back"."""
+    events = []
+    _latched(monkeypatch, sysfs, events)
+    ep = pcie_guard._pci_dir() / f"0000:{CHIPS[0][1]:02x}:00.0"
+    (ep / "current_link_speed").write_text("Unknown\n")
+    (ep / "current_link_width").write_text("63\n")
+    assert pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, lambda m: None) is None
+    assert pcie_guard.offbus_reset_latched() is not None
+    (ep / "current_link_speed").write_text("16.0 GT/s PCIe\n")
+    (ep / "current_link_width").write_text("16\n")
+    assert pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, lambda m: None)

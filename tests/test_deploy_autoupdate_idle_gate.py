@@ -455,6 +455,24 @@ def test_a_stopped_broker_has_no_children_to_count(tmp_path):
     assert "draining" in done.stderr and "children=2" in done.stderr, done.stderr
 
 
+def test_nothing_slow_runs_between_the_last_busy_look_and_the_restart():
+    text = _SCRIPT.read_text()
+    last = text.index("Last look before the restart")
+    assert text.index('chmod -R a+rX "$VENV"') < last
+    tail = text[last : text.index("systemctl restart tt-device-broker")]
+    assert "chmod" not in tail
+
+
+def test_a_device_holder_alone_is_named_as_such_past_the_cap():
+    text = _SCRIPT.read_text()
+    assert '"$holders" -gt 0' in text and "a device holder is" in text
+    assert "the running job is" in text
+
+
+def test_the_obsolete_pending_defer_marker_is_removed_once():
+    assert 'rm -f "$ROOT/pending.defer"' in _SCRIPT.read_text()
+
+
 # --- the autoupdate_apply event: a restart the update caused, traceable from the journal ----------
 
 

@@ -145,7 +145,9 @@ class Probe:
 
     # --- host seams -------------------------------------------------------------------------
     def health(self) -> Optional[dict]:
-        return _uds_api_call(DEFAULT_SOCKET, "/health", "GET", None, 5)
+        # No connect retry: a refused connect means the broker is down, and the probe must
+        # see that at once rather than wait out the client's broker-restart retries.
+        return _uds_api_call(DEFAULT_SOCKET, "/health", "GET", None, 5, retries=0)
 
     def systemctl(self, *args: str) -> str:
         try:
