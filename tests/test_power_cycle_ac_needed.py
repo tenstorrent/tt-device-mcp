@@ -15,6 +15,7 @@ from datetime import datetime
 
 import pytest
 
+from tests.conftest import fsm_dirty
 from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401
 from tests.test_power_cycle_cooldown import (  # noqa: F401
     LADDER,
@@ -187,6 +188,85 @@ async def test_the_hold_bound_is_the_one_trigger_of_the_class_a_ladder(cool, mon
     cool["clk"][0] = mark
     await _bound_forced(cool)
     assert _ladder_runs(cool) >= 1
+
+
+def _watchdog_run(cool, monkeypatch):  # noqa: F811
+    """The broker's own forced run (_force_escalate_stuck_hold) on the rig's clock and bus, with the
+    tray re-power followed by the real post-reset check (spec 04 I25: fabric re-checked)."""
+    g, order = cool["g"], cool["order"]
+    fsm_dirty(srv, "whole tray off the bus", why="gate_error")
+    on_bus = lambda: sorted(cool["beats"], key=int)  # noqa: E731
+    age_now = srv._hold_age_now
+    monkeypatch.setattr(srv, "_hold_age_now", lambda now=None: age_now(now or datetime.fromtimestamp(cool["clk"][0])))
+    monkeypatch.setattr(srv, "_present_chip_indices", on_bus)
+    monkeypatch.setattr(srv, "_decision_heartbeats", lambda: dict(cool["beats"]))
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: EXPECTED)
+
+    async def verify(expected, log, run_fabric=True, **k):
+        order.append("full_check" if run_fabric else "enum_arc_check")
+        return False, {}
+
+    async def ubb_tray(beats, off_bus, expected, log, *, force=False):
+        order.append("ubb_tray")
+        healthy, _evidence, _retries = await g._verify_device_after_reset(expected, log)
+        return bool(healthy)
+
+    monkeypatch.setattr(g, "_verify_device", verify)
+    monkeypatch.setattr(g, "_attempt_ubb_tray_reset", ubb_tray)
+
+    async def run(kind):
+        monkeypatch.setattr(srv, "device_hold_escalation_kind", kind)
+        monkeypatch.setattr(srv, "device_hold_escalation_trigger", "")
+        before = len(order)
+        await srv._force_escalate_stuck_hold()
+        return order[before:]
+
+    return run
+
+
+@pytest.mark.asyncio
+async def test_the_watchdog_run_at_the_bound_runs_the_class_a_ladder_once(cool, monkeypatch):  # noqa: F811
+    """End to end through _force_escalate_stuck_hold, the run the watchdog starts: a whole tray off and
+    the cycle in cooldown. Below the bound no forced run reaches the ladder. At the bound the cooldown
+    refuses the cycle, the tray re-power runs once and the full post-reset check (fabric included)
+    follows; it fails, so the bound asks for the host rung, whose cooldown denial arms the retry at the
+    cooldown's end, where the cycle fires. A later bound window on the same anchor runs no second
+    ladder (spec 04 I73/I76)."""
+    await _two_cycles_that_do_not_heal(cool)
+    m = cool["g"].mechanism
+    monkeypatch.setattr(m, "_class_a_ladder_anchor", None)  # the shared mechanism may carry an earlier anchor
+    start = _new_episode(cool, monkeypatch)
+    until = m.power_cycle_retry[0]
+    assert srv._stuck_hold_ceiling_sec() == BOUND and until - start > 3 * BOUND
+    run = _watchdog_run(cool, monkeypatch)
+    for kind in ("offbus_one_shot", "progress_retry"):
+        cool["clk"][0] = start + BOUND - 1
+        steps = await run(kind)
+        assert not (LADDER | {"full_check"}) & set(steps), f"{kind} below the bound runs no ladder"
+    assert srv._hold_bound_ladder_age is None and srv._hold_bound_cycle_age is None
+
+    cool["clk"][0] = start + BOUND
+    cool["events"].clear()
+    steps = await run("ceiling_window")
+    assert steps[:3] == ["denied", "ubb_tray", "full_check"], "cycle refused, then the ladder, then the full check"
+    assert steps.count("ubb_tray") == 1, "the ladder runs once"
+    assert steps[-1] == "denied" and _cycles(cool) == 2, "the bound's host rung asked; the cooldown holds it"
+    rung = [k for kind, k in cool["events"] if kind == "hold_bound_host_rung"]
+    assert [(r["action"], r["allowed"]) for r in rung] == [("power-cycle", False)]
+    assert srv._hold_bound_ladder_age == BOUND and srv._hold_bound_cycle_age == BOUND
+    assert not srv._hold_bound_rung_pending
+    assert m.power_cycle_retry == (until, srv.device_hold_episode_since), "retry armed for the cooldown's end"
+    assert srv._recovery_degraded(), "a failed full check lifts no hold"
+
+    for later in (2 * BOUND, 3 * BOUND):
+        cool["clk"][0] = start + later
+        steps = await run("ceiling_window")
+        assert not LADDER & set(steps), f"no second ladder on the same anchor at {later}s"
+    assert _cycles(cool) == 2
+
+    cool["clk"][0] = until
+    steps = await run("power_cycle_cooldown")
+    assert not LADDER & set(steps) and _cycles(cool) == 3, "the cycle fires the moment the cooldown ends"
 
 
 @pytest.mark.asyncio
