@@ -423,14 +423,67 @@ def test_a_job_running_at_the_restart_point_is_waited_out_to_its_cap(tmp_path):
     assert looks and all(" held " in t for t in looks), f"the last look let go of dispatch: {trace}"
 
 
-def test_a_device_op_at_the_restart_point_blocks_the_restart(tmp_path):
+def _op_at_the_restart_point(tmp_path, *, op_polls):
+    """The install starts a device op (and leaves a job past its cap running); the op ends after
+    `op_polls` polls of the last look, and the trace records the moment it does."""
     inhibit = tmp_path / "device-op.lock"
     start_op = f"echo 10000 > $M/running; echo {os.getpid()} tt_device_reset > {inhibit}"
-    done, trace, hold = _drain(tmp_path, running=0, queue=0, scope=True, job_age=1600, install=start_op)
+    count = tmp_path / "op-polls"
+    trace = tmp_path / "trace"
+    on_sleep = (
+        f'[ -e {inhibit} ] && echo x >> {count}; '
+        f'[ -e {inhibit} ] && [ "$(wc -l < {count})" -ge {op_polls} ] && rm -f {inhibit} && echo "op ended" >> {trace};'
+    )
+    return _drain(tmp_path, running=0, queue=0, scope=True, job_age=1600, install=start_op, on_sleep=on_sleep)
+
+
+def test_a_device_op_at_the_restart_point_blocks_the_restart_until_it_ends(tmp_path):
+    """After the install the lap never stops short of the restart (spec 08 I24), and never restarts
+    over a device op (I7): an op in flight at the job cap is waited out under the hold, then the
+    broker restarts and installed.sha names the new sha."""
+    done, trace, hold = _op_at_the_restart_point(tmp_path, op_polls=4)
     assert done.returncode == 0, done.stderr
-    assert "applying" in done.stdout and "not restarting, not marking current" in done.stderr, done.stderr
-    assert not any(t.startswith("restart") for t in trace), trace
-    assert not (tmp_path / "root" / "installed.sha").exists(), "a restart that did not run was marked current"
+    assert "the restart waits for the op to end" in done.stderr, done.stderr
+    assert "not restarting" not in done.stderr, done.stderr
+    assert "op ended" in trace and trace[-1].startswith("restart held "), trace
+    assert trace.index("op ended") < len(trace) - 1, "the broker restarted over a device op"
+    assert (tmp_path / "root" / "installed.sha").read_text().strip() == "abc123"
+    looks = [t for t in trace if t.startswith("pgrep")]
+    assert looks and all(" held " in t for t in looks), f"the op wait let go of dispatch: {trace}"
+
+
+def test_a_device_op_past_its_own_bound_is_still_waited_out_then_restarted(tmp_path):
+    """An op that outlasts its reset timeout is named once and still never restarted over; the lap
+    restarts as soon as it ends rather than leaving the old broker on the new install."""
+    done, trace, hold = _op_at_the_restart_point(tmp_path, op_polls=140)
+    assert done.returncode == 0, done.stderr
+    assert done.stderr.count("over its own reset timeout") == 1, done.stderr
+    assert trace.index("op ended") < len(trace) - 1 and trace[-1].startswith("restart held "), trace
+    assert (tmp_path / "root" / "installed.sha").read_text().strip() == "abc123"
+
+
+def test_the_lap_never_stops_between_the_install_and_the_restart():
+    """Nothing after pip install may exit 0 without the restart: the only exits from there on are
+    the fail-closed stage failures (exit 1, before installed.sha), and the last look's wait has no
+    give-up path once the install has run."""
+    text = _SCRIPT.read_text()
+    look = text.index("# Last look before the restart (spec 08 I24)")
+    restart = text.index("systemctl restart tt-device-broker", look)
+    assert "exit" not in text[look:restart], text[look:restart]
+    assert 'wait_job_boundary "restart point" installed' in text[look:restart]
+    start = text.index("wait_job_boundary() {")
+    body = text[start : text.index("\n}\n", start)]
+    give_up = body.index("return 1")
+    assert '"${2:-}" != installed' in body[body.rindex("if ", 0, give_up) - 200 : give_up], body
+    install = text.index('"$VENV/bin/pip" install -q "$clone"')
+    assert "exit 0" not in text[install:restart], "a lap can stop after the install without restarting"
+
+
+def test_the_op_cap_is_the_reset_timeout_plus_its_kill_grace():
+    from tt_device_mcp import constants
+
+    assert "\nOP_CAP=660\n" in _SCRIPT.read_text()
+    assert constants.DEVICE_RESET_TIMEOUT_SEC + constants.GRACEFUL_KILL_GRACE_SEC == 660, "OP_CAP drifted"
 
 
 def test_a_job_that_ends_at_the_restart_point_is_waited_out(tmp_path):

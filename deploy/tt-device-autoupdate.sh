@@ -27,7 +27,8 @@
 # A busy lap drains (spec 08 I20): it keeps the hold, lets the running job finish and applies at
 # that job boundary. The wait is bounded by the broker's hard job limit, counted from the job's
 # start: a job past it no longer holds the update. A drain blocks this lap (and the reconcile after
-# it) for at most that long.
+# it) for at most that long. Once the install has run, the lap always ends in the restart: a device
+# op still in flight there is waited out, never restarted over and never left running on new code.
 set -u
 
 [ -r /etc/default/tt-device-broker ] && . /etc/default/tt-device-broker
@@ -139,6 +140,9 @@ fi
 # with no readable start counts as just started). A job past it is overdue for the broker's own kill
 # and no longer holds the update, so a box busy around the clock still updates within one job.
 JOB_CAP=1560
+# A device op's own bound, DEVICE_RESET_TIMEOUT_SEC (600) plus the same kill grace: how long past the
+# job cap a device op at the restart point is expected to take (see wait_job_boundary).
+OP_CAP=660
 UPTIME=/proc/uptime
 count_busy() {
     local mp p uu q
@@ -190,9 +194,15 @@ op_in_flight() {
 # Wait, under the dispatch hold, for the job boundary: nothing running and no device op in flight.
 # Returns 0 there, and 0 once the youngest running job is past JOB_CAP or the broker is down (a down
 # broker protects no job by waiting, and the restart is what starts it again); 1 when a device op is
-# still in flight at the cap. $1 names the wait in the log.
+# still in flight at the cap, before the install only. $1 names the wait in the log; $2 "installed"
+# is the wait after the install, which never returns 1: pip and apply-host-config have changed the
+# broker's venv and units, and an old broker left running on them (it imports some modules only at
+# a fault's onset) is a split version no lap reports. So a device op in flight at the cap is waited
+# out there, still under the hold: never restarted over (I7), never given up on. The broker bounds
+# each op by its reset timeout, so this adds at most about OP_CAP; an op past that is named once and
+# still waited out, because a restart over it is a half-reset mesh.
 wait_job_boundary() {
-    local w_start w_now w_bound
+    local w_start w_now w_bound op_since="" op_late=0
     youngest_job_age
     w_bound=$(( JOB_CAP - j_age )); [ "$w_bound" -gt 0 ] || w_bound=0
     w_start="$(date +%s)"
@@ -214,8 +224,20 @@ wait_job_boundary() {
         fi
         if [ $(( w_now - w_start )) -ge "$w_bound" ]; then
             if op_in_flight; then
-                echo "autoupdate: $1: a device op is still in flight at the job cap after $(( w_now - w_start ))s; dispatch released, the next lap retries" >&2
-                return 1
+                if [ "${2:-}" != installed ]; then
+                    echo "autoupdate: $1: a device op is still in flight at the job cap after $(( w_now - w_start ))s; dispatch released, the next lap retries" >&2
+                    return 1
+                fi
+                if [ -z "$op_since" ]; then
+                    op_since="$w_now"
+                    echo "autoupdate: $1: a device op is still in flight at the job cap after $(( w_now - w_start ))s; the install has run, so the restart waits for the op to end (expected within ${OP_CAP}s), dispatch held" >&2
+                elif [ "$op_late" -eq 0 ] && [ $(( w_now - op_since )) -ge "$OP_CAP" ]; then
+                    op_late=1
+                    echo "autoupdate: $1: a device op is still in flight ${OP_CAP}s past the job cap, over its own reset timeout; the restart still waits for it (never over a device op)" >&2
+                fi
+                sleep 5
+                hold_write
+                continue
             fi
             if [ "$kids" -eq 0 ] && [ "${scopes:-0}" -eq 0 ] && [ "$holders" -gt 0 ]; then w_what="a device holder is"; else w_what="the running job is"; fi
             echo "autoupdate: $1: $w_what past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); it no longer holds the update, applying" >&2
@@ -317,16 +339,12 @@ chmod -R a+rX "$VENV" 2>/dev/null || true
 rm -f "$ROOT/pending.defer"
 # Last look before the restart (spec 08 I24). The install ran under the dispatch hold, but a job
 # can still be running here: a tenant that opened the device on its own, or a dispatch after an
-# install slow enough for the broker to drop the hold as overdue. It is waited out the same way;
-# a device op still in flight at the cap restarts nothing and leaves installed.sha on the old sha,
-# so the next lap retries.
+# install slow enough for the broker to drop the hold as overdue. It is waited out the same way,
+# and a device op (I7) to its end even past the cap: from here on the lap always restarts.
 hold_write
 count_busy
 if [ $(( kids + holders + ${scopes:-0} )) -ne 0 ] || op_in_flight; then
-    if ! wait_job_boundary "restart point"; then
-        echo "autoupdate: not restarting, not marking current" >&2
-        exit 0
-    fi
+    wait_job_boundary "restart point" installed
 fi
 echo "$remote_sha" > "$STATE"
 
