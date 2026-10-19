@@ -1293,6 +1293,19 @@ each rung fires only when the gentler one failed or cannot apply.
   cycle heals it or AC power is removed; the device is back within the next gate plus the full check
   once the tray returns. A fault that needs AC removal is over the 1 h budget by nature: it is paged,
   not hidden.
+- **I84 — A post-reset 77 from the dispatch-probe cap on a proven fabric re-checks at once, with no
+  eth-training wait.** `_verify_device_after_reset` waits `POST_RESET_FABRIC_RETRY_SLEEP_SEC` (60 s)
+  before re-checking a 77 because a reset returns before the eth links re-train. When the 77 is the
+  fabric wrapper's dispatch-probe cap (`dispatch probe hit its <N>s cap without a verdict`), the
+  wrapper ran that probe only after its validator had already moved traffic across every link, so the
+  links were trained and the wait cannot help: the re-check runs at once. It is the same full check,
+  fabric included, and the retry count is unchanged; a re-check that still reaches no verdict is
+  UNKNOWN and held exactly as before (03 I40), never a release (I32). Any other 77 keeps the wait. The
+  wrapper's reason names the cap line ahead of any validator error line above it, so the test reads
+  the cap and not an earlier line. Time to recover: classes H/J (dirty after a job) and every other
+  class whose reset is followed by this verify drop by the 60 s wait when the first pass hits the
+  dispatch cap (a g15blx02 job kill on 10-17: 321 s, over the 5 min class J budget; 261 s with this);
+  no class gets slower, and the worst-case bound only shrinks.
 
 ## Interfaces
 
@@ -1395,7 +1408,8 @@ it stale ones.
 cooldown clock; `reset_with_quiesce` (I4, I12); exactly one attempt (I3, I11). On rc 0 the ladder
 verifies with `_verify_device_after_reset`: the full probe pass *including* the fabric traffic
 pass, where a post-reset "no trained link" (77) is retried after an eth-training sleep
-(`POST_RESET_FABRIC_RETRIES` / `_SLEEP_SEC`) and a 77 that persists is UNKNOWN — never a
+(`POST_RESET_FABRIC_RETRIES` / `_SLEEP_SEC`; a dispatch-cap 77 on a proven fabric re-checks with
+no sleep, I84) and a 77 that persists is UNKNOWN — never a
 recovery (no hold is cleared onto a fabric no pass ever proved) and never a failed reset (no
 cooldown, no two strikes, no host-rung climb): it settles as a 77-only fabric-unverified hold that
 spec 03 I40 bounds. The bridge-reset rung
@@ -1656,6 +1670,7 @@ sees a silent fabric pass.
 | I27 a regressed tray rung hands off to the power cycle past the grace | `tests/test_offbus_power_cycle.py::test_a_regressed_tray_rung_hands_off_past_the_grace` |
 | I23 holders: wait, then refuse | `tests/test_pcie_guard.py::test_envelope_waits_for_holders_then_refuses_without_touching_anything`, `::test_envelope_proceeds_once_the_holder_lets_go` |
 | I23 an erroring port stays masked and starts the flood window | `tests/test_pcie_guard.py::test_a_port_that_keeps_erroring_stays_masked_and_marks_a_flood` |
+| I84 a dispatch-cap 77 after a reset re-checks at once (the full check, fabric included); any other 77 waits for eth training; a persisting one stays held | `tests/test_post_reset_gate.py::test_a_dispatch_cap_77_after_a_reset_rechecks_at_once_and_class_j_fits_its_budget`, `::test_a_no_trained_link_77_after_a_reset_still_waits_for_eth_training`, `::test_a_dispatch_cap_77_that_persists_never_releases`, `::test_the_wrapper_reason_names_the_dispatch_cap_over_a_validator_error_line` |
 | I23 dry run and plan CLI touch nothing | `tests/test_pcie_guard.py::test_dry_run_logs_the_plan_and_touches_nothing`, `::test_cli_prints_the_plan` |
 | I24 `hold` counts an all-ones chip still in sysfs as off the bus; the mesh reset and the sweep refuse over it | `tests/test_pcie_guard.py::test_chips_off_bus_counts_an_all_ones_chip_still_in_sysfs`, `::test_a_hold_gate_refuses_the_mesh_reset_and_the_sweep_over_an_all_ones_chip` |
 | I24 ENODATA on a bound endpoint is ARC-not-ready, not off the bus; an unbound endpoint, a missing node or another errno is off | `tests/test_arc_not_ready.py::test_enodata_on_31_bound_chips_is_not_off_the_bus`, `tests/test_arc_not_ready.py::test_an_unbound_or_missing_chip_still_counts_off_the_bus` |

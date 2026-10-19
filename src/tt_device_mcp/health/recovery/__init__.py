@@ -29,6 +29,7 @@ from tt_device_mcp import constants, metrics
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
+from tt_device_mcp.health.monitors import fabric
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import pcie_guard
 from tt_device_mcp.health.recovery.base import (
@@ -615,11 +616,19 @@ class Recovery(ABC):
             and retries < POST_RESET_FABRIC_RETRIES
         ):
             retries += 1
-            log(
-                f"post-reset fabric found no trained link (77) — waiting {POST_RESET_FABRIC_RETRY_SLEEP_SEC:.0f}s "
-                f"for eth training, then re-checking (retry {retries}/{POST_RESET_FABRIC_RETRIES})"
-            )
-            await asyncio.sleep(POST_RESET_FABRIC_RETRY_SLEEP_SEC)
+            if fabric.names_dispatch_cap(evidence["fabric"].get("detail", "")):
+                # I84: the validator already moved traffic across every link, so they were trained;
+                # only the dispatch probe ran out its cap. The eth-training wait buys nothing here.
+                log(
+                    f"post-reset fabric passed its links but the dispatch probe hit its cap (77) — "
+                    f"re-checking now, no eth-training wait (retry {retries}/{POST_RESET_FABRIC_RETRIES})"
+                )
+            else:
+                log(
+                    f"post-reset fabric found no trained link (77) — waiting {POST_RESET_FABRIC_RETRY_SLEEP_SEC:.0f}s "
+                    f"for eth training, then re-checking (retry {retries}/{POST_RESET_FABRIC_RETRIES})"
+                )
+                await asyncio.sleep(POST_RESET_FABRIC_RETRY_SLEEP_SEC)
             healthy, evidence = await self._verify_device(expected, log)
         if healthy and expected > 1 and self._fabric_ran_but_unverified(evidence):
             log(
