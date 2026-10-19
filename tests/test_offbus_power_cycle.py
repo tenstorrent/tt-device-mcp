@@ -1105,21 +1105,23 @@ async def test_a_walk_that_did_not_recover_skips_the_mesh_reset_on_every_later_p
 
 
 @pytest.mark.asyncio
-async def test_with_no_power_cycle_command_a_failed_walk_climbs_without_the_sweep(
+async def test_with_no_power_cycle_command_a_failed_walk_sweeps_without_the_mesh_reset(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
     """Where the bounded power cycle cannot fire (no command), the failed walk pages and climbs to the
-    host rung, skipping the last-chance sweep: its back-to-back resets include the same mesh reset."""
+    host rung. The 10-min bound's sweep still runs (spec 04 I31/I76), but without the mesh reset: on
+    this path a mesh reset deepened the drop."""
     hold_since, rec, counters, state = _tray_walk_episode(monkeypatch, tmp_path, cmd=None, drops=range(16, 32))
     sweeps = []
 
     async def sweep(*a, **k):
-        sweeps.append(True)
+        sweeps.append(k)
         return False
 
     monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", sweep)
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
-    assert counters["resets"] == 0 and sweeps == []
+    assert counters["resets"] == 0 and len(sweeps) == 1
+    assert sweeps[0]["host_rung_follows"] is False and sweeps[0]["skip_mesh_reset"] is True
     assert "offbus_gated_hold_page" in [a.get("kind") for a in rec["alerts"]]
     assert "reset_unrecoverable_power_cycle_required" in [k for k, _ in rec["events"]], "the climb is loud"
     assert counters["dirty_cleared"] == 0

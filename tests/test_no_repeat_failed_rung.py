@@ -60,6 +60,7 @@ def _episode(monkeypatch, *, power_cycle=False, clock=None, off_bus=OFF_BUS):
 
     async def sweep(*a, **k):
         counters["sweeps"] += 1
+        counters["sweep_kwargs"] = k
         if clock is not None:
             clock[0] += SWEEP_SEC
         return False
@@ -97,7 +98,8 @@ async def test_a_failed_unchanged_reset_is_not_repeated_and_with_no_host_rung_is
     monkeypatch, clear_job_state
 ):
     """No power cycle or reboot: the first window's reset fails, the hold goes to an operator once,
-    latched, and no later window fires another reset. Fails on base, which resets every window."""
+    latched, and no later window fires another reset. Fails on base, which resets every window. The
+    10-min bound still runs its sweep once, without the mesh reset (spec 04 I31/I76)."""
     counters, events, alerts = _episode(monkeypatch)
     hold_since = srv.device_hold_episode_since
     assert await _window() is True
@@ -112,7 +114,10 @@ async def test_a_failed_unchanged_reset_is_not_repeated_and_with_no_host_rung_is
     assert "no power cycle or reboot to climb to" in pages[0]["message"]
     handoff = opc._pending["handoff"]
     assert handoff["deadline"] is None and handoff["latched"], "latched: no deadline lifts it into a reset"
-    assert counters["power_cycles"] == 0 and counters["reboots"] == 0 and counters["sweeps"] == 0
+    assert counters["power_cycles"] == 0 and counters["reboots"] == 0
+    assert counters["sweeps"] == 1, "the bound's sweep runs once per episode"
+    assert counters["sweep_kwargs"]["host_rung_follows"] is False
+    assert counters["sweep_kwargs"]["skip_mesh_reset"] is True, "the failed mesh reset is left out of it"
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
 
 
@@ -932,7 +937,11 @@ async def test_e3_shrunk_then_unchanged_resets_at_most_twice_then_climbs(monkeyp
         assert _drive_progress_retry_watchdog(monkeypatch) == [], "one retry per episode"
         assert await _window() is True
     assert counters["resets"] == 2, "at most two resets: the one-shot and the progress retry"
-    assert counters["sweeps"] == 0
+    if power_cycle:
+        assert counters["sweeps"] == 0
+    else:
+        assert counters["sweeps"] == 1, "the bound's sweep runs once, without the failed mesh reset"
+        assert counters["sweep_kwargs"]["skip_mesh_reset"] is True
     if not power_cycle:
         assert counters["power_cycles"] == 0 and counters["reboots"] == 0
         assert len([a for a in alerts if a["kind"] == "offbus_gated_hold_page"]) == 1

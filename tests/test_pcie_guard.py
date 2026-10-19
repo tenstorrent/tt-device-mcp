@@ -1118,7 +1118,7 @@ async def test_the_last_chance_sweep_re_powers_only_the_affected_trays(
     g = srv.galaxy_recovery
     swept = []
 
-    async def sweep(bitmap, ids, trays_, expected, log, do_sbr):
+    async def sweep(bitmap, ids, trays_, expected, log, do_sbr, mesh_reset=True):
         swept.append(trays_)
         return True
 
