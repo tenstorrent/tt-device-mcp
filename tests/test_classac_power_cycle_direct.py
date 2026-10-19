@@ -188,6 +188,7 @@ async def test_an_idle_whole_tray_hold_cycles_with_no_reset(rig, monkeypatch, ph
         ("offbus", None, False),  # before the deadline an unreadable scan still holds
         ("offbus-forced", "job_running", False),
         ("offbus-forced", "tenant", False),
+        ("offbus-forced", "startup_verify", False),  # spec 03 I75: the caller's stand-down, re-read here
     ],
 )
 async def test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant(
@@ -206,8 +207,10 @@ async def test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_ten
         rig["scan"] = HolderScan(holders=[SimpleNamespace(pid=4242, uid=1000)], complete=True)
     rig["beats"] = _beats_without(_off(rig["map"], {2: 8}))
     rig["g"]._td_reset_seen = True  # no prelude: only the guard is under test
-    out = await rig["g"].escalate(phase, [], EXPECTED, lambda m: None)
+    stand_down = (lambda: True) if blocker == "startup_verify" else None
+    out = await rig["g"].escalate(phase, [], EXPECTED, lambda m: None, stand_down=stand_down)
     assert rig["order"] == (["power_cycle"] if cycled else [])
+    assert rig["g"].startup_verify_deferred is (blocker == "startup_verify")
     assert out == (galaxy.OUTCOME_TERMINAL if cycled else galaxy.OUTCOME_WAITING)
     assert "released" not in rig["order"]
 
