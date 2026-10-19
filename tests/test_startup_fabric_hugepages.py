@@ -1510,3 +1510,39 @@ async def test_a_terminal_rung_on_a_77_only_hold_keeps_it_recovering(
     await srv._attempt_idle_relift()
     assert rungs == ["present"]
     assert srv.fsm.state is state
+
+
+@pytest.mark.asyncio
+async def test_the_boot_after_the_brokers_own_power_cycle_latches_nothing_and_still_runs_the_full_check(
+    monkeypatch, _startup, _systemctl
+):
+    """Spec 04 I25 with goal 8: an off-bus intent older than the broker's own power-cycle row is not a
+    host hang, so no latch gates the mesh reset; the startup pass still waits for the hugepage pool and
+    runs the full check, fabric forced, before anything is released."""
+    from tt_device_mcp.health.recovery import pcie_guard
+
+    events, rows, gate_calls = _startup
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
+    monkeypatch.setattr(pcie_guard, "record_topology", lambda: None)
+    hd = evidence.health_dir()
+    hd.mkdir(parents=True, exist_ok=True)
+    intent = {"kind": "reset sweep", "off_bus": 8, "boot_id": "boot-a", "at_epoch": 1000.0}
+    (hd / pcie_guard.INTENT_FILE).write_text(json.dumps(intent))
+    row = {"action": "power-cycle", "reason": "idle escalation", "boot_id": "boot-a", "at_epoch": 1325.0}
+    (hd / "auto_recovery.jsonl").write_text(json.dumps(row) + "\n")
+    monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-b")
+    _shortfalls(monkeypatch, [(0, 32), None])
+    seen = []
+
+    async def gate(job_log_file, *, phase, run_fabric, force_fabric=False):
+        seen.append((phase, run_fabric, force_fabric, srv._hugepages_shortfall()))
+
+    monkeypatch.setattr(srv, "_device_health_gate", gate)
+
+    assert srv.pcie_guard_at_start(lambda m: None) is None
+    await srv._verify_fabric_on_start()
+
+    assert pcie_guard.offbus_reset_latched() is None
+    assert "offbus_reset_hold_latched" not in [k for k, _ in events]
+    assert pcie_guard.host_reset_gate(8) == (True, ""), "glx_reset is not gated on this boot"
+    assert seen == [("startup", True, True, None)], "the full startup check ran once the pool was ready"
