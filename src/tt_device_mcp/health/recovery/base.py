@@ -1745,6 +1745,17 @@ class RecoveryMechanism:
             return False
         return anchor not in (self._class_a_ladder_anchor, self._class_a_ladder_spawned)
 
+    def class_a_ladder_watch_at(self, now_epoch: Optional[float] = None) -> Optional[float]:
+        """When :meth:`class_a_ladder_watch_due` turns (or turned) true for the current anchor, for the
+        /health hold report (spec 04 I75); None when it will not (no anchor, its pass already started,
+        or the cooldown ends first and the cycle itself is due). Read-only: moves no clock."""
+        now = time.time() if now_epoch is None else now_epoch
+        anchor = self._class_a_ladder_anchor_now(now)
+        if anchor is None or anchor in (self._class_a_ladder_anchor, self._class_a_ladder_spawned):
+            return None
+        at = anchor + CLASS_A_LADDER_AFTER_SEC
+        return at if at < float(self.power_cycle_cooldown_state["until"]) else None
+
     def class_a_ladder_spawned(self, now_epoch: Optional[float] = None) -> None:
         now = time.time() if now_epoch is None else now_epoch
         self._class_a_ladder_spawned = self._class_a_ladder_anchor_now(now)
