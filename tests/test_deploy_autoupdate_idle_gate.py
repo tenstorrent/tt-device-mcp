@@ -483,6 +483,7 @@ def _apply_event(tmp_path, health_dir, idle="true", drained_s=0, restart_rc=0):
     block = text[text.index("systemctl restart tt-device-broker\n") :]
     script = (
         f"set -u\ninstalled_sha=old111; remote_sha=new222; src_desc=test; idle={idle}; drained_s={drained_s}\n"
+        f"LAST_APPLY_NRESTARTS={tmp_path}/last-apply.nrestarts\n"
         f"systemctl() {{ return {restart_rc}; }}\n" + block
     )
     env = {"PATH": "/usr/bin:/bin", "TT_DEVICE_MCP_HEALTH_DIR": str(health_dir)}

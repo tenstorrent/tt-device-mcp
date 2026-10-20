@@ -45,6 +45,7 @@ def _lap(tmp_path, *, now, sha, interval=None, active="active", nrestarts="0", h
     restarts = tmp_path / "restarts"
     prelude = f"""set -u
 ROOT={root}; STATE={root}/installed.sha; VENV={tmp_path}/venv; BR=main; src_desc=test
+idle=true; drained_s=0; TT_DEVICE_MCP_HEALTH_DIR={root}
 remote_sha={sha}
 date() {{ echo {now}; }}
 chmod() {{ :; }}
