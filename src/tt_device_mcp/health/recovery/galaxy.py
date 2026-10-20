@@ -220,13 +220,14 @@ def _ubb_reset_enabled() -> bool:
     """Whether the broker may FIRE the per-tray BMC reset itself on a below-floor tray-down, rather than
     only NAMING the command and holding. ON by default, with a knob to force it off.
 
-    A tray reset re-powers one 8-chip tray and leaves the other 24 running, so it is the lightest rung
+    A tray reset aims at one 8-chip tray, so it is the lightest rung
     that fits the failure that took the incident box down: a whole tray off the bus, below the
     galaxy-reset floor, which the mesh-wide reset inverts to an all-off-bus mesh and a warm reboot cannot
     re-enumerate. Without it that drop HOLDS forever — the mesh reset is suppressed below the floor — and
-    that indefinite hold is the failure this rung exists to end. Only the target tray's ARC restarts, so
-    it never risks the mesh reset's off-bus inversion, and the bit order and re-enumeration handshake are
-    hardware-confirmed. An operator whose BMC the broker has not confirmed forces the rung off with
+    that indefinite hold is the failure this rung exists to end. It is NOT isolated: one tray's pulse has
+    dropped every other tray within seconds, so the envelope waits for every chip on the box to be idle
+    and re-checks the other trays' chips after the pulse (spec 04 I23). The bit order and
+    re-enumeration handshake are hardware-confirmed. An operator whose BMC the broker has not confirmed forces the rung off with
     TT_DEVICE_MCP_AUTO_UBB_RESET=0, back to naming the command and holding.
 
     Armed also means fireable (I14, I17): the re-power goes out as `ipmitool raw` to the local
@@ -751,9 +752,9 @@ def _route(
 #
 # A Galaxy's 32 ASICs sit on 4 UBB trays of 8: a tray-level power/link failure drops its whole tray
 # off the PCIe bus at once, the measured failure that took chips 0-7 down together. A per-tray BMC
-# reset re-powers one tray and leaves the other 24 chips running — lighter than a 32-chip galaxy
-# reset and blind to a healthy tray. The BMC bit order is verified: a partial-bitmap reset restarts
-# only the targeted tray's ARC and leaves every other tray advancing and on the bus.
+# reset aims at one tray — lighter than a 32-chip galaxy reset — but is not isolated: its pulse has
+# dropped every other tray within seconds, so it requires the whole box idle (spec 04 I23). The BMC
+# bit order is verified: a partial-bitmap reset targets only the named tray's ARC.
 #
 # Which chips belong to which tray is NOT the chip index divided by the width (spec 04 I16) — that
 # ordering disagrees with the hardware's. UBB_CHIP_COUNT is the tray WIDTH, used for the topology

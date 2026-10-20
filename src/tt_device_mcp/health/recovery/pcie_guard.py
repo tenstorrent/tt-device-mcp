@@ -907,6 +907,7 @@ class TrayPlan:
     tray_ports: list = field(default_factory=list)  # the re-powered trays' root ports, the only ones rescanned
     siblings_dropped: list = field(default_factory=list)  # chips on other trays that read all-ones after it
     siblings_still_off: list = field(default_factory=list)  # ... and still did after their remove + rescan
+    box_chips: list = field(default_factory=list)  # every chip on the box: a pulse can drop the other trays too
 
 
 def plan_tray_repower(bitmap: int, tray_chip_ids: list) -> TrayPlan:
@@ -930,6 +931,7 @@ def plan_tray_repower(bitmap: int, tray_chip_ids: list) -> TrayPlan:
     groups = tray_bus_groups(eps)
     plan = TrayPlan(bitmap=bitmap, trays=trays, functions=[], chips=[], root_ports=tt_root_ports(eps))
     plan.tray_ports = tray_root_ports(trays, eps, groups)
+    plan.box_chips = sorted({e.chip for e in eps.values() if e.chip is not None} | _published_chips())
     if not eps:
         # Every chip is off the bus: no healthy tray can be cut, and there is nothing to cross-check.
         # Refusing here would leave an all-off mesh with no tray re-power before the power cycle.
@@ -1253,8 +1255,16 @@ def latch_tray_pulse_drop(off_now, episode: str = "") -> Optional[dict]:
     return why
 
 
+def _published_chips() -> set:
+    """Every chip id tt-kmd publishes under /proc, on the bus or not."""
+    try:
+        return {int(d.name) for d in (SYS_ROOT / "proc/driver/tenstorrent").iterdir() if d.name.isdigit()}
+    except OSError:
+        return set()
+
+
 def _tray_holders(chips: list) -> dict:
-    """``{chip: [pid, ...]}`` for the tray's chips that a process still holds open (tt-kmd's own
+    """``{chip: [pid, ...]}`` for the given chips that a process still holds open (tt-kmd's own
     record). A chip the driver does not publish has no entry."""
     out = {}
     for c in chips:
@@ -1288,7 +1298,8 @@ def safe_tray_repower(
        read; with every chip off the bus there is no healthy tray to cut and nothing to
        cross-check, so it goes ahead;
     2. wait up to ``TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC`` (default 10) for every process to
-       let go of the tray's chips, else refuse;
+       let go of EVERY chip on the box, else refuse: one tray's pulse has dropped the other trays
+       within seconds, so the box must be idle as for a whole-box cycle;
     3. mask AER and DPC on EVERY Tenstorrent root port, the sibling trays' and the off-bus chips'
        included; a port that cannot be masked refuses the fire before any chip is touched;
     4. ``quiesce`` the chips (tt-smi's USER_RESET ioctl);
@@ -1309,7 +1320,7 @@ def safe_tray_repower(
     )
     if os.environ.get("TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN", "").strip() == "1":
         steps = [
-            "wait for holders",
+            f"wait for holders on every chip {plan.box_chips or plan.chips}",
             f"mask AER/DPC on {plan.root_ports}",
             f"quiesce chips {plan.chips}",
             f"remove {plan.functions}",
@@ -1327,10 +1338,11 @@ def safe_tray_repower(
         raise TrayRepowerRefused(plan.mismatch)
     wait = _env_float("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", 10)
     deadline = time.monotonic() + wait
-    holders = _tray_holders(plan.chips)
+    box = sorted(set(plan.box_chips) | set(plan.chips))
+    holders = _tray_holders(box)
     while holders and time.monotonic() < deadline:
         sleep(0.5)
-        holders = _tray_holders(plan.chips)
+        holders = _tray_holders(box)
     if holders:
         why = f"chip(s) still held open after {wait:.0f}s: {holders}"
         health_event("tray_repower_refused", trays=plan.trays, reason=why, holders=holders)
