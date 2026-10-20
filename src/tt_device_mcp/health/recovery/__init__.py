@@ -293,8 +293,9 @@ class RecoveryDeps:
     # re-running the passes the reset just spent.
     note_fabric_77_reset_passes: Optional[Callable[[int], None]] = None
     # Whether the open hold's fabric 77 has a cause no reset or reboot fixes — a known cable fault (a 78),
-    # a topology mismatch or fault, hugepages not yet allocated, the validator missing
-    # (server._fabric_77_no_reset_cause). Such a 77 never climbs to a host rung (spec 04 I29).
+    # a topology mismatch, hugepages not yet allocated, the validator missing
+    # (server._fabric_77_no_reset_cause; never the I42 latch, which takes the ladder). Such a 77
+    # never climbs to a host rung (spec 04 I29).
     fabric_77_no_reset_cause: Optional[Callable[[], bool]] = None
     refresh_idle_hold_ledger: Optional[Callable[[], None]] = None
     spawn_idle_relift: Optional[Callable[[], None]] = None

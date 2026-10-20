@@ -53,6 +53,13 @@ def _kill_quietly(pid: int) -> None:
         pass
 
 
+def _unique_tag(name: str) -> str:
+    """A job tag no other run shares. The sweep matches the tag host-wide, so a fixed one would
+    also find the child of a second test run of the same test on the host (the real runner's
+    tags carry a random suffix too)."""
+    return f"{name}-{os.getpid()}-{os.urandom(4).hex()}"
+
+
 def _escaped_child(tag: str) -> tuple[int, int]:
     """A job shell that starts a child in its OWN session (setsid) and exits: the child is out of
     the job's process group and session, and its parent chain is gone. Returns (job pid, child pid)."""
@@ -66,7 +73,8 @@ async def test_a_child_that_left_the_session_is_found_by_its_tag_and_ended():
     """The common escape on a host without privsep: the ladder and the final killpg reach only
     the job's process group, and a child that called setsid is not in it. Its parent has exited,
     so no parent chain leads to it either; only the job's tag in its environment does."""
-    job_pid, child = _escaped_child("t-escaped-1")
+    tag = _unique_tag("t-escaped-1")
+    job_pid, child = _escaped_child(tag)
     try:
         assert _alive(child)
         # What the runner used to rely on: the group is empty, so killpg cannot reach the child.
@@ -75,7 +83,7 @@ async def test_a_child_that_left_the_session_is_found_by_its_tag_and_ended():
             os.killpg(job_pid, 0)
 
         survivors = await job_reap.reap_job_survivors(
-            "t1", job_pid, None, "t-escaped-1", term_grace_sec=2, kill_wait_sec=1, log=lambda _m: None
+            "t1", job_pid, None, tag, term_grace_sec=2, kill_wait_sec=1, log=lambda _m: None
         )
         assert survivors == []
         assert _wait_dead(child), "a child that left the job's session outlived the sweep"
@@ -108,17 +116,18 @@ async def test_survivors_get_sigterm_before_sigkill(tmp_path):
     """SIGTERM first, so a leftover that handles it gets to clean up."""
     marker = tmp_path / "got-term"
     # A child that records SIGTERM and exits on it.
+    tag = _unique_tag("t-term-2")
     job = _spawn_job(
         f"setsid bash -c 'trap \"touch {marker}; exit 0\" TERM; while :; do sleep 0.1; done' "
         ">/dev/null 2>&1 < /dev/null & echo $!",
-        tag="t-term-2",
+        tag=tag,
     )
     out, _ = job.communicate(timeout=5)
     child = int(out.strip())
     try:
         time.sleep(0.3)  # let the trap install
         await job_reap.reap_job_survivors(
-            "t3", job.pid, None, "t-term-2", term_grace_sec=3, kill_wait_sec=1, log=lambda _m: None
+            "t3", job.pid, None, tag, term_grace_sec=3, kill_wait_sec=1, log=lambda _m: None
         )
         assert _wait_dead(child)
         assert marker.exists(), "the survivor was SIGKILLed without a SIGTERM first"
@@ -128,16 +137,15 @@ async def test_survivors_get_sigterm_before_sigkill(tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_survivor_that_ignores_sigterm_is_sigkilled_after_the_grace():
-    job = _spawn_job(
-        "setsid bash -c \"trap '' TERM; exec sleep 60\" >/dev/null 2>&1 < /dev/null & echo $!", tag="t-ignore"
-    )
+    tag = _unique_tag("t-ignore")
+    job = _spawn_job("setsid bash -c \"trap '' TERM; exec sleep 60\" >/dev/null 2>&1 < /dev/null & echo $!", tag=tag)
     out, _ = job.communicate(timeout=5)
     child = int(out.strip())
     try:
         time.sleep(0.2)
         start = time.monotonic()
         survivors = await job_reap.reap_job_survivors(
-            "t4", job.pid, None, "t-ignore", term_grace_sec=0.5, kill_wait_sec=1, log=lambda _m: None
+            "t4", job.pid, None, tag, term_grace_sec=0.5, kill_wait_sec=1, log=lambda _m: None
         )
         assert survivors == []
         assert _wait_dead(child)
@@ -150,14 +158,15 @@ async def test_a_survivor_that_ignores_sigterm_is_sigkilled_after_the_grace():
 async def test_a_process_that_outlives_sigkill_is_named(monkeypatch):
     """A process stuck in the kernel ignores SIGKILL. It cannot be made in a test, so the
     signals are swallowed instead: the sweep must report it, with whether it holds the device."""
-    job_pid, child = _escaped_child("t-stuck")
+    tag = _unique_tag("t-stuck")
+    job_pid, child = _escaped_child(tag)
     monkeypatch.setattr(job_reap.os, "kill", lambda *a: None)
     monkeypatch.setattr(job_reap.os, "killpg", lambda *a: None)
     monkeypatch.setattr(job_reap, "_holds_device", lambda pid: True)
     lines = []
     try:
         survivors = await job_reap.reap_job_survivors(
-            "086", job_pid, None, "t-stuck", term_grace_sec=0.2, kill_wait_sec=0.2, log=lines.append
+            "086", job_pid, None, tag, term_grace_sec=0.2, kill_wait_sec=0.2, log=lines.append
         )
         assert [s.pid for s in survivors] == [child]
         assert survivors[0].holds_device is True
@@ -170,10 +179,11 @@ async def test_a_process_that_outlives_sigkill_is_named(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_nothing_left_behind_costs_no_wait():
-    job = _spawn_job("true")
+    tag = _unique_tag("t-none")
+    job = _spawn_job("true", tag=tag)
     job.wait(timeout=5)
     start = time.monotonic()
-    survivors = await job_reap.reap_job_survivors("t6", job.pid, None, "t-none", term_grace_sec=5, log=lambda _m: None)
+    survivors = await job_reap.reap_job_survivors("t6", job.pid, None, tag, term_grace_sec=5, log=lambda _m: None)
     assert survivors == []
     assert time.monotonic() - start < 2
 
