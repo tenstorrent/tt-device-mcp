@@ -13,7 +13,10 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from tests import test_device_safety as safety
 from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event, patch_recovery
+from tests.test_aiclk_ceiling_goal8 import PATHS as RESET_PATHS
+from tests.test_aiclk_ceiling_goal8 import _drive, rig  # noqa: F401  (fixture)
 from tests.test_device_safety import _fast_verify_setup, _setup_down_offbus, _setup_selfheal_hold
 from tests.test_eth_timeout_reset import ADVANCING
 from tests.test_eth_timeout_reset import mesh as eth_mesh  # noqa: F401  (fixture)
@@ -23,6 +26,7 @@ from tests.test_startup_fabric_hugepages import _bound
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import monitor as monitor_mod
+from tt_device_mcp.health import post_reset
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.monitors import fabric
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
@@ -402,3 +406,91 @@ def test_a_shortfall_the_accept_list_names_reads_excused_not_short(monkeypatch, 
     v = m.fabric_verdict()
     assert v["missing_vs_cabling"] == 1 and v["links_short"] is (not accepted)
     assert v.get("excused_ports", []) == (["tray 1 QSFP_DD 2"] if accepted else [])
+
+
+SHORT = (False, f"{fabric.LINKS_MISSING}: {fabric.topology_marker('d', 1, 0, (['tray 1 QSFP_DD 2'], []))}")
+REFUSALS = ("post_reset_release_refused", "hold_lift_refused")
+
+
+def _verdict_events(monkeypatch, r) -> list:
+    """The rig's fabric pass, but it records its verdict as the monitor's own pass does, and every event
+    is kept with its fields."""
+    m = srv.health_monitor
+    monkeypatch.setattr(m, "_fabric_verdict", {})
+    monkeypatch.setattr(m, "last_fabric_ok", None)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
+
+    async def fabric_pass(*a, **k):
+        r.order.append("fabric")
+        m.last_fabric_ok = r.fabric[0]
+        m._note_fabric_verdict(*r.fabric)
+        return r.fabric
+
+    monkeypatch.setattr(m, "verify_fabric_health", fabric_pass)
+    fields = []
+
+    def event(name, *a, **f):
+        fields.append((name, f))
+
+    patch_health_event(monkeypatch, event)
+    monkeypatch.setattr(post_reset, "health_event", event)
+    # The stuck-hold arming helpers silence events; keep them recorded.
+    monkeypatch.setattr(safety, "patch_health_event", lambda mp, fn: patch_health_event(mp, event))
+    return fields
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("short", [False, True], ids=["pass", "link-short"])
+@pytest.mark.parametrize("path", list(RESET_PATHS))
+async def test_every_release_event_carries_the_passing_fabric_verdict_and_a_short_link_releases_nothing(
+    rig, monkeypatch, tmp_path, path, short  # noqa: F811
+):
+    """Spec 03 I78 on every reset path (spec 03 I77's list). On a pass every release event carries
+    ``fabric`` with result pass and no link short. With a cabled link missing nothing releases, and
+    each refusal carries the failing verdict with ``links_short`` True. The idle off-bus escalation's
+    reset releases through reset_verified/device_dirty_cleared, and the start after a broker restart
+    closes its hold with startup_fabric_released, each through ``_full_check_gate``'s full check."""
+    if short:
+        rig.fabric = SHORT
+    fields = _verdict_events(monkeypatch, rig)
+    await _drive(path, rig, monkeypatch, tmp_path)
+    names = [n for n, _ in fields]
+    released = [(n, f) for n, f in fields if n in RELEASES and f.get("verified", True) is not False]
+    if short:
+        assert not released and srv.fsm.state is not ServerState.HEALTHY, names
+        for n, f in fields:
+            if n in REFUSALS:
+                assert f["fabric"]["result"] == "fail" and f["fabric"]["links_short"] is True, (n, f)
+        return
+    assert released and srv.fsm.state is ServerState.HEALTHY, names
+    for n, f in released:
+        assert f["fabric"]["result"] == "pass" and f["fabric"]["links_short"] is False, (n, f)
+    if path == "idle-offbus-escalation":
+        assert {"reset_verified", "device_dirty_cleared"} & set(names), names
+    if path == "startup":
+        assert "startup_fabric_released" in names, names
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["kill-reset", "bound-ladder"])
+async def test_a_reset_that_brings_the_port_back_releases_on_a_passing_verdict(wrapper, monkeypatch, path):
+    """The kill reset at the post-job gate (spec 03 I69) and the 10-min bound's ladder (spec 04 I76),
+    on the monitor's own fabric pass: the reset brings the cabled port back, the full check passes, and
+    every release event carries that pass with no link short. No power cycle is asked for."""
+    wrapper["reset_heals"] = True
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    cycles = _stub_power_cycle(monkeypatch)
+    if path == "kill-reset":
+        fsm_dirty(srv, "job 7 ended timeout")
+        srv._owe_kill_reset("job 7 timeout")
+        await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    else:
+        srv._hold_device_fabric_unverified("job 9: fabric router could not find any forwarding direction")
+        _past_the_bound(monkeypatch)
+        await srv._force_escalate_stuck_hold()
+    released = [(n, f) for n, f in wrapper["fields"] if n in RELEASES and f.get("verified", True) is not False]
+    assert released and srv.fsm.state is ServerState.HEALTHY and not cycles, wrapper["events"]
+    assert min(wrapper["fabric"]) >= 1, "every fabric pass ran after the reset"
+    for n, f in released:
+        assert f["fabric"]["result"] == "pass" and f["fabric"]["links_short"] is False, (n, f)
