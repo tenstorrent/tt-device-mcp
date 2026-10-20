@@ -169,6 +169,131 @@ async def test_a_cooldown_denial_arms_the_retry_and_the_host_rung_fires_at_its_e
     assert len(cycles) == 1 and "10-min hold bound" in cycles[0]
 
 
+def _arm_bound_ladder_then_cooldown(monkeypatch, until):
+    """A hold past the bound whose ladder failed and whose power cycle the cooldown (ending at ``until``)
+    denied, on boot ``boot-A``. Returns (escalations, cycles, state); clear ``state["cooling"]`` to end
+    the cooldown."""
+    escalations, _alerts, _events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
+    )
+    monkeypatch.setattr(srv, "_hold_bound_host_rung", _REAL_HOST_RUNG)  # the governor decides below
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-A")
+    _watchdog(monkeypatch)
+    cycles, state = [], {"cooling": True}
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
+    monkeypatch.setattr(srv.recovery_mechanism, "_journal_auto_recovery_denied", lambda *a: None)
+
+    def allowed(action, tenant_active=False, **k):
+        if state["cooling"]:
+            return srv.recovery_mechanism._deny_power_cycle(
+                {"until": until, "last": until - 1800, "cause": "boot", "interval_sec": 1800, "why": "cooldown"}
+            )
+        return True, ""
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+
+    async def failed_ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        return OUTCOME_TERMINAL
+
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", failed_ladder)
+    return escalations, cycles, state
+
+
+def _restart_broker(monkeypatch):
+    """What a broker restart inside the same hold leaves: the episode start (restored from disk, spec 03)
+    and nothing else of this process's memory — no bound bookkeeping, no cooldown retry, no claimed window.
+    The startup check that runs first did not pass, so the hold stands."""
+    since = srv.device_hold_episode_since
+    for name, value in (
+        ("_hold_bound_episode", ""),
+        ("_hold_bound_ladder_age", None),
+        ("_hold_bound_ladder_recovered", False),
+        ("_hold_bound_cycle_age", None),
+        ("_hold_bound_check_failed_age", None),
+        ("_hold_bound_rung_pending", False),
+        ("_hold_bound_denied_why", ""),
+        ("_hold_bound_saved", ("", None, False, None, None, False)),
+        ("device_hold_escalate_bucket", 0),
+        ("device_hold_deadline_bucket", 0),
+        ("_forced_escalation_task", None),
+    ):
+        monkeypatch.setattr(srv, name, value, raising=False)
+    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_cooldown_state", None)
+    srv.device_hold_episode_since = since
+    assert srv._recovery_degraded(), "the startup check did not pass: the hold stands"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cooldown", ["still running", "already over"])
+async def test_a_restart_after_the_bound_ladder_does_not_run_it_again(monkeypatch, clear_job_state, cooldown):
+    """A broker restart inside a hold past the bound, after the bound's ladder ran and its power cycle
+    waited on the cooldown: the new broker takes up the bound's steps for that episode (this boot only)
+    and asks for the power cycle on its first tick, not after a second full ladder. A cooldown still
+    running is waited out and the cycle fires at its end; one already over fires at once. Fails without
+    the bound's steps on disk: the restarted broker's first tick ran the whole ladder again."""
+    until = datetime.now().timestamp() + 900
+    escalations, cycles, state = _arm_bound_ladder_then_cooldown(monkeypatch, until)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == ["present-forced"] and cycles == []
+    assert srv.recovery_mechanism.power_cycle_retry is not None, "the denial armed the retry"
+
+    _restart_broker(monkeypatch)
+    if cooldown == "already over":
+        state["cooling"] = False
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == ["present-forced"], "the restart does not run the bound's ladder again"
+    if cooldown == "already over":
+        assert len(cycles) == 1 and "10-min hold bound" in cycles[0], "the cycle fires on the first tick"
+        return
+    assert cycles == [] and srv.recovery_mechanism.power_cycle_retry is not None, "the retry is armed again"
+    assert srv.recovery_mechanism.power_cycle_retry[0] == until
+    srv._check_hold_deadline(now=datetime.now())  # the next tick inside the cooldown: no ladder over it
+    await _drain()
+    assert escalations == ["present-forced"] and cycles == []
+    state["cooling"] = False
+    srv._check_hold_deadline(now=datetime.fromtimestamp(until + 1))
+    await _drain()
+    assert escalations == ["present-forced"], "the cooldown's end goes straight to the host rung"
+    assert len(cycles) == 1 and "10-min hold bound" in cycles[0]
+    assert srv._recovery_degraded(), "a power-cycle request lifts nothing: only a passing full check does"
+
+
+@pytest.mark.asyncio
+async def test_the_bound_steps_of_an_earlier_boot_do_not_carry(monkeypatch, clear_job_state):
+    """The bound's steps are written with the boot they were taken in. After a reboot (itself the host
+    rung) they do not carry, even onto an episode with the same start: the new boot's hold gets its own
+    ladder. A released hold leaves none behind. Fails without the bound's steps on disk."""
+    until = datetime.now().timestamp() + 900
+    escalations, cycles, _state = _arm_bound_ladder_then_cooldown(monkeypatch, until)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == ["present-forced"] and cycles == []
+    record = srv.health_dir() / srv.HOLD_BOUND_FILE
+    saved = __import__("json").loads(record.read_text())
+    assert saved["boot_id"] == "boot-A" and saved["since"] == srv.device_hold_episode_since
+    assert saved["ladder_age"] >= BOUND and saved["cycle_age"] >= saved["ladder_age"]
+
+    _restart_broker(monkeypatch)
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-B")
+    srv._hold_bound_sync()
+    assert srv._hold_bound_ladder_age is None and srv._hold_bound_cycle_age is None
+    assert not srv._hold_bound_rung_pending, "another boot's steps do not carry"
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == ["present-forced"] * 2, "the new boot's hold gets its own ladder at the bound"
+
+    srv._persist_hold_episode("")  # the device came back fit: the episode is over
+    assert not record.exists(), "a released hold leaves no bound steps on disk"
+
+
 @pytest.mark.asyncio
 async def test_a_check_still_waiting_on_hugepages_is_bounded_by_the_check_window(monkeypatch, clear_job_state):
     """A full check after the bound's ladder that has no verdict yet (a 77 while the 1G hugepage pool

@@ -448,6 +448,7 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
         ("_hold_bound_denied_why", ""),
         ("_hold_bound_tenant_paged", ""),
         ("_hold_bound_tenant_blocker", None),
+        ("_hold_bound_saved", ("", None, False, None, None, False)),
     ):
         monkeypatch.setattr(srv, name, value, raising=False)
     monkeypatch.setattr(srv, "post_job_gate_pending", False, raising=False)

@@ -1250,6 +1250,7 @@ def _persist_hold_episode(since: str, *, tenant: bool = False) -> None:
         else:
             path.unlink(missing_ok=True)
             record.unlink(missing_ok=True)
+            _clear_hold_bound_record()  # the bound's steps belong to the episode, on disk too
     except OSError:
         pass  # never let bookkeeping break the gate
 
@@ -7283,7 +7284,8 @@ def _hold_age_now(now: Optional[datetime] = None) -> float:
 
 
 def _hold_bound_sync() -> None:
-    """Drop the bound's bookkeeping once it belongs to an episode that is no longer open."""
+    """Drop the bound's bookkeeping once it belongs to an episode that is no longer open, and take up
+    what a previous broker of this boot recorded for the episode that is (see _restore_hold_bound)."""
     global _hold_bound_episode, _hold_bound_ladder_age, _hold_bound_cycle_age, _hold_bound_ladder_recovered
     global _hold_bound_check_failed_age, _hold_bound_rung_pending, _hold_bound_denied_why, _hold_bound_tenant_blocker
     if _hold_bound_episode != device_hold_episode_since:
@@ -7292,6 +7294,101 @@ def _hold_bound_sync() -> None:
         _hold_bound_ladder_recovered = _hold_bound_rung_pending = False
         _hold_bound_denied_why = ""
         _hold_bound_tenant_blocker = None
+        _restore_hold_bound()
+
+
+# The bound's steps for the open episode, on disk beside its start (spec 04 I76). In memory alone a
+# broker restart (a self-update, the reconcile timer, an operator) inside a hold already past the bound
+# forgot that the ladder ran and its full check failed: the new broker ran the whole ladder again
+# before it asked for the power cycle, so a cycle whose cooldown ended meanwhile fired that much late.
+HOLD_BOUND_FILE = "hold_bound.json"
+_hold_bound_saved: Optional[tuple] = ("", None, False, None, None, False)
+
+
+def _hold_bound_state() -> tuple:
+    return (
+        _hold_bound_episode,
+        _hold_bound_ladder_age,
+        _hold_bound_ladder_recovered,
+        _hold_bound_cycle_age,
+        _hold_bound_check_failed_age,
+        _hold_bound_rung_pending,
+    )
+
+
+def _clear_hold_bound_record() -> None:
+    global _hold_bound_saved
+    _hold_bound_saved = None  # whatever is in memory is written again on the next change
+    try:
+        (health_dir() / HOLD_BOUND_FILE).unlink(missing_ok=True)
+    except OSError:
+        pass  # never let bookkeeping break the gate
+
+
+def _save_hold_bound() -> None:
+    """Write the bound's steps for the open episode when they changed; with none taken, clear them."""
+    global _hold_bound_saved
+    state = _hold_bound_state()
+    if state == _hold_bound_saved:
+        return
+    episode, ladder, recovered, cycle, failed, pending = state
+    try:
+        path = health_dir() / HOLD_BOUND_FILE
+        if episode and episode == device_hold_episode_since and (pending or {ladder, cycle, failed} != {None}):
+            record = {
+                "since": episode,
+                "boot_id": _current_boot_id(),
+                "ladder_age": ladder,
+                "ladder_recovered": recovered,
+                "cycle_age": cycle,
+                "check_failed_age": failed,
+                "rung_pending": pending,
+            }
+            path.write_text(json.dumps(record))
+        else:
+            path.unlink(missing_ok=True)
+        _hold_bound_saved = state
+    except OSError:
+        pass  # never let bookkeeping break the gate
+
+
+def _restore_hold_bound() -> None:
+    """Take up the bound's steps a previous broker recorded for the open episode, within this boot only:
+    a reboot is itself a host rung, and the episode it ended does not carry (_restore_hold_episode). A
+    host rung the bound asked for after its last ladder is pending again, since whatever cooldown retry
+    the old broker armed died with it: the first tick asks for it, and the governor arms the retry for
+    the cooldown's end or fires it now. The bound window that ladder ran in stays claimed, so the
+    restart does not start the ladder again either. Nothing here lifts a hold; only a passing full
+    check does."""
+    global _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_cycle_age
+    global _hold_bound_check_failed_age, _hold_bound_rung_pending, _hold_bound_saved, device_hold_escalate_bucket
+    since = device_hold_episode_since
+    if not since:
+        return
+    try:
+        rec = json.loads((health_dir() / HOLD_BOUND_FILE).read_text())
+        if not isinstance(rec, dict) or rec.get("since") != since:
+            return
+        file_boot, this_boot = str(rec.get("boot_id") or ""), _current_boot_id()
+        if not (file_boot and this_boot and file_boot == this_boot):
+            return
+        ages = [rec.get(k) for k in ("ladder_age", "cycle_age", "check_failed_age")]
+        ladder, cycle, failed = (None if a is None else float(a) for a in ages)
+    except (OSError, ValueError, TypeError):
+        return
+    _hold_bound_ladder_age, _hold_bound_cycle_age, _hold_bound_check_failed_age = ladder, cycle, failed
+    _hold_bound_ladder_recovered = rec.get("ladder_recovered") is True
+    _hold_bound_rung_pending = rec.get("rung_pending") is True or (
+        cycle is not None and (ladder is None or cycle >= ladder)
+    )
+    if ladder is not None:
+        device_hold_escalate_bucket = max(device_hold_escalate_bucket, int(ladder // _stuck_hold_ceiling_sec()))
+    _hold_bound_saved = None
+    if logger:
+        logger.info(
+            f"HOLD-BOUND restored for the hold since {since}: ladder at {ladder}s, check failed at {failed}s, "
+            f"host rung asked at {cycle}s — the host rung is {'next' if _hold_bound_rung_pending else 'not due'}"
+        )
 
 
 def _note_hold_bound_ladder(age: float, outcome: str) -> None:
@@ -7304,6 +7401,7 @@ def _note_hold_bound_ladder(age: float, outcome: str) -> None:
     _hold_bound_tenant_blocker = None
     _hold_bound_ladder_age = max(age, _hold_age_now())
     _hold_bound_ladder_recovered = outcome == OUTCOME_RECOVERED
+    _save_hold_bound()
 
 
 def _hold_bound_check_pending(age: float) -> bool:
@@ -7332,6 +7430,7 @@ def _note_hold_bound_check_failed(log) -> bool:
     if not _hold_bound_check_pending(age) or _last_77_was_hugepages():
         return False
     _hold_bound_check_failed_age = age
+    _save_hold_bound()
     health_event(
         "hold_bound_check_failed",
         held_age_sec=int(age),
@@ -7402,6 +7501,7 @@ async def _hold_bound_host_rung(age: float, log) -> None:
     global _hold_bound_tenant_blocker
     _hold_bound_sync()
     _hold_bound_rung_pending = True
+    _save_hold_bound()
     if await asyncio.to_thread(recovery_mechanism.scope_active):
         log("10-min hold bound: a reset is still cycling in its own scope — the host rung waits for it")
         return
@@ -7411,6 +7511,7 @@ async def _hold_bound_host_rung(age: float, log) -> None:
         action = "reboot"
     else:
         _hold_bound_rung_pending, _hold_bound_cycle_age = False, age
+        _save_hold_bound()
         if _hold_bound_unarmed_paged != device_hold_episode_since:
             _hold_bound_unarmed_paged = device_hold_episode_since
             event = {
@@ -7431,6 +7532,7 @@ async def _hold_bound_host_rung(age: float, log) -> None:
     allowed, why = recovery_mechanism.auto_recovery_allowed(action, tenant_active=False)
     if allowed or getattr(recovery_mechanism, "power_cycle_retry", None) is not None:
         _hold_bound_rung_pending, _hold_bound_cycle_age = False, age
+        _save_hold_bound()  # before the cycle: a broker that dies in it must not run the ladder again
     if not allowed and why == _hold_bound_denied_why:
         return  # the same denial as the last tick's: asked again, quietly
     _hold_bound_denied_why = "" if allowed else why
@@ -7472,6 +7574,7 @@ def _rearm_after_scope(kind: str) -> None:
         _hold_bound_sync()
         if _hold_bound_cycle_age is not None:
             _hold_bound_rung_pending = True  # the spawn spent the cooldown retry this run never asked
+            _save_hold_bound()
 
 
 def _bound_tenant_blocker(bound: bool) -> Optional[dict]:
@@ -7786,6 +7889,8 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
         _persist_hold_episode(device_hold_episode_since)  # the holder left a real fault behind
+    _hold_bound_sync()  # spec 04 I76: a restarted broker takes up the bound's steps before its windows
+    _save_hold_bound()
     try:
         started = datetime.fromisoformat(device_hold_episode_since)
     except ValueError:
