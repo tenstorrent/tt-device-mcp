@@ -11859,8 +11859,9 @@ def _close_stale_startup_hold(hold: dict) -> None:
     health_event(
         "startup_fabric_released",
         prior_why="closed on broker start",
-        detail=detail,
+        prior_detail=detail,
         held_s=round(held_s, 1),
+        fabric={"result": "none"},  # a bookkeeping close: no check proved this end
     )
     if logger:
         logger.info(f"STARTUP closed a startup hold of {int(held_s)}s left open by the last broker")

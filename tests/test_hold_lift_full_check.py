@@ -352,3 +352,53 @@ async def test_a_kill_reset_whose_full_check_still_finds_the_port_missing_never_
     assert srv.fsm.state is not ServerState.HEALTHY and not _released(wrapper)
     await srv._force_escalate_stuck_hold()
     assert len(cycles) == 1 and not _released(wrapper)
+
+
+@pytest.mark.asyncio
+async def test_a_latched_topology_hold_whose_bound_ladder_leaves_the_port_missing_power_cycles_once(
+    wrapper, monkeypatch
+):
+    """(c) The lift's first job failed on the fabric, so the I42 latch (``topology_hw_fault``) is set and
+    the device is held. At the 10-min bound (spec 04 I76) the ladder runs, the full check after each
+    reset still finds the cabled port missing, and the broker asks for exactly one power cycle. A second
+    bound tick adds no reset, check or cycle. The bound keeps the latch (it clears only
+    ``fabric_known_fault``) and nothing releases the device."""
+    mon = srv.health_monitor
+    wrapper["reset_heals"] = False
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    cycles = _stub_power_cycle(monkeypatch)
+    monkeypatch.setattr(mon, "topology_lift_pending", True)
+    why = mon.note_job_after_topology_lift(True, "... could not find any forwarding direction ...")
+    assert mon.topology_hw_fault, "the I42 latch is set"
+    srv._hold_device_fabric_unverified(f"job 9: {why}")
+    _past_the_bound(monkeypatch)
+    await srv._force_escalate_stuck_hold()
+    assert wrapper["resets"] and min(wrapper["fabric"]) >= 1, "every fabric pass ran after a reset"
+    verdict = mon.fabric_verdict()
+    assert verdict["result"] == "fail" and verdict["links_short"] is True
+    assert len(cycles) == 1, "the bound's ladder did not heal it: one power cycle"
+    seen = (len(wrapper["resets"]), len(wrapper["fabric"]))
+    await srv._force_escalate_stuck_hold()
+    assert len(cycles) == 1 and (len(wrapper["resets"]), len(wrapper["fabric"])) == seen
+    assert mon.topology_hw_fault, "the bound keeps the I42 latch"
+    assert srv.fsm.state is not ServerState.HEALTHY and not _released(wrapper)
+    assert "device_released" not in wrapper["events"]
+    cleared = [f.get("latch") for n, f in wrapper["fields"] if n == "hold_bound_latch_cleared"]
+    assert "topology_hw_fault" not in cleared
+
+
+@pytest.mark.parametrize("accepted", ["", "tray 1 QSFP_DD 2"])
+def test_a_shortfall_the_accept_list_names_reads_excused_not_short(monkeypatch, accepted):
+    """The fabric verdict every lift event carries (spec 03 I78). A shortfall whose every missing port
+    the operator's accept list names passed the check (I71): ``links_short`` is False and
+    ``excused_ports`` names them. Without the list the same marker is short and excuses nothing."""
+    m = srv.health_monitor
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", accepted)
+    monkeypatch.setattr(m, "_fabric_verdict", {})
+    monkeypatch.setattr(m, "last_fabric_ok", bool(accepted))
+    marker = fabric.topology_marker("d", 1, 0, (["tray 1 QSFP_DD 2"], []))
+    m._note_fabric_verdict(bool(accepted), f"fabric links healthy on discovered links (50s); {marker}")
+    v = m.fabric_verdict()
+    assert v["missing_vs_cabling"] == 1 and v["links_short"] is (not accepted)
+    assert v.get("excused_ports", []) == (["tray 1 QSFP_DD 2"] if accepted else [])

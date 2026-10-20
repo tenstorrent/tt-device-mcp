@@ -13640,7 +13640,8 @@ async def test_a_stale_startup_hold_is_closed_with_the_time_it_was_really_held(m
     closed = _startup_releases()[0]
     assert closed["prior_why"] == "closed on broker start"
     assert closed["held_s"] == pytest.approx(60, abs=1)
-    assert "2026-10-13T10:07:49Z" in closed["detail"]
+    assert "2026-10-13T10:07:49Z" in closed["prior_detail"]
+    assert closed["fabric"] == {"result": "none"}, "no check proved a bookkeeping close"
 
 
 @pytest.mark.asyncio
@@ -13658,7 +13659,7 @@ async def test_a_stale_startup_hold_with_no_lift_in_the_journal_runs_to_the_rest
 
     closed = _startup_releases()[0]
     assert closed["held_s"] == pytest.approx(3600, abs=30)
-    assert closed["detail"] == "episode ended by a broker restart"
+    assert closed["prior_detail"] == "episode ended by a broker restart"
 
 
 _HOLD_KINDS = {"device_held", "device_released", "device_hold_orphan_closed"}

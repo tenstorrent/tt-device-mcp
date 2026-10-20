@@ -1072,7 +1072,11 @@ cooldown (spec 04 I65) holds longer.
   10-min bound (spec 04 I76). "Just passed" means the newest healthy fabric verdict is at most
   `HOLD_LIFT_PASS_FRESH_SEC` (300 s) old and newer than the hold's latest fault. A pass that finds
   fewer links than the cabling expects has failed (I71), and under the I42 latch any mismatch
-  fails; a moved tray (as many extra ports as missing) passes per I42. A refused lift journals
+  fails; a moved tray (as many extra ports as missing) passes per I42. Every release and refusal
+  event carries `fabric`, that verdict: `result`, `missing_vs_cabling`/`extra_vs_cabling`,
+  `links_short` (more ports missing than extra and the I71 accept list does not name every missing
+  one), `excused_ports` (only when that list turned a shortfall into a pass) and `age_s`. Only the
+  shortfall is logged: the validator prints no link totals. A refused lift journals
   `hold_lift_refused` (`why`, `hold`, `reason`, `since`) and changes nothing: the hold, its episode
   and its clock stay as they were, so the bounded recovery goes on: the ladder at the 10-min bound
   and, when the full check after it still has no pass, the power cycle (spec 04 I76, after the I65
@@ -1556,7 +1560,8 @@ refuses.
   tenant is refused. The release hook is in memory, so a restart settles the pair from the journal:
   a hold still open whose episode `boot_merge` carried over gets its release re-armed and no second
   hold row (whatever fault it has turned into); a hold still open under a fresh episode is closed
-  first (`prior_why: closed on broker start`), then the fresh hold is written. A carried-over
+  first (`prior_why: closed on broker start`; `prior_detail` says how it ended and `fabric` is
+  `{result: none}`, since no check proved that close), then the fresh hold is written. A carried-over
   fault episode with no open hold (a broker power cycle, a host crash) gets no hold row, since its
   own rows opened it, but the path that lifts it writes one `startup_fabric_released` with
   `carried_over: true` and `episode_since` (the episode's `since`; `held_s` runs from it): without

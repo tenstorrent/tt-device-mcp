@@ -1066,14 +1066,17 @@ class HealthMonitor:
     def _note_fabric_verdict(self, ok: Optional[bool], detail: str) -> None:
         """Keep what fabric_verdict() reports: pass/fail/skipped, and how far the links the check found
         fall short of the cabling descriptor (a topology marker in its detail or kept output)."""
-        missing, extra = fabric.marker_counts(detail)
+        text = detail or ""
+        missing, extra = fabric.marker_counts(text)
         if not (missing or extra) and ok is False:
-            missing, extra = fabric.marker_counts(self.last_fabric_output)
+            text = self.last_fabric_output or ""
+            missing, extra = fabric.marker_counts(text)
         self._fabric_verdict = {
             "result": "pass" if ok is True else "fail" if ok is False else "skipped",
             "missing_vs_cabling": missing,
             "extra_vs_cabling": extra,
             "detail": (detail or "")[:200],
+            "_marker": fabric.find_topology_marker(text) or "",
             "_at": time.monotonic(),
         }
 
@@ -1081,12 +1084,18 @@ class HealthMonitor:
         """The last fabric verdict, for the detail of every hold-lift and release event (spec 03 I78):
         ``result`` (pass/fail/skipped/none), ``missing_vs_cabling``/``extra_vs_cabling`` (port connections
         the links found lack, or add, against the cabling descriptor: 0/0 on a clean pass means every
-        cabled link was found), ``links_short`` (True when more are missing than extra, which FAILS the
-        check, I71) and ``age_s``. ``result`` "none" once a reset voided it or before any check ran."""
+        cabled link was found), ``links_short`` (True when more are missing than extra and the operator's
+        accept list does not name every missing port, which FAILS the check, I71), ``excused_ports``
+        (only when that list turned a shortfall into a pass: the ports it excused) and ``age_s``. Only
+        the shortfall is logged: the validator prints no link totals. ``result`` "none" once a reset
+        voided it or before any check ran."""
         v = dict(self._fabric_verdict)
         if not v or self.last_fabric_ok is None and v["result"] != "skipped":
             return {"result": "none"}
-        v["links_short"] = v["missing_vs_cabling"] > v["extra_vs_cabling"]
+        marker = v.pop("_marker", "")
+        v["links_short"] = bool(fabric.links_missing(marker, fabric.accepted_missing_ports()))
+        if v["missing_vs_cabling"] > v["extra_vs_cabling"] and not v["links_short"]:
+            v["excused_ports"] = sorted(fabric.marker_ports(marker)[0])
         v["age_s"] = round(time.monotonic() - v.pop("_at"), 1)
         return v
 
