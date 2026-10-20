@@ -2184,6 +2184,39 @@ class RecoveryMechanism:
             return False
         return tried > 0
 
+    def reboot_fallback_spent(self, *, now_epoch: Optional[float] = None) -> Optional[str]:
+        """Why the I71 warm-reboot fallback is spent for the wedge still on the box, or None when it
+        may fire: a broker reboot (a fallback or the reboot rung) recorded after the last verified-
+        healthy release did not heal it. Another one would re-anchor the I65 cooldown on its boot and
+        push the power cycle out again; with an I65 interval of an hour or more the reboot's own
+        interval lapses first, so an unhealed drop would reboot hourly and never cycle (spec 04 I71).
+        With no verified release on record only a reboot within the longest I65 cooldown counts: an
+        older one no longer holds the cycle off. A record with no readable stamp counts. An
+        unreadable ledger reads as not spent here; the governor denies the reboot on it."""
+        ledger = self.read_auto_recovery_ledger()
+        if not ledger:
+            return None
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        verified_at = _past_epoch((self.last_verified_release() or {}).get("at_epoch"), now_epoch)
+        since = verified_at if verified_at is not None else now_epoch - POWER_CYCLE_BACKOFF_CAP_SEC
+        for rec in reversed(ledger):
+            if rec.get("action") == "reboot" and _epoch_after(rec.get("at_epoch"), since, now_epoch):
+                return (
+                    "a broker reboot already ran for this wedge and no verified-healthy release "
+                    "followed it; the power cycle is next, at the end of its cooldown"
+                )
+        return None
+
+    def fallback_reboot_allowed(self, *, tenant_active: bool, now_epoch: Optional[float] = None) -> tuple[bool, str]:
+        """Whether the I71 warm reboot may fire in place of a power cycle that was denied or did not
+        launch: at most once per wedge (:meth:`reboot_fallback_spent`), and within the reboot's own
+        limits (:meth:`auto_recovery_allowed`). Returns ``(allowed, reason)``."""
+        spent = self.reboot_fallback_spent(now_epoch=now_epoch)
+        if spent:
+            return False, spent
+        clock = {} if now_epoch is None else {"now_epoch": now_epoch}
+        return self.auto_recovery_allowed("reboot", tenant_active=tenant_active, **clock)
+
     def record_auto_recovery(self, action: str, reason: str, *, now_epoch: Optional[float] = None) -> bool:
         """Append one escalation to the durable ledger and fsync it BEFORE the action fires.
 
@@ -2313,7 +2346,7 @@ class RecoveryMechanism:
 
     async def _fire_recovery_escalation(
         self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: str, pre_fire=None
-    ) -> None:
+    ) -> bool:
         """Shared body of the two host-level recovery rungs (reboot, BMC power cycle). Records the
         escalation durably — the rate limiter — and leaves a visible jobs-list row BEFORE the action
         takes the box down, so both survive it; G6b back-fills the boot when the broker restarts. If
@@ -2331,7 +2364,11 @@ class RecoveryMechanism:
         ``pre_fire(log, reason)``, when given, runs after the record and row and just before
         ``fire`` (spec 04 I26): a bounded, blocking call that never raises and whose outcome never
         stops the fire. Running it after the record means it only runs for an action that is
-        really about to happen, never for one the ledger then aborts."""
+        really about to happen, never for one the ledger then aborts.
+
+        Returns False when the action certainly did not launch (the record could not be written, or
+        ``fire`` raised anything but a timeout), so a caller may take an in-band fallback (spec 04
+        I71); True when it was issued or timed out and may still act."""
         ev = action.replace("-", "_")
         stage = _ACTION_TO_STAGE[action]
         if not self.record_auto_recovery(action, reason):
@@ -2341,7 +2378,7 @@ class RecoveryMechanism:
             )
             health_event(f"auto_{ev}_aborted", reason=reason, why="ledger write failed")
             metrics.stage_fired(stage, "blocked")
-            return
+            return False
         # From here the host is going down: no device reset may start under it.
         self.host_action_requested = (action, time.monotonic())
         # Our own cycle is not a host hang: the next boot must not latch an off-bus intent (I25).
@@ -2402,7 +2439,8 @@ class RecoveryMechanism:
             )
             health_event(f"auto_{ev}_failed", reason=reason, error=repr(exc), timed_out=timed_out)
             metrics.stage_fired(stage, "failed")
-            return
+            return timed_out
         # The pending window counts from the hand-off, not from before a slow pre-fire hook.
         self.host_action_requested = (action, time.monotonic())
         metrics.stage_fired(stage, "ok")
+        return True
