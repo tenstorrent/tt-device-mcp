@@ -7977,21 +7977,20 @@ PREEMPT_POLL_SEC = 1.0
 def _first_waiter_arrival() -> Optional[float]:
     """When (time.monotonic) the earliest job now waiting for the device was queued, or None while
     nobody waits. The monotonic clock keeps a wall-clock step or DST change from moving the kill.
-    A job queued before a broker restart has only its queued_at, read against the wall clock once;
-    one that does not parse counts as arriving now."""
+    A job queued before a broker restart has only its queued_at, read against the wall clock once
+    and kept as its queued_monotonic; one that does not parse counts as arriving at that read."""
     now = time.monotonic()
     arrivals = []
     for j in jobs.values():
         if j.status != JobStatus.QUEUED:
             continue
-        if j.queued_monotonic is not None:
-            arrivals.append(min(now, j.queued_monotonic))
-            continue
-        try:
-            ago = time.time() - datetime.fromisoformat(j.queued_at).timestamp()
-            arrivals.append(now - max(0.0, ago))
-        except (TypeError, ValueError):
-            arrivals.append(now)
+        if j.queued_monotonic is None:
+            try:
+                ago = time.time() - datetime.fromisoformat(j.queued_at).timestamp()
+                j.queued_monotonic = now - max(0.0, ago)
+            except (TypeError, ValueError):
+                j.queued_monotonic = now
+        arrivals.append(min(now, j.queued_monotonic))
     return min(arrivals) if arrivals else None
 
 
@@ -9858,7 +9857,10 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
             kill_at = _preempt_kill_deadline(limit_mono) if limit_mono is not None and job0.preemptable else None
             if kill_at is not None:
                 # Limit passed and a job is waiting (one restored from the queue): the same
-                # bounded stop the runner gives a no-timeout-except-on-contention job.
+                # bounded stop the runner gives a no-timeout-except-on-contention job. A deadline
+                # already past (a waiter queued long before a slow restart) still gets a SIGINT
+                # window and the SIGTERM grace, never a bare SIGKILL.
+                kill_at = max(kill_at, time.monotonic() + 2 * SIGTERM_GRACE_SEC)
                 async with get_lock():
                     job0.preempt_deadline_monotonic = kill_at
                 if logger:
@@ -10747,6 +10749,15 @@ export {JOB_TAG_ENV}={job_tag}
                     # (spec 01 I20), for time or for silence; once a job is queued the reaper
                     # applies to it as to any other.
                     spared = job.preemptable and _first_waiter_arrival() is None
+                    # Past its limit with a job waiting, the preemption owns the stop, and its own
+                    # SIGKILL deadline bounds it to PREEMPT_GRACE_SEC. A reap here would relabel a
+                    # clean preempted end as hung (owing the mesh a reset) and SIGINT the job again
+                    # mid-shutdown. Before the limit a silent job is still reaped.
+                    preempt_owns_stop = job.preemptable and (
+                        preempting
+                        or job.preempt_deadline_monotonic is not None
+                        or _preempt_kill_deadline(limit_end) is not None
+                    )
 
                     if HUNG_NOTICE_SEC > 0 and silent - announced >= HUNG_NOTICE_SEC:
                         announced = silent
@@ -10755,10 +10766,11 @@ export {JOB_TAG_ENV}={job_tag}
                             left += " once another job is queued"
                         note(f"no output for {int(silent)}s{left}")
 
-                    if HUNG_SILENCE_SEC > 0 and silent >= HUNG_SILENCE_SEC and not spared:
+                    if HUNG_SILENCE_SEC > 0 and silent >= HUNG_SILENCE_SEC and not spared and not preempt_owns_stop:
                         async with get_lock():
                             # A user kill that already landed owns the verdict; do not relabel it.
-                            if job.status != JobStatus.RUNNING:
+                            # Nor a preemption that started since the check above.
+                            if job.status != JobStatus.RUNNING or job.preempt_deadline_monotonic is not None:
                                 return
                             job.status = JobStatus.HUNG
                         note(
