@@ -287,6 +287,10 @@ class RecoveryDeps:
     # The I70 rung's 'gone' check counts them as still holding: one with only a removed chip's BAR
     # or deleted node mapped is not in the /dev/tenstorrent holder scan.
     stuck_holder_pids: Optional[Callable[[], set]] = None
+    # Spec 04 I77: a RUNNING job the broker has not itself killed for recovery. The I70 host rung's
+    # guard asks this instead of job_running: a job the dead-chip path SIGKILLed stays RUNNING while
+    # its process is stuck in the kernel, and counting it would hold the rung forever. None: job_running.
+    live_job_running: Optional[Callable[[], bool]] = None
     # Marks the pollers the dead-chip valve stopped as owed a restart (server._owe_device_pollers):
     # that stop has no paired restore, and an idle relift can close the episode with no reset.
     owe_device_pollers: Optional[Callable[[str], None]] = None

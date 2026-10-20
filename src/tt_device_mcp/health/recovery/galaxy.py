@@ -1621,7 +1621,9 @@ class GalaxyRecovery(Recovery):
         if not leftovers & held:
             return "gone", "the leftover no longer holds the device; nothing fired"
         others = dataclasses.replace(scan, holders=[h for h in scan.holders if int(h.pid) not in leftovers])
-        blocker = self._tenant_blocker(others, force=True)
+        # A job the broker killed for recovery and whose process is stuck is the leftover's own
+        # victim, not a running job: it would hold the rung for as long as the host lives (I77).
+        blocker = self._tenant_blocker(others, force=True, job_running=self.deps.live_job_running)
         if blocker is not None:
             return "held", self._describe_blocker(blocker)
         return None
@@ -1983,13 +1985,16 @@ class GalaxyRecovery(Recovery):
         queue-known: resetting out from under a live job is the thing the guard is for."""
         return self._tenant_blocker(scan, force=force) is not None
 
-    def _tenant_blocker(self, scan, *, force: bool = False) -> Optional[dict]:
+    def _tenant_blocker(
+        self, scan, *, force: bool = False, job_running: Optional[Callable[[], bool]] = None
+    ) -> Optional[dict]:
         """Which check of :meth:`_tenant_active` blocks, as health_event fields, or None when none does:
         ``blocker`` is ``job_running``, ``startup_verify`` (the running escalate's I75 stand-down), ``tenant``
         (with the first tenant's pid, uid, user and comm) or ``scan_incomplete`` (with the scan's source
         and gaps). A deferral that names its blocker tells a
-        real tenant apart from a scan that merely could not see."""
-        if self.deps.job_running():
+        real tenant apart from a scan that merely could not see. ``job_running`` replaces
+        ``deps.job_running`` for the running-job check when given."""
+        if (job_running or self.deps.job_running)():
             return {"blocker": "job_running"}
         if self._stand_down is not None and self._stand_down():
             self.startup_verify_deferred = True

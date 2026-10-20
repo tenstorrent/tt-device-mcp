@@ -1093,6 +1093,9 @@ _recovery_deps = RecoveryDeps(
     present_chip_indices=lambda: _present_chip_indices(),
     enumerate_device_holders=lambda: enumerate_device_holders(),
     job_running=lambda: any(j.status == JobStatus.RUNNING for j in jobs.values()),
+    live_job_running=lambda: any(
+        j.status == JobStatus.RUNNING and j.id not in reset_killed_job_ids for j in jobs.values()
+    ),
     isolated_chips=lambda: isolated_chips,
     device_pci_map=lambda: device_pci_map,
     device_hold_episode_reason=lambda: device_hold_episode_reason,

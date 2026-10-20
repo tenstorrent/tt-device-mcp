@@ -484,6 +484,45 @@ def test_a_dead_chip_holder_that_is_also_a_job_leftover_keeps_the_dead_chip_labe
     assert srv._leftover_fault_class() == "J-dead-chip-stuck-holder"
     assert srv._dead_chip_stuck_reason()
 
+
+def _running_job(monkeypatch, job_id="41"):
+    job = srv.Job(id=job_id, owner="tenant", workspace="/tmp", command="x", queued_at="t")
+    job.status = srv.JobStatus.RUNNING
+    monkeypatch.setattr(srv, "jobs", {job_id: job})
+    monkeypatch.setattr(srv, "reset_killed_job_ids", set())
+    return job
+
+
+async def test_the_dead_chip_victim_job_still_running_does_not_hold_the_rung(stuck, monkeypatch):
+    """The dead-chip path SIGKILLed the running job's process and marked the job its own kill; the
+    process is stuck in D, so the job stays RUNNING. That victim is not a running job to the I70
+    rung's guard: the request still comes at 120 s (one sampler tick at most), not never."""
+    stuck["rig"]["beats"] = {str(i): 100 for i in range(EXPECTED) if i != int(CHIP)}
+    job = _running_job(monkeypatch)
+    srv.reset_killed_job_ids.add(job.id)  # what _kill_device_holders' victim marking does
+    _note(stuck)
+    t0 = srv._leftover_unkillable_mono
+    requested_at = None
+    for s in range(0, BUDGET + 2):
+        await _tick(t0 + s)
+        if stuck["order"] and requested_at is None:
+            requested_at = s
+    assert requested_at is not None and requested_at <= BUDGET + 1
+    assert stuck["order"] == ["power_cycle"]
+    assert not any(r["phase"] == "held" for r in _events(stuck, "leftover_host_rung"))
+
+
+async def test_a_live_job_the_broker_did_not_kill_still_holds_the_rung(stuck, monkeypatch):
+    stuck["rig"]["beats"] = {str(i): 100 for i in range(EXPECTED) if i != int(CHIP)}
+    _running_job(monkeypatch)
+    _note(stuck)
+    t0 = srv._leftover_unkillable_mono
+
+    assert await _tick(t0 + BUDGET)
+    assert stuck["order"] == []
+    (rung,) = _events(stuck, "leftover_host_rung")
+    assert rung["phase"] == "held" and "a broker job is running" in rung["detail"]
+
 # --- the dead-chip path calls it -------------------------------------------------------------------
 
 
