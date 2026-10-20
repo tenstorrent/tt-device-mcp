@@ -4140,11 +4140,14 @@ def _patch_device_holders(monkeypatch, scan, ppids=None):
     monkeypatch.setattr(device_holders, "_read_proc_ppid", (ppids or {}).get)
 
 
-async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=lambda: ""):
+async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=lambda: "", settle_sec=0.05):
     """Run one exit-0 job through the real runner; return (job, systemctl calls, is-active calls, killpgs).
 
     ``scope_active`` answers every is-active query, or is a list answered in order (the last
-    answer then repeats). ``holders`` stands in for the holder scan before dispatch."""
+    answer then repeats). ``holders`` stands in for the holder scan before dispatch.
+    ``settle_sec`` is the scope settle window: short by default so a leftover is reaped fast; a
+    test whose scope must settle inside it passes a long one, since each is-active re-check is a
+    thread hop that a loaded host can delay past a short window."""
     _free_device_lock(monkeypatch)
     _quiet_post_job_gate(monkeypatch)
 
@@ -4158,7 +4161,7 @@ async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=la
     monkeypatch.setattr(srv, "privsep_prefix_for", lambda uid, unit=None: ["env"] if privsep else None)
     monkeypatch.setattr(srv, "GRACEFUL_KILL_GRACE_SEC", 0.05)
     monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
-    monkeypatch.setattr(srv, "_SCOPE_SETTLE_SEC", 0.05)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_SEC", settle_sec)
     monkeypatch.setattr(srv, "_SCOPE_SETTLE_POLL_SEC", 0.01)
 
     active_checks = []
@@ -4195,9 +4198,8 @@ async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=la
     await srv.get_job_queue().put(job_id)
     runner = asyncio.create_task(srv.job_runner())
     try:
-        for _ in range(300):
-            if job.finished_at:
-                break
+        deadline = asyncio.get_running_loop().time() + 30.0
+        while not job.finished_at and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.02)
     finally:
         runner.cancel()
@@ -4234,7 +4236,7 @@ async def test_a_scope_that_settles_after_its_job_is_not_signalled(monkeypatch, 
     """systemd sees an emptied scope asynchronously: a scope still active for a moment after a clean
     exit is not a leftover, and is not logged or signalled as one."""
     job, systemctl, active_checks, _ = await _run_one_job(
-        monkeypatch, "924", privsep=True, scope_active=[True, True, False]
+        monkeypatch, "924", privsep=True, scope_active=[True, True, False], settle_sec=30.0
     )
     assert job.status is srv.JobStatus.COMPLETED
     assert len(active_checks) == 3
