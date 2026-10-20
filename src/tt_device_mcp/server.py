@@ -5457,7 +5457,7 @@ async def _pollers_quiesced_for(what: str, log):
     Best-effort, as for a reset: a poller that will not stop never blocks the check. The restart is
     skipped only while a reset scope is still cycling the chips off the bus (a timed-out or abandoned
     reset), where restarting them is the MMIO-at-a-dead-endpoint hazard the reset path also avoids;
-    the health probe re-arms them once the device is idle and healthy. A check that held the mesh
+    they are owed to the next close to HEALTHY (``_owe_device_pollers``). A check that held the mesh
     leaves them stopped too, until the device is verified healthy (``_set_device_pollers``). Costs one ``systemctl stop``
     before the check and one ``start`` after it, each bounded at 30 s per unit."""
     global _pollers_held_for
@@ -5483,6 +5483,8 @@ async def _pollers_quiesced_for(what: str, log):
             if cycling:
                 log(f"device pollers left stopped after {what}: reset {cycling} is still cycling the chips")
                 health_event("pollers_left_quiesced", after=what, scope=str(cycling))
+                # A reset inside the block owed them to this owner, not to the close: owe them on.
+                _owe_device_pollers(f"reset {cycling} still cycling after {what}")
             else:
                 await asyncio.shield(_set_device_pollers(True, log))
 
@@ -5490,19 +5492,6 @@ async def _pollers_quiesced_for(what: str, log):
 # The loop a deferred restart was asked on, and the restart tasks in flight (held so they finish).
 _pollers_owed_loop: Optional[asyncio.AbstractEventLoop] = None
 _pollers_restore_tasks: "set[asyncio.Task]" = set()
-
-
-def _owe_device_pollers(why: str) -> None:
-    """Leave the pollers stopped and owe their start to the next close to HEALTHY (see
-    _restore_pollers_on_close). Also the hook a reset step that did not complete calls (spec 03 I66):
-    its chips may still be off the bus or hung, so it starts nothing, even on a HEALTHY FSM."""
-    global _pollers_owed, _pollers_owed_loop
-    if _pollers_held_for:
-        return  # the wider quiesce's owner restarts them, through the same fitness rule
-    if _pollers_owed is None:
-        health_event("pollers_kept_quiesced", reason=why, services=list(DEVICE_POLLER_SERVICES))
-    _pollers_owed = why
-    _pollers_owed_loop = asyncio.get_running_loop()
 
 
 def _pollers_log(line: str) -> None:
@@ -5513,9 +5502,14 @@ def _pollers_log(line: str) -> None:
 def _owe_device_pollers(reason: str) -> None:
     """Record that the pollers are stopped and owed a restart: the next close to HEALTHY, or the
     fabric pass that settles a post-reset debt, starts them (``_restore_pollers_on_close``). For a
-    deferred restore, and for a stop with no paired restore (the dead-chip valve, which an idle
-    relift may close without any reset). Journaled once per owed stretch."""
+    deferred restore, for a stop with no paired restore (the dead-chip valve, which an idle relift
+    may close without any reset), and for a reset step that did not complete (spec 03 I66): its
+    chips may still be off the bus or hung, so it starts nothing, even on a HEALTHY FSM. Journaled
+    once per owed stretch. Inside a wider quiesce (``_pollers_quiesced_for``) it records nothing:
+    that block's owner restarts them on exit through the same fitness rule, or owes them itself."""
     global _pollers_owed, _pollers_owed_loop
+    if _pollers_held_for:
+        return
     if _pollers_owed is None:
         health_event("pollers_kept_quiesced", reason=reason, services=list(DEVICE_POLLER_SERVICES))
     _pollers_owed = reason

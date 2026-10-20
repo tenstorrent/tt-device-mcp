@@ -450,6 +450,7 @@ async def test_the_startup_quiesce_leaves_the_pollers_off_while_a_reset_cycles(m
     assert _systemctl == ["stop"]
     assert ("pollers_left_quiesced", {"after": "the startup fabric check", "scope": "tt-reset-1"}) in events
     assert srv._pollers_held_for is None
+    assert srv._pollers_owed and "tt-reset-1" in srv._pollers_owed, "owed to the next close to HEALTHY"
 
 
 @pytest.mark.asyncio
