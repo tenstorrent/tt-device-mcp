@@ -81,7 +81,7 @@ the queue and a running job outlive the broker process.
 - **I7** — A re-adopted job keeps its original `timeout_sec` reservation, with time already
   served counted against it (`_readopted_deadline`); re-adoption never grants a fresh
   clock, and the deadline is enforced by `_monitor_readopted_scope`. A re-adopted job that
-  deadline or a requested kill stopped owes the mesh one reset, then the full check (spec 03
+  deadline, a requested kill or a preemption past SIGINT stopped owes the mesh one reset, then the full check (spec 03
   I69), paid before the next job's door or by the idle relift. A re-adopted
   preemptable job (header `PREEMPTABLE: yes`) is held to I20 instead: past its deadline it
   is preempted only once another job waits.
@@ -139,7 +139,8 @@ the queue and a running job outlive the broker process.
   before the tenant filter of I15 and ignores uid and parentage: a process stuck in the kernel
   is never reaped, so it can still be the broker's child. The fence names each holder (job,
   pid, state, wchan, SIGKILL pending) and says that one stuck in the kernel with SIGKILL
-  pending cannot be killed and only a host reboot clears it. One
+  pending cannot be killed and only a host reboot clears it; the broker requests that host rung
+  itself once such a holder has stood for 600 s (spec 04 I70), so the fence never holds open-ended. One
   `reaped_leftover_holds_device` event opens the episode and one `reaped_leftover_released`
   closes it; repeated scans emit nothing. The health gate skips its probes over a leftover and
   keeps the device dirty (`foreign_holder`), so the verify runs once it is gone. A scan error
@@ -197,7 +198,10 @@ the queue and a running job outlive the broker process.
   A preempted job's end is a failed end for the post-job gate (fabric pass forced, I14 rules
   for dirtiness): the gate, fabric included, passes before the waiting job is dispatched. A
   SIGINT exit (−2 / 130) is the stop it was asked for, not a wedge; a kill by any other signal,
-  or no exit status, marks the device dirty. A re-adopted job (I6) has no post-job gate, so
+  or no exit status, marks the device dirty. A preemption whose stop ladder went past SIGINT
+  (SIGTERM, `systemctl stop`, or the SIGKILL at the window's end) is a broker-side timeout: it
+  also owes the mesh one reset, then the full check, fabric included (spec 03 I69), paid by its
+  post-job gate (or, re-adopted, before the next job's door) before the waiting job runs. A re-adopted job (I6) has no post-job gate, so
   its preemption marks the device dirty whatever its exit status: the reset + full check,
   fabric included, passes before the waiting job is dispatched. Anyone using the option MUST
   watch the broker (queue status, or the job's own status) and shut down gracefully within

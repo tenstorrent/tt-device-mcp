@@ -347,7 +347,40 @@ def note_whole_tray_down(episode: str, detail: str, now: Optional[datetime] = No
     if _pending.get("whole_tray_at") is None:
         _pending["whole_tray_at"] = now or datetime.now()
         _pending["whole_tray_detail"] = detail[-200:]
-        health_event("offbus_gated_hold", phase="whole_tray_down", held_since=episode, detail=detail[-200:])
+        health_event(
+            "offbus_gated_hold",
+            phase="whole_tray_down",
+            held_since=episode,
+            detail=detail[-200:],
+            fault_class="whole_tray",
+            hold_age_sec=episode_age_sec(episode, now),
+        )
+
+
+def clear_whole_tray_down(episode: str, detail: str, fault_class: str = "") -> None:
+    """The tray that made this episode a whole-tray drop is back on the bus in part: the no-grace power
+    cycle no longer applies (spec 04 I27). The hold keeps its other hand-off clocks; idempotent. Marks the
+    episode's one deferral (:func:`whole_tray_deferred`), which this call never undoes."""
+    if not episode or _pending.get("episode") != episode or _pending.get("whole_tray_at") is None:
+        return
+    _pending["whole_tray_at"] = None
+    _pending["whole_tray_detail"] = ""
+    _pending["whole_tray_deferred"] = True
+    health_event(
+        "offbus_gated_hold",
+        phase="whole_tray_back",
+        held_since=episode,
+        detail=detail[-200:],
+        fault_class=fault_class,
+        hold_age_sec=episode_age_sec(episode),
+    )
+
+
+def whole_tray_deferred(episode: str) -> bool:
+    """True once this episode's no-grace cycle was held back because the tray came back in part
+    (:func:`clear_whole_tray_down`). That deferral happens once per episode: a whole tray seen off again
+    in the same episode fires without the re-check, so a tray whose read flaps cannot hold it forever."""
+    return bool(episode) and _pending.get("episode") == episode and bool(_pending.get("whole_tray_deferred"))
 
 
 def whole_tray_down_age_sec(episode: str, now: Optional[datetime] = None) -> Optional[float]:
@@ -491,6 +524,31 @@ def due_for_watchdog(episode: str, now: Optional[datetime] = None) -> bool:
         return True
     age = episode_age_sec(episode, now)
     return bool(_pending.get("gated")) and age is not None and age >= grace_sec()
+
+
+def watchdog_due_at(episode: str) -> Optional[tuple[float, str]]:
+    """``(epoch, kind)``: when :func:`due_for_watchdog` turns true for this episode and the bound that
+    turns it, named as the hold watchdog names it; the earliest when several are armed. None when it
+    never will as things stand (not tracked, already spawned, the ladder has not run, nothing armed).
+    Read-only, for the /health hold report (spec 04 I75): moves no clock."""
+    if not episode or _pending.get("episode") != episode or _pending.get("spawned"):
+        return None
+    if power_cycle_argv() is None:
+        h = _pending.get("handoff")
+        return (float(h["deadline"]), "gated_hold_handoff_bound") if h and h["deadline"] else None
+    if not _pending.get("ladder_ran"):
+        return None
+    out = []
+    if _pending.get("ipmi_at") is not None:
+        out.append((_pending["ipmi_at"].timestamp() + ipmi_handoff_sec(), "ipmi_handoff_bound"))
+    if _pending.get("tray_walk_at") is not None:
+        out.append((_pending["tray_walk_at"].timestamp() + tray_walk_handoff_sec(), "tray_walk_handoff_bound"))
+    if _pending.get("gated"):
+        try:
+            out.append((datetime.fromisoformat(episode).timestamp() + grace_sec(), "gated_offbus_grace"))
+        except (TypeError, ValueError):
+            pass
+    return min(out) if out else None
 
 
 def mark_spawned(episode: str) -> None:

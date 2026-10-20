@@ -217,7 +217,8 @@ wait_job_boundary() {
                 echo "autoupdate: $1: a device op is still in flight at the job cap after $(( w_now - w_start ))s; dispatch released, the next lap retries" >&2
                 return 1
             fi
-            echo "autoupdate: $1: the running job is past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); it no longer holds the update, applying" >&2
+            if [ "$kids" -eq 0 ] && [ "${scopes:-0}" -eq 0 ] && [ "$holders" -gt 0 ]; then w_what="a device holder is"; else w_what="the running job is"; fi
+            echo "autoupdate: $1: $w_what past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); it no longer holds the update, applying" >&2
             return 0
         fi
         sleep 5
@@ -226,12 +227,16 @@ wait_job_boundary() {
         hold_write
     done
 }
+# For the autoupdate_apply event below: whether this lap ran into a busy broker, and how long it drained.
+idle=true; drained_s=0
 count_busy
 if [ "$busy" -ne 0 ]; then
+    idle=false; d_t0="$(date +%s)"
     if ! wait_job_boundary drain; then
         rm -f "$HOLD" 2>/dev/null || true
         exit 0
     fi
+    drained_s=$(( $(date +%s) - d_t0 ))
     # The apply's own stretch, under the broker's overdue bound, starts now.
     hold_write
 fi
@@ -310,6 +315,10 @@ if [ ! -x "$clone/deploy/apply-host-config.sh" ]; then
 fi
 bash "$clone/deploy/apply-host-config.sh" "$clone" \
     || { echo "autoupdate: host-config apply failed (required); not marking current" >&2; exit 1; }
+# Nothing slow runs between the last busy look and the restart, so this goes first.
+chmod -R a+rX "$VENV" 2>/dev/null || true
+# The old defer marker is obsolete (the drain replaced it); removed once, fine if absent.
+rm -f "$ROOT/pending.defer"
 # Last look before the restart (spec 08 I24). The install ran under the dispatch hold, but a job
 # can still be running here: a tenant that opened the device on its own, or a dispatch after an
 # install slow enough for the broker to drop the hold as overdue. It is waited out the same way;
@@ -318,13 +327,31 @@ bash "$clone/deploy/apply-host-config.sh" "$clone" \
 hold_write
 count_busy
 if [ $(( kids + holders + ${scopes:-0} )) -ne 0 ] || op_in_flight; then
+    idle=false; d_t0="$(date +%s)"
     if ! wait_job_boundary "restart point"; then
         echo "autoupdate: not restarting, not marking current" >&2
         exit 0
     fi
+    drained_s=$(( drained_s + $(date +%s) - d_t0 ))
 fi
 echo "$remote_sha" > "$STATE"
-chmod -R a+rX "$VENV" 2>/dev/null || true
 
 systemctl restart tt-device-broker
-echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
+restart_rc=$?
+if [ "$restart_rc" -eq 0 ]; then
+    echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
+else
+    echo "autoupdate: broker restart at ${remote_sha:0:9} failed (rc=$restart_rc, via $src_desc)" >&2
+fi
+
+# One line in the broker's event journal (same fields as health_event(): ts, iso, kind), so a restart
+# the update caused is traceable without the systemd journal. restart_rc is the restart's exit code:
+# a failed restart is recorded as such, not as a clean apply. Same journal dir as the broker
+# (TT_DEVICE_MCP_HEALTH_DIR, else root's default). A single O_APPEND write of one short line, by
+# root like the broker; a failed write only warns, the apply is already done.
+EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
+now="$(date +%s.%N)"
+printf '{"ts": %s, "iso": "%s", "kind": "autoupdate_apply", "from_sha": "%s", "to_sha": "%s", "idle": %s, "drained_s": %s, "restart_rc": %s}\n' \
+    "$now" "$(date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ)" "$installed_sha" "$remote_sha" "$idle" "$drained_s" "$restart_rc" \
+    >> "$EVENTS" 2>/dev/null \
+    || echo "autoupdate: warning: could not append autoupdate_apply to $EVENTS" >&2

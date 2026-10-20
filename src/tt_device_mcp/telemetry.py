@@ -22,10 +22,27 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 from tt_device_mcp import metrics
-from tt_device_mcp.health import ALL_ONES, SAMPLE_INTERVAL_SEC, SAMPLE_RING_SIZE
+from tt_device_mcp.health import ALL_ONES, SAMPLE_INTERVAL_SEC, SAMPLE_RING_SIZE, chip_state
 
 if TYPE_CHECKING:
     from tt_device_mcp.health import HealthMonitor, RecoveryDeps, RecoveryMechanism
+
+# The early off-bus watch (spec 03 I79). Between samples the loop reads the kernel's own PCIe
+# record (pci.link_signals: AER counters and the KMD node list, kernel memory only) every
+# LINK_WATCH_SEC. A rise in an uncorrectable AER counter on a chip's path, or a chip node leaving
+# sysfs, arms a fast cadence: the next sample comes FAST_SAMPLE_SEC after the last one (never
+# sooner), and samples stay FAST_SAMPLE_SEC apart for FAST_WINDOW_SEC after the last such signal.
+# One storm (signals less than FAST_WINDOW_SEC apart) keeps the fast cadence at most FAST_MAX_SEC
+# from its first signal; after that the regular cadence runs until the link has been quiet for
+# FAST_WINDOW_SEC. The signal itself decides nothing: the off-bus verdict is still
+# check_for_dead_chips on real samples, with the same two-sample proof, and a bad reading that
+# began under the fast cadence must also have lasted FAST_CONFIRM_SEC, even past the window's end,
+# so a transient that clears in under 4 s never isolates a chip or dirties the device.
+LINK_WATCH_SEC = 1.0
+FAST_SAMPLE_SEC = 2.0
+FAST_WINDOW_SEC = 30.0
+FAST_MAX_SEC = 60.0
+FAST_CONFIRM_SEC = 4.0
 
 
 @dataclass(frozen=True)
@@ -173,6 +190,12 @@ class TelemetrySampler:
         # with nothing to run on and no way back except a rescan. Treat it as a fault to
         # report, not to amputate.
         self.dead_chip_strikes: dict = {}
+        # A reset scope seen still cycling the chips after our wait for it ended: no chip read until
+        # it is gone (spec 03 I66). Re-checked once per tick only while set.
+        self.scope_seen = False
+        # The hung chips the pollers were last stopped for, so one episode stops them once.
+        self.pollers_stopped_for: frozenset = frozenset()
+        self.prev_beats: dict = {}
         # Consecutive samples with NO chip nodes in sysfs — every chip off the bus, or the
         # driver wedged. chip_sample() omits an off-bus chip, so an all-gone drop reads as an
         # empty sample the all-ones blackout above never sees. Debounced like that blackout: a
@@ -186,6 +209,20 @@ class TelemetrySampler:
         # `to_thread` device read on a wedged chip, so the loop can stall indefinitely while
         # the event loop keeps serving — see is_stalled() and the watchdog gate in server.py.
         self.last_tick: float = 0.0
+        # The early off-bus watch (spec 03 I79): the fast cadence runs until fast_until, the last
+        # link_signals read is what the next one is compared with, and bad_since stamps when each
+        # off-bus reading began, for the FAST_CONFIRM_SEC proof. _clock is injectable for tests.
+        self.fast_until: float = 0.0
+        self._link_prev: Optional[dict] = None
+        self.bad_since: dict = {}
+        self._housekeeping_at: float = 0.0
+        # The current storm: its first and its latest signal, for the FAST_MAX_SEC cap, and the
+        # start of the last loop cycle, so no sample follows another sooner than FAST_SAMPLE_SEC.
+        self._storm_start: Optional[float] = None
+        self._last_signal: Optional[float] = None
+        self._storm_capped: bool = False
+        self._cycle_at: float = 0.0
+        self._clock = time.monotonic
 
     def tick(self) -> None:
         self.last_tick = time.monotonic()
@@ -212,27 +249,181 @@ class TelemetrySampler:
             # iteration completed, so a hang inside the cycle freezes it and the watchdog
             # gate trips.
             self.tick()
+            self._cycle_at = self._clock()
             try:
-                sample = await asyncio.to_thread(self._deps.chip_sample)
-                self.ring.append({"ts": time.time(), "chips": sample})
-                await asyncio.to_thread(self._deps.append_trace, sample)
+                # A reset or recovery step on the chips owns them while it runs: they are off the bus
+                # by design, and only the step's own reads may reach them (spec 03 I66).
+                if not await self.recovering_now():
+                    sample = await asyncio.to_thread(self._deps.chip_sample)
+                    self.ring.append({"ts": time.time(), "chips": sample})
+                    await asyncio.to_thread(self._deps.append_trace, sample)
 
-                await self.check_for_dead_chips(sample)
-                # The one loop that runs with an empty queue, so the one place an idle-degraded
-                # window can be caught and put on the durable timeline as it happens.
-                self._deps.refresh_idle_hold_ledger()
-                # ...and the one place a self-heal hold gets re-verified with no job flowing to
-                # do it. Spawned as its own task, never awaited here, so this loop keeps
-                # sampling; read-only, rate-limited, inert unless the operator opts in.
-                self._deps.spawn_idle_relift()
-                # ...and the idle-holder detector: names a foreign process that holds the device
-                # without working (spec 03 I44). Its own detached, rate-limited scan.
-                watch = getattr(self._deps, "watch_idle_holders", None)
-                if watch is not None:
-                    watch()
+                    await self.check_for_dead_chips(sample)
+                await asyncio.to_thread(chip_state.publish)
+                # The rest keeps the regular cadence while the fast one runs (I79): only the
+                # off-bus check gets faster, never the ledger, the relift or the holder scan.
+                now = self._clock()
+                if not self.fast_active() or now - self._housekeeping_at >= SAMPLE_INTERVAL_SEC:
+                    self._housekeeping_at = now
+                    # The one loop that runs with an empty queue, so the one place an idle-degraded
+                    # window can be caught and put on the durable timeline as it happens.
+                    self._deps.refresh_idle_hold_ledger()
+                    # ...and the one place a self-heal hold gets re-verified with no job flowing to
+                    # do it. Spawned as its own task, never awaited here, so this loop keeps
+                    # sampling; read-only, rate-limited, inert unless the operator opts in.
+                    self._deps.spawn_idle_relift()
+                    # ...and the idle-holder detector: names a foreign process that holds the device
+                    # without working (spec 03 I44). Its own detached, rate-limited scan.
+                    watch = getattr(self._deps, "watch_idle_holders", None)
+                    if watch is not None:
+                        watch()
             except Exception:  # noqa: BLE001 - a sampler must never take the runner down
                 pass
-            await asyncio.sleep(SAMPLE_INTERVAL_SEC)
+            await self.wait_for_next_sample()
+
+    def fast_active(self) -> bool:
+        return self._clock() < self.fast_until
+
+    def arm_fast(self, reason: str) -> bool:
+        """Run the fast cadence for FAST_WINDOW_SEC from now, but never past FAST_MAX_SEC from the
+        storm's first signal (I79). True only on the arming edge. Journalled once per window, on the
+        way in, so an AER storm is one event, not one per second."""
+        now = self._clock()
+        was = self.fast_active()
+        if self._last_signal is None or now - self._last_signal >= FAST_WINDOW_SEC:
+            self._storm_start, self._storm_capped = now, False
+        self._last_signal = now
+        self.fast_until = min(now + FAST_WINDOW_SEC, self._storm_start + FAST_MAX_SEC)
+        log = self._deps.logger()
+        if not self.fast_active():
+            if not self._storm_capped:
+                self._storm_capped = True
+                if log:
+                    log.warning(
+                        f"early off-bus watch: signals for {FAST_MAX_SEC:g}s without a pause — back to "
+                        f"sampling every {SAMPLE_INTERVAL_SEC:g}s until the link is quiet for {FAST_WINDOW_SEC:g}s"
+                    )
+            return False
+        if was:
+            return False
+        try:
+            self._deps.health_event("offbus_watch_armed", reason=reason)
+        except Exception:  # noqa: BLE001 - the journal must not stop the watch
+            pass
+        if log:
+            log.warning(f"early off-bus watch: {reason} — sampling every {FAST_SAMPLE_SEC:g}s")
+        return True
+
+    def link_signal(self, now: dict) -> Optional[str]:
+        """What changed since the last link_signals read, as a reason, or None (I79). An
+        uncorrectable AER counter that rose on a chip's path, or a chip node that left sysfs.
+        The first read is only a baseline; a counter that could not be read compares as nothing."""
+        prev, self._link_prev = self._link_prev, now
+        if prev is None:
+            return None
+        why = []
+        # A node the sampler removed itself (isolate_dead_chips) only moves the baseline.
+        isolated = getattr(self._deps, "isolated_chips", None)
+        ours = set(isolated() if isolated is not None else ())
+        gone = sorted(set(prev.get("chips") or ()) - set(now.get("chips") or ()) - ours, key=int)
+        if gone:
+            why.append(f"chip node(s) {', '.join(gone)} left sysfs")
+        before = prev.get("aer") or {}
+        rose = sorted(
+            bdf
+            for bdf, v in (now.get("aer") or {}).items()
+            if v is not None and before.get(bdf) is not None and v > before[bdf]
+        )
+        if rose:
+            why.append(f"uncorrectable AER errors on {', '.join(rose)}")
+        return "; ".join(why) or None
+
+    async def poll_link(self) -> bool:
+        """One early-watch read. True on the arming edge of the fast cadence. While a reset or
+        recovery step owns the chips (I66) a signal only moves the baseline: taking the chips off
+        the bus is what the step does, so it arms nothing."""
+        read = getattr(self._deps, "link_signals", None)
+        if read is None:
+            return False
+        try:
+            reason = self.link_signal(await asyncio.to_thread(read))
+        except Exception:  # noqa: BLE001 - the watch only speeds the sampler up; never stop it
+            return False
+        if reason is None:
+            return False
+        if self._mechanism.reset_in_flight or self.scope_seen or chip_state.recovering():
+            return False
+        return self.arm_fast(reason)
+
+    async def wait_for_next_sample(self) -> None:
+        """Sleep until the next sample: SAMPLE_INTERVAL_SEC, or FAST_SAMPLE_SEC while the fast
+        cadence runs. Only the arming edge of the early watch cuts the wait short (I79), and never
+        to less than FAST_SAMPLE_SEC after the last cycle began: a storm's later signals do not."""
+        interval = FAST_SAMPLE_SEC if self.fast_active() else SAMPLE_INTERVAL_SEC
+        if getattr(self._deps, "link_signals", None) is None:
+            await asyncio.sleep(interval)
+            return
+        deadline = self._clock() + interval
+        while True:
+            left = deadline - self._clock()
+            if left <= 0:
+                return
+            await asyncio.sleep(min(LINK_WATCH_SEC, left))
+            if await self.poll_link():
+                deadline = min(deadline, self._cycle_at + FAST_SAMPLE_SEC)
+
+    def _lasted(self, key: str) -> bool:
+        """The second-sample proof may stand (I79). A bad reading that began on the regular cadence
+        is already proved by samples SAMPLE_INTERVAL_SEC apart. One that began under the fast
+        cadence must also have lasted FAST_CONFIRM_SEC, even once the window has ended: the sample
+        after the last fast one still comes FAST_SAMPLE_SEC later, so the bound follows the
+        reading, not the mode, and a faster cadence never shortens the debounce below it."""
+        since = self.bad_since.get(key)
+        if not self.fast_active() and (since is None or since >= self.fast_until):
+            return True
+        return since is not None and self._clock() - since >= FAST_CONFIRM_SEC
+
+    def _mark_bad(self, key: str) -> None:
+        self.bad_since.setdefault(key, self._clock())
+
+    async def recovering_now(self) -> bool:
+        """Whether a reset or recovery step is running on the chips: this broker's own (the flag),
+        or a reset scope we stopped waiting for that is still cycling them."""
+        if self._mechanism.reset_in_flight:
+            return True
+        if self.scope_seen:
+            if await asyncio.to_thread(self._mechanism.scope_active):
+                return True
+            self.scope_seen = False
+            chip_state.set_recovering("scope", False)
+        return False
+
+    async def stop_pollers_for_hung(self, sample: dict, dead: list) -> None:
+        """Stop the device pollers at the FIRST sample that shows a present chip hung — reading
+        all-ones, or a heartbeat that did not move since the previous sample — not at the second
+        (spec 03 I66). Their reads to it are the MMIO a hung endpoint never completes. Isolation
+        still waits for its two-sample proof; the pollers are cheap to bring back (the health probe
+        re-arms them once the device is idle and healthy). Every chip at once is the re-init blip
+        the blackout path already proves on two samples, so it does not count here."""
+        stalled = [
+            i
+            for i, v in sample.items()
+            if v and isinstance(v[0], int) and v[0] != ALL_ONES and self.prev_beats.get(i) == v[0]
+        ]
+        self.prev_beats = {i: v[0] for i, v in sample.items() if v and isinstance(v[0], int)}
+        hung = frozenset(dead) | frozenset(stalled)
+        if not hung or len(hung) >= len(sample):
+            if not hung:
+                self.pollers_stopped_for = frozenset()
+            return
+        if hung <= self.pollers_stopped_for:
+            return
+        self.pollers_stopped_for = hung
+        log = self._deps.logger()
+        self._deps.health_event(
+            "pollers_quiesced_hung_chip", all_ones=sorted(dead, key=int), stalled=sorted(stalled, key=int)
+        )
+        await self._deps.set_device_pollers(False, lambda m: log.info(f"HUNG-CHIP {m}") if log else None)
 
     async def check_for_dead_chips(self, sample: dict) -> None:
         """Decide whether all-ones means a chip died — or something else entirely.
@@ -264,19 +455,24 @@ class TelemetrySampler:
         """
         log = self._deps.logger()
         dead = sorted((i for i, v in sample.items() if v and v[0] == ALL_ONES), key=int)
+        if not self._mechanism.reset_in_flight:
+            await self.stop_pollers_for_hung(sample, dead)
         if sample and not dead:
             self.dead_chip_strikes = {}
             self.all_chips_gone_strikes = 0
+            self.bad_since = {k: v for k, v in self.bad_since.items() if k == "short"}
             # expected(0) reads the baseline without ratcheting it down to a short sample.
             # Health checks off (TT_DEVICE_MCP_HEALTH_CHECK=0) means no count check either (I25).
             expected = self._monitor.expected(0) if self._monitor._health_check_enabled() else 0
             if expected <= 0 or len(sample) >= expected:
                 # Every chip is present and answering — genuinely healthy. Re-arm every debouncer.
                 self.short_count_strikes = 0
+                self.bad_since = {}
                 return
             await self._check_short_count(len(sample), expected, log)
             return
         self.short_count_strikes = 0
+        self.bad_since.pop("short", None)
 
         if self._mechanism.reset_in_flight:
             return  # a reset is supposed to do this
@@ -289,6 +485,8 @@ class TelemetrySampler:
         # healthy box ends up short a tray. The reset scope outlives our timer, so ask the
         # scope, not the timer.
         if await asyncio.to_thread(self._mechanism.scope_active):
+            self.scope_seen = True
+            chip_state.set_recovering("scope", True)
             return
 
         if not sample:
@@ -301,20 +499,23 @@ class TelemetrySampler:
             # hold-deadline watchdog until a job or a poll finally poked it. A reset is already
             # excused above.
             self.dead_chip_strikes = {}  # no nodes -> the per-chip counter has nothing to track
+            self.bad_since = {k: v for k, v in self.bad_since.items() if k == "gone"}
             expected = self._monitor.expected(0)
             if expected <= 0:
                 # A host with no TT silicon: an empty class dir is its normal, healthy state,
                 # never a drop. (A host that has ever shown chips keeps a nonzero baseline.)
                 self.all_chips_gone_strikes = 0
+                self.bad_since = {}
                 return
             self.all_chips_gone_strikes += 1
+            self._mark_bad("gone")
             # Same two-sample proof the all-ones blackout demands, and re-flagged only on the
             # way in (episode already dirty) so a dirty box does not re-journal the loss on
             # every idle sample. The dirty axis, not state-is-HEALTHY: a box under an affirmative
             # hold (eth self-heal, fabric-unverified — placed dirty=False) that then loses every
             # node has ESCALATED, and must still write the host-at-risk event and go dirty so the
             # next gate owes it a real reset.
-            if self.all_chips_gone_strikes < 2 or self._deps.episode_dirty():
+            if self.all_chips_gone_strikes < 2 or not self._lasted("gone") or self._deps.episode_dirty():
                 return
             self._deps.health_event("all_chips_off_bus", present=0, expected=expected, host_at_risk=True)
             self._deps.mark_device_dirty(
@@ -330,6 +531,7 @@ class TelemetrySampler:
                 )
             return
 
+        self.bad_since.pop("gone", None)
         if len(dead) == len(sample) and len(sample) > 1:
             # Every chip at once is the driver, the bus, or a reset — not 32 simultaneous chip
             # failures — so it never isolates. It must not dirty the device on one sample
@@ -338,10 +540,19 @@ class TelemetrySampler:
             # single untrusted sample takes a healthy box offline. Hold it to the same
             # two-sample proof a single dead chip must pass; a real blackout stays, a re-init
             # blip does not.
-            blackout_strikes = [i for i in dead if self.dead_chip_strikes.get(i, 0) >= 1]
+            seen_twice = [i for i in dead if self.dead_chip_strikes.get(i, 0) >= 1]
             for i in dead:
                 self.dead_chip_strikes[i] = self.dead_chip_strikes.get(i, 0) + 1
-            if len(blackout_strikes) != len(dead):
+                self._mark_bad(f"chip:{i}")
+            if len(seen_twice) == len(dead):
+                # Lost on the second sample, whatever the cadence: a fast cadence adds no BAR read of
+                # a dead chip (spec 03 I66). The FAST_CONFIRM_SEC gate holds back only the verdict.
+                chip_state.mark_lost(dead, "all chips all-ones on two samples", self._nodes(dead))
+                if not all(self._lasted(f"chip:{i}") for i in dead):
+                    # The proof still pending: the next sample reads each heartbeat once for real.
+                    chip_state.reprobe_due(dead)
+                    return
+            if len(seen_twice) != len(dead):
                 if log:
                     log.info(
                         f"all {len(dead)} chips read 0xFFFFFFFF on one sample — treating "
@@ -360,15 +571,32 @@ class TelemetrySampler:
             return
 
         # Two strikes: a dead chip stays dead, a blip does not.
-        confirmed = [i for i in dead if self.dead_chip_strikes.get(i, 0) >= 1]
+        # Under the fast cadence (I79) the reading must also have lasted FAST_CONFIRM_SEC.
+        seen_twice = [i for i in dead if self.dead_chip_strikes.get(i, 0) >= 1]
+        confirmed = [i for i in seen_twice if self._lasted(f"chip:{i}")]
         for i in dead:
             self.dead_chip_strikes[i] = self.dead_chip_strikes.get(i, 0) + 1
+            self._mark_bad(f"chip:{i}")
         for i in list(self.dead_chip_strikes):
             if i not in dead:
                 del self.dead_chip_strikes[i]
+                self.bad_since.pop(f"chip:{i}", None)
 
+        if seen_twice:
+            # Lost on the second sample, before the isolation runs and apart from the fast cadence's
+            # FAST_CONFIRM_SEC gate: a chip the kernel will not let go of, or one still inside that
+            # gate, is never read on the poll clock again (spec 03 I66). One still inside the gate
+            # gets its heartbeat read once for real at the next sample, so the proof rests on reads.
+            chip_state.mark_lost(seen_twice, "all-ones on two samples", self._nodes(seen_twice))
+            pending = [i for i in seen_twice if i not in confirmed]
+            if pending:
+                chip_state.reprobe_due(pending)
         if confirmed:
             await self.isolate_dead_chips(confirmed)
+
+    @staticmethod
+    def _nodes(ids) -> dict:
+        return chip_state.chip_nodes(ids)
 
     async def _check_short_count(self, present: int, expected: int, log) -> None:
         """Fewer chip nodes than the baseline on two consecutive samples -> dirty (spec 03 I31).
@@ -380,7 +608,8 @@ class TelemetrySampler:
         if self._mechanism.reset_in_flight or await asyncio.to_thread(self._mechanism.scope_active):
             return
         self.short_count_strikes += 1
-        if self.short_count_strikes < 2 or self._deps.episode_open():
+        self._mark_bad("short")
+        if self.short_count_strikes < 2 or not self._lasted("short") or self._deps.episode_open():
             return
         self._deps.health_event("chips_missing", present=present, expected=expected)
         self._deps.mark_device_dirty(
@@ -440,6 +669,10 @@ class TelemetrySampler:
         # Then the pollers: tt-telemetry reads every chip in a loop, and on a dead one it
         # segfaults and systemd restarts it straight back into the same read.
         await self._deps.set_device_pollers(False, lambda m: log.info(f"DEAD-CHIP {m}") if log else None)
+        # No reset pairs this stop with a restore, and an idle relift may close the episode without
+        # one: owe the restart, so the next close to HEALTHY (a passing full check) starts them.
+        if self._deps.owe_device_pollers is not None:
+            self._deps.owe_device_pollers(f"chip(s) {','.join(fresh)} left the PCIe bus")
 
         removed = []
         for idx in fresh:
