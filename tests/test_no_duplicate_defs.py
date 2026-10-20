@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """A module that defines the same function twice keeps only the last one, silently.
 
 server.py once carried two ``_owe_device_pollers`` from a clean auto-merge; the later one dropped
