@@ -704,13 +704,31 @@ each rung fires only when the gentler one failed or cannot apply.
   the hold. A sweep a tenant, a live reset scope or a gate held off is not spent: the hold pages, and
   the next forced window runs it again. With no power cycle to follow, nothing skips that sweep: not
   the I37 class A/C skip (futile is not unsafe), not a mesh reset that already failed on the same
-  chips (I38, I58), not a failed tray walk. Those leave only the mesh reset out of the sweep (I36);
-  the sweep still fires every other allowed rung (the SBR on bridged chips, the tray re-power under
-  the single-tray rule). When no rung is allowed at all, nothing fires: that is the one stated
-  exception to the bound's ladder. The full check still runs each window, the page carries
-  `bound_exception`, a `bound_sweep_no_allowed_rung` event is journalled, /health
-  `hold_bound.next_step` reads `check_only_no_allowed_rung`, and the episode is never marked swept.
-  A hold with no clock (no episode start) is never latched, so each forced window sweeps.
+  chips (I38, I58), not a failed tray walk, not a tray rung the config leaves out
+  (`TT_DEVICE_MCP_AUTO_UBB_RESET=0`, the single-tray rule): an earlier failed rung or a config
+  opt-out does not exempt the bound's ladder. The bound's mesh reset fires once per hold episode,
+  latched when it is issued (an incomplete sweep that fired it does not fire it again); later
+  windows sweep without it (I36) and still fire every other allowed rung (the SBR on bridged chips,
+  the tray re-power under the single-tray rule). Only when this hold's bound already ran its mesh
+  reset and no other rung is allowed does nothing fire: the full check, fabric included, still runs
+  each window, a `bound_sweep_no_allowed_rung` event is journalled, every page (the hold page, the
+  no-host-rung page `hold_no_host_rung_opted_in` when both host rungs are off, and the stuck-hold
+  alert) carries `bound_exception`, /health `hold_bound.next_step` reads
+  `check_only_no_allowed_rung`, and the episode is never marked swept. A later window that fires a
+  rung clears that /health state. At the bound, with no power cycle to follow, the release needs a
+  full check whose fabric passed on every cabled link: a 77, no fabric verdict, a failed fabric, or
+  a pass on the discovered links only (fewer than the cabling expects) counts as failed and keeps
+  the hold (`bound_check_fabric_unproven`). A passing check whose release the I32 funnel refuses
+  lifts nothing, so the bound is not marked spent on it. A hold with no clock (no episode start)
+  latches on the empty episode key, so a repeat window, even with a changed off-bus set, does not
+  fire the mesh reset again.
+  Time to recover with no power cycle to follow, past the 10-min bound (each figure is added once
+  per hold, then the hold pages each window until a full check passes): class A (whole tray) and C
+  (all off the bus), B1 (partial, regressed) and B2 (partial, not regressed): one last-chance sweep
+  (SBR, tray re-power where allowed, mesh reset) plus the settle and the full check, about 4 min;
+  I38/I58/failed walk: the same, the mesh reset run once more; the check-only case: one full check
+  per forced window (fabric included), paged each time, bounded only by the hold's own page cadence
+  until an operator opts in a host rung or the check passes.
   The latch clears when the device is released; it is in memory only, so a broker restart costs at
   most one more reset. Bounds the loop one Galaxy host ran: three mesh resets, one per forced
   window, took a 4-chip drop to 31 and then 32 off the bus.
@@ -1058,8 +1076,11 @@ each rung fires only when the gentler one failed or cannot apply.
   ladder, so at the bound the full ladder runs again before any host rung. When the ladder
   leaves the mesh unrecovered, the broker's own code asks for the host rung at once: the BMC power
   cycle, or the warm reboot where only that is opted in. With no host rung for the drop (I31's
-  no-power-cycle path), the bound's ladder still runs its last-chance sweep before the page, and the
-  hold stays until a full check passes. When the ladder brings the mesh back, only its
+  no-power-cycle path), the bound's ladder still runs its last-chance sweep before the page,
+  mesh reset included once per hold even where an earlier mesh reset failed or the config leaves the
+  tray rung out, and the hold stays until a full check passes whose fabric covered every cabled link
+  (a 77 or a discovered-links-only pass is a fail). With both host rungs off, the climb still pages
+  (`hold_no_host_rung_opted_in`, with `bound_exception` in the check-only case); it is never silent. When the ladder brings the mesh back, only its
   full check, fabric included, releases the hold. A full check that ends with no pass (a failed
   verdict, or a fabric pass that could not run for any cause but a 1G hugepage pool still filling)
   asks for the host rung at once (event `hold_bound_check_failed`): inside the forced run when the
@@ -1605,7 +1626,7 @@ sees a silent fabric pass.
 | I30 deadline escalation holds a fabric-only present mesh without a reset; real faults keep the ladder | `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_fabric_only_present_mesh_without_a_reset`, `tests/test_device_safety.py::test_the_deadline_escalation_keeps_the_ladder_for_real_faults`, `tests/test_device_safety.py::test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset`, `tests/test_device_safety.py::test_the_deadline_escalation_climbs_a_present_mesh_eth_frozen_self_heal_hold` |
 | I30 a dispatch-failure hold is never classed a topology mismatch | `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I28 a uid-0 broker poller never blocks the reset; pollers stop and restart around it | `tests/test_dispatch_failure_reset.py::test_a_uid0_telemetry_holder_does_not_block_the_reset` |
-| I31 a regressed galaxy reset is not repeated in its hold episode; climb or page instead; with no power cycle, the bound's sweep runs before the page, releases only on a passing full check and is retried when held off | `tests/test_device_safety.py::test_the_bound_ladder_with_no_power_cycle_releases_only_on_a_passing_full_check`, `tests/test_device_safety.py::test_an_incomplete_bound_sweep_still_pages_and_is_retried_next_window`, `tests/test_device_safety.py::test_stuck_offbus_hold_below_floor_climbs_loud_when_no_host_rung_opted_in`, `tests/test_device_safety.py::test_a_declined_tray_walk_hands_the_stuck_hold_to_the_next_rung`, `tests/test_device_safety.py::test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset`, `tests/test_device_safety.py::test_forced_offbus_ladder_after_a_regression_sweeps_then_power_cycles_when_opted_in`, `tests/test_device_safety.py::test_an_early_regression_is_latched_before_the_ceiling_deferral`, `tests/test_device_safety.py::test_a_new_hold_episode_resets_again_after_a_regression`, `tests/test_device_safety.py::test_gate_skips_a_repeat_galaxy_reset_after_a_regression`, `tests/test_device_safety.py::test_gate_latches_a_regression_seen_before_any_hold`, `tests/test_device_safety.py::test_the_bound_sweep_runs_for_a_class_a_or_c_hold_with_no_power_cycle`, `::test_the_bound_sweep_after_a_boot_scope_failed_mesh_reset_runs_without_it`, `::test_the_bound_sweep_after_an_episode_failed_mesh_reset_runs_without_it`, `::test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_affected_tray_stays_off`, `::test_a_bound_sweep_with_no_allowed_rung_is_named_checked_and_never_spent`, `::test_a_settle_only_bound_release_needs_a_full_check_that_just_passed`, `::test_a_hold_with_no_clock_is_never_latched_and_a_release_clears_the_latch` |
+| I31 a regressed galaxy reset is not repeated in its hold episode; climb or page instead; with no power cycle, the bound's sweep runs before the page (its mesh reset once per hold, even after a failed one or a tray opt-out), releases only on a full check whose fabric covered every cabled link, is not spent on a refused release and is retried when held off; every page names the check-only case | `tests/test_device_safety.py::test_the_bound_ladder_with_no_power_cycle_releases_only_on_a_passing_full_check`, `tests/test_device_safety.py::test_an_incomplete_bound_sweep_still_pages_and_is_retried_next_window`, `tests/test_device_safety.py::test_stuck_offbus_hold_below_floor_climbs_loud_when_no_host_rung_opted_in`, `tests/test_device_safety.py::test_a_declined_tray_walk_hands_the_stuck_hold_to_the_next_rung`, `tests/test_device_safety.py::test_forced_offbus_ladder_does_not_repeat_a_regressed_galaxy_reset`, `tests/test_device_safety.py::test_forced_offbus_ladder_after_a_regression_sweeps_then_power_cycles_when_opted_in`, `tests/test_device_safety.py::test_an_early_regression_is_latched_before_the_ceiling_deferral`, `tests/test_device_safety.py::test_a_new_hold_episode_resets_again_after_a_regression`, `tests/test_device_safety.py::test_gate_skips_a_repeat_galaxy_reset_after_a_regression`, `tests/test_device_safety.py::test_gate_latches_a_regression_seen_before_any_hold`, `tests/test_device_safety.py::test_the_bound_sweep_runs_for_a_class_a_or_c_hold_with_no_power_cycle`, `::test_the_bound_sweep_after_a_boot_scope_failed_mesh_reset_runs_it_once_more`, `::test_the_bound_sweep_after_an_episode_failed_mesh_reset_runs_it_once_per_episode`, `::test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_affected_tray_stays_off`, `::test_a_bound_sweep_with_no_allowed_rung_is_named_checked_and_never_spent`, `::test_a_settle_only_bound_release_needs_a_full_check_that_just_passed`, `::test_a_hold_with_no_clock_latches_on_empty_and_a_release_clears_the_latch`, `::test_a_bound_mesh_reset_fired_in_an_incomplete_window_is_not_fired_again`, `::test_a_tray_rung_opt_out_does_not_turn_the_bound_into_check_only`, `::test_the_bound_pages_with_its_exception_when_no_host_rung_is_opted_in`, `::test_a_later_window_that_fires_a_rung_clears_the_check_only_latch`, `::test_a_refused_release_on_the_settle_only_bound_neither_latches_nor_defers`, `::test_the_settle_only_bound_does_not_lift_on_an_unproven_fabric` |
 | I32 every reset path releases only after a passing fabric pass: the debt settles only on a healthy verdict, the funnel holds fabric-unverified, exemptions | `tests/test_post_reset_gate.py::test_the_debt_settles_only_on_a_healthy_fabric_verdict`, `::test_a_single_chip_or_a_host_with_no_fabric_check_is_exempt`, `::test_a_verified_release_after_a_reset_holds_fabric_unverified`, `::test_no_debt_releases_as_before` |
 | I32 per path: operator reset, bridge rung, no-window sweep, idle off-bus bridge, adopted foreign scope, foreign-holder fast verify, broker start, tray-down prelude rescan | `tests/test_post_reset_gate.py::test_an_operator_reset_without_a_passing_fabric_pass_holds`, `::test_an_operator_reset_with_a_passing_fabric_pass_releases`, `::test_the_bridge_rung`, `::test_the_tray_down_no_window_sweep`, `::test_the_idle_off_bus_bridge_reset`, `::test_a_reset_adopted_from_a_foreign_scope`, `::test_the_foreign_holder_fast_verify_after_a_reset_holds`, `::test_a_broker_start_owes_a_fabric_pass_before_any_release`, `tests/test_tray_down_prelude.py::test_a_rescan_recovery_releases_only_on_a_passing_fabric_pass` |
 | I32 with an AICLK ceiling armed (spec 03 I35), every reset path (operator reset, glx_reset rung, bridge rung, UBB tray sweep, idle off-bus escalation, hold-deadline escalation, broker start) runs reset -> ceiling -> full pass, fabric included -> release; a fabric FAIL keeps the hold for the bounded ladder; a disarmed ceiling still runs the full pass | `tests/test_aiclk_ceiling_goal8.py::test_every_reset_path_runs_ceiling_then_full_fabric_pass_then_releases`, `::test_fabric_fail_after_any_reset_keeps_the_hold_and_enters_bounded_recovery`, `::test_disarmed_ceiling_still_runs_the_full_fabric_pass` |

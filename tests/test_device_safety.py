@@ -11217,7 +11217,11 @@ async def test_the_bound_ladder_with_no_power_cycle_releases_only_on_a_passing_f
         swept.append(events.count("reset_unrecoverable_power_cycle_required"))
         return True
 
+    async def verify(expected, log, run_fabric=True, **_):
+        return check_passes, {"snapshot": {"ok": check_passes}, "fabric": {"ok": check_passes, "detail": ""}}
+
     monkeypatch.setattr(srv.galaxy_recovery, "_issue_all_resets_back_to_back", all_resets)
+    patch_recovery(monkeypatch, "_verify_device", verify)
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
     assert swept == [0], "the bound's sweep runs once, before any page"
     assert counters["reboots"] == 0 and counters["power_cycles"] == 0
@@ -11263,13 +11267,15 @@ def _arm_bound_no_power_cycle(monkeypatch, *, verify_healthy=False):
     monkeypatch.setattr(galaxy_mod, "_settle_before_host_rung_sec", lambda: 0)
     sweeps, verifies = [], []
 
-    async def all_resets(bitmap, ids, trays, expected, log, *, do_sbr=True, mesh_reset=True):
+    async def all_resets(bitmap, ids, trays, expected, log, *, do_sbr=True, mesh_reset=True, on_mesh_reset=None):
         sweeps.append({"bitmap": bitmap, "do_sbr": do_sbr, "mesh_reset": mesh_reset})
+        if mesh_reset and on_mesh_reset is not None:
+            on_mesh_reset()
         return True
 
     async def verify(expected, log, run_fabric=True, **_):
         verifies.append(run_fabric)
-        return verify_healthy, {"snapshot": {"ok": verify_healthy}}
+        return verify_healthy, {"snapshot": {"ok": verify_healthy}, "fabric": {"ok": verify_healthy, "detail": ""}}
 
     monkeypatch.setattr(srv.galaxy_recovery, "_issue_all_resets_back_to_back", all_resets)
     patch_recovery(monkeypatch, "_verify_device", verify)
@@ -11297,18 +11303,24 @@ async def test_the_bound_sweep_runs_for_a_class_a_or_c_hold_with_no_power_cycle(
 
 
 @pytest.mark.asyncio
-async def test_the_bound_sweep_after_a_boot_scope_failed_mesh_reset_runs_without_it(monkeypatch, clear_job_state):
-    """Review F1(b), spec 04 I31/I58: this boot's mesh reset already failed on these chips. With no host rung
-    to follow, the sweep is not skipped: it fires the allowed rungs (here the SBR) and leaves the mesh reset
-    out. With a host rung to follow, the I58 skip is unchanged."""
+async def test_the_bound_sweep_after_a_boot_scope_failed_mesh_reset_runs_it_once_more(monkeypatch, clear_job_state):
+    """Spec 04 I31/I58/I76: this boot's mesh reset already failed on these chips. With no host rung to follow,
+    the 10-min bound still runs the full ladder: the mesh reset fires once more this hold, latched, and a
+    later window leaves it out. With a host rung to follow, the I58 skip is unchanged."""
     _, events, sweeps, verifies = _arm_bound_no_power_cycle(monkeypatch)
     srv.isolated_chips = {"3"}
     monkeypatch.setattr(srv.galaxy_recovery.mechanism, "rung_failed_unchanged", lambda scope, rung, chips: scope == "")
-    out = await srv.galaxy_recovery._settle_and_verify_before_host_rung(
-        32, lambda m: None, "idle-escalation", host_rung_follows=False
-    )
-    assert out is False and sweeps == [{"bitmap": 0, "do_sbr": True, "mesh_reset": False}]
-    assert verifies == [True], "the full check, fabric included, follows the sweep"
+    for _ in range(2):
+        out = await srv.galaxy_recovery._settle_and_verify_before_host_rung(
+            32, lambda m: None, "idle-escalation", host_rung_follows=False
+        )
+        assert out is False
+    assert sweeps == [
+        {"bitmap": 0, "do_sbr": True, "mesh_reset": True},
+        {"bitmap": 0, "do_sbr": True, "mesh_reset": False},
+    ], "the mesh reset fires once per hold, the other allowed rungs every window"
+    assert srv.galaxy_recovery._bound_mesh_reset_since == srv.device_hold_episode_since
+    assert verifies == [True, True], "the full check, fabric included, follows each sweep"
     assert "last_chance_sweep_skipped" not in _names(events)
     sweeps.clear()
     out = await srv.galaxy_recovery._settle_and_verify_before_host_rung(32, lambda m: None, "idle-escalation")
@@ -11316,15 +11328,17 @@ async def test_the_bound_sweep_after_a_boot_scope_failed_mesh_reset_runs_without
 
 
 @pytest.mark.asyncio
-async def test_the_bound_sweep_after_an_episode_failed_mesh_reset_runs_without_it(monkeypatch, clear_job_state):
-    """Review F1(c), spec 04 I31/I38: this hold's mesh reset already failed on exactly these chips. The bound
-    sweep still runs once with every other allowed rung, leaves the mesh reset out, and only then pages."""
+async def test_the_bound_sweep_after_an_episode_failed_mesh_reset_runs_it_once_per_episode(
+    monkeypatch, clear_job_state
+):
+    """Spec 04 I31/I38/I76: this hold's mesh reset already failed on exactly these chips. The 10-min bound
+    still runs the full ladder once, mesh reset included, and only then pages."""
     counters, events, sweeps, verifies = _arm_bound_no_power_cycle(monkeypatch)
     srv.isolated_chips = {"3"}
     monkeypatch.setattr(srv.galaxy_recovery.mechanism, "rung_failed_unchanged", lambda scope, rung, chips: scope != "")
     for _ in range(2):
         await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(32, 8, lambda m: None)
-    assert sweeps == [{"bitmap": 0, "do_sbr": True, "mesh_reset": False}], "once per episode, no mesh reset"
+    assert sweeps == [{"bitmap": 0, "do_sbr": True, "mesh_reset": True}], "once per episode, mesh reset included"
     assert verifies == [True]
     assert srv.galaxy_recovery._bound_sweep_since == srv.device_hold_episode_since
     assert _names(events).count("reset_unrecoverable_power_cycle_required") == 2
@@ -11333,11 +11347,13 @@ async def test_the_bound_sweep_after_an_episode_failed_mesh_reset_runs_without_i
 
 @pytest.mark.asyncio
 async def test_a_bound_sweep_with_no_allowed_rung_is_named_checked_and_never_spent(monkeypatch, clear_job_state):
-    """Review F1(c)/(d), spec 04 I31/I76 exception: the mesh reset may not repeat, no chip is bridged and no
-    tray re-power is allowed, so nothing fires. Each window runs the full check, the page and /health
-    hold_bound.next_step name the exception, and the episode is never marked swept."""
+    """Spec 04 I31/I76 exception: this hold's bound already fired its mesh reset (an earlier window ended
+    incomplete), no chip is bridged and no tray re-power is allowed, so nothing is left to fire. Each window
+    runs the full check, the page and /health hold_bound.next_step name the exception, and the episode is
+    never marked swept."""
     counters, events, sweeps, verifies = _arm_bound_no_power_cycle(monkeypatch)
     monkeypatch.setattr(srv.galaxy_recovery.mechanism, "rung_failed_unchanged", lambda *a: True)
+    srv.galaxy_recovery._bound_mesh_reset_since = srv.device_hold_episode_since
     for window in (1, 2):
         await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(
             32, 8, lambda m: None, swept=True, walk_failed=True
@@ -11347,7 +11363,7 @@ async def test_a_bound_sweep_with_no_allowed_rung_is_named_checked_and_never_spe
     assert srv.galaxy_recovery._bound_sweep_since is None, "no reset fired, so the episode is not spent"
     assert "bound_sweep_no_allowed_rung" in _names(events)
     pages = [k for n, k in events if n == "reset_unrecoverable_power_cycle_required"]
-    assert len(pages) == 2 and all("no reset rung allowed" in k.get("bound_exception", "") for k in pages)
+    assert len(pages) == 2 and all("check only" in k.get("bound_exception", "") for k in pages)
     assert srv._hold_bound_health()["next_step"] == "check_only_no_allowed_rung"
 
 
@@ -11361,10 +11377,11 @@ async def test_a_settle_only_bound_release_needs_a_full_check_that_just_passed(
     order = []
     _, events, sweeps, _ = _arm_bound_no_power_cycle(monkeypatch, verify_healthy=check_passes)
     monkeypatch.setattr(srv.galaxy_recovery.mechanism, "rung_failed_unchanged", lambda *a: True)
+    srv.galaxy_recovery._bound_mesh_reset_since = srv.device_hold_episode_since
 
     async def verify(expected, log, run_fabric=True, **_):
         order.append(("verify", run_fabric, check_passes))
-        return check_passes, {"snapshot": {"ok": check_passes}}
+        return check_passes, {"snapshot": {"ok": check_passes}, "fabric": {"ok": check_passes, "detail": ""}}
 
     patch_recovery(monkeypatch, "_verify_device", verify)
     monkeypatch.setattr(srv, "_clear_device_dirty", lambda **kw: order.append(("release", kw.get("verified"))))
@@ -11380,19 +11397,145 @@ async def test_a_settle_only_bound_release_needs_a_full_check_that_just_passed(
 
 
 @pytest.mark.asyncio
-async def test_a_hold_with_no_clock_is_never_latched_and_a_release_clears_the_latch(monkeypatch, clear_job_state):
-    """Review F3: with no hold clock there is no episode to latch, so the bound sweep is not marked spent
-    under a key nothing clears; each window sweeps. The release clears the per-episode latches."""
+async def test_a_hold_with_no_clock_latches_on_empty_and_a_release_clears_the_latch(monkeypatch, clear_job_state):
+    """Spec 04 I31/I76: a hold with no clock latches its bound on "" so a repeat window does not fire the
+    sweep (and its mesh reset) again; the release clears every per-episode latch, so the next hold starts fresh."""
     _, _, sweeps, _ = _arm_bound_no_power_cycle(monkeypatch)
     srv.isolated_chips = {"3"}
     srv.device_hold_episode_since = ""
     for _ in range(2):
         await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(32, 8, lambda m: None)
-    assert len(sweeps) == 2 and srv.galaxy_recovery._bound_sweep_since is None
+    assert len(sweeps) == 1, "a clockless repeat does not refire the bound's sweep"
+    assert srv.galaxy_recovery._bound_sweep_since == "" and srv.galaxy_recovery._bound_mesh_reset_since == ""
     srv._note_tenant_gate_verdict("held for the test")
-    srv.galaxy_recovery._bound_sweep_since = srv.galaxy_recovery._bound_no_rung_since = srv.device_hold_episode_since
+    gr = srv.galaxy_recovery
+    gr._bound_sweep_since = gr._bound_no_rung_since = gr._bound_mesh_reset_since = srv.device_hold_episode_since
     srv._note_tenant_gate_verdict("")
-    assert srv.galaxy_recovery._bound_sweep_since is None and srv.galaxy_recovery._bound_no_rung_since is None
+    assert gr._bound_sweep_since is None and gr._bound_no_rung_since is None and gr._bound_mesh_reset_since is None
+
+
+@pytest.mark.asyncio
+async def test_a_bound_mesh_reset_fired_in_an_incomplete_window_is_not_fired_again(monkeypatch, clear_job_state):
+    """Spec 04 I31/I58/I76: the bound runs a mesh reset that already failed on these chips once per hold.
+    The latch is set when it is issued, so a window that fired it and then ended incomplete is retried
+    without it; the next window's sweep still runs the other allowed rungs."""
+    _, _, sweeps, _ = _arm_bound_no_power_cycle(monkeypatch)
+    srv.isolated_chips = {"3"}
+    monkeypatch.setattr(srv.galaxy_recovery.mechanism, "rung_failed_unchanged", lambda *a: True)
+    results = iter([False, True])
+
+    async def all_resets(bitmap, ids, trays, expected, log, *, do_sbr=True, mesh_reset=True, on_mesh_reset=None):
+        sweeps.append({"bitmap": bitmap, "do_sbr": do_sbr, "mesh_reset": mesh_reset})
+        if mesh_reset and on_mesh_reset is not None:
+            on_mesh_reset()
+        return next(results)
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_issue_all_resets_back_to_back", all_resets)
+    for _ in range(2):
+        await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(32, 8, lambda m: None)
+    assert [s["mesh_reset"] for s in sweeps] == [True, False], "the mesh reset fires once per hold"
+    assert srv.galaxy_recovery._bound_sweep_since == srv.device_hold_episode_since
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opt_out", ["auto_ubb_reset_off", "single_tray_rule"])
+async def test_a_tray_rung_opt_out_does_not_turn_the_bound_into_check_only(monkeypatch, clear_job_state, opt_out):
+    """Spec 04 I31/I76, goal 10: a config that leaves the tray re-power out (AUTO_UBB_RESET=0, or the default
+    single-tray rule) after the mesh reset already failed on these chips never leaves the bound with nothing
+    to fire: its mesh reset runs once this hold."""
+    _, events, sweeps, verifies = _arm_bound_no_power_cycle(monkeypatch)
+    monkeypatch.setattr(srv.galaxy_recovery.mechanism, "rung_failed_unchanged", lambda *a: True)
+    if opt_out == "auto_ubb_reset_off":
+        monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")
+        monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
+    else:
+        monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
+    await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(32, 8, lambda m: None)
+    assert len(sweeps) == 1 and sweeps[0]["mesh_reset"] is True
+    assert "bound_sweep_no_allowed_rung" not in _names(events)
+    assert verifies == [True]
+
+
+@pytest.mark.asyncio
+async def test_the_bound_pages_with_its_exception_when_no_host_rung_is_opted_in(monkeypatch, clear_job_state):
+    """Spec 04 I76: with both host rungs off (AUTO_REBOOT=0, AUTO_POWER_CYCLE=0) a hold past the bound never
+    goes silent: it pages each window, naming the bound's check-only case when it applies."""
+    _, events, sweeps, verifies = _arm_bound_no_power_cycle(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")
+    monkeypatch.setattr(srv.galaxy_recovery.mechanism, "rung_failed_unchanged", lambda scope, *a: scope == "")
+    # A drop the warm reboot could clear, with no host rung opted in: the chooser's (None, False).
+    monkeypatch.setattr(galaxy_mod, "_host_escalation_for_drop", lambda *a, **k: (None, False))
+    srv.galaxy_recovery._bound_mesh_reset_since = srv.device_hold_episode_since
+    out = await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(32, 8, lambda m: None)
+    assert out == galaxy_mod.NO_HOST_RUNG and sweeps == [] and verifies == [True]
+    pages = [k for n, k in events if n == "hold_no_host_rung_opted_in"]
+    assert pages and "check only" in pages[0].get("bound_exception", ""), _names(events)
+
+
+@pytest.mark.asyncio
+async def test_a_later_window_that_fires_a_rung_clears_the_check_only_latch(monkeypatch, clear_job_state):
+    """Spec 04 I31/I76: once a later window of the hold fires a rung, /health no longer names the
+    check-only case."""
+    _, _, sweeps, _ = _arm_bound_no_power_cycle(monkeypatch)
+    srv.isolated_chips = {"3"}
+    gr = srv.galaxy_recovery
+    gr._bound_mesh_reset_since = gr._bound_no_rung_since = srv.device_hold_episode_since
+    await gr._settle_and_verify_before_host_rung(32, lambda m: None, "idle-escalation", host_rung_follows=False)
+    assert gr._bound_no_rung_since is None
+    assert sweeps == [{"bitmap": 0, "do_sbr": True, "mesh_reset": False}]
+    assert (srv._hold_bound_health() or {}).get("next_step") != "check_only_no_allowed_rung"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_release_on_the_settle_only_bound_neither_latches_nor_defers(monkeypatch, clear_job_state):
+    """Goal 11, spec 04 I31/I32: the full check passed but the release funnel refused the lift (fabric debt).
+    Nothing lifted and nothing fired, so the bound is not spent and the climb does not read it as healed."""
+    _, events, sweeps, _ = _arm_bound_no_power_cycle(monkeypatch, verify_healthy=True)
+    monkeypatch.setattr(srv.galaxy_recovery.mechanism, "rung_failed_unchanged", lambda *a: True)
+    srv.galaxy_recovery._bound_mesh_reset_since = srv.device_hold_episode_since
+    monkeypatch.setattr(srv, "_clear_device_dirty", lambda **kw: False)
+    out = await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(32, 8, lambda m: None)
+    assert sweeps == []
+    assert out != galaxy_mod.HOST_RUNG_DEFERRED
+    assert srv.galaxy_recovery._bound_sweep_since is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fabric",
+    [
+        {"ok": None, "detail": "exit 77: no trained link to test"},
+        {
+            "ok": True,
+            "detail": "fabric links healthy on discovered links (5s); "
+            "TOPOLOGY MISMATCH vs x: 1 missing, 0 extra port connections",
+        },
+        None,
+    ],
+    ids=["fabric_77", "partial_links", "no_fabric"],
+)
+async def test_the_settle_only_bound_does_not_lift_on_an_unproven_fabric(monkeypatch, clear_job_state, fabric):
+    """Goal 11, spec 04 I31/I76: at the bound a full check whose fabric is a 77, has no verdict or passed on
+    the discovered links only (fewer than the cabling expects) counts as failed: no lift and no spent latch."""
+    released = []
+    _, events, sweeps, _ = _arm_bound_no_power_cycle(monkeypatch, verify_healthy=True)
+    monkeypatch.setattr(srv.galaxy_recovery.mechanism, "rung_failed_unchanged", lambda *a: True)
+    srv.galaxy_recovery._bound_mesh_reset_since = srv.device_hold_episode_since
+
+    async def verify(expected, log, run_fabric=True, **_):
+        ev = {"snapshot": {"ok": True}}
+        if fabric is not None:
+            ev["fabric"] = fabric
+        return True, ev
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(srv, "_clear_device_dirty", lambda **kw: released.append(kw) or True)
+    out = await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(32, 8, lambda m: None)
+    assert released == [] and out != galaxy_mod.HOST_RUNG_DEFERRED
+    assert srv.galaxy_recovery._bound_sweep_since is None
+    assert "bound_check_fabric_unproven" in _names(events)
+    assert "reset_unrecoverable_power_cycle_required" in _names(events), "the held bound pages"
 
 
 @pytest.mark.asyncio

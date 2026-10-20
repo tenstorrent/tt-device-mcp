@@ -2297,6 +2297,7 @@ def _reset_for_testing():
         recovery_mechanism.regressed_reset_since = None
     if galaxy_recovery is not None:
         galaxy_recovery._bound_sweep_since = galaxy_recovery._bound_no_rung_since = None
+        galaxy_recovery._bound_mesh_reset_since = None
     _fabric_77_streak_since = None
     _fabric_77_streak = 0
     _fabric_77_fallback_release_monotonic = 0.0
@@ -6916,6 +6917,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
             galaxy_recovery.tray_down_episode_end()  # spec 04 I19: the next drop is a fresh onset
             # Spec 04 I31/I76: the next episode gets its own bound sweep.
             galaxy_recovery._bound_sweep_since = galaxy_recovery._bound_no_rung_since = None
+            galaxy_recovery._bound_mesh_reset_since = None
         offbus_power_cycle.end_hold_handoff()  # spec 04 I33: no hold is handed off any more
         _persist_hold_episode("")  # the device came back fit: the episode is over, on disk too
         device_hold_episode_reason = ""
@@ -7426,11 +7428,12 @@ def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
         # The one hold past the bound with no deadline of its own: it waits for the tenant to leave.
         out["next_step"] = "tenant_blocked"
         out["blocked_by"] = _describe_bound_blocker(_hold_bound_tenant_blocker)
-    if galaxy_recovery is not None and galaxy_recovery._bound_no_rung_since == device_hold_episode_since:
-        # The goal-10 exception (spec 04 I31/I76): no power cycle armed and no reset rung allowed, so each
-        # window runs the full check only and pages.
+    exception = galaxy_recovery.bound_exception(device_hold_episode_since) if galaxy_recovery is not None else ""
+    if exception:
+        # Spec 04 I31/I76: no power cycle armed, and this hold's bound already ran its mesh reset with no
+        # other rung allowed, so each window runs the full check only and pages.
         out["next_step"] = "check_only_no_allowed_rung"
-        out["exception"] = "mesh reset already failed on these chips; no power cycle opted in"
+        out["exception"] = exception
     if cooling:
         out["cooldown_until"] = datetime.fromtimestamp(cd["until"]).isoformat(timespec="seconds")
     return out
@@ -7769,6 +7772,9 @@ def _maybe_alert_stuck_hold(bucket: int, deadline: int, age: float) -> None:
         "escalation_deadline": _hold_bound_deadline_iso(),
         "next_alert_after_sec": gap * deadline,
     }
+    exception = galaxy_recovery.bound_exception(device_hold_episode_since) if galaxy_recovery is not None else ""
+    if exception:
+        event["bound_exception"] = exception  # spec 04 I31/I76: the page names the bound's check-only case
     if alert.send_alert(event, logger) is None:
         return
     device_hold_alert_next_bucket = bucket + gap
