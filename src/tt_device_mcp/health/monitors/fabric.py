@@ -226,6 +226,16 @@ def names_dispatch_failure(text: str) -> bool:
     return DISPATCH_FAILED in (text or "")
 
 
+# The wrapper's 77 when the links passed and its dispatch probe ran out its cap without a verdict.
+DISPATCH_CAP = "dispatch probe hit its"
+
+
+def names_dispatch_cap(text: str) -> bool:
+    """Whether ``text`` carries the wrapper's dispatch-cap 77: the validator had already moved traffic
+    across every link, so the links were trained when it gave up (spec 04 I84)."""
+    return DISPATCH_CAP in (text or "")
+
+
 def find_topology_marker(output: str) -> Optional[str]:
     m = _TOPOLOGY_MARKER.search(output or "")
     return m.group(0).strip() if m else None
@@ -259,6 +269,8 @@ _REASON_PATTERNS = (
     # The wrapper's own final verdict on a mesh whose links passed and whose dispatch did not
     # (spec 03 I55): it names the failure the exit code is about, ahead of any validator line above.
     re.compile(r"dispatch FAILED on a green fabric.*"),
+    # Its 77 on the same green fabric, when the dispatch probe ran out its cap (spec 04 I84).
+    re.compile(r"dispatch probe hit its .*"),
     re.compile(r"what\(\):.*"),
     re.compile(r"filesystem error:.*"),
     re.compile(r"(?:\|\s*(?:critical|fatal|error)\s*\||\[(?:critical|error)\]|TT_THROW|TT_FATAL).*", re.IGNORECASE),

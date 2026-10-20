@@ -178,6 +178,41 @@ def test_a_links_missing_hold_is_not_a_no_reset_topology_hold(monkeypatch):
     assert srv._fabric_no_reset_hold() == "", "the measured fault keeps the reset ladder (04 I30)"
 
 
+@pytest.mark.asyncio
+async def test_a_lift_the_accept_list_excused_names_the_accepted_ports(topo, monkeypatch):  # noqa: F811
+    """Review #1495 F5: a lost link the operator's accept list excuses lifts, and the event, /health and
+    the broker log name the port the list excused; a moved tray excuses nothing."""
+    m, state = topo
+    lines = []
+
+    class _Log:
+        def warning(self, msg):
+            lines.append(msg)
+
+        info = error = warning
+
+    monkeypatch.setattr(m, "_logger", lambda: _Log())
+    monkeypatch.setenv(ACCEPT, f"{_LOST_PORT}, tray 9 port 9")
+    state["first"] = _LOST
+    m.eth_link_drop(256)
+    ok, _ = await m._verify_fabric_health_body(60)
+    assert ok is True and m.fabric_topology["verdict"] == "lift"
+    assert m.fabric_topology["accepted_ports"] == [_LOST_PORT], "only the missing port, not the whole list"
+    assert dict(state["events"])["fabric_topology_mismatch"]["accepted_ports"] == [_LOST_PORT]
+    assert any("TOPOLOGY MISMATCH" in ln and f"ACCEPT_MISSING_PORTS: {_LOST_PORT}" in ln for ln in lines)
+    monkeypatch.setattr(srv.health_monitor, "fabric_topology", m.fabric_topology)
+    assert srv._health_payload()["fabric_topology"]["accepted_ports"] == [_LOST_PORT]
+
+
+@pytest.mark.asyncio
+async def test_a_moved_tray_lift_excuses_no_port(topo, monkeypatch):  # noqa: F811
+    m, state = topo
+    monkeypatch.setenv(ACCEPT, _LOST_PORT)
+    ok, _ = await m._verify_fabric_health_body(60)
+    assert ok is True and m.fabric_topology["accepted_ports"] == []
+    assert dict(state["events"])["fabric_topology_mismatch"]["accepted_ports"] == []
+
+
 def test_health_names_the_ports(monkeypatch):
     topology = {"verdict": "failed", "missing_ports": [_LOST_PORT], "extra_ports": [], "marker": "m"}
     monkeypatch.setattr(srv.health_monitor, "fabric_topology", topology)
@@ -497,10 +532,10 @@ async def test_a_latched_hold_whose_reset_heals_releases_only_on_a_full_pass(lat
 
 @pytest.mark.parametrize("route", ["/api/tt_device_reset", "/api/tt_device_reset_stream"])
 @pytest.mark.parametrize("heals", [True, False])
-def test_an_operator_reset_clears_the_latch_and_its_check_runs_the_fabric(monkeypatch, tmp_path, route, heals):
-    """Both operator reset routes end the latch before the reset (no broker restart needed), and the
-    post-reset check runs the fabric pass (never withheld): a clean descriptor run releases, a mismatch
-    still there reads as the lift it is and is watched by the next job."""
+def test_an_operator_reset_keeps_the_latch_and_only_a_clean_fabric_pass_ends_it(monkeypatch, tmp_path, route, heals):
+    """Spec 03 I78: both operator reset routes keep the I42 latch through the reset, and the post-reset
+    check runs the fabric pass (never withheld): a clean descriptor run ends the latch and releases, a
+    mismatch still there FAILS under the latch and keeps the hold (never a watched lift)."""
     from starlette.testclient import TestClient
 
     from tests.conftest import fsm_dirty
@@ -526,10 +561,16 @@ def test_an_operator_reset_clears_the_latch_and_its_check_runs_the_fabric(monkey
     fsm_dirty(srv, f"job 7: {_latch(m)}", why=srv.FABRIC_RELIFT_WHY)
     TestClient(srv.build_asgi_app(srv.create_mcp_server())).post(route, json={"force": False})
     assert st["resets"], "the reset ran"
-    assert "fabric_topology_hw_fault_cleared" in st["events"]
-    assert m.topology_hw_fault == ""
     assert st["verifies"] == [True], "the post-reset check runs the fabric pass"
     ok, detail = st["fabric"][-1]
     assert "withheld" not in detail
-    assert ok is True and srv.fsm.state is ServerState.HEALTHY
-    assert m.topology_lift_pending is (not heals), "a mismatch left after the reset is a watched lift"
+    assert m.topology_lift_pending is False, "never a watched lift onto the links in doubt"
+    if heals:
+        assert ok is True and srv.fsm.state is ServerState.HEALTHY
+        assert m.topology_hw_fault == "", "the clean pass ends the latch"
+        assert "fabric_topology_hw_fault_cleared" in st["events"]
+    else:
+        assert ok is False, "a mismatch under the latch FAILS"
+        assert srv.fsm.state is not ServerState.HEALTHY, "the hold stays"
+        assert m.topology_hw_fault, "the latch stands"
+        assert "fabric_topology_hw_fault_cleared" not in st["events"]

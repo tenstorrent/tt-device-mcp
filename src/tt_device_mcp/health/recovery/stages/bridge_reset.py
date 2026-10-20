@@ -15,6 +15,11 @@ from tt_device_mcp import privileges
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitors import pci
 
+_BDF_RE = r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]"
+# After a Secondary Bus Reset release the link must retrain before a rescan reads config space
+# (PCIe: at least 100 ms); every SBR here waits this long before its rescan.
+SBR_RETRAIN_SETTLE_SEC = 1.0
+
 
 def bridge_reset_enabled() -> bool:
     """Whether this process can issue a Secondary Bus Reset (spec 04 I17).
@@ -60,23 +65,21 @@ def reset_chip_via_bridge(idx: str, bdf: str) -> Optional[bool]:
     surgical: the other 31 chips never see it, and the inter-chip fabric survives (measured
     — a traffic pass still passes afterwards).
 
-    Reached the endpoint two ways. A chip that only reads all-ones still HAS its own sysfs
-    node, so its bridge is the parent of that node. One that has fully left the bus does not —
-    the node and the parent link are gone with it — so, WHEN OPTED IN, fall back to finding the
-    bridge by the secondary bus it still points at; that is what lets a link-dropped chip be
-    reset too, not only one that stayed enumerated. With the opt-in off the parent walk is the
-    only path, so a node-less endpoint yields no bridge and this returns without firing a reset —
-    the prior behavior. Rescans the bus afterwards to bring the endpoint back.
+    Reaches the bridge three ways. A chip still enumerated has its own sysfs node, so its bridge
+    is the parent of that node. A chip the broker removed itself (isolate_chip — the all-ones
+    chips, which is how this rung normally finds them) has no node any more: its bridge is the one
+    isolate_chip recorded before the remove, used only while that record still holds (spec 04
+    I69, recorded_bridge). One that left the bus on its own has no node and no record — so, WHEN
+    OPTED IN, fall back to finding the bridge by the secondary bus it still points at. With the
+    opt-in off such an endpoint yields no bridge and this returns without firing a reset. Rescans
+    the bus afterwards to bring the endpoint back.
     """
-    bdf_re = r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]"
-    bridge = None
-    try:
-        bridge = (pci.PCI_DEVICES_DIR / bdf).resolve().parent.name
-    except OSError:
-        bridge = None
-    if not re.fullmatch(bdf_re, bridge or ""):
-        bridge = find_bridge_by_secondary_bus(bdf) if gone_chip_bridge_reset_enabled() else None
-    if not bridge or not re.fullmatch(bdf_re, bridge):
+    bridge = pci.parent_bridge(bdf)
+    if not bridge and pci.removed_chip(idx):
+        bridge = recorded_bridge(idx)
+    if not bridge and gone_chip_bridge_reset_enabled():
+        bridge = find_bridge_by_secondary_bus(bdf)
+    if not bridge or not re.fullmatch(_BDF_RE, bridge):
         # No bridge to write to — a topology fact (a node-less endpoint with the opt-in off is
         # the deliberate no-op), not a broken capability. Still journal it: the gentlest rung
         # not firing is never silent, but reason=no_bridge reads apart from a setpci that was
@@ -84,6 +87,83 @@ def reset_chip_via_bridge(idx: str, bdf: str) -> Optional[bool]:
         # absent bridge and no-ops again — the caller must fall to the next rung, not spin here.
         health_event("bridge_reset_failed", chip=idx, bdf=bdf, reason="no_bridge")
         return None
+    fired = secondary_bus_reset(idx, bridge)
+    if not fired:
+        return fired
+    try:
+        time.sleep(SBR_RETRAIN_SETTLE_SEC)
+        Path("/sys/bus/pci/rescan").write_text("1")
+        # The endpoint has to re-enumerate and the driver rebind before it is usable.
+        for _ in range(20):
+            time.sleep(0.5)
+            if (pci.SYSFS_CLASS_DIR / f"tenstorrent!{idx}").exists():
+                pci.forget_removed_chip(idx)
+                return True
+        health_event("bridge_reset_failed", chip=idx, bridge=bridge, reason="endpoint_not_reenumerated")
+        return False
+    except OSError as e:
+        health_event("bridge_reset_failed", chip=idx, bridge=bridge, reason="setpci_write_error", error=str(e))
+        return False
+
+
+def reset_removed_chip(idx: str) -> Optional[bool]:
+    """Fire the Secondary Bus Reset of a chip the broker removed, through its recorded bridge, and
+    do NOT rescan: the caller resets every removed chip of the pass first, waits
+    SBR_RETRAIN_SETTLE_SEC once and rescans once, so no rescan re-enumerates a removed chip that is
+    still hung (spec 04 I69). ``True`` the reset fired,
+    ``False`` a setpci write failed, ``None`` no usable bridge or no setpci."""
+    bridge = recorded_bridge(idx)
+    if not bridge:
+        rec = pci.removed_chip(idx) or {}
+        health_event("bridge_reset_failed", chip=idx, bdf=rec.get("bdf"), reason="no_bridge")
+        return None
+    return secondary_bus_reset(idx, bridge)
+
+
+def recorded_bridge(idx: str) -> Optional[str]:
+    """The bridge isolate_chip recorded for chip ``idx`` before removing it, or None.
+
+    Used only while the record still describes the bus: the bridge is still enumerated, its
+    secondary bus is the removed chip's bus and nothing is enumerated on that bus. A galaxy reset or
+    rescan since the remove can renumber buses, and a Secondary Bus Reset through a bridge that now
+    feeds live silicon would knock out a chip that never dropped — the same refusal as
+    find_bridge_by_secondary_bus. A refused record is journaled; the chip then holds and escalates.
+    """
+    rec = pci.removed_chip(idx)
+    if not rec:
+        return None
+    bridge, bdf = rec.get("bridge"), rec.get("bdf") or ""
+    m = re.fullmatch(r"([0-9a-f]{4}):([0-9a-f]{2}):[0-9a-f]{2}\.[0-9a-f]", bdf)
+    why = None
+    if not bridge or not re.fullmatch(_BDF_RE, bridge) or not m:
+        why = "no_recorded_bridge"
+    elif not (pci.PCI_DEVICES_DIR / bridge).exists():
+        why = "bridge_gone"
+    else:
+        try:
+            sec = int((pci.PCI_DEVICES_DIR / bridge / "secondary_bus_number").read_text().strip(), 10)
+        except (OSError, ValueError):
+            sec = None
+        if bridge[:4] != m.group(1) or sec != int(m.group(2), 16):
+            why = "bridge_renumbered"
+        else:
+            try:
+                live = [
+                    d.name for d in pci.PCI_DEVICES_DIR.iterdir() if d.name.startswith(f"{m.group(1)}:{m.group(2)}:")
+                ]
+            except OSError:
+                live = ["unreadable"]
+            if live:
+                why = "bus_occupied"
+    if why:
+        health_event("recorded_bridge_refused", chip=idx, bdf=bdf, bridge=bridge, reason=why)
+        return None
+    return bridge
+
+
+def secondary_bus_reset(idx: str, bridge: str) -> Optional[bool]:
+    """Assert, hold and release Secondary Bus Reset on ``bridge``. ``True`` it fired; ``False`` a
+    setpci call failed (journaled); ``None`` setpci is not on PATH."""
     try:
         cur = subprocess.run(["setpci", "-s", bridge, "BRIDGE_CONTROL"], capture_output=True, text=True, timeout=15)
     except FileNotFoundError:
@@ -146,15 +226,7 @@ def reset_chip_via_bridge(idx: str, bdf: str) -> Optional[bool]:
                 host_at_risk=True,
             )
             return False
-        time.sleep(1.0)
-        Path("/sys/bus/pci/rescan").write_text("1")
-        # The endpoint has to re-enumerate and the driver rebind before it is usable.
-        for _ in range(20):
-            time.sleep(0.5)
-            if (pci.SYSFS_CLASS_DIR / f"tenstorrent!{idx}").exists():
-                return True
-        health_event("bridge_reset_failed", chip=idx, bridge=bridge, reason="endpoint_not_reenumerated")
-        return False
+        return True
     except (OSError, ValueError, subprocess.SubprocessError) as e:
         health_event("bridge_reset_failed", chip=idx, bridge=bridge, reason="setpci_write_error", error=str(e))
         return False
@@ -164,8 +236,8 @@ def find_bridge_by_secondary_bus(bdf: str) -> Optional[str]:
     """The BDF of the PCI bridge whose secondary bus is this chip's bus, or None.
 
     reset_chip_via_bridge() reaches the bridge by walking the chip's own sysfs node up
-    to its parent. A chip that only reads all-ones still HAS that node; one that has
-    fully left the bus does not, and the parent link is gone with it. The bridge above
+    to its parent. A chip still enumerated HAS that node; one that has fully left the
+    bus (or that the broker removed) does not, and the parent link is gone with it. The bridge above
     it never moves — it stays enumerated with secondary_bus_number still pointing at the
     now-empty bus — so matching that attribute finds the bridge to reset without ever
     touching the vanished endpoint. Bus numbers repeat across PCI domains, so the domain
