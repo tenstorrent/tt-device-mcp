@@ -471,3 +471,87 @@ def test_a_device_holder_alone_is_named_as_such_past_the_cap():
 
 def test_the_obsolete_pending_defer_marker_is_removed_once():
     assert 'rm -f "$ROOT/pending.defer"' in _SCRIPT.read_text()
+
+
+# --- the autoupdate_apply event: a restart the update caused, traceable from the journal ----------
+
+
+def _apply_event(tmp_path, health_dir, idle="true", drained_s=0, restart_rc=0):
+    """The script from its restart on, with a stub restart that exits `restart_rc`, under the
+    broker's own journal-dir variable."""
+    text = _SCRIPT.read_text()
+    block = text[text.index("systemctl restart tt-device-broker\n") :]
+    script = (
+        f"set -u\ninstalled_sha=old111; remote_sha=new222; src_desc=test; idle={idle}; drained_s={drained_s}\n"
+        f"systemctl() {{ return {restart_rc}; }}\n" + block
+    )
+    env = {"PATH": "/usr/bin:/bin", "TT_DEVICE_MCP_HEALTH_DIR": str(health_dir)}
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
+
+
+def _events(health):
+    import json
+
+    return [json.loads(line) for line in (health / "health_events.jsonl").read_text().splitlines()]
+
+
+def test_apply_appends_one_autoupdate_apply_event_in_the_broker_schema(tmp_path):
+    health = tmp_path / "health"
+    health.mkdir()
+    (health / "health_events.jsonl").write_text('{"kind": "x"}\n')
+    done = _apply_event(tmp_path, health, idle="false", drained_s=37)
+    assert done.returncode == 0, done.stderr
+    recs = _events(health)
+    assert len(recs) == 2
+    rec = recs[1]
+    assert rec["kind"] == "autoupdate_apply"
+    assert (rec["from_sha"], rec["to_sha"], rec["idle"], rec["drained_s"]) == ("old111", "new222", False, 37)
+    assert rec["restart_rc"] == 0 and "broker restarted at new222" in done.stderr, done.stderr
+    assert isinstance(rec["ts"], float) and rec["iso"].endswith("Z") and len(rec["iso"]) == 20
+
+
+def test_a_failed_restart_is_recorded_as_failed(tmp_path):
+    """No `set -e`: a failed restart still reaches the event, which must not read as a clean apply."""
+    health = tmp_path / "health"
+    health.mkdir()
+    done = _apply_event(tmp_path, health, restart_rc=5)
+    (rec,) = _events(health)
+    assert rec["kind"] == "autoupdate_apply" and rec["restart_rc"] == 5, rec
+    assert "broker restart at new222 failed (rc=5" in done.stderr, done.stderr
+    assert "broker restarted at" not in done.stderr, done.stderr
+
+
+def test_the_event_goes_to_the_brokers_journal_dir():
+    """The broker's journal override (spec 06), not a second deploy-only name for the same dir."""
+    statements = [s for s in _SCRIPT.read_text().splitlines() if s.startswith("EVENTS=")]
+    assert statements == ['EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"']
+
+
+def test_a_failed_event_write_only_warns(tmp_path):
+    done = _apply_event(tmp_path, tmp_path / "missing")
+    assert done.returncode == 0
+    assert "warning: could not append autoupdate_apply" in done.stderr
+
+
+def _recorded_lap(tmp_path, **kw):
+    """The real gate and last look against the model broker; the stub restart records what the
+    event would carry."""
+    rec = tmp_path / "lap"
+    on_restart = f'\non_restart() {{ echo "idle=$idle drained_s=$drained_s" > {rec}; }}\n'
+    done, trace, _ = _drain(tmp_path, stand_ins=on_restart, **kw)
+    assert done.returncode == 0, done.stderr
+    assert trace[-1].startswith("restart held "), trace
+    return rec.read_text().strip()
+
+
+def test_an_idle_lap_reports_idle_and_no_drain(tmp_path):
+    assert _recorded_lap(tmp_path, running=0, queue=0, install="") == "idle=true drained_s=0"
+
+
+def test_a_lap_that_drains_reports_busy_and_its_drain_time(tmp_path):
+    assert _recorded_lap(tmp_path, running=4, queue=2, install="") == "idle=false drained_s=10"
+
+
+def test_a_wait_at_the_restart_point_adds_to_the_drain_time(tmp_path):
+    lap = _recorded_lap(tmp_path, running=0, queue=0, install="echo 30 > $M/running")
+    assert lap == "idle=false drained_s=140"
