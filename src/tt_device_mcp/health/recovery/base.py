@@ -26,6 +26,7 @@ from tt_device_mcp.health import chip_state
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
 from tt_device_mcp.health.evidence import health_dir, health_event
+from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.monitors.heartbeat import returned_chips
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
@@ -357,6 +358,7 @@ def drop_returned_isolated(isolated: set, context: str, log=None) -> list:
     back = returned_chips(isolated)
     for c in back:
         isolated.discard(c)
+        pci.forget_removed_chip(c)
     if back:
         health_event("isolated_chips_returned", chips=back, context=context, still_isolated=sorted(isolated, key=int))
         if log:
