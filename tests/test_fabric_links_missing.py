@@ -523,9 +523,7 @@ async def _idle_tick():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("heals", [True, False], ids=["reset-heals", "ports-stay-missing"])
-async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_once(
-    monkeypatch, latched_mesh, heals
-):
+async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_once(monkeypatch, latched_mesh, heals):
     """03 I42 with I68 (class D time to recover): a dirty mark on the latched hold (the failed job's own)
     keeps its why, so the read-only relift bails on it and, with nothing queued, it waited for the
     600 s bound. Now the first idle tick runs the post-job gate, fabric forced: the reset with no
