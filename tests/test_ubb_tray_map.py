@@ -764,6 +764,42 @@ async def test_the_last_chance_sweep_labels_each_tray_from_the_map(monkeypatch, 
     assert [f["ubb_bitmap"] for k, f in events if k == "ubb_reset_fired"] == [0x08]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "off, tray, mask, pci",
+    [("27", 4, 0x08, "0000:84:00.0"), ("6", 1, 0x01, "0000:07:00.0")],
+)
+async def test_the_last_chance_sweep_names_the_chip_it_re_powers_a_tray_for(
+    monkeypatch, galaxy_seen, clear_job_state, off, tray, mask, pci
+):
+    """A chip that dropped and came back early in a hold (chip 6, tray 1) must not read as the one a
+    later sweep re-powers a tray for, when a mesh reset left another chip off (chip 27, tray 4). The
+    sweep reads the off-bus set fresh from the heartbeats, re-powers only that chip's tray, and its
+    line and event name the chip, its PCI address and its tray."""
+    lines = []
+    fired = []
+    g, events = _sweep_stubs(monkeypatch, lambda bitmap, ids: fired.append(bitmap))
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32) if str(i) != off})
+
+    ok = await g._settle_and_verify_before_host_rung(32, lines.append, "idle-escalation")
+
+    assert ok is True
+    assert fired == [mask]
+    sweep = [f for k, f in events if k == "last_chance_reset_sweep"]
+    assert len(sweep) == 1, events
+    assert sweep[0]["trays"] == [tray]
+    assert sweep[0]["off_bus_chips"] == [{"chip": int(off), "pci": pci, "tray": tray}]
+    assert any(f"off the bus now: chip {off} ({pci}, tray {tray})" in line for line in lines), lines
+
+
+def test_the_off_bus_placement_marks_what_the_map_cannot_place():
+    """A chip with no banked address or no tray reads '?', never a guess."""
+    placement = galaxy._offbus_placement({"3", "40"}, {3: "0000:04:00.0"}, {1: [3]})
+    assert placement == [{"chip": 3, "pci": "0000:04:00.0", "tray": 1}, {"chip": 40, "pci": None, "tray": None}]
+    assert galaxy._placement_text(placement) == "chip 3 (0000:04:00.0, tray 1), chip 40 (?, tray ?)"
+    assert galaxy._placement_text([]) == "none"
+
+
 # --- the Wormhole snapshot suffix must not disable the rung ------------------------------------
 
 

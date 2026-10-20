@@ -943,6 +943,23 @@ def _affected_trays(offbus_chips: set, expected: int, tray_map: Optional[dict]) 
     return sorted({tray for tray, chips in tray_map.items() if ids & set(chips)})
 
 
+def _offbus_placement(offbus_chips, chip_buses, tray_map: Optional[dict]) -> list:
+    """Each off-bus chip a sweep plans around, as ``{"chip", "pci", "tray"}`` sorted by chip: the
+    PCI address from the banked map and the tray from ``tray_map`` (None where either is unknown).
+    The sweep's line and event carry it so a reader can check the trays it re-powers against the
+    chips that drove them; without it a chip that came back earlier in the hold reads as the one
+    the sweep was for. Pure."""
+    tray_of = {c: t for t, chips in (tray_map or {}).items() for c in chips}
+    buses = chip_buses if isinstance(chip_buses, Mapping) else {}
+    ids = sorted({int(c) for c in offbus_chips or () if str(c).isdigit()})
+    return [{"chip": i, "pci": buses.get(i), "tray": tray_of.get(i)} for i in ids]
+
+
+def _placement_text(placement: list) -> str:
+    """``chip 27 (0000:84:00.0, tray 4)``, comma-joined; ``?`` for an unknown address or tray."""
+    return ", ".join(f"chip {p['chip']} ({p['pci'] or '?'}, tray {p['tray'] or '?'})" for p in placement) or "none"
+
+
 # Issue #26 (spec 04 I19): a tray with this many chips off the bus at the FIRST sighting is a tray that
 # has lost power, not a chip that dropped. Such an onset gets one PCI rescan and a read-only capture of
 # the BMC/CPLD/PCIe state in front of the ladder; the ladder itself, and the power cycle only when the
@@ -1130,6 +1147,12 @@ class GalaxyRecovery(Recovery):
     # watchdog reads it to re-arm the window it spent, so the ladder runs once the tenant is gone
     # rather than at the next window (spec 03 I23).
     tenant_deferred: bool = False
+    # Spec 03 I75: the caller's stand-down for the escalate() now running (True while the startup gate
+    # is still to run on a startup hold), re-read at every tenant check; and whether that run stood down
+    # on it. The caller reads its predicate once before the device-op lock, and the re-adopted job can
+    # end in any read after that, so the last read is the one right before a rung acts.
+    _stand_down: Optional[Callable[[], bool]] = None
+    startup_verify_deferred: bool = False
 
     def tenant_holds(self) -> bool:
         """The forced ladders' own tenant check, alone: a running broker job or a readable tenant fd."""
@@ -1160,6 +1183,12 @@ class GalaxyRecovery(Recovery):
             # two board types is not a topology either UBB table describes.
             return None
         return _tray_map(self.deps.chip_buses_provider() or {}, board_types.pop())
+
+    def _chip_buses_now(self) -> dict:
+        """The banked ``{chip id: PCI address}`` map, or ``{}`` when none is banked or wired."""
+        if self.deps.chip_buses_provider is None:
+            return {}
+        return self.deps.chip_buses_provider() or {}
 
     def next_stage(self, ev: Evidence) -> str:
         # host_escalation/reboot_blocked are folded here, not carried on Evidence (see its own
@@ -1241,6 +1270,7 @@ class GalaxyRecovery(Recovery):
         ev: Optional[Evidence] = None,
         beats: Optional[dict] = None,
         measured_fault: bool = False,
+        stand_down: Optional[Callable[[], bool]] = None,
     ) -> str:
         """Run the next justified rung of this ladder and report the outcome, replacing the
         direct ``_escalate_stuck_hold``/``_escalate_offbus_stuck_hold`` calls the idle relift and
@@ -1283,7 +1313,33 @@ class GalaxyRecovery(Recovery):
         failure, so its reset is due without the grace (spec 03 I56; see ``_stuck_hold_reset_due``).
 
         A host reboot or power cycle still pending (spec 04 I34) stops every caller here, before
-        the prelude: nothing runs, WAITING, one log line per request."""
+        the prelude: nothing runs, WAITING, one log line per request.
+
+        ``stand_down`` (spec 03 I75) is re-read at every tenant check of this run: while it reads True
+        no rung acts, the run reports WAITING with ``tenant_deferred`` and ``startup_verify_deferred``
+        set, and the caller leaves the hold to the startup gate."""
+        self._stand_down = stand_down
+        self.startup_verify_deferred = False
+        try:
+            return await self._escalate_phase(
+                phase, indices, expected, log, stage=stage, ev=ev, beats=beats, measured_fault=measured_fault
+            )
+        finally:
+            self._stand_down = None
+
+    async def _escalate_phase(
+        self,
+        phase: str,
+        indices: list,
+        expected: int,
+        log,
+        *,
+        stage: Optional[str],
+        ev: Optional[Evidence],
+        beats: Optional[dict],
+        measured_fault: bool,
+    ) -> str:
+        """:meth:`escalate`'s body, run with its ``stand_down`` in place."""
         if self.mechanism.host_action_blocks_reset(log, context=f"escalate({phase})"):
             return OUTCOME_WAITING
         rung, _, gate_phase = phase.partition("/")
@@ -1923,11 +1979,15 @@ class GalaxyRecovery(Recovery):
 
     def _tenant_blocker(self, scan, *, force: bool = False) -> Optional[dict]:
         """Which check of :meth:`_tenant_active` blocks, as health_event fields, or None when none does:
-        ``blocker`` is ``job_running``, ``tenant`` (with the first tenant's pid, uid, user and comm) or
-        ``scan_incomplete`` (with the scan's source and gaps). A deferral that names its blocker tells a
+        ``blocker`` is ``job_running``, ``startup_verify`` (the running escalate's I75 stand-down), ``tenant``
+        (with the first tenant's pid, uid, user and comm) or ``scan_incomplete`` (with the scan's source
+        and gaps). A deferral that names its blocker tells a
         real tenant apart from a scan that merely could not see."""
         if self.deps.job_running():
             return {"blocker": "job_running"}
+        if self._stand_down is not None and self._stand_down():
+            self.startup_verify_deferred = True
+            return {"blocker": "startup_verify"}
         # The broker's own probes and the holders it killed for a dead chip are not tenants, nor is
         # a gap they leave while exiting (spec 04 I59).
         scan = discount_broker_internal(scan)
@@ -1952,6 +2012,8 @@ class GalaxyRecovery(Recovery):
         kind = blocker["blocker"]
         if kind == "job_running":
             return "a broker job is running"
+        if kind == "startup_verify":
+            return "the startup gate (full check, fabric included) runs next on this startup hold"
         if kind == "tenant":
             more = f" (+{blocker['tenants'] - 1} more)" if blocker["tenants"] > 1 else ""
             return (
@@ -2198,6 +2260,7 @@ class GalaxyRecovery(Recovery):
         # Chip ids come from the tray map (I16), not index arithmetic — bus 0x80 is tray 4 on BH
         # and index arithmetic would target the wrong silicon.
         tray_chip_ids = [c for t in trays for c in (tray_map or {}).get(t, [])]
+        placement = _offbus_placement(offbus_chips, self._chip_buses_now(), tray_map)
         swept = False
         if await asyncio.to_thread(self.mechanism.scope_active):
             log(f"last chance before the host rung{where}: a reset is already cycling in its own scope — adopting it")
@@ -2213,13 +2276,14 @@ class GalaxyRecovery(Recovery):
                     trays=trays,
                     ubb_bitmap=bitmap,
                     off_bus=len(offbus_chips or set()),
+                    off_bus_chips=placement,
                     expected=expected,
                     host_at_risk=True,
                 )
                 log(
                     f"last chance before the host rung{where}: firing every reset type back-to-back "
                     f"(SBR -> per-tray re-power of trays {trays} -> mesh reset) — nothing to lose before a "
-                    f"reboot or power cycle"
+                    f"reboot or power cycle; off the bus now: {_placement_text(placement)}"
                 )
                 swept = await self._issue_all_resets_back_to_back(
                     bitmap, tray_chip_ids, trays, expected, log, do_sbr=bool(self.deps.isolated_chips())
@@ -3395,7 +3459,7 @@ class GalaxyRecovery(Recovery):
         Bounded below by the hold ceiling: the host rungs never fire before the episode has stood the
         full ladder, however futile the gentler rungs proved — an early forced pass fires the cheap
         rungs only, and the deadline watchdog re-runs the ladder at the ceiling where the climb is
-        then admitted.
+        then admitted. The exceptions are holds with no gentler rung left to try (spec 04 I38, I79).
 
         Fires ONLY for a mass drop. The galaxy reset can drop a present-but-eth-unverifiable mesh to
         all-0xFFFFFFFF, which a reboot/power cycle recovers and self-heal never does; a still-present or
@@ -3506,37 +3570,27 @@ class GalaxyRecovery(Recovery):
                 ceiling_sec=_stuck_hold_ceiling_sec(),
                 reason="reset_and_sweep_failed" if ladder_ran else "present_mesh_reset_failed",
             )
+        elif (
+            off_bus > 0
+            and (reset_regressed or episode_regressed)
+            and hold_age is not None
+            and hold_age < _stuck_hold_ceiling_sec()
+        ):
+            # This hold's reset made the drop worse. I31 bars every reset rung but the sweep for the rest
+            # of the episode, so the ceiling wait has nothing to try: one 8-chip host's hold sat 512 s in
+            # it, then swept and power-cycled anyway. Sweep now, then the cold rung (spec 04 I79).
+            log(
+                f"this {int(hold_age)}s-old hold's reset regressed the mesh ({off_bus}/{expected} off the bus) — "
+                f"no reset rung may repeat it; not waiting for the {_stuck_hold_ceiling_sec()}s ladder end"
+            )
+            health_event(
+                "host_rung_not_deferred",
+                held_since=hold_since,
+                held_age_sec=int(hold_age),
+                ceiling_sec=_stuck_hold_ceiling_sec(),
+                reason="reset_regressed_offbus",
+            )
         elif hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
-            # Spec 04 I80: this episode's reset regressed a partial drop (a few chips, below the reboot
-            # floor). The mesh reset may not run alone again (I31), so the ceiling wait adds nothing but
-            # time; the rung that heals it is the sweep (SBR, the affected tray's re-power, the mesh
-            # reset, then the full verify, fabric included). Run it now, once before the ceiling; it is
-            # not the bound's ladder, so the ceiling climb sweeps again (I76). The host rungs still wait
-            # for the ceiling below. A sweep the tenant or a live reset scope skipped (None) has not
-            # run, so it does not use up the episode's one early try.
-            if (
-                episode_regressed
-                and not swept
-                and 0 < off_bus < _reboot_min_dead_chips(expected)
-                and self._regressed_sweep_since != hold_since
-            ):
-                health_event(
-                    "regressed_offbus_early_sweep",
-                    held_since=hold_since,
-                    held_age_sec=int(hold_age),
-                    off_bus=off_bus,
-                    expected=expected,
-                )
-                early = await self._settle_and_verify_before_host_rung(
-                    expected,
-                    log,
-                    "idle-escalation",
-                    context=f"regressed partial drop, {off_bus}/{expected} off the bus",
-                )
-                if early is True:
-                    return HOST_RUNG_DEFERRED
-                if early is False:
-                    await self._note_failed_early_sweep(hold_since, off_bus, expected, log)
             log(
                 f"mesh unrecovered after the reset ladder but the hold is only {int(hold_age)}s "
                 f"old — the host rungs (reboot/power-cycle) wait for the "
@@ -3550,6 +3604,15 @@ class GalaxyRecovery(Recovery):
             )
             return HOST_RUNG_DEFERRED
         reboot_floor = _reboot_min_dead_chips(expected)
+        # Spec 04 I80: below the 10-min mark a regressed partial drop gets one early sweep per episode. I79
+        # sweeps and climbs at once where the cold rung can fire; where it cannot (none opted in, or held
+        # off) the early sweep still runs once before the page or the denial, and is not repeated below
+        # the mark. It is not the bound's ladder, so the ceiling climb sweeps again (I76).
+        below_mark = hold_age is not None and hold_age < _stuck_hold_ceiling_sec()
+        early_sweep_spent = below_mark and self._regressed_sweep_since == hold_since
+        early_sweep_due = (
+            episode_regressed and not swept and below_mark and 0 < off_bus < reboot_floor and not early_sweep_spent
+        )
         # A below-floor off-bus drop reaching this climb is NOT self-healing: it survived the 20-min grace
         # and a reset that could not recover it. A dropped ASIC does not re-enumerate on a warm reboot (a
         # 6U-Galaxy reboot does not power-cycle the UBBs), so the cold power cycle is the only rung that can
@@ -3567,6 +3630,8 @@ class GalaxyRecovery(Recovery):
             off_bus, expected, warm_reboot_futile=warm_reboot_futile, **self.deps.host_escalation_kwargs()
         )
         if reboot_blocked:
+            if early_sweep_due and await self._regressed_early_sweep(hold_since, hold_age, off_bus, expected, log):
+                return HOST_RUNG_DEFERRED
             # No chassis power cycle is opted in and no rung can recover it: fail closed loudly and hold,
             # never fire a reboot that lands right back in the dead state. A whole-bus drop and a reset
             # that regressed/hard-failed a partial drop off the bus each need the cold rung, but name
@@ -3611,6 +3676,8 @@ class GalaxyRecovery(Recovery):
             self.mechanism._journal_auto_recovery_denied(escalation, why)
             metrics.stage_fired(_HOST_ESCALATION_STAGE.get(escalation, escalation), "blocked")
             self._host_rung_denied_why = why
+            if early_sweep_due and await self._regressed_early_sweep(hold_since, hold_age, off_bus, expected, log):
+                return HOST_RUNG_DEFERRED
             return HOST_RUNG_DENIED
         # The recorded cause names what is actually true at this point — the old fixed string
         # blamed a galaxy reset even on paths where the reset was suppressed and never ran.
@@ -3628,8 +3695,11 @@ class GalaxyRecovery(Recovery):
             health_event(
                 "reset_rung_skipped_failed_unchanged", rung="last_chance_sweep", held_since=hold_since, off_bus=off_bus
             )
-        # A failed I80 early sweep ran below the 10-min mark, so it does not stand in for the bound's
-        # ladder (spec 04 I76): the sweep runs again here, then the host rung if its full check fails.
+        elif early_sweep_spent:
+            # This episode's I80 early sweep already ran and failed below the 10-min mark: no second sweep
+            # before the mark, the cold rung now (I79). At the mark it is not the bound's ladder, so the
+            # sweep runs again there (I76), then the host rung if its full check fails.
+            log("last-chance sweep skipped: this hold's early sweep already failed below the 10-min mark")
         elif not swept and (
             await self._settle_and_verify_before_host_rung(
                 expected, log, "idle-escalation", context=f"idle escalation, {off_bus}/{expected} off the bus"
@@ -3645,6 +3715,26 @@ class GalaxyRecovery(Recovery):
         else:
             await self._auto_reboot_host(log, cause)
         return HOST_RUNG_FIRED
+
+    async def _regressed_early_sweep(
+        self, hold_since: Optional[str], hold_age: float, off_bus: int, expected: int, log
+    ):
+        """Run a spec 04 I80 early sweep (SBR, the affected tray's re-power, the mesh reset, then the full
+        verify, fabric included) and return its verdict: True healed, False failed (the episode's one early
+        try is spent), None skipped by a tenant or a live reset scope (not spent)."""
+        health_event(
+            "regressed_offbus_early_sweep",
+            held_since=hold_since,
+            held_age_sec=int(hold_age),
+            off_bus=off_bus,
+            expected=expected,
+        )
+        early = await self._settle_and_verify_before_host_rung(
+            expected, log, "idle-escalation", context=f"regressed partial drop, {off_bus}/{expected} off the bus"
+        )
+        if early is False:
+            await self._note_failed_early_sweep(hold_since, off_bus, expected, log)
+        return early
 
     async def _note_failed_early_sweep(
         self, hold_since: Optional[str], off_bus_before: int, expected: int, log

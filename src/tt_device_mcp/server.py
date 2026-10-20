@@ -54,6 +54,7 @@ from tt_device_mcp import __version__, aio, alert, device_activity, metrics, pri
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
     FABRIC_CHECK_CANNOT_CHECK_RC,
+    FABRIC_CHECK_TIMEOUT_SEC,
     GRACEFUL_KILL_GRACE_SEC,
     JOB_RETENTION_SEC,
     POST_STEP_DEADLINE_DEFAULT_SEC,
@@ -145,7 +146,6 @@ from tt_device_mcp.health import (
     isolate_chip,
     journal_interrupted_fabric_check,
     mark_boot,
-    mesh_hold_repage_sec,
     mesh_reset_hold_reason,
     note_broker_stopping,
     offbus_chip_ids,
@@ -1486,13 +1486,24 @@ device_pci_map: dict = {}
 # a reset: MMIO aimed at a chip that is mid-reset (or already dead) is what pushes
 # the root complex into the fatal error path that reboots the host. A host
 # running another unit that reads or writes the chips (a clock-cap keeper, say) names it in
-# TT_DEVICE_MCP_POLLER_SERVICES. The default lists no clock-cap keeper: a reset restarts every unit
-# it lists, which would bring back a keeper the host masked. A unit a host does not have answers
+# TT_DEVICE_MCP_POLLER_SERVICES. The default lists no clock-cap keeper, which every reset would
+# otherwise stop and restart on every host. A unit a host does not have answers
 # `systemctl` non-zero and is skipped.
 DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service"
 DEVICE_POLLER_SERVICES = tuple(
     s for s in os.environ.get("TT_DEVICE_MCP_POLLER_SERVICES", DEFAULT_POLLER_SERVICES).split(",") if s.strip()
 )
+# The pollers a quiesce found running, so the restore starts only those: a unit an operator stopped
+# on purpose stays stopped. A unit is recorded before its stop is sent and leaves the record only
+# when a start returns 0, so a stop that fails or outlasts its bound, or a start that fails, never
+# loses it. Kept across nested stops (the dead-chip path stops the pollers and the reset that
+# follows finds them already down) and on disk, so a broker restart in between loses nothing.
+# None until read from disk in this process (_pollers_restore_record).
+POLLERS_TO_RESTORE_FILE = "pollers_to_restore.json"
+_pollers_to_restore: Optional[set[str]] = None
+# `systemctl is-active` states of a unit that is running or on its way up: a crash-looping poller
+# reads "activating" between restarts, and it was running all the same.
+_POLLER_RUNNING_STATES = ("active", "activating", "reloading", "refreshing")
 logger: logging.Logger | None = None
 job_log_dir: Path | None = None
 job_runner_task: asyncio.Task | None = None  # Singleton job runner
@@ -2304,7 +2315,7 @@ def _reset_for_testing():
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
-    global _topology_hw_fault_paged, _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at
+    global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
     job_queue = None
     lock = None
@@ -2327,7 +2338,6 @@ def _reset_for_testing():
     _fabric_77_streak = 0
     _fabric_77_fallback_release_monotonic = 0.0
     _fabric_77_paged_since = None
-    _topology_hw_fault_paged = None
     _fabric_77_recheck_since = None
     _fabric_77_rechecks = 0
     _fabric_77_recheck_monotonic = 0.0
@@ -3849,8 +3859,8 @@ def _fabric_77_eth_drop() -> str:
     The validator cannot build a mesh with links missing and exits 77 instead of failing them, so a
     77 on links the eth read measured below the host's high-water mark is a down link, which the
     present-mesh rung (a galaxy reset, then the full post-reset check) can fix; waiting out the 77
-    bound only delays it. Not for a known cable fault (a 78), a topology mismatch or fault, or a
-    missing prerequisite (hugepages, the validator): no reset fixes those."""
+    bound only delays it. Not for a known cable fault (a 78), a topology mismatch, or a missing
+    prerequisite (hugepages, the validator): no reset fixes those."""
     drop = health_monitor.last_eth_link_drop if health_monitor is not None else ""
     if not drop or _fabric_77_no_reset_cause():
         return ""
@@ -3858,10 +3868,16 @@ def _fabric_77_eth_drop() -> str:
 
 
 def _fabric_77_no_reset_cause() -> bool:
-    """Whether the 77 has a cause no reset fixes: a known cable fault (a 78), a topology mismatch or
-    fault, or a missing prerequisite (hugepages, the validator)."""
-    if health_monitor.known_fabric_fault() or health_monitor.topology_hw_fault:
+    """Whether the 77 has a cause no reset fixes: a known cable fault (a 78), a topology mismatch, or
+    a missing prerequisite (hugepages, the validator). Not the I42 latch: its first job measured the
+    fabric bad, so it takes the ladder, and a 77 after its reset still climbs to the host rung. The
+    latch is read before the mismatch checks, as _fabric_no_reset_hold reads it: the latched hold's
+    detail and its post-reset output (the traffic-only rerun keeps the descriptor run's mismatch
+    line) both name the mismatch, and either would park the hold with no host rung."""
+    if health_monitor.known_fabric_fault():
         return True
+    if health_monitor.topology_hw_fault:
+        return False
     if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
         return True
     if _validator_line_names_topology(health_monitor.last_fabric_output or ""):
@@ -3972,13 +3988,13 @@ def _env_int(name: str, default: int, floor: int) -> int:
         return default
 
 
-# The hardware fault the first job after a topology-mismatch lift names is a hold no fallback release
-# may lift: that job proved the links the traffic-only pass skipped are needed, and enum+ARC and the
-# eth read cannot see them. It stays outside the I40 budget and release. A topology mismatch whose
+# The hardware fault the first job after a topology-mismatch lift names (the I42 latch) is a hold no
+# fallback release may lift: that job proved the links the traffic-only pass skipped are needed, and
+# enum+ARC and the eth read cannot see them. It is a measured fault, never a no-reset topology hold:
+# it takes the ladder, and only a full post-reset pass releases it. A topology mismatch whose
 # traffic-only rerun could not run is inside the bound (I45): its eth read is judged against the
 # link mark re-baselined for this chip-to-bus map, and a release is watched like a lift.
 _TOPOLOGY_HOLD = "topology mismatch"
-_TOPOLOGY_HW_FAULT = "hardware fault: the first job after a topology-mismatch lift"
 # The validator's own line for it, which reaches the broker as a 77 ("COULD NOT RUN") wherever the
 # topology-mismatch path has not relabelled it yet.
 _TOPOLOGY_VALIDATOR_LINE = "Connection mismatch detected"
@@ -3986,10 +4002,11 @@ _TOPOLOGY_VALIDATOR_LINE = "Connection mismatch detected"
 
 def _names_topology_mismatch(text: str) -> bool:
     # A dispatch failure on a green fabric is a measured fault, never a topology hold (spec 04 I30),
-    # even when the descriptor run before it downgraded a "Connection mismatch detected" line.
-    if fabric.names_dispatch_failure(text):
+    # even when the descriptor run before it downgraded a "Connection mismatch detected" line. Nor
+    # is a pass that found descriptor ports missing (spec 03 I71): that is a failed check.
+    if fabric.names_dispatch_failure(text) or fabric.names_links_missing(text):
         return False
-    return text.startswith(_TOPOLOGY_HOLD) or _TOPOLOGY_HW_FAULT in text or _TOPOLOGY_VALIDATOR_LINE in text
+    return text.startswith(_TOPOLOGY_HOLD) or _TOPOLOGY_VALIDATOR_LINE in text
 
 
 def _eth_timeout_reset_shape(evidence: dict) -> bool:
@@ -4033,48 +4050,23 @@ def _kill_reset_debt() -> str:
 
 def _validator_line_names_topology(output: str) -> bool:
     """The validator's mismatch line in the last fabric output, unless the dispatch probe after it
-    failed: then the wrapper's verdict is the dispatch failure (spec 04 I30)."""
-    return _TOPOLOGY_VALIDATOR_LINE in output and not fabric.names_dispatch_failure(output)
+    failed: then the wrapper's verdict is the dispatch failure (spec 04 I30), or the pass found
+    descriptor ports missing: then the verdict is that failure (spec 03 I71)."""
+    return (
+        _TOPOLOGY_VALIDATOR_LINE in output
+        and not fabric.names_dispatch_failure(output)
+        and not fabric.names_links_missing(output)
+    )
 
 
 def _hold_details(evidence: dict) -> tuple[str, str]:
     return str(fsm.record.detail or ""), str((evidence.get("fabric") or {}).get("detail") or "")
 
 
-# (hold episode since, monotonic time of its last page) of the I42 first-job hardware-fault hold. That
-# hold stands until an operator restarts the broker, so its page is its only bound: see
-# _repage_topology_hw_fault.
-_topology_hw_fault_paged: Optional[tuple[str, float]] = None
-
-
-def _repage_topology_hw_fault() -> None:
-    """I42: page a standing first-job hardware-fault hold again every mesh_hold_repage_sec() (0: never
-    again). Called on each idle-relift pass that holds. The fault's own page counts for the episode it
-    opened; a page the hook dropped is tried on the next pass, and a new hold episode pages anew."""
-    global _topology_hw_fault_paged
-    fault = health_monitor.topology_hw_fault if health_monitor is not None else ""
-    if not fault:
-        return
-    since = fsm.record.since
-    last: Optional[float] = None
-    if _topology_hw_fault_paged is not None and _topology_hw_fault_paged[0] == since:
-        last = _topology_hw_fault_paged[1]
-    elif _topology_hw_fault_paged is None and health_monitor.topology_hw_fault_paged:
-        last = health_monitor.topology_hw_fault_paged
-        _topology_hw_fault_paged = (since, last)
-    repage = mesh_hold_repage_sec()
-    if last is not None and (repage == 0 or time.monotonic() - last < repage):
-        return
-    event = {"kind": "fabric_topology_hw_fault", "detail": fault, "held_since": since, "repage": last is not None}
-    if alert.send_alert(event, logger) is not None or alert.alert_argv() is None:
-        _topology_hw_fault_paged = (since, time.monotonic())
-
-
-def _topology_hw_fault_hold(evidence: dict) -> bool:
-    # A known fabric fault (03 I46) is outside the I40 bound too: its release is what failed.
-    if health_monitor is not None and health_monitor.known_fabric_fault():
-        return True
-    return bool(health_monitor.topology_hw_fault) or any(_TOPOLOGY_HW_FAULT in d for d in _hold_details(evidence))
+def _known_fabric_fault_hold() -> bool:
+    # A known fabric fault (03 I46) is outside the I40 bound: its release is what failed. The I42
+    # first-job latch is not: its check runs and fails, so it takes the ladder.
+    return health_monitor is not None and bool(health_monitor.known_fabric_fault())
 
 
 def _fabric_no_reset_hold() -> str:
@@ -4084,10 +4076,14 @@ def _fabric_no_reset_hold() -> str:
     validator's mismatch line) is cabling that differs from the descriptor; a fabric pass that could
     not run (a 77) with no fault measured or reported is a missing verdict. The caller has already
     read every chip present with a live ARC heartbeat, so a reset has nothing to fix in either case.
-    A measured-bad fabric or a runtime-reported fault is not this: those keep the ladder."""
+    A measured-bad fabric or a runtime-reported fault is not this: those keep the ladder. Nor is the
+    I42 latch: its first job measured the fault, so a mismatch line the lift left in the last
+    fabric output names no cabling-only hold, and the 10-min watchdog runs the reset."""
     fabric_hold = fsm.record.why == FABRIC_RELIFT_WHY
     if fabric_hold and not device_fault_reported and health_monitor.known_fabric_fault():
         return "known fabric fault"
+    if health_monitor.topology_hw_fault:
+        return ""
     if _names_topology_mismatch(str(fsm.record.detail or "")) or _names_topology_mismatch(device_hold_episode_reason):
         return "topology mismatch"
     if fabric_hold and _validator_line_names_topology(health_monitor.last_fabric_output or ""):
@@ -4369,7 +4365,9 @@ async def _attempt_idle_relift() -> None:
                 there would outlive every ceiling with no rung ever attempted. ``measured_fault``
                 lets the present ladder reset without the grace (spec 03 I56)."""
                 _void_fabric_ok(f"idle relift: {rung}")
-                outcome = await galaxy_recovery.escalate(rung, indices, expected, _log, measured_fault=measured_fault)
+                outcome = await galaxy_recovery.escalate(
+                    rung, indices, expected, _log, measured_fault=measured_fault, stand_down=_startup_verify_owns_hold
+                )
                 _fold_rung_outcome(outcome, _log)
                 return outcome != OUTCOME_WAITING
 
@@ -4386,11 +4384,18 @@ async def _attempt_idle_relift() -> None:
                 # and pay a reset (spec 03 I43). Only a verify that fails falls through to the ceiling.
                 if fsm.record.why == "foreign_holder" and await _foreign_holder_fast_verify(expected, _log):
                     return
+                if _startup_verify_owns_hold():
+                    return  # spec 03 I75: the startup gate runs on this hold next, no reset first
                 drop = _fabric_77_eth_drop() if fsm.record.why == FABRIC_RELIFT_WHY else ""
                 if drop:
                     _log(f"fabric 77 with eth links measured down ({drop}) — a fault: the present-mesh rung")
-                if await _escalate("present"):
+                # The I42 latch: the lift's first job measured the fabric bad, so the reset runs
+                # now, without the grace, and its full post-reset check decides (I56).
+                latched = fsm.record.why == FABRIC_RELIFT_WHY and bool(health_monitor.topology_hw_fault)
+                if await _escalate("present", measured_fault=latched):
                     return
+                if galaxy_recovery.startup_verify_deferred:
+                    return  # spec 03 I75: the re-adopted job ended inside the ladder; the gate runs next
                 _log(
                     "held-unverified and no read-only check clears this hold class — holding; "
                     "escalates to the gate's galaxy reset once idle past the ceiling"
@@ -4453,7 +4458,7 @@ async def _attempt_idle_relift() -> None:
                 if (
                     fabric_ok is None
                     and _fabric_77_only_hold()
-                    and not _topology_hw_fault_hold(evidence)
+                    and not _known_fabric_fault_hold()
                     and _fabric_77_bound_reached()
                 ):
                     # I40: a pass that cannot run is retried a bounded number of times, never
@@ -4462,8 +4467,16 @@ async def _attempt_idle_relift() -> None:
                         evidence, _log, _escalate, retried=_eth_rearm_retries != retries_at_start
                     ):
                         return
+                if (
+                    fabric_ok is False
+                    and health_monitor.last_fabric_ok is False
+                    and await _escalate("present", measured_fault=True)
+                ):
+                    # The relift's own pass MEASURED the fabric bad (the I42 latch's mismatch, I71's
+                    # missing ports): the fault is proven, so the present-mesh rung runs now and its
+                    # full post-reset check decides, as on an eth_frozen hold (I56).
+                    return
                 if fabric_ok is not True:
-                    _repage_topology_hw_fault()
                     _log(
                         f"fabric still could not verify on retry ({fabric_ok!r}) — holding; "
                         "the door never reopens onto unverified fabric"
@@ -5305,6 +5318,34 @@ def _pollers_unfit_reason() -> Optional[str]:
     return f"fabric unverified since {debt}" if debt else None
 
 
+def _pollers_restore_record() -> set[str]:
+    """The pollers owed a restore (see _pollers_to_restore), read from disk once per process. An
+    unreadable record reads as empty: the restore then starts only what the next stop finds running."""
+    global _pollers_to_restore
+    if _pollers_to_restore is None:
+        try:
+            names = json.loads((health_dir() / POLLERS_TO_RESTORE_FILE).read_text())
+            _pollers_to_restore = {n for n in names if isinstance(n, str)}
+        except (OSError, ValueError, TypeError):
+            _pollers_to_restore = set()
+    return _pollers_to_restore
+
+
+def _note_poller_to_restore(svc: str, owed: bool) -> None:
+    """Add (or, after a start that returned 0, drop) one poller in the restore record, on disk too."""
+    record = _pollers_restore_record()
+    if (svc in record) == owed:
+        return
+    (record.add if owed else record.discard)(svc)
+    path = health_dir() / POLLERS_TO_RESTORE_FILE
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sorted(record)))
+        os.replace(tmp, path)
+    except OSError:
+        pass  # never let bookkeeping break a reset; the record in memory still holds
+
+
 async def _set_device_pollers(active: bool, log) -> list[str]:
     """Stop (or restart) the daemons that continuously poll every chip.
 
@@ -5313,6 +5354,9 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
     endpoint are what drive the root complex past its error threshold — at which
     point firmware-first RAS resets the whole host. Quiescing them is the
     difference between a 60s device reset and an ungraceful reboot.
+
+    The restore starts only the pollers the stop found running: a poller an operator
+    stopped on purpose, or one this host does not have, is left as it was.
 
     Best-effort by design: a poller we cannot stop must not block the recovery.
     """
@@ -5333,31 +5377,69 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
             return []
         _pollers_owed = None
     verb = "start" if active else "stop"
-    touched = []
-    for svc in DEVICE_POLLER_SERVICES:
-        try:
-            proc = await asyncio.create_subprocess_exec(
+    record = _pollers_restore_record()
+    # The stop asks every configured unit; the restore only the ones a stop found running.
+    services = [s for s in DEVICE_POLLER_SERVICES if s in record] if active else DEVICE_POLLER_SERVICES
+
+    async def _apply(svc: str, stage: list) -> Optional[int]:
+        if not active and svc not in record:
+            stage[0] = "probe"
+            probe = await asyncio.create_subprocess_exec(
                 "systemctl",
-                verb,
+                "is-active",
                 svc,
-                stdout=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await aio.wait_for(proc.wait(), timeout=30)
-            if proc.returncode == 0:
-                touched.append(svc)
+            out, _ = await probe.communicate()
+            state = out.decode(errors="replace").strip()
+            # Recorded before the stop is sent: a stop that hangs on a wedged chip still owes a start.
+            # No state read at all counts as running, as every unit did before this record existed.
+            if state in _POLLER_RUNNING_STATES or not state:
+                _note_poller_to_restore(svc, True)
+        stage[0] = verb
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl",
+            verb,
+            svc,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        return proc.returncode
+
+    touched = []
+    for svc in services:
+        stage = [""]
+        try:
+            # One bound for the state probe and the verb together, so the documented worst case holds.
+            rc = await aio.wait_for(_apply(svc, stage), timeout=30)
         except (asyncio.TimeoutError, OSError, ValueError):
-            continue
+            rc = None
+            if stage[0] == "probe":
+                _note_poller_to_restore(svc, True)  # state unknown: restore it, as before
+        if rc == 0:
+            touched.append(svc)
+            if active:
+                _note_poller_to_restore(svc, False)
+        elif not active and svc in record:
+            # Running, and its stop failed or is still running (systemd finishes it): the inline
+            # restore may be skipped when no stop returned 0, so the next close to HEALTHY starts it.
+            _owe_device_pollers(f"{svc} stop did not complete")
     if touched:
         log(f"{'restarted' if active else 'stopped'} device pollers: {', '.join(touched)}")
-    elif DEVICE_POLLER_SERVICES:
+    if active:
+        left = [s for s in DEVICE_POLLER_SERVICES if s not in services]
+        if left:
+            log(f"left device pollers stopped (not running before the stop): {', '.join(left)}")
+    if not touched and services:
         # Pollers were configured, yet the verb reached none of them: on this host they resolve
         # to no active unit. Quiescing was a no-op, so a reset about to run cannot assume it lands
         # on a quiet bus — the real pollers may still be hammering MMIO under a name we were never
         # told. On the stop path that is the host-reboot hazard the quiesce exists to prevent, so
         # flag it host_at_risk; either way, do not let the absence read as a clean quiesce.
-        log(f"WARNING: no configured device poller answered '{verb}': " f"{', '.join(DEVICE_POLLER_SERVICES)}")
-        health_event("pollers_none_active", verb=verb, configured=list(DEVICE_POLLER_SERVICES), host_at_risk=not active)
+        log(f"WARNING: no configured device poller answered '{verb}': " f"{', '.join(services)}")
+        health_event("pollers_none_active", verb=verb, configured=list(services), host_at_risk=not active)
     health_event("pollers_" + ("restarted" if active else "quiesced"), services=touched)
     return touched
 
@@ -6953,6 +7035,11 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         payload["hold_bound"] = _hold_bound_health(now)
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
+    # Spec 03 I71: the descriptor's port connections the last fabric pass found missing or extra, by
+    # name; null after a clean pass on the full topology.
+    payload["fabric_topology"] = (getattr(health_monitor, "fabric_topology", None) or None) if health_monitor else None
+    # Spec 03 I71: the ports an operator accepted as dead, so a lift on them is never silent.
+    payload["fabric_accepted_missing_ports"] = sorted(fabric.accepted_missing_ports())
     # Spec 04 I70: an unkillable leftover fencing every reset, with its deadline and rung stage.
     payload["leftover_fence"] = _leftover_fence_payload()
     return payload
@@ -7116,6 +7203,9 @@ async def _force_escalate_stuck_hold() -> None:
     ):
         _defer_offbus_one_shot_to_tenant_bound()  # quietly: no device op, no event, no rung
         return
+    if _startup_verify_owns_hold(kind):
+        _defer_to_startup_verify(kind, log)
+        return
     async with _device_op("hold-deadline-escalate"):
         if await asyncio.to_thread(recovery_mechanism.scope_active):
             if past_bound:
@@ -7142,6 +7232,11 @@ async def _force_escalate_stuck_hold() -> None:
         if expected <= 0:
             return
         beats = await asyncio.to_thread(_decision_heartbeats)
+        if _startup_verify_owns_hold(kind):
+            # Spec 03 I75, re-read under the lock after this run's reads: the re-adopted job can have
+            # ended since the check before the lock. The ladder re-reads it at its tenant check too.
+            _defer_to_startup_verify(kind, log)
+            return
         off_bus = _offbus_count(beats, expected)
         no_reset = "" if off_bus or isolated_chips else _fabric_no_reset_hold()
         if no_reset:
@@ -7160,6 +7255,9 @@ async def _force_escalate_stuck_hold() -> None:
                 await _hold_bound_host_rung(held_age, log)
                 return
             leftover = await asyncio.to_thread(_reaped_leftover_reason)
+            if _startup_verify_owns_hold(kind):
+                _defer_to_startup_verify(kind, log)  # spec 03 I75: re-read after the leftover scan
+                return
             if leftover:
                 # A killed job's process still holds the device (spec 01 I16): every rung's reset is
                 # fenced and only a host rung clears it, so the bound asks for that rung now.
@@ -7202,8 +7300,15 @@ async def _force_escalate_stuck_hold() -> None:
         _void_fabric_ok("hold escalation")
         device_hold_tenant_deferred = False
         outcome = await galaxy_recovery.escalate(
-            "offbus-forced" if off_bus > 0 else "present-forced", indices, expected, log
+            "offbus-forced" if off_bus > 0 else "present-forced",
+            indices,
+            expected,
+            log,
+            stand_down=lambda: _startup_verify_owns_hold(kind),
         )
+        if outcome == OUTCOME_WAITING and galaxy_recovery.startup_verify_deferred:
+            _defer_to_startup_verify(kind, log, journaled=True)  # spec 03 I75: the job ended inside the ladder
+            return
         stood_down = outcome == OUTCOME_WAITING and galaxy_recovery.tenant_deferred
         if not stood_down:
             _note_hold_bound_ladder(held_age, outcome)  # a run that stood down on a tenant ran no rung
@@ -7358,12 +7463,14 @@ def _hold_bound_cycle_due(age: float) -> bool:
 
 
 def _lift_hold_bound_latches(log) -> None:
-    """At the bound, the latches that withhold or skip the fabric check (spec 03 I42's topology
-    hardware fault, I46's known fabric fault) are lifted, so the check after the ladder gets a real
-    verdict and only a pass releases. A job that fails the same way declares them again."""
+    """At the bound, the latch that skips the fabric check (spec 03 I46's known fabric fault) is lifted,
+    so the check after the ladder gets a real verdict and only a pass releases. A job that fails the
+    same way declares it again. Spec 03 I42's topology hardware fault stays: it withholds nothing, it
+    makes a mismatch FAIL the check, so lifting it would let the post-ladder check pass on the links the
+    lift's first job already failed on and release the device onto them."""
     if health_monitor is None:
         return
-    for name in ("topology_hw_fault", "fabric_known_fault"):
+    for name in ("fabric_known_fault",):
         detail = getattr(health_monitor, name, "")
         if detail:
             setattr(health_monitor, name, "")
@@ -7562,6 +7669,24 @@ def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
     if cooling:
         out["cooldown_until"] = datetime.fromtimestamp(cd["until"]).isoformat(timespec="seconds")
     return out
+
+
+def _defer_to_startup_verify(kind: str, log, *, journaled: bool = False) -> None:
+    """Spec 03 I75: leave a startup hold to the startup gate that is about to run on it, and give the
+    window back so a gate that fails is escalated on the next sampler tick. Logged once per episode;
+    ``journaled`` when the ladder's tenant check already logged and journaled this stand-down."""
+    global _startup_verify_deferral_logged
+    _rearm_tenant_deferred_window(kind)
+    if journaled:
+        _startup_verify_deferral_logged = device_hold_episode_since
+    if _startup_verify_deferral_logged == device_hold_episode_since:
+        return
+    _startup_verify_deferral_logged = device_hold_episode_since
+    log(
+        "startup hold: the startup gate (full check, fabric included) runs as soon as the re-adopted "
+        "jobs end — no reset first; escalates on the first tick after it if the hold stands"
+    )
+    health_event("stuck_hold_deferred", mesh="present", forced=True, blocker="startup_verify")
 
 
 def _rearm_tenant_deferred_window(kind: str) -> bool:
@@ -10989,7 +11114,7 @@ export {JOB_TAG_ENV}={job_tag}
                 # the jobs that died of it, leaving a generic "ended failed" the gate then
                 # cleared on the word of checks that cannot see this fault at all.
                 # The first job after a topology-mismatch lift is the bound on that lift: one that
-                # dies on the fabric makes it a hardware fault, held without a reset (03 I42).
+                # dies on the fabric latches it, held so the ladder resets it (03 I42).
                 # Jobs that keep dying on the fabric's routing after passes that could not run are a
                 # known fabric fault: held, never the dirty-flag reset that only ends in another 77 (03 I46).
                 known = None
@@ -11618,6 +11743,44 @@ STARTUP_PREREQ_WAIT_SEC = 2.5 * 3600
 STARTUP_PREREQ_POLL_MIN_SEC = 5.0
 STARTUP_PREREQ_POLL_MAX_SEC = 60.0
 _startup_prereq_task: Optional[asyncio.Task] = None
+# Spec 03 I75: the startup gate task, and when it stopped waiting on re-adopted jobs (monotonic).
+_startup_verify_task: Optional[asyncio.Task] = None
+_startup_verify_ready_at: Optional[float] = None
+_startup_verify_deferral_logged: Optional[str] = None
+# How long past the re-adopted jobs' end the escalations still leave a startup hold to that gate:
+# its hugepage wait, its fabric pass and the rest of the full check, with margin.
+STARTUP_VERIFY_DEFER_MAX_SEC = STARTUP_HUGEPAGES_WAIT_SEC + FABRIC_CHECK_TIMEOUT_SEC + 120.0
+
+
+# The forced-run kinds the I75 stand-down may defer: the ones _rearm_tenant_deferred_window gives back,
+# so a deferred run is retried on the next tick. Every other kind spent its latch on spawn and runs.
+_STARTUP_VERIFY_DEFERRABLE_KINDS = ("ceiling_window", "offbus_one_shot")
+
+
+def _startup_verify_owns_hold(kind: Optional[str] = None) -> bool:
+    """Spec 03 I75: True while the startup gate (the full check, fabric included) is still to run on
+    the startup hold, so the ceiling escalation and the idle relift leave that hold to it.
+
+    A job re-adopted across a broker restart can outlive the 600 s ceiling. When it ends, the startup
+    gate starts within one scope poll; a forced escalation that won the device lock first reset a mesh
+    no check had found at fault, and the gate then ran on top of that. Bounded: past
+    STARTUP_VERIFY_DEFER_MAX_SEC from the re-adopted jobs' end the escalations act as before.
+
+    Only the gap from the job's end to the gate's verdict: while a job still runs, the escalations meet
+    it as before (deferred on ``job_running``, journaled). A hold with chips off the bus keeps the
+    off-bus one-shot and its ladder (spec 03 I23), and a forced run of a kind whose window cannot be
+    given back (``kind`` outside _STARTUP_VERIFY_DEFERRABLE_KINDS) runs, so neither waits on the gate."""
+    task = _startup_verify_task
+    if task is None or task.done():
+        return False
+    if fsm.state is not ServerState.RECOVERING or fsm.record.why != "startup_unverified":
+        return False
+    if kind is not None and kind not in _STARTUP_VERIFY_DEFERRABLE_KINDS:
+        return False
+    if isolated_chips or any(j.status == JobStatus.RUNNING for j in jobs.values()):
+        return False
+    ready = _startup_verify_ready_at
+    return ready is None or time.monotonic() - ready < STARTUP_VERIFY_DEFER_MAX_SEC
 
 
 async def _await_startup_prerequisites(missing: str) -> None:
@@ -11777,10 +11940,11 @@ async def _verify_fabric_on_start() -> None:
     A pass that exited 77 because the validator or the hugepages were not there yet is owed again
     once they are (see _await_startup_prerequisites).
     """
-    global _startup_prereq_task
+    global _startup_prereq_task, _startup_verify_ready_at
     try:
         while readopted_scopes:
             await asyncio.sleep(_SCOPE_POLL_SEC)
+        _startup_verify_ready_at = time.monotonic()
         # Read before the pass: a validator that lands while it runs must still be waited for.
         missing = await asyncio.to_thread(fabric.validator_missing)
         if not await _await_startup_hugepages():
@@ -11860,7 +12024,7 @@ async def run_startup_tasks() -> None:
     scopes, and a per-user daemon or test server claiming them would show another user's job
     as its own.
     """
-    global _startup_tasks_done
+    global _startup_tasks_done, _startup_verify_task, _startup_verify_ready_at
     if _startup_tasks_done:
         return
     _startup_tasks_done = True
@@ -11968,7 +12132,8 @@ async def run_startup_tasks() -> None:
     asyncio.create_task(_record_startup_health())
     # And then answers it properly, once the device is ours to test — this lifts the hold above on a
     # healthy verdict, holds/escalates on a wedge.
-    asyncio.create_task(_verify_fabric_on_start())
+    _startup_verify_ready_at = None
+    _startup_verify_task = asyncio.create_task(_verify_fabric_on_start())
 
 
 @asynccontextmanager
@@ -12198,6 +12363,9 @@ def create_mcp_server() -> MCPServer:
 
         recovery = select_recovery()
         argv = recovery.reset_argv(indices)
+        # An operator reset re-tests the I42 latch: its post-reset check decides, no restart needed.
+        if health_monitor is not None:
+            health_monitor.clear_topology_hw_fault("operator reset")
         yield f"$ {' '.join(argv)}   ({len(indices)} device(s); ~30-60s)\n"
         reset_owner = _reset_action_owner()
         _plog = (lambda m: logger.info(m)) if logger else (lambda m: None)
@@ -13740,6 +13908,9 @@ def create_mcp_server() -> MCPServer:
 
         recovery = select_recovery()
         argv = recovery.reset_argv(indices)
+        # An operator reset re-tests the I42 latch: its post-reset check decides, no restart needed.
+        if health_monitor is not None:
+            health_monitor.clear_topology_hw_fault("operator reset")
         command = " ".join(argv)
         step(f"exec: {command}  ({len(indices)} device(s); ~30-60s on a Galaxy)")
 
