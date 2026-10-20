@@ -460,6 +460,30 @@ def test_a_job_leftover_alone_keeps_the_600s_budget(stuck):
     assert srv._leftover_fault_class() == "J-unkillable-leftover"
 
 
+
+def _scan():
+    from tt_device_mcp.device_holders import DeviceHolder
+
+    return HolderScan(holders=[DeviceHolder(pid=PID, uid=1234)], complete=True)
+
+
+@pytest.mark.parametrize("where", ["job-scope", "reaped-survivor"])
+def test_a_dead_chip_holder_that_is_also_a_job_leftover_keeps_the_dead_chip_label(stuck, monkeypatch, where):
+    """The killed holder sits in an ended job's ttdev-job scope, or the sweep named it that job's
+    survivor: the I77 entry wins, so the episode keeps the 120 s budget, its class and the
+    re-enumeration fence instead of the job leftover's 600 s."""
+    _note(stuck)
+    if where == "job-scope":
+        (stuck["proc"] / str(PID) / "cgroup").write_text("0::/system.slice/ttdev-job-7.scope\n")
+    else:
+        monkeypatch.setattr(srv, "reaped_survivors", {PID: ("7", "424242")})
+
+    (f,) = srv._reaped_leftovers(_scan())
+    assert f.job_id == "dead-chip:3" and f.unkillable
+    assert srv._leftover_budget_sec() == BUDGET
+    assert srv._leftover_fault_class() == "J-dead-chip-stuck-holder"
+    assert srv._dead_chip_stuck_reason()
+
 # --- the dead-chip path calls it -------------------------------------------------------------------
 
 

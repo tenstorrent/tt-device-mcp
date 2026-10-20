@@ -1122,7 +1122,7 @@ _recovery_deps = RecoveryDeps(
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     wait_device_released=lambda pids: wait_device_released(pids, HOLDER_RELEASE_WAIT_SEC),
     note_stuck_holders=lambda chips, killed: _note_dead_chip_stuck_holders(chips, killed),
-    stuck_holder_pids=lambda: {f.pid for f in _dead_chip_stuck_leftovers(set())},
+    stuck_holder_pids=lambda: {f.pid for f in _dead_chip_stuck_leftovers()},
     owe_device_pollers=lambda reason: _owe_device_pollers(reason),
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
     hold_device_fabric_unverified=lambda why: _hold_device_fabric_unverified(why),
@@ -8299,7 +8299,12 @@ def _reaped_leftovers(scan: Optional[HolderScan] = None) -> list[ReapedLeftover]
             held = {h.pid for h in scan.holders}
             for pid in [p for p in reaped_survivors if p not in held]:
                 reaped_survivors.pop(pid, None)
-        found += _dead_chip_stuck_leftovers({f.pid for f in found})
+        # A registered dead-chip stuck holder (spec 04 I77) wins over its job's label, whether its
+        # job's scope outlived the job or the sweep named it a survivor: the label carries the 120 s
+        # budget, the fault class and the re-enumeration fence.
+        dead = _dead_chip_stuck_leftovers()
+        dead_pids = {d.pid for d in dead}
+        found = [f for f in found if f.pid not in dead_pids] + dead
     except Exception as e:
         if logger:
             logger.error(f"LEFTOVER scan error: {e}")
@@ -8547,9 +8552,8 @@ def _send_dead_chip_page() -> None:
         _dead_chip_page_pending = None
 
 
-def _dead_chip_stuck_leftovers(exclude: set) -> list[ReapedLeftover]:
-    """The registered dead-chip stuck holders still stuck (spec 04 I77), as leftovers; ``exclude``
-    names pids already found as a job's. One that is gone (or a reused pid), a zombie, or no longer
+def _dead_chip_stuck_leftovers() -> list[ReapedLeftover]:
+    """The registered dead-chip stuck holders still stuck (spec 04 I77), as leftovers. One that is gone (or a reused pid), a zombie, or no longer
     stuck with a device reference is dropped and journaled ``dead_chip_holder_released``."""
     _send_dead_chip_page()
     with _dead_chip_stuck_lock:
@@ -8565,7 +8569,7 @@ def _dead_chip_stuck_leftovers(exclude: set) -> list[ReapedLeftover]:
             if logger:
                 logger.info(f"DEAD-CHIP stuck holder pid {pid} ({label}) is gone")
             health_event("dead_chip_holder_released", pid=pid, label=label)
-        elif pid not in exclude:
+        else:
             found.append(f)
     return found
 
