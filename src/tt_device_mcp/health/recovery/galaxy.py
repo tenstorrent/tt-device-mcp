@@ -3456,7 +3456,7 @@ class GalaxyRecovery(Recovery):
         Bounded below by the hold ceiling: the host rungs never fire before the episode has stood the
         full ladder, however futile the gentler rungs proved — an early forced pass fires the cheap
         rungs only, and the deadline watchdog re-runs the ladder at the ceiling where the climb is
-        then admitted.
+        then admitted. The exceptions are holds with no gentler rung left to try (spec 04 I38, I79).
 
         Fires ONLY for a mass drop. The galaxy reset can drop a present-but-eth-unverifiable mesh to
         all-0xFFFFFFFF, which a reboot/power cycle recovers and self-heal never does; a still-present or
@@ -3567,6 +3567,26 @@ class GalaxyRecovery(Recovery):
                 held_age_sec=int(hold_age),
                 ceiling_sec=_stuck_hold_ceiling_sec(),
                 reason="reset_and_sweep_failed" if ladder_ran else "present_mesh_reset_failed",
+            )
+        elif (
+            off_bus > 0
+            and (reset_regressed or episode_regressed)
+            and hold_age is not None
+            and hold_age < _stuck_hold_ceiling_sec()
+        ):
+            # This hold's reset made the drop worse. I31 bars every reset rung but the sweep for the rest
+            # of the episode, so the ceiling wait has nothing to try: one 8-chip host's hold sat 512 s in
+            # it, then swept and power-cycled anyway. Sweep now, then the cold rung (spec 04 I79).
+            log(
+                f"this {int(hold_age)}s-old hold's reset regressed the mesh ({off_bus}/{expected} off the bus) — "
+                f"no reset rung may repeat it; not waiting for the {_stuck_hold_ceiling_sec()}s ladder end"
+            )
+            health_event(
+                "host_rung_not_deferred",
+                held_since=hold_since,
+                held_age_sec=int(hold_age),
+                ceiling_sec=_stuck_hold_ceiling_sec(),
+                reason="reset_regressed_offbus",
             )
         elif hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
             log(
