@@ -178,6 +178,41 @@ def test_a_links_missing_hold_is_not_a_no_reset_topology_hold(monkeypatch):
     assert srv._fabric_no_reset_hold() == "", "the measured fault keeps the reset ladder (04 I30)"
 
 
+@pytest.mark.asyncio
+async def test_a_lift_the_accept_list_excused_names_the_accepted_ports(topo, monkeypatch):  # noqa: F811
+    """Review #1495 F5: a lost link the operator's accept list excuses lifts, and the event, /health and
+    the broker log name the port the list excused; a moved tray excuses nothing."""
+    m, state = topo
+    lines = []
+
+    class _Log:
+        def warning(self, msg):
+            lines.append(msg)
+
+        info = error = warning
+
+    monkeypatch.setattr(m, "_logger", lambda: _Log())
+    monkeypatch.setenv(ACCEPT, f"{_LOST_PORT}, tray 9 port 9")
+    state["first"] = _LOST
+    m.eth_link_drop(256)
+    ok, _ = await m._verify_fabric_health_body(60)
+    assert ok is True and m.fabric_topology["verdict"] == "lift"
+    assert m.fabric_topology["accepted_ports"] == [_LOST_PORT], "only the missing port, not the whole list"
+    assert dict(state["events"])["fabric_topology_mismatch"]["accepted_ports"] == [_LOST_PORT]
+    assert any("TOPOLOGY MISMATCH" in ln and f"ACCEPT_MISSING_PORTS: {_LOST_PORT}" in ln for ln in lines)
+    monkeypatch.setattr(srv.health_monitor, "fabric_topology", m.fabric_topology)
+    assert srv._health_payload()["fabric_topology"]["accepted_ports"] == [_LOST_PORT]
+
+
+@pytest.mark.asyncio
+async def test_a_moved_tray_lift_excuses_no_port(topo, monkeypatch):  # noqa: F811
+    m, state = topo
+    monkeypatch.setenv(ACCEPT, _LOST_PORT)
+    ok, _ = await m._verify_fabric_health_body(60)
+    assert ok is True and m.fabric_topology["accepted_ports"] == []
+    assert dict(state["events"])["fabric_topology_mismatch"]["accepted_ports"] == []
+
+
 def test_health_names_the_ports(monkeypatch):
     topology = {"verdict": "failed", "missing_ports": [_LOST_PORT], "extra_ports": [], "marker": "m"}
     monkeypatch.setattr(srv.health_monitor, "fabric_topology", topology)

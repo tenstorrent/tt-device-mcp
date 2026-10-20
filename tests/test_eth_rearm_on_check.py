@@ -277,20 +277,21 @@ async def test_a_retry_inside_a_fault_episode_is_never_paced(monkeypatch, unarme
 
 
 @pytest.mark.asyncio
-async def test_the_77_fallback_runs_no_eth_read_and_climbs_retried_or_not(monkeypatch, unarmed):
-    """The startup checks never lift a hold the fabric check could not verify (03 I78): the
-    fallback reads no eth heartbeat, retried or not, and climbs the ladder instead."""
+async def test_the_77_fallback_makes_no_eth_retry_and_climbs(monkeypatch, unarmed):
+    """Spec 03 I78: past the I40 bound the startup checks never lift the hold, so the fallback reads no
+    eth heartbeat (no re-arm retry either) and climbs the present-mesh rung."""
     fsm_dirty(srv, "fabric check unrunnable", why="fabric_unverified")
-    rearmed = []
-    climbed = []
+    reads = []
 
     async def _rearmed():
-        rearmed.append(1)
-        return True, "healthy"
+        reads.append("rearmed")
+        return True, "advancing"
 
     async def _verify():
-        rearmed.append(1)
-        return True, "healthy"
+        reads.append("verify")
+        return True, "advancing"
+
+    climbed = []
 
     async def _escalate(kind):
         climbed.append(kind)
@@ -298,8 +299,7 @@ async def test_the_77_fallback_runs_no_eth_read_and_climbs_retried_or_not(monkey
 
     monkeypatch.setattr(srv, "_eth_read_rearmed", _rearmed)
     monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", _verify)
-    assert not await srv._fabric_77_fallback({}, lambda m: None, _escalate, retried=True)
-    assert not await srv._fabric_77_fallback({}, lambda m: None, _escalate)
-    assert rearmed == []
-    assert len(climbed) == 2
-    assert srv.fsm.state is not ServerState.HEALTHY
+    assert await srv._fabric_77_fallback({}, lambda m: None, _escalate) is False
+    assert reads == [], "the fallback gates on no eth read"
+    assert climbed == ["present"]
+    assert srv.fsm.state is not ServerState.HEALTHY, "a 77 past its bound never lifts on the startup checks"

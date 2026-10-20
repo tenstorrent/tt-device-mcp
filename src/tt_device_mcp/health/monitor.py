@@ -349,12 +349,13 @@ class HealthMonitor:
         # skipped are the ones a mesh-wide workload routes over (see note_job_after_topology_lift).
         self.topology_lift_pending: bool = False
         # Set once that first job failed on the fabric. The check still runs, but a mismatch now
-        # FAILS it, so the hold takes the ladder (a reset, then a power cycle); cleared by a clean
-        # pass or an operator reset (I42).
+        # FAILS it, so the hold takes the ladder (a reset, then a power cycle); cleared only by a
+        # clean fabric pass on the full topology, never by an operator reset or the 10-min bound (I42).
         self.topology_hw_fault: str = ""
         self._topology_alerted: set[str] = set()
         # The last pass's port connections against the cabling descriptor, by name, for /health
-        # (spec 03 I71): ``{"verdict": "failed"|"lift", "missing_ports", "extra_ports", "marker"}``;
+        # (spec 03 I71): ``{"verdict": "failed"|"lift", "missing_ports", "extra_ports", "accepted_ports",
+        # "marker"}``, ``accepted_ports`` naming the missing ports the accept list excused on a lift;
         # empty after a clean pass on the full topology.
         self.fabric_topology: dict = {}
         # Whether the last fabric pass that ran reached no verdict (a 77). A job that then dies on the
@@ -573,8 +574,8 @@ class HealthMonitor:
             # still runs (it may name another fault) and fails on the same drop.
             unseen = self.links_unseen_by_traffic() if link_drop and not fabric_asked else ""
             # A link-drop skip is a standing condition, not a stuck read: rate-limit its pass (a
-            # descriptor run, whose validator names the missing links itself). Only a recent PASSING
-            # pass covers it: a failed or unknown last verdict is no cover (03 I30).
+            # descriptor run, whose validator names the missing links itself). Only a recent
+            # PASSING pass covers it: a failed or unknown last verdict is no cover (03 I30).
             link_drop_held = (
                 not fabric_asked and link_drop and not unseen and not fabric_stale and self.last_fabric_ok is True
             )
@@ -1233,6 +1234,7 @@ class HealthMonitor:
                 "verdict": "failed",
                 "missing_ports": missing,
                 "extra_ports": extra,
+                "accepted_ports": [],
                 "marker": marker,
             }
             health_event("fabric_links_missing", detail=lost[:400], missing_ports=missing, extra_ports=extra)
@@ -1374,16 +1376,34 @@ class HealthMonitor:
         next job (the lift is bounded by that one job, see note_job_after_topology_lift)."""
         moved = moved_trays(_load_asic_bus_map(), _asic_bus_map())
         missing, extra = fabric.marker_ports(marker)
-        self.fabric_topology = {"verdict": "lift", "missing_ports": missing, "extra_ports": extra, "marker": marker}
+        # A lift that would have FAILED without the accept list: the ports it excused, by name (I71).
+        excused = bool(fabric.links_missing(marker))
+        accepted = sorted(set(missing) & fabric.accepted_missing_ports()) if excused else []
+        self.fabric_topology = {
+            "verdict": "lift",
+            "missing_ports": missing,
+            "extra_ports": extra,
+            "accepted_ports": accepted,
+            "marker": marker,
+        }
         health_event(
-            "fabric_topology_mismatch", marker=marker, moved_trays=moved, missing_ports=missing, extra_ports=extra
+            "fabric_topology_mismatch",
+            marker=marker,
+            moved_trays=moved,
+            missing_ports=missing,
+            extra_ports=extra,
+            accepted_ports=accepted,
         )
         self.topology_lift_pending = True
         # Only a lift over ports the operator accepted as dead may lower the link mark (I71).
-        self._arm_eth_rebaseline(accepted=bool(fabric.links_missing(marker)))
+        self._arm_eth_rebaseline(accepted=excused)
         log = self._logger()
         if log:
-            log.warning(f"FABRIC TOPOLOGY MISMATCH: {marker}" + (f"; moved: {', '.join(moved)}" if moved else ""))
+            log.warning(
+                f"FABRIC TOPOLOGY MISMATCH: {marker}"
+                + (f"; moved: {', '.join(moved)}" if moved else "")
+                + (f"; excused by TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS: {', '.join(accepted)}" if accepted else "")
+            )
         key = marker + "|" + ",".join(moved)
         if key not in self._topology_alerted:
             self._topology_alerted.add(key)
@@ -1419,8 +1439,9 @@ class HealthMonitor:
         return self.topology_hw_fault
 
     def clear_topology_hw_fault(self, why: str) -> None:
-        """End the I42 latch: on a clean fabric pass, and when an operator reset starts (it re-tests
-        the mesh, no broker restart needed)."""
+        """End the I42 latch. Only a clean fabric pass on the full topology (no mismatch, no link the
+        traffic missed) calls this; an operator reset, a ladder rung or the 10-min bound keeps it, so
+        a post-reset mismatch still FAILS the check."""
         if not self.topology_hw_fault:
             return
         health_event("fabric_topology_hw_fault_cleared", detail=self.topology_hw_fault, why=why)

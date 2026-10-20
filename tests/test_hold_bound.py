@@ -67,6 +67,13 @@ _KINDS = {
         "present-forced",
     ),
     "off-bus": ("gate_error", "chip 29 off the bus", "", {str(i): 100 for i in range(31)}, "offbus-forced"),
+    "foreign holder gone": (
+        "foreign_holder",
+        "gate/pre-job: could not verify: foreign holder",
+        "",
+        None,
+        "present-forced",
+    ),
     "generic": ("eth_frozen", "gate/post-job: eth/fabric fault on a present mesh", "", None, "present-forced"),
 }
 
@@ -84,7 +91,7 @@ async def test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung(m
     if hold == "off-bus":
         monkeypatch.setattr(srv, "dead_chips", lambda b: [])
 
-    async def failed_ladder(kind, indices, expected, log):
+    async def failed_ladder(kind, indices, expected, log, **_):
         escalations.append(kind)
         return OUTCOME_TERMINAL
 
@@ -153,7 +160,7 @@ async def test_a_cooldown_denial_arms_the_retry_and_the_host_rung_fires_at_its_e
     monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
 
-    async def failed_ladder(kind, indices, expected, log):
+    async def failed_ladder(kind, indices, expected, log, **_):
         escalations.append(kind)
         return OUTCOME_TERMINAL
 
@@ -181,7 +188,7 @@ async def test_a_check_still_waiting_on_hugepages_is_bounded_by_the_check_window
     _watchdog(monkeypatch)
     monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: True)
 
-    async def recovered_ladder(kind, indices, expected, log):
+    async def recovered_ladder(kind, indices, expected, log, **_):
         escalations.append(kind)
         return OUTCOME_RECOVERED  # chips back, but the fabric pass is still owed: the hold stands
 
@@ -210,7 +217,7 @@ async def test_another_run_inside_the_check_bound_does_not_cut_the_full_check_sh
         monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
     )
 
-    async def recovered_ladder(kind, indices, expected, log):
+    async def recovered_ladder(kind, indices, expected, log, **_):
         escalations.append(kind)
         return OUTCOME_RECOVERED
 
@@ -247,7 +254,7 @@ async def test_a_failed_check_after_the_bound_ladder_asks_for_the_host_rung_at_o
 
     monkeypatch.setattr(srv, "_hold_bound_host_rung", host_rung)
 
-    async def recovered_ladder(kind, indices, expected, log):
+    async def recovered_ladder(kind, indices, expected, log, **_):
         escalations.append(kind)
         return OUTCOME_RECOVERED  # chips back, the full check gave no pass: the hold stands
 
@@ -269,7 +276,7 @@ async def test_a_passing_check_after_the_bound_ladder_asks_for_no_host_rung(monk
     )
     _watchdog(monkeypatch)
 
-    async def recovered_and_passed(kind, indices, expected, log):
+    async def recovered_and_passed(kind, indices, expected, log, **_):
         escalations.append(kind)
         monkeypatch.setattr(srv, "_recovery_degraded", lambda: False)  # the full check passed
         return OUTCOME_RECOVERED
@@ -294,7 +301,7 @@ async def test_a_relift_that_fails_after_the_bound_ladder_cycles_on_the_next_tic
     pending = {"hugepages": True}
     monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: pending["hugepages"])
 
-    async def recovered_ladder(kind, indices, expected, log):
+    async def recovered_ladder(kind, indices, expected, log, **_):
         escalations.append(kind)
         return OUTCOME_RECOVERED
 
@@ -308,6 +315,87 @@ async def test_a_relift_that_fails_after_the_bound_ladder_cycles_on_the_next_tic
     await _drain()
     assert srv.device_hold_escalation_kind == "hold_bound_cycle"
     assert events.count("host_rung") == 1 and escalations == ["present-forced"]
+
+
+async def _bound_check_pending(monkeypatch, why, detail):
+    """An episode at the bound whose ladder brought the mesh back and whose own post-ladder check is
+    still waiting on the hugepage pool: the next full check that fails is the one that counts."""
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(monkeypatch, why=why, detail=detail, age_min=10.1)
+    _watchdog(monkeypatch)
+    pending = {"hugepages": True}
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: pending["hugepages"])
+
+    async def recovered_ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        return OUTCOME_RECOVERED
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", recovered_ladder)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert "hold_bound_check_failed" not in events and "host_rung" not in events
+    pending["hugepages"] = False
+    monkeypatch.setattr(srv.FABRIC_DEBT, "runs_here", lambda expected: True)
+    return escalations, events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verdict", [(False, {"fabric": {"ok": True}}), (True, {"fabric": {"ok": None}}), (True, {"fabric": {"ok": False}})]
+)
+@pytest.mark.parametrize(
+    "why, detail",
+    [
+        ("eth_frozen", "gate/post-job: eth/fabric fault on a present mesh"),  # the eth_frozen lift
+        ("off_bus", "gate/post-job: 1/32 chip(s) off the bus"),  # the off-bus floor lift
+    ],
+)
+async def test_a_failed_lift_check_after_the_bound_ladder_asks_for_the_host_rung(
+    monkeypatch, clear_job_state, verdict, why, detail
+):
+    """Review #1495 F4: every idle lift path runs _full_check_gate; a check there that ends with no
+    pass after the bound's ladder hands the hold to the host rung on the next tick (spec 04 I76)."""
+    escalations, events = await _bound_check_pending(monkeypatch, why, detail)
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+
+    async def observe(expected, log, **_):
+        return verdict
+
+    monkeypatch.setattr(srv.fsm, "observe", observe)
+    ok, _evidence = await srv._full_check_gate(EXPECTED, lambda m: None)
+    assert not ok and events.count("hold_bound_check_failed") == 1
+    srv._check_hold_deadline(now=datetime.now() + timedelta(seconds=10))  # one sampler tick
+    await _drain()
+    assert srv.device_hold_escalation_kind == "hold_bound_cycle"
+    assert events.count("host_rung") == 1 and len(escalations) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_lift_check_still_waiting_on_hugepages_asks_for_no_host_rung(monkeypatch, clear_job_state):
+    """A full check that could not run because the 1G pool is still filling is no failed check."""
+    _escalations, events = await _bound_check_pending(
+        monkeypatch, "eth_frozen", "gate/post-job: eth/fabric fault on a present mesh"
+    )
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: (12, 32))
+    assert await srv._full_check_gate(EXPECTED, lambda m: None) == (False, {})
+    assert "hold_bound_check_failed" not in events
+
+
+@pytest.mark.asyncio
+async def test_a_failed_foreign_holder_check_after_the_bound_ladder_asks_for_the_host_rung(
+    monkeypatch, clear_job_state
+):
+    """Review #1495 F4, the foreign-holder lift (spec 03 I43): its failed full check counts too."""
+    _escalations, events = await _bound_check_pending(monkeypatch, "foreign_holder", "foreign holder")
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda scan: "")
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+
+    async def observe(expected, log, **_):
+        return True, {"fabric": {"ok": False}}
+
+    monkeypatch.setattr(srv.fsm, "observe", observe)
+    await srv._foreign_holder_fast_verify(EXPECTED, lambda m: None)
+    assert events.count("hold_bound_check_failed") == 1
 
 
 def test_health_shows_the_bound(monkeypatch, clear_job_state):
@@ -616,8 +704,9 @@ async def test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladde
     An off-bus hold is healed by a mesh reset; the post-reset check passes with a topology mismatch and
     lifts. The first job fails on the fabric and sets the I42 latch, which opens a new hold episode at
     that job's end. The next tenant job is dequeued and held at the CLEAN-GATE (it opens no device fd).
-    At the bound the watchdog runs the ladder with the latch standing; the full check fails and the power
-    cycle is asked for once. The gated job never dispatches, and its own bound refuses it."""
+    At the bound the watchdog runs the ladder with the latch standing, so the full check fails on the
+    mismatch and the power cycle is asked for once. The gated job never dispatches, and its own bound
+    refuses it."""
     order, g = rig["order"], rig["g"]
     mon = srv.health_monitor
     rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
@@ -657,6 +746,7 @@ async def test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladde
     why = mon.note_job_after_topology_lift(True, "... could not find any forwarding direction ...")
     assert why and mon.topology_hw_fault
     srv._hold_device_fabric_unverified(f"job 922: {why}")
+    assert not srv._fabric_77_only_hold() and mon.last_fabric_ok is False, "the latch measured the fabric bad"
     assert srv._fabric_no_reset_hold() == "", "a latched hold is measured (03 I42): never a no-reset hold"
     _watchdog(monkeypatch)
     monkeypatch.setattr(srv, "device_hold_job_bound_escalated", False)
@@ -884,7 +974,7 @@ async def test_a_ladder_below_the_bound_does_not_stand_in_for_the_bounds_ladder(
     )
     monkeypatch.setattr(srv, "dead_chips", lambda b: [])
 
-    async def failed_ladder(kind, indices, expected, log):
+    async def failed_ladder(kind, indices, expected, log, **_):
         escalations.append(kind)
         return OUTCOME_TERMINAL
 
@@ -914,7 +1004,7 @@ async def test_a_host_rung_deferred_by_a_reset_scope_fires_on_the_first_tick_aft
     monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: scope["active"])
 
-    async def failed_ladder(kind, indices, expected, log):
+    async def failed_ladder(kind, indices, expected, log, **_):
         escalations.append(kind)
         scope["active"] = "a reset still cycling"
         return OUTCOME_TERMINAL
@@ -993,7 +1083,7 @@ async def test_a_host_rung_denied_with_no_retry_is_asked_again_each_tick_and_jou
     _real_host_rung(monkeypatch, cycles, lambda action: (True, "") if gov["ok"] else (False, "ledger unreadable"))
     monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
 
-    async def failed_ladder(kind, indices, expected, log):
+    async def failed_ladder(kind, indices, expected, log, **_):
         escalations.append(kind)
         return OUTCOME_TERMINAL
 
@@ -1032,7 +1122,7 @@ async def test_a_live_tenant_at_the_bound_is_paged_once_and_the_ladder_runs_when
     monkeypatch.setattr(galaxy, "discount_broker_internal", lambda scan: scan)
     monkeypatch.setattr(galaxy, "holder_comm", lambda pid: "python3")
 
-    async def ladder(kind, indices, expected, log):
+    async def ladder(kind, indices, expected, log, **_):
         if tenant["on"]:
             srv.galaxy_recovery.tenant_deferred = True
             return galaxy.OUTCOME_WAITING
