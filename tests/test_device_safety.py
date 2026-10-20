@@ -5972,9 +5972,9 @@ async def test_auto_power_cycle_aborts_when_the_ledger_cannot_be_written(monkeyp
 
 
 def test_reboot_already_attempted_ignores_this_boot_and_stale_records(monkeypatch, tmp_path):
-    """The escalation trigger is a reboot from a PREVIOUS boot within the interval. A reboot record
-    stamped with the current boot has not taken the box down yet; a reboot older than the interval
-    is a different, already-recovered wedge. Neither is the 'reboot did not clear it' signal."""
+    """The escalation trigger is a reboot from a PREVIOUS boot in this episode (spec 04 I10). A reboot
+    record stamped with the current boot has not taken the box down yet; a reboot a verified release
+    followed is a different, already-recovered wedge. Neither is the 'reboot did not clear it' signal."""
     d = _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-B")
     monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MIN_INTERVAL_SEC", 3600)
@@ -5982,11 +5982,13 @@ def test_reboot_already_attempted_ignores_this_boot_and_stale_records(monkeypatc
     # This-boot reboot: box has not gone down for it yet.
     d_ledger.write_text('{"action": "reboot", "boot_id": "boot-B", "at_epoch": 1000.0}\n')
     assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1060.0) is False
-    # Previous-boot reboot but older than the interval: a separate, recovered wedge.
+    # Previous-boot reboot: the escalation signal, past the interval too while no release verified.
     d_ledger.write_text('{"action": "reboot", "boot_id": "boot-A", "at_epoch": 1000.0}\n')
-    assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1000.0 + 4000) is False
-    # Previous-boot reboot within the interval: the escalation signal.
     assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1060.0) is True
+    assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1000.0 + 4000) is True
+    # A verified release after it: a separate, recovered wedge.
+    (d / recovery_base.AUTO_RECOVERY_VERIFIED).write_text('{"boot_id": "boot-B", "at_epoch": 1300.0}')
+    assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1000.0 + 4000) is False
 
 
 def test_unreadable_boot_id_never_escalates_to_power_cycle(monkeypatch, tmp_path):
