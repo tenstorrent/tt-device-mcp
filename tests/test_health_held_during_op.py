@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from tests.conftest import fsm_dirty
+from tests.conftest import fsm_dirty, fsm_healthy
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
 
@@ -116,3 +116,27 @@ def test_a_hold_opened_inside_an_op_keeps_its_held_since_after_the_op(held, monk
     assert after["held"] is True
     assert after["held_since"] == during["held_since"], "the hold keeps its clock when the op ends"
     assert after["held_age_sec"] >= during["held_age_sec"]
+
+
+def test_a_closed_episodes_held_since_never_carries_into_the_next_hold(held, monkeypatch):
+    """The in-op latch outlived its episode: the gate passed inside the op and closed the hold, but no
+    status read landed while the device was fit, so the next hold opened inside an op reported the
+    previous episode's start (days old) as its held_since. Each episode keeps its own clock."""
+    monkeypatch.setattr(srv, "device_op_active", "health-gate/post-job")
+    srv._note_tenant_gate_verdict(f"device unverified: {REASON}")
+    monkeypatch.setattr(srv, "device_hold_episode_since", held.isoformat())
+    assert srv._health_payload(now=held + timedelta(seconds=300))["held_since"] == held.isoformat()
+
+    fsm_healthy(srv)
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    srv._note_tenant_gate_verdict("")  # the gate passed inside the op: the episode is over
+    monkeypatch.setattr(srv, "device_op_active", "")
+    # no /health, queue-status or jobs read lands while the device is fit
+
+    monkeypatch.setattr(srv, "device_op_active", "health-gate/post-job")
+    fsm_dirty(srv, "new fault", why="off_bus")
+    srv._note_tenant_gate_verdict("device unverified: new fault")
+    payload = srv._health_payload()
+    assert payload["held"] is True
+    assert payload["held_since"] == srv.device_hold_episode_since != held.isoformat()
+    assert payload["held_age_sec"] < 60

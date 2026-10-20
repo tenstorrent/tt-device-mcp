@@ -942,8 +942,9 @@ _hold_row: Optional[dict] = None
 
 # When the device entered a HELD state: degraded (a chip off the bus, or dirty and
 # unverified) with no broker op running. Latched so the synthetic HOLD row can report how
-# long the device has sat refused to tenants, and cleared the moment it is fit again — or a
-# broker op takes over the RUNNING row (that op IS the recovery, and owns the row while it runs).
+# long the device has sat refused to tenants, and cleared the moment it is fit again (or its hold
+# episode closes) — or a broker op takes over the RUNNING row (that op IS the recovery, and owns
+# the row while it runs).
 device_held_since: str = ""
 
 # Whether the CURRENT tenant-refused episode has been written to the durable health
@@ -6996,7 +6997,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_offbus_escalated, device_hold_alert_next_bucket, device_hold_alert_gap
     global device_hold_tenant_deferred, device_hold_offbus_prior_bucket, device_hold_offbus_tenant_wait
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
-    global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold
+    global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold, device_held_since
     if reason and not device_hold_logged:
         device_hold_logged = True
         # Prefer a start this box already recorded: if the device was still held across a restart,
@@ -7069,6 +7070,8 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         )
         _hold_row = None
         device_hold_episode_since = ""
+        # Spec 03 I80: a clock latched inside an op belongs to this episode; the next hold starts its own.
+        device_held_since = ""
         _dispatch_reset_spent = False  # spec 03 I55: the next episode earns its own reset
         if recovery_mechanism is not None:
             recovery_mechanism.regressed_reset_since = None  # spec 04 I31: the next episode may reset again
