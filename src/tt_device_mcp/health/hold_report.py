@@ -13,6 +13,7 @@ chip healthy, admits a job or moves a rung. Pure functions, so each hold kind is
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, Mapping, Optional
 
 # The fault classes, as the recovery budgets name them.
@@ -27,10 +28,10 @@ PARTIAL_MAX_OFF = 3
 
 NOT_VERIFIED = "not verified: sysfs presence and ARC heartbeat only; no health check has passed"
 
-# The universal hold bound's mark: every hold runs the full ladder at this age, then a power cycle
-# if the check after it still fails (outside the boot/post-cycle cooldown). The code that enforces
-# it registers ``hold_bound_candidate`` with ``register_deadline_feed``; until it does, no mark is
-# reported, because /health names only rungs some code will actually fire.
+# The universal hold bound's mark (spec 04 I76): every hold runs the full ladder at this age, then
+# the host rung if the check after it still fails; only that host rung waits on the boot/post-cycle
+# cooldown. The broker registers its I76 feed (built on ``hold_bound_candidate``) with
+# ``register_deadline_feed``, because /health names only rungs some code will actually fire.
 HOLD_BOUND_SEC = 600
 
 
@@ -43,7 +44,7 @@ class RungCandidate:
     source: str
 
 
-# Extra deadline sources a rung that is not on this branch yet feeds in, keyed by name. Each is
+# Extra deadline sources outside the watchdog's own chain (the I76 hold bound), keyed by name. Each is
 # called as ``feed(started_epoch, now_epoch, cooldown_until)`` and returns a RungCandidate or None.
 DeadlineFeed = Callable[[float, float, Optional[float]], Optional[RungCandidate]]
 _deadline_feeds: dict[str, DeadlineFeed] = {}
@@ -51,7 +52,7 @@ _deadline_feeds: dict[str, DeadlineFeed] = {}
 
 def register_deadline_feed(name: str, feed: DeadlineFeed) -> None:
     """Add (or replace) a deadline source ``next_rung`` takes the earliest of. The hook the
-    universal hold bound feeds: ``register_deadline_feed("hold_bound", hold_bound_candidate)``."""
+    universal hold bound feeds: the broker registers its I76 feed under ``"hold_bound"``."""
     _deadline_feeds[name] = feed
 
 
@@ -59,28 +60,42 @@ def unregister_deadline_feed(name: str) -> None:
     _deadline_feeds.pop(name, None)
 
 
-def fed_candidates(started: float, now: float, cooldown_until: Optional[float]) -> list:
-    """Every registered feed's candidate; a feed that raises reports nothing (read-only path)."""
-    out = []
-    for feed in list(_deadline_feeds.values()):
+def fed_by_name(started: float, now: float, cooldown_until: Optional[float]) -> dict:
+    """Every registered feed's candidate by feed name; a feed that raises reports nothing (read-only
+    path)."""
+    out = {}
+    for name, feed in list(_deadline_feeds.items()):
         try:
             c = feed(started, now, cooldown_until)
         except Exception:  # noqa: BLE001 - /health must answer even if a feed is broken
             c = None
-        if c is not None:
-            out.append(c)
+        if isinstance(c, RungCandidate):
+            out[name] = c
     return out
 
 
+def fed_candidates(started: float, now: float, cooldown_until: Optional[float]) -> list:
+    """Every registered feed's candidate."""
+    return list(fed_by_name(started, now, cooldown_until).values())
+
+
 def hold_bound_candidate(
-    started: float, now: float, cooldown_until: Optional[float], bound_sec: int = HOLD_BOUND_SEC
+    started: float,
+    now: float,
+    cooldown_until: Optional[float],
+    bound_sec: int = HOLD_BOUND_SEC,
+    host_rung: Optional[str] = "power cycle",
 ) -> RungCandidate:
-    """The full-ladder mark: hold start + ``bound_sec``. Inside the boot/post-cycle cooldown the
-    mark moves to the cooldown's end, the one wait allowed past it."""
+    """The full-ladder mark: hold start + ``bound_sec``, then ``host_rung`` (None: none is opted in)
+    if the full check after it fails. The ladder runs at the mark even inside the boot/post-cycle
+    cooldown; only the host rung waits for the cooldown's end, the one wait allowed past the mark,
+    so the rung names that end."""
     at = started + bound_sec
-    if cooldown_until is not None and now < cooldown_until and at < cooldown_until:
-        return RungCandidate(cooldown_until, "full ladder, then power cycle", "hold bound (after cooldown)")
-    return RungCandidate(at, "full ladder, then power cycle", f"hold bound ({bound_sec}s)")
+    rung = f"full ladder, then {host_rung}" if host_rung else "full ladder"
+    if host_rung and cooldown_until is not None and now < cooldown_until and at < cooldown_until:
+        end = datetime.fromtimestamp(cooldown_until).isoformat(timespec="seconds")
+        rung = f"{rung} at the cooldown's end ({end})"
+    return RungCandidate(at, rung, f"hold bound ({bound_sec}s)")
 
 
 def classify_hold(

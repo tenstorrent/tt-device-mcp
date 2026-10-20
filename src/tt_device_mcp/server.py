@@ -7346,7 +7346,11 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
             cooldown_until = float(cooldown["until"])
     except (KeyError, TypeError, ValueError):
         cooldown_until = None
-    fed = hold_report.fed_candidates(started, now_epoch, cooldown_until)
+    fed = hold_report.fed_by_name(started, now_epoch, cooldown_until)
+    # Spec 04 I76: the bound's own mark is ceiling window 1 under its own name; it stands in for that
+    # window and, as the watchdog's last branch, loses a tie to every other candidate.
+    bound = [fed.pop("hold_bound")] if "hold_bound" in fed else []
+    fed = list(fed.values())
     ceiling = _stuck_hold_ceiling_sec()
     # Spec 04 I76: below the bound the kill-switch declines every forced spawn and the watchdog forces
     # no 77-only hold; from the bound on, neither holds a rung back.
@@ -7357,7 +7361,7 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
     def done(candidates: list) -> Optional[hold_report.RungCandidate]:
         if floor is not None:
             candidates = [c if c.at >= floor else replace(c, at=floor) for c in candidates]
-        return hold_report.next_rung(fed + candidates)
+        return hold_report.next_rung(fed + candidates + bound)
 
     def routed(c: hold_report.RungCandidate, kind: str) -> Optional[hold_report.RungCandidate]:
         """``c`` as a forced run of ``kind`` takes it at its time (the floor applied; a past one at the
@@ -7444,6 +7448,8 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
     window = max(1, device_hold_escalate_bucket + 1)
     # A window whose run would do nothing is spent all the same; the next one is then the candidate.
     for w in range(window, window + 3):
+        if w == 1 and bound:
+            continue  # the bound's feed names this window
         if add(
             candidates,
             hold_report.RungCandidate(started + w * ceiling, "forced ladder", f"hold ceiling window {w}"),
@@ -8307,6 +8313,44 @@ def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
     if cooling:
         out["cooldown_until"] = datetime.fromtimestamp(cd["until"]).isoformat(timespec="seconds")
     return out
+
+
+def _hold_bound_feed(
+    started: float, now_epoch: float, cooldown_until: Optional[float]
+) -> Optional[hold_report.RungCandidate]:
+    """Spec 04 I76 as the /health deadline feed (spec 04 I75): the bound's own full ladder at hold start
+    + the ceiling, then the host rung, while this episode's bound has taken no step yet. Once a forced run
+    claimed the first window, the bound's ladder ran, its host rung was asked or a tenant blocks it, the
+    watchdog chain's own candidates (the bound's host rung, the I65 retry at the cooldown's end) say what
+    is next, so the feed is silent; so it is while a requested host action is pending (every forced spawn
+    declines until its window ends) and when the mark is routed anywhere but the ladder (the startup
+    gate's stand-down). Only a mark still ahead: past it, window 1 is due in the watchdog's own chain,
+    whose earlier branches stop it first. Read-only: it never claims, moves or expires a clock."""
+    _hold_bound_sync()
+    ceiling = _stuck_hold_ceiling_sec()
+    m = recovery_mechanism
+    req = getattr(m, "host_action_requested", None) if m is not None else None
+    if req is not None and host_action_pending_sec() - (time.monotonic() - req[1]) > 0:
+        return None
+    lad = _hold_bound_ladder_age
+    if (
+        device_hold_escalate_bucket >= 1
+        or (lad is not None and lad >= ceiling)
+        or _hold_bound_cycle_age is not None
+        or _hold_bound_rung_pending
+        or _hold_bound_tenant_blocker is not None
+    ):
+        return None
+    at = started + ceiling
+    if now_epoch >= at:
+        return None  # past the mark and not yet run: the chain's window 1 is due (and its branches stop first)
+    if _forced_run_route("ceiling_window", ceiling, time.monotonic() + (at - now_epoch)).action != ROUTE_LADDER:
+        return None
+    host_rung = "power cycle" if _auto_power_cycle_enabled() else "warm reboot" if _auto_reboot_enabled() else None
+    return hold_report.hold_bound_candidate(started, now_epoch, cooldown_until, int(ceiling), host_rung)
+
+
+hold_report.register_deadline_feed("hold_bound", _hold_bound_feed)
 
 
 def _defer_to_startup_verify(kind: str, log, *, journaled: bool = False) -> None:
