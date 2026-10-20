@@ -152,7 +152,8 @@ def test_the_hold_appears_whole(tmp_path):
 def test_a_queued_job_alone_applies_at_once_under_the_hold(tmp_path):
     """A queued spec is not running work: under the hold it cannot start, so this is a job
     boundary, and it waits, persisted, for the new broker."""
-    done, trace, hold = _gate(tmp_path, queued=1)
+    # A fixed clock: the elapsed time is 0 s however loaded the host is.
+    done, trace, hold = _gate(tmp_path, queued=1, stand_ins="date() { echo 1000; }")
     assert done.returncode == 0, done.stderr
     assert "queued=1" in done.stderr and "drained after 0s" in done.stderr, done.stderr
     assert "applying" in done.stdout
