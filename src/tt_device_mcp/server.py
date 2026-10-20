@@ -11780,15 +11780,23 @@ def _readopted_jobs_ended_at() -> Optional[datetime]:
     return ended
 
 
-# Past its timeout the broker stops a re-adopted job's scope within this (SIGINT, then the reap).
-READOPTED_SERVICE_GRACE_SEC = max(GRACEFUL_KILL_GRACE_SEC, PREEMPT_GRACE_SEC)
+# systemd's default stop timeout for a unit that sets none (DefaultTimeoutStopSec): the longest the
+# blocking `systemctl stop` that ends _terminate_scope's ladder waits before systemd SIGKILLs the scope.
+SCOPE_STOP_TIMEOUT_SEC = 90
+# Past its timeout the broker has stopped a re-adopted job's scope within this: the monitor's poll
+# (_SCOPE_POLL_SEC, counted twice), then SIGINT + GRACEFUL_KILL_GRACE_SEC + the reap's `systemctl stop`
+# (_terminate_scope), or a preempted job's PREEMPT_GRACE_SEC window and its SIGKILL (_preempt_job), plus
+# a margin for the finalize. 180 s. A job still running past it outlived the broker's own SIGKILL.
+READOPTED_SERVICE_GRACE_SEC = (
+    2 * _SCOPE_POLL_SEC + max(GRACEFUL_KILL_GRACE_SEC + SCOPE_STOP_TIMEOUT_SEC, PREEMPT_GRACE_SEC) + 20
+)
 
 
 def _readopted_job_service_end(job: Job) -> Optional[datetime]:
     """The stated end of a re-adopted job's run as service on the startup hold (spec 03 I75): its start +
-    its timeout (at most MAX_TIMEOUT_SEC) + READOPTED_SERVICE_GRACE_SEC, the latest a job the broker stops
-    at its timeout still runs. A job with no known start (a placeholder rebuilt without its log) counts
-    from the hold's start, the broker start it predates. A preemptable job past its soft limit with
+    its timeout (at most MAX_TIMEOUT_SEC) + READOPTED_SERVICE_GRACE_SEC, which covers the broker's whole
+    stop of a job past its timeout (SIGINT, its grace, the reap). A job with no known start (a placeholder
+    rebuilt without its log) counts from the hold's start, the broker start it predates. A preemptable job past its soft limit with
     nothing queued may run on, but no longer as service. None when neither clock can be read."""
     try:
         start = datetime.fromisoformat(job.started_at or device_hold_episode_since)

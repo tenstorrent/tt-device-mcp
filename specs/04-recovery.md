@@ -1185,7 +1185,7 @@ each rung fires only when the gentler one failed or cannot apply.
   and then `startup_check`, spec 03 I75) and, while the host rung waits on it, `cooldown_until`. One helper, `hold_bound_deadline()`, gives the open
   hold's escalation deadline for every hold kind: its start + the ceiling, or the end of a running
   power-cycle cooldown when that is later; for a `startup_unverified` hold behind a re-adopted
-  job, at least the job's stated end (its start + timeout + 60 s grace, or the hold's start + its
+  job, at least the job's stated end (its start + timeout + 180 s grace, or the hold's start + its
   timeout with no known start) while it runs, and at least its end + `STARTUP_VERIFY_DEFER_MAX_SEC`
   after it (spec 03 I75: the job's run time is service, not hold, up to that stated end; past it the
   bound pages the job as the tenant it waits on, and the stuck-hold watchdog, which counts from the

@@ -16740,6 +16740,69 @@ async def test_the_stuck_hold_watchdog_counts_a_readopted_job_from_its_end(monke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["timeout", "preempt"])
+async def test_a_readopted_job_the_broker_is_stopping_serves_until_the_stop_s_bound(monkeypatch, tmp_path, stop):
+    """Spec 03 I75 (review of 10-20, F3): the stated end's grace was 60 s, shorter than the broker's own
+    stop of a re-adopted job past its timeout: the monitor's poll, SIGINT and its 60 s grace, then a
+    blocking `systemctl stop` (up to systemd's 90 s stop timeout). A job that ignored SIGINT read as
+    overrun while the broker was still reaping it: hold_bound_tenant_blocked named it,
+    hold_stuck_past_deadline fired and both reached the operator's alert hook. Now the grace covers
+    the whole stop (READOPTED_SERVICE_GRACE_SEC): inside it, nothing pages; past it, a job still
+    running is paged, flagged and alerted as before. The preempt path (its window, then SIGKILL) fits
+    inside the same grace."""
+    since, job, climbs, _, gate_heals, release_job, tick, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    job.started_at, job.timeout_sec = since.isoformat(), 1200
+    if stop == "preempt":
+        job.preemptable = True
+        job.preempt_deadline_monotonic = time.monotonic() + srv.PREEMPT_GRACE_SEC
+    gate_heals["on"] = False
+    cycles = _arm_unhealed_power_cycle(monkeypatch)
+    sent = _capture_alerts(monkeypatch)
+    # One clock for the tick and the escalation it spawns (which reads datetime.now() itself).
+    clock = {"now": since}
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    monkeypatch.setattr(srv, "datetime", _Clock)
+
+    async def at(sec):
+        clock["now"] = since + timedelta(seconds=sec)
+        await tick(sec)
+
+    # The broker's stop: the monitor's 5 s poll (twice), then SIGINT + its grace + the reap's `systemctl
+    # stop` (systemd's default 90 s), or the preempt window and its SIGKILL.
+    stop_bound = 2 * 5 + max(srv.GRACEFUL_KILL_GRACE_SEC + 90, srv.PREEMPT_GRACE_SEC)
+
+    # The broker is still stopping the job (SIGINT, its grace, the reap): it is still RUNNING.
+    for sec in (1250, 1300, 1330, 1200 + stop_bound):
+        await at(sec)
+    assert "hold_bound_tenant_blocked" not in [k for k, _ in events], "the broker's own stop paged as a tenant"
+    assert "hold_stuck_past_deadline" not in [k for k, _ in events], "the broker's own stop flagged as stuck"
+    assert sent == [], "the operator was alerted over the broker's own stop"
+    assert climbs == [] and cycles == []
+    grace = srv.READOPTED_SERVICE_GRACE_SEC
+    assert stop_bound < grace <= 300, "the grace covers the broker's whole stop, and stays bounded"
+
+    # Past the grace the job still runs: a stuck tenant, paged by name, flagged and alerted.
+    await at(1200 + grace + 1)
+    blocked = [b for k, b in events if k == "hold_bound_tenant_blocked"]
+    assert blocked, "a job past the stop's bound is paged"
+    assert "hold_stuck_past_deadline" in [k for k, _ in events], "and flagged"
+    assert [e for e in sent if e["kind"] == "hold_stuck_past_deadline"], "and alerted"
+    health = srv._hold_bound_health(since + timedelta(seconds=1200 + grace + 1))
+    assert health["next_step"] == "tenant_blocked" and "re-adopted job 428" in health["blocked_by"]
+    assert climbs == [] and cycles == [], "no reset under the running job"
+
+    _ended_ago(job, 0)
+    await release_job()
+
+
+@pytest.mark.asyncio
 async def test_a_hung_startup_check_gets_the_ladder_by_its_bound_after_the_readopted_jobs_end(monkeypatch, tmp_path):
     """Spec 03 I75 / 04 I76: a startup check that hangs after a 20 min re-adopted job holds the ladder
     off only until STARTUP_VERIFY_DEFER_MAX_SEC (420 s) after the job's end, inside 10 min of it."""
