@@ -703,15 +703,36 @@ def _install_spawn_tripwire(monkeypatch, allow_device_spawns: bool = False):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", guarded_exec)
 
 
+def _reset_server_state():
+    """Drop the broker's process-wide job and hold state (see init_async_primitives)."""
+    _reset_for_testing()
+    srv.job_runner_task = None
+    srv.stats_task = None
+    srv.runner_job_id = None
+    jobs.clear()
+
+
 @pytest.fixture(autouse=True)
 def init_async_primitives():
-    """Initialize async primitives before any test runs."""
+    """Give every test fresh broker job and hold state, and fresh async primitives.
+
+    The queue, lock, runner and stats tasks, the jobs dict and the hold/action rows, hold-episode
+    latches, the hold-escalation buckets, latches and kind, the spec 04 I76 hold-bound latches, the
+    shared recovery mechanism's class-A ladder anchor and kill-reset debt are module globals. Left
+    over, they steer the next test: a queue bound to the previous test's closed loop fails the next
+    lifespan's job runner (which then marks the device dirty and holds it), a hold row one test
+    opened shows up in another's recent-jobs list, and a bound host-rung latch one test set skips
+    the next test's ladder. Everything _reset_for_testing names is reset around every test (spec 09
+    I7); a new global of this kind goes there too. Tasks a test started die with its own loop."""
+    _reset_server_state()
     _ensure_async_primitives()
+    yield
+    _reset_server_state()
 
 
 @pytest.fixture
 def clear_job_state(init_async_primitives):
-    """Clear jobs dict and queue before and after each test."""
+    """Drain the job queue before and after a runner test (the autouse reset does the rest)."""
     # Reset global queue and lock to None so they get recreated in current event loop
     _reset_for_testing()
 

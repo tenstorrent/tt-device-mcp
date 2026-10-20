@@ -2503,6 +2503,16 @@ def _reset_for_testing():
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
     global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
+    global device_op_stage_started_at, device_held_since, device_hold_escalated_monotonic
+    global device_hold_deadline_bucket, device_hold_alert_next_bucket, device_hold_alert_gap
+    global device_hold_escalate_bucket, device_hold_offbus_escalated, device_hold_offbus_tenant_wait
+    global device_hold_offbus_idle_early, device_hold_offbus_prior_bucket, device_hold_tenant_deferred
+    global device_hold_job_bound_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
+    global _forced_escalation_task, _host_action_suppressed_logged, exec_scope_seq
+    global _idle_holder_task, _idle_holder_last_scan
+    global _hold_bound_episode, _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_cycle_age
+    global _hold_bound_check_failed_age, _hold_bound_unarmed_paged, _hold_bound_rung_pending
+    global _hold_bound_denied_why, _hold_bound_tenant_paged, _hold_bound_tenant_blocker
     job_queue = None
     lock = None
     _action_row = None
@@ -2522,12 +2532,50 @@ def _reset_for_testing():
     _hold_carry_loaded = False
     if recovery_mechanism is not None:
         recovery_mechanism.regressed_reset_since = None
+        recovery_mechanism._class_a_ladder_anchor = None
+        recovery_mechanism._class_a_ladder_spawned = None
     _fabric_77_streak_since = None
     _fabric_77_streak = 0
     _fabric_77_paged_since = None
     _fabric_77_recheck_since = None
     _fabric_77_rechecks = 0
     _fabric_77_recheck_monotonic = 0.0
+    # Hold escalation: the deadline/alert buckets, the latches one escalation sets and what triggered it.
+    device_op_stage_started_at = ""
+    device_held_since = ""
+    device_hold_escalated_monotonic = 0.0
+    device_hold_deadline_bucket = 0
+    device_hold_alert_next_bucket = 0
+    device_hold_alert_gap = 0
+    device_hold_escalate_bucket = 0
+    device_hold_offbus_escalated = False
+    device_hold_offbus_tenant_wait = False
+    device_hold_offbus_idle_early = False
+    device_hold_offbus_prior_bucket = None
+    device_hold_tenant_deferred = False
+    device_hold_job_bound_escalated = False
+    device_hold_escalation_trigger = ""
+    device_hold_escalation_kind = ""
+    _forced_escalation_task = None
+    _host_action_suppressed_logged = None
+    reset_killed_job_ids.clear()
+    preempt_forced_job_ids.clear()
+    _client_gone_kills.clear()
+    exec_scope_seq = 0
+    _idle_holders.clear()
+    _idle_holder_task = None
+    _idle_holder_last_scan = 0.0
+    # Spec 04 I76: the 10-min hold bound's per-episode ladder, host-rung and tenant state.
+    _hold_bound_episode = ""
+    _hold_bound_ladder_age = None
+    _hold_bound_ladder_recovered = False
+    _hold_bound_cycle_age = None
+    _hold_bound_check_failed_age = None
+    _hold_bound_unarmed_paged = ""
+    _hold_bound_rung_pending = False
+    _hold_bound_denied_why = ""
+    _hold_bound_tenant_paged = ""
+    _hold_bound_tenant_blocker = None
 
 
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:

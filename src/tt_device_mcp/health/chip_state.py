@@ -98,12 +98,14 @@ _expected: Callable[[], int] = _no_baseline
 
 def reset() -> None:
     """Forget everything (tests; a fresh process starts here)."""
-    global _grace_until, _last_written
+    global _grace_until, _last_written, _present, _expected
     with _lock:
         _lost.clear()
         _recovering.clear()
         _grace_until = 0.0
         _last_written = None
+        _present = _sysfs_indices
+        _expected = _no_baseline
 
 
 def configure(*, present: Optional[Callable[[], list]] = None, expected: Optional[Callable[[], int]] = None) -> None:
