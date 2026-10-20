@@ -255,7 +255,8 @@ async def test_another_tenant_blocks_the_rung_but_the_leftover_itself_does_not(f
 
 async def test_a_running_job_blocks_the_rung(fence, monkeypatch):
     t0 = _open(fence)
-    monkeypatch.setattr(srv.galaxy_recovery.deps, "job_running", lambda: True)
+    # The rung's guard asks for a running job the broker did not kill for recovery (spec 04 I77).
+    monkeypatch.setattr(srv.galaxy_recovery.deps, "live_job_running", lambda: True)
 
     assert await _tick(t0 + BUDGET)
     assert fence["order"] == []
