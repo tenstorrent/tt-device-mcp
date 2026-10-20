@@ -21,7 +21,7 @@ REPO = Path(__file__).resolve().parent.parent
 LEAKING_PAIRS = [
     # The I76 bound's host-rung latch and the escalation kind ('hold_bound_cycle').
     "tests/test_hold_bound.py::test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false",
-    "tests/test_hold_bound.py::test_a_latched_i42_hold_still_escalates_and_its_latch_is_lifted",
+    "tests/test_hold_bound.py::test_a_latched_i42_hold_still_escalates_and_its_latch_stands",
     # The shared recovery mechanism's class-A 10-min ladder anchor.
     "tests/test_power_cycle_ac_needed.py::test_the_watchdog_starts_the_class_a_ladder_at_the_10_min_mark",
     "tests/test_power_cycle_ac_needed.py::test_the_full_ladder_runs_10_min_after_the_last_cycle_or_boot_then_the_cycle",
