@@ -277,8 +277,8 @@ def _shortfalls(monkeypatch, seq):
 
 @pytest.fixture
 def _systemctl(monkeypatch):
-    """The real poller quiesce over a fake ``systemctl``: every call's verb lands in the returned list,
-    and no reset scope is cycling unless a test says so."""
+    """The real poller quiesce over a fake ``systemctl`` on a running poller: every stop and start
+    lands in the returned list, and no reset scope is cycling unless a test says so."""
     calls = []
 
     class _Proc:
@@ -287,9 +287,13 @@ def _systemctl(monkeypatch):
         async def wait(self):
             return 0
 
+        async def communicate(self):
+            return b"active\n", b""
+
     async def fake_exec(program, *args, **kwargs):
         assert program == "systemctl", f"unexpected spawn {program} {args}"
-        calls.append(args[0])
+        if args[0] != "is-active":  # the running-state probe before a stop
+            calls.append(args[0])
         return _Proc()
 
     monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
@@ -1531,6 +1535,7 @@ async def test_the_boot_after_the_brokers_own_power_cycle_latches_nothing_and_st
     row = {"action": "power-cycle", "reason": "idle escalation", "boot_id": "boot-a", "at_epoch": 1325.0}
     (hd / "auto_recovery.jsonl").write_text(json.dumps(row) + "\n")
     monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-b")
+    monkeypatch.setattr(pcie_guard, "_boot_btime", lambda: 1445.0)  # the cycle's boot, 2 min after its row
     _shortfalls(monkeypatch, [(0, 32), None])
     seen = []
 

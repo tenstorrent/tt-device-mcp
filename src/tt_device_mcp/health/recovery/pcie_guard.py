@@ -646,18 +646,39 @@ def close_offbus_reset_before_host_action(action: str, log: Callable[[str], None
         health_event("offbus_reset_intent_unremovable", action=action, error=repr(exc))
 
 
+def _boot_btime() -> Optional[float]:
+    """This boot's start (``/proc/stat`` btime), or None if unreadable."""
+    try:
+        for ln in (SYS_ROOT / "proc/stat").read_text().splitlines():
+            if ln.startswith("btime "):
+                return float(ln.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def _host_action_after(intent: dict) -> Optional[dict]:
     """The newest reboot or power cycle the broker recorded in its auto-recovery ledger at or after
-    ``intent`` was written, on the intent's boot when both name one, or None. Such a row means the
-    broker took the host down itself after that reset: the intent is not a host hang."""
-    from tt_device_mcp.health.recovery.base import AUTO_RECOVERY_LEDGER, AUTO_RECOVERY_RANK  # lazy: base is heavy
+    ``intent`` was written, on the intent's boot when both name one, that brought this boot up, or
+    None. Such a row means the broker took the host down itself after that reset: the intent is not a
+    host hang. The row brought this boot up only when this boot started within the attribution window
+    after it (plus the pending window for a request marked missed or late, spec 04 I72), the rule
+    boot attribution uses everywhere: a request the cycler missed, followed by a real hang and an
+    outside power-off later, is no broker action. An unreadable btime attributes nothing."""
+    from tt_device_mcp.health.recovery.base import (  # lazy: base is heavy
+        AUTO_RECOVERY_LEDGER,
+        AUTO_RECOVERY_RANK,
+        BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC,
+        host_action_pending_sec,
+    )
 
+    btime = _boot_btime()
     try:
         at = float(intent.get("at_epoch"))
         lines = (health_dir() / AUTO_RECOVERY_LEDGER).read_text().splitlines()
     except (OSError, TypeError, ValueError):
         return None
-    if at != at:
+    if at != at or btime is None:
         return None
     for ln in reversed(lines):
         try:
@@ -668,6 +689,10 @@ def _host_action_after(intent: dict) -> Optional[dict]:
         if row.get("action") not in AUTO_RECOVERY_RANK or row_at < at:
             continue
         if row.get("boot_id") and intent.get("boot_id") and row["boot_id"] != intent["boot_id"]:
+            continue
+        late = row.get("late") is True or row.get("took_host_down") is False
+        window = BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC + (host_action_pending_sec() if late else 0)
+        if not 0 <= btime - row_at <= window:
             continue
         return row
     return None

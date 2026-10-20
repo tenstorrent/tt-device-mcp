@@ -334,6 +334,7 @@ def test_tenant_gate_writes_one_held_and_one_released_per_episode(monkeypatch):
 
     srv._note_tenant_gate_verdict("chip 2 fell off the PCIe bus")  # a fresh outage reopens it
     assert [k for k, _ in events] == ["device_held", "device_released", "device_held"]
+    assert events[2][1].get("continues_episode"), "a hold right after a release continues it (04 I82)"
 
 
 def test_idle_blackout_writes_a_durable_held_event_with_no_job_flowing(monkeypatch):
@@ -2880,6 +2881,9 @@ async def test_pollers_quiesce_journals_none_active_when_configured_units_resolv
         async def wait(self):
             return self.returncode
 
+        async def communicate(self):
+            return b"inactive\n", b""
+
     async def _exec(*argv, **kw):
         return _NotLoaded()
 
@@ -2917,8 +2921,8 @@ DEFAULT_POLLERS = ("tt-telemetry.service", "tt-metrics-exporter.service")
 
 
 def test_no_clock_cap_keeper_in_the_default_pollers():
-    """A reset restarts every listed poller, so a clock-cap keeper in the default would come back on
-    a host that masked it. The default names none; a host that runs one opts in by env."""
+    """A clock-cap keeper in the default would be stopped and restarted by every reset on every host.
+    The default names none; a host that runs one opts in by env."""
     assert srv.DEFAULT_POLLER_SERVICES.split(",") == list(DEFAULT_POLLERS)
     assert "fmax" not in srv.DEFAULT_POLLER_SERVICES
 
@@ -2937,19 +2941,31 @@ def test_the_specs_name_the_default_pollers():
     assert "fmax" not in i12, i12
 
 
-def _systemctl_with_units(installed, calls):
-    """A `systemctl` stand-in: 0 for a unit the host has, 5 (not loaded) for one it lacks."""
+def _systemctl_with_units(installed, calls, stopped=()):
+    """A `systemctl` stand-in: 0 for a unit the host has, 5 (not loaded) for one it lacks. `is-active`
+    reads "active" for an installed unit unless it is in ``stopped``; a stop or start updates that."""
+    stopped = set(stopped)
 
     class _Proc:
-        def __init__(self, rc):
+        def __init__(self, rc, out=b""):
             self.returncode = rc
+            self._out = out
 
         async def wait(self):
             return self.returncode
 
+        async def communicate(self):
+            return self._out, b""
+
     async def _exec(*argv, **kw):
+        verb, unit = argv[1], argv[2]
         calls.append(argv[1:])
-        return _Proc(0 if argv[2] in installed else 5)
+        if verb == "is-active":
+            up = unit in installed and unit not in stopped
+            return _Proc(0 if up else 3, b"active\n" if up else b"inactive\n")
+        if unit in installed:
+            (stopped.add if verb == "stop" else stopped.discard)(unit)
+        return _Proc(0 if unit in installed else 5)
 
     return _exec
 
@@ -2967,18 +2983,21 @@ async def test_pollers_quiesce_skips_a_default_poller_the_host_does_not_have(mon
         _systemctl_with_units({"tt-telemetry.service", "tt-metrics-exporter.service"}, calls),
     )
 
-    touched = await srv._set_device_pollers(active, lambda m: None)
+    touched = await srv._set_device_pollers(False, lambda m: None)
+    if active:
+        touched = await srv._set_device_pollers(True, lambda m: None)
 
     assert touched == ["tt-telemetry.service", "tt-metrics-exporter.service"]
     assert health.read_health_events(kinds={"pollers_none_active"}) == []
     kind = "pollers_restarted" if active else "pollers_quiesced"
     assert health.read_health_events(kinds={kind})[-1]["services"] == touched
+    assert ("start", "tt-fmax-cap.service") not in calls
 
 
 @pytest.mark.asyncio
 async def test_pollers_quiesce_stops_and_restarts_an_opted_in_fmax_cap(monkeypatch):
-    """A host that opts tt-fmax-cap in via the env list gets it stopped with the other pollers and
-    started again by the restore."""
+    """A host that opts tt-fmax-cap in via the env list, with it running, gets it stopped with the
+    other pollers and started again by the restore."""
     listed = DEFAULT_POLLERS + ("tt-fmax-cap.service",)
     monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", listed)
     calls = []
@@ -3144,6 +3163,205 @@ async def test_a_step_that_did_not_complete_owes_the_pollers_even_on_a_healthy_f
     await asyncio.gather(*list(srv._pollers_restore_tasks))
     assert [c for c in calls if c[0] == "start"] == [("start", u) for u in DEFAULT_POLLERS]
     assert srv._pollers_owed is None
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_leaves_a_poller_stopped_that_was_stopped_before(monkeypatch):
+    """An installed poller an operator stopped on purpose (tt-telemetry, say) must not come back
+    because a reset happened: the restore starts only what the stop found running."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(
+        srv.asyncio,
+        "create_subprocess_exec",
+        _systemctl_with_units(set(DEFAULT_POLLERS), calls, stopped={"tt-telemetry.service"}),
+    )
+    lines = []
+
+    await srv._set_device_pollers(False, lines.append)
+    restarted = await srv._set_device_pollers(True, lines.append)
+
+    assert restarted == ["tt-metrics-exporter.service"]
+    assert ("start", "tt-telemetry.service") not in calls
+    assert any("left device pollers stopped" in m and "tt-telemetry.service" in m for m in lines), lines
+    assert health.read_health_events(kinds={"pollers_none_active"}) == []
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_starts_nothing_when_every_poller_was_already_stopped(monkeypatch):
+    """With every poller stopped before the reset, the restore starts none and raises no alarm."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(
+        srv.asyncio,
+        "create_subprocess_exec",
+        _systemctl_with_units(set(DEFAULT_POLLERS), calls, stopped=set(DEFAULT_POLLERS)),
+    )
+
+    await srv._set_device_pollers(False, lambda m: None)
+    assert await srv._set_device_pollers(True, lambda m: None) == []
+
+    assert not [c for c in calls if c[0] == "start"], calls
+    assert health.read_health_events(kinds={"pollers_none_active"}) == []
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_covers_a_poller_an_earlier_stop_took_down(monkeypatch):
+    """The dead-chip path stops the pollers and the reset that follows finds them already down. The
+    reset's restore must still bring back what was running before the first stop."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+
+    await srv._set_device_pollers(False, lambda m: None)  # dead chip: stop, no restore
+    await srv._set_device_pollers(False, lambda m: None)  # the reset's quiesce
+    assert await srv._set_device_pollers(True, lambda m: None) == list(DEFAULT_POLLERS)
+    # Restored once; a second restore has nothing left to start.
+    assert await srv._set_device_pollers(True, lambda m: None) == []
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_counts_a_crash_looping_poller_as_running(monkeypatch):
+    """A poller systemd is restarting reads "activating" between attempts. It was running, so the
+    restore brings it back."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    calls = []
+
+    class _Proc:
+        def __init__(self, rc, out=b""):
+            self.returncode, self._out = rc, out
+
+        async def wait(self):
+            return self.returncode
+
+        async def communicate(self):
+            return self._out, b""
+
+    async def _exec(*argv, **kw):
+        calls.append(argv[1:])
+        return _Proc(3, b"activating\n") if argv[1] == "is-active" else _Proc(0)
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _exec)
+
+    await srv._set_device_pollers(False, lambda m: None)
+    assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+
+
+def _systemctl_scripted(calls, *, stop=None, start=None, state=b"active\n"):
+    """A `systemctl` stand-in for one unit: `is-active` prints ``state``; ``stop``/``start`` are
+    ``(rc, delay_s)`` for that verb (default ``(0, 0)``)."""
+
+    class _Proc:
+        def __init__(self, rc, out=b"", delay=0.0):
+            self.returncode, self._out, self._delay = rc, out, delay
+
+        async def wait(self):
+            await asyncio.sleep(self._delay)
+            return self.returncode
+
+        async def communicate(self):
+            await asyncio.sleep(self._delay)
+            return self._out, b""
+
+    async def _exec(*argv, **kw):
+        verb = argv[1]
+        calls.append(argv[1:])
+        if verb == "is-active":
+            return _Proc(0, state)
+        rc, delay = {"stop": stop, "start": start}.get(verb) or (0, 0.0)
+        return _Proc(rc, delay=delay)
+
+    return _exec
+
+
+def _short_poller_bound(monkeypatch, bound=0.1):
+    real = srv.aio.wait_for
+    monkeypatch.setattr(srv.aio, "wait_for", lambda aw, timeout: real(aw, timeout=min(timeout, bound)))
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_covers_a_poller_whose_stop_outlasts_its_bound(monkeypatch):
+    """A running poller whose `systemctl stop` outlasts its bound (stuck in MMIO on a hung chip) is
+    still recorded, so the restore starts it, and it is owed to the next close to HEALTHY in case no
+    stop returned 0 and the caller skips the inline restore."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    _short_poller_bound(monkeypatch)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_scripted(calls, stop=(0, 0.5)))
+
+    assert await srv._set_device_pollers(False, lambda m: None) == []
+    assert srv._pollers_owed is not None
+    assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+    assert srv._pollers_owed is None
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_covers_a_poller_whose_stop_fails(monkeypatch):
+    """A running poller whose stop returns non-zero is still restored."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_scripted(calls, stop=(1, 0.0)))
+
+    await srv._set_device_pollers(False, lambda m: None)
+    assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_counts_a_poller_whose_state_cannot_be_read_as_running(monkeypatch):
+    """A state probe that outlasts the bound, or prints nothing, says nothing: the unit is restored,
+    as every unit was before the restore record existed."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_scripted(calls, state=b""))
+    await srv._set_device_pollers(False, lambda m: None)
+    assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+
+    _short_poller_bound(monkeypatch)
+
+    async def _hung_probe(*argv, **kw):
+        calls.append(argv[1:])
+        if argv[1] == "is-active":
+            await asyncio.sleep(0.5)
+        return await _systemctl_scripted([])(*argv, **kw)
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _hung_probe)
+    await srv._set_device_pollers(False, lambda m: None)
+    assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_retries_a_start_that_failed(monkeypatch):
+    """A start that fails or outlasts its bound keeps the unit recorded, and the next restore
+    starts it."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    _short_poller_bound(monkeypatch)
+    for failed_start in ((1, 0.0), (0, 0.5)):
+        calls = []
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_scripted(calls, start=failed_start))
+        await srv._set_device_pollers(False, lambda m: None)
+        assert await srv._set_device_pollers(True, lambda m: None) == []
+        assert "tt-telemetry.service" in srv._pollers_restore_record()
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_scripted(calls))
+        assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+        assert srv._pollers_restore_record() == set()
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_record_survives_a_broker_restart(monkeypatch):
+    """The dead-chip valve stops the pollers, the broker restarts (a deploy, a self-update), and the
+    reset that follows finds them already down. Its restore still starts them: the record is on disk."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+
+    await srv._set_device_pollers(False, lambda m: None)  # dead chip: stop, no restore
+    monkeypatch.setattr(srv, "_pollers_to_restore", None)  # a new broker process
+    await srv._set_device_pollers(False, lambda m: None)  # the reset's quiesce finds them down
+    assert await srv._set_device_pollers(True, lambda m: None) == list(DEFAULT_POLLERS)
+
+    monkeypatch.setattr(srv, "_pollers_to_restore", None)
+    assert srv._pollers_restore_record() == set()  # the start that returned 0 cleared it on disk too
 
 
 # --- the reset is exclusive --------------------------------------------------
@@ -4140,11 +4358,14 @@ def _patch_device_holders(monkeypatch, scan, ppids=None):
     monkeypatch.setattr(device_holders, "_read_proc_ppid", (ppids or {}).get)
 
 
-async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=lambda: ""):
+async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=lambda: "", settle_sec=0.05):
     """Run one exit-0 job through the real runner; return (job, systemctl calls, is-active calls, killpgs).
 
     ``scope_active`` answers every is-active query, or is a list answered in order (the last
-    answer then repeats). ``holders`` stands in for the holder scan before dispatch."""
+    answer then repeats). ``holders`` stands in for the holder scan before dispatch.
+    ``settle_sec`` is the scope settle window: short by default so a leftover is reaped fast; a
+    test whose scope must settle inside it passes a long one, since each is-active re-check is a
+    thread hop that a loaded host can delay past a short window."""
     _free_device_lock(monkeypatch)
     _quiet_post_job_gate(monkeypatch)
 
@@ -4158,7 +4379,7 @@ async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=la
     monkeypatch.setattr(srv, "privsep_prefix_for", lambda uid, unit=None: ["env"] if privsep else None)
     monkeypatch.setattr(srv, "GRACEFUL_KILL_GRACE_SEC", 0.05)
     monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
-    monkeypatch.setattr(srv, "_SCOPE_SETTLE_SEC", 0.05)
+    monkeypatch.setattr(srv, "_SCOPE_SETTLE_SEC", settle_sec)
     monkeypatch.setattr(srv, "_SCOPE_SETTLE_POLL_SEC", 0.01)
 
     active_checks = []
@@ -4195,9 +4416,8 @@ async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=la
     await srv.get_job_queue().put(job_id)
     runner = asyncio.create_task(srv.job_runner())
     try:
-        for _ in range(300):
-            if job.finished_at:
-                break
+        deadline = asyncio.get_running_loop().time() + 30.0
+        while not job.finished_at and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.02)
     finally:
         runner.cancel()
@@ -4234,7 +4454,7 @@ async def test_a_scope_that_settles_after_its_job_is_not_signalled(monkeypatch, 
     """systemd sees an emptied scope asynchronously: a scope still active for a moment after a clean
     exit is not a leftover, and is not logged or signalled as one."""
     job, systemctl, active_checks, _ = await _run_one_job(
-        monkeypatch, "924", privsep=True, scope_active=[True, True, False]
+        monkeypatch, "924", privsep=True, scope_active=[True, True, False], settle_sec=30.0
     )
     assert job.status is srv.JobStatus.COMPLETED
     assert len(active_checks) == 3
@@ -5699,8 +5919,13 @@ def test_an_unconfigured_host_still_has_a_terminating_ladder(monkeypatch, tmp_pa
 
     assert srv._auto_reboot_enabled(), "the warm-reboot rung must be armed on an unconfigured host"
     assert srv._auto_power_cycle_enabled(), "the cold rung must be armed on an unconfigured host"
-    # Gentlest-first still holds: an ordinary partial drop takes the reboot, not the power cycle.
-    assert galaxy._host_escalation_for_drop(off_bus=1, expected=8, **srv._host_escalation_kwargs()) == ("reboot", False)
+    # Spec 04 I71: on a multi-chip host the cold rung goes first, a partial drop included; a warm
+    # reboot does not re-power the trays. A single-chip host keeps the reboot first.
+    assert galaxy._host_escalation_for_drop(off_bus=1, expected=8, **srv._host_escalation_kwargs()) == (
+        "power-cycle",
+        False,
+    )
+    assert galaxy._host_escalation_for_drop(off_bus=1, expected=1, **srv._host_escalation_kwargs()) == ("reboot", False)
     # The drop that used to strand the queue: reboot proven futile, so climb — never (None, True).
     assert galaxy._host_escalation_for_drop(
         off_bus=3, expected=8, warm_reboot_futile=True, **srv._host_escalation_kwargs()
@@ -5752,9 +5977,9 @@ async def test_auto_power_cycle_aborts_when_the_ledger_cannot_be_written(monkeyp
 
 
 def test_reboot_already_attempted_ignores_this_boot_and_stale_records(monkeypatch, tmp_path):
-    """The escalation trigger is a reboot from a PREVIOUS boot within the interval. A reboot record
-    stamped with the current boot has not taken the box down yet; a reboot older than the interval
-    is a different, already-recovered wedge. Neither is the 'reboot did not clear it' signal."""
+    """The escalation trigger is a reboot from a PREVIOUS boot in this episode (spec 04 I10). A reboot
+    record stamped with the current boot has not taken the box down yet; a reboot a verified release
+    followed is a different, already-recovered wedge. Neither is the 'reboot did not clear it' signal."""
     d = _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-B")
     monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MIN_INTERVAL_SEC", 3600)
@@ -5762,11 +5987,13 @@ def test_reboot_already_attempted_ignores_this_boot_and_stale_records(monkeypatc
     # This-boot reboot: box has not gone down for it yet.
     d_ledger.write_text('{"action": "reboot", "boot_id": "boot-B", "at_epoch": 1000.0}\n')
     assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1060.0) is False
-    # Previous-boot reboot but older than the interval: a separate, recovered wedge.
+    # Previous-boot reboot: the escalation signal, past the interval too while no release verified.
     d_ledger.write_text('{"action": "reboot", "boot_id": "boot-A", "at_epoch": 1000.0}\n')
-    assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1000.0 + 4000) is False
-    # Previous-boot reboot within the interval: the escalation signal.
     assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1060.0) is True
+    assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1000.0 + 4000) is True
+    # A verified release after it: a separate, recovered wedge.
+    (d / recovery_base.AUTO_RECOVERY_VERIFIED).write_text('{"boot_id": "boot-B", "at_epoch": 1300.0}')
+    assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1000.0 + 4000) is False
 
 
 def test_unreadable_boot_id_never_escalates_to_power_cycle(monkeypatch, tmp_path):
@@ -11291,17 +11518,85 @@ async def test_forced_offbus_ladder_after_a_regression_sweeps_then_power_cycles_
 
 @pytest.mark.asyncio
 async def test_an_early_regression_is_latched_before_the_ceiling_deferral(monkeypatch, clear_job_state):
-    """A regression on an early forced pass (hold younger than the ceiling, so the host rung defers) is
-    still latched: the next pass does not reset again. Fails on base, which only looked for a
-    regression after the deferral returned."""
+    """A regression on an early forced pass (hold younger than the ceiling) is still latched: the next
+    pass does not reset again. Fails on base, which only looked for a regression after the deferral
+    returned. Since I79's regressed case the early pass no longer defers: with no power cycle opted in
+    it pages for the cold rung at once."""
     counters, events = _arm_regressed_offbus_hold(monkeypatch, held_minutes_ago=3)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
     assert counters["resets"] == 1
-    assert "reset_regressed_offbus" in events and "host_rung_deferred_until_ladder_end" in events
+    assert "reset_regressed_offbus" in events and "host_rung_deferred_until_ladder_end" not in events
+    assert "reset_unrecoverable_power_cycle_required" in events
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
     assert counters["resets"] == 1, "an early regression must latch the episode too"
     assert counters["reboots"] == 0 and counters["power_cycles"] == 0
+
+
+def _arm_regressed_b1_hold_before_the_ceiling(monkeypatch, sweep_result):
+    """Replay of a class B1 episode: a post-job reset dropped one chip (1/32 off the bus, the regression
+    latched before the hold opened) and the first forced pass comes 96 s into the hold, power cycle
+    opted in. The sweep stub records whether the cold rung had fired before it ran."""
+    counters, events = _arm_regressed_offbus_hold(monkeypatch, held_minutes_ago=1.6)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(31)})  # 1 off-bus
+    srv.recovery_mechanism.note_reset_regressed(srv.device_hold_episode_since)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    counters["cycled_before_sweep"] = 0
+
+    async def sweep(*a, **k):
+        counters["sweeps"] += 1
+        counters["cycled_before_sweep"] += counters["power_cycles"]
+        return sweep_result
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", sweep)
+    return counters, events
+
+
+@pytest.mark.asyncio
+async def test_a_regressed_offbus_hold_sweeps_then_power_cycles_before_the_ceiling(monkeypatch, clear_job_state):
+    """Spec 04 I79/I31, class B1: a hold whose reset regressed the mesh has no reset rung left (I31), so
+    the climb does not wait for the 600 s ceiling: it sweeps (I22), then requests the power cycle on the
+    first forced pass. Fails on base, which deferred to the ceiling (host_rung_deferred_until_ladder_end,
+    no sweep, no cycle): one 8-chip hold waited 512 s there and was released at 904 s, over the 900 s
+    B1 power-cycle budget."""
+    counters, events = _arm_regressed_b1_hold_before_the_ceiling(monkeypatch, sweep_result=False)
+    ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    hold_age = (datetime.now() - datetime.fromisoformat(srv.device_hold_episode_since)).total_seconds()
+    assert ran is True and "galaxy_reset_skipped_regressed" in events
+    assert "host_rung_not_deferred" in events and "host_rung_deferred_until_ladder_end" not in events
+    assert counters["resets"] == 0 and counters["sbr"] == 0 and counters["trays"] == 0, "I31: no reset rung"
+    assert counters["sweeps"] == 1 and counters["cycled_before_sweep"] == 0, "the full ladder runs first (I22)"
+    assert counters["power_cycles"] == 1 and counters["reboots"] == 0, "warm reboot futile: the cold rung"
+    assert hold_age < 600, "the cycle is asked on the first forced pass, not at the ceiling"
+    # Time to recover with the measured rung times of that episode: sweep 110 s, cycle to broker start
+    # 151 s, startup full check with fabric 33 s (03 I4, before any release). Base asked at the 609 s
+    # forced pass: 903 s; now about 390 s.
+    assert hold_age + 110 + 151 + 33 < 900 / 2
+
+
+@pytest.mark.asyncio
+async def test_a_regressed_offbus_hold_whose_sweep_recovers_does_not_power_cycle(monkeypatch, clear_job_state):
+    """Spec 04 I79: the early climb still stops at a sweep whose full check passes (a per-tray re-power
+    healed one such Galaxy drop); only the cycle is skipped, never the sweep."""
+    counters, events = _arm_regressed_b1_hold_before_the_ceiling(monkeypatch, sweep_result=True)
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["sweeps"] == 1 and "host_rung_not_deferred" in events
+    assert counters["power_cycles"] == 0 and counters["reboots"] == 0 and counters["resets"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_regressed_offbus_hold_whose_cycle_is_held_off_neither_sweeps_nor_resets(monkeypatch, clear_job_state):
+    """Spec 04 I79: a cold rung auto_recovery_allowed holds off (the I65 cooldown here) before the ceiling
+    returns before the sweep, as it does at the ceiling: no sweep is repeated each forced window and no
+    reset rung runs (I31); the next window asks again."""
+    counters, events = _arm_regressed_b1_hold_before_the_ceiling(monkeypatch, sweep_result=False)
+    monkeypatch.setattr(
+        srv.recovery_mechanism, "auto_recovery_allowed", lambda *a, **k: (False, "power-cycle cooldown")
+    )
+    for _ in range(2):
+        await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["sweeps"] == 0 and counters["resets"] == 0 and counters["trays"] == 0
+    assert counters["power_cycles"] == 0 and counters["reboots"] == 0
 
 
 @pytest.mark.asyncio
@@ -15585,6 +15880,7 @@ def test_a_healthy_startup_gate_clears_a_dead_brokers_hold_clock(monkeypatch, tm
     start, so the new hold was born past its escalation windows and forced the ladder at once. The
     verified-healthy clear is where that episode provably ended. Fails on base: the file survived."""
     _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
+    monkeypatch.setattr(srv, "_HOLD_CARRY_SEC", -1)  # the drop comes after the 04 I82 carry window
 
     srv._clear_device_dirty(verified=True, why="gate/startup: verified healthy")
 
@@ -15599,6 +15895,7 @@ def test_a_hold_after_the_device_was_seen_fit_never_inherits_the_clock(monkeypat
     Fails on base: the hold restored the file regardless."""
     _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
     monkeypatch.setattr(srv, "_persist_hold_episode", lambda *a, **k: None)  # the unlink fails
+    monkeypatch.setattr(srv, "_HOLD_CARRY_SEC", -1)  # the hold comes after the 04 I82 carry window
 
     srv._note_tenant_gate_verdict("")  # a tenant gate passed: fit, no hold open
 

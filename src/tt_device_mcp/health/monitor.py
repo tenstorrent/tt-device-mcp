@@ -574,8 +574,8 @@ class HealthMonitor:
             # still runs (it may name another fault) and fails on the same drop.
             unseen = self.links_unseen_by_traffic() if link_drop and not fabric_asked else ""
             # A link-drop skip is a standing condition, not a stuck read: rate-limit its pass (a
-            # descriptor run, whose validator names the missing links itself). Only a recent
-            # PASSING pass covers it: a failed or unknown last verdict is no cover (03 I30).
+            # descriptor run, whose validator names the missing links itself). Only a recent PASSING
+            # pass covers it: a failed or unknown last verdict is no cover (03 I30).
             link_drop_held = (
                 not fabric_asked and link_drop and not unseen and not fabric_stale and self.last_fabric_ok is True
             )
