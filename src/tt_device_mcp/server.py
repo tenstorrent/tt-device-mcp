@@ -1195,8 +1195,8 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         # A fresh process has no lost or recovering chip: publish that now, over whatever a process
         # that died mid-recovery left in the file (a per-user daemon's state dir outlives it).
         chip_state.publish()
-        recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
-        recovery_mechanism.reenumerate_fence = lambda: _dead_chip_stuck_reason()
+        recovery_mechanism.reset_fence = lambda: _dead_chip_isolation_pending_reason() or _reaped_leftover_reason()
+        recovery_mechanism.reenumerate_fence = lambda: _dead_chip_isolation_pending_reason() or _dead_chip_stuck_reason()
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
         )
@@ -8568,6 +8568,19 @@ def _dead_chip_stuck_leftovers(exclude: set) -> list[ReapedLeftover]:
         elif pid not in exclude:
             found.append(f)
     return found
+
+
+def _dead_chip_isolation_pending_reason() -> str:
+    """Why no reset may run yet (spec 03 I19): a dead chip's endpoint removal is still waiting, off
+    the sampler, for the holders it killed to let go. The device is already dirty; the wait is
+    bounded by HOLDER_RELEASE_WAIT_SEC, then the removal runs. '' when none is pending."""
+    pending = getattr(sampler, "isolations", None) or ()
+    if not any(not t.done() for t in pending):
+        return ""
+    return (
+        "a dead chip's endpoint removal is still waiting for its killed holders to let go "
+        f"(at most {HOLDER_RELEASE_WAIT_SEC}s, spec 03 I19)"
+    )
 
 
 def _dead_chip_stuck_reason() -> str:

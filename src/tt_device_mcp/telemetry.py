@@ -168,6 +168,8 @@ class TelemetrySampler:
         # few seconds costs effectively nothing and is the only way to see the run-up.
         self.ring: deque = deque(maxlen=SAMPLE_RING_SIZE)
         self.task: Optional[asyncio.Task] = None
+        # The dead-chip release waits and endpoint removals running off the loop (spec 03 I19).
+        self.isolations: set = set()
         # All-ones on EVERY chip at once is not 32 independent failures. It is the driver, the
         # bus, or a reset — a global event — and removing every device in response leaves a box
         # with nothing to run on and no way back except a rescan. Treat it as a fault to
@@ -506,18 +508,45 @@ class TelemetrySampler:
         if self._deps.owe_device_pollers is not None:
             self._deps.owe_device_pollers(f"chip(s) {','.join(fresh)} left the PCIe bus")
 
+        # Held from here, before any wait (spec 03 I19): with the fsm still HEALTHY a post-job gate
+        # that meets a lingering killed holder would hold nothing, and the next job could map the
+        # dead chip before its endpoint is gone.
+        self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} fell off the PCIe bus", why="heartbeat")
+
         # A SIGKILLed holder can sit in the driver's release for seconds after the signal, its
         # device fds still open. Remove the endpoint (and let recovery reset the bridge) only
-        # once the killed pids have let go, or the bound has passed (spec 03 I19, 01 I67): a
-        # killed process issues no further reads, so the wait costs nothing in host risk, and
-        # one already gone costs one scan.
-        wait = self._deps.wait_device_released
+        # once the killed pids have let go, or the bound has passed (spec 03 I19, 01 I67). The
+        # wait runs off this loop: the sampler keeps checking the other chips and keeps driving
+        # the hold deadline (the 10-min ladder) meanwhile. One already gone costs one scan.
         pids = [k["pid"] for k in killed or () if isinstance(k.get("pid"), int)]
-        if wait is not None and pids:
-            lingering = sorted(await wait(pids))
+        if self._deps.wait_device_released is not None and pids:
+            task = asyncio.create_task(self._detached_isolation(fresh, killed or [], pids))
+            self.isolations.add(task)
+            task.add_done_callback(self.isolations.discard)
+            return
+        await self._finish_isolation(fresh, killed or [], [])
+
+    async def settle_isolations(self) -> None:
+        """Wait for every detached release wait and endpoint removal to finish."""
+        while self.isolations:
+            await asyncio.gather(*list(self.isolations), return_exceptions=True)
+
+    async def _detached_isolation(self, fresh: list, killed: list, pids: list) -> None:
+        try:
+            await self._finish_isolation(fresh, killed, pids)
+        except Exception as e:  # noqa: BLE001 - off the loop, nothing else would log it
+            log = self._deps.logger()
+            if log:
+                log.error(f"DEAD-CHIP isolation of chip(s) {fresh} failed: {e}")
+
+    async def _finish_isolation(self, fresh: list, killed: list, pids: list) -> None:
+        """The release wait for ``pids`` (none: no wait), then the endpoint removal. The device is
+        already dirty, so it stays held until recovery's reset and full post-reset check pass."""
+        log = self._deps.logger()
+        if pids:
+            lingering = sorted(await self._deps.wait_device_released(pids))
             if lingering:
-                # Bounded: the removal goes ahead as before; the episode is dirty, so the device
-                # stays held until recovery's reset and full post-reset check pass.
+                # Bounded: the removal goes ahead as before.
                 if log:
                     log.error(
                         f"DEAD-CHIP killed holder(s) {lingering} still hold the device at the "
@@ -566,7 +595,6 @@ class TelemetrySampler:
             )
         self._deps.health_event("chip_isolated", chips=removed)
 
-        self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} fell off the PCIe bus", why="heartbeat")
         await asyncio.to_thread(
             self._deps.capture_incident,
             "chip_dead",

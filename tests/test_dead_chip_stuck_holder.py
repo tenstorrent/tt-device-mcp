@@ -485,6 +485,7 @@ async def test_the_dead_chip_path_notes_stuck_holders_and_says_the_host_is_still
     monkeypatch.setattr(srv.sampler._deps, "logger", lambda: log)
 
     await srv.sampler.isolate_dead_chips(["13"])
+    await srv.sampler.settle_isolations()
 
     assert noted and noted[0][0] == ["13"] and [k["pid"] for k in noted[0][1]] == [4242]
     assert ("remove", "13") in order
