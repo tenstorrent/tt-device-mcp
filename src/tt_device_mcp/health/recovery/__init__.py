@@ -76,6 +76,9 @@ OUTCOME_TERMINAL = "terminal"
 # is what turns a ~13 min recovery into a ~seconds one.
 BRIDGE_RESET_MAX_TRIES = 3
 BRIDGE_RESET_SETTLE_SEC = 4
+# The bridge rung's reason for a removed chip whose every recorded-bridge SBR fired and left it off
+# the bus (spec 04 I69); _classify_hold reads it as no window, like no_bridge.
+NO_WINDOW_REMOVED_REASON = "removed_not_reenumerated"
 
 # A reset returns before the eth links re-train, so the immediate post-reset fabric pass can find
 # no trained link (77). Retry (see Recovery._verify_device_after_reset), giving the links time to
@@ -591,6 +594,11 @@ class Recovery(ABC):
                     await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
             else:
                 lost.append(idx)
+                if idx in reset_this_pass:
+                    # A chip the broker removed, reset through its recorded bridge on every try and
+                    # still off the bus: no SBR brings it back, the same no-window fact as no_bridge,
+                    # so its hold keeps its off-bus class (galaxy._classify_hold, spec 04 I69).
+                    self.last_bridge_reset_reasons[idx] = {"reason": NO_WINDOW_REMOVED_REASON}
                 metrics.stage_fired("bridge_reset", "failed")
 
         for idx in recovered:

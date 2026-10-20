@@ -11,6 +11,7 @@ holds the value, so a probe here is a file read and nothing reaches the chip.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -353,7 +354,10 @@ def pci_bus_number(address) -> Optional[int]:
 # Once the endpoint's node is removed its parent link is gone with it, so the bridge a reset must
 # go through is recorded HERE, before the remove. A chip in this map is hung AND un-enumerated by
 # us: re-enumerating it without a reset first lets the driver probe a hung chip (spec 04 I69).
+# Kept on disk too (REMOVED_CHIPS_FILE), so a broker restart does not forget a chip it removed.
 REMOVED_CHIPS: dict = {}
+REMOVED_CHIPS_FILE = "removed_chips.json"
+BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
 
 _BDF_RE = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]")
 
@@ -369,19 +373,94 @@ def parent_bridge(bdf: Optional[str]) -> Optional[str]:
     return bridge if _BDF_RE.fullmatch(bridge) else None
 
 
+def _boot_id() -> str:
+    try:
+        return BOOT_ID_FILE.read_text().strip()
+    except OSError:
+        return ""
+
+
+def _save_removed_chips() -> None:
+    """Write the records with this boot's id, atomically. State that cannot be written must not
+    break recovery: the in-memory records still guard this process."""
+    try:
+        p = evidence.health_dir() / REMOVED_CHIPS_FILE
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps({"boot_id": _boot_id(), "chips": REMOVED_CHIPS}))
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def load_removed_chips() -> list:
+    """Reload the records a previous broker process of THIS boot left, at broker start (spec 04 I69).
+    A record from another boot is dropped: the boot reset every endpoint, so the chip is no longer
+    un-reset, and its bus numbers may have moved. Records of chips back on the bus are dropped too.
+    Returns the chip ids still recorded."""
+    try:
+        data = json.loads((evidence.health_dir() / REMOVED_CHIPS_FILE).read_text())
+    except (OSError, ValueError):
+        data = None
+    chips = data.get("chips") if isinstance(data, dict) else None
+    if isinstance(chips, dict) and chips:
+        if data.get("boot_id") and data.get("boot_id") == _boot_id():
+            for idx, rec in chips.items():
+                if str(idx).isdigit() and isinstance(rec, dict):
+                    REMOVED_CHIPS.setdefault(str(idx), {"bdf": rec.get("bdf"), "bridge": rec.get("bridge")})
+            evidence.health_event("removed_chip_records_loaded", chips=sorted(REMOVED_CHIPS, key=int))
+        else:
+            evidence.health_event("removed_chip_records_cleared", chips=sorted(chips), reason="new_boot")
+    forget_returned_removed_chips("broker start")
+    _save_removed_chips()
+    return removed_chip_ids()
+
+
+def _back_on_bus(idx: str, rec: dict) -> bool:
+    """Whether a removed chip, or anything at its recorded address, is enumerated again."""
+    try:
+        if (SYSFS_CLASS_DIR / f"tenstorrent!{idx}").exists():
+            return True
+        bdf = rec.get("bdf") if isinstance(rec, dict) else None
+        return bool(bdf) and (PCI_DEVICES_DIR / bdf).exists()
+    except OSError:
+        return False
+
+
+def forget_returned_removed_chips(context: str) -> list:
+    """Drop every record whose chip is enumerated again, whatever brought it back (a bridge reset, a
+    mesh reset, a tray re-power, a power cycle, an outside rescan): a record only describes a chip
+    that is still off the bus. Left standing, it would withhold every later rescan and aim a bridge
+    reset at a bus that now holds live silicon. Never releases anything (spec 04 I69)."""
+    back = [i for i in sorted(REMOVED_CHIPS, key=int) if _back_on_bus(i, REMOVED_CHIPS[i])]
+    for i in back:
+        REMOVED_CHIPS.pop(i, None)
+    if back:
+        _save_removed_chips()
+        evidence.health_event("removed_chip_records_cleared", chips=back, reason="back_on_bus", context=context)
+    return back
+
+
 def removed_chip(idx) -> Optional[dict]:
-    """The record isolate_chip left for a chip it removed, or None when the broker did not remove it."""
-    return REMOVED_CHIPS.get(str(idx))
+    """The record isolate_chip left for a chip it removed, or None when the broker did not remove it
+    or the chip is back on the bus."""
+    rec = REMOVED_CHIPS.get(str(idx))
+    if rec is not None and _back_on_bus(str(idx), rec):
+        forget_returned_removed_chips("record read")
+        return None
+    return rec
 
 
 def removed_chip_ids() -> list:
-    """Every chip that still has a removal record, sorted by index."""
+    """Every chip that still has a removal record and is still off the bus, sorted by index."""
+    forget_returned_removed_chips("record read")
     return sorted(REMOVED_CHIPS, key=int)
 
 
 def forget_removed_chip(idx) -> None:
     """Drop the removal record of a chip that is back on the bus."""
-    REMOVED_CHIPS.pop(str(idx), None)
+    if REMOVED_CHIPS.pop(str(idx), None) is not None:
+        _save_removed_chips()
 
 
 def isolate_chip(idx: str) -> bool:
@@ -406,6 +485,7 @@ def isolate_chip(idx: str) -> bool:
         return False
     # Record the bridge BEFORE the remove: afterwards the node and its parent link are gone.
     REMOVED_CHIPS[str(idx)] = {"bdf": bdf, "bridge": parent_bridge(bdf)}
+    _save_removed_chips()
     try:
         (PCI_DEVICES_DIR / bdf / "remove").write_text("1")
         return True

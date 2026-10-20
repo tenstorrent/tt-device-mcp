@@ -171,6 +171,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.health.monitors.pci import load_removed_chips
 from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
@@ -1189,6 +1190,9 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         # A fresh process has no lost or recovering chip: publish that now, over whatever a process
         # that died mid-recovery left in the file (a per-user daemon's state dir outlives it).
         chip_state.publish()
+        # Spec 04 I69: a chip an earlier broker process of this boot removed is still hung and
+        # un-reset; without its record a rescan would re-enumerate it before any reset.
+        load_removed_chips()
         recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
