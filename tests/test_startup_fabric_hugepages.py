@@ -1350,85 +1350,80 @@ async def test_the_77_bound_pages_once_per_hold_episode(monkeypatch, tmp_path, c
 
 
 @pytest.mark.asyncio
-async def test_the_topology_hw_fault_hold_repages_once_per_interval_per_episode(monkeypatch, tmp_path, clear_job_state):
-    """I42: the first-job hardware-fault hold stands until an operator restarts the broker, so the
-    idle relift pages it again every TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC. The fault's own page counts
-    for the episode, a dropped re-page goes out on the next pass, a new episode pages anew, and 0
-    pages once."""
+async def test_the_first_job_hardware_fault_takes_the_ladder_without_the_grace(monkeypatch, tmp_path, clear_job_state):
+    """I42: the first job after a topology lift measured the fabric bad. That hold is no 77-only or
+    no-reset hold: the idle relift runs the present-mesh rung now (measured, no grace, I56) and its
+    full post-reset check decides. The old latch withheld the check and stood for an hour."""
     _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
     fault = "hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)"
     monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", fault)
-    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault_paged", srv.time.monotonic())
-    monkeypatch.setattr(srv, "_topology_hw_fault_paged", None)
-    monkeypatch.setenv("TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC", "3600")
-    monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["hook"])
-    sent = []
-    outcomes = iter([None])  # the first re-page is dropped; every later one starts
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)
+    fsm_dirty(srv, f"job 7: {fault}", why="fabric_unverified")
+    calls = []
 
-    def send_alert(event, log=None):
-        if event["kind"] == "fabric_topology_hw_fault":
-            sent.append(event["held_since"])
-            return next(outcomes, object())
-        return object()
+    async def escalate(rung, *a, measured_fault=False, **k):
+        calls.append((rung, measured_fault))
+        return srv.OUTCOME_WAITING
 
-    monkeypatch.setattr(srv.alert, "send_alert", send_alert)
-
-    async def relift(n):
-        for _ in range(n):
-            monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
-            await srv._attempt_idle_relift()
-
-    since = srv.fsm.record.since
-    await relift(3)
-    assert sent == [], "the fault's own page covers the episode until the interval runs out"
-    srv._topology_hw_fault_paged = (since, srv.time.monotonic() - 3601)
-    await relift(3)
-    assert sent == [since, since], "one dropped re-page, then one re-page for the interval"
-    assert srv.fsm.state is ServerState.RECOVERING
-
-    srv._topology_hw_fault_paged = ("an earlier episode", srv.time.monotonic())
-    await relift(2)
-    assert sent[2:] == [since], "a page sent for an earlier episode does not quiet this one"
-
-    monkeypatch.setenv("TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC", "0")
-    srv._topology_hw_fault_paged = (since, srv.time.monotonic() - 99999)
-    await relift(2)
-    assert len(sent) == 3, "0 pages once per episode"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "hold_detail,fabric_detail,flagged",
-    [
-        (
-            "job 7: hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)",
-            "could not run (77)",
-            "",
-        ),
-        (
-            "gate/startup: fabric unverified (could not run)",
-            "fabric check withheld: hardware fault: the first job after a topology-mismatch lift failed",
-            "",
-        ),
-        ("gate/startup: fabric unverified (could not run)", "could not run (77)", "hardware fault: x"),
-    ],
-)
-async def test_the_first_job_hardware_fault_is_outside_the_77_bound(
-    monkeypatch, tmp_path, clear_job_state, hold_detail, fabric_detail, flagged
-):
-    """The first job after a topology lift proved the skipped links are needed: no release or rung
-    can fix cabling, so past the bound it neither lifts nor climbs."""
-    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
-    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", flagged)
-    fsm_dirty(srv, hold_detail, why="fabric_unverified")
-
-    async def verify(expected, log, run_fabric=True, **_):
-        return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": fabric_detail}}
-
-    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    assert srv._fabric_no_reset_hold() == "" and not srv._fabric_77_only_hold()
     await srv._attempt_idle_relift()
-    assert rungs == []
-    assert srv.fsm.state is ServerState.RECOVERING
+    assert calls == [("present", True)]
+
+
+def test_the_first_job_hardware_fault_is_no_77_no_reset_cause(monkeypatch, tmp_path, clear_job_state):
+    """I42 with spec 04 I29: the latch is a measured fault, so a 77 after its reset still climbs to
+    the host rung once (every hold ends in the power-cycle rung). Counting the latch as a cause no
+    reset fixes would park that 77 without the host rung."""
+    _hold_77(monkeypatch, tmp_path, last_fabric_ok=False)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: False)
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "")
+    monkeypatch.setattr(srv.health_monitor, "last_eth_link_drop", "eth links 60 < 64")
+    fault = "hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)"
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", fault)
+    fsm_dirty(srv, f"job 7: {fault}", why="fabric_unverified")
+    assert not srv._fabric_77_no_reset_cause()
+    assert srv._fabric_77_eth_drop() == "eth links 60 < 64"
+
+
+# The latched hold's post-reset 77: the descriptor run's mismatch line, the marker, then the
+# traffic-only rerun that could not measure.
+_LATCHED_77_OUTPUT = (
+    "  what():  Connection mismatch detected. Check console output for details.\n"
+    "fabric-check: topology mismatch (descriptor 4x8, found 4x8 with 2 ports moved)\n"
+    "traffic-only rerun: exit 77, no link tested\n"
+)
+
+
+@pytest.mark.parametrize("named_in", ["output", "detail", "episode_reason"])
+@pytest.mark.parametrize("latched", [True, False])
+def test_a_latched_hold_whose_77_names_the_mismatch_is_no_77_no_reset_cause(
+    monkeypatch, tmp_path, clear_job_state, named_in, latched
+):
+    """I42 with spec 04 I29: the latch is read before the mismatch checks. The latched hold's
+    post-reset 77 keeps the validator's mismatch line (the rerun output includes the descriptor run),
+    and its detail or episode reason may name the mismatch; none of these parks the hold with no host
+    rung. Without the latch the same reading is a topology mismatch, a cause no reset fixes."""
+    _hold_77(monkeypatch, tmp_path, last_fabric_ok=False)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: False)
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "")
+    monkeypatch.setattr(srv.health_monitor, "last_eth_link_drop", "eth links 60 < 64")
+    fault = "hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)"
+    monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", fault if latched else "")
+    output, detail, reason = "no link tested (77)", "gate/relift: fabric unverified (could not run)", ""
+    if named_in == "output":
+        output = _LATCHED_77_OUTPUT
+    elif named_in == "detail":
+        detail = "topology mismatch: descriptor 4x8, 2 ports moved"
+    else:
+        reason = "topology mismatch: descriptor 4x8, 2 ports moved"
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_output", output)
+    monkeypatch.setattr(srv, "device_hold_episode_reason", reason)
+    fsm_dirty(srv, detail, why="fabric_unverified")
+    assert srv._fabric_77_no_reset_cause() is not latched
+    assert srv._fabric_77_eth_drop() == ("eth links 60 < 64" if latched else "")
 
 
 @pytest.mark.asyncio
