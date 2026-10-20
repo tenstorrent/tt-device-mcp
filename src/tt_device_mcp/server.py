@@ -1557,6 +1557,9 @@ DEAD_CHIP_STUCK_BUDGET_SEC = 120
 DEAD_CHIP_STUCK_CLASS = "J-dead-chip-stuck-holder"
 _dead_chip_stuck: dict[int, tuple[str, str, int, tuple]] = {}  # pid -> (label, starttime, uid, bdfs)
 _dead_chip_stuck_lock = threading.Lock()
+# The registry and the episode's wall-clock start, so a broker restart keeps the fence and the 120 s
+# clock (spec 04 I77). Read once at startup; a different boot id means every pid in it is gone.
+DEAD_CHIP_STUCK_FILE = "dead_chip_stuck.json"
 _dead_chip_page_pending: Optional[dict] = None  # a page the alert hook dropped, sent again next scan
 _leftover_dead_chip: bool = False  # the open I70 episode names a dead-chip stuck holder
 stats: Stats | None = None  # Session statistics
@@ -8526,7 +8529,77 @@ def _note_dead_chip_stuck_holders(chips: list, killed: list) -> list[int]:
     }
     _send_dead_chip_page()
     _reaped_leftovers()  # open the I70 episode now: its clock and /health's leftover_fence
+    _save_dead_chip_stuck()
     return [f.pid for f in stuck]
+
+
+def _save_dead_chip_stuck() -> None:
+    """Write the I77 registry under the health dir (atomic rename) with this boot's id and the open
+    I70 episode's wall-clock start; an empty registry removes the file. Never raises: the registry in
+    memory still holds."""
+    with _dead_chip_stuck_lock:
+        entries = dict(_dead_chip_stuck)
+    path = health_dir() / DEAD_CHIP_STUCK_FILE
+    try:
+        if not entries:
+            path.unlink(missing_ok=True)
+            return
+        record = {
+            "boot_id": _current_boot_id(),
+            "since": _leftover_unkillable_since or time.time(),
+            "holders": [
+                {"pid": pid, "label": label, "starttime": starttime, "uid": uid, "bdfs": list(bdfs)}
+                for pid, (label, starttime, uid, bdfs) in entries.items()
+            ],
+        }
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(record))
+        os.replace(tmp, path)
+    except OSError as e:
+        if logger:
+            logger.error(f"DEAD-CHIP could not record the stuck holders in {path}: {e}")
+
+
+def _restore_dead_chip_stuck() -> list[int]:
+    """At broker start (spec 04 I77): reload the stuck holders the last broker registered, keeping
+    only those on this boot whose pid still has the recorded start time, and resume the I70 episode
+    from its recorded wall-clock start, so the fence holds and the 120 s budget is not restarted.
+    Returns the kept pids. Never raises: an unreadable record keeps nothing."""
+    global _leftover_unkillable_since, _leftover_unkillable_mono
+    path = health_dir() / DEAD_CHIP_STUCK_FILE
+    kept: list[int] = []
+    try:
+        record = json.loads(path.read_text())
+        if record.get("boot_id") == _current_boot_id():
+            for h in record.get("holders", []):
+                pid, starttime = int(h["pid"]), str(h.get("starttime") or "")
+                if starttime and read_proc_starttime(pid) == starttime:
+                    entry = (str(h["label"]), starttime, int(h["uid"]), tuple(h.get("bdfs") or ()))
+                    with _dead_chip_stuck_lock:
+                        _dead_chip_stuck[pid] = entry
+                    kept.append(pid)
+        since = min(float(record.get("since") or time.time()), time.time())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
+        if logger:
+            logger.error(f"DEAD-CHIP stuck-holder record {path} unreadable, nothing restored: {e}")
+        kept = []
+    if kept:
+        _leftover_unkillable_since = since
+        _leftover_unkillable_mono = time.monotonic() - (time.time() - since)
+        if logger:
+            logger.error(f"DEAD-CHIP stuck holder(s) {kept} still alive after the broker restart; fence kept")
+        health_event(
+            "dead_chip_holder_stuck_restored",
+            pids=kept,
+            since=datetime.fromtimestamp(since).isoformat(timespec="seconds"),
+            fault_class=DEAD_CHIP_STUCK_CLASS,
+            budget_sec=DEAD_CHIP_STUCK_BUDGET_SEC,
+        )
+        _reaped_leftovers()  # the episode, its class and budget, and /health's leftover_fence
+    _save_dead_chip_stuck()
+    return kept
 
 
 def _dead_chip_bdfs(chips: list) -> tuple:
@@ -8569,6 +8642,7 @@ def _dead_chip_stuck_leftovers() -> list[ReapedLeftover]:
         if f is None:
             with _dead_chip_stuck_lock:
                 _dead_chip_stuck.pop(pid, None)
+            _save_dead_chip_stuck()
             if logger:
                 logger.info(f"DEAD-CHIP stuck holder pid {pid} ({label}) is gone")
             health_event("dead_chip_holder_released", pid=pid, label=label)
@@ -12207,6 +12281,9 @@ async def run_startup_tasks() -> None:
     if _startup_tasks_done:
         return
     _startup_tasks_done = True
+    # A dead chip's killed holder still stuck in the kernel keeps its fence and its 120 s clock
+    # across this restart, before anything here could reset or re-enumerate (spec 04 I77).
+    _restore_dead_chip_stuck()
     # A fabric check the last broker had in flight was cut off by its stop: journal it, once.
     interrupted = journal_interrupted_fabric_check()
     if interrupted and logger:

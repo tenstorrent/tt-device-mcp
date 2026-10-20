@@ -117,6 +117,7 @@ and job exit statuses never hit disk.
 | Remembered Tenstorrent root ports and chip archs (`tt_pci_topology.json`, spec 04 I23) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Chip-to-PCI-bus map at the last clean fabric pass (`fabric_ok_asic_bus.json`, spec 03 I42) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Topology mismatch cached per chip-to-bus map and descriptor (`fabric_topology_mismatch.json`, spec 03 I45) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
+| Killed holders stuck on a dead chip, with the boot id and the episode start (`dead_chip_stuck.json`, spec 04 I77) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Server log + job logs | `/var/log/tt-device-broker/` (the unit passes `--log-dir`; the bare server defaults to CWD) | `<state>/` | `--log-dir` |
 | Stats | `<log-dir>/stats/` → `/var/log/tt-device-broker/stats/` | `<state>/stats/` | follows `--log-dir` |
 | Metrics textfile | `/var/lib/prometheus/node-exporter/tt_device_mcp.prom` | `<state>/metrics/tt_device_mcp.prom` | `TT_DEVICE_MCP_TEXTFILE_DIR` |

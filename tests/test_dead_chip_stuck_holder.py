@@ -523,6 +523,97 @@ async def test_a_live_job_the_broker_did_not_kill_still_holds_the_rung(stuck, mo
     (rung,) = _events(stuck, "leftover_host_rung")
     assert rung["phase"] == "held" and "a broker job is running" in rung["detail"]
 
+
+# --- a broker restart keeps the registry and the episode clock ------------------------------------
+
+
+def _restart(monkeypatch, elapsed=0.0, **record):
+    """Simulate a broker restart ``elapsed`` seconds after the note: rewrite the record's fields, then
+    drop every in-memory I77/I70 fact the new process would not have."""
+    import json
+
+    path = srv.health_dir() / srv.DEAD_CHIP_STUCK_FILE
+    saved = json.loads(path.read_text())
+    saved["since"] -= elapsed
+    saved.update(record)
+    path.write_text(json.dumps(saved))
+    for name, value in (
+        ("_dead_chip_stuck", {}),
+        ("_leftover_unkillable_since", None),
+        ("_leftover_unkillable_mono", None),
+        ("_leftover_dead_chip", False),
+        ("_leftover_fence_detail", ""),
+    ):
+        monkeypatch.setattr(srv, name, value)
+    return path
+
+
+def test_the_registry_is_recorded_and_removed_once_the_holder_is_gone(stuck):
+    import json
+
+    _note(stuck)
+    path = srv.health_dir() / srv.DEAD_CHIP_STUCK_FILE
+    saved = json.loads(path.read_text())
+    assert saved["boot_id"] == srv._current_boot_id()
+    assert saved["since"] == srv._leftover_unkillable_since
+    assert saved["holders"] == [{"pid": PID, "label": "dead-chip:3", "starttime": "424242", "uid": 1234, "bdfs": [BDF]}]
+    _gone(stuck)
+    srv._reaped_leftovers()
+    assert not path.exists()
+
+
+async def test_a_restart_keeps_the_fence_and_resumes_the_120s_clock(stuck, monkeypatch):
+    stuck["rig"]["beats"] = {str(i): 100 for i in range(EXPECTED) if i != int(CHIP)}
+    _note(stuck)
+    _restart(monkeypatch, elapsed=100)
+
+    assert srv._restore_dead_chip_stuck() == [PID]
+    assert srv._dead_chip_stuck[PID] == ("dead-chip:3", "424242", 1234, (BDF,))
+    assert srv._dead_chip_stuck_reason() and srv.recovery_mechanism.reenumerate_fence()
+    assert srv._leftover_budget_sec() == BUDGET
+    assert srv._leftover_fault_class() == "J-dead-chip-stuck-holder"
+    (restored,) = _events(stuck, "dead_chip_holder_stuck_restored")
+    assert restored["pids"] == [PID]
+    t0 = srv._leftover_unkillable_mono
+    assert abs((time.monotonic() - t0) - 100) < 5  # the clock resumed, not restarted
+    assert not await _tick(t0 + BUDGET - 1)
+    assert await _tick(t0 + BUDGET)
+    assert stuck["order"] == ["power_cycle"]
+
+
+@pytest.mark.parametrize("change", ["reused-pid", "other-boot", "no-starttime"])
+def test_a_restart_drops_holders_that_are_not_the_recorded_process(stuck, monkeypatch, change):
+    _note(stuck)
+    if change == "other-boot":
+        path = _restart(monkeypatch, boot_id="another-boot")
+    elif change == "no-starttime":
+        path = _restart(monkeypatch, holders=[{"pid": PID, "label": "dead-chip:3", "starttime": "", "uid": 1234}])
+    else:
+        path = _restart(monkeypatch)
+        monkeypatch.setattr(srv, "read_proc_starttime", lambda pid: "999999")
+
+    assert srv._restore_dead_chip_stuck() == []
+    assert srv._dead_chip_stuck == {} and srv._leftover_unkillable_mono is None
+    assert srv._dead_chip_stuck_reason() == "" and not path.exists()
+
+
+def test_an_unreadable_record_restores_nothing(stuck):
+    path = srv.health_dir() / srv.DEAD_CHIP_STUCK_FILE
+    path.write_text("{not json")
+    assert srv._restore_dead_chip_stuck() == []
+    assert srv._dead_chip_stuck == {} and not path.exists()
+
+
+async def test_the_broker_start_restores_before_anything_else(stuck, monkeypatch):
+    calls = []
+    monkeypatch.setattr(srv, "_startup_tasks_done", False)
+    monkeypatch.setattr(srv, "_restore_dead_chip_stuck", lambda: calls.append("restore") or [])
+    monkeypatch.setattr(srv, "journal_interrupted_fabric_check", lambda: calls.append("journal") or None)
+    monkeypatch.setattr(srv, "should_privsep", lambda: (_ for _ in ()).throw(RuntimeError("stop here")))
+    with pytest.raises(RuntimeError, match="stop here"):
+        await srv.run_startup_tasks()
+    assert calls == ["restore", "journal"]
+
 # --- the dead-chip path calls it -------------------------------------------------------------------
 
 
