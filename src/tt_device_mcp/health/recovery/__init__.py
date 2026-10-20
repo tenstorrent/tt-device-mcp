@@ -29,8 +29,7 @@ from tt_device_mcp import constants, metrics
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
-from tt_device_mcp.health.monitors import fabric
-from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.health.monitors import fabric, pci
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import pcie_guard
 from tt_device_mcp.health.recovery.base import (
