@@ -152,6 +152,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     isolate_chip,
     journal_interrupted_fabric_check,
     link_signals,
+    load_removed_chips,
     mark_boot,
     mesh_reset_hold_reason,
     note_broker_stopping,
@@ -171,7 +172,6 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
-from tt_device_mcp.health.monitors.pci import load_removed_chips
 from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (

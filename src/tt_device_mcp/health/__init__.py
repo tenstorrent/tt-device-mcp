@@ -90,6 +90,7 @@ from tt_device_mcp.health.monitors.pci import (
     chip_snapshot_event,
     isolate_chip,
     link_signals,
+    load_removed_chips,
     pci_bus_number,
     sysfs_chip_ids,
 )
@@ -223,6 +224,7 @@ __all__ = [
     "chip_snapshot_event",
     "isolate_chip",
     "link_signals",
+    "load_removed_chips",
     # recovery selection/state
     "OUTCOME_RECOVERED",
     "OUTCOME_TERMINAL",
