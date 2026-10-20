@@ -4794,14 +4794,23 @@ _dirty_idle_gate_monotonic: float = 0.0
 _dirty_idle_gate_spent_since: Optional[str] = None
 
 
+def _dirty_idle_gate_why(why: str) -> bool:
+    """Whether a dirty hold with this ``why`` is the idle gate's (spec 03 I68): a job's kill or its
+    leftover, or a fabric-unverified hold under the I42 latch. That one is a measured fabric fault
+    the read-only relift bails on once dirty, so with nothing queued it waited for the 10-min bound."""
+    if why in DIRTY_IDLE_GATE_WHYS:
+        return True
+    return why == FABRIC_RELIFT_WHY and health_monitor is not None and bool(health_monitor.topology_hw_fault)
+
+
 def _dirty_idle_gate_armed() -> bool:
-    """A dirty job_killed/foreign_holder hold on an idle device that has not had its idle gate yet:
-    RECOVERING, nothing queued or owed (see _queue_idle), no device op, no chip off the bus."""
+    """A dirty idle-gate hold (see _dirty_idle_gate_why) on an idle device that has not had its idle
+    gate yet: RECOVERING, nothing queued or owed (see _queue_idle), no device op, no chip off the bus."""
     rec = fsm.record
     return (
         fsm.state is ServerState.RECOVERING
         and rec.dirty
-        and rec.why in DIRTY_IDLE_GATE_WHYS
+        and _dirty_idle_gate_why(rec.why)
         and rec.since != _dirty_idle_gate_spent_since
         and not device_op_active
         and _queue_idle()
