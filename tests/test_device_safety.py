@@ -2880,6 +2880,9 @@ async def test_pollers_quiesce_journals_none_active_when_configured_units_resolv
         async def wait(self):
             return self.returncode
 
+        async def communicate(self):
+            return b"inactive\n", b""
+
     async def _exec(*argv, **kw):
         return _NotLoaded()
 
@@ -2917,8 +2920,8 @@ DEFAULT_POLLERS = ("tt-telemetry.service", "tt-metrics-exporter.service")
 
 
 def test_no_clock_cap_keeper_in_the_default_pollers():
-    """A reset restarts every listed poller, so a clock-cap keeper in the default would come back on
-    a host that masked it. The default names none; a host that runs one opts in by env."""
+    """A clock-cap keeper in the default would be stopped and restarted by every reset on every host.
+    The default names none; a host that runs one opts in by env."""
     assert srv.DEFAULT_POLLER_SERVICES.split(",") == list(DEFAULT_POLLERS)
     assert "fmax" not in srv.DEFAULT_POLLER_SERVICES
 
@@ -2937,19 +2940,31 @@ def test_the_specs_name_the_default_pollers():
     assert "fmax" not in i12, i12
 
 
-def _systemctl_with_units(installed, calls):
-    """A `systemctl` stand-in: 0 for a unit the host has, 5 (not loaded) for one it lacks."""
+def _systemctl_with_units(installed, calls, stopped=()):
+    """A `systemctl` stand-in: 0 for a unit the host has, 5 (not loaded) for one it lacks. `is-active`
+    reads "active" for an installed unit unless it is in ``stopped``; a stop or start updates that."""
+    stopped = set(stopped)
 
     class _Proc:
-        def __init__(self, rc):
+        def __init__(self, rc, out=b""):
             self.returncode = rc
+            self._out = out
 
         async def wait(self):
             return self.returncode
 
+        async def communicate(self):
+            return self._out, b""
+
     async def _exec(*argv, **kw):
+        verb, unit = argv[1], argv[2]
         calls.append(argv[1:])
-        return _Proc(0 if argv[2] in installed else 5)
+        if verb == "is-active":
+            up = unit in installed and unit not in stopped
+            return _Proc(0 if up else 3, b"active\n" if up else b"inactive\n")
+        if unit in installed:
+            (stopped.add if verb == "stop" else stopped.discard)(unit)
+        return _Proc(0 if unit in installed else 5)
 
     return _exec
 
@@ -2967,18 +2982,21 @@ async def test_pollers_quiesce_skips_a_default_poller_the_host_does_not_have(mon
         _systemctl_with_units({"tt-telemetry.service", "tt-metrics-exporter.service"}, calls),
     )
 
-    touched = await srv._set_device_pollers(active, lambda m: None)
+    touched = await srv._set_device_pollers(False, lambda m: None)
+    if active:
+        touched = await srv._set_device_pollers(True, lambda m: None)
 
     assert touched == ["tt-telemetry.service", "tt-metrics-exporter.service"]
     assert health.read_health_events(kinds={"pollers_none_active"}) == []
     kind = "pollers_restarted" if active else "pollers_quiesced"
     assert health.read_health_events(kinds={kind})[-1]["services"] == touched
+    assert ("start", "tt-fmax-cap.service") not in calls
 
 
 @pytest.mark.asyncio
 async def test_pollers_quiesce_stops_and_restarts_an_opted_in_fmax_cap(monkeypatch):
-    """A host that opts tt-fmax-cap in via the env list gets it stopped with the other pollers and
-    started again by the restore."""
+    """A host that opts tt-fmax-cap in via the env list, with it running, gets it stopped with the
+    other pollers and started again by the restore."""
     listed = DEFAULT_POLLERS + ("tt-fmax-cap.service",)
     monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", listed)
     calls = []
@@ -3144,6 +3162,205 @@ async def test_a_step_that_did_not_complete_owes_the_pollers_even_on_a_healthy_f
     await asyncio.gather(*list(srv._pollers_restore_tasks))
     assert [c for c in calls if c[0] == "start"] == [("start", u) for u in DEFAULT_POLLERS]
     assert srv._pollers_owed is None
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_leaves_a_poller_stopped_that_was_stopped_before(monkeypatch):
+    """An installed poller an operator stopped on purpose (tt-telemetry, say) must not come back
+    because a reset happened: the restore starts only what the stop found running."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(
+        srv.asyncio,
+        "create_subprocess_exec",
+        _systemctl_with_units(set(DEFAULT_POLLERS), calls, stopped={"tt-telemetry.service"}),
+    )
+    lines = []
+
+    await srv._set_device_pollers(False, lines.append)
+    restarted = await srv._set_device_pollers(True, lines.append)
+
+    assert restarted == ["tt-metrics-exporter.service"]
+    assert ("start", "tt-telemetry.service") not in calls
+    assert any("left device pollers stopped" in m and "tt-telemetry.service" in m for m in lines), lines
+    assert health.read_health_events(kinds={"pollers_none_active"}) == []
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_starts_nothing_when_every_poller_was_already_stopped(monkeypatch):
+    """With every poller stopped before the reset, the restore starts none and raises no alarm."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(
+        srv.asyncio,
+        "create_subprocess_exec",
+        _systemctl_with_units(set(DEFAULT_POLLERS), calls, stopped=set(DEFAULT_POLLERS)),
+    )
+
+    await srv._set_device_pollers(False, lambda m: None)
+    assert await srv._set_device_pollers(True, lambda m: None) == []
+
+    assert not [c for c in calls if c[0] == "start"], calls
+    assert health.read_health_events(kinds={"pollers_none_active"}) == []
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_covers_a_poller_an_earlier_stop_took_down(monkeypatch):
+    """The dead-chip path stops the pollers and the reset that follows finds them already down. The
+    reset's restore must still bring back what was running before the first stop."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+
+    await srv._set_device_pollers(False, lambda m: None)  # dead chip: stop, no restore
+    await srv._set_device_pollers(False, lambda m: None)  # the reset's quiesce
+    assert await srv._set_device_pollers(True, lambda m: None) == list(DEFAULT_POLLERS)
+    # Restored once; a second restore has nothing left to start.
+    assert await srv._set_device_pollers(True, lambda m: None) == []
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_counts_a_crash_looping_poller_as_running(monkeypatch):
+    """A poller systemd is restarting reads "activating" between attempts. It was running, so the
+    restore brings it back."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    calls = []
+
+    class _Proc:
+        def __init__(self, rc, out=b""):
+            self.returncode, self._out = rc, out
+
+        async def wait(self):
+            return self.returncode
+
+        async def communicate(self):
+            return self._out, b""
+
+    async def _exec(*argv, **kw):
+        calls.append(argv[1:])
+        return _Proc(3, b"activating\n") if argv[1] == "is-active" else _Proc(0)
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _exec)
+
+    await srv._set_device_pollers(False, lambda m: None)
+    assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+
+
+def _systemctl_scripted(calls, *, stop=None, start=None, state=b"active\n"):
+    """A `systemctl` stand-in for one unit: `is-active` prints ``state``; ``stop``/``start`` are
+    ``(rc, delay_s)`` for that verb (default ``(0, 0)``)."""
+
+    class _Proc:
+        def __init__(self, rc, out=b"", delay=0.0):
+            self.returncode, self._out, self._delay = rc, out, delay
+
+        async def wait(self):
+            await asyncio.sleep(self._delay)
+            return self.returncode
+
+        async def communicate(self):
+            await asyncio.sleep(self._delay)
+            return self._out, b""
+
+    async def _exec(*argv, **kw):
+        verb = argv[1]
+        calls.append(argv[1:])
+        if verb == "is-active":
+            return _Proc(0, state)
+        rc, delay = {"stop": stop, "start": start}.get(verb) or (0, 0.0)
+        return _Proc(rc, delay=delay)
+
+    return _exec
+
+
+def _short_poller_bound(monkeypatch, bound=0.1):
+    real = srv.aio.wait_for
+    monkeypatch.setattr(srv.aio, "wait_for", lambda aw, timeout: real(aw, timeout=min(timeout, bound)))
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_covers_a_poller_whose_stop_outlasts_its_bound(monkeypatch):
+    """A running poller whose `systemctl stop` outlasts its bound (stuck in MMIO on a hung chip) is
+    still recorded, so the restore starts it, and it is owed to the next close to HEALTHY in case no
+    stop returned 0 and the caller skips the inline restore."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    _short_poller_bound(monkeypatch)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_scripted(calls, stop=(0, 0.5)))
+
+    assert await srv._set_device_pollers(False, lambda m: None) == []
+    assert srv._pollers_owed is not None
+    assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+    assert srv._pollers_owed is None
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_covers_a_poller_whose_stop_fails(monkeypatch):
+    """A running poller whose stop returns non-zero is still restored."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_scripted(calls, stop=(1, 0.0)))
+
+    await srv._set_device_pollers(False, lambda m: None)
+    assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_counts_a_poller_whose_state_cannot_be_read_as_running(monkeypatch):
+    """A state probe that outlasts the bound, or prints nothing, says nothing: the unit is restored,
+    as every unit was before the restore record existed."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_scripted(calls, state=b""))
+    await srv._set_device_pollers(False, lambda m: None)
+    assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+
+    _short_poller_bound(monkeypatch)
+
+    async def _hung_probe(*argv, **kw):
+        calls.append(argv[1:])
+        if argv[1] == "is-active":
+            await asyncio.sleep(0.5)
+        return await _systemctl_scripted([])(*argv, **kw)
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _hung_probe)
+    await srv._set_device_pollers(False, lambda m: None)
+    assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_retries_a_start_that_failed(monkeypatch):
+    """A start that fails or outlasts its bound keeps the unit recorded, and the next restore
+    starts it."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    _short_poller_bound(monkeypatch)
+    for failed_start in ((1, 0.0), (0, 0.5)):
+        calls = []
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_scripted(calls, start=failed_start))
+        await srv._set_device_pollers(False, lambda m: None)
+        assert await srv._set_device_pollers(True, lambda m: None) == []
+        assert "tt-telemetry.service" in srv._pollers_restore_record()
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_scripted(calls))
+        assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+        assert srv._pollers_restore_record() == set()
+
+
+@pytest.mark.asyncio
+async def test_pollers_restore_record_survives_a_broker_restart(monkeypatch):
+    """The dead-chip valve stops the pollers, the broker restarts (a deploy, a self-update), and the
+    reset that follows finds them already down. Its restore still starts them: the record is on disk."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+
+    await srv._set_device_pollers(False, lambda m: None)  # dead chip: stop, no restore
+    monkeypatch.setattr(srv, "_pollers_to_restore", None)  # a new broker process
+    await srv._set_device_pollers(False, lambda m: None)  # the reset's quiesce finds them down
+    assert await srv._set_device_pollers(True, lambda m: None) == list(DEFAULT_POLLERS)
+
+    monkeypatch.setattr(srv, "_pollers_to_restore", None)
+    assert srv._pollers_restore_record() == set()  # the start that returned 0 cleared it on disk too
 
 
 # --- the reset is exclusive --------------------------------------------------
