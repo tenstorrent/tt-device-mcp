@@ -240,7 +240,6 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES` | 3 | Idle-relift 77 retries on one 77-only hold before the startup checks gate it (I40) | 03 |
 | `TT_DEVICE_MCP_FABRIC_77_BOUND_SEC` | 600 | Age of a 77-only hold (at least one retry behind it) past which the startup checks gate it (I40) | 03 |
 | `TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC` | 120,300,600,1200 | Backoff steps between idle re-checks of a 77-only hold, each clamped to 60..1200 s (I48) | 03 |
-| `TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC` | 21600 | At most one I40 fallback release per window; a second 77-only hold inside it climbs the ladder | 03 |
 | `TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS` | 2 | Jobs in a row that die on the fabric's routing after a 77 pass before a known fabric fault holds without a reset (I46) | 03 |
 | `TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS` | unset (accepts nothing) | Comma-separated port names, exactly as the fabric marker prints them, that an operator accepts as known dead: a pass whose only missing ports are all listed lifts instead of failing, and may lower the eth link mark (I71) | 03 |
 | `TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC` | 21600 | Age past which a known fabric fault expires and the usual 77 path gets one more try (I46) | 03 |

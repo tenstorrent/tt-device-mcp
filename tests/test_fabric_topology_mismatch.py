@@ -133,11 +133,13 @@ async def test_a_fabric_failure_on_the_first_job_fails_the_next_mismatch_and_nev
 
 
 @pytest.mark.asyncio
-async def test_a_clean_pass_or_an_operator_reset_clears_the_first_job_latch(topo):
+async def test_a_clean_pass_clears_the_first_job_latch(topo):
+    """Only a clean pass on the full topology ends the I42 latch (an operator reset keeps it:
+    tests/test_fabric_links_missing.py::test_an_operator_reset_keeps_the_latch_and_only_a_clean_fabric_pass_ends_it)."""
     m, state = topo
     await m._verify_fabric_health_body(60)
     m.note_job_after_topology_lift(True, "... could not find any forwarding direction ...")
-    m.clear_topology_hw_fault("operator reset")
+    m.clear_topology_hw_fault("a clean fabric pass")
     assert m.topology_hw_fault == ""
     assert state["events"][-1][0] == "fabric_topology_hw_fault_cleared"
     m.topology_hw_fault = "hardware fault: x"

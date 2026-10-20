@@ -9131,6 +9131,7 @@ def _setup_selfheal_hold(monkeypatch, tmp_path, *, n_present=31):
     patch_health_event(monkeypatch, lambda *a, **k: None)
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)  # no detached reset cycling
     monkeypatch.setattr(srv, "should_privsep", lambda: True)  # the system broker, with a fabric validator
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "true")  # ... that a fabric pass runs on (I78)
     srv.device_op_lock = None
     srv.device_op_active = ""
     fsm_dirty(srv, "gate/post-job: eth-core heartbeat frozen — held, not reset", why="eth_frozen")
@@ -9140,13 +9141,15 @@ def _setup_selfheal_hold(monkeypatch, tmp_path, *, n_present=31):
 
 @pytest.mark.asyncio
 async def test_idle_relift_lifts_a_self_healed_hold(monkeypatch, tmp_path, clear_job_state):
-    """The mesh came back: enum+ARC read healthy AND the eth heartbeat is advancing, so it lifts."""
+    """The mesh came back: enum+ARC read healthy, the eth heartbeat is advancing and the full check,
+    fabric included, passes (spec 03 I78), so it lifts."""
     _setup_selfheal_hold(monkeypatch, tmp_path)
-    seen = {"run_fabric": None}
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+    seen = {"run_fabric": []}
 
     async def healthy(expected, log, run_fabric=True, **_):
-        seen["run_fabric"] = run_fabric
-        return True, {"snapshot": {"ok": True}}
+        seen["run_fabric"].append(run_fabric)
+        return True, {"snapshot": {"ok": True}, **({"fabric": {"ok": True}} if run_fabric else {})}
 
     async def eth_advancing(timeout_sec=60.0):
         return True, "every active-eth-core heartbeat advancing"
@@ -9158,7 +9161,7 @@ async def test_idle_relift_lifts_a_self_healed_hold(monkeypatch, tmp_path, clear
 
     assert srv.fsm.state is ServerState.HEALTHY, "a self-healed mesh must reopen to tenants on its own"
     assert srv.fsm.record.why not in srv.SELFHEAL_WHYS, "the self-heal marker must clear on lift"
-    assert seen["run_fabric"] is False, "the relift must never run the fabric traffic pass"
+    assert seen["run_fabric"] == [False, True], "the enum+ARC re-read first, then the full check, fabric included"
 
 
 @pytest.mark.asyncio
@@ -9351,6 +9354,7 @@ async def test_a_per_user_daemon_neither_arms_the_down_offbus_recheck_nor_gates_
 
     _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
     monkeypatch.setattr(srv, "should_privsep", lambda: False)
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD")  # nor any fabric check configured
     fsm_healthy(srv)
     fsm_dirty(srv, "startup: probe unhealthy — held until it reads healthy", why="off_bus")
     calls = _recording_verify(monkeypatch, None)
@@ -10175,7 +10179,9 @@ def _arm_stuck_hold(
         lambda why: counters.__setitem__("fault_cleared", counters["fault_cleared"] + 1),
     )
     monkeypatch.setattr(
-        srv, "_clear_device_dirty", lambda **kw: counters.__setitem__("dirty_cleared", counters["dirty_cleared"] + 1)
+        srv,
+        "_clear_device_dirty",
+        lambda **kw: counters.__setitem__("dirty_cleared", counters["dirty_cleared"] + 1) or True,
     )
     return counters
 
@@ -12723,29 +12729,31 @@ def _fast_verify_setup(monkeypatch, tmp_path, *, healthy=True, held_minutes_ago=
     patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", True)
     monkeypatch.setattr(srv, "device_fault_reported", "")
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "true")  # a mesh a fabric pass runs on (I78)
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
     calls = []
 
     async def verify(expected, log, run_fabric=True, **kw):
         calls.append({"run_fabric": run_fabric, "phase": kw.get("phase")})
-        return healthy, {"snapshot": {"ok": healthy}}
+        return healthy, {"snapshot": {"ok": healthy}, **({"fabric": {"ok": healthy}} if run_fabric else {})}
 
     patch_recovery(monkeypatch, "_verify_device", verify)
     return counters, calls, events
 
 
 @pytest.mark.asyncio
-async def test_a_gone_foreign_holder_hold_lifts_on_the_pre_job_verify_without_a_reset(
+async def test_a_gone_foreign_holder_hold_lifts_on_the_full_check_without_a_reset(
     monkeypatch, tmp_path, clear_job_state
 ):
     """Measured (task audit, 2026-10-13): a 'tenant holds the device' hold whose holder had exited sat
     to the ceiling and then paid a full galaxy reset. No fault was ever measured — the verify was only
-    deferred. Well inside the ceiling, the relift now runs the pre-job verify (enum+ARC, no traffic
-    pass) and lifts on a healthy read. Fails on base, which never verifies this class."""
+    deferred. Well inside the ceiling, the relift now runs the full check, fabric included (spec 03
+    I78), and lifts on a pass. Fails on base, which never verifies this class."""
     counters, calls, events = _fast_verify_setup(monkeypatch, tmp_path)
 
     await srv._attempt_idle_relift()
 
-    assert calls == [{"run_fabric": False, "phase": "pre-job"}], "exactly the pre-job verify, no traffic pass"
+    assert [c["run_fabric"] for c in calls] == [True], "exactly one full check, fabric included"
     assert counters["resets"] == 0, "a healthy verify lifts without a reset"
     assert counters["dirty_cleared"] == 1, "the hold is lifted (a verified clear)"
     assert ("foreign_holder_verify", {"lifted": True, "healthy": True, "reason": "holder gone"}) in events
