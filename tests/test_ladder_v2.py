@@ -825,6 +825,53 @@ def test_force_waives_an_unreadable_scan_but_never_a_running_job(monkeypatch):
     assert g._tenant_active(unreadable, force=True) is True, "force must NEVER waive a running job"
 
 
+def test_the_i75_stand_down_blocks_only_inside_the_escalate_that_carries_it(monkeypatch):
+    """Spec 03 I75 (review F3): the caller's stand-down is re-read at the ladder's tenant check, where a
+    re-adopted job that ended mid-run would otherwise let a reset through ahead of the startup gate. A
+    running job still names itself first (job_running), and outside an escalate nothing is blocked."""
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(g, "_stand_down", lambda: True)
+    monkeypatch.setattr(g, "startup_verify_deferred", False)
+    monkeypatch.setattr(g.deps, "job_running", lambda: True)
+    assert g._tenant_blocker(_empty_scan(), force=True) == {"blocker": "job_running"}
+    assert g.startup_verify_deferred is False
+    monkeypatch.setattr(g.deps, "job_running", lambda: False)
+    assert g._tenant_blocker(_empty_scan(), force=True) == {"blocker": "startup_verify"}
+    assert g.startup_verify_deferred is True
+    assert "startup gate" in g._describe_blocker({"blocker": "startup_verify"})
+    monkeypatch.setattr(g, "_stand_down", None)
+    assert g._tenant_blocker(_empty_scan(), force=True) is None
+
+
+@pytest.mark.asyncio
+async def test_escalate_carries_the_stand_down_only_for_its_own_run(monkeypatch):
+    """The stand-down an escalate() call carries is cleared when it returns, whatever the outcome."""
+    g = srv.galaxy_recovery
+    seen = []
+
+    async def ladder(indices, expected, log, *, force=False, measured_fault=False):
+        seen.append(g._stand_down() if g._stand_down else None)
+        return False
+
+    monkeypatch.setattr(g, "_escalate_stuck_hold", ladder)
+    monkeypatch.setattr(g.mechanism, "host_action_blocks_reset", lambda log, context: False)
+    monkeypatch.setattr(g, "_td_reset_seen", True)
+
+    async def no_latch(expected, beats):
+        return None
+
+    async def no_direct(*a):
+        return None
+
+    monkeypatch.setattr(g, "_tray_down_latch", no_latch)
+    monkeypatch.setattr(g, "_power_cycle_direct_from_escalate", no_direct)
+    monkeypatch.setattr(g.deps, "device_degraded", lambda: True)
+    assert (
+        await g.escalate("present-forced", ["0"], 32, lambda m: None, stand_down=lambda: True) == galaxy.OUTCOME_WAITING
+    )
+    assert seen == [True] and g._stand_down is None
+
+
 @pytest.mark.asyncio
 async def test_the_last_chance_sweep_never_resets_over_a_running_job(monkeypatch):
     """End to end: with a job RUNNING and no fd holder, the sweep issues no reset."""

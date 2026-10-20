@@ -80,11 +80,121 @@ def topology_counts(output: str) -> tuple[int, int]:
     return (int(m.group(1)) if m else 0, int(e.group(1)) if e else 0)
 
 
-def topology_marker(desc: str, missing: int, extra: int) -> str:
-    """The one line the wrapper and the built-in path both log for a mismatch."""
-    return (
+# The validator lists each port connection it found missing or extra under its count line, one
+# ``PhysicalPortEndpoint{...}`` pair per line. Counts alone never told an operator which cable to
+# look at (spec 03 I71), so the marker carries the names.
+_PORT_LIST_HEAD = re.compile(r"found \d+ (missing|extra) port/cable connections")
+_PORT_ENDPOINT = re.compile(r"PhysicalPortEndpoint\{([^}]*)\}")
+_PORT_FIELD = re.compile(r"(tray_id|asic_location|port_type|port_id)=([^,}\s]+)")
+# At most this many names per list go into the marker; the rest are counted.
+_MAX_PORT_NAMES = 16
+
+
+def _port_name(fields: str) -> str:
+    f = dict(_PORT_FIELD.findall(fields))
+    parts = [f"tray {f.get('tray_id', '?')}"]
+    if "asic_location" in f:
+        parts.append(f"asic {f['asic_location']}")
+    parts.append(f"{f.get('port_type', 'port')} {f.get('port_id', '?')}")
+    return " ".join(parts)
+
+
+def topology_ports(output: str) -> tuple[list[str], list[str]]:
+    """``(missing, extra)`` port connection names the validator listed against its descriptor,
+    e.g. ``tray 1 QSFP_DD 1 <-> tray 2 QSFP_DD 1``. A list ends at the first line without a port."""
+    lists: dict[str, list[str]] = {"missing": [], "extra": []}
+    kind = None
+    for line in (output or "").splitlines():
+        head = _PORT_LIST_HEAD.search(line)
+        if head:
+            kind = head.group(1)
+            continue
+        ends = _PORT_ENDPOINT.findall(line)
+        if kind is None or not ends:
+            kind = None
+            continue
+        lists[kind].append(" <-> ".join(_port_name(e) for e in ends))
+    return lists["missing"], lists["extra"]
+
+
+def _names(names: list[str]) -> str:
+    shown = ", ".join(names[:_MAX_PORT_NAMES])
+    more = len(names) - _MAX_PORT_NAMES
+    return shown + (f" (+{more} more)" if more > 0 else "")
+
+
+def topology_marker(desc: str, missing: int, extra: int, ports: tuple[list[str], list[str]] = ([], [])) -> str:
+    """The one line the wrapper and the built-in path both log for a mismatch; the built-in path
+    appends the port names it read (``ports`` from :func:`topology_ports`)."""
+    marker = (
         f"TOPOLOGY MISMATCH vs {desc}: {missing} missing, {extra} extra port connections "
         "(tray ids come from PCI bus numbers; a board reset cannot change this)"
+    )
+    if ports[0]:
+        marker += f"; missing ports: {_names(ports[0])}"
+    if ports[1]:
+        marker += f"; extra ports: {_names(ports[1])}"
+    return marker
+
+
+def marker_ports(marker: str) -> tuple[list[str], list[str]]:
+    """The port names a :func:`topology_marker` line carries (none for the wrapper's own line)."""
+    out = []
+    for kind in ("missing", "extra"):
+        m = re.search(rf"; {kind} ports: ([^;]*)", marker or "")
+        names = re.sub(r" \(\+\d+ more\)$", "", m.group(1).strip()) if m else ""
+        out.append([n.strip() for n in names.split(",") if n.strip()])
+    return out[0], out[1]
+
+
+def with_ports(marker: str, output: str) -> str:
+    """``marker`` with the port names ``output`` lists appended, when it carries none yet (the
+    wrapper's own line names only counts)."""
+    if any(marker_ports(marker)):
+        return marker
+    missing, extra = topology_ports(output)
+    if missing:
+        marker += f"; missing ports: {_names(missing)}"
+    if extra:
+        marker += f"; extra ports: {_names(extra)}"
+    return marker
+
+
+# The detail prefix of a pass whose traffic crossed every discovered link while ports of the
+# descriptor were missing (spec 03 I71). A FAILED check, not a lift: the links a job routes over
+# the whole mesh are not all there ("Could not find any forwarding direction").
+LINKS_MISSING = "fabric links missing"
+
+
+def names_links_missing(text: str) -> bool:
+    """Whether ``text`` carries the I71 verdict."""
+    return LINKS_MISSING in (text or "")
+
+
+def accepted_missing_ports() -> frozenset[str]:
+    """Port connections an operator accepts as known dead (``TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS``,
+    comma-separated names exactly as the marker prints them). Empty by default: nothing is accepted."""
+    raw = os.environ.get("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", "")
+    return frozenset(" ".join(n.split()) for n in raw.split(",") if n.strip())
+
+
+def links_missing(marker: str, accepted: frozenset[str] = frozenset()) -> str:
+    """The FAILED detail for a topology marker whose descriptor ports are missing, else "".
+
+    A moved tray renames its links (as many extra as missing, I42) and stays a lift. More missing
+    than extra means links are gone. Only an explicit accept list naming every missing port (all
+    names known, none cut off) turns that back into a lift (I71)."""
+    m = _MARKER_COUNTS.search(marker or "")
+    if not m or int(m.group(1)) <= int(m.group(2)):
+        return ""
+    missing, extra = int(m.group(1)), int(m.group(2))
+    names = marker_ports(marker)[0]
+    if accepted and len(names) == missing and set(names) <= accepted:
+        return ""
+    named = f": {_names(names)}" if names else " (names not listed by the check)"
+    return (
+        f"{LINKS_MISSING}: {missing} port connection(s) of the cabling descriptor missing, {extra} extra, "
+        f"after traffic passed on the discovered links{named}; a job routing over the whole mesh fails"
     )
 
 
@@ -114,6 +224,16 @@ DISPATCH_FAILED = "dispatch FAILED on a green fabric"
 def names_dispatch_failure(text: str) -> bool:
     """Whether ``text`` carries the wrapper's green-fabric dispatch failure (spec 03 I55)."""
     return DISPATCH_FAILED in (text or "")
+
+
+# The wrapper's 77 when the links passed and its dispatch probe ran out its cap without a verdict.
+DISPATCH_CAP = "dispatch probe hit its"
+
+
+def names_dispatch_cap(text: str) -> bool:
+    """Whether ``text`` carries the wrapper's dispatch-cap 77: the validator had already moved traffic
+    across every link, so the links were trained when it gave up (spec 04 I84)."""
+    return DISPATCH_CAP in (text or "")
 
 
 def find_topology_marker(output: str) -> Optional[str]:
@@ -149,6 +269,8 @@ _REASON_PATTERNS = (
     # The wrapper's own final verdict on a mesh whose links passed and whose dispatch did not
     # (spec 03 I55): it names the failure the exit code is about, ahead of any validator line above.
     re.compile(r"dispatch FAILED on a green fabric.*"),
+    # Its 77 on the same green fabric, when the dispatch probe ran out its cap (spec 04 I84).
+    re.compile(r"dispatch probe hit its .*"),
     re.compile(r"what\(\):.*"),
     re.compile(r"filesystem error:.*"),
     re.compile(r"(?:\|\s*(?:critical|fatal|error)\s*\||\[(?:critical|error)\]|TT_THROW|TT_FATAL).*", re.IGNORECASE),

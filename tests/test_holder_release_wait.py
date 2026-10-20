@@ -15,7 +15,7 @@ import time
 import pytest
 
 from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event
-from tests.test_job_reap import _escaped_child, _kill_quietly
+from tests.test_job_reap import _escaped_child, _kill_quietly, _unique_tag
 from tt_device_mcp import device_holders, job_reap
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -32,7 +32,8 @@ def _swallow_signals(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_holder_that_releases_within_the_window_is_not_a_leftover(monkeypatch):
-    job_pid, child = _escaped_child("t-release")
+    tag = _unique_tag("t-release")
+    job_pid, child = _escaped_child(tag)
     _swallow_signals(monkeypatch)
     state = {"holding": True, "scans": 0}
 
@@ -51,7 +52,7 @@ async def test_a_holder_that_releases_within_the_window_is_not_a_leftover(monkey
             "t1",
             job_pid,
             None,
-            "t-release",
+            tag,
             term_grace_sec=0.2,
             kill_wait_sec=0.2,
             release_wait_sec=10,
@@ -68,7 +69,8 @@ async def test_a_holder_that_releases_within_the_window_is_not_a_leftover(monkey
 
 @pytest.mark.asyncio
 async def test_a_holder_still_holding_after_the_window_is_named(monkeypatch):
-    job_pid, child = _escaped_child("t-hold")
+    tag = _unique_tag("t-hold")
+    job_pid, child = _escaped_child(tag)
     _swallow_signals(monkeypatch)
     monkeypatch.setattr(
         device_holders, "enumerate_device_holders", lambda: HolderScan(holders=[DeviceHolder(pid=child, uid=0)])
@@ -80,7 +82,7 @@ async def test_a_holder_still_holding_after_the_window_is_named(monkeypatch):
             "t2",
             job_pid,
             None,
-            "t-hold",
+            tag,
             term_grace_sec=0.2,
             kill_wait_sec=0.2,
             release_wait_sec=0.8,
@@ -93,6 +95,27 @@ async def test_a_holder_still_holding_after_the_window_is_named(monkeypatch):
     finally:
         monkeypatch.undo()
         _kill_quietly(child)
+
+
+@pytest.mark.asyncio
+async def test_another_runs_child_of_the_same_test_is_not_a_survivor(monkeypatch):
+    """Two runs of the suite on one host (two checkouts checked at once) spawn the same test's
+    child together. The sweep matches the job tag host-wide, so each run's tag must be its own,
+    or one run names the other's child as its survivor."""
+    _, other = _escaped_child(_unique_tag("t-hold"))  # the other run's child
+    tag = _unique_tag("t-hold")
+    job_pid, child = _escaped_child(tag)
+    _swallow_signals(monkeypatch)
+    monkeypatch.setattr(job_reap, "_holds_device", lambda pid: False)
+    try:
+        survivors = await job_reap.reap_job_survivors(
+            "t3", job_pid, None, tag, term_grace_sec=0.1, kill_wait_sec=0.1, log=lambda _m: None
+        )
+        assert [s.pid for s in survivors] == [child], "only this run's child is its survivor"
+    finally:
+        monkeypatch.undo()
+        _kill_quietly(child)
+        _kill_quietly(other)
 
 
 @pytest.mark.asyncio

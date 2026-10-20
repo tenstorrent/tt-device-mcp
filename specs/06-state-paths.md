@@ -240,8 +240,8 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES` | 3 | Idle-relift 77 retries on one 77-only hold before the startup checks gate it (I40) | 03 |
 | `TT_DEVICE_MCP_FABRIC_77_BOUND_SEC` | 600 | Age of a 77-only hold (at least one retry behind it) past which the startup checks gate it (I40) | 03 |
 | `TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC` | 120,300,600,1200 | Backoff steps between idle re-checks of a 77-only hold, each clamped to 60..1200 s (I48) | 03 |
-| `TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC` | 21600 | At most one I40 fallback release per window; a second 77-only hold inside it climbs the ladder | 03 |
 | `TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS` | 2 | Jobs in a row that die on the fabric's routing after a 77 pass before a known fabric fault holds without a reset (I46) | 03 |
+| `TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS` | unset (accepts nothing) | Comma-separated port names, exactly as the fabric marker prints them, that an operator accepts as known dead: a pass whose only missing ports are all listed lifts instead of failing, and may lower the eth link mark (I71) | 03 |
 | `TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC` | 21600 | Age past which a known fabric fault expires and the usual 77 path gets one more try (I46) | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD` | 1 | Hold tenant jobs at the door while degraded (vs fail-fast) | 03 |
 | `TT_DEVICE_MCP_TENANT_HOLD_POLL_SEC` | 60 | Held-job re-check cadence when no release wakes it (03 I65) | 03 |
@@ -276,7 +276,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK` | 0 | `1` lets the tray walk re-power one tray for a below-floor drop on that tray, and a tray wholly off the bus in a below-floor drop (spec 04 I25) | 04 |
 | `TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS` | 7 | How long a tray re-power that regressed the mesh keeps the per-tray rung disabled on this host, across reboots (spec 04 I25) | 04 |
 | `TT_DEVICE_MCP_AUTO_MESH_RESET` | unset | `0` holds every automatic mesh reset, `1` arms it; unset, an outage hold (reboot, power cycle and tray reset all `0`) holds it | 04 |
-| `TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC` | 3600 | While a held mesh reset or a topology hardware-fault hold stands, page again after this long; `0` pages once per hold | 03, 04 |
+| `TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC` | 3600 | While a held mesh reset stands, page again after this long; `0` pages once per hold | 03, 04 |
 | `TT_DEVICE_MCP_UBB_RESET_SETTLE_SEC` | 28 | Settle time after a UBB tray reset | 04 |
 | `TT_DEVICE_MCP_TRAY_DOWN_CAPTURE` | `1` | `0` turns off the tray-down prelude (one PCI rescan and the read-only BMC/CPLD/PCIe capture before the ladder at a tray-down onset); the ladder is the same either way | 04 |
 | `TT_DEVICE_MCP_TRAY_CPLD_BUSES` | unset | Site data for the tray-down capture: each tray's CPLD BMC I2C bus, `tray:0xNN,...`. All three CPLD vars must be set and well formed; otherwise the CPLD reads are skipped | 04 |

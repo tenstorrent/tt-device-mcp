@@ -115,14 +115,17 @@ async def test_a_missing_cable_paged_once_even_after_its_hold_expires(cable, mon
 
 
 @pytest.mark.asyncio
-async def test_a_missing_cable_whose_rerun_passes_still_lifts_on_the_discovered_links(cable):
-    """03 I42 is unchanged: the mesh the rerun crossed still serves, bounded by its first job."""
+async def test_a_missing_cable_whose_rerun_passes_fails_the_check_by_port_name(cable):
+    """03 I71: traffic passing on the links that are left does not make a lost cable healthy; a job
+    routing over the whole mesh fails. The check FAILS (a measured fault, reset path), never lifts."""
     m, state = cable
     state["rerun"] = (0, "all links ok\n")
     ok, detail = await m._verify_fabric_health_body(60)
-    assert ok is True and "1 missing, 0 extra" in detail
+    assert ok is False and "fabric check FAILED" in detail
+    assert "1 port connection(s) of the cabling descriptor missing, 0 extra" in detail
+    assert "tray 1 QSFP_DD 1 <-> tray 2 QSFP_DD 1" in detail
     assert m.known_fabric_fault() == ""
-    assert m.topology_lift_pending is True
+    assert m.topology_lift_pending is False
 
 
 @pytest.mark.asyncio
@@ -189,7 +192,7 @@ async def test_the_broker_holds_a_missing_cable_outside_the_77_bound_without_a_r
     monkeypatch.setattr(srv, "health_monitor", m)
     monkeypatch.setattr(srv, "device_fault_reported", "")
     srv.fsm.on_fault(srv.FABRIC_RELIFT_WHY, detail="gate: fabric unverified", dirty=False)
-    assert srv._topology_hw_fault_hold({}) is True
+    assert srv._known_fabric_fault_hold() is True
     assert srv._fabric_no_reset_hold() == "known fabric fault"
 
 
