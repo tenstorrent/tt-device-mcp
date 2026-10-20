@@ -358,19 +358,40 @@ def test_a_device_op_in_flight_still_bars_the_restart_past_the_cap(tmp_path):
     assert not any(t.startswith("restart") for t in trace), trace
     assert not hold.exists(), "a lap that restarts nothing kept dispatch held"
 
-    # A reset scope counts the same, even with the broker down.
+    # A reset scope counts the same while the broker runs.
     scope = tmp_path / "scope"
     scope.mkdir()
-    reset_scope = """
+    done, trace, hold = _drain(scope, running=10_000, queue=1, scope=True, job_age=1600, stand_ins=_RESET_SCOPE)
+    assert "device op is still in flight at the job cap" in done.stderr, done.stderr
+    assert not any(t.startswith("restart") for t in trace), trace
+
+    # The broker's own op bars it with the broker reading down too: a live pid is a live op.
+    down = tmp_path / "down"
+    down.mkdir()
+    (down / "device-op.lock").write_text(f"{os.getpid()} tt_device_reset\n")
+    done, trace, hold = _drain(down, running=10_000, queue=1, scope=True, job_age=1600, broker_state="failed")
+    assert "device op is still in flight at the job cap" in done.stderr, done.stderr
+    assert not any(t.startswith("restart") for t in trace), trace
+
+
+# A ttdev-reset scope systemd lists on every look: one the broker timed out and left running.
+_RESET_SCOPE = """
 _sc=$(declare -f systemctl | sed '1d')
 eval "systemctl_job() $_sc"
 systemctl() { case "$*" in *list-units*ttdev-reset-*) echo "ttdev-reset-7.scope loaded active running" ;; *) systemctl_job "$@" ;; esac; }
 """
+
+
+def test_a_down_broker_with_only_a_reset_scope_left_is_restarted(tmp_path):
+    """A down broker runs no op of its own, and a reset scope is its own unit, which the restart does
+    not stop: the new broker's startup waits it out before its queue opens. So the lap applies, as
+    the reconcile it would otherwise block would start the broker over the same scope."""
     done, trace, hold = _drain(
-        scope, running=10_000, queue=1, scope=True, job_age=1600, broker_state="failed", stand_ins=reset_scope
+        tmp_path, running=10_000, queue=1, scope=True, job_age=1600, broker_state="failed", stand_ins=_RESET_SCOPE
     )
-    assert "device op is still in flight at the job cap" in done.stderr, done.stderr
-    assert not any(t.startswith("restart") for t in trace), trace
+    assert done.returncode == 0, done.stderr
+    assert "the broker is down after 0s; applying" in done.stderr, done.stderr
+    assert trace[-1].startswith("restart held "), trace
 
 
 def test_a_down_broker_ends_the_drain(tmp_path):
@@ -443,7 +464,7 @@ def test_a_device_op_at_the_restart_point_blocks_the_restart_until_it_ends(tmp_p
     broker restarts and installed.sha names the new sha."""
     done, trace, hold = _op_at_the_restart_point(tmp_path, op_polls=4)
     assert done.returncode == 0, done.stderr
-    assert "the restart waits for the op to end" in done.stderr, done.stderr
+    assert "waited out under the hold for at most 660s" in done.stderr, done.stderr
     assert "not restarting" not in done.stderr, done.stderr
     assert "op ended" in trace and trace[-1].startswith("restart held "), trace
     assert trace.index("op ended") < len(trace) - 1, "the broker restarted over a device op"
@@ -452,29 +473,102 @@ def test_a_device_op_at_the_restart_point_blocks_the_restart_until_it_ends(tmp_p
     assert looks and all(" held " in t for t in looks), f"the op wait let go of dispatch: {trace}"
 
 
-def test_a_device_op_past_its_own_bound_is_still_waited_out_then_restarted(tmp_path):
-    """An op that outlasts its reset timeout is named once and still never restarted over; the lap
-    restarts as soon as it ends rather than leaving the old broker on the new install."""
-    done, trace, hold = _op_at_the_restart_point(tmp_path, op_polls=140)
+def _never_ending_op(tmp_path, *, lock, install=True, running=0, job_age=None):
+    """A device op that never ends: the broker's own (a live-pid device-op lock) when `lock`, else
+    only a ttdev-reset scope systemd keeps listing. `install`: it shows at the restart point."""
+    inhibit = tmp_path / "device-op.lock"
+    start = f"echo {os.getpid()} tt_device_reset > {inhibit}" if lock else ":"
+    stand_ins = "" if lock else _RESET_SCOPE
+    if running:
+        start += "; echo %d > $M/running" % running
+    if not install:
+        if lock:
+            inhibit.write_text(f"{os.getpid()} tt_device_reset\n")
+        return _drain(tmp_path, running=running, queue=1, stand_ins=stand_ins, scope=True, job_age=job_age)
+    return _drain(tmp_path, running=0, queue=0, stand_ins=stand_ins, scope=True, job_age=job_age, install=start)
+
+
+def _lap_seconds(tmp_path):
+    return int((tmp_path / "model" / "t").read_text())
+
+
+def _last_hold_epoch(trace):
+    return max(int(t.split()[-1]) for t in trace if " held " in t)
+
+
+def test_the_brokers_own_op_past_op_cap_is_never_restarted_over(tmp_path):
+    """The broker's own op (live-pid lock, in its cgroup: a restart SIGTERMs it) that never ends at
+    the restart point. The wait ends at OP_CAP, the lap restarts nothing, drops the hold so dispatch
+    and the reconcile go on, and leaves installed.sha on the old sha so the next lap redoes the
+    install and the restart (spec 08 I7, I24)."""
+    done, trace, hold = _never_ending_op(tmp_path, lock=True)
+    assert done.returncode == 1, done.stderr
+    assert "not restarting over it (I7)" in done.stderr, done.stderr
+    assert not any(t.startswith("restart") for t in trace), trace
+    assert not hold.exists(), "a lap that restarts nothing kept dispatch held"
+    assert not (tmp_path / "root" / "installed.sha").exists(), "the half-done apply was marked current"
+    assert _lap_seconds(tmp_path) == 660, "the op wait is not bounded by OP_CAP"
+    assert _last_hold_epoch(trace) - _T0 <= 660, "the hold was rewritten past the bound"
+
+
+def test_a_reset_scope_that_never_ends_is_restarted_past_op_cap(tmp_path):
+    """A reset scope the broker timed out and left running (base._run_local_reset: 'left running,
+    not killed mid-reset'), with no broker op behind it, that never ends at the restart point. At
+    OP_CAP the lap restarts: the scope is its own unit, which the restart does not stop, and the new
+    broker's startup waits it out (await_foreign_scope) and passes its full check before the queue
+    opens. The hold stands to the restart and is never rewritten past the bound."""
+    done, trace, hold = _never_ending_op(tmp_path, lock=False)
     assert done.returncode == 0, done.stderr
-    assert done.stderr.count("over its own reset timeout") == 1, done.stderr
-    assert trace.index("op ended") < len(trace) - 1 and trace[-1].startswith("restart held "), trace
+    assert "no broker op behind it" in done.stderr, done.stderr
+    assert trace[-1].startswith("restart held "), trace
     assert (tmp_path / "root" / "installed.sha").read_text().strip() == "abc123"
+    assert _lap_seconds(tmp_path) == 660, "the op wait is not bounded by OP_CAP"
+    assert _last_hold_epoch(trace) - _T0 <= 660, "the hold was rewritten past the bound"
+
+
+def test_an_op_with_no_job_holds_dispatch_for_op_cap_not_the_job_cap(tmp_path):
+    """With no job running, a never-ending op keeps the hold for OP_CAP (under the broker's
+    DISPATCH_HOLD_MAX_SEC of 900 s), never for the job cap of 1560 s, before the install and after."""
+    for name, kw, rc in (
+        ("drain-lock", {"lock": True, "install": False}, 0),
+        ("drain-scope", {"lock": False, "install": False}, 0),
+        ("restart-point-lock", {"lock": True}, 1),
+        ("restart-point-scope", {"lock": False}, 0),
+    ):
+        d = tmp_path / name
+        d.mkdir()
+        done, trace, hold = _never_ending_op(d, **kw)
+        assert done.returncode == rc, (name, done.stderr)
+        assert _lap_seconds(d) == 660, (name, _lap_seconds(d), done.stderr)
+        if not trace[-1].startswith("restart"):
+            assert not hold.exists(), (name, "dispatch kept held past the bound")
+
+
+def test_an_op_after_a_job_past_its_cap_gets_op_cap_more(tmp_path):
+    """A job past its cap no longer holds the update; an op still in flight then gets OP_CAP more,
+    so the worst case after the install is the job cap plus OP_CAP."""
+    done, trace, hold = _never_ending_op(tmp_path, lock=False, running=10_000, job_age=1500)
+    assert done.returncode == 0, done.stderr
+    assert trace[-1].startswith("restart held "), trace
+    assert _lap_seconds(tmp_path) == 60 + 660, done.stderr
 
 
 def test_the_lap_never_stops_between_the_install_and_the_restart():
     """Nothing after pip install may exit 0 without the restart: the only exits from there on are
-    the fail-closed stage failures (exit 1, before installed.sha), and the last look's wait has no
-    give-up path once the install has run."""
+    exit 1 before installed.sha, the fail-closed stage failures and the one the last look takes over
+    the broker's own op past OP_CAP (I7); every give-up of the wait is a drain's, before the install."""
     text = _SCRIPT.read_text()
     look = text.index("# Last look before the restart (spec 08 I24)")
     restart = text.index("systemctl restart tt-device-broker", look)
-    assert "exit" not in text[look:restart], text[look:restart]
-    assert 'wait_job_boundary "restart point" installed' in text[look:restart]
+    tail = "\n".join(line.split("#")[0] for line in text[look:restart].splitlines())
+    assert tail.count("exit") == 1 and 'wait_job_boundary "restart point" installed || exit 1' in tail, tail
     start = text.index("wait_job_boundary() {")
     body = text[start : text.index("\n}\n", start)]
-    give_up = body.index("return 1")
-    assert '"${2:-}" != installed' in body[body.rindex("if ", 0, give_up) - 200 : give_up], body
+    at = 0
+    while (at := body.find("return 1", at + 1)) != -1:
+        assert '"${2:-}" != installed' in body[at - 400 : at], body
+    two = body.index("return 2")
+    assert "if op_lock_live; then" in body[two - 400 : two], body
     install = text.index('"$VENV/bin/pip" install -q "$clone"')
     assert "exit 0" not in text[install:restart], "a lap can stop after the install without restarting"
 

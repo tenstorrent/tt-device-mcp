@@ -90,8 +90,9 @@ echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >
 # An in-flight device operation is an ABSOLUTE bar — not the bounded defer below.
 # Restarting the broker mid-reset lets KillMode=control-group SIGTERM the running
 # tt-smi, leaving 32 ASICs half-reset, which is the state that costs a power-cycle.
-# Unlike a long job, a device op is bounded (DEVICE_RESET_TIMEOUT_SEC), so waiting
-# it out can never starve the updater.
+# A device op is not bounded by the broker: a reset scope that outlives its timeout is
+# left running. So the waits below give an op at most OP_CAP, and past that never
+# restart over the broker's own op (live-pid lock); see wait_job_boundary.
 INHIBIT=/run/tt-device-broker/device-op.lock
 if [ -f "$INHIBIT" ]; then
     op_pid=""; op_name=""
@@ -140,8 +141,9 @@ fi
 # with no readable start counts as just started). A job past it is overdue for the broker's own kill
 # and no longer holds the update, so a box busy around the clock still updates within one job.
 JOB_CAP=1560
-# A device op's own bound, DEVICE_RESET_TIMEOUT_SEC (600) plus the same kill grace: how long past the
-# job cap a device op at the restart point is expected to take (see wait_job_boundary).
+# A device op's own bound, DEVICE_RESET_TIMEOUT_SEC (600) plus the same kill grace: how long an op
+# with nothing else running may keep the hold (see wait_job_boundary). It bounds the wait, never
+# the bar: past it the lap still restarts over nothing the broker is running (I7).
 OP_CAP=660
 UPTIME=/proc/uptime
 count_busy() {
@@ -182,27 +184,35 @@ youngest_job_age() {
 }
 # The device-op bar above, asked again while a drain waits: the broker can start a device op (a
 # gate pass, a reset) on its own while dispatch is held, and the apply must not restart over it.
-op_in_flight() {
+# op_lock_live: the broker itself runs the op (the device-op lock names a live pid), inside its own
+# cgroup, so a restart SIGTERMs it. reset_scope_listed: a ttdev-reset-* scope, its own systemd unit,
+# which a broker restart does not stop; a new broker's startup waits it out (await_foreign_scope)
+# before anything touches the device.
+op_lock_live() {
     local op_pid="" op_name=""
-    if [ -f "$INHIBIT" ]; then
-        read -r op_pid op_name < "$INHIBIT" 2>/dev/null || true
-        [ -n "${op_pid:-}" ] && kill -0 "$op_pid" 2>/dev/null && return 0
-    fi
+    [ -f "$INHIBIT" ] || return 1
+    read -r op_pid op_name < "$INHIBIT" 2>/dev/null || true
+    [ -n "${op_pid:-}" ] && kill -0 "$op_pid" 2>/dev/null
+}
+reset_scope_listed() {
     systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null \
         | grep -q 'ttdev-reset-'
 }
+op_in_flight() { op_lock_live || reset_scope_listed; }
 # Wait, under the dispatch hold, for the job boundary: nothing running and no device op in flight.
-# Returns 0 there, and 0 once the youngest running job is past JOB_CAP or the broker is down (a down
-# broker protects no job by waiting, and the restart is what starts it again); 1 when a device op is
-# still in flight at the cap, before the install only. $1 names the wait in the log; $2 "installed"
-# is the wait after the install, which never returns 1: pip and apply-host-config have changed the
-# broker's venv and units, and an old broker left running on them (it imports some modules only at
-# a fault's onset) is a split version no lap reports. So a device op in flight at the cap is waited
-# out there, still under the hold: never restarted over (I7), never given up on. The broker bounds
-# each op by its reset timeout, so this adds at most about OP_CAP; an op past that is named once and
-# still waited out, because a restart over it is a half-reset mesh.
+# Returns 0 there, 0 once the youngest running job is past JOB_CAP, and 0 when the broker is down and
+# runs no op of its own (a down broker protects no job by waiting, and the restart is what starts
+# it). A device op is waited out too, under the hold, but for at most OP_CAP from when nothing else
+# holds the wait (no job running, or the job cap reached): the broker does not bound every op (a
+# reset that outlives its timeout is left running in its scope), and a hold kept past that would
+# defeat the broker's DISPATCH_HOLD_MAX_SEC and block the reconcile that runs this lap. $1 names the
+# wait in the log. Before the install ($2 empty) an op at the job cap or past OP_CAP returns 1:
+# nothing is installed, the next lap retries. After it ($2 "installed": pip and apply-host-config
+# have changed the venv and units) an op past OP_CAP that is only a reset scope returns 0 and the
+# lap restarts, which stops nothing of it; the broker's own op past OP_CAP returns 2: never
+# restarted over (I7), so the caller drops the hold and leaves installed.sha on the old sha.
 wait_job_boundary() {
-    local w_start w_now w_bound op_since="" op_late=0
+    local w_start w_now w_bound op_since=""
     youngest_job_age
     w_bound=$(( JOB_CAP - j_age )); [ "$w_bound" -gt 0 ] || w_bound=0
     w_start="$(date +%s)"
@@ -215,33 +225,41 @@ wait_job_boundary() {
             return 0
         fi
         w_now="$(date +%s)"
-        if ! op_in_flight; then
+        if ! op_lock_live; then
             case "$(systemctl is-active tt-device-broker 2>/dev/null)" in
                 active|activating|deactivating|reloading) ;;
-                *)  echo "autoupdate: $1: the broker is down after $(( w_now - w_start ))s; applying (the restart starts it)" >&2
+                *)  echo "autoupdate: $1: the broker is down after $(( w_now - w_start ))s; applying (the restart starts it, and its startup waits out any reset scope before the queue opens)" >&2
                     return 0 ;;
             esac
         fi
-        if [ $(( w_now - w_start )) -ge "$w_bound" ]; then
-            if op_in_flight; then
-                if [ "${2:-}" != installed ]; then
+        if op_in_flight; then
+            if [ -z "$op_since" ] && { [ "$running" -eq 0 ] || [ $(( w_now - w_start )) -ge "$w_bound" ]; }; then
+                if [ "${2:-}" != installed ] && [ "$running" -ne 0 ]; then
                     echo "autoupdate: $1: a device op is still in flight at the job cap after $(( w_now - w_start ))s; dispatch released, the next lap retries" >&2
                     return 1
                 fi
-                if [ -z "$op_since" ]; then
-                    op_since="$w_now"
-                    echo "autoupdate: $1: a device op is still in flight at the job cap after $(( w_now - w_start ))s; the install has run, so the restart waits for the op to end (expected within ${OP_CAP}s), dispatch held" >&2
-                elif [ "$op_late" -eq 0 ] && [ $(( w_now - op_since )) -ge "$OP_CAP" ]; then
-                    op_late=1
-                    echo "autoupdate: $1: a device op is still in flight ${OP_CAP}s past the job cap, over its own reset timeout; the restart still waits for it (never over a device op)" >&2
-                fi
-                sleep 5
-                hold_write
-                continue
+                op_since="$w_now"
+                echo "autoupdate: $1: a device op is in flight after $(( w_now - w_start ))s with nothing else holding the wait; it is waited out under the hold for at most ${OP_CAP}s" >&2
             fi
-            if [ "$kids" -eq 0 ] && [ "${scopes:-0}" -eq 0 ] && [ "$holders" -gt 0 ]; then w_what="a device holder is"; else w_what="the running job is"; fi
-            echo "autoupdate: $1: $w_what past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); it no longer holds the update, applying" >&2
-            return 0
+            if [ -n "$op_since" ] && [ $(( w_now - op_since )) -ge "$OP_CAP" ]; then
+                if [ "${2:-}" != installed ]; then
+                    echo "autoupdate: $1: a device op is still in flight ${OP_CAP}s on; dispatch released, the next lap retries" >&2
+                    return 1
+                fi
+                if op_lock_live; then
+                    echo "autoupdate: $1: the broker's own device op is still in flight ${OP_CAP}s on; not restarting over it (I7): dispatch released, installed.sha left on the old sha, the next lap installs and restarts" >&2
+                    return 2
+                fi
+                echo "autoupdate: $1: a reset scope is still running ${OP_CAP}s on with no broker op behind it (the broker timed it out and left it in its own unit, which a restart does not stop); restarting: the new broker's startup waits it out, then its full check, before the queue opens" >&2
+                return 0
+            fi
+        else
+            op_since=""
+            if [ $(( w_now - w_start )) -ge "$w_bound" ]; then
+                if [ "$kids" -eq 0 ] && [ "${scopes:-0}" -eq 0 ] && [ "$holders" -gt 0 ]; then w_what="a device holder is"; else w_what="the running job is"; fi
+                echo "autoupdate: $1: $w_what past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); it no longer holds the update, applying" >&2
+                return 0
+            fi
         fi
         sleep 5
         # Refreshed, so the broker's overdue bound on a hold counts from the last poll: a drain
@@ -340,11 +358,12 @@ rm -f "$ROOT/pending.defer"
 # Last look before the restart (spec 08 I24). The install ran under the dispatch hold, but a job
 # can still be running here: a tenant that opened the device on its own, or a dispatch after an
 # install slow enough for the broker to drop the hold as overdue. It is waited out the same way,
-# and a device op (I7) to its end even past the cap: from here on the lap always restarts.
+# and a device op (I7) for OP_CAP more: from here on the lap restarts, except over an op the broker
+# itself still runs past that (exit 1, installed.sha unchanged, so the next lap redoes both).
 hold_write
 count_busy
 if [ $(( kids + holders + ${scopes:-0} )) -ne 0 ] || op_in_flight; then
-    wait_job_boundary "restart point" installed
+    wait_job_boundary "restart point" installed || exit 1   # the EXIT trap drops the hold
 fi
 echo "$remote_sha" > "$STATE"
 
