@@ -334,6 +334,7 @@ def test_tenant_gate_writes_one_held_and_one_released_per_episode(monkeypatch):
 
     srv._note_tenant_gate_verdict("chip 2 fell off the PCIe bus")  # a fresh outage reopens it
     assert [k for k, _ in events] == ["device_held", "device_released", "device_held"]
+    assert events[2][1].get("continues_episode"), "a hold right after a release continues it (04 I82)"
 
 
 def test_idle_blackout_writes_a_durable_held_event_with_no_job_flowing(monkeypatch):
@@ -15863,6 +15864,7 @@ def test_a_healthy_startup_gate_clears_a_dead_brokers_hold_clock(monkeypatch, tm
     start, so the new hold was born past its escalation windows and forced the ladder at once. The
     verified-healthy clear is where that episode provably ended. Fails on base: the file survived."""
     _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
+    monkeypatch.setattr(srv, "_HOLD_CARRY_SEC", -1)  # the drop comes after the 04 I82 carry window
 
     srv._clear_device_dirty(verified=True, why="gate/startup: verified healthy")
 
@@ -15877,6 +15879,7 @@ def test_a_hold_after_the_device_was_seen_fit_never_inherits_the_clock(monkeypat
     Fails on base: the hold restored the file regardless."""
     _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
     monkeypatch.setattr(srv, "_persist_hold_episode", lambda *a, **k: None)  # the unlink fails
+    monkeypatch.setattr(srv, "_HOLD_CARRY_SEC", -1)  # the hold comes after the 04 I82 carry window
 
     srv._note_tenant_gate_verdict("")  # a tenant gate passed: fit, no hold open
 

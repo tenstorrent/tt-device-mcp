@@ -1316,7 +1316,184 @@ def _forget_stale_hold_episode() -> None:
     if device_hold_logged or not _hold_episode_restorable:
         return
     _hold_episode_restorable = False
+    since = _restore_hold_episode()
+    if since:
+        # Spec 04 I82: a hold the last broker left open that this one's first check released is a
+        # release like any other: a new hold right after it continues that episode.
+        _save_hold_carry(since, "", ladder_age=_recorded_hold_bound_ladder_age(since))
     _persist_hold_episode("")
+
+
+# Spec 04 I82: a release that a new hold follows within _HOLD_CARRY_SEC, or around the first job started
+# in that window, continues the episode: the 10-min clock and the bound's own ladder carry over, so no
+# lift, re-latch, failed first job, class change or broker restart restarts it. On one Galaxy host each
+# bound ladder's check released the device, the first job died on the same missing link, and the new
+# hold started a new clock, so the host rung after the ladder was never due. Only within one boot: a
+# reboot or power cycle ends the episode. A successful first job or a full check passed with no hold
+# open ends the carry; a tenant hold neither saves, takes nor spends one.
+HOLD_CARRY_FILE = "hold_carry.json"
+_HOLD_CARRY_SEC = 300
+_hold_carry: Optional[dict] = None
+_hold_carry_loaded = False
+
+
+def _write_hold_carry() -> None:
+    path = health_dir() / HOLD_CARRY_FILE
+    try:
+        if _hold_carry:
+            path.write_text(json.dumps(_hold_carry))
+        else:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass  # never let bookkeeping break the gate
+
+
+def _load_hold_carry() -> Optional[dict]:
+    """The carry in force, read once per process from disk so a broker restart keeps it."""
+    global _hold_carry, _hold_carry_loaded
+    if not _hold_carry_loaded:
+        _hold_carry_loaded = True
+        try:
+            rec = json.loads((health_dir() / HOLD_CARRY_FILE).read_text())
+        except (OSError, ValueError):
+            rec = None
+        if _hold_carry is None and isinstance(rec, dict):
+            _hold_carry = rec
+    return _hold_carry
+
+
+def _save_hold_carry(since: str, reason: str, *, ladder_age: Optional[float] = None) -> None:
+    """Remember the episode a release just ended (spec 04 I82)."""
+    global _hold_carry, _hold_carry_loaded
+    if not since:
+        return
+    _hold_carry_loaded = True
+    _hold_carry = {
+        "since": since,
+        "reason": reason,
+        "released": time.time(),
+        "boot_id": _current_boot_id(),
+        "ladder_age": ladder_age,
+        "cycle_age": None,
+    }
+    if _hold_bound_episode == since and _hold_bound_ladder_age is not None:
+        _hold_carry["ladder_age"] = _hold_bound_ladder_age
+        _hold_carry["cycle_age"] = _hold_bound_cycle_age
+    _write_hold_carry()
+
+
+def _drop_hold_carry() -> None:
+    global _hold_carry
+    _load_hold_carry()
+    if _hold_carry is not None:
+        _hold_carry = None
+        _write_hold_carry()
+
+
+def _note_hold_carry_job(edge: str, *, ok: bool = False) -> None:
+    """A job started inside the carry window keeps it open until _HOLD_CARRY_SEC after that job ends:
+    the first job after a release is the one that shows whether the release was right (spec 04 I82).
+    ``ok``: the job ended completed, exit 0, naming no device or fabric fault. That proves the release
+    right, so the carry is dropped and the next hold is a fresh episode with its own class path."""
+    rec = _load_hold_carry()
+    if not isinstance(rec, dict):
+        return
+    if edge == "end" and ok:
+        _drop_hold_carry()
+        return
+    now = time.time()
+    try:
+        released = float(rec.get("released") or 0.0)
+    except (TypeError, ValueError):
+        return
+    if edge == "start" and not rec.get("job_started") and now - released <= _HOLD_CARRY_SEC:
+        rec["job_started"] = now
+    elif edge == "end" and rec.get("job_started") and not rec.get("job_ended"):
+        rec["job_ended"] = now
+    else:
+        return
+    _write_hold_carry()
+
+
+def _note_full_check_passed(prior: Optional[dict]) -> None:
+    """A full health check (fabric included) passed with no hold open: the device served and proved
+    fit since the release, so a later hold is a new episode (spec 04 I82). ``prior`` is the carry
+    from before this pass; only that one ends. A carry this pass's own release saved (the startup
+    check releasing a hold a dead broker left open) is the release itself, not proof since it."""
+    if not device_hold_logged and prior is not None and _load_hold_carry() is prior:
+        _drop_hold_carry()
+
+
+def _take_hold_carry() -> Optional[dict]:
+    """The released episode a hold opening now continues, or None. Spent either way."""
+    rec = _load_hold_carry()
+    _drop_hold_carry()
+    if not isinstance(rec, dict):
+        return None
+    try:
+        since = str(rec["since"])
+        datetime.fromisoformat(since)
+        released = float(rec["released"])
+        job_ended = float(rec.get("job_ended") or 0.0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    file_boot, this_boot = str(rec.get("boot_id") or ""), _current_boot_id()
+    if not (file_boot == this_boot if file_boot and this_boot else _since_this_boot(since)):
+        return None
+    now = time.time()
+    open_window = now - released <= _HOLD_CARRY_SEC
+    if rec.get("job_started") and (not job_ended or now - job_ended <= _HOLD_CARRY_SEC):
+        open_window = True
+    return rec if open_window else None
+
+
+def _recorded_hold_bound_ladder_age(since: str) -> Optional[float]:
+    """The bound ladder's hold age the episode record names for ``since``, if any (spec 04 I82)."""
+    try:
+        rec = json.loads((health_dir() / HOLD_EPISODE_RECORD_FILE).read_text())
+        if isinstance(rec, dict) and rec.get("since") == since and rec.get("bound_ladder_age") is not None:
+            return float(rec["bound_ladder_age"])
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _record_hold_bound_ladder() -> None:
+    """Add the bound ladder's hold age to the episode record, so a broker restart keeps it (spec 04 I82)."""
+    path = health_dir() / HOLD_EPISODE_RECORD_FILE
+    try:
+        rec = json.loads(path.read_text())
+        if isinstance(rec, dict) and rec.get("since") == device_hold_episode_since:
+            rec["bound_ladder_age"] = _hold_bound_ladder_age
+            path.write_text(json.dumps(rec))
+    except (OSError, ValueError):
+        pass
+
+
+def _resume_hold_bound(carry: dict) -> None:
+    """A hold that continues a released episode keeps the bound's state (spec 04 I82). A bound ladder
+    whose check released a device that is held again did not heal it: its host rung is due now, not
+    after another ladder. One the bound already asked the host rung for runs the ladder at once."""
+    global _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_cycle_age
+    global _hold_bound_check_failed_age
+    _hold_bound_sync()
+    age = _hold_age_now()
+    lad = carry.get("ladder_age")
+    if lad is None or carry.get("since") != device_hold_episode_since:
+        return
+    _hold_bound_ladder_age = float(lad)
+    _hold_bound_ladder_recovered = True
+    cyc = carry.get("cycle_age")
+    _hold_bound_cycle_age = None if cyc is None else float(cyc)
+    if _hold_bound_cycle_age is None or _hold_bound_cycle_age < _hold_bound_ladder_age:
+        _hold_bound_check_failed_age = max(age, _hold_bound_ladder_age)
+    health_event(
+        "hold_bound_carried",
+        held_since=device_hold_episode_since,
+        held_age_sec=int(age),
+        ladder_age_sec=int(_hold_bound_ladder_age),
+        host_rung_due=_hold_bound_check_failed_age is not None,
+    )
 
 
 # The alert hook's backoff for that episode, on disk beside it. In memory alone a restart during a
@@ -2313,7 +2490,7 @@ def _reset_for_testing():
     Only used by test fixtures - not part of the public API.
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
-    global _hold_episode_restorable, _hold_episode_tenant
+    global _hold_episode_restorable, _hold_episode_tenant, _hold_carry, _hold_carry_loaded
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
     global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
@@ -2332,6 +2509,8 @@ def _reset_for_testing():
     preempt_forced_job_ids.clear()
     _hold_episode_restorable = True
     _hold_episode_tenant = False
+    _hold_carry = None
+    _hold_carry_loaded = False
     if recovery_mechanism is not None:
         recovery_mechanism.regressed_reset_since = None
     _fabric_77_streak_since = None
@@ -6265,10 +6444,12 @@ async def device_health_gate(
                 _log(f"device verified healthy (incl. fabric) despite: {dirty_reason}" f" — no reset needed")
             else:
                 _log("device healthy; no reset needed")
+            prior_carry = _load_hold_carry()  # spec 04 I82: the release below may save a new one
             released = _clear_device_dirty(verified=True, why=f"gate/{phase}: verified healthy")
             if released and state.fabric_ran and fabric_ok is True:
                 # Proof this boot heals: a power cycle before it no longer reads as a boot loop (04 I9).
                 recovery_mechanism.record_verified_release(f"gate/{phase}")
+                _note_full_check_passed(prior_carry)  # spec 04 I82; before the release below saves one
             if released and device_hold_logged:
                 _note_tenant_gate_verdict("")
             return
@@ -7064,8 +7245,17 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         row_since = datetime.now().isoformat()
         restored = _restore_hold_episode() if _hold_episode_restorable else ""
         _hold_episode_restorable = False
-        device_hold_episode_since = restored or row_since
-        _persist_hold_episode(device_hold_episode_since, tenant=_hold_is_tenant_held())
+        # ...or the start of the episode a release ended moments ago (spec 04 I82). A tenant hold is
+        # not a device fault: it neither takes nor spends a fault hold's carry.
+        tenant = _hold_is_tenant_held()
+        carry = None if tenant else _take_hold_carry()
+        starts = [s for s in (restored, str(carry["since"]) if carry else "") if s]
+        device_hold_episode_since = min(starts, key=datetime.fromisoformat) if starts else row_since
+        if restored and carry is None and device_hold_episode_since == restored:
+            ladder_age = _recorded_hold_bound_ladder_age(restored)  # read before the rewrite below
+            if ladder_age is not None:
+                carry = {"since": restored, "ladder_age": ladder_age, "released": time.time()}
+        _persist_hold_episode(device_hold_episode_since, tenant=tenant)
         # ...and the alert hook's backoff for that same episode, so a restart does not page again.
         device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
         device_hold_episode_reason = reason
@@ -7092,10 +7282,20 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # A hold carried over from the last broker and not yet released becomes this one: one
         # device_held/device_released pair per open stretch, and this process's release closes it.
         carried, _carried_hold = _carried_hold, None
+        # A hold that continues an episode a release ended moments ago says so (spec 04 I82).
+        cont = (
+            {"continues_episode": device_hold_episode_since, "prior_reason": str(carry.get("reason") or "")}
+            if carry
+            else {}
+        )
         if carried is not None:
-            health_event("device_held", reason=reason, carried_from=carried.get("iso") or carried.get("ts"))
+            health_event("device_held", reason=reason, carried_from=carried.get("iso") or carried.get("ts"), **cont)
         else:
-            health_event("device_held", reason=reason)
+            health_event("device_held", reason=reason, **cont)
+        if carry:
+            _resume_hold_bound(carry)
+            if _hold_bound_ladder_age is not None:
+                _record_hold_bound_ladder()
     elif not reason and not device_hold_logged:
         _forget_stale_hold_episode()
     elif not reason and device_hold_logged:
@@ -7127,6 +7327,8 @@ def _note_tenant_gate_verdict(reason: str) -> None:
             held_for,
         )
         _hold_row = None
+        if not _hold_episode_tenant:  # spec 04 I82: a tenant's hold time is not fault time
+            _save_hold_carry(device_hold_episode_since, device_hold_episode_reason)
         device_hold_episode_since = ""
         _dispatch_reset_spent = False  # spec 03 I55: the next episode earns its own reset
         if recovery_mechanism is not None:
@@ -7384,6 +7586,7 @@ def _note_hold_bound_ladder(age: float, outcome: str) -> None:
     _hold_bound_tenant_blocker = None
     _hold_bound_ladder_age = max(age, _hold_age_now())
     _hold_bound_ladder_recovered = outcome == OUTCOME_RECOVERED
+    _record_hold_bound_ladder()  # spec 04 I82: a broker restart keeps it
 
 
 def _hold_bound_check_pending(age: float) -> bool:
@@ -10604,6 +10807,7 @@ async def _job_runner_loop():
         async with get_lock():
             job.status = JobStatus.RUNNING
             job.started_at = datetime.now().isoformat()
+            _note_hold_carry_job("start")  # spec 04 I82
             if job.verification:
                 job.reset_clock_at_start = recovery_mechanism.last_reset_monotonic
             _update_queue_depth_metric()
@@ -11125,6 +11329,10 @@ export {JOB_TAG_ENV}={job_tag}
                     if known:
                         _hold_device_fabric_unverified(f"job {job_id}: {known}")
                 fault = _scan_output_for_device_fault(job_log_file)
+                _note_hold_carry_job(  # spec 04 I82
+                    "end",
+                    ok=job.status == JobStatus.COMPLETED and job.exit_code == 0 and not (fault or topo or known),
+                )
                 if fault:
                     _mark_device_reported_fault(f"job {job_id} {fault}", job=job)
                 elif job_id in reset_killed_job_ids:
