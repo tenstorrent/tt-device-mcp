@@ -10,12 +10,19 @@ restart. A bound ladder whose check released a device that is held again did not
 bound step is the host rung, not another ladder. No test reaches a real reset or power cycle."""
 
 import dataclasses
+import json
 import time
 from datetime import datetime, timedelta
 
 import pytest
 
-from tests.test_device_safety import _arm_fabric_only_deadline_hold
+from tests.test_device_safety import (
+    _arm_fabric_only_deadline_hold,
+    _free_device_lock,
+    _no_workspace_activation,
+    _quiet_post_job_gate,
+    _run_one,
+)
 from tests.test_hold_bound import _REAL_HOST_RUNG, BOUND, MISMATCH, _drain, _watchdog
 from tt_device_mcp import server as srv
 from tt_device_mcp.health import evidence as health
@@ -304,6 +311,54 @@ async def test_a_tenant_hold_between_does_not_spend_a_fault_holds_carry(monkeypa
     assert srv._hold_bound_cycle_due(_age())
 
 
+async def _tenant_hold_after_a_bound_ladder_release(monkeypatch, tmp_path, released_ago):
+    """A fault hold's bound ladder released the device ``released_ago`` seconds ago; a foreign process
+    then held it and left with the device still faulted, so the tenant hold is a fault hold from now on."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, events, detail = _open_hold(monkeypatch, "generic", BOUND + 5)
+    since = srv.device_hold_episode_since
+    await _bound_ladder_releases(monkeypatch, escalations, events)
+    srv._hold_carry["released"] = time.time() - released_ago
+    _open_tenant_hold(monkeypatch, 20)
+    assert srv.device_hold_episode_since != since and srv._hold_carry is not None
+    monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, why="eth_frozen", detail=detail))
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    return escalations, events, since
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_hold_that_turns_into_a_fault_hold_takes_the_carry_in_its_window(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Review finding: the switch from a tenant hold to a fault hold kept the tenant's start and left a fault
+    carry still in its window unspent, so the bound ran one more ladder (about 10-13 min) before its host
+    rung. Fails on base: the hold is 20 s old and no host rung is asked."""
+    escalations, events, since = await _tenant_hold_after_a_bound_ladder_release(monkeypatch, tmp_path, 60)
+    assert srv.device_hold_episode_since == since, "the fault hold continues the released episode"
+    assert (tmp_path / srv.HOLD_EPISODE_FILE).read_text() == since, "its clock is on disk"
+    assert srv._hold_carry is None and not (tmp_path / srv.HOLD_CARRY_FILE).exists(), "the carry is spent"
+    assert "hold_turned_fault" in events and "hold_bound_carried" in events
+    assert escalations == [], "no second ladder: the bound goes straight to the host rung"
+    assert events.count("host_rung") == 1
+    assert srv.device_hold_logged, "taking the carry lifts nothing"
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_hold_that_turns_into_a_fault_hold_past_the_window_is_a_new_episode(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The carry's own window still bounds it: past it, the fault hold keeps its own start and class path."""
+    escalations, events, since = await _tenant_hold_after_a_bound_ladder_release(
+        monkeypatch, tmp_path, srv._HOLD_CARRY_SEC + 1
+    )
+    assert srv.device_hold_episode_since != since and _age() < 60
+    assert (tmp_path / srv.HOLD_EPISODE_FILE).read_text() == srv.device_hold_episode_since
+    assert "hold_turned_fault" not in events and "hold_bound_carried" not in events
+    assert escalations == [] and "host_rung" not in events, "below the bound: no ladder and no cycle"
+
+
 @pytest.mark.asyncio
 async def test_the_carried_host_rung_waits_out_the_cooldown_and_asks_once(monkeypatch, tmp_path, clear_job_state):
     """On the carried path the host rung is due at once, yet the I65 cooldown still holds it off: no ladder and
@@ -486,3 +541,59 @@ async def test_a_hold_open_across_a_restart_after_its_bound_ladder_goes_to_the_h
     srv._check_hold_deadline(now=datetime.now())
     await _drain()
     assert escalations == [] and events.count("host_rung") == 1
+
+
+def _carry_before_a_job(tmp_path):
+    """A release moments ago saved a carry; the next job runs inside its window."""
+    srv._save_hold_carry((datetime.now() - timedelta(seconds=BOUND + 5)).isoformat(), "post-job: fabric unverified")
+    assert (tmp_path / srv.HOLD_CARRY_FILE).exists()
+
+
+def _job(tmp_path, job_id, command):
+    return srv.Job(
+        id=job_id,
+        owner="tenant",
+        workspace="/tmp",
+        command=command,
+        queued_at="t",
+        log_file=str(tmp_path / f"{job_id}.log"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_first_jobs_end_closes_the_carry_window_even_when_a_job_end_check_raises(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Review finding: the job-end note ran after the health monitor's job-end checks, so one of them raising
+    left job_ended unset and the carry window open for good. Fails on base: no job_ended."""
+    _isolate(monkeypatch, tmp_path)
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+
+    def boom(*a, **k):
+        raise RuntimeError("job-end check failed")
+
+    monkeypatch.setattr(srv.health_monitor, "note_job_after_topology_lift", boom)
+    _carry_before_a_job(tmp_path)
+    await _run_one(_job(tmp_path, "951", "true"), limit_sec=3, until=lambda: (srv._hold_carry or {}).get("job_ended"))
+    rec = json.loads((tmp_path / srv.HOLD_CARRY_FILE).read_text())
+    assert rec.get("job_started") and rec.get("job_ended"), "the job's end is noted, on disk too"
+    assert srv._take_hold_carry() is not None, "unknown verdict: the carry stays, bounded by its window"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command, kept", [("true", False), ("exit 3", True)])
+async def test_the_first_jobs_verdict_still_decides_the_carry(monkeypatch, tmp_path, clear_job_state, command, kept):
+    """A clean first job drops the carry; a failed one keeps it with its end noted."""
+    _isolate(monkeypatch, tmp_path)
+    _free_device_lock(monkeypatch)
+    _quiet_post_job_gate(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    _carry_before_a_job(tmp_path)
+    job = _job(tmp_path, "952", command)
+    await _run_one(job, limit_sec=5)
+    assert job.finished_at is not None
+    assert (tmp_path / srv.HOLD_CARRY_FILE).exists() is kept
+    if kept:
+        assert srv._hold_carry.get("job_ended")

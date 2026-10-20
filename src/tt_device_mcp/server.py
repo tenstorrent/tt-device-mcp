@@ -8486,6 +8486,26 @@ def _defer_offbus_one_shot_to_tenant_bound() -> None:
         )
 
 
+def _hold_turned_fault() -> None:
+    """A tenant hold whose holder left a device fault behind is a fault hold from now on: write its
+    clock to disk, and continue a fault carry still in its window as a fault hold opened now would
+    (spec 04 I82). Without it the bound runs one more ladder before its host rung."""
+    global device_hold_episode_since
+    carry = _take_hold_carry()
+    if carry:
+        device_hold_episode_since = min((device_hold_episode_since, str(carry["since"])), key=datetime.fromisoformat)
+    _persist_hold_episode(device_hold_episode_since)
+    if carry:
+        health_event(
+            "hold_turned_fault",
+            continues_episode=device_hold_episode_since,
+            prior_reason=str(carry.get("reason") or ""),
+        )
+        _resume_hold_bound(carry)
+        if _hold_bound_ladder_age is not None:
+            _record_hold_bound_ladder()
+
+
 def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     """Flag a hold that has outlived the deadline to the durable timeline, so none sits silent.
 
@@ -8508,7 +8528,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     if not device_hold_episode_since:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
-        _persist_hold_episode(device_hold_episode_since)  # the holder left a real fault behind
+        _hold_turned_fault()  # the holder left a real fault behind
     try:
         started = datetime.fromisoformat(device_hold_episode_since)
     except ValueError:
@@ -11761,6 +11781,8 @@ export {JOB_TAG_ENV}={job_tag}
                 known = None
                 topo = None
                 killed_by_reset = job_id in reset_killed_job_ids
+                # Spec 04 I82: the job's end closes the carry window, whatever the checks below raise.
+                _note_hold_carry_job("end")
                 if health_monitor is not None:
                     tail = _read_job_log_tail(job_log_file)
                     topo = health_monitor.note_job_after_topology_lift(job.status != JobStatus.COMPLETED, tail)
@@ -11770,10 +11792,8 @@ export {JOB_TAG_ENV}={job_tag}
                     if known:
                         _hold_device_fabric_unverified(f"job {job_id}: {known}")
                 fault = _scan_output_for_device_fault(job_log_file)
-                _note_hold_carry_job(  # spec 04 I82
-                    "end",
-                    ok=job.status == JobStatus.COMPLETED and job.exit_code == 0 and not (fault or topo or known),
-                )
+                if job.status == JobStatus.COMPLETED and job.exit_code == 0 and not (fault or topo or known):
+                    _note_hold_carry_job("end", ok=True)  # spec 04 I82: the release was right
                 if fault:
                     _mark_device_reported_fault(f"job {job_id} {fault}", job=job)
                 elif job_id in reset_killed_job_ids:
