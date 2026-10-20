@@ -299,12 +299,16 @@ wait_job_boundary() {
         hold_write
     done
 }
+# For the autoupdate_apply event below: whether this lap ran into a busy broker, and how long it drained.
+idle=true; drained_s=0
 count_busy
 if [ "$busy" -ne 0 ]; then
+    idle=false; d_t0="$(date +%s)"
     if ! wait_job_boundary drain; then
         rm -f "$HOLD" 2>/dev/null || true
         exit 0
     fi
+    drained_s=$(( $(date +%s) - d_t0 ))
     # The apply's own stretch, under the broker's overdue bound, starts now.
     hold_write
 fi
@@ -395,15 +399,34 @@ rm -f "$ROOT/pending.defer"
 hold_write
 count_busy
 if [ $(( kids + holders + ${scopes:-0} )) -ne 0 ] || op_in_flight; then
+    idle=false; d_t0="$(date +%s)"
     if ! wait_job_boundary "restart point"; then
         echo "autoupdate: not restarting, not marking current" >&2
         exit 0
     fi
+    drained_s=$(( drained_s + $(date +%s) - d_t0 ))
 fi
 echo "$remote_sha" > "$STATE"
 
 date +%s > "$LAST_APPLY" 2>/dev/null || true   # I21: the rate limit counts from this restart
 systemctl restart tt-device-broker
+restart_rc=$?
 # I21: the crash-loop baseline, read after the restart (an explicit restart may zero NRestarts).
 systemctl show tt-device-broker -p NRestarts --value > "$LAST_APPLY_NRESTARTS" 2>/dev/null || true
-echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
+if [ "$restart_rc" -eq 0 ]; then
+    echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
+else
+    echo "autoupdate: broker restart at ${remote_sha:0:9} failed (rc=$restart_rc, via $src_desc)" >&2
+fi
+
+# One line in the broker's event journal (same fields as health_event(): ts, iso, kind), so a restart
+# the update caused is traceable without the systemd journal. restart_rc is the restart's exit code:
+# a failed restart is recorded as such, not as a clean apply. Same journal dir as the broker
+# (TT_DEVICE_MCP_HEALTH_DIR, else root's default). A single O_APPEND write of one short line, by
+# root like the broker; a failed write only warns, the apply is already done.
+EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
+now="$(date +%s.%N)"
+printf '{"ts": %s, "iso": "%s", "kind": "autoupdate_apply", "from_sha": "%s", "to_sha": "%s", "idle": %s, "drained_s": %s, "restart_rc": %s}\n' \
+    "$now" "$(date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ)" "$installed_sha" "$remote_sha" "$idle" "$drained_s" "$restart_rc" \
+    >> "$EVENTS" 2>/dev/null \
+    || echo "autoupdate: warning: could not append autoupdate_apply to $EVENTS" >&2

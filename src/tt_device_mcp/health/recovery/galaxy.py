@@ -943,6 +943,23 @@ def _affected_trays(offbus_chips: set, expected: int, tray_map: Optional[dict]) 
     return sorted({tray for tray, chips in tray_map.items() if ids & set(chips)})
 
 
+def _offbus_placement(offbus_chips, chip_buses, tray_map: Optional[dict]) -> list:
+    """Each off-bus chip a sweep plans around, as ``{"chip", "pci", "tray"}`` sorted by chip: the
+    PCI address from the banked map and the tray from ``tray_map`` (None where either is unknown).
+    The sweep's line and event carry it so a reader can check the trays it re-powers against the
+    chips that drove them; without it a chip that came back earlier in the hold reads as the one
+    the sweep was for. Pure."""
+    tray_of = {c: t for t, chips in (tray_map or {}).items() for c in chips}
+    buses = chip_buses if isinstance(chip_buses, Mapping) else {}
+    ids = sorted({int(c) for c in offbus_chips or () if str(c).isdigit()})
+    return [{"chip": i, "pci": buses.get(i), "tray": tray_of.get(i)} for i in ids]
+
+
+def _placement_text(placement: list) -> str:
+    """``chip 27 (0000:84:00.0, tray 4)``, comma-joined; ``?`` for an unknown address or tray."""
+    return ", ".join(f"chip {p['chip']} ({p['pci'] or '?'}, tray {p['tray'] or '?'})" for p in placement) or "none"
+
+
 # Issue #26 (spec 04 I19): a tray with this many chips off the bus at the FIRST sighting is a tray that
 # has lost power, not a chip that dropped. Such an onset gets one PCI rescan and a read-only capture of
 # the BMC/CPLD/PCIe state in front of the ladder; the ladder itself, and the power cycle only when the
@@ -1163,6 +1180,12 @@ class GalaxyRecovery(Recovery):
             # two board types is not a topology either UBB table describes.
             return None
         return _tray_map(self.deps.chip_buses_provider() or {}, board_types.pop())
+
+    def _chip_buses_now(self) -> dict:
+        """The banked ``{chip id: PCI address}`` map, or ``{}`` when none is banked or wired."""
+        if self.deps.chip_buses_provider is None:
+            return {}
+        return self.deps.chip_buses_provider() or {}
 
     def next_stage(self, ev: Evidence) -> str:
         # host_escalation/reboot_blocked are folded here, not carried on Evidence (see its own
@@ -2234,6 +2257,7 @@ class GalaxyRecovery(Recovery):
         # Chip ids come from the tray map (I16), not index arithmetic — bus 0x80 is tray 4 on BH
         # and index arithmetic would target the wrong silicon.
         tray_chip_ids = [c for t in trays for c in (tray_map or {}).get(t, [])]
+        placement = _offbus_placement(offbus_chips, self._chip_buses_now(), tray_map)
         swept = False
         if await asyncio.to_thread(self.mechanism.scope_active):
             log(f"last chance before the host rung{where}: a reset is already cycling in its own scope — adopting it")
@@ -2249,13 +2273,14 @@ class GalaxyRecovery(Recovery):
                     trays=trays,
                     ubb_bitmap=bitmap,
                     off_bus=len(offbus_chips or set()),
+                    off_bus_chips=placement,
                     expected=expected,
                     host_at_risk=True,
                 )
                 log(
                     f"last chance before the host rung{where}: firing every reset type back-to-back "
                     f"(SBR -> per-tray re-power of trays {trays} -> mesh reset) — nothing to lose before a "
-                    f"reboot or power cycle"
+                    f"reboot or power cycle; off the bus now: {_placement_text(placement)}"
                 )
                 swept = await self._issue_all_resets_back_to_back(
                     bitmap, tray_chip_ids, trays, expected, log, do_sbr=bool(self.deps.isolated_chips())
@@ -3431,7 +3456,7 @@ class GalaxyRecovery(Recovery):
         Bounded below by the hold ceiling: the host rungs never fire before the episode has stood the
         full ladder, however futile the gentler rungs proved — an early forced pass fires the cheap
         rungs only, and the deadline watchdog re-runs the ladder at the ceiling where the climb is
-        then admitted.
+        then admitted. The exceptions are holds with no gentler rung left to try (spec 04 I38, I79).
 
         Fires ONLY for a mass drop. The galaxy reset can drop a present-but-eth-unverifiable mesh to
         all-0xFFFFFFFF, which a reboot/power cycle recovers and self-heal never does; a still-present or
@@ -3542,6 +3567,26 @@ class GalaxyRecovery(Recovery):
                 held_age_sec=int(hold_age),
                 ceiling_sec=_stuck_hold_ceiling_sec(),
                 reason="reset_and_sweep_failed" if ladder_ran else "present_mesh_reset_failed",
+            )
+        elif (
+            off_bus > 0
+            and (reset_regressed or episode_regressed)
+            and hold_age is not None
+            and hold_age < _stuck_hold_ceiling_sec()
+        ):
+            # This hold's reset made the drop worse. I31 bars every reset rung but the sweep for the rest
+            # of the episode, so the ceiling wait has nothing to try: one 8-chip host's hold sat 512 s in
+            # it, then swept and power-cycled anyway. Sweep now, then the cold rung (spec 04 I79).
+            log(
+                f"this {int(hold_age)}s-old hold's reset regressed the mesh ({off_bus}/{expected} off the bus) — "
+                f"no reset rung may repeat it; not waiting for the {_stuck_hold_ceiling_sec()}s ladder end"
+            )
+            health_event(
+                "host_rung_not_deferred",
+                held_since=hold_since,
+                held_age_sec=int(hold_age),
+                ceiling_sec=_stuck_hold_ceiling_sec(),
+                reason="reset_regressed_offbus",
             )
         elif hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
             log(
