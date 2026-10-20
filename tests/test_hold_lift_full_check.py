@@ -9,15 +9,20 @@ other two keep the hold, its episode and its clock as they were, so the 10-min b
 the power cycle (spec 04 I76) stay the way out. Device-free: every check is stubbed."""
 
 import time
+from datetime import datetime, timedelta
 
 import pytest
 
-from tests.conftest import fsm_dirty, fsm_healthy, patch_recovery
+from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event, patch_recovery
 from tests.test_device_safety import _fast_verify_setup, _setup_down_offbus, _setup_selfheal_hold
+from tests.test_eth_timeout_reset import ADVANCING
+from tests.test_eth_timeout_reset import mesh as eth_mesh  # noqa: F401  (fixture)
+from tests.test_fabric_topology_mismatch import _LOST
 from tests.test_post_reset_gate import mesh  # noqa: F401
 from tests.test_startup_fabric_hugepages import _bound
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
+from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.monitors import fabric
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
@@ -232,3 +237,118 @@ async def test_an_operator_reset_whose_release_the_funnel_refuses_reports_unveri
     monkeypatch.setattr(srv, "_hold_lift_unproven", lambda: "the last passing fabric pass is 400s old")
     got, _ = await srv._verify_operator_reset(32, srv.galaxy_recovery, lambda m: None, "operator reset")
     assert got is None and srv.fsm.state is ServerState.RECOVERING
+
+
+# --- the real fabric pass on a wrapper that exits 0 but finds a cabled link missing ---------------
+
+WRAPPER_LOST = f"{_LOST}TOPOLOGY MISMATCH vs d: 1 missing, 0 extra port connections\nall links ok\n"
+RELEASES = ("device_dirty_cleared", "device_released", "startup_fabric_released", "reset_verified")
+
+
+@pytest.fixture
+def wrapper(monkeypatch, tmp_path, eth_mesh):  # noqa: F811
+    """The eth-timeout tests' mesh (the real probe pass, leaf probes stubbed) whose fabric pass is the
+    monitor's own, on an operator wrapper that always exits 0. While ``fabric_bad`` (a reset sets it to
+    ``not reset_heals``) its output carries the topology marker of one lost port and nothing extra, so
+    the pass FAILS (spec 03 I71). ``fields`` keeps every broker event with its fields."""
+    st = eth_mesh
+    st.update(eth=ADVANCING, fabric_bad=True, fields=[])
+    m = srv.health_monitor
+    monkeypatch.delattr(m, "verify_fabric_health")  # the monitor's real pass, not the fixture's stand-in
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "/opt/fabric-check.sh")
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
+    for attr, value in (
+        ("topology_hw_fault", ""),
+        ("topology_lift_pending", False),
+        ("fabric_topology", {}),
+        ("_topology_alerted", set()),
+        ("_fabric_check_cmd", lambda: "/opt/fabric-check.sh"),
+        ("_begin_action_row", lambda *a, **k: None),
+        ("_write_action_log", lambda *a, **k: None),
+    ):
+        monkeypatch.setattr(m, attr, value)
+    hdir = tmp_path / "health"
+    hdir.mkdir()
+    monkeypatch.setattr(monitor_mod, "health_dir", lambda: hdir)
+    monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0xC1})
+    monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: None)
+    monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: object())
+    monkeypatch.setattr(fabric, "build_command", lambda descriptor=True: (["run_cluster_validation"], {}))
+    monkeypatch.setattr(fabric, "_validator_paths", lambda: ("bin", "root", "/x/d"))
+
+    async def check(argv, env, **kw):
+        st["fabric"].append(len(st["resets"]))
+        return 0, WRAPPER_LOST if st["fabric_bad"] else "all links ok\n"
+
+    monkeypatch.setattr(fabric, "check", check)
+
+    def event(name, *a, **f):
+        st["events"].append(name)
+        st["fields"].append((name, f))
+
+    patch_health_event(monkeypatch, event)
+    return st
+
+
+def _stub_power_cycle(monkeypatch) -> list:
+    cycles = []
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+    return cycles
+
+
+def _past_the_bound(monkeypatch) -> None:
+    since = datetime.now() - timedelta(seconds=galaxy._stuck_hold_ceiling_sec() + 1)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
+
+
+def _released(st) -> list:
+    """The release events seen. A device_dirty_cleared with verified=False only drops the dirty bit of a
+    hold that stays (the gate's hold for self-heal): it releases nothing."""
+    return [n for n, f in st["fields"] if n in RELEASES and f.get("verified", True) is not False]
+
+
+@pytest.mark.asyncio
+async def test_a_post_job_wrapper_pass_with_a_port_missing_holds_and_admits_no_job(wrapper):
+    """(a) The job ends, the wrapper exits 0 but its marker says 1 missing, 0 extra: that check FAILED.
+    The device is held, the next job's door stays shut, and nothing releases it."""
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=True)
+    assert wrapper["fabric"], "the post-job gate ran the fabric pass"
+    assert srv.health_monitor.fabric_verdict()["links_short"] is True
+    assert srv.fsm.state is not ServerState.HEALTHY, "a check short of the cabling never passes"
+    assert srv._device_unavailable_for_tenant(), "no next job on a mesh with a cabled link missing"
+    assert not _released(wrapper)
+    await srv._device_health_gate(None, phase="pre-job", run_fabric=False)  # the next job's door
+    assert srv._device_unavailable_for_tenant() and not _released(wrapper)
+
+
+@pytest.mark.asyncio
+async def test_a_kill_reset_whose_full_check_still_finds_the_port_missing_never_releases(wrapper, monkeypatch):
+    """(b) A job the broker stopped mid-run owes one reset (spec 03 I69): the kill mesh reset runs
+    glx_reset, and the full check after it still finds the cabled port missing. That is
+    reset_ineffective: the hold stays and no second reset runs at the door. At the 10-min bound (spec 04
+    I76) the ladder runs once more, its full check fails the same way, and the broker asks for exactly
+    one power cycle. Nothing releases the device at any step."""
+    wrapper["reset_heals"] = False
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    cycles = _stub_power_cycle(monkeypatch)
+    fsm_dirty(srv, "job 7 ended timeout")
+    srv._owe_kill_reset("job 7 timeout")
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    assert wrapper["events"].count("kill_mesh_reset") == 1 and wrapper["resets"] == [["tt-smi", "-glx_reset"]]
+    assert min(wrapper["fabric"]) >= 1, "every fabric pass ran after the reset"
+    assert "reset_ineffective" in wrapper["events"]
+    assert srv.fsm.state is ServerState.RECOVERING and srv._device_unavailable_for_tenant()
+    assert not _released(wrapper) and not cycles
+    _past_the_bound(monkeypatch)
+    await srv._force_escalate_stuck_hold()
+    assert len(cycles) == 1, "the bound's ladder did not heal it: one power cycle"
+    assert srv.fsm.state is not ServerState.HEALTHY and not _released(wrapper)
+    await srv._force_escalate_stuck_hold()
+    assert len(cycles) == 1 and not _released(wrapper)
