@@ -407,6 +407,22 @@ async def test_no_rung_before_120s_then_a_power_cycle_with_the_chip_off_the_bus(
     assert rung["phase"] == "requested" and rung["detail"] == f"power-cycle (1/{EXPECTED} chip(s) off the bus)"
 
 
+async def test_the_rung_counts_a_stuck_holder_the_scan_misses_and_fires_nothing_once_it_left(stuck, monkeypatch):
+    """The I70 rung's fresh-scan 'gone' check (stage ``gone``) reads the I77 registry too: the holder
+    scan lists no holder here (a removed chip's BAR or node), so the rung fires only while the
+    holder's own check still finds it stuck. One that exits during the stand-back fires nothing."""
+    stuck["rig"]["beats"] = {str(i): 100 for i in range(EXPECTED) if i != int(CHIP)}
+    _note(stuck)
+    t0 = srv._leftover_unkillable_mono
+    monkeypatch.setattr(galaxy.offbus_power_cycle, "standback_reason", lambda **k: _gone(stuck) or "")
+
+    assert await _tick(t0 + BUDGET)
+    assert stuck["order"] == []
+    (rung,) = _events(stuck, "leftover_host_rung")
+    assert rung["phase"] == "gone"
+    assert srv._leftover_unkillable_mono is None and srv._dead_chip_stuck == {}
+
+
 async def test_the_i65_cooldown_holds_the_rung_and_it_fires_once_the_cooldown_ends(stuck):
     stuck["rig"]["beats"] = {str(i): 100 for i in range(EXPECTED) if i != int(CHIP)}
     stuck["rig"]["allowed"] = (False, "I65 cooldown until 15:26")

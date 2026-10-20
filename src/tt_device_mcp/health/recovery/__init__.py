@@ -132,6 +132,9 @@ class Evidence:
     # Spec 03 I61: a clean post-job eth read timed out on a present mesh, and this hold episode's one
     # present-mesh reset is unspent and not refused by the outage hold. Routed like dispatch_reset_due.
     eth_timeout_reset_due: bool = False
+    # Spec 03 I69: a job the broker stopped mid-run (its timeout, or a requested kill) owes the mesh
+    # one reset before release, on the same unspent latch. Routed like dispatch_reset_due.
+    kill_reset_due: bool = False
     # Spec 03 I55: the fabric passed traffic but mesh dispatch failed over a present mesh, and this
     # hold episode has not had its one present-mesh reset yet (nor does the outage hold forbid it).
     dispatch_reset_due: bool = False
@@ -280,6 +283,13 @@ class RecoveryDeps:
     # chip(s), journals host_at_risk, pages, and fences every re-enumerating rung while it lives.
     # Returns the stuck pids.
     note_stuck_holders: Optional[Callable[[list, list], list]] = None
+    # Spec 04 I77: the registered dead-chip stuck holders still stuck, by pid, on a fresh /proc read.
+    # The I70 rung's 'gone' check counts them as still holding: one with only a removed chip's BAR
+    # or deleted node mapped is not in the /dev/tenstorrent holder scan.
+    stuck_holder_pids: Optional[Callable[[], set]] = None
+    # Marks the pollers the dead-chip valve stopped as owed a restart (server._owe_device_pollers):
+    # that stop has no paired restore, and an idle relift can close the episode with no reset.
+    owe_device_pollers: Optional[Callable[[str], None]] = None
     mark_device_dirty: Optional[Callable[..., None]] = None
     # Places a not-dirty fabric-unverified hold (server._hold_device_fabric_unverified): a reset whose
     # fabric stayed a 77 settles there, never as a failed reset.
@@ -288,6 +298,11 @@ class RecoveryDeps:
     # (server._note_fabric_77_reset_passes), so the next relift falls back at once instead of
     # re-running the passes the reset just spent.
     note_fabric_77_reset_passes: Optional[Callable[[int], None]] = None
+    # Whether the open hold's fabric 77 has a cause no reset or reboot fixes — a known cable fault (a 78),
+    # a topology mismatch, hugepages not yet allocated, the validator missing
+    # (server._fabric_77_no_reset_cause; never the I42 latch, which takes the ladder). Such a 77
+    # never climbs to a host rung (spec 04 I29).
+    fabric_77_no_reset_cause: Optional[Callable[[], bool]] = None
     refresh_idle_hold_ledger: Optional[Callable[[], None]] = None
     spawn_idle_relift: Optional[Callable[[], None]] = None
     watch_idle_holders: Optional[Callable[[], None]] = None
@@ -303,6 +318,10 @@ class RecoveryDeps:
     # short count IS that fault, and re-dirtying it would disable the hold's idle relift.
     episode_open: Optional[Callable[[], bool]] = None
     episode_job: Optional[Callable[[], dict]] = None
+    # Re-runs a failed eth self-test at the head of a full health pass (server._rearm_eth_before_check,
+    # spec 03 I28). Returns a FROZEN detail when the self-test hung during an open fault episode,
+    # else "". None (the conftest deps fixture) skips the retry.
+    eth_rearm: Optional[Callable[[], Awaitable[str]]] = None
 
 
 class Recovery(ABC):

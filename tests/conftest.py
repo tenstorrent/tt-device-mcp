@@ -282,6 +282,8 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(srv, "_dead_chip_page_pending", None)
     monkeypatch.setattr(srv, "_leftover_dead_chip", False)
     monkeypatch.setattr(recovery_base, "_reenumerate_withheld_journaled", {})
+    # The pollers a quiesce stopped and owes a restore. None: read again from the per-test health dir.
+    monkeypatch.setattr(srv, "_pollers_to_restore", None)
     # The reset argv/mode env vars are read live (never cached), so an operator's own shell/CI
     # environment leaks straight into whatever argv a test builds — cleared here for a
     # deterministic floor; a test exercising a declared mode/override sets it itself afterward.
@@ -385,6 +387,9 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     fresh_fsm = ServerFsm(health_tmp / "fsm.json")
     fresh_fsm.on_readings(HealthState(phase="test", at=datetime.now(), expected=0))
     monkeypatch.setattr(srv, "fsm", fresh_fsm)
+    # A poller restart one test deferred must not fire on the next test's close to HEALTHY.
+    monkeypatch.setattr(srv, "_pollers_owed", None)
+    monkeypatch.setattr(srv, "_pollers_owed_loop", None)
 
     # No board types seen yet: the conservative default, and the machine type reads as unknown.
     # Nothing here can shell out — the cache is only ever filled by a health snapshot — so the
@@ -397,6 +402,13 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv, "device_fault_reported", "", raising=False)
     # Many tests assign srv.isolated_chips directly; a leaked chip makes a later hold not 77-only.
     monkeypatch.setattr(srv, "isolated_chips", set())
+    # Spec 03 I66: the lost/recovering registry is process-wide; each test starts with none, and
+    # publishes into its own tmp file, never /run.
+    monkeypatch.setenv("TT_DEVICE_MCP_CHIP_STATE_FILE", str(tmp_path_factory.mktemp("chipstate") / "chip-state.json"))
+    from tt_device_mcp.health import chip_state
+
+    chip_state.reset()
+    monkeypatch.setattr(srv, "_last_offbus_state", {})
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
     # Whether the last reset EXITED non-zero. Left set it would steer the NEXT test's gate
@@ -425,6 +437,25 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # happened to share its `since` would arm a relift it never asked for.
     monkeypatch.setattr(srv, "_startup_fabric_owed_since", None, raising=False)
     monkeypatch.setattr(srv, "_startup_prereq_task", None, raising=False)
+    # The startup gate task (spec 03 I75): left pending, a later test's startup hold would never escalate.
+    monkeypatch.setattr(srv, "_startup_verify_task", None, raising=False)
+    monkeypatch.setattr(srv, "_startup_verify_ready_at", None, raising=False)
+    monkeypatch.setattr(srv, "_startup_verify_deferral_logged", None, raising=False)
+    # The 10-min hold bound's bookkeeping (spec 04 I76) is keyed by the episode's start stamp: two tests
+    # that open a hold at the same fixed stamp would share one ladder record.
+    for name, value in (
+        ("_hold_bound_episode", ""),
+        ("_hold_bound_ladder_age", None),
+        ("_hold_bound_ladder_recovered", False),
+        ("_hold_bound_cycle_age", None),
+        ("_hold_bound_check_failed_age", None),
+        ("_hold_bound_unarmed_paged", ""),
+        ("_hold_bound_rung_pending", False),
+        ("_hold_bound_denied_why", ""),
+        ("_hold_bound_tenant_paged", ""),
+        ("_hold_bound_tenant_blocker", None),
+    ):
+        monkeypatch.setattr(srv, name, value, raising=False)
     monkeypatch.setattr(srv, "post_job_gate_pending", False, raising=False)
     # The per-owner burst-cap ledger. Left populated, one test's submissions would count against
     # the next test's cap. Fresh dict so state never bleeds; raising=False so a base tree without
@@ -437,6 +468,11 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # The short-count debouncer and the dispatch recheck's clock (spec 03 I31/I32), for the same
     # reason. raising=False so a base tree without them (a fails-on-base stash) still sets up.
     monkeypatch.setattr(srv.sampler, "short_count_strikes", 0, raising=False)
+    # The hung-chip poller stop's per-episode latch and its previous heartbeats, and the reset scope
+    # the sampler saw still running (spec 03 I66), for the same reason.
+    monkeypatch.setattr(srv.sampler, "pollers_stopped_for", frozenset(), raising=False)
+    monkeypatch.setattr(srv.sampler, "prev_beats", {}, raising=False)
+    monkeypatch.setattr(srv.sampler, "scope_seen", False, raising=False)
     monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None, raising=False)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
     # A link drop an eth test measured on the singleton would turn the next test's 77 hold into a fault.
@@ -531,6 +567,7 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
     # A regressed tray walk disables the rung for the rest of the process: every test starts armed.
     monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
+    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_PERSISTED", False, raising=False)
     monkeypatch.setattr(pcie_guard, "_LAST_TRAY_PULSE", None, raising=False)
 
     # The bounded off-bus hold (spec 04 I27) runs a host-supplied power-cycle command: unset here, a

@@ -26,7 +26,6 @@ import os
 import pwd
 import queue
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -48,7 +47,7 @@ from tt_device_mcp.constants import (
     step_client_timeout_sec,
     user_state_dir,
 )
-from tt_device_mcp.utils import api_call
+from tt_device_mcp.utils import _connect_uds, api_call
 
 # Env vars to capture from caller's environment
 CAPTURED_ENV_VARS = [
@@ -919,9 +918,7 @@ def _open_reset_stream(
     headers = {"Content-Type": "application/json"}
     if socket_path:
         conn = http.client.HTTPConnection("localhost", timeout=timeout)
-        conn.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.sock.settimeout(timeout)
-        conn.sock.connect(socket_path)
+        conn.sock = _connect_uds(socket_path, timeout)
     else:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
     conn.request("POST", endpoint, body=body, headers=headers)
