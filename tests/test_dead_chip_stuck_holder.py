@@ -460,7 +460,6 @@ def test_a_job_leftover_alone_keeps_the_600s_budget(stuck):
     assert srv._leftover_fault_class() == "J-unkillable-leftover"
 
 
-
 def _scan():
     from tt_device_mcp.device_holders import DeviceHolder
 
@@ -613,6 +612,7 @@ async def test_the_broker_start_restores_before_anything_else(stuck, monkeypatch
     with pytest.raises(RuntimeError, match="stop here"):
         await srv.run_startup_tasks()
     assert calls == ["restore", "journal"]
+
 
 # --- the dead-chip path calls it -------------------------------------------------------------------
 

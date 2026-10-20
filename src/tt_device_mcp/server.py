@@ -1199,7 +1199,9 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         # that died mid-recovery left in the file (a per-user daemon's state dir outlives it).
         chip_state.publish()
         recovery_mechanism.reset_fence = lambda: _dead_chip_isolation_pending_reason() or _reaped_leftover_reason()
-        recovery_mechanism.reenumerate_fence = lambda: _dead_chip_isolation_pending_reason() or _dead_chip_stuck_reason()
+        recovery_mechanism.reenumerate_fence = (
+            lambda: _dead_chip_isolation_pending_reason() or _dead_chip_stuck_reason()
+        )
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
         )
