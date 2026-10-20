@@ -7209,6 +7209,10 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
                 # chips, attempts, last cycle. The next cycle is still next_deadline. Null otherwise.
                 "ac_power_needed": cooldown.get("ac_power_needed"),
             }
+            if cooldown.get("fixed_at") is not None:  # this hold's deadline, fixed at its first denial
+                payload["power_cycle_cooldown"]["fixed_at"] = datetime.fromtimestamp(cooldown["fixed_at"]).isoformat(
+                    timespec="seconds"
+                )
         # Spec 04 I76: the 10-min bound, the step it runs next and any cooldown that step waits on.
         payload["hold_bound"] = _hold_bound_health(now)
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.

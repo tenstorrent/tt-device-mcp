@@ -1538,6 +1538,7 @@ async def test_the_boot_after_the_brokers_own_power_cycle_latches_nothing_and_st
     row = {"action": "power-cycle", "reason": "idle escalation", "boot_id": "boot-a", "at_epoch": 1325.0}
     (hd / "auto_recovery.jsonl").write_text(json.dumps(row) + "\n")
     monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-b")
+    monkeypatch.setattr(pcie_guard, "_boot_btime", lambda: 1445.0)  # the cycle's boot, 2 min after its row
     _shortfalls(monkeypatch, [(0, 32), None])
     seen = []
 
