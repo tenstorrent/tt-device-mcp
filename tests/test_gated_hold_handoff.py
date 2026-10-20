@@ -1,0 +1,239 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+"""The gated off-bus hold's bounded end with no power cycle configured (spec 04 I33).
+
+``TT_DEVICE_MCP_HOST_RESET_GATE=hold`` refuses every reset while a chip is off the bus. With no
+``TT_DEVICE_MCP_POWER_CYCLE_CMD`` there is no I27 cycle to end that hold, so it is handed to an
+operator with a deadline; past it the broker lifts the gate for its own ladder, and every reset that
+ladder fires still owes the full health check, fabric included, before anything releases the device.
+"""
+
+import time
+from datetime import datetime, timedelta
+
+import pytest
+
+from tests import test_post_reset_gate as prg
+from tests.conftest import fsm_dirty, patch_recovery
+from tests.test_offbus_power_cycle import _REAL_GATE, _gated
+from tests.test_post_reset_gate import _REAL_CLEAR_DIRTY, _assert_settled, _verify_returning
+from tt_device_mcp import metrics
+from tt_device_mcp import server as srv
+from tt_device_mcp.fsm import ServerState
+from tt_device_mcp.health import post_reset
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
+from tt_device_mcp.health.recovery import offbus_power_cycle as opc
+from tt_device_mcp.health.recovery import pcie_guard
+
+EXPECTED = 32
+mesh = prg.mesh  # the post-reset gate's fixtures, shared
+verdict = prg.verdict
+
+
+def _deadline_gauge() -> float:
+    return metrics.REGISTRY.get_sample_value("tt_device_broker_offbus_operator_deadline_seconds")
+
+
+def _hold_gate(monkeypatch, tmp_path, *, held_sec, handoff=None, manual="exit 1", off_bus=1):
+    """An off-bus hold refused by a real ``hold`` gate (not a stub), no power cycle configured."""
+    hold_since, rec = _gated(monkeypatch, tmp_path, held_sec=held_sec, cmd=None, manual=manual)
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", _REAL_GATE)
+    monkeypatch.setattr(pcie_guard, "aer_flooding", lambda ports=None: False)
+    monkeypatch.setattr(pcie_guard, "mask_for_mesh_reset", lambda log: None)
+    monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: off_bus)
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
+    if handoff is None:
+        monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", raising=False)
+    else:
+        monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", handoff)
+    return hold_since, rec
+
+
+def _gate_seen_by_reset(monkeypatch, counters):
+    """The ladder's mesh reset, stubbed to record what the real gate says inside it."""
+    seen = []
+
+    async def reset(indices, log):
+        allowed, _ = pcie_guard.host_reset_gate(1)
+        seen.append(allowed)
+        if allowed:
+            counters["resets"] += 1
+        return allowed
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", reset)
+    return seen
+
+
+async def _escalate(force=True):
+    return await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=force)
+
+
+@pytest.mark.asyncio
+async def test_the_hold_is_handed_to_an_operator_once_with_a_deadline(monkeypatch, tmp_path, clear_job_state):
+    metrics.reset_for_tests()
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=60)
+    await _escalate()
+    await _escalate()
+    assert [a["kind"] for a in rec["alerts"]] == ["offbus_gated_hold_page"], "one page per episode"
+    msg = rec["alerts"][0]["message"]
+    assert "TT_DEVICE_MCP_POWER_CYCLE_CMD is not set" in msg and "must recover the host by" in msg
+    assert "full health check, fabric included" in msg
+    deadline = datetime.fromisoformat(hold_since).timestamp() + opc.HOLD_HANDOFF_DEFAULT_SEC
+    assert _deadline_gauge() == pytest.approx(deadline)
+    status = opc.hold_handoff_status(hold_since)
+    assert status["owner"] == "operator" and status["act_by_epoch"] == pytest.approx(deadline)
+    assert status["operator_seen"] == "none seen"
+    fsm_dirty(srv, "gate/post-job: 1/32 off-bus below the reset floor", why="job_killed")
+    srv.device_hold_episode_since = hold_since
+    payload = srv._health_payload()
+    assert payload.get("operator_handoff", {}).get("act_by_epoch") == pytest.approx(deadline)
+    opc.end_hold_handoff()
+    assert _deadline_gauge() == 0 and opc.hold_handoff_status(hold_since) is None
+
+
+@pytest.mark.asyncio
+async def test_before_the_deadline_the_gate_holds_and_no_reset_fires(monkeypatch, tmp_path, clear_job_state):
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=600)
+    counters = {"resets": 0}
+    seen = _gate_seen_by_reset(monkeypatch, counters)
+    for _ in range(3):
+        await _escalate()
+    assert counters["resets"] == 0 and not any(seen)
+    assert not opc.hold_handoff_due(hold_since)
+    assert opc.hold_handoff_status(hold_since)["owner"] == "operator"
+
+
+@pytest.mark.asyncio
+async def test_past_the_deadline_the_ladder_runs_with_the_gate_lifted_for_that_pass_only(
+    monkeypatch, tmp_path, clear_job_state
+):
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=1300)
+    counters = {"resets": 0}
+    seen = _gate_seen_by_reset(monkeypatch, counters)
+    await _escalate()  # hands off; the deadline (hold_since + 1200 s) already passed
+    assert opc.hold_handoff_due(hold_since)
+    assert await _escalate() is True
+    assert counters["resets"] == 1 and seen[-1] is True, "the mesh reset fired with the gate lifted"
+    assert opc.hold_handoff_status(hold_since)["owner"] == "broker"
+    assert pcie_guard.host_reset_gate(1)[0] is False, "outside the pass the gate holds again"
+    assert ("offbus_gated_hold", "gate_lifted") in [(k, f.get("phase")) for k, f in rec["events"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("latch", ["handoff-off", "hang-latch"])
+async def test_an_operator_latch_keeps_the_hold_past_the_deadline(monkeypatch, tmp_path, clear_job_state, latch):
+    hold_since, rec = _hold_gate(
+        monkeypatch, tmp_path, held_sec=1300, handoff="off" if latch == "handoff-off" else None
+    )
+    if latch == "hang-latch":
+        # A fresh latch: well inside its I25 ceiling, so expire_offbus_reset_latch keeps it.
+        latch_rec = {"boot_id": "b", "since": hold_since, "latched_at_epoch": time.time()}
+        monkeypatch.setattr(pcie_guard, "offbus_reset_latched", lambda: latch_rec)
+    counters = {"resets": 0}
+    seen = _gate_seen_by_reset(monkeypatch, counters)
+    for _ in range(2):
+        await _escalate()
+    assert counters["resets"] == 0 and not any(seen)
+    assert not opc.hold_handoff_due(hold_since)
+    status = opc.hold_handoff_status(hold_since)
+    assert status["owner"] == "operator" and status["act_by"] is None
+    assert "the hold stands until an operator recovers the host" in rec["alerts"][0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_an_operator_at_work_keeps_the_gate_shut(monkeypatch, tmp_path, clear_job_state):
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=1300, manual="exit 0")
+    counters = {"resets": 0}
+    seen = _gate_seen_by_reset(monkeypatch, counters)
+    await _escalate()
+    await _escalate()
+    assert counters["resets"] == 0 and not any(seen)
+    assert "an operator recovery is in progress" in opc.hold_handoff_status(hold_since)["operator_seen"]
+
+
+def test_the_watchdog_forces_one_pass_at_the_handoff_bound(monkeypatch, clear_job_state):
+    fired = []
+    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: fired.append(True) or True)
+    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
+    monkeypatch.setattr(srv, "device_hold_offbus_escalated", True)
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: False)
+    monkeypatch.setattr(srv, "_stuck_hold_ceiling_sec", lambda: 100000)
+    monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", raising=False)
+    monkeypatch.setattr(opc, "page_once", lambda *a, **k: None)
+    since = datetime(2026, 10, 14, 20, 55, 0)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
+    opc.note_hold_handoff(since.isoformat(), 1, 32, "gated", lambda m: None)
+    srv._check_hold_deadline(now=since + timedelta(seconds=1199))
+    assert fired == []
+    srv._check_hold_deadline(now=since + timedelta(seconds=1201))
+    assert fired == [True]
+    assert srv.device_hold_escalation_kind == "gated_hold_handoff_bound"
+    srv._check_hold_deadline(now=since + timedelta(seconds=1300))
+    assert fired == [True], "one forced pass per episode from the hand-off bound"
+
+
+def test_the_handoff_knob(monkeypatch):
+    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", raising=False)
+    assert opc.hold_handoff_sec() == 1200
+    for bad in ("0", "-5", "soon"):
+        monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", bad)
+        assert opc.hold_handoff_sec() == 1200
+    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", "OFF")
+    assert opc.hold_handoff_sec() is None
+
+
+# ---- goal: no lifted reset releases the device before the full health check, fabric included ----
+
+
+@pytest.mark.asyncio
+async def test_the_lifted_mesh_reset_releases_only_after_a_passing_fabric_check(mesh, monkeypatch, tmp_path, verdict):
+    """The real reset path under the lifted gate: the reset records the fabric debt, and only a
+    verify that carries a healthy fabric verdict releases; a 77 or no fabric verdict stays held."""
+    evidence, released = verdict
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=1300)
+    monkeypatch.delattr(srv.galaxy_recovery, "_reset_and_verify_device")  # the real reset + verify
+    monkeypatch.setattr(srv, "_clear_device_dirty", _REAL_CLEAR_DIRTY)
+    monkeypatch.setattr(post_reset, "health_event", lambda kind, **f: None)
+    fsm_dirty(srv, "gate/post-job: 1/32 off-bus below the reset floor", why="job_killed")
+    srv.device_hold_episode_since = hold_since
+    fired = []
+
+    async def mesh_reset(argv, log, *a, **k):
+        fired.append(argv)
+        FABRIC_DEBT.note_reset(" ".join(argv))
+        return 0, ""
+
+    monkeypatch.setattr(srv.galaxy_recovery.mechanism, "reset_with_quiesce", mesh_reset)
+    _verify_returning(monkeypatch, evidence)
+    await _escalate()  # the hand-off
+    assert fired == []
+    assert await _escalate() is True
+    assert len(fired) == 1, "the lifted pass ran the mesh reset"
+    _assert_settled(released)
+
+
+@pytest.mark.asyncio
+async def test_a_reset_the_gate_still_refuses_releases_nothing(mesh, monkeypatch, tmp_path):
+    """Within the hand-off the same real reset path is refused by the gate: no reset, no release."""
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=60)
+    monkeypatch.delattr(srv.galaxy_recovery, "_reset_and_verify_device")
+    monkeypatch.setattr(srv, "_clear_device_dirty", _REAL_CLEAR_DIRTY)
+    fsm_dirty(srv, "gate/post-job: 1/32 off-bus below the reset floor", why="job_killed")
+    srv.device_hold_episode_since = hold_since
+    fired = []
+
+    async def mesh_reset(argv, log, *a, **k):
+        fired.append(argv)
+        return 0, ""
+
+    monkeypatch.setattr(srv.galaxy_recovery.mechanism, "reset_with_quiesce", mesh_reset)
+    _verify_returning(monkeypatch, {"snapshot": {"ok": True}, "fabric": {"ok": True}})
+    await _escalate()
+    await _escalate()
+    assert fired == []
+    assert srv.fsm.record is not None and srv.fsm.state is not ServerState.HEALTHY

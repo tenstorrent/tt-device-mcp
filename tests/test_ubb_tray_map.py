@@ -19,7 +19,7 @@ import pytest
 
 from tests.conftest import patch_health_event, patch_recovery, stub_device_pollers
 from tt_device_mcp import server as srv
-from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.recovery import galaxy
 
@@ -371,6 +371,7 @@ async def test_after_a_renumbering_the_walk_re_powers_the_tray_of_the_chips_new_
     """What the re-bank is for: chip 24 now sits on 0xC1, so its drop is a tray-3 drop. The first
     mask is 0x04 and the handshake quiesces tray 3's chips as the kernel numbers them now. Fails on
     2bb8128: the stale map still put chip 24 on 0x81 and fired 0x08 at tray 4's healthy chips."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     _recording_events(monkeypatch)
     _seed_sysfs(tmp_path, RENUMBERED_CHIP_BUSES)
     srv.health_monitor.verify_device_health(32, timeout_sec=5)
@@ -551,6 +552,7 @@ async def test_the_walk_re_powers_the_tray_the_dropped_chips_actually_sit_on(mon
     and the ioctl handshake must quiesce chips 24-31. Read by position from tt-smi's PCI-ordered
     list this was 0x04 — bit 2 — which re-powers tray 3's eight healthy chips and leaves the
     dropped tray down."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired = []
     srv.fsm.set_latch("ubb_reset_fired", False)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
@@ -575,6 +577,7 @@ async def test_the_walk_re_powers_the_tray_the_dropped_chips_actually_sit_on(mon
 async def test_a_lone_off_bus_chip_24_re_powers_tray_4_first(monkeypatch, galaxy_seen, clear_job_state):
     """Issue #27's case: chip 24 (0000:81:00.0) off the bus. The first mask must be 0x08 (tray 4),
     not 0x04, and the log line names the tray, its BMC mask and its chips."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
     fired, lines = [], []
     srv.fsm.set_latch("ubb_reset_fired", False)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
@@ -594,6 +597,207 @@ async def test_a_lone_off_bus_chip_24_re_powers_tray_4_first(monkeypatch, galaxy
     assert out is True
     assert fired[0] == (0x08, list(range(24, 32)))
     assert any("re-powering tray 4 (BMC mask 0x08, chips 24-31)" in line for line in lines), lines
+
+
+@pytest.mark.asyncio
+async def test_the_walk_journals_the_tray_4_mask_it_fired(monkeypatch, galaxy_seen, clear_job_state):
+    """The walk's own fire leaves a ubb_reset_fired naming the tray, its mask and its chips, so the
+    journal shows which silicon a clean pulse re-powered, not only that one began."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
+    events = []
+    srv.fsm.set_latch("ubb_reset_fired", False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    patch_health_event(monkeypatch, lambda kind, **fields: events.append((kind, fields)))
+
+    async def healthy(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}}
+
+    patch_recovery(monkeypatch, "_verify_device", healthy)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: None, raising=False)
+
+    beats = {str(i): 100 for i in range(24)}
+    assert await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None) is True
+
+    done = [f for k, f in events if k == "ubb_reset_fired"]
+    assert len(done) == 1, events
+    assert done[0]["tray"] == 4
+    assert done[0]["ubb_bitmap"] == 0x08
+    assert done[0]["chips"] == list(range(24, 32))
+    assert done[0]["command"] == " ".join(galaxy._ubb_reset_argv(0x08))
+
+
+@pytest.mark.asyncio
+async def test_a_failed_walk_fire_journals_its_rc_and_no_fired_event(monkeypatch, galaxy_seen, clear_job_state):
+    """A walk pulse the BMC did not take is journalled as ubb_reset_failed with its exit code and mask,
+    never as ubb_reset_fired."""
+    from tt_device_mcp.health.recovery.stages.ubb_tray import BmcIpmiError
+
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
+    events = []
+    srv.fsm.set_latch("ubb_reset_fired", False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    patch_health_event(monkeypatch, lambda kind, **fields: events.append((kind, fields)))
+
+    def fail(bitmap, ids):
+        raise BmcIpmiError("ubb tray reset exited 1: Unable to send RAW command", returncode=1)
+
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", fail, raising=False)
+
+    beats = {str(i): 100 for i in range(24)}
+    assert await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None) is False
+
+    assert "ubb_reset_fired" not in [k for k, _ in events]
+    failed = [f for k, f in events if k == "ubb_reset_failed"]
+    assert len(failed) == 1, events
+    assert (failed[0]["tray"], failed[0]["ubb_bitmap"], failed[0]["rc"]) == (4, 0x08, 1)
+    assert failed[0]["chips"] == list(range(24, 32))
+
+
+# --- the back-to-back sweep journals the mask it fired -----------------------------------------
+
+
+def _sweep_stubs(monkeypatch, fire):
+    """Stub every device-touching step of the back-to-back sweep and record its events."""
+    g = srv.galaxy_recovery
+    events = []
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    patch_health_event(monkeypatch, lambda kind, **fields: events.append((kind, fields)))
+
+    async def sbr(log):
+        return False
+
+    async def mesh(argv, log, *a, **k):
+        return 0, ""
+
+    async def healthy(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}}
+
+    patch_recovery(monkeypatch, "_recover_isolated_chips", sbr)
+    patch_recovery(monkeypatch, "_verify_device", healthy)
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", fire)
+    return g, events
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_journals_the_tray_4_mask_it_fired_for_chips_24_to_31(
+    monkeypatch, galaxy_seen, clear_job_state
+):
+    """Chips 24-31 off a Blackhole Galaxy: the sweep's BMC re-power leaves exactly one ubb_reset_fired
+    naming mask 0x08 and chips 24-31, and a log line naming tray 4 beside the exact ipmitool command.
+    Without it a clean fire left no event and no line, so nobody could prove which mask went out."""
+    fired, lines = [], []
+    g, events = _sweep_stubs(monkeypatch, lambda bitmap, ids: fired.append((bitmap, ids)))
+
+    offbus = {str(i) for i in range(24, 32)}
+    out = await g._fire_tray_down_no_window(offbus, 32, lines.append, gate_phase="post-job", ev=None)
+
+    assert out == galaxy.OUTCOME_RECOVERED
+    assert fired == [(0x08, list(range(24, 32)))]
+    done = [f for k, f in events if k == "ubb_reset_fired"]
+    assert len(done) == 1, events
+    command = " ".join(galaxy._ubb_reset_argv(0x08))
+    assert done[0] == {"trays": [4], "ubb_bitmap": 0x08, "chips": list(range(24, 32)), "command": command}
+    assert any(f"tray 4 (BMC mask 0x08, chips 24-31): `{command}`" in line for line in lines), lines
+
+
+@pytest.mark.asyncio
+async def test_a_failed_sweep_fire_journals_its_rc_and_no_fired_event(monkeypatch, galaxy_seen, clear_job_state):
+    """A BMC command that exits non-zero is journalled as ubb_reset_failed with its exit code and mask,
+    never as ubb_reset_fired, and the sweep still goes on to the mesh reset."""
+    from tt_device_mcp.health.recovery.stages.ubb_tray import BmcIpmiError
+
+    def fail(bitmap, ids):
+        raise BmcIpmiError("ubb tray reset exited 1: Unable to send RAW command", returncode=1)
+
+    lines = []
+    g, events = _sweep_stubs(monkeypatch, fail)
+
+    offbus = {str(i) for i in range(24, 32)}
+    await g._fire_tray_down_no_window(offbus, 32, lines.append, gate_phase="post-job", ev=None)
+
+    kinds = [k for k, _ in events]
+    assert "ubb_reset_fired" not in kinds
+    failed = [f for k, f in events if k == "ubb_reset_failed"]
+    assert len(failed) == 1, events
+    assert failed[0]["rc"] == 1
+    assert failed[0]["ubb_bitmap"] == 0x08
+    assert failed[0]["chips"] == list(range(24, 32))
+    assert any("failed to launch (rc 1)" in line for line in lines), lines
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_that_does_not_fire_the_tray_journals_no_fired_event(monkeypatch, galaxy_seen, clear_job_state):
+    """Opted out of the tray fire: the sweep names the command (ubb_reset_required) but never claims a
+    fire it did not make."""
+    g, events = _sweep_stubs(monkeypatch, lambda bitmap, ids: pytest.fail("opted out, yet the tray fired"))
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")
+
+    offbus = {str(i) for i in range(24, 32)}
+    await g._fire_tray_down_no_window(offbus, 32, lambda m: None, gate_phase="post-job", ev=None)
+
+    kinds = [k for k, _ in events]
+    assert "ubb_reset_required" in kinds
+    assert "ubb_reset_fired" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_the_last_chance_sweep_labels_each_tray_from_the_map(monkeypatch, galaxy_seen, clear_job_state):
+    """The other caller of the sweep (the last-chance gate before a host rung) gets the same per-tray
+    line, naming the tray's chips from the map, and the same ubb_reset_fired."""
+    lines = []
+    g, events = _sweep_stubs(monkeypatch, lambda bitmap, ids: None)
+
+    ok = await g._settle_and_verify_before_host_rung(
+        32, lines.append, "post-job", offbus_chips={str(i) for i in range(24, 30)}
+    )  # part of tray 4: a whole tray skips the sweep (spec 04 I37 class A)
+
+    assert ok is True
+    assert any("tray 4 (BMC mask 0x08, chips 24-31)" in line for line in lines), lines
+    assert [f["ubb_bitmap"] for k, f in events if k == "ubb_reset_fired"] == [0x08]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "off, tray, mask, pci",
+    [("27", 4, 0x08, "0000:84:00.0"), ("6", 1, 0x01, "0000:07:00.0")],
+)
+async def test_the_last_chance_sweep_names_the_chip_it_re_powers_a_tray_for(
+    monkeypatch, galaxy_seen, clear_job_state, off, tray, mask, pci
+):
+    """A chip that dropped and came back early in a hold (chip 6, tray 1) must not read as the one a
+    later sweep re-powers a tray for, when a mesh reset left another chip off (chip 27, tray 4). The
+    sweep reads the off-bus set fresh from the heartbeats, re-powers only that chip's tray, and its
+    line and event name the chip, its PCI address and its tray."""
+    lines = []
+    fired = []
+    g, events = _sweep_stubs(monkeypatch, lambda bitmap, ids: fired.append(bitmap))
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32) if str(i) != off})
+
+    ok = await g._settle_and_verify_before_host_rung(32, lines.append, "idle-escalation")
+
+    assert ok is True
+    assert fired == [mask]
+    sweep = [f for k, f in events if k == "last_chance_reset_sweep"]
+    assert len(sweep) == 1, events
+    assert sweep[0]["trays"] == [tray]
+    assert sweep[0]["off_bus_chips"] == [{"chip": int(off), "pci": pci, "tray": tray}]
+    assert any(f"off the bus now: chip {off} ({pci}, tray {tray})" in line for line in lines), lines
+
+
+def test_the_off_bus_placement_marks_what_the_map_cannot_place():
+    """A chip with no banked address or no tray reads '?', never a guess."""
+    placement = galaxy._offbus_placement({"3", "40"}, {3: "0000:04:00.0"}, {1: [3]})
+    assert placement == [{"chip": 3, "pci": "0000:04:00.0", "tray": 1}, {"chip": 40, "pci": None, "tray": None}]
+    assert galaxy._placement_text(placement) == "chip 3 (0000:04:00.0, tray 1), chip 40 (?, tray ?)"
+    assert galaxy._placement_text([]) == "none"
 
 
 # --- the Wormhole snapshot suffix must not disable the rung ------------------------------------
@@ -650,3 +854,109 @@ async def test_a_broker_with_no_cached_bus_map_declines_the_walk(monkeypatch, cl
     assert out is None
     assert fired == []
     assert srv.fsm.latch("ubb_reset_fired") is False
+
+
+# --- the hold-deadline climb's tray rung reads the climb's own forced tenant guard ----------------
+
+
+def _arm_forced_tray_rung(monkeypatch, scan, *, verify_ok=True):
+    """The tray walk opted in on a single-tray below-floor drop, the holder scan fixed to ``scan`` and
+    the post-re-power verify recorded. Returns (fired, verifies)."""
+    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
+    srv.fsm.set_latch("ubb_reset_fired", False)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scan)
+    fired, verifies = [], []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        verifies.append(run_fabric)
+        return verify_ok, {"snapshot": {"ok": True}, "fabric": {"ok": verify_ok}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append((bitmap, ids)), raising=False)
+    return fired, verifies
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("force", [False, True])
+async def test_the_forced_tray_rung_does_not_read_an_unreadable_scan_as_a_tenant(
+    monkeypatch, galaxy_seen, clear_job_state, force
+):
+    """A past incident: the hold-deadline climb passed its own forced tenant guard (no tenant,
+    no job), then the tray rung re-read the scan WITHOUT force, took an unreadable one for a tenant and
+    skipped, so the climb fell to glx_reset. Forced, the walk fires and verifies with the fabric check;
+    unforced (the gate), an unreadable scan still holds. Fails on 4fc0588..4e08ca4: forced also holds."""
+    fired, verifies = _arm_forced_tray_rung(monkeypatch, HolderScan(holders=[], complete=False))
+    lines = []
+
+    beats = {str(i): 100 for i in range(32) if i != 31}
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 1, 32, lines.append, force=force)
+
+    if force:
+        assert out is True
+        assert fired == [(0x08, list(range(24, 32)))]
+        assert verifies and all(verifies), "the walk's verify runs the fabric check before it reports recovered"
+    else:
+        assert out is None
+        assert fired == []
+        assert any("holder scan is unreadable" in line for line in lines), lines
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tenant", ["holder", "job"])
+async def test_the_forced_tray_rung_still_holds_for_a_real_tenant_or_a_running_job(
+    monkeypatch, galaxy_seen, clear_job_state, tenant
+):
+    """force waives only the blindness guard: a readable tenant fd or a job the broker knows is RUNNING
+    still keeps the walk from re-powering silicon under it."""
+    if tenant == "holder":
+        scan = HolderScan(holders=[DeviceHolder(pid=4242, uid=3014)], complete=True)
+    else:
+        scan = HolderScan(holders=[], complete=False)
+        monkeypatch.setattr(srv.galaxy_recovery.deps, "job_running", lambda: True)
+    fired, verifies = _arm_forced_tray_rung(monkeypatch, scan)
+
+    beats = {str(i): 100 for i in range(32) if i != 31}
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 1, 32, lambda m: None, force=True)
+
+    assert out is None
+    assert fired == [] and verifies == []
+
+
+@pytest.mark.asyncio
+async def test_a_forced_tray_walk_whose_fabric_check_fails_keeps_the_hold(monkeypatch, galaxy_seen, clear_job_state):
+    """Invariant of every reset path: no release before the full health check, fabric included, passes. A
+    forced walk whose post-re-power verify fails reports NOT recovered, so no caller clears the hold."""
+    fired, verifies = _arm_forced_tray_rung(monkeypatch, HolderScan(holders=[], complete=False), verify_ok=False)
+
+    beats = {str(i): 100 for i in range(32) if i != 31}
+    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 1, 32, lambda m: None, force=True)
+
+    assert out is False
+    assert fired and verifies and all(verifies)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verify_ok", [True, False])
+async def test_the_hold_deadline_climb_walks_the_tray_on_an_unreadable_scan_not_glx_reset(
+    monkeypatch, galaxy_seen, clear_job_state, verify_ok
+):
+    """End to end through the forced off-bus climb, the incident shape: one chip off the bus below the floor,
+    no bridge candidate, no tenant, an unreadable holder scan. The tray walk fires instead of being skipped
+    for the mesh-wide reset, and the hold is cleared only when its fabric-inclusive verify passed."""
+    from tests.test_device_safety import _arm_offbus_stuck_hold
+
+    counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=1, isolated=set(), sbr_verify_healthy=verify_ok)
+    fired, verifies = _arm_forced_tray_rung(monkeypatch, HolderScan(holders=[], complete=False), verify_ok=verify_ok)
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
+
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+
+    assert fired and fired[0] == (0x08, list(range(24, 32))), "the forced climb walks the affected tray"
+    assert verifies and all(verifies)
+    assert counters["resets"] == 0, "no mesh-wide reset in place of the tray rung"
+    if verify_ok:
+        assert counters["fault_cleared"] == 1 and counters["dirty_cleared"] == 1
+    else:
+        assert counters["dirty_cleared"] == 0, "a walk whose verify failed never releases the device"

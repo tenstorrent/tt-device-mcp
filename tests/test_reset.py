@@ -40,7 +40,8 @@ def test_smi_args_ok_allows_readonly_rejects_reset():
     assert srv.smi_args_ok([])
     assert srv.smi_args_ok(["-ls"])
     assert srv.smi_args_ok(["-s"])
-    assert srv.smi_args_ok(["-f", "/tmp/snap.json"])  # filename positional is fine
+    assert not srv.smi_args_ok(["-f", "/tmp/snap.json"])  # root write primitive
+    assert not srv.smi_args_ok(["--filename", "/tmp/snap.json"])
     # anything that could reset/reconfigure the device is rejected
     assert not srv.smi_args_ok(["-r"])
     assert not srv.smi_args_ok(["-r", "0,1"])
@@ -1060,11 +1061,13 @@ def test_a_streaming_local_reset_is_visible_to_a_restarted_daemon(monkeypatch, t
     untracked direct child lets a restarted daemon probe and reset the device concurrently."""
     (tmp_path / "0").touch()
     release = tmp_path / "release"
+    started = tmp_path / "started"
     reset_script = tmp_path / "reset"
     reset_script.write_text(
         "#!/usr/bin/env python3\n"
         "import pathlib, time\n"
         f"release = pathlib.Path({str(release)!r})\n"
+        f"pathlib.Path({str(started)!r}).touch()\n"
         "while not release.exists():\n"
         "    time.sleep(0.01)\n"
         "print('local operator reset complete')\n"
@@ -1091,10 +1094,12 @@ def test_a_streaming_local_reset_is_visible_to_a_restarted_daemon(monkeypatch, t
     request.start()
     observer = _local_reset_mechanism(tmp_path, monkeypatch)
     try:
-        for _ in range(1000):  # up to 10 s: the reset child starts slowly on a loaded host
-            if observer.scope_active() == recovery_base.LOCAL_RESET_NAME:
+        # Wait for the reset script's own start marker (safety-net timeout only), then for the scope.
+        for _ in range(6000):
+            if started.exists() and observer.scope_active() == recovery_base.LOCAL_RESET_NAME:
                 break
             time.sleep(0.01)
+        assert started.exists()
         assert observer.scope_active() == recovery_base.LOCAL_RESET_NAME
     finally:
         release.write_text("")

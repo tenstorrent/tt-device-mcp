@@ -90,7 +90,8 @@ that did not come through the broker at all.
   the root-owned NOPASSWD wrapper installed by `lock` re-enforces the same read-only allowlist
   itself (any user may exec it, so it cannot trust its caller). The streaming server-side smi
   applies the same allowlist (`smi_args_ok`) before running as the broker. A sudoers drop-in that
-  fails `visudo -c` is not installed.
+  fails `visudo -c` is not installed. `-f`/`--filename` is not allowlisted: it writes a snapshot to
+  a path the caller picks, which is a root write primitive. Workaround: `tt-device-mcp smi -s > file`.
 - **I11 — An anonymous caller owns no holder.** Where an action is gated on device holders
   (the reset gate, spec 04), the caller's identity is the socket peer uid. Over HTTP on a privsep
   host there is no identity to scope the gate to, so every tenant holder counts as foreign and the

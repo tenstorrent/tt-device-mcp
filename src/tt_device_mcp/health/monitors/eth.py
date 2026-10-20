@@ -347,6 +347,11 @@ def build_reason() -> str:
     return unavailable()[1]
 
 
+# classify_exit's reason for a read that hit run_probe's own timeout. The post-job gate tells this
+# stuck read apart from a crash or the probe's own 77 (spec 03 I61).
+READ_TIMED_OUT = "eth-heartbeat read timed out without reaching a verdict"
+
+
 def classify_exit(rc: Optional[int]) -> tuple[Optional[bool], str]:
     """The probe's own exit-code contract: ``True`` healthy, ``False`` unhealthy (a reset can
     act on this — well, HOLD can; a frozen core is never reset), ``None`` skipped (nothing was
@@ -368,7 +373,7 @@ def classify_exit(rc: Optional[int]) -> tuple[Optional[bool], str]:
     if rc == _PROBE_FROZEN:
         return False, "a frozen active-eth core: heartbeat not advancing"
     if rc is None:
-        return None, "eth-heartbeat read timed out without reaching a verdict"
+        return None, READ_TIMED_OUT
     return None, f"probe exited {rc} (not a frozen verdict)"
 
 
@@ -384,13 +389,29 @@ def parse_link_count(text: str) -> Optional[int]:
 
 
 async def check(
-    argv: list[str], env: dict[str, str], *, timeout_sec: float, track: Track, cwd: Optional[str] = None
+    argv: list[str],
+    env: dict[str, str],
+    *,
+    timeout_sec: float,
+    track: Track,
+    cwd: Optional[str] = None,
+    reap_sec: float = 0.0,
 ) -> tuple[Optional[int], str]:
     """Run an already-built eth-heartbeat command (see ``build()``) and return ``(rc, output)``.
 
     ``terminate`` is deliberately left at ``run_probe``'s own default (a hard ``killpg``): a
     hung register read has no graceful unwind worth waiting for, unlike the fabric traffic
-    pass's own escalation ladder — it is either measuring or already wedged.
+    pass's own escalation ladder — it is either measuring or already wedged. ``reap_sec`` is
+    ``run_probe``'s bounded wait for the killed reader to finish exiting.
     """
-    rc, raw = await run_probe(argv, timeout_sec=timeout_sec, track=track, stream=False, env=env, cwd=cwd)
+    rc, raw = await run_probe(
+        argv,
+        timeout_sec=timeout_sec,
+        track=track,
+        stream=False,
+        env=env,
+        cwd=cwd,
+        reap_sec=reap_sec,
+        name="eth-heartbeat",
+    )
     return rc, raw.decode("utf-8", "replace").strip()

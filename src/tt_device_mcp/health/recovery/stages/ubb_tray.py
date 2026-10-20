@@ -8,6 +8,7 @@ import logging
 import os
 import subprocess
 import time
+from typing import Optional
 
 from tt_device_mcp.health.recovery.stages.smi_reset import (
     _reset_ioctl_if_on_bus,
@@ -26,7 +27,12 @@ class BmcIpmiError(RuntimeError):
     """The BMC did not take the tray re-power over IPMI: ``ipmitool`` exited non-zero (e.g. "No data
     available" from a BMC whose IPMI is wedged while Redfish still answers), timed out or could not
     start. Nothing was re-powered, and the BMC's other IPMI rungs will not work either, so the off-bus
-    hold hands off to the host's power-cycle command on its own clock (spec 04 I27)."""
+    hold hands off to the host's power-cycle command on its own clock (spec 04 I27). ``returncode`` is
+    ipmitool's exit code, for the journal; None when it never exited (missing, timed out)."""
+
+    def __init__(self, message: str, returncode: Optional[int] = None):
+        super().__init__(message)
+        self.returncode = returncode
 
 
 def _ubb_reset_argv(bitmap: int) -> list:
@@ -74,7 +80,7 @@ def _fire_ubb_reset(bitmap: int, tray_chip_ids: list, log=None):
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise BmcIpmiError(f"ubb tray reset did not run: {exc!r}"[:300]) from exc
         if r.returncode != 0:
-            raise BmcIpmiError(f"ubb tray reset exited {r.returncode}: {r.stderr.strip()[:200]}")
+            raise BmcIpmiError(f"ubb tray reset exited {r.returncode}: {r.stderr.strip()[:200]}", r.returncode)
         time.sleep(UBB_RESET_SETTLE_SEC)
 
     def reinit(_on_tray: list) -> None:

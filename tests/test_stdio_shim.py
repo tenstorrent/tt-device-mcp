@@ -294,6 +294,9 @@ async def test_a_tool_call_longer_than_the_read_timeout_completes_on_keepalives(
     monkeypatch.setattr(sse_starlette.EventSourceResponse, "DEFAULT_PING_INTERVAL", 0.1)
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
     server.device_op_lock = None
+    # No broker job owns the device: a runner an earlier test left mid-job would refuse the reset.
+    monkeypatch.setattr(server, "current_job_id", None)
+    monkeypatch.setattr(server, "jobs", {})
     monkeypatch.setattr(server, "enumerate_device_holders", lambda *a, **k: HolderScan())
     monkeypatch.setattr(server, "_present_chip_indices", lambda: ["0"])
 

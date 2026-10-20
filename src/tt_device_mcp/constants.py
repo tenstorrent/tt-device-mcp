@@ -49,6 +49,17 @@ SURVIVOR_TERM_GRACE_SEC = 5
 # driver), and no signal will move it.
 SURVIVOR_KILL_WAIT_SEC = 2
 
+# How long, counted from a SIGKILL, to keep polling the /dev/tenstorrent holders for the killed
+# processes to let go before naming one a holder that will not (spec 01 I67). An exit can sit in
+# the driver's release for seconds; reading that as a leftover skipped the post-job gate and left
+# the device held until the next job or the hold ceiling.
+HOLDER_RELEASE_WAIT_SEC = 30
+
+# A preemptable job's whole stop window, from the first signal to SIGKILL. Its owner has
+# agreed to watch the queue and get off the device within this once another job is waiting
+# past its soft limit, so it is shorter than the ordinary ladder (SIGINT 60 s + SIGTERM 15 s).
+PREEMPT_GRACE_SEC = 60
+
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
 # is deliberately never killed, because one stopped partway through 32 ASICs is far worse
@@ -85,6 +96,10 @@ FABRIC_CHECK_TIMEOUT_SEC = 180
 # override's inner bound is this same bound, so its timeout is frozen evidence here as on every
 # other path.
 ETH_POST_JOB_TIMEOUT_SEC = 10.0
+# The most the eth-heartbeat read waits for its own reader to finish exiting after killing it on
+# a timeout (see monitor._verify_eth_heartbeat_body): a SIGKILLed reader is normally gone in
+# milliseconds, and until it is, a holder scan still sees its pid through the driver.
+ETH_REAP_SEC = 2.0
 
 # The fabric check exits with this when it could not run at all (validator or
 # descriptor absent). It means "nothing was learned about the fabric" and must stay

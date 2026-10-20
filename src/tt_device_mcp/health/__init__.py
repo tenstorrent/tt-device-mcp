@@ -19,6 +19,9 @@ both files) — every name either of them needs from here is either:
 
 from __future__ import annotations
 
+# The per-chip lost/recovering gate in front of every poller read of a chip (spec 03 I66).
+from tt_device_mcp.health import chip_state
+
 # The operator's AICLK ceiling state: server.py re-applies it at broker start and at the job door,
 # marks it owed when a job ends, and must be able to kill its helper on the dead-chip path.
 from tt_device_mcp.health.aiclk_ceiling import CEILING
@@ -39,7 +42,7 @@ from tt_device_mcp.health.evidence import (
     previous_boot_error,
     read_health_events,
 )
-from tt_device_mcp.health.monitor import HealthMonitor, journal_interrupted_fabric_check
+from tt_device_mcp.health.monitor import HealthMonitor, eth_read_timed_out, journal_interrupted_fabric_check
 
 # The fabric probe module itself, not a wrapping function: server.py's own preflight check reads
 # fabric.build_command() directly to warn when no fabric check is configured OR installed, and a
@@ -55,6 +58,7 @@ from tt_device_mcp.health.monitors.heartbeat import (
     dead_chips,
     heartbeat_supported,
     heartbeat_verdict,
+    offbus_chip_ids,
     offbus_count,
     read_heartbeats,
     returned_chips,
@@ -75,6 +79,7 @@ from tt_device_mcp.health.monitors.pci import (
     chip_snapshot,
     chip_snapshot_event,
     isolate_chip,
+    sysfs_chip_ids,
 )
 
 # The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and
@@ -103,7 +108,10 @@ from tt_device_mcp.health.recovery.base import (
     HOLD_ESCALATION_REARM_SEC,
     RESET_COOLDOWN_SEC,
     RecoveryMechanism,
+    host_action_pending_sec,
     mesh_hold_repage_sec,
+    mesh_reset_hold_reason,
+    refuse_mesh_reset,
 )
 
 # The Galaxy escalation ladder's own thresholds and vocabulary. The gate takes its escalation
@@ -134,6 +142,7 @@ from tt_device_mcp.health.recovery.stages.bridge_reset import (
 # through as the `fire` callback, so it needs the name itself, not a wrapper around it.
 from tt_device_mcp.health.recovery.stages.power_cycle import _fire_power_cycle
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook as _run_pre_power_cycle_hook
+from tt_device_mcp.health.shutdown import note_broker_stopping
 
 __all__ = [
     # AICLK ceiling state (start, door, job end, dead-chip kill)
@@ -141,6 +150,8 @@ __all__ = [
     # construction pieces ServerFsm.boot assembles into the process singletons
     "HealthMonitor",
     "journal_interrupted_fabric_check",
+    "note_broker_stopping",
+    "eth_read_timed_out",  # spec 03 I61: the stuck eth read the post-job present-mesh reset answers
     "RecoveryMechanism",
     "RecoveryDeps",
     "GalaxyRecovery",
@@ -166,8 +177,10 @@ __all__ = [
     "eth",
     "fabric",
     "ALL_ONES",
+    "chip_state",
     "dead_chips",
     "arc_not_ready_chips",
+    "offbus_chip_ids",
     "offbus_count",
     "returned_chips",
     "heartbeat_supported",
@@ -180,6 +193,7 @@ __all__ = [
     "aer_totals",
     "chip_node_present",
     "chip_pci_bdf",
+    "sysfs_chip_ids",
     "chip_sample",
     "chip_snapshot",
     "chip_snapshot_event",
@@ -195,6 +209,10 @@ __all__ = [
     "_declared_reset_mode",
     # how often a standing hardware-fault hold is paged again (spec 03 I42)
     "mesh_hold_repage_sec",
+    # how long a requested host reboot/power cycle keeps the forced ladder from resetting
+    "host_action_pending_sec",
+    "mesh_reset_hold_reason",
+    "refuse_mesh_reset",
     # the escalation decision the gate acts on: the evidence it hands next_stage, and every
     # decision value that comes back which is not itself a stage name
     "Evidence",
