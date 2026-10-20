@@ -255,15 +255,18 @@ def may_read(idx, node: Path, *, probe: bool = False) -> bool:
     return True
 
 
-def reprobe_due() -> None:
+def reprobe_due(ids: Optional[Iterable] = None) -> None:
     """Make each lost chip's next read real for a decision read through a plain reader (spec 03 I66):
     the reset gate's and the recovery ladder's off-bus counts, the DOWN off-bus recheck, the
     hold-deadline escalation, and job admission, exec and a Slurm step's verdict. A read already due
     stays due; one whose last real read is younger than :data:`PROBE_MIN_SEC` stays gated, so
-    back-to-back decisions read a dead chip once."""
+    back-to-back decisions read a dead chip once. ``ids`` limits it to those chips (the sampler's
+    pending FAST_CONFIRM_SEC proof, I79)."""
+    want = None if ids is None else {str(i) for i in ids}
     with _lock:
-        for rec in _lost.values():
-            rec["next"] = min(rec["next"], rec["read"] + PROBE_MIN_SEC)
+        for idx, rec in _lost.items():
+            if want is None or idx in want:
+                rec["next"] = min(rec["next"], rec["read"] + PROBE_MIN_SEC)
 
 
 def observe(idx, value) -> None:

@@ -242,6 +242,60 @@ def chip_sample() -> dict:
 
 SAMPLE_FIELDS = list(_VOLATILE) + ["aer_correctable", "aer_fatal"]
 
+_BDF = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
+
+
+def _uncorrectable_aer(dev: Path) -> Optional[int]:
+    """Uncorrectable (non-fatal + fatal) AER errors the kernel has counted on one PCI function: its
+    own ``aer_dev_nonfatal``/``aer_dev_fatal`` and, on a root port, the ``aer_rootport_total_err_*``
+    messages it received from below. None when no counter could be read. Correctable errors are
+    left out on purpose: they are routine on a healthy link and would arm the watch all day."""
+    total, seen = 0, False
+    for name in ("aer_dev_nonfatal", "aer_dev_fatal"):
+        p = dev / name
+        if p.exists():
+            v = _sum_aer(p)
+            if v is not None:
+                total, seen = total + v, True
+    for name in ("aer_rootport_total_err_nonfatal", "aer_rootport_total_err_fatal"):
+        try:
+            total += int((dev / name).read_text().strip())
+            seen = True
+        except (OSError, ValueError):
+            continue
+    return total if seen else None
+
+
+def link_signals() -> dict:
+    """The kernel's own record of PCIe trouble on every chip's path, for the sampler's early
+    off-bus watch (spec 03 I79): ``{"chips": [index, ...], "aer": {bdf: uncorrectable total}}``.
+
+    ``chips`` is the KMD node list; ``aer`` covers each chip's endpoint and every port above it up
+    to the root port, keyed by PCI address, so a link drop the port above a chip counted shows
+    even when the chip's own counters did not move (a vanished node is its own signal). Every value here is a counter the kernel keeps in memory:
+    no read reaches a chip, a switch or a config space, which is what makes it safe to take every
+    second while a chip may be dying (an access at a dead endpoint is what stalls a CPU core). The
+    link-state attributes (``current_link_speed``/``width``) are config reads and stay out."""
+    chips: list = []
+    aer: dict = {}
+    try:
+        entries = sorted(SYSFS_CLASS_DIR.iterdir())
+    except OSError:
+        return {"chips": chips, "aer": aer}
+    for ent in entries:
+        idx = ent.name.rsplit("!", 1)[-1]
+        if not idx.isdigit():
+            continue
+        chips.append(idx)
+        try:
+            dev = (ent / "device").resolve()
+        except OSError:
+            continue
+        while _BDF.match(dev.name) and dev.name not in aer:
+            aer[dev.name] = _uncorrectable_aer(dev)
+            dev = dev.parent
+    return {"chips": chips, "aer": aer}
+
 
 def chip_pci_bdf(idx: str) -> Optional[str]:
     """The PCI address behind a chip index, e.g. '0000:46:00.0'."""

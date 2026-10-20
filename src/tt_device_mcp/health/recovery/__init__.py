@@ -273,6 +273,8 @@ class RecoveryDeps:
     # monkeypatched fake still takes effect. Default None only because the conftest deps fixture
     # predates the sampler and never constructs one; ServerFsm.boot always receives real values.
     chip_sample: Optional[Callable[[], dict]] = None
+    # The sampler's early off-bus watch (spec 03 I79): kernel-held AER counters and the node list.
+    link_signals: Optional[Callable[[], dict]] = None
     append_trace: Optional[Callable[[dict], None]] = None
     capture_incident: Optional[Callable[..., object]] = None
     isolate_chip: Optional[Callable[[str], bool]] = None

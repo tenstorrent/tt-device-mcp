@@ -1062,6 +1062,45 @@ cooldown (spec 04 I65) holds longer.
   job longer than 600 s), then the power cycle if the full check after it fails, each once; the
   job's end to that ladder is at most `STARTUP_VERIFY_DEFER_MAX_SEC`, inside 10 min. Other
   classes, off-bus ones (A, B1, B2, C) on a startup hold included: unchanged.
+- **I79 The sampler watches the kernel's PCIe error record between samples and samples sooner
+  when it moves.** Every `LINK_WATCH_SEC` (1 s) between samples the sampler reads
+  `link_signals()`: the KMD chip node list and the uncorrectable AER counters (`aer_dev_nonfatal`,
+  `aer_dev_fatal`, `aer_rootport_total_err_nonfatal`/`_fatal`) of every chip's endpoint and every
+  port above it up to the root port. These are kernel memory: no read reaches a chip, switch or
+  config space. Correctable counters are left out (routine on a healthy link). A rise in any
+  counter, or a chip node that left sysfs, arms a fast cadence: the next sample comes
+  `FAST_SAMPLE_SEC` (2 s) after the last one began (at once if that is already past), and samples
+  stay `FAST_SAMPLE_SEC` apart until `FAST_WINDOW_SEC` (30 s) after the last signal. Only the
+  arming edge cuts a wait short: later signals in the window never do, so no two samples are ever
+  closer than `FAST_SAMPLE_SEC`. A storm (signals less than `FAST_WINDOW_SEC` apart) keeps the
+  fast cadence at most `FAST_MAX_SEC` (60 s) from its first signal, so at most about 30 fast
+  samples; after that the regular cadence runs (one warning) until the link has been quiet for
+  `FAST_WINDOW_SEC`, and the next signal arms a new window. The first arm in a window journals
+  `offbus_watch_armed`. While a reset or recovery step owns the chips (I66: `reset_in_flight`, a
+  reset scope still running, or `chip_state.recovering()`), a signal only moves the baseline and
+  arms nothing: a reset journals no `offbus_watch_armed`. The signal decides nothing: the existing
+  two-sample proof (I19, I31 and the all-gone/blackout checks) still confirms, into the same
+  classification and dirty mark, and a bad reading that began under the fast cadence must also have
+  lasted `FAST_CONFIRM_SEC` (4 s, at least three samples), so a transient AER with live heartbeats,
+  or a blip under 4 s, never strikes a reset. The bound follows the reading, not the window: it
+  still applies on the samples after the window ends (by its natural end or the storm cap), since
+  the first of them comes only `FAST_SAMPLE_SEC` after the last fast one. A reading that began after
+  the window is proved by the regular cadence as before. A chip node the sampler removed itself
+  (isolating a dead chip) moves the baseline and arms nothing. An armed watch therefore lowers the effective debounce
+  from about `SAMPLE_INTERVAL_SEC` (10 s, two regular samples) to `FAST_CONFIRM_SEC` (4 s); it
+  never goes lower. A chip all-ones on two consecutive samples is marked lost (I66) on the second,
+  whatever the cadence; only isolation, the blackout event and the dirty mark wait for
+  `FAST_CONFIRM_SEC`. While that proof is pending the next sample reads each such chip's heartbeat
+  once for real (`chip_state.reprobe_due`, gated by `PROBE_MIN_SEC`), so the fast cadence adds no
+  full poll read of a dead chip and the proof never rests on a value nobody read. The idle hold ledger, the idle relift and the holder scan
+  keep `SAMPLE_INTERVAL_SEC`; the watch adds no lift path and no lift attempt, and every hold still
+  lifts only on a full health check, fabric included, that has just passed (04 I32);
+  the hold-deadline escalation (04 I27: ladder, then power cycle) and the whole-tray power cycle behind the boot
+  cooldown are unchanged. TTR effect: detection of class A (whole-tray or whole-mesh drop) and
+  class B1 (partial off-bus) moves from 10-20 s after the first off-bus reading to about 4-5 s when
+  the kernel counted the fault (AER rise or node removal); about 10 s saved on average, up to 15 s.
+  With no kernel signal, or a storm past `FAST_MAX_SEC`, the regular cadence and its 10-20 s
+  stand. No class gets slower.
 
 - **I78 — A fabric hold on a missing or broken link lifts only on a passing full fabric check.** No
   path lifts or clears an open hold, whatever its class or latch, or gives the device back to the
@@ -1756,6 +1795,10 @@ refuses.
 | I71 (a measured fault: the reset runs, the full check after it decides the release; no heal stays held and climbs) | `tests/test_fabric_links_missing.py::test_a_links_missing_hold_is_not_a_no_reset_topology_hold`, `tests/test_fabric_links_missing.py::test_a_lost_link_resets_and_only_a_full_post_reset_pass_releases`, `tests/test_fabric_links_missing.py::test_a_lost_link_that_a_reset_does_not_heal_stays_held`, `tests/test_fabric_links_missing.py::test_a_lost_link_at_the_startup_gate_fails_and_keeps_the_carried_hold` |
 | I71 (end to end with the real probe pass: a post-reset eth link-count-drop skip plus one missing port fails the full check, keeps the hold and the eth mark, and the next gate fails the same way; the healed control releases) | `tests/test_eth_link_drop_post_reset.py::test_a_post_reset_link_drop_skip_with_a_missing_port_stays_held`, `tests/test_eth_link_drop_post_reset.py::test_the_same_sequence_with_no_missing_port_releases` |
 | I78 | `tests/test_hold_lift_full_check.py::test_the_release_funnel_lifts_only_on_a_fresh_passing_fabric_verdict`, `tests/test_hold_lift_full_check.py::test_the_startup_and_post_reset_releases_refuse_a_missing_link`, `tests/test_hold_lift_full_check.py::test_a_pass_from_before_the_fault_or_too_long_ago_is_refused`, `tests/test_hold_lift_full_check.py::test_a_rung_recovered_outcome_lifts_only_on_a_passing_fabric_verdict`, `tests/test_hold_lift_full_check.py::test_an_eth_frozen_hold_lifts_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_an_off_bus_floor_hold_lifts_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_a_down_off_bus_recheck_lifts_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_a_foreign_holder_hold_lifts_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_an_operator_reset_releases_only_on_a_passing_full_check`, `tests/test_hold_lift_full_check.py::test_an_operator_reset_whose_release_the_funnel_refuses_reports_unverified`, `tests/test_hold_lift_full_check.py::test_replay_a_missing_link_hold_survives_every_lift_attempt_until_a_full_pass`, `tests/test_startup_fabric_hugepages.py::test_a_77_only_hold_past_its_bound_climbs_even_on_a_healthy_eth_read`, `tests/test_fabric_links_missing.py::test_replay_a_held_77_whose_bound_ladder_leaves_a_port_missing_power_cycles_once`, `tests/test_hold_lift_gate.py::test_a_dirty_hold_with_no_fresh_pass_runs_the_full_check_pre_job`, `tests/test_hold_lift_gate.py::test_a_gate_whose_check_passed_still_lifts_only_through_the_funnel`, `tests/test_hold_lift_gate.py::test_the_post_job_gate_lifts_a_dirty_hold_only_on_a_passing_full_check`, `tests/test_hold_lift_gate.py::test_the_kill_reset_gate_lifts_only_on_a_passing_full_check_after_the_reset` |
+| I79 (early off-bus watch: kernel AER/node signal samples sooner; 4 s confirm bound; lift path unchanged) | `tests/test_offbus_early_watch.py` (all: signal source, arming, early confirmation for A and B1, transient-AER and sub-bound blip debounce, housekeeping/relift cadence, no lift) |
+| I79 (no sample gap under `FAST_SAMPLE_SEC`; a storm keeps the fast cadence at most `FAST_MAX_SEC`, re-arms after a quiet window; a reset arms nothing) | `tests/test_offbus_early_watch.py::test_a_sustained_aer_storm_keeps_every_gap_and_is_capped`, `test_a_capped_storm_rearms_only_after_a_quiet_window`, `test_the_arming_edge_never_samples_sooner_than_the_fast_interval`, `test_a_reset_moves_the_baseline_without_arming` |
+| I79/I66 (two fast all-ones samples mark the chip lost before the confirm bound; one gated real read while it is pending) | `tests/test_offbus_early_watch.py::test_two_fast_all_ones_samples_mark_a_chip_lost_before_the_confirm_bound`, `test_two_fast_blackout_samples_mark_every_chip_lost_before_the_confirm_bound` |
+| I79 (the 4 s confirm bound holds across the window end and the storm cap, for the per-chip, blackout, all-gone and short-count paths; a later reading keeps the regular proof; an isolated chip's node arms nothing) | `tests/test_offbus_early_watch.py::test_the_confirm_bound_holds_across_the_end_of_a_fast_window`, `test_a_pending_chip_past_the_window_still_gets_its_real_read`, `test_a_reading_that_began_after_the_window_keeps_the_regular_proof`, `test_a_chip_the_sampler_isolated_arms_nothing_when_its_node_leaves` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
