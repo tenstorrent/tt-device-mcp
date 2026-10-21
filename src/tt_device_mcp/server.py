@@ -3174,13 +3174,18 @@ def _idle_aiclk_max_mhz() -> int:
 
 IDLE_AICLK_MAX_MHZ = _idle_aiclk_max_mhz()
 
+# No chip's AI clock reads anywhere near this. A higher read is not a clock: 0xFFFFFFFF
+# (4294967295) is what an off-bus chip returns for every register.
+AICLK_READ_MAX_MHZ = 5000
+
 
 def _aiclk_left_busy(ceiling_mhz: int = IDLE_AICLK_MAX_MHZ) -> dict[str, int]:
     """Chips whose AI clock still reads above ``ceiling_mhz``, as {chip index: MHz}.
 
     A sysfs read of the KMD's telemetry: it opens no device and takes no chip lock, and a 32-chip
-    read costs milliseconds. An unreadable or non-numeric clock is left out, not counted as busy.
-    Never raises."""
+    read costs milliseconds. An unreadable or non-numeric clock is left out, not counted as busy,
+    and so is a read above ``AICLK_READ_MAX_MHZ`` (0xFFFFFFFF from an off-bus chip): such a chip
+    did not stay open, it left the bus, and takes the off-bus path. Never raises."""
     busy: dict[str, int] = {}
     try:
         chips = chip_snapshot()
@@ -3188,7 +3193,7 @@ def _aiclk_left_busy(ceiling_mhz: int = IDLE_AICLK_MAX_MHZ) -> dict[str, int]:
         return busy
     for idx, rec in chips.items():
         mhz = rec.get("tt_aiclk")
-        if isinstance(mhz, int) and mhz > ceiling_mhz:
+        if isinstance(mhz, int) and ceiling_mhz < mhz <= AICLK_READ_MAX_MHZ:
             busy[idx] = mhz
     return busy
 

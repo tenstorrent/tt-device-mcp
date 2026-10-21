@@ -491,6 +491,35 @@ async def test_a_failed_job_that_left_the_clock_busy_owes_the_reset(runner_env, 
     assert "kill_reset_owed" in runner_env["events"]
 
 
+OFF_BUS = 0xFFFFFFFF
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "clocks, want_debt",
+    [
+        ({"0": OFF_BUS, "1": 800}, ""),
+        ({"0": 6000, "1": 800}, ""),
+        ({"0": OFF_BUS, "1": 1350}, "job 938 failed with 1 chip(s) left at the busy AI clock (max 1350 MHz)"),
+    ],
+    ids=["off-bus-chip", "implausible-clock", "off-bus-beside-a-busy-chip"],
+)
+async def test_an_off_bus_clock_read_is_not_a_busy_clock(runner_env, monkeypatch, clocks, want_debt):
+    """An off-bus chip reads 0xFFFFFFFF for its AI clock. That is not a chip left open: it owes no
+    kill reset and no aiclk_busy_after_job record, and takes the off-bus path instead. A real busy
+    chip beside it still owes the reset, counted and maxed without the off-bus read."""
+    monkeypatch.setattr(srv, "chip_snapshot", lambda: {i: {"tt_aiclk": v} for i, v in clocks.items()})
+    job, runner = await _start("938", "exit 1")
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.FAILED and job.exit_code == 1
+    assert srv._kill_reset_debt().startswith(want_debt) and bool(srv._kill_reset_debt()) == bool(want_debt)
+    assert ("kill_reset_owed" in runner_env["events"]) == bool(want_debt)
+    assert ("aiclk_busy_after_job" in runner_env["events"]) == bool(want_debt)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "command, busy, reset_killed",

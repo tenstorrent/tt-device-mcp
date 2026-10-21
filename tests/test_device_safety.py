@@ -6480,9 +6480,13 @@ def test_aiclk_left_busy_names_only_chips_above_the_idle_clock(monkeypatch):
         "2": {"tt_aiclk": None},
         "3": {},
         "4": {"tt_aiclk": 500},
+        "5": {"tt_aiclk": 0xFFFFFFFF},
+        "6": {"tt_aiclk": srv.AICLK_READ_MAX_MHZ + 1},
+        "7": {"tt_aiclk": srv.AICLK_READ_MAX_MHZ},
     }
     monkeypatch.setattr(srv, "chip_snapshot", lambda: snap)
-    assert srv._aiclk_left_busy(800) == {"0": 1350}
+    # 5: an off-bus chip's all-ones read; 6: no real clock reads that high. Neither is busy.
+    assert srv._aiclk_left_busy(800) == {"0": 1350, "7": srv.AICLK_READ_MAX_MHZ}
 
     def _boom():
         raise OSError("sysfs gone")
