@@ -65,7 +65,25 @@ def _escaped_child(tag: str) -> tuple[int, int]:
     the job's process group and session, and its parent chain is gone. Returns (job pid, child pid)."""
     job = _spawn_job("setsid sleep 60 >/dev/null 2>&1 < /dev/null & echo $!", tag=tag)
     out, _ = job.communicate(timeout=5)
-    return job.pid, int(out.strip())
+    child = int(out.strip())
+    # The job shell exits right after the fork, so the child may still be in setsid or mid-exec,
+    # where /proc/<pid>/environ reads empty and the tag scan misses it. Wait, bounded, until it
+    # is sleep in its own session with the tag visible.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            with open(f"/proc/{child}/comm") as f:
+                comm = f.read().strip()
+            with open(f"/proc/{child}/environ", "rb") as f:
+                tagged = f"{job_reap.JOB_TAG_ENV}={tag}".encode() in f.read().split(b"\0")
+            with open(f"/proc/{child}/stat") as f:
+                sid = int(f.read().rsplit(")", 1)[1].split()[3])
+        except OSError:
+            comm, tagged, sid = "", False, 0
+        if comm == "sleep" and tagged and sid == child:
+            break
+        time.sleep(0.01)
+    return job.pid, child
 
 
 @pytest.mark.asyncio
