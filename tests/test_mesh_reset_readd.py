@@ -65,6 +65,17 @@ def _mechanism(monkeypatch, isolated: set, sysfs: FakeSysfs, events: list, *, ev
 
     monkeypatch.setattr(recovery_base.asyncio, "sleep", fast_sleep)
 
+    real_to_thread = asyncio.to_thread
+
+    async def to_thread(fn, *a, **kw):
+        # The fake rescan runs inline: on a loaded host a worker thread can outlast the few loop turns
+        # a test waits after each output chunk, and the rescan count it reads would then lag.
+        if getattr(fn, "__self__", None).__class__.__name__ == "_Rescan":
+            return fn(*a, **kw)
+        return await real_to_thread(fn, *a, **kw)
+
+    monkeypatch.setattr(recovery_base.asyncio, "to_thread", to_thread)
+
     async def pollers(_active, _log):
         return []
 
