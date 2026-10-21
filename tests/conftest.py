@@ -362,6 +362,10 @@ def _seal_real_hardware(monkeypatch, tmp_dirs):
     # is how three of them failed on a developer box mid-incident and nowhere else. A test
     # that means to exercise the guard patches this itself.
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    # Same hole for a job's own scope: _terminate_job asks systemd whether ttdev-job-<id>.scope
+    # is active. On a broker host whose live job shares a test job's id, the real answer is yes
+    # and the kill path goes to `systemctl kill` on the host's job. A test about scopes patches it.
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
 
     # The pre-reset holder scan (spec 04 I92) walks /proc and signals the readers it finds. Unstubbed,
     # a unit test's reset would scan this machine's real processes. Every reset here sees a clear
