@@ -104,7 +104,7 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
         g.mechanism.last_reset_rc = 1
         return False
 
-    async def sweep(bitmap, ids, trays, expected, log, do_sbr=True):
+    async def sweep(trays, expected, log, do_sbr=True):
         order.append("sweep")
         state["clock"][0] += SWEEP_SEC
         return True

@@ -12,7 +12,6 @@ from tt_device_mcp.health.recovery import base, galaxy, pcie_guard
 HOLD = {
     "TT_DEVICE_MCP_AUTO_REBOOT": "0",
     "TT_DEVICE_MCP_AUTO_POWER_CYCLE": "0",
-    "TT_DEVICE_MCP_AUTO_UBB_RESET": "0",
 }
 
 
@@ -68,6 +67,19 @@ def test_the_hold_reason_follows_the_flags(monkeypatch):
         monkeypatch.setenv(var, "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")
     assert base.mesh_reset_hold_reason() == "", "=1 re-arms the mesh reset under a hold"
+
+
+def test_a_stale_tray_rung_setting_is_ignored(monkeypatch):
+    """The BMC tray re-power rung is gone, and so is its switch: an old host config that still sets it
+    neither holds the mesh reset nor counts toward the outage hold."""
+    for var in HOLD:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_MESH_RESET", raising=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")
+    assert base.mesh_reset_hold_reason() == ""
+    assert "TT_DEVICE_MCP_AUTO_UBB_RESET" not in base.OUTAGE_HOLD_VARS
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    assert base.mesh_reset_hold_reason() == "", "one real rung off is still a per-host choice"
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "0")
     for var in HOLD:
         monkeypatch.delenv(var, raising=False)
@@ -126,8 +138,7 @@ async def test_the_last_chance_sweep_is_refused_under_an_outage_hold(monkeypatch
         pytest.fail("a held sweep ran its SBR step")
 
     monkeypatch.setattr(g, "_recover_isolated_chips", no_sbr)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: pytest.fail("a held sweep re-powered a tray"))
-    assert await g._issue_all_resets_back_to_back(0b1000, [3], [4], 4, lambda m: None) is False
+    assert await g._issue_all_resets_back_to_back([4], 4, lambda m: None) is False
     assert rec["resets"] == [] and "mesh_reset_held" in rec["events"]
 
 

@@ -816,7 +816,7 @@ async def test_a_tray_sweep_the_bmc_failed_starts_the_clock(monkeypatch, clear_j
 
     monkeypatch.setattr(galaxy, "_fire_ubb_reset", no_data)
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", ok_reset)
-    await g._issue_all_resets_back_to_back(0b1000, [3], [4], 4, lambda m: None, do_sbr=False)
+    await g._issue_all_resets_back_to_back([4], 4, lambda m: None, do_sbr=False)
     assert opc.ipmi_unavailable_age_sec(since) is not None
 
 
