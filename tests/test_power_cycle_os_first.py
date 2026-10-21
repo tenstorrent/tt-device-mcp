@@ -478,6 +478,96 @@ def test_refuted_cycles_count_toward_the_backstop(booted, monkeypatch):
     assert mech.power_cycle_cooldown_state["until"] == first_at + recovery_base.POWER_CYCLE_BACKSTOP_WINDOW_SEC
 
 
+@pytest.mark.parametrize(
+    "out,want",
+    [
+        (" 0a 0f", "soft reset"),
+        (" 0b 0f", "power-up via rtc wakeup"),
+        (" 01 0f", "chassis power control command"),
+        (" 00 0f", "unknown"),
+        (" 0c 0f", "unmapped code 0x0c"),
+        ("Close Session command failed\n 1a 0f\n", "soft reset"),
+        ("invalid", None),
+    ],
+)
+def test_restart_cause_names_the_raw_code(os_first, out, want):
+    """ipmitool's `chassis restart_cause` prints "invalid" for 0xa/0xb: the raw code is read and
+    named per IPMI 2.0 (low nibble of the first byte); reserved codes are unmapped, not a cause."""
+    os_first["out"]["restart_cause"] = out
+    assert pc.read_restart_cause(CYCLE) == want
+    assert os_first["calls"][-1][1] == ["/usr/bin/ipmitool", "raw", "0x00", "0x07"]
+
+
+def test_rtc_wakeup_confirms_the_cycle(booted):
+    booted["out"]["restart_cause"] = " 0b 0f"
+    assert booted["mech"].confirm_power_cycle_on_boot(now_epoch=BOOT_NOW) == "confirmed"
+    row = _row(booted)
+    assert row["restart_cause"] == "power-up via rtc wakeup"
+    assert row["host_rebooted"] is True and row["power_cycled"] is True and "took_host_down" not in row
+
+
+def test_an_unmapped_code_is_unconfirmed_and_stamps_nothing(booted):
+    """A reserved code neither proves the BMC reports causes nor refutes the cycle."""
+    booted["out"]["restart_cause"] = " 0c 0f"
+    assert booted["mech"].confirm_power_cycle_on_boot(now_epoch=BOOT_NOW) == "unconfirmed"
+    row = _row(booted)
+    assert row["restart_cause"] == "unmapped code 0x0c" and row["power_cycled"] is None
+    assert row["host_rebooted"] is True and "took_host_down" not in row
+    assert not (booted["tmp"] / recovery_base.POWER_CYCLE_CAUSE_CAPABLE_FILE).exists()
+
+
+@pytest.fixture
+def warm_rebooted(booted, monkeypatch):
+    """The cycle was refuted (0x0a soft reset): the host rebooted warm, a missed I72 attempt."""
+    monkeypatch.setattr(recovery_base, "_last_external_power_cycle", lambda _now: None)
+    mech = booted["mech"]
+    for attr in (
+        "power_cycle_retry",
+        "power_cycle_retry_cooldown",
+        "_missed_retry_episode",
+        "power_cycle_cooldown_state",
+    ):
+        monkeypatch.setattr(mech, attr, getattr(mech, attr))
+    monkeypatch.setattr(mech, "power_cycle_retry", None)
+    monkeypatch.setattr(mech, "_missed_retry_episode", "")
+    (booted["tmp"] / recovery_base.POWER_CYCLE_CAUSE_CAPABLE_FILE).write_text("{}\n")
+    booted["out"]["restart_cause"] = " 0a 0f"
+    assert mech.confirm_power_cycle_on_boot(now_epoch=BOOT_NOW) == "refuted"
+    row = _row(booted)
+    assert row["host_rebooted"] is True and row["power_cycled"] is False and row["cycle_refuted"] == "soft reset"
+    return booted
+
+
+def test_a_warm_reboot_that_healed_asks_no_further_cycle(warm_rebooted, monkeypatch):
+    """Spec 04 I72/I88: the startup check, fabric included, passed after the warm reboot. That
+    verified release ends the streak: it is said once, and a later hold arms no retry."""
+    s, mech = warm_rebooted, warm_rebooted["mech"]
+    monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "")
+    mech.record_verified_release("startup", now_epoch=BOOT_NOW + 60)
+    mech.note_mesh_verified(now_epoch=BOOT_NOW + 60)
+    healed = [k for n, k in s["hevents"] if n == "power_cycle_miss_healed"]
+    assert healed == [{"requested_at": "earlier", "missed": 1, "warm_reboot": True}]
+    monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-2")
+    for now in (BOOT_NOW + 120, BOOT_NOW + 7200):
+        assert not mech.power_cycle_retry_due(now)
+    assert mech.power_cycle_retry is None
+
+
+def test_a_warm_reboot_still_held_asks_the_cycle_again_in_the_new_episode(warm_rebooted, monkeypatch):
+    """Spec 04 I72/I88: the warm boot's startup check failed, so the device is held in a new episode
+    while the retry the old one held was lost with the old broker. The retry is armed for the new
+    episode at the miss's until, once, and the governor then allows the cycle."""
+    mech = warm_rebooted["mech"]
+    monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-2")
+    until = mech.power_cycle_miss_state(now_epoch=BOOT_NOW)["until"]
+    assert not mech.power_cycle_retry_due(until - 1)
+    assert mech.power_cycle_retry == (until, "held-since-2")
+    assert mech.power_cycle_retry_due(until), "asked again the moment the I72 backoff ends"
+    assert mech.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=until + 1)[0]
+    mech.clear_power_cycle_retry()
+    assert not mech.power_cycle_retry_due(until + 1), "armed once per hold episode"
+
+
 def test_a_bmc_that_never_reports_a_cause_leaves_the_cycle_unconfirmed_and_counted(booted):
     """Measured on a Galaxy BMC: `chassis restart_cause` answers "Unspecified error". The row still
     counts as a cycle (the boot-loop-safe side); the event says it was not confirmed."""
