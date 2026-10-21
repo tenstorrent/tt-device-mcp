@@ -1202,6 +1202,26 @@ cooldown (spec 04 I65) holds longer.
   | release whose fresh pass is ≤300 s old and newer than the fault | +0 s | +0 s |
   | foreign holder gone, hugepages still filling (after a boot) | lift on the pre-job verify (~2 s) | waits for the 1G pool (re-read on each relift, 120 s apart), then one full check; bounded by the 10-min ladder and its 300 s check window (spec 04 I76) |
   | foreign holder gone, hugepages ready | ~2 s | one full check (~45-100 s) |
+- **I80 — A hold stays held through its own recovery.** A broker op that runs while a hold episode
+  is open (a forced ladder rung such as a glx_reset, any reset, the check after it) keeps `/health`
+  `held: true` and `status: degraded`, with the hold's own `held_since` and `held_reason`, until
+  the full gate, fabric included, passes and closes the episode. Neither the op starting nor the op
+  ending lifts it, and `held_since` stays one clock for the whole episode: a hold opened inside the
+  op keeps the start `/health` reported during it after the op ends. A closed episode's clock never
+  carries into the next: the release that closes the episode clears the latch, so the next hold,
+  even one opened inside an op with no status read in between, reports its own start. A hold that
+  spec 04 I82 counts as the same episode (a re-hold within `_HOLD_CARRY_SEC` of the release, or
+  around the first job after it) is not a next hold: it reports the carried episode start, during
+  the op and after it, inside an op or outside one, whether or not a status read landed during the
+  op, so a lift/fail cycle never restarts the 10-min clock. A fresh latch takes the logged
+  episode's start, not the read's time, and a latch a read took before the hold's gate verdict
+  yields to an earlier episode start once that verdict logs it (so the queue's HOLD row, which
+  reads the same latch, shows that start too). This is reporting only
+  (`server._health_hold_state`, read by `/health` alone):
+  the jobs list still shows one row for the device, the op's, and the gate, the release and the
+  hold watchdog keep `_device_hold_state`, so it changes no recovery step and no time to recover.
+  A routine op on a device no hold was open for (a between-jobs check, a post-job reset) does not
+  read as held; `device_degraded` names it.
 
 ## Interfaces
 
@@ -1232,7 +1252,8 @@ subsystem through the root:
   *Free* (`require_free=True`, `pre-step` only) applies the reset gate's tenant rule: a holder at
   or above `MIN_TENANT_UID`, or an incomplete scan, is not free (04 I7).
 - `/health` (REST, `server._health_payload`) — `status: ok|degraded` (degraded exactly while the
-  device is HELD: degraded, refused to tenants, no recovery op running), `fsm_state`, `fsm_why`,
+  device is HELD: degraded, refused to tenants, no recovery op running, or an op running inside an
+  open hold, I80), `fsm_state`, `fsm_why`,
   `held`/`held_since`/`held_reason`/`held_age_sec`, `device_degraded`, queue counts, version.
   `held_reason` and `fsm_why` keep the reason the hold opened with; the live fields say where it
   stands now, read fresh from sysfs on every call with no device touch: `isolated_chips` (always),
@@ -1868,6 +1889,7 @@ refuses.
 | I79 (no sample gap under `FAST_SAMPLE_SEC`; a storm keeps the fast cadence at most `FAST_MAX_SEC`, re-arms after a quiet window; a reset arms nothing) | `tests/test_offbus_early_watch.py::test_a_sustained_aer_storm_keeps_every_gap_and_is_capped`, `test_a_capped_storm_rearms_only_after_a_quiet_window`, `test_the_arming_edge_never_samples_sooner_than_the_fast_interval`, `test_a_reset_moves_the_baseline_without_arming` |
 | I79/I66 (two fast all-ones samples mark the chip lost before the confirm bound; one gated real read while it is pending) | `tests/test_offbus_early_watch.py::test_two_fast_all_ones_samples_mark_a_chip_lost_before_the_confirm_bound`, `test_two_fast_blackout_samples_mark_every_chip_lost_before_the_confirm_bound` |
 | I79 (the 4 s confirm bound holds across the window end and the storm cap, for the per-chip, blackout, all-gone and short-count paths; a later reading keeps the regular proof; an isolated chip's node arms nothing) | `tests/test_offbus_early_watch.py::test_the_confirm_bound_holds_across_the_end_of_a_fast_window`, `test_a_pending_chip_past_the_window_still_gets_its_real_read`, `test_a_reading_that_began_after_the_window_keeps_the_regular_proof`, `test_a_chip_the_sampler_isolated_arms_nothing_when_its_node_leaves` |
+| I80 | `tests/test_health_held_during_op.py::test_health_stays_held_while_a_forced_rung_runs`, `tests/test_health_held_during_op.py::test_health_lifts_the_hold_only_when_the_gate_passes_inside_the_op`, `tests/test_health_held_during_op.py::test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held`, `tests/test_health_held_during_op.py::test_a_hold_opened_inside_an_op_keeps_its_held_since_after_the_op`, `tests/test_health_held_during_op.py::test_a_closed_episodes_held_since_never_carries_into_the_next_hold`, `tests/test_health_held_during_op.py::test_a_rehold_inside_the_carry_window_reports_the_carried_start_in_and_after_the_op`, `tests/test_health_held_during_op.py::test_an_in_window_rehold_inside_an_op_with_no_read_keeps_the_carried_start_after_it`, `tests/test_health_held_during_op.py::test_an_in_window_rehold_outside_an_op_reports_the_carried_start`, `tests/test_health_held_during_op.py::test_a_read_before_an_in_window_reholds_verdict_yields_to_the_carried_start` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

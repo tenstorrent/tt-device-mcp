@@ -956,8 +956,9 @@ _hold_row: Optional[dict] = None
 
 # When the device entered a HELD state: degraded (a chip off the bus, or dirty and
 # unverified) with no broker op running. Latched so the synthetic HOLD row can report how
-# long the device has sat refused to tenants, and cleared the moment it is fit again — or a
-# broker op takes over the RUNNING row (that op IS the recovery, and owns the row while it runs).
+# long the device has sat refused to tenants, and cleared the moment it is fit again (or its hold
+# episode closes) — or a broker op takes over the RUNNING row (that op IS the recovery, and owns
+# the row while it runs).
 device_held_since: str = ""
 
 # Whether the CURRENT tenant-refused episode has been written to the durable health
@@ -7407,8 +7408,45 @@ def _device_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, st
     if device_op_active:
         return None  # the op's row is the recovery; don't double it. Keep the latch running.
     if not device_held_since:
-        device_held_since = (now or datetime.now()).isoformat()
+        device_held_since = _held_since_latch(now)
     return reason, device_held_since
+
+
+def _held_since_latch(now: Optional[datetime] = None) -> str:
+    """The start a fresh ``device_held_since`` latch takes (spec 03 I80): the logged episode's own
+    start while one is open, so a re-hold spec 04 I82 carries reports the carried start after the
+    release cleared the latch; ``now`` only for a hold no episode is logged for yet."""
+    if device_hold_logged and device_hold_episode_since:
+        return device_hold_episode_since
+    return (now or datetime.now()).isoformat()
+
+
+def _iso_before(a: str, b: str) -> bool:
+    """True when ISO timestamp ``a`` is earlier than ``b``; False when either does not parse."""
+    try:
+        return datetime.fromisoformat(a) < datetime.fromisoformat(b)
+    except (TypeError, ValueError):
+        return False
+
+
+def _health_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, str]]:
+    """The hold as /health reports it (spec 03 I80): :func:`_device_hold_state`, plus a broker op
+    running inside an open hold episode. That op (a forced ladder rung, a reset, the check after it)
+    is the recovery of THIS hold, and the device stays refused until the full gate, fabric included,
+    passes and closes the episode. The jobs list keeps one row for it (the op's), but a watcher that
+    reads ``held`` must not see the hold lift for the length of a glx_reset. A routine op on a device
+    no hold was open for is not a hold. The reason and clock are the hold's own, not the op's: a hold
+    opened inside the op latches ``device_held_since`` to the clock reported here, so it does not
+    jump forward when the op ends and :func:`_device_hold_state` takes over."""
+    global device_held_since
+    hold = _device_hold_state(now)
+    if hold is not None or not (device_op_active and device_hold_logged):
+        return hold
+    reason = device_hold_episode_reason or _device_degraded_for_tenant()
+    since = device_held_since or _held_since_latch(now)
+    if _device_degraded_for_tenant():
+        device_held_since = since
+    return reason, since
 
 
 def _hold_tray_groups() -> dict:
@@ -7667,13 +7705,14 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     """The /health body. Beyond broker liveness it reports the DEVICE hold state, so a poller
     cannot read a box sitting held-and-refused as 'ok' — the gap that let a stuck hold go
     unseen for hours. ``status`` is 'degraded' exactly while the device is HELD (degraded,
-    refused to tenants, no recovery op running); a transient broker op does not flip it, so a
-    routine reset does not read as a stuck box. ``held``/``held_age_sec``/``held_reason`` carry
+    refused to tenants, no recovery op running, or an op running inside an open hold: I80); a
+    routine broker op on a device that was not held does not flip it, so a routine reset does not
+    read as a stuck box. ``held``/``held_age_sec``/``held_reason`` carry
     the precise latch for a monitor that alarms on how long the device has been unusable, and
     ``device_degraded`` still names an in-flight recovery that ``status`` deliberately hides."""
     running = sum(1 for j in jobs.values() if j.status == JobStatus.RUNNING)
     queued = sum(1 for j in jobs.values() if j.status == JobStatus.QUEUED)
-    hold = _device_hold_state(now)
+    hold = _health_hold_state(now)
     payload = {
         "status": "degraded" if hold else "ok",
         "version": __version__,
@@ -7767,7 +7806,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_offbus_escalated, device_hold_alert_next_bucket, device_hold_alert_gap
     global device_hold_tenant_deferred, device_hold_offbus_prior_bucket, device_hold_offbus_tenant_wait
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
-    global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold
+    global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold, device_held_since
     if reason and not device_hold_logged:
         device_hold_logged = True
         # Prefer a start this box already recorded: if the device was still held across a restart,
@@ -7787,6 +7826,9 @@ def _note_tenant_gate_verdict(reason: str) -> None:
             if ladder_age is not None:
                 carry = {"since": restored, "ladder_age": ladder_age, "released": time.time()}
         _persist_hold_episode(device_hold_episode_since, tenant=tenant)
+        # Spec 03 I80: a latch a status read took before this verdict yields to an earlier episode start.
+        if device_held_since and _iso_before(device_hold_episode_since, device_held_since):
+            device_held_since = device_hold_episode_since
         # ...and the alert hook's backoff for that same episode, so a restart does not page again.
         device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
         device_hold_episode_reason = reason
@@ -7861,6 +7903,8 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         if not _hold_episode_tenant:  # spec 04 I82: a tenant's hold time is not fault time
             _save_hold_carry(device_hold_episode_since, device_hold_episode_reason)
         device_hold_episode_since = ""
+        # Spec 03 I80: a clock latched inside an op belongs to this episode; the next hold starts its own.
+        device_held_since = ""
         _dispatch_reset_spent = False  # spec 03 I55: the next episode earns its own reset
         if recovery_mechanism is not None:
             recovery_mechanism.regressed_reset_since = None  # spec 04 I31: the next episode may reset again
