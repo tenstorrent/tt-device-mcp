@@ -188,6 +188,11 @@ class _SignalGuard:
         self.refused: list = []
         self.owned = _spawned_by_this_run
 
+    def _foreign(self, pids: list) -> list:
+        """The pids that exist and are not this run's. A process (or an ancestor) that exits during
+        the ppid walk breaks it, so a miss is read again; one that is gone by then is skipped."""
+        return [p for p in pids if not self.owned(p) and os.path.exists(f"/proc/{p}") and not self.owned(p)]
+
     def _refuse(self, what: str, sig: int, members: list):
         self.refused.append(f"{what}(signal {int(sig)}) reaches pid(s) {members[:8]} this test did not spawn")
         raise PermissionError(errno.EPERM, f"spec 09 I9: refused {what}: not spawned by this test run")
@@ -199,7 +204,7 @@ class _SignalGuard:
             return self._refuse(f"os.kill({pid})", sig, ["every process"])
         if pid <= 0:
             return self.killpg(os.getpgid(0) if pid == 0 else -pid, sig, what=f"os.kill({pid})")
-        if os.path.exists(f"/proc/{pid}") and not self.owned(pid):
+        if self._foreign([pid]):
             return self._refuse(f"os.kill({pid})", sig, [pid])
         return _real_kill(pid, sig)
 
@@ -208,7 +213,7 @@ class _SignalGuard:
         if sig == 0:
             return _real_killpg(pgid, sig)
         members = _group_members(os.getpgid(0) if pgid == 0 else pgid)
-        foreign = [m for m in members if not self.owned(m)]
+        foreign = self._foreign(members)
         if foreign:
             return self._refuse(what, sig, foreign)
         return _real_killpg(pgid, sig)

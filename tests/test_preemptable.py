@@ -631,7 +631,7 @@ async def test_the_full_post_job_gate_runs_before_the_waiting_job_gets_the_devic
     _fast_preempt(monkeypatch, grace=1)
     order = []
 
-    async def _gate(job_log_file, job_failed=False):
+    async def _gate(job_log_file, job_failed=False, **_kw):
         order.append(("gate", job_failed, waiter.status))
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)

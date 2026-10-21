@@ -65,7 +65,21 @@ def _escaped_child(tag: str) -> tuple[int, int]:
     the job's process group and session, and its parent chain is gone. Returns (job pid, child pid)."""
     job = _spawn_job("setsid sleep 60 >/dev/null 2>&1 < /dev/null & echo $!", tag=tag)
     out, _ = job.communicate(timeout=5)
-    return job.pid, int(out.strip())
+    child = int(out.strip())
+    # `$!` is known before setsid has run: on a small /proc a scan can finish first and still find
+    # the child in the job's group. Return once it leads its own session and runs sleep.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            with open(f"/proc/{child}/stat") as f:
+                stat = f.read()
+        except OSError:
+            break
+        fields = stat[stat.rindex(")") + 2 :].split()
+        if "(sleep)" in stat and int(fields[3]) == child:
+            break
+        time.sleep(0.01)
+    return job.pid, child
 
 
 @pytest.mark.asyncio
