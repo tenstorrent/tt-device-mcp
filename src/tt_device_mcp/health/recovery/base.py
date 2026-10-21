@@ -24,11 +24,13 @@ from typing import Awaitable, Callable, Optional
 from tt_device_mcp import aio, alert, metrics, pre_reset_scan, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
 from tt_device_mcp.health import chip_state
+from tt_device_mcp.health import pci_writer as _pci_writer_mod
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.monitors.heartbeat import returned_chips
+from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import ipmi_guard
 
@@ -41,6 +43,46 @@ LOCAL_RESET_LOCK = "local-reset.lock"
 # `tt-smi -glx_reset` re-powers every tray, counts a 30 s settle, then waits up to 100 s for every chip
 # to show up in /dev/tenstorrent. Either line marks the start of that wait (spec 04 I81).
 GLX_DRIVER_WAIT = re.compile(r"Waiting for all \d+ chips to show up|Waiting for (\d+) seconds: \1\b")
+
+# Spec 03 I83. tt-smi prints this when the driver's POST_RESET on a chip fails after a mesh reset's
+# re-power: the reset marker did not read back zero, and the driver has just cleared the chip's
+# needs_hw_init, so from here every read of that chip is a real bus read again.
+GLX_POST_RESET_FAILED = re.compile(r"POST_RESET failed for device /dev/tenstorrent/(\d+)\.")
+
+# A write to /sys/bus/pci/rescan or a chip's `remove` waits on the kernel's PCI rescan/remove lock and
+# on the device it walks; behind a hung endpoint it can block for good. Every such write goes through
+# the one in-flight writer (health.pci_writer): the first that does not return in this long latches
+# PCI-wedged, and its thread may stay blocked in the kernel until the power cycle.
+PCI_SYSFS_WRITE_TIMEOUT_SEC = _pci_writer_mod.PCI_SYSFS_WRITE_TIMEOUT_SEC
+
+
+async def pci_rescan(context: str = "", write: Optional[Callable[[], object]] = None) -> None:
+    """One global PCI rescan through the one in-flight PCI writer, bounded by
+    PCI_SYSFS_WRITE_TIMEOUT_SEC. Raises OSError, or PciWedged (an asyncio.TimeoutError) on a timeout
+    or when the writer refuses it (PCI-wedged, or an earlier write still blocked): either way the
+    calling rung failed. A timeout is journaled (pci_rescan_timeout) and latches PCI-wedged, which
+    requests the power cycle. ``write`` replaces the bare sysfs write (a module's own stubbable rescan
+    function); ``context`` names the rung in the journal."""
+    fn, args = (write, ()) if write is not None else (Path("/sys/bus/pci/rescan").write_text, ("1",))
+    refused = PCI_WRITER.latched or bool(PCI_WRITER.pending())
+    try:
+        await PCI_WRITER.write(context or "PCI rescan", fn, *args, timeout=PCI_SYSFS_WRITE_TIMEOUT_SEC)
+    except PciWedged:
+        if not refused:
+            health_event("pci_rescan_timeout", context=context, timeout_s=PCI_SYSFS_WRITE_TIMEOUT_SEC)
+        raise
+
+
+def pci_wedged_refusal(context: str, log) -> str:
+    """Why a PCI-dependent rung may not run now (the PCI-wedged latch is set), or "". Journaled and
+    logged: the rung is skipped and counts as failed at once."""
+    if not PCI_WRITER.latched:
+        return ""
+    why = f"PCI-wedged ({PCI_WRITER.reason}); the power cycle is requested"
+    log(f"{context} skipped: {why}")
+    health_event("pci_wedged_rung_skipped", context=context, reason=PCI_WRITER.reason)
+    return why
+
 
 # A reset that did not fix the device will not fix it on the next attempt either,
 # and each extra reset is another chance to trip the root complex into the fatal
@@ -547,6 +589,12 @@ class RecoveryMechanism:
         # nothing else: during a fabric check or a health probe, chips going all-ones IS a failure and
         # must still be acted on — that is precisely how a host was lost.
         self._reset_in_flight = False
+        # Spec 03 I83: the chips tt-smi said failed POST_RESET in the current mesh reset (cleared at
+        # every reset's start; filled by _driver_wait_rescan_hook's watch), and the cut the broker
+        # runs on them once tt-smi has exited (the sampler's cut_post_reset_failed; returns False when
+        # a chip's remove is still blocked in the kernel). None: no cut.
+        self.post_reset_failed: set = set()
+        self.post_reset_cut: Optional[Callable[[list], Awaitable[bool]]] = None
         # Any reset_with_quiesce (the ladder's or a manual one) since the mesh was last released:
         # an off-bus set first seen after it is the reset's doing, never a tray-down onset (04 I19).
         self.reset_since_release = False
@@ -1287,6 +1335,11 @@ class RecoveryMechanism:
             log(f"reset refused: {fenced}")
             health_event("reset_fenced", argv=argv, owner=owner, reason=fenced)
             return None, f"reset refused: {fenced}"
+        # Spec 04 I76: a reset re-enumerates its chips through the kernel's PCI lock, which a blocked
+        # PCI write holds; while PCI-wedged it cannot run and counts as failed at once.
+        wedged = pci_wedged_refusal(f"reset ({' '.join(argv)})", log)
+        if wedged:
+            return None, f"reset refused: {wedged}"
         unclassified = self._override_unclassified(argv, owner, log)
         if unclassified:
             return None, unclassified
@@ -1315,6 +1368,7 @@ class RecoveryMechanism:
         # up with no devices at all.
         self.reset_in_flight = True
         self.reset_since_release = True
+        self.post_reset_failed = set()
         stream, driver_wait = self._driver_wait_rescan_hook(argv, on_output, log)
         cancelled_mid = False
         late_cancel = False
@@ -1369,28 +1423,48 @@ class RecoveryMechanism:
             if restore and rc is None:
                 restore = not await asyncio.to_thread(self.scope_active)
             if restore:
-                withheld = mesh and self._withhold_failed_mesh_rescan(rc, text, log)
+                cut_done = False
                 try:
+                    # Inside the try: the cut can take up to about 45 s, and a cancel that lands in it
+                    # must still reach the finally below, or the pollers stay stopped and owed to nobody.
+                    rescan_ok = await self._post_reset_cut(argv, log)
+                    cut_done = True
+                    # Spec 04 I69 on the mesh path, decided after the cut so a chip the I83 cut just
+                    # removed is also kept out when the BMC re-power did not reach it.
+                    withheld = mesh and self._withhold_failed_mesh_rescan(rc, text, log)
                     if not withheld:
                         # A reset can leave endpoints un-enumerated — and any chip we isolated earlier is
                         # still out of the kernel, because `remove` is not undone by a reset. Rescan, or the
-                        # device comes back short and nobody knows why.
-                        await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
-                        await asyncio.sleep(3)
+                        # device comes back short and nobody knows why. This also re-adds a chip the I83
+                        # cut just removed, if it answers now. Skipped while a remove is still blocked in
+                        # the kernel: the rescan would queue behind it on the same lock.
+                        if rescan_ok:
+                            await pci_rescan()
+                            await asyncio.sleep(3)
+                        else:
+                            log("PCI rescan after the reset skipped: a chip remove is still blocked in the kernel")
                         isolated = self._isolated_chips() if self._isolated_chips is not None else None
                         if isolated:
                             await asyncio.to_thread(drop_returned_isolated, isolated, "reset", log)
                     if rc == 0:
                         await self._reapply_aiclk_ceiling(log)
-                except OSError:
-                    pass
+                except (OSError, asyncio.TimeoutError) as e:
+                    log(f"PCI rescan after the reset did not complete ({type(e).__name__}: {e})")
                 finally:
                     # Only a completed reset brings the chips back, so only then is restoring safe; put
                     # it in the rescan's finally under shield so a cancellation during the rescan still
                     # restores rather than leaving a telemetry gap. A reset that ran and failed (rc != 0)
                     # leaves the device held with chips that may still be off the bus or hung: pollers
                     # stay down. rc None here is a launch failure or a raise with no scope left running.
-                    await self.restore_pollers(quiesced, log, ok=rc in (0, None), after=f"reset rc={rc}")
+                    # A cancel inside the I83 cut leaves its chips undecided (a remove may be under way):
+                    # the pollers stay down too, owed to the next close to HEALTHY.
+                    restored = cut_done and rc in (0, None)
+                    await self.restore_pollers(
+                        quiesced,
+                        log,
+                        ok=restored,
+                        after=f"reset rc={rc}" if cut_done else f"reset rc={rc}, cut cancelled",
+                    )
 
             if late_cancel:
                 raise asyncio.CancelledError()
@@ -1471,6 +1545,30 @@ class RecoveryMechanism:
         except Exception:  # noqa: BLE001 - a missed restart leaves them for the health probe
             pass
 
+    async def _post_reset_cut(self, argv: list[str], log) -> bool:
+        """Spec 03 I83: after a mesh reset, hand the chips tt-smi said failed POST_RESET to the cut
+        (detach, then kill their foreign readers). Runs once tt-smi has exited, before the rescan that
+        ends the reset. Logs one line per mesh reset either way, so every reset's journal shows what
+        the cut saw. Returns False only when a chip's remove is still blocked in the kernel, so the
+        caller skips its rescan. Never raises."""
+        if "-glx_reset" not in argv:
+            return True
+        failed = sorted(self.post_reset_failed, key=int)
+        if not failed:
+            log("mesh reset ended: tt-smi reported no POST_RESET failure; no in-flight cut")
+            return True
+        if self.post_reset_cut is None:
+            log(f"mesh reset ended: POST_RESET failed on chip(s) {failed}; no in-flight cut is wired")
+            return True
+        log(f"mesh reset ended: POST_RESET failed on chip(s) {failed}; checking them for the in-flight cut")
+        try:
+            return bool(await self.post_reset_cut(failed))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - the hold and its bounded recovery still decide
+            log(f"in-flight cut could not run ({e})")
+            return True
+
     def _driver_wait_rescan_hook(self, argv: list[str], on_output, log):
         """Spec 04 I81: let a mesh reset bring back the chips this broker isolated, in the same reset.
 
@@ -1491,19 +1589,23 @@ class RecoveryMechanism:
         over (tt-smi prints the count with end='' and \\r, so a line reader gets it at the newline and a
         file reader sees `seconds: 30` only then): never before the re-power has had its 30 s.
 
+        Spec 03 I83: on every mesh reset the watch also records each chip tt-smi reports as failing
+        POST_RESET (post_reset_failed), for the cut reset_with_quiesce runs once tt-smi has exited.
+
         Returns (the output callback to run the reset with, a dict that holds the rescan task once it
-        starts). With no isolated chip, or not a mesh reset, the callback is the caller's own."""
-        isolated = self._isolated_chips() if self._isolated_chips is not None else None
-        if "-glx_reset" not in argv or not isolated:
+        starts). Not a mesh reset: the callback is the caller's own."""
+        if "-glx_reset" not in argv:
             return on_output, {}
-        chips = sorted(isolated, key=int)
-        state: dict = {"tail": "", "task": None, "stop": asyncio.Event()}
+        isolated = self._isolated_chips() if self._isolated_chips is not None else None
+        chips = sorted(isolated, key=int) if isolated else []
+        state: dict = {"tail": "", "ptail": "", "task": None, "stop": asyncio.Event()}
 
         async def rescan() -> None:
             for attempt in range(1, DRIVER_WAIT_RESCAN_TRIES + 1):
                 try:
-                    await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
-                except OSError as e:
+                    await pci_rescan()
+                except (OSError, asyncio.TimeoutError) as e:
+                    e = e if str(e) else f"no answer in {PCI_SYSFS_WRITE_TIMEOUT_SEC} s"
                     log(
                         f"PCI rescan at tt-smi's driver wait could not run ({e}); the rescan after the reset still runs"
                     )
@@ -1533,7 +1635,11 @@ class RecoveryMechanism:
                     pass
 
         def watch(chunk: str) -> None:
-            if state["task"] is None and not state.get("disarmed") and not state.get("withheld"):
+            if not state.get("disarmed"):
+                text = state["ptail"] + chunk
+                self.post_reset_failed.update(m.group(1) for m in GLX_POST_RESET_FAILED.finditer(text))
+                state["ptail"] = text[-200:]  # a line split across two reads still matches
+            if not state.get("seen") and not state.get("disarmed"):
                 seen = state["tail"] + chunk
                 # Spec 04 I69 on the mesh path: the rescan re-adds removed chips, so it runs only once
                 # the output shows the BMC re-power went out on op_mode 0x3. A 0x0 fallback, a guard
@@ -1541,7 +1647,8 @@ class RecoveryMechanism:
                 if ipmi_guard.scan_reset_output(seen) is not None:
                     state["bmc_failed"] = True
                 if GLX_DRIVER_WAIT.search(seen):
-                    if state.get("bmc_failed"):
+                    state["seen"] = True
+                    if chips and state.get("bmc_failed"):
                         state["withheld"] = True
                         removed = pci.removed_chip_ids()
                         log(
@@ -1555,7 +1662,7 @@ class RecoveryMechanism:
                             reason="mesh_reset_failed",
                             at="driver_wait",
                         )
-                    else:
+                    elif chips:
                         state["task"] = asyncio.get_running_loop().create_task(rescan())
                 else:
                     state["tail"] = seen[-200:]  # a marker split across two reads still matches

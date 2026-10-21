@@ -18,6 +18,7 @@ from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.monitors import heartbeat, pci
+from tt_device_mcp.health.pci_writer import PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery.galaxy import GalaxyRecovery
 
@@ -88,6 +89,27 @@ async def test_an_arc_that_comes_up_within_the_wait_is_recovered(monkeypatch):
     _bridge_rung(monkeypatch, "13", [None, None, "777"])
     assert await srv.galaxy_recovery._recover_isolated_chips(lambda m: None) is True
     assert srv.isolated_chips == set()
+
+
+@pytest.mark.asyncio
+async def test_a_pci_wedged_pass_reads_no_heartbeat(monkeypatch):
+    """Spec 04 I76/I94: once a bridge write latches PCI-wedged the pass has failed and requested the
+    power cycle; the ARC check adds no read or wait after the latch."""
+    _bridge_rung(monkeypatch, "13", ["12345"])
+    srv.isolated_chips = {"13", "14"}
+    srv.device_pci_map = {"13": "0000:46:00.0", "14": "0000:47:00.0"}
+    reads = []
+    monkeypatch.setattr(heartbeat, "_read_beat", lambda n: reads.append(n) or "12345")
+
+    async def write(context, fn, *args, timeout=None):
+        if args[0] == "14":
+            raise PciWedged(f"{context}: timed out")
+        return fn(*args)
+
+    monkeypatch.setattr(recovery_pkg.PCI_WRITER, "write", write)
+    assert await srv.galaxy_recovery._recover_isolated_chips(lambda m: None) is False
+    assert reads == [], "the ARC check read a heartbeat after the PCI-wedged latch"
+    assert "14" in srv.isolated_chips
 
 
 @pytest.mark.asyncio

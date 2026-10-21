@@ -427,7 +427,7 @@ async def test_a_manual_reset_before_the_first_sighting_is_not_an_onset(rig, mon
     the reset's doing, so it gets no prelude, and the ladder runs as before."""
     g = rig["g"]
     mech = g.mechanism
-    monkeypatch.setattr(mech, "run_scoped", lambda argv, log, owner: _done())
+    monkeypatch.setattr(mech, "run_scoped", lambda argv, log, owner, on_output=None: _done())
     monkeypatch.setattr(mech, "_set_device_pollers", lambda on, log: _done(True))
     monkeypatch.setattr(mech, "_set_device_op_detail", lambda d: None)
     monkeypatch.setattr(mech, "reset_in_flight", False)

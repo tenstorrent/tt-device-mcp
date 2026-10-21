@@ -249,6 +249,16 @@ def _fake_exec(seen, raise_after=False):
         class P:
             returncode = 0
 
+            def __init__(self):
+                # A mesh reset streams its output (spec 03 I83's POST_RESET watch), so it reads stdout.
+                self.stdout = self._lines()
+
+            async def _lines(self):
+                yield b"ok\n"
+
+            async def wait(self):
+                return 0
+
             async def communicate(self):
                 return b"ok", b""
 
