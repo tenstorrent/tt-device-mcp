@@ -536,7 +536,7 @@ def hook(tmp_path):
     cycle.chmod(0o755)
     req = tmp_path / "req"
 
-    def run(verb, request=None, cycle_rc=0):
+    def run(verb, request=None, cycle_rc=0, **extra_env):
         if request is not None:
             req.write_text(request)
         env = {
@@ -544,12 +544,13 @@ def hook(tmp_path):
             "TT_DEVICE_MCP_POWER_CYCLE_REQUEST": str(req),
             "CYCLE_RC": str(cycle_rc),
             "HOOK_VERB": verb,
+            **extra_env,
         }
         argv = ["/bin/sh", "-c", 'set -- "$HOOK_VERB"; . "$0"', str(HOOK)]
         r = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
         return r.returncode, [t.rstrip() for t in trace.read_text().splitlines()] if trace.exists() else []
 
-    return {"run": run, "cycle": str(cycle)}
+    return {"run": run, "cycle": str(cycle), "stubs": stubs, "trace": trace, "pid_file": tmp_path / "req.fallback.pid"}
 
 
 def _request(argv, age=0):
@@ -583,6 +584,64 @@ def test_hook_ignores_a_request_with_no_command(hook):
 def test_hook_retries_a_failing_cycle_then_lets_the_reboot_continue(hook):
     rc, trace = hook["run"]("reboot", _request([hook["cycle"]]), cycle_rc=1)
     assert rc == 1 and [t for t in trace if t.startswith("cycle")] == ["cycle"] * 3
+
+
+def _gone(pid):
+    """True once ``pid`` has exited (gone, or a zombie no one reaped yet)."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] in ("Z", "X")
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+
+
+def _children(pid):
+    out = subprocess.run(["ps", "-o", "pid=", "--ppid", str(pid)], capture_output=True, text=True).stdout
+    return [int(p) for p in out.split()]
+
+
+@pytest.mark.parametrize("fired", [False, True], ids=["waiting-out-the-bound", "cycle-command-running"])
+def test_hook_stops_the_fallback_and_its_children_before_any_wait(hook, tmp_path, fired):
+    """The fallback, run for real: still waiting out its bound, or past it, as `timeout` with the cycle
+    command as its child. The hook stops it and every process it started before the RAID wait (the
+    stub mdadm sees none of them alive), so no orphan can cut power alongside the hook's own tries."""
+    pidf, proc = _run_fallback(tmp_path, 0 if fired else 300, ["/bin/sleep", "60"], timeout=60)
+    kids = []
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if pidf.exists() and pidf.read_text().strip():
+                kids = _children(proc.pid)
+                if not fired or (kids and _cmdline(proc.pid)[0] == pc.FALLBACK_FIRE_ARGV0.encode()):
+                    break
+            time.sleep(0.05)
+        assert not fired or kids, "the fallback's cycle command never started"
+        hook["pid_file"].write_text(pidf.read_text())
+        watched = " ".join(str(p) for p in [proc.pid, *kids])
+        mdadm = hook["stubs"] / "mdadm"
+        mdadm.write_text(f'#!/bin/sh\necho "mdadm alive:$(ps -o stat= -p "$WATCHED" | grep -vc Z)" >> "{hook["trace"]}"\n')
+        rc, trace = hook["run"]("reboot", _request([hook["cycle"]]), WATCHED=watched)
+        assert rc == 0
+        assert "mdadm alive:0" in trace, "the fallback or a child of it outlived the stop into the RAID wait"
+        assert proc.wait(timeout=5) == -9
+        deadline = time.monotonic() + 5
+        while not all(_gone(k) for k in kids) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert all(_gone(k) for k in kids), "a child of the fallback survived it"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_hook_stops_the_fallback_first_and_kills_its_process_group():
+    """Static order: the fallback is stopped before the flush and the RAID wait, never alongside them,
+    and the stop takes the process group the fallback leads, not just its pid."""
+    text = HOOK.read_text()
+    stop = text.index('stop_fallback "$fpid"')
+    assert stop < text.index("sync &") < text.index("mdadm --wait-clean")
+    assert stop < text.index('timeout "$try_timeout" "$@"')
+    body = text[text.index("stop_fallback() {") :]
+    body = body[: body.index("\n}\n")]
+    assert 'kill -STOP $gen' in body and 'kill -9 "-$1"' in body and "kill -9 $tree" in body
 
 
 def test_the_installer_installs_the_hook_where_the_broker_looks():

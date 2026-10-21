@@ -24,6 +24,41 @@ export PATH
 
 say() { echo "tt-device-mcp power-cycle hook: $*" >/dev/kmsg 2>/dev/null || echo "tt-device-mcp power-cycle hook: $*" >&2; }
 
+# The pids whose parent is one of the pids in $1, on one line; /proc/<pid>/stat's comm field may hold
+# spaces or ')', so the fields are read after its last ") ".
+children_of() {
+    for st in /proc/[0-9]*/stat; do
+        IFS= read -r s 2>/dev/null <"$st" || continue
+        s=${s##*) }
+        s=${s#* }
+        case " $1 " in *" ${s%% *} "*)
+            p=${st#/proc/}
+            printf '%s ' "${p%/stat}"
+            ;;
+        esac
+    done
+}
+
+# Stop the fallback $1 and everything it started: past its bound it is `timeout` with the cycle
+# command as its child, and a SIGKILL to the pid alone would leave that child to cut power later.
+# Freeze each generation before reading the next, so none forks past the sweep, then SIGKILL its
+# process group (it leads one: a unit's main process does, and so does timeout) and every pid found.
+stop_fallback() {
+    tree=$1
+    gen=$1
+    while [ -n "$gen" ]; do
+        kill -STOP $gen 2>/dev/null
+        gen=$(children_of "$gen")
+        tree="$tree $gen"
+    done
+    IFS= read -r s 2>/dev/null <"/proc/$1/stat" || s=
+    s=${s##*) }
+    s=${s#* }
+    s=${s#* }
+    [ "${s%% *}" = "$1" ] && kill -9 "-$1" 2>/dev/null
+    kill -9 $tree 2>/dev/null
+}
+
 [ "${1:-}" = reboot ] || exit 0
 [ -r "$REQ" ] || exit 0
 {
@@ -43,24 +78,29 @@ case "$try_timeout" in '' | *[!0-9]*) try_timeout=15 ;; esac
 TT_DEVICE_MCP_POWER_CYCLE_REASON="$reason"
 export TT_DEVICE_MCP_POWER_CYCLE_REASON
 
-say "power-cycling the host now: $reason"
-# The filesystems are read-only by now; never block on a flush that cannot finish.
-sync &
-# Hooks run in parallel: let the RAID arrays finish marking themselves clean before power goes.
-command -v mdadm >/dev/null 2>&1 && timeout 10 mdadm --wait-clean --scan >/dev/null 2>&1
 # The broker's fallback survives the killall (its argv[0] starts with '@'); stop it by the pid it
-# recorded, so it cannot fire over this hook's own tries.
+# recorded, first, before any wait here, so it can never cut power while this hook runs: the cycle
+# fires only from this hook, after the OS is down.
 if [ -r "$FALLBACK_PID" ]; then
     IFS= read -r fpid <"$FALLBACK_PID" || fpid=
     case "$fpid" in
     '' | *[!0-9]*) ;;
     *)
         case "$(head -c 31 "/proc/$fpid/cmdline" 2>/dev/null)" in
-        @tt-device-mcp-power-cycle-*) kill -9 "$fpid" 2>/dev/null && say "stopped the fallback (pid $fpid)" ;;
+        @tt-device-mcp-power-cycle-*)
+            stop_fallback "$fpid"
+            say "stopped the fallback (pid $fpid) and its children"
+            ;;
         esac
         ;;
     esac
 fi
+
+say "power-cycling the host now: $reason"
+# The filesystems are read-only by now; never block on a flush that cannot finish.
+sync &
+# Hooks run in parallel: let the RAID arrays finish marking themselves clean before power goes.
+command -v mdadm >/dev/null 2>&1 && timeout 10 mdadm --wait-clean --scan >/dev/null 2>&1
 try=1
 while [ "$try" -le 3 ]; do
     if timeout "$try_timeout" "$@"; then
