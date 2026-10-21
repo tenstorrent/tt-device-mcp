@@ -290,8 +290,9 @@ class JobSubmitInput(BaseModel):
             "that time. If a job is still waiting when it runs out, the broker kills the job's whole "
             f"process tree (SIGTERM, then SIGKILL {PREEMPT_KILL_GRACE_SEC}s later at the latest). If "
             "every process exits through its own code on "
-            "SIGTERM the usual fast check follows; otherwise the device is reset and fully checked "
-            "before the waiting job starts. If "
+            "SIGTERM the usual fast check follows; otherwise the device is marked dirty and the full "
+            "check, fabric included, must pass before the waiting job starts (a failing check holds "
+            "the device and goes on to the reset ladder). If "
             "every waiting job leaves first, nothing happens and a later one starts a fresh "
             f"{PREEMPT_GRACE_SEC}s. The job ends 'preempted'. Its status reads 'PREEMPTABLE <x>min' "
             "while it runs and 'PREEMPTING <s>s' (seconds left) during that time. Anyone using "
@@ -2173,8 +2174,9 @@ def _is_wedge_risk_exit(status: "JobStatus", exit_code: Optional[int], *, preemp
     # A preempted job did not end itself inside its grace minute: the broker signalled its whole
     # tree. Only when the kernel saw every process of it exit through its own code on SIGTERM
     # (preempt_clean, see exit_witness) is that a normal end; a SIGKILL, any signal death or an
-    # exit nobody witnessed is a mid-flight kill, so the device is reset and fully checked before
-    # the waiting job gets it. A job that ends itself in time is not PREEMPTED.
+    # exit nobody witnessed is a mid-flight kill: wedge-risk, so the device is marked dirty and the
+    # full check, fabric included, must pass before the waiting job gets it (a failing check goes
+    # on to the reset ladder; a passing one releases with no reset). A job that ends itself in time is not PREEMPTED.
     if status == JobStatus.PREEMPTED:
         return not preempt_clean
     if status == JobStatus.FAILED and isinstance(exit_code, int):
@@ -4571,7 +4573,8 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
     Returns True only when ``witness`` is set and the kernel's exit records show every process
     of the tree exited through its own code on SIGTERM (no SIGKILL needed, no signal death):
     the job ended cleanly and only the fast post-job check is owed. Any other end, or any doubt,
-    returns False: the device is reset and fully checked (a wedge-risk exit)."""
+    returns False: a wedge-risk exit, so the device is marked dirty and must pass the full check,
+    fabric included, before the next job (a failing check goes on to the reset ladder)."""
     scope = job_scope_unit(job_id)
     scoped = await asyncio.to_thread(_scope_active, scope)
 
@@ -4595,8 +4598,15 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
                 pass
         return not (scoped and await asyncio.to_thread(_scope_active, scope))
 
-    # Subscribed before the SIGTERM, so no exit of the tree can go unseen.
-    seen = await asyncio.to_thread(ExitWitness, pid, scope if scoped else None) if witness else None
+    # Subscribed before the SIGTERM, so no exit of the tree can go unseen. A witness that cannot
+    # be built for any reason leaves the kill unwitnessed: it still runs, and counts as killed.
+    seen = None
+    if witness:
+        try:
+            seen = await asyncio.to_thread(ExitWitness, pid, scope if scoped else None)
+        except Exception as e:  # noqa: BLE001 - the kill must run whatever the witness does
+            if logger:
+                logger.warning(f"PREEMPT job_id={job_id} exit witness unavailable ({e!r}); killing unwitnessed")
     try:
         await _send(signal.SIGTERM)
         loop = asyncio.get_event_loop()
@@ -6092,8 +6102,9 @@ async def job_runner():
                 # inside that minute, so the job can see the waiter and end itself. When the
                 # minute runs out the whole tree is killed (_preempt_kill, bounded) and the job ends
                 # PREEMPTED. If every process exited through its own code on SIGTERM the normal
-                # fast post-job gate follows; otherwise (a wedge-risk exit) the device is reset and
-                # passes the full post-job gate, fabric included, before the waiting job starts.
+                # fast post-job gate follows; otherwise (a wedge-risk exit) the device is marked dirty
+                # and must pass the full post-job gate, fabric included, before the waiting job
+                # starts; a failing gate holds it and goes on to the reset ladder.
                 announced = False
                 contended = False
                 while True:

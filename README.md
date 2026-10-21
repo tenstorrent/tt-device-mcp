@@ -76,8 +76,10 @@ kills the job's whole process tree (SIGTERM, then SIGKILL at most 10 s later). T
 ends `preempted`. If every process of the job exits through its own code on SIGTERM
 (the broker reads this from the kernel's exit records, which needs root), the usual fast
 between-jobs check runs. Otherwise (SIGKILL needed, any process killed by a signal, or
-the exits could not be witnessed) the device is reset and passes the full health check,
-fabric included, before the waiting job starts. If every waiting job leaves before the minute
+the exits could not be witnessed) the device is marked dirty: the full health check,
+fabric included, must pass before the waiting job starts. A passing check releases the
+device with no reset; a failing one keeps it held and goes on to the reset ladder and the
+bounded recovery. If every waiting job leaves before the minute
 ends, nothing happens; a later one starts a fresh minute. A job that queues before x
 waits until x, then the minute starts.
 

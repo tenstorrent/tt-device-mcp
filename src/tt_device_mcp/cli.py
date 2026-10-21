@@ -1667,7 +1667,8 @@ _NO_TIMEOUT_HELP = (
     f"is never stopped for time. Once the limit has passed and a job is waiting, it has "
     f"{PREEMPT_GRACE_SEC}s to end itself (no signal is sent), then it gets SIGTERM and, "
     f"{PREEMPT_KILL_GRACE_SEC}s later, SIGKILL. Ending cleanly on SIGTERM gets the fast check; a "
-    f"SIGKILL means a device reset and the full check before the next job. Status shows "
+    f"SIGKILL means the full check, fabric included, must pass before the next job (a failing "
+    f"one holds the device for recovery). Status shows "
     f"PREEMPTABLE <x>min, then PREEMPTING <s>s. You MUST watch the broker (tt-device-mcp status)."
 )
 

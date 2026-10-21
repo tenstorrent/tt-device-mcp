@@ -8,8 +8,9 @@ unbroken, so the job can see the waiter and end itself; a waiter that leaves ins
 causes nothing. When the minute runs out the job's whole process tree is killed (SIGTERM, then
 SIGKILL PREEMPT_KILL_GRACE_SEC later at the latest) and the job ends PREEMPTED. If the kernel's
 exit records show every process exited through its own code on SIGTERM, only the fast post-job
-check runs; otherwise (SIGKILL, a signal death, no witness) it is a wedge-risk exit and the device
-is reset and fully checked, fabric included, before the waiting job is dispatched. Every clock is
+check runs; otherwise (SIGKILL, a signal death, no witness) it is a wedge-risk exit: the device is
+marked dirty and the full check, fabric included, must pass before the waiting job is dispatched (a
+pass releases it with no reset; a failure holds it for the reset ladder). Every clock is
 time.monotonic(). Spec 01 I16.
 """
 
@@ -28,7 +29,13 @@ import tt_device_mcp.server as srv
 from tests.conftest import fsm_healthy, patch_recovery
 from tt_device_mcp.cli import overview_lines
 from tt_device_mcp.device_holders import HolderScan
-from tt_device_mcp.exit_witness import PROC_EVENT_EXIT, PROC_EVENT_FORK, ExitWitness, parse_events
+from tt_device_mcp.exit_witness import (
+    PROC_CN_MCAST_IGNORE,
+    PROC_EVENT_EXIT,
+    PROC_EVENT_FORK,
+    ExitWitness,
+    parse_events,
+)
 from tt_device_mcp.fsm import ServerState
 
 
@@ -256,7 +263,7 @@ async def test_no_signal_before_the_minute_then_the_whole_tree_is_killed(monkeyp
     assert job.exit_code in (-9, 137), job.exit_code
     assert _gone(int(child.read_text())), "the job's background child survived the preemption"
     assert "PREEMPTED" in job.error
-    assert dirty, "a preempted job must be flagged for the reset + full check"
+    assert dirty, "a preempted job must be flagged for the full check"
     assert gate == [{"job_failed": True}], "a preempted job must reach the full (fabric) post-job gate"
 
 
@@ -507,7 +514,7 @@ def test_an_ordinary_job_row_has_no_preempt_label(clear_job_state):
 @pytest.mark.parametrize("exit_code", [0, 1, -2, 130, -9, 137, -15, 143, None])
 def test_preempted_wedge_risk(exit_code):
     """A preempted job not proven to have ended cleanly: whatever its exit status the device gets
-    the reset + full check, fabric included, before the waiting job. Proven clean, it does not."""
+    the full check, fabric included, before the waiting job. Proven clean, it does not."""
     assert srv._is_wedge_risk_exit(srv.JobStatus.PREEMPTED, exit_code) is True
     assert srv._is_wedge_risk_exit(srv.JobStatus.PREEMPTED, exit_code, preempt_clean=True) is False
 
@@ -567,33 +574,33 @@ async def _preempt(monkeypatch, job_id, command, *, kill_grace):
 async def test_a_preempted_job_that_ends_cleanly_on_sigterm_takes_the_fast_check(monkeypatch, clear_job_state):
     """Case (b): SIGTERM was sent and the kernel saw every process of the tree exit through its own
     code inside the 10 s grace. The job is still PREEMPTED (it did not end itself), but nothing
-    was cut mid-transaction: no SIGKILL, no reset, only the fast post-job check."""
+    was cut mid-transaction: no SIGKILL, not dirty, only the fast post-job check."""
     made = _witness(monkeypatch, clean=True)
     job, sent, gate, dirty = await _preempt(monkeypatch, "961", "sleep 60", kill_grace=5)
     assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
     assert job.preempt_clean is True
     assert made and made[0].closed, "the witness must be closed"
-    assert dirty == [], "a clean end on SIGTERM must not owe a reset"
+    assert dirty == [], "a clean end on SIGTERM must not owe the full check"
     assert gate == [{"job_failed": False}], "a clean end on SIGTERM takes the fast check"
     assert "ended cleanly on SIGTERM" in job.error
 
 
 @pytest.mark.asyncio
-async def test_a_preempted_job_with_a_signal_death_is_reset_and_fully_checked(monkeypatch, clear_job_state):
+async def test_a_preempted_job_with_a_signal_death_is_fully_checked(monkeypatch, clear_job_state):
     """Case (c): the tree was gone inside the 10 s grace, but a process of it died from the signal
-    (the kernel's exit record says so): reset + full check, fabric included."""
+    (the kernel's exit record says so): dirty, so the full check, fabric included."""
     _witness(monkeypatch, clean=False, why="pid 4242 of the job died from a signal")
     job, sent, gate, dirty = await _preempt(monkeypatch, "962", "sleep 60", kill_grace=5)
     assert signal.SIGKILL not in sent, sent
     assert job.preempt_clean is False
-    assert dirty, "a signal death must owe the reset + full check"
+    assert dirty, "a signal death must owe the full check"
     assert gate == [{"job_failed": True}]
 
 
 @pytest.mark.asyncio
-async def test_a_preempted_job_that_needed_sigkill_is_reset_and_fully_checked(monkeypatch, clear_job_state):
+async def test_a_preempted_job_that_needed_sigkill_is_fully_checked(monkeypatch, clear_job_state):
     """Case (c): the tree outlived SIGTERM, so SIGKILL was sent. Whatever the witness would say,
-    that is a kill: reset + full check."""
+    that is a kill: dirty, so the full check."""
     _witness(monkeypatch, clean=True)
     job, sent, gate, dirty = await _preempt(monkeypatch, "963", "trap '' INT TERM; sleep 60", kill_grace=1)
     assert signal.SIGKILL in sent, sent
@@ -603,9 +610,9 @@ async def test_a_preempted_job_that_needed_sigkill_is_reset_and_fully_checked(mo
 
 
 @pytest.mark.asyncio
-async def test_an_unwitnessed_preemption_is_reset_and_fully_checked(monkeypatch, clear_job_state):
+async def test_an_unwitnessed_preemption_is_fully_checked(monkeypatch, clear_job_state):
     """Case (c): the exit could not be observed (no connector permission, lost events, unreadable
-    tree). In doubt, the job counts as killed: reset + full check."""
+    tree). In doubt, the job counts as killed: dirty, so the full check."""
     _witness(monkeypatch, clean=True, ok=False, why="cannot subscribe to process events")
     job, sent, gate, dirty = await _preempt(monkeypatch, "964", "sleep 60", kill_grace=5)
     assert signal.SIGKILL not in sent, sent
@@ -650,17 +657,26 @@ async def test_a_failed_fast_check_after_a_clean_end_keeps_the_hold_and_escalate
 @pytest.mark.asyncio
 async def test_a_killed_preemption_releases_only_on_a_passing_full_check(monkeypatch, tmp_path, fabric_ok):
     """Case (c), the gate side: a killed preemption leaves the device dirty. The post-job gate then
-    runs the full check, fabric included, and releases the device only when it passes. A fabric
-    pass that fails (here: fewer links than expected) keeps the device held for the bounded
-    recovery; nothing is handed to the waiting job."""
-    (tmp_path / "0").write_text("")
+    runs the full check, fabric included. A pass releases the device with no reset (the same RELEASE
+    as after any wedge-risk exit). A fabric pass that fails (here: fewer links than expected) keeps
+    the device held, nothing is handed to the waiting job, and the hold goes on to the reset ladder
+    (the hold-deadline escalation climbs it)."""
+    # A present 32-chip Galaxy mesh (every chip on the bus), so a failing fabric pass reaches the
+    # gate's reset ladder rather than an off-bus hold.
+    for i in range(32):
+        (tmp_path / str(i)).write_text("")
     monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: present)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})
+    monkeypatch.setattr(srv, "dead_chips", lambda beats: [])
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     monkeypatch.setattr(srv, "isolated_chips", set())
     monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
     _free_device_lock(monkeypatch)
     fsm_healthy(srv)
-    seen = []
+    seen, resets = [], []
 
     async def verify(expected, log, run_fabric=True, **_):
         seen.append(run_fabric)
@@ -668,6 +684,7 @@ async def test_a_killed_preemption_releases_only_on_a_passing_full_check(monkeyp
         return fabric_ok or not run_fabric, ({"fabric": {"ok": fabric_ok, "detail": detail}} if run_fabric else {})
 
     async def reset(indices, log):
+        resets.append(indices)
         return True
 
     patch_recovery(monkeypatch, "_verify_device", verify)
@@ -678,9 +695,20 @@ async def test_a_killed_preemption_releases_only_on_a_passing_full_check(monkeyp
     assert seen and seen[0] is True, f"the full check (fabric included) did not run: {seen}"
     if fabric_ok:
         assert srv.fsm.state is ServerState.HEALTHY, srv.fsm.state
+        assert resets == [], "a killed preemption whose full check passed must release with no reset"
     else:
-        assert srv.fsm.state is not ServerState.HEALTHY, "a failed full check released the device"
+        assert srv.fsm.state is ServerState.RECOVERING, "a failed full check released the device"
         assert srv._device_degraded_for_tenant(), "a failed full check let the waiting job through"
+        climbed = []
+
+        async def ladder(indices, expected, log, *, force=False):
+            climbed.append(force)
+
+        monkeypatch.setattr(srv.galaxy_recovery, "_escalate_stuck_hold", ladder)
+        monkeypatch.setattr(srv, "device_op_lock", None)  # bind a fresh lock to this test's loop
+        await srv._force_escalate_stuck_hold()
+        assert climbed == [True], "the held device must go on to the reset ladder"
+        assert srv.fsm.state is not ServerState.HEALTHY, "the escalation must not release the device"
 
 
 def _event(what, data):
@@ -737,6 +765,59 @@ def test_the_witness_reads_kernel_exit_records():
     assert unseen.clean() is False and "no exit record" in unseen.why
     lost = _fed({10}, _exit(10, 0), error=errno.ENOBUFS)
     assert lost.clean() is False and "lost" in lost.why
+
+
+def test_closing_the_witness_unsubscribes_first():
+    """close() sends PROC_CN_MCAST_IGNORE before it closes the socket: the kernel counts listeners
+    and only IGNORE lowers the count, so a bare close would leave it raised after every preemption.
+    A failing send still closes the socket."""
+    for send_error in (None, OSError(errno.ECONNREFUSED, "refused")):
+        calls = []
+
+        class _Ctl:
+            def send(self, data):
+                calls.append(("send", struct.unpack_from("=I", data, len(data) - 4)[0]))
+                if send_error:
+                    raise send_error
+
+            def close(self):
+                calls.append(("close",))
+
+        w = _fed({10})
+        w._sock = _Ctl()
+        w.close()
+        w.close()  # idempotent
+        assert calls == [("send", PROC_CN_MCAST_IGNORE), ("close",)], calls
+        assert w._sock is None
+
+
+def test_a_witness_that_breaks_while_draining_is_void():
+    """Any failure reading events, not only an OSError, voids the witness: not proven clean."""
+
+    class _Broken(_Sock):
+        def recv(self, n):
+            raise ValueError("bad message")
+
+    w = _fed({10})
+    w._sock = _Broken()
+    assert w.clean() is False and "failed" in w.why
+
+
+@pytest.mark.asyncio
+async def test_a_witness_that_cannot_be_built_still_kills_and_counts_as_killed(monkeypatch, clear_job_state):
+    """An unexpected error building the ExitWitness (not an OSError it handles itself) must not skip
+    the kill: SIGTERM is still sent, the job ends PREEMPTED, and with no witness the exit counts as
+    killed, so the device is marked dirty and owes the full check."""
+
+    def _boom(pgid, scope):
+        raise RuntimeError("witness exploded")
+
+    monkeypatch.setattr(srv, "ExitWitness", _boom)
+    job, sent, gate, dirty = await _preempt(monkeypatch, "966", "sleep 60", kill_grace=5)
+    assert sent and sent[0] is signal.SIGTERM, sent
+    assert job.preempt_clean is False
+    assert dirty, "an unwitnessed kill must owe the full check"
+    assert gate == [{"job_failed": True}]
 
 
 def test_the_witness_on_a_real_tree():
@@ -913,7 +994,7 @@ async def test_a_readopted_job_whose_waiter_leaves_inside_the_minute_is_left_alo
 async def test_a_preempted_readopted_job_never_releases_the_device_clean(monkeypatch, tmp_path, clear_job_state, rc):
     """A re-adopted job has no post-job gate: the runner that would have proved the fabric died with
     the old broker. Whatever its exit status (a job may trap the signal and exit 130 / -2), the
-    device must be flagged for the reset + full check (fabric included) before the queue
+    device must be flagged for the full check (fabric included) before the queue
     moves on, whatever the exit status."""
     monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
     monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
@@ -1064,7 +1145,7 @@ async def test_a_waiter_after_the_limit_shows_the_countdown_then_sigkills_at_the
     secs = [int(lbl.split()[1][:-1]) for lbl in counting]
     assert secs == sorted(secs, reverse=True) and secs[-1] <= 1, f"countdown did not count down: {labels}"
     assert "PREEMPTING 0s" in labels, f"the kill's SIGTERM window did not show PREEMPTING 0s: {labels}"
-    assert dirty, "a SIGKILLed job never released the device; it must be flagged for reset"
+    assert dirty, "a SIGKILLed job never released the device; it must be flagged for the full check"
     assert gate == [{"job_failed": True}]
 
 

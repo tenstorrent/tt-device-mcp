@@ -5,7 +5,8 @@
 
 A preempted job that ends cleanly on SIGTERM (every process exits through its own code) needs
 only the fast between-jobs check; one where any process died from a signal may have left an eth
-core or the fabric mid-transaction and needs the reset + full check. The broker cannot tell these
+core or the fabric mid-transaction, so the device is marked dirty and needs the full check,
+fabric included (a failing check goes on to the reset ladder). The broker cannot tell these
 apart from wait statuses: it waits only on its own child, the job's bash wrapper turns any SIGTERM
 into a plain `exit 143`, and grandchildren are reaped by their own parents. The kernel's process
 events connector (netlink) reports every fork and exit on the host with the exit status in
@@ -26,6 +27,7 @@ NETLINK_CONNECTOR = 11
 CN_IDX_PROC = 1
 CN_VAL_PROC = 1
 PROC_CN_MCAST_LISTEN = 1
+PROC_CN_MCAST_IGNORE = 2
 NLMSG_DONE = 3
 PROC_EVENT_FORK = 0x00000001
 PROC_EVENT_EXIT = 0x80000000
@@ -89,6 +91,12 @@ def _tree(pgid: Optional[int], scope: Optional[str]) -> Optional[Set[int]]:
     return found
 
 
+def _send_op(sock: socket.socket, op: int) -> None:
+    """Send a PROC_CN_MCAST_* control message on the connector socket."""
+    body = _CN_MSG.pack(CN_IDX_PROC, CN_VAL_PROC, 0, 0, 4, 0) + struct.pack("=I", op)
+    sock.send(_NLMSGHDR.pack(_NLMSGHDR.size + len(body), NLMSG_DONE, 0, 0, 0) + body)
+
+
 class ExitWitness:
     """Subscribe, snapshot the tree, then call drain() while it dies and clean() once it is gone.
 
@@ -115,8 +123,7 @@ class ExitWitness:
                 except OSError:
                     pass
             sock.bind((0, CN_IDX_PROC))
-            body = _CN_MSG.pack(CN_IDX_PROC, CN_VAL_PROC, 0, 0, 4, 0) + struct.pack("=I", PROC_CN_MCAST_LISTEN)
-            sock.send(_NLMSGHDR.pack(_NLMSGHDR.size + len(body), NLMSG_DONE, 0, 0, 0) + body)
+            _send_op(sock, PROC_CN_MCAST_LISTEN)
             sock.setblocking(False)
         except OSError as e:
             sock.close()
@@ -132,7 +139,15 @@ class ExitWitness:
         self.ok = True
 
     def drain(self) -> None:
-        """Read every queued event. A lost event (buffer overflow) voids the witness."""
+        """Read every queued event. A lost event (buffer overflow) or any other failure voids
+        the witness, so the caller treats the job as killed."""
+        try:
+            self._drain()
+        except Exception as e:  # noqa: BLE001 - a broken witness must not stop the kill
+            self.ok = False
+            self.why = f"process events failed ({e!r})"
+
+    def _drain(self) -> None:
         while self.ok and self._sock is not None:
             try:
                 buf = self._sock.recv(65536)
@@ -170,6 +185,12 @@ class ExitWitness:
         return True
 
     def close(self) -> None:
+        """Unsubscribe, then close. The kernel counts listeners and only IGNORE lowers the
+        count; closing the socket alone leaves the host's connector reporting to nobody."""
         if self._sock is not None:
+            try:
+                _send_op(self._sock, PROC_CN_MCAST_IGNORE)
+            except OSError:
+                pass
             self._sock.close()
             self._sock = None
