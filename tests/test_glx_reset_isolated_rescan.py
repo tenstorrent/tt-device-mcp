@@ -102,6 +102,17 @@ def _real_reset_path(monkeypatch, hw, clock, *, chunks=None):
     monkeypatch.setattr(base.CEILING, "apply", no_ceiling)
 
 
+@pytest.fixture
+def instant_reader_scan(monkeypatch):
+    """The pre-reset holder scan (spec 04 I92, its own tests) found no reader, without its executor
+    hop: the cancel tests below count event-loop ticks to the driver-wait rescan."""
+
+    async def no_readers(argv, owner, log):
+        return ""
+
+    monkeypatch.setattr(srv.recovery_mechanism, "pre_reset_scan", no_readers)
+
+
 def _hw():
     return {"off": {"31"}, "repowered": False, "in_reset": False, "resets": [], "rescans": []}
 
@@ -223,7 +234,9 @@ async def test_a_failed_driver_wait_rescan_is_journaled_and_the_reset_runs_on(mo
 
 
 @pytest.mark.asyncio
-async def test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan(monkeypatch, clear_job_state):
+async def test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan(
+    monkeypatch, clear_job_state, instant_reader_scan
+):
     """An abandoned reset leaves no orphaned rescan task behind."""
     srv.isolated_chips = {"31"}
     monkeypatch.setattr(base, "health_event", lambda *a, **k: None)
@@ -262,7 +275,7 @@ async def test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan(monkeypatc
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rc", [0, 1])
 async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_reset_cleanup(
-    monkeypatch, clear_job_state, rc
+    monkeypatch, clear_job_state, instant_reader_scan, rc
 ):
     """tt-smi has exited but the driver-wait sysfs write is still running when the caller is cancelled
     (an operator's reset call dropped). The cancel still reaches the caller, but only after the cleanup
@@ -323,7 +336,9 @@ async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_res
 
 
 @pytest.mark.asyncio
-async def test_output_after_a_cancelled_reset_starts_no_driver_wait_rescan(monkeypatch, clear_job_state):
+async def test_output_after_a_cancelled_reset_starts_no_driver_wait_rescan(
+    monkeypatch, clear_job_state, instant_reader_scan
+):
     """After a mid-reset cancel the backend's shielded output reader keeps feeding the callback. A driver
     wait marker that arrives then starts no rescan (it would be nobody's to cancel); the caller's own
     callback still sees the output."""
