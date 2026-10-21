@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """The one capped repeat of a failed Galaxy mesh reset in a hold episode (spec 04 I93).
 
 A first ``tt-smi -glx_reset`` that exits non-zero or fails the full check on a mesh with every chip on

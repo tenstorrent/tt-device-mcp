@@ -55,7 +55,7 @@ async def test_a_timeout_resets_then_runs_the_full_check_before_release(killed):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_post_kill_check_stays_held_and_climbs(killed, armed_power_cycle):
+async def test_a_failed_post_kill_check_stays_held_and_climbs(killed, armed_power_cycle, no_mesh_repeat_room):
     killed["reset_heals"] = False
     srv.recovery_mechanism.last_reset_failed = True  # a prior cycle failed: the host rung is due
     await _gate()
