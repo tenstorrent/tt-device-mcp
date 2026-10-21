@@ -83,18 +83,35 @@ cooldown (spec 04 I65) holds longer.
   A third verdict: no function's link reads as down (`hostpci.link_down`: `current_link_speed`
   `Unknown`, or `current_link_width` 63, the six-bit field all ones). A dead link reads all-ones
   from config space while the kernel still lists the node with its driver bound, so it looks
-  present to every other sysfs read. A degraded but live link (a lower speed or width) is still
-  evidence only, and an attribute that cannot be read is no evidence of anything. The same read
+  present to every other sysfs read. An attribute that cannot be read is no evidence of anything. The same read
   keeps such a node out of spec 04's class A presence read (I37) and out of the I25 latch's
   all-back count, so a chip whose link is down never counts as back on the bus.
+
+  A fourth verdict: no live link trained below the link it should have (`hostpci._judge_link`).
+  Expected is the lower of the two ends' caps, `max_link_width`/`max_link_speed` of the endpoint
+  and of its upstream port (the node `..` resolves to). The endpoint's cap alone is wrong: on a
+  Galaxy most chips are x8 endpoints behind x1 root ports and train x1 by design. A link narrower
+  or slower than expected is UNHEALTHY, and so is one below the best that same link showed on an
+  earlier passing check, banked per BDF in `pcie_link_baseline.json` (a high-water mark, like
+  the chip baseline). A mark belongs to the link it was taken on (upstream port and both caps):
+  when those differ it is replaced, not judged, so re-enumerated chips never inherit another
+  link's mark. A failing check banks nothing; an unreadable bank is an empty one (the caps still
+  judge) and is rewritten by the next pass. Speed is judged only for device ids in
+  `SPEED_JUDGED_DEVICE_IDS` (Blackhole): ASPM changes a link's power state, not its trained
+  speed, but a device may retrain slower on its own while idle, which is not a fault. Blackhole
+  links read their capped speed on every recorded pass, idle or not; any other device is judged
+  on width only and its speed kept as evidence. A link that reads down is reported down, not
+  degraded. A degraded link takes the usual host-pci path: held, never released while it fails,
+  and the bounded recovery of 04 (ladder, then power cycle) retrains it. The extra reads are
+  two sysfs files per upstream port and one small file: about 2 ms per pass on 32 chips.
 
   The BAR rule is `flags != 0 && start == 0`. `flags` non-zero is what says the BAR exists — an
   unimplemented BAR reads all zeros across start, end and flags, and a 64-bit BAR leaves its
   second slot that way too — so a start of zero only means "unplaced" when there was something to
   place. Judging on the address alone reports every healthy device as broken and holds it.
 
-  Everything else the probe reads is evidence and never alerts: IOMMU grouping and mode, a live
-  link's speed and width, and AER totals on the endpoints **and their upstream bridges**. A correctable
+  Everything else the probe reads is evidence and never alerts: IOMMU grouping and mode, the speed
+  of a device whose speed is not judged, and AER totals on the endpoints **and their upstream bridges**. A correctable
   count is a trend, not a state — non-zero is ordinary on a healthy link — but the bridge half of
   the documented wedge-to-host-reboot path was not being recorded at all. `Verdict` has no third
   state by design (`health/core.py`), so a fact that must not alert belongs in `evidence`, never
@@ -1735,7 +1752,11 @@ refuses.
 | I9 | `tests/test_monitor.py::test_update_short_circuits_on_an_unhealthy_snapshot`, `tests/test_monitor.py::test_update_never_runs_the_fabric_pass_after_a_frozen_eth_core`, `tests/test_monitor.py::test_update_still_runs_the_fabric_pass_when_eth_is_skipped`, `tests/test_device_safety.py::test_a_frozen_eth_core_skips_the_traffic_probe` |
 | I9 host PCI leads the pass, and skips where the bus shows no chip | `tests/test_monitor.py::test_update_logs_and_sets_device_op_detail_per_probe`, `tests/test_hostpci.py::test_a_bus_with_no_tenstorrent_function_has_no_opinion` |
 | I9 host PCI: unbound driver and unassigned BAR are both UNHEALTHY, reported together | `tests/test_hostpci.py::test_a_chip_bound_to_another_driver_is_unhealthy`, `::test_a_chip_with_no_driver_at_all_is_named`, `::test_an_implemented_but_unplaced_bar_is_unhealthy`, `::test_both_faults_are_reported_together` |
-| I9 host PCI: a link that reads down (speed Unknown or width 63) is UNHEALTHY; a degraded live link or an unreadable attribute is not | `tests/test_hostpci.py::test_a_link_that_reads_down_fails_the_verdict` |
+| I9 host PCI: a link that reads down (speed Unknown or width 63) is UNHEALTHY; an unreadable attribute is not | `tests/test_hostpci.py::test_a_link_that_reads_down_fails_the_verdict`, `::test_a_down_link_is_reported_down_not_degraded`, `::test_a_link_with_no_readable_reading_or_cap_is_no_evidence` |
+| I9 host PCI: a live link below the lower of both ends' caps is UNHEALTHY; x1 by design is not | `tests/test_hostpci.py::test_a_link_x1_by_design_is_healthy`, `::test_a_link_below_the_lower_cap_fails_the_verdict`, `::test_an_unreadable_port_cap_leaves_the_endpoint_cap` |
+| I9 host PCI: speed judged only for listed device ids, width always | `tests/test_hostpci.py::test_speed_is_judged_only_where_it_cannot_drop_on_its_own`, `::test_width_is_judged_on_a_device_whose_speed_is_not` |
+| I9 host PCI link bank: banked on a pass, ratchets up, keyed to its link, unreadable is empty | `tests/test_hostpci.py::test_a_passing_check_banks_each_link_and_a_later_drop_below_it_fails`, `::test_the_bank_only_ratchets_up`, `::test_a_mark_taken_on_another_link_is_replaced_not_judged`, `::test_an_unreadable_bank_is_no_evidence_and_is_rewritten`, `::test_the_bank_is_not_rewritten_when_nothing_changed` |
+| I9 host PCI: a degraded link holds and never releases | `tests/test_eth_timeout_reset.py::test_a_degraded_pcie_link_holds_and_never_releases` |
 | I9 host PCI BAR rule: an unimplemented BAR is not an unplaced one | `tests/test_hostpci.py::test_an_unimplemented_bar_is_not_an_unplaced_one`, `::test_an_unreadable_resource_file_is_not_a_fault`, `::test_malformed_resource_lines_do_not_raise` |
 | I9 host PCI evidence never alerts (AER, bridge AER, IOMMU) | `tests/test_hostpci.py::test_aer_counters_are_evidence_and_never_a_verdict`, `::test_upstream_bridge_aer_is_recorded`, `::test_the_iommu_mode_is_recorded_but_never_alerts` |
 | I9 host PCI opens no device | `tests/test_hostpci.py::test_the_probe_opens_no_device` |

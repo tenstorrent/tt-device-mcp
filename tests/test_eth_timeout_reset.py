@@ -288,6 +288,17 @@ async def test_host_pci_not_ok_keeps_todays_fabric_pass(mesh):
 
 
 @pytest.mark.asyncio
+async def test_a_degraded_pcie_link_holds_and_never_releases(mesh):
+    """Spec 03 I9: a link trained below its expected width fails host-pci like any other host-pci
+    fault. The gate holds and recovers; the device is never released while the check fails."""
+    mesh["eth"] = ADVANCING
+    mesh["hostpci"] = (False, "PCIe link degraded on 1/32: 0000:01:00.0 x1 (expected x8)")
+    await _gate()
+    assert srv.fsm.state is not ServerState.HEALTHY, "a failed host-pci check never releases"
+    assert "PCIe link degraded" in mesh["log"].text()
+
+
+@pytest.mark.asyncio
 async def test_an_outage_hold_refuses_the_reset_and_keeps_todays_pass(mesh, monkeypatch):
     for var, value in OUTAGE_HOLD.items():
         monkeypatch.setenv(var, value)
