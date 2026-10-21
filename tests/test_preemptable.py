@@ -627,6 +627,7 @@ async def test_a_preempted_exit_0_on_a_held_or_owing_device_keeps_its_gate(monke
         def hold():
             srv.fsm.on_fault("probe_unhealthy", detail="fault while the job ran")
             assert srv.fsm.state is not ServerState.HEALTHY
+
     else:
         monkeypatch.setattr(srv, "_kill_reset_debt", lambda: "job 1 timeout")
     _witness(monkeypatch, clean=True, status=0)
