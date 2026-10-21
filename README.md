@@ -75,7 +75,7 @@ signal in that minute. The minute starts at the later of x and the waiting job's
 arrival. If a job is still waiting when the minute runs out, the broker kills the
 job's whole process tree (SIGTERM, then SIGKILL at most 10 s later). The job ends
 `preempted`. If every process of the job exits through its own code on SIGTERM
-(the broker reads this from the kernel's exit records, which needs root), the usual
+(the broker reads this from the kernel's exit records, which may need root), the usual
 fast between-jobs check runs. Otherwise (SIGKILL needed, any process killed by a
 signal, or the exits could not be witnessed) the device is reset and passes the full
 health check, fabric included, before the waiting job starts. If every waiting job

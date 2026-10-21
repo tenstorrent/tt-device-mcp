@@ -345,7 +345,8 @@ class JobSubmitInput(BaseModel):
             "limit has passed and another job is waiting, the job has "
             f"{PREEMPT_GRACE_SEC}s to see the waiter and end itself; the broker sends no signal in "
             "that time. If a job is still waiting when it runs out, the broker kills the job's whole "
-            "process tree (SIGTERM, then SIGKILL). If every process exits through its own code on "
+            f"process tree (SIGTERM, then SIGKILL {PREEMPT_KILL_GRACE_SEC}s later at the latest). If "
+            "every process exits through its own code on "
             "SIGTERM the usual fast check follows; otherwise the device is reset and fully checked "
             "before the waiting job starts. If "
             "every waiting job leaves first, nothing happens and a later one starts a fresh "
@@ -9149,20 +9150,58 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
     stopped = " and ".join(([f"unit {scope}"] if scoped else []) + ([f"pgid {pid}"] if pid else []))
     stopped = f"stopped {stopped}" if stopped else "stopped nothing (no live scope or pid)"
     reason = f"preempted (a job waited {PREEMPT_GRACE_SEC}s past its time limit)"
-    # Subscribed before the SIGTERM, so no exit of the tree can go unseen.
-    seen = await asyncio.to_thread(ExitWitness, pid, scope if scoped else None) if witness else None
+    # Subscribed before the SIGTERM, so no exit of the tree can go unseen. The witness only ever
+    # lifts the reset debt: any error in it voids the verdict (not clean, debt kept) and never
+    # stops the kill.
+    seen = None
+    witness_error = ""
+    if witness:
+        try:
+            seen = await asyncio.to_thread(ExitWitness, pid, scope if scoped else None)
+        except Exception as e:
+            witness_error = f"witness failed ({e!r})"
+
+    def _drain() -> None:
+        nonlocal seen, witness_error
+        if seen is None:
+            return
+        try:
+            seen.drain()
+        except Exception as e:
+            witness_error = f"witness failed ({e!r})"
+            _close_witness()
+
+    def _close_witness() -> None:
+        nonlocal seen
+        if seen is not None:
+            try:
+                seen.close()
+            except Exception:
+                pass
+            seen = None
+
+    def _verdict() -> bool:
+        nonlocal witness_error
+        if seen is None:
+            return False
+        try:
+            return seen.clean() is True
+        except Exception as e:
+            witness_error = f"witness failed ({e!r})"
+            return False
+
     try:
         await _send(signal.SIGTERM)
         deadline = time.monotonic() + PREEMPT_KILL_GRACE_SEC
         while time.monotonic() < deadline:
-            if seen is not None:
-                seen.drain()
+            _drain()
             if await _gone():
-                clean = seen is not None and seen.clean()
-                if logger and seen is not None:
+                clean = _verdict()
+                if logger and witness:
+                    why = witness_error or (getattr(seen, "why", "") if seen is not None else "")
                     logger.info(
                         f"PREEMPT job_id={job_id} ended on SIGTERM: "
-                        + ("every process exited by its own code" if clean else f"not clean: {seen.why}")
+                        + ("every process exited by its own code" if clean else f"not clean: {why}")
                     )
                 if clean:
                     preempt_forced_job_ids.discard(job_id)
@@ -9175,8 +9214,7 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
         _log_job_tree_killed(job_id, reason, f"{stopped}; ladder ended at SIGKILL (preempt kill)")
         return False
     finally:
-        if seen is not None:
-            seen.close()
+        _close_witness()
 
 
 # How often a silent job is noted in its own log. This is the only hang signal that does not

@@ -11,9 +11,9 @@ into a plain `exit 143`, and grandchildren are reaped by their own parents. The 
 events connector (netlink) reports every fork and exit on the host with the exit status in
 waitpid form, so it can.
 
-It needs CAP_NET_ADMIN (the root broker has it). When it cannot subscribe, misses events (receive
-buffer overflow), or the tree cannot be read, the verdict is "not proven clean", which the
-caller treats as a killed job.
+It may need CAP_NET_ADMIN, depending on the kernel (the root broker has it). When it cannot
+subscribe, misses events (receive buffer overflow), or the tree cannot be read, the verdict is
+"not proven clean", which the caller treats as a killed job.
 """
 
 import errno
@@ -26,6 +26,7 @@ NETLINK_CONNECTOR = 11
 CN_IDX_PROC = 1
 CN_VAL_PROC = 1
 PROC_CN_MCAST_LISTEN = 1
+PROC_CN_MCAST_IGNORE = 2
 NLMSG_DONE = 3
 PROC_EVENT_FORK = 0x00000001
 PROC_EVENT_EXIT = 0x80000000
@@ -38,6 +39,12 @@ _EXIT = struct.Struct("=iiII")  # process_pid, process_tgid, exit_code, exit_sig
 _EVENT_AT = _NLMSGHDR.size + _CN_MSG.size
 
 _RCVBUF = 8 << 20
+
+
+def _mcast_op(op: int) -> bytes:
+    """The netlink message that subscribes to (LISTEN) or leaves (IGNORE) the process events."""
+    body = _CN_MSG.pack(CN_IDX_PROC, CN_VAL_PROC, 0, 0, 4, 0) + struct.pack("=I", op)
+    return _NLMSGHDR.pack(_NLMSGHDR.size + len(body), NLMSG_DONE, 0, 0, 0) + body
 
 
 def parse_events(buf: bytes) -> Iterable[Tuple[str, Tuple[int, ...]]]:
@@ -115,8 +122,7 @@ class ExitWitness:
                 except OSError:
                     pass
             sock.bind((0, CN_IDX_PROC))
-            body = _CN_MSG.pack(CN_IDX_PROC, CN_VAL_PROC, 0, 0, 4, 0) + struct.pack("=I", PROC_CN_MCAST_LISTEN)
-            sock.send(_NLMSGHDR.pack(_NLMSGHDR.size + len(body), NLMSG_DONE, 0, 0, 0) + body)
+            sock.send(_mcast_op(PROC_CN_MCAST_LISTEN))
             sock.setblocking(False)
         except OSError as e:
             sock.close()
@@ -170,6 +176,11 @@ class ExitWitness:
         return True
 
     def close(self) -> None:
+        """Unsubscribe (the connector counts listeners host-wide), then close the socket."""
         if self._sock is not None:
+            try:
+                self._sock.send(_mcast_op(PROC_CN_MCAST_IGNORE))
+            except OSError:
+                pass
             self._sock.close()
             self._sock = None

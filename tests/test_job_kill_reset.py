@@ -622,8 +622,10 @@ async def test_a_preempt_kill_that_outlives_sigterm_logs_the_process_tree(monkey
 
 @pytest.mark.asyncio
 async def test_every_preemption_kill_owes_the_reset(monkeypatch, caplog, clear_job_state):
-    """Spec 03 I69: a job that had its minute and did not end itself was killed mid-run, so even a
-    tree that goes on the first SIGTERM owes the mesh one reset plus the full check."""
+    """Spec 03 I69: a job that had its minute and did not end itself was killed mid-run. Unless the
+    kernel witnessed every process exit by its own code (witness=True, spec 01 I20), even a tree
+    that goes on the first SIGTERM owes the mesh one reset plus the full check. Here nothing
+    witnesses it (the re-adopted path), and SIGTERM's default action is a signal death anyway."""
     log = logging.getLogger("tt-device-mcp-test-preempt-term")
     monkeypatch.setattr(srv, "logger", log)
     monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
@@ -702,6 +704,22 @@ async def test_a_preemption_debt_resets_then_runs_the_full_check_before_release(
     assert mesh["fabric"] == [1], "the full check after the reset ran the fabric pass"
     assert srv.fsm.state is ServerState.HEALTHY
     assert srv._kill_reset_debt() == ""
+
+
+@pytest.mark.asyncio
+async def test_a_preemption_debt_whose_full_check_fails_stays_held(mesh):  # noqa: F811
+    """A killed preemption whose full check after the reset fails (the fabric pass moves no
+    traffic) never releases the device to the waiting job: it stays held and goes on to the
+    bounded recovery."""
+    mesh["eth"] = ADVANCING
+    mesh["reset_heals"] = False
+    fsm_dirty(srv, "job 9 ended preempted (exit -9)")
+    srv._owe_kill_reset("job 9 preempted")
+    await _gate()
+    assert mesh["resets"][0] == ["tt-smi", "-glx_reset"], "the debt's reset ran first"
+    assert mesh["fabric"] and min(mesh["fabric"]) >= 1, "every fabric pass ran after the reset"
+    assert srv.fsm.state is ServerState.RECOVERING, "a failed post-kill full check never releases"
+    assert srv._device_unavailable_for_tenant(), "the waiting job must not get a mesh that failed its check"
 
 
 @pytest.mark.asyncio

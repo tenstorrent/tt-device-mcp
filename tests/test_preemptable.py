@@ -621,6 +621,60 @@ async def test_an_unwitnessed_preemption_is_reset_and_fully_checked(monkeypatch,
     assert gate == [{"job_failed": True}]
 
 
+class _Boom(RuntimeError):
+    pass
+
+
+def _broken_witness(monkeypatch, where):
+    """A witness that raises an unexpected error in ``where`` (init, drain or clean)."""
+    made = []
+
+    class _Witness:
+        def __init__(self, pgid, scope):
+            if where == "init":
+                raise _Boom("connector exploded")
+            self.ok, self.why, self.closed = True, "", False
+            made.append(self)
+
+        def drain(self):
+            if where == "drain":
+                raise _Boom("drain exploded")
+
+        def clean(self):
+            if where == "clean":
+                raise _Boom("clean exploded")
+            return True
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(srv, "ExitWitness", _Witness)
+    return made
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("where", ["init", "drain", "clean"])
+@pytest.mark.parametrize("ignores_term", [False, True])
+async def test_a_witness_error_keeps_the_reset_debt_and_the_kill_completes(
+    monkeypatch, clear_job_state, where, ignores_term
+):
+    """Case (c) by doubt: any unexpected error while witnessing (building it, draining it or
+    reading its verdict) makes the end not clean. The I69 debt stays (reset + full check, fabric
+    included, before the waiter) and the kill still runs to the end: SIGTERM, then SIGKILL for a
+    tree that outlives it."""
+    made = _broken_witness(monkeypatch, where)
+    command = "trap '' INT TERM; sleep 60" if ignores_term else "sleep 60"
+    job_id = f"97{['init', 'drain', 'clean'].index(where)}{int(ignores_term)}"
+    job, sent, gate, dirty, owed = await _preempt(monkeypatch, job_id, command, kill_grace=1)
+    assert sent and sent[0] is signal.SIGTERM, sent
+    assert (signal.SIGKILL in sent) is ignores_term, sent
+    assert job.preempt_clean is False
+    assert all(w.closed for w in made), "the witness must be closed"
+    assert dirty, "a witness error must keep the reset + full check"
+    assert owed == [f"job {job_id} preempted"], f"a witness error must keep the I69 reset: {owed}"
+    assert gate == [{"job_failed": True}]
+
+
 @pytest.mark.asyncio
 async def test_a_failed_fast_check_after_a_clean_end_keeps_the_hold_and_escalates(monkeypatch, tmp_path):
     """After case (a) or (b) the post-job gate runs the same fast check as after any clean exit
@@ -707,6 +761,31 @@ def test_the_witness_reads_kernel_exit_records():
     assert unseen.clean() is False and "no exit record" in unseen.why
     lost = _fed({10}, _exit(10, 0), error=errno.ENOBUFS)
     assert lost.clean() is False and "lost" in lost.why
+
+
+def test_closing_the_witness_unsubscribes_first():
+    """close() tells the connector to stop (PROC_CN_MCAST_IGNORE) before closing the socket, so the
+    kernel's host-wide listener count drops; a send error does not stop the close."""
+    from tt_device_mcp.exit_witness import PROC_CN_MCAST_IGNORE
+
+    for error in (None, OSError(errno.EPERM, "no")):
+        calls = []
+
+        class _S:
+            def send(self, msg):
+                calls.append(("send", struct.unpack_from("=I", msg, len(msg) - 4)[0]))
+                if error:
+                    raise error
+
+            def close(self):
+                calls.append(("close", None))
+
+        w = ExitWitness.__new__(ExitWitness)
+        w._sock = _S()
+        w.close()
+        assert calls == [("send", PROC_CN_MCAST_IGNORE), ("close", None)], calls
+        assert w._sock is None
+        w.close()  # idempotent
 
 
 def test_the_witness_on_a_real_tree():
@@ -1310,11 +1389,13 @@ while True:
 @pytest.mark.asyncio
 async def test_a_silent_job_past_its_limit_is_preempted_not_reaped(monkeypatch, tmp_path, clear_job_state):
     """Past its limit with a job waiting, the preemption owns the stop. The silence reaper must
-    neither signal the job inside its minute nor relabel it hung. The kill ends it PREEMPTED, and
-    even a clean exit 0 on SIGTERM owes the spec 03 I69 reset plus the full check: the broker
-    stopped it mid-run. Spec 01 I10/I20."""
+    neither signal the job inside its minute nor relabel it hung. The kill ends it PREEMPTED. The
+    job exits 0 through its own SIGTERM handler, so (witness pinned to that verdict, whatever this
+    host's connector allows) it is case (b): no spec 03 I69 reset, only the fast post-job check.
+    Spec 01 I10/I20."""
     import sys
 
+    made = _witness(monkeypatch, clean=True)
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     gate = _recording_post_job_gate(monkeypatch)
@@ -1356,14 +1437,16 @@ async def test_a_silent_job_past_its_limit_is_preempted_not_reaped(monkeypatch, 
     assert sent and sent[0][0] - t0 >= 2 - 0.15, f"signalled inside the minute: {sent}"
     assert terms.read_text().splitlines() == ["TERM"]
     assert job.exit_code == 0
-    assert owed == ["job 972 preempted"], f"a preemption must owe the I69 reset: {owed}"
-    assert dirty, "a preempted job must be flagged for the reset + full check"
-    assert gate == [{"job_failed": True}], "a preempted job must reach the full (fabric) post-job gate"
+    assert job.preempt_killed_monotonic is not None, "preempted for time, not reaped for silence"
+    assert made and job.preempt_clean is True
+    assert owed == [], f"a clean end on SIGTERM must not owe the I69 reset: {owed}"
+    assert dirty == [], "a clean end on SIGTERM must not flag the device"
+    assert gate == [{"job_failed": False}], "a clean end on SIGTERM takes the fast post-job check"
 
 
 def test_sigkill_comes_ten_seconds_after_sigterm_and_the_docs_say_so():
     """The job gets 10 s between SIGTERM and SIGKILL, not 5: the broker's constant, the spec and the
-    README state the same number."""
+    README, the CLI help and the submit field state the same number."""
     from pathlib import Path
 
     from tt_device_mcp import constants
@@ -1375,3 +1458,8 @@ def test_sigkill_comes_ten_seconds_after_sigterm_and_the_docs_say_so():
     spec = " ".join((root / "specs" / "01-jobs.md").read_text().split())
     assert "(SIGTERM, then SIGKILL at most 10 s later)" in readme
     assert "SIGKILL to both at most `PREEMPT_KILL_GRACE_SEC` (10 s) later" in spec
+    import tt_device_mcp.cli as cli
+
+    doc = srv.JobSubmitInput.model_fields["no_timeout_except_on_contention"].description
+    assert "SIGKILL 10s later" in doc, doc
+    assert "10s later, SIGKILL" in cli._NO_TIMEOUT_HELP, cli._NO_TIMEOUT_HELP
