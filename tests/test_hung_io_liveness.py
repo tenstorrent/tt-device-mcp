@@ -4,8 +4,10 @@
 job may set its own bounded silence limit. A silent job with no IO is reaped at its limit exactly as
 before, and a reap still owes the device the spec 03 I69 reset and full check."""
 
+import asyncio
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -239,3 +241,68 @@ def test_io_sampler_is_not_cpu(tmp_path):
     finally:
         proc.kill()
         proc.wait()
+
+
+# ---------------------------------------------------------------- a /proc read that never returns
+
+
+class _BlockedIo:
+    """Stands in for job_io_bytes when a /proc read blocks for good (a process in D state on a hung
+    device driver): every call waits on ``release``. Counts calls and the most ever in flight."""
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+        self.calls = 0
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    def __call__(self, pid, scope=None, tag=None):
+        with self.lock:
+            self.calls += 1
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            self.release.wait(60)
+            return None
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+
+
+@pytest.fixture
+def blocked_io(monkeypatch):
+    io = _BlockedIo()
+    monkeypatch.setattr(srv, "job_io_bytes", io)
+    yield io
+    io.release.set()
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_io_sample_does_not_stall_the_reaper(fast, blocked_io):
+    t0 = time.monotonic()
+    job, runner = await _start("971", "echo start; sleep 600")
+    await _run(job, runner)
+    assert job.status is srv.JobStatus.HUNG, f"a blocked IO sample kept the job {job.status.value}"
+    assert time.monotonic() - t0 < 10, "the bounded sample is no signal: reaped at the 1 s limit"
+    assert "storage IO unreadable" in job.error, job.error
+    assert srv._kill_reset_debt().startswith("job 971"), "the reap still owes the reset and the full check"
+    assert blocked_io.calls == 1 and blocked_io.max_in_flight == 1, (
+        f"{blocked_io.calls} samples started, {blocked_io.max_in_flight} in flight at once: "
+        "a stuck sample must not be joined by another"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_late_sample_is_dropped_and_sampling_resumes(fast, blocked_io):
+    """A sample that returns after its bound is stale: it is never counted as IO, and the next poll
+    samples afresh, still one at a time."""
+    job, runner = await _start("972", "echo start; sleep 600")
+    assert await _until(lambda: blocked_io.calls == 1)
+    await asyncio.sleep(0.3)  # several polls pass with the sample stuck
+    assert blocked_io.calls == 1
+    blocked_io.release.set()
+    assert await _until(lambda: blocked_io.calls > 1), "sampling resumes once the stuck read returns"
+    await _run(job, runner)
+    assert job.status is srv.JobStatus.HUNG
+    assert blocked_io.max_in_flight == 1

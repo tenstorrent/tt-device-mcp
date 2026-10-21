@@ -9046,6 +9046,10 @@ def _refresh_idle_hold_ledger() -> None:
 # mid-CCL wedges the mesh, which is the exact failure this is meant to clear.
 HUNG_SILENCE_SEC = int(os.environ.get("TT_DEVICE_MCP_HUNG_SILENCE_SEC", "300"))
 HUNG_POLL_SEC = 15.0
+# Bound on one storage-IO sample of the hung watchdog. The sample reads /proc/<pid>/environ of
+# every host process, and that read can block for good on a process stuck in D state (a hung
+# device driver). A sample that does not return in time is no signal, so silence decides.
+HUNG_IO_SAMPLE_SEC = 10.0
 
 
 def _bounded_hung_silence(value) -> Optional[int]:
@@ -11815,15 +11819,40 @@ export {JOB_TAG_ENV}={job_tag}
                 io_scope = job_scope_unit(job_id) if privsep_prefix else None
                 io_prev = None
                 last_io = None  # monotonic time IO was last seen advancing
+                # At most one sample thread in flight: a sample stuck on a blocked /proc read is
+                # never joined by another, so stuck threads cannot fill the executor that
+                # _terminate_job's own to_thread calls need.
+                io_task = None
+                io_timed_out = False
                 while True:
-                    now = time.monotonic()
-                    silent = now - job.last_output_monotonic
+                    poll_start = time.monotonic()
                     io_now = None
                     if limit > 0:
-                        try:
-                            io_now = await asyncio.to_thread(job_io_bytes, job.pid, io_scope, job_tag)
-                        except Exception:  # noqa: BLE001 - no IO signal is the safe side: silence decides
-                            io_now = None
+                        if io_task is None:
+                            io_task = asyncio.ensure_future(asyncio.to_thread(job_io_bytes, job.pid, io_scope, job_tag))
+                            # Retrieves the outcome of a sample nobody awaits any more.
+                            io_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+                            await asyncio.wait({io_task}, timeout=min(HUNG_POLL_SEC, HUNG_IO_SAMPLE_SEC))
+                            if io_task.done():
+                                try:
+                                    io_now = io_task.result()
+                                except Exception:  # noqa: BLE001 - no IO signal is the safe side: silence decides
+                                    io_now = None
+                                io_task = None
+                            elif not io_timed_out:
+                                io_timed_out = True
+                                if logger:
+                                    logger.warning(
+                                        f"JOB_RUNNER job_id={job_id} storage IO sample did not return "
+                                        f"within {min(HUNG_POLL_SEC, HUNG_IO_SAMPLE_SEC)}s; "
+                                        "no IO signal until it does, silence decides"
+                                    )
+                        elif io_task.done():
+                            # A late sample is stale: drop it, and sample afresh on the next poll.
+                            io_task = None
+                    now = time.monotonic()
+                    silent = now - job.last_output_monotonic
+                    if limit > 0:
                         if io_advanced(io_prev, io_now):
                             last_io = now
                         io_prev = io_now
@@ -11894,7 +11923,11 @@ export {JOB_TAG_ENV}={job_tag}
 
                     if limit > 0:
                         if quiet >= limit:
-                            hung_reason = f"no output for {int(silent)}s and no storage IO for {int(quiet)}s"
+                            if io_live or io_now is not None:
+                                io_part = f"no storage IO for {int(quiet)}s"
+                            else:
+                                io_part = "storage IO unreadable"
+                            hung_reason = f"no output for {int(silent)}s and {io_part}"
                             reap_why = f"{hung_reason} (limit {limit}s)"
                         elif silent >= io_cap:
                             hung_reason = f"no output for {int(silent)}s, only storage IO"
@@ -11919,7 +11952,9 @@ export {JOB_TAG_ENV}={job_tag}
                         _log_job_tree_killed(job_id, f"hung ({hung_reason})", await _terminate_job(job_id, job.pid))
                         return
 
-                    await asyncio.sleep(HUNG_POLL_SEC)
+                    # The sample's own wait counts toward the poll, so a blocked sample never
+                    # stretches the period past HUNG_POLL_SEC.
+                    await asyncio.sleep(max(0.0, HUNG_POLL_SEC - (time.monotonic() - poll_start)))
 
             async def preempt_watchdog():
                 # No timeout except on contention: past its limit the job runs on for as long as
