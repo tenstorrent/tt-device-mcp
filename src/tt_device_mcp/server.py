@@ -12024,17 +12024,28 @@ async def _job_runner_loop():
             readmit = job_id
             continue
 
-        # Update job state under lock
+        # Update job state under lock. Check KILLED again inside it: a kill queued on the lock
+        # ahead of us cancels the job and replies "cancelled" before we get it, and RUNNING
+        # must not overwrite that.
         async with get_lock():
-            job.status = JobStatus.RUNNING
-            job.started_at = datetime.now().isoformat()
-            _note_hold_carry_job("start")  # spec 04 I82
-            if job.verification:
-                job.reset_clock_at_start = recovery_mechanism.last_reset_monotonic
-            _update_queue_depth_metric()
-            # Track device became busy
-            if stats:
-                stats.update_device_state(now_busy=True)
+            killed_while_waiting = job.status == JobStatus.KILLED
+            if not killed_while_waiting:
+                job.status = JobStatus.RUNNING
+                job.started_at = datetime.now().isoformat()
+                _note_hold_carry_job("start")  # spec 04 I82
+                if job.verification:
+                    job.reset_clock_at_start = recovery_mechanism.last_reset_monotonic
+                _update_queue_depth_metric()
+                # Track device became busy
+                if stats:
+                    stats.update_device_state(now_busy=True)
+        if killed_while_waiting:
+            if logger:
+                logger.info(f"JOB_RUNNER skipping job_id={job_id}, cancelled while waiting for the lock")
+            _forget_queued_job(job_id)
+            await cleanup_finished_jobs()
+            get_job_queue().task_done()
+            continue
 
         # The sampler runs continuously; this only drops the idle samples from before the
         # job, so an incident's trace is the run-up to THIS job and not the hour before it.

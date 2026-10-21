@@ -478,7 +478,9 @@ flowchart LR
   safety net for a spec that outlives its job: one whose log has the `FINISHED:` footer
   is moved aside to `<id>.finished`, never requeued.
 - A job cancelled while queued becomes KILLED (terminal); the runner skips it at dequeue
-  and forgets its spec.
+  and forgets its spec. It checks again under the lock where it marks the job RUNNING: a kill
+  that took that lock first has already cancelled the job and replied, so the runner skips it
+  there too and never starts it.
 - Before dispatch the runner, in order: waits out any re-adopted job; sleeps out the
   optional mesh-rest cooldown (`TT_DEVICE_MCP_JOB_COOLDOWN_SEC`, default 0; only the
   unspent remainder since the last job's device work ended); waits out a process outside
@@ -666,6 +668,7 @@ flowchart LR
 | B-Queueing (cooldown) | `tests/test_device_safety.py::test_an_armed_cooldown_rests_the_mesh_before_the_next_job`, `tests/test_device_safety.py::test_the_default_off_cooldown_never_delays_a_job`, `tests/test_device_safety.py::test_job_cooldown_remaining_is_only_the_unspent_rest[30.0-100.0-110.0-20.0]` |
 | B-Queueing (gate errored → device held) | `tests/test_device_safety.py::test_a_gate_that_errored_holds` |
 | B-Queueing (admission error fails closed) | `tests/test_device_safety.py::test_an_admission_check_error_retries_instead_of_dispatching`, `tests/test_device_safety.py::test_three_admission_check_errors_in_a_row_hold_the_device`, `tests/test_device_safety.py::test_a_held_job_stays_held_while_the_admission_check_keeps_erroring`, `tests/test_device_safety.py::test_admission_check_errors_leave_an_open_episode_alone[off_bus]`, `tests/test_device_safety.py::test_admission_check_errors_leave_an_open_episode_alone[job_killed]`, `tests/test_device_safety.py::test_a_job_cancelled_during_admission_retries_never_dispatches` |
+| B-Queueing (a cancel that takes the lock before the runner marks the job RUNNING wins; the job never starts) | `tests/test_job_kill_reset.py::test_a_kill_queued_on_the_lock_ahead_of_the_runner_wins` |
 | B-Queueing (malformed fsm.json never poisons the gate) | `tests/test_device_safety.py::test_a_non_dict_job_on_disk_never_poisons_the_gate`, `tests/test_device_safety.py::test_a_non_str_since_on_disk_never_poisons_the_gate` |
 | B-Execution (setup error fails the job, not the runner) | `tests/test_device_safety.py::test_a_setup_error_after_running_fails_the_job_not_the_runner` |
 | B-Log format | `tests/test_recent_jobs.py::test_recent_jobs_parses_and_limits`, `tests/test_recent_jobs.py::test_the_footer_survives_a_reset_worth_of_gate_output`, `tests/test_recent_jobs.py::test_a_job_printing_status_of_its_own_is_still_unfinished` |
