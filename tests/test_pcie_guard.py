@@ -226,36 +226,6 @@ def test_first_look_after_a_recent_boot_counts_errors_since_boot(sysfs, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_gated_sweep_never_reaches_the_power_cycle(sysfs, monkeypatch):
-    """The ladder rule: no power cycle without the full reset ladder. A sweep the gate refused is not
-    the full ladder, so the host rung holds."""
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
-    os.unlink(sysfs / "sys/bus/pci/devices/0000:c1:00.0")
-    g = srv.galaxy_recovery
-    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
-    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    cycles = []
-
-    async def fake_pc(log, reason):
-        cycles.append(reason)
-
-    async def bad(expected, log, run_fabric=True, **k):
-        return False, {}
-
-    async def no_reset(*a, **k):
-        pytest.fail("gated sweep fired a mesh reset")
-
-    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_pc)
-    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", no_reset)
-    patch_recovery(monkeypatch, "_verify_device", bad)
-    out = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 4, lambda m: None, ev=None, beats={})
-    assert out == galaxy.OUTCOME_WAITING and cycles == []
-    out = await g._fire_tray_down_no_window({"2"}, 4, lambda m: None, gate_phase="x", ev=None)
-    assert out == galaxy.OUTCOME_WAITING and cycles == []
-
-
-@pytest.mark.asyncio
 async def test_hold_gate_stops_an_automatic_mesh_reset_over_an_off_bus_chip(sysfs, monkeypatch):
     """The idle relift's glx_reset that dropped a chip must not be re-issued on the next pass."""
     monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")

@@ -29,9 +29,9 @@ async def _async_true(*a, **k):
 
 
 def _ev(**over):
-    """A minimal gate Evidence for the tray-stage dispatch tests. Only ``off_bus`` and
-    ``bridge_reset_failed`` matter to the BELOW_FLOOR rung; everything else takes an inert
-    default so a test names just the field it exercises."""
+    """A minimal gate Evidence for the below-floor dispatch tests. Only ``off_bus`` matters to the
+    BELOW_FLOOR rung; everything else takes an inert default so a test names just the field it
+    exercises."""
     base = dict(
         off_bus=0,
         frozen_chips=0,
@@ -52,7 +52,6 @@ def _ev(**over):
         off_bus_before=None,
         reset_exit_nonzero=False,
         holding_fabric_unverified=False,
-        bridge_reset_failed=None,
     )
     base.update(over)
     return Evidence(**base)
@@ -62,98 +61,6 @@ def _ev(**over):
 
 
 # ------------------------------------------ the branch is LIVE: escalate()'s gate path classifies + fires
-
-
-@pytest.mark.asyncio
-async def test_gate_partial_tray_or_a_bridge_window_never_takes_the_sweep(monkeypatch):
-    """Anything that is not a whole tray with no window on EVERY chip is GENERIC: never the
-    back-to-back sweep and never a tray re-power. The gate holds; a whole tray goes to the bounded
-    power cycle (I37), anything else to the I76 ladder at 10 min. Covers a partial-tray drop and a
-    whole tray where one chip still has a bridge window."""
-    g = srv.galaxy_recovery
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
-    monkeypatch.setattr(srv, "_clear_device_dirty", lambda **k: None)
-
-    sweep = {"n": 0}
-
-    async def sweep_fn(*a, **k):
-        sweep["n"] += 1
-        return galaxy.OUTCOME_RECOVERED
-
-    monkeypatch.setattr(g, "_fire_tray_down_no_window", sweep_fn)
-
-    cycles = {"n": 0}
-
-    async def gated_cycle(*a, **k):
-        cycles["n"] += 1
-
-    monkeypatch.setattr(g, "_offbus_gated_power_cycle", gated_cycle)
-    monkeypatch.setattr(offbus_power_cycle, "whole_tray_down_age_sec", lambda since: 0.0)
-
-    # (1) partial tray: only 4 of UBB3's chips off the bus, every one no_bridge -> not a whole tray
-    beats = {str(i): 100 for i in range(28)}  # 28-31 off -> partial UBB3
-    ev = _ev(off_bus=4, bridge_reset_failed={str(i): {"reason": "no_bridge"} for i in range(28, 32)})
-    out = await g.escalate(
-        "gate/post-job", ["28", "29", "30", "31"], 32, lambda m: None, stage=galaxy.BELOW_FLOOR, ev=ev, beats=beats
-    )
-    assert out == galaxy.OUTCOME_WAITING
-    assert sweep["n"] == 0, "a partial-tray drop is GENERIC, never the sweep"
-
-    # (2) whole tray but one chip still has a bridge window (reason != no_bridge) -> GENERIC
-    beats2 = {str(i): 100 for i in range(24)}
-    br = {str(i): {"reason": "no_bridge"} for i in range(24, 32)}
-    br["24"] = {"reason": "reset_ineffective"}
-    ev2 = _ev(off_bus=8, bridge_reset_failed=br)
-    out2 = await g.escalate(
-        "gate/post-job",
-        [str(i) for i in range(24, 32)],
-        32,
-        lambda m: None,
-        stage=galaxy.BELOW_FLOOR,
-        ev=ev2,
-        beats=beats2,
-    )
-    assert out2 == galaxy.OUTCOME_WAITING
-    assert sweep["n"] == 0, "a whole tray with ANY bridge window is GENERIC, never the sweep"
-    assert cycles["n"] == 2, "a held below-floor drop with a whole tray down takes the bounded power cycle"
-
-
-@pytest.mark.asyncio
-async def test_bridge_rung_records_no_bridge_and_it_survives_the_server_replace(monkeypatch, galaxy_trays):
-    """The seam that makes the branch live: the bridge rung records each gone chip's no_bridge outcome
-    on last_bridge_reset_reasons, the server carries it onto Evidence.bridge_reset_failed via
-    replace(), and _classify_hold reads it to name TRAY_DOWN_NO_WINDOW. A chip whose window was never
-    recorded reads unknown -> GENERIC (the sweep never fires on a guess)."""
-    g = srv.galaxy_recovery
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    monkeypatch.setattr(srv, "_set_device_op_detail", lambda d: None)
-    tray3 = {str(i) for i in range(24, 32)}
-    saved_iso, saved_map = srv.isolated_chips, srv.device_pci_map
-    try:
-        srv.isolated_chips = set(tray3)
-        srv.device_pci_map = {c: f"0000:{40 + int(c):02x}:00.0" for c in tray3}
-        monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", lambda idx, bdf: None)  # gone -> no_bridge
-
-        ok = await g._recover_isolated_chips(lambda m: None)
-
-        assert ok is False, "an all-gone tray never reads as recovered"
-        assert g.last_bridge_reset_reasons == {c: {"reason": "no_bridge"} for c in tray3}
-
-        # the server's replace(ev, bridge_reset_failed=…) after the bridge rung, then classify:
-        ev = replace(_ev(off_bus=8), bridge_reset_failed=g.last_bridge_reset_reasons)
-        assert (
-            galaxy._classify_hold(tray3, 32, ev.bridge_reset_failed, galaxy_trays)
-            == galaxy.HOLD_CLASS_TRAY_DOWN_NO_WINDOW
-        )
-
-        # drop one chip's recorded window -> unknown -> GENERIC (never assume no_bridge)
-        partial = dict(g.last_bridge_reset_reasons)
-        partial.pop("24")
-        ev2 = replace(_ev(off_bus=8), bridge_reset_failed=partial)
-        assert galaxy._classify_hold(tray3, 32, ev2.bridge_reset_failed, galaxy_trays) == galaxy.HOLD_CLASS_GENERIC
-    finally:
-        srv.isolated_chips, srv.device_pci_map = saved_iso, saved_map
 
 
 # ------------------------------------------------------- (a) TRAY_DOWN_NO_WINDOW back-to-back sweep
@@ -455,15 +362,16 @@ async def test_a_sweep_that_recovers_the_mesh_cancels_the_power_cycle(monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["idle-escalation", "post-reboot"])
-async def test_the_other_two_roads_to_a_power_cycle_go_through_the_sweep(path):
-    """Wiring test for the two host-rung roads the gate ladder does not own: the idle/stuck-hold
-    escalation (`stuck_hold_host_escalation` — the road MOST real power cycles took on boxes A/B/C)
-    and the post-reboot cold climb. Both must pass through the last-chance sweep; before ladder-v2
-    they climbed to the host rung having only ever re-tried the mesh reset."""
+async def test_the_idle_escalation_road_to_a_power_cycle_goes_through_the_sweep():
+    """Wiring test for the host-rung road the gate ladder does not own: the idle/stuck-hold
+    escalation (`stuck_hold_host_escalation` — the road MOST real power cycles took). It must pass
+    through the last-chance sweep; before ladder-v2 it climbed to the host rung having only ever
+    re-tried the mesh reset. There is no post-reboot road: the broker has no reboot rung."""
     src = pathlib.Path(galaxy.__file__).read_text()
-    fn = "_climb_to_host_recovery_after_failed_reset" if path == "idle-escalation" else "_verify_post_reboot_recovery"
-    body = src[src.index(f"async def {fn}(") : src.index("async def ", src.index(f"async def {fn}(") + 10)]
+    fn = "_climb_to_host_recovery_after_failed_reset"
+    start = src.index(f"async def {fn}(")
+    nxt = [i for i in (src.find("\n    async def ", start + 10), src.find("\n    def ", start + 10)) if i != -1]
+    body = src[start : min(nxt) if nxt else len(src)]
     assert "_settle_and_verify_before_host_rung" in body, (
         f"{fn} must call the last-chance sweep before its host rung — every road to a power cycle "
         f"gives the resets one more try (user, 2026-09-17)"

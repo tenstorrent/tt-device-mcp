@@ -777,7 +777,6 @@ def test_the_bound_feed_is_silent_when_its_mark_is_not_next(held, monkeypatch, c
 def test_the_bound_feed_names_the_host_rung_the_box_opts_into(held, monkeypatch):
     held["off"] = {3, 4, 5, 6}
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
-    assert srv._hold_bound_feed(START, T0, None).rung == "full ladder, then warm reboot"
     assert srv._hold_bound_feed(START, T0, None).rung == "full ladder"
 
 

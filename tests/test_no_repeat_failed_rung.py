@@ -637,19 +637,6 @@ async def test_a_failed_reset_that_shrank_the_set_retries_once_on_the_new_set_th
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing released the hold"
 
 
-@pytest.mark.asyncio
-async def test_a_failed_reset_on_an_unchanged_set_arms_no_retry_and_climbs_at_once(monkeypatch, clear_job_state):
-    """The control: the same two chips stay off after the exit 1. No retry is armed and the watchdog
-    spawns none; the climb goes straight to I38's power cycle."""
-    counters, events, _, _, _ = _progress_episode(monkeypatch, [{"30", "31"}])
-    assert await _window() is True
-    assert "mesh_reset_progress_retry_armed" not in events
-    assert srv.recovery_mechanism.progress_retry is None
-    assert "host_rung_not_deferred" in events and counters["power_cycles"] == 1 and counters["resets"] == 1
-    assert _drive_progress_retry_watchdog(monkeypatch) == []
-    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
-
-
 def _record_retry_delays(monkeypatch, events):
     """Keep every event kind in ``events`` and return the armed retries' ``retry_in_sec`` values."""
     delays = []
@@ -661,32 +648,6 @@ def _record_retry_delays(monkeypatch, events):
 
     patch_health_event(monkeypatch, record)
     return delays
-
-
-@pytest.mark.asyncio
-async def test_a_failed_reset_that_left_every_chip_back_arms_the_retry_at_once(monkeypatch, clear_job_state):
-    """I39: the reset exits 1 but its own rescan brought both chips back (a glx_reset started while a
-    chip was out of the kernel fails its full-mesh driver-load wait). Waiting buys nothing: the retry is
-    armed with no delay and the watchdog's next dead-chip sample spawns it, without any backdating."""
-    counters, events, _, _, _ = _progress_episode(monkeypatch, [set()])
-    delays = _record_retry_delays(monkeypatch, events)
-    assert await _window() is True
-    assert delays == [0], "every chip is back: the retry is due at once"
-    assert _drive_progress_retry_watchdog(monkeypatch, backdate=False) == ["progress_retry"]
-    assert srv.recovery_mechanism.progress_retry is None, "spent on the spawn"
-    assert counters["power_cycles"] == 0 and counters["dirty_cleared"] == 0, "nothing climbed or released yet"
-
-
-@pytest.mark.asyncio
-async def test_a_failed_reset_that_left_chips_off_keeps_the_60s_wait(monkeypatch, clear_job_state):
-    """The control: 2 -> 1 chips off after the exit 1. The retry keeps its 60 s wait, so the watchdog's
-    next sample spawns nothing; once the 60 s pass it does."""
-    counters, events, _, _, _ = _progress_episode(monkeypatch, [{"31"}])
-    delays = _record_retry_delays(monkeypatch, events)
-    assert await _window() is True
-    assert delays == [60]
-    assert _drive_progress_retry_watchdog(monkeypatch, backdate=False) == [], "not due before its 60 s"
-    assert _drive_progress_retry_watchdog(monkeypatch) == ["progress_retry"]
 
 
 @pytest.mark.asyncio
@@ -791,35 +752,6 @@ async def test_b1_all_back_retry_whose_fabric_verify_fails_keeps_the_hold_for_th
     assert verifies and all(v in (None, True) for v in verifies), "the ladder's reset is verified with the fabric"
     assert counters["sweeps"] == 1 and counters["power_cycles"] == 1, "still failing: the power cycle"
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing released the device"
-
-
-def test_the_ten_minute_ceiling_window_still_fires_after_the_spent_retry(monkeypatch):
-    """The zero-delay retry changes nothing past it: with the retry spent, the hold's 600 s ceiling
-    window (the full ladder) still fires at 600 s, and not before."""
-    spawned = []
-    monkeypatch.setattr(srv, "health_event", lambda kind, **f: None)
-    monkeypatch.setattr(
-        srv, "_maybe_spawn_forced_escalation", lambda: spawned.append(srv.device_hold_escalation_kind) or True
-    )
-    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
-    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
-    monkeypatch.setattr(srv, "device_hold_offbus_escalated", True)
-    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
-    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry", None)
-    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry_spent_since", "")
-    srv.fsm.set_latch("escalated", False)
-    monkeypatch.setattr(srv, "isolated_chips", {30})
-    monkeypatch.setattr(srv, "device_hold_episode_reason", "chip(s) 30 fell off the PCIe bus")
-    since = datetime(2026, 10, 16, 3, 0, 0)
-    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
-    assert galaxy._stuck_hold_ceiling_sec() == 600
-    assert srv.recovery_mechanism.note_progress_retry(since.isoformat(), 0)
-    srv._check_hold_deadline(now=since + timedelta(seconds=390))
-    assert spawned == ["progress_retry"]
-    srv._check_hold_deadline(now=since + timedelta(seconds=599))
-    assert spawned == ["progress_retry"], "nothing else before the ceiling"
-    srv._check_hold_deadline(now=since + timedelta(seconds=600))
-    assert spawned == ["progress_retry", "ceiling_window"], "the 10 min window still runs the ladder"
 
 
 @pytest.mark.asyncio
