@@ -2770,7 +2770,10 @@ async def test_reset_runs_in_its_own_systemd_scope(monkeypatch):
     assert argv[0] == "systemd-run" and "--scope" in argv
     assert any(a.startswith("--unit=" + recovery_base.RESET_SCOPE_PREFIX) for a in argv)
     # The reset command must survive as the scope's payload, after the `--`.
-    assert list(argv[argv.index("--") + 1 :]) == ["tt-smi", "-glx_reset"]
+    # A mesh reset runs under the spec 04 I91 ipmitool guard, which then execs the reset itself.
+    payload = list(argv[argv.index("--") + 1 :])
+    assert payload == recovery_base.ipmi_guard.guarded_argv(["tt-smi", "-glx_reset"])
+    assert payload[-2:] == ["tt-smi", "-glx_reset"]
 
 
 @pytest.mark.asyncio
