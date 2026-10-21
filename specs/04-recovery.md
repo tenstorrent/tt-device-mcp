@@ -1712,6 +1712,49 @@ each rung fires only when the gentler one failed or cannot apply.
   | No isolated chip (present-mesh eth/fabric hold, 77) | mesh reset + settle + check | unchanged |
   | Whole tray, all chips off the bus | sweep skipped, power cycle (I37) | unchanged |
 
+- **I88 — A broker power cycle brings the host OS down cleanly first, within a bound.** Both host
+  power cycles the broker fires (the auto power cycle, `ipmitool chassis power cycle`, and the
+  configured `TT_DEVICE_MCP_POWER_CYCLE_CMD` of I27) go through `fire_os_first`. Power is never cut
+  with the OS up while a clean path can start, so filesystems, RAID arrays and journals are flushed
+  and unmounted before it drops. The order, after the ledger record, the jobs row and the I26 hook:
+  1. The broker writes `/run/tt-device-mcp-power-cycle.request` (epoch, reason, then one argv word
+     per line; mode 0600, fsynced). `/run` is empty on every boot, so a request never outlives it.
+  2. It starts a transient fallback unit (`systemd-run`, `DefaultDependencies=no`, so the shutdown
+     transaction does not stop it) that waits the bound, flushes for 2 s and fires the same argv.
+  3. It asks for a reboot (`systemctl --no-block -i reboot`).
+  4. Once every service has stopped and the filesystems are read-only, systemd-shutdown runs the
+     installed hook `tt-device-mcp-power-cycle.shutdown`. On the `reboot` verb with a request less
+     than an hour old, it syncs, waits for RAID arrays to mark clean (`mdadm --wait-clean`, 30 s
+     cap) and fires the argv, up to 3 tries of 30 s each. Any other verb, or no request, does
+     nothing.
+
+  The bound is `TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC`, default 120 s, clamped to 30-300 s;
+  a malformed value reads as the default, and no value turns it off. A shutdown that hangs before
+  systemd-shutdown is cycled by the fallback unit at the bound. Past that point the fallback has
+  been killed and the hook fires; systemd-shutdown's own timeouts bound that last stage.
+  The clean path needs systemd as PID 1, the installed hook, `systemctl` and `systemd-run`. When any
+  of these is missing, or the request write, the fallback unit or the reboot request fails, the
+  broker undoes the steps it took (stops the unit, removes the request) and fires the argv directly,
+  as before I88. A request-time failure of that direct fire still raises, so the ledger entry is
+  retracted (I26). A `power_cycle_os_first` event records each path (`reboot_requested` with the
+  bound, or `unavailable` with why). On success the host action is pending as for any fire, so I34
+  suppresses device resets while the host goes down.
+  The configured command now runs from systemd-shutdown, after the network is down: it must be an
+  in-band command (for example local `ipmitool`). If the hook's 3 tries all fail, systemd-shutdown
+  reboots warm. That is not a recovery rung and never stands in for the cycle: the next boot's
+  startup check (03 I4) finds the device as it is, and the I65 cooldown and the I76 10-min bound
+  run again. I65, I76, I27's guards and the lift gate (a hold lifts only on a just-passed full
+  check, fabric included) are unchanged. `apply-host-config.sh` installs the hook (spec 08), so a
+  fresh install has it from the first start. Time to recover (TTR), for every class that ends in a
+  power cycle (class A whole-tray drop, the I76 10-min escalation, the I27 off-bus cycle):
+
+  | Case | Before I88 | With I88 |
+  |---|---|---|
+  | Clean shutdown | cycle fires at once | + the host's stop time (about 90 s measured on a Galaxy host, most of it unmounting the root volume) |
+  | Shutdown hangs before systemd-shutdown | cycle fires at once | + the bound (120 s default) + 2 s flush |
+  | Clean path cannot start | cycle fires at once | unchanged (direct fire), plus a few ms of checks |
+  | Hook's command fails 3 times | the live cycle may also fail | warm reboot; recovery runs again after boot |
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -2280,3 +2323,4 @@ sees a silent fabric pass.
 | I75 (one routing for the report and the forced run: a window inside the post-ladder check, a window after a ladder that did not recover, a class-A mark inside the check window, a startup-gate stand-down; each reported where the watchdog acts) | `tests/test_health_hold_report.py::test_the_report_names_the_rung_the_forced_run_routes_to`, `tests/test_health_hold_report.py::test_a_class_a_ladder_mark_inside_the_check_window_is_not_reported`, `tests/test_health_hold_report.py::test_a_startup_verify_stand_down_is_reported_with_its_bounded_end` |
 | I75 (deadline feeds: the broker registers the I76 bound; its mark and source per fault class and latch, fired by the watchdog then; inside a cooldown the ladder stays at the mark and only the host rung names the end; silent once spent, past due, pending, tenant-blocked or stood down; names the opted-in host rung; nothing when HEALTHY; read-only; a broken feed reports nothing) | `tests/test_health_hold_report.py::test_the_broker_registers_its_hold_bound_feed`, `tests/test_health_hold_report.py::test_the_bound_mark_is_reported_for_each_fault_class`, `tests/test_health_hold_report.py::test_a_latched_hold_reports_the_same_mark`, `tests/test_health_hold_report.py::test_a_cooldown_hold_reports_the_ladder_at_the_mark_and_the_host_rung_at_its_end`, `tests/test_health_hold_report.py::test_the_hold_bound_candidate_names_the_cooldown_only_for_its_host_rung`, `tests/test_health_hold_report.py::test_after_the_bound_ladder_the_chain_names_the_host_rung`, `tests/test_health_hold_report.py::test_the_bound_feed_is_silent_when_its_mark_is_not_next`, `tests/test_health_hold_report.py::test_the_bound_feed_names_the_host_rung_the_box_opts_into`, `tests/test_health_hold_report.py::test_the_bound_feed_yields_to_a_startup_stand_down`, `tests/test_health_hold_report.py::test_a_healthy_device_reports_no_bound`, `tests/test_health_hold_report.py::test_the_bound_feed_moves_no_clock`, `tests/test_health_hold_report.py::test_a_broken_feed_reports_nothing` |
 | I86 the last-chance sweep re-probes the bus after SBR: a whole bus runs the full check before any later rung and lifts only on its pass; a failed check runs the remaining rung then the power cycle; a short or unreadable bus fires every rung; a whole tray still skips the sweep | `tests/test_sweep_reprobe.py::test_healed_after_sbr_runs_no_later_rung_and_lifts_only_on_the_full_check`, `::test_bus_whole_but_full_check_fails_runs_the_remaining_rung_then_the_caller_climbs`, `::test_bus_whole_check_fails_then_the_mesh_reset_heals_it_lifts_on_the_second_check`, `::test_never_healed_runs_every_rung_back_to_back_with_one_check`, `::test_an_unreadable_bus_probe_fires_the_next_rung`, `::test_the_gate_ladder_power_cycles_only_when_the_full_check_still_fails`, `::test_a_whole_tray_drop_still_skips_the_sweep`; every hold kind still reaches the ladder at 10 min: `tests/test_hold_bound.py::test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung` |
+| I88 a broker power cycle brings the OS down first: request, then a fallback unit outside the shutdown, then the reboot; the fallback fires the same argv at the clamped bound; no hook, an unwritable request, a fallback that cannot start or a failed reboot undo their steps and fire directly; a failing direct fire still raises; the configured command takes the same path; the escalation's ledger and pending host action are unchanged; the hook fires only on reboot with a fresh request, after sync and RAID wait, 3 tries then a warm reboot; the installer installs it | `tests/test_power_cycle_os_first.py::test_clean_path_writes_the_request_then_the_fallback_then_reboots`, `::test_the_fallback_unit_stays_out_of_the_shutdown_and_fires_the_same_command_at_the_bound`, `::test_a_hung_shutdown_reaches_the_cycle_once_the_bound_passes`, `::test_the_shutdown_bound_is_always_finite_and_clamped`, `::test_no_hook_installed_cycles_directly_and_runs_no_step`, `::test_an_unwritable_request_cycles_directly`, `::test_a_fallback_unit_that_cannot_start_never_reboots_without_its_bound`, `::test_a_failed_reboot_stops_the_fallback_and_cycles_directly`, `::test_a_direct_fire_that_fails_still_raises_so_the_ledger_retracts`, `::test_the_configured_power_cycle_command_takes_the_same_clean_path`, `::test_the_escalation_is_unchanged_around_the_clean_path`, `::test_hook_fires_the_requested_cycle_after_flushing_on_reboot`, `::test_hook_never_cycles_on_any_other_verb`, `::test_hook_ignores_a_stale_request`, `::test_hook_retries_a_failing_cycle_then_lets_the_reboot_continue`, `::test_the_installer_installs_the_hook_where_the_broker_looks` |

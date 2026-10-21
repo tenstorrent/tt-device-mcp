@@ -1,0 +1,48 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# systemd-shutdown hook (spec 04 I88): the broker's power cycle, fired after the host OS is down.
+# Installed by apply-host-config.sh into the system-shutdown directory. systemd-shutdown runs it with
+# the verb ($1) once every service has stopped and the filesystems are unmounted or read-only.
+#
+# It acts only on a reboot the broker asked for: the broker writes REQ (epoch, reason, then one argv
+# word per line) before `systemctl reboot`. /run is empty on every boot, so a request never outlives
+# its boot; one older than an hour is ignored too. With no request it does nothing and the reboot,
+# poweroff or halt goes ahead unchanged.
+#
+# If the cycle command fails three times, the hook exits and systemd-shutdown reboots warm; the
+# broker's startup check then finds the device as it is and its own recovery runs again.
+REQ="${TT_DEVICE_MCP_POWER_CYCLE_REQUEST:-/run/tt-device-mcp-power-cycle.request}"
+MAX_AGE=3600
+
+say() { echo "tt-device-mcp power-cycle hook: $*" >/dev/kmsg 2>/dev/null || echo "tt-device-mcp power-cycle hook: $*" >&2; }
+
+[ "${1:-}" = reboot ] || exit 0
+[ -r "$REQ" ] || exit 0
+{
+    IFS= read -r at || at=
+    IFS= read -r reason || reason=
+    set --
+    while IFS= read -r word; do set -- "$@" "$word"; done
+} <"$REQ"
+[ "$#" -gt 0 ] || { say "request has no command; not cycling"; exit 0; }
+now=$(date +%s 2>/dev/null) || now=0
+case "$at" in '' | *[!0-9]*) say "request has no time; not cycling"; exit 0 ;; esac
+[ "$now" -ge "$at" ] && [ $((now - at)) -le "$MAX_AGE" ] || { say "request is stale; not cycling"; exit 0; }
+
+say "power-cycling the host now: $reason"
+sync
+# Hooks run in parallel: let the RAID arrays finish marking themselves clean before power goes.
+command -v mdadm >/dev/null 2>&1 && timeout 30 mdadm --wait-clean --scan >/dev/null 2>&1
+for try in 1 2 3; do
+    if timeout 30 "$@"; then
+        # Power is about to drop; do not race systemd-shutdown into a warm reboot meanwhile.
+        sleep 25
+        exit 0
+    fi
+    say "cycle command failed (try $try)"
+    sleep 3
+done
+say "cycle command failed 3 times; the reboot continues warm"
+exit 1

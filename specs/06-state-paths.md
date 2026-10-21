@@ -285,6 +285,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC` | 21600 | A host-hang latch older than this lifts once every chip is on the bus, even without a clean host-pci look; with a chip off only when `TT_DEVICE_MCP_POWER_CYCLE_CMD` is unset (spec 04 I25) | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_CMD` | unset (off) | The host's own power-cycle command, run to end an off-bus hold the reset gate refuses (spec 04 I27); unset = page and hold | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC` | 120 | Timeout for that command; past it its process group is killed and the attempt counts as failed | 04 |
+| `TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC` | 120 (30-300) | How long a broker power cycle waits for the clean OS shutdown before its fallback cuts power anyway (spec 04 I88); clamped, never off | 04 |
 | `TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC` | 300 | How long a gated off-bus hold stands, from the episode start, before the I27 power cycle may run | 04 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC` | 1200 | With no `TT_DEVICE_MCP_POWER_CYCLE_CMD`, how long a gated off-bus hold stands for an operator, from the episode start, before the broker lifts the `hold` gate for one pass of its own reset ladder (I33); `off` keeps the hold for an operator | 04 |
 | `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` | unset (none) | Extra spacing between I27 attempts on top of the I65 cooldown, capped at 14400 (the I65 backoff cap); within it the hold pages and stands to a deadline on /health | 04 |

@@ -286,7 +286,10 @@ so a knob without a render line is unreachable.
 Also installed by apply-host-config: `/usr/local/bin/tt-device-mcp-smi-ro` +
 `/etc/sudoers.d/tt-device-mcp-smi` (spec 05), `/etc/logrotate.d/tt-device-broker`, a journald
 retention drop-in (~30 days; journald restarted best-effort), `/etc/profile.d/tt-device-mcp-heal.sh`
-(login-heal) and `/etc/profile.d/tt-device-mcp-client.sh` (runs client-setup at login).
+(login-heal), `/etc/profile.d/tt-device-mcp-client.sh` (runs client-setup at login) and
+`/usr/lib/systemd/system-shutdown/tt-device-mcp-power-cycle.shutdown` (the broker's power cycle
+after a clean OS shutdown, spec 04 I88; also under `/lib/systemd/system-shutdown/` on a split
+`/lib`). The hook install is required: a failure stops apply, as for the unit.
 
 **The validator pin file** (`deploy/fabric-validator.pin`, staged to
 `$TTDEV_ROOT/fabric-validator.pin`): sourced shell defining `TTDEV_VALIDATOR_REPO`, a full
