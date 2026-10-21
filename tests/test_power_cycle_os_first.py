@@ -409,7 +409,13 @@ def _refute_next_boot(s, monkeypatch, boot_id, btime, at):
     """A power-cycle request recorded on the current boot at ``at``, the hook's command failing, and
     the host coming up warm as ``boot_id`` at ``btime``; the BMC refutes the cycle."""
     mech = s["mech"]
-    row = {"action": "power-cycle", "reason": REASON, "at": "earlier", "at_epoch": at, "boot_id": mech._current_boot_id()}
+    row = {
+        "action": "power-cycle",
+        "reason": REASON,
+        "at": "earlier",
+        "at_epoch": at,
+        "boot_id": mech._current_boot_id(),
+    }
     with (s["tmp"] / recovery_base.AUTO_RECOVERY_LEDGER).open("a") as f:
         f.write(json.dumps(row) + "\n")
     monkeypatch.setattr(mech, "_current_boot_id", lambda: boot_id)
