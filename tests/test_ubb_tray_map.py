@@ -565,27 +565,3 @@ def test_a_wormhole_lookup_survives_the_snapshot_suffix_inside_tray_map():
     carries " L", tables are keyed by unsuffixed values, so it returns None."""
     assert galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-wh L") is not None
     assert galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-wh R") is not None
-
-
-# --- the hold-deadline climb's tray rung reads the climb's own forced tenant guard ----------------
-
-
-def _arm_forced_tray_rung(monkeypatch, scan, *, verify_ok=True):
-    """The tray walk opted in on a single-tray below-floor drop, the holder scan fixed to ``scan`` and
-    the post-re-power verify recorded. Returns (fired, verifies)."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scan)
-    fired, verifies = [], []
-
-    async def verify(expected, log, run_fabric=True, **_):
-        verifies.append(run_fabric)
-        return verify_ok, {"snapshot": {"ok": True}, "fabric": {"ok": verify_ok}}
-
-    patch_recovery(monkeypatch, "_verify_device", verify)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append((bitmap, ids)), raising=False)
-    return fired, verifies
-
-

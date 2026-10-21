@@ -21,7 +21,7 @@ from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import Verdict
 from tt_device_mcp.health.monitors import heartbeat, pci
-from tt_device_mcp.health.recovery import base, galaxy, pcie_guard
+from tt_device_mcp.health.recovery import base, galaxy
 
 EXPECTED = 32
 
