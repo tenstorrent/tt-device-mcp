@@ -178,7 +178,13 @@ from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
 from tt_device_mcp.job_preflight import preflight_output_dirs
-from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
+from tt_device_mcp.job_reap import (
+    JOB_TAG_ENV,
+    ReapedLeftover,
+    _leftover_state,
+    find_reaped_leftovers,
+    reap_job_survivors,
+)
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
     SpoolTail,
@@ -190,6 +196,7 @@ from tt_device_mcp.job_spool import (
     sweep_job_spools,
 )
 from tt_device_mcp.peercred import username_for_uid
+from tt_device_mcp.pre_reset_scan import clear_device_readers
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
 from tt_device_mcp.socket_transport import (
     PeerCredMiddleware,
@@ -1228,6 +1235,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         chip_state.publish()
         _reload_removed_chips()
         recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
+        recovery_mechanism.pre_reset_scan = _pre_reset_holder_scan
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
         )
@@ -1781,6 +1789,12 @@ readopted_scopes: dict[str, str] = {}  # job_id -> scope unit, for jobs re-adopt
 # pid -> (job id, starttime) of each process a job's sweep left alive holding the device. The
 # leftover fence (01 I16) names these; a privsep leftover is also found by its job's scope cgroup.
 reaped_survivors: dict[int, tuple[str, str]] = {}
+# Spec 04 I92: what the last pre-reset holder scan refused a reset for (a tenant under an automatic
+# reset, or a reader that would not let go), for /health's ``pre_reset_blocked_by``; None once a scan
+# finds the device clear.
+_pre_reset_blocker: Optional[dict] = None
+# The job id an unkillable pre-reset reader is fenced under (01 I16, 04 I70): it belongs to no job.
+PRE_RESET_READER_JOB = "pre-reset-reader"
 # The leftovers the current fence episode names ('' when no fence stands): the operator hint is
 # emitted once per episode, not on every scan.
 _leftover_fence_detail: str = ""
@@ -2672,7 +2686,7 @@ def _reset_for_testing():
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant, _hold_episode_startup, _hold_carry, _hold_carry_loaded
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
-    global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at
+    global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at, _pre_reset_blocker
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
     global device_op_stage_started_at, device_held_since, device_hold_escalated_monotonic
     global device_hold_deadline_bucket, device_hold_alert_next_bucket, device_hold_alert_gap
@@ -2684,6 +2698,7 @@ def _reset_for_testing():
     global _hold_bound_episode, _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_cycle_age
     global _hold_bound_check_failed_age, _hold_bound_unarmed_paged, _hold_bound_rung_pending
     global _hold_bound_denied_why, _hold_bound_tenant_paged, _hold_bound_tenant_blocker
+    _pre_reset_blocker = None
     job_queue = None
     lock = None
     _action_row = None
@@ -8054,6 +8069,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         payload.update(_hold_report(now))
     # Spec 04 I70: an unkillable leftover fencing every reset, with its deadline and rung stage.
     payload["leftover_fence"] = _leftover_fence_payload()
+    # Spec 04 I92: the tenant or reader the last pre-reset holder scan refused a reset for.
+    payload["pre_reset_blocked_by"] = _pre_reset_blocker
     return payload
 
 
@@ -9817,6 +9834,90 @@ async def _escalate_unkillable_leftover() -> None:
     except Exception:  # noqa: BLE001 - a detached task must never raise unretrieved
         if logger:
             logger.exception("LEFTOVER-HOST-RUNG try failed — retrying next window")
+
+
+async def _reset_in_flight() -> Optional[str]:
+    """Spec 04 I92: why an operator reset must not start, when a reset (ours from before a restart,
+    another broker's, or a local-backend one) is still running. A second reset into a mesh already
+    cycling is the concurrent-reset failure, and the pre-reset scan would read its tt-smi as a reader."""
+    unit = await asyncio.to_thread(recovery_mechanism.scope_active)
+    return f"a reset is already in flight ({unit})" if unit else None
+
+
+async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
+    """The broker's pre-reset holder scan (spec 04 I92), run by every reset with the pollers stopped.
+
+    Clears every reader that is not a tenant (SIGTERM, 10 s, SIGKILL, then the I67 release wait) and
+    returns why the reset must not run, or ''. An automatic reset (owner ``[broker]...``) refuses to
+    run under a tenant and names it in the journal and /health; an operator reset's own gate already
+    ruled on tenants. A reader stuck in the kernel is fenced as a leftover (01 I16), so the
+    J-unkillable clock (04 I70) takes it to the host rung. Every scan emits ``pre_reset_holder_scan``."""
+    global _pre_reset_blocker
+    automatic = (owner or "").startswith("[broker]")
+    job = current_process
+    protected = [job.pid] if job is not None and job.returncode is None and job.pid else []
+    result = await clear_device_readers(
+        tenants_block=automatic, protected=protected, reset_active=recovery_mechanism.scope_active
+    )
+    refused = result.refusal()
+    health_event(
+        "pre_reset_holder_scan",
+        argv=list(argv),
+        owner=owner,
+        outcome=result.outcome,
+        found=result.found,
+        killed=result.killed,
+        tenants=result.tenants,
+        unkillable=result.unkillable,
+        survivors=result.survivors,
+        detached=result.detached,
+        undetached=result.undetached,
+        detach_timed_out=result.detach_timed_out,
+        reset_in_flight=result.reset_in_flight or None,
+        gaps=result.gaps,
+        scan_complete=result.scan_complete,
+        source=result.source,
+        seconds=result.seconds,
+        error=result.error or None,
+    )
+    if result.detached:
+        msg = f"pre-reset: chips {', '.join(result.detached)} off the bus, detached before their readers were killed"
+        log(msg)
+        if logger:
+            logger.warning(msg)
+    for row in result.killed:
+        msg = (
+            f"pre-reset: {row['signal']} to device reader pid {row['pid']} ({row['user']}, {row['comm']}) "
+            f"before {' '.join(argv)}; {'released' if row['released'] else 'still holding'}"
+        )
+        log(msg)
+        if logger:
+            logger.warning(msg)
+    if result.unkillable:
+        for row in result.unkillable:
+            start = _leftover_state(row["pid"])[1] or row.get("starttime") or ""
+            reaped_survivors[row["pid"]] = (PRE_RESET_READER_JOB, start)
+        # Opens the leftover fence episode and the I70 unkillable clock now, not at the next scan.
+        _reaped_leftovers()
+    if not refused:
+        _pre_reset_blocker = None
+        return ""
+    since = (_pre_reset_blocker or {}).get("since") or datetime.now().isoformat(timespec="seconds")
+    _pre_reset_blocker = {
+        "blocker": "tenant" if result.outcome == "tenant_blocked" else result.outcome,
+        "since": since,
+        "owner": owner,
+        "argv": list(argv),
+        "holders": (
+            result.tenants
+            if result.outcome == "tenant_blocked"
+            else (result.readers_left or result.unkillable or result.survivors)
+        ),
+        "reason": refused,
+    }
+    if logger:
+        logger.error(f"pre-reset holder scan refused {' '.join(argv)} ({owner}): {refused}")
+    return refused
 
 
 def _leftover_fence_payload() -> Optional[dict]:
@@ -13395,6 +13496,10 @@ VALIDATOR_BUILD_REQUEST_TIMEOUT_SEC = 30.0
 # Spec 03 I75: the startup gate task, and when it stopped waiting on re-adopted jobs (monotonic).
 _startup_verify_task: Optional[asyncio.Task] = None
 _startup_verify_ready_at: Optional[float] = None
+# Spec 03 I76, report only: wall-clock times of the gate task's start and of its stop waiting on
+# re-adopted jobs (the check's start), for the /health view's since/check_started_at/deadline.
+_startup_verify_started_wall: Optional[float] = None
+_startup_verify_ready_wall: Optional[float] = None
 _startup_verify_deferral_logged: Optional[str] = None
 # How long past the re-adopted jobs' end the escalations still leave a startup hold to that gate:
 # its hugepage wait, its fabric pass and the rest of the full check, with margin.
@@ -13458,22 +13563,39 @@ def _startup_verify_view() -> Optional[dict]:
     live = [jid for jid in readopted_scopes if (job := jobs.get(jid)) is not None and job.status is JobStatus.RUNNING]
     if len(live) != len(readopted_scopes) or _device_liveness_reason():
         return None
+    started = _startup_verify_started_wall
+    checking = _startup_verify_ready_wall if not live else None
     return {
         "phase": "readopted_job_running" if live else "verifying",
         "readopted_job_ids": live,
         "fault": False,
-        "since": device_hold_episode_since or None,
+        "since": device_hold_episode_since or _wall_iso(started),
+        # When the check began and the latest it may end: the hugepage wait plus the check's own
+        # bound (STARTUP_VERIFY_DEFER_MAX_SEC). Null while a re-adopted job still runs.
+        "check_started_at": _wall_iso(checking),
+        "deadline": _wall_iso(checking + STARTUP_VERIFY_DEFER_MAX_SEC if checking is not None else None),
+        "bound_sec": STARTUP_VERIFY_DEFER_MAX_SEC,
     }
+
+
+def _wall_iso(wall: Optional[float]) -> Optional[str]:
+    """Local ISO time of a time.time() value, the format of the hold's ``since``; None stays None."""
+    return datetime.fromtimestamp(wall).isoformat() if wall is not None else None
 
 
 def _sync_fsm_readopted_jobs() -> None:
     """Spec 03 I76: mirror startup_verify.readopted_job_ids into fsm.json's readopted_jobs ([] when the
     view is null), so a client that reads the file gets the answer /health gives. Called when the startup
     gate starts, on each re-adopted scope poll and when a re-adopted job ends; the FSM clears it itself on
-    a release or DOWN. Report-only, and never raises into its caller."""
+    a release or DOWN. Also mirrors whether the startup check is in progress, its start and its deadline
+    (startup_check_in_progress / _started_at / _deadline), which a fault hold clears too. Report-only,
+    and never raises into its caller."""
     try:
         view = _startup_verify_view()
         fsm.set_readopted_jobs(view["readopted_job_ids"] if view else [])
+        fsm.set_startup_check(
+            view["since"] if view else None, view["deadline"] if view else None, in_progress=view is not None
+        )
     except Exception as e:  # noqa: BLE001 - a report must never break the monitor or startup
         if logger:
             logger.warning(f"fsm readopted_jobs sync failed: {e}")
@@ -13690,11 +13812,13 @@ async def _verify_fabric_on_start() -> None:
     A pass that exited 77 because the validator or the hugepages were not there yet is owed again
     once they are (see _await_startup_prerequisites).
     """
-    global _startup_prereq_task, _startup_verify_ready_at
+    global _startup_prereq_task, _startup_verify_ready_at, _startup_verify_ready_wall
     try:
         while readopted_scopes:
             await asyncio.sleep(_SCOPE_POLL_SEC)
         _startup_verify_ready_at = time.monotonic()
+        _startup_verify_ready_wall = time.time()
+        _sync_fsm_readopted_jobs()  # spec 03 I76: fsm.json gets the check's deadline
         # Read before the pass: a validator that lands while it runs must still be waited for.
         missing = await asyncio.to_thread(fabric.validator_missing)
         if missing and logger:
@@ -13728,6 +13852,10 @@ async def _verify_fabric_on_start() -> None:
             logger.error(f"STARTUP FABRIC check failed: {e}")
         health_event("startup_fabric_verify_errored", detail=str(e), host_at_risk=True)
         _mark_device_dirty(f"startup fabric verify errored before it could verify: {e}", why="gate_error")
+    finally:
+        # Spec 03 I76, report only: the check has ended (passed, held or errored), so fsm.json no
+        # longer says it is in progress. Lifts nothing: only the gate's own verdict does that.
+        fsm.set_startup_check(None, None, in_progress=False)
 
 
 async def _probe_on_per_user_start() -> None:
@@ -13779,6 +13907,7 @@ async def run_startup_tasks() -> None:
     as its own.
     """
     global _startup_tasks_done, _startup_verify_task, _startup_verify_ready_at
+    global _startup_verify_ready_wall, _startup_verify_started_wall
     if _startup_tasks_done:
         return
     _startup_tasks_done = True
@@ -13887,6 +14016,8 @@ async def run_startup_tasks() -> None:
     # And then answers it properly, once the device is ours to test — this lifts the hold above on a
     # healthy verdict, holds/escalates on a wedge.
     _startup_verify_ready_at = None
+    _startup_verify_ready_wall = None
+    _startup_verify_started_wall = time.time()
     _startup_verify_task = asyncio.create_task(_verify_fabric_on_start())
     _sync_fsm_readopted_jobs()  # spec 03 I76: the jobs re-adopted above, now the gate owns the hold
 
@@ -14127,6 +14258,7 @@ def create_mcp_server() -> MCPServer:
         output_queue: asyncio.Queue[str] = asyncio.Queue()
         reset_streamed = False
         late_blocker: Optional[dict] = None
+        in_flight: Optional[str] = None
 
         def on_reset_output(chunk: str) -> None:
             nonlocal reset_streamed
@@ -14134,10 +14266,13 @@ def create_mcp_server() -> MCPServer:
             output_queue.put_nowait(chunk)
 
         async def run_reset():
-            nonlocal late_blocker
+            nonlocal late_blocker, in_flight
             async with _device_op("reset", owner=reset_owner):
                 late_blocker = await _reset_recheck_in_op(force, lambda m: output_queue.put_nowait(m + "\n"))
                 if late_blocker:
+                    return None, None, ""
+                in_flight = await _reset_in_flight()
+                if in_flight:
                     return None, None, ""
                 health_event("reset_begin", argv=argv, expected_chips=len(indices))
                 _void_fabric_ok("operator reset")
@@ -14171,6 +14306,12 @@ def create_mcp_server() -> MCPServer:
                 logger.warning(f"reset_stream: busy REFUSED: {_reset_busy_detail(late_blocker)}")
             yield f"busy REFUSED: {_reset_busy_detail(late_blocker)}\n"
             yield f"hint: {RESET_BUSY_HINT.format(force='--force')}\n"
+            yield "::status::refused\n"
+            return
+        if in_flight:
+            if logger:
+                logger.warning(f"reset_stream: REFUSED: {in_flight}")
+            yield f"REFUSED: {in_flight}\n"
             yield "::status::refused\n"
             return
         status = "reset_complete" if rc == 0 else "reset_failed"
@@ -14341,6 +14482,10 @@ def create_mcp_server() -> MCPServer:
             view = _startup_verify_view()
             if view and job_id in view["readopted_job_ids"]:
                 result["startup_verify"] = view
+        elif job.status == JobStatus.QUEUED and (view := _startup_verify_view()):
+            # Spec 03 I76: a queued job waits on the startup check, not on a fault; its bound is in the view.
+            result["hold_reason"] = "held: startup check; dispatches when it passes"
+            result["startup_verify"] = view
         if job.preemptable:
             result["no_timeout_except_on_contention"] = True
             result["preemptable"] = True  # the earlier name, for clients that read it
@@ -15717,6 +15862,10 @@ def create_mcp_server() -> MCPServer:
                     "steps": steps,
                     "hint": RESET_BUSY_HINT.format(force="force=true"),
                 }
+            in_flight = await _reset_in_flight()
+            if in_flight:
+                step(f"REFUSED: {in_flight}", "warning")
+                return {"status": "refused", "reason": "reset_in_flight", "detail": in_flight, "steps": steps}
             _void_fabric_ok("operator reset")
             rc, reset_out = await recovery_mechanism.reset_with_quiesce(argv, lambda m: step(m), reset_owner)
             status = "reset_complete" if rc == 0 else "reset_failed"

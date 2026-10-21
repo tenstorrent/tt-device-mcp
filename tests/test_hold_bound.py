@@ -23,8 +23,10 @@ from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health.core import HealthState
 from tt_device_mcp.health.monitors import fabric
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import OUTCOME_RECOVERED, OUTCOME_TERMINAL, galaxy
 from tt_device_mcp.job_reap import ReapedLeftover
+from tt_device_mcp.pre_reset_scan import PreResetScan
 
 BOUND = 600
 # Class D (moved tray, latched I42 hold): its time-to-recover budget, and the measured worst of the full
@@ -534,6 +536,174 @@ async def test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_
     assert "hold_bound_latch_cleared" not in kinds, "the I42 latch stands: a mismatch after the ladder fails"
     assert srv.health_monitor.topology_hw_fault
     assert srv._hold_escalated_report(), "a stuck-hold event past the bound reports the escalation"
+
+
+# ---- spec 04 I92: a reset the pre-reset holder scan refuses is no reset; the bound still runs -----
+
+_READER_ROW = {"pid": 4303, "uid": 1002, "user": "alice", "comm": "python3", "scoped": False, "state": "S"}
+
+
+def _refusing_scan(outcome: str) -> PreResetScan:
+    """What clear_device_readers hands back when it refuses the reset with ``outcome``."""
+    row = dict(_READER_ROW)
+    if outcome == "survivor":
+        return PreResetScan(found=[row], killed=[dict(row, signal="SIGKILL", released=False)], survivors=[row])
+    if outcome == "offbus_undetached":
+        return PreResetScan(found=[row], undetached=["29"], readers_left=[row])
+    if outcome == "unkillable":
+        row["state"] = "D"
+        return PreResetScan(found=[row], killed=[dict(row, signal="SIGKILL", released=False)], unkillable=[row])
+    assert outcome == "tenant_blocked"
+    return PreResetScan(found=[row], tenants=[row])
+
+
+def _scan_refuses_the_mesh_reset(rig, monkeypatch, scans):  # noqa: F811
+    """The ladder's mesh reset is the real ``_reset_and_verify_device`` and ``reset_with_quiesce``; only the
+    broker's pre-reset scan answers from ``scans`` (one per call, the last repeats). A reset that ran would
+    land in ``rig['order']`` as ``reset_ran``; each scan the mesh reset reached as ``glx_reset``."""
+    order, g = rig["order"], rig["g"]
+    monkeypatch.setattr(g, "_reset_and_verify_device", type(g)._reset_and_verify_device.__get__(g))
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    calls = []
+
+    async def scan(**_):
+        calls.append(1)
+        order.append("glx_reset")
+        return scans[min(len(calls), len(scans)) - 1]
+
+    async def no_scope(log):
+        return False
+
+    async def pollers(active, log):
+        return []
+
+    async def run(argv, log, owner="[broker]health-gate", *a):
+        order.append("reset_ran")
+        return 1, ""
+
+    monkeypatch.setattr(srv, "clear_device_readers", scan)
+    monkeypatch.setattr(srv.recovery_mechanism, "pre_reset_scan", srv._pre_reset_holder_scan)
+    monkeypatch.setattr(srv, "_pre_reset_blocker", None)
+    monkeypatch.setattr(g.mechanism, "await_foreign_scope", no_scope)
+    monkeypatch.setattr(g.mechanism, "run_scoped", run)
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    monkeypatch.setattr(galaxy.pcie_guard, "chips_off_bus", lambda expected: 0)
+    monkeypatch.setattr(FABRIC_DEBT, "owed", "")
+    return calls
+
+
+def _bound_hold_with_a_failing_full_check(rig, monkeypatch):  # noqa: F811
+    """A present-mesh hold past the bound whose full check, fabric included, keeps failing; returns the
+    checks' log. The power cycle is marked pending as the real one does, so a second request would show."""
+    g = rig["g"]
+    rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
+    fsm_dirty(srv, "gate/post-job: eth/fabric fault on a present mesh", why="eth_frozen")
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "_present_chip_indices", lambda: [str(i) for i in range(EXPECTED)])
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda n: EXPECTED)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "")
+    monkeypatch.setattr(srv, "device_hold_episode_since", _since(BOUND + 1))
+    monkeypatch.setattr(srv, "device_hold_episode_reason", "gate/post-job: eth/fabric fault on a present mesh")
+    monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
+    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
+    _watchdog(monkeypatch)
+    checks = []
+
+    async def full_check(expected, log, run_fabric=True, **k):
+        checks.append(run_fabric)
+        return False, {"fabric": {"ok": False, "detail": "eth links down"}}
+
+    monkeypatch.setattr(g, "_verify_device", full_check)
+    rig_cycle = srv._auto_power_cycle_host
+
+    async def cycle_and_mark(log, reason):
+        await rig_cycle(log, reason)
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", cycle_and_mark)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+    return checks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["survivor", "offbus_undetached", "unkillable"])
+async def test_a_reset_the_holder_scan_refuses_keeps_the_hold_and_the_bound_cycles(
+    rig, monkeypatch, clear_job_state, outcome  # noqa: F811
+):
+    """Spec 04 I92 with I76: the pre-reset scan refuses the bound ladder's mesh reset (a reader that would
+    not let go, an off-bus chip it could not detach, a reader stuck in the kernel). No reset runs and none
+    is counted; the hold stays, the full check with fabric still fails, and the broker's own code asks for
+    the power cycle once. Nothing is released and the fabric stays owed."""
+    order, g = rig["order"], rig["g"]
+    checks = _bound_hold_with_a_failing_full_check(rig, monkeypatch)
+    scans = _scan_refuses_the_mesh_reset(rig, monkeypatch, [_refusing_scan(outcome)])
+
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+
+    kinds = [k for k, _ in rig["events"]]
+    assert scans and "glx_reset" in order, "the 10-min ladder reached its mesh reset"
+    assert "reset_ran" not in order, "the scan refused: no reset ran"
+    assert "reset_refused" in kinds and "reset_failed" not in kinds
+    assert [f["outcome"] for k, f in rig["events"] if k == "pre_reset_holder_scan"][0] == outcome
+    assert srv._pre_reset_blocker and srv._pre_reset_blocker["blocker"] == outcome
+    assert checks and all(checks), "the check after the ladder is the full one, fabric included"
+    assert order.count("power_cycle") == 1, "the broker's own code asked for the power cycle once"
+    assert order.index("glx_reset") < order.index("power_cycle")
+    assert "released" not in order, "nothing released without a passing full check"
+    assert FABRIC_DEBT.owed, "a refused reset leaves the fabric owed"
+    assert srv.fsm.state != ServerState.HEALTHY
+    assert g.mechanism.last_reset_rc is None, "a refused reset is no failed reset in the boot's record"
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_the_holder_scan_finds_bounds_the_hold_and_the_ladder_runs_when_it_leaves(
+    rig, monkeypatch, clear_job_state  # noqa: F811
+):
+    """Spec 04 I92 with I76: a tenant at the bound keeps every reset off the device, the ladder's own check
+    and the pre-reset scan alike. That hold is bounded only by the tenant: paged once naming it, shown in
+    /health. On the first tick after it leaves the ladder runs; the scan then refuses past a reader that
+    would not let go, the full check with fabric fails and the power cycle is asked for once."""
+    order = rig["order"]
+    checks = _bound_hold_with_a_failing_full_check(rig, monkeypatch)
+    scans = _scan_refuses_the_mesh_reset(
+        rig, monkeypatch, [_refusing_scan("tenant_blocked"), _refusing_scan("survivor")]
+    )
+    alerts = []
+    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event))
+    monkeypatch.setattr(srv, "device_hold_tenant_deferred", False)
+    tenant = {"on": True}
+    monkeypatch.setattr(
+        srv,
+        "enumerate_device_holders",
+        lambda: HolderScan(holders=[DeviceHolder(pid=4303, uid=1002)] if tenant["on"] else [], complete=True),
+    )
+    monkeypatch.setattr(galaxy, "is_tenant", lambda h: True)
+    monkeypatch.setattr(galaxy, "discount_broker_internal", lambda scan: scan)
+    monkeypatch.setattr(galaxy, "holder_comm", lambda pid: "python3")
+
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    _tick()
+    await _drain()
+
+    kinds = [k for k, _ in rig["events"]]
+    pages = [a for a in alerts if a["kind"] == "hold_bound_tenant_blocked"]
+    assert len(pages) == 1 and "4303" in pages[0]["blocked_by"]
+    assert kinds.count("hold_bound_tenant_blocked") == 1
+    assert srv._hold_bound_health()["next_step"] == "tenant_blocked"
+    assert "reset_ran" not in order and "power_cycle" not in order and "released" not in order
+
+    tenant["on"] = False
+    _tick(20)
+    await _drain()
+    assert scans and "reset_ran" not in order, "the scan still refused: no reset ran"
+    assert checks and all(checks), "the check after the ladder is the full one, fabric included"
+    assert order.count("power_cycle") == 1, "the broker's own code asked for the power cycle once"
+    assert "released" not in order and FABRIC_DEBT.owed
+    assert srv._hold_bound_health()["next_step"] != "tenant_blocked"
 
 
 # ---- broker-level replay: the latch set by the first job after a topology-mismatch lift ----------

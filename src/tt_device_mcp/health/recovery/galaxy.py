@@ -1968,10 +1968,15 @@ class GalaxyRecovery(Recovery):
             )
             aer_mask = pcie_guard.mask_for_mesh_reset(log)
             try:
-                await self.mechanism.reset_with_quiesce(argv, log)
+                result = await self.mechanism.reset_with_quiesce(argv, log)
             finally:
                 if aer_mask is not None:
                     await asyncio.to_thread(aer_mask.restore)
+            out = result[1] if isinstance(result, tuple) and result[0] is None else ""
+            if str(out).startswith("reset refused:"):
+                # Spec 04 I92: no reset ran. The caller's verify still decides, and a failed one climbs
+                # to the host rung as before; the refusal is journalled as itself, not as a reset.
+                health_event("reset_refused", context="reset_sweep", argv=argv, detail=out)
         except Exception as exc:  # noqa: BLE001 - the host rung above must fire even if a reset blew up
             log(f"the back-to-back reset sweep raised {exc!r} — continuing to the host rung")
             health_event("last_chance_reset_sweep_error", error=repr(exc))

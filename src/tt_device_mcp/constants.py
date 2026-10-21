@@ -75,6 +75,20 @@ PREEMPT_GRACE_SEC = 60
 # full check.
 PREEMPT_KILL_GRACE_SEC = 10
 
+# Before any reset, a process other than a tenant that still maps the device gets SIGTERM and
+# this long to let go before SIGKILL (spec 04 I92): the same 10 s a preempted job's handlers get.
+# A reader that keeps its mapping through a reset reads chips that are off the bus.
+PRE_RESET_TERM_GRACE_SEC = PREEMPT_KILL_GRACE_SEC
+
+# The longest the pre-reset scan waits for the off-bus chips' detach (a sysfs PCI remove, spec 04
+# I92) before it gives up: a remove that does not return in this time counts as not detached, the
+# reset is refused and the hold stays for the bounded recovery. One deadline for all the chips.
+PRE_RESET_DETACH_TIMEOUT_SEC = 30
+
+# A pre-reset scan that cannot see a holder it knows of (the driver names a pid it could not read,
+# often one mid-exit) scans once more after this long before it refuses the reset (spec 04 I92).
+PRE_RESET_RESCAN_SETTLE_SEC = 1.0
+
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
 # is deliberately never killed, because one stopped partway through 32 ASICs is far worse
