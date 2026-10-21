@@ -1374,6 +1374,32 @@ def test_health_names_a_disproven_lifts_early_ladder_then_its_host_rung(monkeypa
     assert rung.at == pytest.approx(started + 250 + srv._HOLD_BOUND_CHECK_SEC, abs=1)
 
 
+def test_a_disproven_lifts_deadline_moves_to_the_10_min_mark_once_its_early_ladder_ran(monkeypatch, clear_job_state):
+    """Spec 04 I76 with 03 I42: /health's bound_sec and deadline, and the stuck-hold event's
+    escalation_deadline, name the mark the broker acts on next: one sampler tick in until the early
+    ladder runs, then the 600 s mark, whose full ladder still runs (never a past one-tick deadline)."""
+    tick = float(srv.SAMPLE_INTERVAL_SEC)
+    _arm_disproven_lift_hold(monkeypatch, age_sec=2)
+    started = datetime.fromisoformat(srv.device_hold_episode_since)
+    health = srv._hold_bound_health()
+    assert health["bound_sec"] == int(tick)
+    assert srv.hold_bound_deadline() == started + timedelta(seconds=tick)
+
+    since = _since(300)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since)
+    monkeypatch.setattr(srv, "_hold_bound_episode", since)
+    monkeypatch.setattr(srv, "_hold_bound_ladder_age", 250.0)
+    monkeypatch.setattr(srv, "_hold_bound_cycle_age", None)
+    monkeypatch.setattr(srv, "_hold_bound_check_failed_age", None)
+    monkeypatch.setattr(srv, "_hold_bound_rung_pending", False)
+    assert srv._hold_bound_sec() == tick, "the latch still stands: the broker's own bound is unchanged"
+    started = datetime.fromisoformat(since)
+    deadline = started + timedelta(seconds=BOUND)
+    assert srv.hold_bound_deadline() == deadline
+    health = srv._hold_bound_health()
+    assert health["bound_sec"] == BOUND and health["deadline"] == deadline.isoformat(timespec="seconds")
+
+
 # Spec 04 I79 (the class D 77 climb) against I76 (the 10-min bound): one ladder and one power-cycle
 # request per episode, whichever path gets there first, and no wait past the I65 cooldown's end.
 _77 = "post-job: fabric check COULD NOT RUN (77)"
