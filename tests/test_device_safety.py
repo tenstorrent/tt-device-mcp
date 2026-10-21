@@ -4195,6 +4195,34 @@ async def test_the_owner_comes_from_the_peer_uid_and_the_surface(monkeypatch, cl
         current_peer_uid.reset(tok)
 
 
+def test_rest_job_logs_clamps_tail_to_the_tool_cap(monkeypatch, tmp_path, clear_job_state):
+    """The MCP tool's schema caps `tail` at 10,000 lines, but the REST route the CLI uses passed it
+    through raw: tail=10001 returned 10,001 lines and tail=0 the whole log. The cap holds in the
+    shared helper, on every path (spec 02 I2)."""
+    from starlette.testclient import TestClient
+
+    log = tmp_path / "j.log"
+    log.write_text("".join(f"l{i}\n" for i in range(12000)))
+    monkeypatch.setattr(srv, "jobs", {})
+    srv.jobs["050"] = srv.Job(
+        id="050", owner="t", workspace="/tmp", command="echo hi", queued_at="t", log_file=str(log)
+    )
+    app = srv.build_asgi_app(srv.create_mcp_server())
+    with TestClient(app) as client:
+
+        def lines(tail):
+            body = {"job_id": "050"} if tail is None else {"job_id": "050", "tail": tail}
+            return client.post("/api/tt_device_job_logs", json=body).json()["content"].splitlines()
+
+        assert len(lines(10001)) == srv.MAX_LOG_TAIL_LINES == 10000
+        assert lines(10001)[-1] == "l11999"
+        assert lines(0) == ["l11999"]
+        assert lines(-5) == ["l11999"]
+        assert len(lines("x")) == len(lines(None)) == 100
+        assert len(lines(250)) == 250
+    assert srv.JobLogsInput.model_fields["tail"].metadata[-1].le == srv.MAX_LOG_TAIL_LINES
+
+
 @pytest.mark.asyncio
 async def test_rest_submit_clamps_timeout_to_the_hard_ceiling(monkeypatch, clear_job_state):
     """The 25-min ceiling has to hold on the REST path, not only the MCP tool's schema. The CLI

@@ -211,6 +211,9 @@ MAX_TIMEOUT_SEC = 1500  # 25 minutes
 # it is bounded far tighter than a queued job: a triage that cannot answer in this many seconds
 # is wedged itself, and letting it run unbounded adds a second stuck process to the mesh.
 EXEC_MAX_TIMEOUT_SEC = 600
+# Most lines a job-logs call returns (spec 02 I2): held in _get_job_logs, so the REST route the
+# CLI uses gets the same cap as the MCP tool's schema.
+MAX_LOG_TAIL_LINES = 10000
 
 # In-memory job output is a bounded tail (the log file is the complete record).
 # Unbounded accumulation of a chatty job's output would starve the event loop:
@@ -410,7 +413,7 @@ class JobLogsInput(JobIdInput):
     tail: int = Field(
         100,
         ge=1,
-        le=10000,
+        le=MAX_LOG_TAIL_LINES,
         description="Number of lines to return from end of log file. Default: 100.",
     )
 
@@ -14228,6 +14231,11 @@ def create_mcp_server() -> MCPServer:
             return {"error": "Job not found"}
 
         job = jobs[job_id]
+        # The REST route passes `tail` through raw: clamp it here, as the tool's schema does.
+        try:
+            tail = max(1, min(int(tail), MAX_LOG_TAIL_LINES))
+        except (TypeError, ValueError):
+            tail = 100
         content = ""
         if job.log_file and os.path.exists(job.log_file):
             with open(job.log_file, "r") as f:
