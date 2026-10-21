@@ -13639,14 +13639,14 @@ def create_mcp_server() -> MCPServer:
             result["cause"] = job.error
         if job.status == JobStatus.RUNNING:
             result.update(job_activity_view(job_id) or {})  # DEVICE IDLE (spec 03 I54)
+        elif job.idle_total_sec is not None:
+            result["idle_total_sec"] = job.idle_total_sec
         if job_id in readopted_scopes:
             result["readopted"] = True
             # Spec 03 I76: the broker's startup hold waits on this job; it is not a fault.
             view = _startup_verify_view()
             if view and job_id in view["readopted_job_ids"]:
                 result["startup_verify"] = view
-        elif job.idle_total_sec is not None:
-            result["idle_total_sec"] = job.idle_total_sec
         if job.preemptable:
             result["no_timeout_except_on_contention"] = True
             result["preemptable"] = True  # the earlier name, for clients that read it
