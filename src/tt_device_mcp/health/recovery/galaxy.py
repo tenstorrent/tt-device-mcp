@@ -32,7 +32,6 @@ from tt_device_mcp.health.recovery import (
     BLOCKED,
     DEFER,
     HOLD_FABRIC_UNVERIFIED,
-    NO_WINDOW_REMOVED_REASON,
     OUTCOME_RECOVERED,
     OUTCOME_TERMINAL,
     OUTCOME_WAITING,
@@ -235,16 +234,6 @@ def _offbus_hold_ceiling_sec() -> int:
     return v if v > 0 else 120
 
 
-# The two top-level branches every hold takes, named in code so the ladder reads the way the
-# design does. TRAY_DOWN_NO_WINDOW is the one drop the data says no reset ever recovers (a whole
-# UBB tray off the bus with no bridge window on any of its chips) — so it fires every reset type
-# back-to-back and goes straight to the power cycle. GENERIC is everything else, including anything
-# unseen: cheap rungs first, verify between, mesh-reset retries to the ceiling, then the power
-# cycle. Selected ONCE per hold (see _classify_hold).
-HOLD_CLASS_TRAY_DOWN_NO_WINDOW = "tray-down-no-window"
-HOLD_CLASS_GENERIC = "generic"
-
-
 def _settle_before_host_rung_sec() -> int:
     """Seconds to let the mesh re-enumerate after the last reset in a branch before the ONE verify
     that decides a power cycle — the tray branch's single settle, and the settle GENERIC runs before
@@ -270,47 +259,6 @@ def _progress_retry_sec() -> int:
     except ValueError:
         v = 60
     return min(v if v > 0 else 60, _stuck_hold_ceiling_sec())
-
-
-# The bridge rung's per-chip reasons that mean no SBR brings the chip back (see _classify_hold).
-NO_WINDOW_REASONS = frozenset({"no_bridge", NO_WINDOW_REMOVED_REASON})
-
-
-def _classify_hold(
-    offbus_chips: set,
-    expected: int,
-    bridge_reset_failed: Optional[dict] = None,
-    tray_map: Optional[dict] = None,
-) -> str:
-    """The branch a hold takes, chosen once from the gate's inputs.
-
-    ``HOLD_CLASS_TRAY_DOWN_NO_WINDOW`` iff the off-bus set is exactly one or more whole UBB trays
-    (``_whole_tray_drop_trays`` matches — every off-bus chip's tray fully down, nothing off-bus outside
-    them) AND every off-bus chip has NO bridge window: a secondary bus reset on it reports
-    ``no_bridge`` because its PCIe node left the bus entirely. That is the one drop measured never
-    to return by any rung (40/40 episodes), so it earns the back-to-back reset sweep straight to a
-    power cycle. Everything else — a partial-tray drop, an all-ones (still-bridged) chip a reset can
-    recover, a present-mesh eth/fabric wedge, or anything unseen — is ``HOLD_CLASS_GENERIC``.
-
-    ``bridge_reset_failed`` maps chip id -> its last SBR result dict (``{"reason": "no_bridge", ...}``);
-    a chip absent from it has an UNKNOWN window, so the hold is not the no-window class. A chip the
-    broker removed whose recorded-bridge SBRs all fired and left it off the bus
-    (``removed_not_reenumerated``) has no window either: it is the same drop, now reset through the
-    bridge isolate_chip recorded, and it keeps the class it had before that reset existed (spec 04 I69).
-
-    ``tray_map`` is the cached bus-derived tray identity (I16). Without one the caller cannot know
-    which chips share a tray, so the classification cannot land in TRAY_DOWN_NO_WINDOW — the same
-    "no map, no fire" rule the planners follow. Pure and side-effect-free."""
-    if _whole_tray_drop_trays(offbus_chips, expected, tray_map) is None:
-        return HOLD_CLASS_GENERIC
-    reasons = bridge_reset_failed if isinstance(bridge_reset_failed, dict) else {}
-    for chip in offbus_chips:
-        rec = reasons.get(chip)
-        if rec is None:
-            rec = reasons.get(str(chip))
-        if not isinstance(rec, dict) or rec.get("reason") not in NO_WINDOW_REASONS:
-            return HOLD_CLASS_GENERIC
-    return HOLD_CLASS_TRAY_DOWN_NO_WINDOW
 
 
 # The two off-bus fault classes that go to the power cycle with no further reset (spec 04 I37). A: one
@@ -1493,27 +1441,11 @@ class GalaxyRecovery(Recovery):
             self.deps.clear_device_dirty(verified=True, why=f"gate/{gate_phase}: bridge reset recovered the mesh")
             return OUTCOME_RECOVERED
         if stage == BELOW_FLOOR:
-            # Below the galaxy floor there is no tray rung: no BMC tray re-power exists (spec 04 I23). The
-            # hold's CLASS is decided ONCE here from this pass's evidence (see _classify_hold). A whole UBB
-            # tray off the bus with no bridge window on any of its chips is TRAY_DOWN_NO_WINDOW: every
-            # remaining reset type back-to-back, one verify, then the power cycle
-            # (_fire_tray_down_no_window). Any other whole-tray drop goes to the bounded power cycle now,
-            # with no grace (I37); anything else holds, and the I76 bound runs the ladder at 10 min.
+            # Below the galaxy floor there is no tray rung: no BMC tray re-power exists (spec 04 I23), and
+            # no back-to-back reset sweep either. A whole-tray drop goes to the bounded power cycle now,
+            # with no grace (I37); the I65 cooldown is its only wait. Anything else holds, and the I76
+            # bound runs the ladder at 10 min.
             offbus_set = _offbus_chip_ids(beats or {}, expected)
-            tray_map = self._tray_map_now()
-            hold_class = _classify_hold(offbus_set, expected, ev.bridge_reset_failed if ev else None, tray_map)
-            health_event(
-                "hold_classified",
-                phase=gate_phase,
-                hold_class=hold_class,
-                off_bus=sorted(offbus_set, key=int),
-                trays=_affected_trays(offbus_set, expected, tray_map),
-                expected=expected,
-            )
-            if hold_class == HOLD_CLASS_TRAY_DOWN_NO_WINDOW:
-                # _fire_tray_down_no_window clears the fault/dirty itself on a recovered verify and
-                # holds (WAITING) when it power-cycles or a guard blocks it, so its verdict is final.
-                return await self._fire_tray_down_no_window(offbus_set, expected, log, gate_phase=gate_phase, ev=ev)
             self._note_whole_tray_drop(beats or {}, ev.off_bus if ev else 0, expected, log)
             hold_since = self.deps.device_hold_episode_since()
             if offbus_power_cycle.whole_tray_down_age_sec(hold_since) is not None:
@@ -1813,14 +1745,14 @@ class GalaxyRecovery(Recovery):
         """Fire EVERY reset type once, back-to-back, with no waiting or verifying between them: SBR on
         any chip still bridged, then the mesh-wide reset —
         each issued as soon as the previous command returns. The single implementation of "all rungs",
-        shared by the TRAY_DOWN_NO_WINDOW branch and by the last-chance sweep that gates every host
-        rung, so the two can never drift apart. Never verifies and never raises: a rung that fails to
-        launch is logged and the next one is issued anyway — before a reboot or a power cycle there is
-        nothing left to lose. The caller owns the guards (tenant, scope), the settle and the verify.
+        used only by the last-chance sweep that gates the power cycle. Never verifies and never raises:
+        a rung that fails to launch is logged and the next one is issued anyway — before a power cycle
+        there is nothing left to lose. The caller owns the guards (tenant, scope), the settle and the
+        verify.
 
         Returns whether the sweep was COMPLETE: False when the per-host gate (spec 04 I24) or the
         outage hold (I28) refused it. An incomplete sweep is not the full ladder,
-        so the caller must not climb to a power cycle or reboot on it (I22)."""
+        so the caller must not climb to a power cycle on it (I22)."""
         off_bus = pcie_guard.chips_off_bus(expected)
         allowed, why = pcie_guard.host_reset_gate(off_bus)
         if not allowed:
@@ -1874,18 +1806,16 @@ class GalaxyRecovery(Recovery):
         context: str = "",
         fabric_77_unverified: bool = False,
     ) -> Optional[bool]:
-        """The LAST-CHANCE gate every host rung passes through: fire every reset type once more,
+        """The LAST-CHANCE gate the power cycle passes through: fire every reset type once more,
         back-to-back, then ONE settle and ONE verify — and only if the mesh is still bad does the
-        caller reboot or power-cycle. True iff the mesh came back, in which case the fault/dirty are
-        retired and the door reopens, so the caller skips the host rung entirely.
+        caller power-cycle. True iff the mesh came back, in which case the fault/dirty are retired and
+        the door reopens, so the caller skips the power cycle entirely.
 
-        Why the resets and not just a settle: a reboot or a power cycle takes the whole box down and
-        costs minutes, so before paying that there is nothing to lose by re-issuing SBR and the mesh
-        reset (user, 2026-09-17: "we always need to give the resets one last
-        chance before power cycle"). Before this, only the TRAY_DOWN_NO_WINDOW branch swept; every
-        other road to a host rung — the generic ladder's ceiling, the idle/stuck-hold escalation, the
-        post-reboot cold climb — settled and verified but never re-tried the rungs, so a present-mesh
-        eth wedge could be power-cycled having only ever seen mesh resets.
+        Why the resets and not just a settle: a power cycle takes the whole box down and costs
+        minutes, so before paying that there is nothing to lose by re-issuing SBR and the mesh reset
+        once ("we always need to give the resets one last chance before power cycle"). It runs at
+        most once per hold phase (spec 04 I84): once below the 10-min bound, and once more as part of
+        the bound's own ladder.
 
         ``offbus_chips`` names the off-bus chips the journal lines place (read from the heartbeats when
         not given). The sweep is SKIPPED — the
@@ -2003,105 +1933,6 @@ class GalaxyRecovery(Recovery):
         log(f"the mesh verified after the {via} — no reboot or power cycle needed")
         health_event("gate", phase=gate_phase, healthy=True, recovered_via=via, evidence=evidence)
         return True
-
-    async def _fire_tray_down_no_window(
-        self, offbus_chips: set, expected: int, log, *, gate_phase: str, ev: Optional[Evidence]
-    ) -> str:
-        """The TRAY_DOWN_NO_WINDOW branch: a whole UBB tray off the bus with no bridge window on any
-        chip — the one drop measured never to return by any reset (0/40). So fire every reset type
-        BACK-TO-BACK with no waiting or verifying between them — SBR on the dead chips, then the
-        mesh-wide reset — issue each as soon as the
-        previous command returns, then ONE settle and ONE verify, and only if the mesh is still bad,
-        the power cycle. No retries, no ceiling wait, no rung skipped: there is nothing to lose
-        before a power cycle.
-
-        Returns OUTCOME_RECOVERED if the one verify came back healthy, else OUTCOME_WAITING (the
-        power cycle fired, or was blocked/held). Guards: never under a tenant, never over a reset
-        already cycling in its own scope — it re-powers silicon."""
-        if await asyncio.to_thread(self.mechanism.scope_active):
-            log("tray-down-no-window but a reset is already cycling in its own scope — holding; the gate adopts it")
-            return OUTCOME_WAITING
-        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        if self._tenant_active(scan):
-            log(
-                "tray-down-no-window but a tenant holds the device, the scan is unreadable, or a job is running — holding"
-            )
-            return OUTCOME_WAITING
-        tray_map = self._tray_map_now()
-        trays = _affected_trays(offbus_chips, expected, tray_map) or []
-        health_event(
-            "tray_down_no_window_sweep",
-            trays=trays,
-            off_bus=len(offbus_chips),
-            expected=expected,
-            host_at_risk=True,
-        )
-        log(
-            f"TRAY_DOWN_NO_WINDOW ({len(offbus_chips)}/{expected} off the bus, trays {trays}) — firing every "
-            f"reset type back-to-back (SBR -> mesh reset), then one {_settle_before_host_rung_sec()}s "
-            f"settle and one verify before a power cycle"
-        )
-        complete = await self._issue_all_resets_back_to_back(trays, expected, log)
-        # ONE settle, ONE verify.
-        settle = _settle_before_host_rung_sec()
-        log(f"back-to-back reset sweep issued — settling {settle}s, then one verify")
-        try:
-            await asyncio.sleep(settle)
-            healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
-            FABRIC_DEBT.note_evidence(evidence)
-        finally:
-            pcie_guard.end_offbus_reset()
-        if healthy:
-            log("tray-down-no-window sweep recovered the mesh — no power cycle needed")
-            health_event("tray_down_no_window_recovered", trays=trays, evidence=evidence)
-            self.deps.clear_device_reported_fault(f"gate/{gate_phase}: tray-down-no-window sweep recovered the mesh")
-            self.deps.clear_device_dirty(
-                verified=True, why=f"gate/{gate_phase}: tray-down-no-window sweep recovered the mesh"
-            )
-            return OUTCOME_RECOVERED
-        if not complete:
-            log("tray-down-no-window: the full reset ladder did not run — holding; no power cycle this pass")
-            health_event("host_rung_held", context="tray-down-no-window", reason="reset sweep skipped or incomplete")
-            return OUTCOME_WAITING
-        # Still bad after every reset — the power cycle, under the same opt-in + tenant + rate-limit
-        # guards as any host rung.
-        off_bus = len(offbus_chips)
-        # Log-only: more chips may be off by now than at onset. Every decision below uses off_bus.
-        try:
-            beats_now = await asyncio.to_thread(self.deps.read_heartbeats)
-            off_bus_after = len(_offbus_chip_ids(beats_now or {}, expected))
-        except Exception as e:  # noqa: BLE001 - a failed re-read must never block the power cycle
-            log(f"tray-down-no-window: could not re-read the heartbeats after the verify: {e!r}")
-            off_bus_after = None
-        escalation, reboot_blocked = _host_escalation_for_drop(off_bus, expected, **self.deps.host_escalation_kwargs())
-        if reboot_blocked or escalation != "power-cycle":
-            log(
-                f"tray-down-no-window sweep did not recover the mesh; power cycle not auto-fired "
-                f"(off the bus: {off_bus}/{expected} at onset, {off_bus_after} after the verify)"
-            )
-            if off_bus >= expected:
-                self.deps.emit_all_off_bus_power_cycle_required(log, off_bus, expected, f"gate/{gate_phase}")
-            else:
-                self._emit_reset_unrecoverable_power_cycle_required(
-                    log, off_bus, expected, regressed=False, context=f"gate/{gate_phase} tray-down-no-window"
-                )
-            metrics.stage_fired("power_cycle", "blocked")
-            return OUTCOME_WAITING
-        tenant_active = self._tenant_active(scan)
-        allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=tenant_active)
-        if not allowed:
-            log(
-                f"tray-down-no-window sweep did not recover the mesh and a power cycle is opted in but held off: {why} "
-                f"(off the bus: {off_bus}/{expected} at onset, {off_bus_after} after the verify)"
-            )
-            self.mechanism._journal_auto_recovery_denied(escalation, why)
-            metrics.stage_fired("power_cycle", "blocked")
-            return OUTCOME_WAITING
-        health_event("tray_down_no_window_power_cycle", off_bus=off_bus, off_bus_after=off_bus_after, expected=expected)
-        await self.deps.auto_power_cycle_host(
-            log, "tray-down-no-window: every reset type ran back-to-back and the mesh did not verify"
-        )
-        return OUTCOME_WAITING
 
     async def _class_a_cooldown_sweep(self, offbus: set, expected: int, log) -> str:
         """Spec 04 I73 at the 10-min mark: a whole-tray (class A) hold whose power cycle the boot or
