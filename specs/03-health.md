@@ -951,8 +951,9 @@ cooldown (spec 04 I65) holds longer.
   and the stop is left to the dead-chip valve, which stops the pollers only after a successful
   remove or refuses, journals `chip_dead_kill_refused` and keeps the hold (I84). The pollers keep
   reading that chip for at most one more sample (`SAMPLE_INTERVAL_SEC`, 10 s; the fast cadence's
-  `FAST_CONFIRM_SEC` gate is 4 s), the window the two-sample proof already accepts; a reset's own
-  quiesce has stopped them already. A whole-mesh blip or a reset does not count. They are not restored after a failed or timed-out
+  `FAST_CONFIRM_SEC` gate is 4 s), the window the two-sample proof already accepts. A reset step's own
+  quiesce (04 I12) and the startup check's quiesce follow the same rule: they detach every attached
+  all-ones chip first, and stop the pollers only after it (I84). A whole-mesh blip or a reset does not count. They are not restored after a failed or timed-out
   reset, even while the FSM still reads HEALTHY: the device stays held and their start is owed to the next close to HEALTHY,
   reached only through a passing full check, fabric included (04 I12's deferred restore). The state is
   published atomically to `chip-state.json` (spec 06) and on `/health`, so other readers on the
@@ -1407,6 +1408,31 @@ cooldown (spec 04 I65) holds longer.
   running job with no waiter held the device with no bound. The record routes the bound only: it
   never lifts a hold, and only a just-passed full check with fabric (fewer links than cabled is a
   fail) lifts the hold and clears it. Time to recover, refused kill: 10 min plus the power cycle.
+  Every reset step's poller stop follows the same rule (04 I12). Before `reset_with_quiesce` stops
+  the pollers, and before the startup check's quiesce does, `TelemetrySampler.detach_before_quiesce`
+  PCI-removes each chip the sampler last saw reading all-ones (lost, or on its first strike) whose
+  KMD node is still there, within the same `DETACH_TIMEOUT_SEC` bound, with `reset_in_flight` set so
+  the valve does not race it, and journals `reset_quiesce_detach`. Removed chips join the isolated
+  set, so the reset's rescan brings them back. Per reset kind: the operator reset, every ladder
+  rung, the hold-deadline ladder, the mesh reset (`glx_reset`) and the sweep's repeat all go
+  through `reset_with_quiesce` and detach first; when a chip will not detach, the step is refused
+  before any poller stop or reset (`reset_fenced`), since its own reads and fd closes would reach the
+  chip too. The startup check detaches first; on a refusal it keeps the pollers up and still runs
+  its check, which cannot pass with that chip. The bridge/SBR rung acts only on removed chips and
+  stops no poller, and the power-cycle request takes the host down rather than closing fds on a
+  live one: both are unchanged. A chip that only stalled (it still answers) needs no remove, and
+  the pollers stop at once as before. The step is refused with nothing removed or stopped when
+  every present chip reads all-ones (I19 never isolates the whole mesh; that class goes straight to
+  the power cycle), when a remove fails, times out or none is wired, and at once with no new remove
+  for a chip an earlier step could not detach. Such a chip is recorded (`quiesce_refused`); while
+  it still reads all-ones and is attached, the spec 04 I76 bound treats the hold like a refused
+  kill: no ladder (each of its resets would be refused) and a power-cycle request at the 10-min
+  mark. The record lifts nothing, and only a passing full check with fabric clears it. Time to
+  recover: partial off-bus already removed by the valve, and stalled-only chips, unchanged; an
+  all-ones chip still attached at reset time adds one remove (well under a second, at most 15 s);
+  a remove that fails or hangs costs the first reset at most 15 s, refuses later resets at once, and
+  the power cycle comes at the 10-min bound (plus the I65 cooldown) with no reset run over the
+  attached chip; whole-tray and all-chips-off drops are unchanged, straight to the power cycle.
 
 ## Interfaces
 
@@ -2097,6 +2123,7 @@ refuses.
 | I82 | `tests/test_fabric_killed_by_dead_chip.py::test_a_fabric_check_killed_by_dead_chip_isolation_is_no_verdict`, `tests/test_fabric_killed_by_dead_chip.py::test_the_kill_mark_is_read_once_and_a_later_pass_settles_the_debt`, `tests/test_fabric_killed_by_dead_chip.py::test_a_minus_9_the_isolation_did_not_cause_keeps_its_old_verdict`, `tests/test_fabric_killed_by_dead_chip.py::test_a_kill_during_the_traffic_only_rerun_is_no_verdict_either`, `tests/test_fabric_killed_by_dead_chip.py::test_a_kill_during_the_descriptor_run_starts_no_rerun`, `tests/test_fabric_killed_by_dead_chip.py::test_dead_chip_isolation_marks_the_fabric_check_killed_and_no_lift_follows`, `tests/test_fabric_killed_by_dead_chip.py::test_isolation_with_no_fabric_check_in_flight_marks_nothing` |
 | I84 | `tests/test_deadchip_detach_before_kill.py::test_every_kill_and_poller_stop_comes_after_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_detach_kills_nobody_and_keeps_the_hold`, `tests/test_deadchip_detach_before_kill.py::test_one_failed_detach_of_two_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_with_no_detach_wired_nobody_is_killed`, `tests/test_deadchip_detach_before_kill.py::test_a_hung_detach_is_bounded_and_the_loop_stays_responsive`, `tests/test_deadchip_detach_before_kill.py::test_a_reset_that_started_before_the_kill_keeps_every_holder`, `tests/test_deadchip_detach_before_kill.py::test_another_all_ones_chip_not_yet_detached_defers_the_kill_to_its_own_valve`, `tests/test_deadchip_detach_before_kill.py::test_a_chip_whose_earlier_detach_failed_blocks_every_later_kill`, `tests/test_deadchip_detach_before_kill.py::test_the_broker_never_signals_itself`, `tests/test_deadchip_detach_before_kill.py::test_the_first_all_ones_sample_leaves_the_poller_stop_to_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_or_timed_out_detach_never_stops_the_pollers` |
 | I84 a refusal's holders reach the power cycle at the I76 bound; the record lifts nothing and only a passing full check with fabric clears it | `tests/test_deadchip_refused_bound.py::test_a_refused_holder_gets_the_power_cycle_at_the_bound`, `tests/test_deadchip_refused_bound.py::test_the_refusal_record_lifts_nothing_and_only_a_passing_full_check_clears_it` |
+| I84 a reset step or the startup check detaches attached all-ones chips before its poller stop; a refused detach stops nothing, resets nothing and reaches the power cycle at the I76 bound | `tests/test_reset_quiesce_detach.py::test_a_reset_detaches_the_all_ones_chip_before_the_poller_stop`, `tests/test_reset_quiesce_detach.py::test_the_sweep_s_repeat_reset_with_the_flag_already_set_detaches_first_too`, `tests/test_reset_quiesce_detach.py::test_a_stalled_only_chip_stops_the_pollers_at_once_with_no_detach`, `tests/test_reset_quiesce_detach.py::test_a_chip_already_detached_needs_no_remove`, `tests/test_reset_quiesce_detach.py::test_a_failed_detach_refuses_the_reset_and_stops_nothing`, `tests/test_reset_quiesce_detach.py::test_a_second_reset_over_the_same_stuck_chip_is_refused_with_no_new_remove`, `tests/test_reset_quiesce_detach.py::test_every_chip_all_ones_detaches_nothing_and_refuses_the_reset`, `tests/test_reset_quiesce_detach.py::test_the_startup_check_detaches_before_its_poller_stop`, `tests/test_reset_quiesce_detach.py::test_a_failed_detach_at_startup_keeps_the_pollers_up_and_the_check_runs`, `tests/test_reset_quiesce_detach.py::test_a_refused_detach_gets_the_power_cycle_at_the_bound_with_no_ladder`, `tests/test_reset_quiesce_detach.py::test_the_refusal_record_clears_only_on_a_passing_full_check`, `tests/test_reset_quiesce_detach.py::test_every_poller_stop_is_behind_a_detach_or_the_all_ones_deferral` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

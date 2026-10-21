@@ -206,7 +206,9 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I12 — Quiesce around every reset.** `reset_with_quiesce` stops the MMIO pollers and sets
   `reset_in_flight` before the reset (a reset takes chips off the bus; a poller reading an off-bus
   endpoint is the MMIO stall that reboots the host, and the sampler would isolate mid-reset
-  all-ones chips as dead), and restores them only when no reset scope is still cycling. A PCI
+  all-ones chips as dead), and restores them only when no reset scope is still cycling. Before
+  the stop it detaches every attached all-ones chip, since a stopped poller's fd close reaches a
+  chip that is not detached; a chip that will not detach refuses the reset (spec 03 I84). A PCI
   rescan runs before restore so isolated endpoints re-enumerate. The poller list defaults to
   `tt-telemetry` and `tt-metrics-exporter` on every host. It names no clock-cap keeper, which every
   reset would otherwise stop and restart on every host. A host that runs another unit that reads or
