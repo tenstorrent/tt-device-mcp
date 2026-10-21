@@ -30,8 +30,15 @@ from tests.test_hold_bound import (
     _tick,
     _watchdog,
 )
-from tests.test_hold_episode_carry import _restore_broker_state  # noqa: F401 - the autouse fixture
-from tests.test_hold_episode_carry import _age, _isolate, _job, _open_hold, _record_events, _restart_broker
+from tests.test_hold_episode_carry import (
+    _age,
+    _isolate,
+    _job,
+    _open_hold,
+    _record_events,
+    _restart_broker,
+    _restore_broker_state,  # noqa: F401 - the autouse fixture
+)
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerFsm, ServerState
 
