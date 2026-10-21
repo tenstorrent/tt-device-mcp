@@ -13270,7 +13270,8 @@ def _arm_77_host_rung_end_to_end(monkeypatch):
     alerts, reasons, events = [], [], []
     monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event))
 
-    async def reboot(log, reason):
+    async def power_cycle(log, reason):
+        counters["power_cycles"] += 1
         reasons.append(reason)
 
     async def sweep(expected, log, gate_phase, **k):
@@ -13279,8 +13280,9 @@ def _arm_77_host_rung_end_to_end(monkeypatch):
 
     monkeypatch.setattr(g, "_settle_and_verify_before_host_rung", sweep)
     monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda esc, *, tenant_active: (True, "ok"))
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    monkeypatch.setattr(privileges, "can_ipmi", lambda: True)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
     age = {"v": 700}
     monkeypatch.setattr(galaxy_mod, "_hold_age_sec", lambda since: age["v"])
     patch_health_event(monkeypatch, lambda kind, **kw: events.append(kind))
@@ -13290,7 +13292,7 @@ def _arm_77_host_rung_end_to_end(monkeypatch):
 @pytest.mark.asyncio
 async def test_an_owed_pass_77_reaches_the_host_rung_after_the_sweep_not_at_the_ceiling(monkeypatch, clear_job_state):
     """Spec 04 I79: a 77 hold whose reset came back UNKNOWN and whose sweep still reads 77 climbs at
-    the sweep's end, on a 250 s-old hold, not at the 600 s ceiling: the reboot fires under the 77 cause,
+    the sweep's end, on a 250 s-old hold, not at the 600 s ceiling: the power cycle fires under the 77 cause,
     no page, no hand-off. Held throughout: never released unverified. Fails on 4485fb8, which deferred
     it to the ceiling and so fired the rung about 18.5 min into the hold."""
     counters, g, alerts, reasons, events, age = _arm_77_host_rung_end_to_end(monkeypatch)
@@ -13313,10 +13315,10 @@ async def test_a_77_host_rung_that_cannot_run_pages_once_and_a_later_rung_clears
 ):
     """Spec 04 I29: a 77 climb past the ceiling that cannot run (no host rung opted in, or
     auto_recovery_allowed denies it) pages the operator exactly once per episode and logs no host rung.
-    Once the rung can run, it fires and its reboot ends the hand-off on /health."""
+    Once the rung can run, it fires and its power cycle ends the hand-off on /health."""
     counters, g, alerts, reasons, events, age = _arm_77_host_rung_end_to_end(monkeypatch)
     if cannot_run == "not_opted_in":
-        monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+        monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
     else:
         monkeypatch.setattr(
             srv.recovery_mechanism, "auto_recovery_allowed", lambda esc, *, tenant_active: (False, "rate-limited")
@@ -13331,7 +13333,7 @@ async def test_a_77_host_rung_that_cannot_run_pages_once_and_a_later_rung_clears
     assert alerts[0]["broker_retries"] is (cannot_run == "denied")
     assert reasons == [] and "fabric_unverified_host_rung" not in events
 
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda esc, *, tenant_active: (True, "ok"))
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     assert reasons == [galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE] and len(alerts) == 1
@@ -13339,17 +13341,11 @@ async def test_a_77_host_rung_that_cannot_run_pages_once_and_a_later_rung_clears
     assert counters["dirty_cleared"] == 0
 
 
-def _arm_77_reboot_boot_cold_rung(monkeypatch):
-    """The I79 boot a 77 climb's warm reboot brought up, with a power cycle opted in and no fabric pass
-    since the broker started, through the real climb and its guards. Returns the end-to-end tuple of
+def _arm_77_power_cycle_rung(monkeypatch):
+    """The I79 77 climb with the power cycle (the only host rung) opted in and no fabric pass since the
+    broker started, through the real climb and its guards. Returns the end-to-end tuple of
     _arm_77_host_rung_end_to_end plus ``asked``, the host actions auto_recovery_allowed was asked for."""
     armed = _arm_77_host_rung_end_to_end(monkeypatch)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    monkeypatch.setattr(
-        srv.recovery_mechanism,
-        "boot_from_broker_escalation",
-        lambda boot: {"action": "reboot", "reason": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE},
-    )
     asked = []
     return (*armed, asked)
 
@@ -13358,13 +13354,13 @@ def _arm_77_reboot_boot_cold_rung(monkeypatch):
 async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires_one_power_cycle(
     monkeypatch, clear_job_state
 ):
-    """Spec 04 I79: on the 77 reboot's boot, a cold rung the I65 cooldown holds off is not spent. The
+    """Spec 04 I79: a 77 climb's power cycle the I65 cooldown holds off is not spent. The
     escalations inside the cooldown fire nothing and page no one (the broker fires the cycle itself
     once the cooldown ends), journal the wait once and show its deadline on /health. Each later
-    re-check climbs again; the first one the cooldown no longer denies fires exactly one power cycle,
-    never a reboot. A further escalation fires nothing more. Held throughout: only a passing full
+    re-check climbs again; the first one the cooldown no longer denies fires exactly one power cycle;
+    no path reboots the host. A further escalation fires nothing more. Held throughout: only a passing full
     check releases it. Fails on 2fdd088, which paged an operator for the cooldown."""
-    counters, g, alerts, reasons, events, age, asked = _arm_77_reboot_boot_cold_rung(monkeypatch)
+    counters, g, alerts, reasons, events, age, asked = _arm_77_power_cycle_rung(monkeypatch)
     age["v"] = 250
     mech = srv.recovery_mechanism
     monkeypatch.setattr(mech, "power_cycle_cooldown_state", None)
@@ -13390,7 +13386,7 @@ async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires
     monkeypatch.setattr(mech, "auto_recovery_allowed", allowed)
     for _ in range(2):
         assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert asked == ["power-cycle"] * 2, "the cold rung, never a second reboot, asked on every re-check"
+    assert asked == ["power-cycle"] * 2, "the power cycle, the only host rung, asked on every re-check"
     assert counters["power_cycles"] == 0 and reasons == []
     assert alerts == [], "a bounded cooldown pages no one"
     assert g.fabric_77_handoff_status(srv.device_hold_episode_since) is None
@@ -13407,13 +13403,13 @@ async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires
 
     cooldown["on"] = False
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert counters["power_cycles"] == 1 and reasons == [], "one power cycle once the cooldown ends"
+    assert counters["power_cycles"] == 1 and reasons == [galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE], "one power cycle once the cooldown ends"
     assert g.fabric_77_handoff_status(srv.device_hold_episode_since) is None, "the fired rung ends the hand-off"
     assert srv.recovery_mechanism.unverified_77_host_rung_since == srv.device_hold_episode_since
 
     for _ in range(2):
         assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert counters["power_cycles"] == 1 and reasons == [], "at most one power cycle per episode"
+    assert counters["power_cycles"] == 1 and len(reasons) == 1, "at most one power cycle per episode"
     assert len(asked) == 3
     assert counters["resets"] == 0 and counters["dirty_cleared"] == 0, "held, never released unverified"
     assert [a["why"] for a in alerts] == ["the host rung already ran on this hold"], "paged only once spent"
@@ -13422,18 +13418,18 @@ async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires
 @pytest.mark.asyncio
 @pytest.mark.parametrize("denial", ["tenant", "stale_cooldown"])
 async def test_a_cold_rung_denied_for_a_reason_other_than_the_cooldown_pages_once(monkeypatch, clear_job_state, denial):
-    """Spec 04 I79: on the 77 reboot's boot, a cold rung held off by anything but a bounded I65
+    """Spec 04 I79: a 77 climb's power cycle held off by anything but a bounded I65
     cooldown (a tenant; or a rate limit while an older cooldown record still lingers) is not spent and
     still pages once per episode, naming the broker as the owner while it retries. No cooldown wait is
     journaled for it. Held throughout."""
-    counters, g, alerts, reasons, events, age, asked = _arm_77_reboot_boot_cold_rung(monkeypatch)
+    counters, g, alerts, reasons, events, age, asked = _arm_77_power_cycle_rung(monkeypatch)
     age["v"] = 250
     mech = srv.recovery_mechanism
     monkeypatch.setattr(mech, "power_cycle_retry", None)
     stale = {"until": time.time() + 900, "last": time.time(), "cause": "host boot", "interval_sec": 900}
     monkeypatch.setattr(mech, "power_cycle_cooldown_state", {**stale, "why": "an earlier cooldown"})
     if denial == "tenant":
-        why = "a tenant holds the device; a reboot would destroy a running job"
+        why = "a tenant holds the device; a power cycle would destroy a running job"
     else:
         why = "already auto-escalated 1x this boot (cap 1)"
 
@@ -13459,7 +13455,6 @@ async def test_a_cold_rung_denied_for_a_reason_other_than_the_cooldown_pages_onc
         ("scope_active", galaxy_mod.HOST_RUNG_DEFERRED),
         ("young_hold", galaxy_mod.HOST_RUNG_DEFERRED),
         ("not_opted_in", galaxy_mod.NO_HOST_RUNG),
-        ("reboot_blocked", galaxy_mod.NO_HOST_RUNG),
         ("denied", galaxy_mod.HOST_RUNG_DENIED),
         ("fires", galaxy_mod.HOST_RUNG_FIRED),
     ],
@@ -13474,9 +13469,7 @@ async def test_the_host_rung_climb_reports_fired_deferred_or_cannot_run(monkeypa
     elif case == "young_hold":
         age["v"] = 250
     elif case == "not_opted_in":
-        monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
-    elif case == "reboot_blocked":
-        monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 0xFFFFFFFF for i in range(32)})
+        monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
     elif case == "denied":
         monkeypatch.setattr(
             srv.recovery_mechanism, "auto_recovery_allowed", lambda esc, *, tenant_active: (False, "rate-limited")
@@ -13486,7 +13479,7 @@ async def test_the_host_rung_climb_reports_fired_deferred_or_cannot_run(monkeypa
         32, 0, lambda m: None, swept=True, cause=galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, on_fire=lambda: fired.append(1)
     )
     assert outcome == expect
-    assert (outcome in galaxy_mod.HOST_RUNG_CANNOT_RUN) is (case in ("not_opted_in", "reboot_blocked", "denied"))
+    assert (outcome in galaxy_mod.HOST_RUNG_CANNOT_RUN) is (case in ("not_opted_in", "denied"))
     assert bool(fired) is (expect == galaxy_mod.HOST_RUNG_FIRED)
     assert bool(reasons) is (expect == galaxy_mod.HOST_RUNG_FIRED)
 
