@@ -334,17 +334,18 @@ async def test_a_power_cycle_command_that_timed_out_stays_pending(held, monkeypa
     assert held["spawned"] == [True], "the bound still holds after a timeout"
 
 
-# --- no latch stops resets when the cold rung is refused or not opted in (spec 04 I36 governs) ----
+# --- a cold rung that cannot fire does not buy a second mesh reset (spec 04 I87 governs) ---------
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cold_rung", ["refused", "not-opted-in"])
-async def test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_fire(
+async def test_a_shrinking_offbus_set_gets_no_second_reset_when_the_power_cycle_cannot_fire(
     monkeypatch, clear_job_state, cold_rung
 ):
     """A reset ran, failed and left chips off the bus; the power cycle is denied by its rate limit or
-    not opted in. A chip came back by the next forced window, so the reset runs again: nothing stops
-    resets for the rest of the hold while the cold rung cannot fire: no unbounded hold."""
+    not opted in. A chip came back by the next forced window, but the episode's one mesh reset is spent
+    (spec 04 I87): no later window resets again, and the device stays held for the power cycle or an
+    operator."""
     from tests import test_no_repeat_failed_rung as nr
 
     counters, events, _ = nr._episode(monkeypatch, power_cycle=cold_rung == "refused")
@@ -358,8 +359,8 @@ async def test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_f
     for still_off in (nr.OFF_BUS - 1, nr.OFF_BUS - 2):
         monkeypatch.setattr(srv, "read_heartbeats", lambda n=still_off: {str(i): 100 for i in range(nr.EXPECTED - n)})
         assert await nr._window() is True
-    assert counters["resets"] == 3, "each shrunk set earns its reset"
-    assert "device_reset_skipped_power_cycle_required" not in events and nr.SKIP not in events
+    assert counters["resets"] == 1, "a shrunk set gets no second mesh reset in the episode"
+    assert nr._skipped(events) >= 2
     assert counters["power_cycles"] == 0 and counters["dirty_cleared"] == 0, "the device stays held"
 
 
