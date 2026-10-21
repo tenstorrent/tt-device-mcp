@@ -1002,7 +1002,7 @@ async def test_by_default_the_one_tray_drop_is_never_walked(monkeypatch, tmp_pat
 
 
 async def _gate_tray_rung(off):
-    """One post-job gate pass at the tray rung (escalate's STAGE_UBB_TRAY) with ``off`` off the bus and
+    """One post-job gate pass at the tray rung (escalate's BELOW_FLOOR) with ``off`` off the bus and
     no bridge window recorded, so the hold is GENERIC and takes the per-tray walk path."""
     beats = {str(i): 100 for i in range(32) if i not in off}
     return await srv.galaxy_recovery.escalate(
@@ -1010,7 +1010,7 @@ async def _gate_tray_rung(off):
         sorted(str(c) for c in off),
         EXPECTED,
         lambda m: None,
-        stage=galaxy.STAGE_UBB_TRAY,
+        stage=galaxy.BELOW_FLOOR,
         ev=_ev(off_bus=len(off)),
         beats=beats,
     )

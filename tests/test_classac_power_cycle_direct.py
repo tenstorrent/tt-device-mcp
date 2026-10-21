@@ -517,7 +517,7 @@ async def test_a_whole_tray_drop_with_no_map_cycles_at_the_first_gate_pass(short
     class is read from the buses on the bus, so the cycle is requested now, not after the 600 s
     ceiling and a mesh reset that has never healed a whole tray."""
     rig = short_boot
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase=phase) == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase=phase) == galaxy.OUTCOME_WAITING
     assert "glx_reset" not in rig["order"] and "ubb_tray" not in rig["order"] and "sweep" not in rig["order"]
     assert rig["order"][-1] == "power_cycle"
     ((_, fired),) = [(k, f) for k, f in rig["events"] if k == "power_cycle_direct"]
@@ -536,7 +536,7 @@ async def test_the_hold_deadline_climb_with_no_map_cycles_with_no_reset(short_bo
 async def test_a_partial_drop_with_no_map_keeps_the_ladder(short_boot):
     rig = short_boot
     rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 7, 0xC0: 1})
-    await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup")
+    await _gate(rig, galaxy.BELOW_FLOOR, phase="startup")
     assert "power_cycle" not in rig["order"] and "power_cycle_direct" not in _kinds(rig)
 
 
@@ -555,7 +555,7 @@ async def test_inside_the_cooldown_the_deadline_shows_at_once_and_no_reset_runs(
     monkeypatch.setattr(
         g.mechanism, "auto_recovery_allowed", lambda action, **k: g.mechanism._deny_power_cycle(dict(cooldown))
     )
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup") == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase="startup") == galaxy.OUTCOME_WAITING
     assert rig["order"][-1] == "denied"
     assert not {"glx_reset", "ubb_tray", "sweep", "power_cycle"} & set(rig["order"]), "no reset meanwhile"
     assert g.mechanism.power_cycle_retry[0] == until
@@ -594,7 +594,7 @@ async def test_a_whole_tray_with_eio_survivors_cycles_with_no_map(short_boot, mo
     rig = short_boot
     rig["beats"] = _beats_without(set(range(24, 32)) | {0})  # chip 0's node is there, its read fails
     _unreadable(monkeypatch, {0})
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup") == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase="startup") == galaxy.OUTCOME_WAITING
     assert not {"glx_reset", "ubb_tray", "sweep"} & set(rig["order"]) and rig["order"][-1] == "power_cycle"
 
 
@@ -604,7 +604,7 @@ async def test_a_no_map_tray_of_lingering_nodes_is_class_a(short_boot):
     cannot fill the tray they left."""
     rig = short_boot
     rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 8, 0xC0: 8})
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup") == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase="startup") == galaxy.OUTCOME_WAITING
     assert "glx_reset" not in rig["order"] and rig["order"][-1] == "power_cycle"
 
 
@@ -718,5 +718,5 @@ async def test_a_listed_node_whose_link_is_down_does_not_fill_a_tray(short_boot)
     rig["link_down"] = {f"0000:{rig['present'][0]:02x}:00.0"}
     present_buses, _ = rig["g"]._presence_read(set(range(24, 32)), EXPECTED)
     assert 0 not in present_buses and 1 in present_buses
-    await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup")
+    await _gate(rig, galaxy.BELOW_FLOOR, phase="startup")
     assert "power_cycle" not in rig["order"], "the read does not add up to whole trays: the ladder decides"

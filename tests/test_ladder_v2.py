@@ -30,7 +30,7 @@ async def _async_true(*a, **k):
 
 def _ev(**over):
     """A minimal gate Evidence for the tray-stage dispatch tests. Only ``off_bus`` and
-    ``bridge_reset_failed`` matter to the STAGE_UBB_TRAY rung; everything else takes an inert
+    ``bridge_reset_failed`` matter to the BELOW_FLOOR rung; everything else takes an inert
     default so a test names just the field it exercises."""
     base = dict(
         off_bus=0,
@@ -100,7 +100,7 @@ def test_classify_hold_names_the_two_branches(galaxy_trays):
 async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(
     monkeypatch, galaxy_trays, walk_disabled, opted_in
 ):
-    """Through escalate()'s gate path (the live STAGE_UBB_TRAY rung, not the helper directly): a whole
+    """Through escalate()'s gate path (the live BELOW_FLOOR rung, not the helper directly): a whole
     tray off the bus whose every off-bus chip reported no_bridge — threaded onto
     Evidence.bridge_reset_failed by the server — is classified TRAY_DOWN_NO_WINDOW and dispatched to
     _fire_tray_down_no_window: every reset type back-to-back (SBR -> per-tray re-power -> mesh reset),
@@ -166,7 +166,7 @@ async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(
     ev = _ev(off_bus=8, bridge_reset_failed={c: {"reason": "no_bridge"} for c in offbus})
 
     out = await g.escalate(
-        "gate/post-job", sorted(offbus, key=int), 32, lambda m: None, stage=galaxy.STAGE_UBB_TRAY, ev=ev, beats=beats
+        "gate/post-job", sorted(offbus, key=int), 32, lambda m: None, stage=galaxy.BELOW_FLOOR, ev=ev, beats=beats
     )
 
     assert out == galaxy.OUTCOME_WAITING
@@ -216,7 +216,7 @@ async def test_gate_partial_tray_or_a_bridge_window_takes_the_generic_walk(monke
     beats = {str(i): 100 for i in range(28)}  # 28-31 off -> partial UBB3
     ev = _ev(off_bus=4, bridge_reset_failed={str(i): {"reason": "no_bridge"} for i in range(28, 32)})
     out = await g.escalate(
-        "gate/post-job", ["28", "29", "30", "31"], 32, lambda m: None, stage=galaxy.STAGE_UBB_TRAY, ev=ev, beats=beats
+        "gate/post-job", ["28", "29", "30", "31"], 32, lambda m: None, stage=galaxy.BELOW_FLOOR, ev=ev, beats=beats
     )
     assert out == galaxy.OUTCOME_RECOVERED
     assert sweep["n"] == 0 and generic["n"] == 1, "a partial-tray drop is GENERIC, never the sweep"
@@ -231,7 +231,7 @@ async def test_gate_partial_tray_or_a_bridge_window_takes_the_generic_walk(monke
         [str(i) for i in range(24, 32)],
         32,
         lambda m: None,
-        stage=galaxy.STAGE_UBB_TRAY,
+        stage=galaxy.BELOW_FLOOR,
         ev=ev2,
         beats=beats2,
     )
@@ -260,7 +260,7 @@ async def test_gate_tray_down_no_window_names_the_command_and_holds_when_not_opt
     offbus = {str(i) for i in range(24, 32)}
     ev = _ev(off_bus=8, bridge_reset_failed={c: {"reason": "no_bridge"} for c in offbus})
     out = await g.escalate(
-        "gate/post-job", sorted(offbus, key=int), 32, lambda m: None, stage=galaxy.STAGE_UBB_TRAY, ev=ev, beats=beats
+        "gate/post-job", sorted(offbus, key=int), 32, lambda m: None, stage=galaxy.BELOW_FLOOR, ev=ev, beats=beats
     )
 
     assert out == galaxy.OUTCOME_WAITING

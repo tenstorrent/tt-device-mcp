@@ -557,29 +557,14 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # of taking CI (or a dev box) down. A test exercising either path re-patches the fire itself.
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    # Same for the per-tray BMC reset: clear its opt-in so no test reaches the fire by accident, and
-    # make the real fire a loud tripwire so a test that DOES reach it fails rather than issuing real
-    # reset ioctls / ipmitool. A test exercising the tray-reset path re-patches _fire_ubb_reset itself.
-    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_UBB_RESET", raising=False)
-    # A developer shell that opted the single-tray walk back in must not change what the suite tests.
-    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
-    # The two pins above plus a test's own AUTO_UBB_RESET=0 would read as an operator outage hold and
-    # hold every mesh reset (spec 04 I28); arm it explicitly. A test of the hold deletes this.
+    # Both host rungs off would read as an operator outage hold and hold every mesh reset
+    # (spec 04 I28); arm it explicitly. A test of the hold deletes this.
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")
 
     def _no_reboot_in_tests():
         raise AssertionError("a test reached the real host reboot; _fire_host_reboot must be mocked")
 
     monkeypatch.setattr(recovery_galaxy, "_fire_host_reboot", _no_reboot_in_tests)
-
-    def _no_ubb_reset_in_tests(*a, **k):
-        raise AssertionError("a test reached the real per-tray BMC reset; _fire_ubb_reset must be mocked")
-
-    monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
-    # A regressed tray walk disables the rung for the rest of the process: every test starts armed.
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_PERSISTED", False, raising=False)
-    monkeypatch.setattr(pcie_guard, "_LAST_TRAY_PULSE", None, raising=False)
 
     # The bounded off-bus hold (spec 04 I27) runs a host-supplied power-cycle command: unset here, a
     # loud tripwire if reached anyway, and its per-process episode tracking starts empty per test.
@@ -792,8 +777,6 @@ def health_deps():
         device_hold_episode_escalated=lambda: srv.fsm.latch("escalated"),
         hold_escalation_latched=lambda: srv._hold_escalation_latched(),
         set_device_hold_episode_escalated=srv._set_hold_escalated,
-        device_hold_episode_ubb_reset_fired=lambda: srv.fsm.latch("ubb_reset_fired"),
-        set_device_hold_episode_ubb_reset_fired=lambda v: srv.fsm.set_latch("ubb_reset_fired", v),
         clear_device_reported_fault=lambda why: srv._clear_device_reported_fault(why),
         clear_device_dirty=lambda **kw: srv._clear_device_dirty(**kw),
         note_fabric_77_reset_passes=lambda n: srv._note_fabric_77_reset_passes(n),

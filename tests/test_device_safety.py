@@ -46,7 +46,7 @@ from tt_device_mcp.health.recovery import (
     STAGE_HOST_REBOOT,
     STAGE_POWER_CYCLE,
     STAGE_SMI_RESET,
-    STAGE_UBB_TRAY,
+    BELOW_FLOOR,
     WAIT,
     Evidence,
     galaxy,
@@ -8230,8 +8230,8 @@ def test_cascade_router_climbs_gentlest_first(monkeypatch, health_deps):
     # Below the galaxy floor with nothing to surgically reset: the per-tray BMC reset is the
     # next-gentlest rung the gate always attempts before holding (B5) — never a jump straight to
     # a mesh-wide reset over a single-chip wedge, whether or not a prior reset has failed.
-    assert _rung(monkeypatch, health_deps, off_bus=1) == STAGE_UBB_TRAY
-    assert _rung(monkeypatch, health_deps, off_bus=1, was_failing=True, host_escalation="reboot") == STAGE_UBB_TRAY
+    assert _rung(monkeypatch, health_deps, off_bus=1) == BELOW_FLOOR
+    assert _rung(monkeypatch, health_deps, off_bus=1, was_failing=True, host_escalation="reboot") == BELOW_FLOOR
     # At or above the floor, before this pass's reset: the mesh-wide galaxy reset — whether or not a
     # prior cycle failed. The gate runs the reset again on a fresh pass; a failed prior reset plus an
     # elapsed cooldown earns another attempt, NOT a jump to the host rung.
@@ -8250,7 +8250,7 @@ def test_cascade_router_keys_the_galaxy_floor_on_frozen_chips_too(monkeypatch, h
     assert _rung(monkeypatch, health_deps, off_bus=0, frozen_chips=32) == STAGE_SMI_RESET
     # Below the floor even combined: a few frozen chips still self-heal, so the per-tray rung (the
     # gate always attempts it below the floor) still stands, never the mesh-wide reset.
-    assert _rung(monkeypatch, health_deps, off_bus=0, frozen_chips=3) == STAGE_UBB_TRAY
+    assert _rung(monkeypatch, health_deps, off_bus=0, frozen_chips=3) == BELOW_FLOOR
 
 
 def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(monkeypatch, health_deps):
