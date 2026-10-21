@@ -8314,6 +8314,7 @@ async def _force_escalate_stuck_hold() -> None:
             expected,
             log,
             stand_down=lambda: _forced_run_route(kind, held_age).action == ROUTE_STAND_DOWN,
+            bound=bound,
         )
         if outcome == OUTCOME_WAITING and galaxy_recovery.startup_verify_deferred:
             _defer_to_startup_verify(kind, log, journaled=True)  # spec 03 I75: the job ended inside the ladder

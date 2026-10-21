@@ -906,6 +906,10 @@ class GalaxyRecovery(Recovery):
     # Spec 04 I71: the (episode, monotonic time) of the last page for a power cycle that did not launch.
     # One page per hold episode, then at most one every CYCLE_LAUNCH_REPAGE_SEC while it keeps failing.
     _cycle_launch_paged: Optional[tuple[str, float]] = None
+    # Spec 04 I89: whether the escalate() now running is the I76 10-min bound's ladder, and the
+    # (episode, off-bus set) whose below-floor gate hold already ran its rescan and SBR.
+    _bound: bool = False
+    _below_floor_rungs_key: Optional[tuple] = None
 
     def tenant_holds(self) -> bool:
         """The forced ladders' own tenant check, alone: a running broker job or a readable tenant fd."""
@@ -1030,6 +1034,7 @@ class GalaxyRecovery(Recovery):
         beats: Optional[dict] = None,
         measured_fault: bool = False,
         stand_down: Optional[Callable[[], bool]] = None,
+        bound: bool = False,
     ) -> str:
         """Run the next justified rung of this ladder and report the outcome, replacing the
         direct ``_escalate_stuck_hold``/``_escalate_offbus_stuck_hold`` calls the idle relift and
@@ -1076,8 +1081,13 @@ class GalaxyRecovery(Recovery):
 
         ``stand_down`` (spec 03 I75) is re-read at every tenant check of this run: while it reads True
         no rung acts, the run reports WAITING with ``tenant_deferred`` and ``startup_verify_deferred``
-        set, and the caller leaves the hold to the startup gate."""
+        set, and the caller leaves the hold to the startup gate.
+
+        ``bound`` (spec 04 I89) marks the I76 10-min bound's own ladder: a below-floor off-bus hold
+        then runs its full kept ladder even when an earlier forced run already failed its mesh reset
+        on the same chips."""
         self._stand_down = stand_down
+        self._bound = bound
         self.startup_verify_deferred = False
         try:
             return await self._escalate_phase(
@@ -1085,6 +1095,7 @@ class GalaxyRecovery(Recovery):
             )
         finally:
             self._stand_down = None
+            self._bound = False
 
     async def _escalate_phase(
         self,
@@ -1441,8 +1452,8 @@ class GalaxyRecovery(Recovery):
         if stage == BELOW_FLOOR:
             # Below the galaxy floor there is no tray rung: no BMC tray re-power exists (spec 04 I23), and
             # no back-to-back reset sweep either. A whole-tray drop goes to the bounded power cycle now,
-            # with no grace (I37); the I65 cooldown is its only wait. Anything else holds, and the I76
-            # bound runs the ladder at 10 min.
+            # with no grace (I37); the I65 cooldown is its only wait. Anything else gets the I89 rungs
+            # below and holds; the I76 bound runs the ladder at 10 min.
             offbus_set = _offbus_chip_ids(beats or {}, expected)
             self._note_whole_tray_drop(beats or {}, ev.off_bus if ev else 0, expected, log)
             hold_since = self.deps.device_hold_episode_since()
@@ -1450,6 +1461,11 @@ class GalaxyRecovery(Recovery):
                 # A whole tray is down: the bounded power cycle now, not at the next idle window. It
                 # runs no reset and holds the device; the post-boot startup gate re-proves the mesh.
                 await self._offbus_gated_power_cycle(len(offbus_set), expected, hold_since, log)
+            elif offbus_set and (ev is None or ev.last_action != STAGE_BRIDGE_RESET):
+                # Spec 04 I89: a generic below-floor drop gets its kept rungs now (PCI rescan, then SBR
+                # of the chips the defaults allow), not at the 10-min bound. A broker restart empties
+                # isolated_chips, so without this a chip off the bus at startup waited for the bound.
+                return await self._below_floor_gate_rungs(offbus_set, expected, log, gate_phase, hold_since)
             return OUTCOME_WAITING
         if stage in (STAGE_SMI_RESET, DEFER):
             # DEFER lands here too: a reset already cycling in its own scope is not a second reset
@@ -1689,6 +1705,103 @@ class GalaxyRecovery(Recovery):
         )
         health_event("tray_down_prelude", rescan=rescan, off=len(off), trays=trays, capture=capture)
         return False
+
+    async def _below_floor_kept_rungs(
+        self, offbus_chips: set, expected: int, log, *, context: str, at_bound: bool = False
+    ) -> Optional[set]:
+        """The kept rungs below the galaxy floor (spec 04 I89): one PCI rescan, then the SBR targets are
+        queued into isolated_chips and reset through their parent bridges (:meth:`_recover_isolated_chips`).
+        Never a mesh reset, and never a release: the caller runs the full check, fabric included.
+
+        SBR targets: the chips already isolated (reading all-ones), and a chip absent from both
+        heartbeat reads whose own PCIe node is gone, when TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET is set
+        or ``at_bound`` (the I76 bound runs every kept rung). A chip still enumerated is on the bus
+        (an ARC stall): never SBR'd; the bound's mesh reset covers it.
+
+        Returns the chips still off after the rescan, or None when nothing ran (a reset is cycling in
+        its own scope, or a tenant holds the device). A chip the broker removed withholds the bare
+        rescan (I69); the SBR resets it first and rescans itself."""
+        if await asyncio.to_thread(self.mechanism.scope_active):
+            return None
+        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
+        if self._tenant_active(scan):
+            log(f"below-floor rungs ({context}): a tenant holds the device — not rescanning or resetting")
+            return None
+        rescan = "withheld (removed chip not reset)" if removed_chip_ids() else "ran"
+        if rescan == "ran":
+            try:
+                FABRIC_DEBT.note_reset("PCI rescan")
+                await asyncio.to_thread(_pci_rescan)
+            except OSError as e:
+                rescan = f"failed ({e})"
+        if rescan == "ran":
+            await asyncio.sleep(TRAY_DOWN_RESCAN_SETTLE_SEC)
+        isolated = self.deps.isolated_chips()
+        if rescan == "ran":
+            await asyncio.to_thread(drop_returned_isolated, isolated, f"{context} PCI rescan", log)
+        try:
+            beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        except Exception as exc:  # noqa: BLE001 - an unreadable heartbeat counts every chip off, as the gate does
+            log(f"could not read the heartbeats after the below-floor rescan: {exc!r}")
+            beats = {}
+        still_off = _offbus_chip_ids(beats or {}, expected)
+        queued = []
+        if at_bound or gone_chip_bridge_reset_enabled():
+            pci_map = self.deps.device_pci_map()
+            for c in sorted(set(still_off) & set(offbus_chips), key=int):
+                bdf = pci_map.get(c)
+                if bdf and c not in isolated and not await asyncio.to_thread(chip_node_present, bdf):
+                    queued.append(c)
+        isolated.update(queued)
+        fired = bool(isolated)
+        if fired:
+            await self._recover_isolated_chips(log)
+            beats = await asyncio.to_thread(self.deps.read_heartbeats)
+            still_off = _offbus_chip_ids(beats or {}, expected)
+        log(
+            f"below-floor rungs ({context}): PCI rescan {rescan}; chip(s) {sorted(offbus_chips, key=int)} were off, "
+            f"{sorted(still_off, key=int) or 'none'} still off"
+            + (f"; SBR fired on {sorted(isolated, key=int)}" if fired else "")
+        )
+        health_event(
+            "below_floor_kept_rungs",
+            context=context,
+            rescan=rescan,
+            off_before=sorted(offbus_chips, key=int),
+            queued=queued,
+            sbr=sorted(isolated, key=int) if fired else [],
+            still_off=sorted(still_off, key=int),
+            expected=expected,
+        )
+        return still_off
+
+    async def _below_floor_gate_rungs(
+        self, offbus_set: set, expected: int, log, gate_phase: str, hold_since: Optional[str]
+    ) -> str:
+        """The gate's below-floor kept rungs (spec 04 I89), once per hold episode and off-bus set, then
+        the full check with fabric. RECOVERED only on that check's pass; otherwise the hold stands and
+        the I76 bound runs the full ladder at 10 min. Like the bridge rung, a runtime-reported fault is
+        kept: a rescan and an SBR re-init no eth core on the other chips."""
+        key = (hold_since, frozenset(offbus_set))
+        if self._below_floor_rungs_key == key:
+            return OUTCOME_WAITING
+        self._below_floor_rungs_key = key
+        still_off = await self._below_floor_kept_rungs(offbus_set, expected, log, context=f"gate/{gate_phase}")
+        if still_off is None:
+            self._below_floor_rungs_key = None  # nothing ran: the next pass tries again
+            return OUTCOME_WAITING
+        if still_off:
+            return OUTCOME_WAITING
+        healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+        FABRIC_DEBT.note_evidence(evidence)
+        if not healthy:
+            log("every chip is back after the below-floor rescan/SBR but the full check failed — held")
+            health_event("below_floor_kept_rungs_unverified", phase=gate_phase, evidence=evidence)
+            return OUTCOME_WAITING
+        log("every chip is back after the below-floor rescan/SBR and the full check passed — no mesh reset needed")
+        health_event("gate", phase=gate_phase, healthy=True, recovered_via="below-floor-rescan-sbr", evidence=evidence)
+        self.deps.clear_device_dirty(verified=True, why=f"gate/{gate_phase}: below-floor rescan/SBR recovered the mesh")
+        return OUTCOME_RECOVERED
 
     def _tenant_active(self, scan, *, force: bool = False) -> bool:
         """Is anyone using the device? TWO independent sources, because either one alone lies:
@@ -2645,6 +2758,17 @@ class GalaxyRecovery(Recovery):
             # last-chance sweep still runs every reset once before a power cycle (I22), or hand the hold
             # to an operator when no host rung is available (spec 04 I36). A reset that failed on another
             # set in this hold is spent all the same: one mesh reset per episode (spec 04 I87).
+            # Spec 04 I89: at the 10-min bound a below-floor drop still gets its rescan and SBR first; the
+            # spent mesh reset is not repeated (I87), and the climb below takes over if they did not heal.
+            floor_now = _galaxy_reset_min_dead_chips(expected)
+            if (
+                self._bound
+                and ids_now
+                and floor_now is not None
+                and 0 < off_bus < floor_now
+                and await self._below_floor_bound_rungs(set(ids_now), expected, log)
+            ):
+                return True
             await self._climb_past_failed_rung(expected, ids_now, hold_since, log, spent=spent)
             return True
         isolated_chips = self.deps.isolated_chips()
@@ -2764,13 +2888,19 @@ class GalaxyRecovery(Recovery):
                     f"{off_bus_pre} of {expected} chip(s) off the bus — below the galaxy-reset floor "
                     f"({reset_floor}) and the per-chip rung could not recover it; trying the "
                     f"mesh-wide reset before any host rung"
+                    + (" (I76 bound: PCI rescan and SBR first)" if self._bound else "")
                 )
                 health_event(
                     "stuck_hold_galaxy_reset_below_floor_attempt",
                     off_bus=off_bus_pre,
                     expected=expected,
                     floor=reset_floor,
+                    bound=self._bound,
                 )
+                if self._bound and await self._below_floor_bound_rungs(
+                    _offbus_chip_ids(beats_pre or {}, expected), expected, log
+                ):
+                    return True
             off_bus_before = off_bus_pre
         if off_bus_before is None:
             # The floor read above did not run (floor opted out, or a reset was cycling), so take a
@@ -2793,6 +2923,28 @@ class GalaxyRecovery(Recovery):
         # This episode's one reset is spent and an idle box has no next-job gate to run another, so hand
         # the mesh straight to the host rung, or to an operator when there is none (I36).
         await self._climb_or_hand_off(expected, off_bus_before, hold_since, log)
+        return True
+
+    async def _below_floor_bound_rungs(self, offbus_chips: set, expected: int, log) -> bool:
+        """The I76 bound's kept rungs ahead of its one mesh reset (spec 04 I89): PCI rescan, then SBR of
+        every bridged off-bus chip whatever the opt-in. True only when every chip is back and the full
+        check with fabric passed: the caller then skips the mesh reset. Otherwise the ladder goes on: the
+        mesh reset when this hold has not spent it, else the climb's last-chance sweep (I87), then the
+        host rung."""
+        still_off = await self._below_floor_kept_rungs(
+            offbus_chips, expected, log, context="I76 bound ladder", at_bound=True
+        )
+        if still_off is None or still_off:
+            return False
+        healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase="idle-escalation")
+        FABRIC_DEBT.note_evidence(evidence)
+        if not healthy:
+            log("every chip is back after the bound's rescan/SBR but the full check failed — the ladder goes on")
+            health_event("below_floor_kept_rungs_unverified", phase="idle-escalation", evidence=evidence)
+            return False
+        why = "I76 bound: below-floor rescan/SBR recovered the mesh"
+        self.deps.clear_device_reported_fault(why)
+        self.deps.clear_device_dirty(verified=True, why=why)
         return True
 
     async def _note_mesh_reset_failed(

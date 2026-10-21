@@ -1678,6 +1678,45 @@ each rung fires only when the gentler one failed or cannot apply.
   | No isolated chip (present-mesh eth/fabric hold, 77) | mesh reset + settle + check | unchanged |
   | Whole tray, all chips off the bus | sweep skipped, power cycle (I37) | unchanged |
 
+- **I89 — A below-floor off-bus hold gets its kept rungs at once, and the full ladder at the
+  10-min bound.** A generic below-floor off-bus hold (`BELOW_FLOOR`, `HOLD_CLASS_GENERIC`, not a
+  whole tray) no longer waits for the I76 bound for its gentle rungs. The gate's first pass runs
+  them (`_below_floor_gate_rungs`): a PCI rescan (withheld while a removed chip still owes its I69
+  reset), SBR of the chips the defaults allow, and, once every chip is back on the bus, the full
+  health check, fabric included. Only a pass lifts the hold (I32); a failed check, or a fabric check
+  that finds fewer links than the cabling expects, keeps it (`below_floor_kept_rungs_unverified`) for
+  the bound. The pass runs once per hold episode and off-bus set; a new set or a new episode runs it
+  again. A tenant or a live reset scope skips it, and the next gate pass retries.
+
+  Before the bound the SBR defaults do not change. A chip reading all-ones (isolated) is SBR'd. A
+  chip gone from the bus (absent from two heartbeat reads, its PCIe node gone) is SBR'd only when
+  `TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET` is set; by default it is left to the hold. A stalled chip
+  that still enumerates is on the bus and is never SBR'd: its bridge hosts live silicon.
+
+  At the 10-min bound (`escalate(..., bound=True)` from the I76 watchdog) every kept rung runs,
+  whatever the opt-in: PCI rescan, then SBR of every chip gone from the bus. If they bring every chip
+  back, the full check with fabric runs at once and a pass lifts the hold with no mesh reset.
+  Otherwise the ladder goes on: its one mesh reset and the full check with fabric when this hold has
+  not run one yet; else the I87 climb (the sweep once per phase, or the power cycle at once when the
+  reset failed on the same chips, I22). A pass lifts the hold; a failure requests the power cycle (I76), or pages and
+  holds when none is opted in (I31). An enumerated chip is still not SBR'd at the bound; the mesh
+  reset covers it. An earlier forced run is not the bound's ladder: the rescan and SBR run again at
+  the bound; a spent mesh reset is not repeated (I87). Below the bound a forced run keeps its own path:
+  the mesh reset, with no rescan or SBR (the gate ran those at once). It keeps I58 (a mesh reset that
+  failed on the same chips is not repeated and the host rung fires at once); otherwise its host rung
+  waits for the ceiling (I38) or the bound. A power-cycle cooldown at the bound still
+  runs the ladder, and the power cycle fires when the cooldown ends (I65). Time to recover (TTR):
+
+  | Case | Effect of I89 |
+  |---|---|
+  | B1 below-floor partial off-bus that a PCI rescan brings back (e.g. a chip off the bus at broker start) | recovered at the gate's first pass: rescan (about 3 s settle) + full check (about 45-100 s), instead of holding to the 10-min bound |
+  | B1 gone chip, `TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET` set, SBR brings it back | rescan + SBR (about 10 s) + full check at the first pass, instead of the 10-min bound |
+  | B1 that the gate rungs do not heal | still the bound's ladder, then the power cycle; one rescan (about 3 s) added, once per episode and off-bus set |
+  | B1 at the 10-min bound | rescan (about 3 s settle) + SBR (about 10-20 s) ahead of the one mesh reset and its full check (or of the power cycle when this hold's mesh reset is spent, I87), then the power cycle: about 15-30 s more; an SBR that brings every chip back lifts on the full check with no mesh reset (I86) |
+  | B1 forced run below the bound after a mesh reset failed on the same chips | unchanged: the host rung fires at once (I58) |
+  | B1 at the bound inside a power-cycle cooldown | ladder at the bound, power cycle at the cooldown's end (I65); budget exception unchanged |
+  | Whole tray (A), `TRAY_DOWN_NO_WINDOW`, at or above the floor | unchanged (I37, I27) |
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -1789,7 +1828,9 @@ holds live silicon.
 **Below the floor.** `BELOW_FLOOR` is not a rung: there is no tray rung (I23) and no
 back-to-back reset sweep. A whole UBB tray off the bus goes to the bounded I27 power cycle at once,
 its only wait the I65 cooldown; it runs no reset and holds the device, and the post-boot startup
-gate re-proves the mesh. Anything else holds, and the I76 bound runs the full ladder at 10 min.
+gate re-proves the mesh. Anything else gets the I89 gate rungs at once (PCI rescan, SBR per its
+defaults, a lift only on a passing full check) and otherwise holds; the I76 bound runs the full
+ladder at 10 min.
 The power cycle honours the same tenant guard and the cooldown/boot-loop denials on every path.
 
 **The tray-down prelude (I19).** Every caller of the ladder (`escalate()`: the gate, the idle
@@ -2219,3 +2260,4 @@ sees a silent fabric pass.
 | I75 (one routing for the report and the forced run: a window inside the post-ladder check, a window after a ladder that did not recover, a class-A mark inside the check window, a startup-gate stand-down; each reported where the watchdog acts) | `tests/test_health_hold_report.py::test_the_report_names_the_rung_the_forced_run_routes_to`, `tests/test_health_hold_report.py::test_a_class_a_ladder_mark_inside_the_check_window_is_not_reported`, `tests/test_health_hold_report.py::test_a_startup_verify_stand_down_is_reported_with_its_bounded_end` |
 | I75 (deadline feeds: the broker registers the I76 bound; its mark and source per fault class and latch, fired by the watchdog then; inside a cooldown the ladder stays at the mark and only the host rung names the end; silent once spent, past due, pending, tenant-blocked or stood down; names the opted-in host rung; nothing when HEALTHY; read-only; a broken feed reports nothing) | `tests/test_health_hold_report.py::test_the_broker_registers_its_hold_bound_feed`, `tests/test_health_hold_report.py::test_the_bound_mark_is_reported_for_each_fault_class`, `tests/test_health_hold_report.py::test_a_latched_hold_reports_the_same_mark`, `tests/test_health_hold_report.py::test_a_cooldown_hold_reports_the_ladder_at_the_mark_and_the_host_rung_at_its_end`, `tests/test_health_hold_report.py::test_the_hold_bound_candidate_names_the_cooldown_only_for_its_host_rung`, `tests/test_health_hold_report.py::test_after_the_bound_ladder_the_chain_names_the_host_rung`, `tests/test_health_hold_report.py::test_the_bound_feed_is_silent_when_its_mark_is_not_next`, `tests/test_health_hold_report.py::test_the_bound_feed_names_the_host_rung_the_box_opts_into`, `tests/test_health_hold_report.py::test_the_bound_feed_yields_to_a_startup_stand_down`, `tests/test_health_hold_report.py::test_a_healthy_device_reports_no_bound`, `tests/test_health_hold_report.py::test_the_bound_feed_moves_no_clock`, `tests/test_health_hold_report.py::test_a_broken_feed_reports_nothing` |
 | I86 the last-chance sweep re-probes the bus after SBR: a whole bus runs the full check before any later rung and lifts only on its pass; a failed check runs the remaining rung then the power cycle; a short or unreadable bus fires every rung; a whole tray still skips the sweep | `tests/test_sweep_reprobe.py::test_healed_after_sbr_runs_no_later_rung_and_lifts_only_on_the_full_check`, `::test_bus_whole_but_full_check_fails_runs_the_remaining_rung_then_the_caller_climbs`, `::test_bus_whole_check_fails_then_the_mesh_reset_heals_it_lifts_on_the_second_check`, `::test_never_healed_runs_every_rung_back_to_back_with_one_check`, `::test_an_unreadable_bus_probe_fires_the_next_rung`, `::test_the_gate_ladder_power_cycles_only_when_the_full_check_still_fails`, `::test_a_whole_tray_drop_still_skips_the_sweep`; every hold kind still reaches the ladder at 10 min: `tests/test_hold_bound.py::test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung` |
+| I89 a below-floor off-bus hold: the gate rescans at once and lifts only on a passing full check with fabric (a check short of the cabled links keeps the hold); SBR keeps its defaults before the bound (a gone chip only when opted in, never an enumerated chip), runs once per episode and off-bus set and waits out a tenant; at the bound every kept rung runs in order (rescan, SBR of every gone chip, the one mesh reset, full check) then the power cycle, a spent mesh reset is not repeated (I87, I22), a cooldown arms the retry; below the bound I58 still climbs at once | `tests/test_below_floor_offbus_ladder.py::test_the_bound_runs_every_kept_rung_in_order_then_the_power_cycle`, `::test_the_bound_rescans_and_sbrs_before_the_cycle_after_a_failed_mesh_reset`, `::test_a_forced_run_below_the_bound_skips_a_mesh_reset_that_already_failed`, `::test_sbr_that_heals_at_the_bound_lifts_on_the_full_check_with_no_mesh_reset`, `::test_an_enumerated_chip_is_never_sbrd_even_at_the_bound`, `::test_below_the_bound_a_gone_chip_waits_for_the_opt_in_and_the_host_rung_for_the_bound`, `::test_below_the_bound_a_mesh_reset_that_failed_on_the_same_chips_climbs_at_once`, `::test_a_cooldown_denial_at_the_bound_still_runs_the_ladder_and_arms_the_retry`, `::test_the_gate_rescans_at_once_and_lifts_only_on_the_full_check`, `::test_the_gate_sbrs_a_gone_chip_when_opted_in_once_per_episode_and_set`, `::test_the_gate_keeps_the_sbr_defaults`, `::test_the_gate_waits_and_retries_when_a_tenant_holds_the_device`, `::test_a_fabric_check_short_of_the_cabled_links_keeps_the_hold`; SBR defaults before the bound: `tests/test_device_safety.py::test_a_stalled_but_enumerated_chip_is_not_treated_as_gone`, `tests/test_device_safety.py::test_a_gone_chip_is_left_to_the_hold_by_default` |
