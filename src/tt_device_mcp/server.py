@@ -9361,9 +9361,9 @@ def preempt_label(job: "Job") -> Optional[str]:
 
 
 async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = False) -> bool:
-    """Kill a preempted job's whole process tree once its grace minute is spent: SIGTERM to its
-    scope's cgroup and its process group, then SIGKILL to both PREEMPT_KILL_GRACE_SEC later at
-    the latest. Bounded, and never cut short by the waiter leaving: the runner awaits it.
+    """Kill a preempted job's whole process tree once its grace minute is spent: SIGTERM once,
+    to its scope's cgroup when the scope is live, else to its process group (never both), then
+    SIGKILL to both PREEMPT_KILL_GRACE_SEC later at the latest. Bounded, and never cut short by the waiter leaving: the runner awaits it.
 
     Spec 03 I69: a job that did not end itself owes the mesh one reset, then the full check,
     fabric included (preempt_forced_job_ids), whoever is still waiting by then. The one
@@ -9378,10 +9378,22 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
     scoped = await asyncio.to_thread(_scope_active, scope)
 
     async def _send(sig: signal.Signals) -> None:
+        # SIGTERM goes to each process once: to the live scope's cgroup (it holds the whole
+        # group and anything that left it), else to the process group, never to both. A second
+        # SIGTERM a few ms after the first kills a job whose handler already returned 0 during
+        # interpreter shutdown (handlers back at SIG_DFL), turning a clean exit 0 into a signal
+        # death that owes the reset. The group gets it only when systemctl reports it failed.
+        # SIGKILL goes to both, so nothing of the tree survives.
         if scoped:
-            await asyncio.to_thread(
-                subprocess.run, ["systemctl", "kill", f"--signal={sig.name}", scope], capture_output=True
-            )
+            try:
+                done = await asyncio.to_thread(
+                    subprocess.run, ["systemctl", "kill", f"--signal={sig.name}", scope], capture_output=True
+                )
+                delivered = done.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                delivered = False
+            if delivered and sig is not signal.SIGKILL:
+                return
         if pid:
             try:
                 os.killpg(pid, sig)
