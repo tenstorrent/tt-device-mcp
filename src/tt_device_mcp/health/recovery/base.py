@@ -284,12 +284,11 @@ class HostActionTimedOut(RuntimeError):
     normal bound) instead of reading as "never launched"."""
 
 
-# The host-level recovery rungs, ordered by severity. A warm reboot recovers most wedges; a
-# whole-bus wedge survives it and only the chassis power cycle clears it (measured on box D).
-# The min-interval loop guard is therefore PER SEVERITY: a stronger rung may escalate past a
-# weaker one that just fired — a reboot that did not fix the mesh must not force an hour's wait
-# before the power cycle that will — but no rung may re-fire itself inside the interval (its own
-# loop guard), and a stronger rung that fired blocks de-escalating back to a weaker one.
+# The host-level recovery actions a ledger row can name, ordered by severity. The power cycle is the
+# only host rung the broker fires (spec 04 I71); "reboot" stays so a row an older broker wrote still
+# reads as a broker recovery (boot attribution, the loop guard). The min-interval loop guard is PER
+# SEVERITY: no action may re-fire itself inside the interval, and a stronger one that fired blocks a
+# weaker one.
 AUTO_RECOVERY_RANK = {"reboot": 1, "power-cycle": 2}
 
 # A power cycle whose following boot reached a VERIFIED-healthy release (a gate pass whose fabric
@@ -602,7 +601,7 @@ class RecoveryMechanism:
         # starts no device reset while one is pending (see host_action_pending).
         self.host_action_requested: Optional[tuple[str, float]] = None
         # When a power cycle last failed to launch on this boot (epoch; the fire raised, not timed out).
-        # It lets the reboot back in once per episode (spec 04 I10, reboot_tried_this_episode).
+        # Diagnostic only: a cycle that did not launch keeps the hold and is asked for again (spec 04 I71).
         self.power_cycle_unlaunched_at: Optional[float] = None
         # The request a device reset was last refused for (one log line per request, spec 04 I34).
         self._host_action_reset_refused: Optional[tuple[str, float]] = None

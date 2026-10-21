@@ -22,7 +22,7 @@ import shutil
 from typing import Optional
 
 # What sd_booted(3) reads. Not `systemctl` on PATH: a restricted-PATH host still runs systemd, and
-# reading that as a container would silently drop the scoped-reset backend and the reboot rung.
+# reading that as a container would silently drop the scoped-reset backend and the power-cycle rung.
 SYSTEMD_DIR = "/run/systemd/system"
 
 # Where the kernel's IPMI driver puts the local BMC interface, in the spellings different distros

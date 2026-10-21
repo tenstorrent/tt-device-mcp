@@ -104,7 +104,7 @@ async def test_a_failed_unchanged_reset_is_not_repeated_and_with_no_host_rung_is
     assert events.count(SKIP) == 4
     pages = [a for a in alerts if a["kind"] == "offbus_gated_hold_page"]
     assert len(pages) == 1, "one operator page per episode"
-    assert "no power cycle or reboot to climb to" in pages[0]["message"]
+    assert "no power cycle to climb to" in pages[0]["message"]
     handoff = opc._pending["handoff"]
     assert handoff["deadline"] is None and handoff["latched"], "latched: no deadline lifts it into a reset"
     assert counters["power_cycles"] == 0 and counters["reboots"] == 0 and counters["sweeps"] == 0

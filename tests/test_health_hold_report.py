@@ -620,7 +620,7 @@ def test_the_unkillable_leftover_host_rung_is_named(held, monkeypatch):
     monkeypatch.setattr(srv, "_leftover_rung_last_try", 0.0)
     monkeypatch.setattr(srv, "_leftover_rung_stage", "")
     p = _payload()
-    assert (p["next_rung"], p["next_rung_source"]) == ("host reboot or power cycle", "unkillable leftover budget")
+    assert (p["next_rung"], p["next_rung_source"]) == ("power cycle", "unkillable leftover budget")
     assert abs(datetime.fromisoformat(p["next_rung_at"]).timestamp() - (T0 + 500)) <= 2
     monkeypatch.setattr(srv, "_leftover_unkillable_mono", mono - 700)
     monkeypatch.setattr(srv, "_leftover_rung_last_try", mono - 20)

@@ -4551,7 +4551,7 @@ def _fabric_77_bound_reached() -> bool:
     if opened is None or not _last_77_was_hugepages():
         _fabric_77_streak += 1
         if _fabric_77_climb_owed():
-            # The episode's one reset already came back UNKNOWN, or this boot is the warm reboot a 77
+            # The episode's one reset already came back UNKNOWN, or this boot is the host cycle a 77
             # climb fired: more retries measure nothing new; the climb is owed now (spec 04 I79).
             return True
     if _fabric_77_streak >= _env_int("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", 3, 1):
@@ -4684,8 +4684,8 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
         and device_hold_episode_since
         and galaxy_recovery.fabric_77_climb_owed(device_hold_episode_since)
     ):
-        # This boot is the warm reboot an earlier 77 climb fired: that episode's reset and sweep already
-        # ran and the reboot did not end the 77. The ladder's sweep (every reset type, then the full
+        # This boot is the host cycle an earlier 77 climb fired: that episode's reset and sweep already
+        # ran and the cycle did not end the 77. The ladder's sweep (every reset type, then the full
         # check) runs once more before the cold rung, never a fresh I40 round first (spec 04 I79).
         galaxy_recovery.mechanism.unverified_reset_since = device_hold_episode_since
     return await escalate("present")
@@ -6674,8 +6674,8 @@ async def device_health_gate(
         # pass read, asks for the one gentlest-first rung that evidence justifies, and then either
         # records the hold — whose flavour, wording and journal only the gate has — or hands the
         # rung to escalate() to fire. The router asked is the GALAXY platform's, because the gate's
-        # ladder has always been one ladder for every host: the reset floor, the surgical rung, the
-        # tray walk and the host rungs are the policy at a job boundary whatever the board is, and
+        # ladder has always been one ladder for every host: the reset floor, the surgical rung and
+        # the host rung are the policy at a job boundary whatever the board is, and
         # only the reset argv is platform-specific (resolved inside the reset itself, per pass).
         # PerTargetRecovery.next_stage names a strictly smaller ladder for a caller that wants the
         # platform's own view of one; steering the gate with it would fire the mesh-wide reset on
@@ -6982,18 +6982,13 @@ async def device_health_gate(
             # That rung ended in a system-wide PCI rescan, so re-read the bus before the floor
             # decides on it: a chip that came back changes the count the floor keys on. No scope
             # re-read — our own rescan cannot open a foreign reset scope, and each rung left below
-            # carries its own scope guard (the tray walk checks it, the reset adopts it).
+            # carries its own scope guard (the reset adopts it).
             beats = await asyncio.to_thread(_decision_heartbeats)
             ev = replace(
                 ev,
                 off_bus=_offbus_count(beats, expected),
                 last_action=STAGE_BRIDGE_RESET,
                 last_action_recovered=False,
-                # Carry the per-chip SBR window this rung just read into the evidence the below-floor
-                # handling classifies from: a chip that reported no_bridge here is the
-                # tray-down-no-window signature. next_stage stays pure (it never reads this); only
-                # the BELOW_FLOOR gate handling does, via _classify_hold.
-                bridge_reset_failed=galaxy_recovery.last_bridge_reset_reasons,
             )
             stage = galaxy_recovery.next_stage(ev)
 
@@ -7520,7 +7515,7 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
     """The next rung the broker has armed for this hold and when it fires (spec 04 I75). Each forced
     candidate comes from ``_check_hold_deadline``'s own clocks and branch order, and what it does at its
     time is read from ``_forced_run_route``, the routing ``_force_escalate_stuck_hold`` itself acts on:
-    a forced ladder, the bound's host rung (power cycle or warm reboot), the startup gate's stand-down
+    a forced ladder, the bound's host rung (the power cycle), the startup gate's stand-down
     until its bounded end, or nothing while the full check after the bound's ladder still has its time.
 
     None without the episode clock the watchdog keys on; while a requested host action is pending, that
@@ -7682,7 +7677,7 @@ def _leftover_rung_candidates(now_epoch: float) -> list:
     if _leftover_rung_last_try:
         due = max(due, _leftover_rung_last_try + LEFTOVER_HOST_RUNG_RETRY_SEC)
     at = now_epoch + max(0.0, due - time.monotonic())
-    return [hold_report.RungCandidate(at, "host reboot or power cycle", "unkillable leftover budget")]
+    return [hold_report.RungCandidate(at, "power cycle", "unkillable leftover budget")]
 
 
 def _hold_report(now: Optional[datetime] = None) -> dict:
@@ -8008,8 +8003,8 @@ def _force_escalate_enabled() -> bool:
 
 async def _force_escalate_stuck_hold() -> None:
     """Teeth for the hold-deadline watchdog: a hold that outlived the escalation ceiling gets the gate's
-    OWN gentlest-first ladder — surgical per-chip bridge reset -> per-tray UBB re-power -> galaxy reset
-    (present mesh / mass drop) -> warm reboot -> BMC power cycle — FORCED past the fail-closed defers
+    OWN gentlest-first ladder — surgical per-chip bridge reset -> galaxy reset (present mesh / mass
+    drop) -> BMC power cycle — FORCED past the fail-closed defers
     that let a held box sit (the one-reset-per-episode latch, an unreadable holder scan counted as a
     tenant, the failed-reset cooldown). A held device is refused to tenants, so there is no running job
     to protect; the ladder still climbs only when each rung FAILS — it never jumps straight to the cold
@@ -8146,7 +8141,7 @@ async def _force_escalate_stuck_hold() -> None:
         )
         # Run the gate's OWN gentlest-first ladder, forced past the fail-closed defers — NOT a jump to
         # the cold rung. An off-bus drop takes the off-bus ladder (surgical per-chip bridge reset ->
-        # per-tray UBB re-power -> warm reboot -> BMC power cycle); a present mesh takes the mesh
+        # BMC power cycle); a present mesh takes the mesh
         # reset -> climb. Each rung fires only when the gentler one failed. The module-global Galaxy
         # instance, NOT select_recovery: the idle ladders live on GalaxyRecovery but apply on every
         # platform, exactly like the gate's rungs (see GalaxyRecovery's ladder comment) — the
@@ -9837,7 +9832,7 @@ def _escalate_held_job_past_bound(job: "Job", held_sec: float, bound: float, rea
     """A job held past its bound is not just dropped: the hold behind it escalates through the
     existing forced recovery ladder (_maybe_spawn_forced_escalation, the same teeth the deadline
     watchdog drives), once per episode and only if no forced run has happened in it yet — a further
-    forced run on top of one already spent would climb the ladder (warm reboot, BMC cycle) on a
+    forced run on top of one already spent would climb the ladder (BMC cycle) on a
     short clock. Returns what was done, for the job's error and log. Never raises."""
     global device_hold_job_bound_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
     try:

@@ -120,10 +120,9 @@ def _galaxy_reset_min_dead_chips(expected: int) -> Optional[int]:
     takes the mesh with it — one chip off the bus, one -glx_reset, and the other 31 go to
     0xFFFFFFFF until a power cycle. That wedge is an active-eth-core freeze that self-heals on its own; only a mass drop, which self-heal does not clear, is worth the reset. So
     a below-floor drop HOLDS (self-heal works, no tenant runs on the held mesh) and only a mass drop
-    resets. Distinct from the REBOOT floor above, which gates the host reboot rung AFTER a reset
-    already ran — this one gates the reset itself.
+    resets. This floor gates the reset itself.
 
-    Default-safe: unset -> the same mass-drop floor as the reboot rung (frac 0.5), because a single
+    Default-safe: unset -> the mass-drop floor (frac 0.5), because a single
     galaxy reset on a single-chip wedge is the measured way the whole mesh is lost, and the idle
     relift now lifts a below-floor hold on its own so holding costs no stuck device. The old
     reset-any-unhealthy-device behavior is an explicit opt-out — TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC
@@ -185,7 +184,7 @@ def _stuck_hold_reset_enabled() -> bool:
     the ceiling. It is on by default because an unbounded hold is the failure it exists to prevent;
     a healthy mesh lifts in the first relift and never reaches it, the escalation fires only on an
     idle, tenant-free, present mesh past the ceiling, is rate-limited to one reset per episode, and
-    climbs to the reboot rung if the reset does not recover rather than looping or sitting."""
+    climbs to the power cycle if the reset does not recover rather than looping or sitting."""
     return os.environ.get("TT_DEVICE_MCP_STUCK_HOLD_RESET", "1").strip() == "1"
 
 
@@ -197,7 +196,7 @@ def _offbus_hold_escalate_enabled() -> bool:
     read-only relift cannot lift (still off the bus) and which an idle box has no next-job gate to
     run the gone-chip cascade on, so read-only it stands forever. On by default because that hold is
     unbounded otherwise; it fires only on an idle, tenant-free drop past the ceiling, is rate-limited
-    to one recovery per episode, and climbs to the reboot rung if the reset does not recover."""
+    to one recovery per episode, and climbs to the power cycle if the reset does not recover."""
     return os.environ.get("TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE", "1").strip() == "1"
 
 
@@ -489,8 +488,8 @@ def _route(
     The gate is a two-phase machine — it picks an action, runs it, then asks again about the
     outcome — and this router names the rung for each phase, selected by ``last_action``/
     ``last_action_recovered``. A stateless "what is the next rung" cannot represent it faithfully,
-    because the host-reboot rung is a decision reachable only AFTER a galaxy reset has already run
-    and failed, and a bridge/tray-reset recovery is a release with its own outcome semantics,
+    because the host rung is a decision reachable only AFTER a galaxy reset has already run
+    and failed, and a bridge-reset recovery is a release with its own outcome semantics,
     distinct from a fresh pass's release.
 
     ``last_action_recovered is True`` — whichever rung ran (bridge reset, galaxy reset, or per-tray
@@ -737,8 +736,8 @@ def _offbus_ids_on_trays(offbus_chips: set, expected: int, tray_map: Optional[di
         return None
     if any(i < 0 or i >= expected for i in ids):
         return None
-    # A chip the map cannot place has no tray to re-power, and planning around it would report a
-    # walk as complete while leaving that chip down (I16).
+    # A chip the map cannot place has no tray, and planning around it would report the drop as
+    # whole trays while leaving that chip unaccounted for (I16).
     if not ids <= {c for chips in tray_map.values() for c in chips}:
         return None
     return ids
@@ -775,7 +774,7 @@ def _affected_trays(offbus_chips: set, expected: int, tray_map: Optional[dict]) 
 def _offbus_placement(offbus_chips, chip_buses, tray_map: Optional[dict]) -> list:
     """Each off-bus chip a sweep plans around, as ``{"chip", "pci", "tray"}`` sorted by chip: the
     PCI address from the banked map and the tray from ``tray_map`` (None where either is unknown).
-    The sweep's line and event carry it so a reader can check the trays it re-powers against the
+    The sweep's line and event carry it so a reader can check the trays it names against the
     chips that drove them; without it a chip that came back earlier in the hold reads as the one
     the sweep was for. Pure."""
     tray_of = {c: t for t, chips in (tray_map or {}).items() for c in chips}
@@ -1387,7 +1386,7 @@ class GalaxyRecovery(Recovery):
         also what keeps a per-target host, whose gate runs this same ladder, out of DOWN entirely —
         a state it can reach only through the Galaxy idle ladder.
 
-        The verdict reported is the ACTION's own (the re-verify, the tray walk, the reset), not a
+        The verdict reported is the ACTION's own (the re-verify, the reset), not a
         degraded->fit transition: the gate reaches its ladder whenever THIS pass's probe read
         unhealthy, which happens on a mesh the FSM still records HEALTHY (a post-job pass on a clean
         episode), and a rung that verified such a mesh back must still read as recovered or the gate
@@ -1846,7 +1845,7 @@ class GalaxyRecovery(Recovery):
             offbus_chips = _offbus_chip_ids(beats or {}, expected)
         fault_class = self._power_cycle_direct_class_now(offbus_chips, expected, tray_map, log)
         if fault_class is not None and not await asyncio.to_thread(self.mechanism.scope_active):
-            # Spec 04 I37: the sweep's tray re-power and mesh reset have not healed this class (a
+            # Spec 04 I37: the sweep's mesh reset has not healed this class (a
             # whole tray, or an all-off bus whose mesh reset already failed). The caller climbs at once.
             log(
                 f"last chance before the host rung{where}: class {fault_class} — the sweep does not heal it, skipping it"
@@ -2247,7 +2246,7 @@ class GalaxyRecovery(Recovery):
         ):
             log("off-bus hold: a tenant or a reset arrived during the stand-back checks — holding")
             return False
-        # Re-read the whole box, not just the dropped tray, right before the cycle: a tray re-power can
+        # Re-read the whole box, not just the dropped tray, right before the cycle: a reset can
         # take other trays off the bus (or the box can come back on its own) between the caller's read
         # and here. A box with nothing off the bus any more needs no cycle.
         beats = await asyncio.to_thread(self.deps.read_heartbeats)
@@ -2561,8 +2560,8 @@ class GalaxyRecovery(Recovery):
         device_pci_map = self.deps.device_pci_map()
         # A chip GONE from the bus entirely — absent from sysfs, not reading all-ones — never entered
         # isolated_chips, so the surgical rung below skips it and it falls to the galaxy reset, which
-        # here is unbounded: with the host-reboot rung opted out a galaxy reset that inverts a below-floor
-        # drop has no reboot to climb to. When opted in, route a single/few-chip gone drop to the surgical
+        # here is unbounded: with the power cycle opted out a galaxy reset that inverts a below-floor
+        # drop has no host rung to climb to. When opted in, route a single/few-chip gone drop to the surgical
         # rung: reset_chip_via_bridge finds its bridge by the secondary bus it still points at even with
         # the endpoint's own node gone. Detection is duplicated from the gate, not shared, so the gate
         # stays byte-identical and its inertness holds unconditionally.
@@ -2758,8 +2757,8 @@ class GalaxyRecovery(Recovery):
             expected,
             "the mesh reset failed and no host rung is available",
             log,
-            latched="no host power cycle or reboot enabled",
-            cause="the broker has no power cycle or reboot to climb to",
+            latched="no host power cycle enabled",
+            cause="the broker has no power cycle to climb to",
         )
 
     async def _sweep_after_unverified_reset(self, expected: int, off_bus_before: int, hold_since: str, log) -> None:
