@@ -6,20 +6,30 @@ While nobody waits the job is never stopped for time. Contention = its limit has
 job waits. The broker sends no signal until contention has lasted PREEMPT_GRACE_SEC (a minute)
 unbroken, so the job can see the waiter and end itself; a waiter that leaves inside the minute
 causes nothing. When the minute runs out the job's whole process tree is killed (SIGTERM, then
-SIGKILL PREEMPT_KILL_GRACE_SEC later at the latest), the job ends PREEMPTED (a wedge-risk exit),
-and the device is reset and fully checked, fabric included, before the waiting job is
-dispatched. Every clock is time.monotonic(). Spec 01 I16.
+SIGKILL PREEMPT_KILL_GRACE_SEC later at the latest) and the job ends PREEMPTED. If the kernel's
+exit records show every process exited through its own code on SIGTERM, only the fast post-job
+check runs; otherwise (SIGKILL, a signal death, no witness) it is a wedge-risk exit and the device
+is reset and fully checked, fabric included, before the waiting job is dispatched. Every clock is
+time.monotonic(). Spec 01 I16.
 """
 
 import asyncio
+import errno
 import os
 import signal
+import struct
+import subprocess
+import sys
 import time
 
 import pytest
 
 import tt_device_mcp.server as srv
+from tests.conftest import fsm_healthy, patch_recovery
 from tt_device_mcp.cli import overview_lines
+from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.exit_witness import PROC_EVENT_EXIT, PROC_EVENT_FORK, ExitWitness, parse_events
+from tt_device_mcp.fsm import ServerState
 
 
 def _free_device_lock(monkeypatch):
@@ -496,9 +506,224 @@ def test_an_ordinary_job_row_has_no_preempt_label(clear_job_state):
 
 @pytest.mark.parametrize("exit_code", [0, 1, -2, 130, -9, 137, -15, 143, None])
 def test_preempted_wedge_risk(exit_code):
-    """A preempted job was killed: whatever its exit status the device gets the reset + full check,
-    fabric included, before the waiting job (msg: a timeout never leaves the device hung)."""
+    """A preempted job not proven to have ended cleanly: whatever its exit status the device gets
+    the reset + full check, fabric included, before the waiting job. Proven clean, it does not."""
     assert srv._is_wedge_risk_exit(srv.JobStatus.PREEMPTED, exit_code) is True
+    assert srv._is_wedge_risk_exit(srv.JobStatus.PREEMPTED, exit_code, preempt_clean=True) is False
+
+
+def _witness(monkeypatch, *, clean, ok=True, why=""):
+    """Stand in for the kernel's exit records: the verdict a test needs, without CAP_NET_ADMIN."""
+    made = []
+
+    class _Witness:
+        def __init__(self, pgid, scope):
+            self.ok, self.why, self.closed = ok, why, False
+            made.append(self)
+
+        def drain(self):
+            pass
+
+        def clean(self):
+            return ok and clean
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(srv, "ExitWitness", _Witness)
+    return made
+
+
+async def _preempt(monkeypatch, job_id, command, *, kill_grace):
+    """Run a preemptable job past its 1 s limit with a job waiting, through the minute (1 s here)
+    and the kill, and let the runner reach the post-job gate. Returns the job, the signals sent,
+    the gate's calls and the dirty marks."""
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    gate = _recording_post_job_gate(monkeypatch)
+    dirty = _recording_dirty(monkeypatch)
+    _fast_preempt(monkeypatch, grace=1, kill_grace=kill_grace)
+    job = srv.Job(
+        id=job_id, owner="server", workspace="/tmp", command=command, queued_at="t", timeout_sec=1, preemptable=True
+    )
+    srv.jobs[job_id] = job
+    sent = _recording_signals(monkeypatch, job)
+    await srv.get_job_queue().put(job_id)
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _until_running(job)
+        _waiting_job()
+        await _until_finished(job, limit_sec=15)
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+    assert job.status is srv.JobStatus.PREEMPTED, job.status.value
+    return job, [sig for _, sig in sent], gate, dirty
+
+
+@pytest.mark.asyncio
+async def test_a_preempted_job_that_ends_cleanly_on_sigterm_takes_the_fast_check(monkeypatch, clear_job_state):
+    """Case (b): SIGTERM was sent and the kernel saw every process of the tree exit through its own
+    code inside the 10 s grace. The job is still PREEMPTED (it did not end itself), but nothing
+    was cut mid-transaction: no SIGKILL, no reset, only the fast post-job check."""
+    made = _witness(monkeypatch, clean=True)
+    job, sent, gate, dirty = await _preempt(monkeypatch, "961", "sleep 60", kill_grace=5)
+    assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
+    assert job.preempt_clean is True
+    assert made and made[0].closed, "the witness must be closed"
+    assert dirty == [], "a clean end on SIGTERM must not owe a reset"
+    assert gate == [{"job_failed": False}], "a clean end on SIGTERM takes the fast check"
+    assert "ended cleanly on SIGTERM" in job.error
+
+
+@pytest.mark.asyncio
+async def test_a_preempted_job_with_a_signal_death_is_reset_and_fully_checked(monkeypatch, clear_job_state):
+    """Case (c): the tree was gone inside the 10 s grace, but a process of it died from the signal
+    (the kernel's exit record says so): reset + full check, fabric included."""
+    _witness(monkeypatch, clean=False, why="pid 4242 of the job died from a signal")
+    job, sent, gate, dirty = await _preempt(monkeypatch, "962", "sleep 60", kill_grace=5)
+    assert signal.SIGKILL not in sent, sent
+    assert job.preempt_clean is False
+    assert dirty, "a signal death must owe the reset + full check"
+    assert gate == [{"job_failed": True}]
+
+
+@pytest.mark.asyncio
+async def test_a_preempted_job_that_needed_sigkill_is_reset_and_fully_checked(monkeypatch, clear_job_state):
+    """Case (c): the tree outlived SIGTERM, so SIGKILL was sent. Whatever the witness would say,
+    that is a kill: reset + full check."""
+    _witness(monkeypatch, clean=True)
+    job, sent, gate, dirty = await _preempt(monkeypatch, "963", "trap '' INT TERM; sleep 60", kill_grace=1)
+    assert signal.SIGKILL in sent, sent
+    assert job.preempt_clean is False
+    assert dirty
+    assert gate == [{"job_failed": True}]
+
+
+@pytest.mark.asyncio
+async def test_an_unwitnessed_preemption_is_reset_and_fully_checked(monkeypatch, clear_job_state):
+    """Case (c): the exit could not be observed (no connector permission, lost events, unreadable
+    tree). In doubt, the job counts as killed: reset + full check."""
+    _witness(monkeypatch, clean=True, ok=False, why="cannot subscribe to process events")
+    job, sent, gate, dirty = await _preempt(monkeypatch, "964", "sleep 60", kill_grace=5)
+    assert signal.SIGKILL not in sent, sent
+    assert job.preempt_clean is False
+    assert dirty
+    assert gate == [{"job_failed": True}]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_fast_check_after_a_clean_end_keeps_the_hold_and_escalates(monkeypatch, tmp_path):
+    """After case (a) or (b) the post-job gate runs the same fast check as after any clean exit
+    (job_failed=False). If it fails, the device is not handed on: it is held (RECOVERING) and the
+    hold goes to the broker's bounded recovery, which lifts it only after a full check passes."""
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "exit 0")
+    _free_device_lock(monkeypatch)
+    srv._clear_device_dirty()
+    fsm_healthy(srv)
+    snapshots, resets = [], []
+
+    def snapshot(n, **k):
+        snapshots.append(n)
+        return False, "chip 0: ARC not responding"
+
+    async def reset(indices, log):
+        resets.append(indices)
+        return True
+
+    monkeypatch.setattr(srv.health_monitor, "verify_device_health", snapshot)
+    patch_recovery(monkeypatch, "_reset_and_verify_device", reset)
+    await srv._verify_device_after_job(None, job_failed=False)
+
+    assert snapshots, "the fast check never ran"
+    assert srv.fsm.state is not ServerState.HEALTHY, "a device that failed its fast check was released"
+    assert srv.fsm.state is ServerState.RECOVERING, srv.fsm.state
+
+
+def _event(what, data):
+    body = struct.pack("=IIQ", what, 0, 0) + data
+    cn = struct.pack("=IIIIHH", 1, 1, 0, 0, len(body), 0) + body
+    return struct.pack("=IHHII", 16 + len(cn), 3, 0, 0, 0) + cn
+
+
+def _fork(parent, child):
+    return _event(PROC_EVENT_FORK, struct.pack("=iiii", parent, parent, child, child))
+
+
+def _exit(pid, status, tgid=None):
+    return _event(PROC_EVENT_EXIT, struct.pack("=iiII", pid, pid if tgid is None else tgid, status, 17))
+
+
+class _Sock:
+    def __init__(self, *bufs, error=None):
+        self.bufs, self.error = list(bufs), error
+
+    def recv(self, n):
+        if self.bufs:
+            return self.bufs.pop(0)
+        if self.error:
+            raise OSError(self.error, os.strerror(self.error))
+        raise BlockingIOError
+
+    def close(self):
+        pass
+
+
+def _fed(tree, *bufs, error=None):
+    w = ExitWitness.__new__(ExitWitness)
+    w.ok, w.why, w.tree, w.exits, w.signalled = True, "", set(tree), {}, set()
+    w._sock = _Sock(*bufs, error=error)
+    return w
+
+
+def test_the_witness_reads_kernel_exit_records():
+    """The verdict from crafted connector messages: forks from the tree join it, an own-code exit
+    (low 7 bits zero) is clean, a signal death or an unseen process is not, a lost event voids it."""
+    assert list(parse_events(_fork(10, 11) + _exit(11, 0) + _exit(12, 9, tgid=10))) == [
+        ("fork", (10, 11)),
+        ("exit", (11, 11, 0)),
+        ("exit", (12, 10, 9)),
+    ]
+    clean = _fed({10}, _fork(10, 11) + _fork(99, 98), _exit(11, 0) + _exit(10, 143 << 8) + _exit(98, 9))
+    assert clean.clean() is True and clean.tree == {10, 11}
+    killed = _fed({10}, _fork(10, 11), _exit(11, 15) + _exit(10, 143 << 8))
+    assert killed.clean() is False and "signal" in killed.why
+    thread = _fed({10}, _exit(12, 9, tgid=10) + _exit(10, 0))
+    assert thread.clean() is False, "a thread of the job died from a signal"
+    unseen = _fed({10}, _fork(10, 11), _exit(10, 0))
+    assert unseen.clean() is False and "no exit record" in unseen.why
+    lost = _fed({10}, _exit(10, 0), error=errno.ENOBUFS)
+    assert lost.clean() is False and "lost" in lost.why
+
+
+def test_the_witness_on_a_real_tree():
+    """The kernel's own records, where this host lets the test subscribe (the broker runs as root):
+    a process that exits on SIGTERM by its own handler is clean; one the signal kills is not."""
+    handles = "import signal, sys, time; signal.signal(signal.SIGTERM, lambda *a: sys.exit(0)); time.sleep(30)"
+    for argv, want in (([sys.executable, "-c", handles], True), (["sleep", "30"], False)):
+        p = subprocess.Popen(argv, start_new_session=True)
+        try:
+            time.sleep(0.3)
+            w = ExitWitness(p.pid, None)
+            if not w.ok:
+                pytest.skip(f"no process events here: {w.why}")
+            os.killpg(p.pid, signal.SIGTERM)
+            p.wait(timeout=10)
+            deadline = time.monotonic() + 2
+            while w.clean() is not want and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert w.clean() is want, (argv[0], w.why)
+            w.close()
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
 
 
 @pytest.mark.asyncio
