@@ -1422,7 +1422,7 @@ async def test_a_reset_that_outlives_our_wait_still_shields_its_chips(monkeypatc
     await srv.sampler.check_for_dead_chips(half)  # two samples: would be "confirmed" without the guard
     assert isolated == [], "amputated a chip out of a live reset scope"
     assert marks == [], "dirtied the device on a reset's own all-ones"
-    assert pollers == [False], "the pollers stay off the all-ones tray (03 I66), stopped once"
+    assert pollers == [], "no poller fd is closed on an attached all-ones tray (03 I66, I84); the reset quiesced them"
     assert srv.sampler.scope_seen and chip_state.recovering(), "the live scope is published as recovering"
 
     blackout = {str(i): (heartbeat.ALL_ONES,) for i in range(32)}
@@ -2123,7 +2123,7 @@ async def test_a_transient_all_ones_does_not_amputate_a_chip(monkeypatch):
     blip = {"0": live, "13": [heartbeat.ALL_ONES, 0, 0, 0, 0, 0], "31": live}
     await srv.sampler.check_for_dead_chips(blip)
     assert isolated == [], "isolated on a single sample"
-    assert pollers == [False], "the pollers stop at the first all-ones sample (03 I66); isolation waits"
+    assert pollers == [], "an all-ones chip is not detached yet: the poller stop waits for the valve (03 I66, I84)"
     assert chip_state.lost_chips() == [], "one sample is not lost"
 
     healthy = {"0": live, "13": live, "31": live}
@@ -2134,15 +2134,16 @@ async def test_a_transient_all_ones_does_not_amputate_a_chip(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_chip_dead_on_two_consecutive_samples_is_isolated(monkeypatch):
-    """The case that matters: a real chip drop still gets cut out, fast. The pollers stop on the
-    first all-ones sample already (spec 03 I66), before the second confirms it."""
+    """The case that matters: a real chip drop still gets cut out, fast. The pollers are not stopped
+    on the first all-ones sample (spec 03 I66): the chip is not detached yet, so the valve stops them
+    after its remove (I84)."""
     isolated = _no_isolation(monkeypatch)
     pollers = stub_device_pollers(monkeypatch)
 
     live = [100, 800, 800, 0, 0, 0]
     dead = {"0": live, "13": [heartbeat.ALL_ONES, 0, 0, 0, 0, 0], "31": live}
     await srv.sampler.check_for_dead_chips(dead)
-    assert pollers == [False] and isolated == []
+    assert pollers == [] and isolated == []
     await srv.sampler.check_for_dead_chips(dead)
 
     assert isolated == ["13"], "a genuinely dead chip was not isolated"
