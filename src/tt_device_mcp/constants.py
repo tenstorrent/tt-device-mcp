@@ -38,6 +38,14 @@ GRACEFUL_KILL_GRACE_SEC = 60
 # to the reap, and reaching SIGKILL means the device was NOT released.
 SIGTERM_GRACE_SEC = 15
 
+# SIGINT window for a job the hung reaper stops for silence (spec 01 I10), in place of
+# GRACEFUL_KILL_GRACE_SEC. A job that printed nothing for HUNG_SILENCE_SEC is blocked, most
+# often inside a device op, and does not unwind on SIGINT: on a Galaxy host every silence reap
+# observed ran the full 60 s and ended at SIGTERM. A HUNG job owes the mesh the reset and the
+# full check either way (spec 03 I69), so the long window only delayed recovery. The SIGINT
+# still goes first, and SIGTERM (SIGTERM_GRACE_SEC) and SIGKILL follow as on every ladder.
+HUNG_SIGINT_GRACE_SEC = 10
+
 # After a job is finalized, any of its processes still alive (a child that left the process
 # group, or one the ladder never reached) gets SIGTERM, then SIGKILL after this window. The
 # job itself is already gone, so this is a sweep of leftovers, not a teardown: it is kept
@@ -55,10 +63,17 @@ SURVIVOR_KILL_WAIT_SEC = 2
 # the device held until the next job or the hold ceiling.
 HOLDER_RELEASE_WAIT_SEC = 30
 
-# A preemptable job's whole stop window, from the first signal to SIGKILL. Its owner has
-# agreed to watch the queue and get off the device within this once another job is waiting
-# past its time limit, so it is shorter than the ordinary ladder (SIGINT 60 s + SIGTERM 15 s).
+# A preemptable job's grace minute. Contention (the job past its time limit AND another job
+# waiting) must last this long, unbroken, before the broker does anything to the job: the job
+# is expected to see the waiter in the queue and end itself. No signal is sent inside it.
 PREEMPT_GRACE_SEC = 60
+
+# Once the grace minute is spent, the job's whole process tree gets SIGTERM and, at most this
+# much later, SIGKILL: 10 s for its handlers to release the device. The job already had its
+# minute to end itself. A tree that all exits through its own code on SIGTERM inside it gets the
+# fast post-job check; a SIGKILL, any signal death or an unwitnessed exit gets a reset and the
+# full check.
+PREEMPT_KILL_GRACE_SEC = 10
 
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and

@@ -703,3 +703,95 @@ def test_an_operator_reset_keeps_the_latch_and_only_a_clean_fabric_pass_ends_it(
         assert srv.fsm.state is not ServerState.HEALTHY, "the hold stays"
         assert m.topology_hw_fault, "the latch stands"
         assert "fabric_topology_hw_fault_cleared" not in st["events"]
+
+
+# --- spec 04 I83 single flight: the watchdog's one ladder owns the reset ----------------------------
+
+
+def _relift_unpaced(monkeypatch):
+    """The idle relift is due again and the reset pacing has run out: an unguarded present-mesh retry
+    would run its glx_reset now."""
+    monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", srv.time.monotonic() - 100_000.0)
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
+
+
+@pytest.fixture(params=["missing ports", "latched"])
+def link_short_hold(request, monkeypatch, mesh):  # noqa: F811
+    """A fabric link-short hold (spec 04 I83), every chip on the bus and no reset run yet: the post-job
+    gate's measured missing-port FAIL, or the I42 latch. The watchdog starts its episode. Its at-start
+    ladder runs the glx_reset, the full check after it still counts short and the ladder's host rung is
+    deferred by the boot / post-power-cycle cooldown (WAITING: the hold stands); the bound's host rung
+    after it is deferred too (its retry armed, no host action pending), which leaves the idle relift
+    free to run."""
+    from tests.test_hold_bound import _watchdog
+    from tt_device_mcp.health.recovery import OUTCOME_WAITING
+
+    request.getfixturevalue("lost_mesh" if request.param == "missing ports" else "latched_mesh")
+    mesh["reset_heals"] = False
+    _watchdog(monkeypatch)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+    real_escalate = srv.galaxy_recovery.escalate
+
+    async def escalate(kind, indices, expected, log, **kw):
+        if kind != "present-forced":
+            return await real_escalate(kind, indices, expected, log, **kw)
+        mesh["resets"].append(["tt-smi", "-glx_reset"])  # the at-start ladder: its check still counts short
+        mesh["events"].append("at_start_ladder")
+        return OUTCOME_WAITING
+
+    async def host_rung(age, log):
+        mesh["events"].append("host_rung")
+        srv._hold_bound_rung_pending, srv._hold_bound_cycle_age = False, age  # the cooldown retry is armed
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    monkeypatch.setattr(srv, "_hold_bound_host_rung", host_rung)
+    mesh["hold"] = request.param
+    return mesh
+
+
+async def _open_link_short_hold(m):
+    if m["hold"] == "missing ports":
+        await _gate()
+    assert srv.fsm.state is ServerState.RECOVERING and srv.health_monitor.last_fabric_ok is False
+    assert srv._fabric_link_short_hold(), "every chip on the bus, the fabric short: spec 04 I83's class"
+    assert any(srv._idle_relift_armed()), "the idle relift re-checks this hold"
+    assert m["resets"] == [], "no reset before the at-start pass"
+
+
+@pytest.mark.asyncio
+async def test_the_idle_relift_runs_no_glx_reset_after_the_at_start_pass(monkeypatch, link_short_hold):
+    """Spec 04 I83 single flight, end to end: the watchdog's first tick of the hold runs the at-start
+    ladder (one glx_reset) and asks for the host rung; an idle relift after it, due and unpaced while
+    the cooldown defers the cycle, runs no other glx_reset and releases nothing."""
+    m = link_short_hold
+    await _open_link_short_hold(m)
+    srv._check_hold_deadline()
+    await srv._forced_escalation_task
+    assert m["resets"] == [["tt-smi", "-glx_reset"]], "the at-start pass ran its one reset"
+    assert m["events"].count("host_rung") == 1 and srv._hold_bound_early
+    assert srv.fsm.state is ServerState.RECOVERING and not srv._relift_waits_on_host_action()
+    _relift_unpaced(monkeypatch)
+    await srv._attempt_idle_relift()
+    assert m["resets"] == [["tt-smi", "-glx_reset"]], "no relift glx_reset after the at-start pass"
+    assert srv.fsm.state is not ServerState.HEALTHY, "nothing released without a passing full check"
+
+
+@pytest.mark.asyncio
+async def test_the_idle_relift_runs_no_glx_reset_while_the_at_start_pass_runs(monkeypatch, link_short_hold):
+    """Spec 04 I83 single flight while the watchdog's at-start run is in flight (no ladder recorded
+    yet): the idle relift runs no glx_reset over it."""
+    import asyncio
+
+    m = link_short_hold
+    await _open_link_short_hold(m)
+    in_flight = asyncio.get_running_loop().create_future()
+    monkeypatch.setattr(srv, "_forced_escalation_task", in_flight)
+    monkeypatch.setattr(srv, "device_hold_escalation_kind", "fabric_link_short")
+    _relift_unpaced(monkeypatch)
+    try:
+        await srv._attempt_idle_relift()
+    finally:
+        in_flight.cancel()
+    assert ["tt-smi", "-glx_reset"] not in m["resets"], "the in-flight at-start pass owns the reset"
+    assert srv.fsm.state is not ServerState.HEALTHY

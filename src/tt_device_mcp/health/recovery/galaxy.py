@@ -1748,7 +1748,9 @@ class GalaxyRecovery(Recovery):
         age = _hold_age_sec(hold_since)
         return (hold_since, age is not None and age >= _stuck_hold_ceiling_sec())
 
-    async def _issue_all_resets_back_to_back(self, trays: list, expected: int, log, *, do_sbr: bool = True) -> bool:
+    async def _issue_all_resets_back_to_back(
+        self, trays: list, expected: int, log, *, do_sbr: bool = True, mesh_reset: bool = True
+    ) -> bool:
         """Fire EVERY reset type once, back-to-back, with no waiting or verifying between them: SBR on
         any chip still bridged, then the mesh-wide reset —
         each issued as soon as the previous command returns. The single implementation of "all rungs",
@@ -1759,7 +1761,10 @@ class GalaxyRecovery(Recovery):
 
         Returns whether the sweep was COMPLETE: False when the per-host gate (spec 04 I24) or the
         outage hold (I28) refused it. An incomplete sweep is not the full ladder,
-        so the caller must not climb to a power cycle on it (I22)."""
+        so the caller must not climb to a power cycle on it (I22).
+
+        ``mesh_reset=False`` fires SBR only, so the last-chance sweep can re-probe the bus before the
+        mesh reset (spec 04 I86); the caller then fires the mesh reset with ``do_sbr=False``."""
         off_bus = pcie_guard.chips_off_bus(expected)
         allowed, why = pcie_guard.host_reset_gate(off_bus)
         if not allowed:
@@ -1782,6 +1787,8 @@ class GalaxyRecovery(Recovery):
             # resets — that is the galaxy reset's case, not the gentle rung's.
             if do_sbr:
                 await self._recover_isolated_chips(log)
+            if not mesh_reset:
+                return True
             # 2) mesh-wide reset, no verify (the ONE verify belongs to the caller). Lazy import:
             # select_recovery lives in the package __init__ that imports THIS module, so a top-level
             # import would be circular; by call time the package is fully loaded.
@@ -1823,6 +1830,10 @@ class GalaxyRecovery(Recovery):
         once ("we always need to give the resets one last chance before power cycle"). It runs at
         most once per hold phase (spec 04 I87): once below the 10-min bound, and once more as part of
         the bound's own ladder.
+
+        Spec 04 I86: when SBR fires, the bus is re-probed before the mesh reset. Once every expected
+        chip is back, the full check (fabric included) runs first and the mesh reset only on its
+        failure, followed by one more settle and verify. The probe never lifts a hold by itself.
 
         ``offbus_chips`` names the off-bus chips the journal lines place (read from the heartbeats when
         not given). The sweep is SKIPPED — the
@@ -1898,6 +1909,7 @@ class GalaxyRecovery(Recovery):
         trays = _affected_trays(offbus_chips, expected, tray_map) or []
         placement = _offbus_placement(offbus_chips, self._chip_buses_now(), tray_map)
         swept = False
+        mesh_reset_left = False
         if await asyncio.to_thread(self.mechanism.scope_active):
             log(f"last chance before the host rung{where}: a reset is already cycling in its own scope — adopting it")
         else:
@@ -1917,27 +1929,50 @@ class GalaxyRecovery(Recovery):
                 )
                 log(
                     f"last chance before the host rung{where}: firing every reset type back-to-back "
-                    f"(SBR -> mesh reset) — nothing to lose before the "
+                    f"(SBR -> bus re-probe -> mesh reset) — nothing to lose before the "
                     f"power cycle; off the bus now: {_placement_text(placement)}"
                 )
-                swept = await self._issue_all_resets_back_to_back(
-                    trays, expected, log, do_sbr=bool(self.deps.isolated_chips())
-                )
-        settle = _settle_before_host_rung_sec()
-        log(f"settling {settle}s for re-enumeration, then one verify before the host rung")
-        try:
-            await asyncio.sleep(settle)
-            healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
-            FABRIC_DEBT.note_evidence(evidence)
-        finally:
-            pcie_guard.end_offbus_reset()
-        if healthy and fabric_77_unverified and expected > 1 and self._fabric_ran_but_unverified(evidence):
-            # The caller is past an UNKNOWN reset whose I40 fallback refused (spec 04 I29): a 77 here is
-            # the same no-verdict the reset already got, never a recovered fabric.
-            log("the sweep's verify is still a fabric 77 — the fabric stays unverified, not recovered")
-            health_event("host_rung_sweep_unverified", context=context or gate_phase, evidence=evidence)
-            self._sweep_read_77 = True
-            healthy = False
+                if self.deps.isolated_chips():
+                    # Spec 04 I86: SBR first, then a cheap re-probe of the bus. Once every expected chip
+                    # is back, no further rung fires before the full check: the mesh reset runs only if
+                    # that check fails.
+                    swept = await self._issue_all_resets_back_to_back(
+                        trays, expected, log, do_sbr=True, mesh_reset=False
+                    )
+                    if swept and await asyncio.to_thread(self._bus_whole_now, expected, log):
+                        mesh_reset_left = True
+                        log(
+                            "every expected chip is back on the bus after SBR — the full check runs before the mesh reset"
+                        )
+                        health_event(
+                            "last_chance_sweep_bus_whole", context=context or gate_phase, after="sbr", expected=expected
+                        )
+                    elif swept:
+                        swept = await self._issue_all_resets_back_to_back(trays, expected, log, do_sbr=False)
+                else:
+                    swept = await self._issue_all_resets_back_to_back(trays, expected, log, do_sbr=False)
+        # The bus is already whole: no re-enumeration left to settle for (the bridge-reset rung verifies
+        # at once too).
+        settle = 0 if mesh_reset_left else _settle_before_host_rung_sec()
+        healthy, evidence = await self._settle_and_verify_sweep(
+            expected, log, gate_phase, settle, context=context, fabric_77_unverified=fabric_77_unverified
+        )
+        if not healthy and mesh_reset_left:
+            # The bus probe alone never lifts (I86): the full check failed, so the remaining rung runs and
+            # the caller climbs to the power cycle if the mesh still does not verify.
+            log("the full check failed on a whole bus after SBR — firing the remaining rung (mesh reset)")
+            health_event("last_chance_sweep_resumed", context=context or gate_phase, rung="mesh_reset")
+            swept = await self._issue_all_resets_back_to_back(trays, expected, log, do_sbr=False)
+            mesh_reset_left = False
+            self._sweep_read_77 = False  # the last verify decides, as with one verify
+            healthy, evidence = await self._settle_and_verify_sweep(
+                expected,
+                log,
+                gate_phase,
+                _settle_before_host_rung_sec(),
+                context=context,
+                fabric_77_unverified=fabric_77_unverified,
+            )
         if not healthy:
             if not swept:
                 log(f"the full reset ladder did not run{where} — holding; no power cycle this pass")
@@ -1948,6 +1983,8 @@ class GalaxyRecovery(Recovery):
             self.mechanism.sweep_spent = sweep_phase
             return False
         via = "last-chance-reset-sweep" if swept else "settle-before-host-rung"
+        if swept and mesh_reset_left:
+            via = "last-chance-reset-sweep (SBR, bus whole)"
         self.deps.clear_device_reported_fault(f"gate/{gate_phase}: mesh recovered before the host rung ({via})")
         released = self.deps.clear_device_dirty(
             verified=True, why=f"gate/{gate_phase}: mesh recovered before the host rung ({via})"
@@ -1962,6 +1999,40 @@ class GalaxyRecovery(Recovery):
         log(f"the mesh verified after the {via} — no power cycle needed")
         health_event("gate", phase=gate_phase, healthy=True, recovered_via=via, evidence=evidence)
         return True
+
+    def _bus_whole_now(self, expected: int, log) -> bool:
+        """The cheap re-probe between sweep rungs (spec 04 I86): every expected chip is in sysfs with a
+        live heartbeat and none is still isolated. Only decides whether to skip ahead to the full check;
+        never a verdict on its own. An unreadable bus reads as not whole, so the next rung fires."""
+        try:
+            off_bus = pcie_guard.chips_off_bus(expected)
+            isolated = self.deps.isolated_chips()
+        except Exception as exc:  # noqa: BLE001 - a failed probe must never skip a rung
+            log(f"could not re-probe the bus between sweep rungs: {exc!r} — firing the next rung")
+            return False
+        return off_bus == 0 and not isolated
+
+    async def _settle_and_verify_sweep(
+        self, expected: int, log, gate_phase: str, settle: int, *, context: str, fabric_77_unverified: bool
+    ) -> tuple:
+        """One settle and one full verify (fabric included) after sweep rungs; ends the off-bus reset
+        intent. A fabric 77 after an UNKNOWN reset reads as unhealthy (spec 04 I29)."""
+        if settle:
+            log(f"settling {settle}s for re-enumeration, then one verify before the host rung")
+        try:
+            await asyncio.sleep(settle)
+            healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
+            FABRIC_DEBT.note_evidence(evidence)
+        finally:
+            pcie_guard.end_offbus_reset()
+        if healthy and fabric_77_unverified and expected > 1 and self._fabric_ran_but_unverified(evidence):
+            # The caller is past an UNKNOWN reset whose I40 fallback refused (spec 04 I29): a 77 here is
+            # the same no-verdict the reset already got, never a recovered fabric.
+            log("the sweep's verify is still a fabric 77 — the fabric stays unverified, not recovered")
+            health_event("host_rung_sweep_unverified", context=context or gate_phase, evidence=evidence)
+            self._sweep_read_77 = True
+            healthy = False
+        return healthy, evidence
 
     async def _class_a_cooldown_sweep(self, offbus: set, expected: int, log) -> str:
         """Spec 04 I73 at the 10-min mark: a whole-tray (class A) hold whose power cycle the boot or

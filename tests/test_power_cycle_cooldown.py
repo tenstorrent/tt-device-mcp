@@ -101,6 +101,7 @@ async def test_a_boot_3_min_before_startup_holds_to_a_deadline_then_cycles_once(
     until = T0 - 180 + POWER_CYCLE_MIN_INTERVAL_SEC
     assert _cycles(cool) == 0 and not LADDER & set(cool["order"])
     assert cool["g"].mechanism.power_cycle_retry[0] == until
+    assert cool["g"].mechanism.power_cycle_retry_cooldown, "a boot cooldown defers the 10-min ladder (I76)"
     state = cool["g"].mechanism.power_cycle_cooldown_state
     assert state["cause"] == "host boot" and "power cycle in cooldown until" in state["why"]
     monkeypatch.setattr(srv, "_device_hold_state", lambda now=None: ("tray off", srv.device_hold_episode_since))
@@ -255,6 +256,7 @@ def test_the_per_boot_cap_denial_shows_on_health(cool, monkeypatch):
     until = T0 - 60 + POWER_CYCLE_MIN_INTERVAL_SEC
     assert not allowed and m.power_cycle_cooldown_state["until"] == until == m.power_cycle_retry[0]
     assert m.power_cycle_cooldown_state["last"] == T0 - 60
+    assert not m.power_cycle_retry_cooldown, "a cap wait is not a cooldown: the 10-min ladder still runs (I76)"
 
 
 # ---- (c) backoff ---------------------------------------------------------------------------------
