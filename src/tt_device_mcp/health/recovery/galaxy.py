@@ -1427,7 +1427,7 @@ class GalaxyRecovery(Recovery):
         repeat of a failed reset). False while it holds, firing nothing: a reset is cycling in its own
         scope, a tenant holds the device or the scan is unreadable, an operator stand-back, or the
         power-cycle rate limits deny it (journaled; the next window asks again). True once requested.
-        ``force`` (the hold-deadline climb) waives an unreadable scan, as on the tray rung, never a
+        ``force`` (the hold-deadline climb) waives an unreadable scan, never a
         readable tenant or a running job.
         The boot that comes back runs the startup gate, which waits for the hugepage pool and passes
         the full health check, fabric included, before it releases anything (goal 8)."""
@@ -2414,7 +2414,7 @@ class GalaxyRecovery(Recovery):
         manual-recovery check is configured, or it is rate-limited — those page first), False while
         it holds (grace, a tenant, a reset in its own scope, a stand-back; past the grace plus the
         blocked-page bound those page once), True once the power cycle was requested. The idle relift and
-        the hold watchdog reach it, and the between-jobs gate's tray rung does for a whole-tray drop
+        the hold watchdog reach it, and the between-jobs gate's below-floor branch does for a whole-tray drop
         (:meth:`escalate`): the device is already held there, the call runs no reset, and a fire hands the
         host to the power cycle, so it adds no time to a job that could have run.
 
@@ -2928,7 +2928,7 @@ class GalaxyRecovery(Recovery):
                 # drop back at once — so the mesh reset is tried now, before any host rung.
                 log(
                     f"{off_bus_pre} of {expected} chip(s) off the bus — below the galaxy-reset floor "
-                    f"({reset_floor}) and the per-chip/tray rungs could not recover it; trying the "
+                    f"({reset_floor}) and the per-chip rung could not recover it; trying the "
                     f"mesh-wide reset before any host rung"
                 )
                 health_event(

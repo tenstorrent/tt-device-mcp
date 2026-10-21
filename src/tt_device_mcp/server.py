@@ -6097,8 +6097,8 @@ def _auto_power_cycle_enabled() -> bool:
     """Whether the broker may BMC-power-cycle the host as the final recovery rung. ON by default,
     and still a SEPARATE switch from the reboot because it is the more drastic of the two: it pulls
     chassis power, the only thing that recovers a chip that has LEFT the PCIe bus. Nothing below it
-    can: the per-chip rung needs a parent bridge the departed chip no longer has, the tray rung
-    exists only on a Galaxy, and a warm reboot does not re-power the silicon. Without this rung a
+    can: the per-chip rung needs a parent bridge the departed chip no longer has, no per-tray
+    re-power exists, and a warm reboot does not re-power the silicon. Without this rung a
     dropped ASIC is unrecoverable in software, which is the permanent hold this default exists to
     end. It needs a reachable BMC + ipmitool; where those are absent the fire raises and the ladder
     reports it rather than silently holding. Opt OUT with TT_DEVICE_MCP_AUTO_POWER_CYCLE=0.

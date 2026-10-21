@@ -281,7 +281,7 @@ class RecoveryDeps:
     # deps fixture — may supply its own bindings, which boot leaves untouched).
     board_types_provider: Optional[Callable[[], Optional[list]]] = None
     glx_board_types_provider: Optional[Callable[[], tuple]] = None
-    # {chip index: PCI address}, the map the tray rung derives its trays from (spec 04 I16). Same
+    # {chip index: PCI address}, the map tray placement is derived from (spec 04 I16). Same
     # injection reason as the two above: the cache lives on the HealthMonitor singleton.
     chip_buses_provider: Optional[Callable[[], Optional[dict]]] = None
     journal_skip_once: Optional[Callable[[str, str], None]] = None
