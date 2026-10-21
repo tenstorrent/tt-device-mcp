@@ -56,10 +56,12 @@ def test_a_stale_exit_file_is_replaced_and_given_to_the_jobs_uid(monkeypatch, tm
     stale = tmp_path / "043.exit"
     stale.write_text("0")
     chowned = []
+    real_euid = srv.os.geteuid
     monkeypatch.setattr(srv.os, "geteuid", lambda: 0)  # the broker runs as root
     monkeypatch.setattr(srv.os, "fchown", lambda fd, uid, gid: chowned.append((uid, gid)))
 
     assert srv.prepare_job_exit_file("043", 4321)
+    monkeypatch.setattr(srv.os, "geteuid", real_euid)  # the faked chown left the file ours
 
     assert stale.read_text() == "", "the earlier job's status survived into the new job's file"
     assert chowned == [(4321, -1)], f"the fresh file was not given to the job's uid: {chowned}"
@@ -93,6 +95,53 @@ def test_a_file_the_job_could_not_write_is_not_left_behind(monkeypatch, tmp_path
     monkeypatch.setattr(srv.os, "fchown", denied)
     assert not srv.prepare_job_exit_file("045", 4321)
     assert not (tmp_path / "045.exit").exists()
+    assert list(tmp_path.iterdir()) == [], "the half-made fresh file was left behind"
+
+
+def test_a_co_tenant_cannot_win_the_path_while_the_fresh_file_is_made(monkeypatch, tmp_path, caplog):
+    """Review #1864 F1: in the sticky shared dir another user may create ``<id>.exit`` at any moment.
+    Removing the old file and then creating the new one leaves a window where theirs wins and the
+    job starts on a file it cannot write; the fresh file must replace the path in one step."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    path = tmp_path / "046.exit"
+    path.write_text("0")  # the co-tenant's planted clean exit
+    real_unlink, real_path_unlink = srv.os.unlink, srv.Path.unlink
+
+    def replant(p):
+        if Path(p) == path:
+            path.write_text("0")  # the co-tenant is always quicker than the next syscall
+
+    def os_unlink(p, *a, **k):
+        real_unlink(p, *a, **k)
+        replant(p)
+
+    def path_unlink(self, *a, **k):
+        real_path_unlink(self, *a, **k)
+        replant(self)
+
+    monkeypatch.setattr(srv.os, "unlink", os_unlink)
+    monkeypatch.setattr(srv.Path, "unlink", path_unlink)
+    planted = path.stat().st_ino
+
+    assert srv.prepare_job_exit_file("046", os.geteuid()), "the job started on a file it did not get"
+    assert path.read_text() == "", "the co-tenant's status sits in the job's exit file"
+    assert path.stat().st_ino != planted
+    assert [p.name for p in tmp_path.iterdir()] == ["046.exit"], "the fresh file's temp name was left"
+
+
+def test_a_failed_prepare_warns_once_and_leaves_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    (tmp_path / "047.exit").write_text("0")
+    warnings: list = []
+    monkeypatch.setattr(srv, "logger", type("L", (), {"warning": lambda self, m: warnings.append(m)})())
+
+    def no_rename(src, dst):
+        raise PermissionError("sticky")
+
+    monkeypatch.setattr(srv.os, "rename", no_rename)
+    assert not srv.prepare_job_exit_file("047", os.geteuid())
+    assert len(warnings) == 1 and "047" in warnings[0], warnings
+    assert list(tmp_path.iterdir()) == [], "a stale file or the temp file survived a failed prepare"
 
 
 @pytest.mark.asyncio
@@ -148,6 +197,14 @@ def test_the_startup_sweep_removes_orphans_and_keeps_readopted_jobs_files(monkey
     assert (
         not (tmp_path / "051.exit").exists() and not (tmp_path / "052.exit").exists()
     ), "an orphan exit file survived startup; a recycled id would inherit its status"
+
+
+def test_the_sweep_removes_fresh_files_a_dead_broker_never_renamed(monkeypatch, tmp_path):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    (tmp_path / ".062.exit.abc123.tmp").write_text("")
+    (tmp_path / "063.exit").write_text("0")
+    assert srv.sweep_job_exit_files(lambda jid: jid == "063") == []
+    assert [p.name for p in tmp_path.iterdir()] == ["063.exit"]
 
 
 def test_the_sweep_keeps_only_what_it_is_told_to(monkeypatch, tmp_path):
@@ -234,3 +291,61 @@ def test_an_exit_file_is_read_only_against_a_known_start(monkeypatch, tmp_path):
     assert srv.read_job_exit_code("074", "not a time") is None
     assert srv.read_job_exit_code("074", _ago(60)) == 0
     assert srv.read_job_exit_code("074", _ago(-3600)) is None  # the job started after the write
+
+
+# --- the read side trusts only a plain file the job could have written --------------------------
+
+
+def _symlink(path: Path) -> None:
+    target = path.parent / "elsewhere"
+    target.write_text("0")
+    path.symlink_to(target)
+
+
+def _hardlink(path: Path) -> None:
+    target = path.parent / "elsewhere"
+    target.write_text("0")
+    os.link(target, path)
+
+
+def test_an_exit_file_that_is_not_one_plain_file_reads_as_unknown(monkeypatch, tmp_path):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    for jid, make in (("075", _symlink), ("076", _hardlink)):
+        make(tmp_path / f"{jid}.exit")
+        assert srv.read_job_exit_code(jid, _ago(60)) is None, f"{make.__name__} read as a status"
+        for p in tmp_path.iterdir():
+            p.unlink()
+    fifo = tmp_path / "077.exit"
+    os.mkfifo(fifo)  # a FIFO must neither block the read nor pass for a status
+    assert srv.read_job_exit_code("077", _ago(60)) is None
+
+
+def test_an_exit_file_another_user_owns_reads_as_unknown(monkeypatch, tmp_path):
+    """A file owned by neither the broker nor the job's submitter is a co-tenant's (review #1864 F1)."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    (tmp_path / "078.exit").write_text("0")
+    mine = os.geteuid()
+    assert srv.read_job_exit_code("078", _ago(60), owner_uid=mine) == 0  # the job's submitter wrote it
+    monkeypatch.setattr(srv.os, "geteuid", lambda: mine + 1)  # now neither broker nor submitter
+    assert srv.read_job_exit_code("078", _ago(60)) is None
+    assert srv.read_job_exit_code("078", _ago(60), owner_uid=mine + 2) is None
+    assert srv.read_job_exit_code("078", _ago(60), owner_uid=mine) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_co_tenants_exit_0_never_releases_a_readopted_job_without_a_reset(
+    monkeypatch, tmp_path, clear_job_state
+):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    marks = _recording_dirty(monkeypatch)
+    (tmp_path / "079.exit").write_text("0")  # owned by "someone else" once geteuid moves
+    mine = os.geteuid()
+    job = _readopted("079", _ago(60))
+    job.peer_uid = mine + 2
+    monkeypatch.setattr(srv.os, "geteuid", lambda: mine + 1)
+
+    await srv._monitor_readopted_scope("079", "ttdev-job-079.scope")
+
+    assert job.status is srv.JobStatus.FAILED and job.exit_code is None, (job.status, job.exit_code)
+    assert len(marks) == 1 and "079" in marks[0] and "unknown" in marks[0], marks

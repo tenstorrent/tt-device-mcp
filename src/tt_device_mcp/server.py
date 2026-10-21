@@ -33,8 +33,10 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -1812,55 +1814,68 @@ def prepare_job_exit_file(job_id: str, uid: Optional[int] = None) -> bool:
     Ids recycle, so a file left at this path belongs to an earlier job: read after a restart it
     would pass for this job's status, and in the shared sticky dir a file another user owns cannot
     even be opened by root while fs.protected_regular is set, so the job's EXIT trap loses its
-    status. Remove it, then create the file new and hand it to ``uid``. Empty reads as no status
-    until the job writes one. False (logged) when that fails; the read side's start-time check
-    still refuses a stale file."""
+    status. The new file is made under a random name (O_EXCL|O_NOFOLLOW), handed to ``uid`` and
+    renamed over the path in one step: there is no moment where the path is free for another user
+    to claim, and once the job's uid owns it no other non-root user can replace it. Empty reads as
+    no status until the job writes one. False (one warning) when that fails; the read side's owner
+    and start-time checks still refuse whatever is left there."""
     path = job_exit_file(job_id)
+    tmp: Optional[str] = None
     try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{job_id}.exit.", suffix=".tmp")
+        try:
+            os.fchmod(fd, 0o644)
+            if uid is not None and uid != os.geteuid():
+                os.fchown(fd, uid, -1)
+        finally:
+            os.close(fd)
+        os.rename(tmp, path)
+        return True
     except OSError as e:
-        if logger:
-            logger.warning(f"JOB_RUNNER job_id={job_id} cannot remove the old exit file {path}: {e}")
-        return False
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-    except OSError as e:
-        if logger:
-            logger.warning(f"JOB_RUNNER job_id={job_id} cannot create its exit file {path}: {e}")
-        return False
-    try:
-        if uid is not None and uid != os.geteuid():
-            os.fchown(fd, uid, -1)
-    except OSError as e:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         # A file the job cannot write is worse than none: without it the trap creates its own.
-        if logger:
-            logger.warning(f"JOB_RUNNER job_id={job_id} cannot give its exit file to uid {uid}: {e}")
-        os.close(fd)
         clear_job_exit_file(job_id)
+        if logger:
+            logger.warning(
+                f"JOB_RUNNER job_id={job_id} cannot give the job a fresh exit file {path} (uid {uid}): {e}; "
+                "a status it cannot prove is its own reads as unknown"
+            )
         return False
-    os.close(fd)
-    return True
 
 
-def read_job_exit_code(job_id: str, started_at: Optional[str] = None) -> Optional[int]:
+def read_job_exit_code(job_id: str, started_at: Optional[str] = None, owner_uid: Optional[int] = None) -> Optional[int]:
     """The exit status the job recorded for itself, or None if it never got to.
 
     ``started_at`` is the job's start time (isoformat). A file last written before it is an
     earlier job's with the same id, and an unknown start time cannot prove the file is this job's:
-    both read as no status, never as a clean exit (spec 01 I8)."""
+    both read as no status, never as a clean exit (spec 01 I8). So does anything at the path that is
+    not one plain regular file owned by this broker's uid or ``owner_uid`` (the job's submitter):
+    a symlink, a FIFO, a hard link, or a file another user planted in the shared sticky dir."""
     path = job_exit_file(job_id)
     try:
         start = datetime.fromisoformat(started_at).timestamp() if started_at else None
     except (TypeError, ValueError):
         start = None
+    if start is None:
+        return None
+    owners = {os.geteuid()} | ({owner_uid} if owner_uid is not None else set())
     try:
-        if start is None or path.stat().st_mtime < start - 1.0:
-            return None
-        raw = path.read_text().strip()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid not in owners or st.st_mtime < start - 1.0:
+            return None
+        raw = os.read(fd, 64).decode("ascii", "replace").strip()
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
     try:
         return int(raw)
     except ValueError:
@@ -1881,8 +1896,15 @@ def sweep_job_exit_files(keep: Callable[[str], bool]) -> list[str]:
     removed = []
     try:
         paths = sorted(job_exit_dir().glob("*.exit"))
+        # A fresh file a broker made but died before renaming into place (prepare_job_exit_file).
+        orphans = sorted(job_exit_dir().glob(".*.exit.*.tmp"))
     except OSError:
         return removed
+    for path in orphans:
+        try:
+            path.unlink()
+        except OSError:
+            pass
     for path in paths:
         if keep(path.stem):
             continue
@@ -11025,7 +11047,7 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
         preempt_forced_job_ids.discard(job_id)
         job = jobs.get(job_id)
         if job is not None:
-            rc = await asyncio.to_thread(read_job_exit_code, job_id, job.started_at)
+            rc = await asyncio.to_thread(read_job_exit_code, job_id, job.started_at, job.peer_uid)
             async with get_lock():
                 if job.status == JobStatus.RUNNING:
                     if timed_out:
