@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -192,6 +193,9 @@ class ServerFsm:
         # unknown boot id must never be trusted to mean "the same boot" on either side.
         self._boot_id = current_boot_id
         self._record = FsmRecord(ServerState.BOOT)
+        # When on_fault last placed or refreshed a hold (time.monotonic(), 0.0 for never in this
+        # process): a passing check older than this proves nothing about the fault (spec 03 I78).
+        self.fault_monotonic: float = 0.0
         # Per-episode latches: reset every time a new episode opens (see _open_episode), so a
         # once-per-episode rung re-arms once the device has actually recovered and gone bad again.
         self._latches: dict[str, bool] = {}
@@ -603,6 +607,7 @@ class ServerFsm:
         hold call (dirty=False) or another dirty mark landing on an already-dirty record may
         replace it."""
         why = _validate_why(why) or "gate_error"
+        self.fault_monotonic = time.monotonic()
         if self._record.state in (ServerState.HEALTHY, ServerState.BOOT):
             self._open_episode(ServerState.RECOVERING, why, detail=detail, job=job, dirty=dirty)
         else:
