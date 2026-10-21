@@ -804,7 +804,9 @@ def test_every_rung_outcome_folds_through_the_helper():
     src = inspect.getsource(srv)
     body = src.replace(inspect.getsource(srv._fold_rung_outcome), "")
     assert "fsm.on_outcome(" not in body, "a rung outcome folded around the I32 guard"
-    assert src.count("_fold_rung_outcome(outcome, ") == 4, "the gate, the idle relift, the dirty idle gate (I68) and the hold escalation"
+    assert (
+        src.count("_fold_rung_outcome(outcome, ") == 4
+    ), "the gate, the idle relift, the dirty idle gate (I68) and the hold escalation"
 
 
 # The 10-17 class-J episode (job killed, glx_reset 62 s): the first pass proved all 128 links, then its
