@@ -104,8 +104,8 @@ def test_bmc_step_ok_reads_the_re_power_from_the_output(text, ok):
     ids=["bmc-failed", "fallback-refused", "fallback-sent-rc0", "guard-not-armed", "launch-failed"],
 )
 async def test_a_failed_mesh_reset_withholds_the_rescan_of_an_unreset_removed_chip(
-    ladder, monkeypatch, rc, chunks
-):  # noqa: F811
+    ladder, monkeypatch, rc, chunks  # noqa: F811
+):
     rig = ladder
     pci.REMOVED_CHIPS[REMOVED] = dict(REMOVED_REC)
     srv.isolated_chips = {REMOVED}
