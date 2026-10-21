@@ -48,7 +48,11 @@ filesystems are read-only. A fallback unit cuts it anyway after
 `TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC` (default 120 s), even if the shutdown hangs after
 systemd hands over to systemd-shutdown. The configured command then runs with the network down, so
 it must be in-band (for example local `ipmitool`); the hook gives it 5-15 s per try
-(`TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC`, clamped), 3 tries. The broker never cuts power with
+(`TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC`, clamped), 3 tries. A service that unloads the IPMI
+drivers on its stop (the OpenIPMI init script does, and deletes `/dev/ipmi0`) would leave in-band
+`ipmitool` no way to the BMC, so the hook and the fallback load `ipmi_msghandler`, `ipmi_devintf` and
+`ipmi_si` again and make `/dev/ipmi0` from sysfs when it is missing; the hook also leaves an OEM SEL
+record (`TTPC`) before the cycle and after a cycle that failed. The broker never cuts power with
 the OS up: for an `ipmitool ... chassis power cycle` command it first checks the BMC read-only
 (`mc info`, 10 s), and if that, the hook, `systemd-run` or the reboot request is missing or fails,
 nothing fires, the device stays held and the broker pages `power_cycle_not_launched`. On the next

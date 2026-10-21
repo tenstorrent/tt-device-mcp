@@ -75,10 +75,13 @@ STEP_TIMEOUT_SEC = 30
 # the host would only reboot warm (F2 of the I88 review).
 PREFLIGHT_TIMEOUT_SEC = 10
 # systemd-shutdown kills a hook still running after 90 s and reboots warm. The hook's worst case —
-# the RAID wait, every try at its cap, the pauses between them and the wait for power to drop after a
-# try that worked — stays inside it (hook_worst_case_sec).
+# the RAID wait and the IPMI driver load side by side, the SEL record, every try at its cap, the
+# pauses between them and the wait for power to drop after a try that worked — stays inside it
+# (hook_worst_case_sec).
 SYSTEMD_SHUTDOWN_HOOK_TIMEOUT_SEC = 90
 HOOK_MDADM_WAIT_SEC = 10
+HOOK_IPMI_PREPARE_SEC = 10
+HOOK_SEL_TIMEOUT_SEC = 2
 HOOK_TRIES = 3
 HOOK_RETRY_PAUSE_SEC = 2
 HOOK_POWER_DROP_WAIT_SEC = 25
@@ -86,12 +89,16 @@ HOOK_TRY_TIMEOUT_MIN_SEC = 5
 HOOK_TRY_TIMEOUT_MAX_SEC = 15
 # Runs in the fallback unit under bash, as FALLBACK_ARGV0: record its pid for the hook, wait out the
 # bound inside bash (a sleep child would die in the killall and fire the cycle early), flush what it
-# can without blocking on it, then cycle under the command's timeout. Args: pid file, bound, timeout,
-# argv.
+# can without blocking on it, have the installed hook load the IPMI drivers again if a service stopped
+# them (a hung shutdown may hang past that stop), then cycle under the command's timeout. Args: pid
+# file, bound, timeout, argv.
 FALLBACK_SH = (
     'printf "%s\\n" "$$" >"$1" 2>/dev/null; b=$2; t=$3; shift 3\n'
     'read -rt "$b" <> <(:)\n'
     "sync & read -rt 2 <> <(:)\n"
+    f"for h in {' '.join(d + '/' + SHUTDOWN_HOOK_NAME for d in SHUTDOWN_HOOK_DIRS)}; do\n"
+    f'    [ -x "$h" ] && {{ timeout {HOOK_IPMI_PREPARE_SEC} "$h" --prepare-ipmi >/dev/null 2>&1; break; }}\n'
+    "done\n"
     f'exec -a {FALLBACK_FIRE_ARGV0} timeout "$t" "$@"\n'
 )
 # Re-execs bash with argv[0] set to its own $0 (FALLBACK_ARGV0), then runs FALLBACK_SH.
@@ -112,7 +119,8 @@ def hook_try_timeout_sec(timeout: float) -> int:
 def hook_worst_case_sec() -> int:
     """The shutdown hook's longest run: under SYSTEMD_SHUTDOWN_HOOK_TIMEOUT_SEC by construction."""
     return (
-        HOOK_MDADM_WAIT_SEC
+        max(HOOK_MDADM_WAIT_SEC, HOOK_IPMI_PREPARE_SEC)
+        + HOOK_SEL_TIMEOUT_SEC
         + HOOK_TRIES * HOOK_TRY_TIMEOUT_MAX_SEC
         + (HOOK_TRIES - 1) * HOOK_RETRY_PAUSE_SEC
         + HOOK_POWER_DROP_WAIT_SEC

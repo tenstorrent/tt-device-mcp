@@ -1751,8 +1751,10 @@ each rung fires only when the gentler one failed or cannot apply.
      transaction does not stop it, the reason in `TT_DEVICE_MCP_POWER_CYCLE_REASON`). It runs under
      bash with argv[0] `@tt-device-mcp-power-cycle-fallback`, which systemd-shutdown's killall
      spares, records its pid in `/run/tt-device-mcp-power-cycle.fallback.pid`, waits the bound in
-     its own process (`read -t`, no child to kill), flushes for 2 s without blocking on it and fires
-     the same argv as `@tt-device-mcp-power-cycle-fire` under the command's timeout.
+     its own process (`read -t`, no child to kill), flushes for 2 s without blocking on it, has the
+     installed hook restore the IPMI device (`--prepare-ipmi`, below; 10 s cap, at once when
+     `/dev/ipmi0` is there), since a shutdown that hangs may hang past the service stop that took it
+     away, and fires the same argv as `@tt-device-mcp-power-cycle-fire` under the command's timeout.
   4. It asks for a reboot (`systemctl --no-block -i reboot`).
   5. Once every service has stopped and the filesystems are read-only, systemd-shutdown runs the
      installed hook `tt-device-mcp-power-cycle.shutdown`. On the `reboot` verb with a request less
@@ -1761,12 +1763,24 @@ each rung fires only when the gentler one failed or cannot apply.
      checking its cmdline), before any wait, so it never fires alongside the hook: it freezes each
      generation of the fallback's process tree, then SIGKILLs the process group the fallback leads
      and every pid found, so a `timeout` and cycle command the fallback already started cannot cut
-     power later. Then it starts a `sync` it does not wait on, waits for RAID arrays to mark clean
-     (`mdadm --wait-clean`, 10 s cap) and fires the argv: up to 3 tries at the per-try timeout with 2 s between
-     them, then 25 s for the power to drop. The per-try timeout is
+     power later. Then it starts a `sync` it does not wait on and, when no IPMI device node is there
+     (`/dev/ipmi0`, `/dev/ipmi/0` or `/dev/ipmidev/0`), restores in-band IPMI beside the RAID wait:
+     a service may have stopped it during the shutdown (the OpenIPMI init script's stop unloads
+     `ipmi_si` and `ipmi_devintf` and deletes `/dev/ipmi0`), and an in-band `ipmitool chassis power
+     cycle` then cannot reach the BMC, so the host would only reboot warm. It loads
+     `ipmi_msghandler`, `ipmi_devintf` and `ipmi_si` and makes `/dev/ipmi0` from
+     `/sys/class/ipmi/ipmi0/dev` if devtmpfs has not (50 looks 0.2 s apart, 10 s cap). It waits for
+     RAID arrays to mark clean (`mdadm --wait-clean`, 10 s cap) and for that preparation; a
+     preparation that fails is said loudly and the cycle is still tried (the command may be
+     out-of-band). For an `ipmitool [options] chassis power cycle` command it adds an OEM SEL record
+     (Add SEL Entry, type C0h, the hook's timestamp, manufacturer 0, data `TTPC`, stage 01h, detail
+     1 when it restored the IPMI device, else 0; 2 s cap) through the same options, the hook's trace
+     that outlives the reboot. Then it fires the argv: up to 3 tries at the per-try timeout with 2 s
+     between them, then 25 s for the power to drop. When all 3 fail it says so loudly (the reboot
+     goes on warm) and adds a stage 02h record (detail 3). The per-try timeout is
      `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC` (30 s for the auto cycle) clamped to 5-15 s, so the
-     hook's worst case, 10 + 3 x 15 + 2 x 2 + 25 = 84 s, stays inside systemd-shutdown's 90 s hook
-     timeout. Any other verb, or no request, does nothing.
+     hook's worst case, 10 + 2 + 3 x 15 + 2 x 2 + 25 = 86 s, stays inside systemd-shutdown's 90 s
+     hook timeout. Any other verb, or no request, does nothing.
 
   The bound is `TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC`, default 120 s, clamped to 30-300 s;
   a malformed value reads as the default, and no value turns it off. The fallback's clock starts at
@@ -1837,7 +1851,7 @@ each rung fires only when the gentler one failed or cannot apply.
   | Shutdown hangs before the hook (before or after the hand-over to systemd-shutdown) | cycle fires at once | + the bound (120 s default, 30-300 s) + 2 s flush |
   | Clean path cannot start (a check, the pre-flight, the request, the fallback or the reboot fails) | cycle fires at once under a live OS | no cycle and no reboot; hold + page once per episode; the cycle is asked again on the next I76 pass and fires on the first pass whose clean path starts; the hold lifts only on a just-passed full check, fabric included |
   | Reboot failed and the fallback cannot be stopped | n/a | cycle at the bound + 2 s from the fallback; action kept pending |
-  | Hook's command fails 3 times | the live cycle may also fail | warm reboot after at most 84 s of hook time; then refuted: an I72 miss, the next request at the refuted request + 900 s pending + 0 s, then + 300 s per later miss, paged from the 2nd miss, no I65 cooldown, counted toward the backstop (3 restarts in 2 h, then a page); or unconfirmable: counted (one I65 cooldown, at most 30 min, at most 4 h after repeated cycles) |
+  | Hook's command fails 3 times | the live cycle may also fail | warm reboot after at most 86 s of hook time; then refuted: an I72 miss, the next request at the refuted request + 900 s pending + 0 s, then + 300 s per later miss, paged from the 2nd miss, no I65 cooldown, counted toward the backstop (3 restarts in 2 h, then a page); or unconfirmable: counted (one I65 cooldown, at most 30 min, at most 4 h after repeated cycles) |
 
 - **I89 — A below-floor off-bus hold gets its kept rungs at once, and the full ladder at the
   10-min bound.** A generic below-floor off-bus hold (`BELOW_FLOOR`, `HOLD_CLASS_GENERIC`, not a
