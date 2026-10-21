@@ -25,6 +25,7 @@ from tests.test_device_safety import (
 )
 from tests.test_hold_bound import _REAL_HOST_RUNG, BOUND, MISMATCH, _drain, _watchdog
 from tt_device_mcp import server as srv
+from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health.recovery import OUTCOME_RECOVERED
 
@@ -597,3 +598,139 @@ async def test_the_first_jobs_verdict_still_decides_the_carry(monkeypatch, tmp_p
     assert (tmp_path / srv.HOLD_CARRY_FILE).exists() is kept
     if kept:
         assert srv._hold_carry.get("job_ended")
+
+
+def _startup_hold_after_restart(monkeypatch):
+    """The new broker's fresh startup episode (spec 03 I4): nothing in it names a fault."""
+    monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, why="startup_unverified"))
+
+
+def _record_events(monkeypatch):
+    """Every health event with its fields, from here on."""
+    from tests.conftest import patch_health_event
+
+    seen = []
+    patch_health_event(monkeypatch, lambda kind, **k: seen.append((kind, k)))
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_a_startup_hold_after_a_released_episode_starts_its_own_clock(monkeypatch, tmp_path, clear_job_state):
+    """A job timed out, its reset and full check (fabric included) released the hold about 130 s later, and
+    the next job started inside the carry window. A broker restart about 26 min later re-adopted that live
+    job and opened the startup hold, which took the released episode's start: it was born about 1700 s old,
+    so the deadline flag, a forced escalation and a tenant-blocked page fired on a device whose job was
+    healthy. Fails on base: the startup hold continues the released episode."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, _events, detail = _open_hold(monkeypatch, "generic", 130)
+    old_since = srv.device_hold_episode_since
+    srv._note_tenant_gate_verdict("")  # reset + full check passed: released, carry saved
+    srv._note_hold_carry_job("start")  # the next job starts inside the window and is still running
+    shift = 1580.0  # the restart comes ~26 min later, the job still running
+    srv._hold_carry.update(
+        since=(datetime.fromisoformat(old_since) - timedelta(seconds=shift)).isoformat(),
+        released=srv._hold_carry["released"] - shift,
+        job_started=srv._hold_carry["job_started"] - shift,
+    )
+    srv._write_hold_carry()
+    _restart_broker(monkeypatch)
+    _startup_hold_after_restart(monkeypatch)
+    seen = _record_events(monkeypatch)
+
+    srv._note_tenant_gate_verdict("device unverified: gate/startup: awaiting the startup check")
+
+    assert _age() < 60, "the released episode is over: the startup hold starts its own clock"
+    held = [k for kind, k in seen if kind == "device_held"]
+    assert len(held) == 1 and "continues_episode" not in held[0]
+    assert held[0].get("carry_declined"), "the declined carry is named for the log reader"
+    assert not (tmp_path / srv.HOLD_CARRY_FILE).exists(), "the carry is spent: no later hold takes it"
+    assert not srv._hold_bound_cycle_due(_age())
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    kinds = [kind for kind, _ in seen]
+    assert escalations == [], "no forced escalation before the hold's own 10-min mark"
+    for false_alarm in ("hold_stuck_past_deadline", "hold_bound_tenant_blocked", "hold_bound_carried"):
+        assert false_alarm not in kinds
+
+
+@pytest.mark.asyncio
+async def test_a_hold_open_across_a_restart_keeps_its_clock_even_under_a_startup_why(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """A hold the last broker left open keeps its start, whatever why the new fsm opens with: a restart never
+    resets a real hold's clock, so the bound ladder still runs at the episode's 10-min mark (here at once)."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, _events, detail = _open_hold(monkeypatch, "missing port (topology mismatch)", BOUND + 120)
+    since = srv.device_hold_episode_since
+    _restart_broker(monkeypatch)
+    _startup_hold_after_restart(monkeypatch)
+    seen = _record_events(monkeypatch)
+
+    srv._note_tenant_gate_verdict(detail)
+
+    assert srv.device_hold_episode_since == since, "the open hold's clock survives the restart"
+    assert not any(k.get("carry_declined") for kind, k in seen if kind == "device_held")
+    monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, why=srv.FABRIC_RELIFT_WHY))
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == ["present-forced"], "the full ladder runs on the first tick, not 10 min after the restart"
+
+
+@pytest.mark.asyncio
+async def test_a_startup_hold_below_its_own_bound_runs_the_ladder_at_its_own_10_min_mark(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The fresh clock is still bounded: a startup hold that declined a carry and is still held at its own
+    10-min mark gets the bound's full ladder there (spec 04 I76)."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, _events, detail = _open_hold(monkeypatch, "missing port (topology mismatch)", 130)
+    srv._note_tenant_gate_verdict("")  # released: carry saved
+    _restart_broker(monkeypatch)
+    _startup_hold_after_restart(monkeypatch)
+    srv._note_tenant_gate_verdict("device unverified: gate/startup: awaiting the startup check")
+    assert _age() < 60
+    # The startup gate's full check fails on the short link count: the hold is now that class...
+    monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, why=srv.FABRIC_RELIFT_WHY))
+    srv.device_hold_episode_since = (datetime.now() - timedelta(seconds=BOUND + 5)).isoformat()
+    srv._check_hold_deadline(now=datetime.now())  # ...and its own 10-min mark has come
+    await _drain()
+    assert escalations == ["present-forced"]
+
+
+@pytest.mark.asyncio
+async def test_a_startup_hold_that_declined_a_carry_lifts_only_on_a_full_check_pass(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The fresh clock adds no lift path (spec 03 I4, goal: the full health check before any hold lifts): the
+    real startup gate keeps the hold on a fabric check that counts fewer links than the cabling expects, and
+    only a full pass, fabric included, releases it."""
+    from tests.test_boot_fabric_reverify import _FABRIC_OK, _broker
+    from tests.test_device_safety import _ledger_dir
+    from tt_device_mcp.fsm import ServerFsm
+
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, events, _detail = _open_hold(monkeypatch, "generic", 130)
+    srv._note_tenant_gate_verdict("")  # released: carry saved
+    srv._note_hold_carry_job("start")
+    _restart_broker(monkeypatch)
+    _ledger_dir(monkeypatch, tmp_path)
+    short = (False, {"snapshot": {"ok": True}, "fabric": {"ok": False, "detail": f"what(): {MISMATCH}"}})
+    fresh = ServerFsm(tmp_path / "fsmdir" / "fsm.json", current_boot_id="boot-a")
+    fresh.boot_merge(None)
+    _broker(monkeypatch, tmp_path, fresh, short)
+    monkeypatch.setattr(srv, "_post_reset_debt", lambda: "")
+    assert srv.fsm.record.why == "startup_unverified"
+    srv._note_tenant_gate_verdict("device unverified: gate/startup: awaiting the startup check")
+    assert _age() < 60, "the released episode is not continued"
+
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+    assert srv.device_hold_logged and srv.fsm.state is not ServerState.HEALTHY, "a short link count is a failure"
+
+    _broker(monkeypatch, tmp_path, srv.fsm, _FABRIC_OK)
+    monkeypatch.setattr(srv, "_post_reset_debt", lambda: "")
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+    assert not srv.device_hold_logged and srv.fsm.state is ServerState.HEALTHY

@@ -8054,7 +8054,12 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # ...or the start of the episode a release ended moments ago (spec 04 I82). A tenant hold is
         # not a device fault: it neither takes nor spends a fault hold's carry.
         tenant = _hold_is_tenant_held()
-        carry = None if tenant else _take_hold_carry()
+        # Spec 04 I82: the startup hold a restart opens names no fault, so it continues only a hold
+        # still open at the restart (restored above), never an episode a release already ended: the
+        # carry is spent, and the hold's clock starts now.
+        startup = not restored and fsm.record.why == "startup_unverified"
+        declined = _take_hold_carry() if startup and not tenant else None
+        carry = None if tenant or startup else _take_hold_carry()
         starts = [s for s in (restored, str(carry["since"]) if carry else "") if s]
         device_hold_episode_since = min(starts, key=datetime.fromisoformat) if starts else row_since
         if restored and carry is None and device_hold_episode_since == restored:
@@ -8100,7 +8105,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         cont = (
             {"continues_episode": device_hold_episode_since, "prior_reason": str(carry.get("reason") or "")}
             if carry
-            else {}
+            else {"carry_declined": str(declined["since"])} if declined else {}
         )
         if carried is not None:
             health_event("device_held", reason=reason, carried_from=carried.get("iso") or carried.get("ts"), **cont)

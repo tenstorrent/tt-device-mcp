@@ -1571,7 +1571,15 @@ each rung fires only when the gentler one failed or cannot apply.
   carry (`hold_carry.json`) and the bound ladder's age (in the episode record) are on disk, so a
   broker restart keeps them: a hold the last broker left open escalates no later than its own
   start + 600 s (at once when that is past), and a hold that one past its bound ladder goes to the
-  host rung; only a hold whose start is unknown counts from the restart. The carry never crosses a
+  host rung; only a hold whose start is unknown counts from the restart. The startup hold a restart
+  opens (`startup_unverified`, spec 03 I4) names no fault: it keeps the start of a hold still open at
+  the restart, and never takes the carry of an episode a release already ended. That carry is spent,
+  `device_held` names it as `carry_declined`, and the hold's clock starts when it opens. Otherwise a
+  restart over a healthy job that started in the carry window (the window stays open while that job
+  runs) was born as old as the released episode: past the deadline, so the watchdog flagged it,
+  forced an escalation and paged a tenant block on a device whose job was healthy. The startup hold
+  still lifts only on the startup gate's full check, fabric included (a short link count fails), and
+  its own 10-min mark still runs the bound's ladder. The carry never crosses a
   reboot or power cycle (the boot id must match): a cycle ends the episode, and the startup check
   after hugepages gates release as before (spec 03). A re-hold after the window with no job, or
   around a job started after it, is a new episode. At most one power-cycle request per episode
@@ -1586,6 +1594,7 @@ each rung fires only when the gentler one failed or cannot apply.
   | Tenant hold released, then a fault hold | new episode | new episode: unchanged; the tenant's time is not counted |
   | Tenant hold turns into a fault hold within 300 s of a bound ladder's release | one more ladder at 10 min (about 10-13 min) before the host rung | carried: no ladder, power-cycle request at once (I65 cooldown still applies) |
   | Hold open across a broker restart | 10-min clock restarted at the restart | escalates no later than episode start + 600 s |
+  | Release, then a broker restart opens the startup hold (a re-adopted job, no hold open at the restart) | the startup hold took the released episode's start: deadline flag, forced escalation and tenant-blocked page at once, over a healthy job | fresh clock: the startup gate decides (spec 03 I75), the bound fires no earlier than the startup hold's start + 600 s; a real hold open across the restart is unchanged |
   | Every other class path below the bound | unchanged | unchanged |
 
 - **I83 — A fabric link-short hold gets one ladder at hold start, then the power cycle.** A hold
@@ -2318,6 +2327,7 @@ sees a silent fabric pass.
 | I76 a live tenant at the bound is paged once (`hold_bound_tenant_blocked`, naming it), /health shows `tenant_blocked`, and the ladder then the host rung run on the first tick after it leaves | `tests/test_hold_bound.py::test_a_live_tenant_at_the_bound_is_paged_once_and_the_ladder_runs_when_it_leaves`, `tests/test_hold_bound.py::test_a_killed_jobs_leftover_holder_does_not_stop_the_bound` |
 | I82 a bound ladder's release then a failed first job (missing port, I42 latch, known fabric fault, 77-only, generic) goes to the power cycle at the next hold, not another ladder; a class change keeps the clock; a re-hold past the window with no job, or around a job started after it, is a new episode; the carry never crosses a reboot | `tests/test_hold_episode_carry.py::test_replay_a_release_after_the_bound_ladder_then_a_failed_first_job_goes_to_the_power_cycle`, `::test_a_class_change_on_the_rehold_keeps_the_clock`, `::test_a_rehold_after_the_carry_window_with_no_job_is_a_new_episode`, `::test_a_failed_first_job_keeps_the_carry_however_long_it_ran`, `::test_a_job_started_after_the_window_does_not_extend_it`, `::test_the_carry_does_not_cross_a_reboot` |
 | I82 a broker restart keeps the clock: a released episode's re-hold goes to the power cycle, a hold open past its bound escalates at once, one past its bound ladder goes to the host rung | `tests/test_hold_episode_carry.py::test_replay_a_restart_whose_startup_check_releases_then_a_failed_first_job_goes_to_the_power_cycle`, `::test_a_hold_open_across_a_restart_escalates_at_once_when_past_the_bound`, `::test_a_hold_open_across_a_restart_after_its_bound_ladder_goes_to_the_host_rung`, `::test_replay_a_restart_whose_real_startup_gate_releases_keeps_the_carry` |
+| I82 the startup hold a restart opens never continues a released episode (fresh clock, no false deadline flag, forced escalation or tenant-blocked page); a hold open across the restart keeps its start under a startup why; the fresh clock still runs the ladder at its own 10-min mark and lifts only on a full check pass, fabric included | `tests/test_hold_episode_carry.py::test_a_startup_hold_after_a_released_episode_starts_its_own_clock`, `::test_a_hold_open_across_a_restart_keeps_its_clock_even_under_a_startup_why`, `::test_a_startup_hold_below_its_own_bound_runs_the_ladder_at_its_own_10_min_mark`, `::test_a_startup_hold_that_declined_a_carry_lifts_only_on_a_full_check_pass` |
 | I82 the carry ends when the device proves the release right: a successful first job, or a full check that passes with no hold open, gives the next fault a fresh episode and no cycle; the releasing pass keeps the carry it saves | `tests/test_hold_episode_carry.py::test_a_successful_first_job_ends_the_episode`, `::test_a_passing_full_check_with_no_hold_open_drops_the_carry`, `::test_a_passing_full_check_that_releases_a_hold_keeps_the_new_carry`, `::test_a_pass_whose_release_is_refused_keeps_the_carry` |
 | I82 a tenant hold saves no carry and does not take or spend a fault hold's carry | `tests/test_hold_episode_carry.py::test_a_tenant_hold_leaves_no_carry`, `::test_a_tenant_hold_between_does_not_spend_a_fault_holds_carry` |
 | I82 a tenant hold that turns into a fault hold takes a fault carry in its window, not one past it | `tests/test_hold_episode_carry.py::test_a_tenant_hold_that_turns_into_a_fault_hold_takes_the_carry_in_its_window`, `::test_a_tenant_hold_that_turns_into_a_fault_hold_past_the_window_is_a_new_episode` |
