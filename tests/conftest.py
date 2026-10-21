@@ -500,6 +500,10 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
         ("_hold_bound_denied_why", ""),
         ("_hold_bound_tenant_paged", ""),
         ("_hold_bound_tenant_blocker", None),
+        # The holders the dead-chip valve refused to kill (spec 03 I84), which the bound routes.
+        ("_kill_refused_pids", {}),
+        ("_kill_refused_job_pid", None),
+        ("_kill_refused_since", ""),
     ):
         monkeypatch.setattr(srv, name, value, raising=False)
     monkeypatch.setattr(srv, "post_job_gate_pending", False, raising=False)

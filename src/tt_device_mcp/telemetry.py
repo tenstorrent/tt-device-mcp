@@ -790,6 +790,10 @@ class TelemetrySampler:
                 self._deps.owe_device_pollers(reason)
 
         self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} fell off the PCIe bus", why="heartbeat")
+        if refused and self._deps.note_kill_refused is not None:
+            # After the hold opened: the holders left alive are recorded against it, so the 10-min bound
+            # sends them to the host rung rather than reading them as tenants (spec 04 I76).
+            self._deps.note_kill_refused(refused, stuck or others)
         await asyncio.to_thread(
             self._deps.capture_incident,
             "chip_dead",

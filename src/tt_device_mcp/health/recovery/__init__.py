@@ -290,6 +290,9 @@ class RecoveryDeps:
     # Marks the pollers the dead-chip valve stopped as owed a restart (server._owe_device_pollers):
     # that stop has no paired restore, and an idle relift can close the episode with no reset.
     owe_device_pollers: Optional[Callable[[str], None]] = None
+    # Records the holders the dead-chip valve refused to kill (server._note_dead_kill_refused, spec 03
+    # I84), so the 10-min bound sends them to the host rung instead of reading them as tenants.
+    note_kill_refused: Optional[Callable[[str, list], list]] = None
     mark_device_dirty: Optional[Callable[..., None]] = None
     # Places a not-dirty fabric-unverified hold (server._hold_device_fabric_unverified): a reset whose
     # fabric stayed a 77 settles there, never as a failed reset.

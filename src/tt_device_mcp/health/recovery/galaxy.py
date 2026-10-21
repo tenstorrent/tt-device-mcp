@@ -1844,7 +1844,7 @@ class GalaxyRecovery(Recovery):
         self.deps.clear_device_dirty(verified=True, why=f"gate/{gate_phase}: below-floor rescan/SBR recovered the mesh")
         return OUTCOME_RECOVERED
 
-    def _tenant_active(self, scan, *, force: bool = False) -> bool:
+    def _tenant_active(self, scan, *, force: bool = False, waive_job: bool = False) -> bool:
         """Is anyone using the device? TWO independent sources, because either one alone lies:
 
         * the holder scan — open ``/dev/tenstorrent`` fds. Blind while a running job is off the
@@ -1859,16 +1859,19 @@ class GalaxyRecovery(Recovery):
 
         ``force`` (the hold-deadline backstop) still waives an UNREADABLE scan — that guard protects
         against blindness, not against a known tenant — but never waives a real one, fd-held or
-        queue-known: resetting out from under a live job is the thing the guard is for."""
-        return self._tenant_blocker(scan, force=force) is not None
+        queue-known: resetting out from under a live job is the thing the guard is for.
 
-    def _tenant_blocker(self, scan, *, force: bool = False) -> Optional[dict]:
+        ``waive_job`` (the 10-min bound only) skips the running-job check for a job whose kill the
+        dead-chip valve refused (spec 03 I84): the bound sends it to the host rung, never a reset."""
+        return self._tenant_blocker(scan, force=force, waive_job=waive_job) is not None
+
+    def _tenant_blocker(self, scan, *, force: bool = False, waive_job: bool = False) -> Optional[dict]:
         """Which check of :meth:`_tenant_active` blocks, as health_event fields, or None when none does:
         ``blocker`` is ``job_running``, ``startup_verify`` (the running escalate's I75 stand-down), ``tenant``
         (with the first tenant's pid, uid, user and comm) or ``scan_incomplete`` (with the scan's source
         and gaps). A deferral that names its blocker tells a
         real tenant apart from a scan that merely could not see."""
-        if self.deps.job_running():
+        if not waive_job and self.deps.job_running():
             return {"blocker": "job_running"}
         if self._stand_down is not None and self._stand_down():
             self.startup_verify_deferred = True
