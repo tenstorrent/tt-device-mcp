@@ -463,7 +463,8 @@ class Recovery(ABC):
         targets = sorted(isolated_chips, key=int)
         _t0 = datetime.now()
         self.deps.begin_action_row("[broker]bridge-reset", f"bridge-reset chip(s) {','.join(targets)}")
-        self.deps.set_device_op_detail(f"recovering chip(s) {','.join(targets)} " f"via bridge reset (~10s)")
+        # Spec 04 I90: a device reset like glx_reset, so /status shows it as one from its first second.
+        self.deps.set_device_op_detail(f"{constants.DEVICE_RESET_DETAIL_PREFIX} bridge reset of chip(s) {','.join(targets)} (~10s)")
         device_pci_map = self.deps.device_pci_map()
         recovered, lost, inapplicable = [], [], []
         # The SBR write needs root and setpci (spec 04 I17). Decided once, ahead of the loop,
