@@ -45,7 +45,8 @@ PREEMPT_GRACE_SEC = 60
 
 # Once the grace minute is spent, the job's whole process tree gets SIGTERM and, at most this
 # much later, SIGKILL. The job already had its minute to end itself, so this is short. A tree
-# that all exits through its own code on SIGTERM inside it gets the fast post-job check; a
+# that all exits through its own code on SIGTERM inside it gets the fast post-job check (no check
+# and no reset when it exits 0); a
 # SIGKILL, any signal death or an unwitnessed exit marks the device dirty, so the full check,
 # fabric included, must pass first (a failing one goes on to the reset ladder).
 PREEMPT_KILL_GRACE_SEC = 10

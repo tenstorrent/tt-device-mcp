@@ -73,9 +73,11 @@ stopped for time, before or after x. Once x has passed and another job is waitin
 the job has one minute to see the waiting job and end itself; the broker sends it no
 signal during that minute. If a job is still waiting when the minute ends, the broker
 kills the job's whole process tree (SIGTERM, then SIGKILL at most 10 s later). The job
-ends `preempted`. If every process of the job exits through its own code on SIGTERM
-(the broker reads this from the kernel's exit records, which needs root), the usual fast
-between-jobs check runs. Otherwise (SIGKILL needed, any process killed by a signal, or
+ends `preempted`. If the job returns 0, either by ending itself inside the minute or by
+handling SIGTERM so that every process exits through its own code, no health check and no
+reset run before the next job. If every process exits through its own code on SIGTERM
+with another exit status (the broker reads this from the kernel's exit records, which may
+need root on some kernels), the usual fast between-jobs check runs. Otherwise (SIGKILL needed, any process killed by a signal, or
 the exits could not be witnessed) the device is marked dirty: the full health check,
 fabric included, must pass before the waiting job starts. A passing check releases the
 device with no reset; a failing one keeps it held and goes on to the reset ladder and the

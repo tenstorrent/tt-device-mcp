@@ -8,7 +8,8 @@ unbroken, so the job can see the waiter and end itself; a waiter that leaves ins
 causes nothing. When the minute runs out the job's whole process tree is killed (SIGTERM, then
 SIGKILL PREEMPT_KILL_GRACE_SEC later at the latest) and the job ends PREEMPTED. If the kernel's
 exit records show every process exited through its own code on SIGTERM, only the fast post-job
-check runs; otherwise (SIGKILL, a signal death, no witness) it is a wedge-risk exit: the device is
+check runs, and none at all on exit 0 (as for a job that ends itself with exit 0 inside the
+minute); otherwise (SIGKILL, a signal death, no witness) it is a wedge-risk exit: the device is
 marked dirty and the full check, fabric included, must pass before the waiting job is dispatched (a
 pass releases it with no reset; a failure holds it for the reset ladder). Every clock is
 time.monotonic(). Spec 01 I16.
@@ -268,9 +269,12 @@ async def test_no_signal_before_the_minute_then_the_whole_tree_is_killed(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_a_job_that_ends_itself_inside_the_minute_is_a_normal_end(monkeypatch, tmp_path, clear_job_state):
-    """The point of the minute: a job that sees the waiter and shuts down ends as any job does,
-    never signalled, through the normal post-job gate."""
+async def test_a_job_that_ends_itself_inside_the_minute_with_exit_0_gets_no_check(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The point of the minute: a job that sees the waiter and shuts down ends COMPLETED, never
+    signalled. It returned 0 under contention, so it yielded the device: no post-job check of any
+    kind and nothing marked dirty, so no reset either."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     gate = _recording_post_job_gate(monkeypatch)
@@ -307,8 +311,88 @@ async def test_a_job_that_ends_itself_inside_the_minute_is_a_normal_end(monkeypa
     assert job.status is srv.JobStatus.COMPLETED, job.status.value
     assert job.exit_code == 0 and "shutting-down" in job.output
     assert sent == [], f"a job that ended itself inside the minute was signalled: {sent}"
-    assert gate == [{"job_failed": False}]
+    assert job.yielded_on_contention is True
+    assert gate == [], "a job that yielded with exit 0 must get no check"
     assert dirty == []
+
+
+async def _yield_inside_the_minute(monkeypatch, tmp_path, job_id, rc, *, mid_run=None):
+    """Run a preemptable job past its 1 s limit, queue a waiter, and have the job end itself with
+    ``rc`` inside the 3 s minute. ``mid_run`` runs once the waiter is seen. Returns the job, the
+    signals sent, the gate's calls and the dirty marks."""
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    gate = _recording_post_job_gate(monkeypatch)
+    dirty = _recording_dirty(monkeypatch)
+    _fast_preempt(monkeypatch, grace=3)
+    seen = tmp_path / f"waiter-seen-{job_id}"
+    job = srv.Job(
+        id=job_id,
+        owner="server",
+        workspace="/tmp",
+        command=f"while [ ! -e {seen} ]; do sleep 0.1; done; exit {rc}",
+        queued_at="t",
+        timeout_sec=1,
+        preemptable=True,
+    )
+    srv.jobs[job_id] = job
+    sent = _recording_signals(monkeypatch, job)
+    await srv.get_job_queue().put(job_id)
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _until_running(job)
+        await asyncio.sleep(1.5)
+        _waiting_job()
+        await asyncio.sleep(1.0)
+        assert srv.preempt_label(job).startswith("PREEMPTING "), srv.preempt_label(job)
+        if mid_run is not None:
+            mid_run()
+        seen.touch()
+        await _until_finished(job, limit_sec=10)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+    assert sent == [], sent
+    return job, gate, dirty
+
+
+@pytest.mark.asyncio
+async def test_a_job_that_fails_inside_the_minute_still_gets_the_full_check(monkeypatch, tmp_path, clear_job_state):
+    """Only exit 0 is a yield. A job that ends itself with a failure under contention is an
+    ordinary failed job: the full post-job check, fabric included."""
+    job, gate, dirty = await _yield_inside_the_minute(monkeypatch, tmp_path, "945", 3)
+    assert job.status is srv.JobStatus.FAILED and job.exit_code == 3
+    assert job.yielded_on_contention is False
+    assert gate == [{"job_failed": True}]
+
+
+@pytest.mark.asyncio
+async def test_a_yield_with_exit_0_is_still_checked_when_its_output_names_a_device_fault(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Exit 0 waives only the check the preemption itself would owe. A device fault the runtime
+    named in the job's output is its own evidence: the gate still runs."""
+    faults = []
+    monkeypatch.setattr(srv, "_scan_output_for_device_fault", lambda path: "named a device fault")
+    monkeypatch.setattr(srv, "_mark_device_reported_fault", lambda reason, job=None: faults.append(reason))
+    job, gate, dirty = await _yield_inside_the_minute(monkeypatch, tmp_path, "946", 0)
+    assert job.yielded_on_contention is True
+    assert faults and gate == [{"job_failed": False}]
+
+
+@pytest.mark.asyncio
+async def test_a_yield_with_exit_0_is_still_checked_when_the_device_is_not_healthy(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Exit 0 waives only the check the preemption itself would owe: a device that was not HEALTHY
+    when the job ended (held for another cause) still goes through the gate."""
+
+    def _not_healthy():
+        monkeypatch.setattr(type(srv.fsm), "state", property(lambda self: srv.ServerState.RECOVERING))
+
+    job, gate, dirty = await _yield_inside_the_minute(monkeypatch, tmp_path, "947", 0, mid_run=_not_healthy)
+    assert job.yielded_on_contention is True
+    assert gate == [{"job_failed": False}]
 
 
 @pytest.mark.asyncio
@@ -610,6 +694,47 @@ async def test_a_preempted_job_that_needed_sigkill_is_fully_checked(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_a_preempted_job_that_handles_sigterm_with_exit_0_gets_no_check_or_reset(monkeypatch, clear_job_state):
+    """SIGTERM was sent, the job's own trap ended it with exit 0 inside the 10 s grace, and the
+    kernel saw every process exit by its own code. It returned 0: no post-job check of any kind,
+    quick or full, and nothing marked dirty, so no reset before the next job."""
+    _witness(monkeypatch, clean=True)
+    job, sent, gate, dirty = await _preempt(
+        monkeypatch, "965", "trap 'exit 0' TERM; while :; do sleep 0.1; done", kill_grace=5
+    )
+    assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
+    assert job.exit_code == 0 and job.preempt_clean is True
+    assert dirty == [], "an exit 0 on SIGTERM must not mark the device dirty"
+    assert gate == [], "an exit 0 on SIGTERM must get no check"
+
+
+@pytest.mark.asyncio
+async def test_a_preempted_job_that_exits_0_with_a_signal_death_is_fully_checked(monkeypatch, clear_job_state):
+    """The wrapper's exit 0 does not cover a process of the tree that died from the signal: not
+    proven clean, so dirty and the full check."""
+    _witness(monkeypatch, clean=False, why="pid 4242 of the job died from a signal")
+    job, sent, gate, dirty = await _preempt(
+        monkeypatch, "967", "trap 'exit 0' TERM; while :; do sleep 0.1; done", kill_grace=5
+    )
+    assert signal.SIGKILL not in sent, sent
+    assert job.exit_code == 0 and job.preempt_clean is False
+    assert dirty
+    assert gate == [{"job_failed": True}]
+
+
+@pytest.mark.asyncio
+async def test_a_preempted_job_that_exits_0_after_sigkill_is_fully_checked(monkeypatch, clear_job_state):
+    """A tree that needed SIGKILL stays dirty whatever the exit status: the full check, fabric
+    included, before the next job."""
+    _witness(monkeypatch, clean=True)
+    job, sent, gate, dirty = await _preempt(monkeypatch, "968", "trap '' INT TERM; sleep 60", kill_grace=1)
+    assert signal.SIGKILL in sent, sent
+    assert job.preempt_clean is False
+    assert dirty
+    assert gate == [{"job_failed": True}]
+
+
+@pytest.mark.asyncio
 async def test_an_unwitnessed_preemption_is_fully_checked(monkeypatch, clear_job_state):
     """Case (c): the exit could not be observed (no connector permission, lost events, unreadable
     tree). In doubt, the job counts as killed: dirty, so the full check."""
@@ -818,6 +943,43 @@ async def test_a_witness_that_cannot_be_built_still_kills_and_counts_as_killed(m
     assert job.preempt_clean is False
     assert dirty, "an unwitnessed kill must owe the full check"
     assert gate == [{"job_failed": True}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("breaks_in", ["drain", "clean", "close"])
+async def test_a_witness_error_while_draining_or_judging_still_kills_and_counts_as_killed(
+    monkeypatch, clear_job_state, breaks_in
+):
+    """Any exception from the witness while it drains, judges or closes (not only the errors
+    ExitWitness handles itself) voids the verdict and never stops the kill: SIGTERM, then SIGKILL
+    if needed, the job ends PREEMPTED, not clean, so dirty and the full check."""
+    made = _witness(monkeypatch, clean=True)
+    real = srv.ExitWitness
+
+    def _breaking(pgid, scope):
+        w = real(pgid, scope)
+
+        def _boom(*a):
+            raise RuntimeError(f"witness {breaks_in} exploded")
+
+        setattr(w, breaks_in, _boom)
+        return w
+
+    monkeypatch.setattr(srv, "ExitWitness", _breaking)
+    # drain() runs while the tree lives: a tree that ignores SIGTERM shows the SIGKILL still comes.
+    command = "trap '' INT TERM; sleep 60" if breaks_in == "drain" else "sleep 60"
+    job, sent, gate, dirty = await _preempt(monkeypatch, "969", command, kill_grace=1)
+    assert made, "the witness was never built"
+    assert sent and sent[0] is signal.SIGTERM, sent
+    if breaks_in == "drain":
+        assert signal.SIGKILL in sent, f"a witness that broke while draining stopped the kill: {sent}"
+    if breaks_in == "close":
+        # close() runs after the verdict, so only the clean end on SIGTERM decides.
+        assert job.preempt_clean is True
+    else:
+        assert job.preempt_clean is False
+        assert dirty, "a broken witness must owe the full check"
+        assert gate == [{"job_failed": True}]
 
 
 def test_the_witness_on_a_real_tree():

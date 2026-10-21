@@ -289,8 +289,9 @@ class JobSubmitInput(BaseModel):
             f"{PREEMPT_GRACE_SEC}s to see the waiter and end itself; the broker sends no signal in "
             "that time. If a job is still waiting when it runs out, the broker kills the job's whole "
             f"process tree (SIGTERM, then SIGKILL {PREEMPT_KILL_GRACE_SEC}s later at the latest). If "
-            "every process exits through its own code on "
-            "SIGTERM the usual fast check follows; otherwise the device is marked dirty and the full "
+            "the job returns 0 (it ended itself in that time, or handled SIGTERM and every process "
+            "exited through its own code) no check and no reset follow. If every process exits "
+            "through its own code on SIGTERM with another exit status the usual fast check follows; otherwise the device is marked dirty and the full "
             "check, fabric included, must pass before the waiting job starts (a failing check holds "
             "the device and goes on to the reset ladder). If "
             "every waiting job leaves first, nothing happens and a later one starts a fresh "
@@ -722,6 +723,7 @@ class Job:
     contention_waiters: frozenset = frozenset()  # the waiters seen at the last contention poll
     preempt_killed_monotonic: Optional[float] = None  # set when the grace minute ran out and the kill began
     preempt_clean: bool = False  # the kernel saw every process of the tree exit on SIGTERM by its own code
+    yielded_on_contention: bool = False  # it ended itself with exit 0 while a job waited past its limit
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     log_file: Optional[str] = None
@@ -4572,7 +4574,8 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
 
     Returns True only when ``witness`` is set and the kernel's exit records show every process
     of the tree exited through its own code on SIGTERM (no SIGKILL needed, no signal death):
-    the job ended cleanly and only the fast post-job check is owed. Any other end, or any doubt,
+    the job ended cleanly, so only the fast post-job check is owed, or none if it exited 0.
+    Any error in the witness counts as doubt and never stops the kill. Any other end, or any doubt,
     returns False: a wedge-risk exit, so the device is marked dirty and must pass the full check,
     fabric included, before the next job (a failing check goes on to the reset ladder)."""
     scope = job_scope_unit(job_id)
@@ -4598,28 +4601,61 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
                 pass
         return not (scoped and await asyncio.to_thread(_scope_active, scope))
 
-    # Subscribed before the SIGTERM, so no exit of the tree can go unseen. A witness that cannot
-    # be built for any reason leaves the kill unwitnessed: it still runs, and counts as killed.
+    # Subscribed before the SIGTERM, so no exit of the tree can go unseen. The witness can only
+    # ever prove a clean end: any error building, draining or judging it voids the verdict (not
+    # clean, so the device is marked dirty) and never stops the kill.
     seen = None
+    witness_error = ""
     if witness:
         try:
             seen = await asyncio.to_thread(ExitWitness, pid, scope if scoped else None)
         except Exception as e:  # noqa: BLE001 - the kill must run whatever the witness does
+            witness_error = f"witness failed ({e!r})"
             if logger:
                 logger.warning(f"PREEMPT job_id={job_id} exit witness unavailable ({e!r}); killing unwitnessed")
+
+    def _close_witness() -> None:
+        nonlocal seen
+        if seen is not None:
+            try:
+                seen.close()
+            except Exception:  # noqa: BLE001 - closing a broken witness must not stop the kill
+                pass
+            seen = None
+
+    def _drain() -> None:
+        nonlocal witness_error
+        if seen is None:
+            return
+        try:
+            seen.drain()
+        except Exception as e:  # noqa: BLE001 - a broken witness voids the verdict, not the kill
+            witness_error = f"witness failed ({e!r})"
+            _close_witness()
+
+    def _verdict() -> bool:
+        nonlocal witness_error
+        if seen is None:
+            return False
+        try:
+            return seen.clean() is True
+        except Exception as e:  # noqa: BLE001 - in doubt the exit counts as killed
+            witness_error = f"witness failed ({e!r})"
+            return False
+
     try:
         await _send(signal.SIGTERM)
         loop = asyncio.get_event_loop()
         deadline = loop.time() + PREEMPT_KILL_GRACE_SEC
         while loop.time() < deadline:
-            if seen is not None:
-                seen.drain()
+            _drain()
             if await _gone():
-                clean = seen is not None and seen.clean()
-                if logger and seen is not None:
+                clean = _verdict()
+                if logger and witness:
+                    why = witness_error or (getattr(seen, "why", "") if seen is not None else "")
                     logger.info(
                         f"PREEMPT job_id={job_id} ended on SIGTERM: "
-                        + ("every process exited by its own code" if clean else f"not clean: {seen.why}")
+                        + ("every process exited by its own code" if clean else f"not clean: {why}")
                     )
                 return clean
             await asyncio.sleep(0.1)
@@ -4628,8 +4664,7 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
         await _send(signal.SIGKILL)
         return False
     finally:
-        if seen is not None:
-            seen.close()
+        _close_witness()
 
 
 # How often a silent job is noted in its own log. This is the only hang signal that does not
@@ -6102,7 +6137,8 @@ async def job_runner():
                 # inside that minute, so the job can see the waiter and end itself. When the
                 # minute runs out the whole tree is killed (_preempt_kill, bounded) and the job ends
                 # PREEMPTED. If every process exited through its own code on SIGTERM the normal
-                # fast post-job gate follows; otherwise (a wedge-risk exit) the device is marked dirty
+                # fast post-job gate follows (none at all on exit 0, as for a job that yields inside
+                # the minute); otherwise (a wedge-risk exit) the device is marked dirty
                 # and must pass the full post-job gate, fabric included, before the waiting job
                 # starts; a failing gate holds it and goes on to the reset ladder.
                 announced = False
@@ -6176,6 +6212,11 @@ async def job_runner():
                         )
                     else:
                         job.status = JobStatus.COMPLETED if job.exit_code == 0 else JobStatus.FAILED
+                        # A preemptable job that ends itself with exit 0 while a job waits past its
+                        # limit has done what the grace minute asks: it yielded the device.
+                        job.yielded_on_contention = (
+                            job.preemptable and job.exit_code == 0 and _preempt_kill_at(job, limit_end) is not None
+                        )
 
             if logger:
                 logger.info(
@@ -6329,10 +6370,22 @@ async def job_runner():
                     # investigated. A preemption the kernel saw end cleanly on SIGTERM is a normal
                     # end, not a failure: the fast check, which escalates on its own if it fails.
                     clean_preempt = job.status == JobStatus.PREEMPTED and job.preempt_clean
-                    await _verify_device_after_job(
-                        job_log_file,
-                        job_failed=(job.status != JobStatus.COMPLETED or job.exit_code != 0) and not clean_preempt,
-                    )
+                    # A preempted job that returns 0 (it yielded inside the grace minute, or handled
+                    # SIGTERM and every process of its tree exited by its own code) owes no check of
+                    # any kind and no reset. Only another cause still runs the gate: a device fault
+                    # named in its output, or a device not HEALTHY when it ended.
+                    yielded_ok = job.exit_code == 0 and (job.yielded_on_contention or clean_preempt)
+                    if yielded_ok and not fault and fsm.state is ServerState.HEALTHY:
+                        if logger:
+                            logger.info(
+                                f"CLEAN-GATE job {job_id} ended {job.status.value} with exit 0 under "
+                                f"contention; no post-job check"
+                            )
+                    else:
+                        await _verify_device_after_job(
+                            job_log_file,
+                            job_failed=(job.status != JobStatus.COMPLETED or job.exit_code != 0) and not clean_preempt,
+                        )
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:
                         logger.error(f"JOB_RUNNER post-job health gate error for job_id={job_id}: {e}")

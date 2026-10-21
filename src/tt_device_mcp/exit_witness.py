@@ -4,7 +4,7 @@
 """Witness how every process of a job's tree exits, from the kernel's own exit records.
 
 A preempted job that ends cleanly on SIGTERM (every process exits through its own code) needs
-only the fast between-jobs check; one where any process died from a signal may have left an eth
+only the fast between-jobs check, or none if it exits 0; one where any process died from a signal may have left an eth
 core or the fabric mid-transaction, so the device is marked dirty and needs the full check,
 fabric included (a failing check goes on to the reset ladder). The broker cannot tell these
 apart from wait statuses: it waits only on its own child, the job's bash wrapper turns any SIGTERM
@@ -12,9 +12,9 @@ into a plain `exit 143`, and grandchildren are reaped by their own parents. The 
 events connector (netlink) reports every fork and exit on the host with the exit status in
 waitpid form, so it can.
 
-It needs CAP_NET_ADMIN (the root broker has it). When it cannot subscribe, misses events (receive
-buffer overflow), or the tree cannot be read, the verdict is "not proven clean", which the
-caller treats as a killed job.
+It may need CAP_NET_ADMIN, depending on the kernel (6.8 allows it unprivileged; the root broker
+has it either way). When it cannot subscribe, misses events (receive buffer overflow), or the tree
+cannot be read, the verdict is "not proven clean", which the caller treats as a killed job.
 """
 
 import errno
