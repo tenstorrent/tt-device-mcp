@@ -4542,6 +4542,23 @@ def _fabric_no_reset_hold() -> str:
 # Spec 04 I83: the no-reset causes that are a fabric link-short hold — every chip on the bus, but the
 # full check counts fewer links (or ports) than the cabling expects.
 _FABRIC_LINK_SHORT_CAUSES = ("topology mismatch", "known fabric fault")
+# Spec 04 I83: the measured link-short causes, which keep the reset: the spec 03 I42 latch, and a full
+# check that failed on descriptor ports missing (spec 03 I71; ports the accept list excuses never fail).
+_FABRIC_LINK_SHORT_LATCHED = "topology latch"
+_FABRIC_LINK_SHORT_MISSING = "fabric links missing"
+
+
+def _fabric_links_missing_hold() -> bool:
+    """Whether the last full fabric check FAILED on descriptor ports missing (spec 03 I71)."""
+    mon = health_monitor
+    if mon is None or mon.last_fabric_ok is not False:
+        return False
+    topo = getattr(mon, "fabric_topology", None) or {}
+    return (
+        fabric.names_links_missing(mon.last_fabric_output or "")
+        or fabric.names_links_missing(str(fsm.record.detail or ""))
+        or (topo.get("verdict") == "failed" and bool(topo.get("missing_ports")))
+    )
 
 
 def _fabric_link_short_hold() -> str:
@@ -4549,7 +4566,28 @@ def _fabric_link_short_hold() -> str:
     if isolated_chips:
         return ""
     cause = _fabric_no_reset_hold()
-    return cause if cause in _FABRIC_LINK_SHORT_CAUSES else ""
+    if cause in _FABRIC_LINK_SHORT_CAUSES:
+        return cause
+    if health_monitor is not None and health_monitor.topology_hw_fault:
+        return _FABRIC_LINK_SHORT_LATCHED
+    return _FABRIC_LINK_SHORT_MISSING if _fabric_links_missing_hold() else ""
+
+
+def _link_short_relift_reset_owned() -> bool:
+    """Spec 04 I83 single flight: once the episode's at-start pass (or a bound ladder, or the host rung)
+    has run or is running, the idle relift's measured-fault present-mesh retries run no other glx_reset
+    on a fabric link-short hold. That one ladder's full check, then the host rung, decide the hold."""
+    if not _fabric_link_short_hold():
+        return False
+    _hold_bound_sync()
+    running = (
+        _forced_escalation_task is not None
+        and not _forced_escalation_task.done()
+        and device_hold_escalation_kind == "fabric_link_short"
+    )
+    return (
+        running or _hold_bound_ladder_age is not None or _hold_bound_cycle_age is not None or _hold_bound_rung_pending
+    )
 
 
 def _fabric_link_short_early(kind: Optional[str]) -> bool:
@@ -4827,6 +4865,9 @@ async def _attempt_idle_relift() -> None:
                 host's own escalate() has no ladder and reports WAITING forever — an idle hold
                 there would outlive every ceiling with no rung ever attempted. ``measured_fault``
                 lets the present ladder reset without the grace (spec 03 I56)."""
+                if rung == "present" and _link_short_relift_reset_owned():
+                    _log("fabric link-short hold: the watchdog's one ladder owns the reset (spec 04 I83)")
+                    return False
                 _void_fabric_ok(f"idle relift: {rung}")
                 outcome = await galaxy_recovery.escalate(
                     rung, indices, expected, _log, measured_fault=measured_fault, stand_down=_startup_verify_owns_hold
@@ -8180,12 +8221,13 @@ async def _force_escalate_stuck_hold() -> None:
             return
         off_bus = _offbus_count(beats, expected)
         no_reset = "" if off_bus or isolated_chips or climb_77 else _fabric_no_reset_hold()
-        if kind == "fabric_link_short" and (not early or no_reset not in _FABRIC_LINK_SHORT_CAUSES):
+        link_short = "" if off_bus or isolated_chips or climb_77 else _fabric_link_short_hold()
+        if kind == "fabric_link_short" and (not early or not link_short):
             # The chips or the cause changed since the sampler spawned this: not the I83 class now. No
             # more at-start spawns this episode; the class it is now keeps its own path and the bound.
             _fabric_link_short_declined = device_hold_episode_since
             return
-        if early and no_reset not in _FABRIC_LINK_SHORT_CAUSES:
+        if early and not link_short:
             return
         if no_reset and not early:
             # Every chip enumerates with a live ARC heartbeat and the hold names only the fabric: a 77
@@ -8293,7 +8335,8 @@ _hold_bound_ladder_recovered: bool = False
 # stands in for the bound's ladder only once the host rung after it was granted (or its cooldown retry
 # armed): until then the 10-min bound still runs the full ladder.
 _hold_bound_early: bool = False
-# The hold age at which the governor granted the host rung, or armed its cooldown retry (spec 04 I76).
+# The hold age at which the governor granted the host rung, or armed its boot / post-cycle cooldown retry
+# (spec 04 I76); a missed request's, backstop or per-boot cap retry does not count.
 _hold_bound_granted_age: Optional[float] = None
 _hold_bound_cycle_age: Optional[float] = None
 # The hold age at which a full check after the bound's ladder ended with no pass (spec 04 I76).
@@ -8366,12 +8409,16 @@ def _disproven_lift_bound_due(age: float) -> bool:
 def _note_hold_bound_ladder(age: float, outcome: str, *, early: bool = False) -> None:
     """Record the bound's own ladder. A forced run that started below the bound (the off-bus one-shot,
     a progress retry, a gated grace) is not it: the bound still runs its ladder at the 10-min mark.
-    Spec 04 I83's at-start pass of a fabric link-short hold (``early``) is: it is that class's ladder."""
+    Spec 04 I83's at-start pass of a fabric link-short hold (``early``) is: it is that class's ladder.
+    A host rung still pending from before it (a denial that armed no retry) is spent: the full check
+    after this ladder decides whether the host rung is asked again (spec 04 I76)."""
     global _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_tenant_blocker, _hold_bound_early
+    global _hold_bound_rung_pending, _hold_bound_denied_why
     if age < _hold_bound_sec() and not early:
         return
     _hold_bound_sync()
     _hold_bound_tenant_blocker = None
+    _hold_bound_rung_pending, _hold_bound_denied_why = False, ""
     _hold_bound_ladder_age = max(age, _hold_age_now())
     _hold_bound_early = early  # a ladder at the bound is the bound's own, with its full check window
     _hold_bound_ladder_recovered = outcome == OUTCOME_RECOVERED
@@ -8386,9 +8433,11 @@ def _hold_bound_ladder_counts(lad: Optional[float]) -> bool:
 
 def _hold_bound_check_end(lad: float) -> float:
     """The hold age by which the full check after the bound's ladder must have passed. After I83's
-    at-start pass it ends at the bound at the latest, so the host rung is asked for within 10 min."""
+    at-start pass it ends at the 10-min bound at the latest, so the host rung is asked for within 10 min.
+    That is the ceiling, not _hold_bound_sec(): under the I42 latch the latter is one sampler tick, which
+    would leave a check still waiting on the hugepage pool no window at all."""
     end = lad + _HOLD_BOUND_CHECK_SEC
-    return min(end, max(lad, _hold_bound_sec())) if _hold_bound_early else end
+    return min(end, max(lad, _stuck_hold_ceiling_sec())) if _hold_bound_early else end
 
 
 def _hold_bound_check_pending(age: float) -> bool:
@@ -8433,16 +8482,21 @@ def _hold_bound_ladder_in_last_window(age: float) -> bool:
         return False
     ceiling = _stuck_hold_ceiling_sec()
     lad = _hold_bound_ladder_age
-    if _hold_bound_early:
-        lad = max(lad, ceiling)  # spec 04 I83: the at-start pass counts as the first window's ladder
+    # Spec 04 I83: the at-start pass (and the ladder the I42 latch's one-tick bound counted) is the first
+    # window's ladder; one that owes the 10-min rerun never gets here (_hold_bound_owes_ladder).
+    lad = max(lad, ceiling)
     return lad >= max(ceiling, (int(age // ceiling) - 1) * ceiling)
 
 
 def _hold_bound_owes_ladder(age: float) -> bool:
-    """Spec 04 I83 with I76: at the bound, an at-start pass whose host rung was never granted (both host
-    rungs opted out, or a denial other than the cooldown) does not stand in for the bound's ladder."""
+    """Spec 04 I83 with I76: at the 10-min mark, a ladder that ended below it and whose host rung was
+    never granted (both host rungs opted out, or a denial other than the boot / post-cycle cooldown: a
+    missed request's backoff, the backstop or the per-boot cap) does not stand in for
+    the bound's ladder. That is the at-start pass, and under the I42 latch also the ladder its one-tick
+    bound counted: the latch shortens the bound, never the 10-min ladder (the latch stays)."""
     lad = _hold_bound_ladder_age
-    if not _hold_bound_early or lad is None or age < _hold_bound_sec():
+    ceiling = _stuck_hold_ceiling_sec()
+    if lad is None or age < ceiling or not (_hold_bound_early or lad < ceiling):
         return False
     return _hold_bound_granted_age is None or _hold_bound_granted_age < lad
 
@@ -8575,8 +8629,13 @@ async def _hold_bound_host_rung(age: float, log) -> None:
         return
     _hold_bound_tenant_blocker = None
     allowed, why = recovery_mechanism.auto_recovery_allowed(action, tenant_active=False)
-    if allowed or getattr(recovery_mechanism, "power_cycle_retry", None) is not None:
+    retry = getattr(recovery_mechanism, "power_cycle_retry", None) is not None
+    if allowed or retry:
         _hold_bound_rung_pending, _hold_bound_cycle_age = False, age
+    if allowed or (retry and getattr(recovery_mechanism, "power_cycle_retry_cooldown", False)):
+        # Spec 04 I83/I76: only a host rung that fired, or the boot / post-cycle cooldown it waits out,
+        # stands in for the 10-min ladder. A missed request's backoff, the backstop or the per-boot cap
+        # does not: the hold still gets its ladder at the 10-min mark.
         _hold_bound_granted_age = age
     if not allowed and why == _hold_bound_denied_why:
         return  # the same denial as the last tick's: asked again, quietly

@@ -87,6 +87,7 @@ def test_a_request_the_host_never_acted_on_is_asked_again_as_its_window_ends(coo
     _window_ends(cool, T0 + WINDOW)
     assert _rows()[-1]["took_host_down"] is False
     assert m.power_cycle_retry[0] == T0 + WINDOW
+    assert not m.power_cycle_retry_cooldown, "a missed request is no cooldown: the 10-min ladder still runs (I76)"
     assert _watchdog(cool, monkeypatch, T0 + WINDOW) == [T0 + WINDOW]
     allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=T0 + WINDOW)
     assert allowed, why
