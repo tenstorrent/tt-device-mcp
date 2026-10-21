@@ -492,6 +492,19 @@ class Recovery(ABC):
                 "removed is still un-reset"
             )
             health_event("host_reset_gated", context="bridge_reset", chips=targets, reason=why, host_at_risk=True)
+        # Spec 04 I92: every reset journals its pre-reset holder scan. This one needs none: each target
+        # was cut out of the kernel (detached), so no process can map it and closing a holder's fd
+        # makes the driver send it nothing. Killing readers here would only stop the device pollers'
+        # reads of the chips that stay on the bus.
+        if sbr and not gated:
+            health_event(
+                "pre_reset_holder_scan",
+                argv=["bridge-reset", *targets],
+                owner="[broker]bridge-reset",
+                outcome="targets_detached",
+                chips=targets,
+                seconds=0.0,
+            )
         # Spec 04 I69: a chip the broker removed is still hung, and any rescan this pass would
         # re-enumerate it for the driver to probe. So reset every one of them through its recorded
         # bridge first, then rescan once. If any cannot be reset, no rescan runs this pass at all
@@ -862,6 +875,7 @@ class Recovery(ABC):
 
         log(f"resetting device: {' '.join(argv)}  ({expected} device(s); ~30-60s, restart-safe)")
         health_event("reset_begin", argv=argv, expected_chips=expected)
+        prior_reset_monotonic = self.mechanism.last_reset_monotonic
         self.mechanism.last_reset_monotonic = time.monotonic()
         pcie_guard.begin_offbus_reset("mesh reset", off_bus)
         aer_mask = pcie_guard.mask_for_mesh_reset(log)
@@ -870,6 +884,16 @@ class Recovery(ABC):
         finally:
             if aer_mask is not None:
                 await asyncio.to_thread(aer_mask.restore)
+        if rc is None and (out or "").startswith("reset refused:"):
+            # Spec 04 I92: the pre-reset scan refused (a tenant, a reader that would not die, an off-bus
+            # chip it could not detach, a reset already in flight). No reset ran, so nothing that a
+            # reset settles is settled: the cooldown clock goes back, a kill-reset debt or a spent
+            # dispatch reset stays owed, and the hold stays for the 10-min ladder (I76).
+            self.mechanism.last_reset_monotonic = prior_reset_monotonic
+            log(out)
+            health_event("reset_refused", argv=argv, detail=out)
+            metrics.stage_fired("smi_reset", "blocked")
+            return False
         self.mechanism.last_reset_rc = rc
         if _journal_cpld_too_old(argv, out, log):
             # Latched on the mechanism both platforms share, so the NEXT rung and every later pass

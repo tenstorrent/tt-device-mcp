@@ -1954,6 +1954,76 @@ each rung fires only when the gentler one failed or cannot apply.
   | Same, an override the guard cannot classify | the reset rung is not run (no time spent); the next rung follows at once |
   | Classes with no mesh reset (per-chip bridge reset, `tt-smi -r`, power cycle) | none |
 
+- **I92 — Before every reset, the device is cleared of readers.** A reset takes chips off the bus,
+  and a process still reading one gets no completion: each read is a completion timeout, and under
+  firmware-first error handling a reader in a loop can take the host down. So `reset_with_quiesce`
+  (the mesh reset, the sweep, the operator reset), right after the device pollers stop and before
+  the reset fires, runs the broker's holder scan (`pre_reset_scan.clear_device_readers`):
+  - Every holder other than the broker itself is either a tenant (`is_tenant`, or the running job
+    and its children) or a reader.
+  - A tenant refuses an automatic reset (owner `[broker]...`): nothing is signalled, the reset does
+    not run (`reset refused: ...`), the tenant is named in
+    the journal and in `/health` `pre_reset_blocked_by`, and the hold goes on to the existing
+    tenant handling of the I76 bound. An operator reset's own gate (I6/I7) has already ruled on
+    tenants, so there they are only recorded.
+  - A chip still bound to the driver whose heartbeat reads all-ones is detached first
+    (`isolate_chip`, the driver's PCI remove, the only operation that marks a chip detached). The
+    driver sends a bound chip a power-state message as soon as a holder's fd closes, so killing a
+    reader of an off-bus, still-bound chip would make the kernel read that chip. If any such chip
+    cannot be detached, no reader is signalled and the reset is refused; the hold stays and the
+    bounded recovery (the ladder at 10 min, then the power cycle, I76) runs. This is looked at only
+    when readers are found. A sysfs remove can block in the kernel, so the detaches run off the
+    event loop under one deadline for all the chips (`PRE_RESET_DETACH_TIMEOUT_SEC`, 30 s); one
+    that has not returned by then counts as not detached (`detach_timed_out`), and `/health`, the
+    queue and the I76 timers keep running meanwhile.
+  - A reset already in flight is never signalled: a running reset scope (`ttdev-reset-*`), a holder
+    inside one, or a reset the broker launched outside a scope (registered by pid, its children
+    included) refuses the new reset before any signal (`reset_in_flight`). Killing a reset partway
+    through the chips is worse than any reader. The operator reset (tool and stream) refuses too:
+    `a reset is already in flight (<unit>)`.
+  - A holder the driver names that the scan cannot read (often a pid mid-exit) is looked for once
+    more after `PRE_RESET_RESCAN_SETTLE_SEC` (1 s). Still unseen, it refuses an automatic reset
+    (`scan_incomplete`): an unseen reader is the one the scan exists to remove. An operator reset
+    records the gap and goes on; a gap no pid explains is recorded and the reset goes on.
+  - Each reader gets SIGTERM, `PRE_RESET_TERM_GRACE_SEC` (10 s, the preemption grace) to let go,
+    SIGKILL, then up to `HOLDER_RELEASE_WAIT_SEC` for the driver's release (01 I67). Each signal
+    re-checks pid and start time, so a reused pid is never signalled.
+  - A reader still holding after that and stuck in the kernel (state D or a pending SIGKILL) is
+    registered as a reaped leftover (01 I16): the leftover fence and the I70 clock take it to the
+    host rung. Any other reader left holding refuses the reset with its name.
+  - Every reset journals one `pre_reset_holder_scan` event (outcome `clear`, `killed`,
+    `reset_in_flight`, `tenant_blocked`, `scan_incomplete`, `offbus_undetached`, `unkillable`,
+    `survivor` or `scan_error`). A scan that itself fails (the holder read errors, or the scan
+    raises: outcome `scan_error`) lets the reset run, as before the scan existed; recovery must not
+    stop on a scan bug, and the reset's own gates still apply.
+  - A refusal leaves the device pollers stopped, owed to the next close to HEALTHY (03 I66), which
+    only a passing full check, fabric included, reaches: never restarted onto chips a refused
+    reset left as they were.
+  - The bridge rung runs no scan: its targets are already cut out of the kernel, so no process can
+    map them and closing a holder sends them nothing. It journals the event with outcome
+    `targets_detached`.
+
+  A refused reset is a rung that did not run: it is journalled as `reset_refused` (never
+  `reset_failed` or a timeout), the cooldown clock goes back to the last reset that ran, a kill-reset
+  debt stays owed, the AER mask and the off-bus intent taken for it are released, `FABRIC_DEBT`
+  stays owed and no hold lifts until the full health check, fabric included, passes (03). The hold
+  goes on to the I76 bound: the ladder at 10 min and, while the full check with fabric still fails,
+  the power cycle. A tenant bounds it only as the I76 tenant exception states. Queued jobs and the
+  post-job gate are unchanged.
+  Time to recover (TTR):
+
+  | Case | Effect of I92 |
+  |---|---|
+  | Every fault class, nothing but the broker holding the device | one holder scan before each reset, well under 1 s; no other change |
+  | Any reset with a reader present | + up to 10 s (SIGTERM grace) + up to 30 s (release wait), only then |
+  | A reader of an off-bus, still-bound chip | + up to 30 s for the detaches (one deadline, off the event loop), then the reader case above: at most 70 s in all; refused if a detach fails or times out, then the I76 bound (ladder at 10 min, then the power cycle) |
+  | A reset already in flight | the new reset is refused at once (no wait); the running reset's own verify decides, and the hold stays for the I76 bound |
+  | A holder the scan cannot see | + 1 s for one rescan; still unseen: an automatic reset is refused, then the I76 bound |
+  | Any refused reset (reader left, chip not detached, reader stuck) | no wait of its own: the rung is skipped and the I76 bound runs the ladder at 10 min, then the power cycle if the full check with fabric fails |
+  | Tenant under an automatic reset | the reset waits for the tenant, as the I76 tenant exception already states |
+  | Reader stuck in the kernel | the I70 host rung and its budget |
+  | Bridge rung | none |
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -2511,3 +2581,5 @@ sees a silent fabric pass.
 | I91 both reset backends launch a mesh reset (not `-r`) under the guard; every reset path (gate, ladder, sweep, operator reset, startup) reaches them through `reset_with_quiesce` and nothing else builds a mesh-reset argv | `tests/test_ipmi_guard.py::test_the_scope_backend_launches_a_mesh_reset_under_the_guard`, `tests/test_ipmi_guard.py::test_the_local_backend_launches_a_mesh_reset_under_the_guard`, `tests/test_ipmi_guard.py::test_every_reset_path_goes_through_the_guarded_backends` |
 | I91 the preflight (read-only `mc info`, 10 s bound, firmware >= 0.05.22) refuses a silent BMC or old firmware; a refusal runs no reset, arms no cooldown, keeps the hold, climbs and shows in /health | `tests/test_ipmi_guard.py::test_the_preflight`, `tests/test_ipmi_guard.py::test_the_preflight_is_read_only_and_bounded`, `tests/test_ipmi_guard.py::test_firmware_older_than_0_05_22_is_refused`, `tests/test_ipmi_guard.py::test_a_preflight_refusal_is_a_rung_that_did_not_fire_and_keeps_the_hold` |
 | I91 tt-smi's fallback text or the guard's refusal: rc 0 becomes 1, `bmc_legacy_reset_attempted` host_at_risk, paged once; an unarmed guard (or `unshare` failing) is a reset that did not fire; a guarded reset still owes the full check, fabric included, before release | `tests/test_ipmi_guard.py::test_the_fallback_never_reads_as_a_passing_reset_and_pages_once`, `tests/test_ipmi_guard.py::test_a_guard_that_cannot_arm_is_a_reset_that_did_not_fire`, `tests/test_ipmi_guard.py::test_a_guarded_reset_still_owes_the_full_check_before_release` |
+
+| I92 before every reset (mesh reset, sweep, operator reset) the holder scan runs after the pollers stop: a reader gets SIGTERM, 10 s, SIGKILL; a tenant refuses an automatic reset and is named in the event and /health; an operator reset is not refused by a tenant; an off-bus bound chip is detached before any kill and an undetachable one keeps every reader alive; a D-state reader is fenced for the host rung; a refused reset keeps the fabric owed; a scan bug lets the reset run; the bridge rung journals `targets_detached` and kills nothing | `tests/test_pre_reset_holder_scan.py::test_every_reset_kills_the_reader_after_the_pollers_stop_and_before_the_reset`, `::test_a_reader_gets_sigterm_then_sigkill_after_the_10s_grace`, `::test_a_tenant_refuses_an_automatic_reset_named_in_health_and_the_fabric_stays_owed`, `::test_an_operator_reset_is_not_refused_by_a_tenant`, `::test_an_off_bus_chip_is_detached_before_any_reader_is_killed`, `::test_an_off_bus_chip_that_cannot_be_detached_keeps_its_readers_alive`, `::test_on_bus_chips_readers_are_killed_with_no_detach`, `::test_an_unkillable_reader_is_fenced_for_the_host_rung`, `::test_a_scan_bug_does_not_stop_the_reset`, `::test_the_bridge_rung_journals_its_detached_targets_and_kills_nothing`; `::test_a_detach_that_blocks_in_the_kernel_is_bounded_and_refuses_the_reset`, `::test_a_holder_inside_a_reset_is_never_signalled_and_the_reset_is_refused`, `::test_a_reset_already_running_refuses_before_the_scan`, `::test_a_registered_local_reset_and_its_child_read_as_in_reset`, `::test_a_refused_mesh_reset_is_journalled_as_refused_and_settles_no_debt`, `::test_a_refused_sweep_reset_is_journalled_and_releases_the_aer_mask`, `::test_a_pid_gap_is_rescanned_once_then_refuses_an_automatic_reset`, `::test_a_pid_gap_that_clears_on_the_rescan_lets_the_reset_proceed`, `::test_an_operator_reset_records_a_pid_gap_and_still_clears_the_readers`, `::test_a_gap_no_pid_explains_is_recorded_and_the_reset_proceeds`, `::test_an_automatic_reset_past_an_unseen_holder_is_refused_and_the_fabric_stays_owed`, `::test_a_scan_that_raises_lets_the_reset_proceed`; the operator reset refuses while another is in flight: `tests/test_reset.py::test_an_operator_reset_refuses_while_another_reset_is_in_flight`, `::test_a_streaming_operator_reset_refuses_while_another_reset_is_in_flight`; a refused reset keeps the hold and the I76 bound still runs the ladder at 10 min, then the power cycle: `tests/test_hold_bound.py::test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung`, `::test_a_reset_the_holder_scan_refuses_keeps_the_hold_and_the_bound_cycles`, `::test_a_tenant_the_holder_scan_finds_bounds_the_hold_and_the_ladder_runs_when_it_leaves` |
