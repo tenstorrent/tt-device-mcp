@@ -174,6 +174,7 @@ from tt_device_mcp.job_reap import (
     JOB_TAG_ENV,
     ReapedLeftover,
     find_reaped_leftovers,
+    job_processes,
     reap_job_survivors,
     stuck_device_holder,
 )
@@ -1562,6 +1563,7 @@ _dead_chip_stuck_lock = threading.Lock()
 # The registry and the episode's wall-clock start, so a broker restart keeps the fence and the 120 s
 # clock (spec 04 I77). Read once at startup; a different boot id means every pid in it is gone.
 DEAD_CHIP_STUCK_FILE = "dead_chip_stuck.json"
+_dead_chip_stuck_save_lock = threading.Lock()  # one snapshot+write of the record at a time
 _dead_chip_page_pending: Optional[dict] = None  # a page the alert hook dropped, sent again next scan
 _leftover_dead_chip: bool = False  # the open I70 episode names a dead-chip stuck holder
 stats: Stats | None = None  # Session statistics
@@ -8537,8 +8539,14 @@ def _note_dead_chip_stuck_holders(chips: list, killed: list) -> list[int]:
 
 def _save_dead_chip_stuck() -> None:
     """Write the I77 registry under the health dir (atomic rename) with this boot's id and the open
-    I70 episode's wall-clock start; an empty registry removes the file. Never raises: the registry in
-    memory still holds."""
+    I70 episode's wall-clock start; an empty registry removes the file. The snapshot and the write
+    run under one lock, so a slower writer never puts back a registry a later one emptied. Never
+    raises: the registry in memory still holds."""
+    with _dead_chip_stuck_save_lock:
+        _write_dead_chip_stuck()
+
+
+def _write_dead_chip_stuck() -> None:
     with _dead_chip_stuck_lock:
         entries = dict(_dead_chip_stuck)
     path = health_dir() / DEAD_CHIP_STUCK_FILE
@@ -8580,7 +8588,7 @@ def _restore_dead_chip_stuck() -> list[int]:
                     with _dead_chip_stuck_lock:
                         _dead_chip_stuck[pid] = entry
                     kept.append(pid)
-        since = min(float(record.get("since") or time.time()), time.time())
+        since = _restored_episode_since(record.get("since"))
     except FileNotFoundError:
         return []
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
@@ -8592,16 +8600,54 @@ def _restore_dead_chip_stuck() -> list[int]:
         _leftover_unkillable_mono = time.monotonic() - (time.time() - since)
         if logger:
             logger.error(f"DEAD-CHIP stuck holder(s) {kept} still alive after the broker restart; fence kept")
-        health_event(
-            "dead_chip_holder_stuck_restored",
-            pids=kept,
-            since=datetime.fromtimestamp(since).isoformat(timespec="seconds"),
-            fault_class=DEAD_CHIP_STUCK_CLASS,
-            budget_sec=DEAD_CHIP_STUCK_BUDGET_SEC,
-        )
-        _reaped_leftovers()  # the episode, its class and budget, and /health's leftover_fence
+        try:
+            health_event(
+                "dead_chip_holder_stuck_restored",
+                pids=kept,
+                since=datetime.fromtimestamp(since).isoformat(timespec="seconds"),
+                fault_class=DEAD_CHIP_STUCK_CLASS,
+                budget_sec=DEAD_CHIP_STUCK_BUDGET_SEC,
+            )
+            _reaped_leftovers()  # the episode, its class and budget, and /health's leftover_fence
+        except Exception as e:  # noqa: BLE001 - the restored fence and clock hold; the next scan opens it
+            if logger:
+                logger.error(f"DEAD-CHIP restoring the stuck-holder episode failed: {e}")
     _save_dead_chip_stuck()
     return kept
+
+
+def _restored_episode_since(raw) -> float:
+    """The recorded episode start, as a wall-clock time no later than now. One that is missing, not
+    a number, not finite or out of range is logged and taken as now: the 120 s budget then runs from
+    this start (bounded), and the holders are restored all the same."""
+    now = time.time()
+    try:
+        since = float(raw)
+        datetime.fromtimestamp(since)
+        if math.isfinite(since) and since > 0:
+            return min(since, now)
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    if logger:
+        logger.error(f"DEAD-CHIP stuck-holder record has no usable episode start ({raw!r}); the budget runs from now")
+    return now
+
+
+def _dead_chip_victim_pids(scope: str) -> list[int]:
+    """The live pids of ``scope`` when every one is a registered dead-chip stuck holder (spec 04 I77)
+    with its recorded starttime, else []. A scope with no live process, or any other live process,
+    is a running job. Never raises."""
+    with _dead_chip_stuck_lock:
+        registered = {pid: entry[1] for pid, entry in _dead_chip_stuck.items()}
+    if not registered:
+        return []
+    try:
+        procs = job_processes(None, scope=scope)
+    except Exception:  # noqa: BLE001 - an unreadable scope counts as a running job
+        return []
+    if procs and all(p in registered and registered[p] in ("", info.starttime) for p, info in procs.items()):
+        return sorted(procs)
+    return []
 
 
 def _dead_chip_bdfs(chips: list) -> tuple:
@@ -10414,6 +10460,15 @@ async def reconcile_running_scopes():
         readopted_scopes[job_id] = scope
         if logger:
             logger.info(f"RE-ADOPT job_id={job_id} from {scope} (owner={job.owner})")
+        victim = _dead_chip_victim_pids(scope)
+        if victim:
+            # The dead-chip path's victim, re-adopted by a later restart (the first one consumed its
+            # device-fault record): every live process left in its scope is a registered stuck holder.
+            # It is the broker's own kill, not a running job, so it never holds the I70 rung (04 I77).
+            reset_killed_job_ids.add(job_id)
+            if logger:
+                logger.warning(f"RE-ADOPT job_id={job_id} is the dead-chip path's victim: pid(s) {victim} stuck")
+            health_event("scope_readopted_dead_chip_victim", job_id=job_id, scope=scope, pids=victim)
         asyncio.create_task(_monitor_readopted_scope(job_id, scope))
     # A spool no job claims is the output of a job that ended while no broker ran: the log has what
     # was copied, and the uncopied tail is appended to it before the spool goes (spec 01 I17).

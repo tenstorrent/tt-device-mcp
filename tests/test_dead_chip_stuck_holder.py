@@ -34,10 +34,10 @@ RETRY = srv.LEFTOVER_HOST_RUNG_RETRY_SEC
 KILLED = [{"pid": PID, "uid": 1234}]
 
 
-def _stage_holder(proc, pid=PID, *, state="D", sigpnd="0" * 16, fds=("/dev/tenstorrent/3",), maps=None):
-    """A killed holder outside any job scope; ``fds`` its fd targets (None: fd dir unreadable),
-    ``maps`` its mapping paths (None: no maps file, i.e. unreadable)."""
-    _stage(proc, pid, job_id="", state=state, sigpnd=sigpnd, wchan="tt_cdev_mmap")
+def _stage_holder(proc, pid=PID, *, state="D", sigpnd="0" * 16, fds=("/dev/tenstorrent/3",), maps=None, job_id=""):
+    """A killed holder, outside any job scope unless ``job_id``; ``fds`` its fd targets (None: fd dir
+    unreadable), ``maps`` its mapping paths (None: no maps file, i.e. unreadable)."""
+    _stage(proc, pid, job_id=job_id, state=state, sigpnd=sigpnd, wchan="tt_cdev_mmap")
     d = proc / str(pid)
     if fds is not None:
         (d / "fd").mkdir()
@@ -612,6 +612,159 @@ async def test_the_broker_start_restores_before_anything_else(stuck, monkeypatch
     with pytest.raises(RuntimeError, match="stop here"):
         await srv.run_startup_tasks()
     assert calls == ["restore", "journal"]
+
+
+def test_a_concurrent_save_never_puts_back_a_registry_a_later_one_emptied(stuck, monkeypatch):
+    """Two saves race: the first snapshots the holder and is about to rename its write into place
+    when the holder is pruned and a second save runs. The second waits for the first, so the record
+    ends as the registry is (gone), never as the first one's stale snapshot."""
+    _note(stuck)
+    path = srv.health_dir() / srv.DEAD_CHIP_STUCK_FILE
+    real_replace = os.replace
+    second = []
+
+    def replace(src, dst):
+        if not second:
+            srv._dead_chip_stuck.clear()
+            second.append(threading.Thread(target=srv._save_dead_chip_stuck))
+            second[0].start()
+            second[0].join(0.2)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(srv.os, "replace", replace)
+    srv._save_dead_chip_stuck()
+    second[0].join(5)
+    assert not second[0].is_alive()
+    assert not path.exists(), "a stale snapshot overwrote the emptied registry"
+
+
+@pytest.mark.parametrize("since", [float("nan"), float("inf"), -1e30, -5, "garbage", None])
+def test_a_bad_episode_start_restores_the_holders_with_the_clock_from_now(stuck, monkeypatch, since):
+    _note(stuck)
+    _restart(monkeypatch, since=since)
+
+    assert srv._restore_dead_chip_stuck() == [PID]
+    assert srv._dead_chip_stuck_reason() and srv._leftover_budget_sec() == BUDGET
+    assert abs(time.monotonic() - srv._leftover_unkillable_mono) < 5
+    assert abs(time.time() - srv._leftover_unkillable_since) < 5
+
+
+async def test_a_bad_episode_start_does_not_abort_the_broker_start(stuck, monkeypatch):
+    _note(stuck)
+    _restart(monkeypatch, since=float("nan"))
+    monkeypatch.setattr(srv, "_startup_tasks_done", False)
+    monkeypatch.setattr(srv, "journal_interrupted_fabric_check", lambda: None)
+    monkeypatch.setattr(srv, "should_privsep", lambda: (_ for _ in ()).throw(RuntimeError("past the restore")))
+    with pytest.raises(RuntimeError, match="past the restore"):
+        await srv.run_startup_tasks()
+    assert PID in srv._dead_chip_stuck
+
+
+VICTIM = "41"
+OTHER_PID = 6400
+
+
+async def _broker_restart(stuck, monkeypatch, elapsed, scopes):
+    """One broker restart ``elapsed`` s later with ``scopes`` still active: the new process's restore
+    and scope reconciliation, in startup order, on empty job tables."""
+    _restart(monkeypatch, elapsed=elapsed)
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "readopted_scopes", {})
+    monkeypatch.setattr(srv, "reset_killed_job_ids", set())
+    monkeypatch.setattr(srv, "list_active_job_scopes", lambda: {j: f"ttdev-job-{j}.scope" for j in scopes})
+    srv._restore_dead_chip_stuck()
+    await srv.reconcile_running_scopes()
+
+
+@pytest.mark.parametrize("other_job", [False, True], ids=["victim-only", "with-a-live-job"])
+@pytest.mark.parametrize("elapsed", [70, 200], ids=["inside-budget", "past-budget"])
+async def test_a_second_restart_readopts_the_victim_and_the_rung_still_fires(
+    stuck, monkeypatch, tmp_path, elapsed, other_job
+):
+    """The dead-chip path SIGKILLed job 41's process, which stays stuck in D in the job's scope, so
+    the scope stays active. The first restart skips it (its device-fault record) and drops the record;
+    the second re-adopts it as RUNNING with no in-memory kill marker. The victim still does not hold
+    the rung: the request comes by the original episode's 120 s + one tick, or at once when that has
+    passed. A re-adopted job with a live process of its own still holds it."""
+    proc = stuck["proc"]
+    _gone(stuck)
+    _stage_holder(proc, job_id=VICTIM)
+    monkeypatch.setattr(job_reap, "PROC_DIR", str(proc))
+    monkeypatch.setattr(srv, "job_log_dir", str(tmp_path / "logs"))
+    monkeypatch.setattr(srv, "_job_from_log", lambda jid: None)
+    monkeypatch.setattr(srv, "sweep_job_spools", lambda *a: [])
+
+    async def monitor(job_id, scope):
+        return None
+
+    monkeypatch.setattr(srv, "_monitor_readopted_scope", monitor)
+    scopes = [VICTIM]
+    if other_job:
+        _stage(proc, OTHER_PID, job_id="42", state="S", sigpnd="0" * 16, wchan="do_wait")
+        scopes.append("42")
+    stuck["rig"]["beats"] = {str(i): 100 for i in range(EXPECTED) if i != int(CHIP)}
+    _running_job(monkeypatch, VICTIM)
+    srv._mark_job_device_fault_failed(VICTIM, "dead chip 3")
+    _note(stuck)
+
+    await _broker_restart(stuck, monkeypatch, 30, [VICTIM])  # the record covers this one
+    assert VICTIM not in srv.jobs
+    await _broker_restart(stuck, monkeypatch, elapsed - 30, scopes)
+    assert srv.jobs[VICTIM].status is srv.JobStatus.RUNNING
+    assert srv._dead_chip_stuck_reason()
+
+    t0 = srv._leftover_unkillable_mono
+    start = int(time.monotonic() - t0)
+    requested_at = None
+    for s in range(start, max(start, BUDGET) + RETRY + 2):
+        await _tick(t0 + s)
+        if stuck["order"] and requested_at is None:
+            requested_at = s
+    if other_job:
+        assert requested_at is None and stuck["order"] == []
+        assert "42" not in srv.reset_killed_job_ids
+        assert any(
+            r["phase"] == "held" and "a broker job is running" in r["detail"]
+            for r in _events(stuck, "leftover_host_rung")
+        )
+    else:
+        assert requested_at is not None and requested_at <= max(start, BUDGET) + 1
+        assert stuck["order"] == ["power_cycle"]
+        (victim,) = _events(stuck, "scope_readopted_dead_chip_victim")
+        assert victim["job_id"] == VICTIM and victim["pids"] == [PID]
+    assert VICTIM in srv.reset_killed_job_ids
+    assert "released" not in stuck["order"] and "cleared_dirty" not in stuck["order"]
+
+
+def test_a_scope_with_any_other_live_process_is_not_the_victim(stuck, monkeypatch):
+    proc = stuck["proc"]
+    _gone(stuck)
+    _stage_holder(proc, job_id=VICTIM)
+    monkeypatch.setattr(job_reap, "PROC_DIR", str(proc))
+    _note(stuck)
+    assert srv._dead_chip_victim_pids(f"ttdev-job-{VICTIM}.scope") == [PID]
+    _stage(proc, OTHER_PID, job_id=VICTIM, state="S", sigpnd="0" * 16, wchan="do_wait")
+    assert srv._dead_chip_victim_pids(f"ttdev-job-{VICTIM}.scope") == []
+    assert srv._dead_chip_victim_pids("ttdev-job-99.scope") == []
+
+
+def test_the_broker_wires_the_isolation_wait_into_both_fences(stuck, monkeypatch):
+    """boot_broker wires a dead chip's pending endpoint removal (spec 03 I19) into the reset fence and
+    the re-enumeration fence alike, ahead of any leftover; both lift once the removal is done."""
+
+    class Isolation:
+        finished = False
+
+        def done(self):
+            return self.finished
+
+    pending = Isolation()
+    monkeypatch.setattr(srv.sampler, "isolations", [pending], raising=False)
+    for fence in (srv.recovery_mechanism.reset_fence, srv.recovery_mechanism.reenumerate_fence):
+        assert "endpoint removal is still waiting" in fence()
+    pending.finished = True
+    assert srv.recovery_mechanism.reset_fence() == ""
+    assert srv.recovery_mechanism.reenumerate_fence() == ""
 
 
 # --- the dead-chip path calls it -------------------------------------------------------------------
