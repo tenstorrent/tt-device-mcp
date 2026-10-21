@@ -299,6 +299,29 @@ def test_empty_environs_that_stay_empty_cost_one_bounded_window_per_scan(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_the_sweep_ends_a_child_its_first_scan_caught_inside_execve(tmp_path, monkeypatch):
+    """The sweep returns at once when its first scan finds nothing, so that scan must not miss an
+    escaped child (own session, parent gone) caught inside execve: it is signalled, not left
+    behind to outlive the job."""
+    tag = _unique_tag("t-exec-sweep")
+    monkeypatch.setattr(job_reap, "PROC_DIR", str(tmp_path))
+    _stage_proc(tmp_path, 3999050)
+
+    def exec_done(_sec):
+        (tmp_path / "3999050" / "environ").write_bytes(f"{job_reap.JOB_TAG_ENV}={tag}\0".encode())
+
+    monkeypatch.setattr(job_reap, "time", types.SimpleNamespace(monotonic=time.monotonic, sleep=exec_done))
+    signalled = []
+    monkeypatch.setattr(
+        job_reap, "_signal", lambda targets, sig, pgid: signalled.append((sorted(t.pid for t in targets), sig))
+    )
+    monkeypatch.setattr(job_reap, "_alive", lambda info: False)
+
+    assert await job_reap.reap_job_survivors("t10", None, None, tag, log=lambda _m: None) == []
+    assert signalled[0] == ([3999050], signal.SIGTERM)
+
+
+@pytest.mark.asyncio
 async def test_a_found_process_whose_tag_stops_reading_is_still_a_survivor(monkeypatch):
     """Past exit_mm (a SIGKILLed process stuck in the driver's release) a process's environ
     reads empty, so the rescan's tag match no longer finds it. It is the same live process the
