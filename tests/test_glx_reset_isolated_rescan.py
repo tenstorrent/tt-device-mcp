@@ -13,7 +13,6 @@ retry's second reset finished the job: a one-chip drop (class B1) took ~8.5 min 
 
 import asyncio
 import time
-from pathlib import Path
 
 import pytest
 
@@ -30,7 +29,7 @@ from tests.test_no_repeat_failed_rung import (
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base
 
-RESCAN = Path("/sys/bus/pci/rescan")
+RESCAN = base._scoped_rescan  # the reset path's rescan: the Tenstorrent root ports only
 GLX_OK_SEC = 62  # a mesh reset whose driver wait finds every chip
 B1_BUDGET_SEC = 6 * 60
 SETTLE = "\x1b[93mWaiting for 30 seconds: 0\x1b[0m" + "".join(
@@ -69,7 +68,7 @@ def _real_reset_path(monkeypatch, hw, clock, *, chunks=None):
     real_sleep = asyncio.sleep
 
     async def to_thread(fn, *a, **k):
-        if getattr(fn, "__self__", None) == RESCAN:  # the real sysfs write never runs here
+        if fn is RESCAN:  # the real sysfs write never runs here
             hw["rescans"].append("during" if hw["in_reset"] else "after")
             if hw["repowered"]:
                 hw["off"].clear()
@@ -219,7 +218,7 @@ async def test_a_failed_driver_wait_rescan_is_journaled_and_the_reset_runs_on(mo
     calls = []
 
     async def to_thread(fn, *a, **k):
-        if getattr(fn, "__self__", None) == RESCAN and not calls:
+        if fn is RESCAN and not calls:
             calls.append(fn)
             raise PermissionError("read-only sysfs")
         return await fake(fn, *a, **k)
@@ -244,7 +243,7 @@ async def test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan(
     started = []
 
     async def to_thread(fn, *a, **k):
-        if getattr(fn, "__self__", None) == RESCAN:
+        if fn is RESCAN:
             started.append(time.monotonic())
             await gate.wait()
         return None
@@ -298,7 +297,7 @@ async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_res
     real_sleep = asyncio.sleep
 
     async def to_thread(fn, *a, **k):
-        if getattr(fn, "__self__", None) == RESCAN:
+        if fn is RESCAN:
             rescans.append("driver wait" if not rescans else "after")
             if len(rescans) == 1:
                 await gate.wait()  # a slow sysfs write, still running when tt-smi exits
@@ -357,7 +356,7 @@ async def test_output_after_a_cancelled_reset_starts_no_driver_wait_rescan(
     rescans, seen, feed = [], [], []
 
     async def to_thread(fn, *a, **k):
-        if getattr(fn, "__self__", None) == RESCAN:
+        if fn is RESCAN:
             rescans.append(fn)
         return None
 

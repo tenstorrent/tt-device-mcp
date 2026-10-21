@@ -197,6 +197,24 @@ def returned_chips(ids) -> list[str]:
     return sorted(back, key=int)
 
 
+def arc_live_chips(ids) -> list[str]:
+    """Of ``ids``, the chips whose ARC heartbeat reads as a counter now: not all-ones, not an
+    ENODATA (ARC not ready) or other failed read. Stricter than :func:`returned_chips`: a chip a
+    bridge reset re-enumerated with its ARC dead is back on the bus but not recovered (spec 04 I94)."""
+    want = {str(i) for i in ids}
+    if not want:
+        return []
+    # Only these chips, and a lost-marked one too: a decision read, so it is judged on its answer.
+    beats = read_heartbeats(probe_lost=True, only=frozenset(want))
+    return sorted((i for i in want if i in beats and beats[i] != ALL_ONES), key=int)
+
+
+def heartbeat_attr_present(ids) -> bool:
+    """Does any of ``ids``' sysfs nodes expose ``tt_heartbeat``? A stat, no chip read. False on a
+    host whose KMD predates the counter."""
+    return any((pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}" / "tt_heartbeat").exists() for i in ids)
+
+
 def heartbeat_absence_reason() -> Optional[str]:
     """Why read_heartbeats() came back empty, or None if a heartbeat is exposed.
 

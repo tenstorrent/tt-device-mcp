@@ -11,7 +11,6 @@ rescan (I81/I78) starts only once the output shows the re-power went out. Device
 """
 
 import asyncio
-from pathlib import Path
 
 import pytest
 
@@ -24,8 +23,9 @@ from tt_device_mcp import server as srv
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import OUTCOME_TERMINAL, galaxy, ipmi_guard
+from tt_device_mcp.health.recovery import base as recovery_base
 
-RESCAN = Path("/sys/bus/pci/rescan")
+RESCAN = recovery_base._scoped_rescan  # the closing rescan: the Tenstorrent root ports only
 _REAL_SLEEP = asyncio.sleep  # the fake launch yields for real, so the driver-wait watcher's task can start
 REMOVED = "31"
 # Nothing is enumerated at this address in the fake sysfs, so the record stands (chip still off the bus).
@@ -39,11 +39,11 @@ IPMI_FAILED = "Issuing USER_RESET on 32 devices before IPMI reset...\nRuntimeErr
 
 
 def _count_rescans(monkeypatch) -> list:
-    """Record every write to /sys/bus/pci/rescan (the real one never runs); other threads run inline."""
+    """Record every scoped PCI rescan (the real one never runs); other threads run inline."""
     writes: list = []
 
     async def to_thread(fn, *a, **k):
-        if getattr(fn, "__self__", None) == RESCAN:
+        if fn is RESCAN:
             writes.append(a)
             return None
         return fn(*a, **k)
@@ -114,7 +114,7 @@ async def test_a_failed_mesh_reset_withholds_the_rescan_of_an_unreset_removed_ch
     _launch(monkeypatch, rig, rc, chunks)
     got, _ = await rig["m"].reset_with_quiesce(MESH, lambda m: None)
     assert got != 0
-    assert writes == [], "no global rescan re-enumerates the removed chip the reset did not reach"
+    assert writes == [], "no rescan re-enumerates the removed chip the reset did not reach"
     after = [f for f in _withheld(rig) if "at" not in f]
     assert len(after) == 1 and after[0]["reason"] == "mesh_reset_failed"
     assert after[0]["chips"] == [REMOVED] and after[0]["unreset"] == [REMOVED]

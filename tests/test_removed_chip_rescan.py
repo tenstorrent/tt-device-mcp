@@ -8,7 +8,6 @@ it. These tests build a fake sysfs (one bridge per chip) and record the order of
 rescans."""
 
 import asyncio
-import pathlib
 
 import pytest
 
@@ -19,14 +18,13 @@ from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy, pcie_guard
 from tt_device_mcp.health.recovery.stages import bridge_reset as bridge
 
-RESCAN = "/sys/bus/pci/rescan"
 # chip index -> (its BDF, its bridge's BDF); the bridge's secondary bus is the chip's bus.
 CHIPS = {"13": ("0000:46:00.0", "0000:40:01.1"), "14": ("0000:47:00.0", "0000:40:01.2")}
 
 
 class FakeBus:
     """Fake /sys/bus/pci/devices and /sys/class/tenstorrent. ``trace`` records ("sbr", bridge) for
-    each Secondary Bus Reset assert and ("rescan",) for each global rescan. A rescan brings back
+    each Secondary Bus Reset assert and ("rescan",) for each scoped rescan. A rescan brings back
     every chip whose bridge was reset since its remove (``come_back`` False: none)."""
 
     def __init__(self, tmp_path, monkeypatch, come_back=True):
@@ -45,17 +43,14 @@ class FakeBus:
             self.enumerate(idx)
         monkeypatch.setattr(bridge.subprocess, "run", self.setpci)
         monkeypatch.setattr(bridge.time, "sleep", lambda s: None)
-        real_write = pathlib.Path.write_text
 
-        def write_text(path, data, *a, **k):
-            if str(path) == RESCAN:
-                self.trace.append(("rescan",))
-                for idx in sorted(self.reset_since_remove) if self.come_back else []:
-                    self.enumerate(idx)
-                return len(data)
-            return real_write(path, data, *a, **k)
+        def rescan():
+            self.trace.append(("rescan",))
+            for idx in sorted(self.reset_since_remove) if self.come_back else []:
+                self.enumerate(idx)
+            return ["0000:40:01.0"]
 
-        monkeypatch.setattr(pathlib.Path, "write_text", write_text)
+        monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", rescan)
 
     def enumerate(self, idx):
         bdf, br = CHIPS[idx]

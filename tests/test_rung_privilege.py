@@ -13,7 +13,7 @@ import pytest
 import tt_device_mcp.server as srv
 from tt_device_mcp import privileges
 from tt_device_mcp.health.recovery import base as recovery_base
-from tt_device_mcp.health.recovery import galaxy
+from tt_device_mcp.health.recovery import galaxy, pcie_guard
 from tt_device_mcp.health.recovery.stages import bridge_reset
 
 
@@ -212,7 +212,8 @@ async def test_without_setpci_the_rescan_still_runs_and_no_chip_is_called_no_bri
     the endpoint left the bus, which `_classify_hold` escalates straight to a power cycle."""
     _latch(monkeypatch, root=True, systemd=True, ipmitool=True, ipmi_node=True)  # no setpci
     rescanned = []
-    monkeypatch.setattr(recovery_base.Path, "write_text", lambda self, text: rescanned.append(str(self)), raising=False)
+    # The bare rescan writes only the Tenstorrent root ports' buses (spec 04 I95).
+    monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", lambda: rescanned.append("tt root ports") or ["p"])
     mech = srv.galaxy_recovery
     monkeypatch.setattr(mech.deps, "isolated_chips", lambda: {"0", "1"})
     monkeypatch.setattr(mech.deps, "device_pci_map", lambda: {"0": "0000:31:00.0", "1": "0000:4b:00.0"})
@@ -226,7 +227,7 @@ async def test_without_setpci_the_rescan_still_runs_and_no_chip_is_called_no_bri
     assert set(reasons) == {"0", "1"}, "every target needs a recorded window"
     assert all(r["reason"] == "no_privilege" for r in reasons.values()), reasons
     assert ("bridge_reset", "blocked") in fired, "operator-fixable, so not not_applicable"
-    assert any("rescan" in path for path in rescanned), f"the cheap rung was skipped: {rescanned}"
+    assert rescanned, "the cheap rung was skipped"
 
 
 def test_the_force_escalate_kill_switch_warns_that_the_hold_bound_ignores_it(monkeypatch, said):

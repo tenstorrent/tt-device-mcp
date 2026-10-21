@@ -1460,7 +1460,7 @@ cooldown (spec 04 I65) holds longer.
   the closing rescan, which would queue behind it. (4) Only when every confirmed chip was removed
   are the pollers stopped (and owed, I66) and the readers sent SIGTERM, then SIGKILL 10 s later
   (`reset_inflight_readers_cut`), awaited at most 30 s. The reset's closing rescan (and spec 04
-  I81's driver-wait rescan) write `/sys/bus/pci/rescan` with a 30 s bound through the same
+  I81's driver-wait rescan) rescan only the Tenstorrent root ports (spec 04 I95) with a 30 s bound through the same
   one in-flight PCI writer (spec 04 I76): while a remove is still blocked, they are refused at once
   and PCI-wedged latches.
   A removed chip is in `isolated_chips`, so the closing rescan re-adds it if it answers now; one
