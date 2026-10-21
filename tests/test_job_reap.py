@@ -209,76 +209,77 @@ def test_scope_membership_reads_the_cgroup(tmp_path, monkeypatch):
     assert sorted(found) == [500, 501]
 
 
-def _stage_proc(root, pid, *, environ: bytes, state="S", flags=0):
-    """A fake /proc/<pid> in its own session and group, found only by its environ (the tag)."""
+def test_the_broker_and_init_are_never_job_processes(monkeypatch):
+    monkeypatch.setattr(job_reap, "_read_tag", lambda pid, tag: True)
+    found = job_reap.job_processes(None, None, "anything")
+    assert os.getpid() not in found
+    assert 1 not in found
+
+
+def _stage_proc(root, pid: int, environ: bytes = b"", state: str = "S", flags: int = 0) -> None:
+    """A /proc/<pid> of a process in its own session whose parent is gone."""
     d = root / str(pid)
     d.mkdir()
-    rest = [state, "1", str(pid), str(pid), "0", "0", str(flags)] + ["0"] * 12 + ["1000"]
-    (d / "stat").write_text(f"{pid} (x y) " + " ".join(rest) + "\n")
+    rest = [state, "1", str(pid), str(pid), "0", "-1", str(flags)] + ["0"] * 12 + ["1000"]
+    (d / "stat").write_text(f"{pid} (sleep) " + " ".join(rest) + "\n")
     (d / "environ").write_bytes(environ)
 
 
-def _count_sleeps(monkeypatch, on_sleep=lambda: None) -> list[float]:
-    sleeps: list[float] = []
-
-    def sleep(sec):
-        sleeps.append(sec)
-        on_sleep()
-
-    monkeypatch.setattr(job_reap, "time", types.SimpleNamespace(sleep=sleep), raising=False)
-    return sleeps
-
-
-def test_an_escaped_child_caught_mid_exec_is_found_on_the_re_read(tmp_path, monkeypatch):
-    """Inside execve a process's environ reads empty, so an escaped child (own session, parent
-    gone) looks untagged. The scan reads it once more after a short delay instead of missing it."""
+def test_a_child_scanned_inside_execve_is_still_found_by_its_tag(tmp_path, monkeypatch):
+    """A process inside execve reads an empty environ until the new image's is mapped (seen as
+    comm 'sleep' with 0 environ bytes when the sweep missed a just-spawned setsid child). Ruled
+    out on that one read, it would outlive the sweep and touch the device under the next job."""
+    tag = _unique_tag("t-exec")
     monkeypatch.setattr(job_reap, "PROC_DIR", str(tmp_path))
-    tag = "t-exec"
-    _stage_proc(tmp_path, 600, environ=b"")
-    _stage_proc(tmp_path, 601, environ=b"PATH=/bin\0")
-    filled = f"PATH=/bin\0{job_reap.JOB_TAG_ENV}={tag}\0".encode()
-    sleeps = _count_sleeps(monkeypatch, lambda: (tmp_path / "600" / "environ").write_bytes(filled))
+    _stage_proc(tmp_path, 3999001)
+    reads = []
 
-    assert sorted(job_reap.job_processes(None, None, tag)) == [600]
-    assert len(sleeps) == 1 and sleeps[0] <= 0.1
+    def exec_done(_sec):
+        reads.append(1)
+        (tmp_path / "3999001" / "environ").write_bytes(f"PATH=/bin\0{job_reap.JOB_TAG_ENV}={tag}\0".encode())
+
+    monkeypatch.setattr(job_reap, "time", types.SimpleNamespace(monotonic=time.monotonic, sleep=exec_done))
+    assert sorted(job_reap.job_processes(None, None, tag)) == [3999001]
+    assert reads, "found on a re-read, not the first one"
 
 
-def test_an_environ_that_stays_empty_costs_one_bounded_re_read(tmp_path, monkeypatch):
-    """A process really started with no environment is not the job's, and the many of them cost
-    one delay per scan, not one each."""
+def test_a_kernel_thread_or_zombie_with_no_environ_is_not_re_read(tmp_path, monkeypatch):
     monkeypatch.setattr(job_reap, "PROC_DIR", str(tmp_path))
-    for pid in (610, 611, 612):
-        _stage_proc(tmp_path, pid, environ=b"")
-    sleeps = _count_sleeps(monkeypatch)
+    _stage_proc(tmp_path, 3999002, flags=job_reap._PF_KTHREAD | 0x40)
+    _stage_proc(tmp_path, 3999003, state="Z")
+    _stage_proc(tmp_path, 3999004, environ=b"PATH=/bin\0")
 
+    def no_wait(_sec):
+        pytest.fail("only an empty environ of a live user process is re-read")
+
+    monkeypatch.setattr(job_reap, "time", types.SimpleNamespace(monotonic=time.monotonic, sleep=no_wait))
+    assert job_reap.job_processes(None, None, "t-none") == {}
+
+
+def test_empty_environs_that_stay_empty_cost_one_bounded_window_per_scan(tmp_path, monkeypatch):
+    """A process started with an empty environment reads empty for good: each scan waits for
+    such processes once, together, never once each."""
+    monkeypatch.setattr(job_reap, "PROC_DIR", str(tmp_path))
+    for pid in range(3999010, 3999040):
+        _stage_proc(tmp_path, pid)
+    start = time.monotonic()
     assert job_reap.job_processes(None, None, "t-empty") == {}
-    assert len(sleeps) == 1 and sleeps[0] <= 0.1
-
-
-def test_readable_environs_kernel_threads_and_zombies_add_no_wait(tmp_path, monkeypatch):
-    """The normal path pays nothing: every user process's environ reads, and the empty environ
-    of a kernel thread or a zombie is expected, not a process caught mid-exec."""
-    monkeypatch.setattr(job_reap, "PROC_DIR", str(tmp_path))
-    tag = "t-normal"
-    _stage_proc(tmp_path, 620, environ=f"{job_reap.JOB_TAG_ENV}={tag}\0".encode())
-    _stage_proc(tmp_path, 621, environ=b"PATH=/bin\0")
-    _stage_proc(tmp_path, 622, environ=b"", flags=0x00200040)
-    _stage_proc(tmp_path, 623, environ=b"", state="Z")
-    sleeps = _count_sleeps(monkeypatch)
-
-    assert sorted(job_reap.job_processes(None, None, tag)) == [620]
-    assert sleeps == []
+    assert time.monotonic() - start < 10 * job_reap.TAG_REREAD_SEC
 
 
 @pytest.mark.asyncio
-async def test_the_sweep_ends_a_child_its_first_scan_caught_mid_exec(tmp_path, monkeypatch):
-    """The sweep returns at once when its first scan finds nothing, so that scan must not miss a
-    child caught mid-exec: it is signalled, not left behind (spec 01 I4)."""
+async def test_the_sweep_ends_a_child_its_first_scan_caught_inside_execve(tmp_path, monkeypatch):
+    """The sweep returns at once when its first scan finds nothing, so that scan must not miss an
+    escaped child (own session, parent gone) caught inside execve: it is signalled, not left
+    behind to outlive the job."""
+    tag = _unique_tag("t-exec-sweep")
     monkeypatch.setattr(job_reap, "PROC_DIR", str(tmp_path))
-    tag = "t-exec-sweep"
-    _stage_proc(tmp_path, 630, environ=b"")
-    filled = f"{job_reap.JOB_TAG_ENV}={tag}\0".encode()
-    _count_sleeps(monkeypatch, lambda: (tmp_path / "630" / "environ").write_bytes(filled))
+    _stage_proc(tmp_path, 3999050)
+
+    def exec_done(_sec):
+        (tmp_path / "3999050" / "environ").write_bytes(f"{job_reap.JOB_TAG_ENV}={tag}\0".encode())
+
+    monkeypatch.setattr(job_reap, "time", types.SimpleNamespace(monotonic=time.monotonic, sleep=exec_done))
     signalled = []
     monkeypatch.setattr(
         job_reap, "_signal", lambda targets, sig, pgid: signalled.append((sorted(t.pid for t in targets), sig))
@@ -286,14 +287,31 @@ async def test_the_sweep_ends_a_child_its_first_scan_caught_mid_exec(tmp_path, m
     monkeypatch.setattr(job_reap, "_alive", lambda info: False)
 
     assert await job_reap.reap_job_survivors("t10", None, None, tag, log=lambda _m: None) == []
-    assert signalled[0] == ([630], signal.SIGTERM)
+    assert signalled[0] == ([3999050], signal.SIGTERM)
 
 
-def test_the_broker_and_init_are_never_job_processes(monkeypatch):
-    monkeypatch.setattr(job_reap, "_has_tag", lambda pid, tag: True)
-    found = job_reap.job_processes(None, None, "anything")
-    assert os.getpid() not in found
-    assert 1 not in found
+@pytest.mark.asyncio
+async def test_a_found_process_whose_tag_stops_reading_is_still_a_survivor(monkeypatch):
+    """Past exit_mm (a SIGKILLed process stuck in the driver's release) a process's environ
+    reads empty, so the rescan's tag match no longer finds it. It is the same live process the
+    first scan found, so it is still named, and the device stays held."""
+    proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        info = job_reap._read_stat(proc.pid)
+        scans = iter([{proc.pid: info}, {}])
+        monkeypatch.setattr(job_reap, "job_processes", lambda *a: next(scans))
+        monkeypatch.setattr(job_reap.os, "kill", lambda *a: None)
+        monkeypatch.setattr(job_reap.os, "killpg", lambda *a: None)
+        monkeypatch.setattr(job_reap, "_holds_device", lambda pid: True)
+        survivors = await job_reap.reap_job_survivors(
+            "t10", None, None, "t-exit", term_grace_sec=0.1, kill_wait_sec=0.1, release_wait_sec=0, log=lambda _m: None
+        )
+        assert [s.pid for s in survivors] == [proc.pid]
+        assert survivors[0].holds_device is True
+    finally:
+        monkeypatch.undo()
+        proc.kill()
+        proc.wait()
 
 
 @pytest.mark.asyncio

@@ -39,12 +39,14 @@ logger = logging.getLogger("tt-device-mcp")
 PROC_DIR = "/proc"
 # Exported into every job's shell with a value unique to that run; children inherit it.
 JOB_TAG_ENV = "TT_DEVICE_MCP_JOB_TAG"
+# An empty /proc/<pid>/environ does not prove the tag absent: a process inside execve reads empty
+# until the new image's environment is mapped, and one past exit_mm reads empty for good. Such a
+# process (not a kernel thread or zombie, which never have one) is re-read, bounded for the whole
+# scan, before it is ruled out.
+TAG_REREAD_SEC = 0.1
+_TAG_REREAD_POLL_SEC = 0.002
+_PF_KTHREAD = 0x00200000
 _POLL_SEC = 0.1
-# While a process is inside execve its environ reads empty (the new mm has no env yet), so a
-# tagged child caught there looks untagged. One re-read after this delay settles it; the exec
-# window is microseconds. Paid only when some live user process reads an empty environ.
-ENVIRON_REREAD_SEC = 0.05
-_PF_KTHREAD = 0x00200000  # stat flags bit: a kernel thread, which has no environ to wait for
 
 
 @dataclass(frozen=True)
@@ -55,7 +57,6 @@ class ProcInfo:
     sid: int
     state: str
     starttime: str
-    flags: int = 0
 
 
 @dataclass(frozen=True)
@@ -89,7 +90,6 @@ def _read_stat(pid: int) -> Optional[ProcInfo]:
             pgid=int(rest[2]),
             sid=int(rest[3]),
             starttime=rest[19],
-            flags=int(rest[6]),
         )
     except (IndexError, ValueError):
         return None
@@ -108,17 +108,52 @@ def _in_scope(pid: int, scope: str) -> bool:
     return False
 
 
-def _has_tag(pid: int, tag: str) -> Optional[bool]:
-    """Whether ``pid`` carries the job tag; None when its environ reads empty (mid-execve,
-    exiting, or a process really started with no environment), so it cannot tell yet."""
+def _read_tag(pid: int, tag: str) -> Optional[bool]:
+    """Whether ``pid`` carries ``tag``; None when its environ reads empty but it is a live user
+    process, so the read cannot tell (mid-execve, or exiting)."""
     try:
         with open(f"{PROC_DIR}/{pid}/environ", "rb") as f:
             raw = f.read()
     except OSError:
         return False
-    if not raw:
-        return None
-    return f"{JOB_TAG_ENV}={tag}".encode() in raw.split(b"\0")
+    if raw:
+        return f"{JOB_TAG_ENV}={tag}".encode() in raw.split(b"\0")
+    try:
+        with open(f"{PROC_DIR}/{pid}/stat") as f:
+            rest = f.read().rsplit(")", 1)[1].split()
+        if rest[0] in ("Z", "X") or int(rest[6]) & _PF_KTHREAD:
+            return False
+    except (OSError, IndexError, ValueError):
+        return False
+    return None
+
+
+def _tagged(pids: Iterable[int], tag: str) -> set[int]:
+    """The pids that carry ``tag``. One whose read cannot tell is re-read until it can, for at
+    most ``TAG_REREAD_SEC`` across all of them; still undecided then, it is ruled out."""
+    found, unsure = set(), []
+    for p in pids:
+        has = _read_tag(p, tag)
+        if has:
+            found.add(p)
+        elif has is None:
+            unsure.append(p)
+    deadline = time.monotonic() + TAG_REREAD_SEC
+    while unsure and time.monotonic() < deadline:
+        time.sleep(_TAG_REREAD_POLL_SEC)
+        still = []
+        for p in unsure:
+            has = _read_tag(p, tag)
+            if has:
+                found.add(p)
+            elif has is None:
+                still.append(p)
+        unsure = still
+    return found
+
+
+def _has_tag(pid: int, tag: str) -> bool:
+    return pid in _tagged((pid,), tag)
 
 
 def _cmdline(pid: int) -> str:
@@ -166,22 +201,13 @@ def job_processes(pid: Optional[int], scope: Optional[str] = None, tag: Optional
     Never includes the broker itself or pid 1, whatever /proc says."""
     procs = _all_procs()
     exclude = {os.getpid(), 1, 0}
-    members = set()
-    unread = []
-    for p, info in procs.items():
-        if (pid and (info.pgid == pid or info.sid == pid or p == pid)) or (scope and _in_scope(p, scope)):
-            members.add(p)
-        elif tag and p not in exclude:
-            has = _has_tag(p, tag)
-            if has:
-                members.add(p)
-            elif has is None and info.state not in ("Z", "X") and not info.flags & _PF_KTHREAD:
-                unread.append(p)
-    if unread:
-        # A child that escaped the group and session and is mid-exec is found only by its tag:
-        # read those environs once more rather than miss it (the sweep's first scan decides).
-        time.sleep(ENVIRON_REREAD_SEC)
-        members.update(p for p in unread if _has_tag(p, tag))
+    members = {
+        p
+        for p, info in procs.items()
+        if (pid and (info.pgid == pid or info.sid == pid or p == pid)) or (scope and _in_scope(p, scope))
+    }
+    if tag:
+        members |= _tagged((p for p in procs if p not in exclude and p not in members), tag)
     # Descendants of any member: a child that left the group or session but whose parent
     # chain is still intact.
     children: dict[int, list[int]] = {}
@@ -271,6 +297,10 @@ async def reap_job_survivors(
                 await device_holders.wait_device_released(holding, release_wait_sec - kill_wait_sec)
         # Re-scan: anything the job forked during the sweep is a survivor too.
         rescan = await asyncio.to_thread(job_processes, pid, scope, tag)
+        # A process the first scan found stays the job's while it lives (_alive checks the
+        # starttime): past exit_mm, stuck in the driver's release, its tag no longer reads.
+        for p, i in found.items():
+            rescan.setdefault(p, i)
         survivors = [
             Survivor(pid=p, state=i.state, cmdline=_cmdline(p), holds_device=_holds_device(p), starttime=i.starttime)
             for p, i in sorted(rescan.items())
