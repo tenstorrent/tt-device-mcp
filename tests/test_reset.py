@@ -1707,6 +1707,37 @@ async def test_a_readopted_job_killed_by_a_forced_reset_does_not_flag_the_device
     assert "[KILLED by device reset]" in log.read_text()
 
 
+@pytest.mark.asyncio
+async def test_a_readopted_job_recovery_killed_ends_killed_with_its_cause(monkeypatch, tmp_path, clear_job_state):
+    """Spec 01 I70: a dead-chip holder-kill of a re-adopted job leaves no exit status. The monitor
+    must still say KILLED with recovery's cause, never FAILED with "the broker restarted"."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    log = tmp_path / "run_909.log"
+    log.write_text("... running ...\nown-stderr\n")
+    job = srv.Job(
+        id="909-1", owner="carol", workspace="/w", command="pytest", queued_at="", status=srv.JobStatus.RUNNING
+    )
+    job.log_file = str(log)
+    srv.jobs["909-1"] = job
+    scope = srv.job_scope_unit("909-1")
+    monkeypatch.setattr(srv, "readopted_scopes", {"909-1": scope})
+    srv._mark_job_device_fault_failed("909-1", "device recovery kill: chip 5 left the PCIe bus")
+
+    await srv._monitor_readopted_scope("909-1", scope)
+
+    assert job.status == srv.JobStatus.KILLED and "chip 5 left the PCIe bus" in job.error
+    assert "restarted" not in job.error
+    assert not srv._device_unavailable_for_tenant(), "a recovery-killed job must not flag the device"
+    text = log.read_text()
+    assert f"{srv.RECOVERY_KILL_MARKER} killed by device recovery (chip 5 left the PCIe bus)" in text
+    assert srv.RESET_KILL_MARKER not in text, "one kill line, not two"
+    assert "909-1" not in srv.reset_killed_job_ids and "909-1" not in srv.reset_killed_causes
+
+
 def test_killing_a_readopted_job_holds_the_device_until_its_scope_ends(monkeypatch, tmp_path):
     """A kill marks the job KILLED at once, but its scope gets up to GRACEFUL_KILL_GRACE_SEC to exit.
     Its `readopted_scopes` entry is what keeps the runner from dispatching and a reset from running

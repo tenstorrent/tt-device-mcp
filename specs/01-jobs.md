@@ -385,6 +385,21 @@ the queue and a running job outlive the broker process.
   log that never reached `[Started at ...]`, so a running job cannot fake it. The kill of a
   running job, and every gate, reset, hold and recovery path, are unchanged, so no fault class's
   time-to-recover changes.
+- **I70** — A job the broker's own recovery killed (a dead-chip holder-kill, a reset that took the
+  device from it) shows `KILLED` with its kill cause before or with its terminal status, never
+  `FAILED` from its signal exit and never with its own stderr as the cause. `_mark_job_device_fault_failed`
+  records why recovery killed it (`reset_killed_causes`). When the job's exit makes it terminal, the
+  runner, under the one `get_lock()` that sets its status and with no await in between, appends
+  `[KILLED by device recovery] <cause>` to its log, sets that cause as its error and the status
+  `KILLED`, before the scope stop, the sweep and the footer. Its error keeps the job's own output
+  tail, with the kill line last. A re-adopted job's monitor does the same instead of the `FAILED`
+  "the broker restarted" verdict its missing exit status would give; a re-adopted job a forced reset
+  claimed keeps its `[KILLED by device reset]` line. The recent list reads either line as
+  `broker-kill` with the line's cause, and labels a footerless log of a job already terminal in memory
+  with that job's status and cause, never `interrupted`. A recovery kill wins over the exit status at
+  the flip, so the outcome stats count it `KILLED`. The scope stop still sees the exit's status for
+  its interrupted flag, the preemption path (already one step) is unchanged, and no gate, reset, hold
+  or recovery step changes, so no fault class's time-to-recover changes.
 
 ## Interfaces
 
@@ -568,8 +583,10 @@ flowchart LR
   clock (spec 03, B-post-job clock check), mark the mesh-rest clock, and sweep retention (I13).
   The finished job's caller is released before the post-job gate, so the gate never
   bills the finished job.
-- A job killed by the broker's own recovery gets the real cause written into its error
-  and log (`killed by device recovery: ...`) instead of being read as its own crash.
+- A job killed by the broker's own recovery gets the real cause, the reason recovery killed
+  it, written into its error and log (`[KILLED by device recovery] killed by device recovery
+  (<reason>): ...`) in the same step that marks it `KILLED`, instead of being read as its own
+  crash (I70).
 
 ### Broker shutdown and re-adoption
 
@@ -673,6 +690,7 @@ flowchart LR
 | I21 | `tests/test_verification_jobs.py::test_only_an_operator_running_exactly_one_shipped_check_is_a_verification_job`, `tests/test_verification_jobs.py::test_a_verification_job_queues_at_the_head_and_tenants_stay_fifo`, `tests/test_verification_jobs.py::test_a_job_handed_back_goes_first_among_the_tenants_behind_the_head`, `tests/test_verification_jobs.py::test_only_a_fabric_only_hold_counts`, `tests/test_verification_jobs.py::test_a_held_tenant_yields_to_a_verification_job_that_lifts_the_hold`, `tests/test_verification_jobs.py::test_a_verification_job_passes_no_other_hold`, `tests/test_verification_jobs.py::test_a_held_tenant_does_not_yield_without_a_waiting_verification_job`, `tests/test_verification_jobs.py::test_a_passing_fabric_check_lifts_the_hold`, `tests/test_verification_jobs.py::test_a_passing_check_without_the_full_check_after_the_last_reset_does_not_lift`, `tests/test_verification_jobs.py::test_a_passing_check_settles_the_post_reset_debt_and_lifts`, `tests/test_verification_jobs.py::test_a_refused_release_is_not_reported_as_a_lift`, `tests/test_verification_jobs.py::test_a_pass_on_the_discovered_links_lifts_nothing`, `tests/test_verification_jobs.py::test_nothing_else_lifts_the_hold`, `tests/test_verification_jobs.py::test_a_check_run_with_another_environment_does_not_lift`, `tests/test_verification_jobs.py::test_under_privsep_the_job_env_is_only_its_env_vars`, `tests/test_verification_jobs.py::test_restore_puts_a_verification_job_back_at_the_head` |
 | I66 (a job_run client cancel or disconnect kills its job, whole process group; opt-out keeps it; a queued job is cancelled; job_run_bg unchanged) | `tests/test_job_kill_reset.py::test_a_disconnect_kills_the_whole_process_group`, `tests/test_job_kill_reset.py::test_keep_running_on_disconnect_leaves_the_job_running`, `tests/test_job_kill_reset.py::test_a_cancel_while_queued_cancels_the_job`, `tests/test_job_kill_reset.py::test_the_kill_runs_on_its_own_task_outside_the_cancelled_scope` |
 | I69 (a job cancelled while queued: footer `STATUS: killed` after a marker; the recent list says killed, not abandoned) | `tests/test_recent_jobs.py::test_a_job_cancelled_while_queued_gets_a_footer_and_reads_killed_everywhere`, `tests/test_recent_jobs.py::test_a_running_job_that_prints_the_cancel_marker_is_not_read_as_cancelled` |
+| I70 (a recovery-killed job is `KILLED` with recovery's cause, its log line written, before the sweep; a re-adopted one too, not "the broker restarted"; the recent list reads both kill lines as `broker-kill` and a footerless terminal job by its in-memory status; the per-test reset drops the causes) | `tests/test_job_kill_reset.py::test_a_recovery_kill_is_killed_with_its_cause_before_the_sweep`, `tests/test_reset.py::test_a_readopted_job_recovery_killed_ends_killed_with_its_cause`, `tests/test_recent_jobs.py::test_job_killed_by_a_device_reset_gets_broker_kill_status_and_cause`, `tests/test_recent_jobs.py::test_a_terminal_job_before_its_footer_shows_its_status_and_cause`, `tests/test_recent_jobs.py::test_job_killed_by_recovery_gets_broker_kill_status_and_cause`, `tests/test_test_isolation.py::test_the_per_test_reset_clears_every_hold_bound_and_escalation_global` |
 | I68 | `tests/test_job_preflight.py::test_a_root_owned_existing_dir_is_refused_with_its_owner_and_mode`, `tests/test_job_preflight.py::test_a_writable_dir_passes`, `tests/test_job_preflight.py::test_a_missing_dir_with_a_writable_parent_passes_and_is_not_created`, `tests/test_job_preflight.py::test_a_missing_dir_with_an_unwritable_parent_is_refused_naming_the_parent`, `tests/test_job_preflight.py::test_tt_metal_logs_path_overrides_the_workspace`, `tests/test_job_preflight.py::test_a_missing_workspace_is_left_to_the_job_not_called_an_output_dir_problem`, `tests/test_job_preflight.py::test_the_override_is_what_gets_checked`, `tests/test_job_preflight.py::test_the_runner_fails_the_job_at_the_door_and_spawns_nothing`, `tests/test_job_preflight.py::test_the_runner_checks_as_the_privsep_submitter_with_only_its_env`, `tests/test_job_preflight.py::test_a_preflight_that_errors_or_hangs_lets_the_job_through` |
 | B-Submission (burst cap) | `tests/test_device_safety.py::test_an_armed_burst_cap_refuses_one_owners_flood_but_not_another`, `tests/test_device_safety.py::test_the_default_off_burst_cap_admits_every_submit`, `tests/test_device_safety.py::test_job_burst_decision_prunes_the_window_and_gates_on_the_cap[2-60.0-recent2-110.0-False-50.0-expect_kept2]` |
 | B-Submission (owner derived from the peer uid and the surface) | `tests/test_device_safety.py::test_the_owner_comes_from_the_peer_uid_and_the_surface` |

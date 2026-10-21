@@ -547,3 +547,28 @@ def test_a_failed_save_never_breaks_recovery(tmp_path, monkeypatch):
     monkeypatch.setattr(pci.evidence, "health_dir", boom)
     bus.remove("13")
     assert pci.removed_chip_ids() == ["13"]
+
+
+@pytest.mark.asyncio
+async def test_status_shows_the_bridge_rung_as_a_device_reset(tmp_path, monkeypatch, rung):
+    """Spec 04 I90: the bridge rung narrates as a device reset, and /status carries that as a field
+    (``device_resetting``, the op row's ``resetting``), so a reader needs no row-text match."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    bus.remove("13")
+    srv.device_op_lock = None
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    seen = []
+
+    def detail(d):
+        srv.device_op_detail = d
+        seen.append((d, srv._get_queue_status()))
+
+    monkeypatch.setattr(srv, "_set_device_op_detail", detail)
+    async with srv._device_op("health-gate/post-job"):
+        assert srv._get_queue_status()["device_resetting"] is False, "a held op is not a reset"
+        assert await _run({"13"}) is True
+    d, status = seen[0]
+    assert d.startswith("device reset: bridge reset of chip(s) 13"), d
+    assert status["device_resetting"] is True
+    assert status["running"][0]["resetting"] is True and status["running"][0]["owner"] == "[broker]"
+    assert srv._get_queue_status()["device_resetting"] is False, "over once the op ends"
