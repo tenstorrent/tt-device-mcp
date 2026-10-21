@@ -17,6 +17,7 @@ import asyncio
 import errno
 import os
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -27,9 +28,17 @@ import pytest
 
 import tt_device_mcp.server as srv
 from tests.conftest import fsm_healthy, patch_recovery
+from tt_device_mcp import exit_witness
 from tt_device_mcp.cli import overview_lines
 from tt_device_mcp.device_holders import HolderScan
-from tt_device_mcp.exit_witness import PROC_EVENT_EXIT, PROC_EVENT_FORK, ExitWitness, parse_events
+from tt_device_mcp.exit_witness import (
+    PROC_CN_MCAST_IGNORE,
+    PROC_CN_MCAST_LISTEN,
+    PROC_EVENT_EXIT,
+    PROC_EVENT_FORK,
+    ExitWitness,
+    parse_events,
+)
 from tt_device_mcp.fsm import ServerState
 
 
@@ -855,8 +864,6 @@ def test_the_witness_reports_the_jobs_own_exit_status():
 def test_closing_the_witness_unsubscribes_first():
     """close() tells the connector to stop (PROC_CN_MCAST_IGNORE) before closing the socket, so the
     kernel's host-wide listener count drops; a send error does not stop the close."""
-    from tt_device_mcp.exit_witness import PROC_CN_MCAST_IGNORE
-
     for error in (None, OSError(errno.EPERM, "no")):
         calls = []
 
@@ -932,6 +939,123 @@ def test_the_witness_keeps_up_with_a_busy_host_between_polls():
             p.wait()
 
 
+def test_the_witness_fails_safe_in_a_pid_namespace(monkeypatch, tmp_path):
+    """In a PID namespace below the host's (its namespace inode is not the host's fixed one, or
+    NSpid lists more than one pid) the connector's events
+    carry host pids that never match the tree read from the namespace's /proc. The witness says
+    so (ok=False, before any subscription) instead of a misleading "no exit record", and its
+    verdict is "not proven clean" with no exit status, which the broker treats as a killed job."""
+    real = os.stat
+    for ino, want in ((exit_witness._PROC_PID_INIT_INO, False), (0xF00010D0, True)):
+
+        def stat(path, ino=ino):
+            return type("_Stat", (), {"st_ino": ino}) if path == "/proc/self/ns/pid" else real(path)
+
+        monkeypatch.setattr(exit_witness.os, "stat", stat)
+        assert exit_witness._in_child_pid_namespace() is want, hex(ino)
+    monkeypatch.setattr(exit_witness.os, "stat", real)
+    # no namespace link: the NSpid line decides
+    missing, status = str(tmp_path / "missing"), tmp_path / "status"
+    for line, want in (
+        ("NSpid:\t4242\n", False),
+        ("NSpid:\t4242\t7\n", True),
+        ("NSpid:\t4242\t7\t1\n", True),
+        ("", False),  # no NSpid line (kernel before 4.1)
+    ):
+        status.write_text("Name:\tpython3\nPid:\t4242\n" + line)
+        assert exit_witness._in_child_pid_namespace(missing, str(status)) is want, line
+    assert exit_witness._in_child_pid_namespace(missing, missing) is False
+
+    def _no_socket(*a):
+        raise AssertionError("a namespaced witness must not subscribe")
+
+    monkeypatch.setattr(exit_witness, "_in_child_pid_namespace", lambda: True)
+    monkeypatch.setattr(exit_witness, "socket", type("_NoSockets", (), {"socket": staticmethod(_no_socket)}))
+    w = ExitWitness(os.getpgid(0), None)
+    why = "process events report host pids; the broker runs in a PID namespace"
+    assert w.ok is False and w.why == why
+    assert w.clean() is False and w.exit_status() is None and w.why == why
+    w.close()
+
+
+class _EventPipe:
+    """A selectable stand-in for the connector socket: the test writes crafted events into the
+    other end of a datagram socketpair. Records what the witness sends (its subscription)."""
+
+    def __init__(self, end):
+        self._end, self.sent = end, []
+
+    def setsockopt(self, *a):
+        pass
+
+    def bind(self, addr):
+        pass
+
+    def send(self, msg):
+        self.sent.append(struct.unpack_from("=I", msg, len(msg) - 4)[0])
+        return len(msg)
+
+    def setblocking(self, flag):
+        self._end.setblocking(flag)
+
+    def recv(self, n):
+        return self._end.recv(n)
+
+    def fileno(self):
+        return self._end.fileno()
+
+    def close(self):
+        self._end.close()
+
+
+def test_the_witness_matches_a_real_tree_against_injected_events(monkeypatch):
+    """The witness's own setup and matching on a real process tree, with the kernel's connector
+    replaced by injected events, so it runs anywhere (PID namespaces included, where the real
+    events cannot match): it snapshots the job's group from /proc, its reader thread drains events
+    as they arrive without the caller polling, a fork from the tree joins it, every process exiting
+    by its own code is clean and a signal death is not; close() unsubscribes and stops the reader."""
+    monkeypatch.setattr(exit_witness, "_in_child_pid_namespace", lambda: False)
+    reads_stdin = [sys.executable, "-c", "import sys; sys.stdin.read()"]
+    for argv, want in ((reads_stdin, True), (["sleep", "30"], False)):
+        ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        pipe = _EventPipe(ours)
+        fake = type("_Sockets", (), {"socket": staticmethod(lambda *a: pipe)})
+        for name in ("AF_NETLINK", "SOCK_DGRAM", "SOL_SOCKET", "SO_RCVBUF"):
+            setattr(fake, name, getattr(socket, name))
+        monkeypatch.setattr(exit_witness, "socket", fake)
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE, start_new_session=True)
+        try:
+            w = ExitWitness(p.pid, None)
+            try:
+                assert w.ok, w.why
+                assert w.tree == {p.pid} and pipe.sent == [PROC_CN_MCAST_LISTEN]
+                child = p.pid + 1_000_000  # a fork the test reports; no such process exists
+                theirs.send(_fork(p.pid, child))
+                if want:
+                    p.stdin.close()
+                else:
+                    os.killpg(p.pid, signal.SIGTERM)
+                p.wait(timeout=10)
+                # the kernel's record of the leader, in waitpid form, from its real end
+                status = -p.returncode if p.returncode < 0 else p.returncode << 8
+                theirs.send(_exit(child, 0) + _exit(p.pid, status))
+                deadline = time.monotonic() + 5
+                while p.pid not in w.exits and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                assert w.exits == {child: 0, p.pid: status}, "the reader thread drains as events arrive"
+                assert w.clean() is want, (argv[0], w.why)
+                assert w.exit_status() == (0 if want else None)
+            finally:
+                w.close()
+            assert pipe.sent == [PROC_CN_MCAST_LISTEN, PROC_CN_MCAST_IGNORE]
+            assert w._sock is None and not w._reader.is_alive()
+        finally:
+            theirs.close()
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+
 _HANDLES_TERM = "import signal, sys, time; signal.signal(signal.SIGTERM, lambda *a: sys.exit({rc})); time.sleep(30)"
 
 
@@ -975,6 +1099,20 @@ async def test_the_real_job_wrapper_reports_a_handled_sigterm_by_the_jobs_own_st
     else:
         assert job.preempt_clean is False
         assert dirty and owed == ["job 970 preempted"] and gate == [{"job_failed": True}]
+
+
+@pytest.mark.asyncio
+async def test_a_preemption_witnessed_from_a_pid_namespace_is_reset_and_fully_checked(monkeypatch, clear_job_state):
+    """A broker in a PID namespace cannot witness its job's exits: the real witness says so
+    (ok=False). Even a job that handles SIGTERM with exit 0 within the grace then gets the I69
+    reset and the full check, fabric included, never the exit-0 skip or the fast check."""
+    monkeypatch.setattr(exit_witness, "_in_child_pid_namespace", lambda: True)
+    fsm_healthy(srv)
+    command = f"{sys.executable} -c '{_HANDLES_TERM.format(rc=0)}'"
+    job, sent, gate, dirty, owed = await _preempt(monkeypatch, "972", command, kill_grace=5)
+    assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
+    assert job.preempt_clean is False and job.preempt_exit_status is None
+    assert dirty and owed == ["job 972 preempted"] and gate == [{"job_failed": True}]
 
 
 @pytest.mark.asyncio
