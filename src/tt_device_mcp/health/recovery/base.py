@@ -355,9 +355,27 @@ def mesh_reset_hold_reason() -> str:
     return ""
 
 
+def outage_hold_boot_warning() -> str:
+    """The boot warning for an outage hold that holds the mesh reset by default, or "" when there is
+    none (spec 04 I28). Both host rungs at 0 with ``TT_DEVICE_MCP_AUTO_MESH_RESET`` unset is enough
+    on its own: no third switch has to be 0 any more, so a host that turned off only its host rungs
+    now holds every automatic mesh reset until an operator acts, and the journal must say so."""
+    if os.environ.get("TT_DEVICE_MCP_AUTO_MESH_RESET", "").strip():
+        return ""
+    if not all(os.environ.get(v, "").strip() == "0" for v in OUTAGE_HOLD_VARS):
+        return ""
+    return (
+        " and ".join(f"{v}=0" for v in OUTAGE_HOLD_VARS)
+        + " with TT_DEVICE_MCP_AUTO_MESH_RESET unset is an outage hold: every automatic mesh reset "
+        "(tt-smi -glx_reset from the gate, the idle relift, the hold watchdog and the last-chance sweep) "
+        "is HELD and the device stays held until an operator acts; set TT_DEVICE_MCP_AUTO_MESH_RESET=1 "
+        "to re-arm it (spec 04 I28)"
+    )
+
+
 def drop_returned_isolated(isolated: set, context: str, log=None) -> list:
     """Re-read sysfs and take every chip of ``isolated`` that is back on the bus out of it, in place.
-    Run after every tray re-power, mesh reset and PCI rescan, whatever the verify that follows says:
+    Run after every mesh reset and PCI rescan, whatever the verify that follows says:
     a chip left in the set after it returned keeps /health and the gate reading it as isolated and
     arms a needless bridge reset on the next pass. Never releases anything: only the full health
     check, fabric included, does that (spec 03 I52)."""
@@ -625,7 +643,7 @@ class RecoveryMechanism:
 
     def host_action_blocks_reset(self, log: Callable[[str], None], *, context: str) -> bool:
         """True while a requested host reboot or power cycle is pending: no device reset (bridge,
-        tray re-power, galaxy/SMI reset) may start under it, whichever path asks (spec 04 I34). One
+        galaxy/SMI reset) may start under it, whichever path asks (spec 04 I34). One
         log line and one event per request; the device stays held, and the full health check runs
         after the host comes back. Bounded by host_action_pending()'s window."""
         pending = self.host_action_pending()

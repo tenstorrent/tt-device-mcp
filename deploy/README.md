@@ -116,7 +116,7 @@ SchedulerParameters=nohold_on_prolog_fail
 - **`PrologFlags=Alloc`** runs the prologue when the allocation is granted rather than at the
   first job step. Without it the health check happens later than you think it does.
 - **No `HealthCheckProgram`.** slurmd kills it at 60 s, which cannot contain a `tt-smi -r`
-  (~15 s) plus a fabric traffic pass (45–100 s), let alone a bridge or tray rung. A periodic
+  (~15 s) plus a fabric traffic pass (45–100 s), let alone a bridge or mesh reset. A periodic
   SIGKILL mid-reset wedges the device it was meant to check.
 - **Un-draining after a repair is manual.** Drain survives a reboot, so a node the broker's
   power cycle fixed comes back still drained with a stale reason. Return it with

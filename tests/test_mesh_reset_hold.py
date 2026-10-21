@@ -112,13 +112,60 @@ async def test_the_gate_holds_with_the_explicit_knob_alone(monkeypatch, rec):
 
 
 @pytest.mark.asyncio
-async def test_the_gate_still_resets_with_only_the_tray_rung_off(monkeypatch, rec):
-    """An unconfirmed BMC turns the tray rung off; the ladder still climbs through the mesh reset."""
+@pytest.mark.parametrize("off", list(HOLD))
+async def test_the_gate_still_resets_with_one_host_rung_off(monkeypatch, rec, off):
+    """One host rung off on its own is a per-host choice: the ladder still climbs through the mesh reset."""
     monkeypatch.delenv("TT_DEVICE_MCP_AUTO_MESH_RESET", raising=False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")
-    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_REBOOT", raising=False)
+    for var in HOLD:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv(off, "0")
+    monkeypatch.setattr(base, "_mesh_hold_paged", {})
     await srv.galaxy_recovery._reset_and_verify_device(["0", "1", "2", "3"], lambda m: None)
     assert rec["resets"] == [["tt-smi", "-glx_reset"]] and "mesh_reset_held" not in rec["events"]
+
+
+class _Said:
+    def __init__(self):
+        self.said = []
+
+    def info(self, m):
+        self.said.append(("info", m))
+
+    def warning(self, m):
+        self.said.append(("warning", m))
+
+    def error(self, m):
+        self.said.append(("error", m))
+
+
+def test_an_outage_hold_logs_the_held_mesh_reset_at_boot(monkeypatch):
+    """Both host rungs at 0 with the mesh-reset knob unset hold every automatic mesh reset: the boot
+    inventory says so by name and says how to re-arm it. One rung off, or the knob set either way,
+    logs no such warning (``=0`` is the operator's explicit choice, ``=1`` re-arms it)."""
+    log = _Said()
+    monkeypatch.setattr(srv, "logger", log)
+    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_MESH_RESET", raising=False)
+    for var in HOLD:
+        monkeypatch.delenv(var, raising=False)
+
+    def held_lines():
+        log.said.clear()
+        srv.log_rung_inventory()
+        return [m for lvl, m in log.said if lvl == "warning" and m.startswith("MESH RESET HELD")]
+
+    assert held_lines() == [], "the shipped default holds nothing"
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    assert held_lines() == [], "one host rung off still resets"
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    (line,) = held_lines()
+    for name in ("TT_DEVICE_MCP_AUTO_REBOOT=0", "TT_DEVICE_MCP_AUTO_POWER_CYCLE=0", "glx_reset", "operator"):
+        assert name in line, line
+    assert "TT_DEVICE_MCP_AUTO_MESH_RESET=1" in line and "I28" in line
+    assert base.outage_hold_boot_warning() in line
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")
+    assert held_lines() == [], "=1 re-arms the mesh reset"
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "0")
+    assert held_lines() == [], "an explicit =0 is the RUNG GAP warning's, not this one"
 
 
 @pytest.mark.asyncio

@@ -158,6 +158,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     offbus_chip_ids,
     offbus_count,
     offbus_power_cycle,
+    outage_hold_boot_warning,
     pci_bus_number,
     pcie_guard_at_start,
     previous_boot_bus_locks,
@@ -4038,6 +4039,9 @@ def log_rung_inventory() -> None:
         logger.warning(
             f"RUNG GAP: {gap} — a held present mesh has no automatic exit; it stays held until an operator acts"
         )
+    outage = outage_hold_boot_warning()
+    if outage:
+        logger.warning(f"MESH RESET HELD: {outage}")
 
 
 # The telemetry trace: what the chips were doing while the job ran. Snapshots at the gate
@@ -6842,7 +6846,7 @@ async def device_health_gate(
             return
 
         # spec 04 I34: a host reboot / power cycle still pending — no rung of this ladder (bridge,
-        # gone-chip bridge, tray re-power, galaxy/SMI reset, a second host rung) starts under it, and
+        # gone-chip bridge, galaxy/SMI reset, a second host rung) starts under it, and
         # nothing read off a mesh going down is taken as a verdict. The device stays held; the full
         # check runs once the host is back. Bounded by the request's pending window.
         if recovery_mechanism.host_action_blocks_reset(_log, context=f"gate/{phase}"):
@@ -6981,8 +6985,8 @@ async def device_health_gate(
                 return
             # That rung ended in a system-wide PCI rescan, so re-read the bus before the floor
             # decides on it: a chip that came back changes the count the floor keys on. No scope
-            # re-read — our own rescan cannot open a foreign reset scope, and each rung left below
-            # carries its own scope guard (the reset adopts it).
+            # re-read — our own rescan cannot open a foreign reset scope, and the reset left below
+            # carries its own scope guard (it adopts the scope).
             beats = await asyncio.to_thread(_decision_heartbeats)
             ev = replace(
                 ev,
@@ -8145,7 +8149,7 @@ async def _force_escalate_stuck_hold() -> None:
         # reset -> climb. Each rung fires only when the gentler one failed. The module-global Galaxy
         # instance, NOT select_recovery: the idle ladders live on GalaxyRecovery but apply on every
         # platform, exactly like the gate's rungs (see GalaxyRecovery's ladder comment) — the
-        # Galaxy-only rungs decline themselves off-platform (UBB plans return None) and the reset
+        # Galaxy-only steps decline themselves off-platform and the reset
         # argv is re-derived per platform inside _reset_and_verify_device, so a per-target host fires
         # `tt-smi -r`, never -glx_reset. Routing through select_recovery hands a per-target host the
         # base escalate() that always reports WAITING — these teeth silently bite nothing, and the
@@ -8749,7 +8753,7 @@ def _hold_without_reset(cause: str, expected: int, log) -> None:
 
 def _host_action_blocks_escalation() -> bool:
     """True while a host reboot or power cycle the broker requested is still pending: the forced
-    ladder then starts no device reset (bridge, tray re-power, galaxy reset) — one would only race the
+    ladder then starts no device reset (bridge, galaxy reset) — one would only race the
     host going down. The device stays held, and the full health check, fabric included, still runs
     after the host comes back (startup, behind the hugepage gate). Bounded: past the pending window
     the request reads as failed, is logged once, and the ladder resumes. A request that was refused or

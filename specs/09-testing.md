@@ -179,7 +179,7 @@ carry which spec's anchors. Approximate collected counts in parentheses.
 
 | File(s) | Pins | Spec |
 |---|---|---|
-| `test_device_safety.py` (450) | The safety corpus: gate hold/dirty/verify semantics, idle and fabric relift, stuck-hold escalation, galaxy floor, ledger/governor, bridge and tray rungs, dead-chip sampler, burst cap, cooldown, exec gating, preflight | 01, 03, 04, 05, 06 |
+| `test_device_safety.py` (450) | The safety corpus: gate hold/dirty/verify semantics, idle and fabric relift, stuck-hold escalation, galaxy floor, ledger/governor, bridge rung, dead-chip sampler, burst cap, cooldown, exec gating, preflight | 01, 03, 04, 05, 06 |
 | `test_server.py` (70) | Job lifecycle, ids and wraparound, activation script / env resolution, clean-device gate ladder, MCP progress streaming, synthetic socket host | 01, 02 |
 | `test_readopt.py` (25) | Restart survival: scope re-adoption, recovered deadlines and exit codes, jobexit dir redirection and perms | 01, 05, 06 |
 | `test_recent_jobs.py` (37) | Job-log footer format, recent-history parsing, id reservation, kill audit | 01, 05 |
@@ -189,7 +189,7 @@ carry which spec's anchors. Approximate collected counts in parentheses.
 | `test_boot_platform.py` (7), `test_rung_arming.py` (9) | Boot-time platform commit (and import purity), eth-rung arming rules | 03, 04 |
 | `test_eth_probe.py` (40), `test_fabric_probe.py` (8), `test_eth_heartbeat_probe.py` (21) | Exit-code laundering contracts (ok/frozen/cannot-check), hung reads are skips, the eth-heartbeat probe script's own verdicts | 03 |
 | `test_broker_telemetry.py` (8) | Sampler snapshot/exposition: tri-state fabric verdict, last-pass-not-running-total, crash-tolerant snapshot | 03 |
-| `test_reset.py` (56), `test_reset_gate.py` (18), `test_device_holders.py` (18), `test_recovery_select.py` (3), `test_ubb_reset_launch.py` (3) | Reset argv per platform, scoped execution and quiesce, holder scan and reset gate (foreign deny, fail-closed, force), platform selection, tray-fire tt-smi compat, reclaim pid+starttime identity | 04, 05 |
+| `test_reset.py` (56), `test_reset_gate.py` (18), `test_device_holders.py` (18), `test_recovery_select.py` (3) | Reset argv per platform, scoped execution and quiesce, holder scan and reset gate (foreign deny, fail-closed, force), platform selection, reclaim pid+starttime identity | 04, 05 |
 | `test_metrics.py` (37) | Stage-metrics classification (inapplicable ≠ blocked) and textfile writer behavior | 04, 06 |
 | `test_state_paths.py` (10), `test_install_modes.py` (34) | euid-split defaults, env overrides beat both defaults, install/state base split, per-user daemon gate-on default | 06 |
 | `test_deploy_*.py` (9 files, 42), `test_apply_host_config_render.py` (16) | Deployment-script fail-closed statements (via `deploy_helpers`) and host-config rendering | 08 |

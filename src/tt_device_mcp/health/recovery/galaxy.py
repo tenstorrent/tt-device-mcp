@@ -250,7 +250,7 @@ def _settle_before_host_rung_sec() -> int:
 # or more whole UBB trays off the bus (no whole-tray drop has healed without a power cycle: 0/50 on one
 # Galaxy host). C: every chip still off the bus after a mesh reset already ran and failed this episode
 # (one mesh reset has healed an all-off bus, so the first one still runs, at startup too; a repeat on
-# the unchanged set ran 130-262 s and exited 1). Neither gets a sweep or tray re-power.
+# the unchanged set ran 130-262 s and exited 1). Neither gets a sweep.
 FAULT_CLASS_WHOLE_TRAY = "A"
 FAULT_CLASS_ALL_OFF = "C"
 
@@ -1238,7 +1238,7 @@ class GalaxyRecovery(Recovery):
     async def _power_cycle_direct(
         self, fault_class: str, offbus_chips: set, expected: int, log, *, context: str, force: bool = False
     ) -> Optional[bool]:
-        """Request the power cycle for an I37 class with no reset, sweep or tray re-power first.
+        """Request the power cycle for an I37 class with no reset or sweep first.
 
         None when no power cycle is opted in: the caller runs its ordinary ladder (I36 still stops a
         repeat of a failed reset). False while it holds, firing nothing: a reset is cycling in its own
@@ -1386,7 +1386,7 @@ class GalaxyRecovery(Recovery):
         also what keeps a per-target host, whose gate runs this same ladder, out of DOWN entirely —
         a state it can reach only through the Galaxy idle ladder.
 
-        The verdict reported is the ACTION's own (the re-verify, the reset), not a
+        The verdict reported is the ACTION's own (the re-verify, the bridge reset, the mesh reset), not a
         degraded->fit transition: the gate reaches its ladder whenever THIS pass's probe read
         unhealthy, which happens on a mesh the FSM still records HEALTHY (a post-job pass on a clean
         episode), and a rung that verified such a mesh back must still read as recovered or the gate
@@ -2246,8 +2246,8 @@ class GalaxyRecovery(Recovery):
         ):
             log("off-bus hold: a tenant or a reset arrived during the stand-back checks — holding")
             return False
-        # Re-read the whole box, not just the dropped tray, right before the cycle: a reset can
-        # take other trays off the bus (or the box can come back on its own) between the caller's read
+        # Re-read the whole box, not just the dropped tray, right before the cycle: an external power
+        # event can take other trays off the bus (or the box can come back on its own) between the caller's read
         # and here. A box with nothing off the bus any more needs no cycle.
         beats = await asyncio.to_thread(self.deps.read_heartbeats)
         off_bus = offbus_count(beats, expected)
