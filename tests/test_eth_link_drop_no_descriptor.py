@@ -190,16 +190,15 @@ async def test_a_post_reset_check_that_finds_every_link_releases(nodesc_mesh):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reboot, rung", [("0", "power-cycle"), ("1", "reboot")])
+@pytest.mark.parametrize("rung", ["power-cycle"])
 async def test_the_held_drop_runs_the_ladder_at_the_10_min_mark_then_the_host_rung(
-    monkeypatch, nodesc_mesh, reboot, rung
+    monkeypatch, nodesc_mesh, rung
 ):
     """At the 10-min hold ceiling the watchdog runs the present-mesh reset; its full post-reset check
     still fails on the count, and the same window requests the host rung (a power cycle where the
     reboot rung is off). Never a release without a passing full check."""
     from tt_device_mcp.health.recovery import galaxy
 
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", reboot)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
 

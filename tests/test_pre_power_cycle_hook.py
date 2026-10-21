@@ -200,17 +200,6 @@ async def test_cancelled_while_waiting_on_the_hook_retracts_the_ledger_entry(cyc
     assert _ledger_actions() == []
 
 
-@pytest.mark.asyncio
-async def test_the_warm_reboot_does_not_run_the_power_cycle_hook(cycle, monkeypatch):
-    ran = cycle["dir"] / "ran"
-    hook = _script(cycle["dir"], "hook", f"touch {ran}\n")
-    monkeypatch.setenv("TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK", str(hook))
-    fired = []
-    await srv.galaxy_recovery._auto_reboot_host(lambda _m: None, REASON)
-    assert fired == [True]
-    assert not ran.exists()
-
-
 @pytest.mark.parametrize(
     "raw,want",
     [

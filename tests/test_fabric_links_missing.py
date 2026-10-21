@@ -384,9 +384,9 @@ def latched_mesh(monkeypatch, tmp_path, mesh):  # noqa: F811
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reboot, rung", [("0", "power-cycle"), ("1", "reboot")])
+@pytest.mark.parametrize("rung", ["power-cycle"])
 async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
-    monkeypatch, latched_mesh, reboot, rung
+    monkeypatch, latched_mesh, rung
 ):
     """I42: the idle relift resets the latched hold with no grace; the post-reset check runs the
     descriptor, the latched mismatch FAILS it (never withheld, never a lift), the last-chance sweep
@@ -394,7 +394,6 @@ async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
     hold. A later forced window asks for no second host rung and still releases nothing."""
     from tt_device_mcp.health.recovery import galaxy
 
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", reboot)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
 
@@ -434,7 +433,7 @@ async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dirty", [True, False])
-@pytest.mark.parametrize("reboot, rung", [("0", "power-cycle"), ("1", "reboot")])
+@pytest.mark.parametrize("rung", ["power-cycle"])
 async def test_a_latched_hold_no_relift_reset_takes_the_ladder_at_the_ceiling(
     monkeypatch, tmp_path, mesh, dirty, reboot, rung  # noqa: F811
 ):
@@ -450,7 +449,6 @@ async def test_a_latched_hold_no_relift_reset_takes_the_ladder_at_the_ceiling(
     assert ok is not False and srv._TOPOLOGY_VALIDATOR_LINE in (m.last_fabric_output or ""), "a real lift"
     dfr.fsm_dirty(srv, f"job 7: {_latch(m)}", why=srv.FABRIC_RELIFT_WHY, dirty=dirty)
     assert srv._fabric_no_reset_hold() == "", "a latched fault is measured: never a no-reset hold"
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", reboot)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
 
@@ -492,7 +490,6 @@ async def test_replay_a_held_77_whose_bound_ladder_leaves_a_port_missing_power_c
         dfr.fsm_dirty(srv, "post-job: fabric unverified (rc 77)", why=srv.FABRIC_RELIFT_WHY)
     mesh["descriptor_out"] = _LOST
     mesh["reset_heals"] = False
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
 
@@ -564,7 +561,6 @@ async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_o
     the full check with the descriptor. Only its pass releases (and ends the latch); a
     failed check never releases and the ladder climbs to the host rung at once."""
     _idle_queue(monkeypatch)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
 
@@ -617,7 +613,6 @@ async def test_a_paced_present_rung_does_not_spend_the_dirty_latched_idle_gate(m
     from tt_device_mcp.health.recovery import galaxy
 
     _idle_queue(monkeypatch)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
 

@@ -263,37 +263,6 @@ async def test_the_bridge_rung(mesh, monkeypatch, verdict):
 
 
 @pytest.mark.asyncio
-async def test_the_tray_down_no_window_sweep(mesh, monkeypatch, galaxy_trays, verdict):
-    evidence, released = verdict
-    fsm_dirty(srv, "gate/post-job: tray 3 off the bus", why="job_killed")
-    g = srv.galaxy_recovery
-    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
-    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
-
-    async def no_bridge(log):
-        return False
-
-    async def mesh_reset(argv, log, *a, **k):
-        from tt_device_mcp.health.aiclk_ceiling import CEILING
-
-        CEILING.mark_owed("reset")  # as the real reset_with_quiesce does
-        FABRIC_DEBT.note_reset(" ".join(argv))
-        return 0, ""
-
-    patch_recovery(monkeypatch, "_recover_isolated_chips", no_bridge)
-    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh_reset)
-    _verify_returning(monkeypatch, evidence)
-    offbus = {str(i) for i in range(24, 32)}
-    out = await g._fire_tray_down_no_window(offbus, 32, lambda m: None, gate_phase="post-job", ev=None)
-    assert out == galaxy.OUTCOME_RECOVERED
-    _assert_settled(released)
-    if not released:
-        assert FABRIC_DEBT.owed, "the sweep's own mesh reset records the debt"
-
-
-@pytest.mark.asyncio
 async def test_the_idle_off_bus_bridge_reset(mesh, monkeypatch, verdict):
     evidence, released = verdict
     _arm_offbus_stuck_hold(monkeypatch, isolated={"8"})
@@ -523,36 +492,6 @@ async def test_a_real_bridge_reset_owes_the_ceiling(mesh, monkeypatch, verdict, 
     _verify_returning(monkeypatch, evidence)
     g = srv.galaxy_recovery
     out = await g._fire_gate_rung("post-job", galaxy.STAGE_BRIDGE_RESET, ["8"], 32, lambda m: None, ev=None, beats=None)
-    assert out == galaxy.OUTCOME_RECOVERED
-    _assert_settled(released)
-    await _door_applies_the_owed_ceiling(ceiling)
-
-
-@pytest.mark.asyncio
-async def test_a_tray_down_no_window_sweep_owes_the_ceiling(mesh, monkeypatch, galaxy_trays, verdict, ceiling):
-    evidence, released = verdict
-    fsm_dirty(srv, "gate/post-job: tray 3 off the bus", why="job_killed")
-    g = srv.galaxy_recovery
-    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
-    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
-
-    async def no_bridge(log):
-        return False
-
-    async def mesh_reset(argv, log, *a, **k):
-        from tt_device_mcp.health.aiclk_ceiling import CEILING
-
-        CEILING.mark_owed("reset")  # as the real reset_with_quiesce does
-        FABRIC_DEBT.note_reset(" ".join(argv))
-        return 0, ""
-
-    patch_recovery(monkeypatch, "_recover_isolated_chips", no_bridge)
-    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh_reset)
-    _verify_returning(monkeypatch, evidence)
-    offbus = {str(i) for i in range(24, 32)}
-    out = await g._fire_tray_down_no_window(offbus, 32, lambda m: None, gate_phase="post-job", ev=None)
     assert out == galaxy.OUTCOME_RECOVERED
     _assert_settled(released)
     await _door_applies_the_owed_ceiling(ceiling)

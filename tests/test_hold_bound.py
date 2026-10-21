@@ -56,7 +56,6 @@ def _watchdog(monkeypatch):
         monkeypatch.setattr(srv, name, value)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_cooldown_state", None)
-    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry_due", lambda *a, **k: False)
     monkeypatch.setattr(srv.offbus_power_cycle, "due_for_watchdog", lambda *a, **k: False)
 
 
@@ -229,8 +228,6 @@ async def test_another_run_inside_the_check_bound_does_not_cut_the_full_check_sh
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", recovered_ladder)
     monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: True)  # the check has no verdict yet
     monkeypatch.setattr(srv, "device_hold_escalation_kind", "ceiling_window")
-    await srv._force_escalate_stuck_hold()
-    monkeypatch.setattr(srv, "device_hold_escalation_kind", "progress_retry")
     await srv._force_escalate_stuck_hold()
     assert escalations == ["present-forced"] and "host_rung" not in events
 

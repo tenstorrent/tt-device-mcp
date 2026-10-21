@@ -42,7 +42,6 @@ def fence(leftover, rig, monkeypatch):  # noqa: F811 - the imported fixtures
     monkeypatch.setattr(srv, "_present_chip_indices", lambda: [str(i) for i in range(EXPECTED)])
     monkeypatch.setattr(srv.health_monitor, "expected", lambda n=0: EXPECTED)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=state["holders"], complete=True))
-    monkeypatch.setattr(srv.recovery_mechanism, "_reboot_already_attempted", lambda **k: False)
     # A fired rung leaves its host action pending (I34), as the real request marker does.
     fired = []
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_pending", lambda: ("reboot", 1.0) if fired else None)

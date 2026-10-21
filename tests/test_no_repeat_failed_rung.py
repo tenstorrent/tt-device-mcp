@@ -524,15 +524,14 @@ async def test_e3_offbus_classes_reset_once_then_take_the_next_rung(monkeypatch,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("host_rung", ["power-cycle", "reboot", "none"])
+@pytest.mark.parametrize("host_rung", ["power-cycle", "none"])
 async def test_e3_present_mesh_resets_once_then_takes_the_next_rung(monkeypatch, clear_job_state, host_rung):
     """D (every chip present, the mesh reset fails its verify) over six forced windows: one reset,
-    then the host rung in that same window (the power cycle, else the warm reboot; both are on by
-    default), and with both opted out no further reset at all: the hold stays for an operator."""
+    then the host rung in that same window (the power cycle, on by default; there is no reboot rung),
+    and with it opted out no further reset at all: the hold stays for an operator."""
     counters, events = _present_mesh(monkeypatch)
     if host_rung != "power-cycle":
         monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1" if host_rung == "reboot" else "0")
     monkeypatch.setattr(privileges, "is_root", lambda: True)
     monkeypatch.setattr(privileges, "has_systemd", lambda: True)
     order = _record_cycle_order(monkeypatch, counters)
@@ -556,50 +555,6 @@ async def test_e3_present_mesh_resets_once_then_takes_the_next_rung(monkeypatch,
 
 
 # --- spec 04 I39: one early retry after a failed mesh reset whose off-bus set shrank -------------------
-
-
-def test_progress_retry_is_armed_once_per_episode_and_comes_due(monkeypatch):
-    mech = srv.recovery_mechanism
-    monkeypatch.setattr(mech, "progress_retry", None)
-    monkeypatch.setattr(mech, "progress_retry_spent_since", "")
-    since = "2026-10-15T18:43:41"
-    assert mech.note_progress_retry(since, 60.0)
-    t0 = time.monotonic()
-    assert not mech.progress_retry_due(since, now=t0)
-    assert mech.progress_retry_due(since, now=t0 + 61.0)
-    assert not mech.progress_retry_due("2026-10-15T19:11:00", now=t0 + 61.0), "another episode never sees it"
-    mech.spend_progress_retry()
-    assert not mech.progress_retry_due(since, now=t0 + 61.0)
-    assert not mech.note_progress_retry(since, 60.0), "a spent retry is never re-armed in its episode"
-    assert mech.note_progress_retry("2026-10-15T19:11:00", 60.0), "a new episode gets its own"
-
-
-def test_the_watchdog_spawns_the_due_progress_retry_before_the_ceiling(monkeypatch):
-    fired = []
-    monkeypatch.setattr(srv, "health_event", lambda kind, **f: None)
-    monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: fired.append(True) or True)
-    monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
-    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
-    monkeypatch.setattr(srv, "device_hold_offbus_escalated", True)  # the 120 s one-shot already ran
-    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
-    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry", None)
-    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry_spent_since", "")
-    srv.fsm.set_latch("escalated", False)
-    monkeypatch.setattr(srv, "isolated_chips", {13})
-    monkeypatch.setattr(srv, "device_hold_episode_reason", "chip(s) 13 fell off the PCIe bus")
-    since = datetime(2026, 10, 15, 18, 43, 41)
-    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
-    age = since + timedelta(seconds=400)  # well inside the first ceiling window
-
-    srv._check_hold_deadline(now=age)
-    assert fired == [], "nothing is armed: the watchdog waits as before"
-
-    assert srv.recovery_mechanism.note_progress_retry(since.isoformat(), 0.0)
-    srv._check_hold_deadline(now=age)
-    assert fired == [True], "the due retry runs at once, not at the ceiling window"
-    assert srv.recovery_mechanism.progress_retry is None
-    srv._check_hold_deadline(now=age + timedelta(seconds=30))
-    assert fired == [True], "it is spent: one retry per episode"
 
 
 # --- spec 04 I39 end to end: arm, spawn, one more reset on the changed set, then I38 ---------------
@@ -693,43 +648,6 @@ async def test_a_failed_reset_on_an_unchanged_set_arms_no_retry_and_climbs_at_on
     assert "host_rung_not_deferred" in events and counters["power_cycles"] == 1 and counters["resets"] == 1
     assert _drive_progress_retry_watchdog(monkeypatch) == []
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("verify_ok", [False, True], ids=["verify-fails-keeps-hold", "verify-passes-releases"])
-async def test_the_progress_retry_releases_only_after_the_full_fabric_verify(monkeypatch, clear_job_state, verify_ok):
-    """Goal of spec 04 I39 + the post-reset check (I32): on the real reset path the retry's reset exits 0
-    and the full verify runs with the fabric pass. A failed verify keeps the hold and climbs (the set is
-    unchanged: I38); only a passing verify clears it."""
-    counters, events, _, _, _ = _progress_episode(monkeypatch, [{"31"}])
-    state_off = [{"30", "31"}]
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: _beats_with_off(state_off[0]))
-    monkeypatch.delattr(srv.galaxy_recovery, "_reset_and_verify_device")
-    rcs, verifies = iter([1, 0]), []
-
-    async def reset_cmd(argv, log, *a, **k):
-        rc = next(rcs)
-        state_off[0] = {"31"}  # the first reset brought chip 30 back; 31 stays off through both
-        return rc, ""
-
-    async def verify(expected, log, run_fabric=None, **_):
-        verifies.append(run_fabric)
-        assert counters["dirty_cleared"] == 0, "nothing cleared before the verify"
-        return verify_ok, {"snapshot": {"ok": verify_ok}}
-
-    monkeypatch.setattr(srv.recovery_mechanism, "reset_with_quiesce", reset_cmd)
-    monkeypatch.setattr(srv.recovery_mechanism, "await_foreign_scope", lambda log: _false())
-    patch_recovery(monkeypatch, "_verify_device", verify)
-    assert await _window() is True
-    assert events.count("mesh_reset_progress_retry_armed") == 1 and verifies == []
-    assert _drive_progress_retry_watchdog(monkeypatch) == ["progress_retry"]
-    assert await _window() is True
-    assert verifies and all(v in (None, True) for v in verifies), "the retry's verify runs the fabric pass"
-    if verify_ok:
-        assert counters["dirty_cleared"] == 1 and counters["power_cycles"] == 0
-    else:
-        assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a failed verify keeps the hold"
-        assert counters["power_cycles"] == 1, "and goes on to the host rung (I38)"
 
 
 def _record_retry_delays(monkeypatch, events):

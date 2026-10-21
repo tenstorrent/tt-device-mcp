@@ -103,16 +103,6 @@ async def test_power_cycle_request_suppresses_every_deadline_tick(held):
 
 
 @pytest.mark.asyncio
-async def test_reboot_request_suppresses_the_deadline_tick(held):
-    await srv.galaxy_recovery._auto_reboot_host(lambda m: None, "reset could not recover the device")
-    assert held["fired"] == ["reboot"]
-    _offbus_tick()
-    assert srv._forced_escalation_task is None
-    assert "hold_escalation_suppressed_host_action" in _kinds(held["events"])
-    assert srv.recovery_mechanism.host_action_pending() is not None
-
-
-@pytest.mark.asyncio
 async def test_escalation_waiting_on_the_lock_runs_no_rung(monkeypatch):
     """A forced escalation spawned before the request, still waiting on the device-op lock, must not
     run the ladder once it gets the lock."""

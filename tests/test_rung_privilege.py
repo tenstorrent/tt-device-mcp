@@ -62,21 +62,6 @@ def said(monkeypatch):
     return lines
 
 
-def test_a_non_root_daemon_has_no_reboot_rung(monkeypatch, privileged):
-    """`systemctl reboot` needs root. Armed-by-default is about the operator's intent, not about
-    whether the call would be permitted."""
-    assert srv._auto_reboot_enabled() is True
-    _latch(monkeypatch, systemd=True, setpci_bin=True, ipmitool=True, ipmi_node=True)
-    assert srv._auto_reboot_enabled() is False
-
-
-def test_a_host_without_systemd_has_no_reboot_rung(monkeypatch, privileged):
-    """The reboot is issued through systemctl, so a container with root but no init cannot fire
-    it either."""
-    _latch(monkeypatch, root=True, setpci_bin=True, ipmitool=True, ipmi_node=True)
-    assert srv._auto_reboot_enabled() is False
-
-
 def test_an_unreachable_bmc_has_no_power_cycle_rung(monkeypatch, privileged):
     """Already true for a missing binary; now also for a binary with no node to talk to."""
     assert srv._auto_power_cycle_enabled() is True

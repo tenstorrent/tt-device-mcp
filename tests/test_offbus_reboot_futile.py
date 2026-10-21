@@ -39,87 +39,6 @@ def _choose(off_bus, expected, *, reboot, power_cycle, futile=False, attempted=F
     )
 
 
-@pytest.mark.parametrize("off_bus", [1, 8, 16, 31, 32])
-def test_multi_chip_offbus_takes_the_power_cycle_over_the_reboot_when_armed(off_bus):
-    """I71: chips off the bus on a multi-chip host, both rungs armed -> power cycle."""
-    assert _choose(off_bus, 32, reboot=True, power_cycle=True) == ("power-cycle", False)
-
-
-def test_a_present_mesh_keeps_the_reboot_first():
-    """Review B1: a present mesh (classes D and G2) keeps the warm reboot first when both rungs are
-    armed; the power cycle follows a reboot already attempted, or stands alone with no reboot."""
-    assert _choose(0, 32, reboot=True, power_cycle=True) == ("reboot", False)
-    assert _choose(0, 32, reboot=True, power_cycle=True, attempted=True) == ("power-cycle", False)
-    assert _choose(0, 32, reboot=False, power_cycle=True) == ("power-cycle", False)
-
-
-def test_single_chip_keeps_the_reboot_first():
-    """I71 is multi-chip only: a single-chip host has no UBB re-enumeration failure mode."""
-    assert _choose(1, 1, reboot=True, power_cycle=True) == ("reboot", False)
-    assert _choose(0, 1, reboot=True, power_cycle=True) == ("reboot", False)
-
-
-def test_without_a_power_cycle_the_old_verdict_stands():
-    """No host loses a rung it had: a partial drop the caller has not proven futile still reboots;
-    a whole-bus drop or a proven-futile drop is BLOCKED (loud), never a futile reboot."""
-    assert _choose(8, 32, reboot=True, power_cycle=False) == ("reboot", False)
-    assert _choose(0, 32, reboot=True, power_cycle=False) == ("reboot", False)
-    assert _choose(32, 32, reboot=True, power_cycle=False) == (None, True)
-    assert _choose(8, 32, reboot=True, power_cycle=False, futile=True) == (None, True)
-    assert _choose(8, 32, reboot=False, power_cycle=False) == (None, False)
-
-
-def test_the_reboot_fallback_is_only_for_drops_a_reboot_can_recover():
-    """Review B2: the in-band fallback covers a present mesh, a single chip and a partial drop the
-    caller has not proven futile; never a whole-bus drop or a proven-futile one."""
-    eligible = galaxy_mod._reboot_fallback_eligible
-    assert eligible(0, 32, warm_reboot_futile=False)
-    assert eligible(1, 1, warm_reboot_futile=True)
-    assert eligible(16, 32, warm_reboot_futile=False)
-    assert not eligible(16, 32, warm_reboot_futile=True)
-    assert not eligible(32, 32, warm_reboot_futile=False)
-
-
-def test_the_i79_cold_flag_sends_a_present_mesh_to_the_power_cycle():
-    """I79 on top of I71: a present mesh on the boot a 77 climb's warm reboot brought up carries the
-    cold flag (``warm_reboot_futile``). That reboot already ran and failed, so the drop takes the
-    power cycle even when the reboot is armed and no reboot is on the ledger, holds loudly with no
-    cycle armed, and is never eligible for the I71 fallback reboot. A single-chip host is unchanged."""
-    assert _choose(0, 32, reboot=True, power_cycle=True, futile=True) == ("power-cycle", False)
-    assert _choose(0, 32, reboot=True, power_cycle=False, futile=True) == (None, True)
-    assert not galaxy_mod._reboot_fallback_eligible(0, 32, warm_reboot_futile=True)
-    assert _choose(0, 1, reboot=True, power_cycle=True, futile=True) == ("reboot", False)
-
-
-@pytest.mark.asyncio
-async def test_the_cold_rung_on_the_77_reboots_boot_never_falls_back_to_a_second_reboot(monkeypatch, clear_job_state):
-    """I79 with I71 merged: on the 77 reboot's boot (every chip present) with both rungs armed, the
-    reboot's ledger interval passed and the fallback reboot itself allowed, a cooldown-denied power
-    cycle holds; it never takes the I71 fallback reboot. Once the cooldown ends, one power cycle
-    fires and no reboot. Held throughout: nothing is released unverified."""
-    counters, g, alerts, reasons, events, age, asked = _arm_77_reboot_boot_cold_rung(monkeypatch)
-    age["v"] = 250
-    monkeypatch.setattr(srv.recovery_mechanism, "_reboot_already_attempted", lambda: False)
-    monkeypatch.setattr(srv.recovery_mechanism, "fallback_reboot_allowed", lambda **_: (True, "ok"))
-    cooldown = {"on": True}
-
-    def allowed(esc, *, tenant_active):
-        asked.append(esc)
-        if cooldown["on"] and esc == "power-cycle":
-            return False, "power-cycle cooldown (I65)"
-        return True, "ok"
-
-    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
-    assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert asked == ["power-cycle"], "the cold rung only; no warm reboot asked for"
-    assert reasons == [] and counters["power_cycles"] == 0
-
-    cooldown["on"] = False
-    assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert counters["power_cycles"] == 1 and reasons == [], "one power cycle, never a second reboot"
-    assert counters["resets"] == 0 and counters["dirty_cleared"] == 0, "held, never released unverified"
-
-
 def _arm_partial_drop(monkeypatch, off_bus):
     counters = _arm_offbus_stuck_hold(
         monkeypatch, off_bus=off_bus, isolated=set(), reset_result=False, sbr_verify_healthy=False
@@ -155,45 +74,6 @@ async def test_partial_drop_past_the_ladder_cycles_without_a_reboot(monkeypatch,
     assert counters["resets"] == 1, "the ladder runs before the host rung (only whole-tray skips it, I37)"
     assert counters["power_cycles"] == 1 and counters["reboots"] == 0
     assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
-
-
-@pytest.mark.asyncio
-async def test_present_mesh_wedge_reboots_first_with_both_rungs_armed(monkeypatch, clear_job_state):
-    """Review B1, class D: a present-mesh wedge the galaxy reset could not clear takes the warm
-    reboot first when both rungs are armed (the power cycle follows a failed reboot)."""
-    counters = _arm_stuck_hold(monkeypatch, reset_result=False, beats_after_reset={str(i): 100 for i in range(32)})
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert ran is True and counters["resets"] == 1
-    assert counters["reboots"] == 1 and counters["power_cycles"] == 0
-
-
-@pytest.mark.asyncio
-async def test_present_mesh_wedge_still_reboots_with_no_power_cycle(monkeypatch, clear_job_state):
-    """With the power cycle off the present-mesh wedge keeps its warm reboot rung."""
-    counters = _arm_stuck_hold(monkeypatch, reset_result=False, beats_after_reset={str(i): 100 for i in range(32)})
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert ran is True
-    assert counters["reboots"] == 1 and counters["power_cycles"] == 0
-
-
-@pytest.mark.asyncio
-async def test_a_denied_cycle_falls_back_to_the_reboot_on_a_recoverable_drop(monkeypatch, clear_job_state):
-    """Review B2: 16 of 32 off (not futile), the power cycle denied by the cooldown -> the warm
-    reboot fires now instead of holding to the cooldown's end. The fault is never cleared."""
-    counters = _arm_partial_drop(monkeypatch, 16)
-    asked = _deny(monkeypatch, "power-cycle")
-    events = []
-    patch_health_event(monkeypatch, lambda name, *a, **k: events.append((name, k)))
-
-    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert asked[:2] == ["power-cycle", "reboot"]
-    assert counters["reboots"] == 1 and counters["power_cycles"] == 0
-    assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
-    assert any(n == "power_cycle_reboot_fallback" and k.get("trigger") == "denied" for n, k in events)
 
 
 @pytest.mark.asyncio
@@ -235,21 +115,6 @@ def _cycle_never_launches(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_cycle_that_does_not_launch_falls_back_to_the_reboot(monkeypatch, clear_job_state):
-    """Review B2: an unreachable BMC (the cycle did not launch) on a recoverable drop takes the warm
-    reboot at once instead of retrying the cycle with no bound."""
-    counters = _arm_partial_drop(monkeypatch, 16)
-    cycles = _cycle_never_launches(monkeypatch)
-    events = []
-    patch_health_event(monkeypatch, lambda name, *a, **k: events.append((name, k)))
-
-    ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert ran is True
-    assert cycles["n"] == 1 and counters["reboots"] == 1
-    assert any(n == "power_cycle_reboot_fallback" and k.get("trigger") == "launch_failed" for n, k in events)
-
-
-@pytest.mark.asyncio
 async def test_a_cycle_that_does_not_launch_on_a_futile_drop_never_reboots(monkeypatch, clear_job_state):
     counters = _arm_partial_drop(monkeypatch, 8)
     cycles = _cycle_never_launches(monkeypatch)
@@ -264,32 +129,6 @@ def _gate_partial_drop(monkeypatch, tmp_path):
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     return reboots
-
-
-@pytest.mark.asyncio
-async def test_the_gate_falls_back_to_the_reboot_when_the_cycle_is_denied(monkeypatch, tmp_path, clear_job_state):
-    """Review B2 at the gate: a 16-of-32 drop the reset did not recover names the power cycle; the
-    cooldown denies it, so the warm reboot fires as the in-band fallback."""
-    reboots = _gate_partial_drop(monkeypatch, tmp_path)
-    cycles = {"n": 0}
-
-    async def fake_power_cycle(log, reason):
-        cycles["n"] += 1
-
-    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
-    _deny(monkeypatch, "power-cycle")
-
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-    assert cycles["n"] == 0 and reboots["n"] == 1
-
-
-@pytest.mark.asyncio
-async def test_the_gate_falls_back_to_the_reboot_when_the_cycle_does_not_launch(monkeypatch, tmp_path, clear_job_state):
-    reboots = _gate_partial_drop(monkeypatch, tmp_path)
-    cycles = _cycle_never_launches(monkeypatch)
-
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-    assert cycles["n"] == 1 and reboots["n"] == 1
 
 
 @pytest.mark.asyncio
@@ -415,34 +254,6 @@ async def test_the_gate_takes_no_second_fallback_reboot_when_the_cycle_does_not_
 
     await srv._device_health_gate(None, phase="post-job", run_fabric=False)
     assert cycles["n"] == 1 and reboots["n"] == 0
-
-
-@pytest.mark.parametrize(
-    "ledger, verified_ago, spent",
-    [
-        ([], 7200, False),  # no reboot at all
-        ([("reboot", 600)], 7200, True),  # a reboot since the verified release
-        ([("reboot", 600)], 300, False),  # a verified release followed it: it healed, a new wedge
-        ([("power-cycle", 600)], 7200, False),  # only a cycle: the reboot is still untried
-        ([("reboot", 600)], None, True),  # nothing verified on record: a recent reboot counts
-        ([("reboot", recovery_base.POWER_CYCLE_BACKOFF_CAP_SEC + 60)], None, False),  # too old to hold the cycle
-        ([("reboot", None)], 7200, True),  # an unreadable stamp counts (the cycle side is the safe one)
-    ],
-)
-def test_reboot_fallback_spent_counts_a_reboot_since_the_last_verified_release(
-    monkeypatch, ledger, verified_ago, spent
-):
-    now = 1_900_000_000.0
-    recs = [{"action": a, "boot_id": "b0", "at_epoch": None if ago is None else now - ago} for a, ago in ledger]
-    rm = srv.recovery_mechanism
-    monkeypatch.setattr(rm, "read_auto_recovery_ledger", lambda: recs)
-    verified = None if verified_ago is None else {"boot_id": "b1", "at_epoch": now - verified_ago}
-    monkeypatch.setattr(rm, "last_verified_release", lambda: verified)
-    assert bool(rm.reboot_fallback_spent(now_epoch=now)) is spent
-    if spent:
-        monkeypatch.setattr(rm, "auto_recovery_allowed", lambda *a, **k: (True, "ok"))
-        allowed, why = rm.fallback_reboot_allowed(tenant_active=False, now_epoch=now)
-        assert allowed is False and "already ran for this wedge" in why
 
 
 @pytest.mark.asyncio
