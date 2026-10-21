@@ -1179,7 +1179,11 @@ class RecoveryMechanism:
         log(message)
         health_event("mesh_reset_bmc_preflight_refused", argv=argv, owner=owner, reason=why)
         metrics.stage_fired("smi_reset", "blocked")
-        self.bmc_guard_state = {"kind": "preflight_refused", "reason": why, "at": datetime.now().isoformat(timespec="seconds")}
+        self.bmc_guard_state = {
+            "kind": "preflight_refused",
+            "reason": why,
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
         return message
 
     def _note_bmc_guard_output(self, argv: list[str], owner: str, rc: Optional[int], text: str, log) -> Optional[int]:
@@ -1198,7 +1202,11 @@ class RecoveryMechanism:
         if found["not_armed"] and not (found["refused"] or found["fallback"]):
             log("mesh reset NOT run: the ipmitool guard could not be armed (spec 04 I91)")
             health_event("mesh_reset_guard_not_armed", argv=argv, owner=owner, rc=rc)
-            self.bmc_guard_state = {"kind": "guard_not_armed", "reason": "the ipmitool guard could not be armed", "at": now}
+            self.bmc_guard_state = {
+                "kind": "guard_not_armed",
+                "reason": "the ipmitool guard could not be armed",
+                "at": now,
+            }
             return None
         sent = found["sent"]
         message = (
@@ -1208,7 +1216,11 @@ class RecoveryMechanism:
         )
         log(f"{message}; the mesh reset did not recover the device (spec 04 I91)")
         health_event("bmc_legacy_reset_attempted", argv=argv, owner=owner, rc=rc, sent=sent, host_at_risk=True)
-        self.bmc_guard_state = {"kind": "legacy_reset_sent" if sent else "legacy_reset_refused", "reason": message, "at": now}
+        self.bmc_guard_state = {
+            "kind": "legacy_reset_sent" if sent else "legacy_reset_refused",
+            "reason": message,
+            "at": now,
+        }
         if not self._bmc_guard_paged:
             event = {"kind": "bmc_legacy_reset_attempted", "sent": sent, "host_at_risk": True, "message": message}
             if alert.send_alert(event) is not None or alert.alert_argv() is None:

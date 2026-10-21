@@ -37,6 +37,9 @@ REAL_NAME = "ipmitool.real"
 GUARD_TAG = "# tt-device-mcp ipmi guard (spec 04 I91)"
 REFUSED_MARKER = "tt-device-mcp ipmi guard: REFUSED"
 NOT_ARMED_MARKER = "tt-device-mcp ipmi guard: NOT ARMED"
+# util-linux unshare's error when the private mount namespace cannot be made (e.g. not root): the
+# wrapper never ran, so the guard is not armed and the reset did not run either.
+UNSHARE_FAILED_TEXT = "unshare: unshare failed"
 GUARD_REFUSED_RC = 97
 # tt-smi prints this before it sends op_mode 0x0 (tt_smi/reset.py run_galaxy_ipmi_reset).
 TT_SMI_FALLBACK_TEXT = "falling back to legacy retimer reset"
@@ -135,7 +138,7 @@ def scan_reset_output(text: str) -> Optional[dict]:
     low = (text or "").lower()
     refused = REFUSED_MARKER.lower() in low
     fallback = TT_SMI_FALLBACK_TEXT in low
-    not_armed = NOT_ARMED_MARKER.lower() in low
+    not_armed = NOT_ARMED_MARKER.lower() in low or UNSHARE_FAILED_TEXT in low
     if not (refused or fallback or not_armed):
         return None
     return {"refused": refused, "fallback": fallback, "sent": fallback and not refused, "not_armed": not_armed}

@@ -8011,6 +8011,9 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
                 )
         # Spec 04 I76: the 10-min bound, the step it runs next and any cooldown that step waits on.
         payload["hold_bound"] = _hold_bound_health(now)
+    # Spec 04 I91: why the last mesh reset did not run or did not count (BMC preflight refused, guard
+    # not armed, tt-smi's op_mode 0x0 fallback refused or sent); null after a clean mesh reset.
+    payload["mesh_reset_bmc_guard"] = getattr(recovery_mechanism, "bmc_guard_state", None)
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
     # Spec 03 I71: the descriptor's port connections the last fabric pass found missing or extra, by
