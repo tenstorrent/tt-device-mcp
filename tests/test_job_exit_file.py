@@ -11,6 +11,7 @@ always a reset plus the full check before the next job.
 """
 
 import asyncio
+import json
 import os
 import subprocess
 import time
@@ -349,3 +350,154 @@ async def test_a_co_tenants_exit_0_never_releases_a_readopted_job_without_a_rese
 
     assert job.status is srv.JobStatus.FAILED and job.exit_code is None, (job.status, job.exit_code)
     assert len(marks) == 1 and "079" in marks[0] and "unknown" in marks[0], marks
+
+
+# --- the submitter's uid survives a broker restart ------------------------------------------------
+
+
+async def _submit_with_a_real_header(monkeypatch, tmp_path, peer_uid: int) -> str:
+    """Queue a job over the socket path as ``peer_uid`` and mark it started the way the runner
+    does, so its log on disk carries the header the broker really writes."""
+    from tt_device_mcp.socket_transport import current_peer_uid, current_via_mcp
+
+    srv.device_op_lock = None
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "get_activation_script", lambda *a, **k: ("", {}))
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    monkeypatch.setattr(srv, "job_runner_task", None)
+    monkeypatch.setattr(srv, "job_runner", lambda: asyncio.Event().wait())
+    mcp = srv.create_mcp_server()
+    tok, mtok = current_peer_uid.set(peer_uid), current_via_mcp.set(False)
+    try:
+        res = await mcp.call_tool(
+            "tt_device_job_run_bg", {"params": {"workspace": str(tmp_path), "command": "sleep 100"}}
+        )
+    finally:
+        current_peer_uid.reset(tok)
+        current_via_mcp.reset(mtok)
+    job_id = json.loads(res.content[0].text)["job_id"]
+    with open(srv.jobs[job_id].log_file, "a") as f:
+        f.write(f"[Started at {_ago(60)}]\n\n")
+    # The broker restarts: nothing in memory survives, only the scope and the log.
+    srv.jobs.clear()
+    srv.job_queue = asyncio.Queue()
+    return job_id
+
+
+async def _readopt_after_restart(monkeypatch, job_id: str, *, broker_euid: int) -> "srv.Job":
+    """reconcile_running_scopes re-adopts the job, then the (root) broker reads its exit file."""
+    monitors: list = []
+    monkeypatch.setattr(srv, "list_active_job_scopes", lambda: {job_id: f"ttdev-job-{job_id}.scope"})
+    monkeypatch.setattr(srv.asyncio, "create_task", lambda coro: monitors.append(coro))
+    monkeypatch.setattr(srv, "readopted_scopes", {})
+    await srv.reconcile_running_scopes()
+    assert len(monitors) == 1
+    # Under privsep the broker is root and the exit file belongs to the submitter: the test's own
+    # uid plays the submitter, so the broker's must be another one.
+    monkeypatch.setattr(srv.os, "geteuid", lambda: broker_euid)
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    await monitors[0]
+    return srv.jobs[job_id]
+
+
+@pytest.mark.asyncio
+async def test_a_readopted_privsep_jobs_clean_exit_is_still_its_own(monkeypatch, tmp_path, clear_job_state):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    marks = _recording_dirty(monkeypatch)
+    submitter = os.geteuid()
+    job_id = await _submit_with_a_real_header(monkeypatch, tmp_path, submitter)
+    (tmp_path / f"{job_id}.exit").write_text("0")  # the job's trap, as its submitter
+
+    job = await _readopt_after_restart(monkeypatch, job_id, broker_euid=submitter + 1)
+
+    assert job.peer_uid == submitter, "the submitter's uid did not survive the restart"
+    assert job.status is srv.JobStatus.COMPLETED and job.exit_code == 0, (job.status, job.exit_code)
+    assert marks == [], f"a verified clean exit was flagged for a reset: {marks}"
+
+
+@pytest.mark.asyncio
+async def test_a_co_tenants_file_is_still_unknown_for_a_readopted_job(monkeypatch, tmp_path, clear_job_state):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    marks = _recording_dirty(monkeypatch)
+    co_tenant = os.geteuid()
+    job_id = await _submit_with_a_real_header(monkeypatch, tmp_path, co_tenant + 2)
+    (tmp_path / f"{job_id}.exit").write_text("0")  # written by neither the broker nor the submitter
+
+    job = await _readopt_after_restart(monkeypatch, job_id, broker_euid=co_tenant + 1)
+
+    assert job.peer_uid == co_tenant + 2
+    assert job.status is srv.JobStatus.FAILED and job.exit_code is None, (job.status, job.exit_code)
+    assert len(marks) == 1 and job_id in marks[0] and "unknown" in marks[0], marks
+
+
+@pytest.mark.asyncio
+async def test_a_readopted_job_with_no_log_has_no_uid_and_its_status_stays_unknown(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The fallback Job of reconcile_running_scopes has no header to read a uid from: a file the
+    broker did not write is then no status (fail-safe), never a clean exit."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path / "logs")  # no log for this job
+    marks = _recording_dirty(monkeypatch)
+    srv.jobs.clear()
+    (tmp_path / "083.exit").write_text("0")
+    real = os.geteuid()
+
+    job = await _readopt_after_restart(monkeypatch, "083", broker_euid=real + 1)
+
+    assert job.command == "(re-adopted ttdev-job-083.scope)" and job.peer_uid is None
+    assert job.status is srv.JobStatus.FAILED and job.exit_code is None, (job.status, job.exit_code)
+    assert len(marks) == 1 and "083" in marks[0] and "unknown" in marks[0], marks
+
+
+def _header(job_id: str, *lines: str) -> str:
+    return "=" * 70 + "\n" + f"JOB ID:      {job_id}\n" + "".join(f"{ln}\n" for ln in lines)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A log from before the uid line: a tenant's command or env text must not stand in for it.
+        _header("084", "OWNER:       tenant", "COMMAND:     x", "SUBMITTER UID: 4242"),
+        _header("084", "OWNER:       tenant", "COMMAND:     echo\nSUBMITTER UID: 4242"),
+        # The line is only ever right after JOB ID, for this job.
+        _header("085", "SUBMITTER UID: 4242"),
+        "JOB ID:      084\nSUBMITTER UID: 4242\n",
+        _header("084", "SUBMITTER UID: -1"),
+        _header("084", "SUBMITTER UID: ٤٢"),
+    ],
+    ids=["old-header", "command-text", "other-job", "no-rule-line", "negative", "non-ascii-digits"],
+)
+def test_a_uid_anywhere_but_the_brokers_own_header_line_is_ignored(monkeypatch, tmp_path, text):
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    (tmp_path / "2026-10-20_100000_084.log").write_text(text + "[Started at 2026-10-20T10:00:00]\n")
+
+    job = srv._job_from_log("084")
+
+    assert job is not None and job.peer_uid is None, job and job.peer_uid
+
+
+def test_the_brokers_header_line_names_the_submitter(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    (tmp_path / "2026-10-20_100000_086.log").write_text(_header("086", "SUBMITTER UID: 4242", "OWNER:       t"))
+
+    assert srv._job_from_log("086").peer_uid == 4242
+
+
+@pytest.mark.parametrize("how", ["another-owner", "world-writable", "group-writable-foreign-group"])
+def test_a_log_another_user_could_have_written_names_no_submitter(monkeypatch, tmp_path, how):
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    log = tmp_path / "2026-10-20_100000_087.log"
+    log.write_text(_header("087", "SUBMITTER UID: 4242"))
+    log.chmod(0o644)
+    real = os.geteuid()
+    if how == "another-owner":
+        monkeypatch.setattr(srv.os, "geteuid", lambda: real + 1)
+    elif how == "world-writable":
+        log.chmod(0o646)
+    else:
+        log.chmod(0o664)
+        egid = os.getegid()
+        monkeypatch.setattr(srv.os, "getegid", lambda: egid + 1)
+
+    assert srv._job_from_log("087").peer_uid is None

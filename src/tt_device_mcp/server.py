@@ -2800,6 +2800,8 @@ def append_job_log(job_log_file: Path, stream: str, text: str):
 
 
 HEADER_FIELDS = {"JOB ID": "job_id", "OWNER": "owner", "COMMAND": "command", "QUEUED": "queued_at"}
+# The submitter's SO_PEERCRED uid, the header's line right after JOB ID (absent over HTTP).
+SUBMITTER_UID_FIELD = "SUBMITTER UID"
 FOOTER_FIELDS = {
     "FINISHED": "finished_at",
     "STATUS": "status",
@@ -10847,6 +10849,28 @@ def _readopted_deadline(job: "Job") -> float:
     return time.monotonic() + max(0.0, limit - served)
 
 
+def _job_log_submitter_uid(job_id: str, first: list[str], st: os.stat_result) -> Optional[int]:
+    """The submitter's uid the broker wrote into a job log's header, or None if it cannot be trusted.
+
+    Re-adoption needs it to accept the exit file the broker gave that uid (spec 01 I8), so it must
+    be something no tenant can forge. It is read only from the header's third line, right after
+    JOB ID and ahead of any text a tenant chose (owner, command, env, output), and only from a
+    regular file the broker owns that no other user can write. Anything else, a log from a broker
+    that did not write the line included, is None: the job's exit status then reads as unknown."""
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o002:
+        return None
+    if st.st_mode & 0o020 and st.st_gid != os.getegid():
+        return None
+    if len(first) < 3:
+        return None
+    k1, _, v1 = first[1].partition(":")
+    k2, _, v2 = first[2].partition(":")
+    if k1.strip() != "JOB ID" or v1.strip() != job_id or k2.strip() != SUBMITTER_UID_FIELD:
+        return None
+    v2 = v2.strip()
+    return int(v2) if v2.isascii() and v2.isdigit() else None
+
+
 def _job_from_log(job_id: str) -> Optional["Job"]:
     """Reconstruct a minimal Job from its persisted log header, for re-adoption."""
     if not job_log_dir:
@@ -10855,13 +10879,18 @@ def _job_from_log(job_id: str) -> Optional["Job"]:
     if not matches:
         return None
     path = matches[-1]
-    hdr, started = {}, None
+    hdr, started, first, peer_uid = {}, None, [], None
     try:
         with open(path, errors="replace") as fh:
+            st = os.fstat(fh.fileno())
             for _ in range(500):
                 line = fh.readline()
                 if not line:
                     break
+                if len(first) < 3:
+                    first.append(line)
+                    if len(first) == 3:
+                        peer_uid = _job_log_submitter_uid(job_id, first, st)
                 s = line.strip()
                 if s.startswith("[Started at ") and s.endswith("]"):
                     started = s[len("[Started at ") : -1].strip()
@@ -10888,6 +10917,7 @@ def _job_from_log(job_id: str) -> Optional["Job"]:
         started_at=started,
         timeout_sec=readopted_timeout,
         preemptable=hdr.get("PREEMPTABLE", "").lower() == "yes",
+        peer_uid=peer_uid,
     )
     job.log_file = str(path)
     return job
@@ -11217,6 +11247,8 @@ async def reconcile_running_scopes():
                 logger.warning(f"RE-ADOPT skipping job_id={job_id} (killed by device recovery): {fault_reason}")
             health_event("scope_reconcile_skipped_device_fault", job_id=job_id, scope=scope, reason=fault_reason)
             continue
+        # No log, no submitter uid (peer_uid None): its exit file then counts only if the broker
+        # owns it, so a privsep job's own status reads as unknown, never as exit 0 (spec 01 I8).
         job = _job_from_log(job_id) or Job(
             id=job_id, owner="?", workspace="/", command=f"(re-adopted {scope})", queued_at="", status=JobStatus.RUNNING
         )
@@ -13878,6 +13910,10 @@ def create_mcp_server() -> MCPServer:
             with open(job_log_file, "w") as f:
                 f.write("=" * 70 + "\n")
                 f.write(f"JOB ID:      {job_id}\n")
+                # Right after JOB ID, ahead of anything a tenant chose: re-adoption trusts this
+                # uid only at this line (_job_log_submitter_uid, spec 01 I8).
+                if current_peer_uid.get() is not None:
+                    f.write(f"{SUBMITTER_UID_FIELD}: {current_peer_uid.get()}\n")
                 f.write(f"OWNER:       {owner}\n")
                 f.write(f"WORKSPACE:   {workspace}\n")
                 f.write(f"COMMAND:     {command}\n")
