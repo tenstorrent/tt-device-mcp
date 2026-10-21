@@ -2,54 +2,32 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""The one capped repeat of a failed Galaxy mesh reset in a hold episode (spec 04 I93).
+"""Spacing of a hold episode's second Galaxy mesh reset (spec 04 I93).
 
-A first ``tt-smi -glx_reset`` that exits non-zero or fails the full check on a mesh with every chip on
-the bus may get ONE more mesh reset in the same hold episode, spaced and admitted so it ends before the
-10-min hold bound (spec 04 I76). A mesh reset is never killed mid-flight and its full check is not cut
-short, so neither can be abandoned at the bound: the repeat starts only when its WORST case (the worst
-mesh reset plus one full check pass) still ends by the bound, and its full check takes no 77 retry
-that would run past it. Everything here is a code constant: no env var, config key or CLI option
-changes the cap or turns the repeat off, and none brings back a removed rung.
+When a first ``tt-smi -glx_reset`` on a mesh with every chip on the bus fails (non-zero exit or a failed
+full check), the climb's last-chance sweep runs the episode's second mesh reset before the power cycle.
+That second reset heals far more often when it starts some minutes after the first ended than right
+after it, so the sweep waits for the gap, but never past the 10-min hold bound (spec 04 I76): at the
+bound the ladder runs at once. Code constants only: no env var, config key or CLI option changes the
+gap or turns it off, and none adds a third mesh reset.
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-# At most one repeat per hold episode: two mesh resets before the 10-min ladder. Most repeats that
-# heal a mesh heal on the second reset; later ones add little.
-MESH_RESET_REPEAT_CAP = 1
-# The repeat starts no sooner than this after the first reset ENDS: the gap before a repeat that
-# healed was rarely shorter.
-MESH_RESET_REPEAT_MIN_GAP_SEC = 200
-# Worst-case wall time of one mesh reset, and of one full check pass after it (fabric included; the
-# fabric check's own timeout).
-MESH_RESET_WORST_SEC = 263
-FULL_CHECK_WORST_SEC = 180
-# What a repeat may take, start to verdict: the admission sizes it at this, never at an estimate.
-REPEAT_WORST_SEC = MESH_RESET_WORST_SEC + FULL_CHECK_WORST_SEC
-# The hold bound the repeat must end before (spec 04 I76). A repeat never pushes it later.
+# The second mesh reset starts no sooner than this after the first ENDS, unless the bound comes first:
+# the gap before a second reset that healed was rarely shorter.
+MESH_RESET_MIN_GAP_SEC = 200
+# The hold bound (spec 04 I76) the wait never runs past.
 HOLD_BOUND_SEC = 600
 
 
-def plan(
-    *,
-    repeats_used: int,
-    hold_age_sec: float,
-    since_first_end_sec: Optional[float],
-) -> tuple[str, str, float]:
-    """Decide the repeat from the clock alone: ``("due", "", 0)``, ``("wait", why, seconds_left)``, or
-    ``("skip", why, 0)``. A skip leaves today's climb (the last-chance sweep, then the power cycle), and
-    the 10-min ladder's mesh reset is the episode's second. A due or waiting repeat ends, at its worst
-    case, by the bound."""
-    if repeats_used >= MESH_RESET_REPEAT_CAP:
-        return "skip", "cap_reached", 0.0
-    if since_first_end_sec is None:
-        return "skip", "first_reset_unknown", 0.0
-    wait = max(0.0, MESH_RESET_REPEAT_MIN_GAP_SEC - since_first_end_sec)
-    if hold_age_sec + wait + REPEAT_WORST_SEC > HOLD_BOUND_SEC:
-        return "skip", "cannot_end_before_bound", 0.0
-    if wait > 0:
-        return "wait", "min_gap", wait
-    return "due", "", 0.0
+def gap_wait(*, since_first_end_sec: Optional[float], hold_age_sec: Optional[float], bound_sec: float) -> float:
+    """Seconds the sweep's mesh reset still waits: the gap left after the first reset ended, cut so the
+    wait ends by the bound. 0 when nothing is known about the first reset or the hold clock (no wait),
+    or when the bound is reached."""
+    if since_first_end_sec is None or hold_age_sec is None:
+        return 0.0
+    left = min(MESH_RESET_MIN_GAP_SEC - since_first_end_sec, min(bound_sec, HOLD_BOUND_SEC) - hold_age_sec)
+    return max(0.0, left)

@@ -104,9 +104,8 @@ def reset_host_action_state():
             return
         m.host_action_requested = None
         m._host_action_reset_refused = None
-        # The capped mesh-reset repeat's per-process record (spec 04 I93): one test's repeat is not the next's.
+        # The last mesh reset's per-process record (spec 04 I93): one test's reset does not space the next's sweep.
         m.last_mesh_reset_run = None
-        m.mesh_reset_repeat_at = 0.0
 
     clear()
     yield
@@ -543,6 +542,12 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     monkeypatch.setattr(
         recovery_galaxy, "_settle_before_host_rung_sec", lambda: 0
     )  # no real pre-host-rung settle in tests
+
+    async def _no_gap_sleep(seconds):
+        return None
+
+    # No real wait for the spaced second mesh reset (spec 04 I93); its tests move a fake clock instead.
+    monkeypatch.setattr(recovery_galaxy, "_mesh_reset_gap_sleep", _no_gap_sleep)
     monkeypatch.setattr(srv, "device_op_active", "")
     monkeypatch.setattr(srv, "device_op_detail", "")
     monkeypatch.setattr(srv, "device_op_owner", "[broker]", raising=False)

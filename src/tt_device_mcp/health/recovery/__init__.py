@@ -300,7 +300,7 @@ class RecoveryDeps:
     note_fabric_77_reset_passes: Optional[Callable[[int], None]] = None
     # The open hold's fabric link-short cause (server._fabric_link_short_hold; "" when none): a lost
     # link, a latched topology mismatch or missing descriptor ports. Spec 04 I79/I83 send those holds
-    # to the power cycle after one ladder pass, so the capped mesh-reset repeat (I93) skips them.
+    # to the power cycle after one ladder pass, so the sweep never waits to space its mesh reset (I93).
     fabric_link_short_hold: Optional[Callable[[], str]] = None
     # Whether the open hold's fabric 77 has a cause no reset or reboot fixes — a known cable fault (a 78),
     # a topology mismatch, hugepages not yet allocated, the validator missing
@@ -728,15 +728,6 @@ class Recovery(ABC):
                     "eth-training wait; the fabric stays unverified until the build lands"
                 )
                 break
-            deadline = self.mechanism.post_reset_verify_deadline
-            retry_end = time.monotonic() + POST_RESET_FABRIC_RETRY_SLEEP_SEC + constants.FABRIC_CHECK_TIMEOUT_SEC
-            if deadline is not None and retry_end > deadline:
-                # Spec 04 I93: the repeat's check never runs past the 10-min bound; the fabric stays
-                # UNKNOWN (held, not recovered) and the bound's ladder runs on time.
-                log(
-                    "post-reset fabric could not verify (77) and a re-check would end past the hold bound — not retrying"
-                )
-                break
             retries += 1
             if fabric.names_dispatch_cap(evidence["fabric"].get("detail", "")):
                 # I84: the validator already moved traffic across every link, so they were trained;
@@ -766,7 +757,7 @@ class Recovery(ABC):
         FABRIC_DEBT.note_evidence(evidence)
         return healthy, evidence, retries
 
-    async def _reset_and_verify_device(self, indices: list, log, arc_retry: bool = True) -> Optional[bool]:
+    async def _reset_and_verify_device(self, indices: list, log) -> Optional[bool]:
         """Recover the device with ONE reset, performed safely, then prove it worked.
 
         Safety here is structural, not statistical — the reset is exclusive (the caller
@@ -787,16 +778,17 @@ class Recovery(ABC):
         """
         started = time.monotonic()
         try:
-            return await self._reset_and_verify_device_once(indices, log, arc_retry=arc_retry)
+            return await self._reset_and_verify_device_once(indices, log)
         finally:
             # The reset and its verify are over and the host is still up: an off-bus intent is spent.
             pcie_guard.end_offbus_reset()
             if self.mechanism.last_reset_monotonic >= started and "-glx_reset" in self.reset_argv(indices):
-                # A launched Galaxy mesh reset: the capped repeat paces itself from it (I93).
+                # A launched Galaxy mesh reset: the sweep spaces the episode's second from it (I93).
                 self.mechanism.last_mesh_reset_run = {
                     "episode": self.deps.device_hold_episode_since() or "",
                     "started": started,
-                    "ended": time.monotonic(),
+                    # The reset command's end, not its check's: the sweep's gap counts from here.
+                    "ended": max(started, self.mechanism.last_reset_ended_monotonic),
                 }
 
     async def _arc_not_ready_retry_due(self, argv: list, expected: int, log) -> bool:
@@ -831,8 +823,6 @@ class Recovery(ABC):
             "one more reset on the idle device (not a dead endpoint)"
         )
         health_event("reset_arc_not_ready_retry", argv=argv, arc_not_ready=not_ready, expected_chips=expected)
-        # This second reset is the episode's one capped repeat (spec 04 I93): no further one follows it.
-        self.mechanism.mesh_reset_repeat_at = time.monotonic()
         return True
 
     async def _reset_and_verify_device_once(self, indices: list, log, arc_retry: bool = True) -> Optional[bool]:
@@ -891,6 +881,7 @@ class Recovery(ABC):
         try:
             rc, out = await self.mechanism.reset_with_quiesce(argv, log)
         finally:
+            self.mechanism.last_reset_ended_monotonic = time.monotonic()
             if aer_mask is not None:
                 await asyncio.to_thread(aer_mask.restore)
         self.mechanism.last_reset_rc = rc

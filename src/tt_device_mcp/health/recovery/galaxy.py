@@ -13,7 +13,6 @@ import dataclasses
 import logging
 import math
 import os
-import signal
 import time
 from collections.abc import Mapping
 from datetime import datetime
@@ -21,7 +20,6 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import alert, metrics
-from tt_device_mcp.constants import PREEMPT_KILL_GRACE_SEC
 from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
@@ -60,23 +58,6 @@ from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_r
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
 
 _logger = logging.getLogger("tt-device-mcp")
-
-
-def _signal_pid(pid: int, sig: int) -> None:
-    try:
-        os.kill(pid, sig)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True
-    return True
 
 
 def _is_galaxy(board_types: Optional[list], glx_board_types: tuple) -> Optional[bool]:
@@ -252,6 +233,11 @@ def _offbus_hold_ceiling_sec() -> int:
     except ValueError:
         return 120
     return v if v > 0 else 120
+
+
+async def _mesh_reset_gap_sleep(seconds: float) -> None:
+    """The spaced sweep's wait for the gap after a failed first mesh reset (spec 04 I93)."""
+    await asyncio.sleep(seconds)
 
 
 def _settle_before_host_rung_sec() -> int:
@@ -1502,12 +1488,6 @@ class GalaxyRecovery(Recovery):
             if stage == STAGE_SMI_RESET and not await asyncio.to_thread(self.mechanism.scope_active):
                 failed = self.mechanism.failed_unchanged_entry("", "mesh_reset", ids_before) if ids_before else None
                 if failed is None and self.mechanism.mesh_reset_spent(hold_since):
-                    verdict, recovered = await self._mesh_reset_repeat(indices, expected, hold_since, log)
-                    if verdict == "ran":
-                        # Spec 04 I93: the episode's one capped repeat ran here.
-                        if not recovered:
-                            return OUTCOME_WAITING
-                        return OUTCOME_RECOVERED
                     # Spec 04 I87: this hold's one mesh reset already ran and failed. The gate never runs a
                     # second one in the episode; it reports the failed rung, so the routing below climbs to
                     # the power cycle (whose last-chance sweep is the one re-run allowed) or hands off.
@@ -1555,15 +1535,6 @@ class GalaxyRecovery(Recovery):
             # no reboot or power cycle.
             # No heartbeats passed: the sweep reads them itself, as the I37 hook does, rather than
             # count every chip off and take a partial drop for class C.
-            hold_since = self.deps.device_hold_episode_since() or ""
-            if self.mechanism.mesh_reset_spent(hold_since):
-                # Spec 04 I93: the episode's one capped mesh-reset repeat comes before the host rung when
-                # it can still end before the 10-min bound; a failed repeat climbs on from here.
-                verdict, recovered = await self._mesh_reset_repeat(indices, expected, hold_since, log)
-                if verdict == "wait" or (verdict == "ran" and recovered is None):
-                    return OUTCOME_WAITING
-                if verdict == "ran" and recovered:
-                    return OUTCOME_RECOVERED
             last_chance = await self._settle_and_verify_before_host_rung(
                 expected,
                 log,
@@ -1953,6 +1924,62 @@ class GalaxyRecovery(Recovery):
         age = _hold_age_sec(hold_since)
         return (hold_since, age is not None and age >= _stuck_hold_ceiling_sec())
 
+    async def _space_second_mesh_reset(self, expected: int, log, where: str) -> bool:
+        """Spec 04 I93: on a present mesh whose first Galaxy mesh reset in this hold episode failed, wait
+        until MESH_RESET_MIN_GAP_SEC after that reset ENDED before the sweep runs the episode's second,
+        but never past the 10-min bound (I76): at the bound it runs at once. True iff it waited.
+
+        No wait (the sweep runs at once, as before) unless all of: a Galaxy ``-glx_reset`` on more than
+        one chip; the hold clock known; this hold phase's sweep not spent; not a fabric link-short hold
+        (I79/I83: those go to the power cycle at once); every expected chip on the bus, none isolated or
+        removed (classes A, B and C keep their own paths); no BMC guard finding (I91); and the first
+        mesh reset ran in this episode. The wait holds the device (the hold stands, no job runs); the
+        sweep's own guards (tenant, a reset cycling in its scope, the I87 phase) are read after it."""
+        argv = self.reset_argv(list(range(expected)))
+        if expected <= 1 or "-glx_reset" not in argv or not ipmi_guard.is_mesh_reset(argv):
+            return False
+        hold_since = self.deps.device_hold_episode_since() or ""
+        age = _hold_age_sec(hold_since)
+        run = self.mechanism.last_mesh_reset_run
+        if age is None or run is None:
+            return False
+        phase = self._sweep_phase()
+        if phase is not None and self.mechanism.sweep_spent == phase:
+            return False
+        if self.deps.fabric_link_short_hold and self.deps.fabric_link_short_hold():
+            return False
+        now = time.monotonic()
+        # The first reset belongs to this episode: launched under its stamp, or ended inside it.
+        if run["episode"] != hold_since and run["ended"] < now - age:
+            return False
+        wait = mesh_repeat.gap_wait(
+            since_first_end_sec=now - run["ended"], hold_age_sec=age, bound_sec=_stuck_hold_ceiling_sec()
+        )
+        if wait <= 0:
+            return False
+        beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        if (
+            offbus_count(beats, expected)
+            or pcie_guard.chips_off_bus(expected)
+            or self.deps.isolated_chips()
+            or removed_chip_ids()
+            or self.mechanism.bmc_guard_state is not None
+        ):
+            return False
+        log(
+            f"last chance before the host rung{where}: the first mesh reset failed {int(now - run['ended'])}s ago "
+            f"— the sweep's mesh reset waits {int(wait)}s more (spec 04 I93), the hold stands"
+        )
+        health_event(
+            "mesh_reset_spaced",
+            held_since=hold_since,
+            wait_sec=round(wait, 1),
+            since_first_end_sec=round(now - run["ended"], 1),
+            hold_age_sec=round(age, 1),
+        )
+        await _mesh_reset_gap_sleep(wait)
+        return True
+
     async def _issue_all_resets_back_to_back(
         self, trays: list, expected: int, log, *, do_sbr: bool = True, mesh_reset: bool = True
     ) -> bool:
@@ -2049,6 +2076,8 @@ class GalaxyRecovery(Recovery):
         climbs), and None when the sweep was skipped or incomplete and the mesh is still bad: the
         full ladder has not run, so the caller holds and fires no host rung this pass (I22)."""
         where = f" ({context})" if context else ""
+        if await self._space_second_mesh_reset(expected, log, where):
+            offbus_chips = None  # the wait is over: what is off the bus now is read below
         tray_map = self._tray_map_now()
         if offbus_chips is None:
             try:
@@ -2330,17 +2359,6 @@ class GalaxyRecovery(Recovery):
         spent = self.mechanism.mesh_reset_spent(hold_since)
         if spent and not force and hold_since and self.mechanism.spent_climb_since == hold_since:
             return False
-        if spent and not force and off_bus == 0:
-            # Spec 04 I93: the episode's one capped mesh-reset repeat, before the climb, when it can still
-            # end before the 10-min bound. A skip climbs exactly as before.
-            verdict, recovered = await self._mesh_reset_repeat(indices, expected, hold_since, log)
-            if verdict == "wait":
-                return False
-            if verdict == "ran":
-                if recovered is False:
-                    self.mechanism.spent_climb_since = hold_since or None
-                    await self._climb_or_hand_off(expected, 0, hold_since, log, present_reset_failed=True)
-                return True
         if (
             not force
             and not spent
@@ -2434,142 +2452,12 @@ class GalaxyRecovery(Recovery):
         # recovers and self-heal never will. The reset is now spent for the episode (I87), so the climb
         # does not wait for the ceiling: the last-chance sweep once, then the power cycle, or an
         # operator when there is none (I36). Unforced, that climb runs once per episode. On a present
-        # mesh the episode's one capped repeat comes first when it can end before the bound (I93).
-        if off_bus_before == 0 and not force:
-            verdict, _ = await self._mesh_reset_repeat(indices, expected, hold_since, log)
-            if verdict == "wait":
-                return True
+        # mesh the sweep's mesh reset is spaced from this one (I93).
         self.mechanism.spent_climb_since = hold_since or None
         await self._climb_or_hand_off(
             expected, off_bus_before, hold_since, log, present_reset_failed=off_bus_before == 0
         )
         return True
-
-    async def _mesh_reset_repeat(self, indices: list, expected: int, hold_since: str, log) -> tuple:
-        """The episode's one capped mesh-reset repeat (spec 04 I93), asked for after its first mesh reset
-        failed. Returns ``("ran", recovered)``, ``("wait", None)`` while it is pending (the min gap, or a
-        live tenant on the device; the hold stands and the caller does not climb yet), or ``("skip",
-        None)``: the caller climbs exactly as before (the last-chance sweep, then the power cycle) and
-        the 10-min ladder's mesh reset is the episode's second.
-
-        Galaxy ``-glx_reset`` only, never a third mesh reset, and only when all of: not a fabric
-        link-short hold (lost link, latched topology mismatch, missing descriptor ports: spec 04 I79/I83
-        send those to the power cycle at once); every expected chip on the bus and no removed chip a
-        reset would rescan (classes A and C never repeat, nor does any partial drop); the first reset
-        showed no BMC guard finding and the BMC preflight passes now (op_mode 0x3, no 0x0 fallback,
-        spec 04 I91); the repeat starts at least MESH_RESET_REPEAT_MIN_GAP_SEC after the first ended and
-        its worst case (REPEAT_WORST_SEC) still ends by the 10-min bound, re-checked at launch; no
-        tenant; non-tenant readers of the device SIGTERMed, then SIGKILLed PREEMPT_KILL_GRACE_SEC later,
-        and gone. The full check (fabric included) runs after it, as after every reset, and takes no
-        post-reset 77 retry that would end past the bound."""
-        argv = self.reset_argv(indices)
-        if expected <= 1 or "-glx_reset" not in argv or not ipmi_guard.is_mesh_reset(argv):
-            return "skip", None
-        age = _hold_age_sec(hold_since)
-        if age is None:
-            return self._repeat_skipped("no_hold_clock", hold_since, log)
-        link_short = self.deps.fabric_link_short_hold() if self.deps.fabric_link_short_hold else ""
-        if link_short:
-            # Spec 04 I79/I83: a mesh reset does not heal a link-short hold; its power cycle is due at once.
-            return self._repeat_skipped("fabric_link_short", hold_since, log, detail=link_short)
-        now = time.monotonic()
-        window_start = now - age - mesh_repeat.MESH_RESET_REPEAT_MIN_GAP_SEC
-        run = self.mechanism.last_mesh_reset_run
-        # The first reset belongs to this episode: launched under its stamp, or ended inside it (a gate's
-        # reset can run just before the hold that it failed opened).
-        first_ok = run is not None and (run["episode"] == hold_since or run["ended"] >= now - age)
-        used = 1 if self.mechanism.mesh_reset_repeat_at and self.mechanism.mesh_reset_repeat_at >= window_start else 0
-        verdict, why, left = mesh_repeat.plan(
-            repeats_used=used,
-            hold_age_sec=age,
-            since_first_end_sec=(now - run["ended"]) if first_ok else None,
-        )
-        if verdict == "skip":
-            return self._repeat_skipped(why, hold_since, log)
-        beats = await asyncio.to_thread(self.deps.read_heartbeats)
-        if offbus_count(beats, expected) or pcie_guard.chips_off_bus(expected):
-            return self._repeat_skipped("chip_off_bus", hold_since, log)
-        if removed_chip_ids():
-            return self._repeat_skipped("removed_chip_unreset", hold_since, log)
-        if self.mechanism.bmc_guard_state is not None:
-            return self._repeat_skipped("bmc_guard_finding", hold_since, log)
-        if verdict == "wait":
-            log(f"mesh reset failed — its one repeat waits {int(left)}s more (spec 04 I93)")
-            return "wait", None
-        if await asyncio.to_thread(self.mechanism.scope_active):
-            return "wait", None
-        try:
-            refused = await self.mechanism.bmc_preflight()
-        except Exception as exc:  # noqa: BLE001 - a preflight that cannot decide does not let the repeat run
-            refused = f"the BMC preflight raised {exc!r}"
-        if refused:
-            return self._repeat_skipped("bmc_preflight_refused", hold_since, log, detail=refused)
-        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        blocker = self._tenant_blocker(scan)
-        if blocker is not None:
-            log(f"mesh reset repeat held off: {self._describe_blocker(blocker)}")
-            if self.mechanism.repeat_tenant_blocked_since != hold_since:
-                # Journalled once per episode, naming the blocker; the log line says it every tick.
-                self.mechanism.repeat_tenant_blocked_since = hold_since
-                health_event(
-                    "hold_bound_tenant_blocked",
-                    path="mesh_reset_repeat",
-                    held_since=hold_since,
-                    held_age_sec=int(age),
-                    **blocker,
-                )
-            return "wait", None
-        if not await self._evict_non_tenant_readers(scan, log):
-            return self._repeat_skipped("readers_remain", hold_since, log)
-        # Re-checked at launch: the preflight, the scans and the eviction took time, and nothing after
-        # this point can be abandoned (a reset is never killed mid-flight).
-        age = _hold_age_sec(hold_since)
-        left = mesh_repeat.HOLD_BOUND_SEC - (age if age is not None else mesh_repeat.HOLD_BOUND_SEC)
-        if left < mesh_repeat.REPEAT_WORST_SEC:
-            return self._repeat_skipped("cannot_end_before_bound", hold_since, log)
-        self.mechanism.mesh_reset_repeat_at = time.monotonic()
-        log(f"mesh reset failed {int(now - run['ended'])}s ago — its one repeat runs now (spec 04 I93)")
-        health_event(
-            "mesh_reset_repeat",
-            held_since=hold_since,
-            held_age_sec=int(age),
-            since_first_sec=int(now - run["ended"]),
-            first_reset_sec=int(run["ended"] - run["started"]),
-        )
-        ids_before = await self._offbus_ids_now(expected)
-        self.mechanism.post_reset_verify_deadline = time.monotonic() + left
-        try:
-            recovered = await self._reset_and_verify_device(indices, log, arc_retry=False)
-        finally:
-            self.mechanism.post_reset_verify_deadline = None
-        await self._note_mesh_reset_failed(recovered, hold_since, ids_before, expected)
-        if recovered:
-            self.deps.clear_device_reported_fault("mesh reset repeat recovered the mesh")
-            self.deps.clear_device_dirty(verified=True, why="mesh reset repeat recovered the mesh")
-        return "ran", recovered
-
-    def _repeat_skipped(self, why: str, hold_since: str, log, detail: str = "") -> tuple:
-        log(f"mesh reset repeat skipped: {why}{f' ({detail})' if detail else ''} (spec 04 I93)")
-        health_event("mesh_reset_repeat_skipped", reason=why, held_since=hold_since, detail=detail)
-        return "skip", None
-
-    async def _evict_non_tenant_readers(self, scan, log) -> bool:
-        """SIGTERM every non-tenant process that maps the device, SIGKILL any still alive
-        PREEMPT_KILL_GRACE_SEC later, then rescan. True when no holder is left."""
-        readers = [h for h in discount_broker_internal(scan).holders if not is_tenant(h)]
-        if readers:
-            log(f"mesh reset repeat: stopping {len(readers)} non-tenant reader(s) of the device first")
-            health_event("mesh_reset_repeat_readers", pids=[h.pid for h in readers])
-            for h in readers:
-                _signal_pid(h.pid, signal.SIGTERM)
-            deadline = time.monotonic() + PREEMPT_KILL_GRACE_SEC
-            while time.monotonic() < deadline and any(_pid_alive(h.pid) for h in readers):
-                await asyncio.sleep(0.5)
-            for h in readers:
-                if _pid_alive(h.pid):
-                    _signal_pid(h.pid, signal.SIGKILL)
-        after = discount_broker_internal(await asyncio.to_thread(self.deps.enumerate_device_holders))
-        return after.complete and not after.holders
 
     async def _offbus_gated_power_cycle(self, off_bus: int, expected: int, hold_since: str, log) -> Optional[bool]:
         """The bounded end of an off-bus hold the host reset gate refuses to reset (spec 04 I27).

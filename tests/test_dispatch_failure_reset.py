@@ -157,9 +157,8 @@ async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh, armed_power
     assert mesh["verifies"][-1] is True, "the post-reset check ran the fabric pass"
     assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
     assert armed_power_cycle == ["power-cycle"], "it climbs to the power cycle"
-    # Spec 04 I93: a reset inside the hold leaves no room for the capped repeat's worst case.
-    assert "mesh_reset_repeat_skipped" in mesh["events"] and "mesh_reset_repeat" not in mesh["events"]
-    assert "cannot_end_before_bound" in mesh["log"].text()
+    # Spec 04 I93: the sweep's mesh reset first waited out the gap after the dispatch reset.
+    assert "mesh_reset_spaced" in mesh["events"]
 
 
 @pytest.mark.asyncio
