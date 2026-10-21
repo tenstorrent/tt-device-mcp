@@ -3105,6 +3105,86 @@ async def test_a_dead_chip_stop_owes_the_pollers_a_restart_on_the_next_close(mon
 
 
 @pytest.mark.asyncio
+async def test_owing_the_pollers_inside_a_wider_quiesce_leaves_their_restart_to_its_owner(monkeypatch):
+    """Spec 04 I12: a reset step inside the startup fabric block that owes the pollers records no
+    owe of its own. The block's owner restarts them on exit through the same fitness rule, so a
+    close to HEALTHY inside the block starts nothing on the bus the check is still using."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+
+    async with srv._pollers_quiesced_for("the startup fabric check", lambda m: None):
+        srv._owe_device_pollers("tt-smi -glx_reset did not complete")
+        assert srv._pollers_owed is None
+        assert not health.read_health_events(kinds={"pollers_kept_quiesced"})
+        fsm_dirty(srv, "the step did not complete")
+        fsm_healthy(srv)
+        await asyncio.gather(*list(srv._pollers_restore_tasks))
+        assert not [c for c in calls if c[0] == "start"], calls
+
+    assert [c for c in calls if c[0] == "start"] == [("start", u) for u in DEFAULT_POLLERS]
+    assert srv._pollers_owed is None
+
+
+@pytest.mark.asyncio
+async def test_a_wider_quiesce_left_stopped_while_a_reset_cycles_owes_the_pollers(monkeypatch):
+    """The startup block's owner leaves the pollers stopped while a reset scope still cycles the chips.
+    The owe a reset inside it handed to that owner is not lost: the next close to HEALTHY starts them."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+    cycling = ["tt-reset-1"]
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: cycling[0])
+
+    async with srv._pollers_quiesced_for("the startup fabric check", lambda m: None):
+        srv._owe_device_pollers("tt-smi -glx_reset timed out")
+    assert not [c for c in calls if c[0] == "start"], calls
+    assert srv._pollers_owed and "tt-reset-1" in srv._pollers_owed
+
+    cycling[0] = None
+    fsm_dirty(srv, "the reset timed out")
+    fsm_healthy(srv)
+    await asyncio.gather(*list(srv._pollers_restore_tasks))
+    assert [c for c in calls if c[0] == "start"] == [("start", u) for u in DEFAULT_POLLERS]
+    assert srv._pollers_owed is None
+
+
+@pytest.mark.asyncio
+async def test_owing_the_pollers_outside_a_quiesce_starts_them_on_the_next_close(monkeypatch):
+    """The normal path: an owe with no wider quiesce is journaled once and the next close to HEALTHY
+    starts the pollers once."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(DEFAULT_POLLERS), calls))
+    srv._pollers_restore_record().update(DEFAULT_POLLERS)
+
+    srv._owe_device_pollers("tt-smi -r did not complete")
+    srv._owe_device_pollers("tt-smi -r did not complete")
+    assert srv._pollers_owed == "tt-smi -r did not complete"
+    assert len(health.read_health_events(kinds={"pollers_kept_quiesced"})) == 1
+
+    fsm_dirty(srv, "the step did not complete")
+    fsm_healthy(srv)
+    await asyncio.gather(*list(srv._pollers_restore_tasks))
+    assert [c for c in calls if c[0] == "start"] == [("start", u) for u in DEFAULT_POLLERS]
+    assert srv._pollers_owed is None
+
+
+def test_owing_the_pollers_with_no_running_loop_does_not_raise(monkeypatch):
+    """The owe hook runs from a thread with no event loop too (the dead-chip valve, a recovery
+    callback): it records the owe and keeps the loop an earlier owe recorded."""
+    earlier = asyncio.new_event_loop()
+    try:
+        monkeypatch.setattr(srv, "_pollers_owed_loop", earlier)
+        srv._owe_device_pollers("chip 13 dead")
+        assert srv._pollers_owed == "chip 13 dead"
+        assert srv._pollers_owed_loop is earlier
+    finally:
+        earlier.close()
+
+
+@pytest.mark.asyncio
 async def test_the_startup_quiesce_keeps_the_pollers_stopped_when_the_gate_holds(monkeypatch):
     """The startup fabric block: the forced gate held the mesh
     with 8/32 off the bus, and the block's exit restarted tt-telemetry onto it. A hold at the
@@ -13989,7 +14069,8 @@ async def test_a_stale_startup_hold_is_closed_with_the_time_it_was_really_held(m
     closed = _startup_releases()[0]
     assert closed["prior_why"] == "closed on broker start"
     assert closed["held_s"] == pytest.approx(60, abs=1)
-    assert "2026-10-13T10:07:49Z" in closed["detail"]
+    assert "2026-10-13T10:07:49Z" in closed["prior_detail"]
+    assert closed["fabric"] == {"result": "none"}, "no check proved a bookkeeping close"
 
 
 @pytest.mark.asyncio
@@ -14007,7 +14088,7 @@ async def test_a_stale_startup_hold_with_no_lift_in_the_journal_runs_to_the_rest
 
     closed = _startup_releases()[0]
     assert closed["held_s"] == pytest.approx(3600, abs=30)
-    assert closed["detail"] == "episode ended by a broker restart"
+    assert closed["prior_detail"] == "episode ended by a broker restart"
 
 
 _HOLD_KINDS = {"device_held", "device_released", "device_hold_orphan_closed"}
