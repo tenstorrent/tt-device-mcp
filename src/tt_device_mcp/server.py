@@ -13439,10 +13439,15 @@ def _sync_fsm_readopted_jobs() -> None:
     """Spec 03 I76: mirror startup_verify.readopted_job_ids into fsm.json's readopted_jobs ([] when the
     view is null), so a client that reads the file gets the answer /health gives. Called when the startup
     gate starts, on each re-adopted scope poll and when a re-adopted job ends; the FSM clears it itself on
-    a release or DOWN. Report-only, and never raises into its caller."""
+    a release or DOWN. Also mirrors whether the startup check is in progress, its start and its deadline
+    (startup_check_in_progress / _started_at / _deadline), which a fault hold clears too. Report-only,
+    and never raises into its caller."""
     try:
         view = _startup_verify_view()
         fsm.set_readopted_jobs(view["readopted_job_ids"] if view else [])
+        fsm.set_startup_check(
+            view["since"] if view else None, view["deadline"] if view else None, in_progress=view is not None
+        )
     except Exception as e:  # noqa: BLE001 - a report must never break the monitor or startup
         if logger:
             logger.warning(f"fsm readopted_jobs sync failed: {e}")
@@ -13665,6 +13670,7 @@ async def _verify_fabric_on_start() -> None:
             await asyncio.sleep(_SCOPE_POLL_SEC)
         _startup_verify_ready_at = time.monotonic()
         _startup_verify_ready_wall = time.time()
+        _sync_fsm_readopted_jobs()  # spec 03 I76: fsm.json gets the check's deadline
         # Read before the pass: a validator that lands while it runs must still be waited for.
         missing = await asyncio.to_thread(fabric.validator_missing)
         if missing and logger:
@@ -13698,6 +13704,10 @@ async def _verify_fabric_on_start() -> None:
             logger.error(f"STARTUP FABRIC check failed: {e}")
         health_event("startup_fabric_verify_errored", detail=str(e), host_at_risk=True)
         _mark_device_dirty(f"startup fabric verify errored before it could verify: {e}", why="gate_error")
+    finally:
+        # Spec 03 I76, report only: the check has ended (passed, held or errored), so fsm.json no
+        # longer says it is in progress. Lifts nothing: only the gate's own verdict does that.
+        fsm.set_startup_check(None, None, in_progress=False)
 
 
 async def _probe_on_per_user_start() -> None:

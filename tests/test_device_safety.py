@@ -15901,6 +15901,10 @@ async def test_the_startup_check_reports_when_it_began_and_its_deadline(monkeypa
     assert deadline == began + timedelta(seconds=srv.STARTUP_VERIFY_DEFER_MAX_SEC)
     assert srv.STARTUP_VERIFY_DEFER_MAX_SEC >= srv.STARTUP_HUGEPAGES_WAIT_SEC + srv.FABRIC_CHECK_TIMEOUT_SEC
     assert srv._health_payload()["startup_verify"]["deadline"] == view["deadline"]
+    raw = json.loads(srv.fsm._path.read_text())
+    assert raw["startup_check_in_progress"] is True, "fsm.json does not say the startup check is running"
+    assert (raw["startup_check_started_at"], raw["startup_check_deadline"]) == (view["since"], view["deadline"])
+    assert (raw["state"], raw["why"]) == ("recovering", "startup_unverified")
 
     from tt_device_mcp.socket_transport import current_peer_uid, current_via_mcp
 
@@ -15923,6 +15927,8 @@ async def test_the_startup_check_reports_when_it_began_and_its_deadline(monkeypa
     await release_job()
     assert srv.fsm.state is ServerState.HEALTHY
     assert srv._startup_verify_view() is None and srv._health_payload()["startup_verify"] is None
+    raw = json.loads(srv.fsm._path.read_text())
+    assert (raw["startup_check_in_progress"], raw["startup_check_deadline"]) == (False, None)
     out = await status("501")
     assert "hold_reason" not in out and "startup_verify" not in out, "the hold reason outlived the check"
 
