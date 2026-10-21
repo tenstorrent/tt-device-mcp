@@ -12399,6 +12399,10 @@ export {JOB_TAG_ENV}={job_tag}
                 if job.status not in (JobStatus.KILLED, JobStatus.HUNG):
                     if job.preempt_killed_monotonic is not None:
                         job.status = JobStatus.PREEMPTED
+                        if job.preempt_clean and job.preempt_exit_status == 0:
+                            # Spec 01 I20: the job shell's TERM trap exits 143 after the job's own
+                            # program has returned; the kernel's exit records proved the job's own 0.
+                            job.exit_code = 0
                         terminal_note = (
                             f"\n[PREEMPTED: a job waited {PREEMPT_GRACE_SEC}s past the {job.timeout_sec}s limit]"
                             + (" (ended cleanly on SIGTERM)" if job.preempt_clean else "")
@@ -12635,8 +12639,15 @@ export {JOB_TAG_ENV}={job_tag}
                 # open: something stopped it mid-run that the broker did not send (a signal it did not
                 # handle, often a child's, so its own exit can be a plain 1). Same mesh state, same
                 # debt (03 B-post-job clock check): a forced fabric pass first only 77s or fails on it.
+                # A preempted job is read whatever its exit code: its proven 0 (spec 01 I20) is a
+                # report, not a reason to skip the clock read it always had.
                 left_busy = (
-                    _aiclk_left_busy() if not killed_by_reset and not known and not topo and job.exit_code != 0 else {}
+                    _aiclk_left_busy()
+                    if not killed_by_reset
+                    and not known
+                    and not topo
+                    and (job.exit_code != 0 or job.status == JobStatus.PREEMPTED)
+                    else {}
                 )
                 if (
                     not killed_by_reset

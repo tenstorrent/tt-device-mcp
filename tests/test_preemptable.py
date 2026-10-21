@@ -604,6 +604,7 @@ async def test_a_preempted_job_that_ends_cleanly_on_sigterm_takes_the_fast_check
     assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
     assert job.preempt_clean is True
     assert job.preempt_exit_status == status
+    assert job.exit_code == 143, f"only a proven own 0 replaces the wrapper's 143: {job.exit_code}"
     assert made and made[0].closed, "the witness must be closed"
     assert dirty == [], "a clean end on SIGTERM must not owe a reset"
     assert owed == [], f"a clean end on SIGTERM must not owe the I69 reset: {owed}"
@@ -621,6 +622,7 @@ async def test_a_preempted_job_that_returns_0_on_sigterm_gets_no_check_and_no_re
     job, sent, gate, dirty, owed = await _preempt(monkeypatch, "966", "sleep 60", kill_grace=5)
     assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
     assert job.preempt_clean is True and job.preempt_exit_status == 0
+    assert job.exit_code == 0, "a handled SIGTERM with exit 0 must reach the broker as exit 0"
     assert made and made[0].closed
     assert dirty == [] and owed == [], (dirty, owed)
     assert gate == [], f"a preempted job that returned 0 was checked: {gate}"
@@ -651,6 +653,23 @@ async def test_a_preempted_exit_0_on_a_held_or_owing_device_keeps_its_gate(monke
 
 
 @pytest.mark.asyncio
+async def test_a_preempted_exit_0_that_left_chips_at_the_busy_clock_still_owes_the_reset(monkeypatch, clear_job_state):
+    """Reporting the proven 0 as exit code 0 changes no check: the post-job AI clock read still
+    runs for a preempted job, and chips left at the busy clock still owe the I69 reset (whose
+    debt then keeps the post-job gate), as they did while the job reported the wrapper's 143."""
+    srv._clear_device_dirty()
+    fsm_healthy(srv)
+    reads = []
+    monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: reads.append(1) or {"0": 1350})
+    _witness(monkeypatch, clean=True, status=0)
+    job, sent, gate, dirty, owed = await _preempt(monkeypatch, "968", "sleep 60", kill_grace=5)
+    assert job.preempt_clean is True and job.preempt_exit_status == 0
+    assert job.exit_code == 0
+    assert reads, "the clock read was skipped for a preempted exit 0"
+    assert owed and "busy AI clock" in owed[0], owed
+
+
+@pytest.mark.asyncio
 async def test_a_preempted_job_with_a_signal_death_is_reset_and_fully_checked(monkeypatch, clear_job_state):
     """Case (c): the tree was gone inside the 10 s grace, but a process of it died from the signal
     (the kernel's exit record says so): reset + full check, fabric included."""
@@ -672,6 +691,7 @@ async def test_a_preempted_job_that_needed_sigkill_is_reset_and_fully_checked(mo
     job, sent, gate, dirty, owed = await _preempt(monkeypatch, "963", "trap '' INT TERM; sleep 60", kill_grace=1)
     assert signal.SIGKILL in sent, sent
     assert job.preempt_clean is False
+    assert job.exit_code in (-9, 137), f"a SIGKILLed job keeps its signal death: {job.exit_code}"
     assert dirty
     assert owed == ["job 963 preempted"], f"a killed preemption must owe the I69 reset: {owed}"
     assert gate == [{"job_failed": True}]
@@ -1096,9 +1116,11 @@ async def test_the_real_job_wrapper_reports_a_handled_sigterm_by_the_jobs_own_st
     assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
     if want == "exit0":
         assert job.preempt_clean is True and job.preempt_exit_status == 0
+        assert job.exit_code == 0, "a handled SIGTERM with exit 0 must reach the broker as exit 0"
         assert dirty == [] and owed == [] and gate == [], "exit 0 on SIGTERM: no check and no reset"
     elif want == "fast":
         assert job.preempt_clean is True and job.preempt_exit_status == 3
+        assert job.exit_code == 143
         assert dirty == [] and owed == [] and gate == [{"job_failed": False}]
     else:
         assert job.preempt_clean is False

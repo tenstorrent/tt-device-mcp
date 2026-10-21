@@ -75,8 +75,9 @@ signal in that minute. The minute starts at the later of x and the waiting job's
 arrival. If a job is still waiting when the minute runs out, the broker kills the
 job's whole process tree (SIGTERM, then SIGKILL at most 10 s later). The job ends
 `preempted`. If the job returns 0, either by ending itself inside the minute or by
-handling SIGTERM so that every process exits through its own code, no health check and no
-reset run before the next job (unless the device was already held or owed a reset for
+handling SIGTERM so that every process exits through its own code with status 0 (read from
+the kernel's exit records, past the job wrapper's own `exit 143`; the job then reports exit
+code 0), no health check and no reset run before the next job (unless the device was already held or owed a reset for
 another reason). A frozen eth core left by such a job is then caught by the next job,
 within its runtime or the 300 s silent-hang limit; a fault the health sampler or the output
 scan sees still holds the device. If every process of the job exits through its own code on SIGTERM with
