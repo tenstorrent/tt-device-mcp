@@ -104,3 +104,29 @@ def test_the_leaking_pairs_pass_with_the_leaking_test_first():
     )
     passed = [line.split(" ", 1)[1] for line in run.stdout.splitlines() if line.startswith("PASSED ")]
     assert run.returncode == 0 and passed == LEAKING_PAIRS, run.stdout[-3000:]
+
+
+def test_the_isolation_dirs_go_in_one_session_dir(isolation_tmp_root, tmp_path_factory):
+    """The ~20 dirs each test's isolation makes land in one session dir, not pytest's base temp
+    dir, whose numbered `mktemp` lists that whole dir on every call (the suite went quadratic)."""
+    from tt_device_mcp.health import evidence
+    from tt_device_mcp.health.monitors import pci
+
+    assert isolation_tmp_root.parent == tmp_path_factory.getbasetemp()
+    for made in (Path(evidence.HEALTH_DIR), Path(pci.SYSFS_CLASS_DIR), Path(srv.TT_DEV_DIR)):
+        assert made.parent == isolation_tmp_root, made
+
+
+def test_making_an_isolation_dir_never_lists_its_root(tmp_path, monkeypatch):
+    """Constant cost per dir however many the run made: no listing of the shared root."""
+    from tests.conftest import _FlatTmpDirs
+
+    def no_listing(*_a, **_k):
+        raise AssertionError("listed the isolation root")
+
+    dirs = _FlatTmpDirs(tmp_path)
+    monkeypatch.setattr(os, "scandir", no_listing)
+    monkeypatch.setattr(os, "listdir", no_listing)
+    monkeypatch.setattr(Path, "iterdir", no_listing)
+    a, b = dirs.mktemp("health"), dirs.mktemp("health")
+    assert a != b and a.is_dir() and b.is_dir() and a.parent == b.parent == tmp_path
