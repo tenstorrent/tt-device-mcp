@@ -1127,3 +1127,19 @@ async def test_a_silent_job_past_its_limit_is_preempted_not_reaped(monkeypatch, 
     assert owed == ["job 972 preempted"], f"a preemption must owe the I69 reset: {owed}"
     assert dirty, "a preempted job must be flagged for the reset + full check"
     assert gate == [{"job_failed": True}], "a preempted job must reach the full (fabric) post-job gate"
+
+
+def test_sigkill_comes_ten_seconds_after_sigterm_and_the_docs_say_so():
+    """The job gets 10 s between SIGTERM and SIGKILL, not 5: the broker's constant, the spec and the
+    README state the same number."""
+    from pathlib import Path
+
+    from tt_device_mcp import constants
+
+    assert constants.PREEMPT_KILL_GRACE_SEC == 10
+    assert srv.PREEMPT_KILL_GRACE_SEC == constants.PREEMPT_KILL_GRACE_SEC
+    root = Path(__file__).resolve().parents[1]
+    readme = " ".join((root / "README.md").read_text().split())
+    spec = " ".join((root / "specs" / "01-jobs.md").read_text().split())
+    assert "(SIGTERM, then SIGKILL at most 10 s later)" in readme
+    assert "SIGKILL to both at most `PREEMPT_KILL_GRACE_SEC` (10 s) later" in spec
