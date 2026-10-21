@@ -926,7 +926,13 @@ each rung fires only when the gentler one failed or cannot apply.
   hold whose reset failed reaches the power cycle at once instead of after 8-10 min of repeated
   mesh resets (one replayed Galaxy episode: 1186 s before, 586 s now); a
   present-mesh wedge the reset does not heal: the sweep, then the cycle, then the full check; a
-  whole-tray drop: unchanged here (I37, straight to the cycle at the cooldown's end).
+  whole-tray drop: unchanged here (I37, straight to the cycle at the cooldown's end). Most mesh
+  resets one episode can run: the first reset, then the sweep's at most once per phase (one below the
+  10-min bound, one more as the bound's ladder when the cycle is held off past it), plus the I11
+  ARC-not-ready retry inside a reset call. A spent mesh reset also lets the power cycle fire before
+  the 10-min ceiling: the stuck-hold escalation journals `host_rung_not_deferred` (reason
+  `mesh_reset_spent`), runs the sweep once if this phase has not, then cycles, instead of waiting
+  out the ceiling with no rung left to try.
 
 - **I81 — A mesh reset re-adds the chips the broker isolated at tt-smi's driver wait.**
   `tt-smi -glx_reset` re-powers every tray, counts a 30 s settle, then waits up to 100 s for every
@@ -1131,8 +1137,15 @@ each rung fires only when the gentler one failed or cannot apply.
   D and G2 cycle right after the ladder (about 5-8 min with the boot) instead of a reboot (3-5 min)
   and then the cycle after the reboot's boot and the I65 cooldown (30 min to 4 h); a partial drop
   unchanged (it already cycled); a denied cycle holds to its stated deadline instead of rebooting; a
-  cycle that cannot launch holds and pages instead of one fallback reboot an hour; class A, C and
-  hosts with no power cycle armed unchanged.
+  cycle that cannot launch holds and pages instead of one fallback reboot an hour; class A and C
+  unchanged; an unkillable leftover (I70) with every chip present cycles at the end of its budget
+  (about 5-8 min with the boot) where it rebooted (3-5 min), about 2-3 min more, inside its 23 min
+  bound. Hosts with no power cycle armed (no root or `ipmitool`, or `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`):
+  every class that used to end in a reboot now holds and pages (`hold_bound_no_host_rung`, the
+  `all_chips_off_bus_power_cycle_required` and `reset_unrecoverable_power_cycle_required` events,
+  I70's `no_host_rung` stage) until an operator acts. That is the intended effect of the removal:
+  the reboot could not re-power a UBB or bring back an off-bus chip (above), and a hold that pages
+  replaces a reboot loop.
 
 - **I75 — The next rung `/health` names is the earliest one some code will fire.** One helper
   (`health/hold_report.py`, used by spec 03 I72) reads the hold-deadline watchdog's clocks, takes the
@@ -1238,8 +1251,11 @@ each rung fires only when the gentler one failed or cannot apply.
   after, up to `IDLE_HOLDER_SCAN_SEC` (60 s) while idle before the first scan opens the clock, 600 s
   plus at most one 60 s retry tick to the request, then the power cycle (about 5-8 min) and the startup check (about 3 min): about 19-23 min. Later only while the governor holds the rung, each bounded and
   shown as `held` on `/health`: the I65 cooldown when a cycle or boot fell within its last 30 min.
-  With no power cycle opted in the episode goes to an operator. The `gone` stage and
-  the second scan add no wait.
+  With no power cycle opted in the episode goes to an operator (journal stage `no_host_rung`, held
+  and paged). The power cycle replaced the removed warm reboot as this class's rung (I71): with every
+  chip present that costs about 2-3 min more (the cycle's 5-8 min against the reboot's 3-5 min),
+  inside the 23 min bound above; a host with no power cycle armed now holds where the reboot used to
+  clear the leftover. The `gone` stage and the second scan add no wait.
 
 - **I78 — The I81 driver-wait rescan repeats, bounded, until every isolated chip is back.** I81's
   one rescan comes at the start of tt-smi's 100 s driver wait; a chip whose link trains later in that
