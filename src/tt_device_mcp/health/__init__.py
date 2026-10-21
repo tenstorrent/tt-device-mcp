@@ -125,6 +125,7 @@ from tt_device_mcp.health.recovery.base import (
     host_action_pending_sec,
     mesh_hold_repage_sec,
     mesh_reset_hold_reason,
+    outage_hold_boot_warning,
     refuse_mesh_reset,
 )
 
@@ -240,6 +241,8 @@ __all__ = [
     # how long a requested host reboot/power cycle keeps the forced ladder from resetting
     "host_action_pending_sec",
     "mesh_reset_hold_reason",
+    # the boot warning an outage hold logs (spec 04 I28)
+    "outage_hold_boot_warning",
     "refuse_mesh_reset",
     # the escalation decision the gate acts on: the evidence it hands next_stage, and every
     # decision value that comes back which is not itself a stage name
