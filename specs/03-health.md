@@ -1107,8 +1107,8 @@ cooldown (spec 04 I65) holds longer.
   returns. The stand-down is re-read after every await of the forced run's prelude, under the
   device-op lock, and again at the ladder's last tenant check before any rung (as blocker
   `startup_verify`, after `job_running`): a re-adopted job that ends while the forced run or the
-  relift is already on its way gets no reset before the startup gate. Only the ceiling window and the off-bus one-shot stand down, the kinds whose window is
-  given back; every other forced kind (power-cycle cooldown retry, I39 progress retry, the off-bus
+  relift is already on its way gets no reset before the startup gate. Only the ceiling window, the off-bus one-shot and spec 04 I83's
+  at-start link-short ladder stand down, the kinds whose window is given back; every other forced kind (power-cycle cooldown retry, I39 progress retry, the off-bus
   hand-off bounds, the spec 04 I76 host rung) runs as before. While the re-adopted job runs, both meet it
   as before: the ladder defers on blocker `job_running`. A chip that drops while the gate is
   pending keeps the off-bus one-shot (I23) and its ladder; it does not wait for the gate. The startup gate runs the
