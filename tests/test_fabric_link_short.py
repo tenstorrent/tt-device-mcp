@@ -178,14 +178,13 @@ async def test_a_rehold_of_another_class_after_a_carried_at_start_ladder_asks_fo
 
 
 async def _opted_out_or_denied(monkeypatch, escalations, events, how):
-    """The real host rung, with both host rungs opted out or the power cycle denied for a reason that is
+    """The real host rung, with the power cycle (the only host rung) opted out or denied for a reason that is
     not the cooldown (a stand-back check)."""
     monkeypatch.setattr(srv, "_hold_bound_host_rung", _REAL_HOST_RUNG)
     monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
     monkeypatch.setattr(srv, "_bound_tenant_blocker", lambda *a: None)
     monkeypatch.setattr(srv.recovery_mechanism, "_journal_auto_recovery_denied", lambda *a: None)
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: how == "denied")
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(
         srv.recovery_mechanism, "auto_recovery_allowed", lambda action, **k: (False, "another host action stands")
     )
@@ -203,7 +202,7 @@ async def test_an_at_start_ladder_whose_host_rung_never_fired_does_not_stand_in_
 ):
     """The at-start ladder is a forced run below the
     bound. When the host rung after it was never granted, the full ladder still runs at the 10-min mark,
-    and the later windows follow I76 as for any hold (a ladder each window when both host rungs are opted
+    and the later windows follow I76 as for any hold (a ladder each window when the power cycle is opted
     out; a denied rung stays pending and is asked again each tick)."""
     escalations, _alerts, events = _arm(monkeypatch, "topology mismatch")
     await _opted_out_or_denied(monkeypatch, escalations, events, how)
