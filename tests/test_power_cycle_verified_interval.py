@@ -82,26 +82,6 @@ def test_a_verified_cycle_does_not_block_the_reboot_rung(ledger, tmp_path):
     assert _allowed("reboot") == (True, "")
 
 
-def test_a_reboot_after_a_verified_cycle_keeps_its_own_guards_and_hands_off_to_the_cycle(ledger, tmp_path, monkeypatch):
-    """The reboot the verified cycle no longer blocks is still spaced by its own interval and the
-    per-boot cap, and a reboot that did not heal the box climbs to the power cycle on the next boot."""
-    _stamp(tmp_path)
-    rm = srv.recovery_mechanism
-    assert rm.record_auto_recovery("reboot", "partial drop", now_epoch=REDROP_AT)
-    assert _allowed("reboot", at=REDROP_AT + 1)[0] is False, "per-boot cap"
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-C")  # the reboot came back still dropped
-    back = REDROP_AT + 240
-    allowed, why = _allowed("reboot", at=back)
-    assert allowed is False and "boot-loop guard" in why, "a reboot never re-fires inside its interval"
-    assert rm._reboot_already_attempted(now_epoch=back), "the chooser now offers the power cycle"
-    # The verified cycle spaces nothing; the failed reboot is the I65 cooldown's anchor, so the cycle
-    # fires the moment that cooldown ends, not the cycle's own interval later.
-    allowed, why = _allowed("power-cycle", at=back)
-    assert allowed is False and "broker reboot" in why and "1800s cooldown" in why
-    assert _allowed("power-cycle", at=REDROP_AT + 1800) == (True, "")
-    assert _allowed("reboot", at=REDROP_AT + recovery_base.AUTO_RECOVERY_MIN_INTERVAL_SEC)[0] is True
-
-
 def test_past_the_backstop_a_verified_cycle_gates_the_reboot_again(ledger, tmp_path, monkeypatch):
     """The fixed boot-loop backstop: once POWER_CYCLE_BACKSTOP_MAX cycles ran in the window, no cycle
     counts as proof, so the reboot waits out the interval behind the newest one as before."""
@@ -180,6 +160,7 @@ def test_the_backstop_is_a_stated_bounded_wait_retried_at_its_end(ledger, tmp_pa
     assert allowed is False and "backstop" in why
     assert rm.power_cycle_cooldown_state["until"] == until
     assert rm.power_cycle_cooldown_state["cause"] == "power-cycle backstop"
+    assert not rm.power_cycle_retry_cooldown, "no cycle ran: the 10-min bound's ladder is not deferred (I76)"
     assert not rm.power_cycle_retry_due(until - 1)
     assert rm.power_cycle_retry_due(until)
 

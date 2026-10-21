@@ -9,6 +9,7 @@ import json
 
 import pytest
 
+from tt_device_mcp import server as srv
 from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health.monitor import HealthMonitor, moved_trays
 from tt_device_mcp.health.monitors import fabric
@@ -83,6 +84,24 @@ async def test_a_mismatch_reruns_traffic_only_and_an_ok_names_it_and_pages_once(
     assert state["events"][0][1]["moved_trays"] == ["tray 1 -> tray 3 (1 chips)"]
     await m._verify_fabric_health_body(60)
     assert len(state["alerts"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_hold_bound_keeps_the_latch_so_a_discovered_links_pass_is_not_a_pass(topo, monkeypatch):
+    """Spec 03 I42 / 04 I76: a moved tray's lift failed its first job. At the bound the latch stands, so
+    the check after the bound ladder passing on the discovered links again must not release (the next job
+    would fail and latch again, never reaching the power cycle): it fails, so the host rung follows."""
+    m, state = topo
+    m.topology_hw_fault = "hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)"
+    monkeypatch.setattr(srv, "health_monitor", m)
+    srv._lift_hold_bound_latches(lambda line: None)
+    assert m.topology_hw_fault, "the bound does not lift the I42 latch"
+    ok, detail = await m._verify_fabric_health_body(60)
+    assert ok is False and "after the lift's first job failed on the fabric" in detail
+    assert m.topology_lift_pending is False, "no new lift is armed"
+    assert not srv._names_topology_mismatch(detail), "a measured fault, not a no-reset topology hold"
+    m.adopt_fabric_pass("all links ok\n")
+    assert m.topology_hw_fault == "", "a clean pass on the full topology ends it"
 
 
 @pytest.mark.asyncio

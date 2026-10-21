@@ -50,8 +50,10 @@ from tt_device_mcp.health.recovery.stages.bridge_reset import (
 # A `next_stage` decision that is not a stage name: WAIT (the wedge may self-heal; do nothing),
 # DEFER (a reset is already cycling; adopt and verify it, start nothing new), RELEASE (the door
 # opens — nothing is wrong, or the last action just proved it), HOLD_FABRIC_UNVERIFIED (a fabric
-# pass that ran but reached no verdict; hold without resetting), or BLOCKED (a drop no opted-in
-# rung can recover — distinct from WAIT, which means "it may self-heal"). The stage names below
+# pass that ran but reached no verdict; hold without resetting), BLOCKED (a drop no opted-in
+# rung can recover — distinct from WAIT, which means "it may self-heal"), or BELOW_FLOOR (fewer
+# chips are gone than the mesh-wide reset needs to be worth its blast radius: classify the drop —
+# a whole tray goes straight to the power cycle, anything else waits for the hold bound's ladder). The stage names below
 # are constants.STAGE_NAMES' own values, re-bound here (not re-exported by import: pyflakes reads
 # a bare re-export as an unused import) so a decision routes straight to the name
 # metrics.stage_fired() and _HOST_ESCALATION_STAGE use.
@@ -60,10 +62,9 @@ DEFER = "defer"
 RELEASE = "release"
 HOLD_FABRIC_UNVERIFIED = "hold_fabric_unverified"
 BLOCKED = "blocked"
+BELOW_FLOOR = "below_floor"
 STAGE_BRIDGE_RESET = constants.STAGE_BRIDGE_RESET
 STAGE_SMI_RESET = constants.STAGE_SMI_RESET
-STAGE_UBB_TRAY = constants.STAGE_UBB_TRAY
-STAGE_HOST_REBOOT = constants.STAGE_HOST_REBOOT
 STAGE_POWER_CYCLE = constants.STAGE_POWER_CYCLE
 
 # Recovery.escalate's outcome.
@@ -77,6 +78,9 @@ OUTCOME_TERMINAL = "terminal"
 # is what turns a ~13 min recovery into a ~seconds one.
 BRIDGE_RESET_MAX_TRIES = 3
 BRIDGE_RESET_SETTLE_SEC = 4
+# The bridge rung's reason for a removed chip whose every recorded-bridge SBR fired and left it off
+# the bus (spec 04 I69): no SBR brings it back, the same no-window fact as no_bridge.
+NO_WINDOW_REMOVED_REASON = "removed_not_reenumerated"
 
 # A reset returns before the eth links re-train, so the immediate post-reset fabric pass can find
 # no trained link (77). Retry (see Recovery._verify_device_after_reset), giving the links time to
@@ -154,14 +158,6 @@ class Evidence:
     # Spec 03 I55: the fabric passed traffic but mesh dispatch failed over a present mesh, and this
     # hold episode has not had its one present-mesh reset yet (nor does the outage hold forbid it).
     dispatch_reset_due: bool = False
-    # ladder-v2: the per-chip SBR outcome the bridge rung produced THIS pass — chip id ->
-    # ``{"reason": "no_bridge"}`` for every chip whose secondary bus reset could not fire because
-    # the endpoint left the bus (no bridge to write to). Threaded by the server's ``replace(ev, …)``
-    # AFTER the bridge rung fires (from ``Recovery.last_bridge_reset_reasons``), read only by the
-    # STAGE_UBB_TRAY gate rung to classify the hold (:func:`galaxy._classify_hold`). ``next_stage``
-    # never reads it — the router stays pure; only the tray rung's fire does. None when no bridge
-    # rung ran this pass, which reads as "window unknown" -> the generic branch.
-    bridge_reset_failed: Optional[dict] = None
     # This hold episode's galaxy reset already REGRESSED the off-bus count (spec 04 I31): a failed
     # reset on it is warm-reboot-futile even when this pass's own count did not grow.
     episode_reset_regressed: bool = False
@@ -196,8 +192,7 @@ class RecoveryDeps:
     begin_action_row: Callable[[str, str], None]
     write_action_log: Callable[[str, str, float, str, Optional[int]], None]
     device_hold_episode_since: Callable[[], str]
-    # GalaxyRecovery's host-escalation ladder (reboot/power-cycle opt-ins + the loop-guard read):
-    auto_reboot_enabled: Callable[[], bool]
+    # GalaxyRecovery's host-escalation ladder (the power-cycle opt-in; spec 04 I71):
     auto_power_cycle_enabled: Callable[[], bool]
     # HealthMonitor's own probes (verify_fabric_health/verify_eth_heartbeat): the job-killing
     # ladder and the module logger both live in server.py, not in the health package, so they are
@@ -238,8 +233,6 @@ class RecoveryDeps:
     # flag above, which stays True for the whole episode and is what the journal/reporting read.
     hold_escalation_latched: Callable[[], bool]
     set_device_hold_episode_escalated: Callable[[bool], None]
-    device_hold_episode_ubb_reset_fired: Callable[[], bool]
-    set_device_hold_episode_ubb_reset_fired: Callable[[bool], None]
     clear_device_reported_fault: Callable[[str], None]
     clear_device_dirty: Callable[..., None]
     # Whether the mesh is CURRENTLY dirty, unverified, or carrying a runtime-reported fault —
@@ -249,11 +242,10 @@ class RecoveryDeps:
     # recover, not just the one (_reset_and_verify_device) that happens to also flip a
     # RecoveryMechanism-wide flag another, unrelated reset could have set.
     device_degraded: Callable[[], bool]
-    # The two host-level rungs' OTHER half — GalaxyRecovery gets _auto_reboot_host (it is
-    # Galaxy-only in practice); the chassis power cycle and the loud whole-bus event stay
+    # The host rung's OTHER half — the chassis power cycle and the loud whole-bus event stay
     # server-owned (the gate journals that event itself, and the power cycle's ledger row and job
     # entry are server state), so they are injected rather than moved.
-    # Returns False when the cycle certainly did not launch (spec 04 I71: the in-band fallback).
+    # Returns False when the cycle certainly did not launch (spec 04 I71: hold, page, retry).
     auto_power_cycle_host: Callable[[Callable, str], Awaitable[Optional[bool]]]
     emit_all_off_bus_power_cycle_required: Callable[[Callable, int, int, str], None]
     host_escalation_kwargs: Callable[[], dict]
@@ -261,7 +253,7 @@ class RecoveryDeps:
     # that server.py re-exports by import and tests monkeypatch on ``server.<name>`` to drive the
     # moved bodies' behavior deterministically — see the class docstring. Real server-side callers
     # of these three remain (the gate, the startup probe, the exec/reset tools), which is what
-    # distinguishes them from e.g. ``reset_chip_via_bridge`` or ``_fire_ubb_reset``, which have
+    # distinguishes them from e.g. ``reset_chip_via_bridge``, which has
     # none and so are imported directly where the moved bodies need them instead.
     read_heartbeats: Callable[[], dict]
     heartbeat_supported: Callable[[], bool]
@@ -278,7 +270,7 @@ class RecoveryDeps:
     # deps fixture — may supply its own bindings, which boot leaves untouched).
     board_types_provider: Optional[Callable[[], Optional[list]]] = None
     glx_board_types_provider: Optional[Callable[[], tuple]] = None
-    # {chip index: PCI address}, the map the tray rung derives its trays from (spec 04 I16). Same
+    # {chip index: PCI address}, the map tray placement is derived from (spec 04 I16). Same
     # injection reason as the two above: the cache lives on the HealthMonitor singleton.
     chip_buses_provider: Optional[Callable[[], Optional[dict]]] = None
     journal_skip_once: Optional[Callable[[str, str], None]] = None
@@ -456,10 +448,16 @@ class Recovery(ABC):
         """
         # ladder-v2: the per-chip SBR window this rung reads, chip id -> {"reason": "no_bridge"} for
         # every chip whose reset could not fire because the endpoint left the bus. Reset FRESH every
-        # call (before the empty-set early return), so a later gate never classifies a hold on a
-        # stale prior pass; the server threads it onto Evidence.bridge_reset_failed after this fires.
+        # call (before the empty-set early return), so a later reader never sees a stale prior pass.
         self.last_bridge_reset_reasons: dict = {}
         isolated_chips = self.deps.isolated_chips()
+        # Spec 04 I69: every chip the broker removed is off the bus and un-reset, so it is a target
+        # whether or not this pass was asked for it (a record reloaded after a restart, say). Left out,
+        # the rescan any other chip's reset ends with would re-enumerate it un-reset.
+        adopted = [i for i in pci.removed_chip_ids() if i not in isolated_chips]
+        if adopted:
+            isolated_chips.update(adopted)
+            health_event("removed_chips_isolated", chips=adopted, context="bridge_reset")
         if not isolated_chips:
             return True
         targets = sorted(isolated_chips, key=int)
@@ -550,10 +548,8 @@ class Recovery(ABC):
                 continue
             if not sbr:
                 inapplicable.append(idx)
-                # NOT no_bridge: that means the endpoint left the bus, which is the drop measured
-                # never to return and the one _classify_hold escalates straight to a power cycle
-                # on. Nothing was written here, so the window is unproven — a distinct reason
-                # keeps it out of that class rather than licensing the sweep on an untested chip.
+                # NOT no_bridge: that means the endpoint left the bus. Nothing was written here,
+                # so the window is unproven, and a distinct reason says so.
                 self.last_bridge_reset_reasons[idx] = {"reason": "no_privilege"}
                 # blocked, not not_applicable: metrics.STAGE_OUTCOMES reserves not_applicable for
                 # a platform fact that will never change. A missing euid or package is the most
@@ -605,6 +601,11 @@ class Recovery(ABC):
                     await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
             else:
                 lost.append(idx)
+                if idx in reset_this_pass:
+                    # A chip the broker removed, reset through its recorded bridge on every try and
+                    # still off the bus: no SBR brings it back, the same no-window fact as no_bridge
+                    # (spec 04 I69).
+                    self.last_bridge_reset_reasons[idx] = {"reason": NO_WINDOW_REMOVED_REASON}
                 metrics.stage_fired("bridge_reset", "failed")
 
         for idx in recovered:
@@ -627,10 +628,10 @@ class Recovery(ABC):
         )
 
         # Spec 04 I69: never re-enumerate a removed chip that was not reset this pass — the rescan
-        # lets the driver probe a hung chip. A refused host reset gate withholds it only then (the
-        # removed chips were not reset because of it); chips the broker never removed keep the
-        # bare rescan, as before the gate.
-        unreset_dead = [i for i in still_dead if pci.removed_chip(i) and i not in reset_this_pass]
+        # lets the driver probe a hung chip. Every record counts, not only this pass's targets: the
+        # rescan is global. A refused host reset gate withholds it only then (the removed chips were
+        # not reset because of it); chips the broker never removed keep the bare rescan, as before.
+        unreset_dead = [i for i in pci.removed_chip_ids() if i not in reset_this_pass]
         withhold = ("host_reset_gated" if gated else "removed_chip_not_reset") if unreset_dead else ""
         if still_dead and withhold:
             health_event("pci_rescan_withheld", chips=still_dead, unreset=unreset_dead, reason=withhold)
@@ -700,15 +701,26 @@ class Recovery(ABC):
         ``healthy`` is None: never a recovery (no hold is cleared onto a fabric no pass proved, the box D
         shape: enum+ARC read OK while every full-mesh job died on a down link), and never a failed reset
         either (a 77 measured nothing, so it must not arm the host rungs). Falsy, so a caller that only
-        asks "recovered?" still reads no. Returns ``(healthy, evidence, fabric_retries)``."""
+        asks "recovered?" still reads no. A 77 from a validator that is not built yet (spec 03 I81) gets no
+        retry and no eth-training wait: it is the same UNKNOWN at once. Returns ``(healthy, evidence,
+        fabric_retries)``."""
         healthy, evidence = await self._verify_device(expected, log)
         retries = 0
+        not_built = None
         while (
             self._fabric_ran_but_unverified(evidence)
             and healthy
             and expected > 1
             and retries < POST_RESET_FABRIC_RETRIES
         ):
+            not_built = fabric.validator_not_built()
+            if not_built is not None:
+                # I81: the 77 is a validator that is not on disk; no wait for eth training makes it run.
+                log(
+                    f"post-reset fabric could not run: fabric validator not built ({not_built}) — no "
+                    "eth-training wait; the fabric stays unverified until the build lands"
+                )
+                break
             retries += 1
             if fabric.names_dispatch_cap(evidence["fabric"].get("detail", "")):
                 # I84: the validator already moved traffic across every link, so they were trained;
@@ -726,8 +738,13 @@ class Recovery(ABC):
             healthy, evidence = await self._verify_device(expected, log)
         if healthy and expected > 1 and self._fabric_ran_but_unverified(evidence):
             log(
-                "post-reset fabric still could not verify after eth-training retries — the fabric is UNKNOWN "
-                "(enum+ARC healthy, no pass got a verdict): not recovered, and not a failed reset"
+                (
+                    "post-reset fabric could not verify (fabric validator not built)"
+                    if not_built
+                    else "post-reset fabric still could not verify after eth-training retries"
+                )
+                + " — the fabric is UNKNOWN (enum+ARC healthy, no pass got a verdict): not recovered, and not "
+                "a failed reset"
             )
             healthy = None
         FABRIC_DEBT.note_evidence(evidence)
@@ -869,7 +886,7 @@ class Recovery(ABC):
             if rc is not None:
                 self.mechanism.last_reset_failed = True
                 self.mechanism.last_reset_exit_nonzero = True
-                self.mechanism.mesh_reset_failed_since_release = True
+                self.mechanism.mark_mesh_reset_failed()
             metrics.stage_fired("smi_reset", "timeout" if rc is None else "failed")
             if rc is not None and arc_retry and await self._arc_not_ready_retry_due(argv, expected, log):
                 # The retry is this same gated path (host gate, outage hold, cooldown clock, full verify
@@ -917,7 +934,7 @@ class Recovery(ABC):
         )
         self.mechanism.last_reset_failed = not healthy
         if not healthy:
-            self.mechanism.mesh_reset_failed_since_release = True
+            self.mechanism.mark_mesh_reset_failed()
         if healthy:
             log("reset complete + health verified")
             return True

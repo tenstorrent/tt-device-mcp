@@ -27,7 +27,7 @@ from tt_device_mcp.health import post_reset
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
-from tt_device_mcp.health.recovery import base, galaxy
+from tt_device_mcp.health.recovery import base
 
 _REAL_VERIFY_ON_START = srv._verify_fabric_on_start
 FABRIC_OK = (True, "fabric links healthy")
@@ -187,25 +187,6 @@ async def _bridge_rung(r, monkeypatch):
     )
 
 
-async def _ubb_tray_sweep(r, monkeypatch):
-    fsm_dirty(srv, "gate/post-job: tray 3 off the bus", why="job_killed")
-    g = srv.galaxy_recovery
-    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
-    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
-
-    async def no_bridge(log):
-        return False
-
-    def ubb(bitmap, ids):
-        r.order.append("reset")
-
-    patch_recovery(monkeypatch, "_recover_isolated_chips", no_bridge)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", ubb)
-    offbus = {str(i) for i in range(24, 32)}
-    await g._fire_tray_down_no_window(offbus, 32, lambda m: None, gate_phase="post-job", ev=None)
-
-
 async def _idle_offbus_escalation(r, monkeypatch):
     _arm_offbus_stuck_hold(monkeypatch, isolated={"8"})
     _real_recovery(monkeypatch)
@@ -252,7 +233,6 @@ PATHS = {
     "operator-reset": _operator_reset,
     "ladder-glx_reset": _ladder_glx_reset,
     "bridge-rung": _bridge_rung,
-    "ubb-tray-sweep": _ubb_tray_sweep,
     "idle-offbus-escalation": _idle_offbus_escalation,
     "hold-deadline-escalation": _hold_deadline_escalation,
     "startup": None,  # driven by _drive: needs tmp_path

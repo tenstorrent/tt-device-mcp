@@ -42,6 +42,7 @@ from tt_device_mcp.constants import (
     PRE_STEP_DEADLINE_DEFAULT_SEC,
     PRE_STEP_DEADLINE_ENV,
     PREEMPT_GRACE_SEC,
+    PREEMPT_KILL_GRACE_SEC,
     RESET_STREAM_KEEPALIVE_LINE,
     resolve_socket,
     step_client_timeout_sec,
@@ -1222,7 +1223,9 @@ def _wait_and_stream(
             if result["status"] == "timeout" and result.get("hint"):
                 print(f"\n!! TIMED OUT after {result.get('timeout_sec')}s !!\n{result['hint']}")
             if result["status"] == "preempted":
-                print(f"\n!! PREEMPTED: another job was waiting past the {result.get('timeout_sec')}s limit !!")
+                print(
+                    f"\n!! PREEMPTED: another job waited {PREEMPT_GRACE_SEC}s past the {result.get('timeout_sec')}s limit !!"
+                )
 
             # Show last N lines summary if requested
             if output_lines > 0 and all_output:
@@ -1681,8 +1684,11 @@ def cmd_refresh_banner(args) -> int:
 
 _NO_TIMEOUT_HELP = (
     f"No timeout except on contention: -t is the time limit, but while no other job waits the job "
-    f"is never stopped for time. Once the limit has passed and a job is waiting, it must shut down "
-    f"gracefully within {PREEMPT_GRACE_SEC}s (SIGINT, then SIGTERM) or be killed. Status shows "
+    f"is never stopped for time. Once the limit has passed and a job is waiting, it has "
+    f"{PREEMPT_GRACE_SEC}s to end itself (no signal is sent), then it gets SIGTERM and, "
+    f"{PREEMPT_KILL_GRACE_SEC}s later, SIGKILL. Returning 0 (on its own or on SIGTERM) means no "
+    f"check and no reset; ending cleanly on SIGTERM with another status gets the fast check; a "
+    f"SIGKILL means a device reset and the full check before the next job. Status shows "
     f"PREEMPTABLE <x>min, then PREEMPTING <s>s. You MUST watch the broker (tt-device-mcp status)."
 )
 

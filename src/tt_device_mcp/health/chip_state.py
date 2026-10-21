@@ -12,7 +12,7 @@ confirmed a chip lost, nothing of the broker's keeps reading it on a poll clock 
   sampler isolates the chip from the kernel). Every gated read of a lost chip (:func:`may_read`) is refused and reads
   as all-ones, which is what its last real read said, so every count and rung decides exactly as on
   a real read. A lost chip is read again only when (a) its sysfs node was re-created (a remove and
-  rescan, a tray re-power or a hotplug: a new node is a new endpoint, so the read is safe to try),
+  rescan, an external tray re-power or a hotplug: a new node is a new endpoint, so the read is safe to try),
   (b) a broker reset or recovery step on it has just ended (one read per :data:`GRACE_REPROBE_SEC`
   for :data:`GRACE_SEC`, so the post-reset health check reads the chip for real), or (c) as a
   backstop, once per :data:`LOST_REPROBE_SEC`. A real read that is not all-ones clears ``lost``.
