@@ -215,7 +215,6 @@ async def test_a_hold_that_spans_a_broker_restart_gets_the_ladder_10_min_after_i
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason="pending fix: a release followed by a re-hold restarts the 10-min clock")
 async def test_lift_and_fail_cycles_never_restart_the_10_min_clock(replay):
     """A hold lifts, the next job fails the same way, the hold returns; over and over. Each re-hold is
     the same episode: the full ladder still runs 10 min after the first hold opened."""
