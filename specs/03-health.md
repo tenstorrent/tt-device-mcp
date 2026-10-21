@@ -938,7 +938,9 @@ cooldown (spec 04 I65) holds longer.
   `/health` stay gated. A read that is not all-ones clears *lost*. While a reset step owns the chips (`reset_in_flight`, or a reset
   scope still cycling them after the broker stopped waiting) every chip is *recovering*: the
   sampler skips its sample, `/health` serves the last live picture and reads nothing, and only the
-  step's own reads run, ungated. The device pollers (telemetry services) stop on the FIRST sample
+  step's own reads run, ungated. One bounded exception (I83): once a mesh reset has printed its
+  driver wait (the BMC step is over), the sampler reads one heartbeat per sample from each chip not
+  yet confirmed off the bus in that reset, and none from a confirmed one. The device pollers (telemetry services) stop on the FIRST sample
   that shows a present chip hung (all-ones, or a heartbeat that did not move), not the second; a
   whole-mesh blip or a reset does not count. They are not restored after a failed or timed-out
   reset, even while the FSM still reads HEALTHY: the device stays held and their start is owed to the next close to HEALTHY,
@@ -1358,6 +1360,30 @@ cooldown (spec 04 I65) holds longer.
   recover: off-bus classes (whole-tray drop, partial off-bus) are unchanged, as their recovery is
   driven by the off-bus evidence and the I76 bound, not by this verdict; the fabric/health-check
   failure class no longer opens on a run the broker killed; every other class is unchanged.
+- **I83 — A chip still off the bus during a mesh reset's driver wait is detached before any of its
+  readers is killed, and never killed without a detach.** Past the reset's BMC step (tt-smi's driver
+  wait line, `reset_driver_wait`, raised on every `-glx_reset` and cleared when the reset ends) every
+  healthy chip is back on the bus; another process still reading a chip that is not can stall the
+  host before the reset ends. The sampler reads one heartbeat per sample per chip (the I66
+  exception) and confirms a chip off the bus on its second all-ones read in a row
+  (`reset_inflight_off_bus`); a confirmed chip is not read again in that reset. The cut starts only
+  while no other chip has a single strike, and a chip confirmed while a cut runs gets a cut of its
+  own. It runs on its own task, so the sampler keeps its cadence. Order: (1) the broker scans the
+  device holders that are neither its own processes, their children, nor the reset's scope; with
+  none and a complete scan it does nothing (no detach, no kill); an incomplete scan counts as a
+  reader. (2) Each confirmed chip is removed from the kernel with a PCI remove (`isolate_chip`),
+  the one driver path that marks the device detached; a closing fd of a detached device sends the
+  chip no message, while an attached one is sent a power-state message on close. (3) Only when
+  every confirmed chip was removed are the pollers stopped (and owed, I66) and the readers sent
+  SIGTERM, then SIGKILL 10 s later (`reset_inflight_readers_cut`). If any removal fails or no remove
+  is wired, no reader is signalled (`reset_inflight_cut_refused`, `host_at_risk`): the hold and its
+  bounded recovery decide (spec 04 I76: the full ladder at 10 min, then the power cycle). The cut
+  never lifts a hold or releases the device: the post-reset full health check, fabric included,
+  still gates both, and a removed chip is in `isolated_chips` for the post-reset rescan. Time to
+  recover: no change for a healthy reset (one extra heartbeat read per chip per sample during the
+  driver wait) or any class without an off-bus chip in the reset (D, G, H/J, F); for the off-bus
+  classes (whole-tray, partial off-bus) the ladder, the bound and the power cycle keep their timing,
+  and a host stall that would add a reboot and its boot cooldown is avoided.
 
 ## Interfaces
 
@@ -2046,6 +2072,9 @@ refuses.
 | I80 | `tests/test_health_held_during_op.py::test_health_stays_held_while_a_forced_rung_runs`, `tests/test_health_held_during_op.py::test_health_lifts_the_hold_only_when_the_gate_passes_inside_the_op`, `tests/test_health_held_during_op.py::test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held`, `tests/test_health_held_during_op.py::test_a_hold_opened_inside_an_op_keeps_its_held_since_after_the_op`, `tests/test_health_held_during_op.py::test_a_closed_episodes_held_since_never_carries_into_the_next_hold`, `tests/test_health_held_during_op.py::test_a_rehold_inside_the_carry_window_reports_the_carried_start_in_and_after_the_op`, `tests/test_health_held_during_op.py::test_an_in_window_rehold_inside_an_op_with_no_read_keeps_the_carried_start_after_it`, `tests/test_health_held_during_op.py::test_an_in_window_rehold_outside_an_op_reports_the_carried_start`, `tests/test_health_held_during_op.py::test_a_read_before_an_in_window_reholds_verdict_yields_to_the_carried_start` |
 | I81 | `tests/test_validator_not_built.py::test_the_not_built_read_speaks_only_for_the_pinned_validator`, `tests/test_validator_not_built.py::test_a_post_reset_77_with_the_validator_not_built_takes_no_eth_training_wait`, `tests/test_validator_not_built.py::test_the_post_reset_log_names_the_missing_validator_not_a_trained_link`, `tests/test_validator_not_built.py::test_an_operators_own_fabric_check_keeps_the_eth_training_wait`, `tests/test_validator_not_built.py::test_health_shows_whether_the_validator_is_built`, `tests/test_validator_not_built.py::test_the_build_is_requested_once_per_hold_episode_without_blocking`, `tests/test_validator_not_built.py::test_no_build_request_without_systemd_or_root`, `tests/test_validator_not_built.py::test_a_hung_build_request_is_bounded`, `tests/test_validator_not_built.py::test_the_watch_requests_the_build_then_lifts_only_on_a_passing_full_check`, `tests/test_validator_not_built.py::test_an_idle_relift_on_a_not_built_validator_never_resets_or_lifts`, `tests/test_validator_not_built.py::test_the_10_min_bound_still_forces_a_not_built_hold` |
 | I82 | `tests/test_fabric_killed_by_dead_chip.py::test_a_fabric_check_killed_by_dead_chip_isolation_is_no_verdict`, `tests/test_fabric_killed_by_dead_chip.py::test_the_kill_mark_is_read_once_and_a_later_pass_settles_the_debt`, `tests/test_fabric_killed_by_dead_chip.py::test_a_minus_9_the_isolation_did_not_cause_keeps_its_old_verdict`, `tests/test_fabric_killed_by_dead_chip.py::test_a_kill_during_the_traffic_only_rerun_is_no_verdict_either`, `tests/test_fabric_killed_by_dead_chip.py::test_a_kill_during_the_descriptor_run_starts_no_rerun`, `tests/test_fabric_killed_by_dead_chip.py::test_dead_chip_isolation_marks_the_fabric_check_killed_and_no_lift_follows`, `tests/test_fabric_killed_by_dead_chip.py::test_isolation_with_no_fabric_check_in_flight_marks_nothing` |
+| I83 (detach before kill; no kill without a detach) | `tests/test_inflight_reader_cut.py::test_two_all_ones_reads_detach_the_chip_before_its_readers_are_killed`, `tests/test_inflight_reader_cut.py::test_a_chip_that_cannot_be_detached_keeps_every_reader_alive`, `tests/test_inflight_reader_cut.py::test_one_failed_detach_of_two_kills_no_reader`, `tests/test_inflight_reader_cut.py::test_with_no_detach_wired_nothing_is_killed`, `tests/test_inflight_reader_cut.py::test_no_reader_means_no_detach_and_no_kill`, `tests/test_inflight_reader_cut.py::test_an_incomplete_holder_scan_counts_as_a_reader` |
+| I83 (two reads confirm; a healthy reset does nothing; deferral; one cut per confirmed chip; reset end clears) | `tests/test_inflight_reader_cut.py::test_one_all_ones_read_does_nothing`, `tests/test_inflight_reader_cut.py::test_a_healthy_reset_reads_once_per_sample_and_does_nothing`, `tests/test_inflight_reader_cut.py::test_a_chip_on_its_first_strike_defers_the_cut_until_it_is_settled`, `tests/test_inflight_reader_cut.py::test_a_confirmed_chip_is_not_read_again_in_this_reset`, `tests/test_inflight_reader_cut.py::test_a_chip_confirmed_while_a_cut_runs_gets_its_own_cut`, `tests/test_inflight_reader_cut.py::test_the_reset_end_clears_the_watch` |
+| I83 (the flag rises at the driver wait of a mesh reset only; the broker and the reset are never cut) | `tests/test_inflight_reader_cut.py::test_the_flag_rises_at_the_driver_wait_on_every_mesh_reset_and_not_before`, `tests/test_inflight_reader_cut.py::test_a_reset_that_is_not_a_mesh_reset_never_raises_the_flag`, `tests/test_inflight_reader_cut.py::test_the_cut_never_selects_the_broker_the_reset_or_their_children`, `tests/test_inflight_reader_cut.py::test_reclaim_select_replaces_the_tenant_rule` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
