@@ -422,6 +422,50 @@ def test_envelope_proceeds_once_the_holder_lets_go(sysfs, monkeypatch):
     assert fired == [1]
 
 
+def test_envelope_waits_for_holders_on_every_tray_not_just_the_re_powered_one(sysfs, monkeypatch):
+    """One tray's pulse has dropped the other trays within seconds, so a holder on ANY chip of the box
+    refuses the re-power, as for a whole-box cycle (spec 04 I23)."""
+    pids = sysfs / "proc/driver/tenstorrent/0"  # chip 0 is on tray 1; the fire is tray 4
+    pids.mkdir(parents=True)
+    (pids / "pids").write_text("4343\n")
+    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", "1")
+    assert 0 in pcie_guard.plan_tray_repower(0b1000, [3]).box_chips
+    with pytest.raises(pcie_guard.TrayRepowerRefused, match="4343"):
+        pcie_guard.safe_tray_repower(
+            0b1000, [3], lambda: pytest.fail("fired over another tray's holder"), lambda m: None, sleep=lambda s: None
+        )
+    assert all(_restored(sysfs, p) for p in PORTS)
+    assert not (sysfs / "sys/bus/pci/devices/0000:81:00.0/remove").exists()
+
+
+def test_envelope_counts_a_holder_on_a_chip_off_the_bus(sysfs, monkeypatch):
+    """A chip with no PCI function that tt-kmd still publishes under /proc is part of the box: a process
+    holding it refuses the re-power too (spec 04 I23)."""
+    pids = sysfs / "proc/driver/tenstorrent/7"  # no endpoint in sysfs: off the bus
+    pids.mkdir(parents=True)
+    (pids / "pids").write_text("4444\n")
+    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", "1")
+    assert 7 in pcie_guard.plan_tray_repower(0b1000, [3]).box_chips
+    with pytest.raises(pcie_guard.TrayRepowerRefused, match="4444"):
+        pcie_guard.safe_tray_repower(
+            0b1000,
+            [3],
+            lambda: pytest.fail("fired over an off-bus chip's holder"),
+            lambda m: None,
+            sleep=lambda s: None,
+        )
+
+
+def test_envelope_ignores_the_brokers_own_hold_on_other_trays(sysfs, monkeypatch):
+    """The broker's own pid is never a holder, on any tray (spec 04 I23)."""
+    pids = sysfs / "proc/driver/tenstorrent/0"
+    pids.mkdir(parents=True)
+    (pids / "pids").write_text(f"{os.getpid()}\n")
+    fired = []
+    pcie_guard.safe_tray_repower(0b1000, [3], lambda: fired.append(1), lambda m: None, sleep=lambda s: None)
+    assert fired == [1]
+
+
 def test_envelope_refuses_a_mismatched_tray_map(sysfs):
     with pytest.raises(pcie_guard.TrayRepowerRefused):
         pcie_guard.safe_tray_repower(0b1000, [2], lambda: pytest.fail("fired the wrong tray"), lambda m: None)

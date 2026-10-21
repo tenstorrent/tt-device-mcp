@@ -470,8 +470,11 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I23 — A per-tray re-power runs inside a host-safety envelope** (`pcie_guard.safe_tray_repower`).
   In order: the tray map is cross-checked against sysfs (each chip's bus against tt-smi's tray
   table) and a disagreement refuses the fire, so a mis-mapped tray is never cut (issue #27); it
-  waits up to `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` for every process to let go of the
-  tray's chips, else refuses; the device pollers are stopped as for a mesh reset; AER and DPC are
+  waits up to `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` for every process to let go of EVERY
+  chip on the box (`TrayPlan.box_chips`: each chip sysfs or tt-kmd's `/proc` list names, on the bus
+  or not), not only the tray's, else refuses: one tray's pulse has dropped every other tray of a
+  Galaxy within seconds, so the box must be as idle as for a whole-box cycle (the broker's own pid
+  never counts); the device pollers are stopped as for a mesh reset; AER and DPC are
   masked on EVERY Tenstorrent root port, the sibling trays' included (a mask that cannot be applied
   is put back and refuses the fire, before any chip is touched); the chips are quiesced
   (USER_RESET); the tray's PCI functions are removed; the BMC pulse fires; then, even if the
@@ -1943,7 +1946,7 @@ sees a silent fabric pass.
 | I27 a whole tray that came back in part is not cycled at grace 0 and stays held, once per episode (a flapping tray fires on the next whole-tray read); one still wholly off, or a re-read the map cannot place, fires at once | `tests/test_offbus_power_cycle.py::test_a_whole_tray_that_comes_back_in_part_is_not_cycled_at_grace_0`, `::test_a_flapping_whole_tray_still_reaches_the_power_cycle`, `::test_the_whole_tray_deferral_is_per_episode`, `::test_a_tray_still_wholly_off_at_the_re_read_still_fires_at_once`, `::test_a_re_read_the_tray_map_cannot_place_keeps_the_whole_tray_verdict` |
 | I25 / I32 a skipped tray re-power releases only after the full health check, fabric included | `tests/test_ladder_v2.py::test_a_skipped_tray_rung_releases_only_after_the_full_health_check` |
 | I27 a regressed tray rung hands off to the power cycle past the grace | `tests/test_offbus_power_cycle.py::test_a_regressed_tray_rung_hands_off_past_the_grace` |
-| I23 holders: wait, then refuse | `tests/test_pcie_guard.py::test_envelope_waits_for_holders_then_refuses_without_touching_anything`, `::test_envelope_proceeds_once_the_holder_lets_go` |
+| I23 holders on every chip of the box, off-bus ones included: wait, then refuse | `tests/test_pcie_guard.py::test_envelope_waits_for_holders_then_refuses_without_touching_anything`, `::test_envelope_proceeds_once_the_holder_lets_go`, `::test_envelope_waits_for_holders_on_every_tray_not_just_the_re_powered_one`, `::test_envelope_counts_a_holder_on_a_chip_off_the_bus`, `::test_envelope_ignores_the_brokers_own_hold_on_other_trays` |
 | I23 an erroring port stays masked and starts the flood window | `tests/test_pcie_guard.py::test_a_port_that_keeps_erroring_stays_masked_and_marks_a_flood` |
 | I84 a dispatch-cap 77 after a reset re-checks at once (the full check, fabric included); any other 77 waits for eth training; a persisting one stays held | `tests/test_post_reset_gate.py::test_a_dispatch_cap_77_after_a_reset_rechecks_at_once_and_class_j_fits_its_budget`, `::test_a_no_trained_link_77_after_a_reset_still_waits_for_eth_training`, `::test_a_dispatch_cap_77_that_persists_never_releases`, `::test_the_wrapper_reason_names_the_dispatch_cap_over_a_validator_error_line` |
 | I23 dry run and plan CLI touch nothing | `tests/test_pcie_guard.py::test_dry_run_logs_the_plan_and_touches_nothing`, `::test_cli_prints_the_plan` |
