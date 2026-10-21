@@ -3475,8 +3475,19 @@ def _journal_fsm_transition(why: str, *, verified: bool) -> None:
     its exit code) must not read the same as one a full snapshot+fabric pass stood behind."""
     if fsm.state is not ServerState.HEALTHY:
         health_event(
-            "device_dirty_cleared", why=why, verified=verified, prior_reason=fsm.record.detail or fsm.record.why
+            "device_dirty_cleared",
+            why=why,
+            verified=verified,
+            prior_reason=fsm.record.detail or fsm.record.why,
+            fabric=_lift_fabric(),
         )
+
+
+def _lift_fabric() -> dict:
+    """The fabric verdict every hold-lift and release event carries (spec 03 I78): pass/fail, how far
+    the links the check found fall short of the cabling (``missing_vs_cabling``/``links_short``) and
+    its age — this check's own result, never the prior hold's detail."""
+    return health_monitor.fabric_verdict() if health_monitor is not None else {"result": "none"}
 
 
 def _post_reset_debt() -> str:
@@ -3533,12 +3544,19 @@ def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> b
     if verified:
         owed = _post_reset_debt()
         if owed:
-            health_event("post_reset_release_refused", why=why, reset=owed)
+            health_event("post_reset_release_refused", why=why, reset=owed, fabric=_lift_fabric())
             _hold_device_fabric_unverified(f"{why}; reset ({owed}) has had no passing fabric pass since")
             return False
         unproven = _hold_lift_unproven()
         if unproven:
-            health_event("hold_lift_refused", why=why, hold=fsm.record.why, reason=unproven, since=fsm.record.since)
+            health_event(
+                "hold_lift_refused",
+                why=why,
+                hold=fsm.record.why,
+                reason=unproven,
+                since=fsm.record.since,
+                fabric=_lift_fabric(),
+            )
             if logger:
                 logger.warning(f"HOLD-LIFT refused ({why}): {unproven} — the hold stays")
             return False
@@ -4507,7 +4525,8 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
     bound never releases on them: only a passing full check, fabric included, lifts the hold (spec 03
     I78), and the ladder's own post-reset check is the next one. Pages once per hold episode: a later
     pass on the same episode journals but does not page again, and a page the hook dropped is tried
-    again on the next pass. Returns True when the climb settled the hold."""
+    again on the next pass. ``retried`` is kept for callers; no eth read runs here. Returns True when
+    the climb settled the hold."""
     global _fabric_77_paged_since
     event = {
         "kind": "fabric_check_unrunnable_bound",
@@ -6418,6 +6437,7 @@ async def device_health_gate(
             dirty_job=dirty_job,
             aer=aer_totals(chips),
             evidence=evidence,
+            fabric=_lift_fabric(),  # this gate's own fabric verdict; dirty_reason may be the prior hold's
         )
 
         # Something went wrong: freeze the evidence while it still exists. The kernel's
@@ -7702,7 +7722,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         _forget_stale_hold_episode()
     elif not reason and device_hold_logged:
         device_hold_logged = False
-        health_event("device_released")
+        health_event("device_released", fabric=_lift_fabric())
         _wake_held_jobs()  # any other job parked behind this hold re-runs its own gate now
         # The hold's own row, written now that it has an end and a duration. While it was
         # held the jobs list showed it live, and that row is synthetic — it exists only for
@@ -12593,8 +12613,9 @@ def _close_stale_startup_hold(hold: dict) -> None:
     health_event(
         "startup_fabric_released",
         prior_why="closed on broker start",
-        detail=detail,
+        prior_detail=detail,
         held_s=round(held_s, 1),
+        fabric={"result": "none"},  # a bookkeeping close: no check proved this end
     )
     if logger:
         logger.info(f"STARTUP closed a startup hold of {int(held_s)}s left open by the last broker")
@@ -12619,7 +12640,12 @@ def _journal_startup_hold_released(
         held_s = _episode_elapsed_sec(closed.since)
     extra = {"carried_over": True, "episode_since": closed.since} if carried_over else {}
     health_event(
-        "startup_fabric_released", prior_why=closed.why, detail=closed.detail, held_s=round(held_s, 1), **extra
+        "startup_fabric_released",
+        prior_why=closed.why,
+        prior_detail=closed.detail,
+        held_s=round(held_s, 1),
+        fabric=_lift_fabric(),
+        **extra,
     )
     if logger:
         logger.info(f"STARTUP hold released after {int(held_s)}s (last why: {closed.why})")
