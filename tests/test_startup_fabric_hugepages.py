@@ -1280,7 +1280,6 @@ def test_an_owed_pass_does_not_carry_to_another_episode(monkeypatch, tmp_path, c
 def _bound(monkeypatch, tmp_path, eth):
     _hold_77(monkeypatch, tmp_path)
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "1")
-    monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", 0.0)
     monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
 
     async def verify(expected, log, run_fabric=True, **_):
@@ -1302,11 +1301,13 @@ def _bound(monkeypatch, tmp_path, eth):
 
 
 @pytest.mark.asyncio
-async def test_a_77_only_hold_past_its_bound_lifts_on_a_healthy_eth_read(monkeypatch, tmp_path, clear_job_state):
+async def test_a_77_only_hold_past_its_bound_climbs_even_on_a_healthy_eth_read(monkeypatch, tmp_path, clear_job_state):
+    """03 I78: the startup checks and an advancing eth read are not the full check; past the I40 bound
+    the hold climbs the ladder and is never released unverified."""
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
     await srv._attempt_idle_relift()
-    assert rungs == []
-    assert srv.fsm.state is ServerState.HEALTHY
+    assert rungs == ["present"]
+    assert srv.fsm.state is ServerState.RECOVERING
 
 
 @pytest.mark.asyncio
@@ -1321,7 +1322,6 @@ async def test_a_77_only_hold_with_a_link_drop_climbs_the_ladder_not_released(mo
 @pytest.mark.asyncio
 async def test_a_second_77_only_hold_inside_the_window_climbs_the_ladder(monkeypatch, tmp_path, clear_job_state):
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
-    monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", srv.time.monotonic())
     await srv._attempt_idle_relift()
     assert rungs == ["present"]
     assert srv.fsm.state is ServerState.RECOVERING
@@ -1431,13 +1431,14 @@ def test_a_latched_hold_whose_77_names_the_mismatch_is_no_77_no_reset_cause(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reset_passes, lifted", [(2, True), (0, False)])
+@pytest.mark.parametrize("reset_passes, bounded", [(2, True), (0, False)])
 async def test_after_an_unknown_reset_the_next_relift_77_reaches_the_bound(
-    monkeypatch, tmp_path, clear_job_state, reset_passes, lifted
+    monkeypatch, tmp_path, clear_job_state, reset_passes, bounded
 ):
     """Spec 04 I29: a reset whose post-reset fabric stayed a 77 (one pass and one retry) counts those
-    passes toward the episode's I40 bound, so the next relift's 77 falls back at once and releases on a
-    healthy eth read. Without them, the same relift is still under the default bound and just holds."""
+    passes toward the episode's I40 bound, so the next relift's 77 reaches it at once and climbs the
+    ladder (never a release on the startup checks, 03 I78). Without them, the same relift is still
+    under the default bound and just holds."""
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
     monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
@@ -1445,20 +1446,20 @@ async def test_after_an_unknown_reset_the_next_relift_77_reaches_the_bound(
     if reset_passes:
         srv._note_fabric_77_reset_passes(reset_passes)
     await srv._attempt_idle_relift()
-    assert rungs == []
-    assert (srv.fsm.state is ServerState.HEALTHY) is lifted
+    assert rungs == (["present"] if bounded else [])
+    assert srv.fsm.state is ServerState.RECOVERING
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "eth,released",
-    [((True, "all active-eth cores advancing"), True), ((None, "252 of 256 eth link(s) up"), False)],
+    "eth",
+    [(True, "all active-eth cores advancing"), (None, "252 of 256 eth link(s) up")],
 )
 async def test_a_topology_mismatch_whose_rerun_77s_takes_the_bounded_fallback(
-    monkeypatch, tmp_path, clear_job_state, eth, released
+    monkeypatch, tmp_path, clear_job_state, eth
 ):
-    """I45: a topology-mismatch 77 is no longer an open-ended hold. Past the bound the eth read
-    decides (against the re-baselined mark); a release is watched like a lift."""
+    """I45: a topology-mismatch 77 is no longer an open-ended hold. Past the bound it climbs the
+    ladder whatever the eth read says: a mismatch is never released on the startup checks (03 I78)."""
     rungs = _bound(monkeypatch, tmp_path, eth)
     monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", "")
     monkeypatch.setattr(srv.health_monitor, "topology_lift_pending", False)
@@ -1470,13 +1471,9 @@ async def test_a_topology_mismatch_whose_rerun_77s_takes_the_bounded_fallback(
 
     patch_recovery(monkeypatch, "_verify_device", verify)
     await srv._attempt_idle_relift()
-    if released:
-        assert rungs == []
-        assert srv.fsm.state is ServerState.HEALTHY
-        assert srv.health_monitor.topology_lift_pending is True
-    else:
-        assert rungs == ["present"]
-        assert srv.fsm.state is ServerState.RECOVERING
+    assert rungs == ["present"]
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert srv.health_monitor.topology_lift_pending is False, "nothing was lifted"
 
 
 @pytest.mark.asyncio
@@ -1538,6 +1535,7 @@ async def test_the_boot_after_the_brokers_own_power_cycle_latches_nothing_and_st
     row = {"action": "power-cycle", "reason": "idle escalation", "boot_id": "boot-a", "at_epoch": 1325.0}
     (hd / "auto_recovery.jsonl").write_text(json.dumps(row) + "\n")
     monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-b")
+    monkeypatch.setattr(pcie_guard, "_boot_btime", lambda: 1445.0)  # the cycle's boot, 2 min after its row
     _shortfalls(monkeypatch, [(0, 32), None])
     seen = []
 
