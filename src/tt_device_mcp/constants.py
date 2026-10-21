@@ -63,10 +63,17 @@ SURVIVOR_KILL_WAIT_SEC = 2
 # the device held until the next job or the hold ceiling.
 HOLDER_RELEASE_WAIT_SEC = 30
 
-# A preemptable job's whole stop window, from the first signal to SIGKILL. Its owner has
-# agreed to watch the queue and get off the device within this once another job is waiting
-# past its time limit, so it is shorter than the ordinary ladder (SIGINT 60 s + SIGTERM 15 s).
+# A preemptable job's grace minute. Contention (the job past its time limit AND another job
+# waiting) must last this long, unbroken, before the broker does anything to the job: the job
+# is expected to see the waiter in the queue and end itself. No signal is sent inside it.
 PREEMPT_GRACE_SEC = 60
+
+# Once the grace minute is spent, the job's whole process tree gets SIGTERM and, at most this
+# much later, SIGKILL: 10 s for its handlers to release the device. The job already had its
+# minute to end itself. A tree that all exits through its own code on SIGTERM inside it gets the
+# fast post-job check; a SIGKILL, any signal death or an unwitnessed exit gets a reset and the
+# full check.
+PREEMPT_KILL_GRACE_SEC = 10
 
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
