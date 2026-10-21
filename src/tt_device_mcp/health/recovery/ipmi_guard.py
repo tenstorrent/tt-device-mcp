@@ -291,7 +291,8 @@ def arm(
     try:
         with open(guard, "w", encoding="utf-8") as f:
             f.write(guard_source())
-        os.chmod(guard, 0o755)
+        # Owner-only: only this namespace's root tt-smi (or its sudo) runs it.
+        os.chmod(guard, 0o700)
         open(real, "w").close()
     except OSError as exc:
         raise GuardNotArmed(f"writing the guard: {exc}") from exc
