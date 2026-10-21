@@ -1663,8 +1663,8 @@ def cmd_refresh_banner(args) -> int:
 
 _NO_TIMEOUT_HELP = (
     f"No timeout except on contention: -t is the time limit, but while no other job waits the job "
-    f"is never stopped for time. Once the limit has passed and a job is waiting, it must shut down "
-    f"gracefully within {PREEMPT_GRACE_SEC}s (SIGINT, then SIGTERM) or be killed. Status shows "
+    f"is never stopped for time. Once the limit has passed and a job is waiting, it has "
+    f"{PREEMPT_GRACE_SEC}s to end itself (no signal is sent), then it is killed. Status shows "
     f"PREEMPTABLE <x>min, then PREEMPTING <s>s. You MUST watch the broker (tt-device-mcp status)."
 )
 

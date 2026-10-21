@@ -50,7 +50,7 @@ the queue and a running job outlive the broker process.
   served counted against it (`_readopted_deadline`); re-adoption never grants a fresh
   clock, and the deadline is enforced by `_monitor_readopted_scope`. A re-adopted
   no-timeout-except-on-contention job (header `PREEMPTABLE: yes`) is held to I16 instead:
-  past its deadline it is preempted only once another job waits.
+  past its deadline it is killed only after another job has waited a full minute.
 - **I8** — A job's exit status comes from the job itself: the shell preamble
   (`_exit_trap_preamble`) traps EXIT/TERM/INT and writes the status to
   `job_exit_file(job_id)`. A re-adopted job with no exit file MUST be reported FAILED,
@@ -89,22 +89,33 @@ the queue and a running job outlive the broker process.
   `--no-timeout-except-on-contention`, alias `--preemptable`; `Job.preemptable`) has no
   timeout except on contention. `timeout_sec` (x) is its time limit: while no other job is
   queued it is never stopped for time, before or after x, and a job queued before x does not
-  preempt it. Once x has passed and a job is queued, preemption starts: the stop goes out at
-  once (`_preempt_job`: SIGINT, SIGTERM `SIGTERM_GRACE_SEC` before the kill) and SIGKILL lands
-  at `max(start + x, arrival of the first waiting job) + PREEMPT_GRACE_SEC` (60 s), never later
-  (`_preempt_kill_deadline`). A started preemption completes even if the waiter leaves. The
-  job ends `preempted`. Status, wherever job state shows (queue status, job status, wait
-  progress, `/health`, the CLI), reads `PREEMPTABLE <x>min` while it runs and, during the
-  minute, `PREEMPTING <s>s` (seconds left before the kill, counting down).
-  A preempted job's end is a failed end for the post-job gate (fabric pass forced, I14 rules
-  for dirtiness): the gate, fabric included, passes before the waiting job is dispatched. A
-  SIGINT exit (−2 / 130) is the stop it was asked for, not a wedge; a kill by any other signal,
-  or no exit status, marks the device dirty. A re-adopted job (I6) has no post-job gate, so
-  its preemption marks the device dirty whatever its exit status: the reset + full check,
-  fabric included, passes before the waiting job is dispatched. Preemption adds no wait, gate
-  or cooldown to any reset, hold or recovery path. Anyone using the option MUST watch the
-  broker (queue status, or the job's own status): once a job queues after the limit, they shut
-  down gracefully within one minute or are killed.
+  preempt it. **Contention** is: x has passed AND at least one job is queued. It starts at
+  `max(start + x, arrival of the earliest current waiter)`. The broker sends no signal and
+  takes no action against the job until contention has lasted `PREEMPT_GRACE_SEC` (60 s)
+  unbroken (`_preempt_kill_at`); in that minute the job is expected to see the waiter in the
+  queue and end itself, and a job that does ends as any job does (`completed`/`failed`, the
+  normal post-job gate). When every waiter leaves, contention ends, the minute is forgotten and
+  the job is untouched; a later waiter starts a fresh minute (if none of the waiters seen at
+  the last poll remains, the minute restarts too, so an unsure case favours the running job).
+  When the minute ends with a job still waiting, the broker kills the job's whole process tree
+  (`_preempt_kill`: SIGTERM to its scope and process group, SIGKILL `PREEMPT_KILL_GRACE_SEC`,
+  5 s, later at the latest). A kill once begun completes, even if the waiter leaves: the
+  runner awaits it. The job ends `preempted`, a wedge-risk exit (I14) whatever its exit
+  status: the device is marked dirty, so it is reset and the full post-job gate, fabric
+  included, passes before the waiting job is dispatched; a failed check keeps the hold and
+  goes on to the bounded recovery (spec 03/04). A re-adopted job (I6) is held to the same rule
+  and also ends dirty. Every deadline and countdown is on `time.monotonic()`: the limit is
+  turned into a monotonic instant once (at spawn, or once at re-adoption via
+  `_readopted_deadline`), waiters carry `queued_monotonic`, and none of this state is
+  persisted. Across a broker restart the limit is re-derived from the header and any minute
+  starts afresh (restored waiters count as arriving at restore), which only ever gives the job
+  more time. A wall-clock step or DST change moves no deadline. Status, wherever job state
+  shows (queue status, job status, wait progress, `/health`, the CLI), reads
+  `PREEMPTABLE <x>min` while it runs and, under contention, `PREEMPTING <s>s` (seconds left in
+  the minute, counting down; `0s` once the kill has begun); it clears as soon as the last
+  waiter leaves. Preemption adds no wait, gate or cooldown to any reset, hold or recovery path.
+  Anyone using the option MUST watch the broker (queue status, or the job's own status): once
+  a job queues after the limit, they end gracefully within one minute or are killed.
 
 ## Interfaces
 
@@ -236,10 +247,10 @@ flowchart LR
   terminated via `_terminate_job` (scope-aware, I5) and becomes TIMEOUT, with
   `timeout_hint()` explaining the limit — actionable below the ceiling, non-negotiable at
   it. A no-timeout-except-on-contention job is not bounded by `wait_for`; a
-  `preempt_watchdog` polls every `PREEMPT_POLL_SEC` and, once `_preempt_kill_deadline`
-  returns a kill instant, sets `preempt_deadline_monotonic` and calls `_preempt_job` (I16).
-  The job stays `running` through the minute so status shows the countdown; it becomes
-  `preempted` at exit.
+  `preempt_watchdog` polls every `PREEMPT_POLL_SEC` (and wakes at the minute's end), advances
+  the contention clock with `_preempt_kill_at`, and once the minute has run out sets
+  `preempt_killed_monotonic` and calls `_preempt_kill` (I16). The job stays `running` through
+  the minute so status shows the countdown; it becomes `preempted` at exit.
 - The hung watchdog (I10) announces silence every `HUNG_NOTICE_SEC` (60 s) in the job's
   log, then reaps at `HUNG_SILENCE_SEC` as HUNG; the doomed reap fires first if the
   runtime declared the device unrecoverable. Both kill the process so the streams hit EOF
