@@ -237,7 +237,7 @@ async def test_a_down_offbus_recheck_holds_on_arc_not_ready_chips_without_the_ga
     async def no_gate(*a, **k):
         pytest.fail("the full gate must not run while a chip's ARC is not ready")
 
-    monkeypatch.setattr(srv, "_offbus_return_full_gate", no_gate)
+    monkeypatch.setattr(srv, "_full_check_gate", no_gate)
     monkeypatch.setattr(srv, "_clear_device_dirty", lambda *a, **k: pytest.fail("released"))
 
     await srv._attempt_down_offbus_recheck()

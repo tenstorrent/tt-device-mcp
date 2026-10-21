@@ -103,6 +103,7 @@ def test_a_verified_release_after_a_reset_holds_fabric_unverified(mesh):
 
 def test_no_debt_releases_as_before(mesh):
     fsm_dirty(srv, "gate/post-job: exit 1", why="job_killed")
+    FABRIC_DEBT.note_fabric(True)  # the full check, fabric included, just passed (03 I78)
     assert srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy") is True
     assert srv.fsm.state is ServerState.HEALTHY
 
@@ -110,7 +111,7 @@ def test_no_debt_releases_as_before(mesh):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "evidence, verdict",
-    [(F77, None), ({"snapshot": {"ok": True}}, True)],
+    [(F77, None), ({"snapshot": {"ok": True}}, None)],  # held, so never reported OK (03 I78)
     ids=["fabric-77", "no-fabric-verdict"],
 )
 async def test_an_operator_reset_without_a_passing_fabric_pass_holds(mesh, monkeypatch, evidence, verdict):
@@ -207,21 +208,24 @@ async def test_the_77_fallback_never_releases_a_reset_with_no_passing_fabric_pas
 
 @pytest.mark.asyncio
 async def test_the_foreign_holder_fast_verify_after_a_reset_holds(mesh, monkeypatch):
-    """Its enum+ARC-only pass cannot settle a reset's debt: the hold turns fabric-unverified."""
+    """It runs the full check, fabric included (03 I78): a pass that brings no fabric verdict cannot
+    settle a reset's debt, so nothing is released and the debt stays owed."""
     fsm_dirty(srv, "foreign holder", why="foreign_holder", dirty=False)
     FABRIC_DEBT.note_reset("adopted ttdev-reset-x.scope")
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda scan: "")
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+    runs = []
 
     async def verify(expected, log, run_fabric=True, **_):
-        assert not run_fabric
+        runs.append(run_fabric)
         return True, {"snapshot": {"ok": True}}
 
     patch_recovery(monkeypatch, "_verify_device", verify)
-    assert await srv._foreign_holder_fast_verify(32, lambda m: None) is True
-    assert srv.fsm.state is ServerState.RECOVERING and srv.fsm.record.why == srv.FABRIC_RELIFT_WHY
-    assert srv._idle_relift_armed()[1], "the fabric relift owns it: bounded, never an open-ended hold"
+    await srv._foreign_holder_fast_verify(32, lambda m: None)
+    assert runs == [True], "the full check, fabric included"
+    assert srv.fsm.state is ServerState.RECOVERING and FABRIC_DEBT.owed, "held, the debt still owed"
 
 
 # ---- every reset path, one at a time: an unproven verify holds, a passing fabric pass releases ----
@@ -716,6 +720,7 @@ async def test_the_gate_ladders_last_chance_sweep(mesh, monkeypatch, galaxy_tray
     [
         (True, galaxy.OUTCOME_RECOVERED, "held"),  # the funnel refused: never reopened by the fold
         (False, galaxy.OUTCOME_RECOVERED, "healthy"),
+        (None, galaxy.OUTCOME_RECOVERED, "held"),  # no fabric pass since the hold: refused (03 I78)
         (True, galaxy.OUTCOME_TERMINAL, "held"),  # a 77-only hold measured no fault: not DOWN
         (False, galaxy.OUTCOME_WAITING, "held"),
     ],
@@ -726,6 +731,8 @@ def test_no_rung_outcome_lifts_a_fabric_unverified_hold(mesh, owed, outcome, exp
     if owed:
         FABRIC_DEBT.note_reset("tt-smi -glx_reset")
     srv._hold_device_fabric_unverified("fabric check exited 77")
+    if owed is False and outcome == galaxy.OUTCOME_RECOVERED:
+        FABRIC_DEBT.note_fabric(True)  # the rung's verify ran the full check and it passed
     srv._fold_rung_outcome(outcome, lambda m: None)
     if expect == "healthy":
         assert srv.fsm.state is ServerState.HEALTHY
@@ -746,3 +753,84 @@ def test_every_rung_outcome_folds_through_the_helper():
     body = src.replace(inspect.getsource(srv._fold_rung_outcome), "")
     assert "fsm.on_outcome(" not in body, "a rung outcome folded around the I32 guard"
     assert src.count("_fold_rung_outcome(outcome, ") == 3, "the gate, the idle relift and the hold escalation"
+
+
+# The 10-17 class-J episode (job killed, glx_reset 62 s): the first pass proved all 128 links, then its
+# dispatch probe hung in UMD start-up until the wrapper's 90 s cap (77, 133 s); the re-check passed (57 s).
+DISPATCH_CAP_77 = {
+    "snapshot": {"ok": True},
+    "fabric": {
+        "ok": None,
+        "detail": "fabric check COULD NOT RUN (133s; exit 77, output in /x/fabric.log): fabric-check: dispatch "
+        "probe hit its 90s cap without a verdict (typical is 14s) -> CANNOT CHECK (exit 77; broker will not "
+        "reset on this)",
+    },
+}
+NO_TRAINED_LINK_77 = {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": "no link was tested (77)"}}
+
+
+async def _replay_post_reset_verify(monkeypatch, passes):
+    """Run ``_verify_device_after_reset`` on a fake clock. ``passes`` is ``[(seconds, evidence), ...]``,
+    one per verify. Returns (healthy, seconds spent, sleeps, run_fabric of each verify)."""
+    monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRY_SLEEP_SEC", 60.0)
+    clock, sleeps, fabric_asked = [0.0], [], []
+    todo = list(passes)
+
+    async def verify(expected, log, run_fabric=True, **_):
+        fabric_asked.append(run_fabric)
+        took, evidence = todo.pop(0)
+        clock[0] += took
+        return True, dict(evidence)
+
+    async def sleep(sec, *_a, **_k):
+        sleeps.append(sec)
+        clock[0] += sec
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(recovery_pkg.asyncio, "sleep", sleep)
+    healthy, _, _ = await srv.galaxy_recovery._verify_device_after_reset(32, lambda m: None)
+    return healthy, clock[0], sleeps, fabric_asked
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_cap_77_after_a_reset_rechecks_at_once_and_class_j_fits_its_budget(mesh, monkeypatch):
+    """Spec 04 I84. The validator had moved traffic across every link, so the links were trained: the
+    eth-training wait cannot help, and the re-check runs at once. Class J (budget 300 s) replayed: kill to
+    reset 1 s + glx_reset 62 s + rescan settle 3 s + the verify + release 5 s took 321 s with the wait."""
+    healthy, spent, sleeps, fabric_asked = await _replay_post_reset_verify(
+        monkeypatch, [(133.0, DISPATCH_CAP_77), (57.0, FOK)]
+    )
+    assert healthy is True
+    assert sleeps == [], "no eth-training wait after a dispatch-cap 77"
+    assert fabric_asked == [True, True], "both passes are the full check, fabric included (goal 8)"
+    ttr = 1 + 62 + 3 + spent + 5
+    assert ttr == 261 and ttr < 300
+
+
+@pytest.mark.asyncio
+async def test_a_no_trained_link_77_after_a_reset_still_waits_for_eth_training(mesh, monkeypatch):
+    healthy, spent, sleeps, _ = await _replay_post_reset_verify(monkeypatch, [(40.0, NO_TRAINED_LINK_77), (45.0, FOK)])
+    assert healthy is True and sleeps == [60.0] and spent == 145.0
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_cap_77_that_persists_never_releases(mesh, monkeypatch):
+    """Goal 11: a re-check that still reaches no verdict is UNKNOWN, held, not a pass."""
+    healthy, _, sleeps, fabric_asked = await _replay_post_reset_verify(
+        monkeypatch, [(133.0, DISPATCH_CAP_77), (133.0, DISPATCH_CAP_77)]
+    )
+    assert healthy is None and sleeps == [] and fabric_asked == [True, True]
+
+
+def test_the_wrapper_reason_names_the_dispatch_cap_over_a_validator_error_line():
+    """The I84 test reads the reason; an error line the validator logged above must not hide the cap."""
+    from tt_device_mcp.health.monitor import _override_reason
+    from tt_device_mcp.health.monitors import fabric
+
+    text = (
+        "2026-10-17 15:09:16.6 | error    |     Distributed | link retry on chip 3 (x.cpp:1)\n"
+        "fabric-check: fabric healthy\n"
+        "fabric-check: dispatch probe hit its 90s cap without a verdict (typical is 14s) -> CANNOT CHECK\n"
+    )
+    assert fabric.names_dispatch_cap(_override_reason(text))
+    assert not fabric.names_dispatch_cap("no link was tested (77)")
