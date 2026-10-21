@@ -4569,9 +4569,17 @@ def preempt_label(job: "Job") -> Optional[str]:
 
 
 async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = False) -> bool:
-    """Kill a preempted job's whole process tree once its grace minute is spent: SIGTERM to its
-    scope's cgroup and its process group, then SIGKILL to both PREEMPT_KILL_GRACE_SEC later at
-    the latest. Bounded, and never cut short by the waiter leaving: the runner awaits it.
+    """Kill a preempted job's whole process tree once its grace minute is spent: SIGTERM exactly
+    once, to its scope's cgroup while the scope is live, else to its process group (never both),
+    then SIGKILL to both PREEMPT_KILL_GRACE_SEC later at the latest. Bounded, and never cut short
+    by the waiter leaving: the runner awaits it.
+
+    One SIGTERM, because a second one a few ms later lands while a job that handled the first is
+    already exiting: a Python handler's sys.exit(0) puts SIGTERM back to its default action during
+    interpreter shutdown, so the second one kills it. That signal death would cost the job its
+    exit-0 skip (a reset and the full check instead). The scope's cgroup holds every process of a
+    scoped job, so its process group needs no signal of its own; it gets one only if the scope
+    kill fails.
 
     Returns True only when ``witness`` is set and the kernel's exit records show every process
     of the tree exited through its own code on SIGTERM (no SIGKILL needed, no signal death):
@@ -4584,11 +4592,13 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
     scope = job_scope_unit(job_id)
     scoped = await asyncio.to_thread(_scope_active, scope)
 
-    async def _send(sig: signal.Signals) -> None:
+    async def _send(sig: signal.Signals, *, both: bool) -> None:
         if scoped:
-            await asyncio.to_thread(
+            r = await asyncio.to_thread(
                 subprocess.run, ["systemctl", "kill", f"--signal={sig.name}", scope], capture_output=True
             )
+            if not both and r.returncode == 0:
+                return
         if pid:
             try:
                 os.killpg(pid, sig)
@@ -4652,7 +4662,7 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
         return clean
 
     try:
-        await _send(signal.SIGTERM)
+        await _send(signal.SIGTERM, both=False)
         loop = asyncio.get_event_loop()
         deadline = loop.time() + PREEMPT_KILL_GRACE_SEC
         while loop.time() < deadline:
@@ -4674,7 +4684,7 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
             await asyncio.sleep(0.1)
         if logger:
             logger.warning(f"PREEMPT job_id={job_id} survived SIGTERM for {PREEMPT_KILL_GRACE_SEC}s; SIGKILL")
-        await _send(signal.SIGKILL)
+        await _send(signal.SIGKILL, both=True)
         return False
     finally:
         _close_witness()

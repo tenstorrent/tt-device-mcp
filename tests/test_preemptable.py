@@ -5,8 +5,9 @@
 While nobody waits the job is never stopped for time. Contention = its limit has passed AND a
 job waits. The broker sends no signal until contention has lasted PREEMPT_GRACE_SEC (a minute)
 unbroken, so the job can see the waiter and end itself; a waiter that leaves inside the minute
-causes nothing. When the minute runs out the job's whole process tree is killed (SIGTERM, then
-SIGKILL PREEMPT_KILL_GRACE_SEC later at the latest) and the job ends PREEMPTED. If the kernel's
+causes nothing. When the minute runs out the job's whole process tree is killed (one SIGTERM,
+to its scope if live else its process group, then SIGKILL to both PREEMPT_KILL_GRACE_SEC later
+at the latest) and the job ends PREEMPTED. If the kernel's
 exit records show every process exited through its own code on SIGTERM, only the fast post-job
 check runs, and none at all on exit 0 (as for a job that ends itself with exit 0 inside the
 minute); otherwise (SIGKILL, a signal death, no witness) it is a wedge-risk exit: the device is
@@ -630,15 +631,49 @@ def _witness(monkeypatch, *, clean, ok=True, why="", status=None):
     return made
 
 
-async def _preempt(monkeypatch, job_id, command, *, kill_grace):
+_REAL_KILLPG = os.killpg
+
+
+def _fake_job_scope(monkeypatch, job_id, scope_sends):
+    """Stand in for a privsep job's live systemd scope: the scope is active while the job's process
+    group lives, and `systemctl kill --signal=X <scope>` delivers X to every process of it (the
+    group stands in for the cgroup) and is recorded in ``scope_sends``."""
+    scope = srv.job_scope_unit(job_id)
+    real_run = subprocess.run
+
+    def _alive():
+        try:
+            _REAL_KILLPG(srv.jobs[job_id].pid, 0)
+            return True
+        except (ProcessLookupError, OSError, TypeError):
+            return False
+
+    def run(argv, *a, **k):
+        if list(argv[:2]) == ["systemctl", "kill"] and argv[-1] == scope:
+            sig = signal.Signals[argv[2].split("=", 1)[1]]
+            scope_sends.append(sig)
+            if not _alive():
+                return subprocess.CompletedProcess(argv, 1)
+            _REAL_KILLPG(srv.jobs[job_id].pid, sig)
+            return subprocess.CompletedProcess(argv, 0)
+        return real_run(argv, *a, **k)
+
+    monkeypatch.setattr(srv, "_scope_active", lambda unit: unit == scope and _alive())
+    monkeypatch.setattr(srv.subprocess, "run", run)
+
+
+async def _preempt(monkeypatch, job_id, command, *, kill_grace, scope_sends=None):
     """Run a preemptable job past its 1 s limit with a job waiting, through the minute (1 s here)
     and the kill, and let the runner reach the post-job gate. Returns the job, the signals sent,
-    the gate's calls and the dirty marks."""
+    the gate's calls and the dirty marks. With ``scope_sends`` (a list) the job runs in a live
+    systemd scope, and the signals sent to that scope are recorded there."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     gate = _recording_post_job_gate(monkeypatch)
     dirty = _recording_dirty(monkeypatch)
     _fast_preempt(monkeypatch, grace=1, kill_grace=kill_grace)
+    if scope_sends is not None:
+        _fake_job_scope(monkeypatch, job_id, scope_sends)
     job = srv.Job(
         id=job_id, owner="server", workspace="/tmp", command=command, queued_at="t", timeout_sec=1, preemptable=True
     )
@@ -737,6 +772,135 @@ async def test_a_preempted_job_that_exits_0_after_sigkill_is_fully_checked(monke
     assert job.preempt_clean is False
     assert dirty
     assert gate == [{"job_failed": True}]
+
+
+@pytest.mark.asyncio
+async def test_a_scoped_job_gets_one_sigterm_then_sigkill_to_scope_and_group(monkeypatch, clear_job_state):
+    """A job in a live systemd scope gets SIGTERM exactly once, through its scope and not also
+    through its process group: a second SIGTERM a few ms later kills a job that handled the first
+    and is already exiting. After the 10 s grace SIGKILL still goes to both, and a tree that needed
+    it is dirty (so reset) and gets the full check, fabric included, before the next job."""
+    _witness(monkeypatch, clean=True)
+    scope_sends = []
+    job, sent, gate, dirty = await _preempt(
+        monkeypatch, "971", "trap '' INT TERM; sleep 60", kill_grace=1, scope_sends=scope_sends
+    )
+    sigterms = scope_sends.count(signal.SIGTERM) + sent.count(signal.SIGTERM)
+    assert sigterms == 1, f"SIGTERM sent {sigterms} times (scope {scope_sends}, group {sent})"
+    assert scope_sends[0] is signal.SIGTERM and signal.SIGTERM not in sent, (scope_sends, sent)
+    assert signal.SIGKILL in scope_sends and signal.SIGKILL in sent, "SIGKILL must reach scope and group"
+    assert job.exit_code in (-9, 137), job.exit_code
+    assert job.preempt_clean is False
+    assert dirty, "a tree that needed SIGKILL must be reset"
+    assert gate == [{"job_failed": True}], "a tree that needed SIGKILL must get the full check"
+
+
+@pytest.mark.asyncio
+async def test_the_group_gets_the_one_sigterm_when_the_scope_kill_fails(monkeypatch, clear_job_state):
+    """The scope looked live but `systemctl kill` failed: the SIGTERM goes to the process group
+    instead, so the job is still asked to stop once."""
+    _witness(monkeypatch, clean=True)
+    scope_sends = []
+    real_run = subprocess.run
+
+    def _failing_kill(argv, *a, **k):
+        if list(argv[:2]) == ["systemctl", "kill"]:
+            scope_sends.append(signal.Signals[argv[2].split("=", 1)[1]])
+            return subprocess.CompletedProcess(argv, 1)
+        return real_run(argv, *a, **k)
+
+    _fast_preempt(monkeypatch, grace=1, kill_grace=5)
+    monkeypatch.setattr(srv, "_scope_active", lambda unit: unit == srv.job_scope_unit("972") and p.poll() is None)
+    monkeypatch.setattr(srv.subprocess, "run", _failing_kill)
+    job = srv.Job(
+        id="972", owner="server", workspace="/tmp", command="sleep 60", queued_at="t", timeout_sec=1, preemptable=True
+    )
+    srv.jobs["972"] = job
+    sent = _recording_signals(monkeypatch, job)
+    p = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    pid = job.pid = p.pid
+    try:
+
+        async def _reap():
+            while p.poll() is None:
+                await asyncio.sleep(0.05)
+
+        reaper = asyncio.create_task(_reap())
+        await srv._preempt_kill("972", pid, witness=True)
+        await reaper
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+    assert scope_sends == [signal.SIGTERM], scope_sends
+    assert [sig for _, sig in sent] == [signal.SIGTERM], sent
+
+
+_TERM_EXIT_0 = """import signal, sys, time
+def handled(*a):
+{window}    sys.exit(0)
+signal.signal(signal.SIGTERM, handled)
+time.sleep(30)
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window", [False, True], ids=["plain", "shutdown-window"])
+async def test_a_scoped_python_job_that_exits_0_on_sigterm_gets_the_exit_0_skip(
+    monkeypatch, clear_job_state, tmp_path, window
+):
+    """A Python job in a live scope whose SIGTERM handler calls sys.exit(0) ends with its own exit 0
+    and gets no check and no reset. While it exits, the interpreter puts SIGTERM back to its
+    default action, so any second SIGTERM in that window kills it (about a third of the time with
+    a SIGTERM to the scope and another to the group a few ms apart). The "shutdown-window" case
+    makes that window explicit and 0.3 s long, so a second SIGTERM always lands in it. The witness
+    stand-in judges the Python process by its real exit status, recorded by a subshell around it."""
+    status_file = tmp_path / "status"
+    script = tmp_path / "job.py"
+    lines = "    signal.signal(signal.SIGTERM, signal.SIG_DFL)\n    time.sleep(0.3)\n" if window else ""
+    script.write_text(_TERM_EXIT_0.format(window=lines))
+
+    class _RealStatusWitness:
+        def __init__(self, pgid, scope):
+            self.why = ""
+
+        def drain(self):
+            pass
+
+        def _status(self):
+            try:
+                return int(status_file.read_text().strip())
+            except (OSError, ValueError):
+                return None
+
+        def clean(self):
+            st = self._status()
+            if st is None:
+                self.why = "exit not seen"
+                return False
+            if st > 128:
+                self.why = f"python died from signal {st - 128}"
+                return False
+            return True
+
+        def exit_status(self):
+            return self._status() if self.clean() else None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(srv, "ExitWitness", _RealStatusWitness)
+    scope_sends = []
+    # The subshell ignores SIGTERM so it outlives the Python process and records its status
+    # (set +e: the job shell's set -e would end it before the record on a non-zero status).
+    command = f"( trap '' TERM; set +e; {sys.executable} {script}; echo $? > {status_file} )"
+    job, sent, gate, dirty = await _preempt(monkeypatch, "973", command, kill_grace=5, scope_sends=scope_sends)
+    status = status_file.read_text().strip() if status_file.exists() else "never recorded"
+    assert status == "0", f"the job did not exit 0: {status} (exit {job.exit_code}, sent {scope_sends} {sent})"
+    assert scope_sends == [signal.SIGTERM] and sent == [], (scope_sends, sent)
+    assert job.preempt_clean is True and job.preempt_exit_status == 0
+    assert job.exit_code == 0, "a handled SIGTERM with exit 0 must reach the broker as exit 0"
+    assert dirty == [] and gate == [], "exit 0 on SIGTERM: no check and no reset"
 
 
 @pytest.mark.asyncio
