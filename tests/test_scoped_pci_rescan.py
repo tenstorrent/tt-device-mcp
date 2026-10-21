@@ -151,6 +151,61 @@ def test_at_startup_with_the_tray_already_off_the_bus_the_recorded_port_is_resca
     assert fake.writes() == SCOPED
 
 
+def _record(root_ports: list) -> None:
+    pcie_guard.health_dir().mkdir(parents=True, exist_ok=True)
+    (pcie_guard.health_dir() / pcie_guard.TOPOLOGY_FILE).write_text(
+        json.dumps({"root_ports": root_ports, "devices": [0xB140]})
+    )
+
+
+def _skips(monkeypatch) -> list:
+    events: list = []
+    monkeypatch.setattr(
+        pcie_guard,
+        "health_event",
+        lambda kind, **kw: events.append(kw) if kind == "pci_rescan_port_skipped" else None,
+    )
+    return events
+
+
+def test_a_remembered_port_whose_slot_now_holds_another_device_is_not_rescanned(no_tt_sysfs, monkeypatch):
+    """The recorded topology names a root port whose slot now holds an NVMe drive (the card moved):
+    the rescan skips it, journals why, writes nothing and fails its rung without latching."""
+    skips = _skips(monkeypatch)
+    _record([NVME_PORT])
+    with pytest.raises(pcie_guard.NoTtRootPort):
+        pcie_guard.rescan_tt_root_ports()
+    assert no_tt_sysfs.writes() == {}
+    assert skips == [{"port": NVME_PORT, "function": NVME_EP, "reason": "non_tt_function_below"}]
+    assert not PCI_WRITER.latched
+
+
+def test_a_stale_remembered_port_is_skipped_while_the_tenstorrent_port_is_rescanned(sysfs, monkeypatch):
+    skips = _skips(monkeypatch)
+    _record([TT_PORT, NVME_PORT])
+    assert pcie_guard.rescan_tt_root_ports() == [TT_PORT]
+    assert sysfs.writes() == SCOPED
+    assert [s["port"] for s in skips] == [NVME_PORT]
+
+
+@pytest.mark.parametrize("below", ["nothing", "an empty bridge"])
+def test_a_remembered_port_with_no_other_device_below_it_is_still_rescanned(tmp_path, monkeypatch, below):
+    """Chips off the bus leave the port's subtree empty, or holding only bridges: still rescanned."""
+    fake = FakeSysfs(tmp_path / "root", tt_endpoint=False)
+    monkeypatch.setattr(pcie_guard, "SYS_ROOT", fake.root)
+    monkeypatch.setattr(pcie_guard, "_SEEN", None)
+    if below == "an empty bridge":
+        sw = fake.root / "sys/devices/pci0000:00" / TT_PORT / TT_EP
+        sw.mkdir()
+        (sw / "vendor").write_text("0x1000\n")
+        (sw / "class").write_text("0x060400\n")
+    skips = _skips(monkeypatch)
+    _record([TT_PORT])
+    assert pcie_guard.rescan_tt_root_ports() == [TT_PORT]
+    assert fake.writes() == SCOPED
+    assert skips == []
+
+
 def test_with_no_tenstorrent_root_port_the_rescan_fails_and_writes_nothing(no_tt_sysfs):
     with pytest.raises(OSError):
         pcie_guard.rescan_tt_root_ports()

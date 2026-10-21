@@ -249,6 +249,36 @@ class NoTtRootPort(OSError):
     """No Tenstorrent root port could be rescanned: the scoped rescan wrote nothing."""
 
 
+_PCI_CLASS_BRIDGE = 0x0604
+
+
+def _non_tt_function_below(port: str) -> Optional[str]:
+    """The first function below ``port`` now that is neither a Tenstorrent function nor a PCI bridge
+    (class 0x0604), or None. A function whose vendor cannot be read is not counted; one whose class
+    cannot be read counts as no bridge."""
+    stack = [Path(os.path.realpath(_pci_dir() / port))]
+    while stack:
+        try:
+            children = sorted(c for c in stack.pop().iterdir() if _BDF.match(c.name) and not c.is_symlink())
+        except OSError:
+            continue
+        for dev in children:
+            stack.append(dev)
+            try:
+                vendor = int((dev / "vendor").read_text().strip(), 16)
+            except (OSError, ValueError):
+                continue
+            if vendor == TT_VENDOR:
+                continue
+            try:
+                if int((dev / "class").read_text().strip(), 16) >> 8 == _PCI_CLASS_BRIDGE:
+                    continue
+            except (OSError, ValueError):
+                pass
+            return dev.name
+    return None
+
+
 def rescan_tt_root_ports() -> list:
     """The PCI rescan every tt-device-mcp path makes: only the bus below each Tenstorrent root port
     (:func:`tt_root_ports`), through the kernel's ``<port>/pci_bus/<bus>/rescan``, never the global
@@ -256,10 +286,19 @@ def rescan_tt_root_ports() -> list:
     unrelated root ports (a host's NVMe drives). Blocking: callers run it through the one in-flight
     PCI writer. Returns the ports rescanned. Raises :class:`NoTtRootPort` (an OSError, so the calling
     rung fails and recovery goes on to its next step) when no port is known or none could be
-    rescanned; there is no global fallback."""
-    ports = tt_root_ports()
+    rescanned; there is no global fallback. A port that is only remembered (no Tenstorrent function
+    below it now) is trusted only while no other device sits below it: its slot may since hold
+    another card, whose bus a rescan would resize, so it is skipped."""
+    eps = tt_endpoints()
+    present = {e.root_port for e in (eps or {}).values() if e.root_port}
+    ports = tt_root_ports(eps)
     done: list = []
     for port in ports:
+        if port not in present:
+            other = _non_tt_function_below(port)
+            if other:
+                health_event("pci_rescan_port_skipped", port=port, function=other, reason="non_tt_function_below")
+                continue
         try:
             buses = sorted((_pci_dir() / port / "pci_bus").iterdir())
         except OSError as exc:

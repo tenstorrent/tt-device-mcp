@@ -2131,10 +2131,15 @@ each rung fires only when the gentler one failed or cannot apply.
   `/sys/bus/pci/devices/<root port>/pci_bus/<bus>/rescan` of the root ports above Tenstorrent
   endpoints (vendor 0x1e52): those on the bus now, plus those remembered in the recorded topology
   (I24) whose port is still in sysfs, so a chip already off the bus, and a broker that starts with
-  the tray off, still rescan its port. The kernel rescans and resizes only that port's bus. There
-  is no global fallback: with no Tenstorrent root port to rescan, the call writes nothing, journals
-  `pci_rescan_no_tt_root_port` and raises, so its rung fails and the ladder goes on (I76: the ladder
-  at 10 min, then the power cycle). The broker's rescans still run through the one in-flight writer
+  the tray off, still rescan its port. A remembered port is trusted only while no other device
+  sits below it: one with no Tenstorrent function below it now whose subtree holds any other
+  function that is not a PCI bridge (class 0x0604) is skipped and journaled as
+  `pci_rescan_port_skipped` with reason `non_tt_function_below` (its slot may since hold another
+  card, an NVMe drive for example, whose bus a rescan would resize). A remembered port with an
+  empty subtree, or only bridges below it, is still rescanned. The kernel rescans and resizes only
+  that port's bus. There is no global fallback: with no Tenstorrent root port to rescan, the call
+  writes nothing, journals `pci_rescan_no_tt_root_port` and raises, so its rung fails and the
+  ladder goes on (I76: the ladder at 10 min, then the power cycle). The broker's rescans still run through the one in-flight writer
   (`PCI_WRITER`, I76) with the same bound and latch; the probe's rescan still runs under the
   device-op flock. Only the target changed.
 
@@ -2142,6 +2147,10 @@ each rung fires only when the gentler one failed or cannot apply.
   root port instead of every root bus, so it returns no later than the global one; with no
   Tenstorrent root port it fails at once instead of walking the host, and the next rung or the
   bounded power cycle follows as before. Timeouts, the latch and the lift rules are unchanged.
+  Skipping a remembered port that now holds another device removes no rung on a host whose chips
+  sit below their ports. A host with no recorded topology that starts with its chips off the bus
+  has no port to rescan, so it loses the rescan rung (there is no global fallback) and goes on to
+  the next rung.
 
 ## Interfaces
 
@@ -2712,4 +2721,5 @@ sees a silent fabric pass.
 | I93 at the 600 s bound the ladder runs at once, never waits for the gap, and a failing check asks for the power cycle | `tests/test_mesh_reset_repeat.py::test_the_bound_runs_the_ladder_and_asks_for_the_power_cycle_at_600s` |
 | I95 no source string names the global rescan file; the scoped rescan writes only the Tenstorrent root port's bus, also for an off-bus chip's remembered port and at startup with the tray already off | `tests/test_scoped_pci_rescan.py::test_no_source_string_names_the_global_rescan_file`, `::test_the_scoped_rescan_writes_only_the_tenstorrent_root_ports_bus`, `::test_an_off_bus_chips_remembered_root_port_is_still_rescanned`, `::test_at_startup_with_the_tray_already_off_the_bus_the_recorded_port_is_rescanned` |
 | I95 every rescan rung (reset path, bridge batch, bare rescan of dead chips, tray-down and below-floor), the bridge reset and the health probe write only the Tenstorrent root port; with none, each fails, writes nothing and does not latch | `tests/test_scoped_pci_rescan.py::test_every_rescan_rung_reaches_only_the_tenstorrent_root_port`, `::test_with_no_tenstorrent_root_port_every_rescan_rung_fails_without_a_global_write`, `::test_the_bridge_reset_rescans_only_the_tenstorrent_root_port`, `::test_a_bridge_reset_with_no_tenstorrent_root_port_fails_without_a_global_write`, `::test_the_health_probe_rescans_only_the_tenstorrent_root_port`, `::test_the_health_probe_with_no_tenstorrent_root_port_writes_nothing` |
+| I95 a remembered port is trusted only while no other device sits below it: one whose slot now holds a non-Tenstorrent function is skipped and journaled, alone or beside a Tenstorrent port; one with an empty subtree or only a bridge below is still rescanned | `tests/test_scoped_pci_rescan.py::test_a_remembered_port_whose_slot_now_holds_another_device_is_not_rescanned`, `::test_a_stale_remembered_port_is_skipped_while_the_tenstorrent_port_is_rescanned`, `::test_a_remembered_port_with_no_other_device_below_it_is_still_rescanned` |
 | I95 the 10-min ladder with the real rescan: scoped, and a failed rescan still climbs to the mesh reset, the full check and the power cycle without lifting the hold | `tests/test_scoped_pci_rescan.py::test_the_10_min_ladders_rescan_is_scoped_and_a_failed_one_still_reaches_the_power_cycle` |
