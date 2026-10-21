@@ -1287,14 +1287,15 @@ async def test_a_disproven_lift_runs_the_bound_ladder_after_one_tick_whatever_th
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "detail, output",
-    [("post-job: fabric unverified", MISMATCH), ("post-job: fabric check COULD NOT RUN (77)", "")],
+    "detail, output, at_start",
+    [("post-job: fabric unverified", MISMATCH, True), ("post-job: fabric check COULD NOT RUN (77)", "", False)],
 )
 async def test_a_hold_with_no_disproven_lift_keeps_the_600s_bound_and_its_fast_path(
-    monkeypatch, clear_job_state, detail, output
+    monkeypatch, clear_job_state, detail, output, at_start
 ):
-    """Only the I42 latch moves the bound: a plain topology-mismatch or 77 hold one tick in runs no
-    rung and its bound stays the ceiling (I30's no-reset fast path is unchanged)."""
+    """Only the I42 latch moves the bound: a plain topology-mismatch or 77 hold keeps the ceiling as its
+    bound. A 77 hold one tick in runs no rung (I30's no-reset fast path is unchanged); an unlatched
+    mismatch is spec 04 I83's fabric link-short class, so its one tick runs the at-start ladder."""
     escalations, _alerts, events = _arm_fabric_only_deadline_hold(
         monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail=detail, fabric_output=output, age_min=0.2
     )
@@ -1304,7 +1305,12 @@ async def test_a_hold_with_no_disproven_lift_keeps_the_600s_bound_and_its_fast_p
     assert srv._hold_bound_sec() == srv._stuck_hold_ceiling_sec() == BOUND
     srv._check_hold_deadline(now=datetime.now())
     await _drain()
-    assert escalations == [] and "host_rung" not in events
+    if at_start:
+        assert srv.device_hold_escalation_kind == "fabric_link_short"
+        assert escalations == ["present-forced"], "I83: one full ladder at hold start"
+        assert srv._hold_bound_sec() == BOUND, "the at-start ladder does not move the bound"
+    else:
+        assert escalations == [] and "host_rung" not in events
 
 
 @pytest.mark.asyncio
