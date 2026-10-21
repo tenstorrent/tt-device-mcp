@@ -16,6 +16,7 @@ from tests.test_offbus_one_shot_idle import IDLE, _below_floor_hold
 from tests.test_post_reset_gate import _assert_settled, _verify_returning
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
+from tt_device_mcp.health import chip_state
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.monitors import heartbeat, pci
 from tt_device_mcp.health.pci_writer import PciWedged
@@ -26,10 +27,10 @@ mesh = prg.mesh  # the post-reset gate's fixtures, shared
 verdict = prg.verdict
 
 
-def _bridge_rung(monkeypatch, idx, beats):
+def _bridge_rung(monkeypatch, idx, beats, attr=True):
     """The real bridge rung for isolated chip ``idx``: its stubbed bridge reset re-creates the chip's
-    sysfs node; the node's ``tt_heartbeat`` reads ``beats`` one value per poll (None: no attribute, the
-    ARC is not up). Returns the events the rung logs."""
+    sysfs node; the node's ``tt_heartbeat`` reads ``beats`` one value per poll (None: ENODATA, the
+    ARC is not up). ``attr=False``: a KMD with no ``tt_heartbeat`` attr. Returns the events the rung logs."""
     srv.isolated_chips = {idx}
     srv.device_pci_map = {idx: "0000:46:00.0"}
     monkeypatch.setattr(recovery_pkg, "arc_live_chips", heartbeat.arc_live_chips)
@@ -41,9 +42,13 @@ def _bridge_rung(monkeypatch, idx, beats):
 
     def bridge_reset(i, bdf):
         node.mkdir(exist_ok=True)
+        if attr:
+            (node / "tt_heartbeat").write_text("0")
         return True
 
     def read_beat(n):
+        if not (n / "tt_heartbeat").exists():
+            raise FileNotFoundError(2, "No such file or directory")
         value = next(reads, beats[-1])
         if value is None:
             raise OSError(61, "No data available")  # ENODATA: ARC not ready
@@ -51,6 +56,7 @@ def _bridge_rung(monkeypatch, idx, beats):
 
     monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", bridge_reset)
     monkeypatch.setattr(heartbeat, "_read_beat", read_beat)
+    monkeypatch.setattr(recovery_pkg, "_arc_check_skip_logged", False, raising=False)
     events = []
     patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
     monkeypatch.setattr(recovery_pkg, "health_event", lambda kind, **f: events.append((kind, f)))
@@ -137,6 +143,59 @@ async def test_an_arc_dead_reenumeration_reaches_the_one_shot_on_its_short_clock
     else:
         assert srv.fsm.state is not ServerState.HEALTHY and FABRIC_DEBT.owed
         assert count("post_reset_release_refused") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_kmd_without_the_heartbeat_attr_fails_no_chip_and_says_so_once(monkeypatch):
+    """An old KMD exposes no tt_heartbeat: the check cannot answer, so it marks no chip ARC-dead (else
+    every bridge recovery there fails). The skip is said once, not on every rung."""
+    events = _bridge_rung(monkeypatch, "13", [None], attr=False)
+    logs = []
+    assert await srv.galaxy_recovery._recover_isolated_chips(logs.append) is True
+    assert srv.isolated_chips == set()
+    srv.isolated_chips = {"13"}
+    assert await srv.galaxy_recovery._recover_isolated_chips(logs.append) is True
+    kinds = [k for k, _ in events]
+    assert "bridge_reset_arc_dead" not in kinds
+    assert kinds.count("bridge_reset_arc_check_skipped") == 1
+    assert len([m for m in logs if "ARC check skipped" in m]) == 1
+
+
+@pytest.mark.asyncio
+async def test_without_the_attr_the_rung_still_fails_on_its_other_checks(monkeypatch):
+    """The skip decides nothing else: a chip whose bridge reset left it off the bus still fails the rung."""
+    _bridge_rung(monkeypatch, "13", [None], attr=False)
+    srv.isolated_chips = {"13", "14"}
+    srv.device_pci_map = {"13": "0000:46:00.0", "14": "0000:47:00.0"}
+    node13 = pci.SYSFS_CLASS_DIR / "tenstorrent!13"
+    monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", lambda i, bdf: i == "13" and (node13.mkdir() or True))
+    assert await srv.galaxy_recovery._recover_isolated_chips(lambda m: None) is False
+    assert srv.isolated_chips == {"14"}
+
+
+@pytest.mark.asyncio
+async def test_with_the_attr_an_unreadable_heartbeat_is_not_skipped(monkeypatch):
+    """ENODATA on every chip makes heartbeat_supported() False too, but the attr is there: that is an
+    ARC-dead chip, not an old KMD, and it stays isolated."""
+    events = _bridge_rung(monkeypatch, "13", [None])
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda *a: False)
+    assert await srv.galaxy_recovery._recover_isolated_chips(lambda m: None) is False
+    assert srv.isolated_chips == {"13"}
+    assert "bridge_reset_arc_check_skipped" not in [k for k, _ in events]
+
+
+def test_a_lost_marked_chip_gets_a_real_heartbeat_read(monkeypatch):
+    """A chip marked lost is read for real, not reported all-ones from its mark; only the asked chips are read."""
+    for i in ("13", "14"):
+        node = pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}"
+        node.mkdir()
+        (node / "tt_heartbeat").write_text("0")
+    chip_state.mark_lost(["13"], "test", nodes={"13": pci.SYSFS_CLASS_DIR / "tenstorrent!13"})
+    monkeypatch.setattr(chip_state, "PROBE_MIN_SEC", 0)  # its last real read is older than a probe's gap
+    reads = []
+    monkeypatch.setattr(heartbeat, "_read_beat", lambda n: reads.append(n.name) or "12345")
+    assert heartbeat.arc_live_chips(["13"]) == ["13"]
+    assert reads == ["tenstorrent!13"]
 
 
 def test_the_arc_wait_is_bounded():

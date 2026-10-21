@@ -2126,6 +2126,10 @@ each rung fires only when the gentler one failed or cannot apply.
   short clock instead of the hold waiting for the 10-min ladder. The check only reads sysfs: it adds no
   PCI write, reads nothing once the pass has latched PCI-wedged (I76), and it can only keep a chip held, never lift a hold (the lift still needs the full
   post-reset check, fabric included). The 10-min ladder and power-cycle escalation are unchanged.
+  Each read is a decision read of only those chips, so a chip marked lost (spec 03 I66) is read for
+  real. On a host whose KMD exposes no `tt_heartbeat` attr the check cannot answer: it marks no chip,
+  says so once (`bridge_reset_arc_check_skipped`), and the rung's other checks and the full post-reset
+  check still decide. An attr that is there but unreadable (ENODATA) is a dead ARC, not a skip.
 
 ## Interfaces
 

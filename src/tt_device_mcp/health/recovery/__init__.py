@@ -30,7 +30,12 @@ from tt_device_mcp.device_holders import HolderScan, is_tenant
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitors import fabric, pci
-from tt_device_mcp.health.monitors.heartbeat import arc_live_chips, arc_not_ready_chips, offbus_count
+from tt_device_mcp.health.monitors.heartbeat import (
+    arc_live_chips,
+    arc_not_ready_chips,
+    heartbeat_attr_present,
+    offbus_count,
+)
 from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import base as _base
@@ -103,6 +108,8 @@ NO_WINDOW_REMOVED_REASON = "removed_not_reenumerated"
 BRIDGE_RESET_ARC_POLLS = 10
 BRIDGE_RESET_ARC_POLL_SEC = 0.5
 BRIDGE_RESET_ARC_WAIT_SEC = BRIDGE_RESET_ARC_POLLS * BRIDGE_RESET_ARC_POLL_SEC
+# A KMD without the heartbeat attr cannot answer the I94 check: it is skipped there, said once.
+_arc_check_skip_logged = False
 
 # A reset returns before the eth links re-train, so the immediate post-reset fabric pass can find
 # no trained link (77). Retry (see Recovery._verify_device_after_reset), giving the links time to
@@ -816,8 +823,20 @@ class Recovery(ABC):
     async def _arc_dead_after_bridge_reset(self, chips: list, log) -> list:
         """Spec 04 I94: of the chips the bridge rung brought back on the bus, those whose ARC heartbeat
         still does not read as a counter after BRIDGE_RESET_ARC_WAIT_SEC. Reads only; a live chip costs
-        one heartbeat read and no wait."""
+        one heartbeat read and no wait. On a host whose KMD has no heartbeat attr it marks no chip:
+        the rung's other checks and the full post-reset check, fabric included, still gate the lift."""
+        global _arc_check_skip_logged
         pending = sorted(chips, key=int)
+        if (
+            pending
+            and not await asyncio.to_thread(heartbeat_attr_present, pending)
+            and not await asyncio.to_thread(self.deps.heartbeat_supported)
+        ):
+            if not _arc_check_skip_logged:
+                _arc_check_skip_logged = True
+                log("post-bridge ARC check skipped: this driver exposes no tt_heartbeat attr")
+                health_event("bridge_reset_arc_check_skipped", reason="attr_absent", chips=pending)
+            return []
         for attempt in range(BRIDGE_RESET_ARC_POLLS + 1):
             if not pending:
                 break

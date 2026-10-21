@@ -204,8 +204,15 @@ def arc_live_chips(ids) -> list[str]:
     want = {str(i) for i in ids}
     if not want:
         return []
-    beats = read_heartbeats()
+    # Only these chips, and a lost-marked one too: a decision read, so it is judged on its answer.
+    beats = read_heartbeats(probe_lost=True, only=frozenset(want))
     return sorted((i for i in want if i in beats and beats[i] != ALL_ONES), key=int)
+
+
+def heartbeat_attr_present(ids) -> bool:
+    """Does any of ``ids``' sysfs nodes expose ``tt_heartbeat``? A stat, no chip read. False on a
+    host whose KMD predates the counter."""
+    return any((pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}" / "tt_heartbeat").exists() for i in ids)
 
 
 def heartbeat_absence_reason() -> Optional[str]:
