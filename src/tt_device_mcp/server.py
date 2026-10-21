@@ -4532,6 +4532,23 @@ def _fabric_no_reset_hold() -> str:
 # Spec 04 I83: the no-reset causes that are a fabric link-short hold — every chip on the bus, but the
 # full check counts fewer links (or ports) than the cabling expects.
 _FABRIC_LINK_SHORT_CAUSES = ("topology mismatch", "known fabric fault")
+# Spec 04 I83: the measured link-short causes, which keep the reset: the spec 03 I42 latch, and a full
+# check that failed on descriptor ports missing (spec 03 I71; ports the accept list excuses never fail).
+_FABRIC_LINK_SHORT_LATCHED = "topology latch"
+_FABRIC_LINK_SHORT_MISSING = "fabric links missing"
+
+
+def _fabric_links_missing_hold() -> bool:
+    """Whether the last full fabric check FAILED on descriptor ports missing (spec 03 I71)."""
+    mon = health_monitor
+    if mon is None or mon.last_fabric_ok is not False:
+        return False
+    topo = getattr(mon, "fabric_topology", None) or {}
+    return (
+        fabric.names_links_missing(mon.last_fabric_output or "")
+        or fabric.names_links_missing(str(fsm.record.detail or ""))
+        or (topo.get("verdict") == "failed" and bool(topo.get("missing_ports")))
+    )
 
 
 def _fabric_link_short_hold() -> str:
@@ -4539,7 +4556,31 @@ def _fabric_link_short_hold() -> str:
     if isolated_chips:
         return ""
     cause = _fabric_no_reset_hold()
-    return cause if cause in _FABRIC_LINK_SHORT_CAUSES else ""
+    if cause in _FABRIC_LINK_SHORT_CAUSES:
+        return cause
+    if health_monitor is not None and health_monitor.topology_hw_fault:
+        return _FABRIC_LINK_SHORT_LATCHED
+    return _FABRIC_LINK_SHORT_MISSING if _fabric_links_missing_hold() else ""
+
+
+def _link_short_relift_reset_owned() -> bool:
+    """Spec 04 I83 single flight: once the episode's at-start pass (or a bound ladder, or the host rung)
+    has run or is running, the idle relift's measured-fault present-mesh retries run no other glx_reset
+    on a fabric link-short hold. That one ladder's full check, then the host rung, decide the hold."""
+    if not _fabric_link_short_hold():
+        return False
+    _hold_bound_sync()
+    running = (
+        _forced_escalation_task is not None
+        and not _forced_escalation_task.done()
+        and device_hold_escalation_kind == "fabric_link_short"
+    )
+    return (
+        running
+        or _hold_bound_ladder_age is not None
+        or _hold_bound_cycle_age is not None
+        or _hold_bound_rung_pending
+    )
 
 
 def _fabric_link_short_early(kind: Optional[str]) -> bool:
@@ -4817,6 +4858,9 @@ async def _attempt_idle_relift() -> None:
                 host's own escalate() has no ladder and reports WAITING forever — an idle hold
                 there would outlive every ceiling with no rung ever attempted. ``measured_fault``
                 lets the present ladder reset without the grace (spec 03 I56)."""
+                if rung == "present" and _link_short_relift_reset_owned():
+                    _log("fabric link-short hold: the watchdog's one ladder owns the reset (spec 04 I83)")
+                    return False
                 _void_fabric_ok(f"idle relift: {rung}")
                 outcome = await galaxy_recovery.escalate(
                     rung, indices, expected, _log, measured_fault=measured_fault, stand_down=_startup_verify_owns_hold
@@ -8170,12 +8214,13 @@ async def _force_escalate_stuck_hold() -> None:
             return
         off_bus = _offbus_count(beats, expected)
         no_reset = "" if off_bus or isolated_chips or climb_77 else _fabric_no_reset_hold()
-        if kind == "fabric_link_short" and (not early or no_reset not in _FABRIC_LINK_SHORT_CAUSES):
+        link_short = "" if off_bus or isolated_chips or climb_77 else _fabric_link_short_hold()
+        if kind == "fabric_link_short" and (not early or not link_short):
             # The chips or the cause changed since the sampler spawned this: not the I83 class now. No
             # more at-start spawns this episode; the class it is now keeps its own path and the bound.
             _fabric_link_short_declined = device_hold_episode_since
             return
-        if early and no_reset not in _FABRIC_LINK_SHORT_CAUSES:
+        if early and not link_short:
             return
         if no_reset and not early:
             # Every chip enumerates with a live ARC heartbeat and the hold names only the fabric: a 77
@@ -8430,9 +8475,10 @@ def _hold_bound_ladder_in_last_window(age: float) -> bool:
 
 def _hold_bound_owes_ladder(age: float) -> bool:
     """Spec 04 I83 with I76: at the bound, an at-start pass whose host rung was never granted (both host
-    rungs opted out, or a denial other than the cooldown) does not stand in for the bound's ladder."""
+    rungs opted out, or a denial other than the cooldown) does not stand in for the bound's ladder. The
+    rerun waits for the 10-min mark even under the I42 latch, whose one-tick bound the at-start pass met."""
     lad = _hold_bound_ladder_age
-    if not _hold_bound_early or lad is None or age < _hold_bound_sec():
+    if not _hold_bound_early or lad is None or age < _stuck_hold_ceiling_sec():
         return False
     return _hold_bound_granted_age is None or _hold_bound_granted_age < lad
 

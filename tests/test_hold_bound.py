@@ -655,8 +655,8 @@ async def test_replay_a_disproven_lift_hold_gets_the_ladder_and_power_cycle_with
     """A Galaxy host's post-job hold: a job's fabric failure after a topology lift sets the I42 latch, the
     hold takes the ladder, and no idle relift reset ran first (the watchdog path). The latch stands, so the
     bound applies after one sampler tick, not 600 s (where the ladder started 10 min in and the power
-    cycle came ~14-16 min into the hold, past the old latch's 20 min). Walked tick by tick: below one tick
-    nothing is forced; at the tick the full ladder runs, the full check after it (fabric included) fails,
+    cycle came ~14-16 min into the hold, past the old latch's 20 min). Walked tick by tick: on the first
+    tick (spec 04 I83) the full ladder runs, the full check after it (fabric included) fails,
     the broker asks for the power cycle; the 10-min mark adds no second ladder or cycle while it is
     pending, and the deadline event reads escalated."""
     order, g = rig["order"], rig["g"]
@@ -712,25 +712,25 @@ async def test_replay_a_disproven_lift_hold_gets_the_ladder_and_power_cycle_with
     tick = float(srv.SAMPLE_INTERVAL_SEC)
     hold_age = [0.0]
     assert srv._hold_bound_sec() == tick < BOUND, "a latched hold's bound is one sampler tick"
-    for age in (1, tick / 2):  # below the tick nothing is forced
-        hold_age[0] = age
-        monkeypatch.setattr(srv, "device_hold_episode_since", _since(age))
-        srv._check_hold_deadline(now=datetime.now())
-        await _drain()
-        assert "glx_reset" not in order and "power_cycle" not in order, f"a rung ran at {age}s, below one tick"
-
-    hold_age[0] = tick
-    monkeypatch.setattr(srv, "device_hold_episode_since", _since(tick))
+    # Spec 04 I83: a latched hold is a fabric link-short hold: its one ladder runs on the first tick.
+    hold_age[0] = 1
+    monkeypatch.setattr(srv, "device_hold_episode_since", _since(1))
     srv._check_hold_deadline(now=datetime.now())
     await _drain()
-    assert "glx_reset" in order, "the full ladder ran at the first tick, not at 600 s"
+    assert "glx_reset" in order, "the full ladder ran at hold start, not at one tick or 600 s"
     assert checks == [False], "the full check after the ladder, fabric included, failed"
     assert order.count("power_cycle") == 1, "then the broker's own code asked for the power cycle"
     assert order.index("glx_reset") < order.index("power_cycle")
     assert "released" not in order, "nothing released on a failed check"
     # TTR: the rung is asked at the hold age the ladder started, plus the ladder and its full check
     # (measured worst ~630 s: glx_reset 62-263 s, last-chance sweep, fabric check 85-420 s).
-    assert cycle_ages == [tick], "the power cycle was asked in the run the first tick started"
+    assert cycle_ages == [1], "the power cycle was asked in the run the first tick started"
+    for age in (tick / 2, tick):  # the one-tick bound adds no second ladder or cycle
+        hold_age[0] = age
+        monkeypatch.setattr(srv, "device_hold_episode_since", _since(age))
+        srv._check_hold_deadline(now=datetime.now())
+        await _drain()
+    assert order.count("glx_reset") == 1 and order.count("power_cycle") == 1
     rung_age = cycle_ages[0]
     assert rung_age + _LADDER_AND_CHECK_WORST_SEC <= _CLASS_D_BUDGET_SEC, "within the class D budget"
     assert BOUND + _LADDER_AND_CHECK_WORST_SEC > _CLASS_D_BUDGET_SEC, "the old 600 s wait was over it"
@@ -1354,8 +1354,9 @@ async def test_the_host_rung_after_an_early_disproven_lift_ladder_runs_no_second
 @pytest.mark.parametrize("kill_switch", [False, True])
 def test_health_names_a_disproven_lifts_early_ladder_then_its_host_rung(monkeypatch, clear_job_state, kill_switch):
     """Spec 04 I75/I76 with 03 I42: /health's next rung reads the run's own bound. A latched hold names
-    the full ladder one sampler tick in, then, after that early ladder, the host rung at the end of its
-    check bound (not the 600 s ceiling window), whatever TT_DEVICE_MCP_FORCE_ESCALATE says."""
+    the full ladder (at hold start, spec 04 I83), then, after that early ladder, the host rung at the end of its
+    check bound (not the 600 s ceiling window). Spec 04 I83: that ladder is due at hold start; only the
+    kill switch defers it, to the one-tick bound it never governs."""
     if kill_switch:
         monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
@@ -1363,8 +1364,10 @@ def test_health_names_a_disproven_lifts_early_ladder_then_its_host_rung(monkeypa
     _arm_disproven_lift_hold(monkeypatch, age_sec=2)
     started = datetime.fromisoformat(srv.device_hold_episode_since).timestamp()
     rung = srv._hold_next_rung(time.time())
-    assert (rung.rung, rung.source) == ("forced ladder", "disproven lift bound")
-    assert rung.at == pytest.approx(started + tick, abs=1)
+    # Spec 04 I83: a latched hold is a fabric link-short hold — its one ladder is due at hold start; the
+    # kill switch defers it to the latch's one-tick bound, which it never governs.
+    assert (rung.rung, rung.source) == ("forced ladder", "fabric link-short at-start ladder")
+    assert rung.at == pytest.approx(started + (tick if kill_switch else 2), abs=1)
 
     since = _since(300)
     monkeypatch.setattr(srv, "device_hold_episode_since", since)
