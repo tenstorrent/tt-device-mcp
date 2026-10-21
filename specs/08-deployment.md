@@ -101,6 +101,7 @@ job log, so every "installed" claim below is verified, not assumed.
   observe a half-built prefix. The build runs only out of band (systemd oneshot, `Nice=19`,
   retried hourly by its timer) — never inside the health gate or the updater. Until it lands the
   fabric check reports CANNOT CHECK (exit 77), and the broker does not guess (spec 03).
+  The one foreground run is a fresh install's, before the broker's first start (I25).
 - **I15 — The eth-heartbeat probe's exit codes are the contract and a crash cannot forge
   FROZEN.** 0 = every measured core advancing; 3 = FROZEN (deliberate, evidenced — at least one
   up-link core measured); 77 = could not measure (attach failure, no device, any unexpected
@@ -240,6 +241,15 @@ job log, so every "installed" claim below is verified, not assumed.
   most one job cap (1560 s) after that job started. The drain delays only the restart: no reset,
   ladder rung, power cycle or hold escalation waits on it.
 
+- **I25 — A fresh install builds the pinned validator before the broker's first start.**
+  `install-tt-device-broker.sh` checks that `validator/current` holds all three pinned binaries
+  (and the cabling descriptor, when one is configured) after apply-host-config. If not, it runs
+  `systemctl start tt-device-fabric-validator.service` in the foreground (it joins the run
+  apply-host-config kicked with `--no-block`) and only then enables and restarts the broker. A failed
+  build, or one that leaves `current` incomplete, exits 1 naming the unit's journal, and the broker
+  is not (re)started. An upgrade keeps the old `current` until the new build flips it, so it never
+  waits here. Reason: a broker started before the validator exists gets a 77 from its startup
+  fabric pass and holds the device fabric-unverified, so a fresh install never comes up verified.
 ## Interfaces
 
 **`/etc/default/tt-device-broker`** — written by the installer, sourced by `apply-host-config.sh`,
@@ -542,6 +552,7 @@ script exists, the claim stands on the script (listed below).
 | I3 (/health fail-closed, polled) | `tests/test_deploy_broker_health_failclosed.py::test_broker_health_failure_aborts_with_journal_hint`, `tests/test_deploy_broker_health_failclosed.py::test_broker_health_is_polled_in_a_loop` |
 | I4 (sudoers visudo fail-closed, removed first) | `tests/test_deploy_sudoers_failclosed.py::test_invalid_shipped_sudoers_aborts`, `tests/test_deploy_sudoers_failclosed.py::test_invalid_shipped_sudoers_is_removed_before_aborting` |
 | I5/I6 (timers enabled AND verified active) | `tests/test_deploy_timer_enable_failclosed.py::test_reconcile_timer_enable_is_verified`, `tests/test_deploy_timer_enable_failclosed.py::test_fabric_validator_timer_enable_is_verified`, `tests/test_deploy_timer_enable_failclosed.py::test_is_active_check_follows_the_enable` |
+| I25 (validator built before the broker's first start) | `tests/test_deploy_validator_before_broker.py::test_validator_build_runs_before_the_broker_starts`, `tests/test_deploy_validator_before_broker.py::test_validator_build_is_blocking_and_failclosed`, `tests/test_deploy_validator_before_broker.py::test_incomplete_build_fails_the_install`, `tests/test_deploy_validator_before_broker.py::test_built_check_covers_all_three_pinned_binaries` |
 | I7 (device-op bar unconditional, separate from the I24 busy gate; the job-cap bound never lifts it) | `tests/test_deploy_autoupdate_idle_gate.py::test_an_in_flight_device_op_still_bars_the_update`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_holds_a_drained_apply`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_still_bars_the_restart_past_the_cap`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_at_the_restart_point_blocks_the_restart` |
 | I8 (autoupdate required stages fail-closed; apply precedes installed.sha; staged sources exist) | `tests/test_deploy_required_install_failclosed.py::test_autoupdate_required_stages_fail_closed`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_host_config_apply_fails_closed`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_host_config_apply_precedes_installed_sha`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_staged_sources_exist_in_deploy` |
 | Installer staging split (fabric fatal; heartbeat loud-not-fatal) | `tests/test_deploy_required_install_failclosed.py::test_installer_fabric_check_stage_is_fatal_not_swallowed`, `tests/test_deploy_required_install_failclosed.py::test_installer_eth_heartbeat_stage_is_loud_but_not_fatal` |
