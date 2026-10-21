@@ -126,14 +126,6 @@ AUTO_REBOOT="${TTDEV_AUTO_REBOOT:-}"
 [ -z "$AUTO_REBOOT" ] && [ -r "$UNIT" ] && AUTO_REBOOT="$(sed -n 's/^Environment=TT_DEVICE_MCP_AUTO_REBOOT=//p' "$UNIT" 2>/dev/null | head -1)"
 AUTO_POWER_CYCLE="${TTDEV_AUTO_POWER_CYCLE:-}"
 [ -z "$AUTO_POWER_CYCLE" ] && [ -r "$UNIT" ] && AUTO_POWER_CYCLE="$(sed -n 's/^Environment=TT_DEVICE_MCP_AUTO_POWER_CYCLE=//p' "$UNIT" 2>/dev/null | head -1)"
-# The per-tray BMC reset rung is armed by DEFAULT in server.py (TT_DEVICE_MCP_AUTO_UBB_RESET, only "0"
-# disables it), so unlike the cold rungs above this passthrough's job is the reverse: a force-OFF path.
-# An operator whose BMC bit order the broker has not confirmed disarms the rung — back to naming the
-# command and holding — with TTDEV_AUTO_UBB_RESET=0, without hand-editing the unit. Unset renders no line,
-# leaving the rung armed at its code default; the unit-read fallback mirrors the others so an auto-update
-# never drops a disarm an operator already set.
-AUTO_UBB_RESET="${TTDEV_AUTO_UBB_RESET:-}"
-[ -z "$AUTO_UBB_RESET" ] && [ -r "$UNIT" ] && AUTO_UBB_RESET="$(sed -n 's/^Environment=TT_DEVICE_MCP_AUTO_UBB_RESET=//p' "$UNIT" 2>/dev/null | head -1)"
 # The pre-job dispatch probe opt-in. server.py reads TT_DEVICE_MCP_PREJOB_DISPATCH ("1" arms it),
 # default OFF: the gate proves the mesh runs a kernel before admitting a tenant, but a probe slower
 # than its timeout on a given host reads as a false wedge — and that class of false verdict has cost
@@ -165,7 +157,6 @@ relift_env=""; [ -n "$RELIFT" ] && relift_env="Environment=TT_DEVICE_MCP_SELFHEA
 expected_env=""; [ -n "$EXPECTED_CHIPS" ] && expected_env="Environment=TT_DEVICE_MCP_EXPECTED_CHIPS=$EXPECTED_CHIPS"
 autoreboot_env=""; [ -n "$AUTO_REBOOT" ] && autoreboot_env="Environment=TT_DEVICE_MCP_AUTO_REBOOT=$AUTO_REBOOT"
 autopc_env=""; [ -n "$AUTO_POWER_CYCLE" ] && autopc_env="Environment=TT_DEVICE_MCP_AUTO_POWER_CYCLE=$AUTO_POWER_CYCLE"
-autoubb_env=""; [ -n "$AUTO_UBB_RESET" ] && autoubb_env="Environment=TT_DEVICE_MCP_AUTO_UBB_RESET=$AUTO_UBB_RESET"
 prejobdispatch_env=""; [ -n "$PREJOB_DISPATCH" ] && prejobdispatch_env="Environment=TT_DEVICE_MCP_PREJOB_DISPATCH=$PREJOB_DISPATCH"
 pollers_env=""; [ -n "$POLLER_SERVICES" ] && pollers_env="Environment=TT_DEVICE_MCP_POLLER_SERVICES=$POLLER_SERVICES"
 ethpython_env=""; [ -n "$ETH_PYTHON" ] && ethpython_env="Environment=TTDEV_ETH_CHECK_PYTHON=$ETH_PYTHON"
@@ -199,7 +190,6 @@ if [ -z "$RENDER_ONLY" ]; then
     ensure_default TTDEV_EXPECTED_CHIPS "$EXPECTED_CHIPS"
     ensure_default TTDEV_AUTO_REBOOT "$AUTO_REBOOT"
     ensure_default TTDEV_AUTO_POWER_CYCLE "$AUTO_POWER_CYCLE"
-    ensure_default TTDEV_AUTO_UBB_RESET "$AUTO_UBB_RESET"
     ensure_default TTDEV_PREJOB_DISPATCH "$PREJOB_DISPATCH"
     ensure_default TTDEV_ETH_CHECK_PYTHON "$ETH_PYTHON"
     ensure_default TTDEV_AICLK_CEILING_MHZ "$AICLK_CEILING"
@@ -251,7 +241,6 @@ $relift_env
 $expected_env
 $autoreboot_env
 $autopc_env
-$autoubb_env
 $prejobdispatch_env
 $pollers_env
 $ethpython_env

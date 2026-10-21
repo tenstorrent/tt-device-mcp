@@ -439,7 +439,7 @@ def _back_on_bus(idx: str, rec: dict) -> bool:
 
 def forget_returned_removed_chips(context: str) -> list:
     """Drop every record whose chip is enumerated again, whatever brought it back (a bridge reset, a
-    mesh reset, a tray re-power, a power cycle, an outside rescan): a record only describes a chip
+    mesh reset, an external tray re-power, a power cycle, an outside rescan): a record only describes a chip
     that is still off the bus. Left standing, it would withhold every later rescan and aim a bridge
     reset at a bus that now holds live silicon. Never releases anything (spec 04 I69)."""
     with _REMOVED_LOCK:

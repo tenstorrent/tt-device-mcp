@@ -176,7 +176,6 @@ def rig(monkeypatch, galaxy_trays):
 
     monkeypatch.setattr(g, "_reset_and_verify_device", mesh_reset)
     monkeypatch.setattr(g, "_settle_and_verify_before_host_rung", last_chance)
-    monkeypatch.setattr(g, "_attempt_ubb_tray_reset", recorded("ubb_tray"))
     monkeypatch.setattr(g, "_fire_tray_down_no_window", recorded("tray_down_no_window", galaxy.OUTCOME_WAITING))
     monkeypatch.setattr(g, "_escalate_offbus_stuck_hold", recorded("offbus_ladder"))
     monkeypatch.setattr(g, "_escalate_stuck_hold", recorded("present_ladder"))
