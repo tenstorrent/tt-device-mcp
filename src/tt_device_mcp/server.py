@@ -4576,10 +4576,7 @@ def _link_short_relift_reset_owned() -> bool:
         and device_hold_escalation_kind == "fabric_link_short"
     )
     return (
-        running
-        or _hold_bound_ladder_age is not None
-        or _hold_bound_cycle_age is not None
-        or _hold_bound_rung_pending
+        running or _hold_bound_ladder_age is not None or _hold_bound_cycle_age is not None or _hold_bound_rung_pending
     )
 
 

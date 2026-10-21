@@ -21,13 +21,26 @@ from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health.recovery import OUTCOME_RECOVERED, OUTCOME_TERMINAL, OUTCOME_WAITING
 
 LINK_SHORT = ["topology mismatch", "known fabric fault"]
+# The measured link-short holds: the spec 03 I42 latch on a short count, and a full check that failed on
+# descriptor ports missing (spec 03 I71).
+MEASURED = ["latched", "missing ports"]
+ALL = LINK_SHORT + MEASURED
+_LOST_PORT = "PortA <-> PortB"
+LOST_DETAIL = (
+    "fabric check FAILED (66s): fabric links missing: 1 port connection(s) of the cabling descriptor "
+    f"missing, 0 extra, after traffic passed on the discovered links: {_LOST_PORT}"
+)
 
 
 def _arm(monkeypatch, hold, age_sec=10, latched=False):
     """A ``hold`` opened ``age_sec`` ago, with the watchdog at the start of its episode. The host rung
     is stubbed with its real bookkeeping (a requested power cycle marks the host action pending) and
     lands in events as ``host_rung``."""
-    why, detail, output, beats, _ladder = _KINDS[hold]
+    latched = latched or hold == "latched"
+    if hold == "missing ports":
+        why, detail, output, beats = srv.FABRIC_RELIFT_WHY, f"post-job: {LOST_DETAIL}", LOST_DETAIL, None
+    else:
+        why, detail, output, beats, _ladder = _KINDS["topology mismatch" if hold == "latched" else hold]
     escalations, alerts, events = _arm_fabric_only_deadline_hold(
         monkeypatch, why=why, detail=detail, fabric_output=output, beats=beats, age_min=age_sec / 60
     )
@@ -40,6 +53,8 @@ def _arm(monkeypatch, hold, age_sec=10, latched=False):
         monkeypatch.setattr(srv, "dead_chips", lambda b: [])
     if latched:
         monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", "hardware fault: needs an operator")
+    if hold == "missing ports":
+        monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)
 
     async def host_rung(age, log):
         events.append("host_rung")
@@ -67,7 +82,7 @@ def _tick(after_sec):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", [OUTCOME_RECOVERED, OUTCOME_TERMINAL])
-@pytest.mark.parametrize("hold", LINK_SHORT)
+@pytest.mark.parametrize("hold", ALL)
 async def test_one_ladder_at_hold_start_then_the_power_cycle_at_once(monkeypatch, clear_job_state, hold, outcome):
     """(a) the first tick of the hold runs the full ladder; (b) a full check after it that still counts
     short (or a ladder that did not bring the mesh back) asks for the host rung in the same run, long
@@ -76,7 +91,10 @@ async def test_one_ladder_at_hold_start_then_the_power_cycle_at_once(monkeypatch
     _ladder(monkeypatch, escalations, outcome)
     _tick(0)
     await _drain()
-    assert srv.device_hold_escalation_kind == "fabric_link_short"
+    # Under the I42 latch the hold's bound is one sampler tick: past it, the same one ladder runs as the
+    # latch's bound ladder (spec 03 I42), with the same check and host rung after it.
+    kinds = ("fabric_link_short", "disproven_lift") if hold == "latched" else ("fabric_link_short",)
+    assert srv.device_hold_escalation_kind in kinds
     assert escalations == ["present-forced"], "one full ladder at hold start, not at the 10-min mark"
     assert events.count("host_rung") == 1, "then the power cycle, at once"
     assert events.index("hold_deadline_forced_escalation") < events.index("host_rung")
@@ -85,7 +103,7 @@ async def test_one_ladder_at_hold_start_then_the_power_cycle_at_once(monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("hold", LINK_SHORT)
+@pytest.mark.parametrize("hold", ALL)
 async def test_no_second_glx_reset_or_ladder_in_the_episode(monkeypatch, clear_job_state, hold):
     """(c) after the at-start pass and its power-cycle request, no later tick (the bound, the next
     ceiling window, the hold deadline) runs another glx_reset or ladder, or asks for a second cycle."""
@@ -199,15 +217,19 @@ async def _opted_out_or_denied(monkeypatch, escalations, events, how):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("how", ["opted-out", "denied"])
+@pytest.mark.parametrize(
+    "hold,how",
+    [(h, how) for h in ("topology mismatch", "missing ports") for how in ("opted-out", "denied")]
+    + [("latched", "opted-out")],
+)
 async def test_an_at_start_ladder_whose_host_rung_never_fired_does_not_stand_in_for_the_bounds_ladder(
-    monkeypatch, clear_job_state, how
+    monkeypatch, clear_job_state, hold, how
 ):
     """The at-start ladder is a forced run below the
     bound. When the host rung after it was never granted, the full ladder still runs at the 10-min mark,
     and the later windows follow I76 as for any hold (a ladder each window when both host rungs are opted
     out; a denied rung stays pending and is asked again each tick)."""
-    escalations, _alerts, events = _arm(monkeypatch, "topology mismatch")
+    escalations, _alerts, events = _arm(monkeypatch, hold)
     await _opted_out_or_denied(monkeypatch, escalations, events, how)
     _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
     clock = _clock(monkeypatch)
@@ -269,7 +291,7 @@ async def test_an_at_start_run_that_found_another_class_is_not_spawned_again(mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("hold", LINK_SHORT)
+@pytest.mark.parametrize("hold", ALL)
 async def test_a_full_check_that_passes_after_the_ladder_asks_for_no_power_cycle(monkeypatch, clear_job_state, hold):
     """(d) only a full check that passed after the ladder ends the hold's escalation: no host rung, then
     or on a later tick, and no second ladder."""
@@ -304,10 +326,11 @@ async def test_a_check_still_waiting_gets_the_power_cycle_by_the_bound(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_the_cooldown_delays_the_cycle_only_until_its_end(monkeypatch, clear_job_state):
+@pytest.mark.parametrize("hold", ["topology mismatch"] + MEASURED)
+async def test_the_cooldown_delays_the_cycle_only_until_its_end(monkeypatch, clear_job_state, hold):
     """(e) a running boot / post-power-cycle cooldown denies the host rung and arms the retry; the cycle
     fires on the first tick past the cooldown's end, with no second ladder."""
-    escalations, _alerts, events = _arm(monkeypatch, "topology mismatch")
+    escalations, _alerts, events = _arm(monkeypatch, hold)
     monkeypatch.setattr(srv, "_hold_bound_host_rung", _REAL_HOST_RUNG)  # the governor decides below
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
     monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
@@ -482,3 +505,51 @@ async def test_a_below_bound_host_rung_never_fires_over_a_running_readopted_job(
     finally:
         srv.readopted_scopes.clear()
         srv._startup_verify_task.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold", ALL)
+async def test_the_idle_relift_runs_no_glx_reset_once_the_at_start_pass_ran(monkeypatch, clear_job_state, hold):
+    """(c) single flight: before the at-start pass the idle relift's present-mesh reset is its own; once
+    that pass ran (and asked for the host rung) the watchdog's one ladder owns the episode's reset, and a
+    measured-fault relift retry runs no other glx_reset."""
+    escalations, _alerts, events = _arm(monkeypatch, hold)
+    _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
+    assert srv._fabric_link_short_hold(), "every chip on the bus, the fabric short: this class"
+    assert not srv._link_short_relift_reset_owned(), "no pass yet: nothing owns the reset"
+    _tick(0)
+    await _drain()
+    assert escalations == ["present-forced"] and events.count("host_rung") == 1
+    assert srv._link_short_relift_reset_owned(), "the at-start pass owns the episode's reset"
+
+
+@pytest.mark.asyncio
+async def test_an_offbus_hold_under_the_latch_is_not_this_class(monkeypatch, clear_job_state):
+    """(f) the I42 latch does not make an off-bus hold a link-short one: a chip off the bus by heartbeat
+    runs no ladder at hold start (the at-start run reads the heartbeats, declines once and is not spawned
+    again), the off-bus one-shot keeps its time, and an isolated chip (partial off-bus, or a whole tray)
+    is never this class."""
+    escalations, _alerts, events = _arm(monkeypatch, "off-bus", age_sec=1, latched=True)
+    monkeypatch.setattr(srv, "_offbus_one_shot_sec", lambda: 60.0)
+    _ladder(monkeypatch, escalations, OUTCOME_TERMINAL)
+    _tick(0)
+    await _drain()
+    assert escalations == [] and "host_rung" not in events, "no ladder at hold start"
+    assert srv._fabric_link_short_declined == srv.device_hold_episode_since
+    assert not srv._fabric_link_short_ladder_due(10)
+    _tick(60)
+    await _drain()
+    assert escalations == ["offbus-forced"], "the off-bus one-shot, at its own time"
+    monkeypatch.setattr(srv, "isolated_chips", {str(i) for i in range(8)})
+    assert srv._fabric_link_short_hold() == "", "a whole tray off the bus goes the off-bus way"
+
+
+def test_a_missing_port_hold_needs_a_failed_full_check(monkeypatch, clear_job_state):
+    """(f) the missing-port class is a FAILED full check (spec 03 I71). A check that passed (ports the
+    accept list excuses never fail it) or one with no verdict is not this class."""
+    _arm(monkeypatch, "missing ports")
+    assert srv._fabric_link_short_hold() == "fabric links missing"
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", True)
+    assert srv._fabric_link_short_hold() == ""
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+    assert srv._fabric_link_short_hold() == ""

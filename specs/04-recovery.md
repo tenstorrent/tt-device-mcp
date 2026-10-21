@@ -790,7 +790,8 @@ each rung fires only when the gentler one failed or cannot apply.
   applies below the I76 bound; at the bound I76 runs the full ladder and then the host rung. A
   topology-mismatch or known-fabric-fault hold that this invariant holds with every chip on the bus
   is the I83 fabric link-short class: its watchdog gets one ladder at hold start, then the host rung
-  (I83); this invariant still keeps any other forced run of that hold from resetting it.
+  (I83); this invariant still keeps any other forced run of that hold from resetting it. A latched
+  or missing-port hold with every chip on the bus is that class too: its one reset is I83's ladder.
 
 - **I31 — A galaxy reset that regressed an off-bus mesh is not repeated in that hold episode.**
   When a galaxy reset leaves more chips off the bus than before it (`reset_regressed_offbus`, on the
@@ -1664,14 +1665,17 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I83 — A fabric link-short hold gets one ladder at hold start, then the power cycle.** A hold
   with every expected chip on the bus (none isolated) whose cause is a topology mismatch or a known
   fabric fault (I30's causes other than a 77: the full fabric check counts fewer links or ports than
-  the cabling expects; such a count is a failed check, never a pass), and that I30 holds without
-  measuring (no spec 03 I42 latch, no missing descriptor port), is the fabric link-short class. A
-  latched or missing-port hold is measured and is not this class: it keeps the I76 path (the ladder at
-  its bound, one sampler tick for an I42 latch and 10 min otherwise, with the latch kept, then the host
-  rung). On the hold's first watchdog tick the
-  broker runs its full reset ladder once (`escalation_kind` `fabric_link_short`), lifting only spec 03
-  I46's known-fabric-fault latch first as at the bound, and then the full health check, fabric
-  included. A check that passes releases the device as any check does (spec 03); the hold never lifts
+  the cabling expects; such a count is a failed check, never a pass), is the fabric link-short class.
+  So are the measured holds of the same shape: one under spec 03 I42's latch, and one whose last full
+  fabric check failed on missing descriptor ports (spec 03 I71; ports that
+  `TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS` excuses never fail it, so they stay excused). On the
+  hold's first watchdog tick the broker runs its full reset ladder once (`escalation_kind`
+  `fabric_link_short`; under the I42 latch, past its one-tick bound, the same one ladder runs as that
+  bound's), lifting only spec 03 I46's known-fabric-fault latch first as at the bound, never the I42
+  latch, and then the full health check, fabric included. Under the I42 latch a short count fails, so
+  only a clean pass on the full topology clears it. Single flight: once that pass has run or is
+  running, the idle relift's measured-fault present-mesh retries (spec 03 I56) run no other glx_reset
+  in the episode; that ladder's check, then the host rung, decide the hold. A check that passes releases the device as any check does (spec 03); the hold never lifts
   without it. A check that still counts short, or a ladder that does not bring the mesh back, asks for
   the I76 host rung (the power cycle) in the same run. A run that finds the hold is not (or no longer)
   this class, e.g. a chip already off the bus by its heartbeat, declines once for the episode and is
@@ -1696,8 +1700,11 @@ each rung fires only when the gentler one failed or cannot apply.
   class: was 10 min plus repeated ladders (open-ended while the post-ladder check passed on the short
   count), now one ladder plus one full check from hold start, at most 600 s, or the cooldown's end
   when later. With no host rung grantable it adds one ladder plus check at the bound (about 220 s),
-  then I76's cadence. Latched and missing-port holds: the I76 path, ladder at the bound (one sampler tick
-  when I42-latched, else 600 s) then the host rung.
+  then I76's cadence. Latched and missing-port holds: were a measured-fault present-mesh glx_reset at
+  once, failed-check relift retries about every 120 s, then the I76 ladder at the bound and the host
+  rung (about 11-16 min to the power-cycle request, with 3-4 futile resets); now the same one ladder
+  plus one full check from hold start (about 2-5 min to the request), at most 600 s, or the
+  cooldown's end when later.
   A carried re-hold of another class: the host rung at once instead of a ladder on every tick.
   A run that declines (a heartbeat read once showed a chip off the bus) declines for the whole
   episode, so a link-short hold whose heartbeat glitched once waits for the I76 bound: its ladder at
@@ -2286,12 +2293,14 @@ sees a silent fabric pass.
 | I82 a tenant hold that turns into a fault hold takes a fault carry in its window, not one past it | `tests/test_hold_episode_carry.py::test_a_tenant_hold_that_turns_into_a_fault_hold_takes_the_carry_in_its_window`, `::test_a_tenant_hold_that_turns_into_a_fault_hold_past_the_window_is_a_new_episode` |
 | I82 the first job's end closes the carry window even when a job-end check raises; a clean end drops the carry, a failed one keeps it | `tests/test_hold_episode_carry.py::test_the_first_jobs_end_closes_the_carry_window_even_when_a_job_end_check_raises`, `::test_the_first_jobs_verdict_still_decides_the_carry` |
 | I82 on the carried path the I65 cooldown defers the host rung with no ladder and no cycle, the request fires at its end, once per episode | `tests/test_hold_episode_carry.py::test_the_carried_host_rung_waits_out_the_cooldown_and_asks_once` |
-| I83 a fabric link-short hold (unlatched topology mismatch, known fabric fault) runs one ladder on its first tick and asks for the power cycle at once when the full check after it still fails or the mesh did not come back; nothing is released | `tests/test_fabric_link_short.py::test_one_ladder_at_hold_start_then_the_power_cycle_at_once` |
+| I83 a fabric link-short hold (topology mismatch, known fabric fault, I42-latched, missing descriptor ports) runs one ladder on its first tick and asks for the power cycle at once when the full check after it still fails or the mesh did not come back; nothing is released | `tests/test_fabric_link_short.py::test_one_ladder_at_hold_start_then_the_power_cycle_at_once` |
 | I83 no later tick in the episode (the bound, a later window, the hold deadline) runs a second glx_reset or ladder or a second power-cycle request | `tests/test_fabric_link_short.py::test_no_second_glx_reset_or_ladder_in_the_episode`, `tests/test_latched_hold_replay.py::test_an_unlatched_mismatch_hold_gets_its_ladder_at_start_and_none_again_across_a_restart` |
 | I83 a full check that passes after the ladder asks for no power cycle; one still waiting on hugepages has until the 10-min bound, then the power cycle | `tests/test_fabric_link_short.py::test_a_full_check_that_passes_after_the_ladder_asks_for_no_power_cycle`, `::test_a_check_still_waiting_gets_the_power_cycle_by_the_bound` |
 | I83 the cooldown delays the power cycle only until its end | `tests/test_fabric_link_short.py::test_the_cooldown_delays_the_cycle_only_until_its_end` |
 | I83 other classes (77-only, off-bus, generic) get no ladder at hold start; an isolated chip is not this class | `tests/test_fabric_link_short.py::test_other_classes_get_no_ladder_at_hold_start`, `::test_an_offbus_chip_is_not_the_link_short_class` |
 | I83 a latched mismatch is this class: one ladder at hold start with the I42 latch kept, the short count asks for the power cycle in the same run, no second ladder, nothing released | `tests/test_fabric_link_short.py::test_a_latched_mismatch_gets_one_ladder_at_hold_start_and_keeps_the_latch` |
+| I83 single flight: once the at-start pass ran, the idle relift's measured-fault retries run no other glx_reset | `tests/test_fabric_link_short.py::test_the_idle_relift_runs_no_glx_reset_once_the_at_start_pass_ran` |
+| I83 the latch makes no off-bus hold this class (no ladder at hold start, the off-bus one-shot keeps its time; an isolated chip or whole tray never is); a missing-port hold needs a failed full check (accept-listed ports never fail it) | `tests/test_fabric_link_short.py::test_an_offbus_hold_under_the_latch_is_not_this_class`, `::test_a_missing_port_hold_needs_a_failed_full_check` |
 | I83 a run that found another class declines once and is not spawned again | `tests/test_fabric_link_short.py::test_an_at_start_run_that_found_another_class_is_not_spawned_again` |
 | I83 the at-start pass stands in for the bound's ladder only after a granted host rung; otherwise the ladder runs at 10 min, then I76 | `tests/test_fabric_link_short.py::test_an_at_start_ladder_whose_host_rung_never_fired_does_not_stand_in_for_the_bounds_ladder`, `::test_a_granted_host_rung_after_the_at_start_ladder_runs_no_second_ladder_at_the_bound` |
 | I83 a re-hold of another class after a carried at-start ladder (carry or broker restart) asks for the host rung once, no ladder per tick | `tests/test_fabric_link_short.py::test_a_rehold_of_another_class_after_a_carried_at_start_ladder_asks_for_the_host_rung_once` |
