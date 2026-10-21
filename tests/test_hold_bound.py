@@ -668,9 +668,7 @@ async def test_a_tenant_the_holder_scan_finds_bounds_the_hold_and_the_ladder_run
     would not let go, the full check with fabric fails and the power cycle is asked for once."""
     order = rig["order"]
     checks = _bound_hold_with_a_failing_full_check(rig, monkeypatch)
-    scans = _scan_refuses_the_mesh_reset(
-        rig, monkeypatch, [_refusing_scan("tenant_blocked"), _refusing_scan("survivor")]
-    )
+    scans = _scan_refuses_the_mesh_reset(rig, monkeypatch, [_refusing_scan("survivor")])
     alerts = []
     monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event))
     monkeypatch.setattr(srv, "device_hold_tenant_deferred", False)
@@ -700,6 +698,9 @@ async def test_a_tenant_the_holder_scan_finds_bounds_the_hold_and_the_ladder_run
     _tick(20)
     await _drain()
     assert scans and "reset_ran" not in order, "the scan still refused: no reset ran"
+    outcomes = [f["outcome"] for k, f in rig["events"] if k == "pre_reset_holder_scan"]
+    assert outcomes == ["survivor"], "the scan ran only after the tenant left, and refused past the reader"
+    assert order.count("glx_reset") == 1, "the ladder reached the mesh reset"
     assert checks and all(checks), "the check after the ladder is the full one, fabric included"
     assert order.count("power_cycle") == 1, "the broker's own code asked for the power cycle once"
     assert "released" not in order and FABRIC_DEBT.owed
