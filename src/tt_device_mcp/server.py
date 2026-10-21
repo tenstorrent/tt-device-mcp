@@ -7279,8 +7279,25 @@ def _device_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, st
     if device_op_active:
         return None  # the op's row is the recovery; don't double it. Keep the latch running.
     if not device_held_since:
-        device_held_since = (now or datetime.now()).isoformat()
+        device_held_since = _held_since_latch(now)
     return reason, device_held_since
+
+
+def _held_since_latch(now: Optional[datetime] = None) -> str:
+    """The start a fresh ``device_held_since`` latch takes (spec 03 I80): the logged episode's own
+    start while one is open, so a re-hold spec 04 I82 carries reports the carried start after the
+    release cleared the latch; ``now`` only for a hold no episode is logged for yet."""
+    if device_hold_logged and device_hold_episode_since:
+        return device_hold_episode_since
+    return (now or datetime.now()).isoformat()
+
+
+def _iso_before(a: str, b: str) -> bool:
+    """True when ISO timestamp ``a`` is earlier than ``b``; False when either does not parse."""
+    try:
+        return datetime.fromisoformat(a) < datetime.fromisoformat(b)
+    except (TypeError, ValueError):
+        return False
 
 
 def _health_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, str]]:
@@ -7297,7 +7314,7 @@ def _health_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, st
     if hold is not None or not (device_op_active and device_hold_logged):
         return hold
     reason = device_hold_episode_reason or _device_degraded_for_tenant()
-    since = device_held_since or device_hold_episode_since or (now or datetime.now()).isoformat()
+    since = device_held_since or _held_since_latch(now)
     if _device_degraded_for_tenant():
         device_held_since = since
     return reason, since
@@ -7667,6 +7684,9 @@ def _note_tenant_gate_verdict(reason: str) -> None:
             if ladder_age is not None:
                 carry = {"since": restored, "ladder_age": ladder_age, "released": time.time()}
         _persist_hold_episode(device_hold_episode_since, tenant=tenant)
+        # Spec 03 I80: a latch a status read took before this verdict yields to an earlier episode start.
+        if device_held_since and _iso_before(device_hold_episode_since, device_held_since):
+            device_held_since = device_hold_episode_since
         # ...and the alert hook's backoff for that same episode, so a restart does not page again.
         device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
         device_hold_episode_reason = reason

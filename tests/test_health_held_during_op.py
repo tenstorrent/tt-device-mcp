@@ -171,3 +171,55 @@ def test_a_rehold_inside_the_carry_window_reports_the_carried_start_in_and_after
     after = srv._health_payload()
     assert after["held"] is True and after["held_since"] == held.isoformat()
     assert after["held_age_sec"] >= during["held_age_sec"] > 300
+
+
+def _rehold_after_a_read_hold_releases_inside_an_op(held, monkeypatch):
+    """A hold opened outside any op and reported (latched), then released by its recovery op's gate
+    inside the op with no status read while the device was fit. Returns the reported start."""
+    srv._note_tenant_gate_verdict(f"device unverified: {REASON}")
+    first = srv._health_payload()
+    assert first["held"] is True
+    monkeypatch.setattr(srv, "device_op_active", "reset")
+    fsm_healthy(srv)
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    srv._note_tenant_gate_verdict("")  # the gate passed inside the op: the episode is over
+    return first["held_since"]
+
+
+def test_an_in_window_rehold_inside_an_op_with_no_read_keeps_the_carried_start_after_it(held, monkeypatch):
+    """Spec 04 I82 with I80: the release cleared the latch, the in-window re-hold carried the episode
+    start, but nothing read /health during the op, so the first read after it latched a fresh clock
+    (now) and held_since restarted with the hold still the same episode."""
+    first = _rehold_after_a_read_hold_releases_inside_an_op(held, monkeypatch)
+    fsm_dirty(srv, "new fault", why="off_bus")
+    srv._note_tenant_gate_verdict("device unverified: new fault")
+    monkeypatch.setattr(srv, "device_op_active", "")
+    carried = srv.device_hold_episode_since
+    assert carried == first, "the I82 carry keeps the episode start"
+    after = srv._health_payload()
+    assert after["held"] is True and after["held_since"] == carried
+
+
+def test_an_in_window_rehold_outside_an_op_reports_the_carried_start(held, monkeypatch):
+    """The same re-hold opened after the op ended, outside any op: held_since is the carried start."""
+    first = _rehold_after_a_read_hold_releases_inside_an_op(held, monkeypatch)
+    monkeypatch.setattr(srv, "device_op_active", "")
+    fsm_dirty(srv, "new fault", why="off_bus")
+    srv._note_tenant_gate_verdict("device unverified: new fault")
+    assert srv.device_hold_episode_since == first
+    after = srv._health_payload()
+    assert after["held"] is True and after["held_since"] == first
+
+
+def test_a_read_before_an_in_window_reholds_verdict_yields_to_the_carried_start(held, monkeypatch):
+    """A status read that lands between the re-hold's fault and its gate verdict latches its own clock
+    before the episode is logged; the verdict then carries the earlier start, and held_since follows it."""
+    first = _rehold_after_a_read_hold_releases_inside_an_op(held, monkeypatch)
+    monkeypatch.setattr(srv, "device_op_active", "")
+    fsm_dirty(srv, "new fault", why="off_bus")
+    monkeypatch.setattr(srv, "isolated_chips", {"8"})
+    early = srv._health_payload(now=datetime.now() + timedelta(seconds=60))
+    assert early["held"] is True and early["held_since"] != first
+    srv._note_tenant_gate_verdict("device unverified: new fault")
+    after = srv._health_payload()
+    assert after["held_since"] == srv.device_hold_episode_since == first
