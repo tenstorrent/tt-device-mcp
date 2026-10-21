@@ -618,7 +618,9 @@ def test_hook_stops_the_fallback_and_its_children_before_any_wait(hook, tmp_path
         hook["pid_file"].write_text(pidf.read_text())
         watched = " ".join(str(p) for p in [proc.pid, *kids])
         mdadm = hook["stubs"] / "mdadm"
-        mdadm.write_text(f'#!/bin/sh\necho "mdadm alive:$(ps -o stat= -p "$WATCHED" | grep -vc Z)" >> "{hook["trace"]}"\n')
+        mdadm.write_text(
+            f'#!/bin/sh\necho "mdadm alive:$(ps -o stat= -p "$WATCHED" | grep -vc Z)" >> "{hook["trace"]}"\n'
+        )
         rc, trace = hook["run"]("reboot", _request([hook["cycle"]]), WATCHED=watched)
         assert rc == 0
         assert "mdadm alive:0" in trace, "the fallback or a child of it outlived the stop into the RAID wait"
@@ -641,7 +643,7 @@ def test_hook_stops_the_fallback_first_and_kills_its_process_group():
     assert stop < text.index('timeout "$try_timeout" "$@"')
     body = text[text.index("stop_fallback() {") :]
     body = body[: body.index("\n}\n")]
-    assert 'kill -STOP $gen' in body and 'kill -9 "-$1"' in body and "kill -9 $tree" in body
+    assert "kill -STOP $gen" in body and 'kill -9 "-$1"' in body and "kill -9 $tree" in body
 
 
 def test_the_installer_installs_the_hook_where_the_broker_looks():
