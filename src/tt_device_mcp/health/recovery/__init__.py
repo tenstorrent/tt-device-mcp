@@ -261,7 +261,7 @@ class RecoveryDeps:
     # that server.py re-exports by import and tests monkeypatch on ``server.<name>`` to drive the
     # moved bodies' behavior deterministically — see the class docstring. Real server-side callers
     # of these three remain (the gate, the startup probe, the exec/reset tools), which is what
-    # distinguishes them from e.g. ``reset_chip_via_bridge`` or ``_fire_ubb_reset``, which have
+    # distinguishes them from e.g. ``reset_chip_via_bridge``, which has
     # none and so are imported directly where the moved bodies need them instead.
     read_heartbeats: Callable[[], dict]
     heartbeat_supported: Callable[[], bool]

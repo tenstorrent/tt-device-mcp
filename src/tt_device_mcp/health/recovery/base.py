@@ -323,10 +323,9 @@ BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC = int(
     os.environ.get("TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC", "900").strip() or "900"
 )
 
-# An outage hold turns every hardware rung off at once. Each alone is a normal per-host choice (an
-# unconfirmed BMC turns the tray rung off and the ladder still climbs through the mesh reset), but
-# all three off together say "touch nothing": the mesh reset is held too.
-OUTAGE_HOLD_VARS = ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE", "TT_DEVICE_MCP_AUTO_UBB_RESET")
+# An outage hold turns every hardware rung off at once: both host rungs off together say "touch
+# nothing", so the mesh reset is held too.
+OUTAGE_HOLD_VARS = ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE")
 # The hold reason -> when its page went out (monotonic). A held mesh reset stays HELD until an operator
 # acts, so the page is the hold's only bound: while the hold stands it is sent again every
 # mesh_hold_repage_sec(), so a page that was missed or forgotten never leaves the device held in silence.
