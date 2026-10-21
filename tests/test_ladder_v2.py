@@ -360,7 +360,6 @@ async def test_tray_down_no_window_power_cycles_when_the_sweep_does_not_recover(
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     patch_recovery(monkeypatch, "_recover_isolated_chips", _async_true)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: None)
 
     async def mesh(argv, log, *a, **k):
         return 0, ""
@@ -405,7 +404,6 @@ def _wire_failed_tray_down_sweep(monkeypatch, read_heartbeats, *, allowed=True):
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     patch_recovery(monkeypatch, "_recover_isolated_chips", _async_true)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: None)
 
     async def mesh(argv, log, *a, **k):
         return 0, ""
@@ -548,7 +546,6 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
     # The full sweep ran and the mesh is still bad: the host rung fires.
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: None)
 
     async def fake_reset(argv, log, *a, **k):
         return 0, ""
