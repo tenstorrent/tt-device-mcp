@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import fsm_healthy, patch_health_event, patch_recovery, stub_device_pollers
+from tests.conftest import fsm_healthy, patch_health_event, stub_device_pollers
 from tt_device_mcp import server as srv
 from tt_device_mcp.health import chip_state
 from tt_device_mcp.health import monitor as monitor_mod
