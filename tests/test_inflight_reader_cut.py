@@ -342,7 +342,7 @@ async def test_a_closing_rescan_that_blocks_is_bounded(monkeypatch):
     never = asyncio.Event()
 
     async def to_thread(fn, *a, **k):
-        if getattr(fn, "__self__", None) == base.Path("/sys/bus/pci/rescan"):
+        if fn is base._scoped_rescan:
             await never.wait()
         return fn(*a, **k)
 

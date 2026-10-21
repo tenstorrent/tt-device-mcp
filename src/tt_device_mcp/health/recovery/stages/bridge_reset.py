@@ -8,7 +8,6 @@ import os
 import re
 import subprocess
 import time
-from pathlib import Path
 from typing import Optional
 
 from tt_device_mcp import privileges
@@ -92,7 +91,9 @@ def reset_chip_via_bridge(idx: str, bdf: str) -> Optional[bool]:
         return fired
     try:
         time.sleep(SBR_RETRAIN_SETTLE_SEC)
-        Path("/sys/bus/pci/rescan").write_text("1")
+        from tt_device_mcp.health.recovery import pcie_guard  # the package imports this module
+
+        pcie_guard.rescan_tt_root_ports()
         # The endpoint has to re-enumerate and the driver rebind before it is usable.
         for _ in range(20):
             time.sleep(0.5)

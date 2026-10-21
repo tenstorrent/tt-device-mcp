@@ -84,8 +84,8 @@ def bridge_reset_call_timeout() -> float:
 
 
 def _sysfs_rescan() -> None:
-    """The bare sysfs rescan write; pci_rescan bounds it."""
-    Path("/sys/bus/pci/rescan").write_text("1")
+    """The bare sysfs rescan write, scoped to the Tenstorrent root ports; pci_rescan bounds it."""
+    pcie_guard.rescan_tt_root_ports()
 
 
 # A surgical bridge reset fired seconds after a chip leaves the bus can lose the race with the

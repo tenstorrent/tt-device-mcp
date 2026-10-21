@@ -49,24 +49,32 @@ GLX_DRIVER_WAIT = re.compile(r"Waiting for all \d+ chips to show up|Waiting for 
 # needs_hw_init, so from here every read of that chip is a real bus read again.
 GLX_POST_RESET_FAILED = re.compile(r"POST_RESET failed for device /dev/tenstorrent/(\d+)\.")
 
-# A write to /sys/bus/pci/rescan or a chip's `remove` waits on the kernel's PCI rescan/remove lock and
+# A PCI rescan write or a chip's `remove` waits on the kernel's PCI rescan/remove lock and
 # on the device it walks; behind a hung endpoint it can block for good. Every such write goes through
 # the one in-flight writer (health.pci_writer): the first that does not return in this long latches
 # PCI-wedged, and its thread may stay blocked in the kernel until the power cycle.
 PCI_SYSFS_WRITE_TIMEOUT_SEC = _pci_writer_mod.PCI_SYSFS_WRITE_TIMEOUT_SEC
 
 
+def _scoped_rescan() -> None:
+    """The bare rescan write: only the Tenstorrent root ports' buses (pcie_guard.rescan_tt_root_ports),
+    never /sys/bus/pci/rescan. Raises OSError when there is no such port to rescan."""
+    from tt_device_mcp.health.recovery import pcie_guard  # the package imports this module
+
+    pcie_guard.rescan_tt_root_ports()
+
+
 async def pci_rescan(context: str = "", write: Optional[Callable[[], object]] = None) -> None:
-    """One global PCI rescan through the one in-flight PCI writer, bounded by
+    """One PCI rescan of the Tenstorrent root ports through the one in-flight PCI writer, bounded by
     PCI_SYSFS_WRITE_TIMEOUT_SEC. Raises OSError, or PciWedged (an asyncio.TimeoutError) on a timeout
     or when the writer refuses it (PCI-wedged, or an earlier write still blocked): either way the
     calling rung failed. A timeout is journaled (pci_rescan_timeout) and latches PCI-wedged, which
     requests the power cycle. ``write`` replaces the bare sysfs write (a module's own stubbable rescan
     function); ``context`` names the rung in the journal."""
-    fn, args = (write, ()) if write is not None else (Path("/sys/bus/pci/rescan").write_text, ("1",))
+    fn = write if write is not None else _scoped_rescan
     refused = PCI_WRITER.latched or bool(PCI_WRITER.pending())
     try:
-        await PCI_WRITER.write(context or "PCI rescan", fn, *args, timeout=PCI_SYSFS_WRITE_TIMEOUT_SEC)
+        await PCI_WRITER.write(context or "PCI rescan", fn, timeout=PCI_SYSFS_WRITE_TIMEOUT_SEC)
     except PciWedged:
         if not refused:
             health_event("pci_rescan_timeout", context=context, timeout_s=PCI_SYSFS_WRITE_TIMEOUT_SEC)

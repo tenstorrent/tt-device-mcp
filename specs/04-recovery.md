@@ -1463,7 +1463,7 @@ each rung fires only when the gentler one failed or cannot apply.
   rung deferred by a reset scope or a retry-less denial fires one sampler tick after the deferral
   ends (before, a whole window later); class A (whole tray) and C keep the I37 direct cycle, well inside the bound. Each
   waits only on a running boot / post-power-cycle cooldown (I65) and fires as it ends. Bounds the about 70 min one Galaxy host sat in a latched topology-mismatch hold
-  with no rung run. Blocking PCI sysfs writes (a remove/isolate, a `/sys/bus/pci/rescan`, a
+  with no rung run. Blocking PCI sysfs writes (a remove/isolate, a scoped PCI rescan (I95), a
   bridge reset, the valve's `isolate_chip`, the post-reset cut's remove) go through one in-flight
   writer per broker (`PCI_WRITER`): each write runs in a tracked worker thread with its bound
   (rescan `PCI_SYSFS_WRITE_TIMEOUT_SEC`, 30 s; bridge reset about 91 s); while an earlier
@@ -2117,6 +2117,28 @@ each rung fires only when the gentler one failed or cannot apply.
   New wait: at most `MESH_RESET_MIN_GAP_SEC` (200 s) after the first reset ended, and always over by
   the 600 s hold bound.
 
+- **I95 — Every PCI rescan is scoped to the Tenstorrent root ports; nothing writes the global
+  `/sys/bus/pci/rescan`.** A global rescan walks every root bus of the host and can reassign the
+  bridge windows of root ports unrelated to the device (for example a host's NVMe drives). Every
+  rescan the broker and its probe make (the reset path's rescan, the bridge reset's closing rescan,
+  the bridge-reset batch rescan, the bare rescan of dead chips, the tray-down prelude, the
+  below-floor and last-chance rescans, 03's closing and driver-wait rescans, and the health probe's
+  rescan) goes through `pcie_guard.rescan_tt_root_ports()`. It writes `1` only to
+  `/sys/bus/pci/devices/<root port>/pci_bus/<bus>/rescan` of the root ports above Tenstorrent
+  endpoints (vendor 0x1e52): those on the bus now, plus those remembered in the recorded topology
+  (I24) whose port is still in sysfs, so a chip already off the bus, and a broker that starts with
+  the tray off, still rescan its port. The kernel rescans and resizes only that port's bus. There
+  is no global fallback: with no Tenstorrent root port to rescan, the call writes nothing, journals
+  `pci_rescan_no_tt_root_port` and raises, so its rung fails and the ladder goes on (I76: the ladder
+  at 10 min, then the power cycle). The broker's rescans still run through the one in-flight writer
+  (`PCI_WRITER`, I76) with the same bound and latch; the probe's rescan still runs under the
+  device-op flock. Only the target changed.
+
+  Time to recover (TTR): no fault class is slower. A scoped rescan touches one bus per Tenstorrent
+  root port instead of every root bus, so it returns no later than the global one; with no
+  Tenstorrent root port it fails at once instead of walking the host, and the next rung or the
+  bounded power cycle follows as before. Timeouts, the latch and the lift rules are unchanged.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -2238,7 +2260,7 @@ The power cycle honours the same tenant guard and the cooldown/boot-loop denials
 relift, the hold-deadline watchdog) passes through `_tray_down_latch` first, which latches
 `TRAY_DOWN` or `PARTIAL` at the first sighting (journalled as `tray_down_latched`, with whether a
 reset came first). A `TRAY_DOWN` episode whose prelude has not run goes to `_tray_down_prelude`:
-with no tenant it writes `1` to `/sys/bus/pci/rescan`; it then captures (`bmc_capture`, all reads
+with no tenant it rescans the Tenstorrent root ports (I95); it then captures (`bmc_capture`, all reads
 concurrent, each under its own timeout — 8 s for the BMC, which answers slowly while a tray browns
 out — and the whole under the 10 s deadline); it waits what is left of
 `TRAY_DOWN_RESCAN_SETTLE_SEC` and re-reads the heartbeats. The lspci target is the parent of the
@@ -2683,3 +2705,6 @@ sees a silent fabric pass.
 | I93 a failed first reset: the sweep's mesh reset waits out the gap (the hold stands), its full check runs; a fail asks for the power cycle, a pass lifts the hold; a first reset ending late waits only to the bound | `tests/test_mesh_reset_repeat.py::test_a_failed_first_reset_spaces_the_sweeps_mesh_reset_then_asks_for_the_power_cycle`, `tests/test_mesh_reset_repeat.py::test_a_spaced_sweep_whose_full_check_passes_lifts_the_hold`, `tests/test_mesh_reset_repeat.py::test_a_first_reset_ending_late_waits_only_to_the_bound`, `tests/test_dispatch_failure_reset.py::test_a_failed_post_reset_check_stays_held_and_climbs`, `tests/test_job_kill_reset.py::test_a_failed_post_kill_check_stays_held_and_climbs` |
 | I93 no wait on a fabric link-short hold (I83), a chip off the bus, a BMC guard finding, a first reset from another episode or a spent sweep | `tests/test_mesh_reset_repeat.py::test_the_sweep_waits_only_on_a_present_mesh_after_this_episodes_reset`, `tests/test_fabric_links_missing.py::test_a_lost_link_that_a_reset_does_not_heal_stays_held`, `tests/test_fabric_links_missing.py::test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs` |
 | I93 at the 600 s bound the ladder runs at once, never waits for the gap, and a failing check asks for the power cycle | `tests/test_mesh_reset_repeat.py::test_the_bound_runs_the_ladder_and_asks_for_the_power_cycle_at_600s` |
+| I95 no source string names the global rescan file; the scoped rescan writes only the Tenstorrent root port's bus, also for an off-bus chip's remembered port and at startup with the tray already off | `tests/test_scoped_pci_rescan.py::test_no_source_string_names_the_global_rescan_file`, `::test_the_scoped_rescan_writes_only_the_tenstorrent_root_ports_bus`, `::test_an_off_bus_chips_remembered_root_port_is_still_rescanned`, `::test_at_startup_with_the_tray_already_off_the_bus_the_recorded_port_is_rescanned` |
+| I95 every rescan rung (reset path, bridge batch, bare rescan of dead chips, tray-down and below-floor), the bridge reset and the health probe write only the Tenstorrent root port; with none, each fails, writes nothing and does not latch | `tests/test_scoped_pci_rescan.py::test_every_rescan_rung_reaches_only_the_tenstorrent_root_port`, `::test_with_no_tenstorrent_root_port_every_rescan_rung_fails_without_a_global_write`, `::test_the_bridge_reset_rescans_only_the_tenstorrent_root_port`, `::test_a_bridge_reset_with_no_tenstorrent_root_port_fails_without_a_global_write`, `::test_the_health_probe_rescans_only_the_tenstorrent_root_port`, `::test_the_health_probe_with_no_tenstorrent_root_port_writes_nothing` |
+| I95 the 10-min ladder with the real rescan: scoped, and a failed rescan still climbs to the mesh reset, the full check and the power cycle without lifting the hold | `tests/test_scoped_pci_rescan.py::test_the_10_min_ladders_rescan_is_scoped_and_a_failed_one_still_reaches_the_power_cycle` |

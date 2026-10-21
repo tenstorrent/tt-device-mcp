@@ -11,7 +11,6 @@ again before the post-job traffic pass; the added time stays within ~10 s per pa
 
 import asyncio
 from datetime import datetime, timedelta
-from pathlib import Path
 
 import pytest
 
@@ -135,7 +134,7 @@ def rig(monkeypatch, tmp_path, clear_job_state):
 
         @staticmethod
         async def to_thread(fn, *a, **k):
-            if getattr(fn, "__self__", None) == Path("/sys/bus/pci/rescan"):
+            if fn is base._scoped_rescan:
                 return None
             return await asyncio.to_thread(fn, *a, **k)
 

@@ -15,18 +15,17 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
-from pathlib import Path
 
 import pytest
 
 from tt_device_mcp import privileges
 from tt_device_mcp.health.recovery import base as recovery_base
+from tt_device_mcp.health.recovery import pcie_guard
 
 _real_sleep = asyncio.sleep
 SETTLE_START = "\033[93mWaiting for 30 seconds: 0\033[0m"
 SETTLE = SETTLE_START + "".join(f"\r\033[93mWaiting for 30 seconds: {i}\033[0m" for i in range(1, 31)) + "\n"
 MESH_RESET = ["tt-smi", "-glx_reset"]
-RESCAN = "/sys/bus/pci/rescan"
 
 
 class FakeSysfs:
@@ -37,17 +36,10 @@ class FakeSysfs:
         self.at: list[float] = []
         self.back_after = back_after  # rescans needed before the removed chips reappear
 
-    def path(self, p):
-        if str(p) != RESCAN:
-            return Path(p)
-        sysfs = self
-
-        class _Rescan:
-            def write_text(self, _text):
-                sysfs.rescans += 1
-                sysfs.at.append(time.time())
-
-        return _Rescan()
+    def rescan(self):
+        self.rescans += 1
+        self.at.append(time.time())
+        return ["0000:00:01.0"]
 
     def returned(self, isolated):
         return sorted(isolated, key=int) if self.rescans >= self.back_after else []
@@ -55,7 +47,7 @@ class FakeSysfs:
 
 def _mechanism(monkeypatch, isolated: set, sysfs: FakeSysfs, events: list, *, every=0, scoped=False, tmp=None):
     monkeypatch.setitem(privileges._LATCHED, "systemd", False)
-    monkeypatch.setattr(recovery_base, "Path", sysfs.path)
+    monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", sysfs.rescan)
     monkeypatch.setattr(recovery_base, "returned_chips", sysfs.returned)
     monkeypatch.setattr(recovery_base, "health_event", lambda name, **kw: events.append((name, kw)))
     monkeypatch.setattr(recovery_base, "DRIVER_WAIT_RESCAN_EVERY_SEC", every)
@@ -70,7 +62,7 @@ def _mechanism(monkeypatch, isolated: set, sysfs: FakeSysfs, events: list, *, ev
     async def to_thread(fn, *a, **kw):
         # The fake rescan runs inline: on a loaded host a worker thread can outlast the few loop turns
         # a test waits after each output chunk, and the rescan count it reads would then lag.
-        if getattr(fn, "__self__", None).__class__.__name__ == "_Rescan":
+        if fn is recovery_base._scoped_rescan:
             return fn(*a, **kw)
         return await real_to_thread(fn, *a, **kw)
 
