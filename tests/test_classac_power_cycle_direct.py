@@ -115,7 +115,6 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
     monkeypatch.setattr(g, "_reset_and_verify_device", mesh_reset)
     monkeypatch.setattr(g, "_issue_all_resets_back_to_back", sweep)
     monkeypatch.setattr(g, "_verify_device", verify)
-    monkeypatch.setattr(g, "_attempt_ubb_tray_reset", lambda *a, **k: _record(order, "ubb_tray"))
     g.tray_down_episode_end()
     yield state
     g.tray_down_episode_end()
@@ -665,7 +664,7 @@ async def test_a_tray_of_link_down_nodes_with_one_eio_survivor_is_class_a(rig, m
     assert ev["unreadable"] == [str(survivor)] and ev["off_bus"] == sorted(map(str, tray), key=int)
 
 
-# ---- the tray rung with no map (Part 2 of spec 04 I37) ------------------------------------------
+# ---- the whole-tray check with no map (Part 2 of spec 04 I37) ------------------------------------------
 
 
 @pytest.fixture
@@ -675,39 +674,38 @@ def real_tray_rung(short_boot, monkeypatch):
     g = short_boot["g"]
     monkeypatch.setattr(offbus_power_cycle, "_pending", {})
     monkeypatch.setattr(g.deps, "device_hold_episode_since", lambda: "2026-10-16T12:39:00")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
 
-    async def rung(beats, off_bus):
-        return await type(g)._attempt_ubb_tray_reset(g, beats, off_bus, EXPECTED, lambda m: None)
+    def rung(beats, off_bus):
+        return type(g)._note_whole_tray_drop(g, beats, off_bus, EXPECTED, lambda m: None)
 
     return short_boot, rung, offbus_power_cycle
 
 
 @pytest.mark.asyncio
-async def test_the_tray_rung_with_no_map_hands_a_whole_tray_to_the_power_cycle(real_tray_rung):
+async def test_the_whole_tray_check_with_no_map_hands_a_whole_tray_to_the_power_cycle(real_tray_rung):
     rig, rung, opc = real_tray_rung
-    assert await rung(rig["beats"], 8) is False
+    assert rung(rig["beats"], 8) is True
     assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is not None
-    ((_, ev),) = [(k, f) for k, f in rig["events"] if k == "ubb_reset_declined_whole_tray"]
+    ((_, ev),) = [(k, f) for k, f in rig["events"] if k == "whole_tray_down_power_cycle"]
     assert ev["trays"] == ["bus group 0xc0"]
 
 
 @pytest.mark.asyncio
-async def test_the_tray_rung_with_no_map_and_eio_survivors_hands_off_too(real_tray_rung, monkeypatch):
+async def test_the_whole_tray_check_with_no_map_and_eio_survivors_hands_off_too(real_tray_rung, monkeypatch):
     rig, rung, opc = real_tray_rung
     rig["beats"] = _beats_without(set(range(24, 32)) | {0})
     _unreadable(monkeypatch, {0})
-    assert await rung(rig["beats"], 9) is False
+    assert rung(rig["beats"], 9) is True
     assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is not None
 
 
 @pytest.mark.asyncio
-async def test_the_tray_rung_with_no_map_keeps_a_partial_drop_on_the_ladder(real_tray_rung):
+async def test_the_whole_tray_check_with_no_map_keeps_a_partial_drop_on_the_ladder(real_tray_rung):
     rig, rung, opc = real_tray_rung
     rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 7, 0xC0: 1})
-    assert await rung(rig["beats"], 8) is None
+    assert rung(rig["beats"], 8) is False
     assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is None
-    assert "ubb_reset_declined_whole_tray" not in _kinds(rig)
+    assert "whole_tray_down_power_cycle" not in _kinds(rig)
 
 
 @pytest.mark.asyncio
