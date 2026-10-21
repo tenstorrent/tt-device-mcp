@@ -105,7 +105,26 @@ RELIFT="${TTDEV_SELFHEAL_RELIFT:-}"
 # never re-verifies. An explicit per-host count (32 galaxy / 8 f07) makes the bar authoritative. Unset
 # renders no line, so the hwm fallback is unchanged until a host opts in.
 EXPECTED_CHIPS="${TTDEV_EXPECTED_CHIPS:-}"
+EXPECTED_SRC="TTDEV_EXPECTED_CHIPS (operator or /etc/default)"
 [ -z "$EXPECTED_CHIPS" ] && [ -r "$UNIT" ] && EXPECTED_CHIPS="$(sed -n 's/^Environment=TT_DEVICE_MCP_EXPECTED_CHIPS=//p' "$UNIT" 2>/dev/null | head -1)"
+[ -n "${TTDEV_EXPECTED_CHIPS:-}" ] || EXPECTED_SRC="existing unit"
+# Neither gives a count (a fresh install): derive it from what the machine IS (board type of any chip
+# that answered the installer's snapshot, DMI product, reset mode), never from how many chips are on
+# the bus now, or a tray already missing at first start would set its own bar (spec 08 I28). When no
+# source can tell, the key stays unset and says so loudly: a guessed count is worse than the hwm.
+if [ -z "$EXPECTED_CHIPS" ]; then
+    if derived="$(TTDEV_RESET_MODE="$RESET_MODE" bash "$DEPLOY/tt-device-expected-chips.sh")"; then
+        EXPECTED_CHIPS="${derived%%$'\t'*}"
+        EXPECTED_SRC="${derived#*$'\t'}"
+    else
+        EXPECTED_SRC=""
+        echo "apply-host-config: WARNING: expected chip count UNKNOWN: ${derived:-derivation failed}." \
+            "The broker falls back to the high-water mark of chips seen, so a chip or tray already missing" \
+            "at first start reads as a smaller box. Set it: TTDEV_EXPECTED_CHIPS=<n> in" \
+            "/etc/default/tt-device-broker (applied on the next update), or sudo TTDEV_EXPECTED_CHIPS=<n> ./install.sh." >&2
+    fi
+fi
+[ -n "$EXPECTED_CHIPS" ] && echo "apply-host-config: expected chips $EXPECTED_CHIPS (source: $EXPECTED_SRC)" >&2
 # Opt-in per-host AICLK ceiling (MHz): the broker re-applies the firmware clock cap after every reset,
 # at start and at the job door, and proves it before any traffic pass or job (health/aiclk_ceiling.py).
 # Unset renders no line and the feature is off. An external ceiling daemon, if any, should use the same
