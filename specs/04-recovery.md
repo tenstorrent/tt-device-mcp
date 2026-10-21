@@ -1635,6 +1635,26 @@ each rung fires only when the gentler one failed or cannot apply.
   | Hold open across a broker restart | 10-min clock restarted at the restart | escalates no later than episode start + 600 s |
   | Every other class path below the bound | unchanged | unchanged |
 
+
+- **I86 — The last-chance sweep re-probes the bus after SBR and runs the full check once it is
+  whole.** When the sweep before a host rung (I22) fires SBR, it re-reads the bus right after it
+  (`pcie_guard.chips_off_bus` plus the isolated set: sysfs and heartbeats, no device access). If
+  every expected chip is back, no further rung fires: the full health check, fabric included, runs at
+  once (no settle; the bus is already enumerated). A pass releases through the same funnel as any
+  sweep (I32 still applies). A failure fires the remaining rung (the mesh reset), then one settle and
+  one full check; if that fails the caller climbs to the power cycle as before (I76, goal: ladder at
+  10 min, then power cycle). A bus that is still short, or a probe that cannot read it, fires the next
+  rung at once, as before. The probe never lifts a hold by itself. Whole-tray and all-off-bus classes
+  still skip the sweep (I37), and the I65 cooldown is unchanged. Time to recover (TTR):
+
+  | Case | Before I86 | With I86 |
+  |---|---|---|
+  | Partial off-bus, SBR brings every chip back, full check passes | SBR + mesh reset + 60 s settle + full check | SBR + full check (saves the mesh reset and the settle, about 2 min) |
+  | Partial off-bus, SBR brings every chip back, full check fails | SBR + mesh reset + settle + check, then power cycle | SBR + check + mesh reset + settle + check, then power cycle (one more full check, about 45-100 s) |
+  | Partial off-bus, SBR does not bring every chip back | SBR + mesh reset + settle + check | unchanged (one sysfs read added) |
+  | No isolated chip (present-mesh eth/fabric hold, 77) | mesh reset + settle + check | unchanged |
+  | Whole tray, all chips off the bus | sweep skipped, power cycle (I37) | unchanged |
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -2268,3 +2288,4 @@ sees a silent fabric pass.
 | I75 (the I65 retry only when armed for the episode and not refused by a guard; a pending host action is reported, never dropped) | `tests/test_health_hold_report.py::test_the_cooldown_retry_is_named_only_when_the_watchdog_asks_it`, `tests/test_health_hold_report.py::test_the_cooldown_retry_fires_when_reported`, `tests/test_health_hold_report.py::test_a_pending_host_action_is_reported_and_left_alone` |
 | I75 (one routing for the report and the forced run: a window inside the post-ladder check, a window after a ladder that did not recover, a class-A mark inside the check window, a startup-gate stand-down; each reported where the watchdog acts) | `tests/test_health_hold_report.py::test_the_report_names_the_rung_the_forced_run_routes_to`, `tests/test_health_hold_report.py::test_a_class_a_ladder_mark_inside_the_check_window_is_not_reported`, `tests/test_health_hold_report.py::test_a_startup_verify_stand_down_is_reported_with_its_bounded_end` |
 | I75 (deadline feeds: the broker registers the I76 bound; its mark and source per fault class and latch, fired by the watchdog then; inside a cooldown the ladder stays at the mark and only the host rung names the end; silent once spent, past due, pending, tenant-blocked or stood down; names the opted-in host rung; nothing when HEALTHY; read-only; a broken feed reports nothing) | `tests/test_health_hold_report.py::test_the_broker_registers_its_hold_bound_feed`, `tests/test_health_hold_report.py::test_the_bound_mark_is_reported_for_each_fault_class`, `tests/test_health_hold_report.py::test_a_latched_hold_reports_the_same_mark`, `tests/test_health_hold_report.py::test_a_cooldown_hold_reports_the_ladder_at_the_mark_and_the_host_rung_at_its_end`, `tests/test_health_hold_report.py::test_the_hold_bound_candidate_names_the_cooldown_only_for_its_host_rung`, `tests/test_health_hold_report.py::test_after_the_bound_ladder_the_chain_names_the_host_rung`, `tests/test_health_hold_report.py::test_the_bound_feed_is_silent_when_its_mark_is_not_next`, `tests/test_health_hold_report.py::test_the_bound_feed_names_the_host_rung_the_box_opts_into`, `tests/test_health_hold_report.py::test_the_bound_feed_yields_to_a_startup_stand_down`, `tests/test_health_hold_report.py::test_a_healthy_device_reports_no_bound`, `tests/test_health_hold_report.py::test_the_bound_feed_moves_no_clock`, `tests/test_health_hold_report.py::test_a_broken_feed_reports_nothing` |
+| I86 the last-chance sweep re-probes the bus after SBR: a whole bus runs the full check before any later rung and lifts only on its pass; a failed check runs the remaining rung then the power cycle; a short or unreadable bus fires every rung; a whole tray still skips the sweep | `tests/test_sweep_reprobe.py::test_healed_after_sbr_runs_no_later_rung_and_lifts_only_on_the_full_check`, `::test_bus_whole_but_full_check_fails_runs_the_remaining_rung_then_the_caller_climbs`, `::test_bus_whole_check_fails_then_the_mesh_reset_heals_it_lifts_on_the_second_check`, `::test_never_healed_runs_every_rung_back_to_back_with_one_check`, `::test_an_unreadable_bus_probe_fires_the_next_rung`, `::test_the_gate_ladder_power_cycles_only_when_the_full_check_still_fails`, `::test_a_whole_tray_drop_still_skips_the_sweep`; every hold kind still reaches the ladder at 10 min: `tests/test_hold_bound.py::test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung` |
