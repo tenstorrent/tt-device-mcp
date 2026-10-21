@@ -8498,14 +8498,27 @@ def _hold_escalated_report() -> bool:
     return bool(fsm.latch("escalated")) or _hold_bound_ladder_age is not None or _hold_bound_cycle_age is not None
 
 
+def _hold_bound_mark_sec() -> float:
+    """The hold age of the bound's next ladder mark: _hold_bound_sec() (one sampler tick under the spec 03
+    I42 latch) until a bound ladder or host rung of this episode ran, then the ceiling, whose full ladder
+    the broker still runs (the early ladder does not count as the 10-min one)."""
+    bound = _hold_bound_sec()
+    if bound >= _stuck_hold_ceiling_sec():
+        return bound
+    _hold_bound_sync()
+    if _hold_bound_ladder_age is None and _hold_bound_cycle_age is None and not _hold_bound_rung_pending:
+        return bound
+    return _stuck_hold_ceiling_sec()
+
+
 def hold_bound_deadline(now: Optional[datetime] = None) -> Optional[datetime]:
     """When the open hold escalates under the 10-min bound (spec 04 I76), whatever its kind: the hold's
-    start + the stuck-hold ceiling, or the end of a running power-cycle cooldown (I65), whichever is
-    later. None when nothing is held or the episode clock cannot be read."""
+    start + the bound's next ladder mark (_hold_bound_mark_sec), or the end of a running power-cycle
+    cooldown (I65), whichever is later. None when nothing is held or the episode clock cannot be read."""
     if not device_hold_episode_since:
         return None
     try:
-        deadline = datetime.fromisoformat(device_hold_episode_since) + timedelta(seconds=_hold_bound_sec())
+        deadline = datetime.fromisoformat(device_hold_episode_since) + timedelta(seconds=_hold_bound_mark_sec())
     except ValueError:
         return None
     cd = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
@@ -8524,7 +8537,7 @@ def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
     if not device_hold_episode_since:
         return None
     _hold_bound_sync()
-    ceiling = _hold_bound_sec()
+    ceiling = _hold_bound_mark_sec()
     age = _hold_age_now(now)
     deadline = _hold_bound_deadline_iso(now)
     lad, cyc = _hold_bound_ladder_age, _hold_bound_cycle_age
