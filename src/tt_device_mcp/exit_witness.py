@@ -105,6 +105,7 @@ class ExitWitness:
     def __init__(self, pgid: Optional[int], scope: Optional[str]):
         self.ok = False
         self.why = ""
+        self.pgid = pgid  # the broker's job shell: its own status is the broker's TERM trap's
         self.tree: Set[int] = set()
         self.exits: Dict[int, int] = {}  # tgid -> wait status of its leader's exit
         self.signalled: Set[int] = set()
@@ -174,6 +175,22 @@ class ExitWitness:
             self.why = f"pid {min(unseen)} of the job left no exit record"
             return False
         return True
+
+    def exit_status(self) -> Optional[int]:
+        """The job's own exit status, 0 only when proven: the tree is clean(), at least one
+        process other than the broker's job shell (the process group leader) exited, every such
+        process exited 0, and the shell exited 0 or 143 (its TERM trap, which says nothing of the
+        job). None when the witness cannot say; else a non-zero status of the job."""
+        if not self.clean():
+            return None
+        own = {tgid: status >> 8 for tgid, status in self.exits.items() if tgid != self.pgid}
+        if not own:
+            return None
+        bad = sorted(code for code in own.values() if code)
+        if bad:
+            return bad[0]
+        shell = self.exits.get(self.pgid, 0) >> 8 if self.pgid else 0
+        return 0 if shell in (0, 143) else shell
 
     def close(self) -> None:
         """Unsubscribe (the connector counts listeners host-wide), then close the socket."""

@@ -787,6 +787,8 @@ class Job:
     contention_waiters: frozenset = frozenset()  # the waiters seen at the last contention poll
     preempt_killed_monotonic: Optional[float] = None  # set when the grace minute ran out and the kill began
     preempt_clean: bool = False  # the kernel saw every process of the tree exit on SIGTERM by its own code
+    preempt_exit_status: Optional[int] = None  # the job's own status, witnessed on a clean preemption
+    preempt_yielded: bool = False  # it ended itself under contention (past its limit, a job waiting)
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     log_file: Optional[str] = None
@@ -9065,6 +9067,21 @@ def _first_waiter_arrival() -> Optional[float]:
     return min(arrivals.values()) if arrivals else None
 
 
+def _preempted_exit0_needs_no_check(job: "Job") -> bool:
+    """Spec 01 I20: True for a preempted job whose own exit status is 0, either a self-yield (it
+    ended itself with 0 under contention, never signalled) or a clean end on SIGTERM whose exit
+    witness proved status 0. Such a job gets no post-job check and no reset. Anything else, a
+    missing or unclear witness included, is False and keeps its gate, and so is a device already
+    held or owing a reset for another reason: that hold still lifts only on a passing full check."""
+    if job.status == JobStatus.COMPLETED:
+        exit0 = job.preempt_yielded and job.exit_code == 0
+    elif job.status == JobStatus.PREEMPTED:
+        exit0 = job.preempt_clean and job.preempt_exit_status == 0
+    else:
+        exit0 = False
+    return exit0 and fsm.state is ServerState.HEALTHY and not _kill_reset_debt()
+
+
 def _preempt_contended(limit_end: float) -> bool:
     """Contention for a job whose limit ends at ``limit_end`` (time.monotonic): past it AND at
     least one job waiting. Reads only; the grace minute's clock is _preempt_kill_at's."""
@@ -9121,8 +9138,10 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
     fabric included (preempt_forced_job_ids), whoever is still waiting by then. The one
     exception: ``witness`` is set and the kernel's exit records show every process of the tree
     exited through its own code on SIGTERM (no SIGKILL needed, no signal death). Then nothing
-    was cut mid-flight, the debt is dropped, only the fast post-job check is owed, and this
-    returns True. Any other end, or any doubt, returns False and keeps the debt."""
+    was cut mid-flight, the debt is dropped, and this returns True. The job's own exit status as
+    witnessed (ExitWitness.exit_status, None when unproven) goes on its Job: 0 there means no
+    post-job check at all, anything else the fast one. Any other end, or any doubt, returns False
+    and keeps the debt."""
     preempt_forced_job_ids.add(job_id)
     scope = job_scope_unit(job_id)
     scoped = await asyncio.to_thread(_scope_active, scope)
@@ -9185,10 +9204,15 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
         if seen is None:
             return False
         try:
-            return seen.clean() is True
+            clean = seen.clean() is True
+            status = seen.exit_status() if clean else None
         except Exception as e:
             witness_error = f"witness failed ({e!r})"
             return False
+        j = jobs.get(job_id)
+        if j is not None:
+            j.preempt_exit_status = status if isinstance(status, int) else None
+        return clean
 
     try:
         await _send(signal.SIGTERM)
@@ -9199,9 +9223,14 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
                 clean = _verdict()
                 if logger and witness:
                     why = witness_error or (getattr(seen, "why", "") if seen is not None else "")
+                    status = getattr(jobs.get(job_id), "preempt_exit_status", None)
                     logger.info(
                         f"PREEMPT job_id={job_id} ended on SIGTERM: "
-                        + ("every process exited by its own code" if clean else f"not clean: {why}")
+                        + (
+                            f"every process exited by its own code, job status {status}"
+                            if clean
+                            else f"not clean: {why}"
+                        )
                     )
                 if clean:
                     preempt_forced_job_ids.discard(job_id)
@@ -12044,6 +12073,8 @@ export {JOB_TAG_ENV}={job_tag}
                         )
                     else:
                         job.status = JobStatus.COMPLETED if job.exit_code == 0 else JobStatus.FAILED
+                        # Spec 01 I20: it saw the waiter and ended itself inside the minute.
+                        job.preempt_yielded = job.preemptable and _preempt_contended(limit_end)
 
             if logger:
                 logger.info(
@@ -12344,12 +12375,23 @@ export {JOB_TAG_ENV}={job_tag}
                     # end, not a failure: the fast check, which escalates on its own if it fails.
                     clean_preempt = job.status == JobStatus.PREEMPTED and job.preempt_clean
                     job_failed = (job.status != JobStatus.COMPLETED or job.exit_code != 0) and not clean_preempt
-                    await _verify_device_after_job(
-                        job_log_file,
-                        job_failed=job_failed,
-                        noop_failure=job_failed and not runner_error and _job_never_reached_device(job),
-                        exit1_failure=job_failed and not runner_error and _job_failed_exit1_clean(job, job_log_file),
-                    )
+                    if _preempted_exit0_needs_no_check(job):
+                        # Spec 01 I20: a preemption that returned 0 gets no check at all. The
+                        # clock ceiling stays owed, so the next job's door re-applies it.
+                        CEILING.mark_owed("job end")
+                        if logger:
+                            logger.info(
+                                f"JOB_RUNNER job_id={job_id} preempted, exit 0: no post-job check (spec 01 I20)"
+                            )
+                    else:
+                        await _verify_device_after_job(
+                            job_log_file,
+                            job_failed=job_failed,
+                            noop_failure=job_failed and not runner_error and _job_never_reached_device(job),
+                            exit1_failure=job_failed
+                            and not runner_error
+                            and _job_failed_exit1_clean(job, job_log_file),
+                        )
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:
                         logger.error(f"JOB_RUNNER post-job health gate error for job_id={job_id}: {e}")
