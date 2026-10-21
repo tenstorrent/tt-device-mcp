@@ -128,7 +128,6 @@ async def test_a_failed_early_one_shot_keeps_the_hold_and_reaches_the_power_cycl
     patch_health_event(monkeypatch, lambda kind, **f: mesh.append((kind, f)))
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     fsm_dirty(srv, "gate/post-job: 1/32 off-bus below the reset floor", why="job_killed")
     since = datetime.now()
     monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())

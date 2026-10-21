@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from tests.conftest import _reset_server_state
+from tt_device_mcp import device_holders as dh
 from tt_device_mcp import server as srv
 from tt_device_mcp.health import chip_state
 
@@ -87,6 +88,32 @@ def test_the_per_test_reset_clears_every_hold_bound_and_escalation_global(monkey
     assert (m._class_a_ladder_anchor, m._class_a_ladder_spawned) == (None, None)
     chip_state.reset()
     assert (chip_state._present, chip_state._expected) == (chip_state._sysfs_indices, chip_state._no_baseline)
+
+
+class _HostHoldsTheRealDevice:
+    """``os`` as the holder walk sees it on a device host where this process has the real
+    /dev/tenstorrent/0 open as fd 9: no test may open the real node to set that up."""
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def listdir(self, path):
+        return ["9"] if path == f"/proc/{os.getpid()}/fd" else os.listdir(path)
+
+    def readlink(self, path):
+        return "/dev/tenstorrent/0" if path == f"/proc/{os.getpid()}/fd/9" else os.readlink(path)
+
+
+def test_a_real_device_holder_on_the_host_is_not_a_holder_in_a_test(monkeypatch):
+    """Spec 09 I1 (holder scan): a real job holding the host's own /dev/tenstorrent does not read as
+    a tenant in an unmarked test. Unsealed, it kept a runner test's job waiting on the holder and
+    blocked a hold-bound test's host rung, only while the host ran device work."""
+    monkeypatch.setattr(dh, "os", _HostHoldsTheRealDevice())
+    monkeypatch.setattr(dh, "_iter_pids", lambda: [os.getpid()])
+    monkeypatch.setattr(srv, "_present_chip_indices", lambda: ["0"])
+
+    assert dh.enumerate_device_holders().holders == []
+    assert srv._tenant_holder_reason() == ""
 
 
 def test_the_leaking_pairs_pass_with_the_leaking_test_first():

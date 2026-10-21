@@ -56,7 +56,6 @@ def _watchdog(monkeypatch):
         monkeypatch.setattr(srv, name, value)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_cooldown_state", None)
-    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry_due", lambda *a, **k: False)
     monkeypatch.setattr(srv.offbus_power_cycle, "due_for_watchdog", lambda *a, **k: False)
 
 
@@ -229,8 +228,6 @@ async def test_another_run_inside_the_check_bound_does_not_cut_the_full_check_sh
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", recovered_ladder)
     monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: True)  # the check has no verdict yet
     monkeypatch.setattr(srv, "device_hold_escalation_kind", "ceiling_window")
-    await srv._force_escalate_stuck_hold()
-    monkeypatch.setattr(srv, "device_hold_escalation_kind", "progress_retry")
     await srv._force_escalate_stuck_hold()
     assert escalations == ["present-forced"] and "host_rung" not in events
 
@@ -655,8 +652,8 @@ async def test_replay_a_disproven_lift_hold_gets_the_ladder_and_power_cycle_with
     """A Galaxy host's post-job hold: a job's fabric failure after a topology lift sets the I42 latch, the
     hold takes the ladder, and no idle relift reset ran first (the watchdog path). The latch stands, so the
     bound applies after one sampler tick, not 600 s (where the ladder started 10 min in and the power
-    cycle came ~14-16 min into the hold, past the old latch's 20 min). Walked tick by tick: below one tick
-    nothing is forced; at the tick the full ladder runs, the full check after it (fabric included) fails,
+    cycle came ~14-16 min into the hold, past the old latch's 20 min). Walked tick by tick: on the first
+    tick (spec 04 I83) the full ladder runs, the full check after it (fabric included) fails,
     the broker asks for the power cycle; the 10-min mark adds no second ladder or cycle while it is
     pending, and the deadline event reads escalated."""
     order, g = rig["order"], rig["g"]
@@ -712,25 +709,25 @@ async def test_replay_a_disproven_lift_hold_gets_the_ladder_and_power_cycle_with
     tick = float(srv.SAMPLE_INTERVAL_SEC)
     hold_age = [0.0]
     assert srv._hold_bound_sec() == tick < BOUND, "a latched hold's bound is one sampler tick"
-    for age in (1, tick / 2):  # below the tick nothing is forced
-        hold_age[0] = age
-        monkeypatch.setattr(srv, "device_hold_episode_since", _since(age))
-        srv._check_hold_deadline(now=datetime.now())
-        await _drain()
-        assert "glx_reset" not in order and "power_cycle" not in order, f"a rung ran at {age}s, below one tick"
-
-    hold_age[0] = tick
-    monkeypatch.setattr(srv, "device_hold_episode_since", _since(tick))
+    # Spec 04 I83: a latched hold is a fabric link-short hold: its one ladder runs on the first tick.
+    hold_age[0] = 1
+    monkeypatch.setattr(srv, "device_hold_episode_since", _since(1))
     srv._check_hold_deadline(now=datetime.now())
     await _drain()
-    assert "glx_reset" in order, "the full ladder ran at the first tick, not at 600 s"
+    assert "glx_reset" in order, "the full ladder ran at hold start, not at one tick or 600 s"
     assert checks == [False], "the full check after the ladder, fabric included, failed"
     assert order.count("power_cycle") == 1, "then the broker's own code asked for the power cycle"
     assert order.index("glx_reset") < order.index("power_cycle")
     assert "released" not in order, "nothing released on a failed check"
     # TTR: the rung is asked at the hold age the ladder started, plus the ladder and its full check
     # (measured worst ~630 s: glx_reset 62-263 s, last-chance sweep, fabric check 85-420 s).
-    assert cycle_ages == [tick], "the power cycle was asked in the run the first tick started"
+    assert cycle_ages == [1], "the power cycle was asked in the run the first tick started"
+    for age in (tick / 2, tick):  # the one-tick bound adds no second ladder or cycle
+        hold_age[0] = age
+        monkeypatch.setattr(srv, "device_hold_episode_since", _since(age))
+        srv._check_hold_deadline(now=datetime.now())
+        await _drain()
+    assert order.count("glx_reset") == 1 and order.count("power_cycle") == 1
     rung_age = cycle_ages[0]
     assert rung_age + _LADDER_AND_CHECK_WORST_SEC <= _CLASS_D_BUDGET_SEC, "within the class D budget"
     assert BOUND + _LADDER_AND_CHECK_WORST_SEC > _CLASS_D_BUDGET_SEC, "the old 600 s wait was over it"
@@ -1016,6 +1013,33 @@ def _real_host_rung(monkeypatch, cycles, allowed=lambda action: (True, "")):
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
 
 
+@pytest.mark.asyncio
+async def test_a_bound_cycle_that_cannot_launch_pages_once_and_is_asked_every_tick(monkeypatch, clear_job_state):
+    """Spec 04 I71/I76: at the bound, a power cycle that does not launch leaves the rung pending, so the
+    watchdog asks again each tick. Two failed launches in one episode give two cycle attempts and one
+    page; the hold stays and nothing releases it."""
+    why, detail, output, beats, _ladder = _KINDS["generic"]
+    _escalations, alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why=why, detail=detail, fabric_output=output, beats=beats, age_min=BOUND / 60 + 0.05
+    )
+    cycles = []
+    _real_host_rung(monkeypatch, cycles)
+
+    async def unlaunched(log, reason):
+        cycles.append("power_cycle")
+        return False
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", unlaunched)
+    monkeypatch.setattr(srv, "_bound_tenant_blocker", lambda *a: None)
+    for _ in range(2):
+        await srv._hold_bound_host_rung(BOUND + 1, lambda m: None)
+        assert srv._hold_bound_rung_pending, "a failed launch keeps the rung pending: asked again next tick"
+    assert cycles == ["power_cycle", "power_cycle"]
+    assert events.count("power_cycle_launch_failed_holding") == 2, "every failure is journaled"
+    assert [a["kind"] for a in alerts] == ["power_cycle_launch_failed_holding"], "one page per episode"
+    assert srv._recovery_degraded() and "device_released" not in events, "the hold stays"
+
+
 def _tick(seconds=10):
     srv._check_hold_deadline(now=datetime.now() + timedelta(seconds=seconds))
 
@@ -1287,14 +1311,15 @@ async def test_a_disproven_lift_runs_the_bound_ladder_after_one_tick_whatever_th
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "detail, output",
-    [("post-job: fabric unverified", MISMATCH), ("post-job: fabric check COULD NOT RUN (77)", "")],
+    "detail, output, at_start",
+    [("post-job: fabric unverified", MISMATCH, True), ("post-job: fabric check COULD NOT RUN (77)", "", False)],
 )
 async def test_a_hold_with_no_disproven_lift_keeps_the_600s_bound_and_its_fast_path(
-    monkeypatch, clear_job_state, detail, output
+    monkeypatch, clear_job_state, detail, output, at_start
 ):
-    """Only the I42 latch moves the bound: a plain topology-mismatch or 77 hold one tick in runs no
-    rung and its bound stays the ceiling (I30's no-reset fast path is unchanged)."""
+    """Only the I42 latch moves the bound: a plain topology-mismatch or 77 hold keeps the ceiling as its
+    bound. A 77 hold one tick in runs no rung (I30's no-reset fast path is unchanged); an unlatched
+    mismatch is spec 04 I83's fabric link-short class, so its one tick runs the at-start ladder."""
     escalations, _alerts, events = _arm_fabric_only_deadline_hold(
         monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail=detail, fabric_output=output, age_min=0.2
     )
@@ -1304,7 +1329,12 @@ async def test_a_hold_with_no_disproven_lift_keeps_the_600s_bound_and_its_fast_p
     assert srv._hold_bound_sec() == srv._stuck_hold_ceiling_sec() == BOUND
     srv._check_hold_deadline(now=datetime.now())
     await _drain()
-    assert escalations == [] and "host_rung" not in events
+    if at_start:
+        assert srv.device_hold_escalation_kind == "fabric_link_short"
+        assert escalations == ["present-forced"], "I83: one full ladder at hold start"
+        assert srv._hold_bound_sec() == BOUND, "the at-start ladder does not move the bound"
+    else:
+        assert escalations == [] and "host_rung" not in events
 
 
 @pytest.mark.asyncio
@@ -1348,8 +1378,9 @@ async def test_the_host_rung_after_an_early_disproven_lift_ladder_runs_no_second
 @pytest.mark.parametrize("kill_switch", [False, True])
 def test_health_names_a_disproven_lifts_early_ladder_then_its_host_rung(monkeypatch, clear_job_state, kill_switch):
     """Spec 04 I75/I76 with 03 I42: /health's next rung reads the run's own bound. A latched hold names
-    the full ladder one sampler tick in, then, after that early ladder, the host rung at the end of its
-    check bound (not the 600 s ceiling window), whatever TT_DEVICE_MCP_FORCE_ESCALATE says."""
+    the full ladder (at hold start, spec 04 I83), then, after that early ladder, the host rung at the end of its
+    check bound (not the 600 s ceiling window). Spec 04 I83: that ladder is due at hold start; only the
+    kill switch defers it, to the one-tick bound it never governs."""
     if kill_switch:
         monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
@@ -1357,8 +1388,10 @@ def test_health_names_a_disproven_lifts_early_ladder_then_its_host_rung(monkeypa
     _arm_disproven_lift_hold(monkeypatch, age_sec=2)
     started = datetime.fromisoformat(srv.device_hold_episode_since).timestamp()
     rung = srv._hold_next_rung(time.time())
-    assert (rung.rung, rung.source) == ("forced ladder", "disproven lift bound")
-    assert rung.at == pytest.approx(started + tick, abs=1)
+    # Spec 04 I83: a latched hold is a fabric link-short hold — its one ladder is due at hold start; the
+    # kill switch defers it to the latch's one-tick bound, which it never governs.
+    assert (rung.rung, rung.source) == ("forced ladder", "fabric link-short at-start ladder")
+    assert rung.at == pytest.approx(started + (tick if kill_switch else 2), abs=1)
 
     since = _since(300)
     monkeypatch.setattr(srv, "device_hold_episode_since", since)
@@ -1372,6 +1405,32 @@ def test_health_names_a_disproven_lifts_early_ladder_then_its_host_rung(monkeypa
     rung = srv._hold_next_rung(time.time())
     assert rung.rung == "power cycle", "the host rung follows the early ladder's check bound"
     assert rung.at == pytest.approx(started + 250 + srv._HOLD_BOUND_CHECK_SEC, abs=1)
+
+
+def test_a_disproven_lifts_deadline_moves_to_the_10_min_mark_once_its_early_ladder_ran(monkeypatch, clear_job_state):
+    """Spec 04 I76 with 03 I42: /health's bound_sec and deadline, and the stuck-hold event's
+    escalation_deadline, name the mark the broker acts on next: one sampler tick in until the early
+    ladder runs, then the 600 s mark, whose full ladder still runs (never a past one-tick deadline)."""
+    tick = float(srv.SAMPLE_INTERVAL_SEC)
+    _arm_disproven_lift_hold(monkeypatch, age_sec=2)
+    started = datetime.fromisoformat(srv.device_hold_episode_since)
+    health = srv._hold_bound_health()
+    assert health["bound_sec"] == int(tick)
+    assert srv.hold_bound_deadline() == started + timedelta(seconds=tick)
+
+    since = _since(300)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since)
+    monkeypatch.setattr(srv, "_hold_bound_episode", since)
+    monkeypatch.setattr(srv, "_hold_bound_ladder_age", 250.0)
+    monkeypatch.setattr(srv, "_hold_bound_cycle_age", None)
+    monkeypatch.setattr(srv, "_hold_bound_check_failed_age", None)
+    monkeypatch.setattr(srv, "_hold_bound_rung_pending", False)
+    assert srv._hold_bound_sec() == tick, "the latch still stands: the broker's own bound is unchanged"
+    started = datetime.fromisoformat(since)
+    deadline = started + timedelta(seconds=BOUND)
+    assert srv.hold_bound_deadline() == deadline
+    health = srv._hold_bound_health()
+    assert health["bound_sec"] == BOUND and health["deadline"] == deadline.isoformat(timespec="seconds")
 
 
 # Spec 04 I79 (the class D 77 climb) against I76 (the 10-min bound): one ladder and one power-cycle
@@ -1499,7 +1558,6 @@ async def test_t3_a_77_on_the_boot_a_77_power_cycle_brought_up_still_gets_the_ne
         lambda boot: {"action": "power-cycle", "reason": galaxy.FABRIC_77_HOST_RUNG_CAUSE},
     )
     assert "this boot is the power-cycle" in g._fabric_77_host_rung_spent(srv.device_hold_episode_since)
-    assert not g.fabric_77_climb_owed(srv.device_hold_episode_since) or not g._fabric_77_cold_rung_due()
 
     srv._check_hold_deadline(now=datetime.now())
     await _drain()

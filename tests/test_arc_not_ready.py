@@ -21,7 +21,7 @@ from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import Verdict
 from tt_device_mcp.health.monitors import heartbeat, pci
-from tt_device_mcp.health.recovery import base, galaxy, pcie_guard
+from tt_device_mcp.health.recovery import base, galaxy
 
 EXPECTED = 32
 
@@ -149,38 +149,6 @@ def test_drop_returned_isolated_takes_back_chips_out(monkeypatch, tmp_path, stat
 
     assert base.drop_returned_isolated(isolated, "test", lambda m: None) == ["6"]
     assert isolated == {"7", "9"}
-
-
-@pytest.mark.asyncio
-async def test_a_tray_re_power_drops_a_returned_chip_even_when_the_verify_fails(
-    monkeypatch, tmp_path, clear_job_state, galaxy_trays
-):
-    """Chip 6 comes back on its tray's re-power but the mesh does not verify: the walk still takes it
-    out of isolated_chips, so /health and the next gate stop reading it as isolated."""
-    sysfs = _fake_sysfs(monkeypatch, tmp_path, missing=[6])
-    _live_health(monkeypatch)
-    monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-a")
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    monkeypatch.setattr(base, "health_event", lambda *a, **k: None)
-    monkeypatch.setattr(galaxy, "UBB_WALK_RESCAN_SETTLE_SEC", 0)
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    monkeypatch.setattr(srv, "isolated_chips", {"6"})
-
-    async def unhealthy(expected, log, **_):
-        return False, {}, 0
-
-    patch_recovery(monkeypatch, "_verify_device_after_reset", unhealthy)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: sysfs["add"](6), raising=False)
-    beats = heartbeat.read_heartbeats()
-    assert "6" not in beats
-
-    assert await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 1, EXPECTED, lambda m: None) is False
-    assert srv.isolated_chips == set()
-    assert srv._health_payload()["isolated_chips"] == []
 
 
 @pytest.mark.asyncio

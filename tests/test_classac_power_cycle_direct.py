@@ -65,7 +65,6 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: state["scan"])
     monkeypatch.setattr(srv, "read_heartbeats", lambda: dict(state["beats"]))
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", lambda action, tenant_active=False, **k: state["allowed"])
     monkeypatch.setattr(g.mechanism, "_journal_auto_recovery_denied", lambda *a, **k: order.append("denied"))
     monkeypatch.setattr(g.mechanism, "mesh_reset_failed_since_release", False)
@@ -104,7 +103,7 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
         g.mechanism.last_reset_rc = 1
         return False
 
-    async def sweep(bitmap, ids, trays, expected, log, do_sbr=True):
+    async def sweep(trays, expected, log, do_sbr=True):
         order.append("sweep")
         state["clock"][0] += SWEEP_SEC
         return True
@@ -115,7 +114,6 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
     monkeypatch.setattr(g, "_reset_and_verify_device", mesh_reset)
     monkeypatch.setattr(g, "_issue_all_resets_back_to_back", sweep)
     monkeypatch.setattr(g, "_verify_device", verify)
-    monkeypatch.setattr(g, "_attempt_ubb_tray_reset", lambda *a, **k: _record(order, "ubb_tray"))
     g.tray_down_episode_end()
     yield state
     g.tray_down_episode_end()
@@ -517,7 +515,7 @@ async def test_a_whole_tray_drop_with_no_map_cycles_at_the_first_gate_pass(short
     class is read from the buses on the bus, so the cycle is requested now, not after the 600 s
     ceiling and a mesh reset that has never healed a whole tray."""
     rig = short_boot
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase=phase) == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase=phase) == galaxy.OUTCOME_WAITING
     assert "glx_reset" not in rig["order"] and "ubb_tray" not in rig["order"] and "sweep" not in rig["order"]
     assert rig["order"][-1] == "power_cycle"
     ((_, fired),) = [(k, f) for k, f in rig["events"] if k == "power_cycle_direct"]
@@ -536,7 +534,7 @@ async def test_the_hold_deadline_climb_with_no_map_cycles_with_no_reset(short_bo
 async def test_a_partial_drop_with_no_map_keeps_the_ladder(short_boot):
     rig = short_boot
     rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 7, 0xC0: 1})
-    await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup")
+    await _gate(rig, galaxy.BELOW_FLOOR, phase="startup")
     assert "power_cycle" not in rig["order"] and "power_cycle_direct" not in _kinds(rig)
 
 
@@ -555,7 +553,7 @@ async def test_inside_the_cooldown_the_deadline_shows_at_once_and_no_reset_runs(
     monkeypatch.setattr(
         g.mechanism, "auto_recovery_allowed", lambda action, **k: g.mechanism._deny_power_cycle(dict(cooldown))
     )
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup") == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase="startup") == galaxy.OUTCOME_WAITING
     assert rig["order"][-1] == "denied"
     assert not {"glx_reset", "ubb_tray", "sweep", "power_cycle"} & set(rig["order"]), "no reset meanwhile"
     assert g.mechanism.power_cycle_retry[0] == until
@@ -594,7 +592,7 @@ async def test_a_whole_tray_with_eio_survivors_cycles_with_no_map(short_boot, mo
     rig = short_boot
     rig["beats"] = _beats_without(set(range(24, 32)) | {0})  # chip 0's node is there, its read fails
     _unreadable(monkeypatch, {0})
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup") == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase="startup") == galaxy.OUTCOME_WAITING
     assert not {"glx_reset", "ubb_tray", "sweep"} & set(rig["order"]) and rig["order"][-1] == "power_cycle"
 
 
@@ -604,7 +602,7 @@ async def test_a_no_map_tray_of_lingering_nodes_is_class_a(short_boot):
     cannot fill the tray they left."""
     rig = short_boot
     rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 8, 0xC0: 8})
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup") == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase="startup") == galaxy.OUTCOME_WAITING
     assert "glx_reset" not in rig["order"] and rig["order"][-1] == "power_cycle"
 
 
@@ -665,7 +663,7 @@ async def test_a_tray_of_link_down_nodes_with_one_eio_survivor_is_class_a(rig, m
     assert ev["unreadable"] == [str(survivor)] and ev["off_bus"] == sorted(map(str, tray), key=int)
 
 
-# ---- the tray rung with no map (Part 2 of spec 04 I37) ------------------------------------------
+# ---- the whole-tray check with no map (Part 2 of spec 04 I37) ------------------------------------------
 
 
 @pytest.fixture
@@ -675,39 +673,38 @@ def real_tray_rung(short_boot, monkeypatch):
     g = short_boot["g"]
     monkeypatch.setattr(offbus_power_cycle, "_pending", {})
     monkeypatch.setattr(g.deps, "device_hold_episode_since", lambda: "2026-10-16T12:39:00")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
 
-    async def rung(beats, off_bus):
-        return await type(g)._attempt_ubb_tray_reset(g, beats, off_bus, EXPECTED, lambda m: None)
+    def rung(beats, off_bus):
+        return type(g)._note_whole_tray_drop(g, beats, off_bus, EXPECTED, lambda m: None)
 
     return short_boot, rung, offbus_power_cycle
 
 
 @pytest.mark.asyncio
-async def test_the_tray_rung_with_no_map_hands_a_whole_tray_to_the_power_cycle(real_tray_rung):
+async def test_the_whole_tray_check_with_no_map_hands_a_whole_tray_to_the_power_cycle(real_tray_rung):
     rig, rung, opc = real_tray_rung
-    assert await rung(rig["beats"], 8) is False
+    assert rung(rig["beats"], 8) is True
     assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is not None
-    ((_, ev),) = [(k, f) for k, f in rig["events"] if k == "ubb_reset_declined_whole_tray"]
+    ((_, ev),) = [(k, f) for k, f in rig["events"] if k == "whole_tray_down_power_cycle"]
     assert ev["trays"] == ["bus group 0xc0"]
 
 
 @pytest.mark.asyncio
-async def test_the_tray_rung_with_no_map_and_eio_survivors_hands_off_too(real_tray_rung, monkeypatch):
+async def test_the_whole_tray_check_with_no_map_and_eio_survivors_hands_off_too(real_tray_rung, monkeypatch):
     rig, rung, opc = real_tray_rung
     rig["beats"] = _beats_without(set(range(24, 32)) | {0})
     _unreadable(monkeypatch, {0})
-    assert await rung(rig["beats"], 9) is False
+    assert rung(rig["beats"], 9) is True
     assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is not None
 
 
 @pytest.mark.asyncio
-async def test_the_tray_rung_with_no_map_keeps_a_partial_drop_on_the_ladder(real_tray_rung):
+async def test_the_whole_tray_check_with_no_map_keeps_a_partial_drop_on_the_ladder(real_tray_rung):
     rig, rung, opc = real_tray_rung
     rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 7, 0xC0: 1})
-    assert await rung(rig["beats"], 8) is None
+    assert rung(rig["beats"], 8) is False
     assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is None
-    assert "ubb_reset_declined_whole_tray" not in _kinds(rig)
+    assert "whole_tray_down_power_cycle" not in _kinds(rig)
 
 
 @pytest.mark.asyncio
@@ -718,5 +715,5 @@ async def test_a_listed_node_whose_link_is_down_does_not_fill_a_tray(short_boot)
     rig["link_down"] = {f"0000:{rig['present'][0]:02x}:00.0"}
     present_buses, _ = rig["g"]._presence_read(set(range(24, 32)), EXPECTED)
     assert 0 not in present_buses and 1 in present_buses
-    await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup")
+    await _gate(rig, galaxy.BELOW_FLOOR, phase="startup")
     assert "power_cycle" not in rig["order"], "the read does not add up to whole trays: the ladder decides"
