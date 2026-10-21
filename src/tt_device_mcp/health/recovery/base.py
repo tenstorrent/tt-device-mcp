@@ -1273,6 +1273,7 @@ class RecoveryMechanism:
         cancelled_mid = False
         late_cancel = False
         rc = None
+        text = ""
         try:
             if stream is None:
                 rc, text = await self.run_scoped(argv, log, owner)
@@ -1322,15 +1323,17 @@ class RecoveryMechanism:
             if restore and rc is None:
                 restore = not await asyncio.to_thread(self.scope_active)
             if restore:
+                withheld = mesh and self._withhold_failed_mesh_rescan(rc, text, log)
                 try:
-                    # A reset can leave endpoints un-enumerated — and any chip we isolated earlier is
-                    # still out of the kernel, because `remove` is not undone by a reset. Rescan, or the
-                    # device comes back short and nobody knows why.
-                    await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
-                    await asyncio.sleep(3)
-                    isolated = self._isolated_chips() if self._isolated_chips is not None else None
-                    if isolated:
-                        await asyncio.to_thread(drop_returned_isolated, isolated, "reset", log)
+                    if not withheld:
+                        # A reset can leave endpoints un-enumerated — and any chip we isolated earlier is
+                        # still out of the kernel, because `remove` is not undone by a reset. Rescan, or the
+                        # device comes back short and nobody knows why.
+                        await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
+                        await asyncio.sleep(3)
+                        isolated = self._isolated_chips() if self._isolated_chips is not None else None
+                        if isolated:
+                            await asyncio.to_thread(drop_returned_isolated, isolated, "reset", log)
                     if rc == 0:
                         await self._reapply_aiclk_ceiling(log)
                 except OSError:
@@ -1345,6 +1348,31 @@ class RecoveryMechanism:
 
             if late_cancel:
                 raise asyncio.CancelledError()
+
+    def _withhold_failed_mesh_rescan(self, rc: Optional[int], text: str, log) -> bool:
+        """Spec 04 I69 on the mesh path: True when the rescan after this mesh reset must not run.
+
+        A chip the broker removed is reached by a mesh reset only through the BMC tray re-power. When
+        the output does not show that re-power went out on op_mode 0x3 (no settle count, a 0x0
+        fallback, a guard refusal, or no reset at all) and tt-smi did not exit 0, a global rescan would
+        re-enumerate the removed chip un-reset. Journals pci_rescan_withheld (mesh_reset_failed); the
+        chips stay isolated, and the failed reset sends the hold on to its next rung at once. Chips the
+        broker never removed keep the bare rescan, and a mesh reset that exited 0 always rescans: tt-smi
+        exits 0 only after its own wait found every chip, which it reaches only past the re-power."""
+        if rc == 0 or ipmi_guard.bmc_step_ok(text):
+            return False
+        removed = pci.removed_chip_ids()
+        if not removed:
+            return False
+        fallback = ipmi_guard.scan_reset_output(text) is not None
+        health_event(
+            "pci_rescan_withheld", chips=removed, unreset=removed, reason="mesh_reset_failed", rc=rc, fallback=fallback
+        )
+        log(
+            f"PCI rescan withheld (mesh_reset_failed, rc={rc}) for removed chip(s) {removed}: the BMC re-power "
+            f"did not reach them; they stay isolated, escalating to the next rung"
+        )
+        return True
 
     @property
     def reset_in_flight(self) -> bool:
@@ -1443,10 +1471,30 @@ class RecoveryMechanism:
                     pass
 
         def watch(chunk: str) -> None:
-            if state["task"] is None and not state.get("disarmed"):
+            if state["task"] is None and not state.get("disarmed") and not state.get("withheld"):
                 seen = state["tail"] + chunk
+                # Spec 04 I69 on the mesh path: the rescan re-adds removed chips, so it runs only once
+                # the output shows the BMC re-power went out on op_mode 0x3. A 0x0 fallback, a guard
+                # refusal or an unarmed guard before the wait withholds it for this reset.
+                if ipmi_guard.scan_reset_output(seen) is not None:
+                    state["bmc_failed"] = True
                 if GLX_DRIVER_WAIT.search(seen):
-                    state["task"] = asyncio.get_running_loop().create_task(rescan())
+                    if state.get("bmc_failed"):
+                        state["withheld"] = True
+                        removed = pci.removed_chip_ids()
+                        log(
+                            f"PCI rescan at tt-smi's driver wait withheld (mesh_reset_failed) for isolated chip(s) "
+                            f"{chips}: the output does not show the BMC re-power went out on op_mode 0x3"
+                        )
+                        health_event(
+                            "pci_rescan_withheld",
+                            chips=chips,
+                            unreset=removed,
+                            reason="mesh_reset_failed",
+                            at="driver_wait",
+                        )
+                    else:
+                        state["task"] = asyncio.get_running_loop().create_task(rescan())
                 else:
                     state["tail"] = seen[-200:]  # a marker split across two reads still matches
             if on_output is not None:
