@@ -421,7 +421,7 @@ def _recording_ladder(monkeypatch, graces):
 
 @pytest.mark.asyncio
 async def test_a_hung_reap_gives_sigint_the_short_window(runner_env, monkeypatch):
-    """01 I10: a job silent for HUNG_SILENCE_SEC does not unwind on SIGINT (blx04: both silence
+    """01 I10: a job silent for HUNG_SILENCE_SEC does not unwind on SIGINT (on a galaxy box both silence
     reaps ran the full 60 s and ended at SIGTERM), and it owes the reset either way. Its SIGINT
     window is HUNG_SIGINT_GRACE_SEC, not GRACEFUL_KILL_GRACE_SEC, and the reset debt stays."""
     monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 1)
