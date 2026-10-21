@@ -2121,6 +2121,20 @@ each rung fires only when the gentler one failed or cannot apply.
   New wait: at most `MESH_RESET_MIN_GAP_SEC` (200 s) after the first reset ended, and always over by
   the 600 s hold bound.
 
+- **I94 — A chip the bridge rung brings back counts recovered only with a live ARC heartbeat.** A bridge
+  reset can re-create a chip's sysfs node with its ARC dead (no telemetry). Back on the bus is not
+  recovered: after the rung, each chip whose node returned is read for its heartbeat, up to
+  `BRIDGE_RESET_ARC_WAIT_SEC` (5 s) at `BRIDGE_RESET_ARC_POLL_SEC`. A chip whose heartbeat is missing,
+  unreadable (ENODATA) or all-ones at the end stays in `isolated_chips`, its rung counts failed and a
+  `bridge_reset_arc_dead` event names it, so the off-bus one-shot (spec 03 I23) still fires on its
+  short clock instead of the hold waiting for the 10-min ladder. The check only reads sysfs: it adds no
+  PCI write, reads nothing once the pass has latched PCI-wedged (I76), and it can only keep a chip held, never lift a hold (the lift still needs the full
+  post-reset check, fabric included). The 10-min ladder and power-cycle escalation are unchanged.
+  Each read is a decision read of only those chips, so a chip marked lost (spec 03 I66) is read for
+  real. On a host whose KMD exposes no `tt_heartbeat` attr the check cannot answer: it marks no chip,
+  says so once (`bridge_reset_arc_check_skipped`), and the rung's other checks and the full post-reset
+  check still decide. An attr that is there but unreadable (ENODATA) is a dead ARC, not a skip.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -2688,3 +2702,4 @@ sees a silent fabric pass.
 | I93 a failed first reset: the sweep's mesh reset waits out the gap (the hold stands), its full check runs; a fail asks for the power cycle, a pass lifts the hold; a first reset ending late waits only to the bound | `tests/test_mesh_reset_repeat.py::test_a_failed_first_reset_spaces_the_sweeps_mesh_reset_then_asks_for_the_power_cycle`, `tests/test_mesh_reset_repeat.py::test_a_spaced_sweep_whose_full_check_passes_lifts_the_hold`, `tests/test_mesh_reset_repeat.py::test_a_first_reset_ending_late_waits_only_to_the_bound`, `tests/test_dispatch_failure_reset.py::test_a_failed_post_reset_check_stays_held_and_climbs`, `tests/test_job_kill_reset.py::test_a_failed_post_kill_check_stays_held_and_climbs` |
 | I93 no wait on a fabric link-short hold (I83), a chip off the bus, a BMC guard finding, a first reset from another episode or a spent sweep | `tests/test_mesh_reset_repeat.py::test_the_sweep_waits_only_on_a_present_mesh_after_this_episodes_reset`, `tests/test_fabric_links_missing.py::test_a_lost_link_that_a_reset_does_not_heal_stays_held`, `tests/test_fabric_links_missing.py::test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs` |
 | I93 at the 600 s bound the ladder runs at once, never waits for the gap, and a failing check asks for the power cycle | `tests/test_mesh_reset_repeat.py::test_the_bound_runs_the_ladder_and_asks_for_the_power_cycle_at_600s` |
+| I94 a chip the bridge rung re-creates with no live ARC heartbeat (missing, ENODATA, all-ones) stays isolated, its rung counts failed; a live heartbeat within the bounded wait recovers it; the hold reaches the off-bus one-shot in one sampler tick and lifts only through the full post-reset check, fabric included | `tests/test_bridge_reset_arc_dead.py::test_a_chip_back_on_the_bus_with_a_dead_arc_stays_isolated`, `tests/test_bridge_reset_arc_dead.py::test_an_all_ones_heartbeat_is_not_a_live_arc`, `tests/test_bridge_reset_arc_dead.py::test_a_chip_back_with_a_live_heartbeat_is_recovered`, `tests/test_bridge_reset_arc_dead.py::test_an_arc_that_comes_up_within_the_wait_is_recovered`, `tests/test_bridge_reset_arc_dead.py::test_an_arc_dead_reenumeration_reaches_the_one_shot_on_its_short_clock`, `tests/test_bridge_reset_arc_dead.py::test_the_arc_wait_is_bounded`, `tests/test_bridge_reset_arc_dead.py::test_a_pci_wedged_pass_reads_no_heartbeat` |
