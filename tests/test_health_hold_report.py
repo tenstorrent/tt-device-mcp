@@ -59,7 +59,6 @@ def held(monkeypatch, galaxy_trays):
     monkeypatch.setattr(srv, "_ubb_bus_id_tables", lambda: TABLES)
     monkeypatch.setattr(m, "power_cycle_cooldown_state", None)
     monkeypatch.setattr(m, "power_cycle_retry", None)
-    monkeypatch.setattr(m, "progress_retry", None)
     monkeypatch.setattr(m, "host_action_requested", None)
     monkeypatch.setattr(opc, "_pending", {})
     monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
@@ -364,21 +363,6 @@ def test_the_off_bus_pass_waits_for_the_ladder_to_have_run(held, monkeypatch):
     assert opc.watchdog_due_at(_episode()) is None and opc.watchdog_due_at("other") is None
 
 
-def test_the_i39_progress_retry_is_named(held, monkeypatch):
-    """F1: a failed mesh reset that brought chips back retries early, not at the ceiling."""
-    held["off"] = {3, 4, 5, 6}
-    held["m"].progress_retry = (_episode(), srv.time.monotonic() + 45)
-    p = _payload()
-    assert p["next_rung_source"] == "progress retry"
-    assert abs(datetime.fromisoformat(p["next_rung_at"]).timestamp() - (T0 + 45)) <= 2
-    held["m"].progress_retry = (_episode(), srv.time.monotonic() - 1)
-    p = _payload()
-    assert p["next_rung_at"] == _iso(T0) and p["next_rung_due"] is True
-    assert _fires(T0, monkeypatch) == ["progress_retry"]
-    held["m"].progress_retry = ("another episode", srv.time.monotonic() - 1)
-    assert _payload()["next_rung_source"] == "hold bound (600s)"
-
-
 def test_a_declined_window_stays_reported_as_due(held, monkeypatch):
     """F2a: window 1 is due at 600 s; its spawn was declined, so at 700 s it is still window 1 (the
     watchdog retries it every tick), never window 2 at 1200 s."""
@@ -391,41 +375,6 @@ def test_a_declined_window_stays_reported_as_due(held, monkeypatch):
     )
     assert _fires(START + 700, monkeypatch) == ["ceiling_window"]
     assert _fires(START + 599, monkeypatch) == [] and _fires(START + 600, monkeypatch) == ["ceiling_window"]
-
-
-def test_an_armed_progress_retry_does_not_hide_a_due_ceiling_window(held, monkeypatch):
-    """Review #1304 F2a: an I39 retry armed but not yet due leaves the watchdog's ceiling branch live.
-    At 610 s window 1 (due at 600 s) fires, not the retry due at 640 s; before 600 s the retry is next."""
-    held["off"] = {3, 4, 5, 6}
-    now = START + 610
-    held["m"].progress_retry = (_episode(), srv.time.monotonic() + 30)
-    p = srv._health_payload(now=datetime.fromtimestamp(now))
-    assert (p["next_rung_source"], p["next_rung_at"], p["next_rung_due"]) == (
-        "hold ceiling window 1",
-        _iso(START + 600),
-        True,
-    )
-    assert _fires(now, monkeypatch) == ["ceiling_window"]
-    p = srv._health_payload(now=datetime.fromtimestamp(START + 560))
-    assert p["next_rung_source"] == "progress retry" and p["next_rung_due"] is False
-    held["m"].progress_retry = (_episode(), srv.time.monotonic() - 1)  # due: the chain stops at it
-    p = srv._health_payload(now=datetime.fromtimestamp(now))
-    assert (p["next_rung_source"], p["next_rung_at"]) == ("progress retry", _iso(now))
-    assert _fires(now, monkeypatch) == ["progress_retry"]
-
-
-def test_an_off_bus_one_shot_not_yet_due_does_not_hide_an_earlier_retry(held, monkeypatch):
-    """The one-shot branch needs its age; before it, a due progress retry still fires and is named."""
-    held["off"] = {3, 4}
-    monkeypatch.setattr(srv, "isolated_chips", {"3", "4"})
-    monkeypatch.setattr(srv, "device_hold_offbus_tenant_wait", True)  # one-shot at the 120 s tenant bound
-    held["m"].progress_retry = (_episode(), srv.time.monotonic() - 1)
-    p = _payload()
-    assert (p["next_rung_source"], p["next_rung_at"], p["next_rung_due"]) == ("progress retry", _iso(T0), True)
-    assert _fires(T0, monkeypatch) == ["progress_retry"]
-    assert _fires(START + 120, monkeypatch) == ["offbus_one_shot"]
-    p = srv._health_payload(now=datetime.fromtimestamp(START + 130))
-    assert p["next_rung_source"] == "off-bus one-shot", "due: the watchdog's chain stops at it"
 
 
 @pytest.mark.parametrize("failed", [False, True])
@@ -620,7 +569,7 @@ def test_the_unkillable_leftover_host_rung_is_named(held, monkeypatch):
     monkeypatch.setattr(srv, "_leftover_rung_last_try", 0.0)
     monkeypatch.setattr(srv, "_leftover_rung_stage", "")
     p = _payload()
-    assert (p["next_rung"], p["next_rung_source"]) == ("host reboot or power cycle", "unkillable leftover budget")
+    assert (p["next_rung"], p["next_rung_source"]) == ("power cycle", "unkillable leftover budget")
     assert abs(datetime.fromisoformat(p["next_rung_at"]).timestamp() - (T0 + 500)) <= 2
     monkeypatch.setattr(srv, "_leftover_unkillable_mono", mono - 700)
     monkeypatch.setattr(srv, "_leftover_rung_last_try", mono - 20)
@@ -828,9 +777,6 @@ def test_the_bound_feed_is_silent_when_its_mark_is_not_next(held, monkeypatch, c
 def test_the_bound_feed_names_the_host_rung_the_box_opts_into(held, monkeypatch):
     held["off"] = {3, 4, 5, 6}
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: True)
-    assert srv._hold_bound_feed(START, T0, None).rung == "full ladder, then warm reboot"
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     assert srv._hold_bound_feed(START, T0, None).rung == "full ladder"
 
 

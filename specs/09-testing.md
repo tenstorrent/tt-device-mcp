@@ -64,10 +64,10 @@ gets through anyway.
     `last_fabric_check_monotonic`, `last_job_end_monotonic`, `owner_submit_times`, the hold
     and skip-journal latches, the sampler's blackout strike counter, board-type caches — is
     reset per test so one test's outcome never steers the next test's gate.
-  - **Host rungs**: `TT_DEVICE_MCP_AUTO_REBOOT=0`, `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`
-    (both default ON, so they are pinned off, never merely deleted),
-    `_fire_host_reboot` is
-    replaced with a function that raise `AssertionError` — loud tripwires, so a test that
+  - **Host rung**: `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` (default ON, so it is pinned off, never
+    merely deleted), the off-bus power cycle's `fire_command` is replaced with a function that
+    raises `AssertionError`, and the spawn tripwire refuses `ipmitool`, `reboot`, `shutdown` and
+    `poweroff` — loud tripwires, so a test that
     reaches a real fire fails instead of taking the box down. `shutil.which("tt-smi")` answers
     None: it is a device tool, so an unmarked test must not find one, and preflight verdicts keyed
     on it otherwise differ between a developer box and CI. A test whose subject needs it present
@@ -167,9 +167,9 @@ gets through anyway.
     probe *caches* are the exception to the exception — they are build artifacts a real probe
     needs to run at usable speed, so they point at one session-scoped temp dir shared by all
     device tests rather than a fresh per-test one.
-  - **Never lifted — the destructive rungs.** `TT_DEVICE_MCP_AUTO_REBOOT=0` and
-    `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` stay pinned off, and `_fire_host_reboot` stays an `AssertionError` tripwire. The
-    ladder above the warm rung takes the whole host down; nothing in a pytest
+  - **Never lifted — the destructive rungs.** `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`
+    stays pinned off, and the power cycle's `fire_command` and the `ipmitool` spawn stay tripwires. The
+    power cycle takes the whole host down; nothing in a pytest
     run may reboot or power-cycle the machine it is running on. `tt-smi -r` is the ceiling.
 
 ## What the suite guarantees
@@ -181,7 +181,7 @@ carry which spec's anchors. Approximate collected counts in parentheses.
 |---|---|---|
 | `test_device_safety.py` (450) | The safety corpus: gate hold/dirty/verify semantics, idle and fabric relift, stuck-hold escalation, galaxy floor, ledger/governor, bridge rung, dead-chip sampler, burst cap, cooldown, exec gating, preflight | 01, 03, 04, 05, 06 |
 | `test_server.py` (70) | Job lifecycle, ids and wraparound, activation script / env resolution, clean-device gate ladder, MCP progress streaming, synthetic socket host | 01, 02 |
-| `test_readopt.py` (25) | Restart survival: scope re-adoption, recovered deadlines and exit codes, jobexit dir redirection and perms | 01, 05, 06 |
+| `test_readopt.py` (25), `test_job_exit_file.py` (24) | Restart survival: scope re-adoption, recovered deadlines and exit codes, jobexit dir redirection and perms, fresh per-job exit files and the startup sweep, the submitter's uid from the log header | 01, 05, 06 |
 | `test_recent_jobs.py` (37) | Job-log footer format, recent-history parsing, id reservation, kill audit | 01, 05 |
 | `test_socket_transport.py` (8), `test_stdio_shim.py` (3), `test_cli.py` (34) | Unix-socket JSON-RPC, peer-uid scope, shim socket resolution, CLI entry behavior; `test_cli.py` also carries the lock and smi-wrapper anchors | 02, 05 |
 | `test_authz.py` (7), `test_peercred.py` (8), `test_privsep.py` (14), `test_privsep_guard.py` (3) | SO_PEERCRED parse, identity over self-report, run-as-submitter prefix, refuse-never-root-fallback | 05 |

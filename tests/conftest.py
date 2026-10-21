@@ -461,8 +461,9 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # A host reboot/power cycle a test requested (with a stub fire) must not suppress the NEXT
     # test's forced escalation. raising=False so a base tree without the marker still sets up.
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None, raising=False)
-    # A power cycle a test failed to launch must not hand the NEXT test's chooser the reboot (04 I10).
-    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_unlaunched_at", None, raising=False)
+    # A failed-launch page a test sent must not leak into the NEXT test.
+    if srv.galaxy_recovery is not None:
+        monkeypatch.setattr(srv.galaxy_recovery, "_cycle_launch_paged", None, raising=False)
     monkeypatch.setattr(srv, "_host_action_suppressed_logged", None, raising=False)
     monkeypatch.setattr(srv, "last_fabric_check_monotonic", 0.0)
     # When the last job's device work ended, the anchor the inter-job cooldown measures from.
@@ -584,21 +585,15 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # leaves its per-kind key set, which would suppress the NEXT test's expected notify warning.
     monkeypatch.setattr(srv, "_sd_notify_errors_logged", set(), raising=False)
 
-    # The suite must never actually reboot or power-cycle the box it runs on. Both rungs default ON
-    # (a ladder nobody armed is a ladder that ends in a permanent hold), so this pins them OFF
-    # explicitly — deleting the vars would now select the armed default and point every gate test at
-    # the real thing. The fires below stay loud tripwires so a test that DOES reach one fails instead
-    # of taking CI (or a dev box) down. A test exercising either path re-patches the fire itself.
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    # The suite must never actually power-cycle the box it runs on. The host rung defaults ON
+    # (a ladder nobody armed is a ladder that ends in a permanent hold), so this pins it OFF
+    # explicitly — deleting the var would select the armed default and point every gate test at
+    # the real thing. The fire below stays a loud tripwire so a test that DOES reach it fails instead
+    # of taking CI (or a dev box) down. A test exercising that path re-patches the fire itself.
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    # Both host rungs off would read as an operator outage hold and hold every mesh reset
-    # (spec 04 I28); arm it explicitly. A test of the hold deletes this.
+    # Arm the automatic mesh reset explicitly; only AUTO_MESH_RESET=0 is the outage hold (spec 04
+    # I28). A test of the hold sets it to 0.
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")
-
-    def _no_reboot_in_tests():
-        raise AssertionError("a test reached the real host reboot; _fire_host_reboot must be mocked")
-
-    monkeypatch.setattr(recovery_galaxy, "_fire_host_reboot", _no_reboot_in_tests)
 
     # The bounded off-bus hold (spec 04 I27) runs a host-supplied power-cycle command: unset here, a
     # loud tripwire if reached anyway, and its per-process episode tracking starts empty per test.
@@ -792,7 +787,7 @@ def health_deps():
     """A RecoveryDeps wired to tt_device_mcp.server's OWN module globals/functions via lambdas —
     the same late-bound pattern server.py uses for its own module-level ``recovery_mechanism`` and
     ``_recovery_deps`` — so a test that monkeypatches e.g. ``srv.health_monitor._board_types`` or
-    ``srv._auto_reboot_enabled`` still takes effect through a Recovery (or HealthMonitor) built
+    ``srv._auto_power_cycle_enabled`` still takes effect through a Recovery (or HealthMonitor) built
     from this fixture."""
     return RecoveryDeps(
         current_boot_id=lambda: srv._current_boot_id(),
@@ -803,7 +798,6 @@ def health_deps():
         begin_action_row=lambda *a, **k: srv._begin_action_row(*a, **k),
         write_action_log=lambda *a, **k: srv.write_action_log(*a, **k),
         device_hold_episode_since=lambda: srv.device_hold_episode_since,
-        auto_reboot_enabled=lambda: srv._auto_reboot_enabled(),
         auto_power_cycle_enabled=lambda: srv._auto_power_cycle_enabled(),
         board_types_provider=lambda: srv.health_monitor._board_types,
         glx_board_types_provider=lambda: srv.health_monitor._glx_board_types(),
@@ -931,3 +925,16 @@ def patch_recovery(monkeypatch, name: str, fn) -> None:
     (and ignore) ``self``."""
     monkeypatch.setattr(srv.galaxy_recovery, name, fn)
     monkeypatch.setattr(srv.per_target_recovery, name, fn)
+
+
+@pytest.fixture
+def armed_power_cycle(monkeypatch):
+    """The host rung (the BMC power cycle, spec 04 I71) armed with a recording stub fire: the list it
+    returns gets one entry per power cycle the broker fires. Nothing real is spawned."""
+    from tt_device_mcp import privileges
+
+    fired = []
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    monkeypatch.setattr(privileges, "can_ipmi", lambda: True)
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append("power-cycle"))
+    return fired

@@ -129,7 +129,7 @@ FABRIC_CHECK_CANNOT_CHECK_RC = 77
 # cable, so the broker holds as a known fabric fault and pages once (spec 03 I47).
 FABRIC_CHECK_HARDWARE_FAULT_RC = 78
 
-# The recovery ladder's four named rungs, in severity order (0..3) — the one place that names
+# The recovery ladder's three named rungs, in severity order (0..2) — the one place that names
 # them. Lives here, not in health/recovery/stages/ (the package these actually name), so
 # metrics.py can import it directly: importing a package submodule always runs that package's
 # __init__.py first, and health/recovery/__init__.py imports metrics — a cycle metrics.py's own
@@ -137,9 +137,8 @@ FABRIC_CHECK_HARDWARE_FAULT_RC = 78
 # anything under tt_device_mcp, so it carries no such risk for any importer.
 STAGE_BRIDGE_RESET = "bridge_reset"
 STAGE_SMI_RESET = "smi_reset"
-STAGE_HOST_REBOOT = "host_reboot"
 STAGE_POWER_CYCLE = "power_cycle"
-STAGE_NAMES = (STAGE_BRIDGE_RESET, STAGE_SMI_RESET, STAGE_HOST_REBOOT, STAGE_POWER_CYCLE)
+STAGE_NAMES = (STAGE_BRIDGE_RESET, STAGE_SMI_RESET, STAGE_POWER_CYCLE)
 
 # A Slurm prologue/epilogue must always return a verdict rather than hang until the site's
 # PrologEpilogTimeout kills the script — a kill drains the node with nothing said about what was

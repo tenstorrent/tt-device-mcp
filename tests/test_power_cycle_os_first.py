@@ -298,7 +298,6 @@ def escalation(os_first, monkeypatch, tmp_path):
     monkeypatch.delenv("TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK", raising=False)
     mech = srv.recovery_mechanism
     monkeypatch.setattr(mech, "host_action_requested", None)
-    monkeypatch.setattr(mech, "power_cycle_unlaunched_at", None)
     monkeypatch.setattr(mech, "_power_cycle_not_launched_paged", None)
     monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-1")
     pages = []
@@ -320,13 +319,12 @@ async def test_the_escalation_is_unchanged_around_the_clean_path(escalation):
 
 @pytest.mark.asyncio
 async def test_a_cycle_that_cannot_launch_retracts_holds_and_pages_once_per_episode(escalation, monkeypatch):
-    """F1: no live power cut. The ledger entry is retracted, nothing is pending, the unlaunched stamp
-    is set, and the page names why — once per hold episode."""
+    """F1: no live power cut. The ledger entry is retracted, nothing is pending, and the page names
+    why — once per hold episode."""
     mech = escalation["mech"]
     monkeypatch.setattr(pc, "os_first_unavailable", lambda: "no executable hook")
     assert await srv._auto_power_cycle_host(lambda _l: None, REASON) is False
     assert mech.read_auto_recovery_ledger() == [] and mech.host_action_requested is None
-    assert mech.power_cycle_unlaunched_at is not None
     assert [p["kind"] for p in escalation["pages"]] == ["power_cycle_not_launched"]
     assert "no executable hook" in escalation["pages"][0]["message"]
     assert await srv._auto_power_cycle_host(lambda _l: None, REASON) is False
@@ -405,6 +403,73 @@ def test_a_refuted_cycle_is_counted_missed_never_late(booted, cause):
     assert "late" not in _row(booted)
     assert any(n == "power_cycle_request_missed" and k.get("refuted") == cause for n, k in booted["hevents"])
     assert mech.boot_from_broker_escalation("boot-2") is not None
+
+
+def _refute_next_boot(s, monkeypatch, boot_id, btime, at):
+    """A power-cycle request recorded on the current boot at ``at``, the hook's command failing, and
+    the host coming up warm as ``boot_id`` at ``btime``; the BMC refutes the cycle."""
+    mech = s["mech"]
+    row = {"action": "power-cycle", "reason": REASON, "at": "earlier", "at_epoch": at, "boot_id": mech._current_boot_id()}
+    with (s["tmp"] / recovery_base.AUTO_RECOVERY_LEDGER).open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    monkeypatch.setattr(mech, "_current_boot_id", lambda: boot_id)
+    monkeypatch.setattr(mech, "_boot_btime_id", lambda: str(int(btime)))
+    assert mech.confirm_power_cycle_on_boot(now_epoch=btime + 100) == "refuted"
+
+
+def test_a_refuted_cycle_is_retried_under_i72_and_pages_from_the_second(booted, monkeypatch):
+    """Spec 04 I72/I88: a refuted cycle is the broker's missed attempt. The warm boot it brought up
+    anchors no I65 cooldown; the cycle is asked again at the request's pending window + 0 s, then
+    + 300 s from the second miss on, with the I72 page from the second."""
+    monkeypatch.setattr(recovery_base, "_last_external_power_cycle", lambda _now: None)
+    (booted["tmp"] / recovery_base.POWER_CYCLE_CAUSE_CAPABLE_FILE).write_text("{}\n")
+    booted["out"]["restart_cause"] = "System restart cause: soft reset"
+    mech = booted["mech"]
+    window = recovery_base.host_action_pending_sec()
+    first_at = BOOT_NOW - 300
+    assert mech.confirm_power_cycle_on_boot(now_epoch=BOOT_NOW) == "refuted"
+    ledger = mech.read_auto_recovery_ledger()
+    assert mech.power_cycle_cooldown(now_epoch=BOOT_NOW, ledger=[], requests=ledger) is None, "no I65 anchor"
+    state = mech.power_cycle_miss_state(ledger, now_epoch=BOOT_NOW)
+    assert state["missed"] == 1 and state["until"] == first_at + window + recovery_base.POWER_CYCLE_MISS_RETRY_SEC[0]
+    assert [p for p in booted["pages"] if p["kind"] == "power_cycle_missed"] == []
+    allowed, why = mech.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=BOOT_NOW)
+    assert not allowed and "never took the host down" in why
+    assert mech.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=state["until"] + 1)[0]
+
+    # The retry fires, the hook fails again and the host comes up warm once more.
+    second_at = state["until"] + 1
+    _refute_next_boot(booted, monkeypatch, "boot-3", second_at + 200, second_at)
+    now = second_at + 300
+    ledger = mech.read_auto_recovery_ledger()
+    assert mech.power_cycle_cooldown(now_epoch=now, ledger=[], requests=ledger) is None
+    state = mech.power_cycle_miss_state(ledger, now_epoch=now)
+    assert state["missed"] == 2 and state["until"] == second_at + window + recovery_base.POWER_CYCLE_MISS_RETRY_SEC[1]
+    assert [p["count"] for p in booted["pages"] if p["kind"] == "power_cycle_missed"] == [2]
+    assert not mech.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=now)[0]
+    assert mech.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=state["until"] + 1)[0]
+
+    # A verified release ends the streak: the refuted rows no longer count.
+    monkeypatch.setattr(mech, "last_verified_release", lambda: {"at_epoch": now, "boot_id": "boot-3"})
+    assert mech.power_cycle_miss_state(ledger, now_epoch=now + 1) is None
+
+
+def test_refuted_cycles_count_toward_the_backstop(booted, monkeypatch):
+    """A hook that keeps failing restarts the host warm at most POWER_CYCLE_BACKSTOP_MAX times per
+    backstop window: the refuted rows count there, so the fourth request waits and pages."""
+    monkeypatch.setattr(recovery_base, "_last_external_power_cycle", lambda _now: None)
+    (booted["tmp"] / recovery_base.POWER_CYCLE_CAUSE_CAPABLE_FILE).write_text("{}\n")
+    booted["out"]["restart_cause"] = "System restart cause: soft reset"
+    mech = booted["mech"]
+    assert mech.confirm_power_cycle_on_boot(now_epoch=BOOT_NOW) == "refuted"
+    first_at = BOOT_NOW - 300
+    at = BOOT_NOW + 1000
+    for n in range(recovery_base.POWER_CYCLE_BACKSTOP_MAX - 1):
+        _refute_next_boot(booted, monkeypatch, f"boot-{n + 3}", at + 200, at)
+        at += 1500
+    allowed, why = mech.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=at)
+    assert not allowed and "backstop" in why
+    assert mech.power_cycle_cooldown_state["until"] == first_at + recovery_base.POWER_CYCLE_BACKSTOP_WINDOW_SEC
 
 
 def test_a_bmc_that_never_reports_a_cause_leaves_the_cycle_unconfirmed_and_counted(booted):
