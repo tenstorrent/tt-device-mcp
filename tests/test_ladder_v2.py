@@ -13,15 +13,13 @@ Behaviour under test (user decisions 2026-09-16/17):
 """
 
 import pathlib
-from dataclasses import replace
 
 import pytest
 
 from tests.conftest import patch_health_event, patch_recovery
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
-from tt_device_mcp.health import recovery as recovery_pkg
-from tt_device_mcp.health.recovery import Evidence, galaxy, offbus_power_cycle
+from tt_device_mcp.health.recovery import Evidence, galaxy
 
 
 async def _async_true(*a, **k):

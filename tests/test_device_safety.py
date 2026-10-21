@@ -7974,13 +7974,22 @@ def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(
     # Post-reset but only THIS pass's reset failed (was_failing False — no prior cycle): one failed
     # reset is not "clearly won't recover", so hold, do not reboot.
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=False, host_escalation="power-cycle")
+        _rung(
+            monkeypatch,
+            health_deps,
+            reset_recovered=False,
+            off_bus=16,
+            was_failing=False,
+            host_escalation="power-cycle",
+        )
         == WAIT
     )
     # Post-reset below the reboot floor: a single/few-chip wedge self-heals and the holder-kill covers
     # the MCE path, so hold rather than reboot in-flight work away.
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=1, was_failing=True, host_escalation="power-cycle")
+        _rung(
+            monkeypatch, health_deps, reset_recovered=False, off_bus=1, was_failing=True, host_escalation="power-cycle"
+        )
         == WAIT
     )
     # Post-reset but a reset re-opened its scope (a chip dropped mid-reset reads all-ones like a mass
@@ -8000,7 +8009,9 @@ def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(
     # Reset NOT yet run this pass (pre-reset) at a mass drop: run the galaxy reset first, not the host
     # rung — even with a prior cycle failed.
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=None, off_bus=16, was_failing=True, host_escalation="power-cycle")
+        _rung(
+            monkeypatch, health_deps, reset_recovered=None, off_bus=16, was_failing=True, host_escalation="power-cycle"
+        )
         == STAGE_SMI_RESET
     )
     # A whole-bus drop after the failed reset with the power cycle not armed (a stale reboot setting
@@ -13170,9 +13181,7 @@ async def test_a_latched_hold_whose_sweep_still_reads_a_mismatch_77_climbs_to_th
     g = srv.galaxy_recovery
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     if latched:
-        assert climbs == [
-            {"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True}
-        ]
+        assert climbs == [{"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True}]
         assert [a["kind"] for a in alerts] == []
     else:
         assert climbs == []
@@ -13403,7 +13412,9 @@ async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires
 
     cooldown["on"] = False
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert counters["power_cycles"] == 1 and reasons == [galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE], "one power cycle once the cooldown ends"
+    assert counters["power_cycles"] == 1 and reasons == [
+        galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE
+    ], "one power cycle once the cooldown ends"
     assert g.fabric_77_handoff_status(srv.device_hold_episode_since) is None, "the fired rung ends the hand-off"
     assert srv.recovery_mechanism.unverified_77_host_rung_since == srv.device_hold_episode_since
 

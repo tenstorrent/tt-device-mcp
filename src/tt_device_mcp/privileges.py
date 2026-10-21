@@ -78,7 +78,7 @@ def is_root() -> bool:
 
 
 def has_systemd() -> bool:
-    """Whether systemd is running: a PID-1 reset scope and `systemctl reboot` both need it."""
+    """Whether systemd is running: a PID-1 reset scope needs it."""
     return _state()["systemd"]
 
 

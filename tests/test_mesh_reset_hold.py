@@ -11,7 +11,6 @@ from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base, galaxy, pcie_guard
 
 
-
 @pytest.fixture
 def held(monkeypatch):
     """The outage hold: the mesh-reset knob at 0, the host rung off as well."""

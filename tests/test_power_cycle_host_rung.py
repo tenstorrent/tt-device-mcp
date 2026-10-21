@@ -202,7 +202,6 @@ async def test_a_cooldown_held_cycle_fires_at_the_cooldown_end_with_the_real_gov
     assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
 
 
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case, returns, kept, pending",

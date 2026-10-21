@@ -18,7 +18,6 @@ import pytest
 from tests.conftest import patch_health_event
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
-from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery.stages import power_cycle as pc
 
 REASON = "reset and reboot could not recover it"

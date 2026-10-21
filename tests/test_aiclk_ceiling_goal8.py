@@ -27,7 +27,7 @@ from tt_device_mcp.health import post_reset
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
-from tt_device_mcp.health.recovery import base, galaxy
+from tt_device_mcp.health.recovery import base
 
 _REAL_VERIFY_ON_START = srv._verify_fabric_on_start
 FABRIC_OK = (True, "fabric links healthy")

@@ -10,9 +10,8 @@ device short a link. Now such a pass fails the check, the device stays held, and
 ladder and then a power cycle. A healthy read still passes.
 """
 
-from datetime import datetime, timedelta
-
 import time
+from datetime import datetime, timedelta
 
 import pytest
 

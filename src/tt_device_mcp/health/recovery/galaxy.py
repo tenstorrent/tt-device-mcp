@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """Galaxy recovery: the mesh-wide ``tt-smi -glx_reset``, its gentlest-first routing (a per-chip
-bridge reset before the mesh-wide reset; a host reboot/power-cycle only once a reset has already
+bridge reset before the mesh-wide reset; a host power cycle only once a reset has already
 run and failed), and the explicit cascade router that names the rung each degradation justifies —
 the one the between-job health gate now steers on.
 """
@@ -85,11 +85,11 @@ def _is_galaxy(board_types: Optional[list], glx_board_types: tuple) -> Optional[
 
 
 def _reboot_min_dead_chips(expected: int) -> int:
-    """Fewest dead chips that justifies the destructive reboot/power-cycle rung.
+    """Fewest dead chips that justifies the destructive power-cycle rung (the only host rung).
 
-    Below this the wedge is a single/few-chip active-eth-core freeze that clears itself while the holder-kill covers the dead-BAR-read MCE path — so a reboot there kills
+    Below this the wedge is a single/few-chip active-eth-core freeze that clears itself while the holder-kill covers the dead-BAR-read MCE path — so a power cycle there kills
     every in-flight tenant/agent for a fault that heals on its own. At or above it the mesh is
-    mostly gone, which self-heal does not recover. Floored at 2 so one dead chip never reboots;
+    mostly gone, which self-heal does not recover. Floored at 2 so one dead chip never power-cycles the host;
     the fraction is per-host tunable and a malformed value falls back rather than crashing start."""
     try:
         frac = float(os.environ.get("TT_DEVICE_MCP_REBOOT_MIN_DEAD_FRAC", "0.5"))
@@ -879,7 +879,7 @@ HOST_RUNG_CANNOT_RUN = (NO_HOST_RUNG, HOST_RUNG_DENIED)
 
 class GalaxyRecovery(Recovery):
     """Recovery for a 6U Galaxy: the mesh-wide reset, gentlest-first routing ahead of it (a
-    per-chip bridge reset when a chip is surgically isolable), and the host reboot/power-cycle
+    per-chip bridge reset when a chip is surgically isolable), and the host power-cycle
     escalation once a reset has already run and failed to revive the mesh."""
 
     # Whether the last sweep after an UNKNOWN reset read a fabric 77 (no verdict), and the episode whose
@@ -995,8 +995,8 @@ class GalaxyRecovery(Recovery):
 
     # ---- idle/forced hold-escalation ladder --------------------------------------------------
     #
-    # This whole ladder is Galaxy-flavored in practice: it fires the mesh-wide galaxy reset, the
-    # per-tray UBB reset, and the host reboot/power-cycle escalation, none of which a per-target
+    # This whole ladder is Galaxy-flavored in practice: it fires the mesh-wide galaxy reset (once per
+    # hold episode, I87) and the host power-cycle escalation, neither of which a per-target
     # host has a rung for. Its two callers (the idle relift and the hold-deadline watchdog's
     # forced escalation, both still in server.py) reach it through select_recovery's per-pass
     # platform choice, exactly like the gate's own reset command: on a per-target host that
@@ -1448,9 +1448,7 @@ class GalaxyRecovery(Recovery):
                     # Spec 04 I87: this hold's one mesh reset already ran and failed. The gate never runs a
                     # second one in the episode; it reports the failed rung, so the routing below climbs to
                     # the power cycle (whose last-chance sweep is the one re-run allowed) or hands off.
-                    log(
-                        f"gate/{gate_phase}: this hold's mesh reset already ran and failed — not repeating it"
-                    )
+                    log(f"gate/{gate_phase}: this hold's mesh reset already ran and failed — not repeating it")
                     health_event(
                         "reset_rung_skipped_spent",
                         rung="mesh_reset",
@@ -1885,7 +1883,9 @@ class GalaxyRecovery(Recovery):
             # Spec 04 I87: the full sweep already ran in this phase of the hold (below the 10-min bound,
             # or as the bound's own ladder) and the mesh did not verify. Another would only repeat its
             # mesh reset; the caller goes on to the power cycle.
-            log(f"last chance before the host rung{where}: the sweep already ran in full this hold phase — not repeating it")
+            log(
+                f"last chance before the host rung{where}: the sweep already ran in full this hold phase — not repeating it"
+            )
             health_event(
                 "last_chance_sweep_skipped",
                 context=context or gate_phase,
@@ -1917,8 +1917,8 @@ class GalaxyRecovery(Recovery):
                 )
                 log(
                     f"last chance before the host rung{where}: firing every reset type back-to-back "
-                    f"(SBR -> mesh reset) — nothing to lose before a "
-                    f"reboot or power cycle; off the bus now: {_placement_text(placement)}"
+                    f"(SBR -> mesh reset) — nothing to lose before the "
+                    f"power cycle; off the bus now: {_placement_text(placement)}"
                 )
                 swept = await self._issue_all_resets_back_to_back(
                     trays, expected, log, do_sbr=bool(self.deps.isolated_chips())
@@ -1940,7 +1940,7 @@ class GalaxyRecovery(Recovery):
             healthy = False
         if not healthy:
             if not swept:
-                log(f"the full reset ladder did not run{where} — holding; no reboot or power cycle this pass")
+                log(f"the full reset ladder did not run{where} — holding; no power cycle this pass")
                 health_event(
                     "host_rung_held", context=context or gate_phase, reason="reset sweep skipped or incomplete"
                 )
@@ -1959,7 +1959,7 @@ class GalaxyRecovery(Recovery):
             log(f"the mesh passed enum+ARC after the {via}, but no fabric pass has passed since — held")
             health_event("host_rung_sweep_unverified", context=context or gate_phase, via=via, evidence=evidence)
             return True
-        log(f"the mesh verified after the {via} — no reboot or power cycle needed")
+        log(f"the mesh verified after the {via} — no power cycle needed")
         health_event("gate", phase=gate_phase, healthy=True, recovered_via=via, evidence=evidence)
         return True
 
@@ -2054,7 +2054,11 @@ class GalaxyRecovery(Recovery):
         spent = self.mechanism.mesh_reset_spent(hold_since)
         if spent and not force and hold_since and self.mechanism.spent_climb_since == hold_since:
             return False
-        if not force and not spent and not _stuck_hold_reset_due(hold_since, off_bus=off_bus, measured_fault=measured_fault):
+        if (
+            not force
+            and not spent
+            and not _stuck_hold_reset_due(hold_since, off_bus=off_bus, measured_fault=measured_fault)
+        ):
             return False
         # Retry pacing, not a cap: the grace window between attempts replaces the failed-reset
         # cooldown here — that cooldown guards against repeat MMIO at a DEAD endpoint, but this mesh
@@ -2766,13 +2770,13 @@ class GalaxyRecovery(Recovery):
         """The next rung for a present-mesh episode whose reset came back UNKNOWN and whose I40 fallback
         refused: the last-chance sweep once per episode, then the host climb (spec 04 I29).
 
-        The sweep runs here, not behind the host-rung permission: the climb asks the reboot ledger
+        The sweep runs here, not behind the host-rung permission: the climb asks the host-action ledger
         first, and on one Galaxy host its boot-loop guard kept the sweep waiting an hour. A sweep whose verify
         is still a 77 is not a recovery (the fallback that refused it measured more than a 77 can). With
         a known no-reset cause (a cable fault, a topology mismatch, hugepages not yet allocated, the
         validator missing) it holds and pages once; the idle relift keeps re-running the fabric pass on
         its backoff (spec 03 I48). Otherwise the one rung left that rebuilds what a 77 lacks is the host
-        rung (a reboot refills the 1G hugepages, reloads the driver and retrains every link): it climbs
+        rung (a power cycle refills the 1G hugepages, reloads the driver and retrains every link): it climbs
         there once per episode, through every guard of the climb. A 77 that rung did not end is handed
         to an operator with a deadline, still held."""
         if self.mechanism.unverified_sweep_since != hold_since:
@@ -2882,8 +2886,8 @@ class GalaxyRecovery(Recovery):
     def _fabric_77_host_rung_spent(self, hold_since: str) -> str:
         """Why this 77 episode's one host rung is spent, or "" (spec 04 I29): it already fired on this
         episode, or this boot is that rung's result and no fabric pass has passed since the broker
-        started (the reboot did not end the 77). A pass after the boot frees the rung for a later
-        episode; the reboot ledger's rate limit still bounds it."""
+        started (the power cycle did not end the 77). A pass after the boot frees the rung for a later
+        episode; the host-action ledger's rate limit still bounds it."""
         if self.mechanism.unverified_77_host_rung_since == hold_since:
             return "the host rung already ran on this hold"
         if FABRIC_DEBT.passed_since_start:
@@ -2979,7 +2983,7 @@ class GalaxyRecovery(Recovery):
         health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
         log(
             "the reset and the last-chance sweep both left the fabric unverified (77) for a known no-reset "
-            "cause — no reboot or power cycle; holding, paging once, the idle relift keeps re-checking"
+            "cause — no power cycle; holding, paging once, the idle relift keeps re-checking"
         )
         alert.send_alert(event, _logger)
 

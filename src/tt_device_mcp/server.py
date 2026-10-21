@@ -15556,7 +15556,7 @@ def _preflight_required_capabilities(socket_path: Optional[str]) -> tuple[list[s
     if _scoped_reset_backend():
         # The system broker keeps resets alive in PID-1 scopes and controls host poller units.
         need_bin("systemd-run", "the recovery ladder runs each reset in a transient systemd scope")
-        need_bin("systemctl", "the ladder quiesces pollers, adopts reset scopes, and reboots through it")
+        need_bin("systemctl", "the ladder quiesces pollers, and adopts reset scopes")
     # setpci is required nowhere and warned about only where it would otherwise be usable: the
     # rung needs root as well (I17), and telling an unprivileged daemon to install a tool it
     # still could not use is noise. Its absence for root is loud, not fatal — the ladder has
