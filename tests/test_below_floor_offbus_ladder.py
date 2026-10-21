@@ -15,7 +15,6 @@ Below the bound a forced run keeps its own path (the mesh reset, no rescan or SB
 once). No test reaches a real reset, setpci or power cycle."""
 
 import asyncio
-import pathlib
 import threading
 import time
 from datetime import datetime, timedelta
@@ -315,7 +314,7 @@ def _real_bridge_rung(monkeypatch, tmp_path):
     """Undo _rig's fake: the real _recover_isolated_chips and reset_chip_via_bridge run, against a fake
     sysfs where chip 31's bridge (0000:40:1f.0) is still enumerated with chip 31's bus as its secondary
     bus and chip 31's own node is gone. Returns ``spy``: the bridge lookups by secondary bus, the setpci
-    argvs and the global rescans."""
+    argvs and the scoped rescans."""
     for inst in (srv.galaxy_recovery, srv.per_target_recovery):
         monkeypatch.delattr(inst, "_recover_isolated_chips", raising=False)
     spy = {"find": [], "setpci": [], "rescan": 0}
@@ -330,13 +329,9 @@ def _real_bridge_rung(monkeypatch, tmp_path):
         out = "0000" if argv[-1] == "BRIDGE_CONTROL" else ""
         return bridge.subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
-    real_write = pathlib.Path.write_text
-
-    def write_text(path, data, *a, **k):
-        if str(path) == "/sys/bus/pci/rescan":
-            spy["rescan"] += 1
-            return len(data)
-        return real_write(path, data, *a, **k)
+    def rescan():
+        spy["rescan"] += 1
+        return ["0000:40:1f.0"]
 
     br = pci.PCI_DEVICES_DIR / "0000:40:1f.0"
     br.mkdir()
@@ -347,7 +342,7 @@ def _real_bridge_rung(monkeypatch, tmp_path):
     monkeypatch.setattr(bridge, "find_bridge_by_secondary_bus", find)
     monkeypatch.setattr(bridge.subprocess, "run", setpci)
     monkeypatch.setattr(bridge.time, "sleep", lambda s: None)
-    monkeypatch.setattr(pathlib.Path, "write_text", write_text)
+    monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", rescan)
     monkeypatch.setattr(recovery_pkg, "bridge_reset_enabled", lambda: True)
     monkeypatch.setattr(recovery_pkg, "BRIDGE_RESET_SETTLE_SEC", 0)
     monkeypatch.setattr(srv, "_set_device_op_detail", lambda d: None)

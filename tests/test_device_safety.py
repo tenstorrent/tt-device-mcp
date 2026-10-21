@@ -49,6 +49,7 @@ from tt_device_mcp.health.recovery import (
     WAIT,
     Evidence,
     galaxy,
+    pcie_guard,
 )
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as galaxy_mod
@@ -14031,17 +14032,19 @@ async def test_a_bridge_less_chip_is_rescanned_before_anything_destructive(monke
             self.p = str(p)
 
         def write_text(self, v):
-            rescans.append(self.p)
+            raise AssertionError(f"no bare sysfs write expected here: {self.p}")
 
         def exists(self):
             # The node reappears only AFTER a rescan has run — exactly the real behaviour.
             return "tenstorrent!0" in self.p and bool(rescans)
 
     monkeypatch.setattr(recovery_pkg, "Path", FakePath)
+    # The rescan is scoped to the Tenstorrent root ports (spec 04 I95), never /sys/bus/pci/rescan.
+    monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", lambda: rescans.append("tt root ports") or ["p"])
 
     ok = await srv.galaxy_recovery._recover_isolated_chips(lambda *a, **k: None)
 
-    assert "/sys/bus/pci/rescan" in rescans, "the rescan rung never ran — the cheap recovery was skipped"
+    assert rescans, "the rescan rung never ran — the cheap recovery was skipped"
     assert ok, "the chip came back on the rescan, so recovery must succeed and not escalate further"
 
 
@@ -14079,6 +14082,7 @@ async def test_an_isolated_chip_rung_blocked_in_the_kernel_fails_in_bounded_time
 
     monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", bridge)
     monkeypatch.setattr(recovery_pkg, "Path", BlockedPath)
+    monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", lambda: kernel_lock.wait(30))
     t0 = time.monotonic()
     try:
         ok = await asyncio.wait_for(srv.galaxy_recovery._recover_isolated_chips(lambda *a, **k: None), 10)

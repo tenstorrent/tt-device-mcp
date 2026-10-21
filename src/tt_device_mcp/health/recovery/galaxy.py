@@ -807,9 +807,9 @@ TRAY_DOWN_ONSET = "TRAY_DOWN"
 
 
 def _pci_rescan() -> None:
-    """One bare PCI rescan — the same write the bridge rung's rescan makes. Its own function so the
-    suite replaces it (conftest) and no test writes to the host's sysfs."""
-    Path("/sys/bus/pci/rescan").write_text("1")
+    """One bare PCI rescan of the Tenstorrent root ports — the same write the bridge rung's rescan
+    makes. Its own function so the suite replaces it (conftest) and no test writes to the host's sysfs."""
+    pcie_guard.rescan_tt_root_ports()
 
 
 def tray_down_capture_enabled() -> bool:
