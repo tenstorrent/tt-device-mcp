@@ -56,6 +56,7 @@ from tt_device_mcp.constants import (
     FABRIC_CHECK_CANNOT_CHECK_RC,
     FABRIC_CHECK_TIMEOUT_SEC,
     GRACEFUL_KILL_GRACE_SEC,
+    HUNG_SIGINT_GRACE_SEC,
     JOB_RETENTION_SEC,
     POST_STEP_DEADLINE_DEFAULT_SEC,
     POST_STEP_DEADLINE_ENV,
@@ -12054,9 +12055,13 @@ export {JOB_TAG_ENV}={job_tag}
                             )
                         # Kill the whole scope for a privsep job — killpg on the wrapper pid leaves the
                         # scoped payload running and wedges the eth. See _terminate_job.
+                        # A silent job does not unwind on SIGINT and owes the reset anyway: a
+                        # short SIGINT window (I10) instead of the full GRACEFUL_KILL_GRACE_SEC.
                         reaping = True
                         _log_job_tree_killed(
-                            job_id, f"hung (no output for {int(silent)}s)", await _terminate_job(job_id, job.pid)
+                            job_id,
+                            f"hung (no output for {int(silent)}s)",
+                            await _terminate_job(job_id, job.pid, grace_sec=HUNG_SIGINT_GRACE_SEC),
                         )
                         return
 
