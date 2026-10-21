@@ -367,6 +367,69 @@ async def test_a_recovery_kill_is_killed_with_its_cause_before_the_sweep(runner_
     assert "934" not in srv.reset_killed_causes, "the cause is read once"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_cmd", ["exit 1", "true"], ids=["failed", "exit0"])
+async def test_a_recycled_id_after_a_fault_branch_recovery_kill_owes_its_reset(runner_env, monkeypatch, exit_cmd):
+    """Spec 01 I70 / 03 I69: a recovery-killed job whose log names a device fault takes the fault
+    branch, and that branch drops its reset-killed marker and cause too. Ids recycle (001-999): a
+    leftover marker would end the next job with this id KILLED by recovery and excuse it the reset."""
+    monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: {"0": 1350})
+    srv._mark_job_device_fault_failed("951", "device recovery kill: chip 3 left the PCIe bus")
+    job, runner = await _start("951", f"echo 'fabric router sync: timeout'; {exit_cmd}")
+    job.log_file = str(runner_env["tmp"] / "run_951.log")
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.KILLED
+    assert "951" not in srv.reset_killed_job_ids and "951" not in srv.reset_killed_causes
+
+    # The id comes round again: a job that dies with the device open owes the reset (I69).
+    again, runner = await _start("951", "exit 1")
+    again.log_file = str(runner_env["tmp"] / "run_951b.log")
+    try:
+        assert await _until(lambda: _runner_done(again))
+    finally:
+        await _stop(runner)
+    assert again.status is srv.JobStatus.FAILED, "never KILLED by a recovery that was not its own"
+    assert srv.RECOVERY_KILL_MARKER not in (again.error or "")
+    assert srv._kill_reset_debt().startswith("job 951"), "not excused from the reset it owes"
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_killed_job_that_exited_0_is_no_clean_job(runner_env, monkeypatch):
+    """Spec 01 I70 decision: a recovery kill is not a preemption (user rule for a preempted exit 0:
+    I20 only). A recovery-killed job that exited 0 reads KILLED to the post-job notes: failed for the
+    I42/I46 fabric notes, and no proof the last release was right, so the hold carry stays (04 I82).
+    It owes no second reset (recovery's own reset and full check stand) and its marker is dropped."""
+    seen = {}
+
+    def lift(failed, tail):
+        seen["lift"] = failed
+        return None
+
+    def route(failed, tail):
+        seen["route"] = failed
+        return None
+
+    carry = []
+    monkeypatch.setattr(srv.health_monitor, "note_job_after_topology_lift", lift)
+    monkeypatch.setattr(srv.health_monitor, "note_job_fabric_route_fault", route)
+    monkeypatch.setattr(srv, "_note_hold_carry_job", lambda edge, ok=False: carry.append((edge, ok)))
+    srv._mark_job_device_fault_failed("952", "device recovery kill: chip 3 left the PCIe bus")
+    job, runner = await _start("952", "true")
+    job.log_file = str(runner_env["tmp"] / "run_952.log")
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.KILLED and job.exit_code == 0
+    assert seen == {"lift": True, "route": True}, "read as failed by both fabric notes"
+    assert ("end", True) not in carry and ("end", False) in carry, "the carry window stays open"
+    assert srv._kill_reset_debt() == "", "recovery's own reset stands; no second one"
+    assert "952" not in srv.reset_killed_job_ids and "952" not in srv.reset_killed_causes
+
+
 def test_the_test_reset_drops_every_kill_marker(clear_job_state):
     """A runner stopped mid-job can leave its markers behind, and job ids recycle (001-999): a
     leftover reset-killed id would excuse a later test's job from the debt it owes."""
