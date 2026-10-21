@@ -506,6 +506,9 @@ class RecoveryMechanism:
         # Owes the pollers a step left stopped to the broker's next close to HEALTHY (spec 03 I66,
         # 04 I12); the broker sets it. Called with what the step was.
         self.owe_device_pollers: Optional[Callable[[str], None]] = None
+        # Detaches every attached all-ones chip before the poller stop (spec 03 I84); returns why the
+        # reset must not run, or None. The broker sets it to the sampler's detach_before_quiesce.
+        self.detach_before_quiesce: Optional[Callable[[str], Awaitable[Optional[str]]]] = None
 
         # Two callers (the auto-recovery reset launcher and the operator-run reset tool) need this
         # sequence and they must build it identically, because the scope name is what every other
@@ -1172,6 +1175,25 @@ class RecoveryMechanism:
             log(f"reset refused: {fenced}")
             health_event("reset_fenced", argv=argv, owner=owner, reason=fenced)
             return None, f"reset refused: {fenced}"
+        # Spec 03 I84: a stopped poller closes its fds, and the driver's close path reaches every chip
+        # not detached. So a chip reading all-ones is PCI-removed first, with the flag set so the
+        # sampler's valve does not race the remove; one that will not detach refuses the reset (its
+        # own reads and re-power would reach it too) and the hold goes to the 10-min bound's host rung.
+        detach = self.detach_before_quiesce
+        if detach is not None:
+            was_in_flight = self.reset_in_flight
+            self.reset_in_flight = True
+            try:
+                refused = await detach(" ".join(argv))
+            except BaseException:
+                self.reset_in_flight = was_in_flight
+                raise
+            if refused:
+                self.reset_in_flight = was_in_flight
+                why = f"a chip reads all-ones and is not detached ({refused})"
+                log(f"reset refused: {why}")
+                health_event("reset_fenced", argv=argv, owner=owner, reason=why)
+                return None, f"reset refused: {why}"
         # Name the command we are actually running. This was hardcoded to the galaxy's -glx_reset, so on
         # every other machine the queue told operators a command that was not the one executing.
         self._set_device_op_detail(f"device reset: {' '.join(argv)} (~60s)")

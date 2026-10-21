@@ -1230,6 +1230,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         chip_state.publish()
         _reload_removed_chips()
         recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
+        recovery_mechanism.detach_before_quiesce = _detach_before_quiesce
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
         )
@@ -5801,11 +5802,21 @@ def _note_dead_kill_refused(reason: str, chips: list) -> list:
     return pids
 
 
+async def _detach_before_quiesce(what: str) -> Optional[str]:
+    """Spec 03 I84: detach every attached all-ones chip before a reset step stops the pollers. Returns
+    why the step must neither stop them nor reset, or None. No sampler (not booted): nothing to detach."""
+    if sampler is None:
+        return None
+    return await sampler.detach_before_quiesce(what)
+
+
 def _forget_dead_kill_refused() -> None:
     global _kill_refused_job_pid, _kill_refused_since
     _kill_refused_pids.clear()
     _kill_refused_job_pid = None
     _kill_refused_since = ""
+    if sampler is not None:
+        sampler.quiesce_refused.clear()
 
 
 def _kill_refused_live(scan) -> tuple[set, bool]:
@@ -5830,6 +5841,11 @@ def _kill_refused_live(scan) -> tuple[set, bool]:
 
 def _kill_refused_reason(scan: Optional[HolderScan] = None) -> str:
     """Why the 10-min bound sends this hold to the host rung for refused holders, or "" (spec 04 I76)."""
+    stuck = sampler.quiesce_refused_live() if sampler is not None and sampler.quiesce_refused else []
+    if stuck:
+        # Spec 03 I84: a reset's detach-before-quiesce could not detach these, so every rung's reset is
+        # refused (its poller stop and its own reads would reach them); only the host rung is left.
+        return f"chip(s) {stuck} read all-ones and could not be detached: no reset may stop the pollers over them"
     if not _kill_refused_pids and _kill_refused_job_pid is None:
         return ""
     try:
@@ -6234,6 +6250,18 @@ async def _pollers_quiesced_for(what: str, log):
     before the check and one ``start`` after it, each bounded at 30 s per unit."""
     global _pollers_held_for
     stopped: list[str] = []
+    refused = None
+    try:
+        # Spec 03 I84: a chip reading all-ones is detached before the stop, or the stop's fd closes
+        # reach it. One that will not detach keeps the pollers up (as the valve does); any reset the
+        # check climbs to is refused for it, and the 10-min bound asks for the host rung.
+        refused = await _detach_before_quiesce(what)
+    except Exception as exc:  # noqa: BLE001 - best-effort, as for the stop below
+        log(f"could not detach all-ones chips before {what}: {exc!r}")
+    if refused:
+        log(f"device pollers kept running for {what}: an all-ones chip is not detached ({refused})")
+        yield stopped
+        return
     try:
         stopped = await _set_device_pollers(False, log)
     except Exception as exc:  # noqa: BLE001 - best-effort: never blocks the check

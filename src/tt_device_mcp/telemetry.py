@@ -204,6 +204,10 @@ class TelemetrySampler:
         # The hung chips a stop was last deferred for (an all-ones chip not yet detached), journalled once.
         self.pollers_deferred_for: frozenset = frozenset()
         self.prev_beats: dict = {}
+        # Chips a reset step's detach-before-quiesce could not detach (spec 03 I84), with when: while one
+        # still reads all-ones and is attached, every reset is refused at once and the 10-min bound
+        # asks for the host rung. Cleared by a passing full check.
+        self.quiesce_refused: dict = {}
         # Every chip reading all-ones on the sample the valve runs for (spec 03 I84): one of them it
         # does not remove keeps the holders alive. Set only while check_for_dead_chips calls it.
         self.sample_all_ones: Optional[list] = None
@@ -685,6 +689,81 @@ class TelemetrySampler:
             if ok:
                 removed.append(idx)
         return removed, [i for i in chips if i not in removed]
+
+    def attached_all_ones(self) -> list:
+        """Chips the sampler last saw reading all-ones (lost on two samples, or on a first strike)
+        whose KMD class node is still there: maybe off the bus and not detached. No chip is read."""
+        ids = set(chip_state.lost_chips()) | set(self.dead_chip_strikes)
+        out = []
+        for idx, node in self._nodes(ids).items():
+            try:
+                if node.exists():
+                    out.append(idx)
+            except OSError:
+                out.append(idx)  # unreadable: count it as attached
+        return sorted(out, key=int)
+
+    def quiesce_refused_live(self) -> list:
+        """The chips a reset's detach-before-quiesce could not detach that still read all-ones and
+        are still attached (spec 03 I84)."""
+        live = set(self.attached_all_ones())
+        return sorted((i for i in self.quiesce_refused if i in live), key=int)
+
+    async def detach_before_quiesce(self, what: str) -> Optional[str]:
+        """Detach every attached all-ones chip before a reset step stops the pollers (spec 03 I84,
+        I66). A stopped poller closes its fds, and tt-kmd's close path reaches every chip that is
+        not detached; only the PCI remove marks it. Returns why the step must not stop the pollers
+        or reset, or None. A chip that only stalled (it still answers) needs nothing here.
+
+        Refused, with nothing detached or stopped: every present chip reads all-ones (spec 03 I19
+        never isolates the whole mesh, and that class goes straight to the power cycle), a chip an
+        earlier step could not detach (refused at once, no new remove), or a remove that fails or
+        runs past DETACH_TIMEOUT_SEC. A refusal records the holders it leaves alive, so the 10-min
+        bound sends the hold to the host rung."""
+        chips = self.attached_all_ones()
+        if not chips:
+            return None
+        present = chip_state._sysfs_indices()
+        reason = ""
+        removed: list = []
+        stuck: list = []
+        if len(chips) >= len(present):
+            reason, stuck = "all_chips_all_ones", chips
+        elif any(i in self.quiesce_refused for i in chips):
+            reason, stuck = "detach_failed_earlier", [i for i in chips if i in self.quiesce_refused]
+        else:
+            removed, stuck = await self._detach_chips(chips)
+            # A remove the valve finished meanwhile fails here, yet the chip is detached.
+            stuck = [i for i in stuck if i in self.attached_all_ones()]
+            if removed:
+                self._deps.isolated_chips().update(removed)  # the reset's rescan brings them back
+                self._deps.health_event("chip_isolated", chips=removed)
+            if stuck:
+                reason = "detach_failed" if self._deps.isolate_chip is not None else "detach_unavailable"
+        self._deps.health_event(
+            "reset_quiesce_detach",
+            what=what,
+            chips=chips,
+            detached=removed,
+            refused=reason or None,
+            stuck=stuck,
+            host_at_risk=bool(reason),
+        )
+        if not reason:
+            return None
+        now = time.time()
+        for i in stuck:
+            self.quiesce_refused.setdefault(i, now)
+        log = self._deps.logger()
+        if log:
+            log.error(
+                f"RESET refused before the poller stop ({reason}): chip(s) {stuck} read all-ones and are "
+                f"not detached, so stopping the pollers or resetting would make the driver reach them. "
+                f"The hold stays; the 10-min bound asks for the power cycle — {what}"
+            )
+        if self._deps.note_kill_refused is not None:
+            self._deps.note_kill_refused(reason, stuck)
+        return reason
 
     async def _kill_refusal(self, stuck: list, others: list) -> Optional[str]:
         """Why the valve must not kill or stop anything yet, or None (spec 03 I84). Each case leaves
