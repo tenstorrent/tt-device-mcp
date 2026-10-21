@@ -331,7 +331,7 @@ def cmd_run(args) -> int:
             "env": env_file,
             "inherited_env": inherited_env,
             "timeout_sec": timeout,
-            "preemptable": bool(getattr(args, "preemptable", False)),
+            "no_timeout_except_on_contention": bool(getattr(args, "preemptable", False)),
         },
     )
 
@@ -417,7 +417,7 @@ def cmd_run_bg(args) -> int:
             "env": env_file,
             "inherited_env": inherited_env,
             "timeout_sec": timeout,
-            "preemptable": bool(getattr(args, "preemptable", False)),
+            "no_timeout_except_on_contention": bool(getattr(args, "preemptable", False)),
         },
     )
 
@@ -1222,7 +1222,7 @@ def _wait_and_stream(
             if result["status"] == "timeout" and result.get("hint"):
                 print(f"\n!! TIMED OUT after {result.get('timeout_sec')}s !!\n{result['hint']}")
             if result["status"] == "preempted":
-                print(f"\n!! PREEMPTED: another job was waiting past the {result.get('timeout_sec')}s soft limit !!")
+                print(f"\n!! PREEMPTED: another job was waiting past the {result.get('timeout_sec')}s limit !!")
 
             # Show last N lines summary if requested
             if output_lines > 0 and all_output:
@@ -1679,6 +1679,14 @@ def cmd_refresh_banner(args) -> int:
 # ============== Main ==============
 
 
+_NO_TIMEOUT_HELP = (
+    f"No timeout except on contention: -t is the time limit, but while no other job waits the job "
+    f"is never stopped for time. Once the limit has passed and a job is waiting, it must shut down "
+    f"gracefully within {PREEMPT_GRACE_SEC}s (SIGINT, then SIGTERM) or be killed. Status shows "
+    f"PREEMPTABLE <x>min, then PREEMPTING <s>s. You MUST watch the broker (tt-device-mcp status)."
+)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="TT Device MCP - Tenstorrent device queue server",
@@ -1717,12 +1725,11 @@ Examples:
     run_parser.add_argument("-e", "--env", help="Env file path")
     run_parser.add_argument("-t", "--timeout", type=int, default=600, help="Timeout in seconds")
     run_parser.add_argument(
+        "--no-timeout-except-on-contention",
         "--preemptable",
+        dest="preemptable",
         action="store_true",
-        help=(
-            f"PREEMPTABLE: -t becomes a soft limit; past it the job runs on until another job is "
-            f"queued, then is stopped and SIGKILLed {PREEMPT_GRACE_SEC}s later. Watch the broker."
-        ),
+        help=_NO_TIMEOUT_HELP,
     )
     run_parser.add_argument(
         "-o", "--output-lines", type=int, default=0, help="Show last N lines summary at end (default: 0 = no summary)"
@@ -1749,12 +1756,11 @@ Examples:
     run_bg_parser.add_argument("-e", "--env", help="Env file path")
     run_bg_parser.add_argument("-t", "--timeout", type=int, default=600, help="Timeout in seconds")
     run_bg_parser.add_argument(
+        "--no-timeout-except-on-contention",
         "--preemptable",
+        dest="preemptable",
         action="store_true",
-        help=(
-            f"PREEMPTABLE: -t becomes a soft limit; past it the job runs on until another job is "
-            f"queued, then is stopped and SIGKILLed {PREEMPT_GRACE_SEC}s later. Watch the broker."
-        ),
+        help=_NO_TIMEOUT_HELP,
     )
 
     status_parser = subparsers.add_parser(

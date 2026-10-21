@@ -194,6 +194,35 @@ job log, so every "installed" claim below is verified, not assumed.
   the reconcile that runs it, for at most its bound. The restart after an apply is an ordinary
   broker start, so the queue opens only once the startup check (spec 03 I4: the forced fabric
   pass, after the 1G hugepage pool is ready) has passed.
+- **I21 — Applies are rate-limited per box, and the limit only moves when an apply happens.**
+  Every apply restarts the broker, and every start runs the full startup check, fabric traffic
+  pass included (spec 03 I4), so a burst of pushes is a burst of fabric passes. With
+  `TTDEV_MIN_APPLY_INTERVAL_SEC` > 0 (default 0, off; 3600 suggested on a Galaxy), a lap that finds
+  a new sha less than that long after the last apply exits 0 and says when the sha will apply; the
+  first lap past the interval applies the newest sha, so a burst becomes one restart. The check
+  runs before the device-op bar and the I18 hold, so a rate-limited lap holds nothing. The last
+  apply is the epoch in `$ROOT/last-apply`, written just before `systemctl restart`, so an apply
+  that fails before the restart is retried on the next lap; a missing, non-numeric or future stamp
+  bars nothing; the stamp is read base 10. The dispatch hold, drain and busy gate (I18, I20, I24)
+  are unchanged, and the startup check after the restart is never skipped, deferred or shortened. **The limit applies to a
+  healthy broker only**: the next sha may be the fix for a broker the last apply broke, so a lap
+  inside the interval applies at once, and logs `rate limit skipped` with the reason, when the
+  broker is not `active` (failed, activating, inactive), when its systemd `NRestarts` grew past the
+  count saved in `$ROOT/last-apply-nrestarts` right after the last apply's restart (a crash loop),
+  or when `/health` does not answer, reports `held`, or reports an FSM that is `recovering` or
+  `down`. One exception: every start opens `recovering` with `fsm_why` `startup_unverified` and
+  holds the device until its startup check passes (hugepage wait, 120 s, spec 03 I33, then one full
+  gate pass with fabric, at most 436 s, spec 04). That broker is booting, not broken, and stays
+  limited while it is within `STARTUP_BOUND` (600 s: 120 + 436 s plus 44 s for the restart) of the
+  last apply and held for nothing but that check (`held` false while the gate runs, or
+  `held_reason` `device unverified: ...`). Past the bound, held for a fault found during the check
+  (a dirty episode), or after a failed check (which names its fault in `fsm_why`), it applies at
+  once.
+  Worst-case deploy latency of a sha to a healthy broker: `TTDEV_MIN_APPLY_INTERVAL_SEC` + one 60 s
+  lap + the I20/I24 drain on a busy box (at most one job cap, 1560 s, after the running job
+  started); to a broken broker the limit adds nothing. The by-hand escape is
+  `rm $ROOT/last-apply`: the config file is sourced over the environment, so
+  `TTDEV_MIN_APPLY_INTERVAL_SEC=0` on the command line does not override a configured value.
 - **I24 — An update never restarts the broker under a running tenant job.** A running job is
   re-adopted across a restart (spec 01), but the restart still costs it: its client's socket
   drops for seconds, a client that reads the drop as a failure kills the job (and the kill owes a
@@ -332,7 +361,7 @@ clones it into `$ROOT/src` under `umask 077` on the first lap (removing any non-
 leftover first), fetches the tracked branch thereafter, and reads the sha with
 `rev-parse --verify -q refs/remotes/origin/$TTDEV_BRANCH`; an unmakeable clone, an unreachable
 network and a missing branch each name the fault and exit 0. If that sha equals `installed.sha`,
-exit. Otherwise: device-op bar and reset-scope check
+exit. Otherwise: the apply rate limit (I21); device-op bar and reset-scope check
 (I7 — the scope check asks systemd, because a reset outlives the broker by design); dispatch hold and busy/idle
 gate per I7, I18, I20 and I24; then materialize the tree — `reset --hard` to **the sha this lap resolved**, not to
 `origin/<branch>` re-read after the gate, so a branch that moved during a drain is not installed
@@ -541,6 +570,7 @@ script exists, the claim stands on the script (listed below).
 | I18 (dispatch hold from the busy check through the restart; queued specs and job scopes count as busy) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_hold_is_taken_before_anything_is_counted`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_hold_appears_whole`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_queued_job_alone_applies_at_once_under_the_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_idle_box_applies_and_keeps_the_hold_until_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_running_job_scope_holds_dispatch_and_the_update_applies_when_it_ends` |
 | I19 (an in-progress broker is not reset or started; logged once) | `tests/test_deploy_reconcile_activating.py::test_an_in_progress_broker_is_not_reset_or_started`, `tests/test_deploy_reconcile_activating.py::test_an_in_progress_broker_logs_once_per_episode`, `tests/test_deploy_reconcile_activating.py::test_a_down_broker_is_still_reset_and_started`, `tests/test_deploy_reconcile_activating.py::test_an_active_broker_is_left_alone` |
 | I20 (a busy box drains at once: the hold is kept until the running job ends, then the update applies within one poll; a back-to-back queue cannot slip a job in; bounded by the job cap from the youngest job scope's start, past which the update applies; a down broker ends the drain; a device op holds the apply; the restart opens the queue only after the startup fabric pass, after hugepages) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_job_cap_is_the_brokers_hard_limit_plus_its_kill_grace`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_running_job_scope_holds_dispatch_and_the_update_applies_when_it_ends`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_busy_box_drains_at_once_and_applies_at_the_job_boundary`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_back_to_back_queue_cannot_slip_a_job_into_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_past_its_cap_does_not_delay_the_update_past_the_cap`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_down_broker_ends_the_drain`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_holds_a_drained_apply`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_drain_refreshes_the_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_apply_ends_in_a_full_broker_restart`, `tests/test_restart_drain.py::test_a_job_held_across_an_update_waits_for_the_startup_fabric_pass`, `tests/test_restart_drain.py::test_a_failed_startup_pass_after_an_update_keeps_the_queue_held` |
+| I21 (apply rate limit: off by default; a burst of pushes is one restart onto the newest sha after the interval; checked before the device-op bar and the hold; the stamp is written only by an apply that restarts; a missing, bad or future stamp bars nothing; a broker that is not active, crash-loops, is silent, held or recovering/down applies at once; a healthy broker, or one in its startup check (recovering/startup_unverified, held only for that check) within STARTUP_BOUND of the last apply, stays limited; past the bound or held for a fault it applies at once) | `tests/test_deploy_autoupdate_rate_limit.py::test_the_rate_limit_is_off_by_default`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_burst_of_pushes_becomes_one_restart_onto_the_newest_sha`, `tests/test_deploy_autoupdate_rate_limit.py::test_the_wait_names_the_time_left`, `tests/test_deploy_autoupdate_rate_limit.py::test_no_stamp_a_bad_stamp_or_a_future_stamp_bars_nothing`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_rate_limited_lap_holds_nothing_and_skips_no_check`, `tests/test_deploy_autoupdate_rate_limit.py::test_the_stamp_is_written_only_by_an_apply_that_restarts`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_broken_broker_applies_a_new_sha_inside_the_interval`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_healthy_broker_stays_rate_limited`, `tests/test_deploy_autoupdate_rate_limit.py::test_the_startup_bound_covers_the_hugepage_wait_and_the_fabric_check`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_booting_broker_stays_rate_limited`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_startup_check_past_its_bound_or_held_applies_at_once`, `tests/test_deploy_autoupdate_rate_limit.py::test_the_crash_loop_baseline_is_the_count_after_the_last_apply`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_missing_stamp_is_silent_and_a_leading_zero_stamp_is_decimal` |
 | I24 (no restart under a running tenant job: busy gate always on with no setting, old defer settings inert; a job running at the restart point is waited out to the job cap; a device op there blocks the restart and installed.sha stays old; MainPID 0 counts no children) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_idle_gate_is_always_on_with_no_setting`, `tests/test_deploy_autoupdate_idle_gate.py::test_old_defer_settings_do_not_turn_the_drain_off`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_running_at_the_restart_point_is_waited_out_to_its_cap`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_that_ends_at_the_restart_point_is_waited_out`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_at_the_restart_point_blocks_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_stopped_broker_has_no_children_to_count` |
 | Autoupdate flow: one `autoupdate_apply` event per apply, in the broker's journal dir and schema; `restart_rc` records a failed restart; `idle`/`drained_s` come from the lap's own drain; a failed write only warns | `tests/test_deploy_autoupdate_idle_gate.py::test_apply_appends_one_autoupdate_apply_event_in_the_broker_schema`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_failed_restart_is_recorded_as_failed`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_event_goes_to_the_brokers_journal_dir`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_failed_event_write_only_warns`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_idle_lap_reports_idle_and_no_drain`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_lap_that_drains_reports_busy_and_its_drain_time`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_wait_at_the_restart_point_adds_to_the_drain_time` |
 

@@ -691,3 +691,25 @@ def test_the_capture_reads_the_bridge_of_every_off_chip(galaxy_trays, monkeypatc
     buses = srv.health_monitor._chip_buses
     assert seen["addrs"] == [buses[c] for c in off]
     assert seen["pci_targets"] == ["b"] and seen["trays"] == [3] and seen["all_trays"] == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("removed", [True, False])
+async def test_the_prelude_rescan_never_re_enumerates_a_removed_un_reset_chip(rig, removed):
+    """Spec 04 I69: the prelude resets nothing, so with a chip the broker removed (still hung) its rescan
+    is withheld and journaled, and the ladder follows at once with no added wait. With no removal
+    record the rescan runs as before."""
+    off = _off(rig["map"], {3: 5})
+    rig["beats"] = _beats_without(off)
+    if removed:
+        chip = str(min(off))
+        pci.REMOVED_CHIPS[chip] = {"bdf": "0000:46:00.0", "bridge": "0000:40:01.1"}
+    await _run_ladder(rig["g"], sorted(map(str, off)))
+    ladder = ["glx_reset", "last_chance", "power_cycle"]
+    if removed:
+        assert rig["order"] == ["capture", *ladder]
+        withheld = [k for kind, k in rig["events"] if kind == "pci_rescan_withheld"]
+        assert withheld == [{"chips": [chip], "unreset": [chip], "reason": "removed_chip_not_reset"}]
+    else:
+        assert rig["order"] == ["rescan", "capture", *ladder]
+        assert "pci_rescan_withheld" not in _kinds(rig)
