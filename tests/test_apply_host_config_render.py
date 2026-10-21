@@ -167,16 +167,11 @@ def test_ubb_reset_force_off_unset_renders_no_line(tmp_path):
     assert "TT_DEVICE_MCP_AUTO_UBB_RESET" not in unit
 
 
-def test_ubb_reset_force_off_reaches_the_unit(tmp_path):
-    # A host whose BMC bit order the broker has not confirmed disarms the default-on tray rung: the
-    # /etc/default TTDEV_AUTO_UBB_RESET=0 must reach the unit under the name server.py reads, before
-    # ExecStart so it is in the broker's env — otherwise the only way to force the rung off is to
-    # hand-edit the unit, and the standard /etc/default interface cannot disarm a destructive rung.
-    opted = dict(_GALAXY, TTDEV_AUTO_UBB_RESET="0")
-    unit = _render(tmp_path, opted)
-    line = "Environment=TT_DEVICE_MCP_AUTO_UBB_RESET=0"
-    assert line in unit
-    assert unit.index(line) < unit.index("ExecStart=")
+def test_a_stale_ubb_reset_setting_renders_no_line(tmp_path):
+    # Spec 04 I23: the per-tray BMC re-power rung is gone, with no switch left. A TTDEV_AUTO_UBB_RESET
+    # still in an old /etc/default file renders nothing into the unit.
+    unit = _render(tmp_path, dict(_GALAXY, TTDEV_AUTO_UBB_RESET="0"))
+    assert "AUTO_UBB_RESET" not in unit
 
 
 def test_prejob_dispatch_unset_renders_no_line(tmp_path):
