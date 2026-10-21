@@ -7658,11 +7658,6 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
         early = hold_report.RungCandidate(started + bound_sec, "forced ladder", "disproven lift bound")
         if add(candidates, early, "disproven_lift") and age >= bound_sec:
             return done(candidates)  # due: the watchdog's chain stops at it
-    if m is not None and m.progress_retry is not None and m.progress_retry[0] == episode:
-        left = m.progress_retry[1] - time.monotonic()
-        retry_c = hold_report.RungCandidate(now_epoch + max(0.0, left), "forced ladder", "progress retry")
-        if add(candidates, retry_c, "progress_retry") and left <= 0:
-            return done(candidates)  # due: the watchdog's chain stops at it
     window = max(1, device_hold_escalate_bucket + 1)
     # A window whose run would do nothing is spent all the same; the next one is then the candidate.
     for w in range(window, window + 3):
@@ -9011,12 +9006,6 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         device_hold_escalation_kind = "disproven_lift"
         device_hold_escalation_trigger = "the disproven topology-mismatch lift (spec 03 I42)"
         _maybe_spawn_forced_escalation()
-    elif recovery_mechanism is not None and recovery_mechanism.progress_retry_due(device_hold_episode_since):
-        # spec 04 I39: a failed mesh reset brought chips back; its one retry runs now, not at the ceiling.
-        device_hold_escalation_kind = "progress_retry"
-        device_hold_escalation_trigger = "the retry after a failed reset that brought chips back"
-        if _maybe_spawn_forced_escalation():
-            recovery_mechanism.spend_progress_retry()
     else:
         # The old risky-reset floor window (a separate forced run partway to the ceiling) is gone
         # (ladder-v2): the below-floor mesh reset no longer waits, so the general ceiling window is

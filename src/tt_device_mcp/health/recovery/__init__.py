@@ -897,7 +897,7 @@ class Recovery(ABC):
             if rc is not None:
                 self.mechanism.last_reset_failed = True
                 self.mechanism.last_reset_exit_nonzero = True
-                self.mechanism.mesh_reset_failed_since_release = True
+                self.mechanism.mark_mesh_reset_failed()
             metrics.stage_fired("smi_reset", "timeout" if rc is None else "failed")
             if rc is not None and arc_retry and await self._arc_not_ready_retry_due(argv, expected, log):
                 # The retry is this same gated path (host gate, outage hold, cooldown clock, full verify
@@ -945,7 +945,7 @@ class Recovery(ABC):
         )
         self.mechanism.last_reset_failed = not healthy
         if not healthy:
-            self.mechanism.mesh_reset_failed_since_release = True
+            self.mechanism.mark_mesh_reset_failed()
         if healthy:
             log("reset complete + health verified")
             return True

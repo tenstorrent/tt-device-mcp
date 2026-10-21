@@ -202,10 +202,9 @@ def _offbus_hold_escalate_enabled() -> bool:
 
 
 def _stuck_hold_ceiling_sec() -> int:
-    """Seconds a GENERIC hold may stand — and the window its mesh-reset retries run inside — before
-    the ladder climbs through it to a power cycle. The hard ceiling on any hold. Default 600 (10
-    min): a reset brings a recoverable drop back immediately, so a hold still standing at the
-    ceiling has already had every gentler rung and their retries; the box is idle and
+    """Seconds a GENERIC hold may stand before the ladder climbs through it to a power cycle. The hard
+    ceiling on any hold. Default 600 (10 min): a reset brings a recoverable drop back immediately, so a
+    hold still standing at the ceiling has already had every gentler rung; the box is idle and
     tenant-refused, so climbing then costs nothing a longer wait would save. Parsed defensively — a
     malformed or non-positive value reads as the default, never 0 (which would escalate the instant
     a hold latched). Never above 600 (spec 04 I76): the env may shorten the bound, never lengthen it."""
@@ -246,19 +245,6 @@ def _settle_before_host_rung_sec() -> int:
     except ValueError:
         return 60
     return v if v > 0 else 60
-
-
-def _progress_retry_sec() -> int:
-    """Seconds between a failed mesh reset that brought chips back and its one forced retry (spec 04
-    I39). Long enough for the pollers and re-enumeration to settle after the reset, far short of the
-    600 s ceiling window. ``TT_DEVICE_MCP_PROGRESS_RETRY_SEC``; malformed or non-positive reads as the
-    default (60), and it is capped at the hold ceiling so it can never wait longer than before."""
-    raw = os.environ.get("TT_DEVICE_MCP_PROGRESS_RETRY_SEC", "").strip()
-    try:
-        v = int(raw)
-    except ValueError:
-        v = 60
-    return min(v if v > 0 else 60, _stuck_hold_ceiling_sec())
 
 
 # The two off-bus fault classes that go to the power cycle with no further reset (spec 04 I37). A: one
@@ -354,13 +340,12 @@ def _hold_age_sec(hold_since: str) -> Optional[float]:
 
 def _present_mesh_reset_grace_sec() -> int:
     """Seconds a PRESENT-mesh eth/fabric-unverified hold may stand before the idle escalation
-    galaxy-resets it, and the minimum spacing between retries — deliberately far SHORTER than the
-    hold ceiling. A galaxy reset re-inits the eth cores in a ~60s recoverable pass and is the ONLY
+    galaxy-resets it, and the minimum spacing after any earlier reset — deliberately far SHORTER than
+    the hold ceiling. A galaxy reset re-inits the eth cores in a ~60s recoverable pass and is the ONLY
     cure for a wedge enum+ARC cannot see (it does not self-heal by waiting); eth links re-train in
     seconds, so a wedge still present at the grace is genuine, not a training window. The escalation
-    retries on this cadence until the mesh recovers or the 10-min ceiling hands it to the host
-    rungs: the box is idle and tenant-refused, so a retry costs nothing, and a retry that drops the
-    mesh off the bus flips the hold to the off-bus ladder, which owns that failure mode. Default
+    runs the hold's one mesh reset; once it failed, the hold climbs to the power cycle and the reset
+    never runs again in the episode (spec 04 I84). Default
     120 (2 min). Parsed defensively — a malformed or non-positive value reads as the default,
     never 0."""
     raw = os.environ.get("TT_DEVICE_MCP_PRESENT_MESH_RESET_GRACE_SEC", "").strip()
@@ -383,9 +368,8 @@ def _stuck_hold_reset_due(
     HOLDS a present-mesh eth/fault hold (it is below the reset floor) rather than reset it, because a
     galaxy reset on a present-but-eth-unverifiable mesh can itself drop every chip off the bus. The
     escalation accepts that bounded risk as the cure for an otherwise-unbounded idle strand — at the
-    grace, not the hard ceiling, because an eth wedge does not self-heal by waiting longer — and the
-    caller retries on the grace cadence until recovery or the ceiling (a drop under the reset flips
-    the hold to the off-bus ladder, which owns that failure mode). An off-bus drop (``off_bus > 0``)
+    grace, not the hard ceiling, because an eth wedge does not self-heal by waiting longer. One reset
+    per hold: a failed one climbs to the power cycle (spec 04 I84). An off-bus drop (``off_bus > 0``)
     is EXCLUDED: it self-heals and a galaxy reset there is the measured all-chip drop
     that inverts the mesh (1 off-bus -> 31), so it keeps holding to the ceiling. Age is read off the
     idle-latched episode clock; a missing or unparseable stamp fails closed (not due). The caller
@@ -568,9 +552,9 @@ def _route(
       so a reset is the only remedy, and counted by off-bus alone it would read as 0 and hold below
       the floor forever. This is the branch that must NOT climb to a mesh-wide reset over a
       single-chip wedge.
-    * otherwise -> ``STAGE_SMI_RESET``. The gate runs this reset whether or not a prior cycle
-      failed (``was_failing``): one failed reset plus an elapsed cooldown earns another attempt, not
-      a jump to the host rung.
+    * otherwise -> ``STAGE_SMI_RESET``: the hold's one mesh reset. Once it ran and failed, the gate
+      skips it for the rest of the episode and reports the failed rung, so the escalation above
+      climbs (spec 04 I84).
 
     ``galaxy_floor`` is None only when an operator opts out to the old reset-any-unhealthy behavior;
     then any off-bus chip resets. ``host_escalation``/``reboot_blocked`` are the caller's already-
@@ -1458,8 +1442,25 @@ class GalaxyRecovery(Recovery):
             # to start but one to ADOPT — _reset_and_verify_device waits that scope out
             # (await_foreign_scope) and verifies its result instead of issuing anything.
             ids_before = await self._offbus_ids_now(expected)
-            if stage == STAGE_SMI_RESET and ids_before and not await asyncio.to_thread(self.mechanism.scope_active):
-                failed = self.mechanism.failed_unchanged_entry("", "mesh_reset", ids_before)
+            hold_since = self.deps.device_hold_episode_since() or ""
+            if stage == STAGE_SMI_RESET and not await asyncio.to_thread(self.mechanism.scope_active):
+                failed = self.mechanism.failed_unchanged_entry("", "mesh_reset", ids_before) if ids_before else None
+                if failed is None and self.mechanism.mesh_reset_spent(hold_since):
+                    # Spec 04 I84: this hold's one mesh reset already ran and failed. The gate never runs a
+                    # second one in the episode; it reports the failed rung, so the routing below climbs to
+                    # the power cycle (whose last-chance sweep is the one re-run allowed) or hands off.
+                    log(
+                        f"gate/{gate_phase}: this hold's mesh reset already ran and failed — not repeating it"
+                    )
+                    health_event(
+                        "reset_rung_skipped_spent",
+                        rung="mesh_reset",
+                        path=f"gate/{gate_phase}",
+                        held_since=hold_since,
+                        off_bus=len(ids_before or ()),
+                    )
+                    metrics.stage_fired("smi_reset", "blocked")
+                    return OUTCOME_WAITING
                 if failed is not None:
                     # Spec 04 I58: this boot's mesh reset already failed on exactly these chips, in this
                     # process or before a broker restart. Never fire it again on that set: report it as
@@ -1476,11 +1477,11 @@ class GalaxyRecovery(Recovery):
                         rc=failed.get("rc"),
                     )
                     self.mechanism.last_reset_exit_nonzero = failed.get("rc") not in (None, 0)
-                    self.mechanism.mesh_reset_failed_since_release = True
+                    self.mechanism.mark_mesh_reset_failed()
                     metrics.stage_fired("smi_reset", "blocked")
                     return OUTCOME_WAITING
             recovered = await self._reset_and_verify_device(indices, log)
-            await self._note_mesh_reset_failed(recovered, "", ids_before, expected)
+            await self._note_mesh_reset_failed(recovered, hold_since, ids_before, expected)
             if not recovered:
                 return OUTCOME_WAITING
             self.deps.clear_device_reported_fault(f"gate/{gate_phase}: reset recovered the mesh")
@@ -1741,6 +1742,15 @@ class GalaxyRecovery(Recovery):
         gaps = "; ".join(blocker["gaps"]) or "no detail"
         return f"holder scan incomplete (source={blocker['source']}: {gaps})"
 
+    def _sweep_phase(self) -> Optional[tuple]:
+        """The hold phase a last-chance sweep counts for (spec 04 I84): (episode, at the 10-min bound).
+        None without an episode clock, where nothing can key a repeat."""
+        hold_since = self.deps.device_hold_episode_since()
+        if not hold_since:
+            return None
+        age = _hold_age_sec(hold_since)
+        return (hold_since, age is not None and age >= _stuck_hold_ceiling_sec())
+
     async def _issue_all_resets_back_to_back(self, trays: list, expected: int, log, *, do_sbr: bool = True) -> bool:
         """Fire EVERY reset type once, back-to-back, with no waiting or verifying between them: SBR on
         any chip still bridged, then the mesh-wide reset —
@@ -1867,6 +1877,25 @@ class GalaxyRecovery(Recovery):
                 expected=expected,
             )
             return False
+        sweep_phase = self._sweep_phase()
+        if (
+            sweep_phase is not None
+            and self.mechanism.sweep_spent == sweep_phase
+            and not await asyncio.to_thread(self.mechanism.scope_active)
+        ):
+            # Spec 04 I84: the full sweep already ran in this phase of the hold (below the 10-min bound,
+            # or as the bound's own ladder) and the mesh did not verify. Another would only repeat its
+            # mesh reset; the caller goes on to the power cycle.
+            log(f"last chance before the host rung{where}: the sweep already ran in full this hold phase — not repeating it")
+            health_event(
+                "last_chance_sweep_skipped",
+                context=context or gate_phase,
+                reason="sweep_spent",
+                at_bound=sweep_phase[1],
+                off_bus=len(offbus_chips),
+                expected=expected,
+            )
+            return False
         trays = _affected_trays(offbus_chips, expected, tray_map) or []
         placement = _offbus_placement(offbus_chips, self._chip_buses_now(), tray_map)
         swept = False
@@ -1917,6 +1946,7 @@ class GalaxyRecovery(Recovery):
                     "host_rung_held", context=context or gate_phase, reason="reset sweep skipped or incomplete"
                 )
                 return None
+            self.mechanism.sweep_spent = sweep_phase
             return False
         via = "last-chance-reset-sweep" if swept else "settle-before-host-rung"
         self.deps.clear_device_reported_fault(f"gate/{gate_phase}: mesh recovered before the host rung ({via})")
@@ -1999,15 +2029,14 @@ class GalaxyRecovery(Recovery):
         not the next job), so an idle box stops stranding on a hold no read-only check can lift. Called
         only from the relift's under-lock frozen/unreadable-eth branch, where a healthy enum+ARC pass has
         already proven every chip present, so a galaxy reset usually re-inits every eth core. An eth
-        wedge does not self-heal by waiting and the box is idle and tenant-refused, so the escalation
-        RETRIES on the grace cadence until the mesh recovers or the 10-min ceiling hands it to the host
-        rungs — a retry costs nothing, and a retry that drops the mesh off the bus flips the hold to
-        the off-bus ladder, which owns that failure mode.
+        wedge does not self-heal by waiting and the box is idle and tenant-refused, so the escalation runs
+        the hold's ONE mesh reset; once that has failed, every later escalation of the episode climbs
+        (the last-chance sweep once, then the power cycle) and never repeats it (spec 04 I84).
 
         Every guard fails closed: armed by opt-in only; a PRESENT mesh past the grace
         (``_stuck_hold_reset_due``, re-reading off-bus now under the lock); at least one grace window
-        since the last reset attempt (the pacing that keeps retries from stacking on a reset+verify
-        still settling); no reset already cycling in its own scope; and no foreign tenant (a scan we
+        since the last reset attempt (so it never stacks on a reset+verify still settling); no reset
+        already cycling in its own scope; and no foreign tenant (a scan we
         cannot fully read counts as a tenant, so the reset never lands under a job it merely could not
         see). A recovered mesh retires the fault and clears the hold exactly as the gate does."""
         # force = the hold-deadline backstop firing on a HELD (tenant-refused) box past the ceiling. It
@@ -2020,17 +2049,28 @@ class GalaxyRecovery(Recovery):
         beats = await asyncio.to_thread(self.deps.read_heartbeats)
         off_bus = offbus_count(beats, expected)
         hold_since = self.deps.device_hold_episode_since()
-        if not force and not _stuck_hold_reset_due(hold_since, off_bus=off_bus, measured_fault=measured_fault):
+        # Spec 04 I84: this hold's one mesh reset already ran and failed, so there is nothing to pace or
+        # wait out — the escalation climbs (sweep once, then the power cycle). Unforced, it climbs once
+        # per episode; a later try is the watchdog's (the I65 cooldown retry, the I76 bound).
+        spent = self.mechanism.mesh_reset_spent(hold_since)
+        if spent and not force and hold_since and self.mechanism.spent_climb_since == hold_since:
+            return False
+        if not force and not spent and not _stuck_hold_reset_due(hold_since, off_bus=off_bus, measured_fault=measured_fault):
             return False
         # Retry pacing, not a cap: the grace window between attempts replaces the failed-reset
         # cooldown here — that cooldown guards against repeat MMIO at a DEAD endpoint, but this mesh
         # is fully present (live endpoints), so the only thing to pace is the reset+verify cycle
         # itself.
         since_last_reset = time.monotonic() - self.mechanism.last_reset_monotonic
-        if not force and self.mechanism.last_reset_monotonic and since_last_reset < _present_mesh_reset_grace_sec():
+        if (
+            not force
+            and not spent
+            and self.mechanism.last_reset_monotonic
+            and since_last_reset < _present_mesh_reset_grace_sec()
+        ):
             log(
-                f"present-mesh escalation ran a reset {int(since_last_reset)}s ago — retrying on the "
-                f"{_present_mesh_reset_grace_sec()}s cadence until recovery or the ceiling"
+                f"present-mesh escalation: a reset ran {int(since_last_reset)}s ago — waiting the "
+                f"{_present_mesh_reset_grace_sec()}s grace before this hold's first reset"
             )
             metrics.stage_fired("smi_reset", "blocked")
             return False
@@ -2060,8 +2100,7 @@ class GalaxyRecovery(Recovery):
             off_bus=off_bus,
             measured_fault=measured_fault,
         )
-        # Still latched for visibility (the deadline watchdog journals it), but no longer a cap on
-        # this path: retries are paced by the grace window above.
+        # Latched for visibility (the deadline watchdog journals it); the one-reset rule (I84) is the cap.
         self.deps.set_device_hold_episode_escalated(True)
         # Baseline the off-bus count BEFORE the reset so the climb can tell a reset that regressed the
         # mesh (dropped more chips off the bus) from one that merely did not recover.
@@ -2074,11 +2113,18 @@ class GalaxyRecovery(Recovery):
             # finally ran. Go straight to the last-chance sweep, then the host climb (spec 04 I29).
             await self._sweep_after_unverified_reset(expected, off_bus_before, hold_since, log)
             return True
+        if spent:
+            self.mechanism.spent_climb_since = hold_since or None
+            log("this hold's mesh reset already ran and failed — not repeating it; climbing to the next rung")
+            health_event("reset_rung_skipped_spent", rung="mesh_reset", held_since=hold_since, off_bus=off_bus_before)
+            await self._climb_or_hand_off(
+                expected, off_bus_before, hold_since, log, present_reset_failed=off_bus_before == 0
+            )
+            return True
         ids_before = await self._offbus_ids_now(expected)
         if force and self.mechanism.rung_failed_unchanged(hold_since, "mesh_reset", ids_before):
-            # The deadline watchdog's window: this episode's mesh reset already failed on this same mesh.
-            # The grace-cadence retries above stay (a present mesh's retry is cheap before the ceiling),
-            # but a forced window takes the next stronger rung, never the same reset (spec 04 I36).
+            # The deadline watchdog's window: a mesh reset already failed on this same off-bus set this
+            # boot. A forced window takes the next stronger rung, never the same reset (spec 04 I36, I58).
             await self._climb_past_failed_rung(expected, ids_before, hold_since, log)
             return True
         recovered = await self._reset_and_verify_device(indices, log)
@@ -2094,10 +2140,10 @@ class GalaxyRecovery(Recovery):
             self.deps.clear_device_dirty(verified=True, why="idle escalation: galaxy reset recovered the mesh")
             return True
         # A reset that did not recover must climb, never sit. The failure mode that must not sit is a
-        # galaxy reset that dropped this present mesh to all-0xFFFFFFFF — a mass drop a host
-        # reboot/power cycle recovers and self-heal never will. Before the ceiling the climb defers
-        # the host rungs (journaled) and the grace cadence retries the reset; at the ceiling the
-        # climb hands the mesh to the gate's host rung, or to an operator when there is none (I36).
+        # galaxy reset that dropped this present mesh to all-0xFFFFFFFF — a mass drop a power cycle
+        # recovers and self-heal never will. The reset is now spent for the episode (I84), so the climb
+        # does not wait for the ceiling: the last-chance sweep once, then the power cycle, or an
+        # operator when there is none (I36).
         await self._climb_or_hand_off(
             expected, off_bus_before, hold_since, log, present_reset_failed=off_bus_before == 0
         )
@@ -2501,13 +2547,15 @@ class GalaxyRecovery(Recovery):
             await self._climb_to_host_recovery_after_failed_reset(expected, off_bus, log)
             return True
         ids_now = await self._offbus_ids_now(expected) if off_bus > 0 else None
-        if self.mechanism.rung_failed_unchanged(hold_since, "mesh_reset", ids_now):
+        spent = self.mechanism.mesh_reset_spent(hold_since)
+        if spent or self.mechanism.rung_failed_unchanged(hold_since, "mesh_reset", ids_now):
             # This episode already ran the ladder to its mesh reset and that reset failed on exactly the
             # chips off the bus now. Re-running it repeats a known failure (one Galaxy host fired six
             # identical 263 s resets in one hold, one per window): take the next stronger rung, whose
             # last-chance sweep still runs every reset once before a power cycle (I22), or hand the hold
-            # to an operator when no host rung is available (spec 04 I36).
-            await self._climb_past_failed_rung(expected, ids_now, hold_since, log)
+            # to an operator when no host rung is available (spec 04 I36). A reset that failed on another
+            # set in this hold is spent all the same: one mesh reset per episode (spec 04 I84).
+            await self._climb_past_failed_rung(expected, ids_now, hold_since, log, spent=spent)
             return True
         isolated_chips = self.deps.isolated_chips()
         device_pci_map = self.deps.device_pci_map()
@@ -2668,33 +2716,28 @@ class GalaxyRecovery(Recovery):
         if recovered is False and rc is not None:
             ids_after = await self._offbus_ids_now(expected)
             self.mechanism.note_rung_failed(hold_since, "mesh_reset", ids_before, ids_after, rc=rc)
-            # Chips came back but the mesh did not verify: another reset may finish the job (one Galaxy
-            # host's second reset healed a drop the first had half-fixed). Retry once, soon, rather than
-            # at the next ceiling window (spec 04 I39). With every chip back the wait buys nothing: the
-            # reset's own rescan and settle already ran, so the retry is due at once. A tt-smi glx_reset
-            # that started while a chip was removed from the kernel fails its 32-chip driver-load wait
-            # (rc 1) even though the rescan after it brings the chip back.
-            if ids_before and ids_after is not None and set(ids_after) < set(ids_before):
-                delay = 0 if not ids_after else _progress_retry_sec()
-                if self.mechanism.note_progress_retry(hold_since, delay):
-                    health_event(
-                        "mesh_reset_progress_retry_armed",
-                        held_since=hold_since,
-                        off_bus_before=len(ids_before),
-                        off_bus_after=len(ids_after),
-                        retry_in_sec=delay,
-                    )
 
-    async def _climb_past_failed_rung(self, expected: int, ids_now: set, hold_since: str, log) -> None:
-        """Skip a reset that already failed in this hold episode on the same off-bus set and take the
-        next stronger rung (spec 04 I36)."""
-        off_bus = len(ids_now)
-        log(
-            f"{off_bus}/{expected} off-bus and this hold's mesh reset already failed on exactly these chips — "
-            f"not repeating it; climbing to the next rung"
-        )
-        health_event("reset_rung_skipped_failed_unchanged", rung="mesh_reset", held_since=hold_since, off_bus=off_bus)
-        await self._climb_or_hand_off(expected, off_bus, hold_since, log)
+    async def _climb_past_failed_rung(
+        self, expected: int, ids_now: Optional[set], hold_since: str, log, *, spent: bool = False
+    ) -> None:
+        """Skip a reset that already failed in this hold episode — on the same off-bus set (spec 04 I36)
+        or at all (``spent``, I84) — and take the next stronger rung."""
+        off_bus = len(ids_now or ())
+        if spent:
+            log(
+                f"{off_bus}/{expected} off-bus and this hold's mesh reset already ran and failed — "
+                f"not repeating it; climbing to the next rung"
+            )
+            health_event("reset_rung_skipped_spent", rung="mesh_reset", held_since=hold_since, off_bus=off_bus)
+        else:
+            log(
+                f"{off_bus}/{expected} off-bus and this hold's mesh reset already failed on exactly these chips — "
+                f"not repeating it; climbing to the next rung"
+            )
+            health_event(
+                "reset_rung_skipped_failed_unchanged", rung="mesh_reset", held_since=hold_since, off_bus=off_bus
+            )
+        await self._climb_or_hand_off(expected, off_bus, hold_since, log, present_reset_failed=off_bus == 0)
 
     async def _climb_or_hand_off(
         self, expected: int, off_bus: Optional[int], hold_since: str, log, *, present_reset_failed: bool = False
@@ -2954,10 +2997,11 @@ class GalaxyRecovery(Recovery):
     ) -> str:
         """Climb an idle escalation whose galaxy reset failed to revive the mesh to the host rung — the
         power cycle, the only host rung (I71) — so a reset that did not recover does not sit.
-        Bounded below by the hold ceiling: the host rungs never fire before the episode has stood the
-        full ladder, however futile the gentler rungs proved — an early forced pass fires the cheap
-        rungs only, and the deadline watchdog re-runs the ladder at the ceiling where the climb is
-        then admitted. The exceptions are holds with no gentler rung left to try (spec 04 I38, I79).
+        Bounded below by the hold ceiling: the power cycle never fires before the episode has stood the
+        full ladder — an early forced pass fires the cheap rungs only, and the deadline watchdog runs
+        the ladder at the ceiling where the climb is then admitted. The exceptions are holds with no
+        gentler rung left to try (spec 04 I38, I79), which includes a hold whose one mesh reset already
+        ran and failed (I84).
 
         Fires ONLY for a mass drop. The galaxy reset can drop a present-but-eth-unverifiable mesh to
         all-0xFFFFFFFF, which a reboot/power cycle recovers and self-heal never does; a still-present or
@@ -3030,6 +3074,7 @@ class GalaxyRecovery(Recovery):
             hold_since, "mesh_reset", await self._offbus_ids_now(expected)
         )
         hold_age = _hold_age_sec(hold_since)
+        reset_spent = self.mechanism.mesh_reset_spent(hold_since)
         if failed_unchanged and hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
             log(
                 f"{off_bus}/{expected} off-bus and this hold's mesh reset already failed on exactly these "
@@ -3084,10 +3129,25 @@ class GalaxyRecovery(Recovery):
                 ceiling_sec=_stuck_hold_ceiling_sec(),
                 reason="reset_regressed_offbus",
             )
+        elif reset_spent and hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
+            # This hold's one mesh reset already ran and failed (spec 04 I84). Waiting for the ladder end
+            # used to mean more mesh resets on the ceiling windows; none may run, so the ceiling wait has
+            # nothing left to try. The last-chance sweep below still runs once before the power cycle.
+            log(
+                f"this {int(hold_age)}s-old hold's mesh reset already ran and failed — not waiting for the "
+                f"{_stuck_hold_ceiling_sec()}s ladder end"
+            )
+            health_event(
+                "host_rung_not_deferred",
+                held_since=hold_since,
+                held_age_sec=int(hold_age),
+                ceiling_sec=_stuck_hold_ceiling_sec(),
+                reason="mesh_reset_spent",
+            )
         elif hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
             log(
                 f"mesh unrecovered after the reset ladder but the hold is only {int(hold_age)}s "
-                f"old — the host rungs (reboot/power-cycle) wait for the "
+                f"old — the power cycle waits for the "
                 f"{_stuck_hold_ceiling_sec()}s ladder end; holding for the next forced window"
             )
             health_event(

@@ -565,10 +565,14 @@ class RecoveryMechanism:
         # The exit code of the last reset this process launched; None when it was refused, never
         # launched or timed out still cycling. Only a launched reset that failed is recorded.
         self.last_reset_rc: Optional[int] = None
-        # One early forced retry per hold episode after a failed mesh reset that brought chips back
-        # (spec 04 I39): (episode, monotonic due time), and the episode that already spent it.
-        self.progress_retry: Optional[tuple] = None
-        self.progress_retry_spent_since: str = ""
+        # The hold episode whose one mesh reset already ran and failed (set with
+        # mesh_reset_failed_since_release); None when unknown. No path runs another in it (spec 04 I84).
+        self.mesh_reset_failed_episode: Optional[str] = None
+        # (episode, at_bound) of the last full last-chance sweep that ran and did not verify: the sweep
+        # runs once below the 10-min bound and once as the bound's own ladder, never more (spec 04 I84).
+        self.sweep_spent: Optional[tuple] = None
+        # The episode whose unforced escalation already climbed past its spent mesh reset (I84).
+        self.spent_climb_since: Optional[str] = None
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a
@@ -737,26 +741,24 @@ class RecoveryMechanism:
             return entry
         return None
 
-    def note_progress_retry(self, hold_since: str, delay_sec: float) -> bool:
-        """Arm this episode's one early retry after a failed mesh reset whose off-bus set shrank (spec 04
-        I39). False when the episode has no clock or already spent its retry."""
-        if not hold_since or self.progress_retry_spent_since == hold_since:
-            return False
-        self.progress_retry = (hold_since, time.monotonic() + delay_sec)
-        return True
+    def mark_mesh_reset_failed(self) -> None:
+        """A mesh reset ran and left the mesh unhealthy in the open hold episode (spec 04 I37, I84)."""
+        self.mesh_reset_failed_since_release = True
+        self.mesh_reset_failed_episode = self._device_hold_episode_since() or None
 
-    def progress_retry_due(self, hold_since: str, now: Optional[float] = None) -> bool:
-        """True once this episode's armed early retry is due (spec 04 I39)."""
-        armed = self.progress_retry
-        if not hold_since or armed is None or armed[0] != hold_since:
+    def mesh_reset_spent(self, hold_since: str) -> bool:
+        """True once this hold episode's one mesh reset ran and failed: in this process, or in this boot's
+        record across a broker restart. No path fires the mesh reset again in the episode except the
+        last-chance sweep in front of the power cycle (spec 04 I84)."""
+        if self.mesh_reset_failed_since_release and (
+            not hold_since or self.mesh_reset_failed_episode in (None, hold_since)
+        ):
+            return True
+        if not hold_since:
             return False
-        return (time.monotonic() if now is None else now) >= armed[1]
-
-    def spend_progress_retry(self) -> None:
-        """The early retry started: it is spent for its episode and never re-armed in it."""
-        if self.progress_retry is not None:
-            self.progress_retry_spent_since = self.progress_retry[0]
-        self.progress_retry = None
+        return any(
+            e.get("rung") == "mesh_reset" and e.get("episode") == hold_since for e in self._reset_record()["failed"]
+        )
 
     def rung_failed_unchanged(self, hold_since: str, rung: str, off_now) -> bool:
         """True when ``rung`` already failed this boot on exactly the off-bus set seen now: no path
