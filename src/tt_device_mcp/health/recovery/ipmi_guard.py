@@ -3,11 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Spec 04 I91: a broker mesh reset never sends the BMC's legacy retimer reset.
 
-tt-smi's Galaxy tray reset re-powers the trays with ``ipmitool raw 0x30 0x8B <ubb> <dev> 0x3 <t>``
-and, on ANY failure of that call, sends it again with op_mode ``0x0``. op_mode 0x0 also asserts the
-PCIe retimer reset, which can take every device behind the retimers off the bus, NVMe drives
-included. tt-smi has no switch for the fallback, so every mesh reset the broker launches runs in a
-private mount namespace where ``ipmitool`` is this guard.
+tt-smi's Galaxy tray reset re-powers the trays with the BMC's UBB reset (``ipmitool raw``, OEM
+netfn 0x30, UBB reset cmd 0x8B, op_mode 0x3) and, on ANY failure of that call, sends it again with
+op_mode ``0x0``. op_mode 0x0 also asserts the PCIe retimer reset, which can take every device
+behind the retimers off the bus, NVMe drives included. tt-smi has no switch for the fallback, so
+every mesh reset the broker launches runs in a private mount namespace where ``ipmitool`` is this
+guard.
 
 Stdlib only, because this one file plays three roles:
 
@@ -73,9 +74,9 @@ def _ipmi_byte(token: str) -> Optional[int]:
 def refusal(args: list[str]) -> Optional[str]:
     """Why the guard refuses ``ipmitool <args>``, or None when the real binary may run it.
 
-    Refused: ``raw 0x30 0x8B`` (netfn OEM, the UBB reset) whose op_mode byte (the 5th after ``raw``)
-    is zero in any format or cannot be read, and ``exec`` / ``shell``, which read commands the guard
-    cannot see."""
+    Refused: the UBB reset (``raw`` with OEM netfn 0x30, UBB reset cmd 0x8B) whose op_mode byte
+    (the 5th after ``raw``) is zero in any format or cannot be read, and ``exec`` / ``shell``,
+    which read commands the guard cannot see."""
     low = [str(a).strip().lower() for a in args]
     for verb in ("exec", "shell"):
         if verb in low:
@@ -88,17 +89,21 @@ def refusal(args: list[str]) -> Optional[str]:
             continue
         op = _ipmi_byte(rest[4]) if len(rest) > 4 else None
         if op is None:
-            return "raw 0x30 0x8B with no readable op_mode byte (it may be the legacy retimer reset 0x0)"
+            return (
+                "BMC UBB reset (netfn 0x30, UBB reset cmd 0x8B) with no readable op_mode byte "
+                "(it may be the legacy retimer reset 0x0)"
+            )
         if op == 0:
             return (
-                "raw 0x30 0x8B op_mode 0x0 is the legacy retimer reset: it asserts the PCIe retimer "
-                "reset and can drop every device behind it, NVMe drives included"
+                "BMC UBB reset (netfn 0x30, UBB reset cmd 0x8B) op_mode 0x0 is the legacy retimer "
+                "reset: it asserts the PCIe retimer reset and can drop every device behind it, "
+                "NVMe drives included"
             )
     return None
 
 
 def is_mesh_reset(argv: list[str]) -> bool:
-    """Whether ``argv`` is a tt-smi Galaxy tray reset, the only tt-smi path that sends 0x30 0x8B."""
+    """Whether ``argv`` is a tt-smi Galaxy tray reset, the only tt-smi path that sends the BMC UBB reset."""
     if not argv or os.path.basename(str(argv[0])) != "tt-smi":
         return False
     return any(str(a).startswith(_MESH_FLAG_PREFIXES) for a in argv[1:])
@@ -141,7 +146,7 @@ def _run_mc_info(timeout: float) -> subprocess.CompletedProcess:
 
 
 def bmc_preflight(run: Optional[Callable[[float], subprocess.CompletedProcess]] = None) -> str:
-    """"" when the BMC answers ``mc info`` within BMC_PREFLIGHT_TIMEOUT_SEC and its firmware is not
+    """ "" when the BMC answers ``mc info`` within BMC_PREFLIGHT_TIMEOUT_SEC and its firmware is not
     provably older than 0.05.22; otherwise why the mesh reset must not run. Read-only."""
     run = run or _run_mc_info
     try:
@@ -177,7 +182,9 @@ def firmware_too_old(mc_info: str) -> str:
         return ""
     patch = int(aux.group(1), 16)
     if patch < MIN_BMC_AUX_PATCH:
-        return f"BMC firmware 0.05 with aux revision 0x{patch:02x} is older than 0.05.22 and has no op_mode 0x3 tray reset"
+        return (
+            f"BMC firmware 0.05 with aux revision 0x{patch:02x} is older than 0.05.22 and has no op_mode 0x3 tray reset"
+        )
     return ""
 
 
@@ -218,7 +225,9 @@ def guard_source() -> str:
     return f"#!{sys.executable} -I\n{GUARD_TAG}\n{body}"
 
 
-def arm(guard_dir: str = GUARD_DIR, targets: Optional[list[str]] = None, mount: Callable[..., None] = _mount) -> list[str]:
+def arm(
+    guard_dir: str = GUARD_DIR, targets: Optional[list[str]] = None, mount: Callable[..., None] = _mount
+) -> list[str]:
     """Mount the guard over every ipmitool target; returns the targets. Raises GuardNotArmed."""
     if targets is None:
         try:
