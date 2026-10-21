@@ -448,6 +448,9 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     from tt_device_mcp.health import chip_state
 
     chip_state.reset()
+    # The dead-chip valve's per-chip strikes: a strike left by an earlier test on the same worker
+    # marks a chip lost on its first all-ones sample in the next one.
+    monkeypatch.setattr(srv.sampler, "dead_chip_strikes", {})
     monkeypatch.setattr(srv, "_last_offbus_state", {})
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)

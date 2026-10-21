@@ -121,6 +121,7 @@ from tt_device_mcp.health.recovery import select_recovery as _select_recovery  #
 from tt_device_mcp.health.recovery.base import (
     HOLD_ESCALATION_REARM_SEC,
     RESET_COOLDOWN_SEC,
+    RESET_SCOPE_PREFIX,
     RecoveryMechanism,
     host_action_pending_sec,
     mesh_hold_repage_sec,
@@ -234,6 +235,8 @@ __all__ = [
     "RESET_MODE_TARGET",
     "HOLD_ESCALATION_REARM_SEC",
     "RESET_COOLDOWN_SEC",
+    # the reset's own systemd scope prefix: the in-flight reader cut never kills it (spec 03 I83)
+    "RESET_SCOPE_PREFIX",
     "_declared_reset_mode",
     # how often a standing hardware-fault hold is paged again (spec 03 I42)
     "mesh_hold_repage_sec",

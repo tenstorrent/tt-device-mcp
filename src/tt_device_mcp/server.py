@@ -112,6 +112,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     RESET_COOLDOWN_SEC,
     RESET_MODE_GALAXY,
     RESET_MODE_TARGET,
+    RESET_SCOPE_PREFIX,
     SAMPLE_INTERVAL_SEC,
     SAMPLE_RING_SIZE,
     UBB_CHIP_COUNT,
@@ -179,7 +180,6 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
-from tt_device_mcp.health.recovery.base import RESET_SCOPE_PREFIX
 from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
