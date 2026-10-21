@@ -16,12 +16,17 @@ waitpid form, so it can.
 It may need CAP_NET_ADMIN, depending on the kernel (6.8 allows it unprivileged; the root broker
 has it either way). When it cannot subscribe, misses events (receive buffer overflow), or the tree
 cannot be read, the verdict is "not proven clean", which the caller treats as a killed job.
+A busy host reports thousands of events a second, which fill an unprivileged receive buffer in
+well under 0.1 s, so a reader thread drains the socket as events arrive rather than on the
+caller's poll.
 """
 
 import errno
 import os
+import select
 import socket
 import struct
+import threading
 from typing import Dict, Iterable, Optional, Set, Tuple
 
 NETLINK_CONNECTOR = 11
@@ -112,6 +117,9 @@ class ExitWitness:
         self.exits: Dict[int, int] = {}  # tgid -> wait status of its leader's exit
         self.signalled: Set[int] = set()
         self._sock: Optional[socket.socket] = None
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._reader: Optional[threading.Thread] = None
         try:
             sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, NETLINK_CONNECTOR)
         except OSError as e:
@@ -139,15 +147,31 @@ class ExitWitness:
             return
         self.tree = tree
         self.ok = True
+        self._reader = threading.Thread(target=self._read, name="exit-witness", daemon=True)
+        self._reader.start()
+
+    def _read(self) -> None:
+        """Drain the socket as events arrive, until close() or the witness is void."""
+        while not self._stop.is_set():
+            sock = self._sock
+            if sock is None or not self.ok:
+                return
+            try:
+                ready, _, _ = select.select([sock], [], [], 0.05)
+            except (OSError, ValueError):
+                return
+            if ready:
+                self.drain()
 
     def drain(self) -> None:
         """Read every queued event. A lost event (buffer overflow) or any other failure voids
         the witness, so the caller treats the job as killed."""
-        try:
-            self._drain()
-        except Exception as e:  # noqa: BLE001 - a broken witness must not stop the kill
-            self.ok = False
-            self.why = f"process events failed ({e!r})"
+        with self._lock:
+            try:
+                self._drain()
+            except Exception as e:  # noqa: BLE001 - a broken witness must not stop the kill
+                self.ok = False
+                self.why = f"process events failed ({e!r})"
 
     def _drain(self) -> None:
         while self.ok and self._sock is not None:
@@ -174,6 +198,10 @@ class ExitWitness:
 
     def clean(self) -> bool:
         """True only if every process of the tree was seen to exit, none of them by a signal."""
+        with self._lock:
+            return self._clean()
+
+    def _clean(self) -> bool:
         self.drain()
         if not self.ok:
             return False
@@ -191,6 +219,10 @@ class ExitWitness:
         process other than the broker's job shell (the process group leader) exited, every such
         process exited 0, and the shell exited 0 or 143 (its TERM trap, which says nothing of the
         job). None when the witness cannot say; else a non-zero status of the job."""
+        with self._lock:
+            return self._exit_status()
+
+    def _exit_status(self) -> Optional[int]:
         if not self.clean():
             return None
         own = {tgid: status >> 8 for tgid, status in self.exits.items() if tgid != self.pgid}
@@ -205,10 +237,14 @@ class ExitWitness:
     def close(self) -> None:
         """Unsubscribe, then close. The kernel counts listeners and only IGNORE lowers the
         count; closing the socket alone leaves the host's connector reporting to nobody."""
-        if self._sock is not None:
-            try:
-                _send_op(self._sock, PROC_CN_MCAST_IGNORE)
-            except OSError:
-                pass
-            self._sock.close()
-            self._sock = None
+        self._stop.set()
+        if self._reader is not None and self._reader is not threading.current_thread():
+            self._reader.join(timeout=1)
+        with self._lock:
+            if self._sock is not None:
+                try:
+                    _send_op(self._sock, PROC_CN_MCAST_IGNORE)
+                except OSError:
+                    pass
+                self._sock.close()
+                self._sock = None

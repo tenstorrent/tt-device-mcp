@@ -22,6 +22,7 @@ import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -872,6 +873,7 @@ class _Sock:
 def _fed(tree, *bufs, error=None):
     w = ExitWitness.__new__(ExitWitness)
     w.ok, w.why, w.tree, w.exits, w.signalled = True, "", set(tree), {}, set()
+    w._lock, w._stop, w._reader = threading.RLock(), threading.Event(), None
     w._sock = _Sock(*bufs, error=error)
     return w
 
@@ -1029,6 +1031,36 @@ def test_the_witness_on_a_real_tree():
             if p.poll() is None:
                 p.kill()
                 p.wait()
+
+
+def test_the_witness_keeps_up_with_a_busy_host_between_polls():
+    """A burst of process events larger than the receive buffer while the caller does not poll
+    (an unprivileged socket holds a few hundred) must not void the witness: a reader thread
+    drains it as events arrive."""
+    p = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        w = ExitWitness(p.pid, None)
+        if not w.ok:
+            pytest.skip(f"no process events here: {w.why}")
+        try:
+            for _ in range(400):
+                subprocess.run(["true"], check=True)
+            time.sleep(0.5)
+            assert w.ok, w.why
+            p.terminate()
+            p.wait(timeout=10)
+            deadline = time.monotonic() + 2
+            while p.pid not in w.exits and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert w.ok, w.why
+            assert w.clean() is False and "signal" in w.why, "sleep dies from SIGTERM"
+        finally:
+            w.close()
+        assert w._sock is None and not w._reader.is_alive()
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
 
 
 _HANDLES_TERM = "import signal, sys, time; signal.signal(signal.SIGTERM, lambda *a: sys.exit({rc})); time.sleep(30)"
