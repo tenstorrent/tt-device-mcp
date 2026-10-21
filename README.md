@@ -74,10 +74,13 @@ the job has one minute to see the waiter and end itself; the broker sends it no
 signal in that minute. The minute starts at the later of x and the waiting job's
 arrival. If a job is still waiting when the minute runs out, the broker kills the
 job's whole process tree (SIGTERM, then SIGKILL at most 10 s later). The job ends
-`preempted`, and the device is reset and passes the full health check, fabric
-included, before the waiting job starts. If every waiting job leaves inside the
-minute, nothing happens and a later one starts a fresh minute. A job that queues
-before x waits until x.
+`preempted`. If every process of the job exits through its own code on SIGTERM
+(the broker reads this from the kernel's exit records, which needs root), the usual
+fast between-jobs check runs. Otherwise (SIGKILL needed, any process killed by a
+signal, or the exits could not be witnessed) the device is reset and passes the full
+health check, fabric included, before the waiting job starts. If every waiting job
+leaves inside the minute, nothing happens and a later one starts a fresh minute. A job
+that queues before x waits until x.
 
 Status (`tt-device-mcp status`, the job's status, `/health`) shows the job as
 `PREEMPTABLE <x>min` while it runs, and `PREEMPTING <s>s`, the seconds left before

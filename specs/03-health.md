@@ -962,11 +962,16 @@ cooldown (spec 04 I65) holds longer.
 - **I69 — A job the broker stopped mid-run is followed by a reset, then the full check.** A job
   that hit its timeout, one the hung reaper stopped (HUNG), or a running job stopped by a requested
   kill (`tt_device_job_kill`, the REST kill, or a `tt_device_job_run` whose client went away, spec
-  01 I66), owes the mesh one reset. So does every preemption (spec 01 I20): a preempted job had
-  its grace minute and did not end itself, so `_preempt_kill` ended its tree by force (SIGTERM,
-  then SIGKILL at most `PREEMPT_KILL_GRACE_SEC` later), whatever its exit status. That is a
+  01 I66), owes the mesh one reset. So does a preemption (spec 01 I20) that `_preempt_kill`
+  ended by force: a preempted job had its grace minute and did not end itself, and its tree was
+  signalled (SIGTERM, then SIGKILL at most `PREEMPT_KILL_GRACE_SEC` later). That is a
   broker-side timeout like any other (`preempt_forced_job_ids`, read and dropped at the job's
-  end). A job that ends itself inside the minute is not preempted and owes none. A kill mid-run is how a mesh is left wedged mid-collective, and
+  end), whatever its exit status, unless the kernel's exit records witnessed every process of
+  the tree exit through its own code on SIGTERM, with no SIGKILL (`Job.preempt_clean`, spec 01
+  I20): nothing was cut mid-flight, the mark is dropped, and only the fast post-job check runs
+  (a failed one holds the device for the bounded recovery). A SIGKILL, any signal death or an
+  unwitnessed exit (a re-adopted job is never witnessed) keeps the debt. A job that ends itself
+  inside the minute is not preempted and owes none. A kill mid-run is how a mesh is left wedged mid-collective, and
   a fabric pass that happens to pass does not clear what it cannot see. Every submit path (MCP,
   REST `tt_device_job_run_bg`, the CLI) runs through the same runner, so each owes it the same way.
   The runner records the debt when the job ends, and `_monitor_readopted_scope` records it for a
@@ -1007,7 +1012,9 @@ cooldown (spec 04 I65) holds longer.
   `PREEMPT_KILL_GRACE_SEC`, 10 s, later), then one reset, then the full check; the waiter is
   dispatched at most 10 s later than when the SIGKILL landed at the minute's end, and a job that
   ends itself inside the minute frees the device with the ordinary post-job gate, sooner than
-  any kill. The door payment's move adds no
+  any kill. A preemption witnessed to end cleanly on SIGTERM (spec 01 I20) skips the reset and
+  the full check: the waiter starts after the fast check, about 45-105 s sooner on a Galaxy;
+  a killed one is unchanged. The door payment's move adds no
   wait: the foreign-holder and external-step waits it now follows already ran before the job's
   gate, with their own bounds.
 - **I57 — An incident bundle never presents another pass's fabric transcript as its own.** The
@@ -1879,7 +1886,7 @@ refuses.
 | I69 (HUNG, runner and REST run-bg timeouts, and a re-adopted job's timeout or requested kill each owe the reset; the re-adopted path leaves no requested-kill id) | `tests/test_job_kill_reset.py::test_a_hung_job_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_runner_timeout_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_rest_run_bg_timeout_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_readopted_job_past_its_timeout_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_requested_kill_of_a_readopted_job_owes_the_reset_and_leaves_no_id` |
 | I69 (a debt open at the next job is paid by the post-job gate before its door, the job still QUEUED) | `tests/test_job_kill_reset.py::test_the_runner_pays_an_owed_debt_before_a_queued_job` |
 | I69 (every broker kill logs one KILLED process-tree line) | `tests/test_job_kill_reset.py::test_a_broker_kill_logs_the_process_tree_it_stopped`, `tests/test_job_kill_reset.py::test_a_preempt_kill_that_outlives_sigterm_logs_the_process_tree`, `tests/test_job_kill_reset.py::test_a_reset_that_stops_a_readopted_job_logs_the_process_tree` |
-| I69 (every preemption kill owes the reset and its job's own post-job gate pays it, reset then full check, before the waiting job's door; a job that ends itself inside its minute is not preempted; the re-adopted path too, leaving no id) | `tests/test_job_kill_reset.py::test_every_preemption_kill_owes_the_reset`, `tests/test_preemptable.py::test_a_job_that_ends_itself_inside_the_minute_is_a_normal_end`, `tests/test_job_kill_reset.py::test_a_preemption_owes_and_pays_the_reset_before_the_next_job`, `tests/test_job_kill_reset.py::test_a_preemption_debt_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_preempted_readopted_job_owes_the_reset` |
+| I69 (every preemption kill owes the reset unless every process was witnessed to exit by its own code on SIGTERM, which takes the fast check and its job's own post-job gate pays it, reset then full check, before the waiting job's door; a job that ends itself inside its minute is not preempted; the re-adopted path too, leaving no id) | `tests/test_job_kill_reset.py::test_every_preemption_kill_owes_the_reset`, `tests/test_preemptable.py::test_a_job_that_ends_itself_inside_the_minute_is_a_normal_end`, `tests/test_job_kill_reset.py::test_a_preemption_owes_and_pays_the_reset_before_the_next_job`, `tests/test_job_kill_reset.py::test_a_preemption_debt_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_preempted_readopted_job_owes_the_reset`, `tests/test_preemptable.py::test_a_preempted_job_that_ends_cleanly_on_sigterm_takes_the_fast_check`, `tests/test_preemptable.py::test_a_preempted_job_with_a_signal_death_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_a_preempted_job_that_needed_sigkill_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_an_unwitnessed_preemption_is_reset_and_fully_checked` |
 | I69 (the door payment waits out an external step's reservation) | `tests/test_job_kill_reset.py::test_the_door_payment_waits_out_an_external_step` |
 | I69 (a reaped leftover skips before the debt: no reset, debt kept, no wait; a reboot drops it and the startup full check runs; a cooldown skips and clears it with no wait) | `tests/test_job_kill_reset.py::test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait`, `tests/test_job_kill_reset.py::test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait` |
 | I75 | `tests/test_device_safety.py::test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_gate_not_reset`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_next_tick`, `tests/test_device_safety.py::test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladder`, `tests/test_device_safety.py::test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate` |
