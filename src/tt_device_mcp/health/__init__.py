@@ -98,6 +98,7 @@ from tt_device_mcp.health.monitors.pci import (
 # server.py's release funnel and the gate read it to hold fabric-unverified until a pass settles it.
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
+    BELOW_FLOOR,
     BLOCKED,
     DEFER,
     HOLD_FABRIC_UNVERIFIED,
@@ -143,7 +144,6 @@ from tt_device_mcp.health.recovery.galaxy import (
     _reboot_min_dead_chips,
     _stuck_hold_ceiling_sec,
     _ubb_bus_id_tables,
-    _ubb_reset_enabled,
 )
 from tt_device_mcp.health.recovery.pcie_guard import pcie_guard_at_start
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
@@ -246,6 +246,7 @@ __all__ = [
     "DEFER",
     "RELEASE",
     "HOLD_FABRIC_UNVERIFIED",
+    "BELOW_FLOOR",
     "BLOCKED",
     # Galaxy escalation ladder: the thresholds and vocabulary the gate reads around the router's
     # decisions
@@ -257,7 +258,6 @@ __all__ = [
     "_present_mesh_reset_grace_sec",
     "_reboot_min_dead_chips",
     "_stuck_hold_ceiling_sec",
-    "_ubb_reset_enabled",
     "bridge_reset_enabled",
     "bridge_reset_unavailable_reason",
     "gone_chip_bridge_reset_enabled",

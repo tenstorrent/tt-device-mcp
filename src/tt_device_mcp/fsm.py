@@ -409,6 +409,8 @@ class ServerFsm:
         self._crossed_boot = bool(file_boot_id) and bool(self._boot_id) and not same_boot
         self._loaded_same_boot = same_boot
         self._record = record
+        # A latch an older broker wrote for the removed BMC tray re-power rung means nothing now.
+        latches.pop("ubb_reset_fired", None)
         self._latches = latches
 
     def _persist(self) -> None:
@@ -623,7 +625,7 @@ class ServerFsm:
         back, spec 03 I52). That is right within one boot, where
         the ladder that took it there ran on this silicon; a reboot since is itself the biggest reset
         the ladder has, so a carried DOWN is a verdict about a boot that is gone. Only when the record
-        was loaded from another boot and is still DOWN: ``why`` and ``ubb_reset_fired`` stay, ``since``
+        was loaded from another boot and is still DOWN: ``why`` stays, ``since``
         starts over (the bound counts from this boot), ``dirty`` clears (the caller has just placed a
         no-reset hold) and the ``escalated`` latch drops so this boot's ladder is not pre-spent.
         Returns whether it reopened."""

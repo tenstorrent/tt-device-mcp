@@ -35,12 +35,12 @@ from tt_device_mcp.health.recovery import (
     OUTCOME_RECOVERED,
     OUTCOME_TERMINAL,
     OUTCOME_WAITING,
+    BELOW_FLOOR,
     RELEASE,
     STAGE_BRIDGE_RESET,
     STAGE_HOST_REBOOT,
     STAGE_POWER_CYCLE,
     STAGE_SMI_RESET,
-    STAGE_UBB_TRAY,
     WAIT,
     Evidence,
     Recovery,
@@ -56,7 +56,6 @@ from tt_device_mcp.health.recovery.base import (
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
-from tt_device_mcp.health.recovery.stages.ubb_tray import BmcIpmiError, _fire_ubb_reset, _ubb_reset_argv
 
 _logger = logging.getLogger("tt-device-mcp")
 
@@ -214,46 +213,6 @@ def _post_reboot_verify_enabled() -> bool:
     box dead instead of climbing. The actual power cycle stays behind AUTO_POWER_CYCLE regardless
     of this switch: off, or with no power cycle opted in, it emits the loud event and holds."""
     return os.environ.get("TT_DEVICE_MCP_POST_REBOOT_VERIFY", "1").strip() != "0"
-
-
-def _ubb_reset_enabled() -> bool:
-    """Whether the broker may FIRE the per-tray BMC reset itself on a below-floor tray-down, rather than
-    only NAMING the command and holding. ON by default, with a knob to force it off.
-
-    A tray reset aims at one 8-chip tray, so it is the lightest rung
-    that fits the failure that took the incident box down: a whole tray off the bus, below the
-    galaxy-reset floor, which the mesh-wide reset inverts to an all-off-bus mesh and a warm reboot cannot
-    re-enumerate. Without it that drop HOLDS forever — the mesh reset is suppressed below the floor — and
-    that indefinite hold is the failure this rung exists to end. It is NOT isolated: one tray's pulse has
-    dropped every other tray within seconds, so the envelope waits for every chip on the box to be idle
-    and re-checks the other trays' chips after the pulse (spec 04 I23). The bit order and
-    re-enumeration handshake are hardware-confirmed. An operator whose BMC the broker has not confirmed forces the rung off with
-    TT_DEVICE_MCP_AUTO_UBB_RESET=0, back to naming the command and holding.
-
-    Armed also means fireable (I14, I17): the re-power goes out as `ipmitool raw` to the local
-    BMC, so a host with no reachable BMC reports the rung OFF rather than choosing it and raising.
-
-    A re-power that took chips on other trays off the bus (``ubb_reset_regressed_offbus``) declines the
-    walk and the back-to-back sweep's tray re-power on this host for ``TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS``
-    (:func:`pcie_guard.disable_tray_rung`, kept across broker restarts and reboots, re-armed by
-    :func:`pcie_guard.clear_tray_rung_cmd`); it leaves this switch as it is.
-    """
-    if os.environ.get("TT_DEVICE_MCP_AUTO_UBB_RESET", "1").strip() == "0":
-        return False
-    return privileges.can_ipmi()
-
-
-def _ubb_single_tray_walk_enabled() -> bool:
-    """Whether the verify-between walk may re-power a tray when the whole below-floor drop sits on that
-    one tray. OFF by default; ``TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1`` turns it back on.
-
-    A single-tray re-power is not isolated on a Galaxy: the BMC pulse has taken the other trays off the
-    bus with it (measured: one chip off tray 3 on a 32/32 box, tray 3 re-powered, 24 chips off the bus
-    40 s later). A drop that small self-heals or is cleared by the whole-box host rung, so the walk
-    holds for those instead of re-powering. It also turns back on the walk of a drop that holds a whole
-    tray, which otherwise goes straight to the bounded power cycle. The tray-down-no-window sweep, which
-    ends in the power cycle anyway, is not affected."""
-    return os.environ.get("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "0").strip() == "1"
 
 
 def _stuck_hold_ceiling_sec() -> int:
@@ -693,11 +652,6 @@ def _route(
     * anything short holds (``WAIT``). The gate applies its no-tenant and rate-limit guards on top
       before acting; this only names the rung the ladder selects.
 
-    ``last_action == STAGE_UBB_TRAY and last_action_recovered is False`` -> ``WAIT``: the per-tray
-    BMC reset ran and did not clear the drop (or found no tray-down to fire on); a warm reboot
-    cannot revive a still-off-bus tray either, so the mesh holds for the cold rung, never climbs to
-    the galaxy reset the floor already suppressed.
-
     Anything else — ``last_action is None`` (nothing ran yet this pass), or ``STAGE_BRIDGE_RESET``
     that ran and did NOT recover (falls through to the same floor check a fresh pass would reach) —
     runs the pre-action ladder:
@@ -725,10 +679,11 @@ def _route(
       (spec 03 I55). ``eth_timeout_reset_due`` takes the same rung: a clean post-job eth read timed
       out with no verdict on a present mesh (spec 03 I61), and so does ``kill_reset_due``: a job the
       broker stopped mid-run, by its timeout or a requested kill (spec 03 I69).
-    * below the galaxy floor with nothing to surgically reset -> ``STAGE_UBB_TRAY``: the per-tray
-      BMC reset is the next-gentlest rung the gate always attempts before holding — a single/
-      few-chip wedge self-heals otherwise, and a galaxy reset there is the measured
-      all-chip drop. The floor is keyed on every WEDGED chip (``off_bus + frozen_chips``), not the
+    * below the galaxy floor with nothing to surgically reset -> ``BELOW_FLOOR``: not a rung. The
+      gate classifies the drop — a whole tray off the bus goes straight to the bounded power cycle
+      (spec 04 I37), anything else holds for the 10-min bound's full ladder (I76) — because a
+      single/few-chip wedge self-heals otherwise, and a galaxy reset there is the measured
+      all-chip drop. There is no BMC tray re-power rung (spec 04 I16). The floor is keyed on every WEDGED chip (``off_bus + frozen_chips``), not the
       off-bus count alone — an all-present, all-ARC-frozen mesh has nothing off the bus to invert,
       so a reset is the only remedy, and counted by off-bus alone it would read as 0 and hold below
       the floor forever. This is the branch that must NOT climb to a mesh-wide reset over a
@@ -755,8 +710,6 @@ def _route(
         ):
             return _HOST_ESCALATION_STAGE.get(host_escalation, host_escalation)
         return WAIT
-    if last_action == STAGE_UBB_TRAY and last_action_recovered is False:
-        return WAIT
     if healthy and not fault_reported:
         if fabric_ok is None and (dirty or holding_fabric_unverified or (fabric_forced and expected > 1)):
             return HOLD_FABRIC_UNVERIFIED
@@ -772,7 +725,7 @@ def _route(
     if (dispatch_reset_due or eth_timeout_reset_due or kill_reset_due) and off_bus == 0 and frozen_chips == 0:
         return STAGE_SMI_RESET
     if galaxy_floor is not None and off_bus + frozen_chips < galaxy_floor:
-        return STAGE_UBB_TRAY
+        return BELOW_FLOOR
     return STAGE_SMI_RESET
 
 

@@ -69,7 +69,6 @@ from tt_device_mcp.constants import (
     STAGE_HOST_REBOOT,
     STAGE_POWER_CYCLE,
     STAGE_SMI_RESET,
-    STAGE_UBB_TRAY,
     STATS_UPDATE_SEC,
 )
 from tt_device_mcp.constants import step_deadline_sec as _shared_step_deadline_sec
@@ -92,6 +91,7 @@ from tt_device_mcp.device_holders import (
 from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec, add_close_listener
 from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 I72)
     _HOST_ESCALATION_ACTION,
+    BELOW_FLOOR,
     BLOCKED,
     CEILING,
     DEFER,
@@ -125,7 +125,6 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     _run_pre_power_cycle_hook,
     _stuck_hold_ceiling_sec,
     _ubb_bus_id_tables,
-    _ubb_reset_enabled,
     aer_totals,
     append_trace,
     arc_not_ready_chips,
@@ -976,11 +975,9 @@ device_hold_episode_reason: str = ""
 # Spec 03 I55: the present-mesh reset a dispatch failure on a green fabric earns ran this hold
 # episode. Cleared when the episode ends; in-process, so a broker restart grants one more.
 _dispatch_reset_spent: bool = False
-# The per-tray BMC reset's once-per-episode limit and the idle escalation's ran-at-all marker live
-# as named latches on ``fsm`` (see RecoveryDeps below): ``fsm.latch("escalated")`` (visibility for
-# the deadline watchdog — the present-mesh escalation itself retries on the grace cadence) and
-# ``fsm.latch("ubb_reset_fired")`` (a hard cap — a tray walk that did not recover must not loop),
-# re-armed whenever ``fsm`` opens a fresh episode.
+# The idle escalation's ran-at-all marker lives as a named latch on ``fsm`` (see RecoveryDeps
+# below): ``fsm.latch("escalated")`` (visibility for the deadline watchdog — the present-mesh
+# escalation itself retries on the grace cadence), re-armed whenever ``fsm`` opens a fresh episode.
 
 # When the escalation latch was set (monotonic, process-local exactly as the ladder needs it: a
 # restart is a fresh chance to climb, never a reason to stay blocked). 0.0 = not latched.
@@ -1103,8 +1100,6 @@ _recovery_deps = RecoveryDeps(
     device_hold_episode_escalated=lambda: fsm.latch("escalated"),
     hold_escalation_latched=lambda: _hold_escalation_latched(),
     set_device_hold_episode_escalated=_set_hold_escalated,
-    device_hold_episode_ubb_reset_fired=lambda: fsm.latch("ubb_reset_fired"),
-    set_device_hold_episode_ubb_reset_fired=lambda v: fsm.set_latch("ubb_reset_fired", v),
     clear_device_reported_fault=lambda why: _clear_device_reported_fault(why),
     clear_device_dirty=lambda **kw: _clear_device_dirty(**kw),
     device_degraded=lambda: _recovery_degraded(),
@@ -1144,8 +1139,8 @@ _recovery_deps = RecoveryDeps(
 # cooldown each already carries by the next call (see ServerFsm.boot's own docstring). The module
 # names below are aliases onto the root's members, kept because they are this module's test seams:
 # tests monkeypatch srv.galaxy_recovery/srv.per_target_recovery/srv.recovery_mechanism by name,
-# and the gate reaches galaxy_recovery's Galaxy-only rungs (the per-tray UBB reset, the host
-# reboot/power-cycle escalation, the post-reboot verify) through the alias directly.
+# and the gate reaches galaxy_recovery's Galaxy-only rungs (the below-floor tray-down handling, the
+# host reboot/power-cycle escalation, the post-reboot verify) through the alias directly.
 health_monitor: "Optional[HealthMonitor]" = None  # noqa: F821
 recovery_mechanism: "Optional[RecoveryMechanism]" = None  # noqa: F821
 galaxy_recovery: "Optional[GalaxyRecovery]" = None  # noqa: F821
@@ -3925,14 +3920,6 @@ def _no_reboot_privilege() -> str:
     return "no systemd — there is no systemctl to reboot through"
 
 
-def _no_tray_platform() -> str:
-    """Why the tray rung has no platform here, or "" when it might. Only a host boot committed to
-    per-target lacks trays: an unresolved one may be the degraded Galaxy this rung exists for."""
-    if fsm.recovery is not None and fsm.recovery is fsm.per_target:
-        return "per-target host — there are no UBB trays to re-power"
-    return ""
-
-
 def log_rung_inventory() -> None:
     """State every optional rung at startup, on or off. A rung that is off has to be readable in the
     journal — inferring it from an absence of verdicts is exactly how the eth read stayed dark."""
@@ -3963,15 +3950,6 @@ def log_rung_inventory() -> None:
             "auto-power-cycle",
             _auto_power_cycle_enabled(),
             _opted_out("TT_DEVICE_MCP_AUTO_POWER_CYCLE") or f"{_no_bmc_reason()} — the cold rung cannot fire",
-        ),
-        # The arming predicate stays privilege-only: off-platform the fire paths decline as
-        # not_applicable, which the predicate would turn into blocked.
-        (
-            "auto-tray-reset",
-            _ubb_reset_enabled() and not _no_tray_platform(),
-            _no_tray_platform()
-            or _opted_out("TT_DEVICE_MCP_AUTO_UBB_RESET")
-            or f"{_no_bmc_reason()} — the per-tray re-power cannot fire",
         ),
         ("bridge-reset", bridge_reset_enabled(), bridge_reset_unavailable_reason()),
         ("self-heal-relift", _selfheal_relift_enabled(), "TT_DEVICE_MCP_SELFHEAL_RELIFT=0"),
@@ -6945,21 +6923,21 @@ async def device_health_gate(
                 off_bus=_offbus_count(beats, expected),
                 last_action=STAGE_BRIDGE_RESET,
                 last_action_recovered=False,
-                # Carry the per-chip SBR window this rung just read into the evidence the tray stage
-                # classifies from: a chip that reported no_bridge here is the tray-down-no-window
-                # signature. next_stage stays pure (it never reads this); only the STAGE_UBB_TRAY
-                # gate rung does, via _classify_hold.
+                # Carry the per-chip SBR window this rung just read into the evidence the below-floor
+                # handling classifies from: a chip that reported no_bridge here is the
+                # tray-down-no-window signature. next_stage stays pure (it never reads this); only
+                # the BELOW_FLOOR gate handling does, via _classify_hold.
                 bridge_reset_failed=galaxy_recovery.last_bridge_reset_reasons,
             )
             stage = galaxy_recovery.next_stage(ev)
 
-        if stage == STAGE_UBB_TRAY:
+        if stage == BELOW_FLOOR:
             # Below the mass-drop floor. A mesh-wide galaxy reset is the measured all-chip drop —
             # run against a single/few-chip wedge it inverts the mesh, one chip off the bus becomes
-            # 31 at 0xFFFFFFFF — so it stays suppressed here. The per-tray BMC reset is the lightest
-            # rung that can still clear a whole-tray drop, and it declines itself (naming the
-            # command instead) where there is no tray-down to fire on.
-            if await _fire(STAGE_UBB_TRAY):
+            # 31 at 0xFFFFFFFF — so it stays suppressed here. A whole tray off the bus goes straight
+            # to the bounded power cycle (spec 04 I37); anything else holds for the 10-min bound's
+            # full ladder (spec 04 I76). There is no BMC tray re-power rung.
+            if await _fire(BELOW_FLOOR):
                 return
             reset_floor = _galaxy_reset_min_dead_chips(expected)
             outage_held = mesh_reset_hold_reason() if dispatch_failed and ev.off_bus == 0 else ""
@@ -7484,8 +7462,6 @@ def _hold_tray_groups() -> dict:
 # Names for the watchdog's off-bus forced-pass bounds (offbus_power_cycle.watchdog_due_at kinds).
 _HOLD_OFFBUS_DUE_SOURCES = {
     "gated_offbus_grace": "gated off-bus grace",
-    "ipmi_handoff_bound": "BMC IPMI hand-off bound",
-    "tray_walk_handoff_bound": "failed tray walk hand-off bound",
     "gated_hold_handoff_bound": "gated off-bus operator hand-off bound",
 }
 
@@ -7947,12 +7923,11 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_tenant_deferred = False
         # ...and its held-job bound's attempt.
         device_hold_job_bound_escalated = False
-        # A new episode gets its own single escalation and its own single per-tray BMC reset — the
-        # spent latches reset with this ledger's own clock. Not derived from fsm opening a fresh
+        # A new episode gets its own single escalation — the spent latch resets with this
+        # ledger's own clock. Not derived from fsm opening a fresh
         # episode: this release can land before or after fsm's own clear, and a latch left set
         # across that gap would silence the very next hold's first escalation attempt.
         fsm.set_latch("escalated", False)
-        fsm.set_latch("ubb_reset_fired", False)
 
 
 def _force_escalate_enabled() -> bool:
@@ -8829,18 +8804,9 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # I65 retry below then runs at the cooldown's end.
     climb_77 = only_77 and _fabric_77_climb_retry_due()
     # A gated off-bus hold (spec 04 I27) gets one forced pass the moment its grace runs out, so the
-    # bounded power cycle fires at the grace and not at the next ceiling window; so does a hold whose
-    # tray re-power the BMC's IPMI failed, or whose tray walk did not recover, at its hand-off bound.
+    # bounded power cycle fires at the grace and not at the next ceiling window.
     if not only_77 and offbus_power_cycle.due_for_watchdog(device_hold_episode_since, now):
-        if offbus_power_cycle.ipmi_unavailable_age_sec(device_hold_episode_since, now) is not None:
-            device_hold_escalation_kind = "ipmi_handoff_bound"
-            device_hold_escalation_trigger = f"the {offbus_power_cycle.ipmi_handoff_sec()}s BMC IPMI hand-off bound"
-        elif offbus_power_cycle.tray_walk_failed_age_sec(device_hold_episode_since, now) is not None:
-            device_hold_escalation_kind = "tray_walk_handoff_bound"
-            device_hold_escalation_trigger = (
-                f"the {offbus_power_cycle.tray_walk_handoff_sec()}s failed tray walk hand-off bound"
-            )
-        elif offbus_power_cycle.hold_handoff_due(device_hold_episode_since, now.timestamp() if now else None):
+        if offbus_power_cycle.hold_handoff_due(device_hold_episode_since, now.timestamp() if now else None):
             # spec 04 I33: the operator's hand-off ran out with no power cycle configured.
             device_hold_escalation_kind = "gated_hold_handoff_bound"
             device_hold_escalation_trigger = (

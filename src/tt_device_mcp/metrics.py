@@ -78,13 +78,13 @@ FAULTS = (
     "operator_reset_unhealthy",
 )
 
-# constants.STAGE_NAMES, in severity order (0..4) — imported, not copied. It lives in
+# constants.STAGE_NAMES, in severity order (0..3) — imported, not copied. It lives in
 # constants.py rather than the health.recovery.stages package the names actually name: importing
 # THAT package, even one with an empty __init__.py, still runs health/recovery/__init__.py first
 # (Python always executes a parent package before a submodule), which imports this module —
 # reintroducing exactly the metrics<->health cycle this module's own docstring avoids for fsm.
 # GalaxyRecovery.escalate() calls the underlying primitives (reset_chip_via_bridge,
-# reset_with_quiesce, _fire_ubb_reset, RecoveryMechanism._fire_recovery_escalation) directly
+# reset_with_quiesce, RecoveryMechanism._fire_recovery_escalation) directly
 # rather than through a dispatching object, so stage_fired() is wired at THOSE call sites using
 # these same names. See health/recovery/__init__.py, health/recovery/base.py,
 # health/recovery/galaxy.py.
@@ -121,10 +121,7 @@ OUTCOMES = ("completed", "failed", "killed", "timeout", "hung", "preempted")
 # gives this stage no target (no bridge behind a chip that left the bus entirely, no UBB tray
 # concept on a per-target host). The split matters operationally: "blocked" is a policy knob an
 # operator can flip; "not_applicable" is a platform fact that will never change and must not be
-# graphed as if it were an outage. Before this split every stage's structural non-applicability
-# was folded into "blocked" too, which is why a per-target (non-Galaxy) host's ubb_tray series
-# climbed on every single below-floor off-bus drop forever — indistinguishable from an operator
-# leaving a kill-switch off.
+# graphed as if it were an outage.
 STAGE_OUTCOMES = ("ok", "failed", "timeout", "blocked", "not_applicable")
 
 

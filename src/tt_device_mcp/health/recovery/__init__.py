@@ -50,8 +50,10 @@ from tt_device_mcp.health.recovery.stages.bridge_reset import (
 # A `next_stage` decision that is not a stage name: WAIT (the wedge may self-heal; do nothing),
 # DEFER (a reset is already cycling; adopt and verify it, start nothing new), RELEASE (the door
 # opens — nothing is wrong, or the last action just proved it), HOLD_FABRIC_UNVERIFIED (a fabric
-# pass that ran but reached no verdict; hold without resetting), or BLOCKED (a drop no opted-in
-# rung can recover — distinct from WAIT, which means "it may self-heal"). The stage names below
+# pass that ran but reached no verdict; hold without resetting), BLOCKED (a drop no opted-in
+# rung can recover — distinct from WAIT, which means "it may self-heal"), or BELOW_FLOOR (fewer
+# chips are gone than the mesh-wide reset needs to be worth its blast radius: classify the drop —
+# a whole tray goes straight to the power cycle, anything else waits for the hold bound's ladder). The stage names below
 # are constants.STAGE_NAMES' own values, re-bound here (not re-exported by import: pyflakes reads
 # a bare re-export as an unused import) so a decision routes straight to the name
 # metrics.stage_fired() and _HOST_ESCALATION_STAGE use.
@@ -60,9 +62,9 @@ DEFER = "defer"
 RELEASE = "release"
 HOLD_FABRIC_UNVERIFIED = "hold_fabric_unverified"
 BLOCKED = "blocked"
+BELOW_FLOOR = "below_floor"
 STAGE_BRIDGE_RESET = constants.STAGE_BRIDGE_RESET
 STAGE_SMI_RESET = constants.STAGE_SMI_RESET
-STAGE_UBB_TRAY = constants.STAGE_UBB_TRAY
 STAGE_HOST_REBOOT = constants.STAGE_HOST_REBOOT
 STAGE_POWER_CYCLE = constants.STAGE_POWER_CYCLE
 
@@ -158,8 +160,8 @@ class Evidence:
     # ``{"reason": "no_bridge"}`` for every chip whose secondary bus reset could not fire because
     # the endpoint left the bus (no bridge to write to). Threaded by the server's ``replace(ev, …)``
     # AFTER the bridge rung fires (from ``Recovery.last_bridge_reset_reasons``), read only by the
-    # STAGE_UBB_TRAY gate rung to classify the hold (:func:`galaxy._classify_hold`). ``next_stage``
-    # never reads it — the router stays pure; only the tray rung's fire does. None when no bridge
+    # BELOW_FLOOR gate decision to classify the hold (:func:`galaxy._classify_hold`). ``next_stage``
+    # never reads it — the router stays pure; only the gate's below-floor handling does. None when no bridge
     # rung ran this pass, which reads as "window unknown" -> the generic branch.
     bridge_reset_failed: Optional[dict] = None
     # This hold episode's galaxy reset already REGRESSED the off-bus count (spec 04 I31): a failed
@@ -238,8 +240,6 @@ class RecoveryDeps:
     # flag above, which stays True for the whole episode and is what the journal/reporting read.
     hold_escalation_latched: Callable[[], bool]
     set_device_hold_episode_escalated: Callable[[bool], None]
-    device_hold_episode_ubb_reset_fired: Callable[[], bool]
-    set_device_hold_episode_ubb_reset_fired: Callable[[bool], None]
     clear_device_reported_fault: Callable[[str], None]
     clear_device_dirty: Callable[..., None]
     # Whether the mesh is CURRENTLY dirty, unverified, or carrying a runtime-reported fault —
