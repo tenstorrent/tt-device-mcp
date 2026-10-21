@@ -947,8 +947,10 @@ each rung fires only when the gentler one failed or cannot apply.
   of that wait (`Waiting for 30 seconds: 30`, the settle's end, or `Waiting for all N chips to show
   up`, matched across split reads), runs one global PCI rescan, journaled as
   `reset_driver_wait_rescan` with `ok` and the chips. It fires once per reset (I78 repeats it, bounded, while an isolated chip is still missing), never for
-  another reset command or with no isolated chip, and a failed write is journaled and the reset runs
-  on; the rescan after the reset still runs. A cancelled reset cancels a pending rescan and disarms the
+  another reset command or with no isolated chip, and a failed write, or one still blocked in the
+  kernel after 30 s, is journaled and the reset runs on; the rescan after the reset still runs (also
+  bounded at 30 s). Spec 03 I83's cut removes chips only after tt-smi has exited, never inside this
+  wait, so it costs I81 no chip; a chip it removes is re-added by the closing rescan if it answers. A cancelled reset cancels a pending rescan and disarms the
   watcher, so output the backend still reads after the cancel starts none; a sysfs write already
   running in its worker thread cannot be stopped and finishes on its own. A cancel that lands after
   tt-smi exited, while the rescan's write finishes, still runs the reset's whole cleanup (the
@@ -1461,7 +1463,27 @@ each rung fires only when the gentler one failed or cannot apply.
   rung deferred by a reset scope or a retry-less denial fires one sampler tick after the deferral
   ends (before, a whole window later); class A (whole tray) and C keep the I37 direct cycle, well inside the bound. Each
   waits only on a running boot / post-power-cycle cooldown (I65) and fires as it ends. Bounds the about 70 min one Galaxy host sat in a latched topology-mismatch hold
-  with no rung run.
+  with no rung run. Blocking PCI sysfs writes (a remove/isolate, a `/sys/bus/pci/rescan`, a
+  bridge reset, the valve's `isolate_chip`, the post-reset cut's remove) go through one in-flight
+  writer per broker (`PCI_WRITER`): each write runs in a tracked worker thread with its bound
+  (rescan `PCI_SYSFS_WRITE_TIMEOUT_SEC`, 30 s; bridge reset about 91 s); while an earlier
+  timed-out write is still alive, a new one is refused at once and starts no thread. The first
+  timeout or refusal latches PCI-wedged (`pci_wedged`, `host_at_risk`): the pass stops (the rung
+  fails, the remaining chips stay lost or withheld with reason `pci_wedged`), later PCI rungs are
+  skipped at once (`pci_write_refused`), the dead-chip valve skips its chips
+  (`chip_isolation_skipped`) and holds the device, and the power cycle is requested at once
+  through the host rung; only the I65 cooldown may delay it, and the request fires as the
+  cooldown ends, not at the 10-min mark. No hold lifts while latched unless no write is pending
+  and the full check with fabric has just passed; that lift clears the latch
+  (`pci_wedged_cleared`). Bound: one PCI timeout per ladder, at most one leaked thread per host.
+  Time to recover for a blocked PCI lock: one timeout (about 91 s for a bridge reset, 30 s for a
+  rescan), then the power-cycle request (cooldown permitting), instead of one timeout per chip
+  plus the 10-min wait. Other classes are unchanged. Accepted gaps: a thread blocked in the
+  kernel cannot be killed and stays until the power cycle; the latch is held in memory, so a
+  broker restart loses it (at most one more timeout and one more thread); an operator reset is
+  refused while latched; the valve neither kills holders nor stops pollers while latched (the
+  driver's fd-close path reads the chip, spec 03 I83); the forced-escalation kill switch can
+  delay the early request until the 10-min bound.
 - **I72 — A power-cycle request that never took the host down is a missed attempt, asked again
   as its window ends.** The power-cycle command can return while the cycle never happens (an
   unreachable BMC, a cycler that failed after it detached). A request whose pending window
@@ -1997,9 +2019,11 @@ each rung fires only when the gentler one failed or cannot apply.
     cannot be detached, no reader is signalled and the reset is refused; the hold stays and the
     bounded recovery (the ladder at 10 min, then the power cycle, I76) runs. This is looked at only
     when readers are found. A sysfs remove can block in the kernel, so the detaches run off the
-    event loop under one deadline for all the chips (`PRE_RESET_DETACH_TIMEOUT_SEC`, 30 s); one
-    that has not returned by then counts as not detached (`detach_timed_out`), and `/health`, the
-    queue and the I76 timers keep running meanwhile.
+    event loop under one deadline for all the chips (`PRE_RESET_DETACH_TIMEOUT_SEC`, 30 s), each
+    the one in-flight PCI write (I76); one that has not returned by then, or is refused behind an
+    earlier blocked write, counts as not detached (`detach_timed_out`) and latches PCI-wedged (the
+    power cycle is asked at once, I65 cooldown permitting), and `/health`, the queue and the I76
+    timers keep running meanwhile.
   - A reset already in flight is never signalled: a running reset scope (`ttdev-reset-*`), a holder
     inside one, or a reset the broker launched outside a scope (registered by pid, its children
     included) refuses the new reset before any signal (`reset_in_flight`). Killing a reset partway
@@ -2448,6 +2472,7 @@ sees a silent fabric pass.
 | I70 an unkillable leftover asks for no host rung before its 600 s budget; past it, the power cycle whether every chip is present or one is off the bus | `tests/test_unkillable_leftover_escalation.py::test_no_rung_before_the_budget`, `tests/test_unkillable_leftover_escalation.py::test_a_power_cycle_once_past_the_budget_with_every_chip_present`, `tests/test_unkillable_leftover_escalation.py::test_a_power_cycle_with_chips_off_the_bus` |
 | I70 the clock opens on an unkillable leftover only, closes when none is left (a leftover gone at the deadline fires nothing), and a scan error leaves it as it is; the idle-holder scan keeps it | `tests/test_unkillable_leftover_escalation.py::test_a_killable_leftover_starts_no_clock`, `tests/test_unkillable_leftover_escalation.py::test_a_leftover_gone_at_the_deadline_fires_nothing_and_closes_the_episode`, `tests/test_unkillable_leftover_escalation.py::test_a_scan_error_leaves_the_clock_as_it_is`, `tests/test_unkillable_leftover_escalation.py::test_the_idle_holder_scan_keeps_the_clock` |
 | I70 guards: a governor/cooldown denial holds and the next try fires; the operator stand-back holds the power cycle and a later try fires it once the marker is gone; a pending host action or a device op asks nothing; another tenant or a running job blocks, the leftover itself does not; a leftover that leaves while the try waits on the lock, or a leftover leaving, a tenant arriving or a reset scope starting during the stand-back or governor check, fires nothing (`gone` closes the episode); no host rung opted in journals `no_host_rung` | `tests/test_unkillable_leftover_escalation.py::test_a_governor_denial_holds_then_fires_on_a_later_try`, `tests/test_unkillable_leftover_escalation.py::test_a_held_stage_is_journaled_once_while_it_stands`, `tests/test_unkillable_leftover_escalation.py::test_the_operator_stand_back_holds_the_power_cycle_until_it_is_gone`, `tests/test_unkillable_leftover_escalation.py::test_a_leftover_that_leaves_while_the_try_waits_on_the_lock_fires_nothing`, `tests/test_unkillable_leftover_escalation.py::test_a_change_during_the_last_checks_holds_the_rung`, `tests/test_unkillable_leftover_escalation.py::test_a_pending_host_action_asks_for_nothing`, `tests/test_unkillable_leftover_escalation.py::test_a_device_op_in_flight_defers_the_try`, `tests/test_unkillable_leftover_escalation.py::test_another_tenant_blocks_the_rung_but_the_leftover_itself_does_not`, `tests/test_unkillable_leftover_escalation.py::test_a_running_job_blocks_the_rung`, `tests/test_unkillable_leftover_escalation.py::test_no_host_rung_opted_in_journals_no_host_rung` |
+| I76 with spec 03 I83: one in-flight PCI writer; the first timeout or refusal latches PCI-wedged, stops the pass, skips later PCI rungs and the valve, asks the power cycle at once (cooldown permitting), and no hold lifts while latched without a just-passed full check | `tests/test_pci_wedged_latch.py::test_a_blocked_bridge_reset_stops_the_pass_after_one_call`, `tests/test_pci_wedged_latch.py::test_b_a_later_rescan_behind_a_blocked_write_fails_fast_and_starts_no_thread`, `tests/test_pci_wedged_latch.py::test_c_the_valve_skips_a_dead_chip_while_pci_wedged`, `tests/test_pci_wedged_latch.py::test_d_the_latch_asks_for_the_power_cycle_at_once_outside_the_cooldown`, `tests/test_pci_wedged_latch.py::test_d_inside_the_cooldown_the_latch_asks_when_it_ends`, `tests/test_pci_wedged_latch.py::test_e_no_hold_lifts_while_pci_wedged_without_a_just_passed_full_check`, `tests/test_below_floor_offbus_ladder.py::test_a_remove_blocked_in_the_kernel_still_lets_the_bound_reach_the_power_cycle`, `tests/test_device_safety.py::test_an_isolated_chip_rung_blocked_in_the_kernel_fails_in_bounded_time` |
 | I70/I76 a killed job's leftover past 600 s and the 10-min hold bound request one power cycle per episode, in either order, with a leftover try spawned before the bound's request, and whether the launch ran or timed out; the device stays held with the full check owed | `tests/test_unkillable_leftover_escalation.py::test_replay_the_bound_and_the_leftover_budget_request_one_power_cycle` |
 | I70 `/health` `leftover_fence`, the sampler wiring, and the bounded time to request (at most 660 s) with nothing on the path releasing the device | `tests/test_unkillable_leftover_escalation.py::test_the_health_fields`, `tests/test_unkillable_leftover_escalation.py::test_the_sampler_drives_the_escalation`, `tests/test_unkillable_leftover_escalation.py::test_time_to_request_is_bounded_and_nothing_releases_the_device` |
 | I14 the host rung is the power cycle or a loud hold; blocked climbs are loud | `tests/test_device_safety.py::test_host_escalation_for_drop_is_the_power_cycle_or_a_loud_hold`, `tests/test_device_safety.py::test_gate_all_off_bus_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_reset_regression_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_all_off_bus_power_cycles_when_opted_in` |

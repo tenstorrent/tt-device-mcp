@@ -97,6 +97,10 @@ from tt_device_mcp.health.monitors.pci import (
 
 # The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and
 # server.py's release funnel and the gate read it to hold fabric-unverified until a pass settles it.
+# The one in-flight PCI sysfs writer and its PCI-wedged latch (spec 04 I76): server.py wires the latch
+# to the hold and the power-cycle request, and clears it only on a verified lift; telemetry.py's
+# dead-chip valve skips chips while it is set and removes chips only through it.
+from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
     BELOW_FLOOR,
@@ -121,6 +125,7 @@ from tt_device_mcp.health.recovery import select_recovery as _select_recovery  #
 from tt_device_mcp.health.recovery.base import (
     HOLD_ESCALATION_REARM_SEC,
     RESET_COOLDOWN_SEC,
+    RESET_SCOPE_PREFIX,
     RecoveryMechanism,
     host_action_pending_sec,
     mesh_hold_repage_sec,
@@ -162,6 +167,9 @@ from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle
 from tt_device_mcp.health.shutdown import note_broker_stopping
 
 __all__ = [
+    # the one in-flight PCI sysfs writer and its PCI-wedged latch (spec 04 I76)
+    "PCI_WRITER",
+    "PciWedged",
     # the /health hold report (spec 03 I72, spec 04 I75) and the read-only probes it is fed
     "hold_report",
     "_normalized_board",
@@ -234,6 +242,8 @@ __all__ = [
     "RESET_MODE_TARGET",
     "HOLD_ESCALATION_REARM_SEC",
     "RESET_COOLDOWN_SEC",
+    # the reset's own systemd scope prefix: the in-flight reader cut never kills it (spec 03 I83)
+    "RESET_SCOPE_PREFIX",
     "_declared_reset_mode",
     # how often a standing hardware-fault hold is paged again (spec 03 I42)
     "mesh_hold_repage_sec",
