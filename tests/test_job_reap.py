@@ -65,7 +65,38 @@ def _escaped_child(tag: str) -> tuple[int, int]:
     the job's process group and session, and its parent chain is gone. Returns (job pid, child pid)."""
     job = _spawn_job("setsid sleep 60 >/dev/null 2>&1 < /dev/null & echo $!", tag=tag)
     out, _ = job.communicate(timeout=5)
-    return job.pid, int(out.strip())
+    child = int(out.strip())
+    _wait_escaped(child, tag)
+    return job.pid, child
+
+
+def _wait_escaped(child: int, tag: str, timeout: float = 5.0) -> None:
+    """The job shell exits as soon as it has forked, before the child has run setsid and exec'd
+    sleep. A sweep that ran then would test a race, not the escape: before setsid the job's
+    group still reaches the child, and while it execs sleep its environment reads empty, so for
+    that instant no route finds it (seen about 1 in 100 in a PID namespace, whose short /proc
+    scan lands inside the exec). Wait until it is in its own session and carries the tag."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        info = job_reap._read_stat(child)
+        if info is not None and info.sid == child and job_reap._has_tag(child, tag):
+            return
+        time.sleep(0.005)
+    _kill_quietly(child)
+    raise AssertionError(f"escaped child {child} never left the job's session with its tag")
+
+
+def test_an_escaped_child_is_found_by_the_first_scan():
+    """The helper hands the sweep a child that has finished escaping: the first scan after the
+    job exits finds it by its tag. Repeated, since the race it closes is short."""
+    for i in range(100):
+        tag = _unique_tag(f"t-settled-{i}")
+        job_pid, child = _escaped_child(tag)
+        try:
+            assert child in job_reap.job_processes(job_pid, None, tag)
+            assert child not in job_reap.job_processes(job_pid)
+        finally:
+            _kill_quietly(child)
 
 
 @pytest.mark.asyncio
