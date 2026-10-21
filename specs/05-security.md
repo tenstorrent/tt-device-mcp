@@ -70,7 +70,9 @@ that did not come through the broker at all.
   did not watch exit — one re-adopted across a broker restart. A broker that reaped the process
   itself uses `proc.returncode` and deletes the file unread. A re-adopted job that left no exit
   status is reported FAILED with an explanation, never COMPLETED; malformed content reads as no
-  status. A per-user (redirected) exit directory is never widened world-writable.
+  status. A per-user (redirected) exit directory is never widened world-writable. Each job starts
+  on a fresh exit file owned by the uid it runs as, never one another user or an earlier job with
+  the same id left (spec 01 I8).
 - **I8 — `tt_device_exec` is gated, and force is scoped to exactly one gate.** Exec refuses:
   (a) under privsep, an identity-less or unhonorable caller (I2/I3); (b) while a job owned by
   someone else is running — unless `force=true`, which admits the diagnostic *alongside* the

@@ -1806,10 +1806,59 @@ def ensure_job_exit_dir() -> None:
         pass
 
 
-def read_job_exit_code(job_id: str) -> Optional[int]:
-    """The exit status the job recorded for itself, or None if it never got to."""
+def prepare_job_exit_file(job_id: str, uid: Optional[int] = None) -> bool:
+    """Give a job about to start a fresh, empty exit file its own uid can write (spec 01 I8).
+
+    Ids recycle, so a file left at this path belongs to an earlier job: read after a restart it
+    would pass for this job's status, and in the shared sticky dir a file another user owns cannot
+    even be opened by root while fs.protected_regular is set, so the job's EXIT trap loses its
+    status. Remove it, then create the file new and hand it to ``uid``. Empty reads as no status
+    until the job writes one. False (logged) when that fails; the read side's start-time check
+    still refuses a stale file."""
+    path = job_exit_file(job_id)
     try:
-        raw = job_exit_file(job_id).read_text().strip()
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        if logger:
+            logger.warning(f"JOB_RUNNER job_id={job_id} cannot remove the old exit file {path}: {e}")
+        return False
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    except OSError as e:
+        if logger:
+            logger.warning(f"JOB_RUNNER job_id={job_id} cannot create its exit file {path}: {e}")
+        return False
+    try:
+        if uid is not None and uid != os.geteuid():
+            os.fchown(fd, uid, -1)
+    except OSError as e:
+        # A file the job cannot write is worse than none: without it the trap creates its own.
+        if logger:
+            logger.warning(f"JOB_RUNNER job_id={job_id} cannot give its exit file to uid {uid}: {e}")
+        os.close(fd)
+        clear_job_exit_file(job_id)
+        return False
+    os.close(fd)
+    return True
+
+
+def read_job_exit_code(job_id: str, started_at: Optional[str] = None) -> Optional[int]:
+    """The exit status the job recorded for itself, or None if it never got to.
+
+    ``started_at`` is the job's start time (isoformat). A file last written before it is an
+    earlier job's with the same id, and an unknown start time cannot prove the file is this job's:
+    both read as no status, never as a clean exit (spec 01 I8)."""
+    path = job_exit_file(job_id)
+    try:
+        start = datetime.fromisoformat(started_at).timestamp() if started_at else None
+    except (TypeError, ValueError):
+        start = None
+    try:
+        if start is None or path.stat().st_mtime < start - 1.0:
+            return None
+        raw = path.read_text().strip()
     except OSError:
         return None
     try:
@@ -1823,6 +1872,26 @@ def clear_job_exit_file(job_id: str) -> None:
         job_exit_file(job_id).unlink()
     except OSError:
         pass
+
+
+def sweep_job_exit_files(keep: Callable[[str], bool]) -> list[str]:
+    """Remove the exit files of jobs ``keep`` does not claim; the ids removed. Run at startup after
+    re-adoption: only a re-adopted job ever reads its file, so any other is an earlier job's
+    leftover, and leaving it is how a recycled id inherits a status (spec 01 I8)."""
+    removed = []
+    try:
+        paths = sorted(job_exit_dir().glob("*.exit"))
+    except OSError:
+        return removed
+    for path in paths:
+        if keep(path.stem):
+            continue
+        try:
+            path.unlink()
+            removed.append(path.stem)
+        except OSError:
+            pass
+    return removed
 
 
 def get_device_op_lock() -> asyncio.Lock:
@@ -10956,7 +11025,7 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
         preempt_forced_job_ids.discard(job_id)
         job = jobs.get(job_id)
         if job is not None:
-            rc = await asyncio.to_thread(read_job_exit_code, job_id)
+            rc = await asyncio.to_thread(read_job_exit_code, job_id, job.started_at)
             async with get_lock():
                 if job.status == JobStatus.RUNNING:
                     if timed_out:
@@ -11004,13 +11073,20 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                             f.write(f"\n[KILLED by device reset] {job.error}\n")
                     except OSError:
                         pass
-            elif _is_wedge_risk_exit(job.status, job.exit_code) or job.status == JobStatus.PREEMPTED:
+            elif (
+                _is_wedge_risk_exit(job.status, job.exit_code)
+                or job.status == JobStatus.PREEMPTED
+                or (rc is None and job.status == JobStatus.FAILED)
+            ):
                 # A SIGINT-preempted job (-2 / 130) counts as a clean release only because the
                 # runner's post-job gate proves the fabric after it. That gate died with the old
                 # broker, so here a preemption always flags the device for reset + full check.
+                # So does a job whose status is unknown (no, unreadable or stale exit file): it
+                # was killed or the host went down under it, and nothing shows it released the
+                # device (spec 01 I8).
                 _mark_device_dirty(
                     f"re-adopted job {job_id} ended {job.status.value}"
-                    + (f" (exit {job.exit_code})" if job.exit_code is not None else ""),
+                    + (f" (exit {job.exit_code})" if job.exit_code is not None else " (exit status unknown)"),
                     job=job,
                 )
             # Spec 03 I69: a re-adopted job the broker stopped (its timeout, a requested kill, or a
@@ -11133,6 +11209,12 @@ async def reconcile_running_scopes():
     swept = sweep_job_spools(lambda jid: jid in jobs or jid in readopted_scopes, _salvage_job_spool)
     if swept and logger:
         logger.info(f"RE-ADOPT removed the output spools of jobs not re-adopted: {', '.join(swept)}")
+    # Only a re-adopted job reads its exit file; any other is an earlier job's (spec 01 I8).
+    stale = sweep_job_exit_files(
+        lambda jid: jid in readopted_scopes or (jid in jobs and jobs[jid].status == JobStatus.RUNNING)
+    )
+    if stale and logger:
+        logger.info(f"RE-ADOPT removed the exit files of jobs not re-adopted: {', '.join(stale)}")
 
 
 def _job_cooldown_remaining_sec(last_end_monotonic: float, now_monotonic: float) -> float:
@@ -11621,6 +11703,9 @@ async def _job_runner_loop():
             activation_script, _ = get_activation_script(job.workspace, env_file=None, inherited_env=job.env_vars)
 
             exit_file = job_exit_file(job_id)
+            # Under privsep the job runs as its submitter, else as this broker's own uid.
+            privsep_prefix = privsep_prefix_for(job.peer_uid, unit=job_scope_unit(job_id))
+            await asyncio.to_thread(prepare_job_exit_file, job_id, job.peer_uid if privsep_prefix else os.geteuid())
             full_command = f"""
 {_exit_trap_preamble(str(exit_file))}set -e
 {activation_script}
@@ -11633,7 +11718,6 @@ export {JOB_TAG_ENV}={job_tag}
             # in the finally block, preventing orphaned child processes from holding device locks.
             # Under privsep (root + opt-in) the command runs as the submitting user inside a
             # device-admitted systemd scope; otherwise it runs directly as today.
-            privsep_prefix = privsep_prefix_for(job.peer_uid, unit=job_scope_unit(job_id))
             # The job writes into spool files, not pipes (spec 01 I17): a pipe dies with this
             # broker, and a job re-adopted across a restart then fails on its next print. No spool
             # to be had: pipes, as before.
