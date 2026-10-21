@@ -19,7 +19,7 @@ chip becomes a mesh-wide drop, and a repeat reset at a dead endpoint is how a we
 reboot. The subsystem therefore separates *policy* (which rung the evidence justifies, which
 command fits the board) from *execution and safety state* (the scoped reset run, cooldowns, the
 durable rate-limit ledger), and climbs a gentlest-first ladder — PCI rescan / per-chip bridge
-reset, per-tray BMC reset, `tt-smi` reset, warm host reboot, cold BMC chassis power cycle — where
+reset, `tt-smi` reset, last-chance sweep, cold BMC chassis power cycle — where
 each rung fires only when the gentler one failed or cannot apply.
 
 ## Invariants
@@ -135,11 +135,11 @@ each rung fires only when the gentler one failed or cannot apply.
   case where the mesh reset inverts the mesh (1 chip off the bus → 31 at all-ones).
   `TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC` tunes it; only an explicit `<= 0` disables it; a value above
   1.0 (a chip count typed as a fraction) fails safe to the default.
-- **I9 — The durable auto-recovery ledger.** Every host-level escalation (reboot, power cycle) is
+- **I9 — The durable auto-recovery ledger.** Every host-level escalation (the power cycle, the only host rung, I71) is
   appended to `auto_recovery.jsonl` and fsync'd BEFORE the action fires; if the record cannot reach
-  disk the action is aborted — an unrecorded reboot is one the next boot repeats. The ledger is the
-  rate limiter and survives the reboot it records: a wall-clock min interval
-  (`AUTO_RECOVERY_MIN_INTERVAL_SEC`, 3600 s, spanning the reboot itself) plus a per-boot cap
+  disk the action is aborted — an unrecorded power cycle is one the next boot repeats. The ledger is the
+  rate limiter and survives the host restart it records: a wall-clock min interval
+  (`AUTO_RECOVERY_MIN_INTERVAL_SEC`, 3600 s, spanning the restart itself) plus a per-boot cap
   (`AUTO_RECOVERY_MAX_PER_BOOT`, 1), counted over this boot's records within the action's interval,
   so it never holds past a stated time (I65). The power cycle is spaced by its cooldown (I65) instead
   of the min interval. An unreadable ledger denies (fail closed); a fire that raised
@@ -147,9 +147,9 @@ each rung fires only when the gentler one failed or cannot apply.
   A power cycle whose following boot reached a verified-healthy release — a gate pass whose fabric
   check ran and passed (the startup gate's full check included), or a hold lifted on such a pass —
   healed the box, so it no longer anchors the power cycle's cooldown (I65), and neither does the
-  host boot it brought up once that boot is verified; it no longer counts toward the reboot's min
-  interval or per-boot cap either: a new whole-tray or all-off drop after it power-cycles at once,
-  and a partial drop or present-mesh wedge after it takes the reboot the chooser picks at once (I10).
+  host boot it brought up once that boot is verified: a new drop or wedge after it power-cycles at
+  once (I10). A `reboot` row an older broker wrote still reads as a broker recovery (boot
+  attribution, the loop guard); this broker writes none.
   The proof is stamped in
   `auto_recovery_verified.json` (boot id, time; the first per boot); a missing or unreadable stamp,
   a stamp from the cycle's own boot, or a row with no boot id keeps the row gating, so a cycle no
@@ -167,45 +167,26 @@ each rung fires only when the gentler one failed or cannot apply.
   a new episode within 30 min of a cycle a later boot verified goes from 30+ min (the interval,
   while the mesh reset and the sweep repeat) to about 5-8 min (one power cycle, then the startup
   gate's full check, fabric included, after hugepages are ready, before any release).
-- **I10 — Per-severity rate limiting.** The min interval gates per rank (`reboot` < `power-cycle`):
-  no rung re-fires itself inside it, and a stronger record blocks de-escalating to a weaker rung. An
-  unclassifiable record counts as strongest. A power cycle after a failed reboot waits only for its
-  own cooldown (I65), which counts from that reboot. A power cycle the cooldown, the per-boot cap or
-  the I9 backstop refuses is asked again the moment that wait ends: the hold-deadline watchdog forces
-  one ladder pass for the hold episode it was refused in (kind `power_cycle_cooldown`), instead of
-  waiting for its next ceiling window. The governor still decides that pass, and it releases only
-  through I32. A power cycle a later boot verified healthy (I9) blocks nothing: the fault after it is
-  a new episode, not a boot loop, so the reboot is not held for the rest of the interval. That
-  exemption ends at the power-cycle backstop (I9): there every cycle in the window blocks the reboot
-  again, and the reboot's own interval and per-boot cap always apply, so a reboot fires at most once
-  per `AUTO_RECOVERY_MIN_INTERVAL_SEC`. With both host rungs opted in, the chooser offers the reboot
-  first and the power cycle once a reboot was tried in this episode (`reboot_tried_this_episode`): a
-  broker reboot recorded on an earlier boot and stamped after the last verified-healthy release (I9).
-  It counts until the next verified release, not for a fixed time: the power cycle's cooldown (I65)
-  counts from the reboot's own boot and reaches 3600 s or more after two unhealed cycles, so a
-  reboot that lapsed after `AUTO_RECOVERY_MIN_INTERVAL_SEC` was chosen again at the cooldown's end
-  and a wedge no reboot heals looped on reboots while the cycle never fired. With no usable verified
-  release on record (none, unreadable, or stamped later than now) a reboot counts for
-  `REBOOT_EPISODE_UNVERIFIED_MAX_SEC` (the reboot interval plus the 4 h backoff cap: past the reboot,
-  its boot and the longest cooldown). A release verified on this boot (with a stamp no later than
-  now) ends the episode for every earlier-boot reboot, whatever the stamps say (a clock that stepped
-  back across the boot). A reboot recorded on this boot, or with no readable or a future stamp, does
-  not count. A power cycle that cannot launch on this boot (its command is missing or exits non-zero,
-  so its ledger row is taken back; a timed-out launch may still act and does not count) lets the
-  reboot back in once per episode: with exactly one reboot in the episode the chooser offers the
-  reboot again, under its own interval and per-boot cap, so the hold keeps a host rung that can run;
-  a second reboot in the episode spends it and the cycle is offered again. **Time to recover** (a present-mesh wedge a reset and a reboot do not heal):
-  the ladder, one reboot and its boot, then the power cycle at the I65 cooldown's end (at most the
-  current interval after that boot, 30 min to 4 h), then the startup gate's full check, fabric
-  included; before, a reboot again at each cooldown end and no cycle (unbounded). Faults that skip the
-  reboot (a whole-bus drop, a reboot proven futile) and episodes with no reboot tried are unchanged.
-  Power cycle opted in but cannot launch: one fallback reboot at most `AUTO_RECOVERY_MIN_INTERVAL_SEC`
-  after the first (then its boot and the full check, fabric included), then the cycle again on each
-  pass, failing loud until it can launch; before, a reboot every `AUTO_RECOVERY_MIN_INTERVAL_SEC`
-  (a reboot loop). Hosts that never stamp a verified release (no fabric check, or a single chip with
-  both host rungs on): a reboot counts for `REBOOT_EPISODE_UNVERIFIED_MAX_SEC` instead of
-  `AUTO_RECOVERY_MIN_INTERVAL_SEC`, so a new wedge 1 h to 5 h after a reboot that healed gets the
-  power cycle (at its I65 cooldown's end) instead of a second reboot.
+- **I10 — Per-severity rate limiting; the power cycle has no reboot fallback.** The min interval
+  gates per rank (`reboot` < `power-cycle`; only an older broker's `reboot` row still carries the
+  lower rank): no rung re-fires itself inside it, and a stronger record blocks de-escalating to a
+  weaker rung. An unclassifiable record counts as strongest. A power cycle the cooldown (I65), the
+  per-boot cap or the I9 backstop refuses is asked again the moment that wait ends: the
+  hold-deadline watchdog forces one ladder pass for the hold episode it was refused in (kind
+  `power_cycle_cooldown`), instead of waiting for its next ceiling window. The governor still
+  decides that pass, and it releases only through I32. A power cycle a later boot verified healthy
+  (I9) blocks nothing: the fault after it is a new episode, not a boot loop. There is no warm
+  reboot rung and nothing reboots the host in the power cycle's place: a cycle the governor denies
+  holds and is asked again at the deadline `/health` shows; a cycle that cannot launch (its command
+  is missing or exits non-zero, so its ledger row is taken back) keeps the hold, pages, and is asked
+  again on the next pass and at the I76 bound. No flag, env var, config key or CLI option brings a
+  reboot back: `TT_DEVICE_MCP_AUTO_REBOOT`, `TT_DEVICE_MCP_POST_REBOOT_VERIFY` and
+  `TTDEV_AUTO_REBOOT` are no longer read. **Time to recover** (a present-mesh wedge the ladder does
+  not heal, classes D and G2): the ladder, then one power cycle (about 5-8 min with its boot), or
+  the I65 cooldown's end when a cycle or boot fell inside it, then the startup gate's full check,
+  fabric included; before, a reboot and its boot (about 3-5 min) came first and the cycle only after
+  that boot and its cooldown (30 min to 4 h). A cycle that cannot launch: held, paged and retried
+  each pass with no reboot; before, a fallback reboot every `AUTO_RECOVERY_MIN_INTERVAL_SEC`.
 - **I11 — One attempt, gentlest first, climb only on failure.** No rung fires twice back-to-back:
   the reset is one attempt then cooldown (one exception: a Galaxy `-glx_reset` that exits non-zero
   with every chip back on the bus but some ARC not ready, on an idle box, gets exactly one more
@@ -269,14 +250,12 @@ each rung fires only when the gentler one failed or cannot apply.
   wedge. A light pass still settles like the full one (released and the reported fault retired,
   or dirty): it is the strongest verify that host has, and holding for one it cannot run would
   strand it after every reset.
-- **I14 — Host rungs are armed by default, opt-out, and fireable-or-off.** `_auto_reboot_enabled`
-  and `_auto_power_cycle_enabled` default ON (`TT_DEVICE_MCP_AUTO_REBOOT=0` /
-  `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` opt out); each additionally reads as OFF where the process
-  could not run it (I17) — armed means armed AND fireable. A warm reboot is never fired where it
-  provably cannot help: a whole-bus drop, a reset that regressed the mesh off the bus, or one that
-  hard-exited leaving chips off it routes to the cold rung or holds loudly (`reboot_blocked`),
-  never to a reboot that lands back in the dead state. On a multi-chip mesh with a chip off the bus
-  and the power cycle armed, the cycle goes first and the reboot is only its fallback (I71).
+- **I14 — The host rung is armed by default, opt-out, and fireable-or-off.**
+  `_auto_power_cycle_enabled` defaults ON (`TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` opts out) and
+  additionally reads as OFF where the process could not run it (I17) — armed means armed AND
+  fireable. The power cycle is the only host rung (I71); no switch restores the removed warm reboot.
+  With the power cycle off or unfireable, a hold that needs the host rung goes to an operator (I33,
+  I36), paged, still held.
 - **I15 — The mesh-wide reset never fires on a guessed mode.** On a multi-chip host whose reset
   mode could not be declared or derived, the per-target `-r` is still issued (a no-op on a Galaxy
   lets the cascade climb) but a loud `reset_mode_unknown` event marks it — it must never land
@@ -365,8 +344,6 @@ each rung fires only when the gentler one failed or cannot apply.
   | `tt-smi -glx_reset` | galaxy | — |
   | PCI rescan | any | root |
   | bridge SBR | any | root + setpci |
-  | UBB tray reset | galaxy | ipmi |
-  | host reboot | any | root + systemd |
   | chassis power cycle | any | ipmi |
 
   Each rung's opt-out env var still applies on top. The device-scoped resets need no privilege:
@@ -467,10 +444,10 @@ each rung fires only when the gentler one failed or cannot apply.
   process and only hits the chips under it. The fence lifts once the holder is gone; one stuck
   in the kernel is bounded by I70.
 
-- **I22 — No host rung without the full reset ladder.** A reboot or power cycle fires only after
+- **I22 — No host rung without the full reset ladder.** The power cycle fires only after
   the last-chance sweep (SBR, mesh reset) ran COMPLETE and the one verify after
   it failed, or once this episode's ladder already ran its mesh reset and it failed on an unchanged
-  off-bus set (I38: the sweep would repeat that reset, which I36 forbids). A sweep that was skipped (a reset already cycling in its own scope, a tenant) or
+  off-bus set (I38: the sweep would repeat that reset, which I87 forbids). A sweep that was skipped (a reset already cycling in its own scope, a tenant) or
   incomplete (the I24 gate refused it) holds the host
   rung for that pass: `_settle_and_verify_before_host_rung` returns None and every caller holds.
   I70 is the other exception: under an unkillable leftover every reset is fenced (I21), so its host
@@ -482,9 +459,8 @@ each rung fires only when the gentler one failed or cannot apply.
   10 min, startup). No flag, env var, config key or CLI option brings it back. Measured across
   Galaxy hosts it ran 190 times with 0 heals, and 4 times it broke the box: it took other trays off
   the bus with it or took host storage down. Below the galaxy floor the router answers
-  `BELOW_FLOOR`, a decision, not a rung: a `TRAY_DOWN_NO_WINDOW` hold runs the kept back-to-back
-  sweep (bridge reset, then the mesh reset, one verify, then the power cycle); any other whole-tray
-  drop goes to the I27 power cycle with no grace (I37); anything else holds, and the I76 bound runs
+  `BELOW_FLOOR`, a decision, not a rung: a whole-tray drop goes to the I27 power cycle with no
+  grace and no back-to-back reset sweep, its only wait the I65 cooldown (I37); anything else holds, and the I76 bound runs
   the full ladder at 10 min and requests the power cycle if the full check, fabric included, still
   fails. Only a passing full health check, fabric included, lifts the hold.
   The broker remembers each Tenstorrent root port and chip arch it has seen
@@ -580,8 +556,8 @@ each rung fires only when the gentler one failed or cannot apply.
   logged (`pre_power_cycle_hook` health event: rc, timed_out, seconds, output tail) and the cycle
   fires anyway. A cycle the ledger aborts never runs the hook; a broker stopped while waiting on
   it retracts the ledger entry (nothing fired). The hook changes nothing about which rung fires or
-  when: the full ladder below the power cycle still runs first (I11), and the warm reboot does not
-  run it. Unset, nothing runs and the timeline is unchanged.
+  when: the full ladder below the power cycle still runs first (I11); the power cycle is the only
+  host rung. Unset, nothing runs and the timeline is unchanged.
 
 - **I27 — An off-bus hold the I24 gate refuses to reset is bounded.** Once the gate refuses every
   reset because chips are off the bus, the hold no longer stands until an operator power-cycles the
@@ -659,8 +635,7 @@ each rung fires only when the gentler one failed or cannot apply.
   poweroff, shutdown, halt, kexec or ipmitool power/reset in the last 30 min, 1 when not, 2 when it
   cannot read the journal.
 - **I28 — An operator's outage hold holds every automatic mesh reset.** With
-  `TT_DEVICE_MCP_AUTO_MESH_RESET=0`, or with it unset and `TT_DEVICE_MCP_AUTO_REBOOT`,
-  `TT_DEVICE_MCP_AUTO_POWER_CYCLE` both `0` (an outage hold), no
+  `TT_DEVICE_MCP_AUTO_MESH_RESET=0` (an outage hold), no
   automatic mesh reset fires: not the between-jobs gate's, the idle relift's or the hold
   watchdog's, and no last-chance sweep. `TT_DEVICE_MCP_AUTO_MESH_RESET=1` arms it whatever the
   others say. Either one alone is a per-host choice and still climbs through the mesh
@@ -701,17 +676,16 @@ each rung fires only when the gentler one failed or cannot apply.
   77 for a known no-reset cause (a known fabric fault or missing cable, spec 03 I46/I47, a topology
   mismatch, a missing validator, or a hugepage pool not yet filled; never the spec 03 I42 latch,
   whose first job measured the fabric bad: it is read before the mismatch checks, so a latched hold
-  whose 77 output, detail or reason names the mismatch still climbs) never climbs to a reboot or power cycle: it holds,
+  whose 77 output, detail or reason names the mismatch still climbs) never climbs to the power cycle: it holds,
   journals and pages `fabric_unverified_no_host_rung` once per episode, and the idle relift keeps
   re-checking on its backoff (spec 03 I48). With no such cause, a reset and a sweep that
-  both still read 77 leave the host rung as the only path left (a reboot refills hugepages, reloads
+  both still read 77 leave the host rung as the only path left (a power cycle refills hugepages, reloads
   the driver and retrains the links), so the episode climbs to it once (`fabric_unverified_host_rung`,
-  logged only as the rung fires, recorded in the reboot ledger under its own cause, every guard of I22
+  logged only as the rung fires, recorded in the auto-recovery ledger under its own cause, every guard of I22
   and the host rungs kept). The climb after the sweep never waits for the ladder ceiling (I79). A
   climb that only waits (a reset still in its scope) pages no one and leaves no hand-off; the next
   escalation retries it. The boot that rung brought up reads that cause from the ledger: while no
-  fabric pass has passed since the broker started, it never fires that rung again; a warm reboot's
-  boot with a power cycle opted in climbs once more, to the cold rung (I79). Once the rung is spent, or when it could not
+  fabric pass has passed since the broker started, it never fires that rung again. Once the rung is spent, or when it could not
   run (not opted in, rate-limited, a tenant), the hold goes to an operator once per episode (I33
   shape: one `fabric_unverified_operator_handoff` page, a `FABRIC_77_HANDOFF_SEC` (1200 s) act-by,
   `/health` `operator_handoff`; `owner=broker` while a held-off rung is still retried, I79; a power
@@ -749,8 +723,8 @@ each rung fires only when the gentler one failed or cannot apply.
   gate or on the idle ladder, including before the ceiling), the broker latches that hold episode
   (a regression before any hold opened latches the episode that opens next). While the latch holds
   and chips are still off the bus, neither the gate nor the idle off-bus ladder (forced or not)
-  fires the bridge, tray or mesh reset rungs again: each journals `galaxy_reset_skipped_regressed`
-  and goes straight to the post-reset verdict, with the drop treated as warm-reboot-futile. With a
+  fires the bridge or mesh reset rungs again: each journals `galaxy_reset_skipped_regressed`
+  and goes straight to the post-reset verdict, with the drop left to the power cycle. With a
   power cycle opted in that is the cold rung, still behind the last-chance sweep (I22), so the full
   ladder runs once more before any power cycle; the climb does not wait for the hold ceiling (I79). Without one it pages
   (`reset_unrecoverable_power_cycle_required` or `all_chips_off_bus_power_cycle_required`) and holds.
@@ -811,7 +785,7 @@ each rung fires only when the gentler one failed or cannot apply.
   passes; a failed check keeps it held for the next bounded rung, and a reset the gate still refuses
   releases nothing. The hand-off ends (gauge to 0, `operator_handoff` gone) when the hold ends.
 
-- **I34 — Once a host reboot or power cycle is requested, the hold watchdog starts no device reset
+- **I34 — Once a host power cycle is requested, the hold watchdog starts no device reset
   until the host acts or the request expires.** A cycle handed to a `TT_DEVICE_MCP_POWER_CYCLE_CMD`
   wrapper can run some time after the request returns; a forced escalation (the off-bus one-shot, a
   ceiling window, any other hold-deadline trigger) that ran a bridge reset or galaxy
@@ -845,18 +819,18 @@ each rung fires only when the gentler one failed or cannot apply.
   episode; the next window takes the next stronger rung.** The broker records, per hold episode, each
   mesh reset that RAN and failed, with the off-bus chip set before and after it; a reset the host gate
   or an outage hold refused did not run and is not recorded. Only a failure that left the set exactly
-  as it found it counts: a set that grew is I31, and one that shrank is progress another try may finish.
+  as it found it counts here; I87 extends the rule to a set that shrank or changed, and a set that grew is also I31.
   While the set off the bus is still that recorded set, the idle off-bus ladder (forced or not) fires
   none of its reset rungs again, and a forced present-mesh window does not repeat the reset (the
   grace-cadence retries before the ceiling stay). It journals `reset_rung_skipped_failed_unchanged` and
   climbs to the host rung at once (I38), rate limits kept (a denied cycle holds, fires no reset and is
   asked again the next window). When no host rung is available
-  (power cycle and reboot both off or unfireable) the hold goes to an operator once per episode through
+  (the power cycle off or unfireable) the hold goes to an operator once per episode through
   the I33 hand-off, latched (no deadline, `act_by` null), and no further reset fires on that set. Any
   later reset still owes the I32 fabric pass, so nothing releases the device before the full health
   check, fabric included, passes. The record is keyed by the episode, so a new episode resets again.
-  A power cycle the rate limit denies, or one not opted in, never by itself ends resets for the rest of
-  the hold: a set that changed or shrank is reset again, and the gate's cooldown paces its retries.
+  A power cycle the rate limit denies, or one not opted in, buys no second mesh reset (I87): the hold
+  waits for the cycle, or for an operator with none.
   Bounds the loop one Galaxy host ran: six identical mesh resets in one hold, each exiting 1 after a
   263 s overrun, one per forced window.
 - **I37 — A whole-tray or all-off drop goes to the power cycle with no reset first (classes A
@@ -907,7 +881,7 @@ each rung fires only when the gentler one failed or cannot apply.
   130-262 s and exited 1.
 - **I38 — Once this hold episode's mesh reset has failed on an unchanged off-bus set, the host rung
   fires in the same pass: no hold-ceiling deferral and no last-chance sweep.** Every rung below the
-  host pair (the per-chip bridge reset, the mesh reset) has then had
+  host rung (the per-chip bridge reset, the mesh reset) has then had
   its one try, and I36 forbids the mesh reset again on that set, which is the last step of the I22
   sweep. So the climb that follows the failed reset (or any later window's I36 skip) journals
   `host_rung_not_deferred` (reason `mesh_reset_failed_unchanged`) when the hold is younger than the
@@ -917,35 +891,43 @@ each rung fires only when the gentler one failed or cannot apply.
   denied cycle is asked again the next forced window or at the cooldown's end, never skipped for good. With no host rung the hold goes to an operator
   (I36, I33). The power cycle releases nothing: the startup pass after the host returns runs the full
   health check, fabric included, behind the hugepage gate, and a failure keeps the hold. A set that
-  shrank or changed is not covered and keeps the ordinary ladder. Partial off-bus time to power cycle
+  shrank or changed climbs the same way (I87). Partial off-bus time to power cycle
   falls from the 600 s ceiling window plus a second reset and a sweep (924 s for one chip with a 132 s
   reset; 1186 s for four chips with 263 s resets) to the one-shot plus the one failed reset (about
   150 s and 280 s with the 10-20 s idle one-shot of spec 03 I23; 252 s and 383 s while a tenant holds
   the 120 s wait), when no cycle or boot fell within the last cooldown; within one, at the cooldown's end
   (I65). Bounds the idle 5-6 min one Galaxy host sat between a failed mesh reset and the ceiling
   window; a second mesh reset on the same chips after an exit 1 killed another host.
-- **I39 — A failed mesh reset that brought chips back gets one early retry, not the ceiling wait.**
-  When the mesh reset fails but the off-bus set after it is a strict subset of the set before it, the
-  failure records `mesh_reset_progress_retry_armed` and arms one forced escalation for this hold
-  episode, due at once when every chip is back, otherwise after `TT_DEVICE_MCP_PROGRESS_RETRY_SEC`
-  (60; never past the hold ceiling). With every chip back the reset's own rescan and settle already
-  ran, so a wait buys nothing; a glx_reset started while a chip was out of the kernel fails its
-  full-mesh driver-load wait (rc 1) even though the rescan after it brings the chip back.
-  The hold watchdog spawns it when due (trigger kind `progress_retry`); it is spent on a real spawn and
-  never re-armed in the episode, and a new episode starts with none. The retry climbs the ordinary
-  ladder on the new set (I36 allows one more mesh reset on a changed set); an unchanged set after it
-  goes to I38. Releases nothing: the full health check, fabric included, still decides. Bounds the
-  one-chip Galaxy case whose first reset exited 1 with the chip back on the bus and whose second reset,
-  at the 600 s window, healed it: about 580 s from onset instead of about 740 s. The 60 s default is
-  kept on measured evidence: in the Galaxy logs every second reset that healed came 99 s or more after
-  the failed one, and every second reset 7-11 s after it failed; the retry also never waits past the
-  ceiling. The stated bound for B1's first-reset-fails, second-heals pattern is about 10 min from
-  onset (one-shot 10-20 s on an idle box, spec 03 I23, 120 s while a tenant holds the device; a failed
-  reset of up to 262 s, the 60 s wait, a 62 s healing reset and a 63 s fabric check: about 485 s idle,
-  about 585 s with a tenant, against a floor of 378-511 s with no wait at all). When the failed reset
-  left every chip back the wait is gone: about 60 s sooner (about 425 s idle, about 525 s with a
-  tenant; one Galaxy host's 627 s episode becomes about 567 s). A B1 drop that one reset heals keeps
-  the 6 min bound; one with chips still off keeps the 60 s wait.
+- **I39 — Retired: no progress retry.** A failed mesh reset that brought chips back no longer gets
+  a second reset: the hold's one mesh reset is spent (I87), and the climb goes to the last-chance
+  sweep, then the power cycle. `TT_DEVICE_MCP_PROGRESS_RETRY_SEC` is no longer read and the
+  `progress_retry` trigger kind is gone. Time to recover, class B1 whose first reset fails with chips
+  back: the failed reset, the sweep (SBR and mesh reset, once in this phase, I87), then the power
+  cycle and the startup gate's full check, fabric included, unless the I65 cooldown holds it; before,
+  a second reset 60 s later healed some episodes (about 8-10 min) and repeated resets on a changed set
+  ran without bound on the rest. I81 and I78 now rescan an isolated chip back inside the first
+  reset's driver wait, the case the retry was for.
+
+- **I87 — One mesh reset per hold episode; the last-chance sweep at most once per phase.** Once a
+  mesh reset (`tt-smi -glx_reset`) has run in a hold episode and left the mesh unhealthy, no path
+  runs another standalone mesh reset in that episode, whatever the off-bus set did after it (shrank,
+  changed or stayed): not the between-jobs gate, the idle relift, the stuck-hold escalation, the
+  hold-deadline watchdog's forced windows, the I65 cooldown retry or a startup check. Each such skip
+  journals `reset_rung_skipped_spent` and the episode climbs: the last-chance sweep (I22), then the
+  power cycle (I71). The sweep (SBR, then the mesh reset, then one full check, fabric included) runs
+  at most once per hold phase: once below the I76 10-min bound and once more as the bound's own
+  ladder; a repeat in the same phase climbs instead. The only other mesh reset in an episode is the
+  I11 ARC-not-ready retry inside the same reset call. A power cycle the governor denies, the I65
+  cooldown holds or that is not opted in buys no second reset: the hold waits for the cycle (asked
+  again at its deadline), or goes to an operator (I33) when there is none. No flag, env var, config
+  key or CLI option brings a repeat back: `TT_DEVICE_MCP_AUTO_UBB_RESET` and
+  `TT_DEVICE_MCP_PROGRESS_RETRY_SEC` are no longer read. A new episode (after a verified release or a
+  power cycle) gets its own one reset. Releases nothing: only a full health check, fabric included,
+  that has just passed lifts the hold (I32). Time to recover: a fabric, dispatch or hold-deadline
+  hold whose reset failed reaches the power cycle at once instead of after 8-10 min of repeated
+  mesh resets (one replayed Galaxy episode: 1186 s before, 586 s now); a
+  present-mesh wedge the reset does not heal: the sweep, then the cycle, then the full check; a
+  whole-tray drop: unchanged here (I37, straight to the cycle at the cooldown's end).
 
 - **I81 — A mesh reset re-adds the chips the broker isolated at tt-smi's driver wait.**
   `tt-smi -glx_reset` re-powers every tray, counts a 30 s settle, then waits up to 100 s for every
@@ -953,7 +935,7 @@ each rung fires only when the gentler one failed or cannot apply.
   broker isolated (its PCI endpoint removed) cannot show up on its own: only a PCI rescan adds it
   back, and the rescan `reset_with_quiesce` ends with runs after tt-smi has exited. So before I81
   every mesh reset over an isolated chip failed after about 263 s even when the re-power had healed
-  the chip, and the I39 retry's second reset finished the job. Now, when a `-glx_reset` runs with at
+  the chip, and only a second reset (the retired I39 retry) finished the job. Now, when a `-glx_reset` runs with at
   least one isolated chip, `reset_with_quiesce` watches the reset's output and, at the first marker
   of that wait (`Waiting for 30 seconds: 30`, the settle's end, or `Waiting for all N chips to show
   up`, matched across split reads), runs one global PCI rescan, journaled as
@@ -968,7 +950,7 @@ each rung fires only when the gentler one failed or cannot apply.
   The rescan comes at the start of the wait; an isolated chip whose link trains later in tt-smi's
   100 s wait is picked up by I78's repeat. Releases nothing: the full health check, fabric included, still
   decides (I32). TTR: class B1 with the chip isolated, from the hold, goes
-  from about 505 s (one-shot 120 s, a failed 263 s reset, the 60 s I39 wait, a 62 s healing reset)
+  from about 505 s (one-shot 120 s, a failed 263 s reset, the 60 s retry wait, a 62 s healing reset)
   to about 182 s (one-shot 120 s and one 62 s reset), inside the 6 min budget; both figures leave out
   the full check before release (about 60 s, I78 gives the measured episode). Mass or whole-tray
   drops with isolated chips that a mesh reset heals save the same ~320 s. Paths with no isolated chip
@@ -1042,15 +1024,14 @@ each rung fires only when the gentler one failed or cannot apply.
   the power cycle, and with the boot's start known an unreadable power-cycle record never refuses the
   rung for good. A cap or backstop (I9) denial of the power cycle shows on `/health` like the
   cooldown's, and is asked again at its end the same way. An anchor a verified-healthy release (I9,
-  `auto_recovery_verified.json`) followed anchors nothing: a broker reboot or cycle verified on a
+  `auto_recovery_verified.json`) followed anchors nothing: a broker cycle (or an older broker's reboot) verified on a
   later boot, the current boot once it is verified, an external cycle before that verification. A new
   drop after a healed cycle is a new episode and cycles at once, within the I9 backstop; a missing,
   non-finite or future verification stamp proves nothing and every anchor stays. At most one cycle
   fires per cooldown, and no hold waits on it without a stated time. Goal of 03 I4 holds after each
   cycle: the startup gate waits for the hugepage pool and passes the full check, fabric included,
-  before any release; a failed check keeps the hold and the streak. A broker reboot in the episode anchors the
-  cooldown from its boot like any other; once it ran, the rung asked again at the cooldown's end is
-  the power cycle, never another reboot (I10). Time to the power-cycle request
+  before any release; a failed check keeps the hold and the streak. Any boot in the episode anchors the
+  cooldown from that boot; the rung asked at the cooldown's end is the power cycle (I10). Time to the power-cycle request
   (the boot and the startup check follow it): class A with no cycle or boot in the last 30 min, at
   the first gate or idle pass (0 s on the tests' fake clock); class A within the cooldown, at its end
   (at most 30 min after the anchor; a boot 3 min before startup gives 27 min); class C, after its one
@@ -1127,51 +1108,27 @@ each rung fires only when the gentler one failed or cannot apply.
   chip after a broker restart (class B1, partial off-bus) gets this recorded-bridge rung, at most
   14 + 30.3 N s of waits, instead of the full ladder. Other classes are unchanged; the I76 10-min bound (full ladder, then a power cycle) holds as
   before.
-- **I71 — With a chip off the bus on a multi-chip mesh, the host rung is the power cycle; the
-  warm reboot is its in-band fallback.** `_host_escalation_for_drop` names the power cycle first
-  for a multi-chip climb with a chip off the bus (`off_bus > 0`: classes B1, B2) when
-  `_auto_power_cycle_enabled` (I14). A warm reboot cannot re-power a UBB or re-enumerate a chip
-  that left the bus (a whole-bus drop stayed 32/32 off after it); the BMC power cycle does all a
-  reboot does and also re-powers the trays. A present mesh (`off_bus == 0`: a wedge, class D, or a
-  fabric or dispatch fault the ladder could not clear, G2) and a single-chip host keep the older
-  order: the warm reboot first (faster: no BMC, no I65 cooldown), the power cycle after it. The
-  one exception is a present mesh on the boot an I29 77 reboot brought up (the I79 cold flag,
-  passed as `warm_reboot_futile`): that reboot already ran and failed, so the multi-chip climb takes
-  the power cycle when it is armed, holds loudly (`reboot_blocked`) when it is not, and never takes
-  the fallback reboot below, even once the reboot's ledger interval has passed. The
-  ladder below the host rung is unchanged: a partial drop still runs the bridge, tray and mesh
-  resets first, and a present-mesh wedge takes its second `glx_reset` (`was_failing`) before the
-  host rung; only a whole-tray or all-off drop goes straight to the cycle (I37). With no power
-  cycle armed the older verdict stands, so no host loses a rung it had: a whole-bus drop, or a
-  reset that regressed the mesh, hard-exited or left chips off below the floor, is
-  `reboot_blocked` and holds loudly; anything else takes the warm reboot. A power cycle that the
-  governor or the I65 cooldown denies, or that does not launch (unreachable BMC, failing command),
-  falls back to the warm reboot at once, at the gate and on the idle climb
-  (`power_cycle_reboot_fallback`, trigger `denied` or `launch_failed`), but only for a drop the
-  reboot can recover (`_reboot_fallback_eligible`: the drops the no-cycle verdict hands the
-  reboot), only with the reboot opted in, only within the reboot's own limits (one per boot,
-  the ledger interval), and at most once per wedge: a broker reboot recorded since the last
-  verified-healthy release (with none on record, within the longest I65 cooldown; an unreadable
-  stamp counts) spends it (`reboot_fallback_spent`). A reboot that did not heal re-anchors the I65
-  cooldown on its boot, and with an interval of an hour or more the reboot's own interval lapses
-  first, so a second fallback would reboot hourly and the cycle would never fire; instead the hold
-  asks for the cycle at that cooldown's end. A whole-bus or reboot-futile drop never falls back:
-  it holds and asks for the cycle again at the deadline shown on /health. `_route` returns BLOCKED only when no reset
-  scope is live; under a live scope it waits. The full health check, fabric included, runs after
-  the cycle and after every fallback reboot before any release (03 I4). The I76 10-min hold bound
-  is unchanged. Time to recover, armed multi-chip host, against the base: D and G2 unchanged
-  (reboot, about 3-5 min, then the cycle); a below-floor partial drop unchanged (it was already
-  reboot-futile and cycled); a non-futile partial drop with 16-31 chips off now cycles right after
-  the ladder (about 5-8 min) instead of rebooting first and cycling after the reboot's boot and
-  cooldown, and on a denied or failed cycle reboots at once instead of holding up to 30 min (4 h
-  after repeated unhealed cycles) or retrying a cycle that cannot launch without bound; if that one
-  reboot does not heal it, worst case the ladder, the reboot (about 3-5 min), its boot and the I65
-  interval (30 min; 1 h, 2 h, then 4 h after repeated unhealed cycles), then the cycle, never a
-  second fallback reboot; D and G2 take no second fallback reboot either; a D hold on the 77
-  reboot's boot keeps I79's cold rung (one power cycle once the I65 cooldown allows it, never a
-  second reboot), the same as the base; whole-bus
-  and other reboot-futile drops, class A, C, single-chip hosts and hosts with no power cycle armed
-  are unchanged.
+- **I71 — The power cycle is the only host rung.** `_host_escalation_for_drop` names the BMC power
+  cycle for every climb that reaches the host rung when `_auto_power_cycle_enabled` (I14): a chip
+  off the bus (`off_bus > 0`: classes B1, B2), a whole-tray or all-off drop (class A, I37), a present
+  mesh (`off_bus == 0`: a wedge, class D, or a fabric or dispatch fault the ladder could not clear,
+  G2), an unkillable leftover (I70) and a single-chip host. The warm host reboot rung is gone: it
+  cannot re-power a UBB or re-enumerate a chip that left the bus (a whole-bus drop stayed 32/32 off
+  after it), and the power cycle does all it did. No flag, env var, config key or CLI option brings
+  it back (I10). The ladder below the host rung is unchanged: a partial drop still runs the bridge
+  and mesh resets first and a present-mesh wedge its one `glx_reset` (I87) before the host rung;
+  only a whole-tray or all-off drop goes straight to the cycle (I37). A power cycle that the governor
+  or the I65 cooldown denies holds and is asked again at the deadline `/health` shows; one that does
+  not launch (unreachable BMC, failing command) keeps the hold, pages once, and is asked again on the
+  next pass and at the I76 bound; neither reboots. With no power cycle armed the hold goes to an
+  operator (I33), paged, still held. `_route` returns BLOCKED only when no reset scope is live; under
+  a live scope it waits. The full health check, fabric included, runs after the cycle before any
+  release (03 I4). The I76 10-min hold bound is unchanged. Time to recover, armed multi-chip host:
+  D and G2 cycle right after the ladder (about 5-8 min with the boot) instead of a reboot (3-5 min)
+  and then the cycle after the reboot's boot and the I65 cooldown (30 min to 4 h); a partial drop
+  unchanged (it already cycled); a denied cycle holds to its stated deadline instead of rebooting; a
+  cycle that cannot launch holds and pages instead of one fallback reboot an hour; class A, C and
+  hosts with no power cycle armed unchanged.
 
 - **I75 — The next rung `/health` names is the earliest one some code will fire.** One helper
   (`health/hold_report.py`, used by spec 03 I72) reads the hold-deadline watchdog's clocks, takes the
@@ -1185,7 +1142,7 @@ each rung fires only when the gentler one failed or cannot apply.
     earlier than the 10-min bound (hold start plus the ceiling): below it the watchdog forces no
     77-only hold and the kill-switch declines every forced spawn; from the bound on neither holds a
     rung back (I76);
-  - while a host reboot or power cycle the broker requested is still pending, that request: every
+  - while a power cycle the broker requested is still pending, that request: every
     forced spawn declines until the pending window ends, so the time is the window's end (source
     `host_action_pending`);
   - otherwise the earliest of: the off-bus forced pass at the bound
@@ -1193,13 +1150,11 @@ each rung fires only when the gentler one failed or cannot apply.
     I33 operator hand-off deadline; each named in the source); the I65 retry of a power cycle the
     governor refused, only while that retry is armed for this hold episode (`power cycle`, source
     `power_cycle_cooldown`, or `power_cycle_missed_retry` / `ac_power_needed` when the refusal
-    record says so); the I76 host rung (`power cycle`, or `warm reboot` where only that is opted
-    in; source `hold bound host rung`) once the bound's ladder ran and no host rung was asked since,
+    record says so); the I76 host rung (`power cycle`; source `hold bound host rung`) once the bound's ladder ran and no host rung was asked since,
     at once when the full check after that ladder failed or the rung is still pending, else at the
     end of that check's bound; once it is due the watchdog's branch chain stops there, so nothing
     below is a candidate; then, in the watchdog's own branch order, the off-bus one-shot (hold start
-    plus the one-shot wait, while chips are off the bus and the episode's one-shot has not run), the
-    I39 progress retry while armed for the episode, and the next unspent ceiling window
+    plus the one-shot wait, while chips are off the bus and the episode's one-shot has not run), and the next unspent ceiling window
     (`device_hold_escalate_bucket + 1`, at least 1, at hold start plus that many ceilings). A branch
     stops the chain only once it is due (the one-shot's wait has passed, the retry's time has come),
     as the watchdog's own guard does; one not yet due is reported beside the branches after it, and
@@ -1207,19 +1162,19 @@ each rung fires only when the gentler one failed or cannot apply.
   - the I73 class-A 10-min ladder (`forced ladder`, source `class A 10-min ladder`) while a whole tray
     is off and the cooldown refuses its cycle: 10 min after the later of the last cycle or boot and
     the hold's start, unless its pass for that anchor already started or the cooldown ends first;
-  - the I70 host rung for an unkillable leftover (`host reboot or power cycle`, source
+  - the I70 host rung for an unkillable leftover (`power cycle`, source
     `unkillable leftover budget`): at the end of its budget, then one retry interval after its last
     try; none once its episode closed or with no host rung opted in. It is the sampler's own rung,
     not a forced spawn, so the 10-min floor above does not move it;
   - every registered deadline feed.
   Each forced candidate above (the off-bus forced pass, the I65 retry, the class-A ladder, the I76
-  host rung, the one-shot, the progress retry, the ceiling windows) is routed at its time: a
+  host rung, the one-shot, the ceiling windows) is routed at its time: a
   startup-gate stand-down (spec 03 I75: a ceiling window or one-shot while the startup gate owns the
   hold) is reported as `startup health check, then <rung>` at the stand-down's bounded end (the
   re-adopted jobs' end plus `STARTUP_VERIFY_DEFER_MAX_SEC`), source `startup gate stand-down
   (<source>)`; a run that returns while the bound ladder's post-ladder check is pending is no
   candidate, so the next window or the host rung at that check's end is reported instead; a run
-  routed to the I76 host rung reports `power cycle` (or `warm reboot`), source `hold bound host
+  routed to the I76 host rung reports `power cycle`, source `hold bound host
   rung at <source>`, or nothing when no host rung is opted in; a ceiling window that does not act
   hands over to the next one. The pending host request, the feeds and the I70 leftover rung are not
   forced runs and are not routed.
@@ -1231,8 +1186,7 @@ each rung fires only when the gentler one failed or cannot apply.
   broker registers the I76 hold bound under `hold_bound` through `register_deadline_feed`; it stands
   in for ceiling window 1 and, being the watchdog's last branch, loses a tie at the same time to any
   other candidate. Its candidate (`hold_bound_candidate`) is the bound's mark, hold start plus the
-  ceiling (600 s), source `hold bound (<ceiling>s)`, rung `full ladder, then power cycle` (`warm
-  reboot` where only that is opted in; `full ladder` with no host rung opted in). Inside a
+  ceiling (600 s), source `hold bound (<ceiling>s)`, rung `full ladder, then power cycle` (`full ladder` with the power cycle not opted in). Inside a
   boot/post-cycle cooldown the mark does not move, because the watchdog runs the bound's ladder there;
   only the host rung waits, so the rung reads `... at the cooldown's end (<time>)`. The feed is silent,
   and the chain names what fires next, once window 1 is spent or past due, once the bound's ladder ran,
@@ -1254,10 +1208,7 @@ each rung fires only when the gentler one failed or cannot apply.
   as hung; 600 s is five such periods and the same as the stuck-hold ceiling, while the motivating
   incident sat about an hour without clearing. Past the budget the idle sampler asks for the rung at
   most once per `LEFTOVER_HOST_RUNG_RETRY_SEC` (60 s); each try first re-scans, and a leftover gone
-  by then fires nothing. The rung is chosen by `_host_escalation_for_drop` with the warm reboot
-  futile whenever a chip is off the bus on a multi-chip host (a reboot does not bring an off-bus
-  Galaxy chip back), so that case takes the power cycle; with every chip present the chooser's own
-  order holds (the warm reboot, which ends every process, then the power cycle). No reset or sweep
+  by then fires nothing. The rung is the power cycle, the only host rung (I71), which ends every process. No reset or sweep
   runs first (an exception to I22). Guards kept: a host action already pending (I34)
   asks nothing more (re-read under the device lock, so a try spawned before another path's request,
   such as the I76 bound's host rung, asks nothing: one power-cycle request per episode even when
@@ -1281,17 +1232,14 @@ each rung fires only when the gentler one failed or cannot apply.
   restart starts it again at its first scan (one more budget at most). Time to recover for this
   class: before, unbounded (until an operator rebooted the host; about an hour in the incident);
   after, up to `IDLE_HOLDER_SCAN_SEC` (60 s) while idle before the first scan opens the clock, 600 s
-  plus at most one 60 s retry tick to the request, then the host rung (a warm reboot about 3-5 min,
-  a power cycle about 5-8 min) and the startup check (about 3 min): about 17-23 min (17-20 min by
-  reboot, 19-23 min by power cycle). Later only while the governor holds the rung, each bounded and
-  shown as `held` on `/health`: the I65 cooldown when a cycle or boot fell within its last 30 min,
-  and, on a host with no power cycle opted in, the reboot loop guard
-  (`AUTO_RECOVERY_MIN_INTERVAL_SEC`, 3600 s since the last automatic reboot). The `gone` stage and
+  plus at most one 60 s retry tick to the request, then the power cycle (about 5-8 min) and the startup check (about 3 min): about 19-23 min. Later only while the governor holds the rung, each bounded and
+  shown as `held` on `/health`: the I65 cooldown when a cycle or boot fell within its last 30 min.
+  With no power cycle opted in the episode goes to an operator. The `gone` stage and
   the second scan add no wait.
 
 - **I78 — The I81 driver-wait rescan repeats, bounded, until every isolated chip is back.** I81's
   one rescan comes at the start of tt-smi's 100 s driver wait; a chip whose link trains later in that
-  wait would still miss the reset, which then exits 1 and leaves the I39 retry to heal. So after the
+  wait would still miss the reset, which then exits 1 and spends the episode's one reset (I87). So after the
   I81 rescan, while an isolated chip is still missing, `reset_with_quiesce` drops each returned chip
   from the isolated set (journaled `isolated_chips_returned`, context `mesh reset driver wait`) and
   rescans again every `DRIVER_WAIT_RESCAN_EVERY_SEC` (5 s), at most `DRIVER_WAIT_RESCAN_TRIES` (20)
@@ -1303,14 +1251,14 @@ each rung fires only when the gentler one failed or cannot apply.
   is not up yet. Both reset backends deliver the last count only once the settle is over: the scoped
   backend reads by line, and tt-smi's countdown ends its line only after the last count; the local
   backend polls the output file and sees the last count when it is written. Releases nothing: the
-  full health check, fabric included, still decides (I32), and a failed reset keeps I36, I38, I39 and
+  full health check, fabric included, still decides (I32), and a failed reset keeps I36, I38, I87 and
   the 10 min ladder bound, then the power cycle (I76). Time to recover, class B1 (one chip off the
   bus, isolated, healed by a mesh reset). Measured before, one episode, onset to release: about
-  575 s (about 123 s to the first reset, a failed 263 s mesh reset, a 65 s wait for the I39 retry, a
+  575 s (about 123 s to the first reset, a failed 263 s mesh reset, a 65 s wait for the second reset, a
   62 s healing reset, about 60 s of full check with fabric before release). With I81 and I78, est.:
   about 245 s (123 s, one 62 s healing reset, 60 s check); a chip that trains late in the wait adds
   at most the rest of the 100 s wait instead of a failed reset and a retry. Worst case, a chip that
-  never comes back: unchanged, the failed 263 s reset, then I39, inside the 10 min ladder bound and
+  never comes back: the failed 263 s reset, then the sweep and the power cycle (I87), inside the 10 min ladder bound and
   then the power cycle; the repeat adds no time to it, since it ends with the reset.
 - **I79 — A hold whose reset and full check already failed climbs at once, not at the ceiling.**
   The stuck-hold ceiling (600 s) bounds how long the host rungs wait for the gentler rungs to have
@@ -1326,9 +1274,9 @@ each rung fires only when the gentler one failed or cannot apply.
     the climb still runs the last-chance sweep first (I22), then fires the host rung without the
     ceiling wait (`reason=present_mesh_reset_failed`).
   - **An off-bus hold whose reset regressed the mesh** (class B1, I31): a reset on the gate or the
-    idle ladder left more chips off the bus than before it. I31 bars the bridge, tray and mesh reset
+    idle ladder left more chips off the bus than before it. I31 bars the bridge and mesh reset
     rungs for the rest of the episode, so the ceiling wait has no rung left to try. The climb runs
-    the last-chance sweep first (I22), then the cold rung (warm reboot futile), without the ceiling
+    the last-chance sweep first (I22), then the power cycle, without the ceiling
     wait (`reason=reset_regressed_offbus`). A cold rung `auto_recovery_allowed` holds off (the I65
     cooldown, a tenant, the rate limit) returns before the sweep, as at the ceiling, and is asked
     again on the next forced window; the I76 bound still runs the full ladder at 10 min. With no
@@ -1337,14 +1285,13 @@ each rung fires only when the gentler one failed or cannot apply.
     startup gate's full check (03 I4). Time to recover: one 8-chip hold whose post-job reset dropped
     one chip waited 512 s for the ceiling, swept for 110 s, power-cycled and was released at 904 s;
     the same episode now sweeps at about 98 s, cycles at about 210 s and is released at about 390 s.
-    On a Galaxy, a healing mesh reset followed by a second chip's drop now sweeps (a per-tray
-    re-power) at the drop instead of up to one forced window (80 s measured) later.
-  - **The boot an I29 77 reboot brought up** (with no fabric pass since the broker started) and a
+    On a Galaxy, a healing mesh reset followed by a second chip's drop now sweeps at the drop
+    instead of up to one forced window (80 s measured) later.
+  - **The boot an I29 77 power cycle brought up** (with no fabric pass since the broker started) and a
     power cycle opted in: the 77 is not handed to an operator. The episode owes the climb at once. The
     earlier episode's reset counts as its one reset, the sweep runs on the first re-check, and the
-    climb takes the cold rung (warm reboot futile), once. The cold flag holds on a present mesh too:
-    `_host_escalation_for_drop` names the power cycle for it, and I71's fallback reboot never
-    replaces a cold rung the cooldown or the governor denies. The I40 fallback marks the episode's reset
+    climb takes the power cycle again, once; a cycle the cooldown or the governor denies holds and is
+    asked again (I71). The I40 fallback marks the episode's reset
     as spent before it escalates, so the ladder sweeps rather than resetting again. The boot that power
     cycle brought up is spent: the hold goes to an operator with a deadline (I29), but the operator
     hand-off does not stop the I76 bound: at 600 s the bound's ladder runs and asks for the next
@@ -1368,7 +1315,7 @@ each rung fires only when the gentler one failed or cannot apply.
   included, after the last reset releases it (03 I32, goal of I22). Time to recover, from the hold
   opening after the UNKNOWN reset: the host rung fires at about 8 min (120 s re-check plus a sweep of
   about 5 to 6.5 min), where it used to fire at about 18.5 min (the 600 s ceiling, reached on the
-  next 600 s backoff step). The post-reboot boot asks for the power cycle about 8 min after its hold
+  next 600 s backoff step). The boot after that cycle asks for the next power cycle about 8 min after its hold
   opens, or, if the I65 cooldown ends later, at the cooldown's end (watchdog retry); not paging
   for that cooldown changes neither time. A 77 on the boot a 77 power cycle brought up gets its next
   cycle at 600 s or the doubling cooldown's end, whichever is later. A present mesh's failed reset climbs about
@@ -1403,10 +1350,10 @@ each rung fires only when the gentler one failed or cannot apply.
   the links the lift's first job failed on. A post-ladder check that finds any descriptor port
   missing (spec 03 I71) or, under the I42 latch, any mismatch is a failed check: no release, the host
   rung is asked for (subject to the I65 cooldown). Below the bound the faster class paths stay as they are; a forced run that
-  started below the bound (the off-bus one-shot, a progress retry, a gated grace) is not the bound's
+  started below the bound (the off-bus one-shot, a gated grace) is not the bound's
   ladder, so at the bound the full ladder runs again before any host rung. When the ladder
   leaves the mesh unrecovered, the broker's own code asks for the host rung at once: the BMC power
-  cycle, or the warm reboot where only that is opted in. When the ladder brings the mesh back, only its
+  cycle (I71). When the ladder brings the mesh back, only its
   full check, fabric included, releases the hold. A full check that ends with no pass (a failed
   verdict, or a fabric pass that could not run for any cause but a 1G hugepage pool still filling)
   asks for the host rung at once (event `hold_bound_check_failed`): inside the forced run when the
@@ -1429,8 +1376,8 @@ each rung fires only when the gentler one failed or cannot apply.
   at the bound the broker journals and pages `hold_bound_tenant_blocked` once per episode, naming the
   blocker (pid, user, command), `/health` shows `next_step` `tenant_blocked` with `blocked_by`, and
   on the first sampler tick after the tenant leaves the ladder runs, then the host rung if the full
-  check fails. With both host rungs
-  opted out (`TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` and `TT_DEVICE_MCP_AUTO_REBOOT=0`) the hold pages
+  check fails. With the power cycle
+  opted out (`TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`) the hold pages
   `hold_bound_no_host_rung` once per episode. The operator kill switch
   `TT_DEVICE_MCP_FORCE_ESCALATE=0` turns off only the forced runs below the bound; the bound's ladder
   and host rung ignore it, no env or config switches the bound off, and the boot rung inventory's
@@ -1475,7 +1422,7 @@ each rung fires only when the gentler one failed or cannot apply.
   counts for the doubling, the backstop and the boot's attribution (not the per-boot cap, which counts
   only this boot's rows), and is marked `took_host_down: true, late: true` on disk so every later boot
   counts it too (`power_cycle_request_late`). Broker startup writes that mark for the boot it starts
-  on, whatever the boot does later: it may escalate only by reboot, or not at all, and its power-cycle
+  on, whatever the boot does later: an older broker may have escalated it by reboot, or nothing at all, and its power-cycle
   gate never runs. The mark is idempotent, and a ledger the broker cannot read or rewrite is left as
   it is and logged. Counting it is the boot-loop-safe side. The first miss is asked again
   as its window ends, with no backoff on top: the window already gave the cycler its time. Later
@@ -1505,7 +1452,7 @@ each rung fires only when the gentler one failed or cannot apply.
   |---|---|---|---|
   | A whole tray, missed request | 30 min-4 h (each miss anchored and doubled the cooldown) | first miss 15 min, later 20 min (window + 0 / + 5 min) | 10 min; missed-request exception: window + 5 min |
   | B2 four chips off, missed request | 30 min-4 h (same) | first miss 15 min, later 20 min | 12 min; same exception |
-  | A or B1 after a cycle that landed late | doubles 30 min, 1 h, 2 h, 4 h | unchanged: the late cycle counts and doubles on every path, also when its boot escalates only by reboot (the startup mark) | I65 boot-loop guard (stated exception) |
+  | A or B1 after a cycle that landed late | doubles 30 min, 1 h, 2 h, 4 h | unchanged: the late cycle counts and doubles on every path, also when its boot never cycles (the startup mark) | I65 boot-loop guard (stated exception) |
   | A, B1 or B2 after a cycle that took the host down | I65 cooldown, doubling | unchanged | unchanged |
 
   I72 adds no wait before the first power-cycle request and gates only the power-cycle rung, never a
@@ -1677,7 +1624,7 @@ Class structure: see the diagram in 03-health.md.
   `server.select_recovery` is the module-global alias (`fsm.select_recovery`) the gate and the
   reset routes call.
 - **`Recovery.next_stage(ev: Evidence) -> str`** — the one rung `ev` justifies: a stage name
-  (`bridge_reset`, `smi_reset`, `host_reboot`, `power_cycle` — `constants.STAGE_NAMES`)
+  (`bridge_reset`, `smi_reset`, `power_cycle` — `constants.STAGE_NAMES`)
   or a non-stage decision (`BELOW_FLOOR`, `WAIT`, `DEFER`, `RELEASE`, `HOLD_FABRIC_UNVERIFIED`, `BLOCKED`). Pure:
   the caller acts. The gate steers on `GalaxyRecovery.next_stage` on every platform (the ladder at
   a job boundary is one ladder; only the reset argv is platform-specific);
@@ -1704,12 +1651,11 @@ Class structure: see the diagram in 03-health.md.
   `read_auto_recovery_ledger`, `boot_from_broker_escalation` (attributes a boot to the escalation
   that caused it only within `BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC`, 900 s — a stale entry must
   not stamp an external reboot as broker recovery); `_fire_recovery_escalation` (the shared
-  record-then-fire body of both host rungs).
+  record-then-fire body of the power cycle).
 - **Stage fire functions (the argv seams).** Each stage isolates the destructive action in one
   function the test suite stubs and asserts argv on: `stages/bridge_reset.reset_chip_via_bridge`
   (setpci Secondary Bus Reset on the parent bridge; tri-state result — recovered / retryable /
-  structurally inapplicable), `stages/host_reboot._fire_host_reboot` (`systemctl
-  reboot`), `stages/power_cycle._fire_power_cycle` (`ipmitool chassis power cycle`),
+  structurally inapplicable), `stages/power_cycle._fire_power_cycle` (`ipmitool chassis power cycle`),
   `stages/smi_reset` (the per-chip reset ioctl binding). A fire that raises is a launch failure the
   ladder reports and falls past; it never masks as success.
 - **`device_holders`** — `enumerate_device_holders() -> HolderScan` (tt-kmd's own
@@ -1771,24 +1717,11 @@ structurally inapplicable chip (no bridge, no setpci) as fall-through rather tha
 bare PCI rescan before anything heavier, and refuses a stale cached address whose target bus now
 holds live silicon.
 
-**The two below-floor branches.** `BELOW_FLOOR` splits on the hold's *class*, chosen
-once at fire time by `_classify_hold` (never in `_route`, which stays a pure function of its
-inputs). A whole UBB tray off the bus with *no bridge window on any of its chips* — every off-bus
-chip's per-chip SBR reported `no_bridge`, recorded by the bridge rung on
-`Recovery.last_bridge_reset_reasons` and threaded onto `Evidence.bridge_reset_failed` by the gate's
-`replace(ev, …)` *after* that rung fires — is the `TRAY_DOWN_NO_WINDOW` class: the one drop measured
-never to return by any single reset (0/40 episodes). It fires every reset type back-to-back with no
-verify between (`_fire_tray_down_no_window`) — SBR, then the mesh-wide reset (no tray step, I23) — then exactly ONE settle and ONE verify, and if the mesh is still bad goes
-straight to the cold power cycle (a whole tray off the bus is warm-reboot-futile — a Galaxy reboot
-does not re-power the UBBs); no retries, no ceiling wait, no rung skipped, because there is nothing
-to lose before the power cycle. Everything else — a partial-tray drop, a chip that still has a
-bridge window, or a window left *unknown* because no bridge rung ran this pass — is
-`HOLD_CLASS_GENERIC`: a whole-tray drop goes to the I27 power cycle, anything else holds for the
-I76 ladder at 10 min. The no-window branch honours the same tenant guard and the
-power-cycle cooldown/boot-loop denials as the generic path; the classification is journalled
-(`hold_classified`, with the class, the off-bus set and the trays). A chip absent from
-`bridge_reset_failed` reads as *unknown*, never `no_bridge`, so the aggressive sweep can never fire
-on an unproven window.
+**Below the floor.** `BELOW_FLOOR` is not a rung: there is no tray rung (I23) and no
+back-to-back reset sweep. A whole UBB tray off the bus goes to the bounded I27 power cycle at once,
+its only wait the I65 cooldown; it runs no reset and holds the device, and the post-boot startup
+gate re-proves the mesh. Anything else holds, and the I76 bound runs the full ladder at 10 min.
+The power cycle honours the same tenant guard and the cooldown/boot-loop denials on every path.
 
 **The tray-down prelude (I19).** Every caller of the ladder (`escalate()`: the gate, the idle
 relift, the hold-deadline watchdog) passes through `_tray_down_latch` first, which latches
