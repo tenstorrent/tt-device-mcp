@@ -12,6 +12,8 @@ ladder and then a power cycle. A healthy read still passes.
 
 from datetime import datetime, timedelta
 
+import time
+
 import pytest
 
 from tests import test_dispatch_failure_reset as dfr
@@ -190,13 +192,10 @@ async def test_a_post_reset_check_that_finds_every_link_releases(nodesc_mesh):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rung", ["power-cycle"])
-async def test_the_held_drop_runs_the_ladder_at_the_10_min_mark_then_the_host_rung(
-    monkeypatch, nodesc_mesh, rung
-):
+async def test_the_held_drop_runs_the_ladder_at_the_10_min_mark_then_the_host_rung(monkeypatch, nodesc_mesh):
     """At the 10-min hold ceiling the watchdog runs the present-mesh reset; its full post-reset check
-    still fails on the count, and the same window requests the host rung (a power cycle where the
-    reboot rung is off). Never a release without a passing full check."""
+    still fails on the count, and the same window requests the power cycle, the only host rung. Never
+    a release without a passing full check."""
     from tt_device_mcp.health.recovery import galaxy
 
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
@@ -204,8 +203,11 @@ async def test_the_held_drop_runs_the_ladder_at_the_10_min_mark_then_the_host_ru
 
     async def power_cycle(log, reason):
         cycles.append(reason)
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
 
+    # Like the real rung, the stand-in leaves its request pending.
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
     nodesc_mesh["reset_heals"] = False
     since = datetime.now() - timedelta(seconds=galaxy._stuck_hold_ceiling_sec() + 1)
     monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
@@ -213,8 +215,7 @@ async def test_the_held_drop_runs_the_ladder_at_the_10_min_mark_then_the_host_ru
     assert nodesc_mesh["resets"] and all(r == ["tt-smi", "-glx_reset"] for r in nodesc_mesh["resets"])
     ok, detail = nodesc_mesh["fabric"][-1]
     assert ok is False and FABRIC_LINKS_UNSEEN in detail, "the full post-reset check fails on the count"
-    fired = "reboot" if nodesc_mesh["reboots"] else "power-cycle" if cycles else None
-    assert fired == rung, f"the window requests the {rung} rung once the ladder's check fails"
+    assert len(cycles) == 1, "the window requests the power cycle once the ladder's check fails"
     assert srv.fsm.state is not ServerState.HEALTHY
 
 

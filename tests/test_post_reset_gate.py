@@ -356,7 +356,6 @@ def test_a_given_back_one_shot_gives_back_the_ceiling_window_it_claimed(monkeypa
     monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
     monkeypatch.setattr(srv, "device_hold_offbus_prior_bucket", None)
     monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)
-    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry", None)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
     srv.fsm.set_latch("escalated", False)
     monkeypatch.setattr(srv, "isolated_chips", {"13"})

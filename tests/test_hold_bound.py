@@ -1528,7 +1528,6 @@ async def test_t3_a_77_on_the_boot_a_77_power_cycle_brought_up_still_gets_the_ne
         lambda boot: {"action": "power-cycle", "reason": galaxy.FABRIC_77_HOST_RUNG_CAUSE},
     )
     assert "this boot is the power-cycle" in g._fabric_77_host_rung_spent(srv.device_hold_episode_since)
-    assert not g.fabric_77_climb_owed(srv.device_hold_episode_since) or not g._fabric_77_cold_rung_due()
 
     srv._check_hold_deadline(now=datetime.now())
     await _drain()

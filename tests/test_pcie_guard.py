@@ -371,9 +371,9 @@ async def test_a_sweep_that_fails_its_verify_leaves_no_intent_for_the_power_cycl
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["power-cycle", "reboot"])
+@pytest.mark.parametrize("action", ["power-cycle"])
 async def test_a_broker_host_action_closes_an_open_intent_durably_before_it_fires(sysfs, monkeypatch, tmp_path, action):
-    """Whoever left the intent open, the broker's own reboot or power cycle removes it, durably, after
+    """Whoever left the intent open, the broker's own power cycle removes it, durably, after
     its ledger row and before the fire: the host going down next is the broker's, not a hang."""
     _boot(sysfs, "boot-a")
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)

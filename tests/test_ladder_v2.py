@@ -67,7 +67,7 @@ def _ev(**over):
 
 
 def _wire_failed_tray_down_sweep(monkeypatch, read_heartbeats, *, allowed=True):
-    """Wire _fire_tray_down_no_window so the one verify fails and the power cycle is opted in.
+    """Wire the climb after a failed reset so the one verify fails and the power cycle is opted in.
     Returns the recorded health events and the power-cycle counter."""
     g = srv.galaxy_recovery
     monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
