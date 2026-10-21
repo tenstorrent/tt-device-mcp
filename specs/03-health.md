@@ -1226,6 +1226,23 @@ cooldown (spec 04 I65) holds longer.
   hold watchdog keep `_device_hold_state`, so it changes no recovery step and no time to recover.
   A routine op on a device no hold was open for (a between-jobs check, a post-job reset) does not
   read as held; `device_degraded` names it.
+- **I81 — A missing validator is its own no-verdict class: no reset, no eth-training wait, shown
+  on `/health`, build requested.** When the fabric check runs the pinned validator (no
+  `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, or one naming the shipped `tt-device-fabric-check.sh`) and its
+  binary, runtime root or configured cabling descriptor is not on disk
+  (`fabric.validator_not_built`, stat calls only), the 77 it gives measured nothing. It is the
+  77-only hold of I34, never the generic present-mesh hold, and it owes no reset and counts as no
+  link fault (spec 04 I29: no host rung). A post-reset check that hits it takes no eth-training
+  wait and no retry: the verdict is UNKNOWN at once (`healthy=None`), never a pass and never a
+  failed reset, and the log says `fabric validator not built`, not `no trained link`. `/health`
+  carries `fabric_validator: {built, missing}`. The I39 watch asks systemd for the build once per
+  hold episode (`systemctl start --no-block tt-device-fabric-validator.service`, bounded at 30 s,
+  skipped without systemd or root); the request lifts nothing. Once the build lands, the owed
+  full check (fabric included) runs, and only a pass lifts the hold. An operator's own fabric
+  command is not judged by these paths and keeps the eth-training wait. Spec 04 I76 is unchanged:
+  a validator still missing at the 10-min mark gets the full ladder, then the power cycle. Time
+  to recover: a post-reset check on a box with no validator no longer spends 60 s waiting for eth
+  training; every other class is unchanged.
 
 ## Interfaces
 
@@ -1894,6 +1911,7 @@ refuses.
 | I79/I66 (two fast all-ones samples mark the chip lost before the confirm bound; one gated real read while it is pending) | `tests/test_offbus_early_watch.py::test_two_fast_all_ones_samples_mark_a_chip_lost_before_the_confirm_bound`, `test_two_fast_blackout_samples_mark_every_chip_lost_before_the_confirm_bound` |
 | I79 (the 4 s confirm bound holds across the window end and the storm cap, for the per-chip, blackout, all-gone and short-count paths; a later reading keeps the regular proof; an isolated chip's node arms nothing) | `tests/test_offbus_early_watch.py::test_the_confirm_bound_holds_across_the_end_of_a_fast_window`, `test_a_pending_chip_past_the_window_still_gets_its_real_read`, `test_a_reading_that_began_after_the_window_keeps_the_regular_proof`, `test_a_chip_the_sampler_isolated_arms_nothing_when_its_node_leaves` |
 | I80 | `tests/test_health_held_during_op.py::test_health_stays_held_while_a_forced_rung_runs`, `tests/test_health_held_during_op.py::test_health_lifts_the_hold_only_when_the_gate_passes_inside_the_op`, `tests/test_health_held_during_op.py::test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held`, `tests/test_health_held_during_op.py::test_a_hold_opened_inside_an_op_keeps_its_held_since_after_the_op`, `tests/test_health_held_during_op.py::test_a_closed_episodes_held_since_never_carries_into_the_next_hold`, `tests/test_health_held_during_op.py::test_a_rehold_inside_the_carry_window_reports_the_carried_start_in_and_after_the_op`, `tests/test_health_held_during_op.py::test_an_in_window_rehold_inside_an_op_with_no_read_keeps_the_carried_start_after_it`, `tests/test_health_held_during_op.py::test_an_in_window_rehold_outside_an_op_reports_the_carried_start`, `tests/test_health_held_during_op.py::test_a_read_before_an_in_window_reholds_verdict_yields_to_the_carried_start` |
+| I81 | `tests/test_validator_not_built.py::test_the_not_built_read_speaks_only_for_the_pinned_validator`, `tests/test_validator_not_built.py::test_a_post_reset_77_with_the_validator_not_built_takes_no_eth_training_wait`, `tests/test_validator_not_built.py::test_the_post_reset_log_names_the_missing_validator_not_a_trained_link`, `tests/test_validator_not_built.py::test_an_operators_own_fabric_check_keeps_the_eth_training_wait`, `tests/test_validator_not_built.py::test_health_shows_whether_the_validator_is_built`, `tests/test_validator_not_built.py::test_the_build_is_requested_once_per_hold_episode_without_blocking`, `tests/test_validator_not_built.py::test_no_build_request_without_systemd_or_root`, `tests/test_validator_not_built.py::test_a_hung_build_request_is_bounded`, `tests/test_validator_not_built.py::test_the_watch_requests_the_build_then_lifts_only_on_a_passing_full_check`, `tests/test_validator_not_built.py::test_an_idle_relift_on_a_not_built_validator_never_resets_or_lifts`, `tests/test_validator_not_built.py::test_the_10_min_bound_still_forces_a_not_built_hold` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

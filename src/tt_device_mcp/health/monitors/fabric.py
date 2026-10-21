@@ -382,6 +382,23 @@ def validator_missing() -> Optional[str]:
     return None
 
 
+# The systemd unit that builds the pinned validator (deploy/tt-device-fabric-validator.service).
+VALIDATOR_BUILD_UNIT = "tt-device-fabric-validator.service"
+# The shipped wrapper: an override naming it runs the same pinned validator, so it 77s on the same paths.
+_SHIPPED_WRAPPER = "tt-device-fabric-check.sh"
+
+
+def validator_not_built() -> Optional[str]:
+    """``validator_missing()`` when the fabric check runs the pinned validator, else ``None`` (spec 03
+    I81). That is with no ``TT_DEVICE_MCP_FABRIC_CHECK_CMD``, or one naming the shipped wrapper. An
+    operator's own command needs none of these paths, so their absence says nothing about it. Stat
+    calls only."""
+    override = os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "").strip()
+    if override and _SHIPPED_WRAPPER not in override:
+        return None
+    return validator_missing()
+
+
 def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str, str]]]:
     """The argv + env to run the fabric check with, or ``None`` when nothing is
     configured/available to run at all.
