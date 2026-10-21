@@ -96,7 +96,24 @@ the queue and a running job outlive the broker process.
 - **I8** — A job's exit status comes from the job itself: the shell preamble
   (`_exit_trap_preamble`) traps EXIT/TERM/INT and writes the status to
   `job_exit_file(job_id)`. A re-adopted job with no exit file MUST be reported FAILED,
-  never "completed"; a signalled job records a real 128+N status.
+  never "completed"; a signalled job records a real 128+N status. The file is always the
+  current job's: before a job starts the broker creates a new empty file under a random name
+  (`O_EXCL|O_NOFOLLOW`), gives it to the uid the job runs as and renames it over the path in one
+  step (`prepare_job_exit_file`), replacing whatever an earlier job (ids recycle) or another user
+  left there, so the job's trap can write it in the sticky shared dir and no other non-root user
+  can claim the path first. A failed prepare is logged once and leaves no file. At startup, after
+  re-adoption, the exit files of jobs not re-adopted and any half-made fresh file are removed
+  (`sweep_job_exit_files`). A re-adopted job's file is read without following links and only
+  against its known start time: missing, unreadable, empty, malformed, not one plain regular file
+  (symlink, FIFO, hard link), owned by neither the broker's uid nor the job's submitter, last
+  written before the start, or no start time all mean status UNKNOWN. The submitter's uid
+  survives a restart only through the broker's own log header: the `SUBMITTER UID` line the
+  broker writes right after `JOB ID`, ahead of any text a tenant chose, read only at that line and
+  only from a regular log file the broker owns that no other user can write
+  (`_job_log_submitter_uid`). A re-adopted job without it (no log, an older header) has no
+  submitter, so a file only the submitter could have written reads as UNKNOWN. Unknown is never
+  exit 0: the job is reported FAILED and the device is marked dirty, so a reset and the full
+  check (fabric included) pass before the next job.
 - **I9** — Job ids ("000".."999", recycled) are never reissued while anything still answers
   to them: an in-memory job, a live scope, a reserved action/hold row, or a log among the
   newest `JOB_ID_RECENT_WINDOW` (200) log files. The counter is reseeded from the newest
@@ -378,7 +395,8 @@ Other subsystems and tenants may rely on:
   `_terminate_job` (scope-aware kill, used by recovery), `write_job_log_footer`,
   `cleanup_finished_jobs`, module state `jobs`, `current_job_id`, `current_process`,
   `readopted_scopes`.
-- **Job log format**: header block (`JOB ID`/`OWNER`/`WORKSPACE`/`COMMAND`/`ENV FILE`/
+- **Job log format**: header block (`JOB ID`/`SUBMITTER UID` (socket submits only, I8)/
+  `OWNER`/`WORKSPACE`/`COMMAND`/`ENV FILE`/
   `TIMEOUT`/`QUEUED` + `ENVIRONMENT VARIABLES`), a `[Started at <iso>]` marker, and a
   footer (`FINISHED`/`STATUS`/`EXIT CODE`/`WAIT TIME`/`RUNTIME`). `_recent_jobs` and
   `_job_from_log` parse it; the footer may sit up to `FOOTER_TAIL_LINES` (512) from the
@@ -551,8 +569,8 @@ flowchart LR
   `aio.wait_for`, which has `asyncio.wait_for`'s contract but is built on `asyncio.wait`. Only
   request handlers may keep a plain `asyncio.wait_for` in `server.py`.
 - At startup, `reconcile_running_scopes` re-adopts every active `ttdev-job-*.scope`:
-  the job is reconstructed from its log header (`_job_from_log` — owner, command,
-  queued/started, TIMEOUT), registered RUNNING, and `_monitor_readopted_scope` polls the
+  the job is reconstructed from its log header (`_job_from_log` — owner, submitter uid,
+  command, queued/started, TIMEOUT), registered RUNNING, and `_monitor_readopted_scope` polls the
   scope, enforcing the remaining timeout (I7) and finalizing from the job's exit file
   (I8). The finalize path mirrors the normal evidence classification (I14) and writes the
   footer. `_restore_queued_jobs` then re-queues persisted specs in order (I6).
@@ -627,7 +645,7 @@ flowchart LR
 | I17 | `tests/test_restart_drain.py::test_a_job_writes_its_output_to_a_spool_not_a_pipe`, `tests/test_restart_drain.py::test_a_readopted_job_keeps_printing_and_its_log_gets_every_line_once`, `tests/test_restart_drain.py::test_the_spool_frees_what_the_broker_has_copied`, `tests/test_restart_drain.py::test_an_unusable_spool_dir_falls_back_to_pipes`, `tests/test_restart_drain.py::test_startup_sweeps_spools_of_jobs_not_readopted`, `tests/test_restart_drain.py::test_startup_copies_the_uncopied_spool_tail_into_the_log_before_the_sweep`, `tests/test_restart_drain.py::test_a_spool_line_with_no_newline_is_still_bounded`, `tests/test_restart_drain.py::test_a_spool_reader_ends_as_the_job_exits_not_a_poll_later` |
 | I18 | `tests/test_restart_drain.py::test_no_job_dispatches_while_the_update_holds_dispatch`, `tests/test_restart_drain.py::test_a_dead_or_overdue_hold_is_ignored`, `tests/test_restart_drain.py::test_a_job_held_by_the_update_is_gated_again_before_it_runs`, `tests/test_restart_drain.py::test_a_step_that_reserves_the_device_during_the_hold_is_waited_out` |
 | I7 | `tests/test_readopt.py::test_readopted_deadline_counts_time_already_served`, `tests/test_readopt.py::test_readopted_job_past_its_deadline_is_terminated`, `tests/test_readopt.py::test_readopted_job_inside_its_deadline_is_left_alone`, `tests/test_readopt.py::test_job_from_log_recovers_the_deadline`, `tests/test_readopt.py::test_job_from_log_without_a_timeout_header_still_gets_a_deadline` |
-| I8 | `tests/test_readopt.py::test_readopted_job_recovers_its_real_exit_code`, `tests/test_readopt.py::test_readopted_job_that_passed_is_reported_as_passed`, `tests/test_readopt.py::test_readopted_job_with_no_exit_status_is_not_called_completed`, `tests/test_readopt.py::test_a_signalled_job_records_a_real_exit_status`, `tests/test_readopt.py::test_the_job_exit_dir_is_redirectable` |
+| I8 | `tests/test_readopt.py::test_readopted_job_recovers_its_real_exit_code`, `tests/test_readopt.py::test_readopted_job_that_passed_is_reported_as_passed`, `tests/test_readopt.py::test_readopted_job_with_no_exit_status_is_not_called_completed`, `tests/test_readopt.py::test_a_signalled_job_records_a_real_exit_status`, `tests/test_readopt.py::test_the_job_exit_dir_is_redirectable`, `tests/test_job_exit_file.py::test_a_stale_exit_file_is_replaced_and_given_to_the_jobs_uid`, `tests/test_job_exit_file.py::test_a_file_the_job_could_not_write_is_not_left_behind`, `tests/test_job_exit_file.py::test_the_runner_starts_every_job_on_a_fresh_exit_file_its_trap_writes`, `tests/test_job_exit_file.py::test_the_startup_sweep_removes_orphans_and_keeps_readopted_jobs_files`, `tests/test_job_exit_file.py::test_a_readopted_job_with_no_usable_exit_status_gets_reset_and_full_check`, `tests/test_job_exit_file.py::test_an_unknown_exit_status_really_flags_the_device`, `tests/test_job_exit_file.py::test_a_stale_exit_0_from_an_earlier_job_is_never_this_jobs_status`, `tests/test_job_exit_file.py::test_an_exit_file_is_read_only_against_a_known_start`, `tests/test_job_exit_file.py::test_a_co_tenant_cannot_win_the_path_while_the_fresh_file_is_made`, `tests/test_job_exit_file.py::test_a_failed_prepare_warns_once_and_leaves_nothing`, `tests/test_job_exit_file.py::test_the_sweep_removes_fresh_files_a_dead_broker_never_renamed`, `tests/test_job_exit_file.py::test_an_exit_file_that_is_not_one_plain_file_reads_as_unknown`, `tests/test_job_exit_file.py::test_an_exit_file_another_user_owns_reads_as_unknown`, `tests/test_job_exit_file.py::test_a_co_tenants_exit_0_never_releases_a_readopted_job_without_a_reset`, `tests/test_job_exit_file.py::test_a_readopted_privsep_jobs_clean_exit_is_still_its_own`, `tests/test_job_exit_file.py::test_a_co_tenants_file_is_still_unknown_for_a_readopted_job`, `tests/test_job_exit_file.py::test_a_readopted_job_with_no_log_has_no_uid_and_its_status_stays_unknown`, `tests/test_job_exit_file.py::test_a_uid_anywhere_but_the_brokers_own_header_line_is_ignored`, `tests/test_job_exit_file.py::test_the_brokers_header_line_names_the_submitter`, `tests/test_job_exit_file.py::test_a_log_another_user_could_have_written_names_no_submitter` |
 | I9 | `tests/test_server.py::test_next_job_id_is_3_digit_and_wraps`, `tests/test_server.py::test_next_job_id_skips_live_ids`, `tests/test_server.py::test_seed_job_counter_resumes_across_restart`, `tests/test_server.py::test_seed_job_counter_wraps_at_999`, `tests/test_server.py::test_a_restart_does_not_reissue_an_id_a_log_still_holds`, `tests/test_server.py::test_no_id_in_the_recent_window_is_ever_reissued`, `tests/test_recent_jobs.py::test_a_reserved_action_id_is_not_handed_to_another_job` |
 | I10 | `tests/test_device_safety.py::test_a_silent_job_is_reaped_as_hung`, `tests/test_device_safety.py::test_hung_silence_of_zero_disables_the_reaper`, `tests/test_device_safety.py::test_the_doomed_grace_lets_the_backtrace_land`, `tests/test_device_safety.py::test_doomed_grace_of_zero_disables_the_doomed_reaper`, `tests/test_preemptable.py::test_a_silent_preemptable_job_is_not_reaped_while_nobody_waits`, `tests/test_preemptable.py::test_a_silent_preemptable_job_is_reaped_once_a_job_waits`, `tests/test_preemptable.py::test_a_silent_job_past_its_limit_is_preempted_not_reaped`, `tests/test_job_kill_reset.py::test_a_hung_reap_gives_sigint_the_short_window`, `tests/test_job_kill_reset.py::test_a_runner_timeout_keeps_the_full_sigint_window`, `tests/test_job_kill_reset.py::test_the_hung_sigint_window_is_short_and_the_rest_of_the_ladder_unchanged` |
 | I11 | `tests/test_server.py::TestActivationScript::test_activation_script_default`, `tests/test_server.py::TestActivationScript::test_activation_script_with_env_file`, `tests/test_server.py::TestActivationScript::test_activation_script_inherited_env`, `tests/test_server.py::TestActivationScript::test_activation_script_python_env_dir_over_virtual_env`, `tests/test_server.py::TestActivationScript::test_activation_script_virtual_env_fallback`, `tests/test_server.py::TestEnvFile::test_load_env_file_converts_to_strings` |

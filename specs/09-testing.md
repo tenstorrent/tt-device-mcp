@@ -181,7 +181,7 @@ carry which spec's anchors. Approximate collected counts in parentheses.
 |---|---|---|
 | `test_device_safety.py` (450) | The safety corpus: gate hold/dirty/verify semantics, idle and fabric relift, stuck-hold escalation, galaxy floor, ledger/governor, bridge rung, dead-chip sampler, burst cap, cooldown, exec gating, preflight | 01, 03, 04, 05, 06 |
 | `test_server.py` (70) | Job lifecycle, ids and wraparound, activation script / env resolution, clean-device gate ladder, MCP progress streaming, synthetic socket host | 01, 02 |
-| `test_readopt.py` (25) | Restart survival: scope re-adoption, recovered deadlines and exit codes, jobexit dir redirection and perms | 01, 05, 06 |
+| `test_readopt.py` (25), `test_job_exit_file.py` (24) | Restart survival: scope re-adoption, recovered deadlines and exit codes, jobexit dir redirection and perms, fresh per-job exit files and the startup sweep, the submitter's uid from the log header | 01, 05, 06 |
 | `test_recent_jobs.py` (37) | Job-log footer format, recent-history parsing, id reservation, kill audit | 01, 05 |
 | `test_socket_transport.py` (8), `test_stdio_shim.py` (3), `test_cli.py` (34) | Unix-socket JSON-RPC, peer-uid scope, shim socket resolution, CLI entry behavior; `test_cli.py` also carries the lock and smi-wrapper anchors | 02, 05 |
 | `test_authz.py` (7), `test_peercred.py` (8), `test_privsep.py` (14), `test_privsep_guard.py` (3) | SO_PEERCRED parse, identity over self-report, run-as-submitter prefix, refuse-never-root-fallback | 05 |

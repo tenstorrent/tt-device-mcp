@@ -33,8 +33,10 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -1847,12 +1849,74 @@ def ensure_job_exit_dir() -> None:
         pass
 
 
-def read_job_exit_code(job_id: str) -> Optional[int]:
-    """The exit status the job recorded for itself, or None if it never got to."""
+def prepare_job_exit_file(job_id: str, uid: Optional[int] = None) -> bool:
+    """Give a job about to start a fresh, empty exit file its own uid can write (spec 01 I8).
+
+    Ids recycle, so a file left at this path belongs to an earlier job: read after a restart it
+    would pass for this job's status, and in the shared sticky dir a file another user owns cannot
+    even be opened by root while fs.protected_regular is set, so the job's EXIT trap loses its
+    status. The new file is made under a random name (O_EXCL|O_NOFOLLOW), handed to ``uid`` and
+    renamed over the path in one step: there is no moment where the path is free for another user
+    to claim, and once the job's uid owns it no other non-root user can replace it. Empty reads as
+    no status until the job writes one. False (one warning) when that fails; the read side's owner
+    and start-time checks still refuse whatever is left there."""
+    path = job_exit_file(job_id)
+    tmp: Optional[str] = None
     try:
-        raw = job_exit_file(job_id).read_text().strip()
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{job_id}.exit.", suffix=".tmp")
+        try:
+            os.fchmod(fd, 0o644)
+            if uid is not None and uid != os.geteuid():
+                os.fchown(fd, uid, -1)
+        finally:
+            os.close(fd)
+        os.rename(tmp, path)
+        return True
+    except OSError as e:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        # A file the job cannot write is worse than none: without it the trap creates its own.
+        clear_job_exit_file(job_id)
+        if logger:
+            logger.warning(
+                f"JOB_RUNNER job_id={job_id} cannot give the job a fresh exit file {path} (uid {uid}): {e}; "
+                "a status it cannot prove is its own reads as unknown"
+            )
+        return False
+
+
+def read_job_exit_code(job_id: str, started_at: Optional[str] = None, owner_uid: Optional[int] = None) -> Optional[int]:
+    """The exit status the job recorded for itself, or None if it never got to.
+
+    ``started_at`` is the job's start time (isoformat). A file last written before it is an
+    earlier job's with the same id, and an unknown start time cannot prove the file is this job's:
+    both read as no status, never as a clean exit (spec 01 I8). So does anything at the path that is
+    not one plain regular file owned by this broker's uid or ``owner_uid`` (the job's submitter):
+    a symlink, a FIFO, a hard link, or a file another user planted in the shared sticky dir."""
+    path = job_exit_file(job_id)
+    try:
+        start = datetime.fromisoformat(started_at).timestamp() if started_at else None
+    except (TypeError, ValueError):
+        start = None
+    if start is None:
+        return None
+    owners = {os.geteuid()} | ({owner_uid} if owner_uid is not None else set())
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid not in owners or st.st_mtime < start - 1.0:
+            return None
+        raw = os.read(fd, 64).decode("ascii", "replace").strip()
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
     try:
         return int(raw)
     except ValueError:
@@ -1864,6 +1928,33 @@ def clear_job_exit_file(job_id: str) -> None:
         job_exit_file(job_id).unlink()
     except OSError:
         pass
+
+
+def sweep_job_exit_files(keep: Callable[[str], bool]) -> list[str]:
+    """Remove the exit files of jobs ``keep`` does not claim; the ids removed. Run at startup after
+    re-adoption: only a re-adopted job ever reads its file, so any other is an earlier job's
+    leftover, and leaving it is how a recycled id inherits a status (spec 01 I8)."""
+    removed = []
+    try:
+        paths = sorted(job_exit_dir().glob("*.exit"))
+        # A fresh file a broker made but died before renaming into place (prepare_job_exit_file).
+        orphans = sorted(job_exit_dir().glob(".*.exit.*.tmp"))
+    except OSError:
+        return removed
+    for path in orphans:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    for path in paths:
+        if keep(path.stem):
+            continue
+        try:
+            path.unlink()
+            removed.append(path.stem)
+        except OSError:
+            pass
+    return removed
 
 
 def get_device_op_lock() -> asyncio.Lock:
@@ -2750,6 +2841,8 @@ def append_job_log(job_log_file: Path, stream: str, text: str):
 
 
 HEADER_FIELDS = {"JOB ID": "job_id", "OWNER": "owner", "COMMAND": "command", "QUEUED": "queued_at"}
+# The submitter's SO_PEERCRED uid, the header's line right after JOB ID (absent over HTTP).
+SUBMITTER_UID_FIELD = "SUBMITTER UID"
 FOOTER_FIELDS = {
     "FINISHED": "finished_at",
     "STATUS": "status",
@@ -11058,6 +11151,28 @@ def _readopted_deadline(job: "Job") -> float:
     return time.monotonic() + max(0.0, limit - served)
 
 
+def _job_log_submitter_uid(job_id: str, first: list[str], st: os.stat_result) -> Optional[int]:
+    """The submitter's uid the broker wrote into a job log's header, or None if it cannot be trusted.
+
+    Re-adoption needs it to accept the exit file the broker gave that uid (spec 01 I8), so it must
+    be something no tenant can forge. It is read only from the header's third line, right after
+    JOB ID and ahead of any text a tenant chose (owner, command, env, output), and only from a
+    regular file the broker owns that no other user can write. Anything else, a log from a broker
+    that did not write the line included, is None: the job's exit status then reads as unknown."""
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o002:
+        return None
+    if st.st_mode & 0o020 and st.st_gid != os.getegid():
+        return None
+    if len(first) < 3:
+        return None
+    k1, _, v1 = first[1].partition(":")
+    k2, _, v2 = first[2].partition(":")
+    if k1.strip() != "JOB ID" or v1.strip() != job_id or k2.strip() != SUBMITTER_UID_FIELD:
+        return None
+    v2 = v2.strip()
+    return int(v2) if v2.isascii() and v2.isdigit() else None
+
+
 def _job_from_log(job_id: str) -> Optional["Job"]:
     """Reconstruct a minimal Job from its persisted log header, for re-adoption."""
     if not job_log_dir:
@@ -11066,13 +11181,18 @@ def _job_from_log(job_id: str) -> Optional["Job"]:
     if not matches:
         return None
     path = matches[-1]
-    hdr, started = {}, None
+    hdr, started, first, peer_uid = {}, None, [], None
     try:
         with open(path, errors="replace") as fh:
+            st = os.fstat(fh.fileno())
             for _ in range(500):
                 line = fh.readline()
                 if not line:
                     break
+                if len(first) < 3:
+                    first.append(line)
+                    if len(first) == 3:
+                        peer_uid = _job_log_submitter_uid(job_id, first, st)
                 s = line.strip()
                 if s.startswith("[Started at ") and s.endswith("]"):
                     started = s[len("[Started at ") : -1].strip()
@@ -11099,6 +11219,7 @@ def _job_from_log(job_id: str) -> Optional["Job"]:
         started_at=started,
         timeout_sec=readopted_timeout,
         preemptable=hdr.get("PREEMPTABLE", "").lower() == "yes",
+        peer_uid=peer_uid,
     )
     job.log_file = str(path)
     return job
@@ -11266,7 +11387,7 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
         preempt_forced_job_ids.discard(job_id)
         job = jobs.get(job_id)
         if job is not None:
-            rc = await asyncio.to_thread(read_job_exit_code, job_id)
+            rc = await asyncio.to_thread(read_job_exit_code, job_id, job.started_at, job.peer_uid)
             async with get_lock():
                 if job.status == JobStatus.RUNNING:
                     if timed_out:
@@ -11314,10 +11435,15 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                             f.write(f"\n[KILLED by device reset] {job.error}\n")
                     except OSError:
                         pass
-            elif _is_wedge_risk_exit(job.status, job.exit_code):
+            elif (
+                _is_wedge_risk_exit(job.status, job.exit_code)
+                or (rc is None and job.status == JobStatus.FAILED)
+            ):
+                # A job whose status is unknown (no, unreadable or stale exit file) was killed or
+                # the host went down under it, and nothing shows it released the device (spec 01 I8).
                 _mark_device_dirty(
                     f"re-adopted job {job_id} ended {job.status.value}"
-                    + (f" (exit {job.exit_code})" if job.exit_code is not None else ""),
+                    + (f" (exit {job.exit_code})" if job.exit_code is not None else " (exit status unknown)"),
                     job=job,
                 )
             # Spec 03 I69: a re-adopted job the broker stopped (its timeout, a requested kill, or a
@@ -11427,6 +11553,8 @@ async def reconcile_running_scopes():
                 logger.warning(f"RE-ADOPT skipping job_id={job_id} (killed by device recovery): {fault_reason}")
             health_event("scope_reconcile_skipped_device_fault", job_id=job_id, scope=scope, reason=fault_reason)
             continue
+        # No log, no submitter uid (peer_uid None): its exit file then counts only if the broker
+        # owns it, so a privsep job's own status reads as unknown, never as exit 0 (spec 01 I8).
         job = _job_from_log(job_id) or Job(
             id=job_id, owner="?", workspace="/", command=f"(re-adopted {scope})", queued_at="", status=JobStatus.RUNNING
         )
@@ -11441,6 +11569,12 @@ async def reconcile_running_scopes():
     swept = sweep_job_spools(lambda jid: jid in jobs or jid in readopted_scopes, _salvage_job_spool)
     if swept and logger:
         logger.info(f"RE-ADOPT removed the output spools of jobs not re-adopted: {', '.join(swept)}")
+    # Only a re-adopted job reads its exit file; any other is an earlier job's (spec 01 I8).
+    stale = sweep_job_exit_files(
+        lambda jid: jid in readopted_scopes or (jid in jobs and jobs[jid].status == JobStatus.RUNNING)
+    )
+    if stale and logger:
+        logger.info(f"RE-ADOPT removed the exit files of jobs not re-adopted: {', '.join(stale)}")
 
 
 def _job_cooldown_remaining_sec(last_end_monotonic: float, now_monotonic: float) -> float:
@@ -11929,6 +12063,9 @@ async def _job_runner_loop():
             activation_script, _ = get_activation_script(job.workspace, env_file=None, inherited_env=job.env_vars)
 
             exit_file = job_exit_file(job_id)
+            # Under privsep the job runs as its submitter, else as this broker's own uid.
+            privsep_prefix = privsep_prefix_for(job.peer_uid, unit=job_scope_unit(job_id))
+            await asyncio.to_thread(prepare_job_exit_file, job_id, job.peer_uid if privsep_prefix else os.geteuid())
             full_command = f"""
 {_exit_trap_preamble(str(exit_file))}set -e
 {activation_script}
@@ -11941,7 +12078,6 @@ export {JOB_TAG_ENV}={job_tag}
             # in the finally block, preventing orphaned child processes from holding device locks.
             # Under privsep (root + opt-in) the command runs as the submitting user inside a
             # device-admitted systemd scope; otherwise it runs directly as today.
-            privsep_prefix = privsep_prefix_for(job.peer_uid, unit=job_scope_unit(job_id))
             # The job writes into spool files, not pipes (spec 01 I17): a pipe dies with this
             # broker, and a job re-adopted across a restart then fails on its next print. No spool
             # to be had: pipes, as before.
@@ -14220,6 +14356,10 @@ def create_mcp_server() -> MCPServer:
             with open(job_log_file, "w") as f:
                 f.write("=" * 70 + "\n")
                 f.write(f"JOB ID:      {job_id}\n")
+                # Right after JOB ID, ahead of anything a tenant chose: re-adoption trusts this
+                # uid only at this line (_job_log_submitter_uid, spec 01 I8).
+                if current_peer_uid.get() is not None:
+                    f.write(f"{SUBMITTER_UID_FIELD}: {current_peer_uid.get()}\n")
                 f.write(f"OWNER:       {owner}\n")
                 f.write(f"WORKSPACE:   {workspace}\n")
                 f.write(f"COMMAND:     {command}\n")
