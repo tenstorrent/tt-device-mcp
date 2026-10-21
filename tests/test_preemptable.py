@@ -927,3 +927,19 @@ def test_the_option_is_documented_under_its_name():
         assert text.lower().startswith("no timeout except on contention")
         assert "watch the broker" in text.lower()
         assert "PREEMPTABLE <x>min" in text and "PREEMPTING <s>s" in text
+
+
+def test_sigkill_comes_ten_seconds_after_sigterm_and_the_docs_say_so():
+    """The job gets 10 s between SIGTERM and SIGKILL, not 5: the broker's constant, the spec and the
+    README state the same number."""
+    from pathlib import Path
+
+    from tt_device_mcp import constants
+
+    assert constants.PREEMPT_KILL_GRACE_SEC == 10
+    assert srv.PREEMPT_KILL_GRACE_SEC == constants.PREEMPT_KILL_GRACE_SEC
+    root = Path(__file__).resolve().parents[1]
+    readme = " ".join((root / "README.md").read_text().split())
+    spec = " ".join((root / "specs" / "01-jobs.md").read_text().split())
+    assert "(SIGTERM, then SIGKILL at most 10 s later)" in readme
+    assert "SIGKILL `PREEMPT_KILL_GRACE_SEC`, 10 s, later at the latest" in spec

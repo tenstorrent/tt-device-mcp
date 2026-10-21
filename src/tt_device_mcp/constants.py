@@ -46,7 +46,7 @@ PREEMPT_GRACE_SEC = 60
 # Once the grace minute is spent, the job's whole process tree gets SIGTERM and, at most this
 # much later, SIGKILL. The job already had its minute to end itself, so this is short; the
 # device is reset and fully checked after it either way.
-PREEMPT_KILL_GRACE_SEC = 5
+PREEMPT_KILL_GRACE_SEC = 10
 
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
