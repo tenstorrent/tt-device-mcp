@@ -298,6 +298,10 @@ class RecoveryDeps:
     # (server._note_fabric_77_reset_passes), so the next relift falls back at once instead of
     # re-running the passes the reset just spent.
     note_fabric_77_reset_passes: Optional[Callable[[int], None]] = None
+    # The open hold's fabric link-short cause (server._fabric_link_short_hold; "" when none): a lost
+    # link, a latched topology mismatch or missing descriptor ports. Spec 04 I79/I83 send those holds
+    # to the power cycle after one ladder pass, so the capped mesh-reset repeat (I93) skips them.
+    fabric_link_short_hold: Optional[Callable[[], str]] = None
     # Whether the open hold's fabric 77 has a cause no reset or reboot fixes — a known cable fault (a 78),
     # a topology mismatch, hugepages not yet allocated, the validator missing
     # (server._fabric_77_no_reset_cause; never the I42 latch, which takes the ladder). Such a 77
@@ -724,6 +728,15 @@ class Recovery(ABC):
                     "eth-training wait; the fabric stays unverified until the build lands"
                 )
                 break
+            deadline = self.mechanism.post_reset_verify_deadline
+            retry_end = time.monotonic() + POST_RESET_FABRIC_RETRY_SLEEP_SEC + constants.FABRIC_CHECK_TIMEOUT_SEC
+            if deadline is not None and retry_end > deadline:
+                # Spec 04 I93: the repeat's check never runs past the 10-min bound; the fabric stays
+                # UNKNOWN (held, not recovered) and the bound's ladder runs on time.
+                log(
+                    "post-reset fabric could not verify (77) and a re-check would end past the hold bound — not retrying"
+                )
+                break
             retries += 1
             if fabric.names_dispatch_cap(evidence["fabric"].get("detail", "")):
                 # I84: the validator already moved traffic across every link, so they were trained;
@@ -779,7 +792,7 @@ class Recovery(ABC):
             # The reset and its verify are over and the host is still up: an off-bus intent is spent.
             pcie_guard.end_offbus_reset()
             if self.mechanism.last_reset_monotonic >= started and "-glx_reset" in self.reset_argv(indices):
-                # A launched Galaxy mesh reset: the capped repeat paces and sizes itself from it (I93).
+                # A launched Galaxy mesh reset: the capped repeat paces itself from it (I93).
                 self.mechanism.last_mesh_reset_run = {
                     "episode": self.deps.device_hold_episode_since() or "",
                     "started": started,

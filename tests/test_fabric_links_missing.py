@@ -273,7 +273,7 @@ async def test_a_lost_link_resets_and_only_a_full_post_reset_pass_releases(lost_
 
 
 @pytest.mark.asyncio
-async def test_a_lost_link_that_a_reset_does_not_heal_stays_held(lost_mesh, no_mesh_repeat_room):
+async def test_a_lost_link_that_a_reset_does_not_heal_stays_held(lost_mesh):
     """No release on a failed post-reset check; the last-chance sweep runs and the hold climbs to the host
     rung at once, not at the 600 s ceiling (spec 04 I79)."""
     lost_mesh["reset_heals"] = False
@@ -384,9 +384,7 @@ def latched_mesh(monkeypatch, tmp_path, mesh):  # noqa: F811
 
 
 @pytest.mark.asyncio
-async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
-    monkeypatch, latched_mesh, no_mesh_repeat_room
-):
+async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(monkeypatch, latched_mesh):
     """I42: the idle relift resets the latched hold with no grace; the post-reset check runs the
     descriptor, the latched mismatch FAILS it (never withheld, never a lift), the last-chance sweep
     runs and the hold climbs to the host rung at once (spec 04 I79): bounded, never an open-ended
@@ -549,9 +547,7 @@ async def _idle_tick():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("heals", [True, False], ids=["reset-heals", "ports-stay-missing"])
-async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_once(
-    monkeypatch, latched_mesh, heals, no_mesh_repeat_room
-):
+async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_once(monkeypatch, latched_mesh, heals):
     """03 I42 with I68 (class D time to recover): a dirty mark on the latched hold (the failed job's own)
     keeps its why, so the read-only relift bails on it and, with nothing queued, it waited for the
     600 s bound. Now the first idle tick runs the present-mesh rung: the reset with no grace, then
@@ -602,9 +598,7 @@ async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_o
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("heals", [True, False], ids=["reset-heals", "ports-stay-missing"])
-async def test_a_paced_present_rung_does_not_spend_the_dirty_latched_idle_gate(
-    monkeypatch, latched_mesh, heals, no_mesh_repeat_room
-):
+async def test_a_paced_present_rung_does_not_spend_the_dirty_latched_idle_gate(monkeypatch, latched_mesh, heals):
     """03 I68 class D, paced: a mesh reset started 60 s ago, so the present-mesh rung waits out its
     grace (WAITING, no reset). That tick must not spend the episode's one gate, or the hold waits for
     the 600 s bound. The first tick after the pacing runs exactly one reset and the full check with

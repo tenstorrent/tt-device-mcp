@@ -952,12 +952,3 @@ def armed_power_cycle(monkeypatch):
     monkeypatch.setattr(privileges, "can_ipmi", lambda: True)
     monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append("power-cycle"))
     return fired
-
-
-@pytest.fixture
-def no_mesh_repeat_room(monkeypatch):
-    """A hold with no room left for the capped mesh-reset repeat (spec 04 I93): any repeat would end past
-    the 10-min bound, so it is skipped and a failed first mesh reset climbs at once, as it did before."""
-    from tt_device_mcp.health.recovery import mesh_repeat
-
-    monkeypatch.setattr(mesh_repeat, "HOLD_BOUND_SEC", 0)

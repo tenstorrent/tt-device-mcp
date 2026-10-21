@@ -2452,20 +2452,26 @@ class GalaxyRecovery(Recovery):
         None)``: the caller climbs exactly as before (the last-chance sweep, then the power cycle) and
         the 10-min ladder's mesh reset is the episode's second.
 
-        Galaxy ``-glx_reset`` only, never a third mesh reset, and only when all of: every expected chip
-        on the bus and no removed chip a reset would rescan (classes A and C never repeat, nor does any
-        partial drop); the first reset showed no BMC guard finding and the BMC preflight passes now
-        (op_mode 0x3, no 0x0 fallback, spec 04 I91); the repeat starts at least
-        MESH_RESET_REPEAT_MIN_GAP_SEC after the first ended and can end, with its full check, before
-        the 10-min bound; no tenant; non-tenant readers of the device SIGTERMed, then SIGKILLed
-        PREEMPT_KILL_GRACE_SEC later, and gone. The full check (fabric included) runs after it, as
-        after every reset."""
+        Galaxy ``-glx_reset`` only, never a third mesh reset, and only when all of: not a fabric
+        link-short hold (lost link, latched topology mismatch, missing descriptor ports: spec 04 I79/I83
+        send those to the power cycle at once); every expected chip on the bus and no removed chip a
+        reset would rescan (classes A and C never repeat, nor does any partial drop); the first reset
+        showed no BMC guard finding and the BMC preflight passes now (op_mode 0x3, no 0x0 fallback,
+        spec 04 I91); the repeat starts at least MESH_RESET_REPEAT_MIN_GAP_SEC after the first ended and
+        its worst case (REPEAT_WORST_SEC) still ends by the 10-min bound, re-checked at launch; no
+        tenant; non-tenant readers of the device SIGTERMed, then SIGKILLed PREEMPT_KILL_GRACE_SEC later,
+        and gone. The full check (fabric included) runs after it, as after every reset, and takes no
+        post-reset 77 retry that would end past the bound."""
         argv = self.reset_argv(indices)
         if expected <= 1 or "-glx_reset" not in argv or not ipmi_guard.is_mesh_reset(argv):
             return "skip", None
         age = _hold_age_sec(hold_since)
         if age is None:
             return self._repeat_skipped("no_hold_clock", hold_since, log)
+        link_short = self.deps.fabric_link_short_hold() if self.deps.fabric_link_short_hold else ""
+        if link_short:
+            # Spec 04 I79/I83: a mesh reset does not heal a link-short hold; its power cycle is due at once.
+            return self._repeat_skipped("fabric_link_short", hold_since, log, detail=link_short)
         now = time.monotonic()
         window_start = now - age - mesh_repeat.MESH_RESET_REPEAT_MIN_GAP_SEC
         run = self.mechanism.last_mesh_reset_run
@@ -2477,7 +2483,6 @@ class GalaxyRecovery(Recovery):
             repeats_used=used,
             hold_age_sec=age,
             since_first_end_sec=(now - run["ended"]) if first_ok else None,
-            first_reset_sec=(run["ended"] - run["started"]) if first_ok else None,
         )
         if verdict == "skip":
             return self._repeat_skipped(why, hold_since, log)
@@ -2503,16 +2508,25 @@ class GalaxyRecovery(Recovery):
         blocker = self._tenant_blocker(scan)
         if blocker is not None:
             log(f"mesh reset repeat held off: {self._describe_blocker(blocker)}")
-            health_event(
-                "hold_bound_tenant_blocked",
-                path="mesh_reset_repeat",
-                held_since=hold_since,
-                held_age_sec=int(age),
-                **blocker,
-            )
+            if self.mechanism.repeat_tenant_blocked_since != hold_since:
+                # Journalled once per episode, naming the blocker; the log line says it every tick.
+                self.mechanism.repeat_tenant_blocked_since = hold_since
+                health_event(
+                    "hold_bound_tenant_blocked",
+                    path="mesh_reset_repeat",
+                    held_since=hold_since,
+                    held_age_sec=int(age),
+                    **blocker,
+                )
             return "wait", None
         if not await self._evict_non_tenant_readers(scan, log):
             return self._repeat_skipped("readers_remain", hold_since, log)
+        # Re-checked at launch: the preflight, the scans and the eviction took time, and nothing after
+        # this point can be abandoned (a reset is never killed mid-flight).
+        age = _hold_age_sec(hold_since)
+        left = mesh_repeat.HOLD_BOUND_SEC - (age if age is not None else mesh_repeat.HOLD_BOUND_SEC)
+        if left < mesh_repeat.REPEAT_WORST_SEC:
+            return self._repeat_skipped("cannot_end_before_bound", hold_since, log)
         self.mechanism.mesh_reset_repeat_at = time.monotonic()
         log(f"mesh reset failed {int(now - run['ended'])}s ago — its one repeat runs now (spec 04 I93)")
         health_event(
@@ -2523,7 +2537,11 @@ class GalaxyRecovery(Recovery):
             first_reset_sec=int(run["ended"] - run["started"]),
         )
         ids_before = await self._offbus_ids_now(expected)
-        recovered = await self._reset_and_verify_device(indices, log, arc_retry=False)
+        self.mechanism.post_reset_verify_deadline = time.monotonic() + left
+        try:
+            recovered = await self._reset_and_verify_device(indices, log, arc_retry=False)
+        finally:
+            self.mechanism.post_reset_verify_deadline = None
         await self._note_mesh_reset_failed(recovered, hold_since, ids_before, expected)
         if recovered:
             self.deps.clear_device_reported_fault("mesh reset repeat recovered the mesh")

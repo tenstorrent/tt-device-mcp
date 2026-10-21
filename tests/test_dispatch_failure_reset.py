@@ -144,7 +144,7 @@ async def test_a_second_dispatch_failure_in_the_episode_holds_instead_of_resetti
 
 
 @pytest.mark.asyncio
-async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh, armed_power_cycle, no_mesh_repeat_room):
+async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh, armed_power_cycle):
     """A prior cycle already failed (was_failing): the dispatch reset fires, its post-reset check
     fails, the device stays held and the ladder climbs: the last-chance sweep once (its mesh reset is
     the one repeat the episode allows, spec 04 I87), then the power cycle."""
@@ -157,6 +157,9 @@ async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh, armed_power
     assert mesh["verifies"][-1] is True, "the post-reset check ran the fabric pass"
     assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
     assert armed_power_cycle == ["power-cycle"], "it climbs to the power cycle"
+    # Spec 04 I93: a reset inside the hold leaves no room for the capped repeat's worst case.
+    assert "mesh_reset_repeat_skipped" in mesh["events"] and "mesh_reset_repeat" not in mesh["events"]
+    assert "cannot_end_before_bound" in mesh["log"].text()
 
 
 @pytest.mark.asyncio
