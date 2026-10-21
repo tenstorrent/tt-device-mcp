@@ -629,7 +629,12 @@ each rung fires only when the gentler one failed or cannot apply.
   whole-tray clock (phase `whole_tray_back`) and holds, so the partial drop goes back to the ladder
   and the other bounded clocks. That deferral runs once per hold episode: a whole tray seen off again
   in the same episode (a tray whose read flaps) fires at grace 0 on that pass without the re-check, so
-  the deferral adds at most one pass to a whole-tray hold. A read the map cannot place keeps the
+  the deferral moves a flapping whole tray's power-cycle request from grace 0 to the
+  hold bound's ladder plus its check (I76). At hold age 600 s the broker first runs the full ladder
+  again, then asks for the cycle only when the full check after it fails: at once on a failed
+  verdict, or up to 300 s after the ladder for a check still running. Worst case: about 600 s +
+  ladder time + 300 s after hold start. The I65 cooldown and a live tenant may delay it further, as
+  the bounded exceptions stated in I65 and I76. A read the map cannot place keeps the
   whole-tray verdict. The
   `firing` event names `fault_class` (`whole_tray`, `all_off`, `tray_partial` for 4 or more chips,
   `partial_offbus` for 1-3), `handoff` (`whole_tray`, `ipmi_unavailable`, `tray_walk_failed`,
