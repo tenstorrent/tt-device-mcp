@@ -22,11 +22,15 @@ GROUP=ttdev
 SOCK=/run/tt-device-broker/broker.sock
 
 echo "==> build venv + install broker from $REPO"
-mkdir -p "$R"; rm -rf "$R/venv"
-python3 -m venv "$R/venv"
-"$R/venv/bin/pip" install -q --upgrade pip
-"$R/venv/bin/pip" install -q "$REPO"
-rm -rf "$R/wheel"; "$R/venv/bin/pip" wheel -q --no-deps -w "$R/wheel" "$REPO"
+# Spec 08 I26: a broker already serving keeps its venv (its tt-smi and its lazy imports) until the
+# restart below. The new venv is built and verified beside it, $R/venv is flipped to it just before
+# apply-host-config (which renders the unit from, and probes, $R/venv), and the old one is removed
+# only once the restarted broker answers /health.
+# shellcheck source=deploy/broker-venv.sh
+. "$REPO/deploy/broker-venv.sh"
+mkdir -p "$R"
+NEW_VENV="$(venv_build "$R" "$REPO")" || exit 1
+rm -rf "$R/wheel"; "$NEW_VENV/bin/pip" wheel -q --no-deps -w "$R/wheel" "$REPO"
 chmod -R a+rX "$R"
 
 echo "==> CLI on PATH"
@@ -49,7 +53,7 @@ echo "==> detect machine type (reset mode + fabric check)"
 # board_type (the device is healthy at install time). Persisted to /etc/default so
 # the unit renders identically from the installer and from auto-update.
 RESET_MODE="${TT_DEVICE_MCP_RESET_MODE:-}"
-if [ -z "$RESET_MODE" ] && timeout 30 "$R/venv/bin/tt-smi" -s 2>/dev/null | "$R/venv/bin/python" -c "
+if [ -z "$RESET_MODE" ] && timeout 30 "$NEW_VENV/bin/tt-smi" -s 2>/dev/null | "$NEW_VENV/bin/python" -c "
 import sys, json
 try: d = json.load(sys.stdin)
 except Exception: sys.exit(2)
@@ -137,6 +141,7 @@ echo "==> apply host config (unit + watchdog + sudoers + reconcile units + hooks
 # Single source of truth, shared with auto-update — so a change to the unit,
 # sudoers, or reconcile units reaches every host on the next version bump with no
 # manual installer re-run.
+venv_flip "$R" "$NEW_VENV"
 bash "$REPO/deploy/apply-host-config.sh" "$REPO"
 
 # Spec 08 I25: the broker's first start comes only after the pinned fabric validator is built. A
@@ -190,6 +195,8 @@ done
 [ "$BROKER_UP" = 1 ] \
     || { echo "install: broker did not answer /health after enable — check: journalctl -u tt-device-broker -e" >&2; exit 1; }
 echo "==> health:"; curl -s --max-time 5 --unix-socket "$SOCK" http://localhost/health
+# The restarted broker runs from the new venv; only now may the old one go.
+venv_prune "$R"
 
 MODE="COOPERATIVE (bare-metal allowed; route runs through tt-device-mcp)"
 if [ "$LOCK" = "1" ]; then

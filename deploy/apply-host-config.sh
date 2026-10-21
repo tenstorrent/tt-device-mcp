@@ -399,7 +399,10 @@ else
     echo "apply-host-config: ls_locks.bus_lock PMU event unavailable; bus-lock counter not enabled" >&2
 fi
 pinned_sha="$(sed -n 's/^TTDEV_VALIDATOR_SHA=//p' "$ROOT/fabric-validator.pin" 2>/dev/null | head -1)"
-if [ -n "$pinned_sha" ] && [ ! -x "/opt/tt-device-broker/validator/$pinned_sha/build/tools/scaleout/run_cluster_validation" ]; then
+# Either of the pin's two build slots (spec 08 I27).
+pinned_bin=build/tools/scaleout/run_cluster_validation
+if [ -n "$pinned_sha" ] && [ ! -x "/opt/tt-device-broker/validator/$pinned_sha/$pinned_bin" ] \
+        && [ ! -x "/opt/tt-device-broker/validator/$pinned_sha.build/$pinned_bin" ]; then
     echo "apply-host-config: fabric validator for $pinned_sha not built; starting build out of band" >&2
     systemctl reset-failed tt-device-fabric-validator.service 2>/dev/null || true
     systemctl start --no-block tt-device-fabric-validator.service 2>/dev/null || true
