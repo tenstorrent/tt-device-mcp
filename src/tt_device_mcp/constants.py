@@ -44,8 +44,9 @@ SIGTERM_GRACE_SEC = 15
 PREEMPT_GRACE_SEC = 60
 
 # Once the grace minute is spent, the job's whole process tree gets SIGTERM and, at most this
-# much later, SIGKILL. The job already had its minute to end itself, so this is short; the
-# device is reset and fully checked after it either way.
+# much later, SIGKILL. The job already had its minute to end itself, so this is short. A tree
+# that all exits through its own code on SIGTERM inside it gets the fast post-job check; a
+# SIGKILL, any signal death or an unwitnessed exit gets a reset and the full check.
 PREEMPT_KILL_GRACE_SEC = 10
 
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is

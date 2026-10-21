@@ -646,6 +646,43 @@ async def test_a_failed_fast_check_after_a_clean_end_keeps_the_hold_and_escalate
     assert srv.fsm.state is ServerState.RECOVERING, srv.fsm.state
 
 
+@pytest.mark.parametrize("fabric_ok", [True, False])
+@pytest.mark.asyncio
+async def test_a_killed_preemption_releases_only_on_a_passing_full_check(monkeypatch, tmp_path, fabric_ok):
+    """Case (c), the gate side: a killed preemption leaves the device dirty. The post-job gate then
+    runs the full check, fabric included, and releases the device only when it passes. A fabric
+    pass that fails (here: fewer links than expected) keeps the device held for the bounded
+    recovery; nothing is handed to the waiting job."""
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    _free_device_lock(monkeypatch)
+    fsm_healthy(srv)
+    seen = []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        seen.append(run_fabric)
+        detail = "links healthy" if fabric_ok else "6 of 8 expected links up"
+        return fabric_ok or not run_fabric, ({"fabric": {"ok": fabric_ok, "detail": detail}} if run_fabric else {})
+
+    async def reset(indices, log):
+        return True
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    patch_recovery(monkeypatch, "_reset_and_verify_device", reset)
+    srv._mark_device_dirty("job 965 ended preempted (SIGKILL)")
+    await srv._verify_device_after_job(None, job_failed=True)
+
+    assert seen and seen[0] is True, f"the full check (fabric included) did not run: {seen}"
+    if fabric_ok:
+        assert srv.fsm.state is ServerState.HEALTHY, srv.fsm.state
+    else:
+        assert srv.fsm.state is not ServerState.HEALTHY, "a failed full check released the device"
+        assert srv._device_degraded_for_tenant(), "a failed full check let the waiting job through"
+
+
 def _event(what, data):
     body = struct.pack("=IIQ", what, 0, 0) + data
     cn = struct.pack("=IIIIHH", 1, 1, 0, 0, len(body), 0) + body
@@ -1168,3 +1205,8 @@ def test_sigkill_comes_ten_seconds_after_sigterm_and_the_docs_say_so():
     spec = " ".join((root / "specs" / "01-jobs.md").read_text().split())
     assert "(SIGTERM, then SIGKILL at most 10 s later)" in readme
     assert "SIGKILL `PREEMPT_KILL_GRACE_SEC`, 10 s, later at the latest" in spec
+    import tt_device_mcp.cli as cli
+
+    doc = srv.JobSubmitInput.model_fields["no_timeout_except_on_contention"].description
+    assert "SIGKILL 10s later" in doc, doc
+    assert "10s later, SIGKILL" in cli._NO_TIMEOUT_HELP, cli._NO_TIMEOUT_HELP
