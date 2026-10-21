@@ -53,7 +53,12 @@ the queue and a running job outlive the broker process.
   belongs to the job when it shares its process group or session, sits in its scope's
   cgroup, carries the run's `TT_DEVICE_MCP_JOB_TAG` value (exported into every job's shell,
   so a child that started its own session is still found after its parent exits), or
-  descends from any of those. Leftovers get SIGTERM, then SIGKILL after
+  descends from any of those. An empty environ does not rule the tag out: a process inside
+  execve reads empty until its new image's is mapped, so a live user process (not a kernel
+  thread or zombie) that reads empty is re-read, at most `job_reap.TAG_REREAD_SEC` (0.1 s)
+  per scan for all of them together. A process the first scan found stays the job's in the
+  re-scan while it lives (same pid and starttime): past exit_mm its tag no longer reads.
+  Leftovers get SIGTERM, then SIGKILL after
   `SURVIVOR_TERM_GRACE_SEC` (5 s); with nothing left, the sweep costs one /proc scan and a
   `killpg` backstop. A process still alive after SIGKILL (state D: stuck in the kernel) is
   named in the broker log and the job log, and if it holds or may hold the device, the
