@@ -606,7 +606,18 @@ each rung fires only when the gentler one failed or cannot apply.
   reset because chips are off the bus, the hold no longer stands until an operator power-cycles the
   host. The first idle escalation of the episode still climbs the ladder's own rungs as the gate
   allows (none is skipped, I22). After that, once the episode has stood
-  `TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC` (default 300 s), the broker runs the host's own
+  `TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC` (default 300 s), a partial off-bus drop (any drop that is
+  not exactly one or more whole trays by the I16 map, or with no map) first gets one pass of the
+  ladder's own rungs, the mesh reset included, with the `hold` gate read as `guard` for that pass
+  only, once per episode, unless an I25 latch, `TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC=off` or a
+  stand-back keeps the gate shut. The pass is spent only once its climb has passed the climb's own
+  guards (the ceiling for a pass the watchdog did not force, the episode latch, a reset cycling in
+  its own scope, a tenant, the reset cooldown) and reached the rungs: a pass those guards decline
+  runs no reset, re-arms nothing and leaves the lifted pass due for the next pass that runs, so no
+  decline sends a partial drop to the power cycle without its mesh reset. Each reset in it owes the
+  full health check, fabric included, before any release; if the hold still stands, the hold watchdog forces one more pass at once and
+  that pass runs the power cycle with the gate shut again. A whole tray down (every off-bus chip's
+  tray fully off, nothing off outside those trays) gets no reset first. Then the broker runs the host's own
   power-cycle command `TT_DEVICE_MCP_POWER_CYCLE_CMD` (argv split like shell words, no shell, the
   reason in `TT_DEVICE_MCP_POWER_CYCLE_REASON`, bounded by
   `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC`, default 120 s) through `_fire_recovery_escalation`
@@ -1950,6 +1961,7 @@ sees a silent fabric pass.
 | I25/I27 an idle whole-tray decline is journaled as `whole_tray`, never a failed walk; the firing event names the class and hand-off | `tests/test_offbus_power_cycle.py::test_an_idle_whole_tray_decline_is_journaled_as_whole_tray_not_a_failed_walk` |
 | I27 a whole tray that came back in part is not cycled at grace 0 and stays held, once per episode (a flapping tray fires on the next whole-tray read); one still wholly off, or a re-read the map cannot place, fires at once | `tests/test_offbus_power_cycle.py::test_a_whole_tray_that_comes_back_in_part_is_not_cycled_at_grace_0`, `::test_a_flapping_whole_tray_still_reaches_the_power_cycle`, `::test_the_whole_tray_deferral_is_per_episode`, `::test_a_tray_still_wholly_off_at_the_re_read_still_fires_at_once`, `::test_a_re_read_the_tray_map_cannot_place_keeps_the_whole_tray_verdict` |
 | I25 / I32 a skipped tray re-power releases only after the full health check, fabric included | `tests/test_ladder_v2.py::test_a_skipped_tray_rung_releases_only_after_the_full_health_check` |
+| I27 with a power cycle configured, a whole tray down goes straight to it; a partial drop gets one lifted ladder pass (the mesh reset) past the grace, spent only when its climb reaches the rungs (a pass declined by scope, tenant or the ceiling stays due), then the power cycle on the next forced pass only if the hold stands; each reset releases only after the full check, fabric included, and the cycle releases nothing | `tests/test_gated_hold_handoff.py::test_a_whole_tray_down_goes_straight_to_the_power_cycle`, `::test_a_partial_drop_gets_the_mesh_reset_first_and_the_power_cycle_only_if_it_fails`, `::test_a_partial_drop_the_mesh_reset_heals_never_gets_the_power_cycle`, `::test_a_partial_drop_with_no_tray_map_gets_the_mesh_reset_first`, `::test_before_the_grace_a_partial_drop_gets_no_lifted_reset`, `::test_a_declined_lifted_pass_is_not_spent_and_the_mesh_reset_still_runs_first`, `::test_the_partial_drops_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_the_power_cycle_releases_nothing`, `tests/test_startup_fabric_hugepages.py::test_startup_fabric_pass_waits_for_hugepages_then_runs` |
 | I27 a regressed tray rung hands off to the power cycle past the grace | `tests/test_offbus_power_cycle.py::test_a_regressed_tray_rung_hands_off_past_the_grace` |
 | I23 holders on every chip of the box, off-bus ones included: wait, then refuse | `tests/test_pcie_guard.py::test_envelope_waits_for_holders_then_refuses_without_touching_anything`, `::test_envelope_proceeds_once_the_holder_lets_go`, `::test_envelope_waits_for_holders_on_every_tray_not_just_the_re_powered_one`, `::test_envelope_counts_a_holder_on_a_chip_off_the_bus`, `::test_envelope_ignores_the_brokers_own_hold_on_other_trays` |
 | I23 an erroring port stays masked and starts the flood window | `tests/test_pcie_guard.py::test_a_port_that_keeps_erroring_stays_masked_and_marks_a_flood` |
