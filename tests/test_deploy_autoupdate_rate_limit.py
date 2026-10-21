@@ -37,6 +37,7 @@ def _lap(tmp_path, *, now, sha, interval=None, active="active", nrestarts="0", h
     """One lap at fake time `now` that has just resolved `sha`: the already-current check and the
     rate limit, then (as if every gate passed) the tail that marks the sha current and restarts.
     `active`, `nrestarts` and `health` are what systemd and the broker's /health report."""
+    quoted_health = health.replace("'", "'\\''")  # a /health body may carry single quotes
     text = _SCRIPT.read_text()
     head = _cut(text, 'installed_sha="$(cat "$STATE"', "INHIBIT=/run/")
     tail = text[text.index('echo "$remote_sha" > "$STATE"') :]
@@ -56,7 +57,7 @@ systemctl() {{
         show*NRestarts*) echo '{nrestarts}' ;;
     esac
 }}
-curl() {{ printf '%s' '{health}'; }}
+curl() {{ printf '%s' '{quoted_health}'; }}
 """
     env = {"PATH": "/usr/bin:/bin"}
     if interval is not None:
@@ -178,9 +179,7 @@ def _startup_health(tmp_path, monkeypatch, *, op=False, fault=None, dirty=False)
         f.on_fault(fault, detail="startup gate failed", dirty=False)
     if dirty:
         f.on_fault("heartbeat", detail="chip 3 heartbeat frozen")
-    body = json.dumps(srv._health_payload())
-    assert "'" not in body
-    return body
+    return json.dumps(srv._health_payload())
 
 
 def _startup_bound():

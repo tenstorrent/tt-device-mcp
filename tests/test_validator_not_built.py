@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """Spec 03 I81: a missing fabric validator is its own no-verdict class.
 
 A fresh install whose broker started before the pinned validator was built held its mesh
