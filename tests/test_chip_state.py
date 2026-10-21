@@ -554,9 +554,9 @@ async def test_the_down_offbus_recheck_does_not_hold_on_a_lost_chip_that_is_back
 
     async def gate(*a, **k):
         gated.append(True)
-        return False
+        return False, {}
 
-    monkeypatch.setattr(srv, "_offbus_return_full_gate", gate)
+    monkeypatch.setattr(srv, "_full_check_gate", gate)
     await srv._attempt_down_offbus_recheck()
     assert calls[:2] == ["due", "read"] and gated == [True]
 

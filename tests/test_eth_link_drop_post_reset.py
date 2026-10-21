@@ -213,3 +213,31 @@ async def test_a_passing_fabric_pass_still_covers_a_link_drop_skip(replay):
     assert len(replay["fabric_out"]) == first, "a fresh green pass is not repeated"
     assert srv.health_monitor.last_fabric_ok is True
     assert srv.fsm.state is ServerState.HEALTHY and not srv._device_unavailable_for_tenant()
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_fabric_pass_after_a_green_one_is_not_logged_as_cover(replay, monkeypatch):
+    """03 I30: a green pass, then a forced pass that exits 77, then a gate whose eth read takes the
+    link-drop skip. The 77 reached no verdict, so the log must not claim a passing pass covers the
+    skip, and the fabric-unverified hold stands until a pass returns healthy."""
+    replay["lost"] = False
+    fsm_dirty(srv, "job 7 crashed: could not find any forwarding direction", why="job_killed")
+    await etr._gate()
+    assert srv.fsm.state is ServerState.HEALTHY and srv.health_monitor.last_fabric_ok is True
+
+    async def fabric_77(argv, env, **kw):
+        replay["calls"].append(argv)
+        return 77, "fabric check skipped: validator not runnable\n"
+
+    monkeypatch.setattr(fabric, "check", fabric_77)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True, force_fabric=True)
+    assert srv.health_monitor.last_fabric_skipped is True
+    assert srv.fsm.state is not ServerState.HEALTHY, "a 77 never lifts"
+    replay["log"].said.clear()
+    await etr._gate()
+    said = replay["log"].text()
+    assert f"eth-heartbeat: SKIPPED — {ETH_LINK_DROP_SKIP}" in said
+    assert "a recent passing fabric pass covers it" not in said
+    assert "the last fabric pass reached no verdict" in said
+    assert srv.fsm.state is not ServerState.HEALTHY and srv._device_unavailable_for_tenant()
+    assert "device_released" not in replay["events"]

@@ -168,7 +168,7 @@ run_validator "${desc_argv[@]}"
 
 # TOPOLOGY MISMATCH: the links the validator discovered are not the ones the descriptor names. Its
 # tray ids come from PCI bus numbers, so a tray whose uplink lands on another bus, or a cable that is
-# not there, mismatches on every run, and a board reset cannot change either. Not a measurement:
+# not there, mismatches on every run. Not a measurement by itself:
 # rerun once without the descriptor so traffic still crosses every discovered link, and classify
 # that run with the chain below. A pass carries the marker as the last line before exit 0.
 TOPO=""
@@ -180,7 +180,7 @@ if [ "$rc" -ne 0 ] && [ -n "$DESC" ] && grep -q "Connection mismatch detected" "
         /Physical Discovery found|connections:/        { s = ""; next }
         s != "" && /PhysicalPortEndpoint/              { c[s]++ }
         END { printf "%d %d\n", c["m"], c["e"] }' "$RUNLOG")
-    TOPO="TOPOLOGY MISMATCH vs $DESC: $n_missing missing, $n_extra extra port connections (tray ids come from PCI bus numbers; a board reset cannot change this)"
+    TOPO="TOPOLOGY MISMATCH vs $DESC: $n_missing missing, $n_extra extra port connections (tray ids come from PCI bus numbers)"
     log "$TOPO"
     log "rerunning once without the descriptor: traffic over every discovered link"
     run_validator

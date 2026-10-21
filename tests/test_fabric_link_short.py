@@ -128,17 +128,17 @@ async def _walk(clock, start, stop, step=10):
 
 @pytest.mark.asyncio
 async def test_a_latched_mismatch_keeps_the_latch_and_is_not_released(monkeypatch, clear_job_state):
-    """Spec 03 I42's latch on a one-port-short mismatch is not this class (spec 04 I30): no ladder at hold
-    start. At the 10-min bound I76 runs the full ladder with the latch still set, the full check after it
-    counts the same port short and fails, the broker asks for the power cycle, and nothing is released."""
+    """Spec 03 I42's latch on a one-port-short mismatch is not this class (spec 04 I30): no at-start
+    link-short ladder. Its bound is one sampler tick (I42 with I76): the bound's full ladder runs with the
+    latch still set, the full check after it counts the same port short and fails, the broker asks for
+    the power cycle, and nothing is released."""
     escalations, _alerts, events = _arm(monkeypatch, "topology mismatch", latched=True)
     _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
     clock = _clock(monkeypatch)
     assert srv._fabric_link_short_hold() == "", "a latched hold is measured, never a link-short no-reset hold"
-    await _walk(clock, 0, BOUND - 10)
-    assert escalations == [] and "host_rung" not in events, "nothing forced below the bound"
-    await _walk(clock, BOUND - 10, BOUND + 30)
-    assert escalations == ["present-forced"], "the bound's full ladder"
+    await _walk(clock, 0, BOUND + 30)
+    assert escalations == ["present-forced"], "the latched hold's bound ladder, one tick in"
+    assert srv.device_hold_escalation_kind != "fabric_link_short"
     assert srv.health_monitor.topology_hw_fault, "the I42 latch stands through the bound"
     assert "hold_bound_latch_cleared" not in events
     assert events.count("hold_bound_check_failed") == 1, "the check after the ladder fails on the short count"

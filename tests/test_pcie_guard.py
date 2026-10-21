@@ -422,6 +422,50 @@ def test_envelope_proceeds_once_the_holder_lets_go(sysfs, monkeypatch):
     assert fired == [1]
 
 
+def test_envelope_waits_for_holders_on_every_tray_not_just_the_re_powered_one(sysfs, monkeypatch):
+    """One tray's pulse has dropped the other trays within seconds, so a holder on ANY chip of the box
+    refuses the re-power, as for a whole-box cycle (spec 04 I23)."""
+    pids = sysfs / "proc/driver/tenstorrent/0"  # chip 0 is on tray 1; the fire is tray 4
+    pids.mkdir(parents=True)
+    (pids / "pids").write_text("4343\n")
+    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", "1")
+    assert 0 in pcie_guard.plan_tray_repower(0b1000, [3]).box_chips
+    with pytest.raises(pcie_guard.TrayRepowerRefused, match="4343"):
+        pcie_guard.safe_tray_repower(
+            0b1000, [3], lambda: pytest.fail("fired over another tray's holder"), lambda m: None, sleep=lambda s: None
+        )
+    assert all(_restored(sysfs, p) for p in PORTS)
+    assert not (sysfs / "sys/bus/pci/devices/0000:81:00.0/remove").exists()
+
+
+def test_envelope_counts_a_holder_on_a_chip_off_the_bus(sysfs, monkeypatch):
+    """A chip with no PCI function that tt-kmd still publishes under /proc is part of the box: a process
+    holding it refuses the re-power too (spec 04 I23)."""
+    pids = sysfs / "proc/driver/tenstorrent/7"  # no endpoint in sysfs: off the bus
+    pids.mkdir(parents=True)
+    (pids / "pids").write_text("4444\n")
+    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", "1")
+    assert 7 in pcie_guard.plan_tray_repower(0b1000, [3]).box_chips
+    with pytest.raises(pcie_guard.TrayRepowerRefused, match="4444"):
+        pcie_guard.safe_tray_repower(
+            0b1000,
+            [3],
+            lambda: pytest.fail("fired over an off-bus chip's holder"),
+            lambda m: None,
+            sleep=lambda s: None,
+        )
+
+
+def test_envelope_ignores_the_brokers_own_hold_on_other_trays(sysfs, monkeypatch):
+    """The broker's own pid is never a holder, on any tray (spec 04 I23)."""
+    pids = sysfs / "proc/driver/tenstorrent/0"
+    pids.mkdir(parents=True)
+    (pids / "pids").write_text(f"{os.getpid()}\n")
+    fired = []
+    pcie_guard.safe_tray_repower(0b1000, [3], lambda: fired.append(1), lambda m: None, sleep=lambda s: None)
+    assert fired == [1]
+
+
 def test_envelope_refuses_a_mismatched_tray_map(sysfs):
     with pytest.raises(pcie_guard.TrayRepowerRefused):
         pcie_guard.safe_tray_repower(0b1000, [2], lambda: pytest.fail("fired the wrong tray"), lambda m: None)
@@ -768,15 +812,18 @@ async def test_a_broker_host_action_closes_an_open_intent_durably_before_it_fire
     assert pcie_guard._INTENT_OPEN is False
 
 
-def _intent_then_cycle(sysfs, *, row_action, row_boot="boot-a", row_dt=60.0):
-    """An intent left on boot-a, a ledger row ``row_dt`` s after it, and the host now on boot-b."""
+def _intent_then_cycle(sysfs, *, row_action, row_boot="boot-a", row_dt=60.0, boot_dt=120.0, **row_extra):
+    """An intent left on boot-a, a ledger row ``row_dt`` s after it, and the host now on boot-b, which
+    started ``boot_dt`` s after that row (None: btime unreadable)."""
     _boot(sysfs, "boot-a")
     pcie_guard.begin_offbus_reset("reset sweep", 8)
     at = json.loads((pcie_guard.health_dir() / pcie_guard.INTENT_FILE).read_text())["at_epoch"]
     if row_action:
         row = {"action": row_action, "reason": "idle escalation", "boot_id": row_boot, "at_epoch": at + row_dt}
-        (pcie_guard.health_dir() / "auto_recovery.jsonl").write_text(json.dumps(row) + "\n")
+        (pcie_guard.health_dir() / "auto_recovery.jsonl").write_text(json.dumps(dict(row, **row_extra)) + "\n")
     _boot(sysfs, "boot-b")
+    if boot_dt is not None:
+        (sysfs / "proc/stat").write_text(f"cpu  1 2 3\nbtime {int(at + row_dt + boot_dt)}\n")
 
 
 @pytest.mark.parametrize("action", ["power-cycle", "reboot"])
@@ -813,6 +860,45 @@ def test_an_intent_with_no_later_host_action_still_latches(sysfs, monkeypatch, r
     events = []
     monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
     _intent_then_cycle(sysfs, row_action=row_action, row_boot=row_boot, row_dt=row_dt)
+
+    latch = srv.pcie_guard_at_start(lambda m: None)
+    assert latch is not None and latch["kind"] == "reset sweep"
+    assert "offbus_reset_hold_latched" in [n for n, _ in events]
+    assert pcie_guard.host_reset_gate(8)[0] is False
+
+
+@pytest.mark.parametrize(
+    "boot_dt, row_extra",
+    [
+        (5.0, {}),  # the cycle came up at once
+        (890.0, {}),  # a slow cold cycle, still inside the attribution window
+        (1500.0, {"took_host_down": False}),  # a late cycle (I72): pending plus attribution window
+        (1500.0, {"late": True}),
+    ],
+)
+def test_the_brokers_cycle_that_brought_this_boot_up_does_not_latch(sysfs, monkeypatch, boot_dt, row_extra):
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", "900")
+    _intent_then_cycle(sysfs, row_action="power-cycle", row_dt=300.0, boot_dt=boot_dt, **row_extra)
+    assert srv.pcie_guard_at_start(lambda m: None) is None
+    assert pcie_guard.offbus_reset_latched() is None
+
+
+@pytest.mark.parametrize(
+    "boot_dt, row_extra",
+    [
+        (3600.0, {}),  # this boot came an hour after the request: another cause took the host down
+        (-30.0, {}),  # this boot started before the request was recorded
+        (None, {}),  # btime unreadable: nothing is attributed
+        (3600.0, {"took_host_down": False}),  # a request the cycler missed, past its pending window too
+    ],
+)
+def test_a_host_action_that_did_not_bring_this_boot_up_still_latches(sysfs, monkeypatch, boot_dt, row_extra):
+    """The ledger row must have caused this boot: a request the cycler missed, a real hang inside a
+    later reset and an outside power-off is a host hang, not the broker's action (spec 04 I25)."""
+    events = []
+    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
+    monkeypatch.setenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", "900")
+    _intent_then_cycle(sysfs, row_action="power-cycle", row_dt=300.0, boot_dt=boot_dt, **row_extra)
 
     latch = srv.pcie_guard_at_start(lambda m: None)
     assert latch is not None and latch["kind"] == "reset sweep"
