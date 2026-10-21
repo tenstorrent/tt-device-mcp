@@ -7335,13 +7335,14 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
     of the off-bus forced pass (gated grace, IPMI, tray-walk and operator hand-off bounds), the I65
     retry of a refused power cycle in this episode, the I73 class-A 10-min ladder, the I70
     unkillable-leftover host rung (the sampler's own, never floored or routed), the bound's host rung
-    after its ladder (spec 04 I76), then the watchdog's chain: the off-bus one-shot once due, the I39
-    progress retry once due, else the next unspent ceiling window (reported at its own time even when
-    past: a declined spawn retries it every tick). A branch not yet due does not hide a later one that
-    fires first, and a run that would do nothing is no candidate (its latch is spent, so the chain goes
-    on). Below the 10-min bound the kill-switch and a 77-only hold keep every forced run back, so each
-    candidate fires no earlier than the bound. Plus any registered deadline feed. Read-only: it never
-    claims, moves or expires a clock."""
+    after its ladder (spec 04 I76), then the watchdog's chain: the off-bus one-shot once due, a spec 03
+    I42 disproven lift's early bound ladder (one sampler tick in) once due, the I39 progress retry once
+    due, else the next unspent ceiling window (reported at its own time even when past: a declined
+    spawn retries it every tick). A branch not yet due does not hide a later one that fires first, and
+    a run that would do nothing is no candidate (its latch is spent, so the chain goes on). Below the
+    hold's bound (_hold_bound_sec) the kill-switch and a 77-only hold keep every forced run back, so
+    each candidate fires no earlier than the bound. Plus any registered deadline feed. Read-only: it
+    never claims, moves or expires a clock."""
     episode = device_hold_episode_since
     try:
         started = datetime.fromisoformat(episode).timestamp() if episode else None
@@ -7359,9 +7360,10 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
         cooldown_until = None
     fed = hold_report.fed_candidates(started, now_epoch, cooldown_until)
     ceiling = _stuck_hold_ceiling_sec()
+    bound = _hold_bound_sec()  # one sampler tick under the spec 03 I42 latch, else the ceiling
     # Spec 04 I76: below the bound the kill-switch declines every forced spawn and the watchdog forces
     # no 77-only hold; from the bound on, neither holds a rung back.
-    floor = started + ceiling if not _force_escalate_enabled() or _fabric_77_only_hold() else None
+    floor = started + bound if not _force_escalate_enabled() or _fabric_77_only_hold() else None
     host_rung = "power cycle" if _auto_power_cycle_enabled() else "warm reboot" if _auto_reboot_enabled() else None
     now_mono = time.monotonic()
 
@@ -7437,7 +7439,7 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
         if add(candidates, bound_rung, "hold_bound_cycle"):
             return done(candidates)
     lad = _hold_bound_ladder_age
-    if lad is not None and lad >= ceiling and (_hold_bound_cycle_age is None or _hold_bound_cycle_age < lad):
+    if lad is not None and lad >= bound and (_hold_bound_cycle_age is None or _hold_bound_cycle_age < lad):
         # The full check after the bound's ladder still has its time; the host rung follows at its end.
         add(candidates, replace(bound_rung, at=started + lad + _HOLD_BOUND_CHECK_SEC), "hold_bound_cycle")
     if isolated_chips and not device_hold_offbus_escalated:
@@ -7446,6 +7448,11 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
             candidates, hold_report.RungCandidate(one_shot, "forced ladder", "off-bus one-shot"), "offbus_one_shot"
         )
         if acts and age >= _offbus_one_shot_sec():
+            return done(candidates)  # due: the watchdog's chain stops at it
+    if _disproven_lift_bound_due(max(age, bound)):
+        # Spec 03 I42: the bound's early ladder, owed from one sampler tick in until a bound ladder ran.
+        early = hold_report.RungCandidate(started + bound, "forced ladder", "disproven lift bound")
+        if add(candidates, early, "disproven_lift") and age >= bound:
             return done(candidates)  # due: the watchdog's chain stops at it
     if m is not None and m.progress_retry is not None and m.progress_retry[0] == episode:
         left = m.progress_retry[1] - time.monotonic()
@@ -8128,8 +8135,10 @@ def _forced_run_route(kind: Optional[str], age: float, mono: Optional[float] = N
 
 def _hold_bound_route(kind: Optional[str], age: float) -> ForcedRoute:
     """_forced_run_route past the startup stand-down: from the 10-min bound on, a pending post-ladder
-    check or the host rung in place of the ladder (spec 04 I76); below it, the ladder."""
-    if age < _stuck_hold_ceiling_sec():
+    check or the host rung in place of the ladder (spec 04 I76); below it, the ladder. The bound is the
+    hold's own (_hold_bound_sec: one sampler tick under the spec 03 I42 latch), so the host rung an
+    early bound ladder owes runs no second ladder first."""
+    if age < _hold_bound_sec():
         return ForcedRoute(ROUTE_LADDER)
     if kind != "hold_bound_cycle" and _hold_bound_check_pending(age):
         return ForcedRoute(ROUTE_CHECK_PENDING, (_hold_bound_ladder_age or 0.0) + _HOLD_BOUND_CHECK_SEC)

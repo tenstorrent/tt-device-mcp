@@ -1323,6 +1323,57 @@ async def test_the_10_min_mark_reruns_the_full_ladder_after_an_early_disproven_l
     assert srv.device_hold_escalation_kind == "ceiling_window"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rung_pending", [False, True])
+async def test_the_host_rung_after_an_early_disproven_lift_ladder_runs_no_second_ladder(
+    monkeypatch, clear_job_state, rung_pending
+):
+    """Spec 04 I76 with 03 I42: once the early bound ladder of a disproven lift ran, the host rung it
+    owes (its full check ran out at ladder + 300 s, or a denied rung is still pending) is asked below
+    600 s with no second full ladder first: the bound route keys on the hold's own bound."""
+    escalations, _alerts, events = _arm_disproven_lift_hold(monkeypatch, age_sec=560)
+    monkeypatch.setattr(srv, "_hold_bound_episode", srv.device_hold_episode_since)
+    monkeypatch.setattr(srv, "_hold_bound_ladder_age", 250.0)
+    monkeypatch.setattr(srv, "_hold_bound_ladder_recovered", True)
+    monkeypatch.setattr(srv, "_hold_bound_cycle_age", None)
+    monkeypatch.setattr(srv, "_hold_bound_check_failed_age", None)
+    monkeypatch.setattr(srv, "_hold_bound_rung_pending", rung_pending)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert srv.device_hold_escalation_kind == "hold_bound_cycle"
+    assert escalations == [], "no second full ladder before the host rung"
+    assert events.count("host_rung") == 1, "the host rung was asked"
+
+
+@pytest.mark.parametrize("kill_switch", [False, True])
+def test_health_names_a_disproven_lifts_early_ladder_then_its_host_rung(monkeypatch, clear_job_state, kill_switch):
+    """Spec 04 I75/I76 with 03 I42: /health's next rung reads the run's own bound. A latched hold names
+    the full ladder one sampler tick in, then, after that early ladder, the host rung at the end of its
+    check bound (not the 600 s ceiling window), whatever TT_DEVICE_MCP_FORCE_ESCALATE says."""
+    if kill_switch:
+        monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    tick = float(srv.SAMPLE_INTERVAL_SEC)
+    _arm_disproven_lift_hold(monkeypatch, age_sec=2)
+    started = datetime.fromisoformat(srv.device_hold_episode_since).timestamp()
+    rung = srv._hold_next_rung(time.time())
+    assert (rung.rung, rung.source) == ("forced ladder", "disproven lift bound")
+    assert rung.at == pytest.approx(started + tick)
+
+    since = _since(300)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since)
+    monkeypatch.setattr(srv, "_hold_bound_episode", since)
+    monkeypatch.setattr(srv, "_hold_bound_ladder_age", 250.0)
+    monkeypatch.setattr(srv, "_hold_bound_ladder_recovered", True)
+    monkeypatch.setattr(srv, "_hold_bound_cycle_age", None)
+    monkeypatch.setattr(srv, "_hold_bound_check_failed_age", None)
+    monkeypatch.setattr(srv, "_hold_bound_rung_pending", False)
+    started = datetime.fromisoformat(since).timestamp()
+    rung = srv._hold_next_rung(time.time())
+    assert rung.rung == "power cycle", "the host rung follows the early ladder's check bound"
+    assert rung.at == pytest.approx(started + 250 + srv._HOLD_BOUND_CHECK_SEC)
+
+
 # Spec 04 I79 (the class D 77 climb) against I76 (the 10-min bound): one ladder and one power-cycle
 # request per episode, whichever path gets there first, and no wait past the I65 cooldown's end.
 _77 = "post-job: fabric check COULD NOT RUN (77)"
