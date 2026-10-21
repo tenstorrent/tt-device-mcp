@@ -352,6 +352,40 @@ async def test_a_closing_rescan_that_blocks_is_bounded(monkeypatch):
     assert any("PCI rescan after the reset did not complete" in m for m in logs)
 
 
+@pytest.mark.parametrize("rc", [1, 0])
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_cut_still_settles_the_pollers(monkeypatch, rc):
+    """The cut runs after tt-smi exits and can take about 45 s. A cancel that lands in it must still
+    reach the pollers' restore step: they stay stopped (the cut's chips are undecided) and are owed to
+    the next close to HEALTHY, never left stopped and owed to nobody."""
+    hw = _hw()
+    started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def stuck_cut(chips):
+        started.set()
+        await never.wait()
+        return True
+
+    mech, _, logs = _reset_world(monkeypatch, hw, [FAILED_31], rc, cut=stuck_cut)
+    order: list = []
+
+    async def pollers(active, log):
+        order.append(("pollers", active))
+        return ["tt-telemetry"]
+
+    monkeypatch.setattr(mech, "_set_device_pollers", pollers)
+    monkeypatch.setattr(mech, "owe_device_pollers", lambda after: order.append(("owe", after)))
+    task = asyncio.ensure_future(mech.reset_with_quiesce(["tt-smi", "-glx_reset"], logs.append))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert order == [("pollers", False), ("owe", f"reset rc={rc}, cut cancelled")]
+    assert hw["rescans"] == [], "no closing rescan after a cancelled cut"
+    assert mech.reset_in_flight is False
+
+
 @pytest.mark.asyncio
 async def test_post_reset_failures_are_cleared_at_each_reset_start(monkeypatch):
     hw = _hw()

@@ -1264,8 +1264,12 @@ class RecoveryMechanism:
             if restore and rc is None:
                 restore = not await asyncio.to_thread(self.scope_active)
             if restore:
-                rescan_ok = await self._post_reset_cut(argv, log)
+                cut_done = False
                 try:
+                    # Inside the try: the cut can take up to about 45 s, and a cancel that lands in it
+                    # must still reach the finally below, or the pollers stay stopped and owed to nobody.
+                    rescan_ok = await self._post_reset_cut(argv, log)
+                    cut_done = True
                     # A reset can leave endpoints un-enumerated — and any chip we isolated earlier is
                     # still out of the kernel, because `remove` is not undone by a reset. Rescan, or the
                     # device comes back short and nobody knows why. This also re-adds a chip the I83
@@ -1289,7 +1293,12 @@ class RecoveryMechanism:
                     # restores rather than leaving a telemetry gap. A reset that ran and failed (rc != 0)
                     # leaves the device held with chips that may still be off the bus or hung: pollers
                     # stay down. rc None here is a launch failure or a raise with no scope left running.
-                    await self.restore_pollers(quiesced, log, ok=rc in (0, None), after=f"reset rc={rc}")
+                    # A cancel inside the I83 cut leaves its chips undecided (a remove may be under way):
+                    # the pollers stay down too, owed to the next close to HEALTHY.
+                    restored = cut_done and rc in (0, None)
+                    await self.restore_pollers(
+                        quiesced, log, ok=restored, after=f"reset rc={rc}" if cut_done else f"reset rc={rc}, cut cancelled"
+                    )
 
             if late_cancel:
                 raise asyncio.CancelledError()
