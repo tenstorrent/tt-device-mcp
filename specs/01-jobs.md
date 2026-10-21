@@ -67,6 +67,7 @@ the queue and a running job outlive the broker process.
 - **I5** — A job is never killed with bare SIGKILL first. Termination is the ladder SIGINT
   (`GRACEFUL_KILL_GRACE_SEC` = 60 s) → SIGTERM (`SIGTERM_GRACE_SEC` = 15 s) → SIGKILL,
   because only SIGINT unwinds a Python/ttnn job into the teardown that releases the device.
+  The one shorter SIGINT window is the silence reap's (I10, `HUNG_SIGINT_GRACE_SEC` = 10 s).
   A job running in a systemd scope (privsep, or re-adopted) MUST be signalled via the
   scope, never by `killpg` on the wrapper pid (`_terminate_job`). A finished job's
   leftover that outlives SIGINT and needs the `systemctl stop` reap leaves the device
@@ -109,6 +110,16 @@ the queue and a running job outlive the broker process.
   to it as to any job until contention starts (x passed and a job queued): from then on
   the preemption owns the stop, bounded by its grace minute and its kill, and the silence
   reaper neither relabels it HUNG nor signals it inside the minute it was promised.
+  The silence reap runs I5's ladder with a
+  SIGINT window of `HUNG_SIGINT_GRACE_SEC` (10 s) instead of `GRACEFUL_KILL_GRACE_SEC`: a job
+  silent that long is blocked, most often in a device op, and does not unwind on SIGINT (on a
+  Galaxy host both silence reaps observed ran the full 60 s and ended at SIGTERM), and a HUNG
+  job owes the reset and the full check (fabric included, spec 03 I69) whatever signal ended
+  it. SIGINT still goes first; SIGTERM (`SIGTERM_GRACE_SEC`) and SIGKILL follow unchanged.
+  Every other stop (timeout, user kill, preemption, the doomed reap, a broker error) keeps the
+  full window. Time to recover (hung class), from the reap to the process tree gone: at most
+  75 s → 25 s (10 s SIGINT + 15 s SIGTERM); observed 61 s, ~11 s expected for a job that
+  ignores SIGINT. The I69 reset and full check that follow are unchanged.
 - **I11** — Environment resolution priority is `env_file` > `inherited_env` > workspace
   defaults, and each level REPLACES the one below wholesale — no merging
   (`get_activation_script`). Env vars are resolved and validated once, at queue time; the
@@ -563,7 +574,8 @@ flowchart LR
   the mesh, and the eth cores are left mid-transaction — for a Python job SIGTERM is no
   gentler than SIGKILL. The 60 s SIGINT window covers a real Galaxy mesh teardown; at
   10 s every timeout escalated to SIGKILL and wedged eth cores. Rejected: TERM-first
-  and short grace windows.
+  and short grace windows, except for the silence reap (I10), whose job is not unwinding
+  and owes the reset anyway.
 - **Scope-aware kill.** systemd reparents a privsep payload into the scope's cgroup, so
   `killpg` on the broker-held pid hits only the systemd-run wrapper and leaves the real
   job running mid-CCL (observed: exit code None on a wedged fabric). Signal the scope;
@@ -611,7 +623,7 @@ flowchart LR
 | I7 | `tests/test_readopt.py::test_readopted_deadline_counts_time_already_served`, `tests/test_readopt.py::test_readopted_job_past_its_deadline_is_terminated`, `tests/test_readopt.py::test_readopted_job_inside_its_deadline_is_left_alone`, `tests/test_readopt.py::test_job_from_log_recovers_the_deadline`, `tests/test_readopt.py::test_job_from_log_without_a_timeout_header_still_gets_a_deadline` |
 | I8 | `tests/test_readopt.py::test_readopted_job_recovers_its_real_exit_code`, `tests/test_readopt.py::test_readopted_job_that_passed_is_reported_as_passed`, `tests/test_readopt.py::test_readopted_job_with_no_exit_status_is_not_called_completed`, `tests/test_readopt.py::test_a_signalled_job_records_a_real_exit_status`, `tests/test_readopt.py::test_the_job_exit_dir_is_redirectable` |
 | I9 | `tests/test_server.py::test_next_job_id_is_3_digit_and_wraps`, `tests/test_server.py::test_next_job_id_skips_live_ids`, `tests/test_server.py::test_seed_job_counter_resumes_across_restart`, `tests/test_server.py::test_seed_job_counter_wraps_at_999`, `tests/test_server.py::test_a_restart_does_not_reissue_an_id_a_log_still_holds`, `tests/test_server.py::test_no_id_in_the_recent_window_is_ever_reissued`, `tests/test_recent_jobs.py::test_a_reserved_action_id_is_not_handed_to_another_job` |
-| I10 | `tests/test_device_safety.py::test_a_silent_job_is_reaped_as_hung`, `tests/test_device_safety.py::test_hung_silence_of_zero_disables_the_reaper`, `tests/test_device_safety.py::test_the_doomed_grace_lets_the_backtrace_land`, `tests/test_device_safety.py::test_doomed_grace_of_zero_disables_the_doomed_reaper`, `tests/test_preemptable.py::test_a_silent_preemptable_job_is_not_reaped_while_nobody_waits`, `tests/test_preemptable.py::test_a_silent_preemptable_job_is_reaped_once_a_job_waits` |
+| I10 | `tests/test_device_safety.py::test_a_silent_job_is_reaped_as_hung`, `tests/test_device_safety.py::test_hung_silence_of_zero_disables_the_reaper`, `tests/test_device_safety.py::test_the_doomed_grace_lets_the_backtrace_land`, `tests/test_device_safety.py::test_doomed_grace_of_zero_disables_the_doomed_reaper`, `tests/test_preemptable.py::test_a_silent_preemptable_job_is_not_reaped_while_nobody_waits`, `tests/test_preemptable.py::test_a_silent_preemptable_job_is_reaped_once_a_job_waits`, `tests/test_preemptable.py::test_a_silent_job_past_its_limit_is_preempted_not_reaped`, `tests/test_job_kill_reset.py::test_a_hung_reap_gives_sigint_the_short_window`, `tests/test_job_kill_reset.py::test_a_runner_timeout_keeps_the_full_sigint_window`, `tests/test_job_kill_reset.py::test_the_hung_sigint_window_is_short_and_the_rest_of_the_ladder_unchanged` |
 | I11 | `tests/test_server.py::TestActivationScript::test_activation_script_default`, `tests/test_server.py::TestActivationScript::test_activation_script_with_env_file`, `tests/test_server.py::TestActivationScript::test_activation_script_inherited_env`, `tests/test_server.py::TestActivationScript::test_activation_script_python_env_dir_over_virtual_env`, `tests/test_server.py::TestActivationScript::test_activation_script_virtual_env_fallback`, `tests/test_server.py::TestEnvFile::test_load_env_file_converts_to_strings` |
 | I12 | `tests/test_device_safety.py::test_rest_submit_bad_env_file_is_a_refusal_not_a_500`, `tests/test_server.py::TestEnvFile::test_load_env_file_not_found`, `tests/test_server.py::TestEnvFile::test_load_env_file_invalid_format`, `tests/test_server.py::TestActivationScript::test_activation_script_validate_missing_env` |
 | I14 | `tests/test_server.py::TestCleanDeviceGate::test_wedge_risk_truth_table`, `tests/test_device_safety.py::test_a_hung_job_is_treated_as_a_wedge_risk`, `tests/test_server.py::test_scan_output_detects_eth_core_fault`, `tests/test_server.py::test_scan_output_finds_signature_in_tail_of_large_log`, `tests/test_readopt.py::test_a_readopted_job_that_wedged_the_mesh_flags_the_device` |

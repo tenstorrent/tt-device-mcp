@@ -17,6 +17,7 @@ import pytest
 
 from tests.conftest import fsm_dirty
 from tests.test_eth_timeout_reset import ADVANCING, OUTAGE_HOLD, mesh  # noqa: F401 (fixture)
+from tt_device_mcp import constants
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health.recovery import STAGE_SMI_RESET
@@ -405,6 +406,61 @@ async def test_a_hung_job_owes_the_reset(runner_env, monkeypatch):
         await _stop(runner)
     assert job.status is srv.JobStatus.HUNG
     assert srv._kill_reset_debt().startswith("job 934"), "the hung reaper's kill owes the reset too"
+
+
+def _recording_ladder(monkeypatch, graces):
+    """_terminate_job stand-in: records the SIGINT window it was given, then ends the group
+    through the real ladder with a short window so the test does not wait it out."""
+
+    async def _ladder(job_id, pid, grace_sec=srv.GRACEFUL_KILL_GRACE_SEC):
+        graces.append(grace_sec)
+        return await srv._terminate_process_group(pid, grace_sec=0.2)
+
+    monkeypatch.setattr(srv, "_terminate_job", _ladder)
+
+
+@pytest.mark.asyncio
+async def test_a_hung_reap_gives_sigint_the_short_window(runner_env, monkeypatch):
+    """01 I10: a job silent for HUNG_SILENCE_SEC does not unwind on SIGINT (on a galaxy box both silence
+    reaps ran the full 60 s and ended at SIGTERM), and it owes the reset either way. Its SIGINT
+    window is HUNG_SIGINT_GRACE_SEC, not GRACEFUL_KILL_GRACE_SEC, and the reset debt stays."""
+    monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 1)
+    monkeypatch.setattr(srv, "HUNG_POLL_SEC", 0.05)
+    graces = []
+    _recording_ladder(monkeypatch, graces)
+    job, runner = await _start("936", "echo working; sleep 600")
+    try:
+        assert await _until(lambda: _runner_done(job))
+        assert await _until(srv._kill_reset_debt)
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.HUNG
+    assert graces == [srv.HUNG_SIGINT_GRACE_SEC], f"hung reap SIGINT window {graces}, want the short one"
+    assert srv._kill_reset_debt().startswith("job 936"), "the short window must not drop the I69 reset"
+
+
+@pytest.mark.asyncio
+async def test_a_runner_timeout_keeps_the_full_sigint_window(runner_env, monkeypatch):
+    """Only the silence reap is shortened: a job stopped at its time limit may be mid-run and
+    unwinding, so it keeps GRACEFUL_KILL_GRACE_SEC."""
+    monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 0)
+    graces = []
+    _recording_ladder(monkeypatch, graces)
+    job, runner = await _start("937", "sleep 600", timeout_sec=1)
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.TIMEOUT
+    assert graces == [srv.GRACEFUL_KILL_GRACE_SEC]
+
+
+def test_the_hung_sigint_window_is_short_and_the_rest_of_the_ladder_unchanged():
+    assert constants.HUNG_SIGINT_GRACE_SEC == 10
+    assert constants.HUNG_SIGINT_GRACE_SEC < constants.GRACEFUL_KILL_GRACE_SEC
+    assert constants.GRACEFUL_KILL_GRACE_SEC == 60, "non-hung kills keep the full SIGINT window"
+    assert constants.SIGTERM_GRACE_SEC == 15
+    assert constants.PREEMPT_GRACE_SEC == 60, "preemption's contention grace is not this change"
 
 
 @pytest.mark.asyncio

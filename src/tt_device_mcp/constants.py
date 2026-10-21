@@ -38,6 +38,14 @@ GRACEFUL_KILL_GRACE_SEC = 60
 # to the reap, and reaching SIGKILL means the device was NOT released.
 SIGTERM_GRACE_SEC = 15
 
+# SIGINT window for a job the hung reaper stops for silence (spec 01 I10), in place of
+# GRACEFUL_KILL_GRACE_SEC. A job that printed nothing for HUNG_SILENCE_SEC is blocked, most
+# often inside a device op, and does not unwind on SIGINT: on a Galaxy host every silence reap
+# observed ran the full 60 s and ended at SIGTERM. A HUNG job owes the mesh the reset and the
+# full check either way (spec 03 I69), so the long window only delayed recovery. The SIGINT
+# still goes first, and SIGTERM (SIGTERM_GRACE_SEC) and SIGKILL follow as on every ladder.
+HUNG_SIGINT_GRACE_SEC = 10
+
 # After a job is finalized, any of its processes still alive (a child that left the process
 # group, or one the ladder never reached) gets SIGTERM, then SIGKILL after this window. The
 # job itself is already gone, so this is a sweep of leftovers, not a teardown: it is kept
