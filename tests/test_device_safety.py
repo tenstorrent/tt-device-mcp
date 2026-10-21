@@ -12872,6 +12872,60 @@ def test_preflight_requires_fabric_check_but_only_warns_on_eth_heartbeat(monkeyp
     assert any("ETH_HEARTBEAT" in w for w in warns), warns
 
 
+def _eth_preflight_host(monkeypatch, tmp_path):
+    dev = tmp_path / "dev"
+    dev.mkdir()
+    (dev / "0").touch()
+    (dev / "1").touch()
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(dev))
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "true")
+    monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    monkeypatch.delenv("TT_DEVICE_MCP_PRIVSEP", raising=False)
+    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(tmp_path / "no-validator"))
+    monkeypatch.setattr(srv, "_scoped_reset_backend", lambda: True)
+    monkeypatch.setattr(srv.shutil, "which", lambda n: f"/usr/bin/{n}")
+    monkeypatch.setattr(srv, "health_dir", lambda: tmp_path)
+    spawned = []
+    # Preflight sits on the broker start path: it must never spawn a candidate python.
+    monkeypatch.setattr(srv.eth, "resolve_python", lambda **k: spawned.append(1))
+    return spawned
+
+
+@pytest.mark.parametrize("probe, python", [(True, True), (True, False), (False, True), (False, False)])
+def test_preflight_eth_heartbeat_warning_tracks_whether_the_built_in_reader_is_installed(
+    monkeypatch, tmp_path, probe, python
+):
+    """With no override, preflight warns the eth-heartbeat probe is off only when the built-in
+    reader is not installed (no readable probe script, or no executable candidate python). It
+    decides with os.access alone: whether the reader imports and arms is the self-test's call."""
+    spawned = _eth_preflight_host(monkeypatch, tmp_path)
+    if probe:
+        (tmp_path / "probe.py").write_text("")
+        monkeypatch.setenv("TTDEV_ETH_CHECK_PROBE", str(tmp_path / "probe.py"))
+    else:
+        monkeypatch.setenv("TTDEV_ETH_CHECK_PROBE", str(tmp_path / "missing-probe.py"))
+    if python:
+        py = tmp_path / "python"
+        py.write_text("")
+        py.chmod(0o755)
+        monkeypatch.setenv("TTDEV_ETH_CHECK_PYTHON", str(py))
+    fails, warns, _d = srv._preflight_required_capabilities(socket_path="/run/x.sock")
+    warned = any("eth-heartbeat" in w or "ETH_HEARTBEAT" in w for w in warns)
+    assert warned is not (probe and python), warns
+    assert not any("eth-heartbeat" in f or "ETH_HEARTBEAT" in f for f in fails), fails
+    assert spawned == [], "preflight must not spawn a python to decide this"
+
+
+def test_preflight_no_eth_heartbeat_warning_when_the_override_is_set(monkeypatch, tmp_path):
+    spawned = _eth_preflight_host(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", "true")
+    _fails, warns, _d = srv._preflight_required_capabilities(socket_path="/run/x.sock")
+    assert not any("eth-heartbeat" in w or "ETH_HEARTBEAT" in w for w in warns), warns
+    assert spawned == []
+
+
 def test_preflight_fabric_check_satisfied_by_the_built_in_validator(monkeypatch, tmp_path):
     """TT_DEVICE_MCP_FABRIC_CHECK_CMD unset must NOT hard-fail preflight when the built-in
     validator path (health.monitors.fabric.build_command) is itself available — a host that

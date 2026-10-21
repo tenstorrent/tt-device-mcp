@@ -15055,9 +15055,13 @@ def _preflight_required_capabilities(socket_path: Optional[str]) -> tuple[list[s
         # required validator — the fabric traffic pass is the authoritative eth/fabric check. Absent,
         # the relift falls back to the fabric pass. Warn loud so its absence is never silent, but do
         # not refuse to serve over it.
-        if not os.environ.get("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", "").strip():
+        # "Absent" means neither the env override nor the built-in reader is installed. Only
+        # os.access checks here: whether the reader imports and arms is the startup self-test's
+        # call, which says so at WARNING itself, so preflight spawns nothing on the start path.
+        if not (os.environ.get("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", "").strip() or eth.reader_installed()):
             warns.append(
-                "TT_DEVICE_MCP_ETH_HEARTBEAT_CMD unset — the passive eth-core probe is off "
+                "no eth-heartbeat command (TT_DEVICE_MCP_ETH_HEARTBEAT_CMD unset and no built-in "
+                "probe installed) — the passive eth-core probe is off "
                 "(the read-only relift falls back to the fabric traffic pass). Optional."
             )
 
