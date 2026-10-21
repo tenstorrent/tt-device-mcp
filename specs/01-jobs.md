@@ -207,7 +207,8 @@ the queue and a running job outlive the broker process.
   between polls and the minute restarts too: an unsure case gives the running job more time,
   never less. A job that ends itself inside the minute ends as any job does (`completed` or
   `failed` by its exit status), never signalled; it takes the ordinary post-job gate, except
-  that one returning 0 under contention (`Job.preempt_yielded`) gets no post-job check (below).
+  that one returning 0 under contention (`Job.preempt_yielded`) gets no post-job check (below);
+  a class D fault it leaves is then found at the next job (spec 03 I69).
   When the minute
   runs out with a job still waiting, the broker kills the job's whole process tree
   (`_preempt_kill`: SIGTERM to its scope's cgroup and its process group, then SIGKILL to both

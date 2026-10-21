@@ -1013,11 +1013,16 @@ cooldown (spec 04 I65) holds longer.
   grace minute (`PREEMPT_GRACE_SEC`, 60 s, no signal), its kill (SIGTERM, then SIGKILL at most
   `PREEMPT_KILL_GRACE_SEC`, 10 s, later), then one reset, then the full check; the waiter is
   dispatched at most 10 s later than when the SIGKILL landed at the minute's end, and a job that
-  ends itself inside the minute frees the device with the ordinary post-job gate, sooner than
-  any kill. A preemption witnessed to end cleanly on SIGTERM (spec 01 I20) skips the reset and
+  ends itself inside the minute with a non-zero status frees the device with the ordinary
+  post-job gate, sooner than any kill; one that returns 0 gets no gate (below). A preemption witnessed to end cleanly on SIGTERM (spec 01 I20) skips the reset and
   the full check: the waiter starts after the fast check, about 45-105 s sooner on a Galaxy;
   one that returns 0 (on SIGTERM, or ending itself under contention) also skips the fast check
-  (snapshot plus eth heartbeat), so the waiter starts right after the job's end; a killed one, a
+  (snapshot plus eth heartbeat), so the waiter starts right after the job's end. That skip also drops the eth heartbeat read,
+  the only post-job catch for a frozen eth core after a clean exit (class D, mesh present,
+  fabric/eth failure): such a fault left by an exit-0 preemption is found at the next job, at
+  most that job's runtime, or `HUNG_SILENCE_SEC` (300 s) for a silent hang, then takes the
+  normal class D path, and that job is lost. A fault the sampler or a job-output scan sees
+  still holds and gates as before. A killed one, a
   non-zero or unproven status and a normal completion are unchanged. The door payment's move adds no
   wait: the foreign-holder and external-step waits it now follows already ran before the job's
   gate, with their own bounds.
