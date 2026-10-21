@@ -449,6 +449,13 @@ class Recovery(ABC):
         # stale prior pass; the server threads it onto Evidence.bridge_reset_failed after this fires.
         self.last_bridge_reset_reasons: dict = {}
         isolated_chips = self.deps.isolated_chips()
+        # Spec 04 I69: every chip the broker removed is off the bus and un-reset, so it is a target
+        # whether or not this pass was asked for it (a record reloaded after a restart, say). Left out,
+        # the rescan any other chip's reset ends with would re-enumerate it un-reset.
+        adopted = [i for i in pci.removed_chip_ids() if i not in isolated_chips]
+        if adopted:
+            isolated_chips.update(adopted)
+            health_event("removed_chips_isolated", chips=adopted, context="bridge_reset")
         if not isolated_chips:
             return True
         targets = sorted(isolated_chips, key=int)
@@ -621,10 +628,10 @@ class Recovery(ABC):
         )
 
         # Spec 04 I69: never re-enumerate a removed chip that was not reset this pass — the rescan
-        # lets the driver probe a hung chip. A refused host reset gate withholds it only then (the
-        # removed chips were not reset because of it); chips the broker never removed keep the
-        # bare rescan, as before the gate.
-        unreset_dead = [i for i in still_dead if pci.removed_chip(i) and i not in reset_this_pass]
+        # lets the driver probe a hung chip. Every record counts, not only this pass's targets: the
+        # rescan is global. A refused host reset gate withholds it only then (the removed chips were
+        # not reset because of it); chips the broker never removed keep the bare rescan, as before.
+        unreset_dead = [i for i in pci.removed_chip_ids() if i not in reset_this_pass]
         withhold = ("host_reset_gated" if gated else "removed_chip_not_reset") if unreset_dead else ""
         if still_dead and withhold:
             health_event("pci_rescan_withheld", chips=still_dead, unreset=unreset_dead, reason=withhold)
