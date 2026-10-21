@@ -39,7 +39,7 @@ def privileged(monkeypatch):
     The opt-outs come off too: conftest seals them to 0 suite-wide, which would make every
     assertion below pass on the env var alone and prove nothing about privilege."""
     _latch(monkeypatch, root=True, systemd=True, setpci_bin=True, ipmitool=True, ipmi_node=True)
-    for var in ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE", "TT_DEVICE_MCP_AUTO_UBB_RESET"):
+    for var in ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -84,13 +84,6 @@ def test_an_unreachable_bmc_has_no_power_cycle_rung(monkeypatch, privileged):
     assert srv._auto_power_cycle_enabled() is False
 
 
-def test_an_unreachable_bmc_has_no_tray_rung(monkeypatch, privileged):
-    """The per-tray re-power goes out over the same `ipmitool raw` as the cold rung."""
-    assert galaxy._ubb_reset_enabled() is True
-    _latch(monkeypatch, root=True, systemd=True, setpci_bin=True, ipmitool=True)
-    assert galaxy._ubb_reset_enabled() is False
-
-
 def _commit_platform(monkeypatch, which):
     """Stage what resolve_platform committed at boot: "per-target", "galaxy", or None (unresolved)."""
     monkeypatch.setattr(srv.fsm, "galaxy", srv.galaxy_recovery)
@@ -104,34 +97,17 @@ def _inventory(said):
     return dict(item.split("=") for item in line.removeprefix("RUNG INVENTORY: ").split(", "))
 
 
-def test_a_per_target_host_has_no_tray_rung(monkeypatch, privileged, said):
-    """A per-target host has no UBB trays, so full privilege still leaves nothing to re-power. The
-    inventory must say so, and must name the platform rather than a privilege the host has."""
-    _commit_platform(monkeypatch, "per-target")
+@pytest.mark.parametrize("platform", ["per-target", "galaxy", None])
+def test_no_platform_lists_a_tray_rung(monkeypatch, privileged, said, platform):
+    """There is no BMC tray re-power rung (spec 04 I23), so no platform lists one, on or off, even with
+    full privilege."""
+    _commit_platform(monkeypatch, platform)
 
     srv.log_rung_inventory()
 
-    assert _inventory(said)["auto-tray-reset"] == "OFF"
-    assert any("RUNG OFF auto-tray-reset" in m and "per-target" in m for lvl, m in said if lvl == "warning")
-
-
-def test_an_unresolved_platform_keeps_the_tray_rung(monkeypatch, privileged, said):
-    """A degraded Galaxy is exactly the host whose board reads fail and whose platform stays
-    unresolved, and a below-floor tray-down is what this rung recovers. Unresolved is not
-    per-target."""
-    _commit_platform(monkeypatch, None)
-
-    srv.log_rung_inventory()
-
-    assert _inventory(said)["auto-tray-reset"] == "on"
-
-
-def test_a_galaxy_keeps_the_tray_rung(monkeypatch, privileged, said):
-    _commit_platform(monkeypatch, "galaxy")
-
-    srv.log_rung_inventory()
-
-    assert _inventory(said)["auto-tray-reset"] == "on"
+    assert not [name for name in _inventory(said) if "tray" in name]
+    assert not [m for lvl, m in said if "tray" in m.lower()]
+    assert not hasattr(galaxy, "_ubb_reset_enabled")
 
 
 def test_a_non_root_daemon_has_no_bridge_rung(monkeypatch, privileged):
@@ -147,11 +123,9 @@ def test_the_opt_out_still_wins_where_the_privilege_exists(monkeypatch, privileg
     fully privileged host still has it off."""
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")
 
     assert srv._auto_reboot_enabled() is False
     assert srv._auto_power_cycle_enabled() is False
-    assert galaxy._ubb_reset_enabled() is False
 
 
 def test_the_device_scoped_resets_survive_without_systemd(monkeypatch):

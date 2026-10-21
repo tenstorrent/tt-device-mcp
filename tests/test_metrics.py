@@ -43,7 +43,7 @@ def test_every_helper_rejects_an_unknown_label(fn, args):
 
 def test_valid_labels_are_accepted_for_every_helper():
     metrics.stage_fired("power_cycle", "blocked")
-    metrics.stage_fired("ubb_tray", "not_applicable")
+    metrics.stage_fired("bridge_reset", "not_applicable")
     metrics.probe_observed("fabric", "skipped", 0.5)
     metrics.job_completed("completed")
     metrics.job_completed("hung")
@@ -273,9 +273,8 @@ def test_stages_match_the_constants_registry():
 
 
 def test_stages_also_match_health_recovery_own_stage_constants():
-    """health.recovery's own next_stage()/_route() decision constants (STAGE_BRIDGE_RESET etc,
-    which omit ubb_tray — it is outside that router entirely) now import from the SAME
-    constants.STAGE_NAMES metrics.STAGES does, so this pins that re-export rather than a second,
+    """health.recovery's own next_stage()/_route() decision constants (STAGE_BRIDGE_RESET etc) now import
+    from the SAME constants.STAGE_NAMES metrics.STAGES does, so this pins that re-export rather than a second,
     independent vocabulary that merely happened to agree."""
     from tt_device_mcp.health.recovery import (
         STAGE_BRIDGE_RESET,
@@ -372,28 +371,6 @@ def test_stats_record_job_completion_counts_hung_in_prometheus_but_not_the_legac
 
 
 # ---- health/recovery wiring: "blocked" vs. "not_applicable" is consistent per-stage -------------
-
-
-def test_ubb_tray_no_tray_on_this_platform_is_not_applicable_not_blocked():
-    """The bug this closes: on a per-target (non-Galaxy) host there is no tray concept at all, so
-    _ubb_tray_walk_plan returns None on EVERY below-floor off-bus drop — mapping that to "blocked"
-    made the series climb forever on a platform that will never have a tray rung, indistinguishable
-    from an operator leaving a kill-switch off."""
-    import asyncio
-
-    from tt_device_mcp.health.recovery.galaxy import GalaxyRecovery
-
-    async def _run():
-        recovery = GalaxyRecovery.__new__(GalaxyRecovery)
-        # beats={} + expected=1 -> _ubb_tray_walk_plan finds no whole/partial tray to route,
-        # exactly the per-target-host shape (a single/multi-card box with no UBB trays at all).
-        return await recovery._attempt_ubb_tray_reset({}, off_bus=1, expected=1, log=lambda m: None)
-
-    result = asyncio.run(_run())
-    assert result is None
-    out = metrics.render().decode()
-    assert 'tt_device_broker_stages_fired_total{outcome="not_applicable",stage="ubb_tray"} 1.0' in out
-    assert 'tt_device_broker_stages_fired_total{outcome="blocked",stage="ubb_tray"}' not in out
 
 
 def test_bridge_reset_missing_pci_address_is_not_applicable_not_blocked():

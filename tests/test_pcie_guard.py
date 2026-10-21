@@ -129,58 +129,7 @@ def test_sysfs_names_each_chip_its_bus_and_root_port(sysfs):
     assert pcie_guard.tt_root_ports(eps) == sorted(PORTS)
 
 
-def test_plan_refuses_a_tray_map_that_points_at_another_tray(sysfs):
-    """Tray 4 is bus 0x80, chip 3 in the kernel's order. Chip 2 (list position 3) sits on tray 3:
-    a map built by position names it for tray 4, and firing would cut a healthy tray."""
-    bad = pcie_guard.plan_tray_repower(0b1000, [2])
-    assert bad.mismatch and "[2]" in bad.mismatch and "[3]" in bad.mismatch
-    good = pcie_guard.plan_tray_repower(0b1000, [3])
-    assert not good.mismatch
-    assert good.functions == ["0000:81:00.0"] and good.chips == [3]
-    assert good.root_ports == sorted(PORTS), "every Tenstorrent root port is masked, the siblings too"
-
-
-def test_plan_refuses_without_a_tray_table(sysfs, monkeypatch):
-    monkeypatch.delitem(sys.modules, "tt_smi.constants")
-    monkeypatch.setitem(sys.modules, "tt_smi", types.ModuleType("tt_smi"))
-    assert pcie_guard.plan_tray_repower(0b1, [0]).mismatch
-
-
 # ---------------------------------------------------------------- the envelope
-
-
-def test_envelope_masks_every_port_removes_the_tray_fires_rescans_and_restores(sysfs):
-    steps = []
-
-    def fire():
-        assert all(_masked(sysfs, p) for p in PORTS), "every root port is masked while the tray is unpowered"
-        assert (sysfs / "sys/bus/pci/devices/0000:81:00.0/remove").read_text() == "1"
-        assert not (sysfs / "sys/bus/pci/devices/0000:01:00.0/remove").exists(), "other trays stay"
-        steps.append("fire")
-
-    plan = pcie_guard.safe_tray_repower(
-        0b1000,
-        [3],
-        fire,
-        lambda m: None,
-        quiesce=lambda chips: steps.append(("quiesce", chips)),
-        reinit=lambda chips: steps.append(("reinit", chips)),
-        sleep=lambda s: None,
-    )
-    assert steps == [("quiesce", [3]), "fire", ("reinit", [3])]
-    assert _rescanned(sysfs) == ["0000:80:01.1"]
-    assert all(_restored(sysfs, p) for p in PORTS), "a quiet port gets its exact old settings back"
-    assert plan.kept_masked == []
-
-
-def test_envelope_restores_and_rescans_even_when_the_pulse_fails(sysfs):
-    def fire():
-        raise RuntimeError("ipmitool exited 1")
-
-    with pytest.raises(RuntimeError):
-        pcie_guard.safe_tray_repower(0b1000, [3], fire, lambda m: None, sleep=lambda s: None)
-    assert _rescanned(sysfs) == ["0000:80:01.1"]
-    assert all(_restored(sysfs, p) for p in PORTS)
 
 
 ALL_ONES = "4294967295\n"
@@ -188,306 +137,6 @@ ALL_ONES = "4294967295\n"
 
 def _beat(root, chip, value):
     (root / f"sys/class/tenstorrent/tenstorrent!{chip}/tt_heartbeat").write_text(value)
-
-
-def test_the_envelope_rescans_only_the_re_powered_trays_root_ports(sysfs):
-    """A global rescan walks every other tray's ports too; after each per-tray re-power on a Galaxy the
-    slot-6 chip of every other tray then read all-ones. Only the re-powered tray's port is rescanned,
-    the bare global rescan never, and a tray whose chip is off the bus still has its port found."""
-    plan = pcie_guard.safe_tray_repower(0b0010, [1], lambda: None, lambda m: None, sleep=lambda s: None)
-    assert plan.tray_ports == ["0000:40:01.1"]
-    assert _rescanned(sysfs) == ["0000:40:01.1"]
-    assert not (sysfs / "sys/bus/pci/rescan").exists(), "never the whole bus"
-    # Chip 1 off the bus (its function gone): its port, remembered and still in sysfs, is the tray's.
-    (sysfs / "sys/bus/pci/devices/0000:41:00.0").unlink()
-    assert pcie_guard.tray_root_ports([2]) == ["0000:40:01.1"]
-    assert pcie_guard.tray_root_ports([1, 3]) == ["0000:00:01.1", "0000:c0:01.1"]
-
-
-def test_the_envelope_falls_back_to_the_global_rescan_when_no_tray_port_is_known(sysfs):
-    """With no port of the tray rescannable on its own, a removed chip could never come back: then,
-    and only then, the whole bus is rescanned."""
-    for rp in PORTS:
-        shutil.rmtree(sysfs / "sys/bus/pci/devices" / rp / "pci_bus")
-    lines = []
-    pcie_guard.safe_tray_repower(0b1000, [3], lambda: None, lines.append, sleep=lambda s: None)
-    assert (sysfs / "sys/bus/pci/rescan").read_text() == "1"
-    assert any("rescanning the whole bus" in m for m in lines)
-
-
-def test_a_sibling_chip_newly_all_ones_gets_one_remove_and_scoped_rescan(sysfs, monkeypatch):
-    """Tray 4's re-power leaves chip 0 (tray 1) reading all-ones: it gets one remove and a rescan of its
-    own port, with AER still masked, and is reported. Back after that: still_off is empty; still
-    all-ones: it is reported still off and left to the walk (the mesh reset)."""
-    events = []
-    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    real_write = pcie_guard._write
-    writes = []
-
-    def write(path, text):
-        writes.append((str(path.relative_to(sysfs)), _masked(sysfs, "0000:00:01.1")))
-        real_write(path, text)
-        if path.name == "rescan" and "0000:00:01.1" in str(path) and recovers:
-            _beat(sysfs, 0, "100\n")
-
-    monkeypatch.setattr(pcie_guard, "_write", write)
-    for recovers, still_off in ((True, []), (False, [0])):
-        events.clear()
-        writes.clear()
-        _beat(sysfs, 0, "100\n")
-        plan = pcie_guard.safe_tray_repower(
-            0b1000, [3], lambda: _beat(sysfs, 0, ALL_ONES), lambda m: None, sleep=lambda s: None
-        )
-        assert plan.siblings_dropped == [0] and plan.siblings_still_off == still_off
-        sib = [w for w in writes if "0000:01:00.0" in w[0] or "0000:00:01.1" in w[0]]
-        assert [w[0].rsplit("/", 1)[-1] for w in sib] == ["remove", "rescan"], "one remove, one scoped rescan"
-        assert all(masked for _p, masked in sib), "done while AER is still masked"
-        assert dict(events)["tray_repower_sibling_offbus"]["chips"] == [0]
-        assert dict(events)["tray_repower_sibling_offbus"]["still_off"] == still_off
-        assert dict(events)["tray_repower_envelope"]["siblings_still_off"] == still_off
-        assert all(_restored(sysfs, p) for p in PORTS)
-
-
-def test_a_sibling_chip_already_all_ones_or_on_the_tray_is_not_touched(sysfs, monkeypatch):
-    """Only a chip on ANOTHER tray that read live before the pulse counts: one already all-ones before
-    it (chip 1) or one on the re-powered tray (chip 3) is never removed by the check."""
-    events = []
-    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    _beat(sysfs, 1, ALL_ONES)
-
-    def fire():
-        _beat(sysfs, 3, ALL_ONES)
-
-    plan = pcie_guard.safe_tray_repower(0b1000, [3], fire, lambda m: None, sleep=lambda s: None)
-    assert plan.siblings_dropped == []
-    assert not (sysfs / "sys/bus/pci/devices/0000:41:00.0/remove").exists()
-    assert "tray_repower_sibling_offbus" not in dict(events)
-    assert _rescanned(sysfs) == ["0000:80:01.1"]
-
-
-def test_a_disabled_tray_walk_leaves_the_envelope_armed(sysfs, monkeypatch):
-    """Disabling (a tray re-power regressed) is a ladder decision: the envelope itself never refuses a
-    tray fire on it, since a refused fire inside the sweep would hold the host rung forever (I22). The
-    ubb_tray_rung_disabled event is left once, however often it is disabled."""
-    events, fired = [], []
-    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    assert pcie_guard.tray_rung_disabled() is None
-    pcie_guard.disable_tray_rung(tray=3, new_off=["5"])
-    pcie_guard.disable_tray_rung(tray=1, new_off=["13"])
-    assert [n for n, _ in events] == ["ubb_tray_rung_disabled"]
-    assert pcie_guard.tray_rung_disabled() == {"tray": 3, "new_off": ["5"]}
-    pcie_guard.safe_tray_repower(0b1000, [3], lambda: fired.append(1), lambda m: None, sleep=lambda s: None)
-    assert fired == [1]
-    assert "tray_repower_refused" not in dict(events)
-
-
-def test_a_disabled_tray_rung_survives_a_broker_restart_on_the_same_boot(sysfs, monkeypatch):
-    """The record goes to the health dir with the boot id: a new broker process on the same boot
-    (in-memory state gone) still declines the tray rung."""
-    events = []
-    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    _boot(sysfs, "boot-a")
-    pcie_guard.disable_tray_rung(tray=[3], new_off=["5", "13"], signature="position5")
-    rec = json.loads((pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE).read_text())
-    assert rec["boot_id"] == "boot-a" and rec["why"]["tray"] == [3]
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)  # a broker restart
-    assert pcie_guard.tray_rung_disabled() == {"tray": [3], "new_off": ["5", "13"], "signature": "position5"}
-    assert "ubb_tray_rung_disabled_restored" in [n for n, _ in events]
-    pcie_guard.disable_tray_rung(tray=[1], new_off=["21"])
-    assert [n for n, _ in events].count("ubb_tray_rung_disabled") == 1, "restored: not latched again"
-
-
-def test_a_new_boot_keeps_the_tray_rung_latch(sysfs, monkeypatch):
-    """A power cycle does not repair the UBB whose re-power regressed: a record from an earlier boot
-    still declines the rung (measured: re-armed on each new boot, the same tray re-power took 20 more
-    chips off three times in an hour)."""
-    events = []
-    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    _boot(sysfs, "boot-a")
-    pcie_guard.disable_tray_rung(tray=[1], new_off=[str(c) for c in range(8, 28)])
-    path = pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
-    _boot(sysfs, "boot-b")
-    assert pcie_guard.tray_rung_disabled() == {"tray": [1], "new_off": [str(c) for c in range(8, 28)]}
-    assert path.exists()
-    restored = dict(events)["ubb_tray_rung_disabled_restored"]
-    assert restored["latched_boot_id"] == "boot-a" and restored["boot_id"] == "boot-b"
-    assert "ubb_tray_rung_rearmed" not in dict(events)
-
-
-def test_the_tray_rung_latch_expires_after_its_window(sysfs, monkeypatch):
-    """Bounded: a record older than TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS is removed and the rung re-arms,
-    from disk and in memory alike."""
-    events = []
-    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS", "2")
-    _boot(sysfs, "boot-a")
-    now = [1_000_000.0]
-    monkeypatch.setattr(pcie_guard.time, "time", lambda: now[0])
-    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
-    path = pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE
-    now[0] += 2 * 86400 - 60
-    assert pcie_guard.tray_rung_disabled() == {"tray": [3], "new_off": ["5"]}
-    now[0] += 120
-    assert pcie_guard.tray_rung_disabled() is None, "in memory: expired"
-    assert not path.exists() and "ubb_tray_rung_rearmed" in [n for n, _ in events]
-    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
-    now[0] += 2 * 86400
-    assert pcie_guard.tray_rung_disabled() is None, "from disk: expired"
-    assert not path.exists()
-
-
-def test_a_tray_rung_record_from_another_host_never_counts(sysfs, monkeypatch):
-    """Per host: a record a different host wrote (a copied or shared health dir) is removed."""
-    monkeypatch.setattr(pcie_guard, "health_event", lambda *a, **k: None)
-    _boot(sysfs, "boot-a")
-    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
-    path = pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE
-    rec = json.loads(path.read_text())
-    path.write_text(json.dumps({**rec, "host": rec["host"] + "-other"}))
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
-    assert pcie_guard.tray_rung_disabled() is None
-    assert not path.exists()
-
-
-def test_a_tray_rung_record_without_a_time_is_aged_by_its_file(sysfs, monkeypatch):
-    """A record written before the time was kept (no at_epoch, no host) is aged by the file's mtime, so
-    it is bounded too: it counts inside the window and is removed past it."""
-    monkeypatch.setattr(pcie_guard, "health_event", lambda *a, **k: None)
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS", "1")
-    _boot(sysfs, "boot-a")
-    path = pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"why": {"tray": [3]}, "boot_id": "boot-old"}))
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
-    assert pcie_guard.tray_rung_disabled() == {"tray": [3]}
-    old = path.stat().st_mtime - 2 * 86400
-    os.utime(path, (old, old))
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
-    assert pcie_guard.tray_rung_disabled() is None and not path.exists()
-
-
-def test_an_unreadable_boot_id_keeps_the_tray_rung_record(sysfs, monkeypatch):
-    """With this boot's id unreadable a record cannot be shown stale, so it counts (as the host-hang
-    latch does); the hold it routes to is the bounded I27 hand-off."""
-    monkeypatch.setattr(pcie_guard, "health_event", lambda *a, **k: None)
-    _boot(sysfs, "boot-a")
-    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
-    (sysfs / "proc/sys/kernel/random/boot_id").unlink()
-    assert pcie_guard.tray_rung_disabled() == {"tray": [3], "new_off": ["5"]}
-
-
-def test_a_port_that_keeps_erroring_stays_masked_and_marks_a_flood(sysfs, monkeypatch):
-    """The 0x40 sibling port flooding while tray 4 is re-powered: it stays masked, the others come
-    back, and the flood window starts so the gate refuses the next automatic reset."""
-    sibling = "0000:40:01.1"
-
-    def fire():
-        _set_cfg(sysfs, sibling, AER + 0x10, 4, 0x2000)  # Advisory Non-Fatal, latched again and again
-
-    plan = pcie_guard.safe_tray_repower(0b1000, [3], fire, lambda m: None, sleep=lambda s: None)
-    assert plan.kept_masked == [sibling]
-    assert _masked(sysfs, sibling)
-    assert all(_restored(sysfs, p) for p in PORTS if p != sibling)
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "guard")
-    allowed, why = pcie_guard.host_reset_gate(0)
-    assert not allowed and "flooding" in why
-
-
-def test_envelope_waits_for_holders_then_refuses_without_touching_anything(sysfs, monkeypatch):
-    pids = sysfs / "proc/driver/tenstorrent/3"
-    pids.mkdir(parents=True)
-    (pids / "pids").write_text("4242\n")
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", "1")
-    waited = []
-    with pytest.raises(pcie_guard.TrayRepowerRefused, match="4242"):
-        pcie_guard.safe_tray_repower(
-            0b1000, [3], lambda: pytest.fail("fired over a holder"), lambda m: None, sleep=waited.append
-        )
-    assert waited, "it waits for the holder before refusing"
-    assert all(_restored(sysfs, p) for p in PORTS)
-    assert not (sysfs / "sys/bus/pci/devices/0000:81:00.0/remove").exists()
-
-
-def test_envelope_proceeds_once_the_holder_lets_go(sysfs, monkeypatch):
-    pids = sysfs / "proc/driver/tenstorrent/3"
-    pids.mkdir(parents=True)
-    (pids / "pids").write_text("4242\n")
-    fired = []
-    pcie_guard.safe_tray_repower(
-        0b1000, [3], lambda: fired.append(1), lambda m: None, sleep=lambda s: (pids / "pids").write_text("")
-    )
-    assert fired == [1]
-
-
-def test_envelope_waits_for_holders_on_every_tray_not_just_the_re_powered_one(sysfs, monkeypatch):
-    """One tray's pulse has dropped the other trays within seconds, so a holder on ANY chip of the box
-    refuses the re-power, as for a whole-box cycle (spec 04 I23)."""
-    pids = sysfs / "proc/driver/tenstorrent/0"  # chip 0 is on tray 1; the fire is tray 4
-    pids.mkdir(parents=True)
-    (pids / "pids").write_text("4343\n")
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", "1")
-    assert 0 in pcie_guard.plan_tray_repower(0b1000, [3]).box_chips
-    with pytest.raises(pcie_guard.TrayRepowerRefused, match="4343"):
-        pcie_guard.safe_tray_repower(
-            0b1000, [3], lambda: pytest.fail("fired over another tray's holder"), lambda m: None, sleep=lambda s: None
-        )
-    assert all(_restored(sysfs, p) for p in PORTS)
-    assert not (sysfs / "sys/bus/pci/devices/0000:81:00.0/remove").exists()
-
-
-def test_envelope_counts_a_holder_on_a_chip_off_the_bus(sysfs, monkeypatch):
-    """A chip with no PCI function that tt-kmd still publishes under /proc is part of the box: a process
-    holding it refuses the re-power too (spec 04 I23)."""
-    pids = sysfs / "proc/driver/tenstorrent/7"  # no endpoint in sysfs: off the bus
-    pids.mkdir(parents=True)
-    (pids / "pids").write_text("4444\n")
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", "1")
-    assert 7 in pcie_guard.plan_tray_repower(0b1000, [3]).box_chips
-    with pytest.raises(pcie_guard.TrayRepowerRefused, match="4444"):
-        pcie_guard.safe_tray_repower(
-            0b1000,
-            [3],
-            lambda: pytest.fail("fired over an off-bus chip's holder"),
-            lambda m: None,
-            sleep=lambda s: None,
-        )
-
-
-def test_envelope_ignores_the_brokers_own_hold_on_other_trays(sysfs, monkeypatch):
-    """The broker's own pid is never a holder, on any tray (spec 04 I23)."""
-    pids = sysfs / "proc/driver/tenstorrent/0"
-    pids.mkdir(parents=True)
-    (pids / "pids").write_text(f"{os.getpid()}\n")
-    fired = []
-    pcie_guard.safe_tray_repower(0b1000, [3], lambda: fired.append(1), lambda m: None, sleep=lambda s: None)
-    assert fired == [1]
-
-
-def test_envelope_refuses_a_mismatched_tray_map(sysfs):
-    with pytest.raises(pcie_guard.TrayRepowerRefused):
-        pcie_guard.safe_tray_repower(0b1000, [2], lambda: pytest.fail("fired the wrong tray"), lambda m: None)
-    assert all(_restored(sysfs, p) for p in PORTS)
-
-
-def test_dry_run_logs_the_plan_and_touches_nothing(sysfs, monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN", "1")
-    lines = []
-    with pytest.raises(pcie_guard.TrayRepowerDryRun):
-        pcie_guard.safe_tray_repower(0b1000, [3], lambda: pytest.fail("dry run fired"), lines.append)
-    text = "\n".join(lines)
-    assert "DRY RUN" in text and "0000:81:00.0" in text and "0x08" in text
-    assert all(_restored(sysfs, p) for p in PORTS)
-    assert not (sysfs / "sys/bus/pci/devices/0000:81:00.0/remove").exists()
-    assert not (sysfs / "sys/bus/pci/rescan").exists()
-
-
-def test_cli_prints_the_plan(sysfs, capsys):
-    assert pcie_guard.main(["0x8", "3"]) == 0
-    assert "0000:81:00.0" in capsys.readouterr().out
-    assert pcie_guard.main(["0x8", "2"]) == 1
 
 
 # ---------------------------------------------------------------- the per-host gate
@@ -549,9 +198,8 @@ async def test_a_hold_gate_refuses_the_mesh_reset_and_the_sweep_over_an_all_ones
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(g.monitor, "expected", lambda n: 4)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: pytest.fail("gated sweep fired a tray"))
     assert await g._reset_and_verify_device_once(["0", "1", "2", "3"], lambda m: None) is False
-    assert await g._issue_all_resets_back_to_back(0b1000, [3], [4], 4, lambda m: None, do_sbr=False) is False
+    assert await g._issue_all_resets_back_to_back([4], 4, lambda m: None, do_sbr=False) is False
     assert argvs == [], "no mesh reset over a chip whose heartbeat reads all-ones"
     assert events.count("host_reset_gated") == 2 and "reset_begin" not in events
 
@@ -587,7 +235,6 @@ async def test_a_gated_sweep_never_reaches_the_power_cycle(sysfs, monkeypatch):
     monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: pytest.fail("gated sweep fired a tray"))
     cycles = []
 
     async def fake_pc(log, reason):
@@ -606,40 +253,6 @@ async def test_a_gated_sweep_never_reaches_the_power_cycle(sysfs, monkeypatch):
     assert out == galaxy.OUTCOME_WAITING and cycles == []
     out = await g._fire_tray_down_no_window({"2"}, 4, lambda m: None, gate_phase="x", ev=None)
     assert out == galaxy.OUTCOME_WAITING and cycles == []
-
-
-@pytest.mark.asyncio
-async def test_a_refused_tray_fire_makes_the_sweep_incomplete(sysfs, monkeypatch):
-    g = srv.galaxy_recovery
-    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
-
-    def refuse(*a, **k):
-        raise pcie_guard.TrayRepowerRefused("tray map disagrees")
-
-    async def ok_reset(*a, **k):
-        return 0, ""
-
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", refuse)
-    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", ok_reset)
-    assert await g._issue_all_resets_back_to_back(0b1000, [3], [4], 4, lambda m: None, do_sbr=False) is False
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: None)
-    assert await g._issue_all_resets_back_to_back(0b1000, [3], [4], 4, lambda m: None, do_sbr=False) is True
-
-
-@pytest.mark.asyncio
-async def test_pollers_are_stopped_across_the_tray_fire(sysfs, monkeypatch):
-    g = srv.galaxy_recovery
-    seen = []
-
-    async def pollers(active, log):
-        seen.append(("start" if active else "stop"))
-        return ["tt-fmax-cap.service"]
-
-    monkeypatch.setattr(g.mechanism, "_set_device_pollers", pollers)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: seen.append("fire"))
-    await g._fire_tray_repower(0b1000, [3], lambda m: None)
-    assert seen == ["stop", "fire", "start"]
 
 
 @pytest.mark.asyncio
@@ -993,9 +606,6 @@ def test_the_hold_message_names_both_boots(sysfs, monkeypatch, capsys):
     assert not allowed
     assert "the mesh reset on boot boot-a did not finish before the host went down; held on boot boot-b until" in why
     assert "ceiling" in why, "with no power cycle the ceiling is one of the ends"
-    pcie_guard.main(["0x1"])
-    out = capsys.readouterr().out
-    assert "the mesh reset on boot boot-a did not finish before the host went down; held on boot boot-b" in out
 
 
 def test_a_latch_from_an_ended_boot_never_gates_even_if_the_broker_never_restarted(sysfs, monkeypatch):
@@ -1142,30 +752,6 @@ async def test_the_between_jobs_check_lifts_the_latch_once_the_mesh_is_back(sysf
     assert any("host-hang hold" in line and "lifted" in line for line in logs)
 
 
-@pytest.mark.asyncio
-async def test_a_tray_re_power_carries_an_intent_and_ends_it(monkeypatch, clear_job_state, galaxy_trays):
-    """The walk writes the intent before it fires and removes it once its verify is over."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    monkeypatch.setattr(pcie_guard, "_boot_id", lambda: "boot-a")
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    intent = pcie_guard.health_dir() / pcie_guard.INTENT_FILE
-    seen = []
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-
-    async def healthy(expected, log, run_fabric=True, **_):
-        return True, {"snapshot": {"ok": True}}
-
-    patch_recovery(monkeypatch, "_verify_device", healthy)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: seen.append(intent.exists()), raising=False)
-    beats = {str(i): 100 for i in range(31)}  # chip 31 off
-    assert await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 1, 32, lambda m: None) is True
-    assert seen == [True], "the intent is on disk while the re-power runs"
-    assert not intent.exists()
-
-
 # ---------------------------------------------------------------- per-chip bridge SBR under the gate
 
 
@@ -1193,35 +779,6 @@ async def test_the_per_chip_bridge_reset_obeys_the_hold_gate_and_the_latch(sysfs
 # ---------------------------------------------------------------- last-chance sweep: affected trays only
 
 
-@pytest.mark.asyncio
-# Part of a tray: a whole one skips the sweep (spec 04 I37 class A).
-@pytest.mark.parametrize("off, trays", [(set(range(24, 30)), [3]), (set(), [])])
-async def test_the_last_chance_sweep_re_powers_only_the_affected_trays(
-    monkeypatch, clear_job_state, galaxy_trays, off, trays
-):
-    """Spec 04 I25: a caller that names no off-bus chips gets them read from the heartbeats; only trays
-    holding one are re-powered. A present mesh gets SBR and the mesh reset but no tray re-power."""
-    g = srv.galaxy_recovery
-    swept = []
-
-    async def sweep(bitmap, ids, trays_, expected, log, do_sbr):
-        swept.append(trays_)
-        return True
-
-    async def bad(expected, log, run_fabric=True, **k):
-        return False, {}
-
-    monkeypatch.setattr(g, "_issue_all_resets_back_to_back", sweep)
-    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    monkeypatch.setattr(g.deps, "read_heartbeats", lambda: {str(i): 100 for i in range(32) if i not in off})
-    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    patch_recovery(monkeypatch, "_verify_device", bad)
-    assert await g._settle_and_verify_before_host_rung(32, lambda m: None, "x") is False
-    assert swept == [trays]
-
-
 # ---------------------------------------------------------------- review #52 fixes
 
 
@@ -1236,26 +793,6 @@ def _take_off_bus(root, chip):
 def _forget_in_process(monkeypatch):
     """A new broker process: only the persisted topology is left."""
     monkeypatch.setattr(pcie_guard, "_SEEN", None)
-
-
-def test_an_off_bus_chips_root_port_is_masked_for_its_trays_re_power(sysfs, monkeypatch):
-    """Tray-down: the re-powered tray's chip is off the bus, so no function names its root port. The
-    port an earlier look saw (in this process, or persisted by an earlier one) is still masked."""
-    pcie_guard.tt_endpoints()  # the broker saw the mesh whole once
-    _take_off_bus(sysfs, 0)
-    for fresh in (False, True):
-        if fresh:
-            _forget_in_process(monkeypatch)
-        plan = pcie_guard.plan_tray_repower(0b1, [0])
-        assert not plan.mismatch
-        assert plan.root_ports == sorted(PORTS), "tray 1's own port 0000:00:01.1 is masked too"
-        assert pcie_guard.tt_root_ports() == sorted(PORTS), "and the mesh reset masks it too"
-    seen = []
-    pcie_guard.safe_tray_repower(
-        0b1, [0], lambda: seen.append(_masked(sysfs, "0000:00:01.1")), lambda m: None, sleep=lambda s: None
-    )
-    assert seen == [True]
-    assert _restored(sysfs, "0000:00:01.1")
 
 
 def test_guard_masks_an_off_bus_chips_port_around_a_mesh_reset(sysfs, monkeypatch):
@@ -1273,57 +810,6 @@ def test_a_remembered_port_gone_from_sysfs_is_not_masked(sysfs, monkeypatch):
     _take_off_bus(sysfs, 0)
     os.unlink(sysfs / "sys/bus/pci/devices/0000:00:01.1")
     assert "0000:00:01.1" not in pcie_guard.tt_root_ports()
-
-
-@pytest.mark.parametrize("ever_seen", [True, False])
-def test_an_all_off_bus_mesh_still_gets_its_trays_re_powered(sysfs, monkeypatch, ever_seen):
-    """Every chip off the bus: there is no healthy tray to cut and nothing to cross-check, so the
-    re-power goes ahead (the old path re-powered every tray here before the power cycle)."""
-    if ever_seen:
-        pcie_guard.tt_endpoints()
-    else:
-        _forget_in_process(monkeypatch)
-        (pcie_guard.health_dir() / pcie_guard.TOPOLOGY_FILE).unlink(missing_ok=True)
-    for chip in range(len(CHIPS)):
-        _take_off_bus(sysfs, chip)
-    if not ever_seen:
-        _forget_in_process(monkeypatch)
-    plan = pcie_guard.plan_tray_repower(0b1111, [0, 1, 2, 3])
-    assert not plan.mismatch
-    assert plan.root_ports == (sorted(PORTS) if ever_seen else [])
-    fired = []
-    pcie_guard.safe_tray_repower(0b1111, [0, 1, 2, 3], lambda: fired.append(1), lambda m: None, sleep=lambda s: None)
-    assert fired == [1]
-    assert pcie_guard.tray_bus_groups() == ({1: 0x00, 2: 0x40, 3: 0xC0, 4: 0x80} if ever_seen else None)
-
-
-@pytest.mark.asyncio
-async def test_an_all_off_bus_last_chance_sweep_is_complete(sysfs, monkeypatch):
-    """With the gate off, an all-off mesh's sweep re-powers every tray and is COMPLETE, so the power
-    cycle above it is not held (I22) — the old path's recovery."""
-    pcie_guard.tt_endpoints()
-    for chip in range(len(CHIPS)):
-        _take_off_bus(sysfs, chip)
-    monkeypatch.delenv("TT_DEVICE_MCP_HOST_RESET_GATE", raising=False)
-    g = srv.galaxy_recovery
-    monkeypatch.setattr(g.mechanism, "_set_device_pollers", None, raising=False)
-    fired = []
-
-    def fire(bitmap, ids, log=None):
-        return pcie_guard.safe_tray_repower(
-            bitmap, ids, lambda: fired.append(bitmap), lambda m: None, sleep=lambda s: None
-        )
-
-    async def reset(*a, **k):
-        return 0, ""
-
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", fire)
-    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
-    monkeypatch.setattr(galaxy, "_ubb_reset_enabled", lambda: True)
-    complete = await g._issue_all_resets_back_to_back(
-        0b1111, [0, 1, 2, 3], [1, 2, 3, 4], 4, lambda m: None, do_sbr=False
-    )
-    assert fired == [0b1111] and complete is True
 
 
 def test_the_clear_command_finds_the_system_brokers_latch(sysfs, monkeypatch, capsys):
@@ -1358,22 +844,6 @@ def test_a_latch_that_cannot_be_removed_is_reported_not_called_absent(sysfs, mon
     assert pcie_guard.main(["--clear-hang-latch"]) == 1
     out = capsys.readouterr().out
     assert "could not be cleared" in out and "no host-hang hold" not in out
-
-
-def test_the_flood_window_holds_automatic_resets_even_with_the_gate_off(sysfs, monkeypatch):
-    """A port the envelope had to leave masked opens the flood window, and the next automatic reset
-    is refused whatever the gate's mode — that reset is the incident's re-power-then-glx_reset."""
-    monkeypatch.delenv("TT_DEVICE_MCP_HOST_RESET_GATE", raising=False)
-
-    def fire():
-        _set_cfg(sysfs, "0000:40:01.1", AER + 0x10, 4, 0x2000)
-
-    plan = pcie_guard.safe_tray_repower(0b1000, [3], fire, lambda m: None, sleep=lambda s: None)
-    assert plan.kept_masked
-    allowed, why = pcie_guard.host_reset_gate(0)
-    assert not allowed and "flood window" in why
-    monkeypatch.setattr(pcie_guard, "_FLOOD_UNTIL", 0.0)
-    assert pcie_guard.host_reset_gate(5) == (True, ""), "off, with no window open, is the old behaviour"
 
 
 @pytest.mark.asyncio
@@ -1429,57 +899,6 @@ async def test_a_gated_mesh_reset_records_no_reset_and_arms_no_cooldown(sysfs, m
     assert g.mechanism.last_reset_monotonic == 123.0
 
 
-def test_the_envelope_masks_before_it_quiesces_and_refuses_when_it_cannot_mask(sysfs, monkeypatch):
-    seen = []
-    pcie_guard.safe_tray_repower(
-        0b1000,
-        [3],
-        lambda: None,
-        lambda m: None,
-        quiesce=lambda chips: seen.append(all(_masked(sysfs, p) for p in PORTS)),
-        sleep=lambda s: None,
-    )
-    assert seen == [True], "the ports are masked before any chip is touched"
-
-    real_apply = pcie_guard.AerMask.apply
-
-    def failing_apply(self):
-        self.ports = self.ports + ["0000:ff:00.0"]  # no such function: its config read fails
-        return real_apply(self)
-
-    monkeypatch.setattr(pcie_guard.AerMask, "apply", failing_apply)
-    with pytest.raises(pcie_guard.TrayRepowerRefused, match="could not mask"):
-        pcie_guard.safe_tray_repower(
-            0b1000,
-            [3],
-            lambda: pytest.fail("fired unmasked"),
-            lambda m: None,
-            quiesce=lambda chips: pytest.fail("quiesced with no mask"),
-            sleep=lambda s: None,
-        )
-    assert all(_restored(sysfs, p) for p in PORTS), "a half-applied mask is put back"
-
-
-def test_a_quiesce_that_raises_still_re_inits_and_restores(sysfs):
-    steps = []
-
-    def quiesce(chips):
-        raise RuntimeError("USER_RESET ioctl failed")
-
-    with pytest.raises(RuntimeError):
-        pcie_guard.safe_tray_repower(
-            0b1000,
-            [3],
-            lambda: pytest.fail("fired after a failed quiesce"),
-            lambda m: None,
-            quiesce=quiesce,
-            reinit=lambda chips: steps.append(("reinit", chips)),
-            sleep=lambda s: None,
-        )
-    assert steps == [("reinit", [3])]
-    assert all(_restored(sysfs, p) for p in PORTS)
-
-
 # ---------------------------------------------------------------- re-review #52 fixes
 
 
@@ -1487,49 +906,6 @@ def _no_topology(monkeypatch):
     """A first start on this host: no look yet, in this process or persisted."""
     _forget_in_process(monkeypatch)
     (pcie_guard.health_dir() / pcie_guard.TOPOLOGY_FILE).unlink(missing_ok=True)
-
-
-def _tray_1_plan(sysfs, monkeypatch):
-    """Tray 1's chip leaves the bus and a new broker process plans its re-power."""
-    _take_off_bus(sysfs, 0)
-    _forget_in_process(monkeypatch)
-    return pcie_guard.plan_tray_repower(0b1, [0])
-
-
-def test_without_a_healthy_look_an_off_bus_chips_port_is_not_known(sysfs, monkeypatch):
-    """The documented limit (spec 04 I23): a port never seen with its chip present is not masked."""
-    _no_topology(monkeypatch)
-    plan = _tray_1_plan(sysfs, monkeypatch)
-    assert "0000:00:01.1" not in plan.root_ports
-
-
-def test_broker_start_records_the_topology_for_the_first_tray_drop(sysfs, monkeypatch):
-    _no_topology(monkeypatch)
-    srv.pcie_guard_at_start(lambda m: None)  # what the broker runs at start
-    assert (pcie_guard.health_dir() / pcie_guard.TOPOLOGY_FILE).exists()
-    assert not [f for f in os.listdir(pcie_guard.health_dir()) if f.endswith(".tmp")], "no temp file left"
-    plan = _tray_1_plan(sysfs, monkeypatch)
-    assert not plan.mismatch
-    assert plan.root_ports == sorted(PORTS), "tray 1's own port 0000:00:01.1 is masked"
-
-
-@pytest.mark.asyncio
-async def test_the_between_jobs_check_records_the_topology_for_the_first_tray_drop(sysfs, monkeypatch, health_deps):
-    from tt_device_mcp.health.monitor import HealthMonitor
-    from tt_device_mcp.health.monitors import hostpci
-
-    _no_topology(monkeypatch)
-    monkeypatch.setattr(hostpci, "host_pci_verdict", lambda: (True, "ok", {}))
-    m = HealthMonitor(health_deps)
-
-    async def healthy(*a, **k):
-        return True, "ok"
-
-    monkeypatch.setattr(m, "_verify_device", healthy)
-    await m.update("post-job", run_fabric=False, expected=len(CHIPS))
-    plan = _tray_1_plan(sysfs, monkeypatch)
-    assert not plan.mismatch
-    assert plan.root_ports == sorted(PORTS), "tray 1's own port 0000:00:01.1 is masked"
 
 
 def test_an_unchanged_topology_is_not_rewritten(sysfs, monkeypatch):
@@ -1591,40 +967,6 @@ UNREADABLE = [
 ]
 
 
-@pytest.mark.parametrize("all_off", [False, True])
-@pytest.mark.parametrize("how", UNREADABLE)
-def test_a_tray_re_power_refuses_when_sysfs_cannot_be_read(sysfs, monkeypatch, how, all_off):
-    """Sysfs that cannot be read is not "every chip off the bus": the #27 cross-check cannot run, so
-    the envelope refuses before it touches anything and says why (spec 04 I23)."""
-    pcie_guard.record_topology()  # a healthy look first: the remembered ports must not make it safe
-    if all_off:
-        for chip in range(1, len(CHIPS)):
-            _take_off_bus(sysfs, chip)
-    _break_sysfs(sysfs, monkeypatch, how)
-    events = []
-    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    plan = pcie_guard.plan_tray_repower(0b1, [0])
-    assert plan.mismatch, f"{how}: an unreadable sysfs must refuse the re-power"
-    fired, logs = [], []
-    with pytest.raises(pcie_guard.TrayRepowerRefused) as exc:
-        pcie_guard.safe_tray_repower(0b1, [0], lambda: fired.append(1), logs.append, sleep=lambda s: None)
-    assert fired == []
-    assert not any(_masked(sysfs, p) for p in PORTS if (sysfs / "sys/bus/pci/devices" / p).exists())
-    refused = [k for n, k in events if n == "tray_repower_refused"]
-    assert refused and refused[0]["reason"] == str(exc.value)
-    if how != "device id unreadable":  # that one refuses on the missing tray table, as before
-        assert "cannot read" in str(exc.value)
-
-
-def test_an_all_off_mesh_behind_an_unreadable_sysfs_is_not_re_powered(sysfs, monkeypatch):
-    """The reported case: no function listed because /sys/bus/pci/devices cannot be read."""
-    pcie_guard.record_topology()
-    _break_sysfs(sysfs, monkeypatch, "devices dir unlistable")
-    assert pcie_guard.tt_endpoints() is None
-    assert "cannot read" in pcie_guard.plan_tray_repower(0b1111, [0, 1, 2, 3]).mismatch
-    assert pcie_guard.main(["0b1111", "0", "1", "2", "3"]) == 1
-
-
 @pytest.mark.parametrize("how", UNREADABLE[:-1])
 def test_an_unreadable_sysfs_counts_every_chip_off_so_a_hold_gate_holds(sysfs, monkeypatch, how):
     _break_sysfs(sysfs, monkeypatch, how)
@@ -1664,8 +1006,6 @@ async def test_an_unreadable_look_keeps_the_recorded_topology(sysfs, monkeypatch
     assert path.read_text() == before
     unreadable = [k for n, k in events if n == "pci_topology_unreadable"]
     assert len(unreadable) == 2 and all("cannot read" in k["reason"] for k in unreadable)
-    _forget_in_process(monkeypatch)
-    assert "cannot read" in pcie_guard.plan_tray_repower(0b1, [0]).mismatch
 
 
 # ---------------------------------------------------------------- entries the guard does not need
@@ -1691,8 +1031,7 @@ def test_a_5_digit_domain_beside_the_mesh_does_not_make_sysfs_unreadable(sysfs, 
     assert events == []
     rec = json.loads((pcie_guard.health_dir() / pcie_guard.TOPOLOGY_FILE).read_text())
     assert rec["root_ports"] == sorted(PORTS)
-    plan = pcie_guard.plan_tray_repower(0b1, [0])
-    assert not plan.mismatch and plan.functions == ["0000:01:00.0"] and plan.root_ports == sorted(PORTS)
+    assert pcie_guard.tt_root_ports() == sorted(PORTS)
     assert pcie_guard.chips_off_bus(len(CHIPS)) == 0
 
 
@@ -1713,9 +1052,8 @@ def test_a_chip_in_a_5_digit_domain_is_parsed_and_counted(sysfs):
     eps = pcie_guard.tt_endpoints()
     assert eps["10000:01:00.0"] == pcie_guard.Endpoint("10000:01:00.0", 0x01, "10000:00:01.1", 0, 0xB140)
     assert pcie_guard.chips_off_bus(len(CHIPS)) == 0
-    plan = pcie_guard.plan_tray_repower(0b1, [0])
-    assert not plan.mismatch and plan.functions == ["10000:01:00.0"] and plan.chips == [0]
-    assert "10000:00:01.1" in plan.root_ports and "0000:00:0e.0" not in plan.root_ports
+    ports = pcie_guard.tt_root_ports(eps)
+    assert "10000:00:01.1" in ports and "0000:00:0e.0" not in ports
 
 
 @pytest.mark.parametrize("how", ["entry name unparseable", "vendor unreadable", "vendor unparseable"])
@@ -1732,7 +1070,6 @@ def test_an_unrelated_entry_the_scan_cannot_read_is_skipped(sysfs, monkeypatch, 
     monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
     assert sorted(pcie_guard.tt_endpoints()) == sorted(f"0000:{b:02x}:00.0" for _c, b, _r in CHIPS)
     pcie_guard.record_topology()
-    assert not pcie_guard.plan_tray_repower(0b1, [0]).mismatch
     assert pcie_guard.chips_off_bus(len(CHIPS)) == 0
     assert events == []
 
@@ -1751,73 +1088,6 @@ def test_an_unreadable_sysfs_under_guard_logs_a_mask_failure(sysfs, monkeypatch)
     assert logs and "cannot read" in logs[0]
     assert sorted(mask.ports) == sorted(PORTS) and all(_masked(sysfs, p) for p in PORTS)
     mask.restore(quiet_sec=0)
-
-
-def test_the_operator_re_arms_the_tray_rung_after_a_repair(sysfs, monkeypatch, capsys):
-    """A recorded regression declines the per-tray rung on this host for days. The operator
-    re-arms it after the repair with the command the journal names; a second clear says nothing was
-    latched, and bad usage is refused."""
-    events = []
-    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    _boot(sysfs, "boot-a")
-    pcie_guard.disable_tray_rung(tray=[3], new_off=["5", "13"], signature="position5")
-    disabled = dict(events)["ubb_tray_rung_disabled"]
-    assert disabled["clear_with"] == pcie_guard.clear_tray_rung_cmd() and disabled["latch_days"] > 0
-    cmd = pcie_guard.clear_tray_rung_cmd()
-    assert cmd.startswith("sudo ") and "--clear-tray-rung-latch" in cmd and str(pcie_guard.health_dir()) in cmd
-    rec = pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE
-    assert rec.exists()
-    assert pcie_guard.main(["--clear-tray-rung-latch", "--health-dir", str(pcie_guard.health_dir())]) == 0
-    assert "re-armed" in capsys.readouterr().out
-    assert not rec.exists() and pcie_guard.tray_rung_disabled() is None
-    assert dict(events)["ubb_tray_rung_cleared"]["by"] == "operator"
-    assert pcie_guard.main(["--clear-tray-rung-latch", "--health-dir", str(pcie_guard.health_dir())]) == 0
-    assert "was not latched off" in capsys.readouterr().out
-    assert pcie_guard.main(["--clear-tray-rung-latch", "--bogus"]) == 2
-
-
-def test_a_tray_rung_latch_that_cannot_be_removed_is_reported(sysfs, monkeypatch, capsys):
-    _boot(sysfs, "boot-a")
-    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
-
-    def denied(self, *a, **k):
-        raise PermissionError(13, "Permission denied")
-
-    monkeypatch.setattr(pcie_guard.Path, "unlink", denied)
-    assert pcie_guard.main(["--clear-tray-rung-latch", "--health-dir", str(pcie_guard.health_dir())]) == 1
-    assert "could not be re-armed" in capsys.readouterr().out
-    assert pcie_guard.tray_rung_disabled() is not None, "still latched"
-
-
-def test_a_running_broker_re_arms_when_the_operator_removes_the_record(sysfs, monkeypatch):
-    """The clear runs in another process: the running broker sees its persisted record gone and re-arms,
-    without a restart. A record that never reached disk keeps the in-memory decline."""
-    events = []
-    monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    _boot(sysfs, "boot-a")
-    pcie_guard.disable_tray_rung(tray=[3], new_off=["5"])
-    assert pcie_guard.tray_rung_disabled() is not None
-    (pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE).unlink()
-    assert pcie_guard.tray_rung_disabled() is None
-    assert dict(events)["ubb_tray_rung_cleared"]["by"] == "file_removed"
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", {"tray": [1]})
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_AT", time.time(), raising=False)
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_PERSISTED", False)
-    assert pcie_guard.tray_rung_disabled() == {"tray": [1]}, "an unwritten record is not read as cleared"
-
-
-def test_a_position_5_drop_in_a_later_hold_still_latches_and_names_both_episodes(sysfs, monkeypatch):
-    """The delayed position-5 drop often lands after the pulse's own hold was released: it still latches
-    inside the window, and the record names the pulse's episode and the one the drop was seen in, so an
-    operator can tell an outside drop from the pulse's and re-arm the rung."""
-    _boot(sysfs, "boot-a")
-    monkeypatch.setattr(pcie_guard, "_LAST_TRAY_PULSE", None)
-    tray_map = {t: list(range(8 * t, 8 * t + 8)) for t in range(4)}
-    start = {str(c) for c in range(24, 32)}
-    pcie_guard.note_tray_pulse([3], tray_map, start, episode="2026-10-16T01:00:00")
-    why = pcie_guard.latch_tray_pulse_drop(start | {"5", "13"}, episode="2026-10-16T01:03:00")
-    assert why is not None and why["episode"] == "2026-10-16T01:00:00" and why["seen_in"] == "2026-10-16T01:03:00"
-    assert pcie_guard.tray_rung_disabled()["episode"] == "2026-10-16T01:00:00"
 
 
 def test_the_latch_never_lifts_while_a_listed_link_reads_down(sysfs, monkeypatch):

@@ -26,7 +26,7 @@ from typing import Optional
 SYSTEMD_DIR = "/run/systemd/system"
 
 # Where the kernel's IPMI driver puts the local BMC interface, in the spellings different distros
-# and driver versions use. `ipmitool raw` with no `-I lanplus` — the form both IPMI rungs issue —
+# and driver versions use. `ipmitool` with no `-I lanplus` — the form the cold rung issues —
 # reaches the BMC through one of these, so no openable node means no reachable BMC.
 IPMI_DEVICE_NODES = ("/dev/ipmi0", "/dev/ipmi/0", "/dev/ipmidev/0")
 

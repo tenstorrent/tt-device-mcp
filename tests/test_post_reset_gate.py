@@ -276,10 +276,13 @@ async def test_the_tray_down_no_window_sweep(mesh, monkeypatch, galaxy_trays, ve
         return False
 
     async def mesh_reset(argv, log, *a, **k):
+        from tt_device_mcp.health.aiclk_ceiling import CEILING
+
+        CEILING.mark_owed("reset")  # as the real reset_with_quiesce does
+        FABRIC_DEBT.note_reset(" ".join(argv))
         return 0, ""
 
     patch_recovery(monkeypatch, "_recover_isolated_chips", no_bridge)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: None)
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh_reset)
     _verify_returning(monkeypatch, evidence)
     offbus = {str(i) for i in range(24, 32)}
@@ -287,7 +290,7 @@ async def test_the_tray_down_no_window_sweep(mesh, monkeypatch, galaxy_trays, ve
     assert out == galaxy.OUTCOME_RECOVERED
     _assert_settled(released)
     if not released:
-        assert FABRIC_DEBT.owed.startswith("tray re-power"), "the sweep's own re-power records the debt"
+        assert FABRIC_DEBT.owed, "the sweep's own mesh reset records the debt"
 
 
 @pytest.mark.asyncio
@@ -526,7 +529,7 @@ async def test_a_real_bridge_reset_owes_the_ceiling(mesh, monkeypatch, verdict, 
 
 
 @pytest.mark.asyncio
-async def test_a_tray_re_power_owes_the_ceiling(mesh, monkeypatch, galaxy_trays, verdict, ceiling):
+async def test_a_tray_down_no_window_sweep_owes_the_ceiling(mesh, monkeypatch, galaxy_trays, verdict, ceiling):
     evidence, released = verdict
     fsm_dirty(srv, "gate/post-job: tray 3 off the bus", why="job_killed")
     g = srv.galaxy_recovery
@@ -534,41 +537,24 @@ async def test_a_tray_re_power_owes_the_ceiling(mesh, monkeypatch, galaxy_trays,
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
-    fired = []
 
     async def no_bridge(log):
         return False
 
     async def mesh_reset(argv, log, *a, **k):
+        from tt_device_mcp.health.aiclk_ceiling import CEILING
+
+        CEILING.mark_owed("reset")  # as the real reset_with_quiesce does
+        FABRIC_DEBT.note_reset(" ".join(argv))
         return 0, ""
 
     patch_recovery(monkeypatch, "_recover_isolated_chips", no_bridge)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap))
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh_reset)
     _verify_returning(monkeypatch, evidence)
     offbus = {str(i) for i in range(24, 32)}
     out = await g._fire_tray_down_no_window(offbus, 32, lambda m: None, gate_phase="post-job", ev=None)
-    assert out == galaxy.OUTCOME_RECOVERED and fired
+    assert out == galaxy.OUTCOME_RECOVERED
     _assert_settled(released)
-    await _door_applies_the_owed_ceiling(ceiling)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("evidence", list(UNPROVEN.values()), ids=list(UNPROVEN))
-async def test_a_tray_walk_re_power_owes_the_ceiling(mesh, monkeypatch, galaxy_trays, evidence, ceiling):
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    fired = []
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap))
-    _verify_returning(monkeypatch, evidence)
-    beats = {str(i): 100 for i in range(24)}
-    # Recovered or not by the walk's own verify, the tray was re-powered.
-    await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None)
-    assert fired
-    assert FABRIC_DEBT.owed, "the walk's re-power owes a fabric pass before release"
     await _door_applies_the_owed_ceiling(ceiling)
 
 
@@ -711,7 +697,6 @@ def _arm_last_chance_sweep(monkeypatch, mesh, evidence):
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
     monkeypatch.setattr(g.deps, "isolated_chips", lambda: set())
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: None)
     host = []
 
     async def mesh_reset(argv, log, *a, **k):

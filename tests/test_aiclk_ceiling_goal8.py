@@ -187,7 +187,8 @@ async def _bridge_rung(r, monkeypatch):
     )
 
 
-async def _ubb_tray_sweep(r, monkeypatch):
+async def _tray_down_no_window_sweep(r, monkeypatch):
+    """The TRAY_DOWN_NO_WINDOW sweep: SBR (nothing bridged here), then the mesh reset, no tray step."""
     fsm_dirty(srv, "gate/post-job: tray 3 off the bus", why="job_killed")
     g = srv.galaxy_recovery
     monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
@@ -197,11 +198,7 @@ async def _ubb_tray_sweep(r, monkeypatch):
     async def no_bridge(log):
         return False
 
-    def ubb(bitmap, ids):
-        r.order.append("reset")
-
     patch_recovery(monkeypatch, "_recover_isolated_chips", no_bridge)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", ubb)
     offbus = {str(i) for i in range(24, 32)}
     await g._fire_tray_down_no_window(offbus, 32, lambda m: None, gate_phase="post-job", ev=None)
 
@@ -252,7 +249,7 @@ PATHS = {
     "operator-reset": _operator_reset,
     "ladder-glx_reset": _ladder_glx_reset,
     "bridge-rung": _bridge_rung,
-    "ubb-tray-sweep": _ubb_tray_sweep,
+    "tray-down-no-window-sweep": _tray_down_no_window_sweep,
     "idle-offbus-escalation": _idle_offbus_escalation,
     "hold-deadline-escalation": _hold_deadline_escalation,
     "startup": None,  # driven by _drive: needs tmp_path

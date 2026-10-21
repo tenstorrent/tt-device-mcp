@@ -528,7 +528,7 @@ cooldown (spec 04 I65) holds longer.
   traffic. The same apply runs at broker start, once the hugepage pool is ready, before the startup
   fabric verify, and at the job door
   whenever a job exit or reset may have cleared the cap since the last verified apply — a mesh
-  reset, an adopted in-flight reset, a per-chip bridge reset and a tray re-power each mark it owed
+  reset, an adopted in-flight reset and a per-chip bridge reset each mark it owed
   (one retry,
   then the device is marked dirty `probe_unhealthy` and the bounded ladder owns it — the door never
   wedges the queue). The helper sends only to a chip reading above the ceiling, so it never fights
@@ -575,7 +575,7 @@ cooldown (spec 04 I65) holds longer.
   no reset since. Only an OK verdict sets that stamp; an UNHEALTHY verdict clears it, a pass with no
   verdict (exit 77) leaves it, and every reset or recovery attempt clears it: the gate ladder, an idle
   relift, a hold escalation, a host power cycle and an operator reset clear it as they start (a
-  bridge reset or tray re-power runs inside one of these), every device action row but the pass
+  bridge reset runs inside one of these), every device action row but the pass
   itself clears it, and the mechanism's last reset time is a backstop. A missing
   log, a signal death, exit 124 or any code but 1, and a KILLED, TIMEOUT or HUNG job never qualify.
   The cheap reads still run (host PCI, ARC heartbeat, snapshot, the passive eth read of I30): any
@@ -777,7 +777,8 @@ cooldown (spec 04 I65) holds longer.
   gate's own 77 hold, which sets `why` to fabric_unverified and clears `dirty`, so a carried DOWN of
   any cause or dirty mark reopens, as a fresh record's 77 hold would open: `why` kept, a fresh
   `since` (so the I40 bound and the hold clock count from this boot), the `escalated` latch dropped
-  (`ubb_reset_fired` kept), and one startup pass owed as I39 (even with
+  (a stale `ubb_reset_fired` from an older broker dropped too: the tray rung it
+  latched is gone, spec 04 I23), and one startup pass owed as I39 (even with
   `TT_DEVICE_MCP_FABRIC_RELIFT=0`). It journals `boot_fabric_reverify` with the prior `since`. The
   relift, the I48 backoff and the I40 bound then lift it or fall back; a known fabric fault or a
   missing cable (I46/I47) stays held without a reset below the 10-min bound (spec 04 I76). A DOWN written this boot, or any finding
@@ -925,7 +926,7 @@ cooldown (spec 04 I65) holds longer.
   the sampler reads it all-ones on two consecutive samples (marked before it is isolated); a gated
   read of a lost chip returns all-ones without touching it, what its last real read said, so every
   count and rung decides as before. A lost chip is read again only when (a) its sysfs node was
-  re-created (rescan, tray re-power, hotplug), (b) in the 120 s grace after a broker reset or
+  re-created (rescan, external tray re-power, hotplug), (b) in the 120 s grace after a broker reset or
   recovery step ends, at most once a second, so the post-reset verify reads the chip for real, or
   (c) as a backstop once per `TT_DEVICE_MCP_LOST_REPROBE_SEC` (default 30 s, floor 5), or (d) by a
   decision read, which is not a poll: the gate's heartbeat verdict (between-jobs gate, dispatch
@@ -940,8 +941,7 @@ cooldown (spec 04 I65) holds longer.
   step's own reads run, ungated. The device pollers (telemetry services) stop on the FIRST sample
   that shows a present chip hung (all-ones, or a heartbeat that did not move), not the second; a
   whole-mesh blip or a reset does not count. They are not restored after a failed or timed-out
-  reset, an unrecovered tray walk or a tray re-power that did not fire, even while the FSM still
-  reads HEALTHY: the device stays held and their start is owed to the next close to HEALTHY,
+  reset, even while the FSM still reads HEALTHY: the device stays held and their start is owed to the next close to HEALTHY,
   reached only through a passing full check, fabric included (04 I12's deferred restore). The state is
   published atomically to `chip-state.json` (spec 06) and on `/health`, so other readers on the
   host can stay off a chip the broker knows is lost or under reset. The post-reset full health
@@ -1363,8 +1363,8 @@ subsystem through the root:
   and where the heartbeat detector and a chip baseline exist, `off_bus` (chips off the PCIe bus now,
   the count the rungs use), `arc_not_ready` (on the bus, heartbeat ENODATA on a bound endpoint, 04
   I24) and `expected_chips`. A chip that is back on the bus leaves `isolated_chips` right after the
-  reset, tray re-power or PCI rescan that brought it back (the reset mechanism's rescan, each tray
-  walk step, the tray-down prelude rescan, the isolated-chip rescan), whatever the verify after it
+  reset, external tray re-power or PCI rescan that brought it back (the reset mechanism's rescan,
+  the tray-down prelude rescan, the isolated-chip rescan), whatever the verify after it
   says. Dropping it never releases the device or clears a hold: only the full gate does (I52).
   The chip-state fields (I66): `reset_in_flight` (this broker's reset op is running),
   `recovering` (a reset step owns the chips: nothing is read and `off_bus`/`arc_not_ready` are the
@@ -1453,7 +1453,7 @@ classDiagram
     }
     class Stages {
       <<isolated fire fns — health/recovery/stages/>>
-      bridge_reset · smi ioctls · ubb_tray
+      bridge_reset · smi ioctls
       host_reboot · power_cycle
     }
   }
@@ -1637,10 +1637,8 @@ flowchart TB
   R2 -->|BRIDGE_RESET| BR["per-chip SBR via parent bridge ×3 + rescan<br>+ full re-verify"]
   BR -->|recovered| REL
   BR -->|not| R3{{"re-route"}}
-  R2 -->|UBB_TRAY| UT
-  R3 -->|UBB_TRAY| UT["per-tray BMC re-power — only a clean<br>whole-tray drop, opt-out-able"]
-  UT -->|recovered| REL
-  UT -->|not| BFH["below-floor hold for self-heal<br>(galaxy reset suppressed: it inverts a small drop)"]
+  R2 -->|BELOW_FLOOR| BFH
+  R3 -->|BELOW_FLOOR| BFH["below-floor hold (no tray rung, 04 I23):<br>tray-down sweep, whole-tray power cycle,<br>or the ladder at the 10-min bound"]
   R2 -->|"SMI_RESET / DEFER"| RS
   R3 -->|"SMI_RESET / DEFER"| RS["_reset_and_verify_device:<br>adopt foreign PID-1 scope, or quiesce pollers →<br>systemd-run scoped reset → PCI rescan → restore"]
   RS --> VER["verify + post-reset fabric-77 retries<br>(persistent 77 = NOT recovered)"]
@@ -1940,12 +1938,12 @@ refuses.
 | Heartbeat probe contract | `tests/test_device_safety.py::test_heartbeat_healthy_when_all_chips_advance`, `tests/test_device_safety.py::test_heartbeat_unhealthy_when_a_chip_arc_is_frozen`, `tests/test_device_safety.py::test_heartbeat_unhealthy_when_chips_drop_off_the_bus`, `tests/test_device_safety.py::test_heartbeat_healthy_when_more_chips_than_a_stale_expected`, `tests/test_device_safety.py::test_heartbeat_probe_touches_no_device`, `tests/test_device_safety.py::test_a_chip_dropping_off_the_bus_mid_probe_is_not_read_as_healthy` |
 | Probe pass carries phase | `tests/test_monitor.py::test_update_logs_and_sets_device_op_detail_per_probe`, `tests/test_device_safety.py::test_verify_device_adapter_forwards_the_callers_real_phase`, `tests/test_health_core.py::test_healthstate_from_evidence_carries_the_callers_real_phase` |
 | Deps seam | `tests/test_monitor.py::test_update_routes_heartbeat_through_the_injected_deps`, `tests/test_monitor.py::test_update_derives_present_from_dev_enumeration_not_heartbeat`, `tests/test_monitor.py::test_update_accepts_caller_supplied_indices_and_expected` |
-| Hold surface (/health, rows) | `tests/test_arc_not_ready.py::test_health_reports_arc_not_ready_chips_as_on_the_bus_and_degraded`, `tests/test_arc_not_ready.py::test_drop_returned_isolated_takes_back_chips_out`, `tests/test_arc_not_ready.py::test_a_tray_re_power_drops_a_returned_chip_even_when_the_verify_fails`, `tests/test_arc_not_ready.py::test_a_reset_drops_a_returned_chip_after_its_rescan`, `tests/test_arc_not_ready.py::test_dropping_a_returned_chip_never_clears_the_hold`, `tests/test_device_safety.py::test_health_payload_reports_a_held_device_as_degraded`, `tests/test_device_safety.py::test_health_payload_reads_ok_on_a_fit_device`, `tests/test_device_safety.py::test_hold_state_latches_a_held_device_and_clears_when_fit`, `tests/test_device_safety.py::test_hold_state_suppressed_while_a_broker_op_runs`, `tests/test_device_safety.py::test_tenant_gate_writes_one_held_and_one_released_per_episode` |
+| Hold surface (/health, rows) | `tests/test_arc_not_ready.py::test_health_reports_arc_not_ready_chips_as_on_the_bus_and_degraded`, `::test_drop_returned_isolated_takes_back_chips_out`, `::test_a_reset_drops_a_returned_chip_after_its_rescan`, `::test_dropping_a_returned_chip_never_clears_the_hold`, `tests/test_device_safety.py::test_health_payload_reports_a_held_device_as_degraded`, `::test_health_payload_reads_ok_on_a_fit_device`, `::test_hold_state_latches_a_held_device_and_clears_when_fit`, `::test_hold_state_suppressed_while_a_broker_op_runs`, `::test_tenant_gate_writes_one_held_and_one_released_per_episode` |
 | Startup health report | `tests/test_device_safety.py::test_startup_records_what_came_back_after_a_reboot`, `tests/test_device_safety.py::test_a_failing_startup_probe_never_blocks_the_broker_coming_up` |
 | Sampler idle coverage | `tests/test_device_safety.py::test_an_idle_all_gone_drop_is_confirmed_by_the_sampler_and_put_on_the_timeline`, `tests/test_device_safety.py::test_an_all_gone_drop_on_a_held_not_dirty_box_still_journals_and_goes_dirty`, `tests/test_device_safety.py::test_an_all_chips_blackout_needs_two_samples_before_it_dirties_the_device`, `tests/test_device_safety.py::test_sampler_drives_the_idle_hold_ledger` |
 | Eth/fabric exit-code contract | `tests/test_eth_probe.py::test_exit_laundering[0-True]`, `tests/test_eth_probe.py::test_exit_laundering[3-False]`, `tests/test_eth_probe.py::test_exit_laundering[77-None]`, `tests/test_eth_probe.py::test_hung_read_is_skipped_not_frozen`, `tests/test_fabric_probe.py::test_fabric_classification[0-all links healthy-True]`, `tests/test_fabric_probe.py::test_fabric_classification[None-partial output before hang-False]` |
 | B-Post-job clock check | `tests/test_device_safety.py::test_aiclk_left_busy_names_only_chips_above_the_idle_clock`, `tests/test_device_safety.py::test_a_job_that_left_chips_busy_is_recorded` |
-| I35 (AICLK ceiling: off unset, proven before traffic, fail-closed, door bounded, disarms on a host it cannot run on; startup waits for hugepages; a disarmed ceiling or a job's fmax restore never skips the capped full pass; <= ~10 s added per pass) | `tests/test_aiclk_ceiling.py::test_unset_or_invalid_ceiling_is_off`, `tests/test_aiclk_ceiling.py::test_update_unconfigured_has_no_ceiling_step`, `tests/test_aiclk_ceiling.py::test_update_applies_after_the_snapshot_and_before_any_traffic`, `tests/test_aiclk_ceiling.py::test_update_failed_ceiling_is_unhealthy_and_runs_no_traffic`, `tests/test_aiclk_ceiling.py::test_update_skips_the_ceiling_when_the_snapshot_failed`, `tests/test_aiclk_ceiling.py::test_startup_applies_before_the_startup_fabric_gate`, `tests/test_aiclk_ceiling.py::test_door_reapplies_an_owed_ceiling_before_admitting`, `tests/test_aiclk_ceiling.py::test_door_verified_ceiling_costs_nothing`, `tests/test_aiclk_ceiling.py::test_door_unverified_ceiling_flags_dirty_and_returns`, `tests/test_aiclk_ceiling.py::test_door_apply_error_flags_dirty_never_raises`, `tests/test_aiclk_ceiling.py::test_job_end_marks_the_ceiling_owed`, `tests/test_post_reset_gate.py::test_a_real_bridge_reset_owes_the_ceiling`, `tests/test_post_reset_gate.py::test_a_tray_re_power_owes_the_ceiling`, `tests/test_post_reset_gate.py::test_a_tray_walk_re_power_owes_the_ceiling`, `tests/test_post_reset_gate.py::test_an_adopted_reset_owes_the_ceiling`, `tests/test_aiclk_ceiling.py::test_apply_cannot_run_here_disarms_once`, `tests/test_aiclk_ceiling.py::test_helper_sends_only_to_chips_above_the_ceiling`, `tests/test_aiclk_ceiling.py::test_helper_chip_that_keeps_its_clock_fails`, `tests/test_aiclk_ceiling.py::test_helper_no_chips_is_a_failure_not_a_pass`, `tests/test_aiclk_ceiling_goal8.py::test_every_reset_path_runs_ceiling_then_full_fabric_pass_then_releases`, `::test_fabric_fail_after_any_reset_keeps_the_hold_and_enters_bounded_recovery`, `::test_startup_waits_for_hugepages_then_ceiling_then_full_fabric_pass`, `::test_startup_without_hugepages_applies_no_ceiling_and_stays_held`, `::test_disarmed_ceiling_still_runs_the_full_fabric_pass`, `::test_job_restoring_fmax_is_capped_again_before_post_job_traffic`, `::test_ceiling_apply_adds_at_most_10s` |
+| I35 (AICLK ceiling: off unset, proven before traffic, fail-closed, door bounded, disarms on a host it cannot run on; startup waits for hugepages; a disarmed ceiling or a job's fmax restore never skips the capped full pass; <= ~10 s added per pass) | `tests/test_aiclk_ceiling.py::test_unset_or_invalid_ceiling_is_off`, `::test_update_unconfigured_has_no_ceiling_step`, `::test_update_applies_after_the_snapshot_and_before_any_traffic`, `::test_update_failed_ceiling_is_unhealthy_and_runs_no_traffic`, `::test_update_skips_the_ceiling_when_the_snapshot_failed`, `::test_startup_applies_before_the_startup_fabric_gate`, `::test_door_reapplies_an_owed_ceiling_before_admitting`, `::test_door_verified_ceiling_costs_nothing`, `::test_door_unverified_ceiling_flags_dirty_and_returns`, `::test_door_apply_error_flags_dirty_never_raises`, `::test_job_end_marks_the_ceiling_owed`, `tests/test_post_reset_gate.py::test_a_real_bridge_reset_owes_the_ceiling`, `::test_an_adopted_reset_owes_the_ceiling`, `tests/test_aiclk_ceiling.py::test_apply_cannot_run_here_disarms_once`, `::test_helper_sends_only_to_chips_above_the_ceiling`, `::test_helper_chip_that_keeps_its_clock_fails`, `::test_helper_no_chips_is_a_failure_not_a_pass`, `tests/test_aiclk_ceiling_goal8.py::test_every_reset_path_runs_ceiling_then_full_fabric_pass_then_releases`, `::test_fabric_fail_after_any_reset_keeps_the_hold_and_enters_bounded_recovery`, `::test_startup_waits_for_hugepages_then_ceiling_then_full_fabric_pass`, `::test_startup_without_hugepages_applies_no_ceiling_and_stays_held`, `::test_disarmed_ceiling_still_runs_the_full_fabric_pass`, `::test_job_restoring_fmax_is_capped_again_before_post_job_traffic`, `::test_ceiling_apply_adds_at_most_10s` |
 | I55 (a green-fabric dispatch failure on a present mesh: one glx_reset, then the full check; release only on a pass) | `tests/test_dispatch_failure_reset.py::test_dispatch_failure_on_a_present_mesh_resets_once_then_runs_the_full_check`, `tests/test_dispatch_failure_reset.py::test_a_second_dispatch_failure_in_the_episode_holds_instead_of_resetting_again` |
 | I55 (a failed post-reset check stays held and climbs the bounded ladder) | `tests/test_dispatch_failure_reset.py::test_a_failed_post_reset_check_stays_held_and_climbs` |
 | I55 (under the outage hold: no reset, held, paged, honest message) | `tests/test_dispatch_failure_reset.py::test_outage_hold_holds_and_pages_without_a_reset` |
@@ -1963,7 +1961,7 @@ refuses.
 | I66 (post-reset grace reads lost chips for real; the full check, fabric included, still runs) | `tests/test_chip_state.py::test_the_post_reset_grace_reads_lost_chips_for_real`, `tests/test_chip_state.py::test_the_post_reset_health_check_runs_fabric_on_chips_marked_lost` |
 | I66 (a check reads a lost chip for real: one that answers again passes and clears, one still lost fails on one read; the reset gate does not count a returned chip) | `tests/test_chip_state.py::test_a_lost_chip_that_answers_again_passes_the_health_check_inside_the_reprobe_window`, `tests/test_chip_state.py::test_a_check_reads_a_still_lost_chip_once_and_judges_it_on_that_read`, `tests/test_chip_state.py::test_the_reset_gate_does_not_count_a_lost_chip_that_answers_again` |
 | I66 (every decision read reads a lost chip for real, a dead one at most once a second; polls stay gated) | `tests/test_chip_state.py::test_a_decision_read_judges_a_lost_chip_on_a_real_read_and_reads_a_dead_one_once`, `tests/test_chip_state.py::test_the_recovery_ladder_reads_lost_chips_for_real`, `tests/test_chip_state.py::test_admission_and_exec_probe_a_lost_chip_status_does_not`, `tests/test_chip_state.py::test_the_down_offbus_recheck_does_not_hold_on_a_lost_chip_that_is_back`, `tests/test_chip_state.py::test_the_hold_deadline_escalation_does_not_count_a_lost_chip_that_is_back`, `tests/test_chip_state.py::test_each_tenant_decision_takes_the_probing_verdict` |
-| I66 (stale state: a reset step, sweep or tray walk that raises or is cancelled clears recovering and opens the grace; a fresh broker publishes clean state at boot) | `tests/test_chip_state.py::test_a_reset_step_that_raises_or_is_cancelled_clears_recovering`, `tests/test_chip_state.py::test_the_galaxy_reset_sweep_clears_recovering_on_every_exit`, `tests/test_chip_state.py::test_the_tray_walk_clears_recovering_on_every_exit`, `tests/test_chip_state.py::test_a_fresh_broker_publishes_clean_state_over_a_stale_file` |
+| I66 (stale state: a reset step or sweep that raises or is cancelled clears recovering and opens the grace; a fresh broker publishes clean state at boot) | `tests/test_chip_state.py::test_a_reset_step_that_raises_or_is_cancelled_clears_recovering`, `::test_the_galaxy_reset_sweep_clears_recovering_on_every_exit`, `::test_a_fresh_broker_publishes_clean_state_over_a_stale_file` |
 | I66 (published state: atomic, every expected chip, path follows the device-op lock) | `tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip`, `tests/test_chip_state.py::test_the_default_path_follows_the_device_op_lock` |
 | I65 (a release wakes a held job at once; a wake while still held never dispatches; wakes cannot spin the gate) | `tests/test_tenant_hold_wake.py::test_startup_release_dispatches_a_held_job_within_a_second`, `tests/test_tenant_hold_wake.py::test_a_wake_while_still_held_does_not_dispatch`, `tests/test_tenant_hold_wake.py::test_a_release_from_another_thread_wakes_the_hold` |
 | I55/I61 (a rung fired from a clean exit opens the hold episode first; a failed post-reset check never releases) | `tests/test_dispatch_failure_reset.py::test_a_clean_exit_dispatch_failure_whose_reset_fails_stays_held`, `tests/test_eth_timeout_reset.py::test_the_door_is_shut_while_the_reset_is_unproven` |

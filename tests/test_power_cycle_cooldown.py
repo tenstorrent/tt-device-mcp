@@ -30,7 +30,7 @@ from tt_device_mcp.health.recovery.base import (
 )
 
 T0 = 1_800_000_000.0
-LADDER = {"glx_reset", "ubb_tray", "sweep"}
+LADDER = {"glx_reset", "sweep"}
 
 
 @pytest.fixture

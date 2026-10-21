@@ -184,7 +184,7 @@ def offbus_count(
 def returned_chips(ids) -> list[str]:
     """Of ``ids``, the chips back on the bus by a fresh sysfs read: the KMD node is there and its
     heartbeat is a counter that is not all-ones, or it is ARC-not-ready on a bound endpoint. Read
-    after every tray re-power, mesh reset and PCI rescan so a chip that came back leaves
+    after every mesh reset and PCI rescan so a chip that came back leaves
     ``isolated_chips`` at once, whatever the verify that follows says."""
     want = {str(i) for i in ids}
     if not want:

@@ -323,10 +323,9 @@ BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC = int(
     os.environ.get("TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC", "900").strip() or "900"
 )
 
-# An outage hold turns every hardware rung off at once. Each alone is a normal per-host choice (an
-# unconfirmed BMC turns the tray rung off and the ladder still climbs through the mesh reset), but
-# all three off together say "touch nothing": the mesh reset is held too.
-OUTAGE_HOLD_VARS = ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE", "TT_DEVICE_MCP_AUTO_UBB_RESET")
+# An outage hold turns every hardware rung off at once: both host rungs off together say "touch
+# nothing", so the mesh reset is held too.
+OUTAGE_HOLD_VARS = ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE")
 # The hold reason -> when its page went out (monotonic). A held mesh reset stays HELD until an operator
 # acts, so the page is the hold's only bound: while the hold stands it is sent again every
 # mesh_hold_repage_sec(), so a page that was missed or forgotten never leaves the device held in silence.
@@ -362,9 +361,27 @@ def mesh_reset_hold_reason() -> str:
     return ""
 
 
+def outage_hold_boot_warning() -> str:
+    """The boot warning for an outage hold that holds the mesh reset by default, or "" when there is
+    none (spec 04 I28). Both host rungs at 0 with ``TT_DEVICE_MCP_AUTO_MESH_RESET`` unset is enough
+    on its own: no third switch has to be 0 any more, so a host that turned off only its host rungs
+    now holds every automatic mesh reset until an operator acts, and the journal must say so."""
+    if os.environ.get("TT_DEVICE_MCP_AUTO_MESH_RESET", "").strip():
+        return ""
+    if not all(os.environ.get(v, "").strip() == "0" for v in OUTAGE_HOLD_VARS):
+        return ""
+    return (
+        " and ".join(f"{v}=0" for v in OUTAGE_HOLD_VARS)
+        + " with TT_DEVICE_MCP_AUTO_MESH_RESET unset is an outage hold: every automatic mesh reset "
+        "(tt-smi -glx_reset from the gate, the idle relift, the hold watchdog and the last-chance sweep) "
+        "is HELD and the device stays held until an operator acts; set TT_DEVICE_MCP_AUTO_MESH_RESET=1 "
+        "to re-arm it (spec 04 I28)"
+    )
+
+
 def drop_returned_isolated(isolated: set, context: str, log=None) -> list:
     """Re-read sysfs and take every chip of ``isolated`` that is back on the bus out of it, in place.
-    Run after every tray re-power, mesh reset and PCI rescan, whatever the verify that follows says:
+    Run after every mesh reset and PCI rescan, whatever the verify that follows says:
     a chip left in the set after it returned keeps /health and the gate reading it as isolated and
     arms a needless bridge reset on the next pass. Never releases anything: only the full health
     check, fabric included, does that (spec 03 I52)."""
@@ -632,7 +649,7 @@ class RecoveryMechanism:
 
     def host_action_blocks_reset(self, log: Callable[[str], None], *, context: str) -> bool:
         """True while a requested host reboot or power cycle is pending: no device reset (bridge,
-        tray re-power, galaxy/SMI reset) may start under it, whichever path asks (spec 04 I34). One
+        galaxy/SMI reset) may start under it, whichever path asks (spec 04 I34). One
         log line and one event per request; the device stays held, and the full health check runs
         after the host comes back. Bounded by host_action_pending()'s window."""
         pending = self.host_action_pending()
@@ -1765,18 +1782,20 @@ class RecoveryMechanism:
         now = time.time() if now_epoch is None else now_epoch
         self._class_a_ladder_spawned = self._class_a_ladder_anchor_now(now)
 
-    def class_a_ladder_due(self, now_epoch: Optional[float] = None) -> bool:
+    def class_a_ladder_due(self, now_epoch: Optional[float] = None, *, consume: bool = True) -> bool:
         """Spec 04 I73 / user rule: a class-A hold whose power cycle the cooldown refused never stands
         past CLASS_A_LADDER_AFTER_SEC since its last cycle or boot (or its own start, if later) without
         the full ladder. True once per such anchor, when that mark is reached inside the cooldown: the
         hold watchdog's forced pass then runs the ladder, whose reset is followed by the full health
         check (fabric included) and, if that fails, the power cycle the cooldown releases at its end.
-        False past the cooldown (the cycle itself is due) and with no cooldown standing."""
+        False past the cooldown (the cycle itself is due) and with no cooldown standing. ``consume=False``
+        only asks: the caller takes the anchor once its guards (tenant, scope) let the sweep run."""
         now = time.time() if now_epoch is None else now_epoch
         anchor = self._class_a_ladder_anchor_now(now)
         if anchor is None or now - anchor < CLASS_A_LADDER_AFTER_SEC or self._class_a_ladder_anchor == anchor:
             return False
-        self._class_a_ladder_anchor = anchor
+        if consume:
+            self._class_a_ladder_anchor = anchor
         return True
 
     def power_cycle_miss_state(
