@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from tests.conftest import _reset_server_state
+from tt_device_mcp import device_holders as dh
 from tt_device_mcp import server as srv
 from tt_device_mcp.health import chip_state
 
@@ -89,6 +90,32 @@ def test_the_per_test_reset_clears_every_hold_bound_and_escalation_global(monkey
     assert (chip_state._present, chip_state._expected) == (chip_state._sysfs_indices, chip_state._no_baseline)
 
 
+class _HostHoldsTheRealDevice:
+    """``os`` as the holder walk sees it on a device host where this process has the real
+    /dev/tenstorrent/0 open as fd 9: no test may open the real node to set that up."""
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def listdir(self, path):
+        return ["9"] if path == f"/proc/{os.getpid()}/fd" else os.listdir(path)
+
+    def readlink(self, path):
+        return "/dev/tenstorrent/0" if path == f"/proc/{os.getpid()}/fd/9" else os.readlink(path)
+
+
+def test_a_real_device_holder_on_the_host_is_not_a_holder_in_a_test(monkeypatch):
+    """Spec 09 I1 (holder scan): a real job holding the host's own /dev/tenstorrent does not read as
+    a tenant in an unmarked test. Unsealed, it kept a runner test's job waiting on the holder and
+    blocked a hold-bound test's host rung, only while the host ran device work."""
+    monkeypatch.setattr(dh, "os", _HostHoldsTheRealDevice())
+    monkeypatch.setattr(dh, "_iter_pids", lambda: [os.getpid()])
+    monkeypatch.setattr(srv, "_present_chip_indices", lambda: ["0"])
+
+    assert dh.enumerate_device_holders().holders == []
+    assert srv._tenant_holder_reason() == ""
+
+
 def test_the_leaking_pairs_pass_with_the_leaking_test_first():
     """The order that failed before the reset covered these globals: each pair's first test runs first,
     in one process, and both pass."""
@@ -104,3 +131,29 @@ def test_the_leaking_pairs_pass_with_the_leaking_test_first():
     )
     passed = [line.split(" ", 1)[1] for line in run.stdout.splitlines() if line.startswith("PASSED ")]
     assert run.returncode == 0 and passed == LEAKING_PAIRS, run.stdout[-3000:]
+
+
+def test_the_isolation_dirs_go_in_one_session_dir(isolation_tmp_root, tmp_path_factory):
+    """The ~20 dirs each test's isolation makes land in one session dir, not pytest's base temp
+    dir, whose numbered `mktemp` lists that whole dir on every call (the suite went quadratic)."""
+    from tt_device_mcp.health import evidence
+    from tt_device_mcp.health.monitors import pci
+
+    assert isolation_tmp_root.parent == tmp_path_factory.getbasetemp()
+    for made in (Path(evidence.HEALTH_DIR), Path(pci.SYSFS_CLASS_DIR), Path(srv.TT_DEV_DIR)):
+        assert made.parent == isolation_tmp_root, made
+
+
+def test_making_an_isolation_dir_never_lists_its_root(tmp_path, monkeypatch):
+    """Constant cost per dir however many the run made: no listing of the shared root."""
+    from tests.conftest import _FlatTmpDirs
+
+    def no_listing(*_a, **_k):
+        raise AssertionError("listed the isolation root")
+
+    dirs = _FlatTmpDirs(tmp_path)
+    monkeypatch.setattr(os, "scandir", no_listing)
+    monkeypatch.setattr(os, "listdir", no_listing)
+    monkeypatch.setattr(Path, "iterdir", no_listing)
+    a, b = dirs.mktemp("health"), dirs.mktemp("health")
+    assert a != b and a.is_dir() and b.is_dir() and a.parent == b.parent == tmp_path

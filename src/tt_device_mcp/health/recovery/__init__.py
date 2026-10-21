@@ -79,6 +79,9 @@ OUTCOME_TERMINAL = "terminal"
 # is what turns a ~13 min recovery into a ~seconds one.
 BRIDGE_RESET_MAX_TRIES = 3
 BRIDGE_RESET_SETTLE_SEC = 4
+# The bridge rung's reason for a removed chip whose every recorded-bridge SBR fired and left it off
+# the bus (spec 04 I69); _classify_hold reads it as no window, like no_bridge.
+NO_WINDOW_REMOVED_REASON = "removed_not_reenumerated"
 
 # A reset returns before the eth links re-train, so the immediate post-reset fabric pass can find
 # no trained link (77). Retry (see Recovery._verify_device_after_reset), giving the links time to
@@ -278,7 +281,7 @@ class RecoveryDeps:
     # deps fixture — may supply its own bindings, which boot leaves untouched).
     board_types_provider: Optional[Callable[[], Optional[list]]] = None
     glx_board_types_provider: Optional[Callable[[], tuple]] = None
-    # {chip index: PCI address}, the map the tray rung derives its trays from (spec 04 I16). Same
+    # {chip index: PCI address}, the map tray placement is derived from (spec 04 I16). Same
     # injection reason as the two above: the cache lives on the HealthMonitor singleton.
     chip_buses_provider: Optional[Callable[[], Optional[dict]]] = None
     journal_skip_once: Optional[Callable[[str, str], None]] = None
@@ -460,6 +463,13 @@ class Recovery(ABC):
         # stale prior pass; the server threads it onto Evidence.bridge_reset_failed after this fires.
         self.last_bridge_reset_reasons: dict = {}
         isolated_chips = self.deps.isolated_chips()
+        # Spec 04 I69: every chip the broker removed is off the bus and un-reset, so it is a target
+        # whether or not this pass was asked for it (a record reloaded after a restart, say). Left out,
+        # the rescan any other chip's reset ends with would re-enumerate it un-reset.
+        adopted = [i for i in pci.removed_chip_ids() if i not in isolated_chips]
+        if adopted:
+            isolated_chips.update(adopted)
+            health_event("removed_chips_isolated", chips=adopted, context="bridge_reset")
         if not isolated_chips:
             return True
         targets = sorted(isolated_chips, key=int)
@@ -605,6 +615,11 @@ class Recovery(ABC):
                     await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
             else:
                 lost.append(idx)
+                if idx in reset_this_pass:
+                    # A chip the broker removed, reset through its recorded bridge on every try and
+                    # still off the bus: no SBR brings it back, the same no-window fact as no_bridge,
+                    # so its hold keeps its off-bus class (galaxy._classify_hold, spec 04 I69).
+                    self.last_bridge_reset_reasons[idx] = {"reason": NO_WINDOW_REMOVED_REASON}
                 metrics.stage_fired("bridge_reset", "failed")
 
         for idx in recovered:
@@ -627,10 +642,10 @@ class Recovery(ABC):
         )
 
         # Spec 04 I69: never re-enumerate a removed chip that was not reset this pass — the rescan
-        # lets the driver probe a hung chip. A refused host reset gate withholds it only then (the
-        # removed chips were not reset because of it); chips the broker never removed keep the
-        # bare rescan, as before the gate.
-        unreset_dead = [i for i in still_dead if pci.removed_chip(i) and i not in reset_this_pass]
+        # lets the driver probe a hung chip. Every record counts, not only this pass's targets: the
+        # rescan is global. A refused host reset gate withholds it only then (the removed chips were
+        # not reset because of it); chips the broker never removed keep the bare rescan, as before.
+        unreset_dead = [i for i in pci.removed_chip_ids() if i not in reset_this_pass]
         withhold = ("host_reset_gated" if gated else "removed_chip_not_reset") if unreset_dead else ""
         if still_dead and withhold:
             health_event("pci_rescan_withheld", chips=still_dead, unreset=unreset_dead, reason=withhold)
@@ -700,15 +715,26 @@ class Recovery(ABC):
         ``healthy`` is None: never a recovery (no hold is cleared onto a fabric no pass proved, the box D
         shape: enum+ARC read OK while every full-mesh job died on a down link), and never a failed reset
         either (a 77 measured nothing, so it must not arm the host rungs). Falsy, so a caller that only
-        asks "recovered?" still reads no. Returns ``(healthy, evidence, fabric_retries)``."""
+        asks "recovered?" still reads no. A 77 from a validator that is not built yet (spec 03 I81) gets no
+        retry and no eth-training wait: it is the same UNKNOWN at once. Returns ``(healthy, evidence,
+        fabric_retries)``."""
         healthy, evidence = await self._verify_device(expected, log)
         retries = 0
+        not_built = None
         while (
             self._fabric_ran_but_unverified(evidence)
             and healthy
             and expected > 1
             and retries < POST_RESET_FABRIC_RETRIES
         ):
+            not_built = fabric.validator_not_built()
+            if not_built is not None:
+                # I81: the 77 is a validator that is not on disk; no wait for eth training makes it run.
+                log(
+                    f"post-reset fabric could not run: fabric validator not built ({not_built}) — no "
+                    "eth-training wait; the fabric stays unverified until the build lands"
+                )
+                break
             retries += 1
             if fabric.names_dispatch_cap(evidence["fabric"].get("detail", "")):
                 # I84: the validator already moved traffic across every link, so they were trained;
@@ -726,8 +752,13 @@ class Recovery(ABC):
             healthy, evidence = await self._verify_device(expected, log)
         if healthy and expected > 1 and self._fabric_ran_but_unverified(evidence):
             log(
-                "post-reset fabric still could not verify after eth-training retries — the fabric is UNKNOWN "
-                "(enum+ARC healthy, no pass got a verdict): not recovered, and not a failed reset"
+                (
+                    "post-reset fabric could not verify (fabric validator not built)"
+                    if not_built
+                    else "post-reset fabric still could not verify after eth-training retries"
+                )
+                + " — the fabric is UNKNOWN (enum+ARC healthy, no pass got a verdict): not recovered, and not "
+                "a failed reset"
             )
             healthy = None
         FABRIC_DEBT.note_evidence(evidence)

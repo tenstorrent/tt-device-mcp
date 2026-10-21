@@ -54,10 +54,6 @@ def _episode(monkeypatch, *, power_cycle=False, clock=None, off_bus=OFF_BUS):
             clock[0] += RESET_SEC
         return False
 
-    async def tray(*a, **k):
-        counters["trays"] += 1
-        return None
-
     async def sweep(*a, **k):
         counters["sweeps"] += 1
         if clock is not None:
@@ -65,7 +61,6 @@ def _episode(monkeypatch, *, power_cycle=False, clock=None, off_bus=OFF_BUS):
         return False
 
     patch_recovery(monkeypatch, "_reset_and_verify_device", reset)
-    monkeypatch.setattr(srv.galaxy_recovery, "_attempt_ubb_tray_reset", tray)
     monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", sweep)
     if power_cycle:
         monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")

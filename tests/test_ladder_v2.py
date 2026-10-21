@@ -21,7 +21,7 @@ from tests.conftest import patch_health_event, patch_recovery
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health import recovery as recovery_pkg
-from tt_device_mcp.health.recovery import Evidence, galaxy, pcie_guard
+from tt_device_mcp.health.recovery import Evidence, galaxy, offbus_power_cycle
 
 
 async def _async_true(*a, **k):
@@ -95,26 +95,18 @@ def test_classify_hold_names_the_two_branches(galaxy_trays):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("walk_disabled", [False, True])
 @pytest.mark.parametrize("opted_in", [False, True])
-async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(
-    monkeypatch, galaxy_trays, walk_disabled, opted_in
-):
+async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(monkeypatch, galaxy_trays, opted_in):
     """Through escalate()'s gate path (the live BELOW_FLOOR rung, not the helper directly): a whole
     tray off the bus whose every off-bus chip reported no_bridge — threaded onto
     Evidence.bridge_reset_failed by the server — is classified TRAY_DOWN_NO_WINDOW and dispatched to
-    _fire_tray_down_no_window: every reset type back-to-back (SBR -> per-tray re-power -> mesh reset),
-    NO verify between, exactly ONE settle + ONE verify, then the power cycle. The generic
-    verify-between walk must NOT run. After a tray re-power on this boot regressed other trays (spec 04
-    I25) the sweep skips only the tray re-power: SBR, the mesh reset, the one verify and the power cycle
-    still run.
+    _fire_tray_down_no_window: every reset type back-to-back (SBR -> mesh reset), NO verify between,
+    exactly ONE settle + ONE verify, then the power cycle. No tray re-power step exists (spec 04 I23).
 
     That sweep runs only while no power cycle is opted in (it then ends in the power-cycle-required
     page). With the power cycle opted in, this whole-tray drop is spec 04 I37 class A: the cycle is
     requested at once, with no reset, sweep or verify before it."""
     g = srv.galaxy_recovery
-    if walk_disabled:
-        pcie_guard.disable_tray_rung(tray=1, new_off=["13"])
     monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
     patch_health_event(monkeypatch, lambda *a, **k: None)
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
@@ -127,7 +119,6 @@ async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(
         return False  # a gone tray has no bridge — SBR is a no-op, fired anyway (nothing to lose)
 
     patch_recovery(monkeypatch, "_recover_isolated_chips", sbr)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: order.append(("tray", bitmap)))
 
     async def mesh(argv, log, *a, **k):
         order.append("mesh")
@@ -142,14 +133,6 @@ async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(
         return False, {"snapshot": {"ok": False}}  # still bad -> straight to the power cycle
 
     patch_recovery(monkeypatch, "_verify_device", verify)
-
-    generic = {"n": 0}
-
-    async def generic_walk(beats, off_bus, expected, log):
-        generic["n"] += 1
-        return True
-
-    monkeypatch.setattr(g, "_attempt_ubb_tray_reset", generic_walk)
 
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: opted_in)
     monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
@@ -170,27 +153,20 @@ async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(
     )
 
     assert out == galaxy.OUTCOME_WAITING
-    steps = [o if isinstance(o, str) else o[0] for o in order]
-    assert generic["n"] == 0, "the generic verify-between walk must NOT run for a tray-down-no-window drop"
     if opted_in:
-        assert (steps, verify_calls["n"], cycles["n"]) == ([], 0, 1), "I37 class A: the cycle with no reset first"
+        assert (order, verify_calls["n"], cycles["n"]) == ([], 0, 1), "I37 class A: the cycle with no reset first"
         return
-    if walk_disabled:
-        assert steps == ["sbr", "mesh"], "a regressed tray re-power on this boot is skipped in the sweep"
-    else:
-        assert steps == ["sbr", "tray", "mesh"], "every reset type fires back-to-back, in order, no verify between"
-        # Chips 24-31 sit on bus group 0xc0 which is UBB3 on Blackhole (I16); the BMC bitmap bit is
-        # tray-1 (1-based tray, 0-based bit) so UBB3 → bit 2, not bit 3 (which would be UBB4 on BH).
-        assert order[1] == ("tray", 1 << 2), "the affected tray (UBB3) is re-powered"
+    assert order == ["sbr", "mesh"], "every reset type fires back-to-back, in order, no verify between"
     assert verify_calls["n"] == 1, "exactly ONE settle+verify after the whole sweep — no retries, no ceiling"
     assert cycles["n"] == 0, "no power cycle opted in: the sweep ends in the page, not a cycle"
 
 
 @pytest.mark.asyncio
-async def test_gate_partial_tray_or_a_bridge_window_takes_the_generic_walk(monkeypatch):
-    """Anything that is not a whole tray with no window on EVERY chip is GENERIC — the verify-between
-    per-tray walk, never the back-to-back sweep. Covers a partial-tray drop and a whole tray where one
-    chip still has a bridge window."""
+async def test_gate_partial_tray_or_a_bridge_window_never_takes_the_sweep(monkeypatch):
+    """Anything that is not a whole tray with no window on EVERY chip is GENERIC: never the
+    back-to-back sweep and never a tray re-power. The gate holds; a whole tray goes to the bounded
+    power cycle (I37), anything else to the I76 ladder at 10 min. Covers a partial-tray drop and a
+    whole tray where one chip still has a bridge window."""
     g = srv.galaxy_recovery
     patch_health_event(monkeypatch, lambda *a, **k: None)
     monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
@@ -204,13 +180,13 @@ async def test_gate_partial_tray_or_a_bridge_window_takes_the_generic_walk(monke
 
     monkeypatch.setattr(g, "_fire_tray_down_no_window", sweep_fn)
 
-    generic = {"n": 0}
+    cycles = {"n": 0}
 
-    async def generic_walk(beats, off_bus, expected, log):
-        generic["n"] += 1
-        return True  # recovered -> the rung releases
+    async def gated_cycle(*a, **k):
+        cycles["n"] += 1
 
-    monkeypatch.setattr(g, "_attempt_ubb_tray_reset", generic_walk)
+    monkeypatch.setattr(g, "_offbus_gated_power_cycle", gated_cycle)
+    monkeypatch.setattr(offbus_power_cycle, "whole_tray_down_age_sec", lambda since: 0.0)
 
     # (1) partial tray: only 4 of UBB3's chips off the bus, every one no_bridge -> not a whole tray
     beats = {str(i): 100 for i in range(28)}  # 28-31 off -> partial UBB3
@@ -218,8 +194,8 @@ async def test_gate_partial_tray_or_a_bridge_window_takes_the_generic_walk(monke
     out = await g.escalate(
         "gate/post-job", ["28", "29", "30", "31"], 32, lambda m: None, stage=galaxy.BELOW_FLOOR, ev=ev, beats=beats
     )
-    assert out == galaxy.OUTCOME_RECOVERED
-    assert sweep["n"] == 0 and generic["n"] == 1, "a partial-tray drop is GENERIC, never the sweep"
+    assert out == galaxy.OUTCOME_WAITING
+    assert sweep["n"] == 0, "a partial-tray drop is GENERIC, never the sweep"
 
     # (2) whole tray but one chip still has a bridge window (reason != no_bridge) -> GENERIC
     beats2 = {str(i): 100 for i in range(24)}
@@ -235,14 +211,15 @@ async def test_gate_partial_tray_or_a_bridge_window_takes_the_generic_walk(monke
         ev=ev2,
         beats=beats2,
     )
-    assert out2 == galaxy.OUTCOME_RECOVERED
-    assert sweep["n"] == 0 and generic["n"] == 2, "a whole tray with ANY bridge window is GENERIC, never the sweep"
+    assert out2 == galaxy.OUTCOME_WAITING
+    assert sweep["n"] == 0, "a whole tray with ANY bridge window is GENERIC, never the sweep"
+    assert cycles["n"] == 2, "a held below-floor drop with a whole tray down takes the bounded power cycle"
 
 
 @pytest.mark.asyncio
-async def test_gate_tray_down_no_window_names_the_command_and_holds_when_not_opted_in(monkeypatch, galaxy_trays):
-    """With TT_DEVICE_MCP_AUTO_UBB_RESET=0 the no-window branch honours the same opt-out the generic
-    path does: it NAMES the BMC command (ubb_reset_required) and holds — it never re-powers silicon."""
+async def test_gate_tray_down_no_window_ignores_a_stale_tray_rung_setting(monkeypatch, galaxy_trays):
+    """The tray re-power rung and its TT_DEVICE_MCP_AUTO_UBB_RESET switch are gone. A box that still
+    sets it to 0 must not hold the no-window drop or page for a BMC command: the sweep runs."""
     g = srv.galaxy_recovery
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")
     events = []
@@ -264,8 +241,8 @@ async def test_gate_tray_down_no_window_names_the_command_and_holds_when_not_opt
     )
 
     assert out == galaxy.OUTCOME_WAITING
-    assert sweep["n"] == 0, "the sweep must not re-power silicon when the per-tray fire is opted out"
-    assert "ubb_reset_required" in events, "the exact BMC command is named for the operator, then held"
+    assert sweep["n"] == 1, "the stale setting no longer holds the sweep"
+    assert not [e for e in events if e.startswith("ubb_reset")], "no BMC command is named or fired"
 
 
 @pytest.mark.asyncio
@@ -310,8 +287,8 @@ async def test_bridge_rung_records_no_bridge_and_it_survives_the_server_replace(
 
 @pytest.mark.asyncio
 async def test_tray_down_no_window_fires_all_rungs_back_to_back_then_one_verify(monkeypatch, galaxy_trays):
-    """Every reset type fires back-to-back with NO verify/settle between them — SBR, per-tray
-    re-power of the affected tray, then the mesh-wide reset — then exactly ONE settle and ONE verify.
+    """Every reset type fires back-to-back with NO verify/settle between them — SBR, then the
+    mesh-wide reset (no tray re-power, spec 04 I23) — then exactly ONE settle and ONE verify.
     A verify that comes back healthy releases without a power cycle."""
     g = srv.galaxy_recovery
     monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
@@ -325,7 +302,6 @@ async def test_tray_down_no_window_fires_all_rungs_back_to_back_then_one_verify(
         return False  # a gone tray has no bridge — SBR is a no-op, fired anyway (nothing to lose)
 
     patch_recovery(monkeypatch, "_recover_isolated_chips", sbr)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: order.append(("tray", bitmap)))
 
     async def mesh(argv, log, *a, **k):
         order.append("mesh")
@@ -344,9 +320,7 @@ async def test_tray_down_no_window_fires_all_rungs_back_to_back_then_one_verify(
     out = await g._fire_tray_down_no_window(offbus, 32, lambda m: None, gate_phase="post-job", ev=None)
 
     assert out == galaxy.OUTCOME_RECOVERED
-    steps = [o if isinstance(o, str) else o[0] for o in order]
-    assert steps == ["sbr", "tray", "mesh"], "every reset type fires back-to-back, in order, no verify between"
-    assert order[1] == ("tray", 1 << 2), "the affected tray (UBB3) is re-powered"
+    assert order == ["sbr", "mesh"], "every reset type fires back-to-back, in order, no verify between"
     assert verify_calls["n"] == 1, "exactly ONE verify, after the whole back-to-back sweep"
 
 
@@ -360,7 +334,6 @@ async def test_tray_down_no_window_power_cycles_when_the_sweep_does_not_recover(
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     patch_recovery(monkeypatch, "_recover_isolated_chips", _async_true)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: None)
 
     async def mesh(argv, log, *a, **k):
         return 0, ""
@@ -405,7 +378,6 @@ def _wire_failed_tray_down_sweep(monkeypatch, read_heartbeats, *, allowed=True):
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     patch_recovery(monkeypatch, "_recover_isolated_chips", _async_true)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: None)
 
     async def mesh(argv, log, *a, **k):
         return 0, ""
@@ -493,13 +465,18 @@ async def test_tray_down_no_window_escalation_uses_the_onset_count_not_the_count
 
 @pytest.mark.asyncio
 async def test_tray_down_no_window_holds_under_a_tenant(monkeypatch):
-    """The sweep re-powers silicon, so it never runs under a tenant on the device."""
+    """The sweep resets silicon, so it never runs under a tenant on the device."""
     g = srv.galaxy_recovery
     patch_health_event(monkeypatch, lambda *a, **k: None)
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=False))
     fired = {"n": 0}
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: fired.__setitem__("n", fired["n"] + 1))
+
+    async def sbr(log):
+        fired["n"] += 1
+        return False
+
+    patch_recovery(monkeypatch, "_recover_isolated_chips", sbr)
     out = await g._fire_tray_down_no_window(
         {str(i) for i in range(24, 32)}, 32, lambda m: None, gate_phase="x", ev=None
     )
@@ -536,8 +513,9 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
         return False, {"snapshot": {"ok": False}}
 
     patch_recovery(monkeypatch, "_verify_device", bad)
-    # The sweep did not run (no holder scan stubbed, so it reads as a tenant): the full ladder has not
+    # The sweep did not run (an unreadable holder scan reads as a tenant): the full ladder has not
     # been tried, so the host rung holds (spec 04 I22).
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=False))
     out_held = await g._fire_gate_rung(
         "post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={}
     )
@@ -548,7 +526,6 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
     # The full sweep ran and the mesh is still bad: the host rung fires.
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: None)
 
     async def fake_reset(argv, log, *a, **k):
         return 0, ""
@@ -692,7 +669,6 @@ def _arm_sweep(monkeypatch, *, verify_healthy=False, tenant=False):
         return False
 
     patch_recovery(monkeypatch, "_recover_isolated_chips", sbr)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: order.append(("tray", bitmap)))
 
     async def mesh(argv, log, *a, **k):
         order.append("mesh")
@@ -714,32 +690,29 @@ def _arm_sweep(monkeypatch, *, verify_healthy=False, tenant=False):
 
 @pytest.mark.asyncio
 async def test_gate_ladder_sweeps_every_reset_before_the_power_cycle(monkeypatch, galaxy_trays):
-    """The gate ladder's own host rung: SBR -> tray re-power -> mesh reset fire back-to-back, then
+    """The gate ladder's own host rung: SBR -> mesh reset fire back-to-back, then
     the single settle+verify, and only then the power cycle."""
     g, order, cycles = _arm_sweep(monkeypatch)
     out = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={})
-    steps = [o if isinstance(o, str) else o[0] for o in order]
-    assert steps == ["sbr", "tray", "mesh"], f"every reset type once, in order, before the power cycle; got {steps}"
+    assert order == ["sbr", "mesh"], f"every reset type once, in order, before the power cycle; got {order}"
     assert out == galaxy.OUTCOME_WAITING and cycles["n"] == 1, "still bad after the sweep -> the power cycle fires"
 
 
 @pytest.mark.asyncio
-async def test_a_regressed_tray_rung_is_skipped_in_the_last_chance_sweep(monkeypatch, galaxy_trays):
-    """Spec 04 I25/I22: after a tray re-power on this boot regressed other trays, the last-chance sweep
-    skips the tray re-power (as when opted out) and still runs SBR and the mesh reset, so the sweep
-    counts as the full ladder and the caller climbs (False), never the open-ended hold (None)."""
+async def test_a_partial_drop_last_chance_sweep_runs_no_tray_step(monkeypatch, galaxy_trays):
+    """Spec 04 I22/I23: the last-chance sweep for a partial drop runs SBR and the mesh reset only, so
+    the sweep counts as the full ladder and the caller climbs (False), never the open-ended hold (None)."""
     g, order, cycles = _arm_sweep(monkeypatch)
-    pcie_guard.disable_tray_rung(tray=1, new_off=["13"])
     off = {str(i) for i in range(24, 30)}  # part of UBB3 (a whole tray skips the sweep, spec 04 I37)
     assert await g._settle_and_verify_before_host_rung(32, lambda m: None, "post-job", offbus_chips=off) is False
-    assert order == ["sbr", "mesh"], f"the tray re-power is skipped in the sweep; got {order}"
+    assert order == ["sbr", "mesh"], f"no tray step in the sweep; got {order}"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("healthy", [False, True])
-async def test_a_skipped_tray_rung_releases_only_after_the_full_health_check(monkeypatch, galaxy_trays, healthy):
-    """Goal 8: skipping the tray re-power changes no release rule. The sweep's SBR and mesh reset are
-    followed by the full health check, fabric included, and only its pass counts as recovered."""
+async def test_the_sweep_releases_only_after_the_full_health_check(monkeypatch, galaxy_trays, healthy):
+    """The sweep's SBR and mesh reset are followed by the full health check, fabric included, and
+    only its pass counts as recovered."""
     g, order, cycles = _arm_sweep(monkeypatch, verify_healthy=healthy)
     checks = []
 
@@ -748,7 +721,6 @@ async def test_a_skipped_tray_rung_releases_only_after_the_full_health_check(mon
         return healthy, {"snapshot": {"ok": healthy}}
 
     patch_recovery(monkeypatch, "_verify_device", verify)
-    pcie_guard.disable_tray_rung(tray=[3], new_off=["5", "13"], signature="position5")
     off = {str(i) for i in range(24, 30)}  # part of UBB3 (a whole tray skips the sweep, spec 04 I37)
     out = await g._settle_and_verify_before_host_rung(32, lambda m: None, "post-job", offbus_chips=off)
     assert order == ["sbr", "mesh"]
@@ -761,7 +733,7 @@ async def test_a_sweep_that_recovers_the_mesh_cancels_the_power_cycle(monkeypatc
     """The point of sweeping: if the last-chance resets bring the mesh back, the box is NOT cycled."""
     g, order, cycles = _arm_sweep(monkeypatch, verify_healthy=True)
     out = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={})
-    assert [o if isinstance(o, str) else o[0] for o in order] == ["sbr", "tray", "mesh"]
+    assert order == ["sbr", "mesh"]
     assert out == galaxy.OUTCOME_RECOVERED and cycles["n"] == 0, "a mesh the sweep recovered must not be power-cycled"
 
 

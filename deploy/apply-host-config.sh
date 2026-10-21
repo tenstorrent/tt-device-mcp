@@ -115,13 +115,13 @@ AICLK_CEILING="${TTDEV_AICLK_CEILING_MHZ:-}"
 AICLK_CEILING_CMD="${TTDEV_AICLK_CEILING_CMD:-}"
 [ -z "$AICLK_CEILING_CMD" ] && [ -r "$UNIT" ] && AICLK_CEILING_CMD="$(sed -n 's/^Environment=TT_DEVICE_MCP_AICLK_CEILING_CMD=//p' "$UNIT" 2>/dev/null | head -1)"
 # The cold rungs — the TOP of the recovery cascade. server.py reads TT_DEVICE_MCP_AUTO_REBOOT (warm
-# reboot) and TT_DEVICE_MCP_AUTO_POWER_CYCLE (BMC power cycle), each default OFF, each armed with "1".
-# Without this wiring neither key can be set (nothing else sources /etc/default into the broker process),
-# so the cascade can only ever reach the rung below them and an all-off-bus mesh — the one state a warm
-# reboot cannot re-enumerate — holds forever with no reachable recovery. Unset renders no line, so arming
-# a destructive rung stays a deliberate one-line /etc/default edit that no host takes by accident; the
-# power-cycle preflight still requires ipmitool wherever AUTO_POWER_CYCLE is on. Unit-read fallback
-# mirrors the others so an auto-update never drops a value an operator already set.
+# reboot) and TT_DEVICE_MCP_AUTO_POWER_CYCLE (BMC power cycle), each default ON (unset or any value
+# but "0" leaves the rung armed; only "0" disarms it). Unset renders no line, leaving both rungs armed
+# at their code default, so a host never ends in a permanent hold because nobody armed them. This
+# passthrough is the opt-OUT path for a host where an unattended reboot or power cycle is worse than a
+# stuck queue (nothing else sources /etc/default into the broker process). The power-cycle preflight
+# still requires ipmitool wherever AUTO_POWER_CYCLE is on. Unit-read fallback mirrors the others so an
+# auto-update never drops a value an operator already set.
 AUTO_REBOOT="${TTDEV_AUTO_REBOOT:-}"
 [ -z "$AUTO_REBOOT" ] && [ -r "$UNIT" ] && AUTO_REBOOT="$(sed -n 's/^Environment=TT_DEVICE_MCP_AUTO_REBOOT=//p' "$UNIT" 2>/dev/null | head -1)"
 AUTO_POWER_CYCLE="${TTDEV_AUTO_POWER_CYCLE:-}"
@@ -251,6 +251,11 @@ ExecStart=$VENV/bin/python -m tt_device_mcp.server --socket $SOCK --no-http --lo
 ExecStartPost=/bin/sh -c 'for i in \$(seq 1 50); do [ -S $SOCK ] && { chmod 0666 $SOCK; exit 0; }; sleep 0.1; done'
 Restart=on-failure
 RestartSec=2
+# Jobs inherit this: privsep runs them in a systemd-run --scope, which keeps the caller's rlimits (a
+# scope has no Limit* properties of its own). tt-metal pins host memory, and systemd's 8 MiB default
+# is far below what a login shell gets, so a job run through the broker would fail where the same
+# command run by hand succeeds.
+LimitMEMLOCK=infinity
 [Install]
 WantedBy=multi-user.target
 UNIT
@@ -316,9 +321,19 @@ CLIENT
 chmod 0644 /etc/profile.d/tt-device-mcp-client.sh
 
 # Idle-time health probe (spec 08 I17): PCI rescan and telemetry re-arm while the broker is idle.
-# The service runs the broker's own venv, rendered like the broker unit's ExecStart.
+# The service runs the broker's own venv, rendered like the broker unit's ExecStart. It is installed
+# and armed only when that venv can import the probe module: a build without it would leave a timer
+# that fails every 2 minutes and probes nothing. find_spec imports the package the same way the
+# service's `python -m` does, so a probe that would run is never skipped.
+health_probe_ships() {
+    "$VENV/bin/python" -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("tt_device_mcp.health_probe") else 1)' >/dev/null 2>&1
+}
 install_health_probe_units() {
     local unitdir="$1"
+    if ! health_probe_ships; then
+        echo "apply-host-config: warn: $VENV has no tt_device_mcp.health_probe; tt-device-health-probe units not installed" >&2
+        return 0
+    fi
     sed "s|@VENV@|$VENV|g" "$DEPLOY/tt-device-health-probe.service" > "$unitdir/tt-device-health-probe.service"
     chmod 0644 "$unitdir/tt-device-health-probe.service"
     install -m 0644 "$DEPLOY/tt-device-health-probe.timer" "$unitdir/tt-device-health-probe.timer"
@@ -329,10 +344,17 @@ install_health_probe_units() {
 # probes must not race, so it is retired, but only once the new timer is armed, and its units are
 # moved aside, not deleted. An opted-out host, or one where the new timer will not arm, keeps the
 # old probe's coverage. Undo a retirement: move the *.retired-by-tt-device-mcp files back.
+# A venv without the probe module (an older build replacing one that shipped it) stops a timer left
+# armed by that build: it could only fail. The next apply with the module arms it again.
 arm_health_probe() {
     local unitdir="$1" f
     if [ "${TTDEV_HEALTH_PROBE:-1}" = 0 ]; then
         systemctl disable --now tt-device-health-probe.timer >/dev/null 2>&1 || true
+        return 0
+    fi
+    if ! health_probe_ships; then
+        systemctl disable --now tt-device-health-probe.timer >/dev/null 2>&1 || true
+        echo "apply-host-config: warn: $VENV has no tt_device_mcp.health_probe; tt-device-health-probe.timer not armed (an unmanaged tt-health-probe.timer, if any, is left running)" >&2
         return 0
     fi
     if ! systemctl enable --now tt-device-health-probe.timer >/dev/null 2>&1 \

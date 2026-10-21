@@ -1759,18 +1759,20 @@ class RecoveryMechanism:
         now = time.time() if now_epoch is None else now_epoch
         self._class_a_ladder_spawned = self._class_a_ladder_anchor_now(now)
 
-    def class_a_ladder_due(self, now_epoch: Optional[float] = None) -> bool:
+    def class_a_ladder_due(self, now_epoch: Optional[float] = None, *, consume: bool = True) -> bool:
         """Spec 04 I73 / user rule: a class-A hold whose power cycle the cooldown refused never stands
         past CLASS_A_LADDER_AFTER_SEC since its last cycle or boot (or its own start, if later) without
         the full ladder. True once per such anchor, when that mark is reached inside the cooldown: the
         hold watchdog's forced pass then runs the ladder, whose reset is followed by the full health
         check (fabric included) and, if that fails, the power cycle the cooldown releases at its end.
-        False past the cooldown (the cycle itself is due) and with no cooldown standing."""
+        False past the cooldown (the cycle itself is due) and with no cooldown standing. ``consume=False``
+        only asks: the caller takes the anchor once its guards (tenant, scope) let the sweep run."""
         now = time.time() if now_epoch is None else now_epoch
         anchor = self._class_a_ladder_anchor_now(now)
         if anchor is None or now - anchor < CLASS_A_LADDER_AFTER_SEC or self._class_a_ladder_anchor == anchor:
             return False
-        self._class_a_ladder_anchor = anchor
+        if consume:
+            self._class_a_ladder_anchor = anchor
         return True
 
     def power_cycle_miss_state(

@@ -330,8 +330,6 @@ def _gated(monkeypatch, **pending) -> None:
     "pending, cmd, at, source",
     [
         ({"gated": True}, True, START + 300, "gated off-bus grace"),
-        ({"ipmi_at": datetime.fromtimestamp(START + 30)}, True, START + 330, "BMC IPMI hand-off bound"),
-        ({"tray_walk_at": datetime.fromtimestamp(START + 20)}, True, START + 320, "failed tray walk hand-off bound"),
         (
             {"handoff": {"deadline": START + 1200, "why": "w", "latched": "", "operator_seen": "none"}},
             False,

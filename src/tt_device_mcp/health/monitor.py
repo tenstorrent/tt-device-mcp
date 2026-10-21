@@ -316,8 +316,8 @@ class HealthMonitor:
         # that has left the bus is absent from every later snapshot AND from sysfs, so the tray
         # rung that needs its bus (spec 04 I16) can only ever read one taken before the drop.
         self._bus_ids: Optional[list] = None
-        # {chip index: PCI address} read from sysfs while every chip was on the bus — the map the
-        # tray rung actually keys on (spec 04 I16). tt-smi lists chips in PCI order and the kernel
+        # {chip index: PCI address} read from sysfs while every chip was on the bus — the map
+        # tray placement actually keys on (spec 04 I16). tt-smi lists chips in PCI order and the kernel
         # numbers them in its own order, so ``_bus_ids`` read by position names the wrong chip.
         # Re-banked by any later trusted full read that differs: the kernel can re-number chips.
         self._chip_buses: Optional[dict] = None
