@@ -18,12 +18,15 @@ from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import evidence
+from tt_device_mcp.health import monitor as mon
 from tt_device_mcp.health.monitor import HealthMonitor
 from tt_device_mcp.health.monitors import fabric
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
 REASON = "chip(s) 15 left the PCIe bus"
 _BAD_LINKS = "fabric-check: running run_cluster_validation --send-traffic\nunhealthy ethernet connections: 3"
+_PARTIAL = "fabric-check: running run_cluster_validation --send-traffic"
+_MISMATCH = "Connection mismatch detected\nfound 2 missing port/cable connections\nfound 0 extra port/cable connections"
 
 
 @pytest.fixture(params=["wrapper", "built-in"])
@@ -91,6 +94,65 @@ async def test_a_minus_9_the_isolation_did_not_cause_keeps_its_old_verdict(fab):
     ok, _ = await m.verify_fabric_health(60)
     assert ok is False, "a -9 the broker did not cause still reads as unhealthy"
     assert not FABRIC_DEBT.owed
+
+
+@pytest.fixture
+def mismatch(monkeypatch, health_deps, tmp_path):
+    """The built-in path with a cabling descriptor whose first run stops on a 2-missing-cable
+    mismatch, so the traffic-only rerun (I45) follows; ``state["kill_on"]`` is the run the dead-chip
+    isolation kills (1 = the descriptor run, 2 = the rerun)."""
+    m = HealthMonitor(health_deps)
+    desc = tmp_path / "desc.textproto"
+    desc.write_text("x")
+    monkeypatch.setenv("TTDEV_FABRIC_DESCRIPTOR", str(desc))
+    monkeypatch.setattr(fabric, "_validator_paths", lambda: ("bin", "root", str(desc)))
+    monkeypatch.setattr(mon, "_cached_topology_mismatch", lambda d: None)
+    monkeypatch.setattr(m, "_fabric_check_cmd", lambda: "")
+    monkeypatch.setattr(m, "_begin_action_row", lambda *a, **k: None)
+    monkeypatch.setattr(m, "_write_action_log", lambda *a, **k: None)
+    monkeypatch.setattr(fabric, "build_command", lambda descriptor=True: (["run_cluster_validation"], {}))
+    state = {"calls": 0, "kill_on": 2, "text": _BAD_LINKS}
+
+    async def check(argv, env, **kw):
+        state["calls"] += 1
+        if state["calls"] == state["kill_on"]:
+            m.note_fabric_check_killed(REASON)
+            return -signal.SIGKILL, state["text"] if state["calls"] == 2 else _MISMATCH
+        return 1, _MISMATCH
+
+    monkeypatch.setattr(fabric, "check", check)
+    return m, state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", [_BAD_LINKS, _PARTIAL], ids=["bad-links", "partial"])
+async def test_a_kill_during_the_traffic_only_rerun_is_no_verdict_either(mismatch, text):
+    """The kill lands in the rerun that follows a descriptor mismatch: its -9 is neither the bad
+    links it already printed (a link fault) nor, with only missing cables, an I47 cable fault."""
+    m, state = mismatch
+    state["text"] = text
+    m.last_fabric_ok = True
+    FABRIC_DEBT.note_fabric(True)
+    ok, detail = await m.verify_fabric_health(60)
+    assert state["calls"] == 2, "the kill landed in the rerun"
+    assert ok is None and "KILLED by dead-chip isolation" in detail, detail
+    assert fabric.CABLE_FAULT not in detail and not m.fabric_known_fault, "no I47 cable fault declared"
+    assert m.last_fabric_ok is None and m.last_fabric_skipped is False
+    assert m.fabric_verdict()["result"] == "skipped"
+    assert FABRIC_DEBT.owed and REASON in FABRIC_DEBT.owed and FABRIC_DEBT.pass_monotonic == 0.0
+    assert not [x for x in evidence.read_health_events() if x["kind"] == "fabric_known_fault"]
+
+
+@pytest.mark.asyncio
+async def test_a_kill_during_the_descriptor_run_starts_no_rerun(mismatch):
+    """Killed in the descriptor run, the check ends there: no ~45-100 s rerun on a chip that left
+    the bus, and no cable fault from the mismatch the killed run printed."""
+    m, state = mismatch
+    state["kill_on"] = 1
+    ok, detail = await m.verify_fabric_health(60)
+    assert state["calls"] == 1, "no traffic-only rerun after a killed run"
+    assert ok is None and "KILLED by dead-chip isolation" in detail, detail
+    assert not m.fabric_known_fault and FABRIC_DEBT.owed
 
 
 @pytest.mark.asyncio

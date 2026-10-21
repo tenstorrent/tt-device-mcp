@@ -1188,6 +1188,10 @@ class HealthMonitor:
                 )
                 self.last_fabric_output = text
                 self.last_fabric_output_at = _t0
+        if self._fabric_killed:
+            # Read again after the traffic-only rerun (I45): a kill there is no verdict either (I82),
+            # never a link fault or a missing-cable verdict (I47) from whatever the killed run printed.
+            return self._fabric_killed_no_verdict(cmd, rc, text, (datetime.now() - _t0).total_seconds())
         # Traffic crossed every discovered link but ports of the descriptor are missing: a FAILED
         # check, never a lift (I71). The cached mismatch goes, so the next pass runs the descriptor
         # again and a reset that brought the link back reads clean.
