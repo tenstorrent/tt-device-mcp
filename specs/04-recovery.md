@@ -1849,6 +1849,56 @@ each rung fires only when the gentler one failed or cannot apply.
   |---|---|
   | Every fault class, the I76 bound included | none: the rungs, their order and their waits are unchanged |
 
+- **I91 — A broker mesh reset never sends the BMC's legacy retimer reset.** tt-smi's Galaxy tray
+  reset (`-glx_reset`, `-glx_reset_auto` and their long forms, tt-smi 6.4.0 and later) re-powers the
+  trays with `ipmitool raw 0x30 0x8B <ubb> <dev> 0x3 <time>`. On any failure of that call (a
+  non-zero exit, a busy or wedged BMC, completion code 0xc9 on BMC firmware older than 0.05.22) it
+  sends the same command again with op_mode `0x0`, although its own source says not to. op_mode
+  `0x0` also asserts the PCIe retimer reset: it can take every device behind those retimers off the
+  bus at once, NVMe drives included, which can take down the host's own storage. tt-smi has no
+  switch for this fallback, so the broker closes it:
+  - **The guard.** Every mesh reset the broker launches, through either reset backend (the
+    `systemd-run` scope and the local no-systemd child), runs as `unshare --mount --propagation
+    private -- <python> -I ipmi_guard.py --wrap -- <tt-smi argv>` (`ipmi_guard.guarded_argv`).
+    Inside that private mount namespace the wrapper mounts a small guard, read-only, over every
+    `ipmitool` that sudo's secure path or the broker's PATH resolves, checks each mount by reading
+    it back, then execs tt-smi. The host's mounts are not changed. The guard refuses (exit 97,
+    `tt-device-mcp ipmi guard: REFUSED ...` on stderr) any `raw 0x30 0x8B` whose op_mode byte reads
+    as zero in any format ipmitool accepts (`0x0`, `0x00`, `0`, `00`, any case) or cannot be read,
+    and the `exec` and `shell` subcommands, which could carry the same request unseen. Everything
+    else, op_mode `0x3` and every read-only call included, execs the real binary unchanged. A
+    wrapper that cannot arm the guard (not root, no mount namespace, a mount that fails or does not
+    read back) does not run the reset: it prints `tt-device-mcp ipmi guard: NOT ARMED` and exits 1,
+    and the broker counts that reset as not fired. No environment variable, flag or config turns
+    the guard off.
+  - **The preflight.** Before it quiesces the bus for a mesh reset, the broker asks the BMC
+    `ipmitool mc info` (read-only, at most `BMC_PREFLIGHT_TIMEOUT_SEC` = 10 s). If the BMC does not
+    answer in time, `ipmitool` is missing, or the firmware is provably older than 0.05.22 (firmware
+    revision below 0.05, or 0.05 with the first aux revision byte below 0x16, read in either its
+    decimal or BCD meaning), the mesh reset is not run: the reset returns rc None (a reset that
+    never fired, so no failed-reset cooldown is armed), the journal gets
+    `mesh_reset_bmc_preflight_refused` with the reason, `/health` `mesh_reset_bmc_guard` shows it,
+    and the caller climbs to its next rung exactly as for any reset that did not recover the mesh.
+    A firmware version it cannot read is not a refusal: the guard still stops a `0x0` retry.
+  - **Detection.** After every mesh reset the broker reads its output. The guard's refusal, or
+    tt-smi's `Falling back to legacy retimer reset`, journals `bmc_legacy_reset_attempted`
+    (`host_at_risk: true`, `sent: false` when the guard refused it, `true` when the fallback text
+    appears without a refusal), pages once per episode (until a mesh reset passes without either),
+    shows in `/health` `mesh_reset_bmc_guard`, and turns an rc 0 into rc 1.
+  - **The post-reset check is unchanged (03 I52, I78).** A refused, unarmed or preflight-refused mesh reset never
+    releases the device or lifts a hold. Every reset that ran is still followed by the full health
+    check, fabric included, before any release; the hold climbs as before (I76: the ladder at the
+    10-min bound, then the power cycle, which takes the host OS down first, I88).
+
+  Time to recover (TTR):
+
+  | Case | Effect of I91 |
+  |---|---|
+  | Any class whose ladder runs a mesh reset, BMC answers and op_mode `0x3` works | the preflight's `mc info`, typically under 1 s, at most 10 s per mesh reset; the guard's mount setup, well under 1 s |
+  | Same, op_mode `0x3` fails | the reset ends rc 1 at once instead of tt-smi's `0x0` retry; the next rung (the I76 bound's power cycle) follows; the 30 s settle and up-to-100 s driver wait of a `0x0` reset are not spent |
+  | Same, BMC silent or firmware below 0.05.22 | the reset is not run (at most 10 s spent); the next rung follows at once |
+  | Classes with no mesh reset (per-chip bridge reset, `tt-smi -r`, power cycle) | none |
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
