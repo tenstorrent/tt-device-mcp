@@ -1186,6 +1186,28 @@ class RecoveryMechanism:
         }
         return message
 
+    def _override_unclassified(self, argv: list[str], owner: str, log) -> str:
+        """Spec 04 I91: a ``TT_DEVICE_MCP_RESET_ARGS`` argv the guard cannot classify does not run.
+
+        Returns the refusal text ('' to go ahead). Like a preflight refusal it is a reset that did not
+        fire: journaled, shown in /health, rc None, and the caller climbs to its next rung."""
+        override = os.environ.get("TT_DEVICE_MCP_RESET_ARGS", "").strip().split()
+        if not override or [str(a) for a in argv] != override:
+            return ""
+        why = ipmi_guard.override_unclassified(argv)
+        if not why:
+            return ""
+        message = f"reset NOT run: {why} (spec 04 I91)"
+        log(message)
+        health_event("reset_override_unclassified", argv=argv, owner=owner, reason=why)
+        metrics.stage_fired("smi_reset", "blocked")
+        self.bmc_guard_state = {
+            "kind": "override_unclassified",
+            "reason": why,
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+        return message
+
     def _note_bmc_guard_output(self, argv: list[str], owner: str, rc: Optional[int], text: str, log) -> Optional[int]:
         """Read a mesh reset's output for the guard (spec 04 I91) and return the rc to report.
 
@@ -1250,6 +1272,9 @@ class RecoveryMechanism:
             log(f"reset refused: {fenced}")
             health_event("reset_fenced", argv=argv, owner=owner, reason=fenced)
             return None, f"reset refused: {fenced}"
+        unclassified = self._override_unclassified(argv, owner, log)
+        if unclassified:
+            return None, unclassified
         mesh = ipmi_guard.is_mesh_reset(argv)
         if mesh:
             refused = await self._mesh_reset_preflight(argv, owner, log)

@@ -195,10 +195,42 @@ def test_the_wrapper_refuses_to_mount_in_the_host_namespace(monkeypatch):
         (["tt-smi", "-r", "0,1"], False),
         (["tt-smi", "-r"], False),
         (["true"], False),
+        # TT_DEVICE_MCP_RESET_ARGS is a full argv: the flag counts wherever it sits (review of I91).
+        (["sudo", "tt-smi", "-glx_reset"], True),
+        (["sudo", "-n", "/usr/local/bin/tt-smi", "-glx_reset_auto"], True),
+        (["env", "X=1", "tt-smi", "-glx_reset"], True),
+        (["python3", "-m", "tt_smi", "-glx_reset"], True),
+        (["/opt/site/galaxy-reset.sh", "-glx_reset"], True),
+        (["bash", "-c", "'tt-smi", "-glx_reset'"], True),
+        (["sudo", "tt-smi", "--GALAXY_6U_TRAYS_RESET"], True),
+        (["/opt/site/galaxy-reset.sh"], False),
     ],
 )
 def test_is_mesh_reset(argv, mesh):
     assert ipmi_guard.is_mesh_reset(argv) is mesh
+
+
+@pytest.mark.parametrize(
+    "argv, classified",
+    [
+        (MESH, True),
+        (["sudo", "tt-smi", "-glx_reset"], True),
+        (["/opt/site/galaxy-reset.sh", "-glx_reset"], True),
+        (["tt-smi", "-r", "0"], True),
+        (["sudo", "/usr/local/bin/tt-smi", "-r"], True),
+        (["python3", "-m", "tt_smi", "-r", "0"], True),
+        (["python3", "/opt/tt_smi.py", "-r"], True),
+        (["/opt/site/galaxy-reset.sh"], False),
+        (["sudo", "/opt/site/reset"], False),
+        (["/opt/tt-smi-wrapper.sh"], False),
+        (["python3", "/opt/reset.py"], False),
+    ],
+)
+def test_override_unclassified(argv, classified):
+    why = ipmi_guard.override_unclassified(argv)
+    assert (why == "") is classified
+    if not classified:
+        assert "TT_DEVICE_MCP_RESET_ARGS" in why and "cannot tell" in why
 
 
 def test_the_guarded_argv_is_a_private_mount_namespace_running_the_wrapper():
@@ -457,3 +489,95 @@ async def test_a_guarded_reset_still_owes_the_full_check_before_release(ladder, 
         srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy")
     _assert_settled(released)
     assert srv._health_payload()["mesh_reset_bmc_guard"] is None
+
+
+OVERRIDE_MESH_FORMS = [
+    "sudo tt-smi -glx_reset",
+    "env TT_SMI_LOG=1 tt-smi -glx_reset",
+    "python3 -m tt_smi -glx_reset",
+    "/opt/site/galaxy-reset.sh -glx_reset",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", OVERRIDE_MESH_FORMS)
+async def test_an_override_mesh_reset_in_any_form_gets_the_preflight_and_the_guard(ladder, monkeypatch, override):
+    """Review of I91: a TT_DEVICE_MCP_RESET_ARGS mesh reset not starting with tt-smi ran unguarded."""
+    rig = ladder
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_ARGS", override)
+    argv = rig["g"].reset_argv([str(i) for i in range(32)])
+    assert argv == override.split()
+    preflights = []
+
+    async def preflight():
+        preflights.append(True)
+        return ""
+
+    monkeypatch.setattr(rig["m"], "bmc_preflight", preflight)
+    seen = []
+    monkeypatch.setattr(rig["m"], "_scoped_reset_backend", lambda: True)
+    monkeypatch.setattr(recovery_base.asyncio, "create_subprocess_exec", _fake_exec(seen))
+    await rig["m"].reset_with_quiesce(argv, lambda m: None)
+    assert preflights == [True], "the BMC preflight ran"
+    payload = seen[0][seen[0].index("--") + 1 :]
+    assert payload == ipmi_guard.guarded_argv(argv), "the reset ran under the guard"
+
+
+@pytest.mark.asyncio
+async def test_a_plain_tt_smi_override_runs_unguarded(ladder, monkeypatch):
+    """`sudo tt-smi -r` never sends the BMC UBB reset: no preflight, no guard, nothing refused."""
+    rig = ladder
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_ARGS", "sudo tt-smi -r 0")
+
+    async def preflight():
+        raise AssertionError("no preflight for a non-mesh reset")
+
+    monkeypatch.setattr(rig["m"], "bmc_preflight", preflight)
+    seen = []
+    monkeypatch.setattr(rig["m"], "_scoped_reset_backend", lambda: True)
+    monkeypatch.setattr(recovery_base.asyncio, "create_subprocess_exec", _fake_exec(seen))
+    await rig["m"].reset_with_quiesce(["sudo", "tt-smi", "-r", "0"], lambda m: None)
+    assert seen[0][seen[0].index("--") + 1 :] == ["sudo", "tt-smi", "-r", "0"]
+    assert "reset_override_unclassified" not in [k for k, _ in rig["events"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", ["/opt/site/galaxy-reset.sh", "sudo /opt/site/reset", "python3 /opt/reset.py"])
+async def test_an_unclassifiable_override_is_refused_and_the_ladder_climbs_with_the_hold_kept(
+    ladder, monkeypatch, override
+):
+    """Fail closed: an override the guard cannot classify never runs. The rung did not fire (rc None,
+    no cooldown), the ladder climbs, and the hold lifts only after a full check (fabric included)
+    passes after a reset that did run."""
+    rig = ladder
+    _launch(monkeypatch, rig, 0, "ok")
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_ARGS", override)
+    preflights = []
+
+    async def preflight():
+        preflights.append(True)
+        return ""
+
+    monkeypatch.setattr(rig["m"], "bmc_preflight", preflight)
+    verifies = []
+    _verify_returning(monkeypatch, FOK, verifies)
+    indices = [str(i) for i in range(32)]
+    rc, text = await rig["m"].reset_with_quiesce(override.split(), lambda m: None)
+    assert rc is None and "reset NOT run" in text
+    out = await rig["g"]._reset_and_verify_device(indices, lambda m: None)
+    assert out is False, "the ladder climbs to its next rung"
+    assert rig["launches"] == [] and preflights == [], "nothing was launched"
+    assert not rig["m"].last_reset_failed, "a reset that never fired arms no failed-reset cooldown"
+    refused = [f for k, f in rig["events"] if k == "reset_override_unclassified"]
+    assert refused and refused[0]["argv"] == override.split()
+    assert srv.fsm.state is not srv.ServerState.HEALTHY, "the hold stays"
+    health = srv._health_payload()["mesh_reset_bmc_guard"]
+    assert health["kind"] == "override_unclassified" and "cannot tell" in health["reason"]
+    # With a classifiable command the same hold lifts only once the full check has passed after it.
+    monkeypatch.delenv("TT_DEVICE_MCP_RESET_ARGS")
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    out = await rig["g"]._reset_and_verify_device(indices, lambda m: None)
+    assert rig["launches"] == [MESH] and preflights == [True] and verifies and all(verifies)
+    assert out is True
+    srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy")
+    _assert_settled(True)

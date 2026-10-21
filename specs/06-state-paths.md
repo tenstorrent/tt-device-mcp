@@ -266,7 +266,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_ALERT_CMD` | unset (off) | Opt-in command run with a stuck-hold event as JSON on stdin | 03 |
 | `TT_DEVICE_MCP_ALERT_TIMEOUT_SEC` | 30 | Alert-hook run timeout | 03 |
 | `TT_DEVICE_MCP_RESET_MODE` | unset (derived from boards) | Declared platform: `galaxy`/`per-target`/`loudbox` | 04 |
-| `TT_DEVICE_MCP_RESET_ARGS` | unset | Full reset-command override (argv) | 04 |
+| `TT_DEVICE_MCP_RESET_ARGS` | unset | Full reset-command override (argv). 04 I91 classifies it: a Galaxy tray reset flag anywhere runs under the ipmitool guard after the BMC preflight; an argv naming neither that flag nor tt-smi is not run | 04 |
 | `TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC` | unset → 0.5 floor | Off-bus fraction below which the gate holds instead of resetting; 0 disables the floor | 04 |
 | `TT_DEVICE_MCP_REBOOT_MIN_DEAD_FRAC` | 0.5 | Dead fraction gating the power cycle (the floor below which it never fires; the name is kept from the removed reboot rung) | 04 |
 | `TT_DEVICE_MCP_AUTO_POWER_CYCLE` | 1 | Arm the BMC power-cycle rung | 04 |
