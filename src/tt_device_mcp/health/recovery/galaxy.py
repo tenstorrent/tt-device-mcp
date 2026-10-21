@@ -1707,18 +1707,30 @@ class GalaxyRecovery(Recovery):
         return False
 
     async def _below_floor_kept_rungs(
-        self, offbus_chips: set, expected: int, log, *, context: str, at_bound: bool = False
+        self,
+        offbus_chips: set,
+        expected: int,
+        log,
+        *,
+        context: str,
+        at_bound: bool = False,
+        sbr_tried: frozenset = frozenset(),
     ) -> Optional[set]:
-        """The kept rungs below the galaxy floor (spec 04 I89): one PCI rescan, then the SBR targets are
-        queued into isolated_chips and reset through their parent bridges (:meth:`_recover_isolated_chips`).
-        Never a mesh reset, and never a release: the caller runs the full check, fabric included.
+        """The kept rungs below the galaxy floor (spec 04 I89): one PCI rescan, then an SBR of the
+        bridged off-bus chips through their parent bridges (:meth:`_recover_isolated_chips`). Never a
+        mesh reset, and never a release: the caller runs the full check, fabric included.
 
-        SBR targets: the chips already isolated (reading all-ones), and a chip absent from both
-        heartbeat reads whose own PCIe node is gone, when TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET is set
-        or ``at_bound`` (the I76 bound runs every kept rung). A chip still enumerated is on the bus
-        (an ARC stall): never SBR'd; the bound's mesh reset covers it.
+        SBR targets are the chips with a bridge the rung can write to: the chips already isolated
+        (reading all-ones), the chips the broker removed (their recorded bridge, I69), and a chip absent
+        from both heartbeat reads whose own PCIe node is gone, only when TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET
+        is set (its bridge is found by the secondary bus). The bound widens nothing: without the opt-in a
+        gone chip has no bridge, so its SBR is skipped and journaled, and the chip is not queued. A chip
+        still enumerated is on the bus (an ARC stall): never SBR'd; the bound's mesh reset covers it.
+        A gone chip this run queued and the rung could not fire on is un-queued again, so no later gate
+        pass reads it as an SBR candidate. ``sbr_tried``: chips the caller's own bridge rung already
+        reset this pass; with no other target, no second SBR runs.
 
-        Returns the chips still off after the rescan, or None when nothing ran (a reset is cycling in
+        Returns the chips still off after the rungs, or None when nothing ran (a reset is cycling in
         its own scope, or a tenant holds the device). A chip the broker removed withholds the bare
         rescan (I69); the SBR resets it first and rescans itself."""
         if await asyncio.to_thread(self.mechanism.scope_active):
@@ -1739,37 +1751,60 @@ class GalaxyRecovery(Recovery):
         isolated = self.deps.isolated_chips()
         if rescan == "ran":
             await asyncio.to_thread(drop_returned_isolated, isolated, f"{context} PCI rescan", log)
-        try:
-            beats = await asyncio.to_thread(self.deps.read_heartbeats)
-        except Exception as exc:  # noqa: BLE001 - an unreadable heartbeat counts every chip off, as the gate does
-            log(f"could not read the heartbeats after the below-floor rescan: {exc!r}")
-            beats = {}
-        still_off = _offbus_chip_ids(beats or {}, expected)
-        queued = []
-        if at_bound or gone_chip_bridge_reset_enabled():
-            pci_map = self.deps.device_pci_map()
-            for c in sorted(set(still_off) & set(offbus_chips), key=int):
-                bdf = pci_map.get(c)
-                if bdf and c not in isolated and not await asyncio.to_thread(chip_node_present, bdf):
-                    queued.append(c)
+
+        async def _still_off() -> set:
+            try:
+                beats = await asyncio.to_thread(self.deps.read_heartbeats)
+            except Exception as exc:  # noqa: BLE001 - an unreadable heartbeat counts every chip off, as the gate does
+                log(f"could not read the heartbeats after the below-floor rungs: {exc!r}")
+                beats = {}
+            return _offbus_chip_ids(beats or {}, expected)
+
+        still_off = await _still_off()
+        gone = []
+        pci_map = self.deps.device_pci_map()
+        for c in sorted(set(still_off) & set(offbus_chips), key=int):
+            bdf = pci_map.get(c)
+            if bdf and c not in isolated and c not in removed_chip_ids():
+                if not await asyncio.to_thread(chip_node_present, bdf):
+                    gone.append(c)
+        queued = gone if gone_chip_bridge_reset_enabled() else []
+        if gone and not queued:
+            log(
+                f"below-floor rungs ({context}): chip(s) {gone} left the bus with no bridge to reset through "
+                "(TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET is off) — SBR skipped"
+            )
+            health_event("below_floor_sbr_skipped", context=context, chips=gone, reason="no_bridge_without_opt_in")
         isolated.update(queued)
-        fired = bool(isolated)
+        targets = (set(isolated) | set(removed_chip_ids())) - set(sbr_tried)
+        fired = sorted(set(isolated) | set(removed_chip_ids()), key=int) if targets else []
+        unqueued = []
         if fired:
             await self._recover_isolated_chips(log)
-            beats = await asyncio.to_thread(self.deps.read_heartbeats)
-            still_off = _offbus_chip_ids(beats or {}, expected)
+            reasons = getattr(self, "last_bridge_reset_reasons", {}) or {}
+            # Spec 04 I89: a queued chip the rung could not fire on (no bridge, gated, no privilege,
+            # withheld) is not an SBR candidate: left isolated, every later gate pass would route to a
+            # no-op bridge rung. A chip still gone is re-detected at the next run.
+            unqueued = [c for c in queued if c in isolated and c in reasons]
+            for c in unqueued:
+                isolated.discard(c)
+            if unqueued:
+                health_event("gone_chip_bridge_reset_unqueued", chips=unqueued, reason="sbr_not_fired")
+            still_off = await _still_off()
         log(
             f"below-floor rungs ({context}): PCI rescan {rescan}; chip(s) {sorted(offbus_chips, key=int)} were off, "
-            f"{sorted(still_off, key=int) or 'none'} still off"
-            + (f"; SBR fired on {sorted(isolated, key=int)}" if fired else "")
+            f"{sorted(still_off, key=int) or 'none'} still off" + (f"; SBR tried on {fired}" if fired else "")
         )
         health_event(
             "below_floor_kept_rungs",
             context=context,
+            at_bound=at_bound,
             rescan=rescan,
             off_before=sorted(offbus_chips, key=int),
             queued=queued,
-            sbr=sorted(isolated, key=int) if fired else [],
+            sbr=fired,
+            sbr_skipped=[c for c in gone if c not in queued],
+            unqueued=unqueued,
             still_off=sorted(still_off, key=int),
             expected=expected,
         )
@@ -1783,7 +1818,10 @@ class GalaxyRecovery(Recovery):
         the I76 bound runs the full ladder at 10 min. Like the bridge rung, a runtime-reported fault is
         kept: a rescan and an SBR re-init no eth core on the other chips."""
         key = (hold_since, frozenset(offbus_set))
-        if self._below_floor_rungs_key == key:
+        prev = self._below_floor_rungs_key
+        if prev is not None and prev[1] == key[1] and prev[0] in (hold_since, None):
+            # The same episode: a pass that ran before the hold had its start time stamped counts.
+            self._below_floor_rungs_key = key
             return OUTCOME_WAITING
         self._below_floor_rungs_key = key
         still_off = await self._below_floor_kept_rungs(offbus_set, expected, log, context=f"gate/{gate_phase}")
@@ -2824,11 +2862,11 @@ class GalaxyRecovery(Recovery):
         # prevent, and the gone-chip settle above can let a scope open after the top guard. Skip it while
         # a scope is live; the galaxy reset below waits that scope out (self.mechanism.await_foreign_scope)
         # and verifies instead.
-        if (
-            isolated_chips
-            and not await asyncio.to_thread(self.mechanism.scope_active)
-            and await self._recover_isolated_chips(log)
-        ):
+        # Spec 04 I89: the chips this rung resets, so the bound's kept rungs below do not SBR them twice.
+        sbr_tried: frozenset = frozenset()
+        if isolated_chips and not await asyncio.to_thread(self.mechanism.scope_active):
+            sbr_tried = frozenset(isolated_chips) | frozenset(removed_chip_ids())
+        if sbr_tried and await self._recover_isolated_chips(log):
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True)
             FABRIC_DEBT.note_evidence(evidence)
             if healthy:
@@ -2888,7 +2926,7 @@ class GalaxyRecovery(Recovery):
                     f"{off_bus_pre} of {expected} chip(s) off the bus — below the galaxy-reset floor "
                     f"({reset_floor}) and the per-chip rung could not recover it; trying the "
                     f"mesh-wide reset before any host rung"
-                    + (" (I76 bound: PCI rescan and SBR first)" if self._bound else "")
+                    + (" (I76 bound: PCI rescan and SBR of the bridged chips first)" if self._bound else "")
                 )
                 health_event(
                     "stuck_hold_galaxy_reset_below_floor_attempt",
@@ -2898,7 +2936,7 @@ class GalaxyRecovery(Recovery):
                     bound=self._bound,
                 )
                 if self._bound and await self._below_floor_bound_rungs(
-                    _offbus_chip_ids(beats_pre or {}, expected), expected, log
+                    _offbus_chip_ids(beats_pre or {}, expected), expected, log, sbr_tried=sbr_tried
                 ):
                     return True
             off_bus_before = off_bus_pre
@@ -2925,14 +2963,16 @@ class GalaxyRecovery(Recovery):
         await self._climb_or_hand_off(expected, off_bus_before, hold_since, log)
         return True
 
-    async def _below_floor_bound_rungs(self, offbus_chips: set, expected: int, log) -> bool:
+    async def _below_floor_bound_rungs(
+        self, offbus_chips: set, expected: int, log, sbr_tried: frozenset = frozenset()
+    ) -> bool:
         """The I76 bound's kept rungs ahead of its one mesh reset (spec 04 I89): PCI rescan, then SBR of
-        every bridged off-bus chip whatever the opt-in. True only when every chip is back and the full
+        the bridged off-bus chips (a gone chip only with the opt-in: see _below_floor_kept_rungs). True only when every chip is back and the full
         check with fabric passed: the caller then skips the mesh reset. Otherwise the ladder goes on: the
         mesh reset when this hold has not spent it, else the climb's last-chance sweep (I87), then the
         host rung."""
         still_off = await self._below_floor_kept_rungs(
-            offbus_chips, expected, log, context="I76 bound ladder", at_bound=True
+            offbus_chips, expected, log, context="I76 bound ladder", at_bound=True, sbr_tried=sbr_tried
         )
         if still_off is None or still_off:
             return False

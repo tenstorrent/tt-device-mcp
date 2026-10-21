@@ -7,22 +7,33 @@ At the gate the hold gets one PCI rescan at once, and an SBR only for the chips 
 (an isolated chip, or a chip gone from the bus when TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET is set),
 once per hold episode and off-bus set. Only a passing full check, fabric included, lifts it.
 
-At the 10-min bound (I76) the ladder runs every kept rung in order: PCI rescan, SBR of every chip
-gone from the bus whatever the opt-in, its one mesh reset, the full check with fabric, then the power
-cycle. A chip still enumerated is on the bus: never SBR'd, the mesh reset covers it. Below the bound a
-forced run keeps its own path (the mesh reset, no rescan or SBR: the gate ran those at once). No test
-reaches a real reset or power cycle."""
+At the 10-min bound (I76) the ladder runs every kept rung in order: PCI rescan, SBR of the bridged
+off-bus chips (an isolated or broker-removed chip, or a gone chip with the opt-in: without it a gone chip
+has no bridge, so no SBR is tried and it is not queued), its one mesh reset, the full check with fabric,
+then the power cycle. A chip still enumerated is on the bus: never SBR'd, the mesh reset covers it.
+Below the bound a forced run keeps its own path (the mesh reset, no rescan or SBR: the gate ran those at
+once). No test reaches a real reset, setpci or power cycle."""
 
+import pathlib
 from datetime import datetime, timedelta
 
 import pytest
 
 from tests.conftest import patch_health_event, patch_recovery
-from tests.test_device_safety import _arm_offbus_stuck_hold
+from tests.test_device_safety import _arm_offbus_stuck_hold, _rung
 from tests.test_fabric_topology_mismatch import _LOST, topo  # noqa: F401 - the fixture
 from tt_device_mcp import server as srv
+from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.monitors import pci
-from tt_device_mcp.health.recovery import OUTCOME_RECOVERED, OUTCOME_TERMINAL, OUTCOME_WAITING, galaxy, pcie_guard
+from tt_device_mcp.health.recovery import (
+    OUTCOME_RECOVERED,
+    OUTCOME_TERMINAL,
+    OUTCOME_WAITING,
+    STAGE_BRIDGE_RESET,
+    galaxy,
+    pcie_guard,
+)
+from tt_device_mcp.health.recovery.stages import bridge_reset as bridge
 
 GONE = "31"
 ALL = {str(i): 100 for i in range(32)}
@@ -127,10 +138,21 @@ async def _gate():
 
 
 @pytest.mark.asyncio
-async def test_the_bound_runs_every_kept_rung_in_order_then_the_power_cycle(monkeypatch, tmp_path, clear_job_state):
-    order, events, counters = _rig(monkeypatch, tmp_path)
+@pytest.mark.parametrize(
+    "opt_in, expected_order",
+    [
+        # No bridge for a gone chip without the opt-in: no SBR is tried.
+        (False, ["rescan", "mesh reset", "full check", "power cycle"]),
+        # Opted in, the stuck-hold ladder's own bridge rung SBRs it first; the bound does not repeat it.
+        (True, ["sbr ['31']", "rescan", "mesh reset", "full check", "power cycle"]),
+    ],
+)
+async def test_the_bound_runs_every_kept_rung_in_order_then_the_power_cycle(
+    monkeypatch, tmp_path, clear_job_state, opt_in, expected_order
+):
+    order, events, counters = _rig(monkeypatch, tmp_path, opt_in=opt_in)
     assert await _bound_ladder() == OUTCOME_TERMINAL
-    assert order == ["rescan", "sbr ['31']", "mesh reset", "full check", "power cycle"]
+    assert order == expected_order
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a failed check never lifts"
     hold_since = srv.device_hold_episode_since
     assert srv.recovery_mechanism.rung_failed_unchanged(hold_since, "mesh_reset", {GONE}), "I58 record kept"
@@ -143,11 +165,14 @@ async def test_the_bound_rescans_and_sbrs_before_the_cycle_after_a_failed_mesh_r
     """An earlier forced run below the bound does not stand in for the bound's ladder: the bound runs
     the rescan and SBR again before the power cycle. The mesh reset that already failed on the same
     chips is not repeated (one per episode, I87; no sweep repeat of it, I22)."""
-    order, _events, _counters = _rig(monkeypatch, tmp_path)
-    hold_since = srv.device_hold_episode_since
-    srv.recovery_mechanism.note_rung_failed(hold_since, "mesh_reset", {GONE}, {GONE}, rc=1)
-    await _bound_ladder()
-    assert order == ["rescan", "sbr ['31']", "power cycle"]
+    for opt_in, expected_order in ((True, ["rescan", "sbr ['31']", "power cycle"]), (False, ["rescan", "power cycle"])):
+        (tmp_path / str(opt_in)).mkdir()
+        order, _events, _counters = _rig(monkeypatch, tmp_path / str(opt_in), opt_in=opt_in)
+        srv.isolated_chips.clear()
+        hold_since = srv.device_hold_episode_since
+        srv.recovery_mechanism.note_rung_failed(hold_since, "mesh_reset", {GONE}, {GONE}, rc=1)
+        await _bound_ladder()
+        assert order == expected_order, f"opt_in={opt_in}"
 
 
 @pytest.mark.asyncio
@@ -165,7 +190,10 @@ async def test_a_forced_run_below_the_bound_skips_a_mesh_reset_that_already_fail
 async def test_sbr_that_heals_at_the_bound_lifts_on_the_full_check_with_no_mesh_reset(
     monkeypatch, tmp_path, clear_job_state
 ):
-    order, _events, counters = _rig(monkeypatch, tmp_path, sbr_heals=True, verdicts=[True])
+    """Bridged chips only: the gone chip here has the opt-in. The mesh reset is already spent (I87), so
+    the bound's own rescan and SBR run, not the stuck-hold ladder's bridge rung."""
+    order, _events, counters = _rig(monkeypatch, tmp_path, opt_in=True, sbr_heals=True, verdicts=[True])
+    srv.recovery_mechanism.note_rung_failed(srv.device_hold_episode_since, "mesh_reset", {GONE}, {GONE}, rc=1)
     await _bound_ladder()
     assert order == ["rescan", "sbr ['31']", "full check"], "the shortest path: no mesh reset, no power cycle"
     assert counters["dirty_cleared"] == 1, "lifted once, on the passing full check"
@@ -173,7 +201,7 @@ async def test_sbr_that_heals_at_the_bound_lifts_on_the_full_check_with_no_mesh_
 
 @pytest.mark.asyncio
 async def test_an_enumerated_chip_is_never_sbrd_even_at_the_bound(monkeypatch, tmp_path, clear_job_state):
-    order, _events, _counters = _rig(monkeypatch, tmp_path, enumerated=True)
+    order, _events, _counters = _rig(monkeypatch, tmp_path, opt_in=True, enumerated=True)
     await _bound_ladder()
     assert order == ["rescan", "mesh reset", "full check", "power cycle"]
 
@@ -204,7 +232,7 @@ async def test_below_the_bound_a_mesh_reset_that_failed_on_the_same_chips_climbs
     order.clear()
     srv.device_hold_episode_since = (datetime.now() - timedelta(minutes=10, seconds=5)).isoformat()
     await _bound_ladder()
-    assert order == ["rescan", "sbr ['31']", "power cycle"], "the bound adds the rescan and SBR, no second reset"
+    assert order == ["rescan", "power cycle"], "the bound adds the rescan (no bridge: no SBR), no second reset"
 
 
 @pytest.mark.asyncio
@@ -230,7 +258,7 @@ async def test_a_cooldown_denial_at_the_bound_still_runs_the_ladder_and_arms_the
 
     monkeypatch.setattr(rm, "auto_recovery_allowed", allowed)
     await _bound_ladder()
-    assert order == ["rescan", "sbr ['31']", "mesh reset", "full check"], "every rung ran; the cycle waits"
+    assert order == ["rescan", "mesh reset", "full check"], "every rung ran; the cycle waits"
     assert rm.power_cycle_retry is not None and not rm.power_cycle_retry_due(until - 1)
     assert rm.power_cycle_retry_due(until), "asked again the moment the cooldown ends"
     state["cooling"] = False
@@ -239,6 +267,98 @@ async def test_a_cooldown_denial_at_the_bound_still_runs_the_ladder_and_arms_the
     monkeypatch.setattr(srv, "_bound_tenant_blocker", lambda *a: None)
     await srv._hold_bound_host_rung(601, lambda m: None)
     assert order == ["power cycle"], "the cooldown's end goes straight to the power cycle, no second ladder"
+
+
+def _real_bridge_rung(monkeypatch, tmp_path):
+    """Undo _rig's fake: the real _recover_isolated_chips and reset_chip_via_bridge run, against a fake
+    sysfs where chip 31's bridge (0000:40:1f.0) is still enumerated with chip 31's bus as its secondary
+    bus and chip 31's own node is gone. Returns ``spy``: the bridge lookups by secondary bus, the setpci
+    argvs and the global rescans."""
+    for inst in (srv.galaxy_recovery, srv.per_target_recovery):
+        monkeypatch.delattr(inst, "_recover_isolated_chips", raising=False)
+    spy = {"find": [], "setpci": [], "rescan": 0}
+    real_find = bridge.find_bridge_by_secondary_bus
+
+    def find(bdf):
+        spy["find"].append(bdf)
+        return real_find(bdf)
+
+    def setpci(argv, *a, **k):
+        spy["setpci"].append(list(argv))
+        out = "0000" if argv[-1] == "BRIDGE_CONTROL" else ""
+        return bridge.subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    real_write = pathlib.Path.write_text
+
+    def write_text(path, data, *a, **k):
+        if str(path) == "/sys/bus/pci/rescan":
+            spy["rescan"] += 1
+            return len(data)
+        return real_write(path, data, *a, **k)
+
+    br = pci.PCI_DEVICES_DIR / "0000:40:1f.0"
+    br.mkdir()
+    (br / "secondary_bus_number").write_text(str(0x5F) + "\n")
+    cls = tmp_path / "class"
+    cls.mkdir()
+    monkeypatch.setattr(pci, "SYSFS_CLASS_DIR", cls)
+    monkeypatch.setattr(bridge, "find_bridge_by_secondary_bus", find)
+    monkeypatch.setattr(bridge.subprocess, "run", setpci)
+    monkeypatch.setattr(bridge.time, "sleep", lambda s: None)
+    monkeypatch.setattr(pathlib.Path, "write_text", write_text)
+    monkeypatch.setattr(recovery_pkg, "bridge_reset_enabled", lambda: True)
+    monkeypatch.setattr(recovery_pkg, "BRIDGE_RESET_SETTLE_SEC", 0)
+    monkeypatch.setattr(srv, "_set_device_op_detail", lambda d: None)
+    return spy
+
+
+@pytest.mark.asyncio
+async def test_without_the_opt_in_the_bound_tries_no_sbr_on_a_gone_chip_and_queues_nothing(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The review finding: the bound used to queue a gone chip whatever the opt-in, the real rung found
+    no bridge (no SBR fired) and the chip stayed isolated, so every later gate pass went to a no-op
+    bridge rung. Now: no bridge lookup, no setpci, nothing queued, and the next pass does not route to
+    the bridge rung."""
+    order, events, _counters = _rig(monkeypatch, tmp_path)
+    spy = _real_bridge_rung(monkeypatch, tmp_path)
+    srv.isolated_chips.clear()
+    for spent in (False, True):  # the floor branch, then the I87 spent-reset branch
+        if spent:
+            srv.recovery_mechanism.note_rung_failed(srv.device_hold_episode_since, "mesh_reset", {GONE}, {GONE}, rc=1)
+        order.clear()
+        await _bound_ladder()
+        assert spy["find"] == [] and spy["setpci"] == [], "no SBR is tried on a gone chip without the opt-in"
+        assert srv.isolated_chips == set(), "the bound leaves isolated_chips as it found it"
+        assert "below_floor_sbr_skipped" in events, "the skipped SBR is journaled"
+        assert order[0] == "rescan" and order[-1] == "power cycle"
+    stage = _rung(monkeypatch, srv.galaxy_recovery.deps, off_bus=1, sbr_candidates=len(srv.isolated_chips))
+    assert stage != STAGE_BRIDGE_RESET, "the next gate pass is not sent to a no-op bridge rung"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["opt_in", "recorded_bridge"])
+async def test_a_bridged_gone_chip_reaches_the_bridge_write_at_the_bound(monkeypatch, tmp_path, clear_job_state, case):
+    """The real rung: an opted-in gone chip resolves its bridge by the secondary bus; a chip the broker
+    removed resets through the bridge it recorded (I69). Either way the SBR write reaches the bridge.
+    The mesh reset is spent (I87), so only the bound's kept rungs reset it."""
+    order, events, _counters = _rig(monkeypatch, tmp_path, opt_in=case == "opt_in")
+    spy = _real_bridge_rung(monkeypatch, tmp_path)
+    srv.isolated_chips.clear()
+    if case == "recorded_bridge":
+        # The record isolate_chip leaves when the broker removes a chip (I69), with no state file.
+        monkeypatch.setattr(pci, "_save_removed_chips", lambda: None)
+        monkeypatch.setitem(pci.REMOVED_CHIPS, GONE, {"bdf": "0000:5f:00.0", "bridge": "0000:40:1f.0"})
+    srv.recovery_mechanism.note_rung_failed(srv.device_hold_episode_since, "mesh_reset", {GONE}, {GONE}, rc=1)
+    await _bound_ladder()
+    writes = [a for a in spy["setpci"] if a[-1].startswith("BRIDGE_CONTROL=")]
+    assert writes and all(a[2] == "0000:40:1f.0" for a in writes), spy["setpci"]
+    if case == "opt_in":
+        assert spy["find"] and set(spy["find"]) == {"0000:5f:00.0"}, "found by the secondary bus (once per try)"
+        assert order[0] == "rescan"
+    else:
+        assert order[0] != "rescan", "a removed chip withholds the bare rescan (I69)"
+    assert order[-1] == "power cycle", "still off after the SBR: the ladder goes on"
 
 
 # --- the gate -----------------------------------------------------------------------------------
@@ -263,6 +383,21 @@ async def test_the_gate_sbrs_a_gone_chip_when_opted_in_once_per_episode_and_set(
     srv.device_hold_episode_since = datetime.now().isoformat()  # a new episode
     await _gate()
     assert order[0] == "rescan"
+
+
+@pytest.mark.asyncio
+async def test_a_gate_pass_before_the_hold_start_is_stamped_counts_for_its_episode(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The latch keys on the hold's start time, which the first pass may not have yet: once it is
+    stamped, the same off-bus set does not run the rungs a second time."""
+    order, _events, _counters = _rig(monkeypatch, tmp_path)
+    srv.device_hold_episode_since = None
+    assert await _gate() == OUTCOME_WAITING and order == ["rescan"]
+    order.clear()
+    srv.device_hold_episode_since = datetime.now().isoformat()
+    assert await _gate() == OUTCOME_WAITING
+    assert order == [], "the same episode and set: no second rescan"
 
 
 @pytest.mark.asyncio
