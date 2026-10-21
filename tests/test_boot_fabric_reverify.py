@@ -85,7 +85,6 @@ def _broker(monkeypatch, tmp_path, fsm, verdict=_FABRIC_77):
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
     monkeypatch.setattr(srv, "_fabric_77_streak", 0)
     monkeypatch.setattr(srv, "_fabric_77_paged_since", None)
-    monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", 0.0)
     monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
     events = []
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append((name, k)))
@@ -156,8 +155,8 @@ async def test_the_reopened_hold_lifts_on_a_healthy_relift(monkeypatch, tmp_path
 async def test_a_reopened_hold_that_77s_again_is_held_without_a_reset_then_bounded(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """Another 77 holds it (no reset), and the I40 bound still ends it: past its retries the startup
-    checks gate it and a healthy eth read releases it."""
+    """Another 77 holds it (no reset), and the I40 bound still ends it: past its retries the ladder
+    climbs, even on a healthy eth read, since the startup checks never lift a hold (03 I78)."""
     _events, seen = await _reopened(monkeypatch, tmp_path)
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_RELIFT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "2")
@@ -175,8 +174,8 @@ async def test_a_reopened_hold_that_77s_again_is_held_without_a_reset_then_bound
 
     monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
     await srv._attempt_idle_relift()
-    assert seen["resets"] == 0 and seen["rungs"] == []
-    assert srv.fsm.state is ServerState.HEALTHY, "the I40 bound releases on the startup checks"
+    assert seen["resets"] == 0 and seen["rungs"] == ["present"]
+    assert srv.fsm.state is ServerState.RECOVERING, "the I40 bound climbs; it never releases unverified"
 
 
 @pytest.mark.asyncio

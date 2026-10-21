@@ -12,6 +12,7 @@ holds the value, so a probe here is a file read and nothing reaches the chip.
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -241,6 +242,60 @@ def chip_sample() -> dict:
 
 SAMPLE_FIELDS = list(_VOLATILE) + ["aer_correctable", "aer_fatal"]
 
+_BDF = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
+
+
+def _uncorrectable_aer(dev: Path) -> Optional[int]:
+    """Uncorrectable (non-fatal + fatal) AER errors the kernel has counted on one PCI function: its
+    own ``aer_dev_nonfatal``/``aer_dev_fatal`` and, on a root port, the ``aer_rootport_total_err_*``
+    messages it received from below. None when no counter could be read. Correctable errors are
+    left out on purpose: they are routine on a healthy link and would arm the watch all day."""
+    total, seen = 0, False
+    for name in ("aer_dev_nonfatal", "aer_dev_fatal"):
+        p = dev / name
+        if p.exists():
+            v = _sum_aer(p)
+            if v is not None:
+                total, seen = total + v, True
+    for name in ("aer_rootport_total_err_nonfatal", "aer_rootport_total_err_fatal"):
+        try:
+            total += int((dev / name).read_text().strip())
+            seen = True
+        except (OSError, ValueError):
+            continue
+    return total if seen else None
+
+
+def link_signals() -> dict:
+    """The kernel's own record of PCIe trouble on every chip's path, for the sampler's early
+    off-bus watch (spec 03 I79): ``{"chips": [index, ...], "aer": {bdf: uncorrectable total}}``.
+
+    ``chips`` is the KMD node list; ``aer`` covers each chip's endpoint and every port above it up
+    to the root port, keyed by PCI address, so a link drop the port above a chip counted shows
+    even when the chip's own counters did not move (a vanished node is its own signal). Every value here is a counter the kernel keeps in memory:
+    no read reaches a chip, a switch or a config space, which is what makes it safe to take every
+    second while a chip may be dying (an access at a dead endpoint is what stalls a CPU core). The
+    link-state attributes (``current_link_speed``/``width``) are config reads and stay out."""
+    chips: list = []
+    aer: dict = {}
+    try:
+        entries = sorted(SYSFS_CLASS_DIR.iterdir())
+    except OSError:
+        return {"chips": chips, "aer": aer}
+    for ent in entries:
+        idx = ent.name.rsplit("!", 1)[-1]
+        if not idx.isdigit():
+            continue
+        chips.append(idx)
+        try:
+            dev = (ent / "device").resolve()
+        except OSError:
+            continue
+        while _BDF.match(dev.name) and dev.name not in aer:
+            aer[dev.name] = _uncorrectable_aer(dev)
+            dev = dev.parent
+    return {"chips": chips, "aer": aer}
+
 
 def chip_pci_bdf(idx: str) -> Optional[str]:
     """The PCI address behind a chip index, e.g. '0000:46:00.0'."""
@@ -294,6 +349,41 @@ def pci_bus_number(address) -> Optional[int]:
         return None
 
 
+# Chips this broker cut out of the kernel itself (isolate_chip), chip index -> {"bdf", "bridge"}.
+# Once the endpoint's node is removed its parent link is gone with it, so the bridge a reset must
+# go through is recorded HERE, before the remove. A chip in this map is hung AND un-enumerated by
+# us: re-enumerating it without a reset first lets the driver probe a hung chip (spec 04 I69).
+REMOVED_CHIPS: dict = {}
+
+_BDF_RE = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]")
+
+
+def parent_bridge(bdf: Optional[str]) -> Optional[str]:
+    """The BDF of the bridge directly above an enumerated endpoint, or None."""
+    if not bdf:
+        return None
+    try:
+        bridge = (PCI_DEVICES_DIR / bdf).resolve().parent.name
+    except OSError:
+        return None
+    return bridge if _BDF_RE.fullmatch(bridge) else None
+
+
+def removed_chip(idx) -> Optional[dict]:
+    """The record isolate_chip left for a chip it removed, or None when the broker did not remove it."""
+    return REMOVED_CHIPS.get(str(idx))
+
+
+def removed_chip_ids() -> list:
+    """Every chip that still has a removal record, sorted by index."""
+    return sorted(REMOVED_CHIPS, key=int)
+
+
+def forget_removed_chip(idx) -> None:
+    """Drop the removal record of a chip that is back on the bus."""
+    REMOVED_CHIPS.pop(str(idx), None)
+
+
 def isolate_chip(idx: str) -> bool:
     """Remove a dead chip from the kernel, so nothing on the box can reach it any more.
 
@@ -314,10 +404,13 @@ def isolate_chip(idx: str) -> bool:
         # A silent False here reads as "isolated" to the caller; journal it as the hazard.
         evidence.health_event("chip_isolation_failed", chip=idx, reason="no_pci_bdf", host_at_risk=True)
         return False
+    # Record the bridge BEFORE the remove: afterwards the node and its parent link are gone.
+    REMOVED_CHIPS[str(idx)] = {"bdf": bdf, "bridge": parent_bridge(bdf)}
     try:
         (PCI_DEVICES_DIR / bdf / "remove").write_text("1")
         return True
     except OSError as e:
+        forget_removed_chip(idx)
         evidence.health_event(
             "chip_isolation_failed", chip=idx, bdf=bdf, reason="remove_write_failed", error=str(e), host_at_risk=True
         )

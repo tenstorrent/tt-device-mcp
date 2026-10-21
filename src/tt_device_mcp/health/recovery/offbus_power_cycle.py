@@ -36,6 +36,8 @@ the attempt against the rate limit.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import os
 import shlex
@@ -401,10 +403,56 @@ def note_ladder_ran(episode: str) -> None:
         return
     _track(episode)
     _pending["ladder_ran"] = True
+    if _PARTIAL_PASS.get() == episode:
+        _pending["partial_reset"] = True  # the lifted pass reached its rungs: spent, whatever its outcome
 
 
 def ladder_ran(episode: str) -> bool:
     return _pending.get("episode") == episode and bool(_pending.get("ladder_ran"))
+
+
+def partial_reset_due(episode: str, now: Optional[datetime] = None) -> bool:
+    """True once per episode when, with the power cycle configured, a gated hold has run its ladder and
+    outlived its grace and has not had its one lifted pass yet: a partial off-bus drop then gets the
+    ladder's own rungs (the mesh reset included) with the gate lifted before the power cycle (spec 04
+    I27). A whole tray down never gets it; the caller decides that."""
+    if not episode or _pending.get("episode") != episode or _pending.get("partial_reset"):
+        return False
+    if not (_pending.get("gated") and _pending.get("ladder_ran")):
+        return False
+    age = episode_age_sec(episode, now)
+    return age is not None and age >= grace_sec()
+
+
+_PARTIAL_PASS: contextvars.ContextVar = contextvars.ContextVar("tt_device_mcp_partial_pass", default="")
+
+
+@contextlib.contextmanager
+def partial_pass(episode: str):
+    """Scope this episode's one lifted pass (spec 04 I27). It is spent only once its climb has passed
+    the climb's own guards (ceiling, latch, reset scope, tenant, cooldown) and reaches the rungs
+    (:func:`note_ladder_ran`): a climb those guards decline leaves it due, so the mesh reset is never
+    skipped on the way to the power cycle. A spent pass that leaves the hold standing re-arms the
+    watchdog once (:func:`rearm_after_partial_reset`). With no power cycle configured the lift is the
+    I33 operator hand-off's, not this pass: nothing is tracked."""
+    if power_cycle_argv() is None:
+        yield
+        return
+    token = _PARTIAL_PASS.set(episode)
+    try:
+        yield
+    finally:
+        _PARTIAL_PASS.reset(token)
+        rearm_after_partial_reset(episode)
+
+
+def rearm_after_partial_reset(episode: str) -> None:
+    """The lifted pass ran and ended with the hold still standing: the watchdog forces one more pass,
+    which fires the power cycle, instead of waiting for the next ceiling window (once per episode). A
+    pass that never reached its rungs re-arms nothing."""
+    if _pending.get("episode") == episode and _pending.get("partial_reset") and not _pending.get("partial_rearmed"):
+        _pending["partial_rearmed"] = True
+        _pending["spawned"] = False
 
 
 def hold_handoff_sec() -> Optional[int]:
@@ -524,6 +572,31 @@ def due_for_watchdog(episode: str, now: Optional[datetime] = None) -> bool:
         return True
     age = episode_age_sec(episode, now)
     return bool(_pending.get("gated")) and age is not None and age >= grace_sec()
+
+
+def watchdog_due_at(episode: str) -> Optional[tuple[float, str]]:
+    """``(epoch, kind)``: when :func:`due_for_watchdog` turns true for this episode and the bound that
+    turns it, named as the hold watchdog names it; the earliest when several are armed. None when it
+    never will as things stand (not tracked, already spawned, the ladder has not run, nothing armed).
+    Read-only, for the /health hold report (spec 04 I75): moves no clock."""
+    if not episode or _pending.get("episode") != episode or _pending.get("spawned"):
+        return None
+    if power_cycle_argv() is None:
+        h = _pending.get("handoff")
+        return (float(h["deadline"]), "gated_hold_handoff_bound") if h and h["deadline"] else None
+    if not _pending.get("ladder_ran"):
+        return None
+    out = []
+    if _pending.get("ipmi_at") is not None:
+        out.append((_pending["ipmi_at"].timestamp() + ipmi_handoff_sec(), "ipmi_handoff_bound"))
+    if _pending.get("tray_walk_at") is not None:
+        out.append((_pending["tray_walk_at"].timestamp() + tray_walk_handoff_sec(), "tray_walk_handoff_bound"))
+    if _pending.get("gated"):
+        try:
+            out.append((datetime.fromisoformat(episode).timestamp() + grace_sec(), "gated_offbus_grace"))
+        except (TypeError, ValueError):
+            pass
+    return min(out) if out else None
 
 
 def mark_spawned(episode: str) -> None:
