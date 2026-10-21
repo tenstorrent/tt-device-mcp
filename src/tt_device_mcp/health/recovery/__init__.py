@@ -30,7 +30,7 @@ from tt_device_mcp.device_holders import HolderScan, is_tenant
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitors import fabric, pci
-from tt_device_mcp.health.monitors.heartbeat import arc_not_ready_chips, offbus_count
+from tt_device_mcp.health.monitors.heartbeat import arc_live_chips, arc_not_ready_chips, offbus_count
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import pcie_guard
 from tt_device_mcp.health.recovery.base import (
@@ -81,6 +81,11 @@ BRIDGE_RESET_SETTLE_SEC = 4
 # The bridge rung's reason for a removed chip whose every recorded-bridge SBR fired and left it off
 # the bus (spec 04 I69): no SBR brings it back, the same no-window fact as no_bridge.
 NO_WINDOW_REMOVED_REASON = "removed_not_reenumerated"
+# Spec 04 I94: a chip the bridge rung brought back counts recovered only once its ARC heartbeat reads
+# as a counter. A live chip reads on the first try; this bounds the wait for one whose ARC is still
+# coming up. One that stays dead stays isolated, so the off-bus one-shot climbs past it.
+BRIDGE_RESET_ARC_WAIT_SEC = 5.0
+BRIDGE_RESET_ARC_POLL_SEC = 0.5
 
 # A reset returns before the eth links re-train, so the immediate post-reset fabric pass can find
 # no trained link (77). Retry (see Recovery._verify_device_after_reset), giving the links time to
@@ -567,7 +572,6 @@ class Recovery(ABC):
                 # Reset above and back on the bus from the pass's rescan (or a later chip's).
                 pci.forget_removed_chip(idx)
                 recovered.append(idx)
-                metrics.stage_fired("bridge_reset", "ok")
                 continue
             if not sbr:
                 inapplicable.append(idx)
@@ -608,7 +612,6 @@ class Recovery(ABC):
                 result = await asyncio.to_thread(reset_chip_via_bridge, idx, bdf)
                 if result:
                     recovered.append(idx)
-                    metrics.stage_fired("bridge_reset", "ok")
                     break
                 if result is None:
                     inapplicable.append(idx)
@@ -631,7 +634,15 @@ class Recovery(ABC):
                     self.last_bridge_reset_reasons[idx] = {"reason": NO_WINDOW_REMOVED_REASON}
                 metrics.stage_fired("bridge_reset", "failed")
 
+        # Spec 04 I94: back on the bus is not recovered. A chip re-enumerated with its ARC dead stays
+        # isolated and still dead, so the rung fails and the off-bus one-shot escalates past it.
+        arc_dead = await self._arc_dead_after_bridge_reset(recovered, log)
+        recovered = [i for i in recovered if i not in arc_dead]
+        lost.extend(arc_dead)
+        for idx in arc_dead:
+            metrics.stage_fired("bridge_reset", "failed")
         for idx in recovered:
+            metrics.stage_fired("bridge_reset", "ok")
             isolated_chips.discard(idx)
         # An inapplicable chip is NOT recovered — it stays isolated and forces the not-recovered
         # branch, so an all-gone mesh (every chip no_bridge) can never read as healed and release.
@@ -662,7 +673,7 @@ class Recovery(ABC):
                 f"PCI rescan withheld ({withhold}) for chip(s) {still_dead}: re-enumerating a hung chip "
                 f"that was not reset can take the host down; they stay isolated, escalating to a heavier rung"
             )
-        if still_dead and not withhold:
+        if still_dead and not withhold and set(still_dead) - set(arc_dead):
             # Cheapest rung there is, and the one that was missing: a bare PCI rescan. A chip with no
             # parent bridge is not necessarily a departed ASIC — measured twice on this host, the
             # endpoint was still in lspci AND still bound to the driver, and only its /dev node was
@@ -676,9 +687,15 @@ class Recovery(ABC):
             except OSError as e:
                 log(f"PCI rescan could not run ({e}); falling through to the heavier rungs")
             else:
-                back = [i for i in still_dead if Path(f"{pci.SYSFS_CLASS_DIR}/tenstorrent!{i}").exists()]
+                # A rescan cannot revive a chip already on the bus with its ARC dead (I94).
+                back = [
+                    i
+                    for i in still_dead
+                    if i not in arc_dead and Path(f"{pci.SYSFS_CLASS_DIR}/tenstorrent!{i}").exists()
+                ]
                 # The rescan may bring back more than the chips this pass targeted.
-                back = sorted(set(back) | set(drop_returned_isolated(isolated_chips, "PCI rescan", log)), key=int)
+                others = isolated_chips - set(arc_dead)
+                back = sorted(set(back) | set(drop_returned_isolated(others, "PCI rescan", log)), key=int)
                 if back:
                     for idx in back:
                         isolated_chips.discard(idx)
@@ -696,9 +713,14 @@ class Recovery(ABC):
                     f"chip(s) {sorted(inapplicable, key=int)} have no bridge to reset — they left "
                     f"the bus, so the per-chip rung cannot reach them; escalating to a heavier rung."
                 )
-            if lost:
+            if arc_dead:
                 log(
-                    f"chip(s) {lost} did NOT come back from a bridge reset after "
+                    f"chip(s) {arc_dead} came back on the bus with no live ARC heartbeat after "
+                    f"{BRIDGE_RESET_ARC_WAIT_SEC:g}s: not recovered, they stay isolated; escalating to a heavier rung."
+                )
+            if set(lost) - set(arc_dead):
+                log(
+                    f"chip(s) {[i for i in lost if i not in arc_dead]} did NOT come back from a bridge reset after "
                     f"{BRIDGE_RESET_MAX_TRIES} tries; they stay out of the kernel so they cannot take "
                     f"the host down. Escalating to a galaxy reset — they re-enumerate on the next PCI "
                     f"rescan, no power-cycle required."
@@ -706,6 +728,22 @@ class Recovery(ABC):
             return False
         log(f"chip(s) {recovered} are back on the bus and bound to the driver")
         return True
+
+    async def _arc_dead_after_bridge_reset(self, chips: list, log) -> list:
+        """Spec 04 I94: of the chips the bridge rung brought back on the bus, those whose ARC heartbeat
+        still does not read as a counter after BRIDGE_RESET_ARC_WAIT_SEC. Reads only; a live chip costs
+        one heartbeat read and no wait."""
+        pending = sorted(chips, key=int)
+        for attempt in range(int(BRIDGE_RESET_ARC_WAIT_SEC / BRIDGE_RESET_ARC_POLL_SEC) + 1):
+            if not pending:
+                break
+            if attempt:
+                await asyncio.sleep(BRIDGE_RESET_ARC_POLL_SEC)
+            live = set(await asyncio.to_thread(arc_live_chips, pending))
+            pending = [i for i in pending if i not in live]
+        if pending:
+            health_event("bridge_reset_arc_dead", chips=pending, wait_sec=BRIDGE_RESET_ARC_WAIT_SEC)
+        return pending
 
     def _fabric_ran_but_unverified(self, evidence: dict) -> bool:
         """A 77: the fabric traffic pass RAN but tested no trained link — the ``fabric`` key is present

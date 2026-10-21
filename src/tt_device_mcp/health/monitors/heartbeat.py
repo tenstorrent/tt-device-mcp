@@ -196,6 +196,17 @@ def returned_chips(ids) -> list[str]:
     return sorted(back, key=int)
 
 
+def arc_live_chips(ids) -> list[str]:
+    """Of ``ids``, the chips whose ARC heartbeat reads as a counter now: not all-ones, not an
+    ENODATA (ARC not ready) or other failed read. Stricter than :func:`returned_chips`: a chip a
+    bridge reset re-enumerated with its ARC dead is back on the bus but not recovered (spec 04 I94)."""
+    want = {str(i) for i in ids}
+    if not want:
+        return []
+    beats = read_heartbeats()
+    return sorted((i for i in want if i in beats and beats[i] != ALL_ONES), key=int)
+
+
 def heartbeat_absence_reason() -> Optional[str]:
     """Why read_heartbeats() came back empty, or None if a heartbeat is exposed.
 

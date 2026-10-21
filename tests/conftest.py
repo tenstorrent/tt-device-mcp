@@ -554,6 +554,9 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     monkeypatch.setattr(srv, "_fabric_ok_retire_monotonic", 0.0)
     monkeypatch.setattr(srv, "_fabric_ok_retire_streak", 0)
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRY_SLEEP_SEC", 0.0)  # no real eth-training wait in tests
+    # Spec 04 I94: a chip a stubbed bridge reset brings back has a live ARC unless the test says not
+    # (tests/test_bridge_reset_arc_dead.py reads real fake-sysfs heartbeats).
+    monkeypatch.setattr(recovery_pkg, "arc_live_chips", lambda ids: sorted({str(i) for i in ids}, key=int))
     monkeypatch.setattr(
         recovery_galaxy, "_settle_before_host_rung_sec", lambda: 0
     )  # no real pre-host-rung settle in tests
