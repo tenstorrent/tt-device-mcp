@@ -62,6 +62,42 @@ tt-device-mcp watch                               # live status, redraws in plac
 
 Job ids are three digits, `000`–`999`, reused once nothing live holds one.
 
+### No timeout except on contention
+
+```bash
+tt-device-mcp run-bg --no-timeout-except-on-contention -t 600 "python serve.py"
+```
+
+`-t` (x) is the job's time limit. While no other job is waiting, the job is never
+stopped for time, before or after x. Once x has passed and another job is waiting,
+the job has one minute to see the waiter and end itself; the broker sends it no
+signal in that minute. The minute starts at the later of x and the waiting job's
+arrival. If a job is still waiting when the minute runs out, the broker kills the
+job's whole process tree (SIGTERM, then SIGKILL at most 10 s later). The job ends
+`preempted`. If the job returns 0, either by ending itself inside the minute or by
+handling SIGTERM so that every process exits through its own code with status 0 (read from
+the kernel's exit records, past the job wrapper's own `exit 143`; the job then reports exit
+code 0), no health check and no reset run before the next job (unless the device was already held or owed a reset for
+another reason). A frozen eth core left by such a job is then caught by the next job,
+within its runtime or the 300 s silent-hang limit; a fault the health sampler or the output
+scan sees still holds the device. If every process of the job exits through its own code on SIGTERM with
+another exit status, or one the broker cannot prove (it reads this from the kernel's exit
+records, which may need root), the usual fast between-jobs check runs. Otherwise (SIGKILL needed, any process killed by a
+signal, or the exits could not be witnessed) the device is reset and passes the full
+health check, fabric included, before the waiting job starts. If every waiting job
+leaves inside the minute, nothing happens and a later one starts a fresh minute. A job
+that queues before x waits until x.
+
+Status (`tt-device-mcp status`, the job's status, `/health`) shows the job as
+`PREEMPTABLE <x>min` while it runs, and `PREEMPTING <s>s`, the seconds left before
+the kill, during that minute.
+
+**If you use this option, you must watch the broker** (`tt-device-mcp status` or the
+job's status). As soon as a job queues after the limit, shut down gracefully within
+one minute or be killed. The MCP/REST field is `no_timeout_except_on_contention`
+(its earlier name `preemptable` is still accepted); `--preemptable` is a short alias for
+the flag.
+
 `tt-device-mcp help` lists the rest: `reset`, `exec`, `smi`, `timezone`,
 `lock`/`unlock`.
 
@@ -99,12 +135,16 @@ your project's `AGENTS.md`.
 | `tt_device_job_kill` | Kill or cancel a job |
 | `tt_device_queue_status` | Running and queued jobs |
 | `tt_device_exec` | Run a command directly (`tt-smi`, etc.) |
-| `tt_device_reset` | Reset the device; refuses over another user's job |
+| `tt_device_reset` | Reset the device; refuses while a job runs or another user holds it |
 | `tt_device_recent_jobs` | Recent job history |
 
 ## How it works
 
 Every submission enters one queue. The runner takes one job at a time.
+
+Before a job starts, the broker checks that the job's user can write the
+dirs tt-metal will write (`generated/` and its subdirs), and fails the job at
+once if not.
 
 Between jobs a gate probes the device (chip count, ARC heartbeat, ethernet
 links, fabric traffic). If the device is unfit, the gate holds the queue and
@@ -121,6 +161,52 @@ Start with [00-overview](specs/00-overview.md).
 
 Environment variables set paths, timeouts, and health thresholds. The full index
 is in [06-state-paths](specs/06-state-paths.md).
+
+The power-cycle cooldown also counts cycles that did not reboot the host (for example a BMC power
+cycle). An out-of-band tool can append them to `power_cycle_history.jsonl` in the broker's state dir
+(`/var/lib/tt-device-broker/`), one JSON object per line: `{"at_epoch": <seconds>, "cause": "<text>"}`.
+`TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE` names another file. A missing file or a malformed line is
+ignored.
+
+If other workloads share the host, an automatic power cycle cuts them too. Set
+`TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` to a command that drains them; the broker
+runs it just before it power-cycles the host and waits for it to exit, up to
+`TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC` (default 300 s). The command is
+split like shell words and run without a shell; the reason for the cycle is in
+`TT_DEVICE_MCP_POWER_CYCLE_REASON`. Its exit code and output go to the log. The
+cycle goes ahead whatever the hook does, so a failing or hung hook never blocks
+recovery. The full reset ladder still runs first. The cycle itself comes after a
+clean OS shutdown, with the same reason in `TT_DEVICE_MCP_POWER_CYCLE_REASON`;
+if that cannot start, nothing fires and the device stays held (spec 04 I88). For example, in a systemd
+drop-in for the broker:
+
+```
+[Service]
+Environment="TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK=/usr/local/bin/drain-jobs --reason power-cycle"
+Environment=TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC=300
+```
+
+## Reading chip state from other tools
+
+A read of a chip's sysfs telemetry (`/sys/class/tenstorrent/*/tt_*`) is a PCIe
+read of the chip. On a chip that has left the bus, hung, or is being reset, it
+can stall a CPU core, and many such reads can take the host down. Tools that
+poll those files should check the broker's published chip state first:
+`/run/tt-device-broker/chip-state.json` (world-readable, replaced atomically).
+
+```json
+{"version": 1, "pid": 1234, "recovering": false, "lost": ["7"],
+ "chips": {"0": {"lost": false, "recovering": false},
+           "7": {"lost": true, "recovering": false,
+                 "lost_since": "2026-01-01T12:00:00", "lost_reason": "..."}}}
+```
+
+- Do not read a chip whose `lost` or `recovering` is true. While the top-level
+  `recovering` is true, a reset owns every chip: read none of them.
+- Trust the file only while the process `pid` is alive; a stale file from a
+  stopped broker says nothing about the chips now.
+- The same fields are on `/health` (`lost_chips`, `recovering`,
+  `resetting_chips`).
 
 ## Slurm
 
@@ -148,7 +234,9 @@ See [deploy/README.md](deploy/README.md) for the timeout arithmetic
 **The device is hung.**
 
 - `tt-device-mcp reset`. It scans for processes holding the device first, and
-  refuses if another user is on it. Ask them to stop, or pass `--force`.
+  refuses if another user is on it. It also refuses while a broker job is
+  running, since a reset would kill it. Wait for the job, kill your own job
+  first, or pass `--force` (the job it stops is logged).
 - Never run `tt-smi -r` by hand while the broker is up.
 
 **`pytest` cannot open the device.**
@@ -157,6 +245,14 @@ See [deploy/README.md](deploy/README.md) for the timeout arithmetic
   and require users to go through `tt-device-mcp run`.
 - Hosts are unlocked by default and stay cooperative. A direct run works, and
   collides with whatever the queue is running.
+
+**A job failed at once with "tt-metal output dir not writable".**
+
+- tt-metal writes under `generated/` in the job's working directory, or under
+  `$TT_METAL_LOGS_PATH`. A run as root there leaves it root-owned, and the
+  broker refuses jobs that could not write it rather than let them fail later.
+- The error names each path, its owner and mode. Give the dirs back to your
+  user, move them aside, or set `TT_METAL_LOGS_PATH` in the job's env file.
 
 **A job died with no output.**
 

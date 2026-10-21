@@ -26,7 +26,6 @@ import os
 import pwd
 import queue
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -42,11 +41,14 @@ from tt_device_mcp.constants import (
     POST_STEP_DEADLINE_ENV,
     PRE_STEP_DEADLINE_DEFAULT_SEC,
     PRE_STEP_DEADLINE_ENV,
+    PREEMPT_GRACE_SEC,
+    PREEMPT_KILL_GRACE_SEC,
+    RESET_STREAM_KEEPALIVE_LINE,
     resolve_socket,
     step_client_timeout_sec,
     user_state_dir,
 )
-from tt_device_mcp.utils import api_call
+from tt_device_mcp.utils import _connect_uds, api_call
 
 # Env vars to capture from caller's environment
 CAPTURED_ENV_VARS = [
@@ -166,7 +168,11 @@ def per_user_daemon_env(log_dir=None) -> dict:
     env = dict(os.environ)
     base = _daemon_state_dir(log_dir)
     env.setdefault("TT_DEVICE_MCP_DEVICE_OP_LOCK", str(base / "device-op.lock"))
-    for var, name in (("TT_DEVICE_MCP_HEALTH_DIR", "health"), ("TT_DEVICE_MCP_JOB_EXIT_DIR", "jobexit")):
+    for var, name in (
+        ("TT_DEVICE_MCP_HEALTH_DIR", "health"),
+        ("TT_DEVICE_MCP_JOB_EXIT_DIR", "jobexit"),
+        ("TT_DEVICE_MCP_JOB_SPOOL_DIR", "jobspool"),
+    ):
         if var in env:
             continue
         try:
@@ -326,6 +332,7 @@ def cmd_run(args) -> int:
             "env": env_file,
             "inherited_env": inherited_env,
             "timeout_sec": timeout,
+            "no_timeout_except_on_contention": bool(getattr(args, "preemptable", False)),
         },
     )
 
@@ -411,6 +418,7 @@ def cmd_run_bg(args) -> int:
             "env": env_file,
             "inherited_env": inherited_env,
             "timeout_sec": timeout,
+            "no_timeout_except_on_contention": bool(getattr(args, "preemptable", False)),
         },
     )
 
@@ -605,7 +613,7 @@ def _fmt_when(iso) -> str:
 
 # ANSI styling — applied only when the destination is a terminal (see _overview),
 # so piping `status` into grep/files stays plain text.
-_ANSI = {"hdr": "\033[1;36m", "dim": "\033[2m", "off": "\033[0m"}
+_ANSI = {"hdr": "\033[1;36m", "dim": "\033[2m", "idle": "\033[1;33m", "off": "\033[0m"}
 
 
 def _style(text: str, key: str, color: bool) -> str:
@@ -730,6 +738,8 @@ def overview_lines(running, queued, rjobs, color: bool = False) -> list:
             jid = job.get("id", "?")[:10]
             icon, owner = _fmt_owner(job.get("owner", "?"))
             cmd = job.get("command", "?")[:80]
+            if job.get("preempt"):
+                cmd = f"[{job['preempt']}] {cmd}"
             runtime = "..."
             started = job.get("started_at")
             if started:
@@ -738,6 +748,11 @@ def overview_lines(running, queued, rjobs, color: bool = False) -> list:
                 except Exception:
                     pass
             lines.append(f"  {jid:<10}  {_pad(icon + _ICON_GAP + owner, max_w + 3)}  {runtime:<8} {cmd}")
+            # The job holds the device but has done no device work for over the threshold
+            # (spec 03 I54). Only IDLE gets a line: active is the normal case, and unknown is
+            # never shown as idle.
+            if job.get("activity") == "idle":
+                lines.append(_style(f"  {'':<10}  {job.get('activity_label') or 'DEVICE IDLE'}", "idle", color))
     else:
         lines.append(_style("  (none)", "dim", color))
 
@@ -795,7 +810,7 @@ def cmd_status(args) -> int:
 
         print(f"Job:     {result['job_id']}")
         print(f"Owner:   {result.get('owner', '?')}")
-        print(f"Status:  {result['status']}")
+        print(f"Status:  {result['status']}" + (f"  [{result['preempt']}]" if result.get("preempt") else ""))
         if result.get("cause"):
             print(f"Cause:   {result['cause']}")
         print(f"Command: {result.get('command', '?')}")
@@ -803,6 +818,10 @@ def cmd_status(args) -> int:
             print(f"Exit:    {result['exit_code']}")
         if result.get("runtime_sec"):
             print(f"Runtime: {result['runtime_sec']:.1f}s")
+        if result.get("activity_label"):
+            print(f"Device:  {result['activity_label']}")
+        elif result.get("idle_total_sec"):
+            print(f"Idle:    {result['idle_total_sec']:.1f}s with the device held and no device work")
         if result.get("log_file"):
             print(f"Log:     {result['log_file']}")
     else:
@@ -879,7 +898,10 @@ def cmd_logs(args) -> int:
         return 0
 
 
-RESET_TIMEOUT = 300  # `tt-smi -r` on a 32-chip Galaxy takes ~45-60s; well under this.
+# Per read, not per reset: the broker sends a keepalive line on every quiet stretch
+# (RESET_STREAM_KEEPALIVE_SEC), so against a broker that sends keepalives only one that
+# has gone away trips this. An older broker sends none, and a reset quiet this long trips it.
+RESET_TIMEOUT = 300
 
 
 def _open_reset_stream(
@@ -897,9 +919,7 @@ def _open_reset_stream(
     headers = {"Content-Type": "application/json"}
     if socket_path:
         conn = http.client.HTTPConnection("localhost", timeout=timeout)
-        conn.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.sock.settimeout(timeout)
-        conn.sock.connect(socket_path)
+        conn.sock = _connect_uds(socket_path, timeout)
     else:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
     conn.request("POST", endpoint, body=body, headers=headers)
@@ -935,6 +955,8 @@ def _print_stream_with_dots(resp, interval: float = 2.0):
         if item is DONE:
             break
         for line in item.splitlines():
+            if line == RESET_STREAM_KEEPALIVE_LINE:
+                continue  # the broker is alive; the dots already say we are waiting
             if line.startswith("::status::"):
                 status = line[len("::status::") :].strip()
                 continue
@@ -955,7 +977,7 @@ def cmd_reset(args) -> int:
         return 1
 
     try:
-        conn, resp = _open_reset_stream(args.port, {"force": args.force})
+        conn, resp = _open_reset_stream(args.port, {"force": args.force, "keepalive": True})
     except OSError as exc:
         print(f"Error talking to broker: {exc}")
         return 1
@@ -1200,6 +1222,10 @@ def _wait_and_stream(
                 print(f"Runtime: {result['runtime_sec']:.1f}s")
             if result["status"] == "timeout" and result.get("hint"):
                 print(f"\n!! TIMED OUT after {result.get('timeout_sec')}s !!\n{result['hint']}")
+            if result["status"] == "preempted":
+                print(
+                    f"\n!! PREEMPTED: another job waited {PREEMPT_GRACE_SEC}s past the {result.get('timeout_sec')}s limit !!"
+                )
 
             # Show last N lines summary if requested
             if output_lines > 0 and all_output:
@@ -1212,8 +1238,12 @@ def _wait_and_stream(
         time.sleep(1)
 
 
+WATCH_INTERVAL_SEC = 1.0
+
+
 def cmd_watch(args) -> int:
-    """Live `status`: the same overview, refreshed in place every 2s. Ctrl-C to exit."""
+    """Live `status`: the same overview, refreshed in place every second, so a DEVICE IDLE
+    marker (spec 03 I54) counts up as it happens. Ctrl-C to exit."""
     if not is_daemon_running(args.port):
         print(_server_down_message())
         return 1
@@ -1238,7 +1268,7 @@ def cmd_watch(args) -> int:
             else:
                 sys.stdout.write(frame + "\n")
             sys.stdout.flush()
-            time.sleep(2.0)
+            time.sleep(WATCH_INTERVAL_SEC)
     except KeyboardInterrupt:
         pass
     finally:
@@ -1258,8 +1288,6 @@ _SMI_SAFE_FLAGS = {
     "--version",
     "-l",
     "--local",
-    "-f",
-    "--filename",
     "-h",
     "--help",
 }
@@ -1393,7 +1421,7 @@ for arg in "$@"; do
     case "$arg" in
     -*)
         case "$arg" in
-        -ls|--list|-s|--snapshot|--snapshot_no_tty|-v|--version|-l|--local|-f|--filename|-h|--help) ;;
+        -ls|--list|-s|--snapshot|--snapshot_no_tty|-v|--version|-l|--local|-h|--help) ;;
         *) echo "tt-device-mcp-smi-ro: refusing non-read-only flag: $arg" >&2; exit 2 ;;
         esac ;;
     esac
@@ -1654,6 +1682,17 @@ def cmd_refresh_banner(args) -> int:
 # ============== Main ==============
 
 
+_NO_TIMEOUT_HELP = (
+    f"No timeout except on contention: -t is the time limit, but while no other job waits the job "
+    f"is never stopped for time. Once the limit has passed and a job is waiting, it has "
+    f"{PREEMPT_GRACE_SEC}s to end itself (no signal is sent), then it gets SIGTERM and, "
+    f"{PREEMPT_KILL_GRACE_SEC}s later, SIGKILL. Returning 0 (on its own or on SIGTERM) means no "
+    f"check and no reset; ending cleanly on SIGTERM with another status gets the fast check; a "
+    f"SIGKILL means a device reset and the full check before the next job. Status shows "
+    f"PREEMPTABLE <x>min, then PREEMPTING <s>s. You MUST watch the broker (tt-device-mcp status)."
+)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="TT Device MCP - Tenstorrent device queue server",
@@ -1692,6 +1731,13 @@ Examples:
     run_parser.add_argument("-e", "--env", help="Env file path")
     run_parser.add_argument("-t", "--timeout", type=int, default=600, help="Timeout in seconds")
     run_parser.add_argument(
+        "--no-timeout-except-on-contention",
+        "--preemptable",
+        dest="preemptable",
+        action="store_true",
+        help=_NO_TIMEOUT_HELP,
+    )
+    run_parser.add_argument(
         "-o", "--output-lines", type=int, default=0, help="Show last N lines summary at end (default: 0 = no summary)"
     )
 
@@ -1715,6 +1761,13 @@ Examples:
     run_bg_parser.add_argument("-w", "--workspace", help="Workspace path (default: cwd)")
     run_bg_parser.add_argument("-e", "--env", help="Env file path")
     run_bg_parser.add_argument("-t", "--timeout", type=int, default=600, help="Timeout in seconds")
+    run_bg_parser.add_argument(
+        "--no-timeout-except-on-contention",
+        "--preemptable",
+        dest="preemptable",
+        action="store_true",
+        help=_NO_TIMEOUT_HELP,
+    )
 
     status_parser = subparsers.add_parser(
         "status", help="[N] [-j ID]  — queue + last N recent (all users, default 15); -j for one job's detail"
@@ -1756,13 +1809,13 @@ Examples:
     smi_parser.add_argument("smi_args", nargs=argparse.REMAINDER, help="tt-smi args (read-only; reset/config rejected)")
 
     reset_parser = subparsers.add_parser(
-        "reset", help="[--force]  — reset devices (refused if a foreign tenant holds them)"
+        "reset", help="[--force]  — reset devices (refused if a foreign tenant holds them or a job runs)"
     )
     reset_parser.add_argument(
         "-f",
         "--force",
         action="store_true",
-        help="Override the reset gate even if another user's process holds the device",
+        help="Reset even if a broker job is running or another user's process holds the device",
     )
 
     subparsers.add_parser("pre-step", help="health pass before a job step (Slurm Prolog); exit 0 iff fit and free")

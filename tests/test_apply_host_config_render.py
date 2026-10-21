@@ -29,6 +29,8 @@ def _render(tmp_path, defaults: dict, *, eth_cmd: str | None = None) -> str:
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "TTDEV_ETC_DEFAULT": str(conf),
         "TTDEV_UNIT_PATH": str(tmp_path / "absent.service"),
+        # No host DMI product either: on a Galaxy host it would derive an expected chip count.
+        "TTDEV_DMI_PRODUCT_FILE": str(tmp_path / "absent.product_name"),
     }
     if eth_cmd is not None:
         env["TTDEV_ETH_HEARTBEAT_CMD"] = eth_cmd
@@ -119,10 +121,16 @@ def test_reset_floor_knobs_set_reach_the_unit(tmp_path):
 
 
 def test_expected_chips_unset_renders_no_line(tmp_path):
-    # Default: no per-host count. expected_chip_count() falls back to the high-water mark, exactly
-    # as before this wiring. Pinned so the seam cannot start pinning a chip count by accident.
-    unit = _render(tmp_path, _GALAXY)
+    # A host nothing can identify (no galaxy reset mode, board type or DMI product): no per-host
+    # count, and expected() falls back to the high-water mark. Pinned so the seam never guesses.
+    # A Galaxy derives 32 instead (spec 08 I28, tests/test_deploy_expected_chips.py).
+    unit = _render(tmp_path, {k: v for k, v in _GALAXY.items() if k != "TTDEV_RESET_MODE"})
     assert "TT_DEVICE_MCP_EXPECTED_CHIPS" not in unit
+
+
+def test_a_galaxy_reset_mode_alone_renders_32(tmp_path):
+    unit = _render(tmp_path, _GALAXY)
+    assert "Environment=TT_DEVICE_MCP_EXPECTED_CHIPS=32\n" in unit
 
 
 def test_expected_chips_set_reaches_the_unit(tmp_path):
@@ -146,37 +154,29 @@ def test_cold_rung_knobs_unset_render_no_line(tmp_path):
 
 
 def test_cold_rung_knobs_set_reach_the_unit(tmp_path):
-    # A host that arms the top of the cascade: the /etc/default opt-ins must reach the unit under the
-    # names server.py reads, before ExecStart so they are in the broker's env — otherwise the cold
+    # A host that arms the top of the cascade: the /etc/default opt-in must reach the unit under the
+    # name server.py reads, before ExecStart so it is in the broker's env — otherwise the cold
     # rung is unreachable in the deployed config and an all-off-bus mesh holds with no recovery path.
-    opted = dict(_GALAXY, TTDEV_AUTO_REBOOT="1", TTDEV_AUTO_POWER_CYCLE="1")
-    unit = _render(tmp_path, opted)
-    reboot = "Environment=TT_DEVICE_MCP_AUTO_REBOOT=1"
+    unit = _render(tmp_path, dict(_GALAXY, TTDEV_AUTO_POWER_CYCLE="1"))
     power = "Environment=TT_DEVICE_MCP_AUTO_POWER_CYCLE=1"
-    assert reboot in unit
     assert power in unit
-    assert unit.index(reboot) < unit.index("ExecStart=")
     assert unit.index(power) < unit.index("ExecStart=")
 
 
-def test_ubb_reset_force_off_unset_renders_no_line(tmp_path):
-    # The per-tray BMC reset rung is armed by default in server.py, so unset must render no line — the
-    # rung stays at its code default (armed). Pinned so the seam cannot start rendering a disarm by
-    # accident, which would silently drop the default-on rung fleet-wide.
-    unit = _render(tmp_path, _GALAXY)
-    assert "TT_DEVICE_MCP_AUTO_UBB_RESET" not in unit
+def test_a_stale_reboot_setting_renders_no_line(tmp_path):
+    # Spec 04 I71: the warm host reboot rung is gone, with no switch left. A TTDEV_AUTO_REBOOT still
+    # in an old /etc/default file renders nothing into the unit.
+    unit = _render(tmp_path, dict(_GALAXY, TTDEV_AUTO_REBOOT="1", TTDEV_AUTO_POWER_CYCLE="1"))
+    assert "AUTO_REBOOT" not in unit
+    assert "POST_REBOOT_VERIFY" not in unit
 
 
-def test_ubb_reset_force_off_reaches_the_unit(tmp_path):
-    # A host whose BMC bit order the broker has not confirmed disarms the default-on tray rung: the
-    # /etc/default TTDEV_AUTO_UBB_RESET=0 must reach the unit under the name server.py reads, before
-    # ExecStart so it is in the broker's env — otherwise the only way to force the rung off is to
-    # hand-edit the unit, and the standard /etc/default interface cannot disarm a destructive rung.
-    opted = dict(_GALAXY, TTDEV_AUTO_UBB_RESET="0")
-    unit = _render(tmp_path, opted)
-    line = "Environment=TT_DEVICE_MCP_AUTO_UBB_RESET=0"
-    assert line in unit
-    assert unit.index(line) < unit.index("ExecStart=")
+def test_a_stale_ubb_reset_setting_renders_no_line(tmp_path):
+    # Spec 04 I23: the per-tray BMC re-power rung is gone, with no switch left. Unset, or a
+    # TTDEV_AUTO_UBB_RESET still in an old /etc/default file, renders nothing into the unit.
+    assert "AUTO_UBB_RESET" not in _render(tmp_path, _GALAXY)
+    unit = _render(tmp_path, dict(_GALAXY, TTDEV_AUTO_UBB_RESET="0"))
+    assert "AUTO_UBB_RESET" not in unit
 
 
 def test_prejob_dispatch_unset_renders_no_line(tmp_path):
@@ -200,6 +200,22 @@ def test_prejob_dispatch_set_reaches_the_unit(tmp_path):
     assert unit.index(line) < unit.index("ExecStart=")
 
 
+def test_poller_services_unset_renders_no_line(tmp_path):
+    # Default: no line, so server.py's built-in poller list (no clock-cap keeper) rules.
+    unit = _render(tmp_path, _GALAXY)
+    assert "TT_DEVICE_MCP_POLLER_SERVICES" not in unit
+
+
+def test_poller_services_set_reaches_the_unit(tmp_path):
+    # A host with yet another device poller overrides the default list via /etc/default; the list
+    # must reach the unit verbatim, before ExecStart, or a reset races that poller.
+    pollers = "tt-telemetry.service,tt-metrics-exporter.service,tt-fmax-cap.service,site-poller.service"
+    unit = _render(tmp_path, dict(_GALAXY, TTDEV_POLLER_SERVICES=pollers))
+    line = f"Environment=TT_DEVICE_MCP_POLLER_SERVICES={pollers}"
+    assert line in unit
+    assert unit.index(line) < unit.index("ExecStart=")
+
+
 def test_eth_check_python_reaches_the_unit(tmp_path):
     # The reader resolves ttexalens from this and calls it the per-box mechanism, but nothing rendered
     # it — so no host could satisfy it and the rung self-tested to OFF everywhere. Documented and
@@ -214,3 +230,38 @@ def test_eth_check_python_reaches_the_unit(tmp_path):
 def test_eth_check_python_unset_renders_no_line(tmp_path):
     unit = _render(tmp_path, _GALAXY)
     assert "TTDEV_ETH_CHECK_PYTHON" not in unit
+
+
+def test_aiclk_ceiling_unset_renders_no_line(tmp_path):
+    # Default: no ceiling. ceiling_mhz() reads None, so no helper runs and no time is added to a pass.
+    unit = _render(tmp_path, _GALAXY)
+    assert "TT_DEVICE_MCP_AICLK_CEILING" not in unit
+
+
+def test_aiclk_ceiling_set_reaches_the_unit(tmp_path):
+    # A host that caps its clock: the /etc/default value must reach the unit under the name
+    # ceiling_mhz() reads, before ExecStart, or the broker never re-applies it after a reset.
+    opted = dict(_GALAXY, TTDEV_AICLK_CEILING_MHZ="900")
+    unit = _render(tmp_path, opted)
+    line = "Environment=TT_DEVICE_MCP_AICLK_CEILING_MHZ=900"
+    assert line in unit
+    assert unit.index(line) < unit.index("ExecStart=")
+    assert "TT_DEVICE_MCP_AICLK_CEILING_CMD" not in unit
+
+
+def test_the_unit_never_orders_after_the_vendor_hugepages_service(tmp_path):
+    # tenstorrent-hugepages.service is After=multi-user.target and the broker is ordered before it
+    # (WantedBy=), so an After= on it is a boot ordering cycle: systemd deletes the broker's (or
+    # a serving unit's) start job to break it. The broker waits for the pool in-process instead.
+    unit = _render(tmp_path, _GALAXY)
+    deps = [ln for ln in unit.splitlines() if ln.split("=", 1)[0] in ("After", "Wants", "Requires", "BindsTo")]
+    assert not [ln for ln in deps if "tenstorrent-hugepages" in ln]
+    assert "Wants=dev-hugepages\\x2d1G.mount" in deps
+
+
+def test_the_unit_lifts_the_memlock_limit_jobs_inherit(tmp_path):
+    # Jobs run in a systemd-run --scope that keeps the broker's rlimits; tt-metal pins host memory,
+    # which systemd's 8 MiB default LimitMEMLOCK would refuse.
+    unit = _render(tmp_path, _GALAXY)
+    service = unit.split("[Service]", 1)[1].split("[Install]", 1)[0]
+    assert "LimitMEMLOCK=infinity" in service.splitlines()

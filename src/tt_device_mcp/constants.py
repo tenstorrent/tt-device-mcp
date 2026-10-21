@@ -38,6 +38,57 @@ GRACEFUL_KILL_GRACE_SEC = 60
 # to the reap, and reaching SIGKILL means the device was NOT released.
 SIGTERM_GRACE_SEC = 15
 
+# SIGINT window for a job the hung reaper stops for silence (spec 01 I10), in place of
+# GRACEFUL_KILL_GRACE_SEC. A job that printed nothing for HUNG_SILENCE_SEC is blocked, most
+# often inside a device op, and does not unwind on SIGINT: on a Galaxy host every silence reap
+# observed ran the full 60 s and ended at SIGTERM. A HUNG job owes the mesh the reset and the
+# full check either way (spec 03 I69), so the long window only delayed recovery. The SIGINT
+# still goes first, and SIGTERM (SIGTERM_GRACE_SEC) and SIGKILL follow as on every ladder.
+HUNG_SIGINT_GRACE_SEC = 10
+
+# After a job is finalized, any of its processes still alive (a child that left the process
+# group, or one the ladder never reached) gets SIGTERM, then SIGKILL after this window. The
+# job itself is already gone, so this is a sweep of leftovers, not a teardown: it is kept
+# short because the next job waits on it.
+SURVIVOR_TERM_GRACE_SEC = 5
+
+# How long to wait after the survivors' SIGKILL before naming whoever is still alive. A
+# process that outlives SIGKILL is stuck in the kernel (state D, most often inside the
+# driver), and no signal will move it.
+SURVIVOR_KILL_WAIT_SEC = 2
+
+# How long, counted from a SIGKILL, to keep polling the /dev/tenstorrent holders for the killed
+# processes to let go before naming one a holder that will not (spec 01 I67). An exit can sit in
+# the driver's release for seconds; reading that as a leftover skipped the post-job gate and left
+# the device held until the next job or the hold ceiling.
+HOLDER_RELEASE_WAIT_SEC = 30
+
+# A preemptable job's grace minute. Contention (the job past its time limit AND another job
+# waiting) must last this long, unbroken, before the broker does anything to the job: the job
+# is expected to see the waiter in the queue and end itself. No signal is sent inside it.
+PREEMPT_GRACE_SEC = 60
+
+# Once the grace minute is spent, the job's whole process tree gets SIGTERM and, at most this
+# much later, SIGKILL: 10 s for its handlers to release the device. The job already had its
+# minute to end itself. A tree that all exits through its own code on SIGTERM inside it gets the
+# fast post-job check; a SIGKILL, any signal death or an unwitnessed exit gets a reset and the
+# full check.
+PREEMPT_KILL_GRACE_SEC = 10
+
+# Before any reset, a process other than a tenant that still maps the device gets SIGTERM and
+# this long to let go before SIGKILL (spec 04 I92): the same 10 s a preempted job's handlers get.
+# A reader that keeps its mapping through a reset reads chips that are off the bus.
+PRE_RESET_TERM_GRACE_SEC = PREEMPT_KILL_GRACE_SEC
+
+# The longest the pre-reset scan waits for the off-bus chips' detach (a sysfs PCI remove, spec 04
+# I92) before it gives up: a remove that does not return in this time counts as not detached, the
+# reset is refused and the hold stays for the bounded recovery. One deadline for all the chips.
+PRE_RESET_DETACH_TIMEOUT_SEC = 30
+
+# A pre-reset scan that cannot see a holder it knows of (the driver names a pid it could not read,
+# often one mid-exit) scans once more after this long before it refuses the reset (spec 04 I92).
+PRE_RESET_RESCAN_SETTLE_SEC = 1.0
+
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
 # is deliberately never killed, because one stopped partway through 32 ASICs is far worse
@@ -52,12 +103,32 @@ DEVICE_RESET_OVERRUN_SEC = 180
 # reset that had worked.
 DEVICE_RESET_TIMEOUT_SEC = 600
 
+# The CLI reads the streaming reset with a per-read socket timeout, and a reset can sit
+# silent far longer than that (quiesce, an overrun tt-smi, the post-reset check): the
+# overrun warning goes to the broker log, not the stream. A client that asks for it gets
+# this sentinel line after every quiet interval, so silence never reads as a dead broker.
+RESET_STREAM_KEEPALIVE_SEC = 15
+RESET_STREAM_KEEPALIVE_LINE = "::keepalive::"
+
 # Upper bound on the post-job fabric traffic check (TT_DEVICE_MCP_FABRIC_CHECK_CMD).
 # The check runs a pinned, prebuilt validator — it never compiles — so a healthy pass is
 # 45-75s, and anything far past that is a wedged fabric, not a slow one. This bound is what
 # a wedge COSTS: the queue is dead until it expires, and only then does recovery start. A
 # generous margin here is not caution, it is the wedge's dwell time.
 FABRIC_CHECK_TIMEOUT_SEC = 180
+
+# The caller's bound on the passive eth-heartbeat read a CLEAN post-job gate runs (spec 03 I30);
+# a healthy read answers in ~1s. Matches the self-test's arming budget
+# (server.ETH_CHECK_SELFTEST_BUDGET_SEC): a read this slow could not have armed the rung. The
+# built-in probe's own bound sits at most at 90% of this, and its expiry is "no verdict", so the
+# gate runs the full pass; this bound expiring is frozen evidence (I16) and holds. An operator
+# override's inner bound is this same bound, so its timeout is frozen evidence here as on every
+# other path.
+ETH_POST_JOB_TIMEOUT_SEC = 10.0
+# The most the eth-heartbeat read waits for its own reader to finish exiting after killing it on
+# a timeout (see monitor._verify_eth_heartbeat_body): a SIGKILLed reader is normally gone in
+# milliseconds, and until it is, a holder scan still sees its pid through the driver.
+ETH_REAP_SEC = 2.0
 
 # The fabric check exits with this when it could not run at all (validator or
 # descriptor absent). It means "nothing was learned about the fabric" and must stay
@@ -66,7 +137,13 @@ FABRIC_CHECK_TIMEOUT_SEC = 180
 # reason. The broker skips on this code and warns.
 FABRIC_CHECK_CANNOT_CHECK_RC = 77
 
-# The recovery ladder's five named rungs, in severity order (0..4) — the one place that names
+# The fabric check exits with this when the validator listed cabling-descriptor links that are
+# missing and no extra link that could explain them (a moved tray shows both): a cable that is
+# absent or dead. A hardware verdict, not a skip and not a reset: no reset or rung can fix a
+# cable, so the broker holds as a known fabric fault and pages once (spec 03 I47).
+FABRIC_CHECK_HARDWARE_FAULT_RC = 78
+
+# The recovery ladder's three named rungs, in severity order (0..2) — the one place that names
 # them. Lives here, not in health/recovery/stages/ (the package these actually name), so
 # metrics.py can import it directly: importing a package submodule always runs that package's
 # __init__.py first, and health/recovery/__init__.py imports metrics — a cycle metrics.py's own
@@ -74,10 +151,11 @@ FABRIC_CHECK_CANNOT_CHECK_RC = 77
 # anything under tt_device_mcp, so it carries no such risk for any importer.
 STAGE_BRIDGE_RESET = "bridge_reset"
 STAGE_SMI_RESET = "smi_reset"
-STAGE_UBB_TRAY = "ubb_tray"
-STAGE_HOST_REBOOT = "host_reboot"
 STAGE_POWER_CYCLE = "power_cycle"
-STAGE_NAMES = (STAGE_BRIDGE_RESET, STAGE_SMI_RESET, STAGE_UBB_TRAY, STAGE_HOST_REBOOT, STAGE_POWER_CYCLE)
+STAGE_NAMES = (STAGE_BRIDGE_RESET, STAGE_SMI_RESET, STAGE_POWER_CYCLE)
+# Spec 04 I90: every reset step (bridge, glx_reset, the AICLK re-apply) narrates its device-op
+# detail with this prefix, and /status reads it as a reset in progress.
+DEVICE_RESET_DETAIL_PREFIX = "device reset:"
 
 # A Slurm prologue/epilogue must always return a verdict rather than hang until the site's
 # PrologEpilogTimeout kills the script — a kill drains the node with nothing said about what was

@@ -9,6 +9,7 @@
 #   TTDEV_AUTOUPDATE=1                 # master switch
 #   TTDEV_BRANCH=<branch>              # branch to track (main in prod)
 #   TTDEV_VENV=/path/to/broker/venv    # venv we pip-install into
+#   TTDEV_MIN_APPLY_INTERVAL_SEC=3600  # optional: min seconds between applies (0/unset = off)
 #
 # THE SOURCE IS NOT CONFIGURABLE (spec 08 I16). It is the constant below, and the only
 # lever an operator has is which branch of it to track. That is what keeps this path
@@ -20,8 +21,14 @@
 # So root fetches the public repo itself, into a root-owned clone: code that is about to be
 # installed as root has no business sitting anywhere else on the way in.
 #
-# Idle-gated: an update never interrupts an in-flight exec (re-adoption already
-# covers jobs across the restart).
+# Idle-gated: an update never interrupts an in-flight device op, and never restarts the broker
+# under a running job. From its busy check through the restart the updater holds dispatch (spec 08
+# I18): the broker starts no queued job while the hold names a live pid, so a job queued behind one
+# that just ended waits, persisted, for the new broker instead of being dispatched into the restart.
+# A busy lap drains (spec 08 I20): it keeps the hold, lets the running job finish and applies at
+# that job boundary. The wait is bounded by the broker's hard job limit, counted from the job's
+# start: a job past it no longer holds the update. A drain blocks this lap (and the reconcile after
+# it) for at most that long.
 set -u
 
 [ -r /etc/default/tt-device-broker ] && . /etc/default/tt-device-broker
@@ -80,6 +87,77 @@ installed_sha="$(cat "$STATE" 2>/dev/null || true)"
 
 echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >&2
 
+# Apply rate limit (spec 08 I21), OFF by default. Every apply restarts the broker, and every start
+# runs the full startup check, fabric traffic pass included (spec 03 I4) -- a burst of pushes is a
+# burst of fabric passes on a galaxy. With TTDEV_MIN_APPLY_INTERVAL_SEC set, a new sha waits until
+# that long has passed since the last apply, so the burst becomes one restart onto its newest sha.
+# Checked before the device-op bar and the dispatch hold: a lap that will not apply holds nothing.
+# Only the timing of an apply moves; the startup check after it is never skipped or shortened.
+# The stamp is written just before the restart, so a failed apply retries on the next lap.
+# The limit is for a healthy broker only: a broker that is not running, restarts itself, holds the
+# device or fails its health check may be broken by the last apply, and the next sha may be its
+# fix, so it applies at once (broker_broken below). A broker still in its startup check is booting,
+# not broken, and stays limited, for a bounded time. Escape by hand: rm "$ROOT/last-apply" (the
+# config file sourced above wins over an env override on the command line).
+LAST_APPLY="$ROOT/last-apply"
+LAST_APPLY_NRESTARTS="$ROOT/last-apply-nrestarts"
+MIN_APPLY="${TTDEV_MIN_APPLY_INTERVAL_SEC:-0}"
+# Every start opens RECOVERING(startup_unverified) and holds the device until the startup check
+# passes: the hugepage wait (STARTUP_HUGEPAGES_WAIT_SEC, 120 s, spec 03 I33) and then one full gate
+# pass with its fabric check (436 s at most, spec 04 reset duration bound). That is a broker
+# booting, not a broken one, so it stays limited for STARTUP_BOUND from the last apply: 120 + 436
+# s plus 44 s for the restart itself. Past the bound it counts as broken. A failed startup check
+# names its fault in fsm_why (and a dirty episode is held as one), so it is broken at once.
+STARTUP_BOUND=600
+# Why the broker is not a healthy one to rate-limit, or nothing; $1 is the seconds since the last
+# apply. Not active (failed, activating, inactive); systemd restarted it since the last apply
+# (NRestarts grew past the count saved right after that apply's restart: a crash loop); /health
+# silent; or an FSM that is recovering/down or holds the device, unless that is the startup check
+# above, within STARTUP_BOUND, held for nothing but that check.
+broker_broken() {
+    local st n base h age="${1:-0}"
+    st="$(systemctl is-active tt-device-broker 2>/dev/null)"
+    if [ "$st" != active ]; then echo "is ${st:-unknown}, not active"; return; fi
+    n="$(systemctl show tt-device-broker -p NRestarts --value 2>/dev/null)"
+    base=""; { read -r base < "$LAST_APPLY_NRESTARTS"; } 2>/dev/null || true
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    case "$base" in ''|*[!0-9]*) base=0 ;; esac
+    if [ $(( 10#$n )) -gt $(( 10#$base )) ]; then
+        echo "restarted itself since the last apply (NRestarts $(( 10#$base )) -> $(( 10#$n )))"; return
+    fi
+    h="$(curl -s --max-time 5 --unix-socket /run/tt-device-broker/broker.sock http://localhost/health 2>/dev/null)"
+    if [ -z "$h" ]; then echo "does not answer /health"; return; fi
+    if printf '%s' "$h" | grep -Eq '"fsm_state": *"recovering"' \
+            && printf '%s' "$h" | grep -Eq '"fsm_why": *"startup_unverified"'; then
+        if [ "$age" -gt "$STARTUP_BOUND" ]; then
+            echo "is still in its startup check ${age}s after the last apply (bound ${STARTUP_BOUND}s)"; return
+        fi
+        if ! printf '%s' "$h" | grep -Eq '"held": *true' \
+                || printf '%s' "$h" | grep -Eq '"held_reason": *"device unverified: '; then
+            return   # booting: the startup check is running
+        fi
+    fi
+    if printf '%s' "$h" | grep -Eq '"held": *true'; then echo "holds the device"; return; fi
+    if printf '%s' "$h" | grep -Eq '"fsm_state": *"(recovering|down)"'; then
+        echo "fails its health check (fsm $(printf '%s' "$h" | grep -Eo '"fsm_state": *"[a-z]*"' | grep -Eo '[a-z]*"$' | tr -d '"'))"
+    fi
+}
+if [ "$MIN_APPLY" -gt 0 ] 2>/dev/null; then
+    last=""; { read -r last < "$LAST_APPLY"; } 2>/dev/null || true
+    now="$(date +%s)"
+    # A stamp that is not a number, or lies in the future (the clock stepped back), bars nothing.
+    # Read base 10, so a hand-written leading zero is not taken for octal.
+    case "$last" in ''|*[!0-9]*) last="" ;; *) last=$(( 10#$last )) ;; esac
+    if [ -n "$last" ] && [ "$last" -le "$now" ] && [ $(( now - last )) -lt "$MIN_APPLY" ]; then
+        broken="$(broker_broken "$(( now - last ))")"
+        if [ -z "$broken" ]; then
+            echo "autoupdate: rate-limited: last apply $(( now - last ))s ago (min ${MIN_APPLY}s); ${remote_sha:0:9} applies in $(( last + MIN_APPLY - now ))s" >&2
+            exit 0
+        fi
+        echo "autoupdate: rate limit skipped: the broker $broken; ${remote_sha:0:9} applies now (last apply $(( now - last ))s ago)" >&2
+    fi
+fi
+
 # An in-flight device operation is an ABSOLUTE bar — not the bounded defer below.
 # Restarting the broker mid-reset lets KillMode=control-group SIGTERM the running
 # tt-smi, leaving 32 ASICs half-reset, which is the state that costs a power-cycle.
@@ -103,42 +181,140 @@ if systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttd
     exit 0
 fi
 
-# Idle gate, OFF by default. A job runs in its own scope and is re-adopted across a restart
-# (tests/test_readopt.py), so a busy box is not a reason to hold an update back: waiting buys
-# no safety, only a host left stale on the fix it is waiting for. A host that does want an idle
-# window sets TTDEV_MAX_DEFER_SEC to the seconds it will wait. The in-flight device-op bar above
-# is separate and unconditional — re-adoption covers a job, not a tt-smi killed mid-reset.
-MAX_DEFER="${TTDEV_MAX_DEFER_SEC:-0}"
-PENDING="$ROOT/pending.defer"
-mp="$(systemctl show tt-device-broker -p MainPID --value 2>/dev/null)"
-kids="$(pgrep -P "${mp:-0}" 2>/dev/null | wc -l)"
-holders=0
-for p in /proc/[0-9]*; do
-    if ls -l "$p/fd" 2>/dev/null | grep -q tenstorrent; then
-        uu=$(stat -c %u "$p" 2>/dev/null); [ "${uu:-0}" -ge 1000 ] && holders=$((holders+1))
+# Dispatch hold (spec 08 I18, spec 01 I18). Taken before anything is counted, then a short
+# settle so a dispatch already past the broker's check shows up as a child. A lap that restarts
+# nothing drops it at once; an applying lap keeps it until `systemctl restart` returns (the trap drops
+# it on every exit, and systemd removes it with the RuntimeDirectory anyway). Written whole under
+# a temporary name and renamed into place: the broker removes a hold it cannot parse, so it must
+# never see this one empty or half-written.
+HOLD=/run/tt-device-broker/dispatch-hold
+hold_write() {
+    [ -d "${HOLD%/*}" ] || return 0
+    { echo "$$ $(date +%s)" > "$HOLD.$$" && mv -f "$HOLD.$$" "$HOLD"; } 2>/dev/null || true
+}
+if [ -d "${HOLD%/*}" ]; then
+    trap 'rm -f "$HOLD" "$HOLD.$$" 2>/dev/null || true' EXIT
+    hold_write
+    sleep "${TTDEV_HOLD_SETTLE_SEC:-2}"
+fi
+
+# Idle gate (spec 08 I24), always on, with no setting. A running job is re-adopted across a restart
+# (tests/test_readopt.py), but the restart still costs it: the socket drops for seconds under a
+# polling client, a client that reads the drop as a failure kills the job (and owes a kill reset),
+# and the new broker holds the queue for its startup checks until the re-adopted job ends. So an
+# update never restarts the broker under a running job: a busy lap drains (spec 08 I20) at once,
+# holding dispatch so nothing new starts, and applies at that job's end, polling every 5 s. The
+# in-flight device-op bar above is separate, and absolute.
+#
+# The wait is bounded by the broker's hard job limit, MAX_TIMEOUT_SEC (1500) plus its kill grace
+# GRACEFUL_KILL_GRACE_SEC (60), counted from the start of the youngest running job scope (a job
+# with no readable start counts as just started). A job past it is overdue for the broker's own kill
+# and no longer holds the update, so a box busy around the clock still updates within one job.
+JOB_CAP=1560
+UPTIME=/proc/uptime
+count_busy() {
+    local mp p uu q
+    mp="$(systemctl show tt-device-broker -p MainPID --value 2>/dev/null)"
+    # A stopped broker reads MainPID 0, and `pgrep -P 0` lists init and kthreadd: count no kids.
+    kids=0
+    [ "${mp:-0}" -gt 0 ] 2>/dev/null && kids="$(pgrep -P "$mp" 2>/dev/null | wc -l)"
+    holders=0
+    for p in /proc/[0-9]*; do
+        if ls -l "$p/fd" 2>/dev/null | grep -q tenstorrent; then
+            uu=$(stat -c %u "$p" 2>/dev/null); [ "${uu:-0}" -ge 1000 ] && holders=$((holders+1))
+        fi
+    done
+    # A re-adopted job is no child of this broker, and a queued job is about to be one: a job
+    # scope still running and a persisted queued spec both count as busy.
+    scopes="$(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-job-*' 2>/dev/null \
+        | grep -c 'ttdev-job-')"
+    queued=0
+    for q in "${TTDEV_LOG_DIR:-/var/log/tt-device-broker}"/queued/*.json; do
+        [ -e "$q" ] && queued=$((queued+1))
+    done
+    busy=$(( kids + holders + ${scopes:-0} + queued ))
+}
+# Seconds the youngest running job scope has run (j_age), from systemd's own record of its start:
+# a re-adopted job keeps its scope, so its age survives broker restarts. 0 when none can be read.
+youngest_job_age() {
+    local up u t a
+    j_age=""
+    up="$(cut -d' ' -f1 "$UPTIME" 2>/dev/null)"; up="${up%.*}"
+    for u in $(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-job-*' 2>/dev/null \
+            | grep -o 'ttdev-job-[^ ]*\.scope'); do
+        t="$(systemctl show "$u" -p ActiveEnterTimestampMonotonic --value 2>/dev/null)"
+        if [ -n "$up" ] && [ "${t:-0}" -gt 0 ] 2>/dev/null; then a=$(( up - t / 1000000 )); else a=0; fi
+        { [ -z "$j_age" ] || [ "$a" -lt "$j_age" ]; } && j_age="$a"
+    done
+    [ -n "$j_age" ] || j_age=0
+}
+# The device-op bar above, asked again while a drain waits: the broker can start a device op (a
+# gate pass, a reset) on its own while dispatch is held, and the apply must not restart over it.
+op_in_flight() {
+    local op_pid="" op_name=""
+    if [ -f "$INHIBIT" ]; then
+        read -r op_pid op_name < "$INHIBIT" 2>/dev/null || true
+        [ -n "${op_pid:-}" ] && kill -0 "$op_pid" 2>/dev/null && return 0
     fi
-done
-if { [ "$kids" -ne 0 ] || [ "$holders" -ne 0 ]; } && [ "$MAX_DEFER" -gt 0 ]; then
-    now="$(date +%s)"
-    p_sha=""; p_since=""
-    [ -f "$PENDING" ] && read -r p_sha p_since < "$PENDING" 2>/dev/null
-    # Clock from the FIRST pending update, not the latest commit — so a burst of
-    # commits can't keep resetting the timer and starving a perpetually-busy host.
-    [ -n "${p_since:-}" ] || p_since="$now"
-    echo "$remote_sha $p_since" > "$PENDING"
-    waited=$(( now - p_since ))
-    if [ "$waited" -lt "$MAX_DEFER" ]; then
-        echo "autoupdate: deferring (busy: children=$kids holders=$holders; waited ${waited}s/${MAX_DEFER}s)" >&2
+    systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null \
+        | grep -q 'ttdev-reset-'
+}
+# Wait, under the dispatch hold, for the job boundary: nothing running and no device op in flight.
+# Returns 0 there, and 0 once the youngest running job is past JOB_CAP or the broker is down (a down
+# broker protects no job by waiting, and the restart is what starts it again); 1 when a device op is
+# still in flight at the cap. $1 names the wait in the log.
+wait_job_boundary() {
+    local w_start w_now w_bound
+    youngest_job_age
+    w_bound=$(( JOB_CAP - j_age )); [ "$w_bound" -gt 0 ] || w_bound=0
+    w_start="$(date +%s)"
+    echo "autoupdate: $1: busy (children=$kids holders=$holders scopes=${scopes:-0} queued=$queued) -> draining: dispatch held, the running job finishes, then the update applies (bound ${w_bound}s: job cap ${JOB_CAP}s, youngest job ${j_age}s in)" >&2
+    while :; do
+        count_busy
+        running=$(( kids + holders + ${scopes:-0} ))
+        if [ "$running" -eq 0 ] && ! op_in_flight; then
+            echo "autoupdate: $1: drained after $(( $(date +%s) - w_start ))s (queued=$queued wait for the new broker)" >&2
+            return 0
+        fi
+        w_now="$(date +%s)"
+        if ! op_in_flight; then
+            case "$(systemctl is-active tt-device-broker 2>/dev/null)" in
+                active|activating|deactivating|reloading) ;;
+                *)  echo "autoupdate: $1: the broker is down after $(( w_now - w_start ))s; applying (the restart starts it)" >&2
+                    return 0 ;;
+            esac
+        fi
+        if [ $(( w_now - w_start )) -ge "$w_bound" ]; then
+            if op_in_flight; then
+                echo "autoupdate: $1: a device op is still in flight at the job cap after $(( w_now - w_start ))s; dispatch released, the next lap retries" >&2
+                return 1
+            fi
+            if [ "$kids" -eq 0 ] && [ "${scopes:-0}" -eq 0 ] && [ "$holders" -gt 0 ]; then w_what="a device holder is"; else w_what="the running job is"; fi
+            echo "autoupdate: $1: $w_what past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); it no longer holds the update, applying" >&2
+            return 0
+        fi
+        sleep 5
+        # Refreshed, so the broker's overdue bound on a hold counts from the last poll: a drain
+        # that hangs lets go of dispatch on its own, one that polls keeps it.
+        hold_write
+    done
+}
+# For the autoupdate_apply event below: whether this lap ran into a busy broker, and how long it drained.
+idle=true; drained_s=0
+count_busy
+if [ "$busy" -ne 0 ]; then
+    idle=false; d_t0="$(date +%s)"
+    if ! wait_job_boundary drain; then
+        rm -f "$HOLD" 2>/dev/null || true
         exit 0
     fi
-    echo "autoupdate: busy for ${waited}s (>= ${MAX_DEFER}s) -> applying anyway; re-adoption preserves the running job" >&2
-elif [ "$kids" -ne 0 ] || [ "$holders" -ne 0 ]; then
-    echo "autoupdate: busy (children=$kids holders=$holders); idle gate off -> applying, the running job is re-adopted" >&2
+    drained_s=$(( $(date +%s) - d_t0 ))
+    # The apply's own stretch, under the broker's overdue bound, starts now.
+    hold_write
 fi
-rm -f "$PENDING" 2>/dev/null || true
 
 echo "autoupdate: applying ${remote_sha:0:9}" >&2
-# Reset to the sha this lap decided on, NOT to origin/$BR: the idle gate above can defer for
+# Reset to the sha this lap decided on, NOT to origin/$BR: the drain above can wait for
 # minutes, and a branch that moved in the meantime would otherwise install something this lap
 # never looked at and never announced — and installed.sha would then name the wrong commit.
 git -C "$clone" reset --hard -q "$remote_sha" \
@@ -174,6 +350,10 @@ if [ -d "$clone/deploy" ]; then
     # apply-host-config.sh below.
     install -m 0755 "$clone/deploy/tt-device-eth-heartbeat-probe.py" "$ROOT/eth-heartbeat-probe.py" \
         || { echo "autoupdate: staging eth-heartbeat-probe.py failed (required); not marking current" >&2; exit 1; }
+    # The AICLK ceiling helper (health.aiclk_ceiling; off unless TTDEV_AICLK_CEILING_MHZ is set).
+    # Staged on every update all the same, so a host that opts in later never runs a stale copy.
+    install -m 0755 "$clone/deploy/tt-device-aiclk-ceiling.py" "$ROOT/aiclk-ceiling.py" \
+        || { echo "autoupdate: staging aiclk-ceiling.py failed (required); not marking current" >&2; exit 1; }
     # The reader's interpreter, broker-owned. Pinning a developer's tt-metal python_env makes a
     # health rung die the moment that user rebuilds or moves their tree; tt-exalens ships manylinux
     # wheels on PyPI, so the box owns its own copy at a pinned version. Idempotent, and fail-OPEN:
@@ -183,6 +363,12 @@ if [ -d "$clone/deploy" ]; then
         if "$ROOT/eth-venv/bin/pip" install -q "tt-exalens==$ETH_EXALENS_VERSION" >/dev/null 2>&1; then
             chmod -R a+rX "$ROOT/eth-venv" 2>/dev/null || true
             echo "autoupdate: provisioned eth-venv (tt-exalens $ETH_EXALENS_VERSION)" >&2
+            # Check and warm it once before the broker restart below, so the restarted broker's
+            # startup self-test finds an importable ttexalens (a running broker picks it up on its
+            # paced retry, spec 03 I28). Fail-open, as above, but never silent.
+            if ! timeout 60 "$ROOT/eth-venv/bin/python" -c 'import ttexalens' >/dev/null 2>&1; then
+                echo "autoupdate: WARNING eth-venv installed but 'import ttexalens' FAILS; eth-heartbeat rung will report OFF" >&2
+            fi
         else
             echo "autoupdate: eth-venv provisioning failed; eth-heartbeat rung will report OFF" >&2
         fi
@@ -207,8 +393,46 @@ if [ ! -x "$clone/deploy/apply-host-config.sh" ]; then
 fi
 bash "$clone/deploy/apply-host-config.sh" "$clone" \
     || { echo "autoupdate: host-config apply failed (required); not marking current" >&2; exit 1; }
-echo "$remote_sha" > "$STATE"
+# Nothing slow runs between the last busy look and the restart, so this goes first.
 chmod -R a+rX "$VENV" 2>/dev/null || true
+# The old defer marker is obsolete (the drain replaced it); removed once, fine if absent.
+rm -f "$ROOT/pending.defer"
+# Last look before the restart (spec 08 I24). The install ran under the dispatch hold, but a job
+# can still be running here: a tenant that opened the device on its own, or a dispatch after an
+# install slow enough for the broker to drop the hold as overdue. It is waited out the same way;
+# a device op still in flight at the cap restarts nothing and leaves installed.sha on the old sha,
+# so the next lap retries.
+hold_write
+count_busy
+if [ $(( kids + holders + ${scopes:-0} )) -ne 0 ] || op_in_flight; then
+    idle=false; d_t0="$(date +%s)"
+    if ! wait_job_boundary "restart point"; then
+        echo "autoupdate: not restarting, not marking current" >&2
+        exit 0
+    fi
+    drained_s=$(( drained_s + $(date +%s) - d_t0 ))
+fi
+echo "$remote_sha" > "$STATE"
 
+date +%s > "$LAST_APPLY" 2>/dev/null || true   # I21: the rate limit counts from this restart
 systemctl restart tt-device-broker
-echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
+restart_rc=$?
+# I21: the crash-loop baseline, read after the restart (an explicit restart may zero NRestarts).
+systemctl show tt-device-broker -p NRestarts --value > "$LAST_APPLY_NRESTARTS" 2>/dev/null || true
+if [ "$restart_rc" -eq 0 ]; then
+    echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
+else
+    echo "autoupdate: broker restart at ${remote_sha:0:9} failed (rc=$restart_rc, via $src_desc)" >&2
+fi
+
+# One line in the broker's event journal (same fields as health_event(): ts, iso, kind), so a restart
+# the update caused is traceable without the systemd journal. restart_rc is the restart's exit code:
+# a failed restart is recorded as such, not as a clean apply. Same journal dir as the broker
+# (TT_DEVICE_MCP_HEALTH_DIR, else root's default). A single O_APPEND write of one short line, by
+# root like the broker; a failed write only warns, the apply is already done.
+EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
+now="$(date +%s.%N)"
+printf '{"ts": %s, "iso": "%s", "kind": "autoupdate_apply", "from_sha": "%s", "to_sha": "%s", "idle": %s, "drained_s": %s, "restart_rc": %s}\n' \
+    "$now" "$(date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ)" "$installed_sha" "$remote_sha" "$idle" "$drained_s" "$restart_rc" \
+    >> "$EVENTS" 2>/dev/null \
+    || echo "autoupdate: warning: could not append autoupdate_apply to $EVENTS" >&2

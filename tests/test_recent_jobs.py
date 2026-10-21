@@ -684,7 +684,7 @@ def test_a_missing_journal_never_breaks_the_job_list(monkeypatch, tmp_path, clea
 #
 # The live HOLD row is synthetic: it exists only while the device is held, so the moment the
 # device came back the window it sat refused vanished from the one place anyone looks. Seen
-# on blx02: chip 2 fell off the bus, the reset "timed out", the device was held 4m39s, and
+# on box B: chip 2 fell off the bus, the reset "timed out", the device was held 4m39s, and
 # the list jumped from the failed reset straight to the next broker start.
 
 
@@ -833,7 +833,8 @@ def test_a_hold_the_last_broker_died_holding_gets_a_row(monkeypatch, tmp_path, c
     assert "restart" in rows[0]["command"]
     assert rows[0]["status"] == "ended"
     assert 280 < float(rows[0]["runtime"].rstrip("s")) < 320, "the hold's duration was lost"
-    assert "device_released" in written, "the episode was left open to be re-reported forever"
+    assert "device_hold_orphan_closed" in written, "the episode was left open to be re-reported forever"
+    assert "device_released" not in written, "released on broker start, before any check had run"
     # Stamped at its END, like the normal release row: filed at the hold's start it sorts above
     # the whole recovery it closes, and every rung below reads as "after the hold ended".
     from datetime import datetime as _dt
@@ -970,6 +971,59 @@ def test_job_killed_by_recovery_gets_broker_kill_status_and_cause(monkeypatch, t
     assert r["command"].startswith("[MCP killed:")
 
 
+def test_job_killed_by_a_device_reset_gets_broker_kill_status_and_cause(monkeypatch, tmp_path):
+    """Spec 01 I70: the reset's own kill line reads as the broker's kill, like recovery's."""
+    log = tmp_path / "2026-09-04_134342_783.log"
+    log.write_text(
+        "JOB ID:      783\n"
+        "OWNER:       pshah\n"
+        "COMMAND:     python run.py\n"
+        "[Started at 2026-09-04T13:43:42]\n"
+        f"{srv.RESET_KILL_MARKER} {srv.READOPTED_RESET_KILLED_ERROR}\n"
+        "FINISHED:    2026-09-04T13:45:04\n"
+        "STATUS:      killed\n"
+        "EXIT CODE:   None\n"
+    )
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "jobs", {})
+
+    (r,) = srv._recent_jobs(10)
+    assert r["status"] == "broker-kill" and r["cause"] == srv.READOPTED_RESET_KILLED_ERROR
+    assert r["command"].startswith("[MCP killed: device reset]")
+
+
+def test_a_terminal_job_before_its_footer_shows_its_status_and_cause(monkeypatch, tmp_path, clear_job_state):
+    """Spec 01 I70: between the flip to KILLED and the footer (the scope stop and the sweep run in
+    between) the row says what the broker decided, never "interrupted"."""
+    log = tmp_path / "2026-09-04_134342_784.log"
+    log.write_text(
+        "JOB ID:      784\n"
+        "OWNER:       pshah\n"
+        "COMMAND:     python run.py\n"
+        "[Started at 2026-09-04T13:43:42]\n"
+        "own-stderr\n"
+        f"{srv.RECOVERY_KILL_MARKER} killed by device recovery (chip 3 left the PCIe bus): resubmit\n"
+    )
+    job = srv.Job(id="784", owner="pshah", workspace="/w", command="python run.py", queued_at="2026-09-04T13:43:40")
+    job.status = srv.JobStatus.KILLED
+    job.exit_code = -9
+    job.started_at = "2026-09-04T13:43:42"
+    job.finished_at = "2026-09-04T13:45:04"
+    job.log_file = str(log)
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "jobs", {"784": job})
+
+    (r,) = srv._recent_jobs(10)
+    assert r["status"] == "broker-kill" and r["exit_code"] == -9
+    assert "chip 3 left the PCIe bus" in r["cause"] and "own-stderr" not in r["cause"]
+    assert r["runtime"] == srv._span_str(job.started_at, job.finished_at)
+
+    job.status = srv.JobStatus.FAILED
+    log.write_text(log.read_text().replace(srv.RECOVERY_KILL_MARKER, "[plain line]"))
+    (r,) = srv._recent_jobs(10)
+    assert r["status"] == "failed", "a footerless terminal job is never 'interrupted'"
+
+
 def test_begin_action_row_creates_durable_header_file(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     monkeypatch.setattr(srv, "_action_row", None)
@@ -1007,7 +1061,7 @@ def test_in_flight_hold_row_appears_in_recent_jobs(monkeypatch, tmp_path, clear_
 
 
 def test_a_queued_job_that_never_started_is_abandoned_not_interrupted(monkeypatch, tmp_path, clear_job_state):
-    """Job 901 (cs04, 2026-09-16): queued into a hold, its owner gave up before it ever ran. It
+    """Job 901 (box E, 2026-09-16): queued into a hold, its owner gave up before it ever ran. It
     showed as "interrupted" — the word for a job the broker killed mid-run. Nothing ran."""
     logs = tmp_path / "logs"
     logs.mkdir()
@@ -1022,3 +1076,75 @@ def test_a_queued_job_that_never_started_is_abandoned_not_interrupted(monkeypatc
     j = next(r for r in srv._recent_jobs(20) if r["job_id"] == "901")
     assert j["status"] == "abandoned"
     assert "before it started" in j["cause"]
+
+
+@pytest.mark.asyncio
+async def test_a_job_cancelled_while_queued_gets_a_footer_and_reads_killed_everywhere(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """A queued job cancelled with `tt-device-mcp kill` read `killed` in the job-status API but
+    `abandoned` in the recent list, and its log stopped at "[Waiting to start...]" with no footer:
+    nothing but the runner wrote footers, and the runner never picks a cancelled job up (01 I69)."""
+    from starlette.testclient import TestClient
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    monkeypatch.setattr(srv, "job_log_dir", logs)
+    monkeypatch.setattr(srv, "jobs", {})
+    log = logs / "2026-10-21_091900_047.log"
+    log.write_text(
+        "=" * 70 + "\n"
+        "JOB ID:      047\nOWNER:       tester\nCOMMAND:     echo hi\n"
+        "QUEUED:      2026-10-21T09:19:00.000000\n" + "=" * 70 + "\n\n[Waiting to start...]\n\n"
+    )
+    job = srv.Job(
+        id="047",
+        owner="tester",
+        workspace="/tmp",
+        command="echo hi",
+        queued_at="2026-10-21T09:19:00.000000",
+        status=srv.JobStatus.QUEUED,
+        log_file=str(log),
+    )
+    srv.jobs["047"] = job
+
+    app = srv.build_asgi_app(srv.create_mcp_server())
+    with TestClient(app) as client:
+        r = client.post("/api/tt_device_job_kill", json={"job_id": "047", "owner": "tester"}).json()
+        api = client.post("/api/tt_device_job_status", json={"job_id": "047"}).json()
+
+    assert r["status"] == "cancelled", r  # the kill reply still says how it was killed
+    assert api["status"] == "killed", api
+    text = log.read_text()
+    assert "[CANCELLED before it started] cancelled by " in text
+    footer = srv._parse_job_log_footer(text.splitlines(keepends=True))
+    assert footer["status"] == "killed", text
+    assert footer["finished_at"] == job.finished_at
+
+    srv.jobs.clear()  # evicted from memory: the list reads only the log, as after cleanup or a restart
+    row = next(x for x in srv._recent_jobs(20) if x["job_id"] == "047")
+    assert row["status"] == api["status"] == "killed", row
+    assert row["wait"] == "-"
+    assert row["cause"].startswith("[CANCELLED before it started]"), row
+
+
+def test_a_running_job_that_prints_the_cancel_marker_is_not_read_as_cancelled(monkeypatch, tmp_path, clear_job_state):
+    """The marker counts only in a log that never started: a job's own output may print anything."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    monkeypatch.setattr(srv, "job_log_dir", logs)
+    monkeypatch.setattr(srv, "jobs", {})
+    (logs / "2026-10-21_091900_048.log").write_text(
+        "=" * 70 + "\n"
+        "JOB ID:      048\nOWNER:       tester\nCOMMAND:     echo hi\n"
+        "QUEUED:      2026-10-21T09:19:00.000000\n" + "=" * 70 + "\n"
+        "[Started at 2026-10-21T09:19:01.000000]\n"
+        "[CANCELLED before it started] printed by the job itself\n"
+        "\n" + "=" * 70 + "\nFINISHED:    2026-10-21T09:19:05.000000\nSTATUS:      completed\n"
+        "EXIT CODE:   0\nWAIT TIME:   1.0s\nRUNTIME:     4.0s\n" + "=" * 70 + "\n"
+    )
+
+    row = next(x for x in srv._recent_jobs(20) if x["job_id"] == "048")
+    assert row["status"] == "completed"
+    assert row["wait"] == "1.0s"
+    assert not row.get("cause"), row

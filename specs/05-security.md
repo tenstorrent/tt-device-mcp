@@ -70,7 +70,12 @@ that did not come through the broker at all.
   did not watch exit — one re-adopted across a broker restart. A broker that reaped the process
   itself uses `proc.returncode` and deletes the file unread. A re-adopted job that left no exit
   status is reported FAILED with an explanation, never COMPLETED; malformed content reads as no
-  status. A per-user (redirected) exit directory is never widened world-writable.
+  status. A per-user (redirected) exit directory is never widened world-writable. Each job starts
+  on a fresh exit file owned by the uid it runs as, renamed into place in one step, never one another
+  user or an earlier job with the same id left; a file that is not one plain regular file owned by
+  the broker or the job's submitter reads as no status (spec 01 I8). A re-adopted job's submitter
+  is the uid the broker wrote into its own log header at submit, never a value a tenant could
+  write; without it the job has no submitter and only a broker-owned file counts.
 - **I8 — `tt_device_exec` is gated, and force is scoped to exactly one gate.** Exec refuses:
   (a) under privsep, an identity-less or unhonorable caller (I2/I3); (b) while a job owned by
   someone else is running — unless `force=true`, which admits the diagnostic *alongside* the
@@ -90,13 +95,15 @@ that did not come through the broker at all.
   the root-owned NOPASSWD wrapper installed by `lock` re-enforces the same read-only allowlist
   itself (any user may exec it, so it cannot trust its caller). The streaming server-side smi
   applies the same allowlist (`smi_args_ok`) before running as the broker. A sudoers drop-in that
-  fails `visudo -c` is not installed.
+  fails `visudo -c` is not installed. `-f`/`--filename` is not allowlisted: it writes a snapshot to
+  a path the caller picks, which is a root write primitive. Workaround: `tt-device-mcp smi -s > file`.
 - **I11 — An anonymous caller owns no holder.** Where an action is gated on device holders
   (the reset gate, spec 04), the caller's identity is the socket peer uid. Over HTTP on a privsep
   host there is no identity to scope the gate to, so every tenant holder counts as foreign and the
   gate fails closed; off privsep, HTTP keeps the legacy single-tenant skip. `MIN_TENANT_UID`
   (1000) divides tenants from infrastructure: holders below it (root, telemetry daemons) never
-  count as foreign.
+  count as foreign, unless they sit in a broker job or exec scope or their uid is named in
+  `TT_DEVICE_MCP_TENANT_UIDS` (`device_holders.is_tenant`, 04 I6).
 
 ## Interfaces
 
@@ -128,7 +135,9 @@ Consumed by other subsystems and by tests:
   time, `None` over HTTP, carried in the durable queued-job spec so a restart preserves the
   privsep target.
 - **`device_holders.MIN_TENANT_UID`** (= 1000): the tenant/infrastructure boundary, used by the
-  reset gate (spec 04) and the health gate's holder checks (spec 03).
+  reset gate (spec 04) and the health gate's holder checks (spec 03) through
+  `device_holders.is_tenant`, which also counts a broker-scoped holder and a
+  `TT_DEVICE_MCP_TENANT_UIDS` uid.
 - **Lock surface** (`cli.py`): `cmd_lock` / `cmd_unlock` (sudo; `tt-device-mcp lock|unlock`);
   artifacts managed by them: the udev rule (`99-tenstorrent-ttdev.rules`), the
   `TT_DEVICE_MCP_DEVICE_GROUP=ttdev` line in the broker unit, the read-only smi wrapper +
@@ -187,11 +196,14 @@ lifecycle can assert that a remaining holder is a straggler rather than a tenant
 pids present in its own first scan — a pid that appears only in a later rescan is a holder that
 opened the device after the reclaim began, not a straggler of the allocation that just ended, and
 is reported as a survivor rather than escalated onto. Two exclusions are structural: it never
-signals uids below `MIN_TENANT_UID` (infrastructure that survives a board reset), and it never
+signals a holder `is_tenant` does not count (infrastructure below `MIN_TENANT_UID` that survives a
+board reset), and it never
 signals itself or its own process group. It has no way to recognize "a broker-owned job" as such
 — under privsep that job runs as its submitter's uid and looks like any other tenant holder — so
 protecting a live broker job from the reclaim is the in-flight guard's job (`_broker_work_in_flight`,
-re-checked after the reclaim returns), not a property of this function. A job the broker itself
+re-checked after the reclaim returns), not a property of this function. The guard also refuses
+while a re-adopted job's scope has not ended, even once the job reads KILLED: its processes may
+still be winding down, and a SIGTERM there skips the scope's own graceful stop. A job the broker itself
 means to end still terminates through `_kill_job`.
 
 **Job-step routes are root-only.** `/api/tt_device_pre_step` and `/api/tt_device_post_step`
@@ -244,7 +256,12 @@ converts "unprotected" into "believed protected".
 **Why `MIN_TENANT_UID`.** System uids (< 1000) belong to infrastructure that legitimately holds
 the device continuously — telemetry exporters, the broker's own tooling. Treating them as tenants
 would make every holder-gated action permanently refusable on any instrumented host. Treating
-uids ≥ 1000 as tenants is the conservative default: a human's process is never reset over. Spec 04
+uids ≥ 1000 as tenants is the conservative default: a human's process is never reset over. A job
+submitted by a service account is still a tenant's job: its processes sit in the broker's
+`ttdev-job-*.scope`, which they cannot leave, so a straggler that outlives the job's KILLED or
+finished status (seconds while the scope winds down) still blocks. A service account that also
+runs device work outside the broker is named in `TT_DEVICE_MCP_TENANT_UIDS`. Root is never one,
+even if named: its daemons hold the device permanently and would block every gate for good. Spec 04
 (I6, I7) defines how the reset gate and the automatic ladder consume the boundary.
 
 **Why the exit file defers to the broker's own reaping.** A record written by the job is the only
@@ -276,6 +293,7 @@ job-side record to the one case with no alternative.
 | I6 (uid rendering) | `tests/test_peercred.py::TestUsernameForUid::test_root_resolves`, `tests/test_peercred.py::TestUsernameForUid::test_unknown_uid_falls_back`, `tests/test_peercred.py::TestUsernameForUid::test_credentials_username_property` |
 | I7 (re-adopted exit recovery) | `tests/test_readopt.py::test_readopted_job_recovers_its_real_exit_code`, `tests/test_readopt.py::test_a_signalled_job_records_a_real_exit_status` |
 | I7 (no status ≠ completed) | `tests/test_readopt.py::test_readopted_job_with_no_exit_status_is_not_called_completed` |
+| I7 (fresh file per job; a co-tenant's or linked file is no status) | `tests/test_job_exit_file.py::test_a_co_tenant_cannot_win_the_path_while_the_fresh_file_is_made`, `tests/test_job_exit_file.py::test_an_exit_file_another_user_owns_reads_as_unknown`, `tests/test_job_exit_file.py::test_an_exit_file_that_is_not_one_plain_file_reads_as_unknown`, `tests/test_job_exit_file.py::test_a_co_tenants_exit_0_never_releases_a_readopted_job_without_a_reset`, `tests/test_job_exit_file.py::test_a_readopted_privsep_jobs_clean_exit_is_still_its_own`, `tests/test_job_exit_file.py::test_a_co_tenants_file_is_still_unknown_for_a_readopted_job`, `tests/test_job_exit_file.py::test_a_log_another_user_could_have_written_names_no_submitter` |
 | I7 (redirected dir not widened) | `tests/test_readopt.py::test_a_redirected_job_exit_dir_is_not_made_world_writable`, `tests/test_readopt.py::test_the_job_exit_dir_is_redirectable` |
 | I8 (degraded / live-probe gate) | `tests/test_device_safety.py::test_exec_refuses_the_device_the_broker_is_working_on`, `tests/test_device_safety.py::test_exec_refuses_a_chip_off_the_bus` |
 | I8 (force alongside foreign, audited) | `tests/test_device_safety.py::test_exec_force_runs_a_diagnostic_alongside_a_foreign_job` |
