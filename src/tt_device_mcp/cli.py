@@ -1686,7 +1686,8 @@ _NO_TIMEOUT_HELP = (
     f"No timeout except on contention: -t is the time limit, but while no other job waits the job "
     f"is never stopped for time. Once the limit has passed and a job is waiting, it has "
     f"{PREEMPT_GRACE_SEC}s to end itself (no signal is sent), then it gets SIGTERM and, "
-    f"{PREEMPT_KILL_GRACE_SEC}s later, SIGKILL. Ending cleanly on SIGTERM gets the fast check; a "
+    f"{PREEMPT_KILL_GRACE_SEC}s later, SIGKILL. Returning 0 (on its own or on SIGTERM) means no "
+    f"check and no reset; ending cleanly on SIGTERM with another status gets the fast check; a "
     f"SIGKILL means a device reset and the full check before the next job. Status shows "
     f"PREEMPTABLE <x>min, then PREEMPTING <s>s. You MUST watch the broker (tt-device-mcp status)."
 )

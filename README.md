@@ -74,9 +74,12 @@ the job has one minute to see the waiter and end itself; the broker sends it no
 signal in that minute. The minute starts at the later of x and the waiting job's
 arrival. If a job is still waiting when the minute runs out, the broker kills the
 job's whole process tree (SIGTERM, then SIGKILL at most 10 s later). The job ends
-`preempted`. If every process of the job exits through its own code on SIGTERM
-(the broker reads this from the kernel's exit records, which may need root), the usual
-fast between-jobs check runs. Otherwise (SIGKILL needed, any process killed by a
+`preempted`. If the job returns 0, either by ending itself inside the minute or by
+handling SIGTERM so that every process exits through its own code, no health check and no
+reset run before the next job (unless the device was already held or owed a reset for
+another reason). If every process of the job exits through its own code on SIGTERM with
+another exit status, or one the broker cannot prove (it reads this from the kernel's exit
+records, which may need root), the usual fast between-jobs check runs. Otherwise (SIGKILL needed, any process killed by a
 signal, or the exits could not be witnessed) the device is reset and passes the full
 health check, fabric included, before the waiting job starts. If every waiting job
 leaves inside the minute, nothing happens and a later one starts a fresh minute. A job
