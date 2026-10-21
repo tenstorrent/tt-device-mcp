@@ -13348,6 +13348,10 @@ VALIDATOR_BUILD_REQUEST_TIMEOUT_SEC = 30.0
 # Spec 03 I75: the startup gate task, and when it stopped waiting on re-adopted jobs (monotonic).
 _startup_verify_task: Optional[asyncio.Task] = None
 _startup_verify_ready_at: Optional[float] = None
+# Spec 03 I76, report only: wall-clock times of the gate task's start and of its stop waiting on
+# re-adopted jobs (the check's start), for the /health view's since/check_started_at/deadline.
+_startup_verify_started_wall: Optional[float] = None
+_startup_verify_ready_wall: Optional[float] = None
 _startup_verify_deferral_logged: Optional[str] = None
 # How long past the re-adopted jobs' end the escalations still leave a startup hold to that gate:
 # its hugepage wait, its fabric pass and the rest of the full check, with margin.
@@ -13411,12 +13415,24 @@ def _startup_verify_view() -> Optional[dict]:
     live = [jid for jid in readopted_scopes if (job := jobs.get(jid)) is not None and job.status is JobStatus.RUNNING]
     if len(live) != len(readopted_scopes) or _device_liveness_reason():
         return None
+    started = _startup_verify_started_wall
+    checking = _startup_verify_ready_wall if not live else None
     return {
         "phase": "readopted_job_running" if live else "verifying",
         "readopted_job_ids": live,
         "fault": False,
-        "since": device_hold_episode_since or None,
+        "since": device_hold_episode_since or _wall_iso(started),
+        # When the check began and the latest it may end: the hugepage wait plus the check's own
+        # bound (STARTUP_VERIFY_DEFER_MAX_SEC). Null while a re-adopted job still runs.
+        "check_started_at": _wall_iso(checking),
+        "deadline": _wall_iso(checking + STARTUP_VERIFY_DEFER_MAX_SEC if checking is not None else None),
+        "bound_sec": STARTUP_VERIFY_DEFER_MAX_SEC,
     }
+
+
+def _wall_iso(wall: Optional[float]) -> Optional[str]:
+    """Local ISO time of a time.time() value, the format of the hold's ``since``; None stays None."""
+    return datetime.fromtimestamp(wall).isoformat() if wall is not None else None
 
 
 def _sync_fsm_readopted_jobs() -> None:
@@ -13643,11 +13659,12 @@ async def _verify_fabric_on_start() -> None:
     A pass that exited 77 because the validator or the hugepages were not there yet is owed again
     once they are (see _await_startup_prerequisites).
     """
-    global _startup_prereq_task, _startup_verify_ready_at
+    global _startup_prereq_task, _startup_verify_ready_at, _startup_verify_ready_wall
     try:
         while readopted_scopes:
             await asyncio.sleep(_SCOPE_POLL_SEC)
         _startup_verify_ready_at = time.monotonic()
+        _startup_verify_ready_wall = time.time()
         # Read before the pass: a validator that lands while it runs must still be waited for.
         missing = await asyncio.to_thread(fabric.validator_missing)
         if missing and logger:
@@ -13732,6 +13749,7 @@ async def run_startup_tasks() -> None:
     as its own.
     """
     global _startup_tasks_done, _startup_verify_task, _startup_verify_ready_at
+    global _startup_verify_ready_wall, _startup_verify_started_wall
     if _startup_tasks_done:
         return
     _startup_tasks_done = True
@@ -13840,6 +13858,8 @@ async def run_startup_tasks() -> None:
     # And then answers it properly, once the device is ours to test — this lifts the hold above on a
     # healthy verdict, holds/escalates on a wedge.
     _startup_verify_ready_at = None
+    _startup_verify_ready_wall = None
+    _startup_verify_started_wall = time.time()
     _startup_verify_task = asyncio.create_task(_verify_fabric_on_start())
     _sync_fsm_readopted_jobs()  # spec 03 I76: the jobs re-adopted above, now the gate owns the hold
 
@@ -14294,6 +14314,10 @@ def create_mcp_server() -> MCPServer:
             view = _startup_verify_view()
             if view and job_id in view["readopted_job_ids"]:
                 result["startup_verify"] = view
+        elif job.status == JobStatus.QUEUED and (view := _startup_verify_view()):
+            # Spec 03 I76: a queued job waits on the startup check, not on a fault; its bound is in the view.
+            result["hold_reason"] = "held: startup check; dispatches when it passes"
+            result["startup_verify"] = view
         if job.preemptable:
             result["no_timeout_except_on_contention"] = True
             result["preemptable"] = True  # the earlier name, for clients that read it

@@ -497,6 +497,8 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # The startup gate task (spec 03 I75): left pending, a later test's startup hold would never escalate.
     monkeypatch.setattr(srv, "_startup_verify_task", None, raising=False)
     monkeypatch.setattr(srv, "_startup_verify_ready_at", None, raising=False)
+    monkeypatch.setattr(srv, "_startup_verify_started_wall", None, raising=False)
+    monkeypatch.setattr(srv, "_startup_verify_ready_wall", None, raising=False)
     monkeypatch.setattr(srv, "_startup_verify_deferral_logged", None, raising=False)
     # The 10-min hold bound's bookkeeping (spec 04 I76) is keyed by the episode's start stamp: two tests
     # that open a hold at the same fixed stamp would share one ladder record.
