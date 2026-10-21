@@ -11,8 +11,10 @@ reset is refused. No signal here reaches a real process: every kill is a recorde
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import signal
+import time
 
 import pytest
 
@@ -65,6 +67,7 @@ class _Box:
         kw.setdefault("getpid", lambda: 1)
         kw.setdefault("unkillable", lambda pid: pid in self.stuck)
         kw.setdefault("offbus_chips", lambda: [])
+        kw.setdefault("holder_in_reset", lambda pid: False)
         return prs.clear_device_readers(**kw)
 
 
@@ -225,6 +228,7 @@ def _broker_seams(monkeypatch, box, order, events):
             getpid=lambda: 1,
             getpgid=lambda pid: 1 if pid == 1 else 2,
             unkillable=lambda pid: pid in box.stuck,
+            holder_in_reset=lambda pid: False,
             offbus_chips=lambda: [],
         ),
     )
@@ -346,3 +350,67 @@ async def test_the_bridge_rung_journals_its_detached_targets_and_kills_nothing(m
     assert ok is True and sbrs == ["13"]
     scans = [f for k, f in events if k == "pre_reset_holder_scan"]
     assert len(scans) == 1 and scans[0]["outcome"] == "targets_detached" and scans[0]["chips"] == ["13"]
+
+
+# --- review fixes: a bounded detach, a reset in flight, an incomplete scan ---
+
+
+def test_a_detach_that_blocks_in_the_kernel_is_bounded_and_refuses_the_reset(monkeypatch):
+    import threading
+
+    box = _Box(monkeypatch, holders=[READER])
+    never = threading.Event()
+
+    def blocked_detach(idx):
+        never.wait(5)  # stands in for a sysfs remove stuck in the kernel; released at the end
+        return True
+
+    async def scenario():
+        ticks = []
+
+        async def ticker():
+            while True:
+                ticks.append(1)
+                await asyncio.sleep(0.01)
+
+        t = asyncio.create_task(ticker())
+        t0 = time.monotonic()
+        result = await box.run(
+            tenants_block=True, offbus_chips=lambda: ["3"], detach_chip=blocked_detach, detach_timeout_sec=0.2
+        )
+        took = time.monotonic() - t0
+        t.cancel()
+        return result, took, len(ticks)
+
+    try:
+        result, took, ticks = asyncio.run(scenario())
+    finally:
+        never.set()
+    assert result.outcome == "offbus_undetached" and result.detach_timed_out
+    assert result.undetached == ["3"] and result.refusal()
+    assert took < 2 and ticks >= 5  # the loop kept running while the detach was stuck
+    assert box.sent == {}  # nothing signalled
+
+
+def test_a_holder_inside_a_reset_is_never_signalled_and_the_reset_is_refused(monkeypatch):
+    box = _Box(monkeypatch, holders=[READER])
+    result = asyncio.run(box.run(tenants_block=False, holder_in_reset=lambda pid: pid == READER.pid))
+    assert result.outcome == "reset_in_flight" and result.refusal()
+    assert box.sent == {}
+
+
+def test_a_reset_already_running_refuses_before_the_scan(monkeypatch):
+    box = _Box(monkeypatch, holders=[READER])
+    result = asyncio.run(box.run(tenants_block=False, reset_active=lambda: "ttdev-reset-9-1"))
+    assert result.outcome == "reset_in_flight" and "ttdev-reset-9-1" in result.refusal()
+    assert box.sent == {} and result.found == []
+
+
+def test_a_registered_local_reset_and_its_child_read_as_in_reset(monkeypatch):
+    monkeypatch.setattr(prs.device_holders, "descends_from", lambda pid, anc: pid == anc or (pid, anc) == (52, 51))
+    prs.note_reset_pid(51)
+    try:
+        assert prs.in_reset(51) and prs.in_reset(52)
+    finally:
+        prs.forget_reset_pid(51)
+    assert not prs._reset_pids

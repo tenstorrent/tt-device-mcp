@@ -9805,7 +9805,9 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
     automatic = (owner or "").startswith("[broker]")
     job = current_process
     protected = [job.pid] if job is not None and job.returncode is None and job.pid else []
-    result = await clear_device_readers(tenants_block=automatic, protected=protected)
+    result = await clear_device_readers(
+        tenants_block=automatic, protected=protected, reset_active=recovery_mechanism.scope_active
+    )
     refused = result.refusal()
     health_event(
         "pre_reset_holder_scan",
@@ -9819,6 +9821,9 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
         survivors=result.survivors,
         detached=result.detached,
         undetached=result.undetached,
+        detach_timed_out=result.detach_timed_out,
+        reset_in_flight=result.reset_in_flight or None,
+        gaps=result.gaps,
         scan_complete=result.scan_complete,
         source=result.source,
         seconds=result.seconds,

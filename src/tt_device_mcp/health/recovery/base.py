@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from tt_device_mcp import aio, alert, metrics, privileges
+from tt_device_mcp import aio, alert, metrics, pre_reset_scan, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
 from tt_device_mcp.health import chip_state
 from tt_device_mcp.health.aiclk_ceiling import CEILING
@@ -981,6 +981,8 @@ class RecoveryMechanism:
             # The child now owns the inherited lock for exactly its lifetime.
             os.close(lock_fd)
             lock_fd = None
+            # Outside a reset scope: the pre-reset scan knows it as a reset by this pid (04 I92).
+            pre_reset_scan.note_reset_pid(proc.pid)
 
             async def wait_and_stream() -> int:
                 with open(output_path, "rb") as reader:
@@ -1029,6 +1031,9 @@ class RecoveryMechanism:
             self._write_action_log(owner, command, dt, "error", None)
             return None, f"reset could not be launched: {exc}"
         finally:
+            # One still running (never finished in time) stays registered, as it keeps the local lock.
+            if proc is not None and proc.returncode is not None:
+                pre_reset_scan.forget_reset_pid(proc.pid)
             if lock_fd is not None:
                 os.close(lock_fd)
             if output_file is not None:
