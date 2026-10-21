@@ -22,6 +22,7 @@ from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 
 T0 = 1_800_000_000.0
 START = T0 - 60  # the hold began a minute before the read
+_BOUND_RUNG = "full ladder"  # spec 04 I76; the fixture opts in no host rung
 EXPECTED = 32
 TABLES = {"tt-galaxy-bh": {1: 0x00, 2: 0x40, 3: 0xC0, 4: 0x80}}
 TRAY_CHIPS = {
@@ -82,8 +83,10 @@ def held(monkeypatch, galaxy_trays):
     # Anything that would move a rung or touch a chip fails the test outright.
     monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: pytest.fail("the report spawned a rung"))
     st["m"] = m
+    feeds = dict(hr._deadline_feeds)
     yield st
-    hr.unregister_deadline_feed("hold_bound")
+    hr._deadline_feeds.clear()
+    hr._deadline_feeds.update(feeds)  # the broker's own I76 feed stays registered for later tests
 
 
 def _payload():
@@ -112,8 +115,8 @@ def test_class_a_whole_tray_reports_its_tray_by_bus_and_the_ceiling_window(held)
     p = _payload()
     assert p["hold_class"] == "A"
     assert p["hold_started_at"] == _iso(START)
-    assert (p["next_rung"], p["next_rung_at"]) == ("forced ladder", _iso(START + 600))
-    assert p["next_rung_source"] == "hold ceiling window 1"
+    assert (p["next_rung"], p["next_rung_at"]) == (_BOUND_RUNG, _iso(START + 600))
+    assert p["next_rung_source"] == "hold bound (600s)"
     rows = _rows(p)
     assert rows["0x40"]["tray"] == 2 and rows["0x40"]["chips_present"] == [] and rows["0x40"]["arc_alive"] == []
     assert rows["0x00"]["chips_present"] == TRAY_CHIPS[0x00] == rows["0x00"]["arc_alive"]
@@ -151,7 +154,7 @@ def test_class_b1_after_its_one_shot_reports_the_ceiling(held, monkeypatch):
     monkeypatch.setattr(srv, "isolated_chips", {"3"})
     monkeypatch.setattr(srv, "device_hold_offbus_escalated", True)
     p = _payload()
-    assert p["hold_class"] == "B1" and p["next_rung_source"] == "hold ceiling window 1"
+    assert p["hold_class"] == "B1" and p["next_rung_source"] == "hold bound (600s)"
 
 
 def test_class_b2_part_of_one_tray(held):
@@ -199,7 +202,7 @@ def test_fabric_77_only_hold_names_the_10_min_bound(held, monkeypatch):
     p = _payload()
     assert p["hold_class"] == "D"
     assert (p["next_rung_source"], p["next_rung_at"], p["next_rung_due"]) == (
-        "hold ceiling window 1",
+        "hold bound (600s)",
         _iso(START + 600),
         False,
     )
@@ -240,27 +243,29 @@ def test_a_later_ceiling_window_is_reported_after_the_first(held, monkeypatch):
     assert p["next_rung_at"] == _iso(START + 1200) and p["next_rung_source"] == "hold ceiling window 2"
 
 
-def test_the_hold_bound_feed_wins_when_earlier(held, monkeypatch):
-    """The hook the universal hold bound feeds: with a 30-min ceiling, its 10-min mark is next."""
+def test_the_broker_registers_its_hold_bound_feed(held, monkeypatch):
+    """Spec 04 I75/I76: the broker's own bound is the registered feed, and it follows the ceiling."""
+    assert hr._deadline_feeds.get("hold_bound") is srv._hold_bound_feed
     monkeypatch.setattr(srv, "_stuck_hold_ceiling_sec", lambda: 1800)
     held["off"] = {3}
-    assert _payload()["next_rung_at"] == _iso(START + 1800), "no feed: no 10-min mark is claimed"
-    hr.register_deadline_feed("hold_bound", hr.hold_bound_candidate)
     p = _payload()
-    assert (p["next_rung_at"], p["next_rung"]) == (_iso(START + 600), "full ladder, then power cycle")
+    assert (p["next_rung_at"], p["next_rung_source"]) == (_iso(START + 1800), "hold bound (1800s)")
 
 
-def test_the_hold_bound_inside_the_cooldown_moves_to_its_end():
+def test_the_hold_bound_candidate_names_the_cooldown_only_for_its_host_rung():
+    """The ladder runs at the mark even inside the cooldown; only the host rung waits for its end."""
     c = hr.hold_bound_candidate(START, T0, START + 1800)
-    assert c.at == START + 1800 and "after cooldown" in c.source
-    assert hr.hold_bound_candidate(START, T0, None).at == START + 600
-    assert hr.hold_bound_candidate(START, T0, START + 300).at == START + 600, "cooldown ends before the mark"
+    assert c.at == START + 600 and c.source == "hold bound (600s)"
+    assert c.rung == f"full ladder, then power cycle at the cooldown's end ({_iso(START + 1800)})"
+    assert hr.hold_bound_candidate(START, T0, None).rung == "full ladder, then power cycle"
+    assert hr.hold_bound_candidate(START, T0, START + 300).rung == "full ladder, then power cycle", "ends first"
+    assert hr.hold_bound_candidate(START, T0, START + 1800, host_rung=None).rung == "full ladder"
 
 
 def test_a_broken_feed_reports_nothing(held):
     hr.register_deadline_feed("hold_bound", lambda *a: 1 / 0)
     held["off"] = set(TRAY_CHIPS[0x40])
-    assert _payload()["next_rung_source"] == "hold ceiling window 1"
+    assert _payload()["next_rung_source"] == "hold ceiling window 1", "the chain still names the mark"
 
 
 def test_recovering_reports_too_and_healthy_does_not(held):
@@ -357,7 +362,7 @@ def test_the_off_bus_pass_waits_for_the_ladder_to_have_run(held, monkeypatch):
     _gated(monkeypatch, gated=True)
     opc._pending["ladder_ran"] = False
     monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "/bin/true")
-    assert _payload()["next_rung_source"] == "hold ceiling window 1"
+    assert _payload()["next_rung_source"] == "hold bound (600s)"
     assert opc.watchdog_due_at(_episode()) is None and opc.watchdog_due_at("other") is None
 
 
@@ -373,7 +378,7 @@ def test_the_i39_progress_retry_is_named(held, monkeypatch):
     assert p["next_rung_at"] == _iso(T0) and p["next_rung_due"] is True
     assert _fires(T0, monkeypatch) == ["progress_retry"]
     held["m"].progress_retry = ("another episode", srv.time.monotonic() - 1)
-    assert _payload()["next_rung_source"] == "hold ceiling window 1"
+    assert _payload()["next_rung_source"] == "hold bound (600s)"
 
 
 def test_a_declined_window_stays_reported_as_due(held, monkeypatch):
@@ -731,3 +736,129 @@ def test_a_startup_verify_stand_down_is_reported_with_its_bounded_end(held, monk
     assert abs(datetime.fromisoformat(at).timestamp() - end) <= 2
     t, act = _first_act(read_at, end + 60, monkeypatch, step=5.0)
     assert act == "forced ladder" and abs(t - end) <= 5
+
+
+# ---- spec 04 I76 as the /health deadline feed (spec 04 I75) ---------------------------------------
+
+
+def _class(held, monkeypatch, cls: str) -> None:
+    if cls == "A":
+        held["off"] = set(TRAY_CHIPS[0x40])
+    elif cls == "B1":
+        held["off"] = {3}
+        monkeypatch.setattr(srv, "isolated_chips", {"3"})
+        monkeypatch.setattr(srv, "device_hold_offbus_escalated", True)  # its one-shot spent
+    else:
+        monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: True)
+
+
+@pytest.mark.parametrize("cls", ["A", "B1", "D"])
+def test_the_bound_mark_is_reported_for_each_fault_class(held, monkeypatch, cls):
+    """The bound's ladder, then its host rung, at hold start + 600 s; the watchdog fires it then."""
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    _class(held, monkeypatch, cls)
+    p = _payload()
+    assert p["hold_class"] == cls
+    assert (p["next_rung"], p["next_rung_source"], p["next_rung_at"]) == (
+        "full ladder, then power cycle",
+        "hold bound (600s)",
+        _iso(START + 600),
+    )
+    assert "ceiling_window" not in _fires(START + 599, monkeypatch)
+    assert "ceiling_window" in _fires(START + 600, monkeypatch)
+
+
+@pytest.mark.parametrize("latch", ["fabric_known_fault", "topology_hardware_fault"])
+def test_a_latched_hold_reports_the_same_mark(held, monkeypatch, latch):
+    """Spec 03 I42/I46 latches change what the check after the ladder sees, never when the bound fires."""
+    monkeypatch.setattr(srv.health_monitor, latch, "1 port missing vs the cabling descriptor", raising=False)
+    monkeypatch.setattr(srv, "_fabric_77_only_hold", lambda: True)
+    p = _payload()
+    assert (p["next_rung_source"], p["next_rung_at"]) == ("hold bound (600s)", _iso(START + 600))
+    assert _fires(START + 600, monkeypatch) == ["ceiling_window"]
+
+
+def test_a_cooldown_hold_reports_the_ladder_at_the_mark_and_the_host_rung_at_its_end(held, monkeypatch):
+    """Spec 04 I65: inside a boot/post-cycle cooldown the ladder still runs at the mark;
+    only the host rung waits. Once the bound's ladder ran, the watchdog's own chain names what is next."""
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    held["off"] = {3, 4, 5, 6}
+    end = START + 1800
+    held["m"].power_cycle_cooldown_state = _cool(until=end, last=START - 100)
+    p = _payload()
+    assert (p["next_rung_source"], p["next_rung_at"]) == ("hold bound (600s)", _iso(START + 600))
+    assert p["next_rung"] == f"full ladder, then power cycle at the cooldown's end ({_iso(end)})"
+    assert _fires(START + 600, monkeypatch) == ["ceiling_window"]
+    # The bound's ladder ran and did not heal; its host rung was denied by the cooldown.
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
+    _bound_ladder_ran(monkeypatch, 600.0, False)
+    monkeypatch.setattr(srv, "_hold_bound_cycle_age", 600.0)
+    _deny(held["m"], end, last=START - 100)
+    assert srv._hold_bound_feed(START, START + 700, end) is None, "spent: the chain names what is next"
+    assert _report(START + 700)[1] != "hold bound (600s)"
+
+
+def test_after_the_bound_ladder_the_chain_names_the_host_rung(held, monkeypatch):
+    held["off"] = {3, 4, 5, 6}
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
+    _bound_ladder_ran(monkeypatch, 600.0, True)
+    assert srv._hold_bound_feed(START, START + 700, None) is None
+    assert _report(START + 700)[1] == "hold bound host rung"
+
+
+@pytest.mark.parametrize("case", ["window_spent", "host_action", "tenant", "rung_pending", "past_mark"])
+def test_the_bound_feed_is_silent_when_its_mark_is_not_next(held, monkeypatch, case):
+    held["off"] = {3, 4, 5, 6}
+    monkeypatch.setattr(srv, "_hold_bound_episode", _episode())
+    now = T0
+    if case == "window_spent":
+        monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
+    elif case == "host_action":
+        monkeypatch.setattr(held["m"], "host_action_requested", ("power_cycle", srv.time.monotonic()))
+    elif case == "tenant":
+        monkeypatch.setattr(srv, "_hold_bound_tenant_blocker", "pid 4242 (python3)")
+    elif case == "rung_pending":
+        monkeypatch.setattr(srv, "_hold_bound_rung_pending", True)
+    else:
+        now = START + 700  # due and unrun: the chain's window 1 names it as due
+    assert srv._hold_bound_feed(START, now, None) is None
+    if case == "past_mark":
+        p = srv._health_payload(now=datetime.fromtimestamp(now))
+        assert (p["next_rung_source"], p["next_rung_due"]) == ("hold ceiling window 1", True)
+
+
+def test_the_bound_feed_names_the_host_rung_the_box_opts_into(held, monkeypatch):
+    held["off"] = {3, 4, 5, 6}
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
+    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: True)
+    assert srv._hold_bound_feed(START, T0, None).rung == "full ladder, then warm reboot"
+    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
+    assert srv._hold_bound_feed(START, T0, None).rung == "full ladder"
+
+
+def test_the_bound_feed_yields_to_a_startup_stand_down(held, monkeypatch):
+    monkeypatch.setattr(srv, "_forced_run_route", lambda kind, age, mono=None: srv.ForcedRoute(srv.ROUTE_STAND_DOWN))
+    held["off"] = {3, 4, 5, 6}
+    assert srv._hold_bound_feed(START, T0, None) is None
+
+
+def test_a_healthy_device_reports_no_bound(held, monkeypatch):
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    held["state"] = ServerState.HEALTHY
+    p = _payload()
+    assert not {"next_rung", "next_rung_at", "next_rung_source"} & set(p)
+
+
+def test_the_bound_feed_moves_no_clock(held, monkeypatch):
+    """Reporting only (TTR effect 0): reading /health leaves every I76 clock where it was."""
+    held["off"] = {3, 4, 5, 6}
+    names = (
+        "_hold_bound_ladder_age",
+        "_hold_bound_cycle_age",
+        "_hold_bound_rung_pending",
+        "device_hold_escalate_bucket",
+    )
+    before = {n: getattr(srv, n) for n in names}
+    _payload()
+    srv._hold_bound_feed(START, T0, None)
+    assert {n: getattr(srv, n) for n in names} == before

@@ -1252,12 +1252,20 @@ each rung fires only when the gentler one failed or cannot apply.
   is reported at its own time with `next_rung_due: true`, never moved to a later window: the
   watchdog retries it every tick. With no armed deadline the fields are `null`. A feed that raises
   reports nothing, so `/health` always answers. The helper never claims, moves or expires a clock (it
-  reads a pending host request without `host_action_pending()`, which drops an expired one). A
-  hold bound registers through `register_deadline_feed`: `hold_bound_candidate` reports the full
-  ladder, then a power cycle, at hold start plus 600 s, or at the boot/post-cycle cooldown's end when
-  that is later. It is not registered until the code that enforces the bound registers it, because
-  `/health` names only rungs some code will fire. TTR effect 0 for every class: nothing here changes
-  when or whether a rung fires.
+  reads a pending host request without `host_action_pending()`, which drops an expired one). The
+  broker registers the I76 hold bound under `hold_bound` through `register_deadline_feed`; it stands
+  in for ceiling window 1 and, being the watchdog's last branch, loses a tie at the same time to any
+  other candidate. Its candidate (`hold_bound_candidate`) is the bound's mark, hold start plus the
+  ceiling (600 s), source `hold bound (<ceiling>s)`, rung `full ladder, then power cycle` (`warm
+  reboot` where only that is opted in; `full ladder` with no host rung opted in). Inside a
+  boot/post-cycle cooldown the mark does not move, because the watchdog runs the bound's ladder there;
+  only the host rung waits, so the rung reads `... at the cooldown's end (<time>)`. The feed is silent,
+  and the chain names what fires next, once window 1 is spent or past due, once the bound's ladder ran,
+  its host rung was asked or is pending, or a tenant blocks it; while a requested host action is
+  pending; and when the forced run's routing sends the mark anywhere but the ladder (the startup
+  gate's stand-down). It reads the bound's state and claims, moves or expires no clock. TTR effect 0
+  for every class (A, B1, B2, C, D, AC-needed): it only reports; when the ladder and the host rung
+  fire, and the full health check (fabric included) every lift needs, are unchanged.
 - **I70 — An unkillable leftover fences the device for at most 600 s; then the broker takes the
   host rung (fault class `J-unkillable-leftover`).** The class: a reaped job's leftover (01 I16)
   stuck in the kernel (state D, or SIGKILL pending) still holds `/dev/tenstorrent`. No reset can
@@ -1450,7 +1458,9 @@ each rung fires only when the gentler one failed or cannot apply.
   and host rung ignore it, no env or config switches the bound off, and the boot rung inventory's
   `RUNG OFF forced-escalation` warning says so. `/health` carries `hold_bound` while a hold is open:
   `bound_sec`, `deadline`, `held_age_sec`, `next_step` (`ladder`, `power-cycle` or
-  `tenant_blocked` with `blocked_by`) and, while the host rung waits on it, `cooldown_until`. One helper, `hold_bound_deadline()`, gives the open
+  `tenant_blocked` with `blocked_by`) and, while the host rung waits on it, `cooldown_until`; until the
+  bound's ladder runs, `next_rung`, `next_rung_at` and `next_rung_source` name its mark too (I75's
+  deadline feed). One helper, `hold_bound_deadline()`, gives the open
   hold's escalation deadline for every hold kind: its start + the ceiling, or the end of a running
   power-cycle cooldown when that is later; `/health`'s `deadline` and the stuck-hold event's and
   alert's `escalation_deadline` all read it. A stuck-hold event past the bound reports `escalated`
@@ -2250,4 +2260,4 @@ sees a silent fabric pass.
 | I75 (the I73 class-A 10-min ladder and the I70 unkillable-leftover host rung are named when the code fires them) | `tests/test_health_hold_report.py::test_the_class_a_10_min_ladder_is_named_and_fires_when_reported`, `tests/test_health_hold_report.py::test_the_class_a_ladder_is_not_named_when_the_cooldown_ends_first`, `tests/test_health_hold_report.py::test_the_unkillable_leftover_host_rung_is_named` |
 | I75 (the I65 retry only when armed for the episode and not refused by a guard; a pending host action is reported, never dropped) | `tests/test_health_hold_report.py::test_the_cooldown_retry_is_named_only_when_the_watchdog_asks_it`, `tests/test_health_hold_report.py::test_the_cooldown_retry_fires_when_reported`, `tests/test_health_hold_report.py::test_a_pending_host_action_is_reported_and_left_alone` |
 | I75 (one routing for the report and the forced run: a window inside the post-ladder check, a window after a ladder that did not recover, a class-A mark inside the check window, a startup-gate stand-down; each reported where the watchdog acts) | `tests/test_health_hold_report.py::test_the_report_names_the_rung_the_forced_run_routes_to`, `tests/test_health_hold_report.py::test_a_class_a_ladder_mark_inside_the_check_window_is_not_reported`, `tests/test_health_hold_report.py::test_a_startup_verify_stand_down_is_reported_with_its_bounded_end` |
-| I75 (deadline feeds: the hold bound wins when earlier, moves to the cooldown end inside it; a broken feed reports nothing) | `tests/test_health_hold_report.py::test_the_hold_bound_feed_wins_when_earlier`, `tests/test_health_hold_report.py::test_the_hold_bound_inside_the_cooldown_moves_to_its_end`, `tests/test_health_hold_report.py::test_a_broken_feed_reports_nothing` |
+| I75 (deadline feeds: the broker registers the I76 bound; its mark and source per fault class and latch, fired by the watchdog then; inside a cooldown the ladder stays at the mark and only the host rung names the end; silent once spent, past due, pending, tenant-blocked or stood down; names the opted-in host rung; nothing when HEALTHY; read-only; a broken feed reports nothing) | `tests/test_health_hold_report.py::test_the_broker_registers_its_hold_bound_feed`, `tests/test_health_hold_report.py::test_the_bound_mark_is_reported_for_each_fault_class`, `tests/test_health_hold_report.py::test_a_latched_hold_reports_the_same_mark`, `tests/test_health_hold_report.py::test_a_cooldown_hold_reports_the_ladder_at_the_mark_and_the_host_rung_at_its_end`, `tests/test_health_hold_report.py::test_the_hold_bound_candidate_names_the_cooldown_only_for_its_host_rung`, `tests/test_health_hold_report.py::test_after_the_bound_ladder_the_chain_names_the_host_rung`, `tests/test_health_hold_report.py::test_the_bound_feed_is_silent_when_its_mark_is_not_next`, `tests/test_health_hold_report.py::test_the_bound_feed_names_the_host_rung_the_box_opts_into`, `tests/test_health_hold_report.py::test_the_bound_feed_yields_to_a_startup_stand_down`, `tests/test_health_hold_report.py::test_a_healthy_device_reports_no_bound`, `tests/test_health_hold_report.py::test_the_bound_feed_moves_no_clock`, `tests/test_health_hold_report.py::test_a_broken_feed_reports_nothing` |
