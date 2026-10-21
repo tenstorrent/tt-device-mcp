@@ -513,8 +513,9 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
         return False, {"snapshot": {"ok": False}}
 
     patch_recovery(monkeypatch, "_verify_device", bad)
-    # The sweep did not run (no holder scan stubbed, so it reads as a tenant): the full ladder has not
+    # The sweep did not run (an unreadable holder scan reads as a tenant): the full ladder has not
     # been tried, so the host rung holds (spec 04 I22).
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=False))
     out_held = await g._fire_gate_rung(
         "post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={}
     )
