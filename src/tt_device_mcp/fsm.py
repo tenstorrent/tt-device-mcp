@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 from tt_device_mcp import metrics, privileges
 from tt_device_mcp.health import (
@@ -77,6 +77,10 @@ class ServerState(str, Enum):
     HEALTHY = "healthy"
     RECOVERING = "recovering"
     DOWN = "down"
+
+
+# The states in which fsm.json's readopted_jobs may be non-empty (spec 03 I76).
+_READOPT_STATES = (ServerState.BOOT, ServerState.RECOVERING)
 
 
 # The closed vocabulary `why` may hold — every distinct reason a gate pass or a job's exit has
@@ -195,6 +199,10 @@ class ServerFsm:
         # Per-episode latches: reset every time a new episode opens (see _open_episode), so a
         # once-per-episode rung re-arms once the device has actually recovered and gone bad again.
         self._latches: dict[str, bool] = {}
+        # Spec 03 I76: the re-adopted job ids the startup hold waits on, as /health's
+        # startup_verify.readopted_job_ids reports them (server.py syncs it). Report-only: nothing in
+        # the broker reads it back, so it never lifts a hold or skips a check. [] outside BOOT/RECOVERING.
+        self._readopted_jobs: list[str] = []
         # Whether _load restored an episode a previous boot wrote — see reopen_after_boot. One-shot.
         self._crossed_boot = False
         # Whether _load read a file this same boot wrote: an earlier broker of this boot already
@@ -370,6 +378,9 @@ class ServerFsm:
                 dirty=bool(raw.get("dirty", False)),
             )
             latches = {k: bool(v) for k, v in (raw.get("latches") or {}).items()}
+            # Absent in a file written before spec 03 I76: loads as [].
+            raw_readopted = raw.get("readopted_jobs") or []
+            readopted = [str(j) for j in raw_readopted] if isinstance(raw_readopted, list) else []
         except (ValueError, TypeError, AttributeError):
             # A field is present but the wrong type (latches not a mapping, an unknown state
             # string) — same fail-safe as above: BOOT, not a crash at import time. Explicit,
@@ -410,12 +421,16 @@ class ServerFsm:
         self._loaded_same_boot = same_boot
         self._record = record
         self._latches = latches
+        # No job survives a reboot; within one boot the startup sync re-derives it from the live scopes.
+        self._readopted_jobs = readopted if same_boot and record.state in _READOPT_STATES else []
 
     def _persist(self) -> None:
         """Write the whole record as one atomic replace: a temp file in the same directory,
         fsync'd, then ``os.replace`` — so a reader (or a crash) never observes a half-written
         file, and the record on disk after any crash is always the last one that fully landed.
         Never raises: a durable record we could not write must not take the gate down with it."""
+        if self._record.state not in _READOPT_STATES:
+            self._readopted_jobs = []  # a release (HEALTHY) or DOWN ends the startup verify it reported
         payload = {
             "state": self._record.state.value,
             "why": self._record.why,
@@ -424,6 +439,7 @@ class ServerFsm:
             "job": self._record.job,
             "dirty": self._record.dirty,
             "latches": self._latches,
+            "readopted_jobs": list(self._readopted_jobs),
             "boot_id": self._boot_id,
             # Not read back by anything in this class — purely so an operator staring at the raw
             # file can tell how stale it is without cross-referencing a log timestamp.
@@ -464,6 +480,20 @@ class ServerFsm:
         the boot's arrival — the ledger escalation that caused it — is judged on the first start
         only; see boot_merge and the startup probe's post-reboot verify."""
         return self._loaded_same_boot
+
+    @property
+    def readopted_jobs(self) -> list[str]:
+        """Spec 03 I76: the re-adopted job ids the startup hold waits on; [] when none. Report-only."""
+        return list(self._readopted_jobs) if self._record.state in _READOPT_STATES else []
+
+    def set_readopted_jobs(self, job_ids: Iterable[str]) -> None:
+        """Record which re-adopted jobs the startup hold waits on (spec 03 I76), [] once none does.
+        Persists only on a change. Ignored (kept []) outside BOOT/RECOVERING. Report-only: no gate,
+        hold, bound or escalation reads it."""
+        ids = [str(j) for j in job_ids] if self._record.state in _READOPT_STATES else []
+        if ids != self._readopted_jobs:
+            self._readopted_jobs = ids
+            self._persist()
 
     @property
     def healthy(self) -> bool:

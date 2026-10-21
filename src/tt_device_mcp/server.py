@@ -7742,6 +7742,9 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         # The FSM's own record, straight from the source every field above is now derived from.
         "fsm_state": fsm.state.value,
         "fsm_why": fsm.record.why,
+        # Spec 03 I76: a startup hold behind a live re-adopted job, told apart from a fault; else null.
+        # `status` keeps its two values: clients read any other as a broker that is down.
+        "startup_verify": _startup_verify_view(),
     }
     payload.update(_live_offbus_state())
     # Whether the running job is doing device work (spec 03 I54); absent while no job runs.
@@ -10322,14 +10325,23 @@ def _get_queue_status() -> dict:
     # visible HOLD job; it makes device_busy True, which is what "not available to a
     # tenant" means. Suppressed while an op runs (that op is already the RUNNING row).
     hold = _device_hold_state()
+    startup_verify = _startup_verify_view()  # spec 03 I76
     if hold:
         reason, since = hold
+        command = f"device HELD (degraded): {reason} — new tenant jobs refused until recovered"
+        if startup_verify:
+            readopted = ", ".join(startup_verify["readopted_job_ids"])
+            command = (
+                "device HELD for the startup check, not a fault: "
+                + (f"re-adopted job {readopted} running" if readopted else "the full check is running")
+                + " — new tenant jobs wait for the check"
+            )
         rows.insert(
             0,
             {
                 "id": "--",
                 "owner": "[broker]",
-                "command": f"device HELD (degraded): {reason} — new tenant jobs refused until recovered",
+                "command": command,
                 "workspace": "-",
                 "started_at": since,
                 "op": "hold",
@@ -10357,6 +10369,8 @@ def _get_queue_status() -> dict:
         ],
         "device_busy": bool(rows),
         "device_degraded": degraded,
+        # Spec 03 I76: a startup hold behind a live re-adopted job, told apart from a fault; else null.
+        "startup_verify": startup_verify,
         # "" when no external step holds a reservation; otherwise every current holder's phase
         # name (comma joined — two can overlap, see _reserve_external_step). Also carried in the
         # RUNNING row above for `status`/`watch`; surfaced here too as a plain field for a caller
@@ -10953,6 +10967,7 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                     + ("systemctl stop (survived SIGINT)" if reaped else "SIGINT"),
                 )
                 break
+            _sync_fsm_readopted_jobs()  # spec 03 I76: a fault sign while it runs clears it
             await asyncio.sleep(_SCOPE_POLL_SEC)
         scope_ended = True
     finally:
@@ -11039,6 +11054,7 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                     pass
         clear_job_exit_file(job_id)
         readopted_scopes.pop(job_id, None)
+        _sync_fsm_readopted_jobs()  # spec 03 I76: this job no longer holds the startup hold
         if logger:
             logger.info(
                 f"RE-ADOPT job_id={job_id} scope {scope} ended; finalized " f"exit={job.exit_code if job else '?'}"
@@ -12776,17 +12792,62 @@ def _startup_verify_owns_hold(kind: Optional[str] = None, mono: Optional[float] 
     off-bus one-shot and its ladder (spec 03 I23), and a forced run of a kind whose window cannot be
     given back (``kind`` outside _STARTUP_VERIFY_DEFERRABLE_KINDS) runs, so neither waits on the gate.
     ``mono`` reads the bound at another monotonic time (the /health next-rung report, spec 04 I75)."""
+    if not _startup_verify_gate_pending(mono):
+        return False
+    if kind is not None and kind not in _STARTUP_VERIFY_DEFERRABLE_KINDS:
+        return False
+    return not (isolated_chips or any(j.status == JobStatus.RUNNING for j in jobs.values()))
+
+
+def _startup_verify_gate_pending(mono: Optional[float] = None) -> bool:
+    """Spec 03 I75: the startup gate is still to run on the startup hold, inside its bound
+    (STARTUP_VERIFY_DEFER_MAX_SEC from the re-adopted jobs' end), whether or not a re-adopted job still
+    runs. The spec 03 I76 report reads this; the escalations' stand-down is _startup_verify_owns_hold.
+    ``mono`` reads the bound at another monotonic time (spec 04 I75)."""
     task = _startup_verify_task
     if task is None or task.done():
         return False
     if fsm.state is not ServerState.RECOVERING or fsm.record.why != "startup_unverified":
         return False
-    if kind is not None and kind not in _STARTUP_VERIFY_DEFERRABLE_KINDS:
-        return False
-    if isolated_chips or any(j.status == JobStatus.RUNNING for j in jobs.values()):
-        return False
     ready = _startup_verify_ready_at
     return ready is None or (time.monotonic() if mono is None else mono) - ready < STARTUP_VERIFY_DEFER_MAX_SEC
+
+
+def _startup_verify_view() -> Optional[dict]:
+    """Spec 03 I76: the startup hold while all it waits on is the startup gate — a re-adopted job still
+    running on the device, or the gate itself inside its I75 bound — told apart from a fault.
+
+    A client that reads that hold as 'recovering' stops its healthy re-adopted job to let the broker
+    verify, and the kill then owes the mesh a reset plus the full check (I69). None as soon as anything
+    says fault: a dirty mark, a reported fault, an owed kill reset, a kill already requested, an isolated
+    chip, a live liveness finding, or the hold's `why` turning into a fault class. Reporting only: no
+    gate, wait or escalation reads it, so the startup gate and every hold bound act as before."""
+    if not _startup_verify_gate_pending():
+        return None
+    if fsm.record.dirty or device_fault_reported or _kill_reset_owed or isolated_chips:
+        return None
+    live = [jid for jid in readopted_scopes if (job := jobs.get(jid)) is not None and job.status is JobStatus.RUNNING]
+    if len(live) != len(readopted_scopes) or _device_liveness_reason():
+        return None
+    return {
+        "phase": "readopted_job_running" if live else "verifying",
+        "readopted_job_ids": live,
+        "fault": False,
+        "since": device_hold_episode_since or None,
+    }
+
+
+def _sync_fsm_readopted_jobs() -> None:
+    """Spec 03 I76: mirror startup_verify.readopted_job_ids into fsm.json's readopted_jobs ([] when the
+    view is null), so a client that reads the file gets the answer /health gives. Called when the startup
+    gate starts, on each re-adopted scope poll and when a re-adopted job ends; the FSM clears it itself on
+    a release or DOWN. Report-only, and never raises into its caller."""
+    try:
+        view = _startup_verify_view()
+        fsm.set_readopted_jobs(view["readopted_job_ids"] if view else [])
+    except Exception as e:  # noqa: BLE001 - a report must never break the monitor or startup
+        if logger:
+            logger.warning(f"fsm readopted_jobs sync failed: {e}")
 
 
 async def _await_startup_prerequisites(missing: str) -> None:
@@ -13146,6 +13207,7 @@ async def run_startup_tasks() -> None:
     # healthy verdict, holds/escalates on a wedge.
     _startup_verify_ready_at = None
     _startup_verify_task = asyncio.create_task(_verify_fabric_on_start())
+    _sync_fsm_readopted_jobs()  # spec 03 I76: the jobs re-adopted above, now the gate owns the hold
 
 
 @asynccontextmanager
@@ -13592,6 +13654,12 @@ def create_mcp_server() -> MCPServer:
             result.update(job_activity_view(job_id) or {})  # DEVICE IDLE (spec 03 I54)
         elif job.idle_total_sec is not None:
             result["idle_total_sec"] = job.idle_total_sec
+        if job_id in readopted_scopes:
+            result["readopted"] = True
+            # Spec 03 I76: the broker's startup hold waits on this job; it is not a fault.
+            view = _startup_verify_view()
+            if view and job_id in view["readopted_job_ids"]:
+                result["startup_verify"] = view
         if job.preemptable:
             result["no_timeout_except_on_contention"] = True
             result["preemptable"] = True  # the earlier name, for clients that read it
