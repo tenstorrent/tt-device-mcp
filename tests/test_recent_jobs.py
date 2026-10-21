@@ -971,6 +971,59 @@ def test_job_killed_by_recovery_gets_broker_kill_status_and_cause(monkeypatch, t
     assert r["command"].startswith("[MCP killed:")
 
 
+def test_job_killed_by_a_device_reset_gets_broker_kill_status_and_cause(monkeypatch, tmp_path):
+    """Spec 01 I70: the reset's own kill line reads as the broker's kill, like recovery's."""
+    log = tmp_path / "2026-09-04_134342_783.log"
+    log.write_text(
+        "JOB ID:      783\n"
+        "OWNER:       pshah\n"
+        "COMMAND:     python run.py\n"
+        "[Started at 2026-09-04T13:43:42]\n"
+        f"{srv.RESET_KILL_MARKER} {srv.READOPTED_RESET_KILLED_ERROR}\n"
+        "FINISHED:    2026-09-04T13:45:04\n"
+        "STATUS:      killed\n"
+        "EXIT CODE:   None\n"
+    )
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "jobs", {})
+
+    (r,) = srv._recent_jobs(10)
+    assert r["status"] == "broker-kill" and r["cause"] == srv.READOPTED_RESET_KILLED_ERROR
+    assert r["command"].startswith("[MCP killed: device reset]")
+
+
+def test_a_terminal_job_before_its_footer_shows_its_status_and_cause(monkeypatch, tmp_path, clear_job_state):
+    """Spec 01 I70: between the flip to KILLED and the footer (the scope stop and the sweep run in
+    between) the row says what the broker decided, never "interrupted"."""
+    log = tmp_path / "2026-09-04_134342_784.log"
+    log.write_text(
+        "JOB ID:      784\n"
+        "OWNER:       pshah\n"
+        "COMMAND:     python run.py\n"
+        "[Started at 2026-09-04T13:43:42]\n"
+        "own-stderr\n"
+        f"{srv.RECOVERY_KILL_MARKER} killed by device recovery (chip 3 left the PCIe bus): resubmit\n"
+    )
+    job = srv.Job(id="784", owner="pshah", workspace="/w", command="python run.py", queued_at="2026-09-04T13:43:40")
+    job.status = srv.JobStatus.KILLED
+    job.exit_code = -9
+    job.started_at = "2026-09-04T13:43:42"
+    job.finished_at = "2026-09-04T13:45:04"
+    job.log_file = str(log)
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "jobs", {"784": job})
+
+    (r,) = srv._recent_jobs(10)
+    assert r["status"] == "broker-kill" and r["exit_code"] == -9
+    assert "chip 3 left the PCIe bus" in r["cause"] and "own-stderr" not in r["cause"]
+    assert r["runtime"] == srv._span_str(job.started_at, job.finished_at)
+
+    job.status = srv.JobStatus.FAILED
+    log.write_text(log.read_text().replace(srv.RECOVERY_KILL_MARKER, "[plain line]"))
+    (r,) = srv._recent_jobs(10)
+    assert r["status"] == "failed", "a footerless terminal job is never 'interrupted'"
+
+
 def test_begin_action_row_creates_durable_header_file(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     monkeypatch.setattr(srv, "_action_row", None)

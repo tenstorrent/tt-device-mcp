@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import signal
+from pathlib import Path
 
 import httpx2
 import pytest
@@ -331,6 +332,39 @@ async def test_no_debt_for_a_reset_killed_or_completed_job(runner_env):
     finally:
         await _stop(runner)
     assert srv._kill_reset_debt() == "", "a death our own reset caused owes no second reset"
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_kill_is_killed_with_its_cause_before_the_sweep(runner_env, monkeypatch):
+    """Spec 01 I70: by the time the sweep runs (the first await after the exit), the job already
+    reads KILLED with recovery's cause, and its log says so; its stderr is not the cause."""
+    seen = {}
+
+    async def snapshot(job_id, *a, **k):
+        job = srv.jobs[job_id]
+        seen.update(status=job.status, error=job.error, log=Path(job.log_file).read_text())
+        return []
+
+    monkeypatch.setattr(srv, "reap_job_survivors", snapshot)
+    job, runner = await _start("934", "echo own-stderr >&2; sleep 600")
+    job.log_file = str(runner_env["tmp"] / "run_934.log")  # as _queue_job names it; the runner has not run yet
+    try:
+        assert await _until(lambda: job.status is srv.JobStatus.RUNNING and job.pid)
+        assert await _until(lambda: "own-stderr" in Path(job.log_file).read_text())
+        srv._mark_job_device_fault_failed("934", "device recovery kill: chip 3 left the PCIe bus")
+        os.killpg(job.pid, 9)
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert seen["status"] is srv.JobStatus.KILLED, "never FAILED from the signal exit"
+    # The error keeps the job's own output tail; recovery's cause is its last line, not that tail.
+    last = seen["error"].splitlines()[-1]
+    assert last.startswith(srv.RECOVERY_KILL_MARKER) and "chip 3 left the PCIe bus" in last
+    assert "own-stderr" not in last
+    killed_line = next(ln for ln in seen["log"].splitlines() if ln.startswith(srv.RECOVERY_KILL_MARKER))
+    assert "chip 3 left the PCIe bus" in killed_line and "own-stderr" not in killed_line
+    assert job.status is srv.JobStatus.KILLED and "chip 3 left the PCIe bus" in job.error
+    assert "934" not in srv.reset_killed_causes, "the cause is read once"
 
 
 def test_the_test_reset_drops_every_kill_marker(clear_job_state):
