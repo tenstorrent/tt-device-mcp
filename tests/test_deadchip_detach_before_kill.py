@@ -6,10 +6,11 @@
 tt-kmd's fd-close path sends the chip a power-state message unless the device is marked detached,
 and only the PCI remove marks it. Killing a holder of an off-bus chip that is still attached, or
 stopping a poller that has it open, makes the kernel itself reach the chip. So every kill and
-every poller stop comes after a successful remove, the sampler's first-hung-sample stop (03 I66)
+every poller stop comes after the remove was tried, the sampler's first-hung-sample stop (03 I66)
 included: a frozen heartbeat that still answers stops the pollers at once, an all-ones chip leaves
-the stop to the valve. A failed, missing, hung or partial remove kills and stops nothing and leaves
-the hold to its bounded recovery. No process is spawned and no device touched:
+the stop to the valve. A failed, missing, hung or partial remove kills nobody and leaves the hold to
+its bounded recovery; it stops the pollers once, after the hold is marked, since left running they
+would read the attached chip until the hold's first reset. No process is spawned and no device touched:
 the remove, the holder scan and every signal are stubbed.
 """
 
@@ -42,6 +43,15 @@ def valve(monkeypatch):
     srv.device_op_lock = None
     srv.isolated_chips = set()
     srv._pollers_owed = ""
+    # The sampler is a boot singleton: start each test from a fresh strike and poller history.
+    for name, fresh in (
+        ("dead_chip_strikes", {}),
+        ("prev_beats", {}),
+        ("pollers_stopped_for", frozenset()),
+        ("pollers_deferred_for", frozenset()),
+        ("sample_all_ones", None),
+    ):
+        monkeypatch.setattr(srv.sampler, name, fresh)
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
     monkeypatch.setattr(srv, "chip_pci_bdf", lambda idx: f"0000:46:00.{idx}")
     monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
@@ -69,6 +79,10 @@ def _kills(log):
     return [e for e in log if e[0] in ("kill", "pollers")]
 
 
+def _signals(log):
+    return [e for e in log if e[0] == "kill"]
+
+
 def _refusals():
     return read_health_events(kinds={"chip_dead_kill_refused"})
 
@@ -94,11 +108,11 @@ async def test_a_failed_detach_kills_nobody_and_keeps_the_hold(valve):
     detach_ok["13"] = False
     await srv.sampler.isolate_dead_chips(["13"])
 
-    assert log == [("detach", "13")], f"something was killed or stopped without a detach: {log}"
+    assert log == [("detach", "13"), ("pollers", False)], f"a kill, or no poller stop after the failed remove: {log}"
     refused = _refusals()
     assert refused and refused[-1]["reason"] == "detach_failed"
     assert refused[-1]["chips"] == ["13"] and refused[-1]["host_at_risk"] is True
-    assert not srv._pollers_owed
+    assert "13" in srv._pollers_owed, "the stopped pollers are owed a restart"
     assert srv.fsm.state is not ServerState.HEALTHY, "a refused kill still holds the device"
 
 
@@ -108,7 +122,8 @@ async def test_one_failed_detach_of_two_kills_nobody(valve):
     detach_ok["14"] = False
     await srv.sampler.isolate_dead_chips(["13", "14"])
 
-    assert not _kills(log), log
+    assert not _signals(log), log
+    assert log[-1] == ("pollers", False) and _kills(log) == [("pollers", False)], log
     refused = _refusals()
     assert refused[-1]["reason"] == "detach_failed"
     assert refused[-1]["chips"] == ["14"] and refused[-1]["detached"] == ["13"]
@@ -120,7 +135,7 @@ async def test_with_no_detach_wired_nobody_is_killed(valve, monkeypatch):
     monkeypatch.setattr(srv.sampler._deps, "isolate_chip", None)
     await srv.sampler.isolate_dead_chips(["13"])
 
-    assert not _kills(log), log
+    assert log == [("pollers", False)], log
     assert _refusals()[-1]["reason"] == "detach_unavailable"
     assert srv.fsm.state is not ServerState.HEALTHY
 
@@ -128,7 +143,8 @@ async def test_with_no_detach_wired_nobody_is_killed(valve, monkeypatch):
 @pytest.mark.asyncio
 async def test_a_hung_detach_is_bounded_and_the_loop_stays_responsive(valve, monkeypatch):
     """The remove runs in a worker thread with one bound for all chips: a remove that hangs is not
-    detached, kills nobody, and the next chip is not tried behind it, while the event loop runs on."""
+    detached, kills nobody, and the next chip is not tried behind it, while the event loop runs on.
+    The pollers are stopped once after it, as after a failed remove."""
     log, _ = valve
     monkeypatch.setattr(telemetry, "DETACH_TIMEOUT_SEC", 0.3)
     release = threading.Event()
@@ -155,7 +171,7 @@ async def test_a_hung_detach_is_bounded_and_the_loop_stays_responsive(valve, mon
         release.set()
 
     assert ticks >= 5, "the event loop stalled behind the remove"
-    assert log == [("detach", "13")], f"a kill, a poller stop or a second remove followed a hung one: {log}"
+    assert log == [("detach", "13"), ("pollers", False)], f"a kill or a second remove followed a hung one: {log}"
     assert read_health_events(kinds={"chip_detach_timeout"})[-1]["chip"] == "13"
     assert _refusals()[-1]["reason"] == "detach_failed"
     assert srv.fsm.state is not ServerState.HEALTHY
@@ -192,15 +208,21 @@ async def test_another_all_ones_chip_not_yet_detached_defers_the_kill_to_its_own
 
 @pytest.mark.asyncio
 async def test_a_chip_whose_earlier_detach_failed_blocks_every_later_kill(valve):
+    """Chip 13's remove fails while chip 14 is on its first strike: nobody is killed, and the pollers
+    wait for 14's own remove. 14's valve run removes it and finds 13 still attached: nothing retries
+    13's remove, so it refuses the kill as a failed remove and stops the pollers then."""
     log, detach_ok = valve
     detach_ok["13"] = False
     live = lambda b: [b, 800, 800, 0, 0, 0]  # noqa: E731
     await srv.sampler.check_for_dead_chips({"0": live(1), "13": live(ALL_ONES), "14": live(1)})
     await srv.sampler.check_for_dead_chips({"0": live(2), "13": live(ALL_ONES), "14": live(ALL_ONES)})
+    assert ("detach", "13") in log and not _kills(log), f"a stop reached chip 14 before its remove: {log}"
     await srv.sampler.check_for_dead_chips({"0": live(3), "13": live(ALL_ONES), "14": live(ALL_ONES)})
-    assert ("detach", "14") in log
-    assert not _kills(log), log
-    assert _refusals()[-1]["reason"] == "chip_not_detached" and _refusals()[-1]["chips"] == ["13"]
+    assert log.count(("detach", "13")) == 1, "a failed remove is not retried by the valve"
+    assert not _signals(log), log
+    assert _kills(log) == [("pollers", False)] and log.index(("pollers", False)) > log.index(("detach", "14")), log
+    refused = _refusals()[-1]
+    assert refused["reason"] == "detach_failed" and refused["chips"] == ["13"] and refused["host_at_risk"] is True
 
 
 @pytest.mark.asyncio
@@ -263,10 +285,11 @@ async def test_a_stalled_chip_beside_an_all_ones_chip_does_not_stop_the_pollers(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["failed", "timed out"])
-async def test_a_failed_or_timed_out_detach_never_stops_the_pollers(valve, monkeypatch, fault):
-    """A remove that fails or hangs leaves chip 13 attached: no poller stop on that sample or on any
-    later one while it reads all-ones (as a lost chip does), even once another chip stalls; the
-    refusal is journalled and the device stays held for the bounded recovery."""
+async def test_a_failed_or_timed_out_detach_stops_the_pollers_once_and_kills_nobody(valve, monkeypatch, fault):
+    """A remove that fails or hangs leaves chip 13 attached, and nothing retries it. Left running, the
+    pollers would read it on every later sample until the hold's first reset, so the valve stops them
+    once, after the hold is marked; later samples with 13 still all-ones stop nothing again. Nobody is
+    killed, the refusal is journalled and the device stays held."""
     log, detach_ok = valve
     release = threading.Event()
     if fault == "failed":
@@ -283,17 +306,51 @@ async def test_a_failed_or_timed_out_detach_never_stops_the_pollers(valve, monke
     try:
         await srv.sampler.check_for_dead_chips({"0": _live(1), "13": _live(2), "14": _live(3)})
         await srv.sampler.check_for_dead_chips({"0": _live(2), "13": _live(ALL_ONES), "14": _live(4)})
+        assert not _stops(log), f"the pollers stopped before chip 13's remove was tried: {log}"
         await srv.sampler.check_for_dead_chips({"0": _live(3), "13": _live(ALL_ONES), "14": _live(5)})
-        await srv.sampler.check_for_dead_chips({"0": _live(4), "13": _live(ALL_ONES), "14": _live(6)})
-        await srv.sampler.check_for_dead_chips({"0": _live(5), "13": _live(ALL_ONES), "14": _live(6)})
+        assert _stops(log) and _stops(log)[0] > log.index(("detach", "13")), log
+        assert srv.fsm.state is not ServerState.HEALTHY, "the hold is marked by the time the pollers stop"
+        for beat in (4, 5, 6):
+            await srv.sampler.check_for_dead_chips({"0": _live(beat), "13": _live(ALL_ONES), "14": _live(beat + 2)})
     finally:
         release.set()
 
-    assert ("detach", "13") in log
-    assert not _kills(log), f"a kill or poller stop reached a chip that is not detached: {log}"
+    assert log.count(("detach", "13")) == 1, "a failed remove is not retried by the valve"
+    assert not _signals(log), f"a holder was killed with chip 13 still attached: {log}"
+    assert len(_stops(log)) == 1, f"the pollers were not stopped exactly once: {log}"
     refused = _refusals()
     assert refused and refused[-1]["reason"] == "detach_failed" and refused[-1]["chips"] == ["13"]
+    stopped = read_health_events(kinds={"pollers_quiesced_detach_failed"})
+    assert len(stopped) == 1 and stopped[0]["chips"] == ["13"] and stopped[0]["host_at_risk"] is True
     if fault == "timed out":
         assert read_health_events(kinds={"chip_detach_timeout"})[-1]["chip"] == "13"
-    assert not srv._pollers_owed
-    assert srv.fsm.state is not ServerState.HEALTHY, "a refused stop still holds the device"
+    assert "13" in srv._pollers_owed, "the stopped pollers are owed a restart on the next close to HEALTHY"
+    assert srv.fsm.state is not ServerState.HEALTHY, "a refused kill still holds the device"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_remove_beside_an_untried_chip_stops_the_pollers_on_the_next_sample(valve):
+    """Chip 13's remove fails while chip 14 is on its first strike: the pollers wait for 14 (its remove
+    is not tried yet). On the next sample 14 answers again, 13 is the only all-ones chip, and its
+    remove already failed: the sampler stops the pollers then, one sample later, without a retry."""
+    log, detach_ok = valve
+    detach_ok["13"] = False
+    await srv.sampler.check_for_dead_chips({"0": _live(1), "13": _live(ALL_ONES), "14": _live(1)})
+    await srv.sampler.check_for_dead_chips({"0": _live(2), "13": _live(ALL_ONES), "14": _live(ALL_ONES)})
+    assert log == [("detach", "13")], f"the pollers stopped while chip 14's remove was untried: {log}"
+    await srv.sampler.check_for_dead_chips({"0": _live(3), "13": _live(ALL_ONES), "14": _live(3)})
+    assert log == [("detach", "13"), ("pollers", False)], log
+    stop = read_health_events(kinds={"pollers_quiesced_hung_chip"})
+    assert stop and stop[-1]["all_ones"] == ["13"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_remove_under_a_live_reset_leaves_the_poller_stop_to_the_reset(valve, monkeypatch):
+    """A reset that took the chips meanwhile quiesces the pollers itself: the valve stops nothing."""
+    log, detach_ok = valve
+    detach_ok["13"] = False
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "ttdev-reset-1.scope")
+    await srv.sampler.isolate_dead_chips(["13"])
+    assert log == [("detach", "13")], log
+    assert _refusals()[-1]["reason"] == "detach_failed"
+    assert srv.fsm.state is not ServerState.HEALTHY

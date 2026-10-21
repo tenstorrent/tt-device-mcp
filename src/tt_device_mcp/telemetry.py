@@ -417,14 +417,15 @@ class TelemetrySampler:
         re-arms them once the device is idle and healthy). Every chip at once is the re-init blip
         the blackout path already proves on two samples, so it does not count here.
 
-        Only a sample whose hung chips all still answer stops them here (spec 03 I66, I84). A
-        stopped poller closes its fds, and tt-kmd's close path sends each chip it had open a
+        A stopped poller closes its fds, and tt-kmd's close path sends each chip it had open a
         power-state message (an ARC queue write, then reads polled for up to 1 s) unless the
         device is detached. A frozen heartbeat was just read back, so that chip completes those
         reads; an all-ones chip may be off the bus, and only its PCI remove marks it detached. So
-        while any chip on the sample reads all-ones (a first strike, or a lost chip whose remove
-        failed), the stop is left to the dead-chip valve, which stops them after a successful
-        remove or refuses and keeps the hold."""
+        while a chip on the sample reads all-ones and its remove has not been tried yet (its first
+        strike, or inside the fast cadence's confirm gate), the stop waits for the dead-chip valve,
+        at most one more sample: the valve stops them after its remove, whether the remove worked
+        or not (spec 03 I66, I84). A chip whose remove already failed is never retried, so waiting
+        for it would leave the pollers reading it until the hold's first reset; it stops them here."""
         stalled = [
             i
             for i, v in sample.items()
@@ -440,18 +441,19 @@ class TelemetrySampler:
         if hung <= self.pollers_stopped_for:
             return
         log = self._deps.logger()
-        if dead:
+        untried = [i for i in dead if i not in self._remove_failed(dead)]
+        if untried:
             if hung > self.pollers_deferred_for:
                 self.pollers_deferred_for = hung
                 self._deps.health_event(
                     "pollers_quiesce_deferred",
                     reason="chip_not_detached",
-                    all_ones=sorted(dead, key=int),
+                    all_ones=sorted(untried, key=int),
                     stalled=sorted(stalled, key=int),
                 )
                 if log:
                     log.warning(
-                        f"HUNG-CHIP pollers left running: chip(s) {sorted(dead, key=int)} read all-ones and "
+                        f"HUNG-CHIP pollers left running: chip(s) {sorted(untried, key=int)} read all-ones and "
                         f"are not detached, so closing the pollers' fds would make the driver message them; "
                         f"the dead-chip valve stops them after the PCI remove"
                     )
@@ -461,6 +463,15 @@ class TelemetrySampler:
             "pollers_quiesced_hung_chip", all_ones=sorted(dead, key=int), stalled=sorted(stalled, key=int)
         )
         await self._deps.set_device_pollers(False, lambda m: log.info(f"HUNG-CHIP {m}") if log else None)
+
+    def _remove_failed(self, chips) -> list:
+        """The chips of ``chips`` the dead-chip valve already tried to remove and could not (spec 03
+        I84): it adds a chip to ``isolated_chips`` before the remove, and a removed chip leaves
+        sysfs, so one still sampled is still attached. Nothing retries that remove; only the hold's
+        recovery heals the chip."""
+        isolated = getattr(self._deps, "isolated_chips", None)
+        ours = set(isolated() if isolated is not None else ())
+        return [i for i in chips if i in ours]
 
     async def check_for_dead_chips(self, sample: dict) -> None:
         """Decide whether all-ones means a chip died — or something else entirely.
@@ -686,18 +697,32 @@ class TelemetrySampler:
                 removed.append(idx)
         return removed, [i for i in chips if i not in removed]
 
-    async def _kill_refusal(self, stuck: list, others: list) -> Optional[str]:
-        """Why the valve must not kill or stop anything yet, or None (spec 03 I84). Each case leaves
-        a chip that is off the bus and still attached, and a holder's fd close would reach it."""
+    async def _kill_refusal(self, stuck: list, others: list, untried: list) -> Optional[str]:
+        """Why the valve must not kill anyone, or None (spec 03 I84). Each case leaves a chip that
+        is off the bus and still attached, and a holder's fd close would reach it."""
+        failed = "detach_failed" if self._deps.isolate_chip is not None else "detach_unavailable"
         if stuck:
-            return "detach_failed" if self._deps.isolate_chip is not None else "detach_unavailable"
-        if others:
-            # On its first strike, inside the fast cadence's confirm gate, or an earlier failed
-            # remove: its own valve run detaches it first and then kills.
+            return failed
+        if untried:
+            # On its first strike or inside the fast cadence's confirm gate: its own valve run
+            # detaches it first and then kills.
             return "chip_not_detached"
+        if others:
+            return failed  # an earlier remove failed; nothing retries it
         if self._mechanism.reset_in_flight or await asyncio.to_thread(self._mechanism.scope_active):
             return "reset_started"  # the reset owns the chips and their holders now
         return None
+
+    async def _stop_pollers_remove_failed(self, attached: list, removed: list, reason: str, log) -> None:
+        """Stop and owe the pollers after a remove that failed, timed out or is not wired (spec 03
+        I84). A reset that took the chips meanwhile quiesces them itself."""
+        if self._mechanism.reset_in_flight or await asyncio.to_thread(self._mechanism.scope_active):
+            return
+        self.pollers_stopped_for = frozenset(self.sample_all_ones or attached)
+        self._deps.health_event("pollers_quiesced_detach_failed", chips=attached, detached=removed, host_at_risk=True)
+        await self._deps.set_device_pollers(False, lambda m: log.info(f"DEAD-CHIP {m}") if log else None)
+        if self._deps.owe_device_pollers is not None:
+            self._deps.owe_device_pollers(reason)
 
     async def isolate_dead_chips(self, dead: list) -> None:
         """Cut chips that have left the PCIe bus out of the kernel, immediately.
@@ -765,20 +790,21 @@ class TelemetrySampler:
         # chip under them is gone — and a dead job is a far better outcome than a lost host.
         reason = f"chip(s) {','.join(fresh)} left the PCIe bus"
         others = [i for i in (self.sample_all_ones or dead) if i not in removed]
-        refused = await self._kill_refusal(stuck, others)
+        untried = [i for i in others if i not in isolated_chips]
+        refused = await self._kill_refusal(stuck, others, untried)
         if refused:
             if log:
                 log.error(
-                    f"DEAD-CHIP holders and pollers NOT killed ({refused}): closing their fds would "
-                    f"make the driver touch a chip that is not detached. The hold and its bounded "
-                    f"recovery decide — {reason}"
+                    f"DEAD-CHIP holders NOT killed ({refused}): closing their fds would make the "
+                    f"driver touch a chip that is not detached. The hold and its bounded recovery "
+                    f"decide — {reason}"
                 )
             self._deps.health_event(
                 "chip_dead_kill_refused",
                 reason=refused,
                 chips=stuck or others,
                 detached=removed,
-                host_at_risk=bool(stuck),
+                host_at_risk=refused in ("detach_failed", "detach_unavailable"),
             )
         else:
             await self._deps.kill_device_holders(reason)
@@ -790,6 +816,12 @@ class TelemetrySampler:
                 self._deps.owe_device_pollers(reason)
 
         self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} fell off the PCIe bus", why="heartbeat")
+        if refused in ("detach_failed", "detach_unavailable") and not untried:
+            # Every chip on the sample was tried and one stays attached (spec 03 I84). Left running,
+            # the pollers read it until the hold's first reset, and each crash-restart closes and
+            # reopens their fds on it; stopped now, each fd closes once and systemd does not restart
+            # a unit stopped on request. After the hold is marked, so its timing is unchanged.
+            await self._stop_pollers_remove_failed(stuck or others, removed, reason, log)
         await asyncio.to_thread(
             self._deps.capture_incident,
             "chip_dead",
