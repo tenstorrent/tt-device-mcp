@@ -947,8 +947,10 @@ each rung fires only when the gentler one failed or cannot apply.
   of that wait (`Waiting for 30 seconds: 30`, the settle's end, or `Waiting for all N chips to show
   up`, matched across split reads), runs one global PCI rescan, journaled as
   `reset_driver_wait_rescan` with `ok` and the chips. It fires once per reset (I78 repeats it, bounded, while an isolated chip is still missing), never for
-  another reset command or with no isolated chip, and a failed write is journaled and the reset runs
-  on; the rescan after the reset still runs. A cancelled reset cancels a pending rescan and disarms the
+  another reset command or with no isolated chip, and a failed write, or one still blocked in the
+  kernel after 30 s, is journaled and the reset runs on; the rescan after the reset still runs (also
+  bounded at 30 s). Spec 03 I83's cut removes chips only after tt-smi has exited, never inside this
+  wait, so it costs I81 no chip; a chip it removes is re-added by the closing rescan if it answers. A cancelled reset cancels a pending rescan and disarms the
   watcher, so output the backend still reads after the cancel starts none; a sysfs write already
   running in its worker thread cannot be stopped and finishes on its own. A cancel that lands after
   tt-smi exited, while the rescan's write finishes, still runs the reset's whole cleanup (the

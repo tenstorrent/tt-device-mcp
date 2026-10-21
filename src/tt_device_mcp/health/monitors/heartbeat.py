@@ -37,15 +37,15 @@ from tt_device_mcp.health.monitors.pci import chip_pci_bdf
 HEARTBEAT_SETTLE_SEC = 0.5
 
 
-def read_heartbeats(*, probe_lost: bool = False, skip: frozenset = frozenset()) -> dict[str, int]:
+def read_heartbeats(*, probe_lost: bool = False, only: Optional[frozenset] = None) -> dict[str, int]:
     """Per-chip ARC heartbeat counters, keyed by device index.
 
     Each attribute read is a PCIe read of the chip (the KMD reads the counter from the chip's
     BAR), so a chip the broker has confirmed lost is not read again until :func:`chip_state.may_read`
     allows it (spec 03 I66); it reports ALL_ONES, what its last real read said. ``probe_lost`` is for
     a health check's decision read: each lost chip is read for real once, so a chip that answers
-    again is judged on its answer, not on the mark. Chips in ``skip`` are neither read nor reported
-    (spec 03 I83: a chip whose readers were cut in flight is not read again until the reset ends).
+    again is judged on its answer, not on the mark. ``only``, when given, limits the read to those
+    chips (spec 03 I83: the chips that just failed POST_RESET, and no other).
 
     A chip whose attribute is missing or unreadable is omitted rather than zeroed,
     so the caller sees it as an absent chip (a real fault) and not as a chip whose
@@ -59,7 +59,7 @@ def read_heartbeats(*, probe_lost: bool = False, skip: frozenset = frozenset()) 
     for ent in entries:
         # KMD names these `tenstorrent!N`; the index is what tt-smi and /dev agree on.
         idx = ent.name.rsplit("!", 1)[-1]
-        if not idx.isdigit() or idx in skip:
+        if not idx.isdigit() or (only is not None and idx not in only):
             continue
         if not chip_state.may_read(idx, ent, probe=probe_lost):
             beats[idx] = ALL_ONES

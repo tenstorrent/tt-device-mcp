@@ -1146,7 +1146,7 @@ _recovery_deps = RecoveryDeps(
     health_event=lambda kind, **f: health_event(kind, **f),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     owe_device_pollers=lambda reason: _owe_device_pollers(reason),
-    read_inflight_heartbeats=lambda skip: read_heartbeats(skip=skip),
+    read_inflight_heartbeats=lambda only: read_heartbeats(only=only),
     find_inflight_readers=lambda: _find_inflight_readers(),
     cut_inflight_readers=lambda reason: _cut_inflight_readers(reason),
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
@@ -1241,6 +1241,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         per_target_recovery = fsm.per_target
         select_recovery = fsm.select_recovery
         sampler = fsm.sampler
+        recovery_mechanism.post_reset_cut = sampler.cut_post_reset_failed
         _booted = True
     return fsm.resolve_platform(_boot_platform_probe if probe_platform else None)
 
@@ -5771,14 +5772,14 @@ def _inflight_reader(h) -> bool:
 
 def _find_inflight_readers() -> tuple:
     """Spec 03 I83: the pids _cut_inflight_readers would signal, and whether the scan was complete.
-    Read-only (/proc only): the sampler asks this before it detaches any chip."""
+    Read-only (/proc only): the cut asks this before it detaches any chip."""
     scan = enumerate_device_holders()
     return [h.pid for h in scan.holders if _inflight_reader(h)], scan.complete
 
 
 async def _cut_inflight_readers(reason: str) -> list:
     """Spec 03 I83: stop every process that is not the broker's or the reset's from reading a chip
-    that stayed off the bus after a mesh reset's BMC step. SIGTERM, then SIGKILL
+    that failed POST_RESET and reads all-ones after a mesh reset. SIGTERM, then SIGKILL
     PREEMPT_KILL_GRACE_SEC later (the same grace as a preemption). The sampler calls this only once
     every confirmed chip is detached (removed from the kernel), so the readers' fd close sends no
     message to an off-bus chip. Fails no job: the broker runs none during a reset. Never raises."""

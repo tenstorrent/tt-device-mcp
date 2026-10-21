@@ -44,6 +44,12 @@ FAST_WINDOW_SEC = 30.0
 FAST_MAX_SEC = 60.0
 FAST_CONFIRM_SEC = 4.0
 
+# Spec 03 I83's cut after a failed POST_RESET: all PCI removes together get at most this long (a
+# remove behind a hung endpoint can block in the kernel for good; nobody is killed then), and the
+# reader kill (SIGTERM, SIGKILL 10 s later) at most this long.
+INFLIGHT_DETACH_TIMEOUT_SEC = 15.0
+INFLIGHT_KILL_TIMEOUT_SEC = 30.0
+
 
 @dataclass(frozen=True)
 class BrokerTelemetry:
@@ -196,12 +202,6 @@ class TelemetrySampler:
         # The hung chips the pollers were last stopped for, so one episode stops them once.
         self.pollers_stopped_for: frozenset = frozenset()
         self.prev_beats: dict = {}
-        # The in-flight watch (spec 03 I83): consecutive all-ones reads per chip after a mesh reset's
-        # BMC step, the chips confirmed in this reset, those still owed a cut, and the running cut.
-        self.inflight_strikes: dict = {}
-        self.inflight_cut: frozenset = frozenset()
-        self._inflight_pending: frozenset = frozenset()
-        self._inflight_task: Optional[asyncio.Task] = None
         # Consecutive samples with NO chip nodes in sysfs — every chip off the bus, or the
         # driver wedged. chip_sample() omits an off-bus chip, so an all-gone drop reads as an
         # empty sample the all-ones blackout above never sees. Debounced like that blackout: a
@@ -260,17 +260,11 @@ class TelemetrySampler:
                 # A reset or recovery step on the chips owns them while it runs: they are off the bus
                 # by design, and only the step's own reads may reach them (spec 03 I66).
                 if not await self.recovering_now():
-                    self.end_inflight_watch()
                     sample = await asyncio.to_thread(self._deps.chip_sample)
                     self.ring.append({"ts": time.time(), "chips": sample})
                     await asyncio.to_thread(self._deps.append_trace, sample)
 
                     await self.check_for_dead_chips(sample)
-                elif getattr(self._mechanism, "reset_driver_wait", False):
-                    # The one bounded exception to I66 (spec 03 I83): past the BMC step a chip that
-                    # still reads all-ones is off the bus, and any other process reading it can kill
-                    # the host before the reset ends.
-                    await self.watch_reset_in_flight()
                 await asyncio.to_thread(chip_state.publish)
                 # The rest keeps the regular cadence while the fast one runs (I79): only the
                 # off-bus check gets faster, never the ledger, the relift or the holder scan.
@@ -410,55 +404,41 @@ class TelemetrySampler:
             chip_state.set_recovering("scope", False)
         return False
 
-    def end_inflight_watch(self) -> None:
-        """No reset owns the chips: the in-flight watch's state ends with the reset (03 I83)."""
-        self.inflight_strikes = {}
-        self.inflight_cut = frozenset()
-        self._inflight_pending = frozenset()
-        if getattr(self._mechanism, "reset_driver_wait", False):
-            self._mechanism.reset_driver_wait = False
+    async def cut_post_reset_failed(self, chips: list) -> bool:
+        """Spec 03 I83: after a mesh reset whose POST_RESET failed on ``chips``, detach every one of
+        them still reading all-ones, then kill their foreign readers. Called by reset_with_quiesce
+        once tt-smi has exited, before its rescan; awaited, every step bounded.
 
-    async def watch_reset_in_flight(self) -> None:
-        """Spec 03 I83: during a mesh reset's driver wait, cut the readers of a chip still all-ones.
+        Why here and not earlier: until POST_RESET the driver keeps the chip in needs_hw_init (set by
+        USER_RESET), so its telemetry reads fail with ENODATA, mappings are gone and an fd close sends
+        the chip nothing; no reader can reach it. A failed POST_RESET clears needs_hw_init: from then
+        on a reader's read is a real bus read, and closing its fd sends the chip a power-state message
+        unless the device is detached. Only the PCI remove (isolate_chip) marks it detached. So:
 
-        Runs only once tt-smi has printed its driver wait, so the trays' re-power is over and every
-        healthy chip is back on the bus. One heartbeat read per chip not already confirmed; a chip
-        reading all-ones on two samples in a row is confirmed and not read again in this reset. The
-        cut (_cut_inflight) starts only while no other chip waits on its second read: a reader may
-        hold that chip too, and killing it would close its fd on a chip not yet detached. A chip
-        confirmed while a cut still runs waits in _inflight_pending for the next one."""
+        - one heartbeat read per failed chip (the first read possible since USER_RESET); a chip that
+          answers is not cut (the failed POST_RESET alone is not proof it is off the bus);
+        - no foreign reader: nothing is done, the hold and its bounded recovery decide;
+        - else each confirmed chip is removed, all within INFLIGHT_DETACH_TIMEOUT_SEC; a remove that
+          fails or does not return in time kills nobody (reset_inflight_cut_refused, host_at_risk);
+        - then the pollers stop (owed to the next close to HEALTHY) and the readers get SIGTERM,
+          SIGKILL PREEMPT_KILL_GRACE_SEC later, awaited at most INFLIGHT_KILL_TIMEOUT_SEC.
+
+        Returns False only when a remove is still blocked in the kernel (the caller then skips its
+        rescan). Releases nothing and lifts no hold."""
+        log = self._deps.logger()
         reader = getattr(self._deps, "read_inflight_heartbeats", None)
         if reader is None or getattr(self._deps, "cut_inflight_readers", None) is None:
-            return
-        beats = await asyncio.to_thread(reader, self.inflight_cut)
-        dead = {i for i, v in beats.items() if v == ALL_ONES}
-        self.inflight_strikes = {i: self.inflight_strikes.get(i, 0) + 1 for i in dead}
-        confirmed = sorted((i for i, n in self.inflight_strikes.items() if n >= 2), key=int)
-        if confirmed:
-            self.inflight_cut = self.inflight_cut | frozenset(confirmed)
-            self._inflight_pending = self._inflight_pending | frozenset(confirmed)
-            for i in confirmed:
-                self.inflight_strikes.pop(i, None)
-            self._deps.health_event("reset_inflight_off_bus", chips=confirmed)
-        if not self._inflight_pending or self.inflight_strikes:
-            return
-        if self._inflight_task is not None and not self._inflight_task.done():
-            return
-        chips = sorted(self._inflight_pending, key=int)
-        self._inflight_pending = frozenset()
-        # Its own task: the SIGTERM grace must not stall the sampler loop.
-        self._inflight_task = asyncio.get_running_loop().create_task(self._cut_inflight(chips))
-
-    async def _cut_inflight(self, chips: list) -> None:
-        """Detach, then kill (spec 03 I83). tt-kmd's fd-close path sends the chip a power-state
-        message unless the device is marked detached, and only the PCI remove (isolate_chip) marks
-        it, also tearing down every userspace mapping of the chip. Killing a reader of an off-bus
-        chip that is still attached makes the kernel itself read the chip. So: no foreign reader,
-        nothing is done (the reset keeps its chips); a reader, every confirmed chip is removed first,
-        and only when all were removed are the pollers stopped and the readers killed. A chip that
-        could not be removed leaves every reader alone: the hold and the bounded recovery decide."""
-        log = self._deps.logger()
-        reason = f"chip(s) {chips} still all-ones after the mesh reset's BMC step"
+            return True
+        beats = await asyncio.to_thread(reader, frozenset(chips))
+        if log:
+            log.info(f"IN-FLIGHT read after failed POST_RESET: { {i: beats.get(i) for i in chips} }")
+        confirmed = sorted((i for i in chips if beats.get(i) == ALL_ONES), key=int)
+        self._deps.health_event(
+            "reset_post_reset_failed", chips=list(chips), off_bus=confirmed, beats={i: beats.get(i) for i in chips}
+        )
+        if not confirmed:
+            return True
+        reason = f"chip(s) {confirmed} failed POST_RESET and read all-ones after a mesh reset"
         find = getattr(self._deps, "find_inflight_readers", None)
         try:
             readers, complete = await asyncio.to_thread(find) if find is not None else ([], False)
@@ -467,31 +447,56 @@ class TelemetrySampler:
             if log:
                 log.error(f"IN-FLIGHT holder scan failed ({e}); treating it as a reader")
         if not readers and complete:
-            self._deps.health_event("reset_inflight_readers_cut", chips=chips, readers=[], detached=[], signalled=[])
-            return
-        detached = []
-        if self._deps.isolate_chip is not None:
-            for idx in chips:
+            self._deps.health_event(
+                "reset_inflight_readers_cut", chips=confirmed, readers=[], detached=[], signalled=[]
+            )
+            return True
+        detached: list = []
+        blocked = False
+
+        async def detach_all() -> None:
+            for idx in confirmed:
                 if await asyncio.to_thread(self._deps.isolate_chip, idx):
                     detached.append(idx)
+
+        if self._deps.isolate_chip is not None:
+            try:
+                await asyncio.wait_for(detach_all(), timeout=INFLIGHT_DETACH_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                blocked = True
         if detached:
             self._deps.isolated_chips().update(detached)
-        stuck = [i for i in chips if i not in detached]
+        stuck = [i for i in confirmed if i not in detached]
         if stuck:
+            why = (
+                f"did not return in {INFLIGHT_DETACH_TIMEOUT_SEC} s (its thread may still be blocked in the kernel)"
+                if blocked
+                else "failed"
+            )
             if log:
                 log.error(
-                    f"IN-FLIGHT chip(s) {stuck} could not be removed from the kernel: their readers "
-                    f"{readers} are NOT killed (a kill would make the driver touch the chip). The "
-                    f"hold and its bounded recovery decide — {reason}"
+                    f"IN-FLIGHT chip(s) {stuck}: PCI remove {why}; their readers {readers} are NOT killed "
+                    f"(a kill would make the driver touch the chip). The hold and its bounded recovery decide — {reason}"
                 )
             self._deps.health_event(
-                "reset_inflight_cut_refused", chips=stuck, detached=detached, readers=readers, host_at_risk=True
+                "reset_inflight_cut_refused",
+                chips=stuck,
+                detached=detached,
+                readers=readers,
+                remove_blocked=blocked,
+                host_at_risk=True,
             )
-            return
+            return not blocked
         await self._deps.set_device_pollers(False, lambda m: log.info(f"IN-FLIGHT {m}") if log else None)
         if self._deps.owe_device_pollers is not None:
             self._deps.owe_device_pollers(reason)
-        await self._deps.cut_inflight_readers(reason)
+        try:
+            await asyncio.wait_for(self._deps.cut_inflight_readers(reason), timeout=INFLIGHT_KILL_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            if log:
+                log.error(f"IN-FLIGHT reader cut did not finish in {INFLIGHT_KILL_TIMEOUT_SEC} s — {reason}")
+            self._deps.health_event("reset_inflight_cut_timeout", chips=confirmed, readers=readers)
+        return True
 
     async def stop_pollers_for_hung(self, sample: dict, dead: list) -> None:
         """Stop the device pollers at the FIRST sample that shows a present chip hung — reading
