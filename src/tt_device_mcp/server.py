@@ -5810,6 +5810,15 @@ async def _detach_before_quiesce(what: str) -> Optional[str]:
     return await sampler.detach_before_quiesce(what)
 
 
+def _quiesce_failed_chips() -> list:
+    """Spec 03 I84: the chips a reset step's remove failed on or timed out on that still read all-ones
+    and are attached. No rung can run over them, so the power cycle is asked at once (only the I65
+    cooldown delays it), not at the 10-min bound. An unwired remove is not one: it keeps the bound."""
+    if sampler is None or not sampler.quiesce_detach_failed:
+        return []
+    return sampler.quiesce_failed_live()
+
+
 def _forget_dead_kill_refused() -> None:
     global _kill_refused_job_pid, _kill_refused_since
     _kill_refused_pids.clear()
@@ -5817,6 +5826,7 @@ def _forget_dead_kill_refused() -> None:
     _kill_refused_since = ""
     if sampler is not None:
         sampler.quiesce_refused.clear()
+        sampler.quiesce_detach_failed.clear()
 
 
 def _kill_refused_live(scan) -> tuple[set, bool]:
@@ -8357,6 +8367,15 @@ async def _force_escalate_stuck_hold() -> None:
             if not _host_action_blocks_escalation():
                 await _hold_bound_host_rung(held_age, log)
             return
+        stuck = [] if bound else await asyncio.to_thread(_quiesce_failed_chips)
+        if stuck:
+            # Spec 03 I84: every reset is refused over a chip whose remove failed or timed out, so any
+            # forced run below the bound (the I65 retry at the cooldown's end included) asks for the
+            # host rung, never a ladder.
+            if not _host_action_blocks_escalation():
+                log(f"chip(s) {stuck} read all-ones and could not be detached: no reset can run; the host rung is next")
+                await _hold_bound_host_rung(held_age, log)
+            return
         # The one exception below the bound: the I65 retry of a 77 climb the cooldown denied, whose
         # reset and sweep already ran — it asks for the host rung, never a reset (spec 04 I79).
         climb_77 = kind == "power_cycle_cooldown" and _fabric_77_climb_retry_due()
@@ -8698,6 +8717,9 @@ def _hold_bound_cycle_due(age: float) -> bool:
     _hold_bound_sync()
     if _hold_bound_rung_pending:
         return True
+    if _hold_bound_cycle_age is None and _quiesce_failed_chips():
+        # Spec 03 I84: a reset refused by a failed or timed-out remove; asked once, then the I65 retry.
+        return True
     lad = _hold_bound_ladder_age
     if not _hold_bound_ladder_counts(lad):
         return False
@@ -8745,7 +8767,9 @@ def _hold_bound_route(kind: Optional[str], age: float) -> ForcedRoute:
     hold's own (_hold_bound_sec: one sampler tick under the spec 03 I42 latch), so the host rung an
     early bound ladder owes runs no second ladder first."""
     if age < _hold_bound_sec() and not _fabric_link_short_early(kind):
-        return ForcedRoute(ROUTE_LADDER)
+        # Spec 03 I84: over a chip whose remove failed or timed out every reset is refused; the run asks
+        # for the host rung (_force_escalate_stuck_hold), so the report names it too.
+        return ForcedRoute(ROUTE_HOST_RUNG if _quiesce_failed_chips() else ROUTE_LADDER)
     if kind != "hold_bound_cycle" and _hold_bound_check_pending(age):
         return ForcedRoute(ROUTE_CHECK_PENDING, _hold_bound_check_end(_hold_bound_ladder_age or 0.0))
     if _hold_bound_cycle_next(kind or "", age):
@@ -9314,7 +9338,11 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             "the failed full check after the bound's ladder"
             if _hold_bound_check_failed_age is not None
             and _hold_bound_check_failed_age >= (_hold_bound_ladder_age or 0)
-            else f"the {_HOLD_BOUND_CHECK_SEC}s post-ladder check bound"
+            else (
+                "a reset refused over an all-ones chip whose remove failed"
+                if _hold_bound_ladder_age is None and not _hold_bound_rung_pending
+                else f"the {_HOLD_BOUND_CHECK_SEC}s post-ladder check bound"
+            )
         )
         _maybe_spawn_forced_escalation()
     elif _fabric_link_short_ladder_due(age):

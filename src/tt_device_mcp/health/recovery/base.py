@@ -1178,7 +1178,8 @@ class RecoveryMechanism:
         # Spec 03 I84: a stopped poller closes its fds, and the driver's close path reaches every chip
         # not detached. So a chip reading all-ones is PCI-removed first, with the flag set so the
         # sampler's valve does not race the remove; one that will not detach refuses the reset (its
-        # own reads and re-power would reach it too) and the hold goes to the 10-min bound's host rung.
+        # own reads and re-power would reach it too) and the hold goes to the bound's host rung: at once
+        # when the remove failed or timed out (only the I65 cooldown delays it), at 10 min when unwired.
         detach = self.detach_before_quiesce
         if detach is not None:
             was_in_flight = self.reset_in_flight

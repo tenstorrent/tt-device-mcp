@@ -8,7 +8,8 @@ rung, the mesh reset and its repeat in the last-chance sweep, the hold-deadline 
 startup check in ``_pollers_quiesced_for``. A stopped poller closes its fds, and tt-kmd's close path
 reaches every chip that is not detached. So a chip reading all-ones that is still attached is
 PCI-removed first; one that will not detach refuses the reset (the pollers stay up, nothing runs),
-the hold stays, and the 10-min bound asks for the power cycle. A chip that only stalled still answers:
+the hold stays, and the power cycle is asked: at once when the remove failed or timed out (only the
+I65 cooldown delays it), at the 10-min bound when none is wired. A chip that only stalled still answers:
 the pollers stop at once with no detach. No process is spawned and no device touched: the remove,
 the reset and the poller stop are stubbed, and the chips are sysfs directories in a temp dir.
 """
@@ -56,6 +57,7 @@ def bus(monkeypatch):
     monkeypatch.setattr(srv, "isolated_chips", set())
     monkeypatch.setattr(srv, "_pollers_owed", "")
     monkeypatch.setattr(srv.sampler, "quiesce_refused", {})
+    monkeypatch.setattr(srv.sampler, "quiesce_detach_failed", set())
     monkeypatch.setattr(srv.sampler, "dead_chip_strikes", {})
     monkeypatch.setattr(srv, "current_process", None)
     monkeypatch.setattr(srv, "chip_pci_bdf", lambda idx: f"0000:46:00.{idx}")
@@ -246,11 +248,86 @@ async def test_a_refused_detach_gets_the_power_cycle_at_the_bound_with_no_ladder
     assert "released" not in order
 
 
+def _refuse_young_hold(the_rig, monkeypatch, fault):
+    """A 60 s hold (well below the bound) whose reset was refused because chip 2's remove failed,
+    timed out or is not wired; the test runs the refused reset."""
+    _present_hold_at_the_bound(the_rig, monkeypatch, why="gate_error", detail="chip 2 reads all-ones", age=60)
+    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry_cooldown", False)
+    monkeypatch.setattr(srv.recovery_mechanism, "_ac_power_info", None)
+    if fault == "timed out":
+        monkeypatch.setattr(telemetry, "DETACH_TIMEOUT_SEC", 0.2)
+        monkeypatch.setattr(srv, "isolate_chip", lambda idx: time.sleep(1) or True)
+    elif fault == "failed":
+        monkeypatch.setattr(srv, "isolate_chip", lambda idx: False)
+    else:
+        monkeypatch.setattr(srv.sampler._deps, "isolate_chip", None)
+    _all_ones("2")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cooldown", [False, True], ids=["no-cooldown", "in-cooldown"])
+@pytest.mark.parametrize("fault", ["timed out", "failed"])
+async def test_a_failed_or_timed_out_detach_asks_the_power_cycle_at_once(
+    rig, bus, monkeypatch, clear_job_state, fault, cooldown  # noqa: F811
+):
+    """Goals 9/10: no rung can run over a chip whose remove failed or timed out, so the power cycle is
+    asked on the next watchdog tick, not at the 10-min bound. Only the I65 cooldown delays it, and its
+    retry asks again the moment the cooldown ends, with no ladder in between. No hold lifts."""
+    m = srv.recovery_mechanism
+    until = time.time() + 120
+    cooling = {"on": cooldown}
+
+    def governor(action, tenant_active=False, **k):
+        if cooling["on"]:
+            state = {"until": until, "last": "", "cause": "boot", "interval_sec": 600, "why": "boot cooldown"}
+            return m._deny_power_cycle(state)
+        return True, ""
+
+    monkeypatch.setattr(m, "auto_recovery_allowed", governor)
+    _refuse_young_hold(rig, monkeypatch, fault)
+    rc, out = await m.reset_with_quiesce(OPERATOR, lambda msg: None, owner="manual")
+    assert rc is None and "not detached" in out
+    assert srv._quiesce_failed_chips() == ["2"]
+
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    order = rig["order"]
+    assert "glx_reset" not in order and "sweep" not in order, order
+    if cooldown:
+        assert "power_cycle" not in order and "denied" in order, order
+        assert m.power_cycle_retry is not None and m.power_cycle_retry[0] == until
+        srv._check_hold_deadline(now=datetime.now())  # still inside the cooldown: asked again quietly
+        await _drain()
+        assert "power_cycle" not in order, order
+        cooling["on"] = False
+        srv._check_hold_deadline(now=datetime.fromtimestamp(until + 1))  # the cooldown's end
+        await _drain()
+    assert order.count("power_cycle") == 1, order
+    assert "glx_reset" not in order and "sweep" not in order and "released" not in order, order
+    assert srv.fsm.state is not ServerState.HEALTHY, "no hold lifts without a passing full check"
+    assert srv._hold_age_now() < srv._hold_bound_sec(), "asked well below the 10-min bound"
+
+
+@pytest.mark.asyncio
+async def test_an_unwired_detach_keeps_the_10_min_bound(rig, bus, monkeypatch, clear_job_state):  # noqa: F811
+    """With no remove wired nothing failed: the hold keeps the bound's path, no immediate request."""
+    _refuse_young_hold(rig, monkeypatch, "unwired")
+    rc, _ = await srv.recovery_mechanism.reset_with_quiesce(OPERATOR, lambda msg: None)
+    assert rc is None and srv.sampler.quiesce_refused_live() == ["2"]
+    assert srv._quiesce_failed_chips() == [] and not srv._hold_bound_cycle_due(60)
+
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert "power_cycle" not in rig["order"], rig["order"]
+    assert srv._kill_refused_reason(), "the 10-min bound still sends it to the host rung"
+
+
 @pytest.mark.parametrize("verdict", VERDICTS)
 def test_the_refusal_record_clears_only_on_a_passing_full_check(mesh, monkeypatch, verdict):  # noqa: F811
     """Goals 8/11: the record lifts nothing; a failed full check, or fewer links than cabled, keeps
     both the hold and the record."""
     monkeypatch.setattr(srv.sampler, "quiesce_refused", {"13": time.time()})
+    monkeypatch.setattr(srv.sampler, "quiesce_detach_failed", {"13"})
     fsm_dirty(srv, "chip(s) 13 read all-ones", why="heartbeat")
     FABRIC_DEBT.note_evidence({"fabric": dict(FABRIC[verdict])})
 
@@ -258,6 +335,7 @@ def test_the_refusal_record_clears_only_on_a_passing_full_check(mesh, monkeypatc
 
     assert released is (verdict == "pass")
     assert (srv.sampler.quiesce_refused == {}) is (verdict == "pass")
+    assert (srv.sampler.quiesce_detach_failed == set()) is (verdict == "pass")
     assert (srv.fsm.state is ServerState.HEALTHY) is (verdict == "pass")
 
 

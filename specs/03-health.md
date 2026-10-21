@@ -1427,12 +1427,21 @@ cooldown (spec 04 I65) holds longer.
   for a chip an earlier step could not detach. Such a chip is recorded (`quiesce_refused`); while
   it still reads all-ones and is attached, the spec 04 I76 bound treats the hold like a refused
   kill: no ladder (each of its resets would be refused) and a power-cycle request at the 10-min
-  mark. The record lifts nothing, and only a passing full check with fabric clears it. Time to
+  mark. When the remove failed or timed out (not when none is wired), the chip is also marked
+  (`quiesce_detach_failed`) and the power cycle is asked at once, not at the bound: no rung can run
+  over that chip, so waiting only adds recovery time. The next watchdog tick asks for it through the
+  bound's own host-rung request (`_hold_bound_host_rung`, kind `hold_bound_cycle`), and every forced
+  run below the bound routes to that request instead of a ladder while the chip stays live. Only the
+  bounded I65 boot/post-cycle cooldown delays it: the denial arms the I65 retry, which asks again
+  the moment the cooldown ends. An unwired remove keeps the bound's path unchanged. The record lifts
+  nothing, and only a passing full check with fabric clears it (and the mark). Time to
   recover: partial off-bus already removed by the valve, and stalled-only chips, unchanged; an
   all-ones chip still attached at reset time adds one remove (well under a second, at most 15 s);
   a remove that fails or hangs costs the first reset at most 15 s, refuses later resets at once, and
-  the power cycle comes at the 10-min bound (plus the I65 cooldown) with no reset run over the
-  attached chip; whole-tray and all-chips-off drops are unchanged, straight to the power cycle.
+  the power cycle is asked on the next watchdog tick (one sampler interval, 10 s), or at the end of
+  the I65 cooldown when one runs, with no reset run over the attached chip: about 10 min less than
+  waiting for the bound. With no remove wired it still comes at the 10-min bound (plus the I65
+  cooldown). Whole-tray and all-chips-off drops are unchanged, straight to the power cycle.
 
 ## Interfaces
 
@@ -2124,6 +2133,7 @@ refuses.
 | I84 | `tests/test_deadchip_detach_before_kill.py::test_every_kill_and_poller_stop_comes_after_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_detach_kills_nobody_and_keeps_the_hold`, `tests/test_deadchip_detach_before_kill.py::test_one_failed_detach_of_two_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_with_no_detach_wired_nobody_is_killed`, `tests/test_deadchip_detach_before_kill.py::test_a_hung_detach_is_bounded_and_the_loop_stays_responsive`, `tests/test_deadchip_detach_before_kill.py::test_a_reset_that_started_before_the_kill_keeps_every_holder`, `tests/test_deadchip_detach_before_kill.py::test_another_all_ones_chip_not_yet_detached_defers_the_kill_to_its_own_valve`, `tests/test_deadchip_detach_before_kill.py::test_a_chip_whose_earlier_detach_failed_blocks_every_later_kill`, `tests/test_deadchip_detach_before_kill.py::test_the_broker_never_signals_itself`, `tests/test_deadchip_detach_before_kill.py::test_the_first_all_ones_sample_leaves_the_poller_stop_to_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_or_timed_out_detach_never_stops_the_pollers` |
 | I84 a refusal's holders reach the power cycle at the I76 bound; the record lifts nothing and only a passing full check with fabric clears it | `tests/test_deadchip_refused_bound.py::test_a_refused_holder_gets_the_power_cycle_at_the_bound`, `tests/test_deadchip_refused_bound.py::test_the_refusal_record_lifts_nothing_and_only_a_passing_full_check_clears_it` |
 | I84 a reset step or the startup check detaches attached all-ones chips before its poller stop; a refused detach stops nothing, resets nothing and reaches the power cycle at the I76 bound | `tests/test_reset_quiesce_detach.py::test_a_reset_detaches_the_all_ones_chip_before_the_poller_stop`, `tests/test_reset_quiesce_detach.py::test_the_sweep_s_repeat_reset_with_the_flag_already_set_detaches_first_too`, `tests/test_reset_quiesce_detach.py::test_a_stalled_only_chip_stops_the_pollers_at_once_with_no_detach`, `tests/test_reset_quiesce_detach.py::test_a_chip_already_detached_needs_no_remove`, `tests/test_reset_quiesce_detach.py::test_a_failed_detach_refuses_the_reset_and_stops_nothing`, `tests/test_reset_quiesce_detach.py::test_a_second_reset_over_the_same_stuck_chip_is_refused_with_no_new_remove`, `tests/test_reset_quiesce_detach.py::test_every_chip_all_ones_detaches_nothing_and_refuses_the_reset`, `tests/test_reset_quiesce_detach.py::test_the_startup_check_detaches_before_its_poller_stop`, `tests/test_reset_quiesce_detach.py::test_a_failed_detach_at_startup_keeps_the_pollers_up_and_the_check_runs`, `tests/test_reset_quiesce_detach.py::test_a_refused_detach_gets_the_power_cycle_at_the_bound_with_no_ladder`, `tests/test_reset_quiesce_detach.py::test_the_refusal_record_clears_only_on_a_passing_full_check`, `tests/test_reset_quiesce_detach.py::test_every_poller_stop_is_behind_a_detach_or_the_all_ones_deferral` |
+| I84 a reset refused by a failed or timed-out remove asks for the power cycle at once (only the I65 cooldown delays it, and its retry fires at the cooldown's end); an unwired remove keeps the bound; no hold lifts | `tests/test_reset_quiesce_detach.py::test_a_failed_or_timed_out_detach_asks_the_power_cycle_at_once`, `tests/test_reset_quiesce_detach.py::test_an_unwired_detach_keeps_the_10_min_bound`, `tests/test_reset_quiesce_detach.py::test_the_refusal_record_clears_only_on_a_passing_full_check` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
