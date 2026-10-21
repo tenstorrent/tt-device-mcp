@@ -363,6 +363,12 @@ if [ -d "$clone/deploy" ]; then
         if "$ROOT/eth-venv/bin/pip" install -q "tt-exalens==$ETH_EXALENS_VERSION" >/dev/null 2>&1; then
             chmod -R a+rX "$ROOT/eth-venv" 2>/dev/null || true
             echo "autoupdate: provisioned eth-venv (tt-exalens $ETH_EXALENS_VERSION)" >&2
+            # Check and warm it once before the broker restart below, so the restarted broker's
+            # startup self-test finds an importable ttexalens (a running broker picks it up on its
+            # paced retry, spec 03 I28). Fail-open, as above, but never silent.
+            if ! timeout 60 "$ROOT/eth-venv/bin/python" -c 'import ttexalens' >/dev/null 2>&1; then
+                echo "autoupdate: WARNING eth-venv installed but 'import ttexalens' FAILS; eth-heartbeat rung will report OFF" >&2
+            fi
         else
             echo "autoupdate: eth-venv provisioning failed; eth-heartbeat rung will report OFF" >&2
         fi

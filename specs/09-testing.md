@@ -78,6 +78,14 @@ gets through anyway.
     pinned True (the default-armed shape the ladder tests assert) and
     `recovery_mechanism.scope_active` pinned False (unstubbed it asks the real host's
     systemd, which failed three sampler tests on a box mid-incident and nowhere else).
+  - **Holder scan**: `device_holders.DRIVER_PROC_DIR` (tt-kmd's holder record) and
+    `device_holders.DEVICE_DIR` (the real `/dev/tenstorrent` that the `/proc` fd walk matches
+    each fd against) point at paths that cannot exist; the cgroup reads (`SCOPE_PROC_DIR`,
+    `job_reap.LEFTOVER_PROC_DIR`) at empty dirs. Without the `DEVICE_DIR` seal, any real process
+    of uid >= 1000 holding the device on the host running the suite read as a live tenant: the
+    runner's holder wait kept a test's job queued and the hold bound's host rung was blocked, so
+    tests failed only while the host ran device work. A test about holders stages its own dir and
+    points these at it.
 - **I2** — A spawn tripwire hard-fails any test that would hand a device-touching command
   to the kernel. The seam is the process-spawn layer — `subprocess.Popen.__init__` and
   `asyncio.create_subprocess_exec` are both wrapped — rather than each caller, so a caller
@@ -454,6 +462,7 @@ own claims that are pinned:
 | I5 (state dir overridable so tests never touch the live one) | `tests/test_install_modes.py::test_the_state_dir_is_overridable_so_tests_never_touch_the_live_one` |
 | I6 (import purity — boot off import) | `tests/test_boot_platform.py::test_importing_the_server_never_touches_the_device` |
 | I1 (probe reads sealed sysfs, not silicon) | `tests/test_device_safety.py::test_heartbeat_probe_touches_no_device` |
+| I1 (holder scan sealed: a real holder of the host's `/dev/tenstorrent` is no holder in a test) | `tests/test_test_isolation.py::test_a_real_device_holder_on_the_host_is_not_a_holder_in_a_test` |
 | I1 (env seal: armed flag never inherited from a stale environment) | `tests/test_rung_arming.py::test_the_armed_flag_is_not_inherited_from_a_stale_environment` |
 | I2 (never-list refused even under the marker) | `tests/test_device_marker.py::test_the_never_spawn_list_is_refused_even_under_the_device_marker` |
 | I2 (`tt-smi`/`systemd-run` refused unmarked, permitted marked) | `tests/test_device_marker.py::test_the_device_only_list_is_refused_unmarked_and_permitted_marked` |

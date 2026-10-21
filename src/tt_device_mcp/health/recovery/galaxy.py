@@ -32,6 +32,7 @@ from tt_device_mcp.health.recovery import (
     BLOCKED,
     DEFER,
     HOLD_FABRIC_UNVERIFIED,
+    NO_WINDOW_REMOVED_REASON,
     OUTCOME_RECOVERED,
     OUTCOME_TERMINAL,
     OUTCOME_WAITING,
@@ -284,6 +285,10 @@ def _progress_retry_sec() -> int:
     return min(v if v > 0 else 60, _stuck_hold_ceiling_sec())
 
 
+# The bridge rung's per-chip reasons that mean no SBR brings the chip back (see _classify_hold).
+NO_WINDOW_REASONS = frozenset({"no_bridge", NO_WINDOW_REMOVED_REASON})
+
+
 def _classify_hold(
     offbus_chips: set,
     expected: int,
@@ -301,7 +306,10 @@ def _classify_hold(
     recover, a present-mesh eth/fabric wedge, or anything unseen — is ``HOLD_CLASS_GENERIC``.
 
     ``bridge_reset_failed`` maps chip id -> its last SBR result dict (``{"reason": "no_bridge", ...}``);
-    a chip absent from it has an UNKNOWN window, so the hold is not the no-window class.
+    a chip absent from it has an UNKNOWN window, so the hold is not the no-window class. A chip the
+    broker removed whose recorded-bridge SBRs all fired and left it off the bus
+    (``removed_not_reenumerated``) has no window either: it is the same drop, now reset through the
+    bridge isolate_chip recorded, and it keeps the class it had before that reset existed (spec 04 I69).
 
     ``tray_map`` is the cached bus-derived tray identity (I16). Without one the caller cannot know
     which chips share a tray, so the classification cannot land in TRAY_DOWN_NO_WINDOW — the same
@@ -313,7 +321,7 @@ def _classify_hold(
         rec = reasons.get(chip)
         if rec is None:
             rec = reasons.get(str(chip))
-        if not isinstance(rec, dict) or rec.get("reason") != "no_bridge":
+        if not isinstance(rec, dict) or rec.get("reason") not in NO_WINDOW_REASONS:
             return HOLD_CLASS_GENERIC
     return HOLD_CLASS_TRAY_DOWN_NO_WINDOW
 

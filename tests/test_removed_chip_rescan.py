@@ -371,3 +371,194 @@ async def test_gate_bridge_stage_failed_verify_holds(monkeypatch, rung_ok):
     )
     assert out == galaxy.OUTCOME_WAITING
     assert cleared == []
+
+
+# --------------------------------------------------------------------------- record lifetime (I69)
+
+
+def _restart():
+    """What a broker restart does to the records: the process memory is gone, then startup reloads."""
+    pci.REMOVED_CHIPS.clear()
+    return pci.load_removed_chips()
+
+
+def test_a_removed_chip_record_survives_a_broker_restart(tmp_path, monkeypatch):
+    """A chip the broker removed stays hung and un-reset across a broker restart in the same boot:
+    without its record the bare and prelude rescans would re-enumerate it before any reset."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    boot = tmp_path / "boot_id"
+    boot.write_text("boot-a\n")
+    monkeypatch.setattr(pci, "BOOT_ID_FILE", boot)
+    bus.remove("13")
+    assert _restart() == ["13"]
+    assert pci.removed_chip("13") == {"bdf": "0000:46:00.0", "bridge": "0000:40:01.1"}
+    assert bridge.recorded_bridge("13") == "0000:40:01.1"
+
+
+def _restart_broker():
+    """A broker restart as boot_broker runs it: memory gone, the isolated set rebuilt from sysfs (where
+    a removed chip has no node), then the records reloaded and their chips isolated again."""
+    pci.REMOVED_CHIPS.clear()
+    srv.isolated_chips = set()
+    return srv._reload_removed_chips()
+
+
+def test_boot_broker_reloads_and_isolates_the_removed_chips():
+    """boot_broker takes the reload path that isolates the reloaded chips, not the bare load."""
+    import inspect
+
+    body = inspect.getsource(srv.boot_broker)
+    assert "_reload_removed_chips()" in body and "load_removed_chips()" not in body.replace("_reload_", "")
+
+
+@pytest.mark.asyncio
+async def test_a_reloaded_record_still_withholds_the_bare_rescan(tmp_path, monkeypatch, rung):
+    """After a restart the removed chip is isolated again and reset through its recorded bridge before
+    the rescan, never re-enumerated un-reset."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    boot = tmp_path / "boot_id"
+    boot.write_text("boot-a\n")
+    monkeypatch.setattr(pci, "BOOT_ID_FILE", boot)
+    bus.remove("13")
+    assert _restart_broker() == ["13"]
+    assert srv.isolated_chips == {"13"}, "the reloaded chip is isolated, so the bridge rung targets it"
+    assert await srv.galaxy_recovery._recover_isolated_chips(lambda m: None) is True
+    assert bus.trace[:2] == [("sbr", "0000:40:01.1"), ("rescan",)], bus.trace
+    assert srv.isolated_chips == set() and pci.removed_chip_ids() == []
+
+
+@pytest.mark.asyncio
+async def test_a_pass_for_another_chip_resets_the_reloaded_chip_before_any_rescan(tmp_path, monkeypatch, rung):
+    """After a restart, a rung pass asked only for another chip still resets the reloaded chip through
+    its recorded bridge first: every rescan is global and would re-enumerate it."""
+    bus = FakeBus(tmp_path, monkeypatch, come_back=False)
+    boot = tmp_path / "boot_id"
+    boot.write_text("boot-a\n")
+    monkeypatch.setattr(pci, "BOOT_ID_FILE", boot)
+    bus.remove("13")
+    pci.REMOVED_CHIPS.clear()
+    pci.load_removed_chips()  # a record the isolated set does not name
+    assert await _run({"14"}) is False
+    first_rescan = bus.trace.index(("rescan",))
+    assert ("sbr", "0000:40:01.1") in bus.trace[:first_rescan], bus.trace
+    assert "13" in srv.isolated_chips, "a removed chip still off the bus stays isolated"
+
+
+@pytest.mark.asyncio
+async def test_an_unreset_record_outside_the_targets_withholds_the_bare_rescan(tmp_path, monkeypatch, rung):
+    """The bare-rescan withhold counts every removal record not reset this pass, not only the pass's
+    targets: with the host reset gate closed nothing is reset, so no rescan runs at all."""
+    bus = FakeBus(tmp_path, monkeypatch, come_back=False)
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda n: (False, "test gate"))
+    bus.remove("13")
+    assert await _run({"14"}) is False
+    assert ("rescan",) not in bus.trace, bus.trace
+    (withheld,) = _kinds(rung, "pci_rescan_withheld")
+    assert withheld["unreset"] == ["13"]
+
+
+def test_a_record_from_an_earlier_boot_is_dropped_at_start(tmp_path, monkeypatch):
+    """A boot resets every endpoint and may renumber the bus: an earlier boot's record is stale."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    boot = tmp_path / "boot_id"
+    boot.write_text("boot-a\n")
+    monkeypatch.setattr(pci, "BOOT_ID_FILE", boot)
+    bus.remove("13")
+    boot.write_text("boot-b\n")
+    assert _restart() == []
+    assert pci.removed_chip("13") is None
+
+
+@pytest.mark.parametrize("how", ["mesh reset", "tray re-power", "power cycle"])
+def test_a_record_clears_whatever_brings_the_chip_back(tmp_path, monkeypatch, how):
+    """Any path that re-enumerates the chip (not only the bridge rung) drops its record, in memory and
+    on disk, so it can neither withhold a later rescan nor aim a bridge reset at live silicon."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    bus.remove("13")
+    bus.remove("14")
+    bus.enumerate("13")  # what any of those paths leaves behind: the chip is enumerated again
+    assert pci.removed_chip_ids() == ["14"]
+    assert pci.removed_chip("13") is None
+    assert _restart() == ["14"], "the on-disk record of the returned chip is gone too"
+
+
+def test_a_record_clears_when_its_address_is_enumerated_again(tmp_path, monkeypatch):
+    """A device back at the recorded address, even before its tenstorrent node binds, is not the
+    un-enumerated chip the record describes."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    bus.remove("13")
+    bdf, br = CHIPS["13"]
+    (bus.devices / bdf).symlink_to(bus.real / br / bdf)
+    assert pci.removed_chip("13") is None and pci.removed_chip_ids() == []
+
+
+@pytest.mark.asyncio
+async def test_a_removed_chip_that_stays_off_bus_keeps_the_no_window_class(tmp_path, monkeypatch, rung, galaxy_trays):
+    """A hold whose only cause is a removed chip keeps its off-bus class: every recorded-bridge SBR
+    fired and the chip stayed off the bus, the same no-window fact as no_bridge, so the hold is not
+    GENERIC and does not take the generic budget."""
+    bus = FakeBus(tmp_path, monkeypatch, come_back=False)
+    bus.remove("13")
+    assert await _run({"13"}) is False
+    reasons = srv.galaxy_recovery.last_bridge_reset_reasons
+    assert reasons["13"] == {"reason": recovery_pkg.NO_WINDOW_REMOVED_REASON}
+    tray = {str(i) for i in range(8, 16)}
+    window = {c: {"reason": "no_bridge"} for c in tray} | {"13": reasons["13"]}
+    assert galaxy._classify_hold(tray, 32, window, galaxy_trays) == galaxy.HOLD_CLASS_TRAY_DOWN_NO_WINDOW
+
+
+@pytest.mark.asyncio
+async def test_the_removed_chip_rung_worst_case_for_two_chips(tmp_path, monkeypatch, rung):
+    """The N-chip bound: the first pass asserts each chip's SBR (0.1 s each), then one 1 s retrain
+    settle and one 10 s re-bind poll before the batched rescan; the retries then run serially per
+    chip (4 + 11.1 s, twice: 30.2 s each); then the closing 3 s rescan. 14 + 30.3*N s in all."""
+    bus = FakeBus(tmp_path, monkeypatch, come_back=False)
+    bus.remove("13")
+    bus.remove("14")
+    monkeypatch.setattr(recovery_pkg, "BRIDGE_RESET_SETTLE_SEC", 4)
+    waited = []
+    real_sleep = asyncio.sleep
+
+    async def timed_sleep(delay, *a, **k):
+        waited.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", timed_sleep)
+    monkeypatch.setattr(bridge.time, "sleep", lambda s: waited.append(s))
+    assert await _run({"13", "14"}) is False
+    assert [t[0] for t in bus.trace].count("sbr") == 2 * recovery_pkg.BRIDGE_RESET_MAX_TRIES
+    assert sum(waited) == pytest.approx(14 + 30.3 * 2) == pytest.approx(74.6), waited
+
+
+def test_a_record_is_kept_while_only_its_index_is_reused(tmp_path, monkeypatch):
+    """The driver may give the removed chip's index to another chip; the record is about the address,
+    so a node with that index and nothing at the recorded address does not clear it."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    bus.remove("13")
+    (bus.cls / "tenstorrent!13").mkdir()
+    assert pci.removed_chip_ids() == ["13"]
+
+
+def test_an_unchanged_reload_does_not_rewrite_the_file(tmp_path, monkeypatch):
+    """A broker start that drops no record leaves removed_chips.json as it was."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    boot = tmp_path / "boot_id"
+    boot.write_text("boot-a\n")
+    monkeypatch.setattr(pci, "BOOT_ID_FILE", boot)
+    bus.remove("13")
+    saves = []
+    monkeypatch.setattr(pci, "_save_removed_chips", lambda: saves.append(1))
+    assert _restart() == ["13"]
+    assert saves == []
+
+
+def test_a_failed_save_never_breaks_recovery(tmp_path, monkeypatch):
+    """Persistence is best effort: any error writing the records keeps the in-memory record."""
+    bus = FakeBus(tmp_path, monkeypatch)
+
+    def boom():
+        raise RuntimeError("no state dir")
+
+    monkeypatch.setattr(pci.evidence, "health_dir", boom)
+    bus.remove("13")
+    assert pci.removed_chip_ids() == ["13"]

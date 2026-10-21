@@ -252,3 +252,11 @@ def test_the_unit_never_orders_after_the_vendor_hugepages_service(tmp_path):
     deps = [ln for ln in unit.splitlines() if ln.split("=", 1)[0] in ("After", "Wants", "Requires", "BindsTo")]
     assert not [ln for ln in deps if "tenstorrent-hugepages" in ln]
     assert "Wants=dev-hugepages\\x2d1G.mount" in deps
+
+
+def test_the_unit_lifts_the_memlock_limit_jobs_inherit(tmp_path):
+    # Jobs run in a systemd-run --scope that keeps the broker's rlimits; tt-metal pins host memory,
+    # which systemd's 8 MiB default LimitMEMLOCK would refuse.
+    unit = _render(tmp_path, _GALAXY)
+    service = unit.split("[Service]", 1)[1].split("[Install]", 1)[0]
+    assert "LimitMEMLOCK=infinity" in service.splitlines()
