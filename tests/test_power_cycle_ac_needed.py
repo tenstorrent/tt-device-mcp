@@ -189,7 +189,9 @@ async def test_a_class_a_sweep_releases_only_on_a_passing_full_check(cool, monke
 @pytest.mark.asyncio
 @pytest.mark.parametrize("guard", ["tenant", "refused"])
 async def test_a_class_a_sweep_a_guard_holds_runs_no_check_and_the_cycle_still_follows(
-    cool, monkeypatch, guard  # noqa: F811
+    cool,
+    monkeypatch,
+    guard,  # noqa: F811
 ):
     """A live tenant at the 10-min mark holds the sweep (no reset over a tenant) and leaves it due for the
     next forced pass; a sweep the reset gate or the outage hold refuses runs no check. Either way nothing

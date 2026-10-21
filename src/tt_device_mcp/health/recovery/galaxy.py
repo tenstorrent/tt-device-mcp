@@ -1931,9 +1931,7 @@ class GalaxyRecovery(Recovery):
         gaps = "; ".join(blocker["gaps"]) or "no detail"
         return f"holder scan incomplete (source={blocker['source']}: {gaps})"
 
-    async def _issue_all_resets_back_to_back(
-        self, trays: list, expected: int, log, *, do_sbr: bool = True
-    ) -> bool:
+    async def _issue_all_resets_back_to_back(self, trays: list, expected: int, log, *, do_sbr: bool = True) -> bool:
         """Fire EVERY reset type once, back-to-back, with no waiting or verifying between them: SBR on
         any chip still bridged, then the mesh-wide reset —
         each issued as soon as the previous command returns. The single implementation of "all rungs",
@@ -2265,7 +2263,9 @@ class GalaxyRecovery(Recovery):
         self._td_reset_seen = True  # an onset first sighted after a reset is not an onset (I19)
         complete = await self._issue_all_resets_back_to_back(trays, expected, log)
         if not complete:
-            log("class A 10-min sweep refused (reset gate or outage hold) — holding; the cycle follows at the cooldown's end")
+            log(
+                "class A 10-min sweep refused (reset gate or outage hold) — holding; the cycle follows at the cooldown's end"
+            )
             return OUTCOME_WAITING
         try:
             await asyncio.sleep(settle)
@@ -2645,7 +2645,10 @@ class GalaxyRecovery(Recovery):
         off_bus = offbus_count(beats, expected)
         if off_bus <= 0:
             return ""
-        if cycle and _whole_tray_drop_trays(_offbus_chip_ids(beats, expected), expected, self._tray_map_now()) is not None:
+        if (
+            cycle
+            and _whole_tray_drop_trays(_offbus_chip_ids(beats, expected), expected, self._tray_map_now()) is not None
+        ):
             log(
                 f"{off_bus}/{expected} chip(s) off the bus fill whole trays — no reset first; straight to the power cycle"
             )
