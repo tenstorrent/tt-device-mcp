@@ -32,11 +32,13 @@ from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitors import fabric, pci
 from tt_device_mcp.health.monitors.heartbeat import arc_not_ready_chips, offbus_count
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
+from tt_device_mcp.health.recovery import base as _base
 from tt_device_mcp.health.recovery import pcie_guard
 from tt_device_mcp.health.recovery.base import (
     RESET_COOLDOWN_SEC,
     RecoveryMechanism,
     drop_returned_isolated,
+    pci_rescan,
     refuse_mesh_reset,
 )
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
@@ -71,6 +73,13 @@ STAGE_POWER_CYCLE = constants.STAGE_POWER_CYCLE
 OUTCOME_RECOVERED = "recovered"
 OUTCOME_WAITING = "waiting"
 OUTCOME_TERMINAL = "terminal"
+
+
+def bridge_reset_call_timeout() -> float:
+    """Bound on one reset_chip_via_bridge call: its three setpci calls (15 s each), the link-retrain
+    settle, its rescan (PCI_SYSFS_WRITE_TIMEOUT_SEC) and its 10 s re-enumeration poll, plus slack."""
+    return 3 * 15 + SBR_RETRAIN_SETTLE_SEC + _base.PCI_SYSFS_WRITE_TIMEOUT_SEC + 10 + 5
+
 
 # A surgical bridge reset fired seconds after a chip leaves the bus can lose the race with the
 # endpoint's link retrain and report failure, yet the same chip re-binds in ~2s once the link
@@ -533,8 +542,8 @@ class Recovery(ABC):
                 # reset_chip_via_bridge waits before its own rescan.
                 await asyncio.sleep(SBR_RETRAIN_SETTLE_SEC)
                 try:
-                    await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
-                except OSError as e:
+                    await pci_rescan("bridge reset batch rescan")
+                except (OSError, asyncio.TimeoutError) as e:
                     log(f"PCI rescan after the bridge reset could not run ({e})")
                 for _ in range(20):
                     await asyncio.sleep(0.5)
@@ -594,7 +603,24 @@ class Recovery(ABC):
                 FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
                 # A bridge reset clears the chip's firmware clock cap like any reset (spec 03 I35).
                 CEILING.mark_owed(f"bridge reset of chip {idx}")
-                result = await asyncio.to_thread(reset_chip_via_bridge, idx, bdf)
+                try:
+                    # Bounded: its rescan waits on the kernel's PCI rescan/remove lock, which a
+                    # remove blocked in the kernel holds for good. A timeout is this rung failing.
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(reset_chip_via_bridge, idx, bdf), timeout=bridge_reset_call_timeout()
+                    )
+                except asyncio.TimeoutError:
+                    health_event(
+                        "bridge_reset_failed",
+                        chip=idx,
+                        bdf=bdf,
+                        reason="timeout",
+                        timeout_s=bridge_reset_call_timeout(),
+                    )
+                    log(f"bridge reset of chip {idx} did not answer in {bridge_reset_call_timeout():.0f} s")
+                    lost.append(idx)
+                    metrics.stage_fired("bridge_reset", "failed")
+                    break
                 if result:
                     recovered.append(idx)
                     metrics.stage_fired("bridge_reset", "ok")
@@ -660,9 +686,9 @@ class Recovery(ABC):
             # reboot or a chassis power cycle. A rescan re-enumerates it in about a second with no
             # downtime; both times it restored 8/8. Try it before anything that costs a tenant.
             try:
-                await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
+                await pci_rescan("bare rescan of dead chips")
                 await asyncio.sleep(3)
-            except OSError as e:
+            except (OSError, asyncio.TimeoutError) as e:
                 log(f"PCI rescan could not run ({e}); falling through to the heavier rungs")
             else:
                 back = [i for i in still_dead if Path(f"{pci.SYSFS_CLASS_DIR}/tenstorrent!{i}").exists()]

@@ -53,12 +53,22 @@ GLX_POST_RESET_FAILED = re.compile(r"POST_RESET failed for device /dev/tenstorre
 PCI_SYSFS_WRITE_TIMEOUT_SEC = 30
 
 
-async def pci_rescan() -> None:
+async def pci_rescan(context: str = "", write: Optional[Callable[[], object]] = None) -> None:
     """One global PCI rescan, bounded by PCI_SYSFS_WRITE_TIMEOUT_SEC. Raises OSError or
-    asyncio.TimeoutError."""
-    await asyncio.wait_for(
-        asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1"), timeout=PCI_SYSFS_WRITE_TIMEOUT_SEC
+    asyncio.TimeoutError; a timeout is journaled (pci_rescan_timeout) and counts as the calling rung
+    failing, so the ladder goes on to its next rung and the power-cycle request instead of waiting
+    behind a remove that is blocked in the kernel. ``write`` replaces the bare sysfs write (a
+    module's own stubbable rescan function); ``context`` names the rung in the journal."""
+    call = (
+        asyncio.to_thread(write)
+        if write is not None
+        else asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
     )
+    try:
+        await asyncio.wait_for(call, timeout=PCI_SYSFS_WRITE_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        health_event("pci_rescan_timeout", context=context, timeout_s=PCI_SYSFS_WRITE_TIMEOUT_SEC)
+        raise asyncio.TimeoutError(f"no answer in {PCI_SYSFS_WRITE_TIMEOUT_SEC} s") from None
 
 
 # A reset that did not fix the device will not fix it on the next attempt either,
@@ -1297,7 +1307,10 @@ class RecoveryMechanism:
                     # the pollers stay down too, owed to the next close to HEALTHY.
                     restored = cut_done and rc in (0, None)
                     await self.restore_pollers(
-                        quiesced, log, ok=restored, after=f"reset rc={rc}" if cut_done else f"reset rc={rc}, cut cancelled"
+                        quiesced,
+                        log,
+                        ok=restored,
+                        after=f"reset rc={rc}" if cut_done else f"reset rc={rc}, cut cancelled",
                     )
 
             if late_cancel:
