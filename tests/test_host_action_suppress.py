@@ -365,17 +365,18 @@ async def test_a_shrinking_offbus_set_gets_no_second_reset_when_the_power_cycle_
 
 
 @pytest.mark.asyncio
-async def test_the_gate_keeps_resetting_a_drop_whose_power_cycle_is_not_opted_in(
+async def test_the_gate_runs_one_reset_per_episode_when_the_power_cycle_is_not_opted_in(
     monkeypatch, tmp_path, clear_job_state
 ):
     """The gate's reset ran, hard-failed and left the drop needing the cold rung, with none opted in.
-    The next gate pass, once the reset cooldown ran out, still runs the reset: the gate's cooldown
-    bounds the retry rate, no latch ends the retries."""
+    The next gate pass, once the reset cooldown ran out, does not run the mesh reset again: the hold's
+    one reset is spent (spec 04 I87), so the gate reports the spent rung and keeps the hold for the
+    power cycle or the operator. No host rung fires in its place."""
     from tests.test_device_safety import _reach_reboot_rung_with_regressing_reset
 
     monkeypatch.setattr(srv, "device_hold_episode_since", datetime.now().isoformat(timespec="seconds"))
     srv.device_hold_logged = True
-    reboots = _reach_reboot_rung_with_regressing_reset(monkeypatch, tmp_path, off_before=20, off_after=20)
+    host_rungs = _reach_reboot_rung_with_regressing_reset(monkeypatch, tmp_path, off_before=20, off_after=20)
     events, resets = [], {"n": 0}
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
@@ -384,14 +385,20 @@ async def test_the_gate_keeps_resetting_a_drop_whose_power_cycle_is_not_opted_in
         resets["n"] += 1
         srv.recovery_mechanism.last_reset_monotonic = time.monotonic()
         srv.recovery_mechanism.last_reset_exit_nonzero = True
+        srv.recovery_mechanism.mark_mesh_reset_failed()  # what the real reset records on failure
         return False
 
     patch_recovery(monkeypatch, "_reset_and_verify_device", hard_failing_reset)
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-    assert resets["n"] == 1 and "reset_unrecoverable_power_cycle_required" in events
-    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)  # the reset cooldown ran out
-    events.clear()
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-    assert resets["n"] == 2, "the gate retries the reset; no latch stops it"
-    assert "device_reset_skipped_power_cycle_required" not in events
-    assert reboots["n"] == 0
+    try:
+        await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+        assert resets["n"] == 1 and "reset_unrecoverable_power_cycle_required" in events
+        monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)  # the reset cooldown ran out
+        events.clear()
+        await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+        assert resets["n"] == 1, "the hold's one mesh reset is spent; the gate never runs a second one"
+        assert "reset_rung_skipped_spent" in events
+        assert host_rungs["n"] == 0
+        assert srv.device_hold_episode_since, "the device stays held"
+    finally:
+        srv.recovery_mechanism.mesh_reset_failed_since_release = False
+        srv.recovery_mechanism.mesh_reset_failed_episode = None
