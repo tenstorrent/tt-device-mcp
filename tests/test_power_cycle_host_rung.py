@@ -123,6 +123,47 @@ async def test_a_cycle_that_does_not_launch_holds_pages_and_retries(monkeypatch,
     assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
 
 
+@pytest.mark.asyncio
+async def test_two_failed_launches_in_one_episode_page_once_and_retry_each_pass(monkeypatch, clear_job_state):
+    """Spec 04 I71: an unreachable BMC fails every launch. Each pass journals the failure and asks for the
+    cycle again, but the operator is paged once per hold episode, then at most once per
+    CYCLE_LAUNCH_REPAGE_SEC while it keeps failing; a new episode pages again. The hold stays and the
+    fault is never cleared."""
+    counters = _arm_partial_drop(monkeypatch, 8)
+    _deny(monkeypatch)
+    cycles = _cycle_never_launches(monkeypatch)
+    events, alerts = [], []
+    patch_health_event(monkeypatch, lambda kind, **k: events.append((kind, k)))
+    monkeypatch.setattr(galaxy_mod.alert, "send_alert", lambda ev, *a, **k: alerts.append(ev))
+    monkeypatch.setattr(srv, "device_hold_episode_since", "2026-01-01T00:00:00")
+
+    async def one_pass(force):
+        await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=force)
+
+    await one_pass(False)
+    await one_pass(True)
+    failed = [k for kind, k in events if kind == "power_cycle_launch_failed_holding"]
+    assert cycles["n"] == 2, "every pass asks for the cycle again (no pacing)"
+    assert [k["paged"] for k in failed] == [True, False], "each failure is journaled; only the first pages"
+    assert len(alerts) == 1 and alerts[0]["kind"] == "power_cycle_launch_failed_holding"
+    assert alerts[0]["held_since"] == "2026-01-01T00:00:00"
+    assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0, "the hold stays"
+    assert srv.recovery_mechanism.host_action_requested is None
+
+    episode, at = srv.galaxy_recovery._cycle_launch_paged
+    srv.galaxy_recovery._cycle_launch_paged = (episode, at - recovery_base.CYCLE_LAUNCH_REPAGE_SEC)
+    await one_pass(True)
+    assert len(alerts) == 2, "still failing an interval later: one more page"
+    await one_pass(True)
+    assert len(alerts) == 2
+
+    monkeypatch.setattr(srv, "device_hold_episode_since", "2026-01-01T01:00:00")
+    await one_pass(True)
+    assert len(alerts) == 3 and alerts[2]["held_since"] == "2026-01-01T01:00:00", "a new episode pages again"
+    assert cycles["n"] == 5
+    assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
+
+
 def _gate_partial_drop(monkeypatch, tmp_path):
     _reach_reboot_rung_with_regressing_reset(monkeypatch, tmp_path, off_before=16, off_after=16)
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")

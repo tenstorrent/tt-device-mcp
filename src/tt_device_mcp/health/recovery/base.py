@@ -239,6 +239,9 @@ POWER_CYCLE_MISS_REPAGE_SEC = 3600
 # CLASS_A_LADDER_AFTER_SEC since its last cycle or boot. Nothing stops the cycles but the cooldown.
 POWER_CYCLE_AC_NEEDED_AFTER = 2
 AC_POWER_REPAGE_SEC = 3600
+# Spec 04 I71: a power cycle that does not launch pages once per hold episode, then at most this often
+# while it keeps failing; every failure is still journaled and the cycle asked again each pass.
+CYCLE_LAUNCH_REPAGE_SEC = 3600
 CLASS_A_LADDER_AFTER_SEC = 600
 
 
@@ -592,13 +595,10 @@ class RecoveryMechanism:
         # held box.
         self._auto_recovery_denied_episode = ""
 
-        # The host-level action (reboot / power-cycle) last requested and when (monotonic). Set once
+        # The host-level action (the power cycle) last requested and when (monotonic). Set once
         # its record is on disk, cleared if it fails to launch; read by the hold watchdog, which
         # starts no device reset while one is pending (see host_action_pending).
         self.host_action_requested: Optional[tuple[str, float]] = None
-        # When a power cycle last failed to launch on this boot (epoch; the fire raised, not timed out).
-        # Diagnostic only: a cycle that did not launch keeps the hold and is asked for again (spec 04 I71).
-        self.power_cycle_unlaunched_at: Optional[float] = None
         # The request a device reset was last refused for (one log line per request, spec 04 I34).
         self._host_action_reset_refused: Optional[tuple[str, float]] = None
 
@@ -2267,27 +2267,28 @@ class RecoveryMechanism:
     async def _fire_recovery_escalation(
         self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: str, pre_fire=None
     ) -> bool:
-        """Shared body of the two host-level recovery rungs (reboot, BMC power cycle). Records the
-                escalation durably — the rate limiter — and leaves a visible jobs-list row BEFORE the action
-                takes the box down, so both survive it; G6b back-fills the boot when the broker restarts. If
-                the record cannot be persisted the action is ABORTED: an unrecorded escalation is one the next
-                boot repeats — a loop. ``fire`` is the isolated one-liner that acts, replaced wholesale in
-                tests so no test path can take the box running the suite down.
+        """Shared body of the host-level recovery rung (the BMC power cycle, the only host rung, spec 04
+        I71). Records the escalation durably — the rate limiter — and leaves a visible jobs-list row BEFORE
+        the action takes the box down, so both survive it; G6b back-fills the boot when the broker
+        restarts. If the record cannot be persisted the action is ABORTED: an unrecorded escalation is one
+        the next boot repeats — a loop. ``fire`` is the isolated one-liner that acts, replaced wholesale in
+        tests so no test path can take the box running the suite down.
 
-                Reports the ``stages_fired_total`` metric under the Stage name matching ``action``
-        ("power-cycle" -> "power_cycle" — see ``health.recovery.stages.power_cycle``): "blocked" when the ledger write
-                itself fails (nothing fired), "failed" when ``fire`` raised (attempted, did not launch),
-                "ok" when it returned normally (the action was issued — a SUCCESSFUL reboot/power-cycle
-                takes the box down from inside ``fire`` and never reaches here at all).
+        Reports the ``stages_fired_total`` metric under the Stage name matching ``action``
+        ("power-cycle" -> "power_cycle" — see ``health.recovery.stages.power_cycle``): "blocked" when the
+        ledger write itself fails (nothing fired), "failed" when ``fire`` raised (attempted, did not
+        launch), "ok" when it returned normally (the action was issued — a SUCCESSFUL power cycle takes
+        the box down from inside ``fire`` and never reaches here at all).
 
-                ``pre_fire(log, reason)``, when given, runs after the record and row and just before
-                ``fire`` (spec 04 I26): a bounded, blocking call that never raises and whose outcome never
-                stops the fire. Running it after the record means it only runs for an action that is
-                really about to happen, never for one the ledger then aborts.
+        ``pre_fire(log, reason)``, when given, runs after the record and row and just before ``fire``
+        (spec 04 I26): a bounded, blocking call that never raises and whose outcome never stops the fire.
+        Running it after the record means it only runs for an action that is really about to happen,
+        never for one the ledger then aborts.
 
-                Returns False when the action certainly did not launch (the record could not be written, or
-                ``fire`` raised anything but a timeout), so a caller may take an in-band fallback (spec 04
-                I71); True when it was issued or timed out and may still act."""
+        Returns False when the action certainly did not launch (the record could not be written, or
+        ``fire`` raised anything but a timeout): the caller keeps the hold, pages once per episode and
+        asks again on the next pass (spec 04 I71). True when it was issued or timed out and may still
+        act."""
         ev = action.replace("-", "_")
         stage = _ACTION_TO_STAGE[action]
         if not self.record_auto_recovery(action, reason):
@@ -2337,8 +2338,6 @@ class RecoveryMechanism:
             # block the retry the still-wedged box needs, so retract it and surface loudly.
             self.retract_last_auto_recovery(action)
             timed_out = isinstance(exc, (HostActionTimedOut, subprocess.TimeoutExpired))
-            if action == "power-cycle" and not timed_out:
-                self.power_cycle_unlaunched_at = time.time()
             if timed_out:
                 # It may have launched its detached cycler before it stopped answering: keep the
                 # request pending (normal bound) so no device reset starts under a cycle that may

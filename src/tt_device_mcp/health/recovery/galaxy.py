@@ -47,6 +47,7 @@ from tt_device_mcp.health.recovery import (
 )
 from tt_device_mcp.health.recovery.base import (
     CLASS_A_LADDER_AFTER_SEC,
+    CYCLE_LAUNCH_REPAGE_SEC,
     HOLD_ESCALATION_REARM_SEC,
     drop_returned_isolated,
     refuse_mesh_reset,
@@ -902,6 +903,9 @@ class GalaxyRecovery(Recovery):
     # end in any read after that, so the last read is the one right before a rung acts.
     _stand_down: Optional[Callable[[], bool]] = None
     startup_verify_deferred: bool = False
+    # Spec 04 I71: the (episode, monotonic time) of the last page for a power cycle that did not launch.
+    # One page per hold episode, then at most one every CYCLE_LAUNCH_REPAGE_SEC while it keeps failing.
+    _cycle_launch_paged: Optional[tuple[str, float]] = None
 
     def tenant_holds(self) -> bool:
         """The forced ladders' own tenant check, alone: a running broker job or a readable tenant fd."""
@@ -980,13 +984,24 @@ class GalaxyRecovery(Recovery):
 
     def _hold_after_cycle_launch_failure(self, log, cause: str) -> None:
         """A power cycle that did not launch (spec 04 I71): an unreachable BMC or a failing ipmitool.
-        Nothing stands in for it — there is no warm reboot rung. The hold stays, this pages (journal
-        line plus a /health event), and the next watchdog or gate pass asks for the cycle again under
-        the I76 bound."""
+        Nothing stands in for it — there is no warm reboot rung. The hold stays, every failure is
+        journaled (log line plus a /health event), and the next watchdog or gate pass asks for the
+        cycle again under the I76 bound, unpaced, so the cycle fires on the first pass the BMC answers.
+        The page goes out once per hold episode and again at most every CYCLE_LAUNCH_REPAGE_SEC while
+        the launch keeps failing: the I76 bound asks every watchdog tick, and a failed launch retracts
+        its ledger entry, so nothing else rate-limits it."""
         log(f"the power cycle did not launch ({cause}); holding the device and retrying the cycle on the next pass")
-        event = {"kind": "power_cycle_launch_failed_holding", "cause": cause}
-        health_event(event["kind"], cause=cause)
-        alert.send_alert(event, _logger)
+        episode = self.deps.device_hold_episode_since() or ""
+        mono = time.monotonic()
+        last = self._cycle_launch_paged
+        repage = last is not None and last[0] == episode and mono - last[1] >= CYCLE_LAUNCH_REPAGE_SEC
+        page = last is None or last[0] != episode or repage
+        health_event("power_cycle_launch_failed_holding", cause=cause, paged=page, held_since=episode or None)
+        if not page:
+            return
+        event = {"kind": "power_cycle_launch_failed_holding", "cause": cause, "held_since": episode or None}
+        if alert.send_alert(event, _logger) is not None or alert.alert_argv() is None:
+            self._cycle_launch_paged = (episode, mono)
 
     def _platform_reset_argv(self, indices: list) -> list:
         # All ASICs, no targets: a 6U Galaxy needs -glx_reset — per-PCIe-target -r does not

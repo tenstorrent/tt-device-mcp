@@ -1013,6 +1013,33 @@ def _real_host_rung(monkeypatch, cycles, allowed=lambda action: (True, "")):
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
 
 
+@pytest.mark.asyncio
+async def test_a_bound_cycle_that_cannot_launch_pages_once_and_is_asked_every_tick(monkeypatch, clear_job_state):
+    """Spec 04 I71/I76: at the bound, a power cycle that does not launch leaves the rung pending, so the
+    watchdog asks again each tick. Two failed launches in one episode give two cycle attempts and one
+    page; the hold stays and nothing releases it."""
+    why, detail, output, beats, _ladder = _KINDS["generic"]
+    _escalations, alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why=why, detail=detail, fabric_output=output, beats=beats, age_min=BOUND / 60 + 0.05
+    )
+    cycles = []
+    _real_host_rung(monkeypatch, cycles)
+
+    async def unlaunched(log, reason):
+        cycles.append("power_cycle")
+        return False
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", unlaunched)
+    monkeypatch.setattr(srv, "_bound_tenant_blocker", lambda *a: None)
+    for _ in range(2):
+        await srv._hold_bound_host_rung(BOUND + 1, lambda m: None)
+        assert srv._hold_bound_rung_pending, "a failed launch keeps the rung pending: asked again next tick"
+    assert cycles == ["power_cycle", "power_cycle"]
+    assert events.count("power_cycle_launch_failed_holding") == 2, "every failure is journaled"
+    assert [a["kind"] for a in alerts] == ["power_cycle_launch_failed_holding"], "one page per episode"
+    assert srv._recovery_degraded() and "device_released" not in events, "the hold stays"
+
+
 def _tick(seconds=10):
     srv._check_hold_deadline(now=datetime.now() + timedelta(seconds=seconds))
 

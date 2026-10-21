@@ -1118,8 +1118,13 @@ each rung fires only when the gentler one failed or cannot apply.
   and mesh resets first and a present-mesh wedge its one `glx_reset` (I87) before the host rung;
   only a whole-tray or all-off drop goes straight to the cycle (I37). A power cycle that the governor
   or the I65 cooldown denies holds and is asked again at the deadline `/health` shows; one that does
-  not launch (unreachable BMC, failing command) keeps the hold, pages once, and is asked again on the
-  next pass and at the I76 bound; neither reboots. With no power cycle armed the hold goes to an
+  not launch (unreachable BMC, failing command) keeps the hold and is asked again on every pass: the
+  I76 bound leaves the rung pending, so the watchdog asks each tick, unpaced, and the cycle fires on
+  the first pass the BMC answers (a failed launch costs one `ipmitool` call, at most 30 s; a timed-out
+  one stays pending under I72). Every failure is journaled (`power_cycle_launch_failed_holding`, with
+  `paged`); the page goes out once per hold episode and again at most every `CYCLE_LAUNCH_REPAGE_SEC`
+  (3600 s) while it keeps failing, never once per tick. Neither path reboots. The hold is bounded by
+  the BMC answering; the cycle itself and its time to recover are unchanged. With no power cycle armed the hold goes to an
   operator (I33), paged, still held. `_route` returns BLOCKED only when no reset scope is live; under
   a live scope it waits. The full health check, fabric included, runs after the cycle before any
   release (03 I4). The I76 10-min hold bound is unchanged. Time to recover, armed multi-chip host:
