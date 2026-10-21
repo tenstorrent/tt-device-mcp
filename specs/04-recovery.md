@@ -217,7 +217,7 @@ each rung fires only when the gentler one failed or cannot apply.
   still runs the full ladder and then the host rung. Time to recover for an ARC-not-ready mesh after
   a failed `-glx_reset`: about one settle plus one reset and its full check (measured: the next
   reset recovered at once), instead of the hold's next window (10 min); when the retry does not heal,
-  the next rung is late by at most the settle plus one reset (`DEVICE_RESET_TIMEOUT_SEC`). No other
+  the next rung is late by at most the settle plus one reset (`DEVICE_RESET_TIMEOUT_SEC`) if the retried reset exits non-zero, and by that plus the full check (bounded by the existing verify and fabric-retry limits) if it exits 0 but the check fails. No other
   class changes: a chip off the bus, a per-target `-r`, a running job or a tenant gets no retry); the
   idle ladders latch once per hold episode (the latch
   expires after `HOLD_ESCALATION_REARM_SEC` so a hold never becomes permanent); the tray walk runs
