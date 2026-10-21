@@ -715,15 +715,26 @@ class Recovery(ABC):
         ``healthy`` is None: never a recovery (no hold is cleared onto a fabric no pass proved, the box D
         shape: enum+ARC read OK while every full-mesh job died on a down link), and never a failed reset
         either (a 77 measured nothing, so it must not arm the host rungs). Falsy, so a caller that only
-        asks "recovered?" still reads no. Returns ``(healthy, evidence, fabric_retries)``."""
+        asks "recovered?" still reads no. A 77 from a validator that is not built yet (spec 03 I81) gets no
+        retry and no eth-training wait: it is the same UNKNOWN at once. Returns ``(healthy, evidence,
+        fabric_retries)``."""
         healthy, evidence = await self._verify_device(expected, log)
         retries = 0
+        not_built = None
         while (
             self._fabric_ran_but_unverified(evidence)
             and healthy
             and expected > 1
             and retries < POST_RESET_FABRIC_RETRIES
         ):
+            not_built = fabric.validator_not_built()
+            if not_built is not None:
+                # I81: the 77 is a validator that is not on disk; no wait for eth training makes it run.
+                log(
+                    f"post-reset fabric could not run: fabric validator not built ({not_built}) — no "
+                    "eth-training wait; the fabric stays unverified until the build lands"
+                )
+                break
             retries += 1
             if fabric.names_dispatch_cap(evidence["fabric"].get("detail", "")):
                 # I84: the validator already moved traffic across every link, so they were trained;
@@ -741,8 +752,13 @@ class Recovery(ABC):
             healthy, evidence = await self._verify_device(expected, log)
         if healthy and expected > 1 and self._fabric_ran_but_unverified(evidence):
             log(
-                "post-reset fabric still could not verify after eth-training retries — the fabric is UNKNOWN "
-                "(enum+ARC healthy, no pass got a verdict): not recovered, and not a failed reset"
+                (
+                    "post-reset fabric could not verify (fabric validator not built)"
+                    if not_built
+                    else "post-reset fabric still could not verify after eth-training retries"
+                )
+                + " — the fabric is UNKNOWN (enum+ARC healthy, no pass got a verdict): not recovered, and not "
+                "a failed reset"
             )
             healthy = None
         FABRIC_DEBT.note_evidence(evidence)

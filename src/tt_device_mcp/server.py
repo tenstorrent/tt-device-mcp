@@ -7880,6 +7880,9 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     payload["fabric_topology"] = (getattr(health_monitor, "fabric_topology", None) or None) if health_monitor else None
     # Spec 03 I71: the ports an operator accepted as dead, so a lift on them is never silent.
     payload["fabric_accepted_missing_ports"] = sorted(fabric.accepted_missing_ports())
+    # Spec 03 I81: whether the pinned fabric validator is on disk (stat calls only), and what is missing.
+    not_built = fabric.validator_not_built()
+    payload["fabric_validator"] = {"built": not_built is None, "missing": not_built}
     # Spec 03 I72: the hold's class, start, next rung and per-tray presence, read-only.
     if fsm.state in (ServerState.RECOVERING, ServerState.DOWN):
         payload.update(_hold_report(now))
@@ -12905,6 +12908,10 @@ STARTUP_PREREQ_WAIT_SEC = 2.5 * 3600
 STARTUP_PREREQ_POLL_MIN_SEC = 5.0
 STARTUP_PREREQ_POLL_MAX_SEC = 60.0
 _startup_prereq_task: Optional[asyncio.Task] = None
+# Spec 03 I81: the hold episode (its fsm ``since``) whose missing validator already had its build
+# requested, so one episode asks the build unit once.
+_validator_build_requested_for: Optional[str] = None
+VALIDATOR_BUILD_REQUEST_TIMEOUT_SEC = 30.0
 # Spec 03 I75: the startup gate task, and when it stopped waiting on re-adopted jobs (monotonic).
 _startup_verify_task: Optional[asyncio.Task] = None
 _startup_verify_ready_at: Optional[float] = None
@@ -12992,6 +12999,51 @@ def _sync_fsm_readopted_jobs() -> None:
             logger.warning(f"fsm readopted_jobs sync failed: {e}")
 
 
+async def _request_validator_build(missing: str) -> bool:
+    """Ask systemd to build the pinned validator, once per hold episode (spec 03 I81).
+
+    ``systemctl start --no-block`` only queues the build unit's start, so this never waits on the
+    build itself, and the call is bounded by VALIDATOR_BUILD_REQUEST_TIMEOUT_SEC. A unit already
+    running or queued is left as it is. Skipped without systemd or root. It lifts nothing: the owed
+    pass (I39) runs once the build lands, and only a pass lifts. True when the request was sent.
+    Never raises."""
+    global _validator_build_requested_for
+    episode = str(fsm.record.since or "")
+    if _validator_build_requested_for == episode:
+        return False
+    if not (privileges.has_systemd() and privileges.is_root()):
+        if logger:
+            logger.info(f"STARTUP FABRIC fabric validator not built ({missing}); no systemd/root to request its build")
+        return False
+    _validator_build_requested_for = episode
+    unit = fabric.VALIDATOR_BUILD_UNIT
+    rc: Optional[int] = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl",
+            "start",
+            "--no-block",
+            unit,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            rc = await aio.wait_for(proc.wait(), timeout=VALIDATOR_BUILD_REQUEST_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+    except Exception as e:  # noqa: BLE001 - a request that cannot be sent leaves the watch as it was
+        if logger:
+            logger.warning(f"STARTUP FABRIC could not request the validator build ({unit}): {e}")
+        return False
+    health_event("fabric_validator_build_requested", unit=unit, missing=missing, rc=rc)
+    if logger:
+        logger.info(f"STARTUP FABRIC fabric validator not built ({missing}); requested {unit} (rc={rc})")
+    return rc == 0
+
+
 async def _await_startup_prerequisites(missing: str) -> None:
     """Owe the startup fabric pass again once what it lacked has landed (spec 03 I39).
 
@@ -13010,6 +13062,9 @@ async def _await_startup_prerequisites(missing: str) -> None:
             f"STARTUP FABRIC could not check: {missing} — holding fabric-unverified; the pass re-runs "
             f"once it is there (watching up to {int(STARTUP_PREREQ_WAIT_SEC)}s)"
         )
+    not_built = await asyncio.to_thread(fabric.validator_not_built)
+    if not_built is not None:
+        await _request_validator_build(not_built)
     while True:
         if not _fabric_77_only_hold():
             if logger:
@@ -13162,6 +13217,10 @@ async def _verify_fabric_on_start() -> None:
         _startup_verify_ready_at = time.monotonic()
         # Read before the pass: a validator that lands while it runs must still be waited for.
         missing = await asyncio.to_thread(fabric.validator_missing)
+        if missing and logger:
+            logger.warning(
+                f"STARTUP FABRIC fabric validator not built: {missing} (spec 03 I81: no reset, no link fault)"
+            )
         if not await _await_startup_hugepages():
             missing = missing or "hugepages not yet allocated"
         else:

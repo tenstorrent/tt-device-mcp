@@ -825,6 +825,7 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
 
 def test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified(monkeypatch, tmp_path):
     _mesh_with_fabric_check(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)  # built: a 77 is a link verdict
     calls = _verify_seam(monkeypatch, fabric_ok=None)
     monkeypatch.setattr(srv, "device_fault_reported", "job 7 waiting for active ethernet core")
 

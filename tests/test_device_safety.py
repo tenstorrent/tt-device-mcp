@@ -14334,6 +14334,7 @@ async def test_a_reset_that_leaves_the_fabric_unverified_is_unknown(monkeypatch,
     neither cleared onto an unverified fabric nor counted a failed reset (cooldown, two strikes, host
     rungs): it becomes a not-dirty 77-only fabric-unverified hold the idle relift re-checks (spec 03 I40)."""
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)  # built: a 77 is a link verdict
     srv._mark_device_dirty("job 007 ended: eth link down")
     monkeypatch.setattr(srv, "device_fault_reported", "ethernet link timeout")
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", True)
@@ -14390,6 +14391,7 @@ async def test_a_reset_that_leaves_the_fabric_unverified_counts_toward_the_relif
     """Spec 04 I29: the UNKNOWN reset records its episode and counts its post-reset 77 passes toward the
     I40 bound, so the next relift's 77 falls back to the startup checks at once."""
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)  # built: a 77 is a link verdict
     srv._mark_device_dirty("job 007 ended: eth link down")
     monkeypatch.setattr(srv, "device_hold_episode_since", "2026-10-14T05:38:40")  # the idle ledger's episode
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRIES", 1)
