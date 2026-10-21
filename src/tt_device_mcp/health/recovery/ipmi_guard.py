@@ -12,8 +12,8 @@ guard.
 
 Stdlib only, because this one file plays three roles:
 
-- imported by the broker: :func:`refusal`, :func:`is_mesh_reset`, :func:`guarded_argv`,
-  :func:`bmc_preflight`, :func:`scan_reset_output`;
+- imported by the broker: :func:`refusal`, :func:`is_mesh_reset`, :func:`override_unclassified`,
+  :func:`guarded_argv`, :func:`bmc_preflight`, :func:`scan_reset_output`;
 - ``python -I ipmi_guard.py --wrap -- <argv>``, inside ``unshare --mount``: mount a copy of this file
   over every ipmitool sudo can resolve, check the mounts, exec ``<argv>``;
 - that copy, run as ``ipmitool``: refuse, or exec the real binary.
@@ -56,7 +56,10 @@ MIN_BMC_AUX_PATCH = 0x16  # 22: the lower of the byte's decimal (0x16) and BCD (
 _NETFN_OEM = 0x30
 _CMD_UBB_RESET = 0x8B
 # tt-smi's reset flags that reach the IPMI tray reset (argparse also takes unambiguous prefixes).
-_MESH_FLAG_PREFIXES = ("-glx_reset", "--galaxy_6u_trays_reset", "--galaxy_6u_t")
+# tt-smi's Galaxy tray reset flags (-glx_reset*, --galaxy_6u_trays_reset), matched anywhere in any token.
+_MESH_FLAG_MARKERS = ("glx_reset", "galaxy_6u_t")
+# What a token names when it runs tt-smi itself: the console script, the module, or its .py file.
+_TT_SMI_NAMES = ("tt-smi", "tt_smi")
 
 
 def _ipmi_byte(token: str) -> Optional[int]:
@@ -106,10 +109,34 @@ def refusal(args: list[str]) -> Optional[str]:
 
 
 def is_mesh_reset(argv: list[str]) -> bool:
-    """Whether ``argv`` is a tt-smi Galaxy tray reset, the only tt-smi path that sends the BMC UBB reset."""
-    if not argv or os.path.basename(str(argv[0])) != "tt-smi":
-        return False
-    return any(str(a).startswith(_MESH_FLAG_PREFIXES) for a in argv[1:])
+    """Whether ``argv`` is a tt-smi Galaxy tray reset, the only tt-smi path that sends the BMC UBB reset.
+
+    The flag counts wherever it sits, whatever launches it: ``sudo tt-smi -glx_reset``,
+    ``env X=1 tt-smi -glx_reset``, ``python3 -m tt_smi -glx_reset``, or a wrapper script given the
+    flag. A ``TT_DEVICE_MCP_RESET_ARGS`` override is a full argv, so its first word proves nothing."""
+    return any(marker in str(a).lower() for a in argv for marker in _MESH_FLAG_MARKERS)
+
+
+def _names_tt_smi(token: str) -> bool:
+    name = os.path.basename(str(token))
+    if name.endswith(".py"):
+        name = name[: -len(".py")]
+    return name in _TT_SMI_NAMES
+
+
+def override_unclassified(argv: list[str]) -> str:
+    """'' when a ``TT_DEVICE_MCP_RESET_ARGS`` argv is classified, else why the guard cannot classify it.
+
+    Classified: a mesh reset (:func:`is_mesh_reset`, run under the guard after the BMC preflight), or
+    a tt-smi reset without the Galaxy tray flag (a word that is tt-smi itself, e.g. ``sudo tt-smi -r``),
+    which never sends the BMC UBB reset. Anything else, such as a wrapper script given no Galaxy flag,
+    could reach the BMC unseen, so the broker does not run it (fail closed)."""
+    if is_mesh_reset(argv) or any(_names_tt_smi(a) for a in argv):
+        return ""
+    return (
+        f"TT_DEVICE_MCP_RESET_ARGS ({' '.join(map(str, argv))!r}) names neither tt-smi nor its Galaxy "
+        "tray reset flag, so the ipmitool guard cannot tell whether it reaches the BMC"
+    )
 
 
 def guarded_argv(argv: list[str]) -> list[str]:

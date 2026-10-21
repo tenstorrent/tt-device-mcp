@@ -1872,6 +1872,18 @@ each rung fires only when the gentler one failed or cannot apply.
     read back) does not run the reset: it prints `tt-device-mcp ipmi guard: NOT ARMED` and exits 1,
     and the broker counts that reset as not fired (so does `unshare: unshare failed`). No environment variable, flag or config turns
     the guard off.
+  - **What counts as a mesh reset (`ipmi_guard.is_mesh_reset`).** Any argv with a Galaxy tray reset
+    flag (`glx_reset` or `galaxy_6u_t` inside any word), wherever it sits and whatever launches it.
+    `TT_DEVICE_MCP_RESET_ARGS` is a full argv override, so its first word proves nothing:
+    `sudo tt-smi -glx_reset`, `env X=1 tt-smi -glx_reset`, `python3 -m tt_smi -glx_reset` and a
+    wrapper script given the flag all run under the guard, after the preflight. An override that
+    is not a mesh reset runs only when one of its words is tt-smi itself (`tt-smi`, `tt_smi`, or
+    either with `.py`, under any directory), as in `sudo tt-smi -r`, a path that never sends the
+    BMC UBB reset. Any other override (e.g. a wrapper script given no Galaxy flag) is one the guard
+    cannot classify: it is not run (fail closed). The reset returns rc None (not fired, no
+    failed-reset cooldown), the journal gets `reset_override_unclassified`, `/health`
+    `mesh_reset_bmc_guard` shows `override_unclassified`, and the caller climbs to its next rung
+    as for a preflight refusal.
   - **The preflight.** Before it quiesces the bus for a mesh reset, the broker asks the BMC
     `ipmitool mc info` (read-only, at most `BMC_PREFLIGHT_TIMEOUT_SEC` = 10 s). If the BMC does not
     answer in time, `ipmitool` is missing, or the firmware is provably older than 0.05.22 (firmware
@@ -1898,6 +1910,8 @@ each rung fires only when the gentler one failed or cannot apply.
   | Any class whose ladder runs a mesh reset, BMC answers and op_mode `0x3` works | the preflight's `mc info`, typically under 1 s, at most 10 s per mesh reset; the guard's mount setup, well under 1 s |
   | Same, op_mode `0x3` fails | the reset ends rc 1 at once instead of tt-smi's `0x0` retry; the next rung (the I76 bound's power cycle) follows; the 30 s settle and up-to-100 s driver wait of a `0x0` reset are not spent |
   | Same, BMC silent or firmware below 0.05.22 | the reset is not run (at most 10 s spent); the next rung follows at once |
+  | Same, run through a `TT_DEVICE_MCP_RESET_ARGS` override that names the Galaxy flag | as the three rows above (the override was run unguarded before) |
+  | Same, an override the guard cannot classify | the reset rung is not run (no time spent); the next rung follows at once |
   | Classes with no mesh reset (per-chip bridge reset, `tt-smi -r`, power cycle) | none |
 
 - **I93 — One capped, spaced, guarded mesh-reset repeat per present-mesh hold episode.** An exception
@@ -1988,8 +2002,9 @@ Class structure: see the diagram in 03-health.md.
   None), and the reset argv is re-derived via `select_recovery` inside `_reset_and_verify_device`,
   so a per-target host still fires `tt-smi -r`, never `-glx_reset`. `server.py` folds every outcome
   into the FSM via `fsm.on_outcome(outcome)` (spec 03 owns the state semantics).
-- **`Recovery.reset_argv(indices)`** — `TT_DEVICE_MCP_RESET_ARGS` (a full argv override) wins;
-  otherwise `tt-smi -r <i,j,...>` (per-target) or `tt-smi -glx_reset` (Galaxy, all ASICs, no
+- **`Recovery.reset_argv(indices)`** — `TT_DEVICE_MCP_RESET_ARGS` (a full argv override) wins
+  (I91 classifies it: guarded when it names the Galaxy flag, refused when it names neither that
+  nor tt-smi); otherwise `tt-smi -r <i,j,...>` (per-target) or `tt-smi -glx_reset` (Galaxy, all ASICs, no
   targets).
 - **`RecoveryMechanism`** — `reset_with_quiesce(argv, log, owner)` is the one choke point every
   reset in the broker goes through (gate and tool alike, so "safe" cannot drift); `run_scoped`,
@@ -2504,6 +2519,7 @@ sees a silent fabric pass.
 | I90 the bridge rung's detail starts `device reset:`; /status during it has `device_resetting` and the op row's `resetting` true, false for a non-reset op and after it | `tests/test_removed_chip_rescan.py::test_status_shows_the_bridge_rung_as_a_device_reset` |
 | I91 the guard refuses op_mode `0x0`/`0x00`/`0`/`00` (any case, decimal, octal, over lanplus), a missing or unreadable op byte, `exec` and `shell`; it passes `0x3` and read-only calls; a refused call never execs the real binary; the mounted copy refuses as ipmitool; no env/flag/config is read | `tests/test_ipmi_guard.py::test_the_guard_refuses_the_legacy_retimer_reset`, `tests/test_ipmi_guard.py::test_the_guard_passes_op_mode_3_and_read_only_calls`, `tests/test_ipmi_guard.py::test_a_refused_call_never_execs_the_real_binary`, `tests/test_ipmi_guard.py::test_the_mounted_copy_refuses_as_ipmitool`, `tests/test_ipmi_guard.py::test_nothing_switches_the_guard_off` |
 | I91 arming mounts the guard read-only over every target and fails closed (a mount that fails or does not read back, the host namespace); a wrapper that cannot arm runs no reset | `tests/test_ipmi_guard.py::test_arm_mounts_the_guard_over_every_target_read_only`, `tests/test_ipmi_guard.py::test_arm_fails_closed_when_a_target_is_not_the_guard_after_mounting`, `tests/test_ipmi_guard.py::test_arm_fails_closed_when_a_mount_fails`, `tests/test_ipmi_guard.py::test_the_wrapper_runs_no_reset_when_it_cannot_arm`, `tests/test_ipmi_guard.py::test_the_wrapper_refuses_to_mount_in_the_host_namespace` |
+| I91 a `TT_DEVICE_MCP_RESET_ARGS` override that names the Galaxy flag (sudo, env, `python -m tt_smi`, a wrapper script) gets the preflight and the guard; one naming neither that nor tt-smi is refused (rc None, no launch, no cooldown), journaled, shown in /health, and the ladder climbs with the hold kept until a full check passes | `tests/test_ipmi_guard.py::test_is_mesh_reset`, `tests/test_ipmi_guard.py::test_override_unclassified`, `tests/test_ipmi_guard.py::test_an_override_mesh_reset_in_any_form_gets_the_preflight_and_the_guard`, `tests/test_ipmi_guard.py::test_an_unclassifiable_override_is_refused_and_the_ladder_climbs_with_the_hold_kept`, `tests/test_ipmi_guard.py::test_a_plain_tt_smi_override_runs_unguarded` |
 | I91 both reset backends launch a mesh reset (not `-r`) under the guard; every reset path (gate, ladder, sweep, operator reset, startup) reaches them through `reset_with_quiesce` and nothing else builds a mesh-reset argv | `tests/test_ipmi_guard.py::test_the_scope_backend_launches_a_mesh_reset_under_the_guard`, `tests/test_ipmi_guard.py::test_the_local_backend_launches_a_mesh_reset_under_the_guard`, `tests/test_ipmi_guard.py::test_every_reset_path_goes_through_the_guarded_backends` |
 | I91 the preflight (read-only `mc info`, 10 s bound, firmware >= 0.05.22) refuses a silent BMC or old firmware; a refusal runs no reset, arms no cooldown, keeps the hold, climbs and shows in /health | `tests/test_ipmi_guard.py::test_the_preflight`, `tests/test_ipmi_guard.py::test_the_preflight_is_read_only_and_bounded`, `tests/test_ipmi_guard.py::test_firmware_older_than_0_05_22_is_refused`, `tests/test_ipmi_guard.py::test_a_preflight_refusal_is_a_rung_that_did_not_fire_and_keeps_the_hold` |
 | I91 tt-smi's fallback text or the guard's refusal: rc 0 becomes 1, `bmc_legacy_reset_attempted` host_at_risk, paged once; an unarmed guard (or `unshare` failing) is a reset that did not fire; a guarded reset still owes the full check, fabric included, before release | `tests/test_ipmi_guard.py::test_the_fallback_never_reads_as_a_passing_reset_and_pages_once`, `tests/test_ipmi_guard.py::test_a_guard_that_cannot_arm_is_a_reset_that_did_not_fire`, `tests/test_ipmi_guard.py::test_a_guarded_reset_still_owes_the_full_check_before_release` |

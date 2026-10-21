@@ -253,6 +253,9 @@ async def test_both_backends_rescan_only_once_the_settle_is_over(monkeypatch, tm
     mechanism = _mechanism(monkeypatch, isolated, sysfs, events, scoped=scoped, tmp=tmp_path)
     if scoped:
         mechanism._reset_scope_argv = lambda argv: ("ttdev-reset-test", list(argv))
+    # The fake carries -glx_reset, so it is a mesh reset (spec 04 I91); this test times the rescan,
+    # not the ipmitool guard, whose unshare a sandboxed suite may not be allowed to run.
+    mechanism._launch_argv = list
     argv = [sys.executable, "-c", _FAKE_TT_SMI, "-glx_reset", str(tmp_path)]
 
     rc, text = await asyncio.wait_for(mechanism.reset_with_quiesce(argv, lambda _m: None), timeout=30)

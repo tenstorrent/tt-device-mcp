@@ -1063,7 +1063,9 @@ def test_a_streaming_local_reset_is_visible_to_a_restarted_daemon(monkeypatch, t
     (tmp_path / "0").touch()
     release = tmp_path / "release"
     started = tmp_path / "started"
-    reset_script = tmp_path / "reset"
+    # Named as tt-smi's module file: spec 04 I91 never runs an override that names neither tt-smi nor
+    # the Galaxy flag, and the spawn tripwire refuses a program named tt-smi.
+    reset_script = tmp_path / "tt_smi.py"
     reset_script.write_text(
         "#!/usr/bin/env python3\n"
         "import pathlib, time\n"
