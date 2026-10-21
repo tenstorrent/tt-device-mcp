@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Spec 04 I23: there is no per-tray BMC re-power anywhere in the broker.
 
 The rung (``ipmitool raw 0x30 0x8b`` per tray) was deleted outright: its pulse dropped the other
