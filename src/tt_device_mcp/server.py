@@ -8467,17 +8467,20 @@ def _hold_bound_ladder_in_last_window(age: float) -> bool:
         return False
     ceiling = _stuck_hold_ceiling_sec()
     lad = _hold_bound_ladder_age
-    if _hold_bound_early:
-        lad = max(lad, ceiling)  # spec 04 I83: the at-start pass counts as the first window's ladder
+    # Spec 04 I83: the at-start pass (and the ladder the I42 latch's one-tick bound counted) is the first
+    # window's ladder; one that owes the 10-min rerun never gets here (_hold_bound_owes_ladder).
+    lad = max(lad, ceiling)
     return lad >= max(ceiling, (int(age // ceiling) - 1) * ceiling)
 
 
 def _hold_bound_owes_ladder(age: float) -> bool:
-    """Spec 04 I83 with I76: at the bound, an at-start pass whose host rung was never granted (both host
-    rungs opted out, or a denial other than the cooldown) does not stand in for the bound's ladder. The
-    rerun waits for the 10-min mark even under the I42 latch, whose one-tick bound the at-start pass met."""
+    """Spec 04 I83 with I76: at the 10-min mark, a ladder that ended below it and whose host rung was
+    never granted (both host rungs opted out, or a denial other than the cooldown) does not stand in for
+    the bound's ladder. That is the at-start pass, and under the I42 latch also the ladder its one-tick
+    bound counted: the latch shortens the bound, never the 10-min ladder (the latch stays)."""
     lad = _hold_bound_ladder_age
-    if not _hold_bound_early or lad is None or age < _stuck_hold_ceiling_sec():
+    ceiling = _stuck_hold_ceiling_sec()
+    if lad is None or age < ceiling or not (_hold_bound_early or lad < ceiling):
         return False
     return _hold_bound_granted_age is None or _hold_bound_granted_age < lad
 

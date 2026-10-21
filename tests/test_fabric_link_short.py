@@ -219,8 +219,7 @@ async def _opted_out_or_denied(monkeypatch, escalations, events, how):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "hold,how",
-    [(h, how) for h in ("topology mismatch", "missing ports") for how in ("opted-out", "denied")]
-    + [("latched", "opted-out")],
+    [(h, how) for h in ("topology mismatch", "missing ports", "latched") for how in ("opted-out", "denied")],
 )
 async def test_an_at_start_ladder_whose_host_rung_never_fired_does_not_stand_in_for_the_bounds_ladder(
     monkeypatch, clear_job_state, hold, how
@@ -244,6 +243,106 @@ async def test_an_at_start_ladder_whose_host_rung_never_fired_does_not_stand_in_
         assert escalations == ["present-forced"] * 2, "a denied rung stays pending, asked each tick (I76)"
         assert srv._hold_bound_rung_pending
     assert "device_released" not in events and srv._recovery_degraded()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("passes", [False, True], ids=["check fails", "check passes"])
+async def test_a_latched_hold_whose_power_cycle_is_denied_reruns_the_full_ladder_at_ten_minutes(
+    monkeypatch, clear_job_state, passes
+):
+    """Under the I42 latch the hold's bound is one sampler tick, so its one at-start ladder counts as the
+    bound's. A power cycle the governor then denies for a reason other than the cooldown (another host
+    action stands) arms no retry: the rung stays pending and is asked each tick. That never stands in for
+    the 10-min mark: the hold's full ladder runs again there, the same gentlest-first ladder (no host step
+    of its own: no reboot, no cycle inside it), with the latch kept. Its full check decides: a failing one
+    keeps the hold and asks for the power cycle again; only a passing one lets the hold lift."""
+    escalations, _alerts, events = _arm(monkeypatch, "latched")
+    await _opted_out_or_denied(monkeypatch, escalations, events, "denied")
+    clock = _clock(monkeypatch)
+    ladders, asks = [], []
+    real_allowed = srv.recovery_mechanism.auto_recovery_allowed
+
+    def allowed(action, **k):
+        asks.append((action, srv._hold_age_now()))
+        return real_allowed(action, **k)
+
+    async def ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        ladders.append((srv._hold_age_now(), bool(srv.health_monitor.topology_hw_fault)))
+        if passes and len(ladders) == 2:
+            monkeypatch.setattr(srv, "_recovery_degraded", lambda: False)  # the full check passed
+        return OUTCOME_RECOVERED
+
+    async def no_reboot(log, reason):
+        raise AssertionError("the 10-min ladder never reboots the host")
+
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", ladder)
+    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", no_reboot)
+    await _walk(clock, 0, BOUND - 20)
+    assert escalations == ["present-forced"], "the one at-start ladder below the 10-min mark"
+    assert asks and all(a == "power-cycle" for a, _ in asks), "the power cycle is asked after it"
+    assert srv._hold_bound_rung_pending and srv.recovery_mechanism.power_cycle_retry is None, "denied, no retry"
+    assert srv._recovery_degraded() and "device_released" not in events
+    before = len(asks)
+    await _walk(clock, BOUND - 20, BOUND + 20)
+    assert escalations == ["present-forced"] * 2, "the full ladder again at the 10-min mark"
+    assert ladders[1][0] >= BOUND
+    assert all(latched for _, latched in ladders), "the I42 latch stands through both ladders"
+    assert srv.health_monitor.topology_hw_fault
+    if passes:
+        assert not any(age >= ladders[1][0] for _, age in asks[before:]), "a passing check asks no cycle"
+        return
+    assert any(age >= ladders[1][0] for _, age in asks[before:]), "a failing check asks for the cycle again"
+    assert srv._hold_bound_rung_pending, "still denied: pending, asked each tick (I76)"
+    assert srv._recovery_degraded() and "device_released" not in events, "no lift without a passing check"
+    await _walk(clock, BOUND + 20, 2 * BOUND - 20)
+    assert escalations == ["present-forced"] * 2, "no further ladder inside the next window"
+
+
+@pytest.mark.asyncio
+async def test_a_latched_hold_cooling_past_the_ten_minute_mark_waits_only_for_the_cooldown(
+    monkeypatch, clear_job_state
+):
+    """The boot / post-power-cycle cooldown is the one exemption from the 10-min ladder: a latched hold
+    whose power cycle the cooldown denies runs no second ladder at the 10-min mark (its retry is armed),
+    and the cycle fires on the first tick past the cooldown's end."""
+    escalations, _alerts, events = _arm(monkeypatch, "latched")
+    monkeypatch.setattr(srv, "_hold_bound_host_rung", _REAL_HOST_RUNG)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
+    monkeypatch.setattr(srv, "_bound_tenant_blocker", lambda *a: None)
+    monkeypatch.setattr(srv.recovery_mechanism, "_journal_auto_recovery_denied", lambda *a: None)
+    clock = _clock(monkeypatch)
+    cycles, state = [], {"cooling": True}
+    until = datetime.now().timestamp() + BOUND + 120  # the cooldown runs past the 10-min mark
+
+    def allowed(action, tenant_active=False, **k):
+        if state["cooling"]:
+            return srv.recovery_mechanism._deny_power_cycle(
+                {"until": until, "last": until - 1800, "cause": "boot", "interval_sec": 1800, "why": "cooldown"}
+            )
+        return True, ""
+
+    async def power_cycle(log, reason):
+        cycles.append(srv._hold_age_now())
+
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
+    await _walk(clock, 0, 1)
+    assert escalations == ["present-forced"] and cycles == []
+    assert srv.recovery_mechanism.power_cycle_retry is not None, "the cooldown denial arms the retry"
+    end = int(until - datetime.now().timestamp())
+    await _walk(clock, 10, end - 10)
+    assert escalations == ["present-forced"], "no ladder at the 10-min mark inside the cooldown"
+    assert cycles == [] and srv._recovery_degraded() and "device_released" not in events
+    state["cooling"] = False
+    clock.offset = end + 1
+    srv._check_hold_deadline(now=datetime.fromtimestamp(until + 1))  # the retry reads the tick's own clock
+    await _drain()
+    assert escalations == ["present-forced"], "the cooldown's end goes straight to the power cycle"
+    assert len(cycles) == 1 and cycles[0] >= BOUND
 
 
 @pytest.mark.asyncio
