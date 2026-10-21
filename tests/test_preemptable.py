@@ -2,13 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """No timeout except on contention (PREEMPTABLE jobs).
 
-While nobody waits the job is never stopped for time. Once its limit has passed and a job
-waits, it is stopped (SIGINT, SIGTERM) and SIGKILLed PREEMPT_GRACE_SEC after the later of the
-limit and the waiter's arrival. The job then ends through the normal completion path, so the
-post-job gate (fabric included) runs before the waiting job is dispatched. Spec 01 I20.
+While nobody waits the job is never stopped for time. Contention = its limit has passed AND a
+job waits. The broker sends no signal until contention has lasted PREEMPT_GRACE_SEC (a minute)
+unbroken, so the job can see the waiter and end itself; a waiter that leaves inside the minute
+causes nothing. When the minute runs out the job's whole process tree is killed (SIGTERM, then
+SIGKILL PREEMPT_KILL_GRACE_SEC later at the latest), the job ends PREEMPTED (a wedge-risk exit),
+and the device is reset and fully checked, fabric included, before the waiting job is
+dispatched. Every clock is time.monotonic(). Spec 01 I20.
 """
 
 import asyncio
+import os
+import signal
 import time
 
 import pytest
@@ -44,18 +49,73 @@ def _recording_dirty(monkeypatch):
     return marks
 
 
-def _fast_preempt(monkeypatch, grace=60):
+def _fast_preempt(monkeypatch, grace=60, kill_grace=1):
     monkeypatch.setattr(srv, "PREEMPT_POLL_SEC", 0.05)
     monkeypatch.setattr(srv, "PREEMPT_GRACE_SEC", grace)
+    monkeypatch.setattr(srv, "PREEMPT_KILL_GRACE_SEC", kill_grace, raising=False)
     monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 0)
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+
+
+def _recording_signals(monkeypatch, job):
+    """Record every real signal (not the 0 probe) the broker sends to a process or group while
+    ``job`` runs, with when (time.monotonic) it was sent, and pass it on. The runner's sweep of a
+    finished job's group (after its exit status is in) is not a signal to the job."""
+    sent = []
+    real_killpg, real_kill = os.killpg, os.kill
+
+    def killpg(pgid, sig):
+        if sig and job.exit_code is None:
+            sent.append((time.monotonic(), signal.Signals(sig)))
+        return real_killpg(pgid, sig)
+
+    def kill(pid, sig):
+        if sig and job.exit_code is None:
+            sent.append((time.monotonic(), signal.Signals(sig)))
+        return real_kill(pid, sig)
+
+    monkeypatch.setattr(srv.os, "killpg", killpg)
+    monkeypatch.setattr(srv.os, "kill", kill)
+    return sent
 
 
 def _waiting_job(job_id="950"):
     """A job in the QUEUED state: contention. Kept out of the runner's queue so it is never
     dispatched; contention is read from the jobs table."""
     j = srv.Job(id=job_id, owner="other", workspace="/tmp", command="true", queued_at="t")
+    j.queued_monotonic = time.monotonic()
     srv.jobs[job_id] = j
     return j
+
+
+async def _until_running(job):
+    for _ in range(100):
+        await asyncio.sleep(0.05)
+        if job.status is srv.JobStatus.RUNNING and job.started_at:
+            return
+    raise AssertionError(f"job never started: {job.status.value}")
+
+
+async def _until_finished(job, limit_sec):
+    t0 = time.monotonic()
+    while job.finished_at is None and time.monotonic() - t0 < limit_sec:
+        await asyncio.sleep(0.05)
+    # The gate runs after finished_at is stamped; let the runner reach it.
+    for _ in range(20):
+        await asyncio.sleep(0.05)
+
+
+def _gone(pid):
+    """True once ``pid`` no longer runs (absent, or a zombie waiting to be reaped)."""
+    for _ in range(40):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    return True
+        except FileNotFoundError:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 async def _run_until_finished(job, *, limit_sec):
@@ -137,93 +197,250 @@ async def test_contention_inside_the_limit_does_not_preempt(monkeypatch, clear_j
     await _run_until_finished(job, limit_sec=10)
 
     assert job.status is srv.JobStatus.COMPLETED
-    assert job.preempt_deadline_monotonic is None
+    assert job.preempt_killed_monotonic is None
 
 
 @pytest.mark.asyncio
-async def test_contention_past_the_limit_stops_the_job_and_still_runs_the_full_gate(monkeypatch, clear_job_state):
-    """A waiting job + a passed limit = a graceful stop. The job's clean exit is PREEMPTED, not a
-    wedge, and the post-job gate still runs with the fabric forced before anyone else gets on."""
+async def test_no_signal_before_the_minute_then_the_whole_tree_is_killed(monkeypatch, tmp_path, clear_job_state):
+    """Review finding 1: nothing is sent to the job until contention has lasted the full minute.
+    Then SIGTERM, SIGKILL at most PREEMPT_KILL_GRACE_SEC later, and every process of the job,
+    a background child included, is gone. The device is flagged and the full gate runs."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     gate = _recording_post_job_gate(monkeypatch)
     dirty = _recording_dirty(monkeypatch)
-    _fast_preempt(monkeypatch)
+    _fast_preempt(monkeypatch, grace=2, kill_grace=1)
+    child = tmp_path / "child.pid"
 
     job = srv.Job(
         id="943",
         owner="server",
         workspace="/tmp",
-        # Shuts down on SIGINT, the way a job watching the broker should.
-        command="trap 'echo shutting-down; exit 0' INT; echo serving; while true; do sleep 0.1; done",
+        command=f"trap '' INT TERM; (trap '' INT TERM; sleep 60) & echo $! > {child}; echo serving; sleep 60",
         queued_at="t",
         timeout_sec=1,
         preemptable=True,
     )
     srv.jobs["943"] = job
+    sent = _recording_signals(monkeypatch, job)
     await srv.get_job_queue().put("943")
-
     runner = asyncio.create_task(srv.job_runner())
     try:
-        for _ in range(100):  # let it pass its limit with nobody waiting
-            await asyncio.sleep(0.05)
-            if job.status is srv.JobStatus.RUNNING and job.started_at:
-                break
-        await asyncio.sleep(1.5)
-        assert job.status is srv.JobStatus.RUNNING, "preempted with nobody waiting"
-        assert srv.preempt_label(job) == "PREEMPTABLE 0.0min"
-
+        await _until_running(job)
+        await asyncio.sleep(1.5)  # past the limit, nobody waiting
+        assert sent == [], f"signalled with nobody waiting: {sent}"
         t0 = time.monotonic()
         _waiting_job()
-        for _ in range(200):
-            if job.finished_at is not None:
-                break
-            await asyncio.sleep(0.05)
-        for _ in range(20):
-            await asyncio.sleep(0.05)
+        await _until_finished(job, limit_sec=10)
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
 
     assert job.status is srv.JobStatus.PREEMPTED, job.status.value
-    assert time.monotonic() - t0 < 5, "the stop window did not start when the job queued"
-    assert job.exit_code == 0, "a job that shut down inside the minute was killed anyway"
-    assert "shutting-down" in job.output
+    assert sent, "never killed"
+    first_at, first_sig = sent[0]
+    assert first_at - t0 >= 2 - 0.15, f"signal {first_sig.name} {first_at - t0:.2f}s into the 2 s minute"
+    assert first_sig is signal.SIGTERM, sent
+    kills = [at for at, sig in sent if sig is signal.SIGKILL]
+    assert kills and kills[0] - first_at <= 1 + 0.5, f"SIGKILL not within the kill bound: {sent}"
+    assert job.exit_code in (-9, 137), job.exit_code
+    assert _gone(int(child.read_text())), "the job's background child survived the preemption"
     assert "PREEMPTED" in job.error
+    assert dirty, "a preempted job must be flagged for the reset + full check"
     assert gate == [{"job_failed": True}], "a preempted job must reach the full (fabric) post-job gate"
-    assert dirty == [], "a job that shut down on the stop was treated as a wedge"
 
 
 @pytest.mark.asyncio
-async def test_a_job_that_ignores_the_stop_is_killed_at_the_window_end(monkeypatch, clear_job_state):
+async def test_a_job_that_ends_itself_inside_the_minute_is_a_normal_end(monkeypatch, tmp_path, clear_job_state):
+    """The point of the minute: a job that sees the waiter and shuts down ends as any job does,
+    never signalled, through the normal post-job gate."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     gate = _recording_post_job_gate(monkeypatch)
     dirty = _recording_dirty(monkeypatch)
-    _fast_preempt(monkeypatch, grace=1)
-    _waiting_job()
+    _fast_preempt(monkeypatch, grace=3)
+    seen = tmp_path / "waiter-seen"
 
     job = srv.Job(
         id="944",
-        owner="t",
+        owner="server",
         workspace="/tmp",
-        command="trap '' INT TERM; sleep 30",
+        # Stands in for a job polling the broker's queue: it shuts down when it sees a waiter.
+        command=f"echo serving; while [ ! -e {seen} ]; do sleep 0.1; done; echo shutting-down",
         queued_at="t",
         timeout_sec=1,
         preemptable=True,
     )
     srv.jobs["944"] = job
+    sent = _recording_signals(monkeypatch, job)
     await srv.get_job_queue().put("944")
-    t0 = time.monotonic()
-    await _run_until_finished(job, limit_sec=15)
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _until_running(job)
+        await asyncio.sleep(1.5)
+        _waiting_job()
+        await asyncio.sleep(1.0)  # well inside the 3 s minute
+        assert srv.preempt_label(job).startswith("PREEMPTING "), srv.preempt_label(job)
+        seen.touch()
+        await _until_finished(job, limit_sec=10)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
 
-    assert job.status is srv.JobStatus.PREEMPTED
-    assert time.monotonic() - t0 < 8, "a job ignoring the stop held the device past the window"
-    assert dirty, "a job SIGKILLed at the window end never released the device; it must be flagged"
-    assert gate == [{"job_failed": True}]
+    assert job.status is srv.JobStatus.COMPLETED, job.status.value
+    assert job.exit_code == 0 and "shutting-down" in job.output
+    assert sent == [], f"a job that ended itself inside the minute was signalled: {sent}"
+    assert gate == [{"job_failed": False}]
+    assert dirty == []
 
 
-def test_preempt_labels():
+@pytest.mark.asyncio
+async def test_a_waiter_that_leaves_inside_the_minute_causes_no_preemption(monkeypatch, clear_job_state):
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    gate = _recording_post_job_gate(monkeypatch)
+    dirty = _recording_dirty(monkeypatch)
+    _fast_preempt(monkeypatch, grace=2)
+
+    job = srv.Job(
+        id="947",
+        owner="server",
+        workspace="/tmp",
+        command="sleep 4.5; echo done",
+        queued_at="t",
+        timeout_sec=1,
+        preemptable=True,
+    )
+    srv.jobs["947"] = job
+    sent = _recording_signals(monkeypatch, job)
+    await srv.get_job_queue().put("947")
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _until_running(job)
+        await asyncio.sleep(1.2)
+        waiter = _waiting_job()
+        await asyncio.sleep(0.8)
+        assert srv.preempt_label(job).startswith("PREEMPTING "), srv.preempt_label(job)
+        waiter.status = srv.JobStatus.KILLED  # it gave up waiting
+        await asyncio.sleep(0.2)
+        assert srv.preempt_label(job) == "PREEMPTABLE 0.0min", "the countdown did not clear"
+        assert job.contention_since_monotonic is None
+        await _until_finished(job, limit_sec=10)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+    assert job.status is srv.JobStatus.COMPLETED, job.status.value
+    assert "done" in job.output
+    assert sent == [], f"preempted after the waiter left: {sent}"
+    assert gate == [{"job_failed": False}] and dirty == []
+
+
+@pytest.mark.asyncio
+async def test_a_waiter_that_leaves_after_the_kill_started_does_not_stop_it(monkeypatch, clear_job_state):
+    """A kill once begun completes: SIGKILL, the device flagged, the full gate, whatever the
+    waiter does. Msg: a timeout never leaves the device hung."""
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    gate = _recording_post_job_gate(monkeypatch)
+    dirty = _recording_dirty(monkeypatch)
+    _fast_preempt(monkeypatch, grace=1, kill_grace=1)
+    waiter = _waiting_job()
+
+    job = srv.Job(
+        id="948",
+        owner="server",
+        workspace="/tmp",
+        command="trap '' INT TERM; sleep 60",
+        queued_at="t",
+        timeout_sec=1,
+        preemptable=True,
+    )
+    srv.jobs["948"] = job
+    sent = _recording_signals(monkeypatch, job)
+    await srv.get_job_queue().put("948")
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _until_running(job)
+        for _ in range(100):
+            if sent:
+                break
+            await asyncio.sleep(0.02)
+        assert sent, "never killed"
+        waiter.status = srv.JobStatus.KILLED
+        assert srv.preempt_label(job) == "PREEMPTING 0s"
+        await _until_finished(job, limit_sec=10)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+    assert job.status is srv.JobStatus.PREEMPTED, job.status.value
+    assert job.exit_code in (-9, 137), job.exit_code
+    assert any(sig is signal.SIGKILL for _, sig in sent), sent
+    assert dirty and gate == [{"job_failed": True}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step_sec", [7200, -7200])
+async def test_a_wall_clock_step_moves_no_deadline(monkeypatch, clear_job_state, step_sec):
+    """Review finding 2: a wall-clock step (NTP, DST, an operator) neither starts nor delays a
+    preemption. Forward: a 1 h limit is not 'passed'. Backward: a passed limit still is."""
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    _recording_post_job_gate(monkeypatch)
+    _recording_dirty(monkeypatch)
+    _fast_preempt(monkeypatch, grace=1, kill_grace=1)
+    real_time = time.time
+    offset = {"v": 0}
+    monkeypatch.setattr(srv.time, "time", lambda: real_time() + offset["v"])
+
+    limit = 3600 if step_sec > 0 else 1
+    job = srv.Job(
+        id="949",
+        owner="server",
+        workspace="/tmp",
+        command="sleep 60",
+        queued_at="t",
+        timeout_sec=limit,
+        preemptable=True,
+    )
+    srv.jobs["949"] = job
+    sent = _recording_signals(monkeypatch, job)
+    await srv.get_job_queue().put("949")
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _until_running(job)
+        _waiting_job()
+        offset["v"] = step_sec
+        t0 = time.monotonic()
+        while job.finished_at is None and time.monotonic() - t0 < (2.5 if step_sec > 0 else 6):
+            await asyncio.sleep(0.05)
+        if step_sec > 0:
+            assert job.status is srv.JobStatus.RUNNING, "a forward clock step preempted a job inside its limit"
+            assert sent == [], sent
+            assert srv.preempt_label(job) == "PREEMPTABLE 60min"
+        else:
+            assert job.status is srv.JobStatus.PREEMPTED, "a backward clock step delayed the preemption"
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        if job.pid:
+            try:
+                os.killpg(job.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def test_the_kill_instant_ignores_the_wall_clock(monkeypatch, clear_job_state):
+    job = srv.Job(id="1", owner="o", workspace="/", command="c", queued_at="", preemptable=True)
+    w = _waiting_job("955")
+    w.queued_monotonic = 110.0
+    before = srv._preempt_kill_at(job, 100.0, now=120.0)
+    monkeypatch.setattr(srv.time, "time", lambda: 0.0)  # the wall clock jumps to 1970
+    assert srv._preempt_kill_at(job, 100.0, now=125.0) == before == 110.0 + srv.PREEMPT_GRACE_SEC
+
+
+def test_preempt_labels(clear_job_state):
     job = srv.Job(id="1", owner="o", workspace="/", command="c", queued_at="", timeout_sec=300)
     assert srv.preempt_label(job) is None
     job.preemptable = True
@@ -231,9 +448,16 @@ def test_preempt_labels():
     job.timeout_sec = 90
     assert srv.preempt_label(job) == "PREEMPTABLE 1.5min"
     job.status = srv.JobStatus.RUNNING
-    job.preempt_deadline_monotonic = time.monotonic() + 41.5
+    assert srv.preempt_label(job) == "PREEMPTABLE 1.5min", "a countdown with nobody waiting"
+    _waiting_job("957")
+    job.contention_since_monotonic = time.monotonic() - srv.PREEMPT_GRACE_SEC + 41.5
+    job.contention_waiters = frozenset({"957"})
     assert srv.preempt_label(job) == "PREEMPTING 42s"
-    job.preempt_deadline_monotonic = time.monotonic() - 5
+    job.contention_since_monotonic -= 20
+    assert srv.preempt_label(job) == "PREEMPTING 22s"
+    srv.jobs["957"].status = srv.JobStatus.KILLED
+    assert srv.preempt_label(job) == "PREEMPTABLE 1.5min", "the countdown outlived the waiter"
+    job.preempt_killed_monotonic = time.monotonic()
     assert srv.preempt_label(job) == "PREEMPTING 0s"
 
 
@@ -252,7 +476,9 @@ def test_queue_status_and_cli_show_the_preempt_label(clear_job_state):
     row = next(r for r in srv._get_queue_status()["running"] if r["id"] == "945")
     assert row["preempt"] == "PREEMPTABLE 5min"
 
-    job.preempt_deadline_monotonic = time.monotonic() + 30
+    _waiting_job("958")
+    job.contention_since_monotonic = time.monotonic() - 30
+    job.contention_waiters = frozenset({"958"})
     row = next(r for r in srv._get_queue_status()["running"] if r["id"] == "945")
     assert row["preempt"].startswith("PREEMPTING ")
 
@@ -268,14 +494,11 @@ def test_an_ordinary_job_row_has_no_preempt_label(clear_job_state):
     assert "preempt" not in row
 
 
-@pytest.mark.parametrize(
-    "exit_code,risk",
-    [(0, False), (1, False), (-2, False), (130, False), (-9, True), (137, True), (143, True), (None, True)],
-)
-def test_preempted_wedge_risk(exit_code, risk):
-    """SIGINT is the stop we send and the one a job unwinds on; any other signal, or no status at
-    all, means the device was not released."""
-    assert srv._is_wedge_risk_exit(srv.JobStatus.PREEMPTED, exit_code) is risk
+@pytest.mark.parametrize("exit_code", [0, 1, -2, 130, -9, 137, -15, 143, None])
+def test_preempted_wedge_risk(exit_code):
+    """A preempted job was killed: whatever its exit status the device gets the reset + full check,
+    fabric included, before the waiting job (msg: a timeout never leaves the device hung)."""
+    assert srv._is_wedge_risk_exit(srv.JobStatus.PREEMPTED, exit_code) is True
 
 
 @pytest.mark.asyncio
@@ -316,6 +539,10 @@ async def test_rest_submit_carries_the_option_into_the_job_and_its_log(monkeypat
     # A restart re-reads the option from the header.
     assert srv._job_from_log(res["job_id"]).preemptable is True
 
+
+def test_the_earlier_field_name_is_still_accepted():
+    params = srv.JobSubmitInput(workspace="/tmp", command="true", preemptable=True)
+    assert params.no_timeout_except_on_contention is True
 
 def test_a_log_without_the_header_is_an_ordinary_job(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
@@ -367,74 +594,70 @@ async def test_a_readopted_preemptable_job_past_its_limit_is_left_alone_while_no
 
 
 @pytest.mark.asyncio
-async def test_a_readopted_preemptable_job_is_preempted_once_a_job_waits(monkeypatch, tmp_path, clear_job_state):
+async def test_a_readopted_preemptable_job_is_killed_a_full_minute_after_a_job_waits(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """After a restart the limit is re-derived from the header once, and the minute starts afresh:
+    nothing is sent before a full minute of contention, then the whole scope is killed."""
     monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
     monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "PREEMPT_GRACE_SEC", 1)
+    _recording_dirty(monkeypatch)
     active = {"v": True}
     stopped = []
     monkeypatch.setattr(srv, "_scope_active", lambda scope: active["v"])
 
-    async def fake_preempt(job_id, pid, kill_at):
-        stopped.append(job_id)
+    async def fake_kill(job_id, pid):
+        stopped.append((job_id, time.monotonic()))
         active["v"] = False
 
-    monkeypatch.setattr(srv, "_preempt_job", fake_preempt)
+    monkeypatch.setattr(srv, "_preempt_kill", fake_kill)
     _readopted("021", served_sec=2400, timeout_sec=300)
     _waiting_job("951")
 
+    t0 = time.monotonic()
     await asyncio.wait_for(srv._monitor_readopted_scope("021", "ttdev-job-021.scope"), timeout=5)
-    assert stopped == ["021"]
+    assert [j for j, _ in stopped] == ["021"]
+    assert stopped[0][1] - t0 >= 1 - 0.05, "killed before a full minute of contention after the restart"
     assert srv.jobs["021"].status is srv.JobStatus.PREEMPTED
 
 
-class _RecordingLogger:
-    def __init__(self):
-        self.warnings = []
-
-    def warning(self, msg, *a, **k):
-        self.warnings.append(msg)
-
-    def __getattr__(self, name):
-        return lambda *a, **k: None
-
-
 @pytest.mark.asyncio
-async def test_the_stop_window_runs_to_its_end_after_the_shell_exits(monkeypatch, clear_job_state):
-    """The shell exits on the SIGINT while a child that ignores it still holds the device. The
-    streams close at once, but the window is not cut short: the child gets the window's SIGKILL,
-    not just the survivor sweep's much shorter grace."""
-    _free_device_lock(monkeypatch)
-    _no_workspace_activation(monkeypatch)
-    _recording_post_job_gate(monkeypatch)
-    _recording_dirty(monkeypatch)
-    _fast_preempt(monkeypatch, grace=3)
-    log = _RecordingLogger()
-    monkeypatch.setattr(srv, "logger", log)
-    _waiting_job()
+async def test_a_readopted_job_whose_waiter_leaves_inside_the_minute_is_left_alone(
+    monkeypatch, tmp_path, clear_job_state
+):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "PREEMPT_GRACE_SEC", 1)
+    stopped = []
+    calls = {"n": 0}
+    waiter = _waiting_job("953")
 
-    job = srv.Job(
-        id="945",
-        owner="t",
-        workspace="/tmp",
-        command="(trap '' INT TERM; sleep 30) & trap 'exit 0' INT; while true; do sleep 0.1; done",
-        queued_at="t",
-        timeout_sec=1,
-        preemptable=True,
-    )
-    srv.jobs["945"] = job
-    await srv.get_job_queue().put("945")
-    await _run_until_finished(job, limit_sec=20)
+    def scope_active(scope):
+        calls["n"] += 1
+        if calls["n"] == 20:
+            waiter.status = srv.JobStatus.KILLED
+        return calls["n"] < 200  # ends on its own, well after the minute would have run out
 
-    assert job.status is srv.JobStatus.PREEMPTED
-    assert any("PREEMPT job_id=945 still running" in w for w in log.warnings), log.warnings
+    async def fake_kill(job_id, pid):
+        stopped.append(job_id)
+
+    monkeypatch.setattr(srv, "_scope_active", scope_active)
+    monkeypatch.setattr(srv, "_preempt_kill", fake_kill)
+    monkeypatch.setattr(srv, "_terminate_scope", fake_kill)
+    _readopted("023", served_sec=2400, timeout_sec=300)
+
+    await asyncio.wait_for(srv._monitor_readopted_scope("023", "ttdev-job-023.scope"), timeout=10)
+    assert stopped == []
+    assert srv.jobs["023"].status is not srv.JobStatus.PREEMPTED
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rc", ["130", "-2", None])
 async def test_a_preempted_readopted_job_never_releases_the_device_clean(monkeypatch, tmp_path, clear_job_state, rc):
     """A re-adopted job has no post-job gate: the runner that would have proved the fabric died with
-    the old broker. Its SIGINT exit (130 / -2) is a clean release only where that gate follows, so
-    here the device must be flagged for the reset + full check (fabric included) before the queue
+    the old broker. Whatever its exit status (a job may trap the signal and exit 130 / -2), the
+    device must be flagged for the reset + full check (fabric included) before the queue
     moves on, whatever the exit status."""
     monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
     monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
@@ -443,12 +666,14 @@ async def test_a_preempted_readopted_job_never_releases_the_device_clean(monkeyp
     active = {"v": True}
     monkeypatch.setattr(srv, "_scope_active", lambda scope: active["v"])
 
-    async def fake_preempt(job_id, pid, kill_at):
+    monkeypatch.setattr(srv, "PREEMPT_GRACE_SEC", 0)
+
+    async def fake_kill(job_id, pid):
         if rc is not None:
             (tmp_path / f"{job_id}.exit").write_text(rc)
         active["v"] = False
 
-    monkeypatch.setattr(srv, "_preempt_job", fake_preempt)
+    monkeypatch.setattr(srv, "_preempt_kill", fake_kill)
     _readopted("022", served_sec=2400, timeout_sec=300)
     _waiting_job("952")
 
@@ -457,83 +682,86 @@ async def test_a_preempted_readopted_job_never_releases_the_device_clean(monkeyp
     assert len(marks) == 1 and "022" in marks[0], f"a preempted re-adopted job released the device clean: {marks}"
 
 
-def _waiting_since(job_id, ago_sec):
+def _queued_at(job_id, mono):
     j = _waiting_job(job_id)
-    j.queued_at = (srv.datetime.now() - srv.timedelta(seconds=ago_sec)).isoformat()
-    j.queued_monotonic = time.monotonic() - ago_sec
+    j.queued_monotonic = mono
     return j
 
 
-def _secs_left(kill_at):
-    return kill_at - time.monotonic()
+def _pjob():
+    return srv.Job(id="1", owner="o", workspace="/", command="c", queued_at="", preemptable=True)
 
 
-def test_no_kill_deadline_while_nobody_waits_even_long_past_the_limit(clear_job_state):
-    assert srv._preempt_kill_deadline(time.monotonic() - 3600) is None
+def test_no_kill_instant_while_nobody_waits_even_long_past_the_limit(clear_job_state):
+    assert srv._preempt_kill_at(_pjob(), 100.0, now=3700.0) is None
 
 
-def test_no_kill_deadline_before_the_limit_even_with_a_waiter(clear_job_state):
-    _waiting_since("960", ago_sec=30)
-    assert srv._preempt_kill_deadline(time.monotonic() + 5) is None
+def test_no_kill_instant_before_the_limit_even_with_a_waiter(clear_job_state):
+    _queued_at("960", 70.0)
+    job = _pjob()
+    assert srv._preempt_kill_at(job, 100.0, now=95.0) is None
+    assert job.contention_since_monotonic is None
 
 
 def test_a_waiter_after_the_limit_starts_the_minute_at_its_arrival(clear_job_state):
-    # Limit passed 10 s ago; the waiter arrived 3 s ago: kill 60 s after the arrival, 57 s from now,
-    # however late the poll noticed.
-    _waiting_since("961", ago_sec=3)
-    left = _secs_left(srv._preempt_kill_deadline(time.monotonic() - 10))
-    assert 56 <= left <= 57.5, left
+    # Limit at 100; the waiter arrived at 107; noticed late, at 110: the minute still runs from 107.
+    _queued_at("961", 107.0)
+    assert srv._preempt_kill_at(_pjob(), 100.0, now=110.0) == 107.0 + srv.PREEMPT_GRACE_SEC
 
 
 def test_a_waiter_before_the_limit_starts_the_minute_at_the_limit(clear_job_state):
-    # Waiting for 30 s; the limit passed 10 s ago: kill 60 s after the limit, 50 s from now.
-    _waiting_since("962", ago_sec=30)
-    left = _secs_left(srv._preempt_kill_deadline(time.monotonic() - 10))
-    assert 49 <= left <= 50.5, left
+    _queued_at("962", 80.0)
+    assert srv._preempt_kill_at(_pjob(), 100.0, now=110.0) == 100.0 + srv.PREEMPT_GRACE_SEC
 
 
-def test_the_earliest_waiter_sets_the_deadline(clear_job_state):
-    _waiting_since("963", ago_sec=2)
-    _waiting_since("964", ago_sec=8)
-    left = _secs_left(srv._preempt_kill_deadline(time.monotonic() - 20))
-    assert 51 <= left <= 52.5, left
+def test_the_earliest_waiter_sets_the_minute(clear_job_state):
+    _queued_at("963", 118.0)
+    _queued_at("964", 112.0)
+    assert srv._preempt_kill_at(_pjob(), 100.0, now=120.0) == 112.0 + srv.PREEMPT_GRACE_SEC
 
 
-def test_a_wall_clock_step_does_not_move_the_kill_deadline(monkeypatch, clear_job_state):
-    # The clock is monotonic: an NTP step or a DST change an hour forward or back while the job
-    # runs neither kills it early nor gives it an extra hour.
-    _waiting_since("965", ago_sec=3)
-    limit_end = time.monotonic() - 10
-    real = time.time
-    for step in (3600, -3600):
-        monkeypatch.setattr(srv.time, "time", lambda s=step: real() + s)
-        left = _secs_left(srv._preempt_kill_deadline(limit_end))
-        assert 56 <= left <= 57.5, (step, left)
+def test_a_later_waiter_does_not_restart_a_running_minute(clear_job_state):
+    job = _pjob()
+    _queued_at("965", 110.0)
+    assert srv._preempt_kill_at(job, 100.0, now=111.0) == 110.0 + srv.PREEMPT_GRACE_SEC
+    _queued_at("966", 130.0)
+    assert srv._preempt_kill_at(job, 100.0, now=131.0) == 110.0 + srv.PREEMPT_GRACE_SEC
 
 
-def test_a_waiter_restored_after_a_restart_is_read_from_its_queued_at(clear_job_state):
-    # A job restored from the queue spool has no monotonic arrival: its queued_at is read once.
-    j = _waiting_since("966", ago_sec=30)
-    j.queued_monotonic = None
-    left = _secs_left(srv._preempt_kill_deadline(time.monotonic() - 10))
-    assert 49 <= left <= 50.5, left
+def test_the_minute_restarts_with_a_new_waiter_after_the_last_one_left(clear_job_state):
+    job = _pjob()
+    a = _queued_at("967", 110.0)
+    assert srv._preempt_kill_at(job, 100.0, now=120.0) == 110.0 + srv.PREEMPT_GRACE_SEC
+    a.status = srv.JobStatus.KILLED
+    assert srv._preempt_kill_at(job, 100.0, now=130.0) is None
+    assert job.contention_since_monotonic is None and srv.preempt_label(job).startswith("PREEMPTABLE ")
+    _queued_at("968", 140.0)
+    assert srv._preempt_kill_at(job, 100.0, now=145.0) == 140.0 + srv.PREEMPT_GRACE_SEC
 
 
-def test_the_earlier_field_name_is_still_accepted():
-    params = srv.JobSubmitInput(workspace="/tmp", command="true", preemptable=True)
-    assert params.no_timeout_except_on_contention is True
+def test_a_waiter_swap_between_polls_restarts_the_minute(clear_job_state):
+    """A leaves and B arrives between two polls: the poll never saw the queue empty, but none of
+    the waiters it knew remains, so the minute starts afresh at B's arrival (the running job is
+    never cut short by a gap the broker did not see)."""
+    job = _pjob()
+    a = _queued_at("969", 110.0)
+    assert srv._preempt_kill_at(job, 100.0, now=120.0) == 110.0 + srv.PREEMPT_GRACE_SEC
+    a.status = srv.JobStatus.KILLED
+    _queued_at("970", 125.0)
+    assert srv._preempt_kill_at(job, 100.0, now=130.0) == 125.0 + srv.PREEMPT_GRACE_SEC
 
 
 @pytest.mark.asyncio
 async def test_a_waiter_after_the_limit_shows_the_countdown_then_sigkills_at_the_minute(monkeypatch, clear_job_state):
     """Past the limit, nobody waiting: PREEMPTABLE. A job queues: PREEMPTING <s>s counting down in
-    queue status and /health, then SIGKILL exactly one window after the arrival for a job that
-    ignores the stop. The device is flagged and the full post-job gate runs."""
+    queue status and /health, then the kill one minute after the arrival; a job that ignores
+    SIGTERM is SIGKILLed PREEMPT_KILL_GRACE_SEC later. The device is flagged and the full
+    post-job gate runs."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     gate = _recording_post_job_gate(monkeypatch)
     dirty = _recording_dirty(monkeypatch)
-    _fast_preempt(monkeypatch, grace=3)
+    _fast_preempt(monkeypatch, grace=3, kill_grace=0.5)
 
     job = srv.Job(
         id="965",
@@ -559,7 +787,7 @@ async def test_a_waiter_after_the_limit_shows_the_countdown_then_sigkills_at_the
         assert srv._health_payload()["preempt"] == "PREEMPTABLE 0.0min"
 
         t0 = time.monotonic()
-        _waiting_since("966", ago_sec=0)
+        _waiting_job("966")
         while job.finished_at is None and time.monotonic() - t0 < 10:
             row = next((r for r in srv._get_queue_status()["running"] if r["id"] == "965"), None)
             if row:
@@ -574,11 +802,12 @@ async def test_a_waiter_after_the_limit_shows_the_countdown_then_sigkills_at_the
 
     assert job.status is srv.JobStatus.PREEMPTED
     assert job.exit_code in (-9, 137), f"expected a SIGKILL, got exit {job.exit_code}"
-    assert 2.5 <= elapsed <= 4.5, f"SIGKILL {elapsed:.1f}s after the waiter arrived, window is 3 s"
+    assert 3.3 <= elapsed <= 4.5, f"SIGKILL {elapsed:.1f}s after the waiter arrived; minute 3 s + kill 0.5 s"
     counting = [lbl for lbl in labels if lbl.startswith("PREEMPTING ")]
     assert counting and counting[0] in ("PREEMPTING 3s", "PREEMPTING 2s"), labels
     secs = [int(lbl.split()[1][:-1]) for lbl in counting]
     assert secs == sorted(secs, reverse=True) and secs[-1] <= 1, f"countdown did not count down: {labels}"
+    assert "PREEMPTING 0s" in labels, f"the kill's SIGTERM window did not show PREEMPTING 0s: {labels}"
     assert dirty, "a SIGKILLed job never released the device; it must be flagged for reset"
     assert gate == [{"job_failed": True}]
 
@@ -590,7 +819,7 @@ async def test_a_waiter_before_the_limit_starts_the_countdown_at_the_limit(monke
     _recording_post_job_gate(monkeypatch)
     _recording_dirty(monkeypatch)
     _fast_preempt(monkeypatch, grace=1)
-    _waiting_since("967", ago_sec=0)
+    _waiting_job("967")
 
     job = srv.Job(
         id="968",
@@ -606,9 +835,9 @@ async def test_a_waiter_before_the_limit_starts_the_countdown_at_the_limit(monke
     seen = {}
 
     async def watch():
-        while job.preempt_deadline_monotonic is None:
+        while job.contention_since_monotonic is None:
             await asyncio.sleep(0.02)
-        seen["kill_wall"] = time.time() + (job.preempt_deadline_monotonic - time.monotonic())
+        seen["kill_wall"] = time.time() + (job.contention_since_monotonic + srv.PREEMPT_GRACE_SEC - time.monotonic())
         seen["noticed_wall"] = time.time()
 
     watcher = asyncio.create_task(watch())
@@ -631,7 +860,7 @@ async def test_the_full_post_job_gate_runs_before_the_waiting_job_gets_the_devic
     _fast_preempt(monkeypatch, grace=1)
     order = []
 
-    async def _gate(job_log_file, job_failed=False):
+    async def _gate(job_log_file, job_failed=False, **_):
         order.append(("gate", job_failed, waiter.status))
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
@@ -666,7 +895,9 @@ def test_health_shows_the_label_only_for_a_running_preemptable_job(clear_job_sta
     srv.jobs["971"].timeout_sec = 600
     payload = srv._health_payload()
     assert payload["preempt"] == "PREEMPTABLE 10min" and payload["preempt_job_id"] == "971"
-    srv.jobs["971"].preempt_deadline_monotonic = time.monotonic() + 59.2
+    _waiting_job("972")
+    srv.jobs["971"].contention_since_monotonic = time.monotonic() - 0.8
+    srv.jobs["971"].contention_waiters = frozenset({"972"})
     assert srv._health_payload()["preempt"] == "PREEMPTING 60s"
 
 
@@ -704,6 +935,68 @@ def test_the_option_is_documented_under_its_name():
         assert "PREEMPTABLE <x>min" in text and "PREEMPTING <s>s" in text
 
 
+def _waiting_since(job_id, ago_sec):
+    j = _waiting_job(job_id)
+    j.queued_at = (srv.datetime.now() - srv.timedelta(seconds=ago_sec)).isoformat()
+    j.queued_monotonic = time.monotonic() - ago_sec
+    return j
+
+
+def _secs_left(kill_at):
+    return kill_at - time.monotonic()
+
+
+def test_a_restored_waiter_is_read_from_its_queued_at_only_once(monkeypatch, clear_job_state):
+    # A job restored from the queue spool has no monotonic arrival: its queued_at is read once, and
+    # from then on the arrival is monotonic, so a later wall-clock step does not move the minute.
+    j = _waiting_since("966", ago_sec=3)
+    j.queued_monotonic = None
+    limit_end = time.monotonic() - 10
+    assert 56 <= _secs_left(srv._preempt_kill_at(_pjob(), limit_end)) <= 57.5
+    real = time.time
+    monkeypatch.setattr(srv.time, "time", lambda: real() - 3600)
+    left = _secs_left(srv._preempt_kill_at(_pjob(), limit_end))
+    assert 56 <= left <= 57.5, left
+
+
+def test_an_unparsable_restored_waiter_starts_the_minute_at_its_first_read(clear_job_state):
+    j = _waiting_job("967")
+    j.queued_monotonic = None
+    j.queued_at = "not a time"
+    first = srv._preempt_kill_at(_pjob(), time.monotonic() - 10)
+    time.sleep(0.2)
+    assert srv._preempt_kill_at(_pjob(), time.monotonic() - 10) == first
+
+
+@pytest.mark.asyncio
+async def test_a_readopted_job_with_a_waiter_from_before_the_restart_still_gets_its_minute(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """A waiter queued long before a slow restart: the new broker never saw that contention, so the
+    minute counts from the monitor's start, never from before it (no kill on the first poll)."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "PREEMPT_GRACE_SEC", 1)
+    _recording_dirty(monkeypatch)
+    active = {"v": True}
+    stopped = []
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: active["v"])
+
+    async def fake_kill(job_id, pid):
+        stopped.append(time.monotonic())
+        active["v"] = False
+
+    monkeypatch.setattr(srv, "_preempt_kill", fake_kill)
+    _readopted("023", served_sec=2400, timeout_sec=300)
+    _waiting_since("952", ago_sec=600)
+
+    t0 = time.monotonic()
+    await asyncio.wait_for(srv._monitor_readopted_scope("023", "ttdev-job-023.scope"), timeout=5)
+    assert len(stopped) == 1
+    assert stopped[0] - t0 >= 1 - 0.05, f"killed {stopped[0] - t0:.2f}s after the restart"
+    assert srv.jobs["023"].status is srv.JobStatus.PREEMPTED
+
+
 @pytest.mark.asyncio
 async def test_a_silent_preemptable_job_is_not_reaped_while_nobody_waits(monkeypatch, clear_job_state):
     """No timeout except on contention covers silence too: a quiet job (a server between
@@ -735,9 +1028,9 @@ async def test_a_silent_preemptable_job_is_not_reaped_while_nobody_waits(monkeyp
 
 @pytest.mark.asyncio
 async def test_a_silent_preemptable_job_is_reaped_once_a_job_waits(monkeypatch, clear_job_state):
-    """With a job waiting the silence reaper applies as to any job, even before the time limit:
-    a hung job must not hold the device the waiter needs. The reap is a failed end, so the full
-    gate (fabric included) runs before the waiter is dispatched."""
+    """With a job waiting the silence reaper applies as to any job, before the time limit: a hung
+    job must not hold the device the waiter needs. The reap is a failed end, so the full gate
+    (fabric included) runs before the waiter is dispatched."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     gate = _recording_post_job_gate(monkeypatch)
@@ -761,36 +1054,32 @@ async def test_a_silent_preemptable_job_is_reaped_once_a_job_waits(monkeypatch, 
     await _run_until_finished(job, limit_sec=15)
 
     assert job.status is srv.JobStatus.HUNG, f"a silent contended job ended {job.status.value}"
-    assert job.preempt_deadline_monotonic is None, "reaped for silence, not preempted for time"
+    assert job.preempt_killed_monotonic is None, "reaped for silence, not preempted for time"
     assert gate == [{"job_failed": True}]
 
 
-_SLOW_SHUTDOWN = """
+_TERM_EXITS_CLEAN = """
 import signal, sys, time
 
-stop = []
-
-
-def on_int(*_):
+def on_term(*_):
     with open(sys.argv[1], "a") as f:
-        f.write("INT\\n")
-    stop.append(1)
+        f.write("TERM\\n")
+    sys.exit(0)
 
 
-signal.signal(signal.SIGINT, on_int)
+signal.signal(signal.SIGTERM, on_term)
 print("serving", flush=True)
-while not stop:
+while True:
     time.sleep(0.05)
-time.sleep(2.0)  # an orderly shutdown that prints nothing
-sys.exit(0)
 """
 
 
 @pytest.mark.asyncio
 async def test_a_silent_job_past_its_limit_is_preempted_not_reaped(monkeypatch, tmp_path, clear_job_state):
-    """Past its limit with a job waiting, the preemption owns the stop. The silence reaper, polling
-    through the job's quiet shutdown, must neither relabel it hung (which owes the mesh a reset) nor
-    send a second SIGINT. Spec 01 I10/I20."""
+    """Past its limit with a job waiting, the preemption owns the stop. The silence reaper must
+    neither signal the job inside its minute nor relabel it hung. The kill ends it PREEMPTED, and
+    even a clean exit 0 on SIGTERM owes the spec 03 I69 reset plus the full check: the broker
+    stopped it mid-run. Spec 01 I10/I20."""
     import sys
 
     _free_device_lock(monkeypatch)
@@ -799,91 +1088,41 @@ async def test_a_silent_job_past_its_limit_is_preempted_not_reaped(monkeypatch, 
     dirty = _recording_dirty(monkeypatch)
     owed = []
     monkeypatch.setattr(srv, "_owe_kill_reset", owed.append)
-    _fast_preempt(monkeypatch)
+    _fast_preempt(monkeypatch, grace=2, kill_grace=2)
     monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 1)
     monkeypatch.setattr(srv, "HUNG_POLL_SEC", 0.1)
     script = tmp_path / "serve.py"
-    script.write_text(_SLOW_SHUTDOWN)
-    sigints = tmp_path / "sigints"
+    script.write_text(_TERM_EXITS_CLEAN)
+    terms = tmp_path / "terms"
 
     job = srv.Job(
         id="972",
         owner="t",
         workspace="/tmp",
-        command=f"exec {sys.executable} -I {script} {sigints}",
+        command=f"exec {sys.executable} -I {script} {terms}",
         queued_at="t",
         timeout_sec=1,
         preemptable=True,
     )
     srv.jobs["972"] = job
+    sent = _recording_signals(monkeypatch, job)
     await srv.get_job_queue().put("972")
-
     runner = asyncio.create_task(srv.job_runner())
     try:
-        for _ in range(100):
-            await asyncio.sleep(0.05)
-            if job.status is srv.JobStatus.RUNNING and job.started_at:
-                break
+        await _until_running(job)
         await asyncio.sleep(2.5)  # past both its limit and the silence limit, nobody waiting
         assert job.status is srv.JobStatus.RUNNING, f"a silent uncontended job ended {job.status.value}"
+        t0 = time.monotonic()
         _waiting_job()
-        for _ in range(200):
-            if job.finished_at is not None:
-                break
-            await asyncio.sleep(0.05)
-        for _ in range(20):
-            await asyncio.sleep(0.05)
+        await _until_finished(job, limit_sec=10)
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
 
     assert job.status is srv.JobStatus.PREEMPTED, f"a silent preempted job ended {job.status.value}"
-    assert sigints.read_text().splitlines() == ["INT"], "the job was sent more than one SIGINT"
+    assert sent and sent[0][0] - t0 >= 2 - 0.15, f"signalled inside the minute: {sent}"
+    assert terms.read_text().splitlines() == ["TERM"]
     assert job.exit_code == 0
-    assert owed == [] and dirty == [], "a job that shut down on the first SIGINT was treated as a wedge"
+    assert owed == ["job 972 preempted"], f"a preemption must owe the I69 reset: {owed}"
+    assert dirty, "a preempted job must be flagged for the reset + full check"
     assert gate == [{"job_failed": True}], "a preempted job must reach the full (fabric) post-job gate"
-
-
-def test_a_restored_waiter_is_read_from_its_queued_at_only_once(monkeypatch, clear_job_state):
-    # Once read, a restored waiter's arrival is monotonic: a later wall-clock step does not move it.
-    j = _waiting_since("967", ago_sec=3)
-    j.queued_monotonic = None
-    limit_end = time.monotonic() - 10
-    srv._preempt_kill_deadline(limit_end)
-    real = time.time
-    monkeypatch.setattr(srv.time, "time", lambda: real() - 3600)
-    left = _secs_left(srv._preempt_kill_deadline(limit_end))
-    assert 56 <= left <= 57.5, left
-
-
-def test_an_unparsable_restored_waiter_starts_the_minute_at_its_first_read(clear_job_state):
-    j = _waiting_job("968")
-    j.queued_at = "not a time"
-    first = srv._preempt_kill_deadline(time.monotonic() - 10)
-    time.sleep(0.2)
-    assert srv._preempt_kill_deadline(time.monotonic() - 10) == first
-
-
-@pytest.mark.asyncio
-async def test_a_readopted_job_past_its_kill_deadline_still_gets_a_sigint_window(
-    monkeypatch, tmp_path, clear_job_state
-):
-    """A waiter queued long before a slow restart puts the re-adopted job's deadline in the past;
-    the stop still starts with SIGINT and the SIGTERM grace, not a bare SIGKILL."""
-    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
-    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
-    active = {"v": True}
-    deadlines = []
-    monkeypatch.setattr(srv, "_scope_active", lambda scope: active["v"])
-
-    async def fake_preempt(job_id, pid, kill_at):
-        deadlines.append(kill_at - time.monotonic())
-        active["v"] = False
-
-    monkeypatch.setattr(srv, "_preempt_job", fake_preempt)
-    _readopted("023", served_sec=2400, timeout_sec=300)
-    _waiting_since("952", ago_sec=600)
-
-    await asyncio.wait_for(srv._monitor_readopted_scope("023", "ttdev-job-023.scope"), timeout=5)
-    assert len(deadlines) == 1
-    assert deadlines[0] >= 2 * srv.SIGTERM_GRACE_SEC - 1, deadlines
