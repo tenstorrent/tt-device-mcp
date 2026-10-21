@@ -60,6 +60,7 @@ async def pci_rescan() -> None:
         asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1"), timeout=PCI_SYSFS_WRITE_TIMEOUT_SEC
     )
 
+
 # A reset that did not fix the device will not fix it on the next attempt either,
 # and each extra reset is another chance to trip the root complex into the fatal
 # path that resets the host. After a failed reset+verify we stop resetting for

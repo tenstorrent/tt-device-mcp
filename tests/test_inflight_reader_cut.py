@@ -295,7 +295,9 @@ async def test_enodata_in_the_driver_wait_reads_as_absent_and_cuts_nothing(monke
 @pytest.mark.asyncio
 async def test_a_post_reset_failure_is_cut_after_tt_smi_exits_and_before_the_closing_rescan(monkeypatch):
     hw = _hw()
-    mech, calls, logs = _reset_world(monkeypatch, hw, ["Issuing POST_RESET on 32 devices after IPMI reset...\n", FAILED_31], 1)
+    mech, calls, logs = _reset_world(
+        monkeypatch, hw, ["Issuing POST_RESET on 32 devices after IPMI reset...\n", FAILED_31], 1
+    )
     rc, _ = await mech.reset_with_quiesce(["tt-smi", "-glx_reset"], logs.append)
     assert rc == 1
     assert calls == [("cut", ["31"], [])], "cut once tt-smi exited, before any rescan"
