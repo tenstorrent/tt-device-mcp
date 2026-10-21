@@ -306,23 +306,37 @@ async def test_a_full_check_that_passes_after_the_ladder_asks_for_no_power_cycle
 
 
 @pytest.mark.asyncio
-async def test_a_check_still_waiting_gets_the_power_cycle_by_the_bound(monkeypatch, clear_job_state):
+@pytest.mark.parametrize("hold", ["topology mismatch"] + MEASURED)
+async def test_a_check_still_waiting_gets_the_power_cycle_by_the_bound(monkeypatch, clear_job_state, hold):
     """(d) a full check with no verdict yet (a 77 while the 1G hugepage pool fills) keeps the hold and
-    asks for no cycle while it runs; it has until the 10-min bound at the latest, then the host rung."""
-    escalations, _alerts, events = _arm(monkeypatch, "topology mismatch")
+    asks for no cycle while it runs; it has until min(ladder end + _HOLD_BOUND_CHECK_SEC, the 10-min
+    bound), then the host rung. The same window under the I42 latch, whose own bound is one sampler
+    tick: the hold is 1 s old, so the latched one takes the at-start pass, and its ladder takes real hold
+    time, so the latch's bound is long past when it ends."""
+    escalations, _alerts, events = _arm(monkeypatch, hold, age_sec=1)
     monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: True)
-    _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
-    _tick(0)
-    await _drain()
-    assert escalations == ["present-forced"] and "host_rung" not in events
+    clock = _clock(monkeypatch)
+    ladder_sec = 120
+
+    async def ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        clock.offset += ladder_sec
+        return OUTCOME_RECOVERED
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", ladder)
+    await _walk(clock, 0, 1)
+    assert escalations == ["present-forced"] and "host_rung" not in events, "the check waits on the pool"
     assert srv._recovery_degraded()
-    _tick(srv._HOLD_BOUND_CHECK_SEC - 30)
-    await _drain()
+    assert srv.device_hold_escalation_kind == "fabric_link_short" and srv._hold_bound_early, "the at-start pass"
+    lad = srv._hold_bound_ladder_age
+    assert lad >= ladder_sec
+    check_end = min(lad + srv._HOLD_BOUND_CHECK_SEC, BOUND)
+    start = int(clock.offset) + 10
+    await _walk(clock, start, start + int(check_end - srv._hold_age_now()) - 20)
     assert "host_rung" not in events, "the full check gets its time"
-    _tick(BOUND)
-    await _drain()
+    await _walk(clock, int(clock.offset) + 10, BOUND + 30)
     assert escalations == ["present-forced"] and events.count("host_rung") == 1
-    assert srv._hold_age_now() <= BOUND + 30
+    assert srv._hold_bound_cycle_age <= check_end + 20, "the host rung by the window's end, at the bound at the latest"
 
 
 @pytest.mark.asyncio

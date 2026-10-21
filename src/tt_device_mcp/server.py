@@ -8418,9 +8418,11 @@ def _hold_bound_ladder_counts(lad: Optional[float]) -> bool:
 
 def _hold_bound_check_end(lad: float) -> float:
     """The hold age by which the full check after the bound's ladder must have passed. After I83's
-    at-start pass it ends at the bound at the latest, so the host rung is asked for within 10 min."""
+    at-start pass it ends at the 10-min bound at the latest, so the host rung is asked for within 10 min.
+    That is the ceiling, not _hold_bound_sec(): under the I42 latch the latter is one sampler tick, which
+    would leave a check still waiting on the hugepage pool no window at all."""
     end = lad + _HOLD_BOUND_CHECK_SEC
-    return min(end, max(lad, _hold_bound_sec())) if _hold_bound_early else end
+    return min(end, max(lad, _stuck_hold_ceiling_sec())) if _hold_bound_early else end
 
 
 def _hold_bound_check_pending(age: float) -> bool:
