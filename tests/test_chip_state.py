@@ -245,8 +245,9 @@ def test_the_sampler_reads_no_chip_while_a_reset_owns_them(monkeypatch, sysfs, o
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["all-ones", "stalled heartbeat"])
 async def test_the_first_hung_sample_stops_the_pollers(monkeypatch, kind):
-    """A present chip that reads all-ones, or whose heartbeat did not move since the last sample, stops
-    the pollers on that first sample (isolation still waits for its second); once per episode."""
+    """A present chip whose heartbeat did not move since the last sample stops the pollers on that first
+    sample (isolation still waits for its second); once per episode. A chip reading all-ones may be off
+    the bus and is not detached yet, so its stop is deferred to the dead-chip valve (I84), journalled once."""
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv.sampler, "isolate_dead_chips", lambda d: asyncio.sleep(0))
     events = []
@@ -259,12 +260,17 @@ async def test_the_first_hung_sample_stops_the_pollers(monkeypatch, kind):
     bad = ALL_ONES if kind == "all-ones" else 101
     hung = {"0": row(200), "1": row(bad), "2": row(202), "3": row(203)}
     await srv.sampler.check_for_dead_chips(hung)
-    assert pollers == [False], "the pollers did not stop at the first hung sample"
-    stops = [f for k, f in events if k == "pollers_quiesced_hung_chip"]
-    assert stops and (stops[0]["all_ones"] if kind == "all-ones" else stops[0]["stalled"]) == ["1"]
     hung2 = {"0": row(300), "1": row(bad), "2": row(302), "3": row(303)}
     await srv.sampler.check_for_dead_chips(hung2)
-    assert pollers == [False], "one episode stops them once"
+    if kind == "all-ones":
+        assert pollers == [], "the pollers stopped on a chip that is not detached"
+        deferred = [f for k, f in events if k == "pollers_quiesce_deferred"]
+        assert len(deferred) == 1 and deferred[0]["all_ones"] == ["1"]
+        assert deferred[0]["reason"] == "chip_not_detached"
+        return
+    assert pollers == [False], "the pollers did not stop at the first hung sample, or stopped twice"
+    stops = [f for k, f in events if k == "pollers_quiesced_hung_chip"]
+    assert stops and stops[0]["stalled"] == ["1"]
 
 
 @pytest.mark.asyncio

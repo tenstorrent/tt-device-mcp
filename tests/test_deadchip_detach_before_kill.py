@@ -217,3 +217,81 @@ async def test_the_broker_never_signals_itself(monkeypatch):
     monkeypatch.setattr(srv, "current_process", None)
     await srv._kill_device_holders("chip(s) 13 left the PCIe bus")
     assert sent == [(TENANT, signal.SIGKILL)], sent
+
+
+# --- the first hung sample's poller stop (03 I66) waits for the detach too -----------------------
+
+_live = lambda b: [b, 800, 800, 0, 0, 0]  # noqa: E731
+
+
+def _stops(log):
+    return [i for i, e in enumerate(log) if e == ("pollers", False)]
+
+
+@pytest.mark.asyncio
+async def test_the_first_all_ones_sample_leaves_the_poller_stop_to_the_detach(valve):
+    """Chip 13 reads all-ones on one sample: it may be off the bus and is still attached, so the
+    pollers are not stopped then (their fd close would make the driver message it). The second
+    sample detaches it, and only then are the pollers stopped."""
+    log, _ = valve
+    await srv.sampler.check_for_dead_chips({"0": _live(1), "13": _live(2), "14": _live(3)})
+    await srv.sampler.check_for_dead_chips({"0": _live(2), "13": _live(ALL_ONES), "14": _live(4)})
+    assert not _stops(log), f"the pollers stopped before chip 13 was detached: {log}"
+    deferred = read_health_events(kinds={"pollers_quiesce_deferred"})
+    assert deferred and deferred[-1]["reason"] == "chip_not_detached" and deferred[-1]["all_ones"] == ["13"]
+
+    await srv.sampler.check_for_dead_chips({"0": _live(3), "13": _live(ALL_ONES), "14": _live(5)})
+    stops = _stops(log)
+    assert stops and stops[0] > log.index(("detach", "13")), f"a poller stop came before the detach: {log}"
+    assert not _refusals()
+    assert srv.fsm.state is not ServerState.HEALTHY, "the valve keeps the hold"
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_chip_beside_an_all_ones_chip_does_not_stop_the_pollers(valve):
+    """A frozen heartbeat alone stops the pollers at once (it still answers reads), but not while another
+    chip on the same sample reads all-ones and is not detached: the fd close would reach that one too."""
+    log, _ = valve
+    await srv.sampler.check_for_dead_chips({"0": _live(1), "13": _live(2), "14": _live(3)})
+    await srv.sampler.check_for_dead_chips({"0": _live(2), "13": _live(ALL_ONES), "14": _live(3)})
+    assert not _stops(log), log
+    deferred = read_health_events(kinds={"pollers_quiesce_deferred"})[-1]
+    assert deferred["all_ones"] == ["13"] and deferred["stalled"] == ["14"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["failed", "timed out"])
+async def test_a_failed_or_timed_out_detach_never_stops_the_pollers(valve, monkeypatch, fault):
+    """A remove that fails or hangs leaves chip 13 attached: no poller stop on that sample or on any
+    later one while it reads all-ones (as a lost chip does), even once another chip stalls; the
+    refusal is journalled and the device stays held for the bounded recovery."""
+    log, detach_ok = valve
+    release = threading.Event()
+    if fault == "failed":
+        detach_ok["13"] = False
+    else:
+        monkeypatch.setattr(telemetry, "DETACH_TIMEOUT_SEC", 0.3)
+
+        def hung_remove(idx):
+            log.append(("detach", idx))
+            release.wait(5)
+            return True
+
+        monkeypatch.setattr(srv, "isolate_chip", hung_remove)
+    try:
+        await srv.sampler.check_for_dead_chips({"0": _live(1), "13": _live(2), "14": _live(3)})
+        await srv.sampler.check_for_dead_chips({"0": _live(2), "13": _live(ALL_ONES), "14": _live(4)})
+        await srv.sampler.check_for_dead_chips({"0": _live(3), "13": _live(ALL_ONES), "14": _live(5)})
+        await srv.sampler.check_for_dead_chips({"0": _live(4), "13": _live(ALL_ONES), "14": _live(6)})
+        await srv.sampler.check_for_dead_chips({"0": _live(5), "13": _live(ALL_ONES), "14": _live(6)})
+    finally:
+        release.set()
+
+    assert ("detach", "13") in log
+    assert not _kills(log), f"a kill or poller stop reached a chip that is not detached: {log}"
+    refused = _refusals()
+    assert refused and refused[-1]["reason"] == "detach_failed" and refused[-1]["chips"] == ["13"]
+    if fault == "timed out":
+        assert read_health_events(kinds={"chip_detach_timeout"})[-1]["chip"] == "13"
+    assert not srv._pollers_owed
+    assert srv.fsm.state is not ServerState.HEALTHY, "a refused stop still holds the device"

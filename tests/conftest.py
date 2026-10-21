@@ -517,6 +517,7 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # The hung-chip poller stop's per-episode latch and its previous heartbeats, and the reset scope
     # the sampler saw still running (spec 03 I66), for the same reason.
     monkeypatch.setattr(srv.sampler, "pollers_stopped_for", frozenset(), raising=False)
+    monkeypatch.setattr(srv.sampler, "pollers_deferred_for", frozenset(), raising=False)
     monkeypatch.setattr(srv.sampler, "prev_beats", {}, raising=False)
     monkeypatch.setattr(srv.sampler, "scope_seen", False, raising=False)
     monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None, raising=False)

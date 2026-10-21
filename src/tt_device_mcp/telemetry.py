@@ -201,6 +201,8 @@ class TelemetrySampler:
         self.scope_seen = False
         # The hung chips the pollers were last stopped for, so one episode stops them once.
         self.pollers_stopped_for: frozenset = frozenset()
+        # The hung chips a stop was last deferred for (an all-ones chip not yet detached), journalled once.
+        self.pollers_deferred_for: frozenset = frozenset()
         self.prev_beats: dict = {}
         # Every chip reading all-ones on the sample the valve runs for (spec 03 I84): one of them it
         # does not remove keeps the holders alive. Set only while check_for_dead_chips calls it.
@@ -413,7 +415,16 @@ class TelemetrySampler:
         (spec 03 I66). Their reads to it are the MMIO a hung endpoint never completes. Isolation
         still waits for its two-sample proof; the pollers are cheap to bring back (the health probe
         re-arms them once the device is idle and healthy). Every chip at once is the re-init blip
-        the blackout path already proves on two samples, so it does not count here."""
+        the blackout path already proves on two samples, so it does not count here.
+
+        Only a sample whose hung chips all still answer stops them here (spec 03 I66, I84). A
+        stopped poller closes its fds, and tt-kmd's close path sends each chip it had open a
+        power-state message (an ARC queue write, then reads polled for up to 1 s) unless the
+        device is detached. A frozen heartbeat was just read back, so that chip completes those
+        reads; an all-ones chip may be off the bus, and only its PCI remove marks it detached. So
+        while any chip on the sample reads all-ones (a first strike, or a lost chip whose remove
+        failed), the stop is left to the dead-chip valve, which stops them after a successful
+        remove or refuses and keeps the hold."""
         stalled = [
             i
             for i, v in sample.items()
@@ -424,11 +435,28 @@ class TelemetrySampler:
         if not hung or len(hung) >= len(sample):
             if not hung:
                 self.pollers_stopped_for = frozenset()
+                self.pollers_deferred_for = frozenset()
             return
         if hung <= self.pollers_stopped_for:
             return
-        self.pollers_stopped_for = hung
         log = self._deps.logger()
+        if dead:
+            if hung > self.pollers_deferred_for:
+                self.pollers_deferred_for = hung
+                self._deps.health_event(
+                    "pollers_quiesce_deferred",
+                    reason="chip_not_detached",
+                    all_ones=sorted(dead, key=int),
+                    stalled=sorted(stalled, key=int),
+                )
+                if log:
+                    log.warning(
+                        f"HUNG-CHIP pollers left running: chip(s) {sorted(dead, key=int)} read all-ones and "
+                        f"are not detached, so closing the pollers' fds would make the driver message them; "
+                        f"the dead-chip valve stops them after the PCI remove"
+                    )
+            return
+        self.pollers_stopped_for = hung
         self._deps.health_event(
             "pollers_quiesced_hung_chip", all_ones=sorted(dead, key=int), stalled=sorted(stalled, key=int)
         )
