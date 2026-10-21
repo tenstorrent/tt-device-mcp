@@ -644,6 +644,9 @@ async def test_a_reset_step_that_raises_or_is_cancelled_clears_recovering(sysfs,
     order: list = []
     _reset_seams(monkeypatch, order, 0)
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None, raising=False)
+    # The all-ones chip below is only there to gate reads; its detach-before-quiesce (spec 03 I84) has
+    # its own tests, so it is out of the way here.
+    monkeypatch.setattr(srv.recovery_mechanism, "detach_before_quiesce", None)
     exc = RuntimeError("boom") if how == "raises" else asyncio.CancelledError()
 
     async def run(argv, log, owner="[broker]health-gate"):
