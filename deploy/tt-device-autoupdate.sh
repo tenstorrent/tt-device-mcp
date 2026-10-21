@@ -26,9 +26,12 @@
 # I18): the broker starts no queued job while the hold names a live pid, so a job queued behind one
 # that just ended waits, persisted, for the new broker instead of being dispatched into the restart.
 # A busy lap drains (spec 08 I20): it keeps the hold, lets the running job finish and applies at
-# that job boundary. The wait is bounded by the broker's hard job limit, counted from the job's
-# start: a job past it no longer holds the update. A drain blocks this lap (and the reconcile after
-# it) for at most that long.
+# that job boundary. The wait under the hold is bounded by the broker's hard job limit, counted
+# from the job's start: a broker job past it still gets no restart, so the lap lets go of dispatch
+# and the next lap retries until the job ends (a capped job by the broker's limit kill; a
+# no-timeout-except-on-contention job only by itself or on contention, so with nothing queued the
+# update waits with no bound). A drain blocks this lap (and the
+# reconcile after it) for at most that long.
 set -u
 
 [ -r /etc/default/tt-device-broker ] && . /etc/default/tt-device-broker
@@ -206,10 +209,15 @@ fi
 # holding dispatch so nothing new starts, and applies at that job's end, polling every 5 s. The
 # in-flight device-op bar above is separate, and absolute.
 #
-# The wait is bounded by the broker's hard job limit, MAX_TIMEOUT_SEC (1500) plus its kill grace
-# GRACEFUL_KILL_GRACE_SEC (60), counted from the start of the youngest running job scope (a job
-# with no readable start counts as just started). A job past it is overdue for the broker's own kill
-# and no longer holds the update, so a box busy around the clock still updates within one job.
+# The wait under the hold is bounded by the broker's hard job limit, MAX_TIMEOUT_SEC (1500) plus its
+# kill grace GRACEFUL_KILL_GRACE_SEC (60), counted from the start of the youngest running job scope
+# (a job with no readable start counts as just started). A broker job still running past it (a child,
+# a job scope, or a device holder inside one: a re-adopted job) never gets a restart: the lap releases
+# dispatch and the next lap retries, so the update applies at that job's end. A capped job ends by
+# the broker's limit kill, at most JOB_CAP after its start. A no-timeout-except-on-contention job
+# (spec 01 I20) is not killed for time: it runs until it ends, or until a queued job contends for it
+# (preempt grace plus kill grace); until then the update waits, with no bound while nothing is queued. Only a device holder outside every broker job, which no broker
+# kill ends, stops holding the update at the bound, so a box busy around the clock still updates.
 JOB_CAP=1560
 UPTIME=/proc/uptime
 count_busy() {
@@ -218,10 +226,16 @@ count_busy() {
     # A stopped broker reads MainPID 0, and `pgrep -P 0` lists init and kthreadd: count no kids.
     kids=0
     [ "${mp:-0}" -gt 0 ] 2>/dev/null && kids="$(pgrep -P "$mp" 2>/dev/null | wc -l)"
-    holders=0
+    holders=0; jobholders=0
     for p in /proc/[0-9]*; do
         if ls -l "$p/fd" 2>/dev/null | grep -q tenstorrent; then
-            uu=$(stat -c %u "$p" 2>/dev/null); [ "${uu:-0}" -ge 1000 ] && holders=$((holders+1))
+            uu=$(stat -c %u "$p" 2>/dev/null)
+            if [ "${uu:-0}" -ge 1000 ]; then
+                holders=$((holders+1))
+                # A process cannot leave its job's scope cgroup: a holder in one is a broker job's,
+                # re-adopted ones included, even when the scope list below cannot be read.
+                grep -q 'ttdev-job-' "$p/cgroup" 2>/dev/null && jobholders=$((jobholders+1))
+            fi
         fi
     done
     # A re-adopted job is no child of this broker, and a queued job is about to be one: a job
@@ -260,9 +274,10 @@ op_in_flight() {
         | grep -q 'ttdev-reset-'
 }
 # Wait, under the dispatch hold, for the job boundary: nothing running and no device op in flight.
-# Returns 0 there, and 0 once the youngest running job is past JOB_CAP or the broker is down (a down
-# broker protects no job by waiting, and the restart is what starts it again); 1 when a device op is
-# still in flight at the cap. $1 names the wait in the log.
+# Returns 0 there, 0 when the broker is down (a down broker protects no job by waiting, and the
+# restart is what starts it again), and 0 at JOB_CAP when only a device holder outside every broker
+# job is left; 1 at JOB_CAP when a broker job is still running or a device op is in flight. $1 names
+# the wait in the log.
 wait_job_boundary() {
     local w_start w_now w_bound
     youngest_job_age
@@ -289,9 +304,12 @@ wait_job_boundary() {
                 echo "autoupdate: $1: a device op is still in flight at the job cap after $(( w_now - w_start ))s; dispatch released, the next lap retries" >&2
                 return 1
             fi
-            if [ "$kids" -eq 0 ] && [ "${scopes:-0}" -eq 0 ] && [ "$holders" -gt 0 ]; then w_what="a device holder is"; else w_what="the running job is"; fi
-            echo "autoupdate: $1: $w_what past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); it no longer holds the update, applying" >&2
-            return 0
+            if [ "$kids" -eq 0 ] && [ "${scopes:-0}" -eq 0 ] && [ "$jobholders" -eq 0 ] && [ "$holders" -gt 0 ]; then
+                echo "autoupdate: $1: a device holder outside any broker job is past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); it no longer holds the update, applying" >&2
+                return 0
+            fi
+            echo "autoupdate: $1: the running job is past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders job_holders=$jobholders scopes=${scopes:-0}); a running broker job always holds the update: dispatch released, the next lap retries" >&2
+            return 1
         fi
         sleep 5
         # Refreshed, so the broker's overdue bound on a hold counts from the last poll: a drain
@@ -400,8 +418,8 @@ rm -f "$ROOT/pending.defer"
 # Last look before the restart (spec 08 I24). The install ran under the dispatch hold, but a job
 # can still be running here: a tenant that opened the device on its own, or a dispatch after an
 # install slow enough for the broker to drop the hold as overdue. It is waited out the same way;
-# a device op still in flight at the cap restarts nothing and leaves installed.sha on the old sha,
-# so the next lap retries.
+# a broker job or device op still running at the cap restarts nothing and leaves installed.sha on
+# the old sha, so the next lap retries.
 hold_write
 count_busy
 if [ $(( kids + holders + ${scopes:-0} )) -ne 0 ] || op_in_flight; then
