@@ -487,3 +487,95 @@ async def test_a_refused_sweep_reset_is_journalled_and_releases_the_aer_mask(mon
     assert "last_chance_reset_sweep_error" not in refused_mesh["events"]
     assert refused_mesh["restores"] == [1]
     assert g.mechanism.reset_in_flight is False
+
+
+# --- an incomplete scan (a holder the scan could not see) ---
+
+
+def _scans(monkeypatch, *scans):
+    """enumerate_device_holders answers ``scans`` in turn (the last one repeats); returns the call log."""
+    calls = []
+
+    def enumerate_holders():
+        calls.append(1)
+        return scans[min(len(calls), len(scans)) - 1]
+
+    monkeypatch.setattr(device_holders, "enumerate_device_holders", enumerate_holders)
+    return calls
+
+
+def _gap(pid, *holders):
+    scan = HolderScan(holders=list(holders), source="driver")
+    scan.mark_incomplete(f"pid {pid} named by the driver, not attributable", pid=pid)
+    return scan
+
+
+@pytest.mark.asyncio
+async def test_a_pid_gap_is_rescanned_once_then_refuses_an_automatic_reset(monkeypatch):
+    box = _Box(monkeypatch, [])
+    calls = _scans(monkeypatch, _gap(4303, READER))
+    result = await box.run(tenants_block=True, rescan_settle_sec=0)
+    assert len(calls) == 2, "a pid gap gets exactly one rescan"
+    assert result.outcome == "scan_incomplete" and "4303" in result.refusal()
+    assert box.sent == {}, "nothing is signalled past a holder the scan could not see"
+
+
+@pytest.mark.asyncio
+async def test_a_pid_gap_that_clears_on_the_rescan_lets_the_reset_proceed(monkeypatch):
+    box = _Box(monkeypatch, [])
+    calls = _scans(monkeypatch, _gap(4303, READER), HolderScan(holders=[READER]))
+    result = await box.run(tenants_block=True, rescan_settle_sec=0)
+    assert len(calls) == 2 and result.outcome == "killed" and result.refusal() == ""
+    assert box.sent[READER.pid][0] == "TERM"
+
+
+@pytest.mark.asyncio
+async def test_an_operator_reset_records_a_pid_gap_and_still_clears_the_readers(monkeypatch):
+    box = _Box(monkeypatch, [])
+    _scans(monkeypatch, _gap(4303, READER))
+    result = await box.run(tenants_block=False, rescan_settle_sec=0)
+    assert result.gaps and result.outcome == "killed" and result.refusal() == ""
+
+
+@pytest.mark.asyncio
+async def test_a_gap_no_pid_explains_is_recorded_and_the_reset_proceeds(monkeypatch):
+    box = _Box(monkeypatch, [])
+    scan = HolderScan(holders=[READER])
+    scan.mark_incomplete("3 fd tables unreadable")
+    calls = _scans(monkeypatch, scan)
+    result = await box.run(tenants_block=True, rescan_settle_sec=0)
+    assert len(calls) == 1, "no pid to wait for, so no rescan"
+    assert result.scan_complete is False and result.gaps == []
+    assert result.outcome == "killed" and result.refusal() == ""
+
+
+@pytest.mark.asyncio
+async def test_an_automatic_reset_past_an_unseen_holder_is_refused_and_the_fabric_stays_owed(monkeypatch):
+    order, events = [], []
+    box = _Box(monkeypatch, [], order=order)
+    _scans(monkeypatch, _gap(4303))
+    _broker_seams(monkeypatch, box, order, events)
+    FABRIC_DEBT.owed = ""
+    try:
+        rc, out = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
+        assert rc is None and out.startswith("reset refused:") and "reset" not in order
+        assert [f["outcome"] for k, f in events if k == "pre_reset_holder_scan"] == ["scan_incomplete"]
+        assert FABRIC_DEBT.owed
+    finally:
+        FABRIC_DEBT.owed = ""
+
+
+@pytest.mark.asyncio
+async def test_a_scan_that_raises_lets_the_reset_proceed(monkeypatch):
+    """A scan bug must not stop a recovery: the reset runs and the scan event says scan_error."""
+    order, events = [], []
+    box = _Box(monkeypatch, [], order=order)
+    _broker_seams(monkeypatch, box, order, events)
+
+    def broken():
+        raise RuntimeError("proc walk failed")
+
+    monkeypatch.setattr(device_holders, "enumerate_device_holders", broken)
+    rc, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
+    assert rc == 0 and "reset" in order
+    assert [f["outcome"] for k, f in events if k == "pre_reset_holder_scan"] == ["scan_error"]

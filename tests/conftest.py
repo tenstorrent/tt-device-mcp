@@ -23,7 +23,7 @@ if str(src_path) not in sys.path:
 import tt_device_mcp.device_holders as device_holders
 import tt_device_mcp.job_reap as job_reap
 import tt_device_mcp.server as srv
-from tt_device_mcp import privileges
+from tt_device_mcp import pre_reset_scan, privileges
 from tt_device_mcp.fsm import ServerFsm
 from tt_device_mcp.health import bmc_capture, post_reset
 from tt_device_mcp.health import evidence as health
@@ -360,6 +360,14 @@ def _seal_real_hardware(monkeypatch, tmp_dirs):
     # is how three of them failed on a developer box mid-incident and nowhere else. A test
     # that means to exercise the guard patches this itself.
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+
+    # The pre-reset holder scan (spec 04 I92) walks /proc and signals the readers it finds. Unstubbed,
+    # a unit test's reset would scan this machine's real processes. Every reset here sees a clear
+    # scan; the scan's own tests drive it through its seams.
+    async def _clear_scan(**_kw):
+        return pre_reset_scan.PreResetScan()
+
+    monkeypatch.setattr(srv, "clear_device_readers", _clear_scan)
 
 
 def _redirect_probe_caches(monkeypatch, tmp_dirs, device_marked, session_root):
