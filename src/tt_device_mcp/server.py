@@ -8177,8 +8177,10 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_tenant_deferred, device_hold_offbus_prior_bucket, device_hold_offbus_tenant_wait
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
     global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold, device_held_since
+    global _hold_startup_deferred
     if reason and not device_hold_logged and _startup_hold_behind_readopted_job():
         return  # spec 03 I75: the device is the re-adopted job's; the hold's clock starts at its end
+    _hold_startup_deferred = False  # a hold opens now, or the device passed: the deferral is over
     if reason and not device_hold_logged:
         device_hold_logged = True
         # Prefer a start this box already recorded: if the device was still held across a restart,
