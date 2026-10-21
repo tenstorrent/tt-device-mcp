@@ -169,10 +169,37 @@ async def test_no_repeat_after_a_bmc_guard_finding(mesh, monkeypatch):  # noqa: 
         ["python3", "-m", "tt_smi", "-glx_reset"],
     ],
 )
-async def test_a_repeat_under_an_override_reset_argv_is_refused(mesh, monkeypatch, argv):  # noqa: F811
+async def test_a_repeat_under_an_override_reset_argv_is_still_guarded(mesh, monkeypatch, argv):  # noqa: F811
     await _first_reset_failed(mesh)
     _age_first_reset(mesh_repeat.MESH_RESET_REPEAT_MIN_GAP_SEC + 5)
     monkeypatch.setattr(srv.galaxy_recovery, "reset_argv", lambda indices: list(argv))
+    preflights = []
+
+    async def _preflight():
+        preflights.append(True)
+        return ""
+
+    monkeypatch.setattr(srv.recovery_mechanism, "bmc_preflight", _preflight)
+    assert (await _repeat())[0] == "ran"
+    assert preflights, "the BMC preflight ran before the repeat"
+    assert mesh["resets"][-1] == list(argv), "the repeat launched through the same reset backend"
+    launched = srv.recovery_mechanism._launch_argv(list(argv))
+    assert launched[0] == "unshare" and "--wrap" in launched, "and that backend runs it under the ipmitool guard"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("argv", [["sudo", "tt-smi", "-glx_reset"], ["python3", "-m", "tt_smi", "-glx_reset"]])
+async def test_a_repeat_under_an_override_reset_argv_is_refused_when_the_preflight_refuses(
+    mesh, monkeypatch, argv  # noqa: F811
+):
+    await _first_reset_failed(mesh)
+    _age_first_reset(mesh_repeat.MESH_RESET_REPEAT_MIN_GAP_SEC + 5)
+    monkeypatch.setattr(srv.galaxy_recovery, "reset_argv", lambda indices: list(argv))
+
+    async def _refuse():
+        return "op_mode 0x0 fallback possible"
+
+    monkeypatch.setattr(srv.recovery_mechanism, "bmc_preflight", _refuse)
     assert (await _repeat())[0] == "skip"
     assert len(mesh["resets"]) == 1, "a reset the guard cannot vouch for never repeats"
 
