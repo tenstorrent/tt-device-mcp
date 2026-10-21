@@ -8889,8 +8889,10 @@ def _bound_tenant_holds(bound: bool) -> bool:
     I84, a running broker job included) are no tenants: only a host rung clears either (spec 04 I76).
     Any other running job or readable tenant still is."""
     if bound:
-        scan, waive_job = _bound_excused(enumerate_device_holders())
-        return galaxy_recovery._tenant_active(scan, force=True, waive_job=waive_job)
+        scan = enumerate_device_holders()
+        excused, waive_job = _bound_excused(scan)
+        if waive_job or excused is not scan:
+            return galaxy_recovery._tenant_active(excused, force=True, waive_job=waive_job)
     return galaxy_recovery.tenant_holds()
 
 
