@@ -60,10 +60,10 @@ DRIVER_WAIT_RESCAN_TRIES = 20
 # rung is never hammered, finite so the ladder always continues.
 HOLD_ESCALATION_REARM_SEC = int(os.environ.get("TT_DEVICE_MCP_HOLD_REARM_SEC", "1800"))
 
-# The last recovery rung, and the highest-risk change in this repo: a warm host reboot. A
-# reset recovers an idle device cheaply; a reboot takes EVERY tenant's work down with the box.
+# The last recovery rung, and the highest-risk change in this repo: the host power cycle. A
+# reset recovers an idle device cheaply; a power cycle takes EVERY tenant's work down with the box.
 # It is armed by default because without it a dropped ASIC holds the device forever, but it is
-# opt-OUT per host (TT_DEVICE_MCP_AUTO_REBOOT=0) and rate-limited, and the rate limit is durable on
+# opt-OUT per host (TT_DEVICE_MCP_AUTO_POWER_CYCLE=0) and rate-limited, and the rate limit is durable on
 # disk (see read_auto_recovery_ledger) because a reboot the ledger did not record is a reboot the
 # next boot repeats: a loop. The min interval is wall-clock and so spans the reboot itself, which
 # is what makes it the loop guard; the per-boot cap tightens it within a single long-lived boot.
@@ -302,16 +302,11 @@ AUTO_RECOVERY_RANK = {"reboot": 1, "power-cycle": 2}
 AUTO_RECOVERY_VERIFIED = "auto_recovery_verified.json"
 POWER_CYCLE_BACKSTOP_MAX = 3
 POWER_CYCLE_BACKSTOP_WINDOW_SEC = 7200
-# A broker reboot no verified release followed counts as tried for the whole hold episode (spec 04
-# I10), so the next host rung is the power cycle at its I65 cooldown's end, never a second reboot.
-# With no verified release on record (none yet, or unreadable) the episode has no known start: a
-# reboot then counts for this long, which outlasts the reboot, its boot and the longest cooldown.
-REBOOT_EPISODE_UNVERIFIED_MAX_SEC = AUTO_RECOVERY_MIN_INTERVAL_SEC + POWER_CYCLE_BACKOFF_CAP_SEC
 
 # The metrics.STAGES name for each auto-recovery action _fire_recovery_escalation ever fires. An
 # explicit table, not a ternary: a third action added here later must fail loud (KeyError) rather
 # than silently mislabel itself onto whichever branch a two-way ternary happened to default to.
-_ACTION_TO_STAGE = {"reboot": "host_reboot", "power-cycle": "power_cycle"}
+_ACTION_TO_STAGE = {"power-cycle": "power_cycle"}
 
 # How long after a broker escalation records itself the resulting boot must appear for the boot to be
 # ATTRIBUTED to that escalation. An escalation is recorded seconds-to-minutes before the reboot/power
@@ -323,9 +318,9 @@ BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC = int(
     os.environ.get("TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC", "900").strip() or "900"
 )
 
-# An outage hold turns every hardware rung off at once: both host rungs off together say "touch
-# nothing", so the mesh reset is held too.
-OUTAGE_HOLD_VARS = ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE")
+# An outage hold turns every hardware rung off at once: the host rung (the power cycle) off says
+# "touch nothing", so the mesh reset is held too.
+OUTAGE_HOLD_VARS = ("TT_DEVICE_MCP_AUTO_POWER_CYCLE",)
 # The hold reason -> when its page went out (monotonic). A held mesh reset stays HELD until an operator
 # acts, so the page is the hold's only bound: while the hold stands it is sent again every
 # mesh_hold_repage_sec(), so a page that was missed or forgotten never leaves the device held in silence.
@@ -2142,93 +2137,6 @@ class RecoveryMechanism:
     def clear_power_cycle_retry(self) -> None:
         self.power_cycle_retry = None
 
-    def _reboot_already_attempted(self, *, now_epoch: Optional[float] = None) -> bool:
-        """The chooser's read: :meth:`reboot_tried_this_episode`."""
-        return self.reboot_tried_this_episode(now_epoch=now_epoch)
-
-    def reboot_tried_this_episode(self, *, now_epoch: Optional[float] = None) -> bool:
-        """True if the broker already auto-rebooted for the wedge it is still looking at: a reboot
-        record from a PREVIOUS boot (this boot is the one that came back up) stamped after the last
-        verified-healthy release (spec 04 I10). That is the signal a warm reboot did not clear
-        the mesh, and only then is the more drastic power cycle the right rung. It holds for the whole
-        episode, not for a fixed time: the I65 cooldown after the reboot's boot can outlast any fixed
-        window, and a reboot re-chosen at its end loops on reboots while the cycle never fires. With
-        no verified release on record a reboot counts for REBOOT_EPISODE_UNVERIFIED_MAX_SEC. A power
-        cycle that failed to launch on this boot lets the reboot back in once per episode. An
-        unreadable ledger reads as 'not attempted' here — the governor is what fails closed on it;
-        this only chooses which rung to offer the governor."""
-        ledger = self.read_auto_recovery_ledger()
-        if not ledger:
-            return False
-        boot_id = self._current_boot_id()
-        if not boot_id:
-            # Without a boot id we cannot tell a reboot that crossed a boot from one recorded this
-            # boot that has not taken the box down yet. Fail closed: do NOT offer the power cycle, so
-            # the chooser stays on the reboot, whose own interval guard still rate-limits it. Offering
-            # the power cycle here would let it fire in the SAME boot as the reboot — the interval
-            # (weaker-rank record) and the per-boot cap (no boot id) both no-op, so it would be the one
-            # path with no loop guard at all.
-            return False
-        now_epoch = time.time() if now_epoch is None else now_epoch
-        verified = self.last_verified_release() or {}
-        verified_at = _past_epoch(verified.get("at_epoch"), now_epoch)
-        if verified_at is not None and verified.get("boot_id") == boot_id:
-            # Verified healthy on this boot: every earlier-boot reboot came before it, whatever the
-            # stamps say (a clock that stepped back across the boot). A future stamp proves nothing.
-            return False
-        tried = 0
-        for rec in ledger:
-            if rec.get("action") != "reboot":
-                continue
-            if rec.get("boot_id") == boot_id:
-                continue  # a reboot recorded under THIS boot has not taken the box down yet
-            at = _past_epoch(rec.get("at_epoch"), now_epoch)
-            if at is None:
-                continue
-            if verified_at is not None:
-                tried += at > verified_at  # no verified release since it: the same episode
-            elif now_epoch - at < REBOOT_EPISODE_UNVERIFIED_MAX_SEC:
-                tried += 1
-        if tried == 1 and self.power_cycle_unlaunched_at is not None:
-            # The power cycle failed to launch on this boot (so after that reboot): offer the reboot
-            # once more in the episode, under its own interval and per-boot cap, rather than leave the
-            # hold with no host rung that can run. A second reboot in the episode spends it.
-            return False
-        return tried > 0
-
-    def reboot_fallback_spent(self, *, now_epoch: Optional[float] = None) -> Optional[str]:
-        """Why the I71 warm-reboot fallback is spent for the wedge still on the box, or None when it
-        may fire: a broker reboot (a fallback or the reboot rung) recorded after the last verified-
-        healthy release did not heal it. Another one would re-anchor the I65 cooldown on its boot and
-        push the power cycle out again; with an I65 interval of an hour or more the reboot's own
-        interval lapses first, so an unhealed drop would reboot hourly and never cycle (spec 04 I71).
-        With no verified release on record only a reboot within the longest I65 cooldown counts: an
-        older one no longer holds the cycle off. A record with no readable stamp counts. An
-        unreadable ledger reads as not spent here; the governor denies the reboot on it."""
-        ledger = self.read_auto_recovery_ledger()
-        if not ledger:
-            return None
-        now_epoch = time.time() if now_epoch is None else now_epoch
-        verified_at = _past_epoch((self.last_verified_release() or {}).get("at_epoch"), now_epoch)
-        since = verified_at if verified_at is not None else now_epoch - POWER_CYCLE_BACKOFF_CAP_SEC
-        for rec in reversed(ledger):
-            if rec.get("action") == "reboot" and _epoch_after(rec.get("at_epoch"), since, now_epoch):
-                return (
-                    "a broker reboot already ran for this wedge and no verified-healthy release "
-                    "followed it; the power cycle is next, at the end of its cooldown"
-                )
-        return None
-
-    def fallback_reboot_allowed(self, *, tenant_active: bool, now_epoch: Optional[float] = None) -> tuple[bool, str]:
-        """Whether the I71 warm reboot may fire in place of a power cycle that was denied or did not
-        launch: at most once per wedge (:meth:`reboot_fallback_spent`), and within the reboot's own
-        limits (:meth:`auto_recovery_allowed`). Returns ``(allowed, reason)``."""
-        spent = self.reboot_fallback_spent(now_epoch=now_epoch)
-        if spent:
-            return False, spent
-        clock = {} if now_epoch is None else {"now_epoch": now_epoch}
-        return self.auto_recovery_allowed("reboot", tenant_active=tenant_active, **clock)
-
     def record_auto_recovery(self, action: str, reason: str, *, now_epoch: Optional[float] = None) -> bool:
         """Append one escalation to the durable ledger and fsync it BEFORE the action fires.
 
@@ -2360,27 +2268,26 @@ class RecoveryMechanism:
         self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: str, pre_fire=None
     ) -> bool:
         """Shared body of the two host-level recovery rungs (reboot, BMC power cycle). Records the
-        escalation durably — the rate limiter — and leaves a visible jobs-list row BEFORE the action
-        takes the box down, so both survive it; G6b back-fills the boot when the broker restarts. If
-        the record cannot be persisted the action is ABORTED: an unrecorded escalation is one the next
-        boot repeats — a loop. ``fire`` is the isolated one-liner that acts, replaced wholesale in
-        tests so no test path can take the box running the suite down.
+                escalation durably — the rate limiter — and leaves a visible jobs-list row BEFORE the action
+                takes the box down, so both survive it; G6b back-fills the boot when the broker restarts. If
+                the record cannot be persisted the action is ABORTED: an unrecorded escalation is one the next
+                boot repeats — a loop. ``fire`` is the isolated one-liner that acts, replaced wholesale in
+                tests so no test path can take the box running the suite down.
 
-        Reports the ``stages_fired_total`` metric under the Stage name matching ``action``
-        ("reboot" -> "host_reboot", "power-cycle" -> "power_cycle" — see
-        ``health.recovery.stages.host_reboot``/``power_cycle``): "blocked" when the ledger write
-        itself fails (nothing fired), "failed" when ``fire`` raised (attempted, did not launch),
-        "ok" when it returned normally (the action was issued — a SUCCESSFUL reboot/power-cycle
-        takes the box down from inside ``fire`` and never reaches here at all).
+                Reports the ``stages_fired_total`` metric under the Stage name matching ``action``
+        ("power-cycle" -> "power_cycle" — see ``health.recovery.stages.power_cycle``): "blocked" when the ledger write
+                itself fails (nothing fired), "failed" when ``fire`` raised (attempted, did not launch),
+                "ok" when it returned normally (the action was issued — a SUCCESSFUL reboot/power-cycle
+                takes the box down from inside ``fire`` and never reaches here at all).
 
-        ``pre_fire(log, reason)``, when given, runs after the record and row and just before
-        ``fire`` (spec 04 I26): a bounded, blocking call that never raises and whose outcome never
-        stops the fire. Running it after the record means it only runs for an action that is
-        really about to happen, never for one the ledger then aborts.
+                ``pre_fire(log, reason)``, when given, runs after the record and row and just before
+                ``fire`` (spec 04 I26): a bounded, blocking call that never raises and whose outcome never
+                stops the fire. Running it after the record means it only runs for an action that is
+                really about to happen, never for one the ledger then aborts.
 
-        Returns False when the action certainly did not launch (the record could not be written, or
-        ``fire`` raised anything but a timeout), so a caller may take an in-band fallback (spec 04
-        I71); True when it was issued or timed out and may still act."""
+                Returns False when the action certainly did not launch (the record could not be written, or
+                ``fire`` raised anything but a timeout), so a caller may take an in-band fallback (spec 04
+                I71); True when it was issued or timed out and may still act."""
         ev = action.replace("-", "_")
         stage = _ACTION_TO_STAGE[action]
         if not self.record_auto_recovery(action, reason):

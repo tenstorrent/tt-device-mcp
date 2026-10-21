@@ -65,7 +65,6 @@ BLOCKED = "blocked"
 BELOW_FLOOR = "below_floor"
 STAGE_BRIDGE_RESET = constants.STAGE_BRIDGE_RESET
 STAGE_SMI_RESET = constants.STAGE_SMI_RESET
-STAGE_HOST_REBOOT = constants.STAGE_HOST_REBOOT
 STAGE_POWER_CYCLE = constants.STAGE_POWER_CYCLE
 
 # Recovery.escalate's outcome.
@@ -201,8 +200,7 @@ class RecoveryDeps:
     begin_action_row: Callable[[str, str], None]
     write_action_log: Callable[[str, str, float, str, Optional[int]], None]
     device_hold_episode_since: Callable[[], str]
-    # GalaxyRecovery's host-escalation ladder (reboot/power-cycle opt-ins + the loop-guard read):
-    auto_reboot_enabled: Callable[[], bool]
+    # GalaxyRecovery's host-escalation ladder (the power-cycle opt-in; spec 04 I71):
     auto_power_cycle_enabled: Callable[[], bool]
     # HealthMonitor's own probes (verify_fabric_health/verify_eth_heartbeat): the job-killing
     # ladder and the module logger both live in server.py, not in the health package, so they are
@@ -252,11 +250,10 @@ class RecoveryDeps:
     # recover, not just the one (_reset_and_verify_device) that happens to also flip a
     # RecoveryMechanism-wide flag another, unrelated reset could have set.
     device_degraded: Callable[[], bool]
-    # The two host-level rungs' OTHER half — GalaxyRecovery gets _auto_reboot_host (it is
-    # Galaxy-only in practice); the chassis power cycle and the loud whole-bus event stay
+    # The host rung's OTHER half — the chassis power cycle and the loud whole-bus event stay
     # server-owned (the gate journals that event itself, and the power cycle's ledger row and job
     # entry are server state), so they are injected rather than moved.
-    # Returns False when the cycle certainly did not launch (spec 04 I71: the in-band fallback).
+    # Returns False when the cycle certainly did not launch (spec 04 I71: hold, page, retry).
     auto_power_cycle_host: Callable[[Callable, str], Awaitable[Optional[bool]]]
     emit_all_off_bus_power_cycle_required: Callable[[Callable, int, int, str], None]
     host_escalation_kwargs: Callable[[], dict]

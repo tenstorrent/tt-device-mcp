@@ -38,7 +38,6 @@ from tt_device_mcp.health.recovery import (
     OUTCOME_WAITING,
     RELEASE,
     STAGE_BRIDGE_RESET,
-    STAGE_HOST_REBOOT,
     STAGE_POWER_CYCLE,
     STAGE_SMI_RESET,
     WAIT,
@@ -54,7 +53,6 @@ from tt_device_mcp.health.recovery.base import (
     refuse_mesh_reset,
 )
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
-from tt_device_mcp.health.recovery.stages.host_reboot import _fire_host_reboot
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
 
 _logger = logging.getLogger("tt-device-mcp")
@@ -202,17 +200,6 @@ def _offbus_hold_escalate_enabled() -> bool:
     unbounded otherwise; it fires only on an idle, tenant-free drop past the ceiling, is rate-limited
     to one recovery per episode, and climbs to the reboot rung if the reset does not recover."""
     return os.environ.get("TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE", "1").strip() == "1"
-
-
-def _post_reboot_verify_enabled() -> bool:
-    """Whether the broker, on coming back up from a warm reboot IT fired, climbs to the cold rung
-    when the reboot did not bring the mesh back. ON by default; TT_DEVICE_MCP_POST_REBOOT_VERIFY=0
-    is the operator kill-switch. It is on by default because a warm reboot cannot re-enumerate a
-    whole-bus wedge (a 6U-Galaxy reboot does not power-cycle the UBBs) — so a reboot that came back
-    all-off-bus has no other rung to reach, and the incident was exactly that boot re-holding the
-    box dead instead of climbing. The actual power cycle stays behind AUTO_POWER_CYCLE regardless
-    of this switch: off, or with no power cycle opted in, it emits the loud event and holds."""
-    return os.environ.get("TT_DEVICE_MCP_POST_REBOOT_VERIFY", "1").strip() != "0"
 
 
 def _stuck_hold_ceiling_sec() -> int:
@@ -493,103 +480,43 @@ def _offbus_stuck_hold_due(hold_since: str, *, off_bus: int, now: Optional[datet
     return (now - started).total_seconds() >= _stuck_hold_ceiling_sec()
 
 
-def _choose_recovery_escalation(
-    *,
-    auto_reboot_enabled: Callable[[], bool],
-    auto_power_cycle_enabled: Callable[[], bool],
-    reboot_already_attempted: Callable[[], bool],
-) -> Optional[str]:
+def _choose_recovery_escalation(*, auto_power_cycle_enabled: Callable[[], bool]) -> Optional[str]:
     """The host-level recovery rung to attempt after a reset failed to revive the mesh, or None if
-    the host opted into neither. Escalates least-drastic-first: a warm reboot is tried before the
-    chassis power cycle, and the power cycle is reached only once a reboot has already been tried
-    and the box came back still wedged — UNLESS the host opted into the power cycle alone, in which
-    case a whole-bus wedge (which a reboot cannot clear anyway) goes straight to it.
+    the host has none armed. The power cycle is the only host rung: it brings the host OS down
+    before power goes and re-powers the UBBs. There is no warm reboot rung: it never recovered a
+    device a power cycle would not have, and a Galaxy's UBBs stay unpowered-through across it.
 
-    ``auto_reboot_enabled``/``auto_power_cycle_enabled``/``reboot_already_attempted`` are injected
-    (server.py's own env predicates and its ``RecoveryMechanism`` instance) rather than read from a
+    ``auto_power_cycle_enabled`` is injected (server.py's own predicate) rather than read from a
     module global, so this stays free of a server<->health import cycle."""
-    if auto_power_cycle_enabled() and (reboot_already_attempted() or not auto_reboot_enabled()):
-        return "power-cycle"
-    if auto_reboot_enabled():
-        return "reboot"
-    return None
+    return "power-cycle" if auto_power_cycle_enabled() else None
 
 
 def _host_escalation_for_drop(
     off_bus: int,
     expected: int,
     *,
-    warm_reboot_futile: bool = False,
-    auto_reboot_enabled: Callable[[], bool],
     auto_power_cycle_enabled: Callable[[], bool],
-    reboot_already_attempted: Callable[[], bool],
 ) -> tuple[Optional[str], bool]:
-    """The host recovery rung to fire for an ``off_bus``/``expected`` drop, plus whether the warm
-    reboot was suppressed as unable to recover it (spec 04 I71). Every host-rung path calls this.
+    """The host recovery rung to fire for an ``off_bus``/``expected`` drop, plus whether no host rung
+    can run, so the caller must page and keep holding (spec 04 I71). Every host-rung path calls this.
 
-    A single-chip host (``expected <= 1``) has no UBB re-enumeration failure mode: it keeps
-    :func:`_choose_recovery_escalation`'s order, the reboot first and the power cycle after it.
-
-    A present mesh (``off_bus == 0``) that survived the reset ladder (class D, or a fabric or
-    dispatch fault the ladder could not clear, G2) keeps that order too: every chip is on the bus,
-    so the reason a reboot cannot help an off-bus chip does not apply, and no cause-checked record
-    shows a reboot never heals it. The reboot is the faster rung (no BMC, no I65 cooldown). The one
-    exception is a caller-proven ``warm_reboot_futile`` on a multi-chip host: the I79 cold flag (this
-    boot is the warm reboot a 77 climb fired, and the fabric still reads 77) means the reboot has
-    already run and failed, so that drop takes the power cycle like an off-bus one, or holds loudly
-    when it is not armed (spec 04 I79).
-
-    On a multi-chip host with a chip off the bus (``off_bus > 0``) the power cycle is THE host rung
-    whenever it is armed: a warm reboot does not power-cycle a Galaxy's UBBs, so an ASIC that fell
-    off the bus stays off across it (measured: 32/32 came back off the bus after the auto-reboot;
-    only a cold chassis power cycle recovered them). The power cycle does all a reboot does and
-    re-powers the UBBs, so it goes first.
-
-    With no power cycle armed the old rule stands unchanged, so no host loses a rung it had: a
-    whole-bus drop (``off_bus >= expected``) or a caller-proven ``warm_reboot_futile`` (a reset that
-    regressed or hard-failed the drop, a below-floor drop past its grace, a whole-tray sweep, a
-    reboot that already ran) returns ``(None, True)`` and the caller MUST emit the loud actionable
-    event and KEEP HOLDING; any other drop gets ``"reboot"`` when it is armed.
-
-    A power cycle the rate limits or the I65 cooldown deny, or one that fails to launch, falls back
-    to the warm reboot when :func:`_reboot_fallback_eligible` allows it (the callers do this, I71);
-    otherwise it is held and asked again when the wait ends (I10, I65). Pure and side-effect-free;
-    the caller acts on the result."""
-    if expected <= 1 or (off_bus <= 0 and not warm_reboot_futile):
-        escalation = _choose_recovery_escalation(
-            auto_reboot_enabled=auto_reboot_enabled,
-            auto_power_cycle_enabled=auto_power_cycle_enabled,
-            reboot_already_attempted=reboot_already_attempted,
-        )
-        return escalation, False
+    The power cycle is the one host rung. Armed, it is returned for every drop (a present mesh that
+    survived the reset ladder included). Not armed, ``(None, True)``: the caller MUST emit the loud
+    actionable event and KEEP HOLDING; nothing else may stand in for the cycle. A power cycle the
+    rate limits or the I65 cooldown deny, or one that fails to launch, is held and asked again when
+    the wait ends or on the next pass (I10, I65, I76). Pure and side-effect-free; the caller acts on
+    the result."""
     if auto_power_cycle_enabled():
         return "power-cycle", False
-    if warm_reboot_futile or off_bus >= expected:
-        return None, True
-    return ("reboot" if auto_reboot_enabled() else None), False
-
-
-def _reboot_fallback_eligible(off_bus: int, expected: int, *, warm_reboot_futile: bool) -> bool:
-    """Whether a power cycle that was denied or did not launch may fall back to the warm reboot
-    (spec 04 I71): exactly the drops :func:`_host_escalation_for_drop` would hand the reboot with no
-    power cycle armed. A whole-bus drop and a caller-proven ``warm_reboot_futile`` drop are not: the
-    reboot cannot bring an off-bus chip back there, so they hold for the cycle instead. The
-    reboot's own limits (one per boot, the ledger interval) and the one-per-wedge rule
-    (:meth:`~RecoveryMechanism.reboot_fallback_spent`) bound how often the fallback fires. A present
-    mesh carrying the I79 cold flag (``warm_reboot_futile``) is not eligible: the reboot already ran
-    on it and failed."""
-    if expected <= 1 or (off_bus <= 0 and not warm_reboot_futile):
-        return True
-    return not (warm_reboot_futile or off_bus >= expected)
+    return None, True
 
 
 # The ledger/auto_recovery_allowed vocabulary — what record_auto_recovery(action=...) and every
 # auto_recovery_* event have always written, so it is durable and never translated. These two maps
 # are the ONE place a host rung crosses between it and the stage-name vocabulary `_route` returns.
-CASCADE_REBOOT = "reboot"  # a warm host reboot — takes the whole box down
-CASCADE_POWER_CYCLE = "power-cycle"  # a BMC chassis power cycle, above the reboot
-_HOST_ESCALATION_STAGE = {CASCADE_REBOOT: STAGE_HOST_REBOOT, CASCADE_POWER_CYCLE: STAGE_POWER_CYCLE}
-# What the failed-reset climb returns when no host rung (power cycle or reboot) is available to it.
+CASCADE_POWER_CYCLE = "power-cycle"  # a chassis power cycle, host OS brought down first
+_HOST_ESCALATION_STAGE = {CASCADE_POWER_CYCLE: STAGE_POWER_CYCLE}
+# What the failed-reset climb returns when no host rung (the power cycle) is available to it.
 NO_HOST_RUNG = "no_host_rung"
 # And back, for the gate: once the router has named a host rung it needs the ledger's own word for
 # it again — `auto_recovery_allowed(action)`, `_journal_auto_recovery_denied(action, ...)`.
@@ -650,9 +577,7 @@ def _route(
     * a host rung is opted in (``host_escalation``), a prior cycle failed too (``was_failing`` — one
       bad pass is not "clearly won't recover"), no reset is still cycling, and the drop is a mass
       drop OR a present mesh that survived the reset still unhealthy (``off_bus == 0 or
-      off_bus >= reboot_floor``) -> that rung. With a chip off the bus on a multi-chip host it is
-      ``STAGE_POWER_CYCLE`` whenever that is armed and ``STAGE_HOST_REBOOT`` only without it (I71);
-      a present mesh and a single-chip host try the reboot first.
+      off_bus >= reboot_floor``) -> that rung: ``STAGE_POWER_CYCLE``, the only host rung (I71).
       ``off_bus == 0`` climbs on its own because the reboot floor is floored at 2 and could never
       otherwise be satisfied by a present mesh — an eth/fabric wedge the reset could not clear,
       which self-heal will not either since it already survived the deepest reset.
@@ -1085,21 +1010,15 @@ class GalaxyRecovery(Recovery):
 
     def next_stage(self, ev: Evidence) -> str:
         # host_escalation/reboot_blocked are folded here, not carried on Evidence (see its own
-        # docstring): only the post-galaxy-reset phase ever needs them, so the ledger read inside
-        # `reboot_already_attempted` — the one piece of this fold that touches disk — is skipped on
-        # every other call, exactly as the gate only pays for it once a galaxy reset has failed.
+        # docstring): only the post-galaxy-reset phase ever needs them.
         host_escalation, reboot_blocked = None, False
         if ev.last_action == STAGE_SMI_RESET and ev.last_action_recovered is False:
-            # With a chip off the bus on a multi-chip host the fold picks the power cycle whenever it
-            # is armed (I71). Without it, a reset proven unable to clear the drop holds loudly
-            # instead of the warm reboot.
+            # The fold picks the power cycle whenever it is armed (I71). Without it, a reset proven
+            # unable to clear the drop holds loudly.
             host_escalation, reboot_blocked = _host_escalation_for_drop(
                 ev.off_bus,
                 ev.expected,
-                warm_reboot_futile=self._gate_warm_reboot_futile(ev),
-                auto_reboot_enabled=self.deps.auto_reboot_enabled,
                 auto_power_cycle_enabled=self.deps.auto_power_cycle_enabled,
-                reboot_already_attempted=self.mechanism._reboot_already_attempted,
             )
         return _route(
             healthy=ev.healthy,
@@ -1128,48 +1047,15 @@ class GalaxyRecovery(Recovery):
             kill_reset_due=ev.kill_reset_due,
         )
 
-    @staticmethod
-    def _gate_warm_reboot_futile(ev: Evidence) -> bool:
-        """The gate's post-reset proof that a warm reboot cannot clear this drop: the reset regressed
-        it, hard-exited leaving chips off the bus, or already regressed it this hold episode."""
-        reset_regressed = (
-            ev.expected > 1 and ev.off_bus_before is not None and ev.off_bus > ev.off_bus_before and not ev.scope_active
-        )
-        return (
-            ev.expected > 1
-            and ev.off_bus > 0
-            and not ev.scope_active
-            and (reset_regressed or ev.reset_exit_nonzero or ev.episode_reset_regressed)
-        )
-
-    def reboot_fallback_allowed(self, ev: Evidence, *, tenant_active: bool) -> tuple[bool, str]:
-        """Whether the gate may fire the warm reboot in place of a power cycle the governor or the
-        I65 cooldown just denied (spec 04 I71). Only for a drop the reboot can still recover
-        (:func:`_reboot_fallback_eligible`), with the reboot opted in, not yet spent on this wedge and
-        its own limits passing."""
-        if not _reboot_fallback_eligible(ev.off_bus, ev.expected, warm_reboot_futile=self._gate_warm_reboot_futile(ev)):
-            return False, "a warm reboot cannot recover this drop"
-        if not self.deps.auto_reboot_enabled():
-            return False, "the warm reboot is not opted in"
-        return self.mechanism.fallback_reboot_allowed(tenant_active=tenant_active)
-
-    async def _reboot_after_cycle_launch_failure(self, log, cause: str, *, eligible: bool) -> bool:
-        """The in-band fallback for a power cycle that did not launch (spec 04 I71): an unreachable
-        BMC or a failing ipmitool must not leave the hold waiting on a rung that cannot run. Fires the
-        warm reboot when the drop is ``eligible`` (:func:`_reboot_fallback_eligible`), the reboot is
-        opted in and its own limits pass; returns True iff it fired. Otherwise the hold stands and
-        the power cycle is asked again on the next pass, as before."""
-        if not eligible or not self.deps.auto_reboot_enabled():
-            return False
-        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        allowed, why = self.mechanism.fallback_reboot_allowed(tenant_active=self._tenant_active(scan))
-        if not allowed:
-            log(f"the power cycle did not launch and the warm-reboot fallback is held off: {why}")
-            return False
-        log("the power cycle did not launch; firing the warm reboot as the in-band fallback")
-        health_event("power_cycle_reboot_fallback", trigger="launch_failed", cause=cause)
-        await self._auto_reboot_host(log, f"{cause}; the power cycle did not launch")
-        return True
+    def _hold_after_cycle_launch_failure(self, log, cause: str) -> None:
+        """A power cycle that did not launch (spec 04 I71): an unreachable BMC or a failing ipmitool.
+        Nothing stands in for it — there is no warm reboot rung. The hold stays, this pages (journal
+        line plus a /health event), and the next watchdog or gate pass asks for the cycle again under
+        the I76 bound."""
+        log(f"the power cycle did not launch ({cause}); holding the device and retrying the cycle on the next pass")
+        event = {"kind": "power_cycle_launch_failed_holding", "cause": cause}
+        health_event(event["kind"], cause=cause)
+        alert.send_alert(event, _logger)
 
     def _platform_reset_argv(self, indices: list) -> list:
         # All ASICs, no targets: a 6U Galaxy needs -glx_reset — per-PCIe-target -r does not
@@ -1384,7 +1270,7 @@ class GalaxyRecovery(Recovery):
         cycling in its scope is adopted and verified first. The present-mesh ladder has no chip off
         the bus, and an idle off-bus hold whose escalation is switched off stays read-only."""
         if rung == "gate":
-            if stage in (STAGE_HOST_REBOOT, STAGE_POWER_CYCLE, DEFER):
+            if stage in (STAGE_POWER_CYCLE, DEFER):
                 return None
         elif rung == "offbus-forced":
             pass
@@ -1434,9 +1320,7 @@ class GalaxyRecovery(Recovery):
         off_bus = len(offbus_chips)
         name = {FAULT_CLASS_WHOLE_TRAY: "whole tray(s) off the bus", FAULT_CLASS_ALL_OFF: "every chip off the bus"}
         what = f"class {fault_class} ({name.get(fault_class, fault_class)}): {off_bus}/{expected} chip(s) off"
-        escalation, _ = _host_escalation_for_drop(
-            off_bus, expected, warm_reboot_futile=True, **self.deps.host_escalation_kwargs()
-        )
+        escalation, _ = _host_escalation_for_drop(off_bus, expected, **self.deps.host_escalation_kwargs())
         if escalation != "power-cycle":
             health_event("power_cycle_direct", phase="not_opted_in", fault_class=fault_class, context=context)
             return None
@@ -1498,21 +1382,16 @@ class GalaxyRecovery(Recovery):
             return guard
         beats = await asyncio.to_thread(self.deps.read_heartbeats)
         off_bus = len(_offbus_chip_ids(beats, expected)) if expected > 1 else 0
-        # A warm reboot does not bring an off-bus Galaxy chip back, so any chip off the bus on a
-        # multi-chip host routes to the power cycle; with every chip present the reboot, which ends
-        # every process, comes first in the chooser's own order.
-        escalation, _ = _host_escalation_for_drop(
-            off_bus, expected, warm_reboot_futile=off_bus > 0, **self.deps.host_escalation_kwargs()
-        )
+        # The power cycle is the only host rung (I71): it ends every process, a leftover holder included.
+        escalation, _ = _host_escalation_for_drop(off_bus, expected, **self.deps.host_escalation_kwargs())
         if escalation is None:
             return "no-host-rung", (
                 f"no host rung is opted in ({off_bus}/{expected} chip(s) off the bus); "
-                "an operator must reboot or power-cycle the host"
+                "an operator must power-cycle the host"
             )
-        if escalation == "power-cycle":
-            standback = await asyncio.to_thread(offbus_power_cycle.standback_reason, require_manual_check=False)
-            if standback:
-                return "held", f"standing back from the power cycle: {standback}"
+        standback = await asyncio.to_thread(offbus_power_cycle.standback_reason, require_manual_check=False)
+        if standback:
+            return "held", f"standing back from the power cycle: {standback}"
         allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=False)
         if not allowed:
             return "held", f"{escalation} held off: {why}"
@@ -1523,10 +1402,7 @@ class GalaxyRecovery(Recovery):
             return guard
         reason = f"{what}; no reset can free it (spec 04 I70)"
         log(f"{what}: past its budget, no reset can free it — requesting the host {escalation} (spec 04 I70)")
-        if escalation == "power-cycle":
-            await self.deps.auto_power_cycle_host(log, reason)
-        else:
-            await self._auto_reboot_host(log, reason)
+        await self.deps.auto_power_cycle_host(log, reason)
         return "requested", f"{escalation} ({off_bus}/{expected} chip(s) off the bus)"
 
     async def _leftover_scan_guard(self, leftovers: set) -> Optional[tuple[str, str]]:
@@ -1557,8 +1433,7 @@ class GalaxyRecovery(Recovery):
     # inside _reset_and_verify_device, which re-derives select_recovery per call precisely so a
     # rung reached through a fixed platform reference still fires the command that fits the host
     # actually detected. So the gate reaches this through the module-global Galaxy instance,
-    # exactly as it has always called _recover_isolated_chips and _auto_reboot_host, not through
-    # its per-pass platform choice.
+    # not through its per-pass platform choice.
 
     async def _fire_gate_rung(
         self,
@@ -1679,7 +1554,7 @@ class GalaxyRecovery(Recovery):
             self.deps.clear_device_reported_fault(f"gate/{gate_phase}: reset recovered the mesh")
             self.deps.clear_device_dirty(verified=True, why=f"gate/{gate_phase}: reset recovered the mesh")
             return OUTCOME_RECOVERED
-        if stage in (STAGE_HOST_REBOOT, STAGE_POWER_CYCLE):
+        if stage == STAGE_POWER_CYCLE:
             # The caller has already confirmed the opt-in, the two-strikes precondition, that no
             # tenant holds the device and that the durable rate limits pass. Before taking the box
             # down, give every reset type one last back-to-back run, then ONE settle and ONE verify
@@ -1703,12 +1578,7 @@ class GalaxyRecovery(Recovery):
             if stage == STAGE_POWER_CYCLE:
                 cause = "the reset ladder could not recover the device"
                 if await self.deps.auto_power_cycle_host(log, cause) is False:
-                    eligible = ev is not None and _reboot_fallback_eligible(
-                        ev.off_bus, ev.expected, warm_reboot_futile=self._gate_warm_reboot_futile(ev)
-                    )
-                    await self._reboot_after_cycle_launch_failure(log, cause, eligible=eligible)
-            else:
-                await self._auto_reboot_host(log, "reset failed twice; device unrecoverable by reset")
+                    self._hold_after_cycle_launch_failure(log, cause)
             return OUTCOME_WAITING
         raise ValueError(f"escalate(): {stage!r} is not a gate action rung")
 
@@ -2194,8 +2064,7 @@ class GalaxyRecovery(Recovery):
             health_event("host_rung_held", context="tray-down-no-window", reason="reset sweep skipped or incomplete")
             return OUTCOME_WAITING
         # Still bad after every reset — the power cycle, under the same opt-in + tenant + rate-limit
-        # guards as any host rung. A whole tray off the bus with no window is warm-reboot-futile (a
-        # 6U-Galaxy reboot does not power-cycle the UBBs), so it goes straight to the cold rung.
+        # guards as any host rung.
         off_bus = len(offbus_chips)
         # Log-only: more chips may be off by now than at onset. Every decision below uses off_bus.
         try:
@@ -2204,9 +2073,7 @@ class GalaxyRecovery(Recovery):
         except Exception as e:  # noqa: BLE001 - a failed re-read must never block the power cycle
             log(f"tray-down-no-window: could not re-read the heartbeats after the verify: {e!r}")
             off_bus_after = None
-        escalation, reboot_blocked = _host_escalation_for_drop(
-            off_bus, expected, warm_reboot_futile=True, **self.deps.host_escalation_kwargs()
-        )
+        escalation, reboot_blocked = _host_escalation_for_drop(off_bus, expected, **self.deps.host_escalation_kwargs())
         if reboot_blocked or escalation != "power-cycle":
             log(
                 f"tray-down-no-window sweep did not recover the mesh; power cycle not auto-fired "
@@ -2366,8 +2233,7 @@ class GalaxyRecovery(Recovery):
         # this path: retries are paced by the grace window above.
         self.deps.set_device_hold_episode_escalated(True)
         # Baseline the off-bus count BEFORE the reset so the climb can tell a reset that regressed the
-        # mesh (dropped more chips off the bus) from one that merely did not recover — the former needs
-        # the cold rung, not a warm reboot that cannot re-enumerate the dropped ASICs.
+        # mesh (dropped more chips off the bus) from one that merely did not recover.
         beats_before = await asyncio.to_thread(self.deps.read_heartbeats)
         off_bus_before = offbus_count(beats_before, expected)
         if hold_since and self.mechanism.unverified_reset_since == hold_since:
@@ -2881,8 +2747,7 @@ class GalaxyRecovery(Recovery):
         # Below the galaxy-reset floor, hold rather than fire the mesh-wide reset — the same suppression
         # the gate applies (galaxy_reset_suppressed_below_mass_threshold). A galaxy reset is the measured
         # all-chip drop: run against a single/few-chip off-bus wedge it inverts the mesh (the drop goes
-        # all-0xFFFFFFFF), and a warm reboot cannot re-enumerate dropped ASICs, so resetting a below-floor
-        # drop can only make it worse. The drop self-heals and the surgical per-chip rung
+        # all-0xFFFFFFFF), so resetting a below-floor drop can only make it worse. The drop self-heals and the surgical per-chip rung
         # above is the only reset that applies below the floor, so once that cannot recover it, hold: the
         # deadline watchdog keeps the hold visible and self-heal or a cold power cycle clears it, never a
         # reset that deepens the drop. Skip the floor only while a reset already cycles (its all-ones reads
@@ -3068,7 +2933,7 @@ class GalaxyRecovery(Recovery):
             if not spent:
 
                 def on_fire() -> None:
-                    # Logged as the rung fires, before the reboot can take the broker down; a stale
+                    # Logged as the rung fires, before the power cycle can take the broker down; a stale
                     # hand-off of an earlier "could not run" ends here.
                     self._fabric_77_handoff = None
                     health_event("fabric_unverified_host_rung", held_since=hold_since, expected=expected)
@@ -3086,7 +2951,6 @@ class GalaxyRecovery(Recovery):
                     cause=FABRIC_77_HOST_RUNG_CAUSE,
                     on_fire=on_fire,
                     ladder_ran=True,
-                    cold=self._fabric_77_cold_rung_due(),
                 )
                 if outcome == HOST_RUNG_FIRED:
                     self.mechanism.unverified_77_host_rung_since = hold_since
@@ -3151,29 +3015,17 @@ class GalaxyRecovery(Recovery):
         if FABRIC_DEBT.passed_since_start:
             return ""
         rec = self.mechanism.boot_from_broker_escalation(self.deps.current_boot_id())
-        if rec and str(rec.get("reason", "")) == FABRIC_77_HOST_RUNG_CAUSE and not self._fabric_77_cold_rung_due():
+        if rec and str(rec.get("reason", "")) == FABRIC_77_HOST_RUNG_CAUSE:
             return f"this boot is the {rec.get('action')} that rung fired, and the fabric still reads 77"
         return ""
 
-    def _fabric_77_cold_rung_due(self) -> bool:
-        """Whether this boot is the warm reboot a 77 climb fired, the fabric has not passed since the
-        broker started, and a power cycle is opted in: the climb then takes the cold rung, once
-        (spec 04 I79). A boot that is that power cycle's result is spent and goes to an operator."""
-        if FABRIC_DEBT.passed_since_start:
-            return False
-        rec = self.mechanism.boot_from_broker_escalation(self.deps.current_boot_id())
-        if not rec or str(rec.get("reason", "")) != FABRIC_77_HOST_RUNG_CAUSE or rec.get("action") != "reboot":
-            return False
-        return bool(self.deps.host_escalation_kwargs()["auto_power_cycle_enabled"]())
-
     def fabric_77_climb_owed(self, hold_since: str) -> bool:
         """Whether a 77-only hold owes the climb at once rather than the I40/I48 waits (spec 04 I79):
-        its one reset already came back UNKNOWN on this episode, or this boot is the warm reboot an
-        earlier 77 climb fired and the cold rung is still due. False once this episode's host rung has
+        its one reset already came back UNKNOWN on this episode. False once this episode's host rung has
         fired. Counts nothing; the caller decides."""
         if not hold_since or self.mechanism.unverified_77_host_rung_since == hold_since:
             return False
-        return self.mechanism.unverified_reset_since == hold_since or self._fabric_77_cold_rung_due()
+        return self.mechanism.unverified_reset_since == hold_since
 
     def _hand_77_hold_to_operator(
         self, hold_since: str, expected: int, why: str, log, *, broker_retries: bool = False
@@ -3267,11 +3119,10 @@ class GalaxyRecovery(Recovery):
         cause: str = "",
         on_fire: Optional[Callable[[], None]] = None,
         ladder_ran: bool = False,
-        cold: bool = False,
         present_reset_failed: bool = False,
     ) -> str:
-        """Climb an idle escalation whose galaxy reset failed to revive the mesh to the host rung — a
-        warm reboot, then a BMC power cycle above it — so a reset that did not recover does not sit.
+        """Climb an idle escalation whose galaxy reset failed to revive the mesh to the host rung — the
+        power cycle, the only host rung (I71) — so a reset that did not recover does not sit.
         Bounded below by the hold ceiling: the host rungs never fire before the episode has stood the
         full ladder, however futile the gentler rungs proved — an early forced pass fires the cheap
         rungs only, and the deadline watchdog re-runs the ladder at the ceiling where the climb is
@@ -3289,20 +3140,18 @@ class GalaxyRecovery(Recovery):
         cycle on top of the current one). The idle escalation fires exactly one reset per episode (the
         once-per-episode latch), and an idle stuck box has no next-job gate to run a second, so requiring
         a second failure would hold forever — the indefinite hold this path exists to end. One failed
-        reset that mass-dropped an idle, tenant-free mesh is enough to reboot here; the rate limiter bars
+        reset that mass-dropped an idle, tenant-free mesh is enough to power-cycle here; the rate limiter bars
         a loop. A no-op where the host opted into no host rung — except an all-off-bus drop, which always
         emits the loud actionable event before holding, since absence is never health.
 
         ``off_bus_before`` is the caller's pre-reset baseline. A reset that REGRESSED the mesh (more chips
-        off the bus than before) or hard-exited leaving chips off it is a warm-reboot-futile drop: a
-        6U-Galaxy reboot does not power-cycle the UBBs, so a dropped ASIC stays off across it. Route such
-        a reset straight to the cold rung, never the warm reboot that just proved it cannot help — the
-        same verdict the gate reaches, so a regression is handled the same on the idle path as at a job
-        boundary.
+        off the bus than before) or hard-exited leaving chips off it is latched for the episode and goes
+        to the power cycle — the same verdict the gate reaches. If the cycle cannot launch the hold
+        stays, the broker pages, and the next pass asks for the cycle again.
 
         ``cause`` replaces the recorded reason (the I29 77 climb names itself, so the next boot can tell
         it apart); ``on_fire`` runs just before the rung fires. Returns HOST_RUNG_FIRED once it requested the
-        reboot or power cycle, HOST_RUNG_DEFERRED when it only waited (a later escalation retries),
+        power cycle, HOST_RUNG_DEFERRED when it only waited (a later escalation retries),
         NO_HOST_RUNG when no rung is available, or HOST_RUNG_DENIED when auto_recovery_allowed refused it."""
         if await asyncio.to_thread(self.mechanism.scope_active):
             log(
@@ -3321,9 +3170,7 @@ class GalaxyRecovery(Recovery):
         beats = await asyncio.to_thread(self.deps.read_heartbeats)
         off_bus = offbus_count(beats, expected)
         # A reset that made the mesh WORSE off the bus (the incident's 8->32), or that hard-exited
-        # leaving chips off it, cannot be undone by a warm reboot — a 6U-Galaxy reboot does not
-        # power-cycle the UBBs, so a dropped ASIC stays off across it. Route such a reset to the cold
-        # rung, never the reboot, and flag a regression loudly. No reset is cycling here (the top guard
+        # leaving chips off it, goes to the power cycle; flag a regression loudly. No reset is cycling here (the top guard
         # already returned on a live scope), so the count is a confirmed post-reset state. This mirrors
         # the gate's own escalation so a regression climbs the same on the idle path as at a job boundary.
         # Detected BEFORE the ceiling deferral below so an early regression is latched for the episode:
@@ -3340,8 +3187,7 @@ class GalaxyRecovery(Recovery):
             )
             log(
                 f"the idle escalation's reset REGRESSED the mesh — {off_bus_before} -> {off_bus} of "
-                f"{expected} chip(s) off the bus. A warm reboot cannot re-enumerate a dropped Galaxy "
-                f"ASIC, so climbing to the cold rung, never the reboot; no further mesh reset this hold."
+                f"{expected} chip(s) off the bus. Climbing to the power cycle; no further mesh reset this hold."
             )
         episode_regressed = self.mechanism.reset_regressed_in(hold_since)
         # This episode's mesh reset already ran and failed on exactly the chips off the bus now (I36).
@@ -3420,28 +3266,13 @@ class GalaxyRecovery(Recovery):
                 ceiling_sec=_stuck_hold_ceiling_sec(),
             )
             return HOST_RUNG_DEFERRED
-        reboot_floor = _reboot_min_dead_chips(expected)
         # An off-bus drop reaching this climb is NOT self-healing: it survived the grace and a reset that
-        # could not recover it. A dropped ASIC does not re-enumerate on a warm reboot (a 6U-Galaxy reboot
-        # does not power-cycle the UBBs), so on a multi-chip host the chooser routes it to the cold rung
-        # whenever that is armed, below the floor included (I71); a present mesh tries the reboot first.
-        # With no cold rung armed the old verdict stands: a reset proven unable to clear it (regressed,
-        # hard-failed, or a below-floor drop) holds loudly; any other drop keeps the warm reboot, which is
-        # also its fallback when the cycle is denied or does not launch.
-        below_floor_offbus = 0 < off_bus < reboot_floor
-        # ``cold``: this boot is the warm reboot an earlier 77 climb fired and the fabric still reads 77,
-        # so a second reboot is futile and the cold rung is the one left (spec 04 I79).
-        warm_reboot_futile = cold or (
-            expected > 1
-            and off_bus > 0
-            and (reset_regressed or episode_regressed or self.mechanism.last_reset_exit_nonzero or below_floor_offbus)
-        )
-        escalation, reboot_blocked = _host_escalation_for_drop(
-            off_bus, expected, warm_reboot_futile=warm_reboot_futile, **self.deps.host_escalation_kwargs()
-        )
+        # could not recover it, and a present mesh survived the deepest reset. The power cycle is the one
+        # host rung for both (I71); with it not armed the climb holds loudly.
+        escalation, reboot_blocked = _host_escalation_for_drop(off_bus, expected, **self.deps.host_escalation_kwargs())
         if reboot_blocked:
-            # No chassis power cycle is opted in and no rung can recover it: fail closed loudly and hold,
-            # never fire a reboot that lands right back in the dead state. A whole-bus drop and a reset
+            # No chassis power cycle is opted in and no rung can recover it: fail closed loudly and hold.
+            # A whole-bus drop and a reset
             # that regressed/hard-failed a partial drop off the bus each need the cold rung, but name
             # them apart so the count is not misreported as all-off-bus.
             if off_bus >= expected:
@@ -3450,14 +3281,7 @@ class GalaxyRecovery(Recovery):
                 self._emit_reset_unrecoverable_power_cycle_required(
                     log, off_bus, expected, regressed=reset_regressed or episode_regressed, context="idle escalation"
                 )
-            # reboot_blocked means specifically: this drop needs the cold rung and power-cycle is
-            # not opted in — a power_cycle kill-switch decline, not a "no rung exists at all" case.
             metrics.stage_fired("power_cycle", "blocked")
-            return NO_HOST_RUNG
-        if not escalation:
-            # Both TT_DEVICE_MCP_AUTO_REBOOT and _AUTO_POWER_CYCLE are off (the default) —
-            # gentlest-first, the reboot rung is the one this leaves declined.
-            metrics.stage_fired("host_reboot", "blocked")
             return NO_HOST_RUNG
         if off_bus == 0 and not cause:
             # A PRESENT mesh (every chip on the bus, ARC-healthy) whose galaxy reset STILL did not verify
@@ -3476,17 +3300,6 @@ class GalaxyRecovery(Recovery):
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
         tenant_active = self._tenant_active(scan)
         allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=tenant_active)
-        fallback_eligible = _reboot_fallback_eligible(off_bus, expected, warm_reboot_futile=warm_reboot_futile)
-        if not allowed and escalation == "power-cycle" and fallback_eligible and self.deps.auto_reboot_enabled():
-            # I71: a denied cycle on a drop the reboot can still recover takes the in-band rung now
-            # rather than hold to the cooldown's end; once per wedge, within the reboot's own limits.
-            reboot_ok, reboot_why = self.mechanism.fallback_reboot_allowed(tenant_active=tenant_active)
-            if reboot_ok:
-                log(f"a host power cycle is held off ({why}); firing the warm reboot as the in-band fallback")
-                health_event("power_cycle_reboot_fallback", trigger="denied", reason=why, off_bus=off_bus)
-                escalation, allowed = "reboot", True
-            else:
-                why = f"{why}; warm-reboot fallback held off too: {reboot_why}"
         if not allowed:
             log(
                 f"reset dropped the mesh ({off_bus}/{expected} off-bus) and a host {escalation} is "
@@ -3522,114 +3335,17 @@ class GalaxyRecovery(Recovery):
         if on_fire is not None:
             on_fire()
         health_event("stuck_hold_host_escalation", escalation=escalation, off_bus=off_bus)
-        if escalation == "power-cycle":
-            if await self.deps.auto_power_cycle_host(log, cause) is False:
-                await self._reboot_after_cycle_launch_failure(log, cause, eligible=fallback_eligible)
-        else:
-            await self._auto_reboot_host(log, cause)
+        if await self.deps.auto_power_cycle_host(log, cause) is False:
+            self._hold_after_cycle_launch_failure(log, cause)
         return HOST_RUNG_FIRED
-
-    async def _verify_post_reboot_recovery(self, off_bus: int, expected: int, log) -> None:
-        """After a warm reboot the broker itself fired, confirm the mesh came back — and climb to the
-        cold rung if it did not, instead of silently re-holding a dead box.
-
-        A warm reboot fires and then the broker dies with the box; the next boot is its ONLY
-        verification point. The incident was a reboot that returned 0/32 — a 6U-Galaxy reboot does not
-        power-cycle the UBBs, so ASICs that fell off the bus stay off across it — and nothing then
-        compared what came back to what left, so the startup hold was re-raised and the box sat dead
-        ~18h. This is that comparison: the auto-recovery ledger says this boot IS a broker reboot's
-        result, the sysfs probe says how much of the mesh returned.
-
-        A mass drop the reboot did not clear does not self-heal and the reboot already failed on it, so
-        the only rung above it is the chassis power cycle — fired under the SAME opt-in + rate-limit +
-        tenant guards as every other host rung, never a second warm reboot (the rung that just failed).
-        With no power cycle opted in it emits the loud actionable event and keeps holding; absence is
-        never health. Below the reboot floor a few-chip drop re-enumerates on its own, so it holds
-        exactly as the gate does — the reboot substantially worked and taking the box down again would
-        kill tenants for a wedge that clears itself."""
-        if not _post_reboot_verify_enabled():
-            return
-        boot_id = self.deps.current_boot_id()
-        escalation_rec = self.mechanism.boot_from_broker_escalation(boot_id)
-        if not escalation_rec or escalation_rec.get("action") != "reboot":
-            # Not a broker warm reboot's result: an external/manual reboot or firmware crash (nothing to
-            # verify), or the top rung — a power cycle — already fired, above which there is no rung to
-            # climb. Only a reboot the broker fired to recover the device is verified here.
-            return
-        if await asyncio.to_thread(self.mechanism.scope_active):
-            # A reset re-adopted from the previous broker is still cycling; its all-ones is not a
-            # confirmed drop. The startup fabric verify adopts it — do not climb over its in-flight state.
-            log(
-                "the warm reboot that brought this boot up left a reset still cycling in its own scope — "
-                "deferring the post-reboot verdict to it rather than climbing over its in-flight all-ones"
-            )
-            return
-        if off_bus == 0:
-            # A fully-present mesh reads healthy on the sysfs probe and never calls this; guard anyway so a
-            # zero-drop is never routed to a power cycle.
-            return
-        # The warm reboot ran and the mesh came back with chips STILL off the bus. A dropped ASIC does not
-        # re-enumerate on another warm reboot (a 6U-Galaxy reboot does not power-cycle the UBBs) and the
-        # reboot was itself the self-heal escalation, so a still-off-bus mesh here is NOT self-healing at
-        # any count — the cold power cycle is the only rung above the reboot that just ran. Route to it,
-        # never hold below the floor; the reboot floor only ever gated the mesh reset, not the power cycle.
-        escalation, reboot_blocked = _host_escalation_for_drop(
-            off_bus, expected, warm_reboot_futile=True, **self.deps.host_escalation_kwargs()
-        )
-        # _host_escalation_for_drop's reboot_futile only fires for expected > 1 (a single-chip
-        # host has no UBB-re-enumeration failure mode of its own), so on a single-chip host it can
-        # still hand back "reboot" here even though warm_reboot_futile=True. This method's own
-        # contract is never a second warm reboot — the rung that just ran and failed — so anything
-        # short of an opted-in power cycle is blocked, same as no rung being available at all.
-        if reboot_blocked or escalation != "power-cycle":
-            # No chassis power cycle is opted in — the one rung that could recover a mesh a warm reboot
-            # cannot re-enumerate. Fail closed LOUDLY (never a silent re-hold); name a whole-bus drop apart
-            # from a partial one so the count is not misreported as all-off-bus.
-            if off_bus >= expected:
-                self.deps.emit_all_off_bus_power_cycle_required(log, off_bus, expected, "post-reboot verify")
-            else:
-                health_event(
-                    "post_reboot_recovery_stuck_no_cold_rung", off_bus=off_bus, expected=expected, host_at_risk=True
-                )
-                log(
-                    f"the warm reboot left {off_bus}/{expected} off the bus and no chassis power cycle is "
-                    f"opted in — the warm reboot is the rung that just failed and cannot re-enumerate a "
-                    f"dropped ASIC. Set TT_DEVICE_MCP_AUTO_POWER_CYCLE=1 to let the broker cold-cycle the "
-                    f"chassis, or power-cycle it manually (BMC/ipmitool). Device stays HELD."
-                )
-            metrics.stage_fired("power_cycle", "blocked")
-            return
-        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        tenant_active = self._tenant_active(scan)
-        allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=tenant_active)
-        if not allowed:
-            log(
-                f"the warm reboot did not bring the mesh back ({off_bus}/{expected} off the bus) and a "
-                f"power cycle is opted in but held off: {why}"
-            )
-            metrics.stage_fired("power_cycle", "blocked")
-            return
-        # Last chance before the cold rung: the warm reboot did not re-enumerate the mesh, but it also
-        # did not re-power the UBBs — so re-issue every reset type once more, settle and verify before
-        # pulling the chassis power.
-        if (
-            await self._settle_and_verify_before_host_rung(
-                expected, log, "post-reboot", context=f"post-reboot, {off_bus}/{expected} off the bus"
-            )
-            is not False
-        ):
-            return
-        health_event("post_reboot_host_escalation", escalation=escalation, off_bus=off_bus, expected=expected)
-        await self.deps.auto_power_cycle_host(log, "post-reboot verify: the warm reboot did not bring the mesh back")
 
     def _emit_reset_unrecoverable_power_cycle_required(
         self, log, off_bus: int, expected: int, *, regressed: bool, context: str
     ) -> None:
-        """Fail closed, loudly, on a PARTIAL drop a warm reboot cannot recover: a reset that regressed
-        the mesh off the bus, or hard-exited leaving chips off it, with no auto power cycle opted in.
-        Distinct from the whole-bus event so the count is not misreported as all-off-bus. The dropped
-        ASICs are off the bus a reboot cannot re-enumerate, so — like the whole-bus wedge — the only
-        rung that can recover them is the cold power cycle. Name it and leave the device HELD."""
+        """Fail closed, loudly, on a PARTIAL drop no reset recovers: a reset that regressed the mesh off
+        the bus, or hard-exited leaving chips off it, with no auto power cycle opted in. Distinct from
+        the whole-bus event so the count is not misreported as all-off-bus. The only rung that can
+        recover the dropped ASICs is the power cycle. Name it and leave the device HELD."""
         cause = "regressed the mesh off the bus" if regressed else "could not run and left chips off the bus"
         health_event(
             "reset_unrecoverable_power_cycle_required",
@@ -3641,23 +3357,9 @@ class GalaxyRecovery(Recovery):
             host_at_risk=True,
         )
         log(
-            f"a reset {cause} — {off_bus}/{expected} chip(s) off the PCIe bus [{context}] — which a warm "
-            f"reboot CANNOT re-enumerate (a 6U-Galaxy reboot does not power-cycle the UBBs). The reboot "
-            f"is not the answer here: set TT_DEVICE_MCP_AUTO_POWER_CYCLE=1 to let the broker cold-cycle "
-            f"the chassis, or power-cycle it manually (BMC/ipmitool). Device stays HELD."
-        )
-
-    async def _auto_reboot_host(self, log, reason: str) -> None:
-        """Fire the warm-host-reboot recovery rung. The caller has already confirmed both the env
-        opt-in AND ``RecoveryMechanism.auto_recovery_allowed``."""
-        await self.mechanism._fire_recovery_escalation(
-            "reboot",
-            row_owner="[broker]reboot-request",
-            label="auto host reboot",
-            detail="reset could not recover the device",
-            fire=_fire_host_reboot,
-            log=log,
-            reason=reason,
+            f"a reset {cause} — {off_bus}/{expected} chip(s) off the PCIe bus [{context}]. Only a power "
+            f"cycle brings them back: set TT_DEVICE_MCP_AUTO_POWER_CYCLE=1 to let the broker cycle the "
+            f"chassis, or power-cycle it manually (BMC/ipmitool). Device stays HELD."
         )
 
     def _note_whole_tray_drop(self, beats: dict, off_bus: int, expected: int, log) -> bool:
