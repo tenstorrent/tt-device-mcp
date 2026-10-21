@@ -12513,6 +12513,13 @@ export {JOB_TAG_ENV}={job_tag}
                 # dispatch hangs on. The next post-job gate pays one reset, then the full check.
                 # Not a job our own reset killed, nor one that named a known fabric/topology fault:
                 # those already have their own path.
+                # A job that did not exit 0 and left chips at the busy AI clock died with the device
+                # open: something stopped it mid-run that the broker did not send (a signal it did not
+                # handle, often a child's, so its own exit can be a plain 1). Same mesh state, same
+                # debt (03 B-post-job clock check): a forced fabric pass first only 77s or fails on it.
+                left_busy = (
+                    _aiclk_left_busy() if not killed_by_reset and not known and not topo and job.exit_code != 0 else {}
+                )
                 if (
                     not killed_by_reset
                     and not known
@@ -12521,9 +12528,18 @@ export {JOB_TAG_ENV}={job_tag}
                         job.status in (JobStatus.TIMEOUT, JobStatus.HUNG)
                         or job_id in request_killed_job_ids
                         or job_id in preempt_forced_job_ids
+                        or left_busy
                     )
                 ):
-                    _owe_kill_reset(f"job {job_id} {job.status.value}")
+                    _owe_kill_reset(
+                        f"job {job_id} {job.status.value}"
+                        + (
+                            f" with {len(left_busy)} chip(s) left at the busy AI clock "
+                            f"(max {max(left_busy.values())} MHz)"
+                            if left_busy and job.status not in (JobStatus.TIMEOUT, JobStatus.HUNG)
+                            else ""
+                        )
+                    )
                 request_killed_job_ids.discard(job_id)
                 preempt_forced_job_ids.discard(job_id)
                 # Last, so its detail is the one the hold shows: the next job waits until this
