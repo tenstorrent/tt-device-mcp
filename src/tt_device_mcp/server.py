@@ -11435,10 +11435,7 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                             f.write(f"\n[KILLED by device reset] {job.error}\n")
                     except OSError:
                         pass
-            elif (
-                _is_wedge_risk_exit(job.status, job.exit_code)
-                or (rc is None and job.status == JobStatus.FAILED)
-            ):
+            elif _is_wedge_risk_exit(job.status, job.exit_code) or (rc is None and job.status == JobStatus.FAILED):
                 # A job whose status is unknown (no, unreadable or stale exit file) was killed or
                 # the host went down under it, and nothing shows it released the device (spec 01 I8).
                 _mark_device_dirty(
