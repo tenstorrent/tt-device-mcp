@@ -1049,7 +1049,17 @@ cooldown (spec 04 I65) holds longer.
   still holds and gates as before. A killed one, a
   non-zero or unproven status and a normal completion are unchanged. The door payment's move adds no
   wait: the foreign-holder and external-step waits it now follows already ran before the job's
-  gate, with their own bounds.
+  gate, with their own bounds. A job that did not exit 0 and left any chip above
+  `IDLE_AICLK_MAX_MHZ` when it ended (the post-job clock check's read, taken at the job's end,
+  before the gate) owes the same reset: the busy clock means it died with the device open, stopped
+  mid-run by something the broker did not send (a signal it did not handle, often a child's, so its
+  own exit can be a plain 1). Not when our own reset killed it or it named a known fabric or topology
+  fault. Time to recover for this class (a job killed from outside the broker mid-run): before, the
+  forced fabric pass ran on the open mesh first (up to `FABRIC_CHECK_TIMEOUT_SEC`; seen: 147 s to an
+  exit 77), held fabric-unverified, and only the idle relift's next failed pass and the stuck-hold
+  escalation reached the reset, ~7 min to the reset and ~9.5 min to release. After: one reset (~33-62 s
+  on a Galaxy) and one full check (~91 s seen), ~2-2.5 min, with no added wait. A failed job that
+  closed the device (idle clock) or whose clock cannot be read keeps the forced pass, unchanged.
 - **I57 — An incident bundle never presents another pass's fabric transcript as its own.** The
   monitor stamps `last_fabric_output_at` with the start of the run that produced
   `last_fabric_output`; the gate records when its pass began and hands both to
@@ -1679,7 +1689,9 @@ without closing leaves its chips at the busy clock until something opens and clo
   reads each chip's `tt_aiclk` from sysfs (no device access) and, if any chip reads above
   `IDLE_AICLK_MAX_MHZ` (default 800, `TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ`), journals one
   `aiclk_busy_after_job` event and writes one line to the job's log.
-- It is a record only: it adds no device work and no time between jobs, and it never makes a
+- The same read, taken at the job's end before the gate, makes a busy chip owe the I69 reset: the
+  job died with the device open, so the gate resets first and then runs the full check.
+- The record itself adds no device work and no time between jobs, and it never makes a
   device dirty. Lowering the clock needs a device open and close, which is the fabric pass's
   job (forced post-job on any non-success) or an operator's.
 
@@ -1975,6 +1987,7 @@ refuses.
 | I69 (every preemption kill owes the reset unless every process was witnessed to exit by its own code on SIGTERM, which takes the fast check (none when its own status is a proven 0) and its job's own post-job gate pays it, reset then full check, before the waiting job's door; a job that ends itself inside its minute is not preempted; the re-adopted path too, leaving no id) | `tests/test_job_kill_reset.py::test_every_preemption_kill_owes_the_reset`, `tests/test_preemptable.py::test_a_job_that_ends_itself_inside_the_minute_is_a_normal_end`, `tests/test_job_kill_reset.py::test_a_preemption_owes_and_pays_the_reset_before_the_next_job`, `tests/test_job_kill_reset.py::test_a_preemption_debt_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_preempted_readopted_job_owes_the_reset`, `tests/test_preemptable.py::test_a_preempted_job_that_ends_cleanly_on_sigterm_takes_the_fast_check`, `tests/test_preemptable.py::test_a_preempted_job_that_returns_0_on_sigterm_gets_no_check_and_no_reset`, `tests/test_preemptable.py::test_a_preempted_exit_0_on_a_held_or_owing_device_keeps_its_gate`, `tests/test_preemptable.py::test_a_preempted_job_with_a_signal_death_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_a_preempted_job_that_needed_sigkill_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_an_unwitnessed_preemption_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_a_witness_error_keeps_the_reset_debt_and_the_kill_completes` |
 | I69 (the door payment waits out an external step's reservation) | `tests/test_job_kill_reset.py::test_the_door_payment_waits_out_an_external_step` |
 | I69 (a reaped leftover skips before the debt: no reset, debt kept, no wait; a reboot drops it and the startup full check runs; a cooldown skips and clears it with no wait) | `tests/test_job_kill_reset.py::test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait`, `tests/test_job_kill_reset.py::test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait` |
+| I69 (a failed job that left chips at the busy AI clock owes the reset; an idle clock, an exit 0 or our own reset's kill owes none) | `tests/test_job_kill_reset.py::test_a_failed_job_that_left_the_clock_busy_owes_the_reset`, `tests/test_job_kill_reset.py::test_no_clock_debt_for_a_closed_device_an_exit0_or_our_own_kill` |
 | I75 | `tests/test_device_safety.py::test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_gate_not_reset`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_next_tick`, `tests/test_device_safety.py::test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladder`, `tests/test_device_safety.py::test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate` |
 | I75 (the stand-down is re-read under the lock and at the ladder's tenant check: a job ending mid-run gets no reset before the gate) | `tests/test_device_safety.py::test_a_readopted_job_ending_during_a_forced_run_gets_no_reset_before_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_after_a_job_ended_during_a_forced_run_escalates_next_tick`, `tests/test_device_safety.py::test_idle_relift_gives_no_reset_when_the_readopted_job_ends_inside_the_ladder`, `tests/test_ladder_v2.py::test_the_i75_stand_down_blocks_only_inside_the_escalate_that_carries_it`, `tests/test_ladder_v2.py::test_escalate_carries_the_stand_down_only_for_its_own_run`, `tests/test_classac_power_cycle_direct.py::test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant` |
 | I75 (a running re-adopted job still defers on `job_running`; off-bus and non-rearmable forced kinds never wait on the gate; a failed gate gets the spec 04 I76 ladder then one power cycle) | `tests/test_device_safety.py::test_a_running_readopted_job_still_defers_the_startup_hold_on_job_running`, `tests/test_device_safety.py::test_idle_relift_meets_a_running_readopted_job_on_job_running`, `tests/test_device_safety.py::test_an_offbus_startup_hold_keeps_its_one_shot_while_the_startup_gate_is_pending`, `tests/test_device_safety.py::test_a_forced_run_whose_window_cannot_be_given_back_is_not_deferred_to_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_gets_the_bound_ladder_then_one_power_cycle` |

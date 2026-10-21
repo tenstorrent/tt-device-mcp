@@ -419,6 +419,47 @@ async def test_a_runner_timeout_owes_the_reset(runner_env):
     assert srv._kill_reset_debt().startswith("job 935")
 
 
+@pytest.mark.asyncio
+async def test_a_failed_job_that_left_the_clock_busy_owes_the_reset(runner_env, monkeypatch):
+    """A child killed from outside the broker: the job's shell exits a plain 1, but its chips still
+    read the busy AI clock, so it died with the device open and the gate resets first."""
+    monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: {"0": 1350, "1": 1350})
+    job, runner = await _start("936", "exit 1")
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.FAILED and job.exit_code == 1
+    debt = srv._kill_reset_debt()
+    assert debt.startswith("job 936 failed with 2 chip(s) left at the busy AI clock (max 1350 MHz)")
+    assert "kill_reset_owed" in runner_env["events"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command, busy, reset_killed",
+    [("exit 1", {}, False), ("true", {"0": 1350}, False), ("exit 1", {"0": 1350}, True)],
+    ids=["failed-idle-clock", "exit0-busy-clock", "our-reset-killed-it"],
+)
+async def test_no_clock_debt_for_a_closed_device_an_exit0_or_our_own_kill(
+    runner_env, monkeypatch, command, busy, reset_killed
+):
+    """An idle clock means the job closed the device (the forced pass stays); an exit-0 job is never
+    read and owes no reset; a death our own reset caused owes no second reset."""
+    reads = []
+    monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: reads.append(1) or dict(busy))
+    if reset_killed:
+        srv.reset_killed_job_ids.add("937")
+    job, runner = await _start("937", command)
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert srv._kill_reset_debt() == ""
+    if command == "true":
+        assert reads == [], "an exit-0 job's clock is never read"
+
+
 def _readopted_job(job_id, served_sec, timeout_sec):
     started = (srv.datetime.now() - srv.timedelta(seconds=served_sec)).isoformat()
     job = srv.Job(
