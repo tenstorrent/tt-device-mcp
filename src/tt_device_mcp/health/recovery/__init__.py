@@ -81,6 +81,11 @@ def bridge_reset_call_timeout() -> float:
     return 3 * 15 + SBR_RETRAIN_SETTLE_SEC + _base.PCI_SYSFS_WRITE_TIMEOUT_SEC + 10 + 5
 
 
+def _sysfs_rescan() -> None:
+    """The bare sysfs rescan write; pci_rescan bounds it."""
+    Path("/sys/bus/pci/rescan").write_text("1")
+
+
 # A surgical bridge reset fired seconds after a chip leaves the bus can lose the race with the
 # endpoint's link retrain and report failure, yet the same chip re-binds in ~2s once the link
 # settles. Retry a few times before giving up on it (see Recovery._recover_isolated_chips) — this
@@ -542,7 +547,7 @@ class Recovery(ABC):
                 # reset_chip_via_bridge waits before its own rescan.
                 await asyncio.sleep(SBR_RETRAIN_SETTLE_SEC)
                 try:
-                    await pci_rescan("bridge reset batch rescan")
+                    await pci_rescan("bridge reset batch rescan", _sysfs_rescan)
                 except (OSError, asyncio.TimeoutError) as e:
                     log(f"PCI rescan after the bridge reset could not run ({e})")
                 for _ in range(20):
@@ -686,7 +691,7 @@ class Recovery(ABC):
             # reboot or a chassis power cycle. A rescan re-enumerates it in about a second with no
             # downtime; both times it restored 8/8. Try it before anything that costs a tenant.
             try:
-                await pci_rescan("bare rescan of dead chips")
+                await pci_rescan("bare rescan of dead chips", _sysfs_rescan)
                 await asyncio.sleep(3)
             except (OSError, asyncio.TimeoutError) as e:
                 log(f"PCI rescan could not run ({e}); falling through to the heavier rungs")
