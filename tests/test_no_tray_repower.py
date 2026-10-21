@@ -137,21 +137,6 @@ async def test_the_last_chance_sweep_before_a_host_rung_has_no_tray_step(sweep_r
 
 
 @pytest.mark.asyncio
-async def test_the_tray_down_no_window_sweep_has_no_tray_step(sweep_rig, monkeypatch):
-    cycles = []
-
-    async def cycle(*a, **k):
-        cycles.append(a)
-        return True
-
-    monkeypatch.setattr(srv.galaxy_recovery, "_offbus_gated_power_cycle", cycle)
-    await srv.galaxy_recovery._fire_tray_down_no_window(
-        {str(i) for i in range(24, 32)}, 32, lambda m: None, gate_phase="post-job", ev=None
-    )
-    _assert_no_tray_step(sweep_rig)
-
-
-@pytest.mark.asyncio
 async def test_the_class_a_ten_minute_sweep_has_no_tray_step(sweep_rig, monkeypatch):
     monkeypatch.setattr(srv.galaxy_recovery.mechanism, "class_a_ladder_due", lambda *a, **k: True)
     out = await srv.galaxy_recovery._class_a_cooldown_sweep({str(i) for i in range(24, 32)}, 32, lambda m: None)

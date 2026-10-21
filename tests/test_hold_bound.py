@@ -56,7 +56,6 @@ def _watchdog(monkeypatch):
         monkeypatch.setattr(srv, name, value)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_cooldown_state", None)
-    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry_due", lambda *a, **k: False)
     monkeypatch.setattr(srv.offbus_power_cycle, "due_for_watchdog", lambda *a, **k: False)
 
 
@@ -229,8 +228,6 @@ async def test_another_run_inside_the_check_bound_does_not_cut_the_full_check_sh
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", recovered_ladder)
     monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: True)  # the check has no verdict yet
     monkeypatch.setattr(srv, "device_hold_escalation_kind", "ceiling_window")
-    await srv._force_escalate_stuck_hold()
-    monkeypatch.setattr(srv, "device_hold_escalation_kind", "progress_retry")
     await srv._force_escalate_stuck_hold()
     assert escalations == ["present-forced"] and "host_rung" not in events
 
@@ -1016,6 +1013,33 @@ def _real_host_rung(monkeypatch, cycles, allowed=lambda action: (True, "")):
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
 
 
+@pytest.mark.asyncio
+async def test_a_bound_cycle_that_cannot_launch_pages_once_and_is_asked_every_tick(monkeypatch, clear_job_state):
+    """Spec 04 I71/I76: at the bound, a power cycle that does not launch leaves the rung pending, so the
+    watchdog asks again each tick. Two failed launches in one episode give two cycle attempts and one
+    page; the hold stays and nothing releases it."""
+    why, detail, output, beats, _ladder = _KINDS["generic"]
+    _escalations, alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why=why, detail=detail, fabric_output=output, beats=beats, age_min=BOUND / 60 + 0.05
+    )
+    cycles = []
+    _real_host_rung(monkeypatch, cycles)
+
+    async def unlaunched(log, reason):
+        cycles.append("power_cycle")
+        return False
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", unlaunched)
+    monkeypatch.setattr(srv, "_bound_tenant_blocker", lambda *a: None)
+    for _ in range(2):
+        await srv._hold_bound_host_rung(BOUND + 1, lambda m: None)
+        assert srv._hold_bound_rung_pending, "a failed launch keeps the rung pending: asked again next tick"
+    assert cycles == ["power_cycle", "power_cycle"]
+    assert events.count("power_cycle_launch_failed_holding") == 2, "every failure is journaled"
+    assert [a["kind"] for a in alerts] == ["power_cycle_launch_failed_holding"], "one page per episode"
+    assert srv._recovery_degraded() and "device_released" not in events, "the hold stays"
+
+
 def _tick(seconds=10):
     srv._check_hold_deadline(now=datetime.now() + timedelta(seconds=seconds))
 
@@ -1534,7 +1558,6 @@ async def test_t3_a_77_on_the_boot_a_77_power_cycle_brought_up_still_gets_the_ne
         lambda boot: {"action": "power-cycle", "reason": galaxy.FABRIC_77_HOST_RUNG_CAUSE},
     )
     assert "this boot is the power-cycle" in g._fabric_77_host_rung_spent(srv.device_hold_episode_since)
-    assert not g.fabric_77_climb_owed(srv.device_hold_episode_since) or not g._fabric_77_cold_rung_due()
 
     srv._check_hold_deadline(now=datetime.now())
     await _drain()

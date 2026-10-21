@@ -384,17 +384,13 @@ def latched_mesh(monkeypatch, tmp_path, mesh):  # noqa: F811
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reboot, rung", [("0", "power-cycle"), ("1", "reboot")])
-async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
-    monkeypatch, latched_mesh, reboot, rung
-):
+async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(monkeypatch, latched_mesh):
     """I42: the idle relift resets the latched hold with no grace; the post-reset check runs the
     descriptor, the latched mismatch FAILS it (never withheld, never a lift), the last-chance sweep
     runs and the hold climbs to the host rung at once (spec 04 I79): bounded, never an open-ended
     hold. A later forced window asks for no second host rung and still releases nothing."""
     from tt_device_mcp.health.recovery import galaxy
 
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", reboot)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
 
@@ -402,13 +398,8 @@ async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
         cycles.append(reason)
         srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
 
-    async def host_reboot(log, reason):
-        latched_mesh["reboots"] += 1
-        srv.recovery_mechanism.host_action_requested = ("reboot", time.monotonic())
-
-    # Like the real rungs, each stand-in leaves its request pending.
+    # Like the real rung, the stand-in leaves its request pending.
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", host_reboot)
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
     latched_mesh["reset_heals"] = False
     await srv._attempt_idle_relift()
@@ -422,22 +413,20 @@ async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
     assert srv.fsm.state is not ServerState.HEALTHY, "a failed post-reset check never releases"
     assert "reset_ineffective" in latched_mesh["events"]
     assert "host_rung_not_deferred" in latched_mesh["events"], "the host rung follows the sweep at once"
-    fired = "reboot" if latched_mesh["reboots"] else "power-cycle" if cycles else None
-    assert fired == rung, f"the relift's ladder fires the {rung} rung"
+    assert len(cycles) == 1, "the relift's ladder fires the power cycle"
     # The ceiling: the hold-deadline watchdog's forced window asks for no second host rung.
     ceiling = galaxy._stuck_hold_ceiling_sec()
     since = datetime.now() - timedelta(seconds=ceiling + 1)
     monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
     await srv._force_escalate_stuck_hold()
-    assert latched_mesh["reboots"] + len(cycles) == 1, "the host rung is asked for once"
+    assert len(cycles) == 1, "the host rung is asked for once"
     assert srv.fsm.state is not ServerState.HEALTHY, "no release without a passing full check"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dirty", [True, False])
-@pytest.mark.parametrize("reboot, rung", [("0", "power-cycle"), ("1", "reboot")])
 async def test_a_latched_hold_no_relift_reset_takes_the_ladder_at_the_ceiling(
-    monkeypatch, tmp_path, mesh, dirty, reboot, rung  # noqa: F811
+    monkeypatch, tmp_path, mesh, dirty  # noqa: F811
 ):
     """I42 with the 10-min bound: a real lift leaves the validator's mismatch line in the last fabric
     output, and its first job latches the fault. When no idle relift reset has run first (the device
@@ -451,14 +440,16 @@ async def test_a_latched_hold_no_relift_reset_takes_the_ladder_at_the_ceiling(
     assert ok is not False and srv._TOPOLOGY_VALIDATOR_LINE in (m.last_fabric_output or ""), "a real lift"
     dfr.fsm_dirty(srv, f"job 7: {_latch(m)}", why=srv.FABRIC_RELIFT_WHY, dirty=dirty)
     assert srv._fabric_no_reset_hold() == "", "a latched fault is measured: never a no-reset hold"
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", reboot)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
 
     async def power_cycle(log, reason):
         cycles.append(reason)
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
 
+    # Like the real rung, the stand-in leaves its request pending.
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
     mesh["reset_heals"] = False
     ceiling = galaxy._stuck_hold_ceiling_sec()
     since = datetime.now() - timedelta(seconds=ceiling + 1)
@@ -467,8 +458,7 @@ async def test_a_latched_hold_no_relift_reset_takes_the_ladder_at_the_ceiling(
     assert "hold_deadline_no_reset" not in mesh["events"], "the ceiling never parks a latched hold"
     assert mesh["resets"] and all(r == ["tt-smi", "-glx_reset"] for r in mesh["resets"]), "the present-mesh rung"
     assert mesh["verifies"][-1] is True and mesh["fabric"][-1][0] is False, "the full post-reset check fails"
-    fired = "reboot" if mesh["reboots"] else "power-cycle" if cycles else None
-    assert fired == rung, f"the same window fires the {rung} rung once the ladder's check fails"
+    assert len(cycles) == 1, "the same window fires the power cycle once the ladder's check fails"
     assert srv.fsm.state is not ServerState.HEALTHY, "no release without a passing full check"
 
 
@@ -493,7 +483,6 @@ async def test_replay_a_held_77_whose_bound_ladder_leaves_a_port_missing_power_c
         dfr.fsm_dirty(srv, "post-job: fabric unverified (rc 77)", why=srv.FABRIC_RELIFT_WHY)
     mesh["descriptor_out"] = _LOST
     mesh["reset_heals"] = False
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
 
@@ -512,7 +501,7 @@ async def test_replay_a_held_77_whose_bound_ladder_leaves_a_port_missing_power_c
     assert mesh["calls"][-1] == ["run_cluster_validation"], "even though the traffic-only rerun passed"
     assert srv.fsm.state is not ServerState.HEALTHY, "a failed post-ladder check never releases"
     assert "device_released" not in mesh["events"]
-    assert mesh["reboots"] == 0 and len(cycles) == 1, "exactly one power cycle is asked for"
+    assert len(cycles) == 1, "exactly one power cycle is asked for"
     await srv._force_escalate_stuck_hold()
     assert len(cycles) == 1, "no second power cycle while the first is pending"
     assert srv.fsm.state is not ServerState.HEALTHY and "device_released" not in mesh["events"]
@@ -565,7 +554,6 @@ async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_o
     the full check with the descriptor. Only its pass releases (and ends the latch); a
     failed check never releases and the ladder climbs to the host rung at once."""
     _idle_queue(monkeypatch)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
 
@@ -618,7 +606,6 @@ async def test_a_paced_present_rung_does_not_spend_the_dirty_latched_idle_gate(m
     from tt_device_mcp.health.recovery import galaxy
 
     _idle_queue(monkeypatch)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
 

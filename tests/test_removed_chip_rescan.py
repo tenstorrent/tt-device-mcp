@@ -493,21 +493,6 @@ def test_a_record_clears_when_its_address_is_enumerated_again(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_removed_chip_that_stays_off_bus_keeps_the_no_window_class(tmp_path, monkeypatch, rung, galaxy_trays):
-    """A hold whose only cause is a removed chip keeps its off-bus class: every recorded-bridge SBR
-    fired and the chip stayed off the bus, the same no-window fact as no_bridge, so the hold is not
-    GENERIC and does not take the generic budget."""
-    bus = FakeBus(tmp_path, monkeypatch, come_back=False)
-    bus.remove("13")
-    assert await _run({"13"}) is False
-    reasons = srv.galaxy_recovery.last_bridge_reset_reasons
-    assert reasons["13"] == {"reason": recovery_pkg.NO_WINDOW_REMOVED_REASON}
-    tray = {str(i) for i in range(8, 16)}
-    window = {c: {"reason": "no_bridge"} for c in tray} | {"13": reasons["13"]}
-    assert galaxy._classify_hold(tray, 32, window, galaxy_trays) == galaxy.HOLD_CLASS_TRAY_DOWN_NO_WINDOW
-
-
-@pytest.mark.asyncio
 async def test_the_removed_chip_rung_worst_case_for_two_chips(tmp_path, monkeypatch, rung):
     """The N-chip bound: the first pass asserts each chip's SBR (0.1 s each), then one 1 s retrain
     settle and one 10 s re-bind poll before the batched rescan; the retries then run serially per

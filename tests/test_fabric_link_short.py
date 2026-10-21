@@ -198,14 +198,13 @@ async def test_a_rehold_of_another_class_after_a_carried_at_start_ladder_asks_fo
 
 
 async def _opted_out_or_denied(monkeypatch, escalations, events, how):
-    """The real host rung, with both host rungs opted out or the power cycle denied for a reason that is
+    """The real host rung, with the power cycle (the only host rung) opted out or denied for a reason that is
     not the cooldown (a stand-back check)."""
     monkeypatch.setattr(srv, "_hold_bound_host_rung", _REAL_HOST_RUNG)
     monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
     monkeypatch.setattr(srv, "_bound_tenant_blocker", lambda *a: None)
     monkeypatch.setattr(srv.recovery_mechanism, "_journal_auto_recovery_denied", lambda *a: None)
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: how == "denied")
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(
         srv.recovery_mechanism, "auto_recovery_allowed", lambda action, **k: (False, "another host action stands")
     )
@@ -226,7 +225,7 @@ async def test_an_at_start_ladder_whose_host_rung_never_fired_does_not_stand_in_
 ):
     """The at-start ladder is a forced run below the
     bound. When the host rung after it was never granted, the full ladder still runs at the 10-min mark,
-    and the later windows follow I76 as for any hold (a ladder each window when both host rungs are opted
+    and the later windows follow I76 as for any hold (a ladder each window when the power cycle is opted
     out; a denied rung stays pending and is asked again each tick)."""
     escalations, _alerts, events = _arm(monkeypatch, hold)
     await _opted_out_or_denied(monkeypatch, escalations, events, how)
@@ -254,7 +253,7 @@ async def test_a_latched_hold_whose_power_cycle_is_denied_reruns_the_full_ladder
     bound's. A power cycle the governor then denies for a reason other than the cooldown (another host
     action stands) arms no retry: the rung stays pending and is asked each tick. That never stands in for
     the 10-min mark: the hold's full ladder runs again there, the same gentlest-first ladder (no host step
-    of its own: no reboot, no cycle inside it), with the latch kept. Its full check decides: a failing one
+    of its own: no cycle inside it), with the latch kept. Its full check decides: a failing one
     keeps the hold and asks for the power cycle again; only a passing one lets the hold lift."""
     escalations, _alerts, events = _arm(monkeypatch, "latched")
     await _opted_out_or_denied(monkeypatch, escalations, events, "denied")
@@ -273,12 +272,8 @@ async def test_a_latched_hold_whose_power_cycle_is_denied_reruns_the_full_ladder
             monkeypatch.setattr(srv, "_recovery_degraded", lambda: False)  # the full check passed
         return OUTCOME_RECOVERED
 
-    async def no_reboot(log, reason):
-        raise AssertionError("the 10-min ladder never reboots the host")
-
     monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", ladder)
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", no_reboot)
     await _walk(clock, 0, BOUND - 20)
     assert escalations == ["present-forced"], "the one at-start ladder below the 10-min mark"
     assert asks and all(a == "power-cycle" for a, _ in asks), "the power cycle is asked after it"

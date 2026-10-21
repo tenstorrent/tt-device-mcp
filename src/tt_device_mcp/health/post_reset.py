@@ -4,7 +4,7 @@
 """The post-reset fabric debt: no reset releases the device until a fabric pass has passed since.
 
 Every reset action (a ``tt-smi -r`` or ``glx_reset`` through ``reset_with_quiesce``, a reset this
-broker adopted from a foreign scope, a bridge chip reset, a UBB tray reset or re-power, a PCI
+broker adopted from a foreign scope, a bridge chip reset, a PCI
 rescan) and every broker start marks the debt owed. Only a fabric pass that returns a healthy
 verdict settles it; a 77 (the pass could not run) or a failure leaves it owed.
 

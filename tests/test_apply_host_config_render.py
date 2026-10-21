@@ -146,17 +146,21 @@ def test_cold_rung_knobs_unset_render_no_line(tmp_path):
 
 
 def test_cold_rung_knobs_set_reach_the_unit(tmp_path):
-    # A host that arms the top of the cascade: the /etc/default opt-ins must reach the unit under the
-    # names server.py reads, before ExecStart so they are in the broker's env — otherwise the cold
+    # A host that arms the top of the cascade: the /etc/default opt-in must reach the unit under the
+    # name server.py reads, before ExecStart so it is in the broker's env — otherwise the cold
     # rung is unreachable in the deployed config and an all-off-bus mesh holds with no recovery path.
-    opted = dict(_GALAXY, TTDEV_AUTO_REBOOT="1", TTDEV_AUTO_POWER_CYCLE="1")
-    unit = _render(tmp_path, opted)
-    reboot = "Environment=TT_DEVICE_MCP_AUTO_REBOOT=1"
+    unit = _render(tmp_path, dict(_GALAXY, TTDEV_AUTO_POWER_CYCLE="1"))
     power = "Environment=TT_DEVICE_MCP_AUTO_POWER_CYCLE=1"
-    assert reboot in unit
     assert power in unit
-    assert unit.index(reboot) < unit.index("ExecStart=")
     assert unit.index(power) < unit.index("ExecStart=")
+
+
+def test_a_stale_reboot_setting_renders_no_line(tmp_path):
+    # Spec 04 I71: the warm host reboot rung is gone, with no switch left. A TTDEV_AUTO_REBOOT still
+    # in an old /etc/default file renders nothing into the unit.
+    unit = _render(tmp_path, dict(_GALAXY, TTDEV_AUTO_REBOOT="1", TTDEV_AUTO_POWER_CYCLE="1"))
+    assert "AUTO_REBOOT" not in unit
+    assert "POST_REBOOT_VERIFY" not in unit
 
 
 def test_a_stale_ubb_reset_setting_renders_no_line(tmp_path):
