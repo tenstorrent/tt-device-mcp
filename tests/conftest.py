@@ -399,6 +399,17 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     _redirect_probe_caches(monkeypatch, tmp_dirs, device_marked, device_probe_cache_root)
     health_tmp = tmp_dirs.mktemp("health")
     monkeypatch.setattr(health, "HEALTH_DIR", health_tmp)
+    # Spec 04 I91: a mesh reset's BMC preflight runs `ipmitool mc info`; ipmitool is never spawned
+    # by the suite, so every test sees a healthy BMC unless it patches its own answer.
+    from tt_device_mcp.health.recovery import ipmi_guard
+
+    monkeypatch.setattr(
+        ipmi_guard,
+        "_run_mc_info",
+        lambda timeout: subprocess.CompletedProcess(
+            ["ipmitool", "mc", "info"], 0, "Firmware Revision : 0.05\nAux Firmware Rev Info : 0x23 0x00 0x00 0x00\n", ""
+        ),
+    )
     monkeypatch.setattr(heartbeat, "_heartbeat_supported", None)
     # raising=False so a base tree without the re-arm latch (a fails-on-base stash) still sets up.
     monkeypatch.setattr(heartbeat, "_heartbeat_absent_journaled", False, raising=False)
