@@ -543,10 +543,10 @@ def _witness(monkeypatch, *, clean, ok=True, why="", status=None):
     return made
 
 
-async def _preempt(monkeypatch, job_id, command, *, kill_grace):
+async def _preempt(monkeypatch, job_id, command, *, kill_grace, while_running=None):
     """Run a preemptable job past its 1 s limit with a job waiting, through the minute (1 s here)
-    and the kill, and let the runner reach the post-job gate. Returns the job, the signals sent,
-    the gate's calls and the dirty marks."""
+    and the kill, and let the runner reach the post-job gate. ``while_running`` is called once the
+    job runs. Returns the job, the signals sent, the gate's calls and the dirty marks."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     gate = _recording_post_job_gate(monkeypatch)
@@ -563,6 +563,8 @@ async def _preempt(monkeypatch, job_id, command, *, kill_grace):
     runner = asyncio.create_task(srv.job_runner())
     try:
         await _until_running(job)
+        if while_running is not None:
+            while_running()
         _waiting_job()
         await _until_finished(job, limit_sec=15)
         for _ in range(20):
@@ -612,19 +614,23 @@ async def test_a_preempted_job_that_returns_0_on_sigterm_gets_no_check_and_no_re
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("held", ["debt"])
+@pytest.mark.parametrize("held", ["held", "debt"])
 async def test_a_preempted_exit_0_on_a_held_or_owing_device_keeps_its_gate(monkeypatch, clear_job_state, held):
-    """The exit-0 skip never lifts a hold: a device already held, or owing an I69 reset for another
-    reason, still goes through the post-job gate, where only a passing full check releases it."""
+    """The exit-0 skip never lifts a hold: a device held while the job ran, or owing an I69 reset
+    for another reason, still goes through the post-job gate, where only a passing full check
+    releases it."""
     srv._clear_device_dirty()
     fsm_healthy(srv)
-    if held == "dirty":
-        srv.fsm.on_fault("probe_unhealthy", detail="earlier fault")
-        assert srv.fsm.state is not ServerState.HEALTHY
+    hold = None
+    if held == "held":
+        # Held during the job: a hold from before it would be cleared (or the job refused) at the door.
+        def hold():
+            srv.fsm.on_fault("probe_unhealthy", detail="fault while the job ran")
+            assert srv.fsm.state is not ServerState.HEALTHY
     else:
         monkeypatch.setattr(srv, "_kill_reset_debt", lambda: "job 1 timeout")
     _witness(monkeypatch, clean=True, status=0)
-    job, sent, gate, dirty, owed = await _preempt(monkeypatch, "967", "sleep 60", kill_grace=5)
+    job, sent, gate, dirty, owed = await _preempt(monkeypatch, "967", "sleep 60", kill_grace=5, while_running=hold)
     assert job.preempt_clean is True and job.preempt_exit_status == 0
     assert gate and gate[-1] == {"job_failed": False}, f"the post-job gate was skipped on a held device: {gate}"
 
