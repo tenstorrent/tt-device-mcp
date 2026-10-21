@@ -178,7 +178,13 @@ from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
 from tt_device_mcp.job_preflight import preflight_output_dirs
-from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
+from tt_device_mcp.job_reap import (
+    JOB_TAG_ENV,
+    ReapedLeftover,
+    _leftover_state,
+    find_reaped_leftovers,
+    reap_job_survivors,
+)
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
     SpoolTail,
@@ -190,6 +196,7 @@ from tt_device_mcp.job_spool import (
     sweep_job_spools,
 )
 from tt_device_mcp.peercred import username_for_uid
+from tt_device_mcp.pre_reset_scan import clear_device_readers
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
 from tt_device_mcp.socket_transport import (
     PeerCredMiddleware,
@@ -1228,6 +1235,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         chip_state.publish()
         _reload_removed_chips()
         recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
+        recovery_mechanism.pre_reset_scan = _pre_reset_holder_scan
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
         )
@@ -1757,6 +1765,12 @@ readopted_scopes: dict[str, str] = {}  # job_id -> scope unit, for jobs re-adopt
 # pid -> (job id, starttime) of each process a job's sweep left alive holding the device. The
 # leftover fence (01 I16) names these; a privsep leftover is also found by its job's scope cgroup.
 reaped_survivors: dict[int, tuple[str, str]] = {}
+# Spec 04 I92: what the last pre-reset holder scan refused a reset for (a tenant under an automatic
+# reset, or a reader that would not let go), for /health's ``pre_reset_blocked_by``; None once a scan
+# finds the device clear.
+_pre_reset_blocker: Optional[dict] = None
+# The job id an unkillable pre-reset reader is fenced under (01 I16, 04 I70): it belongs to no job.
+PRE_RESET_READER_JOB = "pre-reset-reader"
 # The leftovers the current fence episode names ('' when no fence stands): the operator hint is
 # emitted once per episode, not on every scan.
 _leftover_fence_detail: str = ""
@@ -2648,7 +2662,7 @@ def _reset_for_testing():
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant, _hold_carry, _hold_carry_loaded
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
-    global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at
+    global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at, _pre_reset_blocker
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
     global device_op_stage_started_at, device_held_since, device_hold_escalated_monotonic
     global device_hold_deadline_bucket, device_hold_alert_next_bucket, device_hold_alert_gap
@@ -2660,6 +2674,7 @@ def _reset_for_testing():
     global _hold_bound_episode, _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_cycle_age
     global _hold_bound_check_failed_age, _hold_bound_unarmed_paged, _hold_bound_rung_pending
     global _hold_bound_denied_why, _hold_bound_tenant_paged, _hold_bound_tenant_blocker
+    _pre_reset_blocker = None
     job_queue = None
     lock = None
     _action_row = None
@@ -8026,6 +8041,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         payload.update(_hold_report(now))
     # Spec 04 I70: an unkillable leftover fencing every reset, with its deadline and rung stage.
     payload["leftover_fence"] = _leftover_fence_payload()
+    # Spec 04 I92: the tenant or reader the last pre-reset holder scan refused a reset for.
+    payload["pre_reset_blocked_by"] = _pre_reset_blocker
     return payload
 
 
@@ -9774,6 +9791,77 @@ async def _escalate_unkillable_leftover() -> None:
     except Exception:  # noqa: BLE001 - a detached task must never raise unretrieved
         if logger:
             logger.exception("LEFTOVER-HOST-RUNG try failed — retrying next window")
+
+
+async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
+    """The broker's pre-reset holder scan (spec 04 I92), run by every reset with the pollers stopped.
+
+    Clears every reader that is not a tenant (SIGTERM, 10 s, SIGKILL, then the I67 release wait) and
+    returns why the reset must not run, or ''. An automatic reset (owner ``[broker]...``) refuses to
+    run under a tenant and names it in the journal and /health; an operator reset's own gate already
+    ruled on tenants. A reader stuck in the kernel is fenced as a leftover (01 I16), so the
+    J-unkillable clock (04 I70) takes it to the host rung. Every scan emits ``pre_reset_holder_scan``."""
+    global _pre_reset_blocker
+    automatic = (owner or "").startswith("[broker]")
+    job = current_process
+    protected = [job.pid] if job is not None and job.returncode is None and job.pid else []
+    result = await clear_device_readers(tenants_block=automatic, protected=protected)
+    refused = result.refusal()
+    health_event(
+        "pre_reset_holder_scan",
+        argv=list(argv),
+        owner=owner,
+        outcome=result.outcome,
+        found=result.found,
+        killed=result.killed,
+        tenants=result.tenants,
+        unkillable=result.unkillable,
+        survivors=result.survivors,
+        detached=result.detached,
+        undetached=result.undetached,
+        scan_complete=result.scan_complete,
+        source=result.source,
+        seconds=result.seconds,
+        error=result.error or None,
+    )
+    if result.detached:
+        msg = f"pre-reset: chips {', '.join(result.detached)} off the bus, detached before their readers were killed"
+        log(msg)
+        if logger:
+            logger.warning(msg)
+    for row in result.killed:
+        msg = (
+            f"pre-reset: {row['signal']} to device reader pid {row['pid']} ({row['user']}, {row['comm']}) "
+            f"before {' '.join(argv)}; {'released' if row['released'] else 'still holding'}"
+        )
+        log(msg)
+        if logger:
+            logger.warning(msg)
+    if result.unkillable:
+        for row in result.unkillable:
+            start = _leftover_state(row["pid"])[1] or row.get("starttime") or ""
+            reaped_survivors[row["pid"]] = (PRE_RESET_READER_JOB, start)
+        # Opens the leftover fence episode and the I70 unkillable clock now, not at the next scan.
+        _reaped_leftovers()
+    if not refused:
+        _pre_reset_blocker = None
+        return ""
+    since = (_pre_reset_blocker or {}).get("since") or datetime.now().isoformat(timespec="seconds")
+    _pre_reset_blocker = {
+        "blocker": "tenant" if result.outcome == "tenant_blocked" else result.outcome,
+        "since": since,
+        "owner": owner,
+        "argv": list(argv),
+        "holders": (
+            result.tenants
+            if result.outcome == "tenant_blocked"
+            else (result.readers_left or result.unkillable or result.survivors)
+        ),
+        "reason": refused,
+    }
+    if logger:
+        logger.error(f"pre-reset holder scan refused {' '.join(argv)} ({owner}): {refused}")
+    return refused
 
 
 def _leftover_fence_payload() -> Optional[dict]:

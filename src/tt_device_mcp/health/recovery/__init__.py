@@ -492,6 +492,19 @@ class Recovery(ABC):
                 "removed is still un-reset"
             )
             health_event("host_reset_gated", context="bridge_reset", chips=targets, reason=why, host_at_risk=True)
+        # Spec 04 I92: every reset journals its pre-reset holder scan. This one needs none: each target
+        # was cut out of the kernel (detached), so no process can map it and closing a holder's fd
+        # makes the driver send it nothing. Killing readers here would only stop the device pollers'
+        # reads of the chips that stay on the bus.
+        if sbr and not gated:
+            health_event(
+                "pre_reset_holder_scan",
+                argv=["bridge-reset", *targets],
+                owner="[broker]bridge-reset",
+                outcome="targets_detached",
+                chips=targets,
+                seconds=0.0,
+            )
         # Spec 04 I69: a chip the broker removed is still hung, and any rescan this pass would
         # re-enumerate it for the driver to probe. So reset every one of them through its recorded
         # bridge first, then rescan once. If any cannot be reset, no rescan runs this pass at all

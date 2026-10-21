@@ -75,6 +75,11 @@ PREEMPT_GRACE_SEC = 60
 # full check.
 PREEMPT_KILL_GRACE_SEC = 10
 
+# Before any reset, a process other than a tenant that still maps the device gets SIGTERM and
+# this long to let go before SIGKILL (spec 04 I92): the same 10 s a preempted job's handlers get.
+# A reader that keeps its mapping through a reset reads chips that are off the bus.
+PRE_RESET_TERM_GRACE_SEC = PREEMPT_KILL_GRACE_SEC
+
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
 # is deliberately never killed, because one stopped partway through 32 ASICs is far worse

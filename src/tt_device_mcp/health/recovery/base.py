@@ -503,6 +503,11 @@ class RecoveryMechanism:
         # 01 I16): a reaped job's process still holding the device, which a reset cannot free.
         # Checked here, where every reset passes, so no caller can reset over one.
         self.reset_fence: Optional[Callable[[], str]] = None
+        # Clears the device of readers right before a reset (spec 04 I92): scans the holders,
+        # SIGTERMs then SIGKILLs every one that is not a tenant, and returns why the reset must not
+        # run ('' when it may): a tenant under an automatic reset, or a reader that would not let
+        # go. The broker sets it; called with (argv, owner, log).
+        self.pre_reset_scan: Optional[Callable[[list, str, Callable[[str], None]], Awaitable[str]]] = None
         # Owes the pollers a step left stopped to the broker's next close to HEALTHY (spec 03 I66,
         # 04 I12); the broker sets it. Called with what the step was.
         self.owe_device_pollers: Optional[Callable[[str], None]] = None
@@ -1180,6 +1185,12 @@ class RecoveryMechanism:
         # And it leaves the fabric unproven: no release until a fabric pass passes (post_reset).
         FABRIC_DEBT.note_reset(" ".join(argv))
         quiesced = await self._set_device_pollers(False, log)
+        # With our own pollers stopped, nothing else may map the device either (spec 04 I92).
+        refused = await self.clear_readers_before_reset(argv, owner, log)
+        if refused:
+            log(f"reset refused: {refused}")
+            await self.restore_pollers(quiesced, log, ok=False, after="reset refused: pre-reset holder scan")
+            return None, f"reset refused: {refused}"
         # A reset takes the chips off the bus — that is what it does — so for its duration they
         # read all-ones exactly like a dead chip. Without this flag the sampler isolates them
         # mid-reset and tears the endpoints out of the kernel, which is how a healthy host ended
@@ -1271,6 +1282,22 @@ class RecoveryMechanism:
         # (sampler, /health) read no chip, and only this step's own reads reach them.
         self._reset_in_flight = bool(on)
         chip_state.set_recovering(f"op:{id(self)}", bool(on))
+
+    async def clear_readers_before_reset(self, argv: list, owner: str, log) -> str:
+        """Run the broker's pre-reset holder scan (spec 04 I92); why the reset must not run, or ''.
+
+        ``reset_with_quiesce`` calls it with the device pollers already stopped, so the mesh reset, the
+        sweep and the operator reset all pass it. (The bridge rung only resets chips already cut out
+        of the kernel, and journals that instead.) A scan that raises lets the reset run, as it did before the scan existed: recovery
+        must not stop on a scan bug, and the reset's own gates still apply."""
+        if self.pre_reset_scan is None:
+            return ""
+        try:
+            return await self.pre_reset_scan(list(argv), owner, log) or ""
+        except Exception as e:  # noqa: BLE001 - see above
+            log(f"pre-reset holder scan failed, reset proceeds: {e!r}")
+            health_event("pre_reset_holder_scan", argv=list(argv), owner=owner, outcome="scan_error", error=repr(e))
+            return ""
 
     async def restore_pollers(self, quiesced: list, log, *, ok: bool, after: str) -> None:
         """Start the device pollers a reset step stopped, but only after a step that completed
