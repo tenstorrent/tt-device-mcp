@@ -8180,7 +8180,11 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global _hold_startup_deferred
     if reason and not device_hold_logged and _startup_hold_behind_readopted_job():
         return  # spec 03 I75: the device is the re-adopted job's; the hold's clock starts at its end
-    _hold_startup_deferred = False  # a hold opens now, or the device passed: the deferral is over
+    # A hold opens now, or the device passed: the deferral is over. It ended at the jobs' end, when the
+    # startup gate took the device; the gate's own run (a device op no sampler verdict reads) counts in
+    # the hold's 10-min clock, so a hold its failing verdict opens dates back to then (spec 03 I75).
+    deferred_until = _startup_verify_ready_wall if _hold_startup_deferred else None
+    _hold_startup_deferred = False
     if reason and not device_hold_logged:
         device_hold_logged = True
         # Prefer a start this box already recorded: if the device was still held across a restart,
@@ -8201,7 +8205,8 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         startup = startup and not tenant
         carry = None if tenant or startup else _take_hold_carry()
         deferred = _load_hold_carry() if startup else None
-        starts = [s for s in (restored, str(carry["since"]) if carry else "") if s]
+        jobs_end = _wall_iso(min(deferred_until, time.time())) if deferred_until is not None else ""
+        starts = [s for s in (restored, str(carry["since"]) if carry else "", jobs_end) if s]
         device_hold_episode_since = min(starts, key=datetime.fromisoformat) if starts else row_since
         if restored and carry is None and device_hold_episode_since == restored:
             ladder_age = _recorded_hold_bound_ladder_age(restored)  # read before the rewrite below

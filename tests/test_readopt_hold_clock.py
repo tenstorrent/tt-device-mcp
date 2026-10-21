@@ -65,7 +65,8 @@ def _readopted_job(monkeypatch, tmp_path, job_id="960"):
     monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
     monkeypatch.setattr(srv, "_device_liveness_reason", lambda: "")
     monkeypatch.setattr(srv, "_startup_verify_ready_at", None)
-    monkeypatch.setattr(srv, "_hold_startup_deferred", False)
+    monkeypatch.setattr(srv, "_startup_verify_ready_wall", None)
+    monkeypatch.setattr(srv, "_hold_startup_deferred", False, raising=False)
     job = _job(tmp_path, job_id, "pytest")
     job.status = srv.JobStatus.RUNNING
     job.queued_at = job.started_at = datetime.now().isoformat()
@@ -81,6 +82,7 @@ async def _job_ends(tmp_path, job, exit_code="0"):
     await srv._monitor_readopted_scope(job.id, f"ttdev-job-{job.id}.scope")
     assert not srv.readopted_scopes
     srv._startup_verify_ready_at = time.monotonic()
+    srv._startup_verify_ready_wall = time.time()
 
 
 def _restarted_over_a_live_job(monkeypatch, tmp_path):
@@ -213,31 +215,51 @@ async def test_the_jobs_end_opens_a_fresh_hold_that_only_a_full_check_with_fabri
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("gate_sec", [60, 400])
 async def test_a_failed_startup_gate_after_the_job_gets_the_bound_ladder_by_600_s_after_its_end(
-    rig, monkeypatch, tmp_path, clear_job_state  # noqa: F811
+    rig, monkeypatch, tmp_path, clear_job_state, gate_sec  # noqa: F811
 ):
-    """The re-adopted job ran 25 min, then the startup gate's full check failed. The hold's clock counts from
-    the job's end: no ladder before the 10-min mark, the broker's own full ladder at it, and when the full
-    check with fabric after it still fails, one power-cycle request. Nothing releases the hold."""
+    """The re-adopted job ran 25 min, then the startup gate took the device: its hugepage wait and full
+    check run as a device op, which the sampler's verdict skips, and the check fails ``gate_sec`` later.
+    The hold's clock still counts from the job's end, not from that failing verdict: no ladder before the
+    10-min mark, the broker's own full ladder at it, and when the full check with fabric after it still
+    fails, one power-cycle request. Nothing releases the hold. Fails on a clock that starts at the
+    gate's verdict: the hold is ``gate_sec`` short of the bound at the job's end + 600 s."""
     order = rig["order"]
     job = _restarted_over_a_live_job(monkeypatch, tmp_path)
     for minutes in (0, 25):
         srv._note_tenant_gate_verdict(STARTUP)
         srv._check_hold_deadline(now=datetime.now() + timedelta(minutes=minutes))
     assert not srv.device_hold_logged
+    real_datetime, offset = srv.datetime, [0.0]
+
+    class _Clock(real_datetime):  # the broker's wall clock, ``offset`` seconds past the job's end
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime.now(tz) + timedelta(seconds=offset[0])
+
+    monkeypatch.setattr(srv, "datetime", _Clock)
 
     await _job_ends(tmp_path, job)
-    srv._note_tenant_gate_verdict(STARTUP)
-    since = srv.device_hold_episode_since
-    assert srv.device_hold_logged and _age() < 60
-    checks = _bound_hold_with_a_failing_full_check(rig, monkeypatch)  # the startup gate's check failed
-    monkeypatch.setattr(srv, "device_hold_episode_since", since)
+    monkeypatch.setattr(srv, "device_op_active", True)  # the startup gate's hugepage wait and full check
+    srv._refresh_idle_hold_ledger()  # a sampler tick while the gate runs
+    assert not srv.device_hold_logged, "no verdict while the gate holds the device"
 
-    _tick(BOUND - 60)
+    offset[0] = gate_sec
+    checks = _bound_hold_with_a_failing_full_check(rig, monkeypatch)  # the startup gate's check failed
+    monkeypatch.setattr(srv, "device_hold_episode_since", "")
+    monkeypatch.setattr(srv, "device_op_active", False)
+    srv._refresh_idle_hold_ledger()  # the gate's failing verdict opens the hold
+    assert srv.device_hold_logged and _age() >= gate_sec - 1, "the clock counts from the job's end"
+
+    offset[0] = BOUND - 60
+    srv._refresh_idle_hold_ledger()
     await _drain()
     assert "glx_reset" not in order and "power_cycle" not in order, "the 10-min mark is not reached yet"
 
-    _tick(BOUND + 1)
+    offset[0] = BOUND + 1
+    assert _age() >= srv._hold_bound_sec(), "the job's end + 600 s is the 10-min mark"
+    srv._refresh_idle_hold_ledger()
     await _drain()
     assert "glx_reset" in order, "the full ladder ran at the 10-min mark after the job's end"
     assert checks and all(checks), "the check after the ladder is the full one, fabric included"
