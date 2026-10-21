@@ -14042,6 +14042,49 @@ async def test_a_bridge_less_chip_is_rescanned_before_anything_destructive(monke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", ["bridge reset", "bare rescan"])
+async def test_an_isolated_chip_rung_blocked_in_the_kernel_fails_in_bounded_time(monkeypatch, blocked):
+    """A PCI remove blocked in the kernel holds the rescan/remove lock, so a bridge reset (its own
+    rescan) or a bare rescan behind it never returns. Each must give up at its bound, be journaled
+    and count as the rung failing, so the hold goes on to its next rung and the power cycle."""
+    import threading
+
+    events = []
+    kernel_lock = threading.Event()
+    monkeypatch.setattr(srv, "isolated_chips", {"0"})
+    monkeypatch.setattr(srv, "device_pci_map", {"0": "0000:61:00.0"})
+    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+    monkeypatch.setattr(recovery_base, "PCI_SYSFS_WRITE_TIMEOUT_SEC", 0.2)
+    monkeypatch.setattr(recovery_pkg, "bridge_reset_call_timeout", lambda: 0.2)
+
+    def bridge(idx, bdf):
+        if blocked == "bridge reset":
+            kernel_lock.wait(30)
+        return None  # no bridge: the bare rescan rung follows
+
+    class BlockedPath:
+        def __init__(self, p):
+            self.p = str(p)
+
+        def write_text(self, v):
+            kernel_lock.wait(30)
+
+        def exists(self):
+            return False
+
+    monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", bridge)
+    monkeypatch.setattr(recovery_pkg, "Path", BlockedPath)
+    t0 = time.monotonic()
+    try:
+        ok = await asyncio.wait_for(srv.galaxy_recovery._recover_isolated_chips(lambda *a, **k: None), 10)
+    finally:
+        kernel_lock.set()  # free the worker threads
+    assert not ok and time.monotonic() - t0 < 5
+    assert ("bridge_reset_failed" if blocked == "bridge reset" else "pci_rescan_timeout") in events
+
+
+@pytest.mark.asyncio
 async def test_prejob_dispatch_probe_holds_a_mesh_that_cannot_run_a_kernel(monkeypatch, tmp_path):
     """The gap that admitted job 142: an UNFLAGGED device skips the pre-job gate entirely, and
     every check it would have run passes on a mesh that cannot dispatch — enumeration and the ARC
