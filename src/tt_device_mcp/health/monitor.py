@@ -584,7 +584,13 @@ class HealthMonitor:
             reset_due = (
                 eth_timeout_reset and not fabric_asked and eok is None and eth_read_timed_out(edetail) and hp_ok is True
             )
-            if link_drop_held and log:
+            if link_drop_held and log and self.last_fabric_skipped:
+                # A 77 since the green pass (it leaves last_fabric_ok alone) reached no verdict: no cover.
+                log(
+                    "eth links unverified after a clean exit — the last fabric pass reached no verdict, so "
+                    "the fabric stays unverified; any fabric-unverified hold stands until a pass returns healthy"
+                )
+            elif link_drop_held and log:
                 log(
                     "eth links unverified after a clean exit — a recent passing fabric pass covers it, not repeating it"
                 )

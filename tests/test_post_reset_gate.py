@@ -778,8 +778,8 @@ async def test_the_gate_ladders_last_chance_sweep(mesh, monkeypatch, galaxy_tray
     ],
 )
 def test_no_rung_outcome_lifts_a_fabric_unverified_hold(mesh, owed, outcome, expect):
-    """The gate, the idle relift and the hold escalation fold a rung's outcome through one helper, so
-    none of them reopens the door the release funnel held (I32), nor parks a 77-only hold in DOWN."""
+    """The gate, the idle relift, the dirty idle gate and the hold escalation fold a rung's outcome through one
+    helper, so none of them reopens the door the release funnel held (I32), nor parks a 77-only hold in DOWN."""
     if owed:
         FABRIC_DEBT.note_reset("tt-smi -glx_reset")
     srv._hold_device_fabric_unverified("fabric check exited 77")
@@ -804,7 +804,7 @@ def test_every_rung_outcome_folds_through_the_helper():
     src = inspect.getsource(srv)
     body = src.replace(inspect.getsource(srv._fold_rung_outcome), "")
     assert "fsm.on_outcome(" not in body, "a rung outcome folded around the I32 guard"
-    assert src.count("_fold_rung_outcome(outcome, ") == 3, "the gate, the idle relift and the hold escalation"
+    assert src.count("_fold_rung_outcome(outcome, ") == 4, "the gate, the idle relift, the dirty idle gate (I68) and the hold escalation"
 
 
 # The 10-17 class-J episode (job killed, glx_reset 62 s): the first pass proved all 128 links, then its
