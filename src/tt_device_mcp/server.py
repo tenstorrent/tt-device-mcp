@@ -7531,10 +7531,10 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
     bound = [fed.pop("hold_bound")] if "hold_bound" in fed else []
     fed = list(fed.values())
     ceiling = _stuck_hold_ceiling_sec()
-    bound = _hold_bound_sec()  # one sampler tick under the spec 03 I42 latch, else the ceiling
+    bound_sec = _hold_bound_sec()  # one sampler tick under the spec 03 I42 latch, else the ceiling
     # Spec 04 I76: below the bound the kill-switch declines every forced spawn and the watchdog forces
     # no 77-only hold; from the bound on, neither holds a rung back.
-    floor = started + bound if not _force_escalate_enabled() or _fabric_77_only_hold() else None
+    floor = started + bound_sec if not _force_escalate_enabled() or _fabric_77_only_hold() else None
     host_rung = "power cycle" if _auto_power_cycle_enabled() else "warm reboot" if _auto_reboot_enabled() else None
     now_mono = time.monotonic()
 
@@ -7610,7 +7610,7 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
         if add(candidates, bound_rung, "hold_bound_cycle"):
             return done(candidates)
     lad = _hold_bound_ladder_age
-    if lad is not None and lad >= bound and (_hold_bound_cycle_age is None or _hold_bound_cycle_age < lad):
+    if lad is not None and lad >= bound_sec and (_hold_bound_cycle_age is None or _hold_bound_cycle_age < lad):
         # The full check after the bound's ladder still has its time; the host rung follows at its end.
         add(candidates, replace(bound_rung, at=started + lad + _HOLD_BOUND_CHECK_SEC), "hold_bound_cycle")
     if isolated_chips and not device_hold_offbus_escalated:
@@ -7620,10 +7620,10 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
         )
         if acts and age >= _offbus_one_shot_sec():
             return done(candidates)  # due: the watchdog's chain stops at it
-    if _disproven_lift_bound_due(max(age, bound)):
+    if _disproven_lift_bound_due(max(age, bound_sec)):
         # Spec 03 I42: the bound's early ladder, owed from one sampler tick in until a bound ladder ran.
-        early = hold_report.RungCandidate(started + bound, "forced ladder", "disproven lift bound")
-        if add(candidates, early, "disproven_lift") and age >= bound:
+        early = hold_report.RungCandidate(started + bound_sec, "forced ladder", "disproven lift bound")
+        if add(candidates, early, "disproven_lift") and age >= bound_sec:
             return done(candidates)  # due: the watchdog's chain stops at it
     if m is not None and m.progress_retry is not None and m.progress_retry[0] == episode:
         left = m.progress_retry[1] - time.monotonic()

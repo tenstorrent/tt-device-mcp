@@ -9,7 +9,8 @@ the fabric, which sets the I42 topology latch and opens a new 77 hold. Each hold
 reset ladder at 10 min; a full check that still fails (fabric included) asks for exactly one power
 cycle per episode (a request the host never acted on is retried under spec 04 I72, not counted
 here); only the bounded post-power-cycle cooldown may hold longer, and the cycle fires as it ends;
-nothing is released without a passing full check. Also: a hold across a broker restart keeps its
+nothing is released without a passing full check. The I42-latched hold's bound is one sampler tick
+(spec 03 I42): its ladder and power cycle come then, not at 10 min. Also: a hold across a broker restart keeps its
 start, lift/fail cycles keep one clock, and a missing-link hold is never lifted on an unrunnable
 fabric pass. No device is opened."""
 
@@ -170,22 +171,23 @@ def _restart_broker(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_i42_latched_hold_after_a_lift_gets_the_ladder_at_10_min_and_one_cycle(replay):
+async def test_the_i42_latched_hold_after_a_lift_gets_the_ladder_one_tick_in_and_one_cycle(replay):
     """The sequence's second episode: a release about 2 h into the first, the first job after it fails
-    on the fabric (I42 latch set) and a new hold opens. The latch is no exemption from the bound."""
+    on the fabric (I42 latch set) and a new hold opens. The latch is no exemption from the bound: its
+    bound is one sampler tick, so the full ladder runs then, well inside the 10-min bound."""
     order = replay["order"]
     _Clock.t = 2 * 3600
     srv.health_monitor.topology_lift_pending = True
     detail = srv.health_monitor.note_job_after_topology_lift(True, "... could not find any forwarding direction ...")
     assert detail and srv.health_monitor.topology_hw_fault, "the first job after the lift set the I42 latch"
     start = 2 * 3600 + 5
+    tick = float(srv.SAMPLE_INTERVAL_SEC)
     _open_hold(detail, start)
-    for at in (60, 300, BOUND - 1):
-        await _tick(start + at)
+    await _tick(start + tick - 1)
     assert "glx_reset" not in order and _cycles(order) == 0
 
-    await _tick(start + BOUND)
-    assert "glx_reset" in order, "the latched hold gets the full ladder at 10 min"
+    await _tick(start + tick)
+    assert "glx_reset" in order, "the latched hold gets the full ladder one sampler tick in"
     assert replay["checks"] and not any(replay["checks"]), "fabric included, the check after it failed"
     assert _cycles(order) == 1 and order.index("glx_reset") < order.index("power_cycle")
     assert srv.health_monitor.topology_hw_fault, "the latch stands: the post-ladder check must not pass on it"
@@ -198,9 +200,9 @@ async def test_the_i42_latched_hold_after_a_lift_gets_the_ladder_at_10_min_and_o
 @pytest.mark.asyncio
 async def test_a_hold_that_spans_a_broker_restart_gets_the_ladder_10_min_after_it_began(replay, monkeypatch):
     """A hold opens, the broker restarts 8 min in (new code installed): the restored episode keeps its
-    start, so the full ladder runs at 10 min of the hold, not 10 min after the restart."""
+    start, so the full ladder runs at 10 min of the hold, not 10 min after the restart. A topology-mismatch
+    hold with no I42 latch (no lift was disproven yet), so its bound is the 10-min ceiling."""
     order = replay["order"]
-    srv.health_monitor.topology_hw_fault = MISMATCH
     _hold_via_gate(MISMATCH, 0)
     for at in (60, 300):
         await _tick(at)
@@ -217,14 +219,16 @@ async def test_a_hold_that_spans_a_broker_restart_gets_the_ladder_10_min_after_i
 @pytest.mark.asyncio
 async def test_lift_and_fail_cycles_never_restart_the_10_min_clock(replay):
     """A hold lifts, the next job fails the same way, the hold returns; over and over. Each re-hold is
-    the same episode: the full ladder still runs 10 min after the first hold opened."""
+    the same episode: the full ladder still runs 10 min after the first hold opened. No I42 latch, so
+    the bound is the 10-min ceiling (a latched hold's one-tick bound would run the ladder at once)."""
     order = replay["order"]
-    srv.health_monitor.topology_hw_fault = MISMATCH
     _hold_via_gate(MISMATCH, 0)
     for lift, rehold in ((200, 230), (400, 430)):
         await _tick(lift - 1)
         _lift_via_gate(lift)
         _hold_via_gate(MISMATCH, rehold)
+    await _tick(BOUND - 1)
+    assert "glx_reset" not in order
     await _tick(BOUND + 1)
     assert "glx_reset" in order, "the ladder ran 10 min after the FIRST hold, not after the last re-hold"
 
