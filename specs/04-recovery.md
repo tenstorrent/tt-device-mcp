@@ -1911,7 +1911,7 @@ each rung fires only when the gentler one failed or cannot apply.
   - **The guard.** Every mesh reset the broker launches, through either reset backend (the
     `systemd-run` scope and the local no-systemd child), runs as `unshare --mount --propagation
     private -- <python> -I ipmi_guard.py --wrap -- <tt-smi argv>` (`ipmi_guard.guarded_argv`).
-    Inside that private mount namespace the wrapper mounts a small guard, read-only, over every
+    Inside that private mount namespace the wrapper mounts a small owner-only (root) guard, read-only, over every
     `ipmitool` that sudo's secure path or the broker's PATH resolves, checks each mount by reading
     it back, then execs tt-smi. The host's mounts are not changed. The guard refuses (exit 97,
     `tt-device-mcp ipmi guard: REFUSED ...` on stderr) any `raw 0x30 0x8B` whose op_mode byte reads
