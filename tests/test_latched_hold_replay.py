@@ -236,9 +236,7 @@ async def test_lift_and_fail_cycles_never_restart_the_10_min_clock(replay):
 
 
 @pytest.mark.asyncio
-async def test_an_unlatched_mismatch_hold_gets_its_ladder_at_start_and_none_again_across_a_restart(
-    replay, monkeypatch
-):
+async def test_an_unlatched_mismatch_hold_gets_its_ladder_at_start_and_none_again_across_a_restart(replay, monkeypatch):
     """Spec 04 I83 on the gate path: an unlatched topology-mismatch hold is the fabric link-short class.
     Its first tick runs the full ladder, the failed full check after it (fabric included) asks for the
     power cycle at once; a broker restart keeps the episode's start, and no tick up to the bound runs a
