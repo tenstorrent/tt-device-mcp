@@ -1196,20 +1196,50 @@ cooldown (spec 04 I65) holds longer.
   `startup_verify`, after `job_running`): a re-adopted job that ends while the forced run or the
   relift is already on its way gets no reset before the startup gate. Only the ceiling window, the off-bus one-shot and spec 04 I83's
   at-start link-short ladder stand down, the kinds whose window is given back; every other forced kind (power-cycle cooldown retry, the off-bus
-  hand-off bounds, the spec 04 I76 host rung) runs as before. While the re-adopted job runs, both meet it
-  as before: the ladder defers on blocker `job_running`. A chip that drops while the gate is
+  hand-off bounds, the spec 04 I76 host rung) runs as before. While the re-adopted job runs, no
+  hold episode is open (below), so neither has a hold to act on; a hold opened over it by a fault
+  meets it as before: the ladder defers on blocker `job_running`. A chip that drops while the gate is
   pending keeps the off-bus one-shot (I23) and its ladder; it does not wait for the gate. The startup gate runs the
   full check, fabric included (goal: a health check after every reset or start), and releases only
-  on a pass. A gate that leaves the hold standing is escalated on the first sampler tick after it.
+  on a pass. A gate that leaves the hold standing meets the spec 04 I76 bound, whose clock starts
+  at the re-adopted jobs' end (below).
   Bounded: `STARTUP_VERIFY_DEFER_MAX_SEC` (hugepage wait + fabric timeout + 120 s, 420 s) after the
   re-adopted jobs end, the escalations act as before. A dirty or faulted job end keeps the gate's
   own reset + full check. Time to recover (class S, restart over a re-adopted job longer than the
   ceiling): from the job's end, one scope poll plus the startup gate (about 1-2 min), against a
   galaxy reset, its settle and verify, then the gate (about 4-6 min) before. A gate that fails
-  hands the hold to the spec 04 I76 bound's ladder on the next tick (the bound is already past after a
-  job longer than 600 s), then the power cycle if the full check after it fails, each once; the
-  job's end to that ladder is at most `STARTUP_VERIFY_DEFER_MAX_SEC`, inside 10 min. Other
-  classes, off-bus ones (A, B1, B2, C) on a startup hold included: unchanged.
+  hands the hold to the spec 04 I76 bound's ladder, then the power cycle if the full check after it
+  fails, each once. Other classes, off-bus ones (A, B1, B2, C) on a startup hold included: unchanged.
+
+  **No hold episode opens while every re-adopted job still runs and nothing names a fault.** The
+  device is the re-adopted job's, as it was before the restart; a hold whose clock started at the
+  restart reached the spec 04 I76 10-min mark while the job ran and met the ladder's `job_running`
+  deferral with no bound (a 742 s hold over one job was seen). So the gate verdict records no hold
+  episode (no `device_held`, no episode `since`, no hold bound armed) while the hold's `why` is
+  `startup_unverified`, the startup gate has not yet begun, every re-adopted job is RUNNING and
+  none of these holds: a dirty mark, a reported runtime fault, an owed kill reset, an isolated chip,
+  a live liveness finding (a chip off the bus). Any one of them opens the hold at once, with its own
+  clock. The FSM stays `RECOVERING`, tenants stay refused and the queue is not idle: nothing
+  dispatches onto the device. A startup episode restored from before the restart (spec 04 I82) is
+  dropped, since its clock is the restart's; a restored fault episode keeps its clock and opens the
+  hold. The first deferral logs `startup_hold_behind_readopted_job` once, naming the jobs. The
+  jobs' end opens a fresh episode, so the 10-min bound counts from there: the gate passes within
+  about 1-2 min, or a failed gate gets the spec 04 I76 ladder at 600 s after the jobs' end, then one
+  power cycle if the full check after it fails. The gate's hugepage wait and full check run as a device
+  op that no sampler verdict reads, so the hold opens only at the gate's failing verdict; its episode
+  then dates back to the jobs' end (when the gate stopped waiting on them), and the gate's own run
+  counts inside the 10-min bound. A fault hold already open over a re-adopted job is
+  unchanged: it pages `hold_bound_tenant_blocked` once and runs the ladder when the job ends. A job
+  end that pins a spec 04 I82 carry (`startup_pinned`) does so for a deferred startup hold too, so
+  the hold opened after it does not take a closed episode's clock. Time to recover (class S over a
+  re-adopted job): before, the hold counted from the restart and the ladder deferred on
+  `job_running` without bound while the job ran; after, no hold while the job runs, the gate passes
+  1-2 min after its end, and a failed gate gets the ladder 600 s after its end, however long the gate
+  ran (counted from the gate's failing verdict instead, the ladder came up to the gate's run time
+  later, about 17 min after the end). Regression, bounded: a job that outlived the 10-min mark and whose gate then fails
+  gets its ladder up to about 8 min later than before (600 s after its end, against the next tick after
+  the gate's failing verdict, within its own bound `STARTUP_VERIFY_DEFER_MAX_SEC`, 420 s, of the end); a
+  job whose gate passes is unchanged.
 - **I76 — A startup hold behind a live re-adopted job is reported as startup verify, not as a fault.**
   After a restart that re-adopts a running job, the `startup_unverified` hold (I4) waits for that job
   and then the startup gate. A client that read the hold as a device in recovery stopped its healthy
@@ -1248,7 +1278,8 @@ cooldown (spec 04 I65) holds longer.
   or the hold's `why` turning into another class. `status` keeps its two values (`degraded` while
   held): clients, the CLI's own reachability probe among them, read any other value as a broker that
   is down. Reporting only: `fsm_state`/`fsm_why` keep their contract, `held`/`held_since`/
-  `held_age_sec` keep counting, tenants stay refused, the startup gate still runs the full check,
+  `held_age_sec` keep counting (from the FSM's record; while I75 opens no hold episode behind a
+  live re-adopted job, `since` is the startup gate's start), tenants stay refused, the startup gate still runs the full check,
   fabric included, after the hugepage wait and alone releases the queue, a kill still owes the reset
   plus the full check, and no hold bound, ladder or power-cycle escalation reads either field (nor
   `since`, `check_started_at`, `deadline` or `hold_reason`: their times are kept apart from the
@@ -2173,7 +2204,8 @@ refuses.
 | I74 (the startup gate pays an open debt: one reset, one full check after it, no pass before; a failed check stays held; the read-only probe leaves it; a later debt is paid by the post-job gate) | `tests/test_job_kill_reset.py::test_the_startup_gate_pays_an_open_debt_with_one_full_check`, `tests/test_job_kill_reset.py::test_a_failed_startup_kill_check_stays_held`, `tests/test_job_kill_reset.py::test_the_read_only_startup_probe_leaves_the_debt`, `tests/test_job_kill_reset.py::test_a_debt_owed_after_the_startup_check_is_paid_by_the_post_job_gate` |
 | I75 | `tests/test_device_safety.py::test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_gate_not_reset`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_next_tick`, `tests/test_device_safety.py::test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladder`, `tests/test_device_safety.py::test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate` |
 | I75 (the stand-down is re-read under the lock and at the ladder's tenant check: a job ending mid-run gets no reset before the gate) | `tests/test_device_safety.py::test_a_readopted_job_ending_during_a_forced_run_gets_no_reset_before_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_after_a_job_ended_during_a_forced_run_escalates_next_tick`, `tests/test_device_safety.py::test_idle_relift_gives_no_reset_when_the_readopted_job_ends_inside_the_ladder`, `tests/test_ladder_v2.py::test_the_i75_stand_down_blocks_only_inside_the_escalate_that_carries_it`, `tests/test_ladder_v2.py::test_escalate_carries_the_stand_down_only_for_its_own_run`, `tests/test_classac_power_cycle_direct.py::test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant` |
-| I75 (a running re-adopted job still defers on `job_running`; off-bus and non-rearmable forced kinds never wait on the gate; a failed gate gets the spec 04 I76 ladder then one power cycle) | `tests/test_device_safety.py::test_a_running_readopted_job_still_defers_the_startup_hold_on_job_running`, `tests/test_device_safety.py::test_idle_relift_meets_a_running_readopted_job_on_job_running`, `tests/test_device_safety.py::test_an_offbus_startup_hold_keeps_its_one_shot_while_the_startup_gate_is_pending`, `tests/test_device_safety.py::test_a_forced_run_whose_window_cannot_be_given_back_is_not_deferred_to_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_gets_the_bound_ladder_then_one_power_cycle` |
+| I75 (a hold already open over a running re-adopted job still defers on `job_running`; off-bus and non-rearmable forced kinds never wait on the gate; a failed gate gets the spec 04 I76 ladder then one power cycle) | `tests/test_device_safety.py::test_a_running_readopted_job_still_defers_the_startup_hold_on_job_running`, `tests/test_device_safety.py::test_idle_relift_meets_a_running_readopted_job_on_job_running`, `tests/test_device_safety.py::test_an_offbus_startup_hold_keeps_its_one_shot_while_the_startup_gate_is_pending`, `tests/test_device_safety.py::test_a_forced_run_whose_window_cannot_be_given_back_is_not_deferred_to_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_gets_the_bound_ladder_then_one_power_cycle` |
+| I75 (no hold episode opens behind a live re-adopted job naming no fault, and nothing escalates past 10 min; any fault opens it at once; a restored startup episode is dropped, a restored fault episode keeps its clock; the jobs' end opens a fresh hold that only a full check with fabric lifts, a short link count fails; a failed gate gets the bound ladder 600 s after the job's end however long the gate's device op ran, then one power cycle; a fault hold over the job pages once and runs the ladder at its end) | `tests/test_readopt_hold_clock.py::test_a_live_readopted_job_opens_no_hold_and_nothing_escalates_past_10_min`, `::test_anything_that_names_a_fault_opens_the_hold_at_once`, `::test_a_restored_startup_episode_is_dropped_and_a_restored_fault_episode_keeps_its_clock`, `::test_the_jobs_end_opens_a_fresh_hold_that_only_a_full_check_with_fabric_lifts`, `::test_a_failed_startup_gate_after_the_job_gets_the_bound_ladder_by_600_s_after_its_end`, `::test_a_fault_hold_over_a_readopted_job_pages_once_and_runs_the_ladder_when_the_job_ends` |
 | I76 | `tests/test_device_safety.py::test_health_names_a_startup_hold_behind_a_live_readopted_job_as_no_fault`, `tests/test_device_safety.py::test_the_startup_check_still_runs_and_gates_the_queue_after_the_readopted_job_ends`, `tests/test_device_safety.py::test_a_startup_check_that_passes_after_the_readopted_job_releases_the_queue`, `tests/test_device_safety.py::test_the_startup_check_reports_when_it_began_and_its_deadline`, `tests/test_device_safety.py::test_killing_the_readopted_job_drops_the_startup_verify_state_and_still_owes_the_reset`, `tests/test_device_safety.py::test_a_fault_during_the_startup_verify_state_reads_as_a_fault`, `tests/test_device_safety.py::test_the_startup_verify_state_hides_no_hold_bound`, `tests/test_device_safety.py::test_the_startup_verify_report_never_hides_or_delays_the_10min_hold_bound`, `tests/test_device_safety.py::test_fsm_json_names_the_readopted_job_while_it_runs_and_clears_when_it_ends`, `tests/test_device_safety.py::test_fsm_json_readopted_jobs_clear_on_release`, `tests/test_device_safety.py::test_a_same_boot_restart_that_readopts_no_job_empties_a_stale_fsm_json_list`, `tests/test_device_safety.py::test_fsm_json_readopted_jobs_empty_when_the_job_is_gone_or_a_fault_shows`, `tests/test_fsm.py::test_readopted_jobs_persist_and_survive_a_same_boot_restart`, `tests/test_fsm.py::test_readopted_jobs_clear_on_release_and_on_down`, `tests/test_fsm.py::test_readopted_jobs_clear_when_the_job_ends`, `tests/test_fsm.py::test_an_fsm_file_without_readopted_jobs_still_loads`, `tests/test_fsm.py::test_startup_check_in_progress_is_set_while_the_check_runs_and_cleared_by_its_end` |
 | I71 (descriptor ports missing after a passing rerun fail the check by port name; a moved tray still lifts) | `tests/test_fabric_links_missing.py::test_topology_ports_names_each_missing_and_extra_connection`, `tests/test_fabric_links_missing.py::test_the_marker_carries_the_names_and_they_parse_back`, `tests/test_fabric_links_missing.py::test_a_long_port_list_is_capped_with_a_count`, `tests/test_fabric_links_missing.py::test_a_wrapper_marker_without_names_takes_them_from_the_validator_output`, `tests/test_fabric_links_missing.py::test_more_missing_than_extra_is_links_missing_and_a_moved_tray_is_not`, `tests/test_fabric_links_missing.py::test_a_lost_link_whose_rerun_passes_fails_the_check_and_names_the_port`, `tests/test_fabric_links_missing.py::test_an_override_wrapper_that_exits_0_on_a_lost_link_still_fails`, `tests/test_fabric_links_missing.py::test_health_names_the_ports`, `tests/test_fabric_links_missing.py::test_health_shows_the_accepted_ports`, `tests/test_fabric_cable_fault.py::test_a_missing_cable_whose_rerun_passes_fails_the_check_by_port_name` |
 | I71 (only an accept list naming every missing port lifts; the eth mark is never lowered otherwise) | `tests/test_fabric_links_missing.py::test_only_an_explicit_accept_list_naming_every_missing_port_lifts`, `tests/test_fabric_links_missing.py::test_a_moved_tray_still_lifts_and_never_lowers_the_mark`, `tests/test_fabric_links_missing.py::test_a_mark_lowered_before_this_fix_is_restored`, `tests/test_fabric_links_missing.py::test_a_lift_the_accept_list_excused_names_the_accepted_ports`, `tests/test_fabric_links_missing.py::test_a_moved_tray_lift_excuses_no_port` |

@@ -61,12 +61,12 @@ def _wrap(bindir: Path, name: str) -> None:
     (bindir / name).write_text(
         f'#!/bin/bash\n. "$HOOK"; check_live "{name} $*"\n{real} "$@"; rc=$?\ncheck_live "after {name} $*"\nexit $rc\n'
     )
-    (bindir / name).chmod(0o755)
+    (bindir / name).chmod(0o700)
 
 
 def _stub(bindir: Path, name: str, body: str) -> None:
     (bindir / name).write_text(body)
-    (bindir / name).chmod(0o755)
+    (bindir / name).chmod(0o700)
 
 
 def _env(tmp: Path, bindir: Path, live: list[str]) -> dict:
