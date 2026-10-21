@@ -2113,7 +2113,9 @@ class GalaxyRecovery(Recovery):
                     )
                     if swept and await asyncio.to_thread(self._bus_whole_now, expected, log):
                         mesh_reset_left = True
-                        log("every expected chip is back on the bus after SBR — the full check runs before the mesh reset")
+                        log(
+                            "every expected chip is back on the bus after SBR — the full check runs before the mesh reset"
+                        )
                         health_event(
                             "last_chance_sweep_bus_whole", context=context or gate_phase, after="sbr", expected=expected
                         )

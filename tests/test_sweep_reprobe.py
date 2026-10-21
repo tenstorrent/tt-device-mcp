@@ -78,9 +78,7 @@ async def test_healed_after_sbr_runs_no_later_rung_and_lifts_only_on_the_full_ch
 
 
 @pytest.mark.asyncio
-async def test_bus_whole_but_full_check_fails_runs_the_remaining_rung_then_the_caller_climbs(
-    monkeypatch, galaxy_trays
-):
+async def test_bus_whole_but_full_check_fails_runs_the_remaining_rung_then_the_caller_climbs(monkeypatch, galaxy_trays):
     g, rec = _arm(monkeypatch, heals_after_sbr=True, verdicts=[False, False])
     assert await _sweep(g) is False, "the full ladder ran and the mesh did not verify: the caller climbs"
     assert rec["rungs"] == ["sbr", "mesh"], "a failed full check resumes the remaining rung"
@@ -90,9 +88,7 @@ async def test_bus_whole_but_full_check_fails_runs_the_remaining_rung_then_the_c
 
 
 @pytest.mark.asyncio
-async def test_bus_whole_check_fails_then_the_mesh_reset_heals_it_lifts_on_the_second_check(
-    monkeypatch, galaxy_trays
-):
+async def test_bus_whole_check_fails_then_the_mesh_reset_heals_it_lifts_on_the_second_check(monkeypatch, galaxy_trays):
     g, rec = _arm(monkeypatch, heals_after_sbr=True, verdicts=[False, True])
     assert await _sweep(g) is True
     assert rec["rungs"] == ["sbr", "mesh"]
