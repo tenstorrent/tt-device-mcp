@@ -14,7 +14,10 @@ then the power cycle. A chip still enumerated is on the bus: never SBR'd, the me
 Below the bound a forced run keeps its own path (the mesh reset, no rescan or SBR: the gate ran those at
 once). No test reaches a real reset, setpci or power cycle."""
 
+import asyncio
 import pathlib
+import threading
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -22,7 +25,10 @@ import pytest
 from tests.conftest import patch_health_event, patch_recovery
 from tests.test_device_safety import _arm_offbus_stuck_hold, _rung
 from tests.test_fabric_topology_mismatch import _LOST, topo  # noqa: F401 - the fixture
+from tests.test_inflight_reader_cut import _World
 from tt_device_mcp import server as srv
+from tt_device_mcp import telemetry
+from tt_device_mcp.health import ALL_ONES
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.recovery import (
@@ -30,6 +36,7 @@ from tt_device_mcp.health.recovery import (
     OUTCOME_TERMINAL,
     OUTCOME_WAITING,
     STAGE_BRIDGE_RESET,
+    base,
     galaxy,
     pcie_guard,
 )
@@ -267,6 +274,41 @@ async def test_a_cooldown_denial_at_the_bound_still_runs_the_ladder_and_arms_the
     monkeypatch.setattr(srv, "_bound_tenant_blocker", lambda *a: None)
     await srv._hold_bound_host_rung(601, lambda m: None)
     assert order == ["power cycle"], "the cooldown's end goes straight to the power cycle, no second ladder"
+
+
+@pytest.mark.asyncio
+async def test_a_remove_blocked_in_the_kernel_still_lets_the_bound_reach_the_power_cycle(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I83 / 04 I76: a post-reset cut whose PCI remove blocks in the kernel holds the PCI
+    rescan/remove lock, so every later rescan would queue behind it. The remove's timeout latches
+    PCI-wedged: the bound's rescan rung is refused at once (no second write, no second timeout), counts
+    as failed and the ladder goes on to the full check and the power cycle."""
+    order, events, _counters = _rig(monkeypatch, tmp_path)
+    kernel_lock = threading.Event()  # never released while the test runs: the blocked remove
+    w = _World(monkeypatch, detach_ok=lambda idx: kernel_lock.wait(30) and True, beats={GONE: ALL_ONES})
+    monkeypatch.setattr(telemetry, "INFLIGHT_DETACH_TIMEOUT_SEC", 0.2)
+    monkeypatch.setattr(base, "PCI_SYSFS_WRITE_TIMEOUT_SEC", 0.2)
+
+    def blocked_rescan():
+        order.append("rescan")
+        kernel_lock.wait(30)
+
+    monkeypatch.setattr(galaxy, "_pci_rescan", blocked_rescan)
+    try:
+        assert await srv.sampler.cut_post_reset_failed([GONE]) is False
+        assert w.events[-1][1]["remove_blocked"] is True
+        t0 = time.monotonic()
+        assert await asyncio.wait_for(_bound_ladder(), 10) == OUTCOME_TERMINAL
+        assert time.monotonic() - t0 < 5
+    finally:
+        kernel_lock.set()  # free the worker threads
+    # The latch asks for the power cycle at once (the watchdog's tick), before any ladder runs; the
+    # bound's own ladder then skips the refused rescan and ends in the power cycle too.
+    assert order[0] == "power cycle", "the PCI-wedged latch requested the power cycle at once"
+    assert order[1:] == ["mesh reset", "full check", "power cycle"], "the rescan never started a second write"
+    assert srv.PCI_WRITER.latched, "the blocked remove latched PCI-wedged"
+    assert "pci_rescan_timeout" not in events, "one PCI timeout per ladder: the refused rescan did not wait"
 
 
 def _real_bridge_rung(monkeypatch, tmp_path):

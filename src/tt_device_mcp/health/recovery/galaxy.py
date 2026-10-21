@@ -52,6 +52,7 @@ from tt_device_mcp.health.recovery.base import (
     CYCLE_LAUNCH_REPAGE_SEC,
     HOLD_ESCALATION_REARM_SEC,
     drop_returned_isolated,
+    pci_rescan,
     refuse_mesh_reset,
 )
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
@@ -1670,9 +1671,9 @@ class GalaxyRecovery(Recovery):
                 td["rescanned"] = True
                 try:
                     FABRIC_DEBT.note_reset("PCI rescan")
-                    await asyncio.to_thread(_pci_rescan)
+                    await pci_rescan("tray-down rescan", lambda: _pci_rescan())
                     rescan = "ran"
-                except OSError as e:
+                except (OSError, asyncio.TimeoutError) as e:
                     rescan = f"failed ({e})"
         capture: dict = {}
         if not td["captured"]:
@@ -1755,8 +1756,10 @@ class GalaxyRecovery(Recovery):
         if rescan == "ran":
             try:
                 FABRIC_DEBT.note_reset("PCI rescan")
-                await asyncio.to_thread(_pci_rescan)
-            except OSError as e:
+                # Bounded: a PCI remove blocked in the kernel holds the rescan lock, and an unbounded
+                # rescan here would keep the I76 bound from ever reaching the power-cycle request.
+                await pci_rescan(f"{context} rescan", lambda: _pci_rescan())
+            except (OSError, asyncio.TimeoutError) as e:
                 rescan = f"failed ({e})"
         if rescan == "ran":
             await asyncio.sleep(TRAY_DOWN_RESCAN_SETTLE_SEC)

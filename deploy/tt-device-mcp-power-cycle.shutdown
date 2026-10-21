@@ -11,10 +11,18 @@
 # empty on every boot, so a request never outlives its boot; one older than an hour is ignored too.
 # With no request it does nothing and the reboot, poweroff or halt goes ahead unchanged.
 #
-# systemd-shutdown kills a hook still running after 90 s. The worst case here is 10 s (RAID wait)
-# + 3 tries x 15 s + 2 pauses x 2 s + 25 s (power drop) = 84 s. If the cycle command fails three
-# times, the hook exits and systemd-shutdown reboots warm; the broker's startup check then finds the
-# device as it is and its own recovery runs again.
+# In-band ipmitool needs the IPMI drivers and /dev/ipmi0, and a service may have taken both away
+# while the OS went down (openipmi's stop unloads ipmi_si/ipmi_devintf and deletes the node): the
+# cycle then never reaches the BMC and the host only reboots warm. So the hook loads the drivers again
+# and makes the node from sysfs when it is missing, alongside the RAID wait. Nothing is on disk any
+# more, so it leaves its trace in the BMC's SEL (an OEM record "TTPC", before the cycle and after a
+# cycle that failed every try) where the cycle command is ipmitool.
+#
+# systemd-shutdown kills a hook still running after 90 s. The worst case here is 10 s (RAID wait and
+# IPMI drivers, side by side) + 2 s (SEL record) + 3 tries x 15 s + 2 pauses x 2 s + 25 s (power
+# drop) = 86 s. If the cycle command fails three times, the hook says so, records it in the SEL where
+# it can and exits; systemd-shutdown reboots warm and the broker's startup check then finds the device
+# as it is and its own recovery runs again.
 REQ="${TT_DEVICE_MCP_POWER_CYCLE_REQUEST:-/run/tt-device-mcp-power-cycle.request}"
 FALLBACK_PID="${REQ%.request}.fallback.pid"
 MAX_AGE=3600
@@ -22,7 +30,59 @@ MAX_AGE=3600
 PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 
+IPMI_DEV="${TT_DEVICE_MCP_IPMI_DEV:-/dev}"
+IPMI_SYSFS="${TT_DEVICE_MCP_IPMI_SYSFS:-/sys/class/ipmi}"
+
 say() { echo "tt-device-mcp power-cycle hook: $*" >/dev/kmsg 2>/dev/null || echo "tt-device-mcp power-cycle hook: $*" >&2; }
+
+# ipmitool's in-band interface opens the first of these that exists.
+ipmi_node_ready() { [ -c "$IPMI_DEV/ipmi0" ] || [ -c "$IPMI_DEV/ipmi/0" ] || [ -c "$IPMI_DEV/ipmidev/0" ]; }
+
+# Load the IPMI drivers and make /dev/ipmi0 from sysfs where devtmpfs has not; returns once the node
+# is there, or fails after 50 looks 0.2 s apart (ipmi_si may take a moment to find the BMC). The
+# caller bounds it with `timeout` too.
+prepare_ipmi() {
+    ipmi_node_ready && return 0
+    for m in ipmi_msghandler ipmi_devintf ipmi_si; do modprobe -q "$m" 2>/dev/null; done
+    n=0
+    while :; do
+        if [ ! -e "$IPMI_DEV/ipmi0" ] && IFS=: read -r maj min 2>/dev/null <"$IPMI_SYSFS/ipmi0/dev"; then
+            mknod -m 0600 "$IPMI_DEV/ipmi0" c "$maj" "$min" 2>/dev/null
+        fi
+        ipmi_node_ready && return 0
+        n=$((n + 1))
+        [ "$n" -lt 50 ] || return 1
+        sleep 0.2
+    done
+}
+
+# The fallback unit runs this too before it fires: a shutdown that hangs may hang past openipmi's stop.
+if [ "${1:-}" = --prepare-ipmi ]; then
+    prepare_ipmi
+    exit
+fi
+
+# One OEM SEL record (IPMI Add SEL Entry, type C0h: our timestamp, no manufacturer, "TTPC", then $1
+# the stage and $2 a detail byte) on the BMC the cycle command drives; the cycle argv follows. Only
+# for `ipmitool [options] chassis power cycle`: any other command is opaque. Best effort, bounded.
+sel_note() {
+    stage=$1 detail=$2
+    shift 2
+    [ "$#" -ge 4 ] && [ "${1##*/}" = ipmitool ] || return 0
+    eval 'tail3="${'$(($# - 2))'} ${'$(($# - 1))'} ${'$#'}"'
+    [ "$tail3" = "chassis power cycle" ] || return 0
+    keep=$(($# - 3)) i=0
+    for a; do
+        shift
+        [ "$i" -lt "$keep" ] && set -- "$@" "$a"
+        i=$((i + 1))
+    done
+    t=$(date +%s 2>/dev/null) || t=0
+    timeout 2 "$@" raw 0x0a 0x44 0x00 0x00 0xc0 \
+        "$((t & 255))" "$((t >> 8 & 255))" "$((t >> 16 & 255))" "$((t >> 24 & 255))" \
+        0x00 0x00 0x00 0x54 0x54 0x50 0x43 "$stage" "$detail" >/dev/null 2>&1 ||
+        say "could not add the SEL record (stage $stage)"
+}
 
 # The pids whose parent is one of the pids in $1, on one line; /proc/<pid>/stat's comm field may hold
 # spaces or ')', so the fields are read after its last ") ".
@@ -99,8 +159,23 @@ fi
 say "power-cycling the host now: $reason"
 # The filesystems are read-only by now; never block on a flush that cannot finish.
 sync &
+ipmi_pid=
+ipmi_restored=0
+ipmi_node_ready || {
+    timeout 10 "$0" --prepare-ipmi &
+    ipmi_pid=$!
+}
 # Hooks run in parallel: let the RAID arrays finish marking themselves clean before power goes.
 command -v mdadm >/dev/null 2>&1 && timeout 10 mdadm --wait-clean --scan >/dev/null 2>&1
+if [ -n "$ipmi_pid" ]; then
+    if wait "$ipmi_pid"; then
+        ipmi_restored=1
+        say "loaded the IPMI drivers again and found the IPMI device: a service had removed them"
+    else
+        say "NO IPMI DEVICE: could not load the IPMI drivers or make /dev/ipmi0; an in-band cycle cannot reach the BMC"
+    fi
+fi
+sel_note 0x01 "$ipmi_restored" "$@"
 try=1
 while [ "$try" -le 3 ]; do
     if timeout "$try_timeout" "$@"; then
@@ -112,5 +187,6 @@ while [ "$try" -le 3 ]; do
     [ "$try" -lt 3 ] && sleep 2
     try=$((try + 1))
 done
-say "cycle command failed 3 times; the reboot continues warm"
+say "POWER CYCLE FAILED: the cycle command failed 3 times; the reboot continues WARM, the device is not power-cycled"
+sel_note 0x02 3 "$@"
 exit 1

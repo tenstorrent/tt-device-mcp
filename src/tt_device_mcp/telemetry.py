@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 from tt_device_mcp import metrics
-from tt_device_mcp.health import ALL_ONES, SAMPLE_INTERVAL_SEC, SAMPLE_RING_SIZE, chip_state
+from tt_device_mcp.health import ALL_ONES, PCI_WRITER, SAMPLE_INTERVAL_SEC, SAMPLE_RING_SIZE, PciWedged, chip_state
 
 if TYPE_CHECKING:
     from tt_device_mcp.health import HealthMonitor, RecoveryDeps, RecoveryMechanism
@@ -44,6 +44,11 @@ FAST_WINDOW_SEC = 30.0
 FAST_MAX_SEC = 60.0
 FAST_CONFIRM_SEC = 4.0
 
+# Spec 03 I83's cut after a failed POST_RESET: all PCI removes together get at most this long (a
+# remove behind a hung endpoint can block in the kernel for good; nobody is killed then), and the
+# reader kill (SIGTERM, SIGKILL 10 s later) at most this long.
+INFLIGHT_DETACH_TIMEOUT_SEC = 15.0
+INFLIGHT_KILL_TIMEOUT_SEC = 30.0
 # Spec 03 I84: the dead-chip valve's PCI removes together get at most this long. A remove drains the
 # driver's in-flight ioctls, and a reader wedged on the dead chip can hold that drain open; the write
 # runs in a worker thread so the sampler never stalls on it, and a remove still running at the bound
@@ -409,6 +414,107 @@ class TelemetrySampler:
             chip_state.set_recovering("scope", False)
         return False
 
+    async def cut_post_reset_failed(self, chips: list) -> bool:
+        """Spec 03 I83: after a mesh reset whose POST_RESET failed on ``chips``, detach every one of
+        them still reading all-ones, then kill their foreign readers. Called by reset_with_quiesce
+        once tt-smi has exited, before its rescan; awaited, every step bounded.
+
+        Why here and not earlier: until POST_RESET the driver keeps the chip in needs_hw_init (set by
+        USER_RESET), so its telemetry reads fail with ENODATA, mappings are gone and an fd close sends
+        the chip nothing; no reader can reach it. A failed POST_RESET clears needs_hw_init: from then
+        on a reader's read is a real bus read, and closing its fd sends the chip a power-state message
+        unless the device is detached. Only the PCI remove (isolate_chip) marks it detached. So:
+
+        - one heartbeat read per failed chip (the first read possible since USER_RESET); a chip that
+          answers is not cut (the failed POST_RESET alone is not proof it is off the bus);
+        - no foreign reader: nothing is done, the hold and its bounded recovery decide;
+        - else each confirmed chip is removed, all within INFLIGHT_DETACH_TIMEOUT_SEC; a remove that
+          fails or does not return in time kills nobody (reset_inflight_cut_refused, host_at_risk);
+        - then the pollers stop (owed to the next close to HEALTHY) and the readers get SIGTERM,
+          SIGKILL PREEMPT_KILL_GRACE_SEC later, awaited at most INFLIGHT_KILL_TIMEOUT_SEC.
+
+        Returns False only when a remove is still blocked in the kernel (the caller then skips its
+        rescan). Releases nothing and lifts no hold."""
+        log = self._deps.logger()
+        reader = getattr(self._deps, "read_inflight_heartbeats", None)
+        if reader is None or getattr(self._deps, "cut_inflight_readers", None) is None:
+            return True
+        beats = await asyncio.to_thread(reader, frozenset(chips))
+        if log:
+            log.info(f"IN-FLIGHT read after failed POST_RESET: { {i: beats.get(i) for i in chips} }")
+        confirmed = sorted((i for i in chips if beats.get(i) == ALL_ONES), key=int)
+        self._deps.health_event(
+            "reset_post_reset_failed", chips=list(chips), off_bus=confirmed, beats={i: beats.get(i) for i in chips}
+        )
+        if not confirmed:
+            return True
+        reason = f"chip(s) {confirmed} failed POST_RESET and read all-ones after a mesh reset"
+        find = getattr(self._deps, "find_inflight_readers", None)
+        try:
+            readers, complete = await asyncio.to_thread(find) if find is not None else ([], False)
+        except Exception as e:  # noqa: BLE001 - an unread scan counts as a reader
+            readers, complete = [], False
+            if log:
+                log.error(f"IN-FLIGHT holder scan failed ({e}); treating it as a reader")
+        if not readers and complete:
+            self._deps.health_event(
+                "reset_inflight_readers_cut", chips=confirmed, readers=[], detached=[], signalled=[]
+            )
+            return True
+        detached: list = []
+        blocked = False
+
+        if self._deps.isolate_chip is not None:
+            # Each remove is the one in-flight PCI write (spec 04 I76), all within one budget. The first
+            # that times out or is refused (PCI-wedged) ends the cut: nobody is killed.
+            deadline = time.monotonic() + INFLIGHT_DETACH_TIMEOUT_SEC
+            for idx in confirmed:
+                try:
+                    ok = await PCI_WRITER.write(
+                        f"in-flight cut remove of chip {idx}",
+                        self._deps.isolate_chip,
+                        idx,
+                        timeout=max(0.01, deadline - time.monotonic()),
+                    )
+                except PciWedged:
+                    blocked = True
+                    break
+                if ok:
+                    detached.append(idx)
+        if detached:
+            self._deps.isolated_chips().update(detached)
+        stuck = [i for i in confirmed if i not in detached]
+        if stuck:
+            why = (
+                f"did not return in {INFLIGHT_DETACH_TIMEOUT_SEC} s (its thread may still be blocked in the kernel)"
+                if blocked
+                else "failed"
+            )
+            if log:
+                log.error(
+                    f"IN-FLIGHT chip(s) {stuck}: PCI remove {why}; their readers {readers} are NOT killed "
+                    f"(a kill would make the driver touch the chip). The hold and its bounded recovery decide — {reason}"
+                )
+            self._deps.health_event(
+                "reset_inflight_cut_refused",
+                chips=stuck,
+                detached=detached,
+                readers=readers,
+                remove_blocked=blocked,
+                host_at_risk=True,
+            )
+            return not blocked
+        await self._deps.set_device_pollers(False, lambda m: log.info(f"IN-FLIGHT {m}") if log else None)
+        if self._deps.owe_device_pollers is not None:
+            self._deps.owe_device_pollers(reason)
+        try:
+            await asyncio.wait_for(self._deps.cut_inflight_readers(reason), timeout=INFLIGHT_KILL_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            if log:
+                log.error(f"IN-FLIGHT reader cut did not finish in {INFLIGHT_KILL_TIMEOUT_SEC} s — {reason}")
+            self._deps.health_event("reset_inflight_cut_timeout", chips=confirmed, readers=readers)
+        return True
+
     async def stop_pollers_for_hung(self, sample: dict, dead: list) -> None:
         """Stop the device pollers at the FIRST sample that shows a present chip hung — reading
         all-ones, or a heartbeat that did not move since the previous sample — not at the second
@@ -674,10 +780,11 @@ class TelemetrySampler:
             )
 
     async def _detach_chips(self, chips: list) -> tuple:
-        """PCI-remove each chip, every write in a worker thread and all of them inside one
-        DETACH_TIMEOUT_SEC budget (spec 03 I84). Returns ``(removed, stuck)``. A remove still running
-        at the bound is stuck, and no further chip is tried: a hung remove keeps the kernel's
-        remove path busy, so the next write would hang behind it."""
+        """PCI-remove each chip, every write the one in-flight PCI write (spec 04 I76) and all of them
+        inside one DETACH_TIMEOUT_SEC budget (spec 03 I84). Returns ``(removed, stuck)``. A remove still
+        running at the bound, or refused behind an earlier blocked write, latches PCI-wedged and is
+        stuck, and no further chip is tried: a hung remove keeps the kernel's remove path busy, so the
+        next write would hang behind it."""
         removed: list = []
         if self._deps.isolate_chip is None:
             return removed, list(chips)
@@ -687,8 +794,8 @@ class TelemetrySampler:
             if left <= 0:
                 break
             try:
-                ok = await asyncio.wait_for(asyncio.to_thread(self._deps.isolate_chip, idx), timeout=left)
-            except asyncio.TimeoutError:
+                ok = await PCI_WRITER.write(f"isolate dead chip {idx}", self._deps.isolate_chip, idx, timeout=left)
+            except PciWedged:
                 self._deps.health_event(
                     "chip_detach_timeout", chip=idx, timeout_sec=DETACH_TIMEOUT_SEC, host_at_risk=True
                 )
@@ -749,6 +856,21 @@ class TelemetrySampler:
         if not fresh:
             return
         isolated_chips.update(fresh)
+
+        if PCI_WRITER.latched:
+            # Spec 04 I76: a PCI write is blocked in the kernel. A remove would only queue behind it on
+            # the same lock (or start a second blocked thread), and killing a holder or stopping a poller
+            # of a chip that is off the bus but still attached makes the driver touch that chip on the fd
+            # close. So skip the chip: no remove, no kill; the device is held and the power cycle, already
+            # requested by the latch, is the recovery.
+            if log:
+                log.error(
+                    f"DEAD CHIP(S) {fresh}: isolation skipped, PCI-wedged ({PCI_WRITER.reason}); "
+                    f"holding the device for the power cycle"
+                )
+            self._deps.health_event("chip_isolation_skipped", chips=fresh, reason=PCI_WRITER.reason, host_at_risk=True)
+            self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} fell off the PCIe bus", why="heartbeat")
+            return
 
         if log:
             log.error(

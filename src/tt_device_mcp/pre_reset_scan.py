@@ -24,9 +24,9 @@ off-bus chip that is still bound would make the kernel read that chip: the very 
 exists to prevent. So such chips are detached first (``isolate_chip``, the broker's own valve), and
 only then are readers signalled. If one cannot be detached, nothing is signalled and the reset is
 refused: the hold stays and the bounded recovery (the 10-min ladder, then the power cycle) runs.
-The detach is a sysfs write that can block in the kernel, so it runs off the event loop with one
-deadline (``PRE_RESET_DETACH_TIMEOUT_SEC``) for all the chips; a detach that does not return in time
-counts as not detached.
+The detach is a sysfs write that can block in the kernel, so it runs off the event loop as the one
+in-flight PCI write (spec 04 I76) with one deadline (``PRE_RESET_DETACH_TIMEOUT_SEC``) for all the
+chips; a detach that does not return in time counts as not detached and latches PCI-wedged.
 
 Two more refusals come before any signal. A holder inside a reset (a process in a reset scope, or
 one the broker launched as a reset and registered here) is never signalled: killing a reset partway
@@ -219,7 +219,7 @@ async def clear_device_readers(
     holder (one the broker already killed, still mid-exit) is a reader whatever its uid.
 
     Before any signal, every chip still bound but off the bus (``offbus_chips``) is detached
-    (``detach_chip``, in the executor, all within ``detach_timeout_sec``); if one fails or the deadline
+    (``detach_chip``, the one in-flight PCI write, all within ``detach_timeout_sec``); if one fails or the deadline
     passes, nothing is signalled and the reset is refused (module docstring).
 
     ``reset_active`` (the mechanism's ``scope_active``) names a reset already running; with one, or
@@ -307,18 +307,19 @@ async def clear_device_readers(
         off = [str(i) for i in await loop.run_in_executor(None, offbus_chips)]
     except Exception:  # noqa: BLE001 - unreadable: treat as on the bus, as the reset's own gates do
         off = []
-    # A sysfs remove can block in the kernel: off the loop, one deadline for all the chips. A detach
-    # still running at the deadline is left to finish on its own; this reset is refused either way.
+    # A sysfs remove can block in the kernel: off the loop, one deadline for all the chips, each the
+    # one in-flight PCI write (spec 04 I76). A detach still running at the deadline, or refused behind
+    # an earlier blocked write, latches PCI-wedged; this reset is refused either way.
+    from tt_device_mcp.health.pci_writer import PCI_WRITER
+
     deadline = clock() + detach_timeout_sec
     for idx in off:
         left_sec = deadline - clock()
         ok = False
         if left_sec > 0 and not result.detach_timed_out:
             try:
-                ok = bool(
-                    await asyncio.wait_for(asyncio.shield(loop.run_in_executor(None, detach_chip, idx)), left_sec)
-                )
-            except asyncio.TimeoutError:
+                ok = bool(await PCI_WRITER.write(f"pre-reset detach of chip {idx}", detach_chip, idx, timeout=left_sec))
+            except asyncio.TimeoutError:  # PciWedged included
                 result.detach_timed_out = True
             except Exception:  # noqa: BLE001
                 ok = False

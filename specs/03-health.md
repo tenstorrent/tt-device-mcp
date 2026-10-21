@@ -941,7 +941,8 @@ cooldown (spec 04 I65) holds longer.
   `/health` stay gated. A read that is not all-ones clears *lost*. While a reset step owns the chips (`reset_in_flight`, or a reset
   scope still cycling them after the broker stopped waiting) every chip is *recovering*: the
   sampler skips its sample, `/health` serves the last live picture and reads nothing, and only the
-  step's own reads run, ungated. The device pollers (telemetry services) stop on the FIRST sample
+  step's own reads run, ungated. The I83 cut is one of those step reads: after a mesh reset whose
+  POST_RESET failed, one heartbeat read of each failed chip only, nothing else. The device pollers (telemetry services) stop on the FIRST sample
   that shows a present chip hung, not the second, when every hung chip on it still answers (a
   heartbeat that did not move: the read came back, so the chip completes the driver's fd-close
   messages, a power-state ARC message polled for at most 1 s). While a chip on the
@@ -1397,13 +1398,68 @@ cooldown (spec 04 I65) holds longer.
   recover: off-bus classes (whole-tray drop, partial off-bus) are unchanged, as their recovery is
   driven by the off-bus evidence and the I76 bound, not by this verdict; the fabric/health-check
   failure class no longer opens on a run the broker killed; every other class is unchanged.
+- **I83 — A chip that failed POST_RESET and reads all-ones after a mesh reset is detached before
+  any of its readers is killed, and never killed without a detach.** Driver facts (tt-kmd 2.11.0)
+  this rests on: `tt-smi -glx_reset` issues USER_RESET on every chip before the BMC re-power; it
+  zaps every userspace mapping and sets the chip's `needs_hw_init`. While that is set, telemetry
+  reads (the heartbeat included) fail with ENODATA without touching the chip, and an fd close sends
+  it nothing. tt-smi then waits for every chip (the I81 driver wait) and issues POST_RESET on each;
+  POST_RESET clears `needs_hw_init` whether it succeeds or not, and on failure tt-smi prints
+  `POST_RESET failed for device /dev/tenstorrent/N.` and exits 1. So no reader can reach a chip
+  between USER_RESET and its POST_RESET, and an all-ones read is possible only after it: a watch
+  during the driver wait reads ENODATA on every chip and never sees all-ones. A chip that never
+  enumerates fails the driver wait and gets no POST_RESET at all; the kernel has removed its
+  endpoint (detached), so it needs no cut. The window where a reader can stall the host is a chip
+  that came back far enough to enumerate, failed POST_RESET (`needs_hw_init` now clear) and is off
+  the bus: reads are real bus reads again and an fd close sends a power-state message.
+  The trigger: the reset's output watch records every chip in that tt-smi line (cleared at each
+  reset's start). Once tt-smi has exited, and only if no reset scope is still cycling the chips,
+  `reset_with_quiesce` runs the cut before its closing rescan; every mesh reset logs one line saying
+  which chips failed POST_RESET, or none. Order: (1) one heartbeat read of each failed chip and no
+  other (`reset_post_reset_failed` with the values): the failed POST_RESET is the first, independent
+  strike, and this read is the second, the first read possible since USER_RESET; a chip that answers
+  is not cut. A second read would only add a read of an off-bus chip and delay the cut, while
+  readers keep reading it. (2) The broker scans the device holders that are neither its own
+  processes, their children, nor the reset's scope; with none and a complete scan it does nothing
+  (no detach, no kill); an incomplete scan counts as a reader. (3) Each confirmed chip is removed
+  from the kernel with a PCI remove (`isolate_chip`), the one driver path that marks the device
+  detached. All removes together get at most 15 s; one that fails or does not return in time
+  (its thread may stay blocked in the kernel) leaves every reader alone
+  (`reset_inflight_cut_refused`, `host_at_risk`, `remove_blocked`), and a blocked remove also skips
+  the closing rescan, which would queue behind it. (4) Only when every confirmed chip was removed
+  are the pollers stopped (and owed, I66) and the readers sent SIGTERM, then SIGKILL 10 s later
+  (`reset_inflight_readers_cut`), awaited at most 30 s. The reset's closing rescan (and spec 04
+  I81's driver-wait rescan) write `/sys/bus/pci/rescan` with a 30 s bound through the same
+  one in-flight PCI writer (spec 04 I76): while a remove is still blocked, they are refused at once
+  and PCI-wedged latches.
+  A removed chip is in `isolated_chips`, so the closing rescan re-adds it if it answers now; one
+  still dead stays out for the hold. The cut never lifts a hold or releases the device: no hold
+  lifts without a full health check, fabric included, that has just passed (fewer links than
+  cabled fails it), and every hold still runs the full ladder at 10 min, then the power cycle
+  (spec 04 I76). Known gap: tt-smi's own fd close of the failed chip, as it exits, is outside the
+  broker. Time to recover: no change for a healthy reset (no read at all during the reset; one log
+  line) or for any class whose reset reports no POST_RESET failure (ARC not ready, fabric/health
+  check, dispatch, hold deadline, dirty boot, and a whole-tray or partial off-bus set that never
+  enumerates). A reset with a failed POST_RESET adds one read per failed chip, at most 15 s of
+  removes and, with a reader, the kill (SIGTERM, SIGKILL 10 s later, awaited at most 30 s) before
+  the closing rescan: one read plus 15 s plus 30 s, about 45 s at worst, on a reset that has already
+  failed, while the ladder, the I76 bound and the power cycle keep their timing. A remove left
+  blocked in the kernel holds the PCI rescan/remove lock; it latches PCI-wedged (spec 04 I76):
+  later PCI writes are refused at once and the power cycle is asked at once (cooldown permitting),
+  so it adds one timeout before the power-cycle request. A blocked thread cannot be killed and stays
+  until the cycle; the latch is lost on a broker restart (one more timeout and thread at most). A cancel
+  during the cut still restores the pollers, or owes them to the next healthy close when the reset
+  failed (I66).
+  The cut runs after the driver wait, so it removes no chip I81's rescan still waits for.
 - **I84 — The out-of-reset dead-chip valve detaches a chip before it kills anyone; a failed
   detach kills nobody.** The driver's fd-close path sends the chip a power-state message unless
   the device is marked detached, and only the PCI remove marks it; a stopped poller closes its fd
   the same way. So `TelemetrySampler.isolate_dead_chips` first PCI-removes every newly confirmed
-  chip, each write in a worker thread (the event loop never waits on it) and all of them within
-  one `DETACH_TIMEOUT_SEC` (15 s) bound; a remove still running at the bound is not detached,
-  journals `chip_detach_timeout`, and no further chip is tried behind it. Only when every chip is
+  chip, each write the one in-flight PCI writer's (spec 04 I76; a worker thread, so the event loop
+  never waits on it) and all of them within one `DETACH_TIMEOUT_SEC` (15 s) bound; a remove still
+  running at the bound, or refused behind an earlier blocked write, is not detached, journals
+  `chip_detach_timeout`, latches PCI-wedged (the power cycle is asked at once, I65 cooldown
+  permitting) and no further chip is tried behind it. Only when every chip is
   removed does it kill the device holders (`_kill_device_holders`, SIGKILL; the chip is gone, so
   no SIGTERM grace applies) and stop and owe the pollers. It kills nobody, logs the reason and
   journals `chip_dead_kill_refused` when: a remove failed or timed out
@@ -1432,8 +1488,8 @@ cooldown (spec 04 I65) holds longer.
   10 min and then the power cycle. Whole-tray and all-chips-off drops keep their own path straight
   to the power cycle (I19's blackout rule is unchanged). Time to recover: partial off-bus with a
   working remove is unchanged (the kill and poller stop move after a remove that takes well under
-  a second); a remove that hangs adds at most 15 s before the hold is marked, so the I76 ladder
-  and the power cycle come at most 15 s later in that case only; a failed remove leaves the
+  a second); a remove that hangs adds at most 15 s before the hold is marked, and its PCI-wedged
+  latch asks for the power cycle at once (I65 cooldown permitting) instead of at the I76 mark; a failed remove leaves the
   holders to the hold's bounded recovery instead of a kill that can take the host down; whole-tray,
   all-chips-off and every non-off-bus class are unchanged. A refusal records which holders it kept
   (`chip_dead_holders_kept`: pids with their start times, the running job, the hold's start); at the
@@ -2131,6 +2187,9 @@ refuses.
 | I80 | `tests/test_health_held_during_op.py::test_health_stays_held_while_a_forced_rung_runs`, `tests/test_health_held_during_op.py::test_health_lifts_the_hold_only_when_the_gate_passes_inside_the_op`, `tests/test_health_held_during_op.py::test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held`, `tests/test_health_held_during_op.py::test_a_hold_opened_inside_an_op_keeps_its_held_since_after_the_op`, `tests/test_health_held_during_op.py::test_a_closed_episodes_held_since_never_carries_into_the_next_hold`, `tests/test_health_held_during_op.py::test_a_rehold_inside_the_carry_window_reports_the_carried_start_in_and_after_the_op`, `tests/test_health_held_during_op.py::test_an_in_window_rehold_inside_an_op_with_no_read_keeps_the_carried_start_after_it`, `tests/test_health_held_during_op.py::test_an_in_window_rehold_outside_an_op_reports_the_carried_start`, `tests/test_health_held_during_op.py::test_a_read_before_an_in_window_reholds_verdict_yields_to_the_carried_start` |
 | I81 | `tests/test_validator_not_built.py::test_the_not_built_read_speaks_only_for_the_pinned_validator`, `tests/test_validator_not_built.py::test_a_post_reset_77_with_the_validator_not_built_takes_no_eth_training_wait`, `tests/test_validator_not_built.py::test_the_post_reset_log_names_the_missing_validator_not_a_trained_link`, `tests/test_validator_not_built.py::test_an_operators_own_fabric_check_keeps_the_eth_training_wait`, `tests/test_validator_not_built.py::test_health_shows_whether_the_validator_is_built`, `tests/test_validator_not_built.py::test_the_build_is_requested_once_per_hold_episode_without_blocking`, `tests/test_validator_not_built.py::test_no_build_request_without_systemd_or_root`, `tests/test_validator_not_built.py::test_a_hung_build_request_is_bounded`, `tests/test_validator_not_built.py::test_the_watch_requests_the_build_then_lifts_only_on_a_passing_full_check`, `tests/test_validator_not_built.py::test_an_idle_relift_on_a_not_built_validator_never_resets_or_lifts`, `tests/test_validator_not_built.py::test_the_10_min_bound_still_forces_a_not_built_hold` |
 | I82 | `tests/test_fabric_killed_by_dead_chip.py::test_a_fabric_check_killed_by_dead_chip_isolation_is_no_verdict`, `tests/test_fabric_killed_by_dead_chip.py::test_the_kill_mark_is_read_once_and_a_later_pass_settles_the_debt`, `tests/test_fabric_killed_by_dead_chip.py::test_a_minus_9_the_isolation_did_not_cause_keeps_its_old_verdict`, `tests/test_fabric_killed_by_dead_chip.py::test_a_kill_during_the_traffic_only_rerun_is_no_verdict_either`, `tests/test_fabric_killed_by_dead_chip.py::test_a_kill_during_the_descriptor_run_starts_no_rerun`, `tests/test_fabric_killed_by_dead_chip.py::test_dead_chip_isolation_marks_the_fabric_check_killed_and_no_lift_follows`, `tests/test_fabric_killed_by_dead_chip.py::test_isolation_with_no_fabric_check_in_flight_marks_nothing` |
+| I83 (detach before kill; no kill without a detach; a blocked remove refuses in time, latches PCI-wedged and skips the rescan) | `tests/test_pci_wedged_latch.py::test_b_a_later_rescan_behind_a_blocked_write_fails_fast_and_starts_no_thread`, `tests/test_inflight_reader_cut.py::test_a_failed_post_reset_chip_reading_all_ones_is_detached_before_its_readers_are_killed`, `tests/test_inflight_reader_cut.py::test_a_chip_that_cannot_be_detached_keeps_every_reader_alive`, `tests/test_inflight_reader_cut.py::test_one_failed_detach_of_two_kills_no_reader`, `tests/test_inflight_reader_cut.py::test_with_no_detach_wired_nothing_is_killed`, `tests/test_inflight_reader_cut.py::test_no_reader_means_no_detach_and_no_kill`, `tests/test_inflight_reader_cut.py::test_an_incomplete_holder_scan_counts_as_a_reader`, `tests/test_inflight_reader_cut.py::test_a_remove_that_blocks_refuses_the_cut_in_time`, `tests/test_inflight_reader_cut.py::test_a_kill_that_overruns_its_bound_is_journaled`, `tests/test_inflight_reader_cut.py::test_a_blocked_remove_skips_the_closing_rescan`, `tests/test_below_floor_offbus_ladder.py::test_a_remove_blocked_in_the_kernel_still_lets_the_bound_reach_the_power_cycle`, `tests/test_device_safety.py::test_an_isolated_chip_rung_blocked_in_the_kernel_fails_in_bounded_time` |
+| I83 (trigger: the POST_RESET failure line, cleared per reset; one confirming read of the failed chips only; ENODATA in the driver wait reads as absent and cuts nothing) | `tests/test_inflight_reader_cut.py::test_the_watch_records_post_reset_failures_split_across_reads`, `tests/test_inflight_reader_cut.py::test_a_reset_that_is_not_a_mesh_reset_records_nothing`, `tests/test_inflight_reader_cut.py::test_post_reset_failures_are_cleared_at_each_reset_start`, `tests/test_inflight_reader_cut.py::test_a_failed_chip_that_answers_is_not_cut`, `tests/test_inflight_reader_cut.py::test_an_unreadable_failed_chip_is_not_cut`, `tests/test_inflight_reader_cut.py::test_only_the_failed_chips_are_read`, `tests/test_inflight_reader_cut.py::test_enodata_in_the_driver_wait_reads_as_absent_and_cuts_nothing` |
+| I83 (cut after tt-smi exits, before the bounded closing rescan, which re-adds a removed chip that answers; the broker and the reset are never cut) | `tests/test_inflight_reader_cut.py::test_the_mechanism_is_wired_to_the_samplers_cut`, `tests/test_inflight_reader_cut.py::test_a_post_reset_failure_is_cut_after_tt_smi_exits_and_before_the_closing_rescan`, `tests/test_inflight_reader_cut.py::test_a_chip_the_cut_removes_is_readded_by_the_closing_rescan_when_it_answers`, `tests/test_inflight_reader_cut.py::test_a_closing_rescan_that_blocks_is_bounded`, `tests/test_inflight_reader_cut.py::test_the_cut_never_selects_the_broker_the_reset_or_their_children`, `tests/test_inflight_reader_cut.py::test_reclaim_select_replaces_the_tenant_rule`, `tests/test_inflight_reader_cut.py::test_a_cancel_during_the_cut_still_settles_the_pollers` |
 | I84 | `tests/test_deadchip_detach_before_kill.py::test_every_kill_and_poller_stop_comes_after_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_detach_kills_nobody_and_keeps_the_hold`, `tests/test_deadchip_detach_before_kill.py::test_one_failed_detach_of_two_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_with_no_detach_wired_nobody_is_killed`, `tests/test_deadchip_detach_before_kill.py::test_a_hung_detach_is_bounded_and_the_loop_stays_responsive`, `tests/test_deadchip_detach_before_kill.py::test_a_reset_that_started_before_the_kill_keeps_every_holder`, `tests/test_deadchip_detach_before_kill.py::test_another_all_ones_chip_not_yet_detached_defers_the_kill_to_its_own_valve`, `tests/test_deadchip_detach_before_kill.py::test_a_chip_whose_earlier_detach_failed_blocks_every_later_kill`, `tests/test_deadchip_detach_before_kill.py::test_the_broker_never_signals_itself`, `tests/test_deadchip_detach_before_kill.py::test_the_first_all_ones_sample_leaves_the_poller_stop_to_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_or_timed_out_detach_stops_the_pollers_once_and_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_beside_an_untried_chip_stops_the_pollers_on_the_next_sample`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_under_a_live_reset_leaves_the_poller_stop_to_the_reset` |
 | I84 a refusal's holders reach the power cycle at the I76 bound; the record lifts nothing and only a passing full check with fabric clears it | `tests/test_deadchip_refused_bound.py::test_a_refused_holder_gets_the_power_cycle_at_the_bound`, `tests/test_deadchip_refused_bound.py::test_the_refusal_record_lifts_nothing_and_only_a_passing_full_check_clears_it` |
 

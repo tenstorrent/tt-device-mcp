@@ -118,12 +118,20 @@ def test_the_fallback_unit_stays_out_of_the_shutdown_and_survives_its_killall(os
 
 def _run_fallback(tmp_path, bound, cmd, timeout=5):
     pidf = tmp_path / "fallback.pid"
+    # The fallback runs the installed hook's IPMI preparation: never the host's, a stub here.
+    prep = tmp_path / "prepare-ipmi"
+    prep.write_text(f'#!/bin/sh\necho "$*" >> "{tmp_path / "prepared"}"\n')
+    prep.chmod(0o755)
+    script = pc.FALLBACK_SH
+    for d in pc.SHUTDOWN_HOOK_DIRS:
+        script = script.replace(f"{d}/{pc.SHUTDOWN_HOOK_NAME}", str(prep))
+    assert str(prep) in script
     argv = [
         "/bin/bash",
         "-c",
         pc.FALLBACK_LAUNCH_SH,
         pc.FALLBACK_ARGV0,
-        pc.FALLBACK_SH,
+        script,
         str(pidf),
         str(bound),
         str(timeout),
@@ -162,6 +170,21 @@ def test_a_hung_shutdown_reaches_the_cycle_once_the_bound_passes(tmp_path):
     took = time.monotonic() - t0
     assert out.read_text() == f"{REASON}|a b|c|"
     assert 2 <= took < 2 + 2 + 5, f"fired after {took:.1f}s for a 2s bound"
+
+
+def test_the_fallback_has_the_hook_prepare_ipmi_before_it_fires(tmp_path):
+    """A shutdown that hangs may hang past openipmi's stop (drivers unloaded, /dev/ipmi0 gone): the
+    fallback has the installed hook load them again, bounded, before its cycle command runs. Its unit
+    has DefaultDependencies=no, so no ordering against openipmi could keep them loaded for it."""
+    out = tmp_path / "fired"
+    cmd = ["/bin/sh", "-c", f'cat "{tmp_path / "prepared"}" > "$0"', str(out)]
+    _, proc = _run_fallback(tmp_path, 0, cmd)
+    assert proc.wait(timeout=30) == 0
+    assert out.read_text() == "--prepare-ipmi\n"
+    for d in pc.SHUTDOWN_HOOK_DIRS:
+        assert f"{d}/{pc.SHUTDOWN_HOOK_NAME}" in pc.FALLBACK_SH
+    assert f'timeout {pc.HOOK_IPMI_PREPARE_SEC} "$h" --prepare-ipmi' in pc.FALLBACK_SH
+    assert pc.FALLBACK_SH.index("--prepare-ipmi") < pc.FALLBACK_SH.index(f"exec -a {pc.FALLBACK_FIRE_ARGV0}")
 
 
 def test_the_fallback_fires_under_an_at_sign_argv0_and_its_timeout(tmp_path):
@@ -506,6 +529,10 @@ def test_the_hooks_worst_case_fits_systemd_shutdowns_hook_timeout():
     assert pc.hook_worst_case_sec() < pc.SYSTEMD_SHUTDOWN_HOOK_TIMEOUT_SEC
     text = HOOK.read_text()
     assert f"timeout {pc.HOOK_MDADM_WAIT_SEC} mdadm" in text
+    assert f'timeout {pc.HOOK_IPMI_PREPARE_SEC} "$0" --prepare-ipmi &' in text
+    # The IPMI preparation runs beside the RAID wait, never before or after it.
+    assert text.index("--prepare-ipmi &") < text.index("mdadm --wait-clean") < text.index('wait "$ipmi_pid"')
+    assert f'timeout {pc.HOOK_SEL_TIMEOUT_SEC} "$@" raw' in text
     assert f"-le {pc.HOOK_TRY_TIMEOUT_MAX_SEC} ] || try_timeout={pc.HOOK_TRY_TIMEOUT_MAX_SEC}" in text
     assert f"-ge {pc.HOOK_TRY_TIMEOUT_MIN_SEC} ] || try_timeout={pc.HOOK_TRY_TIMEOUT_MIN_SEC}" in text
     assert f"-le {pc.HOOK_TRIES} ]" in text and f"sleep {pc.HOOK_RETRY_PAUSE_SEC}\n" in text
@@ -531,10 +558,33 @@ def hook(tmp_path):
         p = stubs / name
         p.write_text(f'#!/bin/sh\necho "{name} $*" >> "{trace}"\n')
         p.chmod(0o755)
+    # The IPMI node and its sysfs entry live in tmp_path; by default the node is there (a link to
+    # /dev/null, a character device) and modprobe and mknod are stubs that never touch the host.
+    dev, sysfs = tmp_path / "dev", tmp_path / "sys-class-ipmi"
+    dev.mkdir()
+    sysfs.mkdir()
+    (dev / "ipmi0").symlink_to("/dev/null")
+    (stubs / "modprobe").write_text(
+        "#!/bin/sh\n"
+        f'echo "modprobe $*" >> "{trace}"\n'
+        '[ -n "$MODPROBE_LOADS" ] && [ "$2" = ipmi_si ] || exit "${MODPROBE_RC:-0}"\n'
+        f'mkdir -p "{sysfs}/ipmi0" && echo 238:0 > "{sysfs}/ipmi0/dev"\n'
+    )
+    (stubs / "mknod").write_text(f'#!/bin/sh\necho "mknod $*" >> "{trace}"\nln -s /dev/null "$3"\n')
+    for name in ("modprobe", "mknod"):
+        (stubs / name).chmod(0o755)
     cycle = tmp_path / "cycle"
     cycle.write_text(f'#!/bin/sh\necho "cycle $*" >> "{trace}"\nexit "${{CYCLE_RC:-0}}"\n')
     cycle.chmod(0o755)
+    # An in-band ipmitool stand-in: records its argv, fails `chassis power cycle` with CYCLE_RC.
+    ipmitool = tmp_path / "ipmitool"
+    ipmitool.write_text(
+        f'#!/bin/sh\necho "ipmitool $*" >> "{trace}"\n'
+        'case "$*" in *"chassis power cycle") exit "${CYCLE_RC:-0}" ;; esac\n'
+    )
+    ipmitool.chmod(0o755)
     req = tmp_path / "req"
+    last = {}
 
     def run(verb, request=None, cycle_rc=0, **extra_env):
         if request is not None:
@@ -542,15 +592,27 @@ def hook(tmp_path):
         env = {
             "PATH": f"{stubs}:/usr/bin:/bin",
             "TT_DEVICE_MCP_POWER_CYCLE_REQUEST": str(req),
+            "TT_DEVICE_MCP_IPMI_DEV": str(dev),
+            "TT_DEVICE_MCP_IPMI_SYSFS": str(sysfs),
             "CYCLE_RC": str(cycle_rc),
             "HOOK_VERB": verb,
             **extra_env,
         }
         argv = ["/bin/sh", "-c", 'set -- "$HOOK_VERB"; . "$0"', str(HOOK)]
         r = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
+        last["stderr"] = r.stderr
         return r.returncode, [t.rstrip() for t in trace.read_text().splitlines()] if trace.exists() else []
 
-    return {"run": run, "cycle": str(cycle), "stubs": stubs, "trace": trace, "pid_file": tmp_path / "req.fallback.pid"}
+    return {
+        "run": run,
+        "cycle": str(cycle),
+        "ipmitool": str(ipmitool),
+        "stubs": stubs,
+        "trace": trace,
+        "dev": dev,
+        "last": last,
+        "pid_file": tmp_path / "req.fallback.pid",
+    }
 
 
 def _request(argv, age=0):
@@ -584,6 +646,83 @@ def test_hook_ignores_a_request_with_no_command(hook):
 def test_hook_retries_a_failing_cycle_then_lets_the_reboot_continue(hook):
     rc, trace = hook["run"]("reboot", _request([hook["cycle"]]), cycle_rc=1)
     assert rc == 1 and [t for t in trace if t.startswith("cycle")] == ["cycle"] * 3
+
+
+def _no_sleeps(trace):
+    return [t for t in trace if not t.startswith("sleep 0.2")]
+
+
+def test_hook_loads_the_ipmi_drivers_and_makes_the_node_before_an_in_band_cycle(hook):
+    """openipmi's stop unloaded ipmi_si/ipmi_devintf and deleted /dev/ipmi0 before the hook ran: the
+    hook loads them again and makes the node from sysfs, and only then fires the cycle."""
+    (hook["dev"] / "ipmi0").unlink()
+    rc, trace = hook["run"]("reboot", _request([hook["ipmitool"], "chassis", "power", "cycle"]), MODPROBE_LOADS="1")
+    assert rc == 0
+    trace = _no_sleeps(trace)
+    loads = [t for t in trace if t.startswith("modprobe")]
+    assert loads == [f"modprobe -q {m}" for m in ("ipmi_msghandler", "ipmi_devintf", "ipmi_si")]
+    mknod = trace.index(f"mknod -m 0600 {hook['dev']}/ipmi0 c 238 0")
+    assert trace.index(loads[-1]) < mknod < trace.index("ipmitool chassis power cycle")
+    assert "loaded the IPMI drivers again" in hook["last"]["stderr"]
+
+
+def test_hook_leaves_loaded_drivers_alone(hook):
+    rc, trace = hook["run"]("reboot", _request([hook["cycle"]]))
+    assert rc == 0 and not [t for t in trace if t.startswith(("modprobe", "mknod"))]
+
+
+def test_hook_with_no_ipmi_device_says_so_loudly_and_still_tries(hook):
+    """No driver loads and no node appears: the hook gives up within its bound, says so, still tries
+    the command (it may be out-of-band) and, when every try fails, says the reboot goes on warm."""
+    (hook["dev"] / "ipmi0").unlink()
+    rc, trace = hook["run"](
+        "reboot", _request([hook["ipmitool"], "chassis", "power", "cycle"]), cycle_rc=1, MODPROBE_RC="1"
+    )
+    assert rc == 1
+    assert len([t for t in trace if t.startswith("sleep 0.2")]) == 49, "the preparation is bounded on its own"
+    assert [t for t in trace if t.endswith("chassis power cycle")] == ["ipmitool chassis power cycle"] * 3
+    err = hook["last"]["stderr"]
+    assert "NO IPMI DEVICE" in err and "POWER CYCLE FAILED" in err and "WARM" in err
+
+
+def _sel_records(trace, prefix):
+    """The OEM SEL records the hook added, as (timestamp, stage, detail)."""
+    out = []
+    for t in trace:
+        if t.startswith(prefix + " raw 0x0a 0x44 "):
+            b = t[len(prefix) + 1 :].split()[3:]
+            assert b[:3] == ["0x00", "0x00", "0xc0"] and b[7:14] == ["0x00"] * 3 + ["0x54", "0x54", "0x50", "0x43"]
+            assert len(b) == 16
+            out.append((sum(int(x) << (8 * i) for i, x in enumerate(b[3:7])), b[14], b[15]))
+    return out
+
+
+def test_hook_records_the_cycle_in_the_bmc_sel_on_the_cycles_own_bmc(hook):
+    """The trace that outlives the reboot: an OEM SEL record before the cycle, through the same
+    ipmitool options as the cycle command, saying whether the hook had to restore the IPMI device."""
+    (hook["dev"] / "ipmi0").unlink()
+    argv = [hook["ipmitool"], "-I", "open", "chassis", "power", "cycle"]
+    rc, trace = hook["run"]("reboot", _request(argv), MODPROBE_LOADS="1")
+    assert rc == 0
+    recs = _sel_records(trace, "ipmitool -I open")
+    assert [(s, d) for _, s, d in recs] == [("0x01", "1")]
+    assert abs(recs[0][0] - time.time()) < 60
+    sel = next(i for i, t in enumerate(trace) if " raw 0x0a 0x44 " in t)
+    assert sel < trace.index("ipmitool -I open chassis power cycle")
+
+
+def test_hook_records_a_cycle_that_failed_every_try_in_the_sel(hook):
+    rc, trace = hook["run"]("reboot", _request([hook["ipmitool"], "chassis", "power", "cycle"]), cycle_rc=1)
+    assert rc == 1
+    assert [(s, d) for _, s, d in _sel_records(trace, "ipmitool")] == [("0x01", "0"), ("0x02", "3")]
+    assert [i for i, t in enumerate(trace) if " raw " in t][-1] > max(
+        i for i, t in enumerate(trace) if t.endswith("chassis power cycle")
+    )
+
+
+def test_hook_adds_no_sel_record_for_an_opaque_command(hook):
+    rc, trace = hook["run"]("reboot", _request([hook["cycle"], "chassis", "power", "cycle"]))
+    assert rc == 0 and not [t for t in trace if " raw " in t]
 
 
 def _gone(pid):
@@ -653,6 +792,18 @@ def test_hook_stops_the_fallback_first_and_kills_its_process_group():
     body = text[text.index("stop_fallback() {") :]
     body = body[: body.index("\n}\n")]
     assert "kill -STOP $gen" in body and 'kill -9 "-$1"' in body and "kill -9 $tree" in body
+
+
+def test_the_installer_and_autoupdate_both_deploy_the_hook_with_no_hand_step():
+    """Both the installer and every auto-update run apply-host-config.sh, which installs the hook
+    (and with it the IPMI preparation the fallback unit calls) fail-closed under set -e."""
+    apply = APPLY.read_text()
+    assert "set -euo pipefail" in apply
+    line = next(t for t in apply.splitlines() if t.startswith("install -D -m 0755") and HOOK.name in t)
+    assert "||" not in line, "the hook install must stay fatal"
+    for script in ("install-tt-device-broker.sh", "tt-device-autoupdate.sh"):
+        text = (REPO / "deploy" / script).read_text()
+        assert 'deploy/apply-host-config.sh" "$' in text, script
 
 
 def test_the_installer_installs_the_hook_where_the_broker_looks():

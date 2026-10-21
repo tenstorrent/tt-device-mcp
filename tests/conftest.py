@@ -82,6 +82,19 @@ def reset_removed_chip_records():
 
 
 @pytest.fixture(autouse=True)
+def reset_pci_writer():
+    """Clear the one in-flight PCI writer and its PCI-wedged latch (spec 04 I76) around every test."""
+    try:
+        from tt_device_mcp.health.pci_writer import PCI_WRITER
+    except ImportError:
+        yield
+        return
+    PCI_WRITER.reset_for_tests()
+    yield
+    PCI_WRITER.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def reset_broker_internal_pids():
     """Clear the broker-internal pid registry (spec 04 I59) around every test: a probe one test
     spawned through run_probe must not discount a holder in the next."""
@@ -362,6 +375,10 @@ def _seal_real_hardware(monkeypatch, tmp_dirs):
     # is how three of them failed on a developer box mid-incident and nowhere else. A test
     # that means to exercise the guard patches this itself.
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    # Same hole for a job's own scope: _terminate_job asks systemd whether ttdev-job-<id>.scope
+    # is active. On a broker host whose live job shares a test job's id, the real answer is yes
+    # and the kill path goes to `systemctl kill` on the host's job. A test about scopes patches it.
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
 
     # The pre-reset holder scan (spec 04 I92) walks /proc and signals the readers it finds. Unstubbed,
     # a unit test's reset would scan this machine's real processes. Every reset here sees a clear
@@ -469,6 +486,9 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     from tt_device_mcp.health import chip_state
 
     chip_state.reset()
+    # The dead-chip valve's per-chip strikes: a strike left by an earlier test on the same worker
+    # marks a chip lost on its first all-ones sample in the next one.
+    monkeypatch.setattr(srv.sampler, "dead_chip_strikes", {})
     monkeypatch.setattr(srv, "_last_offbus_state", {})
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
