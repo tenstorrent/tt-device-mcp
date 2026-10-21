@@ -192,11 +192,14 @@ cooldown (spec 04 I65) holds longer.
   can itself be stuck inside a fabric check holding the device lock. Its dead-chip isolation is
   deliberately lock-free, requires two consecutive all-ones samples, is suppressed while a reset
   scope is live (a reset reads all-ones by design), treats an all-chips blackout as a global event
-  (report, never amputate), and kills device holders BEFORE removing the endpoint — a mapping
-  outlives the endpoint and a read through it stalls a CPU core and reboots the host.
+  (report, never amputate), and removes the endpoint BEFORE it kills any device holder or stops a
+  poller (I84) — the driver's fd-close path reaches a chip that is not detached, and a read of an
+  off-bus chip stalls a CPU core and reboots the host.
   Its raw reads go through the chip-state gate (I66): it skips the sample while a reset step owns
   the chips, a chip it has confirmed lost reads as all-ones without a PCIe read until its re-read
-  is due, and it stops the device pollers on the first hung sample, not the second.
+  is due, and it stops the device pollers on the first hung sample, not the second, unless a chip
+  on that sample reads all-ones and its remove is not tried yet: that stop waits for I84's
+  detach-first valve, which stops them after the remove whether it worked or not.
 - **I20 — A stalled sampler withholds the systemd watchdog ping.** The escalation ladder must
   never sit silently behind a dead sampler; a stall past `STALL_SEC` gets the broker restarted.
 - **I21 — The idle relift lifts a hold only on proof, read-only for self-heal holds.**
@@ -940,8 +943,23 @@ cooldown (spec 04 I65) holds longer.
   sampler skips its sample, `/health` serves the last live picture and reads nothing, and only the
   step's own reads run, ungated. The I83 cut is one of those step reads: after a mesh reset whose
   POST_RESET failed, one heartbeat read of each failed chip only, nothing else. The device pollers (telemetry services) stop on the FIRST sample
-  that shows a present chip hung (all-ones, or a heartbeat that did not move), not the second; a
-  whole-mesh blip or a reset does not count. They are not restored after a failed or timed-out
+  that shows a present chip hung, not the second, when every hung chip on it still answers (a
+  heartbeat that did not move: the read came back, so the chip completes the driver's fd-close
+  messages, a power-state ARC message polled for at most 1 s). While a chip on the
+  sample reads all-ones and its remove is not tried yet (a first strike, or inside the fast
+  cadence's confirm gate) the sampler does not stop them: a stopped poller closes its fds, and
+  tt-kmd's close path (noc cleanup, memory teardown, power-state message) reaches every chip that is
+  not detached, and only the PCI remove marks it detached. It journals `pollers_quiesce_deferred`
+  (`reason: chip_not_detached`) once per hung set and leaves the stop to the dead-chip valve, at
+  most one more sample later (`SAMPLE_INTERVAL_SEC`, 10 s; the fast cadence's `FAST_CONFIRM_SEC`
+  gate is 4 s), the window the two-sample proof already accepts. The valve stops them after its
+  remove, whether the remove worked or not (I84). A chip whose remove already failed or timed out is
+  never retried, so it does not defer the stop: the sampler stops them on that sample. Left running,
+  the pollers would not spare that chip the close: they would read it on every sample until the
+  hold's first reset (up to spec 04 I76's 10-min ladder), and a crashed poller that systemd restarts
+  closes and reopens its fds on it each time (tt-kmd's open path sends the same power-state
+  message). Stopped once, each fd closes once and stays closed, and systemd does not restart a unit
+  stopped on request. A reset that owns the chips quiesces them itself. A whole-mesh blip or a reset does not count. They are not restored after a failed or timed-out
   reset, even while the FSM still reads HEALTHY: the device stays held and their start is owed to the next close to HEALTHY,
   reached only through a passing full check, fabric included (04 I12's deferred restore). The state is
   published atomically to `chip-state.json` (spec 06) and on `/health`, so other readers on the
@@ -955,7 +973,9 @@ cooldown (spec 04 I65) holds longer.
   recheck no longer waits another relift interval (up to 120 s) on it, and the hold-deadline
   escalation no longer takes the off-bus ladder for it. A decision on a chip still lost costs at most
   one read of it per second. Pollers left stopped after a failed reset are a telemetry gap
-  only. Lost and recovering state lives in process memory: a reset step clears recovering on every
+  only. Leaving the hung-sample stop to the valve while a chip reads all-ones changes no class's
+  time to recover: the stop neither marks nor lifts a hold, adds no wait, and the valve's two-sample
+  proof, its 15 s-bounded remove, the hold and the 04 I76 ladder keep their timing. Lost and recovering state lives in process memory: a reset step clears recovering on every
   exit (return, raise, cancel) and opens the grace, and a fresh broker publishes a clean
   `chip-state.json` at boot, over a file a crashed process left.
 - **I65 A release wakes a held job at once; the wake never dispatches.** A tenant job held at the
@@ -1197,16 +1217,32 @@ cooldown (spec 04 I65) holds longer.
   (I69), so the restart cost a job and made recovery longer. While the startup gate still owns the
   hold (I75: its task is still to run, within `STARTUP_VERIFY_DEFER_MAX_SEC` of the re-adopted jobs'
   end) and nothing says fault, `/health` carries a `startup_verify` object (`phase`:
-  `readopted_job_running` or `verifying`, `readopted_job_ids`, `fault: false`, `since`);
+  `readopted_job_running` or `verifying`, `readopted_job_ids`, `fault: false`, `since`,
+  `check_started_at`, `deadline`, `bound_sec`). `since` is the hold episode's start or, while that is
+  still unset, the startup gate's start; it is never null while the object shows. `check_started_at`
+  is when the gate stopped waiting on re-adopted jobs and began its hugepage wait and full check;
+  `deadline` is `check_started_at` plus `bound_sec` (`STARTUP_VERIFY_DEFER_MAX_SEC`: the hugepage
+  wait, the fabric check bound and margin, the I75 bound); both are null while a re-adopted job
+  still runs. A client with a queued job reads them rather than guess how long the check may take;
+  past `deadline` the object is null (I75) and the hold reads as any other hold;
   `tt_device_queue_status` carries the same field and a hold row that says it is no fault; a
-  re-adopted job's `tt_device_job_status` carries `readopted: true` and the same object. The
+  re-adopted job's `tt_device_job_status` carries `readopted: true` and the same object, and a queued
+  job's carries `hold_reason` (`held: startup check; dispatches when it passes`) and the same object
+  while it shows. The
   persisted `fsm.json` carries `readopted_jobs`, a list of job id strings that matches
   `startup_verify.readopted_job_ids` within one re-adopted scope poll (`_SCOPE_POLL_SEC`: a kill or
   a fault sign while the job runs reaches the file on the next poll; `[]` while the object is null),
   for a client that reads the file rather than `/health`: synced when the startup gate takes the hold, on each re-adopted scope
   poll and when a re-adopted job ends; the FSM itself empties it on a release (HEALTHY) or DOWN and
   never keeps it outside `boot`/`recovering`; a reboot drops it; a file written before the field
-  loads with `[]`. Nothing in the broker reads it back. The field
+  loads with `[]`. Next to it, `startup_check_in_progress` (a plain boolean),
+  `startup_check_started_at` and `startup_check_deadline` (the object's `since` and `deadline`, or
+  null) tell a client that reads the file that the startup check owns the hold: true from the gate's
+  start until the check passes (the release), ends held or errored, or the hold becomes a fault hold
+  (any `on_fault` with another `why`, or DOWN); `false`/null otherwise, and on every broker start until
+  the gate syncs it. `state`, `why` and `device_resetting` where present keep their values (`recovering`
+  with `startup_unverified`, or `boot`), so a client that falls back on them reads the same hold.
+  Nothing in the broker reads any of these back. The field
   is null as soon as anything says fault: a dirty mark, a runtime fault report, an owed kill reset, a
   requested kill of a re-adopted job, an isolated chip, a live liveness finding (a chip off the bus),
   or the hold's `why` turning into another class. `status` keeps its two values (`degraded` while
@@ -1214,8 +1250,11 @@ cooldown (spec 04 I65) holds longer.
   is down. Reporting only: `fsm_state`/`fsm_why` keep their contract, `held`/`held_since`/
   `held_age_sec` keep counting, tenants stay refused, the startup gate still runs the full check,
   fabric included, after the hugepage wait and alone releases the queue, a kill still owes the reset
-  plus the full check, and no hold bound, ladder or power-cycle escalation reads either field. Time to
-  recover: no class gets slower and no wait is added. Class S (restart over a live re-adopted job),
+  plus the full check, and no hold bound, ladder or power-cycle escalation reads either field (nor
+  `since`, `check_started_at`, `deadline` or `hold_reason`: their times are kept apart from the
+  gate's own monotonic clock). Time to
+  recover: no class gets slower and no wait is added; the timing fields change no class's path or
+  time. Class S (restart over a live re-adopted job),
   for a client that reads the field instead of killing its job: the startup gate after the job's own
   end (about 1-2 min), against a lost job plus one reset, its settle and the full check (about 4-6
   min) before. A fault that appears during the window (off-bus, ARC/heartbeat, runtime fault,
@@ -1412,6 +1451,54 @@ cooldown (spec 04 I65) holds longer.
   during the cut still restores the pollers, or owes them to the next healthy close when the reset
   failed (I66).
   The cut runs after the driver wait, so it removes no chip I81's rescan still waits for.
+- **I84 — The out-of-reset dead-chip valve detaches a chip before it kills anyone; a failed
+  detach kills nobody.** The driver's fd-close path sends the chip a power-state message unless
+  the device is marked detached, and only the PCI remove marks it; a stopped poller closes its fd
+  the same way. So `TelemetrySampler.isolate_dead_chips` first PCI-removes every newly confirmed
+  chip, each write the one in-flight PCI writer's (spec 04 I76; a worker thread, so the event loop
+  never waits on it) and all of them within one `DETACH_TIMEOUT_SEC` (15 s) bound; a remove still
+  running at the bound, or refused behind an earlier blocked write, is not detached, journals
+  `chip_detach_timeout`, latches PCI-wedged (the power cycle is asked at once, I65 cooldown
+  permitting) and no further chip is tried behind it. Only when every chip is
+  removed does it kill the device holders (`_kill_device_holders`, SIGKILL; the chip is gone, so
+  no SIGTERM grace applies) and stop and owe the pollers. It kills nobody, logs the reason and
+  journals `chip_dead_kill_refused` when: a remove failed or timed out
+  (`detach_failed`) or none is wired (`detach_unavailable`); another chip that read all-ones on
+  the same sample has not had its remove tried (`chip_not_detached`: on its first strike or inside
+  the fast cadence's confirm gate — its own confirmation detaches it, then kills) or had one that
+  failed (`detach_failed`: nothing retries a failed remove, so nobody is killed while it stays
+  attached); or a reset began meanwhile (`reset_started`: the reset scope owns the chips and their
+  holders). After a `detach_failed` or `detach_unavailable` refusal, once every all-ones chip on the
+  sample has had its remove tried and no reset owns the chips, it stops and owes the pollers once,
+  after the hold is marked, and journals `pollers_quiesced_detach_failed` (`host_at_risk`): each
+  poller fd then closes once on the attached chip, a close no wait avoids (I66), and none reads or
+  reopens it again before the hold's recovery. A remove that timed out may already have marked the
+  chip detached (the remove marks it before it tears the chip down), and then the close skips it. The broker never signals its own pid, and the reset scope and its descendants
+  are never signalled from here. The sampler's first-hung-sample poller stop (I66) follows the same
+  rule: with a chip on the sample reading all-ones and its remove not yet tried it stops nothing
+  and leaves the stop to this valve. Host risk, on every path: the pollers read an all-ones chip
+  for at most one extra sample interval (10 s; 4 s under the fast cadence's confirm gate) until its
+  remove is tried; after a failed, missing or timed-out remove they stop in that same valve run, or
+  on the next sample when another all-ones chip's remove was still untried, never left reading the
+  attached chip until the hold's first reset; a stalled chip that still answers stops them on its
+  first sample as before. How a reset quiesces the pollers around a chip that is still attached is
+  left to the separate reset-path change. Refused or not, the valve still marks the device dirty: it never
+  lifts or clears a hold and never returns the device to the queue, so only a just-passed full
+  check, fabric included (I78/I82), lifts it, and spec 04 I76 still runs the full ladder at
+  10 min and then the power cycle. Whole-tray and all-chips-off drops keep their own path straight
+  to the power cycle (I19's blackout rule is unchanged). Time to recover: partial off-bus with a
+  working remove is unchanged (the kill and poller stop move after a remove that takes well under
+  a second); a remove that hangs adds at most 15 s before the hold is marked, and its PCI-wedged
+  latch asks for the power cycle at once (I65 cooldown permitting) instead of at the I76 mark; a failed remove leaves the
+  holders to the hold's bounded recovery instead of a kill that can take the host down; whole-tray,
+  all-chips-off and every non-off-bus class are unchanged. A refusal records which holders it kept
+  (`chip_dead_holders_kept`: pids with their start times, the running job, the hold's start); at the
+  spec 04 I76 bound those holders are no tenants, so the broker skips the ladder (whose reset would
+  kill them) and asks for the power cycle at the 10-min mark, killing nobody; without the record a
+  running job with no waiter held the device with no bound. The record routes the bound only: it
+  never lifts a hold, and only a just-passed full check with fabric (fewer links than cabled is a
+  fail) lifts the hold and clears it. Time to recover, refused kill: 10 min plus the power cycle.
+  The poller stop that follows a failed remove runs after the hold is marked, so it moves no rung.
 
 ## Interfaces
 
@@ -2054,7 +2141,7 @@ refuses.
 | I63 (shutdown detection: systemd state, shutdown target jobs, own unit deactivating, the broker's stop signal) | `tests/test_check_interrupted_by_shutdown.py::test_shutdown_in_progress_reads_systemd`, `tests/test_check_interrupted_by_shutdown.py::test_the_broker_stop_signal_counts_without_systemd` |
 | I66 (a lost chip is not re-read within the reprobe window; a re-created node is read at once; a valid read clears lost) | `tests/test_chip_state.py::test_a_lost_chip_is_not_read_again_within_the_reprobe_window`, `tests/test_chip_state.py::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost`, `tests/test_chip_state.py::test_a_single_blip_is_not_marked_lost_but_two_samples_are` |
 | I66 (no poller read while a reset step owns the chips; /health reads nothing then) | `tests/test_chip_state.py::test_the_sampler_reads_no_chip_while_a_reset_owns_them`, `tests/test_chip_state.py::test_health_reports_per_chip_state_and_reads_nothing_while_recovering` |
-| I66 (pollers stop on the first hung sample, not on a mesh blip or reset; not restored after a failed reset, owed to the next HEALTHY) | `tests/test_chip_state.py::test_the_first_hung_sample_stops_the_pollers`, `tests/test_chip_state.py::test_a_whole_mesh_blip_or_a_reset_does_not_stop_the_pollers`, `tests/test_chip_state.py::test_a_failed_reset_leaves_the_pollers_stopped`, `tests/test_device_safety.py::test_a_step_that_did_not_complete_owes_the_pollers_even_on_a_healthy_fsm` |
+| I66 (pollers stop on the first hung sample, not on a mesh blip or reset; not restored after a failed reset, owed to the next HEALTHY) | `tests/test_chip_state.py::test_the_first_hung_sample_stops_the_pollers`, `tests/test_deadchip_detach_before_kill.py::test_the_first_all_ones_sample_leaves_the_poller_stop_to_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_stalled_chip_beside_an_all_ones_chip_does_not_stop_the_pollers`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_or_timed_out_detach_stops_the_pollers_once_and_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_beside_an_untried_chip_stops_the_pollers_on_the_next_sample`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_under_a_live_reset_leaves_the_poller_stop_to_the_reset`, `tests/test_chip_state.py::test_a_whole_mesh_blip_or_a_reset_does_not_stop_the_pollers`, `tests/test_chip_state.py::test_a_failed_reset_leaves_the_pollers_stopped`, `tests/test_device_safety.py::test_a_step_that_did_not_complete_owes_the_pollers_even_on_a_healthy_fsm` |
 | I66 (post-reset grace reads lost chips for real; the full check, fabric included, still runs) | `tests/test_chip_state.py::test_the_post_reset_grace_reads_lost_chips_for_real`, `tests/test_chip_state.py::test_the_post_reset_health_check_runs_fabric_on_chips_marked_lost` |
 | I66 (a check reads a lost chip for real: one that answers again passes and clears, one still lost fails on one read; the reset gate does not count a returned chip) | `tests/test_chip_state.py::test_a_lost_chip_that_answers_again_passes_the_health_check_inside_the_reprobe_window`, `tests/test_chip_state.py::test_a_check_reads_a_still_lost_chip_once_and_judges_it_on_that_read`, `tests/test_chip_state.py::test_the_reset_gate_does_not_count_a_lost_chip_that_answers_again` |
 | I66 (every decision read reads a lost chip for real, a dead one at most once a second; polls stay gated) | `tests/test_chip_state.py::test_a_decision_read_judges_a_lost_chip_on_a_real_read_and_reads_a_dead_one_once`, `tests/test_chip_state.py::test_the_recovery_ladder_reads_lost_chips_for_real`, `tests/test_chip_state.py::test_admission_and_exec_probe_a_lost_chip_status_does_not`, `tests/test_chip_state.py::test_the_down_offbus_recheck_does_not_hold_on_a_lost_chip_that_is_back`, `tests/test_chip_state.py::test_the_hold_deadline_escalation_does_not_count_a_lost_chip_that_is_back`, `tests/test_chip_state.py::test_each_tenant_decision_takes_the_probing_verdict` |
@@ -2087,7 +2174,7 @@ refuses.
 | I75 | `tests/test_device_safety.py::test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_gate_not_reset`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_next_tick`, `tests/test_device_safety.py::test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladder`, `tests/test_device_safety.py::test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate` |
 | I75 (the stand-down is re-read under the lock and at the ladder's tenant check: a job ending mid-run gets no reset before the gate) | `tests/test_device_safety.py::test_a_readopted_job_ending_during_a_forced_run_gets_no_reset_before_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_after_a_job_ended_during_a_forced_run_escalates_next_tick`, `tests/test_device_safety.py::test_idle_relift_gives_no_reset_when_the_readopted_job_ends_inside_the_ladder`, `tests/test_ladder_v2.py::test_the_i75_stand_down_blocks_only_inside_the_escalate_that_carries_it`, `tests/test_ladder_v2.py::test_escalate_carries_the_stand_down_only_for_its_own_run`, `tests/test_classac_power_cycle_direct.py::test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant` |
 | I75 (a running re-adopted job still defers on `job_running`; off-bus and non-rearmable forced kinds never wait on the gate; a failed gate gets the spec 04 I76 ladder then one power cycle) | `tests/test_device_safety.py::test_a_running_readopted_job_still_defers_the_startup_hold_on_job_running`, `tests/test_device_safety.py::test_idle_relift_meets_a_running_readopted_job_on_job_running`, `tests/test_device_safety.py::test_an_offbus_startup_hold_keeps_its_one_shot_while_the_startup_gate_is_pending`, `tests/test_device_safety.py::test_a_forced_run_whose_window_cannot_be_given_back_is_not_deferred_to_the_startup_gate`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_gets_the_bound_ladder_then_one_power_cycle` |
-| I76 | `tests/test_device_safety.py::test_health_names_a_startup_hold_behind_a_live_readopted_job_as_no_fault`, `tests/test_device_safety.py::test_the_startup_check_still_runs_and_gates_the_queue_after_the_readopted_job_ends`, `tests/test_device_safety.py::test_a_startup_check_that_passes_after_the_readopted_job_releases_the_queue`, `tests/test_device_safety.py::test_killing_the_readopted_job_drops_the_startup_verify_state_and_still_owes_the_reset`, `tests/test_device_safety.py::test_a_fault_during_the_startup_verify_state_reads_as_a_fault`, `tests/test_device_safety.py::test_the_startup_verify_state_hides_no_hold_bound`, `tests/test_device_safety.py::test_the_startup_verify_report_never_hides_or_delays_the_10min_hold_bound`, `tests/test_device_safety.py::test_fsm_json_names_the_readopted_job_while_it_runs_and_clears_when_it_ends`, `tests/test_device_safety.py::test_fsm_json_readopted_jobs_clear_on_release`, `tests/test_device_safety.py::test_a_same_boot_restart_that_readopts_no_job_empties_a_stale_fsm_json_list`, `tests/test_device_safety.py::test_fsm_json_readopted_jobs_empty_when_the_job_is_gone_or_a_fault_shows`, `tests/test_fsm.py::test_readopted_jobs_persist_and_survive_a_same_boot_restart`, `tests/test_fsm.py::test_readopted_jobs_clear_on_release_and_on_down`, `tests/test_fsm.py::test_readopted_jobs_clear_when_the_job_ends`, `tests/test_fsm.py::test_an_fsm_file_without_readopted_jobs_still_loads` |
+| I76 | `tests/test_device_safety.py::test_health_names_a_startup_hold_behind_a_live_readopted_job_as_no_fault`, `tests/test_device_safety.py::test_the_startup_check_still_runs_and_gates_the_queue_after_the_readopted_job_ends`, `tests/test_device_safety.py::test_a_startup_check_that_passes_after_the_readopted_job_releases_the_queue`, `tests/test_device_safety.py::test_the_startup_check_reports_when_it_began_and_its_deadline`, `tests/test_device_safety.py::test_killing_the_readopted_job_drops_the_startup_verify_state_and_still_owes_the_reset`, `tests/test_device_safety.py::test_a_fault_during_the_startup_verify_state_reads_as_a_fault`, `tests/test_device_safety.py::test_the_startup_verify_state_hides_no_hold_bound`, `tests/test_device_safety.py::test_the_startup_verify_report_never_hides_or_delays_the_10min_hold_bound`, `tests/test_device_safety.py::test_fsm_json_names_the_readopted_job_while_it_runs_and_clears_when_it_ends`, `tests/test_device_safety.py::test_fsm_json_readopted_jobs_clear_on_release`, `tests/test_device_safety.py::test_a_same_boot_restart_that_readopts_no_job_empties_a_stale_fsm_json_list`, `tests/test_device_safety.py::test_fsm_json_readopted_jobs_empty_when_the_job_is_gone_or_a_fault_shows`, `tests/test_fsm.py::test_readopted_jobs_persist_and_survive_a_same_boot_restart`, `tests/test_fsm.py::test_readopted_jobs_clear_on_release_and_on_down`, `tests/test_fsm.py::test_readopted_jobs_clear_when_the_job_ends`, `tests/test_fsm.py::test_an_fsm_file_without_readopted_jobs_still_loads`, `tests/test_fsm.py::test_startup_check_in_progress_is_set_while_the_check_runs_and_cleared_by_its_end` |
 | I71 (descriptor ports missing after a passing rerun fail the check by port name; a moved tray still lifts) | `tests/test_fabric_links_missing.py::test_topology_ports_names_each_missing_and_extra_connection`, `tests/test_fabric_links_missing.py::test_the_marker_carries_the_names_and_they_parse_back`, `tests/test_fabric_links_missing.py::test_a_long_port_list_is_capped_with_a_count`, `tests/test_fabric_links_missing.py::test_a_wrapper_marker_without_names_takes_them_from_the_validator_output`, `tests/test_fabric_links_missing.py::test_more_missing_than_extra_is_links_missing_and_a_moved_tray_is_not`, `tests/test_fabric_links_missing.py::test_a_lost_link_whose_rerun_passes_fails_the_check_and_names_the_port`, `tests/test_fabric_links_missing.py::test_an_override_wrapper_that_exits_0_on_a_lost_link_still_fails`, `tests/test_fabric_links_missing.py::test_health_names_the_ports`, `tests/test_fabric_links_missing.py::test_health_shows_the_accepted_ports`, `tests/test_fabric_cable_fault.py::test_a_missing_cable_whose_rerun_passes_fails_the_check_by_port_name` |
 | I71 (only an accept list naming every missing port lifts; the eth mark is never lowered otherwise) | `tests/test_fabric_links_missing.py::test_only_an_explicit_accept_list_naming_every_missing_port_lifts`, `tests/test_fabric_links_missing.py::test_a_moved_tray_still_lifts_and_never_lowers_the_mark`, `tests/test_fabric_links_missing.py::test_a_mark_lowered_before_this_fix_is_restored`, `tests/test_fabric_links_missing.py::test_a_lift_the_accept_list_excused_names_the_accepted_ports`, `tests/test_fabric_links_missing.py::test_a_moved_tray_lift_excuses_no_port` |
 | I71 (a measured fault: the reset runs, the full check after it decides the release; no heal stays held and climbs) | `tests/test_fabric_links_missing.py::test_a_links_missing_hold_is_not_a_no_reset_topology_hold`, `tests/test_fabric_links_missing.py::test_a_lost_link_resets_and_only_a_full_post_reset_pass_releases`, `tests/test_fabric_links_missing.py::test_a_lost_link_that_a_reset_does_not_heal_stays_held`, `tests/test_fabric_links_missing.py::test_a_lost_link_at_the_startup_gate_fails_and_keeps_the_carried_hold` |
@@ -2103,6 +2190,8 @@ refuses.
 | I83 (detach before kill; no kill without a detach; a blocked remove refuses in time, latches PCI-wedged and skips the rescan) | `tests/test_pci_wedged_latch.py::test_b_a_later_rescan_behind_a_blocked_write_fails_fast_and_starts_no_thread`, `tests/test_inflight_reader_cut.py::test_a_failed_post_reset_chip_reading_all_ones_is_detached_before_its_readers_are_killed`, `tests/test_inflight_reader_cut.py::test_a_chip_that_cannot_be_detached_keeps_every_reader_alive`, `tests/test_inflight_reader_cut.py::test_one_failed_detach_of_two_kills_no_reader`, `tests/test_inflight_reader_cut.py::test_with_no_detach_wired_nothing_is_killed`, `tests/test_inflight_reader_cut.py::test_no_reader_means_no_detach_and_no_kill`, `tests/test_inflight_reader_cut.py::test_an_incomplete_holder_scan_counts_as_a_reader`, `tests/test_inflight_reader_cut.py::test_a_remove_that_blocks_refuses_the_cut_in_time`, `tests/test_inflight_reader_cut.py::test_a_kill_that_overruns_its_bound_is_journaled`, `tests/test_inflight_reader_cut.py::test_a_blocked_remove_skips_the_closing_rescan`, `tests/test_below_floor_offbus_ladder.py::test_a_remove_blocked_in_the_kernel_still_lets_the_bound_reach_the_power_cycle`, `tests/test_device_safety.py::test_an_isolated_chip_rung_blocked_in_the_kernel_fails_in_bounded_time` |
 | I83 (trigger: the POST_RESET failure line, cleared per reset; one confirming read of the failed chips only; ENODATA in the driver wait reads as absent and cuts nothing) | `tests/test_inflight_reader_cut.py::test_the_watch_records_post_reset_failures_split_across_reads`, `tests/test_inflight_reader_cut.py::test_a_reset_that_is_not_a_mesh_reset_records_nothing`, `tests/test_inflight_reader_cut.py::test_post_reset_failures_are_cleared_at_each_reset_start`, `tests/test_inflight_reader_cut.py::test_a_failed_chip_that_answers_is_not_cut`, `tests/test_inflight_reader_cut.py::test_an_unreadable_failed_chip_is_not_cut`, `tests/test_inflight_reader_cut.py::test_only_the_failed_chips_are_read`, `tests/test_inflight_reader_cut.py::test_enodata_in_the_driver_wait_reads_as_absent_and_cuts_nothing` |
 | I83 (cut after tt-smi exits, before the bounded closing rescan, which re-adds a removed chip that answers; the broker and the reset are never cut) | `tests/test_inflight_reader_cut.py::test_the_mechanism_is_wired_to_the_samplers_cut`, `tests/test_inflight_reader_cut.py::test_a_post_reset_failure_is_cut_after_tt_smi_exits_and_before_the_closing_rescan`, `tests/test_inflight_reader_cut.py::test_a_chip_the_cut_removes_is_readded_by_the_closing_rescan_when_it_answers`, `tests/test_inflight_reader_cut.py::test_a_closing_rescan_that_blocks_is_bounded`, `tests/test_inflight_reader_cut.py::test_the_cut_never_selects_the_broker_the_reset_or_their_children`, `tests/test_inflight_reader_cut.py::test_reclaim_select_replaces_the_tenant_rule`, `tests/test_inflight_reader_cut.py::test_a_cancel_during_the_cut_still_settles_the_pollers` |
+| I84 | `tests/test_deadchip_detach_before_kill.py::test_every_kill_and_poller_stop_comes_after_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_detach_kills_nobody_and_keeps_the_hold`, `tests/test_deadchip_detach_before_kill.py::test_one_failed_detach_of_two_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_with_no_detach_wired_nobody_is_killed`, `tests/test_deadchip_detach_before_kill.py::test_a_hung_detach_is_bounded_and_the_loop_stays_responsive`, `tests/test_deadchip_detach_before_kill.py::test_a_reset_that_started_before_the_kill_keeps_every_holder`, `tests/test_deadchip_detach_before_kill.py::test_another_all_ones_chip_not_yet_detached_defers_the_kill_to_its_own_valve`, `tests/test_deadchip_detach_before_kill.py::test_a_chip_whose_earlier_detach_failed_blocks_every_later_kill`, `tests/test_deadchip_detach_before_kill.py::test_the_broker_never_signals_itself`, `tests/test_deadchip_detach_before_kill.py::test_the_first_all_ones_sample_leaves_the_poller_stop_to_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_or_timed_out_detach_stops_the_pollers_once_and_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_beside_an_untried_chip_stops_the_pollers_on_the_next_sample`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_under_a_live_reset_leaves_the_poller_stop_to_the_reset` |
+| I84 a refusal's holders reach the power cycle at the I76 bound; the record lifts nothing and only a passing full check with fabric clears it | `tests/test_deadchip_refused_bound.py::test_a_refused_holder_gets_the_power_cycle_at_the_bound`, `tests/test_deadchip_refused_bound.py::test_the_refusal_record_lifts_nothing_and_only_a_passing_full_check_clears_it` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

@@ -83,6 +83,7 @@ from tt_device_mcp.device_holders import (
     MIN_TENANT_UID,  # noqa: F401 - re-exported: tests read srv.MIN_TENANT_UID
     HolderScan,
     ReclaimResult,
+    _read_proc_starttime,
     descends_from,
     discount_broker_internal,
     enumerate_device_holders,
@@ -182,7 +183,13 @@ from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
 from tt_device_mcp.job_preflight import preflight_output_dirs
-from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
+from tt_device_mcp.job_reap import (
+    JOB_TAG_ENV,
+    ReapedLeftover,
+    _leftover_state,
+    find_reaped_leftovers,
+    reap_job_survivors,
+)
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
     SpoolTail,
@@ -194,6 +201,7 @@ from tt_device_mcp.job_spool import (
     sweep_job_spools,
 )
 from tt_device_mcp.peercred import username_for_uid
+from tt_device_mcp.pre_reset_scan import clear_device_readers
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
 from tt_device_mcp.socket_transport import (
     PeerCredMiddleware,
@@ -1150,9 +1158,11 @@ _recovery_deps = RecoveryDeps(
     read_inflight_heartbeats=lambda only: read_heartbeats(only=only),
     find_inflight_readers=lambda: _find_inflight_readers(),
     cut_inflight_readers=lambda reason: _cut_inflight_readers(reason),
+    note_kill_refused=lambda reason, chips: _note_dead_kill_refused(reason, chips),
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
     hold_device_fabric_unverified=lambda why: _hold_device_fabric_unverified(why),
     note_fabric_77_reset_passes=lambda n: _note_fabric_77_reset_passes(n),
+    fabric_link_short_hold=lambda: _fabric_link_short_hold(),
     fabric_77_no_reset_cause=lambda: _fabric_77_no_reset_cause(),
     refresh_idle_hold_ledger=lambda: _refresh_idle_hold_ledger(),
     spawn_idle_relift=lambda: _maybe_spawn_idle_relift(),
@@ -1236,6 +1246,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         _reload_removed_chips()
         recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
         PCI_WRITER.on_latch = _on_pci_wedged
+        recovery_mechanism.pre_reset_scan = _pre_reset_holder_scan
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
         )
@@ -1288,19 +1299,24 @@ HOLD_EPISODE_RECORD_FILE = "hold_episode.json"
 FOREIGN_HOLDER_NOTE = "held: "
 
 
-def _persist_hold_episode(since: str, *, tenant: bool = False) -> None:
+def _persist_hold_episode(since: str, *, tenant: bool = False, startup: bool = False) -> None:
     """Record (or clear) the episode start so a restart cannot rewind the escalation clock.
     ``tenant``: the hold opened because a foreign process held the device, not on a device
     fault. Such a hold never carries (see _restore_hold_episode), so it leaves nothing on disk —
-    not even for an older broker, which would carry it."""
-    global _hold_episode_tenant
+    not even for an older broker, which would carry it. ``startup``: the startup hold a restart
+    opened, naming no fault yet; it keeps its clock on disk but defers the I82 carry (spec 04 I82)."""
+    global _hold_episode_tenant, _hold_episode_startup
     _hold_episode_tenant = bool(since) and tenant
+    _hold_episode_startup = bool(since) and startup and not tenant
     record, path = health_dir() / HOLD_EPISODE_RECORD_FILE, health_dir() / HOLD_EPISODE_FILE
     try:
         if since and not tenant:
             # Sidecar first: one without its start restores nothing, a start without one falls
             # back to the btime rule — a crash between the writes is safe either way.
-            record.write_text(json.dumps({"since": since, "boot_id": _current_boot_id()}))
+            rec = {"since": since, "boot_id": _current_boot_id()}
+            if _hold_episode_startup:
+                rec["startup"] = True
+            record.write_text(json.dumps(rec))
             path.write_text(since)
         else:
             path.unlink(missing_ok=True)
@@ -1363,6 +1379,18 @@ _hold_episode_restorable = True
 # device fault the clock is written after all, so a restart stops rewinding it — one way only: a
 # fault hold that a foreign holder later joins is still a fault.
 _hold_episode_tenant = False
+# Whether the open hold is the startup hold a restart opened, still naming no fault (spec 04 I82). It
+# neither takes nor spends a released episode's carry; the first fault it turns into takes it.
+_hold_episode_startup = False
+
+
+def _recorded_hold_startup(since: str) -> bool:
+    """Whether the episode record names ``since`` as a startup hold that deferred the carry (spec 04 I82)."""
+    try:
+        rec = json.loads((health_dir() / HOLD_EPISODE_RECORD_FILE).read_text())
+        return isinstance(rec, dict) and rec.get("since") == since and bool(rec.get("startup"))
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _forget_stale_hold_episode() -> None:
@@ -1459,7 +1487,10 @@ def _note_hold_carry_job(edge: str, *, ok: bool = False) -> None:
     """A job started inside the carry window keeps it open until _HOLD_CARRY_SEC after that job ends:
     the first job after a release is the one that shows whether the release was right (spec 04 I82).
     ``ok``: the job ended completed, exit 0, naming no device or fabric fault. That proves the release
-    right, so the carry is dropped and the next hold is a fresh episode with its own class path."""
+    right, so the carry is dropped and the next hold is a fresh episode with its own class path.
+    A job that ends any other way under the startup hold a restart opened (it was re-adopted) pins
+    the carry to that hold: the startup gate's reset and full check can outlast the window, and the
+    hold names its fault only when the gate fails, so the carry stays open until the gate's verdict."""
     rec = _load_hold_carry()
     if not isinstance(rec, dict):
         return
@@ -1475,6 +1506,8 @@ def _note_hold_carry_job(edge: str, *, ok: bool = False) -> None:
         rec["job_started"] = now
     elif edge == "end" and rec.get("job_started") and not rec.get("job_ended"):
         rec["job_ended"] = now
+        if _hold_episode_startup:
+            rec["startup_pinned"] = True
     else:
         return
     _write_hold_carry()
@@ -1509,6 +1542,8 @@ def _take_hold_carry() -> Optional[dict]:
     open_window = now - released <= _HOLD_CARRY_SEC
     if rec.get("job_started") and (not job_ended or now - job_ended <= _HOLD_CARRY_SEC):
         open_window = True
+    if rec.get("startup_pinned") and _hold_episode_startup:
+        open_window = True  # the startup hold its first job ended under turns now, however long its gate ran
     return rec if open_window else None
 
 
@@ -1766,6 +1801,12 @@ readopted_scopes: dict[str, str] = {}  # job_id -> scope unit, for jobs re-adopt
 # pid -> (job id, starttime) of each process a job's sweep left alive holding the device. The
 # leftover fence (01 I16) names these; a privsep leftover is also found by its job's scope cgroup.
 reaped_survivors: dict[int, tuple[str, str]] = {}
+# Spec 04 I92: what the last pre-reset holder scan refused a reset for (a tenant under an automatic
+# reset, or a reader that would not let go), for /health's ``pre_reset_blocked_by``; None once a scan
+# finds the device clear.
+_pre_reset_blocker: Optional[dict] = None
+# The job id an unkillable pre-reset reader is fenced under (01 I16, 04 I70): it belongs to no job.
+PRE_RESET_READER_JOB = "pre-reset-reader"
 # The leftovers the current fence episode names ('' when no fence stands): the operator hint is
 # emitted once per episode, not on every scan.
 _leftover_fence_detail: str = ""
@@ -2655,9 +2696,9 @@ def _reset_for_testing():
     Only used by test fixtures - not part of the public API.
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
-    global _hold_episode_restorable, _hold_episode_tenant, _hold_carry, _hold_carry_loaded
+    global _hold_episode_restorable, _hold_episode_tenant, _hold_episode_startup, _hold_carry, _hold_carry_loaded
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
-    global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at
+    global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at, _pre_reset_blocker
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
     global device_op_stage_started_at, device_held_since, device_hold_escalated_monotonic
     global device_hold_deadline_bucket, device_hold_alert_next_bucket, device_hold_alert_gap
@@ -2669,6 +2710,7 @@ def _reset_for_testing():
     global _hold_bound_episode, _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_cycle_age
     global _hold_bound_check_failed_age, _hold_bound_unarmed_paged, _hold_bound_rung_pending
     global _hold_bound_denied_why, _hold_bound_tenant_paged, _hold_bound_tenant_blocker
+    _pre_reset_blocker = None
     job_queue = None
     lock = None
     _action_row = None
@@ -2685,6 +2727,7 @@ def _reset_for_testing():
     reset_killed_causes.clear()
     _hold_episode_restorable = True
     _hold_episode_tenant = False
+    _hold_episode_startup = False
     _hold_carry = None
     _hold_carry_loaded = False
     if recovery_mechanism is not None:
@@ -3760,6 +3803,7 @@ def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> b
         # Only proof retires it, whatever the device was flagged for — dirty or held.
         fsm.on_readings(_healthy_reading())
         _forget_stale_hold_episode()  # e.g. the startup gate: a clock left by a dead broker is over
+        _forget_dead_kill_refused()  # spec 03 I84: the full check passed, so no chip is off the bus
         # A passing full check (fabric included, the debt above) after a power cycle ends its
         # backoff streak and any cooldown retry (spec 04 I65).
         recovery_mechanism.note_mesh_verified()
@@ -5717,6 +5761,8 @@ async def _kill_device_holders(reason: str) -> list:
     except Exception:  # noqa: BLE001 - never let the scan block the rescue
         return killed
     for h in scan.holders:
+        if h.pid == os.getpid():
+            continue  # the broker never signals itself (spec 03 I84)
         try:
             if not is_tenant(h):
                 # Infrastructure we kill here can sit mid-exit for seconds, named by the driver with
@@ -5837,6 +5883,89 @@ async def _cut_inflight_readers(reason: str) -> list:
         scan_complete=result.scan_complete,
     )
     return cut
+
+
+# Spec 03 I84 / 04 I76: the holders the dead-chip valve refused to kill because a chip under them is
+# off the bus and still attached ({pid: starttime}), the broker job's pid among them, and the hold they
+# were refused in. The 10-min bound counts none of them as a tenant: it sends them to the host rung.
+# Only a passing full check clears the record (_clear_device_dirty's verified release).
+_kill_refused_pids: dict = {}
+_kill_refused_job_pid: Optional[int] = None
+_kill_refused_since: str = ""
+
+
+def _note_dead_kill_refused(reason: str, chips: list) -> list:
+    """Record the holders the dead-chip valve left alive (spec 03 I84) and journal them. Returns their
+    pids. Signals nothing and never raises: the record only routes the 10-min bound (spec 04 I76)."""
+    global _kill_refused_job_pid, _kill_refused_since
+    pids = []
+    try:
+        scan = enumerate_device_holders()
+    except Exception:  # noqa: BLE001 - an unreadable scan records only the job
+        scan = None
+    for h in scan.holders if scan is not None else []:
+        start = _read_proc_starttime(h.pid)
+        if h.pid == os.getpid() or start is None:
+            continue  # the broker itself, or already gone
+        _kill_refused_pids[h.pid] = start
+        pids.append(h.pid)
+    proc = current_process
+    if proc is not None and proc.returncode is None:
+        _kill_refused_job_pid = proc.pid
+        pids.append(proc.pid)
+    _kill_refused_since = _kill_refused_since or fsm.record.since or datetime.now().isoformat()
+    pids = sorted(set(pids))
+    health_event(
+        "chip_dead_holders_kept",
+        reason=reason,
+        chips=list(chips),
+        pids=pids,
+        job_pid=_kill_refused_job_pid,
+        held_since=_kill_refused_since,
+    )
+    return pids
+
+
+def _forget_dead_kill_refused() -> None:
+    global _kill_refused_job_pid, _kill_refused_since
+    _kill_refused_pids.clear()
+    _kill_refused_job_pid = None
+    _kill_refused_since = ""
+
+
+def _kill_refused_live(scan) -> tuple[set, bool]:
+    """The refused holders still alive in ``scan`` (pid and start time both match, so a recycled pid is
+    not one) and whether the running broker job is the refused one. With that job, every holder in a
+    broker job scope is its own (one job at a time), a child that opened the device later included."""
+    proc = current_process
+    job = (
+        _kill_refused_job_pid is not None
+        and proc is not None
+        and proc.returncode is None
+        and proc.pid == _kill_refused_job_pid
+    )
+    live = {
+        h.pid
+        for h in scan.holders
+        if (job and getattr(h, "scoped", False))
+        or (h.pid in _kill_refused_pids and _read_proc_starttime(h.pid) == _kill_refused_pids[h.pid])
+    }
+    return live, job
+
+
+def _kill_refused_reason(scan: Optional[HolderScan] = None) -> str:
+    """Why the 10-min bound sends this hold to the host rung for refused holders, or "" (spec 04 I76)."""
+    if not _kill_refused_pids and _kill_refused_job_pid is None:
+        return ""
+    try:
+        scan = scan if scan is not None else enumerate_device_holders()
+    except Exception:  # noqa: BLE001 - unreadable: the running job alone decides
+        scan = HolderScan(holders=[], complete=False)
+    live, job = _kill_refused_live(scan)
+    if not live and not job:
+        return ""
+    who = f"pid(s) {sorted(live)}" + (" and the running broker job" if job else "")
+    return f"the dead-chip valve refused to kill {who}: a chip under them is off the bus and still attached"
 
 
 def _boot_btime_id() -> str:
@@ -8095,6 +8224,9 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
                 )
         # Spec 04 I76: the 10-min bound, the step it runs next and any cooldown that step waits on.
         payload["hold_bound"] = _hold_bound_health(now)
+    # Spec 04 I91: why the last mesh reset did not run or did not count (BMC preflight refused, guard
+    # not armed, tt-smi's op_mode 0x0 fallback refused or sent); null after a clean mesh reset.
+    payload["mesh_reset_bmc_guard"] = getattr(recovery_mechanism, "bmc_guard_state", None)
     # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
     payload["hold_exit_gap"] = _hold_exit_gap() or None
     # Spec 03 I71: the descriptor's port connections the last fabric pass found missing or extra, by
@@ -8110,6 +8242,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         payload.update(_hold_report(now))
     # Spec 04 I70: an unkillable leftover fencing every reset, with its deadline and rung stage.
     payload["leftover_fence"] = _leftover_fence_payload()
+    # Spec 04 I92: the tenant or reader the last pre-reset holder scan refused a reset for.
+    payload["pre_reset_blocked_by"] = _pre_reset_blocker
     return payload
 
 
@@ -8138,7 +8272,15 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # ...or the start of the episode a release ended moments ago (spec 04 I82). A tenant hold is
         # not a device fault: it neither takes nor spends a fault hold's carry.
         tenant = _hold_is_tenant_held()
-        carry = None if tenant else _take_hold_carry()
+        # Spec 04 I82: the startup hold a restart opens names no fault, so it continues only a hold
+        # still open at the restart (restored above), never an episode a release already ended. Like a
+        # tenant hold it neither takes nor spends the carry: its clock starts now, and the fault it may
+        # turn into takes the carry then (_hold_turned_fault). A restored startup hold that
+        # deferred the carry defers it again.
+        startup = fsm.record.why == "startup_unverified" and (not restored or _recorded_hold_startup(restored))
+        startup = startup and not tenant
+        carry = None if tenant or startup else _take_hold_carry()
+        deferred = _load_hold_carry() if startup else None
         starts = [s for s in (restored, str(carry["since"]) if carry else "") if s]
         device_hold_episode_since = min(starts, key=datetime.fromisoformat) if starts else row_since
         if restored and carry is None and device_hold_episode_since == restored:
@@ -8150,7 +8292,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
                     "ladder_early": _recorded_hold_bound_ladder_early(restored),
                     "released": time.time(),
                 }
-        _persist_hold_episode(device_hold_episode_since, tenant=tenant)
+        _persist_hold_episode(device_hold_episode_since, tenant=tenant, startup=startup)
         # Spec 03 I80: a latch a status read took before this verdict yields to an earlier episode start.
         if device_held_since and _iso_before(device_hold_episode_since, device_held_since):
             device_held_since = device_hold_episode_since
@@ -8184,7 +8326,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         cont = (
             {"continues_episode": device_hold_episode_since, "prior_reason": str(carry.get("reason") or "")}
             if carry
-            else {}
+            else {"carry_deferred": str(deferred.get("since") or "")} if isinstance(deferred, dict) else {}
         )
         if carried is not None:
             health_event("device_held", reason=reason, carried_from=carried.get("iso") or carried.get("ts"), **cont)
@@ -8390,6 +8532,20 @@ async def _force_escalate_stuck_hold() -> None:
                 # fenced and only a host rung clears it, so the bound asks for that rung now.
                 health_event("hold_bound_leftover", held_age_sec=int(held_age), held_since=device_hold_episode_since)
                 log(f"10-min hold bound: {leftover} — no reset can run; the host rung is next")
+                await _hold_bound_host_rung(held_age, log)
+                return
+            refused = await asyncio.to_thread(_kill_refused_reason) if bound else ""
+            if refused:
+                # Spec 03 I84: a holder on a chip that is off the bus and still attached. Killing it, or
+                # a ladder rung's reset killing it, makes the driver reach that chip, so the bound skips
+                # the ladder and asks for the host rung, which ends every process with the host OS.
+                health_event(
+                    "hold_bound_kill_refused",
+                    held_age_sec=int(held_age),
+                    held_since=device_hold_episode_since,
+                    detail=refused,
+                )
+                log(f"10-min hold bound: {refused} — no reset can run over it; the host rung is next")
                 await _hold_bound_host_rung(held_age, log)
                 return
         health_event(
@@ -8824,10 +8980,10 @@ def _bound_tenant_blocker(bound: bool) -> Optional[dict]:
         return None
     try:
         scan = enumerate_device_holders()
+        waive_job = False
         if bound:
-            leftover = {f.pid for f in _reaped_leftovers(scan)}
-            scan = replace(scan, holders=[h for h in scan.holders if h.pid not in leftover])
-        blocker = galaxy_recovery._tenant_blocker(scan, force=True)
+            scan, waive_job = _bound_excused(scan)
+        blocker = galaxy_recovery._tenant_blocker(scan, force=True, waive_job=waive_job)
     except Exception:  # noqa: BLE001 - naming the blocker never decides whether one holds
         blocker = None
     return blocker or {"blocker": "tenant"}
@@ -8864,17 +9020,27 @@ def _hold_bound_tenant_blocked(blocker: dict, log) -> None:
     log(f"10-min hold bound: {desc} — no reset or host rung runs over a live tenant; it runs once the tenant leaves")
 
 
+def _bound_excused(scan: HolderScan) -> tuple[HolderScan, bool]:
+    """``scan`` without the holders the 10-min bound does not count as tenants, and whether the running
+    broker job is one of them: a reaped job's leftover (spec 01 I16) and a holder the dead-chip valve
+    refused to kill (spec 03 I84). Neither is freed by a reset; only the host rung clears it."""
+    refused, waive_job = _kill_refused_live(scan)
+    excused = {f.pid for f in _reaped_leftovers(scan)} | refused
+    if excused:
+        scan = replace(scan, holders=[h for h in scan.holders if h.pid not in excused])
+    return scan, waive_job
+
+
 def _bound_tenant_holds(bound: bool) -> bool:
     """The forced ladders' tenant check (galaxy_recovery.tenant_holds), except that from the 10-min bound
-    on a reaped job's leftover (spec 01 I16) is no tenant: its job already ended and only a host rung
-    clears one stuck in the kernel (spec 04 I76). A running job or any other readable tenant still is."""
+    on a reaped job's leftover (spec 01 I16) and a holder the dead-chip valve refused to kill (spec 03
+    I84, a running broker job included) are no tenants: only a host rung clears either (spec 04 I76).
+    Any other running job or readable tenant still is."""
     if bound:
         scan = enumerate_device_holders()
-        leftover = {f.pid for f in _reaped_leftovers(scan)}
-        if leftover:
-            return galaxy_recovery._tenant_active(
-                replace(scan, holders=[h for h in scan.holders if h.pid not in leftover]), force=True
-            )
+        excused, waive_job = _bound_excused(scan)
+        if waive_job or excused is not scan:
+            return galaxy_recovery._tenant_active(excused, force=True, waive_job=waive_job)
     return galaxy_recovery.tenant_holds()
 
 
@@ -9158,7 +9324,8 @@ def _defer_offbus_one_shot_to_tenant_bound() -> None:
 
 
 def _hold_turned_fault() -> None:
-    """A tenant hold whose holder left a device fault behind is a fault hold from now on: write its
+    """A tenant hold whose holder left a device fault behind, or a startup hold that now names a fault
+    (its full check failed, or a re-adopted job ended on one), is a fault hold from now on: write its
     clock to disk, and continue a fault carry still in its window as a fault hold opened now would
     (spec 04 I82). Without it the bound runs one more ladder before its host rung."""
     global device_hold_episode_since
@@ -9200,6 +9367,12 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
         _hold_turned_fault()  # the holder left a real fault behind
+    elif (
+        _hold_episode_startup
+        and fsm.state in (ServerState.RECOVERING, ServerState.DOWN)
+        and fsm.record.why != "startup_unverified"
+    ):
+        _hold_turned_fault()  # the startup hold turned into a fault hold
     try:
         started = datetime.fromisoformat(device_hold_episode_since)
     except ValueError:
@@ -9879,6 +10052,90 @@ async def _escalate_unkillable_leftover() -> None:
     except Exception:  # noqa: BLE001 - a detached task must never raise unretrieved
         if logger:
             logger.exception("LEFTOVER-HOST-RUNG try failed — retrying next window")
+
+
+async def _reset_in_flight() -> Optional[str]:
+    """Spec 04 I92: why an operator reset must not start, when a reset (ours from before a restart,
+    another broker's, or a local-backend one) is still running. A second reset into a mesh already
+    cycling is the concurrent-reset failure, and the pre-reset scan would read its tt-smi as a reader."""
+    unit = await asyncio.to_thread(recovery_mechanism.scope_active)
+    return f"a reset is already in flight ({unit})" if unit else None
+
+
+async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
+    """The broker's pre-reset holder scan (spec 04 I92), run by every reset with the pollers stopped.
+
+    Clears every reader that is not a tenant (SIGTERM, 10 s, SIGKILL, then the I67 release wait) and
+    returns why the reset must not run, or ''. An automatic reset (owner ``[broker]...``) refuses to
+    run under a tenant and names it in the journal and /health; an operator reset's own gate already
+    ruled on tenants. A reader stuck in the kernel is fenced as a leftover (01 I16), so the
+    J-unkillable clock (04 I70) takes it to the host rung. Every scan emits ``pre_reset_holder_scan``."""
+    global _pre_reset_blocker
+    automatic = (owner or "").startswith("[broker]")
+    job = current_process
+    protected = [job.pid] if job is not None and job.returncode is None and job.pid else []
+    result = await clear_device_readers(
+        tenants_block=automatic, protected=protected, reset_active=recovery_mechanism.scope_active
+    )
+    refused = result.refusal()
+    health_event(
+        "pre_reset_holder_scan",
+        argv=list(argv),
+        owner=owner,
+        outcome=result.outcome,
+        found=result.found,
+        killed=result.killed,
+        tenants=result.tenants,
+        unkillable=result.unkillable,
+        survivors=result.survivors,
+        detached=result.detached,
+        undetached=result.undetached,
+        detach_timed_out=result.detach_timed_out,
+        reset_in_flight=result.reset_in_flight or None,
+        gaps=result.gaps,
+        scan_complete=result.scan_complete,
+        source=result.source,
+        seconds=result.seconds,
+        error=result.error or None,
+    )
+    if result.detached:
+        msg = f"pre-reset: chips {', '.join(result.detached)} off the bus, detached before their readers were killed"
+        log(msg)
+        if logger:
+            logger.warning(msg)
+    for row in result.killed:
+        msg = (
+            f"pre-reset: {row['signal']} to device reader pid {row['pid']} ({row['user']}, {row['comm']}) "
+            f"before {' '.join(argv)}; {'released' if row['released'] else 'still holding'}"
+        )
+        log(msg)
+        if logger:
+            logger.warning(msg)
+    if result.unkillable:
+        for row in result.unkillable:
+            start = _leftover_state(row["pid"])[1] or row.get("starttime") or ""
+            reaped_survivors[row["pid"]] = (PRE_RESET_READER_JOB, start)
+        # Opens the leftover fence episode and the I70 unkillable clock now, not at the next scan.
+        _reaped_leftovers()
+    if not refused:
+        _pre_reset_blocker = None
+        return ""
+    since = (_pre_reset_blocker or {}).get("since") or datetime.now().isoformat(timespec="seconds")
+    _pre_reset_blocker = {
+        "blocker": "tenant" if result.outcome == "tenant_blocked" else result.outcome,
+        "since": since,
+        "owner": owner,
+        "argv": list(argv),
+        "holders": (
+            result.tenants
+            if result.outcome == "tenant_blocked"
+            else (result.readers_left or result.unkillable or result.survivors)
+        ),
+        "reason": refused,
+    }
+    if logger:
+        logger.error(f"pre-reset holder scan refused {' '.join(argv)} ({owner}): {refused}")
+    return refused
 
 
 def _leftover_fence_payload() -> Optional[dict]:
@@ -11603,6 +11860,13 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
             reset_killed = job_id in reset_killed_job_ids
             reset_killed_job_ids.discard(job_id)
             reset_killed_causes.pop(job_id, None)
+            # Spec 04 I82: the first job after a release, re-adopted across a restart, closes the carry
+            # window as it would have in the broker that started it; a clean exit 0 proves the release.
+            # Any other end pins the carry to the startup hold until the startup gate's verdict.
+            _note_hold_carry_job("end")
+            stopped = reset_killed or timed_out or request_killed or preempt_forced
+            if job.status == JobStatus.COMPLETED and job.exit_code == 0 and not (fault or stopped):
+                _note_hold_carry_job("end", ok=True)
             if fault:
                 _mark_device_reported_fault(f"re-adopted job {job_id} {fault}", job=job)
             elif reset_killed:
@@ -13450,6 +13714,10 @@ VALIDATOR_BUILD_REQUEST_TIMEOUT_SEC = 30.0
 # Spec 03 I75: the startup gate task, and when it stopped waiting on re-adopted jobs (monotonic).
 _startup_verify_task: Optional[asyncio.Task] = None
 _startup_verify_ready_at: Optional[float] = None
+# Spec 03 I76, report only: wall-clock times of the gate task's start and of its stop waiting on
+# re-adopted jobs (the check's start), for the /health view's since/check_started_at/deadline.
+_startup_verify_started_wall: Optional[float] = None
+_startup_verify_ready_wall: Optional[float] = None
 _startup_verify_deferral_logged: Optional[str] = None
 # How long past the re-adopted jobs' end the escalations still leave a startup hold to that gate:
 # its hugepage wait, its fabric pass and the rest of the full check, with margin.
@@ -13513,22 +13781,39 @@ def _startup_verify_view() -> Optional[dict]:
     live = [jid for jid in readopted_scopes if (job := jobs.get(jid)) is not None and job.status is JobStatus.RUNNING]
     if len(live) != len(readopted_scopes) or _device_liveness_reason():
         return None
+    started = _startup_verify_started_wall
+    checking = _startup_verify_ready_wall if not live else None
     return {
         "phase": "readopted_job_running" if live else "verifying",
         "readopted_job_ids": live,
         "fault": False,
-        "since": device_hold_episode_since or None,
+        "since": device_hold_episode_since or _wall_iso(started),
+        # When the check began and the latest it may end: the hugepage wait plus the check's own
+        # bound (STARTUP_VERIFY_DEFER_MAX_SEC). Null while a re-adopted job still runs.
+        "check_started_at": _wall_iso(checking),
+        "deadline": _wall_iso(checking + STARTUP_VERIFY_DEFER_MAX_SEC if checking is not None else None),
+        "bound_sec": STARTUP_VERIFY_DEFER_MAX_SEC,
     }
+
+
+def _wall_iso(wall: Optional[float]) -> Optional[str]:
+    """Local ISO time of a time.time() value, the format of the hold's ``since``; None stays None."""
+    return datetime.fromtimestamp(wall).isoformat() if wall is not None else None
 
 
 def _sync_fsm_readopted_jobs() -> None:
     """Spec 03 I76: mirror startup_verify.readopted_job_ids into fsm.json's readopted_jobs ([] when the
     view is null), so a client that reads the file gets the answer /health gives. Called when the startup
     gate starts, on each re-adopted scope poll and when a re-adopted job ends; the FSM clears it itself on
-    a release or DOWN. Report-only, and never raises into its caller."""
+    a release or DOWN. Also mirrors whether the startup check is in progress, its start and its deadline
+    (startup_check_in_progress / _started_at / _deadline), which a fault hold clears too. Report-only,
+    and never raises into its caller."""
     try:
         view = _startup_verify_view()
         fsm.set_readopted_jobs(view["readopted_job_ids"] if view else [])
+        fsm.set_startup_check(
+            view["since"] if view else None, view["deadline"] if view else None, in_progress=view is not None
+        )
     except Exception as e:  # noqa: BLE001 - a report must never break the monitor or startup
         if logger:
             logger.warning(f"fsm readopted_jobs sync failed: {e}")
@@ -13745,11 +14030,13 @@ async def _verify_fabric_on_start() -> None:
     A pass that exited 77 because the validator or the hugepages were not there yet is owed again
     once they are (see _await_startup_prerequisites).
     """
-    global _startup_prereq_task, _startup_verify_ready_at
+    global _startup_prereq_task, _startup_verify_ready_at, _startup_verify_ready_wall
     try:
         while readopted_scopes:
             await asyncio.sleep(_SCOPE_POLL_SEC)
         _startup_verify_ready_at = time.monotonic()
+        _startup_verify_ready_wall = time.time()
+        _sync_fsm_readopted_jobs()  # spec 03 I76: fsm.json gets the check's deadline
         # Read before the pass: a validator that lands while it runs must still be waited for.
         missing = await asyncio.to_thread(fabric.validator_missing)
         if missing and logger:
@@ -13783,6 +14070,10 @@ async def _verify_fabric_on_start() -> None:
             logger.error(f"STARTUP FABRIC check failed: {e}")
         health_event("startup_fabric_verify_errored", detail=str(e), host_at_risk=True)
         _mark_device_dirty(f"startup fabric verify errored before it could verify: {e}", why="gate_error")
+    finally:
+        # Spec 03 I76, report only: the check has ended (passed, held or errored), so fsm.json no
+        # longer says it is in progress. Lifts nothing: only the gate's own verdict does that.
+        fsm.set_startup_check(None, None, in_progress=False)
 
 
 async def _probe_on_per_user_start() -> None:
@@ -13834,6 +14125,7 @@ async def run_startup_tasks() -> None:
     as its own.
     """
     global _startup_tasks_done, _startup_verify_task, _startup_verify_ready_at
+    global _startup_verify_ready_wall, _startup_verify_started_wall
     if _startup_tasks_done:
         return
     _startup_tasks_done = True
@@ -13942,6 +14234,8 @@ async def run_startup_tasks() -> None:
     # And then answers it properly, once the device is ours to test — this lifts the hold above on a
     # healthy verdict, holds/escalates on a wedge.
     _startup_verify_ready_at = None
+    _startup_verify_ready_wall = None
+    _startup_verify_started_wall = time.time()
     _startup_verify_task = asyncio.create_task(_verify_fabric_on_start())
     _sync_fsm_readopted_jobs()  # spec 03 I76: the jobs re-adopted above, now the gate owns the hold
 
@@ -14182,6 +14476,7 @@ def create_mcp_server() -> MCPServer:
         output_queue: asyncio.Queue[str] = asyncio.Queue()
         reset_streamed = False
         late_blocker: Optional[dict] = None
+        in_flight: Optional[str] = None
 
         def on_reset_output(chunk: str) -> None:
             nonlocal reset_streamed
@@ -14189,10 +14484,13 @@ def create_mcp_server() -> MCPServer:
             output_queue.put_nowait(chunk)
 
         async def run_reset():
-            nonlocal late_blocker
+            nonlocal late_blocker, in_flight
             async with _device_op("reset", owner=reset_owner):
                 late_blocker = await _reset_recheck_in_op(force, lambda m: output_queue.put_nowait(m + "\n"))
                 if late_blocker:
+                    return None, None, ""
+                in_flight = await _reset_in_flight()
+                if in_flight:
                     return None, None, ""
                 health_event("reset_begin", argv=argv, expected_chips=len(indices))
                 _void_fabric_ok("operator reset")
@@ -14226,6 +14524,12 @@ def create_mcp_server() -> MCPServer:
                 logger.warning(f"reset_stream: busy REFUSED: {_reset_busy_detail(late_blocker)}")
             yield f"busy REFUSED: {_reset_busy_detail(late_blocker)}\n"
             yield f"hint: {RESET_BUSY_HINT.format(force='--force')}\n"
+            yield "::status::refused\n"
+            return
+        if in_flight:
+            if logger:
+                logger.warning(f"reset_stream: REFUSED: {in_flight}")
+            yield f"REFUSED: {in_flight}\n"
             yield "::status::refused\n"
             return
         status = "reset_complete" if rc == 0 else "reset_failed"
@@ -14396,6 +14700,10 @@ def create_mcp_server() -> MCPServer:
             view = _startup_verify_view()
             if view and job_id in view["readopted_job_ids"]:
                 result["startup_verify"] = view
+        elif job.status == JobStatus.QUEUED and (view := _startup_verify_view()):
+            # Spec 03 I76: a queued job waits on the startup check, not on a fault; its bound is in the view.
+            result["hold_reason"] = "held: startup check; dispatches when it passes"
+            result["startup_verify"] = view
         if job.preemptable:
             result["no_timeout_except_on_contention"] = True
             result["preemptable"] = True  # the earlier name, for clients that read it
@@ -15772,6 +16080,10 @@ def create_mcp_server() -> MCPServer:
                     "steps": steps,
                     "hint": RESET_BUSY_HINT.format(force="force=true"),
                 }
+            in_flight = await _reset_in_flight()
+            if in_flight:
+                step(f"REFUSED: {in_flight}", "warning")
+                return {"status": "refused", "reason": "reset_in_flight", "detail": in_flight, "steps": steps}
             _void_fabric_ok("operator reset")
             rc, reset_out = await recovery_mechanism.reset_with_quiesce(argv, lambda m: step(m), reset_owner)
             status = "reset_complete" if rc == 0 else "reset_failed"

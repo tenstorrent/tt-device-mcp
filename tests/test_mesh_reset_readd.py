@@ -65,6 +65,17 @@ def _mechanism(monkeypatch, isolated: set, sysfs: FakeSysfs, events: list, *, ev
 
     monkeypatch.setattr(recovery_base.asyncio, "sleep", fast_sleep)
 
+    real_to_thread = asyncio.to_thread
+
+    async def to_thread(fn, *a, **kw):
+        # The fake rescan runs inline: on a loaded host a worker thread can outlast the few loop turns
+        # a test waits after each output chunk, and the rescan count it reads would then lag.
+        if getattr(fn, "__self__", None).__class__.__name__ == "_Rescan":
+            return fn(*a, **kw)
+        return await real_to_thread(fn, *a, **kw)
+
+    monkeypatch.setattr(recovery_base.asyncio, "to_thread", to_thread)
+
     async def pollers(_active, _log):
         return []
 
@@ -242,6 +253,9 @@ async def test_both_backends_rescan_only_once_the_settle_is_over(monkeypatch, tm
     mechanism = _mechanism(monkeypatch, isolated, sysfs, events, scoped=scoped, tmp=tmp_path)
     if scoped:
         mechanism._reset_scope_argv = lambda argv: ("ttdev-reset-test", list(argv))
+    # The fake carries -glx_reset, so it is a mesh reset (spec 04 I91); this test times the rescan,
+    # not the ipmitool guard, whose unshare a sandboxed suite may not be allowed to run.
+    mechanism._launch_argv = list
     argv = [sys.executable, "-c", _FAKE_TT_SMI, "-glx_reset", str(tmp_path)]
 
     rc, text = await asyncio.wait_for(mechanism.reset_with_quiesce(argv, lambda _m: None), timeout=30)

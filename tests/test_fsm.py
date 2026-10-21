@@ -406,6 +406,38 @@ def test_readopted_jobs_clear_when_the_job_ends(tmp_path):
     assert f.state is ServerState.RECOVERING and f.record.why == "startup_unverified", "the hold stands"
 
 
+def test_startup_check_in_progress_is_set_while_the_check_runs_and_cleared_by_its_end(tmp_path):
+    """Spec 03 I76: fsm.json says plainly whether the startup check is in progress, with its start and
+    deadline, so a client that reads the file keeps its queued job through the check. True from the
+    check's start until it passes (release) or the hold becomes a fault hold; state/why stay as they are."""
+    path = tmp_path / "fsm.json"
+
+    def disk():
+        raw = json.loads(path.read_text())
+        return raw["startup_check_in_progress"], raw["startup_check_started_at"], raw["startup_check_deadline"]
+
+    f = _startup_hold(path)
+    assert disk() == (False, None, None) and not f.startup_check_in_progress
+    f.set_startup_check("2026-01-01T10:00:00", None, in_progress=True)
+    assert disk() == (True, "2026-01-01T10:00:00", None) and f.startup_check_in_progress
+    f.set_startup_check("2026-01-01T10:00:00", "2026-01-01T10:11:00", in_progress=True)
+    assert disk() == (True, "2026-01-01T10:00:00", "2026-01-01T10:11:00")
+    raw = json.loads(path.read_text())
+    assert (raw["state"], raw["why"]) == ("recovering", "startup_unverified"), "the fallback values stand"
+    f.on_fault("startup_unverified", dirty=False)
+    assert disk()[0] is True, "a refresh of the startup hold itself is not a fault hold"
+    f.on_readings(HealthState(phase="startup", at=datetime.now(), expected=0))
+    assert f.state is ServerState.HEALTHY and disk() == (False, None, None), "the check passed"
+    f.set_startup_check("2026-01-01T10:00:00", None, in_progress=True)
+    assert disk()[0] is False, "only a held device reports a startup check"
+
+    g = _startup_hold(path)
+    g.set_startup_check("2026-01-01T10:00:00", None, in_progress=True)
+    g.on_fault("eth_frozen", dirty=False)
+    assert g.state is ServerState.RECOVERING and disk() == (False, None, None), "a fault hold ends it"
+    assert ServerFsm(path, current_boot_id="boot-aaa").startup_check_in_progress is False
+
+
 def test_an_fsm_file_without_readopted_jobs_still_loads(tmp_path):
     """Spec 03 I76: a file written before the field existed loads whole, with readopted_jobs []; a
     malformed value degrades to [] too."""

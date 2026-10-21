@@ -352,6 +352,31 @@ def test_reset_failure_surfaces_returncode_and_output(monkeypatch, tmp_path):
     assert "reset failed" in d["stdout"]
 
 
+def test_an_operator_reset_refuses_while_another_reset_is_in_flight(monkeypatch, tmp_path):
+    """Spec 04 I92: a second reset into a mesh still cycling (a scope from before a restart, another
+    broker's, or a local-backend reset) is refused, and the in-flight reset is never signalled."""
+    (tmp_path / "0").write_text("")
+    calls = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "ttdev-reset-7-1")
+    d = _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": True}).json()
+
+    assert d["status"] == "refused" and d["reason"] == "reset_in_flight"
+    assert "ttdev-reset-7-1" in d["detail"]
+    assert calls == [], "a second reset ran into one already in flight"
+
+
+def test_a_streaming_operator_reset_refuses_while_another_reset_is_in_flight(monkeypatch, tmp_path):
+    (tmp_path / "0").write_text("")
+    calls = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "ttdev-reset-7-1")
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": True})
+
+    assert resp.status_code == 200
+    assert "REFUSED: a reset is already in flight (ttdev-reset-7-1)" in resp.text
+    assert resp.text.rstrip().endswith("::status::refused")
+    assert calls == [], "a second reset ran into one already in flight"
+
+
 def _intercept_scoped_subprocess(monkeypatch, rc=0, output="Resetting...\n"):
     """Intercept the reset at the systemd-run/create_subprocess_exec seam, NOT at
     _run_reset_scoped — so the real scoped runner runs, including the action-log row it
@@ -1063,7 +1088,9 @@ def test_a_streaming_local_reset_is_visible_to_a_restarted_daemon(monkeypatch, t
     (tmp_path / "0").touch()
     release = tmp_path / "release"
     started = tmp_path / "started"
-    reset_script = tmp_path / "reset"
+    # Named as tt-smi's module file: spec 04 I91 never runs an override that names neither tt-smi nor
+    # the Galaxy flag, and the spawn tripwire refuses a program named tt-smi.
+    reset_script = tmp_path / "tt_smi.py"
     reset_script.write_text(
         "#!/usr/bin/env python3\n"
         "import pathlib, time\n"

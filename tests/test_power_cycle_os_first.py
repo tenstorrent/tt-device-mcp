@@ -603,7 +603,11 @@ def _children(pid):
 def test_hook_stops_the_fallback_and_its_children_before_any_wait(hook, tmp_path, fired):
     """The fallback, run for real: still waiting out its bound, or past it, as `timeout` with the cycle
     command as its child. The hook stops it and every process it started before the RAID wait (the
-    stub mdadm sees none of them alive), so no orphan can cut power alongside the hook's own tries."""
+    stub mdadm sees none of them alive), so no orphan can cut power alongside the hook's own tries.
+    A SIGKILL is delivered at once but the kernel tears the process down after kill(2) returns, so a
+    single look can still see a killed process: the stub waits up to 5 s for the processes to go,
+    while the hook is held in the RAID wait, so only what the hook did before that wait can end them
+    (none of them exits on its own within 60 s)."""
     pidf, proc = _run_fallback(tmp_path, 0 if fired else 300, ["/bin/sleep", "60"], timeout=60)
     kids = []
     try:
@@ -619,7 +623,12 @@ def test_hook_stops_the_fallback_and_its_children_before_any_wait(hook, tmp_path
         watched = " ".join(str(p) for p in [proc.pid, *kids])
         mdadm = hook["stubs"] / "mdadm"
         mdadm.write_text(
-            f'#!/bin/sh\necho "mdadm alive:$(ps -o stat= -p "$WATCHED" | grep -vc Z)" >> "{hook["trace"]}"\n'
+            "#!/bin/sh\n"
+            "end=$(($(date +%s) + 5))\n"
+            'while n=$(ps -o stat= -p "$WATCHED" | grep -vc Z); [ "$n" -gt 0 ] && [ "$(date +%s)" -lt "$end" ]; do\n'
+            "    /bin/sleep 0.05\n"
+            "done\n"
+            f'echo "mdadm alive:$n" >> "{hook["trace"]}"\n'
         )
         rc, trace = hook["run"]("reboot", _request([hook["cycle"]]), WATCHED=watched)
         assert rc == 0
