@@ -62,6 +62,39 @@ tt-device-mcp watch                               # live status, redraws in plac
 
 Job ids are three digits, `000`–`999`, reused once nothing live holds one.
 
+### No timeout except on contention
+
+```bash
+tt-device-mcp run-bg --no-timeout-except-on-contention -t 600 "python serve.py"
+```
+
+`-t` (x) is the job's time limit. While no other job is waiting, the job is never
+stopped for time, before or after x. Once x has passed and another job is waiting,
+the job has one minute to see the waiting job and end itself; the broker sends it no
+signal during that minute. If a job is still waiting when the minute ends, the broker
+kills the job's whole process tree (SIGTERM, then SIGKILL at most 10 s later). The job
+ends `preempted`. If the job returns 0, either by ending itself inside the minute or by
+handling SIGTERM so that every process exits through its own code with status 0 (read from
+the kernel's exit records, past the job wrapper's own `exit 143`; the job then reports exit
+code 0), no health check and no reset run before the next job. (A frozen eth core left by such a job is then caught by the next job, within its runtime or the 300 s silent-hang limit; a fault the health sampler or the output scan sees still holds the device.) If every process exits through its own code on SIGTERM
+with another exit status (the broker reads this from the kernel's exit records, which may
+need root on some kernels), the usual fast between-jobs check runs. Otherwise (SIGKILL needed, any process killed by a signal, or
+the exits could not be witnessed) the device is marked dirty: the full health check,
+fabric included, must pass before the waiting job starts. A passing check releases the
+device with no reset; a failing one keeps it held and goes on to the reset ladder and the
+bounded recovery. If every waiting job leaves before the minute
+ends, nothing happens; a later one starts a fresh minute. A job that queues before x
+waits until x, then the minute starts.
+
+Status (`tt-device-mcp status`, the job's status, `/health`) shows the job as
+`PREEMPTABLE <x>min` while it runs, and `PREEMPTING <s>s`, the seconds left in the
+minute, while a job waits past the limit.
+
+**If you use this option, you must watch the broker** (`tt-device-mcp status` or the
+job's status). As soon as a job queues after the limit, end gracefully within one
+minute or be killed. The MCP/REST field is `no_timeout_except_on_contention`;
+`--preemptable` is a short alias for the flag.
+
 `tt-device-mcp help` lists the rest: `reset`, `exec`, `smi`, `timezone`,
 `lock`/`unlock`.
 

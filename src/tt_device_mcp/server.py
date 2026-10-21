@@ -56,6 +56,8 @@ from tt_device_mcp.constants import (
     POST_STEP_DEADLINE_ENV,
     PRE_STEP_DEADLINE_DEFAULT_SEC,
     PRE_STEP_DEADLINE_ENV,
+    PREEMPT_GRACE_SEC,
+    PREEMPT_KILL_GRACE_SEC,
     SIGTERM_GRACE_SEC,
     STAGE_BRIDGE_RESET,
     STAGE_HOST_REBOOT,
@@ -75,6 +77,7 @@ from tt_device_mcp.device_holders import (
     evaluate_reset_gate,
     reclaim_foreign_holders,
 )
+from tt_device_mcp.exit_witness import ExitWitness
 from tt_device_mcp.fsm import ServerFsm, ServerState
 from tt_device_mcp.health import (
     _HOST_ESCALATION_ACTION,
@@ -275,6 +278,26 @@ class JobSubmitInput(BaseModel):
             f"Maximum runtime in seconds before auto-kill. Default: {DEFAULT_TIMEOUT_SEC} "
             f"(10 minutes). Hard maximum {MAX_TIMEOUT_SEC}s ({MAX_TIMEOUT_SEC // 60} minutes) — "
             f"a run that cannot fit is reshaped (moved off-device or split), not given a bigger number."
+        ),
+    )
+    no_timeout_except_on_contention: bool = Field(
+        False,
+        description=(
+            "No timeout except on contention. timeout_sec is the job's time limit, but while no other "
+            "job is waiting the job is never stopped for time, before or after that limit. Once the "
+            "limit has passed and another job is waiting, the job has "
+            f"{PREEMPT_GRACE_SEC}s to see the waiter and end itself; the broker sends no signal in "
+            "that time. If a job is still waiting when it runs out, the broker kills the job's whole "
+            f"process tree (SIGTERM, then SIGKILL {PREEMPT_KILL_GRACE_SEC}s later at the latest). If "
+            "the job returns 0 (it ended itself in that time, or handled SIGTERM and every process "
+            "exited through its own code) no check and no reset follow. If every process exits "
+            "through its own code on SIGTERM with another exit status the usual fast check follows; otherwise the device is marked dirty and the full "
+            "check, fabric included, must pass before the waiting job starts (a failing check holds "
+            "the device and goes on to the reset ladder). If "
+            "every waiting job leaves first, nothing happens and a later one starts a fresh "
+            f"{PREEMPT_GRACE_SEC}s. The job ends 'preempted'. Its status reads 'PREEMPTABLE <x>min' "
+            "while it runs and 'PREEMPTING <s>s' (seconds left) during that time. Anyone using "
+            "this MUST watch the broker (queue status or this job's status). Default: false."
         ),
     )
 
@@ -545,6 +568,8 @@ class Stats:
             metrics.job_completed("timeout")
         elif status == JobStatus.HUNG:
             metrics.job_completed("hung")
+        elif status == JobStatus.PREEMPTED:
+            metrics.job_completed("preempted")
 
         if wait_sec is not None:
             self.wait_times.append(wait_sec)
@@ -667,6 +692,7 @@ class JobStatus(Enum):
     TIMEOUT = "timeout"
     HUNG = "hung"
     KILLED = "killed"
+    PREEMPTED = "preempted"  # a preemptable job stopped because another job was waiting
 
 
 @dataclass
@@ -690,6 +716,15 @@ class Job:
     pid: Optional[int] = None
     last_output_monotonic: float = 0.0  # set on every line; the hung watchdog's clock
     doomed_monotonic: Optional[float] = None  # first sight of an unrecoverable-device line, if any
+    preemptable: bool = False  # no timeout except on contention: timeout_sec is enforced only while another job waits
+    # Preemption state, all on time.monotonic() and in memory only (a restart re-derives it):
+    queued_monotonic: Optional[float] = None  # when it was queued; starts a contention minute
+    contention_since_monotonic: Optional[float] = None  # start of the running job's current grace minute
+    contention_waiters: frozenset = frozenset()  # the waiters seen at the last contention poll
+    preempt_killed_monotonic: Optional[float] = None  # set when the grace minute ran out and the kill began
+    preempt_clean: bool = False  # the kernel saw every process of the tree exit on SIGTERM by its own code
+    preempt_exit_status: Optional[int] = None  # the job's own status, witnessed on a clean preemption
+    yielded_on_contention: bool = False  # it ended itself with exit 0 while a job waited past its limit
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     log_file: Optional[str] = None
@@ -2123,7 +2158,7 @@ async def _terminate_process_group(pid: int, grace_sec: float = GRACEFUL_KILL_GR
         pass
 
 
-def _is_wedge_risk_exit(status: "JobStatus", exit_code: Optional[int]) -> bool:
+def _is_wedge_risk_exit(status: "JobStatus", exit_code: Optional[int], *, preempt_clean: bool = False) -> bool:
     """True if a finished job may have left the device/mesh wedged, so the next
     job must not start until the device is reset + verified.
 
@@ -2139,6 +2174,14 @@ def _is_wedge_risk_exit(status: "JobStatus", exit_code: Optional[int]) -> bool:
     left unusable by a SIGABRT does not care which number described it."""
     if status in (JobStatus.KILLED, JobStatus.TIMEOUT, JobStatus.HUNG):
         return True
+    # A preempted job did not end itself inside its grace minute: the broker signalled its whole
+    # tree. Only when the kernel saw every process of it exit through its own code on SIGTERM
+    # (preempt_clean, see exit_witness) is that a normal end; a SIGKILL, any signal death or an
+    # exit nobody witnessed is a mid-flight kill: wedge-risk, so the device is marked dirty and the
+    # full check, fabric included, must pass before the waiting job gets it (a failing check goes
+    # on to the reset ladder; a passing one releases with no reset). A job that ends itself in time is not PREEMPTED.
+    if status == JobStatus.PREEMPTED:
+        return not preempt_clean
     if status == JobStatus.FAILED and isinstance(exit_code, int):
         if exit_code < 0:  # waitpid: -N
             return True
@@ -4148,6 +4191,13 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         "fsm_state": fsm.state.value,
         "fsm_why": fsm.record.why,
     }
+    # A running no-timeout-except-on-contention job: its PREEMPTABLE / PREEMPTING label, so a
+    # poller sees the device is about to be handed over without a second call.
+    for j in jobs.values():
+        if j.status == JobStatus.RUNNING and j.preemptable:
+            payload["preempt"] = preempt_label(j)
+            payload["preempt_job_id"] = j.id
+            break
     if hold:
         reason, since = hold
         payload["held_since"] = since
@@ -4460,6 +4510,185 @@ def _refresh_idle_hold_ledger() -> None:
 # mid-CCL wedges the mesh, which is the exact failure this is meant to clear.
 HUNG_SILENCE_SEC = int(os.environ.get("TT_DEVICE_MCP_HUNG_SILENCE_SEC", "300"))
 HUNG_POLL_SEC = 15.0
+
+# How often a preemptable job past its time limit looks for a waiting job. The grace minute is
+# anchored on the waiter's own queue time, so this only bounds how late a gap between waiters is
+# seen; the kill itself is timed to the minute's end.
+PREEMPT_POLL_SEC = 1.0
+
+
+def _waiter_arrivals(now: float) -> dict:
+    """Every job now waiting for the device, by id, with when (time.monotonic) it was queued.
+    A waiter with no monotonic stamp counts as arriving now."""
+    return {
+        j.id: min(now, j.queued_monotonic) if j.queued_monotonic is not None else now
+        for j in jobs.values()
+        if j.status == JobStatus.QUEUED
+    }
+
+
+def _preempt_kill_at(job: "Job", limit_end: float, now: Optional[float] = None) -> Optional[float]:
+    """Advance ``job``'s contention clock and return the instant (time.monotonic) its grace minute
+    ends, or None while there is no contention.
+
+    Contention = past its time limit (``limit_end``, monotonic) AND at least one job waiting. It
+    starts at the later of the limit and the earliest current waiter's arrival. When every waiter
+    leaves, contention ends and the minute is forgotten; a later waiter starts a fresh one. If
+    none of the waiters seen at the last poll is still there, a gap may have fallen between polls,
+    so the minute restarts too: an unsure case gives the running job more time, never less.
+    Everything is on time.monotonic(), so a wall-clock step or a DST change moves nothing."""
+    now = time.monotonic() if now is None else now
+    waiters = _waiter_arrivals(now) if now >= limit_end else {}
+    if not waiters:
+        job.contention_since_monotonic = None
+        job.contention_waiters = frozenset()
+        return None
+    if job.contention_since_monotonic is None or not (job.contention_waiters & waiters.keys()):
+        job.contention_since_monotonic = max(limit_end, min(waiters.values()))
+    job.contention_waiters = frozenset(waiters)
+    return job.contention_since_monotonic + PREEMPT_GRACE_SEC
+
+
+def preempt_label(job: "Job") -> Optional[str]:
+    """`PREEMPTABLE <x>min` (x = its time limit) for a no-timeout-except-on-contention job,
+    `PREEMPTING <s>s` (seconds left in the grace minute) while it runs under contention, and
+    `PREEMPTING 0s` once the kill has begun; None for an ordinary job. Shown wherever job state
+    shows, so its owner and the waiting tenant can both see the device is about to be handed
+    over. The countdown clears as soon as the last waiter leaves."""
+    if not job.preemptable:
+        return None
+    if job.status == JobStatus.RUNNING:
+        if job.preempt_killed_monotonic is not None:
+            return "PREEMPTING 0s"
+        now = time.monotonic()
+        if job.contention_since_monotonic is not None and job.contention_waiters & _waiter_arrivals(now).keys():
+            left = max(0, math.ceil(job.contention_since_monotonic + PREEMPT_GRACE_SEC - now))
+            return f"PREEMPTING {left}s"
+    minutes = job.timeout_sec / 60
+    return f"PREEMPTABLE {minutes:g}min" if minutes == int(minutes) else f"PREEMPTABLE {minutes:.1f}min"
+
+
+async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = False) -> bool:
+    """Kill a preempted job's whole process tree once its grace minute is spent: SIGTERM exactly
+    once, to its scope's cgroup while the scope is live, else to its process group (never both),
+    then SIGKILL to both PREEMPT_KILL_GRACE_SEC later at the latest. Bounded, and never cut short
+    by the waiter leaving: the runner awaits it.
+
+    One SIGTERM, because a second one a few ms later lands while a job that handled the first is
+    already exiting: a Python handler's sys.exit(0) puts SIGTERM back to its default action during
+    interpreter shutdown, so the second one kills it. That signal death would cost the job its
+    exit-0 skip (a reset and the full check instead). The scope's cgroup holds every process of a
+    scoped job, so its process group needs no signal of its own; it gets one only if the scope
+    kill fails.
+
+    Returns True only when ``witness`` is set and the kernel's exit records show every process
+    of the tree exited through its own code on SIGTERM (no SIGKILL needed, no signal death):
+    the job ended cleanly, so only the fast post-job check is owed, or none if it exited 0.
+    The job's own exit status as witnessed (ExitWitness.exit_status, None when unproven; the job
+    shell's TERM-trap 143 is not the job's) goes on its Job as ``preempt_exit_status``.
+    Any error in the witness counts as doubt and never stops the kill. Any other end, or any doubt,
+    returns False: a wedge-risk exit, so the device is marked dirty and must pass the full check,
+    fabric included, before the next job (a failing check goes on to the reset ladder)."""
+    scope = job_scope_unit(job_id)
+    scoped = await asyncio.to_thread(_scope_active, scope)
+
+    async def _send(sig: signal.Signals, *, both: bool) -> None:
+        if scoped:
+            r = await asyncio.to_thread(
+                subprocess.run, ["systemctl", "kill", f"--signal={sig.name}", scope], capture_output=True
+            )
+            if not both and r.returncode == 0:
+                return
+        if pid:
+            try:
+                os.killpg(pid, sig)
+            except (ProcessLookupError, OSError):
+                pass
+
+    async def _gone() -> bool:
+        if pid:
+            try:
+                os.killpg(pid, 0)
+                return False
+            except (ProcessLookupError, OSError):
+                pass
+        return not (scoped and await asyncio.to_thread(_scope_active, scope))
+
+    # Subscribed before the SIGTERM, so no exit of the tree can go unseen. The witness can only
+    # ever prove a clean end: any error building, draining or judging it voids the verdict (not
+    # clean, so the device is marked dirty) and never stops the kill.
+    seen = None
+    witness_error = ""
+    if witness:
+        try:
+            seen = await asyncio.to_thread(ExitWitness, pid, scope if scoped else None)
+        except Exception as e:  # noqa: BLE001 - the kill must run whatever the witness does
+            witness_error = f"witness failed ({e!r})"
+            if logger:
+                logger.warning(f"PREEMPT job_id={job_id} exit witness unavailable ({e!r}); killing unwitnessed")
+
+    def _close_witness() -> None:
+        nonlocal seen
+        if seen is not None:
+            try:
+                seen.close()
+            except Exception:  # noqa: BLE001 - closing a broken witness must not stop the kill
+                pass
+            seen = None
+
+    def _drain() -> None:
+        nonlocal witness_error
+        if seen is None:
+            return
+        try:
+            seen.drain()
+        except Exception as e:  # noqa: BLE001 - a broken witness voids the verdict, not the kill
+            witness_error = f"witness failed ({e!r})"
+            _close_witness()
+
+    def _verdict() -> bool:
+        nonlocal witness_error
+        if seen is None:
+            return False
+        try:
+            clean = seen.clean() is True
+            status = seen.exit_status() if clean else None
+        except Exception as e:  # noqa: BLE001 - in doubt the exit counts as killed
+            witness_error = f"witness failed ({e!r})"
+            return False
+        j = jobs.get(job_id)
+        if j is not None:
+            j.preempt_exit_status = status if isinstance(status, int) else None
+        return clean
+
+    try:
+        await _send(signal.SIGTERM, both=False)
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + PREEMPT_KILL_GRACE_SEC
+        while loop.time() < deadline:
+            _drain()
+            if await _gone():
+                clean = _verdict()
+                if logger and witness:
+                    why = witness_error or (getattr(seen, "why", "") if seen is not None else "")
+                    status = getattr(jobs.get(job_id), "preempt_exit_status", None)
+                    logger.info(
+                        f"PREEMPT job_id={job_id} ended on SIGTERM: "
+                        + (
+                            f"every process exited by its own code, job status {status}"
+                            if clean
+                            else f"not clean: {why}"
+                        )
+                    )
+                return clean
+            await asyncio.sleep(0.1)
+        if logger:
+            logger.warning(f"PREEMPT job_id={job_id} survived SIGTERM for {PREEMPT_KILL_GRACE_SEC}s; SIGKILL")
+        await _send(signal.SIGKILL, both=True)
+        return False
+    finally:
+        _close_witness()
+
 
 # How often a silent job is noted in its own log. This is the only hang signal that does not
 # depend on the workload: the runtime has no always-on heartbeat, and a framework's progress
@@ -4864,6 +5093,7 @@ def _get_queue_status() -> dict:
             "command": j.command[:COMMAND_DISPLAY_LENGTH],
             "workspace": Path(j.workspace).name,
             "started_at": j.started_at,
+            **({"preempt": preempt_label(j)} if j.preemptable else {}),
         }
         for j in running
     ]
@@ -5211,7 +5441,13 @@ async def cleanup_finished_jobs():
 
     async with get_lock():
         for job_id, job in jobs.items():
-            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.TIMEOUT, JobStatus.KILLED):
+            if job.status in (
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+                JobStatus.TIMEOUT,
+                JobStatus.KILLED,
+                JobStatus.PREEMPTED,
+            ):
                 if job.finished_at:
                     finished = datetime.fromisoformat(job.finished_at)
                     age_sec = (now - finished).total_seconds()
@@ -5391,6 +5627,7 @@ def _job_from_log(job_id: str) -> Optional["Job"]:
         status=JobStatus.RUNNING,
         started_at=started,
         timeout_sec=readopted_timeout,
+        preemptable=hdr.get("PREEMPTABLE", "").lower() == "yes",
     )
     job.log_file = str(path)
     return job
@@ -5434,16 +5671,33 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
     # release the chip on the way out.
     timed_out = False
     try:
+        # The limit is turned into a time.monotonic() instant ONCE, here: from then on no wall-clock
+        # step or DST change can move it. A preemptable job's contention minute is not carried
+        # over a restart; it starts afresh, which only ever gives the job more time.
         deadline = None
         job0 = jobs.get(job_id)
         if job0 is not None and job0.started_at and job0.timeout_sec:
-            try:
-                started = datetime.fromisoformat(job0.started_at)
-                deadline = started.timestamp() + job0.timeout_sec
-            except (TypeError, ValueError):
-                deadline = None
+            deadline = _readopted_deadline(job0)
         while await asyncio.to_thread(_scope_active, scope):
-            if deadline is not None and datetime.now().timestamp() > deadline:
+            poll = _SCOPE_POLL_SEC
+            if deadline is not None and job0.preemptable:
+                now = time.monotonic()
+                kill_at = _preempt_kill_at(job0, deadline, now)
+                if kill_at is not None and now >= kill_at:
+                    # Contention (one restored from the queue, or new) lasted the full minute: the
+                    # same bounded kill the runner gives a no-timeout-except-on-contention job.
+                    async with get_lock():
+                        job0.preempt_killed_monotonic = now
+                    if logger:
+                        logger.warning(
+                            f"JOB_RUNNER job_id={job_id} PREEMPTING (re-adopted): a job waited "
+                            f"{PREEMPT_GRACE_SEC}s past its {job0.timeout_sec}s limit; killing it"
+                        )
+                    await _preempt_kill(job_id, None)
+                    break
+                if kill_at is not None:
+                    poll = min(poll, max(0.0, kill_at - now))
+            if deadline is not None and not job0.preemptable and time.monotonic() > deadline:
                 timed_out = True
                 if logger:
                     logger.warning(
@@ -5452,7 +5706,7 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                     )
                 await _terminate_scope(scope)
                 break
-            await asyncio.sleep(_SCOPE_POLL_SEC)
+            await asyncio.sleep(poll)
     finally:
         job = jobs.get(job_id)
         if job is not None:
@@ -5463,6 +5717,13 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                         job.status = JobStatus.TIMEOUT
                         job.error = (job.error or "") + (
                             f"\n[TIMEOUT after {job.timeout_sec}s] (re-adopted across a broker restart)"
+                        )
+                    elif job.preempt_killed_monotonic is not None:
+                        job.exit_code = rc
+                        job.status = JobStatus.PREEMPTED
+                        job.error = (job.error or "") + (
+                            f"\n[PREEMPTED: a job waited {PREEMPT_GRACE_SEC}s past the {job.timeout_sec}s limit] "
+                            "(re-adopted across a broker restart)"
                         )
                     elif rc is None:
                         # The job died without running its EXIT trap — killed by a signal,
@@ -5781,6 +6042,7 @@ async def job_runner():
                 current_process = proc
                 current_job_id = job_id
                 job.pid = proc.pid
+                limit_end = time.monotonic() + job.timeout_sec  # start + x, for preempt_watchdog
                 # A job that never emits a line at all is still measured for silence, so the
                 # clock starts at spawn rather than at first output.
                 job.last_output_monotonic = time.monotonic()
@@ -5891,17 +6153,71 @@ async def job_runner():
 
                     await asyncio.sleep(HUNG_POLL_SEC)
 
+            async def preempt_watchdog():
+                # No timeout except on contention: past its limit the job runs on for as long as
+                # nobody is waiting. Contention (past the limit AND a job waiting) must then last
+                # a full PREEMPT_GRACE_SEC, unbroken, before the broker touches the job: no signal
+                # inside that minute, so the job can see the waiter and end itself. When the
+                # minute runs out the whole tree is killed (_preempt_kill, bounded) and the job ends
+                # PREEMPTED. If every process exited through its own code on SIGTERM the normal
+                # fast post-job gate follows (none at all on exit 0, as for a job that yields inside
+                # the minute); otherwise (a wedge-risk exit) the device is marked dirty
+                # and must pass the full post-job gate, fabric included, before the waiting job
+                # starts; a failing gate holds it and goes on to the reset ladder.
+                announced = False
+                contended = False
+                while True:
+                    now = time.monotonic()
+                    kill_at = _preempt_kill_at(job, limit_end, now)
+                    if kill_at is not None and now >= kill_at:
+                        break
+                    if not announced and now >= limit_end:
+                        announced = True
+                        note(
+                            f"PREEMPTABLE: past the {job.timeout_sec}s limit; running on until another "
+                            f"job is queued, then end within {PREEMPT_GRACE_SEC}s or be killed"
+                        )
+                    if (kill_at is not None) != contended:
+                        contended = kill_at is not None
+                        if contended:
+                            left = max(0, math.ceil(kill_at - now))
+                            note(f"PREEMPTING: a job is waiting past the limit; end within {left}s or be killed")
+                        else:
+                            note("PREEMPTABLE: the waiting job left; no preemption")
+                    await asyncio.sleep(PREEMPT_POLL_SEC if kill_at is None else min(PREEMPT_POLL_SEC, kill_at - now))
+                async with get_lock():
+                    if job.status != JobStatus.RUNNING:
+                        return
+                    job.preempt_killed_monotonic = time.monotonic()
+                note(f"PREEMPTED: a job waited {PREEMPT_GRACE_SEC}s past the {job.timeout_sec}s limit; killing the job")
+                if logger:
+                    logger.warning(
+                        f"JOB_RUNNER job_id={job_id} PREEMPTING: a job waited {PREEMPT_GRACE_SEC}s past "
+                        f"its {job.timeout_sec}s limit -> killing it (SIGTERM, SIGKILL within "
+                        f"{PREEMPT_KILL_GRACE_SEC}s)"
+                    )
+                job.preempt_clean = await _preempt_kill(job_id, job.pid, witness=True)
+
             watchdog = asyncio.create_task(hung_watchdog())
+            preempter = asyncio.create_task(preempt_watchdog()) if job.preemptable else None
             try:
                 await asyncio.wait_for(
                     asyncio.gather(
                         read_stream(proc.stdout, "stdout", job.out_buf),
                         read_stream(proc.stderr, "stderr", job.err_buf),
                     ),
-                    timeout=job.timeout_sec,
+                    # A preemptable job has no wall-clock bound of its own: preempt_watchdog ends it.
+                    timeout=None if job.preemptable else job.timeout_sec,
                 )
             finally:
                 watchdog.cancel()
+                if preempter is not None:
+                    if job.preempt_killed_monotonic is not None:
+                        # A kill once begun always completes (it is bounded), whoever left the
+                        # queue meanwhile: no half-killed tree is ever handed to the next job.
+                        await asyncio.gather(preempter, return_exceptions=True)
+                    else:
+                        preempter.cancel()
                 if log_fh:
                     log_fh.close()
             await proc.wait()
@@ -5911,7 +6227,23 @@ async def job_runner():
                 # Preserve a verdict already reached by the killer (user kill, hung reaper):
                 # the process died by our signal, so its returncode would otherwise read FAILED.
                 if job.status not in (JobStatus.KILLED, JobStatus.HUNG):
-                    job.status = JobStatus.COMPLETED if job.exit_code == 0 else JobStatus.FAILED
+                    if job.preempt_killed_monotonic is not None:
+                        job.status = JobStatus.PREEMPTED
+                        if job.preempt_clean and job.preempt_exit_status == 0:
+                            # The job shell's TERM trap exits 143 after the job's own program has
+                            # already returned; the kernel's exit records proved the job's own 0.
+                            job.exit_code = 0
+                        terminal_note = (
+                            f"\n[PREEMPTED: a job waited {PREEMPT_GRACE_SEC}s past the {job.timeout_sec}s limit]"
+                            + (" (ended cleanly on SIGTERM)" if job.preempt_clean else "")
+                        )
+                    else:
+                        job.status = JobStatus.COMPLETED if job.exit_code == 0 else JobStatus.FAILED
+                        # A preemptable job that ends itself with exit 0 while a job waits past its
+                        # limit has done what the grace minute asks: it yielded the device.
+                        job.yielded_on_contention = (
+                            job.preemptable and job.exit_code == 0 and _preempt_kill_at(job, limit_end) is not None
+                        )
 
             if logger:
                 logger.info(
@@ -6038,7 +6370,7 @@ async def job_runner():
                             f"CLEAN-GATE job {job_id} was killed by device recovery; not "
                             f"flagging the device over a death we caused"
                         )
-                elif _is_wedge_risk_exit(job.status, job.exit_code):
+                elif _is_wedge_risk_exit(job.status, job.exit_code, preempt_clean=job.preempt_clean):
                     _mark_device_dirty(
                         f"job {job_id} ended {job.status.value}"
                         + (f" (exit {job.exit_code})" if job.exit_code is not None else ""),
@@ -6062,11 +6394,27 @@ async def job_runner():
                     # Any non-success exit means we do not know what the job did to the
                     # mesh, so the fabric is proved before the next tenant sees it — the
                     # periodic interval does not get a vote on whether a failure is
-                    # investigated.
-                    await _verify_device_after_job(
-                        job_log_file,
-                        job_failed=(job.status != JobStatus.COMPLETED or job.exit_code != 0),
+                    # investigated. A preemption the kernel saw end cleanly on SIGTERM is a normal
+                    # end, not a failure: the fast check, which escalates on its own if it fails.
+                    clean_preempt = job.status == JobStatus.PREEMPTED and job.preempt_clean
+                    # A preempted job that returns 0 (it yielded inside the grace minute, or handled
+                    # SIGTERM and every process of its tree exited by its own code) owes no check of
+                    # any kind and no reset. Only another cause still runs the gate: a device fault
+                    # named in its output, or a device not HEALTHY when it ended.
+                    yielded_ok = job.exit_code == 0 and (
+                        job.yielded_on_contention or (clean_preempt and job.preempt_exit_status == 0)
                     )
+                    if yielded_ok and not fault and fsm.state is ServerState.HEALTHY:
+                        if logger:
+                            logger.info(
+                                f"CLEAN-GATE job {job_id} ended {job.status.value} with exit 0 under "
+                                f"contention; no post-job check"
+                            )
+                    else:
+                        await _verify_device_after_job(
+                            job_log_file,
+                            job_failed=(job.status != JobStatus.COMPLETED or job.exit_code != 0) and not clean_preempt,
+                        )
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:
                         logger.error(f"JOB_RUNNER post-job health gate error for job_id={job_id}: {e}")
@@ -6119,6 +6467,7 @@ def _persist_queued_job(job: "Job") -> None:
                     "env": job.env,
                     "env_vars": job.env_vars,
                     "timeout_sec": job.timeout_sec,
+                    "preemptable": job.preemptable,
                     "log_file": job.log_file,
                 }
             )
@@ -6243,10 +6592,14 @@ async def _restore_queued_jobs() -> None:
                 workspace=spec["workspace"],
                 command=spec["command"],
                 queued_at=spec["queued_at"],
+                # Its old monotonic stamp died with the old broker: a restored waiter starts any
+                # contention minute afresh, which only ever gives the running job more time.
+                queued_monotonic=time.monotonic(),
                 peer_uid=spec.get("peer_uid"),
                 env=spec.get("env"),
                 env_vars=spec.get("env_vars") or {},
                 timeout_sec=int(spec.get("timeout_sec", DEFAULT_TIMEOUT_SEC)),
+                preemptable=bool(spec.get("preemptable", False)),
                 log_file=spec.get("log_file"),
             )
         except (OSError, ValueError, TypeError, KeyError) as e:
@@ -6575,6 +6928,7 @@ def create_mcp_server() -> MCPServer:
             env=data.get("env"),
             inherited_env=data.get("inherited_env"),
             timeout_sec=data.get("timeout_sec", DEFAULT_TIMEOUT_SEC),
+            preemptable=bool(data.get("no_timeout_except_on_contention", False)),
         )
         return JSONResponse(result)
 
@@ -6858,6 +7212,11 @@ def create_mcp_server() -> MCPServer:
         }
         if job.error:
             result["cause"] = job.error
+        if job.preemptable:
+            result["no_timeout_except_on_contention"] = True
+            result["timeout_sec"] = job.timeout_sec
+            if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
+                result["preempt"] = preempt_label(job)
 
         if job.status not in (JobStatus.QUEUED, JobStatus.RUNNING):
             if job.runtime_sec is not None:
@@ -6950,6 +7309,7 @@ def create_mcp_server() -> MCPServer:
         env: str = None,
         inherited_env: dict[str, str] = None,
         timeout_sec: int = DEFAULT_TIMEOUT_SEC,
+        preemptable: bool = False,
     ) -> dict:
         """Internal helper to queue a job."""
         global job_counter
@@ -7045,6 +7405,8 @@ def create_mcp_server() -> MCPServer:
                 f.write(f"COMMAND:     {command}\n")
                 f.write(f"ENV FILE:    {env or '(none)'}\n")
                 f.write(f"TIMEOUT:     {timeout_sec}s\n")
+                if preemptable:
+                    f.write("PREEMPTABLE: yes\n")
                 f.write(f"QUEUED:      {queued_at}\n")
                 f.write("-" * 70 + "\n")
                 f.write("ENVIRONMENT VARIABLES:\n")
@@ -7059,10 +7421,12 @@ def create_mcp_server() -> MCPServer:
             workspace=workspace,
             command=command,
             queued_at=queued_at,
+            queued_monotonic=time.monotonic(),
             peer_uid=current_peer_uid.get(),
             env=env,
             env_vars=resolved_env_vars,
             timeout_sec=timeout_sec,
+            preemptable=bool(preemptable),
             log_file=job_log_file,
         )
         jobs[job_id] = job
@@ -7152,6 +7516,7 @@ def create_mcp_server() -> MCPServer:
             params.env,
             params.inherited_env,
             params.timeout_sec,
+            params.no_timeout_except_on_contention,
         )
 
     @mcp.tool(
@@ -7195,6 +7560,7 @@ def create_mcp_server() -> MCPServer:
             params.env,
             params.inherited_env,
             params.timeout_sec,
+            params.no_timeout_except_on_contention,
         )
         if "error" in result:
             return result
@@ -7329,6 +7695,9 @@ def create_mcp_server() -> MCPServer:
                         recent_lines.append(stripped)
                 log_snippet = "\n".join(recent_lines) if recent_lines else ""
                 msg = f"Running ({int(elapsed)}s)"
+                label = preempt_label(job)
+                if label:
+                    msg += f" {label}"
                 if job.log_file:
                     msg += f"\nLog: {job.log_file}"
                 if log_snippet:

@@ -27,7 +27,7 @@ the queue and a running job outlive the broker process.
 - **I2** — `MAX_TIMEOUT_SEC` (1500 s / 25 min) is a hard ceiling on `timeout_sec`, clamped
   in `_queue_job` — the single funnel shared by the MCP tools and the REST route — never
   only at a tool schema. At the ceiling, the timeout message MUST NOT offer a way to raise
-  it.
+  it. A no-timeout-except-on-contention job's `timeout_sec` is clamped the same way (I16).
 - **I3** — The job log file is created at queue time, before the job is enqueued, so it can
   be tailed immediately; it is the complete, durable record of the run (in-memory capture is
   a bounded tail, `JOB_CAPTURE_MAX_LINES`).
@@ -48,7 +48,9 @@ the queue and a running job outlive the broker process.
   a live job holds (ids wrap).
 - **I7** — A re-adopted job keeps its original `timeout_sec` reservation, with time already
   served counted against it (`_readopted_deadline`); re-adoption never grants a fresh
-  clock, and the deadline is enforced by `_monitor_readopted_scope`.
+  clock, and the deadline is enforced by `_monitor_readopted_scope`. A re-adopted
+  no-timeout-except-on-contention job (header `PREEMPTABLE: yes`) is held to I16 instead:
+  past its deadline it is killed only after another job has waited a full minute.
 - **I8** — A job's exit status comes from the job itself: the shell preamble
   (`_exit_trap_preamble`) traps EXIT/TERM/INT and writes the status to
   `job_exit_file(job_id)`. A re-adopted job with no exit file MUST be reported FAILED,
@@ -83,17 +85,83 @@ the queue and a running job outlive the broker process.
   `TENANT_HOLD_POLL_SEC` (60 s) until fit, with no clock bound (a kill releases the hold);
   with `TT_DEVICE_MCP_TENANT_HOLD=0` it is refused at the door as FAILED with the reason in
   its log. Gate internals are spec 03.
+- **I16** — A job submitted with `no_timeout_except_on_contention` (CLI
+  `--no-timeout-except-on-contention`, alias `--preemptable`; `Job.preemptable`) has no
+  timeout except on contention. `timeout_sec` (x) is its time limit: while no other job is
+  queued it is never stopped for time, before or after x, and a job queued before x does not
+  preempt it. **Contention** is: x has passed AND at least one job is queued. It starts at
+  `max(start + x, arrival of the earliest current waiter)`. The broker sends no signal and
+  takes no action against the job until contention has lasted `PREEMPT_GRACE_SEC` (60 s)
+  unbroken (`_preempt_kill_at`); in that minute the job is expected to see the waiter in the
+  queue and end itself. A job that does ends `completed`/`failed`; if it returns 0 it has
+  yielded the device (`Job.yielded_on_contention`): no post-job check of any kind, quick or
+  full, and no reset before the next job. A non-zero exit gets the normal post-job gate. When every waiter leaves, contention ends, the minute is forgotten and
+  the job is untouched; a later waiter starts a fresh minute (if none of the waiters seen at
+  the last poll remains, the minute restarts too, so an unsure case favours the running job).
+  When the minute ends with a job still waiting, the broker kills the job's whole process tree
+  (`_preempt_kill`: SIGTERM exactly once, to its systemd scope while the scope is live, else to
+  its process group, never both; then SIGKILL `PREEMPT_KILL_GRACE_SEC`, 10 s, later at the
+  latest, to scope and process group). One SIGTERM, because a second one a few ms later kills a job that
+  handled the first and is already exiting (a Python `sys.exit(0)` handler puts SIGTERM back to
+  its default action during interpreter shutdown), turning a clean exit 0 into a signal death.
+  A kill once begun completes, even if the waiter leaves: the runner awaits it. The job ends `preempted`. What follows depends on how the tree died, as
+  witnessed by the kernel's process events (`exit_witness.ExitWitness`, subscribed before the
+  SIGTERM and the tree snapshot, so no exit or fork of the tree is missed): if SIGKILL was not
+  needed and every process of the tree (process group and scope, plus anything they forked)
+  was seen to exit through its own code (no wait status shows a signal death), the job ended
+  cleanly on SIGTERM (`Job.preempt_clean`). That is not a wedge-risk exit: if the job's own
+  exit status is 0 (it handled SIGTERM; `ExitWitness.exit_status` proves it from the exit
+  records, `Job.preempt_exit_status`, and the job then reports exit code 0) no post-job check of
+  any kind runs and no reset; with any other or an unproven status the normal fast post-job
+  gate runs, no reset, and a failed fast check holds the device and goes on to the full check and the bounded recovery as after any job. Exit 0
+  waives only the check the preemption itself would owe: a device fault named in the job's
+  output, or a device not HEALTHY when the job ends, still runs the gate. Recovery-time cost of
+  the waiver (both exit-0 paths, the yield inside the minute and a handled SIGTERM): the skipped
+  fast check includes the passive eth-heartbeat read, the only post-job catch for an eth core
+  frozen by a job that exited cleanly. Detection of that fault moves to the next job: at most
+  that job's runtime, or `HUNG_SILENCE_SEC` (300 s) for a silent hang, after which the normal
+  frozen-eth path (spec 03) runs. A fault the health sampler or the job-output scan sees still
+  holds and gates as before. In every other case
+  (SIGKILL sent; any process died from a signal, SIGTERM's default action included; an exit
+  not witnessed, because the connector is unavailable (some kernels allow it only with
+  CAP_NET_ADMIN), events were lost (a reader thread drains the socket as they arrive, so a
+  busy host's event rate does not overflow it between polls), the tree could not be read, or the witness raised while it
+  was built, drained or judged, in which case the kill still runs to SIGKILL if needed) the
+  exit is wedge-risk (I14), whatever its exit status: the device is marked dirty, so the full
+  post-job gate, fabric included, must pass before the waiting job is dispatched. No reset runs
+  when that check passes (the gate's RELEASE, as after any wedge-risk exit); a failed check keeps
+  the hold and goes on to the reset ladder and the bounded recovery (spec 03/04). The job's own
+  wait status cannot make this call: the bash wrapper's TERM trap exits 143 after the job's
+  program has returned, whatever it returned, a job's own trap can replace that, and
+  grandchildren are reaped by their parents. So the job's own status is read past the wrapper:
+  0 only when every process of the tree other than the wrapper (the process group leader)
+  exited 0 and the wrapper exited 0 or 143; a tree where only the wrapper was running (a SIGTERM
+  between commands) proves nothing and gets the fast check. A re-adopted
+  job (I6) is not the broker's child, so it is never witnessed: it is held to the same rule
+  and always ends dirty, exit 0 included. Every deadline and countdown is on `time.monotonic()`: the limit is
+  turned into a monotonic instant once (at spawn, or once at re-adoption via
+  `_readopted_deadline`), waiters carry `queued_monotonic`, and none of this state is
+  persisted. Across a broker restart the limit is re-derived from the header and any minute
+  starts afresh (restored waiters count as arriving at restore), which only ever gives the job
+  more time. A wall-clock step or DST change moves no deadline. Status, wherever job state
+  shows (queue status, job status, wait progress, `/health`, the CLI), reads
+  `PREEMPTABLE <x>min` while it runs and, under contention, `PREEMPTING <s>s` (seconds left in
+  the minute, counting down; `0s` once the kill has begun); it clears as soon as the last
+  waiter leaves. Preemption adds no wait, gate or cooldown to any reset, hold or recovery path.
+  Anyone using the option MUST watch the broker (queue status, or the job's own status): once
+  a job queues after the limit, they end gracefully within one minute or are killed.
 
 ## Interfaces
 
 Other subsystems and tenants may rely on:
 
 - **Job states** (`JobStatus`): `queued`, `running`, `completed`, `failed`, `timeout`,
-  `hung`, `killed`. Terminal: all but `queued`/`running`. `completed` means exit code 0;
-  a non-zero exit is `failed`.
+  `hung`, `killed`, `preempted`. Terminal: all but `queued`/`running`. `completed` means
+  exit code 0; a non-zero exit is `failed`; `preempted` is a no-timeout-except-on-contention job
+  stopped on contention (I16).
 - **`Job` fields and properties**: `id`, `owner`, `workspace`, `command`, `queued_at`,
-  `started_at`, `finished_at`, `exit_code`, `timeout_sec`, `log_file`, `env_vars`;
-  computed `runtime_sec`, `wait_sec`.
+  `started_at`, `finished_at`, `exit_code`, `timeout_sec`, `log_file`, `env_vars`,
+  `preemptable`; computed `runtime_sec`, `wait_sec`.
 - **MCP/REST surface** (schemas and routes are spec 02; names only):
   `tt_device_job_run` (queue + block, streams progress), `tt_device_job_run_bg`,
   `tt_device_job_status`, `tt_device_job_wait`, `tt_device_job_logs`,
@@ -212,7 +280,11 @@ flowchart LR
 - `asyncio.wait_for(..., timeout=job.timeout_sec)` bounds the run. On expiry the job is
   terminated via `_terminate_job` (scope-aware, I5) and becomes TIMEOUT, with
   `timeout_hint()` explaining the limit — actionable below the ceiling, non-negotiable at
-  it.
+  it. A no-timeout-except-on-contention job is not bounded by `wait_for`; a
+  `preempt_watchdog` polls every `PREEMPT_POLL_SEC` (and wakes at the minute's end), advances
+  the contention clock with `_preempt_kill_at`, and once the minute has run out sets
+  `preempt_killed_monotonic` and calls `_preempt_kill` (I16). The job stays `running` through
+  the minute so status shows the countdown; it becomes `preempted` at exit.
 - The hung watchdog (I10) announces silence every `HUNG_NOTICE_SEC` (60 s) in the job's
   log, then reaps at `HUNG_SILENCE_SEC` as HUNG; the doomed reap fires first if the
   runtime declared the device unrecoverable. Both kill the process so the streams hit EOF
@@ -314,6 +386,7 @@ flowchart LR
 | I11 | `tests/test_server.py::TestActivationScript::test_activation_script_default`, `tests/test_server.py::TestActivationScript::test_activation_script_with_env_file`, `tests/test_server.py::TestActivationScript::test_activation_script_inherited_env`, `tests/test_server.py::TestActivationScript::test_activation_script_python_env_dir_over_virtual_env`, `tests/test_server.py::TestActivationScript::test_activation_script_virtual_env_fallback`, `tests/test_server.py::TestEnvFile::test_load_env_file_converts_to_strings` |
 | I12 | `tests/test_device_safety.py::test_rest_submit_bad_env_file_is_a_refusal_not_a_500`, `tests/test_server.py::TestEnvFile::test_load_env_file_not_found`, `tests/test_server.py::TestEnvFile::test_load_env_file_invalid_format`, `tests/test_server.py::TestActivationScript::test_activation_script_validate_missing_env` |
 | I14 | `tests/test_server.py::TestCleanDeviceGate::test_wedge_risk_truth_table`, `tests/test_device_safety.py::test_a_hung_job_is_treated_as_a_wedge_risk`, `tests/test_server.py::test_scan_output_detects_eth_core_fault`, `tests/test_server.py::test_scan_output_finds_signature_in_tail_of_large_log`, `tests/test_readopt.py::test_a_readopted_job_that_wedged_the_mesh_flags_the_device` |
+| I16 | `tests/test_preemptable.py::test_a_preemptable_job_runs_past_its_limit_while_nobody_waits`, `tests/test_preemptable.py::test_an_ordinary_job_still_times_out_at_its_limit`, `tests/test_preemptable.py::test_contention_inside_the_limit_does_not_preempt`, `tests/test_preemptable.py::test_no_signal_before_the_minute_then_the_whole_tree_is_killed`, `tests/test_preemptable.py::test_a_job_that_ends_itself_inside_the_minute_with_exit_0_gets_no_check`, `tests/test_preemptable.py::test_a_job_that_fails_inside_the_minute_still_gets_the_full_check`, `tests/test_preemptable.py::test_a_yield_with_exit_0_is_still_checked_when_its_output_names_a_device_fault`, `tests/test_preemptable.py::test_a_yield_with_exit_0_is_still_checked_when_the_device_is_not_healthy`, `tests/test_preemptable.py::test_a_waiter_that_leaves_inside_the_minute_causes_no_preemption`, `tests/test_preemptable.py::test_a_waiter_that_leaves_after_the_kill_started_does_not_stop_it`, `tests/test_preemptable.py::test_a_wall_clock_step_moves_no_deadline`, `tests/test_preemptable.py::test_the_kill_instant_ignores_the_wall_clock`, `tests/test_preemptable.py::test_preempt_labels`, `tests/test_preemptable.py::test_queue_status_and_cli_show_the_preempt_label`, `tests/test_preemptable.py::test_an_ordinary_job_row_has_no_preempt_label`, `tests/test_preemptable.py::test_preempted_wedge_risk`, `tests/test_preemptable.py::test_a_preempted_job_that_ends_cleanly_on_sigterm_takes_the_fast_check`, `tests/test_preemptable.py::test_a_preempted_job_with_a_signal_death_is_fully_checked`, `tests/test_preemptable.py::test_a_preempted_job_that_needed_sigkill_is_fully_checked`, `tests/test_preemptable.py::test_a_preempted_job_that_handles_sigterm_with_exit_0_gets_no_check_or_reset`, `tests/test_preemptable.py::test_the_real_job_wrapper_reports_a_handled_sigterm_by_the_jobs_own_status`, `tests/test_preemptable.py::test_the_witness_reads_the_jobs_own_status_past_the_shells_term_trap`, `tests/test_preemptable.py::test_a_preempted_job_that_exits_0_with_a_signal_death_is_fully_checked`, `tests/test_preemptable.py::test_a_preempted_job_that_exits_0_after_sigkill_is_fully_checked`, `tests/test_preemptable.py::test_an_unwitnessed_preemption_is_fully_checked`, `tests/test_preemptable.py::test_a_killed_preemption_releases_only_on_a_passing_full_check`, `tests/test_preemptable.py::test_a_failed_fast_check_after_a_clean_end_keeps_the_hold_and_escalates`, `tests/test_preemptable.py::test_the_witness_reads_kernel_exit_records`, `tests/test_preemptable.py::test_the_witness_on_a_real_tree`, `tests/test_preemptable.py::test_the_witness_keeps_up_with_a_busy_host_between_polls`, `tests/test_preemptable.py::test_closing_the_witness_unsubscribes_first`, `tests/test_preemptable.py::test_a_witness_that_breaks_while_draining_is_void`, `tests/test_preemptable.py::test_a_witness_that_cannot_be_built_still_kills_and_counts_as_killed`, `tests/test_preemptable.py::test_a_witness_error_while_draining_or_judging_still_kills_and_counts_as_killed`, `tests/test_preemptable.py::test_rest_submit_carries_the_option_into_the_job_and_its_log`, `tests/test_preemptable.py::test_a_log_without_the_header_is_an_ordinary_job`, `tests/test_preemptable.py::test_a_readopted_preemptable_job_past_its_limit_is_left_alone_while_nobody_waits`, `tests/test_preemptable.py::test_a_readopted_preemptable_job_is_killed_a_full_minute_after_a_job_waits`, `tests/test_preemptable.py::test_a_readopted_job_whose_waiter_leaves_inside_the_minute_is_left_alone`, `tests/test_preemptable.py::test_a_preempted_readopted_job_never_releases_the_device_clean`, `tests/test_preemptable.py::test_no_kill_instant_while_nobody_waits_even_long_past_the_limit`, `tests/test_preemptable.py::test_no_kill_instant_before_the_limit_even_with_a_waiter`, `tests/test_preemptable.py::test_a_waiter_after_the_limit_starts_the_minute_at_its_arrival`, `tests/test_preemptable.py::test_a_waiter_before_the_limit_starts_the_minute_at_the_limit`, `tests/test_preemptable.py::test_the_earliest_waiter_sets_the_minute`, `tests/test_preemptable.py::test_a_later_waiter_does_not_restart_a_running_minute`, `tests/test_preemptable.py::test_the_minute_restarts_with_a_new_waiter_after_the_last_one_left`, `tests/test_preemptable.py::test_a_waiter_swap_between_polls_restarts_the_minute`, `tests/test_preemptable.py::test_a_waiter_after_the_limit_shows_the_countdown_then_sigkills_at_the_minute`, `tests/test_preemptable.py::test_a_waiter_before_the_limit_starts_the_countdown_at_the_limit`, `tests/test_preemptable.py::test_the_full_post_job_gate_runs_before_the_waiting_job_gets_the_device`, `tests/test_preemptable.py::test_health_shows_the_label_only_for_a_running_preemptable_job`, `tests/test_preemptable.py::test_the_cli_flag_reads_no_timeout_except_on_contention`, `tests/test_preemptable.py::test_the_option_is_documented_under_its_name`, `tests/test_preemptable.py::test_sigkill_comes_ten_seconds_after_sigterm_and_the_docs_say_so`, `tests/test_preemptable.py::test_a_scoped_job_gets_one_sigterm_then_sigkill_to_scope_and_group`, `tests/test_preemptable.py::test_the_group_gets_the_one_sigterm_when_the_scope_kill_fails`, `tests/test_preemptable.py::test_a_scoped_python_job_that_exits_0_on_sigterm_gets_the_exit_0_skip` |
 | I15 | `tests/test_device_safety.py::test_hold_mode_holds_a_degraded_device_then_dispatches_when_fit`, `tests/test_device_safety.py::test_hold_mode_self_heals_a_dirty_device_by_re_running_the_gate`, `tests/test_device_safety.py::test_exhausting_the_verify_budget_does_not_dispatch`, `tests/test_device_safety.py::test_tenant_gate_writes_one_held_and_one_released_per_episode` |
 | B-Submission (burst cap) | `tests/test_device_safety.py::test_an_armed_burst_cap_refuses_one_owners_flood_but_not_another`, `tests/test_device_safety.py::test_the_default_off_burst_cap_admits_every_submit`, `tests/test_device_safety.py::test_job_burst_decision_prunes_the_window_and_gates_on_the_cap[2-60.0-recent2-110.0-False-50.0-expect_kept2]` |
 | B-Submission (owner derived from the peer uid and the surface) | `tests/test_device_safety.py::test_the_owner_comes_from_the_peer_uid_and_the_surface` |

@@ -285,6 +285,9 @@ class Recovery(ABC):
         # after selection later resolves to the other.
         self.mechanism = mechanism
         self.deps = deps
+        # The bridge rung's per-chip SBR window (see _recover_isolated_chips). Present from the
+        # start, so a gate that reads it before any bridge rung fired reads empty, not an error.
+        self.last_bridge_reset_reasons: dict = {}
 
     @abstractmethod
     def next_stage(self, ev: Evidence) -> str:

@@ -38,6 +38,19 @@ GRACEFUL_KILL_GRACE_SEC = 60
 # to the reap, and reaching SIGKILL means the device was NOT released.
 SIGTERM_GRACE_SEC = 15
 
+# A preemptable job's grace minute. Contention (the job past its time limit AND another job
+# waiting) must last this long, unbroken, before the broker does anything to the job: the job
+# is expected to see the waiter in the queue and end itself. No signal is sent inside it.
+PREEMPT_GRACE_SEC = 60
+
+# Once the grace minute is spent, the job's whole process tree gets SIGTERM and, at most this
+# much later, SIGKILL. The job already had its minute to end itself, so this is short. A tree
+# that all exits through its own code on SIGTERM inside it gets the fast post-job check (no check
+# and no reset when it exits 0); a
+# SIGKILL, any signal death or an unwitnessed exit marks the device dirty, so the full check,
+# fabric included, must pass first (a failing one goes on to the reset ladder).
+PREEMPT_KILL_GRACE_SEC = 10
+
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
 # is deliberately never killed, because one stopped partway through 32 ASICs is far worse
