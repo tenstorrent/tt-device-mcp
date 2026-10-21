@@ -290,6 +290,15 @@ class RecoveryDeps:
     # Marks the pollers the dead-chip valve stopped as owed a restart (server._owe_device_pollers):
     # that stop has no paired restore, and an idle relift can close the episode with no reset.
     owe_device_pollers: Optional[Callable[[str], None]] = None
+    # Spec 03 I83: one heartbeat read of every chip not in the given set, during a mesh reset's driver
+    # wait (monitors.heartbeat.read_heartbeats with skip). None: the in-flight watch is off.
+    read_inflight_heartbeats: Optional[Callable[[frozenset], dict]] = None
+    # Spec 03 I83: (pids, scan complete) of the device holders that are not the broker's own or the
+    # reset's (server._find_inflight_readers). Read-only.
+    find_inflight_readers: Optional[Callable[[], tuple]] = None
+    # Spec 03 I83: SIGTERM, then SIGKILL PREEMPT_KILL_GRACE_SEC later, to those holders
+    # (server._cut_inflight_readers). The sampler calls it only once every confirmed chip is detached.
+    cut_inflight_readers: Optional[Callable[[str], Awaitable[list]]] = None
     mark_device_dirty: Optional[Callable[..., None]] = None
     # Places a not-dirty fabric-unverified hold (server._hold_device_fabric_unverified): a reset whose
     # fabric stayed a 77 settles there, never as a failed reset.

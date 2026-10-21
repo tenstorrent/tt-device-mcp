@@ -2835,7 +2835,7 @@ async def test_pollers_are_stopped_before_the_reset_and_restarted_after(monkeypa
         order.append("start" if active else "stop")
         return ["tt-telemetry.service"]
 
-    async def reset(argv, log, owner="[broker]health-gate"):
+    async def reset(argv, log, owner="[broker]health-gate", on_output=None):
         order.append("reset")
         return 0, ""
 
@@ -2854,7 +2854,7 @@ async def test_pollers_are_restarted_even_if_the_reset_raises(monkeypatch):
         order.append("start" if active else "stop")
         return ["tt-telemetry.service"]
 
-    async def reset(argv, log, owner="[broker]health-gate"):
+    async def reset(argv, log, owner="[broker]health-gate", on_output=None):
         raise OSError("boom")
 
     monkeypatch.setattr(srv, "_set_device_pollers", pollers)
@@ -3011,7 +3011,7 @@ def _reset_that_fails(monkeypatch, rc=1):
     """reset_with_quiesce's backend stubbed: the reset exits ``rc``, no scope is left cycling, and
     the PCI rescan and settle sleep are no-ops."""
 
-    async def run_scoped(argv, log, owner="[broker]health-gate"):
+    async def run_scoped(argv, log, owner="[broker]health-gate", on_output=None):
         return rc, "reset exited 1; device not recovered"
 
     async def to_thread(fn, *a, **k):

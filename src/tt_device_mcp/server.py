@@ -87,6 +87,8 @@ from tt_device_mcp.device_holders import (
     discount_broker_internal,
     enumerate_device_holders,
     evaluate_reset_gate,
+    in_broker_scope,
+    is_broker_internal,
     is_tenant,
     note_broker_internal,
     read_proc_cpu,
@@ -177,6 +179,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.health.recovery.base import RESET_SCOPE_PREFIX
 from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import JOB_TAG_ENV, ReapedLeftover, find_reaped_leftovers, reap_job_survivors
 from tt_device_mcp.job_spool import (
@@ -1143,6 +1146,9 @@ _recovery_deps = RecoveryDeps(
     health_event=lambda kind, **f: health_event(kind, **f),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     owe_device_pollers=lambda reason: _owe_device_pollers(reason),
+    read_inflight_heartbeats=lambda skip: read_heartbeats(skip=skip),
+    find_inflight_readers=lambda: _find_inflight_readers(),
+    cut_inflight_readers=lambda reason: _cut_inflight_readers(reason),
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
     hold_device_fabric_unverified=lambda why: _hold_device_fabric_unverified(why),
     note_fabric_77_reset_passes=lambda n: _note_fabric_77_reset_passes(n),
@@ -5753,6 +5759,54 @@ async def _kill_device_holders(reason: str) -> list:
         _mark_job_device_fault_failed(victim, f"device recovery kill: {reason}")
     _note_tenant_gate_verdict(f"device recovery: chip(s) left PCIe bus ({reason})")
     return killed
+
+
+def _inflight_reader(h) -> bool:
+    """Spec 03 I83: a holder the in-flight cut may signal. Never the broker's own processes (its
+    internal pids, its children) nor the reset's scope: the reset still owns the chips."""
+    if is_broker_internal(h.pid) or in_broker_scope(h.pid, (RESET_SCOPE_PREFIX,)):
+        return False
+    return h.pid != os.getpid() and not descends_from(h.pid, os.getpid())
+
+
+def _find_inflight_readers() -> tuple:
+    """Spec 03 I83: the pids _cut_inflight_readers would signal, and whether the scan was complete.
+    Read-only (/proc only): the sampler asks this before it detaches any chip."""
+    scan = enumerate_device_holders()
+    return [h.pid for h in scan.holders if _inflight_reader(h)], scan.complete
+
+
+async def _cut_inflight_readers(reason: str) -> list:
+    """Spec 03 I83: stop every process that is not the broker's or the reset's from reading a chip
+    that stayed off the bus after a mesh reset's BMC step. SIGTERM, then SIGKILL
+    PREEMPT_KILL_GRACE_SEC later (the same grace as a preemption). The sampler calls this only once
+    every confirmed chip is detached (removed from the kernel), so the readers' fd close sends no
+    message to an off-bus chip. Fails no job: the broker runs none during a reset. Never raises."""
+    try:
+        result = await asyncio.to_thread(
+            reclaim_foreign_holders, grace_sec=PREEMPT_KILL_GRACE_SEC, select=_inflight_reader
+        )
+    except Exception as e:  # noqa: BLE001 - the reset goes on either way
+        if logger:
+            logger.error(f"IN-FLIGHT reader cut could not run ({e}) — {reason}")
+        health_event("reset_inflight_readers_cut", reason=reason, ok=False, error=str(e))
+        return []
+    cut = [{"pid": h.pid, "user": h.username} for h in result.signalled]
+    left = [{"pid": h.pid, "user": h.username} for h in result.survivors]
+    for h in result.signalled:
+        if not is_tenant(h):
+            note_broker_internal(h.pid)  # mid-exit infrastructure is not a tenant (spec 04 I59)
+    if logger and (cut or left):
+        logger.error(f"IN-FLIGHT cut {len(cut)} reader(s) of an off-bus chip — {reason}. Survivors: {left}")
+    health_event(
+        "reset_inflight_readers_cut",
+        reason=reason,
+        ok=True,
+        signalled=cut,
+        survivors=left,
+        scan_complete=result.scan_complete,
+    )
+    return cut
 
 
 def _boot_btime_id() -> str:

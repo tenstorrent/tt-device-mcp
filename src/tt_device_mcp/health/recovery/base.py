@@ -537,6 +537,10 @@ class RecoveryMechanism:
         # nothing else: during a fabric check or a health probe, chips going all-ones IS a failure and
         # must still be acted on — that is precisely how a host was lost.
         self._reset_in_flight = False
+        # Spec 03 I83: a mesh reset's BMC step is over (tt-smi printed its driver wait). From here a
+        # chip that still reads all-ones is off the bus for real, not mid-re-power, so the sampler's
+        # in-flight watch may cut its readers. Set only by _driver_wait_rescan_hook's watch.
+        self.reset_driver_wait = False
         # Any reset_with_quiesce (the ladder's or a manual one) since the mesh was last released:
         # an off-bus set first seen after it is the reset's doing, never a tray-down onset (04 I19).
         self.reset_since_release = False
@@ -1186,6 +1190,7 @@ class RecoveryMechanism:
         # up with no devices at all.
         self.reset_in_flight = True
         self.reset_since_release = True
+        self.reset_driver_wait = False
         stream, driver_wait = self._driver_wait_rescan_hook(argv, on_output, log)
         cancelled_mid = False
         late_cancel = False
@@ -1237,6 +1242,9 @@ class RecoveryMechanism:
             if restore and rc is None:
                 restore = not await asyncio.to_thread(self.scope_active)
             if restore:
+                # No scope still cycles the chips: the in-flight watch (03 I83) ends with the reset. A
+                # scope still cycling keeps it on; the sampler drops it once recovering ends.
+                self.reset_driver_wait = False
                 try:
                     # A reset can leave endpoints un-enumerated — and any chip we isolated earlier is
                     # still out of the kernel, because `remove` is not undone by a reset. Rescan, or the
@@ -1316,12 +1324,15 @@ class RecoveryMechanism:
         over (tt-smi prints the count with end='' and \\r, so a line reader gets it at the newline and a
         file reader sees `seconds: 30` only then): never before the re-power has had its 30 s.
 
+        Spec 03 I83: on every mesh reset the same marker also sets reset_driver_wait, the point after
+        which the sampler's in-flight watch may cut the readers of a chip still all-ones.
+
         Returns (the output callback to run the reset with, a dict that holds the rescan task once it
-        starts). With no isolated chip, or not a mesh reset, the callback is the caller's own."""
-        isolated = self._isolated_chips() if self._isolated_chips is not None else None
-        if "-glx_reset" not in argv or not isolated:
+        starts). Not a mesh reset: the callback is the caller's own."""
+        if "-glx_reset" not in argv:
             return on_output, {}
-        chips = sorted(isolated, key=int)
+        isolated = self._isolated_chips() if self._isolated_chips is not None else None
+        chips = sorted(isolated, key=int) if isolated else []
         state: dict = {"tail": "", "task": None, "stop": asyncio.Event()}
 
         async def rescan() -> None:
@@ -1358,10 +1369,13 @@ class RecoveryMechanism:
                     pass
 
         def watch(chunk: str) -> None:
-            if state["task"] is None and not state.get("disarmed"):
+            if not state.get("seen") and not state.get("disarmed"):
                 seen = state["tail"] + chunk
                 if GLX_DRIVER_WAIT.search(seen):
-                    state["task"] = asyncio.get_running_loop().create_task(rescan())
+                    state["seen"] = True
+                    self.reset_driver_wait = True
+                    if chips:
+                        state["task"] = asyncio.get_running_loop().create_task(rescan())
                 else:
                     state["tail"] = seen[-200:]  # a marker split across two reads still matches
             if on_output is not None:
