@@ -561,6 +561,8 @@ class RecoveryMechanism:
         # fired and is still pending or spaced), not a missed request's backoff, the backstop or the
         # per-boot cap. Only the former defers the 10-min bound's ladder (spec 04 I76/I83).
         self.power_cycle_retry_cooldown: bool = False
+        # Spec 04 I72/I88: the hold episode a missed or refuted request's retry was last looked up for.
+        self._missed_retry_episode = ""
         # The cooldown in force at the last power-cycle decision (until, last, cause, interval), for /health.
         self.power_cycle_cooldown_state: Optional[dict] = None
 
@@ -2188,17 +2190,28 @@ class RecoveryMechanism:
         )
         stamp = health_dir() / POWER_CYCLE_CAUSE_CAPABLE_FILE
         capable = stamp.exists()
-        if cause is not None and cause != "unknown" and not capable:
+        # An unmapped (reserved) code says nothing about how the host restarted: it neither proves the
+        # BMC reports real causes nor refutes the cycle.
+        mapped = cause is not None and power_cycle_stage.restart_cause_is_mapped(cause)
+        if mapped and cause != "unknown" and not capable:
             with contextlib.suppress(OSError):
                 stamp.write_text(json.dumps({"at_epoch": now_epoch, "cause": cause}) + "\n", encoding="utf-8")
             capable = True
-        if cause is not None and power_cycle_stage.restart_cause_is_cycle(cause):
+        if mapped and power_cycle_stage.restart_cause_is_cycle(cause):
             verdict = "confirmed"
-        elif cause is not None and (cause != "unknown" or capable):
+        elif mapped and (cause != "unknown" or capable):
             verdict = "refuted"
         else:
             verdict = "unconfirmed"
-        mark: dict = {"cycle_checked": verdict, "restart_cause": cause}
+        # This boot came up from the request (checked above), so the host rebooted whatever the verdict;
+        # whether the power went off and on is the BMC's answer, None when it cannot tell.
+        power_cycled = {"confirmed": True, "refuted": False}.get(verdict)
+        mark: dict = {
+            "cycle_checked": verdict,
+            "restart_cause": cause,
+            "host_rebooted": True,
+            "power_cycled": power_cycled,
+        }
         if verdict == "refuted":
             mark.update(took_host_down=False, cycle_refuted=cause)
         rec.update(mark)
@@ -2216,9 +2229,13 @@ class RecoveryMechanism:
             )
             health_event("power_cycle_unconfirmed", requested_at=requested, restart_cause=cause)
         else:
+            retry = self.power_cycle_miss_state(ledger, now_epoch=now_epoch)
+            retry_at = _local_time(retry["until"]) if retry else "the next escalation"
             log.warning(
                 f"power cycle requested at {requested} did not happen: the BMC reports restart cause "
-                f"{cause!r}, so the host rebooted warm; marked missed, retried per spec 04 I72 (I88)"
+                f"{cause!r}, so the host rebooted warm; marked missed (spec 04 I72, I88). If the startup "
+                f"check, fabric included, passes, the warm reboot healed it and no cycle follows; if the "
+                f"device is held, the cycle is asked again from {retry_at}"
             )
             self._journal_missed_power_cycles([rec], ledger, now_epoch, refuted=cause)
         return verdict
@@ -2456,6 +2473,28 @@ class RecoveryMechanism:
             r.get("action") == "power-cycle" and _epoch_after(r.get("at_epoch"), healed, now_epoch) for r in ledger
         ):
             return
+        # Spec 04 I72/I88: a missed or refuted request this release follows needs no further cycle: the
+        # device healed without one (a warm reboot in its place, or a later rung). Said once, here.
+        missed = [
+            r
+            for r in ledger
+            if r.get("action") == "power-cycle"
+            and r.get("took_host_down") is False
+            and _epoch_after(r.get("at_epoch"), healed, now_epoch)
+        ]
+        if missed:
+            warm = [r for r in missed if r.get("cycle_refuted")]
+            how = "a warm reboot in its place" if warm else "a later rung"
+            log.info(
+                f"{len(missed)} missed power-cycle request(s) (last {missed[-1].get('at')}) need no retry: the "
+                f"full check, fabric included, passed after {how} (spec 04 I72)"
+            )
+            health_event(
+                "power_cycle_miss_healed",
+                requested_at=missed[-1].get("at"),
+                missed=len(missed),
+                warm_reboot=bool(warm),
+            )
         try:
             path = health_dir() / POWER_CYCLE_HEALED_FILE
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -2482,13 +2521,41 @@ class RecoveryMechanism:
         """True once a power cycle the cooldown (or the cap or backstop) refused may be asked again, in
         the hold episode that was refused. The watchdog then forces one ladder pass; the governor still
         decides."""
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        self._arm_missed_power_cycle_retry(now_epoch)
         retry = self.power_cycle_retry
         if retry is None:
             return False
         until, episode = retry
         if not episode or episode != (self._device_hold_episode_since() or ""):
             return False
-        return (time.time() if now_epoch is None else now_epoch) >= until
+        return now_epoch >= until
+
+    def _arm_missed_power_cycle_retry(self, now_epoch: float) -> None:
+        """Spec 04 I72/I88: a missed or refuted power-cycle request no verified release followed is
+        asked again in the hold episode open when its retry is due, not only in the one it was missed
+        in. A warm reboot in place of the cycle starts a broker with no retry in memory, and the hold its
+        startup check opens is a new episode: without this the cycle waited for the next ceiling window.
+        Looked up once per hold episode; the forced pass goes to the governor, which still decides. A
+        warm reboot whose full check, fabric included, passed released the device: that verified release
+        ends the streak, so nothing is armed and no cycle follows. Never raises."""
+        episode = self._device_hold_episode_since() or ""
+        if not episode or episode == self._missed_retry_episode:
+            return
+        retry = self.power_cycle_retry
+        if retry is not None and retry[1] == episode:
+            return
+        self._missed_retry_episode = episode
+        try:
+            state = self.power_cycle_miss_state(now_epoch=now_epoch)
+        except Exception as e:  # noqa: BLE001 - the 10-min bound still escalates the hold
+            log.warning(f"missed power-cycle retry not armed (spec 04 I72): {e!r}")
+            return
+        if state is None:
+            return
+        self.power_cycle_retry = (state["until"], episode)
+        self.power_cycle_retry_cooldown = False
+        log.warning(f"device held with a missed power cycle outstanding (spec 04 I72): {state['why']}")
 
     def clear_power_cycle_retry(self) -> None:
         self.power_cycle_retry = None
