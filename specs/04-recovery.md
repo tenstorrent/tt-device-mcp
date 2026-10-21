@@ -1642,7 +1642,7 @@ each rung fires only when the gentler one failed or cannot apply.
   every expected chip is back, no further rung fires: the full health check, fabric included, runs at
   once (no settle; the bus is already enumerated). A pass releases through the same funnel as any
   sweep (I32 still applies). A failure fires the remaining rung (the mesh reset), then one settle and
-  one full check; if that fails the caller climbs to the power cycle as before (I76, goal: ladder at
+  one full check; if that fails the caller climbs to the power cycle as before (I76: ladder at
   10 min, then power cycle). A bus that is still short, or a probe that cannot read it, fires the next
   rung at once, as before. The probe never lifts a hold by itself. Whole-tray and all-off-bus classes
   still skip the sweep (I37), and the I65 cooldown is unchanged. Time to recover (TTR):

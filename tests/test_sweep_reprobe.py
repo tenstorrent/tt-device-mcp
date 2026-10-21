@@ -141,7 +141,7 @@ async def test_with_no_isolated_chip_the_sweep_is_the_mesh_reset_alone(monkeypat
 async def test_the_gate_ladder_power_cycles_only_when_the_full_check_still_fails(
     monkeypatch, galaxy_trays, heals, verdicts, rungs, cycles
 ):
-    """Goal 10: the gate's host rung runs the sweep, and requests the power cycle exactly when the full
+    """I76: the gate's host rung runs the sweep, and requests the power cycle exactly when the full
     check after the whole ladder still fails."""
     g, rec = _arm(monkeypatch, heals_after_sbr=heals, verdicts=verdicts)
     beats = {str(i): (0xFFFFFFFF if str(i) in PARTIAL else 100) for i in range(32)}
@@ -155,7 +155,7 @@ async def test_the_gate_ladder_power_cycles_only_when_the_full_check_still_fails
 
 @pytest.mark.asyncio
 async def test_a_whole_tray_drop_still_skips_the_sweep(monkeypatch, galaxy_trays):
-    """Msg #273 / I37: a whole tray off the bus goes to the power cycle, with no rung and no re-probe."""
+    """I37: a whole tray off the bus goes to the power cycle, with no rung and no re-probe."""
     tray = {str(i) for i in range(8, 16)}
     g, rec = _arm(monkeypatch, heals_after_sbr=True, verdicts=[], isolated=tray)
     assert await _sweep(g, off=tray) is False
