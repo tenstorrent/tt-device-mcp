@@ -12,7 +12,7 @@ import signal
 import subprocess
 import tempfile
 import time
-from typing import Callable
+from typing import Callable, Optional
 
 from tt_device_mcp.health.evidence import health_event
 
@@ -29,22 +29,25 @@ HOOK_OUTPUT_TAIL_BYTES = 2048
 
 
 DEFAULT_POWER_CYCLE_ARGV = ("ipmitool", "chassis", "power", "cycle")
+# The auto rung's ipmitool answers in seconds; the configured command (I27) brings its own timeout.
+DEFAULT_POWER_CYCLE_TIMEOUT_SEC = 30
 
 
-def _fire_direct_power_cycle() -> None:
-    """Shell out to the BMC chassis power cycle with the OS still up — the I88 fallback. Isolated so
-    every test replaces it and no test path can ever power-cycle the box running the suite. Raises on
-    a non-zero exit / missing binary so a fire that did NOT take the box down is detectable."""
-    r = subprocess.run(list(DEFAULT_POWER_CYCLE_ARGV), timeout=30, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"ipmitool power cycle exited {r.returncode}: {r.stderr.strip()[:200]}")
+class PowerCycleNotLaunched(RuntimeError):
+    """The power cycle could not start with the OS brought down first, and nothing fired (spec 04
+    I88): the caller retracts the ledger entry, keeps the hold, pages, and retries under I76. Never a
+    timeout: a cycle that did not launch must not read as one that may still act."""
+
+    def __init__(self, why: str):
+        super().__init__(why)
+        self.why = why
 
 
 def _fire_power_cycle() -> None:
     """The BMC chassis power cycle — the one action that recovers a whole-bus wedge a warm reboot
     leaves wedged (measured on box D) — with the host OS brought down cleanly first (spec 04 I88).
-    Every test replaces it. Raises when neither the clean path nor the direct fire launched."""
-    fire_os_first(list(DEFAULT_POWER_CYCLE_ARGV), "auto BMC power cycle", _fire_direct_power_cycle)
+    Every test replaces it. Raises PowerCycleNotLaunched when the clean path cannot start."""
+    fire_os_first(list(DEFAULT_POWER_CYCLE_ARGV), "auto BMC power cycle", DEFAULT_POWER_CYCLE_TIMEOUT_SEC)
 
 
 # Spec 04 I88. The power cycle brings the OS down first: the broker leaves the cycle's argv in
@@ -57,15 +60,63 @@ SHUTDOWN_HOOK_DIRS = ("/usr/lib/systemd/system-shutdown", "/lib/systemd/system-s
 # so a request can never outlive the boot it was written in.
 REQUEST_FILE = "/run/tt-device-mcp-power-cycle.request"
 FALLBACK_UNIT_PREFIX = "tt-device-mcp-power-cycle-fallback"
+# systemd-shutdown's killall spares a root process whose argv[0] starts with '@', so the fallback
+# lives through it and still bounds a hang after the hand-over (umount, the hooks themselves). The
+# hook finds it by the pid it writes and stops it before firing the cycle itself.
+FALLBACK_ARGV0 = "@" + FALLBACK_UNIT_PREFIX
+FALLBACK_FIRE_ARGV0 = "@tt-device-mcp-power-cycle-fire"
 # A clean reboot of a Galaxy host reached systemd-shutdown in 86 s (measured); past the bound the
 # fallback cycles a shutdown that hangs. Configurable within [MIN, MAX], never off.
 SHUTDOWN_BOUND_DEFAULT_SEC = 120
 SHUTDOWN_BOUND_MIN_SEC = 30
 SHUTDOWN_BOUND_MAX_SEC = 300
 STEP_TIMEOUT_SEC = 30
-# Runs in the fallback unit: wait out the bound, flush what it can (never blocking on it), then cycle.
-FALLBACK_SH = 'sleep "$1"; shift; sync & sleep 2; exec "$@"'
+# The read-only BMC check before anything is written: a BMC that does not answer it cannot cycle, so
+# the host would only reboot warm (F2 of the I88 review).
+PREFLIGHT_TIMEOUT_SEC = 10
+# systemd-shutdown kills a hook still running after 90 s and reboots warm. The hook's worst case —
+# the RAID wait, every try at its cap, the pauses between them and the wait for power to drop after a
+# try that worked — stays inside it (hook_worst_case_sec).
+SYSTEMD_SHUTDOWN_HOOK_TIMEOUT_SEC = 90
+HOOK_MDADM_WAIT_SEC = 10
+HOOK_TRIES = 3
+HOOK_RETRY_PAUSE_SEC = 2
+HOOK_POWER_DROP_WAIT_SEC = 25
+HOOK_TRY_TIMEOUT_MIN_SEC = 5
+HOOK_TRY_TIMEOUT_MAX_SEC = 15
+# Runs in the fallback unit under bash, as FALLBACK_ARGV0: record its pid for the hook, wait out the
+# bound inside bash (a sleep child would die in the killall and fire the cycle early), flush what it
+# can without blocking on it, then cycle under the command's timeout. Args: pid file, bound, timeout,
+# argv.
+FALLBACK_SH = (
+    'printf "%s\\n" "$$" >"$1" 2>/dev/null; b=$2; t=$3; shift 3\n'
+    'read -rt "$b" <> <(:)\n'
+    "sync & read -rt 2 <> <(:)\n"
+    f'exec -a {FALLBACK_FIRE_ARGV0} timeout "$t" "$@"\n'
+)
+# Re-execs bash with argv[0] set to its own $0 (FALLBACK_ARGV0), then runs FALLBACK_SH.
+FALLBACK_LAUNCH_SH = 'exec -a "$0" /bin/bash -c "$1" "$0" "${@:2}"'
 REBOOT_ARGV = ("systemctl", "--no-block", "-i", "reboot")
+
+
+def hook_try_timeout_sec(timeout: float) -> int:
+    """The per-try timeout the shutdown hook gives the cycle command: the command's own timeout,
+    clamped so the hook's worst case fits systemd-shutdown's 90 s."""
+    try:
+        t = int(timeout)
+    except (TypeError, ValueError, OverflowError):
+        t = DEFAULT_POWER_CYCLE_TIMEOUT_SEC
+    return max(HOOK_TRY_TIMEOUT_MIN_SEC, min(t, HOOK_TRY_TIMEOUT_MAX_SEC))
+
+
+def hook_worst_case_sec() -> int:
+    """The shutdown hook's longest run: under SYSTEMD_SHUTDOWN_HOOK_TIMEOUT_SEC by construction."""
+    return (
+        HOOK_MDADM_WAIT_SEC
+        + HOOK_TRIES * HOOK_TRY_TIMEOUT_MAX_SEC
+        + (HOOK_TRIES - 1) * HOOK_RETRY_PAUSE_SEC
+        + HOOK_POWER_DROP_WAIT_SEC
+    )
 
 
 def shutdown_bound_sec() -> int:
@@ -94,35 +145,110 @@ def os_first_unavailable() -> str:
         return "systemd is not running as init"
     if not installed_shutdown_hook():
         return f"no executable {SHUTDOWN_HOOK_NAME} in {' or '.join(SHUTDOWN_HOOK_DIRS)}"
-    for tool in ("systemctl", "systemd-run"):
+    for tool in ("systemctl", "systemd-run", "timeout"):
         if shutil.which(tool) is None:
             return f"{tool} not found"
+    if not os.access("/bin/bash", os.X_OK):
+        return "/bin/bash not found (the fallback needs it)"
     return ""
 
 
-def request_text(argv: list, reason: str, now: float) -> str:
-    """The request the shutdown hook reads: the epoch, the reason on one line, then one argv word per
-    line. The hook ignores a request with no argv or one older than an hour."""
-    return "\n".join([str(int(now)), " ".join(reason.split())[:300], *argv]) + "\n"
+def _one_line(reason: str) -> str:
+    return " ".join(str(reason).split())[:300]
 
 
-def fallback_argv(argv: list, bound: int, unit: str) -> list:
+def fallback_pid_file() -> str:
+    """Where the fallback records its pid for the hook: beside the request, so both share /run."""
+    base = REQUEST_FILE[: -len(".request")] if REQUEST_FILE.endswith(".request") else REQUEST_FILE
+    return base + ".fallback.pid"
+
+
+def request_text(argv: list, reason: str, now: float, timeout: float = DEFAULT_POWER_CYCLE_TIMEOUT_SEC) -> str:
+    """The request the shutdown hook reads: the epoch, the reason on one line, the per-try timeout,
+    then one argv word per line. The hook ignores a request with no argv or one older than an hour."""
+    return "\n".join([str(int(now)), _one_line(reason), str(hook_try_timeout_sec(timeout)), *argv]) + "\n"
+
+
+def fallback_argv(argv: list, bound: int, unit: str, *, reason: str = "", timeout: float = STEP_TIMEOUT_SEC) -> list:
     """The transient unit that cycles a hung shutdown. DefaultDependencies=no keeps it out of the
-    shutdown transaction, so it lives until systemd hands over to systemd-shutdown, by which point
-    the hook fires instead."""
+    shutdown transaction, and its '@' argv[0] keeps it alive through systemd-shutdown's killall, so it
+    bounds every stage up to the hook, which stops it by its recorded pid and fires instead. The cycle
+    command gets the reason in ``TT_DEVICE_MCP_POWER_CYCLE_REASON`` and runs under ``timeout``."""
     return [
         "systemd-run",
         f"--unit={unit}",
         "--collect",
         "--property=DefaultDependencies=no",
+        f"--setenv=TT_DEVICE_MCP_POWER_CYCLE_REASON={_one_line(reason)}",
         "--description=tt-device-mcp: power-cycle a hung shutdown (spec 04 I88)",
-        "/bin/sh",
+        "/bin/bash",
         "-c",
+        FALLBACK_LAUNCH_SH,
+        FALLBACK_ARGV0,
         FALLBACK_SH,
-        FALLBACK_UNIT_PREFIX,
+        fallback_pid_file(),
         str(int(bound)),
+        str(max(1, int(timeout))),
         *argv,
     ]
+
+
+def bmc_query_argv(argv: list, query: list) -> Optional[list]:
+    """A read-only BMC query on the same BMC and credentials as the cycle command, or None when there
+    is none to derive: ``ipmitool [options] chassis power cycle`` becomes ``ipmitool [options]
+    <query>``. Any other command is opaque."""
+    argv = [str(a) for a in argv]
+    if len(argv) >= 4 and os.path.basename(argv[0]) == "ipmitool" and argv[-3:] == ["chassis", "power", "cycle"]:
+        return [*argv[:-3], *query]
+    return None
+
+
+def preflight_argv(argv: list) -> Optional[list]:
+    """The pre-flight for a cycle command: ``mc info`` on its BMC (a BMC that does not answer it
+    cannot cycle). A command that is not ipmitool gets only the executable check."""
+    return bmc_query_argv(argv, ["mc", "info"])
+
+
+# `ipmitool chassis restart_cause` answers that mean the power really went off and on (IPMI 2.0 Get
+# System Restart Cause). A warm reboot is none of these: BMCs report it as "unknown" or a reset.
+CYCLE_RESTART_CAUSES = (
+    "chassis power control command",
+    "power-cycle via pef",
+    "power-up via pushbutton",
+    "power-up due to always-restore power policy",
+    "power-up due to restore-previous power policy",
+)
+
+
+def restart_cause_is_cycle(cause: str) -> bool:
+    return cause.strip().lower() in CYCLE_RESTART_CAUSES
+
+
+def read_restart_cause(argv: list) -> Optional[str]:
+    """The BMC's last system restart cause, lower case, for the BMC the cycle command ``argv`` drives
+    (``ipmitool chassis restart_cause``, read-only, bounded by PREFLIGHT_TIMEOUT_SEC); None when there
+    is no query to derive, the BMC does not answer or does not support it (some answer "Unspecified
+    error")."""
+    probe = bmc_query_argv(argv, ["chassis", "restart_cause"])
+    if probe is None:
+        return None
+    exe = _resolve_command(probe[0])
+    if exe is None:
+        return None
+    rc, out = _run_step([exe, *probe[1:]], PREFLIGHT_TIMEOUT_SEC)
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        head, sep, cause = line.partition(":")
+        if sep and head.strip().lower() == "system restart cause" and cause.strip():
+            return cause.strip().lower()
+    return None
+
+
+def _resolve_command(cmd: str) -> Optional[str]:
+    """``cmd`` as an absolute path, or None when it is not an executable on PATH. Tests replace it."""
+    exe = shutil.which(cmd)
+    return os.path.abspath(exe) if exe else None
 
 
 def _run_step(argv: list, timeout: float = STEP_TIMEOUT_SEC) -> tuple:
@@ -134,47 +260,76 @@ def _run_step(argv: list, timeout: float = STEP_TIMEOUT_SEC) -> tuple:
     return r.returncode, ((r.stderr or "") + (r.stdout or "")).strip()[-200:]
 
 
-def _write_request(argv: list, reason: str) -> None:
+def _write_request(argv: list, reason: str, timeout: float) -> None:
     tmp = REQUEST_FILE + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(request_text(argv, reason, time.time()))
+        f.write(request_text(argv, reason, time.time(), timeout))
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, REQUEST_FILE)
 
 
 def _drop_request() -> None:
-    for p in (REQUEST_FILE, REQUEST_FILE + ".tmp"):
+    for p in (REQUEST_FILE, REQUEST_FILE + ".tmp", fallback_pid_file()):
         try:
             os.unlink(p)
         except OSError:
             pass
 
 
-def fire_os_first(argv: list, reason: str, fire_direct: Callable[[], None]) -> str:
-    """Power-cycle the host with its OS brought down cleanly first (spec 04 I88).
+def _stop_fallback(unit: str) -> bool:
+    """Stop the fallback unit after a reboot that did not start. True once it is gone; False while
+    it may still be alive (and fire the cycle at its bound), so the caller keeps the action pending."""
+    svc = f"{unit}.service"
+    rc, out = _run_step(["systemctl", "stop", svc])
+    if rc != 0:
+        _logger.warning("could not stop %s (rc %s): %s; killing it", svc, rc, out)
+        _run_step(["systemctl", "kill", "--signal=SIGKILL", svc])
+    rc, _ = _run_step(["systemctl", "is-active", "--quiet", svc])
+    # is-active exits 0 while the unit runs and non-zero once it is inactive or gone; a check that
+    # could not run proves nothing, so it reads as alive.
+    return rc is not None and rc != 0
 
-    Writes the request, starts the fallback unit (fires ``argv`` once :func:`shutdown_bound_sec`
-    passes), then ``systemctl reboot``; the shutdown hook fires ``argv`` once the filesystems are
-    read-only. Returns "os_first" once the reboot is queued. When the clean path cannot start (no
-    systemd, no hook, a step that fails), it undoes what it started and calls ``fire_direct`` — the
-    live cycle — and returns "direct"; ``fire_direct`` raising propagates, so a cycle that launched
-    neither way still reads as not launched."""
+
+def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_TIMEOUT_SEC) -> str:
+    """Power-cycle the host with its OS brought down cleanly first (spec 04 I88). Never cuts power
+    under a running OS from here.
+
+    Checks the BMC read-only (:func:`preflight_argv`), writes the request, starts the fallback unit
+    (fires ``argv`` once :func:`shutdown_bound_sec` passes), then ``systemctl reboot``; the shutdown
+    hook fires ``argv`` once the filesystems are read-only. Returns "os_first" once the reboot is
+    queued. When any step cannot start it undoes what it started and raises PowerCycleNotLaunched:
+    nothing fired, the caller holds and pages. The one exception: a fallback unit that outlives a
+    failed reboot may still fire at its bound, so that returns "fallback_pending" and the action
+    stays pending."""
     argv = [str(a) for a in argv]
     why = os_first_unavailable()
     if not why and (not argv or any("\n" in a for a in argv)):
         why = "the power-cycle argv cannot be passed to the shutdown hook"
+    if not why:
+        exe = _resolve_command(argv[0])
+        if exe is None:
+            why = f"power-cycle command {argv[0]!r} not found"
+        else:
+            # Absolute, so neither the hook's nor the fallback's PATH decides what runs.
+            argv[0] = exe
+    if not why:
+        probe = preflight_argv(argv)
+        if probe is not None:
+            rc, out = _run_step(probe, PREFLIGHT_TIMEOUT_SEC)
+            if rc != 0:
+                why = f"BMC did not answer the read-only pre-flight {' '.join(probe[-2:])} (rc {rc}): {out}"
     bound = shutdown_bound_sec()
     unit = f"{FALLBACK_UNIT_PREFIX}-{int(time.time())}"
     started = False
     if not why:
         try:
-            _write_request(argv, reason)
+            _write_request(argv, reason, timeout)
         except OSError as e:
             why = f"could not write {REQUEST_FILE}: {e}"
     if not why:
-        rc, out = _run_step(fallback_argv(argv, bound, unit))
+        rc, out = _run_step(fallback_argv(argv, bound, unit, reason=reason, timeout=timeout))
         if rc == 0:
             started = True
         else:
@@ -191,15 +346,22 @@ def fire_os_first(argv: list, reason: str, fire_direct: Callable[[], None]) -> s
             )
             return "os_first"
         why = f"systemctl reboot failed (rc {rc}): {out}"
-    if started:
-        rc, out = _run_step(["systemctl", "stop", f"{unit}.service"])
-        if rc != 0:
-            _logger.warning("could not stop %s (rc %s): %s", unit, rc, out)
+    if started and not _stop_fallback(unit):
+        # It may still fire at its bound: the action stays pending (no device reset under it) rather
+        # than reading as never launched.
+        health_event("power_cycle_os_first", phase="fallback_pending", reason=reason, why=why[-300:], unit=unit)
+        _logger.error(
+            "POWER CYCLE: %s, and the fallback unit %s could not be stopped; it fires at %ss unless "
+            "stopped — keeping the action pending",
+            why,
+            unit,
+            bound,
+        )
+        return "fallback_pending"
     _drop_request()
-    health_event("power_cycle_os_first", phase="unavailable", reason=reason, why=why[-300:])
-    _logger.warning("POWER CYCLE: clean OS shutdown first is unavailable (%s); power-cycling directly", why)
-    fire_direct()
-    return "direct"
+    health_event("power_cycle_os_first", phase="not_launched", reason=reason, why=why[-300:])
+    _logger.error("POWER CYCLE NOT LAUNCHED: %s; nothing fired, the device stays held", why)
+    raise PowerCycleNotLaunched(why)
 
 
 def pre_power_cycle_hook_timeout_sec() -> float:

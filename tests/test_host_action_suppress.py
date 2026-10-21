@@ -317,14 +317,12 @@ def test_an_operator_reset_is_refused_while_a_host_action_is_pending(monkeypatch
 @pytest.mark.asyncio
 async def test_a_power_cycle_command_that_timed_out_stays_pending(held, monkeypatch):
     """A cycler that timed out may already have started its detached cycle: the mark stays, with
-    its normal bound, so no reset starts under it. A non-zero exit still clears it."""
-    from tt_device_mcp.health.recovery import offbus_power_cycle as opc
+    its normal bound, so no reset starts under it. A cycle that never launched (spec 04 I88) is no
+    timeout: it never runs the command under a live OS."""
+    from tt_device_mcp.health.recovery.stages import power_cycle as pc
 
-    monkeypatch.setattr(opc, "_run", lambda *a, **k: (None, "timed out after 30s"))
-    with pytest.raises(recovery_base.HostActionTimedOut):
-        _real_fire_command(["cycler"], REASON)
-    monkeypatch.setattr(opc, "_run", lambda *a, **k: (1, "nope"))
-    with pytest.raises(RuntimeError) as err:
+    monkeypatch.setattr(pc, "os_first_unavailable", lambda: "no hook")
+    with pytest.raises(pc.PowerCycleNotLaunched) as err:
         _real_fire_command(["cycler"], REASON)
     assert not isinstance(err.value, recovery_base.HostActionTimedOut)
 

@@ -499,15 +499,17 @@ async def test_a_failed_fire_keeps_its_error_for_the_next_page(monkeypatch, tmp_
     assert "BMC unreachable" in rec["alerts"][0]["last_error"]
 
 
-def test_fire_command_raises_on_a_non_zero_exit_and_passes_the_reason(tmp_path):
-    """The real fire, on harmless stand-in scripts: a non-zero exit raises (so the ledger retracts an
-    action that never launched) and the reason reaches the command's environment."""
-    out = tmp_path / "reason"
-    ok = _script(tmp_path, "ok", f'printf %s "$TT_DEVICE_MCP_POWER_CYCLE_REASON" > {out}')
-    _REAL_FIRE([ok], "3/32 off the bus")
-    assert out.read_text() == "3/32 off the bus"
-    with pytest.raises(RuntimeError, match="exited 2"):
-        _REAL_FIRE([_script(tmp_path, "bad", "exit 2")], "x")
+def test_fire_command_never_runs_the_command_under_a_live_os(tmp_path, monkeypatch):
+    """The real fire, on a harmless stand-in script: without the shutdown hook (spec 04 I88) it
+    raises PowerCycleNotLaunched, so the ledger retracts, and the command never runs."""
+    from tt_device_mcp.health.recovery.stages import power_cycle as pc
+
+    monkeypatch.setattr(pc, "os_first_unavailable", lambda: "no hook")
+    out = tmp_path / "ran"
+    ok = _script(tmp_path, "ok", f"touch {out}")
+    with pytest.raises(pc.PowerCycleNotLaunched, match="no hook"):
+        _REAL_FIRE([ok], "3/32 off the bus")
+    assert not out.exists()
 
 
 # --- the watchdog and the knobs -------------------------------------------------------------------

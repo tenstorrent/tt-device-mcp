@@ -556,29 +556,14 @@ def page_if_blocked(episode: str, age: float, log, why: str, *, bound: Optional[
 
 def fire_command(argv: list, reason: str, timeout: float = FIRE_TIMEOUT_DEFAULT_SEC) -> None:
     """Run the host's power-cycle command with the host OS brought down cleanly first (spec 04 I88):
-    the shutdown hook runs ``argv`` once the filesystems are read-only. Where that path cannot start
-    it runs the command directly (:func:`fire_command_direct`). Tests replace it: no test may cycle
-    the host."""
+    the shutdown hook runs ``argv`` once the filesystems are read-only, with the reason in
+    ``TT_DEVICE_MCP_POWER_CYCLE_REASON`` and ``TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC`` per try
+    (clamped to fit systemd-shutdown). Never runs it under a live OS: where the clean path cannot
+    start it raises PowerCycleNotLaunched, and the caller retracts, holds and pages. Tests replace it:
+    no test may cycle the host."""
     from tt_device_mcp.health.recovery.stages.power_cycle import fire_os_first
 
-    fire_os_first(argv, reason, lambda: fire_command_direct(argv, reason, timeout))
-
-
-def fire_command_direct(argv: list, reason: str, timeout: float = FIRE_TIMEOUT_DEFAULT_SEC) -> None:
-    """Run the host's power-cycle command with the reason in ``TT_DEVICE_MCP_POWER_CYCLE_REASON``.
-    Raises on a non-zero exit, a timeout or a command that cannot start, so the caller's ledger
-    retracts an action that never launched; a timeout raises HostActionTimedOut, which keeps the
-    request pending (it may still act)."""
-    env = {**os.environ, "TT_DEVICE_MCP_POWER_CYCLE_REASON": reason}
-    rc, out = _run(argv, _int_env("TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC", int(timeout)), env)
-    if rc is None and out.startswith("timed out"):
-        # It may have started its detached cycler before it stopped answering: the request stays
-        # pending (spec 04 I34) rather than reading as never launched.
-        from tt_device_mcp.health.recovery.base import HostActionTimedOut
-
-        raise HostActionTimedOut(f"power-cycle command {out}")
-    if rc != 0:
-        raise RuntimeError(f"power-cycle command {'exited ' + str(rc) if rc is not None else out}: {out[-200:]}")
+    fire_os_first(argv, reason, _int_env("TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC", int(timeout)))
 
 
 def fire_and_record(argv: list, reason: str, state: dict) -> None:

@@ -5759,6 +5759,9 @@ def _record_previous_boot_error() -> None:
     # whatever this boot does later (it may only reboot, or never escalate), so every later boot
     # still counts it for the I65 doubling and the backstop. Idempotent, so it runs before the
     # once-per-boot guard: a broker restart retries a mark an earlier start could not write.
+    # Spec 04 I88: if this boot came from the broker's power-cycle request, ask the BMC (read-only,
+    # bounded) whether it really was a cycle; a warm reboot in its place is marked missed (I72) first.
+    recovery_mechanism.confirm_power_cycle_on_boot()
     try:
         recovery_mechanism.mark_late_power_cycle()
     except Exception as e:
