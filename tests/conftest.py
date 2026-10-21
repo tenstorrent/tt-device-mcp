@@ -33,6 +33,7 @@ from tt_device_mcp.health.monitors import eth, heartbeat, pci
 from tt_device_mcp.health.recovery import RecoveryDeps, offbus_power_cycle, pcie_guard
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as recovery_galaxy
+from tt_device_mcp.health.recovery.stages import power_cycle as power_cycle_stage
 from tt_device_mcp.server import (
     _ensure_async_primitives,
     _reset_for_testing,
@@ -602,6 +603,15 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
         raise AssertionError("a test reached the real off-bus power cycle; fire_command must be mocked")
 
     monkeypatch.setattr(offbus_power_cycle, "fire_command", _no_offbus_power_cycle_in_tests)
+    # The OS-first power cycle (spec 04 I88) reads the installed shutdown hook: on a box that has it,
+    # a test reaching the real fire would queue a reboot. Here it reads as not installed, and every
+    # step it would spawn is a loud tripwire; the I88 tests re-patch both.
+    monkeypatch.setattr(power_cycle_stage, "installed_shutdown_hook", lambda: "")
+
+    def _no_os_first_step_in_tests(*a, **k):
+        raise AssertionError("a test reached a real OS-first power-cycle step; _run_step must be mocked")
+
+    monkeypatch.setattr(power_cycle_stage, "_run_step", _no_os_first_step_in_tests)
     monkeypatch.setattr(offbus_power_cycle, "_pending", {})
 
     # The tray-down prelude (spec 04 I19) rescans the bus and reads the BMC: never the real sysfs

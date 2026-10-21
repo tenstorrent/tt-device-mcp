@@ -575,10 +575,12 @@ each rung fires only when the gentler one failed or cannot apply.
   full health check, fabric included, before any release; if the hold still stands, the hold watchdog forces one more pass at once and
   that pass runs the power cycle with the gate shut again. A whole tray down (every off-bus chip's
   tray fully off, nothing off outside those trays) gets no reset first. Then the broker runs the host's own
-  power-cycle command `TT_DEVICE_MCP_POWER_CYCLE_CMD` (argv split like shell words, no shell, the
-  reason in `TT_DEVICE_MCP_POWER_CYCLE_REASON`, bounded by
-  `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC`, default 120 s) through `_fire_recovery_escalation`
-  (ledger record, jobs-list row, the I26 hook). It holds instead while a tenant holds the device or
+  power-cycle command `TT_DEVICE_MCP_POWER_CYCLE_CMD` (argv split like shell words, no shell)
+  through `_fire_recovery_escalation` (ledger record, jobs-list row, the I26 hook), always after a
+  clean OS shutdown (I88): the shutdown hook and the fallback unit both run it with the reason in
+  `TT_DEVICE_MCP_POWER_CYCLE_REASON`. `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC` (default 120 s)
+  bounds the fallback's run; the hook clamps it to 5-15 s per try so its 3 tries fit
+  systemd-shutdown's 90 s. A cycle that cannot start that way fires nothing and holds (I88). It holds instead while a tenant holds the device or
   the holder scan is incomplete, while a reset runs in its own scope, and while anything stands
   back: a path in `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE` (`:`-separated) exists, the
   manual-recovery check exits 0 (an operator is recovering the host) or
@@ -1129,7 +1131,9 @@ each rung fires only when the gentler one failed or cannot apply.
   the first pass the BMC answers (a failed launch costs one `ipmitool` call, at most 30 s; a timed-out
   one stays pending under I72). Every failure is journaled (`power_cycle_launch_failed_holding`, with
   `paged`); the page goes out once per hold episode and again at most every `CYCLE_LAUNCH_REPAGE_SEC`
-  (3600 s) while it keeps failing, never once per tick. Neither path reboots. The hold is bounded by
+  (3600 s) while it keeps failing, never once per tick. When the cycle could not start with the OS
+  brought down first, the I88 `power_cycle_not_launched` page is that episode's one page, and only
+  the re-page follows. Neither path reboots. The hold is bounded by
   the BMC answering; the cycle itself and its time to recover are unchanged. With no power cycle armed the hold goes to an
   operator (I33), paged, still held. `_route` returns BLOCKED only when no reset scope is live; under
   a live scope it waits. The full health check, fabric included, runs after the cycle before any
@@ -1678,6 +1682,112 @@ each rung fires only when the gentler one failed or cannot apply.
   | No isolated chip (present-mesh eth/fabric hold, 77) | mesh reset + settle + check | unchanged |
   | Whole tray, all chips off the bus | sweep skipped, power cycle (I37) | unchanged |
 
+- **I88 — A broker power cycle brings the host OS down cleanly first, within a bound, and never
+  cuts power under a live OS.** Both host power cycles the broker fires (the auto power cycle,
+  `ipmitool chassis power cycle`, and the configured `TT_DEVICE_MCP_POWER_CYCLE_CMD` of I27) go
+  through `fire_os_first`. No broker path runs the cycle command while the OS is up. The order,
+  after the ledger record, the jobs row and the I26 hook:
+  1. Checks. The clean path needs systemd as PID 1, the installed hook, `systemctl`, `systemd-run`,
+     `timeout`, `/bin/bash`, an argv the request can carry and a cycle command on `PATH`; `argv[0]`
+     is then made absolute, so neither the hook's nor the fallback's `PATH` decides what runs. For
+     an `ipmitool ... chassis power cycle` command a read-only pre-flight, `ipmitool [same options]
+     mc info`, must exit 0 within 10 s (`PREFLIGHT_TIMEOUT_SEC`): a BMC that does not answer cannot
+     cycle, and the host would only reboot warm. Any other command gets only the executable check.
+  2. The broker writes `/run/tt-device-mcp-power-cycle.request`: the epoch, the reason, the hook's
+     per-try timeout, then one argv word per line (mode 0600, fsynced). `/run` is empty on every
+     boot, so a request never outlives it.
+  3. It starts a transient fallback unit (`systemd-run`, `DefaultDependencies=no`, so the shutdown
+     transaction does not stop it, the reason in `TT_DEVICE_MCP_POWER_CYCLE_REASON`). It runs under
+     bash with argv[0] `@tt-device-mcp-power-cycle-fallback`, which systemd-shutdown's killall
+     spares, records its pid in `/run/tt-device-mcp-power-cycle.fallback.pid`, waits the bound in
+     its own process (`read -t`, no child to kill), flushes for 2 s without blocking on it and fires
+     the same argv as `@tt-device-mcp-power-cycle-fire` under the command's timeout.
+  4. It asks for a reboot (`systemctl --no-block -i reboot`).
+  5. Once every service has stopped and the filesystems are read-only, systemd-shutdown runs the
+     installed hook `tt-device-mcp-power-cycle.shutdown`. On the `reboot` verb with a request less
+     than an hour old, it sets a standard `PATH`, exports the reason in
+     `TT_DEVICE_MCP_POWER_CYCLE_REASON` and first stops the fallback by its recorded pid (after
+     checking its cmdline), before any wait, so it never fires alongside the hook: it freezes each
+     generation of the fallback's process tree, then SIGKILLs the process group the fallback leads
+     and every pid found, so a `timeout` and cycle command the fallback already started cannot cut
+     power later. Then it starts a `sync` it does not wait on, waits for RAID arrays to mark clean
+     (`mdadm --wait-clean`, 10 s cap) and fires the argv: up to 3 tries at the per-try timeout with 2 s between
+     them, then 25 s for the power to drop. The per-try timeout is
+     `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC` (30 s for the auto cycle) clamped to 5-15 s, so the
+     hook's worst case, 10 + 3 x 15 + 2 x 2 + 25 = 84 s, stays inside systemd-shutdown's 90 s hook
+     timeout. Any other verb, or no request, does nothing.
+
+  The bound is `TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC`, default 120 s, clamped to 30-300 s;
+  a malformed value reads as the default, and no value turns it off. The fallback's clock starts at
+  the request and lives through the hand-over to systemd-shutdown, so a shutdown that hangs at any
+  stage before the hook (a stuck service, umount, another hook) is cycled at the bound + 2 s.
+
+  **A cycle that cannot start fires nothing.** When a check fails or the request write, the
+  fallback unit or the reboot request fails, the broker undoes the steps it took (stops the unit,
+  removes the request and pid file) and raises `PowerCycleNotLaunched`. The escalation retracts the
+  ledger entry (I26), clears the pending host action, keeps the hold and pages
+  `power_cycle_not_launched` once per hold episode with the reason (every attempt is journalled);
+  the I71 launch-failure page stays quiet for that episode, so it gets one page, then I71's hourly
+  re-page while it keeps failing.
+  The I76 bound asks for the cycle again on the next pass, so it fires on the first pass whose clean
+  path can start. Nothing stands in for it: there is no warm reboot rung (I71), so a cycle that did
+  not launch never leads to a reboot, and the hold lifts only on a just-passed full check, fabric
+  included. The one exception: if the reboot request failed and the fallback unit
+  cannot be stopped (`systemctl stop`, then `kill`, and `is-active` still says active or cannot
+  answer), it may still fire at its bound, so `fire_os_first` returns `fallback_pending`, the ledger
+  entry stays and the host action stays pending (I34). A `power_cycle_os_first` event records each
+  path (`reboot_requested` with the bound, `not_launched` or `fallback_pending` with why).
+
+  **The next boot checks that the cycle happened.** At broker startup, before the I72
+  late-power-cycle mark, `confirm_power_cycle_on_boot` looks at the last escalation recorded before
+  this boot. If it is a power-cycle row from an earlier boot, not yet checked, and this boot started
+  within its pending plus attribution window, the broker reads `ipmitool [same options] chassis
+  restart_cause` (read-only, 10 s) once and marks the row `cycle_checked`:
+  - `confirmed`: a cause that means the power went off and on (a chassis power control command, a
+    PEF power cycle, a power-up). It counts as before.
+  - `refuted`: any other cause, or `unknown` from a BMC that has reported a real cause before (the
+    stamp `power_cycle_restart_cause_capable.json` in the health dir, written the first time it
+    does). The hook's command failed and the host rebooted warm. The row gets
+    `took_host_down: false` and `cycle_refuted`, and the late-cycle check never counts it again.
+    It is an I72 missed attempt, counted from its earlier boot until a verified release ends the
+    streak: the next request goes out at the refuted request + the pending window (900 s by
+    default) + 0 s, a second miss 300 s after its window, and the operator is paged from the second
+    miss on, then about hourly. The warm boot it caused anchors no I65 cooldown or doubling and no
+    I73 streak. Because that boot was still a host restart, the row counts toward the I9 backstop
+    (at most 3 host restarts in 2 h, then the broker pages instead of cycling).
+  - `unconfirmed`: no answer, a command with no BMC query to derive, or `unknown` from a BMC never
+    seen to report a cause. It is journalled and counts as a cycle, the boot-loop-safe side (one I65
+    cooldown).
+
+  The configured command now runs from systemd-shutdown, after the network is down: it must be an
+  in-band command (for example local `ipmitool`). If the hook's 3 tries all fail, systemd-shutdown
+  reboots warm. That is not a recovery rung and never stands in for the cycle: the next boot's
+  startup check (03 I4) finds the device as it is, the check above marks the row, and the I65
+  cooldown and the I76 10-min bound run again. I65, I76, I27's guards and the lift gate (a hold
+  lifts only on a just-passed full check, fabric included) are unchanged. `apply-host-config.sh`
+  installs the hook (spec 08), so a fresh install has it from the first start.
+
+  Stated limits. A BMC that never reports a restart cause (some Galaxy BMCs
+  answer none) cannot confirm or refute a cycle: there the pre-flight is the only guard, and a warm
+  reboot in place of a cycle still counts as one (one I65 cooldown, at most 30 min, at most 4 h
+  after repeated unhealed cycles). A configured command that is not `ipmitool ... chassis power
+  cycle` gets only the executable check and is never confirmed. A BMC that answers `unknown` after a
+  real cycle would refute it falsely; this needs the capability stamp first, so it only bites on a
+  BMC that has reported a cause before. A false refute loses that cycle's I65 cooldown, so the next
+  cycle can come sooner than I65 allows, but the backstop still counts it: at most 3 host restarts in
+  2 h, then a page.
+
+  Time to recover (TTR), for every class that ends in a power cycle (class A whole-tray drop, the
+  I76 10-min escalation, the I27 off-bus cycle):
+
+  | Case | Before I88 | With I88 |
+  |---|---|---|
+  | Clean shutdown | cycle fires at once | + the pre-flight (under 10 s) + the host's stop time (about 90 s measured on a Galaxy host, most of it unmounting the root volume) |
+  | Shutdown hangs before the hook (before or after the hand-over to systemd-shutdown) | cycle fires at once | + the bound (120 s default, 30-300 s) + 2 s flush |
+  | Clean path cannot start (a check, the pre-flight, the request, the fallback or the reboot fails) | cycle fires at once under a live OS | no cycle and no reboot; hold + page once per episode; the cycle is asked again on the next I76 pass and fires on the first pass whose clean path starts; the hold lifts only on a just-passed full check, fabric included |
+  | Reboot failed and the fallback cannot be stopped | n/a | cycle at the bound + 2 s from the fallback; action kept pending |
+  | Hook's command fails 3 times | the live cycle may also fail | warm reboot after at most 84 s of hook time; then refuted: an I72 miss, the next request at the refuted request + 900 s pending + 0 s, then + 300 s per later miss, paged from the 2nd miss, no I65 cooldown, counted toward the backstop (3 restarts in 2 h, then a page); or unconfirmable: counted (one I65 cooldown, at most 30 min, at most 4 h after repeated cycles) |
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -2035,7 +2145,7 @@ sees a silent fabric pass.
 | I14 the host rung is the power cycle or a loud hold; blocked climbs are loud | `tests/test_device_safety.py::test_host_escalation_for_drop_is_the_power_cycle_or_a_loud_hold`, `tests/test_device_safety.py::test_gate_all_off_bus_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_reset_regression_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_all_off_bus_power_cycles_when_opted_in` |
 | Cold rung fireable-or-off (ipmitool) | `tests/test_device_safety.py::test_a_host_without_ipmitool_serves_with_the_cold_rung_off`, `tests/test_device_safety.py::test_ipmitool_present_leaves_the_cold_rung_armed` |
 | I26 pre-power-cycle hook: opt-in, runs between record and fire, bounded, never gates the cycle | `tests/test_pre_power_cycle_hook.py::test_unset_hook_runs_nothing_and_the_cycle_is_unchanged`, `tests/test_pre_power_cycle_hook.py::test_the_hook_runs_after_the_record_and_before_the_fire`, `tests/test_pre_power_cycle_hook.py::test_a_failing_hook_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_a_hook_that_cannot_run_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_a_hung_hook_is_killed_with_its_children_and_the_cycle_goes_ahead`, `tests/test_pre_power_cycle_hook.py::test_a_background_child_holding_output_does_not_stretch_the_wait`, `tests/test_pre_power_cycle_hook.py::test_the_hook_never_runs_when_the_ledger_aborts_the_cycle`, `tests/test_pre_power_cycle_hook.py::test_a_hook_that_raises_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_cancelled_while_waiting_on_the_hook_retracts_the_ledger_entry`, `tests/test_pre_power_cycle_hook.py::test_the_timeout_is_always_finite_and_positive` |
-| I27 the gated off-bus hold: safe rungs first, grace, idle and nothing standing back, then one power cycle per interval with the attempt on disk first; otherwise hold or page once | `tests/test_offbus_power_cycle.py::test_a_gate_that_allows_resets_hands_back_to_the_ladder`, `tests/test_offbus_power_cycle.py::test_no_power_cycle_before_the_safe_rungs_ran`, `tests/test_offbus_power_cycle.py::test_an_unset_command_pages_once_and_the_hold_stands`, `tests/test_offbus_power_cycle.py::test_within_the_grace_it_holds`, `tests/test_offbus_power_cycle.py::test_past_the_grace_and_idle_it_fires_once_with_the_attempt_on_disk_first`, `tests/test_offbus_power_cycle.py::test_the_ladder_then_the_power_cycle_through_the_escalation`, `tests/test_offbus_power_cycle.py::test_a_tenant_or_an_unreadable_scan_holds`, `tests/test_offbus_power_cycle.py::test_a_reset_in_its_own_scope_holds`, `tests/test_offbus_power_cycle.py::test_anything_objecting_stands_back`, `tests/test_offbus_power_cycle.py::test_checks_that_say_no_let_it_fire`, `tests/test_offbus_power_cycle.py::test_an_attempt_within_the_interval_pages_instead`, `tests/test_offbus_power_cycle.py::test_an_attempt_older_than_the_interval_does_not_limit`, `tests/test_offbus_power_cycle.py::test_the_mechanism_limits_still_apply`, `tests/test_offbus_power_cycle.py::test_an_unwritable_attempt_record_never_fires`, `tests/test_offbus_power_cycle.py::test_a_failed_fire_keeps_its_error_for_the_next_page`, `tests/test_offbus_power_cycle.py::test_fire_command_raises_on_a_non_zero_exit_and_passes_the_reason`, `tests/test_offbus_power_cycle.py::test_due_for_the_watchdog_once_per_episode`, `tests/test_offbus_power_cycle.py::test_the_hold_watchdog_forces_one_pass_at_the_grace`, `tests/test_offbus_power_cycle.py::test_the_knobs_default_and_reject_nonsense`, `tests/test_offbus_power_cycle.py::test_a_corrupt_state_file_reads_empty_and_a_bad_stamp_counts_as_now` |
+| I27 the gated off-bus hold: safe rungs first, grace, idle and nothing standing back, then one power cycle per interval with the attempt on disk first; otherwise hold or page once | `tests/test_offbus_power_cycle.py::test_a_gate_that_allows_resets_hands_back_to_the_ladder`, `tests/test_offbus_power_cycle.py::test_no_power_cycle_before_the_safe_rungs_ran`, `tests/test_offbus_power_cycle.py::test_an_unset_command_pages_once_and_the_hold_stands`, `tests/test_offbus_power_cycle.py::test_within_the_grace_it_holds`, `tests/test_offbus_power_cycle.py::test_past_the_grace_and_idle_it_fires_once_with_the_attempt_on_disk_first`, `tests/test_offbus_power_cycle.py::test_the_ladder_then_the_power_cycle_through_the_escalation`, `tests/test_offbus_power_cycle.py::test_a_tenant_or_an_unreadable_scan_holds`, `tests/test_offbus_power_cycle.py::test_a_reset_in_its_own_scope_holds`, `tests/test_offbus_power_cycle.py::test_anything_objecting_stands_back`, `tests/test_offbus_power_cycle.py::test_checks_that_say_no_let_it_fire`, `tests/test_offbus_power_cycle.py::test_an_attempt_within_the_interval_pages_instead`, `tests/test_offbus_power_cycle.py::test_an_attempt_older_than_the_interval_does_not_limit`, `tests/test_offbus_power_cycle.py::test_the_mechanism_limits_still_apply`, `tests/test_offbus_power_cycle.py::test_an_unwritable_attempt_record_never_fires`, `tests/test_offbus_power_cycle.py::test_a_failed_fire_keeps_its_error_for_the_next_page`, `tests/test_offbus_power_cycle.py::test_fire_command_never_runs_the_command_under_a_live_os`, `tests/test_offbus_power_cycle.py::test_due_for_the_watchdog_once_per_episode`, `tests/test_offbus_power_cycle.py::test_the_hold_watchdog_forces_one_pass_at_the_grace`, `tests/test_offbus_power_cycle.py::test_the_knobs_default_and_reject_nonsense`, `tests/test_offbus_power_cycle.py::test_a_corrupt_state_file_reads_empty_and_a_bad_stamp_counts_as_now` |
 | I27 an attempt a later boot verified healthy does not count toward the off-bus interval; one it cannot prove healed still does | `tests/test_power_cycle_new_episode_g8.py::test_g8_the_off_bus_hold_interval_skips_a_cycle_a_later_boot_verified`, `::test_last_attempt_within_skips_only_what_healed_says` |
 | I27 bounded: a blocked cycle pages once (high severity) past grace + the bound; a page the hook drops is retried | `tests/test_offbus_power_cycle.py::test_a_blocked_power_cycle_pages_once_past_its_bound`, `tests/test_offbus_power_cycle.py::test_a_page_the_alert_hook_drops_is_sent_again`, `tests/test_offbus_power_cycle.py::test_the_blocked_page_bound_defaults_and_rejects_nonsense` |
 | I27 the manual-recovery guard fails closed: no check configured never fires (pages once), the installed template is the default, a check that is unreadable, raises or times out stands back, a clean check lets it fire, and the tenant is re-read after the checks | `tests/test_offbus_power_cycle.py::test_no_manual_recovery_check_never_fires_and_pages_once`, `tests/test_offbus_power_cycle.py::test_the_installed_check_is_the_default`, `tests/test_offbus_power_cycle.py::test_a_manual_recovery_check_that_cannot_answer_holds_until_the_bound`, `tests/test_offbus_power_cycle.py::test_checks_that_say_no_let_it_fire`, `tests/test_offbus_power_cycle.py::test_a_tenant_arriving_during_the_checks_holds`, `tests/test_offbus_power_cycle.py::test_the_pages_name_the_host` |
@@ -2219,3 +2329,4 @@ sees a silent fabric pass.
 | I75 (one routing for the report and the forced run: a window inside the post-ladder check, a window after a ladder that did not recover, a class-A mark inside the check window, a startup-gate stand-down; each reported where the watchdog acts) | `tests/test_health_hold_report.py::test_the_report_names_the_rung_the_forced_run_routes_to`, `tests/test_health_hold_report.py::test_a_class_a_ladder_mark_inside_the_check_window_is_not_reported`, `tests/test_health_hold_report.py::test_a_startup_verify_stand_down_is_reported_with_its_bounded_end` |
 | I75 (deadline feeds: the broker registers the I76 bound; its mark and source per fault class and latch, fired by the watchdog then; inside a cooldown the ladder stays at the mark and only the host rung names the end; silent once spent, past due, pending, tenant-blocked or stood down; names the opted-in host rung; nothing when HEALTHY; read-only; a broken feed reports nothing) | `tests/test_health_hold_report.py::test_the_broker_registers_its_hold_bound_feed`, `tests/test_health_hold_report.py::test_the_bound_mark_is_reported_for_each_fault_class`, `tests/test_health_hold_report.py::test_a_latched_hold_reports_the_same_mark`, `tests/test_health_hold_report.py::test_a_cooldown_hold_reports_the_ladder_at_the_mark_and_the_host_rung_at_its_end`, `tests/test_health_hold_report.py::test_the_hold_bound_candidate_names_the_cooldown_only_for_its_host_rung`, `tests/test_health_hold_report.py::test_after_the_bound_ladder_the_chain_names_the_host_rung`, `tests/test_health_hold_report.py::test_the_bound_feed_is_silent_when_its_mark_is_not_next`, `tests/test_health_hold_report.py::test_the_bound_feed_names_the_host_rung_the_box_opts_into`, `tests/test_health_hold_report.py::test_the_bound_feed_yields_to_a_startup_stand_down`, `tests/test_health_hold_report.py::test_a_healthy_device_reports_no_bound`, `tests/test_health_hold_report.py::test_the_bound_feed_moves_no_clock`, `tests/test_health_hold_report.py::test_a_broken_feed_reports_nothing` |
 | I86 the last-chance sweep re-probes the bus after SBR: a whole bus runs the full check before any later rung and lifts only on its pass; a failed check runs the remaining rung then the power cycle; a short or unreadable bus fires every rung; a whole tray still skips the sweep | `tests/test_sweep_reprobe.py::test_healed_after_sbr_runs_no_later_rung_and_lifts_only_on_the_full_check`, `::test_bus_whole_but_full_check_fails_runs_the_remaining_rung_then_the_caller_climbs`, `::test_bus_whole_check_fails_then_the_mesh_reset_heals_it_lifts_on_the_second_check`, `::test_never_healed_runs_every_rung_back_to_back_with_one_check`, `::test_an_unreadable_bus_probe_fires_the_next_rung`, `::test_the_gate_ladder_power_cycles_only_when_the_full_check_still_fails`, `::test_a_whole_tray_drop_still_skips_the_sweep`; every hold kind still reaches the ladder at 10 min: `tests/test_hold_bound.py::test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung` |
+| I88 a broker power cycle brings the OS down first and never cuts power under a live OS: BMC pre-flight, request (with the per-try timeout), fallback unit outside the shutdown that survives its killall under an `@` argv[0], then the reboot; the fallback fires the same argv at the clamped bound; a missing hook or command, a failed pre-flight, an unwritable request, a fallback that cannot start or a failed reboot undo their steps and raise PowerCycleNotLaunched; a fallback that will not stop keeps the action pending; the escalation retracts, holds and pages once per episode and never reboots; a refuted cycle is an I72 miss, anchors no I65 cooldown and counts toward the backstop; the next boot confirms, refutes (missed, never late) or leaves the cycle unconfirmed from the BMC restart cause; the hook fires only on reboot with a fresh request, stops the fallback and its process tree before any wait, 3 tries at the 5-15 s clamped timeout within systemd-shutdown's 90 s, then a warm reboot; the installer installs it | `tests/test_power_cycle_os_first.py::test_clean_path_checks_the_bmc_writes_the_request_then_the_fallback_then_reboots`, `::test_the_fallback_unit_stays_out_of_the_shutdown_and_survives_its_killall`, `::test_a_hung_shutdown_reaches_the_cycle_once_the_bound_passes`, `::test_the_fallback_fires_under_an_at_sign_argv0_and_its_timeout`, `::test_the_shutdown_bound_is_always_finite_and_clamped`, `::test_no_hook_installed_raises_not_launched_and_runs_no_step`, `::test_an_unwritable_request_raises_not_launched`, `::test_a_fallback_unit_that_cannot_start_never_reboots`, `::test_a_failed_reboot_stops_the_fallback_and_raises_not_launched`, `::test_a_fallback_that_will_not_stop_keeps_the_action_pending`, `::test_an_unanswered_is_active_reads_as_alive`, `::test_a_stopped_fallback_after_a_failed_stop_raises_not_launched`, `::test_an_argv_the_hook_cannot_carry_raises_not_launched`, `::test_a_missing_cycle_command_raises_not_launched`, `::test_a_bmc_that_fails_the_preflight_never_reboots`, `::test_the_preflight_keeps_the_configured_commands_bmc_options`, `::test_an_opaque_configured_command_gets_only_the_executable_check`, `::test_the_configured_command_never_runs_under_a_live_os`, `::test_unavailable_without_systemd_or_the_hook`, `::test_installed_shutdown_hook_needs_an_executable_file`, `::test_the_escalation_is_unchanged_around_the_clean_path`, `::test_a_cycle_that_cannot_launch_retracts_holds_and_pages_once_per_episode`, `::test_a_preflight_failure_retracts_and_never_reboots`, `::test_a_fallback_left_alive_keeps_the_action_pending_and_the_ledger`, `::test_a_confirmed_cycle_counts_as_before`, `::test_a_refuted_cycle_is_counted_missed_never_late`, `::test_a_bmc_that_never_reports_a_cause_leaves_the_cycle_unconfirmed_and_counted`, `::test_unknown_from_a_bmc_never_seen_to_report_a_cause_is_unconfirmed`, `::test_a_boot_long_after_the_request_is_not_checked`, `::test_the_hooks_worst_case_fits_systemd_shutdowns_hook_timeout`, `::test_the_per_try_timeout_honours_the_configured_one_within_the_hook_budget`, `::test_hook_fires_the_requested_cycle_after_flushing_on_reboot`, `::test_hook_never_cycles_on_any_other_verb`, `::test_hook_does_nothing_without_a_request`, `::test_hook_ignores_a_stale_request`, `::test_hook_ignores_a_request_with_no_command`, `::test_hook_retries_a_failing_cycle_then_lets_the_reboot_continue`, `::test_the_installer_installs_the_hook_where_the_broker_looks`, `::test_hook_stops_the_fallback_and_its_children_before_any_wait`, `::test_hook_stops_the_fallback_first_and_kills_its_process_group`, `::test_a_refuted_cycle_is_retried_under_i72_and_pages_from_the_second`, `::test_refuted_cycles_count_toward_the_backstop`, `tests/test_power_cycle_host_rung.py::test_a_cycle_that_cannot_launch_os_first_never_reboots_and_holds` |

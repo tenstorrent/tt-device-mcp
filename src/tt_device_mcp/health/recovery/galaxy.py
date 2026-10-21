@@ -989,13 +989,18 @@ class GalaxyRecovery(Recovery):
         cycle again under the I76 bound, unpaced, so the cycle fires on the first pass the BMC answers.
         The page goes out once per hold episode and again at most every CYCLE_LAUNCH_REPAGE_SEC while
         the launch keeps failing: the I76 bound asks every watchdog tick, and a failed launch retracts
-        its ledger entry, so nothing else rate-limits it."""
+        its ledger entry, so nothing else rate-limits it. A cycle that could not start with the OS
+        brought down first (I88) has just paged power_cycle_not_launched for this episode: that is the
+        episode's one page, and only the re-page follows."""
         log(f"the power cycle did not launch ({cause}); holding the device and retrying the cycle on the next pass")
         episode = self.deps.device_hold_episode_since() or ""
         mono = time.monotonic()
         last = self._cycle_launch_paged
         repage = last is not None and last[0] == episode and mono - last[1] >= CYCLE_LAUNCH_REPAGE_SEC
         page = last is None or last[0] != episode or repage
+        if page and not repage and self.mechanism.power_cycle_not_launched_paged_for(episode):
+            self._cycle_launch_paged = (episode, mono)
+            page = False
         health_event("power_cycle_launch_failed_holding", cause=cause, paged=page, held_since=episode or None)
         if not page:
             return

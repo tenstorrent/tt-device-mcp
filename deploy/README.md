@@ -41,6 +41,20 @@ uses `/opt/tt-device-broker/manual-recovery-check.sh` (staged from
 auth.log). With neither, or a check that cannot read its sources, the cycle never fires and the
 broker pages instead. The broker runs as root, so it can read both.
 
+**Clean shutdown before a power cycle (spec 04 I88).** Every broker power cycle (the auto
+cycle and `TT_DEVICE_MCP_POWER_CYCLE_CMD`) first reboots the OS cleanly; the system-shutdown hook
+`tt-device-mcp-power-cycle.shutdown`, installed by `apply-host-config.sh`, cuts power once the
+filesystems are read-only. A fallback unit cuts it anyway after
+`TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC` (default 120 s), even if the shutdown hangs after
+systemd hands over to systemd-shutdown. The configured command then runs with the network down, so
+it must be in-band (for example local `ipmitool`); the hook gives it 5-15 s per try
+(`TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC`, clamped), 3 tries. The broker never cuts power with
+the OS up: for an `ipmitool ... chassis power cycle` command it first checks the BMC read-only
+(`mc info`, 10 s), and if that, the hook, `systemd-run` or the reboot request is missing or fails,
+nothing fires, the device stays held and the broker pages `power_cycle_not_launched`. On the next
+boot it reads `ipmitool chassis restart_cause` to confirm the cycle; a BMC that reports no cause
+cannot confirm it, and then a warm reboot in its place still counts as a cycle.
+
 ## What is verified vs. what needs on-box validation
 
 Unit-tested (no hardware): the privsep gating + `systemd-run` argv construction

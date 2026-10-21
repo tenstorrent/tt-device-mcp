@@ -174,7 +174,9 @@ runs it just before it power-cycles the host and waits for it to exit, up to
 split like shell words and run without a shell; the reason for the cycle is in
 `TT_DEVICE_MCP_POWER_CYCLE_REASON`. Its exit code and output go to the log. The
 cycle goes ahead whatever the hook does, so a failing or hung hook never blocks
-recovery. The full reset ladder still runs first. For example, in a systemd
+recovery. The full reset ladder still runs first. The cycle itself comes after a
+clean OS shutdown, with the same reason in `TT_DEVICE_MCP_POWER_CYCLE_REASON`;
+if that cannot start, nothing fires and the device stays held (spec 04 I88). For example, in a systemd
 drop-in for the broker:
 
 ```

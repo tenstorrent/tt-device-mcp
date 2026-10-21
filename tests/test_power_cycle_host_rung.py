@@ -24,6 +24,10 @@ from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import BLOCKED, DEFER, STAGE_POWER_CYCLE, WAIT
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as galaxy_mod
+from tt_device_mcp.health.recovery.stages import power_cycle as pc
+
+_real_auto_power_cycle_host = srv._auto_power_cycle_host  # before any test stubs it
+_real_fire_power_cycle = pc._fire_power_cycle
 
 
 def _arm_partial_drop(monkeypatch, off_bus):
@@ -121,6 +125,51 @@ async def test_a_cycle_that_does_not_launch_holds_pages_and_retries(monkeypatch,
     assert cycles["n"] == 2, "the next pass asks for the cycle again"
     assert set(asked) == {"power-cycle"}
     assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_that_cannot_launch_os_first_never_reboots_and_holds(monkeypatch, clear_job_state, tmp_path):
+    """Spec 04 I88/I71: the real escalation, with no shutdown hook installed, raises
+    PowerCycleNotLaunched. No reboot is asked for and no step runs (no warm-reboot fallback), the ledger
+    keeps no row, the hold stays (fault and dirty flags untouched), and the next pass asks for the
+    power cycle again, never another host action. The episode gets one page (power_cycle_not_launched,
+    naming why), not a second launch-failure page; the hourly re-page still follows while it fails."""
+    counters = _arm_partial_drop(monkeypatch, 8)
+    _ledger_dir(monkeypatch, tmp_path)
+    asked = _deny(monkeypatch)
+    monkeypatch.delenv("TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK", raising=False)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", _real_auto_power_cycle_host)
+    monkeypatch.setattr(srv, "_fire_power_cycle", _real_fire_power_cycle)
+    steps = []
+    monkeypatch.setattr(pc, "_run_step", lambda argv, timeout=None: steps.append(list(argv)) or (1, "stub"))
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "_power_cycle_not_launched_paged", None)
+    monkeypatch.setattr(srv, "device_hold_episode_since", "2026-01-01T00:00:00")
+    monkeypatch.setattr(srv.galaxy_recovery, "_cycle_launch_paged", None)
+    events, alerts = [], []
+    patch_health_event(monkeypatch, lambda kind, **k: events.append(kind))
+    monkeypatch.setattr(recovery_base, "health_event", lambda kind, **k: events.append(kind))
+    monkeypatch.setattr(galaxy_mod.alert, "send_alert", lambda ev, *a, **k: alerts.append(ev["kind"]))
+
+    for force in (False, True):
+        await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=force)
+    assert steps == [], "nothing ran: no reboot, no fallback unit"
+    assert srv.recovery_mechanism.read_auto_recovery_ledger() == []
+    assert srv.recovery_mechanism.host_action_requested is None
+    assert not hasattr(srv.recovery_mechanism, "power_cycle_unlaunched_at"), "no reboot comes back"
+    assert set(asked) == {"power-cycle"}, "the next pass asks for the cycle again, nothing else"
+    assert events.count("power_cycle_not_launched") == 2 and "auto_reboot" not in " ".join(events)
+    assert events.count("power_cycle_launch_failed_holding") == 2, "every failure is journaled"
+    assert alerts == ["power_cycle_not_launched"], "one page per hold episode"
+    assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0, "the hold stays"
+
+    episode, at = srv.galaxy_recovery._cycle_launch_paged
+    assert episode == "2026-01-01T00:00:00"
+    srv.galaxy_recovery._cycle_launch_paged = (episode, at - recovery_base.CYCLE_LAUNCH_REPAGE_SEC)
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert alerts == ["power_cycle_not_launched", "power_cycle_launch_failed_holding"], "the hourly re-page"
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert len(alerts) == 2 and steps == [] and set(asked) == {"power-cycle"}
 
 
 @pytest.mark.asyncio

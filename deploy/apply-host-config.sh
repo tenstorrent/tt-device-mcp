@@ -282,6 +282,15 @@ install -m 0644 "$DEPLOY/tt-device-fabric-validator.timer"   /etc/systemd/system
 # and with neither the cycle never fires, so this stage is required (fatal under set -e).
 install -m 0755 "$DEPLOY/tt-manual-recovery-check.sh" "$ROOT/manual-recovery-check.sh"
 
+# Power cycle with the OS down first (spec 04 I88): systemd-shutdown runs this hook once the
+# filesystems are read-only, and it fires the cycle the broker asked for. Without it the broker
+# cycles with the OS still up, so this stage is required (fatal under set -e). On a split /lib it
+# goes to both directories systemd-shutdown may read.
+install -D -m 0755 "$DEPLOY/tt-device-mcp-power-cycle.shutdown" /usr/lib/systemd/system-shutdown/tt-device-mcp-power-cycle.shutdown
+if [ -d /lib/systemd ] && [ ! /lib/systemd -ef /usr/lib/systemd ]; then
+    install -D -m 0755 "$DEPLOY/tt-device-mcp-power-cycle.shutdown" /lib/systemd/system-shutdown/tt-device-mcp-power-cycle.shutdown
+fi
+
 # Slurm hooks: staged here too, not just by install-tt-device-broker.sh — auto-update never
 # re-runs the installer, only this script (this file's own header comment), so an autoupdating
 # host would otherwise never receive deploy/slurm/*.sh at all, and deploy/README.md's
