@@ -192,8 +192,9 @@ cooldown (spec 04 I65) holds longer.
   can itself be stuck inside a fabric check holding the device lock. Its dead-chip isolation is
   deliberately lock-free, requires two consecutive all-ones samples, is suppressed while a reset
   scope is live (a reset reads all-ones by design), treats an all-chips blackout as a global event
-  (report, never amputate), and kills device holders BEFORE removing the endpoint — a mapping
-  outlives the endpoint and a read through it stalls a CPU core and reboots the host.
+  (report, never amputate), and removes the endpoint BEFORE it kills any device holder or stops a
+  poller (I84) — the driver's fd-close path reaches a chip that is not detached, and a read of an
+  off-bus chip stalls a CPU core and reboots the host.
   Its raw reads go through the chip-state gate (I66): it skips the sample while a reset step owns
   the chips, a chip it has confirmed lost reads as all-ones without a PCIe read until its re-read
   is due, and it stops the device pollers on the first hung sample, not the second.
@@ -1358,6 +1359,31 @@ cooldown (spec 04 I65) holds longer.
   recover: off-bus classes (whole-tray drop, partial off-bus) are unchanged, as their recovery is
   driven by the off-bus evidence and the I76 bound, not by this verdict; the fabric/health-check
   failure class no longer opens on a run the broker killed; every other class is unchanged.
+- **I84 — The out-of-reset dead-chip valve detaches a chip before it kills anyone; a failed
+  detach kills nobody.** The driver's fd-close path sends the chip a power-state message unless
+  the device is marked detached, and only the PCI remove marks it; a stopped poller closes its fd
+  the same way. So `TelemetrySampler.isolate_dead_chips` first PCI-removes every newly confirmed
+  chip, each write in a worker thread (the event loop never waits on it) and all of them within
+  one `DETACH_TIMEOUT_SEC` (15 s) bound; a remove still running at the bound is not detached,
+  journals `chip_detach_timeout`, and no further chip is tried behind it. Only when every chip is
+  removed does it kill the device holders (`_kill_device_holders`, SIGKILL; the chip is gone, so
+  no SIGTERM grace applies) and stop and owe the pollers. It kills nobody and stops nothing, logs
+  the reason and journals `chip_dead_kill_refused` when: a remove failed or timed out
+  (`detach_failed`) or none is wired (`detach_unavailable`); another chip that read all-ones on
+  the same sample is not removed (`chip_not_detached`: on its first strike, inside the fast
+  cadence's confirm gate, or after an earlier failed remove — its own confirmation detaches it,
+  then kills); or a reset began meanwhile (`reset_started`: the reset scope owns the chips and
+  their holders). The broker never signals its own pid, and the reset scope and its descendants
+  are never signalled from here. Refused or not, the valve still marks the device dirty: it never
+  lifts or clears a hold and never returns the device to the queue, so only a just-passed full
+  check, fabric included (I78/I82), lifts it, and spec 04 I76 still runs the full ladder at
+  10 min and then the power cycle. Whole-tray and all-chips-off drops keep their own path straight
+  to the power cycle (I19's blackout rule is unchanged). Time to recover: partial off-bus with a
+  working remove is unchanged (the kill and poller stop move after a remove that takes well under
+  a second); a remove that hangs adds at most 15 s before the hold is marked, so the I76 ladder
+  and the power cycle come at most 15 s later in that case only; a failed remove leaves the
+  holders to the hold's bounded recovery (10-min ladder, then power cycle) instead of a kill that
+  can take the host down; whole-tray, all-chips-off and every non-off-bus class are unchanged.
 
 ## Interfaces
 
@@ -2046,6 +2072,7 @@ refuses.
 | I80 | `tests/test_health_held_during_op.py::test_health_stays_held_while_a_forced_rung_runs`, `tests/test_health_held_during_op.py::test_health_lifts_the_hold_only_when_the_gate_passes_inside_the_op`, `tests/test_health_held_during_op.py::test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held`, `tests/test_health_held_during_op.py::test_a_hold_opened_inside_an_op_keeps_its_held_since_after_the_op`, `tests/test_health_held_during_op.py::test_a_closed_episodes_held_since_never_carries_into_the_next_hold`, `tests/test_health_held_during_op.py::test_a_rehold_inside_the_carry_window_reports_the_carried_start_in_and_after_the_op`, `tests/test_health_held_during_op.py::test_an_in_window_rehold_inside_an_op_with_no_read_keeps_the_carried_start_after_it`, `tests/test_health_held_during_op.py::test_an_in_window_rehold_outside_an_op_reports_the_carried_start`, `tests/test_health_held_during_op.py::test_a_read_before_an_in_window_reholds_verdict_yields_to_the_carried_start` |
 | I81 | `tests/test_validator_not_built.py::test_the_not_built_read_speaks_only_for_the_pinned_validator`, `tests/test_validator_not_built.py::test_a_post_reset_77_with_the_validator_not_built_takes_no_eth_training_wait`, `tests/test_validator_not_built.py::test_the_post_reset_log_names_the_missing_validator_not_a_trained_link`, `tests/test_validator_not_built.py::test_an_operators_own_fabric_check_keeps_the_eth_training_wait`, `tests/test_validator_not_built.py::test_health_shows_whether_the_validator_is_built`, `tests/test_validator_not_built.py::test_the_build_is_requested_once_per_hold_episode_without_blocking`, `tests/test_validator_not_built.py::test_no_build_request_without_systemd_or_root`, `tests/test_validator_not_built.py::test_a_hung_build_request_is_bounded`, `tests/test_validator_not_built.py::test_the_watch_requests_the_build_then_lifts_only_on_a_passing_full_check`, `tests/test_validator_not_built.py::test_an_idle_relift_on_a_not_built_validator_never_resets_or_lifts`, `tests/test_validator_not_built.py::test_the_10_min_bound_still_forces_a_not_built_hold` |
 | I82 | `tests/test_fabric_killed_by_dead_chip.py::test_a_fabric_check_killed_by_dead_chip_isolation_is_no_verdict`, `tests/test_fabric_killed_by_dead_chip.py::test_the_kill_mark_is_read_once_and_a_later_pass_settles_the_debt`, `tests/test_fabric_killed_by_dead_chip.py::test_a_minus_9_the_isolation_did_not_cause_keeps_its_old_verdict`, `tests/test_fabric_killed_by_dead_chip.py::test_a_kill_during_the_traffic_only_rerun_is_no_verdict_either`, `tests/test_fabric_killed_by_dead_chip.py::test_a_kill_during_the_descriptor_run_starts_no_rerun`, `tests/test_fabric_killed_by_dead_chip.py::test_dead_chip_isolation_marks_the_fabric_check_killed_and_no_lift_follows`, `tests/test_fabric_killed_by_dead_chip.py::test_isolation_with_no_fabric_check_in_flight_marks_nothing` |
+| I84 | `tests/test_deadchip_detach_before_kill.py::test_every_kill_and_poller_stop_comes_after_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_detach_kills_nobody_and_keeps_the_hold`, `tests/test_deadchip_detach_before_kill.py::test_one_failed_detach_of_two_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_with_no_detach_wired_nobody_is_killed`, `tests/test_deadchip_detach_before_kill.py::test_a_hung_detach_is_bounded_and_the_loop_stays_responsive`, `tests/test_deadchip_detach_before_kill.py::test_a_reset_that_started_before_the_kill_keeps_every_holder`, `tests/test_deadchip_detach_before_kill.py::test_another_all_ones_chip_not_yet_detached_defers_the_kill_to_its_own_valve`, `tests/test_deadchip_detach_before_kill.py::test_a_chip_whose_earlier_detach_failed_blocks_every_later_kill`, `tests/test_deadchip_detach_before_kill.py::test_the_broker_never_signals_itself` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

@@ -5681,6 +5681,8 @@ async def _kill_device_holders(reason: str) -> list:
     except Exception:  # noqa: BLE001 - never let the scan block the rescue
         return killed
     for h in scan.holders:
+        if h.pid == os.getpid():
+            continue  # the broker never signals itself (spec 03 I84)
         try:
             if not is_tenant(h):
                 # Infrastructure we kill here can sit mid-exit for seconds, named by the driver with
