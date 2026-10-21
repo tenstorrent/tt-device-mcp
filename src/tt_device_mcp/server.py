@@ -723,6 +723,7 @@ class Job:
     contention_waiters: frozenset = frozenset()  # the waiters seen at the last contention poll
     preempt_killed_monotonic: Optional[float] = None  # set when the grace minute ran out and the kill began
     preempt_clean: bool = False  # the kernel saw every process of the tree exit on SIGTERM by its own code
+    preempt_exit_status: Optional[int] = None  # the job's own status, witnessed on a clean preemption
     yielded_on_contention: bool = False  # it ended itself with exit 0 while a job waited past its limit
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
@@ -4575,6 +4576,8 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
     Returns True only when ``witness`` is set and the kernel's exit records show every process
     of the tree exited through its own code on SIGTERM (no SIGKILL needed, no signal death):
     the job ended cleanly, so only the fast post-job check is owed, or none if it exited 0.
+    The job's own exit status as witnessed (ExitWitness.exit_status, None when unproven; the job
+    shell's TERM-trap 143 is not the job's) goes on its Job as ``preempt_exit_status``.
     Any error in the witness counts as doubt and never stops the kill. Any other end, or any doubt,
     returns False: a wedge-risk exit, so the device is marked dirty and must pass the full check,
     fabric included, before the next job (a failing check goes on to the reset ladder)."""
@@ -4638,10 +4641,15 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
         if seen is None:
             return False
         try:
-            return seen.clean() is True
+            clean = seen.clean() is True
+            status = seen.exit_status() if clean else None
         except Exception as e:  # noqa: BLE001 - in doubt the exit counts as killed
             witness_error = f"witness failed ({e!r})"
             return False
+        j = jobs.get(job_id)
+        if j is not None:
+            j.preempt_exit_status = status if isinstance(status, int) else None
+        return clean
 
     try:
         await _send(signal.SIGTERM)
@@ -4653,9 +4661,14 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
                 clean = _verdict()
                 if logger and witness:
                     why = witness_error or (getattr(seen, "why", "") if seen is not None else "")
+                    status = getattr(jobs.get(job_id), "preempt_exit_status", None)
                     logger.info(
                         f"PREEMPT job_id={job_id} ended on SIGTERM: "
-                        + ("every process exited by its own code" if clean else f"not clean: {why}")
+                        + (
+                            f"every process exited by its own code, job status {status}"
+                            if clean
+                            else f"not clean: {why}"
+                        )
                     )
                 return clean
             await asyncio.sleep(0.1)
@@ -6206,6 +6219,10 @@ async def job_runner():
                 if job.status not in (JobStatus.KILLED, JobStatus.HUNG):
                     if job.preempt_killed_monotonic is not None:
                         job.status = JobStatus.PREEMPTED
+                        if job.preempt_clean and job.preempt_exit_status == 0:
+                            # The job shell's TERM trap exits 143 after the job's own program has
+                            # already returned; the kernel's exit records proved the job's own 0.
+                            job.exit_code = 0
                         terminal_note = (
                             f"\n[PREEMPTED: a job waited {PREEMPT_GRACE_SEC}s past the {job.timeout_sec}s limit]"
                             + (" (ended cleanly on SIGTERM)" if job.preempt_clean else "")
@@ -6374,7 +6391,9 @@ async def job_runner():
                     # SIGTERM and every process of its tree exited by its own code) owes no check of
                     # any kind and no reset. Only another cause still runs the gate: a device fault
                     # named in its output, or a device not HEALTHY when it ended.
-                    yielded_ok = job.exit_code == 0 and (job.yielded_on_contention or clean_preempt)
+                    yielded_ok = job.exit_code == 0 and (
+                        job.yielded_on_contention or (clean_preempt and job.preempt_exit_status == 0)
+                    )
                     if yielded_ok and not fault and fsm.state is ServerState.HEALTHY:
                         if logger:
                             logger.info(

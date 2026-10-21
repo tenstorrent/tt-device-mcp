@@ -603,8 +603,9 @@ def test_preempted_wedge_risk(exit_code):
     assert srv._is_wedge_risk_exit(srv.JobStatus.PREEMPTED, exit_code, preempt_clean=True) is False
 
 
-def _witness(monkeypatch, *, clean, ok=True, why=""):
-    """Stand in for the kernel's exit records: the verdict a test needs, without CAP_NET_ADMIN."""
+def _witness(monkeypatch, *, clean, ok=True, why="", status=None):
+    """Stand in for the kernel's exit records: the verdict a test needs, without CAP_NET_ADMIN.
+    ``status`` is the job's own exit status the records prove (None: not proven)."""
     made = []
 
     class _Witness:
@@ -617,6 +618,9 @@ def _witness(monkeypatch, *, clean, ok=True, why=""):
 
         def clean(self):
             return ok and clean
+
+        def exit_status(self):
+            return status if ok and clean else None
 
         def close(self):
             self.closed = True
@@ -698,7 +702,7 @@ async def test_a_preempted_job_that_handles_sigterm_with_exit_0_gets_no_check_or
     """SIGTERM was sent, the job's own trap ended it with exit 0 inside the 10 s grace, and the
     kernel saw every process exit by its own code. It returned 0: no post-job check of any kind,
     quick or full, and nothing marked dirty, so no reset before the next job."""
-    _witness(monkeypatch, clean=True)
+    _witness(monkeypatch, clean=True, status=0)
     job, sent, gate, dirty = await _preempt(
         monkeypatch, "965", "trap 'exit 0' TERM; while :; do sleep 0.1; done", kill_grace=5
     )
@@ -892,6 +896,27 @@ def test_the_witness_reads_kernel_exit_records():
     assert lost.clean() is False and "lost" in lost.why
 
 
+def test_the_witness_reads_the_jobs_own_status_past_the_shells_term_trap():
+    """exit_status(): the job shell (pgid 10) exits 143 from the broker's TERM trap after its
+    program returned, so the shell's own status says nothing of the job. 0 only when proven."""
+    ok = _fed({10, 11}, _exit(11, 0) + _exit(10, 143 << 8))
+    ok.pgid = 10
+    assert ok.exit_status() == 0
+    failed = _fed({10, 11}, _exit(11, 3 << 8) + _exit(10, 143 << 8))
+    failed.pgid = 10
+    assert failed.exit_status() == 3
+    shell_failed = _fed({10, 11}, _exit(11, 0) + _exit(10, 1 << 8))
+    shell_failed.pgid = 10
+    assert shell_failed.exit_status() == 1
+    # A TERM between commands: nothing but the shell was running, so nothing proves a 0.
+    only_shell = _fed({10}, _exit(10, 143 << 8))
+    only_shell.pgid = 10
+    assert only_shell.exit_status() is None
+    killed = _fed({10, 11}, _exit(11, 15) + _exit(10, 143 << 8))
+    killed.pgid = 10
+    assert killed.exit_status() is None
+
+
 def test_closing_the_witness_unsubscribes_first():
     """close() sends PROC_CN_MCAST_IGNORE before it closes the socket: the kernel counts listeners
     and only IGNORE lowers the count, so a bare close would leave it raised after every preemption.
@@ -1004,6 +1029,52 @@ def test_the_witness_on_a_real_tree():
             if p.poll() is None:
                 p.kill()
                 p.wait()
+
+
+_HANDLES_TERM = "import signal, sys, time; signal.signal(signal.SIGTERM, lambda *a: sys.exit({rc})); time.sleep(30)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "program, want",
+    [
+        # Handles SIGTERM with exit 0: the job returned 0, so no check of any kind and no reset.
+        ("handles_0", "exit0"),
+        # Handles SIGTERM with another status: a clean end, the fast check, no reset.
+        ("handles_3", "fast"),
+        # SIGTERM's default action kills it: a signal death, dirty, the full check.
+        ("sleep", "full"),
+    ],
+)
+async def test_the_real_job_wrapper_reports_a_handled_sigterm_by_the_jobs_own_status(
+    monkeypatch, clear_job_state, program, want
+):
+    """The real job wrapper (its TERM trap is `exit 143`, not overridden here) around a program,
+    preempted within the 10 s grace and judged from the kernel's own exit records. The wrapper's
+    trap runs after the program returns, so the shell exits 143 whatever the program did; the
+    broker reads the job's own status instead. A handled SIGTERM with exit 0 reaches the broker as
+    exit 0 and gets no check and no reset."""
+    probe = ExitWitness(os.getpgid(0), None)
+    probe.close()
+    if not probe.ok:
+        pytest.skip(f"no process events here: {probe.why}")
+    if program == "sleep":
+        command = "sleep 30"
+    else:
+        command = f"{sys.executable} -c '{_HANDLES_TERM.format(rc=program.split('_')[1])}'"
+    job, sent, gate, dirty = await _preempt(monkeypatch, "970", command, kill_grace=5)
+    assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
+    if want == "exit0":
+        assert job.preempt_clean is True and job.preempt_exit_status == 0
+        assert job.exit_code == 0, "a handled SIGTERM with exit 0 must reach the broker as exit 0"
+        assert dirty == [] and gate == [], "exit 0 on SIGTERM: no check and no reset"
+    elif want == "fast":
+        assert job.preempt_clean is True and job.preempt_exit_status == 3
+        assert job.exit_code == 143
+        assert dirty == [] and gate == [{"job_failed": False}]
+    else:
+        assert job.preempt_clean is False
+        assert dirty and gate == [{"job_failed": True}]
 
 
 @pytest.mark.asyncio

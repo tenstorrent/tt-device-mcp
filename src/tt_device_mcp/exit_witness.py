@@ -4,9 +4,10 @@
 """Witness how every process of a job's tree exits, from the kernel's own exit records.
 
 A preempted job that ends cleanly on SIGTERM (every process exits through its own code) needs
-only the fast between-jobs check, or none if it exits 0; one where any process died from a signal may have left an eth
-core or the fabric mid-transaction, so the device is marked dirty and needs the full check,
-fabric included (a failing check goes on to the reset ladder). The broker cannot tell these
+only the fast between-jobs check, or none if the job's own exit status is 0 (exit_status(), which
+looks past the job shell's TERM-trap `exit 143`). One where any process died from a signal may
+have left an eth core or the fabric mid-transaction, so the device is marked dirty and needs the
+full check, fabric included (a failing check goes on to the reset ladder). The broker cannot tell these
 apart from wait statuses: it waits only on its own child, the job's bash wrapper turns any SIGTERM
 into a plain `exit 143`, and grandchildren are reaped by their own parents. The kernel's process
 events connector (netlink) reports every fork and exit on the host with the exit status in
@@ -106,6 +107,7 @@ class ExitWitness:
     def __init__(self, pgid: Optional[int], scope: Optional[str]):
         self.ok = False
         self.why = ""
+        self.pgid = pgid  # the broker's job shell: its own status is the broker's TERM trap's
         self.tree: Set[int] = set()
         self.exits: Dict[int, int] = {}  # tgid -> wait status of its leader's exit
         self.signalled: Set[int] = set()
@@ -183,6 +185,22 @@ class ExitWitness:
             self.why = f"pid {min(unseen)} of the job left no exit record"
             return False
         return True
+
+    def exit_status(self) -> Optional[int]:
+        """The job's own exit status, 0 only when proven: the tree is clean(), at least one
+        process other than the broker's job shell (the process group leader) exited, every such
+        process exited 0, and the shell exited 0 or 143 (its TERM trap, which says nothing of the
+        job). None when the witness cannot say; else a non-zero status of the job."""
+        if not self.clean():
+            return None
+        own = {tgid: status >> 8 for tgid, status in self.exits.items() if tgid != self.pgid}
+        if not own:
+            return None
+        bad = sorted(code for code in own.values() if code)
+        if bad:
+            return bad[0]
+        shell = self.exits.get(self.pgid, 0) >> 8 if self.pgid else 0
+        return 0 if shell in (0, 143) else shell
 
     def close(self) -> None:
         """Unsubscribe, then close. The kernel counts listeners and only IGNORE lowers the
