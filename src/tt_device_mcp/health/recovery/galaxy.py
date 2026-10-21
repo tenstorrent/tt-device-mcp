@@ -2468,7 +2468,9 @@ class GalaxyRecovery(Recovery):
         now = time.monotonic()
         window_start = now - age - mesh_repeat.MESH_RESET_REPEAT_MIN_GAP_SEC
         run = self.mechanism.last_mesh_reset_run
-        first_ok = run is not None and run["ended"] >= window_start
+        # The first reset belongs to this episode: launched under its stamp, or ended inside it (a gate's
+        # reset can run just before the hold that it failed opened).
+        first_ok = run is not None and (run["episode"] == hold_since or run["ended"] >= now - age)
         used = 1 if self.mechanism.mesh_reset_repeat_at and self.mechanism.mesh_reset_repeat_at >= window_start else 0
         verdict, why, left = mesh_repeat.plan(
             repeats_used=used,

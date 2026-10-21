@@ -104,6 +104,9 @@ def reset_host_action_state():
             return
         m.host_action_requested = None
         m._host_action_reset_refused = None
+        # The capped mesh-reset repeat's per-process record (spec 04 I93): one test's repeat is not the next's.
+        m.last_mesh_reset_run = None
+        m.mesh_reset_repeat_at = 0.0
 
     clear()
     yield
