@@ -468,7 +468,7 @@ each rung fires only when the gentler one failed or cannot apply.
   in the kernel is bounded by I70.
 
 - **I22 — No host rung without the full reset ladder.** A reboot or power cycle fires only after
-  the last-chance sweep (SBR, per-tray re-power, mesh reset) ran COMPLETE and the one verify after
+  the last-chance sweep (SBR, mesh reset) ran COMPLETE and the one verify after
   it failed, or once this episode's ladder already ran its mesh reset and it failed on an unchanged
   off-bus set (I38: the sweep would repeat that reset, which I36 forbids). A sweep that was skipped (a reset already cycling in its own scope, a tenant) or
   incomplete (the I24 gate refused it) holds the host
@@ -1822,9 +1822,7 @@ escalation (`_climb_to_host_recovery_after_failed_reset` — the road most measu
 actually took), and the post-reboot cold climb (`_verify_post_reboot_recovery`, where the warm reboot
 just proved it cannot re-power the UBBs). Before this, those three settled and verified but never
 re-tried the cheaper rungs, so a present-mesh eth wedge could be power-cycled having only ever seen
-mesh resets. Details: the trays re-powered are those holding an off-bus chip, or — with no tray to
-blame, e.g. a present-mesh fabric wedge — EVERY tray, since a tray re-power is strictly lighter than
-the rung it is delaying; SBR fires only where a chip is actually isolated, so a mass drop is never
+mesh resets. Details: SBR fires only where a chip is actually isolated, so a mass drop is never
 nibbled at with per-chip bridge resets; and the sweep is SKIPPED (the settle and verify still run)
 under the two guards a destructive rung never crosses — a tenant on the mesh, or a reset already
 cycling in its own scope. A sweep that brings the mesh back cancels the host rung outright.
@@ -1853,7 +1851,7 @@ The boot's jobs-list row is written once per boot, keyed on the kernel boot_id; 
 unreadable, on `/proc/stat` btime matched within `_BTIME_DEDUP_SLACK_SEC` (10 s), because a
 wall-clock step moves btime within one boot and an exact match would count one reboot twice.
 Absence is never health: every blocked/exhausted path emits a loud actionable event
-(`ubb_reset_required`, `all-off-bus power-cycle required`,
+(`all-off-bus power-cycle required`,
 `reset_unrecoverable_power_cycle_required`) rather than a silent hold.
 
 **The reset gate.** `evaluate_reset_gate` MUST allow only when no foreign-uid holder exists AND the
@@ -2201,7 +2199,7 @@ sees a silent fabric pass.
 | I19 the whole bus off keeps its own route | `tests/test_tray_down_prelude.py::test_the_whole_bus_off_keeps_its_own_route` |
 | I19 the capture is read-only, CPLD reads (every configured tray, the PDB) come only from config, BMC reads get the long timeout, it meets its deadline, fsyncs, and is written even with no incident bundle | `tests/test_tray_down_prelude.py::test_the_allow_list_refuses_anything_but_the_read_shapes`, `::test_cpld_reads_come_only_from_config_and_cover_every_configured_tray`, `::test_bmc_reads_get_the_long_timeout_inside_the_deadline`, `::test_the_capture_meets_its_deadline_survives_a_missing_tool_and_fsyncs_the_bundle`, `::test_a_missing_incident_bundle_still_gets_the_bmc_reads_written` |
 | I19 lspci targets the upstream bridge of every off chip, by sysfs parent or secondary bus, plus the endpoint while present | `tests/test_tray_down_prelude.py::test_lspci_targets_the_bridge_above_each_off_chip`, `::test_the_capture_reads_the_bridge_of_every_off_chip` |
-| Tray rung's two branches: no-window sweep vs generic walk, classified once from threaded evidence, opt-out honoured | `tests/test_ladder_v2.py::test_classify_hold_names_the_two_branches`, `::test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep`, `::test_bridge_rung_records_no_bridge_and_it_survives_the_server_replace` |
+| Below-floor hold classes: the no-window sweep vs generic (no tray step, I23), classified once from threaded evidence; the bridge rung's `no_bridge` record survives the server replace | `tests/test_ladder_v2.py::test_classify_hold_names_the_two_branches`, `::test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep`, `::test_bridge_rung_records_no_bridge_and_it_survives_the_server_replace` |
 | Last-chance sweep gates EVERY host rung (gate ladder, idle escalation, post-reboot climb); a sweep that recovers cancels the cycle; never over a tenant; no per-chip SBR on a mass drop | `tests/test_ladder_v2.py::test_gate_ladder_sweeps_every_reset_before_the_power_cycle`, `tests/test_ladder_v2.py::test_a_sweep_that_recovers_the_mesh_cancels_the_power_cycle`, `tests/test_ladder_v2.py::test_the_other_two_roads_to_a_power_cycle_go_through_the_sweep`, `tests/test_ladder_v2.py::test_the_last_chance_sweep_never_resets_over_a_tenant`, `tests/test_device_safety.py::test_a_mass_gone_drop_is_left_to_the_galaxy_reset` |
 | A RUNNING broker job counts as a tenant even with an empty holder scan; `force` waives an unreadable scan but never a running job; no rung hand-rolls the fd-only check | `tests/test_ladder_v2.py::test_a_running_job_is_a_tenant_even_with_an_empty_holder_scan`, `tests/test_ladder_v2.py::test_force_waives_an_unreadable_scan_but_never_a_running_job`, `tests/test_ladder_v2.py::test_the_last_chance_sweep_never_resets_over_a_running_job`, `tests/test_ladder_v2.py::test_every_tenant_guard_goes_through_the_one_helper` |
 | Gate rungs release without over-climbing | `tests/test_device_safety.py::test_a_recovered_bridge_reset_releases_without_the_mesh_wide_reset`, `::test_a_recovered_mass_drop_reset_releases_without_reaching_the_host_rungs` |

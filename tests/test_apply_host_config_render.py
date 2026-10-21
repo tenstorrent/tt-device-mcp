@@ -159,17 +159,10 @@ def test_cold_rung_knobs_set_reach_the_unit(tmp_path):
     assert unit.index(power) < unit.index("ExecStart=")
 
 
-def test_ubb_reset_force_off_unset_renders_no_line(tmp_path):
-    # The per-tray BMC reset rung is armed by default in server.py, so unset must render no line — the
-    # rung stays at its code default (armed). Pinned so the seam cannot start rendering a disarm by
-    # accident, which would silently drop the default-on rung fleet-wide.
-    unit = _render(tmp_path, _GALAXY)
-    assert "TT_DEVICE_MCP_AUTO_UBB_RESET" not in unit
-
-
 def test_a_stale_ubb_reset_setting_renders_no_line(tmp_path):
-    # Spec 04 I23: the per-tray BMC re-power rung is gone, with no switch left. A TTDEV_AUTO_UBB_RESET
-    # still in an old /etc/default file renders nothing into the unit.
+    # Spec 04 I23: the per-tray BMC re-power rung is gone, with no switch left. Unset, or a
+    # TTDEV_AUTO_UBB_RESET still in an old /etc/default file, renders nothing into the unit.
+    assert "AUTO_UBB_RESET" not in _render(tmp_path, _GALAXY)
     unit = _render(tmp_path, dict(_GALAXY, TTDEV_AUTO_UBB_RESET="0"))
     assert "AUTO_UBB_RESET" not in unit
 

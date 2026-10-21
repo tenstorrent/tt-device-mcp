@@ -381,7 +381,7 @@ def outage_hold_boot_warning() -> str:
 
 def drop_returned_isolated(isolated: set, context: str, log=None) -> list:
     """Re-read sysfs and take every chip of ``isolated`` that is back on the bus out of it, in place.
-    Run after every tray re-power, mesh reset and PCI rescan, whatever the verify that follows says:
+    Run after every mesh reset and PCI rescan, whatever the verify that follows says:
     a chip left in the set after it returned keeps /health and the gate reading it as isolated and
     arms a needless bridge reset on the next pass. Never releases anything: only the full health
     check, fabric included, does that (spec 03 I52)."""
@@ -645,7 +645,7 @@ class RecoveryMechanism:
 
     def host_action_blocks_reset(self, log: Callable[[str], None], *, context: str) -> bool:
         """True while a requested host reboot or power cycle is pending: no device reset (bridge,
-        tray re-power, galaxy/SMI reset) may start under it, whichever path asks (spec 04 I34). One
+        galaxy/SMI reset) may start under it, whichever path asks (spec 04 I34). One
         log line and one event per request; the device stays held, and the full health check runs
         after the host comes back. Bounded by host_action_pending()'s window."""
         pending = self.host_action_pending()

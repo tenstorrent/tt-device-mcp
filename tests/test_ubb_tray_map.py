@@ -178,8 +178,8 @@ def test_a_whole_tray_drop_names_the_tray_that_is_down(bh_trays):
 
 
 def test_affected_trays_names_the_tray_an_operator_would_read_from_tt_smi(bh_trays):
-    """The tray ids ride out in the ubb_reset_required event and in the operator line beside the
-    BMC command. A lone off-bus chip 20 (0xc5) is on tray 3, which is what
+    """The tray ids ride out in the hold_classified event and the last-chance sweep's operator line.
+    A lone off-bus chip 20 (0xc5) is on tray 3, which is what
     `tt-smi -glx_list_tray_to_device` prints for it."""
     assert galaxy._affected_trays({"20"}, 32, bh_trays) == [3]
     assert galaxy._affected_trays({"0", "31"}, 32, bh_trays) == [1, 4]
