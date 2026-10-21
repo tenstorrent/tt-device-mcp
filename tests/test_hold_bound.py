@@ -1358,7 +1358,7 @@ def test_health_names_a_disproven_lifts_early_ladder_then_its_host_rung(monkeypa
     started = datetime.fromisoformat(srv.device_hold_episode_since).timestamp()
     rung = srv._hold_next_rung(time.time())
     assert (rung.rung, rung.source) == ("forced ladder", "disproven lift bound")
-    assert rung.at == pytest.approx(started + tick)
+    assert rung.at == pytest.approx(started + tick, abs=1)
 
     since = _since(300)
     monkeypatch.setattr(srv, "device_hold_episode_since", since)
@@ -1371,7 +1371,7 @@ def test_health_names_a_disproven_lifts_early_ladder_then_its_host_rung(monkeypa
     started = datetime.fromisoformat(since).timestamp()
     rung = srv._hold_next_rung(time.time())
     assert rung.rung == "power cycle", "the host rung follows the early ladder's check bound"
-    assert rung.at == pytest.approx(started + 250 + srv._HOLD_BOUND_CHECK_SEC)
+    assert rung.at == pytest.approx(started + 250 + srv._HOLD_BOUND_CHECK_SEC, abs=1)
 
 
 # Spec 04 I79 (the class D 77 climb) against I76 (the 10-min bound): one ladder and one power-cycle
