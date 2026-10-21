@@ -233,7 +233,9 @@ the queue and a running job outlive the broker process.
   died from a signal, SIGTERM's default action included; an exit not witnessed, because the
   connector is unavailable (some kernels allow it only with CAP_NET_ADMIN), events were lost
   (a reader thread drains the socket as they arrive, so a busy host's event rate does not
-  overflow it between polls), the tree could not be read, or witnessing raised any error) it is a wedge risk and a
+  overflow it between polls), the tree could not be read, the broker runs in a PID namespace
+  below the host's (the connector reports host pids, which never match the tree it reads from
+  its own /proc, so the witness declines up front), or witnessing raised any error) it is a wedge risk and a
   broker-side timeout whatever its exit status: it owes the mesh
   one reset, then the full check, fabric included (spec 03 I69), paid by its post-job gate (or,
   re-adopted, before the next job's door) before the waiting job is dispatched. The job's own

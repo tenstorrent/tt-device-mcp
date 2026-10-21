@@ -13,7 +13,9 @@ waitpid form, so it can.
 
 It may need CAP_NET_ADMIN, depending on the kernel (the root broker has it). When it cannot
 subscribe, misses events (receive buffer overflow), or the tree cannot be read, the verdict is
-"not proven clean", which the caller treats as a killed job.
+"not proven clean", which the caller treats as a killed job. The same holds in a PID namespace
+below the host's (a container): the connector reports host pids, which never match the tree read
+from the namespace's /proc, and the kernel ignores a subscription from there.
 A busy host reports thousands of events a second, which fill an unprivileged receive buffer in
 well under 0.1 s, so a reader thread drains the socket as events arrive rather than on the
 caller's poll.
@@ -44,6 +46,7 @@ _EXIT = struct.Struct("=iiII")  # process_pid, process_tgid, exit_code, exit_sig
 _EVENT_AT = _NLMSGHDR.size + _CN_MSG.size
 
 _RCVBUF = 8 << 20
+_PROC_PID_INIT_INO = 0xEFFFFFFC  # linux/proc_ns.h
 
 
 def _mcast_op(op: int) -> bytes:
@@ -71,6 +74,26 @@ def parse_events(buf: bytes) -> Iterable[Tuple[str, Tuple[int, ...]]]:
                 pid, tgid, code, _ = _EXIT.unpack_from(buf, data)
                 yield "exit", (pid, tgid, code)
         off += (nl_len + 3) & ~3
+
+
+def _in_child_pid_namespace(ns: str = "/proc/self/ns/pid", status: str = "/proc/self/status") -> bool:
+    """True when this process runs in a PID namespace below the host's. The host's namespace has
+    a fixed inode number (PROC_PID_INIT_INO); where the namespace link cannot be read, the NSpid
+    line of the status lists one pid per namespace level, so more than one (it shows only levels
+    from the /proc mount's namespace down). False when neither can tell (kernels before 4.1 have
+    no NSpid line)."""
+    try:
+        return os.stat(ns).st_ino != _PROC_PID_INIT_INO
+    except OSError:
+        pass
+    try:
+        with open(status) as f:
+            for line in f:
+                if line.startswith("NSpid:"):
+                    return len(line.split()) > 2
+    except OSError:
+        pass
+    return False
 
 
 def _tree(pgid: Optional[int], scope: Optional[str]) -> Optional[Set[int]]:
@@ -118,6 +141,9 @@ class ExitWitness:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._reader: Optional[threading.Thread] = None
+        if _in_child_pid_namespace():
+            self.why = "process events report host pids; the broker runs in a PID namespace"
+            return
         try:
             sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, NETLINK_CONNECTOR)
         except OSError as e:
