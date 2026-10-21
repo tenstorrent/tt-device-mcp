@@ -19,12 +19,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
+from tests.test_fabric_topology_mismatch import _LOST, _LOST_PORT, topo  # noqa: F401 (fixture)
 from tt_device_mcp import server as srv
 from tt_device_mcp.constants import FABRIC_CHECK_CANNOT_CHECK_RC
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import evidence
 from tt_device_mcp.health import monitor as health_monitor_mod
 from tt_device_mcp.health.monitors import hostpci, pci
+from tt_device_mcp.health.recovery import galaxy as galaxy_mod
 
 # --- hostpci.hugepages_shortfall ---------------------------------------------------------------
 
@@ -450,6 +452,7 @@ async def test_the_startup_quiesce_leaves_the_pollers_off_while_a_reset_cycles(m
     assert _systemctl == ["stop"]
     assert ("pollers_left_quiesced", {"after": "the startup fabric check", "scope": "tt-reset-1"}) in events
     assert srv._pollers_held_for is None
+    assert srv._pollers_owed and "tt-reset-1" in srv._pollers_owed, "owed to the next close to HEALTHY"
 
 
 @pytest.mark.asyncio
@@ -971,15 +974,29 @@ async def test_a_77_eth_drop_reset_releases_only_on_a_passing_full_check(
 ):
     """Goal 8: the reset this escalation runs is followed by the full health check, fabric included,
     and only a passing fabric verdict releases the device; a 77 or a failed pass keeps it held."""
+    _hold_77_eth(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(minutes=21)).isoformat())
+    resets, checks = _present_rung_chain(monkeypatch, post_reset)
+
+    await srv._attempt_idle_relift()
+
+    assert len(resets) == 1, "the first relift pass runs the present-mesh reset"
+    assert checks == [True], "the post-reset check runs the fabric pass"
+    assert (srv.fsm.state is ServerState.HEALTHY) is released
+    if not released:
+        assert srv._recovery_degraded(), "a post-reset check that did not pass keeps the device held"
+
+
+def _present_rung_chain(monkeypatch, post_reset):
+    """The real present-mesh rung down to the reset command, with the post-reset check answering
+    ``post_reset`` as its fabric verdict. Returns the reset argvs and the run_fabric of each check."""
     from tt_device_mcp.health import recovery as recovery_pkg
     from tt_device_mcp.health.recovery import pcie_guard
 
-    _hold_77_eth(monkeypatch, tmp_path)
     monkeypatch.setenv("TT_DEVICE_MCP_STUCK_HOLD_RESET", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: srv.HolderScan(holders=[], complete=True))
-    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(minutes=21)).isoformat())
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", None)
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRIES", 0)
@@ -1009,14 +1026,236 @@ async def test_a_77_eth_drop_reset_releases_only_on_a_passing_full_check(
     monkeypatch.setattr(srv.recovery_mechanism, "reset_with_quiesce", reset)
     monkeypatch.setattr(srv.galaxy_recovery, "_climb_to_host_recovery_after_failed_reset", climb)
     patch_recovery(monkeypatch, "_verify_device", verify)
+    return resets, checks
+
+
+# --- a 77 from a validator crash gets one reset per episode (I62) -------------------------------
+#
+# A Galaxy host, 2026-10-14: after a rescan brought chips back, every post-job fabric pass exited
+# 77 with "what():  unordered_map::at". The relift re-ran it for the I40 bound and the hold ended
+# only with a host reboot after 26.6 min, while an operator glx_reset six minutes earlier had healed the
+# same state in under two minutes. The gate's eth read had measured 228 of 256 links (I53); a crash
+# with no link count recorded (no eth reader, or a read that cleared the drop) must still reach the
+# reset, once.
+
+_CRASH = "Validating fabric...\nterminate called after throwing an instance of 'std::out_of_range'\n  what():  unordered_map::at"
+_SINCE = "2026-10-14T15:18:18.000001"
+
+
+def _hold_77_crash(monkeypatch, tmp_path, *, output=_CRASH, drop="", since=_SINCE):
+    _hold_77_eth(monkeypatch, tmp_path, drop=drop)
+    srv.fsm.record.detail = "gate/post-job: enum+ARC healthy, fabric unverified (rc 77)"
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_output", output)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+    monkeypatch.setattr(srv, "device_hold_episode_since", since)
+    monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", None)
+
+
+def _record_rungs(monkeypatch):
+    seen, rungs = [], []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        seen.append(run_fabric)
+        return True, {"fabric": {"ok": None, "detail": "could not run (77)"}}
+
+    async def escalate(rung, *a, **k):
+        rungs.append(rung)
+        return srv.OUTCOME_WAITING
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    return seen, rungs
+
+
+@pytest.mark.asyncio
+async def test_the_replayed_crash_hold_with_links_down_escalates_present(monkeypatch, tmp_path, clear_job_state):
+    """That hold as the gate left it: the eth read's drop is still recorded, so I53 alone
+    sends it to the present-mesh rung on the first relift."""
+    _hold_77_crash(monkeypatch, tmp_path, drop=_DROP)
+    assert srv._fabric_77_eth_drop() == _DROP
+    seen, rungs = _record_rungs(monkeypatch)
+    await srv._attempt_idle_relift()
+    assert rungs == ["present"] and seen == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output",
+    [_CRASH, "what(): map::at", "rc=77\nwhat():\tunordered_map::at\n"],
+)
+async def test_a_validator_crash_77_escalates_on_the_first_relift(monkeypatch, tmp_path, clear_job_state, output):
+    _hold_77_crash(monkeypatch, tmp_path, output=output)
+    assert srv._fabric_77_eth_drop() == ""
+    assert "validator crashed" in srv._fabric_77_validator_crash()
+    assert not srv._fabric_77_only_hold()
+    assert srv._fabric_no_reset_hold() == ""
+    assert srv._idle_relift_armed() == (False, False, True)
+    seen, rungs = _record_rungs(monkeypatch)
+    await srv._attempt_idle_relift()
+    assert rungs == ["present"], "the present-mesh rung, not the I48 backoff"
+    assert seen == [], "no fabric re-run first"
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "post_reset, released",
+    [
+        ({"ok": True, "detail": "fabric links healthy"}, True),
+        ({"ok": None, "detail": "what():  unordered_map::at"}, False),
+        ({"ok": False, "detail": "2 links failed"}, False),
+    ],
+)
+async def test_the_crash_reset_runs_the_full_check_and_releases_only_on_a_pass(
+    monkeypatch, tmp_path, clear_job_state, post_reset, released
+):
+    """The rung fires once the 120 s present-mesh grace has passed, well inside the 5 min budget;
+    goal 8: the reset is followed by the full check, fabric included, and only ok=True releases."""
+    since = (datetime.now() - timedelta(seconds=galaxy_mod._present_mesh_reset_grace_sec() + 5)).isoformat()
+    assert galaxy_mod._present_mesh_reset_grace_sec() <= 120
+    _hold_77_crash(monkeypatch, tmp_path, since=since)
+    resets, checks = _present_rung_chain(monkeypatch, post_reset)
 
     await srv._attempt_idle_relift()
 
-    assert len(resets) == 1, "the first relift pass runs the present-mesh reset"
+    assert len(resets) == 1, "the first relift pass past the grace runs the present-mesh reset"
     assert checks == [True], "the post-reset check runs the fabric pass"
     assert (srv.fsm.state is ServerState.HEALTHY) is released
     if not released:
         assert srv._recovery_degraded(), "a post-reset check that did not pass keeps the device held"
+
+
+@pytest.mark.asyncio
+async def test_the_crash_reset_keeps_the_hold_on_a_pass_with_links_missing(
+    monkeypatch,
+    tmp_path,
+    clear_job_state,
+    topo,  # noqa: F811
+):
+    """Goal 11 (I62 with I71 and I78): after the crash's present-mesh reset, the full check's
+    traffic passes on every discovered link while a port connection of the cabling is missing.
+    That check FAILED: the hold stays, its episode with it, and no lift path may clear it; the
+    bounded recovery (the climb, then the I76 bound) owns it from here."""
+    m, state = topo
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
+    state["first"] = _LOST  # the descriptor run: one QSFP-DD connection gone
+    state["rerun"] = (0, "all links ok\n")  # the traffic-only rerun on the links that are left
+    since = (datetime.now() - timedelta(seconds=galaxy_mod._present_mesh_reset_grace_sec() + 5)).isoformat()
+    _hold_77_crash(monkeypatch, tmp_path, since=since)
+    resets, _ = _present_rung_chain(monkeypatch, {"ok": None})
+    verdicts = []
+
+    async def verify(expected, log, run_fabric=True, **_):
+        ok, detail = await m._verify_fabric_health_body(60)  # the real verdict on that output
+        verdicts.append((run_fabric, ok, detail))
+        return ok is not False, {"snapshot": {"ok": True}, "fabric": {"ok": ok, "detail": detail}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+    await srv._attempt_idle_relift()
+
+    assert len(resets) == 1, "the crash's one present-mesh reset ran"
+    assert [v[:2] for v in verdicts] == [(True, False)], "its full check ran the fabric pass, and FAILED"
+    assert verdicts[0][2].startswith("fabric check FAILED") and _LOST_PORT in verdicts[0][2]
+    assert srv.fsm.state is not ServerState.HEALTHY and srv._recovery_degraded()
+    assert srv.device_hold_episode_since == since, "the hold's episode and clock are kept"
+    assert srv._hold_lift_unproven(), "no passing fabric pass on the full cabling"
+    assert srv._clear_device_dirty(verified=True, why="test lift") is False, "the lift funnel refuses"
+    assert srv.fsm.state is not ServerState.HEALTHY
+
+    monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
+    await srv._attempt_idle_relift()
+    assert all(ok is False for _, ok, _ in verdicts), "every later check finds the link still missing"
+    assert srv.fsm.state is not ServerState.HEALTHY, "a later tick never lifts on the short-link pass"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop", ["", _DROP], ids=["crash", "eth_drop"])
+async def test_a_tick_before_the_grace_does_not_push_the_reset_past_it(monkeypatch, tmp_path, clear_job_state, drop):
+    """A relift tick that comes while the hold is younger than the grace gets not-due from the rung.
+    It must not use up a whole relift interval: the next relift is due when the grace ends, so the
+    reset runs one sampler tick after the grace, not up to one interval later."""
+    grace = galaxy_mod._present_mesh_reset_grace_sec()
+    interval = srv.SELFHEAL_RELIFT_INTERVAL_SEC
+    assert grace <= interval, "the case this guards: a not-due tick would push the rung a full interval"
+    _hold_77_crash(monkeypatch, tmp_path, drop=drop, since=(datetime.now() - timedelta(seconds=5)).isoformat())
+    resets, checks = _present_rung_chain(monkeypatch, {"ok": True, "detail": "fabric links healthy"})
+    monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
+
+    await srv._attempt_idle_relift()
+    assert resets == [], "inside the grace the present rung is not due"
+    due_in = srv.last_relift_monotonic + interval - srv.time.monotonic()
+    assert grace - 5 - 2 <= due_in <= grace - 5 + 1, "the next relift is due at the grace end"
+
+    # The grace has passed: the hold is older and the relift clock moved on by the same amount.
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(seconds=grace + 1)).isoformat())
+    monkeypatch.setattr(srv, "last_relift_monotonic", srv.last_relift_monotonic - (grace - 4))
+    await srv._attempt_idle_relift()
+    assert len(resets) == 1, "the reset runs on the first tick past the grace"
+    assert checks == [True] and srv.fsm.state is ServerState.HEALTHY
+
+
+def test_a_not_due_tick_past_the_grace_keeps_the_interval(monkeypatch, clear_job_state):
+    """Past the grace (the rung waits on something else, e.g. a tenant) the relift keeps its interval."""
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(minutes=5)).isoformat())
+    monkeypatch.setattr(srv, "last_relift_monotonic", 123.0)
+    srv._relift_at_present_grace()
+    assert srv.last_relift_monotonic == 123.0
+    monkeypatch.setattr(srv, "device_hold_episode_since", "")
+    srv._relift_at_present_grace()
+    assert srv.last_relift_monotonic == 123.0
+
+
+@pytest.mark.asyncio
+async def test_a_validator_crash_77_gets_no_second_reset_after_an_unverified_one(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The episode's reset came back unverified (a 77 again): the crash is a missing verdict now. It
+    keeps the I48 backoff and the I40 bound and its fallback; this rule never resets it again."""
+    _hold_77_crash(monkeypatch, tmp_path)
+    resets, checks = _present_rung_chain(monkeypatch, {"ok": None, "detail": "what():  unordered_map::at"})
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(minutes=3)).isoformat())
+    await srv._attempt_idle_relift()
+    assert len(resets) == 1
+    assert srv.recovery_mechanism.unverified_reset_since == srv.device_hold_episode_since
+    srv.health_monitor.last_fabric_output = _CRASH
+    srv.health_monitor.last_fabric_skipped = True
+    srv.health_monitor.last_fabric_ok = None
+    assert srv._fabric_77_validator_crash() == ""
+    assert srv._fabric_77_only_hold()
+    assert srv._fabric_no_reset_hold() == "fabric check could not run (77)"
+    assert srv._idle_relift_armed() == (False, True, False)
+    seen, rungs = _record_rungs(monkeypatch)
+    monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
+    monkeypatch.setattr(srv, "_fabric_77_bound_reached", lambda: False)  # past it, the I40 fallback owns it
+    await srv._attempt_idle_relift()
+    assert rungs == [] and seen == [True], "the pass re-runs on its backoff, never a second reset"
+
+
+@pytest.mark.parametrize(
+    "exclusion",
+    ["cable", "topology_mismatch", "hugepages", "validator_missing", "no_episode", "not_skipped"],
+)
+def test_a_validator_crash_77_keeps_its_no_reset_exclusions(monkeypatch, tmp_path, clear_job_state, exclusion):
+    _hold_77_crash(monkeypatch, tmp_path)
+    assert srv._fabric_77_validator_crash()
+    if exclusion == "cable":
+        monkeypatch.setattr(
+            srv.health_monitor, "known_fabric_fault", lambda: "fabric cable fault (fabric check exit 78)"
+        )
+    elif exclusion == "topology_mismatch":
+        monkeypatch.setattr(srv.health_monitor, "last_fabric_output", _CRASH + "\n" + srv._TOPOLOGY_VALIDATOR_LINE)
+    elif exclusion == "hugepages":
+        monkeypatch.setattr(srv.health_monitor, "last_fabric_output", _CRASH + "\nhugepage pool not ready")
+    elif exclusion == "validator_missing":
+        monkeypatch.setattr(srv.fabric, "validator_missing", lambda: "no validator binary")
+    elif exclusion == "no_episode":
+        monkeypatch.setattr(srv, "device_hold_episode_since", "")
+    elif exclusion == "not_skipped":
+        monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", False)
+    assert srv._fabric_77_validator_crash() == ""
+    assert not srv._idle_relift_armed()[2], "never the generic present-mesh escalation"
 
 
 # --- a startup pass the validator missed is owed again once it lands (I39) ----------------------

@@ -792,7 +792,7 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
     pollers = 2 * n_services * literal(srv._set_device_pollers, r"timeout=(\d+)")
     rescan = literal(recovery_base.RecoveryMechanism.reset_with_quiesce, r"asyncio\.sleep\((\d+)\)")
     kill = constants.GRACEFUL_KILL_GRACE_SEC + constants.SIGTERM_GRACE_SEC
-    candidates = re.search(r"for c in \((.*?)\n\s*\)\n", inspect.getsource(eth.resolve_python), re.S).group(1)
+    candidates = re.search(r"for c in \((.*?)\n\s*\)\n", inspect.getsource(eth._python_candidates), re.S).group(1)
     n_candidates = len([line for line in candidates.splitlines() if line.strip()])
     eth_setup = n_candidates * default(eth.resolve_python, "import_timeout_sec")
     finished_pass = (

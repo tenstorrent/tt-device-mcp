@@ -590,6 +590,58 @@ async def test_an_adopted_reset_owes_the_ceiling(mesh, monkeypatch, verdict, cei
 
 
 @pytest.mark.asyncio
+async def test_the_arc_not_ready_retry_reset(mesh, monkeypatch, tmp_path, verdict):
+    """A -glx_reset that left every chip on the bus but ARC not ready gets one more reset; that retry is
+    a reset too, and only a fabric pass after it releases."""
+    await _arc_not_ready_retry(monkeypatch, tmp_path, *verdict)
+
+
+@pytest.mark.asyncio
+async def test_the_arc_not_ready_retry_never_releases_on_fewer_links_than_the_cabling(mesh, monkeypatch, tmp_path):
+    """The retried reset exits 0 but its fabric pass finds a port connection the cabling descriptor
+    expects missing: a failed check, not a pass on the links it could see. The hold stays."""
+    from tt_device_mcp.health.monitors import fabric
+
+    cable = f"{fabric.CABLE_FAULT}: 1 port/cable connection(s) of the cabling descriptor missing and none extra"
+    evidence = {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": cable}}
+    out = await _arc_not_ready_retry(monkeypatch, tmp_path, evidence, False)
+    assert out is not True
+
+
+async def _arc_not_ready_retry(monkeypatch, tmp_path, evidence, released):
+    from tests.test_arc_not_ready import _fake_sysfs
+
+    fsm_dirty(srv, "gate/post-job: reset", why="job_killed")
+    handle = _fake_sysfs(monkeypatch, tmp_path)
+    g = srv.galaxy_recovery
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_ARGS", "tt-smi -glx_reset")
+    monkeypatch.setattr(recovery_pkg, "ARC_NOT_READY_RETRY_SETTLE_SEC", 0)
+    monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRY_SLEEP_SEC", 0)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
+    rcs = iter([1, 0])
+
+    async def mesh_reset(argv, log, *a, **k):
+        FABRIC_DEBT.note_reset(" ".join(argv))
+        rc = next(rcs)
+        handle["nodata"].clear()
+        handle["nodata"].update(str(i) for i in range(1, 32) if rc)
+        return rc, ""
+
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh_reset)
+    calls = []
+    _verify_returning(monkeypatch, evidence, calls)
+    out = await g._reset_and_verify_device([str(i) for i in range(32)], lambda m: None)
+    assert next(rcs, None) is None, "the retry reset fired"
+    assert calls and all(calls), "every verify after the retry runs the fabric pass"
+    if out:
+        srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy")
+    _assert_settled(released)
+    return out
+
+
+@pytest.mark.asyncio
 async def test_a_broker_start_owes_a_fabric_pass_before_any_release(mesh, monkeypatch, tmp_path):
     """Startup after a boot or a broker restart: the debt is noted before the startup gate, whose
     own pass (run only once the hugepage pool is ready, tests/test_startup_fabric_hugepages.py)
@@ -726,8 +778,8 @@ async def test_the_gate_ladders_last_chance_sweep(mesh, monkeypatch, galaxy_tray
     ],
 )
 def test_no_rung_outcome_lifts_a_fabric_unverified_hold(mesh, owed, outcome, expect):
-    """The gate, the idle relift and the hold escalation fold a rung's outcome through one helper, so
-    none of them reopens the door the release funnel held (I32), nor parks a 77-only hold in DOWN."""
+    """The gate, the idle relift, the dirty idle gate and the hold escalation fold a rung's outcome through one
+    helper, so none of them reopens the door the release funnel held (I32), nor parks a 77-only hold in DOWN."""
     if owed:
         FABRIC_DEBT.note_reset("tt-smi -glx_reset")
     srv._hold_device_fabric_unverified("fabric check exited 77")
@@ -752,7 +804,9 @@ def test_every_rung_outcome_folds_through_the_helper():
     src = inspect.getsource(srv)
     body = src.replace(inspect.getsource(srv._fold_rung_outcome), "")
     assert "fsm.on_outcome(" not in body, "a rung outcome folded around the I32 guard"
-    assert src.count("_fold_rung_outcome(outcome, ") == 3, "the gate, the idle relift and the hold escalation"
+    assert (
+        src.count("_fold_rung_outcome(outcome, ") == 4
+    ), "the gate, the idle relift, the dirty idle gate (I68) and the hold escalation"
 
 
 # The 10-17 class-J episode (job killed, glx_reset 62 s): the first pass proved all 128 links, then its

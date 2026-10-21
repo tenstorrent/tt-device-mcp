@@ -220,13 +220,14 @@ def _ubb_reset_enabled() -> bool:
     """Whether the broker may FIRE the per-tray BMC reset itself on a below-floor tray-down, rather than
     only NAMING the command and holding. ON by default, with a knob to force it off.
 
-    A tray reset re-powers one 8-chip tray and leaves the other 24 running, so it is the lightest rung
+    A tray reset aims at one 8-chip tray, so it is the lightest rung
     that fits the failure that took the incident box down: a whole tray off the bus, below the
     galaxy-reset floor, which the mesh-wide reset inverts to an all-off-bus mesh and a warm reboot cannot
     re-enumerate. Without it that drop HOLDS forever — the mesh reset is suppressed below the floor — and
-    that indefinite hold is the failure this rung exists to end. Only the target tray's ARC restarts, so
-    it never risks the mesh reset's off-bus inversion, and the bit order and re-enumeration handshake are
-    hardware-confirmed. An operator whose BMC the broker has not confirmed forces the rung off with
+    that indefinite hold is the failure this rung exists to end. It is NOT isolated: one tray's pulse has
+    dropped every other tray within seconds, so the envelope waits for every chip on the box to be idle
+    and re-checks the other trays' chips after the pulse (spec 04 I23). The bit order and
+    re-enumeration handshake are hardware-confirmed. An operator whose BMC the broker has not confirmed forces the rung off with
     TT_DEVICE_MCP_AUTO_UBB_RESET=0, back to naming the command and holding.
 
     Armed also means fireable (I14, I17): the re-power goes out as `ipmitool raw` to the local
@@ -779,9 +780,9 @@ def _route(
 #
 # A Galaxy's 32 ASICs sit on 4 UBB trays of 8: a tray-level power/link failure drops its whole tray
 # off the PCIe bus at once, the measured failure that took chips 0-7 down together. A per-tray BMC
-# reset re-powers one tray and leaves the other 24 chips running — lighter than a 32-chip galaxy
-# reset and blind to a healthy tray. The BMC bit order is verified: a partial-bitmap reset restarts
-# only the targeted tray's ARC and leaves every other tray advancing and on the bus.
+# reset aims at one tray — lighter than a 32-chip galaxy reset — but is not isolated: its pulse has
+# dropped every other tray within seconds, so it requires the whole box idle (spec 04 I23). The BMC
+# bit order is verified: a partial-bitmap reset targets only the named tray's ARC.
 #
 # Which chips belong to which tray is NOT the chip index divided by the width (spec 04 I16) — that
 # ordering disagrees with the hardware's. UBB_CHIP_COUNT is the tray WIDTH, used for the topology
@@ -2872,13 +2873,21 @@ class GalaxyRecovery(Recovery):
         lift = await self._offbus_hold_lift(expected, log)
         if not lift:
             return await self._climb_offbus_stuck_hold(indices, expected, log, force=force)
-        with pcie_guard.hold_lifted(lift):
+        with pcie_guard.hold_lifted(lift), offbus_power_cycle.partial_pass(self.deps.device_hold_episode_since()):
             return await self._climb_offbus_stuck_hold(indices, expected, log, force=force)
 
     async def _offbus_hold_lift(self, expected: int, log) -> str:
-        """Why this pass may lift the ``hold`` gate (spec 04 I33), or "" to keep it."""
+        """Why this pass may lift the ``hold`` gate, or "" to keep it: with no power cycle configured,
+        once the operator hand-off ran out (spec 04 I33); with one configured, once per episode past
+        the grace for a partial off-bus drop, so the mesh reset is tried before the power cycle. A
+        whole tray down (every off-bus chip's tray fully off, :func:`_ubb_reset_plan`) keeps the gate
+        shut and goes to the power cycle (I27)."""
         hold_since = self.deps.device_hold_episode_since()
-        if not offbus_power_cycle.hold_handoff_due(hold_since) or offbus_power_cycle.power_cycle_argv() is not None:
+        cycle = offbus_power_cycle.power_cycle_argv() is not None
+        if cycle:
+            if not offbus_power_cycle.partial_reset_due(hold_since):
+                return ""
+        elif not offbus_power_cycle.hold_handoff_due(hold_since):
             return ""
         if not _hold_gate_liftable():
             return ""
@@ -2886,9 +2895,17 @@ class GalaxyRecovery(Recovery):
         off_bus = offbus_count(beats, expected)
         if off_bus <= 0:
             return ""
+        if cycle and _ubb_reset_plan(_offbus_chip_ids(beats, expected), expected, self._tray_map_now()) is not None:
+            log(
+                f"{off_bus}/{expected} chip(s) off the bus fill whole trays — no reset first; straight to the power cycle"
+            )
+            return ""
         standback = await asyncio.to_thread(offbus_power_cycle.standback_reason, require_manual_check=False)
         if standback:
-            log(f"off-bus hold past its operator hand-off, but {standback} — holding; the gate stays shut")
+            log(
+                f"off-bus hold past its {'grace' if cycle else 'operator hand-off'}, but {standback} — holding; "
+                f"the gate stays shut"
+            )
             offbus_power_cycle.page_if_blocked(
                 hold_since,
                 offbus_power_cycle.episode_age_sec(hold_since) or 0.0,
@@ -2898,7 +2915,13 @@ class GalaxyRecovery(Recovery):
                 off_bus=off_bus,
             )
             return ""
-        why = f"the {offbus_power_cycle.hold_handoff_sec()}s operator hand-off of this off-bus hold ran out"
+        if cycle:
+            why = (
+                f"a partial off-bus drop outlived its {offbus_power_cycle.grace_sec()}s grace: "
+                f"the reset ladder runs once before the power cycle"
+            )
+        else:
+            why = f"the {offbus_power_cycle.hold_handoff_sec()}s operator hand-off of this off-bus hold ran out"
         log(
             f"{off_bus}/{expected} chip(s) off the bus and {why} — lifting TT_DEVICE_MCP_HOST_RESET_GATE=hold "
             f"for this pass: the ladder's own rungs may fire, then the full health check"

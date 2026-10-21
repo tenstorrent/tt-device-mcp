@@ -151,8 +151,13 @@ def test_the_hold_appears_whole(tmp_path):
 
 def test_a_queued_job_alone_applies_at_once_under_the_hold(tmp_path):
     """A queued spec is not running work: under the hold it cannot start, so this is a job
-    boundary, and it waits, persisted, for the new broker."""
-    done, trace, hold = _gate(tmp_path, queued=1)
+    boundary, and it waits, persisted, for the new broker.
+
+    Nothing here sleeps, so the lap's clock stands still while each poll takes over a second of
+    real time: a slow or loaded host must not read as a drain. (On the real clock, a count that
+    crossed a second boundary under a loaded full-suite run printed "drained after 1s".)"""
+    clock = "\ndate() { echo 1700000000; }\npgrep() { seen pgrep; command sleep 1.05; }\n"
+    done, trace, hold = _gate(tmp_path, queued=1, stand_ins=clock)
     assert done.returncode == 0, done.stderr
     assert "queued=1" in done.stderr and "drained after 0s" in done.stderr, done.stderr
     assert "applying" in done.stdout
@@ -483,6 +488,7 @@ def _apply_event(tmp_path, health_dir, idle="true", drained_s=0, restart_rc=0):
     block = text[text.index("systemctl restart tt-device-broker\n") :]
     script = (
         f"set -u\ninstalled_sha=old111; remote_sha=new222; src_desc=test; idle={idle}; drained_s={drained_s}\n"
+        f"LAST_APPLY_NRESTARTS={tmp_path}/last-apply.nrestarts\n"
         f"systemctl() {{ return {restart_rc}; }}\n" + block
     )
     env = {"PATH": "/usr/bin:/bin", "TT_DEVICE_MCP_HEALTH_DIR": str(health_dir)}

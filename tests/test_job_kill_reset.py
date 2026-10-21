@@ -10,6 +10,7 @@ The gate tests run the real probe pass on the eth-timeout tests' mesh (only leaf
 import asyncio
 import logging
 import os
+import time
 
 import httpx2
 import pytest
@@ -603,7 +604,7 @@ async def test_a_preempt_sigkill_overrun_logs_the_process_tree(monkeypatch, capl
     proc = await asyncio.create_subprocess_exec("sleep", "600", start_new_session=True)
     try:
         with caplog.at_level(logging.INFO, logger=log.name):
-            await srv._preempt_job("960", proc.pid)
+            await srv._preempt_job("960", proc.pid, time.monotonic() + srv.PREEMPT_GRACE_SEC)
         assert await asyncio.wait_for(proc.wait(), timeout=5) == -9, "the window's SIGKILL reached the group"
     finally:
         if proc.returncode is None:
@@ -611,7 +612,7 @@ async def test_a_preempt_sigkill_overrun_logs_the_process_tree(monkeypatch, capl
             await proc.wait()
     lines = [r.getMessage() for r in caplog.records if "KILLED process tree" in r.getMessage()]
     assert len(lines) == 1, lines
-    assert "job_id=960" in lines[0] and "reason=preempted (a job waited past its soft limit)" in lines[0]
+    assert "job_id=960" in lines[0] and "reason=preempted (a job waited past its time limit)" in lines[0]
     assert f"pgid {proc.pid}" in lines[0] and "ladder ended at SIGKILL (preempt window)" in lines[0]
     assert "960" in srv.preempt_forced_job_ids, "a SIGKILL-ended preemption is a broker-side timeout"
 
@@ -659,7 +660,7 @@ async def test_a_preemption_that_unwinds_on_sigint_owes_no_reset(monkeypatch, cl
         return f"stopped pgid {pid} pids [{pid}]; ladder ended at SIGINT"
 
     monkeypatch.setattr(srv, "_terminate_job", unwound)
-    await srv._preempt_job("962", 12345)
+    await srv._preempt_job("962", 12345, time.monotonic() + srv.PREEMPT_GRACE_SEC)
     assert "962" not in srv.preempt_forced_job_ids, "a job that unwound released the mesh itself"
 
 

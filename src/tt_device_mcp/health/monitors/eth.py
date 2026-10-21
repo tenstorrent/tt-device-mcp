@@ -85,6 +85,31 @@ def _tree_for(python: str, current: str) -> str:
     return current
 
 
+def _python_candidates() -> tuple[list[str], str]:
+    """``(candidate pythons in resolve_python() order, the validator's current dir)``."""
+    vroot = os.environ.get("TTDEV_VALIDATOR_ROOT", "/opt/tt-device-broker/validator").strip()
+    current = f"{vroot}/current"
+    eth_venv = os.environ.get("TTDEV_ETH_VENV", "").strip()
+    candidates = [
+        c
+        for c in (
+            os.environ.get("TTDEV_ETH_CHECK_PYTHON", "").strip(),
+            f"{current}/python_env/bin/python",
+            f"{eth_venv}/bin/python" if eth_venv else DEFAULT_ETH_VENV_PYTHON,
+        )
+        if c
+    ]
+    return candidates, current
+
+
+def reader_installed() -> bool:
+    """Whether the built-in reader is installed at all: its probe script is readable and some
+    candidate python is executable. Spawns nothing (``os.access`` only), so the startup preflight
+    can ask it without delaying the broker start. Whether that python imports ttexalens, and
+    whether the read is fast enough to arm, is the startup self-test's call, not this one's."""
+    return _probe_path() is not None and any(os.access(c, os.X_OK) for c in _python_candidates()[0])
+
+
 def resolve_python(*, import_timeout_sec: float = 10.0) -> Optional[tuple[str, str]]:
     """The first candidate python that can ``import ttexalens``, as ``(python, tt_metal_tree)``.
 
@@ -104,19 +129,7 @@ def resolve_python(*, import_timeout_sec: float = 10.0) -> Optional[tuple[str, s
     candidate that starts importing ttexalens in place, ahead of the cached one, is picked up only
     after one of those (or a broker restart).
     """
-    vroot = os.environ.get("TTDEV_VALIDATOR_ROOT", "/opt/tt-device-broker/validator").strip()
-    current = f"{vroot}/current"
-    eth_venv = os.environ.get("TTDEV_ETH_VENV", "").strip()
-    candidates = [
-        c
-        for c in (
-            os.environ.get("TTDEV_ETH_CHECK_PYTHON", "").strip(),
-            f"{current}/python_env/bin/python",
-            f"{eth_venv}/bin/python" if eth_venv else DEFAULT_ETH_VENV_PYTHON,
-        )
-        if c
-    ]
-
+    candidates, current = _python_candidates()
     key = (tuple(candidates), os.path.realpath(current))
     with _python_cache_lock:
         cached = _python_cache

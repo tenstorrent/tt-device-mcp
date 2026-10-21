@@ -301,7 +301,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD` | unset | Command; exit 0 holds the I27 power cycle, 1 clears, anything else holds | 04 |
 | `TT_DEVICE_MCP_MANUAL_RECOVERY_CMD` | `$TTDEV_ROOT/manual-recovery-check.sh` if installed | Command; exit 0 means an operator is recovering the host, so the I27 power cycle holds; 1 clears, anything else holds. Neither set nor installed: the power cycle never fires and the broker pages | 04 |
 | `TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN` | unset | `1`: log the per-tray re-power plan and refuse it | 04 |
-| `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` | 10 | How long a tray re-power waits for holders of the tray's chips | 04 |
+| `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` | 10 | How long a tray re-power waits for holders of every chip on the box | 04 |
 | `TT_DEVICE_MCP_AER_QUIET_CHECK_SEC` | 2 | How long a root port must stay error-free before its AER settings are restored | 04 |
 | `TT_DEVICE_MCP_AER_FLOOD_THRESHOLD` | 50 | New AER errors on the Tenstorrent root ports per flood period that count as a flood | 04 |
 | `TT_DEVICE_MCP_AER_FLOOD_PERIOD_SEC` | 60 | The period the flood threshold is a rate over | 04 |
@@ -346,6 +346,7 @@ Behavior).
 | `TTDEV_UNIT_PATH` | `/etc/systemd/system/tt-device-broker.service` | Unit path (render seam) |
 | `TTDEV_BRANCH` | `main` | Branch autoupdate tracks — the **only** settable part of the update source (08 I16); the repository itself is a constant in `autoupdate.sh`, not configuration |
 | `TTDEV_AUTOUPDATE` | `1` | Autoupdate master switch. Read at install to seed the config file, and by every lap; `sudo TTDEV_AUTOUPDATE=0 ./install.sh` turns a host off outright (after `sudo`, which resets the environment) |
+| `TTDEV_MIN_APPLY_INTERVAL_SEC` | 0 (off) | Minimum seconds between autoupdate applies (each one restarts the broker and runs the startup fabric pass); a newer sha waits, so a burst of pushes is one restart. Last apply kept in `$ROOT/last-apply`, its `NRestarts` baseline in `$ROOT/last-apply-nrestarts`; a broken broker (not active, crash-looping, held, failing health) is never rate-limited; one in its startup check stays limited for at most 600 s after the apply. By-hand escape: `rm $ROOT/last-apply` (the sourced config file wins over an env override) (spec 08 I21) |
 | `TTDEV_LOCK` | 0 | Apply the udev device lock at install (shared host) |
 | `TTDEV_HEALTH_PROBE` | 1 | Read by `apply-host-config.sh` from the config file: `0` disables `tt-device-health-probe.timer` (spec 08 I17), anything else enables it |
 | `TTDEV_NO_LOCK` | unset | Back-compat: force cooperative (no lock) |
