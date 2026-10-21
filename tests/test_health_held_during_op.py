@@ -7,6 +7,7 @@ The jobs list suppresses the HOLD row while a broker op runs (the op's row is th
 its whole length. /health now keeps the hold until the full gate, fabric included, passes.
 """
 
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -27,8 +28,11 @@ def _isolate_hold(monkeypatch):
         ("device_held_since", ""),
         ("_hold_row", None),
         ("device_hold_escalation_trigger", ""),
+        ("_hold_carry", None),
+        ("_hold_carry_loaded", False),
     ):
         monkeypatch.setattr(srv, name, value)
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-a")
     monkeypatch.setattr(srv, "health_event", lambda *a, **k: None)
     monkeypatch.setattr(srv, "_persist_hold_episode", lambda *a, **k: None)
 
@@ -118,10 +122,8 @@ def test_a_hold_opened_inside_an_op_keeps_its_held_since_after_the_op(held, monk
     assert after["held_age_sec"] >= during["held_age_sec"]
 
 
-def test_a_closed_episodes_held_since_never_carries_into_the_next_hold(held, monkeypatch):
-    """The in-op latch outlived its episode: the gate passed inside the op and closed the hold, but no
-    status read landed while the device was fit, so the next hold opened inside an op reported the
-    previous episode's start (days old) as its held_since. Each episode keeps its own clock."""
+def _release_inside_an_op(held, monkeypatch):
+    """A hold opened inside an op, reported, then released by the gate passing inside the op."""
     monkeypatch.setattr(srv, "device_op_active", "health-gate/post-job")
     srv._note_tenant_gate_verdict(f"device unverified: {REASON}")
     monkeypatch.setattr(srv, "device_hold_episode_since", held.isoformat())
@@ -132,6 +134,16 @@ def test_a_closed_episodes_held_since_never_carries_into_the_next_hold(held, mon
     srv._note_tenant_gate_verdict("")  # the gate passed inside the op: the episode is over
     monkeypatch.setattr(srv, "device_op_active", "")
     # no /health, queue-status or jobs read lands while the device is fit
+    assert not srv.device_held_since and not srv.device_hold_episode_since
+
+
+def test_a_closed_episodes_held_since_never_carries_into_the_next_hold(held, monkeypatch):
+    """The in-op latch outlived its episode: the gate passed inside the op and closed the hold, but no
+    status read landed while the device was fit, so the next hold opened inside an op reported the
+    previous episode's start (days old) as its held_since. Each episode keeps its own clock. The next
+    hold here comes after the spec 04 I82 carry window, so it is a new episode."""
+    _release_inside_an_op(held, monkeypatch)
+    srv._hold_carry["released"] = time.time() - srv._HOLD_CARRY_SEC - 1
 
     monkeypatch.setattr(srv, "device_op_active", "health-gate/post-job")
     fsm_dirty(srv, "new fault", why="off_bus")
@@ -140,3 +152,22 @@ def test_a_closed_episodes_held_since_never_carries_into_the_next_hold(held, mon
     assert payload["held"] is True
     assert payload["held_since"] == srv.device_hold_episode_since != held.isoformat()
     assert payload["held_age_sec"] < 60
+
+
+def test_a_rehold_inside_the_carry_window_reports_the_carried_start_in_and_after_the_op(held, monkeypatch):
+    """Spec 04 I82 with I80: a release followed within _HOLD_CARRY_SEC by a new hold continues the
+    episode. Opened inside an op, that hold reports the carried start as held_since, during the op
+    and after it, and the 10-min clock keeps it: a lift/fail cycle never restarts the clock."""
+    _release_inside_an_op(held, monkeypatch)
+
+    monkeypatch.setattr(srv, "device_op_active", "health-gate/post-job")
+    fsm_dirty(srv, "new fault", why="off_bus")
+    srv._note_tenant_gate_verdict("device unverified: new fault")
+    assert srv.device_hold_episode_since == held.isoformat(), "the I82 carry keeps the episode start"
+    during = srv._health_payload()
+    assert during["held"] is True and during["held_since"] == held.isoformat()
+
+    monkeypatch.setattr(srv, "device_op_active", "")
+    after = srv._health_payload()
+    assert after["held"] is True and after["held_since"] == held.isoformat()
+    assert after["held_age_sec"] >= during["held_age_sec"] > 300

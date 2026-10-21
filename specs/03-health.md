@@ -1167,7 +1167,10 @@ cooldown (spec 04 I65) holds longer.
   ending lifts it, and `held_since` stays one clock for the whole episode: a hold opened inside the
   op keeps the start `/health` reported during it after the op ends. A closed episode's clock never
   carries into the next: the release that closes the episode clears the latch, so the next hold,
-  even one opened inside an op with no status read in between, reports its own start. This is reporting only
+  even one opened inside an op with no status read in between, reports its own start. A hold that
+  spec 04 I82 counts as the same episode (a re-hold within `_HOLD_CARRY_SEC` of the release, or
+  around the first job after it) is not a next hold: it reports the carried episode start, during
+  the op and after it, so a lift/fail cycle never restarts the 10-min clock. This is reporting only
   (`server._health_hold_state`, read by `/health` alone):
   the jobs list still shows one row for the device, the op's, and the gate, the release and the
   hold watchdog keep `_device_hold_state`, so it changes no recovery step and no time to recover.
@@ -1836,7 +1839,7 @@ refuses.
 | I79 (no sample gap under `FAST_SAMPLE_SEC`; a storm keeps the fast cadence at most `FAST_MAX_SEC`, re-arms after a quiet window; a reset arms nothing) | `tests/test_offbus_early_watch.py::test_a_sustained_aer_storm_keeps_every_gap_and_is_capped`, `test_a_capped_storm_rearms_only_after_a_quiet_window`, `test_the_arming_edge_never_samples_sooner_than_the_fast_interval`, `test_a_reset_moves_the_baseline_without_arming` |
 | I79/I66 (two fast all-ones samples mark the chip lost before the confirm bound; one gated real read while it is pending) | `tests/test_offbus_early_watch.py::test_two_fast_all_ones_samples_mark_a_chip_lost_before_the_confirm_bound`, `test_two_fast_blackout_samples_mark_every_chip_lost_before_the_confirm_bound` |
 | I79 (the 4 s confirm bound holds across the window end and the storm cap, for the per-chip, blackout, all-gone and short-count paths; a later reading keeps the regular proof; an isolated chip's node arms nothing) | `tests/test_offbus_early_watch.py::test_the_confirm_bound_holds_across_the_end_of_a_fast_window`, `test_a_pending_chip_past_the_window_still_gets_its_real_read`, `test_a_reading_that_began_after_the_window_keeps_the_regular_proof`, `test_a_chip_the_sampler_isolated_arms_nothing_when_its_node_leaves` |
-| I80 | `tests/test_health_held_during_op.py::test_health_stays_held_while_a_forced_rung_runs`, `tests/test_health_held_during_op.py::test_health_lifts_the_hold_only_when_the_gate_passes_inside_the_op`, `tests/test_health_held_during_op.py::test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held`, `tests/test_health_held_during_op.py::test_a_hold_opened_inside_an_op_keeps_its_held_since_after_the_op`, `tests/test_health_held_during_op.py::test_a_closed_episodes_held_since_never_carries_into_the_next_hold` |
+| I80 | `tests/test_health_held_during_op.py::test_health_stays_held_while_a_forced_rung_runs`, `tests/test_health_held_during_op.py::test_health_lifts_the_hold_only_when_the_gate_passes_inside_the_op`, `tests/test_health_held_during_op.py::test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held`, `tests/test_health_held_during_op.py::test_a_hold_opened_inside_an_op_keeps_its_held_since_after_the_op`, `tests/test_health_held_during_op.py::test_a_closed_episodes_held_since_never_carries_into_the_next_hold`, `tests/test_health_held_during_op.py::test_a_rehold_inside_the_carry_window_reports_the_carried_start_in_and_after_the_op` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
