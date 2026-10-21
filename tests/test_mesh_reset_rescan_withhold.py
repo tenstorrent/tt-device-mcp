@@ -15,14 +15,15 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import patch_recovery
 from tests.test_device_safety import _arm_fabric_only_deadline_hold
 from tests.test_hold_bound import _KINDS, BOUND
 from tests.test_ipmi_guard import MESH, ladder  # noqa: F401 - the fixture
-from tests.test_post_reset_gate import FOK, _assert_settled, _verify_returning
+from tests.test_post_reset_gate import F77, FOK, _verify_returning
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
-from tt_device_mcp.health.recovery import OUTCOME_TERMINAL, ipmi_guard
+from tt_device_mcp.health.recovery import OUTCOME_TERMINAL, galaxy, ipmi_guard
 
 RESCAN = Path("/sys/bus/pci/rescan")
 _REAL_SLEEP = asyncio.sleep  # the fake launch yields for real, so the driver-wait watcher's task can start
@@ -185,25 +186,51 @@ async def test_the_driver_wait_rescan_starts_only_after_the_bmc_re_power_went_ou
 
 
 @pytest.mark.asyncio
-async def test_a_clean_mesh_reset_still_owes_the_full_check_before_release(ladder, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize(
+    "healthy, evidence, released",
+    [
+        (True, FOK, True),
+        (False, {"snapshot": {"ok": True}, "fabric": {"ok": False, "detail": "4 links down"}}, False),
+        (False, {"snapshot": {"ok": False}}, False),
+        (True, F77, False),
+        (True, {"snapshot": {"ok": True}}, False),
+    ],
+    ids=["full-check-passed", "fabric-failed", "enum-arc-failed", "fabric-77", "no-fabric-verdict"],
+)
+async def test_a_clean_mesh_reset_still_owes_the_full_check_before_release(
+    ladder, monkeypatch, healthy, evidence, released  # noqa: F811
+):
     """Goals 8/11: the rescan after a re-powered mesh reset releases nothing; the hold lifts only once
-    the full check, fabric included, has passed after it, and a failed check keeps it."""
+    the full check, fabric included, has passed after it, and a failed or unproven check keeps it.
+    Driven through the gate's own mesh-reset rung and fold, so nothing here clears the hold."""
     rig = ladder
-    _count_rescans(monkeypatch)
-
-    async def run_scoped(argv, log, owner="", on_output=None):
-        FABRIC_DEBT.note_reset(" ".join(argv))
-        rig["launches"].append(list(argv))
-        return 0, SETTLE + DRIVER_WAIT.replace("found 31", "found 32")
-
-    monkeypatch.setattr(rig["m"], "run_scoped", run_scoped)
+    pci.REMOVED_CHIPS[REMOVED] = dict(REMOVED_REC)
+    srv.isolated_chips = {REMOVED}
+    writes = _count_rescans(monkeypatch)
+    _launch(monkeypatch, rig, 0, [SETTLE, DRIVER_WAIT.replace("found 31", "found 32")])
     verifies = []
-    _verify_returning(monkeypatch, FOK, verifies)
-    out = await rig["g"]._reset_and_verify_device([str(i) for i in range(32)], lambda m: None)
+
+    async def verify(expected, log, run_fabric=True, **_):
+        verifies.append(run_fabric)
+        return healthy, dict(evidence)
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    g = rig["g"]
+    out = await g._fire_gate_rung(
+        "post-job", galaxy.STAGE_SMI_RESET, [str(i) for i in range(32)], 32, lambda m: None, ev=None, beats=None
+    )
+    srv._fold_rung_outcome(out, lambda m: None)
+    assert rig["launches"] == [MESH] and writes, "the re-powered reset rescanned as before"
     assert verifies and all(verifies), "the full check ran, fabric included"
-    if out:
-        srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy")
-    _assert_settled(True)
+    if released:
+        assert out == galaxy.OUTCOME_RECOVERED
+        assert srv.fsm.state is srv.ServerState.HEALTHY and FABRIC_DEBT.owed == ""
+    else:
+        assert srv.fsm.state is not srv.ServerState.HEALTHY, "a hold lifted without a passing full check"
+        assert FABRIC_DEBT.owed, "the reset still owes its full check"
+        assert not any(
+            k == "device_dirty_cleared" and f.get("verified") for k, f in rig["events"]
+        ), "released as verified"
 
 
 @pytest.mark.asyncio
