@@ -20,6 +20,7 @@ import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -801,6 +802,7 @@ def _fed(tree, *bufs, error=None):
     w = ExitWitness.__new__(ExitWitness)
     w.ok, w.why, w.tree, w.exits, w.signalled = True, "", set(tree), {}, set()
     w.pgid = min(tree) if tree else None
+    w._lock, w._stop, w._reader = threading.RLock(), threading.Event(), None
     w._sock = _Sock(*bufs, error=error)
     return w
 
@@ -868,6 +870,7 @@ def test_closing_the_witness_unsubscribes_first():
                 calls.append(("close", None))
 
         w = ExitWitness.__new__(ExitWitness)
+        w._lock, w._stop, w._reader = threading.RLock(), threading.Event(), None
         w._sock = _S()
         w.close()
         assert calls == [("send", PROC_CN_MCAST_IGNORE), ("close", None)], calls
@@ -897,6 +900,81 @@ def test_the_witness_on_a_real_tree():
             if p.poll() is None:
                 p.kill()
                 p.wait()
+
+
+def test_the_witness_keeps_up_with_a_busy_host_between_polls():
+    """A burst of process events larger than the receive buffer while the caller does not poll
+    (an unprivileged socket holds a few hundred) must not void the witness: a reader thread
+    drains it as events arrive."""
+    p = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        w = ExitWitness(p.pid, None)
+        if not w.ok:
+            pytest.skip(f"no process events here: {w.why}")
+        try:
+            for _ in range(400):
+                subprocess.run(["true"], check=True)
+            time.sleep(0.5)
+            assert w.ok, w.why
+            p.terminate()
+            p.wait(timeout=10)
+            deadline = time.monotonic() + 2
+            while p.pid not in w.exits and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert w.ok, w.why
+            assert w.clean() is False and "signal" in w.why, "sleep dies from SIGTERM"
+        finally:
+            w.close()
+        assert w._sock is None and not w._reader.is_alive()
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+
+
+_HANDLES_TERM = "import signal, sys, time; signal.signal(signal.SIGTERM, lambda *a: sys.exit({rc})); time.sleep(30)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "program, want",
+    [
+        # Handles SIGTERM with exit 0: the job returned 0, so no check of any kind and no reset.
+        ("handles_0", "exit0"),
+        # Handles SIGTERM with another status: a clean end, the fast check, no reset.
+        ("handles_3", "fast"),
+        # SIGTERM's default action kills it: a signal death, the I69 reset + full check.
+        ("sleep", "full"),
+    ],
+)
+async def test_the_real_job_wrapper_reports_a_handled_sigterm_by_the_jobs_own_status(
+    monkeypatch, clear_job_state, program, want
+):
+    """The real job wrapper (its TERM trap is `exit 143`, not overridden here) around a program,
+    preempted within the 10 s grace and judged from the kernel's own exit records. The wrapper's
+    trap runs after the program returns, so the shell exits 143 whatever the program did; the
+    broker reads the job's own status instead. A handled SIGTERM with exit 0 gets no check and no
+    reset."""
+    probe = ExitWitness(os.getpgid(0), None)
+    probe.close()
+    if not probe.ok:
+        pytest.skip(f"no process events here: {probe.why}")
+    fsm_healthy(srv)
+    if program == "sleep":
+        command = "sleep 30"
+    else:
+        command = f"{sys.executable} -c '{_HANDLES_TERM.format(rc=program.split('_')[1])}'"
+    job, sent, gate, dirty, owed = await _preempt(monkeypatch, "970", command, kill_grace=5)
+    assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
+    if want == "exit0":
+        assert job.preempt_clean is True and job.preempt_exit_status == 0
+        assert dirty == [] and owed == [] and gate == [], "exit 0 on SIGTERM: no check and no reset"
+    elif want == "fast":
+        assert job.preempt_clean is True and job.preempt_exit_status == 3
+        assert dirty == [] and owed == [] and gate == [{"job_failed": False}]
+    else:
+        assert job.preempt_clean is False
+        assert dirty and owed == ["job 970 preempted"] and gate == [{"job_failed": True}]
 
 
 @pytest.mark.asyncio

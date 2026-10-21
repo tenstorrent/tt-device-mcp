@@ -77,7 +77,9 @@ job's whole process tree (SIGTERM, then SIGKILL at most 10 s later). The job end
 `preempted`. If the job returns 0, either by ending itself inside the minute or by
 handling SIGTERM so that every process exits through its own code, no health check and no
 reset run before the next job (unless the device was already held or owed a reset for
-another reason). If every process of the job exits through its own code on SIGTERM with
+another reason). A frozen eth core left by such a job is then caught by the next job,
+within its runtime or the 300 s silent-hang limit; a fault the health sampler or the output
+scan sees still holds the device. If every process of the job exits through its own code on SIGTERM with
 another exit status, or one the broker cannot prove (it reads this from the kernel's exit
 records, which may need root), the usual fast between-jobs check runs. Otherwise (SIGKILL needed, any process killed by a
 signal, or the exits could not be witnessed) the device is reset and passes the full
