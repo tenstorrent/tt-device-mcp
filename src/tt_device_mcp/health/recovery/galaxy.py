@@ -1400,17 +1400,12 @@ class GalaxyRecovery(Recovery):
             fired is False
             and rung == "offbus-forced"
             and fault_class == FAULT_CLASS_WHOLE_TRAY
-            and self.mechanism.class_a_ladder_due()
+            and self.mechanism.class_a_ladder_due(consume=False)
         ):
             # Spec 04 I73: the cooldown refused the cycle, and the hold has stood 10 min since its last
-            # cycle or boot. The full ladder runs once now (each reset followed by the full health
-            # check, fabric included); the cycle still fires the moment the cooldown ends.
-            log(
-                f"whole tray(s) off and the power cycle in cooldown {CLASS_A_LADDER_AFTER_SEC}s after the last "
-                f"cycle or boot — running the full ladder; the cycle follows at the cooldown's end if it fails"
-            )
-            health_event("class_a_cooldown_ladder", off_bus=sorted(offbus, key=int), expected=expected)
-            return None
+            # cycle or boot. The sweep runs once now (SBR, then the mesh reset), then the full health
+            # check, fabric included; the cycle still fires the moment the cooldown ends.
+            return await self._class_a_cooldown_sweep(offbus, expected, log)
         if fired and rung != "gate":
             return OUTCOME_TERMINAL
         return OUTCOME_WAITING
@@ -1549,12 +1544,12 @@ class GalaxyRecovery(Recovery):
     # semantics call for.
     #
     # Both halves apply on EVERY platform. The gate's ladder has always been one ladder: the
-    # galaxy-reset floor, the surgical rung, the tray walk and the host rungs are the policy at a
+    # galaxy-reset floor, the surgical rung, the mesh reset and the host rungs are the policy at a
     # job boundary whatever the board is, and only the reset argv is platform-specific — resolved
     # inside _reset_and_verify_device, which re-derives select_recovery per call precisely so a
     # rung reached through a fixed platform reference still fires the command that fits the host
     # actually detected. So the gate reaches this through the module-global Galaxy instance,
-    # exactly as it has always called _attempt_ubb_tray_reset and _auto_reboot_host, not through
+    # exactly as it has always called _recover_isolated_chips and _auto_reboot_host, not through
     # its per-pass platform choice.
 
     async def _fire_gate_rung(
@@ -2235,6 +2230,58 @@ class GalaxyRecovery(Recovery):
         )
         return OUTCOME_WAITING
 
+    async def _class_a_cooldown_sweep(self, offbus: set, expected: int, log) -> str:
+        """Spec 04 I73 at the 10-min mark: a whole-tray (class A) hold whose power cycle the boot or
+        post-cycle cooldown refused has stood CLASS_A_LADDER_AFTER_SEC since its last cycle or boot. Fire
+        the resets that remain (:meth:`_issue_all_resets_back_to_back`: SBR on any chip still bridged,
+        then the mesh-wide reset; no tray step exists, I23), then ONE settle and ONE full health check,
+        fabric included. Only a passing check releases the device; a failed one keeps it held, and the
+        power cycle fires the moment the cooldown ends (I65). Never under a live tenant or over a reset
+        already cycling in its own scope: a guard that holds it leaves the once-per-cycle-or-boot mark
+        unspent, so the next forced pass inside the cooldown runs it.
+
+        OUTCOME_RECOVERED on a passing check, OUTCOME_TERMINAL when the sweep ran and the check failed,
+        OUTCOME_WAITING when a guard held it or the sweep was refused (nothing ran)."""
+        if await asyncio.to_thread(self.mechanism.scope_active):
+            log("class A 10-min sweep: a reset is already cycling in its own scope — holding")
+            return OUTCOME_WAITING
+        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
+        blocker = self._tenant_blocker(scan, force=True)
+        if blocker is not None:
+            self.tenant_deferred = True
+            log(f"class A 10-min sweep: {self._describe_blocker(blocker)} — holding; sweeps once idle")
+            health_event("stuck_hold_deferred", mesh="offbus", forced=True, **blocker)
+            return OUTCOME_WAITING
+        if not self.mechanism.class_a_ladder_due():
+            return OUTCOME_WAITING  # once per cycle or boot: taken only now that the guards let it run
+        trays = _affected_trays(offbus, expected, self._tray_map_now()) or []
+        settle = _settle_before_host_rung_sec()
+        log(
+            f"whole tray(s) {trays} off and the power cycle in cooldown {CLASS_A_LADDER_AFTER_SEC}s after the "
+            f"last cycle or boot — SBR then the mesh reset, one {settle}s settle and one full check; the "
+            f"cycle follows at the cooldown's end if it fails"
+        )
+        health_event("class_a_cooldown_ladder", off_bus=sorted(offbus, key=int), expected=expected, trays=trays)
+        self._td_reset_seen = True  # an onset first sighted after a reset is not an onset (I19)
+        complete = await self._issue_all_resets_back_to_back(trays, expected, log)
+        if not complete:
+            log("class A 10-min sweep refused (reset gate or outage hold) — holding; the cycle follows at the cooldown's end")
+            return OUTCOME_WAITING
+        try:
+            await asyncio.sleep(settle)
+            healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase="class-a-10min")
+            FABRIC_DEBT.note_evidence(evidence)
+        finally:
+            pcie_guard.end_offbus_reset()
+        health_event("class_a_cooldown_ladder_verified", healthy=bool(healthy), trays=trays, evidence=evidence)
+        if healthy:
+            log("class A 10-min sweep recovered the mesh: the full check passed, fabric included")
+            self.deps.clear_device_reported_fault("class A 10-min sweep recovered the mesh")
+            self.deps.clear_device_dirty(verified=True, why="class A 10-min sweep recovered the mesh")
+            return OUTCOME_RECOVERED
+        log("class A 10-min sweep did not recover the mesh — holding; the power cycle fires at the cooldown's end")
+        return OUTCOME_TERMINAL
+
     async def _escalate_stuck_hold(
         self, indices: list, expected: int, log, *, force: bool = False, measured_fault: bool = False
     ) -> bool:
@@ -2665,13 +2712,13 @@ class GalaxyRecovery(Recovery):
         # bypasses the one-reset latch, an unreadable-scan tenant, and the failed-reset cooldown — none
         # protect a running job that no longer exists — while keeping a live reset scope and a real
         # readable tenant. This is what turns the gentlest-first ladder below (surgical bridge reset ->
-        # per-tray UBB re-power -> reboot -> power cycle) from "runs once, then holds" into "runs each
-        # window until the box recovers or reaches the loud terminal rung."
+        # mesh reset -> reboot -> power cycle) from "runs once, then holds" into "runs each window
+        # until the box recovers or reaches the loud terminal rung." There is no per-tray BMC re-power
+        # rung (spec 04 I23).
         #
-        # Only the first and last rungs are universal. The tray rung is Galaxy-only — on a loudbox both
-        # UBB plans return None and it is skipped — and the surgical rung cannot reach a chip that has
+        # Only the first and last rungs are universal. The surgical rung cannot reach a chip that has
         # LEFT the bus, because the parent bridge it resets through went with it (exit 3, "no bridge to
-        # reset"). A dropped ASIC on a non-Galaxy host therefore falls past both to the mesh reset and
+        # reset"). A dropped ASIC on a non-Galaxy host therefore falls past it to the mesh reset and
         # then, at the ladder's end, to the cold rung — which must stay armed for the ladder to
         # terminate at all.
         if not _offbus_hold_escalate_enabled() and not force:
@@ -2734,7 +2781,7 @@ class GalaxyRecovery(Recovery):
         if off_bus > 0 and self.mechanism.reset_regressed_in(hold_since):
             # This episode's galaxy reset already made the drop WORSE. Re-running the ladder would fire
             # that same mesh reset again (one Galaxy host went 4 -> 31 -> 32 off-bus across three, one
-            # per forced window), and the tray rung re-powers trays the whole box shares. Go straight to
+            # per forced window). Go straight to
             # the host climb: it routes the drop to the cold rung, whose last-chance sweep still runs the
             # full reset ladder once before any power cycle (I22), or pages and holds when no power
             # cycle is opted in (spec 04 I31).

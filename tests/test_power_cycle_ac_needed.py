@@ -12,12 +12,14 @@ included. External cycles space the cooldown (I65) but never count as attempts. 
 real reset or power cycle."""
 
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
 from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401
 from tests.test_power_cycle_cooldown import LADDER, T0, _cycles, _ledger, _tray_off, _watchdog, cool  # noqa: F401
 from tt_device_mcp import server as srv
+from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
@@ -110,12 +112,32 @@ async def test_cycles_continue_at_cooldown_spacing_past_the_ac_needed_state(cool
     assert any(e["kind"] == "power_cycle_ac_power_needed" for e in paged), "the AC page still goes out"
 
 
+def _full_checks(cool, monkeypatch, *, heals=False):  # noqa: F811
+    """Record every health check as ``verify``, each with whether it ran the fabric pass. ``heals``:
+    the check finds the tray back and passes, but only when it ran the fabric pass."""
+    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
+    fabric = []
+
+    async def verify(expected, log, run_fabric=True, **k):
+        cool["order"].append("verify")
+        fabric.append(run_fabric)
+        if heals and run_fabric:
+            cool["beats"] = _beats_without(set())
+            return True, {}
+        return False, {}
+
+    monkeypatch.setattr(cool["g"], "_verify_device", verify)
+    return fabric
+
+
 @pytest.mark.asyncio
-async def test_the_full_ladder_runs_10_min_after_the_last_cycle_or_boot_then_the_cycle(cool):  # noqa: F811
-    """A hold never stands 10 min past its last cycle or boot without the full ladder. The
-    ladder runs once at that mark inside the cooldown; a ladder that did not heal leaves the cycle to
-    fire at the cooldown's end."""
+async def test_the_full_ladder_runs_10_min_after_the_last_cycle_or_boot_then_the_cycle(cool, monkeypatch):  # noqa: F811
+    """A hold never stands 10 min past its last cycle or boot without the ladder. At that mark, inside
+    the cooldown, the sweep runs once (SBR, then the mesh reset; there is no tray step), then one full
+    check, fabric included. A failed check keeps the device held, and the cycle fires at the cooldown's
+    end."""
     await _two_cycles_that_do_not_heal(cool)
+    fabric = _full_checks(cool, monkeypatch)
     m = cool["g"].mechanism
     boot = cool["boot"]["btime"]
     until = m.power_cycle_retry[0]
@@ -125,11 +147,10 @@ async def test_the_full_ladder_runs_10_min_after_the_last_cycle_or_boot_then_the
     assert _ladder_runs(cool) == 0, "a whole tray goes to the cycle, not the ladder, before the 10-min mark"
     before = len(cool["order"])
     cool["clk"][0] = boot + CLASS_A_LADDER_AFTER_SEC
-    await _forced(cool)
-    assert cool["order"][before:] == [
-        "denied",
-        "ubb_tray",
-    ], "the 10-min pass runs the tray re-power only: glx_reset is suppressed, no sweep"
+    assert await _forced(cool) == galaxy.OUTCOME_TERMINAL
+    assert cool["order"][before:] == ["denied", "sweep", "verify"], "the sweep, then one full check"
+    assert fabric == [True], "the check after the sweep runs the fabric pass"
+    assert "released" not in cool["order"], "a failed check keeps the device held"
     assert _cycles(cool) == 2, "the cooldown still holds the cycle"
     ran = _ladder_runs(cool)
     for later in (1200, 1800):
@@ -138,13 +159,69 @@ async def test_the_full_ladder_runs_10_min_after_the_last_cycle_or_boot_then_the
     assert _ladder_runs(cool) == ran, "once per cycle or boot, not every window"
     cool["clk"][0] = until
     await _forced(cool)
-    assert _cycles(cool) == 3, "the ladder did not heal it: the cycle fires at the cooldown's end"
-    # The next boot gets its own 10-min ladder.
+    assert _cycles(cool) == 3, "the sweep did not heal it: the cycle fires at the cooldown's end"
+    assert "released" not in cool["order"]
+    # The next boot gets its own 10-min sweep.
     _boot(cool, until + BOOT, "boot-D")
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
     cool["clk"][0] = until + BOOT + CLASS_A_LADDER_AFTER_SEC
     await _forced(cool)
     assert _ladder_runs(cool) > ran
+
+
+@pytest.mark.asyncio
+async def test_a_class_a_sweep_releases_only_on_a_passing_full_check(cool, monkeypatch):  # noqa: F811
+    """The 10-min sweep brings the tray back: the device is released only after the full check
+    passed, fabric included, and the cooldown's end fires no cycle."""
+    await _two_cycles_that_do_not_heal(cool)
+    fabric = _full_checks(cool, monkeypatch, heals=True)
+    until = cool["g"].mechanism.power_cycle_retry[0]
+    cool["clk"][0] = cool["boot"]["btime"] + CLASS_A_LADDER_AFTER_SEC
+    before = len(cool["order"])
+    assert await _forced(cool) == galaxy.OUTCOME_RECOVERED
+    assert cool["order"][before:] == ["denied", "sweep", "verify", "released"]
+    assert fabric == [True]
+    cool["clk"][0] = until
+    await _forced(cool)
+    assert _cycles(cool) == 2, "a healed tray is not cycled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", ["tenant", "refused"])
+async def test_a_class_a_sweep_a_guard_holds_runs_no_check_and_the_cycle_still_follows(
+    cool, monkeypatch, guard  # noqa: F811
+):
+    """A live tenant at the 10-min mark holds the sweep (no reset over a tenant) and leaves it due for the
+    next forced pass; a sweep the reset gate or the outage hold refuses runs no check. Either way nothing
+    is released, and the power cycle still fires at the cooldown's end."""
+    await _two_cycles_that_do_not_heal(cool)
+    _full_checks(cool, monkeypatch)
+    g = cool["g"]
+    until = g.mechanism.power_cycle_retry[0]
+    if guard == "tenant":
+        monkeypatch.setattr(galaxy, "is_tenant", lambda h: True)
+        monkeypatch.setattr(galaxy, "holder_comm", lambda pid: "python")
+        cool["scan"] = HolderScan(holders=[SimpleNamespace(pid=4242, uid=1000)], complete=True)
+    else:
+
+        async def refused(trays, expected, log, do_sbr=True):
+            cool["order"].append("refused")
+            return False
+
+        monkeypatch.setattr(g, "_issue_all_resets_back_to_back", refused)
+    cool["clk"][0] = cool["boot"]["btime"] + CLASS_A_LADDER_AFTER_SEC
+    before = len(cool["order"])
+    assert await _forced(cool) == galaxy.OUTCOME_WAITING
+    assert cool["order"][before:] == ([] if guard == "tenant" else ["denied", "refused"])
+    if guard == "tenant":
+        # The tenant left the mark unspent: the next forced pass inside the cooldown runs the sweep.
+        cool["scan"] = HolderScan(holders=[], complete=True)
+        cool["clk"][0] += 60
+        await _forced(cool)
+        assert cool["order"][before:] == ["denied", "sweep", "verify"]
+    cool["clk"][0] = until
+    await _forced(cool)
+    assert _cycles(cool) == 3 and "released" not in cool["order"]
 
 
 @pytest.mark.asyncio
