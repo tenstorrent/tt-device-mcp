@@ -914,3 +914,16 @@ def patch_recovery(monkeypatch, name: str, fn) -> None:
     (and ignore) ``self``."""
     monkeypatch.setattr(srv.galaxy_recovery, name, fn)
     monkeypatch.setattr(srv.per_target_recovery, name, fn)
+
+
+@pytest.fixture
+def armed_power_cycle(monkeypatch):
+    """The host rung (the BMC power cycle, spec 04 I71) armed with a recording stub fire: the list it
+    returns gets one entry per power cycle the broker fires. Nothing real is spawned."""
+    from tt_device_mcp import privileges
+
+    fired = []
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    monkeypatch.setattr(privileges, "can_ipmi", lambda: True)
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append("power-cycle"))
+    return fired

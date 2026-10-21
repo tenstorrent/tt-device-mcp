@@ -53,7 +53,6 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
         "resets": [],
         "fabric": [],
         "eth_reads": 0,
-        "reboots": 0,
         "events": [],
     }
     for i in range(CHIPS):
@@ -115,9 +114,6 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
         st["fabric_bad"] = not st.get("reset_heals", True)
         return 0, ""
 
-    async def reboot(log, reason):
-        st["reboots"] += 1
-
     g = srv.galaxy_recovery
     monkeypatch.setattr(g.mechanism, "await_foreign_scope", no_scope)
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
@@ -169,15 +165,15 @@ async def test_the_full_check_after_the_reset_gates_the_release(mesh):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh):
+async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh, armed_power_cycle):
     mesh["reset_heals"] = False
-    srv.recovery_mechanism.last_reset_failed = True  # a prior cycle failed: the host rung is armed
+    srv.recovery_mechanism.last_reset_failed = True  # a prior cycle failed: the host rung is due
     await _gate()
     assert mesh["resets"][0] == ["tt-smi", "-glx_reset"]
     assert mesh["events"].count("eth_timeout_mesh_reset") == 1
     assert mesh["fabric"] and min(mesh["fabric"]) >= 1, "every fabric pass ran after the reset"
     assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
-    assert mesh["reboots"] == 1, "it climbs to the opted-in host rung"
+    assert armed_power_cycle == ["power-cycle"], "it climbs to the power cycle"
 
 
 @pytest.mark.asyncio
