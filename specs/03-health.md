@@ -1405,6 +1405,10 @@ subsystem through the root:
   last live values), `lost_chips` (confirmed lost, not polled), `off_bus_chips` (the ids behind
   `off_bus`), `hung_chips` (sysfs node present, reading all-ones) and `resetting_chips` (every
   expected chip while `recovering`, else empty).
+- `/status` (`tt_device_queue_status`, `server._get_queue_status`) — the device fields beside the
+  running and queued rows: `device_busy`, `device_resetting` (a device-op row whose detail starts
+  `device reset:` is active, spec 04 I90; false otherwise), `device_degraded` (the same predicate
+  tenant admission reads, "" when fit), and `startup_verify` (I76).
 
 **Test monkeypatch seams.** The module globals `server.health_monitor`,
 `server.recovery_mechanism`, `server.galaxy_recovery`, `server.per_target_recovery`,

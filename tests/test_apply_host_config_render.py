@@ -29,6 +29,8 @@ def _render(tmp_path, defaults: dict, *, eth_cmd: str | None = None) -> str:
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "TTDEV_ETC_DEFAULT": str(conf),
         "TTDEV_UNIT_PATH": str(tmp_path / "absent.service"),
+        # No host DMI product either: on a Galaxy host it would derive an expected chip count.
+        "TTDEV_DMI_PRODUCT_FILE": str(tmp_path / "absent.product_name"),
     }
     if eth_cmd is not None:
         env["TTDEV_ETH_HEARTBEAT_CMD"] = eth_cmd
@@ -119,10 +121,16 @@ def test_reset_floor_knobs_set_reach_the_unit(tmp_path):
 
 
 def test_expected_chips_unset_renders_no_line(tmp_path):
-    # Default: no per-host count. expected_chip_count() falls back to the high-water mark, exactly
-    # as before this wiring. Pinned so the seam cannot start pinning a chip count by accident.
-    unit = _render(tmp_path, _GALAXY)
+    # A host nothing can identify (no galaxy reset mode, board type or DMI product): no per-host
+    # count, and expected() falls back to the high-water mark. Pinned so the seam never guesses.
+    # A Galaxy derives 32 instead (spec 08 I28, tests/test_deploy_expected_chips.py).
+    unit = _render(tmp_path, {k: v for k, v in _GALAXY.items() if k != "TTDEV_RESET_MODE"})
     assert "TT_DEVICE_MCP_EXPECTED_CHIPS" not in unit
+
+
+def test_a_galaxy_reset_mode_alone_renders_32(tmp_path):
+    unit = _render(tmp_path, _GALAXY)
+    assert "Environment=TT_DEVICE_MCP_EXPECTED_CHIPS=32\n" in unit
 
 
 def test_expected_chips_set_reaches_the_unit(tmp_path):
