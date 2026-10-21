@@ -346,6 +346,103 @@ async def test_a_latched_hold_cooling_past_the_ten_minute_mark_waits_only_for_th
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["fails", "passes", "none"], ids=["check fails", "check passes", "no verdict"])
+@pytest.mark.parametrize("hold", ["latched", "topology mismatch", "missing ports"])
+async def test_a_power_cycle_denied_before_the_ten_minute_ladder_waits_for_that_ladders_check(
+    monkeypatch, clear_job_state, hold, verdict
+):
+    """A power cycle denied below the 10-min mark for a reason other than the cooldown arms no retry: the
+    host rung stays pending. The 10-min ladder spends it. The full check after that ladder still waits on
+    the 1G hugepage pool when the denial clears, and no power cycle fires over it: only a failed verdict,
+    or the end of _HOLD_BOUND_CHECK_SEC with no verdict, asks for the cycle; a passing check lifts the
+    hold with none."""
+    escalations, _alerts, events = _arm(monkeypatch, hold)
+    await _opted_out_or_denied(monkeypatch, escalations, events, "denied")
+    clock = _clock(monkeypatch)
+    state = {"denied": True, "hugepages": False}
+    ladders, cycles = [], []
+
+    def allowed(action, **k):
+        return (False, "another host action stands") if state["denied"] else (True, "")
+
+    async def ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        ladders.append(srv._hold_age_now())
+        if len(ladders) == 2:
+            state["hugepages"] = True  # the full check after the 10-min ladder waits on the pool
+            state["denied"] = False  # and the denial has cleared
+        return OUTCOME_RECOVERED
+
+    async def power_cycle(log, reason):
+        cycles.append(srv._hold_age_now())
+
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: state["hugepages"])
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", ladder)
+    await _walk(clock, 0, BOUND - 20)
+    assert len(ladders) == 1 and srv._hold_bound_rung_pending, "denied below the bound, no retry: pending"
+    await _walk(clock, BOUND - 20, BOUND + 20)
+    assert len(ladders) == 2 and ladders[1] >= BOUND, "the 10-min ladder"
+    check_end = ladders[1] + srv._HOLD_BOUND_CHECK_SEC
+    mid = int(ladders[1] - srv._hold_age_now() + clock.offset + srv._HOLD_BOUND_CHECK_SEC / 2)
+    await _walk(clock, int(clock.offset) + 10, mid)
+    assert cycles == [], "no power cycle while the check after the ladder still waits on the pool"
+    assert srv._recovery_degraded() and "device_released" not in events
+    if verdict == "fails":
+        state["hugepages"] = False
+        assert srv._note_hold_bound_check_failed(lambda m: None), "the check ends with no pass"
+        await _walk(clock, mid, mid + 20)
+        assert len(cycles) == 1 and cycles[0] < check_end, "a failed verdict asks for the cycle at once"
+    elif verdict == "passes":
+        monkeypatch.setattr(srv, "_recovery_degraded", lambda: False)  # the full check passed: the hold lifts
+        await _walk(clock, mid, int(check_end - srv._hold_age_now() + clock.offset) + 60)
+        assert cycles == [], "a passing check asks for no cycle"
+    else:
+        await _walk(clock, mid, int(check_end - srv._hold_age_now() + clock.offset) - 20)
+        assert cycles == [], "the check keeps its whole window"
+        await _walk(clock, int(clock.offset) + 10, int(check_end - srv._hold_age_now() + clock.offset) + 30)
+        assert len(cycles) == 1 and check_end <= cycles[0] <= check_end + 30, "the cycle at the window's end"
+    assert len(ladders) == 2, "no other ladder in the window"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("why", ["missed request", "backstop", "per-boot cap"])
+@pytest.mark.parametrize("hold", ["latched", "topology mismatch"])
+async def test_a_retry_after_no_cycle_that_ran_does_not_defer_the_ten_minute_ladder(
+    monkeypatch, clear_job_state, hold, why
+):
+    """Goal of spec 04 I76: only the boot / post-power-cycle cooldown holds past 10 min with no ladder. A
+    power cycle denied for a missed request's backoff, the backstop or the per-boot cap arms a retry at
+    that wait's end, but no cycle ran: the full ladder still runs at the 10-min mark, and the hold lifts
+    only on a passing check after it."""
+    escalations, _alerts, events = _arm(monkeypatch, hold)
+    await _opted_out_or_denied(monkeypatch, escalations, events, "denied")
+    clock = _clock(monkeypatch)
+    until = datetime.now().timestamp() + 4 * BOUND  # the wait runs well past the 10-min mark
+    ladders = []
+
+    def allowed(action, **k):
+        return srv.recovery_mechanism._deny_power_cycle(
+            {"until": until, "last": until - 3600, "cause": why, "interval_sec": 3600, "why": why}, cooldown=False
+        )
+
+    async def ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        ladders.append(srv._hold_age_now())
+        return OUTCOME_RECOVERED
+
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", ladder)
+    await _walk(clock, 0, BOUND - 20)
+    assert len(ladders) == 1 and srv.recovery_mechanism.power_cycle_retry is not None, "a retry is armed"
+    assert not srv.recovery_mechanism.power_cycle_retry_cooldown
+    await _walk(clock, BOUND - 20, BOUND + 20)
+    assert len(ladders) == 2 and BOUND <= ladders[1] < BOUND + 20, "the full ladder at the 10-min mark"
+    assert srv._recovery_degraded() and "device_released" not in events
+
+
+@pytest.mark.asyncio
 async def test_a_granted_host_rung_after_the_at_start_ladder_runs_no_second_ladder_at_the_bound(
     monkeypatch, clear_job_state
 ):

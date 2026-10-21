@@ -8325,7 +8325,8 @@ _hold_bound_ladder_recovered: bool = False
 # stands in for the bound's ladder only once the host rung after it was granted (or its cooldown retry
 # armed): until then the 10-min bound still runs the full ladder.
 _hold_bound_early: bool = False
-# The hold age at which the governor granted the host rung, or armed its cooldown retry (spec 04 I76).
+# The hold age at which the governor granted the host rung, or armed its boot / post-cycle cooldown retry
+# (spec 04 I76); a missed request's, backstop or per-boot cap retry does not count.
 _hold_bound_granted_age: Optional[float] = None
 _hold_bound_cycle_age: Optional[float] = None
 # The hold age at which a full check after the bound's ladder ended with no pass (spec 04 I76).
@@ -8398,12 +8399,16 @@ def _disproven_lift_bound_due(age: float) -> bool:
 def _note_hold_bound_ladder(age: float, outcome: str, *, early: bool = False) -> None:
     """Record the bound's own ladder. A forced run that started below the bound (the off-bus one-shot,
     a progress retry, a gated grace) is not it: the bound still runs its ladder at the 10-min mark.
-    Spec 04 I83's at-start pass of a fabric link-short hold (``early``) is: it is that class's ladder."""
+    Spec 04 I83's at-start pass of a fabric link-short hold (``early``) is: it is that class's ladder.
+    A host rung still pending from before it (a denial that armed no retry) is spent: the full check
+    after this ladder decides whether the host rung is asked again (spec 04 I76)."""
     global _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_tenant_blocker, _hold_bound_early
+    global _hold_bound_rung_pending, _hold_bound_denied_why
     if age < _hold_bound_sec() and not early:
         return
     _hold_bound_sync()
     _hold_bound_tenant_blocker = None
+    _hold_bound_rung_pending, _hold_bound_denied_why = False, ""
     _hold_bound_ladder_age = max(age, _hold_age_now())
     _hold_bound_early = early  # a ladder at the bound is the bound's own, with its full check window
     _hold_bound_ladder_recovered = outcome == OUTCOME_RECOVERED
@@ -8475,7 +8480,8 @@ def _hold_bound_ladder_in_last_window(age: float) -> bool:
 
 def _hold_bound_owes_ladder(age: float) -> bool:
     """Spec 04 I83 with I76: at the 10-min mark, a ladder that ended below it and whose host rung was
-    never granted (both host rungs opted out, or a denial other than the cooldown) does not stand in for
+    never granted (both host rungs opted out, or a denial other than the boot / post-cycle cooldown: a
+    missed request's backoff, the backstop or the per-boot cap) does not stand in for
     the bound's ladder. That is the at-start pass, and under the I42 latch also the ladder its one-tick
     bound counted: the latch shortens the bound, never the 10-min ladder (the latch stays)."""
     lad = _hold_bound_ladder_age
@@ -8613,8 +8619,13 @@ async def _hold_bound_host_rung(age: float, log) -> None:
         return
     _hold_bound_tenant_blocker = None
     allowed, why = recovery_mechanism.auto_recovery_allowed(action, tenant_active=False)
-    if allowed or getattr(recovery_mechanism, "power_cycle_retry", None) is not None:
+    retry = getattr(recovery_mechanism, "power_cycle_retry", None) is not None
+    if allowed or retry:
         _hold_bound_rung_pending, _hold_bound_cycle_age = False, age
+    if allowed or (retry and getattr(recovery_mechanism, "power_cycle_retry_cooldown", False)):
+        # Spec 04 I83/I76: only a host rung that fired, or the boot / post-cycle cooldown it waits out,
+        # stands in for the 10-min ladder. A missed request's backoff, the backstop or the per-boot cap
+        # does not: the hold still gets its ladder at the 10-min mark.
         _hold_bound_granted_age = age
     if not allowed and why == _hold_bound_denied_why:
         return  # the same denial as the last tick's: asked again, quietly

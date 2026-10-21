@@ -1473,7 +1473,13 @@ each rung fires only when the gentler one failed or cannot apply.
   the chip is still off or came back meanwhile. A cooldown, per-boot cap or backstop denial (I65, I9)
   arms the retry the watchdog fires the moment that wait ends; a denial that arms no retry keeps the
   rung pending, is asked again every tick and is journaled once per distinct reason
-  (`hold_bound_host_rung`). Only that bounded boot / post-power-cycle cooldown may hold longer than
+  (`hold_bound_host_rung`). A rung still pending from a denial below the bound is spent by the
+  bound's ladder: the full check after that ladder decides, so the host rung waits for its verdict
+  (a failure asks at once; no verdict, the 300 s check bound) even when the denial clears
+  meanwhile, and never fires at the ladder's end without one. Of those retries only the cooldown's
+  (the boot / post-power-cycle wait) stands in for the 10-min ladder (I83): a missed request's
+  retry, the per-boot cap's or the backstop's follows no cycle that ran, so the hold still gets its
+  ladder at 600 s. Only that bounded boot / post-power-cycle cooldown may hold longer than
   the bound, with one exception: a live readable tenant that is not a broker job's leftover (invariant
   4, I6/I7) still refuses every rung, so such a hold is bounded only by the tenant. It is never silent:
   at the bound the broker journals and pages `hold_bound_tenant_blocked` once per episode, naming the
@@ -1680,17 +1686,22 @@ each rung fires only when the gentler one failed or cannot apply.
   the I76 host rung (the power cycle) in the same run. A run that finds the hold is not (or no longer)
   this class, e.g. a chip already off the bus by its heartbeat, declines once for the episode and is
   not spawned again; the hold keeps its own class's path. That pass stands in for the episode's bound
-  ladder only once the host rung after it was granted or its cooldown retry armed: then no later tick
+  ladder only once the host rung after it was granted or its boot / post-power-cycle cooldown retry
+  armed: then no later tick
   (the 10-min bound, a later ceiling window, the hold deadline) runs a second glx_reset or ladder, and
   the host rung is next. The I82 carry and a broker restart keep the pass's age and its at-start
   mark but not the grant, so after either the bound still runs one more full ladder (about 220 s,
   bounded), then the host rung. When no host
-  rung was granted (both host rungs opted out, or a denial other than the cooldown), the pass is a
+  rung was granted (both host rungs opted out, or a denial other than the cooldown, including a
+  retry armed by a missed request, the per-boot cap or the backstop), the pass is a
   forced run below the bound and the full ladder runs again at the 10-min mark, then the I76 cadence.
   The same holds under the I42 latch: its one-tick bound counts the pass as the bound's ladder, but a
   latch shortens the bound, never the 10-min mark. A power cycle denied there for any cause but the
   cooldown (the rung stays pending, asked each tick) still gets the full ladder at 10 min, with the
-  latch kept, then its full check: only a pass releases; a failure asks for the power cycle again. A
+  latch kept, then its full check: only a pass releases; a failure asks for the power cycle again.
+  That ladder spends the pending rung on every link-short path (latched, topology mismatch, missing
+  ports): a denial that clears while its check still waits (e.g. on hugepages) does not cycle the
+  box before the verdict or the I76 check bound (ladder end + 300 s). A
   cooldown retry armed across the 10-min mark runs no ladder there; the cycle fires as the cooldown ends.
   A re-hold of another class in the same episode below the bound (I82 carry or a broker restart)
   asks for the host rung once and runs no further forced ladder. A check still waiting on the 1G
@@ -1712,6 +1723,12 @@ each rung fires only when the gentler one failed or cannot apply.
   rung (about 11-16 min to the power-cycle request, with 3-4 futile resets); now the same one ladder
   plus one full check from hold start (about 2-5 min to the request), at most 600 s, or the
   cooldown's end when later.
+  A non-cooldown denial before the 10-min ladder (all link-short holds): the power cycle waits for
+  the full check after that ladder, at most 300 s more (was: fired at the ladder's end, about
+  600 s, with no verdict); a failed check asks at once, a pass releases with no cycle. A retry
+  armed by a missed request, the per-boot cap or the backstop: the 10-min ladder runs at 600 s
+  (was: deferred to that retry's end, 30 min or more). The cooldown and a cycle that fired:
+  unchanged.
   A carried re-hold of another class: the host rung at once instead of a ladder on every tick.
   A run that declines (a heartbeat read once showed a chip off the bus) declines for the whole
   episode, so a link-short hold whose heartbeat glitched once waits for the I76 bound: its ladder at
@@ -2311,6 +2328,8 @@ sees a silent fabric pass.
 | I83 a run that found another class declines once and is not spawned again | `tests/test_fabric_link_short.py::test_an_at_start_run_that_found_another_class_is_not_spawned_again` |
 | I83 the at-start pass stands in for the bound's ladder only after a granted host rung; otherwise the ladder runs at 10 min, then I76 | `tests/test_fabric_link_short.py::test_an_at_start_ladder_whose_host_rung_never_fired_does_not_stand_in_for_the_bounds_ladder`, `::test_a_granted_host_rung_after_the_at_start_ladder_runs_no_second_ladder_at_the_bound` |
 | I83 under the I42 latch a power cycle denied for a cause other than the cooldown still gets the full ladder at 10 min, latch kept; only a passing full check releases, a failing one asks for the cycle again; a cooldown retry armed across the 10-min mark runs no ladder there and the cycle fires at the cooldown's end | `tests/test_fabric_link_short.py::test_a_latched_hold_whose_power_cycle_is_denied_reruns_the_full_ladder_at_ten_minutes`, `::test_a_latched_hold_cooling_past_the_ten_minute_mark_waits_only_for_the_cooldown` |
+| I83/I76 a power cycle denied below the bound and still pending (latched, topology mismatch, missing ports) waits for the full check after the 10-min ladder: a failed check asks for it inside the check window, no verdict asks at ladder end + 300 s, a pass releases with no cycle | `tests/test_fabric_link_short.py::test_a_power_cycle_denied_before_the_ten_minute_ladder_waits_for_that_ladders_check` |
+| I83/I76 a retry after no cycle that ran (missed request, backstop, per-boot cap) does not stand in for the 10-min ladder; only the boot / post-power-cycle cooldown's retry does | `tests/test_fabric_link_short.py::test_a_retry_after_no_cycle_that_ran_does_not_defer_the_ten_minute_ladder`, `tests/test_power_cycle_verified_interval.py::test_the_backstop_is_a_stated_bounded_wait_retried_at_its_end`, `tests/test_power_cycle_cooldown.py::test_the_per_boot_cap_denial_shows_on_health`, `::test_a_boot_3_min_before_startup_holds_to_a_deadline_then_cycles_once`, `tests/test_power_cycle_missed_request.py::test_a_request_the_host_never_acted_on_is_asked_again_as_its_window_ends` |
 | I83 a re-hold of another class after a carried at-start ladder (carry or broker restart) asks for the host rung once, no ladder per tick | `tests/test_fabric_link_short.py::test_a_rehold_of_another_class_after_a_carried_at_start_ladder_asks_for_the_host_rung_once` |
 | I83 with spec 03 I75: on a startup hold the at-start ladder meets a running re-adopted job on `job_running`, stands down to the pending startup gate after the job ends, the gate's full check alone lifts; a failed gate gets the ladder then one power cycle; a below-bound host rung never fires over the running job | `tests/test_fabric_link_short.py::test_a_startup_hold_link_short_leaves_the_at_start_ladder_to_the_startup_gate`, `tests/test_fabric_link_short.py::test_a_below_bound_host_rung_never_fires_over_a_running_readopted_job` |
 | I76 `TT_DEVICE_MCP_FORCE_ESCALATE=0` does not stop the bound, and the boot warning says so; a held job past the bound still starts its escalation and below it names the bound; no message claims the hold has no automatic exit | `tests/test_hold_bound.py::test_the_operator_kill_switch_does_not_stop_the_bound`, `tests/test_rung_privilege.py::test_the_force_escalate_kill_switch_warns_that_the_hold_bound_ignores_it`, `tests/test_hold_bound.py::test_a_held_job_past_its_bound_under_the_kill_switch_says_the_bound_still_runs`, `tests/test_device_safety.py::test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |

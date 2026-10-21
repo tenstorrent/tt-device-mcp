@@ -537,6 +537,10 @@ class RecoveryMechanism:
         # Spec 04 I65: when a power cycle the cooldown denied may be asked again, and the hold episode
         # it was denied in — the hold watchdog forces one escalation at that time. None when nothing waits.
         self.power_cycle_retry: Optional[tuple[float, str]] = None
+        # Whether that retry waits out the boot / post-power-cycle cooldown (spec 04 I65, or a cycle that
+        # fired and is still pending or spaced), not a missed request's backoff, the backstop or the
+        # per-boot cap. Only the former defers the 10-min bound's ladder (spec 04 I76/I83).
+        self.power_cycle_retry_cooldown: bool = False
         # The cooldown in force at the last power-cycle decision (until, last, cause, interval), for /health.
         self.power_cycle_cooldown_state: Optional[dict] = None
 
@@ -1490,7 +1494,7 @@ class RecoveryMechanism:
             self._ac_power_info = self._ac_power_needed(ledger, now_epoch, requests)
             backstop = self._power_cycle_backstop(ledger, now_epoch)
             if backstop is not None:
-                return self._deny_power_cycle(backstop)
+                return self._deny_power_cycle(backstop, cooldown=False)
         elif verified and _power_cycle_backstop_until(self._cycles_that_ran(ledger, now_epoch), now_epoch) is not None:
             verified = None
         rank = AUTO_RECOVERY_RANK.get(action, max(AUTO_RECOVERY_RANK.values()))
@@ -1551,7 +1555,7 @@ class RecoveryMechanism:
                 return self._deny_power_cycle(pending)
             missed = self.power_cycle_miss_state(requests, now_epoch=now_epoch)
             if missed is not None and now_epoch < missed["until"]:
-                return self._deny_power_cycle(missed)
+                return self._deny_power_cycle(missed, cooldown=False)
         boot_id = self._current_boot_id()
         if boot_id:
             # The per-boot cap counts this boot's requests within the action's interval only: a
@@ -1588,7 +1592,8 @@ class RecoveryMechanism:
                             "cause": "broker request this boot",
                             "interval_sec": interval,
                             "why": why,
-                        }
+                        },
+                        cooldown=False,
                     )
                 return False, why
         if cycle:
@@ -1907,7 +1912,7 @@ class RecoveryMechanism:
         state = self.power_cycle_miss_state(ledger, now_epoch=now_epoch)
         if state is not None:
             # A retry due now (the first miss) is still a deadline: the watchdog asks at once.
-            self._deny_power_cycle(state)
+            self._deny_power_cycle(state, cooldown=False)
 
     def power_cycle_interval(self, ledger: Optional[list[dict]] = None, *, now_epoch: Optional[float] = None) -> int:
         """The power-cycle cooldown's length now: :func:`power_cycle_interval_sec` of the broker power
@@ -2113,10 +2118,11 @@ class RecoveryMechanism:
         except OSError:
             pass
 
-    def _deny_power_cycle(self, state: dict) -> tuple[bool, str]:
+    def _deny_power_cycle(self, state: dict, *, cooldown: bool = True) -> tuple[bool, str]:
         """Refuse the power cycle for a stated, bounded wait (spec 04 I65): ``state`` (``until``,
         ``last``, ``cause``, ``interval_sec``, ``why``) is what /health shows, and the hold watchdog
-        asks again at ``until`` in this hold episode."""
+        asks again at ``until`` in this hold episode. ``cooldown`` is False for a wait that follows no
+        cycle that ran (a missed request's backoff, the backstop, the per-boot cap)."""
         ac = self._ac_power_info
         if ac is not None:
             # Spec 04 I73: the wait is still the cooldown's; /health also says AC removal may be needed.
@@ -2124,6 +2130,7 @@ class RecoveryMechanism:
             state["why"] = f"{ac['why']}. {state['why']}"
         self.power_cycle_cooldown_state = state
         self.power_cycle_retry = (state["until"], self._device_hold_episode_since() or "")
+        self.power_cycle_retry_cooldown = cooldown
         return False, state["why"]
 
     def power_cycle_retry_due(self, now_epoch: Optional[float] = None) -> bool:

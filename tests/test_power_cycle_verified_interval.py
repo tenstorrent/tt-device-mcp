@@ -180,6 +180,7 @@ def test_the_backstop_is_a_stated_bounded_wait_retried_at_its_end(ledger, tmp_pa
     assert allowed is False and "backstop" in why
     assert rm.power_cycle_cooldown_state["until"] == until
     assert rm.power_cycle_cooldown_state["cause"] == "power-cycle backstop"
+    assert not rm.power_cycle_retry_cooldown, "no cycle ran: the 10-min bound's ladder is not deferred (I76)"
     assert not rm.power_cycle_retry_due(until - 1)
     assert rm.power_cycle_retry_due(until)
 
