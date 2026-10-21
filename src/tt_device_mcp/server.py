@@ -12680,13 +12680,12 @@ export {JOB_TAG_ENV}={job_tag}
                     _note_hold_carry_job("end", ok=True)  # spec 04 I82: the release was right
                 if fault:
                     _mark_device_reported_fault(f"job {job_id} {fault}", job=job)
-                elif job_id in reset_killed_job_ids:
+                elif killed_by_reset:
                     # This job's death is OURS — a reset/recovery SIGKILLed it to take the device
                     # (most often a chip off the bus whose mapping would hang the host). Treating it
                     # as evidence the mesh needs a reset makes the reset its own justification, and
                     # the operator's one reset becomes two. Every extra reset of 32 ASICs is another
                     # chance to drop a marginal chip.
-                    reset_killed_job_ids.discard(job_id)
                     # Say so on the JOB: a bare signal exit reads to the submitter as their own code
                     # crashing. Name the real cause so they resubmit rather than debug a phantom.
                     # The normal exit already did (spec 01 I70); a timeout or runner-error end did not.
@@ -12705,6 +12704,11 @@ export {JOB_TAG_ENV}={job_tag}
                         + (f" (exit {job.exit_code})" if job.exit_code is not None else ""),
                         job=job,
                     )
+                # Spec 01 I70: every branch drops the marker, the fault branch too. Ids recycle
+                # (001-999): a leftover one would end a later job with this id KILLED by recovery and
+                # excuse it from the reset it owes (03 I69).
+                reset_killed_job_ids.discard(job_id)
+                reset_killed_causes.pop(job_id, None)
                 # Spec 03 I69: a job the broker stopped mid-run (its timeout, the hung/doomed reaper,
                 # a requested kill, or a preemption kill) can leave the mesh wedged in a way the passive checks pass and the next job's
                 # dispatch hangs on. The next post-job gate pays one reset, then the full check.
