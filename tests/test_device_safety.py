@@ -2038,6 +2038,12 @@ def test_dead_chips_are_picked_out_of_a_live_mesh():
     assert heartbeat.dead_chips({"0": 500}) == []
 
 
+def _no_host_device_holders(monkeypatch):
+    """The dead-chip valve SIGKILLs every holder its scan finds. Unstubbed, the scan reads the
+    host's real /proc, so on a device host the test kills real jobs (spec 09 I9)."""
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+
+
 @pytest.mark.asyncio
 async def test_a_dead_chip_is_isolated_without_waiting_for_the_device_lock(monkeypatch):
     """This must NOT take the device lock. Every other device op waits its turn because two
@@ -2059,6 +2065,7 @@ async def test_a_dead_chip_is_isolated_without_waiting_for_the_device_lock(monke
 
     monkeypatch.setattr(srv, "_set_device_pollers", pollers)
     monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    _no_host_device_holders(monkeypatch)
 
     # Hold the device lock, as a hung fabric check would. Isolation must proceed anyway.
     # The lock is held for the whole block, so any finite bound proves isolation skips it;
@@ -2168,6 +2175,7 @@ async def test_a_chip_is_only_isolated_once(monkeypatch):
 
     monkeypatch.setattr(srv, "_set_device_pollers", pollers)
     monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    _no_host_device_holders(monkeypatch)
 
     await srv.sampler.isolate_dead_chips(["13"])
     await srv.sampler.isolate_dead_chips(["13"])
@@ -3089,6 +3097,7 @@ async def test_a_dead_chip_stop_owes_the_pollers_a_restart_on_the_next_close(mon
     monkeypatch.setattr(srv, "isolate_chip", lambda idx: True)
     monkeypatch.setattr(srv, "chip_pci_bdf", lambda idx: f"0000:46:00.{idx}")
     monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    _no_host_device_holders(monkeypatch)
 
     await srv.sampler.isolate_dead_chips(["13"])
 
