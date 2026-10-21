@@ -252,6 +252,35 @@ job log, so every "installed" claim below is verified, not assumed.
   is not (re)started. An upgrade keeps the old `current` until the new build flips it, so it never
   waits here. Reason: a broker started before the validator exists gets a 77 from its startup
   fabric pass and holds the device fabric-unverified, so a fresh install never comes up verified.
+
+- **I26 — The installer never removes the venv a live broker runs from.** `$R/venv` is a relative
+  symlink to a versioned venv, `$R/venv.<short-sha>.<random>` (`deploy/broker-venv.sh`). The
+  installer builds the new venv at that final path (a venv is not relocatable), pip-installs this
+  tree into it and verifies it: `import tt_device_mcp.server`, `import tt_smi` and `tt-smi --help`
+  all succeed. A failed build or verification removes only the new venv, leaves `$R/venv` as it was
+  and exits 1. The flip is `ln -sfn` + `mv -Tf`, one rename, and comes right before
+  apply-host-config (which renders the unit from `$R/venv` and probes it). A legacy real-directory
+  venv moves aside to `venv.legacy` first, so a migration has a gap of two renames, not a rebuild.
+  Every `venv.*` the link does not point at is removed only after the restarted broker answers
+  `/health`; a failed install keeps the old venv for a rollback. Reason: until the restart, the
+  running broker resolves tt-smi (every reset rung), its lazy imports and its stdio adapters through
+  `$R/venv`. Removing it for the minute a rebuild takes left every reset rung unable to run in that
+  window. Autoupdate does not run the installer; it pip-installs into the venv `$R/venv` resolves to.
+
+- **I27 — A validator repair never removes the prefix `current` points at.** Each pin has two build
+  slots, `validator/<sha>` and `validator/<sha>.build`, and a build runs only in the slot `current`
+  does not point at, then flips `current` to it (I14). A validator tree is not relocatable (its
+  RPATH and runtime root are absolute paths into the tree), so the slot is its final path. A run
+  that finds a complete slot `current` does not point at flips to it; one that finds the live slot
+  complete changes nothing, so the link's own mtime stays the time of its last real flip. The other
+  same-pin slot is removed only once `current` has pointed at the live one for an hour, far longer
+  than any fabric check. apply-host-config counts either slot as built. Reason: a same-pin repair
+  used to wipe and rebuild the live prefix, so every fabric check in the tens of minutes of the
+  build ran a missing validator and returned 77. The live slot is found by resolved path (the
+  link's target and both slots canonicalized), never by the link's text, so a root spelled
+  differently from the run that wrote `current` (a trailing slash, a symlinked parent) still finds
+  it. A `current` that exists but cannot be resolved, or that resolves into the chosen build slot,
+  stops the run with an error rather than building there.
 ## Interfaces
 
 **`/etc/default/tt-device-broker`** — written by the installer, sourced by `apply-host-config.sh`,
@@ -315,9 +344,9 @@ path resolves `command -v tt-device-mcp`, then the broker venv, then the per-use
 
 **Staged copies under `$TTDEV_ROOT`** (`/opt/tt-device-broker`): `reconcile.sh`,
 `autoupdate.sh`, `client-setup.sh`, `fabric-check.sh`, `eth-heartbeat-probe.py`,
-`install-fabric-validator.sh`, `fabric-validator.pin`, `installed.sha`, `wheel/`, `venv/`,
-`eth-venv/` (pinned `tt-exalens` interpreter for the heartbeat probe), `validator/<sha>/` +
-`validator/current`, `slurm/prolog.sh` + `slurm/epilog.sh` (staged by BOTH
+`install-fabric-validator.sh`, `fabric-validator.pin`, `installed.sha`, `wheel/`, `venv` (a
+symlink to `venv.<short-sha>.<random>/`, I26), `eth-venv/` (pinned `tt-exalens` interpreter for the
+heartbeat probe), `validator/<sha>/` and `validator/<sha>.build/` (I27) + `validator/current`, `slurm/prolog.sh` + `slurm/epilog.sh` (staged by BOTH
 `install-tt-device-broker.sh` and `apply-host-config.sh`, like `fabric-check.sh` above — the
 first install and every subsequent auto-update both refresh them, since auto-update never
 re-runs the installer, only `apply-host-config.sh`).
@@ -329,9 +358,9 @@ explicitly; then `exec` the mode's installer. The per-user installer gets the re
 as `$1`. Root running the per-user shape on a systemd host is allowed with a note.
 
 **System install flow (`install-tt-device-broker.sh`), in order.** (1) Root check. (2) Venv
-rebuild: `rm -rf $R/venv`, fresh venv, pip-install this tree, stage the wheel, `chmod -R a+rX`.
-The removal happens while any previous broker is still running; live stdio adapters exec out of
-that venv, so an adapter alive across the rebuild is executing a path that no longer exists. (3) `/usr/local/bin/tt-device-mcp` symlink into
+build (I26): a new versioned venv beside the live one, pip-install this tree, verify it, stage the
+wheel, `chmod -R a+rX`. The live `$R/venv` is untouched until the flip, which comes right before
+apply-host-config; the old venv is pruned once the restarted broker answers `/health`. (3) `/usr/local/bin/tt-device-mcp` symlink into
 the venv. (4) Lock policy: cooperative by default; `TTDEV_LOCK=1` opts in, applied only *after*
 the broker is up via `tt-device-mcp lock` (self-checks and reverts); `TTDEV_NO_LOCK=1` forces
 cooperative (back-compat). (5) Machine detection: `tt-smi -s` board_type containing "galaxy" (or
@@ -419,9 +448,10 @@ self-update, no lock — the operator owns the box.
 
 **Validator build/pin flow (`install-fabric-validator.sh`).** flock-serialized (concurrent
 tt-metal builds corrupt a tree; the timer refires long before a build ends). If all three pinned
-binaries exist for the SHA: re-assert the `current` symlink and exit (idempotent — the timer polls
-freely; checking all three is what keeps a pre-dispatch-probe host from reporting "already built"
-forever). Otherwise: shallow-fetch the exact SHA, verify the pinned toolchain and its compilers
+binaries exist in a slot for the SHA (I27): flip `current` to it if it is not already live, prune the
+other slot once the live one is an hour old, and exit (idempotent — the timer polls freely; checking
+all three is what keeps a pre-dispatch-probe host from reporting "already built" forever).
+Otherwise, in the slot `current` does not point at: shallow-fetch the exact SHA, verify the pinned toolchain and its compilers
 exist by name, configure from scratch (build dir *and* CPM cache — an interrupted download
 poisons the cache reproducibly), require ninja, build only the three named targets, verify each
 binary, flip `current` atomically (I14). Consumption (`fabric-check.sh`, the 0/77/UNHEALTHY
@@ -558,6 +588,8 @@ script exists, the claim stands on the script (listed below).
 | I4 (sudoers visudo fail-closed, removed first) | `tests/test_deploy_sudoers_failclosed.py::test_invalid_shipped_sudoers_aborts`, `tests/test_deploy_sudoers_failclosed.py::test_invalid_shipped_sudoers_is_removed_before_aborting` |
 | I5/I6 (timers enabled AND verified active) | `tests/test_deploy_timer_enable_failclosed.py::test_reconcile_timer_enable_is_verified`, `tests/test_deploy_timer_enable_failclosed.py::test_fabric_validator_timer_enable_is_verified`, `tests/test_deploy_timer_enable_failclosed.py::test_is_active_check_follows_the_enable` |
 | I25 (validator built before the broker's first start) | `tests/test_deploy_validator_before_broker.py::test_validator_build_runs_before_the_broker_starts`, `tests/test_deploy_validator_before_broker.py::test_validator_build_is_blocking_and_failclosed`, `tests/test_deploy_validator_before_broker.py::test_incomplete_build_fails_the_install`, `tests/test_deploy_validator_before_broker.py::test_built_check_covers_all_three_pinned_binaries` |
+| I26 (live venv never removed: versioned venv built and verified beside it, one-rename flip before apply-host-config, prune after /health) | `tests/test_deploy_install_live_swap.py::test_installer_venv_step_never_removes_the_live_venv`, `tests/test_deploy_install_live_swap.py::test_fresh_install_builds_verifies_and_links_a_versioned_venv`, `tests/test_deploy_install_live_swap.py::test_upgrade_keeps_the_live_venv_until_prune`, `tests/test_deploy_install_live_swap.py::test_reinstall_of_the_same_commit_never_builds_over_the_live_venv`, `tests/test_deploy_install_live_swap.py::test_a_venv_that_fails_verification_is_discarded_and_the_live_one_kept`, `tests/test_deploy_install_live_swap.py::test_migration_from_a_real_dir_venv_has_only_the_two_rename_gap`, `tests/test_deploy_install_live_swap.py::test_installer_flips_before_host_config_and_prunes_after_health` |
+| I27 (validator repair builds in the slot `current` does not point at; stale slot pruned after an hour) | `tests/test_deploy_install_live_swap.py::test_validator_fresh_build_publishes_current`, `tests/test_deploy_install_live_swap.py::test_validator_upgrade_keeps_the_old_pin_live_until_the_flip`, `tests/test_deploy_install_live_swap.py::test_validator_same_pin_repair_builds_beside_the_live_prefix`, `tests/test_deploy_install_live_swap.py::test_validator_second_repair_returns_to_the_first_slot`, `tests/test_deploy_install_live_swap.py::test_validator_already_built_pin_does_not_refresh_the_link`, `tests/test_deploy_install_live_swap.py::test_validator_repair_with_trailing_slash_root_builds_beside_the_live_prefix`, `tests/test_deploy_install_live_swap.py::test_validator_repair_with_symlinked_parent_root_builds_beside_the_live_prefix`, `tests/test_deploy_install_live_swap.py::test_validator_refuses_when_current_resolves_inside_the_build_slot`, `tests/test_deploy_install_live_swap.py::test_host_config_counts_either_build_slot_as_built` |
 | I7 (device-op bar unconditional, separate from the I24 busy gate; the job-cap bound never lifts it) | `tests/test_deploy_autoupdate_idle_gate.py::test_an_in_flight_device_op_still_bars_the_update`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_holds_a_drained_apply`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_still_bars_the_restart_past_the_cap`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_at_the_restart_point_blocks_the_restart` |
 | I8 (autoupdate required stages fail-closed; apply precedes installed.sha; staged sources exist) | `tests/test_deploy_required_install_failclosed.py::test_autoupdate_required_stages_fail_closed`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_host_config_apply_fails_closed`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_host_config_apply_precedes_installed_sha`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_staged_sources_exist_in_deploy` |
 | Installer staging split (fabric fatal; heartbeat loud-not-fatal) | `tests/test_deploy_required_install_failclosed.py::test_installer_fabric_check_stage_is_fatal_not_swallowed`, `tests/test_deploy_required_install_failclosed.py::test_installer_eth_heartbeat_stage_is_loud_but_not_fatal` |

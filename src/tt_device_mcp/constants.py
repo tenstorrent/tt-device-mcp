@@ -139,6 +139,9 @@ STAGE_BRIDGE_RESET = "bridge_reset"
 STAGE_SMI_RESET = "smi_reset"
 STAGE_POWER_CYCLE = "power_cycle"
 STAGE_NAMES = (STAGE_BRIDGE_RESET, STAGE_SMI_RESET, STAGE_POWER_CYCLE)
+# Spec 04 I90: every reset step (bridge, glx_reset, the AICLK re-apply) narrates its device-op
+# detail with this prefix, and /status reads it as a reset in progress.
+DEVICE_RESET_DETAIL_PREFIX = "device reset:"
 
 # A Slurm prologue/epilogue must always return a verdict rather than hang until the site's
 # PrologEpilogTimeout kills the script — a kill drains the node with nothing said about what was

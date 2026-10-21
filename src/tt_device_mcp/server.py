@@ -55,6 +55,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from tt_device_mcp import __version__, aio, alert, device_activity, metrics, privileges, telemetry
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
+    DEVICE_RESET_DETAIL_PREFIX,
     FABRIC_CHECK_CANNOT_CHECK_RC,
     FABRIC_CHECK_TIMEOUT_SEC,
     GRACEFUL_KILL_GRACE_SEC,
@@ -211,6 +212,9 @@ MAX_TIMEOUT_SEC = 1500  # 25 minutes
 # it is bounded far tighter than a queued job: a triage that cannot answer in this many seconds
 # is wedged itself, and letting it run unbounded adds a second stuck process to the mesh.
 EXEC_MAX_TIMEOUT_SEC = 600
+# Most lines a job-logs call returns (spec 02 I2): held in _get_job_logs, so the REST route the
+# CLI uses gets the same cap as the MCP tool's schema.
+MAX_LOG_TAIL_LINES = 10000
 
 # In-memory job output is a bounded tail (the log file is the complete record).
 # Unbounded accumulation of a chatty job's output would starve the event loop:
@@ -410,7 +414,7 @@ class JobLogsInput(JobIdInput):
     tail: int = Field(
         100,
         ge=1,
-        le=10000,
+        le=MAX_LOG_TAIL_LINES,
         description="Number of lines to return from end of log file. Default: 100.",
     )
 
@@ -1072,6 +1076,9 @@ _host_action_suppressed_logged: "Optional[tuple[str, float]]" = None
 # kills the running job, the job dies mid-CCL, and that death then reads as evidence the
 # device needs resetting — by the reset that caused it. The set is drained as each is seen.
 reset_killed_job_ids: set = set()
+# Spec 01 I70: why recovery killed each of those jobs, as _mark_job_device_fault_failed was told.
+# The runner reads it when the job's exit turns it terminal, then drops it.
+reset_killed_causes: dict = {}
 # Spec 03 I69: running jobs a requested kill stopped (tt_device_job_kill, the REST kill, a job_run
 # whose client went away). The runner reads it when the job ends, then drops the id.
 request_killed_job_ids: set = set()
@@ -2666,6 +2673,7 @@ def _reset_for_testing():
     request_killed_job_ids.clear()
     reset_killed_job_ids.clear()
     preempt_forced_job_ids.clear()
+    reset_killed_causes.clear()
     _hold_episode_restorable = True
     _hold_episode_tenant = False
     _hold_carry = None
@@ -2701,6 +2709,7 @@ def _reset_for_testing():
     reset_killed_job_ids.clear()
     preempt_forced_job_ids.clear()
     _client_gone_kills.clear()
+    reset_killed_causes.clear()
     exec_scope_seq = 0
     _idle_holders.clear()
     _idle_holder_task = None
@@ -2929,6 +2938,19 @@ def write_job_log_footer(job_log_file: Path, job: Job):
         if job.idle_total_sec is not None:
             f.write(f"DEVICE IDLE: {job.idle_total_sec:.1f}s\n")
         f.write("=" * 70 + "\n")
+
+
+# The line a queued job's log gets when it is cancelled before it started (spec 01 I69).
+CANCELLED_QUEUED_MARKER = "[CANCELLED before it started]"
+
+
+def write_cancelled_job_log_footer(job_log_file: Path, job: Job, requested_by: str) -> None:
+    """End a job cancelled while queued with the same footer every finished job gets, STATUS:
+    killed (its JobStatus, as the job-status API and the outcome metric report it), after a
+    marker naming who cancelled it, so the recent list and the log say what the API says."""
+    with open(job_log_file, "a") as f:
+        f.write(f"{CANCELLED_QUEUED_MARKER} cancelled by {requested_by}\n")
+    write_job_log_footer(job_log_file, job)
 
 
 def seed_job_counter() -> None:
@@ -6622,7 +6644,10 @@ async def device_health_gate(
         # Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, paid here with no
         # pre-reset fabric pass or eth read: the full check after the reset runs both. A spent latch,
         # the outage hold or a cooldown clears the debt and keeps today's path (the dirty exit's pass).
-        kill_debt = _kill_reset_debt() if with_recover and phase == "post-job" else ""
+        # The startup gate pays a debt it finds the same way (I74): a re-adopted job the broker stopped
+        # before it ran. Its one full check, fabric included, then follows the reset instead of a pass
+        # before it, and the post-job gate owes nothing after. A debt owed after this gate stays open.
+        kill_debt = _kill_reset_debt() if with_recover and phase in ("post-job", "startup") else ""
         if kill_debt:
             refused = (
                 "this hold episode's present-mesh reset is spent"
@@ -10663,6 +10688,8 @@ def _get_queue_status() -> dict:
     # a reader takes `started_at` as the runtime of whatever `command` says, so the two
     # must measure the same thing. `op_started_at` carries the whole-op hold for anyone
     # who wants the total — which is a real question, just not the one the label asks.
+    # Spec 04 I90: a reset step (bridge, glx_reset, AICLK) is running, as a field, not row text.
+    resetting = bool(device_op_active) and device_op_detail.startswith(DEVICE_RESET_DETAIL_PREFIX)
     if device_op_active:
         stage = f"{device_op_active}: {device_op_detail}" if device_op_detail else device_op_active
         rows.insert(
@@ -10675,6 +10702,7 @@ def _get_queue_status() -> dict:
                 "started_at": device_op_stage_started_at or device_op_started_at or None,
                 "op": device_op_active,
                 "op_started_at": device_op_started_at or None,
+                "resetting": resetting,
             },
         )
 
@@ -10745,6 +10773,7 @@ def _get_queue_status() -> dict:
             for i, j in enumerate(queued)
         ],
         "device_busy": bool(rows),
+        "device_resetting": resetting,
         "device_degraded": degraded,
         # Spec 03 I76: a startup hold behind a live re-adopted job, told apart from a fault; else null.
         "startup_verify": startup_verify,
@@ -10754,6 +10783,17 @@ def _get_queue_status() -> dict:
         # that wants the fact without parsing a row's `command` string.
         "external_step_active": external_step_active,
     }
+
+
+def _label_recovery_killed(rec: dict) -> None:
+    """A recent-list record whose log carries a recovery or reset kill line: the broker's kill."""
+    reset = rec.get("recovery_killed") == "reset"
+    rec["status"] = "broker-kill"
+    if not rec.get("cause"):
+        rec["cause"] = "killed by a forced device reset" if reset else "killed by device recovery: a chip left PCIe bus"
+    if not (rec.get("command") or "").startswith("[MCP killed"):
+        tag = "[MCP killed: device reset]" if reset else "[MCP killed: chips left PCIe]"
+        rec["command"] = f"{tag} {rec.get('command') or ''}"
 
 
 def _recent_jobs(limit: int = 20) -> list[dict]:
@@ -10813,9 +10853,15 @@ def _recent_jobs(limit: int = 20) -> list[dict]:
                 rec[HEADER_FIELDS[key.strip()]] = val.strip()
         rec.update(_parse_job_log_footer(tail))
         for line in tail:
-            if "[KILLED by device recovery]" in line:
-                rec["recovery_killed"] = True
-                msg = line.partition("[KILLED by device recovery]")[2].strip()
+            # Only a log that never started: a running job may print anything, the marker too.
+            if not started_at and line.startswith(CANCELLED_QUEUED_MARKER):
+                rec["cancelled_queued"] = True
+                rec["cause"] = f"{line.strip()}: it never ran"
+                break
+            marker = next((m for m in (RECOVERY_KILL_MARKER, RESET_KILL_MARKER) if m in line), None)
+            if marker:
+                rec["recovery_killed"] = "reset" if marker == RESET_KILL_MARKER else "recovery"
+                msg = line.partition(marker)[2].strip()
                 if msg:
                     rec["cause"] = msg
                 break
@@ -10833,11 +10879,9 @@ def _recent_jobs(limit: int = 20) -> list[dict]:
         # Footer present => finished; trust the recorded status/wait/runtime.
         if rec["status"] is not None:
             if rec.get("recovery_killed"):
-                rec["status"] = "broker-kill"
-                if not rec.get("cause"):
-                    rec["cause"] = "killed by device recovery: a chip left PCIe bus"
-                if not (rec.get("command") or "").startswith("[MCP killed"):
-                    rec["command"] = f"[MCP killed: chips left PCIe] {rec.get('command') or ''}"
+                _label_recovery_killed(rec)
+            elif rec.get("cancelled_queued"):
+                rec["wait"] = "-"  # nothing waited on the device: it left the queue unrun
             elif rec["status"] == "started" and _hold_row is not None and rec["job_id"] == _hold_row["id"]:
                 rec["runtime"] = _span_str(_hold_row["started_at"], now)
             elif rec.get("owner") == "[broker]hold" and rec["status"] == "completed":
@@ -10856,6 +10900,18 @@ def _recent_jobs(limit: int = 20) -> list[dict]:
         elif job is not None and job.status == JobStatus.QUEUED:
             rec["status"] = "queued"
             rec["wait"] = _span_str(job.queued_at or rec["queued_at"], now)  # waiting up to now
+        elif job is not None and started_at and (not job.log_file or Path(job.log_file) == f):
+            # Spec 01 I70: terminal in memory, footer not yet written (the scope stop and sweep run
+            # between the two). Say what the broker decided, never "interrupted".
+            start = job.started_at or started_at
+            rec["status"] = job.status.value
+            rec["exit_code"] = job.exit_code
+            rec["started_at"] = start
+            rec["finished_at"] = job.finished_at
+            rec["runtime"] = _span_str(start, job.finished_at or now)
+            rec["wait"] = _span_str(job.queued_at or rec["queued_at"], start)
+            if rec.get("recovery_killed"):
+                _label_recovery_killed(rec)
         elif _action_row is not None and rec["job_id"] == _action_row["id"]:
             rec["status"] = "running"
             rec["started_at"] = _action_row["started_at"]
@@ -11397,9 +11453,17 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
         job = jobs.get(job_id)
         if job is not None:
             rc = await asyncio.to_thread(read_job_exit_code, job_id, job.started_at, job.peer_uid)
+            job_log = Path(job.log_file) if job.log_file else None
+            recovery_noted = False
             async with get_lock():
                 if job.status == JobStatus.RUNNING:
-                    if timed_out:
+                    if job_id in reset_killed_job_ids:
+                        # Spec 01 I70: recovery killed it (a dead-chip holder-kill, say). Its cause,
+                        # not "the broker restarted", and KILLED, never the FAILED of a lost exit.
+                        job.exit_code = rc
+                        job.error, _ = _finalize_recovery_kill(job, job_log)
+                        recovery_noted = True
+                    elif timed_out:
                         job.status = JobStatus.TIMEOUT
                         job.error = (job.error or "") + (
                             f"\n[TIMEOUT after {job.timeout_sec}s] (re-adopted across a broker restart)"
@@ -11430,18 +11494,19 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
             # behind it is dispatched onto the wedge. Mirror the normal clean gate: the runtime
             # naming a fault is the strongest evidence and is independent of exit code (a wedge
             # rides out on exit 0), so scan the log first, then fall back to a wedge-risk exit.
-            job_log = Path(job.log_file) if job.log_file else None
             fault = _scan_output_for_device_fault(job_log)
             reset_killed = job_id in reset_killed_job_ids
             reset_killed_job_ids.discard(job_id)
+            reset_killed_causes.pop(job_id, None)
             if fault:
                 _mark_device_reported_fault(f"re-adopted job {job_id} {fault}", job=job)
             elif reset_killed:
                 # A forced reset stopped it (#5): the kill is the reset's own, not evidence for another.
-                if job_log:
+                # Its line names the reset (spec 01 I70), whatever else the job's error holds.
+                if job_log and not recovery_noted:
                     try:
                         with open(job_log, "a") as f:
-                            f.write(f"\n[KILLED by device reset] {job.error}\n")
+                            f.write(f"\n{RESET_KILL_MARKER} {READOPTED_RESET_KILLED_ERROR}\n")
                     except OSError:
                         pass
             elif _is_wedge_risk_exit(job.status, job.exit_code) or (rc is None and job.status == JobStatus.FAILED):
@@ -11454,8 +11519,9 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                 )
             # Spec 03 I69: a re-adopted job the broker stopped (its timeout, a requested kill, or a
             # preemption kill) owes the same one reset + full check as one the runner
-            # stopped. This path has no post-job gate: the I68 idle gate pays it on an idle queue, the
-            # runner's door before a waiting job.
+            # stopped. This path has no post-job gate: the startup gate pays it when it is still open
+            # there (I74), else the I68 idle gate on an idle queue or the runner's door before a
+            # waiting job.
             if not fault and not reset_killed and (timed_out or request_killed or preempt_forced):
                 _owe_kill_reset(f"re-adopted job {job_id} {job.status.value}")
             if job.log_file:
@@ -12020,17 +12086,28 @@ async def _job_runner_loop():
             readmit = job_id
             continue
 
-        # Update job state under lock
+        # Update job state under lock. Check KILLED again inside it: a kill queued on the lock
+        # ahead of us cancels the job and replies "cancelled" before we get it, and RUNNING
+        # must not overwrite that.
         async with get_lock():
-            job.status = JobStatus.RUNNING
-            job.started_at = datetime.now().isoformat()
-            _note_hold_carry_job("start")  # spec 04 I82
-            if job.verification:
-                job.reset_clock_at_start = recovery_mechanism.last_reset_monotonic
-            _update_queue_depth_metric()
-            # Track device became busy
-            if stats:
-                stats.update_device_state(now_busy=True)
+            killed_while_waiting = job.status == JobStatus.KILLED
+            if not killed_while_waiting:
+                job.status = JobStatus.RUNNING
+                job.started_at = datetime.now().isoformat()
+                _note_hold_carry_job("start")  # spec 04 I82
+                if job.verification:
+                    job.reset_clock_at_start = recovery_mechanism.last_reset_monotonic
+                _update_queue_depth_metric()
+                # Track device became busy
+                if stats:
+                    stats.update_device_state(now_busy=True)
+        if killed_while_waiting:
+            if logger:
+                logger.info(f"JOB_RUNNER skipping job_id={job_id}, cancelled while waiting for the lock")
+            _forget_queued_job(job_id)
+            await cleanup_finished_jobs()
+            get_job_queue().task_done()
+            continue
 
         # The sampler runs continuously; this only drops the idle samples from before the
         # job, so an incident's trace is the run-up to THIS job and not the hour before it.
@@ -12039,6 +12116,7 @@ async def _job_runner_loop():
         cancelled = False  # set if the broker is shutting down (don't kill the job)
         terminal_note = ""  # timeout/exception marker, appended to error at the end
         runner_error = False  # the broker, not the job, ended it: never a no-op failure (03 I36)
+        exit_status = None  # spec 01 I70: the status the exit gave a job recovery then marked KILLED
         privsep_prefix = None  # set below; read by the finally even when setup raised first
         proc = None
         watchdog = None
@@ -12411,6 +12489,12 @@ export {JOB_TAG_ENV}={job_tag}
                         job.status = JobStatus.COMPLETED if job.exit_code == 0 else JobStatus.FAILED
                         # Spec 01 I20: it saw the waiter and ended itself inside the minute.
                         job.preempt_yielded = job.preemptable and _preempt_contended(limit_end)
+                # Spec 01 I70: a job recovery killed turns KILLED with its cause in the same step, the
+                # log line first; a reader never sees it FAILED, or with its stderr as the cause.
+                if job_id in reset_killed_job_ids:
+                    exit_status = job.status
+                    job.error, recovery_note = _finalize_recovery_kill(job, job_log_file)
+                    terminal_note = f"\n{recovery_note}"
 
             if logger:
                 logger.info(
@@ -12511,7 +12595,8 @@ export {JOB_TAG_ENV}={job_tag}
                         await _stop_job_scope(
                             job_id,
                             job_log_file,
-                            interrupted=job.status in (JobStatus.KILLED, JobStatus.HUNG, JobStatus.PREEMPTED),
+                            interrupted=(exit_status or job.status)
+                            in (JobStatus.KILLED, JobStatus.HUNG, JobStatus.PREEMPTED),
                         )
                     except Exception as e:
                         if logger:
@@ -12595,30 +12680,19 @@ export {JOB_TAG_ENV}={job_tag}
                     _note_hold_carry_job("end", ok=True)  # spec 04 I82: the release was right
                 if fault:
                     _mark_device_reported_fault(f"job {job_id} {fault}", job=job)
-                elif job_id in reset_killed_job_ids:
+                elif killed_by_reset:
                     # This job's death is OURS — a reset/recovery SIGKILLed it to take the device
                     # (most often a chip off the bus whose mapping would hang the host). Treating it
                     # as evidence the mesh needs a reset makes the reset its own justification, and
                     # the operator's one reset becomes two. Every extra reset of 32 ASICs is another
                     # chance to drop a marginal chip.
-                    reset_killed_job_ids.discard(job_id)
                     # Say so on the JOB: a bare signal exit reads to the submitter as their own code
                     # crashing. Name the real cause so they resubmit rather than debug a phantom.
-                    async with get_lock():
-                        job.status = JobStatus.KILLED
-                        if not job.error:
-                            job.error = (
-                                "killed by device recovery: the broker SIGKILLed this job to "
-                                "reset/reboot the device after a wedge (e.g. a chip left the "
-                                "PCIe bus). It did not crash on its own — resubmit once the "
-                                "device is healthy."
-                            )
-                    if job_log_file:
-                        try:
-                            with open(job_log_file, "a") as f:
-                                f.write(f"\n[KILLED by device recovery] {job.error}\n")
-                        except OSError:
-                            pass
+                    # The normal exit already did (spec 01 I70); a timeout or runner-error end did not.
+                    if exit_status is None:
+                        async with get_lock():
+                            cause, recovery_note = _finalize_recovery_kill(job, job_log_file)
+                            job.error = f"{job.error}\n{recovery_note}" if job.error else cause
                     if logger:
                         logger.info(
                             f"CLEAN-GATE job {job_id} was killed by device recovery; not "
@@ -12630,6 +12704,11 @@ export {JOB_TAG_ENV}={job_tag}
                         + (f" (exit {job.exit_code})" if job.exit_code is not None else ""),
                         job=job,
                     )
+                # Spec 01 I70: every branch drops the marker, the fault branch too. Ids recycle
+                # (001-999): a leftover one would end a later job with this id KILLED by recovery and
+                # excuse it from the reset it owes (03 I69).
+                reset_killed_job_ids.discard(job_id)
+                reset_killed_causes.pop(job_id, None)
                 # Spec 03 I69: a job the broker stopped mid-run (its timeout, the hung/doomed reaper,
                 # a requested kill, or a preemption kill) can leave the mesh wedged in a way the passive checks pass and the next job's
                 # dispatch hangs on. The next post-job gate pays one reset, then the full check.
@@ -12862,6 +12941,7 @@ def _mark_job_device_fault_failed(job_id: str, reason: str) -> None:
     if not job_id:
         return
     reset_killed_job_ids.add(job_id)
+    reset_killed_causes[job_id] = reason
     path = _device_fault_failed_path(job_id)
     if not path:
         return
@@ -12873,6 +12953,37 @@ def _mark_job_device_fault_failed(job_id: str, reason: str) -> None:
     except (OSError, TypeError, ValueError) as e:
         if logger:
             logger.warning(f"could not persist device-fault-failed job_id={job_id}: {e}")
+
+
+RECOVERY_KILL_MARKER = "[KILLED by device recovery]"
+RESET_KILL_MARKER = "[KILLED by device reset]"
+
+
+def _recovery_kill_cause(job_id: str) -> str:
+    """The cause a recovery-killed job reports: why recovery killed it, never the job's own stderr."""
+    reason = reset_killed_causes.pop(job_id, "") or "a wedge, e.g. a chip left the PCIe bus"
+    reason = reason.removeprefix("device recovery kill: ")
+    return (
+        f"killed by device recovery ({reason}): the broker SIGKILLed this job to reset/reboot the "
+        "device. It did not crash on its own — resubmit once the device is healthy."
+    )
+
+
+def _finalize_recovery_kill(job: "Job", log_file) -> tuple[str, str]:
+    """Spec 01 I70: end a recovery-killed job as KILLED with its cause, the log line written first.
+
+    Synchronous, so the caller makes the status change and this in one step, under `get_lock()`: no
+    reader sees the job terminal without its cause. Returns the cause and the log line."""
+    cause = _recovery_kill_cause(job.id)
+    note = f"{RECOVERY_KILL_MARKER} {cause}"
+    if log_file:
+        try:
+            with open(log_file, "a") as f:
+                f.write(f"\n{note}\n")
+        except OSError:
+            pass
+    job.status = JobStatus.KILLED
+    return cause, note
 
 
 def _clear_device_fault_failed(job_id: str) -> None:
@@ -14204,6 +14315,11 @@ def create_mcp_server() -> MCPServer:
             return {"error": "Job not found"}
 
         job = jobs[job_id]
+        # The REST route passes `tail` through raw: clamp it here, as the tool's schema does.
+        try:
+            tail = max(1, min(int(tail), MAX_LOG_TAIL_LINES))
+        except (TypeError, ValueError):
+            tail = 100
         content = ""
         if job.log_file and os.path.exists(job.log_file):
             with open(job.log_file, "r") as f:
@@ -14268,6 +14384,14 @@ def create_mcp_server() -> MCPServer:
         if logger:
             logger.info(f"KILL job_id={job_id} ({action}) requested by {caller_owner} " f"— job owner {job.owner}")
         health_event("job_killed", job_id=job_id, action=action, requested_by=caller_owner, job_owner=job.owner)
+
+        if action == "cancelled" and job.log_file:
+            # No runner ever picks this job up, so nothing else writes its footer: without one the
+            # recent list could only guess from a log ending at "[Waiting to start...]" (spec 01 I69).
+            try:
+                write_cancelled_job_log_footer(Path(job.log_file), job, caller_owner)
+            except OSError:
+                pass
 
         if terminate is not None:
             # Outside the lock so the job can release the device before SIGKILL.

@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import signal
+from pathlib import Path
 
 import httpx2
 import pytest
@@ -108,6 +109,53 @@ async def test_no_debt_without_a_kill_keeps_todays_path(mesh):  # noqa: F811
     await _gate()
     assert "kill_mesh_reset" not in mesh["events"]
     assert mesh["fabric"] and mesh["fabric"][0] == 0, "a plain dirty exit keeps its pre-reset fabric pass"
+
+
+# ---------------------------------------------------------------- spec 03 I74: the startup gate pays
+
+
+async def _startup_gate(**kw):
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True, **kw)
+
+
+@pytest.mark.asyncio
+async def test_the_startup_gate_pays_an_open_debt_with_one_full_check(killed):
+    """A re-adopted job the broker stopped before the startup check: one reset, then the one full
+    check, fabric included, before release; no pass before the reset and no second gate after."""
+    await _startup_gate()
+    assert killed["resets"] == [["tt-smi", "-glx_reset"]], "one present-mesh reset"
+    assert killed["fabric"] == [1], "one fabric pass, after the reset; none before it"
+    assert killed["events"].count("kill_mesh_reset") == 1
+    assert srv.fsm.state is ServerState.HEALTHY, "the full check after the reset released it"
+    assert srv._kill_reset_debt() == "", "paid: the runner's door owes nothing after"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_startup_kill_check_stays_held(killed):
+    killed["reset_heals"] = False
+    await _startup_gate()
+    assert len(killed["resets"]) == 1
+    assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
+    assert srv._device_unavailable_for_tenant()
+
+
+@pytest.mark.asyncio
+async def test_the_read_only_startup_probe_leaves_the_debt(killed):
+    await srv._device_health_gate(None, phase="startup", run_fabric=False, with_recover=False)
+    assert killed["resets"] == [] and "kill_mesh_reset" not in killed["events"]
+    assert srv._kill_reset_debt() == "job 7 timeout", "a read-only pass has no rung to pay it with"
+
+
+@pytest.mark.asyncio
+async def test_a_debt_owed_after_the_startup_check_is_paid_by_the_post_job_gate(mesh):  # noqa: F811
+    mesh["eth"] = ADVANCING
+    await _startup_gate()
+    assert mesh["resets"] == [] and mesh["fabric"] == [0], "no debt: the startup pass ran as before"
+    fsm_dirty(srv, "job 8 ended timeout")
+    srv._owe_kill_reset("job 8 timeout")
+    await _gate()
+    assert mesh["resets"] == [["tt-smi", "-glx_reset"]] and mesh["fabric"] == [0, 1]
+    assert srv.fsm.state is ServerState.HEALTHY and srv._kill_reset_debt() == ""
 
 
 _PRESENT = dict(
@@ -286,6 +334,102 @@ async def test_no_debt_for_a_reset_killed_or_completed_job(runner_env):
     assert srv._kill_reset_debt() == "", "a death our own reset caused owes no second reset"
 
 
+@pytest.mark.asyncio
+async def test_a_recovery_kill_is_killed_with_its_cause_before_the_sweep(runner_env, monkeypatch):
+    """Spec 01 I70: by the time the sweep runs (the first await after the exit), the job already
+    reads KILLED with recovery's cause, and its log says so; its stderr is not the cause."""
+    seen = {}
+
+    async def snapshot(job_id, *a, **k):
+        job = srv.jobs[job_id]
+        seen.update(status=job.status, error=job.error, log=Path(job.log_file).read_text())
+        return []
+
+    monkeypatch.setattr(srv, "reap_job_survivors", snapshot)
+    job, runner = await _start("934", "echo own-stderr >&2; sleep 600")
+    job.log_file = str(runner_env["tmp"] / "run_934.log")  # as _queue_job names it; the runner has not run yet
+    try:
+        assert await _until(lambda: job.status is srv.JobStatus.RUNNING and job.pid)
+        assert await _until(lambda: "own-stderr" in Path(job.log_file).read_text())
+        srv._mark_job_device_fault_failed("934", "device recovery kill: chip 3 left the PCIe bus")
+        os.killpg(job.pid, 9)
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert seen["status"] is srv.JobStatus.KILLED, "never FAILED from the signal exit"
+    # The error keeps the job's own output tail; recovery's cause is its last line, not that tail.
+    last = seen["error"].splitlines()[-1]
+    assert last.startswith(srv.RECOVERY_KILL_MARKER) and "chip 3 left the PCIe bus" in last
+    assert "own-stderr" not in last
+    killed_line = next(ln for ln in seen["log"].splitlines() if ln.startswith(srv.RECOVERY_KILL_MARKER))
+    assert "chip 3 left the PCIe bus" in killed_line and "own-stderr" not in killed_line
+    assert job.status is srv.JobStatus.KILLED and "chip 3 left the PCIe bus" in job.error
+    assert "934" not in srv.reset_killed_causes, "the cause is read once"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_cmd", ["exit 1", "true"], ids=["failed", "exit0"])
+async def test_a_recycled_id_after_a_fault_branch_recovery_kill_owes_its_reset(runner_env, monkeypatch, exit_cmd):
+    """Spec 01 I70 / 03 I69: a recovery-killed job whose log names a device fault takes the fault
+    branch, and that branch drops its reset-killed marker and cause too. Ids recycle (001-999): a
+    leftover marker would end the next job with this id KILLED by recovery and excuse it the reset."""
+    monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: {"0": 1350})
+    srv._mark_job_device_fault_failed("951", "device recovery kill: chip 3 left the PCIe bus")
+    job, runner = await _start("951", f"echo 'fabric router sync: timeout'; {exit_cmd}")
+    job.log_file = str(runner_env["tmp"] / "run_951.log")
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.KILLED
+    assert "951" not in srv.reset_killed_job_ids and "951" not in srv.reset_killed_causes
+
+    # The id comes round again: a job that dies with the device open owes the reset (I69).
+    again, runner = await _start("951", "exit 1")
+    again.log_file = str(runner_env["tmp"] / "run_951b.log")
+    try:
+        assert await _until(lambda: _runner_done(again))
+    finally:
+        await _stop(runner)
+    assert again.status is srv.JobStatus.FAILED, "never KILLED by a recovery that was not its own"
+    assert srv.RECOVERY_KILL_MARKER not in (again.error or "")
+    assert srv._kill_reset_debt().startswith("job 951"), "not excused from the reset it owes"
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_killed_job_that_exited_0_is_no_clean_job(runner_env, monkeypatch):
+    """Spec 01 I70 decision: a recovery kill is not a preemption (user rule for a preempted exit 0:
+    I20 only). A recovery-killed job that exited 0 reads KILLED to the post-job notes: failed for the
+    I42/I46 fabric notes, and no proof the last release was right, so the hold carry stays (04 I82).
+    It owes no second reset (recovery's own reset and full check stand) and its marker is dropped."""
+    seen = {}
+
+    def lift(failed, tail):
+        seen["lift"] = failed
+        return None
+
+    def route(failed, tail):
+        seen["route"] = failed
+        return None
+
+    carry = []
+    monkeypatch.setattr(srv.health_monitor, "note_job_after_topology_lift", lift)
+    monkeypatch.setattr(srv.health_monitor, "note_job_fabric_route_fault", route)
+    monkeypatch.setattr(srv, "_note_hold_carry_job", lambda edge, ok=False: carry.append((edge, ok)))
+    srv._mark_job_device_fault_failed("952", "device recovery kill: chip 3 left the PCIe bus")
+    job, runner = await _start("952", "true")
+    job.log_file = str(runner_env["tmp"] / "run_952.log")
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.KILLED and job.exit_code == 0
+    assert seen == {"lift": True, "route": True}, "read as failed by both fabric notes"
+    assert ("end", True) not in carry and ("end", False) in carry, "the carry window stays open"
+    assert srv._kill_reset_debt() == "", "recovery's own reset stands; no second one"
+    assert "952" not in srv.reset_killed_job_ids and "952" not in srv.reset_killed_causes
+
+
 def test_the_test_reset_drops_every_kill_marker(clear_job_state):
     """A runner stopped mid-job can leave its markers behind, and job ids recycle (001-999): a
     leftover reset-killed id would excuse a later test's job from the debt it owes."""
@@ -377,6 +521,66 @@ async def test_a_cancel_while_queued_cancels_the_job(runner_env, monkeypatch):
     job = await _job_run_then_cancel(_params(runner_env["tmp"], "true"), lambda j: True)
     await asyncio.gather(*rec.seen)
     assert job.status is srv.JobStatus.KILLED, "a queued job nobody waits for never runs"
+    assert srv._kill_reset_debt() == "", "a job that never ran owes no reset"
+
+
+class _Statuses(srv.Job):
+    """A Job that records every status it is given."""
+
+    def __setattr__(self, name, value):
+        if name == "status":
+            self.__dict__.setdefault("statuses", []).append(value)
+        super().__setattr__(name, value)
+
+
+@pytest.mark.asyncio
+async def test_a_kill_queued_on_the_lock_ahead_of_the_runner_wins(runner_env, monkeypatch):
+    """Another coroutine holds the lock across an await; a kill queues on it, then the runner does.
+    The kill takes the lock first and cancels the job; the runner must see that under the lock and
+    skip the job, never mark it RUNNING and start it, and go on to the next job."""
+    tmp = runner_env["tmp"]
+    at_door, go = asyncio.Event(), asyncio.Event()
+    real_hold = srv._wait_out_dispatch_hold
+
+    async def _pause_the_first_job(job, job_log_file):
+        if job.id == "941":
+            at_door.set()
+            await go.wait()
+            return False
+        return await real_hold(job, job_log_file)
+
+    monkeypatch.setattr(srv, "_wait_out_dispatch_hold", _pause_the_first_job)
+    common = {"owner": srv.submitting_owner(), "workspace": "/tmp", "queued_at": "t", "timeout_sec": 600}
+    first = _Statuses(id="941", command=f"touch {tmp / 'first-ran'}", **common)
+    second = srv.Job(id="942", command=f"touch {tmp / 'second-ran'}", **common)
+    for job in (first, second):
+        srv.jobs[job.id] = job
+        await srv.get_job_queue().put(job.id)
+    runner = asyncio.create_task(srv.job_runner())
+    lock = srv.get_lock()
+    try:
+        assert await _until(at_door.is_set)
+        await lock.acquire()  # the other coroutine, mid-await
+        try:
+            kill = asyncio.create_task(
+                srv.create_mcp_server().call_tool(
+                    "tt_device_job_kill", {"params": {"job_id": "941", "owner": first.owner}}
+                )
+            )
+            assert await _until(lambda: len(lock._waiters or ()) == 1), "the kill waits on the lock"
+            go.set()
+            assert await _until(lambda: len(lock._waiters or ()) == 2), "the runner waits behind it"
+        finally:
+            lock.release()
+        reply = await asyncio.wait_for(kill, 5)
+        assert await _until(lambda: _runner_done(second)), "the queue moves on to the next job"
+    finally:
+        await _stop(runner)
+    assert "cancelled" in str(reply)
+    assert srv.JobStatus.RUNNING not in first.statuses, "a cancelled job was marked RUNNING"
+    assert first.status is srv.JobStatus.KILLED and first.started_at is None and first.pid is None
+    assert not (tmp / "first-ran").exists(), "a cancelled job's process was started"
+    assert second.status is srv.JobStatus.COMPLETED and (tmp / "second-ran").exists()
     assert srv._kill_reset_debt() == "", "a job that never ran owes no reset"
 
 

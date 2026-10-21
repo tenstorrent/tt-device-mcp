@@ -75,6 +75,7 @@ def test_the_per_test_reset_clears_every_hold_bound_and_escalation_global(monkey
     for name in FRESH_SETS:
         getattr(srv, name).add("job-1")
     srv._idle_holders["1234"] = {"left": "over"}
+    srv.reset_killed_causes["job-1"] = "left over"
     m = srv.recovery_mechanism
     monkeypatch.setattr(m, "_class_a_ladder_anchor", 1.0)
     monkeypatch.setattr(m, "_class_a_ladder_spawned", 1.0)
@@ -85,6 +86,7 @@ def test_the_per_test_reset_clears_every_hold_bound_and_escalation_global(monkey
     assert {name: getattr(srv, name) for name in FRESH} == FRESH
     assert {name: getattr(srv, name) for name in FRESH_SETS} == {name: set() for name in FRESH_SETS}
     assert srv._idle_holders == {}
+    assert srv.reset_killed_causes == {}, "spec 01 I70: a recycled job id never reads another's cause"
     assert (m._class_a_ladder_anchor, m._class_a_ladder_spawned) == (None, None)
     chip_state.reset()
     assert (chip_state._present, chip_state._expected) == (chip_state._sysfs_indices, chip_state._no_baseline)
