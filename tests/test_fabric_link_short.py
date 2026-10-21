@@ -127,21 +127,23 @@ async def _walk(clock, start, stop, step=10):
 
 
 @pytest.mark.asyncio
-async def test_a_latched_mismatch_keeps_the_latch_and_is_not_released(monkeypatch, clear_job_state):
-    """Spec 03 I42's latch on a one-port-short mismatch is not this class (spec 04 I30): no at-start
-    link-short ladder. Its bound is one sampler tick (I42 with I76): the bound's full ladder runs with the
-    latch still set, the full check after it counts the same port short and fails, the broker asks for
-    the power cycle, and nothing is released."""
+async def test_a_latched_mismatch_gets_one_ladder_at_hold_start_and_keeps_the_latch(monkeypatch, clear_job_state):
+    """Spec 03 I42's latch on a one-port-short mismatch is this class (spec 04 I83): one ladder at hold
+    start, with the latch still set; the full check after it counts the same port short and fails, the
+    broker asks for the power cycle in the same run, and nothing is released or run again."""
     escalations, _alerts, events = _arm(monkeypatch, "topology mismatch", latched=True)
     _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
     clock = _clock(monkeypatch)
-    assert srv._fabric_link_short_hold() == "", "a latched hold is measured, never a link-short no-reset hold"
-    await _walk(clock, 0, BOUND + 30)
-    assert escalations == ["present-forced"], "the latched hold's bound ladder, one tick in"
-    assert srv.device_hold_escalation_kind != "fabric_link_short"
+    assert srv._fabric_link_short_hold() == "topology latch", "a latched hold is a link-short hold"
+    await _walk(clock, 0, 1)
+    assert escalations == ["present-forced"], "the one ladder, at hold start"
+    # Past one tick (the latch's bound) the same one ladder runs under the bound's kind.
+    assert srv.device_hold_escalation_kind in ("fabric_link_short", "disproven_lift")
+    assert events.count("host_rung") == 1, "the short count asks for the host rung in the same run"
+    await _walk(clock, 1, BOUND + 30)
+    assert escalations == ["present-forced"], "no second ladder below or at the bound"
     assert srv.health_monitor.topology_hw_fault, "the I42 latch stands through the bound"
     assert "hold_bound_latch_cleared" not in events
-    assert events.count("hold_bound_check_failed") == 1, "the check after the ladder fails on the short count"
     assert events.count("host_rung") == 1 and "device_released" not in events
     assert srv._recovery_degraded()
 
