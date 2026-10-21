@@ -1912,6 +1912,11 @@ class RecoveryMechanism:
         if alert.send_alert(event) is not None or alert.alert_argv() is None:
             self._power_cycle_not_launched_paged = episode
 
+    def power_cycle_not_launched_paged_for(self, episode: str) -> bool:
+        """Whether the I88 not-launched page already went out for hold ``episode``: the caller's own
+        launch-failure page then stays quiet for it, so the episode gets one page (spec 04 I71)."""
+        return self._power_cycle_not_launched_paged == (episode or "")
+
     def _rewrite_ledger_marks(self, marks: dict) -> None:
         """Merge ``marks`` ((boot_id, at_epoch) -> fields) into the matching power-cycle rows on disk
         that are not yet marked as having taken the host down. Raises OSError."""
