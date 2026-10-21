@@ -175,6 +175,39 @@ def job_processes(pid: Optional[int], scope: Optional[str] = None, tag: Optional
     return {p: procs[p] for p in members if p not in exclude and procs[p].state != "Z"}
 
 
+def _read_io_bytes(pid: int) -> Optional[int]:
+    """read_bytes + write_bytes from /proc/<pid>/io: what the process sent to or fetched from
+    storage, page-cache hits excluded. None when the file cannot be read (gone, or not ours)."""
+    try:
+        with open(f"{PROC_DIR}/{pid}/io") as f:
+            fields = dict(line.split(":", 1) for line in f if ":" in line)
+        return int(fields["read_bytes"]) + int(fields["write_bytes"])
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def job_io_bytes(
+    pid: Optional[int], scope: Optional[str] = None, tag: Optional[str] = None
+) -> Optional[dict[tuple[int, str], int]]:
+    """Storage IO bytes of each live process in the job (same membership as ``job_processes``),
+    keyed by (pid, starttime) so a reused pid is a new process. None when no member's counters
+    are readable: the caller then has no IO signal, not an idle job."""
+    out = {}
+    for p, info in job_processes(pid, scope, tag).items():
+        n = _read_io_bytes(p)
+        if n is not None:
+            out[(p, info.starttime)] = n
+    return out or None
+
+
+def io_advanced(prev: Optional[dict], cur: Optional[dict]) -> bool:
+    """True when some process of the job moved storage bytes between two ``job_io_bytes`` samples:
+    a counter that grew, or a process that is new since ``prev`` and has already moved some."""
+    if prev is None or cur is None:
+        return False
+    return any(n > prev.get(key, 0) for key, n in cur.items())
+
+
 def _alive(info: ProcInfo) -> bool:
     now = _read_stat(info.pid)
     # Same pid AND same start time is the same process; a zombie holds no fds.

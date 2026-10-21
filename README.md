@@ -85,6 +85,22 @@ one minute or be killed. The MCP/REST field is `no_timeout_except_on_contention`
 (its earlier name `preemptable` is still accepted); `--preemptable` is a short alias for
 the flag.
 
+### Hung jobs
+
+A running job with no output and no storage IO for 300 s is reaped as `hung`: the broker
+kills its whole process tree, resets the device and runs the full health check, fabric
+included, before the next job starts. Storage IO by the job's processes (bytes read from
+or written to disk) keeps a silent job alive for up to 30 minutes without output; CPU use
+never does, since a process spinning on a hung device looks busy. A job that is silent
+for long stretches by design can set its own limit, from 60 s to 3600 s:
+
+```bash
+tt-device-mcp run-bg --hung-silence 1200 "python convert_weights.py"
+```
+
+The MCP/REST field is `hung_silence_sec`. The job's log notes the silence every minute
+and says whether storage IO is keeping the job alive.
+
 `tt-device-mcp help` lists the rest: `reset`, `exec`, `smi`, `timezone`,
 `lock`/`unlock`.
 

@@ -60,6 +60,18 @@ HOLDER_RELEASE_WAIT_SEC = 30
 # past its time limit, so it is shorter than the ordinary ladder (SIGINT 60 s + SIGTERM 15 s).
 PREEMPT_GRACE_SEC = 60
 
+# A job may ask for its own silence limit at submit (hung_silence_sec), within these bounds. The
+# upper one keeps a wedged job that asked for a long limit from holding the device for more than
+# an hour; the lower one keeps a job from being reaped (and the device reset) on a normal pause.
+HUNG_SILENCE_MIN_SEC = 60
+HUNG_SILENCE_MAX_SEC = 3600
+# Storage IO by the job's processes (read_bytes/write_bytes in /proc/<pid>/io) counts as liveness:
+# a silent job still reading a model or writing a cache is working. CPU time does not count: a
+# tt-metal host process busy-polls a hung device, and counting it would keep exactly the jobs
+# this reaper exists for. IO without output is believed only this long (or the job's own limit,
+# if longer): a job that loops on IO without ever printing is still reaped.
+HUNG_IO_CAP_SEC = 1800
+
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
 # is deliberately never killed, because one stopped partway through 32 ASICs is far worse
