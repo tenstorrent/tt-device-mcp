@@ -414,3 +414,76 @@ def test_a_registered_local_reset_and_its_child_read_as_in_reset(monkeypatch):
     finally:
         prs.forget_reset_pid(51)
     assert not prs._reset_pids
+
+
+# --- a refused reset is not a reset: nothing it would settle is settled ---
+
+
+@pytest.fixture
+def refused_mesh(monkeypatch):
+    """A Galaxy gate pass whose mesh reset the pre-reset scan refuses, with one chip off the bus.
+    Records the journal, the AER mask restores and the off-bus intent's begin and end."""
+    out = {"events": [], "restores": [], "intent": [], "logs": []}
+    g = srv.galaxy_recovery
+
+    async def no_scope(log):
+        return False
+
+    async def refused(argv, log, *a, **k):
+        return None, "reset refused: tenant pid 4202 holds /dev/tenstorrent"
+
+    class _Mask:
+        def restore(self):
+            out["restores"].append(1)
+
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    patch_health_event(monkeypatch, lambda name, **k: out["events"].append(name))
+    monkeypatch.setattr(g.mechanism, "await_foreign_scope", no_scope)
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", refused)
+    monkeypatch.setattr(g.mechanism, "last_reset_monotonic", 123.0)
+    monkeypatch.setattr(g.mechanism, "last_reset_failed", False)
+    monkeypatch.setattr(g.monitor, "expected", lambda n: 4)
+    pg = recovery_pkg.pcie_guard
+    monkeypatch.setattr(pg, "chips_off_bus", lambda expected: 1)
+    monkeypatch.setattr(pg, "host_reset_gate", lambda off_bus: (True, ""))
+    monkeypatch.setattr(pg, "mask_for_mesh_reset", lambda log: _Mask())
+    monkeypatch.setattr(pg, "begin_offbus_reset", lambda kind, n: out["intent"].append(("begin", kind)))
+    monkeypatch.setattr(pg, "end_offbus_reset", lambda: out["intent"].append(("end",)))
+    return out
+
+
+@pytest.mark.asyncio
+async def test_a_refused_mesh_reset_is_journalled_as_refused_and_settles_no_debt(monkeypatch, refused_mesh):
+    """A refusal is no reset: it is logged and journalled as itself (not 'timed out' / reset_failed),
+    the cooldown clock goes back so a kill-reset debt taken before it stays owed, and the AER mask and
+    the off-bus intent are both released. The hold stays for the 10-min ladder."""
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(srv, "_kill_reset_owed", "job 9 killed")
+    monkeypatch.setattr(srv, "_kill_reset_owed_at", 200.0)
+    healthy = await g._reset_and_verify_device(["0", "1", "2", "3"], refused_mesh["logs"].append)
+
+    assert healthy is False
+    assert "reset_refused" in refused_mesh["events"] and "reset_failed" not in refused_mesh["events"]
+    assert any(m.startswith("reset refused:") for m in refused_mesh["logs"])
+    assert not any("timed out" in m for m in refused_mesh["logs"])
+    assert g.mechanism.last_reset_monotonic == 123.0 and g.mechanism.last_reset_failed is False
+    assert srv._kill_reset_debt() == "job 9 killed", "a refused reset settled the kill-reset debt"
+    assert refused_mesh["restores"] == [1], "the AER mask was not restored after a refusal"
+    assert refused_mesh["intent"] == [("begin", "mesh reset"), ("end",)]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_sweep_reset_is_journalled_and_releases_the_aer_mask(monkeypatch, refused_mesh):
+    """The last-chance sweep's mesh reset refused: journalled as refused, the AER mask released, and
+    the sweep still hands back to its caller's verify so a failed one climbs to the host rung."""
+    g = srv.galaxy_recovery
+
+    async def no_sbr(log):
+        return None
+
+    monkeypatch.setattr(g, "_recover_isolated_chips", no_sbr)
+    assert await g._issue_all_resets_back_to_back([4], 4, lambda m: None) is True
+    assert "reset_refused" in refused_mesh["events"]
+    assert "last_chance_reset_sweep_error" not in refused_mesh["events"]
+    assert refused_mesh["restores"] == [1]
+    assert g.mechanism.reset_in_flight is False

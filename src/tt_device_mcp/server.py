@@ -9793,6 +9793,14 @@ async def _escalate_unkillable_leftover() -> None:
             logger.exception("LEFTOVER-HOST-RUNG try failed — retrying next window")
 
 
+async def _reset_in_flight() -> Optional[str]:
+    """Spec 04 I92: why an operator reset must not start, when a reset (ours from before a restart,
+    another broker's, or a local-backend one) is still running. A second reset into a mesh already
+    cycling is the concurrent-reset failure, and the pre-reset scan would read its tt-smi as a reader."""
+    unit = await asyncio.to_thread(recovery_mechanism.scope_active)
+    return f"a reset is already in flight ({unit})" if unit else None
+
+
 async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
     """The broker's pre-reset holder scan (spec 04 I92), run by every reset with the pollers stopped.
 
@@ -14170,6 +14178,7 @@ def create_mcp_server() -> MCPServer:
         output_queue: asyncio.Queue[str] = asyncio.Queue()
         reset_streamed = False
         late_blocker: Optional[dict] = None
+        in_flight: Optional[str] = None
 
         def on_reset_output(chunk: str) -> None:
             nonlocal reset_streamed
@@ -14177,10 +14186,13 @@ def create_mcp_server() -> MCPServer:
             output_queue.put_nowait(chunk)
 
         async def run_reset():
-            nonlocal late_blocker
+            nonlocal late_blocker, in_flight
             async with _device_op("reset", owner=reset_owner):
                 late_blocker = await _reset_recheck_in_op(force, lambda m: output_queue.put_nowait(m + "\n"))
                 if late_blocker:
+                    return None, None, ""
+                in_flight = await _reset_in_flight()
+                if in_flight:
                     return None, None, ""
                 health_event("reset_begin", argv=argv, expected_chips=len(indices))
                 _void_fabric_ok("operator reset")
@@ -14214,6 +14226,12 @@ def create_mcp_server() -> MCPServer:
                 logger.warning(f"reset_stream: busy REFUSED: {_reset_busy_detail(late_blocker)}")
             yield f"busy REFUSED: {_reset_busy_detail(late_blocker)}\n"
             yield f"hint: {RESET_BUSY_HINT.format(force='--force')}\n"
+            yield "::status::refused\n"
+            return
+        if in_flight:
+            if logger:
+                logger.warning(f"reset_stream: REFUSED: {in_flight}")
+            yield f"REFUSED: {in_flight}\n"
             yield "::status::refused\n"
             return
         status = "reset_complete" if rc == 0 else "reset_failed"
@@ -15760,6 +15778,10 @@ def create_mcp_server() -> MCPServer:
                     "steps": steps,
                     "hint": RESET_BUSY_HINT.format(force="force=true"),
                 }
+            in_flight = await _reset_in_flight()
+            if in_flight:
+                step(f"REFUSED: {in_flight}", "warning")
+                return {"status": "refused", "reason": "reset_in_flight", "detail": in_flight, "steps": steps}
             _void_fabric_ok("operator reset")
             rc, reset_out = await recovery_mechanism.reset_with_quiesce(argv, lambda m: step(m), reset_owner)
             status = "reset_complete" if rc == 0 else "reset_failed"

@@ -875,6 +875,7 @@ class Recovery(ABC):
 
         log(f"resetting device: {' '.join(argv)}  ({expected} device(s); ~30-60s, restart-safe)")
         health_event("reset_begin", argv=argv, expected_chips=expected)
+        prior_reset_monotonic = self.mechanism.last_reset_monotonic
         self.mechanism.last_reset_monotonic = time.monotonic()
         pcie_guard.begin_offbus_reset("mesh reset", off_bus)
         aer_mask = pcie_guard.mask_for_mesh_reset(log)
@@ -883,6 +884,16 @@ class Recovery(ABC):
         finally:
             if aer_mask is not None:
                 await asyncio.to_thread(aer_mask.restore)
+        if rc is None and (out or "").startswith("reset refused:"):
+            # Spec 04 I92: the pre-reset scan refused (a tenant, a reader that would not die, an off-bus
+            # chip it could not detach, a reset already in flight). No reset ran, so nothing that a
+            # reset settles is settled: the cooldown clock goes back, a kill-reset debt or a spent
+            # dispatch reset stays owed, and the hold stays for the 10-min ladder (I76).
+            self.mechanism.last_reset_monotonic = prior_reset_monotonic
+            log(out)
+            health_event("reset_refused", argv=argv, detail=out)
+            metrics.stage_fired("smi_reset", "blocked")
+            return False
         self.mechanism.last_reset_rc = rc
         if _journal_cpld_too_old(argv, out, log):
             # Latched on the mechanism both platforms share, so the NEXT rung and every later pass
