@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from tt_device_mcp import aio, alert, metrics, privileges
+from tt_device_mcp import aio, alert, metrics, pre_reset_scan, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
 from tt_device_mcp.health import chip_state
 from tt_device_mcp.health.aiclk_ceiling import CEILING
@@ -30,6 +30,7 @@ from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.monitors.heartbeat import returned_chips
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
+from tt_device_mcp.health.recovery import ipmi_guard
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
 # A daemon without systemd uses the local lock below for the same restart-adoption contract.
@@ -503,9 +504,18 @@ class RecoveryMechanism:
         # 01 I16): a reaped job's process still holding the device, which a reset cannot free.
         # Checked here, where every reset passes, so no caller can reset over one.
         self.reset_fence: Optional[Callable[[], str]] = None
+        # Clears the device of readers right before a reset (spec 04 I92): scans the holders,
+        # SIGTERMs then SIGKILLs every one that is not a tenant, and returns why the reset must not
+        # run ('' when it may): a tenant under an automatic reset, or a reader that would not let
+        # go. The broker sets it; called with (argv, owner, log).
+        self.pre_reset_scan: Optional[Callable[[list, str, Callable[[str], None]], Awaitable[str]]] = None
         # Owes the pollers a step left stopped to the broker's next close to HEALTHY (spec 03 I66,
         # 04 I12); the broker sets it. Called with what the step was.
         self.owe_device_pollers: Optional[Callable[[str], None]] = None
+        # Spec 04 I91: the last mesh reset's BMC preflight refusal or legacy-retimer-reset finding,
+        # shown in /health as mesh_reset_bmc_guard; None when the last mesh reset showed neither.
+        self.bmc_guard_state: Optional[dict] = None
+        self._bmc_guard_paged = False
 
         # Two callers (the auto-recovery reset launcher and the operator-run reset tool) need this
         # sequence and they must build it identically, because the scope name is what every other
@@ -593,6 +603,11 @@ class RecoveryMechanism:
         self.sweep_spent: Optional[tuple] = None
         # The episode whose unforced escalation already climbed past its spent mesh reset (I87).
         self.spent_climb_since: Optional[str] = None
+        # The last Galaxy mesh reset this process launched: {"episode", "started", "ended"} (monotonic
+        # seconds). The last-chance sweep spaces the episode's second from it (spec 04 I93); None until one ran.
+        self.last_mesh_reset_run: Optional[dict] = None
+        # Monotonic time the last reset command this process launched returned (its check not included).
+        self.last_reset_ended_monotonic: float = 0.0
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a
@@ -932,8 +947,14 @@ class RecoveryMechanism:
             # Outlive the broker: without this the scope inherits our death signal.
             "--property=KillMode=mixed",
             "--",
-            *argv,
+            *self._launch_argv(argv),
         ]
+
+    @staticmethod
+    def _launch_argv(argv: list[str]) -> list[str]:
+        """What a reset backend executes for ``argv``: a mesh reset runs under the spec 04 I91 ipmitool
+        guard, so tt-smi's op_mode 0x0 fallback can never reach the BMC; anything else runs as is."""
+        return ipmi_guard.guarded_argv(argv) if ipmi_guard.is_mesh_reset(argv) else list(argv)
 
     async def _run_local_reset(
         self,
@@ -966,7 +987,7 @@ class RecoveryMechanism:
                 return None, text
             output_file = open(output_path, "w+b")
             proc = await asyncio.create_subprocess_exec(
-                *argv,
+                *self._launch_argv(argv),
                 stdout=output_file,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
@@ -976,6 +997,8 @@ class RecoveryMechanism:
             # The child now owns the inherited lock for exactly its lifetime.
             os.close(lock_fd)
             lock_fd = None
+            # Outside a reset scope: the pre-reset scan knows it as a reset by this pid (04 I92).
+            pre_reset_scan.note_reset_pid(proc.pid)
 
             async def wait_and_stream() -> int:
                 with open(output_path, "rb") as reader:
@@ -1024,6 +1047,9 @@ class RecoveryMechanism:
             self._write_action_log(owner, command, dt, "error", None)
             return None, f"reset could not be launched: {exc}"
         finally:
+            # One still running (never finished in time) stays registered, as it keeps the local lock.
+            if proc is not None and proc.returncode is not None:
+                pre_reset_scan.forget_reset_pid(proc.pid)
             if lock_fd is not None:
                 os.close(lock_fd)
             if output_file is not None:
@@ -1149,6 +1175,95 @@ class RecoveryMechanism:
         self._write_action_log(owner, " ".join(argv), dt, "completed" if rc == 0 else "failed", rc)
         return rc, text
 
+    async def bmc_preflight(self) -> str:
+        """Spec 04 I91: '' when the BMC may take a mesh reset, else why not (read-only, bounded)."""
+        return await asyncio.to_thread(ipmi_guard.bmc_preflight)
+
+    async def _mesh_reset_preflight(self, argv: list[str], owner: str, log) -> str:
+        """Run the BMC preflight before a mesh reset. A refusal is a reset that did not fire: journaled,
+        shown in /health, and returned as the reset's text; the caller climbs to its next rung."""
+        try:
+            why = await self.bmc_preflight()
+        except Exception as exc:  # noqa: BLE001 - a preflight that cannot decide does not let the reset run
+            why = f"the BMC preflight raised {exc!r}"
+        if not why:
+            if self.bmc_guard_state and self.bmc_guard_state.get("kind") == "preflight_refused":
+                self.bmc_guard_state = None
+            return ""
+        message = f"mesh reset NOT run: {why} (spec 04 I91: no BMC tray reset without a BMC that can take op_mode 0x3)"
+        log(message)
+        health_event("mesh_reset_bmc_preflight_refused", argv=argv, owner=owner, reason=why)
+        metrics.stage_fired("smi_reset", "blocked")
+        self.bmc_guard_state = {
+            "kind": "preflight_refused",
+            "reason": why,
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+        return message
+
+    def _override_unclassified(self, argv: list[str], owner: str, log) -> str:
+        """Spec 04 I91: a ``TT_DEVICE_MCP_RESET_ARGS`` argv the guard cannot classify does not run.
+
+        Returns the refusal text ('' to go ahead). Like a preflight refusal it is a reset that did not
+        fire: journaled, shown in /health, rc None, and the caller climbs to its next rung."""
+        override = os.environ.get("TT_DEVICE_MCP_RESET_ARGS", "").strip().split()
+        if not override or [str(a) for a in argv] != override:
+            return ""
+        why = ipmi_guard.override_unclassified(argv)
+        if not why:
+            return ""
+        message = f"reset NOT run: {why} (spec 04 I91)"
+        log(message)
+        health_event("reset_override_unclassified", argv=argv, owner=owner, reason=why)
+        metrics.stage_fired("smi_reset", "blocked")
+        self.bmc_guard_state = {
+            "kind": "override_unclassified",
+            "reason": why,
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+        return message
+
+    def _note_bmc_guard_output(self, argv: list[str], owner: str, rc: Optional[int], text: str, log) -> Optional[int]:
+        """Read a mesh reset's output for the guard (spec 04 I91) and return the rc to report.
+
+        A wrapper that could not arm the guard ran no reset: rc None (not fired, no cooldown). A refused
+        0x0, or tt-smi announcing its 0x0 retry, is journaled host_at_risk, paged once per episode,
+        shown in /health, and never reads as a passing reset."""
+        found = ipmi_guard.scan_reset_output(text)
+        if found is None:
+            if rc == 0:
+                self.bmc_guard_state = None
+                self._bmc_guard_paged = False
+            return rc
+        now = datetime.now().isoformat(timespec="seconds")
+        if found["not_armed"] and not (found["refused"] or found["fallback"]):
+            log("mesh reset NOT run: the ipmitool guard could not be armed (spec 04 I91)")
+            health_event("mesh_reset_guard_not_armed", argv=argv, owner=owner, rc=rc)
+            self.bmc_guard_state = {
+                "kind": "guard_not_armed",
+                "reason": "the ipmitool guard could not be armed",
+                "at": now,
+            }
+            return None
+        sent = found["sent"]
+        message = (
+            "tt-smi fell back to the BMC legacy retimer reset (op_mode 0x0) and it may have reached the BMC"
+            if sent
+            else "tt-smi tried the BMC legacy retimer reset (op_mode 0x0) and the guard refused it"
+        )
+        log(f"{message}; the mesh reset did not recover the device (spec 04 I91)")
+        health_event("bmc_legacy_reset_attempted", argv=argv, owner=owner, rc=rc, sent=sent, host_at_risk=True)
+        self.bmc_guard_state = {
+            "kind": "legacy_reset_sent" if sent else "legacy_reset_refused",
+            "reason": message,
+            "at": now,
+        }
+        if not self._bmc_guard_paged:
+            event = {"kind": "bmc_legacy_reset_attempted", "sent": sent, "host_at_risk": True, "message": message}
+            if alert.send_alert(event) is not None or alert.alert_argv() is None:
+                self._bmc_guard_paged = True
+        return 1 if rc == 0 else rc
+
     async def reset_with_quiesce(
         self,
         argv: list[str],
@@ -1172,6 +1287,14 @@ class RecoveryMechanism:
             log(f"reset refused: {fenced}")
             health_event("reset_fenced", argv=argv, owner=owner, reason=fenced)
             return None, f"reset refused: {fenced}"
+        unclassified = self._override_unclassified(argv, owner, log)
+        if unclassified:
+            return None, unclassified
+        mesh = ipmi_guard.is_mesh_reset(argv)
+        if mesh:
+            refused = await self._mesh_reset_preflight(argv, owner, log)
+            if refused:
+                return None, refused
         # Name the command we are actually running. This was hardcoded to the galaxy's -glx_reset, so on
         # every other machine the queue told operators a command that was not the one executing.
         self._set_device_op_detail(f"device reset: {' '.join(argv)} (~60s)")
@@ -1180,6 +1303,12 @@ class RecoveryMechanism:
         # And it leaves the fabric unproven: no release until a fabric pass passes (post_reset).
         FABRIC_DEBT.note_reset(" ".join(argv))
         quiesced = await self._set_device_pollers(False, log)
+        # With our own pollers stopped, nothing else may map the device either (spec 04 I92).
+        refused = await self.clear_readers_before_reset(argv, owner, log)
+        if refused:
+            log(f"reset refused: {refused}")
+            await self.restore_pollers(quiesced, log, ok=False, after="reset refused: pre-reset holder scan")
+            return None, f"reset refused: {refused}"
         # A reset takes the chips off the bus — that is what it does — so for its duration they
         # read all-ones exactly like a dead chip. Without this flag the sampler isolates them
         # mid-reset and tears the endpoints out of the kernel, which is how a healthy host ended
@@ -1190,11 +1319,14 @@ class RecoveryMechanism:
         cancelled_mid = False
         late_cancel = False
         rc = None
+        text = ""
         try:
             if stream is None:
                 rc, text = await self.run_scoped(argv, log, owner)
             else:
                 rc, text = await self.run_scoped(argv, log, owner, stream)
+            if mesh:
+                rc = self._note_bmc_guard_output(argv, owner, rc, text, log)
             return rc, text
         except asyncio.CancelledError:
             cancelled_mid = True  # abandoned mid-reset; the detached backend keeps cycling the chips
@@ -1237,15 +1369,17 @@ class RecoveryMechanism:
             if restore and rc is None:
                 restore = not await asyncio.to_thread(self.scope_active)
             if restore:
+                withheld = mesh and self._withhold_failed_mesh_rescan(rc, text, log)
                 try:
-                    # A reset can leave endpoints un-enumerated — and any chip we isolated earlier is
-                    # still out of the kernel, because `remove` is not undone by a reset. Rescan, or the
-                    # device comes back short and nobody knows why.
-                    await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
-                    await asyncio.sleep(3)
-                    isolated = self._isolated_chips() if self._isolated_chips is not None else None
-                    if isolated:
-                        await asyncio.to_thread(drop_returned_isolated, isolated, "reset", log)
+                    if not withheld:
+                        # A reset can leave endpoints un-enumerated — and any chip we isolated earlier is
+                        # still out of the kernel, because `remove` is not undone by a reset. Rescan, or the
+                        # device comes back short and nobody knows why.
+                        await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
+                        await asyncio.sleep(3)
+                        isolated = self._isolated_chips() if self._isolated_chips is not None else None
+                        if isolated:
+                            await asyncio.to_thread(drop_returned_isolated, isolated, "reset", log)
                     if rc == 0:
                         await self._reapply_aiclk_ceiling(log)
                 except OSError:
@@ -1261,6 +1395,31 @@ class RecoveryMechanism:
             if late_cancel:
                 raise asyncio.CancelledError()
 
+    def _withhold_failed_mesh_rescan(self, rc: Optional[int], text: str, log) -> bool:
+        """Spec 04 I69 on the mesh path: True when the rescan after this mesh reset must not run.
+
+        A chip the broker removed is reached by a mesh reset only through the BMC tray re-power. When
+        the output does not show that re-power went out on op_mode 0x3 (no settle count, a 0x0
+        fallback, a guard refusal, or no reset at all) and tt-smi did not exit 0, a global rescan would
+        re-enumerate the removed chip un-reset. Journals pci_rescan_withheld (mesh_reset_failed); the
+        chips stay isolated, and the failed reset sends the hold on to its next rung at once. Chips the
+        broker never removed keep the bare rescan, and a mesh reset that exited 0 always rescans: tt-smi
+        exits 0 only after its own wait found every chip, which it reaches only past the re-power."""
+        if rc == 0 or ipmi_guard.bmc_step_ok(text):
+            return False
+        removed = pci.removed_chip_ids()
+        if not removed:
+            return False
+        fallback = ipmi_guard.scan_reset_output(text) is not None
+        health_event(
+            "pci_rescan_withheld", chips=removed, unreset=removed, reason="mesh_reset_failed", rc=rc, fallback=fallback
+        )
+        log(
+            f"PCI rescan withheld (mesh_reset_failed, rc={rc}) for removed chip(s) {removed}: the BMC re-power "
+            f"did not reach them; they stay isolated, escalating to the next rung"
+        )
+        return True
+
     @property
     def reset_in_flight(self) -> bool:
         return self._reset_in_flight
@@ -1271,6 +1430,22 @@ class RecoveryMechanism:
         # (sampler, /health) read no chip, and only this step's own reads reach them.
         self._reset_in_flight = bool(on)
         chip_state.set_recovering(f"op:{id(self)}", bool(on))
+
+    async def clear_readers_before_reset(self, argv: list, owner: str, log) -> str:
+        """Run the broker's pre-reset holder scan (spec 04 I92); why the reset must not run, or ''.
+
+        ``reset_with_quiesce`` calls it with the device pollers already stopped, so the mesh reset, the
+        sweep and the operator reset all pass it. (The bridge rung only resets chips already cut out
+        of the kernel, and journals that instead.) A scan that raises lets the reset run, as it did before the scan existed: recovery
+        must not stop on a scan bug, and the reset's own gates still apply."""
+        if self.pre_reset_scan is None:
+            return ""
+        try:
+            return await self.pre_reset_scan(list(argv), owner, log) or ""
+        except Exception as e:  # noqa: BLE001 - see above
+            log(f"pre-reset holder scan failed, reset proceeds: {e!r}")
+            health_event("pre_reset_holder_scan", argv=list(argv), owner=owner, outcome="scan_error", error=repr(e))
+            return ""
 
     async def restore_pollers(self, quiesced: list, log, *, ok: bool, after: str) -> None:
         """Start the device pollers a reset step stopped, but only after a step that completed
@@ -1358,10 +1533,30 @@ class RecoveryMechanism:
                     pass
 
         def watch(chunk: str) -> None:
-            if state["task"] is None and not state.get("disarmed"):
+            if state["task"] is None and not state.get("disarmed") and not state.get("withheld"):
                 seen = state["tail"] + chunk
+                # Spec 04 I69 on the mesh path: the rescan re-adds removed chips, so it runs only once
+                # the output shows the BMC re-power went out on op_mode 0x3. A 0x0 fallback, a guard
+                # refusal or an unarmed guard before the wait withholds it for this reset.
+                if ipmi_guard.scan_reset_output(seen) is not None:
+                    state["bmc_failed"] = True
                 if GLX_DRIVER_WAIT.search(seen):
-                    state["task"] = asyncio.get_running_loop().create_task(rescan())
+                    if state.get("bmc_failed"):
+                        state["withheld"] = True
+                        removed = pci.removed_chip_ids()
+                        log(
+                            f"PCI rescan at tt-smi's driver wait withheld (mesh_reset_failed) for isolated chip(s) "
+                            f"{chips}: the output does not show the BMC re-power went out on op_mode 0x3"
+                        )
+                        health_event(
+                            "pci_rescan_withheld",
+                            chips=chips,
+                            unreset=removed,
+                            reason="mesh_reset_failed",
+                            at="driver_wait",
+                        )
+                    else:
+                        state["task"] = asyncio.get_running_loop().create_task(rescan())
                 else:
                     state["tail"] = seen[-200:]  # a marker split across two reads still matches
             if on_output is not None:

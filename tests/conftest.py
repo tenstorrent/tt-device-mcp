@@ -23,7 +23,7 @@ if str(src_path) not in sys.path:
 import tt_device_mcp.device_holders as device_holders
 import tt_device_mcp.job_reap as job_reap
 import tt_device_mcp.server as srv
-from tt_device_mcp import privileges
+from tt_device_mcp import pre_reset_scan, privileges
 from tt_device_mcp.fsm import ServerFsm
 from tt_device_mcp.health import bmc_capture, post_reset
 from tt_device_mcp.health import evidence as health
@@ -104,6 +104,8 @@ def reset_host_action_state():
             return
         m.host_action_requested = None
         m._host_action_reset_refused = None
+        # The last mesh reset's per-process record (spec 04 I93): one test's reset does not space the next's sweep.
+        m.last_mesh_reset_run = None
 
     clear()
     yield
@@ -361,6 +363,14 @@ def _seal_real_hardware(monkeypatch, tmp_dirs):
     # that means to exercise the guard patches this itself.
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
 
+    # The pre-reset holder scan (spec 04 I92) walks /proc and signals the readers it finds. Unstubbed,
+    # a unit test's reset would scan this machine's real processes. Every reset here sees a clear
+    # scan; the scan's own tests drive it through its seams.
+    async def _clear_scan(**_kw):
+        return pre_reset_scan.PreResetScan()
+
+    monkeypatch.setattr(srv, "clear_device_readers", _clear_scan)
+
 
 def _redirect_probe_caches(monkeypatch, tmp_dirs, device_marked, session_root):
     """Keep the fabric and eth probes off the real /var/cache, marker or not.
@@ -399,6 +409,17 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     _redirect_probe_caches(monkeypatch, tmp_dirs, device_marked, device_probe_cache_root)
     health_tmp = tmp_dirs.mktemp("health")
     monkeypatch.setattr(health, "HEALTH_DIR", health_tmp)
+    # Spec 04 I91: a mesh reset's BMC preflight runs `ipmitool mc info`; ipmitool is never spawned
+    # by the suite, so every test sees a healthy BMC unless it patches its own answer.
+    from tt_device_mcp.health.recovery import ipmi_guard
+
+    monkeypatch.setattr(
+        ipmi_guard,
+        "_run_mc_info",
+        lambda timeout: subprocess.CompletedProcess(
+            ["ipmitool", "mc", "info"], 0, "Firmware Revision : 0.05\nAux Firmware Rev Info : 0x23 0x00 0x00 0x00\n", ""
+        ),
+    )
     monkeypatch.setattr(heartbeat, "_heartbeat_supported", None)
     # raising=False so a base tree without the re-arm latch (a fails-on-base stash) still sets up.
     monkeypatch.setattr(heartbeat, "_heartbeat_absent_journaled", False, raising=False)
@@ -486,6 +507,8 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # The startup gate task (spec 03 I75): left pending, a later test's startup hold would never escalate.
     monkeypatch.setattr(srv, "_startup_verify_task", None, raising=False)
     monkeypatch.setattr(srv, "_startup_verify_ready_at", None, raising=False)
+    monkeypatch.setattr(srv, "_startup_verify_started_wall", None, raising=False)
+    monkeypatch.setattr(srv, "_startup_verify_ready_wall", None, raising=False)
     monkeypatch.setattr(srv, "_startup_verify_deferral_logged", None, raising=False)
     # The 10-min hold bound's bookkeeping (spec 04 I76) is keyed by the episode's start stamp: two tests
     # that open a hold at the same fixed stamp would share one ladder record.
@@ -500,6 +523,10 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
         ("_hold_bound_denied_why", ""),
         ("_hold_bound_tenant_paged", ""),
         ("_hold_bound_tenant_blocker", None),
+        # The holders the dead-chip valve refused to kill (spec 03 I84), which the bound routes.
+        ("_kill_refused_pids", {}),
+        ("_kill_refused_job_pid", None),
+        ("_kill_refused_since", ""),
     ):
         monkeypatch.setattr(srv, name, value, raising=False)
     monkeypatch.setattr(srv, "post_job_gate_pending", False, raising=False)
@@ -517,6 +544,7 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # The hung-chip poller stop's per-episode latch and its previous heartbeats, and the reset scope
     # the sampler saw still running (spec 03 I66), for the same reason.
     monkeypatch.setattr(srv.sampler, "pollers_stopped_for", frozenset(), raising=False)
+    monkeypatch.setattr(srv.sampler, "pollers_deferred_for", frozenset(), raising=False)
     monkeypatch.setattr(srv.sampler, "prev_beats", {}, raising=False)
     monkeypatch.setattr(srv.sampler, "scope_seen", False, raising=False)
     monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None, raising=False)
@@ -529,6 +557,12 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     monkeypatch.setattr(
         recovery_galaxy, "_settle_before_host_rung_sec", lambda: 0
     )  # no real pre-host-rung settle in tests
+
+    async def _no_gap_sleep(seconds):
+        return None
+
+    # No real wait for the spaced second mesh reset (spec 04 I93); its tests move a fake clock instead.
+    monkeypatch.setattr(recovery_galaxy, "_mesh_reset_gap_sleep", _no_gap_sleep)
     monkeypatch.setattr(srv, "device_op_active", "")
     monkeypatch.setattr(srv, "device_op_detail", "")
     monkeypatch.setattr(srv, "device_op_owner", "[broker]", raising=False)

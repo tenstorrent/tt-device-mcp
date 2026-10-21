@@ -290,6 +290,9 @@ class RecoveryDeps:
     # Marks the pollers the dead-chip valve stopped as owed a restart (server._owe_device_pollers):
     # that stop has no paired restore, and an idle relift can close the episode with no reset.
     owe_device_pollers: Optional[Callable[[str], None]] = None
+    # Records the holders the dead-chip valve refused to kill (server._note_dead_kill_refused, spec 03
+    # I84), so the 10-min bound sends them to the host rung instead of reading them as tenants.
+    note_kill_refused: Optional[Callable[[str, list], list]] = None
     mark_device_dirty: Optional[Callable[..., None]] = None
     # Places a not-dirty fabric-unverified hold (server._hold_device_fabric_unverified): a reset whose
     # fabric stayed a 77 settles there, never as a failed reset.
@@ -298,6 +301,10 @@ class RecoveryDeps:
     # (server._note_fabric_77_reset_passes), so the next relift falls back at once instead of
     # re-running the passes the reset just spent.
     note_fabric_77_reset_passes: Optional[Callable[[int], None]] = None
+    # The open hold's fabric link-short cause (server._fabric_link_short_hold; "" when none): a lost
+    # link, a latched topology mismatch or missing descriptor ports. Spec 04 I79/I83 send those holds
+    # to the power cycle after one ladder pass, so the sweep never waits to space its mesh reset (I93).
+    fabric_link_short_hold: Optional[Callable[[], str]] = None
     # Whether the open hold's fabric 77 has a cause no reset or reboot fixes — a known cable fault (a 78),
     # a topology mismatch, hugepages not yet allocated, the validator missing
     # (server._fabric_77_no_reset_cause; never the I42 latch, which takes the ladder). Such a 77
@@ -492,6 +499,19 @@ class Recovery(ABC):
                 "removed is still un-reset"
             )
             health_event("host_reset_gated", context="bridge_reset", chips=targets, reason=why, host_at_risk=True)
+        # Spec 04 I92: every reset journals its pre-reset holder scan. This one needs none: each target
+        # was cut out of the kernel (detached), so no process can map it and closing a holder's fd
+        # makes the driver send it nothing. Killing readers here would only stop the device pollers'
+        # reads of the chips that stay on the bus.
+        if sbr and not gated:
+            health_event(
+                "pre_reset_holder_scan",
+                argv=["bridge-reset", *targets],
+                owner="[broker]bridge-reset",
+                outcome="targets_detached",
+                chips=targets,
+                seconds=0.0,
+            )
         # Spec 04 I69: a chip the broker removed is still hung, and any rescan this pass would
         # re-enumerate it for the driver to probe. So reset every one of them through its recorded
         # bridge first, then rescan once. If any cannot be reset, no rescan runs this pass at all
@@ -772,11 +792,20 @@ class Recovery(ABC):
         enum+ARC verify and only the fabric stayed unverifiable (a persistent 77: held fabric-unverified,
         the caller must not climb on it), False otherwise.
         """
+        started = time.monotonic()
         try:
             return await self._reset_and_verify_device_once(indices, log)
         finally:
             # The reset and its verify are over and the host is still up: an off-bus intent is spent.
             pcie_guard.end_offbus_reset()
+            if self.mechanism.last_reset_monotonic >= started and "-glx_reset" in self.reset_argv(indices):
+                # A launched Galaxy mesh reset: the sweep spaces the episode's second from it (I93).
+                self.mechanism.last_mesh_reset_run = {
+                    "episode": self.deps.device_hold_episode_since() or "",
+                    "started": started,
+                    # The reset command's end, not its check's: the sweep's gap counts from here.
+                    "ended": max(started, self.mechanism.last_reset_ended_monotonic),
+                }
 
     async def _arc_not_ready_retry_due(self, argv: list, expected: int, log) -> bool:
         """After a mesh reset that EXITED non-zero: is this the one shape a second reset clears, on a box
@@ -862,14 +891,26 @@ class Recovery(ABC):
 
         log(f"resetting device: {' '.join(argv)}  ({expected} device(s); ~30-60s, restart-safe)")
         health_event("reset_begin", argv=argv, expected_chips=expected)
+        prior_reset_monotonic = self.mechanism.last_reset_monotonic
         self.mechanism.last_reset_monotonic = time.monotonic()
         pcie_guard.begin_offbus_reset("mesh reset", off_bus)
         aer_mask = pcie_guard.mask_for_mesh_reset(log)
         try:
             rc, out = await self.mechanism.reset_with_quiesce(argv, log)
         finally:
+            self.mechanism.last_reset_ended_monotonic = time.monotonic()
             if aer_mask is not None:
                 await asyncio.to_thread(aer_mask.restore)
+        if rc is None and (out or "").startswith("reset refused:"):
+            # Spec 04 I92: the pre-reset scan refused (a tenant, a reader that would not die, an off-bus
+            # chip it could not detach, a reset already in flight). No reset ran, so nothing that a
+            # reset settles is settled: the cooldown clock goes back, a kill-reset debt or a spent
+            # dispatch reset stays owed, and the hold stays for the 10-min ladder (I76).
+            self.mechanism.last_reset_monotonic = prior_reset_monotonic
+            log(out)
+            health_event("reset_refused", argv=argv, detail=out)
+            metrics.stage_fired("smi_reset", "blocked")
+            return False
         self.mechanism.last_reset_rc = rc
         if _journal_cpld_too_old(argv, out, log):
             # Latched on the mechanism both platforms share, so the NEXT rung and every later pass

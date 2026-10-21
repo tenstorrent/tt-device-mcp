@@ -42,6 +42,8 @@ from tt_device_mcp.health.recovery import (
     WAIT,
     Evidence,
     Recovery,
+    ipmi_guard,
+    mesh_repeat,
     offbus_power_cycle,
     pcie_guard,
 )
@@ -231,6 +233,11 @@ def _offbus_hold_ceiling_sec() -> int:
     except ValueError:
         return 120
     return v if v > 0 else 120
+
+
+async def _mesh_reset_gap_sleep(seconds: float) -> None:
+    """The spaced sweep's wait for the gap after a failed first mesh reset (spec 04 I93)."""
+    await asyncio.sleep(seconds)
 
 
 def _settle_before_host_rung_sec() -> int:
@@ -1844,7 +1851,7 @@ class GalaxyRecovery(Recovery):
         self.deps.clear_device_dirty(verified=True, why=f"gate/{gate_phase}: below-floor rescan/SBR recovered the mesh")
         return OUTCOME_RECOVERED
 
-    def _tenant_active(self, scan, *, force: bool = False) -> bool:
+    def _tenant_active(self, scan, *, force: bool = False, waive_job: bool = False) -> bool:
         """Is anyone using the device? TWO independent sources, because either one alone lies:
 
         * the holder scan — open ``/dev/tenstorrent`` fds. Blind while a running job is off the
@@ -1859,16 +1866,19 @@ class GalaxyRecovery(Recovery):
 
         ``force`` (the hold-deadline backstop) still waives an UNREADABLE scan — that guard protects
         against blindness, not against a known tenant — but never waives a real one, fd-held or
-        queue-known: resetting out from under a live job is the thing the guard is for."""
-        return self._tenant_blocker(scan, force=force) is not None
+        queue-known: resetting out from under a live job is the thing the guard is for.
 
-    def _tenant_blocker(self, scan, *, force: bool = False) -> Optional[dict]:
+        ``waive_job`` (the 10-min bound only) skips the running-job check for a job whose kill the
+        dead-chip valve refused (spec 03 I84): the bound sends it to the host rung, never a reset."""
+        return self._tenant_blocker(scan, force=force, waive_job=waive_job) is not None
+
+    def _tenant_blocker(self, scan, *, force: bool = False, waive_job: bool = False) -> Optional[dict]:
         """Which check of :meth:`_tenant_active` blocks, as health_event fields, or None when none does:
         ``blocker`` is ``job_running``, ``startup_verify`` (the running escalate's I75 stand-down), ``tenant``
         (with the first tenant's pid, uid, user and comm) or ``scan_incomplete`` (with the scan's source
         and gaps). A deferral that names its blocker tells a
         real tenant apart from a scan that merely could not see."""
-        if self.deps.job_running():
+        if not waive_job and self.deps.job_running():
             return {"blocker": "job_running"}
         if self._stand_down is not None and self._stand_down():
             self.startup_verify_deferred = True
@@ -1916,6 +1926,62 @@ class GalaxyRecovery(Recovery):
             return None
         age = _hold_age_sec(hold_since)
         return (hold_since, age is not None and age >= _stuck_hold_ceiling_sec())
+
+    async def _space_second_mesh_reset(self, expected: int, log, where: str) -> bool:
+        """Spec 04 I93: on a present mesh whose first Galaxy mesh reset in this hold episode failed, wait
+        until MESH_RESET_MIN_GAP_SEC after that reset ENDED before the sweep runs the episode's second,
+        but never past the 10-min bound (I76): at the bound it runs at once. True iff it waited.
+
+        No wait (the sweep runs at once, as before) unless all of: a Galaxy ``-glx_reset`` on more than
+        one chip; the hold clock known; this hold phase's sweep not spent; not a fabric link-short hold
+        (I79/I83: those go to the power cycle at once); every expected chip on the bus, none isolated or
+        removed (classes A, B and C keep their own paths); no BMC guard finding (I91); and the first
+        mesh reset ran in this episode. The wait holds the device (the hold stands, no job runs); the
+        sweep's own guards (tenant, a reset cycling in its scope, the I87 phase) are read after it."""
+        argv = self.reset_argv(list(range(expected)))
+        if expected <= 1 or "-glx_reset" not in argv or not ipmi_guard.is_mesh_reset(argv):
+            return False
+        hold_since = self.deps.device_hold_episode_since() or ""
+        age = _hold_age_sec(hold_since)
+        run = self.mechanism.last_mesh_reset_run
+        if age is None or run is None:
+            return False
+        phase = self._sweep_phase()
+        if phase is not None and self.mechanism.sweep_spent == phase:
+            return False
+        if self.deps.fabric_link_short_hold and self.deps.fabric_link_short_hold():
+            return False
+        now = time.monotonic()
+        # The first reset belongs to this episode: launched under its stamp, or ended inside it.
+        if run["episode"] != hold_since and run["ended"] < now - age:
+            return False
+        wait = mesh_repeat.gap_wait(
+            since_first_end_sec=now - run["ended"], hold_age_sec=age, bound_sec=_stuck_hold_ceiling_sec()
+        )
+        if wait <= 0:
+            return False
+        beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        if (
+            offbus_count(beats, expected)
+            or pcie_guard.chips_off_bus(expected)
+            or self.deps.isolated_chips()
+            or removed_chip_ids()
+            or self.mechanism.bmc_guard_state is not None
+        ):
+            return False
+        log(
+            f"last chance before the host rung{where}: the first mesh reset failed {int(now - run['ended'])}s ago "
+            f"— the sweep's mesh reset waits {int(wait)}s more (spec 04 I93), the hold stands"
+        )
+        health_event(
+            "mesh_reset_spaced",
+            held_since=hold_since,
+            wait_sec=round(wait, 1),
+            since_first_end_sec=round(now - run["ended"], 1),
+            hold_age_sec=round(age, 1),
+        )
+        await _mesh_reset_gap_sleep(wait)
+        return True
 
     async def _issue_all_resets_back_to_back(
         self, trays: list, expected: int, log, *, do_sbr: bool = True, mesh_reset: bool = True
@@ -1968,10 +2034,15 @@ class GalaxyRecovery(Recovery):
             )
             aer_mask = pcie_guard.mask_for_mesh_reset(log)
             try:
-                await self.mechanism.reset_with_quiesce(argv, log)
+                result = await self.mechanism.reset_with_quiesce(argv, log)
             finally:
                 if aer_mask is not None:
                     await asyncio.to_thread(aer_mask.restore)
+            out = result[1] if isinstance(result, tuple) and result[0] is None else ""
+            if str(out).startswith("reset refused:"):
+                # Spec 04 I92: no reset ran. The caller's verify still decides, and a failed one climbs
+                # to the host rung as before; the refusal is journalled as itself, not as a reset.
+                health_event("reset_refused", context="reset_sweep", argv=argv, detail=out)
         except Exception as exc:  # noqa: BLE001 - the host rung above must fire even if a reset blew up
             log(f"the back-to-back reset sweep raised {exc!r} — continuing to the host rung")
             health_event("last_chance_reset_sweep_error", error=repr(exc))
@@ -2013,6 +2084,8 @@ class GalaxyRecovery(Recovery):
         climbs), and None when the sweep was skipped or incomplete and the mesh is still bad: the
         full ladder has not run, so the caller holds and fires no host rung this pass (I22)."""
         where = f" ({context})" if context else ""
+        if await self._space_second_mesh_reset(expected, log, where):
+            offbus_chips = None  # the wait is over: what is off the bus now is read below
         tray_map = self._tray_map_now()
         if offbus_chips is None:
             try:
@@ -2386,7 +2459,8 @@ class GalaxyRecovery(Recovery):
         # galaxy reset that dropped this present mesh to all-0xFFFFFFFF — a mass drop a power cycle
         # recovers and self-heal never will. The reset is now spent for the episode (I87), so the climb
         # does not wait for the ceiling: the last-chance sweep once, then the power cycle, or an
-        # operator when there is none (I36). Unforced, that climb runs once per episode.
+        # operator when there is none (I36). Unforced, that climb runs once per episode. On a present
+        # mesh the sweep's mesh reset is spaced from this one (I93).
         self.mechanism.spent_climb_since = hold_since or None
         await self._climb_or_hand_off(
             expected, off_bus_before, hold_since, log, present_reset_failed=off_bus_before == 0
