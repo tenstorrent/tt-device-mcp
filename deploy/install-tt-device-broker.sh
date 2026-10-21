@@ -52,16 +52,23 @@ echo "==> detect machine type (reset mode + fabric check)"
 # loudbox / n150 / n300 use -r on targets. Detect from tt-smi's authoritative
 # board_type (the device is healthy at install time). Persisted to /etc/default so
 # the unit renders identically from the installer and from auto-update.
+# The same snapshot's board types also give apply-host-config the box's expected chip count (spec 08
+# I28): the TYPE of any chip that answers, never how many answer, so a tray already off the bus does
+# not lower the bar. Taken only when one of the two still needs it; a failed snapshot leaves it empty.
 RESET_MODE="${TT_DEVICE_MCP_RESET_MODE:-}"
-if [ -z "$RESET_MODE" ] && timeout 30 "$NEW_VENV/bin/tt-smi" -s 2>/dev/null | "$NEW_VENV/bin/python" -c "
+BOARD_TYPES=""
+if [ -z "$RESET_MODE" ] || [ -z "${TTDEV_EXPECTED_CHIPS:-}" ]; then
+    BOARD_TYPES="$(timeout 30 "$NEW_VENV/bin/tt-smi" -s 2>/dev/null | "$NEW_VENV/bin/python" -c "
 import sys, json
 try: d = json.load(sys.stdin)
 except Exception: sys.exit(2)
-bt = [x.get('board_info', {}).get('board_type', '') or '' for x in d.get('device_info', [])]
-sys.exit(0 if any('galaxy' in b.lower() for b in bt) else 1)" 2>/dev/null; then
+for x in d.get('device_info', []): print((x.get('board_info') or {}).get('board_type') or '')" 2>/dev/null || true)"
+fi
+if [ -z "$RESET_MODE" ] && printf '%s\n' "$BOARD_TYPES" | grep -qi galaxy; then
     RESET_MODE=galaxy
 fi
 [ "$RESET_MODE" = galaxy ] && echo "    machine: Galaxy (board_type) -> reset uses -glx_reset"
+export TTDEV_BOARD_TYPES="$BOARD_TYPES"
 
 # Post-job fabric traffic check (run_cluster_validation) — EVERY machine. Chip liveness cannot see an
 # ethernet core that never retrained, and with no fabric evidence the health gate falls back to a full

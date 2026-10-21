@@ -281,6 +281,22 @@ job log, so every "installed" claim below is verified, not assumed.
   differently from the run that wrote `current` (a trailing slash, a symlinked parent) still finds
   it. A `current` that exists but cannot be resolved, or that resolves into the chosen build slot,
   stops the run with an error rather than building there.
+- **I28 — A fresh install knows the expected chip count from what the machine is, never from how
+  many chips answer.** When neither `TTDEV_EXPECTED_CHIPS` (operator or `/etc/default`) nor the
+  current unit gives a count, apply-host-config derives one with `deploy/tt-device-expected-chips.sh`:
+  a board type of any chip that answered the installer's `tt-smi -s` snapshot (`tt-galaxy-wh`,
+  `tt-galaxy-bh` → 32), else a DMI product name containing "Galaxy" (→ 32), else reset mode
+  `galaxy` (→ 32). The number of chips that answered is never an input, so a tray already off the
+  bus at install still gets 32. Card boards (n150, n300, p100, p150, p300) decide nothing: their
+  type gives chips per card, not cards per box, and a count set below the real one would bypass
+  the high-water mark. Card boards, unknown or mixed types, a card that disagrees with a galaxy
+  DMI product or reset mode, and no source at all leave the key unset with a loud warning naming
+  the reason, so `/health` shows the count as unknown. The operator value, then the unit's, always
+  wins; the chosen source is logged. The derived value is backfilled into `/etc/default` like any
+  resolved knob, so later updates read it back. Reason: with no declared count the broker's bar is
+  a high-water mark of chips seen; a whole-tray drop already present at the first start became the
+  bar and was never detected. With 32 declared, fewer chips present fails the check (03) and the
+  hold takes its normal recovery path.
 ## Interfaces
 
 **`/etc/default/tt-device-broker`** — written by the installer, sourced by `apply-host-config.sh`,
@@ -364,7 +380,10 @@ apply-host-config; the old venv is pruned once the restarted broker answers `/he
 the venv. (4) Lock policy: cooperative by default; `TTDEV_LOCK=1` opts in, applied only *after*
 the broker is up via `tt-device-mcp lock` (self-checks and reverts); `TTDEV_NO_LOCK=1` forces
 cooperative (back-compat). (5) Machine detection: `tt-smi -s` board_type containing "galaxy" (or
-preset `TT_DEVICE_MCP_RESET_MODE`) selects Galaxy reset mode. (6) Stage `fabric-check.sh`
+preset `TT_DEVICE_MCP_RESET_MODE`) selects Galaxy reset mode. The same snapshot's board types (one
+per answering chip) are passed to apply-host-config as `TTDEV_BOARD_TYPES` for the expected chip
+count (I28); the snapshot is skipped only when both the reset mode and `TTDEV_EXPECTED_CHIPS` are
+preset. (6) Stage `fabric-check.sh`
 (fail-closed under `set -e` — a broker with no fabric check full-resets after every abnormal
 exit) and the eth-heartbeat probe (loud but non-fatal: optional pre-read, staging best-effort);
 scrub the retired `eth-heartbeat-check.sh` wrapper. (7) Write `/etc/default/tt-device-broker`
@@ -380,7 +399,8 @@ poll, fail-closed (I3). (11) Optional lock.
 autoupdate — the single source of truth for the host surface, so a unit/sudoers change reaches
 every host on the next version bump. Reads `/etc/default`; for each knob absent there, falls back
 to the value in the currently rendered unit (a migrating host never loses an operator's setting),
-then backfills resolved values into `/etc/default` (`ensure_default`: missing or present-but-empty
+derives the expected chip count when neither gives one (I28), then backfills resolved values
+into `/etc/default` (`ensure_default`: missing or present-but-empty
 keys only — an empty key is a key predating its value, and leaving it made the file disagree with
 the running unit). Renders the unit (knob rules per Interfaces; the device-lock `DEVICE_GROUP`
 line is preserved across re-renders so an update never silently unlocks a shared host), then
@@ -590,6 +610,7 @@ script exists, the claim stands on the script (listed below).
 | I25 (validator built before the broker's first start) | `tests/test_deploy_validator_before_broker.py::test_validator_build_runs_before_the_broker_starts`, `tests/test_deploy_validator_before_broker.py::test_validator_build_is_blocking_and_failclosed`, `tests/test_deploy_validator_before_broker.py::test_incomplete_build_fails_the_install`, `tests/test_deploy_validator_before_broker.py::test_built_check_covers_all_three_pinned_binaries` |
 | I26 (live venv never removed: versioned venv built and verified beside it, one-rename flip before apply-host-config, prune after /health) | `tests/test_deploy_install_live_swap.py::test_installer_venv_step_never_removes_the_live_venv`, `tests/test_deploy_install_live_swap.py::test_fresh_install_builds_verifies_and_links_a_versioned_venv`, `tests/test_deploy_install_live_swap.py::test_upgrade_keeps_the_live_venv_until_prune`, `tests/test_deploy_install_live_swap.py::test_reinstall_of_the_same_commit_never_builds_over_the_live_venv`, `tests/test_deploy_install_live_swap.py::test_a_venv_that_fails_verification_is_discarded_and_the_live_one_kept`, `tests/test_deploy_install_live_swap.py::test_migration_from_a_real_dir_venv_has_only_the_two_rename_gap`, `tests/test_deploy_install_live_swap.py::test_installer_flips_before_host_config_and_prunes_after_health` |
 | I27 (validator repair builds in the slot `current` does not point at; stale slot pruned after an hour) | `tests/test_deploy_install_live_swap.py::test_validator_fresh_build_publishes_current`, `tests/test_deploy_install_live_swap.py::test_validator_upgrade_keeps_the_old_pin_live_until_the_flip`, `tests/test_deploy_install_live_swap.py::test_validator_same_pin_repair_builds_beside_the_live_prefix`, `tests/test_deploy_install_live_swap.py::test_validator_second_repair_returns_to_the_first_slot`, `tests/test_deploy_install_live_swap.py::test_validator_already_built_pin_does_not_refresh_the_link`, `tests/test_deploy_install_live_swap.py::test_validator_repair_with_trailing_slash_root_builds_beside_the_live_prefix`, `tests/test_deploy_install_live_swap.py::test_validator_repair_with_symlinked_parent_root_builds_beside_the_live_prefix`, `tests/test_deploy_install_live_swap.py::test_validator_refuses_when_current_resolves_inside_the_build_slot`, `tests/test_deploy_install_live_swap.py::test_host_config_counts_either_build_slot_as_built` |
+| I28 (expected chip count from board type / DMI product / galaxy reset mode, never from the chips that answer; operator and unit win; cannot tell = unset + warning) | `tests/test_deploy_expected_chips.py::test_a_galaxy_board_type_maps_to_32`, `tests/test_deploy_expected_chips.py::test_the_count_never_follows_how_many_chips_answered`, `tests/test_deploy_expected_chips.py::test_a_card_board_cannot_tell`, `tests/test_deploy_expected_chips.py::test_no_source_that_can_tell_never_guesses`, `tests/test_deploy_expected_chips.py::test_the_operator_value_wins_over_every_derived_source`, `tests/test_deploy_expected_chips.py::test_the_existing_unit_value_wins_over_derivation`, `tests/test_deploy_expected_chips.py::test_cannot_tell_leaves_it_unset_and_says_so_loudly`, `tests/test_deploy_expected_chips.py::test_a_fresh_galaxy_install_writes_32_with_no_operator_input`, `tests/test_deploy_expected_chips.py::test_a_fresh_galaxy_install_with_a_tray_already_missing_still_gets_32`, `tests/test_deploy_expected_chips.py::test_a_fresh_galaxy_install_with_no_chip_answering_gets_32_from_dmi`, `tests/test_deploy_expected_chips.py::test_fewer_chips_than_the_declared_count_fails_the_check`, `tests/test_apply_host_config_render.py::test_expected_chips_unset_renders_no_line` |
 | I7 (device-op bar unconditional, separate from the I24 busy gate; the job-cap bound never lifts it) | `tests/test_deploy_autoupdate_idle_gate.py::test_an_in_flight_device_op_still_bars_the_update`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_holds_a_drained_apply`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_still_bars_the_restart_past_the_cap`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_at_the_restart_point_blocks_the_restart` |
 | I8 (autoupdate required stages fail-closed; apply precedes installed.sha; staged sources exist) | `tests/test_deploy_required_install_failclosed.py::test_autoupdate_required_stages_fail_closed`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_host_config_apply_fails_closed`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_host_config_apply_precedes_installed_sha`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_staged_sources_exist_in_deploy` |
 | Installer staging split (fabric fatal; heartbeat loud-not-fatal) | `tests/test_deploy_required_install_failclosed.py::test_installer_fabric_check_stage_is_fatal_not_swallowed`, `tests/test_deploy_required_install_failclosed.py::test_installer_eth_heartbeat_stage_is_loud_but_not_fatal` |
