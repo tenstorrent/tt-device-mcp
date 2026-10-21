@@ -853,6 +853,27 @@ cooldown (spec 04 I65) holds longer.
   instead of about 5. Every other guard stays: the arm switch, retry pacing (one grace window
   between resets), reset scope, and no tenant (I13). A positive frozen read, or no measured
   failure, keeps the grace.
+- **I62 — A 77 from a validator crash gets one reset per hold episode.** When the last fabric pass
+  could not run because the validator crashed on `map::at` (`what(): unordered_map::at` or
+  `map::at`: it looked up a link or chip the mesh did not have), the fabric-unverified hold is
+  treated as I53 treats a measured link drop, even when no eth read recorded one: not a 77-only
+  hold and not a no-reset hold, so the idle relift sends it to the present-mesh rung (a galaxy reset,
+  then the full post-reset check, fabric included) and only a passing fabric verdict releases the
+  device. Only once per hold episode: after that episode's reset came back unverified (a 77 again),
+  a persistent crash is a 77-only hold again and keeps I48/I40 and the I40 fallback (whose climb
+  after an unverified reset is spec 04 I29), never a second reset from this rule. The I53
+  exclusions apply, bar the I42 latch: that is a measured fault and takes the ladder itself. A relift tick that comes before the present-mesh grace (120 s) gets not-due
+  from the rung and makes the next relift due at the grace end, not one relift interval later, so
+  the reset starts within one sampler interval (10 s) of the grace; the same holds for an I53
+  eth-drop 77. Time-to-recover for this class drops from the I40 bound (about 17 minutes) to the
+  grace, one sampler interval and one reset and check: worst case about 4 minutes (120 + 10 + about
+  100 s), inside its 5-minute budget. A crash that persists after that reset is a 77-only hold:
+  the spec 04 I76 bound runs the full ladder 10 minutes after the hold opened and, if the full
+  check after it still fails, requests the power cycle; worst case 10 minutes plus the ladder and
+  check, then the power cycle and its boot cooldown. No step of this path lifts the hold without a
+  passing full check, fabric included: a post-reset pass whose traffic crossed every discovered link
+  while ports of the cabling are missing has FAILED (I71), so the hold, its episode and its clock
+  stay, and the climb and the I76 bound own it (no lift, I78).
 - **I63 — A probe killed by a host shutdown or the broker's own stop is not a verdict.** systemd
   stops a unit by signalling its whole cgroup, so a host reboot SIGTERMs a running fabric,
   eth-heartbeat, aiclk-ceiling or tt-smi probe in the same instant it SIGTERMs the broker. A probe
@@ -1783,6 +1804,7 @@ refuses.
 | I55 (the verdict names the dispatch failure, never the downgraded mismatch) | `tests/test_dispatch_failure_reset.py::test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch`, `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
 | I55 (rung gap warned at boot and on /health; floor message honest, the whole-tray power cycle promised only while armed) | `tests/test_dispatch_failure_reset.py::test_rung_gap_boot_warning_and_health_field`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
 | I56 (a measured fabric failure on a present mesh resets on the first relift; frozen read or no measured failure keeps the grace) | `tests/test_device_safety.py::test_idle_relift_resets_a_measured_fabric_failure_without_the_grace`, `tests/test_device_safety.py::test_idle_relift_keeps_the_grace_without_a_measured_fabric_failure`, `tests/test_post_reset_gate.py::test_the_measured_fabric_failure_reset_on_the_first_relift` (the real reset path: the verify after it runs the fabric pass, release only on a healthy verdict, 04 I32/I32a) |
+| I62 | `tests/test_startup_fabric_hugepages.py::test_a_validator_crash_77_escalates_on_the_first_relift`, `tests/test_startup_fabric_hugepages.py::test_a_tick_before_the_grace_does_not_push_the_reset_past_it`, `tests/test_startup_fabric_hugepages.py::test_a_not_due_tick_past_the_grace_keeps_the_interval`, `tests/test_startup_fabric_hugepages.py::test_the_crash_reset_runs_the_full_check_and_releases_only_on_a_pass`, `tests/test_startup_fabric_hugepages.py::test_the_crash_reset_keeps_the_hold_on_a_pass_with_links_missing`, `tests/test_startup_fabric_hugepages.py::test_a_validator_crash_77_gets_no_second_reset_after_an_unverified_one`, `tests/test_startup_fabric_hugepages.py::test_a_validator_crash_77_keeps_its_no_reset_exclusions`, `tests/test_startup_fabric_hugepages.py::test_the_replayed_crash_hold_with_links_down_escalates_present` |
 | I63 (a probe killed during a shutdown raises, journaled; no verdict) | `tests/test_check_interrupted_by_shutdown.py::test_a_probe_killed_during_shutdown_raises_and_is_journaled`, `tests/test_check_interrupted_by_shutdown.py::test_fabric_interrupted_by_shutdown_is_journaled_and_not_a_verdict`, `tests/test_check_interrupted_by_shutdown.py::test_tt_smi_killed_during_shutdown_raises_else_fails` |
 | I63 (no reboot, no further rung, no release over a shutdown-killed post-reset verify) | `tests/test_check_interrupted_by_shutdown.py::test_post_reset_verify_killed_by_shutdown_requests_no_reboot_and_releases_nothing` |
 | I63 (a timeout kill and a signal outside a shutdown fail as before) | `tests/test_check_interrupted_by_shutdown.py::test_a_timeout_kill_keeps_the_old_failure_even_during_shutdown`, `tests/test_check_interrupted_by_shutdown.py::test_a_signal_outside_shutdown_keeps_the_old_failure`, `tests/test_check_interrupted_by_shutdown.py::test_fabric_signal_and_timeout_outside_shutdown_still_fail`, `tests/test_check_interrupted_by_shutdown.py::test_a_clean_or_failing_exit_never_asks` |

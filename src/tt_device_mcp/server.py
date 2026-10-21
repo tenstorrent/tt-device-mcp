@@ -120,6 +120,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     _normalized_board,
     _offbus_hold_ceiling_sec,
     _power_cycle_direct_class,
+    _present_mesh_reset_grace_sec,
     _reboot_min_dead_chips,
     _run_pre_power_cycle_hook,
     _stuck_hold_ceiling_sec,
@@ -4119,7 +4120,9 @@ def _fabric_77_only_hold() -> bool:
     never escalated to a reset by the idle relift, the deadline escalation or the watchdog; the
     idle relift re-runs the fabric pass instead, and a real verdict decides.
 
-    Not when the last eth read measured links down (see _fabric_77_eth_drop): that is a fault."""
+    Not when the last eth read measured links down (see _fabric_77_eth_drop), or the validator
+    crashed on a mesh this episode has not yet reset (see _fabric_77_validator_crash): those are
+    faults."""
     return (
         fsm.state is ServerState.RECOVERING
         and fsm.record.why == FABRIC_RELIFT_WHY
@@ -4127,7 +4130,7 @@ def _fabric_77_only_hold() -> bool:
         and not device_fault_reported
         and not isolated_chips
         and health_monitor.last_fabric_ok is not False
-        and not _fabric_77_eth_drop()
+        and not _fabric_77_reset_cause()
     )
 
 
@@ -4187,6 +4190,54 @@ def _fabric_77_no_reset_cause() -> bool:
     if _last_77_was_hugepages() or fabric.validator_missing() is not None:
         return True
     return "hugepages not yet allocated" in str(fsm.record.detail or "")  # the startup pass's hugepages hold
+
+
+# The fabric validator's own crash on a mesh it cannot map (an unordered_map lookup of a link or chip
+# it did not find), which the wrapper reports as a 77.
+_VALIDATOR_CRASH_RE = re.compile(r"what\(\):\s+(unordered_)?map::at")
+
+
+def _fabric_77_validator_crash() -> str:
+    """The validator crash that makes a fabric 77 worth one reset, or "" (spec 03 I62).
+
+    A validator that dies on ``map::at`` found a mesh whose links or chips do not match what it
+    looked up: on one Galaxy host every such pass came after links went down, and a galaxy reset
+    healed it in under two minutes while the relift re-ran the pass for 17. So the crash gets the
+    present-mesh rung once per hold episode even when no eth read measured the drop. Once that
+    episode's reset came back unverified, a persistent crash is a missing verdict again: it goes to
+    the I40 bound and its fallback, never a second reset from here. Not for the causes no reset
+    fixes (see _fabric_77_no_reset_cause)."""
+    if health_monitor is None or not health_monitor.last_fabric_skipped:
+        return ""
+    found = _VALIDATOR_CRASH_RE.search(health_monitor.last_fabric_output or "")
+    if not found or not device_hold_episode_since:
+        return ""
+    if recovery_mechanism.unverified_reset_since == device_hold_episode_since:
+        return ""
+    if _fabric_77_no_reset_cause():
+        return ""
+    return f"the fabric validator crashed ({found.group(0)})"
+
+
+def _fabric_77_reset_cause() -> str:
+    """What makes this fabric 77 a fault the present-mesh rung can fix, or ""."""
+    return _fabric_77_eth_drop() or _fabric_77_validator_crash()
+
+
+def _relift_at_present_grace() -> None:
+    """Make the next relift due when the hold reaches the present-mesh grace (spec 03 I62).
+
+    A relift tick on a fault 77 (I53, I62) before the grace gets not-due from the present rung. If it
+    used up a whole relift interval, the rung would fire up to one interval after the grace instead
+    of at it. A hold already past the grace keeps the normal interval."""
+    global last_relift_monotonic
+    try:
+        age = (datetime.now() - datetime.fromisoformat(device_hold_episode_since)).total_seconds()
+    except (TypeError, ValueError):
+        return
+    left = _present_mesh_reset_grace_sec() - age
+    if 0 < left < SELFHEAL_RELIFT_INTERVAL_SEC:
+        last_relift_monotonic = time.monotonic() - SELFHEAL_RELIFT_INTERVAL_SEC + left
 
 
 def _fabric_hold_only(own_op: str = "") -> bool:
@@ -4391,7 +4442,7 @@ def _fabric_no_reset_hold() -> str:
         fabric_hold
         and not device_fault_reported
         and health_monitor.last_fabric_ok is not False
-        and not _fabric_77_eth_drop()
+        and not _fabric_77_reset_cause()
     ):
         return "fabric check could not run (77)"
     return ""
@@ -4675,8 +4726,11 @@ async def _attempt_idle_relift() -> None:
                 if _startup_verify_owns_hold():
                     return  # spec 03 I75: the startup gate runs on this hold next, no reset first
                 drop = _fabric_77_eth_drop() if fsm.record.why == FABRIC_RELIFT_WHY else ""
+                crash = "" if drop or fsm.record.why != FABRIC_RELIFT_WHY else _fabric_77_validator_crash()
                 if drop:
                     _log(f"fabric 77 with eth links measured down ({drop}) — a fault: the present-mesh rung")
+                elif crash:
+                    _log(f"fabric 77: {crash} — a fault: the present-mesh rung, once this episode")
                 # The I42 latch: the lift's first job measured the fabric bad, so the reset runs
                 # now, without the grace, and its full post-reset check decides (I56).
                 latched = fsm.record.why == FABRIC_RELIFT_WHY and bool(health_monitor.topology_hw_fault)
@@ -4684,6 +4738,8 @@ async def _attempt_idle_relift() -> None:
                     return
                 if galaxy_recovery.startup_verify_deferred:
                     return  # spec 03 I75: the re-adopted job ended inside the ladder; the gate runs next
+                if drop or crash:
+                    _relift_at_present_grace()
                 _log(
                     "held-unverified and no read-only check clears this hold class — holding; "
                     "escalates to the gate's galaxy reset once idle past the ceiling"
