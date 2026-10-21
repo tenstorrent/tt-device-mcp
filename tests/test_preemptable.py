@@ -544,6 +544,7 @@ def test_the_earlier_field_name_is_still_accepted():
     params = srv.JobSubmitInput(workspace="/tmp", command="true", preemptable=True)
     assert params.no_timeout_except_on_contention is True
 
+
 def test_a_log_without_the_header_is_an_ordinary_job(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     (tmp_path / "2026-07-17_000956_012.log").write_text("JOB ID:      012\nTIMEOUT:     300s\n")

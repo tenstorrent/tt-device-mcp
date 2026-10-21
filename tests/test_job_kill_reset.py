@@ -11,7 +11,6 @@ import asyncio
 import logging
 import os
 import signal
-import time
 
 import httpx2
 import pytest

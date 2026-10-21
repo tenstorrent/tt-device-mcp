@@ -1222,7 +1222,9 @@ def _wait_and_stream(
             if result["status"] == "timeout" and result.get("hint"):
                 print(f"\n!! TIMED OUT after {result.get('timeout_sec')}s !!\n{result['hint']}")
             if result["status"] == "preempted":
-                print(f"\n!! PREEMPTED: another job waited {PREEMPT_GRACE_SEC}s past the {result.get('timeout_sec')}s limit !!")
+                print(
+                    f"\n!! PREEMPTED: another job waited {PREEMPT_GRACE_SEC}s past the {result.get('timeout_sec')}s limit !!"
+                )
 
             # Show last N lines summary if requested
             if output_lines > 0 and all_output:
