@@ -211,6 +211,9 @@ MAX_TIMEOUT_SEC = 1500  # 25 minutes
 # it is bounded far tighter than a queued job: a triage that cannot answer in this many seconds
 # is wedged itself, and letting it run unbounded adds a second stuck process to the mesh.
 EXEC_MAX_TIMEOUT_SEC = 600
+# Most lines a job-logs call returns (spec 02 I2): held in _get_job_logs, so the REST route the
+# CLI uses gets the same cap as the MCP tool's schema.
+MAX_LOG_TAIL_LINES = 10000
 
 # In-memory job output is a bounded tail (the log file is the complete record).
 # Unbounded accumulation of a chatty job's output would starve the event loop:
@@ -410,7 +413,7 @@ class JobLogsInput(JobIdInput):
     tail: int = Field(
         100,
         ge=1,
-        le=10000,
+        le=MAX_LOG_TAIL_LINES,
         description="Number of lines to return from end of log file. Default: 100.",
     )
 
@@ -2929,6 +2932,19 @@ def write_job_log_footer(job_log_file: Path, job: Job):
         if job.idle_total_sec is not None:
             f.write(f"DEVICE IDLE: {job.idle_total_sec:.1f}s\n")
         f.write("=" * 70 + "\n")
+
+
+# The line a queued job's log gets when it is cancelled before it started (spec 01 I69).
+CANCELLED_QUEUED_MARKER = "[CANCELLED before it started]"
+
+
+def write_cancelled_job_log_footer(job_log_file: Path, job: Job, requested_by: str) -> None:
+    """End a job cancelled while queued with the same footer every finished job gets, STATUS:
+    killed (its JobStatus, as the job-status API and the outcome metric report it), after a
+    marker naming who cancelled it, so the recent list and the log say what the API says."""
+    with open(job_log_file, "a") as f:
+        f.write(f"{CANCELLED_QUEUED_MARKER} cancelled by {requested_by}\n")
+    write_job_log_footer(job_log_file, job)
 
 
 def seed_job_counter() -> None:
@@ -10816,6 +10832,11 @@ def _recent_jobs(limit: int = 20) -> list[dict]:
                 rec[HEADER_FIELDS[key.strip()]] = val.strip()
         rec.update(_parse_job_log_footer(tail))
         for line in tail:
+            # Only a log that never started: a running job may print anything, the marker too.
+            if not started_at and line.startswith(CANCELLED_QUEUED_MARKER):
+                rec["cancelled_queued"] = True
+                rec["cause"] = f"{line.strip()}: it never ran"
+                break
             if "[KILLED by device recovery]" in line:
                 rec["recovery_killed"] = True
                 msg = line.partition("[KILLED by device recovery]")[2].strip()
@@ -10841,6 +10862,8 @@ def _recent_jobs(limit: int = 20) -> list[dict]:
                     rec["cause"] = "killed by device recovery: a chip left PCIe bus"
                 if not (rec.get("command") or "").startswith("[MCP killed"):
                     rec["command"] = f"[MCP killed: chips left PCIe] {rec.get('command') or ''}"
+            elif rec.get("cancelled_queued"):
+                rec["wait"] = "-"  # nothing waited on the device: it left the queue unrun
             elif rec["status"] == "started" and _hold_row is not None and rec["job_id"] == _hold_row["id"]:
                 rec["runtime"] = _span_str(_hold_row["started_at"], now)
             elif rec.get("owner") == "[broker]hold" and rec["status"] == "completed":
@@ -14208,6 +14231,11 @@ def create_mcp_server() -> MCPServer:
             return {"error": "Job not found"}
 
         job = jobs[job_id]
+        # The REST route passes `tail` through raw: clamp it here, as the tool's schema does.
+        try:
+            tail = max(1, min(int(tail), MAX_LOG_TAIL_LINES))
+        except (TypeError, ValueError):
+            tail = 100
         content = ""
         if job.log_file and os.path.exists(job.log_file):
             with open(job.log_file, "r") as f:
@@ -14272,6 +14300,14 @@ def create_mcp_server() -> MCPServer:
         if logger:
             logger.info(f"KILL job_id={job_id} ({action}) requested by {caller_owner} " f"— job owner {job.owner}")
         health_event("job_killed", job_id=job_id, action=action, requested_by=caller_owner, job_owner=job.owner)
+
+        if action == "cancelled" and job.log_file:
+            # No runner ever picks this job up, so nothing else writes its footer: without one the
+            # recent list could only guess from a log ending at "[Waiting to start...]" (spec 01 I69).
+            try:
+                write_cancelled_job_log_footer(Path(job.log_file), job, caller_owner)
+            except OSError:
+                pass
 
         if terminate is not None:
             # Outside the lock so the job can release the device before SIGKILL.

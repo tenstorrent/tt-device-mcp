@@ -1023,3 +1023,75 @@ def test_a_queued_job_that_never_started_is_abandoned_not_interrupted(monkeypatc
     j = next(r for r in srv._recent_jobs(20) if r["job_id"] == "901")
     assert j["status"] == "abandoned"
     assert "before it started" in j["cause"]
+
+
+@pytest.mark.asyncio
+async def test_a_job_cancelled_while_queued_gets_a_footer_and_reads_killed_everywhere(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """A queued job cancelled with `tt-device-mcp kill` read `killed` in the job-status API but
+    `abandoned` in the recent list, and its log stopped at "[Waiting to start...]" with no footer:
+    nothing but the runner wrote footers, and the runner never picks a cancelled job up (01 I69)."""
+    from starlette.testclient import TestClient
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    monkeypatch.setattr(srv, "job_log_dir", logs)
+    monkeypatch.setattr(srv, "jobs", {})
+    log = logs / "2026-10-21_091900_047.log"
+    log.write_text(
+        "=" * 70 + "\n"
+        "JOB ID:      047\nOWNER:       tester\nCOMMAND:     echo hi\n"
+        "QUEUED:      2026-10-21T09:19:00.000000\n" + "=" * 70 + "\n\n[Waiting to start...]\n\n"
+    )
+    job = srv.Job(
+        id="047",
+        owner="tester",
+        workspace="/tmp",
+        command="echo hi",
+        queued_at="2026-10-21T09:19:00.000000",
+        status=srv.JobStatus.QUEUED,
+        log_file=str(log),
+    )
+    srv.jobs["047"] = job
+
+    app = srv.build_asgi_app(srv.create_mcp_server())
+    with TestClient(app) as client:
+        r = client.post("/api/tt_device_job_kill", json={"job_id": "047", "owner": "tester"}).json()
+        api = client.post("/api/tt_device_job_status", json={"job_id": "047"}).json()
+
+    assert r["status"] == "cancelled", r  # the kill reply still says how it was killed
+    assert api["status"] == "killed", api
+    text = log.read_text()
+    assert "[CANCELLED before it started] cancelled by " in text
+    footer = srv._parse_job_log_footer(text.splitlines(keepends=True))
+    assert footer["status"] == "killed", text
+    assert footer["finished_at"] == job.finished_at
+
+    srv.jobs.clear()  # evicted from memory: the list reads only the log, as after cleanup or a restart
+    row = next(x for x in srv._recent_jobs(20) if x["job_id"] == "047")
+    assert row["status"] == api["status"] == "killed", row
+    assert row["wait"] == "-"
+    assert row["cause"].startswith("[CANCELLED before it started]"), row
+
+
+def test_a_running_job_that_prints_the_cancel_marker_is_not_read_as_cancelled(monkeypatch, tmp_path, clear_job_state):
+    """The marker counts only in a log that never started: a job's own output may print anything."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    monkeypatch.setattr(srv, "job_log_dir", logs)
+    monkeypatch.setattr(srv, "jobs", {})
+    (logs / "2026-10-21_091900_048.log").write_text(
+        "=" * 70 + "\n"
+        "JOB ID:      048\nOWNER:       tester\nCOMMAND:     echo hi\n"
+        "QUEUED:      2026-10-21T09:19:00.000000\n" + "=" * 70 + "\n"
+        "[Started at 2026-10-21T09:19:01.000000]\n"
+        "[CANCELLED before it started] printed by the job itself\n"
+        "\n" + "=" * 70 + "\nFINISHED:    2026-10-21T09:19:05.000000\nSTATUS:      completed\n"
+        "EXIT CODE:   0\nWAIT TIME:   1.0s\nRUNTIME:     4.0s\n" + "=" * 70 + "\n"
+    )
+
+    row = next(x for x in srv._recent_jobs(20) if x["job_id"] == "048")
+    assert row["status"] == "completed"
+    assert row["wait"] == "1.0s"
+    assert not row.get("cause"), row

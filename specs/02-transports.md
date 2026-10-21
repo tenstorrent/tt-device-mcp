@@ -27,6 +27,8 @@ transport. The HTTP/TCP listener predates it, attaches no identity, and is to be
   REST route, both call the same shared helper (`_queue_job`, `_get_job_status`, `_get_job_logs`,
   `_kill_job`, `_get_queue_status`, `_exec_impl`, `_reset_device`). Limits and refusals enforced
   in the helper (e.g. spec 01's `MAX_TIMEOUT_SEC` clamp) hold identically on every ingress path.
+  So does the job-logs `tail`: `_get_job_logs` clamps it to 1..`MAX_LOG_TAIL_LINES` (10,000),
+  the bound the MCP tool's schema states, and a value that is not a number reads as 100.
 - **I3 — Transport identity exists on the socket and only on the socket.** A request arriving over
   the unix socket carries the peer's real uid (SO_PEERCRED), stamped per request into
   `socket_transport.current_peer_uid`; a TCP/HTTP request carries none (`None`, unauthenticated).
@@ -258,7 +260,7 @@ CONTRIBUTING's workflow) — spec diff first, then the removal, in its own PR.
 | Claim | Test(s) |
 |---|---|
 | I1 / I7 | `tests/test_server.py::test_the_app_serves_the_shims_synthetic_socket_host`, `tests/test_socket_transport.py::test_socket_jsonrpc_round_trip` |
-| I2 | `tests/test_device_safety.py::test_rest_submit_clamps_timeout_to_the_hard_ceiling`, `tests/test_reset.py::test_privsep_streaming_reset_refuses_over_a_foreign_holder` |
+| I2 | `tests/test_device_safety.py::test_rest_submit_clamps_timeout_to_the_hard_ceiling`, `tests/test_device_safety.py::test_rest_job_logs_clamps_tail_to_the_tool_cap`, `tests/test_reset.py::test_privsep_streaming_reset_refuses_over_a_foreign_holder` |
 | I3 (uid stamped on socket, none on TCP) | `tests/test_socket_transport.py::TestPeerUidScope::test_peer_uid_from_unix_scope`, `tests/test_socket_transport.py::TestPeerUidScope::test_tcp_scope_has_no_peer_uid`, `tests/test_socket_transport.py::TestPeerUidScope::test_missing_client_is_none`, `tests/test_socket_transport.py::TestPeerUidScope::test_middleware_publishes_and_clears_contextvar`, `tests/test_socket_transport.py::TestPeerUidScope::test_the_middleware_derives_the_surface_from_the_request_path` |
 | I3 (identity is authoritative vs self-report — spec 05 owns mechanics) | `tests/test_authz.py::TestAuthzOwner::test_socket_overrides_reported_owner`, `tests/test_authz.py::TestAuthzOwner::test_http_uses_reported_owner`, `tests/test_authz.py::TestAuthzOwner::test_http_unknown_when_no_owner` |
 | I4 (resolution order, lazy daemon, no TCP) | `tests/test_stdio_shim.py::test_resolve_prefers_explicit_socket`, `tests/test_stdio_shim.py::test_resolve_auto_discovers_broker_socket`, `tests/test_stdio_shim.py::test_resolve_lazy_starts_user_daemon_when_none` |
