@@ -505,9 +505,9 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
 
     patch_recovery(monkeypatch, "_verify_device", healthy)
     out = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={})
-    assert out == galaxy.OUTCOME_RECOVERED and cycles["n"] == 0, (
-        "a mesh that returned during the settle skips the host rung"
-    )
+    assert (
+        out == galaxy.OUTCOME_RECOVERED and cycles["n"] == 0
+    ), "a mesh that returned during the settle skips the host rung"
 
     async def bad(expected, log, run_fabric=True, **k):
         return False, {"snapshot": {"ok": False}}
@@ -519,9 +519,9 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
     out_held = await g._fire_gate_rung(
         "post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={}
     )
-    assert out_held == galaxy.OUTCOME_WAITING and cycles["n"] == 0, (
-        "a host rung never fires when the last-chance sweep was skipped"
-    )
+    assert (
+        out_held == galaxy.OUTCOME_WAITING and cycles["n"] == 0
+    ), "a host rung never fires when the last-chance sweep was skipped"
 
     # The full sweep ran and the mesh is still bad: the host rung fires.
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
@@ -532,9 +532,9 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
 
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", fake_reset)
     out2 = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={})
-    assert out2 == galaxy.OUTCOME_WAITING and cycles["n"] == 1, (
-        "a mesh still bad after the full sweep, settle and verify proceeds to the host rung"
-    )
+    assert (
+        out2 == galaxy.OUTCOME_WAITING and cycles["n"] == 1
+    ), "a mesh still bad after the full sweep, settle and verify proceeds to the host rung"
 
 
 # ---------------------------------------------------------------- (d) power-cycle cooldown (1800s)
@@ -608,9 +608,9 @@ async def test_a_device_fault_killed_job_is_not_restored_after_a_restart(monkeyp
 
     assert "042" not in srv.jobs, "a device-fault-killed job must not be re-queued"
     assert "043" in srv.jobs, "an ordinary queued job is still restored"
-    assert not srv._queued_spec_path("042").exists(), (
-        "the killed job's spec is dropped so a later boot never restores it"
-    )
+    assert not srv._queued_spec_path(
+        "042"
+    ).exists(), "the killed job's spec is dropped so a later boot never restores it"
     assert srv._device_fault_failed_reason("042") is None, "the record is consumed once the restart it guarded has run"
 
 
@@ -752,9 +752,9 @@ async def test_the_other_two_roads_to_a_power_cycle_go_through_the_sweep(path):
         f"gives the resets one more try (user, 2026-09-17)"
     )
     # and the sweep is reached BEFORE the rung fires, not after it
-    assert body.index("_settle_and_verify_before_host_rung") < body.index("auto_power_cycle_host"), (
-        f"{fn} calls the sweep AFTER the power cycle — it must gate it"
-    )
+    assert body.index("_settle_and_verify_before_host_rung") < body.index(
+        "auto_power_cycle_host"
+    ), f"{fn} calls the sweep AFTER the power cycle — it must gate it"
 
 
 @pytest.mark.asyncio
