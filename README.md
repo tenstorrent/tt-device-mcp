@@ -76,7 +76,7 @@ kills the job's whole process tree (SIGTERM, then SIGKILL at most 10 s later). T
 ends `preempted`. If the job returns 0, either by ending itself inside the minute or by
 handling SIGTERM so that every process exits through its own code with status 0 (read from
 the kernel's exit records, past the job wrapper's own `exit 143`; the job then reports exit
-code 0), no health check and no reset run before the next job. If every process exits through its own code on SIGTERM
+code 0), no health check and no reset run before the next job. (A frozen eth core left by such a job is then caught by the next job, within its runtime or the 300 s silent-hang limit; a fault the health sampler or the output scan sees still holds the device.) If every process exits through its own code on SIGTERM
 with another exit status (the broker reads this from the kernel's exit records, which may
 need root on some kernels), the usual fast between-jobs check runs. Otherwise (SIGKILL needed, any process killed by a signal, or
 the exits could not be witnessed) the device is marked dirty: the full health check,

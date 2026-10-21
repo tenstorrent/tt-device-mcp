@@ -112,7 +112,13 @@ the queue and a running job outlive the broker process.
   any kind runs and no reset; with any other or an unproven status the normal fast post-job
   gate runs, no reset, and a failed fast check holds the device and goes on to the full check and the bounded recovery as after any job. Exit 0
   waives only the check the preemption itself would owe: a device fault named in the job's
-  output, or a device not HEALTHY when the job ends, still runs the gate. In every other case
+  output, or a device not HEALTHY when the job ends, still runs the gate. Recovery-time cost of
+  the waiver (both exit-0 paths, the yield inside the minute and a handled SIGTERM): the skipped
+  fast check includes the passive eth-heartbeat read, the only post-job catch for an eth core
+  frozen by a job that exited cleanly. Detection of that fault moves to the next job: at most
+  that job's runtime, or `HUNG_SILENCE_SEC` (300 s) for a silent hang, after which the normal
+  frozen-eth path (spec 03) runs. A fault the health sampler or the job-output scan sees still
+  holds and gates as before. In every other case
   (SIGKILL sent; any process died from a signal, SIGTERM's default action included; an exit
   not witnessed, because the connector is unavailable (some kernels allow it only with
   CAP_NET_ADMIN), events were lost (a reader thread drains the socket as they arrive, so a
