@@ -4792,6 +4792,8 @@ def _maybe_spawn_eth_rearm() -> None:
 # ``since``) it already gave its one gate.
 _dirty_idle_gate_monotonic: float = 0.0
 _dirty_idle_gate_spent_since: Optional[str] = None
+# The episode whose gate was last journaled, so a rung retried behind its pacing journals once.
+_dirty_idle_gate_logged_since: Optional[str] = None
 
 
 def _dirty_idle_gate_why(why: str) -> bool:
@@ -4823,9 +4825,10 @@ async def _attempt_dirty_idle_gate() -> None:
 
     Once per hold episode: a pass lifts it, a failure takes the gate's own ladder and the hold stays
     with the bounded escalation (I23). A dirty I42-latched hold takes the present-mesh rung instead
-    (see _dirty_idle_gate_latched_reset). Skipped while a reset scope cycles, a tenant or a reaped
+    (see _dirty_idle_gate_latched_reset); a tick on which that rung ran no reset does not spend the
+    episode's gate. Skipped while a reset scope cycles, a tenant or a reaped
     job's leftover holds the device, or the episode changed. Never raises."""
-    global _dirty_idle_gate_monotonic, _dirty_idle_gate_spent_since
+    global _dirty_idle_gate_monotonic, _dirty_idle_gate_spent_since, _dirty_idle_gate_logged_since
     now = time.monotonic()
     if _dirty_idle_gate_monotonic and (now - _dirty_idle_gate_monotonic) < DIRTY_IDLE_GATE_RECHECK_SEC:
         return
@@ -4839,14 +4842,20 @@ async def _attempt_dirty_idle_gate() -> None:
         if not _dirty_idle_gate_armed():
             return
         rec = fsm.record
+        spent_before = _dirty_idle_gate_spent_since
         _dirty_idle_gate_spent_since = rec.since
-        if logger:
-            logger.info(
-                f"IDLE-GATE dirty {rec.why} hold with nothing queued — running the post-job gate, fabric forced"
-            )
-        health_event("dirty_idle_gate", why=rec.why, since=rec.since)
-        if rec.why not in DIRTY_IDLE_GATE_WHYS:
-            await _dirty_idle_gate_latched_reset()
+        latched = rec.why not in DIRTY_IDLE_GATE_WHYS
+        if rec.since != _dirty_idle_gate_logged_since:
+            _dirty_idle_gate_logged_since = rec.since
+            if logger:
+                gate = "the present-mesh rung" if latched else "the post-job gate, fabric forced"
+                logger.info(f"IDLE-GATE dirty {rec.why} hold with nothing queued — running {gate}")
+            health_event("dirty_idle_gate", why=rec.why, since=rec.since)
+        if latched:
+            if not await _dirty_idle_gate_latched_reset():
+                # No rung ran (paced behind the last reset, or the re-check bailed): the episode keeps
+                # its gate, so the next recheck tick retries as soon as the pacing allows.
+                _dirty_idle_gate_spent_since = spent_before
             return
         # Not under _device_op: the gate takes it itself, and the lock is not reentrant.
         await _device_health_gate(None, phase="post-job", run_fabric=True, force_fabric=True)
@@ -4856,11 +4865,15 @@ async def _attempt_dirty_idle_gate() -> None:
             logger.error(f"IDLE-GATE post-job gate error: {e}")
 
 
-async def _dirty_idle_gate_latched_reset() -> None:
+async def _dirty_idle_gate_latched_reset() -> bool:
     """The idle gate on a dirty I42-latched hold (spec 03 I68): the fabric was measured bad, so the
     present-mesh rung resets now with no grace (I56) rather than the post-job gate, which holds a
     present mesh below the galaxy-reset floor. The rung's full post-reset check (fabric, descriptor)
-    alone releases; a failure climbs to the host rung at once (04 I79)."""
+    alone releases; a failure climbs to the host rung at once (04 I79).
+
+    Returns whether a rung ran. A rung that came back WAITING (its retry pacing behind a reset that
+    started under the grace ago, a reset scope, a tenant) or a re-check that bailed ran none, and the
+    caller keeps the episode's gate for the next tick."""
 
     def _log(msg: str) -> None:
         if logger:
@@ -4868,18 +4881,19 @@ async def _dirty_idle_gate_latched_reset() -> None:
 
     indices = _present_chip_indices()
     if not indices:
-        return
+        return False
     expected = health_monitor.expected(len(indices))
     async with _device_op("idle-gate"):
         if not (fsm.state is ServerState.RECOVERING and fsm.record.why == FABRIC_RELIFT_WHY):
-            return  # a job's gate or a reset took the hold over while we waited for the lock
+            return False  # a job's gate or a reset took the hold over while we waited for the lock
         if not health_monitor.topology_hw_fault or _startup_verify_owns_hold():
-            return
+            return False
         _void_fabric_ok("idle gate: present")
         outcome = await galaxy_recovery.escalate(
             "present", indices, expected, _log, measured_fault=True, stand_down=_startup_verify_owns_hold
         )
         _fold_rung_outcome(outcome, _log)
+        return outcome != OUTCOME_WAITING
 
 
 def _maybe_spawn_idle_relift() -> None:

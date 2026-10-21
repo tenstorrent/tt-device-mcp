@@ -526,8 +526,8 @@ async def _idle_tick():
 async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_once(monkeypatch, latched_mesh, heals):
     """03 I42 with I68 (class D time to recover): a dirty mark on the latched hold (the failed job's own)
     keeps its why, so the read-only relift bails on it and, with nothing queued, it waited for the
-    600 s bound. Now the first idle tick runs the post-job gate, fabric forced: the reset with no
-    grace, then the full check with the descriptor. Only its pass releases (and ends the latch); a
+    600 s bound. Now the first idle tick runs the present-mesh rung: the reset with no grace, then
+    the full check with the descriptor. Only its pass releases (and ends the latch); a
     failed check never releases and the ladder climbs to the host rung at once."""
     _idle_queue(monkeypatch)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
@@ -571,6 +571,60 @@ async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_o
     await srv._force_escalate_stuck_hold()
     assert len(cycles) == 1, "no second power cycle while the first is pending"
     assert srv.fsm.state is not ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heals", [True, False], ids=["reset-heals", "ports-stay-missing"])
+async def test_a_paced_present_rung_does_not_spend_the_dirty_latched_idle_gate(monkeypatch, latched_mesh, heals):
+    """03 I68 class D, paced: a mesh reset started 60 s ago, so the present-mesh rung waits out its
+    grace (WAITING, no reset). That tick must not spend the episode's one gate, or the hold waits for
+    the 600 s bound. The first tick after the pacing runs exactly one reset and the full check with
+    the descriptor; only its pass releases, and a failure takes exactly one power cycle."""
+    from tt_device_mcp.health.recovery import galaxy
+
+    _idle_queue(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    cycles = []
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", time.monotonic() - 60)
+    srv._mark_device_dirty("job 7 ended failed")
+    assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY and srv.fsm.record.dirty, "the latched hold, now dirty"
+    latched_mesh["reset_heals"] = heals
+    await _idle_tick()
+    assert latched_mesh["resets"] == [], "paced: no reset 60 s after the last one"
+    assert srv.fsm.state is ServerState.RECOVERING and srv.fsm.record.why == srv.FABRIC_RELIFT_WHY, "still held"
+    assert "device_released" not in latched_mesh["events"] and not cycles
+    assert srv._dirty_idle_gate_armed(), "a tick that ran no reset leaves the episode's gate armed"
+    # The grace has passed since that reset started: the next recheck tick takes the rung.
+    srv.recovery_mechanism.last_reset_monotonic = time.monotonic() - galaxy._present_mesh_reset_grace_sec() - 1
+    monkeypatch.setattr(srv, "_dirty_idle_gate_monotonic", 0.0)
+    srv._relift_task = None
+    await _idle_tick()
+    assert latched_mesh["resets"] and latched_mesh["resets"][0] == ["tt-smi", "-glx_reset"], "reset once paced"
+    assert latched_mesh["verifies"][-1] is True, "the check after the reset runs the fabric pass"
+    assert any("--cabling-descriptor-path" in c for c in latched_mesh["calls"]), "the descriptor ran again"
+    ok, detail = latched_mesh["fabric"][-1]
+    if heals:
+        assert latched_mesh["resets"] == [["tt-smi", "-glx_reset"]]
+        assert ok is True and srv.fsm.state is ServerState.HEALTHY, "only a passing full check releases"
+        assert srv.health_monitor.topology_hw_fault == "" and not cycles
+        return
+    assert ok is False and fabric.LINKS_MISSING in detail, "the latched mismatch FAILS the check"
+    assert srv.fsm.state is not ServerState.HEALTHY and "device_released" not in latched_mesh["events"]
+    assert len(cycles) == 1, "a failed check takes exactly one power cycle"
+    # The episode's gate is spent now: no second reset from the idle gate on the same episode.
+    resets = len(latched_mesh["resets"])
+    monkeypatch.setattr(srv, "_dirty_idle_gate_monotonic", 0.0)
+    srv._relift_task = None
+    await _idle_tick()
+    assert len(latched_mesh["resets"]) == resets and len(cycles) == 1
 
 
 @pytest.mark.asyncio
