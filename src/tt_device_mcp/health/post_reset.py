@@ -59,6 +59,12 @@ class FabricDebt:
             health_event("post_reset_fabric_owed", reset=what)
         self.owed = what
 
+    def note_fabric_killed(self, what: str) -> None:
+        """A fabric pass was cut short before its verdict (spec 03 I82): no earlier pass vouches for
+        the fabric any more, and a fresh pass is owed before a release."""
+        self.pass_monotonic = 0.0
+        self.note_reset(what)
+
     def note_fabric(self, ok: Optional[bool]) -> None:
         """Fold one fabric verdict in: only a healthy one settles the debt."""
         if ok is True:
