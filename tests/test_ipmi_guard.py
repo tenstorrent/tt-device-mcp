@@ -152,6 +152,7 @@ def test_arm_mounts_the_guard_over_every_target_read_only(tmp_path):
     for t in (a, b):
         assert ("-o", "remount,bind,ro", str(t)) in mounts
         assert ipmi_guard.GUARD_TAG in t.read_text()
+    assert (guard_dir / ipmi_guard.GUARD_NAME).stat().st_mode & 0o777 == 0o700  # owner-only
 
 
 def test_arm_fails_closed_when_a_target_is_not_the_guard_after_mounting(tmp_path):
