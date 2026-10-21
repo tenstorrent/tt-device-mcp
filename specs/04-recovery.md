@@ -1592,7 +1592,11 @@ each rung fires only when the gentler one failed or cannot apply.
   saves, including the startup check that releases a hold a dead broker left open; a pass that does
   not release (a reset still owes its fabric pass, I32) ends nothing. A tenant hold (a foreign process holds the device) is not fault time: its release saves
   no carry, it neither takes nor continues one, and a fault hold's carry stays in force across it
-  for a later fault hold in the carry's own window (tenant holds are never persisted, I76). The
+  for a later fault hold in the carry's own window (tenant holds are never persisted, I76). A
+  tenant hold that turns into a fault hold (the holder left the device still faulted) takes, at
+  that switch, a fault carry still in its window, as a fault hold opened then would
+  (`hold_turned_fault`). The first job's end is noted before the job-end checks run, so one of
+  them raising cannot leave the window open; only a clean end drops the carry. The
   carry (`hold_carry.json`) and the bound ladder's age (in the episode record) are on disk, so a
   broker restart keeps them: a hold the last broker left open escalates no later than its own
   start + 600 s (at once when that is past), and a hold that one past its bound ladder goes to the
@@ -1609,6 +1613,7 @@ each rung fires only when the gentler one failed or cannot apply.
   | Release, re-hold within 300 s with no job, below the bound | new 10-min clock | carried: the class path runs as before; the clock keeps the episode start, so the bound fires no later than episode start + 600 s |
   | First job after the release succeeds, or a full check passes with no hold open, then a new fault | new episode | new episode: unchanged; the class's own fast path runs (a whole-tray drop still goes straight to a power cycle) |
   | Tenant hold released, then a fault hold | new episode | new episode: unchanged; the tenant's time is not counted |
+  | Tenant hold turns into a fault hold within 300 s of a bound ladder's release | one more ladder at 10 min (about 10-13 min) before the host rung | carried: no ladder, power-cycle request at once (I65 cooldown still applies) |
   | Hold open across a broker restart | 10-min clock restarted at the restart | escalates no later than episode start + 600 s |
   | Every other class path below the bound | unchanged | unchanged |
 
@@ -2181,6 +2186,8 @@ sees a silent fabric pass.
 | I82 a broker restart keeps the clock: a released episode's re-hold goes to the power cycle, a hold open past its bound escalates at once, one past its bound ladder goes to the host rung | `tests/test_hold_episode_carry.py::test_replay_a_restart_whose_startup_check_releases_then_a_failed_first_job_goes_to_the_power_cycle`, `::test_a_hold_open_across_a_restart_escalates_at_once_when_past_the_bound`, `::test_a_hold_open_across_a_restart_after_its_bound_ladder_goes_to_the_host_rung`, `::test_replay_a_restart_whose_real_startup_gate_releases_keeps_the_carry` |
 | I82 the carry ends when the device proves the release right: a successful first job, or a full check that passes with no hold open, gives the next fault a fresh episode and no cycle; the releasing pass keeps the carry it saves | `tests/test_hold_episode_carry.py::test_a_successful_first_job_ends_the_episode`, `::test_a_passing_full_check_with_no_hold_open_drops_the_carry`, `::test_a_passing_full_check_that_releases_a_hold_keeps_the_new_carry`, `::test_a_pass_whose_release_is_refused_keeps_the_carry` |
 | I82 a tenant hold saves no carry and does not take or spend a fault hold's carry | `tests/test_hold_episode_carry.py::test_a_tenant_hold_leaves_no_carry`, `::test_a_tenant_hold_between_does_not_spend_a_fault_holds_carry` |
+| I82 a tenant hold that turns into a fault hold takes a fault carry in its window, not one past it | `tests/test_hold_episode_carry.py::test_a_tenant_hold_that_turns_into_a_fault_hold_takes_the_carry_in_its_window`, `::test_a_tenant_hold_that_turns_into_a_fault_hold_past_the_window_is_a_new_episode` |
+| I82 the first job's end closes the carry window even when a job-end check raises; a clean end drops the carry, a failed one keeps it | `tests/test_hold_episode_carry.py::test_the_first_jobs_end_closes_the_carry_window_even_when_a_job_end_check_raises`, `::test_the_first_jobs_verdict_still_decides_the_carry` |
 | I82 on the carried path the I65 cooldown defers the host rung with no ladder and no cycle, the request fires at its end, once per episode | `tests/test_hold_episode_carry.py::test_the_carried_host_rung_waits_out_the_cooldown_and_asks_once` |
 | I76 `TT_DEVICE_MCP_FORCE_ESCALATE=0` does not stop the bound, and the boot warning says so; a held job past the bound still starts its escalation and below it names the bound; no message claims the hold has no automatic exit | `tests/test_hold_bound.py::test_the_operator_kill_switch_does_not_stop_the_bound`, `tests/test_rung_privilege.py::test_the_force_escalate_kill_switch_warns_that_the_hold_bound_ignores_it`, `tests/test_hold_bound.py::test_a_held_job_past_its_bound_under_the_kill_switch_says_the_bound_still_runs`, `tests/test_device_safety.py::test_hold_bound_counts_from_the_episode_and_reuses_a_spent_escalation`, `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
 | I58 all off after a failed reset and a broker restart: the startup or a later gate cycles with no second reset; the sweep skips a failed-unchanged set | `tests/test_classac_power_cycle_direct.py::test_replay_all_off_after_a_restart_cycles_with_no_second_reset`, `::test_a_partial_drop_keeps_the_ladder` |
