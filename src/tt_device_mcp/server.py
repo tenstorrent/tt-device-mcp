@@ -5691,6 +5691,11 @@ async def _kill_device_holders(reason: str) -> list:
             killed.append({"pid": proc.pid, "user": who})
         except (ProcessLookupError, OSError):
             pass
+        if who == "[broker]fabric-check":
+            # Its -9 is ours, not the fabric's: no verdict, a full pass owed (spec 03 I82). Marked
+            # even when killpg raised (the group already gone): conservative on purpose, as a pass
+            # that races a dead chip proves nothing either.
+            health_monitor.note_fabric_check_killed(reason)
     if logger:
         logger.error(
             f"DEAD-CHIP killed {len(killed)} device holder(s) — {reason}. Their "
