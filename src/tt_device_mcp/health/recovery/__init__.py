@@ -753,7 +753,7 @@ class Recovery(ABC):
         FABRIC_DEBT.note_evidence(evidence)
         return healthy, evidence, retries
 
-    async def _reset_and_verify_device(self, indices: list, log) -> Optional[bool]:
+    async def _reset_and_verify_device(self, indices: list, log, arc_retry: bool = True) -> Optional[bool]:
         """Recover the device with ONE reset, performed safely, then prove it worked.
 
         Safety here is structural, not statistical — the reset is exclusive (the caller
@@ -772,11 +772,19 @@ class Recovery(ABC):
         enum+ARC verify and only the fabric stayed unverifiable (a persistent 77: held fabric-unverified,
         the caller must not climb on it), False otherwise.
         """
+        started = time.monotonic()
         try:
-            return await self._reset_and_verify_device_once(indices, log)
+            return await self._reset_and_verify_device_once(indices, log, arc_retry=arc_retry)
         finally:
             # The reset and its verify are over and the host is still up: an off-bus intent is spent.
             pcie_guard.end_offbus_reset()
+            if self.mechanism.last_reset_monotonic >= started and "-glx_reset" in self.reset_argv(indices):
+                # A launched Galaxy mesh reset: the capped repeat paces and sizes itself from it (I93).
+                self.mechanism.last_mesh_reset_run = {
+                    "episode": self.deps.device_hold_episode_since() or "",
+                    "started": started,
+                    "ended": time.monotonic(),
+                }
 
     async def _arc_not_ready_retry_due(self, argv: list, expected: int, log) -> bool:
         """After a mesh reset that EXITED non-zero: is this the one shape a second reset clears, on a box
@@ -810,6 +818,8 @@ class Recovery(ABC):
             "one more reset on the idle device (not a dead endpoint)"
         )
         health_event("reset_arc_not_ready_retry", argv=argv, arc_not_ready=not_ready, expected_chips=expected)
+        # This second reset is the episode's one capped repeat (spec 04 I93): no further one follows it.
+        self.mechanism.mesh_reset_repeat_at = time.monotonic()
         return True
 
     async def _reset_and_verify_device_once(self, indices: list, log, arc_retry: bool = True) -> Optional[bool]:
