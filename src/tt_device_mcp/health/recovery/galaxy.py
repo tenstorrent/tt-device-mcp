@@ -1819,9 +1819,7 @@ class GalaxyRecovery(Recovery):
         kept: a rescan and an SBR re-init no eth core on the other chips."""
         key = (hold_since, frozenset(offbus_set))
         prev = self._below_floor_rungs_key
-        if prev is not None and prev[1] == key[1] and prev[0] in (hold_since, None):
-            # The same episode: a pass that ran before the hold had its start time stamped counts.
-            self._below_floor_rungs_key = key
+        if prev == key:  # the same episode and off-bus set
             return OUTCOME_WAITING
         self._below_floor_rungs_key = key
         still_off = await self._below_floor_kept_rungs(offbus_set, expected, log, context=f"gate/{gate_phase}")

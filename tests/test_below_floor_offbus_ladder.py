@@ -361,6 +361,31 @@ async def test_a_bridged_gone_chip_reaches_the_bridge_write_at_the_bound(monkeyp
     assert order[-1] == "power cycle", "still off after the SBR: the ladder goes on"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["bound", "gate"])
+async def test_an_opted_in_gone_chip_with_no_bridge_is_unqueued(monkeypatch, tmp_path, clear_job_state, path):
+    """Opted in, the gone chip is queued, but no bridge has its bus as secondary: the real rung fires no
+    SBR, so the chip is un-queued. Left isolated, every later gate pass would route to a no-op bridge
+    rung; at the bound the ladder still goes on to the power cycle."""
+    order, events, _counters = _rig(monkeypatch, tmp_path, opt_in=True)
+    spy = _real_bridge_rung(monkeypatch, tmp_path)
+    (pci.PCI_DEVICES_DIR / "0000:40:1f.0" / "secondary_bus_number").unlink()
+    (pci.PCI_DEVICES_DIR / "0000:40:1f.0").rmdir()
+    srv.isolated_chips.clear()
+    if path == "bound":
+        srv.recovery_mechanism.note_rung_failed(srv.device_hold_episode_since, "mesh_reset", {GONE}, {GONE}, rc=1)
+        await _bound_ladder()
+        assert order[-1] == "power cycle", "still off with no SBR: the ladder goes on"
+    else:
+        assert await _gate() == OUTCOME_WAITING
+    assert spy["find"], "the opted-in rung looked for the bridge"
+    assert spy["setpci"] == [], "no bridge: no SBR fired"
+    assert srv.isolated_chips == set(), "the chip the rung could not fire on is un-queued"
+    assert "gone_chip_bridge_reset_unqueued" in events
+    stage = _rung(monkeypatch, srv.galaxy_recovery.deps, off_bus=1, sbr_candidates=len(srv.isolated_chips))
+    assert stage != STAGE_BRIDGE_RESET, "the next gate pass is not sent to a no-op bridge rung"
+
+
 # --- the gate -----------------------------------------------------------------------------------
 
 
@@ -383,21 +408,6 @@ async def test_the_gate_sbrs_a_gone_chip_when_opted_in_once_per_episode_and_set(
     srv.device_hold_episode_since = datetime.now().isoformat()  # a new episode
     await _gate()
     assert order[0] == "rescan"
-
-
-@pytest.mark.asyncio
-async def test_a_gate_pass_before_the_hold_start_is_stamped_counts_for_its_episode(
-    monkeypatch, tmp_path, clear_job_state
-):
-    """The latch keys on the hold's start time, which the first pass may not have yet: once it is
-    stamped, the same off-bus set does not run the rungs a second time."""
-    order, _events, _counters = _rig(monkeypatch, tmp_path)
-    srv.device_hold_episode_since = None
-    assert await _gate() == OUTCOME_WAITING and order == ["rescan"]
-    order.clear()
-    srv.device_hold_episode_since = datetime.now().isoformat()
-    assert await _gate() == OUTCOME_WAITING
-    assert order == [], "the same episode and set: no second rescan"
 
 
 @pytest.mark.asyncio
