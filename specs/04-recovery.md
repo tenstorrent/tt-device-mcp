@@ -1134,7 +1134,19 @@ each rung fires only when the gentler one failed or cannot apply.
   at most 300 s after the last boot when that boot came at or after it.
 - **I69 — A chip the broker removed is reset before anything re-enumerates it.** Isolating a dead
   chip (sysfs `remove`) records its parent bridge first, because the remove takes the node and its
-  parent link with it; the record clears when the chip is back on the bus. The bridge rung resets
+  parent link with it. The records are also kept in the health dir (`removed_chips.json`) with the
+  kernel boot id, and reloaded at broker start, where each reloaded chip is isolated again (sysfs
+  gives it no node, so no scan would): a broker restart does not make a removed, un-reset chip look
+  like one the broker never touched, and the bridge rung targets it. Every bridge-rung pass also
+  targets every recorded chip, whichever chips it was asked for, and the bare rescan is withheld
+  while any record, targeted or not, was not reset this pass: every rescan is global. A record from
+  another boot is dropped at start (the boot reset every endpoint and may renumber the bus); a start
+  that drops no record leaves the file as it was. A record clears whenever any device is enumerated
+  again at its recorded address, whatever brought it back (the bridge rung, a mesh reset, a tray
+  re-power, a power cycle); a node reusing the chip's index alone does not clear it. It is checked
+  on every read, so a stale record can neither withhold a later rescan nor aim a bridge reset at
+  live silicon. Clearing a record releases nothing: the returned chip still passes the full check,
+  fabric included, before any release (03 I4). The bridge rung resets
   such a chip through that recorded bridge, only while the bridge is still enumerated, its
   secondary bus is the chip's bus and nothing is enumerated on that bus (a stale record is refused
   and the chip holds). Every removed chip of the pass is reset (owing the AICLK ceiling, 03 I35),
@@ -1153,7 +1165,16 @@ each rung fires only when the gentler one failed or cannot apply.
   driver to re-bind when the first try lands (formerly a 3 s rescan with no reset); at most 3 tries
   with a 4 s settle between and the 3 s closing rescan, 44.3 s of waits, when it never returns. A
   removed chip that cannot be reset holds and reaches the next rung 3 s sooner; a tray-down onset
-  with a removed chip skips the prelude's rescan and its 3 s settle. Other classes are unchanged.
+  with a removed chip skips the prelude's rescan and its 3 s settle. With N removed chips that never
+  return, the first pass asserts every SBR (0.1 s each) before one 1 s settle and one 10 s re-bind
+  poll, the retries then run serially per chip (30.2 s each), then the closing 3 s rescan:
+  14 + 30.3 N s of waits (44.3 s for one chip, 74.6 s for two). A removed chip whose recorded-bridge
+  resets all fired and left it off the bus reports `removed_not_reenumerated`, which
+  `_classify_hold` reads as no window, like `no_bridge`: a whole-tray drop of removed chips keeps
+  its off-bus class (tray down, no window) and its budget instead of the generic one. A removed
+  chip after a broker restart (class B1, partial off-bus) gets this recorded-bridge rung, at most
+  14 + 30.3 N s of waits, instead of the full ladder. Other classes are unchanged; the I76 10-min bound (full ladder, then a power cycle) holds as
+  before.
 - **I71 — With a chip off the bus on a multi-chip mesh, the host rung is the power cycle; the
   warm reboot is its in-band fallback.** `_host_escalation_for_drop` names the power cycle first
   for a multi-chip climb with a chip off the bus (`off_bus > 0`: classes B1, B2) when
@@ -2321,7 +2342,8 @@ sees a silent fabric pass.
 | Reset tool contract: steps/attribution/no-devices/job stop | `tests/test_reset.py::test_reset_success_reports_steps_and_command`, `tests/test_reset.py::test_reset_failure_surfaces_returncode_and_output`, `tests/test_reset.py::test_explicit_reset_leaves_one_row_attributed_to_the_caller`, `tests/test_reset.py::test_reset_no_devices_does_not_call_tt_smi`, `tests/test_reset.py::test_a_reset_stops_the_running_job_gracefully`, `tests/test_reset.py::test_reset_device_quiesce_scope_routes_a_live_privsep_job` |
 | Rung inventory stated loudly at boot | `tests/test_rung_arming.py::test_a_rung_that_is_off_is_stated_loudly` |
 | I69 a removed chip is reset through its recorded bridge before the rescan; a stale record is refused; no rescan for a removed un-reset chip or when the gate left it un-reset; the bare rescan stays for a chip the broker did not remove, gate refusal or not | `tests/test_removed_chip_rescan.py::test_isolate_records_the_parent_bridge_before_the_remove`, `::test_a_removed_chip_is_reset_through_its_recorded_bridge_then_rescanned`, `::test_a_stale_recorded_bridge_is_refused`, `::test_no_rescan_for_a_removed_chip_without_privilege`, `::test_no_rescan_when_the_host_reset_gate_refuses`, `::test_a_gate_refusal_keeps_the_bare_rescan_for_a_chip_the_broker_did_not_remove`, `::test_no_rescan_when_a_removed_chip_has_no_usable_bridge`, `::test_every_removed_chip_is_reset_before_the_first_rescan`, `::test_the_bare_rescan_stays_for_a_chip_the_broker_did_not_remove`, `::test_a_returned_chip_drops_its_removal_record` |
-| I69 a removed chip's SBR owes the AICLK ceiling (03 I35); one 1 s retrain settle follows the last SBR before the rescan; the never-returns worst case is 44.3 s of waits | `tests/test_removed_chip_rescan.py::test_a_removed_chip_reset_owes_the_aiclk_ceiling`, `::test_the_link_retrains_after_the_last_sbr_before_the_rescan`, `::test_a_removed_chip_rung_stays_inside_its_stated_worst_case` |
+| I69 removal records survive a broker restart in the same boot, their chips are isolated again and reset through the recorded bridge before any rescan, also on a pass asked for another chip; any un-reset record withholds the bare rescan; an earlier boot's record is dropped; an unchanged start does not rewrite the file; a record clears whatever re-enumerates its address, not on a reused index; a failed save keeps the record; a removed chip left off the bus keeps the no-window class | `tests/test_removed_chip_rescan.py::test_a_removed_chip_record_survives_a_broker_restart`, `::test_boot_broker_reloads_and_isolates_the_removed_chips`, `::test_a_reloaded_record_still_withholds_the_bare_rescan`, `::test_a_pass_for_another_chip_resets_the_reloaded_chip_before_any_rescan`, `::test_an_unreset_record_outside_the_targets_withholds_the_bare_rescan`, `::test_a_record_from_an_earlier_boot_is_dropped_at_start`, `::test_an_unchanged_reload_does_not_rewrite_the_file`, `::test_a_record_clears_whatever_brings_the_chip_back`, `::test_a_record_clears_when_its_address_is_enumerated_again`, `::test_a_record_is_kept_while_only_its_index_is_reused`, `::test_a_failed_save_never_breaks_recovery`, `::test_a_removed_chip_that_stays_off_bus_keeps_the_no_window_class` |
+| I69 a removed chip's SBR owes the AICLK ceiling (03 I35); one 1 s retrain settle follows the last SBR before the rescan; the never-returns worst case is 44.3 s of waits, 14 + 30.3 N s for N chips | `tests/test_removed_chip_rescan.py::test_a_removed_chip_reset_owes_the_aiclk_ceiling`, `::test_the_link_retrains_after_the_last_sbr_before_the_rescan`, `::test_a_removed_chip_rung_stays_inside_its_stated_worst_case`, `::test_the_removed_chip_rung_worst_case_for_two_chips` |
 | I69 the tray-down prelude withholds its rescan while a removed chip is un-reset and goes straight to the ladder; with no record it rescans as before | `tests/test_tray_down_prelude.py::test_the_prelude_rescan_never_re_enumerates_a_removed_un_reset_chip` |
 | I69/03 I4 the bridge rung's gate path runs the full check, fabric included, before clearing dirty; a failed check holds | `tests/test_removed_chip_rescan.py::test_gate_bridge_stage_verifies_with_fabric_before_clearing_dirty`, `::test_gate_bridge_stage_failed_verify_holds` |
 | Stage metrics: structural inapplicability is not "blocked" | `tests/test_metrics.py::test_ubb_tray_no_tray_on_this_platform_is_not_applicable_not_blocked`, `tests/test_metrics.py::test_bridge_reset_missing_pci_address_is_not_applicable_not_blocked` |

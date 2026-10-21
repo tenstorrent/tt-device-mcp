@@ -77,6 +77,9 @@ OUTCOME_TERMINAL = "terminal"
 # is what turns a ~13 min recovery into a ~seconds one.
 BRIDGE_RESET_MAX_TRIES = 3
 BRIDGE_RESET_SETTLE_SEC = 4
+# The bridge rung's reason for a removed chip whose every recorded-bridge SBR fired and left it off
+# the bus (spec 04 I69); _classify_hold reads it as no window, like no_bridge.
+NO_WINDOW_REMOVED_REASON = "removed_not_reenumerated"
 
 # A reset returns before the eth links re-train, so the immediate post-reset fabric pass can find
 # no trained link (77). Retry (see Recovery._verify_device_after_reset), giving the links time to
@@ -460,6 +463,13 @@ class Recovery(ABC):
         # stale prior pass; the server threads it onto Evidence.bridge_reset_failed after this fires.
         self.last_bridge_reset_reasons: dict = {}
         isolated_chips = self.deps.isolated_chips()
+        # Spec 04 I69: every chip the broker removed is off the bus and un-reset, so it is a target
+        # whether or not this pass was asked for it (a record reloaded after a restart, say). Left out,
+        # the rescan any other chip's reset ends with would re-enumerate it un-reset.
+        adopted = [i for i in pci.removed_chip_ids() if i not in isolated_chips]
+        if adopted:
+            isolated_chips.update(adopted)
+            health_event("removed_chips_isolated", chips=adopted, context="bridge_reset")
         if not isolated_chips:
             return True
         targets = sorted(isolated_chips, key=int)
@@ -605,6 +615,11 @@ class Recovery(ABC):
                     await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
             else:
                 lost.append(idx)
+                if idx in reset_this_pass:
+                    # A chip the broker removed, reset through its recorded bridge on every try and
+                    # still off the bus: no SBR brings it back, the same no-window fact as no_bridge,
+                    # so its hold keeps its off-bus class (galaxy._classify_hold, spec 04 I69).
+                    self.last_bridge_reset_reasons[idx] = {"reason": NO_WINDOW_REMOVED_REASON}
                 metrics.stage_fired("bridge_reset", "failed")
 
         for idx in recovered:
@@ -627,10 +642,10 @@ class Recovery(ABC):
         )
 
         # Spec 04 I69: never re-enumerate a removed chip that was not reset this pass — the rescan
-        # lets the driver probe a hung chip. A refused host reset gate withholds it only then (the
-        # removed chips were not reset because of it); chips the broker never removed keep the
-        # bare rescan, as before the gate.
-        unreset_dead = [i for i in still_dead if pci.removed_chip(i) and i not in reset_this_pass]
+        # lets the driver probe a hung chip. Every record counts, not only this pass's targets: the
+        # rescan is global. A refused host reset gate withholds it only then (the removed chips were
+        # not reset because of it); chips the broker never removed keep the bare rescan, as before.
+        unreset_dead = [i for i in pci.removed_chip_ids() if i not in reset_this_pass]
         withhold = ("host_reset_gated" if gated else "removed_chip_not_reset") if unreset_dead else ""
         if still_dead and withhold:
             health_event("pci_rescan_withheld", chips=still_dead, unreset=unreset_dead, reason=withhold)

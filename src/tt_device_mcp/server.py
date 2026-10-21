@@ -153,6 +153,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     isolate_chip,
     journal_interrupted_fabric_check,
     link_signals,
+    load_removed_chips,
     mark_boot,
     mesh_reset_hold_reason,
     note_broker_stopping,
@@ -1170,6 +1171,18 @@ def _boot_platform_probe() -> None:
     health_monitor.verify_device_health(0, timeout_sec=BOOT_PLATFORM_PROBE_TIMEOUT_SEC)
 
 
+def _reload_removed_chips() -> list:
+    """Spec 04 I69: a chip an earlier broker process of this boot removed is still hung and un-reset.
+    Reload its record and isolate it again: sysfs gives it no node, so neither the gone-chip scan nor
+    the sampler would, and only an isolated chip gets the bridge rung that resets it through its
+    recorded bridge. The gate holds while it is isolated; nothing here releases anything."""
+    chips = load_removed_chips()
+    if chips:
+        isolated_chips.update(chips)
+        health_event("removed_chips_isolated_at_start", chips=chips)
+    return chips
+
+
 def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
     """The broker's boot flow: construct the health subsystem, then fix this host's platform.
 
@@ -1197,6 +1210,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         # A fresh process has no lost or recovering chip: publish that now, over whatever a process
         # that died mid-recovery left in the file (a per-user daemon's state dir outlives it).
         chip_state.publish()
+        _reload_removed_chips()
         recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
