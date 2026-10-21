@@ -104,7 +104,6 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
         monkeypatch.setattr(r, "_verify_device", verify)
     monkeypatch.setattr(g.mechanism, "await_foreign_scope", no_scope)
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
-    monkeypatch.setattr(g, "_auto_reboot_host", reboot)
     patch_health_event(monkeypatch, lambda name, *a, **k: st["events"].append(name))
     monkeypatch.setattr(alert, "send_alert", lambda event, log=None: st["alerts"].append(event) or object())
     monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})

@@ -206,7 +206,6 @@ async def test_the_warm_reboot_does_not_run_the_power_cycle_hook(cycle, monkeypa
     hook = _script(cycle["dir"], "hook", f"touch {ran}\n")
     monkeypatch.setenv("TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK", str(hook))
     fired = []
-    monkeypatch.setattr(galaxy, "_fire_host_reboot", lambda: fired.append(True))
     await srv.galaxy_recovery._auto_reboot_host(lambda _m: None, REASON)
     assert fired == [True]
     assert not ran.exists()

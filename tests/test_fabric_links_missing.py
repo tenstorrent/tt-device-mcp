@@ -408,7 +408,6 @@ async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
 
     # Like the real rungs, each stand-in leaves its request pending.
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", host_reboot)
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
     latched_mesh["reset_heals"] = False
     await srv._attempt_idle_relift()

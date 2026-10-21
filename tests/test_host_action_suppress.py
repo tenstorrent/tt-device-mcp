@@ -42,7 +42,6 @@ def held(monkeypatch, tmp_path):
     monkeypatch.delenv("TT_DEVICE_MCP_FORCE_ESCALATE", raising=False)
     fired = []
     monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append("power-cycle"))
-    monkeypatch.setattr(galaxy, "_fire_host_reboot", lambda: fired.append("reboot"))
     spawned = []
 
     async def _escalation():

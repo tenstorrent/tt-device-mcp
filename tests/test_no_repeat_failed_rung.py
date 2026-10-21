@@ -542,7 +542,6 @@ async def test_e3_present_mesh_resets_once_then_takes_the_next_rung(monkeypatch,
         counters["reboots"] += 1
         reboots_at.append(counters["resets"])
 
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", reboot)
     assert await _present_window(True) is True
     assert counters["resets"] == 1
     fired = {"power-cycle": order, "reboot": reboots_at, "none": []}[host_rung]

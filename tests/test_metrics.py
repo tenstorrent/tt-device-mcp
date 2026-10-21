@@ -278,12 +278,11 @@ def test_stages_also_match_health_recovery_own_stage_constants():
     independent vocabulary that merely happened to agree."""
     from tt_device_mcp.health.recovery import (
         STAGE_BRIDGE_RESET,
-        STAGE_HOST_REBOOT,
         STAGE_POWER_CYCLE,
         STAGE_SMI_RESET,
     )
 
-    for name in (STAGE_BRIDGE_RESET, STAGE_SMI_RESET, STAGE_HOST_REBOOT, STAGE_POWER_CYCLE):
+    for name in (STAGE_BRIDGE_RESET, STAGE_SMI_RESET, STAGE_POWER_CYCLE):
         assert name in metrics.STAGES
 
 

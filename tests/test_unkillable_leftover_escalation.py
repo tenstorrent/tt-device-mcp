@@ -42,7 +42,6 @@ def fence(leftover, rig, monkeypatch):  # noqa: F811 - the imported fixtures
     monkeypatch.setattr(srv, "_present_chip_indices", lambda: [str(i) for i in range(EXPECTED)])
     monkeypatch.setattr(srv.health_monitor, "expected", lambda n=0: EXPECTED)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=state["holders"], complete=True))
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: True)
     monkeypatch.setattr(srv.recovery_mechanism, "_reboot_already_attempted", lambda **k: False)
     # A fired rung leaves its host action pending (I34), as the real request marker does.
     fired = []
@@ -54,7 +53,6 @@ def fence(leftover, rig, monkeypatch):  # noqa: F811 - the imported fixtures
         rig["order"].append("reboot")
         fired.append("reboot")
 
-    monkeypatch.setattr(rig["g"], "_auto_reboot_host", reboot)
     return state
 
 
@@ -263,7 +261,6 @@ async def test_a_running_job_blocks_the_rung(fence, monkeypatch):
 
 
 async def test_no_host_rung_opted_in_journals_no_host_rung(fence, monkeypatch):
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
     t0 = _open(fence)
 
@@ -351,7 +348,6 @@ def both(fence, monkeypatch, clear_job_state):  # noqa: F811 - the imported fixt
     r = fence["rig"]
     m = srv.recovery_mechanism
     _present_hold_at_the_bound(r, monkeypatch, why="job_killed", detail="job 7 killed: device left dirty")
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(m, "auto_recovery_allowed", partial(type(m).auto_recovery_allowed, m))
     monkeypatch.setattr(m, "host_action_pending", types.MethodType(type(m).host_action_pending, m))
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-A")

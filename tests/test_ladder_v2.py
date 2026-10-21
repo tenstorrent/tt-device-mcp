@@ -135,7 +135,6 @@ async def test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep(monkey
     patch_recovery(monkeypatch, "_verify_device", verify)
 
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: opted_in)
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", lambda action, tenant_active=False, **k: (True, ""))
     cycles = {"n": 0}
 
@@ -345,7 +344,6 @@ async def test_tray_down_no_window_power_cycles_when_the_sweep_does_not_recover(
 
     patch_recovery(monkeypatch, "_verify_device", verify)
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", lambda action, tenant_active=False, **k: (True, ""))
     reboots = {"n": 0}
     cycles = {"n": 0}
@@ -357,7 +355,6 @@ async def test_tray_down_no_window_power_cycles_when_the_sweep_does_not_recover(
         reboots["n"] += 1
 
     monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_pc)
-    monkeypatch.setattr(g, "_auto_reboot_host", fake_reboot)
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 1 for i in range(24)})
 
     offbus = {str(i) for i in range(24, 32)}
@@ -389,7 +386,6 @@ def _wire_failed_tray_down_sweep(monkeypatch, read_heartbeats, *, allowed=True):
 
     patch_recovery(monkeypatch, "_verify_device", verify)
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(
         g.mechanism,
         "auto_recovery_allowed",

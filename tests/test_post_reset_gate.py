@@ -716,7 +716,6 @@ def _arm_last_chance_sweep(monkeypatch, mesh, evidence):
 
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh_reset)
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
-    monkeypatch.setattr(g, "_auto_reboot_host", reboot)
     patch_recovery(monkeypatch, "_verify_device", verify)
     return g, host
 
@@ -732,7 +731,7 @@ def _assert_no_release(mesh):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage", [galaxy.STAGE_HOST_REBOOT, galaxy.STAGE_POWER_CYCLE])
+@pytest.mark.parametrize("stage", [galaxy.STAGE_POWER_CYCLE])
 async def test_the_gate_ladders_last_chance_sweep(mesh, monkeypatch, galaxy_trays, sweep_verdict, stage):
     """The gate's host rung runs the sweep; its verify passes enum+ARC. Folded into the FSM the way the
     gate's ``_fire`` does, the device is released only on a passing fabric pass; otherwise it stays

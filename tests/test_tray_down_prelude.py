@@ -135,7 +135,6 @@ def rig(monkeypatch, galaxy_trays):
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     monkeypatch.setattr(srv, "read_heartbeats", lambda: dict(state["beats"]))
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", lambda action, tenant_active=False, **k: state["allowed"])
     monkeypatch.setattr(g.mechanism, "_journal_auto_recovery_denied", lambda *a, **k: None)
     monkeypatch.setattr(galaxy, "TRAY_DOWN_RESCAN_SETTLE_SEC", 0)

@@ -44,7 +44,6 @@ from tt_device_mcp.health.recovery import (
     OUTCOME_WAITING,
     RELEASE,
     STAGE_BRIDGE_RESET,
-    STAGE_HOST_REBOOT,
     STAGE_POWER_CYCLE,
     STAGE_SMI_RESET,
     WAIT,
@@ -5706,8 +5705,6 @@ async def test_auto_reboot_records_durably_before_it_fires(monkeypatch, tmp_path
 
     order = []
     monkeypatch.setattr(srv.recovery_mechanism, "record_auto_recovery", lambda *a, **k: order.append("record") or True)
-    monkeypatch.setattr(galaxy, "_fire_host_reboot", lambda: order.append("fire"))
-
     await srv.galaxy_recovery._auto_reboot_host(lambda _m: None, "reset failed twice")
 
     assert order == ["record", "fire"], "recorded the escalation before firing the reboot"
@@ -5727,8 +5724,6 @@ async def test_auto_reboot_aborts_when_the_ledger_cannot_be_written(monkeypatch,
     monkeypatch.setattr(srv.recovery_mechanism, "record_auto_recovery", lambda *a, **k: False)
 
     fired = []
-    monkeypatch.setattr(galaxy, "_fire_host_reboot", lambda: fired.append(True))
-
     await srv.galaxy_recovery._auto_reboot_host(lambda _m: None, "reset failed twice")
 
     assert fired == [], "must NOT reboot when the escalation could not be recorded"
@@ -7454,7 +7449,6 @@ def _reach_reboot_rung(monkeypatch, tmp_path, n_present):
     async def fake_reboot(log, reason):
         reboots["n"] += 1
 
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", fake_reboot)
     patch_health_event(monkeypatch, lambda *a, **k: None)
     monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})
     monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
@@ -7722,8 +7716,6 @@ async def test_the_gate_aborts_the_host_reboot_when_the_ledger_cannot_be_written
     monkeypatch.setattr(
         srv.recovery_mechanism, "record_auto_recovery", lambda *a, **k: recorded.append(a) or False
     )  # unwritable ledger
-    monkeypatch.setattr(galaxy, "_fire_host_reboot", lambda: fired.append(True))
-
     await srv._device_health_gate(None, phase="post-job", run_fabric=False)
 
     assert recorded, "the gate never reached the host rung, so this proves nothing"
@@ -8242,18 +8234,14 @@ def test_cascade_router_keys_the_galaxy_floor_on_frozen_chips_too(monkeypatch, h
 
 
 def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(monkeypatch, health_deps):
-    """The host rungs (warm reboot, then BMC power cycle) are the highest-risk — each takes the whole
+    """The host rung (the BMC power cycle, the only one) is the highest-risk — it takes the whole
     box down. The gate reaches one only AFTER the galaxy reset it just ran also failed to recover
     (last_action is the galaxy reset, last_action_recovered is False), so the router names a host
     rung only in that post-reset phase, and only when a prior cycle failed too (was_failing), the
     drop is at/above the reboot floor, no reset is still cycling, AND that rung is opted in.
     Anything short holds the mesh degraded."""
     # Reset just ran and did not recover, a prior cycle failed too, mass drop, opted in: climb to the
-    # chosen host rung, gentlest of the two.
-    assert (
-        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=True, host_escalation="reboot")
-        == STAGE_HOST_REBOOT
-    )
+    # power cycle, the only host rung.
     assert (
         _rung(
             monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=True, host_escalation="power-cycle"
@@ -8383,10 +8371,12 @@ def test_cascade_router_climbs_the_present_mesh_post_reset_wedge_too(monkeypatch
     unhealthy after the reset it just ran — an eth/fabric wedge the reset could not clear, which
     self-heal will not either since it already survived the deepest reset (server.py:3148). A
     router that requires off_bus >= reboot_floor can never be satisfied by off_bus==0 (the reboot
-    floor is floored at 2) and names WAIT while the gate reboots."""
+    floor is floored at 2) and names WAIT while the gate climbs."""
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=0, was_failing=True, host_escalation="reboot")
-        == STAGE_HOST_REBOOT
+        _rung(
+            monkeypatch, health_deps, reset_recovered=False, off_bus=0, was_failing=True, host_escalation="power-cycle"
+        )
+        == STAGE_POWER_CYCLE
     )
 
 
@@ -10207,7 +10197,6 @@ def _arm_stuck_hold(
         counters["power_cycles"] += 1
 
     patch_recovery(monkeypatch, "_reset_and_verify_device", reset)
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", reboot)
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
     monkeypatch.setattr(
         srv,
@@ -12519,7 +12508,6 @@ async def test_a_present_mesh_wedge_that_survived_the_galaxy_reset_climbs_to_the
     async def fake_reboot(log, reason):
         reboots["n"] += 1
 
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", fake_reboot)
     await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(
         32, 0, lambda _m: None
     )  # present before the reset
@@ -12541,7 +12529,6 @@ async def test_a_few_chip_off_bus_drop_still_holds_below_the_reboot_floor(monkey
     async def fake_reboot(log, reason):
         reboots["n"] += 1
 
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", fake_reboot)
     await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(
         32, 2, lambda _m: None
     )  # 2 off-bus, no regression
@@ -12630,7 +12617,6 @@ async def test_post_reboot_all_off_bus_holds_loudly_with_no_cold_rung_opted_in(m
     async def fake_power_cycle(log, reason):
         cycles["n"] += 1
 
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", fake_reboot)
     monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
     await srv.galaxy_recovery._verify_post_reboot_recovery(off_bus=32, expected=32, log=lambda _m: None)
     assert reboots["n"] == 0 and cycles["n"] == 0, "no rung may fire with none opted in — hold loudly"
@@ -12655,7 +12641,6 @@ async def test_post_reboot_verify_never_repeats_the_warm_reboot(monkeypatch, tmp
     async def fake_reboot(log, reason):
         reboots["n"] += 1
 
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", fake_reboot)
     # 20 of 32 off the bus: a mass drop (>= floor) but not all-off-bus.
     await srv.galaxy_recovery._verify_post_reboot_recovery(off_bus=20, expected=32, log=lambda _m: None)
     assert reboots["n"] == 0, "the warm reboot already failed on this drop — it must never be repeated"
@@ -12690,7 +12675,6 @@ async def test_post_reboot_verify_never_cold_cycles_a_single_chip_host_without_p
     async def fake_power_cycle(log, reason):
         cycles["n"] += 1
 
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", fake_reboot)
     monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
     await srv.galaxy_recovery._verify_post_reboot_recovery(off_bus=1, expected=1, log=lambda _m: None)
     assert cycles["n"] == 0, "AUTO_POWER_CYCLE=0 must never cold-cycle the chassis regardless of chip count"
@@ -13892,7 +13876,6 @@ async def test_the_77_host_rung_fires_the_reboot_through_the_climbs_guards(monke
         g._sweep_read_77 = True
         return False
 
-    monkeypatch.setattr(g, "_auto_reboot_host", reboot)
     monkeypatch.setattr(g, "_settle_and_verify_before_host_rung", sweep)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
@@ -13928,7 +13911,6 @@ def _arm_77_host_rung_end_to_end(monkeypatch):
         g._sweep_read_77 = True
         return False
 
-    monkeypatch.setattr(g, "_auto_reboot_host", reboot)
     monkeypatch.setattr(g, "_settle_and_verify_before_host_rung", sweep)
     monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda esc, *, tenant_active: (True, "ok"))
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")

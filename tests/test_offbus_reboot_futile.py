@@ -23,7 +23,7 @@ from tests.test_device_safety import (
     _rung,
 )
 from tt_device_mcp import server as srv
-from tt_device_mcp.health.recovery import BLOCKED, DEFER, STAGE_HOST_REBOOT, STAGE_POWER_CYCLE, WAIT
+from tt_device_mcp.health.recovery import BLOCKED, DEFER, STAGE_POWER_CYCLE, WAIT
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as galaxy_mod
 
@@ -314,19 +314,6 @@ def test_next_stage_names_the_power_cycle_for_a_failed_reset_partial_drop(monkey
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     d = _rung(monkeypatch, health_deps, off_bus=16, was_failing=True, reset_recovered=False, off_bus_before=16)
     assert d == STAGE_POWER_CYCLE
-
-
-def test_next_stage_present_mesh_reboots_first_with_both_rungs_armed(monkeypatch, health_deps):
-    """Review B1, class G2: a present mesh the reset did not recover names the warm reboot first."""
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    d = _rung(monkeypatch, health_deps, off_bus=0, was_failing=True, reset_recovered=False)
-    assert d == STAGE_HOST_REBOOT
-
-
-def test_next_stage_present_mesh_with_no_power_cycle_still_reboots(monkeypatch, health_deps):
-    d = _rung(monkeypatch, health_deps, off_bus=0, was_failing=True, reset_recovered=False, host_escalation="reboot")
-    assert d == STAGE_HOST_REBOOT
 
 
 def test_a_live_scope_waits_instead_of_blocking(monkeypatch, health_deps):
