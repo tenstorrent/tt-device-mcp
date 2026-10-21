@@ -589,8 +589,8 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # the real thing. The fire below stays a loud tripwire so a test that DOES reach it fails instead
     # of taking CI (or a dev box) down. A test exercising that path re-patches the fire itself.
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    # The host rung off would read as an operator outage hold and hold every mesh reset
-    # (spec 04 I28); arm it explicitly. A test of the hold deletes this.
+    # Arm the automatic mesh reset explicitly; only AUTO_MESH_RESET=0 is the outage hold (spec 04
+    # I28). A test of the hold sets it to 0.
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")
 
     # The bounded off-bus hold (spec 04 I27) runs a host-supplied power-cycle command: unset here, a

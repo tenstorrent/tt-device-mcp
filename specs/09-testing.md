@@ -64,10 +64,10 @@ gets through anyway.
     `last_fabric_check_monotonic`, `last_job_end_monotonic`, `owner_submit_times`, the hold
     and skip-journal latches, the sampler's blackout strike counter, board-type caches — is
     reset per test so one test's outcome never steers the next test's gate.
-  - **Host rungs**: `TT_DEVICE_MCP_AUTO_REBOOT=0`, `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`
-    (both default ON, so they are pinned off, never merely deleted),
-    `_fire_host_reboot` is
-    replaced with a function that raise `AssertionError` — loud tripwires, so a test that
+  - **Host rung**: `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` (default ON, so it is pinned off, never
+    merely deleted), the off-bus power cycle's `fire_command` is replaced with a function that
+    raises `AssertionError`, and the spawn tripwire refuses `ipmitool`, `reboot`, `shutdown` and
+    `poweroff` — loud tripwires, so a test that
     reaches a real fire fails instead of taking the box down. `shutil.which("tt-smi")` answers
     None: it is a device tool, so an unmarked test must not find one, and preflight verdicts keyed
     on it otherwise differ between a developer box and CI. A test whose subject needs it present
@@ -167,9 +167,9 @@ gets through anyway.
     probe *caches* are the exception to the exception — they are build artifacts a real probe
     needs to run at usable speed, so they point at one session-scoped temp dir shared by all
     device tests rather than a fresh per-test one.
-  - **Never lifted — the destructive rungs.** `TT_DEVICE_MCP_AUTO_REBOOT=0` and
-    `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` stay pinned off, and `_fire_host_reboot` stays an `AssertionError` tripwire. The
-    ladder above the warm rung takes the whole host down; nothing in a pytest
+  - **Never lifted — the destructive rungs.** `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`
+    stays pinned off, and the power cycle's `fire_command` and the `ipmitool` spawn stay tripwires. The
+    power cycle takes the whole host down; nothing in a pytest
     run may reboot or power-cycle the machine it is running on. `tt-smi -r` is the ceiling.
 
 ## What the suite guarantees

@@ -637,16 +637,14 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I28 — An operator's outage hold holds every automatic mesh reset.** With
   `TT_DEVICE_MCP_AUTO_MESH_RESET=0` (an outage hold), no
   automatic mesh reset fires: not the between-jobs gate's, the idle relift's or the hold
-  watchdog's, and no last-chance sweep. `TT_DEVICE_MCP_AUTO_MESH_RESET=1` arms it whatever the
-  others say. Either one alone is a per-host choice and still climbs through the mesh
-  reset. The two host rungs alone make the outage hold: with the BMC tray re-power rung removed
-  (I23), no third switch has to be `0` as well. This is a behaviour change for a host that set
-  both host rungs to `0` and left the tray rung at its default: it used to keep the automatic mesh
-  reset and now holds it. Time to recover on such a host: B1/B2 (partial off-bus), D (fabric or
-  health-check failure, a dispatch failure included), H (tenant-held verify) and J (a failed or
-  timed-out job) lose the automatic mesh reset and stay HELD, paged, until an operator acts;
-  `TT_DEVICE_MCP_AUTO_MESH_RESET=1` restores it. The broker names this at boot: the rung inventory
-  logs `MESH RESET HELD` with the two variables, the held resets and the `=1` that re-arms them.
+  watchdog's, and no last-chance sweep. Unset or `=1` arms it. It is the only switch that holds the
+  mesh reset: with the power cycle the only host rung, `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` alone is a
+  per-host choice (no BMC power cycle) and still climbs through the mesh reset. Time to recover
+  under the hold: B1/B2 (partial off-bus), D (fabric or health-check failure, a dispatch failure
+  included), H (tenant-held verify) and J (a failed or timed-out job) lose the automatic mesh reset
+  and stay HELD, paged, until an operator acts; `TT_DEVICE_MCP_AUTO_MESH_RESET=1` restores it. The
+  broker names this at boot: it logs `RUNG GAP` with the held present-mesh reset and serves it on
+  /health as `hold_exit_gap`.
   A held reset did not happen, as for I24: it is checked before `reset_begin` and the cooldown clock, sets no failed-reset flag, and the episode
   holds. This covers a chip off the bus in the startup and pre-job gates: under the hold they run no
   `tt-smi -glx_reset` and leave the device HELD (a mesh reset over an off-bus mesh is what drops
@@ -1578,7 +1576,7 @@ each rung fires only when the gentler one failed or cannot apply.
   the host rung is next. The I82 carry and a broker restart keep the pass's age and its at-start
   mark but not the grant, so after either the bound still runs one more full ladder (about 220 s,
   bounded), then the host rung. When no host
-  rung was granted (both host rungs opted out, or a denial other than the cooldown), the pass is a
+  rung was granted (the power cycle opted out, or a denial other than the cooldown), the pass is a
   forced run below the bound and the full ladder runs again at the 10-min mark, then the I76 cadence.
   A re-hold of another class in the same episode below the bound (I82 carry or a broker restart)
   asks for the host rung once and runs no further forced ladder. A check still waiting on the 1G
@@ -1735,27 +1733,23 @@ chip's sysfs node, found from the banked PCI address (I16), or, once the node is
 whose secondary bus is the chip's bus, so the link status (LnkSta/LnkCap) is kept even when the
 endpoint is gone; the endpoint is read too while it is still enumerated. One `TRAY-DOWN:` error
 line names the trays, the chips off, the rescan result and the capture, and says the full ladder
-follows; `tray_down_prelude` journals the same. Then `escalate()` dispatches the caller's own
-ladder with the caller's own stage, indices, evidence and beats, so the `TRAY_DOWN_NO_WINDOW`
-branch above, the generic walk, the mesh-wide reset, the last-chance sweep and the host rungs run
-as they would have. When the `TRAY_DOWN_NO_WINDOW` verify fails, the branch re-reads the
-heartbeats once and logs the count then off the bus as `off_bus_after` on
-`tray_down_no_window_power_cycle` and in its blocked/denied log lines (`None` if the re-read
-fails); it is log-only, and `off_bus`, the count at onset, still drives every decision.
+follows; `tray_down_prelude` journals the same. Then `escalate()` sends a class A or C off-bus set
+straight to the power cycle (I37, `_power_cycle_direct_from_escalate`); anything else gets the
+caller's own ladder with the caller's own stage, indices, evidence and beats, so the generic walk,
+the mesh-wide reset, the last-chance sweep and the power cycle run as they would have.
 
-**The last-chance reset sweep gates EVERY host rung.** A reboot or a power cycle takes the whole box
-down and costs minutes, so before paying that the ladder re-issues every reset type once more,
-back-to-back, then takes ONE settle and ONE verify — and fires the host rung only if the mesh is
-still bad (`_settle_and_verify_before_host_rung` → `_issue_all_resets_back_to_back`, the same
-implementation the `TRAY_DOWN_NO_WINDOW` branch uses, so the two can never drift). The sweep
-fires no tray step (I23): its resets are the bridge reset and the mesh reset, and the full health
-check, fabric included, still has to pass after the sweep before anything is released. This holds on
-every road to a host rung, not just the tray branch: the gate ladder's own rung, the idle/stuck-hold
-escalation (`_climb_to_host_recovery_after_failed_reset` — the road most measured power cycles
-actually took), and the post-reboot cold climb (`_verify_post_reboot_recovery`, where the warm reboot
-just proved it cannot re-power the UBBs). Before this, those three settled and verified but never
-re-tried the cheaper rungs, so a present-mesh eth wedge could be power-cycled having only ever seen
-mesh resets. Details: SBR fires only where a chip is actually isolated, so a mass drop is never
+**The last-chance reset sweep gates the power cycle.** A power cycle takes the whole box down and
+costs minutes, so before paying that the ladder re-issues every reset type once more, back-to-back,
+then takes ONE settle and ONE verify — and fires the power cycle only if the mesh is still bad
+(`_settle_and_verify_before_host_rung` → `_issue_all_resets_back_to_back`, the same implementation
+the class A 10-min sweep (I73) uses, so the two can never drift). It runs at most once per hold
+phase (I87): once below the 10-min bound, and once more as part of the bound's own ladder. The
+sweep fires no tray step (I23): its resets are the bridge reset and the mesh reset, and the full
+health check, fabric included, still has to pass after the sweep before anything is released. This
+holds on every road to the power cycle: the gate ladder's own rung, the idle/stuck-hold escalation
+(`_climb_to_host_recovery_after_failed_reset` — the road most measured power cycles actually took)
+and the I29 sweep after an unverified reset. Before this, those roads settled and verified but never re-tried the cheaper rungs, so a
+present-mesh eth wedge could be power-cycled having only ever seen mesh resets. Details: SBR fires only where a chip is actually isolated, so a mass drop is never
 nibbled at with per-chip bridge resets; and the sweep is SKIPPED (the settle and verify still run)
 under the two guards a destructive rung never crosses — a tenant on the mesh, or a reset already
 cycling in its own scope. A sweep that brings the mesh back cancels the host rung outright.
@@ -1773,14 +1767,9 @@ waives a known tenant — fd-held or queue-known.
 durably and fsync (abort on failure), leave the jobs-list row, then fire; a fire that raises
 retracts the record (I9). `auto_recovery_allowed` enforces tenant-absolute, per-severity interval,
 and per-boot cap (I7, I9, I10); a denied opted-in rung journals `auto_recovery_denied` once per
-hold episode. `boot_from_broker_escalation` back-fills the boot that results; on coming back up
-from a broker-fired warm reboot, `_verify_post_reboot_recovery` compares what returned to what
-left and climbs a still-off-bus mesh to the power cycle (never a second warm reboot — the rung
-that just failed), or holds loudly naming the BMC command when the cold rung is not armed. It runs
-on the boot's first broker start only (`fsm.restarted_this_boot` false): the ledger entry stays
-adjacent to the boot for its whole life, and a restart later in the same boot that finds a fresh
-degradation is not that reboot's verdict — it stays held for the forced startup gate and its ladder.
-The boot's jobs-list row is written once per boot, keyed on the kernel boot_id; where that is
+hold episode. `boot_from_broker_escalation` back-fills the boot that results; the startup gate
+then re-proves the mesh on that boot (spec 03 I4), and a mesh still bad there holds and climbs its
+own ladder like any other hold. The boot's jobs-list row is written once per boot, keyed on the kernel boot_id; where that is
 unreadable, on `/proc/stat` btime matched within `_BTIME_DEDUP_SLACK_SEC` (10 s), because a
 wall-clock step moves btime within one boot and an exact match would count one reboot twice.
 Absence is never health: every blocked/exhausted path emits a loud actionable event

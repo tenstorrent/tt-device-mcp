@@ -1132,7 +1132,7 @@ cooldown (spec 04 I65) holds longer.
   device-op lock, and again at the ladder's last tenant check before any rung (as blocker
   `startup_verify`, after `job_running`): a re-adopted job that ends while the forced run or the
   relift is already on its way gets no reset before the startup gate. Only the ceiling window, the off-bus one-shot and spec 04 I83's
-  at-start link-short ladder stand down, the kinds whose window is given back; every other forced kind (power-cycle cooldown retry, I39 progress retry, the off-bus
+  at-start link-short ladder stand down, the kinds whose window is given back; every other forced kind (power-cycle cooldown retry, the off-bus
   hand-off bounds, the spec 04 I76 host rung) runs as before. While the re-adopted job runs, both meet it
   as before: the ladder defers on blocker `job_running`. A chip that drops while the gate is
   pending keeps the off-bus one-shot (I23) and its ladder; it does not wait for the gate. The startup gate runs the
@@ -1480,8 +1480,7 @@ queued backlog, self-test and arm the eth-heartbeat rung (I28), close any orphan
 `fsm.boot_merge()` — always closed (I4), with this boot's auto-recovery ledger attribution folded
 into `detail` on the boot's first broker start only (a later restart in the same boot was not
 caused by that escalation and carries no attribution) — followed by an async startup-health report (sysfs heartbeat only, records what
-came back after a reboot and marks dirty if degraded; on the boot's first broker start only, a
-degraded mesh after a broker-fired warm reboot goes on to the post-reboot verify, spec 04) and the
+came back after a reboot and marks dirty if degraded) and the
 forced startup gate on every start
 (`phase="startup"`, `force_fabric=True`), which queues behind re-adopted jobs and is the only
 thing that may lift the `startup_unverified` hold. A per-user daemon (`should_privsep()` false)
