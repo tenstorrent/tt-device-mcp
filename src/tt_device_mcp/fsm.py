@@ -203,6 +203,12 @@ class ServerFsm:
         # startup_verify.readopted_job_ids reports them (server.py syncs it). Report-only: nothing in
         # the broker reads it back, so it never lifts a hold or skips a check. [] outside BOOT/RECOVERING.
         self._readopted_jobs: list[str] = []
+        # Spec 03 I76, report-only: while the startup gate owns the startup hold, when the gate began
+        # and the latest its check may end (ISO strings, deadline None while a re-adopted job runs),
+        # as /health's startup_verify reports them; None otherwise. fsm.json carries it as
+        # startup_check_in_progress / startup_check_started_at / startup_check_deadline. Nothing in
+        # the broker reads it back. Not loaded from the file: each broker start syncs it afresh.
+        self._startup_check: Optional[dict] = None
         # Whether _load restored an episode a previous boot wrote — see reopen_after_boot. One-shot.
         self._crossed_boot = False
         # Whether _load read a file this same boot wrote: an earlier broker of this boot already
@@ -433,6 +439,7 @@ class ServerFsm:
         Never raises: a durable record we could not write must not take the gate down with it."""
         if self._record.state not in _READOPT_STATES:
             self._readopted_jobs = []  # a release (HEALTHY) or DOWN ends the startup verify it reported
+            self._startup_check = None
         payload = {
             "state": self._record.state.value,
             "why": self._record.why,
@@ -442,6 +449,9 @@ class ServerFsm:
             "dirty": self._record.dirty,
             "latches": self._latches,
             "readopted_jobs": list(self._readopted_jobs),
+            "startup_check_in_progress": self._startup_check is not None,
+            "startup_check_started_at": (self._startup_check or {}).get("started_at"),
+            "startup_check_deadline": (self._startup_check or {}).get("deadline"),
             "boot_id": self._boot_id,
             # Not read back by anything in this class — purely so an operator staring at the raw
             # file can tell how stale it is without cross-referencing a log timestamp.
@@ -495,6 +505,23 @@ class ServerFsm:
         ids = [str(j) for j in job_ids] if self._record.state in _READOPT_STATES else []
         if ids != self._readopted_jobs:
             self._readopted_jobs = ids
+            self._persist()
+
+    @property
+    def startup_check_in_progress(self) -> bool:
+        """Spec 03 I76: whether the startup gate owns the startup hold right now. Report-only."""
+        return self._startup_check is not None and self._record.state in _READOPT_STATES
+
+    def set_startup_check(self, started_at: Optional[str], deadline: Optional[str], *, in_progress: bool) -> None:
+        """Record that the startup check is in progress, when it began and the latest it may end (spec
+        03 I76), or that it no longer is. Persists only on a change. Ignored outside BOOT/RECOVERING;
+        a release, DOWN or a fault hold (on_fault with any other why) clears it. Report-only: no gate,
+        hold, bound or escalation reads it."""
+        value = {"started_at": started_at, "deadline": deadline} if in_progress else None
+        if self._record.state not in _READOPT_STATES:
+            value = None
+        if value != self._startup_check:
+            self._startup_check = value
             self._persist()
 
     @property
@@ -610,6 +637,8 @@ class ServerFsm:
         replace it."""
         why = _validate_why(why) or "gate_error"
         self.fault_monotonic = time.monotonic()
+        if why != "startup_unverified":
+            self._startup_check = None  # spec 03 I76: a fault hold ends the startup check it reported
         if self._record.state in (ServerState.HEALTHY, ServerState.BOOT):
             self._open_episode(ServerState.RECOVERING, why, detail=detail, job=job, dirty=dirty)
         else:

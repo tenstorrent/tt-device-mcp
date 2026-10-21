@@ -15807,6 +15807,9 @@ async def test_health_names_a_startup_hold_behind_a_live_readopted_job_as_no_fau
         "readopted_job_ids": ["428"],
         "fault": False,
         "since": since.isoformat(),
+        "check_started_at": None,
+        "deadline": None,
+        "bound_sec": srv.STARTUP_VERIFY_DEFER_MAX_SEC,
     }
     assert body["fsm_state"] == "recovering" and body["fsm_why"] == "startup_unverified", "the FSM contract stands"
     assert body["held"] is True and body["held_age_sec"] is not None, "the hold and its clock are not hidden"
@@ -15852,6 +15855,82 @@ async def test_the_startup_check_still_runs_and_gates_the_queue_after_the_readop
     assert srv._startup_verify_view() is None, "a hold the startup gate left standing is a fault hold"
     assert srv._health_payload()["startup_verify"] is None
     assert srv._device_unavailable_for_tenant()
+
+
+@pytest.mark.asyncio
+async def test_the_startup_check_reports_when_it_began_and_its_deadline(monkeypatch, tmp_path, clear_job_state):
+    """Spec 03 I76: while the startup check runs, the hold's episode start can still be unset, and
+    the view showed 'verifying' with since null, so a client with a queued job guessed how long the
+    check would take and withdrew it. The view now names the gate's start (since), the check's own
+    start (check_started_at) and its bound (deadline: hugepage wait plus the check's bound), and a
+    queued job's status says it waits on the check. All of it goes with the view once the gate passes.
+    Fails on base, which reports since null and no deadline."""
+    *_, release_job, _, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "device_hold_episode_since", "")
+    gate_started = time.time() - 30
+    monkeypatch.setattr(srv, "_startup_verify_started_wall", gate_started)
+    monkeypatch.setattr(srv, "_startup_verify_ready_wall", None)
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def gate(job_log_file, *, phase, run_fabric, force_fabric=False):
+        entered.set()
+        await finish.wait()
+        fsm_healthy(srv)
+
+    monkeypatch.setattr(srv, "_device_health_gate", gate)
+    queued = srv.Job(id="501", owner="o", workspace="/w", command="c", queued_at="")
+    srv.jobs["501"] = queued
+    _readopted_running_job()
+
+    view = srv._startup_verify_view()
+    assert (
+        view["phase"] == "readopted_job_running" and view["since"] == datetime.fromtimestamp(gate_started).isoformat()
+    )
+    assert view["check_started_at"] is None and view["deadline"] is None, "the check has not begun"
+
+    before = time.time()
+    srv.readopted_scopes.pop("428")
+    srv.jobs["428"].status = srv.JobStatus.COMPLETED
+    await asyncio.wait_for(entered.wait(), 5)
+    view = srv._startup_verify_view()
+    assert view["phase"] == "verifying"
+    assert view["since"] == datetime.fromtimestamp(gate_started).isoformat(), "since was null during the check"
+    began = datetime.fromisoformat(view["check_started_at"])
+    assert datetime.fromtimestamp(before - 1) <= began <= datetime.now()
+    deadline = datetime.fromisoformat(view["deadline"])
+    assert deadline == began + timedelta(seconds=srv.STARTUP_VERIFY_DEFER_MAX_SEC)
+    assert srv.STARTUP_VERIFY_DEFER_MAX_SEC >= srv.STARTUP_HUGEPAGES_WAIT_SEC + srv.FABRIC_CHECK_TIMEOUT_SEC
+    assert srv._health_payload()["startup_verify"]["deadline"] == view["deadline"]
+    raw = json.loads(srv.fsm._path.read_text())
+    assert raw["startup_check_in_progress"] is True, "fsm.json does not say the startup check is running"
+    assert (raw["startup_check_started_at"], raw["startup_check_deadline"]) == (view["since"], view["deadline"])
+    assert (raw["state"], raw["why"]) == ("recovering", "startup_unverified")
+
+    from tt_device_mcp.socket_transport import current_peer_uid, current_via_mcp
+
+    mcp = srv.create_mcp_server()
+
+    async def status(job_id):
+        tok, mtok = current_peer_uid.set(4242), current_via_mcp.set(False)
+        try:
+            res = await mcp.call_tool("tt_device_job_status", {"params": {"job_id": job_id}})
+            return json.loads(res.content[0].text)
+        finally:
+            current_peer_uid.reset(tok)
+            current_via_mcp.reset(mtok)
+
+    out = await status("501")
+    assert out["status"] == "queued" and out["hold_reason"].startswith("held: startup check")
+    assert out["startup_verify"]["deadline"] == view["deadline"]
+
+    finish.set()
+    await release_job()
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert srv._startup_verify_view() is None and srv._health_payload()["startup_verify"] is None
+    raw = json.loads(srv.fsm._path.read_text())
+    assert (raw["startup_check_in_progress"], raw["startup_check_deadline"]) == (False, None)
+    out = await status("501")
+    assert "hold_reason" not in out and "startup_verify" not in out, "the hold reason outlived the check"
 
 
 @pytest.mark.asyncio
