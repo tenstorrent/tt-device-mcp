@@ -15,7 +15,7 @@ from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health.monitor import ETH_COULD_NOT_CHECK, ETH_LINK_DROP_SKIP
 from tt_device_mcp.health.monitors import eth, hostpci
-from tt_device_mcp.health.recovery import base, pcie_guard
+from tt_device_mcp.health.recovery import base, mesh_repeat, pcie_guard
 
 CHIPS = 32
 TIMED_OUT = (None, f"{ETH_COULD_NOT_CHECK}: {eth.READ_TIMED_OUT}")
@@ -165,7 +165,9 @@ async def test_the_full_check_after_the_reset_gates_the_release(mesh):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh, armed_power_cycle):
+async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh, armed_power_cycle, monkeypatch):
+    # The capped mesh-reset repeat (spec 04 I93, its own tests) is spent: the climb is under test.
+    monkeypatch.setattr(mesh_repeat, "MESH_RESET_REPEAT_CAP", 0)
     mesh["reset_heals"] = False
     srv.recovery_mechanism.last_reset_failed = True  # a prior cycle failed: the host rung is due
     await _gate()
