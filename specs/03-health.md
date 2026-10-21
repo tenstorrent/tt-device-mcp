@@ -1389,7 +1389,9 @@ cooldown (spec 04 I65) holds longer.
   their holders). The broker never signals its own pid, and the reset scope and its descendants
   are never signalled from here. The sampler's first-hung-sample poller stop (I66) follows the same
   rule: with a chip reading all-ones on the sample it stops nothing and leaves the stop to this
-  valve. Refused or not, the valve still marks the device dirty: it never
+  valve. Host risk of that wait: the pollers read the all-ones chip for at most one extra sample
+  interval (10 s; 4 s under the fast cadence's confirm gate) until it is confirmed and removed; a
+  stalled chip that still answers stops them on its first sample as before. Refused or not, the valve still marks the device dirty: it never
   lifts or clears a hold and never returns the device to the queue, so only a just-passed full
   check, fabric included (I78/I82), lifts it, and spec 04 I76 still runs the full ladder at
   10 min and then the power cycle. Whole-tray and all-chips-off drops keep their own path straight

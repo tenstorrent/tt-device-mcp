@@ -6,8 +6,10 @@
 tt-kmd's fd-close path sends the chip a power-state message unless the device is marked detached,
 and only the PCI remove marks it. Killing a holder of an off-bus chip that is still attached, or
 stopping a poller that has it open, makes the kernel itself reach the chip. So every kill and
-every poller stop comes after a successful remove; a failed, missing, hung or partial remove kills
-nobody and leaves the hold to its bounded recovery. No process is spawned and no device touched:
+every poller stop comes after a successful remove, the sampler's first-hung-sample stop (03 I66)
+included: a frozen heartbeat that still answers stops the pollers at once, an all-ones chip leaves
+the stop to the valve. A failed, missing, hung or partial remove kills and stops nothing and leaves
+the hold to its bounded recovery. No process is spawned and no device touched:
 the remove, the holder scan and every signal are stubbed.
 """
 
@@ -178,14 +180,14 @@ async def test_another_all_ones_chip_not_yet_detached_defers_the_kill_to_its_own
     await srv.sampler.check_for_dead_chips({"0": live(1), "13": live(ALL_ONES), "14": live(2)})
     await srv.sampler.check_for_dead_chips({"0": live(2), "13": live(ALL_ONES), "14": live(ALL_ONES)})
     assert ("detach", "13") in log
-    assert ("kill", TENANT) not in log and ("kill", FABRIC) not in log, log
+    assert not _kills(log), f"a kill or poller stop reached chip 14, not detached: {log}"
     assert _refusals()[-1]["reason"] == "chip_not_detached" and _refusals()[-1]["chips"] == ["14"]
 
     # 13 is gone from sysfs once removed; 14 reads all-ones a second time.
     await srv.sampler.check_for_dead_chips({"0": live(3), "14": live(ALL_ONES)})
     i14 = log.index(("detach", "14"))
-    kills = [i for i, e in enumerate(log) if e[0] == "kill"]
-    assert kills and min(kills) > i14, log
+    kills = [i for i, e in enumerate(log) if e[0] in ("kill", "pollers")]
+    assert ("pollers", False) in log and kills and min(kills) > i14, log
 
 
 @pytest.mark.asyncio
@@ -197,7 +199,7 @@ async def test_a_chip_whose_earlier_detach_failed_blocks_every_later_kill(valve)
     await srv.sampler.check_for_dead_chips({"0": live(2), "13": live(ALL_ONES), "14": live(ALL_ONES)})
     await srv.sampler.check_for_dead_chips({"0": live(3), "13": live(ALL_ONES), "14": live(ALL_ONES)})
     assert ("detach", "14") in log
-    assert not [e for e in log if e[0] == "kill"], log
+    assert not _kills(log), log
     assert _refusals()[-1]["reason"] == "chip_not_detached" and _refusals()[-1]["chips"] == ["13"]
 
 
