@@ -111,7 +111,7 @@ gets through anyway.
   broker's own constant rather than a literal, so it cannot drift wider than the set the broker
   actually manages; notably it excludes `tt-device-broker.service`, which a test stopping would
   pull the host out from under itself. Read-only queries (scope liveness) pass either way,
-  because gate paths genuinely need them.
+  because gate paths genuinely need them, except on the broker's own job and exec units (I10).
 - **I3** — A test that needs a forbidden command MUST stub the function that composes the
   argv and assert on the argv itself — never on a mocked spawn. The established seams:
   `Recovery.reset_argv` (`health/recovery/__init__.py`), `systemd_run_prefix` (`privsep.py`), and the
@@ -171,6 +171,17 @@ gets through anyway.
     stays pinned off, and the power cycle's `fire_command` and the `ipmitool` spawn stay tripwires. The
     power cycle takes the whole host down; nothing in a pytest
     run may reboot or power-cycle the machine it is running on. `tt-smi -r` is the ceiling.
+- **I10** — No test reaches the host's own broker job and exec units (`ttdev-job-*`,
+  `ttdev-exec-*`), marker or not. On a broker host the live broker runs each job in a
+  `ttdev-job-<id>.scope`, and a test's job can share its id: a kill test read that live scope as
+  its own and asked systemd to SIGINT a real job. The spawn tripwire (I2) applies to any
+  `systemctl`/`systemd-run` argv that names such a unit, a glob that matches one included:
+  - **A query fails closed.** A read-only `systemctl` verb (`is-active`, `is-failed`,
+    `is-enabled`, `status`, `show`, `list-units`, `cat`) runs a stand-in that prints nothing and
+    exits 3, so every caller reads no such unit live. A test that needs a live scope stubs the
+    query (`srv._scope_active`, `srv.list_active_job_scopes`) or `subprocess.run` itself.
+  - **An action is refused.** Any other `systemctl` verb on such a unit, and any `systemd-run`
+    that names one, fails the test. The `device` marker lifts neither.
 
 ## What the suite guarantees
 
@@ -473,6 +484,9 @@ own claims that are pinned:
 | I8 (the gate reads real `/dev`, never the sandboxed attribute) | `tests/test_device_marker.py::test_the_device_gate_reads_the_real_dev_dir_not_the_sandboxed_one` |
 | I8 (no chips, or no dir, means no device) | `tests/test_device_marker.py::test_no_chips_means_no_device`, `::test_an_absent_dev_dir_means_no_device` |
 | I8 (the marker is registered, so `-m device` selects it) | `tests/test_device_marker.py::test_the_device_marker_is_registered` |
+| I10 (a live host job scope reads as none through the real queries, sync and asyncio) | `tests/test_host_job_units.py::test_a_live_host_job_scope_reads_as_none_through_the_real_queries`, `::test_a_live_host_job_scope_reads_as_none_through_asyncio`, `::test_a_glob_over_job_scopes_counts_as_naming_them` |
+| I10 (a test's kill never takes the host scope path) | `tests/test_host_job_units.py::test_killing_a_tests_job_never_takes_the_host_scope_path` |
+| I10 (an action on a broker unit is refused, marker or not) | `tests/test_host_job_units.py::test_an_action_on_a_broker_unit_is_refused_marker_or_not` |
 | I8 (an unmarked test keeps its seals) | `tests/test_device_marker.py::test_this_test_is_not_device_marked` |
 | I8 (real silicon: topology, probes, `/proc` identity, reclaim, warm reset) | every test in `tests/test_device_hardware.py` |
 | Spec anchors resolve (a renamed or deleted test cannot leave a table asserting coverage) | `tests/test_spec_anchors.py::test_every_spec_anchor_names_a_test_that_exists`, `tests/test_spec_anchors.py::test_every_anchor_points_at_a_test_file_that_exists` |
