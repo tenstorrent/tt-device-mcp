@@ -43,6 +43,10 @@ UNSHARE_FAILED_TEXT = "unshare: unshare failed"
 GUARD_REFUSED_RC = 97
 # tt-smi prints this before it sends op_mode 0x0 (tt_smi/reset.py run_galaxy_ipmi_reset).
 TT_SMI_FALLBACK_TEXT = "falling back to legacy retimer reset"
+# tt-smi prints its 30 s settle count, then its wait for every chip, only once the BMC tray reset
+# returned without raising (tt_smi/reset.py: run_galaxy_ipmi_reset, timed_wait(30),
+# run_ubb_wait_for_driver_load). Any of them is the output's proof that the re-power went out.
+TT_SMI_REPOWERED = re.compile(r"Waiting for \d+ seconds: \d+|Waiting for all \d+ chips to show up")
 # Ubuntu's default sudo secure_path, in its order, then the broker's own PATH: every directory a
 # `sudo ipmitool` or a bare `ipmitool` from tt-smi can resolve.
 SECURE_PATH_DIRS = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin", "/snap/bin")
@@ -169,6 +173,15 @@ def scan_reset_output(text: str) -> Optional[dict]:
     if not (refused or fallback or not_armed):
         return None
     return {"refused": refused, "fallback": fallback, "sent": fallback and not refused, "not_armed": not_armed}
+
+
+def bmc_step_ok(text: str) -> bool:
+    """Spec 04 I69 (mesh path): a mesh reset's output shows the BMC tray reset went through on op_mode 0x3.
+
+    True only when tt-smi got past that call (its settle count or its wait for every chip is in the
+    output) and nothing in the output says it fell back to 0x0, the guard refused it, or the guard
+    was not armed. Only then did the reset reach every tray, and with it every chip the broker removed."""
+    return bool(TT_SMI_REPOWERED.search(text or "")) and scan_reset_output(text) is None
 
 
 def _run_mc_info(timeout: float) -> subprocess.CompletedProcess:
