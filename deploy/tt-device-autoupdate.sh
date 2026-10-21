@@ -27,8 +27,10 @@
 # that just ended waits, persisted, for the new broker instead of being dispatched into the restart.
 # A busy lap drains (spec 08 I20): it keeps the hold, lets the running job finish and applies at
 # that job boundary. The wait under the hold is bounded by the broker's hard job limit, counted
-# from the job's start: a broker job past it still gets no restart (the broker's own kill ends it),
-# so the lap lets go of dispatch and the next lap retries. A drain blocks this lap (and the
+# from the job's start: a broker job past it still gets no restart, so the lap lets go of dispatch
+# and the next lap retries until the job ends (a capped job by the broker's limit kill; a
+# no-timeout-except-on-contention job only by itself or on contention, so with nothing queued the
+# update waits with no bound). A drain blocks this lap (and the
 # reconcile after it) for at most that long.
 set -u
 
@@ -210,9 +212,11 @@ fi
 # The wait under the hold is bounded by the broker's hard job limit, MAX_TIMEOUT_SEC (1500) plus its
 # kill grace GRACEFUL_KILL_GRACE_SEC (60), counted from the start of the youngest running job scope
 # (a job with no readable start counts as just started). A broker job still running past it (a child,
-# a job scope, or a device holder inside one: a re-adopted job) is overdue for the broker's own kill,
-# and that kill ends it, never a restart: the lap releases dispatch and the next lap retries, so the
-# update applies at that job's end. Only a device holder outside every broker job, which no broker
+# a job scope, or a device holder inside one: a re-adopted job) never gets a restart: the lap releases
+# dispatch and the next lap retries, so the update applies at that job's end. A capped job ends by
+# the broker's limit kill, at most JOB_CAP after its start. A no-timeout-except-on-contention job
+# (spec 01 I20) is not killed for time: it runs until it ends, or until a queued job contends for it
+# (preempt grace plus kill grace); until then the update waits, with no bound while nothing is queued. Only a device holder outside every broker job, which no broker
 # kill ends, stops holding the update at the bound, so a box busy around the clock still updates.
 JOB_CAP=1560
 UPTIME=/proc/uptime
@@ -304,7 +308,7 @@ wait_job_boundary() {
                 echo "autoupdate: $1: a device holder outside any broker job is past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); it no longer holds the update, applying" >&2
                 return 0
             fi
-            echo "autoupdate: $1: the running job is past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders job_holders=$jobholders scopes=${scopes:-0}); a running job always holds the update: dispatch released, the broker's job-limit kill ends it, the next lap retries" >&2
+            echo "autoupdate: $1: the running job is past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders job_holders=$jobholders scopes=${scopes:-0}); a running broker job always holds the update: dispatch released, the next lap retries" >&2
             return 1
         fi
         sleep 5

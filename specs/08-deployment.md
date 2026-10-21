@@ -189,11 +189,15 @@ job log, so every "installed" claim below is verified, not assumed.
   across restarts; a start that cannot be read counts as now). **A broker job still running at
   that bound, of any age, never gets a restart**: a broker child, a running `ttdev-job-*` scope,
   or a device holder whose cgroup is a `ttdev-job-*` scope (a re-adopted job, seen even when the
-  scope list cannot be read). It is overdue for the broker's own job-limit kill, and that kill ends
-  it: the lap restarts nothing, drops the hold, and the next lap retries, so the update applies at
-  the first lap after that job ends. A device op in flight at the bound is handled the same way
-  (I7). Only a device holder outside every broker job, which no broker kill ends and a restart does
-  not touch, stops holding the update at the bound: the lap applies. A broker that is not running (not `active`, `activating`, `deactivating` or
+  scope list cannot be read). The lap restarts nothing, drops the hold, and the next lap retries,
+  so the update applies at the first lap after that job ends, however long it runs. A capped job
+  ends by the broker's job-limit kill, at most one job cap after its start. A
+  no-timeout-except-on-contention job (spec 01 I20) past its limit is not killed for time: it runs
+  until it ends, or until a queued job contends for it (`PREEMPT_GRACE_SEC` + `PREEMPT_KILL_GRACE_SEC`,
+  60 + 10 s, after contention starts); while nothing is queued the update waits with no bound. A
+  device op in flight at the bound is handled the same way (I7). Only a device holder outside every
+  broker job, which no broker kill ends and a restart does not touch, stops holding the update at
+  the bound: the lap applies. A broker that is not running (not `active`, `activating`, `deactivating` or
   `reloading`) protects no job by waiting, and the drain would block the reconcile that starts it,
   so the drain ends and the restart starts it. The hold is rewritten on every poll and once more
   as the apply starts, so the broker's overdue bound (`DISPATCH_HOLD_MAX_SEC`) counts from the
@@ -227,9 +231,11 @@ job log, so every "installed" claim below is verified, not assumed.
   (a dirty episode), or after a failed check (which names its fault in `fsm_why`), it applies at
   once.
   Worst-case deploy latency of a sha to a healthy broker: `TTDEV_MIN_APPLY_INTERVAL_SEC` + one 60 s
-  lap + the I20/I24 drain on a busy box (the running job's end, which the broker's job-limit kill
-  bounds at one job cap, 1560 s, after that job started, plus one 60 s lap when it ran past the cap
-  and one more job if the queue dispatched one before that lap); to a broken broker the limit adds
+  lap + the I20/I24 drain on a busy box (the running job's end, plus one 60 s lap when it ran past
+  the cap and one more job if the queue dispatched one before that lap). A capped job ends by the
+  broker's job-limit kill at most one job cap, 1560 s, after it started; a
+  no-timeout-except-on-contention job (spec 01 I20) past its limit ends only by itself or on
+  contention, so with nothing queued the latency has no bound. To a broken broker the limit adds
   nothing. The by-hand escape is
   `rm $ROOT/last-apply`: the config file is sourced over the environment, so
   `TTDEV_MIN_APPLY_INTERVAL_SEC=0` on the command line does not override a configured value.
@@ -247,8 +253,10 @@ job log, so every "installed" claim below is verified, not assumed.
   is, under the same bound; a broker job or device op still running at the bound restarts nothing
   and leaves `installed.sha` on the old sha, so the next lap retries. A stopped broker (MainPID 0)
   has no children to count. Worst case on a busy box: the update applies at the first lap after
-  the running job ends; the broker's job-limit kill ends it at most one job cap (1560 s) after it
-  started (a re-adopted job keeps the time it already served). The drain delays only the restart: no reset,
+  the running job ends. A capped job ends by the broker's job-limit kill at most one job cap
+  (1560 s) after it started (a re-adopted job keeps the time it already served); a
+  no-timeout-except-on-contention job (spec 01 I20) runs past it until it ends or a queued job
+  contends for it, so while nothing is queued the update waits with no bound. The drain delays only the restart: no reset,
   ladder rung, power cycle or hold escalation waits on it.
 
 - **I25 — A fresh install builds the pinned validator before the broker's first start.**

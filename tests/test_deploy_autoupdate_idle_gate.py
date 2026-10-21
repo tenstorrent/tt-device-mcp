@@ -311,8 +311,9 @@ def test_a_back_to_back_queue_cannot_slip_a_job_into_the_restart(tmp_path):
 def _no_restart(done, trace, hold):
     """The lap restarted nothing, released dispatch and left the update for the next lap."""
     assert done.returncode == 0, done.stderr
-    assert "a running job always holds the update" in done.stderr, done.stderr
-    assert "dispatch released, the broker's job-limit kill ends it, the next lap retries" in done.stderr
+    assert "a running broker job always holds the update" in done.stderr, done.stderr
+    assert "dispatch released, the next lap retries" in done.stderr
+    assert "job-limit kill" not in done.stderr, "the log claims a kill bound a no-timeout job lacks"
     assert "applying" not in done.stdout and "no longer holds the update" not in done.stderr, done.stderr
     assert not any(t.startswith("restart") for t in trace), f"a running job got a restart: {trace}"
     assert "job cut by restart" not in trace, trace
@@ -322,8 +323,9 @@ def _no_restart(done, trace, hold):
 def test_a_job_past_its_cap_never_gets_a_restart(tmp_path):
     """A running ttdev-job scope holds the update at any age. The wait under the hold is bounded
     by the broker's hard job limit (1500 s + 60 s kill grace) from the scope's start; past it the
-    lap releases dispatch and retries on the next lap: the broker's own job-limit kill ends the
-    job, never a restart (blx06 10-21: three restarts over one job past the cap)."""
+    lap releases dispatch and retries on the next lap until the job ends, never a restart (a
+    capped job by the broker's limit kill; a no-timeout-except-on-contention job only by itself
+    or on contention)."""
     # Already past the cap: no wait under the hold, and no restart.
     past = tmp_path / "past"
     past.mkdir()
