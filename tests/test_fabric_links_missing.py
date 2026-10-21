@@ -384,7 +384,9 @@ def latched_mesh(monkeypatch, tmp_path, mesh):  # noqa: F811
 
 
 @pytest.mark.asyncio
-async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(monkeypatch, latched_mesh, no_mesh_repeat_room):
+async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
+    monkeypatch, latched_mesh, no_mesh_repeat_room
+):
     """I42: the idle relift resets the latched hold with no grace; the post-reset check runs the
     descriptor, the latched mismatch FAILS it (never withheld, never a lift), the last-chance sweep
     runs and the hold climbs to the host rung at once (spec 04 I79): bounded, never an open-ended

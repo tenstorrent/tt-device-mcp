@@ -44,10 +44,11 @@ from tt_device_mcp.health.recovery import (
     WAIT,
     Evidence,
     Recovery,
+    ipmi_guard,
+    mesh_repeat,
     offbus_power_cycle,
     pcie_guard,
 )
-from tt_device_mcp.health.recovery import ipmi_guard, mesh_repeat
 from tt_device_mcp.health.recovery.base import (
     CLASS_A_LADDER_AFTER_SEC,
     CYCLE_LAUNCH_REPAGE_SEC,
@@ -2503,7 +2504,10 @@ class GalaxyRecovery(Recovery):
         if blocker is not None:
             log(f"mesh reset repeat held off: {self._describe_blocker(blocker)}")
             health_event(
-                "hold_bound_tenant_blocked", path="mesh_reset_repeat", held_since=hold_since, held_age_sec=int(age),
+                "hold_bound_tenant_blocked",
+                path="mesh_reset_repeat",
+                held_since=hold_since,
+                held_age_sec=int(age),
                 **blocker,
             )
             return "wait", None

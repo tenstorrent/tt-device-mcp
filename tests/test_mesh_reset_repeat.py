@@ -32,9 +32,7 @@ def _age_first_reset(seconds: float) -> None:
 
 
 async def _repeat():
-    return await srv.galaxy_recovery._mesh_reset_repeat(
-        INDICES, CHIPS, srv.device_hold_episode_since, srv.logger.info
-    )
+    return await srv.galaxy_recovery._mesh_reset_repeat(INDICES, CHIPS, srv.device_hold_episode_since, srv.logger.info)
 
 
 async def _first_reset_failed(mesh):  # noqa: F811
@@ -165,7 +163,11 @@ async def test_no_repeat_after_a_bmc_guard_finding(mesh, monkeypatch):  # noqa: 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "argv",
-    [["sudo", "tt-smi", "-glx_reset"], ["env", "X=1", "tt-smi", "-glx_reset"], ["python3", "-m", "tt_smi", "-glx_reset"]],
+    [
+        ["sudo", "tt-smi", "-glx_reset"],
+        ["env", "X=1", "tt-smi", "-glx_reset"],
+        ["python3", "-m", "tt_smi", "-glx_reset"],
+    ],
 )
 async def test_a_repeat_under_an_override_reset_argv_is_refused(mesh, monkeypatch, argv):  # noqa: F811
     await _first_reset_failed(mesh)
