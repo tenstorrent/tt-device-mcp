@@ -427,6 +427,66 @@ async def test_a_cancel_while_queued_cancels_the_job(runner_env, monkeypatch):
     assert srv._kill_reset_debt() == "", "a job that never ran owes no reset"
 
 
+class _Statuses(srv.Job):
+    """A Job that records every status it is given."""
+
+    def __setattr__(self, name, value):
+        if name == "status":
+            self.__dict__.setdefault("statuses", []).append(value)
+        super().__setattr__(name, value)
+
+
+@pytest.mark.asyncio
+async def test_a_kill_queued_on_the_lock_ahead_of_the_runner_wins(runner_env, monkeypatch):
+    """Another coroutine holds the lock across an await; a kill queues on it, then the runner does.
+    The kill takes the lock first and cancels the job; the runner must see that under the lock and
+    skip the job, never mark it RUNNING and start it, and go on to the next job."""
+    tmp = runner_env["tmp"]
+    at_door, go = asyncio.Event(), asyncio.Event()
+    real_hold = srv._wait_out_dispatch_hold
+
+    async def _pause_the_first_job(job, job_log_file):
+        if job.id == "941":
+            at_door.set()
+            await go.wait()
+            return False
+        return await real_hold(job, job_log_file)
+
+    monkeypatch.setattr(srv, "_wait_out_dispatch_hold", _pause_the_first_job)
+    common = {"owner": srv.submitting_owner(), "workspace": "/tmp", "queued_at": "t", "timeout_sec": 600}
+    first = _Statuses(id="941", command=f"touch {tmp / 'first-ran'}", **common)
+    second = srv.Job(id="942", command=f"touch {tmp / 'second-ran'}", **common)
+    for job in (first, second):
+        srv.jobs[job.id] = job
+        await srv.get_job_queue().put(job.id)
+    runner = asyncio.create_task(srv.job_runner())
+    lock = srv.get_lock()
+    try:
+        assert await _until(at_door.is_set)
+        await lock.acquire()  # the other coroutine, mid-await
+        try:
+            kill = asyncio.create_task(
+                srv.create_mcp_server().call_tool(
+                    "tt_device_job_kill", {"params": {"job_id": "941", "owner": first.owner}}
+                )
+            )
+            assert await _until(lambda: len(lock._waiters or ()) == 1), "the kill waits on the lock"
+            go.set()
+            assert await _until(lambda: len(lock._waiters or ()) == 2), "the runner waits behind it"
+        finally:
+            lock.release()
+        reply = await asyncio.wait_for(kill, 5)
+        assert await _until(lambda: _runner_done(second)), "the queue moves on to the next job"
+    finally:
+        await _stop(runner)
+    assert "cancelled" in str(reply)
+    assert srv.JobStatus.RUNNING not in first.statuses, "a cancelled job was marked RUNNING"
+    assert first.status is srv.JobStatus.KILLED and first.started_at is None and first.pid is None
+    assert not (tmp / "first-ran").exists(), "a cancelled job's process was started"
+    assert second.status is srv.JobStatus.COMPLETED and (tmp / "second-ran").exists()
+    assert srv._kill_reset_debt() == "", "a job that never ran owes no reset"
+
+
 @pytest.mark.asyncio
 async def test_keep_running_on_disconnect_leaves_the_job_running(runner_env, monkeypatch):
     rec = _Recorded()

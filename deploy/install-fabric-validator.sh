@@ -56,8 +56,18 @@ flip() { ln -sfn "$1" "$CURRENT.tmp" && mv -Tf "$CURRENT.tmp" "$CURRENT"; }
 # and runtime root are absolute paths into the tree it was built in), so the slot is its final path.
 # A same-pin repair therefore builds beside the live prefix, never in it: the fabric checks keep the
 # old tree until the flip.
-LIVE="$(readlink "$CURRENT" 2>/dev/null || true)"
-case "$LIVE" in "$PREFIX"|"$PREFIX.build") ;; *) LIVE="" ;; esac
+# Slots are told apart by resolved path, not by the link's text: a root spelled differently from
+# the run that wrote `current` (a trailing slash, a symlinked parent) must still find the live slot,
+# or the build below would land in it. LIVE keeps this run's spelling for the comparisons below.
+LIVE=""
+CUR_REAL=""
+if [ -e "$CURRENT" ]; then
+    CUR_REAL="$(readlink -f -- "$CURRENT")" || CUR_REAL=""
+    [ -n "$CUR_REAL" ] || { log "cannot resolve live $CURRENT; refusing to build"; exit 1; }
+    for slot in "$PREFIX" "$PREFIX.build"; do
+        if [ "$CUR_REAL" = "$(readlink -m -- "$slot")" ]; then LIVE="$slot"; fi
+    done
+fi
 for slot in ${LIVE:+"$LIVE"} "$PREFIX" "$PREFIX.build"; do
     built "$slot" || continue
     if [ "$slot" != "$LIVE" ]; then
@@ -75,6 +85,14 @@ for slot in ${LIVE:+"$LIVE"} "$PREFIX" "$PREFIX.build"; do
     exit 0
 done
 if [ "$LIVE" = "$PREFIX" ]; then BUILD="$PREFIX.build"; else BUILD="$PREFIX"; fi
+# The live tree must never be the build slot or inside it, whatever `current` points at.
+BUILD_REAL="$(readlink -m -- "$BUILD")"
+case "$CUR_REAL" in
+    "$BUILD_REAL" | "$BUILD_REAL"/*)
+        log "live $CURRENT resolves into build slot $BUILD; refusing to build over it"
+        exit 1
+        ;;
+esac
 
 log "building validator from tt-metal $SHA in $BUILD (this takes tens of minutes; the fabric check reports CANNOT CHECK until it lands)"
 

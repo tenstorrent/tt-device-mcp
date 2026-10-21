@@ -317,10 +317,10 @@ def _live_bins(root: Path, bins=_BINS) -> list[str]:
     return [str(root / "current" / b) for b in bins]
 
 
-def _run_validator(tmp: Path, sha: str, live: list[str]) -> subprocess.CompletedProcess:
+def _run_validator(tmp: Path, sha: str, live: list[str], root: str | None = None) -> subprocess.CompletedProcess:
     bindir = tmp / "vstubs" if (tmp / "vstubs").exists() else _validator_bindir(tmp)
     env = _env(tmp, bindir, live)
-    env["TTDEV_VALIDATOR_ROOT"] = str(tmp / "validator")
+    env["TTDEV_VALIDATOR_ROOT"] = root or str(tmp / "validator")
     return subprocess.run(
         ["bash", str(_VALIDATOR), str(_pin(tmp, sha))], env=env, capture_output=True, text=True, timeout=60
     )
@@ -393,6 +393,41 @@ def test_validator_already_built_pin_does_not_refresh_the_link(tmp_path):
     assert res.returncode == 0, res.stderr
     assert abs(os.lstat(root / "current").st_mtime - old) < 1, "the link's mtime dates its last real flip"
     assert not [s for s in _log(tmp_path) if s.startswith("step cmake")]
+
+
+def _repair_under_respelled_root(tmp: Path, spelled: str, root: Path) -> None:
+    # `current` was written by a run that spelled the root as `root`; this run spells it `spelled`.
+    present = _BINS[:2]
+    _prefix(root, "aaa", bins=present)
+    os.symlink(root / "aaa", root / "current")
+    res = _run_validator(tmp, "aaa", _live_bins(root, present), root=spelled)
+    assert res.returncode == 0, res.stderr
+    assert _missing(tmp) == [], "a live broker never loses a validator binary it had"
+    assert not [s for s in _log(tmp) if s.startswith("step rm") and "/aaa/build" in s], "live slot wiped"
+    assert all((root / "aaa" / b).exists() for b in present)
+    assert os.path.realpath(root / "current") == os.path.realpath(root / "aaa.build")
+    assert _built(root / "current")
+
+
+def test_validator_repair_with_trailing_slash_root_builds_beside_the_live_prefix(tmp_path):
+    root = tmp_path / "validator"
+    _repair_under_respelled_root(tmp_path, f"{root}/", root)
+
+
+def test_validator_repair_with_symlinked_parent_root_builds_beside_the_live_prefix(tmp_path):
+    (tmp_path / "real").mkdir()
+    (tmp_path / "alias").symlink_to(tmp_path / "real")
+    _repair_under_respelled_root(tmp_path, str(tmp_path / "alias" / "validator"), tmp_path / "real" / "validator")
+
+
+def test_validator_refuses_when_current_resolves_inside_the_build_slot(tmp_path):
+    root = tmp_path / "validator"
+    _prefix(root, "aaa", bins=_BINS[:2])
+    os.symlink(root / "aaa" / "build", root / "current")  # not a slot root: the live slot is unknown
+    res = _run_validator(tmp_path, "aaa", [str(root / "aaa" / b) for b in _BINS[:2]])
+    assert res.returncode != 0 and "refusing" in res.stderr
+    assert not [s for s in _log(tmp_path) if s.startswith(("step rm", "step cmake", "step git"))]
+    assert all((root / "aaa" / b).exists() for b in _BINS[:2])
 
 
 def test_host_config_counts_either_build_slot_as_built():
