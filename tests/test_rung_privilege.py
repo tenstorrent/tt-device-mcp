@@ -39,8 +39,7 @@ def privileged(monkeypatch):
     The opt-outs come off too: conftest seals them to 0 suite-wide, which would make every
     assertion below pass on the env var alone and prove nothing about privilege."""
     _latch(monkeypatch, root=True, systemd=True, setpci_bin=True, ipmitool=True, ipmi_node=True)
-    for var in ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE"):
-        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", raising=False)
 
 
 @pytest.fixture
@@ -106,10 +105,8 @@ def test_a_non_root_daemon_has_no_bridge_rung(monkeypatch, privileged):
 def test_the_opt_out_still_wins_where_the_privilege_exists(monkeypatch, privileged):
     """Privilege is a second conjunct, never a replacement: an operator who turned a rung off on a
     fully privileged host still has it off."""
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
 
-    assert srv._auto_reboot_enabled() is False
     assert srv._auto_power_cycle_enabled() is False
 
 
@@ -126,15 +123,13 @@ def test_the_device_scoped_resets_survive_without_systemd(monkeypatch):
 def test_the_inventory_names_the_privilege_a_rung_lacked(monkeypatch, said):
     """A rung reported OFF is only actionable with its cause. An operator who never set the env
     var must not read their own opt-out back at them when the real reason is euid."""
-    for var in ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE"):
-        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", raising=False)
 
     srv.log_rung_inventory()
 
     warnings = [m for lvl, m in said if lvl == "warning"]
-    assert any("RUNG OFF auto-reboot" in m and "root" in m for m in warnings)
     assert any("RUNG OFF auto-power-cycle" in m and "ipmitool is not on PATH" in m for m in warnings)
-    assert not any("TT_DEVICE_MCP_AUTO_REBOOT=0" in m for m in warnings), "the opt-out was never set"
+    assert not any("TT_DEVICE_MCP_AUTO_POWER_CYCLE=0" in m for m in warnings), "the opt-out was never set"
 
 
 def test_boot_states_the_privileges_it_measured(said):
@@ -162,14 +157,10 @@ def test_the_bridge_rung_names_which_half_it_lacks(monkeypatch, privileged, said
 def test_the_forced_ladder_cannot_fire_a_rung_privilege_denies(monkeypatch):
     """The hold-deadline watchdog's forced escalation bypasses the fail-closed DEFERS, not the
     arming. An unprivileged daemon whose hold outlives the ceiling must still not reach for a
-    reboot it cannot issue — otherwise the bypass would route to a rung that raises."""
+    power cycle it cannot issue — otherwise the bypass would route to a rung that raises."""
     from tt_device_mcp.health.recovery.galaxy import _choose_recovery_escalation
 
-    chosen = _choose_recovery_escalation(
-        auto_reboot_enabled=srv._auto_reboot_enabled,
-        auto_power_cycle_enabled=srv._auto_power_cycle_enabled,
-        reboot_already_attempted=lambda: False,
-    )
+    chosen = _choose_recovery_escalation(auto_power_cycle_enabled=srv._auto_power_cycle_enabled)
 
     assert chosen is None, "no host rung is reachable unprivileged, forced or not"
 
