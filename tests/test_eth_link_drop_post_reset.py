@@ -27,7 +27,6 @@ from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health.monitor import ETH_LINK_DROP_SKIP, HealthMonitor
 from tt_device_mcp.health.monitors import eth, fabric
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
-from tt_device_mcp.health.recovery import mesh_repeat
 
 HIGH_WATER = 256
 LEFT = 252  # four eth links down: one QSFP_DD port connection's worth on the descriptor
@@ -126,14 +125,12 @@ def _post_reset_descriptor_runs(st) -> list[bool]:
 
 
 @pytest.mark.asyncio
-async def test_a_post_reset_link_drop_skip_with_a_missing_port_stays_held(replay, armed_power_cycle, monkeypatch):
+async def test_a_post_reset_link_drop_skip_with_a_missing_port_stays_held(replay, armed_power_cycle):
     """03 I71 with a full check after every reset: the eth read's link-count-drop skip (252 of 256)
     reaches no verdict, the descriptor run finds one port missing and none extra, and the
     traffic-only rerun passes. The post-reset check fails, the device stays held, the eth mark
     stays at 256, and the next between-jobs gate fails the same way instead of lifting. With the
-    power cycle armed, the last-chance sweep runs before it (spec 04 I79). The capped mesh-reset
-    repeat (spec 04 I93, its own tests) is spent here so the climb is the one under test."""
-    monkeypatch.setattr(mesh_repeat, "MESH_RESET_REPEAT_CAP", 0)
+    power cycle armed, the last-chance sweep runs before it (spec 04 I79)."""
     await _hold_then_reset(replay, resets=2)
     said = replay["log"].text()
     assert f"eth-heartbeat: SKIPPED — {ETH_LINK_DROP_SKIP}: {LEFT} of {HIGH_WATER}" in said, "the real skip verdict"

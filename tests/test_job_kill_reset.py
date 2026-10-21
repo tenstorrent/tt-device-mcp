@@ -63,9 +63,8 @@ async def test_a_failed_post_kill_check_stays_held_and_climbs(killed, armed_powe
     assert killed["fabric"] and min(killed["fabric"]) >= 1, "every fabric pass ran after the reset"
     assert srv.fsm.state is ServerState.RECOVERING, "a failed post-kill check never releases"
     assert armed_power_cycle == ["power-cycle"], "it climbs to the power cycle"
-    # Spec 04 I93: a reset inside the hold leaves no room for the capped repeat's worst case.
-    assert "mesh_reset_repeat_skipped" in killed["events"] and "mesh_reset_repeat" not in killed["events"]
-    assert "cannot_end_before_bound" in killed["log"].text()
+    # Spec 04 I93: the sweep's mesh reset first waited out the gap after the kill reset.
+    assert "mesh_reset_spaced" in killed["events"]
 
 
 @pytest.mark.asyncio
