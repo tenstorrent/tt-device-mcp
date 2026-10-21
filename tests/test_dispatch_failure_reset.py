@@ -147,7 +147,7 @@ async def test_a_second_dispatch_failure_in_the_episode_holds_instead_of_resetti
 async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh, armed_power_cycle):
     """A prior cycle already failed (was_failing): the dispatch reset fires, its post-reset check
     fails, the device stays held and the ladder climbs: the last-chance sweep once (its mesh reset is
-    the one repeat the episode allows, spec 04 I84), then the power cycle."""
+    the one repeat the episode allows, spec 04 I87), then the power cycle."""
     mesh["reset_heals"] = False
     srv.recovery_mechanism.last_reset_failed = True
     await _gate()

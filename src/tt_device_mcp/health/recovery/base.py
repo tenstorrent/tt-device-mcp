@@ -557,12 +557,12 @@ class RecoveryMechanism:
         # launched or timed out still cycling. Only a launched reset that failed is recorded.
         self.last_reset_rc: Optional[int] = None
         # The hold episode whose one mesh reset already ran and failed (set with
-        # mesh_reset_failed_since_release); None when unknown. No path runs another in it (spec 04 I84).
+        # mesh_reset_failed_since_release); None when unknown. No path runs another in it (spec 04 I87).
         self.mesh_reset_failed_episode: Optional[str] = None
         # (episode, at_bound) of the last full last-chance sweep that ran and did not verify: the sweep
-        # runs once below the 10-min bound and once as the bound's own ladder, never more (spec 04 I84).
+        # runs once below the 10-min bound and once as the bound's own ladder, never more (spec 04 I87).
         self.sweep_spent: Optional[tuple] = None
-        # The episode whose unforced escalation already climbed past its spent mesh reset (I84).
+        # The episode whose unforced escalation already climbed past its spent mesh reset (I87).
         self.spent_climb_since: Optional[str] = None
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
@@ -733,14 +733,14 @@ class RecoveryMechanism:
         return None
 
     def mark_mesh_reset_failed(self) -> None:
-        """A mesh reset ran and left the mesh unhealthy in the open hold episode (spec 04 I37, I84)."""
+        """A mesh reset ran and left the mesh unhealthy in the open hold episode (spec 04 I37, I87)."""
         self.mesh_reset_failed_since_release = True
         self.mesh_reset_failed_episode = self._device_hold_episode_since() or None
 
     def mesh_reset_spent(self, hold_since: str) -> bool:
         """True once this hold episode's one mesh reset ran and failed: in this process, or in this boot's
         record across a broker restart. No path fires the mesh reset again in the episode except the
-        last-chance sweep in front of the power cycle (spec 04 I84)."""
+        last-chance sweep in front of the power cycle (spec 04 I87)."""
         if self.mesh_reset_failed_since_release and (
             not hold_since or self.mesh_reset_failed_episode in (None, hold_since)
         ):

@@ -5828,49 +5828,36 @@ def test_reboot_does_not_de_escalate_past_a_recent_power_cycle(monkeypatch, tmp_
     assert "boot-loop guard" in why
 
 
-def test_choose_escalation_power_cycle_alone_goes_straight_to_it(monkeypatch, tmp_path):
-    """A host may opt into the power cycle without the reboot — e.g. it only ever sees whole-bus
-    wedges a reboot cannot clear. With reboot off, the power cycle is the rung directly, with no
-    reboot-first requirement to satisfy."""
+def test_choose_escalation_power_cycle_is_the_only_host_rung(monkeypatch, tmp_path):
+    """The power cycle is the one host rung: armed, it is the escalation, with nothing to satisfy
+    first. A leftover reboot setting from an older install arms nothing."""
     _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     assert galaxy._choose_recovery_escalation(**srv._host_escalation_kwargs()) == "power-cycle"
 
 
-def test_choose_escalation_none_when_neither_opted_in(monkeypatch, tmp_path):
-    """Both rungs off (the default): no host-level escalation is offered, and the ladder leaves the
-    device flagged exactly as it did before either rung existed."""
+def test_choose_escalation_none_when_the_power_cycle_is_not_armed(monkeypatch, tmp_path):
+    """The power cycle not armed: no host-level escalation is offered, and a stale reboot setting
+    does not bring one back."""
     _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
     assert galaxy._choose_recovery_escalation(**srv._host_escalation_kwargs()) is None
 
 
-def test_host_escalation_for_drop_sends_all_off_bus_to_the_cold_rung(monkeypatch, tmp_path):
-    """A whole-bus drop (present==0) is the one wedge a warm reboot cannot clear: it does not
-    power-cycle the Galaxy UBBs, so dropped ASICs stay off across it. So an all-off-bus mesh never
-    takes the reboot rung — power-cycle when opted in, else no rung + reboot_blocked so the caller
-    holds loudly. A partial drop (a chip still on the bus) keeps the ordinary reboot-first ladder."""
+@pytest.mark.parametrize("off_bus,expected", [(32, 32), (31, 32), (8, 32), (0, 32), (1, 1)])
+def test_host_escalation_for_drop_is_the_power_cycle_or_a_loud_hold(monkeypatch, tmp_path, off_bus, expected):
+    """Every drop, whole-tray, partial or a present mesh, gets the power cycle when it is armed. Not
+    armed, no rung and the caller holds loudly: no warm reboot stands in for it, whatever the env
+    says."""
     _ledger_dir(monkeypatch, tmp_path)
-    # Reboot opted in, power cycle NOT: an all-off-bus drop BLOCKS the reboot (it cannot re-enumerate).
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    assert galaxy._host_escalation_for_drop(off_bus=32, expected=32, **srv._host_escalation_kwargs()) == (None, True)
-    # A partial drop keeps the reboot rung — some chips are on the bus, a reboot may re-enumerate them.
-    assert galaxy._host_escalation_for_drop(off_bus=31, expected=32, **srv._host_escalation_kwargs()) == (
-        "reboot",
-        False,
-    )
-    # Power cycle opted in: an all-off-bus drop skips straight to the cold rung, no useless reboot first.
+    kw = srv._host_escalation_kwargs()
+    assert galaxy._host_escalation_for_drop(off_bus=off_bus, expected=expected, **kw) == (None, True)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    assert galaxy._host_escalation_for_drop(off_bus=32, expected=32, **srv._host_escalation_kwargs()) == (
-        "power-cycle",
-        False,
-    )
-    # A single-chip host has no UBB re-enumeration failure mode: the ordinary ladder applies.
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    assert galaxy._host_escalation_for_drop(off_bus=1, expected=1, **srv._host_escalation_kwargs()) == ("reboot", False)
+    assert galaxy._host_escalation_for_drop(off_bus=off_bus, expected=expected, **kw) == ("power-cycle", False)
 
 
 @pytest.mark.asyncio
@@ -7870,16 +7857,13 @@ def _rung(monkeypatch, deps, **kw):
 
     ``host_escalation``/``reset_recovered`` are legacy test-only shorthands, not ``Evidence``
     fields (``Evidence`` deliberately has neither — see its own docstring): ``host_escalation``
-    sets the auto-reboot/auto-power-cycle env opt-ins ``next_stage``'s own fold reads (mirroring
-    ``_choose_recovery_escalation``, so "reboot" needs only TT_DEVICE_MCP_AUTO_REBOOT and
-    "power-cycle" only TT_DEVICE_MCP_AUTO_POWER_CYCLE — the ledger read the fold also touches,
-    ``reboot_already_attempted``, reads an empty per-test ledger by default); ``reset_recovered``
+    sets the env ``next_stage``'s own fold reads: "power-cycle" arms TT_DEVICE_MCP_AUTO_POWER_CYCLE,
+    anything else leaves it off; ``reset_recovered``
     maps onto ``last_action=STAGE_SMI_RESET`` with ``last_action_recovered`` set to the same
     bool, ``None`` staying the pre-action ladder."""
     host_escalation = kw.pop("host_escalation", "unset")
     if host_escalation != "unset":
-        # Both rungs are armed by DEFAULT, so selecting one means explicitly disarming the other:
-        # clearing the var would leave it on and the router would name the gentler rung instead.
+        # "reboot" sets only the stale reboot setting, which arms no rung: the power cycle stays off.
         monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1" if host_escalation == "reboot" else "0")
         monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1" if host_escalation == "power-cycle" else "0")
     reset_recovered = kw.pop("reset_recovered", "unset")
@@ -7981,21 +7965,22 @@ def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(
         )
         == STAGE_POWER_CYCLE
     )
-    # Post-reset, mass drop, but neither host rung opted in (the default): hold, never reboot.
+    # Post-reset, mass drop, but the power cycle not armed: no rung can recover it, so BLOCKED (the
+    # loud fail-closed hold), never a warm reboot in its place.
     assert (
         _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=True, host_escalation=None)
-        == WAIT
+        == BLOCKED
     )
     # Post-reset but only THIS pass's reset failed (was_failing False — no prior cycle): one failed
     # reset is not "clearly won't recover", so hold, do not reboot.
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=False, host_escalation="reboot")
+        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=False, host_escalation="power-cycle")
         == WAIT
     )
     # Post-reset below the reboot floor: a single/few-chip wedge self-heals and the holder-kill covers
     # the MCE path, so hold rather than reboot in-flight work away.
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=1, was_failing=True, host_escalation="reboot")
+        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=1, was_failing=True, host_escalation="power-cycle")
         == WAIT
     )
     # Post-reset but a reset re-opened its scope (a chip dropped mid-reset reads all-ones like a mass
@@ -8007,7 +7992,7 @@ def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(
             reset_recovered=False,
             off_bus=16,
             was_failing=True,
-            host_escalation="reboot",
+            host_escalation="power-cycle",
             scope_active=True,
         )
         == WAIT
@@ -8015,12 +8000,12 @@ def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(
     # Reset NOT yet run this pass (pre-reset) at a mass drop: run the galaxy reset first, not the host
     # rung — even with a prior cycle failed.
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=None, off_bus=16, was_failing=True, host_escalation="reboot")
+        _rung(monkeypatch, health_deps, reset_recovered=None, off_bus=16, was_failing=True, host_escalation="power-cycle")
         == STAGE_SMI_RESET
     )
-    # A whole-bus drop after the failed reset, with only the reboot opted in and no power cycle to
-    # fall back to: BLOCKED (B7), never WAIT — no opted-in rung can recover it, so the loud
-    # fail-closed alert owns this, not the ordinary self-heal hold.
+    # A whole-bus drop after the failed reset with the power cycle not armed (a stale reboot setting
+    # arms nothing): BLOCKED (B7), never WAIT — no rung can recover it, so the loud fail-closed
+    # alert owns this, not the ordinary self-heal hold.
     assert (
         _rung(
             monkeypatch,
@@ -9895,9 +9880,9 @@ def _arm_stuck_hold(
     """Arm the idle escalation: present-mesh hold past the ceiling, no tenant, no cooldown, reset
     mocked. ``beats_after_reset`` (if given) is what ``read_heartbeats`` returns AFTER the mocked
     reset runs — how a galaxy reset that dropped the mesh off the bus is expressed to the failed-
-    reset climb. The host rung (reboot/power-cycle) is mocked to count and its rate-limit ledger +
+    reset climb. The host rung (the power cycle) is mocked to count and its rate-limit ledger +
     boot id are stubbed open. Returns a counters dict recording reset / fault-clear / dirty-clear /
-    reboot / power-cycle calls."""
+    power-cycle calls; "reboots" stays 0, as no path reboots the host."""
     beats = beats if beats is not None else {str(i): 100 for i in range(32)}
     scan = scan if scan is not None else HolderScan(holders=[], complete=True)
     counters = {"resets": 0, "fault_cleared": 0, "dirty_cleared": 0, "reboots": 0, "power_cycles": 0}
@@ -9922,9 +9907,6 @@ def _arm_stuck_hold(
         if beats_after_reset is not None:
             monkeypatch.setattr(srv, "read_heartbeats", lambda: beats_after_reset)
         return reset_result
-
-    async def reboot(log, reason):
-        counters["reboots"] += 1
 
     async def power_cycle(log, reason):
         counters["power_cycles"] += 1
@@ -10096,26 +10078,36 @@ async def test_stuck_hold_escalation_is_inert_when_kill_switched(monkeypatch, cl
 
 
 @pytest.mark.asyncio
-async def test_stuck_hold_escalation_retries_on_the_grace_cadence(monkeypatch, clear_job_state):
-    """A present-mesh reset that does not clear the wedge RETRIES — an eth wedge does not self-heal
-    by waiting and the box is idle, so the only cure keeps getting its shot until recovery or the
-    ceiling. Retries are paced, not capped: a pass inside the grace window since the last reset
-    defers; one past it fires again, episode latch notwithstanding."""
-    counters = _arm_stuck_hold(monkeypatch, reset_result=False)  # the reset ran but did not recover
+@pytest.mark.parametrize("power_cycle", [False, True], ids=["no-host-rung", "power-cycle"])
+async def test_stuck_hold_escalation_never_repeats_a_failed_mesh_reset_in_the_episode(
+    monkeypatch, clear_job_state, power_cycle
+):
+    """Spec 04 I87: a present-mesh reset that ran and did not clear the wedge is spent for the hold
+    episode. A later idle pass past the grace, or a forced window, never runs it again: the climb
+    goes on to the power cycle (or hands off when there is none). Repeated resets ten minutes apart
+    measured nothing new and only pushed the power cycle later."""
+    counters = _arm_stuck_hold(monkeypatch, reset_result=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1" if power_cycle else "0")
+    real_reset = srv.galaxy_recovery._reset_and_verify_device
+
+    async def launched_reset(indices, log):
+        srv.recovery_mechanism.last_reset_rc = 1  # the reset launched and exited non-zero
+        return await real_reset(indices, log)
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", launched_reset)
     first = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
     assert first is True and counters["resets"] == 1
 
-    srv.galaxy_recovery.mechanism.last_reset_monotonic = time.monotonic()
-    second = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert (
-        second is False and counters["resets"] == 1
-    ), "inside the grace window since the last reset the retry must defer, not stack"
+    assert counters["power_cycles"] == (1 if power_cycle else 0), "the climb asks for the power cycle, if armed"
 
     srv.galaxy_recovery.mechanism.last_reset_monotonic = time.monotonic() - galaxy._present_mesh_reset_grace_sec() - 1
-    third = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert (
-        third is True and counters["resets"] == 2
-    ), "past the grace window the escalation retries — the episode latch is not a cap here"
+    again = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert again is False and counters["resets"] == 1, "an idle pass past the grace never repeats the reset"
+    assert counters["power_cycles"] == (1 if power_cycle else 0), "unforced, the climb runs once per episode"
+    # The watchdog's forced window (the I76 bound) climbs again, still without a second reset.
+    await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["resets"] == 1, "the episode's one mesh reset is spent: no forced window repeats it"
+    assert counters["reboots"] == 0
 
 
 @pytest.mark.asyncio
@@ -10166,14 +10158,17 @@ async def test_stuck_hold_failed_reset_on_a_present_mesh_climbs_to_the_host_rung
     """A galaxy reset that did NOT recover but left the mesh PRESENT (every chip on the bus, ARC-
     healthy) is an eth/fabric wedge the reset could not clear — reaching here means the galaxy reset,
     which normally re-inits every eth core, failed, so it is NOT self-healing and the cascade must
-    climb to the host rung rather than hold indefinitely (measured on box D: hours of ceiling ->
-    galaxy-reset -> hold with the eth core wedged the whole time). Only a FEW chips off the bus below
-    the floor still holds (they re-enumerate) — see the below-floor test. Opt-in + rate-limited."""
+    climb to the host rung, the power cycle, rather than hold indefinitely (measured on one Galaxy:
+    hours of ceiling -> galaxy-reset -> hold with the eth core wedged the whole time). A stale reboot
+    setting changes nothing: the power cycle is the only host rung."""
     counters = _arm_stuck_hold(monkeypatch, reset_result=False, beats_after_reset={str(i): 100 for i in range(32)})
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
     assert ran is True and counters["resets"] == 1
-    assert counters["reboots"] == 1, "a present-mesh wedge that survived the galaxy reset must climb to the host rung"
+    assert (
+        counters["power_cycles"] == 1
+    ), "a present-mesh wedge that survived the galaxy reset must climb to the power cycle"
 
 
 @pytest.mark.asyncio
@@ -10827,7 +10822,7 @@ async def test_present_mesh_failed_reset_sweeps_then_climbs_without_the_ceiling_
     swept = []
     counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=6, reset_result=False)
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
 
     async def sweep(*a, **k):
         swept.append(k.get("context"))
@@ -10838,7 +10833,7 @@ async def test_present_mesh_failed_reset_sweeps_then_climbs_without_the_ceiling_
     assert ran is True
     assert counters["resets"] == 1, "the grace-time galaxy reset still fires"
     assert len(swept) == 1, "the last-chance sweep still runs before the host rung (I22)"
-    assert counters["reboots"] == 1 and counters["power_cycles"] == 0
+    assert counters["power_cycles"] == 1 and counters["reboots"] == 0
     assert "host_rung_not_deferred" in events and "host_rung_deferred_until_ladder_end" not in events
     assert counters["dirty_cleared"] == 0, "nothing releases the device without a passing full check"
 
@@ -12225,26 +12220,27 @@ async def test_a_present_mesh_wedge_that_survived_the_galaxy_reset_climbs_to_the
 ):
     """The cascade must PROGRESS. A present mesh (every chip on the bus) whose galaxy reset still did
     not verify is an eth/fabric wedge the reset could not clear — it survived the deepest reset, so it
-    is not self-healing and must climb to the host reboot/power-cycle, not hold indefinitely (measured
-    on box D: hours of ceiling->galaxy-reset->hold with the eth core wedged). Fails on base, which
-    holds any off_bus < reboot_floor, present mesh included."""
+    is not self-healing and must climb to the power cycle, not hold indefinitely (measured on one
+    Galaxy: hours of ceiling->galaxy-reset->hold with the eth core wedged)."""
     _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-A")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})  # all 32 present
     _no_holders(monkeypatch)
     monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda esc, *, tenant_active: (True, "ok"))
     patch_health_event(monkeypatch, lambda *a, **k: None)
-    reboots = {"n": 0}
+    cycles = {"n": 0}
 
-    async def fake_reboot(log, reason):
-        reboots["n"] += 1
+    async def fake_power_cycle(log, reason):
+        cycles["n"] += 1
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
 
     await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(
         32, 0, lambda _m: None
     )  # present before the reset
-    assert reboots["n"] == 1, "a present-mesh wedge that survived the galaxy reset must climb to the host rung"
+    assert cycles["n"] == 1, "a present-mesh wedge that survived the galaxy reset must climb to the power cycle"
 
 
 @pytest.mark.asyncio
@@ -13133,7 +13129,7 @@ async def test_a_sweep_still_reading_77_with_no_known_cause_climbs_to_the_host_r
     counters, climbs, alerts = _arm_sweep_still_77(monkeypatch)
     g = srv.galaxy_recovery
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert climbs == [{"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True, "cold": False}]
+    assert climbs == [{"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True}]
     assert alerts == [], "the host rung is the automatic end; no operator page yet"
     assert srv.recovery_mechanism.unverified_77_host_rung_since == srv.device_hold_episode_since
 
@@ -13175,7 +13171,7 @@ async def test_a_latched_hold_whose_sweep_still_reads_a_mismatch_77_climbs_to_th
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     if latched:
         assert climbs == [
-            {"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True, "cold": False}
+            {"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True}
         ]
         assert [a["kind"] for a in alerts] == []
     else:
