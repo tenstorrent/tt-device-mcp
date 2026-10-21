@@ -27,6 +27,7 @@ import asyncio
 import logging
 import os
 import signal
+import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
@@ -39,6 +40,11 @@ PROC_DIR = "/proc"
 # Exported into every job's shell with a value unique to that run; children inherit it.
 JOB_TAG_ENV = "TT_DEVICE_MCP_JOB_TAG"
 _POLL_SEC = 0.1
+# While a process is inside execve its environ reads empty (the new mm has no env yet), so a
+# tagged child caught there looks untagged. One re-read after this delay settles it; the exec
+# window is microseconds. Paid only when some live user process reads an empty environ.
+ENVIRON_REREAD_SEC = 0.05
+_PF_KTHREAD = 0x00200000  # stat flags bit: a kernel thread, which has no environ to wait for
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,7 @@ class ProcInfo:
     sid: int
     state: str
     starttime: str
+    flags: int = 0
 
 
 @dataclass(frozen=True)
@@ -82,6 +89,7 @@ def _read_stat(pid: int) -> Optional[ProcInfo]:
             pgid=int(rest[2]),
             sid=int(rest[3]),
             starttime=rest[19],
+            flags=int(rest[6]),
         )
     except (IndexError, ValueError):
         return None
@@ -100,13 +108,17 @@ def _in_scope(pid: int, scope: str) -> bool:
     return False
 
 
-def _has_tag(pid: int, tag: str) -> bool:
+def _has_tag(pid: int, tag: str) -> Optional[bool]:
+    """Whether ``pid`` carries the job tag; None when its environ reads empty (mid-execve,
+    exiting, or a process really started with no environment), so it cannot tell yet."""
     try:
         with open(f"{PROC_DIR}/{pid}/environ", "rb") as f:
-            entries = f.read().split(b"\0")
+            raw = f.read()
     except OSError:
         return False
-    return f"{JOB_TAG_ENV}={tag}".encode() in entries
+    if not raw:
+        return None
+    return f"{JOB_TAG_ENV}={tag}".encode() in raw.split(b"\0")
 
 
 def _cmdline(pid: int) -> str:
@@ -154,13 +166,22 @@ def job_processes(pid: Optional[int], scope: Optional[str] = None, tag: Optional
     Never includes the broker itself or pid 1, whatever /proc says."""
     procs = _all_procs()
     exclude = {os.getpid(), 1, 0}
-    members = {
-        p
-        for p, info in procs.items()
-        if (pid and (info.pgid == pid or info.sid == pid or p == pid))
-        or (scope and _in_scope(p, scope))
-        or (tag and p not in exclude and _has_tag(p, tag))
-    }
+    members = set()
+    unread = []
+    for p, info in procs.items():
+        if (pid and (info.pgid == pid or info.sid == pid or p == pid)) or (scope and _in_scope(p, scope)):
+            members.add(p)
+        elif tag and p not in exclude:
+            has = _has_tag(p, tag)
+            if has:
+                members.add(p)
+            elif has is None and info.state not in ("Z", "X") and not info.flags & _PF_KTHREAD:
+                unread.append(p)
+    if unread:
+        # A child that escaped the group and session and is mid-exec is found only by its tag:
+        # read those environs once more rather than miss it (the sweep's first scan decides).
+        time.sleep(ENVIRON_REREAD_SEC)
+        members.update(p for p in unread if _has_tag(p, tag))
     # Descendants of any member: a child that left the group or session but whose parent
     # chain is still intact.
     children: dict[int, list[int]] = {}

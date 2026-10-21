@@ -55,7 +55,9 @@ the queue and a running job outlive the broker process.
   so a child that started its own session is still found after its parent exits), or
   descends from any of those. Leftovers get SIGTERM, then SIGKILL after
   `SURVIVOR_TERM_GRACE_SEC` (5 s); with nothing left, the sweep costs one /proc scan and a
-  `killpg` backstop. A process still alive after SIGKILL (state D: stuck in the kernel) is
+  `killpg` backstop. A live user process whose environ reads empty (as it does inside
+  `execve`) is read once more after `ENVIRON_REREAD_SEC` (50 ms, once per scan, however many
+  there are), so an escaped child caught mid-exec is still found by its tag. A process still alive after SIGKILL (state D: stuck in the kernel) is
   named in the broker log and the job log, and if it holds or may hold the device, the
   device is marked dirty with the job and pid, so the next job waits until it is gone. A
   broker shutdown that lands mid-sweep lets the sweep and the job's bookkeeping finish first.

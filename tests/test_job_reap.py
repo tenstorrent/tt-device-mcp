@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import time
+import types
 
 import pytest
 
@@ -206,6 +207,86 @@ def test_scope_membership_reads_the_cgroup(tmp_path, monkeypatch):
 
     found = job_reap.job_processes(None, "ttdev-job-086.scope")
     assert sorted(found) == [500, 501]
+
+
+def _stage_proc(root, pid, *, environ: bytes, state="S", flags=0):
+    """A fake /proc/<pid> in its own session and group, found only by its environ (the tag)."""
+    d = root / str(pid)
+    d.mkdir()
+    rest = [state, "1", str(pid), str(pid), "0", "0", str(flags)] + ["0"] * 12 + ["1000"]
+    (d / "stat").write_text(f"{pid} (x y) " + " ".join(rest) + "\n")
+    (d / "environ").write_bytes(environ)
+
+
+def _count_sleeps(monkeypatch, on_sleep=lambda: None) -> list[float]:
+    sleeps: list[float] = []
+
+    def sleep(sec):
+        sleeps.append(sec)
+        on_sleep()
+
+    monkeypatch.setattr(job_reap, "time", types.SimpleNamespace(sleep=sleep), raising=False)
+    return sleeps
+
+
+def test_an_escaped_child_caught_mid_exec_is_found_on_the_re_read(tmp_path, monkeypatch):
+    """Inside execve a process's environ reads empty, so an escaped child (own session, parent
+    gone) looks untagged. The scan reads it once more after a short delay instead of missing it."""
+    monkeypatch.setattr(job_reap, "PROC_DIR", str(tmp_path))
+    tag = "t-exec"
+    _stage_proc(tmp_path, 600, environ=b"")
+    _stage_proc(tmp_path, 601, environ=b"PATH=/bin\0")
+    filled = f"PATH=/bin\0{job_reap.JOB_TAG_ENV}={tag}\0".encode()
+    sleeps = _count_sleeps(monkeypatch, lambda: (tmp_path / "600" / "environ").write_bytes(filled))
+
+    assert sorted(job_reap.job_processes(None, None, tag)) == [600]
+    assert len(sleeps) == 1 and sleeps[0] <= 0.1
+
+
+def test_an_environ_that_stays_empty_costs_one_bounded_re_read(tmp_path, monkeypatch):
+    """A process really started with no environment is not the job's, and the many of them cost
+    one delay per scan, not one each."""
+    monkeypatch.setattr(job_reap, "PROC_DIR", str(tmp_path))
+    for pid in (610, 611, 612):
+        _stage_proc(tmp_path, pid, environ=b"")
+    sleeps = _count_sleeps(monkeypatch)
+
+    assert job_reap.job_processes(None, None, "t-empty") == {}
+    assert len(sleeps) == 1 and sleeps[0] <= 0.1
+
+
+def test_readable_environs_kernel_threads_and_zombies_add_no_wait(tmp_path, monkeypatch):
+    """The normal path pays nothing: every user process's environ reads, and the empty environ
+    of a kernel thread or a zombie is expected, not a process caught mid-exec."""
+    monkeypatch.setattr(job_reap, "PROC_DIR", str(tmp_path))
+    tag = "t-normal"
+    _stage_proc(tmp_path, 620, environ=f"{job_reap.JOB_TAG_ENV}={tag}\0".encode())
+    _stage_proc(tmp_path, 621, environ=b"PATH=/bin\0")
+    _stage_proc(tmp_path, 622, environ=b"", flags=0x00200040)
+    _stage_proc(tmp_path, 623, environ=b"", state="Z")
+    sleeps = _count_sleeps(monkeypatch)
+
+    assert sorted(job_reap.job_processes(None, None, tag)) == [620]
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_ends_a_child_its_first_scan_caught_mid_exec(tmp_path, monkeypatch):
+    """The sweep returns at once when its first scan finds nothing, so that scan must not miss a
+    child caught mid-exec: it is signalled, not left behind (spec 01 I4)."""
+    monkeypatch.setattr(job_reap, "PROC_DIR", str(tmp_path))
+    tag = "t-exec-sweep"
+    _stage_proc(tmp_path, 630, environ=b"")
+    filled = f"{job_reap.JOB_TAG_ENV}={tag}\0".encode()
+    _count_sleeps(monkeypatch, lambda: (tmp_path / "630" / "environ").write_bytes(filled))
+    signalled = []
+    monkeypatch.setattr(
+        job_reap, "_signal", lambda targets, sig, pgid: signalled.append((sorted(t.pid for t in targets), sig))
+    )
+    monkeypatch.setattr(job_reap, "_alive", lambda info: False)
+
+    assert await job_reap.reap_job_survivors("t10", None, None, tag, log=lambda _m: None) == []
+    assert signalled[0] == ([630], signal.SIGTERM)
 
 
 def test_the_broker_and_init_are_never_job_processes(monkeypatch):
