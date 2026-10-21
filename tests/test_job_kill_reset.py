@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import signal
+import subprocess
 from pathlib import Path
 
 import httpx2
@@ -228,12 +229,25 @@ def runner_env(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv, "_tenant_holder_reason", lambda: "")
     monkeypatch.setattr(srv, "get_activation_script", lambda *a, **kw: ("", {}))
     monkeypatch.setattr(srv, "privsep_prefix_for", lambda uid, unit=None: None)
+    # No job here runs in a scope: a live broker on this host may run a real ttdev-job-<id>.scope
+    # whose id a test's job reuses, and its kill must not take the scope path.
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    monkeypatch.setattr(srv, "list_active_job_scopes", lambda: {})
     # The lifespan and job_run start a runner when none is live; a test owns its runner (or has
     # none, so a submitted job stays QUEUED).
     monkeypatch.setattr(srv, "job_runner_task", _HeldRunner())
     events = []
     monkeypatch.setattr(srv, "health_event", lambda name, *a, **k: events.append(name))
     return {"tmp": tmp_path, "events": events}
+
+
+def test_a_host_job_scope_with_the_tests_job_id_is_not_the_tests_job(runner_env, monkeypatch):
+    """A broker on the host runs ttdev-job-323.scope while a test's job 323 is killed: the test's
+    kill must not see that scope (it took the scope path and asked to SIGINT the live job)."""
+    host = subprocess.CompletedProcess([], 0, stdout="ttdev-job-323.scope loaded active running\n")
+    monkeypatch.setattr(srv.subprocess, "run", lambda *a, **k: host)
+    assert not srv._scope_active(srv.job_scope_unit("323"))
+    assert srv.list_active_job_scopes() == {}
 
 
 class _HeldRunner:
