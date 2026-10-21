@@ -82,6 +82,19 @@ def reset_removed_chip_records():
 
 
 @pytest.fixture(autouse=True)
+def reset_pci_writer():
+    """Clear the one in-flight PCI writer and its PCI-wedged latch (spec 04 I76) around every test."""
+    try:
+        from tt_device_mcp.health.pci_writer import PCI_WRITER
+    except ImportError:
+        yield
+        return
+    PCI_WRITER.reset_for_tests()
+    yield
+    PCI_WRITER.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def reset_broker_internal_pids():
     """Clear the broker-internal pid registry (spec 04 I59) around every test: a probe one test
     spawned through run_probe must not discount a holder in the next."""

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 from tt_device_mcp import metrics
-from tt_device_mcp.health import ALL_ONES, SAMPLE_INTERVAL_SEC, SAMPLE_RING_SIZE, chip_state
+from tt_device_mcp.health import ALL_ONES, PCI_WRITER, SAMPLE_INTERVAL_SEC, SAMPLE_RING_SIZE, PciWedged, chip_state
 
 if TYPE_CHECKING:
     from tt_device_mcp.health import HealthMonitor, RecoveryDeps, RecoveryMechanism
@@ -454,16 +454,23 @@ class TelemetrySampler:
         detached: list = []
         blocked = False
 
-        async def detach_all() -> None:
-            for idx in confirmed:
-                if await asyncio.to_thread(self._deps.isolate_chip, idx):
-                    detached.append(idx)
-
         if self._deps.isolate_chip is not None:
-            try:
-                await asyncio.wait_for(detach_all(), timeout=INFLIGHT_DETACH_TIMEOUT_SEC)
-            except asyncio.TimeoutError:
-                blocked = True
+            # Each remove is the one in-flight PCI write (spec 04 I76), all within one budget. The first
+            # that times out or is refused (PCI-wedged) ends the cut: nobody is killed.
+            deadline = time.monotonic() + INFLIGHT_DETACH_TIMEOUT_SEC
+            for idx in confirmed:
+                try:
+                    ok = await PCI_WRITER.write(
+                        f"in-flight cut remove of chip {idx}",
+                        self._deps.isolate_chip,
+                        idx,
+                        timeout=max(0.01, deadline - time.monotonic()),
+                    )
+                except PciWedged:
+                    blocked = True
+                    break
+                if ok:
+                    detached.append(idx)
         if detached:
             self._deps.isolated_chips().update(detached)
         stuck = [i for i in confirmed if i not in detached]
@@ -744,6 +751,21 @@ class TelemetrySampler:
             return
         isolated_chips.update(fresh)
 
+        if PCI_WRITER.latched:
+            # Spec 04 I76: a PCI write is blocked in the kernel. A remove would only queue behind it on
+            # the same lock (or start a second blocked thread), and killing a holder or stopping a poller
+            # of a chip that is off the bus but still attached makes the driver touch that chip on the fd
+            # close. So skip the chip: no remove, no kill; the device is held and the power cycle, already
+            # requested by the latch, is the recovery.
+            if log:
+                log.error(
+                    f"DEAD CHIP(S) {fresh}: isolation skipped, PCI-wedged ({PCI_WRITER.reason}); "
+                    f"holding the device for the power cycle"
+                )
+            self._deps.health_event("chip_isolation_skipped", chips=fresh, reason=PCI_WRITER.reason, host_at_risk=True)
+            self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} fell off the PCIe bus", why="heartbeat")
+            return
+
         if log:
             log.error(
                 f"DEAD CHIP(S) {fresh}: all reads return 0xFFFFFFFF — the chip has left "
@@ -776,8 +798,15 @@ class TelemetrySampler:
 
         removed = []
         for idx in fresh:
-            if await asyncio.to_thread(self._deps.isolate_chip, idx):
-                removed.append(idx)
+            # The one in-flight PCI write (spec 04 I76). A remove that times out or is refused latches
+            # PCI-wedged: the rest are left on the bus (stuck) and the power cycle is requested.
+            try:
+                if await PCI_WRITER.write(f"isolate dead chip {idx}", self._deps.isolate_chip, idx):
+                    removed.append(idx)
+            except PciWedged as e:
+                if log:
+                    log.error(f"DEAD-CHIP remove of chip {idx} failed: {e}")
+                break
         stuck = [i for i in fresh if i not in removed]
         if stuck:
             # A dead chip that could not be removed is still on the bus and still

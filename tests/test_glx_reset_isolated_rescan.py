@@ -256,7 +256,15 @@ async def test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan(monkeypatc
     pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
     for _ in range(5):
         await asyncio.sleep(0)
-    assert all(t.done() for t in pending), "no rescan task left running"
+    # The sysfs write itself is not cancellable (its thread runs on in the kernel): the one in-flight
+    # PCI writer keeps tracking it so no second write starts behind it (spec 04 I76). Nothing else is left.
+    write = srv.PCI_WRITER._task
+    assert srv.PCI_WRITER.pending(), "the write is still tracked"
+    assert all(t.done() for t in pending if t is not write), "no rescan task left running"
+    gate.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert write.done() and not srv.PCI_WRITER.pending()
 
 
 @pytest.mark.asyncio
@@ -307,6 +315,8 @@ async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_res
     assert rescans == ["driver wait"] and srv.recovery_mechanism.reset_in_flight is True
     monkeypatch.setattr(srv.asyncio, "sleep", no_sleep)
     task.cancel()
+    await real_sleep(0)
+    gate.set()  # the write ends inside its bound; the rescan after the reset waits for it (spec 04 I76)
     with pytest.raises(asyncio.CancelledError):
         await task
 

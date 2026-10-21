@@ -108,6 +108,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     OUTCOME_RECOVERED,
     OUTCOME_TERMINAL,
     OUTCOME_WAITING,
+    PCI_WRITER,
     RELEASE,
     RESET_COOLDOWN_SEC,
     RESET_MODE_GALAXY,
@@ -1234,6 +1235,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         chip_state.publish()
         _reload_removed_chips()
         recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
+        PCI_WRITER.on_latch = _on_pci_wedged
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
         )
@@ -3439,6 +3441,17 @@ def _job_snapshot(job: "Job | None") -> dict:
     )
 
 
+def _on_pci_wedged(reason: str) -> None:
+    """Spec 04 I76: a PCI sysfs write blocked in the kernel (or one refused behind it) latched
+    PCI-wedged. Hold the device and let the watchdog ask for the power cycle on this tick, not at the
+    10-min mark: every rung needs the PCI lock the blocked write holds."""
+    _mark_device_dirty(f"PCI-wedged: {reason}", why="heartbeat")
+    try:
+        asyncio.get_running_loop().call_soon(_check_hold_deadline)
+    except RuntimeError:
+        pass  # no loop here: the sampler's next tick asks
+
+
 def _mark_device_dirty(reason: str, job: "Job | None" = None, *, why: str = "job_killed") -> None:
     """Flag the device as possibly-wedged so the runner cleans it before the next job.
 
@@ -3727,6 +3740,20 @@ def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> b
             if logger:
                 logger.warning(f"HOLD-LIFT refused ({why}): {unproven} — the hold stays")
             return False
+        # Spec 04 I76: the PCI-wedged latch clears only on this verified lift, with no PCI write still
+        # blocked in the kernel; while one is, nothing lifts.
+        if PCI_WRITER.latched and not PCI_WRITER.clear(why):
+            health_event(
+                "hold_lift_refused",
+                why=why,
+                hold=fsm.record.why,
+                reason=f"PCI-wedged: a PCI write ({PCI_WRITER.pending()}) is still blocked in the kernel",
+                since=fsm.record.since,
+                fabric=_lift_fabric(),
+            )
+            if logger:
+                logger.warning(f"HOLD-LIFT refused ({why}): PCI-wedged, a PCI write is still blocked — the hold stays")
+            return False
     was_degraded = fsm.state is not ServerState.HEALTHY
     _journal_fsm_transition(why, verified=verified)
     if verified:
@@ -3765,6 +3792,8 @@ def _clear_device_dirty_unverified(why: str, *, holds: bool = True, fault: str =
     means we tried and could not tell, which is the case the hold exists for.
     """
     _journal_fsm_transition(why, verified=False)
+    if PCI_WRITER.latched:
+        holds = True  # spec 04 I76: PCI-wedged lifts only on a verified full check
     if not holds:
         fsm.on_readings(_healthy_reading())
         return
@@ -8286,6 +8315,12 @@ async def _force_escalate_stuck_hold() -> None:
         # the host rung after it) from running. Below the bound the faster class paths stay as they are.
         held_age = _hold_age_now()
         bound = held_age >= _hold_bound_sec()
+        if PCI_WRITER.latched:
+            # Spec 04 I76: PCI-wedged. Every rung needs the PCI lock a blocked write holds, so the host
+            # rung now, at any hold age; only the I65 cooldown delays it (its retry fires at the end).
+            if not _host_action_blocks_escalation():
+                await _hold_bound_host_rung(held_age, log)
+            return
         # Spec 04 I83: a fabric link-short hold gets its one ladder at hold start, and every later run
         # in the episode is the bound's (the host rung), not a second ladder.
         early = not bound and _fabric_link_short_early(kind)
@@ -8447,6 +8482,8 @@ _hold_bound_unarmed_paged: str = ""
 # tenant, or a governor denial that armed no retry. The watchdog asks again on every tick until it is
 # requested, a cooldown retry is armed or no host rung is configured (spec 04 I76).
 _hold_bound_rung_pending: bool = False
+# Spec 04 I76: the PCI-wedged latch (its latched_at) the watchdog already asked the host rung for.
+_pci_wedged_asked: Optional[float] = None
 _hold_bound_denied_why: str = ""
 # The live tenant that keeps the bound's ladder or host rung from running (paged once per episode) and
 # what it is, for /health (spec 04 I76).
@@ -8669,6 +8706,8 @@ def _hold_bound_route(kind: Optional[str], age: float) -> ForcedRoute:
     check or the host rung in place of the ladder (spec 04 I76); below it, the ladder. The bound is the
     hold's own (_hold_bound_sec: one sampler tick under the spec 03 I42 latch), so the host rung an
     early bound ladder owes runs no second ladder first."""
+    if PCI_WRITER.latched:
+        return ForcedRoute(ROUTE_HOST_RUNG)  # spec 04 I76: no rung can run over a blocked PCI lock
     if age < _hold_bound_sec() and not _fabric_link_short_early(kind):
         return ForcedRoute(ROUTE_LADDER)
     if kind != "hold_bound_cycle" and _hold_bound_check_pending(age):
@@ -9156,7 +9195,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     use; a missing or unparseable stamp is not held, so it is not flagged."""
     global device_hold_deadline_bucket, device_hold_escalate_bucket, device_hold_offbus_escalated
     global device_hold_risky_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
-    global device_hold_offbus_prior_bucket, device_hold_offbus_idle_early
+    global device_hold_offbus_prior_bucket, device_hold_offbus_idle_early, _pci_wedged_asked
     if not device_hold_episode_since:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
@@ -9214,6 +9253,17 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         device_hold_escalation_trigger = "the end of the power-cycle cooldown"
         if _maybe_spawn_forced_escalation():
             recovery_mechanism.clear_power_cycle_retry()
+    # Spec 04 I76: PCI-wedged asks for the power cycle at once, once per latch; a cooldown denial arms
+    # the I65 retry above, which fires the moment the cooldown ends.
+    if (
+        PCI_WRITER.latched
+        and _pci_wedged_asked != PCI_WRITER.latched_at
+        and getattr(recovery_mechanism, "power_cycle_retry", None) is None
+    ):
+        device_hold_escalation_kind = "pci_wedged"
+        device_hold_escalation_trigger = "a PCI sysfs write blocked in the kernel (PCI-wedged)"
+        if _maybe_spawn_forced_escalation():
+            _pci_wedged_asked = PCI_WRITER.latched_at
     # Spec 04 I73: a whole tray whose cycle the cooldown refuses gets the full ladder at the 10-min
     # mark after its last cycle or boot, not at the next ceiling window (up to a window late).
     if not only_77 and recovery_mechanism.class_a_ladder_watch_due(now.timestamp() if now else None):

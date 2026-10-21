@@ -281,8 +281,9 @@ async def test_a_remove_blocked_in_the_kernel_still_lets_the_bound_reach_the_pow
     monkeypatch, tmp_path, clear_job_state
 ):
     """Spec 03 I83 / 04 I76: a post-reset cut whose PCI remove blocks in the kernel holds the PCI
-    rescan/remove lock, so every later rescan queues behind it. The bound's rescan rung must give up at
-    its own bound, count as failed and let the ladder go on to the full check and the power cycle."""
+    rescan/remove lock, so every later rescan would queue behind it. The remove's timeout latches
+    PCI-wedged: the bound's rescan rung is refused at once (no second write, no second timeout), counts
+    as failed and the ladder goes on to the full check and the power cycle."""
     order, events, _counters = _rig(monkeypatch, tmp_path)
     kernel_lock = threading.Event()  # never released while the test runs: the blocked remove
     w = _World(monkeypatch, detach_ok=lambda idx: kernel_lock.wait(30) and True, beats={GONE: ALL_ONES})
@@ -302,8 +303,12 @@ async def test_a_remove_blocked_in_the_kernel_still_lets_the_bound_reach_the_pow
         assert time.monotonic() - t0 < 5
     finally:
         kernel_lock.set()  # free the worker threads
-    assert order == ["rescan", "mesh reset", "full check", "power cycle"]
-    assert "pci_rescan_timeout" in events, "the timed-out rescan is journaled as that rung failing"
+    # The latch asks for the power cycle at once (the watchdog's tick), before any ladder runs; the
+    # bound's own ladder then skips the refused rescan and ends in the power cycle too.
+    assert order[0] == "power cycle", "the PCI-wedged latch requested the power cycle at once"
+    assert order[1:] == ["mesh reset", "full check", "power cycle"], "the rescan never started a second write"
+    assert srv.PCI_WRITER.latched, "the blocked remove latched PCI-wedged"
+    assert "pci_rescan_timeout" not in events, "one PCI timeout per ladder: the refused rescan did not wait"
 
 
 def _real_bridge_rung(monkeypatch, tmp_path):

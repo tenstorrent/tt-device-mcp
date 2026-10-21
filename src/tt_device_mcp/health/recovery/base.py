@@ -24,11 +24,13 @@ from typing import Awaitable, Callable, Optional
 from tt_device_mcp import aio, alert, metrics, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
 from tt_device_mcp.health import chip_state
+from tt_device_mcp.health import pci_writer as _pci_writer_mod
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.monitors.heartbeat import returned_chips
+from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
@@ -47,28 +49,38 @@ GLX_DRIVER_WAIT = re.compile(r"Waiting for all \d+ chips to show up|Waiting for 
 GLX_POST_RESET_FAILED = re.compile(r"POST_RESET failed for device /dev/tenstorrent/(\d+)\.")
 
 # A write to /sys/bus/pci/rescan or a chip's `remove` waits on the kernel's PCI rescan/remove lock and
-# on the device it walks; behind a hung endpoint it can block for good. Each one runs in a worker
-# thread awaited at most this long: on timeout the step gives up and says so, and the thread may stay
-# blocked in the kernel (no thread can be cancelled there).
-PCI_SYSFS_WRITE_TIMEOUT_SEC = 30
+# on the device it walks; behind a hung endpoint it can block for good. Every such write goes through
+# the one in-flight writer (health.pci_writer): the first that does not return in this long latches
+# PCI-wedged, and its thread may stay blocked in the kernel until the power cycle.
+PCI_SYSFS_WRITE_TIMEOUT_SEC = _pci_writer_mod.PCI_SYSFS_WRITE_TIMEOUT_SEC
 
 
 async def pci_rescan(context: str = "", write: Optional[Callable[[], object]] = None) -> None:
-    """One global PCI rescan, bounded by PCI_SYSFS_WRITE_TIMEOUT_SEC. Raises OSError or
-    asyncio.TimeoutError; a timeout is journaled (pci_rescan_timeout) and counts as the calling rung
-    failing, so the ladder goes on to its next rung and the power-cycle request instead of waiting
-    behind a remove that is blocked in the kernel. ``write`` replaces the bare sysfs write (a
-    module's own stubbable rescan function); ``context`` names the rung in the journal."""
-    call = (
-        asyncio.to_thread(write)
-        if write is not None
-        else asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
-    )
+    """One global PCI rescan through the one in-flight PCI writer, bounded by
+    PCI_SYSFS_WRITE_TIMEOUT_SEC. Raises OSError, or PciWedged (an asyncio.TimeoutError) on a timeout
+    or when the writer refuses it (PCI-wedged, or an earlier write still blocked): either way the
+    calling rung failed. A timeout is journaled (pci_rescan_timeout) and latches PCI-wedged, which
+    requests the power cycle. ``write`` replaces the bare sysfs write (a module's own stubbable rescan
+    function); ``context`` names the rung in the journal."""
+    fn, args = (write, ()) if write is not None else (Path("/sys/bus/pci/rescan").write_text, ("1",))
+    refused = PCI_WRITER.latched or bool(PCI_WRITER.pending())
     try:
-        await asyncio.wait_for(call, timeout=PCI_SYSFS_WRITE_TIMEOUT_SEC)
-    except asyncio.TimeoutError:
-        health_event("pci_rescan_timeout", context=context, timeout_s=PCI_SYSFS_WRITE_TIMEOUT_SEC)
-        raise asyncio.TimeoutError(f"no answer in {PCI_SYSFS_WRITE_TIMEOUT_SEC} s") from None
+        await PCI_WRITER.write(context or "PCI rescan", fn, *args, timeout=PCI_SYSFS_WRITE_TIMEOUT_SEC)
+    except PciWedged:
+        if not refused:
+            health_event("pci_rescan_timeout", context=context, timeout_s=PCI_SYSFS_WRITE_TIMEOUT_SEC)
+        raise
+
+
+def pci_wedged_refusal(context: str, log) -> str:
+    """Why a PCI-dependent rung may not run now (the PCI-wedged latch is set), or "". Journaled and
+    logged: the rung is skipped and counts as failed at once."""
+    if not PCI_WRITER.latched:
+        return ""
+    why = f"PCI-wedged ({PCI_WRITER.reason}); the power cycle is requested"
+    log(f"{context} skipped: {why}")
+    health_event("pci_wedged_rung_skipped", context=context, reason=PCI_WRITER.reason)
+    return why
 
 
 # A reset that did not fix the device will not fix it on the next attempt either,
@@ -1208,6 +1220,11 @@ class RecoveryMechanism:
             log(f"reset refused: {fenced}")
             health_event("reset_fenced", argv=argv, owner=owner, reason=fenced)
             return None, f"reset refused: {fenced}"
+        # Spec 04 I76: a reset re-enumerates its chips through the kernel's PCI lock, which a blocked
+        # PCI write holds; while PCI-wedged it cannot run and counts as failed at once.
+        wedged = pci_wedged_refusal(f"reset ({' '.join(argv)})", log)
+        if wedged:
+            return None, f"reset refused: {wedged}"
         # Name the command we are actually running. This was hardcoded to the galaxy's -glx_reset, so on
         # every other machine the queue told operators a command that was not the one executing.
         self._set_device_op_detail(f"device reset: {' '.join(argv)} (~60s)")

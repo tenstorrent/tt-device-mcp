@@ -31,6 +31,7 @@ from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitors import fabric, pci
 from tt_device_mcp.health.monitors.heartbeat import arc_not_ready_chips, offbus_count
+from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import base as _base
 from tt_device_mcp.health.recovery import pcie_guard
@@ -39,6 +40,7 @@ from tt_device_mcp.health.recovery.base import (
     RecoveryMechanism,
     drop_returned_isolated,
     pci_rescan,
+    pci_wedged_refusal,
     refuse_mesh_reset,
 )
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
@@ -484,6 +486,15 @@ class Recovery(ABC):
         if not isolated_chips:
             return True
         targets = sorted(isolated_chips, key=int)
+        # Spec 04 I76: a PCI sysfs write is blocked in the kernel (PCI-wedged). Every bridge reset ends in
+        # a rescan on that same lock, so none can run: the rung fails at once, its chips stay withheld,
+        # and the power cycle is already requested.
+        if pci_wedged_refusal(f"bridge reset of chip(s) {','.join(targets)}", log):
+            for idx in targets:
+                self.last_bridge_reset_reasons[idx] = {"reason": "pci_wedged"}
+                metrics.stage_fired("bridge_reset", "blocked")
+            health_event("chip_recovery", recovered=[], still_dead=targets, inapplicable=[], pci_wedged=True)
+            return False
         _t0 = datetime.now()
         self.deps.begin_action_row("[broker]bridge-reset", f"bridge-reset chip(s) {','.join(targets)}")
         # Spec 04 I90: a device reset like glx_reset, so /status shows it as one from its first second.
@@ -521,6 +532,9 @@ class Recovery(ABC):
         # (each per-chip reset below rescans too): the chips stay isolated and the hold escalates.
         reset_this_pass: set = set()
         withheld: list = []
+        # Spec 04 I76: set by the first bridge reset that times out or is refused. The pass stops there:
+        # no further bridge call, no rescan; every chip not yet tried is withheld.
+        wedged = False
         removed = [t for t in targets if pci.removed_chip(t)]
         unreset: list = []
         if sbr and not gated and removed:
@@ -529,7 +543,18 @@ class Recovery(ABC):
                     FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
                     # An SBR clears the chip's firmware clock cap like any reset (spec 03 I35).
                     CEILING.mark_owed(f"bridge reset of chip {idx}")
-                    fired = await asyncio.to_thread(reset_removed_chip, idx)
+                    try:
+                        fired = await PCI_WRITER.write(
+                            f"bridge reset of removed chip {idx}",
+                            reset_removed_chip,
+                            idx,
+                            timeout=bridge_reset_call_timeout(),
+                        )
+                    except PciWedged as e:
+                        health_event("bridge_reset_failed", chip=idx, reason="pci_wedged", error=str(e))
+                        log(f"bridge reset of removed chip {idx} failed: {e}")
+                        wedged = True
+                        break
                     if fired:
                         reset_this_pass.add(idx)
                         break
@@ -541,6 +566,9 @@ class Recovery(ABC):
                         await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
                 if idx not in reset_this_pass:
                     unreset.append(idx)
+                if wedged:
+                    unreset.extend(i for i in removed if i not in reset_this_pass and i not in unreset)
+                    break
             if not unreset:
                 log(f"chip(s) {removed} reset through their recorded bridges — rescanning once")
                 # One link-retrain settle for the batch, after the last SBR release, as
@@ -555,6 +583,11 @@ class Recovery(ABC):
                     if all((pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}").exists() for i in removed):
                         break
         for idx in targets:
+            if wedged and idx not in lost:
+                withheld.append(idx)
+                self.last_bridge_reset_reasons[idx] = {"reason": "pci_wedged"}
+                metrics.stage_fired("bridge_reset", "blocked")
+                continue
             if gated:
                 inapplicable.append(idx)
                 self.last_bridge_reset_reasons[idx] = {"reason": "gated"}
@@ -609,22 +642,29 @@ class Recovery(ABC):
                 # A bridge reset clears the chip's firmware clock cap like any reset (spec 03 I35).
                 CEILING.mark_owed(f"bridge reset of chip {idx}")
                 try:
-                    # Bounded: its rescan waits on the kernel's PCI rescan/remove lock, which a
-                    # remove blocked in the kernel holds for good. A timeout is this rung failing.
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(reset_chip_via_bridge, idx, bdf), timeout=bridge_reset_call_timeout()
+                    # The one in-flight PCI write (spec 04 I76): its rescan waits on the kernel's PCI
+                    # rescan/remove lock, which a write blocked in the kernel holds for good. A timeout
+                    # latches PCI-wedged and ends the whole pass here, not just this chip.
+                    result = await PCI_WRITER.write(
+                        f"bridge reset of chip {idx}",
+                        reset_chip_via_bridge,
+                        idx,
+                        bdf,
+                        timeout=bridge_reset_call_timeout(),
                     )
-                except asyncio.TimeoutError:
+                except PciWedged as e:
                     health_event(
                         "bridge_reset_failed",
                         chip=idx,
                         bdf=bdf,
                         reason="timeout",
                         timeout_s=bridge_reset_call_timeout(),
+                        error=str(e),
                     )
-                    log(f"bridge reset of chip {idx} did not answer in {bridge_reset_call_timeout():.0f} s")
+                    log(f"bridge reset of chip {idx} failed: {e}; the pass stops, the power cycle is requested")
                     lost.append(idx)
                     metrics.stage_fired("bridge_reset", "failed")
+                    wedged = True
                     break
                 if result:
                     recovered.append(idx)
@@ -676,6 +716,8 @@ class Recovery(ABC):
         # not reset because of it); chips the broker never removed keep the bare rescan, as before.
         unreset_dead = [i for i in pci.removed_chip_ids() if i not in reset_this_pass]
         withhold = ("host_reset_gated" if gated else "removed_chip_not_reset") if unreset_dead else ""
+        if wedged or PCI_WRITER.latched:
+            withhold = "pci_wedged"
         if still_dead and withhold:
             health_event("pci_rescan_withheld", chips=still_dead, unreset=unreset_dead, reason=withhold)
             log(
