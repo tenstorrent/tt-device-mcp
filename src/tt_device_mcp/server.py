@@ -1467,7 +1467,10 @@ def _note_hold_carry_job(edge: str, *, ok: bool = False) -> None:
     """A job started inside the carry window keeps it open until _HOLD_CARRY_SEC after that job ends:
     the first job after a release is the one that shows whether the release was right (spec 04 I82).
     ``ok``: the job ended completed, exit 0, naming no device or fabric fault. That proves the release
-    right, so the carry is dropped and the next hold is a fresh episode with its own class path."""
+    right, so the carry is dropped and the next hold is a fresh episode with its own class path.
+    A job that ends any other way under the startup hold a restart opened (it was re-adopted) pins
+    the carry to that hold: the startup gate's reset and full check can outlast the window, and the
+    hold names its fault only when the gate fails, so the carry stays open until the gate's verdict."""
     rec = _load_hold_carry()
     if not isinstance(rec, dict):
         return
@@ -1483,6 +1486,8 @@ def _note_hold_carry_job(edge: str, *, ok: bool = False) -> None:
         rec["job_started"] = now
     elif edge == "end" and rec.get("job_started") and not rec.get("job_ended"):
         rec["job_ended"] = now
+        if _hold_episode_startup:
+            rec["startup_pinned"] = True
     else:
         return
     _write_hold_carry()
@@ -1517,6 +1522,8 @@ def _take_hold_carry() -> Optional[dict]:
     open_window = now - released <= _HOLD_CARRY_SEC
     if rec.get("job_started") and (not job_ended or now - job_ended <= _HOLD_CARRY_SEC):
         open_window = True
+    if rec.get("startup_pinned") and _hold_episode_startup:
+        open_window = True  # the startup hold its first job ended under turns now, however long its gate ran
     return rec if open_window else None
 
 
@@ -11533,6 +11540,7 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
             reset_killed_causes.pop(job_id, None)
             # Spec 04 I82: the first job after a release, re-adopted across a restart, closes the carry
             # window as it would have in the broker that started it; a clean exit 0 proves the release.
+            # Any other end pins the carry to the startup hold until the startup gate's verdict.
             _note_hold_carry_job("end")
             stopped = reset_killed or timed_out or request_killed or preempt_forced
             if job.status == JobStatus.COMPLETED and job.exit_code == 0 and not (fault or stopped):

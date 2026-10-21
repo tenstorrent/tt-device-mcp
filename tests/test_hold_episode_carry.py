@@ -851,3 +851,135 @@ async def test_a_startup_hold_restored_across_a_second_restart_still_defers_the_
         srv._note_tenant_gate_verdict("device unverified: gate/startup: awaiting the startup check")
         assert _age() < 60
         assert (tmp_path / srv.HOLD_CARRY_FILE).exists()
+
+
+# How a re-adopted first job can end without proving the release: (exit file, log).
+_UNPROVEN_ENDS = {
+    "fault named": ("1", "waiting for active ethernet core\n"),
+    "exit 1, no fault": ("1", ""),
+    "no exit status": (None, ""),
+}
+
+
+async def _readopted_first_job_ends(monkeypatch, tmp_path, hold, end):
+    """A release after the bound ladder; its first job was still running when the broker restarted, the new
+    broker re-adopted it under its startup hold, and the job then ended ``end`` through the real re-adopt path."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    escalations, events, _detail = _open_hold(monkeypatch, hold, BOUND + 5)
+    since = srv.device_hold_episode_since
+    await _bound_ladder_releases(monkeypatch, escalations, events)
+    srv._note_hold_carry_job("start")
+    _restart_broker(monkeypatch)
+    # The startup record as the fsm's boot merge opens it: RECOVERING, startup_unverified, not dirty.
+    monkeypatch.setattr(
+        srv.fsm,
+        "_record",
+        dataclasses.replace(srv.fsm.record, state=ServerState.RECOVERING, why="startup_unverified", dirty=False),
+    )
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    srv._note_tenant_gate_verdict("device unverified: gate/startup: awaiting the startup check")
+    assert _age() < 60
+    exit_code, log = _UNPROVEN_ENDS[end]
+    job = _job(tmp_path, "960", "pytest")
+    job.status = srv.JobStatus.RUNNING
+    job.queued_at = job.started_at = datetime.now().isoformat()
+    (tmp_path / "960.log").write_text(log)
+    if exit_code is not None:
+        (tmp_path / "960.exit").write_text(exit_code)
+    srv.jobs["960"] = job
+    mark = len(events)
+    await srv._monitor_readopted_scope("960", "ttdev-job-960.scope")
+    return escalations, events, since, mark
+
+
+def _gate_ran_for(seconds):
+    """The startup gate's reset and full check took ``seconds`` after the job's end."""
+    for k in ("released", "job_started", "job_ended"):
+        if srv._hold_carry.get(k):
+            srv._hold_carry[k] -= seconds
+    srv._write_hold_carry()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate_sec", [srv._HOLD_CARRY_SEC + 10, srv.STARTUP_VERIFY_DEFER_MAX_SEC])
+@pytest.mark.parametrize("end", list(_UNPROVEN_ENDS))
+@pytest.mark.parametrize("hold", list(_CLASSES))
+async def test_a_readopted_first_job_that_fails_keeps_the_carry_through_a_slow_startup_gate(
+    monkeypatch, tmp_path, clear_job_state, hold, end, gate_sec
+):
+    """The re-adopted first job's failure does not change the startup hold's `why`, so the hold names its
+    fault only when the startup gate's reset and full check fail, which can come more than _HOLD_CARRY_SEC
+    after the job's end (a failing reset plus the fabric check and its retry). The episode still continues:
+    the host rung is due at once, no second ladder, no fresh 10-min clock. Fails when the carry window keeps
+    counting from the job's end under the startup hold: the clock restarts and the cycle waits a ladder."""
+    escalations, events, since, mark = await _readopted_first_job_ends(monkeypatch, tmp_path, hold, end)
+    assert srv.fsm.record.why == "startup_unverified"
+    _gate_ran_for(gate_sec)
+    monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, why=_CLASSES[hold][0]))
+
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+
+    assert srv.device_hold_episode_since == since, "the failed first job continues the episode"
+    assert srv._hold_bound_cycle_due(_age()), "the ladder already ran this episode: the host rung is due now"
+    assert escalations == [], "no second ladder"
+    assert events[mark:].count("host_rung") == 1
+    assert not (tmp_path / srv.HOLD_CARRY_FILE).exists(), "taken once"
+    assert srv.device_hold_logged and "device_released" not in events[mark:], "nothing lifted the hold"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", list(_UNPROVEN_ENDS))
+async def test_the_pinned_carry_leaves_the_startup_hold_to_its_gate(monkeypatch, tmp_path, clear_job_state, end):
+    """Until the startup gate's verdict the hold is still the gate's (spec 03 I75): the pinned carry resumes
+    no bound and asks no host rung, however long the gate runs; it waits on disk for the verdict."""
+    escalations, events, since, mark = await _readopted_first_job_ends(monkeypatch, tmp_path, "generic", end)
+    _gate_ran_for(srv._HOLD_CARRY_SEC + 10)
+
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+
+    assert srv.device_hold_episode_since != since and _age() < 60
+    assert not srv._hold_bound_cycle_due(_age())
+    assert escalations == [] and "host_rung" not in events[mark:]
+    assert json.loads((tmp_path / srv.HOLD_CARRY_FILE).read_text()).get("startup_pinned")
+    assert srv.device_hold_logged and "device_released" not in events[mark:]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_real_startup_gate_after_a_failed_readopted_job_goes_to_the_host_rung_and_lifts_only_on_a_pass(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Through the real startup gate, more than _HOLD_CARRY_SEC after the re-adopted job ended on a fault: a
+    full check that counts fewer links than the cabling expects keeps the hold and continues the episode at
+    the host rung; only a later full pass, fabric included, releases it."""
+    from tests.test_boot_fabric_reverify import _FABRIC_OK, _broker
+    from tests.test_device_safety import _ledger_dir
+    from tt_device_mcp.fsm import ServerFsm
+
+    escalations, events, since, mark = await _readopted_first_job_ends(
+        monkeypatch, tmp_path, "missing port (topology mismatch)", "fault named"
+    )
+    _gate_ran_for(srv._HOLD_CARRY_SEC + 10)
+    _ledger_dir(monkeypatch, tmp_path)
+    short = (False, {"snapshot": {"ok": True}, "fabric": {"ok": False, "detail": f"what(): {MISMATCH}"}})
+    fresh = ServerFsm(tmp_path / "fsmdir" / "fsm.json", current_boot_id="boot-a")
+    fresh.boot_merge(None)
+    _broker(monkeypatch, tmp_path, fresh, short)
+    monkeypatch.setattr(srv, "_post_reset_debt", lambda: "")
+
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+    assert srv.device_hold_logged and srv.fsm.record.why != "startup_unverified", "a short link count fails"
+    srv._check_hold_deadline(now=datetime.now())
+
+    assert srv.device_hold_episode_since == since
+    assert srv._hold_bound_cycle_due(_age())
+    assert "device_released" not in events[mark:]
+
+    _broker(monkeypatch, tmp_path, srv.fsm, _FABRIC_OK)
+    monkeypatch.setattr(srv, "_post_reset_debt", lambda: "")
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+    assert not srv.device_hold_logged and srv.fsm.state is ServerState.HEALTHY
