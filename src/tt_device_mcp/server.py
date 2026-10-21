@@ -1279,19 +1279,24 @@ HOLD_EPISODE_RECORD_FILE = "hold_episode.json"
 FOREIGN_HOLDER_NOTE = "held: "
 
 
-def _persist_hold_episode(since: str, *, tenant: bool = False) -> None:
+def _persist_hold_episode(since: str, *, tenant: bool = False, startup: bool = False) -> None:
     """Record (or clear) the episode start so a restart cannot rewind the escalation clock.
     ``tenant``: the hold opened because a foreign process held the device, not on a device
     fault. Such a hold never carries (see _restore_hold_episode), so it leaves nothing on disk —
-    not even for an older broker, which would carry it."""
-    global _hold_episode_tenant
+    not even for an older broker, which would carry it. ``startup``: the startup hold a restart
+    opened, naming no fault yet; it keeps its clock on disk but defers the I82 carry (spec 04 I82)."""
+    global _hold_episode_tenant, _hold_episode_startup
     _hold_episode_tenant = bool(since) and tenant
+    _hold_episode_startup = bool(since) and startup and not tenant
     record, path = health_dir() / HOLD_EPISODE_RECORD_FILE, health_dir() / HOLD_EPISODE_FILE
     try:
         if since and not tenant:
             # Sidecar first: one without its start restores nothing, a start without one falls
             # back to the btime rule — a crash between the writes is safe either way.
-            record.write_text(json.dumps({"since": since, "boot_id": _current_boot_id()}))
+            rec = {"since": since, "boot_id": _current_boot_id()}
+            if _hold_episode_startup:
+                rec["startup"] = True
+            record.write_text(json.dumps(rec))
             path.write_text(since)
         else:
             path.unlink(missing_ok=True)
@@ -1354,6 +1359,18 @@ _hold_episode_restorable = True
 # device fault the clock is written after all, so a restart stops rewinding it — one way only: a
 # fault hold that a foreign holder later joins is still a fault.
 _hold_episode_tenant = False
+# Whether the open hold is the startup hold a restart opened, still naming no fault (spec 04 I82). It
+# neither takes nor spends a released episode's carry; the first fault it turns into takes it.
+_hold_episode_startup = False
+
+
+def _recorded_hold_startup(since: str) -> bool:
+    """Whether the episode record names ``since`` as a startup hold that deferred the carry (spec 04 I82)."""
+    try:
+        rec = json.loads((health_dir() / HOLD_EPISODE_RECORD_FILE).read_text())
+        return isinstance(rec, dict) and rec.get("since") == since and bool(rec.get("startup"))
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _forget_stale_hold_episode() -> None:
@@ -2646,7 +2663,7 @@ def _reset_for_testing():
     Only used by test fixtures - not part of the public API.
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
-    global _hold_episode_restorable, _hold_episode_tenant, _hold_carry, _hold_carry_loaded
+    global _hold_episode_restorable, _hold_episode_tenant, _hold_episode_startup, _hold_carry, _hold_carry_loaded
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
     global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
@@ -2676,6 +2693,7 @@ def _reset_for_testing():
     reset_killed_causes.clear()
     _hold_episode_restorable = True
     _hold_episode_tenant = False
+    _hold_episode_startup = False
     _hold_carry = None
     _hold_carry_loaded = False
     if recovery_mechanism is not None:
@@ -8055,11 +8073,14 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # not a device fault: it neither takes nor spends a fault hold's carry.
         tenant = _hold_is_tenant_held()
         # Spec 04 I82: the startup hold a restart opens names no fault, so it continues only a hold
-        # still open at the restart (restored above), never an episode a release already ended: the
-        # carry is spent, and the hold's clock starts now.
-        startup = not restored and fsm.record.why == "startup_unverified"
-        declined = _take_hold_carry() if startup and not tenant else None
+        # still open at the restart (restored above), never an episode a release already ended. Like a
+        # tenant hold it neither takes nor spends the carry: its clock starts now, and the fault it may
+        # turn into takes the carry then (_hold_turned_fault). A restored startup hold that
+        # deferred the carry defers it again.
+        startup = fsm.record.why == "startup_unverified" and (not restored or _recorded_hold_startup(restored))
+        startup = startup and not tenant
         carry = None if tenant or startup else _take_hold_carry()
+        deferred = _load_hold_carry() if startup else None
         starts = [s for s in (restored, str(carry["since"]) if carry else "") if s]
         device_hold_episode_since = min(starts, key=datetime.fromisoformat) if starts else row_since
         if restored and carry is None and device_hold_episode_since == restored:
@@ -8071,7 +8092,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
                     "ladder_early": _recorded_hold_bound_ladder_early(restored),
                     "released": time.time(),
                 }
-        _persist_hold_episode(device_hold_episode_since, tenant=tenant)
+        _persist_hold_episode(device_hold_episode_since, tenant=tenant, startup=startup)
         # Spec 03 I80: a latch a status read took before this verdict yields to an earlier episode start.
         if device_held_since and _iso_before(device_hold_episode_since, device_held_since):
             device_held_since = device_hold_episode_since
@@ -8105,7 +8126,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         cont = (
             {"continues_episode": device_hold_episode_since, "prior_reason": str(carry.get("reason") or "")}
             if carry
-            else {"carry_declined": str(declined["since"])} if declined else {}
+            else {"carry_deferred": str(deferred.get("since") or "")} if isinstance(deferred, dict) else {}
         )
         if carried is not None:
             health_event("device_held", reason=reason, carried_from=carried.get("iso") or carried.get("ts"), **cont)
@@ -9069,7 +9090,8 @@ def _defer_offbus_one_shot_to_tenant_bound() -> None:
 
 
 def _hold_turned_fault() -> None:
-    """A tenant hold whose holder left a device fault behind is a fault hold from now on: write its
+    """A tenant hold whose holder left a device fault behind, or a startup hold that now names a fault
+    (its full check failed, or a re-adopted job ended on one), is a fault hold from now on: write its
     clock to disk, and continue a fault carry still in its window as a fault hold opened now would
     (spec 04 I82). Without it the bound runs one more ladder before its host rung."""
     global device_hold_episode_since
@@ -9111,6 +9133,12 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
         _hold_turned_fault()  # the holder left a real fault behind
+    elif (
+        _hold_episode_startup
+        and fsm.state in (ServerState.RECOVERING, ServerState.DOWN)
+        and fsm.record.why != "startup_unverified"
+    ):
+        _hold_turned_fault()  # the startup hold turned into a fault hold
     try:
         started = datetime.fromisoformat(device_hold_episode_since)
     except ValueError:
@@ -11503,6 +11531,12 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
             reset_killed = job_id in reset_killed_job_ids
             reset_killed_job_ids.discard(job_id)
             reset_killed_causes.pop(job_id, None)
+            # Spec 04 I82: the first job after a release, re-adopted across a restart, closes the carry
+            # window as it would have in the broker that started it; a clean exit 0 proves the release.
+            _note_hold_carry_job("end")
+            stopped = reset_killed or timed_out or request_killed or preempt_forced
+            if job.status == JobStatus.COMPLETED and job.exit_code == 0 and not (fault or stopped):
+                _note_hold_carry_job("end", ok=True)
             if fault:
                 _mark_device_reported_fault(f"re-adopted job {job_id} {fault}", job=job)
             elif reset_killed:
