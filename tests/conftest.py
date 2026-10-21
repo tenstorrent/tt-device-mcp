@@ -282,6 +282,12 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     # broker host a live job's pid would read as scoped. Empty dir; a test about scopes stages its own.
     monkeypatch.setattr(device_holders, "SCOPE_PROC_DIR", str(tmp_path_factory.mktemp("no-scope-proc")))
     monkeypatch.delenv(device_holders.TENANT_UIDS_ENV, raising=False)
+    # The fd walk reads the REAL /proc and matches each fd against DEVICE_DIR, which defaults to the
+    # REAL /dev/tenstorrent: on a device host, any real job or service of a uid >= 1000 that has the
+    # device open reads as a live tenant, so a test that runs a job, a rung or a hold through the
+    # holder gate waits on it or sees its rung blocked, depending on what the host runs right then.
+    # Pointed at a path that cannot exist, like DRIVER_PROC_DIR; a test about holders stages its own.
+    monkeypatch.setattr(device_holders, "DEVICE_DIR", "/nonexistent/tt-device-mcp-test/dev-tenstorrent")
     monkeypatch.setattr(srv, "reaped_survivors", {})
     monkeypatch.setattr(srv, "_leftover_fence_detail", "")
     monkeypatch.setattr(srv, "_leftover_unkillable_since", None)
