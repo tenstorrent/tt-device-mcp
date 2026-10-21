@@ -1506,7 +1506,7 @@ def _note_hold_carry_job(edge: str, *, ok: bool = False) -> None:
         rec["job_started"] = now
     elif edge == "end" and rec.get("job_started") and not rec.get("job_ended"):
         rec["job_ended"] = now
-        if _hold_episode_startup:
+        if _hold_episode_startup or _hold_startup_deferred:
             rec["startup_pinned"] = True
     else:
         return
@@ -8261,6 +8261,14 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_tenant_deferred, device_hold_offbus_prior_bucket, device_hold_offbus_tenant_wait
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
     global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold, device_held_since
+    global _hold_startup_deferred
+    if reason and not device_hold_logged and _startup_hold_behind_readopted_job():
+        return  # spec 03 I75: the device is the re-adopted job's; the hold's clock starts at its end
+    # A hold opens now, or the device passed: the deferral is over. It ended at the jobs' end, when the
+    # startup gate took the device; the gate's own run (a device op no sampler verdict reads) counts in
+    # the hold's 10-min clock, so a hold its failing verdict opens dates back to then (spec 03 I75).
+    deferred_until = _startup_verify_ready_wall if _hold_startup_deferred else None
+    _hold_startup_deferred = False
     if reason and not device_hold_logged:
         device_hold_logged = True
         # Prefer a start this box already recorded: if the device was still held across a restart,
@@ -8281,7 +8289,8 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         startup = startup and not tenant
         carry = None if tenant or startup else _take_hold_carry()
         deferred = _load_hold_carry() if startup else None
-        starts = [s for s in (restored, str(carry["since"]) if carry else "") if s]
+        jobs_end = _wall_iso(min(deferred_until, time.time())) if deferred_until is not None else ""
+        starts = [s for s in (restored, str(carry["since"]) if carry else "", jobs_end) if s]
         device_hold_episode_since = min(starts, key=datetime.fromisoformat) if starts else row_since
         if restored and carry is None and device_hold_episode_since == restored:
             ladder_age = _recorded_hold_bound_ladder_age(restored)  # read before the rewrite below
@@ -13749,6 +13758,42 @@ def _startup_verify_owns_hold(kind: Optional[str] = None, mono: Optional[float] 
     if kind is not None and kind not in _STARTUP_VERIFY_DEFERRABLE_KINDS:
         return False
     return not (isolated_chips or any(j.status == JobStatus.RUNNING for j in jobs.values()))
+
+
+# Whether _startup_hold_behind_readopted_job deferred the startup hold: the re-adopted job's end then pins
+# an I82 carry to the hold that opens after it, as it would to one already open (spec 04 I82).
+_hold_startup_deferred = False
+
+
+def _startup_hold_behind_readopted_job() -> bool:
+    """Spec 03 I75: the startup hold names no fault and all it waits on is a live re-adopted job, so no
+    hold episode opens yet: the device is that job's, as it was before the restart. The episode, and the
+    spec 04 I76 10-min clock with it, starts when the jobs end and the startup gate takes the device.
+    Counted from the restart, a job past 600 s took the bound's ladder (deferred on ``job_running``) and the
+    hold went past 10 min with no ladder at the mark. A startup hold a previous broker left open over the
+    same job restarts its clock too; a fault hold open at the restart keeps its own (spec 04 I82).
+    Anything that says fault opens the hold at once, the job still running."""
+    global _hold_episode_restorable, _hold_startup_deferred
+    if fsm.state is not ServerState.RECOVERING or fsm.record.why != "startup_unverified":
+        return False
+    if not readopted_scopes or _startup_verify_ready_at is not None:
+        return False
+    if fsm.record.dirty or device_fault_reported or _kill_reset_owed or isolated_chips:
+        return False
+    if any((job := jobs.get(jid)) is None or job.status is not JobStatus.RUNNING for jid in readopted_scopes):
+        return False
+    if _device_liveness_reason():
+        return False
+    if _hold_episode_restorable:
+        restored = _restore_hold_episode()
+        if restored and not _recorded_hold_startup(restored):
+            return False  # a fault hold open at the restart: its clock runs on
+        _hold_episode_restorable = False  # the startup hold's clock restarts at the jobs' end
+        _persist_hold_episode("")  # so a later restart restores no clock from it either
+    if not _hold_startup_deferred:
+        _hold_startup_deferred = True
+        health_event("startup_hold_behind_readopted_job", jobs=sorted(readopted_scopes))
+    return True
 
 
 def _startup_verify_gate_pending(mono: Optional[float] = None) -> bool:
