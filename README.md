@@ -70,14 +70,18 @@ tt-device-mcp run-bg --no-timeout-except-on-contention -t 600 "python serve.py"
 
 `-t` (x) is the job's time limit. While no other job is waiting, the job is never
 stopped for time, before or after x. Once x has passed and another job is waiting,
-the broker preempts it: it asks the job to stop at once (SIGINT, then SIGTERM) and
-kills it (SIGKILL) one minute after the later of x and the waiting job's arrival.
-The job ends `preempted`, and the device gets the full health check, fabric included,
-before the waiting job starts. A job that queues before x waits until x.
+the job has one minute to see the waiter and end itself; the broker sends it no
+signal in that minute. The minute starts at the later of x and the waiting job's
+arrival. If a job is still waiting when the minute runs out, the broker kills the
+job's whole process tree (SIGTERM, then SIGKILL at most 10 s later). The job ends
+`preempted`, and the device is reset and passes the full health check, fabric
+included, before the waiting job starts. If every waiting job leaves inside the
+minute, nothing happens and a later one starts a fresh minute. A job that queues
+before x waits until x.
 
 Status (`tt-device-mcp status`, the job's status, `/health`) shows the job as
 `PREEMPTABLE <x>min` while it runs, and `PREEMPTING <s>s`, the seconds left before
-the kill, during that last minute.
+the kill, during that minute.
 
 **If you use this option, you must watch the broker** (`tt-device-mcp status` or the
 job's status). As soon as a job queues after the limit, shut down gracefully within

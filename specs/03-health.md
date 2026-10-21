@@ -962,22 +962,22 @@ cooldown (spec 04 I65) holds longer.
 - **I69 — A job the broker stopped mid-run is followed by a reset, then the full check.** A job
   that hit its timeout, one the hung reaper stopped (HUNG), or a running job stopped by a requested
   kill (`tt_device_job_kill`, the REST kill, or a `tt_device_job_run` whose client went away, spec
-  01 I66), owes the mesh one reset. So does a preemption (spec 01 I20) the job did not end on
-  SIGINT alone: when `_preempt_job`'s ladder reached SIGTERM or `systemctl stop`, or the window's
-  SIGKILL, the broker could only end it by force, and that is a broker-side timeout like any other
-  (`preempt_forced_job_ids`, read and dropped at the job's end). A preempted job that unwound on
-  SIGINT released the mesh itself and owes none. A kill mid-run is how a mesh is left wedged mid-collective, and
+  01 I66), owes the mesh one reset. So does every preemption (spec 01 I20): a preempted job had
+  its grace minute and did not end itself, so `_preempt_kill` ended its tree by force (SIGTERM,
+  then SIGKILL at most `PREEMPT_KILL_GRACE_SEC` later), whatever its exit status. That is a
+  broker-side timeout like any other (`preempt_forced_job_ids`, read and dropped at the job's
+  end). A job that ends itself inside the minute is not preempted and owes none. A kill mid-run is how a mesh is left wedged mid-collective, and
   a fabric pass that happens to pass does not clear what it cannot see. Every submit path (MCP,
   REST `tt_device_job_run_bg`, the CLI) runs through the same runner, so each owes it the same way.
   The runner records the debt when the job ends, and `_monitor_readopted_scope` records it for a
-  re-adopted job (spec 01 I7) that its timeout, a requested kill or a preemption past SIGINT
+  re-adopted job (spec 01 I7) that its timeout, a requested kill or a preemption
   stopped; that path drops the job's requested-kill and forced-preemption marks at the job's end
   either way. A job a reset or recovery killed (its own
   kill), and one that named a known fabric or topology fault (held without a reset, I42/I46), owe
   none. Every process tree the broker kills logs one INFO line in server.log (`JOB_RUNNER
   job_id=<id> KILLED process tree: reason=<why>; ...`) naming the unit or process group and pids
   it stopped and the ladder step that ended it: the timeout, hung and kill ladders, a preemption
-  (its SIGKILL at the window's end included, `ladder ended at SIGKILL (preempt window)`) and a
+  (`ladder ended at SIGTERM (preempt kill)` or `ladder ended at SIGKILL (preempt kill)`) and a
   reset that stops a re-adopted job's scope (`reason=device reset`). The next post-job gate pays it: it skips the
   pre-reset fabric traffic pass and the passive eth read, captures the incident (`job_killed`),
   logs one line and journals `kill_mesh_reset`, and fires `STAGE_SMI_RESET` through the same path
@@ -1002,11 +1002,12 @@ cooldown (spec 04 I65) holds longer.
   for a per-target `tt-smi -r`), then one full check (fabric pass bounded by
   `FABRIC_CHECK_TIMEOUT_SEC`). Against today, a wedged mesh saves the failed pre-reset fabric pass
   (~45-100 s), and a mesh that was fine pays the reset minus that pass (~+0-20 s on a Galaxy,
-  ~+15 s per target). No wait is added. A preemption past SIGINT (the preemption class) now pays
-  the same: its stop window (at most `PREEMPT_GRACE_SEC`, 60 s, unchanged), then one reset, then
-  the full check, where it used to get only the dirty flag's fabric pass; the same ~+0-20 s
-  (Galaxy) or ~+15 s (per target) on a fine mesh, and the failed pre-reset fabric pass saved on a
-  wedged one. A preemption that unwound on SIGINT is unchanged. The door payment's move adds no
+  ~+15 s per target). No wait is added. A preemption (the preemption class) pays the same: its
+  grace minute (`PREEMPT_GRACE_SEC`, 60 s, no signal), its kill (SIGTERM, then SIGKILL at most
+  `PREEMPT_KILL_GRACE_SEC`, 10 s, later), then one reset, then the full check; the waiter is
+  dispatched at most 10 s later than when the SIGKILL landed at the minute's end, and a job that
+  ends itself inside the minute frees the device with the ordinary post-job gate, sooner than
+  any kill. The door payment's move adds no
   wait: the foreign-holder and external-step waits it now follows already ran before the job's
   gate, with their own bounds.
 - **I57 — An incident bundle never presents another pass's fabric transcript as its own.** The
@@ -1877,8 +1878,8 @@ refuses.
 | I69 (router: the kill reset takes STAGE_SMI_RESET only on a present, unfrozen mesh) | `tests/test_job_kill_reset.py::test_router_kill_reset_needs_a_present_unfrozen_mesh` |
 | I69 (HUNG, runner and REST run-bg timeouts, and a re-adopted job's timeout or requested kill each owe the reset; the re-adopted path leaves no requested-kill id) | `tests/test_job_kill_reset.py::test_a_hung_job_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_runner_timeout_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_rest_run_bg_timeout_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_readopted_job_past_its_timeout_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_requested_kill_of_a_readopted_job_owes_the_reset_and_leaves_no_id` |
 | I69 (a debt open at the next job is paid by the post-job gate before its door, the job still QUEUED) | `tests/test_job_kill_reset.py::test_the_runner_pays_an_owed_debt_before_a_queued_job` |
-| I69 (every broker kill logs one KILLED process-tree line) | `tests/test_job_kill_reset.py::test_a_broker_kill_logs_the_process_tree_it_stopped`, `tests/test_job_kill_reset.py::test_a_preempt_sigkill_overrun_logs_the_process_tree`, `tests/test_job_kill_reset.py::test_a_reset_that_stops_a_readopted_job_logs_the_process_tree` |
-| I69 (a preemption past SIGINT owes the reset and its job's own post-job gate pays it, reset then full check, before the waiting job's door; one that unwound on SIGINT owes none; the re-adopted path too, leaving no id) | `tests/test_job_kill_reset.py::test_a_preemption_past_sigint_is_a_broker_side_timeout`, `tests/test_job_kill_reset.py::test_a_preemption_that_unwinds_on_sigint_owes_no_reset`, `tests/test_job_kill_reset.py::test_a_sigkill_ended_preemption_owes_and_pays_the_reset_before_the_next_job`, `tests/test_job_kill_reset.py::test_a_preemption_debt_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_preempted_readopted_job_past_sigint_owes_the_reset` |
+| I69 (every broker kill logs one KILLED process-tree line) | `tests/test_job_kill_reset.py::test_a_broker_kill_logs_the_process_tree_it_stopped`, `tests/test_job_kill_reset.py::test_a_preempt_kill_that_outlives_sigterm_logs_the_process_tree`, `tests/test_job_kill_reset.py::test_a_reset_that_stops_a_readopted_job_logs_the_process_tree` |
+| I69 (every preemption kill owes the reset and its job's own post-job gate pays it, reset then full check, before the waiting job's door; a job that ends itself inside its minute is not preempted; the re-adopted path too, leaving no id) | `tests/test_job_kill_reset.py::test_every_preemption_kill_owes_the_reset`, `tests/test_preemptable.py::test_a_job_that_ends_itself_inside_the_minute_is_a_normal_end`, `tests/test_job_kill_reset.py::test_a_preemption_owes_and_pays_the_reset_before_the_next_job`, `tests/test_job_kill_reset.py::test_a_preemption_debt_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_preempted_readopted_job_owes_the_reset` |
 | I69 (the door payment waits out an external step's reservation) | `tests/test_job_kill_reset.py::test_the_door_payment_waits_out_an_external_step` |
 | I69 (a reaped leftover skips before the debt: no reset, debt kept, no wait; a reboot drops it and the startup full check runs; a cooldown skips and clears it with no wait) | `tests/test_job_kill_reset.py::test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait`, `tests/test_job_kill_reset.py::test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait` |
 | I75 | `tests/test_device_safety.py::test_a_startup_hold_behind_a_readopted_job_is_lifted_by_the_startup_gate_not_reset`, `tests/test_device_safety.py::test_a_failed_startup_gate_behind_a_readopted_job_escalates_on_the_next_tick`, `tests/test_device_safety.py::test_a_startup_gate_stuck_past_its_bound_no_longer_holds_off_the_ladder`, `tests/test_device_safety.py::test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate` |
