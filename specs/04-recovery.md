@@ -1380,7 +1380,16 @@ each rung fires only when the gentler one failed or cannot apply.
   so the ladder stood down and re-armed every window; from the bound on it is no tenant. Its fence
   keeps every reset off the device and only a host rung clears it, so the bound asks for the host
   rung at once (event `hold_bound_leftover`); a running job or any other readable tenant still
-  refuses it. At the bound the I46 latch is lifted
+  refuses it. A holder the spec 03 I84 dead-chip valve refused to kill (a failed or missing PCI
+  remove, so its fd close would reach an attached chip off the bus) is no tenant at the bound
+  either: the valve records the episode's refused pids (pid and start time; a recycled pid does
+  not match) and the running job it refused, a passing full check clears the record, and at the
+  bound the broker skips the ladder (its reset would kill those holders) and asks for the host rung
+  at once (event `hold_bound_kill_refused`), killing nobody and never rebooting. Before, the
+  running job never timed out with no waiter and the bound only paged `hold_bound_tenant_blocked`,
+  so that hold had no bound. A process the valve did not refuse still blocks the bound. Time to
+  recover, class refused dead-chip kill: the 10-min mark plus the power cycle (no bound before);
+  every other class unchanged. At the bound the I46 latch is lifted
   (`hold_bound_latch_cleared`), so the full health check after the ladder, fabric included, gets a
   real verdict and only a pass releases (goal of I8/spec 03 I4, I78); a job that fails the same way
   declares it again. The spec 03 I42 latch stays: it withholds no check (a latched hold already takes
@@ -2479,6 +2488,7 @@ sees a silent fabric pass.
 | I78 the driver-wait rescan repeats until every isolated chip is back and then stops; it gives up after its tries, journaled; it ends with the reset and never delays its cleanup; a cancelled reset stops it; no rescan while the settle counts; on both backends (line reader and file reader) the rescan runs after the settle and inside the driver wait | `tests/test_mesh_reset_readd.py::test_the_rescan_repeats_until_the_chip_is_back_and_then_stops`, `::test_the_repeat_gives_up_after_its_tries`, `::test_the_repeat_ends_with_the_reset_and_never_delays_its_cleanup`, `::test_a_cancelled_reset_stops_the_repeats`, `::test_no_rescan_while_the_settle_counts`, `::test_both_backends_rescan_only_once_the_settle_is_over` |
 | I76 every hold kind (77-only, topology mismatch, known fabric fault, latched, generic) runs the full ladder at the 10-min bound, then the host rung; below the bound a no-reset hold keeps its fast path; a latched I42 hold escalates with its latch standing | `tests/test_hold_bound.py::test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung`, `::test_below_the_bound_a_no_reset_hold_keeps_its_fast_path`, `::test_a_latched_i42_hold_still_escalates_and_its_latch_stands`, `::test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_power_cycle` |
 | I76 the I29 77 hold with no host rung (reset and sweep already ran this episode) gets the power cycle at the bound in the same run; a killed job's leftover holder (01 I16) does not stand the bound down: no reset runs over it and the host rung is asked for, which a live tenant still refuses | `tests/test_hold_bound.py::test_replay_a_77_held_with_no_host_rung_gets_the_power_cycle_at_the_bound`, `::test_a_killed_jobs_leftover_holder_does_not_stop_the_bound` |
+| I76 a holder the spec 03 I84 valve refused to kill (a running broker job or a tenant fd) does not stand the bound down: the ladder is skipped and the host rung asked for, nobody is killed; a process the valve did not refuse, or a recycled pid, still blocks | `tests/test_deadchip_refused_bound.py::test_a_refused_holder_gets_the_power_cycle_at_the_bound`, `::test_a_tenant_the_valve_never_refused_still_blocks_the_bound` |
 | I76 a cooldown denial of the host rung arms the retry, which fires at the cooldown's end | `tests/test_hold_bound.py::test_a_cooldown_denial_arms_the_retry_and_the_host_rung_fires_at_its_end` |
 | I76 a bound ladder that brings the mesh back but whose full check ends with no pass (77-only, topology mismatch / I42 latch, known fabric fault, generic) does not release and asks for the host rung in the same run; a relift check that fails after the ladder asks for it on the next tick; a check that passes asks for none | `tests/test_hold_bound.py::test_a_failed_check_after_the_bound_ladder_asks_for_the_host_rung_at_once`, `::test_a_relift_that_fails_after_the_bound_ladder_cycles_on_the_next_tick`, `::test_a_passing_check_after_the_bound_ladder_asks_for_no_host_rung` |
 | I76 a check still waiting on hugepages (or hanging) after the bound ladder gets the 300 s check bound, then the host rung; another run inside that bound does not cut the check short | `tests/test_hold_bound.py::test_a_check_still_waiting_on_hugepages_is_bounded_by_the_check_window`, `::test_another_run_inside_the_check_bound_does_not_cut_the_full_check_short` |

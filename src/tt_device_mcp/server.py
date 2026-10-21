@@ -83,6 +83,7 @@ from tt_device_mcp.device_holders import (
     MIN_TENANT_UID,  # noqa: F401 - re-exported: tests read srv.MIN_TENANT_UID
     HolderScan,
     ReclaimResult,
+    _read_proc_starttime,
     descends_from,
     discount_broker_internal,
     enumerate_device_holders,
@@ -1150,6 +1151,7 @@ _recovery_deps = RecoveryDeps(
     health_event=lambda kind, **f: health_event(kind, **f),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     owe_device_pollers=lambda reason: _owe_device_pollers(reason),
+    note_kill_refused=lambda reason, chips: _note_dead_kill_refused(reason, chips),
     mark_device_dirty=lambda reason, **kw: _mark_device_dirty(reason, **kw),
     hold_device_fabric_unverified=lambda why: _hold_device_fabric_unverified(why),
     note_fabric_77_reset_passes=lambda n: _note_fabric_77_reset_passes(n),
@@ -3766,6 +3768,7 @@ def _clear_device_dirty(*, verified: bool = False, why: str = "unrecorded") -> b
         # Only proof retires it, whatever the device was flagged for — dirty or held.
         fsm.on_readings(_healthy_reading())
         _forget_stale_hold_episode()  # e.g. the startup gate: a clock left by a dead broker is over
+        _forget_dead_kill_refused()  # spec 03 I84: the full check passed, so no chip is off the bus
         # A passing full check (fabric included, the debt above) after a power cycle ends its
         # backoff streak and any cooldown retry (spec 04 I65).
         recovery_mechanism.note_mesh_verified()
@@ -5721,6 +5724,8 @@ async def _kill_device_holders(reason: str) -> list:
     except Exception:  # noqa: BLE001 - never let the scan block the rescue
         return killed
     for h in scan.holders:
+        if h.pid == os.getpid():
+            continue  # the broker never signals itself (spec 03 I84)
         try:
             if not is_tenant(h):
                 # Infrastructure we kill here can sit mid-exit for seconds, named by the driver with
@@ -5793,6 +5798,89 @@ async def _kill_device_holders(reason: str) -> list:
         _mark_job_device_fault_failed(victim, f"device recovery kill: {reason}")
     _note_tenant_gate_verdict(f"device recovery: chip(s) left PCIe bus ({reason})")
     return killed
+
+
+# Spec 03 I84 / 04 I76: the holders the dead-chip valve refused to kill because a chip under them is
+# off the bus and still attached ({pid: starttime}), the broker job's pid among them, and the hold they
+# were refused in. The 10-min bound counts none of them as a tenant: it sends them to the host rung.
+# Only a passing full check clears the record (_clear_device_dirty's verified release).
+_kill_refused_pids: dict = {}
+_kill_refused_job_pid: Optional[int] = None
+_kill_refused_since: str = ""
+
+
+def _note_dead_kill_refused(reason: str, chips: list) -> list:
+    """Record the holders the dead-chip valve left alive (spec 03 I84) and journal them. Returns their
+    pids. Signals nothing and never raises: the record only routes the 10-min bound (spec 04 I76)."""
+    global _kill_refused_job_pid, _kill_refused_since
+    pids = []
+    try:
+        scan = enumerate_device_holders()
+    except Exception:  # noqa: BLE001 - an unreadable scan records only the job
+        scan = None
+    for h in scan.holders if scan is not None else []:
+        start = _read_proc_starttime(h.pid)
+        if h.pid == os.getpid() or start is None:
+            continue  # the broker itself, or already gone
+        _kill_refused_pids[h.pid] = start
+        pids.append(h.pid)
+    proc = current_process
+    if proc is not None and proc.returncode is None:
+        _kill_refused_job_pid = proc.pid
+        pids.append(proc.pid)
+    _kill_refused_since = _kill_refused_since or fsm.record.since or datetime.now().isoformat()
+    pids = sorted(set(pids))
+    health_event(
+        "chip_dead_holders_kept",
+        reason=reason,
+        chips=list(chips),
+        pids=pids,
+        job_pid=_kill_refused_job_pid,
+        held_since=_kill_refused_since,
+    )
+    return pids
+
+
+def _forget_dead_kill_refused() -> None:
+    global _kill_refused_job_pid, _kill_refused_since
+    _kill_refused_pids.clear()
+    _kill_refused_job_pid = None
+    _kill_refused_since = ""
+
+
+def _kill_refused_live(scan) -> tuple[set, bool]:
+    """The refused holders still alive in ``scan`` (pid and start time both match, so a recycled pid is
+    not one) and whether the running broker job is the refused one. With that job, every holder in a
+    broker job scope is its own (one job at a time), a child that opened the device later included."""
+    proc = current_process
+    job = (
+        _kill_refused_job_pid is not None
+        and proc is not None
+        and proc.returncode is None
+        and proc.pid == _kill_refused_job_pid
+    )
+    live = {
+        h.pid
+        for h in scan.holders
+        if (job and getattr(h, "scoped", False))
+        or (h.pid in _kill_refused_pids and _read_proc_starttime(h.pid) == _kill_refused_pids[h.pid])
+    }
+    return live, job
+
+
+def _kill_refused_reason(scan: Optional[HolderScan] = None) -> str:
+    """Why the 10-min bound sends this hold to the host rung for refused holders, or "" (spec 04 I76)."""
+    if not _kill_refused_pids and _kill_refused_job_pid is None:
+        return ""
+    try:
+        scan = scan if scan is not None else enumerate_device_holders()
+    except Exception:  # noqa: BLE001 - unreadable: the running job alone decides
+        scan = HolderScan(holders=[], complete=False)
+    live, job = _kill_refused_live(scan)
+    if not live and not job:
+        return ""
+    who = f"pid(s) {sorted(live)}" + (" and the running broker job" if job else "")
+    return f"the dead-chip valve refused to kill {who}: a chip under them is off the bus and still attached"
 
 
 def _boot_btime_id() -> str:
@@ -8355,6 +8443,20 @@ async def _force_escalate_stuck_hold() -> None:
                 log(f"10-min hold bound: {leftover} — no reset can run; the host rung is next")
                 await _hold_bound_host_rung(held_age, log)
                 return
+            refused = await asyncio.to_thread(_kill_refused_reason) if bound else ""
+            if refused:
+                # Spec 03 I84: a holder on a chip that is off the bus and still attached. Killing it, or
+                # a ladder rung's reset killing it, makes the driver reach that chip, so the bound skips
+                # the ladder and asks for the host rung, which ends every process with the host OS.
+                health_event(
+                    "hold_bound_kill_refused",
+                    held_age_sec=int(held_age),
+                    held_since=device_hold_episode_since,
+                    detail=refused,
+                )
+                log(f"10-min hold bound: {refused} — no reset can run over it; the host rung is next")
+                await _hold_bound_host_rung(held_age, log)
+                return
         health_event(
             "hold_deadline_forced_escalation",
             off_bus=off_bus,
@@ -8783,10 +8885,10 @@ def _bound_tenant_blocker(bound: bool) -> Optional[dict]:
         return None
     try:
         scan = enumerate_device_holders()
+        waive_job = False
         if bound:
-            leftover = {f.pid for f in _reaped_leftovers(scan)}
-            scan = replace(scan, holders=[h for h in scan.holders if h.pid not in leftover])
-        blocker = galaxy_recovery._tenant_blocker(scan, force=True)
+            scan, waive_job = _bound_excused(scan)
+        blocker = galaxy_recovery._tenant_blocker(scan, force=True, waive_job=waive_job)
     except Exception:  # noqa: BLE001 - naming the blocker never decides whether one holds
         blocker = None
     return blocker or {"blocker": "tenant"}
@@ -8823,17 +8925,27 @@ def _hold_bound_tenant_blocked(blocker: dict, log) -> None:
     log(f"10-min hold bound: {desc} — no reset or host rung runs over a live tenant; it runs once the tenant leaves")
 
 
+def _bound_excused(scan: HolderScan) -> tuple[HolderScan, bool]:
+    """``scan`` without the holders the 10-min bound does not count as tenants, and whether the running
+    broker job is one of them: a reaped job's leftover (spec 01 I16) and a holder the dead-chip valve
+    refused to kill (spec 03 I84). Neither is freed by a reset; only the host rung clears it."""
+    refused, waive_job = _kill_refused_live(scan)
+    excused = {f.pid for f in _reaped_leftovers(scan)} | refused
+    if excused:
+        scan = replace(scan, holders=[h for h in scan.holders if h.pid not in excused])
+    return scan, waive_job
+
+
 def _bound_tenant_holds(bound: bool) -> bool:
     """The forced ladders' tenant check (galaxy_recovery.tenant_holds), except that from the 10-min bound
-    on a reaped job's leftover (spec 01 I16) is no tenant: its job already ended and only a host rung
-    clears one stuck in the kernel (spec 04 I76). A running job or any other readable tenant still is."""
+    on a reaped job's leftover (spec 01 I16) and a holder the dead-chip valve refused to kill (spec 03
+    I84, a running broker job included) are no tenants: only a host rung clears either (spec 04 I76).
+    Any other running job or readable tenant still is."""
     if bound:
         scan = enumerate_device_holders()
-        leftover = {f.pid for f in _reaped_leftovers(scan)}
-        if leftover:
-            return galaxy_recovery._tenant_active(
-                replace(scan, holders=[h for h in scan.holders if h.pid not in leftover]), force=True
-            )
+        excused, waive_job = _bound_excused(scan)
+        if waive_job or excused is not scan:
+            return galaxy_recovery._tenant_active(excused, force=True, waive_job=waive_job)
     return galaxy_recovery.tenant_holds()
 
 
