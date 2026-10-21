@@ -158,7 +158,6 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     offbus_chip_ids,
     offbus_count,
     offbus_power_cycle,
-    outage_hold_boot_warning,
     pci_bus_number,
     pcie_guard_at_start,
     previous_boot_bus_locks,
@@ -4039,9 +4038,6 @@ def log_rung_inventory() -> None:
         logger.warning(
             f"RUNG GAP: {gap} — a held present mesh has no automatic exit; it stays held until an operator acts"
         )
-    outage = outage_hold_boot_warning()
-    if outage:
-        logger.warning(f"MESH RESET HELD: {outage}")
 
 
 # The telemetry trace: what the chips were doing while the job ran. Snapshots at the gate

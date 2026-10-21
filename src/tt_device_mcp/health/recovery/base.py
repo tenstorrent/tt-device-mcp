@@ -317,9 +317,6 @@ BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC = int(
     os.environ.get("TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC", "900").strip() or "900"
 )
 
-# An outage hold turns every hardware rung off at once: the host rung (the power cycle) off says
-# "touch nothing", so the mesh reset is held too.
-OUTAGE_HOLD_VARS = ("TT_DEVICE_MCP_AUTO_POWER_CYCLE",)
 # The hold reason -> when its page went out (monotonic). A held mesh reset stays HELD until an operator
 # acts, so the page is the hold's only bound: while the hold stands it is sent again every
 # mesh_hold_repage_sec(), so a page that was missed or forgotten never leaves the device held in silence.
@@ -341,36 +338,13 @@ def mesh_reset_hold_reason() -> str:
     """Why the operator forbids an AUTOMATIC mesh-wide reset (the gate's, the idle relift's, the
     watchdog's or the last-chance sweep's ``tt-smi -glx_reset``), or "" when it may fire.
 
-    ``TT_DEVICE_MCP_AUTO_MESH_RESET=0`` holds it explicitly and ``=1`` arms it whatever else is set.
-    Unset, an outage hold (every :data:`OUTAGE_HOLD_VARS` set to 0) holds it: a mesh reset on a mesh
-    that is already off the bus is what starts an off-bus power-cycle loop. The operator's own reset
-    tool is never held."""
-    mesh = os.environ.get("TT_DEVICE_MCP_AUTO_MESH_RESET", "").strip()
-    if mesh == "0":
+    ``TT_DEVICE_MCP_AUTO_MESH_RESET=0`` is the operator's outage hold; unset (or ``=1``) arms it. No
+    other switch holds it: with the power cycle the only host rung left, reading ``AUTO_POWER_CYCLE=0``
+    as an outage hold would take the first mesh reset away from every host that merely has no BMC
+    power cycle. The operator's own reset tool is never held."""
+    if os.environ.get("TT_DEVICE_MCP_AUTO_MESH_RESET", "").strip() == "0":
         return "TT_DEVICE_MCP_AUTO_MESH_RESET=0"
-    if mesh == "1":
-        return ""
-    if all(os.environ.get(v, "").strip() == "0" for v in OUTAGE_HOLD_VARS):
-        return "outage hold (" + ", ".join(f"{v}=0" for v in OUTAGE_HOLD_VARS) + ")"
     return ""
-
-
-def outage_hold_boot_warning() -> str:
-    """The boot warning for an outage hold that holds the mesh reset by default, or "" when there is
-    none (spec 04 I28). Both host rungs at 0 with ``TT_DEVICE_MCP_AUTO_MESH_RESET`` unset is enough
-    on its own: no third switch has to be 0 any more, so a host that turned off only its host rungs
-    now holds every automatic mesh reset until an operator acts, and the journal must say so."""
-    if os.environ.get("TT_DEVICE_MCP_AUTO_MESH_RESET", "").strip():
-        return ""
-    if not all(os.environ.get(v, "").strip() == "0" for v in OUTAGE_HOLD_VARS):
-        return ""
-    return (
-        " and ".join(f"{v}=0" for v in OUTAGE_HOLD_VARS)
-        + " with TT_DEVICE_MCP_AUTO_MESH_RESET unset is an outage hold: every automatic mesh reset "
-        "(tt-smi -glx_reset from the gate, the idle relift, the hold watchdog and the last-chance sweep) "
-        "is HELD and the device stays held until an operator acts; set TT_DEVICE_MCP_AUTO_MESH_RESET=1 "
-        "to re-arm it (spec 04 I28)"
-    )
 
 
 def drop_returned_isolated(isolated: set, context: str, log=None) -> list:

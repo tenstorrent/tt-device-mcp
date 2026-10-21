@@ -24,9 +24,8 @@ FABRIC_OUT = (
     f"{DISPATCH_LINE}\n"
 )
 OUTAGE_HOLD = {
-    "TT_DEVICE_MCP_AUTO_MESH_RESET": "",
+    "TT_DEVICE_MCP_AUTO_MESH_RESET": "0",
     "TT_DEVICE_MCP_AUTO_POWER_CYCLE": "0",
-    "TT_DEVICE_MCP_AUTO_UBB_RESET": "0",
 }
 
 
@@ -60,7 +59,7 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     srv.device_op_lock = None
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")  # not the outage hold; OUTAGE_HOLD unsets it
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")  # not the outage hold; OUTAGE_HOLD sets it to 0
     monkeypatch.setattr(base, "_mesh_hold_paged", {})
     g = srv.galaxy_recovery
     monkeypatch.setattr(srv.health_monitor, "expected", lambda present: CHIPS)
