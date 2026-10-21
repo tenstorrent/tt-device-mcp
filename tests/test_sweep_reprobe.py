@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Spec 04 I86: the last-chance sweep re-probes the bus after SBR and, once every expected chip is
 back, runs the full check (fabric included) before any further rung. The mesh reset fires only when
 that check fails, and the caller still climbs to the power cycle when the mesh never verifies. The
