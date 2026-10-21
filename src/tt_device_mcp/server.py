@@ -3737,12 +3737,21 @@ eth_check_armed: bool = False
 eth_check_disarm_reason: str = "startup self-test has not run yet"
 # A self-test that missed its budget once (a read that hung on a busy box, no device detected at
 # that moment) used to leave the rung off until the next broker restart. An idle broker retries it
-# at this pace instead (see _maybe_spawn_eth_rearm). Only a failure a retry can fix counts: a host
-# with no eth reader at all (eth.build() returned None) is not retried, and neither is a per-user
-# daemon, which never runs the self-test.
+# at this pace instead (see _maybe_spawn_eth_rearm). A host with no eth reader yet (eth.build()
+# returned None: no python imports ttexalens, or no probe) is retried too, at this pace only, even
+# inside a fault episode: an eth-venv provisioned after the broker started (an autoupdate that
+# installs it) used to leave the rung off until the next restart. A per-user daemon never runs the
+# self-test, so it never retries.
 eth_rearm_retryable: bool = False
+# Whether the last self-test found no reader at all; such a retry stays paced (see
+# _rearm_eth_before_check), so a box with no ttexalens adds at most one resolve per interval.
+eth_rearm_no_reader: bool = False
 ETH_CHECK_REARM_INTERVAL_SEC = 600.0
 _last_eth_rearm_monotonic: float = 0.0
+# Set when a retry, not the startup self-test, armed the rung: when, and the cause it was off for.
+# Shown in /health (eth_heartbeat_rung), so a rung that armed late is readable without the journal.
+eth_check_armed_late: Optional[dict] = None
+_eth_selftest_runs: int = 0
 # Counts the self-test retries _rearm_eth_before_check ran; a relift compares it across its own pass.
 _eth_rearm_retries: int = 0
 _eth_rearm_task: Optional[asyncio.Task] = None
@@ -3783,9 +3792,15 @@ async def selftest_eth_heartbeat() -> str:
     caller holds the device on it; the rung stays off and retryable either way.
     """
     global eth_check_armed, eth_check_disarm_reason, eth_rearm_retryable, _last_eth_rearm_monotonic
+    global eth_rearm_no_reader, eth_check_armed_late, _eth_selftest_runs
     # Stamped here, so the first idle retry comes a full interval after this attempt.
     _last_eth_rearm_monotonic = time.monotonic()
     eth_rearm_retryable = False
+    retry = _eth_selftest_runs > 0
+    _eth_selftest_runs += 1
+    prior_reason = eth_check_disarm_reason
+    was_no_reader = eth_rearm_no_reader
+    eth_rearm_no_reader = False
     # Arm provisionally: eth.build() refuses to hand back a runnable probe on an unarmed host, and
     # this self-test IS the arming. Rolled back below unless the attach answers inside budget.
     prior = os.environ.get("TTDEV_ETH_CHECK_ARMED")
@@ -3796,6 +3811,9 @@ async def selftest_eth_heartbeat() -> str:
     hung = False
     if built is None:
         eth_check_disarm_reason = "no runnable eth read on this host (no python that imports ttexalens)"
+        # A venv provisioned later (eth.resolve_python caches a miss for 60s only) arms on a paced retry.
+        eth_rearm_retryable = True
+        eth_rearm_no_reader = True
     else:
         # A reader exists, so a failure below (could not check, over budget, not runnable) may pass
         # on a later, quieter try. Harmless once armed: the retry checks eth_check_armed first.
@@ -3835,10 +3853,17 @@ async def selftest_eth_heartbeat() -> str:
             else:
                 eth_check_armed = True
                 eth_check_disarm_reason = ""
+                if retry:
+                    eth_check_armed_late = {
+                        "at": datetime.now().isoformat(timespec="seconds"),
+                        "was_off_for": prior_reason,
+                    }
+                    health_event("eth_rung_armed_late", was_off_for=prior_reason[:200], selftest_sec=round(dt, 2))
                 if logger:
                     logger.info(
-                        f"RUNG ARMED eth-heartbeat: self-test answered in {dt:.2f}s "
+                        f"RUNG ARMED eth-heartbeat{' (late)' if retry else ''}: self-test answered in {dt:.2f}s "
                         f"(budget {ETH_CHECK_SELFTEST_BUDGET_SEC:.0f}s, rc={rc})"
+                        + (f"; it was off: {prior_reason}" if retry else "")
                     )
         except asyncio.TimeoutError:
             # The OUTER budget, not the probe's own: a read this slow cannot be told apart from a
@@ -3861,11 +3886,18 @@ async def selftest_eth_heartbeat() -> str:
             os.environ.pop("TTDEV_ETH_CHECK_ARMED", None)
         else:
             os.environ["TTDEV_ETH_CHECK_ARMED"] = prior
-        if logger:
+        if logger and eth_rearm_no_reader and was_no_reader and eth_check_disarm_reason == prior_reason:
+            # The same missing reader as last time: stated at WARNING once, not every interval.
+            logger.debug(f"RUNG OFF eth-heartbeat: still {eth_check_disarm_reason}")
+        elif logger:
             logger.warning(
                 f"RUNG OFF eth-heartbeat: {eth_check_disarm_reason}. The passive frozen-eth detector "
                 "produces NO verdict until a retry arms it"
-                + (" (retried at the next full health check or reset)" if eth_rearm_retryable else "")
+                + (
+                    f" (retried every {ETH_CHECK_REARM_INTERVAL_SEC:.0f}s, idle or at a full health check)"
+                    if eth_rearm_no_reader
+                    else " (retried at the next full health check or reset)" if eth_rearm_retryable else ""
+                )
                 + ", so a frozen core is left to the traffic pass, which can knock it off the PCIe bus "
                 "instead of naming it."
             )
@@ -3887,12 +3919,15 @@ async def _rearm_eth_before_check() -> str:
     (spec 03 I28). The caller holds the device-op lock (every full pass does). Unpaced inside a
     fault episode: a reset or a held device's re-check must not run with the rung off just because
     a broker start found the core frozen. Outside one it keeps the idle tick's ETH_CHECK_REARM_INTERVAL_SEC
-    pace, so a core that stays frozen is not retried at every full pass. Returns the self-test's
-    FROZEN detail, or ""."""
+    pace, so a core that stays frozen is not retried at every full pass. A host that had no reader
+    at all keeps that pace inside an episode too: no fault makes a venv appear, and a box with no
+    ttexalens must not add a resolve to every post-reset check. Returns the self-test's FROZEN
+    detail, or ""."""
     global _eth_rearm_retries
     if eth_check_armed or not eth_rearm_retryable:
         return ""
-    if not _fault_episode_open() and time.monotonic() - _last_eth_rearm_monotonic < ETH_CHECK_REARM_INTERVAL_SEC:
+    paced = eth_rearm_no_reader or not _fault_episode_open()
+    if paced and time.monotonic() - _last_eth_rearm_monotonic < ETH_CHECK_REARM_INTERVAL_SEC:
         return ""
     _eth_rearm_retries += 1
     _set_device_op_detail("health check: eth-heartbeat self-test (re-arming)")
@@ -7744,6 +7779,12 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         "fsm_why": fsm.record.why,
     }
     payload.update(_live_offbus_state())
+    # Spec 03 I28: whether the passive eth read is armed, why not, and whether a retry armed it late.
+    payload["eth_heartbeat_rung"] = {
+        "armed": eth_check_armed,
+        "disarm_reason": None if eth_check_armed else (eth_check_disarm_reason or "disarmed"),
+        "armed_late": eth_check_armed_late,
+    }
     # Whether the running job is doing device work (spec 03 I54); absent while no job runs.
     for j in jobs.values():
         view = job_activity_view(j.id) if j.status == JobStatus.RUNNING else None

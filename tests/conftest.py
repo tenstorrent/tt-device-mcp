@@ -444,6 +444,9 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv, "eth_rearm_retryable", False, raising=False)
     monkeypatch.setattr(srv, "_last_eth_rearm_monotonic", 0.0, raising=False)
     monkeypatch.setattr(srv, "_eth_rearm_task", None, raising=False)
+    monkeypatch.setattr(srv, "eth_rearm_no_reader", False, raising=False)
+    monkeypatch.setattr(srv, "eth_check_armed_late", None, raising=False)
+    monkeypatch.setattr(srv, "_eth_selftest_runs", 0, raising=False)
     # The owed startup fabric pass (spec 03 I39): left set, a later test's 77-only hold that
     # happened to share its `since` would arm a relift it never asked for.
     monkeypatch.setattr(srv, "_startup_fabric_owed_since", None, raising=False)
