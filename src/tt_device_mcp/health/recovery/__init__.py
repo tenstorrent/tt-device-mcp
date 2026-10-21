@@ -301,6 +301,10 @@ class RecoveryDeps:
     # (server._note_fabric_77_reset_passes), so the next relift falls back at once instead of
     # re-running the passes the reset just spent.
     note_fabric_77_reset_passes: Optional[Callable[[int], None]] = None
+    # The open hold's fabric link-short cause (server._fabric_link_short_hold; "" when none): a lost
+    # link, a latched topology mismatch or missing descriptor ports. Spec 04 I79/I83 send those holds
+    # to the power cycle after one ladder pass, so the sweep never waits to space its mesh reset (I93).
+    fabric_link_short_hold: Optional[Callable[[], str]] = None
     # Whether the open hold's fabric 77 has a cause no reset or reboot fixes — a known cable fault (a 78),
     # a topology mismatch, hugepages not yet allocated, the validator missing
     # (server._fabric_77_no_reset_cause; never the I42 latch, which takes the ladder). Such a 77
@@ -788,11 +792,20 @@ class Recovery(ABC):
         enum+ARC verify and only the fabric stayed unverifiable (a persistent 77: held fabric-unverified,
         the caller must not climb on it), False otherwise.
         """
+        started = time.monotonic()
         try:
             return await self._reset_and_verify_device_once(indices, log)
         finally:
             # The reset and its verify are over and the host is still up: an off-bus intent is spent.
             pcie_guard.end_offbus_reset()
+            if self.mechanism.last_reset_monotonic >= started and "-glx_reset" in self.reset_argv(indices):
+                # A launched Galaxy mesh reset: the sweep spaces the episode's second from it (I93).
+                self.mechanism.last_mesh_reset_run = {
+                    "episode": self.deps.device_hold_episode_since() or "",
+                    "started": started,
+                    # The reset command's end, not its check's: the sweep's gap counts from here.
+                    "ended": max(started, self.mechanism.last_reset_ended_monotonic),
+                }
 
     async def _arc_not_ready_retry_due(self, argv: list, expected: int, log) -> bool:
         """After a mesh reset that EXITED non-zero: is this the one shape a second reset clears, on a box
@@ -885,6 +898,7 @@ class Recovery(ABC):
         try:
             rc, out = await self.mechanism.reset_with_quiesce(argv, log)
         finally:
+            self.mechanism.last_reset_ended_monotonic = time.monotonic()
             if aer_mask is not None:
                 await asyncio.to_thread(aer_mask.restore)
         if rc is None and (out or "").startswith("reset refused:"):

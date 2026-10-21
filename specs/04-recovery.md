@@ -1310,7 +1310,8 @@ each rung fires only when the gentler one failed or cannot apply.
     `reason=reset_and_sweep_failed`.
   - **A present mesh whose galaxy reset failed its full check** (an eth/fabric wedge, classes D and J):
     the climb still runs the last-chance sweep first (I22), then fires the host rung without the
-    ceiling wait (`reason=present_mesh_reset_failed`).
+    ceiling wait (`reason=present_mesh_reset_failed`). Below the bound the sweep's mesh reset first
+    waits out I93's gap after the failed first reset (at most 200 s, never past the 600 s bound).
   - **An off-bus hold whose reset regressed the mesh** (class B1, I31): a reset on the gate or the
     idle ladder left more chips off the bus than before it. I31 bars the bridge and mesh reset
     rungs for the rest of the episode, so the ceiling wait has no rung left to try. The climb runs
@@ -1651,7 +1652,7 @@ each rung fires only when the gentler one failed or cannot apply.
   latch, and then the full health check, fabric included. Under the I42 latch a short count fails, so
   only a clean pass on the full topology clears it. Single flight: once that pass has run or is
   running, the idle relift's measured-fault present-mesh retries (spec 03 I56) run no other glx_reset
-  in the episode; that ladder's check, then the host rung, decide the hold. A check that passes releases the device as any check does (spec 03); the hold never lifts
+  in the episode, and the sweep takes no I93 wait; that ladder's check, then the host rung, decide the hold. A check that passes releases the device as any check does (spec 03); the hold never lifts
   without it. A check that still counts short, or a ladder that does not bring the mesh back, asks for
   the I76 host rung (the power cycle) in the same run. A run that finds the hold is not (or no longer)
   this class, e.g. a chip already off the bus by its heartbeat, declines once for the episode and is
@@ -2032,6 +2033,51 @@ each rung fires only when the gentler one failed or cannot apply.
   | Tenant under an automatic reset | the reset waits for the tenant, as the I76 tenant exception already states |
   | Reader stuck in the kernel | the I70 host rung and its budget |
   | Bridge rung | none |
+
+- **I93 — The sweep's mesh reset is spaced from a failed first one, never past the bound.** On a
+  present Galaxy mesh whose first mesh reset (`tt-smi -glx_reset`) in a hold episode exited non-zero
+  or failed its full check, the climb's last-chance sweep (I22) runs the episode's second mesh reset,
+  as I87 states. A second mesh reset heals about a quarter of the meshes the first one did not, mostly
+  on op_mode `0x3` boxes, and the heals came after a gap of roughly 200 s at the short end and about
+  6 min at the median; one right after the first re-hits the same settling mesh. So before the sweep
+  runs below the bound, the climb waits until `MESH_RESET_MIN_GAP_SEC` (200 s) after the first reset
+  COMMAND ended, cut so the wait ends by the I76 10-min bound (`gap_wait`). The wait is inline: the
+  device stays held, no job runs, and the hold never lifts during it. It journals `mesh_reset_spaced`
+  (the wait, the time since the first reset ended, the hold age). After the wait the sweep runs as
+  before (its tenant and reset-in-scope guards are read then), and its full check, fabric included,
+  decides: a pass lifts the hold (I52, 03 I78), a fail asks for the power cycle (I71). There is no
+  separate repeat and no third mesh reset; I87 is unchanged. `tt-smi -r` (LoudBox and other
+  non-Galaxy boards) gets no wait. The gap is a code constant in `health/recovery/mesh_repeat.py`: no
+  env var, config key or CLI option sets it or turns it off. The sweep waits only when ALL of:
+  - a Galaxy mesh reset on more than one chip, the hold clock known, and this hold phase's sweep not
+    spent (I87);
+  - not a fabric link-short hold (I83: a topology mismatch, a known fabric fault, the 03 I42 latch or
+    missing descriptor ports): that class keeps its one ladder, then the power cycle at once;
+  - every expected chip on the bus, by heartbeat and by `pcie_guard`, none isolated and no removed chip
+    a reset would rescan (I69): classes A, B and C keep their own paths;
+  - no BMC guard finding in the episode (I91);
+  - the first mesh reset belongs to this episode: launched under its stamp, or ended inside it (a
+    reset from an earlier episode spaces nothing).
+
+  At the bound (I76) the wait is zero: the bound's ladder runs the sweep at once, so the power-cycle
+  request is never later than a ladder at 600 s. A first reset that ended late waits only to the
+  bound.
+
+  Time to recover (TTR). The gap counts from the first reset command's end, and the post-reset check
+  (about 20-155 s) runs inside it, so the wait is 200 s minus the check time when the climb follows
+  the check at once.
+
+  | Fault class | Before | After |
+  |---|---|---|
+  | Fabric/health-check failure or dispatch failure (03 I55), present mesh, first reset failed (D/J/H/F) | sweep at once, then the power cycle | the sweep waits out the gap (about 45-180 s); a heal lifts at about first reset end + 200 s + the sweep (~62 s) + settle + check, with no power cycle; a fail asks for the power cycle up to 200 s later than before, never later than a ladder at 600 s |
+  | Partial off-bus (B/C), whole tray (A) | unchanged | unchanged (no wait) |
+  | ARC not ready (I11) | the I11 retry, then climb | unchanged (a chip off the bus: no wait) |
+  | Fabric link-short (I83) | one ladder at hold start, then the power cycle | unchanged (no wait) |
+  | Hold-deadline expiry (I76) | ladder at 10 min, then power cycle | unchanged; the bound's ladder never waits |
+  | Dirty boot / startup check (03 I75) | unchanged | unchanged |
+
+  New wait: at most `MESH_RESET_MIN_GAP_SEC` (200 s) after the first reset ended, and always over by
+  the 600 s hold bound.
 
 ## Interfaces
 
@@ -2593,3 +2639,8 @@ sees a silent fabric pass.
 | I91 tt-smi's fallback text or the guard's refusal: rc 0 becomes 1, `bmc_legacy_reset_attempted` host_at_risk, paged once; an unarmed guard (or `unshare` failing) is a reset that did not fire; a guarded reset still owes the full check, fabric included, before release | `tests/test_ipmi_guard.py::test_the_fallback_never_reads_as_a_passing_reset_and_pages_once`, `tests/test_ipmi_guard.py::test_a_guard_that_cannot_arm_is_a_reset_that_did_not_fire`, `tests/test_ipmi_guard.py::test_a_guarded_reset_still_owes_the_full_check_before_release` |
 
 | I92 before every reset (mesh reset, sweep, operator reset) the holder scan runs after the pollers stop: a reader gets SIGTERM, 10 s, SIGKILL; a tenant refuses an automatic reset and is named in the event and /health; an operator reset is not refused by a tenant; an off-bus bound chip is detached before any kill and an undetachable one keeps every reader alive; a D-state reader is fenced for the host rung; a refused reset keeps the fabric owed; a scan bug lets the reset run; the bridge rung journals `targets_detached` and kills nothing | `tests/test_pre_reset_holder_scan.py::test_every_reset_kills_the_reader_after_the_pollers_stop_and_before_the_reset`, `::test_a_reader_gets_sigterm_then_sigkill_after_the_10s_grace`, `::test_a_tenant_refuses_an_automatic_reset_named_in_health_and_the_fabric_stays_owed`, `::test_an_operator_reset_is_not_refused_by_a_tenant`, `::test_an_off_bus_chip_is_detached_before_any_reader_is_killed`, `::test_an_off_bus_chip_that_cannot_be_detached_keeps_its_readers_alive`, `::test_on_bus_chips_readers_are_killed_with_no_detach`, `::test_an_unkillable_reader_is_fenced_for_the_host_rung`, `::test_a_scan_bug_does_not_stop_the_reset`, `::test_the_bridge_rung_journals_its_detached_targets_and_kills_nothing`; `::test_a_detach_that_blocks_in_the_kernel_is_bounded_and_refuses_the_reset`, `::test_a_holder_inside_a_reset_is_never_signalled_and_the_reset_is_refused`, `::test_a_reset_already_running_refuses_before_the_scan`, `::test_a_registered_local_reset_and_its_child_read_as_in_reset`, `::test_a_refused_mesh_reset_is_journalled_as_refused_and_settles_no_debt`, `::test_a_refused_sweep_reset_is_journalled_and_releases_the_aer_mask`, `::test_a_pid_gap_is_rescanned_once_then_refuses_an_automatic_reset`, `::test_a_pid_gap_that_clears_on_the_rescan_lets_the_reset_proceed`, `::test_an_operator_reset_records_a_pid_gap_and_still_clears_the_readers`, `::test_a_gap_no_pid_explains_is_recorded_and_the_reset_proceeds`, `::test_an_automatic_reset_past_an_unseen_holder_is_refused_and_the_fabric_stays_owed`, `::test_a_scan_that_raises_lets_the_reset_proceed`; the operator reset refuses while another is in flight: `tests/test_reset.py::test_an_operator_reset_refuses_while_another_reset_is_in_flight`, `::test_a_streaming_operator_reset_refuses_while_another_reset_is_in_flight`; a refused reset keeps the hold and the I76 bound still runs the ladder at 10 min, then the power cycle: `tests/test_hold_bound.py::test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung`, `::test_a_reset_the_holder_scan_refuses_keeps_the_hold_and_the_bound_cycles`, `::test_a_tenant_the_holder_scan_finds_bounds_the_hold_and_the_ladder_runs_when_it_leaves` |
+
+| I93 the gap: 200 s after the first reset ended, cut so the wait ends by the 600 s bound; no wait without the first reset or the hold clock; no env/config knob | `tests/test_mesh_reset_repeat.py::test_the_gap_wait_ends_by_the_hold_bound`, `tests/test_mesh_reset_repeat.py::test_the_gap_wait_needs_the_first_reset_and_the_hold_clock`, `tests/test_mesh_reset_repeat.py::test_no_env_or_config_knob_changes_the_gap` |
+| I93 a failed first reset: the sweep's mesh reset waits out the gap (the hold stands), its full check runs; a fail asks for the power cycle, a pass lifts the hold; a first reset ending late waits only to the bound | `tests/test_mesh_reset_repeat.py::test_a_failed_first_reset_spaces_the_sweeps_mesh_reset_then_asks_for_the_power_cycle`, `tests/test_mesh_reset_repeat.py::test_a_spaced_sweep_whose_full_check_passes_lifts_the_hold`, `tests/test_mesh_reset_repeat.py::test_a_first_reset_ending_late_waits_only_to_the_bound`, `tests/test_dispatch_failure_reset.py::test_a_failed_post_reset_check_stays_held_and_climbs`, `tests/test_job_kill_reset.py::test_a_failed_post_kill_check_stays_held_and_climbs` |
+| I93 no wait on a fabric link-short hold (I83), a chip off the bus, a BMC guard finding, a first reset from another episode or a spent sweep | `tests/test_mesh_reset_repeat.py::test_the_sweep_waits_only_on_a_present_mesh_after_this_episodes_reset`, `tests/test_fabric_links_missing.py::test_a_lost_link_that_a_reset_does_not_heal_stays_held`, `tests/test_fabric_links_missing.py::test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs` |
+| I93 at the 600 s bound the ladder runs at once, never waits for the gap, and a failing check asks for the power cycle | `tests/test_mesh_reset_repeat.py::test_the_bound_runs_the_ladder_and_asks_for_the_power_cycle_at_600s` |

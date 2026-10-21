@@ -603,6 +603,11 @@ class RecoveryMechanism:
         self.sweep_spent: Optional[tuple] = None
         # The episode whose unforced escalation already climbed past its spent mesh reset (I87).
         self.spent_climb_since: Optional[str] = None
+        # The last Galaxy mesh reset this process launched: {"episode", "started", "ended"} (monotonic
+        # seconds). The last-chance sweep spaces the episode's second from it (spec 04 I93); None until one ran.
+        self.last_mesh_reset_run: Optional[dict] = None
+        # Monotonic time the last reset command this process launched returned (its check not included).
+        self.last_reset_ended_monotonic: float = 0.0
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
         # still cycling nor a verify that failed after a clean exit). A reset that could not even run
         # leaves the mesh in whatever off-bus state it was, and a warm reboot cannot re-enumerate a

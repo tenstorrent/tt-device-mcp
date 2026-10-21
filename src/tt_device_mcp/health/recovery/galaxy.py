@@ -42,6 +42,8 @@ from tt_device_mcp.health.recovery import (
     WAIT,
     Evidence,
     Recovery,
+    ipmi_guard,
+    mesh_repeat,
     offbus_power_cycle,
     pcie_guard,
 )
@@ -231,6 +233,11 @@ def _offbus_hold_ceiling_sec() -> int:
     except ValueError:
         return 120
     return v if v > 0 else 120
+
+
+async def _mesh_reset_gap_sleep(seconds: float) -> None:
+    """The spaced sweep's wait for the gap after a failed first mesh reset (spec 04 I93)."""
+    await asyncio.sleep(seconds)
 
 
 def _settle_before_host_rung_sec() -> int:
@@ -1920,6 +1927,62 @@ class GalaxyRecovery(Recovery):
         age = _hold_age_sec(hold_since)
         return (hold_since, age is not None and age >= _stuck_hold_ceiling_sec())
 
+    async def _space_second_mesh_reset(self, expected: int, log, where: str) -> bool:
+        """Spec 04 I93: on a present mesh whose first Galaxy mesh reset in this hold episode failed, wait
+        until MESH_RESET_MIN_GAP_SEC after that reset ENDED before the sweep runs the episode's second,
+        but never past the 10-min bound (I76): at the bound it runs at once. True iff it waited.
+
+        No wait (the sweep runs at once, as before) unless all of: a Galaxy ``-glx_reset`` on more than
+        one chip; the hold clock known; this hold phase's sweep not spent; not a fabric link-short hold
+        (I79/I83: those go to the power cycle at once); every expected chip on the bus, none isolated or
+        removed (classes A, B and C keep their own paths); no BMC guard finding (I91); and the first
+        mesh reset ran in this episode. The wait holds the device (the hold stands, no job runs); the
+        sweep's own guards (tenant, a reset cycling in its scope, the I87 phase) are read after it."""
+        argv = self.reset_argv(list(range(expected)))
+        if expected <= 1 or "-glx_reset" not in argv or not ipmi_guard.is_mesh_reset(argv):
+            return False
+        hold_since = self.deps.device_hold_episode_since() or ""
+        age = _hold_age_sec(hold_since)
+        run = self.mechanism.last_mesh_reset_run
+        if age is None or run is None:
+            return False
+        phase = self._sweep_phase()
+        if phase is not None and self.mechanism.sweep_spent == phase:
+            return False
+        if self.deps.fabric_link_short_hold and self.deps.fabric_link_short_hold():
+            return False
+        now = time.monotonic()
+        # The first reset belongs to this episode: launched under its stamp, or ended inside it.
+        if run["episode"] != hold_since and run["ended"] < now - age:
+            return False
+        wait = mesh_repeat.gap_wait(
+            since_first_end_sec=now - run["ended"], hold_age_sec=age, bound_sec=_stuck_hold_ceiling_sec()
+        )
+        if wait <= 0:
+            return False
+        beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        if (
+            offbus_count(beats, expected)
+            or pcie_guard.chips_off_bus(expected)
+            or self.deps.isolated_chips()
+            or removed_chip_ids()
+            or self.mechanism.bmc_guard_state is not None
+        ):
+            return False
+        log(
+            f"last chance before the host rung{where}: the first mesh reset failed {int(now - run['ended'])}s ago "
+            f"— the sweep's mesh reset waits {int(wait)}s more (spec 04 I93), the hold stands"
+        )
+        health_event(
+            "mesh_reset_spaced",
+            held_since=hold_since,
+            wait_sec=round(wait, 1),
+            since_first_end_sec=round(now - run["ended"], 1),
+            hold_age_sec=round(age, 1),
+        )
+        await _mesh_reset_gap_sleep(wait)
+        return True
+
     async def _issue_all_resets_back_to_back(
         self, trays: list, expected: int, log, *, do_sbr: bool = True, mesh_reset: bool = True
     ) -> bool:
@@ -2021,6 +2084,8 @@ class GalaxyRecovery(Recovery):
         climbs), and None when the sweep was skipped or incomplete and the mesh is still bad: the
         full ladder has not run, so the caller holds and fires no host rung this pass (I22)."""
         where = f" ({context})" if context else ""
+        if await self._space_second_mesh_reset(expected, log, where):
+            offbus_chips = None  # the wait is over: what is off the bus now is read below
         tray_map = self._tray_map_now()
         if offbus_chips is None:
             try:
@@ -2394,7 +2459,8 @@ class GalaxyRecovery(Recovery):
         # galaxy reset that dropped this present mesh to all-0xFFFFFFFF — a mass drop a power cycle
         # recovers and self-heal never will. The reset is now spent for the episode (I87), so the climb
         # does not wait for the ceiling: the last-chance sweep once, then the power cycle, or an
-        # operator when there is none (I36). Unforced, that climb runs once per episode.
+        # operator when there is none (I36). Unforced, that climb runs once per episode. On a present
+        # mesh the sweep's mesh reset is spaced from this one (I93).
         self.mechanism.spent_climb_since = hold_since or None
         await self._climb_or_hand_off(
             expected, off_bus_before, hold_since, log, present_reset_failed=off_bus_before == 0
